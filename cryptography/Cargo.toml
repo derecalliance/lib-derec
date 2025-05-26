@@ -1,0 +1,22 @@
+[package]
+name = "derec-cryptography"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sha2 = "0.10.9"
+aead = "0.5.2"
+aes = "0.8.4"
+aes-gcm = "0.10.3"
+rand = "0.8.5"
+rand_chacha = "0.3.1"
+ark-std = "0.5.0"
+ark-ec = "0.5.0"
+ark-ff = "0.5.0"
+ark-poly = "0.5.0"
+ark-serialize = { version = "0.5.0", default-features = true }
+ark-bw6-761 = "0.5.0"
+ark-secp256k1 = "0.5.0"
+thiserror = "1.0.69"
+ml-kem = "0.2.1"
+rand_core = "0.6.4"
