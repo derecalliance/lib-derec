@@ -102,11 +102,6 @@ message PairResponseMessage {
   SenderKind senderKind = 2;
 
   /*
-   * public signature key (PEM encoded) of the responder
-   */
-  string publicSignatureKey = 3;
-
-  /*
    * app-readable contact information (e.g. name, phone number, etc.)
    */
   CommunicationInfo communicationInfo = 4;
@@ -115,7 +110,7 @@ message PairResponseMessage {
    * 64-bit (random) nonce to identify the pairing session;
    * this is the same value as sent in the pairing request
    */
-  int64 nonce = 5;
+  uint64 nonce = 5;
 
   /*
    * The parameter range for the sender.
