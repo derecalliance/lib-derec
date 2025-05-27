@@ -1,0 +1,62 @@
+/*
+ * Copyright (c) DeRec Alliance and its Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *        http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+syntax = "proto3";
+import "result.proto";
+
+package org.derecalliance.derec.protobuf;
+
+/*
+* ----------------------------------------------------------------------------
+* The sharer is asking the helper whether they have a particular version of
+* the share, which they will have to cryptographically prove.
+* ----------------------------------------------------------------------------
+*/
+message VerifyShareRequestMessage {
+  /*
+   * which share version is being verified?
+   */
+  int32 version = 1;
+
+  /*
+   * 256-bit nonce that serves as the challenge.
+   * This is randomly chosen for each request.
+   */
+  bytes nonce = 2;
+}
+
+/* response in the challenge-response proof that the stored share is correct */
+message VerifyShareResponseMessage {
+  /* the success or failure of processing the request */
+  Result result = 1;
+
+  /*
+   * which version is the response for?
+   */
+  int32 version = 2;
+
+  /**
+    * 256-bit nonce that was used in the challenge
+    */
+  bytes nonce = 3;
+
+  /**
+   * response: sha384 hash of concatenation of the following:
+   * (committedDeRecShare, nonce)
+   */
+  bytes hash = 4;
+}

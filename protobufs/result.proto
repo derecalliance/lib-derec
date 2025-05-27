@@ -1,0 +1,79 @@
+/*
+ * Copyright (c) DeRec Alliance and its Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *        http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+syntax = "proto3";
+
+package org.derecalliance.derec.protobuf;
+
+/*
+ * Result of success or failure for processing the request messages
+ */
+message Result {
+  StatusEnum status = 1;
+  string memo = 2;
+}
+
+/*
+ * The success or failure of processing a request,
+ * used in DeRec Response messages
+ */
+enum StatusEnum {
+  /* The request was successfully handled. */
+  OK = 0;
+
+  /*
+   * The request was partially fulfilled. The memo will give more details.
+   */
+  PARTIAL = 1;
+
+  /*
+   * The request fails for some reason other than one of the specific
+   * reasons below.
+   */
+  FAIL = 2;
+
+  /*
+   * This request fails because it would cause the helper to be storing
+   * more bytes for this sharer than the agreed limit for this secret ID.
+   */
+  SIZE_LIMIT_EXCEEDED = 3;
+
+  /* the request is being ignored because it is too frequent (it was
+   * sent too soon after the last request of that type, according to
+   * the agreed limit on the frequency.
+   */
+  TOO_FREQUENT = 4;
+
+  /* This secret ID is not stored by this helper. */
+  UNKNOWN_SECRET_ID = 5;
+
+  /* This share version for this secret ID not stored by this helper. */
+  UNKNOWN_SHARE_VERSION = 6;
+
+  /* The received message could not be decrypted successfully. */
+  DECRYPTION_FAILED = 7;
+
+  /* Signature could not be verified */
+  VERIFICATION_FAILED = 8;
+
+  /* Format error - includes errors like protobuf parsing failure or invalid message formatting. */
+  FORMAT_ERROR = 9;
+
+  /* the helper is asking the sharer to send an unpair request */
+  REQUEST_TO_CLOSE = 99;
+}
+

@@ -1,0 +1,89 @@
+/*
+ * Copyright (c) DeRec Alliance and its Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *        http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+syntax = "proto3";
+import "result.proto";
+import "parameterrange.proto";
+import "google/protobuf/timestamp.proto";
+
+package org.derecalliance.derec.protobuf;
+
+/*
+ * Request that the given share be stored, and that all versions outside
+ * the given keepList be removed from use.
+ *
+ * If the share field is not absent, then the helper is
+ * requested to store this version of the share. If the helper already has
+ * this version of the share, then it is a request to replace it. It is
+ * an error on the part of the sharer if the two shares with the same version
+ * number and secret ID are actually different.
+ *
+ * If the keepList field is present in this message, then it is a request
+ * to update that list, and to delete any version not on that list. If the
+ * keepList is absent, then the helper should continue to use the existing
+ * keepList, except this new received share should be added to the list.
+ * The keepList should be ignored if the version is not equal to or greater
+ * than the latest version that has been stored (to prevent replay attacks 
+ * from deleting newer shares).
+ */
+message StoreShareRequestMessage {
+  /*
+   * The bytes that the sharer is requesting that the helper stores. A helper does not need to know the details of 
+   * the algorithm used to construct the share and MUST treat the share as an opaque byte string.
+   */
+   bytes share = 1;
+
+  /*
+   * An identifier for the algorithm used to create the share bytes (field 1). For interoperability purposes there 
+   * may be a registry of ids and corresponding protobuf definitions of the contents of the share, if it is desired that 
+   * different sharer implementations are able to reconstruct secrets that have been shared by other implementations.
+   *
+   * Share algorithm number 0 is the creation of the `share` bytes by serializing the
+   * protobuf message `CommittedDeRecShare`, which is detailed in the DeRecAlliance Repo 'cryptography'.
+   *
+   * It is recommended that implementations support at least this
+   * algorithm, to aid in interoperability if a secret is created on one app and recovered using another app.
+   */
+   int32 shareAlgorithm = 2;
+
+  /*
+   * The version number of the share (the secretId is given in the containing DeRecMessage)
+   */
+   int32 version = 3;
+
+  /*
+  * All versions that the helper must retain (including this new one).
+  * The helper should delete all other versions outside this list.
+  */
+  repeated int32 keepList = 4;
+
+  /*
+   * A description of the version. This is not encrypted, so it can
+   * be read by the helper. The sharer should either leave this
+   * empty, or give a description that they want the helper to know.
+   */
+  string versionDescription = 5;
+}
+
+
+message StoreShareResponseMessage {
+  Result result = 1;
+  /*
+   * version number from the share message
+   */
+  int32 version = 2;
+}
