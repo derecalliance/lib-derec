@@ -71,6 +71,10 @@ pub type PairingSharedKey = [u8; 32];
 /// 3. Packages the public components into a `PairingContactMessageMaterial` to be sent to the responder.
 /// 4. Returns the secret components as `PairingSecretKeyMaterial` to be retained by the contactor.
 ///
+///
+/// # Arguments
+/// * `entropy` - A cryptographically secure random seed of length `λ` (32 bytes).
+/// 
 /// # Returns
 /// - `Ok((PairingContactMessageMaterial, PairingSecretKeyMaterial))` on success, containing:
 ///     - The public contact message material to send to the responder.
@@ -83,7 +87,7 @@ pub type PairingSharedKey = [u8; 32];
 /// # Example
 /// ```rust
 /// use derec_cryptography::pairing::*;
-/// let (contact_msg, secret_keys) = contact_message().unwrap();
+/// let (contact_msg, secret_keys) = contact_message([0u8; 32]).unwrap();
 /// // Send `contact_msg` to the responder, keep `secret_keys` for later.
 /// ```
 pub fn contact_message(entropy: [u8; 32]) -> Result<(PairingContactMessageMaterial, PairingSecretKeyMaterial), DerecPairingError> {
@@ -128,7 +132,7 @@ pub fn contact_message(entropy: [u8; 32]) -> Result<(PairingContactMessageMateri
 /// # Example
 /// ```rust
 /// use derec_cryptography::pairing::*;
-/// let (contact_msg, _) = contact_message().unwrap();
+/// let (contact_msg, _) = contact_message([0u8; 32]).unwrap();
 /// let (request_msg, secret_keys) = pairing_request_message(&contact_msg).unwrap();
 /// // Send `request_msg` to the contactor, keep `secret_keys` for later.
 /// ```
@@ -174,7 +178,7 @@ pub fn pairing_request_message(
 /// # Example
 /// ```rust
 /// use derec_cryptography::pairing::*;
-/// let (contact_msg, _) = contact_message().unwrap();
+/// let (contact_msg, _) = contact_message([0u8; 32]).unwrap();
 /// let (request_msg, secret_keys) = pairing_request_message(&contact_msg).unwrap();
 /// let shared_key = finish_pairing_requestor(&secret_keys, &contact_msg).unwrap();
 /// ```
@@ -213,7 +217,7 @@ pub fn finish_pairing_requestor(
 /// # Example
 /// ```rust
 /// use derec_cryptography::pairing::*;
-/// let (contact_msg, contactor_secrets) = contact_message().unwrap();
+/// let (contact_msg, contactor_secrets) = contact_message([0u8; 32]).unwrap();
 /// let (request_msg, _) = pairing_request_message(&contact_msg).unwrap();
 /// let shared_key = finish_pairing_contactor(&contactor_secrets, &request_msg).unwrap();
 /// ```
