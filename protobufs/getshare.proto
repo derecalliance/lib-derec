@@ -1,0 +1,51 @@
+/*
+ * Copyright (c) DeRec Alliance and its Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *        http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+syntax = "proto3";
+import "result.proto";
+import "storeshare.proto";
+
+package org.derecalliance.derec.protobuf;
+
+/* Request a given share that is stored by the helper. */
+message GetShareRequestMessage {
+  /*
+   * Secret ID (any length from 1 to 16 bytes) for the requested share
+   * Must be unique for each secret created by a sharer
+   */
+  bytes secretId = 1;
+
+  /* the share version for the requested share */
+  int32 shareVersion = 2;
+}
+
+/*
+  * Response giving the requested share to the sharer.
+  * The request is only processed if it comes through the communication channel
+  * that is either for the same secret ID that is being requested, or through
+  * a secret ID that was created in recovery mode.
+  */
+message GetShareResponseMessage {
+  /* the success or failure of processing the request */
+  Result result = 1;
+
+  /* the committed deRec share */
+  bytes committedDeRecShare = 2;
+
+  /* the share algorithm */
+  int32 shareAlgorithm = 3;
+}

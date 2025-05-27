@@ -1,0 +1,45 @@
+/*
+ * Copyright (c) DeRec Alliance and its Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *        http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+syntax = "proto3";
+import "result.proto";
+
+package org.derecalliance.derec.protobuf;
+
+/*
+ * ----------------------------------------------------------------------------
+ * Remove pairing. This is a request that the other party ceases to be a
+ * helper, and deletes any information about the sharer and the relationship,
+ * other than information that must be retained according to regulations or
+ * service agreements etc.
+ * ----------------------------------------------------------------------------
+ */
+message UnpairRequestMessage {
+  /*
+   * A human-readable reason for why the unpairing happened.
+   */
+  string memo = 1;
+}
+
+/*
+ * ----------------------------------------------------------------------------
+ * Response to the unpairing request.
+ * ----------------------------------------------------------------------------
+ */
+message UnpairResponseMessage {
+  Result result = 1;
+}

@@ -1,0 +1,68 @@
+/*
+ * Copyright (c) DeRec Alliance and its Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *        http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+syntax = "proto3";
+package org.derecalliance.derec.protobuf;
+
+/**
+* ----------------------------------------------------------------------------
+* This is the sole message that is not a DeRecMessage. It is not encrypted,
+* not signed, and not sent through the usual communication channels. It 
+* might be in a QR code, presented by either the helper or sharer, and scanned
+* by the other party.  Or it might be in an app that is provided by one party
+* and used by another party.  Or it might be sent through an existing channel
+* if the two parties already have some other relationship before they start
+* the DeRec protocol. The nonce might be sent separately from the rest of it.
+* ----------------------------------------------------------------------------
+*/
+message ContactMessage {
+ /**
+  * public key in PEM encoding format
+  */
+ string publicEncryptionKey = 1;
+ 
+/**
+  * A number used to later identify the publicEncryptionKey. 
+  * When a message is sent to the creator of this contact, and it is encrypted
+  * with the publicEncryptionKey, this identifier is also sent, so the recipient 
+  * knows which key to use to decrypt it. If the recipient creates multiple 
+  * keys for multiple pairings, then they should remember the publicKeyId that
+  * they chose for each one, so they won't have to try all the keys during decryption. 
+  */
+ int32 publicKeyId = 2;
+
+ /**
+  * 64-bit (random) nonce to identify the pairing session. 
+  * This should be given to a party after authenticating.
+  */
+ int64 nonce = 3;
+
+ /**
+  * URI endpoint for contacting the helper/sharer
+  * This can be an https endpoint or a rabbitMQ endpoint
+  */
+ string transportUri = 4;
+
+  /**
+   * Message encoding mechanism
+   */
+  MessageEncodingEnum messageEncodingType = 5;
+
+  enum MessageEncodingEnum {
+   Protobuf = 0;
+  }
+}
