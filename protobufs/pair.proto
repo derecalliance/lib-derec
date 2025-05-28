@@ -51,14 +51,14 @@ message PairRequestMessage {
   SenderKind senderKind = 1;
 
   /*
-   * public key (PEM encoded - RFC 7468) used for signing messages from the initiator
+   * ML-KEM-768 ciphertext
    */
-  string publicSignatureKey = 3;
+  bytes mlkemCiphertext = 3;
 
   /*
-   * public key (PEM encoded - RFC 7468) used for encrypting messages to the initiator
+   * serialized ECIES public key
    */
-  string publicEncryptionKey = 4;
+  bytes eciesPublicKey = 4;
 
 /**
   * A number used to later identify the publicEncryptionKey. 
@@ -68,7 +68,7 @@ message PairRequestMessage {
   * keys for multiple pairings, then they should remember the publicKeyId that
   * they chose for each one, so they won't have to try all the keys during decryption. 
   */
- int32 publicKeyId = 5;
+  uint64 publicKeyId = 5;
 
   /*
    * sender’s app-readable contact information,
@@ -79,7 +79,7 @@ message PairRequestMessage {
   /*
    * 64-bit (random) nonce to identify the pairing session
    */
-  int64 nonce = 7;
+  uint64 nonce = 7;
 
   /*
    * The parameter range for the sender.
@@ -102,11 +102,6 @@ message PairResponseMessage {
   SenderKind senderKind = 2;
 
   /*
-   * public signature key (PEM encoded) of the responder
-   */
-  string publicSignatureKey = 3;
-
-  /*
    * app-readable contact information (e.g. name, phone number, etc.)
    */
   CommunicationInfo communicationInfo = 4;
@@ -115,7 +110,7 @@ message PairResponseMessage {
    * 64-bit (random) nonce to identify the pairing session;
    * this is the same value as sent in the pairing request
    */
-  int64 nonce = 5;
+  uint64 nonce = 5;
 
   /*
    * The parameter range for the sender.

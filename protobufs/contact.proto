@@ -31,9 +31,14 @@ package org.derecalliance.derec.protobuf;
 */
 message ContactMessage {
  /**
-  * public key in PEM encoding format
+  * serialized ML-KEM-768 encapsulation key
   */
- string publicEncryptionKey = 1;
+ bytes mlkemEncapsulationKey = 1;
+
+ /**
+  * serialized ECIES public key
+  */
+ bytes eciesPublicKey = 2;
  
 /**
   * A number used to later identify the publicEncryptionKey. 
@@ -43,24 +48,24 @@ message ContactMessage {
   * keys for multiple pairings, then they should remember the publicKeyId that
   * they chose for each one, so they won't have to try all the keys during decryption. 
   */
- int32 publicKeyId = 2;
+ uint64 publicKeyId = 3;
 
  /**
   * 64-bit (random) nonce to identify the pairing session. 
   * This should be given to a party after authenticating.
   */
- int64 nonce = 3;
+ uint64 nonce = 4;
 
  /**
   * URI endpoint for contacting the helper/sharer
   * This can be an https endpoint or a rabbitMQ endpoint
   */
- string transportUri = 4;
+ string transportUri = 5;
 
   /**
    * Message encoding mechanism
    */
-  MessageEncodingEnum messageEncodingType = 5;
+  MessageEncodingEnum messageEncodingType = 6;
 
   enum MessageEncodingEnum {
    Protobuf = 0;
