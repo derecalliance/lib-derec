@@ -17,6 +17,8 @@
 
 syntax = "proto3";
 
+package org.derecalliance.derec.protobuf;
+
 /*
  * A DeRec share that is committed and ready to be given to a helper to store.
  * During recovery, this protobuf message is returned.
