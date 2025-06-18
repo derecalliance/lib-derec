@@ -3,12 +3,7 @@ use rand::RngCore;
 use std::collections::HashMap;
 use derec_cryptography::vss;
 use crate::protos::derec_proto::{StoreShareRequestMessage, DeRecShare, CommittedDeRecShare, committed_de_rec_share::SiblingHash};
-
-/// A type alias representing a multicast message for secret sharing.
-///
-/// `SharingMulticastMessage` is a `HashMap` that maps each recipient's channel identifier (as a `Vec<u8>`)
-/// to a `StoreShareRequestMessage` containing the secret share and associated metadata for that channel.
-pub type SharingMulticastMessage = HashMap<Vec<u8>, StoreShareRequestMessage>;
+use crate::types::*;
 
 /// Protects a secret by splitting it into verifiable secret shares and preparing messages for distribution.
 ///
@@ -39,13 +34,12 @@ pub type SharingMulticastMessage = HashMap<Vec<u8>, StoreShareRequestMessage>;
 ///
 /// ```rust
 /// use crate::derec_library::sharing::protect_secret;
-/// let secret_id = b"my_secret";
-/// let secret_data = b"super_secret_data";
-/// let channels = vec![b"channel1", b"channel2", b"channel3"];
+/// let secret_id = b"my_password";
+/// let secret_data = b"password";
+/// let channels = vec![b"channel1", b"channel2", b"channel3"]; // from pairing
 /// let threshold = 2;
 /// let version = 1;
 /// let result = protect_secret(secret_id, secret_data, &channels, threshold, version, None, None);
-/// assert!(result.is_ok());
 /// ```
 pub fn protect_secret(
     secret_id: impl AsRef<[u8]>,
@@ -55,7 +49,7 @@ pub fn protect_secret(
     version: i32,
     keep_list: Option<&[i32]>,
     description: Option<&str>,
-) -> Result<SharingMulticastMessage, &'static str> {
+) -> Result<HashMap<ChannelId, StoreShareRequestMessage>, &'static str> {
     // our secret sharing scheme requires some entropy
     let mut rng = rand::rngs::OsRng;
     let mut entropy: [u8; 32] = [0; 32];
@@ -66,7 +60,7 @@ pub fn protect_secret(
         .map_err(|_| "VSS failed to generate shares")?;
 
     // let's iterate over all shares and prepare DeRec protocol messages
-    let mut output = SharingMulticastMessage::new();
+    let mut output = HashMap::new();
     for (channel, share) in channels.iter().zip(vss_shares.iter()) {
         let derec_share = DeRecShare {
             encrypted_secret: share.encrypted_secret.to_owned(),

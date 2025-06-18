@@ -326,6 +326,7 @@ dependencies = [
  "prost-build",
  "prost-types",
  "rand",
+ "sha2",
 ]
 
 [[package]]
