@@ -9,6 +9,30 @@ use crate::protos::derec_proto::{
 use crate::types::*;
 use sha2::*;
 
+/// Generates a verification request for each provided channel.
+///
+/// This function creates a map of `ChannelId` to `VerifyShareRequestMessage`, where each request
+/// contains a securely generated random nonce and the specified version. The nonce is used to
+/// ensure freshness and prevent replay attacks during the verification process.
+///
+/// # Arguments
+///
+/// * `_secret_id` - An identifier for the secret (not used in this function, but may be useful for context).
+/// * `channels` - A slice of channel identifiers for which to generate verification requests.
+/// * `version` - The version number to include in each verification request.
+///
+/// # Returns
+///
+/// Returns a `Result` containing a `HashMap` mapping each `ChannelId` to its corresponding
+/// `VerifyShareRequestMessage` on success, or an error string on failure.
+///
+/// # Example
+///
+/// ```rust
+/// use crate::derec_library::verification::*;
+/// let channels = vec![b"channel1".to_vec(), b"channel2".to_vec()];
+/// let requests = generate_verification_request("secret_id", &channels, 1).unwrap();
+/// ```
 pub fn generate_verification_request(
     _secret_id: impl AsRef<[u8]>,
     channels: &[impl AsRef<[u8]>],
@@ -28,6 +52,34 @@ pub fn generate_verification_request(
     Ok(request_map)
 }
 
+/// Generates a verification response for a given share and verification request.
+///
+/// This function computes a SHA-384 hash over the provided share content and the nonce from the
+/// verification request. It then constructs a `VerifyShareResponseMessage` containing the hash,
+/// the original nonce, the version, and a result indicating success.
+///
+/// # Arguments
+///
+/// * `_secret_id` - An identifier for the secret (not used in this function, but may be useful for context).
+/// * `_channel_id` - A slice of channel identifiers (not used in this function, but may be useful for context).
+/// * `share_content` - The content of the share to be verified.
+/// * `request` - The original `VerifyShareRequestMessage` containing the nonce and version.
+///
+/// # Returns
+///
+/// Returns a `Result` containing the constructed `VerifyShareResponseMessage` on success,
+/// or an error string on failure.
+///
+/// # Example
+///
+/// ```rust
+/// use crate::derec_library::verification::*;
+/// let channel = b"channel1".to_vec();
+/// let share_content = b"example_share";
+/// let requests = generate_verification_request("secret", &[channel.clone()], 1).unwrap();
+/// let request = requests.get(&channel).unwrap();
+/// let response = generate_verification_response("secret", &[channel.clone()], share_content, request).unwrap();
+/// ```
 pub fn generate_verification_response(
     _secret_id: impl AsRef<[u8]>,
     _channel_id: &[impl AsRef<[u8]>],
@@ -49,6 +101,38 @@ pub fn generate_verification_response(
 
     Ok(response)
 }
+
+/// Verifies a share response by recomputing the hash and comparing it to the provided response.
+///
+/// This function takes the share content and the corresponding `VerifyShareResponseMessage`,
+/// recomputes the SHA-384 hash using the share content and the nonce from the response,
+/// and checks if it matches the hash included in the response. This ensures the integrity
+/// and authenticity of the share content as verified by the original request's nonce.
+///
+/// # Arguments
+///
+/// * `_secret_id` - An identifier for the secret (not used in this function, but may be useful for context).
+/// * `_channel_id` - A slice of channel identifiers (not used in this function, but may be useful for context).
+/// * `share_content` - The content of the share to be verified.
+/// * `response` - The `VerifyShareResponseMessage` containing the nonce and hash to verify against.
+///
+/// # Returns
+///
+/// Returns `Ok(true)` if the verification succeeds (hashes match), or an `Err` with an error message
+/// if the verification fails (hash mismatch).
+///
+/// # Example
+///
+/// ```rust
+/// use crate::derec_library::verification::*;
+/// let channel = b"channel1".to_vec();
+/// let share_content = b"example_share";
+/// let requests = generate_verification_request("secret", &[channel.clone()], 1).unwrap();
+/// let request = requests.get(&channel).unwrap();
+/// let response = generate_verification_response("secret", &[channel.clone()], share_content, request).unwrap();
+/// let verify = verify_share_response("secret", &[channel.clone()], share_content, &response).unwrap();
+/// assert!(verify);
+/// ```
 
 pub fn verify_share_response(
     _secret_id: impl AsRef<[u8]>,
