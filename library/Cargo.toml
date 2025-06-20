@@ -6,7 +6,9 @@ edition = "2024"
 [dependencies]
 derec-cryptography = { path = "../cryptography" }
 prost = "0.12"
+prost-types = "0.12"
 rand = "0.8.5"
+sha2 = "0.10.9"
 
 [build-dependencies]
 prost-build = "0.12"

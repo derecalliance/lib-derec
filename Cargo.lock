@@ -324,7 +324,9 @@ dependencies = [
  "derec-cryptography",
  "prost",
  "prost-build",
+ "prost-types",
  "rand",
+ "sha2",
 ]
 
 [[package]]
