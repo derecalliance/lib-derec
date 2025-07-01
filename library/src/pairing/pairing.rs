@@ -2,7 +2,7 @@ use rand::RngCore;
 use derec_cryptography::pairing;
 use crate::protos::derec_proto;
 
-
+#[uniffi::export]
 pub fn create_contact_message(
     channel_id: u64,
     transport_uri: &String

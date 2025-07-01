@@ -3,12 +3,21 @@ name = "derec-library"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["cdylib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+
 [dependencies]
 derec-cryptography = { path = "../cryptography" }
 prost = "0.12"
 prost-types = "0.12"
 rand = "0.8.5"
 sha2 = "0.10.9"
+uniffi = { version = "0.29", features = [ "cli" ] }
 
 [build-dependencies]
 prost-build = "0.12"
+uniffi = { version = "0.29", features = [ "build" ] }
