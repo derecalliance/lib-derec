@@ -6,7 +6,6 @@ mod tests {
         produce_pairing_response_message,
         process_pairing_response_message
     };
-    use crate::protos::derec_proto;
 
     #[test]
     fn test_alice_bob_pairing_flow() {
