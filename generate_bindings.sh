@@ -1,3 +1,5 @@
+cargo b --release
+
 mkdir -p library/bindings/swift
 cargo r --features=uniffi/cli --bin uniffi-bindgen -- generate --language swift --library target/release/libderec_library.dylib --out-dir library/bindings/swift
 
