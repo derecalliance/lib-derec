@@ -17,4 +17,4 @@ target/
 #.idea/
 
 # We don't want to commit auto-generated bindings
-bindings/
+library/bindings/
