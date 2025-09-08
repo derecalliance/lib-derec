@@ -4,11 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-crate-type = ["cdylib"]
-
-[[bin]]
-name = "uniffi-bindgen"
-path = "uniffi-bindgen.rs"
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 derec-cryptography = { path = "../cryptography" }
@@ -16,12 +12,9 @@ prost = "0.12"
 prost-types = "0.12"
 rand = "0.8.5"
 sha2 = "0.10.9"
-uniffi = { version = "0.29", features = [ "cli" ] }
-wasm-bindgen = { version = "0.2.99", optional = true }
+wasm-bindgen = { version = "0.2", features = ["serde-serialize"] }
+serde = { version = "1.0", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
 
 [build-dependencies]
 prost-build = "0.12"
-uniffi = { version = "0.29", features = [ "build" ] }
-
-[features]
-ffi_wasm = ["dep:wasm-bindgen"]

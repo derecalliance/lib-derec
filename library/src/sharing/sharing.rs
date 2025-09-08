@@ -36,7 +36,7 @@ use crate::types::*;
 /// use crate::derec_library::sharing::protect_secret;
 /// let secret_id = b"my_password";
 /// let secret_data = b"password";
-/// let channels = vec![b"channel1", b"channel2", b"channel3"]; // from pairing
+/// let channels = vec![1, 2, 3]; // from pairing
 /// let threshold = 2;
 /// let version = 1;
 /// let result = protect_secret(secret_id, secret_data, &channels, threshold, version, None, None);
@@ -44,7 +44,7 @@ use crate::types::*;
 pub fn protect_secret(
     secret_id: impl AsRef<[u8]>,
     secret_data: impl AsRef<[u8]>,
-    channels: &[impl AsRef<[u8]>],
+    channels: impl AsRef<[ChannelId]>,
     threshold: usize,
     version: i32,
     keep_list: Option<&[i32]>,
@@ -55,13 +55,13 @@ pub fn protect_secret(
     let mut entropy: [u8; 32] = [0; 32];
     rng.fill_bytes(&mut entropy);
 
-    let (t, n) = (threshold as u64, channels.len() as u64);
+    let (t, n) = (threshold as u64, channels.as_ref().len() as u64);
     let vss_shares = vss::share((t,n), secret_data.as_ref(), &entropy)
         .map_err(|_| "VSS failed to generate shares")?;
 
     // let's iterate over all shares and prepare DeRec protocol messages
     let mut output = HashMap::new();
-    for (channel, share) in channels.iter().zip(vss_shares.iter()) {
+    for (channel, share) in channels.as_ref().iter().zip(vss_shares.iter()) {
         let derec_share = DeRecShare {
             encrypted_secret: share.encrypted_secret.to_owned(),
             x: share.x.to_owned(),
@@ -87,7 +87,7 @@ pub fn protect_secret(
             version_description: description.map(|d| d.to_string()).unwrap_or_default(),
         };
 
-        output.insert(channel.as_ref().to_owned(), outbound_msg);
+        output.insert(*channel, outbound_msg);
     }
 
     Ok(output)
