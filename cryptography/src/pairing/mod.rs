@@ -32,6 +32,7 @@
 //!
 
 use rand_chacha::rand_core::SeedableRng;
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 
 pub mod pairing_mlkem;
 pub mod pairing_ecies;
@@ -45,17 +46,20 @@ pub enum DerecPairingError {
     PairingStateError,
 }
 
+#[derive(CanonicalSerialize, CanonicalDeserialize)]
 pub struct PairingContactMessageMaterial {
     pub mlkem_encapsulation_key: Vec<u8>,
     pub ecies_public_key: Vec<u8>,
 }
 
+#[derive(CanonicalSerialize, CanonicalDeserialize)]
 pub struct PairingSecretKeyMaterial {
     pub mlkem_decapsulation_key: Option<Vec<u8>>,
     pub mlkem_shared_secret: Option<[u8; 32]>,
     pub ecies_secret_key: Vec<u8>,
 }
 
+#[derive(CanonicalSerialize, CanonicalDeserialize)]
 pub struct PairingRequestMessageMaterial {
     pub mlkem_ciphertext: Vec<u8>,
     pub ecies_public_key: Vec<u8>,

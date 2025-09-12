@@ -328,6 +328,7 @@ dependencies = [
 name = "derec-library"
 version = "0.1.0"
 dependencies = [
+ "ark-serialize",
  "derec-cryptography",
  "prost",
  "prost-build",
