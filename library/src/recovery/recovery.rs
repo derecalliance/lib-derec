@@ -9,6 +9,7 @@ use crate::{protos::derec_proto::{
     Result as DerecResult,
     StatusEnum
 }, types::ChannelId};
+use crate::{Error, Result};
 
 /// Generates a `GetShareRequestMessage` for requesting a secret share.
 ///
@@ -86,18 +87,16 @@ pub fn recover_from_share_responses(
     responses: &[GetShareResponseMessage],
     secret_id: impl AsRef<[u8]>,
     version: i32,
-) -> Result<Vec<u8>, &'static str> {
+) -> Result<Vec<u8>> {
     let mut shares = Vec::new();
     for res in responses {
-        match extract_share_from_response(res, &secret_id.as_ref().to_vec(), version) {
-            Ok(share) => shares.push(share),
-            Err(e) => return Err(e),
-        }
+        let share = extract_share_from_response(res, &secret_id.as_ref().to_vec(), version)?;
+        shares.push(share);
     }
 
     // Assuming we have a function to reconstruct the secret from shares
     let reconstructed_secret = recover(&shares)
-        .map_err(|_| "Failed to reconstruct secret from shares")?;
+        .map_err(|err| Error::Recovery(format!("Failed to reconstruct secret from shares: {err}")))?;
 
     Ok(reconstructed_secret)
 }
@@ -106,28 +105,28 @@ fn extract_share_from_response(
     response: &GetShareResponseMessage,
     secret_id: impl AsRef<[u8]>,
     version: i32
-) -> Result<VSSShare, &'static str> {
-    if response.result.is_none() {
-        return Err("Response does not contain a result");
-    }
+) -> Result<VSSShare> {
+    let result = response
+        .result
+        .as_ref()
+        .ok_or(Error::MissingField("result"))?;
 
-    let result = response.result.as_ref().unwrap();
     if result.status != StatusEnum::Ok as i32 {
-        return Err("Share response indicates an error");
+        return Err(Error::Recovery("Share response indicates an error".to_string()));
     }
 
     let committed_derec_share = CommittedDeRecShare::decode(response.committed_de_rec_share.as_slice())
-        .map_err(|_| "Failed to decode CommittedDeRecShare")?;
+        .map_err(|err| Error::Decode(format!("Failed to decode CommittedDeRecShare: {err}")))?;
 
     let derec_share = DeRecShare::decode(committed_derec_share.de_rec_share.as_slice())
-        .map_err(|_| "Failed to decode DeRecShare")?;
+        .map_err(|err| Error::Decode(format!("Failed to decode DeRecShare: {err}")))?;
 
     if derec_share.secret_id != secret_id.as_ref() {
-        return Err("Secret ID in response does not match the requested secret ID");
+        return Err(Error::Recovery("Secret ID in response does not match the requested secret ID".to_string()));
     }
 
     if derec_share.version != version {
-        return Err("Share version in response does not match the requested version");
+        return Err(Error::Recovery("Share version in response does not match the requested version".to_string()));
     }
 
     let share = VSSShare {

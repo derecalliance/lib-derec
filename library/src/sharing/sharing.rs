@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use derec_cryptography::vss;
 use crate::protos::derec_proto::{StoreShareRequestMessage, DeRecShare, CommittedDeRecShare, committed_de_rec_share::SiblingHash};
 use crate::types::*;
+use crate::{Error, Result};
 
 /// Protects a secret by splitting it into verifiable secret shares and preparing messages for distribution.
 ///
@@ -49,7 +50,7 @@ pub fn protect_secret(
     version: i32,
     keep_list: Option<&[i32]>,
     description: Option<&str>,
-) -> Result<HashMap<ChannelId, StoreShareRequestMessage>, &'static str> {
+) -> Result<HashMap<ChannelId, StoreShareRequestMessage>> {
     // our secret sharing scheme requires some entropy
     let mut rng = rand::rngs::OsRng;
     let mut entropy: [u8; 32] = [0; 32];
@@ -57,7 +58,7 @@ pub fn protect_secret(
 
     let (t, n) = (threshold as u64, channels.as_ref().len() as u64);
     let vss_shares = vss::share((t,n), secret_data.as_ref(), &entropy)
-        .map_err(|_| "VSS failed to generate shares")?;
+        .map_err(|err| Error::Vss(format!("Failed to generate shares: {err}")))?;
 
     // let's iterate over all shares and prepare DeRec protocol messages
     let mut output = HashMap::new();
