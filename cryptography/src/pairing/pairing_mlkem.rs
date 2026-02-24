@@ -2,25 +2,25 @@
 
 use kem::{Decapsulate, Encapsulate};
 use ml_kem::array::ArrayN;
-use ml_kem::{kem, EncodedSizeUser, KemCore, MlKem768, MlKem768Params};
+use ml_kem::{kem, EncodedSizeUser, KemCore, MlKem1024, MlKem1024Params};
 use rand_core::CryptoRngCore;
 
 use super::DerecPairingError;
 
-type MlKem768DecapsulationKey = kem::DecapsulationKey<MlKem768Params>;
-type MlKem768EncapsulationKey = kem::EncapsulationKey<MlKem768Params>;
+type MlKem1024DecapsulationKey = kem::DecapsulationKey<MlKem1024Params>;
+type MlKem1024EncapsulationKey = kem::EncapsulationKey<MlKem1024Params>;
 
 /// Size in bytes of the `EncapsulationKey`.
-pub const ENCAPSULATION_KEY_SIZE: usize = 1184;
+pub const ENCAPSULATION_KEY_SIZE: usize = 1568;
 /// Size in bytes of the `DecapsulationKey`.
-pub const DECAPSULATION_KEY_SIZE: usize = 2400;
+pub const DECAPSULATION_KEY_SIZE: usize = 3168;
 /// Size in bytes of the `Ciphertext`.
-pub const CIPHERTEXT_SIZE: usize = 1088;
+pub const CIPHERTEXT_SIZE: usize = 1568;
 
 /// Shared secret key.
 pub type SharedSecret = [u8; 32];
 
-/// Generates a new ML-KEM-768 key pair for encapsulation and decapsulation.
+/// Generates a new ML-KEM-1024 key pair for encapsulation and decapsulation.
 ///
 /// # Arguments
 ///
@@ -34,13 +34,13 @@ pub type SharedSecret = [u8; 32];
 ///
 pub fn generate_encapsulation_key<R: CryptoRngCore>(rng: &mut R) -> (Vec<u8>, Vec<u8>) {
     // Generate a (decapsulation key, encapsulation key) pair
-    let (dk, ek) = MlKem768::generate(rng);
+    let (dk, ek) = MlKem1024::generate(rng);
     let ek_bytes = ek.as_bytes();
     let dk_bytes = dk.as_bytes();
     (dk_bytes.to_vec(), ek_bytes.to_vec())
 }
 
-/// Performs ML-KEM-768 key encapsulation using the provided encapsulation key.
+/// Performs ML-KEM-1024 key encapsulation using the provided encapsulation key.
 ///
 /// This function takes an encoded encapsulation key and a cryptographically secure random number generator,
 /// and produces a ciphertext along with a shared secret. The ciphertext can be sent to the holder of the
@@ -61,7 +61,7 @@ pub fn encapsulate<R: CryptoRngCore>(
     ek_encoded: impl AsRef<[u8]>,
     rng: &mut R
 ) -> Result<(Vec<u8>, SharedSecret), DerecPairingError> {
-    let ek = MlKem768EncapsulationKey::from_bytes(
+    let ek = MlKem1024EncapsulationKey::from_bytes(
         &as_array::<ENCAPSULATION_KEY_SIZE>(ek_encoded)
             .unwrap()
             .into()
@@ -74,7 +74,7 @@ pub fn encapsulate<R: CryptoRngCore>(
     Ok((ct.0.to_vec(), k_send.0))
 }
 
-/// Performs ML-KEM-768 key decapsulation using the provided decapsulation key and ciphertext.
+/// Performs ML-KEM-1024 key decapsulation using the provided decapsulation key and ciphertext.
 ///
 /// This function takes an encoded decapsulation key and a ciphertext, and recovers the shared secret
 /// that was established during encapsulation. The ciphertext must have been generated using the
@@ -93,7 +93,7 @@ pub fn decapsulate(
     dk_encoded: impl AsRef<[u8]>,
     ctxt: impl AsRef<[u8]>
 ) -> Result<SharedSecret, DerecPairingError> {
-    let dk = MlKem768DecapsulationKey::from_bytes(
+    let dk = MlKem1024DecapsulationKey::from_bytes(
         &as_array::<DECAPSULATION_KEY_SIZE>(dk_encoded).unwrap().into()
     );
 
