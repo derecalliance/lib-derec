@@ -1,14 +1,12 @@
-use prost::Message;
+use crate::{
+    protos::derec_proto::{
+        CommittedDeRecShare, DeRecShare, GetShareRequestMessage, GetShareResponseMessage,
+        Result as DerecResult, StatusEnum, StoreShareRequestMessage,
+    },
+    types::ChannelId,
+};
 use derec_cryptography::vss::*;
-use crate::{protos::derec_proto::{
-    CommittedDeRecShare,
-    DeRecShare,
-    StoreShareRequestMessage,
-    GetShareRequestMessage,
-    GetShareResponseMessage,
-    Result as DerecResult,
-    StatusEnum
-}, types::ChannelId};
+use prost::Message;
 
 /// Generates a `GetShareRequestMessage` for requesting a secret share.
 ///
@@ -55,7 +53,10 @@ pub fn generate_share_response(
     GetShareResponseMessage {
         share_algorithm: 0,
         committed_de_rec_share: share_content.share.to_vec(),
-        result: Some(DerecResult { status: StatusEnum::Ok as i32, memo: String::new() }),
+        result: Some(DerecResult {
+            status: StatusEnum::Ok as i32,
+            memo: String::new(),
+        }),
     }
 }
 
@@ -89,15 +90,15 @@ pub fn recover_from_share_responses(
 ) -> Result<Vec<u8>, &'static str> {
     let mut shares = Vec::new();
     for res in responses {
-        match extract_share_from_response(res, &secret_id.as_ref().to_vec(), version) {
+        match extract_share_from_response(res, secret_id.as_ref(), version) {
             Ok(share) => shares.push(share),
             Err(e) => return Err(e),
         }
     }
 
     // Assuming we have a function to reconstruct the secret from shares
-    let reconstructed_secret = recover(&shares)
-        .map_err(|_| "Failed to reconstruct secret from shares")?;
+    let reconstructed_secret =
+        recover(&shares).map_err(|_| "Failed to reconstruct secret from shares")?;
 
     Ok(reconstructed_secret)
 }
@@ -105,7 +106,7 @@ pub fn recover_from_share_responses(
 fn extract_share_from_response(
     response: &GetShareResponseMessage,
     secret_id: impl AsRef<[u8]>,
-    version: i32
+    version: i32,
 ) -> Result<VSSShare, &'static str> {
     if response.result.is_none() {
         return Err("Response does not contain a result");
@@ -116,8 +117,9 @@ fn extract_share_from_response(
         return Err("Share response indicates an error");
     }
 
-    let committed_derec_share = CommittedDeRecShare::decode(response.committed_de_rec_share.as_slice())
-        .map_err(|_| "Failed to decode CommittedDeRecShare")?;
+    let committed_derec_share =
+        CommittedDeRecShare::decode(response.committed_de_rec_share.as_slice())
+            .map_err(|_| "Failed to decode CommittedDeRecShare")?;
 
     let derec_share = DeRecShare::decode(committed_derec_share.de_rec_share.as_slice())
         .map_err(|_| "Failed to decode DeRecShare")?;
@@ -135,7 +137,11 @@ fn extract_share_from_response(
         y: derec_share.y,
         encrypted_secret: derec_share.encrypted_secret,
         commitment: committed_derec_share.commitment,
-        merkle_path: committed_derec_share.merkle_path.iter().map(|h| (h.is_left, h.hash.to_owned())).collect(),
+        merkle_path: committed_derec_share
+            .merkle_path
+            .iter()
+            .map(|h| (h.is_left, h.hash.to_owned()))
+            .collect(),
     };
 
     Ok(share)
@@ -157,27 +163,29 @@ mod tests {
         let version: i32 = 2;
 
         // Use the actual protect_secret API from sharing module
-        let shares = sharing::protect_secret(secret_id, secret, &channels, threshold, version, None, None)
-            .expect("protect_secret should succeed");
+        let shares =
+            sharing::protect_secret(secret_id, secret, &channels, threshold, version, None, None)
+                .expect("protect_secret should succeed");
 
         // Simulate generating share requests and responses for each share
         let mut responses = Vec::new();
         for (i, share) in shares.iter().enumerate() {
             // Generate a share response
             let response = super::generate_share_response(
-            &share.0,
-            &secret_id,
-            &super::generate_share_request(&channels[i], &secret_id.to_vec(), version),
-            share.1,
+                share.0,
+                secret_id,
+                &super::generate_share_request(&channels[i], secret_id, version),
+                share.1,
             );
 
             responses.push(response);
         }
 
         // Attempt to recover the secret from the responses
-        let recovered = super::recover_from_share_responses(&responses, &secret_id.to_vec(), version)
+        let recovered = super::recover_from_share_responses(&responses, secret_id, version)
             .expect("recovery should succeed");
 
         assert_eq!(recovered, secret);
     }
 }
+

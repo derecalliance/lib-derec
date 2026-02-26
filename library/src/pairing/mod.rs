@@ -1,15 +1,16 @@
+#![allow(clippy::module_inception)]
 pub mod pairing;
 
 pub use pairing::create_contact_message;
+pub use pairing::process_pairing_response_message;
 pub use pairing::produce_pairing_request_message;
 pub use pairing::produce_pairing_response_message;
-pub use pairing::process_pairing_response_message;
 
-use ark_serialize::{CanonicalSerialize, CanonicalDeserialize};
-use prost::Message;
 use crate::protos::derec_proto::SenderKind;
 use crate::protos::derec_proto::{ContactMessage, PairRequestMessage, PairResponseMessage};
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
+use prost::Message;
 
 use wasm_bindgen::prelude::*;
 
@@ -37,14 +38,8 @@ struct TsProcessPairingResponseMessage {
 }
 
 #[wasm_bindgen]
-pub fn ts_create_contact_message(
-    channel_id: u64,
-    transport_uri: &str
-) -> JsValue {
-    let lib_result = pairing::create_contact_message(
-        channel_id,
-        &transport_uri.to_string()
-    );
+pub fn ts_create_contact_message(channel_id: u64, transport_uri: &str) -> JsValue {
+    let lib_result = pairing::create_contact_message(channel_id, transport_uri);
 
     let wrapper = TsCreateContactMessageResult {
         contact_message: lib_result.0.encode_to_vec(),
@@ -52,7 +47,7 @@ pub fn ts_create_contact_message(
             let mut buf = Vec::new();
             lib_result.1.serialize_uncompressed(&mut buf).unwrap();
             buf
-        }
+        },
     };
     serde_wasm_bindgen::to_value(&wrapper).unwrap()
 }
@@ -61,7 +56,7 @@ pub fn ts_create_contact_message(
 pub fn ts_produce_pairing_request_message(
     channel_id: u64,
     kind: u32,
-    contact_message: &[u8]
+    contact_message: &[u8],
 ) -> JsValue {
     let contact_msg = ContactMessage::decode(contact_message).unwrap();
     let lib_result = pairing::produce_pairing_request_message(
@@ -72,7 +67,7 @@ pub fn ts_produce_pairing_request_message(
             2 => SenderKind::Helper,
             _ => panic!("Invalid sender kind"),
         },
-        &contact_msg
+        &contact_msg,
     );
 
     let wrapper = TsProducePairingRequestMessage {
@@ -81,7 +76,7 @@ pub fn ts_produce_pairing_request_message(
             let mut buf = Vec::new();
             lib_result.1.serialize_uncompressed(&mut buf).unwrap();
             buf
-        }
+        },
     };
 
     serde_wasm_bindgen::to_value(&wrapper).unwrap()
@@ -91,12 +86,12 @@ pub fn ts_produce_pairing_request_message(
 pub fn ts_produce_pairing_response_message(
     kind: u32,
     pair_request_message: &[u8],
-    pairing_secret_key_material: &[u8]
+    pairing_secret_key_material: &[u8],
 ) -> JsValue {
     let pair_request_msg = PairRequestMessage::decode(pair_request_message).unwrap();
-    let pairing_sk = PairingSecretKeyMaterial::deserialize_uncompressed(
-        &mut &pairing_secret_key_material[..]
-    ).unwrap();
+    let pairing_sk =
+        PairingSecretKeyMaterial::deserialize_uncompressed(&mut &pairing_secret_key_material[..])
+            .unwrap();
 
     let lib_result = pairing::produce_pairing_response_message(
         match kind {
@@ -106,7 +101,7 @@ pub fn ts_produce_pairing_response_message(
             _ => panic!("Invalid sender kind"),
         },
         &pair_request_msg,
-        &pairing_sk
+        &pairing_sk,
     );
 
     let wrapper = TsProducePairingResponseMessage {
@@ -121,19 +116,16 @@ pub fn ts_produce_pairing_response_message(
 pub fn ts_process_pairing_response_message(
     contact_message: &[u8],
     pair_response_message: &[u8],
-    pairing_secret_key_material: &[u8]
+    pairing_secret_key_material: &[u8],
 ) -> JsValue {
     let contact_msg = ContactMessage::decode(contact_message).unwrap();
     let pair_response_msg = PairResponseMessage::decode(pair_response_message).unwrap();
-    let pairing_sk = PairingSecretKeyMaterial::deserialize_uncompressed(
-        &mut &pairing_secret_key_material[..]
-    ).unwrap();
+    let pairing_sk =
+        PairingSecretKeyMaterial::deserialize_uncompressed(&mut &pairing_secret_key_material[..])
+            .unwrap();
 
-    let lib_result = pairing::process_pairing_response_message(
-        &contact_msg,
-        &pair_response_msg,
-        &pairing_sk
-    );
+    let lib_result =
+        pairing::process_pairing_response_message(&contact_msg, &pair_response_msg, &pairing_sk);
 
     let wrapper = TsProcessPairingResponseMessage {
         pairing_shared_key: lib_result.to_vec(),
@@ -144,3 +136,4 @@ pub fn ts_process_pairing_response_message(
 
 #[cfg(test)]
 mod test;
+

@@ -1,9 +1,10 @@
+#![allow(clippy::module_inception)]
 pub mod sharing;
 use prost::Message;
 pub use sharing::protect_secret;
 
-use wasm_bindgen::prelude::*;
 use std::collections::HashMap;
+use wasm_bindgen::prelude::*;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct TsProtectSecretResult {
@@ -18,7 +19,6 @@ pub fn ts_protect_secret(
     threshold: u32,
     version: u32,
 ) -> JsValue {
-
     let sharing = sharing::protect_secret(
         secret_id,
         secret_data,
@@ -27,11 +27,18 @@ pub fn ts_protect_secret(
         version as i32,
         None,
         None,
-    ).unwrap();
+    )
+    .unwrap();
 
-    let wrapper = TsProtectSecretResult { value: sharing.into_iter().map(|(k, v)| (k, v.encode_to_vec())).collect() };
+    let wrapper = TsProtectSecretResult {
+        value: sharing
+            .into_iter()
+            .map(|(k, v)| (k, v.encode_to_vec()))
+            .collect(),
+    };
     serde_wasm_bindgen::to_value(&wrapper).unwrap()
 }
 
 #[cfg(test)]
 mod test;
+
