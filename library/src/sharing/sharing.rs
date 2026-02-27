@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::protos::derec_proto::{
     CommittedDeRecShare, DeRecShare, StoreShareRequestMessage, committed_de_rec_share::SiblingHash,
 };
@@ -98,4 +100,3 @@ pub fn protect_secret(
 
     Ok(output)
 }
-

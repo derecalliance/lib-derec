@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 #![allow(clippy::module_inception)]
 pub mod pairing;
 
@@ -5,6 +6,16 @@ pub use pairing::create_contact_message;
 pub use pairing::process_pairing_response_message;
 pub use pairing::produce_pairing_request_message;
 pub use pairing::produce_pairing_response_message;
+=======
+// SPDX-License-Identifier: Apache-2.0
+
+#![allow(clippy::module_inception)]
+mod error;
+pub use error::PairingError;
+
+mod pairing;
+pub use pairing::*;
+>>>>>>> main
 
 use crate::protos::derec_proto::SenderKind;
 use crate::protos::derec_proto::{ContactMessage, PairRequestMessage, PairResponseMessage};

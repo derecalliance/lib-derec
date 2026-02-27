@@ -19,5 +19,5 @@ ark-poly = "0.5.0"
 ark-serialize = { version = "0.5.0", default-features = true }
 ark-bw6-761 = "0.5.0"
 ark-secp256k1 = "0.5.0"
-thiserror = "1.0.69"
+thiserror = "2.0.18"
 ml-kem = "0.2.1"

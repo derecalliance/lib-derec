@@ -1,8 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
+
 #![allow(clippy::module_inception)]
-pub mod verification;
-pub use verification::generate_verification_request;
-pub use verification::generate_verification_response;
-pub use verification::verify_share_response;
+mod error;
+pub use error::VerificationError;
+
+mod verification;
+pub use verification::*;
 
 use crate::protos::derec_proto::{VerifyShareRequestMessage, VerifyShareResponseMessage};
 use prost::Message;
@@ -39,4 +42,3 @@ pub fn ts_verify_share_response(
 
 #[cfg(test)]
 mod test;
-

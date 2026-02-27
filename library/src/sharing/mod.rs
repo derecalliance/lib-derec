@@ -1,8 +1,13 @@
-#![allow(clippy::module_inception)]
-pub mod sharing;
-use prost::Message;
-pub use sharing::protect_secret;
+// SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::module_inception)]
+mod error;
+pub use error::SharingError;
+
+mod sharing;
+pub use sharing::*;
+
+use prost::Message;
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 
@@ -41,4 +46,3 @@ pub fn ts_protect_secret(
 
 #[cfg(test)]
 mod test;
-
