@@ -1,18 +1,19 @@
-pub mod verification;
-pub use verification::generate_verification_request;
-pub use verification::generate_verification_response;
-pub use verification::verify_share_response;
+// SPDX-License-Identifier: Apache-2.0
 
-use prost::Message;
+#![allow(clippy::module_inception)]
+mod error;
+pub use error::VerificationError;
+
+mod verification;
+pub use verification::*;
+
 use crate::protos::derec_proto::{VerifyShareRequestMessage, VerifyShareResponseMessage};
+use prost::Message;
 
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
-pub fn ts_generate_verification_request(
-    secret_id: &[u8],
-    version: u32,
-) -> Vec<u8> {
+pub fn ts_generate_verification_request(secret_id: &[u8], version: u32) -> Vec<u8> {
     verification::generate_verification_request(secret_id, version as i32).encode_to_vec()
 }
 
@@ -24,7 +25,8 @@ pub fn ts_generate_verification_response(
     request: &[u8],
 ) -> Vec<u8> {
     let request = VerifyShareRequestMessage::decode(request).unwrap();
-    verification::generate_verification_response(secret_id, &channel_id, share_content, &request).encode_to_vec()
+    verification::generate_verification_response(secret_id, &channel_id, share_content, &request)
+        .encode_to_vec()
 }
 
 #[wasm_bindgen]

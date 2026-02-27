@@ -2,7 +2,7 @@
 
 use kem::{Decapsulate, Encapsulate};
 use ml_kem::array::ArrayN;
-use ml_kem::{kem, EncodedSizeUser, KemCore, MlKem1024, MlKem1024Params};
+use ml_kem::{EncodedSizeUser, KemCore, MlKem1024, MlKem1024Params, kem};
 use rand_core::CryptoRngCore;
 
 use super::DerecPairingError;
@@ -59,12 +59,12 @@ pub fn generate_encapsulation_key<R: CryptoRngCore>(rng: &mut R) -> (Vec<u8>, Ve
 ///
 pub fn encapsulate<R: CryptoRngCore>(
     ek_encoded: impl AsRef<[u8]>,
-    rng: &mut R
+    rng: &mut R,
 ) -> Result<(Vec<u8>, SharedSecret), DerecPairingError> {
     let ek = MlKem1024EncapsulationKey::from_bytes(
         &as_array::<ENCAPSULATION_KEY_SIZE>(ek_encoded)
             .unwrap()
-            .into()
+            .into(),
     );
 
     let (ct, k_send) = ek
@@ -91,10 +91,12 @@ pub fn encapsulate<R: CryptoRngCore>(
 ///
 pub fn decapsulate(
     dk_encoded: impl AsRef<[u8]>,
-    ctxt: impl AsRef<[u8]>
+    ctxt: impl AsRef<[u8]>,
 ) -> Result<SharedSecret, DerecPairingError> {
     let dk = MlKem1024DecapsulationKey::from_bytes(
-        &as_array::<DECAPSULATION_KEY_SIZE>(dk_encoded).unwrap().into()
+        &as_array::<DECAPSULATION_KEY_SIZE>(dk_encoded)
+            .unwrap()
+            .into(),
     );
 
     let k_recv = dk
@@ -106,7 +108,7 @@ pub fn decapsulate(
 
 fn as_array<const N: usize>(input: impl AsRef<[u8]>) -> Option<[u8; N]> {
     if input.as_ref().len() != N {
-        return None;
+        None
     } else {
         let mut array = [0u8; N];
         array.copy_from_slice(input.as_ref());

@@ -5,8 +5,8 @@
 
 use ark_ec::*;
 use ark_ff::*;
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use rand::Rng;
-use ark_serialize::{CanonicalSerialize, CanonicalDeserialize};
 use sha2::*;
 
 use super::DerecPairingError;
@@ -26,14 +26,12 @@ pub fn generate_key<R: Rng>(rng: &mut R) -> Result<(Vec<u8>, Vec<u8>), DerecPair
     let pk = ark_secp256k1::Affine::generator() * sk;
 
     let mut sk_bytes = Vec::new();
-    sk
-        .serialize_uncompressed(&mut sk_bytes)
-        .map_err(|err| DerecPairingError::SerializationError(err))?;
+    sk.serialize_uncompressed(&mut sk_bytes)
+        .map_err(DerecPairingError::SerializationError)?;
 
     let mut pk_bytes = Vec::new();
-    pk
-        .serialize_uncompressed(&mut pk_bytes)
-        .map_err(|err| DerecPairingError::SerializationError(err))?;
+    pk.serialize_uncompressed(&mut pk_bytes)
+        .map_err(DerecPairingError::SerializationError)?;
 
     Ok((sk_bytes, pk_bytes))
 }
@@ -55,16 +53,16 @@ pub fn generate_key<R: Rng>(rng: &mut R) -> Result<(Vec<u8>, Vec<u8>), DerecPair
 ///
 pub fn derive_shared_key(sk: &[u8], pk: &[u8]) -> Result<[u8; 32], DerecPairingError> {
     let sk = ark_secp256k1::Fr::deserialize_uncompressed(sk)
-        .map_err(|err| DerecPairingError::SerializationError(err))?;
+        .map_err(DerecPairingError::SerializationError)?;
     let pk = ark_secp256k1::Affine::deserialize_uncompressed(pk)
-        .map_err(|err| DerecPairingError::SerializationError(err))?;
+        .map_err(DerecPairingError::SerializationError)?;
 
     let shared_key = pk * sk;
 
     let mut shared_key_bytes = Vec::new();
     shared_key
         .serialize_uncompressed(&mut shared_key_bytes)
-        .map_err(|err| DerecPairingError::SerializationError(err))?;
+        .map_err(DerecPairingError::SerializationError)?;
 
     let mut hasher = sha2::Sha256::new();
     hasher.update(shared_key_bytes);

@@ -1,9 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::protos::derec_proto::{
+    CommittedDeRecShare, DeRecShare, StoreShareRequestMessage, committed_de_rec_share::SiblingHash,
+};
+use crate::types::*;
+use derec_cryptography::vss;
 use prost::Message;
 use rand::RngCore;
 use std::collections::HashMap;
-use derec_cryptography::vss;
-use crate::protos::derec_proto::{StoreShareRequestMessage, DeRecShare, CommittedDeRecShare, committed_de_rec_share::SiblingHash};
-use crate::types::*;
 
 /// Protects a secret by splitting it into verifiable secret shares and preparing messages for distribution.
 ///
@@ -56,7 +60,7 @@ pub fn protect_secret(
     rng.fill_bytes(&mut entropy);
 
     let (t, n) = (threshold as u64, channels.as_ref().len() as u64);
-    let vss_shares = vss::share((t,n), secret_data.as_ref(), &entropy)
+    let vss_shares = vss::share((t, n), secret_data.as_ref(), &entropy)
         .map_err(|_| "VSS failed to generate shares")?;
 
     // let's iterate over all shares and prepare DeRec protocol messages
@@ -67,22 +71,26 @@ pub fn protect_secret(
             x: share.x.to_owned(),
             y: share.y.to_owned(),
             secret_id: secret_id.as_ref().to_vec(),
-            version: version,
+            version,
         };
 
         let committed_derec_share = CommittedDeRecShare {
             de_rec_share: derec_share.encode_to_vec(),
             commitment: share.commitment.to_owned(),
-            merkle_path: share.merkle_path
+            merkle_path: share
+                .merkle_path
                 .iter()
-                .map(|(b,h)| SiblingHash { is_left: *b, hash: h.to_owned() } )
+                .map(|(b, h)| SiblingHash {
+                    is_left: *b,
+                    hash: h.to_owned(),
+                })
                 .collect(),
         };
 
         let outbound_msg = StoreShareRequestMessage {
             share: committed_derec_share.encode_to_vec(),
             share_algorithm: 0,
-            version: version,
+            version,
             keep_list: keep_list.map(|lst| lst.to_vec()).unwrap_or_default(),
             version_description: description.map(|d| d.to_string()).unwrap_or_default(),
         };

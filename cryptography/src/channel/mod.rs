@@ -3,14 +3,21 @@
 //! This module provides cryptographic primitives for encrypting and decrypting messages
 //! given a (shared) symmetric key using AES-256-GCM authenticated encryption.
 
-use aes_gcm::{aead::Aead, Aes256Gcm, Nonce, Key};
 use aes::cipher::KeyInit;
+use aes_gcm::{Aes256Gcm, Key, Nonce, aead::Aead};
 
 /// Custom error type for Derec channel encryption and decryption operations.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DerecChannelError {
+    #[error("encryption failed: {0:?}")]
     EncryptionError(aead::Error),
+
+    #[error("decryption failed: {0:?}")]
     DecryptionError(aead::Error),
+
+    #[error("ciphertext too short (need at least 12 bytes for nonce prefix, got {got})")]
+    CiphertextTooShort { got: usize },
 }
 
 /// Encrypts a message using AES-256-GCM authenticated encryption.
@@ -36,12 +43,16 @@ pub enum DerecChannelError {
 /// let nonce = [0u8; 32];
 /// let ciphertext = encrypt_message(msg, &key, &nonce).unwrap();
 /// ```
-pub fn encrypt_message(msg: &[u8], key: &[u8; 32], nonce: &[u8; 32]) -> Result<Vec<u8>, DerecChannelError> {
+pub fn encrypt_message(
+    msg: &[u8],
+    key: &[u8; 32],
+    nonce: &[u8; 32],
+) -> Result<Vec<u8>, DerecChannelError> {
     let key: &Key<Aes256Gcm> = key.into();
-    let cipher = Aes256Gcm::new(&key);
+    let cipher = Aes256Gcm::new(key);
 
     let e = cipher
-        .encrypt(&Nonce::from_slice(&nonce[0..12]), msg)
+        .encrypt(Nonce::from_slice(&nonce[0..12]), msg)
         .map_err(DerecChannelError::EncryptionError)?;
 
     let mut ctxt = Vec::new();
@@ -75,11 +86,15 @@ pub fn encrypt_message(msg: &[u8], key: &[u8; 32], nonce: &[u8; 32]) -> Result<V
 /// assert_eq!(plaintext, msg);
 /// ```
 pub fn decrypt_message(ctxt: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, DerecChannelError> {
+    if ctxt.len() < 12 {
+        return Err(DerecChannelError::CiphertextTooShort { got: ctxt.len() });
+    }
+
     let key: &Key<Aes256Gcm> = key.into();
-    let cipher = Aes256Gcm::new(&key);
+    let cipher = Aes256Gcm::new(key);
 
     cipher
-        .decrypt(&Nonce::from_slice(&ctxt[0..12]), &ctxt[12..])
+        .decrypt(Nonce::from_slice(&ctxt[0..12]), &ctxt[12..])
         .map_err(DerecChannelError::DecryptionError)
 }
 
@@ -89,7 +104,6 @@ mod tests {
 
     #[test]
     fn test_encrypt_decrypt() {
-
         let msg = b"hello derec";
         let key = [0u8; 32];
         let nonce = [0u8; 32];

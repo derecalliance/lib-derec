@@ -28,10 +28,10 @@
 //! Implements functions for Shamir secret sharing, as adapted
 //! from the definition in Fig 7 of https://eprint.iacr.org/2020/800.pdf
 
+use ark_ff::{BigInteger, PrimeField};
 use ark_poly::{Polynomial, univariate::DensePolynomial};
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::UniformRand;
-use ark_ff::{PrimeField, BigInteger};
-use ark_serialize::{CanonicalSerialize, CanonicalDeserialize};
 use rand::Rng;
 
 use super::*;
@@ -56,11 +56,8 @@ use ark_bw6_761::Fr as F;
 /// - The second element is the serialized y-coordinate (as a field element).
 ///
 pub fn share<R: Rng>(
-    secret: &[u8; λ], 
-    access: (u64, u64),
-    rng: &mut R
+    secret: &[u8; λ], access: (u64, u64), rng: &mut R
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
-
     // parse the desired access structure.
     // n is the number of shares, while
     // t <= n is the reconstruction threshold.
@@ -69,15 +66,12 @@ pub fn share<R: Rng>(
     // let us sample a random degree t-1 polynomial.
     // A degree t - 1 polynomial has t coefficients,
     // which we sample at random
-    let mut coeffs: Vec<F> = (0..t)
-        .map(|_| F::rand(rng))
-        .collect();
+    let mut coeffs: Vec<F> = (0..t).map(|_| F::rand(rng)).collect();
 
-    // But we don't want a completely random polynomial, 
+    // But we don't want a completely random polynomial,
     // but rather one whose evaluation at x=0 is the secret.
     // So, let us replace zero-th coefficient with our secret.
-    let secret_bigint = BigInteger::from_bits_be(
-        &bytes_to_bits_be(secret));
+    let secret_bigint = BigInteger::from_bits_be(&bytes_to_bits_be(secret));
     coeffs[0] = F::from_bigint(secret_bigint).unwrap();
 
     // we now have all the right coefficients to define the polynomial
@@ -91,19 +85,14 @@ pub fn share<R: Rng>(
     };
 
     // Shamir shares are just evaluations of our polynomial above
-    let shares = (0..n)
-        .map(|_| 
-            { 
-                let x = F::rand(rng);
-                let y = poly.evaluate(&x);
-                (encode_point(&x), encode_point(&y))
-            }
-        )
-        .collect();
-
-    shares
+    (0..n)
+        .map(|_| {
+            let x = F::rand(rng);
+            let y = poly.evaluate(&x);
+            (encode_point(&x), encode_point(&y))
+        })
+        .collect()
 }
-
 
 /// Recovers the 256-bit secret from a set of Shamir shares.
 ///
@@ -117,9 +106,7 @@ pub fn share<R: Rng>(
 ///
 /// * `[u8; λ]` - The recovered secret as a byte array of length λ.
 ///
-pub fn recover(
-    shares: Vec<(Vec<u8>, Vec<u8>)>
-) -> [u8; λ] {
+pub fn recover(shares: Vec<(Vec<u8>, Vec<u8>)>) -> [u8; λ] {
     // let us parse all Shamir shares as field elements
     let xs: Vec<F> = shares
         .iter()
@@ -139,17 +126,15 @@ pub fn recover(
     let secret = ys
         .iter()
         .zip(lagrange_coeffs.iter())
-        .fold(F::from(0), |acc, (a,b)| acc + (a * b));
-    
+        .fold(F::from(0), |acc, (a, b)| acc + (a * b));
+
     // serialize secret into big-endian representation
     let secret_bytes = secret.into_bigint().to_bytes_be();
 
     // our 256 bit key should be in the below slice
     let start = secret_bytes.len() - λ;
     secret_bytes[start..start + λ].try_into().unwrap()
-
 }
-
 
 // Naive lagrange interpolation over the input x-coordinates.
 // This method computes the lagrange coefficients, which should
@@ -170,9 +155,9 @@ fn lagrange_coefficients(xs: &[F], x: F) -> Vec<F> {
     output
 }
 
- // Encodes a byte array as bit array, in a Big endian encoding.
- // We iterate over each byte in the order of its index in the input x,
- // and for each byte we write the bits in order from LSB to MSB.
+// Encodes a byte array as bit array, in a Big endian encoding.
+// We iterate over each byte in the order of its index in the input x,
+// and for each byte we write the bits in order from LSB to MSB.
 fn bytes_to_bits_be(x: &[u8]) -> Vec<bool> {
     // convert byte array to bit array for BigInt conversion
     let mut output: Vec<bool> = Vec::new();

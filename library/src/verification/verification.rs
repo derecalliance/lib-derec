@@ -1,11 +1,10 @@
-use rand::RngCore;
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::protos::derec_proto::{
-    VerifyShareRequestMessage,
-    VerifyShareResponseMessage,
-    Result as DerecResult,
-    StatusEnum
+    Result as DerecResult, StatusEnum, VerifyShareRequestMessage, VerifyShareResponseMessage,
 };
 use crate::types::*;
+use rand::RngCore;
 use sha2::*;
 
 /// Generates a verification request for each provided channel.
@@ -82,10 +81,13 @@ pub fn generate_verification_response(
     let hash = hasher.finalize().to_vec();
 
     VerifyShareResponseMessage {
-        result: Some(DerecResult { status: StatusEnum::Ok as i32, memo: String::new() }),
+        result: Some(DerecResult {
+            status: StatusEnum::Ok as i32,
+            memo: String::new(),
+        }),
         version: request.version,
         nonce: request.nonce.clone(),
-        hash
+        hash,
     }
 }
 
@@ -119,7 +121,6 @@ pub fn generate_verification_response(
 /// let verify = verify_share_response("secret", &channel, share_content, &response);
 /// assert!(verify);
 /// ```
-
 pub fn verify_share_response(
     _secret_id: impl AsRef<[u8]>,
     _channel_id: &ChannelId,
@@ -134,6 +135,7 @@ pub fn verify_share_response(
 
     hash == response.hash
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,14 +147,23 @@ mod tests {
 
         let share_content = b"test_share_content";
         let request = generate_verification_request("secret", version);
-        let response = generate_verification_response("secret", &target_channel, share_content, &request);
+        let response =
+            generate_verification_response("secret", &target_channel, share_content, &request);
 
         assert_eq!(response.version, version);
         assert_eq!(response.nonce, request.nonce);
-        assert_eq!(response.result.as_ref().unwrap().status, StatusEnum::Ok as i32);
+        assert_eq!(
+            response.result.as_ref().unwrap().status,
+            StatusEnum::Ok as i32
+        );
 
         // Should verify successfully
-        assert!(verify_share_response("secret", &target_channel, share_content, &response));
+        assert!(verify_share_response(
+            "secret",
+            &target_channel,
+            share_content,
+            &response
+        ));
     }
 
     #[test]
@@ -164,10 +175,16 @@ mod tests {
         let wrong_share_content = b"wrong_content";
         let request = generate_verification_request("secret", version);
 
-        let response = generate_verification_response("secret", &target_channel, share_content, &request);
+        let response =
+            generate_verification_response("secret", &target_channel, share_content, &request);
 
         // Should fail verification with wrong share content
-        assert!(!verify_share_response("secret", &target_channel, wrong_share_content, &response));
+        assert!(!verify_share_response(
+            "secret",
+            &target_channel,
+            wrong_share_content,
+            &response
+        ));
     }
 
     #[test]
@@ -197,6 +214,11 @@ mod tests {
         // Tamper with the nonce
         response.nonce[0] ^= 0xAA;
 
-        assert!(!verify_share_response("secret", &41, share_content, &response));
+        assert!(!verify_share_response(
+            "secret",
+            &41,
+            share_content,
+            &response
+        ));
     }
 }
