@@ -5,7 +5,6 @@
 //! sharing algorithm, so that each share can be individually verified during reconstruction.
 
 use rand_chacha::rand_core::SeedableRng;
-use thiserror::Error;
 
 use super::channel::{decrypt_message, encrypt_message};
 
@@ -37,18 +36,24 @@ pub struct VSSShare {
 }
 
 /// Custom error type for Verifiable Secret Sharing (VSS) operations.
-#[derive(Error, Debug)]
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DerecVSSError {
     #[error("inconsistent ciphertexts")]
     InconsistentCiphertexts,
+
     #[error("inconsistent commitments")]
     InconsistentCommitments,
+
     #[error("one or more shares are corrupted")]
     CorruptShares,
+
     #[error("insufficient shares")]
     InsufficientShares,
+
     #[error("decryption failed")]
     DecryptionFailure,
+
     #[error("invalid access structure")]
     InvalidAccessStructure,
 }

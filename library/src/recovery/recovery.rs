@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::{
     protos::derec_proto::{
         CommittedDeRecShare, DeRecShare, GetShareRequestMessage, GetShareResponseMessage,
@@ -149,7 +151,7 @@ fn extract_share_from_response(
 
 #[cfg(test)]
 mod tests {
-    use crate::sharing::*;
+    use crate::sharing;
 
     #[test]
     fn test_generate_share_request() {
@@ -188,4 +190,3 @@ mod tests {
         assert_eq!(recovered, secret);
     }
 }
-

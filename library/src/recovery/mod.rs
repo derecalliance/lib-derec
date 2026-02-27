@@ -1,8 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
+
 #![allow(clippy::module_inception)]
-pub mod recovery;
-pub use recovery::generate_share_request;
-pub use recovery::generate_share_response;
-pub use recovery::recover_from_share_responses;
+mod error;
+pub use error::RecoveryError;
+
+mod recovery;
+pub use recovery::*;
 
 use crate::protos::derec_proto::{
     GetShareRequestMessage, GetShareResponseMessage, StoreShareRequestMessage,

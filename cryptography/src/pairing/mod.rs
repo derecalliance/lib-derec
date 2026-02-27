@@ -31,18 +31,26 @@
 //! - `finish_pairing_contactor`: Used by the contactor to derive the shared key.
 //!
 
-use rand_chacha::rand_core::SeedableRng;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use rand_chacha::rand_core::SeedableRng;
 
-pub mod pairing_mlkem;
 pub mod pairing_ecies;
+pub mod pairing_mlkem;
 
 /// Custom error type for Derec pairing operations.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DerecPairingError {
+    #[error("serialization error: {0:?}")]
     SerializationError(ark_serialize::SerializationError),
+
+    #[error("ml-kem encapsulation failed")]
     MLKemEncapsulationError,
+
+    #[error("ml-kem decapsulation failed")]
     MLKemDecapsulationError,
+
+    #[error("pairing state error (required secret material is missing)")]
     PairingStateError,
 }
 
@@ -78,7 +86,7 @@ pub type PairingSharedKey = [u8; 32];
 ///
 /// # Arguments
 /// * `entropy` - A cryptographically secure random seed of length `λ` (32 bytes).
-/// 
+///
 /// # Returns
 /// - `Ok((PairingContactMessageMaterial, PairingSecretKeyMaterial))` on success, containing:
 ///     - The public contact message material to send to the responder.
@@ -94,11 +102,13 @@ pub type PairingSharedKey = [u8; 32];
 /// let (contact_msg, secret_keys) = contact_message([0u8; 32]).unwrap();
 /// // Send `contact_msg` to the responder, keep `secret_keys` for later.
 /// ```
-pub fn contact_message(entropy: [u8; 32]) -> Result<(PairingContactMessageMaterial, PairingSecretKeyMaterial), DerecPairingError> {
+pub fn contact_message(
+    entropy: [u8; 32],
+) -> Result<(PairingContactMessageMaterial, PairingSecretKeyMaterial), DerecPairingError> {
     let mut csprng = rand_chacha::ChaCha8Rng::from_seed(entropy);
     let (dk, ek) = pairing_mlkem::generate_encapsulation_key(&mut csprng);
     let (sk, pk) = pairing_ecies::generate_key(&mut csprng)?;
-    
+
     Ok((
         PairingContactMessageMaterial {
             mlkem_encapsulation_key: ek,
@@ -108,7 +118,7 @@ pub fn contact_message(entropy: [u8; 32]) -> Result<(PairingContactMessageMateri
             mlkem_decapsulation_key: Some(dk),
             mlkem_shared_secret: None,
             ecies_secret_key: sk,
-        }
+        },
     ))
 }
 
@@ -143,11 +153,12 @@ pub fn contact_message(entropy: [u8; 32]) -> Result<(PairingContactMessageMateri
 /// ```
 pub fn pairing_request_message(
     entropy: [u8; 32],
-    received: &PairingContactMessageMaterial
+    received: &PairingContactMessageMaterial,
 ) -> Result<(PairingRequestMessageMaterial, PairingSecretKeyMaterial), DerecPairingError> {
     let mut csprng = rand_chacha::ChaCha8Rng::from_seed(entropy);
 
-    let (ct, shared_key) = pairing_mlkem::encapsulate(&received.mlkem_encapsulation_key, &mut csprng)?;
+    let (ct, shared_key) =
+        pairing_mlkem::encapsulate(&received.mlkem_encapsulation_key, &mut csprng)?;
     let (sk, pk) = pairing_ecies::generate_key(&mut csprng)?;
 
     Ok((
@@ -190,13 +201,18 @@ pub fn pairing_request_message(
 /// ```
 pub fn finish_pairing_requestor(
     secrets: &PairingSecretKeyMaterial,
-    received: &PairingContactMessageMaterial
+    received: &PairingContactMessageMaterial,
 ) -> Result<PairingSharedKey, DerecPairingError> {
-    let mlkem_shared_key = secrets.mlkem_shared_secret.ok_or(DerecPairingError::PairingStateError)?;
-    let ecies_shared_key = pairing_ecies::derive_shared_key(&secrets.ecies_secret_key, &received.ecies_public_key)?;
+    let mlkem_shared_key = secrets
+        .mlkem_shared_secret
+        .ok_or(DerecPairingError::PairingStateError)?;
+    let ecies_shared_key =
+        pairing_ecies::derive_shared_key(&secrets.ecies_secret_key, &received.ecies_public_key)?;
 
     // xor and return
-    Ok(std::array::from_fn(|i| mlkem_shared_key[i] ^ ecies_shared_key[i]))
+    Ok(std::array::from_fn(|i| {
+        mlkem_shared_key[i] ^ ecies_shared_key[i]
+    }))
 }
 
 /// Completes the pairing protocol for the contactor (initiator) and derives the final shared 256-bit key.
@@ -229,14 +245,21 @@ pub fn finish_pairing_requestor(
 /// ```
 pub fn finish_pairing_contactor(
     secrets: &PairingSecretKeyMaterial,
-    received: &PairingRequestMessageMaterial
+    received: &PairingRequestMessageMaterial,
 ) -> Result<PairingSharedKey, DerecPairingError> {
-    let mlkem_dk = secrets.mlkem_decapsulation_key.to_owned().ok_or(DerecPairingError::PairingStateError)?;
+    let mlkem_dk = secrets
+        .mlkem_decapsulation_key
+        // TODO: Avoid cloning secret key material (future PR)
+        .to_owned()
+        .ok_or(DerecPairingError::PairingStateError)?;
     let mlkem_shared_key = pairing_mlkem::decapsulate(&mlkem_dk, &received.mlkem_ciphertext)?;
-    let ecies_shared_key = pairing_ecies::derive_shared_key(&secrets.ecies_secret_key, &received.ecies_public_key)?;
+    let ecies_shared_key =
+        pairing_ecies::derive_shared_key(&secrets.ecies_secret_key, &received.ecies_public_key)?;
 
     // xor and return
-    Ok(std::array::from_fn(|i| mlkem_shared_key[i] ^ ecies_shared_key[i]))
+    Ok(std::array::from_fn(|i| {
+        mlkem_shared_key[i] ^ ecies_shared_key[i]
+    }))
 }
 
 #[cfg(test)]
@@ -247,7 +270,8 @@ mod tests {
     fn test_pairing() {
         // generated by Bob
         let (bob_contact, bob_secrets) = contact_message([0u8; 32]).unwrap();
-        let (alice_request, alice_secrets) = pairing_request_message([0u8; 32], &bob_contact).unwrap();
+        let (alice_request, alice_secrets) =
+            pairing_request_message([0u8; 32], &bob_contact).unwrap();
 
         let alice_shared_key = finish_pairing_requestor(&alice_secrets, &bob_contact).unwrap();
         let bob_shared_key = finish_pairing_contactor(&bob_secrets, &alice_request).unwrap();

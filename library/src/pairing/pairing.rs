@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::protos::derec_proto;
 use derec_cryptography::pairing;
 use rand::RngCore;
