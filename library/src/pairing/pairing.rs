@@ -1,19 +1,20 @@
 use rand::RngCore;
 use derec_cryptography::pairing;
 use crate::protos::derec_proto;
+use crate::{Error, Result};
 
 
 pub fn create_contact_message(
     channel_id: u64,
     transport_uri: &String
-) -> (derec_proto::ContactMessage, pairing::PairingSecretKeyMaterial) {
+) -> Result<(derec_proto::ContactMessage, pairing::PairingSecretKeyMaterial)> {
     let mut rng = rand::rngs::OsRng;
 
     // generate the public key material
     let mut seed = [0u8; 32];
     rng.fill_bytes(&mut seed);
     let (pk, sk) = pairing::contact_message(seed)
-        .expect("Failed to generate contact message");
+        .map_err(|err| Error::Crypto(format!("Failed to generate contact message: {err:?}")))?;
 
     let contact_msg = derec_proto::ContactMessage {
         public_key_id: channel_id,
@@ -24,14 +25,14 @@ pub fn create_contact_message(
         message_encoding_type: 0,
     };
 
-    (contact_msg, sk)
+    Ok((contact_msg, sk))
 }
 
 pub fn produce_pairing_request_message(
     channel_id: u64,
     kind: derec_proto::SenderKind,
     contact_message: &derec_proto::ContactMessage
-) -> (derec_proto::PairRequestMessage, pairing::PairingSecretKeyMaterial) {
+) -> Result<(derec_proto::PairRequestMessage, pairing::PairingSecretKeyMaterial)> {
     // extract the PairingContactMessageMaterial from the contact message
     let pk = pairing::PairingContactMessageMaterial {
         mlkem_encapsulation_key: contact_message.mlkem_encapsulation_key.clone(),
@@ -44,7 +45,7 @@ pub fn produce_pairing_request_message(
     let mut seed = [0u8; 32];
     rng.fill_bytes(&mut seed);
     let (pk, sk) = pairing::pairing_request_message(seed, &pk)
-        .expect("Failed to generate pairing request message");
+        .map_err(|err| Error::Crypto(format!("Failed to generate pairing request message: {err:?}")))?;
 
     let request_msg = derec_proto::PairRequestMessage {
         sender_kind: kind.into(),
@@ -56,14 +57,14 @@ pub fn produce_pairing_request_message(
         parameter_range: None,
     };
 
-    (request_msg, sk)
+    Ok((request_msg, sk))
 }
 
 pub fn produce_pairing_response_message(
     kind: derec_proto::SenderKind,
     pair_request_message: &derec_proto::PairRequestMessage,
     pairing_secret_key_material: &pairing::PairingSecretKeyMaterial
-) -> (derec_proto::PairResponseMessage, pairing::PairingSharedKey) {
+) -> Result<(derec_proto::PairResponseMessage, pairing::PairingSharedKey)> {
     // extract the PairingContactMessageMaterial from the contact message
     let pairing_request = pairing::PairingRequestMessageMaterial {
         mlkem_ciphertext: pair_request_message.mlkem_ciphertext.clone(),
@@ -82,16 +83,16 @@ pub fn produce_pairing_response_message(
     let sk = pairing::finish_pairing_contactor(
         &pairing_secret_key_material,
         &pairing_request
-    ).expect("Failed to finish pairing contactor");
+    ).map_err(|err| Error::Crypto(format!("Failed to finish pairing contactor: {err:?}")))?;
 
-    (response_msg, sk)
+    Ok((response_msg, sk))
 }
 
 pub fn process_pairing_response_message(
     contact_message: &derec_proto::ContactMessage,
     _pair_response_message: &derec_proto::PairResponseMessage,
     pairing_secret_key_material: &pairing::PairingSecretKeyMaterial
-) -> pairing::PairingSharedKey {
+) -> Result<pairing::PairingSharedKey> {
     let pk = pairing::PairingContactMessageMaterial {
         mlkem_encapsulation_key: contact_message.mlkem_encapsulation_key.clone(),
         ecies_public_key: contact_message.ecies_public_key.clone(),
@@ -100,7 +101,7 @@ pub fn process_pairing_response_message(
     let sk = pairing::finish_pairing_requestor(
         &pairing_secret_key_material,
         &pk
-    ).expect("Failed to finish pairing helper");
+    ).map_err(|err| Error::Crypto(format!("Failed to finish pairing helper: {err:?}")))?;
 
-    sk
+    Ok(sk)
 }

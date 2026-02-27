@@ -5,12 +5,17 @@ pub use recovery::recover_from_share_responses;
 
 use prost::Message;
 use crate::protos::derec_proto::{GetShareRequestMessage, GetShareResponseMessage, StoreShareRequestMessage};
+use crate::Error;
 
 use wasm_bindgen::prelude::*;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct TsRecoverShareResponses {
     value: std::collections::HashMap<u64, Vec<u8>>,
+}
+
+fn to_js_error(err: Error) -> JsValue {
+    JsValue::from_str(&err.to_string())
 }
 
 #[wasm_bindgen]
@@ -28,10 +33,12 @@ pub fn ts_generate_share_response(
     channel_id: u64,
     share_content: &[u8],
     request: &[u8],
-) -> Vec<u8> {
-    let request = GetShareRequestMessage::decode(request).unwrap();
-    let share_content = StoreShareRequestMessage::decode(share_content).unwrap();
-    recovery::generate_share_response(&channel_id, secret_id, &request, &share_content).encode_to_vec()
+) -> Result<Vec<u8>, JsValue> {
+    let request = GetShareRequestMessage::decode(request)
+        .map_err(|err| to_js_error(Error::Decode(err.to_string())))?;
+    let share_content = StoreShareRequestMessage::decode(share_content)
+        .map_err(|err| to_js_error(Error::Decode(err.to_string())))?;
+    Ok(recovery::generate_share_response(&channel_id, secret_id, &request, &share_content).encode_to_vec())
 }
 
 #[wasm_bindgen]
@@ -39,22 +46,18 @@ pub fn ts_recover_from_share_responses(
     responses: JsValue,
     secret_id: &[u8],
     version: i32
-) -> Result<Vec<u8>, String> {
-    let responses: TsRecoverShareResponses = serde_wasm_bindgen::from_value(responses).unwrap();
+) -> Result<Vec<u8>, JsValue> {
+    let responses: TsRecoverShareResponses = serde_wasm_bindgen::from_value(responses)
+        .map_err(|err| to_js_error(Error::Serialization(err.to_string())))?;
     let mut parsed_responses = Vec::new();
     for (_channel_id, bytes) in responses.value {
-        let response = GetShareResponseMessage::decode(&*bytes);
-        if response.is_err() {
-            return Err(response.unwrap_err().to_string());
-        } else {
-            parsed_responses.push(response.unwrap());
-        }
+        let response = GetShareResponseMessage::decode(&*bytes)
+            .map_err(|err| to_js_error(Error::Decode(err.to_string())))?;
+        parsed_responses.push(response);
     }
-    let secret = recovery::recover_from_share_responses(&parsed_responses, secret_id, version);
-    if secret.is_err() {
-        return Err(secret.unwrap_err().to_string());
-    }
-    return Ok(secret.unwrap());
+    let secret = recovery::recover_from_share_responses(&parsed_responses, secret_id, version)
+        .map_err(to_js_error)?;
+    Ok(secret)
 }
 
 #[cfg(test)]
