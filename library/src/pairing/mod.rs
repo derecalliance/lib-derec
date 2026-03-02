@@ -82,9 +82,17 @@ pub fn ts_produce_pairing_response_message(
     kind: u32,
     pair_request_message: &[u8],
     pairing_secret_key_material: &[u8],
+<<<<<<< HEAD
 ) -> Result<JsValue, JsValue> {
     let pair_request_msg = PairRequestMessage::decode(pair_request_message)
         .map_err(|e| js_error("PROTOBUF_DECODE", e.to_string()))?;
+=======
+) -> JsValue {
+    let pair_request_msg = PairRequestMessage::decode(pair_request_message).unwrap();
+    let pairing_sk =
+        PairingSecretKeyMaterial::deserialize_uncompressed(&mut &pairing_secret_key_material[..])
+            .unwrap();
+>>>>>>> main
 
     let pairing_sk =
         PairingSecretKeyMaterial::deserialize_uncompressed(&mut &pairing_secret_key_material[..])
