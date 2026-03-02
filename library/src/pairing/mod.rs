@@ -7,6 +7,9 @@ pub use error::PairingError;
 mod pairing;
 pub use pairing::*;
 
+mod types;
+pub use types::*;
+
 use crate::protos::derec_proto::SenderKind;
 use crate::protos::derec_proto::{ContactMessage, PairRequestMessage, PairResponseMessage};
 use crate::ts_bindings_utils::{js_error, js_error_from_lib};
@@ -41,12 +44,14 @@ struct TsProcessPairingResponseMessage {
 
 #[wasm_bindgen]
 pub fn ts_create_contact_message(channel_id: u64, transport_uri: &str) -> Result<JsValue, JsValue> {
-    let (contact_msg, sk) =
-        pairing::create_contact_message(channel_id, transport_uri).map_err(js_error_from_lib)?;
+    let CreateContactMessageResult {
+        contact_message,
+        secret_key,
+    } = pairing::create_contact_message(channel_id, transport_uri).map_err(js_error_from_lib)?;
 
     let wrapper = TsCreateContactMessageResult {
-        contact_message: contact_msg.encode_to_vec(),
-        secret_key_material: serialize_pairing_secret_key_material(&sk)?,
+        contact_message: contact_message.encode_to_vec(),
+        secret_key_material: serialize_pairing_secret_key_material(&secret_key)?,
     };
 
     serde_wasm_bindgen::to_value(&wrapper)
@@ -64,13 +69,15 @@ pub fn ts_produce_pairing_request_message(
 
     let sender_kind = get_sender_kind(kind)?;
 
-    let (pair_request_msg, sk) =
-        pairing::produce_pairing_request_message(channel_id, sender_kind, &contact_msg)
-            .map_err(js_error_from_lib)?;
+    let ProducePairingRequestMessageResult {
+        pair_request_message,
+        secret_key,
+    } = pairing::produce_pairing_request_message(channel_id, sender_kind, &contact_msg)
+        .map_err(js_error_from_lib)?;
 
     let wrapper = TsProducePairingRequestMessage {
-        pair_request_message: pair_request_msg.encode_to_vec(),
-        secret_key_material: serialize_pairing_secret_key_material(&sk)?,
+        pair_request_message: pair_request_message.encode_to_vec(),
+        secret_key_material: serialize_pairing_secret_key_material(&secret_key)?,
     };
 
     serde_wasm_bindgen::to_value(&wrapper)
@@ -82,23 +89,18 @@ pub fn ts_produce_pairing_response_message(
     kind: u32,
     pair_request_message: &[u8],
     pairing_secret_key_material: &[u8],
-<<<<<<< HEAD
 ) -> Result<JsValue, JsValue> {
     let pair_request_msg = PairRequestMessage::decode(pair_request_message)
         .map_err(|e| js_error("PROTOBUF_DECODE", e.to_string()))?;
-=======
-) -> JsValue {
-    let pair_request_msg = PairRequestMessage::decode(pair_request_message).unwrap();
-    let pairing_sk =
-        PairingSecretKeyMaterial::deserialize_uncompressed(&mut &pairing_secret_key_material[..])
-            .unwrap();
->>>>>>> main
 
     let pairing_sk =
         PairingSecretKeyMaterial::deserialize_uncompressed(&mut &pairing_secret_key_material[..])
             .map_err(|e| js_error("SERIALIZATION_ERROR", e.to_string()))?;
 
-    let (pair_response_msg, sk) = pairing::produce_pairing_response_message(
+    let ProducePairingResponseMessageResult {
+        pair_response_message,
+        shared_key,
+    } = pairing::produce_pairing_response_message(
         get_sender_kind(kind)?,
         &pair_request_msg,
         &pairing_sk,
@@ -106,8 +108,8 @@ pub fn ts_produce_pairing_response_message(
     .map_err(js_error_from_lib)?;
 
     let wrapper = TsProducePairingResponseMessage {
-        pair_response_message: pair_response_msg.encode_to_vec(),
-        pairing_shared_key: sk.to_vec(),
+        pair_response_message: pair_response_message.encode_to_vec(),
+        pairing_shared_key: shared_key.to_vec(),
     };
 
     serde_wasm_bindgen::to_value(&wrapper)
@@ -133,7 +135,7 @@ pub fn ts_process_pairing_response_message(
             .map_err(js_error_from_lib)?;
 
     let wrapper = TsProcessPairingResponseMessage {
-        pairing_shared_key: lib_result.to_vec(),
+        pairing_shared_key: lib_result.shared_key.to_vec(),
     };
 
     serde_wasm_bindgen::to_value(&wrapper)

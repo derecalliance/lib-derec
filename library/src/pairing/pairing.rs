@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    pairing::PairingError,
+    pairing::{
+        CreateContactMessageResult, PairingError, ProcessPairingResponseMessageResult,
+        ProducePairingRequestMessageResult, ProducePairingResponseMessageResult,
+    },
     protos::derec_proto::{self, StatusEnum},
 };
 use derec_cryptography::pairing;
@@ -32,10 +35,12 @@ use rand::RngCore;
 ///
 /// # Returns
 ///
-/// On success returns a tuple:
+/// # Returns
 ///
-/// 1. [`derec_proto::ContactMessage`]: public contact payload to send out-of-band.
-/// 2. [`pairing::PairingSecretKeyMaterial`]: secret key material that must be retained by the caller.
+/// On success returns [`CreateContactMessageResult`] containing:
+///
+/// - `contact_message`: [`derec_proto::ContactMessage`] — public contact payload to send out-of-band.
+/// - `secret_key`: [`pairing::PairingSecretKeyMaterial`] — secret key material that must be retained by the caller.
 ///
 /// # Errors
 ///
@@ -53,26 +58,23 @@ use rand::RngCore;
 /// # Example
 ///
 /// ```rust
-/// use derec_library::pairing;
+/// use derec_library::pairing::*;
 ///
 /// let channel_id = 42u64;
 /// let transport_uri = "https://relay.example/derec";
 ///
-/// let (contact, secret_state) = pairing::create_contact_message(channel_id, transport_uri)?;
-///
-/// // Encode `contact` (e.g. QR code) and keep `secret_state` locally for later steps.
-/// # Ok::<(), derec_library::Error>(())
+/// let CreateContactMessageResult {
+///     contact_message,
+///     secret_key,
+/// } = create_contact_message(
+///     channel_id,
+///     transport_uri
+/// ).expect("Failed to create contact message");
 /// ```
 pub fn create_contact_message(
     channel_id: u64,
     transport_uri: &str,
-) -> Result<
-    (
-        derec_proto::ContactMessage,
-        pairing::PairingSecretKeyMaterial,
-    ),
-    crate::Error,
-> {
+) -> Result<CreateContactMessageResult, crate::Error> {
     if transport_uri.trim().is_empty() {
         return Err(PairingError::EmptyTransportUri.into());
     }
@@ -86,7 +88,7 @@ pub fn create_contact_message(
     let (pk, sk) = pairing::contact_message(seed)
         .map_err(|e| PairingError::ContactMessageKeygen { source: e })?;
 
-    let contact_msg = derec_proto::ContactMessage {
+    let contact_message = derec_proto::ContactMessage {
         public_key_id: channel_id,
         transport_uri: transport_uri.to_owned(),
         mlkem_encapsulation_key: pk.mlkem_encapsulation_key,
@@ -95,7 +97,10 @@ pub fn create_contact_message(
         message_encoding_type: 0,
     };
 
-    Ok((contact_msg, sk))
+    Ok(CreateContactMessageResult {
+        contact_message,
+        secret_key: sk,
+    })
 }
 
 /// Produces a [`PairRequestMessage`] in response to a previously received
@@ -132,12 +137,12 @@ pub fn create_contact_message(
 ///
 /// # Returns
 ///
-/// On success returns a tuple:
+/// On success returns [`ProducePairingRequestMessageResult`] containing:
 ///
-/// 1. [`derec_proto::PairRequestMessage`] – the pairing request to transmit
-///    to the initiator.
-/// 2. [`pairing::PairingSecretKeyMaterial`] – secret state required later
-///    to derive the final shared pairing key.
+/// - `pair_request_message`: [`derec_proto::PairRequestMessage`] — the pairing
+///   request to transmit to the initiator.
+/// - `secret_key`: [`pairing::PairingSecretKeyMaterial`] — secret
+///   state required later to derive the final shared pairing key.
 ///
 /// # Errors
 ///
@@ -160,34 +165,34 @@ pub fn create_contact_message(
 /// # Example
 ///
 /// ```rust
-/// use derec_library::pairing;
+/// use derec_library::pairing::*;
 ///
 /// let channel_id = 99u64;
 /// let kind = derec_library::protos::derec_proto::SenderKind::Helper;
 ///
 /// // This would normally come from QR decoding.
-/// let (contact_msg, _contactor_state) = pairing::create_contact_message(
+/// let CreateContactMessageResult {
+///     contact_message,
+///     ..
+/// } = create_contact_message(
 ///     channel_id,
 ///     "https://relay.example/derec",
-/// )?;
+/// ).expect("Failed to create contact message");
 ///
-/// let (request_msg, secret_state) =
-///     pairing::produce_pairing_request_message(channel_id, kind, &contact_msg)?;
-///
-/// // Send `request_msg` via transport and retain `secret_state`.
-/// # Ok::<(), derec_library::Error>(())
+/// let ProducePairingRequestMessageResult {
+///     pair_request_message,
+///     secret_key,
+/// } = produce_pairing_request_message(
+///     channel_id,
+///     kind,
+///     &contact_message,
+/// ).expect("Failed to produce pairing request message");
 /// ```
 pub fn produce_pairing_request_message(
     channel_id: u64,
     kind: derec_proto::SenderKind,
     contact_message: &derec_proto::ContactMessage,
-) -> Result<
-    (
-        derec_proto::PairRequestMessage,
-        pairing::PairingSecretKeyMaterial,
-    ),
-    crate::Error,
-> {
+) -> Result<ProducePairingRequestMessageResult, crate::Error> {
     if contact_message.mlkem_encapsulation_key.is_empty() {
         return Err(PairingError::InvalidContactMessage("mlkem_encapsulation_key is empty").into());
     }
@@ -210,7 +215,7 @@ pub fn produce_pairing_request_message(
     let (req_pk, sk) = pairing::pairing_request_message(seed, &contact_pk)
         .map_err(|e| PairingError::PairRequestKeygen { source: e })?;
 
-    let request_msg = derec_proto::PairRequestMessage {
+    let pair_request_message = derec_proto::PairRequestMessage {
         sender_kind: kind.into(),
         mlkem_ciphertext: req_pk.mlkem_ciphertext,
         ecies_public_key: req_pk.ecies_public_key,
@@ -220,7 +225,10 @@ pub fn produce_pairing_request_message(
         parameter_range: None,
     };
 
-    Ok((request_msg, sk))
+    Ok(ProducePairingRequestMessageResult {
+        pair_request_message,
+        secret_key: sk,
+    })
 }
 
 /// Produces a [`PairResponseMessage`] and derives the final pairing shared key on the
@@ -253,10 +261,11 @@ pub fn produce_pairing_request_message(
 ///
 /// # Returns
 ///
-/// On success returns a tuple:
+/// On success returns [`ProducePairingResponseMessageResult`] containing:
 ///
-/// 1. [`derec_proto::PairResponseMessage`] – response message to send back to the responder.
-/// 2. [`pairing::PairingSharedKey`] – the derived 256-bit shared key.
+/// - `pair_response_message`: [`derec_proto::PairResponseMessage`] — response
+///   message to send back to the responder.
+/// - `shared_key`: [`pairing::PairingSharedKey`] — the derived 256-bit shared key.
 ///
 /// # Errors
 ///
@@ -278,34 +287,45 @@ pub fn produce_pairing_request_message(
 /// # Example
 ///
 /// ```rust
-/// use derec_library::pairing;
+/// use derec_library::pairing::*;
 ///
 /// let channel_id = 99u64;
 /// let kind = derec_library::protos::derec_proto::SenderKind::Helper;
 ///
-/// // This would normally come from QR decoding.
-/// let (contact_msg, contactor_secret_state) = pairing::create_contact_message(
+/// // Initiator creates contact message.
+/// let CreateContactMessageResult {
+///     contact_message,
+///     secret_key: contactor_secret_key,
+/// } = create_contact_message(
 ///     channel_id,
 ///     "https://relay.example/derec",
-/// )?;
+/// ).expect("Failed to create contact message");
 ///
-/// let (pair_request_msg, _secret_state) =
-///     pairing::produce_pairing_request_message(channel_id, kind, &contact_msg)?;
-///
-/// let (pair_response_msg, shared_key) = pairing::produce_pairing_response_message(
+/// // Responder produces pairing request.
+/// let ProducePairingRequestMessageResult{
+///     pair_request_message,
+///     ..
+/// } = produce_pairing_request_message(
+///     channel_id,
 ///     kind,
-///     &pair_request_msg,
-///     &contactor_secret_state,
-/// )?;
+///     &contact_message,
+/// ).expect("Failed to produce pairing request message");
 ///
-/// // Send `pair_response_msg` back to the responder and keep/use `shared_key`.
-/// # Ok::<(), derec_library::Error>(())
+/// // Initiator finalizes pairing.
+/// let ProducePairingResponseMessageResult{
+///     pair_response_message,
+///     shared_key,
+/// } = produce_pairing_response_message(
+///     kind,
+///     &pair_request_message,
+///     &contactor_secret_key,
+/// ).expect("Failed to produce pairing response message");
 /// ```
 pub fn produce_pairing_response_message(
     kind: derec_proto::SenderKind,
     pair_request_message: &derec_proto::PairRequestMessage,
     pairing_secret_key_material: &pairing::PairingSecretKeyMaterial,
-) -> Result<(derec_proto::PairResponseMessage, pairing::PairingSharedKey), crate::Error> {
+) -> Result<ProducePairingResponseMessageResult, crate::Error> {
     if pair_request_message.mlkem_ciphertext.is_empty() {
         return Err(PairingError::InvalidPairRequestMessage("mlkem_ciphertext is empty").into());
     }
@@ -320,10 +340,11 @@ pub fn produce_pairing_response_message(
     };
 
     // Generate the shared key material (contactor side)
-    let sk = pairing::finish_pairing_contactor(pairing_secret_key_material, &pairing_request)
-        .map_err(|e| PairingError::FinishPairingContactor { source: e })?;
+    let shared_key =
+        pairing::finish_pairing_contactor(pairing_secret_key_material, &pairing_request)
+            .map_err(|e| PairingError::FinishPairingContactor { source: e })?;
 
-    let response_msg = derec_proto::PairResponseMessage {
+    let pair_response_message = derec_proto::PairResponseMessage {
         sender_kind: kind.into(),
         result: Some(derec_proto::Result {
             status: derec_proto::StatusEnum::Ok as i32,
@@ -334,7 +355,10 @@ pub fn produce_pairing_response_message(
         parameter_range: None,
     };
 
-    Ok((response_msg, sk))
+    Ok(ProducePairingResponseMessageResult {
+        pair_response_message,
+        shared_key,
+    })
 }
 
 /// Processes a [`PairResponseMessage`] and derives the final pairing shared key on the
@@ -367,7 +391,9 @@ pub fn produce_pairing_response_message(
 ///
 /// # Returns
 ///
-/// On success returns the derived [`pairing::PairingSharedKey`] (a 256-bit shared key).
+/// On success returns [`ProcessPairingResponseMessageResult`] containing:
+///
+/// - `shared_key`: the derived 256-bit pairing shared key (wrapped in a semantic type).
 ///
 /// # Errors
 ///
@@ -391,40 +417,51 @@ pub fn produce_pairing_response_message(
 /// # Example
 ///
 /// ```rust
-/// use derec_library::pairing;
+/// use derec_library::pairing::*;
 ///
 /// let channel_id = 99u64;
 /// let kind = derec_library::protos::derec_proto::SenderKind::Helper;
 ///
 /// // This would normally come from QR decoding.
-/// let (contact_msg, contactor_secret_state) = pairing::create_contact_message(
+/// let CreateContactMessageResult {
+///     contact_message,
+///     secret_key: contactor_secret_key,
+/// } = create_contact_message(
 ///     channel_id,
 ///     "https://relay.example/derec",
-/// )?;
+/// ).expect("Failed to create contact message");
 ///
-/// let (pair_request_msg, requestor_secret_state) =
-///     pairing::produce_pairing_request_message(channel_id, kind, &contact_msg)?;
-///
-/// let (pair_response_msg, shared_key) = pairing::produce_pairing_response_message(
+/// // Responder produces pairing request.
+/// let ProducePairingRequestMessageResult{
+///     pair_request_message,
+///     secret_key: requestor_secret_key,
+/// } = produce_pairing_request_message(
+///     channel_id,
 ///     kind,
-///     &pair_request_msg,
-///     &contactor_secret_state,
-/// )?;
+///     &contact_message,
+/// ).expect("Failed to produce pairing request message");
 ///
-/// let shared_key = pairing::process_pairing_response_message(
-///     &contact_msg,
-///     &pair_response_msg,
-///     &requestor_secret_state,
-/// )?;
+/// // Initiator finalizes pairing.
+/// let ProducePairingResponseMessageResult{
+///     pair_response_message,
+///     shared_key,
+/// } = produce_pairing_response_message(
+///     kind,
+///     &pair_request_message,
+///     &contactor_secret_key,
+/// ).expect("Failed to produce pairing response message");
 ///
-/// // `shared_key` can now be used as the basis for secure channels/messages.
-/// # Ok::<(), derec_library::Error>(())
+/// let ProcessPairingResponseMessageResult { shared_key } = process_pairing_response_message(
+///     &contact_message,
+///     &pair_response_message,
+///     &requestor_secret_key,
+/// ).expect("Failed to process pairing response message");
 /// ```
 pub fn process_pairing_response_message(
     contact_message: &derec_proto::ContactMessage,
     pair_response_message: &derec_proto::PairResponseMessage,
     pairing_secret_key_material: &pairing::PairingSecretKeyMaterial,
-) -> Result<pairing::PairingSharedKey, crate::Error> {
+) -> Result<ProcessPairingResponseMessageResult, crate::Error> {
     let res = pair_response_message
         .result
         .as_ref()
@@ -458,5 +495,5 @@ pub fn process_pairing_response_message(
     let shared_key = pairing::finish_pairing_requestor(pairing_secret_key_material, &pk)
         .map_err(|e| PairingError::FinishPairingRequestor { source: e })?;
 
-    Ok(shared_key)
+    Ok(ProcessPairingResponseMessageResult { shared_key })
 }
