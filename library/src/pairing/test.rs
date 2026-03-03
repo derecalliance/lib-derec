@@ -1,7 +1,5 @@
 #[cfg(test)]
 mod tests {
-    use derec_cryptography::pairing::PairingSecretKeyMaterial;
-
     use crate::Error;
     use crate::pairing::pairing::{
         create_contact_message, process_pairing_response_message, produce_pairing_request_message,
@@ -12,6 +10,7 @@ mod tests {
         ProducePairingResponseMessageResult,
     };
     use crate::protos::derec_proto;
+    use derec_cryptography::pairing::PairingSecretKeyMaterial;
 
     #[test]
     fn test_create_contact_message_empty_transport_uri() {
