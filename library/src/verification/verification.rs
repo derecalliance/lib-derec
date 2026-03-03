@@ -30,14 +30,15 @@ const VERIFICATION_NONCE_LEN: usize = 32;
 ///
 /// # Returns
 ///
-/// Returns a [`VerifyShareRequestMessage`] containing:
+/// On success returns a [`VerifyShareRequestMessage`] containing:
 ///
 /// - `version`: the provided version
 /// - `nonce`: 32 bytes generated using the OS CSPRNG (`rand::rngs::OsRng`)
 ///
 /// # Errors
 ///
-/// This function does not return an error. It performs no fallible operations in normal execution.
+/// This function currently returns no verification-specific errors. The return type is
+/// `Result<_, crate::Error>` for API stability and to allow future validations.
 ///
 /// # Security Notes
 ///
@@ -52,7 +53,8 @@ const VERIFICATION_NONCE_LEN: usize = 32;
 /// let secret_id = "secret_id";
 /// let version = 7;
 ///
-/// let request = generate_verification_request(secret_id, version);
+/// let request = generate_verification_request(secret_id, version)
+///     .expect("failed to build verification request");
 ///
 /// assert_eq!(request.version, 7);
 /// assert_eq!(request.nonce.len(), 32);
@@ -60,13 +62,13 @@ const VERIFICATION_NONCE_LEN: usize = 32;
 pub fn generate_verification_request(
     _secret_id: impl AsRef<[u8]>,
     version: i32,
-) -> VerifyShareRequestMessage {
+) -> Result<VerifyShareRequestMessage, crate::Error> {
     // Generate a nonce using a secure random number generator
     let mut rng = rand::rngs::OsRng;
     let mut nonce = vec![0u8; VERIFICATION_NONCE_LEN];
     rng.fill_bytes(&mut nonce);
 
-    VerifyShareRequestMessage { version, nonce }
+    Ok(VerifyShareRequestMessage { version, nonce })
 }
 
 /// Creates a [`VerifyShareResponseMessage`] to answer a DeRec *verification* request.
@@ -122,7 +124,8 @@ pub fn generate_verification_request(
 /// let channel_id = 1;
 /// let share_content = b"example_share";
 ///
-/// let request = generate_verification_request(secret_id, version);
+/// let request = generate_verification_request(secret_id, version)
+///     .expect("Failed to generate verification request");
 ///
 /// let response = generate_verification_response(secret_id, &channel_id, share_content, &request)
 ///     .expect("Failed to generate verification response");
@@ -177,11 +180,15 @@ pub fn generate_verification_response(
 ///
 /// # Returns
 ///
-/// Returns `true` if the recomputed digest matches `response.hash`, otherwise `false`.
+/// On success returns:
+///
+/// - `Ok(true)` if the recomputed digest matches `response.hash`
+/// - `Ok(false)` otherwise
 ///
 /// # Errors
 ///
-/// This function does not return an error. It performs no structural validation of the response.
+/// This function currently returns no verification-specific errors. The return type is
+/// `Result<_, crate::Error>` for API stability and to allow future validations.
 ///
 /// # Security Notes
 ///
@@ -197,25 +204,30 @@ pub fn generate_verification_response(
 /// let secret_id = "secret_id";
 /// let version = 7;
 /// let channel_id = 1;
-/// let request = generate_verification_request(secret_id, version);
+/// let request = generate_verification_request(secret_id, version)
+///     .expect("failed to build verification request");
+///
 /// let share_content = b"example_share";
 ///
 /// let response = generate_verification_response(secret_id, &channel_id, share_content, &request)
-///     .expect("Failed to generate verification response");
+///     .expect("failed to generate verification response");
 ///
-/// assert!(verify_share_response(secret_id, &channel_id, share_content, &response));
+/// let ok = verify_share_response(secret_id, &channel_id, share_content, &response)
+///     .expect("failed to verify response");
+///
+/// assert!(ok);
 /// ```
 pub fn verify_share_response(
     _secret_id: impl AsRef<[u8]>,
     _channel_id: &ChannelId,
     share_content: impl AsRef<[u8]>,
     response: &VerifyShareResponseMessage,
-) -> bool {
+) -> Result<bool, crate::Error> {
     // compute the Sha384 hash of the share content
     let mut hasher = Sha384::new();
     hasher.update(share_content);
     hasher.update(response.nonce.as_slice());
     let hash = hasher.finalize().to_vec();
 
-    hash == response.hash
+    Ok(hash == response.hash)
 }

@@ -16,8 +16,14 @@ use prost::Message;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
-pub fn ts_generate_verification_request(secret_id: &[u8], version: u32) -> Vec<u8> {
-    verification::generate_verification_request(secret_id, version as i32).encode_to_vec()
+pub fn ts_generate_verification_request(
+    secret_id: &[u8],
+    version: u32,
+) -> Result<Vec<u8>, JsValue> {
+    let result = verification::generate_verification_request(secret_id, version as i32)
+        .map_err(js_error_from_lib)?;
+
+    Ok(result.encode_to_vec())
 }
 
 #[wasm_bindgen]
@@ -49,8 +55,10 @@ pub fn ts_verify_share_response(
 ) -> Result<bool, JsValue> {
     let response = VerifyShareResponseMessage::decode(response)
         .map_err(|e| js_error("PROTOBUF_DECODE", e.to_string()))?;
+
     let result =
-        verification::verify_share_response(secret_id, &channel_id, share_content, &response);
+        verification::verify_share_response(secret_id, &channel_id, share_content, &response)
+            .map_err(js_error_from_lib)?;
 
     Ok(result)
 }
