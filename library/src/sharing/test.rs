@@ -1,13 +1,12 @@
 #[cfg(test)]
 mod tests {
-    use prost::Message;
-
     use crate::{
         Error,
         protos::derec_proto::{CommittedDeRecShare, DeRecShare},
         sharing::{ProtectSecretResult, SharingError, protect_secret},
         types::ChannelId,
     };
+    use prost::Message;
 
     #[test]
     fn test_protect_secret_empty_channels() {
