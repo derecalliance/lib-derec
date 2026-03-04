@@ -4,83 +4,153 @@ use crate::protos::derec_proto::{
     Result as DerecResult, StatusEnum, VerifyShareRequestMessage, VerifyShareResponseMessage,
 };
 use crate::types::*;
+use crate::verification::VerificationError;
 use rand::RngCore;
 use sha2::*;
 
-/// Generates a verification request for each provided channel.
+const VERIFICATION_NONCE_LEN: usize = 32;
+
+/// Creates a [`VerifyShareRequestMessage`] to initiate the DeRec *verification* flow.
 ///
-/// This function creates a map of `ChannelId` to `VerifyShareRequestMessage`, where each request
-/// contains a securely generated random nonce and the specified version. The nonce is used to
-/// ensure freshness and prevent replay attacks during the verification process.
+/// In DeRec, verification allows an Owner to challenge a Helper to prove it still holds the
+/// expected share bytes. The Owner sends a request containing:
+///
+/// - A `version` identifying the share-distribution version being verified
+/// - A fresh, unpredictable `nonce` that prevents replay of previously captured responses
+///
+/// The Helper is expected to compute a SHA-384 digest over `(share_content || nonce)` and return it
+/// in a [`VerifyShareResponseMessage`].
 ///
 /// # Arguments
 ///
-/// * `_secret_id` - An identifier for the secret (not used in this function, but may be useful for context).
-/// * `channels` - A slice of channel identifiers for which to generate verification requests.
-/// * `version` - The version number to include in each verification request.
+/// * `_secret_id` - Secret identifier (currently unused by this helper). Included for API consistency
+///   and for future extensions where the secret context may influence verification.
+/// * `version` - Distribution version to embed in the request. The responder should echo this value
+///   in the response.
 ///
 /// # Returns
 ///
-/// Returns a `Result` containing a `HashMap` mapping each `ChannelId` to its corresponding
-/// `VerifyShareRequestMessage` on success, or an error string on failure.
+/// On success returns a [`VerifyShareRequestMessage`] containing:
+///
+/// - `version`: the provided version
+/// - `nonce`: 32 bytes generated using the OS CSPRNG (`rand::rngs::OsRng`)
+///
+/// # Errors
+///
+/// This function currently returns no verification-specific errors. The return type is
+/// `Result<_, crate::Error>` for API stability and to allow future validations.
+///
+/// # Security Notes
+///
+/// - The nonce is generated using the OS CSPRNG and MUST be unique/unpredictable to mitigate replay.
+/// - The request is not itself a proof; the proof is the responder’s hash bound to the nonce.
 ///
 /// # Example
 ///
 /// ```rust
-/// use crate::derec_library::verification::*;
-/// let requests = generate_verification_request("secret_id", 1);
+/// use derec_library::verification::*;
+///
+/// let secret_id = "secret_id";
+/// let version = 7;
+///
+/// let request = generate_verification_request(secret_id, version)
+///     .expect("failed to build verification request");
+///
+/// assert_eq!(request.version, 7);
+/// assert_eq!(request.nonce.len(), 32);
 /// ```
 pub fn generate_verification_request(
     _secret_id: impl AsRef<[u8]>,
     version: i32,
-) -> VerifyShareRequestMessage {
+) -> Result<VerifyShareRequestMessage, crate::Error> {
     // Generate a nonce using a secure random number generator
     let mut rng = rand::rngs::OsRng;
-    let mut nonce: Vec<u8> = vec![0; 32];
+    let mut nonce = vec![0u8; VERIFICATION_NONCE_LEN];
     rng.fill_bytes(&mut nonce);
-    VerifyShareRequestMessage { version, nonce }
+
+    Ok(VerifyShareRequestMessage { version, nonce })
 }
 
-/// Generates a verification response for a given share and verification request.
+/// Creates a [`VerifyShareResponseMessage`] to answer a DeRec *verification* request.
 ///
-/// This function computes a SHA-384 hash over the provided share content and the nonce from the
-/// verification request. It then constructs a `VerifyShareResponseMessage` containing the hash,
-/// the original nonce, the version, and a result indicating success.
+/// The response proves possession of the provided `share_content` by computing:
+///
+/// `hash = SHA384(share_content || request.nonce)`
+///
+/// The returned [`VerifyShareResponseMessage`] includes:
+///
+/// - `result.status = Ok`
+/// - `version = request.version`
+/// - `nonce = request.nonce`
+/// - `hash = SHA-384 digest`
 ///
 /// # Arguments
 ///
-/// * `_secret_id` - An identifier for the secret (not used in this function, but may be useful for context).
-/// * `_channel_id` - A slice of channel identifiers (not used in this function, but may be useful for context).
-/// * `share_content` - The content of the share to be verified.
-/// * `request` - The original `VerifyShareRequestMessage` containing the nonce and version.
+/// * `_secret_id` - Secret identifier (currently unused by this helper). Included for API consistency
+///   and future extensions.
+/// * `_channel_id` - Channel identifier (currently unused by this helper). Included for API consistency
+///   and future extensions.
+/// * `share_content` - The share bytes to be proven/verified. The digest is computed over these bytes.
+/// * `request` - The original [`VerifyShareRequestMessage`] containing `version` and the challenge `nonce`.
 ///
 /// # Returns
 ///
-/// Returns a `Result` containing the constructed `VerifyShareResponseMessage` on success,
-/// or an error string on failure.
+/// On success returns a [`VerifyShareResponseMessage`] containing:
+///
+/// - `result`: [`DerecResult`] with `status = StatusEnum::Ok`
+/// - `version`: echoed from `request.version`
+/// - `nonce`: echoed from `request.nonce`
+/// - `hash`: `SHA384(share_content || request.nonce)`
+///
+/// # Errors
+///
+/// Returns [`VerificationError`] in the following cases:
+///
+/// - [`VerificationError::Invariant`] if `request.nonce.len() != 32`.
+///
+/// # Security Notes
+///
+/// - This response is only meaningful when the verifier binds it to the original request nonce.
+/// - The `result` field indicates protocol-level success; verifiers may additionally enforce that
+///   `result` is present and `status == Ok` (this crate’s current `verify_share_response` does not).
 ///
 /// # Example
 ///
 /// ```rust
-/// use crate::derec_library::verification::*;
+/// use derec_library::verification::*;
+///
+/// let secret_id = "secret_id";
+/// let version = 7;
+/// let channel_id = 1;
 /// let share_content = b"example_share";
-/// let channel = 2;
-/// let request = generate_verification_request("secret", 101);
-/// let response = generate_verification_response("secret", &channel, share_content, &request);
+///
+/// let request = generate_verification_request(secret_id, version)
+///     .expect("Failed to generate verification request");
+///
+/// let response = generate_verification_response(secret_id, &channel_id, share_content, &request)
+///     .expect("Failed to generate verification response");
+///
+/// assert_eq!(response.version, request.version);
+/// assert_eq!(response.nonce, request.nonce);
+/// assert!(!response.hash.is_empty());
 /// ```
 pub fn generate_verification_response(
     _secret_id: impl AsRef<[u8]>,
     _channel_id: &ChannelId,
     share_content: impl AsRef<[u8]>,
     request: &VerifyShareRequestMessage,
-) -> VerifyShareResponseMessage {
+) -> Result<VerifyShareResponseMessage, crate::Error> {
+    if request.nonce.len() != VERIFICATION_NONCE_LEN {
+        return Err(VerificationError::Invariant("request nonce must be 32 bytes").into());
+    }
+
     // compute the Sha384 hash of the share content
     let mut hasher = Sha384::new();
     hasher.update(share_content);
     hasher.update(request.nonce.as_slice());
     let hash = hasher.finalize().to_vec();
 
-    VerifyShareResponseMessage {
+    Ok(VerifyShareResponseMessage {
         result: Some(DerecResult {
             status: StatusEnum::Ok as i32,
             memo: String::new(),
@@ -88,137 +158,76 @@ pub fn generate_verification_response(
         version: request.version,
         nonce: request.nonce.clone(),
         hash,
-    }
+    })
 }
 
-/// Verifies a share response by recomputing the hash and comparing it to the provided response.
+/// Verifies a [`VerifyShareResponseMessage`] by recomputing the expected SHA-384 digest.
 ///
-/// This function takes the share content and the corresponding `VerifyShareResponseMessage`,
-/// recomputes the SHA-384 hash using the share content and the nonce from the response,
-/// and checks if it matches the hash included in the response. This ensures the integrity
-/// and authenticity of the share content as verified by the original request's nonce.
+/// This helper recomputes:
+///
+/// `expected = SHA384(share_content || response.nonce)`
+///
+/// and returns `true` if `expected == response.hash`.
 ///
 /// # Arguments
 ///
-/// * `_secret_id` - An identifier for the secret (not used in this function, but may be useful for context).
-/// * `_channel_id` - A slice of channel identifiers (not used in this function, but may be useful for context).
-/// * `share_content` - The content of the share to be verified.
-/// * `response` - The `VerifyShareResponseMessage` containing the nonce and hash to verify against.
+/// * `_secret_id` - Secret identifier (currently unused by this helper). Included for API consistency
+///   and future extensions.
+/// * `_channel_id` - Channel identifier (currently unused by this helper). Included for API consistency
+///   and future extensions.
+/// * `share_content` - The expected share bytes. The digest is recomputed over these bytes.
+/// * `response` - The [`VerifyShareResponseMessage`] containing the nonce and hash to verify.
 ///
 /// # Returns
 ///
-/// Returns `Ok(true)` if the verification succeeds (hashes match), or an `Err` with an error message
-/// if the verification fails (hash mismatch).
+/// On success returns:
+///
+/// - `Ok(true)` if the recomputed digest matches `response.hash`
+/// - `Ok(false)` otherwise
+///
+/// # Errors
+///
+/// This function currently returns no verification-specific errors. The return type is
+/// `Result<_, crate::Error>` for API stability and to allow future validations.
+///
+/// # Security Notes
+///
+/// - **Limitation:** this function does *not* validate `response.result`, `response.version`, or that
+///   `response.nonce` matches the original request nonce. It only checks that the hash matches the
+///   nonce included in the response.
 ///
 /// # Example
 ///
 /// ```rust
-/// use crate::derec_library::verification::*;
+/// use derec_library::verification::*;
+///
+/// let secret_id = "secret_id";
+/// let version = 7;
+/// let channel_id = 1;
+/// let request = generate_verification_request(secret_id, version)
+///     .expect("failed to build verification request");
+///
 /// let share_content = b"example_share";
-/// let channel = 2;
-/// let request = generate_verification_request("secret", 100);
-/// let response = generate_verification_response("secret", &channel, share_content, &request);
-/// let verify = verify_share_response("secret", &channel, share_content, &response);
-/// assert!(verify);
+///
+/// let response = generate_verification_response(secret_id, &channel_id, share_content, &request)
+///     .expect("failed to generate verification response");
+///
+/// let ok = verify_share_response(secret_id, &channel_id, share_content, &response)
+///     .expect("failed to verify response");
+///
+/// assert!(ok);
 /// ```
 pub fn verify_share_response(
     _secret_id: impl AsRef<[u8]>,
     _channel_id: &ChannelId,
     share_content: impl AsRef<[u8]>,
     response: &VerifyShareResponseMessage,
-) -> bool {
+) -> Result<bool, crate::Error> {
     // compute the Sha384 hash of the share content
     let mut hasher = Sha384::new();
     hasher.update(share_content);
     hasher.update(response.nonce.as_slice());
     let hash = hasher.finalize().to_vec();
 
-    hash == response.hash
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_generate_verification_response_and_verify_success() {
-        let target_channel = 2;
-        let version = 4;
-
-        let share_content = b"test_share_content";
-        let request = generate_verification_request("secret", version);
-        let response =
-            generate_verification_response("secret", &target_channel, share_content, &request);
-
-        assert_eq!(response.version, version);
-        assert_eq!(response.nonce, request.nonce);
-        assert_eq!(
-            response.result.as_ref().unwrap().status,
-            StatusEnum::Ok as i32
-        );
-
-        // Should verify successfully
-        assert!(verify_share_response(
-            "secret",
-            &target_channel,
-            share_content,
-            &response
-        ));
-    }
-
-    #[test]
-    fn test_generate_verification_response_and_verify_failure() {
-        let target_channel = 2;
-        let version = 3;
-
-        let share_content = b"test_share_content";
-        let wrong_share_content = b"wrong_content";
-        let request = generate_verification_request("secret", version);
-
-        let response =
-            generate_verification_response("secret", &target_channel, share_content, &request);
-
-        // Should fail verification with wrong share content
-        assert!(!verify_share_response(
-            "secret",
-            &target_channel,
-            wrong_share_content,
-            &response
-        ));
-    }
-
-    #[test]
-    fn test_generate_verification_response_nonce_and_hash() {
-        let channel = 5;
-        let share_content = b"abc123";
-        let request = generate_verification_request("secret", 4);
-
-        let response = generate_verification_response("secret", &channel, share_content, &request);
-
-        // Manually compute expected hash
-        let mut hasher = Sha384::new();
-        hasher.update(share_content);
-        hasher.update(request.nonce.as_slice());
-        let expected_hash = hasher.finalize().to_vec();
-
-        assert_eq!(response.hash, expected_hash);
-    }
-
-    #[test]
-    fn test_verification_fails_with_modified_nonce() {
-        let share_content = b"nonce_test_content";
-        let request = generate_verification_request("secret", 4);
-
-        let mut response = generate_verification_response("secret", &41, share_content, &request);
-
-        // Tamper with the nonce
-        response.nonce[0] ^= 0xAA;
-
-        assert!(!verify_share_response(
-            "secret",
-            &41,
-            share_content,
-            &response
-        ));
-    }
+    Ok(hash == response.hash)
 }

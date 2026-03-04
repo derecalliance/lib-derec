@@ -3,11 +3,23 @@
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RecoveryError {
+    #[error("secret_id is empty")]
+    EmptySecretId,
+
+    #[error("share version must be >= 0 (got={version})")]
+    InvalidVersion { version: i32 },
+
+    #[error("no share responses provided")]
+    EmptyResponses,
+
     #[error("share response does not contain a result")]
     MissingResult,
 
     #[error("share response indicates an error status (status={status})")]
     NonOkStatus { status: i32 },
+
+    #[error("committed_de_rec_share is empty")]
+    EmptyCommittedDeRecShare,
 
     #[error("failed to decode CommittedDeRecShare")]
     DecodeCommittedDeRecShare {

@@ -4,6 +4,7 @@ pub mod pairing;
 pub mod protos;
 pub mod recovery;
 pub mod sharing;
+mod ts_bindings_utils;
 pub mod types;
 pub mod verification;
 

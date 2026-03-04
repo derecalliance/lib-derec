@@ -7,6 +7,10 @@ pub use error::SharingError;
 mod sharing;
 pub use sharing::*;
 
+mod types;
+pub use types::*;
+
+use crate::ts_bindings_utils::{js_error, js_error_from_lib};
 use prost::Message;
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
@@ -23,8 +27,8 @@ pub fn ts_protect_secret(
     channels: &[u64],
     threshold: u32,
     version: u32,
-) -> JsValue {
-    let sharing = sharing::protect_secret(
+) -> Result<JsValue, JsValue> {
+    let ProtectSecretResult { shares } = sharing::protect_secret(
         secret_id,
         secret_data,
         channels,
@@ -33,15 +37,17 @@ pub fn ts_protect_secret(
         None,
         None,
     )
-    .unwrap();
+    .map_err(js_error_from_lib)?;
 
     let wrapper = TsProtectSecretResult {
-        value: sharing
+        value: shares
             .into_iter()
             .map(|(k, v)| (k, v.encode_to_vec()))
             .collect(),
     };
-    serde_wasm_bindgen::to_value(&wrapper).unwrap()
+
+    serde_wasm_bindgen::to_value(&wrapper)
+        .map_err(|e| js_error("WASM_SERIALIZE_ERROR", e.to_string()))
 }
 
 #[cfg(test)]
