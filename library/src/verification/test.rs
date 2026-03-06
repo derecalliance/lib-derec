@@ -22,7 +22,7 @@ mod tests {
         };
 
         let result =
-            generate_verification_response(secret_id, &channel_id, share_content, &request);
+            generate_verification_response(secret_id, &channel_id.into(), share_content, &request);
 
         assert!(matches!(
             result,
@@ -40,9 +40,13 @@ mod tests {
         let share_content = b"test_share_content";
         let request = generate_verification_request(secret_id, version)
             .expect("Failed to generate verification request");
-        let response =
-            generate_verification_response(secret_id, &target_channel, share_content, &request)
-                .expect("Failed to generate verification response");
+        let response = generate_verification_response(
+            secret_id,
+            &target_channel.into(),
+            share_content,
+            &request,
+        )
+        .expect("Failed to generate verification response");
 
         assert_eq!(response.version, version);
         assert_eq!(response.nonce, request.nonce);
@@ -52,7 +56,7 @@ mod tests {
         );
 
         assert!(
-            matches!(verify_share_response(secret_id, &target_channel, share_content, &response), Ok(valid) if valid)
+            matches!(verify_share_response(secret_id, &target_channel.into(), share_content, &response), Ok(valid) if valid)
         );
     }
 
@@ -67,12 +71,16 @@ mod tests {
         let request = generate_verification_request(secret_id, version)
             .expect("Failed to generate verification request");
 
-        let response =
-            generate_verification_response(secret_id, &target_channel, share_content, &request)
-                .expect("Failed to generate verification response");
+        let response = generate_verification_response(
+            secret_id,
+            &target_channel.into(),
+            share_content,
+            &request,
+        )
+        .expect("Failed to generate verification response");
 
         assert!(
-            matches!(verify_share_response(secret_id, &target_channel, wrong_share_content, &response), Ok(valid) if !valid)
+            matches!(verify_share_response(secret_id, &target_channel.into(), wrong_share_content, &response), Ok(valid) if !valid)
         );
     }
 
@@ -85,8 +93,9 @@ mod tests {
         let request = generate_verification_request(secret_id, version)
             .expect("Failed to generate verification request");
 
-        let response = generate_verification_response(secret_id, &channel, share_content, &request)
-            .expect("Failed to generate verification response");
+        let response =
+            generate_verification_response(secret_id, &channel.into(), share_content, &request)
+                .expect("Failed to generate verification response");
 
         // Manually compute expected hash
         let mut hasher = Sha384::new();
@@ -107,14 +116,14 @@ mod tests {
             .expect("Failed to generate verification request");
 
         let mut response =
-            generate_verification_response(secret_id, &channel, share_content, &request)
+            generate_verification_response(secret_id, &channel.into(), share_content, &request)
                 .expect("Failed to generate verification response");
 
         // Tamper with the nonce
         response.nonce[0] ^= 0xAA;
 
         assert!(
-            matches!(verify_share_response(secret_id, &channel, share_content, &response), Ok(valid) if !valid)
+            matches!(verify_share_response(secret_id, &channel.into(), share_content, &response), Ok(valid) if !valid)
         );
     }
 }

@@ -1,79 +1,47 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::module_inception)]
+//! # Recovery Flow
+//!
+//! This module implements the **secret recovery protocol** defined by DeRec.
+//!
+//! Recovery allows an Owner who has lost access to their secret to reconstruct
+//! it using shares previously distributed to a set of Helpers.
+//!
+//! The recovery process consists of the following steps:
+//!
+//! 1. The Owner pairs with Helpers in **recovery mode**.
+//! 2. The Owner requests the shares stored by each Helper.
+//! 3. Each Helper responds with the share it holds for the given `(secret_id, version)`.
+//! 4. Once a sufficient number of shares are collected, the Owner verifies them
+//!    and reconstructs the secret.
+//!
+//! Secret reconstruction uses a **threshold secret sharing scheme**, meaning that
+//! at least `t` valid shares must be collected before recovery can succeed.
+//!
+//! Incorrect or corrupted shares may be provided by malicious or faulty Helpers.
+//! The recovery algorithm verifies each share before attempting reconstruction,
+//! allowing the Owner to discard invalid shares and continue collecting others
+//! until the threshold is reached.
+//!
+//! ## Module structure
+//!
+//! - `core` — implementation of the recovery protocol logic
+//! - `error` — recovery-specific error types
+//! - `wasm` — WebAssembly bindings for TypeScript consumers
+//!
+//! Most applications should use the high-level recovery functions provided by
+//! this module rather than interacting with protobuf messages directly.
+
 mod error;
-pub use error::RecoveryError;
+pub use error::*;
 
-mod recovery;
-pub use recovery::*;
+mod core;
+pub use core::*;
 
-use crate::{
-    protos::derec_proto::{
-        GetShareRequestMessage, GetShareResponseMessage, StoreShareRequestMessage,
-    },
-    ts_bindings_utils::{js_error, js_error_from_lib},
-};
-use prost::Message;
-
-use wasm_bindgen::prelude::*;
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct TsRecoverShareResponses {
-    value: std::collections::HashMap<u64, Vec<u8>>,
-}
-
-#[wasm_bindgen]
-pub fn ts_generate_share_request(
-    channel_id: u64,
-    secret_id: &[u8],
-    version: i32,
-) -> Result<Vec<u8>, JsValue> {
-    let result = recovery::generate_share_request(&channel_id, secret_id, version)
-        .map_err(js_error_from_lib)?;
-
-    Ok(result.encode_to_vec())
-}
-
-#[wasm_bindgen]
-pub fn ts_generate_share_response(
-    secret_id: &[u8],
-    channel_id: u64,
-    share_content: &[u8],
-    request: &[u8],
-) -> Result<Vec<u8>, JsValue> {
-    let request = GetShareRequestMessage::decode(request)
-        .map_err(|e| js_error("PROTOBUF_DECODE", e.to_string()))?;
-    let share_content = StoreShareRequestMessage::decode(share_content)
-        .map_err(|e| js_error("PROTOBUF_DECODE", e.to_string()))?;
-
-    let result =
-        recovery::generate_share_response(&channel_id, secret_id, &request, &share_content)
-            .map_err(js_error_from_lib)?;
-
-    Ok(result.encode_to_vec())
-}
-
-#[wasm_bindgen]
-pub fn ts_recover_from_share_responses(
-    responses: JsValue,
-    secret_id: &[u8],
-    version: i32,
-) -> Result<Vec<u8>, JsValue> {
-    let responses: TsRecoverShareResponses = serde_wasm_bindgen::from_value(responses)
-        .map_err(|e| js_error("WASM_DESERIALIZE_ERROR", e.to_string()))?;
-
-    let mut parsed_responses = Vec::new();
-    for (_channel_id, bytes) in responses.value {
-        let decoded = GetShareResponseMessage::decode(&*bytes)
-            .map_err(|e| js_error("PROTOBUF_DECODE", e.to_string()))?;
-        parsed_responses.push(decoded);
-    }
-
-    let secret = recovery::recover_from_share_responses(&parsed_responses, secret_id, version)
-        .map_err(js_error_from_lib)?;
-
-    Ok(secret)
-}
+#[cfg(target_arch = "wasm32")]
+mod wasm;
+#[cfg(target_arch = "wasm32")]
+pub use wasm::*;
 
 #[cfg(test)]
 mod test;

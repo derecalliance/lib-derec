@@ -36,7 +36,7 @@ mod tests {
     fn test_protect_secret_empty_secret_id() {
         let empty_secret_id = b"";
         let secret_data = b"secret-data";
-        let channels: Vec<ChannelId> = vec![1, 2, 3];
+        let channels: Vec<ChannelId> = [1, 2, 3].iter().copied().map(ChannelId::from).collect();
         let threshold = 2;
         let version = 1;
 
@@ -60,7 +60,7 @@ mod tests {
     fn test_protect_secret_empty_secret_data() {
         let secret_id = b"secret-id";
         let empty_secret_data = b"";
-        let channels: Vec<ChannelId> = vec![1, 2, 3];
+        let channels: Vec<ChannelId> = [1, 2, 3].iter().copied().map(ChannelId::from).collect();
         let threshold = 2;
         let version = 1;
 
@@ -84,7 +84,7 @@ mod tests {
     fn test_protect_secret_invalid_threshold_too_low() {
         let secret_id = b"secret-id";
         let secret_data = b"secret-data";
-        let channels: Vec<ChannelId> = vec![1, 2, 3];
+        let channels: Vec<ChannelId> = [1, 2, 3].iter().copied().map(ChannelId::from).collect();
         let too_low_threshold = 1; // invalid: must be >= 2
         let version = 1;
 
@@ -111,7 +111,7 @@ mod tests {
     fn test_protect_secret_invalid_threshold_too_high() {
         let secret_id = b"secret-id";
         let secret_data = b"secret-data";
-        let channels: Vec<ChannelId> = vec![1, 2, 3];
+        let channels: Vec<ChannelId> = [1, 2, 3].iter().copied().map(ChannelId::from).collect();
         let too_high_threshold = 4; // invalid: must be <= channels.len()
         let version = 1;
 
@@ -138,7 +138,7 @@ mod tests {
     fn test_protect_secret_valid_sharing() {
         let secret_id = b"my_secret_id";
         let secret_data = b"super_secret_value";
-        let channels: Vec<ChannelId> = vec![1, 2, 3];
+        let channels: Vec<ChannelId> = [1, 2, 3].iter().copied().map(ChannelId::from).collect();
         let threshold = 2;
         let version = 7;
         let keep_list = [1, 2, 3];
@@ -186,4 +186,3 @@ mod tests {
         }
     }
 }
-

@@ -1,13 +1,13 @@
 #[cfg(test)]
 mod tests {
     use crate::Error;
-    use crate::pairing::pairing::{
-        create_contact_message, process_pairing_response_message, produce_pairing_request_message,
-        produce_pairing_response_message,
-    };
     use crate::pairing::{
         CreateContactMessageResult, PairingError, ProducePairingRequestMessageResult,
         ProducePairingResponseMessageResult,
+    };
+    use crate::pairing::{
+        create_contact_message, process_pairing_response_message, produce_pairing_request_message,
+        produce_pairing_response_message,
     };
     use crate::protos::derec_proto;
     use derec_cryptography::pairing::PairingSecretKeyMaterial;
@@ -17,7 +17,7 @@ mod tests {
         let alice_channel_id = 42u64;
         let empty_transport_uri = "";
 
-        let result = create_contact_message(alice_channel_id, empty_transport_uri);
+        let result = create_contact_message(&alice_channel_id.into(), empty_transport_uri);
 
         assert!(matches!(
             result,
@@ -40,7 +40,8 @@ mod tests {
             message_encoding_type: 0,
         };
 
-        let result = produce_pairing_request_message(channel_id, kind, &invalid_contact_msg);
+        let result =
+            produce_pairing_request_message(&channel_id.into(), kind, &invalid_contact_msg);
 
         assert!(matches!(
             result,
@@ -63,7 +64,8 @@ mod tests {
             message_encoding_type: 0,
         };
 
-        let result = produce_pairing_request_message(channel_id, kind, &invalid_contact_msg);
+        let result =
+            produce_pairing_request_message(&channel_id.into(), kind, &invalid_contact_msg);
 
         assert!(matches!(
             result,
@@ -360,7 +362,7 @@ mod tests {
         let CreateContactMessageResult {
             contact_message: alice_contact_msg,
             secret_key: alice_sk_state,
-        } = create_contact_message(alice_channel_id, &alice_transport_uri)
+        } = create_contact_message(&alice_channel_id.into(), &alice_transport_uri)
             .expect("Failed to create contract message");
 
         // Bob produces a pairing request message using Alice's contact message
@@ -369,7 +371,7 @@ mod tests {
         let ProducePairingRequestMessageResult {
             pair_request_message: bob_pair_req_msg,
             secret_key: bob_sk_state,
-        } = produce_pairing_request_message(bob_channel_id, bob_kind, &alice_contact_msg)
+        } = produce_pairing_request_message(&bob_channel_id.into(), bob_kind, &alice_contact_msg)
             .expect("Failed to produce pairing request message");
 
         let ProducePairingResponseMessageResult {
@@ -400,7 +402,7 @@ mod tests {
         let CreateContactMessageResult {
             contact_message: contact_msg,
             secret_key: _,
-        } = create_contact_message(channel_id, &transport_uri)
+        } = create_contact_message(&channel_id.into(), &transport_uri)
             .expect("Failed to create contract message");
 
         assert_eq!(contact_msg.public_key_id, channel_id);
@@ -414,14 +416,14 @@ mod tests {
         let transport_uri = String::from("test://transport");
         let CreateContactMessageResult {
             contact_message, ..
-        } = create_contact_message(channel_id, &transport_uri)
+        } = create_contact_message(&channel_id.into(), &transport_uri)
             .expect("Failed to create contract message");
 
         let ProducePairingRequestMessageResult {
             pair_request_message,
             ..
         } = produce_pairing_request_message(
-            channel_id,
+            &channel_id.into(),
             derec_proto::SenderKind::SharerNonRecovery,
             &contact_message,
         )
