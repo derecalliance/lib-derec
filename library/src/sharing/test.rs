@@ -33,6 +33,31 @@ mod tests {
     }
 
     #[test]
+    fn test_protect_secret_duplicated_channels() {
+        let secret_id = b"secret-id";
+        let secret_data = b"secret-data";
+        let duplicated_channels: Vec<ChannelId> =
+            [1, 1, 3].iter().copied().map(ChannelId::from).collect();
+        let threshold = 2;
+        let version = 1;
+
+        let result = protect_secret(
+            secret_id,
+            secret_data,
+            &duplicated_channels,
+            threshold,
+            version,
+            None,
+            None,
+        );
+
+        assert!(matches!(
+            result,
+            Err(Error::Sharing(SharingError::DuplicateChannels))
+        ));
+    }
+
+    #[test]
     fn test_protect_secret_empty_secret_id() {
         let empty_secret_id = b"";
         let secret_data = b"secret-data";

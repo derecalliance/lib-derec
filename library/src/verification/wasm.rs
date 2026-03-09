@@ -31,7 +31,7 @@ pub fn ts_generate_verification_response(
     let request = VerifyShareRequestMessage::decode(request)
         .map_err(|e| js_error("PROTOBUF_DECODE", e.to_string()))?;
     let result =
-        generate_verification_response(secret_id, &channel_id.into(), share_content, &request)
+        generate_verification_response(secret_id, channel_id.into(), share_content, &request)
             .map_err(js_error_from_lib)?;
 
     Ok(result.encode_to_vec())
@@ -47,7 +47,7 @@ pub fn ts_verify_share_response(
     let response = VerifyShareResponseMessage::decode(response)
         .map_err(|e| js_error("PROTOBUF_DECODE", e.to_string()))?;
 
-    let result = verify_share_response(secret_id, &channel_id.into(), share_content, &response)
+    let result = verify_share_response(secret_id, channel_id.into(), share_content, &response)
         .map_err(js_error_from_lib)?;
 
     Ok(result)

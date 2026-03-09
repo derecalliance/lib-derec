@@ -10,14 +10,15 @@ mod tests {
         produce_pairing_response_message,
     };
     use crate::protos::derec_proto;
+    use crate::types::ChannelId;
     use derec_cryptography::pairing::PairingSecretKeyMaterial;
 
     #[test]
     fn test_create_contact_message_empty_transport_uri() {
-        let alice_channel_id = 42u64;
+        let alice_channel_id = ChannelId(42);
         let empty_transport_uri = "";
 
-        let result = create_contact_message(&alice_channel_id.into(), empty_transport_uri);
+        let result = create_contact_message(alice_channel_id, empty_transport_uri);
 
         assert!(matches!(
             result,
@@ -27,12 +28,12 @@ mod tests {
 
     #[test]
     fn test_produce_pairing_request_message_empty_mlkem_encapsulation_key() {
-        let channel_id = 99u64;
+        let channel_id = ChannelId(42);
         let transport_uri = "alice://transport";
         let kind = derec_proto::SenderKind::Helper;
 
         let invalid_contact_msg = derec_proto::ContactMessage {
-            public_key_id: channel_id,
+            public_key_id: channel_id.into(),
             transport_uri: transport_uri.to_owned(),
             mlkem_encapsulation_key: Vec::new(),
             ecies_public_key: vec![0u8; 32],
@@ -40,8 +41,7 @@ mod tests {
             message_encoding_type: 0,
         };
 
-        let result =
-            produce_pairing_request_message(&channel_id.into(), kind, &invalid_contact_msg);
+        let result = produce_pairing_request_message(channel_id, kind, &invalid_contact_msg);
 
         assert!(matches!(
             result,
@@ -51,12 +51,12 @@ mod tests {
 
     #[test]
     fn test_produce_pairing_request_message_empty_ecies_public_key() {
-        let channel_id = 99u64;
+        let channel_id = ChannelId(42);
         let transport_uri = "alice://transport";
         let kind = derec_proto::SenderKind::Helper;
 
         let invalid_contact_msg = derec_proto::ContactMessage {
-            public_key_id: channel_id,
+            public_key_id: channel_id.into(),
             transport_uri: transport_uri.to_owned(),
             mlkem_encapsulation_key: vec![0u8; 32],
             ecies_public_key: Vec::new(),
@@ -64,8 +64,7 @@ mod tests {
             message_encoding_type: 0,
         };
 
-        let result =
-            produce_pairing_request_message(&channel_id.into(), kind, &invalid_contact_msg);
+        let result = produce_pairing_request_message(channel_id, kind, &invalid_contact_msg);
 
         assert!(matches!(
             result,
@@ -75,7 +74,7 @@ mod tests {
 
     #[test]
     fn test_produce_pairing_response_message_empty_mlkem_ciphertext() {
-        let channel_id = 99u64;
+        let channel_id = ChannelId(42);
         let kind = derec_proto::SenderKind::Helper;
         let sk_state = PairingSecretKeyMaterial {
             mlkem_decapsulation_key: None,
@@ -87,7 +86,7 @@ mod tests {
             sender_kind: kind.into(),
             mlkem_ciphertext: Vec::new(),
             ecies_public_key: vec![0u8; 32],
-            public_key_id: channel_id,
+            public_key_id: channel_id.into(),
             nonce: 1234,
             communication_info: None,
             parameter_range: None,
@@ -103,7 +102,7 @@ mod tests {
 
     #[test]
     fn test_produce_pairing_response_message_empty_ecies_public_key() {
-        let channel_id = 99u64;
+        let channel_id = ChannelId(42);
         let kind = derec_proto::SenderKind::Helper;
         let sk_state = PairingSecretKeyMaterial {
             mlkem_decapsulation_key: None,
@@ -115,7 +114,7 @@ mod tests {
             sender_kind: kind.into(),
             mlkem_ciphertext: vec![0u8; 32],
             ecies_public_key: Vec::new(),
-            public_key_id: channel_id,
+            public_key_id: channel_id.into(),
             nonce: 1234,
             communication_info: None,
             parameter_range: None,
@@ -131,10 +130,10 @@ mod tests {
 
     #[test]
     fn test_process_pairing_response_message_no_result() {
-        let channel_id = 99u64;
+        let channel_id = ChannelId(42);
         let nonce = 1234;
         let contact_msg = derec_proto::ContactMessage {
-            public_key_id: channel_id,
+            public_key_id: channel_id.into(),
             transport_uri: "alice://transport".to_owned(),
             mlkem_encapsulation_key: vec![0u8; 32],
             ecies_public_key: vec![0u8; 32],
@@ -166,10 +165,10 @@ mod tests {
 
     #[test]
     fn test_process_pairing_response_message_result_no_ok() {
-        let channel_id = 99u64;
+        let channel_id = ChannelId(42);
         let nonce = 1234;
         let contact_msg = derec_proto::ContactMessage {
-            public_key_id: channel_id,
+            public_key_id: channel_id.into(),
             transport_uri: "alice://transport".to_owned(),
             mlkem_encapsulation_key: vec![0u8; 32],
             ecies_public_key: vec![0u8; 32],
@@ -204,10 +203,10 @@ mod tests {
 
     #[test]
     fn test_process_pairing_response_message_invalid_status() {
-        let channel_id = 99u64;
+        let channel_id = ChannelId(42);
         let nonce = 1234;
         let contact_msg = derec_proto::ContactMessage {
-            public_key_id: channel_id,
+            public_key_id: channel_id.into(),
             transport_uri: "alice://transport".to_owned(),
             mlkem_encapsulation_key: vec![0u8; 32],
             ecies_public_key: vec![0u8; 32],
@@ -242,9 +241,9 @@ mod tests {
 
     #[test]
     fn test_process_pairing_response_message_nonce_mismatch() {
-        let channel_id = 99u64;
+        let channel_id = ChannelId(42);
         let contact_msg = derec_proto::ContactMessage {
-            public_key_id: channel_id,
+            public_key_id: channel_id.into(),
             transport_uri: "alice://transport".to_owned(),
             mlkem_encapsulation_key: vec![0u8; 32],
             ecies_public_key: vec![0u8; 32],
@@ -279,10 +278,10 @@ mod tests {
 
     #[test]
     fn test_process_pairing_response_message_empty_mlkem_encapsulation_key() {
-        let channel_id = 99u64;
+        let channel_id = ChannelId(42);
         let nonce = 1234;
         let contact_msg = derec_proto::ContactMessage {
-            public_key_id: channel_id,
+            public_key_id: channel_id.into(),
             transport_uri: "alice://transport".to_owned(),
             mlkem_encapsulation_key: Vec::new(),
             ecies_public_key: vec![0u8; 32],
@@ -317,10 +316,10 @@ mod tests {
 
     #[test]
     fn test_process_pairing_response_message_empty_ecies_public_key() {
-        let channel_id = 99u64;
+        let channel_id = ChannelId(42);
         let nonce = 1234;
         let contact_msg = derec_proto::ContactMessage {
-            public_key_id: channel_id,
+            public_key_id: channel_id.into(),
             transport_uri: "alice://transport".to_owned(),
             mlkem_encapsulation_key: vec![0u8; 32],
             ecies_public_key: Vec::new(),
@@ -356,22 +355,22 @@ mod tests {
     #[test]
     fn test_alice_bob_pairing_flow() {
         // Alice creates a contact message
-        let alice_channel_id = 42u64;
+        let alice_channel_id = ChannelId(42);
         let alice_kind = derec_proto::SenderKind::SharerNonRecovery;
         let alice_transport_uri = String::from("alice://transport");
         let CreateContactMessageResult {
             contact_message: alice_contact_msg,
             secret_key: alice_sk_state,
-        } = create_contact_message(&alice_channel_id.into(), &alice_transport_uri)
+        } = create_contact_message(alice_channel_id, &alice_transport_uri)
             .expect("Failed to create contract message");
 
         // Bob produces a pairing request message using Alice's contact message
-        let bob_channel_id = 99u64;
+        let bob_channel_id = ChannelId(99);
         let bob_kind = derec_proto::SenderKind::Helper;
         let ProducePairingRequestMessageResult {
             pair_request_message: bob_pair_req_msg,
             secret_key: bob_sk_state,
-        } = produce_pairing_request_message(&bob_channel_id.into(), bob_kind, &alice_contact_msg)
+        } = produce_pairing_request_message(bob_channel_id, bob_kind, &alice_contact_msg)
             .expect("Failed to produce pairing request message");
 
         let ProducePairingResponseMessageResult {
@@ -396,40 +395,40 @@ mod tests {
 
     #[test]
     fn test_create_contact_message() {
-        let channel_id = 123u64;
+        let channel_id = ChannelId(42);
         let transport_uri = String::from("test://transport");
 
         let CreateContactMessageResult {
             contact_message: contact_msg,
             secret_key: _,
-        } = create_contact_message(&channel_id.into(), &transport_uri)
+        } = create_contact_message(channel_id, &transport_uri)
             .expect("Failed to create contract message");
 
-        assert_eq!(contact_msg.public_key_id, channel_id);
+        assert_eq!(contact_msg.public_key_id, channel_id.into());
         assert_eq!(contact_msg.transport_uri, transport_uri);
         assert_eq!(contact_msg.message_encoding_type, 0);
     }
 
     #[test]
     fn test_produce_pairing_request_message() {
-        let channel_id = 123u64;
+        let channel_id = ChannelId(42);
         let transport_uri = String::from("test://transport");
         let CreateContactMessageResult {
             contact_message, ..
-        } = create_contact_message(&channel_id.into(), &transport_uri)
+        } = create_contact_message(channel_id, &transport_uri)
             .expect("Failed to create contract message");
 
         let ProducePairingRequestMessageResult {
             pair_request_message,
             ..
         } = produce_pairing_request_message(
-            &channel_id.into(),
+            channel_id,
             derec_proto::SenderKind::SharerNonRecovery,
             &contact_message,
         )
         .expect("Failed to produce pairing request message");
 
-        assert_eq!(pair_request_message.public_key_id, channel_id);
+        assert_eq!(pair_request_message.public_key_id, channel_id.into());
         assert_eq!(pair_request_message.nonce, contact_message.nonce);
     }
 }

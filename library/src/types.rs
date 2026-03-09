@@ -58,3 +58,9 @@ impl From<ChannelId> for u64 {
         value.0
     }
 }
+
+impl PartialEq<u64> for ChannelId {
+    fn eq(&self, other: &u64) -> bool {
+        self.0 == *other
+    }
+}

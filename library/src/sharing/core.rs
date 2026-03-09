@@ -5,9 +5,10 @@ use crate::protos::derec_proto::{
 };
 use crate::sharing::{ProtectSecretResult, SharingError};
 use crate::types::*;
+use crate::utils::generate_seed;
 use derec_cryptography::vss;
 use prost::Message;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Protects a secret by generating verifiable secret shares and preparing
 /// protocol messages for distribution to previously paired helpers.
@@ -56,6 +57,7 @@ use std::collections::HashMap;
 /// Returns [`crate::Error`] (specifically `Error::Sharing(...)`) in the following cases:
 ///
 /// - `SharingError::EmptyChannels` if `channels` is empty.
+/// - `SharingError::DuplicateChannels` if `channels` contains duplicated values.
 /// - `SharingError::EmptySecretId` if `secret_id` is empty.
 /// - `SharingError::EmptySecretData` if `secret_data` is empty.
 /// - `SharingError::InvalidThreshold { .. }` if `threshold` does not satisfy
@@ -114,6 +116,11 @@ pub fn protect_secret(
         return Err(SharingError::EmptyChannels.into());
     }
 
+    let unique: HashSet<_> = channels.iter().copied().collect();
+    if unique.len() != channels.len() {
+        return Err(SharingError::DuplicateChannels.into());
+    }
+
     if secret_id.is_empty() {
         return Err(SharingError::EmptySecretId.into());
     }
@@ -131,6 +138,8 @@ pub fn protect_secret(
     }
 
     let vss_shares = generate_vss_shares(secret_data, threshold, channels.len())?;
+    let keep_list = keep_list.map(|lst| lst.to_vec()).unwrap_or_default();
+    let version_description = description.unwrap_or_default().to_owned();
 
     let mut shares = HashMap::with_capacity(channels.len());
 
@@ -160,8 +169,8 @@ pub fn protect_secret(
             share: committed_derec_share.encode_to_vec(),
             share_algorithm: 0,
             version,
-            keep_list: keep_list.map(|lst| lst.to_vec()).unwrap_or_default(),
-            version_description: description.map(|d| d.to_owned()).unwrap_or_default(),
+            keep_list: keep_list.clone(),
+            version_description: version_description.clone(),
         };
 
         shares.insert(*channel, outbound_msg);
@@ -170,21 +179,13 @@ pub fn protect_secret(
     Ok(ProtectSecretResult { shares })
 }
 
-fn generate_entropy() -> [u8; 32] {
-    let mut rng = rand::rngs::OsRng;
-    let mut entropy = [0u8; 32];
-    use rand::RngCore;
-    rng.fill_bytes(&mut entropy);
-
-    entropy
-}
-
 fn generate_vss_shares(
     secret_data: &[u8],
     threshold: usize,
     channels_len: usize,
 ) -> Result<Vec<derec_cryptography::vss::VSSShare>, SharingError> {
-    let entropy = generate_entropy();
+    let entropy = generate_seed::<32>();
+
     let (t, n) = (threshold as u64, channels_len as u64);
 
     vss::share((t, n), secret_data, &entropy)

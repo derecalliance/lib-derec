@@ -10,7 +10,6 @@
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
@@ -19,76 +18,73 @@ syntax = "proto3";
 
 package org.derecalliance.derec.protobuf;
 
-/*
- * A DeRec share that is committed and ready to be given to a helper to store.
- * During recovery, this protobuf message is returned.
- * The commitment involves a Merkle tree.  The hash of the share given to
- * each helper is one leaf in the tree.  Each leaf hash and internal hash
- * is a SHA-384 hash. The Merkle path from a leaf to the root (which is the
- * siblings of all nodes along that route) is called merklePath.
- * The root hash is called a "commitment".
- */
+// CommittedDeRecShare represents a DeRec share that has been committed and
+// is ready to be given to a helper for storage.
+//
+// During recovery, this protobuf message is returned.
+//
+// The commitment uses a Merkle tree. The hash of the share given to each
+// helper forms a leaf in the tree. Each leaf and internal node hash is a
+// SHA-384 hash.
+//
+// The Merkle path from a leaf to the root (i.e., the sibling nodes along
+// that route) is called merklePath. The root hash is referred to as the
+// "commitment".
 message CommittedDeRecShare {
-  /*
-   * Protobuf serialization of DeRecShare.
-   */
+
+  // Protobuf serialization of DeRecShare.
   bytes deRecShare = 1;
 
-  /** The Merkle root */
+  // The Merkle root.
   bytes commitment = 2;
 
-  /* one leaf or interior node. isLeft is true if it's a left child */
+  // Represents a leaf or interior node in the Merkle path.
+  // isLeft is true if the sibling is a left child.
   message SiblingHash {
     bool isLeft = 1;
     bytes hash = 2;
   }
 
-  /* The bottom-up Merkle path */
+  // The bottom-up Merkle path from the leaf to the root.
   repeated SiblingHash merklePath = 3;
 }
 
 
-/*
- * The information to share with a helper.
- * The sharer first generates a random AES-256 key k, and uses that
- * to AES-GCM encrypt the secret. A random polynomial f is generated
- * such that f(0)=k, and is evaluated at a random x value for the
- * intended helper.  The share contains y, where f(x) = y.
- * This should be done in GF(p), where p is the smallest 256-bit prime.
- * The order of the polynomial is the threshold for how many helpers are needed
- * to recover it.
- * This also includes the secretId and share version number, because they
- * should be serialized along with this, in order for them all to be signed
- * together.
- */
+// DeRecShare contains the information that a sharer provides to a helper.
+//
+// The sharer first generates a random AES-256 key k and uses it to
+// AES-GCM encrypt the secret. A random polynomial f is generated such
+// that f(0) = k. The polynomial is then evaluated at a random x value
+// for the intended helper, and the share contains the value y where
+// f(x) = y.
+//
+// The computation should be done in GF(p), where p is the smallest
+// 256-bit prime. The degree of the polynomial determines the threshold
+// number of helpers required to reconstruct the secret.
+//
+// The message also includes the secretId and the share version number,
+// because they must be serialized together with the share so that they
+// are covered by the same signature.
 message DeRecShare {
-  /*
-   * The result of taking the secret to be shared, serializing it,
-   * then encrypting it with a random AES-256 key.
-   */
+
+  // The result of serializing the secret to be shared and encrypting it
+  // with a randomly generated AES-256 key.
   bytes encryptedSecret = 1;
 
-  /*
-   * This is a random 256-bit integer, 2's complement, big endian.
-   */
+  // Random 256-bit integer encoded as two's complement, big-endian.
   bytes x = 2;
 
-  /*
-   * This is f(x)
-   */
+  // The value y = f(x).
   bytes y = 3;
 
-  /*
-   * Secret ID (any length from 1 to 16 bytes) for the requested share
-   * Must be unique for each secret created by a sharer.
-   */
+  // Secret ID (any length from 1 to 16 bytes) associated with the share.
+  //
+  // Must be unique for each secret created by a sharer.
   bytes secretId = 4;
 
-  /*
-   * version number for the share;
-   * note that helper is entitled to ignore any
-   * StoreShareRequestMessage with a version less
-   * than or equal to the last seen version
-   */
+  // Version number of the share.
+  //
+  // A helper is entitled to ignore any StoreShareRequestMessage whose
+  // version is less than or equal to the last seen version.
   int32 version = 5;
 }

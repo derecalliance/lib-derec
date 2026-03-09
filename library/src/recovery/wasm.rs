@@ -21,8 +21,8 @@ pub fn ts_generate_share_request(
     secret_id: &[u8],
     version: i32,
 ) -> Result<Vec<u8>, JsValue> {
-    let result = generate_share_request(&channel_id.into(), secret_id, version)
-        .map_err(js_error_from_lib)?;
+    let result =
+        generate_share_request(channel_id.into(), secret_id, version).map_err(js_error_from_lib)?;
 
     Ok(result.encode_to_vec())
 }
@@ -39,7 +39,7 @@ pub fn ts_generate_share_response(
     let share_content = StoreShareRequestMessage::decode(share_content)
         .map_err(|e| js_error("PROTOBUF_DECODE", e.to_string()))?;
 
-    let result = generate_share_response(&channel_id.into(), secret_id, &request, &share_content)
+    let result = generate_share_response(channel_id.into(), secret_id, &request, &share_content)
         .map_err(js_error_from_lib)?;
 
     Ok(result.encode_to_vec())

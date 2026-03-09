@@ -7,11 +7,12 @@ use crate::{
     },
     protos::derec_proto::{self, StatusEnum},
     types::ChannelId,
+    utils::generate_seed,
 };
 use derec_cryptography::pairing;
-use rand::RngCore;
+use rand::{Rng, rng};
 
-/// Creates a [`ContactMessage`] to bootstrap the DeRec *pairing* flow.
+/// Creates a [`ContactMessage`] used to bootstrap the DeRec *pairing* flow.
 ///
 /// In DeRec, pairing starts with an **out-of-band “contact” transfer** (typically QR)
 /// that is **not signed or encrypted**. The contact contains:
@@ -33,8 +34,6 @@ use rand::RngCore;
 /// * `transport_uri` - URI endpoint the counterparty will use to contact this party for the pairing
 ///   protocol and subsequent DeRec flows. Examples include an HTTPS endpoint, a relay URL, or another
 ///   application-defined transport scheme. Must not be empty.
-///
-/// # Returns
 ///
 /// # Returns
 ///
@@ -60,37 +59,37 @@ use rand::RngCore;
 ///
 /// ```rust
 /// use derec_library::pairing::*;
+/// use derec_library::types::ChannelId;
 ///
-/// let channel_id = 42u64;
+/// let channel_id = ChannelId(42);
 /// let transport_uri = "https://relay.example/derec";
 ///
 /// let CreateContactMessageResult {
 ///     contact_message,
 ///     secret_key,
 /// } = create_contact_message(
-///     &channel_id.into(),
+///     channel_id,
 ///     transport_uri
 /// ).expect("Failed to create contact message");
 /// ```
 pub fn create_contact_message(
-    channel_id: &ChannelId,
+    channel_id: ChannelId,
     transport_uri: &str,
 ) -> Result<CreateContactMessageResult, crate::Error> {
     if transport_uri.trim().is_empty() {
         return Err(PairingError::EmptyTransportUri.into());
     }
 
-    let mut rng = rand::rngs::OsRng;
+    let mut rng = rng();
 
     // generate the public key material
-    let mut seed = [0u8; 32];
-    rng.fill_bytes(&mut seed);
+    let seed = generate_seed::<32>();
 
-    let (pk, sk) = pairing::contact_message(seed)
+    let (pk, sk) = pairing::contact_message(*seed)
         .map_err(|e| PairingError::ContactMessageKeygen { source: e })?;
 
     let contact_message = derec_proto::ContactMessage {
-        public_key_id: (*channel_id).into(),
+        public_key_id: channel_id.into(),
         transport_uri: transport_uri.to_owned(),
         mlkem_encapsulation_key: pk.mlkem_encapsulation_key,
         ecies_public_key: pk.ecies_public_key,
@@ -167,8 +166,9 @@ pub fn create_contact_message(
 ///
 /// ```rust
 /// use derec_library::pairing::*;
+/// use derec_library::types::ChannelId;
 ///
-/// let channel_id = 42u64;
+/// let channel_id = ChannelId(42);
 /// let kind = derec_library::protos::derec_proto::SenderKind::Helper;
 ///
 /// // This would normally come from QR decoding.
@@ -176,7 +176,7 @@ pub fn create_contact_message(
 ///     contact_message,
 ///     ..
 /// } = create_contact_message(
-///     &channel_id.into(),
+///     channel_id,
 ///     "https://relay.example/derec",
 /// ).expect("Failed to create contact message");
 ///
@@ -184,13 +184,13 @@ pub fn create_contact_message(
 ///     pair_request_message,
 ///     secret_key,
 /// } = produce_pairing_request_message(
-///     &channel_id.into(),
+///     channel_id,
 ///     kind,
 ///     &contact_message,
 /// ).expect("Failed to produce pairing request message");
 /// ```
 pub fn produce_pairing_request_message(
-    channel_id: &ChannelId,
+    channel_id: ChannelId,
     kind: derec_proto::SenderKind,
     contact_message: &derec_proto::ContactMessage,
 ) -> Result<ProducePairingRequestMessageResult, crate::Error> {
@@ -207,20 +207,17 @@ pub fn produce_pairing_request_message(
         ecies_public_key: contact_message.ecies_public_key.clone(),
     };
 
-    let mut rng = rand::rngs::OsRng;
-
     // Generate request key material
-    let mut seed = [0u8; 32];
-    rng.fill_bytes(&mut seed);
+    let seed = generate_seed::<32>();
 
-    let (req_pk, sk) = pairing::pairing_request_message(seed, &contact_pk)
+    let (req_pk, sk) = pairing::pairing_request_message(*seed, &contact_pk)
         .map_err(|e| PairingError::PairRequestKeygen { source: e })?;
 
     let pair_request_message = derec_proto::PairRequestMessage {
         sender_kind: kind.into(),
         mlkem_ciphertext: req_pk.mlkem_ciphertext,
         ecies_public_key: req_pk.ecies_public_key,
-        public_key_id: (*channel_id).into(),
+        public_key_id: channel_id.into(),
         nonce: contact_message.nonce,
         communication_info: None,
         parameter_range: None,
@@ -289,8 +286,9 @@ pub fn produce_pairing_request_message(
 ///
 /// ```rust
 /// use derec_library::pairing::*;
+/// use derec_library::types::ChannelId;
 ///
-/// let channel_id = 42u64;
+/// let channel_id = ChannelId(42);
 /// let kind = derec_library::protos::derec_proto::SenderKind::Helper;
 ///
 /// // Initiator creates contact message.
@@ -298,22 +296,22 @@ pub fn produce_pairing_request_message(
 ///     contact_message,
 ///     secret_key: contactor_secret_key,
 /// } = create_contact_message(
-///     &channel_id.into(),
+///     channel_id,
 ///     "https://relay.example/derec",
 /// ).expect("Failed to create contact message");
 ///
 /// // Responder produces pairing request.
-/// let ProducePairingRequestMessageResult{
+/// let ProducePairingRequestMessageResult {
 ///     pair_request_message,
 ///     ..
 /// } = produce_pairing_request_message(
-///     &channel_id.into(),
+///     channel_id,
 ///     kind,
 ///     &contact_message,
 /// ).expect("Failed to produce pairing request message");
 ///
 /// // Initiator finalizes pairing.
-/// let ProducePairingResponseMessageResult{
+/// let ProducePairingResponseMessageResult {
 ///     pair_response_message,
 ///     shared_key,
 /// } = produce_pairing_response_message(
@@ -419,8 +417,9 @@ pub fn produce_pairing_response_message(
 ///
 /// ```rust
 /// use derec_library::pairing::*;
+/// use derec_library::types::ChannelId;
 ///
-/// let channel_id = 42u64;
+/// let channel_id = ChannelId(42);
 /// let kind = derec_library::protos::derec_proto::SenderKind::Helper;
 ///
 /// // This would normally come from QR decoding.
@@ -428,22 +427,22 @@ pub fn produce_pairing_response_message(
 ///     contact_message,
 ///     secret_key: contactor_secret_key,
 /// } = create_contact_message(
-///     &channel_id.into(),
+///     channel_id,
 ///     "https://relay.example/derec",
 /// ).expect("Failed to create contact message");
 ///
 /// // Responder produces pairing request.
-/// let ProducePairingRequestMessageResult{
+/// let ProducePairingRequestMessageResult {
 ///     pair_request_message,
 ///     secret_key: requestor_secret_key,
 /// } = produce_pairing_request_message(
-///     &channel_id.into(),
+///     channel_id,
 ///     kind,
 ///     &contact_message,
 /// ).expect("Failed to produce pairing request message");
 ///
 /// // Initiator finalizes pairing.
-/// let ProducePairingResponseMessageResult{
+/// let ProducePairingResponseMessageResult {
 ///     pair_response_message,
 ///     shared_key,
 /// } = produce_pairing_response_message(
@@ -463,6 +462,13 @@ pub fn process_pairing_response_message(
     pair_response_message: &derec_proto::PairResponseMessage,
     pairing_secret_key_material: &pairing::PairingSecretKeyMaterial,
 ) -> Result<ProcessPairingResponseMessageResult, crate::Error> {
+    if contact_message.mlkem_encapsulation_key.is_empty() {
+        return Err(PairingError::InvalidContactMessage("mlkem_encapsulation_key is empty").into());
+    }
+    if contact_message.ecies_public_key.is_empty() {
+        return Err(PairingError::InvalidContactMessage("ecies_public_key is empty").into());
+    }
+
     let res = pair_response_message
         .result
         .as_ref()
@@ -479,13 +485,6 @@ pub fn process_pairing_response_message(
 
     if pair_response_message.nonce != contact_message.nonce {
         return Err(PairingError::ProtocolViolation("nonce mismatch").into());
-    }
-
-    if contact_message.mlkem_encapsulation_key.is_empty() {
-        return Err(PairingError::InvalidContactMessage("mlkem_encapsulation_key is empty").into());
-    }
-    if contact_message.ecies_public_key.is_empty() {
-        return Err(PairingError::InvalidContactMessage("ecies_public_key is empty").into());
     }
 
     let pk = pairing::PairingContactMessageMaterial {

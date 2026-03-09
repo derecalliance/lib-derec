@@ -18,56 +18,54 @@
 syntax = "proto3";
 package org.derecalliance.derec.protobuf;
 
-/**
-* ----------------------------------------------------------------------------
-* This is the sole message that is not a DeRecMessage. It is not encrypted,
-* not signed, and not sent through the usual communication channels. It 
-* might be in a QR code, presented by either the helper or sharer, and scanned
-* by the other party.  Or it might be in an app that is provided by one party
-* and used by another party.  Or it might be sent through an existing channel
-* if the two parties already have some other relationship before they start
-* the DeRec protocol. The nonce might be sent separately from the rest of it.
-* ----------------------------------------------------------------------------
-*/
+// ContactMessage is the only protocol message that is not wrapped inside
+// a DeRecMessage.
+//
+// It is not encrypted, not signed, and not transmitted through the normal
+// protocol channels. Instead, it is exchanged out-of-band between the
+// two parties before the protocol begins.
+//
+// Typical transport mechanisms include:
+// - QR codes displayed by either the helper or the sharer and scanned by
+//   the other party
+// - Distribution inside an application provided by one party to the other
+// - Transmission through an existing communication channel if the parties
+//   already have a prior relationship
+//
+// The nonce may also be transmitted separately from the rest of the message.
 message ContactMessage {
- /**
-  * serialized ML-KEM-768 encapsulation key
-  */
- bytes mlkemEncapsulationKey = 1;
 
- /**
-  * serialized ECIES public key
-  */
- bytes eciesPublicKey = 2;
+  // Serialized ML-KEM-768 encapsulation key.
+  bytes mlkemEncapsulationKey = 1;
+
+  // Serialized ECIES public key.
+  bytes eciesPublicKey = 2;
  
-/**
-  * A number used to later identify the publicEncryptionKey. 
-  * When a message is sent to the creator of this contact, and it is encrypted
-  * with the publicEncryptionKey, this identifier is also sent, so the recipient 
-  * knows which key to use to decrypt it. If the recipient creates multiple 
-  * keys for multiple pairings, then they should remember the publicKeyId that
-  * they chose for each one, so they won't have to try all the keys during decryption. 
-  */
- uint64 publicKeyId = 3;
+  // Identifier used to reference the public encryption key.
+  //
+  // When a message is sent to the creator of this contact and encrypted
+  // with the public encryption key, this identifier is included so the
+  // recipient knows which key to use for decryption.
+  //
+  // If the recipient generates multiple keys for multiple pairings, they
+  // should remember the publicKeyId associated with each one so that they
+  // do not need to try all keys during decryption.
+  uint64 publicKeyId = 3;
 
- /**
-  * 64-bit (random) nonce to identify the pairing session. 
-  * This should be given to a party after authenticating.
-  */
- uint64 nonce = 4;
+  // Random 64-bit nonce used to identify the pairing session.
+  //
+  // This should be given to the other party only after authentication.
+  uint64 nonce = 4;
 
- /**
-  * URI endpoint for contacting the helper/sharer
-  * This can be an https endpoint or a rabbitMQ endpoint
-  */
- string transportUri = 5;
+  // URI endpoint used to contact the helper or sharer.
+  //
+  // This can be an HTTPS endpoint or a RabbitMQ endpoint.
+  string transportUri = 5;
 
-  /**
-   * Message encoding mechanism
-   */
+  // Message encoding mechanism used for protocol messages.
   MessageEncodingEnum messageEncodingType = 6;
 
   enum MessageEncodingEnum {
-   Protobuf = 0;
+    Protobuf = 0;
   }
 }

@@ -4,11 +4,9 @@ use crate::protos::derec_proto::{
     Result as DerecResult, StatusEnum, VerifyShareRequestMessage, VerifyShareResponseMessage,
 };
 use crate::types::*;
-use crate::verification::VerificationError;
-use rand::RngCore;
+use rand::{Rng, rng};
 use sha2::*;
-
-const VERIFICATION_NONCE_LEN: usize = 32;
+use subtle::ConstantTimeEq;
 
 /// Creates a [`VerifyShareRequestMessage`] to initiate the DeRec *verification* flow.
 ///
@@ -57,18 +55,17 @@ const VERIFICATION_NONCE_LEN: usize = 32;
 ///     .expect("failed to build verification request");
 ///
 /// assert_eq!(request.version, 7);
-/// assert_eq!(request.nonce.len(), 32);
 /// ```
 pub fn generate_verification_request(
     _secret_id: impl AsRef<[u8]>,
     version: i32,
 ) -> Result<VerifyShareRequestMessage, crate::Error> {
-    // Generate a nonce using a secure random number generator
-    let mut rng = rand::rngs::OsRng;
-    let mut nonce = vec![0u8; VERIFICATION_NONCE_LEN];
-    rng.fill_bytes(&mut nonce);
+    let mut rng = rng();
 
-    Ok(VerifyShareRequestMessage { version, nonce })
+    Ok(VerifyShareRequestMessage {
+        version,
+        nonce: rng.next_u64(),
+    })
 }
 
 /// Creates a [`VerifyShareResponseMessage`] to answer a DeRec *verification* request.
@@ -118,16 +115,17 @@ pub fn generate_verification_request(
 ///
 /// ```rust
 /// use derec_library::verification::*;
+/// use derec_library::types::ChannelId;
 ///
+/// let channel_id = ChannelId(42);
 /// let secret_id = "secret_id";
 /// let version = 7;
-/// let channel_id = 1;
 /// let share_content = b"example_share";
 ///
 /// let request = generate_verification_request(secret_id, version)
 ///     .expect("Failed to generate verification request");
 ///
-/// let response = generate_verification_response(secret_id, &channel_id.into(), share_content, &request)
+/// let response = generate_verification_response(secret_id, channel_id, share_content, &request)
 ///     .expect("Failed to generate verification response");
 ///
 /// assert_eq!(response.version, request.version);
@@ -136,18 +134,14 @@ pub fn generate_verification_request(
 /// ```
 pub fn generate_verification_response(
     _secret_id: impl AsRef<[u8]>,
-    _channel_id: &ChannelId,
+    _channel_id: ChannelId,
     share_content: impl AsRef<[u8]>,
     request: &VerifyShareRequestMessage,
 ) -> Result<VerifyShareResponseMessage, crate::Error> {
-    if request.nonce.len() != VERIFICATION_NONCE_LEN {
-        return Err(VerificationError::Invariant("request nonce must be 32 bytes").into());
-    }
-
     // compute the Sha384 hash of the share content
     let mut hasher = Sha384::new();
     hasher.update(share_content);
-    hasher.update(request.nonce.as_slice());
+    hasher.update(request.nonce.to_be_bytes());
     let hash = hasher.finalize().to_vec();
 
     Ok(VerifyShareResponseMessage {
@@ -156,7 +150,7 @@ pub fn generate_verification_response(
             memo: String::new(),
         }),
         version: request.version,
-        nonce: request.nonce.clone(),
+        nonce: request.nonce,
         hash,
     })
 }
@@ -200,34 +194,36 @@ pub fn generate_verification_response(
 ///
 /// ```rust
 /// use derec_library::verification::*;
+/// use derec_library::types::ChannelId;
 ///
+/// let channel_id = ChannelId(42);
 /// let secret_id = "secret_id";
 /// let version = 7;
-/// let channel_id = 1;
 /// let request = generate_verification_request(secret_id, version)
 ///     .expect("failed to build verification request");
 ///
 /// let share_content = b"example_share";
 ///
-/// let response = generate_verification_response(secret_id, &channel_id.into(), share_content, &request)
+/// let response = generate_verification_response(secret_id, channel_id, share_content, &request)
 ///     .expect("failed to generate verification response");
 ///
-/// let ok = verify_share_response(secret_id, &channel_id.into(), share_content, &response)
+/// let ok = verify_share_response(secret_id, channel_id, share_content, &response)
 ///     .expect("failed to verify response");
 ///
 /// assert!(ok);
 /// ```
 pub fn verify_share_response(
     _secret_id: impl AsRef<[u8]>,
-    _channel_id: &ChannelId,
+    _channel_id: ChannelId,
     share_content: impl AsRef<[u8]>,
     response: &VerifyShareResponseMessage,
 ) -> Result<bool, crate::Error> {
     // compute the Sha384 hash of the share content
     let mut hasher = Sha384::new();
     hasher.update(share_content);
-    hasher.update(response.nonce.as_slice());
+    hasher.update(response.nonce.to_be_bytes());
     let hash = hasher.finalize().to_vec();
 
-    Ok(hash == response.hash)
+    // Ok(hash == response.hash)
+    Ok(hash.ct_eq(response.hash.as_slice()).into())
 }

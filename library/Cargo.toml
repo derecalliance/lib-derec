@@ -8,18 +8,22 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 derec-cryptography = { path = "../cryptography" }
-prost = "0.12"
-prost-types = "0.12"
-rand = "0.8.5"
+prost = "0.14.3"
+prost-types = "0.14.3"
+rand = { version = "0.10.0", features = ["sys_rng"] }
 sha2 = "0.10.9"
 serde = { version = "1.0", features = ["derive"] }
 ark-serialize = { version = "0.5.0", default-features = true }
 thiserror = "2.0.18"
+zeroize = "1.8.2"
+subtle = "2.6.1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = { version = "0.2.114", features = ["serde-serialize"] }
 serde-wasm-bindgen = { version = "0.6.5" }
 js-sys = { version = "0.3.91" }
+getrandom_02 = { package = "getrandom", version = "0.2.16", features = ["js"] }
+getrandom_04 = { package = "getrandom", version = "0.4.2", features = ["wasm_js"] }
 
 [build-dependencies]
-prost-build = "0.12"
+prost-build = "0.14.3"

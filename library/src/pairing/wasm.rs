@@ -42,7 +42,7 @@ pub fn ts_create_contact_message(channel_id: u64, transport_uri: &str) -> Result
     let CreateContactMessageResult {
         contact_message,
         secret_key,
-    } = create_contact_message(&channel_id.into(), transport_uri).map_err(js_error_from_lib)?;
+    } = create_contact_message(channel_id.into(), transport_uri).map_err(js_error_from_lib)?;
 
     let wrapper = TsCreateContactMessageResult {
         contact_message: contact_message.encode_to_vec(),
@@ -67,7 +67,7 @@ pub fn ts_produce_pairing_request_message(
     let ProducePairingRequestMessageResult {
         pair_request_message,
         secret_key,
-    } = produce_pairing_request_message(&channel_id.into(), sender_kind, &contact_msg)
+    } = produce_pairing_request_message(channel_id.into(), sender_kind, &contact_msg)
         .map_err(js_error_from_lib)?;
 
     let wrapper = TsProducePairingRequestMessage {

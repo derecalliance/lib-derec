@@ -53,19 +53,20 @@ use prost::Message;
 ///
 /// ```rust
 /// use derec_library::recovery::*;
+/// use derec_library::types::ChannelId;
 ///
-/// let channel_id = 7u64;
+/// let channel_id = ChannelId(42);
 /// let secret_id = b"my_secret";
 /// let version = 1;
 ///
-/// let req = generate_share_request(&channel_id.into(), secret_id, version)
+/// let req = generate_share_request(channel_id, secret_id, version)
 ///     .expect("failed to build request");
 ///
 /// assert_eq!(req.secret_id, secret_id);
 /// assert_eq!(req.share_version, 1);
 /// ```
 pub fn generate_share_request(
-    _channel_id: &ChannelId,
+    _channel_id: ChannelId,
     secret_id: impl AsRef<[u8]>,
     version: i32,
 ) -> Result<GetShareRequestMessage, crate::Error> {
@@ -134,23 +135,24 @@ pub fn generate_share_request(
 /// ```rust
 /// use derec_library::recovery::*;
 /// use derec_library::protos::derec_proto::StoreShareRequestMessage;
+/// use derec_library::types::ChannelId;
 ///
-/// let channel_id = 1u64;
+/// let channel_id = ChannelId(42);
 /// let secret_id = b"secret_id";
 /// let version = 1;
-/// let request = generate_share_request(&channel_id.into(), secret_id, version).unwrap();
+/// let request = generate_share_request(channel_id, secret_id, version).unwrap();
 ///
 /// // In a real helper, this comes from secure storage.
 /// let stored = StoreShareRequestMessage { share: vec![1, 2, 3], ..Default::default() };
 ///
-/// let resp = generate_share_response(&channel_id.into(), secret_id, &request, &stored)
+/// let resp = generate_share_response(channel_id, secret_id, &request, &stored)
 ///     .expect("failed to build response");
 ///
 /// assert!(resp.result.is_some());
 /// assert!(!resp.committed_de_rec_share.is_empty());
 /// ```
 pub fn generate_share_response(
-    _channel_id: &ChannelId,
+    _channel_id: ChannelId,
     _secret_id: impl AsRef<[u8]>,
     _request: &GetShareRequestMessage,
     share_content: &StoreShareRequestMessage,
@@ -254,7 +256,6 @@ pub fn recover_from_share_responses(
         shares.push(extract_share_from_response(res, secret_id, version)?);
     }
 
-    // Assuming we have a function to reconstruct the secret from shares
     recover(&shares).map_err(|e| RecoveryError::ReconstructionFailed { source: e }.into())
 }
 

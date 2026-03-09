@@ -10,7 +10,6 @@
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
@@ -21,31 +20,31 @@ import "storeshare.proto";
 
 package org.derecalliance.derec.protobuf;
 
-/* Request a given share that is stored by the helper. */
+// GetShareRequestMessage requests a share stored by the helper.
 message GetShareRequestMessage {
-  /*
-   * Secret ID (any length from 1 to 16 bytes) for the requested share
-   * Must be unique for each secret created by a sharer
-   */
+
+  // Secret ID (any length from 1 to 16 bytes) for the requested share.
+  // Must be unique for each secret created by a sharer.
   bytes secretId = 1;
 
-  /* the share version for the requested share */
+  // Version of the share being requested.
   int32 shareVersion = 2;
 }
 
-/*
-  * Response giving the requested share to the sharer.
-  * The request is only processed if it comes through the communication channel
-  * that is either for the same secret ID that is being requested, or through
-  * a secret ID that was created in recovery mode.
-  */
+// GetShareResponseMessage returns the requested share to the sharer.
+//
+// The request is only processed if it arrives through the communication
+// channel associated with either:
+// - the same secret ID being requested, or
+// - a secret ID created in recovery mode.
 message GetShareResponseMessage {
-  /* the success or failure of processing the request */
+
+  // Result indicating success or failure when processing the request.
   Result result = 1;
 
-  /* the committed deRec share */
+  // The committed DeRec share.
   bytes committedDeRecShare = 2;
 
-  /* the share algorithm */
+  // Identifier of the share algorithm used to produce the share.
   int32 shareAlgorithm = 3;
 }
