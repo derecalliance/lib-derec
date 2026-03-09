@@ -323,7 +323,7 @@ dependencies = [
 
 [[package]]
 name = "derec-cryptography"
-version = "0.1.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "aead",
  "aes",
@@ -345,7 +345,7 @@ dependencies = [
 
 [[package]]
 name = "derec-library"
-version = "0.1.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "ark-serialize",
  "derec-cryptography",

@@ -1,13 +1,21 @@
 [package]
 name = "derec-library"
-version = "0.1.0"
+version = "0.0.1-alpha.1"
 edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Rust SDK for the DeRec protocol, including native and WebAssembly bindings."
+readme = "README.md"
+repository = "https://github.com/derecalliance/lib-derec"
+documentation = "https://derec-alliance.gitbook.io/docs/sdk/rust"
+homepage = "https://derecalliance.org"
+keywords = ["derec", "decentralized", "recovery", "secret-sharing", "sdk", "wasm"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-derec-cryptography = { path = "../cryptography" }
+derec-cryptography = { path = "../cryptography", version = "0.0.1-alpha.1" }
 prost = "0.14.3"
 prost-types = "0.14.3"
 rand = { version = "0.10.0", features = ["sys_rng"] }

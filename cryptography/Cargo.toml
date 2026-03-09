@@ -1,7 +1,14 @@
 [package]
 name = "derec-cryptography"
-version = "0.1.0"
+version = "0.0.1-alpha.1"
 edition = "2024"
+license = "Apache-2.0"
+description = "Cryptographic primitives used by the DeRec protocol implementation."
+repository = "https://github.com/derecalliance/lib-derec"
+documentation = "https://derec-alliance.gitbook.io/docs/sdk/rust"
+homepage = "https://derecalliance.org"
+readme = "README.md"
+keywords = ["derec", "decentralized", "cryptography", "secret-sharing", "recovery"]
 
 [dependencies]
 sha2 = "0.10.9"
