@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    sharing::{ProtectSecretResult, protect_secret},
+    sharing,
     ts_bindings_utils::{js_error, js_error_from_lib},
     types::ChannelId,
 };
@@ -10,12 +10,12 @@ use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct TsProtectSecretResult {
+struct ProtectSecretResult {
     value: HashMap<ChannelId, Vec<u8>>,
 }
 
 #[wasm_bindgen]
-pub fn ts_protect_secret(
+pub fn protect_secret(
     secret_id: &[u8],
     secret_data: &[u8],
     channels: &[u64],
@@ -24,7 +24,7 @@ pub fn ts_protect_secret(
 ) -> Result<JsValue, JsValue> {
     let channels: Vec<ChannelId> = channels.iter().copied().map(ChannelId::from).collect();
 
-    let ProtectSecretResult { shares } = protect_secret(
+    let sharing::ProtectSecretResult { shares } = sharing::protect_secret(
         secret_id,
         secret_data,
         channels,
@@ -35,7 +35,7 @@ pub fn ts_protect_secret(
     )
     .map_err(js_error_from_lib)?;
 
-    let wrapper = TsProtectSecretResult {
+    let wrapper = ProtectSecretResult {
         value: shares
             .into_iter()
             .map(|(k, v)| (k, v.encode_to_vec()))
