@@ -94,7 +94,7 @@ pub fn create_contact_message(
         mlkem_encapsulation_key: pk.mlkem_encapsulation_key,
         ecies_public_key: pk.ecies_public_key,
         nonce: rng.next_u64(),
-        message_encoding_type: 0,
+        transport_protocol: 0,
     };
 
     Ok(CreateContactMessageResult {

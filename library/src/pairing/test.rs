@@ -38,7 +38,7 @@ mod tests {
             mlkem_encapsulation_key: Vec::new(),
             ecies_public_key: vec![0u8; 32],
             nonce: 1234,
-            message_encoding_type: 0,
+            transport_protocol: 0,
         };
 
         let result = produce_pairing_request_message(channel_id, kind, &invalid_contact_msg);
@@ -61,7 +61,7 @@ mod tests {
             mlkem_encapsulation_key: vec![0u8; 32],
             ecies_public_key: Vec::new(),
             nonce: 1234,
-            message_encoding_type: 0,
+            transport_protocol: 0,
         };
 
         let result = produce_pairing_request_message(channel_id, kind, &invalid_contact_msg);
@@ -138,7 +138,7 @@ mod tests {
             mlkem_encapsulation_key: vec![0u8; 32],
             ecies_public_key: vec![0u8; 32],
             nonce,
-            message_encoding_type: 0,
+            transport_protocol: 0,
         };
 
         let sk_state = PairingSecretKeyMaterial {
@@ -173,7 +173,7 @@ mod tests {
             mlkem_encapsulation_key: vec![0u8; 32],
             ecies_public_key: vec![0u8; 32],
             nonce,
-            message_encoding_type: 0,
+            transport_protocol: 0,
         };
 
         let sk_state = PairingSecretKeyMaterial {
@@ -211,7 +211,7 @@ mod tests {
             mlkem_encapsulation_key: vec![0u8; 32],
             ecies_public_key: vec![0u8; 32],
             nonce,
-            message_encoding_type: 0,
+            transport_protocol: 0,
         };
 
         let sk_state = PairingSecretKeyMaterial {
@@ -248,7 +248,7 @@ mod tests {
             mlkem_encapsulation_key: vec![0u8; 32],
             ecies_public_key: vec![0u8; 32],
             nonce: 1234,
-            message_encoding_type: 0,
+            transport_protocol: 0,
         };
 
         let sk_state = PairingSecretKeyMaterial {
@@ -286,7 +286,7 @@ mod tests {
             mlkem_encapsulation_key: Vec::new(),
             ecies_public_key: vec![0u8; 32],
             nonce,
-            message_encoding_type: 0,
+            transport_protocol: 0,
         };
 
         let sk_state = PairingSecretKeyMaterial {
@@ -324,7 +324,7 @@ mod tests {
             mlkem_encapsulation_key: vec![0u8; 32],
             ecies_public_key: Vec::new(),
             nonce,
-            message_encoding_type: 0,
+            transport_protocol: 0,
         };
 
         let sk_state = PairingSecretKeyMaterial {
@@ -406,7 +406,7 @@ mod tests {
 
         assert_eq!(contact_msg.public_key_id, channel_id.into());
         assert_eq!(contact_msg.transport_uri, transport_uri);
-        assert_eq!(contact_msg.message_encoding_type, 0);
+        assert_eq!(contact_msg.transport_protocol, 0);
     }
 
     #[test]

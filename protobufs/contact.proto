@@ -62,10 +62,13 @@ message ContactMessage {
   // This can be an HTTPS endpoint or a RabbitMQ endpoint.
   string transportUri = 5;
 
-  // Message encoding mechanism used for protocol messages.
-  MessageEncodingEnum messageEncodingType = 6;
+  // Transport protocol that the transportUri represents.
+  //
+  // This indicates how the endpoint should be interpreted and how protocol
+  // messages should be delivered to the recipient.
+  TransportProtocol transportProtocol = 6;
 
-  enum MessageEncodingEnum {
-    Protobuf = 0;
+  enum TransportProtocol {
+    HTTPS = 0;
   }
 }
