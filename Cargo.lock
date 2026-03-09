@@ -344,11 +344,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "derec-cryptography"
+version = "0.0.1-alpha.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4239c379da19e53b9b8f5ce74deb756388a53dfdd99b147f08b02dfe2b9a76c"
+dependencies = [
+ "aead",
+ "aes",
+ "aes-gcm",
+ "ark-bw6-761",
+ "ark-ec",
+ "ark-ff",
+ "ark-poly",
+ "ark-secp256k1",
+ "ark-serialize",
+ "ark-std",
+ "ml-kem",
+ "rand 0.8.5",
+ "rand_chacha",
+ "rand_core 0.6.4",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "derec-library"
 version = "0.0.1-alpha.1"
 dependencies = [
  "ark-serialize",
- "derec-cryptography",
+ "derec-cryptography 0.0.1-alpha.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "getrandom 0.2.16",
  "getrandom 0.4.2",
  "js-sys",

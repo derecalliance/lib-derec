@@ -15,7 +15,7 @@ keywords = ["derec", "decentralized", "recovery", "secret-sharing", "sdk", "wasm
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-derec-cryptography = { path = "../cryptography", version = "0.0.1-alpha.1" }
+derec-cryptography =  "0.0.1-alpha.1"
 prost = "0.14.3"
 prost-types = "0.14.3"
 rand = { version = "0.10.0", features = ["sys_rng"] }
