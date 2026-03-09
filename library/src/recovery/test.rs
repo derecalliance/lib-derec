@@ -11,6 +11,7 @@ mod tests {
             recover_from_share_responses,
         },
         sharing::{self, ProtectSecretResult},
+        types::ChannelId,
     };
     use prost::Message;
 
@@ -61,11 +62,11 @@ mod tests {
 
     #[test]
     fn test_generate_share_request_empty_secret_id() {
-        let channel_id = 1;
+        let channel_id = ChannelId(1);
         let empty_secret_id = b"";
         let version = 0;
 
-        let result = generate_share_request(&channel_id, empty_secret_id, version);
+        let result = generate_share_request(channel_id, empty_secret_id, version);
 
         assert!(matches!(
             result,
@@ -75,11 +76,11 @@ mod tests {
 
     #[test]
     fn test_generate_share_request_invalid_version() {
-        let channel_id = 1;
+        let channel_id = ChannelId(1);
         let secret_id = b"secret_id";
         let invalid_version = -1;
 
-        let result = generate_share_request(&channel_id, secret_id, invalid_version);
+        let result = generate_share_request(channel_id, secret_id, invalid_version);
 
         assert!(matches!(
             result,
@@ -91,7 +92,7 @@ mod tests {
 
     #[test]
     fn test_generate_share_response_empty_committed_share() {
-        let channel_id = 1;
+        let channel_id = ChannelId(1);
         let secret_id = b"secret_id";
         let request = GetShareRequestMessage {
             secret_id: secret_id.to_vec(),
@@ -102,7 +103,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = generate_share_response(&channel_id, secret_id, &request, &share_content);
+        let result = generate_share_response(channel_id, secret_id, &request, &share_content);
 
         assert!(matches!(
             result,
@@ -309,7 +310,7 @@ mod tests {
 
         let secret_id = b"real_secret_id";
         let secret = b"real_secret_value";
-        let channels = vec![21, 22, 23];
+        let channels: Vec<ChannelId> = [21, 22, 23].into_iter().map(ChannelId::from).collect();
         let threshold = 2;
         let version: i32 = 2;
 
@@ -321,10 +322,10 @@ mod tests {
         // Simulate generating share requests and responses for each share
         let mut responses = Vec::new();
         for (i, (channel_id, share_content)) in shares.iter().enumerate() {
-            let request = generate_share_request(&channels[i], secret_id, version)
+            let request = generate_share_request(channels[i], secret_id, version)
                 .unwrap_or_else(|_| panic!("Failed to generate request {i}"));
             // Generate a share response
-            let response = generate_share_response(channel_id, secret_id, &request, share_content)
+            let response = generate_share_response(*channel_id, secret_id, &request, share_content)
                 .unwrap_or_else(|_| panic!("Failed to generate response {i}"));
 
             responses.push(response);

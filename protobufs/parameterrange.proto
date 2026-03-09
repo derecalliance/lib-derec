@@ -10,7 +10,6 @@
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
@@ -20,34 +19,29 @@ syntax = "proto3";
 package org.derecalliance.derec.protobuf;
 
 message ParameterRange {
-  /**
-   * Min/Max number of bytes willing to store at any given time
-   */
+
+  // Minimum and maximum number of bytes the party is willing to store
+  // at any given time.
   int64 minShareSize = 1;
   int64 maxShareSize = 2;
 
-  /**
-   * Min/Max time between verifications that will be accepted
-   */
+  // Minimum and maximum interval between verification requests that
+  // will be accepted.
   int64 minTimeBetweenVerifications = 3;
   int64 maxTimeBetweenVerifications = 4;
 
-  /**
-   * Min/Max time between accepting new shares
-   */
+  // Minimum and maximum interval between accepting new share updates.
   int64 minTimeBetweenShareUpdates = 5;
   int64 maxTimeBetweenShareUpdates = 6;
 
-  /**
-   * Min/Max timeout period in seconds for unpairing with the other party and
-   * deleting all the data
-   */
+  // Minimum and maximum timeout period (in seconds) after which the
+  // other party is considered unresponsive and the pairing may be
+  // removed along with all associated data.
   int64 minUnresponsiveDeletionTimeout = 7;
   int64 maxUnresponsiveDeletionTimeout = 8;
 
-  /**
-   * Min/Max timeout period in seconds for treating the other party as inactive
-   */
+  // Minimum and maximum timeout period (in seconds) after which the
+  // other party is considered inactive.
   int64 minUnresponsiveDeactivationTimeout = 9;
   int64 maxUnresponsiveDeactivationTimeout = 10;
 }

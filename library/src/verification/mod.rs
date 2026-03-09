@@ -1,67 +1,56 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::module_inception)]
+//! # Verification Flow
+//!
+//! This module implements the **share verification protocol** defined by DeRec.
+//!
+//! Verification is an optional but strongly recommended maintenance mechanism that
+//! allows an Owner to periodically confirm that a Helper is still retaining the
+//! correct share for a given `(secret_id, version)`.
+//!
+//! ## Purpose
+//!
+//! In practice, Helpers may lose state (device loss, storage corruption, app bugs),
+//! or may refuse to cooperate during recovery. Verification reduces the likelihood
+//! of discovering these failures only at recovery time.
+//!
+//! ## Protocol overview
+//!
+//! Verification is a challenge-response interaction initiated by the Owner:
+//!
+//! 1. The Owner sends a random challenge nonce to the Helper.
+//! 2. The Helper computes a response derived from the stored share contents and
+//!    the challenge nonce.
+//! 3. The Owner verifies the response. If it matches the expected value, the Helper
+//!    is considered to be holding the correct share.
+//!
+//! If verification fails, the Owner may respond by re-sending the correct share,
+//! retrying verification, and/or taking application-defined remediation actions
+//! (e.g., marking the Helper inactive, warning the user, or initiating re-sharing).
+//!
+//! ## Relationship to recovery
+//!
+//! Verification does not reconstruct the secret. It is a proactive health check to
+//! improve the probability that enough Helpers will provide valid shares when the
+//! Owner later enters recovery mode.
+//!
+//! ## Module structure
+//!
+//! - `core` — implementation of the verification logic (challenge construction and validation)
+//! - `error` — verification-specific error types
+//! - `wasm` — WebAssembly bindings for TypeScript consumers
+//!
+//! Most applications should interact with the high-level APIs exposed by this module
+//! rather than constructing protobuf messages directly.
+
 mod error;
-pub use error::VerificationError;
+pub use error::*;
 
-mod verification;
-pub use verification::*;
+mod core;
+pub use core::*;
 
-use crate::{
-    protos::derec_proto::{VerifyShareRequestMessage, VerifyShareResponseMessage},
-    ts_bindings_utils::{js_error, js_error_from_lib},
-};
-use prost::Message;
-
-use wasm_bindgen::prelude::*;
-
-#[wasm_bindgen]
-pub fn ts_generate_verification_request(
-    secret_id: &[u8],
-    version: u32,
-) -> Result<Vec<u8>, JsValue> {
-    let result = verification::generate_verification_request(secret_id, version as i32)
-        .map_err(js_error_from_lib)?;
-
-    Ok(result.encode_to_vec())
-}
-
-#[wasm_bindgen]
-pub fn ts_generate_verification_response(
-    secret_id: &[u8],
-    channel_id: u64,
-    share_content: &[u8],
-    request: &[u8],
-) -> Result<Vec<u8>, JsValue> {
-    let request = VerifyShareRequestMessage::decode(request)
-        .map_err(|e| js_error("PROTOBUF_DECODE", e.to_string()))?;
-    let result = verification::generate_verification_response(
-        secret_id,
-        &channel_id,
-        share_content,
-        &request,
-    )
-    .map_err(js_error_from_lib)?;
-
-    Ok(result.encode_to_vec())
-}
-
-#[wasm_bindgen]
-pub fn ts_verify_share_response(
-    secret_id: &[u8],
-    channel_id: u64,
-    share_content: &[u8],
-    response: &[u8],
-) -> Result<bool, JsValue> {
-    let response = VerifyShareResponseMessage::decode(response)
-        .map_err(|e| js_error("PROTOBUF_DECODE", e.to_string()))?;
-
-    let result =
-        verification::verify_share_response(secret_id, &channel_id, share_content, &response)
-            .map_err(js_error_from_lib)?;
-
-    Ok(result)
-}
+#[cfg(target_arch = "wasm32")]
+mod wasm;
 
 #[cfg(test)]
 mod test;

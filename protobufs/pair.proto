@@ -10,7 +10,6 @@
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
@@ -21,99 +20,83 @@ import "parameterrange.proto";
 import "result.proto";
 
 package org.derecalliance.derec.protobuf;
-/*
- * Is the sender of this message (i.e., the responder) a
- * helper, or a sharer that is not in recovery mode, or a sharer that is
- * in recovery mode?
- */
+
+// SenderKind identifies the role of the sender of a pairing message.
 enum SenderKind {
+  // Sender is a sharer operating in normal (non-recovery) mode.
   SHARER_NON_RECOVERY = 0;
+
+  // Sender is a sharer operating in recovery mode.
   SHARER_RECOVERY = 1;
+
+  // Sender is acting as a helper.
   HELPER = 2;
 }
 
-/*
-* ----------------------------------------------------------------------------
-* Pairing protocol
-* First message sent from the pairing initiator to the pairing
-* responder. There would earlier have been communication of the information
-* in a ContactMessage that was sent from the responder to the initiator by some
-* other means. For example, the responder could display a QR code that the
-* initiator scanned.
-* The initiator can be helper or sharer, and
-* the responder can be sharer or helper.
-* ----------------------------------------------------------------------------
-*/
+// PairRequestMessage is the first message sent in the pairing protocol,
+// from the pairing initiator to the pairing responder.
+//
+// Before this message is sent, the responder must have already provided
+// contact information (ContactMessage) to the initiator through an
+// out-of-band mechanism. For example, the responder may display a QR
+// code that the initiator scans.
+//
+// The initiator can be either a helper or a sharer, and the responder
+// can also be either a sharer or a helper.
 message PairRequestMessage {
-  /*
-   * The kind of the sender of this message (i.e., the responder)
-   */
+
+  // The role of the sender of this message.
   SenderKind senderKind = 1;
 
-  /*
-   * ML-KEM-768 ciphertext
-   */
+  // ML-KEM-768 ciphertext.
   bytes mlkemCiphertext = 3;
 
-  /*
-   * serialized ECIES public key
-   */
+  // Serialized ECIES public key.
   bytes eciesPublicKey = 4;
 
-/**
-  * A number used to later identify the publicEncryptionKey. 
-  * When any message is later sent to this initiator, and it is encrypted
-  * with the publicEncryptionKey, this identifier is also sent, so the recipient 
-  * knows which key to use to decrypt it. If the recipient creates multiple 
-  * keys for multiple pairings, then they should remember the publicKeyId that
-  * they chose for each one, so they won't have to try all the keys during decryption. 
-  */
+  // Identifier used to reference the public encryption key.
+  //
+  // When a later message is sent to this initiator and encrypted with
+  // the public encryption key, this identifier is included so the
+  // recipient knows which key to use for decryption.
+  //
+  // If the recipient generates multiple keys for multiple pairings,
+  // they should remember the publicKeyId chosen for each pairing so
+  // that they do not need to try all keys during decryption.
   uint64 publicKeyId = 5;
 
-  /*
-   * sender’s app-readable contact information,
-   * such as name, phone number, etc.
-   */
+  // Sender's application-readable contact information, such as name,
+  // phone number, or other identifying information.
   CommunicationInfo communicationInfo = 6;
 
-  /*
-   * 64-bit (random) nonce to identify the pairing session
-   */
+  // Random 64-bit nonce used to identify the pairing session.
   uint64 nonce = 7;
 
-  /*
-   * The parameter range for the sender.
-   */
+  // Parameter range supported by the sender.
   ParameterRange parameterRange = 8;
 }
 
-/*
- * Response, which is identical to the request, except without the
- * public encryption key, because it already happened during contact.
- */
+// PairResponseMessage is the response to PairRequestMessage.
+//
+// It is identical to the request except that it does not include the
+// public encryption key, since that information was already exchanged
+// through the ContactMessage.
 message PairResponseMessage {
-  /** the success or failure of processing the request */
+
+  // Result indicating success or failure of processing the request.
   Result result = 1;
 
-
-  /*
-   * The kind of the sender of this message (i.e., the responder)
-   */
+  // The role of the sender of this message.
   SenderKind senderKind = 2;
 
-  /*
-   * app-readable contact information (e.g. name, phone number, etc.)
-   */
+  // Application-readable contact information (e.g., name, phone number).
   CommunicationInfo communicationInfo = 4;
 
-  /*
-   * 64-bit (random) nonce to identify the pairing session;
-   * this is the same value as sent in the pairing request
-   */
+  // Random 64-bit nonce identifying the pairing session.
+  //
+  // This must match the nonce sent in the pairing request.
   uint64 nonce = 5;
 
-  /*
-   * The parameter range for the sender.
-   */
+  // Parameter range supported by the sender.
   ParameterRange parameterRange = 6;
 }

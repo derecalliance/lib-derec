@@ -11,7 +11,6 @@ aes-gcm = "0.10.3"
 rand = "0.8.5"
 rand_chacha = "0.3.1"
 rand_core = "0.6.4"
-getrandom = { version = "0.2", features = ["js"] }
 ark-std = "0.5.0"
 ark-ec = "0.5.0"
 ark-ff = "0.5.0"
@@ -20,4 +19,5 @@ ark-serialize = { version = "0.5.0", default-features = true }
 ark-bw6-761 = "0.5.0"
 ark-secp256k1 = "0.5.0"
 thiserror = "2.0.18"
-ml-kem = "0.2.1"
+ml-kem = "0.2.3"
+

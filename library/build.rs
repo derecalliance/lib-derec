@@ -3,7 +3,8 @@
 use std::path::PathBuf;
 
 fn main() {
-    let proto_root = PathBuf::from("../protobufs");
+    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let proto_root = manifest_dir.join("../protobufs");
 
     let proto_files = [
         proto_root.join("committedderecshare.proto"),
@@ -25,12 +26,14 @@ fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
     // Re-run if proto changes
+    println!("cargo:rerun-if-changed={}", proto_root.display());
     for proto in &proto_files {
         println!("cargo:rerun-if-changed={}", proto.display());
     }
 
     prost_build::Config::new()
-        .out_dir(out_dir.clone())
+        .out_dir(&out_dir)
+        .file_descriptor_set_path(out_dir.join("derec_descriptor.bin"))
         .compile_protos(&proto_files, &[proto_root])
         .expect("Failed to compile .proto files");
 }
