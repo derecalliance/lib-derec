@@ -9,7 +9,7 @@ readme = "README.md"
 repository = "https://github.com/derecalliance/lib-derec"
 documentation = "https://derec-alliance.gitbook.io/docs/sdk/rust"
 homepage = "https://derecalliance.org"
-keywords = ["derec", "decentralized", "recovery", "secret-sharing", "sdk", "wasm"]
+keywords = ["derec", "decentralized", "recovery", "secret-sharing", "sdk"]
 
 include = [
   "src/**",
