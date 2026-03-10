@@ -1,5 +1,5 @@
-use crate::protos::derec_proto;
 use derec_cryptography::pairing::{self as cryptography_pairing, PairingSecretKeyMaterial};
+use derec_proto;
 
 pub struct CreateContactMessageResult {
     pub contact_message: derec_proto::ContactMessage,

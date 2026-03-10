@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let proto_root = manifest_dir.join("../protobufs");
+    let proto_root = manifest_dir.join("protobufs");
 
     let proto_files = [
         proto_root.join("committedderecshare.proto"),

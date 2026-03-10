@@ -1,91 +1,195 @@
 # Contributing Guide
 
-Thank you for your interest in contributing to [DeRec Protocol!](https://github.com/derecalliance/protocol/blob/main/protocol.md) 🚀
+Thank you for your interest in contributing to the **DeRec Rust implementation**.
 
-All contributions are welcome, regardless of your experience level.
+This repository contains the reference Rust implementation of the
+[DeRec Protocol](https://github.com/derecalliance/protocol/blob/main/protocol.md).
 
-## New to the codebase? No worries! 🎉
+All contributions are welcome.
 
-Contributing to open source doesn't always mean writing code. Here are some great ways you can help:
+---
 
-- 🐛 **Report bugs** - Help us identify and fix issues.
-- 📚 **Improve documentation** - Make our docs clearer and more comprehensive.
-- 📢 **Spread the word** - Share the project with your network.
-- ✨ **Add features** - Implement new functionality.
-- 🔧 **Submit patches** - Fix existing issues and improve code.
+# Repository Overview
 
-Every contribution, no matter how small, makes a difference!
+This repository is organized as a Rust workspace containing several crates.
 
-## Support Questions
+```
+lib-derec/
+├── protobufs      # Generated protobuf protocol types
+├── cryptography   # Cryptographic primitives used by the protocol
+├── library        # Main SDK used by applications
+├── bindings/      # Example bindings and integration samples
+```
 
-Need help getting started or running into issues? Here's how to get support:
+Crate responsibilities:
 
-1. **Check the documentation first** 📖
-   - Review the README for use instructions.
-   - Browse existing issues for similar problems.
+| Crate | Purpose |
+|------|--------|
+| `derec-proto` | Generated protobuf message definitions |
+| `derec-cryptography` | Cryptographic primitives used by the protocol |
+| `derec-library` | Main SDK implementing the DeRec protocol |
 
-2. **Still stuck? Reach out!** 💬
-   - Open a new discussion for general questions.
-   - Create a support issue for specific problems.
+Most application developers will interact only with **`derec-library`**.
 
-We're here to help you succeed!
+---
 
-## Reporting Issues
+# Development Setup
 
-If you find a bug or have a feature request, please open an issue with the following information:
+Before building the project, install the required development tools.
 
-- A clear and descriptive title.
-- Steps to reproduce the issue (if applicable).
-- Expected and actual behavior.
-- Any relevant logs, screenshots, or code snippets.
+See:
 
-## Submitting Patches or contributions
+```
+INSTALL.md
+```
 
-- Include tests if your patch is supposed to solve a bug, and explain clearly under which circumstances the bug happens. Make sure the test fails without your patch.
+This document explains how to install:
 
-### First time setup
+- Rust
+- `protoc` (Protocol Buffers compiler)
+- `wasm-pack`
+- `bun` (for TypeScript bindings)
 
-1. **Configure git with your username and email:**
-   ```shell
-   git config --global user.name 'your name'
-   git config --global user.email 'your email'
-   ```
-2. **Fork Project to your GitHub account by clicking the [Fork button](https://github.com/derecalliance/lib-rust/fork).**
+---
 
-3. **[Clone](https://help.github.com/articles/fork-a-repo/#step-2-create-a-local-clone-of-your-fork) your GitHub fork locally:**
-   ```bash
-   git clone https://github.com/{username}/derecalliance/lib-rust
-   cd lib-rust
-   ```
+# Building the Workspace
 
-4. **Add the main repository as a remote to update later:**
-   ```bash
-   git remote add lib-rust https://github.com/derecalliance/lib-rust
-   cd lib-rust
-   ```
+Build all crates:
 
-5. **[Install rust](https://doc.rust-lang.org/book/ch01-01-installation.html#installation) and verify your versions:**
-   ```bash
-   rustc --version   # should output 1.87.0 
-   cargo --version   # should output 1.87.0 
-   ```
+```bash
+cargo build --workspace
+```
 
-6. **Build Project and run test to verify setup:**
-   ```
-   cargo build
-   cargo test
-   ```
+Run tests:
 
-7. **Start coding**
-   - Create a new branch to identify the issue (e.g. `fix_for#123`).
-   - Include tests that cover any code changes you make. Make sure the test fails without your patch.
-   - Push your commits and [create a pull request](https://help.github.com/articles/creating-a-pull-request/).
-   - **celebrate! 🎉** --We'll review it as soon as possible and get back to you.
+```bash
+cargo test --workspace
+```
 
-**Thank you for contributing to DeRec Protocol!** 💪
+Format the code:
 
-## Code Style
+```bash
+cargo fmt
+```
 
-- Follow the existing code style.
-- Use meaningful variable and function names.
-- Write comments where necessary.
+---
+
+# WebAssembly Builds
+
+The WebAssembly builds are produced from the `derec-library` crate.
+
+From the `derec-library/` directory run:
+
+```bash
+make
+```
+
+This produces two WASM packages:
+
+```
+target/pkg-node
+target/pkg-web
+```
+
+- `pkg-node` → optimized for Node.js environments
+- `pkg-web` → optimized for browser environments
+
+---
+
+# Reporting Issues
+
+If you find a bug or want to request a feature, please open an issue including:
+
+- A clear and descriptive title
+- Steps to reproduce the issue
+- Expected vs actual behavior
+- Logs, screenshots, or examples if applicable
+
+---
+
+# Submitting Contributions
+
+1. Fork the repository.
+
+2. Clone your fork:
+
+```bash
+git clone https://github.com/<your-username>/lib-derec
+cd lib-derec
+```
+
+3. Add the upstream repository:
+
+```bash
+git remote add upstream https://github.com/derecalliance/lib-derec
+```
+
+4. Create a new branch:
+
+```bash
+git checkout -b my-feature
+```
+
+5. Implement your changes.
+
+6. Ensure the project builds and tests pass:
+
+```bash
+cargo build --workspace
+cargo test --workspace
+```
+
+7. Push your branch:
+
+```bash
+git push origin my-feature
+```
+
+8. Open a Pull Request.
+
+---
+
+# Code Style
+
+Please follow existing project conventions:
+
+- Use `rustfmt` formatting
+- Prefer clear and descriptive names
+- Document public APIs using `rustdoc`
+- Add tests for new functionality
+
+Run formatting locally:
+
+```bash
+cargo fmt
+```
+
+---
+
+# Release Process
+
+Publishing crates is documented in:
+
+```
+RELEASE.md
+```
+
+This document describes:
+
+- crate version updates
+- dependency ordering
+- publishing procedures
+
+---
+
+# Getting Help
+
+If you need help:
+
+- Check the README and documentation
+- Search existing issues
+- Open a new issue or discussion if necessary
+
+---
+
+Thank you for contributing to the **DeRec ecosystem**.

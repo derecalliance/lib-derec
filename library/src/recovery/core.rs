@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    protos::derec_proto::{
-        CommittedDeRecShare, DeRecShare, GetShareRequestMessage, GetShareResponseMessage,
-        Result as DerecResult, StatusEnum, StoreShareRequestMessage,
-    },
-    recovery::RecoveryError,
-    types::ChannelId,
-};
+use crate::{recovery::RecoveryError, types::ChannelId};
 use derec_cryptography::vss::*;
+use derec_proto::{
+    CommittedDeRecShare, DeRecShare, GetShareRequestMessage, GetShareResponseMessage,
+    Result as DerecResult, StatusEnum, StoreShareRequestMessage,
+};
 use prost::Message;
 
 /// Produces a [`GetShareRequestMessage`] to request a specific `(secret_id, version)` share
@@ -134,8 +131,8 @@ pub fn generate_share_request(
 ///
 /// ```rust
 /// use derec_library::recovery::*;
-/// use derec_library::protos::derec_proto::StoreShareRequestMessage;
 /// use derec_library::types::ChannelId;
+/// use derec_proto::StoreShareRequestMessage;
 ///
 /// let channel_id = ChannelId(42);
 /// let secret_id = b"secret_id";
@@ -222,7 +219,7 @@ pub fn generate_share_response(
 ///
 /// ```rust
 /// use derec_library::recovery::*;
-/// use derec_library::protos::derec_proto::GetShareResponseMessage;
+/// use derec_proto::GetShareResponseMessage;
 ///
 /// let secret_id = b"secret_id";
 /// let version = 1;

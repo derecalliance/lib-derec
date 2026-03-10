@@ -9,9 +9,9 @@ mod tests {
         create_contact_message, process_pairing_response_message, produce_pairing_request_message,
         produce_pairing_response_message,
     };
-    use crate::protos::derec_proto;
     use crate::types::ChannelId;
     use derec_cryptography::pairing::PairingSecretKeyMaterial;
+    use derec_proto;
 
     #[test]
     fn test_create_contact_message_empty_transport_uri() {

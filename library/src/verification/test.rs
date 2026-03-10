@@ -1,12 +1,12 @@
 #[cfg(test)]
 mod tests {
     use crate::{
-        protos::derec_proto::StatusEnum,
         types::ChannelId,
         verification::{
             generate_verification_request, generate_verification_response, verify_share_response,
         },
     };
+    use derec_proto::StatusEnum;
     use sha2::{Digest, Sha384};
 
     #[test]

@@ -1,4 +1,5 @@
-use crate::{protos::derec_proto::StoreShareRequestMessage, types::ChannelId};
+use crate::types::ChannelId;
+use derec_proto::StoreShareRequestMessage;
 use std::collections::HashMap;
 
 pub struct ProtectSecretResult {

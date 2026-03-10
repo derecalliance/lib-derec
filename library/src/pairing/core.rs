@@ -5,11 +5,14 @@ use crate::{
         CreateContactMessageResult, PairingError, ProcessPairingResponseMessageResult,
         ProducePairingRequestMessageResult, ProducePairingResponseMessageResult,
     },
-    protos::derec_proto::{self, StatusEnum},
     types::ChannelId,
     utils::generate_seed,
 };
 use derec_cryptography::pairing;
+use derec_proto::{
+    ContactMessage, PairRequestMessage, PairResponseMessage, Result as DeRecResult, SenderKind,
+    StatusEnum,
+};
 use rand::{Rng, rng};
 
 /// Creates a [`ContactMessage`] used to bootstrap the DeRec *pairing* flow.
@@ -88,7 +91,7 @@ pub fn create_contact_message(
     let (pk, sk) = pairing::contact_message(*seed)
         .map_err(|e| PairingError::ContactMessageKeygen { source: e })?;
 
-    let contact_message = derec_proto::ContactMessage {
+    let contact_message = ContactMessage {
         public_key_id: channel_id.into(),
         transport_uri: transport_uri.to_owned(),
         mlkem_encapsulation_key: pk.mlkem_encapsulation_key,
@@ -167,9 +170,10 @@ pub fn create_contact_message(
 /// ```rust
 /// use derec_library::pairing::*;
 /// use derec_library::types::ChannelId;
+/// use derec_proto::SenderKind::Helper;
 ///
 /// let channel_id = ChannelId(42);
-/// let kind = derec_library::protos::derec_proto::SenderKind::Helper;
+/// let kind = Helper;
 ///
 /// // This would normally come from QR decoding.
 /// let CreateContactMessageResult {
@@ -191,8 +195,8 @@ pub fn create_contact_message(
 /// ```
 pub fn produce_pairing_request_message(
     channel_id: ChannelId,
-    kind: derec_proto::SenderKind,
-    contact_message: &derec_proto::ContactMessage,
+    kind: SenderKind,
+    contact_message: &ContactMessage,
 ) -> Result<ProducePairingRequestMessageResult, crate::Error> {
     if contact_message.mlkem_encapsulation_key.is_empty() {
         return Err(PairingError::InvalidContactMessage("mlkem_encapsulation_key is empty").into());
@@ -213,7 +217,7 @@ pub fn produce_pairing_request_message(
     let (req_pk, sk) = pairing::pairing_request_message(*seed, &contact_pk)
         .map_err(|e| PairingError::PairRequestKeygen { source: e })?;
 
-    let pair_request_message = derec_proto::PairRequestMessage {
+    let pair_request_message = PairRequestMessage {
         sender_kind: kind.into(),
         mlkem_ciphertext: req_pk.mlkem_ciphertext,
         ecies_public_key: req_pk.ecies_public_key,
@@ -287,9 +291,10 @@ pub fn produce_pairing_request_message(
 /// ```rust
 /// use derec_library::pairing::*;
 /// use derec_library::types::ChannelId;
+/// use derec_proto::SenderKind::Helper;
 ///
 /// let channel_id = ChannelId(42);
-/// let kind = derec_library::protos::derec_proto::SenderKind::Helper;
+/// let kind = Helper;
 ///
 /// // Initiator creates contact message.
 /// let CreateContactMessageResult {
@@ -321,8 +326,8 @@ pub fn produce_pairing_request_message(
 /// ).expect("Failed to produce pairing response message");
 /// ```
 pub fn produce_pairing_response_message(
-    kind: derec_proto::SenderKind,
-    pair_request_message: &derec_proto::PairRequestMessage,
+    kind: SenderKind,
+    pair_request_message: &PairRequestMessage,
     pairing_secret_key_material: &pairing::PairingSecretKeyMaterial,
 ) -> Result<ProducePairingResponseMessageResult, crate::Error> {
     if pair_request_message.mlkem_ciphertext.is_empty() {
@@ -343,10 +348,10 @@ pub fn produce_pairing_response_message(
         pairing::finish_pairing_contactor(pairing_secret_key_material, &pairing_request)
             .map_err(|e| PairingError::FinishPairingContactor { source: e })?;
 
-    let pair_response_message = derec_proto::PairResponseMessage {
+    let pair_response_message = PairResponseMessage {
         sender_kind: kind.into(),
-        result: Some(derec_proto::Result {
-            status: derec_proto::StatusEnum::Ok as i32,
+        result: Some(DeRecResult {
+            status: StatusEnum::Ok as i32,
             memo: String::new(),
         }),
         nonce: pair_request_message.nonce,
@@ -418,9 +423,10 @@ pub fn produce_pairing_response_message(
 /// ```rust
 /// use derec_library::pairing::*;
 /// use derec_library::types::ChannelId;
+/// use derec_proto::SenderKind::Helper;
 ///
 /// let channel_id = ChannelId(42);
-/// let kind = derec_library::protos::derec_proto::SenderKind::Helper;
+/// let kind = Helper;
 ///
 /// // This would normally come from QR decoding.
 /// let CreateContactMessageResult {
@@ -458,8 +464,8 @@ pub fn produce_pairing_response_message(
 /// ).expect("Failed to process pairing response message");
 /// ```
 pub fn process_pairing_response_message(
-    contact_message: &derec_proto::ContactMessage,
-    pair_response_message: &derec_proto::PairResponseMessage,
+    contact_message: &ContactMessage,
+    pair_response_message: &PairResponseMessage,
     pairing_secret_key_material: &pairing::PairingSecretKeyMaterial,
 ) -> Result<ProcessPairingResponseMessageResult, crate::Error> {
     if contact_message.mlkem_encapsulation_key.is_empty() {

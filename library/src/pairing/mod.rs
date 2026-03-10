@@ -43,8 +43,5 @@ pub use core::*;
 mod types;
 pub use types::*;
 
-#[cfg(target_arch = "wasm32")]
-mod wasm;
-
 #[cfg(test)]
 mod test;

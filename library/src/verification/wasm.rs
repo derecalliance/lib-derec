@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    protos::derec_proto::{VerifyShareRequestMessage, VerifyShareResponseMessage},
     ts_bindings_utils::{js_error, js_error_from_lib},
     verification,
 };
+use derec_proto::{VerifyShareRequestMessage, VerifyShareResponseMessage};
 use prost::Message;
 use wasm_bindgen::prelude::*;
 
