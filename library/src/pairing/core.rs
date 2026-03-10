@@ -170,9 +170,10 @@ pub fn create_contact_message(
 /// ```rust
 /// use derec_library::pairing::*;
 /// use derec_library::types::ChannelId;
+/// use derec_proto::SenderKind::Helper;
 ///
 /// let channel_id = ChannelId(42);
-/// let kind = derec_library::protos::derec_proto::SenderKind::Helper;
+/// let kind = Helper;
 ///
 /// // This would normally come from QR decoding.
 /// let CreateContactMessageResult {
@@ -290,9 +291,10 @@ pub fn produce_pairing_request_message(
 /// ```rust
 /// use derec_library::pairing::*;
 /// use derec_library::types::ChannelId;
+/// use derec_proto::SenderKind::Helper;
 ///
 /// let channel_id = ChannelId(42);
-/// let kind = derec_library::protos::derec_proto::SenderKind::Helper;
+/// let kind = Helper;
 ///
 /// // Initiator creates contact message.
 /// let CreateContactMessageResult {
@@ -421,9 +423,10 @@ pub fn produce_pairing_response_message(
 /// ```rust
 /// use derec_library::pairing::*;
 /// use derec_library::types::ChannelId;
+/// use derec_proto::SenderKind::Helper;
 ///
 /// let channel_id = ChannelId(42);
-/// let kind = derec_library::protos::derec_proto::SenderKind::Helper;
+/// let kind = Helper;
 ///
 /// // This would normally come from QR decoding.
 /// let CreateContactMessageResult {
