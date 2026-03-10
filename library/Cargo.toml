@@ -1,6 +1,6 @@
 [package]
 name = "derec-library"
-version = "0.0.1-alpha.1"
+version = "0.0.1-alpha.3"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -15,9 +15,9 @@ keywords = ["derec", "decentralized", "recovery", "secret-sharing", "sdk", "wasm
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-derec-cryptography =  "0.0.1-alpha.1"
+derec-cryptography =  "0.0.1-alpha.2"
+derec-proto =  "0.0.1-alpha.2"
 prost = "0.14.3"
-prost-types = "0.14.3"
 rand = { version = "0.10.0", features = ["sys_rng"] }
 sha2 = "0.10.9"
 serde = { version = "1.0", features = ["derive"] }
@@ -33,5 +33,3 @@ js-sys = { version = "0.3.91" }
 getrandom_02 = { package = "getrandom", version = "0.2.16", features = ["js"] }
 getrandom_04 = { package = "getrandom", version = "0.4.2", features = ["wasm_js"] }
 
-[build-dependencies]
-prost-build = "0.14.3"

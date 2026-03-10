@@ -2,16 +2,16 @@
 mod tests {
     use crate::{
         Error,
-        protos::derec_proto::{
-            CommittedDeRecShare, DeRecShare, GetShareRequestMessage, GetShareResponseMessage,
-            Result as DerecResult, StatusEnum, StoreShareRequestMessage,
-        },
         recovery::{
             RecoveryError, generate_share_request, generate_share_response,
             recover_from_share_responses,
         },
         sharing::{self, ProtectSecretResult},
         types::ChannelId,
+    };
+    use derec_proto::{
+        CommittedDeRecShare, DeRecShare, GetShareRequestMessage, GetShareResponseMessage,
+        Result as DerecResult, StatusEnum, StoreShareRequestMessage,
     };
     use prost::Message;
 

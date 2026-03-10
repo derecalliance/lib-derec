@@ -2,10 +2,10 @@
 mod tests {
     use crate::{
         Error,
-        protos::derec_proto::{CommittedDeRecShare, DeRecShare},
         sharing::{ProtectSecretResult, SharingError, protect_secret},
         types::ChannelId,
     };
+    use derec_proto::{CommittedDeRecShare, DeRecShare};
     use prost::Message;
 
     #[test]

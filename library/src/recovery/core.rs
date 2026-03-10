@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    protos::derec_proto::{
-        CommittedDeRecShare, DeRecShare, GetShareRequestMessage, GetShareResponseMessage,
-        Result as DerecResult, StatusEnum, StoreShareRequestMessage,
-    },
-    recovery::RecoveryError,
-    types::ChannelId,
-};
+use crate::{recovery::RecoveryError, types::ChannelId};
 use derec_cryptography::vss::*;
+use derec_proto::{
+    CommittedDeRecShare, DeRecShare, GetShareRequestMessage, GetShareResponseMessage,
+    Result as DerecResult, StatusEnum, StoreShareRequestMessage,
+};
 use prost::Message;
 
 /// Produces a [`GetShareRequestMessage`] to request a specific `(secret_id, version)` share

@@ -1,6 +1,10 @@
 # derec-cryptography
 
-Cryptographic primitives used by the **DeRec protocol implementation**.
+![Crates.io](https://img.shields.io/crates/v/derec-cryptography)
+![Docs.rs](https://docs.rs/derec-cryptography/badge.svg)
+![License](https://img.shields.io/badge/license-Apache%202.0-blue)
+
+Low-level cryptographic primitives used by the **DeRec protocol implementation**.
 
 This crate contains the low-level cryptographic building blocks required by
 `derec-library`, including key generation, encapsulation, and serialization
@@ -16,34 +20,46 @@ which provides the complete protocol implementation and developer-facing APIs.
 
 This crate provides implementations and utilities for:
 
-- ML-KEM key encapsulation mechanisms
+- ML-KEM key encapsulation mechanisms (KEM)
 - ECIES key generation and shared secret derivation
-- serialization helpers for elliptic curve keys
-- cryptographic hashing utilities used in the protocol
-- primitives required by DeRec pairing flows
+- Serialization helpers for elliptic curve keys
+- Cryptographic hashing utilities used in the protocol
+- Primitives required by DeRec pairing flows
 
-The cryptographic constructions rely heavily on well-established libraries
+The cryptographic constructions rely on well-established cryptographic libraries,
 including:
 
-- `arkworks`
-- `ml-kem`
-- `aes-gcm`
-- `sha2`
+- `arkworks` (elliptic curve arithmetic)
+- `ml-kem` (post-quantum key encapsulation)
+- `aes-gcm` (authenticated encryption)
+- `sha2` (cryptographic hashing)
 
 These libraries are used to implement the cryptographic mechanisms specified
 by the DeRec protocol.
 
 ---
 
+## Relationship with other crates
+
+The DeRec Rust implementation is composed of multiple crates:
+
+- `derec-library` – main SDK used by applications
+- `derec-cryptography` – internal cryptographic primitives
+- `derec-proto` – generated protocol message types
+
+Most developers should only interact with `derec-library`.
+
+---
+
 ## Security notice
 
-This crate exposes **low-level cryptographic functionality** and does not
-provide the protocol-level safety guarantees expected by applications.
+This crate exposes **low-level cryptographic functionality** and does not enforce
+the protocol-level safety guarantees required by applications.
 
-Application developers should **not construct protocol messages manually**
-using this crate.
+Misuse of these primitives may lead to insecure implementations.
 
-Instead, use the higher-level APIs provided by `derec-library`.
+Applications should rely on the higher-level SDK provided by `derec-library`,
+which implements the full DeRec protocol flows and safety checks.
 
 ---
 
@@ -59,4 +75,12 @@ See the `LICENSE` file for details.
 
 Full protocol documentation is available at:
 
-https://derecalliance.gitbook.io/protocol
+https://derec-alliance.gitbook.io/docs/protocol-specification/protocol-overview
+
+---
+
+## DeRec Alliance
+
+The DeRec Alliance is an open initiative focused on creating standards for decentralized secret recovery.
+
+More information at https://derecalliance.org

@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    protos::derec_proto::{
-        GetShareRequestMessage, GetShareResponseMessage, StoreShareRequestMessage,
-    },
     recovery,
     ts_bindings_utils::{js_error, js_error_from_lib},
 };
+use derec_proto::{GetShareRequestMessage, GetShareResponseMessage, StoreShareRequestMessage};
 use prost::Message;
 use wasm_bindgen::prelude::*;
 

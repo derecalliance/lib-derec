@@ -2,12 +2,11 @@
 
 use crate::{
     pairing,
-    protos::derec_proto::SenderKind,
-    protos::derec_proto::{ContactMessage, PairRequestMessage, PairResponseMessage},
     ts_bindings_utils::{js_error, js_error_from_lib},
 };
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
+use derec_proto::{ContactMessage, PairRequestMessage, PairResponseMessage, SenderKind};
 use prost::Message;
 
 use wasm_bindgen::prelude::*;

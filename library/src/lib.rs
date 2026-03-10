@@ -54,11 +54,8 @@
 //! applications.
 
 pub mod pairing;
-pub mod protos;
 pub mod recovery;
 pub mod sharing;
-#[cfg(target_arch = "wasm32")]
-mod ts_bindings_utils;
 pub mod types;
 mod utils;
 pub mod verification;

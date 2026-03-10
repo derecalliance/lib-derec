@@ -1,6 +1,6 @@
 [package]
 name = "derec-proto"
-version = "0.0.1-alpha.2"
+version = "0.0.1-alpha.3"
 edition = "2024"
 license = "Apache-2.0"
 description = "Generated Rust protobuf types for the DeRec protocol."

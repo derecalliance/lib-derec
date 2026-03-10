@@ -19,7 +19,7 @@ The library supports both **native Rust environments** and **WebAssembly targets
 
 ---
 
-# What is DeRec?
+## What is DeRec?
 
 The **DeRec protocol** allows a secret to be split into multiple shares and stored by independent helpers.
 
@@ -36,20 +36,29 @@ This SDK implements the message flows and cryptographic mechanisms required by t
 
 ---
 
-# Installation
+## Installation
 
-Add the crate to your project:
+Add the crate to your project via `cargo`:
+
+```bash
+cargo add derec-library
+```
+
+Or manually in your `Cargo.toml`
 
 ```toml
 [dependencies]
 derec-library = "0.0.1-alpha.1"
 ```
 
-# Basic Concepts
+> [!WARNING]
+> Note: this is a pre-release version. APIs may change until 0.1.0.
 
-The protocol involves two primary roles.
+## Basic Concepts
 
-## Owner
+The protocol involves two primary roles: **Owner** and **Helper**.
+
+### Owner
 
 The party that wants to protect a secret.
 
@@ -59,9 +68,9 @@ Responsibilities:
 * Verify helpers still possess the shares
 * Recover the secret when necessary
 
-## Helper
+### Helper
 
-A trusted entity that stores a share for the sharer.
+A trusted entity that stores a share for the Owner.
 
 Responsibilities:
 * Store the share
@@ -70,18 +79,75 @@ Responsibilities:
 
 ---
 
-# Protocol Flows
+## Protocol Flows
 
 The SDK provides building blocks for the main protocol flows.
 
-Flow | Purpose
-Pairing | Establish secure communication between sharer and helper
-Share Distribution | Split and distribute secret shares
-Verification | Ensure helpers still possess shares
-Recovery | Retrieve shares and reconstruct the secret
-Unpairing | Terminate the helper relationship
+| Flow | Purpose |
+|------|--------|
+| Pairing | Establish secure communication between owner and helper |
+| Share Distribution | Split and distribute secret shares |
+| Verification | Ensure helpers still possess shares |
+| Recovery | Retrieve shares and reconstruct the secret |
+| Unpairing | Terminate the helper relationship |
 
-# Example: Pairing Flow
+
+## Quick Intro
+
+```rust
+use derec_library::verification::*;
+use derec_library::types::ChannelId;
+
+let channel_id = ChannelId(42);
+let secret_id = b"example_secret";
+
+let request = generate_verification_request(secret_id, 1).unwrap();
+```
+
+See the examples down below for complete protocol flows.
+
+---
+
+## WebAssembly Support
+
+The library also provides WebAssembly bindings so the protocol can run in:
+* Browsers
+* Mobile wallets
+* Web applications
+
+Example JavaScript usage:
+
+```ts
+import * as derec from "derec-library";
+
+const request = derec.generate_verification_request(secretId, version);
+```
+
+Bindings are generated using `wasm-bindgen`.
+
+---
+
+## Transport Layer
+
+The DeRec protocol is transport agnostic.
+
+Applications may use any communication channel including:
+
+* HTTPS
+* WebSockets
+* Message queues
+* Custom relay servers
+
+> [!INFO]
+> Currently, only the HTTPS transport protocol is supported.
+
+The `transportUri` in protocol messages identifies the helper endpoint.
+
+---
+
+## Examples
+
+### Pairing Flow
 
 ```rust
 use derec_library::pairing::*;
@@ -130,13 +196,14 @@ let ProcessPairingResponseMessageResult { shared_key } = process_pairing_respons
 ).expect("Failed to process pairing response message");
 ```
 
-The ContactMessage is exchanged out-of-band, typically using:
+The `ContactMessage` is exchanged out-of-band, typically using:
+
 * QR codes
 * Existing communication channels
 
 ---
 
-# Example: Sharing
+### Sharing Flow
 
 ```rust
 use derec_library::sharing::*;
@@ -163,7 +230,7 @@ assert_eq!(shares.len(), 3);
 
 ---
 
-# Example: Verification
+### Verification Flow
 
 ```rust
 use derec_library::verification::*;
@@ -188,7 +255,7 @@ assert!(ok);
 
 ---
 
-# Example: Recovery
+### Recovery Flow
 
 ```rust
 use derec_library::recovery::*;
@@ -214,52 +281,15 @@ let _ = recover_from_share_responses(&responses, secret_id, version).unwrap_err(
 
 ---
 
-# WebAssembly Support
+## Protocol specification
 
-The library also provides WebAssembly bindings so the protocol can run in:
-* Browser-based
-* Mobile wallets
-* Web applications
+Full protocol documentation:
 
-Example JavaScript usage:
-
-```ts
-import * as derec from "derec-library";
-
-const request = derec.generate_verification_request(secretId, version);
-```
-
-Bindings are generated using wasm-bindgen.
+https://derec-alliance.gitbook.io/docs/protocol-specification/messages
 
 ---
 
-# Transport Layer
-
-The DeRec protocol is transport agnostic.
-
-Applications may use any communication channel including:
-
-* HTTPS
-* WebSockets
-* Message queues
-* Custom relay servers
-
-> [!INFO]
-> Currently, only the HTTPS transport protocol is supported.
-
-The transportUri in protocol messages identifies the helper endpoint.
-
----
-
-# Documentation
-
-Full protocol documentation: https://derecalliance.gitbook.io/protocol
-
-API documentation: https://docs.rs/derec-library
-
----
-
-# Security Considerations
+## Security Considerations
 
 Applications using this SDK should ensure:
 * Secure storage of secret material
@@ -271,15 +301,15 @@ The DeRec protocol design assumes helpers are independent and trusted entities.
 
 ---
 
-License
+## License
 
 Licensed under the Apache License, Version 2.0.
 
-See the LICENSE file for details.
+See the `LICENSE` file for details.
 
 ---
 
-Contributing
+## Contributing
 
 Contributions are welcome.
 
@@ -289,10 +319,8 @@ Please open issues or pull requests to discuss improvements.
 
 ---
 
-DeRec Alliance
+## DeRec Alliance
 
 The DeRec Alliance is an open initiative focused on creating standards for decentralized secret recovery.
 
-More information:
-
-https://derecalliance.org
+More information at https://derecalliance.org

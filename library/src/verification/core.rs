@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::protos::derec_proto::{
+use crate::types::*;
+use derec_proto::{
     Result as DerecResult, StatusEnum, VerifyShareRequestMessage, VerifyShareResponseMessage,
 };
-use crate::types::*;
 use rand::{Rng, rng};
 use sha2::*;
 use subtle::ConstantTimeEq;

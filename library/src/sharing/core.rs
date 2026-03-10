@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::protos::derec_proto::{
-    CommittedDeRecShare, DeRecShare, StoreShareRequestMessage, committed_de_rec_share::SiblingHash,
-};
 use crate::sharing::{ProtectSecretResult, SharingError};
 use crate::types::*;
 use crate::utils::generate_seed;
 use derec_cryptography::vss;
+use derec_proto::{
+    CommittedDeRecShare, DeRecShare, StoreShareRequestMessage, committed_de_rec_share::SiblingHash,
+};
 use prost::Message;
 use std::collections::{HashMap, HashSet};
 
