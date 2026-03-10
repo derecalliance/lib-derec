@@ -11,6 +11,13 @@ documentation = "https://derec-alliance.gitbook.io/docs/sdk/rust"
 homepage = "https://derecalliance.org"
 keywords = ["derec", "decentralized", "recovery", "secret-sharing", "sdk", "wasm"]
 
+include = [
+  "src/**",
+  "Cargo.toml",
+  "README.md",
+  "LICENSE",
+]
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
