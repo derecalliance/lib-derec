@@ -1,0 +1,27 @@
+[package]
+name = "derec-proto"
+version = "0.0.1-alpha.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "Generated Rust protobuf types for the DeRec protocol."
+repository = "https://github.com/derecalliance/lib-derec"
+documentation = "https://docs.rs/derec-proto"
+readme = "README.md"
+keywords = ["derec", "recovery", "decentralized", "protobuf", "protocol", "sdk"]
+
+include = [
+  "src/**",
+  "build.rs",
+  "Cargo.toml",
+  "README.md",
+  "LICENSE",
+  "protobufs/**",
+]
+
+[dependencies]
+prost = "0.14.3"
+prost-types = "0.14.3"
+
+[build-dependencies]
+prost-build = "0.14.3"
+
