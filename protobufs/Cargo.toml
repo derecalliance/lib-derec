@@ -7,7 +7,7 @@ description = "Generated Rust protobuf types for the DeRec protocol."
 repository = "https://github.com/derecalliance/lib-derec"
 documentation = "https://docs.rs/derec-proto"
 readme = "README.md"
-keywords = ["derec", "recovery", "decentralized", "protobuf", "protocol", "sdk"]
+keywords = ["derec", "recovery", "decentralized", "protobuf", "protocol"]
 
 include = [
   "src/**",
