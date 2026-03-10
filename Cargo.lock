@@ -324,6 +324,8 @@ dependencies = [
 [[package]]
 name = "derec-cryptography"
 version = "0.0.1-alpha.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4239c379da19e53b9b8f5ce74deb756388a53dfdd99b147f08b02dfe2b9a76c"
 dependencies = [
  "aead",
  "aes",
@@ -345,9 +347,7 @@ dependencies = [
 
 [[package]]
 name = "derec-cryptography"
-version = "0.0.1-alpha.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4239c379da19e53b9b8f5ce74deb756388a53dfdd99b147f08b02dfe2b9a76c"
+version = "0.0.1-alpha.2"
 dependencies = [
  "aead",
  "aes",
@@ -372,10 +372,12 @@ name = "derec-library"
 version = "0.0.1-alpha.1"
 dependencies = [
  "ark-serialize",
- "derec-cryptography 0.0.1-alpha.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "derec-cryptography 0.0.1-alpha.1",
+ "derec-proto 0.0.1-alpha.1",
  "getrandom 0.2.16",
  "getrandom 0.4.2",
  "js-sys",
+ "prost",
  "rand 0.10.0",
  "serde",
  "serde-wasm-bindgen",
@@ -389,6 +391,17 @@ dependencies = [
 [[package]]
 name = "derec-proto"
 version = "0.0.1-alpha.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd5faf0cbda4ac2163684bb5e61516723cad45035d32a718f6d405a250fb4156"
+dependencies = [
+ "prost",
+ "prost-build",
+ "prost-types",
+]
+
+[[package]]
+name = "derec-proto"
+version = "0.0.1-alpha.2"
 dependencies = [
  "prost",
  "prost-build",

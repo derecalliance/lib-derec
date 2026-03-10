@@ -29,9 +29,11 @@
 //! provided by the protocol flow modules (`pairing`, `sharing`, `verification`,
 //! and `recovery`) rather than manipulating protobuf messages directly.
 
-pub mod derec_proto {
+mod derec_proto {
     include!(concat!(
         env!("OUT_DIR"),
         "/org.derecalliance.derec.protobuf.rs"
     ));
 }
+
+pub use derec_proto::*;
