@@ -10,7 +10,7 @@ import {
     produce_pairing_request_message,
     produce_pairing_response_message,
     process_pairing_response_message
-} from "derec-library";
+} from "@derecalliance/derec-nodejs";
 
 const secret_id = new Uint8Array([1, 2, 3, 4, 255]);
 const secret_data = new Uint8Array([5, 6, 7, 8, 255]);

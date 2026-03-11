@@ -1,4 +1,4 @@
-import { protect_secret, generate_verification_request, generate_verification_response, verify_share_response, generate_share_request, generate_share_response, recover_from_share_responses, create_contact_message, produce_pairing_request_message, produce_pairing_response_message, process_pairing_response_message } from "derec-library";
+import { protect_secret, generate_verification_request, generate_verification_response, verify_share_response, generate_share_request, generate_share_response, recover_from_share_responses, create_contact_message, produce_pairing_request_message, produce_pairing_response_message, process_pairing_response_message } from "@derecalliance/derec-nodejs";
 const secret_id = new Uint8Array([1, 2, 3, 4, 255]);
 const secret_data = new Uint8Array([5, 6, 7, 8, 255]);
 const channels = new BigUint64Array([1n, 2n, 3n]);

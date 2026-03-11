@@ -38,5 +38,8 @@ pub use error::*;
 mod core;
 pub use core::*;
 
+#[cfg(target_arch = "wasm32")]
+pub mod wasm;
+
 #[cfg(test)]
 mod test;

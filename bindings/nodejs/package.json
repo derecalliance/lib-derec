@@ -1,0 +1,16 @@
+{
+  "name": "derec-nodejs-bindings-test",
+  "private": true,
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@derecalliance/derec-nodejs": "file:../../library/target/pkg-nodejs"
+  }
+}

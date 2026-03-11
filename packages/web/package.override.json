@@ -1,0 +1,23 @@
+{
+  "name": "@derecalliance/derec-web",
+  "description": "Browser WebAssembly bindings for derec-library, the Rust SDK for the DeRec protocol.",
+  "files": [
+    "derec_library_bg.wasm",
+    "derec_library_bg.wasm.d.ts",
+    "derec_library.js",
+    "derec_library.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "derec",
+    "decentralized",
+    "recovery",
+    "secret-sharing",
+    "sdk",
+    "nodejs",
+    "typescript",
+    "wasm",
+    "webassembly"
+  ]
+}

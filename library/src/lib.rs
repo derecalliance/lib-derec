@@ -63,4 +63,7 @@ pub mod verification;
 mod error;
 pub use error::Error;
 
+#[cfg(target_arch = "wasm32")]
+pub(crate) mod ts_bindings_utils;
+
 pub type Result<T> = std::result::Result<T, Error>;
