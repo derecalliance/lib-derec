@@ -56,7 +56,7 @@ This step ensures the packages compile correctly once packaged.
 
 ---
 
-## Publish Crates
+## Publishing Rust SDK
 
 Publish the crates required by `derec-library` first:
 
@@ -77,9 +77,7 @@ in either order.
 > [!INFO]
 > Each publish may take a few seconds before the crate becomes available for dependency resolution.
 
----
-
-## Verify release
+### Verify release
 
 After publishing, confirm the new versions are available:
 
@@ -91,6 +89,112 @@ You can also verify using:
 
 ```bash
 cargo search derec
+```
+
+---
+
+## Publishing Node.js SDK
+
+Build the Node.js WebAssembly package:
+
+```bash
+cd library
+make nodejs
+```
+
+This generates the npm package in:
+
+```
+library/target/pkg-nodejs
+```
+
+Review the package contents before publishing:
+
+```
+cd library/target/pkg-nodejs
+npm pack
+```
+
+This creates a `.tgz` archive showing exactly what will be published.
+
+Publish the package to npm:
+
+```
+npm publish --access public
+```
+
+> [!INFO]
+> The --access public flag is required for scoped packages such as
+> @derecalliance/derec-nodejs.
+
+### Verify Node.js release
+
+After publishing, confirm the new version is available:
+* https://www.npmjs.com/package/@derecalliance/derec-nodejs
+
+You can also verify using:
+
+```bash
+npm view @derecalliance/derec-nodejs
+```
+
+Or install it in a test project:
+
+```bash
+npm install @derecalliance/derec-nodejs
+```
+
+---
+
+## Publishing Web SDK
+
+Build the Browser WebAssembly package:
+
+```bash
+cd library
+make web
+```
+
+This generates the npm package in:
+
+```
+library/target/pkg-web
+```
+
+Review the package contents before publishing:
+
+```
+cd library/target/pkg-web
+npm pack
+```
+
+This creates a `.tgz` archive showing exactly what will be published.
+
+Publish the package to npm:
+
+```
+npm publish --access public
+```
+
+> [!INFO]
+> The --access public flag is required for scoped packages such as
+> @derecalliance/derec-web.
+
+### Verify Node.js release
+
+After publishing, confirm the new version is available:
+* https://www.npmjs.com/package/@derecalliance/derec-web
+
+You can also verify using:
+
+```bash
+npm view @derecalliance/derec-web
+```
+
+Or install it in a test project:
+
+```bash
+npm install @derecalliance/derec-web
 ```
 
 ---
