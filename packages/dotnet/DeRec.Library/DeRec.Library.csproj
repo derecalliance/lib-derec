@@ -1,0 +1,60 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+    <PackageId>DeRec.Library</PackageId>
+    <Authors>DeRec Alliance</Authors>
+    <Company>DeRec Alliance</Company>
+    <Description>.NET bindings for derec-library, the Rust SDK for the DeRec protocol.</Description>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/derecalliance/lib-derec</RepositoryUrl>
+    <PackageProjectUrl>https://derecalliance.org</PackageProjectUrl>
+    <PackageTags>derec recovery secret-sharing sdk dotnet</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+    <None Include="LICENSE" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+      <None Include="runtimes/osx-arm64/native/libderec_library.dylib"
+          Pack="true"
+          PackagePath="runtimes/osx-arm64/native/"
+          Condition="Exists('runtimes/osx-arm64/native/libderec_library.dylib')" />
+
+      <None Include="runtimes/osx-x64/native/libderec_library.dylib"
+          Pack="true"
+          PackagePath="runtimes/osx-x64/native/"
+          Condition="Exists('runtimes/osx-x64/native/libderec_library.dylib')" />
+
+      <None Include="runtimes/linux-x64/native/libderec_library.so"
+          Pack="true"
+          PackagePath="runtimes/linux-x64/native/"
+          Condition="Exists('runtimes/linux-x64/native/libderec_library.so')" />
+
+      <None Include="runtimes/linux-arm64/native/libderec_library.so"
+          Pack="true"
+          PackagePath="runtimes/linux-arm64/native/"
+          Condition="Exists('runtimes/linux-arm64/native/libderec_library.so')" />
+  </ItemGroup>
+
+  <ItemGroup>
+      <Protobuf Include="../../../protobufs/protobufs/*.proto"
+          GrpcServices="None"
+          ProtoRoot="../../../protobufs/protobufs"
+      />
+  </ItemGroup>
+
+  <ItemGroup>
+      <PackageReference Include="Google.Protobuf" Version="3.32.0" />
+      <PackageReference Include="Grpc.Tools" Version="2.76.0" PrivateAssets="All" />
+  </ItemGroup>
+
+</Project>

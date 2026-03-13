@@ -1,14 +1,19 @@
-.PHONY: all native node web
+.DEFAULT_GOAL := all
 
-all: native node web
+.PHONY: all native nodejs web dotnet
+
+all: native nodejs web dotnet
 
 native:
-	cargo b --release
+	cargo build --release
 
-nodejs:
+nodejs: native
 	wasm-pack build --release --out-dir target/pkg-nodejs --target nodejs
 	node ../scripts/prepare-nodejs-package.mjs
 
-web:
-	wasm-pack build --release  --out-dir target/pkg-web --target web
+web: native
+	wasm-pack build --release --out-dir target/pkg-web --target web
 	node ../scripts/prepare-web-package.mjs
+
+dotnet: native
+	../scripts/prepare-dotnet-package.sh

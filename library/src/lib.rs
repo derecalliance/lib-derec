@@ -54,6 +54,7 @@
 //! applications.
 
 pub mod pairing;
+pub mod protocol_version;
 pub mod recovery;
 pub mod sharing;
 pub mod types;
@@ -65,5 +66,8 @@ pub use error::Error;
 
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod ts_bindings_utils;
+
+#[cfg(not(target_arch = "wasm32"))]
+mod ffi;
 
 pub type Result<T> = std::result::Result<T, Error>;
