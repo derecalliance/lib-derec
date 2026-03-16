@@ -1,6 +1,7 @@
 import { readFile, writeFile, copyFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -59,6 +60,14 @@ async function main() {
     generatedPackageJson,
     overridePackageJson,
   );
+
+  const version = execFileSync(
+    "bash",
+    [path.join(repoRoot, "scripts", "get-version.sh")],
+    { encoding: "utf8" }
+  ).trim();
+
+  mergedPackageJson.version = version;
 
   await writeFile(
     generatedPackageJsonPath,

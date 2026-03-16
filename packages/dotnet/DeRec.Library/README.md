@@ -1,21 +1,13 @@
-# DeRec NodeJS SDK
+# DeRec .Net SDK
 
-Node.js WebAssembly bindings for `derec-library`, the Rust SDK for the DeRec protocol.
-
-This package allows Node.js and TypeScript applications to interact with the DeRec protocol through a WebAssembly implementation compiled from the official Rust SDK.
+.NET bindings for `derec-library`, the Rust SDK for the DeRec protocol.
 
 DeRec enables decentralized recovery of secrets by distributing encrypted shares to trusted helpers.
 
 ## Installation
 
 ```bash
-npm install @derecalliance/derec-nodejs
-```
-
-or with yarn:
-
-```bash
-yarn add @derecalliance/derec-nodejs
+dotnet add package DeRec.Library
 ```
 
 ## Requirements
@@ -33,24 +25,12 @@ No additional native dependencies are required.
 
 ## Quick Example
 
-Basic usage from JavaScript:
-
 ```js
-const derec = require("@derecalliance/derec-nodejs");
+using Derec.Library;
 
-const result = derec.some_function();
-
-console.log(result);
-```
-
-Using TypeScript:
-
-```ts
-import * as derec from "@derecalliance/derec-nodejs";
-
-const result = derec.some_function();
-
-console.log(result);
+Console.WriteLine(DeRec.VersionMajor());
+Console.WriteLine(DeRec.VersionMinor());
+Console.WriteLine(DeRec.VersionPatch());
 ```
 
 ## Example: Generating Shares
@@ -110,7 +90,7 @@ Your editor should automatically provide autocompletion and type checking.
 
 Full documentation for the DeRec protocol and SDK:
 
-* [TypeScript SDK Documentation](https://derec-alliance.gitbook.io/docs/sdk/typescript)
+* [TypeScript SDK Documentation](https://derec-alliance.gitbook.io/docs/sdk/dotnet)
 * [DeRec Alliance](https://derecalliance.org)
 * [Protocol specification](https://derec-alliance.gitbook.io/docs/protocol-specification/protocol-overview)
 * [Rust SDK repository](https://github.com/derecalliance/lib-derec)

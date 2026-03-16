@@ -199,6 +199,163 @@ npm install @derecalliance/derec-web
 
 ---
 
+## Publishing .NET SDK
+
+### Prerequisites
+
+Before building the .NET package, ensure the following tools are installed:
+
+| Tool | Purpose |
+|-----|-----|
+| Rust | Build the native library |
+| rustup | Manage Rust targets |
+| cargo-zigbuild | Cross-compile native targets |
+| zig | Cross-linker used by cargo-zigbuild |
+| .NET SDK (10+) | Build and publish the NuGet package |
+
+Install required tools:
+
+```bash
+# Rust toolchain
+curl https://sh.rustup.rs -sSf | sh
+
+# Rust targets for cross compilation
+rustup target add aarch64-apple-darwin
+rustup target add x86_64-apple-darwin
+rustup target add x86_64-unknown-linux-gnu
+rustup target add aarch64-unknown-linux-gnu
+
+# Zig compiler (required by cargo-zigbuild)
+brew install zig
+
+# cargo-zigbuild
+cargo install cargo-zigbuild
+```
+
+Verify installation:
+
+```bash
+rustc --version
+cargo --version
+zig version
+cargo zigbuild --version
+dotnet --version
+```
+
+### Build the .NET package
+
+Build the multi-runtime NuGet package:
+
+```bash
+cd library
+make dotnet
+```
+
+The build process performs the following steps automatically:
+
+1. Builds the native Rust library.
+2. Cross-compiles the library for multiple targets:
+  * osx-arm64
+  * osx-x64
+  * linux-x64
+  * linux-arm64
+3. Stages the compiled artifacts into the NuGet runtime layout:
+```
+packages/dotnet/DeRec.Library/runtimes/
+  osx-arm64/native/libderec_library.dylib
+  osx-x64/native/libderec_library.dylib
+  linux-x64/native/libderec_library.so
+  linux-arm64/native/libderec_library.so
+```
+
+4. Packs the NuGet package.
+
+The resulting package is generated at:
+
+```bash
+packages/dotnet/DeRec.Library/bin/Release/
+```
+
+### Review the package before publishing
+
+Inspect the package contents:
+
+```bash
+cd packages/dotnet/DeRec.Library/bin/Release
+unzip -l DeRec.Library.*.nupkg
+```
+
+Verify that the package contains:
+
+```bash
+runtimes/osx-arm64/native/libderec_library.dylib
+runtimes/osx-x64/native/libderec_library.dylib
+runtimes/linux-x64/native/libderec_library.so
+runtimes/linux-arm64/native/libderec_library.so
+```
+
+### Publish the package to NuGet
+
+Authenticate with NuGet:
+
+```bash
+dotnet nuget add \
+  source https://api.nuget.org/v3/index.json \
+  --name nuget
+```
+
+Publish the package:
+
+```bash
+dotnet nuget push DeRec.Library.<version>.nupkg \
+  --api-key <YOUR_API_KEY> \
+  --source https://api.nuget.org/v3/index.json
+```
+
+### Verify the release
+
+After publishing, confirm the new version is available:
+* https://www.nuget.org/packages/DeRec.Library
+
+You can also verify using:
+
+```bash
+dotnet nuget search DeRec.Library
+```
+
+Or install it in a test project:
+
+```bash
+dotnet add package DeRec.Library
+```
+
+### Validate runtime loading
+
+Create a minimal test project:
+
+```bash
+dotnet new console -n derec-test
+cd derec-test
+dotnet add package DeRec.Library
+```
+
+Then run a simple pairing test to ensure the native runtime loads correctly.
+
+This confirms that the correct native library is resolved for the host platform.
+
+---
+
+## Release Checklist
+
+Before publishing a release:
+
+- [ ] Version updated in Cargo.toml
+- [ ] Changelog updated
+- [ ] `make all` succeeds
+- [ ] Test installation of all SDKs
+
+---
+
 ## Git Tagging
 
 After publishing, tag the release in git:
