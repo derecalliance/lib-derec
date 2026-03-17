@@ -53,6 +53,7 @@
 //! WebAssembly bindings are primarily intended for integration with TypeScript
 //! applications.
 
+pub mod derec_message;
 pub mod pairing;
 pub mod protocol_version;
 pub mod recovery;

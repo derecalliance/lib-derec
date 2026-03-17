@@ -1,16 +1,5 @@
-import init, {
-    protect_secret,
-    generate_verification_request,
-    generate_verification_response,
-    verify_share_response,
-    generate_share_request,
-    generate_share_response,
-    recover_from_share_responses,
-    create_contact_message,
-    produce_pairing_request_message,
-    produce_pairing_response_message,
-    process_pairing_response_message
-} from "@derecalliance/derec-web";
+import init, * as derec from "@derecalliance/derec-web";
+import { runDeRecMessageTest } from "./derec_message";
 
 async function main() {
     await init();
@@ -21,19 +10,19 @@ async function main() {
     const threshold = 2;
     const version = 1;
 
-    const shares = protect_secret(secret_id, secret_data, channels, threshold, version);
+    const shares = derec.protect_secret(secret_id, secret_data, channels, threshold, version);
     const some_share = shares.value.get(1);
     const some_channel = 1n;
 
     console.log("protect_secret: ", shares);
 
-    const request = generate_verification_request(secret_id, version);
+    const request = derec.generate_verification_request(secret_id, version);
     console.log("generate_verification_request: ", request);
 
-    const response = generate_verification_response(secret_id, some_channel, some_share, request);
+    const response = derec.generate_verification_response(secret_id, some_channel, some_share, request);
     console.log("generate_verification_response: ", response);
 
-    const verification_expected_true = verify_share_response(
+    const verification_expected_true = derec.verify_share_response(
         secret_id,
         some_channel,
         some_share,
@@ -41,7 +30,7 @@ async function main() {
     );
     console.log("verify_share_response (expected true): ", verification_expected_true);
 
-    const verification = verify_share_response(
+    const verification = derec.verify_share_response(
         secret_id,
         1n,
         shares.value.get(2),
@@ -49,10 +38,10 @@ async function main() {
     );
     console.log("verify_share_response (expected false): ", verification);
 
-    const share_request = generate_share_request(1n, secret_id, version);
+    const share_request = derec.generate_share_request(1n, secret_id, version);
     console.log("generate_share_request: ", share_request);
 
-    const share_response_1 = generate_share_response(
+    const share_response_1 = derec.generate_share_response(
         secret_id,
         1n,
         shares.value.get(1),
@@ -60,7 +49,7 @@ async function main() {
     );
     console.log("generate_share_response: ", share_response_1);
 
-    const share_response_2 = generate_share_response(
+    const share_response_2 = derec.generate_share_response(
         secret_id,
         2n,
         shares.value.get(2),
@@ -68,7 +57,7 @@ async function main() {
     );
     console.log("generate_share_response: ", share_response_2);
 
-    const share_response_3 = generate_share_response(
+    const share_response_3 = derec.generate_share_response(
         secret_id,
         3n,
         shares.value.get(3),
@@ -82,7 +71,7 @@ async function main() {
     responses.set(3, Array.from(share_response_3));
 
     try {
-        const recovered = recover_from_share_responses({ value: responses }, secret_id, version);
+        const recovered = derec.recover_from_share_responses({ value: responses }, secret_id, version);
         console.log("recover_from_share_responses: ", recovered);
     } catch (e) {
         console.error("Error recovering from share responses: ", e);
@@ -95,14 +84,14 @@ async function main() {
     const role_sharer = 0;
 
     // run by Alice, who then produces the QR code
-    const create_contact_message_result = create_contact_message(
+    const create_contact_message_result = derec.create_contact_message(
         channel_id,
         "https://example.com/alice"
     );
     console.log("create_contact_message: ", create_contact_message_result);
 
     // run by Bob, who scans Alice's QR code
-    const produce_pairing_request_message_result = produce_pairing_request_message(
+    const produce_pairing_request_message_result = derec.produce_pairing_request_message(
         channel_id,
         role_helper,
         create_contact_message_result.contact_message
@@ -113,7 +102,7 @@ async function main() {
     );
 
     // run by Alice, who receives Bob's pairing request message
-    const produce_pairing_response_message_result = produce_pairing_response_message(
+    const produce_pairing_response_message_result = derec.produce_pairing_response_message(
         role_sharer,
         produce_pairing_request_message_result.pair_request_message,
         create_contact_message_result.secret_key_material
@@ -124,7 +113,7 @@ async function main() {
     );
 
     // run by Bob, who receives Alice's pairing response message
-    const process_pairing_response_message_result = process_pairing_response_message(
+    const process_pairing_response_message_result = derec.process_pairing_response_message(
         create_contact_message_result.contact_message,
         produce_pairing_response_message_result.pair_response_message,
         produce_pairing_request_message_result.secret_key_material
@@ -132,6 +121,11 @@ async function main() {
     console.log(
         "process_pairing_response_message: ",
         process_pairing_response_message_result
+    );
+
+    runDeRecMessageTest(
+        derec,
+        produce_pairing_request_message_result.pair_request_message,
     );
 
     const app = document.getElementById("app");

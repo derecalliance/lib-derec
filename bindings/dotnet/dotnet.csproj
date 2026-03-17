@@ -8,7 +8,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="DeRec.Library" Version="0.0.1-alpha.3" />
+    <PackageReference Include="DeRec.Library" Version="0.0.1-alpha.4" />
   </ItemGroup>
 
 </Project>

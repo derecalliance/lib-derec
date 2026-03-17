@@ -33,6 +33,51 @@ Console.WriteLine(DeRec.VersionMinor());
 Console.WriteLine(DeRec.VersionPatch());
 ```
 
+## Example: Building and Encoding a DeRecMessage
+
+All DeRec protocol messages except `ContactMessage` must be wrapped inside a `DeRecMessage`
+before being signed, encrypted, and transmitted over the wire.
+
+The `DeRecMessageBuilder` helps construct the envelope, and `DeRecMessageCodec`
+handles serialization and transport encoding.
+
+Example (simplified):
+
+```csharp
+using System;
+using System.Linq;
+using DeRec.Library;
+using Org.Derecalliance.Derec.Protobuf;
+
+byte[] sender = Enumerable.Repeat((byte)0x11, 48).ToArray();
+byte[] receiver = Enumerable.Repeat((byte)0x22, 48).ToArray();
+byte[] secretId = new byte[] { 1, 2, 3, 4 };
+
+var pairRequest = new PairRequestMessage
+{
+    // populate fields as needed
+};
+
+DeRecMessage derecMessage = new DeRecMessageBuilder()
+    .Sender(sender)
+    .Receiver(receiver)
+    .SecretId(secretId)
+    .Message(pairRequest)
+    .Build();
+
+byte[] serialized = DeRecMessageCodec.Serialize(derecMessage);
+
+Console.WriteLine(serialized.Length);
+```
+
+This produces a serialized DeRecMessage that can then be signed, encrypted,
+and sent to the intended recipient.
+
+To produce transport-ready wire bytes, use DeRecMessageCodec.EncodeToBytes(...)
+with signing and encryption backends. To recover the original envelope on the
+receiving side, use DeRecMessageCodec.DecodeFromBytes(...) with decryption and
+signature verification backends.
+
 ## Example: Generating Shares
 
 A typical DeRec workflow involves splitting a secret into shares that are distributed to helpers.
