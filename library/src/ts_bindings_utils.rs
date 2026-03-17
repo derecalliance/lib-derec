@@ -1,4 +1,5 @@
 use wasm_bindgen::JsValue;
+use wasm_bindgen::prelude::wasm_bindgen;
 
 #[derive(serde::Serialize)]
 struct TsError {
@@ -16,4 +17,9 @@ pub(crate) fn js_error(code: &'static str, message: impl Into<String>) -> JsValu
 
 pub(crate) fn js_error_from_lib(err: crate::Error) -> JsValue {
     js_error("DEREC_ERROR", err.to_string())
+}
+
+#[wasm_bindgen(start)]
+pub fn wasm_start() {
+    console_error_panic_hook::set_once();
 }

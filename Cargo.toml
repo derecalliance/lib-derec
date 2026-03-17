@@ -1,4 +1,13 @@
 [workspace]
 resolver = "3"
-members = ["cryptography", "library", "protobufs"]
+members = [
+    "cryptography",
+    "library",
+    "protobufs",
+    "bindings/rust",
+]
 
+[patch.crates-io]
+derec-cryptography = { path = "cryptography" }
+derec-proto = { path = "protobufs" }
+derec-library = { path = "library" }

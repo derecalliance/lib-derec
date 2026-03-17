@@ -53,4 +53,4 @@ pub use core::*;
 pub mod wasm;
 
 #[cfg(test)]
-mod test;
+mod tests;

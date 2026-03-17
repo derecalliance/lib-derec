@@ -8,10 +8,12 @@ internal static class Program
     private static void Main()
     {
         RunProtocolVersionTest();
-        RunPairingFlowTest();
+        var pairRequestMessage = RunPairingFlowTest();
         RunSharingFlowTest();
         RunVerificationFlowTest();
         RunRecoveryFlowTest();
+
+        RunDeRecMessageBuilderTest(pairRequestMessage);
 
         Console.WriteLine("All smoke tests passed.");
     }
@@ -34,7 +36,7 @@ internal static class Program
         Console.WriteLine("Protocol version test passed.");
     }
 
-    private static void RunPairingFlowTest()
+    private static PairRequestMessage RunPairingFlowTest()
     {
         Console.WriteLine("=== Pairing flow test ===");
 
@@ -109,6 +111,8 @@ internal static class Program
         }
 
         Console.WriteLine("Pairing flow test passed.");
+
+        return pairRequest.PairRequestMessage;
     }
 
     private static void RunSharingFlowTest()
@@ -295,5 +299,194 @@ internal static class Program
         }
 
         Console.WriteLine("Recovery flow test passed.");
+    }
+
+    private static void RunDeRecMessageBuilderTest(PairRequestMessage pairRequest)
+    {
+        Console.WriteLine("=== DeRecMessage builder/codec test ===");
+
+        byte[] sender = Enumerable.Repeat((byte)0x11, 48).ToArray();
+        byte[] receiver = Enumerable.Repeat((byte)0x22, 48).ToArray();
+        byte[] secretId = new byte[] { 1, 2, 3, 4 };
+        DateTimeOffset timestamp = DateTimeOffset.UtcNow;
+
+        DeRecMessage derecMessage = new DeRecMessageBuilder()
+            .Sender(sender)
+            .Receiver(receiver)
+            .SecretId(secretId)
+            .Timestamp(timestamp)
+            .Message(pairRequest)
+            .Build();
+
+        if (derecMessage.ProtocolVersionMajor < 0 || derecMessage.ProtocolVersionMinor < 0)
+        {
+            throw new InvalidOperationException("DeRecMessage builder test failed: invalid protocol version.");
+        }
+
+        if (derecMessage.Sender.Length != 48)
+        {
+            throw new InvalidOperationException("DeRecMessage builder test failed: invalid sender length.");
+        }
+
+        if (derecMessage.Receiver.Length != 48)
+        {
+            throw new InvalidOperationException("DeRecMessage builder test failed: invalid receiver length.");
+        }
+
+        if (derecMessage.SecretId.Length != 4)
+        {
+            throw new InvalidOperationException("DeRecMessage builder test failed: invalid secretId length.");
+        }
+
+        if (derecMessage.Timestamp is null)
+        {
+            throw new InvalidOperationException("DeRecMessage builder test failed: missing timestamp.");
+        }
+
+        if (derecMessage.MessageBodies?.SharerMessageBodies is null)
+        {
+            throw new InvalidOperationException("DeRecMessage builder test failed: expected owner/sharer message bodies.");
+        }
+
+        if (derecMessage.MessageBodies.SharerMessageBodies.SharerMessageBody.Count != 1)
+        {
+            throw new InvalidOperationException("DeRecMessage builder test failed: expected exactly one message body.");
+        }
+
+        Console.WriteLine("DeRecMessage built successfully.");
+
+        // Serialize / deserialize
+        byte[] serialized = DeRecMessageCodec.Serialize(derecMessage);
+        Console.WriteLine($"Serialized size = {serialized.Length}");
+
+        DeRecMessage deserialized = DeRecMessageCodec.Deserialize(serialized);
+
+        if (!derecMessage.Equals(deserialized))
+        {
+            throw new InvalidOperationException("DeRecMessage codec test failed: deserialize(serialize(x)) != x.");
+        }
+
+        Console.WriteLine("Serialize/deserialize roundtrip OK.");
+
+        // Dummy crypto backends
+        var signer = new DummySigner(sender);
+        var verifier = new DummyVerifier(sender);
+        var encrypter = new DummyEncrypter(42, receiver);
+        var decrypter = new DummyDecrypter(42, receiver);
+
+        byte[] wireBytes = DeRecMessageCodec.EncodeToBytes(
+                derecMessage,
+                signer,
+                encrypter
+                );
+
+        Console.WriteLine($"Wire size = {wireBytes.Length}");
+
+        DeRecMessage decoded = DeRecMessageCodec.DecodeFromBytes(
+                wireBytes,
+                decrypter,
+                verifier
+                );
+
+        if (!derecMessage.Equals(decoded))
+        {
+            throw new InvalidOperationException("DeRecMessage codec test failed: decode(encode(x)) != x.");
+        }
+
+        Console.WriteLine("Encode/decode roundtrip OK.");
+        Console.WriteLine("DeRecMessage builder/codec test passed.");
+    }
+
+    private sealed class DummySigner : IDeRecMessageSigner
+    {
+        private readonly byte[] _senderKeyHash;
+
+        public DummySigner(byte[] senderKeyHash)
+        {
+            _senderKeyHash = senderKeyHash;
+        }
+
+        public byte[] SenderKeyHash() => _senderKeyHash;
+
+        public byte[] Sign(byte[] payload)
+        {
+            byte[] prefix = new byte[] { 9, 9, 9 };
+            byte[] output = new byte[prefix.Length + payload.Length];
+            Buffer.BlockCopy(prefix, 0, output, 0, prefix.Length);
+            Buffer.BlockCopy(payload, 0, output, prefix.Length, payload.Length);
+            return output;
+        }
+    }
+
+    private sealed class DummyVerifier : IDeRecMessageVerifier
+    {
+        private readonly byte[] _senderKeyHash;
+
+        public DummyVerifier(byte[] senderKeyHash)
+        {
+            _senderKeyHash = senderKeyHash;
+        }
+
+        public VerifiedPayload Verify(byte[] signedPayload)
+        {
+            if (signedPayload.Length < 3)
+            {
+                throw new InvalidOperationException("DummyVerifier failed: signed payload too short.");
+            }
+
+            byte[] payload = signedPayload[3..];
+
+            return new VerifiedPayload
+            {
+                Payload = payload,
+                SignerKeyHash = _senderKeyHash
+            };
+        }
+    }
+
+    private sealed class DummyEncrypter : IDeRecMessageEncrypter
+    {
+        private readonly int _recipientKeyId;
+        private readonly byte[] _recipientKeyHash;
+
+        public DummyEncrypter(int recipientKeyId, byte[] recipientKeyHash)
+        {
+            _recipientKeyId = recipientKeyId;
+            _recipientKeyHash = recipientKeyHash;
+        }
+
+        public int RecipientKeyId() => _recipientKeyId;
+
+        public byte[] RecipientKeyHash() => _recipientKeyHash;
+
+        public byte[] Encrypt(byte[] payload)
+        {
+            byte[] copy = (byte[])payload.Clone();
+            Array.Reverse(copy);
+            return copy;
+        }
+    }
+
+    private sealed class DummyDecrypter : IDeRecMessageDecrypter
+    {
+        private readonly int _recipientKeyId;
+        private readonly byte[] _recipientKeyHash;
+
+        public DummyDecrypter(int recipientKeyId, byte[] recipientKeyHash)
+        {
+            _recipientKeyId = recipientKeyId;
+            _recipientKeyHash = recipientKeyHash;
+        }
+
+        public int RecipientKeyId() => _recipientKeyId;
+
+        public byte[] RecipientKeyHash() => _recipientKeyHash;
+
+        public byte[] Decrypt(byte[] payload)
+        {
+            byte[] copy = (byte[])payload.Clone();
+            Array.Reverse(copy);
+            return copy;
+        }
     }
 }

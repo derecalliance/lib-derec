@@ -47,4 +47,4 @@ pub use types::*;
 pub mod wasm;
 
 #[cfg(test)]
-mod test;
+mod tests;

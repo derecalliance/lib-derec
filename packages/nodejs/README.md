@@ -53,6 +53,45 @@ const result = derec.some_function();
 console.log(result);
 ```
 
+## Example: Building a DeRecMessage
+
+In DeRec, all protocol messages (except `ContactMessage`) must be wrapped inside a `DeRecMessage` envelope before being sent over the wire.
+
+The `build_derec_message` helper simplifies this process by constructing a valid envelope from one or more flow messages.
+
+Example (simplified):
+
+```ts
+import * as derec from "@derecalliance/derec-nodejs";
+
+// Example: assume this comes from a previous flow (e.g. pairing)
+const pairRequestMessage = derec.produce_pairing_request_message(
+  1n,
+  2,
+  /* contact_message */ new Uint8Array()
+).pair_request_message;
+
+// Convert to Uint8Array if needed
+const messageBytes = pairRequestMessage instanceof Uint8Array
+  ? pairRequestMessage
+  : Uint8Array.from(pairRequestMessage);
+
+const sender = new Uint8Array(48).fill(0x11);
+const receiver = new Uint8Array(48).fill(0x22);
+const secretId = new Uint8Array([1, 2, 3]);
+
+const derecMessage = derec.build_derec_message(
+  sender,
+  receiver,
+  secretId,
+  [messageBytes],    // owner messages
+  [],                // helper messages
+  BigInt(Date.now()) // optional timestamp (ms since epoch)
+);
+
+console.log(derecMessage);
+```
+
 ## Example: Generating Shares
 
 A typical DeRec workflow involves splitting a secret into shares that are distributed to helpers.

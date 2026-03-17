@@ -284,6 +284,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "console_error_panic_hook"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
+dependencies = [
+ "cfg-if",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -344,40 +354,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "derec-cryptography"
-version = "0.0.1-alpha.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f801134b3bb1eac5f445570b284c05b0958be2c111cb5e684d48bb52659bd66"
-dependencies = [
- "aead",
- "aes",
- "aes-gcm",
- "ark-bw6-761",
- "ark-ec",
- "ark-ff",
- "ark-poly",
- "ark-secp256k1",
- "ark-serialize",
- "ark-std",
- "ml-kem",
- "rand 0.8.5",
- "rand_chacha",
- "rand_core 0.6.4",
- "sha2",
- "thiserror",
-]
-
-[[package]]
 name = "derec-library"
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.4"
 dependencies = [
  "ark-serialize",
- "derec-cryptography 0.0.1-alpha.3 (registry+https://github.com/rust-lang/crates.io-index)",
- "derec-proto 0.0.1-alpha.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "console_error_panic_hook",
+ "derec-cryptography",
+ "derec-proto",
  "getrandom 0.2.16",
  "getrandom 0.4.2",
  "js-sys",
  "prost",
+ "prost-types",
  "rand 0.10.0",
  "serde",
  "serde-wasm-bindgen",
@@ -398,13 +386,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "derec-proto"
-version = "0.0.1-alpha.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "797988e99e5802944a1f14e57b6bcea159d12e79b99515e6b22c28e2ea41645d"
+name = "derec-rust-binding-smoke-test"
+version = "0.1.0"
 dependencies = [
+ "derec-cryptography",
+ "derec-library",
+ "derec-proto",
  "prost",
- "prost-build",
  "prost-types",
 ]
 

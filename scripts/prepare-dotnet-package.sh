@@ -88,6 +88,10 @@ main() {
          "$RUNTIMES_DIR/linux-x64" \
          "$RUNTIMES_DIR/linux-arm64"
 
+  log "Cleaning previous nuget packages"
+  rm -f "$DOTNET_PKG_DIR"/bin/Release/*.nupkg
+  rm -f "$DOTNET_PKG_DIR"/bin/Release/*.snupkg
+
   cd "$LIBRARY_DIR"
 
   for entry in "${TARGETS[@]}"; do
