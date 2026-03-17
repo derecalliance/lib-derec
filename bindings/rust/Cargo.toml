@@ -1,0 +1,12 @@
+[package]
+name = "derec-rust-binding-smoke-test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+derec-cryptography = { path = "../../cryptography" }
+derec-library = { path = "../../library" }
+derec-proto = { path = "../../protobufs" }
+prost = "0.14.3"
+prost-types = "0.14.3"
+
