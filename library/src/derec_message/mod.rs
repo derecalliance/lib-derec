@@ -6,14 +6,8 @@ use prost::Message;
 mod builder;
 pub use builder::*;
 
-// mod wire;
-// pub use wire::*;
-
 mod error;
 pub use error::*;
-
-// #[cfg(target_arch = "wasm32")]
-// pub mod wasm;
 
 #[cfg(test)]
 mod tests;

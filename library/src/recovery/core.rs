@@ -81,12 +81,10 @@ const SHARE_ALGORITHM_VSS: i32 = 0;
 /// ```
 pub fn generate_share_request(
     channel_id: ChannelId,
-    secret_id: impl AsRef<[u8]>,
+    secret_id: &[u8],
     version: i32,
     shared_key: &[u8; 32],
 ) -> Result<GenerateShareRequestResult, crate::Error> {
-    let secret_id = secret_id.as_ref();
-
     if secret_id.is_empty() {
         return Err(RecoveryError::EmptySecretId.into());
     }
@@ -205,15 +203,15 @@ pub fn generate_share_request(
 /// ```
 pub fn generate_share_response(
     channel_id: ChannelId,
-    _secret_id: impl AsRef<[u8]>,
-    request_bytes: impl AsRef<[u8]>,
-    stored_share_request_wire_bytes: impl AsRef<[u8]>,
+    _secret_id: &[u8],
+    request_bytes: &[u8],
+    stored_share_request_wire_bytes: &[u8],
     shared_key: &[u8; 32],
 ) -> Result<GenerateShareResponseResult, crate::Error> {
-    let (request_envelope, request) =
+    let (envelope, request) =
         derec_message::extract_inner_message::<GetShareRequestMessage>(request_bytes, shared_key)?;
 
-    if request_envelope.timestamp != request.timestamp {
+    if envelope.timestamp != request.timestamp {
         return Err(crate::Error::Invariant(
             "Envelope timestamp does not match request timestamp",
         ));
@@ -312,8 +310,6 @@ pub fn generate_share_response(
 /// - [`RecoveryError::EmptyResponses`] if `responses_bytes` is empty
 /// - [`RecoveryError::EmptySecretId`] if `secret_id` is empty
 /// - [`RecoveryError::InvalidVersion`] if `version < 0`
-/// - response decryption or decoding fails
-/// - `envelope.timestamp != response.timestamp` for any response
 /// - [`RecoveryError::MissingResult`] if any response is missing the `result` field
 /// - [`RecoveryError::NonOkStatus`] if any response indicates a non-OK status
 /// - [`RecoveryError::EmptyCommittedDeRecShare`] if any response contains empty committed share bytes
@@ -322,6 +318,7 @@ pub fn generate_share_response(
 /// - [`RecoveryError::SecretIdMismatch`] if any decoded share does not match `secret_id`
 /// — [`RecoveryError::VersionMismatch`] if any decoded share does not match `version`
 /// - [`RecoveryError::ReconstructionFailed`] if VSS reconstruction fails
+/// - [`Error::Invariant`] if `envelope.timestamp != response.timestamp` for any response
 ///
 /// # Security Notes
 ///
@@ -342,16 +339,14 @@ pub fn generate_share_response(
 /// assert!(result.is_err());
 /// ```
 pub fn recover_from_share_responses(
-    responses_bytes: &[impl AsRef<[u8]>],
-    secret_id: impl AsRef<[u8]>,
+    responses_bytes: &[Vec<u8>],
+    secret_id: &[u8],
     version: i32,
     shared_key: &[u8; 32],
 ) -> Result<RecoverFromResponsesResult, crate::Error> {
     if responses_bytes.is_empty() {
         return Err(RecoveryError::EmptyResponses.into());
     }
-
-    let secret_id = secret_id.as_ref();
 
     if secret_id.is_empty() {
         return Err(RecoveryError::EmptySecretId.into());

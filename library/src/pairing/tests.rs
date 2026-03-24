@@ -124,7 +124,7 @@ fn test_create_contact_message() {
 
     let contact_msg = decode_contact_message(&wire_bytes);
 
-    assert_eq!(contact_msg.channel_id, channel_id.into());
+    assert_eq!(contact_msg.channel_id, u64::from(channel_id));
 
     let transport = contact_msg
         .transport_protocol
@@ -245,7 +245,7 @@ fn test_produce_pairing_request_message() {
         decode_inner_pair_request(&pair_request_wire_bytes, &alice_sk_state.ecies_secret_key);
 
     assert_eq!(outer.timestamp, pair_request_message.timestamp);
-    assert_eq!(pair_request_message.channel_id, channel_id.into());
+    assert_eq!(pair_request_message.channel_id, u64::from(channel_id));
     assert_eq!(pair_request_message.nonce, contact_message.nonce);
 
     let transport = pair_request_message

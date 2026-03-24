@@ -255,8 +255,8 @@ fn transport_protocol_to_js(tp: &TransportProtocol) -> TransportProtocolJs {
 
 fn get_sender_kind(kind: u32) -> Result<SenderKind, JsValue> {
     match kind {
-        0 => Ok(SenderKind::SharerNonRecovery),
-        1 => Ok(SenderKind::SharerRecovery),
+        0 => Ok(SenderKind::OwnerNonRecovery),
+        1 => Ok(SenderKind::OwnerRecovery),
         2 => Ok(SenderKind::Helper),
         _ => Err(js_error(
             "INVALID_SENDER_KIND",

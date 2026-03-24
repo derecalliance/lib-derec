@@ -80,7 +80,8 @@ fn create_response_wire_bytes_with_mismatched_timestamp(
     committed_bytes: Vec<u8>,
 ) -> Vec<u8> {
     let message_timestamp = current_timestamp();
-    let envelope_timestamp = current_timestamp();
+    let mut envelope_timestamp = message_timestamp;
+    envelope_timestamp.seconds += 1;
 
     let message = GetShareResponseMessage {
         share_algorithm: 0,
@@ -463,7 +464,8 @@ fn test_generate_share_response_request_timestamp_mismatch() {
     let version = 0;
 
     let message_timestamp = current_timestamp();
-    let envelope_timestamp = current_timestamp();
+    let mut envelope_timestamp = message_timestamp;
+    envelope_timestamp.seconds += 1;
 
     let tampered_request_message = derec_proto::GetShareRequestMessage {
         secret_id: secret_id.to_vec(),
@@ -516,7 +518,8 @@ fn test_generate_share_response_stored_share_timestamp_mismatch() {
         .expect("request generation should succeed");
 
     let message_timestamp = current_timestamp();
-    let envelope_timestamp = current_timestamp();
+    let mut envelope_timestamp = message_timestamp;
+    envelope_timestamp.seconds += 1;
 
     let stored_share_message = StoreShareRequestMessage {
         share: create_committed_share_bytes(secret_id, version),

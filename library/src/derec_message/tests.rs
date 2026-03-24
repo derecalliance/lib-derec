@@ -15,7 +15,10 @@ fn pairing_keypair() -> (Vec<u8>, Vec<u8>) {
 }
 
 fn sample_message() -> PairRequestMessage {
-    PairRequestMessage::default()
+    PairRequestMessage {
+        channel_id: 1,
+        ..Default::default()
+    }
 }
 
 #[test]
@@ -226,8 +229,14 @@ fn test_current_timestamp_returns_valid_range() {
 
 #[test]
 fn test_message_overwrites_previous_payload() {
-    let first = PairRequestMessage::default();
-    let second = PairRequestMessage::default();
+    let first = PairRequestMessage {
+        channel_id: 1,
+        ..Default::default()
+    };
+    let second = PairRequestMessage {
+        channel_id: 2,
+        ..Default::default()
+    };
 
     let first_encoded = first.encode_to_vec();
     let second_encoded = second.encode_to_vec();
