@@ -6,9 +6,6 @@ pub enum SharingError {
     #[error("no channels provided")]
     EmptyChannels,
 
-    #[error("some channels are duplicated")]
-    DuplicateChannels,
-
     #[error(
         "invalid threshold (threshold={threshold}, channels={channels}); must satisfy 2 <= threshold <= channels"
     )]

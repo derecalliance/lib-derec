@@ -1,229 +1,368 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::types::*;
-use derec_proto::{
-    Result as DerecResult, StatusEnum, VerifyShareRequestMessage, VerifyShareResponseMessage,
+use crate::{
+    derec_message::{self, DeRecMessageBuilder, current_timestamp},
+    types::*,
+    verification::{GenerateVerificationRequestResult, GenerateVerificationResponseResult},
 };
+use derec_proto::{DeRecResult, StatusEnum, VerifyShareRequestMessage, VerifyShareResponseMessage};
+use prost::Message;
 use rand::{Rng, rng};
-use sha2::*;
+use sha2::{Digest, Sha384};
 use subtle::ConstantTimeEq;
 
-/// Creates a [`VerifyShareRequestMessage`] to initiate the DeRec *verification* flow.
+/// Creates a verification request envelope to initiate the DeRec *verification* flow.
 ///
-/// In DeRec, verification allows an Owner to challenge a Helper to prove it still holds the
-/// expected share bytes. The Owner sends a request containing:
+/// In DeRec, verification allows an Owner to challenge a Helper to prove it still holds
+/// the expected share bytes. The Owner sends an encrypted
+/// [`VerifyShareRequestMessage`] containing:
 ///
-/// - A `version` identifying the share-distribution version being verified
-/// - A fresh, unpredictable `nonce` that prevents replay of previously captured responses
+/// - a `version` identifying the share-distribution version being verified
+/// - a fresh `nonce` used to bind the later proof to this specific request
 ///
-/// The Helper is expected to compute a SHA-384 digest over `(share_content || nonce)` and return it
-/// in a [`VerifyShareResponseMessage`].
+/// The request is serialized, encrypted with the already established channel shared key,
+/// and wrapped in an outer plain [`derec_proto::DeRecMessage`] envelope.
+///
+/// The Helper is expected to compute:
+///
+/// `SHA384(share_content || nonce_be)`
+///
+/// and return that digest in a [`VerifyShareResponseMessage`].
 ///
 /// # Arguments
 ///
-/// * `_secret_id` - Secret identifier (currently unused by this helper). Included for API consistency
-///   and for future extensions where the secret context may influence verification.
-/// * `version` - Distribution version to embed in the request. The responder should echo this value
-///   in the response.
+/// * `_secret_id` - Secret identifier (currently unused by this helper). Included for API
+///   consistency and future extensibility.
+/// * `channel_id` - Channel identifier for the previously paired helper.
+/// * `version` - Distribution version to embed in the request. The responder is expected to
+///   echo this value in the response.
+/// * `shared_key` - Previously established 32-byte symmetric channel key used to encrypt the
+///   inner verification request.
 ///
 /// # Returns
 ///
-/// On success returns a [`VerifyShareRequestMessage`] containing:
+/// On success returns [`GenerateVerificationRequestResult`] containing:
+///
+/// - `wire_bytes`: serialized outer [`derec_proto::DeRecMessage`] bytes carrying an encrypted
+///   inner [`VerifyShareRequestMessage`]
+///
+/// The inner request contains:
 ///
 /// - `version`: the provided version
-/// - `nonce`: 32 bytes generated using the OS CSPRNG (`rand::rngs::OsRng`)
+/// - `nonce`: a fresh randomly generated `u64`
+/// - `timestamp`: the request creation timestamp
 ///
 /// # Errors
 ///
-/// This function currently returns no verification-specific errors. The return type is
-/// `Result<_, crate::Error>` for API stability and to allow future validations.
+/// Returns [`crate::Error`] if outer envelope construction or symmetric encryption fails.
 ///
 /// # Security Notes
 ///
-/// - The nonce is generated using the OS CSPRNG and MUST be unique/unpredictable to mitigate replay.
-/// - The request is not itself a proof; the proof is the responder’s hash bound to the nonce.
+/// - The nonce is generated using the crate's RNG source via `rand::rng()` and must be
+///   unpredictable to prevent replay of previously captured responses.
+/// - The outer envelope is not encrypted; only the inner protobuf message is encrypted.
+/// - The outer envelope timestamp is set equal to the inner request timestamp to preserve
+///   the invariant `envelope.timestamp == request.timestamp`.
 ///
 /// # Example
 ///
 /// ```rust
-/// use derec_library::verification::*;
+/// use derec_library::types::ChannelId;
+/// use derec_library::verification::generate_verification_request;
 ///
-/// let secret_id = "secret_id";
-/// let version = 7;
+/// let channel_id = ChannelId(42);
+/// let shared_key = [7u8; 32];
 ///
-/// let request = generate_verification_request(secret_id, version)
-///     .expect("failed to build verification request");
+/// let result = generate_verification_request(
+///     b"secret_id",
+///     channel_id,
+///     7,
+///     &shared_key,
+/// )
+/// .expect("failed to build verification request");
 ///
-/// assert_eq!(request.version, 7);
+/// assert!(!result.wire_bytes.is_empty());
 /// ```
 pub fn generate_verification_request(
     _secret_id: impl AsRef<[u8]>,
+    channel_id: ChannelId,
     version: i32,
-) -> Result<VerifyShareRequestMessage, crate::Error> {
+    shared_key: &[u8; 32],
+) -> Result<GenerateVerificationRequestResult, crate::Error> {
     let mut rng = rng();
 
-    Ok(VerifyShareRequestMessage {
+    let timestamp = current_timestamp();
+    let nonce = rng.next_u64();
+
+    let message = VerifyShareRequestMessage {
         version,
-        nonce: rng.next_u64(),
-    })
+        nonce,
+        timestamp: Some(timestamp),
+    };
+
+    let wire_bytes = DeRecMessageBuilder::channel()
+        .channel_id(channel_id)
+        .timestamp(timestamp)
+        .message(&message)
+        .encrypt(shared_key)?
+        .build()?
+        .encode_to_vec();
+
+    Ok(GenerateVerificationRequestResult { wire_bytes })
 }
 
-/// Creates a [`VerifyShareResponseMessage`] to answer a DeRec *verification* request.
+/// Creates a verification response envelope answering a DeRec verification request.
 ///
-/// The response proves possession of the provided `share_content` by computing:
+/// The responder decrypts the incoming request, validates the invariant
+/// `envelope.timestamp == request.timestamp`, computes:
 ///
-/// `hash = SHA384(share_content || request.nonce)`
+/// `hash = SHA384(share_content || request.nonce_be)`
 ///
-/// The returned [`VerifyShareResponseMessage`] includes:
+/// and returns an encrypted [`VerifyShareResponseMessage`] carrying:
 ///
 /// - `result.status = Ok`
 /// - `version = request.version`
 /// - `nonce = request.nonce`
 /// - `hash = SHA-384 digest`
 ///
+/// The response is serialized, encrypted with the channel shared key, and wrapped in a
+/// plain outer [`derec_proto::DeRecMessage`] envelope.
+///
 /// # Arguments
 ///
-/// * `_secret_id` - Secret identifier (currently unused by this helper). Included for API consistency
-///   and future extensions.
-/// * `_channel_id` - Channel identifier (currently unused by this helper). Included for API consistency
-///   and future extensions.
-/// * `share_content` - The share bytes to be proven/verified. The digest is computed over these bytes.
-/// * `request` - The original [`VerifyShareRequestMessage`] containing `version` and the challenge `nonce`.
+/// * `_secret_id` - Secret identifier (currently unused by this helper). Included for API
+///   consistency and future extensibility.
+/// * `channel_id` - Channel identifier for the previously paired helper.
+/// * `shared_key` - Previously established 32-byte symmetric channel key used to decrypt
+///   the request and encrypt the response.
+/// * `share_content` - The share bytes whose possession is being proven.
+/// * `request_bytes` - Serialized outer [`derec_proto::DeRecMessage`] bytes carrying the
+///   encrypted inner [`VerifyShareRequestMessage`].
 ///
 /// # Returns
 ///
-/// On success returns a [`VerifyShareResponseMessage`] containing:
+/// On success returns [`GenerateVerificationResponseResult`] containing:
 ///
-/// - `result`: [`DerecResult`] with `status = StatusEnum::Ok`
-/// - `version`: echoed from `request.version`
-/// - `nonce`: echoed from `request.nonce`
-/// - `hash`: `SHA384(share_content || request.nonce)`
+/// - `wire_bytes`: serialized outer [`derec_proto::DeRecMessage`] bytes carrying an encrypted
+///   inner [`VerifyShareResponseMessage`]
 ///
 /// # Errors
 ///
-/// Returns [`VerificationError`] in the following cases:
+/// Returns [`crate::Error`] if:
 ///
-/// - [`VerificationError::Invariant`] if `request.nonce.len() != 32`.
+/// - request decryption or protobuf decoding fails
+/// - `envelope.timestamp != request.timestamp`
+/// - outer response envelope construction or encryption fails
 ///
 /// # Security Notes
 ///
-/// - This response is only meaningful when the verifier binds it to the original request nonce.
-/// - The `result` field indicates protocol-level success; verifiers may additionally enforce that
-///   `result` is present and `status == Ok` (this crate’s current `verify_share_response` does not).
+/// - The proof is bound to the request nonce and therefore to a specific verification challenge.
+/// - The outer response timestamp is set equal to the inner response timestamp to preserve
+///   the invariant `envelope.timestamp == response.timestamp`.
 ///
 /// # Example
 ///
 /// ```rust
-/// use derec_library::verification::*;
 /// use derec_library::types::ChannelId;
+/// use derec_library::verification::{
+///     generate_verification_request,
+///     generate_verification_response,
+/// };
 ///
 /// let channel_id = ChannelId(42);
-/// let secret_id = "secret_id";
-/// let version = 7;
-/// let share_content = b"example_share";
+/// let shared_key = [7u8; 32];
 ///
-/// let request = generate_verification_request(secret_id, version)
-///     .expect("Failed to generate verification request");
+/// let request = generate_verification_request(
+///     b"secret_id",
+///     channel_id,
+///     7,
+///     &shared_key,
+/// )
+/// .expect("failed to generate verification request");
 ///
-/// let response = generate_verification_response(secret_id, channel_id, share_content, &request)
-///     .expect("Failed to generate verification response");
+/// let response = generate_verification_response(
+///     b"secret_id",
+///     channel_id,
+///     &shared_key,
+///     b"example_share",
+///     &request.wire_bytes,
+/// )
+/// .expect("failed to generate verification response");
 ///
-/// assert_eq!(response.version, request.version);
-/// assert_eq!(response.nonce, request.nonce);
-/// assert!(!response.hash.is_empty());
+/// assert!(!response.wire_bytes.is_empty());
 /// ```
 pub fn generate_verification_response(
     _secret_id: impl AsRef<[u8]>,
-    _channel_id: ChannelId,
+    channel_id: ChannelId,
+    shared_key: &[u8; 32],
     share_content: impl AsRef<[u8]>,
-    request: &VerifyShareRequestMessage,
-) -> Result<VerifyShareResponseMessage, crate::Error> {
-    // compute the Sha384 hash of the share content
-    let mut hasher = Sha384::new();
-    hasher.update(share_content);
-    hasher.update(request.nonce.to_be_bytes());
-    let hash = hasher.finalize().to_vec();
+    request_bytes: impl AsRef<[u8]>,
+) -> Result<GenerateVerificationResponseResult, crate::Error> {
+    let (envelope, request) = derec_message::extract_inner_message::<VerifyShareRequestMessage>(
+        request_bytes,
+        shared_key,
+    )?;
 
-    Ok(VerifyShareResponseMessage {
-        result: Some(DerecResult {
+    if envelope.timestamp != request.timestamp {
+        return Err(crate::Error::Invariant(
+            "Envelope timestamp does not match request timestamp",
+        ));
+    }
+
+    let hash = hash_content(share_content, request.nonce);
+    let timestamp = current_timestamp();
+
+    let message = VerifyShareResponseMessage {
+        result: Some(DeRecResult {
             status: StatusEnum::Ok as i32,
             memo: String::new(),
         }),
         version: request.version,
         nonce: request.nonce,
         hash,
-    })
+        timestamp: Some(timestamp),
+    };
+
+    let wire_bytes = DeRecMessageBuilder::channel()
+        .channel_id(channel_id)
+        .timestamp(timestamp)
+        .message(&message)
+        .encrypt(shared_key)?
+        .build()?
+        .encode_to_vec();
+
+    Ok(GenerateVerificationResponseResult { wire_bytes })
 }
 
-/// Verifies a [`VerifyShareResponseMessage`] by recomputing the expected SHA-384 digest.
+/// Verifies a DeRec verification response by decrypting it and recomputing the expected
+/// SHA-384 digest.
 ///
-/// This helper recomputes:
+/// This function:
 ///
-/// `expected = SHA384(share_content || response.nonce)`
+/// 1. decrypts and decodes the inner [`VerifyShareResponseMessage`]
+/// 2. checks the invariant `envelope.timestamp == response.timestamp`
+/// 3. requires `response.result.status == Ok`
+/// 4. recomputes:
 ///
-/// and returns `true` if `expected == response.hash`.
+/// `expected = SHA384(share_content || response.nonce_be)`
+///
+/// 5. returns whether `expected == response.hash` using constant-time comparison
 ///
 /// # Arguments
 ///
-/// * `_secret_id` - Secret identifier (currently unused by this helper). Included for API consistency
-///   and future extensions.
-/// * `_channel_id` - Channel identifier (currently unused by this helper). Included for API consistency
-///   and future extensions.
+/// * `_secret_id` - Secret identifier (currently unused by this helper). Included for API
+///   consistency and future extensibility.
+/// * `_channel_id` - Channel identifier (currently unused by this helper). Included for API
+///   consistency and future extensibility.
+/// * `shared_key` - Previously established 32-byte symmetric channel key used to decrypt the
+///   response.
 /// * `share_content` - The expected share bytes. The digest is recomputed over these bytes.
-/// * `response` - The [`VerifyShareResponseMessage`] containing the nonce and hash to verify.
+/// * `response_bytes` - Serialized outer [`derec_proto::DeRecMessage`] bytes carrying the
+///   encrypted inner [`VerifyShareResponseMessage`].
 ///
 /// # Returns
 ///
 /// On success returns:
 ///
-/// - `Ok(true)` if the recomputed digest matches `response.hash`
-/// - `Ok(false)` otherwise
+/// - `Ok(true)` if the response status is `Ok` and the recomputed digest matches `response.hash`
+/// - `Ok(false)` if the response status is `Ok` but the digest does not match
 ///
 /// # Errors
 ///
-/// This function currently returns no verification-specific errors. The return type is
-/// `Result<_, crate::Error>` for API stability and to allow future validations.
+/// Returns [`crate::Error`] if:
+///
+/// - response decryption or protobuf decoding fails
+/// - `envelope.timestamp != response.timestamp`
+/// - `response.result` is missing
+/// - `response.result.status != Ok`
 ///
 /// # Security Notes
 ///
-/// - **Limitation:** this function does *not* validate `response.result`, `response.version`, or that
-///   `response.nonce` matches the original request nonce. It only checks that the hash matches the
-///   nonce included in the response.
+/// - This function validates the response envelope/message timestamp invariant.
+/// - This function validates that the responder explicitly marked the operation as successful.
+/// - This function does **not** compare the response against the original request bytes, so it
+///   does not independently verify that the returned `version` or `nonce` match a specific
+///   previously issued request. It only verifies the cryptographic proof against the nonce
+///   present in the response itself.
 ///
 /// # Example
 ///
 /// ```rust
-/// use derec_library::verification::*;
 /// use derec_library::types::ChannelId;
+/// use derec_library::verification::{
+///     generate_verification_request,
+///     generate_verification_response,
+///     verify_share_response,
+/// };
 ///
 /// let channel_id = ChannelId(42);
-/// let secret_id = "secret_id";
-/// let version = 7;
-/// let request = generate_verification_request(secret_id, version)
-///     .expect("failed to build verification request");
-///
+/// let shared_key = [7u8; 32];
 /// let share_content = b"example_share";
 ///
-/// let response = generate_verification_response(secret_id, channel_id, share_content, &request)
-///     .expect("failed to generate verification response");
+/// let request = generate_verification_request(
+///     b"secret_id",
+///     channel_id,
+///     7,
+///     &shared_key,
+/// )
+/// .expect("failed to generate verification request");
 ///
-/// let ok = verify_share_response(secret_id, channel_id, share_content, &response)
-///     .expect("failed to verify response");
+/// let response = generate_verification_response(
+///     b"secret_id",
+///     channel_id,
+///     &shared_key,
+///     share_content,
+///     &request.wire_bytes,
+/// )
+/// .expect("failed to generate verification response");
+///
+/// let ok = verify_share_response(
+///     b"secret_id",
+///     channel_id,
+///     &shared_key,
+///     share_content,
+///     &response.wire_bytes,
+/// )
+/// .expect("failed to verify response");
 ///
 /// assert!(ok);
 /// ```
 pub fn verify_share_response(
     _secret_id: impl AsRef<[u8]>,
     _channel_id: ChannelId,
+    shared_key: &[u8; 32],
     share_content: impl AsRef<[u8]>,
-    response: &VerifyShareResponseMessage,
+    response_bytes: impl AsRef<[u8]>,
 ) -> Result<bool, crate::Error> {
-    // compute the Sha384 hash of the share content
-    let mut hasher = Sha384::new();
-    hasher.update(share_content);
-    hasher.update(response.nonce.to_be_bytes());
-    let hash = hasher.finalize().to_vec();
+    let (envelope, response) = derec_message::extract_inner_message::<VerifyShareResponseMessage>(
+        response_bytes,
+        shared_key,
+    )?;
 
-    // Ok(hash == response.hash)
-    Ok(hash.ct_eq(response.hash.as_slice()).into())
+    if envelope.timestamp != response.timestamp {
+        return Err(crate::Error::Invariant(
+            "Envelope timestamp does not match response timestamp",
+        ));
+    }
+
+    let result = response.result.ok_or(crate::Error::Invariant(
+        "Verification response is missing result",
+    ))?;
+
+    if result.status != StatusEnum::Ok as i32 {
+        return Err(crate::Error::Invariant(
+            "Verification response status is not Ok",
+        ));
+    }
+
+    let expected_hash = hash_content(share_content, response.nonce);
+
+    Ok(expected_hash.ct_eq(response.hash.as_slice()).into())
+}
+
+fn hash_content(share_content: impl AsRef<[u8]>, nonce: u64) -> Vec<u8> {
+    let mut hasher = Sha384::new();
+    hasher.update(share_content.as_ref());
+    hasher.update(nonce.to_be_bytes());
+    hasher.finalize().to_vec()
 }

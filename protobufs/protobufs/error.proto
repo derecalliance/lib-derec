@@ -1,27 +1,60 @@
 /*
  * Copyright (c) DeRec Alliance and its Contributors.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *        http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 syntax = "proto3";
+
 import "result.proto";
 
 package org.derecalliance.derec.protobuf;
 
-// ErrorResponseMessage is sent by a message receiver when an invalid
-// or malformed protocol message is received.
+// ErrorResponseMessage is a generic error response sent when a protocol
+// message cannot be processed successfully.
+//
+// # Context
+//
+// This message may be returned in response to any DeRecMessage when the
+// receiver encounters an error during processing.
+//
+// Typical scenarios include:
+//
+// - malformed or invalid message payloads
+// - unsupported or unknown message types
+// - protocol violations (e.g., invalid sequence, nonce mismatch)
+// - authorization or validation failures
+//
+// # Semantics
+//
+// This message indicates that:
+//
+// - the original request was not successfully processed
+// - no state change should be assumed by the sender
+//
+// The sender SHOULD:
+//
+// - inspect the `result` field to determine the cause of the failure
+// - decide whether to retry, abort, or escalate based on the error
+//
+// # Usage Guidelines
+//
+// - This message is intended as a fallback when no more specific response
+//   type is applicable
+// - Protocol-specific errors SHOULD use their corresponding response
+//   messages when available
+//
+// # Security Considerations
+//
+// - Error responses SHOULD avoid leaking sensitive internal details
+// - Only high-level error information should be exposed via `result`
+//
+// # Idempotency
+//
+// Error responses are idempotent and may be returned multiple times
+// for repeated invalid requests.
 message ErrorResponseMessage {
   // Result describing the error encountered while processing the request.
-  Result result = 1;
+  //
+  // This field encodes the error type and any associated status information.
+  DeRecResult result = 1;
 }

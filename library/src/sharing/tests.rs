@@ -1,23 +1,37 @@
 use crate::{
     Error,
+    derec_message::extract_inner_message,
     sharing::{ProtectSecretResult, SharingError, protect_secret},
     types::ChannelId,
 };
-use derec_proto::{CommittedDeRecShare, DeRecShare};
+use derec_proto::{CommittedDeRecShare, DeRecShare, StoreShareRequestMessage};
 use prost::Message;
+use std::collections::HashMap;
+
+fn make_channels(ids: &[u64]) -> HashMap<ChannelId, [u8; 32]> {
+    let mut channels = HashMap::new();
+
+    for id in ids {
+        let mut key = [0u8; 32];
+        key[24..].copy_from_slice(&id.to_be_bytes());
+        channels.insert(ChannelId(*id), key);
+    }
+
+    channels
+}
 
 #[test]
 fn test_protect_secret_empty_channels() {
     let secret_id = b"secret-id";
     let secret_data = b"secret-data";
-    let empty_channels: Vec<ChannelId> = vec![];
+    let empty_channels: HashMap<ChannelId, [u8; 32]> = HashMap::new();
     let threshold = 2;
     let version = 1;
 
     let result = protect_secret(
         secret_id,
         secret_data,
-        &empty_channels,
+        empty_channels,
         threshold,
         version,
         None,
@@ -31,42 +45,17 @@ fn test_protect_secret_empty_channels() {
 }
 
 #[test]
-fn test_protect_secret_duplicated_channels() {
-    let secret_id = b"secret-id";
-    let secret_data = b"secret-data";
-    let duplicated_channels: Vec<ChannelId> =
-        [1, 1, 3].iter().copied().map(ChannelId::from).collect();
-    let threshold = 2;
-    let version = 1;
-
-    let result = protect_secret(
-        secret_id,
-        secret_data,
-        &duplicated_channels,
-        threshold,
-        version,
-        None,
-        None,
-    );
-
-    assert!(matches!(
-        result,
-        Err(Error::Sharing(SharingError::DuplicateChannels))
-    ));
-}
-
-#[test]
 fn test_protect_secret_empty_secret_id() {
     let empty_secret_id = b"";
     let secret_data = b"secret-data";
-    let channels: Vec<ChannelId> = [1, 2, 3].iter().copied().map(ChannelId::from).collect();
+    let channels = make_channels(&[1, 2, 3]);
     let threshold = 2;
     let version = 1;
 
     let result = protect_secret(
         empty_secret_id,
         secret_data,
-        &channels,
+        channels,
         threshold,
         version,
         None,
@@ -83,14 +72,14 @@ fn test_protect_secret_empty_secret_id() {
 fn test_protect_secret_empty_secret_data() {
     let secret_id = b"secret-id";
     let empty_secret_data = b"";
-    let channels: Vec<ChannelId> = [1, 2, 3].iter().copied().map(ChannelId::from).collect();
+    let channels = make_channels(&[1, 2, 3]);
     let threshold = 2;
     let version = 1;
 
     let result = protect_secret(
         secret_id,
         empty_secret_data,
-        &channels,
+        channels,
         threshold,
         version,
         None,
@@ -107,14 +96,14 @@ fn test_protect_secret_empty_secret_data() {
 fn test_protect_secret_invalid_threshold_too_low() {
     let secret_id = b"secret-id";
     let secret_data = b"secret-data";
-    let channels: Vec<ChannelId> = [1, 2, 3].iter().copied().map(ChannelId::from).collect();
-    let too_low_threshold = 1; // invalid: must be >= 2
+    let channels = make_channels(&[1, 2, 3]);
+    let too_low_threshold = 1;
     let version = 1;
 
     let result = protect_secret(
         secret_id,
         secret_data,
-        &channels,
+        channels,
         too_low_threshold,
         version,
         None,
@@ -134,14 +123,14 @@ fn test_protect_secret_invalid_threshold_too_low() {
 fn test_protect_secret_invalid_threshold_too_high() {
     let secret_id = b"secret-id";
     let secret_data = b"secret-data";
-    let channels: Vec<ChannelId> = [1, 2, 3].iter().copied().map(ChannelId::from).collect();
-    let too_high_threshold = 4; // invalid: must be <= channels.len()
+    let channels = make_channels(&[1, 2, 3]);
+    let too_high_threshold = 4;
     let version = 1;
 
     let result = protect_secret(
         secret_id,
         secret_data,
-        &channels,
+        channels,
         too_high_threshold,
         version,
         None,
@@ -161,7 +150,7 @@ fn test_protect_secret_invalid_threshold_too_high() {
 fn test_protect_secret_valid_sharing() {
     let secret_id = b"my_secret_id";
     let secret_data = b"super_secret_value";
-    let channels: Vec<ChannelId> = [1, 2, 3].iter().copied().map(ChannelId::from).collect();
+    let channels = make_channels(&[1, 2, 3]);
     let threshold = 2;
     let version = 7;
     let keep_list = [1, 2, 3];
@@ -170,7 +159,7 @@ fn test_protect_secret_valid_sharing() {
     let ProtectSecretResult { shares } = protect_secret(
         secret_id,
         secret_data,
-        &channels,
+        channels.clone(),
         threshold,
         version,
         Some(&keep_list),
@@ -181,11 +170,30 @@ fn test_protect_secret_valid_sharing() {
     assert_eq!(
         shares.len(),
         channels.len(),
-        "invalid number of shares given the number of channels"
+        "invalid number of share envelopes given the number of channels"
     );
 
-    for ch in &channels {
-        let msg = shares.get(ch).expect("missing share message for channel");
+    for (channel_id, shared_key) in &channels {
+        let wire_bytes = shares
+            .get(channel_id)
+            .expect("missing DeRecMessage envelope for channel");
+
+        let (envelope, msg): (_, StoreShareRequestMessage) =
+            extract_inner_message(wire_bytes, shared_key)
+                .expect("failed to decrypt and decode StoreShareRequestMessage");
+
+        assert!(
+            envelope.timestamp.is_some(),
+            "outer DeRecMessage envelope timestamp must be present"
+        );
+        assert!(
+            msg.timestamp.is_some(),
+            "inner StoreShareRequestMessage timestamp must be present"
+        );
+        assert_eq!(
+            envelope.timestamp, msg.timestamp,
+            "envelope timestamp must match StoreShareRequestMessage timestamp"
+        );
 
         assert_eq!(msg.version, version);
         assert_eq!(msg.share_algorithm, 0);
@@ -201,10 +209,16 @@ fn test_protect_secret_valid_sharing() {
         assert_eq!(inner.secret_id, secret_id.to_vec());
         assert_eq!(inner.version, version);
 
-        assert!(!inner.encrypted_secret.is_empty());
-        assert!(!inner.x.is_empty());
-        assert!(!inner.y.is_empty());
+        assert!(
+            !inner.encrypted_secret.is_empty(),
+            "encrypted_secret must not be empty"
+        );
+        assert!(!inner.x.is_empty(), "share x coordinate must not be empty");
+        assert!(!inner.y.is_empty(), "share y coordinate must not be empty");
 
-        assert!(!committed.commitment.is_empty());
+        assert!(
+            !committed.commitment.is_empty(),
+            "commitment must not be empty"
+        );
     }
 }

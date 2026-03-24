@@ -1,0 +1,86 @@
+/*
+ * Copyright (c) DeRec Alliance and its Contributors.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+syntax = "proto3";
+
+package org.derecalliance.derec.protobuf;
+
+/// Enumeration of supported transport protocols.
+///
+/// Additional values MAY be introduced in future versions of the protocol.
+enum Protocol {
+  /// HTTPS-based transport.
+  ///
+  /// Messages are delivered via HTTP(S) requests, typically using a
+  /// request/response pattern where the Owner acts as client and the
+  /// Helper acts as server.
+  ///
+  /// This is the default and currently required transport.
+  HTTPS = 0;
+}
+
+/// TransportProtocol defines how a DeRec participant (Owner or Helper)
+/// can be reached over the network.
+///
+/// This message encapsulates the transport-layer endpoint and the protocol
+/// required to deliver DeRec messages to that endpoint. It is typically
+/// exchanged during pairing (via ContactMessage) so that both parties know
+/// how to establish communication channels.
+///
+/// A TransportProtocol does not itself provide security guarantees.
+/// All DeRec protocol messages MUST still be signed and encrypted at the
+/// application layer, regardless of the underlying transport.
+///
+/// # Semantics
+///
+/// - The `uri` identifies the remote endpoint (e.g., HTTPS URL, message queue).
+/// - The `protocol` specifies how the URI should be interpreted and how
+///   messages must be transmitted.
+/// - The combination of (`protocol`, `uri`) MUST be sufficient for the sender
+///   to deliver a DeRec message to the receiver.
+///
+/// # Usage
+///
+/// - Included in ContactMessage during pairing to advertise reachable endpoints.
+/// - May be stored by peers as part of the communication channel state.
+/// - Used by the sender to select the correct transport mechanism when
+///   delivering protocol messages.
+///
+/// # Extensibility
+///
+/// The Protocol enum is expected to grow as new transport mechanisms are
+/// supported (e.g., message queues, peer-to-peer transports). Implementations
+/// MUST ignore unknown enum values unless explicitly required otherwise.
+///
+/// # Reliability
+///
+/// Transport protocols may be:
+/// - request/response (e.g., HTTPS)
+/// - store-and-forward (e.g., message queues)
+///
+/// Implementations MUST handle retries and idempotency at the protocol layer,
+/// independent of transport guarantees.
+message TransportProtocol {
+  /// URI endpoint used to contact the peer.
+  ///
+  /// The format of this field depends on the selected `protocol`.
+  /// Examples:
+  ///
+  /// - HTTPS: "https://example.com/derec"
+  /// - Future protocols MAY define other URI schemes.
+  ///
+  /// The URI MUST be sufficient to route messages to the intended recipient.
+  string uri = 1;
+
+  /// Transport protocol associated with the URI.
+  ///
+  /// This determines:
+  /// - how the `uri` should be interpreted
+  /// - how messages are serialized and delivered
+  /// - what communication pattern is expected (e.g., synchronous vs async)
+  ///
+  /// Implementations MUST support all mandatory protocol types defined here.
+  Protocol protocol = 2;
+}

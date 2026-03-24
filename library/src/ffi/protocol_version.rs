@@ -41,8 +41,8 @@
 /// - Changes to `minor` indicate backward-compatible additions or updates
 #[repr(C)]
 pub struct DeRecProtocolVersion {
-    pub major: i32,
-    pub minor: i32,
+    pub major: u32,
+    pub minor: u32,
 }
 
 /// Returns the current DeRec protocol version used by the SDK.

@@ -1,6 +1,6 @@
 [package]
 name = "derec-library"
-version = "0.0.1-alpha.4"
+version = "0.0.1-alpha.5"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -22,8 +22,10 @@ include = [
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-derec-cryptography =  "0.0.1-alpha.3"
-derec-proto =  "0.0.1-alpha.3"
+# derec-cryptography =  "0.0.1-alpha.5"
+# derec-proto =  "0.0.1-alpha.3"
+derec-cryptography =  { path = "../cryptography" }
+derec-proto = { path = "../protobufs" }
 prost = "0.14.3"
 prost-types = "0.14.3"
 rand = { version = "0.10.0", features = ["sys_rng"] }
@@ -33,6 +35,7 @@ ark-serialize = { version = "0.5.0", default-features = true }
 thiserror = "2.0.18"
 zeroize = "1.8.2"
 subtle = "2.6.1"
+k256 = { version = "0.13.4", features = ["ecdsa"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = { version = "0.2.114", features = ["serde-serialize"] }
@@ -41,4 +44,7 @@ js-sys = { version = "0.3.91" }
 getrandom_02 = { package = "getrandom", version = "0.2.16", features = ["js"] }
 getrandom_04 = { package = "getrandom", version = "0.4.2", features = ["wasm_js"] }
 console_error_panic_hook = "0.1.7"
+
+[dev-dependencies]
+rand08 = { package = "rand", version = "0.8.5" }
 

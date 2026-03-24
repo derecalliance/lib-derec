@@ -50,6 +50,9 @@ pub enum Error {
     #[error(transparent)]
     Verification(#[from] crate::verification::VerificationError),
 
+    #[error(transparent)]
+    DeRecMessage(#[from] crate::derec_message::DeRecMessageBuilderError),
+
     #[error("invalid input: {0}")]
     InvalidInput(&'static str),
 

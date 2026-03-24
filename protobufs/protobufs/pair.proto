@@ -1,102 +1,226 @@
 /*
  * Copyright (c) DeRec Alliance and its Contributors.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *        http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
 import "communicationinfo.proto";
 import "parameterrange.proto";
 import "result.proto";
+import "transportprotocol.proto";
 
 package org.derecalliance.derec.protobuf;
 
-// SenderKind identifies the role of the sender of a pairing message.
+// SenderKind identifies the logical role of the sender in the pairing flow.
+//
+// The role determines:
+//
+// - how the receiver interprets the message
+// - whether the pairing is part of a normal operation or a recovery procedure
+// - how the resulting channel should be associated with existing state
+//
+// In particular, recovery mode has special semantics on the Helper side,
+// allowing linkage to previously known secrets belonging to the same user.
 enum SenderKind {
-  // Sender is a sharer operating in normal (non-recovery) mode.
-  SHARER_NON_RECOVERY = 0;
+  // Sender is an Owner operating in normal (non-recovery) mode.
+  //
+  // This is the standard pairing flow used when establishing a new
+  // secret-sharing relationship.
+  OWNER_NON_RECOVERY = 0;
 
-  // Sender is a sharer operating in recovery mode.
-  SHARER_RECOVERY = 1;
+  // Sender is an Owner operating in recovery mode.
+  //
+  // This indicates that the sender is attempting to recover previously
+  // shared secrets. Helpers may use this signal to:
+  //
+  // - link the new pairing to existing identities
+  // - expose additional secret IDs and versions during recovery
+  OWNER_RECOVERY = 1;
 
-  // Sender is acting as a helper.
+  // Sender is acting as a Helper.
+  //
+  // Helpers may initiate pairing in some application flows, though the
+  // Owner typically acts as the initiator.
   HELPER = 2;
 }
 
-// PairRequestMessage is the first message sent in the pairing protocol,
-// from the pairing initiator to the pairing responder.
+// PairRequestMessage is the first message in the pairing protocol,
+// sent from the initiator to the responder after receiving a ContactMessage.
 //
-// Before this message is sent, the responder must have already provided
-// contact information (ContactMessage) to the initiator through an
-// out-of-band mechanism. For example, the responder may display a QR
-// code that the initiator scans.
+// # Preconditions
 //
-// The initiator can be either a helper or a sharer, and the responder
-// can also be either a sharer or a helper.
+// Before sending this message:
+//
+// - The initiator MUST have received a valid ContactMessage from the responder
+// - The initiator MUST use the responder's public encryption material from
+//   the ContactMessage to construct this request
+//
+// # Purpose
+//
+// This message establishes:
+//
+// - the initiator's identity and role (Owner/Helper, recovery mode or not)
+// - fresh cryptographic material for the responder to use in subsequent messages
+// - agreement negotiation inputs (parameter ranges)
+// - binding between the out-of-band contact exchange and this pairing attempt
+// - transport information for future communication
+//
+// # Security Properties
+//
+// - The nonce binds this request to the ContactMessage exchange
+// - The ciphertext and public keys bootstrap a secure communication channel
+// - The message is encrypted and authenticated at the DeRecMessage layer
+//
+// # Outcome
+//
+// Upon successful processing, the responder replies with PairResponseMessage.
+// After this exchange:
+//
+// - both parties know each other's public keys
+// - a secure communication channel is established for subsequent protocol flows
 message PairRequestMessage {
-
   // The role of the sender of this message.
+  //
+  // This informs the responder whether the initiator is:
+  //
+  // - an Owner (normal or recovery mode), or
+  // - a Helper
+  //
+  // Recovery mode has special semantics for how Helpers associate this
+  // pairing with existing stored secrets.
   SenderKind senderKind = 1;
 
   // ML-KEM-768 ciphertext.
-  bytes mlkemCiphertext = 3;
-
-  // Serialized ECIES public key.
-  bytes eciesPublicKey = 4;
-
-  // Identifier used to reference the public encryption key.
   //
-  // When a later message is sent to this initiator and encrypted with
-  // the public encryption key, this identifier is included so the
-  // recipient knows which key to use for decryption.
+  // This ciphertext is generated using the responder's ML-KEM public key
+  // obtained from the ContactMessage. It is used to establish shared
+  // cryptographic material for securing subsequent communication.
+  bytes mlkemCiphertext = 2;
+
+  // Serialized ECIES public key of the sender.
   //
-  // If the recipient generates multiple keys for multiple pairings,
-  // they should remember the publicKeyId chosen for each pairing so
-  // that they do not need to try all keys during decryption.
-  uint64 publicKeyId = 5;
+  // This key is provided to the responder so that future messages can be
+  // encrypted toward the initiator.
+  bytes eciesPublicKey = 3;
 
-  // Sender's application-readable contact information, such as name,
-  // phone number, or other identifying information.
-  CommunicationInfo communicationInfo = 6;
+  // Channel identifier chosen by the initiator.
+  //
+  // This value identifies the logical communication channel that will be
+  // established upon successful pairing. The responder MUST use this value
+  // when sending subsequent messages to the initiator.
+  //
+  // Implementations SHOULD ensure uniqueness to avoid collisions between
+  // concurrent or stored pairing sessions.
+  uint64 channelId = 4;
 
-  // Random 64-bit nonce used to identify the pairing session.
-  uint64 nonce = 7;
+  // Sender's application-level identifying information.
+  //
+  // This field is intended for user-facing identification and may include
+  // data such as name, phone number, or account identifiers.
+  //
+  // It is not used directly by the protocol for security decisions.
+  CommunicationInfo communicationInfo = 5;
+
+  // Nonce binding this request to the ContactMessage exchange.
+  //
+  // This value MUST match the nonce provided in the ContactMessage.
+  // It allows the responder to verify that the pairing request corresponds
+  // to the same out-of-band interaction, preventing mismatched or spoofed
+  // pairing attempts.
+  uint64 nonce = 6;
 
   // Parameter range supported by the sender.
-  ParameterRange parameterRange = 8;
+  //
+  // This defines the acceptable configuration space (e.g., thresholds,
+  // limits) that the sender is willing to operate under.
+  //
+  // The responder combines this with its own parameter range to determine
+  // whether pairing is possible and which parameters to use.
+  ParameterRange parameterRange = 7;
+
+  // Transport information for reaching the initiator.
+  //
+  // This specifies:
+  //
+  // - the endpoint where the initiator can receive messages
+  // - the protocol required to deliver those messages
+  //
+  // After pairing, the responder uses this information to send responses
+  // and all subsequent protocol messages to the initiator.
+  TransportProtocol transportProtocol = 8;
+
+  // Timestamp indicating when this message was created.
+  //
+  // Used for observability and may assist in replay detection or timeout
+  // handling, depending on the implementation.
+  google.protobuf.Timestamp timestamp = 9;
 }
 
-// PairResponseMessage is the response to PairRequestMessage.
+// PairResponseMessage is the response to a PairRequestMessage.
 //
-// It is identical to the request except that it does not include the
-// public encryption key, since that information was already exchanged
-// through the ContactMessage.
+// # Purpose
+//
+// This message completes the pairing handshake. It informs the initiator:
+//
+// - whether the pairing was accepted or rejected
+// - the responder's role and identity information
+// - the responder's supported parameter range
+//
+// # Differences from PairRequestMessage
+//
+// - Does not include encryption public keys, as those were already exchanged
+//   via ContactMessage and PairRequestMessage
+// - Includes a Result field indicating success or failure
+//
+// # Semantics
+//
+// - If `result` indicates success, a secure channel is considered established
+// - If `result` indicates failure, the pairing MUST be treated as unsuccessful
+//   and no further protocol messages should be exchanged on this channel
+//
+// The nonce MUST match the value provided in the request, ensuring that the
+// response corresponds to the same pairing session.
 message PairResponseMessage {
 
-  // Result indicating success or failure of processing the request.
-  Result result = 1;
+  // Result of processing the pairing request.
+  //
+  // Indicates whether the pairing was successful or failed.
+  // Failure may occur due to:
+  //
+  // - incompatible parameter ranges
+  // - failed authentication at the application layer
+  // - invalid or malformed request data
+  DeRecResult result = 1;
 
   // The role of the sender of this message.
+  //
+  // This informs the initiator whether the responder is acting as
+  // an Owner or a Helper.
   SenderKind senderKind = 2;
 
-  // Application-readable contact information (e.g., name, phone number).
+  // Application-level identifying information of the responder.
+  //
+  // Intended for user-facing identification and display purposes.
   CommunicationInfo communicationInfo = 4;
 
-  // Random 64-bit nonce identifying the pairing session.
+  // Nonce identifying the pairing session.
   //
-  // This must match the nonce sent in the pairing request.
+  // This value MUST exactly match the nonce received in the
+  // PairRequestMessage. A mismatch indicates an invalid or unrelated
+  // pairing attempt and SHOULD result in rejection.
   uint64 nonce = 5;
 
-  // Parameter range supported by the sender.
+  // Parameter range supported by the responder.
+  //
+  // The initiator combines this with its own parameter range to determine
+  // the final agreed configuration for the channel.
   ParameterRange parameterRange = 6;
+
+  // Timestamp indicating when this message was created.
+  //
+  // Used for observability and may assist in replay detection or timeout
+  // handling, depending on the implementation.
+  google.protobuf.Timestamp timestamp = 7;
 }

@@ -44,4 +44,7 @@ pub enum PairingError {
         #[source]
         source: derec_cryptography::pairing::DerecPairingError,
     },
+
+    #[error(transparent)]
+    PairingEncryption(#[from] derec_cryptography::pairing::envelope::DerecEncryptionError),
 }

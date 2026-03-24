@@ -34,6 +34,7 @@
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use rand_chacha::rand_core::SeedableRng;
 
+pub mod envelope;
 pub mod pairing_ecies;
 pub mod pairing_mlkem;
 

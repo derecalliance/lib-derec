@@ -35,8 +35,8 @@ use std::fmt;
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProtocolVersion {
-    pub major: i32,
-    pub minor: i32,
+    pub major: u32,
+    pub minor: u32,
 }
 
 impl ProtocolVersion {
