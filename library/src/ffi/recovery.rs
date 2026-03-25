@@ -30,12 +30,16 @@
 //! # Serialized Share Response Collection
 //!
 //! [`recover_from_share_responses`] accepts a custom FFI byte encoding representing
-//! a sequence of serialized outer recovery response envelopes:
+//! a sequence of recovery response inputs. Each input pairs one serialized outer
+//! recovery response envelope with the 32-byte shared key required to decrypt it.
+//!
+//! The encoding is:
 //!
 //! 1. A 32-bit little-endian count
 //! 2. For each entry:
 //!    - a length-prefixed serialized outer `DeRecMessage` carrying an encrypted
 //!      inner `GetShareResponseMessage`
+//!    - exactly 32 raw bytes containing the shared key for that response
 //!
 //! This collection format is specific to the FFI layer and should be treated as
 //! an opaque transport container by foreign callers.
@@ -49,13 +53,14 @@ use crate::ffi::common::{
     DeRecBuffer, DeRecStatus, empty_buffer, err_status, ok_status, read_len_prefixed_vec,
     read_u32_le, vec_into_buffer,
 };
+use crate::recovery::RecoveryResponseInput;
 
 /// FFI result returned by [`generate_share_request`].
 ///
 /// On success:
 ///
 /// - `status` indicates success
-/// - `get_share_request_message` contains serialized outer `DeRecMessage` bytes
+/// - `request_wire_bytes` contains serialized outer `DeRecMessage` bytes
 ///   carrying an encrypted inner `GetShareRequestMessage`
 ///
 /// On failure:
@@ -65,7 +70,7 @@ use crate::ffi::common::{
 #[repr(C)]
 pub struct GenerateShareRequestResult {
     pub status: DeRecStatus,
-    pub get_share_request_message: DeRecBuffer,
+    pub request_wire_bytes: DeRecBuffer,
 }
 
 /// FFI result returned by [`generate_share_response`].
@@ -73,7 +78,7 @@ pub struct GenerateShareRequestResult {
 /// On success:
 ///
 /// - `status` indicates success
-/// - `get_share_response_message` contains serialized outer `DeRecMessage` bytes
+/// - `response_wire_bytes` contains serialized outer `DeRecMessage` bytes
 ///   carrying an encrypted inner `GetShareResponseMessage`
 ///
 /// On failure:
@@ -83,7 +88,7 @@ pub struct GenerateShareRequestResult {
 #[repr(C)]
 pub struct GenerateShareResponseResult {
     pub status: DeRecStatus,
-    pub get_share_response_message: DeRecBuffer,
+    pub response_wire_bytes: DeRecBuffer,
 }
 
 /// FFI result returned by [`recover_from_share_responses`].
@@ -156,14 +161,14 @@ pub extern "C" fn generate_share_request(
     if secret_id_ptr.is_null() && secret_id_len > 0 {
         return GenerateShareRequestResult {
             status: err_status("secret_id_ptr is null"),
-            get_share_request_message: empty_buffer(),
+            request_wire_bytes: empty_buffer(),
         };
     }
 
     if shared_key_ptr.is_null() && shared_key_len > 0 {
         return GenerateShareRequestResult {
             status: err_status("shared_key_ptr is null"),
-            get_share_request_message: empty_buffer(),
+            request_wire_bytes: empty_buffer(),
         };
     }
 
@@ -184,7 +189,7 @@ pub extern "C" fn generate_share_request(
         Err(_) => {
             return GenerateShareRequestResult {
                 status: err_status("shared_key must be exactly 32 bytes"),
-                get_share_request_message: empty_buffer(),
+                request_wire_bytes: empty_buffer(),
             };
         }
     };
@@ -199,14 +204,14 @@ pub extern "C" fn generate_share_request(
         Err(err) => {
             return GenerateShareRequestResult {
                 status: err_status(err.to_string()),
-                get_share_request_message: empty_buffer(),
+                request_wire_bytes: empty_buffer(),
             };
         }
     };
 
     GenerateShareRequestResult {
         status: ok_status(),
-        get_share_request_message: vec_into_buffer(result.wire_bytes),
+        request_wire_bytes: vec_into_buffer(result.wire_bytes),
     }
 }
 
@@ -270,28 +275,28 @@ pub extern "C" fn generate_share_response(
     if secret_id_ptr.is_null() && secret_id_len > 0 {
         return GenerateShareResponseResult {
             status: err_status("secret_id_ptr is null"),
-            get_share_response_message: empty_buffer(),
+            response_wire_bytes: empty_buffer(),
         };
     }
 
     if request_ptr.is_null() && request_len > 0 {
         return GenerateShareResponseResult {
             status: err_status("request_ptr is null"),
-            get_share_response_message: empty_buffer(),
+            response_wire_bytes: empty_buffer(),
         };
     }
 
     if stored_share_ptr.is_null() && stored_share_len > 0 {
         return GenerateShareResponseResult {
             status: err_status("stored_share_ptr is null"),
-            get_share_response_message: empty_buffer(),
+            response_wire_bytes: empty_buffer(),
         };
     }
 
     if shared_key_ptr.is_null() && shared_key_len > 0 {
         return GenerateShareResponseResult {
             status: err_status("shared_key_ptr is null"),
-            get_share_response_message: empty_buffer(),
+            response_wire_bytes: empty_buffer(),
         };
     }
 
@@ -324,7 +329,7 @@ pub extern "C" fn generate_share_response(
         Err(_) => {
             return GenerateShareResponseResult {
                 status: err_status("shared_key must be exactly 32 bytes"),
-                get_share_response_message: empty_buffer(),
+                response_wire_bytes: empty_buffer(),
             };
         }
     };
@@ -340,42 +345,43 @@ pub extern "C" fn generate_share_response(
         Err(err) => {
             return GenerateShareResponseResult {
                 status: err_status(err.to_string()),
-                get_share_response_message: empty_buffer(),
+                response_wire_bytes: empty_buffer(),
             };
         }
     };
 
     GenerateShareResponseResult {
         status: ok_status(),
-        get_share_response_message: vec_into_buffer(result.wire_bytes),
+        response_wire_bytes: vec_into_buffer(result.wire_bytes),
     }
 }
 
-/// Recovers the original secret from a serialized collection of recovery response envelopes.
+/// Recovers the original secret from a serialized collection of recovery response inputs.
 ///
 /// This is the C FFI entry point used by a recovering owner/requestor after
 /// enough helpers have returned share responses.
 ///
 /// The caller provides:
 ///
-/// - `responses_ptr` / `responses_len` as a serialized FFI collection of outer
-///   recovery response envelopes
+/// - `responses_ptr` / `responses_len` as a serialized FFI collection of recovery
+///   response inputs
 /// - `secret_id_ptr` / `secret_id_len` as the secret ID bytes
 /// - `version` as the target version to recover
-/// - `shared_key_ptr` / `shared_key_len` as the 32-byte symmetric key used to
-///   decrypt the response envelopes
+///
+/// Each serialized recovery response input contains:
+///
+/// - one serialized outer recovery response envelope
+/// - the 32-byte shared key needed to decrypt that response
 ///
 /// On success, this function returns the recovered secret bytes.
 ///
 /// # Arguments
 ///
-/// * `responses_ptr` - Pointer to the serialized FFI collection of share responses.
+/// * `responses_ptr` - Pointer to the serialized FFI collection of recovery response inputs.
 /// * `responses_len` - Length of the serialized response collection.
 /// * `secret_id_ptr` - Pointer to secret ID bytes.
 /// * `secret_id_len` - Length of the secret ID buffer.
 /// * `version` - Target share version to recover.
-/// * `shared_key_ptr` - Pointer to 32-byte shared symmetric key bytes.
-/// * `shared_key_len` - Length of the shared key buffer. Must be exactly `32`.
 ///
 /// # Returns
 ///
@@ -387,14 +393,13 @@ pub extern "C" fn generate_share_response(
 ///
 /// - `responses_ptr` is null while `responses_len > 0`
 /// - `secret_id_ptr` is null while `secret_id_len > 0`
-/// - `shared_key_ptr` is null while `shared_key_len > 0`
-/// - `shared_key_len != 32`
 /// - the serialized response collection is malformed
+/// - any embedded shared key is not exactly 32 bytes
 /// - the underlying Rust recovery API returns an error
 ///
 /// # Safety
 ///
-/// `responses_ptr`, `secret_id_ptr`, and `shared_key_ptr` must either be null when
+/// `responses_ptr` and `secret_id_ptr` must either be null when
 /// their lengths are zero, or point to the corresponding readable byte ranges.
 #[unsafe(no_mangle)]
 pub extern "C" fn recover_from_share_responses(
@@ -403,8 +408,6 @@ pub extern "C" fn recover_from_share_responses(
     secret_id_ptr: *const u8,
     secret_id_len: usize,
     version: i32,
-    shared_key_ptr: *const u8,
-    shared_key_len: usize,
 ) -> RecoverFromShareResponsesResult {
     if responses_ptr.is_null() && responses_len > 0 {
         return RecoverFromShareResponsesResult {
@@ -416,13 +419,6 @@ pub extern "C" fn recover_from_share_responses(
     if secret_id_ptr.is_null() && secret_id_len > 0 {
         return RecoverFromShareResponsesResult {
             status: err_status("secret_id_ptr is null"),
-            secret_data: empty_buffer(),
-        };
-    }
-
-    if shared_key_ptr.is_null() && shared_key_len > 0 {
-        return RecoverFromShareResponsesResult {
-            status: err_status("shared_key_ptr is null"),
             secret_data: empty_buffer(),
         };
     }
@@ -439,23 +435,7 @@ pub extern "C" fn recover_from_share_responses(
         unsafe { std::slice::from_raw_parts(secret_id_ptr, secret_id_len) }
     };
 
-    let shared_key_bytes: &[u8] = if shared_key_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(shared_key_ptr, shared_key_len) }
-    };
-
-    let shared_key: [u8; 32] = match shared_key_bytes.try_into() {
-        Ok(value) => value,
-        Err(_) => {
-            return RecoverFromShareResponsesResult {
-                status: err_status("shared_key must be exactly 32 bytes"),
-                secret_data: empty_buffer(),
-            };
-        }
-    };
-
-    let responses = match deserialize_share_responses(responses_bytes) {
+    let owned_inputs = match deserialize_recovery_response_inputs(responses_bytes) {
         Ok(value) => value,
         Err(err) => {
             return RecoverFromShareResponsesResult {
@@ -465,20 +445,24 @@ pub extern "C" fn recover_from_share_responses(
         }
     };
 
-    let recovered_secret = match crate::recovery::recover_from_share_responses(
-        &responses,
-        secret_id,
-        version,
-        &shared_key,
-    ) {
-        Ok(value) => value,
-        Err(err) => {
-            return RecoverFromShareResponsesResult {
-                status: err_status(err.to_string()),
-                secret_data: empty_buffer(),
-            };
-        }
-    };
+    let borrowed_inputs: Vec<RecoveryResponseInput<'_>> = owned_inputs
+        .iter()
+        .map(|input| RecoveryResponseInput {
+            bytes: &input.response_bytes,
+            shared_key: &input.shared_key,
+        })
+        .collect();
+
+    let recovered_secret =
+        match crate::recovery::recover_from_share_responses(secret_id, version, &borrowed_inputs) {
+            Ok(value) => value,
+            Err(err) => {
+                return RecoverFromShareResponsesResult {
+                    status: err_status(err.to_string()),
+                    secret_data: empty_buffer(),
+                };
+            }
+        };
 
     RecoverFromShareResponsesResult {
         status: ok_status(),
@@ -486,19 +470,42 @@ pub extern "C" fn recover_from_share_responses(
     }
 }
 
-fn deserialize_share_responses(bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+struct OwnedRecoveryResponseInput {
+    response_bytes: Vec<u8>,
+    shared_key: [u8; 32],
+}
+
+fn deserialize_recovery_response_inputs(
+    bytes: &[u8],
+) -> Result<Vec<OwnedRecoveryResponseInput>, String> {
     let mut input = bytes;
 
     let count = read_u32_le(&mut input)? as usize;
     let mut responses = Vec::with_capacity(count);
 
     for _ in 0..count {
-        let encoded = read_len_prefixed_vec(&mut input)?;
-        responses.push(encoded);
+        let response_bytes = read_len_prefixed_vec(&mut input)?;
+
+        if input.len() < 32 {
+            return Err(
+                "unexpected end of serialized recovery response inputs while reading shared key"
+                    .to_string(),
+            );
+        }
+
+        let shared_key: [u8; 32] = input[..32]
+            .try_into()
+            .map_err(|_| "failed to parse shared key".to_string())?;
+        input = &input[32..];
+
+        responses.push(OwnedRecoveryResponseInput {
+            response_bytes,
+            shared_key,
+        });
     }
 
     if !input.is_empty() {
-        return Err("unexpected trailing bytes in serialized share responses".to_string());
+        return Err("unexpected trailing bytes in serialized recovery response inputs".to_string());
     }
 
     Ok(responses)

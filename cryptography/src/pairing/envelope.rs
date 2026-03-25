@@ -64,11 +64,11 @@
 //!
 //! # Usage
 //!
-//! ```rust
-//! use derec_cryptography::envelope::encryption;
+//! ```rust, ignore
+//! use derec_cryptography::envelope;
 //!
-//! let ciphertext = encryption::encrypt(&plaintext, &receiver_pk)?;
-//! let plaintext = encryption::decrypt(&ciphertext, &receiver_sk)?;
+//! let ciphertext = envelope::encrypt(&plaintext, &public_key)?;
+//! let plaintext = envelope::decrypt(&ciphertext, &secret_key)?;
 //! ```
 
 use rand::rngs::OsRng;
@@ -125,10 +125,10 @@ pub enum DerecEncryptionError {
 ///
 /// # Example
 ///
-/// ```rust
-/// use derec_cryptography::envelope::encryption;
+/// ```rust, ignore
+/// use derec_cryptography::envelope;
 ///
-/// let ciphertext = encryption::encrypt(b"hello", &receiver_pk).unwrap();
+/// let ciphertext = envelope::encrypt(b"hello", &public_key).unwrap();
 /// ```
 pub fn encrypt(bytes: &[u8], public_key: &[u8]) -> Result<Vec<u8>, DerecEncryptionError> {
     if public_key.is_empty() {
@@ -187,10 +187,10 @@ pub fn encrypt(bytes: &[u8], public_key: &[u8]) -> Result<Vec<u8>, DerecEncrypti
 ///
 /// # Example
 ///
-/// ```rust
-/// use derec_cryptography::envelope::encryption;
+/// ```rust, ignore
+/// use derec_cryptography::envelope;
 ///
-/// let plaintext = encryption::decrypt(&ciphertext, &receiver_sk).unwrap();
+/// let plaintext = envelope::decrypt(&ciphertext, &secret_key).unwrap();
 /// ```
 pub fn decrypt(ciphertext: &[u8], secret_key: &[u8]) -> Result<Vec<u8>, DerecEncryptionError> {
     if ciphertext.len() < 4 {
@@ -220,4 +220,122 @@ pub fn decrypt(ciphertext: &[u8], secret_key: &[u8]) -> Result<Vec<u8>, DerecEnc
         .map_err(|_| DerecEncryptionError::DecryptionFailed)?;
 
     Ok(plaintext)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pairing::pairing_ecies;
+    use rand::rngs::OsRng;
+
+    fn generate_recipient_keypair() -> (Vec<u8>, Vec<u8>) {
+        pairing_ecies::generate_key(&mut OsRng).expect("failed to generate recipient keypair")
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_roundtrip() {
+        let (secret_key, public_key) = generate_recipient_keypair();
+        let plaintext = b"hello derec envelope";
+
+        let ciphertext = encrypt(plaintext, &public_key).expect("encryption should succeed");
+        let decrypted = decrypt(&ciphertext, &secret_key).expect("decryption should succeed");
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_roundtrip_empty_plaintext() {
+        let (secret_key, public_key) = generate_recipient_keypair();
+        let plaintext = b"";
+
+        let ciphertext = encrypt(plaintext, &public_key).expect("encryption should succeed");
+        let decrypted = decrypt(&ciphertext, &secret_key).expect("decryption should succeed");
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_encrypt_rejects_empty_public_key() {
+        let err = encrypt(b"hello", &[]).expect_err("empty public key should fail");
+
+        assert!(matches!(err, DerecEncryptionError::InvalidPublicKey));
+    }
+
+    #[test]
+    fn test_decrypt_rejects_too_short_ciphertext() {
+        let err = decrypt(&[1, 2, 3], &[42; 32]).expect_err("short ciphertext should fail");
+
+        assert!(matches!(err, DerecEncryptionError::InvalidFormat));
+    }
+
+    #[test]
+    fn test_decrypt_rejects_truncated_ephemeral_key_section() {
+        let ciphertext = {
+            let epk_len = 100u32.to_le_bytes();
+            let mut out = Vec::new();
+            out.extend_from_slice(&epk_len);
+            out.extend_from_slice(&[1, 2, 3, 4, 5]);
+            out
+        };
+
+        let err = decrypt(&ciphertext, &[7; 32]).expect_err("truncated epk section should fail");
+
+        assert!(matches!(err, DerecEncryptionError::InvalidFormat));
+    }
+
+    #[test]
+    fn test_decrypt_with_wrong_secret_key_fails() {
+        let (_correct_secret_key, public_key) = generate_recipient_keypair();
+        let (wrong_secret_key, _) = generate_recipient_keypair();
+
+        let ciphertext = encrypt(b"hello", &public_key).expect("encryption should succeed");
+        let err = decrypt(&ciphertext, &wrong_secret_key)
+            .expect_err("decryption with wrong secret key should fail");
+
+        assert!(matches!(err, DerecEncryptionError::DecryptionFailed));
+    }
+
+    #[test]
+    fn test_decrypt_with_tampered_ciphertext_fails() {
+        let (secret_key, public_key) = generate_recipient_keypair();
+        let mut ciphertext =
+            encrypt(b"hello tamper test", &public_key).expect("encryption should succeed");
+
+        let epk_len =
+            u32::from_le_bytes(ciphertext[0..4].try_into().expect("valid length prefix")) as usize;
+        let ciphertext_offset = 4 + epk_len;
+
+        assert!(
+            ciphertext.len() > ciphertext_offset,
+            "ciphertext payload should not be empty"
+        );
+
+        let last = ciphertext.len() - 1;
+        ciphertext[last] ^= 0x01;
+
+        let err = decrypt(&ciphertext, &secret_key)
+            .expect_err("tampered ciphertext should fail authentication");
+
+        assert!(matches!(err, DerecEncryptionError::DecryptionFailed));
+    }
+
+    #[test]
+    fn test_ciphertext_contains_ephemeral_key_prefix() {
+        let (_secret_key, public_key) = generate_recipient_keypair();
+        let ciphertext = encrypt(b"format check", &public_key).expect("encryption should succeed");
+
+        assert!(
+            ciphertext.len() >= 5,
+            "ciphertext should include length prefix and payload"
+        );
+
+        let epk_len =
+            u32::from_le_bytes(ciphertext[0..4].try_into().expect("valid length prefix")) as usize;
+
+        assert!(epk_len > 0, "ephemeral public key length must be non-zero");
+        assert!(
+            ciphertext.len() > 4 + epk_len,
+            "ciphertext should include encrypted payload after the ephemeral public key"
+        );
+    }
 }

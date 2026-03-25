@@ -95,7 +95,7 @@ pub struct ChannelSharedKeyInput {
 #[repr(C)]
 pub struct ProtectSecretResult {
     pub status: DeRecStatus,
-    pub shares: DeRecBuffer,
+    pub shares_wire_bytes: DeRecBuffer,
 }
 
 /// Splits a secret into helper shares and returns one serialized outer
@@ -189,35 +189,35 @@ pub extern "C" fn protect_secret(
     if secret_id_ptr.is_null() && secret_id_len > 0 {
         return ProtectSecretResult {
             status: err_status("secret_id_ptr is null"),
-            shares: empty_buffer(),
+            shares_wire_bytes: empty_buffer(),
         };
     }
 
     if secret_data_ptr.is_null() && secret_data_len > 0 {
         return ProtectSecretResult {
             status: err_status("secret_data_ptr is null"),
-            shares: empty_buffer(),
+            shares_wire_bytes: empty_buffer(),
         };
     }
 
     if channels_ptr.is_null() && channels_len > 0 {
         return ProtectSecretResult {
             status: err_status("channels_ptr is null"),
-            shares: empty_buffer(),
+            shares_wire_bytes: empty_buffer(),
         };
     }
 
     if keep_list_ptr.is_null() && keep_list_len > 0 {
         return ProtectSecretResult {
             status: err_status("keep_list_ptr is null"),
-            shares: empty_buffer(),
+            shares_wire_bytes: empty_buffer(),
         };
     }
 
     if description_ptr.is_null() && description_len > 0 {
         return ProtectSecretResult {
             status: err_status("description_ptr is null"),
-            shares: empty_buffer(),
+            shares_wire_bytes: empty_buffer(),
         };
     }
 
@@ -261,7 +261,7 @@ pub extern "C" fn protect_secret(
             Err(_) => {
                 return ProtectSecretResult {
                     status: err_status("description is not valid UTF-8"),
-                    shares: empty_buffer(),
+                    shares_wire_bytes: empty_buffer(),
                 };
             }
         }
@@ -276,7 +276,7 @@ pub extern "C" fn protect_secret(
     let result = match crate::sharing::protect_secret(
         secret_id,
         secret_data,
-        channel_map,
+        &channel_map,
         threshold,
         version,
         keep_list,
@@ -286,7 +286,7 @@ pub extern "C" fn protect_secret(
         Err(err) => {
             return ProtectSecretResult {
                 status: err_status(err.to_string()),
-                shares: empty_buffer(),
+                shares_wire_bytes: empty_buffer(),
             };
         }
     };
@@ -295,7 +295,7 @@ pub extern "C" fn protect_secret(
 
     ProtectSecretResult {
         status: ok_status(),
-        shares: vec_into_buffer(shares_bytes),
+        shares_wire_bytes: vec_into_buffer(shares_bytes),
     }
 }
 

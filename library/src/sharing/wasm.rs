@@ -122,7 +122,7 @@ pub fn protect_secret(
     let sharing::ProtectSecretResult { shares } = sharing::protect_secret(
         secret_id,
         secret_data,
-        channel_map,
+        &channel_map,
         threshold as usize,
         version,
         keep_list.as_deref(),

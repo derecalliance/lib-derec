@@ -31,7 +31,7 @@ fn test_protect_secret_empty_channels() {
     let result = protect_secret(
         secret_id,
         secret_data,
-        empty_channels,
+        &empty_channels,
         threshold,
         version,
         None,
@@ -55,7 +55,7 @@ fn test_protect_secret_empty_secret_id() {
     let result = protect_secret(
         empty_secret_id,
         secret_data,
-        channels,
+        &channels,
         threshold,
         version,
         None,
@@ -79,7 +79,7 @@ fn test_protect_secret_empty_secret_data() {
     let result = protect_secret(
         secret_id,
         empty_secret_data,
-        channels,
+        &channels,
         threshold,
         version,
         None,
@@ -103,7 +103,7 @@ fn test_protect_secret_invalid_threshold_too_low() {
     let result = protect_secret(
         secret_id,
         secret_data,
-        channels,
+        &channels,
         too_low_threshold,
         version,
         None,
@@ -130,7 +130,7 @@ fn test_protect_secret_invalid_threshold_too_high() {
     let result = protect_secret(
         secret_id,
         secret_data,
-        channels,
+        &channels,
         too_high_threshold,
         version,
         None,
@@ -159,7 +159,7 @@ fn test_protect_secret_valid_sharing() {
     let ProtectSecretResult { shares } = protect_secret(
         secret_id,
         secret_data,
-        channels.clone(),
+        &channels,
         threshold,
         version,
         Some(&keep_list),

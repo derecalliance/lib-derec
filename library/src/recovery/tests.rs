@@ -3,7 +3,7 @@ use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp},
     recovery::{
         GenerateShareRequestResult, GenerateShareResponseResult, RecoverFromResponsesResult,
-        RecoveryError, generate_share_request, generate_share_response,
+        RecoveryError, RecoveryResponseInput, generate_share_request, generate_share_response,
         recover_from_share_responses,
     },
     sharing::{self, ProtectSecretResult},
@@ -196,10 +196,9 @@ fn test_generate_share_response_empty_committed_share() {
 fn test_recover_from_share_responses_empty_responses() {
     let secret_id = b"secret_id";
     let version = 0;
-    let shared_key = make_shared_key(1);
 
-    let empty: Vec<Vec<u8>> = vec![];
-    let result = recover_from_share_responses(&empty, secret_id, version, &shared_key);
+    let empty: Vec<RecoveryResponseInput<'_>> = vec![];
+    let result = recover_from_share_responses(secret_id, version, &empty);
 
     assert!(matches!(
         result,
@@ -210,16 +209,20 @@ fn test_recover_from_share_responses_empty_responses() {
 #[test]
 fn test_recover_from_share_responses_empty_secret_id() {
     let shared_key = make_shared_key(1);
-    let responses = vec![create_response_wire_bytes(
+    let responses_bytes = [create_response_wire_bytes(
         ChannelId(1),
         &shared_key,
         Some(StatusEnum::Ok as i32),
         vec![1],
     )];
+    let responses = vec![RecoveryResponseInput {
+        bytes: &responses_bytes[0],
+        shared_key: &shared_key,
+    }];
     let empty_secret_id = b"";
     let version = 0;
 
-    let result = recover_from_share_responses(&responses, empty_secret_id, version, &shared_key);
+    let result = recover_from_share_responses(empty_secret_id, version, &responses);
 
     assert!(matches!(
         result,
@@ -230,16 +233,20 @@ fn test_recover_from_share_responses_empty_secret_id() {
 #[test]
 fn test_recover_from_share_responses_invalid_version() {
     let shared_key = make_shared_key(1);
-    let responses = vec![create_response_wire_bytes(
+    let responses_bytes = [create_response_wire_bytes(
         ChannelId(1),
         &shared_key,
         Some(StatusEnum::Ok as i32),
         vec![1],
     )];
+    let responses = vec![RecoveryResponseInput {
+        bytes: &responses_bytes[0],
+        shared_key: &shared_key,
+    }];
     let secret_id = b"secret_id";
     let invalid_version = -1;
 
-    let result = recover_from_share_responses(&responses, secret_id, invalid_version, &shared_key);
+    let result = recover_from_share_responses(secret_id, invalid_version, &responses);
 
     assert!(matches!(
         result,
@@ -255,14 +262,18 @@ fn test_recover_from_share_responses_missing_result() {
     let version = 0;
     let shared_key = make_shared_key(1);
 
-    let responses = vec![create_response_wire_bytes(
+    let responses_bytes = [create_response_wire_bytes(
         ChannelId(1),
         &shared_key,
         None,
         create_committed_share_bytes(secret_id, version),
     )];
+    let responses = vec![RecoveryResponseInput {
+        bytes: &responses_bytes[0],
+        shared_key: &shared_key,
+    }];
 
-    let result = recover_from_share_responses(&responses, secret_id, version, &shared_key);
+    let result = recover_from_share_responses(secret_id, version, &responses);
 
     assert!(matches!(
         result,
@@ -276,14 +287,18 @@ fn test_recover_from_share_responses_non_ok_status() {
     let version = 0;
     let shared_key = make_shared_key(1);
 
-    let responses = vec![create_response_wire_bytes(
+    let responses_bytes = [create_response_wire_bytes(
         ChannelId(1),
         &shared_key,
         Some(StatusEnum::Fail as i32),
         create_committed_share_bytes(secret_id, version),
     )];
+    let responses = vec![RecoveryResponseInput {
+        bytes: &responses_bytes[0],
+        shared_key: &shared_key,
+    }];
 
-    let result = recover_from_share_responses(&responses, secret_id, version, &shared_key);
+    let result = recover_from_share_responses(secret_id, version, &responses);
 
     assert!(matches!(
         result,
@@ -298,14 +313,18 @@ fn test_recover_from_share_responses_empty_committed_de_rec_share() {
     let version = 0;
     let shared_key = make_shared_key(1);
 
-    let responses = vec![create_response_wire_bytes(
+    let responses_bytes = [create_response_wire_bytes(
         ChannelId(1),
         &shared_key,
         Some(StatusEnum::Ok as i32),
         vec![],
     )];
+    let responses = vec![RecoveryResponseInput {
+        bytes: &responses_bytes[0],
+        shared_key: &shared_key,
+    }];
 
-    let result = recover_from_share_responses(&responses, secret_id, version, &shared_key);
+    let result = recover_from_share_responses(secret_id, version, &responses);
 
     assert!(matches!(
         result,
@@ -320,14 +339,18 @@ fn test_recover_from_share_responses_decode_committed_derec_share_error() {
     let shared_key = make_shared_key(1);
     let invalid_bytes = vec![0xFF, 0xFF, 0xFF];
 
-    let responses = vec![create_response_wire_bytes(
+    let responses_bytes = [create_response_wire_bytes(
         ChannelId(1),
         &shared_key,
         Some(StatusEnum::Ok as i32),
         invalid_bytes,
     )];
+    let responses = vec![RecoveryResponseInput {
+        bytes: &responses_bytes[0],
+        shared_key: &shared_key,
+    }];
 
-    let result = recover_from_share_responses(&responses, secret_id, version, &shared_key);
+    let result = recover_from_share_responses(secret_id, version, &responses);
 
     assert!(matches!(
         result,
@@ -351,14 +374,18 @@ fn test_recover_from_share_responses_decode_derec_share_error() {
     }
     .encode_to_vec();
 
-    let responses = vec![create_response_wire_bytes(
+    let responses_bytes = [create_response_wire_bytes(
         ChannelId(1),
         &shared_key,
         Some(StatusEnum::Ok as i32),
         committed,
     )];
+    let responses = vec![RecoveryResponseInput {
+        bytes: &responses_bytes[0],
+        shared_key: &shared_key,
+    }];
 
-    let result = recover_from_share_responses(&responses, secret_id, version, &shared_key);
+    let result = recover_from_share_responses(secret_id, version, &responses);
 
     assert!(matches!(
         result,
@@ -373,15 +400,18 @@ fn test_recover_from_share_responses_secret_id_mismatch() {
     let version = 0;
     let shared_key = make_shared_key(1);
 
-    let responses = vec![create_response_wire_bytes(
+    let responses_bytes = [create_response_wire_bytes(
         ChannelId(1),
         &shared_key,
         Some(StatusEnum::Ok as i32),
         create_committed_share_bytes(wrong_secret_id, version),
     )];
+    let responses = vec![RecoveryResponseInput {
+        bytes: &responses_bytes[0],
+        shared_key: &shared_key,
+    }];
 
-    let result =
-        recover_from_share_responses(&responses, requested_secret_id, version, &shared_key);
+    let result = recover_from_share_responses(requested_secret_id, version, &responses);
 
     assert!(matches!(
         result,
@@ -396,15 +426,18 @@ fn test_recover_from_share_responses_version_mismatch() {
     let wrong_version = 8;
     let shared_key = make_shared_key(1);
 
-    let responses = vec![create_response_wire_bytes(
+    let responses_bytes = [create_response_wire_bytes(
         ChannelId(1),
         &shared_key,
         Some(StatusEnum::Ok as i32),
         create_committed_share_bytes(secret_id, wrong_version),
     )];
+    let responses = vec![RecoveryResponseInput {
+        bytes: &responses_bytes[0],
+        shared_key: &shared_key,
+    }];
 
-    let result =
-        recover_from_share_responses(&responses, secret_id, requested_version, &shared_key);
+    let result = recover_from_share_responses(secret_id, requested_version, &responses);
 
     assert!(matches!(
         result,
@@ -419,14 +452,18 @@ fn test_recover_from_share_responses_reconstruction_failed() {
     let version = 0;
     let shared_key = make_shared_key(1);
 
-    let responses = vec![create_response_wire_bytes(
+    let responses_bytes = [create_response_wire_bytes(
         ChannelId(1),
         &shared_key,
         Some(StatusEnum::Ok as i32),
         create_committed_share_bytes(secret_id, version),
     )];
+    let responses = vec![RecoveryResponseInput {
+        bytes: &responses_bytes[0],
+        shared_key: &shared_key,
+    }];
 
-    let result = recover_from_share_responses(&responses, secret_id, version, &shared_key);
+    let result = recover_from_share_responses(secret_id, version, &responses);
 
     assert!(matches!(
         result,
@@ -440,13 +477,17 @@ fn test_recover_from_share_responses_response_timestamp_mismatch() {
     let version = 0;
     let shared_key = make_shared_key(1);
 
-    let responses = vec![create_response_wire_bytes_with_mismatched_timestamp(
+    let responses_bytes = [create_response_wire_bytes_with_mismatched_timestamp(
         ChannelId(1),
         &shared_key,
         create_committed_share_bytes(secret_id, version),
     )];
+    let responses = vec![RecoveryResponseInput {
+        bytes: &responses_bytes[0],
+        shared_key: &shared_key,
+    }];
 
-    let result = recover_from_share_responses(&responses, secret_id, version, &shared_key);
+    let result = recover_from_share_responses(secret_id, version, &responses);
 
     assert!(matches!(
         result,
@@ -632,18 +673,11 @@ fn test_recovery_end_to_end() {
     let threshold = 2;
     let version = 2;
 
-    let ProtectSecretResult { shares } = sharing::protect_secret(
-        secret_id,
-        secret,
-        channels.clone(),
-        threshold,
-        version,
-        None,
-        None,
-    )
-    .expect("protect_secret should succeed");
+    let ProtectSecretResult { shares } =
+        sharing::protect_secret(secret_id, secret, &channels, threshold, version, None, None)
+            .expect("protect_secret should succeed");
 
-    let mut responses = Vec::new();
+    let mut response_wire_bytes = Vec::new();
 
     for channel_id in channels.keys() {
         let GenerateShareRequestResult {
@@ -666,11 +700,19 @@ fn test_recovery_end_to_end() {
         )
         .expect("generate_share_response should succeed");
 
-        responses.push(response);
+        response_wire_bytes.push(response);
     }
 
+    let responses: Vec<RecoveryResponseInput<'_>> = response_wire_bytes
+        .iter()
+        .map(|response_bytes| RecoveryResponseInput {
+            bytes: response_bytes,
+            shared_key: &shared_key,
+        })
+        .collect();
+
     let RecoverFromResponsesResult { secret_data } =
-        recover_from_share_responses(&responses, secret_id, version, &shared_key)
+        recover_from_share_responses(secret_id, version, &responses)
             .expect("recovery should succeed");
 
     assert_eq!(secret_data, secret);

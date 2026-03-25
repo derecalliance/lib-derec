@@ -1,4 +1,4 @@
-# DeRec Rust SDK
+#DeRec Rust SDK
 
 ![Crates.io](https://img.shields.io/crates/v/derec-library)
 ![Docs.rs](https://docs.rs/derec-library/badge.svg)
@@ -96,9 +96,7 @@ The SDK provides building blocks for the main protocol flows.
 
 ```rust
 use derec_library::verification::*;
-use derec_library::types::ChannelId;
 
-let channel_id = ChannelId(42);
 let secret_id = b"example_secret";
 
 let request = generate_verification_request(secret_id, 1).unwrap();
@@ -147,257 +145,51 @@ The `transportUri` in protocol messages identifies the helper endpoint.
 
 ## Examples
 
-### DeRecMessage Envelope
-
-All DeRec protocol messages except `ContactMessage` must be wrapped in a `DeRecMessage`
-before being signed, encrypted, and transmitted through the wire.
-
-The example below shows the full lifecycle using:
-
-* the pairing flow to produce a `PairRequestMessage`
-* `DeRecMessageBuilder` to wrap it into a `DeRecMessage`
-* `DeRecMessageCodec` to encode and decode the wire payload
-* **dummy** signing and encryption backends for demonstration purposes
-
-> [!WARNING]
-> The signing and encryption implementations below are intentionally fake and **not secure**.
-> They exist only to demonstrate how to use `DeRecMessageBuilder` and `DeRecMessageCodec`.
-
-```rust,ignore
-use derec_library::derec_message::{
-    DeRecMessageBuilder,
-    DeRecMessageCodec,
-    DeRecMessageCodecError,
-    DeRecMessageDecrypter,
-    DeRecMessageEncrypter,
-    DeRecMessageSigner,
-    DeRecMessageVerifier,
-    VerifiedPayload,
-};
-use derec_library::pairing::*;
-use derec_library::types::ChannelId;
-use derec_proto::SenderKind;
-
-#[derive(Clone)]
-struct DummySigner {
-    sender_key_hash: Vec<u8>,
-}
-
-impl DeRecMessageSigner for DummySigner {
-    fn sender_key_hash(&self) -> &[u8] {
-        &self.sender_key_hash
-    }
-
-    fn sign(&self, payload: &[u8]) -> Result<Vec<u8>, DeRecMessageCodecError> {
-        // Fake "signature": just prefix a marker
-        let mut out = b"SIGNED:".to_vec();
-        out.extend_from_slice(payload);
-        Ok(out)
-    }
-}
-
-#[derive(Clone)]
-struct DummyVerifier {
-    sender_key_hash: Vec<u8>,
-}
-
-impl DeRecMessageVerifier for DummyVerifier {
-    fn verify(&self, signed_payload: &[u8]) -> Result<VerifiedPayload, DeRecMessageCodecError> {
-        let prefix = b"SIGNED:";
-        let payload = signed_payload
-            .strip_prefix(prefix)
-            .ok_or_else(|| DeRecMessageCodecError::Verification("missing SIGNED prefix".into()))?;
-
-        Ok(VerifiedPayload {
-            payload: payload.to_vec(),
-            signer_key_hash: self.sender_key_hash.clone(),
-        })
-    }
-}
-
-#[derive(Clone)]
-struct DummyEncrypter {
-    recipient_key_id: i32,
-    recipient_key_hash: Vec<u8>,
-}
-
-impl DeRecMessageEncrypter for DummyEncrypter {
-    fn recipient_key_id(&self) -> i32 {
-        self.recipient_key_id
-    }
-
-    fn recipient_key_hash(&self) -> &[u8] {
-        &self.recipient_key_hash
-    }
-
-    fn encrypt(&self, signed_payload: &[u8]) -> Result<Vec<u8>, DeRecMessageCodecError> {
-        // Fake "encryption": just prefix a marker
-        let mut out = b"ENCRYPTED:".to_vec();
-        out.extend_from_slice(signed_payload);
-        Ok(out)
-    }
-}
-
-#[derive(Clone)]
-struct DummyDecrypter {
-    recipient_key_id: i32,
-    recipient_key_hash: Vec<u8>,
-}
-
-impl DeRecMessageDecrypter for DummyDecrypter {
-    fn recipient_key_id(&self) -> i32 {
-        self.recipient_key_id
-    }
-
-    fn recipient_key_hash(&self) -> &[u8] {
-        &self.recipient_key_hash
-    }
-
-    fn decrypt(&self, encrypted_payload: &[u8]) -> Result<Vec<u8>, DeRecMessageCodecError> {
-        let prefix = b"ENCRYPTED:";
-        let payload = encrypted_payload
-            .strip_prefix(prefix)
-            .ok_or_else(|| DeRecMessageCodecError::Decryption("missing ENCRYPTED prefix".into()))?;
-
-        Ok(payload.to_vec())
-    }
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let channel_id = ChannelId(42);
-    let kind = SenderKind::Helper;
-
-    // In a real implementation these are SHA-384 hashes of the sender's and
-    // receiver's public keys.
-    let sender_key_hash = vec![0x11; 48];
-    let receiver_key_hash = vec![0x22; 48];
-
-    let signer = DummySigner {
-        sender_key_hash: sender_key_hash.clone(),
-    };
-
-    let verifier = DummyVerifier {
-        sender_key_hash: sender_key_hash.clone(),
-    };
-
-    let encrypter = DummyEncrypter {
-        recipient_key_id: 7,
-        recipient_key_hash: receiver_key_hash.clone(),
-    };
-
-    let decrypter = DummyDecrypter {
-        recipient_key_id: 7,
-        recipient_key_hash: receiver_key_hash.clone(),
-    };
-
-    // This would normally come from QR decoding.
-    let CreateContactMessageResult {
-        contact_message,
-        secret_key: _contactor_secret_key,
-    } = create_contact_message(
-        channel_id,
-        "https://relay.example/derec",
-    )?;
-
-    // Produce an Owner-side flow message.
-    let ProducePairingRequestMessageResult {
-        pair_request_message,
-        secret_key: _requestor_secret_key,
-    } = produce_pairing_request_message(
-        channel_id,
-        kind,
-        &contact_message,
-    )?;
-
-    // Wrap the flow message in a DeRecMessage envelope.
-    let derec_message = DeRecMessageBuilder::new()
-        .sender(sender_key_hash.clone())
-        .receiver(receiver_key_hash.clone())
-        .secret_id([1, 2, 3, 4])?
-        .message(pair_request_message)?
-        .build()?;
-
-    // Encode into wire bytes:
-    //   1. serialize protobuf
-    //   2. sign
-    //   3. encrypt
-    //   4. prefix recipient key id
-    let wire_bytes = DeRecMessageCodec::encode_to_bytes(
-        &derec_message,
-        &signer,
-        &encrypter,
-    )?;
-
-    // Decode from wire bytes:
-    //   1. parse recipient key id
-    //   2. decrypt
-    //   3. verify signature
-    //   4. decode protobuf
-    let decoded = DeRecMessageCodec::decode_from_bytes(
-        &wire_bytes,
-        &decrypter,
-        &verifier,
-    )?;
-
-    assert_eq!(decoded.protocol_version_major, derec_message.protocol_version_major);
-    assert_eq!(decoded.protocol_version_minor, derec_message.protocol_version_minor);
-    assert_eq!(decoded.sender, derec_message.sender);
-    assert_eq!(decoded.receiver, derec_message.receiver);
-    assert_eq!(decoded.secret_id, derec_message.secret_id);
-
-    println!("Successfully encoded and decoded a DeRecMessage envelope");
-
-    Ok(())
-}
-```
-
 ### Pairing Flow
 
 ```rust
 use derec_library::pairing::*;
-use derec_library::types::ChannelId;
+use derec_proto::SenderKind;
 
-// Alternatively:
-// let channel_id: ChannelId = 42.into();
-let channel_id = ChannelId(42);
-let transport_uri = "https://example-helper.com/derec";
+let channel_id = 42.into();
 
-let kind = derec_library::protos::derec_proto::SenderKind::Helper;
-
-// This would normally come from QR decoding.
+// Step 1
 let CreateContactMessageResult {
-    contact_message,
+    wire_bytes: contact_message_bytes,
     secret_key: contactor_secret_key,
 } = create_contact_message(
     channel_id,
     "https://relay.example/derec",
-).expect("Failed to create contact message");
+).unwrap();
 
-// Responder produces pairing request.
+// Step 2
 let ProducePairingRequestMessageResult {
-    pair_request_message,
+    wire_bytes: pair_request_wire_bytes,
     secret_key: requestor_secret_key,
 } = produce_pairing_request_message(
-    channel_id,
-    kind,
-    &contact_message,
-).expect("Failed to produce pairing request message");
+    SenderKind::Helper,
+    "https://example-helper.com/derec",
+    &contact_message_bytes,
+).unwrap();
 
-// Initiator finalizes pairing.
+// Step 3
 let ProducePairingResponseMessageResult {
-    pair_response_message,
+    wire_bytes: pair_response_wire_bytes,
     shared_key,
+    ..
 } = produce_pairing_response_message(
-    kind,
-    &pair_request_message,
+    SenderKind::SharerNonRecovery,
+    &pair_request_wire_bytes,
     &contactor_secret_key,
-).expect("Failed to produce pairing response message");
+).unwrap();
 
-let ProcessPairingResponseMessageResult { shared_key } = process_pairing_response_message(
-    &contact_message,
-    &pair_response_message,
-    &requestor_secret_key,
-).expect("Failed to process pairing response message");
+// Step 4
+let ProcessPairingResponseMessageResult { shared_key } =
+    process_pairing_response_message(
+        &contact_message_bytes,
+        &pair_response_wire_bytes,
+        &requestor_secret_key,
+    ).unwrap();
 ```
 
 The `ContactMessage` is exchanged out-of-band, typically using:
@@ -411,15 +203,16 @@ The `ContactMessage` is exchanged out-of-band, typically using:
 
 ```rust
 use derec_library::sharing::*;
-use derec_library::types::ChannelId;
 
 let secret_id = b"my_secret";
 let secret_data = b"super_secret_value";
-let channels: Vec<ChannelId> = [1, 2, 3].into_iter().map(ChannelId::from).collect();
+let channels = [1.into(), 2.into(), 3.into()];
 let threshold = 2;
 let version = 1;
 
-let ProtectSecretResult { shares } = protect_secret(
+let ProtectSecretResult {
+    share_message_wire_bytes_array,
+} = protect_secret(
     secret_id,
     secret_data,
     &channels,
@@ -427,9 +220,7 @@ let ProtectSecretResult { shares } = protect_secret(
     version,
     None,
     None,
-).expect("sharing failed");
-
-assert_eq!(shares.len(), 3);
+).unwrap();
 ```
 
 ---
@@ -438,21 +229,22 @@ assert_eq!(shares.len(), 3);
 
 ```rust
 use derec_library::verification::*;
-use derec_library::types::ChannelId;
 
-let channel_id = ChannelId(42);
-let secret_id = "secret_id";
+let secret_id = b"secret_id";
 let version = 7;
-let request = generate_verification_request(secret_id, version)
-    .expect("failed to build verification request");
 
-let share_content = b"example_share";
+let request = generate_verification_request(secret_id, version).unwrap();
 
-let response = generate_verification_response(secret_id, channel_id, share_content, &request)
-    .expect("failed to generate verification response");
+let response = generate_verification_response(
+    b"example_share",
+    &request.wire_bytes,
+).unwrap();
 
-let ok = verify_share_response(secret_id, channel_id, share_content, &response)
-    .expect("failed to verify response");
+let ok = verify_share_response(
+    b"example_share",
+    &request.wire_bytes,
+    &response.wire_bytes,
+).unwrap();
 
 assert!(ok);
 ```
@@ -463,24 +255,22 @@ assert!(ok);
 
 ```rust
 use derec_library::recovery::*;
-use derec_library::protos::derec_proto::StoreShareRequestMessage;
-use derec_library::types::ChannelId;
 
-let channel_id = ChannelId(42);
 let secret_id = b"secret_id";
 let version = 1;
-let request = generate_share_request(channel_id, secret_id, version).unwrap();
 
-// In a real helper, this comes from secure storage.
-let stored = StoreShareRequestMessage { share: vec![1, 2, 3], ..Default::default() };
+let request = generate_share_request(secret_id, version).unwrap();
 
-let resp = generate_share_response(channel_id, secret_id, &request, &stored)
-    .expect("failed to build response");
+let response = generate_share_response(
+    &request.wire_bytes,
+    b"example_share",
+).unwrap();
 
-// Responses should contain at least t responses
-let responses = vec![resp];
-
-let _ = recover_from_share_responses(&responses, secret_id, version).unwrap_err();
+let _ = recover_from_share_responses(
+    b"...aggregated responses...",
+    secret_id,
+    version,
+).unwrap();
 ```
 
 ---

@@ -4,7 +4,7 @@ use crate::{
     derec_message::{self, DeRecMessageBuilder, current_timestamp},
     recovery::{
         GenerateShareRequestResult, GenerateShareResponseResult, RecoverFromResponsesResult,
-        RecoveryError,
+        RecoveryError, RecoveryResponseInput,
     },
     types::ChannelId,
 };
@@ -278,7 +278,7 @@ pub fn generate_share_response(
 ///
 /// This function performs the recovery pipeline:
 ///
-/// 1. validate inputs (`responses_bytes`, `secret_id`, `version`)
+/// 1. validate inputs (`responses`, `secret_id`, `version`)
 /// 2. decrypt and decode each inner [`GetShareResponseMessage`]
 /// 3. validate `envelope.timestamp == response.timestamp` for each response
 /// 4. validate that each response reports `result.status == Ok`
@@ -290,12 +290,14 @@ pub fn generate_share_response(
 ///
 /// # Arguments
 ///
-/// * `responses_bytes` - Serialized outer [`derec_proto::DeRecMessage`] bytes collected from helpers.
-///   Must not be empty.
 /// * `secret_id` - The secret identifier being recovered. Must not be empty.
 /// * `version` - The version of the secret being recovered. Must be `>= 0`.
-/// * `shared_key` - Previously established 32-byte symmetric channel key used to decrypt
-///   the helper responses.
+/// * `responses` - Collection of helper responses paired with their corresponding
+///   per-channel shared keys. Each entry must contain:
+///   - `response_bytes`: serialized outer [`derec_proto::DeRecMessage`] bytes
+///     containing an encrypted [`GetShareResponseMessage`]
+///   - `shared_key`: the 32-byte symmetric key associated with that helper,
+///     used to decrypt the response
 ///
 /// # Returns
 ///
@@ -307,7 +309,7 @@ pub fn generate_share_response(
 ///
 /// Returns [`crate::Error`] (specifically `Error::Recovery(...)`) in the following cases:
 ///
-/// - [`RecoveryError::EmptyResponses`] if `responses_bytes` is empty
+/// - [`RecoveryError::EmptyResponses`] if `responses` is empty
 /// - [`RecoveryError::EmptySecretId`] if `secret_id` is empty
 /// - [`RecoveryError::InvalidVersion`] if `version < 0`
 /// - [`RecoveryError::MissingResult`] if any response is missing the `result` field
@@ -316,9 +318,10 @@ pub fn generate_share_response(
 /// - [`RecoveryError::DecodeCommittedDeRecShare`] if committed share decoding fails
 /// - [`RecoveryError::DecodeDeRecShare`] if inner share decoding fails
 /// - [`RecoveryError::SecretIdMismatch`] if any decoded share does not match `secret_id`
-/// — [`RecoveryError::VersionMismatch`] if any decoded share does not match `version`
+/// - [`RecoveryError::VersionMismatch`] if any decoded share does not match `version`
 /// - [`RecoveryError::ReconstructionFailed`] if VSS reconstruction fails
 /// - [`Error::Invariant`] if `envelope.timestamp != response.timestamp` for any response
+/// - [`Error::Decryption`] if any response cannot be decrypted with its provided `shared_key`
 ///
 /// # Security Notes
 ///
@@ -326,25 +329,32 @@ pub fn generate_share_response(
 ///   avoid logging, and store it securely if persistence is required.
 /// - Responses are treated as untrusted input; this function validates protocol status,
 ///   timestamp invariants, secret identity, and version binding before attempting reconstruction.
+/// - Each response is decrypted independently using its associated shared key; incorrect key
+///   pairing will result in decryption failure.
 ///
 /// # Example
 ///
 /// ```rust
-/// use derec_library::recovery::recover_from_share_responses;
+/// use derec_library::recovery::{recover_from_share_responses, RecoveryResponseInput};
 ///
 /// let shared_key = [7u8; 32];
-/// let responses: Vec<Vec<u8>> = vec![];
 ///
-/// let result = recover_from_share_responses(&responses, b"secret_id", 1, &shared_key);
+/// let responses = vec![
+///     RecoveryResponseInput {
+///         bytes: &[],
+///         shared_key: &shared_key,
+///     }
+/// ];
+///
+/// let result = recover_from_share_responses(b"secret_id", 1, &responses);
 /// assert!(result.is_err());
 /// ```
 pub fn recover_from_share_responses(
-    responses_bytes: &[Vec<u8>],
     secret_id: &[u8],
     version: i32,
-    shared_key: &[u8; 32],
+    responses: &[RecoveryResponseInput<'_>],
 ) -> Result<RecoverFromResponsesResult, crate::Error> {
-    if responses_bytes.is_empty() {
+    if responses.is_empty() {
         return Err(RecoveryError::EmptyResponses.into());
     }
 
@@ -356,11 +366,12 @@ pub fn recover_from_share_responses(
         return Err(RecoveryError::InvalidVersion { version }.into());
     }
 
-    let responses = responses_bytes
+    let decoded_responses = responses
         .iter()
-        .map(|bytes| {
-            let (envelope, response) =
-                derec_message::extract_inner_message::<GetShareResponseMessage>(bytes, shared_key)?;
+        .map(|input| {
+            let (envelope, response) = derec_message::extract_inner_message::<
+                GetShareResponseMessage,
+            >(input.bytes, input.shared_key)?;
 
             if envelope.timestamp != response.timestamp {
                 return Err(crate::Error::Invariant(
@@ -372,9 +383,9 @@ pub fn recover_from_share_responses(
         })
         .collect::<Result<Vec<_>, crate::Error>>()?;
 
-    let mut shares = Vec::with_capacity(responses.len());
+    let mut shares = Vec::with_capacity(decoded_responses.len());
 
-    for response in &responses {
+    for response in &decoded_responses {
         shares.push(extract_share_from_response(response, secret_id, version)?);
     }
 

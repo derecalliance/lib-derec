@@ -25,6 +25,7 @@ This crate provides implementations and utilities for:
 - Serialization helpers for elliptic curve keys
 - Cryptographic hashing utilities used in the protocol
 - Primitives required by DeRec pairing flows
+- Envelope encryption for message payload protection
 
 The cryptographic constructions rely on well-established cryptographic libraries,
 including:
@@ -36,6 +37,55 @@ including:
 
 These libraries are used to implement the cryptographic mechanisms specified
 by the DeRec protocol.
+
+---
+
+## Envelope Encryption
+
+The module `pairing::envelope` provides ECIES-style hybrid encryption used to
+protect DeRec message payloads.
+
+It combines:
+
+- secp256k1 ECDH (via internal `pairing_ecies`)
+- AES-256-GCM authenticated encryption (via `channel`)
+
+### Design
+
+Encryption follows a standard ECIES pattern:
+
+1. Generate ephemeral keypair
+2. Derive shared key via ECDH
+3. Encrypt payload using AES-256-GCM
+4. Output:
+
+```
+[u32 epk_len][epk_bytes][ciphertext]
+```
+
+Decryption performs the inverse operation using the recipient secret key.
+
+### Responsibilities
+
+This module:
+
+- encrypts arbitrary byte payloads to a recipient public key
+- decrypts ciphertext using a recipient secret key
+
+This module does **not**:
+
+- enforce protocol semantics
+- perform signing
+- know about higher-level DeRec flows
+
+### Example
+
+```rust
+use derec_cryptography::pairing::envelope::encryption;
+
+let ciphertext = encryption::encrypt(b"hello", &receiver_pk).unwrap();
+let plaintext = encryption::decrypt(&ciphertext, &receiver_sk).unwrap();
+```
 
 ---
 

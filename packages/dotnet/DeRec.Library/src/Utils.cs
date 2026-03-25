@@ -1,6 +1,5 @@
 using System;
 using System.Runtime.InteropServices;
-using System.Buffers.Binary;
 
 namespace DeRec.Library;
 
@@ -47,33 +46,5 @@ internal static class Utils
         {
             Native.Utils.derec_free_string(status.Message);
         }
-    }
-
-    public static uint ReadU32(ReadOnlySpan<byte> span, ref int offset)
-    {
-        const int size = 4;
-
-        if (offset + size > span.Length)
-        {
-            throw new InvalidDataException("Unexpected end of buffer while reading u32.");
-        }
-
-        uint value = BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(offset, size));
-        offset += size;
-        return value;
-    }
-
-    public static ulong ReadU64(ReadOnlySpan<byte> span, ref int offset)
-    {
-        const int size = 8;
-
-        if (offset + size > span.Length)
-        {
-            throw new InvalidDataException("Unexpected end of buffer while reading u64.");
-        }
-
-        ulong value = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(offset, size));
-        offset += size;
-        return value;
     }
 }

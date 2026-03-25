@@ -59,7 +59,7 @@ use crate::ffi::common::{
 #[repr(C)]
 pub struct GenerateVerificationRequestResult {
     pub status: DeRecStatus,
-    pub verify_share_request_message: DeRecBuffer,
+    pub request_wire_bytes: DeRecBuffer,
 }
 
 /// FFI result returned by [`generate_verification_response`].
@@ -77,7 +77,7 @@ pub struct GenerateVerificationRequestResult {
 #[repr(C)]
 pub struct GenerateVerificationResponseResult {
     pub status: DeRecStatus,
-    pub verify_share_response_message: DeRecBuffer,
+    pub response_wire_bytes: DeRecBuffer,
 }
 
 /// FFI result returned by [`verify_share_response`].
@@ -149,14 +149,14 @@ pub extern "C" fn generate_verification_request(
     if secret_id_ptr.is_null() && secret_id_len > 0 {
         return GenerateVerificationRequestResult {
             status: err_status("secret_id_ptr is null"),
-            verify_share_request_message: empty_buffer(),
+            request_wire_bytes: empty_buffer(),
         };
     }
 
     if shared_key_ptr.is_null() && shared_key_len > 0 {
         return GenerateVerificationRequestResult {
             status: err_status("shared_key_ptr is null"),
-            verify_share_request_message: empty_buffer(),
+            request_wire_bytes: empty_buffer(),
         };
     }
 
@@ -177,7 +177,7 @@ pub extern "C" fn generate_verification_request(
         Err(_) => {
             return GenerateVerificationRequestResult {
                 status: err_status("shared_key must be exactly 32 bytes"),
-                verify_share_request_message: empty_buffer(),
+                request_wire_bytes: empty_buffer(),
             };
         }
     };
@@ -192,14 +192,14 @@ pub extern "C" fn generate_verification_request(
         Err(err) => {
             return GenerateVerificationRequestResult {
                 status: err_status(err.to_string()),
-                verify_share_request_message: empty_buffer(),
+                request_wire_bytes: empty_buffer(),
             };
         }
     };
 
     GenerateVerificationRequestResult {
         status: ok_status(),
-        verify_share_request_message: vec_into_buffer(result.wire_bytes),
+        request_wire_bytes: vec_into_buffer(result.wire_bytes),
     }
 }
 
@@ -265,28 +265,28 @@ pub extern "C" fn generate_verification_response(
     if secret_id_ptr.is_null() && secret_id_len > 0 {
         return GenerateVerificationResponseResult {
             status: err_status("secret_id_ptr is null"),
-            verify_share_response_message: empty_buffer(),
+            response_wire_bytes: empty_buffer(),
         };
     }
 
     if shared_key_ptr.is_null() && shared_key_len > 0 {
         return GenerateVerificationResponseResult {
             status: err_status("shared_key_ptr is null"),
-            verify_share_response_message: empty_buffer(),
+            response_wire_bytes: empty_buffer(),
         };
     }
 
     if share_content_ptr.is_null() && share_content_len > 0 {
         return GenerateVerificationResponseResult {
             status: err_status("share_content_ptr is null"),
-            verify_share_response_message: empty_buffer(),
+            response_wire_bytes: empty_buffer(),
         };
     }
 
     if request_ptr.is_null() && request_len > 0 {
         return GenerateVerificationResponseResult {
             status: err_status("request_ptr is null"),
-            verify_share_response_message: empty_buffer(),
+            response_wire_bytes: empty_buffer(),
         };
     }
 
@@ -307,7 +307,7 @@ pub extern "C" fn generate_verification_response(
         Err(_) => {
             return GenerateVerificationResponseResult {
                 status: err_status("shared_key must be exactly 32 bytes"),
-                verify_share_response_message: empty_buffer(),
+                response_wire_bytes: empty_buffer(),
             };
         }
     };
@@ -335,14 +335,14 @@ pub extern "C" fn generate_verification_response(
         Err(err) => {
             return GenerateVerificationResponseResult {
                 status: err_status(err.to_string()),
-                verify_share_response_message: empty_buffer(),
+                response_wire_bytes: empty_buffer(),
             };
         }
     };
 
     GenerateVerificationResponseResult {
         status: ok_status(),
-        verify_share_response_message: vec_into_buffer(result.wire_bytes),
+        response_wire_bytes: vec_into_buffer(result.wire_bytes),
     }
 }
 

@@ -1,8 +1,10 @@
-# DeRec .Net SDK
+# DeRec .NET SDK
 
 .NET bindings for `derec-library`, the Rust SDK for the DeRec protocol.
 
 DeRec enables decentralized recovery of secrets by distributing encrypted shares to trusted helpers.
+
+---
 
 ## Installation
 
@@ -10,146 +12,175 @@ DeRec enables decentralized recovery of secrets by distributing encrypted shares
 dotnet add package DeRec.Library
 ```
 
+---
+
 ## Requirements
 
-* Node.js 18+ recommended
-* TypeScript optional but supported
+- .NET 6 or later
 
-The package includes:
+No additional native dependencies are required. The package includes the native DeRec library.
 
-* Compiled WebAssembly module
-* JavaScript bindings
-* TypeScript type definitions
+---
 
-No additional native dependencies are required.
+## Design Overview
+
+The .NET SDK is a **thin interop layer** over the Rust implementation.
+
+All of the following are handled internally in Rust:
+
+- Protobuf serialization / deserialization
+- Encryption / decryption
+- DeRecMessage envelope construction
+- Protocol validation
+
+The .NET API operates exclusively on **opaque `byte[]` wire payloads**.
+
+---
 
 ## Quick Example
 
-```js
-using Derec.Library;
+```csharp
+using DeRec.Library;
 
-Console.WriteLine(DeRec.VersionMajor());
-Console.WriteLine(DeRec.VersionMinor());
-Console.WriteLine(DeRec.VersionPatch());
+var version = DeRec.Library.Native.ProtocolVersion.derec_protocol_version();
+
+Console.WriteLine(version.Major);
+Console.WriteLine(version.Minor);
 ```
 
-## Example: Building and Encoding a DeRecMessage
+---
 
-All DeRec protocol messages except `ContactMessage` must be wrapped inside a `DeRecMessage`
-before being signed, encrypted, and transmitted over the wire.
-
-The `DeRecMessageBuilder` helps construct the envelope, and `DeRecMessageCodec`
-handles serialization and transport encoding.
-
-Example (simplified):
+## Example: Pairing Flow
 
 ```csharp
-using System;
-using System.Linq;
 using DeRec.Library;
-using Org.Derecalliance.Derec.Protobuf;
 
-byte[] sender = Enumerable.Repeat((byte)0x11, 48).ToArray();
-byte[] receiver = Enumerable.Repeat((byte)0x22, 48).ToArray();
-byte[] secretId = new byte[] { 1, 2, 3, 4 };
-
-var pairRequest = new PairRequestMessage
-{
-    // populate fields as needed
-};
-
-DeRecMessage derecMessage = new DeRecMessageBuilder()
-    .Sender(sender)
-    .Receiver(receiver)
-    .SecretId(secretId)
-    .Message(pairRequest)
-    .Build();
-
-byte[] serialized = DeRecMessageCodec.Serialize(derecMessage);
-
-Console.WriteLine(serialized.Length);
-```
-
-This produces a serialized DeRecMessage that can then be signed, encrypted,
-and sent to the intended recipient.
-
-To produce transport-ready wire bytes, use DeRecMessageCodec.EncodeToBytes(...)
-with signing and encryption backends. To recover the original envelope on the
-receiving side, use DeRecMessageCodec.DecodeFromBytes(...) with decryption and
-signature verification backends.
-
-## Example: Generating Shares
-
-A typical DeRec workflow involves splitting a secret into shares that are distributed to helpers.
-
-Example (simplified):
-
-```ts
-import * as derec from "@derecalliance/derec-nodejs";
-
-const secretId = new Uint8Array([1,2,3]);
-const secretData = new TextEncoder().encode("super-secret");
-
-const channels = [1,2,3];
-const threshold = 2;
-const version = 1;
-
-const result = derec.protect_secret(
-  secretId,
-  secretData,
-  channels,
-  threshold,
-  version
+// Step 1: Owner creates contact message
+var contact = Pairing.CreateContactMessage(
+    channelId: 1,
+    transportUri: "wss://example.com"
 );
 
-console.log(result);
+// Step 2: Helper produces pairing request
+var request = Pairing.ProducePairingRequestMessage(
+    kind: Pairing.SenderKind.Helper,
+    transportUri: "wss://helper.com",
+    contactMessageBytes: contact.WireBytes
+);
+
+// Step 3: Owner produces pairing response
+var response = Pairing.ProducePairingResponseMessage(
+    kind: Pairing.SenderKind.SharerNonRecovery,
+    pairRequestWireBytes: request.WireBytes,
+    pairingSecretKeyMaterial: request.SecretKeyMaterial
+);
+
+// Step 4: Helper processes response
+var final = Pairing.ProcessPairingResponseMessage(
+    contactMessageBytes: contact.WireBytes,
+    pairResponseWireBytes: response.WireBytes,
+    pairingSecretKeyMaterial: request.SecretKeyMaterial
+);
+
+Console.WriteLine($"Shared key length: {final.SharedKey.Length}");
 ```
 
-This produces a set of share messages that can be sent to helpers.
+---
 
-## Package Contents
+## Example: Share Distribution
 
-The `npm` package includes:
+```csharp
+using DeRec.Library;
 
-```text
-derec_library_bg.wasm
-derec_library.js
-derec_library.d.ts
+var result = Sharing.ProtectSecret(
+    secretId: new byte[] {1,2,3},
+    secretData: System.Text.Encoding.UTF8.GetBytes("super-secret"),
+    channels: new ulong[] {1,2,3},
+    threshold: 2,
+    version: 1
+);
+
+// Opaque wire bytes containing all share messages
+byte[] shareMessages = result.ShareMessageWireBytesArray;
 ```
 
-* `.wasm` – compiled Rust SDK
-* `.js` – Node bindings generated by wasm-bindgen
-* `.d.ts` – TypeScript type definitions
+---
 
-## TypeScript Support
+## Example: Recovery Flow
 
-Type definitions are bundled with the package.
+```csharp
+using DeRec.Library;
 
-```ts
-import * as derec from "@derecalliance/derec-nodejs";
+// Request a share
+byte[] request = Recovery.GenerateShareRequest(
+    secretId: new byte[] {1,2,3},
+    version: 1
+);
+
+// Helper responds with share content
+byte[] response = Recovery.GenerateShareResponse(
+    shareRequestWireBytes: request,
+    shareContent: /* stored share bytes */
+);
+
+// Owner aggregates responses and recovers secret
+byte[] secret = Recovery.RecoverFromShareResponses(
+    shareResponseWireBytesArray: /* aggregated responses */,
+    secretId: new byte[] {1,2,3},
+    version: 1
+);
 ```
 
-Your editor should automatically provide autocompletion and type checking.
+---
+
+## Example: Verification Flow
+
+```csharp
+using DeRec.Library;
+
+// Owner generates verification request
+byte[] request = Verification.GenerateVerificationRequest(
+    secretId: new byte[] {1,2,3},
+    version: 1
+);
+
+// Helper produces response
+byte[] response = Verification.GenerateVerificationResponse(
+    shareContent: /* stored share */,
+    requestWireBytes: request
+);
+
+// Owner verifies response
+bool isValid = Verification.VerifyShareResponse(
+    shareContent: /* stored share */,
+    requestWireBytes: request,
+    responseWireBytes: response
+);
+
+Console.WriteLine($"Valid: {isValid}");
+```
+
+---
+
+## Key Principles
+
+- All protocol messages are opaque `byte[]`
+- No protobuf types are exposed in .NET
+- No cryptography is performed in .NET
+- Rust is the single source of truth for protocol logic
+
+---
 
 ## Documentation
 
-Full documentation for the DeRec protocol and SDK:
+- DeRec Alliance: https://derecalliance.org
+- Protocol specification: https://derec-alliance.gitbook.io/docs/protocol-specification/protocol-overview
+- Rust SDK repository: https://github.com/derecalliance/lib-derec
 
-* [TypeScript SDK Documentation](https://derec-alliance.gitbook.io/docs/sdk/dotnet)
-* [DeRec Alliance](https://derecalliance.org)
-* [Protocol specification](https://derec-alliance.gitbook.io/docs/protocol-specification/protocol-overview)
-* [Rust SDK repository](https://github.com/derecalliance/lib-derec)
-
-For detailed API documentation and examples, refer to the Rust SDK documentation.
+---
 
 ## License
 
 Licensed under the Apache License, Version 2.0.
 
 See the `LICENSE` file for details.
-
-## DeRec Alliance
-
-The DeRec Alliance is an open initiative focused on creating standards for decentralized secret recovery.
-
-More information at https://derecalliance.org

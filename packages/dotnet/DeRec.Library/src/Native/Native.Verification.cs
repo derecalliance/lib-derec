@@ -9,14 +9,14 @@ internal static class Verification
     internal struct GenerateVerificationRequestResult
     {
         public Status Status;
-        public Buffer VerifyShareRequestMessage;
+        public Buffer RequestWireBytes;
     }
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct GenerateVerificationResponseResult
     {
         public Status Status;
-        public Buffer VerifyShareResponseMessage;
+        public Buffer ResponseWireBytes;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -32,7 +32,10 @@ internal static class Verification
     internal static extern GenerateVerificationRequestResult generate_verification_request(
         byte[] secretId,
         UIntPtr secretIdLen,
-        int version
+        ulong channelId,
+        int version,
+        byte[] sharedKey,
+        UIntPtr sharedKeyLen
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
@@ -40,10 +43,12 @@ internal static class Verification
         byte[] secretId,
         UIntPtr secretIdLen,
         ulong channelId,
+        byte[] sharedKey,
+        UIntPtr sharedKeyLen,
         byte[] shareContent,
         UIntPtr shareContentLen,
-        byte[] request,
-        UIntPtr requestLen
+        byte[] requestWireBytes,
+        UIntPtr requestWireBytesLen
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
@@ -51,9 +56,11 @@ internal static class Verification
         byte[] secretId,
         UIntPtr secretIdLen,
         ulong channelId,
+        byte[] sharedKey,
+        UIntPtr sharedKeyLen,
         byte[] shareContent,
         UIntPtr shareContentLen,
-        byte[] response,
-        UIntPtr responseLen
+        byte[] responseWireBytes,
+        UIntPtr responseWireBytesLen
     );
 }

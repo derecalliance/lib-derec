@@ -69,7 +69,7 @@ use prost::Message;
 #[repr(C)]
 pub struct CreateContactMessageResult {
     pub status: DeRecStatus,
-    pub contact_message: DeRecBuffer,
+    pub contact_wire_bytes: DeRecBuffer,
     pub secret_key_material: DeRecBuffer,
 }
 
@@ -91,7 +91,7 @@ pub struct CreateContactMessageResult {
 #[repr(C)]
 pub struct ProducePairingRequestMessageResult {
     pub status: DeRecStatus,
-    pub pair_request_message: DeRecBuffer,
+    pub request_wire_bytes: DeRecBuffer,
     pub secret_key_material: DeRecBuffer,
 }
 
@@ -113,7 +113,7 @@ pub struct ProducePairingRequestMessageResult {
 #[repr(C)]
 pub struct ProducePairingResponseMessageResult {
     pub status: DeRecStatus,
-    pub pair_response_message: DeRecBuffer,
+    pub response_wire_bytes: DeRecBuffer,
     pub transport_protocol: DeRecBuffer,
     pub shared_key: DeRecBuffer,
 }
@@ -181,7 +181,7 @@ pub extern "C" fn create_contact_message(
     if transport_uri_ptr.is_null() {
         return CreateContactMessageResult {
             status: err_status("transport_uri_ptr is null"),
-            contact_message: empty_buffer(),
+            contact_wire_bytes: empty_buffer(),
             secret_key_material: empty_buffer(),
         };
     }
@@ -194,7 +194,7 @@ pub extern "C" fn create_contact_message(
         Err(_) => {
             return CreateContactMessageResult {
                 status: err_status("transport_uri is not valid UTF-8"),
-                contact_message: empty_buffer(),
+                contact_wire_bytes: empty_buffer(),
                 secret_key_material: empty_buffer(),
             };
         }
@@ -205,7 +205,7 @@ pub extern "C" fn create_contact_message(
         Err(err) => {
             return CreateContactMessageResult {
                 status: err_status(err.to_string()),
-                contact_message: empty_buffer(),
+                contact_wire_bytes: empty_buffer(),
                 secret_key_material: empty_buffer(),
             };
         }
@@ -216,7 +216,7 @@ pub extern "C" fn create_contact_message(
 
     CreateContactMessageResult {
         status: ok_status(),
-        contact_message: vec_into_buffer(contact_message_bytes),
+        contact_wire_bytes: vec_into_buffer(contact_message_bytes),
         secret_key_material: vec_into_buffer(secret_key_material_bytes),
     }
 }
@@ -275,7 +275,7 @@ pub extern "C" fn produce_pairing_request_message(
     if transport_uri_ptr.is_null() {
         return ProducePairingRequestMessageResult {
             status: err_status("transport_uri_ptr is null"),
-            pair_request_message: empty_buffer(),
+            request_wire_bytes: empty_buffer(),
             secret_key_material: empty_buffer(),
         };
     }
@@ -283,7 +283,7 @@ pub extern "C" fn produce_pairing_request_message(
     if contact_message_ptr.is_null() {
         return ProducePairingRequestMessageResult {
             status: err_status("contact_message_ptr is null"),
-            pair_request_message: empty_buffer(),
+            request_wire_bytes: empty_buffer(),
             secret_key_material: empty_buffer(),
         };
     }
@@ -293,7 +293,7 @@ pub extern "C" fn produce_pairing_request_message(
         Err(_) => {
             return ProducePairingRequestMessageResult {
                 status: err_status(format!("invalid SenderKind value: {sender_kind}")),
-                pair_request_message: empty_buffer(),
+                request_wire_bytes: empty_buffer(),
                 secret_key_material: empty_buffer(),
             };
         }
@@ -307,7 +307,7 @@ pub extern "C" fn produce_pairing_request_message(
         Err(_) => {
             return ProducePairingRequestMessageResult {
                 status: err_status("transport_uri is not valid UTF-8"),
-                pair_request_message: empty_buffer(),
+                request_wire_bytes: empty_buffer(),
                 secret_key_material: empty_buffer(),
             };
         }
@@ -325,7 +325,7 @@ pub extern "C" fn produce_pairing_request_message(
         Err(err) => {
             return ProducePairingRequestMessageResult {
                 status: err_status(err.to_string()),
-                pair_request_message: empty_buffer(),
+                request_wire_bytes: empty_buffer(),
                 secret_key_material: empty_buffer(),
             };
         }
@@ -336,7 +336,7 @@ pub extern "C" fn produce_pairing_request_message(
 
     ProducePairingRequestMessageResult {
         status: ok_status(),
-        pair_request_message: vec_into_buffer(pair_request_message_bytes),
+        request_wire_bytes: vec_into_buffer(pair_request_message_bytes),
         secret_key_material: vec_into_buffer(secret_key_material_bytes),
     }
 }
@@ -398,7 +398,7 @@ pub extern "C" fn produce_pairing_response_message(
     if pair_request_message_ptr.is_null() {
         return ProducePairingResponseMessageResult {
             status: err_status("pair_request_message_ptr is null"),
-            pair_response_message: empty_buffer(),
+            response_wire_bytes: empty_buffer(),
             transport_protocol: empty_buffer(),
             shared_key: empty_buffer(),
         };
@@ -407,7 +407,7 @@ pub extern "C" fn produce_pairing_response_message(
     if secret_key_material_ptr.is_null() {
         return ProducePairingResponseMessageResult {
             status: err_status("secret_key_material_ptr is null"),
-            pair_response_message: empty_buffer(),
+            response_wire_bytes: empty_buffer(),
             transport_protocol: empty_buffer(),
             shared_key: empty_buffer(),
         };
@@ -418,7 +418,7 @@ pub extern "C" fn produce_pairing_response_message(
         Err(_) => {
             return ProducePairingResponseMessageResult {
                 status: err_status(format!("invalid SenderKind value: {sender_kind}")),
-                pair_response_message: empty_buffer(),
+                response_wire_bytes: empty_buffer(),
                 transport_protocol: empty_buffer(),
                 shared_key: empty_buffer(),
             };
@@ -437,7 +437,7 @@ pub extern "C" fn produce_pairing_response_message(
             Err(err) => {
                 return ProducePairingResponseMessageResult {
                     status: err_status(format!("invalid secret key material: {err}")),
-                    pair_response_message: empty_buffer(),
+                    response_wire_bytes: empty_buffer(),
                     transport_protocol: empty_buffer(),
                     shared_key: empty_buffer(),
                 };
@@ -453,7 +453,7 @@ pub extern "C" fn produce_pairing_response_message(
         Err(err) => {
             return ProducePairingResponseMessageResult {
                 status: err_status(err.to_string()),
-                pair_response_message: empty_buffer(),
+                response_wire_bytes: empty_buffer(),
                 transport_protocol: empty_buffer(),
                 shared_key: empty_buffer(),
             };
@@ -466,7 +466,7 @@ pub extern "C" fn produce_pairing_response_message(
 
     ProducePairingResponseMessageResult {
         status: ok_status(),
-        pair_response_message: vec_into_buffer(pair_response_message_bytes),
+        response_wire_bytes: vec_into_buffer(pair_response_message_bytes),
         transport_protocol: vec_into_buffer(transport_protocol_bytes),
         shared_key: vec_into_buffer(shared_key_bytes),
     }

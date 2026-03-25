@@ -32,11 +32,14 @@ which provides a higher-level API and complete protocol flows.
 ```rust
 use derec_proto::ContactMessage;
 
-let msg = ContactMessage {
-    public_key_id: 1,
-    ..Default::default()
-};
+// Constructing a message directly (typically handled by derec-library)
+let msg = ContactMessage::default();
 ```
+
+> [!NOTE]
+> In the current SDK design, applications should not construct or manipulate
+> protobuf messages directly. Instead, use `derec-library`, which produces
+> and consumes opaque `wire_bytes`.
 
 ---
 

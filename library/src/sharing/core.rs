@@ -108,7 +108,7 @@ const SHARE_ALGORITHM_VSS: i32 = 0;
 /// let ProtectSecretResult { shares } = protect_secret(
 ///     secret_id,
 ///     secret_data,
-///     channels,
+///     &channels,
 ///     2,
 ///     1,
 ///     None,
@@ -120,7 +120,7 @@ const SHARE_ALGORITHM_VSS: i32 = 0;
 pub fn protect_secret(
     secret_id: impl AsRef<[u8]>,
     secret_data: impl AsRef<[u8]>,
-    channels: HashMap<ChannelId, [u8; 32]>,
+    channels: &HashMap<ChannelId, [u8; 32]>,
     threshold: usize,
     version: i32,
     keep_list: Option<&[i32]>,
@@ -157,8 +157,8 @@ pub fn protect_secret(
 
     // Make channel/share assignment deterministic instead of relying on HashMap
     // iteration order.
-    let mut ordered_channels: Vec<_> = channels.into_iter().collect();
-    ordered_channels.sort_by_key(|(channel_id, _)| <u64 as From<ChannelId>>::from(*channel_id));
+    let mut ordered_channels: Vec<_> = channels.iter().collect();
+    ordered_channels.sort_by_key(|(channel_id, _)| <u64 as From<ChannelId>>::from(**channel_id));
 
     let mut shares = HashMap::with_capacity(channel_count);
 
@@ -195,14 +195,14 @@ pub fn protect_secret(
         };
 
         let wire_bytes = DeRecMessageBuilder::channel()
-            .channel_id(channel_id)
+            .channel_id(*channel_id)
             .timestamp(timestamp)
             .message(&message)
-            .encrypt(&shared_key)?
+            .encrypt(shared_key)?
             .build()?
             .encode_to_vec();
 
-        shares.insert(channel_id, wire_bytes);
+        shares.insert(*channel_id, wire_bytes);
     }
 
     Ok(ProtectSecretResult { shares })

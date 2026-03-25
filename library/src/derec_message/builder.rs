@@ -64,10 +64,7 @@
 //! - the `message` field is treated as opaque payload bytes by this module
 //! - envelope fields are used only for routing, sequencing, and protocol metadata
 
-use std::{
-    marker::PhantomData,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::marker::PhantomData;
 
 use crate::{
     derec_message::DeRecMessageBuilderError, protocol_version::ProtocolVersion, types::ChannelId,
@@ -453,7 +450,10 @@ impl<Mode> DeRecMessageBuilder<Encrypted, Mode> {
 /// # Panics
 ///
 /// Panics if the system clock is earlier than the Unix epoch.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn current_timestamp() -> Timestamp {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("time went backwards");
@@ -461,5 +461,15 @@ pub fn current_timestamp() -> Timestamp {
     Timestamp {
         seconds: now.as_secs() as i64,
         nanos: now.subsec_nanos() as i32,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn current_timestamp() -> Timestamp {
+    let millis = js_sys::Date::now() as i64;
+
+    Timestamp {
+        seconds: millis / 1000,
+        nanos: ((millis % 1000) * 1_000_000) as i32,
     }
 }
