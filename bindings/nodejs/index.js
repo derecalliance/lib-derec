@@ -1,4 +1,4 @@
-import * as derec from "@derecalliance/derec-nodejs";
+import * as derec from "@derec-alliance/nodejs";
 const secretId = new Uint8Array([1, 2, 3, 4, 255]);
 const secretData = new Uint8Array([5, 6, 7, 8, 255]);
 const channelIds = [1n, 2n, 3n];

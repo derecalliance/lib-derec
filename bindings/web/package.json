@@ -13,6 +13,6 @@
     "vite": "^7.3.1"
   },
   "dependencies": {
-    "@derecalliance/derec-web": "file:../../library/target/pkg-web"
+    "@derec-alliance/web": "file:../../library/target/pkg-web"
   }
 }

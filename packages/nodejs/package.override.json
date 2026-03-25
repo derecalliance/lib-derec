@@ -1,5 +1,5 @@
 {
-  "name": "@derecalliance/derec-nodejs",
+  "name": "@derec-alliance/nodejs",
   "description": "Node.js WebAssembly bindings for derec-library, the Rust SDK for the DeRec protocol.",
   "files": [
     "derec_library_bg.wasm",

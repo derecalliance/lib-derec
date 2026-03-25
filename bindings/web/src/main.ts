@@ -1,4 +1,4 @@
-import init, * as derec from "@derecalliance/derec-web";
+import init, * as derec from "@derec-alliance/web";
 
 function sharedKey(byte: number): Uint8Array {
     return new Uint8Array(32).fill(byte);

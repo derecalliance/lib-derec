@@ -1,5 +1,5 @@
 {
-  "name": "@derecalliance/derec-web",
+  "name": "@derec-alliance/web",
   "description": "Browser WebAssembly bindings for derec-library, the Rust SDK for the DeRec protocol.",
   "files": [
     "derec_library_bg.wasm",
