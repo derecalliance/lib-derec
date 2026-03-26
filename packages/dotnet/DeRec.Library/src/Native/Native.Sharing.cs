@@ -6,10 +6,19 @@ namespace DeRec.Library.Native;
 internal static class Sharing
 {
     [StructLayout(LayoutKind.Sequential)]
+    internal struct ChannelSharedKeyInput
+    {
+        public ulong ChannelId;
+
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)]
+        public byte[] SharedKey;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     internal struct ProtectSecretResult
     {
         public Status Status;
-        public Buffer Shares;
+        public Buffer SharesWireBytes;
     }
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
@@ -18,7 +27,7 @@ internal static class Sharing
         UIntPtr secretIdLen,
         byte[] secretData,
         UIntPtr secretDataLen,
-        ulong[] channels,
+        ChannelSharedKeyInput[] channels,
         UIntPtr channelsLen,
         UIntPtr threshold,
         int version,

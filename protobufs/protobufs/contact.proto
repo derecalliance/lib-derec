@@ -1,74 +1,127 @@
 /*
  * Copyright (c) DeRec Alliance and its Contributors.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *        http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
+import "transportprotocol.proto";
+
 package org.derecalliance.derec.protobuf;
 
-// ContactMessage is the only protocol message that is not wrapped inside
-// a DeRecMessage.
+// ContactMessage is the only DeRec protocol message that is not wrapped
+// inside a DeRecMessage.
 //
-// It is not encrypted, not signed, and not transmitted through the normal
-// protocol channels. Instead, it is exchanged out-of-band between the
-// two parties before the protocol begins.
+// This message is exchanged out-of-band before pairing begins. It provides
+// the minimum information required for another party to initiate contact and
+// send the first protocol message for a new pairing session.
 //
-// Typical transport mechanisms include:
-// - QR codes displayed by either the helper or the sharer and scanned by
-//   the other party
-// - Distribution inside an application provided by one party to the other
-// - Transmission through an existing communication channel if the parties
-//   already have a prior relationship
+// Unlike normal DeRec protocol messages, a ContactMessage:
 //
-// The nonce may also be transmitted separately from the rest of the message.
+// - is not wrapped in a DeRecMessage
+// - is not signed
+// - is not encrypted
+// - is not delivered through an already-established DeRec channel
+//
+// Because it is exchanged before any secure channel exists, this message
+// should only contain bootstrap information needed to establish that channel.
+// It is typically transferred through a trusted or user-mediated mechanism.
+//
+// Typical exchange mechanisms include:
+//
+// - QR codes displayed by either the Owner or Helper and scanned by the other
+//   party
+// - distribution inside an application controlled by one of the parties
+// - transmission over an already-existing communication channel when the
+//   parties have a prior relationship
+//
+// The recipient of this message uses its contents to construct and send the
+// initial pairing request. In particular, the ContactMessage conveys:
+//
+// - the public encryption key material needed to protect the first inbound
+//   pairing message
+// - a channel identifier that the recipient must echo in subsequent protocol
+//   messages sent to this contact
+// - a nonce that binds the pairing attempt to the out-of-band contact exchange
+// - the transport information required to deliver the pairing request
+//
+// The nonce may be transmitted together with the rest of the message or
+// delivered separately by the application, depending on the authentication
+// and pairing UX.
 message ContactMessage {
 
   // Serialized ML-KEM-768 encapsulation key.
+  //
+  // This public key is used by the sender of the first protocol message to
+  // establish confidentiality for the initial pairing exchange.
+  //
+  // The exact cryptographic processing and message construction are defined
+  // by the DeRec pairing protocol and its implementation.
   bytes mlkemEncapsulationKey = 1;
 
   // Serialized ECIES public key.
+  //
+  // This public key is used as part of the encryption scheme for the initial
+  // pairing message sent to the creator of this contact.
+  //
+  // Together with `mlkemEncapsulationKey`, this field provides the public
+  // encryption material needed before the peers have established a secure
+  // DeRec channel.
   bytes eciesPublicKey = 2;
  
-  // Identifier used to reference the public encryption key.
+  // Channel identifier associated with this contact.
   //
-  // When a message is sent to the creator of this contact and encrypted
-  // with the public encryption key, this identifier is included so the
-  // recipient knows which key to use for decryption.
+  // This value identifies the communication channel that the creator of this
+  // ContactMessage expects to use for the new pairing. After receiving this
+  // contact, the initiating party includes this channelId in subsequent
+  // protocol messages sent to the contact creator.
   //
-  // If the recipient generates multiple keys for multiple pairings, they
-  // should remember the publicKeyId associated with each one so that they
-  // do not need to try all keys during decryption.
-  uint64 publicKeyId = 3;
+  // The recipient uses this identifier to determine which local key material
+  // and pairing state should be used when processing the message.
+  //
+  // If an implementation generates multiple pending contact records or
+  // multiple encryption key pairs for different pairing attempts, it should
+  // retain the mapping from channelId to the corresponding local state so it
+  // can process inbound messages without trial decryption across all keys.
+  //
+  // This value MUST be unique within the scope required by the implementation
+  // to disambiguate concurrent or stored pairing sessions.
+  uint64 channelId = 3;
 
-  // Random 64-bit nonce used to identify the pairing session.
+  // Random nonce used to bind the pairing request to this contact exchange.
   //
-  // This should be given to the other party only after authentication.
+  // The initiator includes this value in the pairing request so the creator
+  // of the ContactMessage can confirm that the request corresponds to the
+  // same out-of-band contact information that was just shared.
+  //
+  // This helps the application detect mismatched, stale, or spoofed pairing
+  // attempts during the bootstrap phase.
+  //
+  // Applications may choose to reveal this nonce only after sufficient
+  // out-of-band authentication has taken place.
   uint64 nonce = 4;
 
-  // URI endpoint used to contact the helper or sharer.
+  // Transport information used to reach the creator of this contact.
   //
-  // This can be an HTTPS endpoint or a RabbitMQ endpoint.
-  string transportUri = 5;
-
-  // Transport protocol that the transportUri represents.
+  // This specifies both:
   //
-  // This indicates how the endpoint should be interpreted and how protocol
-  // messages should be delivered to the recipient.
-  TransportProtocol transportProtocol = 6;
+  // - the endpoint to which the first protocol message should be sent
+  // - the transport protocol that determines how that endpoint is interpreted
+  //   and used
+  //
+  // The initiating party uses this field to deliver the initial pairing
+  // request. Subsequent protocol exchanges may continue using the same
+  // transport information or updated transport details, depending on the
+  // protocol and application behavior.
+  TransportProtocol transportProtocol = 5;
 
-  enum TransportProtocol {
-    HTTPS = 0;
-  }
+  // Timestamp indicating when the sender created this message.
+  //
+  // This value is expressed in UTC and can be used for:
+  //
+  // - replay detection
+  // - timeout handling
+  // - logging and observability
+  google.protobuf.Timestamp timestamp = 6;
 }

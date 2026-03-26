@@ -1,70 +1,69 @@
 using System;
-using System.Runtime.InteropServices;
-using Google.Protobuf;
-using Org.Derecalliance.Derec.Protobuf;
 
 namespace DeRec.Library;
 
 public static class Verification
 {
-    public static VerifyShareRequestMessage GenerateVerificationRequest(
+    public static byte[] GenerateVerificationRequest(
         byte[] secretId,
-        int version
+        ulong channelId,
+        int version,
+        byte[] sharedKey
     )
     {
         Native.Verification.GenerateVerificationRequestResult nativeResult =
             Native.Verification.generate_verification_request(
                 secretId,
                 (UIntPtr)secretId.Length,
-                version
+                channelId,
+                version,
+                sharedKey,
+                (UIntPtr)sharedKey.Length
             );
 
         try
         {
             Utils.ThrowIfError(nativeResult.Status);
 
-            byte[] requestBytes = Utils.CopyBuffer(nativeResult.VerifyShareRequestMessage);
-
-            return VerifyShareRequestMessage.Parser.ParseFrom(requestBytes);
+            return Utils.CopyBuffer(nativeResult.RequestWireBytes);
         }
         finally
         {
-            Utils.FreeBuffer(nativeResult.VerifyShareRequestMessage);
+            Utils.FreeBuffer(nativeResult.RequestWireBytes);
             Utils.FreeStatusMessage(nativeResult.Status);
         }
     }
 
-    public static VerifyShareResponseMessage GenerateVerificationResponse(
+    public static byte[] GenerateVerificationResponse(
         byte[] secretId,
         ulong channelId,
+        byte[] sharedKey,
         byte[] shareContent,
-        VerifyShareRequestMessage request
+        byte[] requestWireBytes
     )
     {
-        byte[] requestBytes = request.ToByteArray();
-
         Native.Verification.GenerateVerificationResponseResult nativeResult =
             Native.Verification.generate_verification_response(
                 secretId,
                 (UIntPtr)secretId.Length,
                 channelId,
+                sharedKey,
+                (UIntPtr)sharedKey.Length,
                 shareContent,
                 (UIntPtr)shareContent.Length,
-                requestBytes,
-                (UIntPtr)requestBytes.Length
+                requestWireBytes,
+                (UIntPtr)requestWireBytes.Length
             );
 
         try
         {
             Utils.ThrowIfError(nativeResult.Status);
 
-            byte[] responseBytes = Utils.CopyBuffer(nativeResult.VerifyShareResponseMessage);
-
-            return VerifyShareResponseMessage.Parser.ParseFrom(responseBytes);
+            return Utils.CopyBuffer(nativeResult.ResponseWireBytes);
         }
         finally
         {
-            Utils.FreeBuffer(nativeResult.VerifyShareResponseMessage);
+            Utils.FreeBuffer(nativeResult.ResponseWireBytes);
             Utils.FreeStatusMessage(nativeResult.Status);
         }
     }
@@ -72,21 +71,22 @@ public static class Verification
     public static bool VerifyShareResponse(
         byte[] secretId,
         ulong channelId,
+        byte[] sharedKey,
         byte[] shareContent,
-        VerifyShareResponseMessage response
+        byte[] responseWireBytes
     )
     {
-        byte[] responseBytes = response.ToByteArray();
-
         Native.Verification.VerifyShareResponseResult nativeResult =
             Native.Verification.verify_share_response(
                 secretId,
                 (UIntPtr)secretId.Length,
                 channelId,
+                sharedKey,
+                (UIntPtr)sharedKey.Length,
                 shareContent,
                 (UIntPtr)shareContent.Length,
-                responseBytes,
-                (UIntPtr)responseBytes.Length
+                responseWireBytes,
+                (UIntPtr)responseWireBytes.Length
             );
 
         try

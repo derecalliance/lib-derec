@@ -1,49 +1,95 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! WASM bindings for the DeRec pairing flow.
+//!
+//! These bindings expose the Rust pairing functions to JavaScript consumers in both
+//! browser and Node.js environments.
+//!
+//! # Binding model
+//!
+//! The pairing flow exchanges **raw bytes** at the public API boundary:
+//!
+//! - `create_contact_message` returns plain serialized `ContactMessage` bytes
+//! - `produce_pairing_request_message` accepts contact-message bytes and returns
+//!   serialized outer `DeRecMessage` bytes containing an encrypted inner `PairRequestMessage`
+//! - `produce_pairing_response_message` accepts serialized outer request bytes and returns
+//!   serialized outer response bytes containing an encrypted inner `PairResponseMessage`
+//! - `process_pairing_response_message` accepts contact bytes and response bytes and derives
+//!   the final shared pairing key
+//!
+//! Secret pairing state is serialized into opaque byte arrays so it can be stored and later
+//! passed back into subsequent pairing functions.
+
 use crate::{
     pairing,
     ts_bindings_utils::{js_error, js_error_from_lib},
 };
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
-use derec_proto::{ContactMessage, PairRequestMessage, PairResponseMessage, SenderKind};
-use prost::Message;
-
+use derec_proto::{SenderKind, TransportProtocol};
 use wasm_bindgen::prelude::*;
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct CreateContactMessageResult {
-    contact_message: Vec<u8>,
+struct CreateContactMessageResultJs {
+    /// Plain serialized `ContactMessage` protobuf bytes.
+    wire_bytes: Vec<u8>,
+    /// Serialized `PairingSecretKeyMaterial`.
     secret_key_material: Vec<u8>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct ProducePairingRequestMessage {
-    pair_request_message: Vec<u8>,
+struct ProducePairingRequestMessageResultJs {
+    /// Serialized outer `DeRecMessage` containing encrypted inner `PairRequestMessage`.
+    wire_bytes: Vec<u8>,
+    /// Serialized `PairingSecretKeyMaterial`.
     secret_key_material: Vec<u8>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct ProducePairingResponseMessage {
-    pair_response_message: Vec<u8>,
+struct TransportProtocolJs {
+    uri: String,
+    protocol: i32,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ProducePairingResponseMessageResultJs {
+    /// Serialized outer `DeRecMessage` containing encrypted inner `PairResponseMessage`.
+    wire_bytes: Vec<u8>,
+    /// Transport protocol extracted from the pairing request.
+    transport_protocol: TransportProtocolJs,
+    /// Final derived pairing shared key.
     pairing_shared_key: Vec<u8>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct ProcessPairingResponseMessage {
+struct ProcessPairingResponseMessageResultJs {
+    /// Final derived pairing shared key.
     pairing_shared_key: Vec<u8>,
 }
 
+/// Creates a serialized `ContactMessage` used to bootstrap pairing.
+///
+/// # Arguments
+///
+/// * `channel_id` - Channel identifier associated with the generated pairing material
+/// * `transport_uri` - Transport endpoint that the peer should use for subsequent traffic
+///
+/// # Returns
+///
+/// A JS object with:
+///
+/// - `wire_bytes`: serialized `ContactMessage` protobuf bytes
+/// - `secret_key_material`: serialized `PairingSecretKeyMaterial`
 #[wasm_bindgen]
 pub fn create_contact_message(channel_id: u64, transport_uri: &str) -> Result<JsValue, JsValue> {
     let pairing::CreateContactMessageResult {
-        contact_message,
+        wire_bytes,
         secret_key,
     } = pairing::create_contact_message(channel_id.into(), transport_uri)
         .map_err(js_error_from_lib)?;
 
-    let wrapper = CreateContactMessageResult {
-        contact_message: contact_message.encode_to_vec(),
+    let wrapper = CreateContactMessageResultJs {
+        wire_bytes,
         secret_key_material: serialize_pairing_secret_key_material(&secret_key)?,
     };
 
@@ -51,25 +97,42 @@ pub fn create_contact_message(channel_id: u64, transport_uri: &str) -> Result<Js
         .map_err(|e| js_error("WASM_SERIALIZE_ERROR", e.to_string()))
 }
 
+/// Produces a serialized pairing request envelope from a contact message.
+///
+/// This is the **responder-side** step: the party that received the out-of-band
+/// contact creates the pairing request.
+///
+/// # Arguments
+///
+/// * `kind` - Sender role encoded as:
+///   - `0` => `SharerNonRecovery`
+///   - `1` => `SharerRecovery`
+///   - `2` => `Helper`
+/// * `transport_uri` - Transport endpoint the responder can use to receive follow-up traffic
+/// * `contact_message_bytes` - Plain serialized `ContactMessage` bytes
+///
+/// # Returns
+///
+/// A JS object with:
+///
+/// - `wire_bytes`: serialized outer `DeRecMessage` bytes
+/// - `secret_key_material`: serialized responder-side `PairingSecretKeyMaterial`
 #[wasm_bindgen]
 pub fn produce_pairing_request_message(
-    channel_id: u64,
     kind: u32,
-    contact_message: &[u8],
+    transport_uri: &str,
+    contact_message_bytes: &[u8],
 ) -> Result<JsValue, JsValue> {
-    let contact_msg = ContactMessage::decode(contact_message)
-        .map_err(|e| js_error("PROTOBUF_DECODE", e.to_string()))?;
-
     let sender_kind = get_sender_kind(kind)?;
 
     let pairing::ProducePairingRequestMessageResult {
-        pair_request_message,
+        wire_bytes,
         secret_key,
-    } = pairing::produce_pairing_request_message(channel_id.into(), sender_kind, &contact_msg)
+    } = pairing::produce_pairing_request_message(sender_kind, transport_uri, contact_message_bytes)
         .map_err(js_error_from_lib)?;
 
-    let wrapper = ProducePairingRequestMessage {
-        pair_request_message: pair_request_message.encode_to_vec(),
+    let wrapper = ProducePairingRequestMessageResultJs {
+        wire_bytes,
         secret_key_material: serialize_pairing_secret_key_material(&secret_key)?,
     };
 
@@ -77,31 +140,49 @@ pub fn produce_pairing_request_message(
         .map_err(|e| js_error("WASM_SERIALIZE_ERROR", e.to_string()))
 }
 
+/// Produces a serialized pairing response envelope and derives the initiator-side shared key.
+///
+/// This is the **initiator-side** step: the party that originally created the contact
+/// processes the incoming pairing request and returns the pairing response.
+///
+/// # Arguments
+///
+/// * `kind` - Sender role encoded as:
+///   - `0` => `SharerNonRecovery`
+///   - `1` => `SharerRecovery`
+///   - `2` => `Helper`
+/// * `pair_request_wire_bytes` - Serialized outer `DeRecMessage` carrying encrypted inner request bytes
+/// * `pairing_secret_key_material` - Serialized initiator-side `PairingSecretKeyMaterial`
+///
+/// # Returns
+///
+/// A JS object with:
+///
+/// - `wire_bytes`: serialized outer `DeRecMessage` bytes carrying encrypted inner response bytes
+/// - `transport_protocol`: transport information extracted from the pairing request
+/// - `pairing_shared_key`: final shared pairing key
 #[wasm_bindgen]
 pub fn produce_pairing_response_message(
     kind: u32,
-    pair_request_message: &[u8],
+    pair_request_wire_bytes: &[u8],
     pairing_secret_key_material: &[u8],
 ) -> Result<JsValue, JsValue> {
-    let pair_request_msg = PairRequestMessage::decode(pair_request_message)
-        .map_err(|e| js_error("PROTOBUF_DECODE", e.to_string()))?;
-
-    let pairing_sk =
-        PairingSecretKeyMaterial::deserialize_uncompressed(&mut &pairing_secret_key_material[..])
-            .map_err(|e| js_error("SERIALIZATION_ERROR", e.to_string()))?;
+    let pairing_sk = deserialize_pairing_secret_key_material(pairing_secret_key_material)?;
 
     let pairing::ProducePairingResponseMessageResult {
-        pair_response_message,
+        wire_bytes,
+        transport_protocol,
         shared_key,
     } = pairing::produce_pairing_response_message(
         get_sender_kind(kind)?,
-        &pair_request_msg,
+        pair_request_wire_bytes,
         &pairing_sk,
     )
     .map_err(js_error_from_lib)?;
 
-    let wrapper = ProducePairingResponseMessage {
-        pair_response_message: pair_response_message.encode_to_vec(),
+    let wrapper = ProducePairingResponseMessageResultJs {
+        wire_bytes,
+        transport_protocol: transport_protocol_to_js(&transport_protocol),
         pairing_shared_key: shared_key.to_vec(),
     };
 
@@ -109,26 +190,40 @@ pub fn produce_pairing_response_message(
         .map_err(|e| js_error("WASM_SERIALIZE_ERROR", e.to_string()))
 }
 
+/// Processes a serialized pairing response envelope and derives the responder-side shared key.
+///
+/// This is the **responder-side** finalization step: the party that created the pairing request
+/// processes the pairing response and derives the same final shared key.
+///
+/// # Arguments
+///
+/// * `contact_message_bytes` - Plain serialized `ContactMessage` bytes
+/// * `pair_response_wire_bytes` - Serialized outer `DeRecMessage` carrying encrypted inner response bytes
+/// * `pairing_secret_key_material` - Serialized responder-side `PairingSecretKeyMaterial`
+///
+/// # Returns
+///
+/// A JS object with:
+///
+/// - `pairing_shared_key`: final shared pairing key
 #[wasm_bindgen]
 pub fn process_pairing_response_message(
-    contact_message: &[u8],
-    pair_response_message: &[u8],
+    contact_message_bytes: &[u8],
+    pair_response_wire_bytes: &[u8],
     pairing_secret_key_material: &[u8],
 ) -> Result<JsValue, JsValue> {
-    let contact_msg = ContactMessage::decode(contact_message)
-        .map_err(|e| js_error("PROTOBUF_DECODE", e.to_string()))?;
-    let pair_response_msg = PairResponseMessage::decode(pair_response_message)
-        .map_err(|e| js_error("PROTOBUF_DECODE", e.to_string()))?;
-    let pairing_sk =
-        PairingSecretKeyMaterial::deserialize_uncompressed(&mut &pairing_secret_key_material[..])
-            .map_err(|e| js_error("SERIALIZATION_ERROR", e.to_string()))?;
+    let pairing_sk = deserialize_pairing_secret_key_material(pairing_secret_key_material)?;
 
-    let lib_result =
-        pairing::process_pairing_response_message(&contact_msg, &pair_response_msg, &pairing_sk)
-            .map_err(js_error_from_lib)?;
+    let pairing::ProcessPairingResponseMessageResult { shared_key } =
+        pairing::process_pairing_response_message(
+            contact_message_bytes,
+            pair_response_wire_bytes,
+            &pairing_sk,
+        )
+        .map_err(js_error_from_lib)?;
 
-    let wrapper = ProcessPairingResponseMessage {
-        pairing_shared_key: lib_result.shared_key.to_vec(),
+    let wrapper = ProcessPairingResponseMessageResultJs {
+        pairing_shared_key: shared_key.to_vec(),
     };
 
     serde_wasm_bindgen::to_value(&wrapper)
@@ -141,14 +236,27 @@ fn serialize_pairing_secret_key_material(
     let mut buf = Vec::new();
     sk.serialize_uncompressed(&mut buf)
         .map_err(|e| js_error("SERIALIZATION_ERROR", format!("{e:?}")))?;
-
     Ok(buf)
+}
+
+fn deserialize_pairing_secret_key_material(
+    bytes: &[u8],
+) -> Result<PairingSecretKeyMaterial, JsValue> {
+    PairingSecretKeyMaterial::deserialize_uncompressed(&mut &bytes[..])
+        .map_err(|e| js_error("SERIALIZATION_ERROR", e.to_string()))
+}
+
+fn transport_protocol_to_js(tp: &TransportProtocol) -> TransportProtocolJs {
+    TransportProtocolJs {
+        uri: tp.uri.clone(),
+        protocol: tp.protocol,
+    }
 }
 
 fn get_sender_kind(kind: u32) -> Result<SenderKind, JsValue> {
     match kind {
-        0 => Ok(SenderKind::SharerNonRecovery),
-        1 => Ok(SenderKind::SharerRecovery),
+        0 => Ok(SenderKind::OwnerNonRecovery),
+        1 => Ok(SenderKind::OwnerRecovery),
         2 => Ok(SenderKind::Helper),
         _ => Err(js_error(
             "INVALID_SENDER_KIND",

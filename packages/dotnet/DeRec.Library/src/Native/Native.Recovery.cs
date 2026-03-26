@@ -9,14 +9,14 @@ internal static class Recovery
     internal struct GenerateShareRequestResult
     {
         public Status Status;
-        public Buffer GetShareRequestMessage;
+        public Buffer WireBytes;
     }
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct GenerateShareResponseResult
     {
         public Status Status;
-        public Buffer GetShareResponseMessage;
+        public Buffer WireBytes;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -31,7 +31,9 @@ internal static class Recovery
         ulong channelId,
         byte[] secretId,
         UIntPtr secretIdLen,
-        int version
+        int version,
+        byte[] sharedKey,
+        UIntPtr sharedKeyLen
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
@@ -39,10 +41,12 @@ internal static class Recovery
         ulong channelId,
         byte[] secretId,
         UIntPtr secretIdLen,
-        byte[] request,
-        UIntPtr requestLen,
-        byte[] shareContent,
-        UIntPtr shareContentLen
+        byte[] requestWireBytes,
+        UIntPtr requestWireBytesLen,
+        byte[] storedShareRequestWireBytes,
+        UIntPtr storedShareRequestWireBytesLen,
+        byte[] sharedKey,
+        UIntPtr sharedKeyLen
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]

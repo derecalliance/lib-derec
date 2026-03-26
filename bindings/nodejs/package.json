@@ -11,6 +11,6 @@
     "typescript": "^5.9.3"
   },
   "dependencies": {
-    "@derecalliance/derec-nodejs": "file:../../library/target/pkg-nodejs"
+    "@derec-alliance/nodejs": "file:../../library/target/pkg-nodejs"
   }
 }

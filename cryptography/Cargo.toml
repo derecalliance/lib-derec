@@ -1,6 +1,6 @@
 [package]
 name = "derec-cryptography"
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.6"
 edition = "2024"
 license = "Apache-2.0"
 description = "Cryptographic primitives used by the DeRec protocol implementation."
@@ -27,4 +27,6 @@ ark-bw6-761 = "0.5.0"
 ark-secp256k1 = "0.5.0"
 thiserror = "2.0.18"
 ml-kem = "0.2.3"
+
+k256 = { version = "0.13.4", features = ["ecdsa"] }
 

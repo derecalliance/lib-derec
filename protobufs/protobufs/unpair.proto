@@ -1,37 +1,105 @@
 /*
  * Copyright (c) DeRec Alliance and its Contributors.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *        http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
 import "result.proto";
 
 package org.derecalliance.derec.protobuf;
 
-// UnpairRequestMessage requests that the other party cease acting as a
-// helper and delete any information related to the sharer and their
-// relationship.
+// UnpairRequestMessage requests termination of the DeRec relationship
+// between two parties (Owner and Helper).
 //
-// Exceptions may apply for information that must be retained due to
-// regulatory requirements, service agreements, or other obligations.
+// # Context
+//
+// This message is used when:
+//
+// - the Owner no longer wants a Helper to store shares
+// - the Helper chooses to stop acting as a Helper
+// - the relationship must be terminated due to policy, failure, or user action
+//
+// # Semantics
+//
+// Upon receiving this message, the recipient MUST:
+//
+// - stop acting as a Helper for the corresponding channel
+// - cease all protocol interactions for that channel
+//
+// The recipient SHOULD:
+//
+// - delete all stored shares and related state for the Owner
+//
+// However, deletion MAY be subject to:
+//
+// - regulatory requirements
+// - contractual obligations
+// - service-specific retention policies
+//
+// # Effects on Protocol State
+//
+// After a successful unpair:
+//
+// - the channel is considered permanently closed
+// - the Owner MUST NOT rely on this Helper for recovery
+// - the Owner SHOULD reshare secrets with remaining Helpers if necessary
+//
+// # Idempotency
+//
+// This message is idempotent. Repeated unpair requests SHOULD result in
+// the same final state.
 message UnpairRequestMessage {
 
-  // Human-readable explanation for why the unpairing occurred.
+  // Optional human-readable explanation for the unpairing.
+  //
+  // This field is intended for logging, debugging, or user display.
+  // It MUST NOT be relied upon for protocol behavior.
   string memo = 1;
+
+  // Timestamp indicating when this message was created.
+  //
+  // This value is expressed in UTC and can be used for:
+  //
+  // - observability and logging
+  // - replay detection (in combination with sequence numbers)
+  // - timeout handling
+  google.protobuf.Timestamp timestamp = 2;
 }
 
-// UnpairResponseMessage is the response to an unpair request.
+// UnpairResponseMessage is the response to an UnpairRequestMessage.
+//
+// # Semantics
+//
+// This message indicates whether the recipient successfully processed
+// the unpair request.
+//
+// On success:
+//
+// - the relationship is considered terminated
+// - the recipient has ceased participation in the protocol for this channel
+//
+// On failure:
+//
+// - the relationship state is undefined and SHOULD be handled by the
+//   application (e.g., retry or escalate)
+//
+// # Idempotency
+//
+// Multiple identical unpair requests SHOULD produce consistent responses.
 message UnpairResponseMessage {
-  Result result = 1;
+  // Result of processing the unpair request.
+  //
+  // Indicates whether the unpair operation was successfully completed.
+  DeRecResult result = 1;
+
+  // Timestamp indicating when this message was created.
+  //
+  // This value is expressed in UTC and can be used for:
+  //
+  // - observability and logging
+  // - replay detection (in combination with sequence numbers)
+  // - timeout handling
+  google.protobuf.Timestamp timestamp = 2;
 }

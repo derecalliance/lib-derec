@@ -25,6 +25,7 @@ lib-derec/
 ├── cryptography   # Cryptographic primitives used by the protocol
 ├── library        # Main SDK exposed to application developers
 ├── bindings/      # Example bindings and integration samples
+├── packages/      # Package wrappers for each SDK supported
 ```
 
 Most developers should interact only with `derec-library` crate. Other crates are internal components used by the SDK.

@@ -9,7 +9,7 @@ internal static class Pairing
     internal struct CreateContactMessageResult
     {
         public Status Status;
-        public Buffer ContactMessage;
+        public Buffer ContactWireBytes;
         public Buffer SecretKeyMaterial;
     }
 
@@ -17,7 +17,7 @@ internal static class Pairing
     internal struct ProducePairingRequestMessageResult
     {
         public Status Status;
-        public Buffer PairRequestMessage;
+        public Buffer RequestWireBytes;
         public Buffer SecretKeyMaterial;
     }
 
@@ -25,7 +25,8 @@ internal static class Pairing
     internal struct ProducePairingResponseMessageResult
     {
         public Status Status;
-        public Buffer PairResponseMessage;
+        public Buffer ResponseWireBytes;
+        public Buffer TransportProtocol;
         public Buffer SharedKey;
     }
 
@@ -45,28 +46,29 @@ internal static class Pairing
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern ProducePairingRequestMessageResult produce_pairing_request_message(
-        ulong channelId,
-        int peerStatus,
-        byte[] contactMessage,
-        UIntPtr contactMessageLen
+        int senderKind,
+        byte[] transportUri,
+        UIntPtr transportUriLen,
+        byte[] contactMessageBytes,
+        UIntPtr contactMessageBytesLen
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern ProducePairingResponseMessageResult produce_pairing_response_message(
-        int peerStatus,
-        byte[] pairRequestMessage,
-        UIntPtr pairRequestMessageLen,
-        byte[] secretKeyMaterial,
-        UIntPtr secretKeyMaterialLen
+        int senderKind,
+        byte[] pairRequestWireBytes,
+        UIntPtr pairRequestWireBytesLen,
+        byte[] pairingSecretKeyMaterial,
+        UIntPtr pairingSecretKeyMaterialLen
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern ProcessPairingResponseMessageResult process_pairing_response_message(
-        byte[] contactMessage,
-        UIntPtr contactMessageLen,
-        byte[] pairResponseMessage,
-        UIntPtr pairResponseMessageLen,
-        byte[] secretKeyMaterial,
-        UIntPtr secretKeyMaterialLen
+        byte[] contactMessageBytes,
+        UIntPtr contactMessageBytesLen,
+        byte[] pairResponseWireBytes,
+        UIntPtr pairResponseWireBytesLen,
+        byte[] pairingSecretKeyMaterial,
+        UIntPtr pairingSecretKeyMaterialLen
     );
 }

@@ -1,84 +1,156 @@
 /*
  * Copyright (c) DeRec Alliance and its Contributors.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *        http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 syntax = "proto3";
-import "result.proto";
-import "parameterrange.proto";
+
 import "google/protobuf/timestamp.proto";
+import "result.proto";
 
 package org.derecalliance.derec.protobuf;
 
-// StoreShareRequestMessage requests that the helper store the provided share
-// and remove any share versions not listed in keepList.
+// StoreShareRequestMessage instructs a Helper to store a share for a given
+// secret and manage the set of retained share versions.
 //
-// If the share field is present, the helper is requested to store this
-// version of the share. If the helper already stores this version, the
-// request replaces the existing share. It is an error on the part of the
-// sharer if two shares with the same version number and secret ID differ.
+// # Context
 //
-// If the keepList field is present, it updates the list of versions that
-// must be retained. Any version not in the list should be deleted.
+// This message is used in the sharing flow when:
 //
-// If keepList is absent, the helper should continue using the existing
-// keepList but add the newly received share version to the list.
+// - a new secret is created
+// - an existing secret is updated
+// - the helper set or recovery threshold changes
 //
-// The keepList must be ignored if the version is less than the latest
-// version already stored, in order to prevent replay attacks that could
-// delete newer shares.
+// The Owner sends this message to each Helper to:
+//
+// - store (or replace) a specific share version
+// - update the set of versions that must be retained (keepList)
+//
+// # Semantics
+//
+// This message may carry two independent instructions:
+//
+// 1. Share storage/update:
+//    - If `share` is present, the Helper MUST store this share under the
+//      specified `version`
+//    - If the version already exists, the Helper MUST replace it
+//
+// 2. Retention policy update:
+//    - If `keepList` is present, it defines the complete set of versions
+//      that MUST be retained
+//    - Any stored version not in `keepList` SHOULD be deleted
+//
+// If `keepList` is absent:
+//
+// - The Helper MUST preserve the existing keepList
+// - The Helper MUST add the new `version` to the retained set
+//
+// # Consistency Requirements
+//
+// The Owner MUST ensure that for a given (secretId, version):
+//
+// - all Helpers receive identical share contents
+//
+// It is an error for different shares to be associated with the same
+// version and secretId.
+//
+// # Replay Protection
+//
+// To prevent replay attacks:
+//
+// - If `version` is less than the latest stored version,
+//   the Helper MUST ignore the `keepList` field
+//
+// This ensures that stale messages cannot cause deletion of newer shares.
+//
+// # Share Opacity
+//
+// The Helper MUST treat the `share` field as opaque data. It is not required
+// to understand or validate the share contents.
+//
+// # Idempotency
+//
+// This message is idempotent:
+//
+// - Re-sending the same (version, share) pair SHOULD result in the same state
+// - Re-applying the same keepList SHOULD not change state after the first time
 message StoreShareRequestMessage {
 
-  // The share bytes that the sharer is requesting the helper to store.
+  // Share bytes to be stored by the Helper.
   //
-  // The helper does not need to know the details of the algorithm used to
-  // construct the share and MUST treat it as an opaque byte string.
+  // This is an opaque byte array produced by the share distribution
+  // algorithm. The Helper MUST store it without interpretation.
   bytes share = 1;
 
-  // Identifier for the algorithm used to produce the share bytes (field 1).
+  // Identifier of the algorithm used to produce the share.
   //
-  // For interoperability purposes, there may be a registry of identifiers
-  // and corresponding protobuf definitions describing the structure of
-  // the share contents.
+  // This allows the Owner and Helper to coordinate on how the share
+  // should be interpreted during recovery.
   //
-  // Share algorithm 0 defines the share bytes as the serialized protobuf
-  // message `CommittedDeRecShare`, defined in the DeRec Alliance
-  // cryptography repository.
+  // Algorithm 0 defines the share as a serialized `CommittedDeRecShare`
+  // protobuf message (see DeRec cryptography repository).
   //
-  // Implementations are encouraged to support at least this algorithm to
-  // improve interoperability between different sharer implementations.
+  // Implementations SHOULD support algorithm 0 for interoperability.
   int32 shareAlgorithm = 2;
 
-  // Version number of the share (the secretId is provided in the
-  // enclosing DeRecMessage).
+  // Version number of the share.
+  //
+  // Each resharing event increments this value. The secretId is provided
+  // in the enclosing DeRecMessage.
   int32 version = 3;
 
-  // List of share versions that the helper must retain, including the
-  // current version. Any version not listed here should be deleted.
+  // List of share versions that MUST be retained by the Helper.
+  //
+  // Any stored version not included in this list SHOULD be deleted.
+  //
+  // If absent, the Helper MUST:
+  //
+  // - retain the existing keepList
+  // - add the current `version` to the retained set
+  //
+  // This field MUST be ignored if `version` is older than the latest
+  // version already stored, to prevent replay attacks.
   repeated int32 keepList = 4;
 
-  // Optional description of the share version.
+  // Optional human-readable description of this share version.
   //
-  // This field is not encrypted and can be read by the helper. The sharer
-  // may leave it empty or include information they are comfortable
-  // revealing to the helper.
+  // This field is visible to the Helper and is not intended to carry
+  // sensitive information. It may be used for debugging, labeling, or
+  // user-facing display.
   string versionDescription = 5;
+
+  // Timestamp indicating when this message was created.
+  //
+  // Used for observability, replay detection, and timeout handling.
+  google.protobuf.Timestamp timestamp = 6;
 }
 
+// StoreShareResponseMessage is the response to a StoreShareRequestMessage.
+//
+// # Semantics
+//
+// This message indicates whether the Helper successfully:
+//
+// - stored or updated the requested share version
+// - applied the retention policy (keepList)
+//
+// # Idempotency
+//
+// Multiple identical requests SHOULD produce identical responses.
 message StoreShareResponseMessage {
-  Result result = 1;
 
-  // Version number from the corresponding share request message.
+  // Result of processing the request.
+  //
+  // Indicates success or failure of the storage/update operation.
+  DeRecResult result = 1;
+
+  // Version number from the corresponding request.
+  //
+  // This allows the sender to correlate responses with requests.
   int32 version = 2;
+
+  // Timestamp indicating when this message was created.
+  //
+  // Used for observability, replay detection, and timeout handling.
+  google.protobuf.Timestamp timestamp = 3;
 }

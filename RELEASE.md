@@ -125,23 +125,23 @@ npm publish --access public
 
 > [!INFO]
 > The --access public flag is required for scoped packages such as
-> @derecalliance/derec-nodejs.
+> @derec-alliance/nodejs.
 
 ### Verify Node.js release
 
 After publishing, confirm the new version is available:
-* https://www.npmjs.com/package/@derecalliance/derec-nodejs
+* https://www.npmjs.com/package/@derec-alliance/nodejs
 
 You can also verify using:
 
 ```bash
-npm view @derecalliance/derec-nodejs
+npm view @derec-alliance/nodejs
 ```
 
 Or install it in a test project:
 
 ```bash
-npm install @derecalliance/derec-nodejs
+npm install @derec-alliance/nodejs
 ```
 
 ---
@@ -178,23 +178,23 @@ npm publish --access public
 
 > [!INFO]
 > The --access public flag is required for scoped packages such as
-> @derecalliance/derec-web.
+> @derec-alliance/web.
 
 ### Verify Node.js release
 
 After publishing, confirm the new version is available:
-* https://www.npmjs.com/package/@derecalliance/derec-web
+* https://www.npmjs.com/package/@derec-alliance/web
 
 You can also verify using:
 
 ```bash
-npm view @derecalliance/derec-web
+npm view @derec-alliance/web
 ```
 
 Or install it in a test project:
 
 ```bash
-npm install @derecalliance/derec-web
+npm install @derec-alliance/web
 ```
 
 ---

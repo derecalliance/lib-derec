@@ -1,21 +1,10 @@
 /*
  * Copyright (c) DeRec Alliance and its Contributors.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *        http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 syntax = "proto3";
+
 import "google/protobuf/timestamp.proto";
 import "pair.proto";
 import "unpair.proto";
@@ -27,86 +16,157 @@ import "error.proto";
 
 package org.derecalliance.derec.protobuf;
 
-// DeRecMessage is the top-level protocol envelope for all messages except
-// ContactMessage.
+// DeRecMessage is the top-level protocol envelope for all DeRec messages,
+// except ContactMessage which is exchanged out-of-band during pairing.
 //
-// This message is serialized as protobuf bytes, signed with the sender's
-// private signature key, and then encrypted with the receiver's public
-// encryption key. The signed-then-encrypted payload uses OpenPGP format.
-// The sender transmits the concatenation of the recipient key ID followed
-// by the signed-then-encrypted message. The key ID is a 32-bit signed
-// integer in big-endian format and identifies which encryption key the
-// recipient should use to decrypt the message.
+// This message represents the unit of communication between an Owner and a
+// Helper once a secure channel has been established. Every protocol exchange
+// (pairing, sharing, verification, recovery, etc.) is carried inside this
+// envelope.
 //
-// This envelope will usually contain only a single DeRec message. If it
-// contains more than one, it is equivalent to sending them individually
-// in the given order.
+// # Security Model
 //
-// This can contain multiple individual requests or responses, which are
-// guaranteed to arrive together and in order, allowing atomic execution
-// of several requests at once, such as updating a version and then
-// immediately asking for a listing of all known versions.
+// The DeRecMessage envelope itself is not responsible for confidentiality or
+// authenticity. Instead:
+//
+// - The `message` field contains encrypted bytes representing the inner message
+// - Encryption and signing are applied at the payload level prior to transport
+//
+// Implementations MUST ensure that:
+//
+// - The inner message is encrypted using the agreed channel keys
+// - The envelope metadata is treated as untrusted until the payload is verified
+//
+// # Semantics
+//
+// A DeRecMessage provides:
+//
+// - protocol versioning information for compatibility handling
+// - ordering guarantees via a monotonically increasing sequence number
+// - channel identification for routing and key selection
+// - a timestamp for replay protection and observability
+// - an encrypted payload containing exactly one protocol message
+//
+// The envelope is transport-agnostic and can be delivered over any supported
+// transport (e.g., HTTPS, message queues), as defined by TransportProtocol.
+//
+// # Ordering and Idempotency
+//
+// Communication follows a request/response pattern:
+//
+// - The Owner sends a request message
+// - The Helper replies with a corresponding response
+//
+// The `sequence` field is used to:
+//
+// - enforce message ordering
+// - detect duplicates or out-of-order delivery
+// - support replay protection
+//
+// Implementations SHOULD treat messages as idempotent and be resilient to
+// retries and duplicate deliveries.
+//
+// # Key Rotation
+//
+// The sequence number may also be used as a trigger for automatic key rotation.
+// When a configured threshold is reached, implementations MAY initiate a key
+// rotation flow to maintain forward secrecy.
+//
+// # Versioning
+//
+// The protocolVersionMajor and protocolVersionMinor fields allow peers to:
+//
+// - detect incompatible protocol versions
+// - apply backward-compatible parsing logic when possible
+//
+// Implementations MUST define behavior for handling version mismatches.
+//
+// # Payload Encoding
+//
+// The `message` field contains encrypted raw bytes. When decrypted, these bytes
+// MUST deserialize into a MessageBody, which contains exactly one concrete
+// protocol message.
+//
+// The oneof structure ensures that each DeRecMessage carries a single logical
+// operation.
 message DeRecMessage {
-  // DeRec protocol version number.
-  int32 protocolVersionMajor = 1;
-  int32 protocolVersionMinor = 2;
-
-  // SHA-384 hash of the sender's public key, used to identify the sender
-  // and the key.
-  bytes sender = 3;
-
-  // SHA-384 hash of the receiver's public key, used to prevent
-  // signature-replacement attacks.
-  bytes receiver = 4;
-
-  // Secret ID, with any length from 1 to 16 bytes.
+  // DeRec protocol major version.
   //
-  // Must be unique for each secret created by a sharer.
-  bytes secretId = 5;
+  // Incremented for breaking changes that are not backward compatible.
+  uint32 protocolVersionMajor = 1;
 
-  // UTC timestamp indicating when the sender created this message.
-  google.protobuf.Timestamp timestamp = 6;
+  // DeRec protocol minor version.
+  //
+  // Incremented for backward-compatible changes such as adding new fields
+  // or message types.
+  uint32 protocolVersionMinor = 2;
 
-  // Message body containing one of the possible DeRec message groups.
-  MessageBodies messageBodies = 7;
+  // Monotonically increasing message sequence number.
+  //
+  // This value increments by 1 for each message sent on a given channel.
+  // It is used to:
+  //
+  // - enforce ordering
+  // - detect duplicates or missing messages
+  // - support replay protection
+  //
+  // Implementations MAY also use this value to trigger automatic key rotation
+  // once a predefined threshold is reached.
+  uint32 sequence = 3;
 
-  message MessageBodies {
-    oneof messages {
-      HelperMessageBodies helperMessageBodies = 1;
-      SharerMessageBodies sharerMessageBodies = 2;
-    }
-  }
+  // Channel identifier associated with this communication session.
+  //
+  // This value uniquely identifies the logical channel between an Owner and
+  // a Helper for a given secret. It is established during pairing and used
+  // thereafter to:
+  //
+  // - route messages to the correct channel state
+  // - select the appropriate cryptographic keys
+  //
+  // This MUST match the channelId exchanged during the ContactMessage phase.
+  uint64 channelId = 4;
 
-  // Contains one or more DeRec message bodies sent by a sharer.
-  message SharerMessageBodies {
-    repeated SharerMessageBody sharerMessageBody= 1;
-  }
+  // Timestamp indicating when the sender created this message.
+  //
+  // This value is expressed in UTC and can be used for:
+  //
+  // - replay detection
+  // - timeout handling
+  // - logging and observability
+  //
+  // Implementations SHOULD NOT rely solely on this value for security-critical
+  // decisions without additional protections.
+  google.protobuf.Timestamp timestamp = 5;
 
-  message SharerMessageBody {
+  // Encrypted message payload.
+  //
+  // This field contains the encrypted bytes of a serialized MessageBody.
+  // The encryption scheme and key material are defined by the pairing process
+  // and subsequent key management flows.
+  //
+  // Upon decryption, this field MUST deserialize into a valid MessageBody
+  // containing exactly one protocol message.
+  bytes message = 6;
+
+  // MessageBody defines all possible DeRec protocol messages that can be
+  // transported inside the DeRecMessage envelope.
+  //
+  // Exactly one of the fields MUST be set when constructing a message.
+  message MessageBody {
     oneof body {
       PairRequestMessage pairRequestMessage = 1;
-      UnpairRequestMessage unpairRequestMessage = 2;
-      StoreShareRequestMessage storeShareRequestMessage = 3;
-      VerifyShareRequestMessage verifyShareRequestMessage = 4;
-      GetSecretIdsVersionsRequestMessage getSecretIdsVersionsRequestMessage = 5;
-      GetShareRequestMessage getShareRequestMessage = 6;
-    }
-  }
-
-  // Contains one or more DeRec message bodies sent by a helper.
-  message HelperMessageBodies {
-    repeated HelperMessageBody helperMessageBody= 1;
-  }
-
-  message HelperMessageBody {
-    oneof body {
-      PairResponseMessage pairResponseMessage = 1;
-      UnpairResponseMessage unpairResponseMessage = 2;
-      StoreShareResponseMessage storeShareResponseMessage = 3;
-      VerifyShareResponseMessage verifyShareResponseMessage = 4;
-      GetSecretIdsVersionsResponseMessage getSecretIdsVersionsResponseMessage = 5;
-      GetShareResponseMessage getShareResponseMessage = 6;
-      ErrorResponseMessage errorResponseMessage = 7;
+      PairResponseMessage pairResponseMessage = 2;
+      UnpairRequestMessage unpairRequestMessage = 3;
+      UnpairResponseMessage unpairResponseMessage = 4;
+      StoreShareRequestMessage storeShareRequestMessage = 5;
+      StoreShareResponseMessage storeShareResponseMessage = 6;
+      VerifyShareRequestMessage verifyShareRequestMessage = 7;
+      VerifyShareResponseMessage verifyShareResponseMessage = 8;
+      GetSecretIdsVersionsRequestMessage getSecretIdsVersionsRequestMessage = 9;
+      GetSecretIdsVersionsResponseMessage getSecretIdsVersionsResponseMessage = 10;
+      GetShareRequestMessage getShareRequestMessage = 11;
+      GetShareResponseMessage getShareResponseMessage = 12;
+      ErrorResponseMessage errorResponseMessage = 13;
     }
   }
 }
