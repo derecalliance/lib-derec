@@ -1,10 +1,10 @@
 [package]
 name = "derec-proto"
-version = "0.0.1-alpha.5"
+version = "0.0.1-alpha.6"
 edition = "2024"
 license = "Apache-2.0"
 description = "Generated Rust protobuf types for the DeRec protocol."
-repository = "https://github.com/derecalliance/lib-derec"
+repository = "git+https://github.com/derecalliance/lib-derec"
 documentation = "https://docs.rs/derec-proto"
 readme = "README.md"
 keywords = ["derec", "recovery", "decentralized", "protobuf", "protocol"]

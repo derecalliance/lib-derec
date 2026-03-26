@@ -1,21 +1,21 @@
 # DeRec Web SDK
 
-Browser WebAssembly bindings for `derec-library`, the Rust SDK for the DeRec protocol.
+Browser WebAssembly bindings for `derec-library`, the Rust SDK implementing the DeRec protocol.
 
-DeRec enables decentralized recovery of secrets by distributing encrypted shares to trusted helpers.
+DeRec enables decentralized recovery of secrets by distributing encrypted shares across trusted helpers.
 
 ---
 
 ## Installation
 
 ```bash
-npm install @derecalliance/derec-web
+npm install @derec-alliance/web
 ```
 
 or with yarn:
 
 ```bash
-yarn add @derecalliance/derec-web
+yarn add @derec-alliance/web
 ```
 
 ---
@@ -24,9 +24,9 @@ yarn add @derecalliance/derec-web
 
 - Modern browser with WebAssembly support
 - ES module support
-- TypeScript optional
+- TypeScript (optional)
 
-No additional native dependencies are required.
+No native dependencies are required.
 
 ---
 
@@ -34,26 +34,43 @@ No additional native dependencies are required.
 
 The Web SDK is a **thin binding layer** over the Rust implementation.
 
-All of the following are handled internally in Rust:
+All core logic is executed in Rust:
 
 - Protobuf serialization / deserialization
-- Encryption / decryption
+- Cryptography (pairing, encryption, verification)
 - DeRecMessage envelope construction
 - Protocol validation
 
-The JavaScript API operates exclusively on **opaque `Uint8Array` wire payloads**.
+The JavaScript API operates exclusively on:
+
+```ts
+Uint8Array
+```
+
+These represent **opaque wire-level protocol messages**.
+
+---
+
+## Initialization
+
+```ts
+import init from "@derec-alliance/web";
+
+await init();
+```
 
 ---
 
 ## Quick Example
 
 ```ts
-import init, * as derec from "@derecalliance/derec-web";
+import init, * as derec from "@derec-alliance/web";
 
 async function main() {
   await init();
 
   const version = derec.derec_protocol_version();
+
   console.log(version.major, version.minor);
 }
 
@@ -62,42 +79,38 @@ main();
 
 ---
 
-## Example: Pairing Flow
+## Pairing Flow
 
 ```ts
-import init, * as derec from "@derecalliance/derec-web";
+import init, * as derec from "@derec-alliance/web";
 
 async function main() {
   await init();
 
-  // Step 1: Owner creates contact message
   const contact = derec.create_contact_message(
     1n,
-    new TextEncoder().encode("wss://example.com")
+    new TextEncoder().encode("wss://owner.example.com")
   );
 
-  // Step 2: Helper produces pairing request
   const request = derec.produce_pairing_request_message(
-    2, // SenderKind.Helper
-    new TextEncoder().encode("wss://helper.com"),
+    2,
+    new TextEncoder().encode("wss://helper.example.com"),
     contact.wire_bytes
   );
 
-  // Step 3: Owner produces pairing response
   const response = derec.produce_pairing_response_message(
-    0, // SenderKind.SharerNonRecovery
+    0,
     request.wire_bytes,
     request.secret_key_material
   );
 
-  // Step 4: Helper processes response
-  const final = derec.process_pairing_response_message(
+  const result = derec.process_pairing_response_message(
     contact.wire_bytes,
     response.wire_bytes,
     request.secret_key_material
   );
 
-  console.log("Shared key length:", final.shared_key.length);
+  console.log("Shared key length:", result.shared_key.length);
 }
 
 main();
@@ -105,23 +118,22 @@ main();
 
 ---
 
-## Example: Share Distribution
+## Share Distribution (Sharing Flow)
 
 ```ts
-import init, * as derec from "@derecalliance/derec-web";
+import init, * as derec from "@derec-alliance/web";
 
 async function main() {
   await init();
 
   const result = derec.protect_secret(
-    new Uint8Array([1,2,3]),
+    new Uint8Array([1, 2, 3]),
     new TextEncoder().encode("super-secret"),
     [1n, 2n, 3n],
     2,
     1
   );
 
-  // Opaque wire bytes containing all share messages
   const shareMessages = result.share_message_wire_bytes_array;
 
   console.log(shareMessages);
@@ -132,27 +144,27 @@ main();
 
 ---
 
-## Example: Recovery Flow
+## Recovery Flow
 
 ```ts
-import init, * as derec from "@derecalliance/derec-web";
+import init, * as derec from "@derec-alliance/web";
 
 async function main() {
   await init();
 
   const request = derec.generate_share_request(
-    new Uint8Array([1,2,3]),
+    new Uint8Array([1, 2, 3]),
     1
   );
 
   const response = derec.generate_share_response(
     request,
-    new Uint8Array() // shareContent
+    new Uint8Array()
   );
 
   const secret = derec.recover_from_share_responses(
-    new Uint8Array(), // aggregated responses
-    new Uint8Array([1,2,3]),
+    new Uint8Array(),
+    new Uint8Array([1, 2, 3]),
     1
   );
 
@@ -164,26 +176,26 @@ main();
 
 ---
 
-## Example: Verification Flow
+## Verification Flow
 
 ```ts
-import init, * as derec from "@derecalliance/derec-web";
+import init, * as derec from "@derec-alliance/web";
 
 async function main() {
   await init();
 
   const request = derec.generate_verification_request(
-    new Uint8Array([1,2,3]),
+    new Uint8Array([1, 2, 3]),
     1
   );
 
   const response = derec.generate_verification_response(
-    new Uint8Array(), // shareContent
+    new Uint8Array(),
     request
   );
 
   const isValid = derec.verify_share_response(
-    new Uint8Array(), // shareContent
+    new Uint8Array(),
     request,
     response
   );
@@ -198,7 +210,7 @@ main();
 
 ## Usage with Bundlers
 
-Works with:
+Compatible with:
 
 - Vite
 - Webpack
@@ -206,23 +218,21 @@ Works with:
 - Next.js
 - Parcel
 
-Example:
-
 ```ts
-import init from "@derecalliance/derec-web";
+import init from "@derec-alliance/web";
 
 await init();
 ```
 
 ---
 
-## Loading from CDN
+## CDN Usage
 
 ```html
 <script type="module">
-import init from "https://cdn.jsdelivr.net/npm/@derecalliance/derec-web/+esm";
+  import init from "https://cdn.jsdelivr.net/npm/@derec-alliance/web/+esm";
 
-await init();
+  await init();
 </script>
 ```
 
@@ -236,9 +246,9 @@ derec_library.js
 derec_library.d.ts
 ```
 
-- `.wasm` – compiled Rust SDK
-- `.js` – bindings
-- `.d.ts` – TypeScript definitions
+- `.wasm` — compiled Rust core
+- `.js` — WASM bindings
+- `.d.ts` — TypeScript definitions
 
 ---
 
@@ -246,8 +256,8 @@ derec_library.d.ts
 
 - All protocol messages are opaque `Uint8Array`
 - No protobuf types are exposed
-- No cryptography is performed in JavaScript
-- Rust is the single source of truth for protocol logic
+- No cryptographic operations occur in JavaScript
+- Rust is the single source of truth
 
 ---
 
@@ -255,13 +265,12 @@ derec_library.d.ts
 
 - DeRec Alliance: https://derecalliance.org
 - Protocol specification: https://derec-alliance.gitbook.io/docs/protocol-specification/protocol-overview
-- Rust SDK repository: https://github.com/derecalliance/lib-derec
+- Rust SDK: https://github.com/derecalliance/lib-derec
 
 ---
 
 ## License
 
-Licensed under the Apache License, Version 2.0.
+Apache License 2.0
 
-See the `LICENSE` file for details.
-
+See `LICENSE` for details.

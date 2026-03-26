@@ -1,4 +1,4 @@
-#DeRec Rust SDK
+# DeRec Rust SDK
 
 ![Crates.io](https://img.shields.io/crates/v/derec-library)
 ![Docs.rs](https://docs.rs/derec-library/badge.svg)
@@ -48,7 +48,7 @@ Or manually in your `Cargo.toml`
 
 ```toml
 [dependencies]
-derec-library = "0.0.1-alpha.1"
+derec-library = "0.0.1-alpha.6"
 ```
 
 > [!WARNING]

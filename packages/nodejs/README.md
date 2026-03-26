@@ -1,21 +1,21 @@
 # DeRec NodeJS SDK
 
-Node.js bindings for `derec-library`, the Rust SDK for the DeRec protocol.
+Node.js bindings for `derec-library`, the Rust SDK implementing the DeRec protocol.
 
-DeRec enables decentralized recovery of secrets by distributing encrypted shares to trusted helpers.
+DeRec enables decentralized recovery of secrets by distributing encrypted shares across trusted helpers.
 
 ---
 
 ## Installation
 
 ```bash
-npm install @derecalliance/derec-nodejs
+npm install @derec-alliance/nodejs
 ```
 
 or with yarn:
 
 ```bash
-yarn add @derecalliance/derec-nodejs
+yarn add @derec-alliance/nodejs
 ```
 
 ---
@@ -23,9 +23,9 @@ yarn add @derecalliance/derec-nodejs
 ## Requirements
 
 - Node.js 18+
-- TypeScript optional
+- TypeScript (optional)
 
-No additional native dependencies are required.
+No native dependencies are required.
 
 ---
 
@@ -33,21 +33,27 @@ No additional native dependencies are required.
 
 The NodeJS SDK is a **thin binding layer** over the Rust implementation.
 
-All of the following are handled internally in Rust:
+All core logic is executed in Rust:
 
 - Protobuf serialization / deserialization
-- Encryption / decryption
+- Cryptography (pairing, encryption, verification)
 - DeRecMessage envelope construction
 - Protocol validation
 
-The JavaScript/TypeScript API operates exclusively on **opaque `Uint8Array` wire payloads**.
+The JavaScript / TypeScript API operates exclusively on:
+
+```ts
+Uint8Array
+```
+
+These represent **opaque wire-level protocol messages**.
 
 ---
 
 ## Quick Example
 
 ```ts
-import * as derec from "@derecalliance/derec-nodejs";
+import * as derec from "@derec-alliance/nodejs";
 
 const version = derec.derec_protocol_version();
 
@@ -56,21 +62,21 @@ console.log(version.major, version.minor);
 
 ---
 
-## Example: Pairing Flow
+## Pairing Flow
 
 ```ts
-import * as derec from "@derecalliance/derec-nodejs";
+import * as derec from "@derec-alliance/nodejs";
 
-// Step 1: Owner creates contact message
+// Step 1: Owner creates contact message (out-of-band)
 const contact = derec.create_contact_message(
   1n,
-  new TextEncoder().encode("wss://example.com")
+  new TextEncoder().encode("wss://owner.example.com")
 );
 
 // Step 2: Helper produces pairing request
 const request = derec.produce_pairing_request_message(
   2, // SenderKind.Helper
-  new TextEncoder().encode("wss://helper.com"),
+  new TextEncoder().encode("wss://helper.example.com"),
   contact.wire_bytes
 );
 
@@ -81,84 +87,86 @@ const response = derec.produce_pairing_response_message(
   request.secret_key_material
 );
 
-// Step 4: Helper processes response
-const final = derec.process_pairing_response_message(
+// Step 4: Helper processes response and derives shared key
+const result = derec.process_pairing_response_message(
   contact.wire_bytes,
   response.wire_bytes,
   request.secret_key_material
 );
 
-console.log("Shared key length:", final.shared_key.length);
+console.log("Shared key length:", result.shared_key.length);
 ```
 
 ---
 
-## Example: Share Distribution
+## Share Distribution (Sharing Flow)
 
 ```ts
-import * as derec from "@derecalliance/derec-nodejs";
+import * as derec from "@derec-alliance/nodejs";
 
 const result = derec.protect_secret(
-  new Uint8Array([1,2,3]),
-  new TextEncoder().encode("super-secret"),
-  [1n, 2n, 3n],
-  2,
-  1
+  new Uint8Array([1, 2, 3]),                // secret ID
+  new TextEncoder().encode("super-secret"), // secret bytes
+  [1n, 2n, 3n],                             // helper channel IDs
+  2,                                        // threshold
+  1                                         // version
 );
 
-// Opaque wire bytes containing all share messages
 const shareMessages = result.share_message_wire_bytes_array;
+
+console.log(shareMessages);
 ```
 
 ---
 
-## Example: Recovery Flow
+## Recovery Flow
 
 ```ts
-import * as derec from "@derecalliance/derec-nodejs";
+import * as derec from "@derec-alliance/nodejs";
 
-// Request a share
+// Owner requests shares from helpers
 const request = derec.generate_share_request(
-  new Uint8Array([1,2,3]),
-  1
+  new Uint8Array([1, 2, 3]), // secret ID
+  1                          // version
 );
 
-// Helper responds with share content
+// Helper responds with its share
 const response = derec.generate_share_response(
   request,
-  /* shareContent */ new Uint8Array()
+  new Uint8Array() // share content
 );
 
-// Owner aggregates responses and recovers secret
+// Owner reconstructs secret from aggregated responses
 const secret = derec.recover_from_share_responses(
-  /* aggregated responses */ new Uint8Array(),
-  new Uint8Array([1,2,3]),
+  new Uint8Array(), // aggregated responses
+  new Uint8Array([1, 2, 3]),
   1
 );
+
+console.log(secret);
 ```
 
 ---
 
-## Example: Verification Flow
+## Verification Flow
 
 ```ts
-import * as derec from "@derecalliance/derec-nodejs";
+import * as derec from "@derec-alliance/nodejs";
 
-// Owner generates verification request
+// Owner challenges helper
 const request = derec.generate_verification_request(
-  new Uint8Array([1,2,3]),
+  new Uint8Array([1, 2, 3]),
   1
 );
 
-// Helper produces response
+// Helper proves it still holds the share
 const response = derec.generate_verification_response(
-  /* shareContent */ new Uint8Array(),
+  new Uint8Array(), // share content
   request
 );
 
-// Owner verifies response
 const isValid = derec.verify_share_response(
-  /* shareContent */ new Uint8Array(),
+  new Uint8Array(), // share content
   request,
   response
 );
@@ -172,8 +180,8 @@ console.log("Valid:", isValid);
 
 - All protocol messages are opaque `Uint8Array`
 - No protobuf types are exposed
-- No cryptography is performed in JavaScript
-- Rust is the single source of truth for protocol logic
+- No cryptographic operations occur in JavaScript
+- Rust is the single source of truth
 
 ---
 
@@ -185,9 +193,9 @@ derec_library.js
 derec_library.d.ts
 ```
 
-- `.wasm` – compiled Rust SDK
-- `.js` – bindings
-- `.d.ts` – TypeScript definitions
+- `.wasm` — compiled Rust core
+- `.js` — bindings
+- `.d.ts` — TypeScript definitions
 
 ---
 
@@ -195,12 +203,12 @@ derec_library.d.ts
 
 - DeRec Alliance: https://derecalliance.org
 - Protocol specification: https://derec-alliance.gitbook.io/docs/protocol-specification/protocol-overview
-- Rust SDK repository: https://github.com/derecalliance/lib-derec
+- Rust SDK: https://github.com/derecalliance/lib-derec
 
 ---
 
 ## License
 
-Licensed under the Apache License, Version 2.0.
+Apache License 2.0
 
-See the `LICENSE` file for details.
+See `LICENSE` for details.

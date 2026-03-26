@@ -1,6 +1,10 @@
 {
   "name": "@derec-alliance/nodejs",
   "description": "Node.js WebAssembly bindings for derec-library, the Rust SDK for the DeRec protocol.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/derecalliance/lib-derec"
+  },
   "files": [
     "derec_library_bg.wasm",
     "derec_library_bg.wasm.d.ts",
