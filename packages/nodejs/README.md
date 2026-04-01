@@ -70,13 +70,13 @@ import * as derec from "@derec-alliance/nodejs";
 // Step 1: Owner creates contact message (out-of-band)
 const contact = derec.create_contact_message(
   1n,
-  new TextEncoder().encode("wss://owner.example.com")
+  { protocol: "https", uri: "https://owner.example.com" }
 );
 
 // Step 2: Helper produces pairing request
 const request = derec.produce_pairing_request_message(
   2, // SenderKind.Helper
-  new TextEncoder().encode("wss://helper.example.com"),
+  { protocol: "https", uri: "https://helper.example.com" },
   contact.wire_bytes
 );
 

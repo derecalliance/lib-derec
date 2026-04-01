@@ -1,6 +1,3 @@
-using System;
-using System.Text;
-
 namespace DeRec.Library;
 
 public static class Pairing
@@ -27,7 +24,7 @@ public static class Pairing
     public sealed class ProducePairingResponseMessageResult
     {
         public required byte[] WireBytes { get; init; }
-        public required byte[] TransportProtocolWireBytes { get; init; }
+        public required TransportProtocol ResponderTransportProtocol { get; init; }
         public required byte[] SharedKey { get; init; }
     }
 
@@ -36,15 +33,15 @@ public static class Pairing
         public required byte[] SharedKey { get; init; }
     }
 
-    public static CreateContactMessageResult CreateContactMessage(ulong channelId, string transportUri)
+    public static CreateContactMessageResult CreateContactMessage(ulong channelId, TransportProtocol transportProtocol)
     {
-        byte[] transportUriBytes = Encoding.UTF8.GetBytes(transportUri);
+        byte[] transportProtocolBytes = transportProtocol.ToProtoBytes();
 
         Native.Pairing.CreateContactMessageResult nativeResult =
             Native.Pairing.create_contact_message(
                 channelId,
-                transportUriBytes,
-                (UIntPtr)transportUriBytes.Length
+                transportProtocolBytes,
+                (UIntPtr)transportProtocolBytes.Length
             );
 
         try
@@ -70,17 +67,17 @@ public static class Pairing
 
     public static ProducePairingRequestMessageResult ProducePairingRequestMessage(
         SenderKind kind,
-        string transportUri,
+        TransportProtocol transportProtocol,
         byte[] contactMessageBytes
     )
     {
-        byte[] transportUriBytes = Encoding.UTF8.GetBytes(transportUri);
+        byte[] transportProtocolBytes = transportProtocol.ToProtoBytes();
 
         Native.Pairing.ProducePairingRequestMessageResult nativeResult =
             Native.Pairing.produce_pairing_request_message(
                 (int)kind,
-                transportUriBytes,
-                (UIntPtr)transportUriBytes.Length,
+                transportProtocolBytes,
+                (UIntPtr)transportProtocolBytes.Length,
                 contactMessageBytes,
                 (UIntPtr)contactMessageBytes.Length
             );
@@ -126,20 +123,20 @@ public static class Pairing
             Utils.ThrowIfError(nativeResult.Status);
 
             byte[] wireBytes = Utils.CopyBuffer(nativeResult.ResponseWireBytes);
-            byte[] transportProtocolWireBytes = Utils.CopyBuffer(nativeResult.TransportProtocol);
+            byte[] responderTransportProtocolBytes = Utils.CopyBuffer(nativeResult.ResponderTransportProtocol);
             byte[] sharedKey = Utils.CopyBuffer(nativeResult.SharedKey);
 
             return new ProducePairingResponseMessageResult
             {
                 WireBytes = wireBytes,
-                TransportProtocolWireBytes = transportProtocolWireBytes,
+                ResponderTransportProtocol = TransportProtocol.FromProtoBytes(responderTransportProtocolBytes),
                 SharedKey = sharedKey,
             };
         }
         finally
         {
             Utils.FreeBuffer(nativeResult.ResponseWireBytes);
-            Utils.FreeBuffer(nativeResult.TransportProtocol);
+            Utils.FreeBuffer(nativeResult.ResponderTransportProtocol);
             Utils.FreeBuffer(nativeResult.SharedKey);
             Utils.FreeStatusMessage(nativeResult.Status);
         }

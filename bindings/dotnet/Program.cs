@@ -36,7 +36,7 @@ internal static class Program
 
         ulong channelId = 1;
 
-        var contact = Pairing.CreateContactMessage(channelId, "https://example.com/alice");
+        var contact = Pairing.CreateContactMessage(channelId, new TransportProtocol("https://example.com/alice"));
 
         Console.WriteLine($"contact.wire_bytes = {contact.WireBytes.Length}");
         Console.WriteLine($"contact.secret_key_material bytes = {contact.SecretKeyMaterial.Length}");
@@ -53,7 +53,7 @@ internal static class Program
 
         var pairRequest = Pairing.ProducePairingRequestMessage(
             Pairing.SenderKind.Helper,
-            "https://example.com/helper",
+            new TransportProtocol("https://example.com/helper"),
             contact.WireBytes
         );
 
@@ -78,7 +78,8 @@ internal static class Program
 
         Console.WriteLine($"pair_response.wire_bytes = {pairResponse.WireBytes.Length}");
         Console.WriteLine($"pair_response.shared_key bytes = {pairResponse.SharedKey.Length}");
-        Console.WriteLine($"pair_response.transport_protocol wire bytes = {pairResponse.TransportProtocolWireBytes.Length}");
+        Console.WriteLine($"pair_response.responder_transport_protocol.uri = {pairResponse.ResponderTransportProtocol.Uri}");
+        Console.WriteLine($"pair_response.responder_transport_protocol.protocol = {pairResponse.ResponderTransportProtocol.Protocol}");
 
         if (pairResponse.WireBytes.Length == 0)
         {

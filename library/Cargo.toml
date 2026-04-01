@@ -1,6 +1,6 @@
 [package]
 name = "derec-library"
-version = "0.0.1-alpha.6"
+version = "0.0.1-alpha.7"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -27,7 +27,7 @@ derec-proto =  "0.0.1-alpha.6"
 prost = "0.14.3"
 prost-types = "0.14.3"
 rand = { version = "0.10.0", features = ["sys_rng"] }
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 serde = { version = "1.0", features = ["derive"] }
 ark-serialize = { version = "0.5.0", default-features = true }
 thiserror = "2.0.18"

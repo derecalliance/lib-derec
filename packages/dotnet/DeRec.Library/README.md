@@ -58,13 +58,13 @@ using DeRec.Library;
 // Step 1: Owner creates contact message
 var contact = Pairing.CreateContactMessage(
     channelId: 1,
-    transportUri: "wss://example.com"
+    transportProtocol: new TransportProtocol("https://example.com")
 );
 
 // Step 2: Helper produces pairing request
 var request = Pairing.ProducePairingRequestMessage(
     kind: Pairing.SenderKind.Helper,
-    transportUri: "wss://helper.com",
+    transportProtocol: new TransportProtocol("https://helper.com"),
     contactMessageBytes: contact.WireBytes
 );
 

@@ -26,7 +26,7 @@ internal static class Pairing
     {
         public Status Status;
         public Buffer ResponseWireBytes;
-        public Buffer TransportProtocol;
+        public Buffer ResponderTransportProtocol;
         public Buffer SharedKey;
     }
 
@@ -40,15 +40,15 @@ internal static class Pairing
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern CreateContactMessageResult create_contact_message(
         ulong channelId,
-        byte[] transportUri,
-        UIntPtr transportUriLen
+        byte[] transportProtocolBytes,
+        UIntPtr transportProtocolBytesLen
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern ProducePairingRequestMessageResult produce_pairing_request_message(
         int senderKind,
-        byte[] transportUri,
-        UIntPtr transportUriLen,
+        byte[] transportProtocolBytes,
+        UIntPtr transportProtocolBytesLen,
         byte[] contactMessageBytes,
         UIntPtr contactMessageBytesLen
     );

@@ -11,7 +11,7 @@ use crate::{
 };
 use derec_cryptography::pairing;
 use derec_proto::{
-    ContactMessage, DeRecMessage, DeRecResult, PairRequestMessage, PairResponseMessage, Protocol,
+    ContactMessage, DeRecMessage, DeRecResult, PairRequestMessage, PairResponseMessage,
     SenderKind, StatusEnum, TransportProtocol,
 };
 use prost::Message;
@@ -41,8 +41,9 @@ use rand::{Rng, rng};
 /// * `channel_id` - Identifier associated with the generated pairing key material.
 ///   This value is embedded into the contact and later copied into pairing messages
 ///   so the peer can associate the session with the correct channel.
-/// * `transport_uri` - Transport endpoint the peer should use for subsequent DeRec
-///   protocol messages after reading the contact. Must not be empty or whitespace-only.
+/// * `transport_protocol` - Transport endpoint and protocol the peer should use for
+///   subsequent DeRec protocol messages after reading the contact.
+///   The `uri` field must not be empty or whitespace-only.
 ///
 /// # Returns
 ///
@@ -55,7 +56,7 @@ use rand::{Rng, rng};
 ///
 /// Returns [`crate::Error`] (specifically `Error::Pairing(...)`) in the following cases:
 ///
-/// - `PairingError::EmptyTransportUri` if `transport_uri` is empty or whitespace
+/// - `PairingError::EmptyTransportUri` if `transport_protocol.uri` is empty or whitespace
 /// - `PairingError::ContactMessageKeygen { .. }` if pairing key generation fails
 ///
 /// # Security Notes
@@ -70,6 +71,7 @@ use rand::{Rng, rng};
 /// ```rust
 /// use derec_library::pairing::*;
 /// use derec_library::types::ChannelId;
+/// use derec_proto::{Protocol, TransportProtocol};
 ///
 /// let channel_id = ChannelId(42);
 ///
@@ -78,7 +80,10 @@ use rand::{Rng, rng};
 ///     secret_key,
 /// } = create_contact_message(
 ///     channel_id,
-///     "https://relay.example/derec",
+///     TransportProtocol {
+///         uri: "https://relay.example/derec".to_owned(),
+///         protocol: Protocol::Https.into(),
+///     },
 /// ).expect("Failed to create contact message");
 ///
 /// assert!(!wire_bytes.is_empty());
@@ -86,9 +91,9 @@ use rand::{Rng, rng};
 /// ```
 pub fn create_contact_message(
     channel_id: ChannelId,
-    transport_uri: &str,
+    transport_protocol: TransportProtocol,
 ) -> Result<CreateContactMessageResult, crate::Error> {
-    if transport_uri.trim().is_empty() {
+    if transport_protocol.uri.trim().is_empty() {
         return Err(PairingError::EmptyTransportUri.into());
     }
 
@@ -100,10 +105,7 @@ pub fn create_contact_message(
 
     let message = ContactMessage {
         channel_id: channel_id.into(),
-        transport_protocol: Some(TransportProtocol {
-            uri: transport_uri.to_owned(),
-            protocol: Protocol::Https.into(),
-        }),
+        transport_protocol: Some(transport_protocol),
         mlkem_encapsulation_key: pk.mlkem_encapsulation_key,
         ecies_public_key: pk.ecies_public_key,
         nonce: rng.next_u64(),
@@ -145,8 +147,8 @@ pub fn create_contact_message(
 ///
 /// * `kind` - Role of the sender within the DeRec protocol (for example
 ///   `SharerNonRecovery`, `SharerRecovery`, or `Helper`)
-/// * `transport_uri` - Transport URI the initiator can use for subsequent protocol
-///   traffic with this responder. Must not be empty or whitespace-only.
+/// * `transport_protocol` - Transport endpoint the initiator can use to reach this responder
+///   for subsequent protocol traffic. The `uri` field must not be empty or whitespace-only.
 /// * `contact_message_bytes` - Plain serialized [`ContactMessage`] received from the initiator
 ///
 /// # Returns
@@ -154,6 +156,8 @@ pub fn create_contact_message(
 /// On success returns [`ProducePairingRequestMessageResult`] containing:
 ///
 /// - `wire_bytes`: serialized outer [`derec_proto::DeRecMessage`] envelope bytes
+/// - `initiator_transport_protocol`: transport information extracted from the contact message,
+///   indicating how to reach the initiator for subsequent protocol traffic
 /// - `secret_key`: responder-side pairing secret state required later to derive the final
 ///   shared pairing key
 ///
@@ -162,8 +166,9 @@ pub fn create_contact_message(
 /// Returns [`crate::Error`] (specifically `Error::Pairing(...)`) in the following cases:
 ///
 /// - the provided contact bytes are not a valid [`ContactMessage`]
-/// - `PairingError::EmptyTransportUri` if `transport_uri` is empty or whitespace
-/// - `PairingError::InvalidContactMessage` if required contact fields are missing
+/// - `PairingError::EmptyTransportUri` if `transport_protocol.uri` is empty or whitespace
+/// - `PairingError::InvalidContactMessage` if required contact fields are missing or the
+///   contact transport protocol is absent or has an empty URI
 /// - `PairingError::PairRequestKeygen { .. }` if ML-KEM encapsulation or key generation fails
 /// - envelope construction or inner-message encryption fails
 ///
@@ -173,39 +178,49 @@ pub fn create_contact_message(
 /// - The inner pairing request is encrypted to the initiator’s public key
 /// - The outer `DeRecMessage` envelope is plain protobuf metadata and is not itself encrypted
 /// - The returned secret key material must be securely retained by the responder
+/// - The returned `initiator_transport_protocol` is peer-provided data; apply any
+///   caller-side validation required by the selected transport layer before using it
 ///
 /// # Example
 ///
 /// ```rust
 /// use derec_library::pairing::*;
-/// use derec_proto::SenderKind::Helper;
+/// use derec_proto::{Protocol, SenderKind::Helper, TransportProtocol};
 ///
 /// let CreateContactMessageResult {
 ///     wire_bytes: contact_message_bytes,
 ///     ..
 /// } = create_contact_message(
 ///     42.into(),
-///     "https://relay.example/derec",
+///     TransportProtocol {
+///         uri: "https://relay.example/derec".to_owned(),
+///         protocol: Protocol::Https.into(),
+///     },
 /// ).expect("Failed to create contact message");
 ///
 /// let ProducePairingRequestMessageResult {
 ///     wire_bytes,
+///     initiator_transport_protocol,
 ///     secret_key,
 /// } = produce_pairing_request_message(
 ///     Helper,
-///     "https://relay.example/responder",
+///     TransportProtocol {
+///         uri: "https://relay.example/responder".to_owned(),
+///         protocol: Protocol::Https.into(),
+///     },
 ///     &contact_message_bytes,
 /// ).expect("Failed to produce pairing request message");
 ///
 /// assert!(!wire_bytes.is_empty());
+/// assert_eq!(initiator_transport_protocol.uri, "https://relay.example/derec");
 /// let _ = secret_key;
 /// ```
 pub fn produce_pairing_request_message(
     kind: SenderKind,
-    transport_uri: &str,
+    transport_protocol: TransportProtocol,
     contact_message_bytes: &[u8],
 ) -> Result<ProducePairingRequestMessageResult, crate::Error> {
-    if transport_uri.trim().is_empty() {
+    if transport_protocol.uri.trim().is_empty() {
         return Err(PairingError::EmptyTransportUri.into());
     }
 
@@ -218,6 +233,18 @@ pub fn produce_pairing_request_message(
 
     if contact_message.ecies_public_key.is_empty() {
         return Err(PairingError::InvalidContactMessage("ecies_public_key is empty").into());
+    }
+
+    let initiator_transport_protocol =
+        contact_message
+            .transport_protocol
+            .clone()
+            .ok_or(PairingError::InvalidContactMessage(
+                "transport_protocol is missing",
+            ))?;
+
+    if initiator_transport_protocol.uri.trim().is_empty() {
+        return Err(PairingError::InvalidContactMessage("transport_protocol.uri is empty").into());
     }
 
     let contact_pk = pairing::PairingContactMessageMaterial {
@@ -240,10 +267,7 @@ pub fn produce_pairing_request_message(
         nonce: contact_message.nonce,
         communication_info: None,
         parameter_range: None,
-        transport_protocol: Some(TransportProtocol {
-            uri: transport_uri.to_owned(),
-            protocol: Protocol::Https.into(),
-        }),
+        transport_protocol: Some(transport_protocol),
         timestamp: Some(timestamp),
     };
 
@@ -257,6 +281,7 @@ pub fn produce_pairing_request_message(
 
     Ok(ProducePairingRequestMessageResult {
         wire_bytes,
+        initiator_transport_protocol,
         secret_key,
     })
 }
@@ -295,7 +320,7 @@ pub fn produce_pairing_request_message(
 /// - `wire_bytes`: serialized outer [`derec_proto::DeRecMessage`] envelope bytes carrying
 ///   the encrypted inner [`PairResponseMessage`]
 /// - `shared_key`: the initiator-side derived pairing shared key
-/// - `transport_protocol`: responder transport information extracted from the validated
+/// - `responder_transport_protocol`: responder transport information extracted from the validated
 ///   [`PairRequestMessage`]
 ///
 /// # Errors
@@ -314,21 +339,21 @@ pub fn produce_pairing_request_message(
 /// - The derived shared key should be treated as sensitive material
 /// - The inner response message is encrypted to the responder’s public key
 /// - The outer `DeRecMessage` envelope is plain protobuf metadata and is not itself encrypted
-/// - The returned `transport_protocol` is peer-provided data and should only be used after any
+/// - The returned `responder_transport_protocol` is peer-provided data and should only be used after any
 ///   caller-side validation required by the selected transport layer
 ///
 /// # Example
 ///
 /// ```rust
 /// use derec_library::pairing::*;
-/// use derec_proto::SenderKind::Helper;
+/// use derec_proto::{Protocol, SenderKind::Helper, TransportProtocol};
 ///
 /// let CreateContactMessageResult {
 ///     wire_bytes: contact_bytes,
 ///     secret_key: initiator_secret_key,
 /// } = create_contact_message(
 ///     42.into(),
-///     "https://relay.example/derec",
+///     TransportProtocol { uri: "https://relay.example/derec".to_owned(), protocol: Protocol::Https.into() },
 /// ).expect("Failed to create contact message");
 ///
 /// let ProducePairingRequestMessageResult {
@@ -336,14 +361,14 @@ pub fn produce_pairing_request_message(
 ///     ..
 /// } = produce_pairing_request_message(
 ///     Helper,
-///     "https://relay.example/responder",
+///     TransportProtocol { uri: "https://relay.example/responder".to_owned(), protocol: Protocol::Https.into() },
 ///     &contact_bytes,
 /// ).expect("Failed to produce pairing request message");
 ///
 /// let ProducePairingResponseMessageResult {
 ///     wire_bytes,
 ///     shared_key,
-///     transport_protocol,
+///     responder_transport_protocol,
 /// } = produce_pairing_response_message(
 ///     Helper,
 ///     &pair_request_wire_bytes,
@@ -351,7 +376,7 @@ pub fn produce_pairing_request_message(
 /// ).expect("Failed to produce pairing response message");
 ///
 /// assert!(!wire_bytes.is_empty());
-/// let _ = (shared_key, transport_protocol);
+/// let _ = (shared_key, responder_transport_protocol);
 /// ```
 pub fn produce_pairing_response_message(
     kind: SenderKind,
@@ -422,7 +447,7 @@ pub fn produce_pairing_response_message(
     Ok(ProducePairingResponseMessageResult {
         wire_bytes,
         shared_key,
-        transport_protocol,
+        responder_transport_protocol: transport_protocol,
     })
 }
 
@@ -483,22 +508,23 @@ pub fn produce_pairing_response_message(
 ///
 /// ```rust
 /// use derec_library::pairing::*;
-/// use derec_proto::SenderKind::Helper;
+/// use derec_proto::{Protocol, SenderKind::Helper, TransportProtocol};
 ///
 /// let CreateContactMessageResult {
 ///     wire_bytes: contact_bytes,
 ///     secret_key: initiator_secret_key,
 /// } = create_contact_message(
 ///     42.into(),
-///     "https://relay.example/derec",
+///     TransportProtocol { uri: "https://relay.example/derec".to_owned(), protocol: Protocol::Https.into() },
 /// ).expect("Failed to create contact message");
 ///
 /// let ProducePairingRequestMessageResult {
 ///     wire_bytes: request_bytes,
 ///     secret_key: responder_secret_key,
+///     ..
 /// } = produce_pairing_request_message(
 ///     Helper,
-///     "https://relay.example/responder",
+///     TransportProtocol { uri: "https://relay.example/responder".to_owned(), protocol: Protocol::Https.into() },
 ///     &contact_bytes,
 /// ).expect("Failed to produce pairing request message");
 ///

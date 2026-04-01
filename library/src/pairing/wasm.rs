@@ -7,9 +7,11 @@
 //!
 //! # Binding model
 //!
-//! The pairing flow exchanges **raw bytes** at the public API boundary:
+//! The pairing flow exchanges **raw bytes** at the public API boundary for wire messages,
+//! and **plain JS objects** for structured values like `TransportProtocol`:
 //!
-//! - `create_contact_message` returns plain serialized `ContactMessage` bytes
+//! - `create_contact_message` accepts a `TransportProtocol` JS object and returns plain
+//!   serialized `ContactMessage` bytes
 //! - `produce_pairing_request_message` accepts contact-message bytes and returns
 //!   serialized outer `DeRecMessage` bytes containing an encrypted inner `PairRequestMessage`
 //! - `produce_pairing_response_message` accepts serialized outer request bytes and returns
@@ -19,6 +21,16 @@
 //!
 //! Secret pairing state is serialized into opaque byte arrays so it can be stored and later
 //! passed back into subsequent pairing functions.
+//!
+//! # TransportProtocol representation
+//!
+//! `TransportProtocol` values are represented as plain JS objects at the boundary:
+//!
+//! ```json
+//! { "protocol": "https", "uri": "https://example.com/derec" }
+//! ```
+//!
+//! The `protocol` field is a lowercase string matching the enum variant name (e.g. `"https"`).
 
 use crate::{
     pairing,
@@ -41,6 +53,9 @@ struct CreateContactMessageResultJs {
 struct ProducePairingRequestMessageResultJs {
     /// Serialized outer `DeRecMessage` containing encrypted inner `PairRequestMessage`.
     wire_bytes: Vec<u8>,
+    /// Transport information extracted from the contact message, indicating how to reach
+    /// the initiator for subsequent protocol traffic.
+    initiator_transport_protocol: TransportProtocolJs,
     /// Serialized `PairingSecretKeyMaterial`.
     secret_key_material: Vec<u8>,
 }
@@ -48,7 +63,15 @@ struct ProducePairingRequestMessageResultJs {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct TransportProtocolJs {
     uri: String,
-    protocol: i32,
+    /// Lowercase protocol name (e.g. `"https"`).
+    protocol: String,
+}
+
+/// Input shape for `TransportProtocol` from JS: `{ protocol: "https", uri: "..." }`.
+#[derive(serde::Deserialize)]
+struct TransportProtocolInput {
+    uri: String,
+    protocol: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -56,7 +79,7 @@ struct ProducePairingResponseMessageResultJs {
     /// Serialized outer `DeRecMessage` containing encrypted inner `PairResponseMessage`.
     wire_bytes: Vec<u8>,
     /// Transport protocol extracted from the pairing request.
-    transport_protocol: TransportProtocolJs,
+    responder_transport_protocol: TransportProtocolJs,
     /// Final derived pairing shared key.
     pairing_shared_key: Vec<u8>,
 }
@@ -72,7 +95,8 @@ struct ProcessPairingResponseMessageResultJs {
 /// # Arguments
 ///
 /// * `channel_id` - Channel identifier associated with the generated pairing material
-/// * `transport_uri` - Transport endpoint that the peer should use for subsequent traffic
+/// * `transport_protocol` - Plain JS object `{ protocol: "https", uri: "https://..." }`
+///   describing the transport endpoint the peer should use for subsequent traffic
 ///
 /// # Returns
 ///
@@ -81,11 +105,16 @@ struct ProcessPairingResponseMessageResultJs {
 /// - `wire_bytes`: serialized `ContactMessage` protobuf bytes
 /// - `secret_key_material`: serialized `PairingSecretKeyMaterial`
 #[wasm_bindgen]
-pub fn create_contact_message(channel_id: u64, transport_uri: &str) -> Result<JsValue, JsValue> {
+pub fn create_contact_message(
+    channel_id: u64,
+    transport_protocol: JsValue,
+) -> Result<JsValue, JsValue> {
+    let transport_protocol = js_to_transport_protocol(transport_protocol)?;
+
     let pairing::CreateContactMessageResult {
         wire_bytes,
         secret_key,
-    } = pairing::create_contact_message(channel_id.into(), transport_uri)
+    } = pairing::create_contact_message(channel_id.into(), transport_protocol)
         .map_err(js_error_from_lib)?;
 
     let wrapper = CreateContactMessageResultJs {
@@ -108,7 +137,8 @@ pub fn create_contact_message(channel_id: u64, transport_uri: &str) -> Result<Js
 ///   - `0` => `SharerNonRecovery`
 ///   - `1` => `SharerRecovery`
 ///   - `2` => `Helper`
-/// * `transport_uri` - Transport endpoint the responder can use to receive follow-up traffic
+/// * `transport_protocol` - Plain JS object `{ protocol: "https", uri: "https://..." }`
+///   describing the responder's transport endpoint
 /// * `contact_message_bytes` - Plain serialized `ContactMessage` bytes
 ///
 /// # Returns
@@ -116,23 +146,28 @@ pub fn create_contact_message(channel_id: u64, transport_uri: &str) -> Result<Js
 /// A JS object with:
 ///
 /// - `wire_bytes`: serialized outer `DeRecMessage` bytes
+/// - `initiator_transport_protocol`: transport information extracted from the contact message,
+///   indicating how to reach the initiator for subsequent protocol traffic
 /// - `secret_key_material`: serialized responder-side `PairingSecretKeyMaterial`
 #[wasm_bindgen]
 pub fn produce_pairing_request_message(
     kind: u32,
-    transport_uri: &str,
+    transport_protocol: JsValue,
     contact_message_bytes: &[u8],
 ) -> Result<JsValue, JsValue> {
     let sender_kind = get_sender_kind(kind)?;
+    let transport_protocol = js_to_transport_protocol(transport_protocol)?;
 
     let pairing::ProducePairingRequestMessageResult {
         wire_bytes,
+        initiator_transport_protocol,
         secret_key,
-    } = pairing::produce_pairing_request_message(sender_kind, transport_uri, contact_message_bytes)
+    } = pairing::produce_pairing_request_message(sender_kind, transport_protocol, contact_message_bytes)
         .map_err(js_error_from_lib)?;
 
     let wrapper = ProducePairingRequestMessageResultJs {
         wire_bytes,
+        initiator_transport_protocol: transport_protocol_to_js(&initiator_transport_protocol),
         secret_key_material: serialize_pairing_secret_key_material(&secret_key)?,
     };
 
@@ -171,7 +206,7 @@ pub fn produce_pairing_response_message(
 
     let pairing::ProducePairingResponseMessageResult {
         wire_bytes,
-        transport_protocol,
+        responder_transport_protocol,
         shared_key,
     } = pairing::produce_pairing_response_message(
         get_sender_kind(kind)?,
@@ -182,7 +217,7 @@ pub fn produce_pairing_response_message(
 
     let wrapper = ProducePairingResponseMessageResultJs {
         wire_bytes,
-        transport_protocol: transport_protocol_to_js(&transport_protocol),
+        responder_transport_protocol: transport_protocol_to_js(&responder_transport_protocol),
         pairing_shared_key: shared_key.to_vec(),
     };
 
@@ -246,10 +281,32 @@ fn deserialize_pairing_secret_key_material(
         .map_err(|e| js_error("SERIALIZATION_ERROR", e.to_string()))
 }
 
+fn js_to_transport_protocol(val: JsValue) -> Result<TransportProtocol, JsValue> {
+    let input: TransportProtocolInput = serde_wasm_bindgen::from_value(val)
+        .map_err(|e| js_error("DECODE_ERROR", e.to_string()))?;
+    let protocol = match input.protocol.to_lowercase().as_str() {
+        "https" => 0,
+        other => {
+            return Err(js_error(
+                "INVALID_PROTOCOL",
+                format!("unknown protocol: {other}"),
+            ))
+        }
+    };
+    Ok(TransportProtocol {
+        uri: input.uri,
+        protocol,
+    })
+}
+
 fn transport_protocol_to_js(tp: &TransportProtocol) -> TransportProtocolJs {
+    let protocol = match tp.protocol {
+        0 => "https".to_owned(),
+        n => format!("unknown({n})"),
+    };
     TransportProtocolJs {
         uri: tp.uri.clone(),
-        protocol: tp.protocol,
+        protocol,
     }
 }
 

@@ -105,7 +105,10 @@ fn mismatch_envelope_timestamp(wire_bytes: &[u8]) -> Vec<u8> {
 
 #[test]
 fn test_create_contact_message_empty_transport_uri() {
-    let result = create_contact_message(ChannelId(42), "");
+    let result = create_contact_message(ChannelId(42), TransportProtocol {
+        uri: String::new(),
+        protocol: Protocol::Https.into(),
+    });
 
     assert!(matches!(
         result,
@@ -119,8 +122,11 @@ fn test_create_contact_message() {
     let transport_uri = "https://relay.example/alice";
 
     let CreateContactMessageResult { wire_bytes, .. } =
-        create_contact_message(channel_id, transport_uri)
-            .expect("failed to create contact message");
+        create_contact_message(channel_id, TransportProtocol {
+            uri: transport_uri.to_owned(),
+            protocol: Protocol::Https.into(),
+        })
+        .expect("failed to create contact message");
 
     let contact_msg = decode_contact_message(&wire_bytes);
 
@@ -153,7 +159,7 @@ fn test_produce_pairing_request_message_empty_mlkem_encapsulation_key() {
 
     let result = produce_pairing_request_message(
         SenderKind::Helper,
-        "https://relay.example/bob",
+        TransportProtocol { uri: "https://relay.example/bob".to_owned(), protocol: Protocol::Https.into() },
         &invalid_contact_msg.encode_to_vec(),
     );
 
@@ -180,7 +186,7 @@ fn test_produce_pairing_request_message_empty_ecies_public_key() {
 
     let result = produce_pairing_request_message(
         SenderKind::Helper,
-        "https://relay.example/bob",
+        TransportProtocol { uri: "https://relay.example/bob".to_owned(), protocol: Protocol::Https.into() },
         &invalid_contact_msg.encode_to_vec(),
     );
 
@@ -207,7 +213,7 @@ fn test_produce_pairing_request_message_empty_transport_uri() {
 
     let result = produce_pairing_request_message(
         SenderKind::Helper,
-        "",
+        TransportProtocol { uri: String::new(), protocol: Protocol::Https.into() },
         &invalid_contact_msg.encode_to_vec(),
     );
 
@@ -226,8 +232,11 @@ fn test_produce_pairing_request_message() {
     let CreateContactMessageResult {
         wire_bytes: contact_message_bytes,
         secret_key: alice_sk_state,
-    } = create_contact_message(channel_id, alice_transport_uri)
-        .expect("failed to create contact message");
+    } = create_contact_message(channel_id, TransportProtocol {
+        uri: alice_transport_uri.to_owned(),
+        protocol: Protocol::Https.into(),
+    })
+    .expect("failed to create contact message");
 
     let contact_message = decode_contact_message(&contact_message_bytes);
 
@@ -236,7 +245,7 @@ fn test_produce_pairing_request_message() {
         ..
     } = produce_pairing_request_message(
         SenderKind::Helper,
-        bob_transport_uri,
+        TransportProtocol { uri: bob_transport_uri.to_owned(), protocol: Protocol::Https.into() },
         &contact_message_bytes,
     )
     .expect("failed to produce pairing request message");
@@ -257,13 +266,43 @@ fn test_produce_pairing_request_message() {
 }
 
 #[test]
+fn test_produce_pairing_request_message_initiator_transport_protocol() {
+    let alice_transport_uri = "https://relay.example/alice";
+
+    let CreateContactMessageResult {
+        wire_bytes: contact_message_bytes,
+        ..
+    } = create_contact_message(ChannelId(42), TransportProtocol {
+        uri: alice_transport_uri.to_owned(),
+        protocol: Protocol::Https.into(),
+    })
+    .expect("failed to create contact message");
+
+    let ProducePairingRequestMessageResult {
+        initiator_transport_protocol,
+        ..
+    } = produce_pairing_request_message(
+        SenderKind::Helper,
+        TransportProtocol { uri: "https://relay.example/bob".to_owned(), protocol: Protocol::Https.into() },
+        &contact_message_bytes,
+    )
+    .expect("failed to produce pairing request message");
+
+    assert_eq!(initiator_transport_protocol.uri, alice_transport_uri);
+    assert_eq!(initiator_transport_protocol.protocol, Protocol::Https as i32);
+}
+
+#[test]
 fn test_produce_pairing_response_message_empty_mlkem_ciphertext() {
     let alice_channel_id = ChannelId(42);
 
     let CreateContactMessageResult {
         wire_bytes: alice_contact_bytes,
         secret_key: alice_sk_state,
-    } = create_contact_message(alice_channel_id, "https://relay.example/alice")
+    } = create_contact_message(alice_channel_id, TransportProtocol {
+        uri: "https://relay.example/alice".to_owned(),
+        protocol: Protocol::Https.into(),
+    })
         .expect("failed to create contact message");
 
     let alice_contact = decode_contact_message(&alice_contact_bytes);
@@ -309,7 +348,10 @@ fn test_produce_pairing_response_message_empty_ecies_public_key() {
     let CreateContactMessageResult {
         wire_bytes: alice_contact_bytes,
         secret_key: alice_sk_state,
-    } = create_contact_message(alice_channel_id, "https://relay.example/alice")
+    } = create_contact_message(alice_channel_id, TransportProtocol {
+        uri: "https://relay.example/alice".to_owned(),
+        protocol: Protocol::Https.into(),
+    })
         .expect("failed to create contact message");
 
     let alice_contact = decode_contact_message(&alice_contact_bytes);
@@ -355,7 +397,10 @@ fn test_produce_pairing_response_message_missing_transport_protocol() {
     let CreateContactMessageResult {
         wire_bytes: alice_contact_bytes,
         secret_key: alice_sk_state,
-    } = create_contact_message(alice_channel_id, "https://relay.example/alice")
+    } = create_contact_message(alice_channel_id, TransportProtocol {
+        uri: "https://relay.example/alice".to_owned(),
+        protocol: Protocol::Https.into(),
+    })
         .expect("failed to create contact message");
 
     let alice_contact = decode_contact_message(&alice_contact_bytes);
@@ -397,7 +442,10 @@ fn test_produce_pairing_response_message_empty_transport_uri() {
     let CreateContactMessageResult {
         wire_bytes: alice_contact_bytes,
         secret_key: alice_sk_state,
-    } = create_contact_message(alice_channel_id, "https://relay.example/alice")
+    } = create_contact_message(alice_channel_id, TransportProtocol {
+        uri: "https://relay.example/alice".to_owned(),
+        protocol: Protocol::Https.into(),
+    })
         .expect("failed to create contact message");
 
     let alice_contact = decode_contact_message(&alice_contact_bytes);
@@ -442,7 +490,10 @@ fn test_produce_pairing_response_message_rejects_envelope_timestamp_mismatch() {
     let CreateContactMessageResult {
         wire_bytes: alice_contact_bytes,
         secret_key: alice_sk_state,
-    } = create_contact_message(alice_channel_id, "https://relay.example/alice")
+    } = create_contact_message(alice_channel_id, TransportProtocol {
+        uri: "https://relay.example/alice".to_owned(),
+        protocol: Protocol::Https.into(),
+    })
         .expect("failed to create contact message");
 
     let ProducePairingRequestMessageResult {
@@ -450,7 +501,7 @@ fn test_produce_pairing_response_message_rejects_envelope_timestamp_mismatch() {
         ..
     } = produce_pairing_request_message(
         SenderKind::Helper,
-        "https://relay.example/bob",
+        TransportProtocol { uri: "https://relay.example/bob".to_owned(), protocol: Protocol::Https.into() },
         &alice_contact_bytes,
     )
     .expect("failed to produce valid pairing request");
@@ -477,15 +528,19 @@ fn test_process_pairing_response_message_missing_result() {
     let CreateContactMessageResult {
         wire_bytes: alice_contact_bytes,
         secret_key: alice_sk_state,
-    } = create_contact_message(alice_channel_id, "https://relay.example/alice")
+    } = create_contact_message(alice_channel_id, TransportProtocol {
+        uri: "https://relay.example/alice".to_owned(),
+        protocol: Protocol::Https.into(),
+    })
         .expect("failed to create contact message");
 
     let ProducePairingRequestMessageResult {
         wire_bytes: bob_request_bytes,
         secret_key: bob_sk_state,
+        ..
     } = produce_pairing_request_message(
         SenderKind::Helper,
-        "https://relay.example/bob",
+        TransportProtocol { uri: "https://relay.example/bob".to_owned(), protocol: Protocol::Https.into() },
         &alice_contact_bytes,
     )
     .expect("failed to produce valid pairing request");
@@ -528,15 +583,19 @@ fn test_process_pairing_response_message_result_non_ok() {
     let CreateContactMessageResult {
         wire_bytes: alice_contact_bytes,
         secret_key: alice_sk_state,
-    } = create_contact_message(alice_channel_id, "https://relay.example/alice")
+    } = create_contact_message(alice_channel_id, TransportProtocol {
+        uri: "https://relay.example/alice".to_owned(),
+        protocol: Protocol::Https.into(),
+    })
         .expect("failed to create contact message");
 
     let ProducePairingRequestMessageResult {
         wire_bytes: bob_request_bytes,
         secret_key: bob_sk_state,
+        ..
     } = produce_pairing_request_message(
         SenderKind::Helper,
-        "https://relay.example/bob",
+        TransportProtocol { uri: "https://relay.example/bob".to_owned(), protocol: Protocol::Https.into() },
         &alice_contact_bytes,
     )
     .expect("failed to produce valid pairing request");
@@ -582,15 +641,19 @@ fn test_process_pairing_response_message_invalid_status() {
     let CreateContactMessageResult {
         wire_bytes: alice_contact_bytes,
         secret_key: alice_sk_state,
-    } = create_contact_message(alice_channel_id, "https://relay.example/alice")
+    } = create_contact_message(alice_channel_id, TransportProtocol {
+        uri: "https://relay.example/alice".to_owned(),
+        protocol: Protocol::Https.into(),
+    })
         .expect("failed to create contact message");
 
     let ProducePairingRequestMessageResult {
         wire_bytes: bob_request_bytes,
         secret_key: bob_sk_state,
+        ..
     } = produce_pairing_request_message(
         SenderKind::Helper,
-        "https://relay.example/bob",
+        TransportProtocol { uri: "https://relay.example/bob".to_owned(), protocol: Protocol::Https.into() },
         &alice_contact_bytes,
     )
     .expect("failed to produce valid pairing request");
@@ -636,15 +699,19 @@ fn test_process_pairing_response_message_nonce_mismatch() {
     let CreateContactMessageResult {
         wire_bytes: alice_contact_bytes,
         secret_key: alice_sk_state,
-    } = create_contact_message(alice_channel_id, "https://relay.example/alice")
+    } = create_contact_message(alice_channel_id, TransportProtocol {
+        uri: "https://relay.example/alice".to_owned(),
+        protocol: Protocol::Https.into(),
+    })
         .expect("failed to create contact message");
 
     let ProducePairingRequestMessageResult {
         wire_bytes: bob_request_bytes,
         secret_key: bob_sk_state,
+        ..
     } = produce_pairing_request_message(
         SenderKind::Helper,
-        "https://relay.example/bob",
+        TransportProtocol { uri: "https://relay.example/bob".to_owned(), protocol: Protocol::Https.into() },
         &alice_contact_bytes,
     )
     .expect("failed to produce valid pairing request");
@@ -690,15 +757,19 @@ fn test_process_pairing_response_message_empty_mlkem_encapsulation_key() {
     let CreateContactMessageResult {
         wire_bytes: alice_contact_bytes,
         secret_key: alice_sk_state,
-    } = create_contact_message(alice_channel_id, "https://relay.example/alice")
+    } = create_contact_message(alice_channel_id, TransportProtocol {
+        uri: "https://relay.example/alice".to_owned(),
+        protocol: Protocol::Https.into(),
+    })
         .expect("failed to create contact message");
 
     let ProducePairingRequestMessageResult {
         wire_bytes: bob_request_bytes,
         secret_key: bob_sk_state,
+        ..
     } = produce_pairing_request_message(
         SenderKind::Helper,
-        "https://relay.example/bob",
+        TransportProtocol { uri: "https://relay.example/bob".to_owned(), protocol: Protocol::Https.into() },
         &alice_contact_bytes,
     )
     .expect("failed to produce valid pairing request");
@@ -748,15 +819,19 @@ fn test_process_pairing_response_message_empty_ecies_public_key() {
     let CreateContactMessageResult {
         wire_bytes: alice_contact_bytes,
         secret_key: alice_sk_state,
-    } = create_contact_message(alice_channel_id, "https://relay.example/alice")
+    } = create_contact_message(alice_channel_id, TransportProtocol {
+        uri: "https://relay.example/alice".to_owned(),
+        protocol: Protocol::Https.into(),
+    })
         .expect("failed to create contact message");
 
     let ProducePairingRequestMessageResult {
         wire_bytes: bob_request_bytes,
         secret_key: bob_sk_state,
+        ..
     } = produce_pairing_request_message(
         SenderKind::Helper,
-        "https://relay.example/bob",
+        TransportProtocol { uri: "https://relay.example/bob".to_owned(), protocol: Protocol::Https.into() },
         &alice_contact_bytes,
     )
     .expect("failed to produce valid pairing request");
@@ -806,15 +881,19 @@ fn test_process_pairing_response_message_rejects_envelope_timestamp_mismatch() {
     let CreateContactMessageResult {
         wire_bytes: alice_contact_bytes,
         secret_key: initiator_secret_key,
-    } = create_contact_message(alice_channel_id, "https://relay.example/alice")
+    } = create_contact_message(alice_channel_id, TransportProtocol {
+        uri: "https://relay.example/alice".to_owned(),
+        protocol: Protocol::Https.into(),
+    })
         .expect("failed to create contact message");
 
     let ProducePairingRequestMessageResult {
         wire_bytes: request_bytes,
         secret_key: responder_secret_key,
+        ..
     } = produce_pairing_request_message(
         SenderKind::Helper,
-        "https://relay.example/bob",
+        TransportProtocol { uri: "https://relay.example/bob".to_owned(), protocol: Protocol::Https.into() },
         &alice_contact_bytes,
     )
     .expect("failed to produce pairing request");
@@ -854,15 +933,19 @@ fn test_alice_bob_pairing_flow() {
     let CreateContactMessageResult {
         wire_bytes: alice_contact_bytes,
         secret_key: alice_sk_state,
-    } = create_contact_message(alice_channel_id, alice_transport_uri)
-        .expect("failed to create contact message");
+    } = create_contact_message(alice_channel_id, TransportProtocol {
+        uri: alice_transport_uri.to_owned(),
+        protocol: Protocol::Https.into(),
+    })
+    .expect("failed to create contact message");
 
     let ProducePairingRequestMessageResult {
         wire_bytes: bob_pair_req_bytes,
         secret_key: bob_sk_state,
+        ..
     } = produce_pairing_request_message(
         SenderKind::Helper,
-        bob_transport_uri,
+        TransportProtocol { uri: bob_transport_uri.to_owned(), protocol: Protocol::Https.into() },
         &alice_contact_bytes,
     )
     .expect("failed to produce pairing request");
@@ -873,7 +956,7 @@ fn test_alice_bob_pairing_flow() {
     let ProducePairingResponseMessageResult {
         wire_bytes: alice_pair_resp_bytes,
         shared_key: alice_shared_key,
-        transport_protocol: bob_transport_protocol,
+        responder_transport_protocol: bob_transport_protocol,
     } = produce_pairing_response_message(alice_kind, &bob_pair_req_bytes, &alice_sk_state)
         .expect("failed to produce pairing response");
 

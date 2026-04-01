@@ -149,7 +149,7 @@ The `transportUri` in protocol messages identifies the helper endpoint.
 
 ```rust
 use derec_library::pairing::*;
-use derec_proto::SenderKind;
+use derec_proto::{Protocol, SenderKind, TransportProtocol};
 
 let channel_id = 42.into();
 
@@ -159,7 +159,10 @@ let CreateContactMessageResult {
     secret_key: contactor_secret_key,
 } = create_contact_message(
     channel_id,
-    "https://relay.example/derec",
+    TransportProtocol {
+        uri: "https://relay.example/derec".to_owned(),
+        protocol: Protocol::Https.into(),
+    },
 ).unwrap();
 
 // Step 2

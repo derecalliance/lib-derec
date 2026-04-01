@@ -78,8 +78,11 @@ pub struct CreateContactMessageResult {
 /// On success:
 ///
 /// - `status` indicates success
-/// - `pair_request_message` contains serialized outer `DeRecMessage` bytes
+/// - `request_wire_bytes` contains serialized outer `DeRecMessage` bytes
 ///   carrying an encrypted inner `PairRequestMessage`
+/// - `initiator_transport_protocol` contains serialized `TransportProtocol` protobuf
+///   bytes extracted from the contact message, indicating how to reach the initiator
+///   for subsequent protocol traffic
 /// - `secret_key_material` contains opaque serialized pairing secret key material
 ///   that must be stored by the caller and later supplied to
 ///   [`process_pairing_response_message`]
@@ -92,6 +95,7 @@ pub struct CreateContactMessageResult {
 pub struct ProducePairingRequestMessageResult {
     pub status: DeRecStatus,
     pub request_wire_bytes: DeRecBuffer,
+    pub initiator_transport_protocol: DeRecBuffer,
     pub secret_key_material: DeRecBuffer,
 }
 
@@ -102,7 +106,7 @@ pub struct ProducePairingRequestMessageResult {
 /// - `status` indicates success
 /// - `pair_response_message` contains serialized outer `DeRecMessage` bytes
 ///   carrying an encrypted inner `PairResponseMessage`
-/// - `transport_protocol` contains serialized `TransportProtocol` protobuf bytes
+/// - `responder_transport_protocol` contains serialized `TransportProtocol` protobuf bytes
 ///   extracted from the validated pairing request
 /// - `shared_key` contains the derived pairing shared key bytes
 ///
@@ -114,7 +118,7 @@ pub struct ProducePairingRequestMessageResult {
 pub struct ProducePairingResponseMessageResult {
     pub status: DeRecStatus,
     pub response_wire_bytes: DeRecBuffer,
-    pub transport_protocol: DeRecBuffer,
+    pub responder_transport_protocol: DeRecBuffer,
     pub shared_key: DeRecBuffer,
 }
 
@@ -142,7 +146,8 @@ pub struct ProcessPairingResponseMessageResult {
 /// The caller provides:
 ///
 /// - `channel_id` as a raw `u64`
-/// - `transport_uri_ptr` / `transport_uri_len` as a UTF-8 string buffer
+/// - `transport_protocol_ptr` / `transport_protocol_len` as serialized `TransportProtocol`
+///   protobuf bytes
 ///
 /// On success, this function returns:
 ///
@@ -153,8 +158,8 @@ pub struct ProcessPairingResponseMessageResult {
 /// # Arguments
 ///
 /// * `channel_id` - Channel identifier used by the pairing flow.
-/// * `transport_uri_ptr` - Pointer to UTF-8 transport URI bytes.
-/// * `transport_uri_len` - Length of the transport URI buffer.
+/// * `transport_protocol_ptr` - Pointer to serialized `TransportProtocol` protobuf bytes.
+/// * `transport_protocol_len` - Length of the serialized `TransportProtocol` buffer.
 ///
 /// # Returns
 ///
@@ -164,43 +169,43 @@ pub struct ProcessPairingResponseMessageResult {
 ///
 /// The returned `status` indicates failure if:
 ///
-/// - `transport_uri_ptr` is null
-/// - the transport URI is not valid UTF-8
+/// - `transport_protocol_ptr` is null
+/// - the bytes cannot be decoded as a valid `TransportProtocol`
 /// - the underlying Rust pairing API returns an error
 ///
 /// # Safety
 ///
-/// `transport_uri_ptr` must either be null (in which case an error is returned)
-/// or point to `transport_uri_len` readable bytes.
+/// `transport_protocol_ptr` must either be null (in which case an error is returned)
+/// or point to `transport_protocol_len` readable bytes.
 #[unsafe(no_mangle)]
 pub extern "C" fn create_contact_message(
     channel_id: u64,
-    transport_uri_ptr: *const u8,
-    transport_uri_len: usize,
+    transport_protocol_ptr: *const u8,
+    transport_protocol_len: usize,
 ) -> CreateContactMessageResult {
-    if transport_uri_ptr.is_null() {
+    if transport_protocol_ptr.is_null() {
         return CreateContactMessageResult {
-            status: err_status("transport_uri_ptr is null"),
+            status: err_status("transport_protocol_ptr is null"),
             contact_wire_bytes: empty_buffer(),
             secret_key_material: empty_buffer(),
         };
     }
 
-    let transport_uri_bytes =
-        unsafe { std::slice::from_raw_parts(transport_uri_ptr, transport_uri_len) };
+    let transport_protocol_bytes =
+        unsafe { std::slice::from_raw_parts(transport_protocol_ptr, transport_protocol_len) };
 
-    let transport_uri = match std::str::from_utf8(transport_uri_bytes) {
+    let transport_protocol = match TransportProtocol::decode(transport_protocol_bytes) {
         Ok(value) => value,
         Err(_) => {
             return CreateContactMessageResult {
-                status: err_status("transport_uri is not valid UTF-8"),
+                status: err_status("transport_protocol_bytes is not a valid TransportProtocol"),
                 contact_wire_bytes: empty_buffer(),
                 secret_key_material: empty_buffer(),
             };
         }
     };
 
-    let result = match crate::pairing::create_contact_message(channel_id.into(), transport_uri) {
+    let result = match crate::pairing::create_contact_message(channel_id.into(), transport_protocol) {
         Ok(value) => value,
         Err(err) => {
             return CreateContactMessageResult {
@@ -228,7 +233,8 @@ pub extern "C" fn create_contact_message(
 /// The caller provides:
 ///
 /// - `sender_kind` as the raw `i32` protobuf enum value of [`SenderKind`]
-/// - `transport_uri_ptr` / `transport_uri_len` as the responder transport URI
+/// - `transport_protocol_ptr` / `transport_protocol_len` as serialized `TransportProtocol`
+///   protobuf bytes describing the responder's transport endpoint
 /// - a plain serialized `ContactMessage` protobuf buffer
 ///
 /// On success, this function returns:
@@ -241,8 +247,8 @@ pub extern "C" fn create_contact_message(
 /// # Arguments
 ///
 /// * `sender_kind` - Raw protobuf enum value of [`SenderKind`].
-/// * `transport_uri_ptr` - Pointer to UTF-8 transport URI bytes.
-/// * `transport_uri_len` - Length of the transport URI buffer.
+/// * `transport_protocol_ptr` - Pointer to serialized `TransportProtocol` protobuf bytes.
+/// * `transport_protocol_len` - Length of the serialized `TransportProtocol` buffer.
 /// * `contact_message_ptr` - Pointer to plain serialized `ContactMessage` protobuf bytes.
 /// * `contact_message_len` - Length of the serialized contact message buffer.
 ///
@@ -254,9 +260,9 @@ pub extern "C" fn create_contact_message(
 ///
 /// The returned `status` indicates failure if:
 ///
-/// - `transport_uri_ptr` is null
+/// - `transport_protocol_ptr` is null
 /// - `contact_message_ptr` is null
-/// - `transport_uri` is not valid UTF-8
+/// - the bytes cannot be decoded as a valid `TransportProtocol`
 /// - `sender_kind` is not a valid [`SenderKind`]
 /// - the underlying Rust pairing API returns an error
 ///
@@ -267,15 +273,16 @@ pub extern "C" fn create_contact_message(
 #[unsafe(no_mangle)]
 pub extern "C" fn produce_pairing_request_message(
     sender_kind: i32,
-    transport_uri_ptr: *const u8,
-    transport_uri_len: usize,
+    transport_protocol_ptr: *const u8,
+    transport_protocol_len: usize,
     contact_message_ptr: *const u8,
     contact_message_len: usize,
 ) -> ProducePairingRequestMessageResult {
-    if transport_uri_ptr.is_null() {
+    if transport_protocol_ptr.is_null() {
         return ProducePairingRequestMessageResult {
-            status: err_status("transport_uri_ptr is null"),
+            status: err_status("transport_protocol_ptr is null"),
             request_wire_bytes: empty_buffer(),
+            initiator_transport_protocol: empty_buffer(),
             secret_key_material: empty_buffer(),
         };
     }
@@ -284,6 +291,7 @@ pub extern "C" fn produce_pairing_request_message(
         return ProducePairingRequestMessageResult {
             status: err_status("contact_message_ptr is null"),
             request_wire_bytes: empty_buffer(),
+            initiator_transport_protocol: empty_buffer(),
             secret_key_material: empty_buffer(),
         };
     }
@@ -294,20 +302,22 @@ pub extern "C" fn produce_pairing_request_message(
             return ProducePairingRequestMessageResult {
                 status: err_status(format!("invalid SenderKind value: {sender_kind}")),
                 request_wire_bytes: empty_buffer(),
+                initiator_transport_protocol: empty_buffer(),
                 secret_key_material: empty_buffer(),
             };
         }
     };
 
-    let transport_uri_bytes =
-        unsafe { std::slice::from_raw_parts(transport_uri_ptr, transport_uri_len) };
+    let transport_protocol_bytes =
+        unsafe { std::slice::from_raw_parts(transport_protocol_ptr, transport_protocol_len) };
 
-    let transport_uri = match std::str::from_utf8(transport_uri_bytes) {
+    let transport_protocol = match TransportProtocol::decode(transport_protocol_bytes) {
         Ok(value) => value,
         Err(_) => {
             return ProducePairingRequestMessageResult {
-                status: err_status("transport_uri is not valid UTF-8"),
+                status: err_status("transport_protocol_bytes is not a valid TransportProtocol"),
                 request_wire_bytes: empty_buffer(),
+                initiator_transport_protocol: empty_buffer(),
                 secret_key_material: empty_buffer(),
             };
         }
@@ -318,7 +328,7 @@ pub extern "C" fn produce_pairing_request_message(
 
     let result = match crate::pairing::produce_pairing_request_message(
         sender_kind,
-        transport_uri,
+        transport_protocol,
         contact_message_bytes,
     ) {
         Ok(value) => value,
@@ -326,17 +336,21 @@ pub extern "C" fn produce_pairing_request_message(
             return ProducePairingRequestMessageResult {
                 status: err_status(err.to_string()),
                 request_wire_bytes: empty_buffer(),
+                initiator_transport_protocol: empty_buffer(),
                 secret_key_material: empty_buffer(),
             };
         }
     };
 
     let pair_request_message_bytes = result.wire_bytes;
+    let initiator_transport_protocol_bytes =
+        serialize_transport_protocol(&result.initiator_transport_protocol);
     let secret_key_material_bytes = serialize_pairing_secret_key_material(&result.secret_key);
 
     ProducePairingRequestMessageResult {
         status: ok_status(),
         request_wire_bytes: vec_into_buffer(pair_request_message_bytes),
+        initiator_transport_protocol: vec_into_buffer(initiator_transport_protocol_bytes),
         secret_key_material: vec_into_buffer(secret_key_material_bytes),
     }
 }
@@ -399,7 +413,7 @@ pub extern "C" fn produce_pairing_response_message(
         return ProducePairingResponseMessageResult {
             status: err_status("pair_request_message_ptr is null"),
             response_wire_bytes: empty_buffer(),
-            transport_protocol: empty_buffer(),
+            responder_transport_protocol: empty_buffer(),
             shared_key: empty_buffer(),
         };
     }
@@ -408,7 +422,7 @@ pub extern "C" fn produce_pairing_response_message(
         return ProducePairingResponseMessageResult {
             status: err_status("secret_key_material_ptr is null"),
             response_wire_bytes: empty_buffer(),
-            transport_protocol: empty_buffer(),
+            responder_transport_protocol: empty_buffer(),
             shared_key: empty_buffer(),
         };
     }
@@ -419,7 +433,7 @@ pub extern "C" fn produce_pairing_response_message(
             return ProducePairingResponseMessageResult {
                 status: err_status(format!("invalid SenderKind value: {sender_kind}")),
                 response_wire_bytes: empty_buffer(),
-                transport_protocol: empty_buffer(),
+                responder_transport_protocol: empty_buffer(),
                 shared_key: empty_buffer(),
             };
         }
@@ -438,7 +452,7 @@ pub extern "C" fn produce_pairing_response_message(
                 return ProducePairingResponseMessageResult {
                     status: err_status(format!("invalid secret key material: {err}")),
                     response_wire_bytes: empty_buffer(),
-                    transport_protocol: empty_buffer(),
+                    responder_transport_protocol: empty_buffer(),
                     shared_key: empty_buffer(),
                 };
             }
@@ -454,20 +468,20 @@ pub extern "C" fn produce_pairing_response_message(
             return ProducePairingResponseMessageResult {
                 status: err_status(err.to_string()),
                 response_wire_bytes: empty_buffer(),
-                transport_protocol: empty_buffer(),
+                responder_transport_protocol: empty_buffer(),
                 shared_key: empty_buffer(),
             };
         }
     };
 
     let pair_response_message_bytes = result.wire_bytes;
-    let transport_protocol_bytes = serialize_transport_protocol(&result.transport_protocol);
+    let transport_protocol_bytes = serialize_transport_protocol(&result.responder_transport_protocol);
     let shared_key_bytes = serialize_pairing_shared_key(&result.shared_key);
 
     ProducePairingResponseMessageResult {
         status: ok_status(),
         response_wire_bytes: vec_into_buffer(pair_response_message_bytes),
-        transport_protocol: vec_into_buffer(transport_protocol_bytes),
+        responder_transport_protocol: vec_into_buffer(transport_protocol_bytes),
         shared_key: vec_into_buffer(shared_key_bytes),
     }
 }

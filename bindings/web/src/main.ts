@@ -246,9 +246,10 @@ async function main() {
     const roleHelper = 2;
     const roleSharer = 0;
 
+    const aliceTransportProtocol = { protocol: "https", uri: "https://example.com/alice" };
     const createContactMessageResult = derec.create_contact_message(
         channelId,
-        "https://example.com/alice"
+        aliceTransportProtocol
     );
     console.log("create_contact_message:", createContactMessageResult);
 
@@ -264,7 +265,7 @@ async function main() {
 
     const producePairingRequestMessageResult = derec.produce_pairing_request_message(
         roleHelper,
-        "https://example.com/helper",
+        { protocol: "https", uri: "https://example.com/helper" },
         contactWireBytes
     );
     console.log("produce_pairing_request_message:", producePairingRequestMessageResult);

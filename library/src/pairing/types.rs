@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use derec_cryptography::pairing::{self as cryptography_pairing, PairingSecretKeyMaterial};
+use derec_proto::TransportProtocol;
 
 /// Result of [`create_contact_message`].
 ///
@@ -30,6 +31,10 @@ pub struct CreateContactMessageResult {
 /// The `wire_bytes` field contains a serialized outer [`derec_proto::DeRecMessage`]
 /// envelope. Its inner payload is an encrypted [`derec_proto::PairRequestMessage`].
 ///
+/// The `initiator_transport_protocol` field is copied from the validated contact message
+/// and tells the responder which endpoint and protocol to use for subsequent traffic
+/// directed at the initiator.
+///
 /// The `secret_key` field contains the responder-side pairing secret key material
 /// generated while constructing the request. Callers must preserve it securely and
 /// later pass it into [`process_pairing_response_message`] to derive the final
@@ -38,6 +43,11 @@ pub struct ProducePairingRequestMessageResult {
     /// Serialized outer [`derec_proto::DeRecMessage`] bytes carrying an encrypted
     /// inner [`derec_proto::PairRequestMessage`].
     pub wire_bytes: Vec<u8>,
+
+    /// Transport information extracted from the validated [`derec_proto::ContactMessage`].
+    /// Tells the responder which endpoint and protocol to use when sending subsequent
+    /// DeRec messages to the initiator.
+    pub initiator_transport_protocol: TransportProtocol,
 
     /// Responder-side pairing secret key material associated with this request.
     pub secret_key: PairingSecretKeyMaterial,
@@ -65,7 +75,7 @@ pub struct ProducePairingResponseMessageResult {
     pub wire_bytes: Vec<u8>,
 
     /// Transport information extracted from the validated pairing request.
-    pub transport_protocol: derec_proto::TransportProtocol,
+    pub responder_transport_protocol: TransportProtocol,
 
     /// Final pairing shared key derived by the initiator.
     pub shared_key: cryptography_pairing::PairingSharedKey,

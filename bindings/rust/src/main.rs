@@ -12,7 +12,7 @@ use derec_library::types::ChannelId;
 use derec_library::verification::{
     generate_verification_request, generate_verification_response, verify_share_response,
 };
-use derec_proto::{ContactMessage, Protocol, SenderKind};
+use derec_proto::{ContactMessage, Protocol, SenderKind, TransportProtocol};
 use prost::Message;
 use std::collections::HashMap;
 
@@ -43,8 +43,11 @@ fn run_pairing_flow_test() {
 
     let channel_id = ChannelId(1);
 
-    let contact = create_contact_message(channel_id, "https://example.com/alice")
-        .expect("Pairing test failed: create_contact_message failed.");
+    let contact = create_contact_message(channel_id, TransportProtocol {
+        uri: "https://example.com/alice".to_owned(),
+        protocol: Protocol::Https.into(),
+    })
+    .expect("Pairing test failed: create_contact_message failed.");
 
     println!("contact.wire_bytes = {}", contact.wire_bytes.len());
     println!(
@@ -86,7 +89,10 @@ fn run_pairing_flow_test() {
 
     let pair_request = produce_pairing_request_message(
         SenderKind::Helper,
-        "https://example.com/helper",
+        TransportProtocol {
+            uri: "https://example.com/helper".to_owned(),
+            protocol: Protocol::Https.into(),
+        },
         &contact.wire_bytes,
     )
     .expect("Pairing test failed: produce_pairing_request_message failed.");
@@ -96,12 +102,24 @@ fn run_pairing_flow_test() {
         pair_request.wire_bytes.len()
     );
     println!(
+        "pair_request.initiator_transport_protocol.uri = {}",
+        pair_request.initiator_transport_protocol.uri
+    );
+    println!(
         "pair_request.secret_key_material bytes = {}",
         serialize_pairing_secret_key_material_len(&pair_request.secret_key)
     );
 
     if pair_request.wire_bytes.is_empty() {
         panic!("Pairing test failed: empty pair request wire bytes.");
+    }
+
+    if pair_request.initiator_transport_protocol.uri != "https://example.com/alice" {
+        panic!("Pairing test failed: initiator_transport_protocol URI does not match contact message.");
+    }
+
+    if pair_request.initiator_transport_protocol.protocol() != Protocol::Https {
+        panic!("Pairing test failed: initiator_transport_protocol protocol does not match contact message.");
     }
 
     if serialize_pairing_secret_key_material_len(&pair_request.secret_key) == 0 {
@@ -124,8 +142,8 @@ fn run_pairing_flow_test() {
         pair_response.shared_key.len()
     );
     println!(
-        "pair_response.transport_protocol = {:?}",
-        pair_response.transport_protocol
+        "pair_response.responder_transport_protocol = {:?}",
+        pair_response.responder_transport_protocol
     );
 
     if pair_response.wire_bytes.is_empty() {

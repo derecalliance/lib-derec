@@ -89,12 +89,12 @@ async function main() {
 
   const contact = derec.create_contact_message(
     1n,
-    new TextEncoder().encode("wss://owner.example.com")
+    { protocol: "https", uri: "https://owner.example.com" }
   );
 
   const request = derec.produce_pairing_request_message(
     2,
-    new TextEncoder().encode("wss://helper.example.com"),
+    { protocol: "https", uri: "https://helper.example.com" },
     contact.wire_bytes
   );
 
