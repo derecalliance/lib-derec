@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use derec_cryptography::pairing::{self as cryptography_pairing, PairingSecretKeyMaterial};
-use derec_proto::TransportProtocol;
+use derec_proto::{ContactMessage, TransportProtocol};
 
 /// Result of [`create_contact_message`].
 ///
@@ -31,9 +31,9 @@ pub struct CreateContactMessageResult {
 /// The `wire_bytes` field contains a serialized outer [`derec_proto::DeRecMessage`]
 /// envelope. Its inner payload is an encrypted [`derec_proto::PairRequestMessage`].
 ///
-/// The `initiator_transport_protocol` field is copied from the validated contact message
-/// and tells the responder which endpoint and protocol to use for subsequent traffic
-/// directed at the initiator.
+/// The `initiator_contact_message` field is the decoded initiator contact message. It
+/// provides the responder with the initiator's transport endpoint, public keys, channel
+/// identifier, and nonce — everything needed to complete the pairing flow.
 ///
 /// The `secret_key` field contains the responder-side pairing secret key material
 /// generated while constructing the request. Callers must preserve it securely and
@@ -44,10 +44,10 @@ pub struct ProducePairingRequestMessageResult {
     /// inner [`derec_proto::PairRequestMessage`].
     pub wire_bytes: Vec<u8>,
 
-    /// Transport information extracted from the validated [`derec_proto::ContactMessage`].
-    /// Tells the responder which endpoint and protocol to use when sending subsequent
-    /// DeRec messages to the initiator.
-    pub initiator_transport_protocol: TransportProtocol,
+    /// The validated [`derec_proto::ContactMessage`] decoded from the initiator's out-of-band
+    /// contact bytes. Provides the responder with the initiator's transport endpoint, public
+    /// keys, channel identifier, and nonce — everything needed to complete the pairing flow.
+    pub initiator_contact_message: ContactMessage,
 
     /// Responder-side pairing secret key material associated with this request.
     pub secret_key: PairingSecretKeyMaterial,

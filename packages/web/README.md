@@ -101,11 +101,11 @@ async function main() {
   const response = derec.produce_pairing_response_message(
     0,
     request.wire_bytes,
-    request.secret_key_material
+    contact.secret_key_material
   );
 
   const result = derec.process_pairing_response_message(
-    contact.wire_bytes,
+    request.initiator_contact_message,
     response.wire_bytes,
     request.secret_key_material
   );

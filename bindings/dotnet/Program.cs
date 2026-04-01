@@ -58,12 +58,16 @@ internal static class Program
         );
 
         Console.WriteLine($"pair_request.wire_bytes = {pairRequest.WireBytes.Length}");
+        Console.WriteLine($"pair_request.initiator_contact_message.channel_id = {pairRequest.InitiatorContactMessage.ChannelId}");
+        Console.WriteLine($"pair_request.initiator_contact_message.transport_protocol.uri = {pairRequest.InitiatorContactMessage.TransportProtocol.Uri}");
+        Console.WriteLine($"pair_request.initiator_contact_message.nonce = {pairRequest.InitiatorContactMessage.Nonce}");
         Console.WriteLine($"pair_request.secret_key_material bytes = {pairRequest.SecretKeyMaterial.Length}");
 
         if (pairRequest.WireBytes.Length == 0)
         {
             throw new InvalidOperationException("Pairing test failed: empty pair request wire bytes.");
         }
+
 
         if (pairRequest.SecretKeyMaterial.Length == 0)
         {
@@ -92,7 +96,7 @@ internal static class Program
         }
 
         var processed = Pairing.ProcessPairingResponseMessage(
-            contact.WireBytes,
+            pairRequest.InitiatorContactMessage,
             pairResponse.WireBytes,
             pairRequest.SecretKeyMaterial
         );

@@ -84,12 +84,12 @@ const request = derec.produce_pairing_request_message(
 const response = derec.produce_pairing_response_message(
   0, // SenderKind.SharerNonRecovery
   request.wire_bytes,
-  request.secret_key_material
+  contact.secret_key_material
 );
 
 // Step 4: Helper processes response and derives shared key
 const result = derec.process_pairing_response_message(
-  contact.wire_bytes,
+  request.initiator_contact_message,
   response.wire_bytes,
   request.secret_key_material
 );

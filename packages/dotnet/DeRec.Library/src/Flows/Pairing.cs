@@ -18,6 +18,7 @@ public static class Pairing
     public sealed class ProducePairingRequestMessageResult
     {
         public required byte[] WireBytes { get; init; }
+        public required ContactMessage InitiatorContactMessage { get; init; }
         public required byte[] SecretKeyMaterial { get; init; }
     }
 
@@ -87,17 +88,20 @@ public static class Pairing
             Utils.ThrowIfError(nativeResult.Status);
 
             byte[] wireBytes = Utils.CopyBuffer(nativeResult.RequestWireBytes);
+            byte[] initiatorContactMessageWireBytes = Utils.CopyBuffer(nativeResult.InitiatorContactMessageWireBytes);
             byte[] secretKeyMaterial = Utils.CopyBuffer(nativeResult.SecretKeyMaterial);
 
             return new ProducePairingRequestMessageResult
             {
                 WireBytes = wireBytes,
+                InitiatorContactMessage = ContactMessage.FromProtoBytes(initiatorContactMessageWireBytes),
                 SecretKeyMaterial = secretKeyMaterial,
             };
         }
         finally
         {
             Utils.FreeBuffer(nativeResult.RequestWireBytes);
+            Utils.FreeBuffer(nativeResult.InitiatorContactMessageWireBytes);
             Utils.FreeBuffer(nativeResult.SecretKeyMaterial);
             Utils.FreeStatusMessage(nativeResult.Status);
         }
@@ -143,11 +147,13 @@ public static class Pairing
     }
 
     public static ProcessPairingResponseMessageResult ProcessPairingResponseMessage(
-        byte[] contactMessageBytes,
+        ContactMessage contactMessage,
         byte[] pairResponseWireBytes,
         byte[] pairingSecretKeyMaterial
     )
     {
+        byte[] contactMessageBytes = contactMessage.ToProtoBytes();
+
         Native.Pairing.ProcessPairingResponseMessageResult nativeResult =
             Native.Pairing.process_pairing_response_message(
                 contactMessageBytes,

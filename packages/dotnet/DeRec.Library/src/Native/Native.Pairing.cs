@@ -18,6 +18,7 @@ internal static class Pairing
     {
         public Status Status;
         public Buffer RequestWireBytes;
+        public Buffer InitiatorContactMessageWireBytes;
         public Buffer SecretKeyMaterial;
     }
 

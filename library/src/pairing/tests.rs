@@ -266,7 +266,7 @@ fn test_produce_pairing_request_message() {
 }
 
 #[test]
-fn test_produce_pairing_request_message_initiator_transport_protocol() {
+fn test_produce_pairing_request_message_initiator_contact_message() {
     let alice_transport_uri = "https://relay.example/alice";
 
     let CreateContactMessageResult {
@@ -279,7 +279,7 @@ fn test_produce_pairing_request_message_initiator_transport_protocol() {
     .expect("failed to create contact message");
 
     let ProducePairingRequestMessageResult {
-        initiator_transport_protocol,
+        initiator_contact_message,
         ..
     } = produce_pairing_request_message(
         SenderKind::Helper,
@@ -288,8 +288,11 @@ fn test_produce_pairing_request_message_initiator_transport_protocol() {
     )
     .expect("failed to produce pairing request message");
 
-    assert_eq!(initiator_transport_protocol.uri, alice_transport_uri);
-    assert_eq!(initiator_transport_protocol.protocol, Protocol::Https as i32);
+    let tp = initiator_contact_message
+        .transport_protocol
+        .expect("transport protocol should be present");
+    assert_eq!(tp.uri, alice_transport_uri);
+    assert_eq!(tp.protocol, Protocol::Https as i32);
 }
 
 #[test]
@@ -536,8 +539,8 @@ fn test_process_pairing_response_message_missing_result() {
 
     let ProducePairingRequestMessageResult {
         wire_bytes: bob_request_bytes,
+        initiator_contact_message,
         secret_key: bob_sk_state,
-        ..
     } = produce_pairing_request_message(
         SenderKind::Helper,
         TransportProtocol { uri: "https://relay.example/bob".to_owned(), protocol: Protocol::Https.into() },
@@ -564,7 +567,7 @@ fn test_process_pairing_response_message_missing_result() {
     );
 
     let result = process_pairing_response_message(
-        &alice_contact_bytes,
+        initiator_contact_message,
         &pair_response_wire_bytes,
         &bob_sk_state,
     );
@@ -591,8 +594,8 @@ fn test_process_pairing_response_message_result_non_ok() {
 
     let ProducePairingRequestMessageResult {
         wire_bytes: bob_request_bytes,
+        initiator_contact_message,
         secret_key: bob_sk_state,
-        ..
     } = produce_pairing_request_message(
         SenderKind::Helper,
         TransportProtocol { uri: "https://relay.example/bob".to_owned(), protocol: Protocol::Https.into() },
@@ -622,7 +625,7 @@ fn test_process_pairing_response_message_result_non_ok() {
     );
 
     let result = process_pairing_response_message(
-        &alice_contact_bytes,
+        initiator_contact_message,
         &pair_response_wire_bytes,
         &bob_sk_state,
     );
@@ -649,8 +652,8 @@ fn test_process_pairing_response_message_invalid_status() {
 
     let ProducePairingRequestMessageResult {
         wire_bytes: bob_request_bytes,
+        initiator_contact_message,
         secret_key: bob_sk_state,
-        ..
     } = produce_pairing_request_message(
         SenderKind::Helper,
         TransportProtocol { uri: "https://relay.example/bob".to_owned(), protocol: Protocol::Https.into() },
@@ -680,7 +683,7 @@ fn test_process_pairing_response_message_invalid_status() {
     );
 
     let result = process_pairing_response_message(
-        &alice_contact_bytes,
+        initiator_contact_message,
         &pair_response_wire_bytes,
         &bob_sk_state,
     );
@@ -707,8 +710,8 @@ fn test_process_pairing_response_message_nonce_mismatch() {
 
     let ProducePairingRequestMessageResult {
         wire_bytes: bob_request_bytes,
+        initiator_contact_message,
         secret_key: bob_sk_state,
-        ..
     } = produce_pairing_request_message(
         SenderKind::Helper,
         TransportProtocol { uri: "https://relay.example/bob".to_owned(), protocol: Protocol::Https.into() },
@@ -738,7 +741,7 @@ fn test_process_pairing_response_message_nonce_mismatch() {
     );
 
     let result = process_pairing_response_message(
-        &alice_contact_bytes,
+        initiator_contact_message,
         &pair_response_wire_bytes,
         &bob_sk_state,
     );
@@ -765,8 +768,8 @@ fn test_process_pairing_response_message_empty_mlkem_encapsulation_key() {
 
     let ProducePairingRequestMessageResult {
         wire_bytes: bob_request_bytes,
+        initiator_contact_message,
         secret_key: bob_sk_state,
-        ..
     } = produce_pairing_request_message(
         SenderKind::Helper,
         TransportProtocol { uri: "https://relay.example/bob".to_owned(), protocol: Protocol::Https.into() },
@@ -795,12 +798,11 @@ fn test_process_pairing_response_message_empty_mlkem_encapsulation_key() {
         &pair_response_msg,
     );
 
-    let mut invalid_contact = decode_contact_message(&alice_contact_bytes);
+    let mut invalid_contact = initiator_contact_message;
     invalid_contact.mlkem_encapsulation_key.clear();
-    let invalid_contact_bytes = invalid_contact.encode_to_vec();
 
     let result = process_pairing_response_message(
-        &invalid_contact_bytes,
+        invalid_contact,
         &pair_response_wire_bytes,
         &bob_sk_state,
     );
@@ -827,8 +829,8 @@ fn test_process_pairing_response_message_empty_ecies_public_key() {
 
     let ProducePairingRequestMessageResult {
         wire_bytes: bob_request_bytes,
+        initiator_contact_message,
         secret_key: bob_sk_state,
-        ..
     } = produce_pairing_request_message(
         SenderKind::Helper,
         TransportProtocol { uri: "https://relay.example/bob".to_owned(), protocol: Protocol::Https.into() },
@@ -857,12 +859,11 @@ fn test_process_pairing_response_message_empty_ecies_public_key() {
         &pair_response_msg,
     );
 
-    let mut invalid_contact = decode_contact_message(&alice_contact_bytes);
+    let mut invalid_contact = initiator_contact_message;
     invalid_contact.ecies_public_key.clear();
-    let invalid_contact_bytes = invalid_contact.encode_to_vec();
 
     let result = process_pairing_response_message(
-        &invalid_contact_bytes,
+        invalid_contact,
         &pair_response_wire_bytes,
         &bob_sk_state,
     );
@@ -889,8 +890,8 @@ fn test_process_pairing_response_message_rejects_envelope_timestamp_mismatch() {
 
     let ProducePairingRequestMessageResult {
         wire_bytes: request_bytes,
+        initiator_contact_message,
         secret_key: responder_secret_key,
-        ..
     } = produce_pairing_request_message(
         SenderKind::Helper,
         TransportProtocol { uri: "https://relay.example/bob".to_owned(), protocol: Protocol::Https.into() },
@@ -911,7 +912,7 @@ fn test_process_pairing_response_message_rejects_envelope_timestamp_mismatch() {
     let tampered_wire_bytes = mismatch_envelope_timestamp(&response_bytes);
 
     let result = process_pairing_response_message(
-        &alice_contact_bytes,
+        initiator_contact_message,
         &tampered_wire_bytes,
         &responder_secret_key,
     );
@@ -941,8 +942,8 @@ fn test_alice_bob_pairing_flow() {
 
     let ProducePairingRequestMessageResult {
         wire_bytes: bob_pair_req_bytes,
+        initiator_contact_message,
         secret_key: bob_sk_state,
-        ..
     } = produce_pairing_request_message(
         SenderKind::Helper,
         TransportProtocol { uri: bob_transport_uri.to_owned(), protocol: Protocol::Https.into() },
@@ -952,6 +953,8 @@ fn test_alice_bob_pairing_flow() {
 
     let (outer_req, bob_pair_req_msg) =
         decode_inner_pair_request(&bob_pair_req_bytes, &alice_sk_state.ecies_secret_key);
+
+    let contact_nonce = initiator_contact_message.nonce;
 
     let ProducePairingResponseMessageResult {
         wire_bytes: alice_pair_resp_bytes,
@@ -963,19 +966,18 @@ fn test_alice_bob_pairing_flow() {
     let ProcessPairingResponseMessageResult {
         shared_key: bob_shared_key,
     } = process_pairing_response_message(
-        &alice_contact_bytes,
+        initiator_contact_message,
         &alice_pair_resp_bytes,
         &bob_sk_state,
     )
     .expect("failed to process pairing response");
 
-    let alice_contact_msg = decode_contact_message(&alice_contact_bytes);
     let (outer_resp, alice_pair_resp_msg) =
         decode_inner_pair_response(&alice_pair_resp_bytes, &bob_sk_state.ecies_secret_key);
 
     assert_eq!(outer_req.timestamp, bob_pair_req_msg.timestamp);
     assert_eq!(outer_resp.timestamp, alice_pair_resp_msg.timestamp);
-    assert_eq!(alice_contact_msg.nonce, bob_pair_req_msg.nonce);
+    assert_eq!(contact_nonce, bob_pair_req_msg.nonce);
     assert_eq!(alice_pair_resp_msg.nonce, bob_pair_req_msg.nonce);
     assert_eq!(alice_shared_key, bob_shared_key);
     assert_eq!(bob_transport_protocol.uri, bob_transport_uri);

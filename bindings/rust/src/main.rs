@@ -97,13 +97,19 @@ fn run_pairing_flow_test() {
     )
     .expect("Pairing test failed: produce_pairing_request_message failed.");
 
+    let initiator_tp = pair_request
+        .initiator_contact_message
+        .transport_protocol
+        .as_ref()
+        .expect("initiator_contact_message should have transport_protocol");
+
     println!(
         "pair_request.wire_bytes = {}",
         pair_request.wire_bytes.len()
     );
     println!(
-        "pair_request.initiator_transport_protocol.uri = {}",
-        pair_request.initiator_transport_protocol.uri
+        "pair_request.initiator_contact_message.transport_protocol.uri = {}",
+        initiator_tp.uri
     );
     println!(
         "pair_request.secret_key_material bytes = {}",
@@ -114,12 +120,12 @@ fn run_pairing_flow_test() {
         panic!("Pairing test failed: empty pair request wire bytes.");
     }
 
-    if pair_request.initiator_transport_protocol.uri != "https://example.com/alice" {
-        panic!("Pairing test failed: initiator_transport_protocol URI does not match contact message.");
+    if initiator_tp.uri != "https://example.com/alice" {
+        panic!("Pairing test failed: initiator_contact_message URI does not match contact message.");
     }
 
-    if pair_request.initiator_transport_protocol.protocol() != Protocol::Https {
-        panic!("Pairing test failed: initiator_transport_protocol protocol does not match contact message.");
+    if initiator_tp.protocol() != Protocol::Https {
+        panic!("Pairing test failed: initiator_contact_message protocol does not match contact message.");
     }
 
     if serialize_pairing_secret_key_material_len(&pair_request.secret_key) == 0 {
@@ -155,7 +161,7 @@ fn run_pairing_flow_test() {
     }
 
     let processed = process_pairing_response_message(
-        &contact.wire_bytes,
+        pair_request.initiator_contact_message,
         &pair_response.wire_bytes,
         &pair_request.secret_key,
     )

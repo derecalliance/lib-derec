@@ -11,8 +11,8 @@ use crate::{
 };
 use derec_cryptography::pairing;
 use derec_proto::{
-    ContactMessage, DeRecMessage, DeRecResult, PairRequestMessage, PairResponseMessage,
-    SenderKind, StatusEnum, TransportProtocol,
+    ContactMessage, DeRecMessage, DeRecResult, PairRequestMessage, PairResponseMessage, SenderKind,
+    StatusEnum, TransportProtocol,
 };
 use prost::Message;
 use rand::{Rng, rng};
@@ -156,8 +156,8 @@ pub fn create_contact_message(
 /// On success returns [`ProducePairingRequestMessageResult`] containing:
 ///
 /// - `wire_bytes`: serialized outer [`derec_proto::DeRecMessage`] envelope bytes
-/// - `initiator_transport_protocol`: transport information extracted from the contact message,
-///   indicating how to reach the initiator for subsequent protocol traffic
+/// - `initiator_contact_message`: the decoded initiator [`derec_proto::ContactMessage`],
+///   providing transport endpoint, public keys, channel identifier, and nonce
 /// - `secret_key`: responder-side pairing secret state required later to derive the final
 ///   shared pairing key
 ///
@@ -200,7 +200,7 @@ pub fn create_contact_message(
 ///
 /// let ProducePairingRequestMessageResult {
 ///     wire_bytes,
-///     initiator_transport_protocol,
+///     initiator_contact_message,
 ///     secret_key,
 /// } = produce_pairing_request_message(
 ///     Helper,
@@ -212,7 +212,7 @@ pub fn create_contact_message(
 /// ).expect("Failed to produce pairing request message");
 ///
 /// assert!(!wire_bytes.is_empty());
-/// assert_eq!(initiator_transport_protocol.uri, "https://relay.example/derec");
+/// assert_eq!(initiator_contact_message.transport_protocol.unwrap().uri, "https://relay.example/derec");
 /// let _ = secret_key;
 /// ```
 pub fn produce_pairing_request_message(
@@ -235,16 +235,15 @@ pub fn produce_pairing_request_message(
         return Err(PairingError::InvalidContactMessage("ecies_public_key is empty").into());
     }
 
-    let initiator_transport_protocol =
-        contact_message
-            .transport_protocol
-            .clone()
-            .ok_or(PairingError::InvalidContactMessage(
-                "transport_protocol is missing",
-            ))?;
-
-    if initiator_transport_protocol.uri.trim().is_empty() {
-        return Err(PairingError::InvalidContactMessage("transport_protocol.uri is empty").into());
+    {
+        let initiator_tp = contact_message.transport_protocol.as_ref().ok_or(
+            PairingError::InvalidContactMessage("transport_protocol is missing"),
+        )?;
+        if initiator_tp.uri.trim().is_empty() {
+            return Err(
+                PairingError::InvalidContactMessage("transport_protocol.uri is empty").into(),
+            );
+        }
     }
 
     let contact_pk = pairing::PairingContactMessageMaterial {
@@ -281,7 +280,7 @@ pub fn produce_pairing_request_message(
 
     Ok(ProducePairingRequestMessageResult {
         wire_bytes,
-        initiator_transport_protocol,
+        initiator_contact_message: contact_message,
         secret_key,
     })
 }
@@ -461,20 +460,19 @@ pub fn produce_pairing_response_message(
 ///
 /// After receiving the initiator’s serialized pairing-response envelope, the responder:
 ///
-/// 1. Decodes the original [`ContactMessage`] from the provided contact bytes
-/// 2. Decrypts and decodes the inner [`PairResponseMessage`] from the response wire bytes
-/// 3. Validates the response status and binds it to the same pairing session using the nonce
-/// 4. Uses the responder’s previously stored [`pairing::PairingSecretKeyMaterial`] together with
+/// 1. Decrypts and decodes the inner [`PairResponseMessage`] from the response wire bytes
+/// 2. Validates the response status and binds it to the same pairing session using the nonce
+/// 3. Uses the responder’s previously stored [`pairing::PairingSecretKeyMaterial`] together with
 ///    the initiator’s original public pairing material from the contact message to finalize the
 ///    responder side
-/// 5. Derives the final 256-bit [`pairing::PairingSharedKey`]
+/// 4. Derives the final 256-bit [`pairing::PairingSharedKey`]
 ///
 /// Both parties should derive the same shared key if the pairing flow completed successfully.
 ///
 /// # Arguments
 ///
-/// * `contact_message_bytes` - Plain serialized [`ContactMessage`] originally received
-///   from the initiator out-of-band
+/// * `contact_message` - Decoded [`ContactMessage`] previously returned as
+///   `initiator_contact_message` by [`produce_pairing_request_message`]
 /// * `pair_response_wire_bytes` - Serialized outer [`derec_proto::DeRecMessage`] carrying
 ///   the encrypted inner [`PairResponseMessage`]
 /// * `pairing_secret_key_material` - Responder-side secret state previously returned by
@@ -490,17 +488,16 @@ pub fn produce_pairing_response_message(
 ///
 /// Returns [`crate::Error`] (specifically `Error::Pairing(...)`) in the following cases:
 ///
-/// - the provided contact bytes are not a valid [`ContactMessage`]
 /// - the provided response bytes cannot be decrypted/decoded into a valid response
 /// - `PairingError::InvalidPairResponseMessage` if the response indicates failure or is malformed
 /// - `PairingError::ProtocolViolation` if the response does not match the pairing session
 ///   (for example, nonce mismatch)
-/// - `PairingError::InvalidContactMessage` if the original contact is malformed
+/// - `PairingError::InvalidContactMessage` if the contact message is missing required fields
 /// - `PairingError::FinishPairingRequestor { .. }` if final pairing derivation fails
 ///
 /// # Security Notes
 ///
-/// - Both `contact_message_bytes` and `pair_response_wire_bytes` are untrusted inputs
+/// - `pair_response_wire_bytes` is untrusted input and must be decrypted and validated
 /// - The nonce check is a critical session-binding validation
 /// - The derived shared key should be treated as sensitive material and stored securely
 ///
@@ -520,8 +517,8 @@ pub fn produce_pairing_response_message(
 ///
 /// let ProducePairingRequestMessageResult {
 ///     wire_bytes: request_bytes,
+///     initiator_contact_message,
 ///     secret_key: responder_secret_key,
-///     ..
 /// } = produce_pairing_request_message(
 ///     Helper,
 ///     TransportProtocol { uri: "https://relay.example/responder".to_owned(), protocol: Protocol::Https.into() },
@@ -539,7 +536,7 @@ pub fn produce_pairing_response_message(
 ///
 /// let ProcessPairingResponseMessageResult { shared_key } =
 ///     process_pairing_response_message(
-///         &contact_bytes,
+///         initiator_contact_message,
 ///         &response_bytes,
 ///         &responder_secret_key,
 ///     ).expect("Failed to process pairing response message");
@@ -547,13 +544,10 @@ pub fn produce_pairing_response_message(
 /// let _ = shared_key;
 /// ```
 pub fn process_pairing_response_message(
-    contact_message_bytes: &[u8],
+    contact_message: ContactMessage,
     response_bytes: &[u8],
     pairing_secret_key_material: &pairing::PairingSecretKeyMaterial,
 ) -> Result<ProcessPairingResponseMessageResult, crate::Error> {
-    let contact_message =
-        ContactMessage::decode(contact_message_bytes).map_err(crate::Error::ProtobufDecode)?;
-
     let (envelope, response) = extract_inner_pairing_message::<PairResponseMessage>(
         response_bytes,
         &pairing_secret_key_material.ecies_secret_key,

@@ -72,12 +72,12 @@ var request = Pairing.ProducePairingRequestMessage(
 var response = Pairing.ProducePairingResponseMessage(
     kind: Pairing.SenderKind.SharerNonRecovery,
     pairRequestWireBytes: request.WireBytes,
-    pairingSecretKeyMaterial: request.SecretKeyMaterial
+    pairingSecretKeyMaterial: contact.SecretKeyMaterial
 );
 
 // Step 4: Helper processes response
 var final = Pairing.ProcessPairingResponseMessage(
-    contactMessageBytes: contact.WireBytes,
+    contactMessage: request.InitiatorContactMessage,
     pairResponseWireBytes: response.WireBytes,
     pairingSecretKeyMaterial: request.SecretKeyMaterial
 );

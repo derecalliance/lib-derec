@@ -124,7 +124,7 @@ const producePairingRequestMessageResult = derec.produce_pairing_request_message
 console.log("produce_pairing_request_message:", producePairingRequestMessageResult);
 const producePairingResponseMessageResult = derec.produce_pairing_response_message(roleSharer, producePairingRequestMessageResult.wire_bytes, createContactMessageResult.secret_key_material);
 console.log("produce_pairing_response_message:", producePairingResponseMessageResult);
-const processPairingResponseMessageResult = derec.process_pairing_response_message(createContactMessageResult.wire_bytes, producePairingResponseMessageResult.wire_bytes, producePairingRequestMessageResult.secret_key_material);
+const processPairingResponseMessageResult = derec.process_pairing_response_message(producePairingRequestMessageResult.initiator_contact_message, producePairingResponseMessageResult.wire_bytes, producePairingRequestMessageResult.secret_key_material);
 console.log("process_pairing_response_message:", processPairingResponseMessageResult);
 const validOwnerMessage = producePairingRequestMessageResult.wire_bytes;
 console.log("pairRequestWireBytes:", validOwnerMessage);

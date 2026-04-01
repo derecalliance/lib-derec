@@ -293,8 +293,10 @@ async function main() {
             : producePairingResponseMessageResult
     );
 
+    const initiatorContactMessage = (producePairingRequestMessageResult as any).initiator_contact_message;
+
     const processPairingResponseMessageResult = derec.process_pairing_response_message(
-        contactWireBytes,
+        initiatorContactMessage,
         pairResponseWireBytes,
         pairRequestSecretKeyMaterial
     );
