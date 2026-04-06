@@ -6,6 +6,9 @@ pub enum SharingError {
     #[error("no channels provided")]
     EmptyChannels,
 
+    #[error("duplicate channel id: {0}")]
+    DuplicateChannelId(u64),
+
     #[error(
         "invalid threshold (threshold={threshold}, channels={channels}); must satisfy 2 <= threshold <= channels"
     )]
@@ -22,4 +25,7 @@ pub enum SharingError {
         #[source]
         source: derec_cryptography::vss::DerecVSSError,
     },
+
+    #[error("Helper rejected the share (status={status}): {memo}")]
+    HelperRejected { status: i32, memo: String },
 }

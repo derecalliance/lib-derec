@@ -159,19 +159,27 @@ pub fn random_oracle(msg: &[u8], rand: &[u8], tag: &[u8]) -> [u8; 4 * λ] {
 
 // A share's hash is SHA256(x || y).
 fn leaf_hash(share: (&Vec<u8>, &Vec<u8>)) -> Vec<u8> {
-    let mut hasher_input = Vec::new();
-    hasher_input.extend_from_slice(share.0);
-    hasher_input.extend_from_slice(share.1);
+    leaf_hash_pub(share.0, share.1)
+}
 
+/// Public entry point for leaf hashing used by [`super::verify`].
+pub fn leaf_hash_pub(x: &[u8], y: &[u8]) -> Vec<u8> {
+    let mut hasher_input = Vec::new();
+    hasher_input.extend_from_slice(x);
+    hasher_input.extend_from_slice(y);
     compute_sha256_hash(&hasher_input)
 }
 
 // computes the intermediate hash of two Merkle nodes
 fn intermediate_hash(left: &[u8], right: &[u8]) -> Vec<u8> {
+    intermediate_hash_pub(left, right)
+}
+
+/// Public entry point for intermediate hashing used by [`super::verify`].
+pub fn intermediate_hash_pub(left: &[u8], right: &[u8]) -> Vec<u8> {
     let mut hasher_input = Vec::new();
     hasher_input.extend_from_slice(left);
     hasher_input.extend_from_slice(right);
-
     compute_sha256_hash(&hasher_input)
 }
 

@@ -1,9 +1,5 @@
 import init, * as derec from "@derec-alliance/web";
 
-function sharedKey(byte: number): Uint8Array {
-    return new Uint8Array(32).fill(byte);
-}
-
 function asBytes(value: unknown): Uint8Array {
     if (value instanceof Uint8Array) {
         return value;
@@ -28,6 +24,10 @@ function extractWireBytes(value: unknown): Uint8Array {
     throw new Error(`Expected wire bytes or object with wire_bytes, got: ${JSON.stringify(value)}`);
 }
 
+function sharedKey(byte: number): Uint8Array {
+    return new Uint8Array(32).fill(byte);
+}
+
 async function main() {
     await init();
 
@@ -42,22 +42,17 @@ async function main() {
     sharedKeys.set(2n, sharedKey(2));
     sharedKeys.set(3n, sharedKey(3));
 
-    const channels = channelIds.map((channelId) => ({
-        channel_id: channelId,
-        shared_key: sharedKeys.get(channelId)!,
-    }));
-
+    // protect_secret now takes a plain array of channel IDs (no shared keys needed).
     const protectSecretResult = derec.protect_secret(
         secretId,
         secretData,
-        channels,
+        channelIds,
         threshold,
-        version,
-        [],
-        null
+        version
     );
     console.log("protect_secret:", protectSecretResult);
 
+    // Normalize shares result into a JS Map (channel ID → CommittedDeRecShare bytes)
     const shares = new Map<bigint, Uint8Array>();
 
     if (protectSecretResult instanceof Map) {
@@ -94,23 +89,62 @@ async function main() {
         );
     }
 
+    if (shares.size !== channelIds.length) {
+        throw new Error(`Sharing failed: expected ${channelIds.length} shares but got ${shares.size}`);
+    }
+
+    for (const [channelId, shareBytes] of shares.entries()) {
+        console.log(`channel = ${channelId}, committed share bytes = ${shareBytes?.length ?? 0}`);
+        if (!shareBytes || shareBytes.length === 0) {
+            throw new Error(`Sharing failed: empty CommittedDeRecShare bytes for channel ${channelId}`);
+        }
+    }
+
+    // Produce encrypted StoreShareRequestMessage envelopes for each channel.
+    const storedShares = new Map<bigint, Uint8Array>();
+
+    for (const [channelId, shareBytes] of shares.entries()) {
+        const key = sharedKeys.get(channelId)!;
+        const storeResult = derec.produce_store_share_request_message(
+            channelId,
+            version,
+            shareBytes,
+            [],
+            "",
+            key
+        );
+        const wireBytes = extractWireBytes(storeResult);
+        console.log(`store_share_request[${channelId}] wire bytes = ${wireBytes?.length ?? 0}`);
+        if (!wireBytes || wireBytes.length === 0) {
+            throw new Error(`Sharing failed: empty store share request wire bytes for channel ${channelId}`);
+        }
+        storedShares.set(channelId, wireBytes);
+
+        // Process the request from the Helper side.
+        const processResult = derec.produce_store_share_response_message(channelId, key, wireBytes);
+        const responseBytes = extractWireBytes(processResult);
+        const committedShareBytes = asBytes((processResult as any).committed_share);
+        console.log(`store_share_response[${channelId}] wire bytes = ${responseBytes?.length ?? 0}`);
+        console.log(`committed_share[${channelId}] bytes = ${committedShareBytes?.length ?? 0}`);
+        if (!responseBytes || responseBytes.length === 0) {
+            throw new Error(`Sharing failed: empty response wire bytes for channel ${channelId}`);
+        }
+        if (!committedShareBytes || committedShareBytes.length === 0) {
+            throw new Error(`Sharing failed: empty committed_share bytes for channel ${channelId}`);
+        }
+
+        derec.process_store_share_response_message(version, key, responseBytes);
+        console.log(`store_share_response validated ok[${channelId}]`);
+    }
+
+    console.log("Sharing flow test passed.");
+
     const someChannel = 1n;
     const otherChannel = 2n;
 
-    const someShare = shares.get(someChannel);
-    if (!someShare) {
-        throw new Error("missing share for channel 1");
-    }
-
-    const otherShare = shares.get(otherChannel);
-    if (!otherShare) {
-        throw new Error("missing share for channel 2");
-    }
-
-    const someSharedKey = sharedKeys.get(someChannel);
-    if (!someSharedKey) {
-        throw new Error("missing shared key for channel 1");
-    }
+    const someSharedKey = sharedKeys.get(someChannel)!;
+    const storedWire1 = storedShares.get(someChannel)!;
+    const storedWire2 = storedShares.get(otherChannel)!;
 
     const verificationRequestResult = derec.generate_verification_request(
         secretId,
@@ -126,7 +160,7 @@ async function main() {
         secretId,
         someChannel,
         someSharedKey,
-        someShare,
+        storedWire1,
         verificationRequestWireBytes
     );
     console.log("generate_verification_response:", verificationResponseResult);
@@ -137,7 +171,7 @@ async function main() {
         secretId,
         someChannel,
         someSharedKey,
-        someShare,
+        storedWire1,
         verificationResponseWireBytes
     );
     console.log("verify_share_response (expected true):", verificationExpectedTrue);
@@ -146,7 +180,7 @@ async function main() {
         secretId,
         someChannel,
         someSharedKey,
-        otherShare,
+        storedWire2,
         verificationResponseWireBytes
     );
     console.log("verify_share_response (expected false):", verificationExpectedFalse);
@@ -164,7 +198,7 @@ async function main() {
     const shareResponse1Result = derec.generate_share_response(
         secretId,
         1n,
-        shares.get(1n)!,
+        storedShares.get(1n)!,
         shareRequest1WireBytes,
         sharedKeys.get(1n)!
     );
@@ -185,7 +219,7 @@ async function main() {
     const shareResponse2Result = derec.generate_share_response(
         secretId,
         2n,
-        shares.get(2n)!,
+        storedShares.get(2n)!,
         shareRequest2WireBytes,
         sharedKeys.get(2n)!
     );
@@ -206,7 +240,7 @@ async function main() {
     const shareResponse3Result = derec.generate_share_response(
         secretId,
         3n,
-        shares.get(3n)!,
+        storedShares.get(3n)!,
         shareRequest3WireBytes,
         sharedKeys.get(3n)!
     );

@@ -51,9 +51,12 @@ struct CreateContactMessageResultJs {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ContactMessageJs {
-    channel_id: u64,
+    /// Serialized as a decimal string to safely round-trip u64 through JS,
+    /// which cannot represent integers above Number.MAX_SAFE_INTEGER (2^53-1).
+    channel_id: String,
     transport_protocol: TransportProtocolJs,
-    nonce: u64,
+    /// Serialized as a decimal string for the same reason as `channel_id`.
+    nonce: String,
     mlkem_encapsulation_key: Vec<u8>,
     ecies_public_key: Vec<u8>,
 }
@@ -313,6 +316,14 @@ fn js_to_transport_protocol(val: JsValue) -> Result<TransportProtocol, JsValue> 
 fn js_to_contact_message(val: JsValue) -> Result<ContactMessage, JsValue> {
     let input: ContactMessageJs = serde_wasm_bindgen::from_value(val)
         .map_err(|e| js_error("DECODE_ERROR", e.to_string()))?;
+    let channel_id = input
+        .channel_id
+        .parse::<u64>()
+        .map_err(|e| js_error("DECODE_ERROR", format!("invalid channel_id: {e}")))?;
+    let nonce = input
+        .nonce
+        .parse::<u64>()
+        .map_err(|e| js_error("DECODE_ERROR", format!("invalid nonce: {e}")))?;
     let protocol = match input.transport_protocol.protocol.to_lowercase().as_str() {
         "https" => 0,
         other => {
@@ -323,12 +334,12 @@ fn js_to_contact_message(val: JsValue) -> Result<ContactMessage, JsValue> {
         }
     };
     Ok(ContactMessage {
-        channel_id: input.channel_id,
+        channel_id,
         transport_protocol: Some(TransportProtocol {
             uri: input.transport_protocol.uri,
             protocol,
         }),
-        nonce: input.nonce,
+        nonce,
         mlkem_encapsulation_key: input.mlkem_encapsulation_key,
         ecies_public_key: input.ecies_public_key,
         timestamp: None,
@@ -345,9 +356,9 @@ fn contact_message_to_js(cm: &derec_proto::ContactMessage) -> ContactMessageJs {
             protocol: "https".to_owned(),
         });
     ContactMessageJs {
-        channel_id: cm.channel_id,
+        channel_id: cm.channel_id.to_string(),
         transport_protocol,
-        nonce: cm.nonce,
+        nonce: cm.nonce.to_string(),
         mlkem_encapsulation_key: cm.mlkem_encapsulation_key.clone(),
         ecies_public_key: cm.ecies_public_key.clone(),
     }

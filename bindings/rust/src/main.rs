@@ -7,7 +7,10 @@ use derec_library::recovery::{
     RecoveryResponseInput, generate_share_request, generate_share_response,
     recover_from_share_responses,
 };
-use derec_library::sharing::protect_secret;
+use derec_library::sharing::{
+    process_store_share_response_message, produce_store_share_request_message,
+    produce_store_share_response_message, protect_secret,
+};
 use derec_library::types::ChannelId;
 use derec_library::verification::{
     generate_verification_request, generate_verification_response, verify_share_response,
@@ -43,10 +46,13 @@ fn run_pairing_flow_test() {
 
     let channel_id = ChannelId(1);
 
-    let contact = create_contact_message(channel_id, TransportProtocol {
-        uri: "https://example.com/alice".to_owned(),
-        protocol: Protocol::Https.into(),
-    })
+    let contact = create_contact_message(
+        channel_id,
+        TransportProtocol {
+            uri: "https://example.com/alice".to_owned(),
+            protocol: Protocol::Https.into(),
+        },
+    )
     .expect("Pairing test failed: create_contact_message failed.");
 
     println!("contact.wire_bytes = {}", contact.wire_bytes.len());
@@ -121,11 +127,15 @@ fn run_pairing_flow_test() {
     }
 
     if initiator_tp.uri != "https://example.com/alice" {
-        panic!("Pairing test failed: initiator_contact_message URI does not match contact message.");
+        panic!(
+            "Pairing test failed: initiator_contact_message URI does not match contact message."
+        );
     }
 
     if initiator_tp.protocol() != Protocol::Https {
-        panic!("Pairing test failed: initiator_contact_message protocol does not match contact message.");
+        panic!(
+            "Pairing test failed: initiator_contact_message protocol does not match contact message."
+        );
     }
 
     if serialize_pairing_secret_key_material_len(&pair_request.secret_key) == 0 {
@@ -196,19 +206,8 @@ fn run_sharing_flow_test() {
     let threshold = 2_usize;
     let version = 1_i32;
 
-    let keep_list = [1_i32, 2, 3];
-    let shared_keys = make_shared_keys(&channels);
-
-    let result = protect_secret(
-        secret_id,
-        secret_data,
-        &shared_keys,
-        threshold,
-        version,
-        Some(&keep_list),
-        Some("v1 initial distribution"),
-    )
-    .expect("Sharing test failed: protect_secret failed.");
+    let result = protect_secret(secret_id, secret_data, &channels, threshold, version)
+        .expect("Sharing test failed: protect_secret failed.");
 
     println!("shares count = {}", result.shares.len());
 
@@ -229,16 +228,90 @@ fn run_sharing_flow_test() {
         }
     }
 
-    for (channel, bytes) in &result.shares {
-        println!("channel = {:?}", channel);
-        println!("share wire bytes = {}", bytes.len());
+    let shared_key = [42u8; 32];
 
-        if bytes.is_empty() {
+    for (channel, share) in &result.shares {
+        println!("channel = {:?}", channel);
+        println!("commitment bytes = {}", share.commitment.len());
+
+        if share.commitment.is_empty() {
             panic!(
-                "Sharing test failed: empty share bytes for channel {:?}.",
+                "Sharing test failed: empty commitment for channel {:?}.",
                 channel
             );
         }
+
+        let store_msg = produce_store_share_request_message(
+            *channel,
+            version,
+            share,
+            &[],
+            "",
+            &shared_key,
+        )
+        .unwrap_or_else(|_| {
+            panic!(
+                "Sharing test failed: produce_store_share_request_message failed for channel {:?}.",
+                channel
+            )
+        });
+
+        println!(
+            "store_share_request wire bytes = {}",
+            store_msg.wire_bytes.len()
+        );
+
+        if store_msg.wire_bytes.is_empty() {
+            panic!(
+                "Sharing test failed: empty store share request wire bytes for channel {:?}.",
+                channel
+            );
+        }
+
+        let processed = produce_store_share_response_message(
+            *channel,
+            &shared_key,
+            &store_msg.wire_bytes,
+        )
+        .unwrap_or_else(|_| {
+            panic!(
+                "Sharing test failed: produce_store_share_response_message failed for channel {:?}.",
+                channel
+            )
+        });
+
+        println!(
+            "store_share_response wire bytes = {}",
+            processed.wire_bytes.len()
+        );
+        println!(
+            "committed_share commitment bytes = {}",
+            processed.committed_share.commitment.len()
+        );
+
+        if processed.wire_bytes.is_empty() {
+            panic!(
+                "Sharing test failed: empty response wire bytes for channel {:?}.",
+                channel
+            );
+        }
+
+        if processed.committed_share.commitment.is_empty() {
+            panic!(
+                "Sharing test failed: empty committed_share commitment for channel {:?}.",
+                channel
+            );
+        }
+
+        process_store_share_response_message(version, &shared_key, &processed.wire_bytes)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Sharing test failed: process_store_share_response_message failed for channel {:?}: {}",
+                    channel, e
+                )
+            });
+
+        println!("store_share_response validated ok");
     }
 
     println!("Sharing flow test passed.");
@@ -253,31 +326,39 @@ fn run_verification_flow_test() {
     let threshold = 2_usize;
     let version = 1_i32;
 
-    let keep_list = [1_i32, 2, 3];
     let shared_keys = make_shared_keys(&channels);
 
-    let sharing = protect_secret(
-        secret_id,
-        secret_data,
-        &shared_keys,
-        threshold,
-        version,
-        Some(&keep_list),
-        Some("v1 initial distribution"),
-    )
-    .expect("Verification test failed: protect_secret failed.");
+    let sharing = protect_secret(secret_id, secret_data, &channels, threshold, version)
+        .expect("Verification test failed: protect_secret failed.");
 
     let channel_1 = ChannelId(1);
     let channel_2 = ChannelId(2);
 
-    let stored_share_request_wire_bytes_1 = sharing
-        .shares
-        .get(&channel_1)
-        .expect("Verification test failed: missing share for channel 1.");
-
     let shared_key_1 = shared_keys
         .get(&channel_1)
         .expect("Verification test failed: missing shared key for channel 1.");
+
+    let stored_wire_1 = produce_store_share_request_message(
+        channel_1,
+        version,
+        &sharing.shares[&channel_1],
+        &[],
+        "",
+        shared_key_1,
+    )
+    .expect("Verification test failed: produce_store_share_request_message failed for channel 1.")
+    .wire_bytes;
+
+    let stored_wire_2 = produce_store_share_request_message(
+        channel_2,
+        version,
+        &sharing.shares[&channel_2],
+        &[],
+        "",
+        shared_key_1,
+    )
+    .expect("Verification test failed: produce_store_share_request_message failed for channel 2.")
+    .wire_bytes;
 
     let request = generate_verification_request(secret_id, channel_1, version, shared_key_1)
         .expect("Verification test failed: generate_verification_request failed.");
@@ -290,7 +371,7 @@ fn run_verification_flow_test() {
         secret_id,
         channel_1,
         shared_key_1,
-        stored_share_request_wire_bytes_1,
+        &stored_wire_1,
         &request.wire_bytes,
     )
     .expect("Verification test failed: generate_verification_response failed.");
@@ -303,7 +384,7 @@ fn run_verification_flow_test() {
         secret_id,
         channel_1,
         shared_key_1,
-        stored_share_request_wire_bytes_1,
+        &stored_wire_1,
         &response.wire_bytes,
     )
     .expect("Verification test failed: verify_share_response failed for valid case.");
@@ -314,16 +395,11 @@ fn run_verification_flow_test() {
         panic!("Verification test failed: expected valid response.");
     }
 
-    let stored_share_request_wire_bytes_2 = sharing
-        .shares
-        .get(&channel_2)
-        .expect("Verification test failed: missing share for channel 2.");
-
     let invalid = verify_share_response(
         secret_id,
         channel_1,
         shared_key_1,
-        stored_share_request_wire_bytes_2,
+        &stored_wire_2,
         &response.wire_bytes,
     )
     .expect("Verification test failed: verify_share_response failed for invalid case.");
@@ -346,29 +422,43 @@ fn run_recovery_flow_test() {
     let threshold = 2_usize;
     let version = 1_i32;
 
-    let keep_list = [1_i32, 2, 3];
     let shared_keys = make_shared_keys(&channels);
 
-    let sharing = protect_secret(
-        secret_id,
-        secret_data,
-        &shared_keys,
-        threshold,
-        version,
-        Some(&keep_list),
-        Some("v1 initial distribution"),
-    )
-    .expect("Recovery test failed: protect_secret failed.");
+    let sharing = protect_secret(secret_id, secret_data, &channels, threshold, version)
+        .expect("Recovery test failed: protect_secret failed.");
 
     let channel_1 = ChannelId(1);
+    let channel_2 = ChannelId(2);
+
     let shared_key_1 = shared_keys
         .get(&channel_1)
         .expect("Recovery test failed: missing shared key for channel 1.");
 
-    let stored_share_request_wire_bytes_1 = sharing
-        .shares
-        .get(&channel_1)
-        .unwrap_or_else(|| panic!("Recovery test failed: missing share for channel 1."));
+    let shared_key_2 = shared_keys
+        .get(&channel_2)
+        .expect("Recovery test failed: missing shared key for channel 2.");
+
+    let stored_wire_1 = produce_store_share_request_message(
+        channel_1,
+        version,
+        &sharing.shares[&channel_1],
+        &[],
+        "",
+        shared_key_1,
+    )
+    .expect("Recovery test failed: produce_store_share_request_message failed for channel 1.")
+    .wire_bytes;
+
+    let stored_wire_2 = produce_store_share_request_message(
+        channel_2,
+        version,
+        &sharing.shares[&channel_2],
+        &[],
+        "",
+        shared_key_2,
+    )
+    .expect("Recovery test failed: produce_store_share_request_message failed for channel 2.")
+    .wire_bytes;
 
     let share_request_1 = generate_share_request(channel_1, &secret_id, version, shared_key_1)
         .expect("Recovery test failed: generate_share_request failed for channel 1.");
@@ -381,7 +471,7 @@ fn run_recovery_flow_test() {
         channel_1,
         &secret_id,
         &share_request_1.wire_bytes,
-        stored_share_request_wire_bytes_1,
+        &stored_wire_1,
         shared_key_1,
     )
     .unwrap_or_else(|_| {
@@ -392,16 +482,6 @@ fn run_recovery_flow_test() {
         "share_response[1] wire bytes = {}",
         share_response_1.wire_bytes.len()
     );
-
-    let channel_2 = ChannelId(2);
-    let shared_key_2 = shared_keys
-        .get(&channel_2)
-        .expect("Recovery test failed: missing shared key for channel 2.");
-
-    let stored_share_request_wire_bytes_2 = sharing
-        .shares
-        .get(&channel_2)
-        .unwrap_or_else(|| panic!("Recovery test failed: missing share for channel 2.",));
 
     let share_request_2 = generate_share_request(channel_2, &secret_id, version, shared_key_2)
         .expect("Recovery test failed: generate_share_request failed for channel 2.");
@@ -414,7 +494,7 @@ fn run_recovery_flow_test() {
         channel_2,
         &secret_id,
         &share_request_2.wire_bytes,
-        stored_share_request_wire_bytes_2,
+        &stored_wire_2,
         shared_key_2,
     )
     .unwrap_or_else(|_| {
@@ -436,8 +516,6 @@ fn run_recovery_flow_test() {
             shared_key: shared_key_2,
         },
     ];
-
-    //
 
     let recovered = recover_from_share_responses(&secret_id, version, &response_wire_bytes)
         .expect("Recovery test failed: recover_from_share_responses failed.");

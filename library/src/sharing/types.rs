@@ -1,19 +1,43 @@
 use crate::types::ChannelId;
+use derec_proto::CommittedDeRecShare;
 use std::collections::HashMap;
 
 /// Result of [`protect_secret`].
 ///
-/// This type contains one serialized share-delivery message per helper channel.
-///
-/// Each value in [`ProtectSecretResult::shares`] is a serialized outer
-/// [`derec_proto::DeRecMessage`] envelope ready to be sent to the corresponding
-/// helper. The envelope contains an encrypted inner
-/// [`derec_proto::StoreShareRequestMessage`].
+/// Contains one [`CommittedDeRecShare`] per helper channel, ready to be wrapped
+/// into a [`derec_proto::StoreShareRequestMessage`] and delivered to each helper
+/// using [`produce_store_share_request_message`].
 pub struct ProtectSecretResult {
-    /// Mapping from helper [`ChannelId`] to serialized outer
-    /// [`derec_proto::DeRecMessage`] wire bytes.
+    /// Mapping from helper [`ChannelId`] to its committed share.
     ///
-    /// Each envelope carries exactly one encrypted
-    /// [`derec_proto::StoreShareRequestMessage`] for that helper.
-    pub shares: HashMap<ChannelId, Vec<u8>>,
+    /// Each value is a cryptographically committed VSS share for that helper.
+    /// Pass each entry to [`produce_store_share_request_message`] together with
+    /// the helper's shared key to produce the encrypted delivery envelope.
+    pub shares: HashMap<ChannelId, CommittedDeRecShare>,
+}
+
+/// Result of [`produce_store_share_request_message`].
+pub struct ProduceStoreShareRequestMessageResult {
+    /// Serialized [`derec_proto::DeRecMessage`] envelope carrying an encrypted
+    /// [`derec_proto::StoreShareRequestMessage`] inner payload.
+    ///
+    /// Send these bytes to the helper over the channel transport.
+    /// The helper stores them and uses them to respond to verification
+    /// and recovery requests.
+    pub wire_bytes: Vec<u8>,
+}
+
+/// Result of [`process_store_share_request_message`].
+pub struct ProduceStoreShareResponseMessageResult {
+    /// Serialized [`derec_proto::DeRecMessage`] envelope carrying an encrypted
+    /// [`derec_proto::StoreShareResponseMessage`] inner payload.
+    ///
+    /// Send these bytes back to the owner over the channel transport.
+    pub wire_bytes: Vec<u8>,
+
+    /// The [`CommittedDeRecShare`] extracted from the request.
+    ///
+    /// The helper must persist this value. It is required to respond to
+    /// future verification and recovery requests on this channel.
+    pub committed_share: CommittedDeRecShare,
 }

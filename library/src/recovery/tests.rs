@@ -14,17 +14,13 @@ use derec_proto::{
     StoreShareRequestMessage,
 };
 use prost::Message;
-use std::collections::HashMap;
 
 fn make_shared_key(byte: u8) -> [u8; 32] {
     [byte; 32]
 }
 
-fn make_channels(ids: &[u64], shared_key: [u8; 32]) -> HashMap<ChannelId, [u8; 32]> {
-    ids.iter()
-        .copied()
-        .map(|id| (ChannelId(id), shared_key))
-        .collect()
+fn make_channel_ids(ids: &[u64]) -> Vec<ChannelId> {
+    ids.iter().copied().map(ChannelId).collect()
 }
 
 fn create_committed_share_bytes(secret_id: &[u8], version: i32) -> Vec<u8> {
@@ -669,25 +665,46 @@ fn test_recovery_end_to_end() {
     let secret_id = b"real_secret_id";
     let secret = b"real_secret_value";
     let shared_key = make_shared_key(42);
-    let channels = make_channels(&[21, 22, 23], shared_key);
+    let channel_ids = make_channel_ids(&[21, 22, 23]);
     let threshold = 2;
     let version = 2;
 
     let ProtectSecretResult { shares } =
-        sharing::protect_secret(secret_id, secret, &channels, threshold, version, None, None)
+        sharing::protect_secret(secret_id, secret, &channel_ids, threshold, version)
             .expect("protect_secret should succeed");
 
     let mut response_wire_bytes = Vec::new();
 
-    for channel_id in channels.keys() {
+    for channel_id in &channel_ids {
         let GenerateShareRequestResult {
             wire_bytes: request,
         } = generate_share_request(*channel_id, secret_id, version, &shared_key)
             .expect("generate_share_request should succeed");
 
-        let stored_share_wire_bytes = shares
+        // Wrap the CommittedDeRecShare into an encrypted StoreShareRequestMessage
+        // envelope (what produce_store_share_request_message will do once implemented).
+        let committed_share = shares
             .get(channel_id)
-            .expect("missing stored share envelope for channel");
+            .expect("missing committed share for channel");
+
+        let timestamp = current_timestamp();
+        let store_msg = StoreShareRequestMessage {
+            share: committed_share.encode_to_vec(),
+            share_algorithm: 0,
+            version,
+            keep_list: vec![],
+            version_description: String::new(),
+            timestamp: Some(timestamp),
+        };
+        let stored_share_wire_bytes = DeRecMessageBuilder::channel()
+            .channel_id(*channel_id)
+            .timestamp(timestamp)
+            .message(&store_msg)
+            .encrypt(&shared_key)
+            .expect("encryption should succeed")
+            .build()
+            .expect("build should succeed")
+            .encode_to_vec();
 
         let GenerateShareResponseResult {
             wire_bytes: response,
@@ -695,7 +712,7 @@ fn test_recovery_end_to_end() {
             *channel_id,
             secret_id,
             &request,
-            stored_share_wire_bytes,
+            &stored_share_wire_bytes,
             &shared_key,
         )
         .expect("generate_share_response should succeed");

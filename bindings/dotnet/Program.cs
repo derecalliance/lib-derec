@@ -126,36 +126,26 @@ internal static class Program
 
         byte[] secretId = new byte[] { 1, 2, 3, 4, 255 };
         byte[] secretData = new byte[] { 5, 6, 7, 8, 255 };
-        ulong[] channels = new ulong[] { 1, 2, 3 };
+        ulong[] channelIds = new ulong[] { 1, 2, 3 };
         ulong threshold = 2;
         int version = 1;
 
-        var sharedKeys = CreateChannelSharedKeys(channels);
+        var result = Sharing.ProtectSecret(secretId, secretData, channelIds, threshold, version);
 
-        var result = Sharing.ProtectSecret(
-            secretId,
-            secretData,
-            sharedKeys,
-            threshold,
-            version,
-            keepList: new[] { 1, 2, 3 },
-            description: "v1 initial distribution"
-        );
+        Console.WriteLine($"shares_wire_bytes total bytes = {result.SharesWireBytes.Length}");
 
-        Console.WriteLine($"share_message_wire_bytes_array total bytes = {result.ShareMessageWireBytesArray.Length}");
-
-        var shares = DeserializeShareMessageWireBytesArray(result.ShareMessageWireBytesArray);
+        var shares = DeserializeSharesWireBytes(result.SharesWireBytes);
 
         Console.WriteLine($"shares count = {shares.Count}");
 
-        if (shares.Count != channels.Length)
+        if (shares.Count != channelIds.Length)
         {
             throw new InvalidOperationException(
-                $"Sharing test failed: expected {channels.Length} shares but got {shares.Count}."
+                $"Sharing test failed: expected {channelIds.Length} shares but got {shares.Count}."
             );
         }
 
-        foreach (ulong channel in channels)
+        foreach (ulong channel in channelIds)
         {
             if (!shares.ContainsKey(channel))
             {
@@ -165,10 +155,12 @@ internal static class Program
             }
         }
 
+        var sharedKeys = CreateChannelSharedKeys(channelIds);
+
         foreach (var entry in shares)
         {
             Console.WriteLine($"channel = {entry.Key}");
-            Console.WriteLine($"share wire bytes = {entry.Value.Length}");
+            Console.WriteLine($"committed share bytes = {entry.Value.Length}");
 
             if (entry.Value.Length == 0)
             {
@@ -176,6 +168,55 @@ internal static class Program
                     $"Sharing test failed: empty share bytes for channel {entry.Key}."
                 );
             }
+
+            var storeResult = Sharing.ProduceStoreShareRequestMessage(
+                entry.Key,
+                version,
+                entry.Value,
+                Array.Empty<int>(),
+                string.Empty,
+                sharedKeys[entry.Key]
+            );
+
+            Console.WriteLine($"store_share_request wire bytes = {storeResult.WireBytes.Length}");
+
+            if (storeResult.WireBytes.Length == 0)
+            {
+                throw new InvalidOperationException(
+                    $"Sharing test failed: empty store share request wire bytes for channel {entry.Key}."
+                );
+            }
+
+            var processResult = Sharing.ProduceStoreShareResponseMessage(
+                entry.Key,
+                sharedKeys[entry.Key],
+                storeResult.WireBytes
+            );
+
+            Console.WriteLine($"store_share_response wire bytes = {processResult.WireBytes.Length}");
+            Console.WriteLine($"committed_share_bytes = {processResult.CommittedShareBytes.Length}");
+
+            if (processResult.WireBytes.Length == 0)
+            {
+                throw new InvalidOperationException(
+                    $"Sharing test failed: empty response wire bytes for channel {entry.Key}."
+                );
+            }
+
+            if (processResult.CommittedShareBytes.Length == 0)
+            {
+                throw new InvalidOperationException(
+                    $"Sharing test failed: empty committed_share_bytes for channel {entry.Key}."
+                );
+            }
+
+            Sharing.ProcessStoreShareResponseMessage(
+                version,
+                sharedKeys[entry.Key],
+                processResult.WireBytes
+            );
+
+            Console.WriteLine("store_share_response validated ok");
         }
 
         Console.WriteLine("Sharing flow test passed.");
@@ -193,46 +234,44 @@ internal static class Program
 
         var sharedKeys = CreateChannelSharedKeys(channels);
 
-        var sharing = Sharing.ProtectSecret(
-            secretId,
-            secretData,
-            sharedKeys,
-            threshold,
-            version,
-            keepList: new[] { 1, 2, 3 },
-            description: "v1 initial distribution"
-        );
+        var sharing = Sharing.ProtectSecret(secretId, secretData, channels, threshold, version);
+        var shares = DeserializeSharesWireBytes(sharing.SharesWireBytes);
 
-        var shares = DeserializeShareMessageWireBytesArray(sharing.ShareMessageWireBytesArray);
-
-        if (!shares.TryGetValue(1, out var storedShareRequestWireBytes1))
+        if (shares.Count != channels.Length)
         {
-            throw new InvalidOperationException("Verification test failed: missing share for channel 1.");
+            throw new InvalidOperationException(
+                $"Verification test failed: expected {channels.Length} shares but got {shares.Count}."
+            );
         }
 
-        if (!sharedKeys.TryGetValue(1, out var sharedKey1))
-        {
-            throw new InvalidOperationException("Verification test failed: missing shared key for channel 1.");
-        }
+        ulong channel1 = 1;
+        ulong channel2 = 2;
 
-        var request = Verification.GenerateVerificationRequest(secretId, 1, version, sharedKey1);
-        Console.WriteLine($"verification_request wire bytes = {request.Length}");
+        byte[] sharedKey1 = sharedKeys[channel1];
 
-        var response = Verification.GenerateVerificationResponse(
-            secretId,
-            1,
-            sharedKey1,
-            storedShareRequestWireBytes1,
-            request
+        byte[] storedWire1 = Sharing.ProduceStoreShareRequestMessage(
+            channel1, version, shares[channel1], Array.Empty<int>(), string.Empty, sharedKey1
+        ).WireBytes;
+
+        // Intentionally use sharedKey1 for channel2's envelope to test invalid verification.
+        byte[] storedWire2 = Sharing.ProduceStoreShareRequestMessage(
+            channel2, version, shares[channel2], Array.Empty<int>(), string.Empty, sharedKey1
+        ).WireBytes;
+
+        byte[] requestWireBytes = Verification.GenerateVerificationRequest(
+            secretId, channel1, version, sharedKey1
         );
-        Console.WriteLine($"verification_response wire bytes = {response.Length}");
+
+        Console.WriteLine($"verification_request wire bytes = {requestWireBytes.Length}");
+
+        byte[] responseWireBytes = Verification.GenerateVerificationResponse(
+            secretId, channel1, sharedKey1, storedWire1, requestWireBytes
+        );
+
+        Console.WriteLine($"verification_response wire bytes = {responseWireBytes.Length}");
 
         bool valid = Verification.VerifyShareResponse(
-            secretId,
-            1,
-            sharedKey1,
-            storedShareRequestWireBytes1,
-            response
+            secretId, channel1, sharedKey1, storedWire1, responseWireBytes
         );
 
         Console.WriteLine($"verification valid = {valid}");
@@ -242,17 +281,8 @@ internal static class Program
             throw new InvalidOperationException("Verification test failed: expected valid response.");
         }
 
-        if (!shares.TryGetValue(2, out var storedShareRequestWireBytes2))
-        {
-            throw new InvalidOperationException("Verification test failed: missing share for channel 2.");
-        }
-
         bool invalid = Verification.VerifyShareResponse(
-            secretId,
-            1,
-            sharedKey1,
-            storedShareRequestWireBytes2,
-            response
+            secretId, channel1, sharedKey1, storedWire2, responseWireBytes
         );
 
         Console.WriteLine($"verification invalid case = {invalid}");
@@ -277,58 +307,52 @@ internal static class Program
 
         var sharedKeys = CreateChannelSharedKeys(channels);
 
-        var sharing = Sharing.ProtectSecret(
-            secretId,
-            secretData,
-            sharedKeys,
-            threshold,
-            version,
-            keepList: new[] { 1, 2, 3 },
-            description: "v1 initial distribution"
-        );
+        var sharing = Sharing.ProtectSecret(secretId, secretData, channels, threshold, version);
+        var shares = DeserializeSharesWireBytes(sharing.SharesWireBytes);
 
-        var shares = DeserializeShareMessageWireBytesArray(sharing.ShareMessageWireBytesArray);
-
-        List<Recovery.RecoveryResponseInput> responses = new();
-
-        foreach (ulong channel in channels)
+        if (shares.Count != channels.Length)
         {
-            if (!shares.TryGetValue(channel, out var storedShareRequestWireBytes))
-            {
-                throw new InvalidOperationException(
-                    $"Recovery test failed: missing share for channel {channel}."
-                );
-            }
-
-            if (!sharedKeys.TryGetValue(channel, out var sharedKey))
-            {
-                throw new InvalidOperationException(
-                    $"Recovery test failed: missing shared key for channel {channel}."
-                );
-            }
-
-            byte[] shareRequest = Recovery.GenerateShareRequest(channel, secretId, version, sharedKey);
-            Console.WriteLine($"share_request[{channel}] wire bytes = {shareRequest.Length}");
-
-            byte[] shareResponse = Recovery.GenerateShareResponse(
-                channel,
-                secretId,
-                shareRequest,
-                storedShareRequestWireBytes,
-                sharedKey
+            throw new InvalidOperationException(
+                $"Recovery test failed: expected {channels.Length} shares but got {shares.Count}."
             );
-
-            Console.WriteLine($"share_response[{channel}] wire bytes = {shareResponse.Length}");
-
-            responses.Add(new Recovery.RecoveryResponseInput
-            {
-                Bytes = shareResponse,
-                SharedKey = sharedKey
-            });
         }
 
+        ulong channel1 = 1;
+        ulong channel2 = 2;
+
+        byte[] sharedKey1 = sharedKeys[channel1];
+        byte[] sharedKey2 = sharedKeys[channel2];
+
+        byte[] storedWire1 = Sharing.ProduceStoreShareRequestMessage(
+            channel1, version, shares[channel1], Array.Empty<int>(), string.Empty, sharedKey1
+        ).WireBytes;
+
+        byte[] storedWire2 = Sharing.ProduceStoreShareRequestMessage(
+            channel2, version, shares[channel2], Array.Empty<int>(), string.Empty, sharedKey2
+        ).WireBytes;
+
+        byte[] shareRequest1 = Recovery.GenerateShareRequest(channel1, secretId, version, sharedKey1);
+        Console.WriteLine($"share_request[1] wire bytes = {shareRequest1.Length}");
+
+        byte[] shareResponse1 = Recovery.GenerateShareResponse(
+            channel1, secretId, shareRequest1, storedWire1, sharedKey1
+        );
+        Console.WriteLine($"share_response[1] wire bytes = {shareResponse1.Length}");
+
+        byte[] shareRequest2 = Recovery.GenerateShareRequest(channel2, secretId, version, sharedKey2);
+        Console.WriteLine($"share_request[2] wire bytes = {shareRequest2.Length}");
+
+        byte[] shareResponse2 = Recovery.GenerateShareResponse(
+            channel2, secretId, shareRequest2, storedWire2, sharedKey2
+        );
+        Console.WriteLine($"share_response[2] wire bytes = {shareResponse2.Length}");
+
         byte[] recovered = Recovery.RecoverFromShareResponses(
-            responses,
+            new[]
+            {
+                new Recovery.RecoveryResponseInput { Bytes = shareResponse1, SharedKey = sharedKey1 },
+                new Recovery.RecoveryResponseInput { Bytes = shareResponse2, SharedKey = sharedKey2 },
+            },
             secretId,
             version
         );
@@ -344,21 +368,19 @@ internal static class Program
         Console.WriteLine("Recovery flow test passed.");
     }
 
-    private static Dictionary<ulong, byte[]> CreateChannelSharedKeys(IEnumerable<ulong> channels)
+    private static Dictionary<ulong, byte[]> CreateChannelSharedKeys(ulong[] channelIds)
     {
-        var result = new Dictionary<ulong, byte[]>();
-        byte fill = 1;
-
-        foreach (ulong channel in channels)
+        var keys = new Dictionary<ulong, byte[]>();
+        for (int i = 0; i < channelIds.Length; i++)
         {
-            result[channel] = Enumerable.Repeat(fill, 32).ToArray();
-            fill++;
+            var key = new byte[32];
+            Array.Fill(key, (byte)(i + 1));
+            keys[channelIds[i]] = key;
         }
-
-        return result;
+        return keys;
     }
 
-    private static Dictionary<ulong, byte[]> DeserializeShareMessageWireBytesArray(byte[] bytes)
+    private static Dictionary<ulong, byte[]> DeserializeSharesWireBytes(byte[] bytes)
     {
         var result = new Dictionary<ulong, byte[]>();
         int offset = 0;
@@ -376,7 +398,7 @@ internal static class Program
             if (offset + messageLen > bytes.Length)
             {
                 throw new InvalidOperationException(
-                    $"Unexpected end of share_message_wire_bytes_array while reading entry {i}."
+                    $"Unexpected end of shares_wire_bytes while reading entry {i}."
                 );
             }
 
@@ -387,7 +409,7 @@ internal static class Program
             if (result.ContainsKey(channelId))
             {
                 throw new InvalidOperationException(
-                    $"Duplicate channelId parsed from share_message_wire_bytes_array: {channelId}. " +
+                    $"Duplicate channelId parsed from shares_wire_bytes: {channelId}. " +
                     "This usually means the .NET deserializer no longer matches the Rust FFI format."
                 );
             }
@@ -398,7 +420,7 @@ internal static class Program
         if (offset != bytes.Length)
         {
             throw new InvalidOperationException(
-                $"Unexpected trailing bytes in share_message_wire_bytes_array. offset={offset}, total={bytes.Length}"
+                $"Unexpected trailing bytes in shares_wire_bytes. offset={offset}, total={bytes.Length}"
             );
         }
 

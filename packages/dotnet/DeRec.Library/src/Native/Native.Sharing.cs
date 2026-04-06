@@ -6,15 +6,6 @@ namespace DeRec.Library.Native;
 internal static class Sharing
 {
     [StructLayout(LayoutKind.Sequential)]
-    internal struct ChannelSharedKeyInput
-    {
-        public ulong ChannelId;
-
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)]
-        public byte[] SharedKey;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
     internal struct ProtectSecretResult
     {
         public Status Status;
@@ -27,13 +18,62 @@ internal static class Sharing
         UIntPtr secretIdLen,
         byte[] secretData,
         UIntPtr secretDataLen,
-        ChannelSharedKeyInput[] channels,
+        ulong[] channelIds,
         UIntPtr channelsLen,
         UIntPtr threshold,
+        int version
+    );
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct ProduceStoreShareRequestMessageResult
+    {
+        public Status Status;
+        public Buffer WireBytes;
+    }
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern ProduceStoreShareRequestMessageResult produce_store_share_request_message(
+        ulong channelId,
         int version,
-        int[]? keepList,
+        byte[] committedShare,
+        UIntPtr committedShareLen,
+        int[] keepList,
         UIntPtr keepListLen,
-        byte[]? description,
-        UIntPtr descriptionLen
+        byte[] description,
+        UIntPtr descriptionLen,
+        byte[] sharedKey,
+        UIntPtr sharedKeyLen
+    );
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct ProduceStoreShareResponseMessageResult
+    {
+        public Status Status;
+        public Buffer WireBytes;
+        public Buffer CommittedShareBytes;
+    }
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern ProduceStoreShareResponseMessageResult produce_store_share_response_message(
+        ulong channelId,
+        byte[] sharedKey,
+        UIntPtr sharedKeyLen,
+        byte[] requestBytes,
+        UIntPtr requestBytesLen
+    );
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct ProcessStoreShareResponseMessageResult
+    {
+        public Status Status;
+    }
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern ProcessStoreShareResponseMessageResult process_store_share_response_message(
+        int version,
+        byte[] sharedKey,
+        UIntPtr sharedKeyLen,
+        byte[] responseBytes,
+        UIntPtr responseBytesLen
     );
 }
