@@ -35,6 +35,8 @@ internal static class Sharing
     internal static extern ProduceStoreShareRequestMessageResult produce_store_share_request_message(
         ulong channelId,
         int version,
+        byte[] secretId,
+        UIntPtr secretIdLen,
         byte[] committedShare,
         UIntPtr committedShareLen,
         int[] keepList,
@@ -51,6 +53,8 @@ internal static class Sharing
         public Status Status;
         public Buffer WireBytes;
         public Buffer CommittedShareBytes;
+        public Buffer SecretIdBytes;
+        public int Version;
     }
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]

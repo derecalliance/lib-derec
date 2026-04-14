@@ -6,17 +6,29 @@ namespace DeRec.Library.Native;
 internal static class Verification
 {
     [StructLayout(LayoutKind.Sequential)]
-    internal struct GenerateVerificationRequestResult
+    internal struct ProduceVerifyShareRequestMessageResult
     {
         public Status Status;
         public Buffer RequestWireBytes;
+        public int MessageType;
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    internal struct GenerateVerificationResponseResult
+    internal struct ExtractVerifyShareRequestResult
+    {
+        public Status Status;
+        public ulong ChannelId;
+        public Buffer SecretId;
+        public int Version;
+        public ulong Nonce;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct ProduceVerifyShareResponseMessageResult
     {
         public Status Status;
         public Buffer ResponseWireBytes;
+        public int MessageType;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -28,39 +40,55 @@ internal static class Verification
         public bool IsValid;
     }
 
+    /// <summary>
+    /// Builds an encrypted verification request envelope. The envelope's
+    /// <c>message_type</c> is set to <c>VERIFY_SHARE_REQUEST</c>.
+    /// </summary>
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
-    internal static extern GenerateVerificationRequestResult generate_verification_request(
+    internal static extern ProduceVerifyShareRequestMessageResult produce_verify_share_request_message(
+        ulong channelId,
         byte[] secretId,
         UIntPtr secretIdLen,
-        ulong channelId,
         int version,
         byte[] sharedKey,
         UIntPtr sharedKeyLen
     );
 
+    /// <summary>
+    /// Decodes and decrypts a verification request envelope in a single call.
+    /// Returns <c>channel_id</c>, <c>secret_id</c>, <c>version</c>, and <c>nonce</c>.
+    /// </summary>
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
-    internal static extern GenerateVerificationResponseResult generate_verification_response(
-        byte[] secretId,
-        UIntPtr secretIdLen,
-        ulong channelId,
-        byte[] sharedKey,
-        UIntPtr sharedKeyLen,
-        byte[] shareContent,
-        UIntPtr shareContentLen,
+    internal static extern ExtractVerifyShareRequestResult extract_verify_share_request(
         byte[] requestWireBytes,
-        UIntPtr requestWireBytesLen
+        UIntPtr requestWireBytesLen,
+        byte[] sharedKey,
+        UIntPtr sharedKeyLen
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
-    internal static extern VerifyShareResponseResult verify_share_response(
+    internal static extern ProduceVerifyShareResponseMessageResult produce_verify_share_response_message(
+        ulong channelId,
         byte[] secretId,
         UIntPtr secretIdLen,
-        ulong channelId,
+        int version,
+        ulong nonce,
         byte[] sharedKey,
         UIntPtr sharedKeyLen,
         byte[] shareContent,
-        UIntPtr shareContentLen,
+        UIntPtr shareContentLen
+    );
+
+    /// <summary>
+    /// Decodes and decrypts the response envelope, then validates the SHA-384 proof.
+    /// </summary>
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern VerifyShareResponseResult process_verify_share_response_message(
         byte[] responseWireBytes,
-        UIntPtr responseWireBytesLen
+        UIntPtr responseWireBytesLen,
+        byte[] sharedKey,
+        UIntPtr sharedKeyLen,
+        byte[] shareContent,
+        UIntPtr shareContentLen
     );
 }

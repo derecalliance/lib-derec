@@ -1,17 +1,19 @@
 //! C FFI exports for the DeRec *verification* flow.
 //!
 //! This module exposes verification through a C-compatible ABI so that
-//! non-Rust consumers can:
+//! non-Rust consumers can run the complete Owner/Helper protocol.
 //!
-//! 1. Create a verification request envelope
-//! 2. Produce a verification response envelope from stored share bytes
-//! 3. Verify a received verification response envelope against expected share content
+//! **Owner side**
 //!
-//! The verification flow is exposed through three FFI entry points:
+//! 1. [`produce_verify_share_request_message`] — builds the encrypted challenge envelope
+//! 2. [`process_verify_share_response_message`] — decrypts and validates the Helper's proof
 //!
-//! - [`generate_verification_request`]
-//! - [`generate_verification_response`]
-//! - [`verify_share_response`]
+//! **Helper side**
+//!
+//! 1. [`extract_verify_share_request`] — decodes the outer envelope from wire bytes and
+//!    decrypts the inner challenge using the channel shared key, returning `channel_id`,
+//!    `secret_id`, `version`, and `nonce` in one call
+//! 2. [`produce_verify_share_response_message`] — builds the encrypted proof envelope
 //!
 //! All exported functions follow the common FFI pattern used across the SDK:
 //!
@@ -26,67 +28,86 @@
 //! - secret IDs and share contents are passed as `(*const u8, usize)` byte buffers
 //! - shared symmetric keys are passed as `(*const u8, usize)` byte buffers and must
 //!   be exactly 32 bytes long
-//! - request and response inputs are passed as serialized outer `DeRecMessage` bytes
-//! - request and response outputs are returned as serialized outer `DeRecMessage` bytes
-//! - returned buffers must be released by the caller using the common FFI
-//!   buffer-freeing helper exposed elsewhere in the FFI surface
-//! - on error, output buffers are returned empty and `is_valid` is returned as `false`
-//!   where applicable, with details reported in the returned [`DeRecStatus`]
-//!
-//! # Notes
-//!
-//! - verification requests and responses are exchanged as serialized outer
-//!   `DeRecMessage` envelopes whose inner messages are encrypted
-//! - this module does not expose Rust-native verification structs directly over FFI
-//! - protobuf decoding and protocol validation are delegated to the core Rust SDK
+//! - request and response wire bytes are serialized outer `DeRecMessage` envelopes
+//! - returned buffers must be released by the caller via the common FFI buffer-freeing helper
+//! - on error, output buffers are returned empty and `is_valid` is `false` where applicable
 
 use crate::ffi::common::{
     DeRecBuffer, DeRecStatus, empty_buffer, err_status, ok_status, vec_into_buffer,
 };
+use derec_proto::DeRecMessage;
+use prost::Message as _;
 
-/// FFI result returned by [`generate_verification_request`].
+/// FFI result returned by [`produce_verify_share_request_message`].
 ///
 /// On success:
 ///
 /// - `status` indicates success
-/// - `verify_share_request_message` contains serialized outer `DeRecMessage` bytes
+/// - `request_wire_bytes` contains serialized outer `DeRecMessage` bytes
 ///   carrying an encrypted inner `VerifyShareRequestMessage`
+/// - `message_type` is the `MessageType` discriminant from the outer envelope
 ///
 /// On failure:
 ///
 /// - `status` contains an error
-/// - `verify_share_request_message` is empty
+/// - `request_wire_bytes` is empty
 #[repr(C)]
-pub struct GenerateVerificationRequestResult {
+pub struct ProduceVerifyShareRequestMessageResult {
     pub status: DeRecStatus,
     pub request_wire_bytes: DeRecBuffer,
+    pub message_type: i32,
 }
 
-/// FFI result returned by [`generate_verification_response`].
+/// FFI result returned by [`extract_verify_share_request`].
 ///
 /// On success:
 ///
 /// - `status` indicates success
-/// - `verify_share_response_message` contains serialized outer `DeRecMessage` bytes
-///   carrying an encrypted inner `VerifyShareResponseMessage`
+/// - `channel_id` is the channel extracted from the **unencrypted** outer envelope
+/// - `secret_id` is the secret identifier from the decrypted inner request
+/// - `version` is the share-distribution version being challenged
+/// - `nonce` is the Owner's random challenge value — pass unchanged to
+///   [`produce_verify_share_response_message`]
 ///
 /// On failure:
 ///
 /// - `status` contains an error
-/// - `verify_share_response_message` is empty
+/// - all other fields are zeroed / empty
 #[repr(C)]
-pub struct GenerateVerificationResponseResult {
+pub struct ExtractVerifyShareRequestResult {
     pub status: DeRecStatus,
-    pub response_wire_bytes: DeRecBuffer,
+    pub channel_id: u64,
+    pub secret_id: DeRecBuffer,
+    pub version: i32,
+    pub nonce: u64,
 }
 
-/// FFI result returned by [`verify_share_response`].
+/// FFI result returned by [`produce_verify_share_response_message`].
 ///
 /// On success:
 ///
 /// - `status` indicates success
-/// - `is_valid` indicates whether the provided response matches the expected
-///   share content
+/// - `response_wire_bytes` contains serialized outer `DeRecMessage` bytes
+///   carrying an encrypted inner `VerifyShareResponseMessage`
+/// - `message_type` is the `MessageType` discriminant from the outer envelope
+///
+/// On failure:
+///
+/// - `status` contains an error
+/// - `response_wire_bytes` is empty
+#[repr(C)]
+pub struct ProduceVerifyShareResponseMessageResult {
+    pub status: DeRecStatus,
+    pub response_wire_bytes: DeRecBuffer,
+    pub message_type: i32,
+}
+
+/// FFI result returned by [`process_verify_share_response_message`].
+///
+/// On success:
+///
+/// - `status` indicates success
+/// - `is_valid` indicates whether the SHA-384 proof matches the expected share content
 ///
 /// On failure:
 ///
@@ -98,66 +119,46 @@ pub struct VerifyShareResponseResult {
     pub is_valid: bool,
 }
 
-/// Creates a serialized verification request envelope.
+/// Creates a serialized verification request envelope (Owner side, step 1).
 ///
-/// This is the C FFI entry point for the first step of the DeRec verification flow.
-///
-/// The caller provides:
-///
-/// - a secret ID
-/// - a channel ID
-/// - a share-distribution version
-/// - the 32-byte shared symmetric key established during pairing
-///
-/// On success, this function returns serialized outer `DeRecMessage` bytes
-/// carrying an encrypted inner `VerifyShareRequestMessage`.
+/// Embeds `secret_id`, `version`, a fresh nonce, and a timestamp inside an encrypted
+/// inner `VerifyShareRequestMessage`, then wraps it in an outer `DeRecMessage` envelope.
+/// The envelope's `message_type` is set to `VERIFY_SHARE_REQUEST`.
 ///
 /// # Arguments
 ///
-/// * `secret_id_ptr` - Pointer to secret ID bytes.
-/// * `secret_id_len` - Length of the secret ID buffer.
-/// * `channel_id` - Channel identifier associated with the paired helper.
+/// * `channel_id` - Channel identifier for the paired Helper.
+/// * `secret_id_ptr` / `secret_id_len` - Secret ID bytes embedded in the request.
 /// * `version` - Share-distribution version being verified.
-/// * `shared_key_ptr` - Pointer to 32-byte shared symmetric key bytes.
-/// * `shared_key_len` - Length of the shared key buffer. Must be exactly `32`.
+/// * `shared_key_ptr` / `shared_key_len` - 32-byte shared symmetric key. Must be exactly 32.
 ///
 /// # Returns
 ///
-/// Returns [`GenerateVerificationRequestResult`].
-///
-/// # Errors
-///
-/// The returned `status` indicates failure if:
-///
-/// - `secret_id_ptr` is null while `secret_id_len > 0`
-/// - `shared_key_ptr` is null while `shared_key_len > 0`
-/// - `shared_key_len != 32`
-/// - the underlying Rust verification API returns an error
+/// Returns [`ProduceVerifyShareRequestMessageResult`].
 ///
 /// # Safety
 ///
 /// Non-null input pointers must point to the corresponding readable byte ranges.
 #[unsafe(no_mangle)]
-pub extern "C" fn generate_verification_request(
+pub extern "C" fn produce_verify_share_request_message(
+    channel_id: u64,
     secret_id_ptr: *const u8,
     secret_id_len: usize,
-    channel_id: u64,
     version: i32,
     shared_key_ptr: *const u8,
     shared_key_len: usize,
-) -> GenerateVerificationRequestResult {
-    if secret_id_ptr.is_null() && secret_id_len > 0 {
-        return GenerateVerificationRequestResult {
-            status: err_status("secret_id_ptr is null"),
-            request_wire_bytes: empty_buffer(),
-        };
-    }
+) -> ProduceVerifyShareRequestMessageResult {
+    let err = |msg: &str| ProduceVerifyShareRequestMessageResult {
+        status: err_status(msg),
+        request_wire_bytes: empty_buffer(),
+        message_type: 0,
+    };
 
+    if secret_id_ptr.is_null() && secret_id_len > 0 {
+        return err("secret_id_ptr is null");
+    }
     if shared_key_ptr.is_null() && shared_key_len > 0 {
-        return GenerateVerificationRequestResult {
-            status: err_status("shared_key_ptr is null"),
-            request_wire_bytes: empty_buffer(),
-        };
+        return err("shared_key_ptr is null");
     }
 
     let secret_id: &[u8] = if secret_id_len == 0 {
@@ -173,150 +174,64 @@ pub extern "C" fn generate_verification_request(
     };
 
     let shared_key: [u8; 32] = match shared_key_bytes.try_into() {
-        Ok(value) => value,
-        Err(_) => {
-            return GenerateVerificationRequestResult {
-                status: err_status("shared_key must be exactly 32 bytes"),
-                request_wire_bytes: empty_buffer(),
-            };
-        }
+        Ok(v) => v,
+        Err(_) => return err("shared_key must be exactly 32 bytes"),
     };
 
-    let result = match crate::verification::generate_verification_request(
-        secret_id,
+    match crate::primitives::verification::request::produce(
         channel_id.into(),
+        secret_id,
         version,
         &shared_key,
     ) {
-        Ok(value) => value,
-        Err(err) => {
-            return GenerateVerificationRequestResult {
-                status: err_status(err.to_string()),
-                request_wire_bytes: empty_buffer(),
-            };
-        }
-    };
-
-    GenerateVerificationRequestResult {
-        status: ok_status(),
-        request_wire_bytes: vec_into_buffer(result.wire_bytes),
+        Ok(r) => ProduceVerifyShareRequestMessageResult {
+            status: ok_status(),
+            request_wire_bytes: vec_into_buffer(r.envelope),
+            message_type: 0,
+        },
+        Err(e) => err(&e.to_string()),
     }
 }
 
-/// Produces a serialized verification response envelope from a verification request.
+/// Decodes and decrypts a verification request envelope (Helper side, step 1).
 ///
-/// This is the C FFI entry point used by a helper/responding party to answer
-/// a verification challenge using its stored share content.
-///
-/// The caller provides:
-///
-/// - a secret ID
-/// - a channel ID
-/// - the 32-byte shared symmetric key established during pairing
-/// - raw share content bytes
-/// - serialized outer `DeRecMessage` bytes carrying an encrypted inner
-///   `VerifyShareRequestMessage`
-///
-/// On success, this function returns serialized outer `DeRecMessage` bytes
-/// carrying an encrypted inner `VerifyShareResponseMessage`.
+/// Decodes the outer `DeRecMessage` from wire bytes, then decrypts the inner
+/// `VerifyShareRequestMessage` using the channel's shared key. Validates the timestamp
+/// invariant and returns `channel_id`, `secret_id`, `version`, and `nonce` in a single call.
 ///
 /// # Arguments
 ///
-/// * `secret_id_ptr` - Pointer to secret ID bytes.
-/// * `secret_id_len` - Length of the secret ID buffer.
-/// * `channel_id` - Channel identifier associated with the share.
-/// * `shared_key_ptr` - Pointer to 32-byte shared symmetric key bytes.
-/// * `shared_key_len` - Length of the shared key buffer. Must be exactly `32`.
-/// * `share_content_ptr` - Pointer to raw share content bytes.
-/// * `share_content_len` - Length of the share content buffer.
-/// * `request_ptr` - Pointer to serialized outer request envelope bytes.
-/// * `request_len` - Length of the serialized request buffer.
+/// * `request_ptr` / `request_len` - Serialized outer `DeRecMessage` wire bytes.
+/// * `shared_key_ptr` / `shared_key_len` - 32-byte shared symmetric key. Must be exactly 32.
 ///
 /// # Returns
 ///
-/// Returns [`GenerateVerificationResponseResult`].
-///
-/// # Errors
-///
-/// The returned `status` indicates failure if:
-///
-/// - `secret_id_ptr` is null while `secret_id_len > 0`
-/// - `shared_key_ptr` is null while `shared_key_len > 0`
-/// - `shared_key_len != 32`
-/// - `share_content_ptr` is null while `share_content_len > 0`
-/// - `request_ptr` is null while `request_len > 0`
-/// - the underlying Rust verification API returns an error
+/// Returns [`ExtractVerifyShareRequestResult`].
 ///
 /// # Safety
 ///
-/// All non-null input pointers must point to the corresponding readable byte ranges.
+/// Non-null input pointers must point to the corresponding readable byte ranges.
 #[unsafe(no_mangle)]
-pub extern "C" fn generate_verification_response(
-    secret_id_ptr: *const u8,
-    secret_id_len: usize,
-    channel_id: u64,
-    shared_key_ptr: *const u8,
-    shared_key_len: usize,
-    share_content_ptr: *const u8,
-    share_content_len: usize,
+pub extern "C" fn extract_verify_share_request(
     request_ptr: *const u8,
     request_len: usize,
-) -> GenerateVerificationResponseResult {
-    if secret_id_ptr.is_null() && secret_id_len > 0 {
-        return GenerateVerificationResponseResult {
-            status: err_status("secret_id_ptr is null"),
-            response_wire_bytes: empty_buffer(),
-        };
-    }
-
-    if shared_key_ptr.is_null() && shared_key_len > 0 {
-        return GenerateVerificationResponseResult {
-            status: err_status("shared_key_ptr is null"),
-            response_wire_bytes: empty_buffer(),
-        };
-    }
-
-    if share_content_ptr.is_null() && share_content_len > 0 {
-        return GenerateVerificationResponseResult {
-            status: err_status("share_content_ptr is null"),
-            response_wire_bytes: empty_buffer(),
-        };
-    }
+    shared_key_ptr: *const u8,
+    shared_key_len: usize,
+) -> ExtractVerifyShareRequestResult {
+    let err = |msg: &str| ExtractVerifyShareRequestResult {
+        status: err_status(msg),
+        channel_id: 0,
+        secret_id: empty_buffer(),
+        version: 0,
+        nonce: 0,
+    };
 
     if request_ptr.is_null() && request_len > 0 {
-        return GenerateVerificationResponseResult {
-            status: err_status("request_ptr is null"),
-            response_wire_bytes: empty_buffer(),
-        };
+        return err("request_ptr is null");
     }
-
-    let secret_id: &[u8] = if secret_id_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(secret_id_ptr, secret_id_len) }
-    };
-
-    let shared_key_bytes: &[u8] = if shared_key_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(shared_key_ptr, shared_key_len) }
-    };
-
-    let shared_key: [u8; 32] = match shared_key_bytes.try_into() {
-        Ok(value) => value,
-        Err(_) => {
-            return GenerateVerificationResponseResult {
-                status: err_status("shared_key must be exactly 32 bytes"),
-                response_wire_bytes: empty_buffer(),
-            };
-        }
-    };
-
-    let share_content: &[u8] = if share_content_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(share_content_ptr, share_content_len) }
-    };
+    if shared_key_ptr.is_null() && shared_key_len > 0 {
+        return err("shared_key_ptr is null");
+    }
 
     let request_bytes: &[u8] = if request_len == 0 {
         &[]
@@ -324,118 +239,83 @@ pub extern "C" fn generate_verification_response(
         unsafe { std::slice::from_raw_parts(request_ptr, request_len) }
     };
 
-    let result = match crate::verification::generate_verification_response(
-        secret_id,
-        channel_id.into(),
-        &shared_key,
-        share_content,
-        request_bytes,
-    ) {
-        Ok(value) => value,
-        Err(err) => {
-            return GenerateVerificationResponseResult {
-                status: err_status(err.to_string()),
-                response_wire_bytes: empty_buffer(),
-            };
-        }
+    let shared_key_bytes: &[u8] = if shared_key_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(shared_key_ptr, shared_key_len) }
     };
 
-    GenerateVerificationResponseResult {
-        status: ok_status(),
-        response_wire_bytes: vec_into_buffer(result.wire_bytes),
+    let shared_key: [u8; 32] = match shared_key_bytes.try_into() {
+        Ok(v) => v,
+        Err(_) => return err("shared_key must be exactly 32 bytes"),
+    };
+
+    let channel_id = match DeRecMessage::decode(request_bytes) {
+        Ok(e) => e.channel_id,
+        Err(e) => return err(&format!("failed to decode envelope: {e}")),
+    };
+
+    match crate::primitives::verification::request::extract(request_bytes, &shared_key) {
+        Ok(r) => ExtractVerifyShareRequestResult {
+            status: ok_status(),
+            channel_id,
+            secret_id: vec_into_buffer(r.request.secret_id),
+            version: r.request.version,
+            nonce: r.request.nonce,
+        },
+        Err(e) => err(&e.to_string()),
     }
 }
 
-/// Verifies a serialized verification response envelope against expected share content.
+/// Produces a serialized verification response envelope (Helper side, step 2).
 ///
-/// This is the C FFI entry point used by the requesting party to validate a helper’s
-/// verification response.
-///
-/// The caller provides:
-///
-/// - a secret ID
-/// - a channel ID
-/// - the 32-byte shared symmetric key established during pairing
-/// - the expected raw share content bytes
-/// - serialized outer `DeRecMessage` bytes carrying an encrypted inner
-///   `VerifyShareResponseMessage`
-///
-/// On success, the function returns whether the response is valid for the provided
-/// share content.
+/// Computes `SHA384(share_content || nonce_be)` and returns an encrypted
+/// `VerifyShareResponseMessage` with the proof and all echoed request fields.
+/// The envelope's `message_type` is set to `VERIFY_SHARE_RESPONSE`.
 ///
 /// # Arguments
 ///
-/// * `secret_id_ptr` - Pointer to secret ID bytes.
-/// * `secret_id_len` - Length of the secret ID buffer.
-/// * `channel_id` - Channel identifier associated with the share.
-/// * `shared_key_ptr` - Pointer to 32-byte shared symmetric key bytes.
-/// * `shared_key_len` - Length of the shared key buffer. Must be exactly `32`.
-/// * `share_content_ptr` - Pointer to raw share content bytes.
-/// * `share_content_len` - Length of the share content buffer.
-/// * `response_ptr` - Pointer to serialized outer response envelope bytes.
-/// * `response_len` - Length of the serialized response buffer.
+/// * `channel_id` - Channel identifier.
+/// * `secret_id_ptr` / `secret_id_len` - Secret ID from [`extract_verify_share_request`].
+///   Echoed verbatim into the response.
+/// * `version` - Version from [`extract_verify_share_request`].
+/// * `nonce` - Nonce from [`extract_verify_share_request`]. Must be passed unchanged.
+/// * `shared_key_ptr` / `shared_key_len` - 32-byte shared symmetric key. Must be exactly 32.
+/// * `share_content_ptr` / `share_content_len` - Raw share bytes whose possession is proven.
 ///
 /// # Returns
 ///
-/// Returns [`VerifyShareResponseResult`].
-///
-/// On success:
-///
-/// - `status` indicates success
-/// - `is_valid` is `true` if the response verifies correctly, otherwise `false`
-///
-/// # Errors
-///
-/// The returned `status` indicates failure if:
-///
-/// - `secret_id_ptr` is null while `secret_id_len > 0`
-/// - `shared_key_ptr` is null while `shared_key_len > 0`
-/// - `shared_key_len != 32`
-/// - `share_content_ptr` is null while `share_content_len > 0`
-/// - `response_ptr` is null while `response_len > 0`
-/// - the underlying Rust verification API returns an error
+/// Returns [`ProduceVerifyShareResponseMessageResult`].
 ///
 /// # Safety
 ///
 /// All non-null input pointers must point to the corresponding readable byte ranges.
 #[unsafe(no_mangle)]
-pub extern "C" fn verify_share_response(
+pub extern "C" fn produce_verify_share_response_message(
+    channel_id: u64,
     secret_id_ptr: *const u8,
     secret_id_len: usize,
-    channel_id: u64,
+    version: i32,
+    nonce: u64,
     shared_key_ptr: *const u8,
     shared_key_len: usize,
     share_content_ptr: *const u8,
     share_content_len: usize,
-    response_ptr: *const u8,
-    response_len: usize,
-) -> VerifyShareResponseResult {
+) -> ProduceVerifyShareResponseMessageResult {
+    let err = |msg: &str| ProduceVerifyShareResponseMessageResult {
+        status: err_status(msg),
+        response_wire_bytes: empty_buffer(),
+        message_type: 0,
+    };
+
     if secret_id_ptr.is_null() && secret_id_len > 0 {
-        return VerifyShareResponseResult {
-            status: err_status("secret_id_ptr is null"),
-            is_valid: false,
-        };
+        return err("secret_id_ptr is null");
     }
-
     if shared_key_ptr.is_null() && shared_key_len > 0 {
-        return VerifyShareResponseResult {
-            status: err_status("shared_key_ptr is null"),
-            is_valid: false,
-        };
+        return err("shared_key_ptr is null");
     }
-
     if share_content_ptr.is_null() && share_content_len > 0 {
-        return VerifyShareResponseResult {
-            status: err_status("share_content_ptr is null"),
-            is_valid: false,
-        };
-    }
-
-    if response_ptr.is_null() && response_len > 0 {
-        return VerifyShareResponseResult {
-            status: err_status("response_ptr is null"),
-            is_valid: false,
-        };
+        return err("share_content_ptr is null");
     }
 
     let secret_id: &[u8] = if secret_id_len == 0 {
@@ -451,13 +331,8 @@ pub extern "C" fn verify_share_response(
     };
 
     let shared_key: [u8; 32] = match shared_key_bytes.try_into() {
-        Ok(value) => value,
-        Err(_) => {
-            return VerifyShareResponseResult {
-                status: err_status("shared_key must be exactly 32 bytes"),
-                is_valid: false,
-            };
-        }
+        Ok(v) => v,
+        Err(_) => return err("shared_key must be exactly 32 bytes"),
     };
 
     let share_content: &[u8] = if share_content_len == 0 {
@@ -466,30 +341,109 @@ pub extern "C" fn verify_share_response(
         unsafe { std::slice::from_raw_parts(share_content_ptr, share_content_len) }
     };
 
+    let request = derec_proto::VerifyShareRequestMessage {
+        secret_id: secret_id.to_vec(),
+        version,
+        nonce,
+        timestamp: None,
+    };
+
+    match crate::primitives::verification::response::produce(
+        channel_id.into(),
+        &request,
+        &shared_key,
+        share_content,
+    ) {
+        Ok(r) => ProduceVerifyShareResponseMessageResult {
+            status: ok_status(),
+            response_wire_bytes: vec_into_buffer(r.envelope),
+            message_type: 0,
+        },
+        Err(e) => err(&e.to_string()),
+    }
+}
+
+/// Decrypts and validates a verification response envelope (Owner side, step 2).
+///
+/// Decodes the outer `DeRecMessage`, decrypts the inner `VerifyShareResponseMessage`,
+/// validates the timestamp invariant, and checks whether the SHA-384 proof matches
+/// `SHA384(share_content || nonce_be)`.
+///
+/// # Arguments
+///
+/// * `response_ptr` / `response_len` - Serialized outer `DeRecMessage` response wire bytes.
+/// * `shared_key_ptr` / `shared_key_len` - 32-byte shared symmetric key. Must be exactly 32.
+/// * `share_content_ptr` / `share_content_len` - Expected share bytes.
+///
+/// # Returns
+///
+/// Returns [`VerifyShareResponseResult`].
+///
+/// On success `is_valid` is `true` if the proof matches, `false` otherwise.
+///
+/// # Safety
+///
+/// All non-null input pointers must point to the corresponding readable byte ranges.
+#[unsafe(no_mangle)]
+pub extern "C" fn process_verify_share_response_message(
+    response_ptr: *const u8,
+    response_len: usize,
+    shared_key_ptr: *const u8,
+    shared_key_len: usize,
+    share_content_ptr: *const u8,
+    share_content_len: usize,
+) -> VerifyShareResponseResult {
+    let err = |msg: &str| VerifyShareResponseResult {
+        status: err_status(msg),
+        is_valid: false,
+    };
+
+    if response_ptr.is_null() && response_len > 0 {
+        return err("response_ptr is null");
+    }
+    if shared_key_ptr.is_null() && shared_key_len > 0 {
+        return err("shared_key_ptr is null");
+    }
+    if share_content_ptr.is_null() && share_content_len > 0 {
+        return err("share_content_ptr is null");
+    }
+
     let response_bytes: &[u8] = if response_len == 0 {
         &[]
     } else {
         unsafe { std::slice::from_raw_parts(response_ptr, response_len) }
     };
 
-    let is_valid = match crate::verification::verify_share_response(
-        secret_id,
-        channel_id.into(),
-        &shared_key,
-        share_content,
-        response_bytes,
-    ) {
-        Ok(value) => value,
-        Err(err) => {
-            return VerifyShareResponseResult {
-                status: err_status(err.to_string()),
-                is_valid: false,
-            };
-        }
+    let shared_key_bytes: &[u8] = if shared_key_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(shared_key_ptr, shared_key_len) }
     };
 
-    VerifyShareResponseResult {
-        status: ok_status(),
-        is_valid,
+    let shared_key: [u8; 32] = match shared_key_bytes.try_into() {
+        Ok(v) => v,
+        Err(_) => return err("shared_key must be exactly 32 bytes"),
+    };
+
+    let share_content: &[u8] = if share_content_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(share_content_ptr, share_content_len) }
+    };
+
+    let extract_result = match crate::primitives::verification::response::extract(response_bytes, &shared_key) {
+        Ok(r) => r,
+        Err(e) => return err(&e.to_string()),
+    };
+
+    match crate::primitives::verification::response::process(
+        &extract_result.response,
+        share_content,
+    ) {
+        Ok(is_valid) => VerifyShareResponseResult {
+            status: ok_status(),
+            is_valid,
+        },
+        Err(e) => err(&e.to_string()),
     }
 }

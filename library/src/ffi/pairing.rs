@@ -205,7 +205,7 @@ pub extern "C" fn create_contact_message(
         }
     };
 
-    let result = match crate::pairing::create_contact_message(channel_id.into(), transport_protocol) {
+    let result = match crate::primitives::pairing::request::create_contact(channel_id.into(), transport_protocol) {
         Ok(value) => value,
         Err(err) => {
             return CreateContactMessageResult {
@@ -216,7 +216,7 @@ pub extern "C" fn create_contact_message(
         }
     };
 
-    let contact_message_bytes = result.wire_bytes;
+    let contact_message_bytes = result.contact_message.encode_to_vec();
     let secret_key_material_bytes = serialize_pairing_secret_key_material(&result.secret_key);
 
     CreateContactMessageResult {
@@ -326,10 +326,22 @@ pub extern "C" fn produce_pairing_request_message(
     let contact_message_bytes =
         unsafe { std::slice::from_raw_parts(contact_message_ptr, contact_message_len) };
 
-    let result = match crate::pairing::produce_pairing_request_message(
+    let contact_message = match ContactMessage::decode(contact_message_bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            return ProducePairingRequestMessageResult {
+                status: err_status("contact_message_bytes is not a valid ContactMessage"),
+                request_wire_bytes: empty_buffer(),
+                initiator_contact_message_wire_bytes: empty_buffer(),
+                secret_key_material: empty_buffer(),
+            };
+        }
+    };
+
+    let result = match crate::primitives::pairing::request::produce(
         sender_kind,
         transport_protocol,
-        contact_message_bytes,
+        &contact_message,
     ) {
         Ok(value) => value,
         Err(err) => {
@@ -342,7 +354,7 @@ pub extern "C" fn produce_pairing_request_message(
         }
     };
 
-    let pair_request_message_bytes = result.wire_bytes;
+    let pair_request_message_bytes = result.envelope;
     let initiator_contact_message_bytes = result.initiator_contact_message.encode_to_vec();
     let secret_key_material_bytes = serialize_pairing_secret_key_material(&result.secret_key);
 
@@ -457,9 +469,24 @@ pub extern "C" fn produce_pairing_response_message(
             }
         };
 
-    let result = match crate::pairing::produce_pairing_response_message(
-        sender_kind,
+    let request = match crate::primitives::pairing::request::extract(
         pair_request_message_bytes,
+        &pairing_secret_key_material.ecies_secret_key,
+    ) {
+        Ok(r) => r.request,
+        Err(err) => {
+            return ProducePairingResponseMessageResult {
+                status: err_status(err.to_string()),
+                response_wire_bytes: empty_buffer(),
+                responder_transport_protocol: empty_buffer(),
+                shared_key: empty_buffer(),
+            };
+        }
+    };
+
+    let result = match crate::primitives::pairing::response::produce(
+        sender_kind,
+        &request,
         &pairing_secret_key_material,
     ) {
         Ok(value) => value,
@@ -473,7 +500,7 @@ pub extern "C" fn produce_pairing_response_message(
         }
     };
 
-    let pair_response_message_bytes = result.wire_bytes;
+    let pair_response_message_bytes = result.envelope;
     let transport_protocol_bytes = serialize_transport_protocol(&result.responder_transport_protocol);
     let shared_key_bytes = serialize_pairing_shared_key(&result.shared_key);
 
@@ -587,9 +614,22 @@ pub extern "C" fn process_pairing_response_message(
             }
         };
 
-    let result = match crate::pairing::process_pairing_response_message(
-        contact_message,
+    let response = match crate::primitives::pairing::response::extract(
         pair_response_message_bytes,
+        &pairing_secret_key_material.ecies_secret_key,
+    ) {
+        Ok(r) => r.response,
+        Err(err) => {
+            return ProcessPairingResponseMessageResult {
+                status: err_status(err.to_string()),
+                shared_key: empty_buffer(),
+            };
+        }
+    };
+
+    let result = match crate::primitives::pairing::response::process(
+        &contact_message,
+        &response,
         &pairing_secret_key_material,
     ) {
         Ok(value) => value,

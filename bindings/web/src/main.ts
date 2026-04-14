@@ -1,28 +1,4 @@
-import init, * as derec from "@derec-alliance/web";
-
-function asBytes(value: unknown): Uint8Array {
-    if (value instanceof Uint8Array) {
-        return value;
-    }
-
-    if (Array.isArray(value)) {
-        return Uint8Array.from(value);
-    }
-
-    throw new Error(`Expected byte array, got: ${JSON.stringify(value)}`);
-}
-
-function extractWireBytes(value: unknown): Uint8Array {
-    if (value instanceof Uint8Array || Array.isArray(value)) {
-        return asBytes(value);
-    }
-
-    if (value && typeof value === "object" && "wire_bytes" in value) {
-        return asBytes((value as { wire_bytes: unknown }).wire_bytes);
-    }
-
-    throw new Error(`Expected wire bytes or object with wire_bytes, got: ${JSON.stringify(value)}`);
-}
+import init, { primitives } from "@derec-alliance/web";
 
 function sharedKey(byte: number): Uint8Array {
     return new Uint8Array(32).fill(byte);
@@ -42,51 +18,34 @@ async function main() {
     sharedKeys.set(2n, sharedKey(2));
     sharedKeys.set(3n, sharedKey(3));
 
-    // protect_secret now takes a plain array of channel IDs (no shared keys needed).
-    const protectSecretResult = derec.protect_secret(
+    // ---- Sharing flow ----
+
+    const splitResult = primitives.sharing.request.split(
         secretId,
         secretData,
         channelIds,
         threshold,
         version
     );
-    console.log("protect_secret:", protectSecretResult);
 
-    // Normalize shares result into a JS Map (channel ID → CommittedDeRecShare bytes)
     const shares = new Map<bigint, Uint8Array>();
 
-    if (protectSecretResult instanceof Map) {
-        for (const [k, v] of protectSecretResult.entries()) {
-            shares.set(BigInt(k), asBytes(v));
+    if ((splitResult as any)?.value instanceof Map) {
+        for (const [k, v] of (splitResult as any).value.entries()) {
+            shares.set(BigInt(k), v as Uint8Array);
         }
-    } else if ((protectSecretResult as any)?.value instanceof Map) {
-        for (const [k, v] of (protectSecretResult as any).value.entries()) {
-            shares.set(BigInt(k), asBytes(v));
-        }
-    } else if (Array.isArray(protectSecretResult)) {
-        for (const entry of protectSecretResult) {
+    } else if (Array.isArray((splitResult as any)?.value)) {
+        for (const entry of (splitResult as any).value) {
             if (Array.isArray(entry) && entry.length === 2) {
-                shares.set(BigInt(entry[0]), asBytes(entry[1]));
-            } else if (entry?.channel_id !== undefined && entry?.share !== undefined) {
-                shares.set(BigInt(entry.channel_id), asBytes(entry.share));
+                shares.set(BigInt(entry[0]), entry[1] as Uint8Array);
             }
         }
-    } else if (Array.isArray((protectSecretResult as any)?.value)) {
-        for (const entry of (protectSecretResult as any).value) {
-            if (Array.isArray(entry) && entry.length === 2) {
-                shares.set(BigInt(entry[0]), asBytes(entry[1]));
-            } else if (entry?.channel_id !== undefined && entry?.share !== undefined) {
-                shares.set(BigInt(entry.channel_id), asBytes(entry.share));
-            }
-        }
-    } else if ((protectSecretResult as any)?.value && typeof (protectSecretResult as any).value === "object") {
-        for (const [k, v] of Object.entries((protectSecretResult as any).value)) {
-            shares.set(BigInt(k), asBytes(v));
+    } else if ((splitResult as any)?.value && typeof (splitResult as any).value === "object") {
+        for (const [k, v] of Object.entries((splitResult as any).value)) {
+            shares.set(BigInt(k), v as Uint8Array);
         }
     } else {
-        throw new Error(
-            `Unexpected protect_secret result shape: ${JSON.stringify(protectSecretResult)}`
-        );
+        throw new Error(`Unexpected split result shape: ${JSON.stringify(splitResult)}`);
     }
 
     if (shares.size !== channelIds.length) {
@@ -94,251 +53,203 @@ async function main() {
     }
 
     for (const [channelId, shareBytes] of shares.entries()) {
-        console.log(`channel = ${channelId}, committed share bytes = ${shareBytes?.length ?? 0}`);
-        if (!shareBytes || shareBytes.length === 0) {
+        console.log(`channel = ${channelId}, committed share bytes = ${(shareBytes as any)?.length ?? 0}`);
+        if (!shareBytes || (shareBytes as any).length === 0) {
             throw new Error(`Sharing failed: empty CommittedDeRecShare bytes for channel ${channelId}`);
         }
     }
 
-    // Produce encrypted StoreShareRequestMessage envelopes for each channel.
-    const storedShares = new Map<bigint, Uint8Array>();
+    const storedEnvelopes = new Map<bigint, any>();
 
     for (const [channelId, shareBytes] of shares.entries()) {
         const key = sharedKeys.get(channelId)!;
-        const storeResult = derec.produce_store_share_request_message(
+        const requestEnvelope = primitives.sharing.request.produce(
             channelId,
             version,
-            shareBytes,
+            secretId,
+            shareBytes as Uint8Array,
             [],
             "",
             key
         );
-        const wireBytes = extractWireBytes(storeResult);
-        console.log(`store_share_request[${channelId}] wire bytes = ${wireBytes?.length ?? 0}`);
-        if (!wireBytes || wireBytes.length === 0) {
-            throw new Error(`Sharing failed: empty store share request wire bytes for channel ${channelId}`);
+        console.log(`sharing_request_produce[${channelId}] channel_id=${(requestEnvelope as any)?.channel_id}`);
+        if (!(requestEnvelope as any)?.channel_id) {
+            throw new Error(`Sharing failed: invalid store share request envelope for channel ${channelId}`);
         }
-        storedShares.set(channelId, wireBytes);
+        storedEnvelopes.set(channelId, requestEnvelope);
 
-        // Process the request from the Helper side.
-        const processResult = derec.produce_store_share_response_message(channelId, key, wireBytes);
-        const responseBytes = extractWireBytes(processResult);
-        const committedShareBytes = asBytes((processResult as any).committed_share);
-        console.log(`store_share_response[${channelId}] wire bytes = ${responseBytes?.length ?? 0}`);
-        console.log(`committed_share[${channelId}] bytes = ${committedShareBytes?.length ?? 0}`);
-        if (!responseBytes || responseBytes.length === 0) {
-            throw new Error(`Sharing failed: empty response wire bytes for channel ${channelId}`);
-        }
+        const processResult = primitives.sharing.response.produce(channelId, key, requestEnvelope);
+        const responseEnvelope = (processResult as any)?.envelope ?? processResult;
+        const committedShareBytes: Uint8Array = (processResult as any)?.committed_share;
+        const secretIdBytes: Uint8Array = (processResult as any)?.secret_id;
+        const responseVersion: number = (processResult as any)?.version;
+
         if (!committedShareBytes || committedShareBytes.length === 0) {
             throw new Error(`Sharing failed: empty committed_share bytes for channel ${channelId}`);
         }
+        if (!secretIdBytes || secretIdBytes.length === 0) {
+            throw new Error(`Sharing failed: empty secret_id bytes for channel ${channelId}`);
+        }
+        if (responseVersion !== version) {
+            throw new Error(`Sharing failed: version mismatch for channel ${channelId}: expected ${version}, got ${responseVersion}`);
+        }
 
-        derec.process_store_share_response_message(version, key, responseBytes);
-        console.log(`store_share_response validated ok[${channelId}]`);
+        primitives.sharing.response.process(version, key, responseEnvelope);
+        console.log(`sharing_response_process validated ok[${channelId}]`);
     }
 
     console.log("Sharing flow test passed.");
+
+    // ---- Verification flow ----
 
     const someChannel = 1n;
     const otherChannel = 2n;
 
     const someSharedKey = sharedKeys.get(someChannel)!;
-    const storedWire1 = storedShares.get(someChannel)!;
-    const storedWire2 = storedShares.get(otherChannel)!;
+    const storedEnvelope1 = storedEnvelopes.get(someChannel)!;
+    const storedEnvelope2 = storedEnvelopes.get(otherChannel)!;
 
-    const verificationRequestResult = derec.generate_verification_request(
-        secretId,
-        someChannel,
-        version,
-        someSharedKey
+    const verificationRequest = primitives.verification.request.produce(
+        someChannel, secretId, version, someSharedKey
     );
-    console.log("generate_verification_request:", verificationRequestResult);
+    if (!(verificationRequest as any)?.channel_id) {
+        throw new Error("Verification failed: invalid request envelope");
+    }
 
-    const verificationRequestWireBytes = extractWireBytes(verificationRequestResult);
+    const reqResult = primitives.verification.request.extract(verificationRequest, someSharedKey);
+    const reqChannelId: bigint = BigInt((reqResult as any).channel_id ?? 0);
+    const reqSecretId: Uint8Array = new Uint8Array((reqResult as any).secret_id ?? []);
+    const reqVersion: number = (reqResult as any).version ?? 0;
+    const reqNonce: bigint = BigInt((reqResult as any).nonce ?? 0);
 
-    const verificationResponseResult = derec.generate_verification_response(
-        secretId,
-        someChannel,
-        someSharedKey,
-        storedWire1,
-        verificationRequestWireBytes
+    console.log("verification_request_extract channel_id:", reqChannelId, "nonce:", reqNonce);
+
+    if (reqChannelId !== someChannel) {
+        throw new Error(`Verification failed: expected channel_id ${someChannel}, got ${reqChannelId}`);
+    }
+    if (reqSecretId.length === 0) {
+        throw new Error("Verification failed: secret_id is empty");
+    }
+    if (reqVersion !== version) {
+        throw new Error(`Verification failed: expected version ${version}, got ${reqVersion}`);
+    }
+    if (reqNonce === 0n) {
+        throw new Error("Verification failed: nonce must not be zero");
+    }
+
+    const verificationResponse = primitives.verification.response.produce(
+        someChannel, reqSecretId, reqVersion, reqNonce, someSharedKey, storedEnvelope1
     );
-    console.log("generate_verification_response:", verificationResponseResult);
+    if (!(verificationResponse as any)?.channel_id) {
+        throw new Error("Verification failed: invalid response envelope");
+    }
 
-    const verificationResponseWireBytes = extractWireBytes(verificationResponseResult);
-
-    const verificationExpectedTrue = derec.verify_share_response(
-        secretId,
-        someChannel,
-        someSharedKey,
-        storedWire1,
-        verificationResponseWireBytes
+    const verificationExpectedTrue = primitives.verification.response.process(
+        verificationResponse, someSharedKey, storedEnvelope1
     );
-    console.log("verify_share_response (expected true):", verificationExpectedTrue);
+    console.log("verification_response_process (expected true):", verificationExpectedTrue);
+    if (!verificationExpectedTrue) {
+        throw new Error("Verification failed: expected true for correct share");
+    }
 
-    const verificationExpectedFalse = derec.verify_share_response(
-        secretId,
-        someChannel,
-        someSharedKey,
-        storedWire2,
-        verificationResponseWireBytes
+    const verificationExpectedFalse = primitives.verification.response.process(
+        verificationResponse, someSharedKey, storedEnvelope2
     );
-    console.log("verify_share_response (expected false):", verificationExpectedFalse);
+    console.log("verification_response_process (expected false):", verificationExpectedFalse);
+    if (verificationExpectedFalse) {
+        throw new Error("Verification failed: expected false for wrong share");
+    }
 
-    const shareRequest1Result = derec.generate_share_request(
-        1n,
-        secretId,
-        version,
-        sharedKeys.get(1n)!
+    console.log("Verification flow test passed.");
+
+    // ---- Recovery flow ----
+
+    const shareRequest1 = primitives.recovery.request.produce(1n, secretId, version, sharedKeys.get(1n)!);
+    const shareResponse1 = primitives.recovery.response.produce(
+        secretId, 1n, storedEnvelopes.get(1n)!, shareRequest1, sharedKeys.get(1n)!
     );
-    console.log("generate_share_request[1]:", shareRequest1Result);
 
-    const shareRequest1WireBytes = extractWireBytes(shareRequest1Result);
-
-    const shareResponse1Result = derec.generate_share_response(
-        secretId,
-        1n,
-        storedShares.get(1n)!,
-        shareRequest1WireBytes,
-        sharedKeys.get(1n)!
+    const shareRequest2 = primitives.recovery.request.produce(2n, secretId, version, sharedKeys.get(2n)!);
+    const shareResponse2 = primitives.recovery.response.produce(
+        secretId, 2n, storedEnvelopes.get(2n)!, shareRequest2, sharedKeys.get(2n)!
     );
-    console.log("generate_share_response[1]:", shareResponse1Result);
 
-    const shareResponse1WireBytes = extractWireBytes(shareResponse1Result);
-
-    const shareRequest2Result = derec.generate_share_request(
-        2n,
-        secretId,
-        version,
-        sharedKeys.get(2n)!
+    const shareRequest3 = primitives.recovery.request.produce(3n, secretId, version, sharedKeys.get(3n)!);
+    const shareResponse3 = primitives.recovery.response.produce(
+        secretId, 3n, storedEnvelopes.get(3n)!, shareRequest3, sharedKeys.get(3n)!
     );
-    console.log("generate_share_request[2]:", shareRequest2Result);
-
-    const shareRequest2WireBytes = extractWireBytes(shareRequest2Result);
-
-    const shareResponse2Result = derec.generate_share_response(
-        secretId,
-        2n,
-        storedShares.get(2n)!,
-        shareRequest2WireBytes,
-        sharedKeys.get(2n)!
-    );
-    console.log("generate_share_response[2]:", shareResponse2Result);
-
-    const shareResponse2WireBytes = extractWireBytes(shareResponse2Result);
-
-    const shareRequest3Result = derec.generate_share_request(
-        3n,
-        secretId,
-        version,
-        sharedKeys.get(3n)!
-    );
-    console.log("generate_share_request[3]:", shareRequest3Result);
-
-    const shareRequest3WireBytes = extractWireBytes(shareRequest3Result);
-
-    const shareResponse3Result = derec.generate_share_response(
-        secretId,
-        3n,
-        storedShares.get(3n)!,
-        shareRequest3WireBytes,
-        sharedKeys.get(3n)!
-    );
-    console.log("generate_share_response[3]:", shareResponse3Result);
-
-    const shareResponse3WireBytes = extractWireBytes(shareResponse3Result);
 
     const recoveryResponses = [
-        {
-            response_bytes: shareResponse1WireBytes,
-            shared_key: sharedKeys.get(1n)!,
-        },
-        {
-            response_bytes: shareResponse2WireBytes,
-            shared_key: sharedKeys.get(2n)!,
-        },
-        {
-            response_bytes: shareResponse3WireBytes,
-            shared_key: sharedKeys.get(3n)!,
-        },
+        { response: shareResponse1, shared_key: sharedKeys.get(1n)! },
+        { response: shareResponse2, shared_key: sharedKeys.get(2n)! },
+        { response: shareResponse3, shared_key: sharedKeys.get(3n)! },
     ];
 
-    try {
-        const recovered = derec.recover_from_share_responses(
-            recoveryResponses,
-            secretId,
-            version
-        );
-        console.log("recover_from_share_responses:", recovered);
-    } catch (e) {
-        console.error("Error recovering from share responses:", e);
+    const recovered = primitives.recovery.response.recover(recoveryResponses, secretId, version);
+    console.log("recovery_response_recover recovered bytes:", recovered?.length ?? 0);
+
+    if (!recovered || recovered.length === 0) {
+        throw new Error("Recovery failed: empty recovered secret");
     }
+    if (!recovered.every((b: number, i: number) => b === secretData[i])) {
+        throw new Error("Recovery failed: recovered secret does not match original");
+    }
+
+    console.log("Recovery flow test passed.");
+
+    // ---- Pairing flow ----
 
     console.log("--------------------   Pairing Functions   --------------------");
 
     const channelId = 1n;
     const roleHelper = 2;
-    const roleSharer = 0;
+    const roleOwner = 0;
 
-    const aliceTransportProtocol = { protocol: "https", uri: "https://example.com/alice" };
-    const createContactMessageResult = derec.create_contact_message(
+    const createContactResult = primitives.pairing.request.create_contact(
         channelId,
-        aliceTransportProtocol
+        { protocol: "https", uri: "https://example.com/alice" }
     );
-    console.log("create_contact_message:", createContactMessageResult);
+    if (!(createContactResult as any)?.contact_message) {
+        throw new Error("Pairing failed: missing contact_message");
+    }
 
-    const contactWireBytes = extractWireBytes(
-        (createContactMessageResult as any).wire_bytes !== undefined
-            ? (createContactMessageResult as any).wire_bytes
-            : createContactMessageResult
-    );
-
-    const contactSecretKeyMaterial = asBytes(
-        (createContactMessageResult as any).secret_key_material
-    );
-
-    const producePairingRequestMessageResult = derec.produce_pairing_request_message(
+    const pairingRequestResult = primitives.pairing.request.produce(
         roleHelper,
         { protocol: "https", uri: "https://example.com/helper" },
-        contactWireBytes
+        (createContactResult as any).contact_message
     );
-    console.log("produce_pairing_request_message:", producePairingRequestMessageResult);
+    if (!(pairingRequestResult as any)?.envelope) {
+        throw new Error("Pairing failed: missing envelope in pairing request result");
+    }
 
-    const pairRequestWireBytes = extractWireBytes(
-        (producePairingRequestMessageResult as any).wire_bytes !== undefined
-            ? (producePairingRequestMessageResult as any).wire_bytes
-            : producePairingRequestMessageResult
+    const pairingResponseResult = primitives.pairing.response.produce(
+        roleOwner,
+        (pairingRequestResult as any).envelope,
+        (createContactResult as any).secret_key_material
     );
+    if (!(pairingResponseResult as any)?.pairing_shared_key || (pairingResponseResult as any).pairing_shared_key.length === 0) {
+        throw new Error("Pairing failed: empty pairing_shared_key");
+    }
 
-    const pairRequestSecretKeyMaterial = asBytes(
-        (producePairingRequestMessageResult as any).secret_key_material
+    const pairingProcessResult = primitives.pairing.response.process(
+        (pairingRequestResult as any).initiator_contact_message,
+        (pairingResponseResult as any).envelope,
+        (pairingRequestResult as any).secret_key_material
     );
+    if (!(pairingProcessResult as any)?.pairing_shared_key || (pairingProcessResult as any).pairing_shared_key.length === 0) {
+        throw new Error("Pairing failed: empty pairing_shared_key in processed result");
+    }
 
-    const producePairingResponseMessageResult = derec.produce_pairing_response_message(
-        roleSharer,
-        pairRequestWireBytes,
-        contactSecretKeyMaterial
-    );
-    console.log("produce_pairing_response_message:", producePairingResponseMessageResult);
+    const ownerKey: Uint8Array = (pairingResponseResult as any).pairing_shared_key;
+    const helperKey: Uint8Array = (pairingProcessResult as any).pairing_shared_key;
+    const keysMatch = ownerKey.length === helperKey.length && ownerKey.every((b: number, i: number) => b === helperKey[i]);
+    console.log("pairing shared keys match:", keysMatch);
+    if (!keysMatch) {
+        throw new Error("Pairing failed: shared keys do not match");
+    }
 
-    const pairResponseWireBytes = extractWireBytes(
-        (producePairingResponseMessageResult as any).wire_bytes !== undefined
-            ? (producePairingResponseMessageResult as any).wire_bytes
-            : producePairingResponseMessageResult
-    );
-
-    const initiatorContactMessage = (producePairingRequestMessageResult as any).initiator_contact_message;
-
-    const processPairingResponseMessageResult = derec.process_pairing_response_message(
-        initiatorContactMessage,
-        pairResponseWireBytes,
-        pairRequestSecretKeyMaterial
-    );
-    console.log("process_pairing_response_message:", processPairingResponseMessageResult);
-
-    console.log("pairRequestWireBytes:", pairRequestWireBytes);
-    console.log("is Uint8Array:", pairRequestWireBytes instanceof Uint8Array);
-    console.log("length:", pairRequestWireBytes.length);
+    console.log("Pairing flow test passed.");
+    console.log("All web smoke tests passed.");
 
     const app = document.getElementById("app");
     if (app) {

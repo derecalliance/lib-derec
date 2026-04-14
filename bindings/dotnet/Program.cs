@@ -1,8 +1,9 @@
-﻿using System;
-using System.Buffers.Binary;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using DeRec.Library;
+using DeRec.Library.Primitives;
+using Proto = Org.Derecalliance.Derec.Protobuf;
 
 internal static class Program
 {
@@ -22,7 +23,6 @@ internal static class Program
         Console.WriteLine("=== Protocol version test ===");
 
         var version = ProtocolVersion.Current();
-
         Console.WriteLine($"protocol version = {version}");
         Console.WriteLine($"major = {version.Major}");
         Console.WriteLine($"minor = {version.Minor}");
@@ -36,86 +36,56 @@ internal static class Program
 
         ulong channelId = 1;
 
-        var contact = Pairing.CreateContactMessage(channelId, new TransportProtocol("https://example.com/alice"));
-
-        Console.WriteLine($"contact.wire_bytes = {contact.WireBytes.Length}");
-        Console.WriteLine($"contact.secret_key_material bytes = {contact.SecretKeyMaterial.Length}");
-
-        if (contact.WireBytes.Length == 0)
-        {
-            throw new InvalidOperationException("Pairing test failed: empty contact wire bytes.");
-        }
-
-        if (contact.SecretKeyMaterial.Length == 0)
-        {
-            throw new InvalidOperationException("Pairing test failed: empty contact secret key material.");
-        }
-
-        var pairRequest = Pairing.ProducePairingRequestMessage(
-            Pairing.SenderKind.Helper,
-            new TransportProtocol("https://example.com/helper"),
-            contact.WireBytes
+        var contact = Pairing.Request.CreateContact(
+            channelId,
+            new TransportProtocol("https://example.com/alice")
         );
 
-        Console.WriteLine($"pair_request.wire_bytes = {pairRequest.WireBytes.Length}");
-        Console.WriteLine($"pair_request.initiator_contact_message.channel_id = {pairRequest.InitiatorContactMessage.ChannelId}");
-        Console.WriteLine($"pair_request.initiator_contact_message.transport_protocol.uri = {pairRequest.InitiatorContactMessage.TransportProtocol.Uri}");
-        Console.WriteLine($"pair_request.initiator_contact_message.nonce = {pairRequest.InitiatorContactMessage.Nonce}");
-        Console.WriteLine($"pair_request.secret_key_material bytes = {pairRequest.SecretKeyMaterial.Length}");
+        Console.WriteLine($"contact.ContactMessage.ChannelId = {contact.ContactMessage.ChannelId}");
+        Console.WriteLine($"contact.SecretKeyMaterial bytes = {contact.SecretKeyMaterial.Length}");
 
-        if (pairRequest.WireBytes.Length == 0)
-        {
-            throw new InvalidOperationException("Pairing test failed: empty pair request wire bytes.");
-        }
+        if (contact.SecretKeyMaterial.Length == 0)
+            throw new InvalidOperationException("Pairing test failed: empty contact secret key material.");
 
+        var pairRequest = Pairing.Request.Produce(
+            Pairing.SenderKind.Helper,
+            new TransportProtocol("https://example.com/helper"),
+            contact.ContactMessage
+        );
+
+        Console.WriteLine($"pairRequest.Envelope bytes = {pairRequest.Envelope.Length}");
+        Console.WriteLine($"pairRequest.InitiatorContactMessage.ChannelId = {pairRequest.InitiatorContactMessage.ChannelId}");
+        Console.WriteLine($"pairRequest.SecretKeyMaterial bytes = {pairRequest.SecretKeyMaterial.Length}");
 
         if (pairRequest.SecretKeyMaterial.Length == 0)
-        {
             throw new InvalidOperationException("Pairing test failed: empty pair request secret key material.");
-        }
 
-        var pairResponse = Pairing.ProducePairingResponseMessage(
+        var pairResponse = Pairing.Response.Produce(
             Pairing.SenderKind.OwnerNonRecovery,
-            pairRequest.WireBytes,
+            pairRequest.Envelope,
             contact.SecretKeyMaterial
         );
 
-        Console.WriteLine($"pair_response.wire_bytes = {pairResponse.WireBytes.Length}");
-        Console.WriteLine($"pair_response.shared_key bytes = {pairResponse.SharedKey.Length}");
-        Console.WriteLine($"pair_response.responder_transport_protocol.uri = {pairResponse.ResponderTransportProtocol.Uri}");
-        Console.WriteLine($"pair_response.responder_transport_protocol.protocol = {pairResponse.ResponderTransportProtocol.Protocol}");
-
-        if (pairResponse.WireBytes.Length == 0)
-        {
-            throw new InvalidOperationException("Pairing test failed: empty pair response wire bytes.");
-        }
+        Console.WriteLine($"pairResponse.Envelope bytes = {pairResponse.Envelope.Length}");
+        Console.WriteLine($"pairResponse.SharedKey bytes = {pairResponse.SharedKey.Length}");
+        Console.WriteLine($"pairResponse.ResponderTransportProtocol.Uri = {pairResponse.ResponderTransportProtocol.Uri}");
 
         if (pairResponse.SharedKey.Length == 0)
-        {
             throw new InvalidOperationException("Pairing test failed: empty pair response shared key.");
-        }
 
-        var processed = Pairing.ProcessPairingResponseMessage(
+        var processed = Pairing.Response.Process(
             pairRequest.InitiatorContactMessage,
-            pairResponse.WireBytes,
+            pairResponse.Envelope,
             pairRequest.SecretKeyMaterial
         );
 
-        Console.WriteLine($"processed.shared_key bytes = {processed.SharedKey.Length}");
+        Console.WriteLine($"processed.SharedKey bytes = {processed.SharedKey.Length}");
 
         if (processed.SharedKey.Length == 0)
-        {
             throw new InvalidOperationException("Pairing test failed: empty processed shared key.");
-        }
 
-        bool sharedKeysEqual = pairResponse.SharedKey.SequenceEqual(processed.SharedKey);
-
-        Console.WriteLine($"shared keys equal = {sharedKeysEqual}");
-
-        if (!sharedKeysEqual)
-        {
+        if (!pairResponse.SharedKey.SequenceEqual(processed.SharedKey))
             throw new InvalidOperationException("Pairing test failed: shared keys do not match.");
-        }
 
         Console.WriteLine("Pairing flow test passed.");
     }
@@ -130,93 +100,53 @@ internal static class Program
         ulong threshold = 2;
         int version = 1;
 
-        var result = Sharing.ProtectSecret(secretId, secretData, channelIds, threshold, version);
-
-        Console.WriteLine($"shares_wire_bytes total bytes = {result.SharesWireBytes.Length}");
-
-        var shares = DeserializeSharesWireBytes(result.SharesWireBytes);
+        var splitResult = Sharing.Request.Split(secretId, secretData, channelIds, threshold, version);
+        var shares = splitResult.DeserializeShares();
 
         Console.WriteLine($"shares count = {shares.Count}");
 
         if (shares.Count != channelIds.Length)
-        {
-            throw new InvalidOperationException(
-                $"Sharing test failed: expected {channelIds.Length} shares but got {shares.Count}."
-            );
-        }
-
-        foreach (ulong channel in channelIds)
-        {
-            if (!shares.ContainsKey(channel))
-            {
-                throw new InvalidOperationException(
-                    $"Sharing test failed: missing share for channel {channel}."
-                );
-            }
-        }
+            throw new InvalidOperationException($"Sharing test failed: expected {channelIds.Length} shares but got {shares.Count}.");
 
         var sharedKeys = CreateChannelSharedKeys(channelIds);
 
         foreach (var entry in shares)
         {
-            Console.WriteLine($"channel = {entry.Key}");
-            Console.WriteLine($"committed share bytes = {entry.Value.Length}");
+            ulong channel = entry.Key;
+            byte[] shareBytes = entry.Value;
 
-            if (entry.Value.Length == 0)
-            {
-                throw new InvalidOperationException(
-                    $"Sharing test failed: empty share bytes for channel {entry.Key}."
-                );
-            }
+            Console.WriteLine($"channel = {channel}, committed share bytes = {shareBytes.Length}");
 
-            var storeResult = Sharing.ProduceStoreShareRequestMessage(
-                entry.Key,
-                version,
-                entry.Value,
-                Array.Empty<int>(),
-                string.Empty,
-                sharedKeys[entry.Key]
+            if (shareBytes.Length == 0)
+                throw new InvalidOperationException($"Sharing test failed: empty share bytes for channel {channel}.");
+
+            var storeRequest = Sharing.Request.Produce(
+                channel, version, secretId, shareBytes,
+                new int[0], string.Empty, sharedKeys[channel]
             );
 
-            Console.WriteLine($"store_share_request wire bytes = {storeResult.WireBytes.Length}");
+            Console.WriteLine($"storeRequest.Envelope.ChannelId = {storeRequest.Envelope.ChannelId}");
 
-            if (storeResult.WireBytes.Length == 0)
-            {
-                throw new InvalidOperationException(
-                    $"Sharing test failed: empty store share request wire bytes for channel {entry.Key}."
-                );
-            }
+            var storeResponse = Sharing.Response.Produce(channel, sharedKeys[channel], storeRequest.Envelope);
 
-            var processResult = Sharing.ProduceStoreShareResponseMessage(
-                entry.Key,
-                sharedKeys[entry.Key],
-                storeResult.WireBytes
-            );
+            Console.WriteLine($"storeResponse.Envelope.ChannelId = {storeResponse.Envelope.ChannelId}");
+            Console.WriteLine($"storeResponse.CommittedShareBytes = {storeResponse.CommittedShareBytes.Length}");
 
-            Console.WriteLine($"store_share_response wire bytes = {processResult.WireBytes.Length}");
-            Console.WriteLine($"committed_share_bytes = {processResult.CommittedShareBytes.Length}");
+            var committedShare = Proto.CommittedDeRecShare.Parser.ParseFrom(storeResponse.CommittedShareBytes);
+            var deRecShare = Proto.DeRecShare.Parser.ParseFrom(committedShare.DeRecShare.ToByteArray());
+            Console.WriteLine($"  de_rec_share.version = {deRecShare.Version}");
+            Console.WriteLine($"  commitment bytes = {committedShare.Commitment.Length}");
+            Console.WriteLine($"  merkle_path nodes = {committedShare.MerklePath.Count}");
 
-            if (processResult.WireBytes.Length == 0)
-            {
-                throw new InvalidOperationException(
-                    $"Sharing test failed: empty response wire bytes for channel {entry.Key}."
-                );
-            }
+            if (storeResponse.CommittedShareBytes.Length == 0)
+                throw new InvalidOperationException($"Sharing test failed: empty committed_share_bytes for channel {channel}.");
+            if (storeResponse.SecretId.Length == 0)
+                throw new InvalidOperationException($"Sharing test failed: empty secret_id for channel {channel}.");
+            if (storeResponse.Version != version)
+                throw new InvalidOperationException($"Sharing test failed: version mismatch for channel {channel}.");
 
-            if (processResult.CommittedShareBytes.Length == 0)
-            {
-                throw new InvalidOperationException(
-                    $"Sharing test failed: empty committed_share_bytes for channel {entry.Key}."
-                );
-            }
-
-            Sharing.ProcessStoreShareResponseMessage(
-                version,
-                sharedKeys[entry.Key],
-                processResult.WireBytes
-            );
-
-            Console.WriteLine("store_share_response validated ok");
+            Sharing.Response.Process(version, sharedKeys[channel], storeResponse.Envelope);
+            Console.WriteLine($"sharing_response_process validated ok[{channel}]");
         }
 
         Console.WriteLine("Sharing flow test passed.");
@@ -234,63 +164,49 @@ internal static class Program
 
         var sharedKeys = CreateChannelSharedKeys(channels);
 
-        var sharing = Sharing.ProtectSecret(secretId, secretData, channels, threshold, version);
-        var shares = DeserializeSharesWireBytes(sharing.SharesWireBytes);
-
-        if (shares.Count != channels.Length)
-        {
-            throw new InvalidOperationException(
-                $"Verification test failed: expected {channels.Length} shares but got {shares.Count}."
-            );
-        }
+        var shares = Sharing.Request.Split(secretId, secretData, channels, threshold, version)
+            .DeserializeShares();
 
         ulong channel1 = 1;
         ulong channel2 = 2;
-
         byte[] sharedKey1 = sharedKeys[channel1];
 
-        byte[] storedWire1 = Sharing.ProduceStoreShareRequestMessage(
-            channel1, version, shares[channel1], Array.Empty<int>(), string.Empty, sharedKey1
-        ).WireBytes;
+        DeRecMessage storedEnvelope1 = Sharing.Request.Produce(
+            channel1, version, secretId, shares[channel1], new int[0], string.Empty, sharedKey1
+        ).Envelope;
 
-        // Intentionally use sharedKey1 for channel2's envelope to test invalid verification.
-        byte[] storedWire2 = Sharing.ProduceStoreShareRequestMessage(
-            channel2, version, shares[channel2], Array.Empty<int>(), string.Empty, sharedKey1
-        ).WireBytes;
+        DeRecMessage storedEnvelope2 = Sharing.Request.Produce(
+            channel2, version, secretId, shares[channel2], new int[0], string.Empty, sharedKey1
+        ).Envelope;
 
-        byte[] requestWireBytes = Verification.GenerateVerificationRequest(
-            secretId, channel1, version, sharedKey1
+        // Owner side: produce request
+        DeRecMessage requestEnvelope = Verification.Request.Produce(channel1, secretId, version, sharedKey1);
+        Console.WriteLine($"verification_request.ChannelId = {requestEnvelope.ChannelId}");
+
+        // Helper side: extract request
+        var req = Verification.Request.Extract(requestEnvelope, sharedKey1);
+        Console.WriteLine($"req.ChannelId = {req.ChannelId}, req.Version = {req.Version}, req.Nonce = {req.Nonce}");
+
+        if (req.ChannelId != channel1) throw new InvalidOperationException("Verification test failed: channel_id mismatch.");
+        if (!req.SecretId.SequenceEqual(secretId)) throw new InvalidOperationException("Verification test failed: secret_id mismatch.");
+        if (req.Version != version) throw new InvalidOperationException("Verification test failed: version mismatch.");
+        if (req.Nonce == 0) throw new InvalidOperationException("Verification test failed: nonce must not be zero.");
+
+        // Helper side: produce response
+        DeRecMessage responseEnvelope = Verification.Response.Produce(
+            channel1, req.SecretId, req.Version, req.Nonce, sharedKey1, storedEnvelope1
         );
+        Console.WriteLine($"verification_response.ChannelId = {responseEnvelope.ChannelId}");
 
-        Console.WriteLine($"verification_request wire bytes = {requestWireBytes.Length}");
+        // Owner side: correct share → true
+        bool valid = Verification.Response.Process(responseEnvelope, sharedKey1, storedEnvelope1);
+        Console.WriteLine($"verification valid (expected true) = {valid}");
+        if (!valid) throw new InvalidOperationException("Verification test failed: expected valid response.");
 
-        byte[] responseWireBytes = Verification.GenerateVerificationResponse(
-            secretId, channel1, sharedKey1, storedWire1, requestWireBytes
-        );
-
-        Console.WriteLine($"verification_response wire bytes = {responseWireBytes.Length}");
-
-        bool valid = Verification.VerifyShareResponse(
-            secretId, channel1, sharedKey1, storedWire1, responseWireBytes
-        );
-
-        Console.WriteLine($"verification valid = {valid}");
-
-        if (!valid)
-        {
-            throw new InvalidOperationException("Verification test failed: expected valid response.");
-        }
-
-        bool invalid = Verification.VerifyShareResponse(
-            secretId, channel1, sharedKey1, storedWire2, responseWireBytes
-        );
-
-        Console.WriteLine($"verification invalid case = {invalid}");
-
-        if (invalid)
-        {
-            throw new InvalidOperationException("Verification test failed: expected invalid response for wrong share.");
-        }
+        // Owner side: wrong share → false
+        bool invalid = Verification.Response.Process(responseEnvelope, sharedKey1, storedEnvelope2);
+        Console.WriteLine($"verification invalid (expected false) = {invalid}");
+        if (invalid) throw new InvalidOperationException("Verification test failed: expected invalid response for wrong share.");
 
         Console.WriteLine("Verification flow test passed.");
     }
@@ -307,51 +223,40 @@ internal static class Program
 
         var sharedKeys = CreateChannelSharedKeys(channels);
 
-        var sharing = Sharing.ProtectSecret(secretId, secretData, channels, threshold, version);
-        var shares = DeserializeSharesWireBytes(sharing.SharesWireBytes);
-
-        if (shares.Count != channels.Length)
-        {
-            throw new InvalidOperationException(
-                $"Recovery test failed: expected {channels.Length} shares but got {shares.Count}."
-            );
-        }
+        var shares = Sharing.Request.Split(secretId, secretData, channels, threshold, version)
+            .DeserializeShares();
 
         ulong channel1 = 1;
         ulong channel2 = 2;
-
         byte[] sharedKey1 = sharedKeys[channel1];
         byte[] sharedKey2 = sharedKeys[channel2];
 
-        byte[] storedWire1 = Sharing.ProduceStoreShareRequestMessage(
-            channel1, version, shares[channel1], Array.Empty<int>(), string.Empty, sharedKey1
-        ).WireBytes;
+        DeRecMessage storedEnvelope1 = Sharing.Request.Produce(
+            channel1, version, secretId, shares[channel1], new int[0], string.Empty, sharedKey1
+        ).Envelope;
 
-        byte[] storedWire2 = Sharing.ProduceStoreShareRequestMessage(
-            channel2, version, shares[channel2], Array.Empty<int>(), string.Empty, sharedKey2
-        ).WireBytes;
+        DeRecMessage storedEnvelope2 = Sharing.Request.Produce(
+            channel2, version, secretId, shares[channel2], new int[0], string.Empty, sharedKey2
+        ).Envelope;
 
-        byte[] shareRequest1 = Recovery.GenerateShareRequest(channel1, secretId, version, sharedKey1);
-        Console.WriteLine($"share_request[1] wire bytes = {shareRequest1.Length}");
+        DeRecMessage shareRequest1 = Recovery.Request.Produce(channel1, secretId, version, sharedKey1);
+        Console.WriteLine($"shareRequest[1].ChannelId = {shareRequest1.ChannelId}");
 
-        byte[] shareResponse1 = Recovery.GenerateShareResponse(
-            channel1, secretId, shareRequest1, storedWire1, sharedKey1
+        DeRecMessage shareResponse1 = Recovery.Response.Produce(
+            channel1, secretId, shareRequest1, storedEnvelope1, sharedKey1
         );
-        Console.WriteLine($"share_response[1] wire bytes = {shareResponse1.Length}");
+        Console.WriteLine($"shareResponse[1].ChannelId = {shareResponse1.ChannelId}");
 
-        byte[] shareRequest2 = Recovery.GenerateShareRequest(channel2, secretId, version, sharedKey2);
-        Console.WriteLine($"share_request[2] wire bytes = {shareRequest2.Length}");
-
-        byte[] shareResponse2 = Recovery.GenerateShareResponse(
-            channel2, secretId, shareRequest2, storedWire2, sharedKey2
+        DeRecMessage shareRequest2 = Recovery.Request.Produce(channel2, secretId, version, sharedKey2);
+        DeRecMessage shareResponse2 = Recovery.Response.Produce(
+            channel2, secretId, shareRequest2, storedEnvelope2, sharedKey2
         );
-        Console.WriteLine($"share_response[2] wire bytes = {shareResponse2.Length}");
 
-        byte[] recovered = Recovery.RecoverFromShareResponses(
+        byte[] recovered = Recovery.Response.Recover(
             new[]
             {
-                new Recovery.RecoveryResponseInput { Bytes = shareResponse1, SharedKey = sharedKey1 },
-                new Recovery.RecoveryResponseInput { Bytes = shareResponse2, SharedKey = sharedKey2 },
+                new Recovery.Response.RecoveryInput { Envelope = shareResponse1, SharedKey = sharedKey1 },
+                new Recovery.Response.RecoveryInput { Envelope = shareResponse2, SharedKey = sharedKey2 },
             },
             secretId,
             version
@@ -361,9 +266,7 @@ internal static class Program
         Console.WriteLine($"recovered matches original = {recovered.SequenceEqual(secretData)}");
 
         if (!recovered.SequenceEqual(secretData))
-        {
             throw new InvalidOperationException("Recovery test failed: recovered secret does not match original.");
-        }
 
         Console.WriteLine("Recovery flow test passed.");
     }
@@ -378,76 +281,5 @@ internal static class Program
             keys[channelIds[i]] = key;
         }
         return keys;
-    }
-
-    private static Dictionary<ulong, byte[]> DeserializeSharesWireBytes(byte[] bytes)
-    {
-        var result = new Dictionary<ulong, byte[]>();
-        int offset = 0;
-
-        uint count = ReadU32(bytes, ref offset);
-        Console.WriteLine($"declared share entry count = {count}");
-
-        for (uint i = 0; i < count; i++)
-        {
-            ulong channelId = ReadU64(bytes, ref offset);
-            uint messageLen = ReadU32(bytes, ref offset);
-
-            Console.WriteLine($"parsed entry[{i}] channelId = {channelId}, messageLen = {messageLen}");
-
-            if (offset + messageLen > bytes.Length)
-            {
-                throw new InvalidOperationException(
-                    $"Unexpected end of shares_wire_bytes while reading entry {i}."
-                );
-            }
-
-            byte[] messageBytes = new byte[messageLen];
-            Buffer.BlockCopy(bytes, offset, messageBytes, 0, (int)messageLen);
-            offset += (int)messageLen;
-
-            if (result.ContainsKey(channelId))
-            {
-                throw new InvalidOperationException(
-                    $"Duplicate channelId parsed from shares_wire_bytes: {channelId}. " +
-                    "This usually means the .NET deserializer no longer matches the Rust FFI format."
-                );
-            }
-
-            result[channelId] = messageBytes;
-        }
-
-        if (offset != bytes.Length)
-        {
-            throw new InvalidOperationException(
-                $"Unexpected trailing bytes in shares_wire_bytes. offset={offset}, total={bytes.Length}"
-            );
-        }
-
-        return result;
-    }
-
-    private static uint ReadU32(byte[] bytes, ref int offset)
-    {
-        if (offset + 4 > bytes.Length)
-        {
-            throw new InvalidOperationException("Unexpected end of buffer while reading u32.");
-        }
-
-        uint value = BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(offset, 4));
-        offset += 4;
-        return value;
-    }
-
-    private static ulong ReadU64(byte[] bytes, ref int offset)
-    {
-        if (offset + 8 > bytes.Length)
-        {
-            throw new InvalidOperationException("Unexpected end of buffer while reading u64.");
-        }
-
-        ulong value = BinaryPrimitives.ReadUInt64LittleEndian(bytes.AsSpan(offset, 8));
-        offset += 8;
-        return value;
     }
 }

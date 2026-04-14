@@ -6,14 +6,14 @@ namespace DeRec.Library.Native;
 internal static class Recovery
 {
     [StructLayout(LayoutKind.Sequential)]
-    internal struct GenerateShareRequestResult
+    internal struct ProduceGetShareRequestMessageResult
     {
         public Status Status;
         public Buffer WireBytes;
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    internal struct GenerateShareResponseResult
+    internal struct ProduceGetShareResponseMessageResult
     {
         public Status Status;
         public Buffer WireBytes;
@@ -27,7 +27,7 @@ internal static class Recovery
     }
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
-    internal static extern GenerateShareRequestResult generate_share_request(
+    internal static extern ProduceGetShareRequestMessageResult produce_get_share_request_message(
         ulong channelId,
         byte[] secretId,
         UIntPtr secretIdLen,
@@ -37,7 +37,7 @@ internal static class Recovery
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
-    internal static extern GenerateShareResponseResult generate_share_response(
+    internal static extern ProduceGetShareResponseMessageResult produce_get_share_response_message(
         ulong channelId,
         byte[] secretId,
         UIntPtr secretIdLen,

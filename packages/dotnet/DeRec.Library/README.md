@@ -42,7 +42,7 @@ The .NET API operates exclusively on **opaque `byte[]` wire payloads**.
 ```csharp
 using DeRec.Library;
 
-var version = DeRec.Library.Native.ProtocolVersion.derec_protocol_version();
+var version = ProtocolVersion.Current();
 
 Console.WriteLine(version.Major);
 Console.WriteLine(version.Minor);
@@ -54,31 +54,32 @@ Console.WriteLine(version.Minor);
 
 ```csharp
 using DeRec.Library;
+using DeRec.Library.Primitives;
 
 // Step 1: Owner creates contact message
-var contact = Pairing.CreateContactMessage(
+var contact = Pairing.Request.CreateContact(
     channelId: 1,
     transportProtocol: new TransportProtocol("https://example.com")
 );
 
 // Step 2: Helper produces pairing request
-var request = Pairing.ProducePairingRequestMessage(
+var request = Pairing.Request.Produce(
     kind: Pairing.SenderKind.Helper,
     transportProtocol: new TransportProtocol("https://helper.com"),
-    contactMessageBytes: contact.WireBytes
+    contactMessage: contact.ContactMessage
 );
 
 // Step 3: Owner produces pairing response
-var response = Pairing.ProducePairingResponseMessage(
-    kind: Pairing.SenderKind.SharerNonRecovery,
-    pairRequestWireBytes: request.WireBytes,
+var response = Pairing.Response.Produce(
+    kind: Pairing.SenderKind.OwnerNonRecovery,
+    pairRequest: request.Envelope,
     pairingSecretKeyMaterial: contact.SecretKeyMaterial
 );
 
 // Step 4: Helper processes response
-var final = Pairing.ProcessPairingResponseMessage(
+var final = Pairing.Response.Process(
     contactMessage: request.InitiatorContactMessage,
-    pairResponseWireBytes: response.WireBytes,
+    pairResponse: response.Envelope,
     pairingSecretKeyMaterial: request.SecretKeyMaterial
 );
 
@@ -91,17 +92,32 @@ Console.WriteLine($"Shared key length: {final.SharedKey.Length}");
 
 ```csharp
 using DeRec.Library;
+using DeRec.Library.Primitives;
 
-var result = Sharing.ProtectSecret(
+var splitResult = Sharing.Request.Split(
     secretId: new byte[] {1,2,3},
     secretData: System.Text.Encoding.UTF8.GetBytes("super-secret"),
-    channels: new ulong[] {1,2,3},
+    channelIds: new ulong[] {1,2,3},
     threshold: 2,
     version: 1
 );
 
-// Opaque wire bytes containing all share messages
-byte[] shareMessages = result.ShareMessageWireBytesArray;
+// Unpack into a channel ID → committed share map
+var shares = splitResult.DeserializeShares();
+
+// Wrap each share into an encrypted delivery envelope
+foreach (var (channelId, committedShare) in shares)
+{
+    var envelope = Sharing.Request.Produce(
+        channelId: channelId,
+        version: 1,
+        secretId: new byte[] {1,2,3},
+        committedShare: committedShare,
+        keepList: Array.Empty<int>(),
+        description: string.Empty,
+        sharedKey: sharedKeys[channelId]
+    );
+}
 ```
 
 ---
@@ -110,22 +126,31 @@ byte[] shareMessages = result.ShareMessageWireBytesArray;
 
 ```csharp
 using DeRec.Library;
+using DeRec.Library.Primitives;
 
-// Request a share
-byte[] request = Recovery.GenerateShareRequest(
+// Owner side: produce the recovery request
+DeRecMessage shareRequest = Recovery.Request.Produce(
+    channelId: 1,
     secretId: new byte[] {1,2,3},
-    version: 1
+    version: 1,
+    sharedKey: sharedKey
 );
 
-// Helper responds with share content
-byte[] response = Recovery.GenerateShareResponse(
-    shareRequestWireBytes: request,
-    shareContent: /* stored share bytes */
+// Helper side: produce the response
+DeRecMessage shareResponse = Recovery.Response.Produce(
+    channelId: 1,
+    secretId: new byte[] {1,2,3},
+    request: shareRequest,
+    storedShareRequest: storedShareRequest,
+    sharedKey: sharedKey
 );
 
-// Owner aggregates responses and recovers secret
-byte[] secret = Recovery.RecoverFromShareResponses(
-    shareResponseWireBytesArray: /* aggregated responses */,
+// Owner side: aggregate responses and reconstruct the secret
+byte[] secret = Recovery.Response.Recover(
+    responses: new[]
+    {
+        new Recovery.Response.RecoveryInput { Envelope = shareResponse, SharedKey = sharedKey },
+    },
     secretId: new byte[] {1,2,3},
     version: 1
 );
@@ -137,24 +162,38 @@ byte[] secret = Recovery.RecoverFromShareResponses(
 
 ```csharp
 using DeRec.Library;
+using DeRec.Library.Primitives;
 
-// Owner generates verification request
-byte[] request = Verification.GenerateVerificationRequest(
+// Owner side: produce the verification request.
+DeRecMessage requestEnvelope = Verification.Request.Produce(
+    channelId: 1,
     secretId: new byte[] {1,2,3},
-    version: 1
+    version: 1,
+    sharedKey: sharedKey
 );
 
-// Helper produces response
-byte[] response = Verification.GenerateVerificationResponse(
-    shareContent: /* stored share */,
-    requestWireBytes: request
+// Helper side: decrypt and extract the challenge fields.
+var req = Verification.Request.Extract(
+    request: requestEnvelope,
+    sharedKey: sharedKey
+);
+// req.ChannelId, req.SecretId, req.Version, req.Nonce
+
+// Helper side: produce the response.
+DeRecMessage responseEnvelope = Verification.Response.Produce(
+    channelId: req.ChannelId,
+    secretId: req.SecretId,
+    version: req.Version,
+    nonce: req.Nonce,
+    sharedKey: sharedKey,
+    storedRequest: storedShareRequest
 );
 
-// Owner verifies response
-bool isValid = Verification.VerifyShareResponse(
-    shareContent: /* stored share */,
-    requestWireBytes: request,
-    responseWireBytes: response
+// Owner side: verify the response.
+bool isValid = Verification.Response.Process(
+    response: responseEnvelope,
+    sharedKey: sharedKey,
+    storedRequest: storedShareRequest
 );
 
 Console.WriteLine($"Valid: {isValid}");

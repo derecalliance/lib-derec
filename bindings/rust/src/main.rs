@@ -1,21 +1,17 @@
-use derec_library::pairing::{
-    create_contact_message, process_pairing_response_message, produce_pairing_request_message,
-    produce_pairing_response_message,
-};
+use derec_library::pairing::{contact, request as pair_request, response as pair_response};
 use derec_library::protocol_version::ProtocolVersion;
 use derec_library::recovery::{
-    RecoveryResponseInput, generate_share_request, generate_share_response,
-    recover_from_share_responses,
+    ResponseInput as RecoveryResponseInput, request as rec_request, response as rec_response,
+    recover,
 };
 use derec_library::sharing::{
-    process_store_share_response_message, produce_store_share_request_message,
-    produce_store_share_response_message, protect_secret,
+    request as share_request, response as share_response,
 };
 use derec_library::types::ChannelId;
 use derec_library::verification::{
-    generate_verification_request, generate_verification_response, verify_share_response,
+    request as verif_request, response as verif_response,
 };
-use derec_proto::{ContactMessage, Protocol, SenderKind, TransportProtocol};
+use derec_proto::{Protocol, SenderKind, TransportProtocol};
 use prost::Message;
 use std::collections::HashMap;
 
@@ -46,31 +42,32 @@ fn run_pairing_flow_test() {
 
     let channel_id = ChannelId(1);
 
-    let contact = create_contact_message(
+    let contact_result = contact::create(
         channel_id,
         TransportProtocol {
             uri: "https://example.com/alice".to_owned(),
             protocol: Protocol::Https.into(),
         },
     )
-    .expect("Pairing test failed: create_contact_message failed.");
+    .expect("Pairing test failed: contact::create failed.");
 
-    println!("contact.wire_bytes = {}", contact.wire_bytes.len());
+    let contact_wire_bytes = contact_result.contact.encode_to_vec();
+
+    println!("contact.wire_bytes = {}", contact_wire_bytes.len());
     println!(
         "contact.secret_key_material bytes = {}",
-        serialize_pairing_secret_key_material_len(&contact.secret_key)
+        serialize_pairing_secret_key_material_len(&contact_result.secret_key)
     );
 
-    if contact.wire_bytes.is_empty() {
+    if contact_wire_bytes.is_empty() {
         panic!("Pairing test failed: empty contact wire bytes.");
     }
 
-    if serialize_pairing_secret_key_material_len(&contact.secret_key) == 0 {
+    if serialize_pairing_secret_key_material_len(&contact_result.secret_key) == 0 {
         panic!("Pairing test failed: empty contact secret key material.");
     }
 
-    let decoded_contact = ContactMessage::decode(contact.wire_bytes.as_slice())
-        .expect("Pairing test failed: failed to decode contact wire bytes.");
+    let decoded_contact = contact_result.contact.clone();
 
     let transport = decoded_contact
         .transport_protocol
@@ -93,89 +90,105 @@ fn run_pairing_flow_test() {
         panic!("Pairing test failed: unexpected transport protocol.");
     }
 
-    let pair_request = produce_pairing_request_message(
+    let pair_req = pair_request::produce(
         SenderKind::Helper,
         TransportProtocol {
             uri: "https://example.com/helper".to_owned(),
             protocol: Protocol::Https.into(),
         },
-        &contact.wire_bytes,
+        &decoded_contact,
     )
-    .expect("Pairing test failed: produce_pairing_request_message failed.");
+    .expect("Pairing test failed: pair_request::produce failed.");
 
-    let initiator_tp = pair_request
-        .initiator_contact_message
+    let pair_request_wire_bytes = pair_req.envelope.clone();
+
+    let initiator_tp = pair_req
+        .initiator_contact
         .transport_protocol
         .as_ref()
-        .expect("initiator_contact_message should have transport_protocol");
+        .expect("initiator_contact should have transport_protocol");
 
     println!(
         "pair_request.wire_bytes = {}",
-        pair_request.wire_bytes.len()
+        pair_request_wire_bytes.len()
     );
     println!(
-        "pair_request.initiator_contact_message.transport_protocol.uri = {}",
+        "pair_request.initiator_contact.transport_protocol.uri = {}",
         initiator_tp.uri
     );
     println!(
         "pair_request.secret_key_material bytes = {}",
-        serialize_pairing_secret_key_material_len(&pair_request.secret_key)
+        serialize_pairing_secret_key_material_len(&pair_req.secret_key)
     );
 
-    if pair_request.wire_bytes.is_empty() {
+    if pair_request_wire_bytes.is_empty() {
         panic!("Pairing test failed: empty pair request wire bytes.");
     }
 
     if initiator_tp.uri != "https://example.com/alice" {
         panic!(
-            "Pairing test failed: initiator_contact_message URI does not match contact message."
+            "Pairing test failed: initiator_contact URI does not match contact message."
         );
     }
 
     if initiator_tp.protocol() != Protocol::Https {
         panic!(
-            "Pairing test failed: initiator_contact_message protocol does not match contact message."
+            "Pairing test failed: initiator_contact protocol does not match contact message."
         );
     }
 
-    if serialize_pairing_secret_key_material_len(&pair_request.secret_key) == 0 {
+    if serialize_pairing_secret_key_material_len(&pair_req.secret_key) == 0 {
         panic!("Pairing test failed: empty pair request secret key material.");
     }
 
-    let pair_response = produce_pairing_response_message(
+    // Alice (initiator) extracts the request and produces the response.
+    let extracted_request =
+        pair_request::extract(&pair_req.envelope, &contact_result.secret_key.ecies_secret_key)
+            .expect("Pairing test failed: pair_request::extract failed.");
+
+    let pair_resp = pair_response::produce(
         SenderKind::OwnerNonRecovery,
-        &pair_request.wire_bytes,
-        &contact.secret_key,
+        &extracted_request.request,
+        &contact_result.secret_key,
     )
-    .expect("Pairing test failed: produce_pairing_response_message failed.");
+    .expect("Pairing test failed: pair_response::produce failed.");
+
+    let pair_response_wire_bytes = pair_resp.envelope.clone();
 
     println!(
         "pair_response.wire_bytes = {}",
-        pair_response.wire_bytes.len()
+        pair_response_wire_bytes.len()
     );
     println!(
         "pair_response.shared_key bytes = {}",
-        pair_response.shared_key.len()
+        pair_resp.shared_key.len()
     );
     println!(
-        "pair_response.responder_transport_protocol = {:?}",
-        pair_response.responder_transport_protocol
+        "pair_response.peer_endpoint = {:?}",
+        pair_resp.peer_endpoint
     );
 
-    if pair_response.wire_bytes.is_empty() {
+    if pair_response_wire_bytes.is_empty() {
         panic!("Pairing test failed: empty pair response wire bytes.");
     }
 
-    if pair_response.shared_key.is_empty() {
+    if pair_resp.shared_key.is_empty() {
         panic!("Pairing test failed: empty pair response shared key.");
     }
 
-    let processed = process_pairing_response_message(
-        pair_request.initiator_contact_message,
-        &pair_response.wire_bytes,
-        &pair_request.secret_key,
+    // Bob (responder) extracts the response and finalizes pairing.
+    let extracted_response = pair_response::extract(
+        &pair_resp.envelope,
+        &pair_req.secret_key.ecies_secret_key,
     )
-    .expect("Pairing test failed: process_pairing_response_message failed.");
+    .expect("Pairing test failed: pair_response::extract failed.");
+
+    let processed = pair_response::process(
+        &pair_req.initiator_contact,
+        &extracted_response.response,
+        &pair_req.secret_key,
+    )
+    .expect("Pairing test failed: pair_response::process failed.");
 
     println!(
         "processed.shared_key bytes = {}",
@@ -186,7 +199,7 @@ fn run_pairing_flow_test() {
         panic!("Pairing test failed: empty processed shared key.");
     }
 
-    let shared_keys_equal = pair_response.shared_key == processed.shared_key;
+    let shared_keys_equal = pair_resp.shared_key == processed.shared_key;
 
     println!("shared keys equal = {}", shared_keys_equal);
 
@@ -206,21 +219,21 @@ fn run_sharing_flow_test() {
     let threshold = 2_usize;
     let version = 1_i32;
 
-    let result = protect_secret(secret_id, secret_data, &channels, threshold, version)
-        .expect("Sharing test failed: protect_secret failed.");
+    let split_result = share_request::split(&channels, secret_id, version, secret_data, threshold)
+        .expect("Sharing test failed: share_request::split failed.");
 
-    println!("shares count = {}", result.shares.len());
+    println!("shares count = {}", split_result.shares.len());
 
-    if result.shares.len() != channels.len() {
+    if split_result.shares.len() != channels.len() {
         panic!(
             "Sharing test failed: expected {} shares but got {}.",
             channels.len(),
-            result.shares.len()
+            split_result.shares.len()
         );
     }
 
     for channel in &channels {
-        if !result.shares.contains_key(channel) {
+        if !split_result.shares.contains_key(channel) {
             panic!(
                 "Sharing test failed: missing share for channel {:?}.",
                 channel
@@ -230,9 +243,23 @@ fn run_sharing_flow_test() {
 
     let shared_key = [42u8; 32];
 
-    for (channel, share) in &result.shares {
+    for (channel, share) in &split_result.shares {
         println!("channel = {:?}", channel);
-        println!("commitment bytes = {}", share.commitment.len());
+        println!("  commitment bytes = {}", share.commitment.len());
+        println!("  merkle_path nodes = {}", share.merkle_path.len());
+
+        // Decode the inner DeRecShare from the CommittedDeRecShare.
+        if let Ok(de_rec_share) = derec_proto::DeRecShare::decode(share.de_rec_share.as_slice()) {
+            println!("  de_rec_share.version = {}", de_rec_share.version);
+            println!("  de_rec_share.secret_id bytes = {}", de_rec_share.secret_id.len());
+            println!("  de_rec_share.x bytes = {}", de_rec_share.x.len());
+            println!("  de_rec_share.y bytes = {}", de_rec_share.y.len());
+            println!("  de_rec_share.encrypted_secret bytes = {}", de_rec_share.encrypted_secret.len());
+        }
+
+        for (i, node) in share.merkle_path.iter().enumerate() {
+            println!("  merkle_path[{}] is_left={} hash_bytes={}", i, node.is_left, node.hash.len());
+        }
 
         if share.commitment.is_empty() {
             panic!(
@@ -241,9 +268,10 @@ fn run_sharing_flow_test() {
             );
         }
 
-        let store_msg = produce_store_share_request_message(
+        let store_result = share_request::produce(
             *channel,
             version,
+            &secret_id,
             share,
             &[],
             "",
@@ -251,45 +279,65 @@ fn run_sharing_flow_test() {
         )
         .unwrap_or_else(|_| {
             panic!(
-                "Sharing test failed: produce_store_share_request_message failed for channel {:?}.",
+                "Sharing test failed: share_request::produce failed for channel {:?}.",
                 channel
             )
         });
 
+        let store_request_wire_bytes = store_result.envelope.clone();
         println!(
             "store_share_request wire bytes = {}",
-            store_msg.wire_bytes.len()
+            store_request_wire_bytes.len()
         );
 
-        if store_msg.wire_bytes.is_empty() {
+        if store_request_wire_bytes.is_empty() {
             panic!(
                 "Sharing test failed: empty store share request wire bytes for channel {:?}.",
                 channel
             );
         }
 
-        let processed = produce_store_share_response_message(
-            *channel,
-            &shared_key,
-            &store_msg.wire_bytes,
-        )
-        .unwrap_or_else(|_| {
-            panic!(
-                "Sharing test failed: produce_store_share_response_message failed for channel {:?}.",
-                channel
-            )
-        });
+        let extracted_req = share_request::extract(&store_request_wire_bytes, &shared_key)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Sharing test failed: share_request::extract failed for channel {:?}: {}",
+                    channel, e
+                )
+            });
 
+        let processed = share_response::produce(*channel, &extracted_req.request, &shared_key)
+            .unwrap_or_else(|_| {
+                panic!(
+                    "Sharing test failed: share_response::produce failed for channel {:?}.",
+                    channel
+                )
+            });
+
+        let response_wire_bytes = processed.envelope.clone();
         println!(
             "store_share_response wire bytes = {}",
-            processed.wire_bytes.len()
+            response_wire_bytes.len()
         );
+        // Decode the stored CommittedDeRecShare from the response.
         println!(
-            "committed_share commitment bytes = {}",
-            processed.committed_share.commitment.len()
+            "  stored committed_share: commitment_bytes={} merkle_path_nodes={}",
+            processed.committed_share.commitment.len(),
+            processed.committed_share.merkle_path.len()
         );
+        if let Ok(stored_de_rec_share) =
+            derec_proto::DeRecShare::decode(processed.committed_share.de_rec_share.as_slice())
+        {
+            println!(
+                "  stored de_rec_share: version={} x_bytes={} y_bytes={}",
+                stored_de_rec_share.version,
+                stored_de_rec_share.x.len(),
+                stored_de_rec_share.y.len()
+            );
+        }
+        println!("secret_id bytes = {}", processed.secret_id.len());
+        println!("version = {}", processed.version);
 
-        if processed.wire_bytes.is_empty() {
+        if response_wire_bytes.is_empty() {
             panic!(
                 "Sharing test failed: empty response wire bytes for channel {:?}.",
                 channel
@@ -303,10 +351,32 @@ fn run_sharing_flow_test() {
             );
         }
 
-        process_store_share_response_message(version, &shared_key, &processed.wire_bytes)
+        if processed.secret_id.is_empty() {
+            panic!(
+                "Sharing test failed: empty secret_id for channel {:?}.",
+                channel
+            );
+        }
+
+        if processed.version != version {
+            panic!(
+                "Sharing test failed: version mismatch for channel {:?}: expected {}, got {}.",
+                channel, version, processed.version
+            );
+        }
+
+        let extracted_resp = share_response::extract(&response_wire_bytes, &shared_key)
             .unwrap_or_else(|e| {
                 panic!(
-                    "Sharing test failed: process_store_share_response_message failed for channel {:?}: {}",
+                    "Sharing test failed: share_response::extract failed for channel {:?}: {}",
+                    channel, e
+                )
+            });
+
+        share_response::process(version, &extracted_resp.response)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Sharing test failed: share_response::process failed for channel {:?}: {}",
                     channel, e
                 )
             });
@@ -328,8 +398,8 @@ fn run_verification_flow_test() {
 
     let shared_keys = make_shared_keys(&channels);
 
-    let sharing = protect_secret(secret_id, secret_data, &channels, threshold, version)
-        .expect("Verification test failed: protect_secret failed.");
+    let sharing = share_request::split(&channels, secret_id, version, secret_data, threshold)
+        .expect("Verification test failed: share_request::split failed.");
 
     let channel_1 = ChannelId(1);
     let channel_2 = ChannelId(2);
@@ -338,75 +408,121 @@ fn run_verification_flow_test() {
         .get(&channel_1)
         .expect("Verification test failed: missing shared key for channel 1.");
 
-    let stored_wire_1 = produce_store_share_request_message(
+    let stored_wire_1 = share_request::produce(
         channel_1,
         version,
+        &secret_id,
         &sharing.shares[&channel_1],
         &[],
         "",
         shared_key_1,
     )
-    .expect("Verification test failed: produce_store_share_request_message failed for channel 1.")
-    .wire_bytes;
+    .expect("Verification test failed: share_request::produce failed for channel 1.")
+    .envelope;
 
-    let stored_wire_2 = produce_store_share_request_message(
+    let stored_wire_2 = share_request::produce(
         channel_2,
         version,
+        &secret_id,
         &sharing.shares[&channel_2],
         &[],
         "",
         shared_key_1,
     )
-    .expect("Verification test failed: produce_store_share_request_message failed for channel 2.")
-    .wire_bytes;
+    .expect("Verification test failed: share_request::produce failed for channel 2.")
+    .envelope;
 
-    let request = generate_verification_request(secret_id, channel_1, version, shared_key_1)
-        .expect("Verification test failed: generate_verification_request failed.");
-    println!(
-        "verification_request wire bytes = {}",
-        request.wire_bytes.len()
-    );
+    // Owner side: produce the verification request.
+    let produced = verif_request::produce(channel_1, &secret_id, version, shared_key_1)
+        .expect("Verification test failed: verif_request::produce failed.");
 
-    let response = generate_verification_response(
-        secret_id,
+    println!("verification_request wire bytes = {}", produced.envelope.len());
+
+    // Helper side: decode the outer envelope to check channel_id.
+    let request_envelope = derec_proto::DeRecMessage::decode(produced.envelope.as_slice())
+        .expect("Verification test failed: failed to decode request envelope.");
+    println!("request_envelope.channel_id = {}", request_envelope.channel_id);
+
+    if request_envelope.channel_id != u64::from(channel_1) {
+        panic!(
+            "Verification test failed: expected channel_id {:?}, got {}.",
+            channel_1, request_envelope.channel_id
+        );
+    }
+
+    // Helper side: decrypt and extract challenge metadata.
+    let req_result = verif_request::extract(&produced.envelope, shared_key_1)
+        .expect("Verification test failed: verif_request::extract failed.");
+    println!("req_result.request.secret_id bytes = {}", req_result.request.secret_id.len());
+    println!("req_result.request.version = {}", req_result.request.version);
+    println!("req_result.request.nonce = {}", req_result.request.nonce);
+
+    if req_result.request.secret_id != secret_id {
+        panic!("Verification test failed: secret_id does not match.");
+    }
+    if req_result.request.version != version {
+        panic!(
+            "Verification test failed: expected version {}, got {}.",
+            version, req_result.request.version
+        );
+    }
+    if req_result.request.nonce == 0 {
+        panic!("Verification test failed: nonce must not be zero.");
+    }
+
+    // Helper side: build the response.
+    let resp_produced = verif_response::produce(
         channel_1,
+        &req_result.request,
         shared_key_1,
         &stored_wire_1,
-        &request.wire_bytes,
     )
-    .expect("Verification test failed: generate_verification_response failed.");
-    println!(
-        "verification_response wire bytes = {}",
-        response.wire_bytes.len()
-    );
+    .expect("Verification test failed: verif_response::produce failed.");
 
-    let valid = verify_share_response(
-        secret_id,
-        channel_1,
-        shared_key_1,
-        &stored_wire_1,
-        &response.wire_bytes,
-    )
-    .expect("Verification test failed: verify_share_response failed for valid case.");
+    println!("verification_response wire bytes = {}", resp_produced.envelope.len());
 
-    println!("verification valid = {}", valid);
+    // Owner side: decode response envelope to check channel_id.
+    let response_envelope = derec_proto::DeRecMessage::decode(resp_produced.envelope.as_slice())
+        .expect("Verification test failed: failed to decode response envelope.");
+    println!("response_envelope.channel_id = {}", response_envelope.channel_id);
 
-    if !valid {
+    if response_envelope.channel_id != u64::from(channel_1) {
+        panic!(
+            "Verification test failed: expected channel_id {:?} in response, got {}.",
+            channel_1, response_envelope.channel_id
+        );
+    }
+
+    let resp_result = verif_response::extract(&resp_produced.envelope, shared_key_1)
+        .expect("Verification test failed: verif_response::extract failed.");
+
+    let proc_result = verif_response::process(&resp_result.response, &stored_wire_1)
+        .expect("Verification test failed: verif_response::process failed for valid case.");
+
+    println!("verification valid = {}", proc_result.valid);
+
+    if !proc_result.valid {
         panic!("Verification test failed: expected valid response.");
     }
 
-    let invalid = verify_share_response(
-        secret_id,
+    // Test with wrong share content — should return false.
+    let resp_produced_2 = verif_response::produce(
         channel_1,
+        &req_result.request,
         shared_key_1,
-        &stored_wire_2,
-        &response.wire_bytes,
+        &stored_wire_1,
     )
-    .expect("Verification test failed: verify_share_response failed for invalid case.");
+    .expect("Verification test failed: second verif_response::produce failed.");
 
-    println!("verification invalid case = {}", invalid);
+    let resp_result_2 = verif_response::extract(&resp_produced_2.envelope, shared_key_1)
+        .expect("Verification test failed: second verif_response::extract failed.");
 
-    if invalid {
+    let proc_result_2 = verif_response::process(&resp_result_2.response, &stored_wire_2)
+        .expect("Verification test failed: verif_response::process failed for invalid case.");
+
+    println!("verification invalid case = {}", proc_result_2.valid);
+
+    if proc_result_2.valid {
         panic!("Verification test failed: expected invalid response for wrong share.");
     }
 
@@ -424,8 +540,8 @@ fn run_recovery_flow_test() {
 
     let shared_keys = make_shared_keys(&channels);
 
-    let sharing = protect_secret(secret_id, secret_data, &channels, threshold, version)
-        .expect("Recovery test failed: protect_secret failed.");
+    let sharing = share_request::split(&channels, secret_id, version, secret_data, threshold)
+        .expect("Recovery test failed: share_request::split failed.");
 
     let channel_1 = ChannelId(1);
     let channel_2 = ChannelId(2);
@@ -438,95 +554,109 @@ fn run_recovery_flow_test() {
         .get(&channel_2)
         .expect("Recovery test failed: missing shared key for channel 2.");
 
-    let stored_wire_1 = produce_store_share_request_message(
+    let stored_envelope_1 = share_request::produce(
         channel_1,
         version,
+        &secret_id,
         &sharing.shares[&channel_1],
         &[],
         "",
         shared_key_1,
     )
-    .expect("Recovery test failed: produce_store_share_request_message failed for channel 1.")
-    .wire_bytes;
+    .expect("Recovery test failed: share_request::produce failed for channel 1.")
+    .envelope;
 
-    let stored_wire_2 = produce_store_share_request_message(
+    let stored_envelope_2 = share_request::produce(
         channel_2,
         version,
+        &secret_id,
         &sharing.shares[&channel_2],
         &[],
         "",
         shared_key_2,
     )
-    .expect("Recovery test failed: produce_store_share_request_message failed for channel 2.")
-    .wire_bytes;
+    .expect("Recovery test failed: share_request::produce failed for channel 2.")
+    .envelope;
 
-    let share_request_1 = generate_share_request(channel_1, &secret_id, version, shared_key_1)
-        .expect("Recovery test failed: generate_share_request failed for channel 1.");
-    println!(
-        "share_request[1] wire bytes = {}",
-        share_request_1.wire_bytes.len()
-    );
+    let stored_request_1 = share_request::extract(&stored_envelope_1, shared_key_1)
+        .expect("Recovery test failed: share_request::extract failed for channel 1.")
+        .request;
 
-    let share_response_1 = generate_share_response(
+    let stored_request_2 = share_request::extract(&stored_envelope_2, shared_key_2)
+        .expect("Recovery test failed: share_request::extract failed for channel 2.")
+        .request;
+
+    let share_req_1 = rec_request::produce(channel_1, &secret_id, version, shared_key_1)
+        .expect("Recovery test failed: rec_request::produce failed for channel 1.");
+    println!("share_request[1] wire bytes = {}", share_req_1.envelope.len());
+
+    let get_request_1 = rec_request::extract(&share_req_1.envelope, shared_key_1)
+        .expect("Recovery test failed: rec_request::extract failed for channel 1.")
+        .request;
+
+    let share_resp_1 = rec_response::produce(
         channel_1,
         &secret_id,
-        &share_request_1.wire_bytes,
-        &stored_wire_1,
+        &get_request_1,
+        &stored_request_1,
         shared_key_1,
     )
     .unwrap_or_else(|_| {
-        panic!("Recovery test failed: generate_share_response failed for channel 1.",)
+        panic!("Recovery test failed: rec_response::produce failed for channel 1.",)
     });
 
-    println!(
-        "share_response[1] wire bytes = {}",
-        share_response_1.wire_bytes.len()
-    );
+    println!("share_response[1] wire bytes = {}", share_resp_1.envelope.len());
 
-    let share_request_2 = generate_share_request(channel_2, &secret_id, version, shared_key_2)
-        .expect("Recovery test failed: generate_share_request failed for channel 2.");
-    println!(
-        "share_request[2] wire bytes = {}",
-        share_request_2.wire_bytes.len()
-    );
+    let get_response_1 = rec_response::extract(&share_resp_1.envelope, shared_key_1)
+        .expect("Recovery test failed: rec_response::extract failed for channel 1.")
+        .response;
 
-    let share_response_2 = generate_share_response(
+    let share_req_2 = rec_request::produce(channel_2, &secret_id, version, shared_key_2)
+        .expect("Recovery test failed: rec_request::produce failed for channel 2.");
+    println!("share_request[2] wire bytes = {}", share_req_2.envelope.len());
+
+    let get_request_2 = rec_request::extract(&share_req_2.envelope, shared_key_2)
+        .expect("Recovery test failed: rec_request::extract failed for channel 2.")
+        .request;
+
+    let share_resp_2 = rec_response::produce(
         channel_2,
         &secret_id,
-        &share_request_2.wire_bytes,
-        &stored_wire_2,
+        &get_request_2,
+        &stored_request_2,
         shared_key_2,
     )
     .unwrap_or_else(|_| {
-        panic!("Recovery test failed: generate_share_response failed for channel 2.",)
+        panic!("Recovery test failed: rec_response::produce failed for channel 2.",)
     });
 
-    println!(
-        "share_response[2] wire bytes = {}",
-        share_response_2.wire_bytes.len()
-    );
+    println!("share_response[2] wire bytes = {}", share_resp_2.envelope.len());
 
-    let response_wire_bytes = vec![
+    let get_response_2 = rec_response::extract(&share_resp_2.envelope, shared_key_2)
+        .expect("Recovery test failed: rec_response::extract failed for channel 2.")
+        .response;
+
+    let inputs = vec![
         RecoveryResponseInput {
-            bytes: &share_response_1.wire_bytes,
+            share_response: &get_response_1,
             shared_key: shared_key_1,
         },
         RecoveryResponseInput {
-            bytes: &share_response_2.wire_bytes,
+            share_response: &get_response_2,
             shared_key: shared_key_2,
         },
     ];
 
-    let recovered = recover_from_share_responses(&secret_id, version, &response_wire_bytes)
-        .expect("Recovery test failed: recover_from_share_responses failed.");
+    let recovered = recover(&secret_id, version, &inputs)
+        .expect("Recovery test failed: recover failed.");
 
-    println!("recovered bytes = {}", recovered.secret_data.len());
+    println!("recovered bytes = {}", recovered.secret.len());
     println!(
         "recovered matches original = {}",
-        recovered.secret_data.as_slice() == secret_data
+        recovered.secret.as_slice() == secret_data
     );
 
-    if recovered.secret_data.as_slice() != secret_data {
+    if recovered.secret.as_slice() != secret_data {
         panic!("Recovery test failed: recovered secret does not match original.");
     }
 

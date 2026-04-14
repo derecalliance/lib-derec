@@ -53,11 +53,10 @@ These represent **opaque wire-level protocol messages**.
 ## Quick Example
 
 ```ts
-import * as derec from "@derec-alliance/nodejs";
+import { primitives } from "@derec-alliance/nodejs";
 
-const version = derec.derec_protocol_version();
-
-console.log(version.major, version.minor);
+const result = primitives.verification.request.produce(channelId, secretId, version, sharedKey);
+// result carries the encoded DeRecMessage envelope, ready to send over transport
 ```
 
 ---
@@ -65,36 +64,36 @@ console.log(version.major, version.minor);
 ## Pairing Flow
 
 ```ts
-import * as derec from "@derec-alliance/nodejs";
+import { primitives } from "@derec-alliance/nodejs";
 
 // Step 1: Owner creates contact message (out-of-band)
-const contact = derec.create_contact_message(
+const contact = primitives.pairing.request.create_contact(
   1n,
   { protocol: "https", uri: "https://owner.example.com" }
 );
 
 // Step 2: Helper produces pairing request
-const request = derec.produce_pairing_request_message(
+const request = primitives.pairing.request.produce(
   2, // SenderKind.Helper
   { protocol: "https", uri: "https://helper.example.com" },
-  contact.wire_bytes
+  contact.contact_message
 );
 
 // Step 3: Owner produces pairing response
-const response = derec.produce_pairing_response_message(
-  0, // SenderKind.SharerNonRecovery
-  request.wire_bytes,
+const response = primitives.pairing.response.produce(
+  0, // SenderKind.OwnerNonRecovery
+  request.envelope,
   contact.secret_key_material
 );
 
 // Step 4: Helper processes response and derives shared key
-const result = derec.process_pairing_response_message(
+const result = primitives.pairing.response.process(
   request.initiator_contact_message,
-  response.wire_bytes,
+  response.envelope,
   request.secret_key_material
 );
 
-console.log("Shared key length:", result.shared_key.length);
+console.log("Shared key length:", result.pairing_shared_key.length);
 ```
 
 ---
@@ -102,19 +101,23 @@ console.log("Shared key length:", result.shared_key.length);
 ## Share Distribution (Sharing Flow)
 
 ```ts
-import * as derec from "@derec-alliance/nodejs";
+import { primitives } from "@derec-alliance/nodejs";
 
-const result = derec.protect_secret(
+const splitResult = primitives.sharing.request.split(
   new Uint8Array([1, 2, 3]),                // secret ID
   new TextEncoder().encode("super-secret"), // secret bytes
   [1n, 2n, 3n],                             // helper channel IDs
   2,                                        // threshold
   1                                         // version
 );
+// splitResult.value: Map<bigint, Uint8Array> — one CommittedDeRecShare per helper
 
-const shareMessages = result.share_message_wire_bytes_array;
-
-console.log(shareMessages);
+// Wrap each share into an encrypted delivery envelope
+for (const [channelId, committedShare] of splitResult.value) {
+  const envelope = primitives.sharing.request.produce(
+    channelId, version, secretId, committedShare, [], "", sharedKeys.get(channelId)
+  );
+}
 ```
 
 ---
@@ -122,28 +125,33 @@ console.log(shareMessages);
 ## Recovery Flow
 
 ```ts
-import * as derec from "@derec-alliance/nodejs";
+import { primitives } from "@derec-alliance/nodejs";
 
-// Owner requests shares from helpers
-const request = derec.generate_share_request(
+// Owner side: produce the recovery request
+const shareRequest = primitives.recovery.request.produce(
+  1n,                        // channel ID
   new Uint8Array([1, 2, 3]), // secret ID
-  1                          // version
+  1,                         // version
+  sharedKey
 );
 
-// Helper responds with its share
-const response = derec.generate_share_response(
-  request,
-  new Uint8Array() // share content
+// Helper side: produce the response
+const shareResponse = primitives.recovery.response.produce(
+  new Uint8Array([1, 2, 3]), // secret ID
+  1n,                        // channel ID
+  storedShareEnvelope,
+  shareRequest,
+  sharedKey
 );
 
-// Owner reconstructs secret from aggregated responses
-const secret = derec.recover_from_share_responses(
-  new Uint8Array(), // aggregated responses
+// Owner side: aggregate responses and reconstruct the secret
+const recovered = primitives.recovery.response.recover(
+  [{ response: shareResponse, shared_key: sharedKey }],
   new Uint8Array([1, 2, 3]),
   1
 );
 
-console.log(secret);
+console.log(recovered);
 ```
 
 ---
@@ -151,25 +159,27 @@ console.log(secret);
 ## Verification Flow
 
 ```ts
-import * as derec from "@derec-alliance/nodejs";
+import { primitives } from "@derec-alliance/nodejs";
 
-// Owner challenges helper
-const request = derec.generate_verification_request(
-  new Uint8Array([1, 2, 3]),
-  1
+// Owner side: produce the verification request.
+const requestEnvelope = primitives.verification.request.produce(channelId, secretId, version, sharedKey);
+
+// Helper side: decrypt and extract the challenge fields.
+const req = primitives.verification.request.extract(requestEnvelope, sharedKey);
+// req.channel_id, req.secret_id, req.version, req.nonce
+
+// Helper side: produce the response.
+const responseEnvelope = primitives.verification.response.produce(
+  channelId,
+  req.secret_id,
+  req.version,
+  req.nonce,
+  sharedKey,
+  storedShareEnvelope
 );
 
-// Helper proves it still holds the share
-const response = derec.generate_verification_response(
-  new Uint8Array(), // share content
-  request
-);
-
-const isValid = derec.verify_share_response(
-  new Uint8Array(), // share content
-  request,
-  response
-);
+// Owner side: verify the response.
+const isValid = primitives.verification.response.process(responseEnvelope, sharedKey, storedShareEnvelope);
 
 console.log("Valid:", isValid);
 ```
@@ -191,11 +201,13 @@ console.log("Valid:", isValid);
 derec_library_bg.wasm
 derec_library.js
 derec_library.d.ts
+index.js
+index.d.ts
 ```
 
 - `.wasm` — compiled Rust core
-- `.js` — bindings
-- `.d.ts` — TypeScript definitions
+- `derec_library.js` / `derec_library.d.ts` — raw wasm-bindgen bindings
+- `index.js` / `index.d.ts` — `primitives.*` namespace assembly and TypeScript declarations
 
 ---
 

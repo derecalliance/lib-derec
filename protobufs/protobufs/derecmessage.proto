@@ -30,7 +30,7 @@ package org.derecalliance.derec.protobuf;
 // authenticity. Instead:
 //
 // - The `message` field contains encrypted bytes representing the inner message
-// - Encryption and signing are applied at the payload level prior to transport
+// - Encryption is applied at the payload level prior to transport
 //
 // Implementations MUST ensure that:
 //
@@ -137,6 +137,10 @@ message DeRecMessage {
   // Implementations SHOULD NOT rely solely on this value for security-critical
   // decisions without additional protections.
   google.protobuf.Timestamp timestamp = 5;
+
+
+  // TODO: Remove any referencces to MessageType
+  // MessageType messageType = 6;
 
   // Encrypted message payload.
   //

@@ -95,8 +95,7 @@ message StoreShareRequestMessage {
 
   // Version number of the share.
   //
-  // Each resharing event increments this value. The secretId is provided
-  // in the enclosing DeRecMessage.
+  // Each resharing event increments this value.
   int32 version = 3;
 
   // List of share versions that MUST be retained by the Helper.
@@ -123,6 +122,12 @@ message StoreShareRequestMessage {
   //
   // Used for observability, replay detection, and timeout handling.
   google.protobuf.Timestamp timestamp = 6;
+
+  // Identifier of the secret to which this share belongs.
+  //
+  // Used by the Helper to associate the share with the correct secret in the
+  // share store under the composite key (channel_id, secret_id, version).
+  bytes secretId = 7;
 }
 
 // StoreShareResponseMessage is the response to a StoreShareRequestMessage.
@@ -153,4 +158,11 @@ message StoreShareResponseMessage {
   //
   // Used for observability, replay detection, and timeout handling.
   google.protobuf.Timestamp timestamp = 3;
+
+  // Identifier of the secret to which this response refers.
+  //
+  // Echoed from the corresponding StoreShareRequestMessage so the Owner can
+  // correlate responses with the correct secret without inspecting the share
+  // bytes.
+  bytes secretId = 4;
 }

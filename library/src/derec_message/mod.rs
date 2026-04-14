@@ -1,32 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use derec_proto::DeRecMessage;
-use prost::Message;
+use crate::types::SharedKey;
 
 mod builder;
 pub use builder::*;
 
 mod error;
+use derec_proto::MessageBody;
 pub use error::*;
 
 #[cfg(test)]
 mod tests;
 
-pub fn extract_inner_message<M>(
-    wire_bytes: impl AsRef<[u8]>,
-    shared_key: &[u8; 32],
-) -> Result<(DeRecMessage, M), crate::Error>
-where
-    M: Message + Default,
-{
-    let derec_message =
-        DeRecMessage::decode(wire_bytes.as_ref()).map_err(crate::Error::ProtobufDecode)?;
+pub fn extract_inner_message(
+    message_bytes: &[u8],
+    shared_key: &SharedKey,
+) -> Result<MessageBody, crate::Error> {
+    let decrypted = derec_cryptography::channel::decrypt_message(message_bytes, shared_key)
+        .map_err(DeRecMessageBuilderError::Encryption)?;
 
-    let plaintext =
-        derec_cryptography::channel::decrypt_message(&derec_message.message, shared_key)
-            .map_err(DeRecMessageBuilderError::Encryption)?;
+    let inner = MessageBody::decode_from_vec(&decrypted).map_err(crate::Error::ProtobufDecode)?;
 
-    let message = M::decode(plaintext.as_slice()).map_err(crate::Error::ProtobufDecode)?;
-
-    Ok((derec_message, message))
+    Ok(inner)
 }

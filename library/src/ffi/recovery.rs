@@ -53,9 +53,9 @@ use crate::ffi::common::{
     DeRecBuffer, DeRecStatus, empty_buffer, err_status, ok_status, read_len_prefixed_vec,
     read_u32_le, vec_into_buffer,
 };
-use crate::recovery::RecoveryResponseInput;
+use crate::primitives::recovery::response::RecoveryResponseInput;
 
-/// FFI result returned by [`generate_share_request`].
+/// FFI result returned by [`produce_get_share_request_message`].
 ///
 /// On success:
 ///
@@ -68,12 +68,12 @@ use crate::recovery::RecoveryResponseInput;
 /// - `status` contains an error
 /// - output buffers are empty
 #[repr(C)]
-pub struct GenerateShareRequestResult {
+pub struct ProduceGetShareRequestMessageResult {
     pub status: DeRecStatus,
     pub request_wire_bytes: DeRecBuffer,
 }
 
-/// FFI result returned by [`generate_share_response`].
+/// FFI result returned by [`produce_get_share_response_message`].
 ///
 /// On success:
 ///
@@ -86,7 +86,7 @@ pub struct GenerateShareRequestResult {
 /// - `status` contains an error
 /// - output buffers are empty
 #[repr(C)]
-pub struct GenerateShareResponseResult {
+pub struct ProduceGetShareResponseMessageResult {
     pub status: DeRecStatus,
     pub response_wire_bytes: DeRecBuffer,
 }
@@ -135,7 +135,7 @@ pub struct RecoverFromShareResponsesResult {
 ///
 /// # Returns
 ///
-/// Returns [`GenerateShareRequestResult`].
+/// Returns [`ProduceGetShareRequestMessageResult`].
 ///
 /// # Errors
 ///
@@ -150,23 +150,23 @@ pub struct RecoverFromShareResponsesResult {
 ///
 /// Non-null input pointers must point to the corresponding readable byte ranges.
 #[unsafe(no_mangle)]
-pub extern "C" fn generate_share_request(
+pub extern "C" fn produce_get_share_request_message(
     channel_id: u64,
     secret_id_ptr: *const u8,
     secret_id_len: usize,
     version: i32,
     shared_key_ptr: *const u8,
     shared_key_len: usize,
-) -> GenerateShareRequestResult {
+) -> ProduceGetShareRequestMessageResult {
     if secret_id_ptr.is_null() && secret_id_len > 0 {
-        return GenerateShareRequestResult {
+        return ProduceGetShareRequestMessageResult {
             status: err_status("secret_id_ptr is null"),
             request_wire_bytes: empty_buffer(),
         };
     }
 
     if shared_key_ptr.is_null() && shared_key_len > 0 {
-        return GenerateShareRequestResult {
+        return ProduceGetShareRequestMessageResult {
             status: err_status("shared_key_ptr is null"),
             request_wire_bytes: empty_buffer(),
         };
@@ -187,14 +187,14 @@ pub extern "C" fn generate_share_request(
     let shared_key: [u8; 32] = match shared_key_bytes.try_into() {
         Ok(value) => value,
         Err(_) => {
-            return GenerateShareRequestResult {
+            return ProduceGetShareRequestMessageResult {
                 status: err_status("shared_key must be exactly 32 bytes"),
                 request_wire_bytes: empty_buffer(),
             };
         }
     };
 
-    let result = match crate::recovery::generate_share_request(
+    let result = match crate::primitives::recovery::request::produce(
         channel_id.into(),
         secret_id,
         version,
@@ -202,16 +202,16 @@ pub extern "C" fn generate_share_request(
     ) {
         Ok(value) => value,
         Err(err) => {
-            return GenerateShareRequestResult {
+            return ProduceGetShareRequestMessageResult {
                 status: err_status(err.to_string()),
                 request_wire_bytes: empty_buffer(),
             };
         }
     };
 
-    GenerateShareRequestResult {
+    ProduceGetShareRequestMessageResult {
         status: ok_status(),
-        request_wire_bytes: vec_into_buffer(result.wire_bytes),
+        request_wire_bytes: vec_into_buffer(result.envelope),
     }
 }
 
@@ -247,7 +247,7 @@ pub extern "C" fn generate_share_request(
 ///
 /// # Returns
 ///
-/// Returns [`GenerateShareResponseResult`].
+/// Returns [`ProduceGetShareResponseMessageResult`].
 ///
 /// # Errors
 ///
@@ -261,7 +261,7 @@ pub extern "C" fn generate_share_request(
 ///
 /// All non-null input pointers must point to the corresponding readable byte ranges.
 #[unsafe(no_mangle)]
-pub extern "C" fn generate_share_response(
+pub extern "C" fn produce_get_share_response_message(
     channel_id: u64,
     secret_id_ptr: *const u8,
     secret_id_len: usize,
@@ -271,30 +271,30 @@ pub extern "C" fn generate_share_response(
     stored_share_len: usize,
     shared_key_ptr: *const u8,
     shared_key_len: usize,
-) -> GenerateShareResponseResult {
+) -> ProduceGetShareResponseMessageResult {
     if secret_id_ptr.is_null() && secret_id_len > 0 {
-        return GenerateShareResponseResult {
+        return ProduceGetShareResponseMessageResult {
             status: err_status("secret_id_ptr is null"),
             response_wire_bytes: empty_buffer(),
         };
     }
 
     if request_ptr.is_null() && request_len > 0 {
-        return GenerateShareResponseResult {
+        return ProduceGetShareResponseMessageResult {
             status: err_status("request_ptr is null"),
             response_wire_bytes: empty_buffer(),
         };
     }
 
     if stored_share_ptr.is_null() && stored_share_len > 0 {
-        return GenerateShareResponseResult {
+        return ProduceGetShareResponseMessageResult {
             status: err_status("stored_share_ptr is null"),
             response_wire_bytes: empty_buffer(),
         };
     }
 
     if shared_key_ptr.is_null() && shared_key_len > 0 {
-        return GenerateShareResponseResult {
+        return ProduceGetShareResponseMessageResult {
             status: err_status("shared_key_ptr is null"),
             response_wire_bytes: empty_buffer(),
         };
@@ -327,32 +327,54 @@ pub extern "C" fn generate_share_response(
     let shared_key: [u8; 32] = match shared_key_bytes.try_into() {
         Ok(value) => value,
         Err(_) => {
-            return GenerateShareResponseResult {
+            return ProduceGetShareResponseMessageResult {
                 status: err_status("shared_key must be exactly 32 bytes"),
                 response_wire_bytes: empty_buffer(),
             };
         }
     };
 
-    let result = match crate::recovery::generate_share_response(
+    let crate::primitives::recovery::request::ExtractResult { request } =
+        match crate::primitives::recovery::request::extract(request_bytes, &shared_key) {
+            Ok(r) => r,
+            Err(e) => {
+                return ProduceGetShareResponseMessageResult {
+                    status: err_status(e.to_string()),
+                    response_wire_bytes: empty_buffer(),
+                };
+            }
+        };
+
+    let crate::primitives::sharing::request::ExtractResult { request: stored_share_request } =
+        match crate::primitives::sharing::request::extract(stored_share_bytes, &shared_key) {
+            Ok(r) => r,
+            Err(e) => {
+                return ProduceGetShareResponseMessageResult {
+                    status: err_status(e.to_string()),
+                    response_wire_bytes: empty_buffer(),
+                };
+            }
+        };
+
+    let result = match crate::primitives::recovery::response::produce(
         channel_id.into(),
         secret_id,
-        request_bytes,
-        stored_share_bytes,
+        &request,
+        &stored_share_request,
         &shared_key,
     ) {
         Ok(value) => value,
         Err(err) => {
-            return GenerateShareResponseResult {
+            return ProduceGetShareResponseMessageResult {
                 status: err_status(err.to_string()),
                 response_wire_bytes: empty_buffer(),
             };
         }
     };
 
-    GenerateShareResponseResult {
+    ProduceGetShareResponseMessageResult {
         status: ok_status(),
-        response_wire_bytes: vec_into_buffer(result.wire_bytes),
+        response_wire_bytes: vec_into_buffer(result.envelope),
     }
 }
 
@@ -435,7 +457,7 @@ pub extern "C" fn recover_from_share_responses(
         unsafe { std::slice::from_raw_parts(secret_id_ptr, secret_id_len) }
     };
 
-    let owned_inputs = match deserialize_recovery_response_inputs(responses_bytes) {
+    let serialized_inputs = match deserialize_recovery_response_inputs(responses_bytes) {
         Ok(value) => value,
         Err(err) => {
             return RecoverFromShareResponsesResult {
@@ -445,16 +467,39 @@ pub extern "C" fn recover_from_share_responses(
         }
     };
 
-    let borrowed_inputs: Vec<RecoveryResponseInput<'_>> = owned_inputs
+    let owned_inputs: Result<Vec<OwnedRecoveryResponseExtractedInput>, String> = serialized_inputs
+        .into_iter()
+        .map(|input| {
+            let crate::primitives::recovery::response::ExtractResult { response } =
+                crate::primitives::recovery::response::extract(input.response_bytes.as_slice(), &input.shared_key)
+                    .map_err(|e| e.to_string())?;
+            Ok(OwnedRecoveryResponseExtractedInput {
+                response,
+                shared_key: input.shared_key,
+            })
+        })
+        .collect();
+
+    let extracted_inputs = match owned_inputs {
+        Ok(v) => v,
+        Err(err) => {
+            return RecoverFromShareResponsesResult {
+                status: err_status(err),
+                secret_data: empty_buffer(),
+            };
+        }
+    };
+
+    let borrowed_inputs: Vec<RecoveryResponseInput<'_>> = extracted_inputs
         .iter()
         .map(|input| RecoveryResponseInput {
-            bytes: &input.response_bytes,
+            share_response: &input.response,
             shared_key: &input.shared_key,
         })
         .collect();
 
     let recovered_secret =
-        match crate::recovery::recover_from_share_responses(secret_id, version, &borrowed_inputs) {
+        match crate::primitives::recovery::response::recover(secret_id, version, &borrowed_inputs) {
             Ok(value) => value,
             Err(err) => {
                 return RecoverFromShareResponsesResult {
@@ -472,6 +517,11 @@ pub extern "C" fn recover_from_share_responses(
 
 struct OwnedRecoveryResponseInput {
     response_bytes: Vec<u8>,
+    shared_key: [u8; 32],
+}
+
+struct OwnedRecoveryResponseExtractedInput {
+    response: derec_proto::GetShareResponseMessage,
     shared_key: [u8; 32],
 }
 

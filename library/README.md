@@ -95,11 +95,17 @@ The SDK provides building blocks for the main protocol flows.
 ## Quick Intro
 
 ```rust
-use derec_library::verification::*;
+use derec_library::primitives::verification::request;
+use derec_library::types::ChannelId;
 
+let channel_id = ChannelId(1);
 let secret_id = b"example_secret";
+let version = 1;
+// shared_key: [u8; 32] established during pairing
 
-let request = generate_verification_request(secret_id, 1).unwrap();
+let result = request::produce(channel_id, secret_id, version, &shared_key).unwrap();
+// result.envelope is already serialized wire bytes, ready to send over transport
+let wire_bytes = result.envelope;
 ```
 
 See the examples down below for complete protocol flows.
@@ -116,9 +122,10 @@ The library also provides WebAssembly bindings so the protocol can run in:
 Example JavaScript usage:
 
 ```ts
-import * as derec from "derec-library";
+import { primitives } from "@derec-alliance/nodejs"; // or @derec-alliance/web
 
-const request = derec.generate_verification_request(secretId, version);
+const result = primitives.verification.request.produce(channelId, secretId, version, sharedKey);
+// result carries the encoded DeRecMessage envelope, ready to send over transport
 ```
 
 Bindings are generated using `wasm-bindgen`.
@@ -148,51 +155,66 @@ The `transportUri` in protocol messages identifies the helper endpoint.
 ### Pairing Flow
 
 ```rust
-use derec_library::pairing::*;
+use derec_library::primitives::pairing::{request, response};
+use derec_library::types::ChannelId;
 use derec_proto::{Protocol, SenderKind, TransportProtocol};
 
-let channel_id = 42.into();
+let channel_id = ChannelId(42);
 
-// Step 1
-let CreateContactMessageResult {
-    wire_bytes: contact_message_bytes,
-    secret_key: contactor_secret_key,
-} = create_contact_message(
+// Step 1 — Initiator creates the contact message (sent out-of-band).
+let request::CreateContactResult {
+    contact_message,
+    secret_key: initiator_secret_key,
+} = request::create_contact(
     channel_id,
     TransportProtocol {
         uri: "https://relay.example/derec".to_owned(),
         protocol: Protocol::Https.into(),
     },
 ).unwrap();
+// Serialize for out-of-band transfer (QR code, deep link, etc.)
+// let contact_bytes = contact_message.encode_to_vec();
 
-// Step 2
-let ProducePairingRequestMessageResult {
-    wire_bytes: pair_request_wire_bytes,
-    secret_key: requestor_secret_key,
-} = produce_pairing_request_message(
+// Step 2 — Responder decodes the contact and produces the request envelope.
+let contact = contact_message;
+let request::ProduceResult {
+    envelope: pair_request_envelope,
+    initiator_contact_message,
+    secret_key: responder_secret_key,
+} = request::produce(
     SenderKind::Helper,
-    "https://example-helper.com/derec",
-    &contact_message_bytes,
+    TransportProtocol {
+        uri: "https://example-helper.com/derec".to_owned(),
+        protocol: Protocol::Https.into(),
+    },
+    &contact,
 ).unwrap();
 
-// Step 3
-let ProducePairingResponseMessageResult {
-    wire_bytes: pair_response_wire_bytes,
-    shared_key,
+// Step 3 — Initiator extracts the request and produces the response envelope.
+let request::ExtractResult { request } =
+    request::extract(&pair_request_envelope, &initiator_secret_key.ecies_secret_key).unwrap();
+let response::ProduceResult {
+    envelope: pair_response_envelope,
+    shared_key: initiator_shared_key,
     ..
-} = produce_pairing_response_message(
-    SenderKind::SharerNonRecovery,
-    &pair_request_wire_bytes,
-    &contactor_secret_key,
+} = response::produce(
+    SenderKind::OwnerNonRecovery,
+    &request,
+    &initiator_secret_key,
 ).unwrap();
 
-// Step 4
-let ProcessPairingResponseMessageResult { shared_key } =
-    process_pairing_response_message(
-        &contact_message_bytes,
-        &pair_response_wire_bytes,
-        &requestor_secret_key,
+// Step 4 — Responder extracts the response and finalizes pairing.
+let response::ExtractResult { response } =
+    response::extract(&pair_response_envelope, &responder_secret_key.ecies_secret_key).unwrap();
+let response::ProcessResult { shared_key: responder_shared_key } =
+    response::process(
+        &initiator_contact_message,
+        &response,
+        &responder_secret_key,
     ).unwrap();
+
+// Both sides now hold the same shared key.
+assert_eq!(initiator_shared_key, responder_shared_key);
 ```
 
 The `ContactMessage` is exchanged out-of-band, typically using:
@@ -205,25 +227,24 @@ The `ContactMessage` is exchanged out-of-band, typically using:
 ### Sharing Flow
 
 ```rust
-use derec_library::sharing::*;
+use derec_library::primitives::sharing::request;
+use derec_library::types::ChannelId;
 
 let secret_id = b"my_secret";
 let secret_data = b"super_secret_value";
-let channels = [1.into(), 2.into(), 3.into()];
+let channels = [ChannelId(1), ChannelId(2), ChannelId(3)];
 let threshold = 2;
 let version = 1;
 
-let ProtectSecretResult {
-    share_message_wire_bytes_array,
-} = protect_secret(
-    secret_id,
-    secret_data,
+let request::SplitResult { shares } = request::split(
     &channels,
-    threshold,
+    secret_id,
     version,
-    None,
-    None,
+    secret_data,
+    threshold,
 ).unwrap();
+// shares: HashMap<ChannelId, CommittedDeRecShare>
+// Pass each share to request::produce() to create encrypted delivery envelopes.
 ```
 
 ---
@@ -231,23 +252,30 @@ let ProtectSecretResult {
 ### Verification Flow
 
 ```rust
-use derec_library::verification::*;
+use derec_library::primitives::verification::{request, response};
+use derec_library::types::ChannelId;
 
+let channel_id = ChannelId(1);
 let secret_id = b"secret_id";
 let version = 7;
+// shared_key: [u8; 32] established during pairing
 
-let request = generate_verification_request(secret_id, version).unwrap();
+// Owner side: produce and send the verification request.
+let result = request::produce(channel_id, secret_id, version, &shared_key).unwrap();
+let request_wire_bytes = result.envelope;
 
-let response = generate_verification_response(
-    b"example_share",
-    &request.wire_bytes,
-).unwrap();
+// Helper side: decrypt and extract the challenge fields.
+let request::ExtractResult { request } =
+    request::extract(&request_wire_bytes, &shared_key).unwrap();
 
-let ok = verify_share_response(
-    b"example_share",
-    &request.wire_bytes,
-    &response.wire_bytes,
-).unwrap();
+// Helper side: produce the response.
+let resp_result = response::produce(channel_id, &request, &shared_key, b"example_share").unwrap();
+let response_wire_bytes = resp_result.envelope;
+
+// Owner side: decrypt and verify the proof.
+let response::ExtractResult { response } =
+    response::extract(&response_wire_bytes, &shared_key).unwrap();
+let ok = response::process(&response, b"example_share").unwrap();
 
 assert!(ok);
 ```
@@ -257,22 +285,32 @@ assert!(ok);
 ### Recovery Flow
 
 ```rust
-use derec_library::recovery::*;
+use derec_library::primitives::recovery::{request, response};
+use derec_library::types::ChannelId;
 
+let channel_id = ChannelId(1);
 let secret_id = b"secret_id";
 let version = 1;
+// shared_key: [u8; 32] established during pairing
 
-let request = generate_share_request(secret_id, version).unwrap();
+// Owner side: produce the recovery request.
+let request::ProduceResult { envelope: request_envelope } =
+    request::produce(channel_id, secret_id, version, &shared_key).unwrap();
 
-let response = generate_share_response(
-    &request.wire_bytes,
-    b"example_share",
-).unwrap();
+// Helper side: extract the request, then produce the response.
+let request::ExtractResult { request } =
+    request::extract(&request_envelope, &shared_key).unwrap();
+let response::ProduceResult { envelope: response_envelope } =
+    response::produce(channel_id, secret_id, &request, &stored_share_request, &shared_key).unwrap();
 
-let _ = recover_from_share_responses(
-    b"...aggregated responses...",
+// Owner side: aggregate responses from a threshold of helpers and reconstruct the secret.
+let response::RecoverResult { secret_data } = response::recover(
     secret_id,
     version,
+    &[response::RecoveryResponseInput {
+        share_response: &share_response,
+        shared_key: &shared_key,
+    }],
 ).unwrap();
 ```
 

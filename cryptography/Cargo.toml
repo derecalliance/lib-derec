@@ -1,6 +1,6 @@
 [package]
 name = "derec-cryptography"
-version = "0.0.1-alpha.6"
+version = "0.0.1-alpha.7"
 edition = "2024"
 license = "Apache-2.0"
 description = "Cryptographic primitives used by the DeRec protocol implementation."
@@ -11,7 +11,7 @@ readme = "README.md"
 keywords = ["derec", "decentralized", "cryptography", "secret-sharing", "recovery"]
 
 [dependencies]
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 aead = "0.5.2"
 aes = "0.8.4"
 aes-gcm = "0.10.3"

@@ -3,7 +3,8 @@ use crate::{
     derec_message::DeRecMessageBuilder, protocol_version::ProtocolVersion, types::ChannelId,
 };
 use derec_cryptography::pairing::pairing_ecies;
-use derec_proto::PairRequestMessage;
+use derec_proto::{MessageBody, PairRequestMessage};
+use prost::Message;
 use rand08::thread_rng;
 
 const CHANNEL_ID: ChannelId = ChannelId(42);
@@ -28,7 +29,7 @@ fn test_pairing_builder_new_sets_defaults() {
     assert!(builder.sequence.is_none());
     assert!(builder.channel_id.is_none());
     assert!(builder.timestamp.is_none());
-    assert!(builder.message.is_empty());
+    assert!(builder.message.is_none());
 }
 
 #[test]
@@ -38,25 +39,26 @@ fn test_channel_builder_new_sets_defaults() {
     assert!(builder.sequence.is_none());
     assert!(builder.channel_id.is_none());
     assert!(builder.timestamp.is_none());
-    assert!(builder.message.is_empty());
+    assert!(builder.message.is_none());
 }
 
 #[test]
 fn test_channel_id_sequence_timestamp_and_message_set_fields() {
     let inner = sample_message();
-    let encoded = inner.encode_to_vec();
     let timestamp = current_timestamp();
 
     let builder = DeRecMessageBuilder::pairing()
         .channel_id(CHANNEL_ID)
         .sequence(SEQUENCE)
         .timestamp(timestamp)
-        .message(&inner);
+        .message_body(MessageBody::PairRequest(inner.clone()));
 
     assert_eq!(builder.channel_id, Some(CHANNEL_ID));
     assert_eq!(builder.sequence, Some(SEQUENCE));
     assert_eq!(builder.timestamp, Some(timestamp));
-    assert_eq!(builder.message, encoded);
+    assert!(
+        matches!(builder.message, Some(MessageBody::PairRequest(inner_message)) if inner_message == inner),
+    );
 }
 
 #[test]
@@ -87,7 +89,7 @@ fn test_channel_encrypt_rejects_missing_message() {
 fn test_channel_encrypt_rejects_missing_channel_id() {
     let err = DeRecMessageBuilder::channel()
         .timestamp(current_timestamp())
-        .message(&sample_message())
+        .message_body(MessageBody::PairRequest(sample_message()))
         .encrypt(&SHARED_KEY)
         .unwrap_err();
 
@@ -100,7 +102,7 @@ fn test_pairing_build_rejects_missing_timestamp() {
 
     let err = DeRecMessageBuilder::pairing()
         .channel_id(CHANNEL_ID)
-        .message(&sample_message())
+        .message_body(MessageBody::PairRequest(sample_message()))
         .encrypt_pairing(&pk)
         .unwrap()
         .build()
@@ -115,7 +117,7 @@ fn test_pairing_build_rejects_missing_channel_id() {
 
     let err = DeRecMessageBuilder::pairing()
         .timestamp(current_timestamp())
-        .message(&sample_message())
+        .message_body(MessageBody::PairRequest(sample_message()))
         .encrypt_pairing(&pk)
         .unwrap()
         .build()
@@ -128,7 +130,7 @@ fn test_pairing_build_rejects_missing_channel_id() {
 fn test_channel_build_rejects_missing_timestamp() {
     let err = DeRecMessageBuilder::channel()
         .channel_id(CHANNEL_ID)
-        .message(&sample_message())
+        .message_body(MessageBody::PairRequest(sample_message()))
         .encrypt(&SHARED_KEY)
         .unwrap()
         .build()
@@ -141,7 +143,7 @@ fn test_channel_build_rejects_missing_timestamp() {
 fn test_channel_build_rejects_missing_channel_id_after_encrypt_is_impossible_but_checked_before() {
     let err = DeRecMessageBuilder::channel()
         .timestamp(current_timestamp())
-        .message(&sample_message())
+        .message_body(MessageBody::PairRequest(sample_message()))
         .encrypt(&SHARED_KEY)
         .unwrap_err();
 
@@ -159,7 +161,7 @@ fn test_pairing_encrypt_and_build_succeeds() {
         .channel_id(CHANNEL_ID)
         .sequence(SEQUENCE)
         .timestamp(timestamp)
-        .message(&inner)
+        .message_body(MessageBody::PairRequest(inner))
         .encrypt_pairing(&pk)
         .unwrap()
         .build()
@@ -186,7 +188,7 @@ fn test_channel_encrypt_and_build_succeeds() {
         .channel_id(CHANNEL_ID)
         .sequence(SEQUENCE)
         .timestamp(timestamp)
-        .message(&inner)
+        .message_body(MessageBody::PairRequest(inner))
         .encrypt(&SHARED_KEY)
         .unwrap()
         .build()
@@ -210,7 +212,7 @@ fn test_build_defaults_sequence_to_zero_when_not_set() {
     let envelope = DeRecMessageBuilder::pairing()
         .channel_id(CHANNEL_ID)
         .timestamp(current_timestamp())
-        .message(&sample_message())
+        .message_body(MessageBody::PairRequest(sample_message()))
         .encrypt_pairing(&pk)
         .unwrap()
         .build()
@@ -238,13 +240,11 @@ fn test_message_overwrites_previous_payload() {
         ..Default::default()
     };
 
-    let first_encoded = first.encode_to_vec();
-    let second_encoded = second.encode_to_vec();
-
     let builder = DeRecMessageBuilder::pairing()
-        .message(&first)
-        .message(&second);
+        .message_body(MessageBody::PairRequest(first))
+        .message_body(MessageBody::PairRequest(second.clone()));
 
-    assert_ne!(first_encoded.len(), 0);
-    assert_eq!(builder.message, second_encoded);
+    assert!(
+        matches!(builder.message, Some(MessageBody::PairRequest(inner_message)) if inner_message == second),
+    );
 }

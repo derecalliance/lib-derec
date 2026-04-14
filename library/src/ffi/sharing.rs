@@ -188,12 +188,12 @@ pub extern "C" fn protect_secret(
         raw.iter().map(|&id| ChannelId(id)).collect()
     };
 
-    let result = match crate::sharing::protect_secret(
-        secret_id,
-        secret_data,
+    let result = match crate::primitives::sharing::request::split(
         &channel_ids,
-        threshold,
+        secret_id,
         version,
+        secret_data,
+        threshold,
     ) {
         Ok(value) => value,
         Err(err) => {
@@ -278,6 +278,8 @@ pub struct ProduceStoreShareRequestMessageResult {
 pub extern "C" fn produce_store_share_request_message(
     channel_id: u64,
     version: i32,
+    secret_id_ptr: *const u8,
+    secret_id_len: usize,
     committed_share_ptr: *const u8,
     committed_share_len: usize,
     keep_list_ptr: *const i32,
@@ -296,6 +298,9 @@ pub extern "C" fn produce_store_share_request_message(
         };
     }
 
+    if secret_id_ptr.is_null() && secret_id_len > 0 {
+        bail!("secret_id_ptr is null");
+    }
     if committed_share_ptr.is_null() && committed_share_len > 0 {
         bail!("committed_share_ptr is null");
     }
@@ -311,6 +316,12 @@ pub extern "C" fn produce_store_share_request_message(
     if shared_key_len != 32 {
         bail!("shared_key_len must be exactly 32");
     }
+
+    let secret_id: &[u8] = if secret_id_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(secret_id_ptr, secret_id_len) }
+    };
 
     let committed_share_bytes: &[u8] = if committed_share_len == 0 {
         &[]
@@ -345,9 +356,10 @@ pub extern "C" fn produce_store_share_request_message(
             Err(e) => bail!(format!("failed to decode CommittedDeRecShare: {e}")),
         };
 
-    let result = match crate::sharing::produce_store_share_request_message(
+    let result = match crate::primitives::sharing::request::produce(
         ChannelId(channel_id),
         version,
+        secret_id,
         &committed_share,
         keep_list,
         description,
@@ -359,7 +371,7 @@ pub extern "C" fn produce_store_share_request_message(
 
     ProduceStoreShareRequestMessageResult {
         status: ok_status(),
-        wire_bytes: vec_into_buffer(result.wire_bytes),
+        wire_bytes: vec_into_buffer(result.envelope),
     }
 }
 
@@ -372,16 +384,20 @@ pub extern "C" fn produce_store_share_request_message(
 ///   carrying an encrypted [`derec_proto::StoreShareResponseMessage`] to send back to the Owner
 /// - `committed_share_bytes` contains the serialized [`CommittedDeRecShare`] protobuf,
 ///   extracted from the request, for the Helper to store locally
+/// - `secret_id_bytes` contains the secret identifier extracted from the inner share
+/// - `version` contains the share-distribution version from the request
 ///
 /// On failure:
 ///
 /// - `status` contains an error
-/// - both `wire_bytes` and `committed_share_bytes` are returned empty
+/// - all buffer fields are returned empty and `version` is `0`
 #[repr(C)]
 pub struct ProduceStoreShareResponseMessageResult {
     pub status: DeRecStatus,
     pub wire_bytes: DeRecBuffer,
     pub committed_share_bytes: DeRecBuffer,
+    pub secret_id_bytes: DeRecBuffer,
+    pub version: i32,
 }
 
 /// Processes an incoming sharing request on behalf of a Helper.
@@ -399,6 +415,8 @@ pub struct ProduceStoreShareResponseMessageResult {
 ///
 /// - an encrypted [`derec_proto::StoreShareResponseMessage`] envelope (send to the Owner)
 /// - the serialized [`CommittedDeRecShare`] protobuf (store locally)
+/// - the secret identifier bytes extracted from the inner share
+/// - the share-distribution version from the request
 ///
 /// # Arguments
 ///
@@ -433,6 +451,8 @@ pub extern "C" fn produce_store_share_response_message(
                 status: err_status($msg),
                 wire_bytes: empty_buffer(),
                 committed_share_bytes: empty_buffer(),
+                secret_id_bytes: empty_buffer(),
+                version: 0,
             }
         };
     }
@@ -458,10 +478,16 @@ pub extern "C" fn produce_store_share_response_message(
         unsafe { std::slice::from_raw_parts(request_bytes_ptr, request_bytes_len) }
     };
 
-    let result = match crate::sharing::produce_store_share_response_message(
+    let crate::primitives::sharing::request::ExtractResult { request } =
+        match crate::primitives::sharing::request::extract(request_bytes, shared_key) {
+            Ok(r) => r,
+            Err(e) => bail!(e.to_string()),
+        };
+
+    let result = match crate::primitives::sharing::response::produce(
         ChannelId(channel_id),
+        &request,
         shared_key,
-        request_bytes,
     ) {
         Ok(r) => r,
         Err(e) => bail!(e.to_string()),
@@ -471,8 +497,10 @@ pub extern "C" fn produce_store_share_response_message(
 
     ProduceStoreShareResponseMessageResult {
         status: ok_status(),
-        wire_bytes: vec_into_buffer(result.wire_bytes),
+        wire_bytes: vec_into_buffer(result.envelope),
         committed_share_bytes: vec_into_buffer(committed_share_bytes),
+        secret_id_bytes: vec_into_buffer(result.secret_id),
+        version: result.version,
     }
 }
 
@@ -563,11 +591,13 @@ pub extern "C" fn process_store_share_response_message(
         unsafe { std::slice::from_raw_parts(response_bytes_ptr, response_bytes_len) }
     };
 
-    if let Err(e) = crate::sharing::process_store_share_response_message(
-        version,
-        shared_key,
-        response_bytes,
-    ) {
+    let crate::primitives::sharing::response::ExtractResult { response } =
+        match crate::primitives::sharing::response::extract(response_bytes, shared_key) {
+            Ok(r) => r,
+            Err(e) => bail!(e.to_string()),
+        };
+
+    if let Err(e) = crate::primitives::sharing::response::process(version, &response) {
         bail!(e.to_string());
     }
 

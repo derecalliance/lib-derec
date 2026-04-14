@@ -39,19 +39,28 @@
 #[non_exhaustive]
 pub enum Error {
     #[error(transparent)]
-    Pairing(#[from] crate::pairing::PairingError),
+    Pairing(#[from] crate::primitives::pairing::PairingError),
 
     #[error(transparent)]
-    Recovery(#[from] crate::recovery::RecoveryError),
+    Recovery(#[from] crate::primitives::recovery::RecoveryError),
 
     #[error(transparent)]
-    Sharing(#[from] crate::sharing::SharingError),
+    Sharing(#[from] crate::primitives::sharing::SharingError),
 
     #[error(transparent)]
-    Verification(#[from] crate::verification::VerificationError),
+    Verification(#[from] crate::primitives::verification::VerificationError),
 
     #[error(transparent)]
     DeRecMessage(#[from] crate::derec_message::DeRecMessageBuilderError),
+
+    #[error(transparent)]
+    SecretStore(#[from] crate::protocol::SecretStoreError),
+
+    #[error(transparent)]
+    ContactStore(#[from] crate::protocol::ContactStoreError),
+
+    #[error(transparent)]
+    ShareStore(#[from] crate::protocol::ShareStoreError),
 
     #[error("invalid input: {0}")]
     InvalidInput(&'static str),

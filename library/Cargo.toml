@@ -22,8 +22,10 @@ include = [
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-derec-cryptography =  "0.0.1-alpha.6"
-derec-proto =  "0.0.1-alpha.6"
+# derec-cryptography =  "0.0.1-alpha.6"
+# derec-proto =  "0.0.1-alpha.6"
+derec-cryptography = { path = "../cryptography" }
+derec-proto = { path = "../protobufs" }
 prost = "0.14.3"
 prost-types = "0.14.3"
 rand = { version = "0.10.0", features = ["sys_rng"] }
@@ -35,6 +37,9 @@ zeroize = "1.8.2"
 subtle = "2.6.1"
 k256 = { version = "0.13.4", features = ["ecdsa"] }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["rt"], default-features = false }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = { version = "0.2.114", features = ["serde-serialize"] }
 serde-wasm-bindgen = { version = "0.6.5" }
@@ -42,6 +47,9 @@ js-sys = { version = "0.3.91" }
 getrandom_02 = { package = "getrandom", version = "0.2.16", features = ["js"] }
 getrandom_04 = { package = "getrandom", version = "0.4.2", features = ["wasm_js"] }
 console_error_panic_hook = "0.1.7"
+
+[features]
+primitives = []
 
 [dev-dependencies]
 rand08 = { package = "rand", version = "0.8.5" }

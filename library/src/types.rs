@@ -64,3 +64,38 @@ impl PartialEq<u64> for ChannelId {
         self.0 == *other
     }
 }
+
+/// 32-byte symmetric key shared between an Owner and a Helper after pairing.
+///
+/// A `SharedKey` is established during the pairing flow and used to encrypt
+/// and authenticate all subsequent protocol messages on the associated channel.
+pub type SharedKey = [u8; 32];
+
+/// A secret to be protected by the DeRec protocol.
+///
+/// Groups the three pieces of information that identify and describe a secret
+/// throughout its lifecycle — from initial sharing through verification and
+/// recovery.
+///
+/// # Versioning
+///
+/// Secrets are versioned so that Helpers can store multiple generations and the
+/// Owner can rotate the secret without losing recovery capability until the new
+/// version has been confirmed by a quorum of Helpers.
+pub struct Secret {
+    /// Application-defined identifier for this secret.
+    ///
+    /// Used by the Owner to distinguish between different protected values and
+    /// by the recovery flow to request the correct share from each Helper.
+    pub id: Vec<u8>,
+
+    /// Monotonically increasing version number.
+    ///
+    /// Must be incremented each time the secret data changes. Helpers store
+    /// shares keyed by `(channel_id, version)` and keep the previous version
+    /// until the Owner confirms the new one has been accepted by a threshold.
+    pub version: i32,
+
+    /// Raw secret bytes to be split and distributed.
+    pub data: Vec<u8>,
+}

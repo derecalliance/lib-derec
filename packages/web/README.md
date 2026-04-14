@@ -64,14 +64,13 @@ await init();
 ## Quick Example
 
 ```ts
-import init, * as derec from "@derec-alliance/web";
+import init, { primitives } from "@derec-alliance/web";
 
 async function main() {
   await init();
 
-  const version = derec.derec_protocol_version();
-
-  console.log(version.major, version.minor);
+  const result = primitives.verification.request.produce(channelId, secretId, version, sharedKey);
+  // result carries the encoded DeRecMessage envelope, ready to send over transport
 }
 
 main();
@@ -82,35 +81,35 @@ main();
 ## Pairing Flow
 
 ```ts
-import init, * as derec from "@derec-alliance/web";
+import init, { primitives } from "@derec-alliance/web";
 
 async function main() {
   await init();
 
-  const contact = derec.create_contact_message(
+  const contact = primitives.pairing.request.create_contact(
     1n,
     { protocol: "https", uri: "https://owner.example.com" }
   );
 
-  const request = derec.produce_pairing_request_message(
-    2,
+  const request = primitives.pairing.request.produce(
+    2, // SenderKind.Helper
     { protocol: "https", uri: "https://helper.example.com" },
-    contact.wire_bytes
+    contact.contact_message
   );
 
-  const response = derec.produce_pairing_response_message(
-    0,
-    request.wire_bytes,
+  const response = primitives.pairing.response.produce(
+    0, // SenderKind.OwnerNonRecovery
+    request.envelope,
     contact.secret_key_material
   );
 
-  const result = derec.process_pairing_response_message(
+  const result = primitives.pairing.response.process(
     request.initiator_contact_message,
-    response.wire_bytes,
+    response.envelope,
     request.secret_key_material
   );
 
-  console.log("Shared key length:", result.shared_key.length);
+  console.log("Shared key length:", result.pairing_shared_key.length);
 }
 
 main();
@@ -121,22 +120,26 @@ main();
 ## Share Distribution (Sharing Flow)
 
 ```ts
-import init, * as derec from "@derec-alliance/web";
+import init, { primitives } from "@derec-alliance/web";
 
 async function main() {
   await init();
 
-  const result = derec.protect_secret(
-    new Uint8Array([1, 2, 3]),
-    new TextEncoder().encode("super-secret"),
-    [1n, 2n, 3n],
-    2,
-    1
+  const splitResult = primitives.sharing.request.split(
+    new Uint8Array([1, 2, 3]),                // secret ID
+    new TextEncoder().encode("super-secret"), // secret bytes
+    [1n, 2n, 3n],                             // helper channel IDs
+    2,                                        // threshold
+    1                                         // version
   );
+  // splitResult.value: Map<bigint, Uint8Array> — one CommittedDeRecShare per helper
 
-  const shareMessages = result.share_message_wire_bytes_array;
-
-  console.log(shareMessages);
+  // Wrap each share into an encrypted delivery envelope
+  for (const [channelId, committedShare] of splitResult.value) {
+    const envelope = primitives.sharing.request.produce(
+      channelId, version, secretId, committedShare, [], "", sharedKeys.get(channelId)
+    );
+  }
 }
 
 main();
@@ -147,28 +150,36 @@ main();
 ## Recovery Flow
 
 ```ts
-import init, * as derec from "@derec-alliance/web";
+import init, { primitives } from "@derec-alliance/web";
 
 async function main() {
   await init();
 
-  const request = derec.generate_share_request(
+  // Owner side: produce the recovery request
+  const shareRequest = primitives.recovery.request.produce(
+    1n,                        // channel ID
+    new Uint8Array([1, 2, 3]), // secret ID
+    1,                         // version
+    sharedKey
+  );
+
+  // Helper side: produce the response
+  const shareResponse = primitives.recovery.response.produce(
+    new Uint8Array([1, 2, 3]), // secret ID
+    1n,                        // channel ID
+    storedShareEnvelope,
+    shareRequest,
+    sharedKey
+  );
+
+  // Owner side: aggregate responses and reconstruct the secret
+  const recovered = primitives.recovery.response.recover(
+    [{ response: shareResponse, shared_key: sharedKey }],
     new Uint8Array([1, 2, 3]),
     1
   );
 
-  const response = derec.generate_share_response(
-    request,
-    new Uint8Array()
-  );
-
-  const secret = derec.recover_from_share_responses(
-    new Uint8Array(),
-    new Uint8Array([1, 2, 3]),
-    1
-  );
-
-  console.log(secret);
+  console.log(recovered);
 }
 
 main();
@@ -179,26 +190,30 @@ main();
 ## Verification Flow
 
 ```ts
-import init, * as derec from "@derec-alliance/web";
+import init, { primitives } from "@derec-alliance/web";
 
 async function main() {
   await init();
 
-  const request = derec.generate_verification_request(
-    new Uint8Array([1, 2, 3]),
-    1
+  // Owner side: produce the verification request.
+  const requestEnvelope = primitives.verification.request.produce(channelId, secretId, version, sharedKey);
+
+  // Helper side: decrypt and extract the challenge fields.
+  const req = primitives.verification.request.extract(requestEnvelope, sharedKey);
+  // req.channel_id, req.secret_id, req.version, req.nonce
+
+  // Helper side: produce the response.
+  const responseEnvelope = primitives.verification.response.produce(
+    channelId,
+    req.secret_id,
+    req.version,
+    req.nonce,
+    sharedKey,
+    storedShareEnvelope
   );
 
-  const response = derec.generate_verification_response(
-    new Uint8Array(),
-    request
-  );
-
-  const isValid = derec.verify_share_response(
-    new Uint8Array(),
-    request,
-    response
-  );
+  // Owner side: verify the response.
+  const isValid = primitives.verification.response.process(responseEnvelope, sharedKey, storedShareEnvelope);
 
   console.log("Valid:", isValid);
 }
@@ -244,11 +259,13 @@ await init();
 derec_library_bg.wasm
 derec_library.js
 derec_library.d.ts
+index.js
+index.d.ts
 ```
 
 - `.wasm` — compiled Rust core
-- `.js` — WASM bindings
-- `.d.ts` — TypeScript definitions
+- `derec_library.js` / `derec_library.d.ts` — raw wasm-bindgen bindings
+- `index.js` / `index.d.ts` — `primitives.*` namespace assembly and TypeScript declarations
 
 ---
 
