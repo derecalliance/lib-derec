@@ -33,14 +33,14 @@ pub enum PairingError {
         source: derec_cryptography::pairing::DerecPairingError,
     },
 
-    #[error("failed to finalize pairing (contactor side)")]
-    FinishPairingContactor {
+    #[error("failed to finalize pairing (initiator side)")]
+    FinishPairingInitiator {
         #[source]
         source: derec_cryptography::pairing::DerecPairingError,
     },
 
-    #[error("failed to finalize pairing (requestor side)")]
-    FinishPairingRequestor {
+    #[error("failed to finalize pairing (responder side)")]
+    FinishPairingResponder {
         #[source]
         source: derec_cryptography::pairing::DerecPairingError,
     },

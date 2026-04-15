@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Verification request primitives — full inline implementations.
-
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     types::*,
@@ -64,24 +62,17 @@ pub struct ExtractResult {
 /// - `envelope`: serialized outer [`derec_proto::DeRecMessage`] bytes carrying an encrypted
 ///   inner [`derec_proto::VerifyShareRequestMessage`]
 ///
-/// The inner request contains:
-///
-/// - `secret_id`: the provided secret identifier
-/// - `version`: the provided version
-/// - `nonce`: a fresh randomly generated `u64`
-/// - `timestamp`: the request creation timestamp
-///
 /// # Errors
 ///
 /// Returns [`crate::Error`] if outer envelope construction or symmetric encryption fails.
 ///
 /// # Security Notes
 ///
-/// - The nonce is generated using the crate's RNG source via `rand::rng()` and must be
-///   unpredictable to prevent replay of previously captured responses.
-/// - The outer envelope is not encrypted; only the inner protobuf message is encrypted.
-/// - The outer envelope timestamp is set equal to the inner request timestamp to preserve
-///   the invariant `envelope.timestamp == request.timestamp`.
+/// - The nonce is generated using a cryptographically secure RNG and must be unpredictable
+///   to prevent replay of previously captured responses.
+/// - Only the inner protobuf message is encrypted; the outer envelope is plain.
+/// - The outer envelope timestamp equals the inner request timestamp, preserving the
+///   invariant `envelope.timestamp == request.timestamp`.
 ///
 /// # Example
 ///
@@ -102,6 +93,10 @@ pub struct ExtractResult {
 ///
 /// assert!(!result.envelope.is_empty());
 /// ```
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0, version = version))
+)]
 pub fn produce(
     channel_id: ChannelId,
     secret_id: impl AsRef<[u8]>,
@@ -127,6 +122,9 @@ pub fn produce(
         .encrypt(shared_key)?
         .build()?
         .encode_to_vec();
+
+    #[cfg(feature = "logging")]
+    tracing::info!("verification request envelope produced");
 
     Ok(ProduceResult { envelope })
 }
@@ -162,6 +160,10 @@ pub fn produce(
 /// - decryption or inner-message decoding fails
 /// - `envelope.timestamp != request.timestamp`
 /// - the inner message is not a [`derec_proto::VerifyShareRequestMessage`]
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
+)]
 pub fn extract(
     envelope_bytes: &[u8],
     shared_key: &SharedKey,
@@ -171,6 +173,8 @@ pub fn extract(
     let request = match extract_inner_message(&envelope.message, shared_key)? {
         MessageBody::VerifyShareRequest(message) => message,
         _ => {
+            #[cfg(feature = "logging")]
+            tracing::warn!("unexpected message type; expected VerifyShareRequestMessage");
             return Err(crate::Error::Invariant(
                 "Invalid message. Expected: VerifyShareRequestMessage",
             ));
@@ -178,10 +182,15 @@ pub fn extract(
     };
 
     if envelope.timestamp != request.timestamp {
+        #[cfg(feature = "logging")]
+        tracing::warn!("timestamp invariant violated");
         return Err(crate::Error::Invariant(
             "Envelope timestamp does not match request timestamp",
         ));
     }
+
+    #[cfg(feature = "logging")]
+    tracing::info!("verification request extracted and validated");
 
     Ok(ExtractResult { request })
 }

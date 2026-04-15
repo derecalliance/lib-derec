@@ -227,7 +227,6 @@ fn test_recover_from_share_responses_empty_secret_id() {
             .expect("extract should succeed");
     let responses = vec![RecoveryResponseInput {
         share_response: &response,
-        shared_key: &shared_key,
     }];
     let empty_secret_id = b"";
     let version = 0;
@@ -254,7 +253,6 @@ fn test_recover_from_share_responses_invalid_version() {
             .expect("extract should succeed");
     let responses = vec![RecoveryResponseInput {
         share_response: &response,
-        shared_key: &shared_key,
     }];
     let secret_id = b"secret_id";
     let invalid_version = -1;
@@ -286,7 +284,6 @@ fn test_recover_from_share_responses_missing_result() {
             .expect("extract should succeed");
     let responses = vec![RecoveryResponseInput {
         share_response: &response,
-        shared_key: &shared_key,
     }];
 
     let result = recover_from_share_responses(secret_id, version, &responses);
@@ -314,7 +311,6 @@ fn test_recover_from_share_responses_non_ok_status() {
             .expect("extract should succeed");
     let responses = vec![RecoveryResponseInput {
         share_response: &response,
-        shared_key: &shared_key,
     }];
 
     let result = recover_from_share_responses(secret_id, version, &responses);
@@ -343,7 +339,6 @@ fn test_recover_from_share_responses_empty_committed_de_rec_share() {
             .expect("extract should succeed");
     let responses = vec![RecoveryResponseInput {
         share_response: &response,
-        shared_key: &shared_key,
     }];
 
     let result = recover_from_share_responses(secret_id, version, &responses);
@@ -372,7 +367,6 @@ fn test_recover_from_share_responses_decode_committed_derec_share_error() {
             .expect("extract should succeed");
     let responses = vec![RecoveryResponseInput {
         share_response: &response,
-        shared_key: &shared_key,
     }];
 
     let result = recover_from_share_responses(secret_id, version, &responses);
@@ -410,7 +404,6 @@ fn test_recover_from_share_responses_decode_derec_share_error() {
             .expect("extract should succeed");
     let responses = vec![RecoveryResponseInput {
         share_response: &response,
-        shared_key: &shared_key,
     }];
 
     let result = recover_from_share_responses(secret_id, version, &responses);
@@ -439,7 +432,6 @@ fn test_recover_from_share_responses_secret_id_mismatch() {
             .expect("extract should succeed");
     let responses = vec![RecoveryResponseInput {
         share_response: &response,
-        shared_key: &shared_key,
     }];
 
     let result = recover_from_share_responses(requested_secret_id, version, &responses);
@@ -468,7 +460,6 @@ fn test_recover_from_share_responses_version_mismatch() {
             .expect("extract should succeed");
     let responses = vec![RecoveryResponseInput {
         share_response: &response,
-        shared_key: &shared_key,
     }];
 
     let result = recover_from_share_responses(secret_id, requested_version, &responses);
@@ -497,7 +488,6 @@ fn test_recover_from_share_responses_reconstruction_failed() {
             .expect("extract should succeed");
     let responses = vec![RecoveryResponseInput {
         share_response: &response,
-        shared_key: &shared_key,
     }];
 
     let result = recover_from_share_responses(secret_id, version, &responses);
@@ -778,7 +768,6 @@ fn test_recovery_end_to_end() {
         .iter()
         .map(|response| RecoveryResponseInput {
             share_response: response,
-            shared_key: &shared_key,
         })
         .collect();
 

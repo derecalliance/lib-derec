@@ -90,8 +90,7 @@ pub struct ExtractResult {
 ///
 /// # Security Notes
 ///
-/// - This function uses cryptographically secure randomness for VSS generation
-/// - The caller is responsible for securely managing the original `secret_data`
+/// - The caller is responsible for securely managing the original `secret_data`.
 ///
 /// # Example
 ///
@@ -111,6 +110,18 @@ pub struct ExtractResult {
 ///
 /// assert_eq!(shares.len(), 3);
 /// ```
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(
+        skip_all,
+        fields(
+            channels_count = channels.len(),
+            version = version,
+            threshold = threshold,
+            secret_data_len = secret_data.as_ref().len(),
+        )
+    )
+)]
 pub fn split(
     channels: &[ChannelId],
     secret_id: impl AsRef<[u8]>,
@@ -122,14 +133,20 @@ pub fn split(
     let secret_data = secret_data.as_ref();
 
     if channels.is_empty() {
+        #[cfg(feature = "logging")]
+        tracing::warn!("channels list is empty");
         return Err(SharingError::EmptyChannels.into());
     }
 
     if secret_id.is_empty() {
+        #[cfg(feature = "logging")]
+        tracing::warn!("secret_id is empty");
         return Err(SharingError::EmptySecretId.into());
     }
 
     if secret_data.is_empty() {
+        #[cfg(feature = "logging")]
+        tracing::warn!("secret_data is empty");
         return Err(SharingError::EmptySecretData.into());
     }
 
@@ -137,6 +154,8 @@ pub fn split(
     ordered_channels.sort();
     for pair in ordered_channels.windows(2) {
         if pair[0] == pair[1] {
+            #[cfg(feature = "logging")]
+            tracing::warn!("duplicate channel ID detected");
             return Err(SharingError::DuplicateChannelId(pair[0].into()).into());
         }
     }
@@ -144,6 +163,8 @@ pub fn split(
     let channel_count = ordered_channels.len();
 
     if threshold < 2 || threshold > channel_count {
+        #[cfg(feature = "logging")]
+        tracing::warn!(threshold = threshold, channels = channel_count, "threshold out of valid range");
         return Err(SharingError::InvalidThreshold {
             threshold,
             channels: channel_count,
@@ -157,25 +178,28 @@ pub fn split(
 
     for (channel_id, share) in ordered_channels.into_iter().zip(vss_shares.into_iter()) {
         let derec_share = DeRecShare {
-            encrypted_secret: share.encrypted_secret,
-            x: share.x,
-            y: share.y,
+            encrypted_secret: share.encrypted_secret.clone(),
+            x: share.x.clone(),
+            y: share.y.clone(),
             secret_id: secret_id.to_vec(),
             version,
         };
 
         let committed_derec_share = CommittedDeRecShare {
             de_rec_share: derec_share.encode_to_vec(),
-            commitment: share.commitment,
+            commitment: share.commitment.clone(),
             merkle_path: share
                 .merkle_path
-                .into_iter()
-                .map(|(is_left, hash)| SiblingHash { is_left, hash })
+                .iter()
+                .map(|(is_left, hash)| SiblingHash { is_left: *is_left, hash: hash.clone() })
                 .collect(),
         };
 
         shares.insert(channel_id, committed_derec_share);
     }
+
+    #[cfg(feature = "logging")]
+    tracing::info!("secret split into shares");
 
     Ok(SplitResult { shares })
 }
@@ -185,8 +209,9 @@ pub fn split(
 ///
 /// Call this once for each share returned by [`split`], providing the corresponding
 /// helper's shared key (established during pairing). The resulting wire bytes should be
-/// sent to the helper over the channel transport and stored by the helper for future
-/// verification and recovery requests.
+/// sent to the helper over the channel transport. On the helper side, the inner
+/// [`derec_proto::StoreShareRequestMessage`] extracted by [`extract`] must be retained
+/// for future verification and recovery flows.
 ///
 /// # Arguments
 ///
@@ -231,6 +256,10 @@ pub fn split(
 ///
 /// assert!(!envelope.is_empty());
 /// ```
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0, version = version))
+)]
 pub fn produce(
     channel_id: ChannelId,
     version: i32,
@@ -260,6 +289,9 @@ pub fn produce(
         .build()?
         .encode_to_vec();
 
+    #[cfg(feature = "logging")]
+    tracing::info!("share request envelope produced");
+
     Ok(ProduceResult { envelope })
 }
 
@@ -274,8 +306,8 @@ pub fn produce(
 ///
 /// The extracted [`StoreShareRequestMessage`] should be passed to
 /// [`crate::primitives::sharing::response::produce`] to build the acknowledgement
-/// response, and the encoded request bytes must also be retained in the share store for
-/// future verification and recovery flows.
+/// response. The helper must also persist the [`StoreShareRequestMessage`] itself (e.g.
+/// as serialized bytes via `.encode_to_vec()`) for future verification and recovery flows.
 ///
 /// # Arguments
 ///
@@ -295,7 +327,12 @@ pub fn produce(
 ///
 /// - `envelope_bytes` cannot be decoded as a valid [`derec_proto::DeRecMessage`]
 /// - decryption or inner-message decoding fails
+/// - the inner message is not a [`derec_proto::StoreShareRequestMessage`]
 /// - `envelope.timestamp != request.timestamp`
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
+)]
 pub fn extract(
     envelope_bytes: &[u8],
     shared_key: &SharedKey,
@@ -305,17 +342,24 @@ pub fn extract(
     let request = match extract_inner_message(&envelope.message, shared_key)? {
         MessageBody::StoreShareRequest(message) => message,
         _ => {
+            #[cfg(feature = "logging")]
+            tracing::warn!("unexpected message type; expected StoreShareRequestMessage");
             return Err(crate::Error::Invariant(
-                "Invalid message. Expected: StoreShareRequestMessage. Received: ???",
+                "Invalid message. Expected: StoreShareRequestMessage",
             ));
         }
     };
 
     if envelope.timestamp != request.timestamp {
+        #[cfg(feature = "logging")]
+        tracing::warn!("timestamp invariant violated");
         return Err(crate::Error::Invariant(
             "Envelope timestamp does not match request timestamp",
         ));
     }
+
+    #[cfg(feature = "logging")]
+    tracing::info!("share request extracted and validated");
 
     Ok(ExtractResult { request })
 }
@@ -329,6 +373,6 @@ fn generate_vss_shares(
     let t = threshold as u64;
     let n = channels_len as u64;
 
-    vss::share((t, n), secret_data, &entropy)
+    vss::share(t, n, secret_data, &entropy)
         .map_err(|source| SharingError::VssShareFailed { source })
 }

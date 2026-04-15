@@ -46,12 +46,6 @@ pub struct ExtractResult {
 /// - `envelope`: serialized outer [`derec_proto::DeRecMessage`] bytes carrying an encrypted
 ///   inner [`derec_proto::GetShareRequestMessage`]
 ///
-/// The inner request contains:
-///
-/// - `secret_id`: the requested secret identifier
-/// - `share_version`: the requested version
-/// - `timestamp`: the request creation timestamp
-///
 /// # Errors
 ///
 /// Returns [`crate::Error`] (specifically `Error::Recovery(...)`) in the following cases:
@@ -63,9 +57,6 @@ pub struct ExtractResult {
 /// # Security Notes
 ///
 /// - This request does not contain secret material; it only identifies which share is requested.
-/// - The outer envelope is not encrypted; only the inner protobuf message is encrypted.
-/// - The outer envelope timestamp is set equal to the inner request timestamp to preserve
-///   the invariant `envelope.timestamp == request.timestamp`.
 ///
 /// # Example
 ///
@@ -81,6 +72,10 @@ pub struct ExtractResult {
 ///
 /// assert!(!result.envelope.is_empty());
 /// ```
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0, version = version))
+)]
 pub fn produce(
     channel_id: ChannelId,
     secret_id: &[u8],
@@ -88,10 +83,14 @@ pub fn produce(
     shared_key: &SharedKey,
 ) -> Result<ProduceResult, crate::Error> {
     if secret_id.is_empty() {
+        #[cfg(feature = "logging")]
+        tracing::warn!("secret_id is empty");
         return Err(RecoveryError::EmptySecretId.into());
     }
 
     if version < 0 {
+        #[cfg(feature = "logging")]
+        tracing::warn!(version = version, "version is negative");
         return Err(RecoveryError::InvalidVersion { version }.into());
     }
 
@@ -110,6 +109,9 @@ pub fn produce(
         .encrypt(shared_key)?
         .build()?
         .encode_to_vec();
+
+    #[cfg(feature = "logging")]
+    tracing::info!("recovery request envelope produced");
 
     Ok(ProduceResult { envelope })
 }
@@ -147,6 +149,10 @@ pub fn produce(
 /// - decryption or inner-message decoding fails
 /// - `envelope.timestamp != request.timestamp`
 /// - the inner message is not a [`derec_proto::GetShareRequestMessage`]
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
+)]
 pub fn extract(
     envelope_bytes: &[u8],
     shared_key: &SharedKey,
@@ -156,6 +162,8 @@ pub fn extract(
     let request = match extract_inner_message(&envelope.message, shared_key)? {
         MessageBody::GetShareRequest(message) => message,
         _ => {
+            #[cfg(feature = "logging")]
+            tracing::warn!("unexpected message type; expected GetShareRequestMessage");
             return Err(crate::Error::Invariant(
                 "Invalid message. Expected: GetShareRequestMessage",
             ));
@@ -163,10 +171,15 @@ pub fn extract(
     };
 
     if envelope.timestamp != request.timestamp {
+        #[cfg(feature = "logging")]
+        tracing::warn!("timestamp invariant violated");
         return Err(crate::Error::Invariant(
             "Envelope timestamp does not match request timestamp",
         ));
     }
+
+    #[cfg(feature = "logging")]
+    tracing::info!("recovery request extracted and validated");
 
     Ok(ExtractResult { request })
 }

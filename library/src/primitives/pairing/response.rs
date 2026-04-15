@@ -58,7 +58,9 @@ pub struct ProcessResult {
 /// * `request` - The decoded [`derec_proto::PairRequestMessage`] previously returned by the
 ///   request module's `extract` function.
 /// * `pairing_secret_key_material` - Initiator-side pairing secret state previously returned
-///   by the request module's `create_contact` function.
+///   by the request module's `create_contact` function. Must be the
+///   [`derec_cryptography::pairing::PairingSecretKeyMaterial::Initiator`] variant; passing the
+///   `Responder` variant will return [`PairingError::Invariant`].
 ///
 /// # Returns
 ///
@@ -76,14 +78,13 @@ pub struct ProcessResult {
 ///
 /// - [`PairingError::InvalidPairRequestMessage`] if the request is malformed or missing fields
 /// - [`PairingError::EmptyTransportUri`] if the request transport information is missing or empty
-/// - [`PairingError::FinishPairingContactor`] if pairing finalization fails
-/// - envelope construction or inner-message encryption fails
+/// - [`PairingError::Invariant`] if `pairing_secret_key_material` is not the `Initiator` variant
+/// - [`PairingError::FinishPairingInitiator`] if pairing finalization fails
+/// - [`PairingError::PairingEncryption`] if inner-message encryption fails
 ///
 /// # Security Notes
 ///
 /// - The derived shared key should be treated as sensitive material.
-/// - The inner response message is encrypted to the responder's public key.
-/// - The outer `DeRecMessage` envelope is plain protobuf metadata and is not itself encrypted.
 /// - The returned `responder_transport_protocol` is peer-provided data; apply any
 ///   caller-side validation required by the selected transport layer before using it.
 ///
@@ -98,16 +99,24 @@ pub struct ProcessResult {
 /// // let response::ProduceResult { envelope, shared_key, responder_transport_protocol } =
 /// //     response::produce(Helper, &request, &initiator_secret_key)?;
 /// ```
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = request.channel_id, kind = kind as i32))
+)]
 pub fn produce(
     kind: SenderKind,
     request: &PairRequestMessage,
     pairing_secret_key_material: &PairingSecretKeyMaterial,
 ) -> Result<ProduceResult, crate::Error> {
     if request.mlkem_ciphertext.is_empty() {
+        #[cfg(feature = "logging")]
+        tracing::warn!("pair request missing mlkem_ciphertext");
         return Err(PairingError::InvalidPairRequestMessage("mlkem_ciphertext is empty").into());
     }
 
     if request.ecies_public_key.is_empty() {
+        #[cfg(feature = "logging")]
+        tracing::warn!("pair request missing ecies_public_key");
         return Err(PairingError::InvalidPairRequestMessage("ecies_public_key is empty").into());
     }
 
@@ -117,6 +126,8 @@ pub fn produce(
         .ok_or(PairingError::EmptyTransportUri)?;
 
     if responder_transport_protocol.uri.trim().is_empty() {
+        #[cfg(feature = "logging")]
+        tracing::warn!("responder transport URI is empty");
         return Err(PairingError::EmptyTransportUri.into());
     }
 
@@ -125,11 +136,21 @@ pub fn produce(
         ecies_public_key: request.ecies_public_key.clone(),
     };
 
-    let shared_key = cryptography_pairing::finish_pairing_contactor(
-        pairing_secret_key_material,
+    let initiator_material = match pairing_secret_key_material {
+        cryptography_pairing::PairingSecretKeyMaterial::Initiator(m) => m,
+        _ => {
+            return Err(
+                PairingError::Invariant("expected Initiator key material for pairing response")
+                    .into(),
+            )
+        }
+    };
+
+    let shared_key = cryptography_pairing::finish_pairing_initiator(
+        initiator_material,
         &pairing_request,
     )
-    .map_err(|e| PairingError::FinishPairingContactor { source: e })?;
+    .map_err(|e| PairingError::FinishPairingInitiator { source: e })?;
 
     let timestamp = current_timestamp();
 
@@ -152,6 +173,9 @@ pub fn produce(
         .encrypt_pairing(&request.ecies_public_key)?
         .build()?
         .encode_to_vec();
+
+    #[cfg(feature = "logging")]
+    tracing::info!("pairing response envelope produced; initiator shared key derived");
 
     Ok(ProduceResult {
         envelope,
@@ -177,8 +201,9 @@ pub fn produce(
 /// * `envelope_bytes` - Serialized outer [`derec_proto::DeRecMessage`] bytes carrying an
 ///   asymmetrically-encrypted inner [`derec_proto::PairResponseMessage`], as produced by
 ///   [`produce`].
-/// * `ecies_secret_key` - The ECIES secret key to use for decryption. This must correspond
-///   to the public key embedded in the pairing request used during [`produce`].
+/// * `ecies_secret_key` - The responder's ECIES secret key. Must correspond to the
+///   `ecies_public_key` the responder embedded in their [`derec_proto::PairRequestMessage`],
+///   which is the key used by [`produce`] to encrypt the inner response.
 ///
 /// # Returns
 ///
@@ -195,6 +220,10 @@ pub fn produce(
 /// - the decrypted bytes cannot be decoded as a [`derec_proto::PairResponseMessage`]
 /// - `envelope.timestamp != response.timestamp`
 /// - the inner message is not a [`derec_proto::PairResponseMessage`]
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
+)]
 pub fn extract(
     envelope_bytes: &[u8],
     ecies_secret_key: &[u8],
@@ -210,6 +239,8 @@ pub fn extract(
     {
         MessageBody::PairResponse(r) => r,
         _ => {
+            #[cfg(feature = "logging")]
+            tracing::warn!("unexpected message type; expected PairResponseMessage");
             return Err(crate::Error::Invariant(
                 "Invalid message. Expected: PairResponseMessage",
             ));
@@ -217,10 +248,15 @@ pub fn extract(
     };
 
     if envelope.timestamp != response.timestamp {
+        #[cfg(feature = "logging")]
+        tracing::warn!("timestamp invariant violated");
         return Err(crate::Error::Invariant(
             "Envelope timestamp does not match response timestamp",
         ));
     }
+
+    #[cfg(feature = "logging")]
+    tracing::info!("pairing response extracted and validated");
 
     Ok(ExtractResult { response })
 }
@@ -250,7 +286,9 @@ pub fn extract(
 /// * `response` - The decrypted [`derec_proto::PairResponseMessage`] previously returned
 ///   by [`extract`].
 /// * `pairing_secret_key_material` - Responder-side secret state previously returned by
-///   the request module's `produce` function.
+///   the request module's `produce` function. Must be the
+///   [`derec_cryptography::pairing::PairingSecretKeyMaterial::Responder`] variant; passing the
+///   `Initiator` variant will return [`PairingError::Invariant`].
 ///
 /// # Returns
 ///
@@ -266,7 +304,8 @@ pub fn extract(
 /// - [`PairingError::InvalidPairResponseMessage`] if the response indicates failure or is malformed
 /// - [`PairingError::ProtocolViolation`] if the response does not match the pairing session
 ///   (for example, nonce mismatch or invalid status enum)
-/// - [`PairingError::FinishPairingRequestor`] if final pairing derivation fails
+/// - [`PairingError::Invariant`] if `pairing_secret_key_material` is not the `Responder` variant
+/// - [`PairingError::FinishPairingResponder`] if final pairing derivation fails
 ///
 /// # Security Notes
 ///
@@ -284,16 +323,24 @@ pub fn extract(
 /// // let response::ProcessResult { shared_key } =
 /// //     response::process(&initiator_contact_message, &resp, &responder_secret_key)?;
 /// ```
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = contact_message.channel_id))
+)]
 pub fn process(
     contact_message: &ContactMessage,
     response: &PairResponseMessage,
     pairing_secret_key_material: &PairingSecretKeyMaterial,
 ) -> Result<ProcessResult, crate::Error> {
     if contact_message.mlkem_encapsulation_key.is_empty() {
+        #[cfg(feature = "logging")]
+        tracing::warn!("contact message missing mlkem_encapsulation_key");
         return Err(PairingError::InvalidContactMessage("mlkem_encapsulation_key is empty").into());
     }
 
     if contact_message.ecies_public_key.is_empty() {
+        #[cfg(feature = "logging")]
+        tracing::warn!("contact message missing ecies_public_key");
         return Err(PairingError::InvalidContactMessage("ecies_public_key is empty").into());
     }
 
@@ -306,12 +353,16 @@ pub fn process(
         .map_err(|_| PairingError::ProtocolViolation("invalid status enum value"))?;
 
     if status != StatusEnum::Ok {
+        #[cfg(feature = "logging")]
+        tracing::warn!("pair response status is not Ok");
         return Err(
             PairingError::InvalidPairResponseMessage("response indicates non-ok status").into(),
         );
     }
 
     if response.nonce != contact_message.nonce {
+        #[cfg(feature = "logging")]
+        tracing::warn!("nonce mismatch; possible replay or wrong pairing session");
         return Err(PairingError::ProtocolViolation("nonce mismatch").into());
     }
 
@@ -320,9 +371,22 @@ pub fn process(
         ecies_public_key: contact_message.ecies_public_key.clone(),
     };
 
+    let responder_material = match pairing_secret_key_material {
+        cryptography_pairing::PairingSecretKeyMaterial::Responder(m) => m,
+        _ => {
+            return Err(
+                PairingError::Invariant("expected Responder key material for pairing process")
+                    .into(),
+            )
+        }
+    };
+
     let shared_key =
-        cryptography_pairing::finish_pairing_requestor(pairing_secret_key_material, &pk)
-            .map_err(|e| PairingError::FinishPairingRequestor { source: e })?;
+        cryptography_pairing::finish_pairing_responder(responder_material, &pk)
+            .map_err(|e| PairingError::FinishPairingResponder { source: e })?;
+
+    #[cfg(feature = "logging")]
+    tracing::info!("pairing complete; responder shared key derived");
 
     Ok(ProcessResult { shared_key })
 }

@@ -39,10 +39,11 @@ pub struct ExtractResult {
 /// 1. Validates the `share` field of the provided `request` is non-empty
 /// 2. Decodes the embedded [`derec_proto::CommittedDeRecShare`] from the `share` field
 /// 3. Validates that `de_rec_share`, `commitment`, and `merkle_path` are non-empty
-/// 4. Verifies the Merkle proof: recomputes the root from `(x, y)` and the path,
+/// 4. Decodes `de_rec_share` as a [`derec_proto::DeRecShare`] to extract `(x, y)` coordinates
+/// 5. Verifies the Merkle proof: recomputes the root from `(x, y)` and the path,
 ///    and rejects the share if it does not match `commitment`
-/// 5. Constructs a [`derec_proto::StoreShareResponseMessage`] with `status = Ok`
-/// 6. Encrypts and wraps the response into a new [`derec_proto::DeRecMessage`] envelope
+/// 6. Constructs a [`derec_proto::StoreShareResponseMessage`] with `status = Ok`
+/// 7. Encrypts and wraps the response into a new [`derec_proto::DeRecMessage`] envelope
 ///
 /// The Helper must persist `committed_share` from the returned result for future verification
 /// and recovery requests.
@@ -73,6 +74,7 @@ pub struct ExtractResult {
 /// - `CommittedDeRecShare.de_rec_share` is empty
 /// - `CommittedDeRecShare.commitment` is empty
 /// - `CommittedDeRecShare.merkle_path` is empty
+/// - `CommittedDeRecShare.de_rec_share` cannot be decoded as a valid [`derec_proto::DeRecShare`]
 /// - the Merkle proof does not verify against `commitment`
 /// - response envelope construction or encryption fails
 ///
@@ -92,12 +94,18 @@ pub struct ExtractResult {
 /// // let response::ProduceResult { envelope, committed_share, .. } =
 /// //     response::produce(channel_id, &request, &shared_key)?;
 /// ```
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0, version = request.version))
+)]
 pub fn produce(
     channel_id: ChannelId,
     request: &StoreShareRequestMessage,
     shared_key: &[u8; 32],
 ) -> Result<ProduceResult, crate::Error> {
     if request.share.is_empty() {
+        #[cfg(feature = "logging")]
+        tracing::warn!("share field is empty in StoreShareRequestMessage");
         return Err(crate::Error::Invariant(
             "share field is empty in StoreShareRequestMessage",
         ));
@@ -107,18 +115,24 @@ pub fn produce(
         .map_err(crate::Error::ProtobufDecode)?;
 
     if committed_share.de_rec_share.is_empty() {
+        #[cfg(feature = "logging")]
+        tracing::warn!("CommittedDeRecShare.de_rec_share is empty");
         return Err(crate::Error::Invariant(
             "CommittedDeRecShare.de_rec_share is empty",
         ));
     }
 
     if committed_share.commitment.is_empty() {
+        #[cfg(feature = "logging")]
+        tracing::warn!("CommittedDeRecShare.commitment is empty");
         return Err(crate::Error::Invariant(
             "CommittedDeRecShare.commitment is empty",
         ));
     }
 
     if committed_share.merkle_path.is_empty() {
+        #[cfg(feature = "logging")]
+        tracing::warn!("CommittedDeRecShare.merkle_path is empty");
         return Err(crate::Error::Invariant(
             "CommittedDeRecShare.merkle_path is empty",
         ));
@@ -143,6 +157,8 @@ pub fn produce(
     };
 
     if !vss::verify(&vss_share) {
+        #[cfg(feature = "logging")]
+        tracing::warn!("Merkle proof verification failed");
         return Err(crate::Error::Invariant(
             "CommittedDeRecShare Merkle proof verification failed",
         ));
@@ -167,6 +183,9 @@ pub fn produce(
         .encrypt(shared_key)?
         .build()?
         .encode_to_vec();
+
+    #[cfg(feature = "logging")]
+    tracing::info!("share accepted; response envelope produced");
 
     Ok(ProduceResult {
         envelope,
@@ -210,6 +229,10 @@ pub fn produce(
 /// - decryption or inner-message decoding fails
 /// - `envelope.timestamp != response.timestamp`
 /// - the inner message is not a [`derec_proto::StoreShareResponseMessage`]
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
+)]
 pub fn extract(
     envelope_bytes: &[u8],
     shared_key: &SharedKey,
@@ -219,6 +242,8 @@ pub fn extract(
     let response = match extract_inner_message(&envelope.message, shared_key)? {
         MessageBody::StoreShareResponse(message) => message,
         _ => {
+            #[cfg(feature = "logging")]
+            tracing::warn!("unexpected message type; expected StoreShareResponseMessage");
             return Err(crate::Error::Invariant(
                 "Invalid message. Expected: StoreShareResponseMessage. Received: ???",
             ));
@@ -226,10 +251,15 @@ pub fn extract(
     };
 
     if envelope.timestamp != response.timestamp {
+        #[cfg(feature = "logging")]
+        tracing::warn!("timestamp invariant violated");
         return Err(crate::Error::Invariant(
             "Envelope timestamp does not match response timestamp",
         ));
     }
+
+    #[cfg(feature = "logging")]
+    tracing::info!("share response extracted and validated");
 
     Ok(ExtractResult { response })
 }
@@ -279,8 +309,14 @@ pub fn extract(
 /// // let response::ExtractResult { response } = response::extract(&envelope_bytes, &shared_key)?;
 /// // response::process(version, &response)?;
 /// ```
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(version = version))
+)]
 pub fn process(version: i32, response: &StoreShareResponseMessage) -> Result<(), crate::Error> {
     if response.version != version {
+        #[cfg(feature = "logging")]
+        tracing::warn!(expected = version, got = response.version, "version mismatch in share response");
         return Err(crate::Error::Invariant(
             "Response version does not match request version",
         ));
@@ -291,12 +327,17 @@ pub fn process(version: i32, response: &StoreShareResponseMessage) -> Result<(),
     ))?;
 
     if result.status != StatusEnum::Ok as i32 {
+        #[cfg(feature = "logging")]
+        tracing::warn!(status = result.status, "helper rejected share storage");
         return Err(SharingError::HelperRejected {
             status: result.status,
             memo: result.memo,
         }
         .into());
     }
+
+    #[cfg(feature = "logging")]
+    tracing::info!("share storage confirmed by helper");
 
     Ok(())
 }

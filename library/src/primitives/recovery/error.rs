@@ -44,7 +44,4 @@ pub enum RecoveryError {
         #[source]
         source: derec_cryptography::vss::DerecVSSError,
     },
-
-    #[error(transparent)]
-    Encryption(#[from] derec_cryptography::channel::DerecChannelError),
 }

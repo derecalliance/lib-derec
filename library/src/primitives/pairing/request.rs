@@ -13,7 +13,6 @@ use derec_proto::{
 use prost::Message;
 use rand::{Rng, rng};
 
-/// Result of [`create_contact`].
 pub struct CreateContactResult {
     /// Decoded [`derec_proto::ContactMessage`] — serialize with `.encode_to_vec()` before sending out-of-band.
     pub contact_message: ContactMessage,
@@ -21,7 +20,6 @@ pub struct CreateContactResult {
     pub secret_key: PairingSecretKeyMaterial,
 }
 
-/// Result of [`produce`].
 pub struct ProduceResult {
     /// Serialized outer [`derec_proto::DeRecMessage`] wire bytes carrying an encrypted inner
     /// [`derec_proto::PairRequestMessage`]. Ready to send over transport.
@@ -33,7 +31,6 @@ pub struct ProduceResult {
     pub secret_key: PairingSecretKeyMaterial,
 }
 
-/// Result of [`extract`].
 pub struct ExtractResult {
     /// Decrypted inner pairing request message.
     pub request: PairRequestMessage,
@@ -84,10 +81,8 @@ pub struct ExtractResult {
 ///
 /// # Security Notes
 ///
-/// - The `contact_message` is public and intended for out-of-band exchange
-/// - The returned secret key material must be protected
-/// - The session nonce is generated from a cryptographically secure RNG and is later
-///   used to bind pairing messages to the same session
+/// - The `contact_message` is public and intended for out-of-band exchange.
+/// - The returned secret key material must be protected.
 ///
 /// # Example
 ///
@@ -111,11 +106,17 @@ pub struct ExtractResult {
 ///
 /// let _ = (contact_message, secret_key);
 /// ```
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+)]
 pub fn create_contact(
     channel_id: ChannelId,
     transport_protocol: TransportProtocol,
 ) -> Result<CreateContactResult, crate::Error> {
     if transport_protocol.uri.trim().is_empty() {
+        #[cfg(feature = "logging")]
+        tracing::warn!("transport URI is empty");
         return Err(PairingError::EmptyTransportUri.into());
     }
 
@@ -134,9 +135,12 @@ pub fn create_contact(
         timestamp: Some(current_timestamp()),
     };
 
+    #[cfg(feature = "logging")]
+    tracing::info!("contact message created");
+
     Ok(CreateContactResult {
         contact_message,
-        secret_key,
+        secret_key: PairingSecretKeyMaterial::Initiator(secret_key),
     })
 }
 
@@ -189,13 +193,11 @@ pub fn create_contact(
 /// - [`PairingError::InvalidContactMessage`] if required contact fields are missing or the
 ///   contact transport protocol is absent or has an empty URI
 /// - [`PairingError::PairRequestKeygen`] if ML-KEM encapsulation or key generation fails
-/// - envelope construction or inner-message encryption fails
+/// - [`PairingError::PairingEncryption`] if inner-message encryption fails
 ///
 /// # Security Notes
 ///
 /// - The `contact_message` is peer-provided data; validate all required fields before use.
-/// - The inner pairing request is encrypted to the initiator's public key.
-/// - The outer `DeRecMessage` envelope is plain protobuf metadata and is not itself encrypted.
 /// - The returned secret key material must be securely retained by the responder.
 ///
 /// # Example
@@ -212,20 +214,30 @@ pub fn create_contact(
 /// //         &contact_message,
 /// //     )?;
 /// ```
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = contact_message.channel_id, kind = kind as i32))
+)]
 pub fn produce(
     kind: SenderKind,
     transport_protocol: TransportProtocol,
     contact_message: &ContactMessage,
 ) -> Result<ProduceResult, crate::Error> {
     if transport_protocol.uri.trim().is_empty() {
+        #[cfg(feature = "logging")]
+        tracing::warn!("transport URI is empty");
         return Err(PairingError::EmptyTransportUri.into());
     }
 
     if contact_message.mlkem_encapsulation_key.is_empty() {
+        #[cfg(feature = "logging")]
+        tracing::warn!("contact message missing mlkem_encapsulation_key");
         return Err(PairingError::InvalidContactMessage("mlkem_encapsulation_key is empty").into());
     }
 
     if contact_message.ecies_public_key.is_empty() {
+        #[cfg(feature = "logging")]
+        tracing::warn!("contact message missing ecies_public_key");
         return Err(PairingError::InvalidContactMessage("ecies_public_key is empty").into());
     }
 
@@ -234,6 +246,8 @@ pub fn produce(
             PairingError::InvalidContactMessage("transport_protocol is missing"),
         )?;
         if initiator_tp.uri.trim().is_empty() {
+            #[cfg(feature = "logging")]
+            tracing::warn!("contact message transport_protocol.uri is empty");
             return Err(
                 PairingError::InvalidContactMessage("transport_protocol.uri is empty").into(),
             );
@@ -272,10 +286,13 @@ pub fn produce(
         .build()?
         .encode_to_vec();
 
+    #[cfg(feature = "logging")]
+    tracing::info!("pairing request envelope produced");
+
     Ok(ProduceResult {
         envelope,
         initiator_contact_message: contact_message.clone(),
-        secret_key,
+        secret_key: PairingSecretKeyMaterial::Responder(secret_key),
     })
 }
 
@@ -296,8 +313,9 @@ pub fn produce(
 /// * `envelope_bytes` - Serialized outer [`derec_proto::DeRecMessage`] bytes carrying an
 ///   asymmetrically-encrypted inner [`derec_proto::PairRequestMessage`], as produced by
 ///   [`produce`].
-/// * `ecies_secret_key` - The ECIES secret key to use for decryption. This must correspond
-///   to the public key embedded in the contact message used during [`produce`].
+/// * `ecies_secret_key` - The initiator's ECIES secret key. Must correspond to the
+///   `ecies_public_key` the initiator published in their [`derec_proto::ContactMessage`],
+///   which is the key used by [`produce`] to encrypt the inner request.
 ///
 /// # Returns
 ///
@@ -314,6 +332,10 @@ pub fn produce(
 /// - the decrypted bytes cannot be decoded as a [`derec_proto::PairRequestMessage`]
 /// - `envelope.timestamp != request.timestamp`
 /// - the inner message is not a [`derec_proto::PairRequestMessage`]
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
+)]
 pub fn extract(
     envelope_bytes: &[u8],
     ecies_secret_key: &[u8],
@@ -329,6 +351,8 @@ pub fn extract(
     {
         MessageBody::PairRequest(r) => r,
         _ => {
+            #[cfg(feature = "logging")]
+            tracing::warn!("unexpected message type; expected PairRequestMessage");
             return Err(crate::Error::Invariant(
                 "Invalid message. Expected: PairRequestMessage",
             ));
@@ -336,10 +360,15 @@ pub fn extract(
     };
 
     if envelope.timestamp != request.timestamp {
+        #[cfg(feature = "logging")]
+        tracing::warn!("timestamp invariant violated");
         return Err(crate::Error::Invariant(
             "Envelope timestamp does not match request timestamp",
         ));
     }
+
+    #[cfg(feature = "logging")]
+    tracing::info!("pairing request extracted and validated");
 
     Ok(ExtractResult { request })
 }

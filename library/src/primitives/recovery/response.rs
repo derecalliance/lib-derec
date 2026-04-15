@@ -18,7 +18,6 @@ const SHARE_ALGORITHM_VSS: i32 = 0;
 /// Input required to process a single share response during recovery.
 pub struct RecoveryResponseInput<'a> {
     pub share_response: &'a GetShareResponseMessage,
-    pub shared_key: &'a SharedKey,
 }
 
 /// Result of [`produce`].
@@ -54,8 +53,7 @@ pub struct RecoverResult {
 /// # Arguments
 ///
 /// * `channel_id` - Identifier of the previously paired helper channel.
-/// * `_secret_id` - Secret identifier (currently unused by this helper). Included for API
-///   consistency and future extensibility.
+/// * `_secret_id` - Secret identifier of the share being requested. Reserved for future validation.
 /// * `request` - The decoded [`derec_proto::GetShareRequestMessage`] previously extracted
 ///   from the recovery request envelope.
 /// * `stored_share_request` - The decoded [`derec_proto::StoreShareRequestMessage`] previously
@@ -70,30 +68,20 @@ pub struct RecoverResult {
 /// - `envelope`: serialized outer [`derec_proto::DeRecMessage`] bytes carrying an encrypted
 ///   inner [`derec_proto::GetShareResponseMessage`]
 ///
-/// The inner response contains:
-///
-/// - `result.status = Ok`
-/// - `committed_de_rec_share`: the committed share bytes from the stored share request
-/// - `share_algorithm = 0`
-/// - `timestamp`: the response creation timestamp
-///
 /// # Errors
 ///
-/// Returns [`crate::Error`] if:
+/// Returns [`crate::Error`] (specifically `Error::Recovery(...)`) in the following cases:
 ///
-/// - the stored share does not contain committed share bytes
-/// - the stored committed share cannot be decoded
-/// - the inner [`derec_proto::DeRecShare`] cannot be decoded
-/// - the stored share does not match the requested `secret_id`
-/// - the stored share does not match the requested `share_version`
+/// - [`RecoveryError::EmptyCommittedDeRecShare`] if the stored share has no committed share bytes
+/// - [`RecoveryError::DecodeCommittedDeRecShare`] if the committed share cannot be decoded
+/// - [`RecoveryError::DecodeDeRecShare`] if the inner [`derec_proto::DeRecShare`] cannot be decoded
+/// - [`RecoveryError::SecretIdMismatch`] if the stored share does not match the requested `secret_id`
+/// - [`RecoveryError::VersionMismatch`] if the stored share does not match the requested `share_version`
 /// - outer response envelope construction or encryption fails
 ///
 /// # Security Notes
 ///
 /// - The response contains share material and must be treated as sensitive.
-/// - The outer envelope is not encrypted; only the inner protobuf message is encrypted.
-/// - The outer response timestamp is set equal to the inner response timestamp to preserve
-///   the invariant `envelope.timestamp == response.timestamp`.
 ///
 /// # Example
 ///
@@ -109,6 +97,10 @@ pub struct RecoverResult {
 /// // let response::ProduceResult { envelope } =
 /// //     response::produce(channel_id, b"secret_id", &request, &stored_share_request, &shared_key)?;
 /// ```
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0, version = request.share_version))
+)]
 pub fn produce(
     channel_id: ChannelId,
     _secret_id: &[u8],
@@ -117,6 +109,8 @@ pub fn produce(
     shared_key: &SharedKey,
 ) -> Result<ProduceResult, crate::Error> {
     if stored_share_request.share.is_empty() {
+        #[cfg(feature = "logging")]
+        tracing::warn!("stored share is empty");
         return Err(RecoveryError::EmptyCommittedDeRecShare.into());
     }
 
@@ -127,10 +121,14 @@ pub fn produce(
         .map_err(|source| RecoveryError::DecodeDeRecShare { source })?;
 
     if derec_share.secret_id != request.secret_id {
+        #[cfg(feature = "logging")]
+        tracing::warn!("secret_id mismatch between request and stored share");
         return Err(RecoveryError::SecretIdMismatch.into());
     }
 
     if derec_share.version != request.share_version {
+        #[cfg(feature = "logging")]
+        tracing::warn!(expected = request.share_version, got = derec_share.version, "version mismatch between request and stored share");
         return Err(RecoveryError::VersionMismatch {
             expected: request.share_version,
             got: derec_share.version,
@@ -157,6 +155,9 @@ pub fn produce(
         .encrypt(shared_key)?
         .build()?
         .encode_to_vec();
+
+    #[cfg(feature = "logging")]
+    tracing::info!("recovery response envelope produced");
 
     Ok(ProduceResult { envelope })
 }
@@ -194,6 +195,10 @@ pub fn produce(
 /// - decryption or inner-message decoding fails
 /// - `envelope.timestamp != response.timestamp`
 /// - the inner message is not a [`derec_proto::GetShareResponseMessage`]
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
+)]
 pub fn extract(
     envelope_bytes: &[u8],
     shared_key: &SharedKey,
@@ -203,6 +208,8 @@ pub fn extract(
     let response = match extract_inner_message(&envelope.message, shared_key)? {
         MessageBody::GetShareResponse(message) => message,
         _ => {
+            #[cfg(feature = "logging")]
+            tracing::warn!("unexpected message type; expected GetShareResponseMessage");
             return Err(crate::Error::Invariant(
                 "Invalid message. Expected: GetShareResponseMessage",
             ));
@@ -210,10 +217,15 @@ pub fn extract(
     };
 
     if envelope.timestamp != response.timestamp {
+        #[cfg(feature = "logging")]
+        tracing::warn!("timestamp invariant violated");
         return Err(crate::Error::Invariant(
             "Envelope timestamp does not match response timestamp",
         ));
     }
+
+    #[cfg(feature = "logging")]
+    tracing::info!("recovery response extracted and validated");
 
     Ok(ExtractResult { response })
 }
@@ -237,7 +249,6 @@ pub fn extract(
 /// * `responses` - Collection of helper responses. Each entry must contain:
 ///   - `share_response`: decrypted [`derec_proto::GetShareResponseMessage`] previously
 ///     returned by [`extract`]
-///   - `shared_key`: the 32-byte symmetric key associated with that helper
 ///
 /// # Returns
 ///
@@ -280,27 +291,36 @@ pub fn extract(
 /// let responses = vec![
 ///     RecoveryResponseInput {
 ///         share_response: &response,
-///         shared_key: &shared_key,
 ///     }
 /// ];
 ///
 /// let result = response::recover(b"secret_id", 1, &responses);
 /// assert!(result.is_err()); // empty committed share expected to fail
 /// ```
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(version = version, responses_count = responses.len()))
+)]
 pub fn recover(
     secret_id: &[u8],
     version: i32,
     responses: &[RecoveryResponseInput<'_>],
 ) -> Result<RecoverResult, crate::Error> {
     if responses.is_empty() {
+        #[cfg(feature = "logging")]
+        tracing::warn!("responses list is empty");
         return Err(RecoveryError::EmptyResponses.into());
     }
 
     if secret_id.is_empty() {
+        #[cfg(feature = "logging")]
+        tracing::warn!("secret_id is empty");
         return Err(RecoveryError::EmptySecretId.into());
     }
 
     if version < 0 {
+        #[cfg(feature = "logging")]
+        tracing::warn!(version = version, "version is negative");
         return Err(RecoveryError::InvalidVersion { version }.into());
     }
 
@@ -316,6 +336,9 @@ pub fn recover(
 
     let secret_data =
         vss::recover(&shares).map_err(|source| RecoveryError::ReconstructionFailed { source })?;
+
+    #[cfg(feature = "logging")]
+    tracing::info!("secret reconstructed from shares");
 
     Ok(RecoverResult { secret_data })
 }

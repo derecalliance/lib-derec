@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Verification response primitives — full inline implementations.
-
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
+    primitives::verification::VerificationError,
     types::*,
 };
 use derec_proto::{
@@ -89,6 +88,13 @@ pub struct ExtractResult {
 /// // let response::ProduceResult { envelope } =
 /// //     response::produce(channel_id, &request, &shared_key, b"example_share")?;
 /// ```
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(
+        skip_all,
+        fields(channel_id = channel_id.0, version = request.version, share_content_len = share_content.as_ref().len())
+    )
+)]
 pub fn produce(
     channel_id: ChannelId,
     request: &VerifyShareRequestMessage,
@@ -117,6 +123,9 @@ pub fn produce(
         .encrypt(shared_key)?
         .build()?
         .encode_to_vec();
+
+    #[cfg(feature = "logging")]
+    tracing::info!("verification response envelope produced");
 
     Ok(ProduceResult { envelope })
 }
@@ -155,6 +164,10 @@ pub fn produce(
 /// - decryption or inner-message decoding fails
 /// - `envelope.timestamp != response.timestamp`
 /// - the inner message is not a [`derec_proto::VerifyShareResponseMessage`]
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
+)]
 pub fn extract(
     envelope_bytes: &[u8],
     shared_key: &SharedKey,
@@ -164,6 +177,8 @@ pub fn extract(
     let response = match extract_inner_message(&envelope.message, shared_key)? {
         MessageBody::VerifyShareResponse(message) => message,
         _ => {
+            #[cfg(feature = "logging")]
+            tracing::warn!("unexpected message type; expected VerifyShareResponseMessage");
             return Err(crate::Error::Invariant(
                 "Invalid message. Expected: VerifyShareResponseMessage",
             ));
@@ -171,10 +186,15 @@ pub fn extract(
     };
 
     if envelope.timestamp != response.timestamp {
+        #[cfg(feature = "logging")]
+        tracing::warn!("timestamp invariant violated");
         return Err(crate::Error::Invariant(
             "Envelope timestamp does not match response timestamp",
         ));
     }
+
+    #[cfg(feature = "logging")]
+    tracing::info!("verification response extracted and validated");
 
     Ok(ExtractResult { response })
 }
@@ -205,10 +225,10 @@ pub fn extract(
 ///
 /// # Errors
 ///
-/// Returns [`crate::Error`] if:
+/// Returns [`crate::Error`] wrapping:
 ///
-/// - `response.result` is missing
-/// - `response.result.status != Ok`
+/// - [`VerificationError::MissingResult`] if `response.result` is absent
+/// - [`VerificationError::NonOkStatus`] if `response.result.status != Ok`
 ///
 /// # Security Notes
 ///
@@ -234,23 +254,33 @@ pub fn extract(
 /// // let ok = response::process(&resp, share_content)?;
 /// // assert!(ok);
 /// ```
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(share_content_len = share_content.as_ref().len()))
+)]
 pub fn process(
     response: &VerifyShareResponseMessage,
     share_content: impl AsRef<[u8]>,
 ) -> Result<bool, crate::Error> {
-    let result = response.result.as_ref().ok_or(crate::Error::Invariant(
-        "Verification response is missing result",
-    ))?;
+    let result = response
+        .result
+        .as_ref()
+        .ok_or(VerificationError::MissingResult)?;
 
     if result.status != StatusEnum::Ok as i32 {
-        return Err(crate::Error::Invariant(
-            "Verification response status is not Ok",
-        ));
+        #[cfg(feature = "logging")]
+        tracing::warn!(status = result.status, "verification response status is not Ok");
+        return Err(VerificationError::NonOkStatus { status: result.status }.into());
     }
 
     let expected_hash = hash_content(share_content, response.nonce);
 
-    Ok(expected_hash.ct_eq(response.hash.as_slice()).into())
+    let matched: bool = expected_hash.ct_eq(response.hash.as_slice()).into();
+
+    #[cfg(feature = "logging")]
+    tracing::info!(verified = matched, "verification proof checked");
+
+    Ok(matched)
 }
 
 fn hash_content(share_content: impl AsRef<[u8]>, nonce: u64) -> Vec<u8> {

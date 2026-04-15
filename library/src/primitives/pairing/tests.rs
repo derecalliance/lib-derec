@@ -184,7 +184,7 @@ fn test_produce_pairing_request_message() {
     .expect("failed to produce pairing request message");
 
     let ExtractPairingRequestResult { request: pair_request_message } =
-        extract_pairing_request(&envelope, &alice_sk_state.ecies_secret_key)
+        extract_pairing_request(&envelope, &alice_sk_state.ecies_secret_key())
             .expect("failed to extract pairing request");
 
     let envelope_decoded = decode_outer_envelope(&envelope);
@@ -414,7 +414,7 @@ fn test_extract_pairing_request_rejects_envelope_timestamp_mismatch() {
 
     let tampered_bytes = mismatch_envelope_timestamp(&envelope);
 
-    let result = extract_pairing_request(&tampered_bytes, &alice_sk_state.ecies_secret_key);
+    let result = extract_pairing_request(&tampered_bytes, &alice_sk_state.ecies_secret_key());
 
     assert!(matches!(
         result,
@@ -448,7 +448,7 @@ fn test_process_pairing_response_message_missing_result() {
     .expect("failed to produce valid pairing request");
 
     let ExtractPairingRequestResult { request: bob_pair_request_msg } =
-        extract_pairing_request(&bob_request_envelope, &alice_sk_state.ecies_secret_key)
+        extract_pairing_request(&bob_request_envelope, &alice_sk_state.ecies_secret_key())
             .expect("failed to extract pairing request");
 
     let pair_response_msg = PairResponseMessage {
@@ -498,7 +498,7 @@ fn test_process_pairing_response_message_result_non_ok() {
     .expect("failed to produce valid pairing request");
 
     let ExtractPairingRequestResult { request: bob_pair_request_msg } =
-        extract_pairing_request(&bob_request_envelope, &alice_sk_state.ecies_secret_key)
+        extract_pairing_request(&bob_request_envelope, &alice_sk_state.ecies_secret_key())
             .expect("failed to extract pairing request");
 
     let pair_response_msg = PairResponseMessage {
@@ -551,7 +551,7 @@ fn test_process_pairing_response_message_invalid_status() {
     .expect("failed to produce valid pairing request");
 
     let ExtractPairingRequestResult { request: bob_pair_request_msg } =
-        extract_pairing_request(&bob_request_envelope, &alice_sk_state.ecies_secret_key)
+        extract_pairing_request(&bob_request_envelope, &alice_sk_state.ecies_secret_key())
             .expect("failed to extract pairing request");
 
     let pair_response_msg = PairResponseMessage {
@@ -604,7 +604,7 @@ fn test_process_pairing_response_message_nonce_mismatch() {
     .expect("failed to produce valid pairing request");
 
     let ExtractPairingRequestResult { request: bob_pair_request_msg } =
-        extract_pairing_request(&bob_request_envelope, &alice_sk_state.ecies_secret_key)
+        extract_pairing_request(&bob_request_envelope, &alice_sk_state.ecies_secret_key())
             .expect("failed to extract pairing request");
 
     let pair_response_msg = PairResponseMessage {
@@ -657,7 +657,7 @@ fn test_process_pairing_response_message_empty_mlkem_encapsulation_key() {
     .expect("failed to produce valid pairing request");
 
     let ExtractPairingRequestResult { request: bob_pair_request_msg } =
-        extract_pairing_request(&bob_request_envelope, &alice_sk_state.ecies_secret_key)
+        extract_pairing_request(&bob_request_envelope, &alice_sk_state.ecies_secret_key())
             .expect("failed to extract pairing request");
 
     let pair_response_msg = PairResponseMessage {
@@ -713,7 +713,7 @@ fn test_process_pairing_response_message_empty_ecies_public_key() {
     .expect("failed to produce valid pairing request");
 
     let ExtractPairingRequestResult { request: bob_pair_request_msg } =
-        extract_pairing_request(&bob_request_envelope, &alice_sk_state.ecies_secret_key)
+        extract_pairing_request(&bob_request_envelope, &alice_sk_state.ecies_secret_key())
             .expect("failed to extract pairing request");
 
     let pair_response_msg = PairResponseMessage {
@@ -769,7 +769,7 @@ fn test_extract_pairing_response_rejects_envelope_timestamp_mismatch() {
     .expect("failed to produce pairing request");
 
     let ExtractPairingRequestResult { request } =
-        extract_pairing_request(&request_envelope, &initiator_secret_key.ecies_secret_key)
+        extract_pairing_request(&request_envelope, &initiator_secret_key.ecies_secret_key())
             .expect("failed to extract pairing request");
 
     let ProducePairingResponseMessageResult {
@@ -784,7 +784,7 @@ fn test_extract_pairing_response_rejects_envelope_timestamp_mismatch() {
 
     let tampered_bytes = mismatch_envelope_timestamp(&response_envelope);
 
-    let result = extract_pairing_response(&tampered_bytes, &responder_secret_key.ecies_secret_key);
+    let result = extract_pairing_response(&tampered_bytes, &responder_secret_key.ecies_secret_key());
 
     assert!(matches!(
         result,
@@ -826,7 +826,7 @@ fn test_alice_bob_pairing_flow() {
 
     // Alice (initiator) decrypts the request.
     let ExtractPairingRequestResult { request: bob_pair_req_msg } =
-        extract_pairing_request(&bob_pair_req_envelope, &alice_sk_state.ecies_secret_key)
+        extract_pairing_request(&bob_pair_req_envelope, &alice_sk_state.ecies_secret_key())
             .expect("failed to extract pairing request");
 
     // Alice produces the pairing response envelope.
@@ -839,7 +839,7 @@ fn test_alice_bob_pairing_flow() {
 
     // Bob (responder) decrypts the response.
     let ExtractPairingResponseResult { response: alice_pair_resp_msg } =
-        extract_pairing_response(&alice_pair_resp_envelope, &bob_sk_state.ecies_secret_key)
+        extract_pairing_response(&alice_pair_resp_envelope, &bob_sk_state.ecies_secret_key())
             .expect("failed to extract pairing response");
 
     // Bob finalizes pairing.
