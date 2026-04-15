@@ -55,7 +55,7 @@ pub fn build_merkle_tree<R: Rng>(
     rng: &mut R,
 ) -> Vec<Vec<u8>> {
     // merkle tree nodes are of type Vec<u8>,
-    // though we know their size to be 256 B
+    // though we know their size to be 32 bytes (SHA-256 output)
     let merkle_tree_size = (2_u32.pow(depth + 1) - 1) as usize;
     let mut merkle_nodes: Vec<Vec<u8>> = Vec::new();
     //allocate space up front
@@ -209,7 +209,7 @@ mod tests {
         let mut msg: [u8; 1024] = [0u8; 1024];
         rng.fill(&mut msg);
 
-        let shares = vss::share((3, 5), &msg, &rand).unwrap();
+        let shares = vss::share(3, 5, &msg, &rand).unwrap();
         let recovered = vss::recover(&shares).unwrap();
 
         assert_eq!(msg, recovered[..]);
@@ -228,7 +228,7 @@ mod tests {
         let mut msg: [u8; 1024] = [0u8; 1024];
         rng.fill(&mut msg);
 
-        let shares = vss::share((5, 7), &msg, &seed1).unwrap();
+        let shares = vss::share(5, 7, &msg, &seed1).unwrap();
         let share_points: Vec<(Vec<u8>, Vec<u8>)> =
             shares.iter().map(|s| (s.x.clone(), s.y.clone())).collect();
         let merkle_tree = build_merkle_tree(&share_points, 3, &mut thread_rng());

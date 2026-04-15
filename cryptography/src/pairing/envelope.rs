@@ -7,14 +7,13 @@
 //!
 //! # Purpose
 //!
-//! In the DeRec protocol, messages are:
+//! In the DeRec protocol, pairing messages are:
 //!
-//! 1. Built as a `DeRecMessage`
-//! 2. Signed by the sender
-//! 3. **Encrypted for the recipient**
-//! 4. Sent over the wire
+//! 1. **Encrypted for the recipient** using this module
+//! 2. Placed inside a `DeRecMessage` envelope
+//! 3. Sent over the wire
 //!
-//! This module implements step (3): **public-key encryption of message payloads**.
+//! This module implements step (1): **public-key encryption of message payloads**.
 //!
 //! # Design
 //!
@@ -67,8 +66,8 @@
 //! ```rust, ignore
 //! use derec_cryptography::envelope;
 //!
-//! let ciphertext = envelope::encrypt(&plaintext, &public_key)?;
-//! let plaintext = envelope::decrypt(&ciphertext, &secret_key)?;
+//! let ciphertext = envelope::encrypt(&plaintext, &public_key).unwrap();
+//! let plaintext = envelope::decrypt(&ciphertext, &secret_key).unwrap();
 //! ```
 
 use rand::rngs::OsRng;
@@ -130,32 +129,46 @@ pub enum DerecEncryptionError {
 ///
 /// let ciphertext = envelope::encrypt(b"hello", &public_key).unwrap();
 /// ```
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(plaintext_len = bytes.len(), public_key_len = public_key.len()))
+)]
 pub fn encrypt(bytes: &[u8], public_key: &[u8]) -> Result<Vec<u8>, DerecEncryptionError> {
     if public_key.is_empty() {
+        #[cfg(feature = "logging")]
+        tracing::warn!("recipient public key is empty");
         return Err(DerecEncryptionError::InvalidPublicKey);
     }
 
-    // 1. Generate ephemeral keypair
-    let (esk, epk) = pairing_ecies::generate_key(&mut OsRng)
-        .map_err(|_| DerecEncryptionError::EncryptionFailed)?;
+    let (esk, epk) = pairing_ecies::generate_key(&mut OsRng).map_err(|_e| {
+        #[cfg(feature = "logging")]
+        tracing::warn!(error = %_e, "ephemeral keypair generation failed");
+        DerecEncryptionError::EncryptionFailed
+    })?;
 
-    // 2. Derive shared key
-    let shared = pairing_ecies::derive_shared_key(&esk, public_key)
-        .map_err(|_| DerecEncryptionError::EncryptionFailed)?;
+    let shared = pairing_ecies::derive_shared_key(&esk, public_key).map_err(|_e| {
+        #[cfg(feature = "logging")]
+        tracing::warn!(error = %_e, "ECDH shared key derivation failed");
+        DerecEncryptionError::EncryptionFailed
+    })?;
 
-    // 3. Encrypt using AES-GCM
     let nonce = rand::random::<[u8; NONCE_SIZE]>();
 
-    let ciphertext = channel::encrypt_message(bytes, &shared, &nonce)
-        .map_err(|_| DerecEncryptionError::EncryptionFailed)?;
+    let ciphertext = channel::encrypt_message(bytes, &shared, &nonce).map_err(|_e| {
+        #[cfg(feature = "logging")]
+        tracing::warn!(error = %_e, "AES-GCM encryption failed");
+        DerecEncryptionError::EncryptionFailed
+    })?;
 
-    // 4. Build output
     let mut out = Vec::with_capacity(4 + epk.len() + ciphertext.len());
 
     let epk_len = epk.len() as u32;
     out.extend_from_slice(&epk_len.to_le_bytes());
     out.extend_from_slice(&epk);
     out.extend_from_slice(&ciphertext);
+
+    #[cfg(feature = "logging")]
+    tracing::info!(output_len = out.len(), "payload encrypted");
 
     Ok(out)
 }
@@ -192,12 +205,20 @@ pub fn encrypt(bytes: &[u8], public_key: &[u8]) -> Result<Vec<u8>, DerecEncrypti
 ///
 /// let plaintext = envelope::decrypt(&ciphertext, &secret_key).unwrap();
 /// ```
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(ciphertext_len = ciphertext.len()))
+)]
 pub fn decrypt(ciphertext: &[u8], secret_key: &[u8]) -> Result<Vec<u8>, DerecEncryptionError> {
     if ciphertext.len() < 4 {
+        #[cfg(feature = "logging")]
+        tracing::warn!(
+            got = ciphertext.len(),
+            "ciphertext too short to contain epk length prefix"
+        );
         return Err(DerecEncryptionError::InvalidFormat);
     }
 
-    // Read epk length
     let epk_len = u32::from_le_bytes(
         ciphertext[0..4]
             .try_into()
@@ -205,19 +226,32 @@ pub fn decrypt(ciphertext: &[u8], secret_key: &[u8]) -> Result<Vec<u8>, DerecEnc
     ) as usize;
 
     if ciphertext.len() < 4 + epk_len {
+        #[cfg(feature = "logging")]
+        tracing::warn!(
+            epk_len = epk_len,
+            ciphertext_len = ciphertext.len(),
+            "ciphertext truncated; epk section incomplete"
+        );
         return Err(DerecEncryptionError::InvalidFormat);
     }
 
     let epk = &ciphertext[4..4 + epk_len];
     let encrypted = &ciphertext[4 + epk_len..];
 
-    // Derive shared key
-    let shared = pairing_ecies::derive_shared_key(secret_key, epk)
-        .map_err(|_| DerecEncryptionError::DecryptionFailed)?;
+    let shared = pairing_ecies::derive_shared_key(secret_key, epk).map_err(|_e| {
+        #[cfg(feature = "logging")]
+        tracing::warn!(error = %_e, "ECDH shared key derivation failed");
+        DerecEncryptionError::DecryptionFailed
+    })?;
 
-    // Decrypt
-    let plaintext = channel::decrypt_message(encrypted, &shared)
-        .map_err(|_| DerecEncryptionError::DecryptionFailed)?;
+    let plaintext = channel::decrypt_message(encrypted, &shared).map_err(|_e| {
+        #[cfg(feature = "logging")]
+        tracing::warn!(error = %_e, "AES-GCM decryption failed");
+        DerecEncryptionError::DecryptionFailed
+    })?;
+
+    #[cfg(feature = "logging")]
+    tracing::info!(plaintext_len = plaintext.len(), "payload decrypted");
 
     Ok(plaintext)
 }

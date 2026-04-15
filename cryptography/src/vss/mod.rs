@@ -6,6 +6,7 @@
 
 use super::channel::{decrypt_message, encrypt_message};
 use rand_chacha::rand_core::SeedableRng;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 mod shamir;
 mod utils;
@@ -18,8 +19,7 @@ const λ: usize = λ_bits / 8;
 
 const MERKLE_TREE_DEPTH: u32 = 7;
 
-/// Encodes a VSS share.
-#[derive(Clone)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct VSSShare {
     /// we use the x-coordinate to uniquely identify shares
     pub x: Vec<u8>,
@@ -53,6 +53,9 @@ pub enum DerecVSSError {
     #[error("decryption failed")]
     DecryptionFailure,
 
+    #[error("encryption failed")]
+    EncryptionFailure,
+
     #[error("invalid access structure")]
     InvalidAccessStructure,
 }
@@ -62,10 +65,10 @@ pub enum DerecVSSError {
 ///
 /// # Arguments
 ///
-/// * `access_structure` - A tuple `(t, n)` where `t` is the threshold number of shares required to reconstruct the secret,
-///   and `n` is the total number of shares to generate. Must satisfy `2 <= t <= n` and `n <= 128`.
+/// * `threshold` - Minimum number of shares required to reconstruct the secret (`t`). Must satisfy `2 <= threshold`.
+/// * `total_shares` - Total number of shares to generate (`n`). Must satisfy `threshold <= total_shares <= 128`.
 /// * `msg` - The secret message to be shared, as a byte slice.
-/// * `rand` - A cryptographically secure random seed of length `λ` (32 bytes).
+/// * `entropy` - A cryptographically secure random seed of length `λ` (32 bytes).
 ///
 /// # Returns
 ///
@@ -78,46 +81,83 @@ pub enum DerecVSSError {
 /// # Details
 ///
 /// - The function derives a pseudo-random AES key and nonce from the message and random seed.
-/// - The message is encrypted using AES with the derived key and nonce.
+/// - The message is encrypted using AES-256-GCM with the derived key and nonce.
 /// - The AES key is split into shares using Shamir's Secret Sharing.
 /// - A Merkle tree is constructed over the shares for verifiable commitments.
 /// - Each share includes its Merkle authentication path for individual verification.
+///
+/// # Errors
+///
+/// Returns [`DerecVSSError::InvalidAccessStructure`] if the access structure does not satisfy
+/// `2 <= t <= n <= 128`.
+///
+/// Returns [`DerecVSSError::EncryptionFailure`] if AES-GCM encryption of the secret fails.
 ///
 /// # Example
 ///
 /// ```rust
 /// use derec_cryptography::vss::{share, recover, VSSShare};
-/// let shares = share((3, 5), b"my secret", &[0u8; 32]).unwrap();
+/// let shares = share(3, 5, b"my secret", &[0u8; 32]).unwrap();
 /// assert_eq!(shares.len(), 5);
 /// ```
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(
+        skip_all,
+        fields(threshold, total_shares, msg_len = msg.len())
+    )
+)]
 pub fn share(
-    access_structure: (u64, u64), // (t, n)
+    threshold: u64,
+    total_shares: u64,
     msg: &[u8],
     entropy: &[u8; λ],
 ) -> Result<Vec<VSSShare>, DerecVSSError> {
-    if (access_structure.0 > access_structure.1) || (access_structure.0 < 2) {
+    if (threshold > total_shares) || (threshold < 2) {
+        #[cfg(feature = "logging")]
+        tracing::warn!(
+            threshold,
+            total_shares,
+            "invalid access structure: threshold out of range"
+        );
         return Err(DerecVSSError::InvalidAccessStructure);
     }
 
     // we can only support up to 2^7 = 128 shares
-    if access_structure.1 > 1 << MERKLE_TREE_DEPTH {
+    if total_shares > 1 << MERKLE_TREE_DEPTH {
+        #[cfg(feature = "logging")]
+        tracing::warn!(
+            total_shares,
+            max = 1u64 << MERKLE_TREE_DEPTH,
+            "invalid access structure: too many shares"
+        );
         return Err(DerecVSSError::InvalidAccessStructure);
     }
 
     //pseudo-random key derivation
+    // random_oracle returns [u8; 4*λ], so each λ-byte chunk is statically guaranteed to exist.
     let hash = utils::random_oracle(msg, entropy, &[]);
-    let k: [u8; λ] = hash[..λ].try_into().unwrap();
-    let nonce: [u8; λ] = hash[λ..2 * λ].try_into().unwrap();
-    let seed1: [u8; λ] = hash[2 * λ..3 * λ].try_into().unwrap();
-    let seed2: [u8; λ] = hash[3 * λ..4 * λ].try_into().unwrap();
+    let mut k = [0u8; λ];
+    let mut nonce = [0u8; λ];
+    let mut seed1 = [0u8; λ];
+    let mut seed2 = [0u8; λ];
+    k.copy_from_slice(&hash[..λ]);
+    nonce.copy_from_slice(&hash[λ..2 * λ]);
+    seed1.copy_from_slice(&hash[2 * λ..3 * λ]);
+    seed2.copy_from_slice(&hash[3 * λ..4 * λ]);
 
     //AES encrypt the message using the pseudo-random key k
-    let c = encrypt_message(msg, &k, &nonce).unwrap();
+    let c = encrypt_message(msg, &k, &nonce).map_err(|_e| {
+        #[cfg(feature = "logging")]
+        tracing::warn!(error = %_e, "AES-GCM encryption failed during secret sharing");
+        DerecVSSError::EncryptionFailure
+    })?;
 
     // generate shares of the AES key k
     let shamir_shares = shamir::share(
         &k,
-        access_structure,
+        threshold,
+        total_shares,
         &mut rand_chacha::ChaCha8Rng::from_seed(seed1),
     );
 
@@ -127,7 +167,7 @@ pub fn share(
         &mut rand_chacha::ChaCha8Rng::from_seed(seed2),
     );
     let merkle_proofs =
-        utils::extract_merkle_proofs(&merkle_tree, MERKLE_TREE_DEPTH, access_structure.1);
+        utils::extract_merkle_proofs(&merkle_tree, MERKLE_TREE_DEPTH, total_shares);
 
     let mut output = vec![];
     for (i, (x, y)) in shamir_shares.iter().enumerate() {
@@ -139,6 +179,9 @@ pub fn share(
             merkle_path: merkle_proofs[i].to_owned(),
         });
     }
+    #[cfg(feature = "logging")]
+    tracing::info!(shares_count = output.len(), "secret split into VSS shares");
+
     Ok(output)
 }
 
@@ -161,9 +204,10 @@ pub fn share(
 /// ```rust
 /// use derec_cryptography::vss::{share, verify};
 ///
-/// let shares = share((2, 3), b"my secret", &[0u8; 32]).unwrap();
+/// let shares = share(2, 3, b"my secret", &[0u8; 32]).unwrap();
 /// assert!(verify(&shares[0]));
 /// ```
+#[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
 pub fn verify(share: &VSSShare) -> bool {
     let mut on_path_hash = utils::leaf_hash_pub(&share.x, &share.y);
 
@@ -175,7 +219,12 @@ pub fn verify(share: &VSSShare) -> bool {
         };
     }
 
-    on_path_hash == share.commitment
+    let result = on_path_hash == share.commitment;
+
+    #[cfg(feature = "logging")]
+    tracing::debug!(verified = result, "Merkle proof checked");
+
+    result
 }
 
 /// Recovers the secret from a set of VSS shares.
@@ -214,16 +263,22 @@ pub fn verify(share: &VSSShare) -> bool {
 /// ```rust
 /// use derec_cryptography::vss::{share, recover};
 ///
-/// let shares = share((3, 5), b"my secret", &[0u8; 32]).unwrap();
+/// let shares = share(3, 5, b"my secret", &[0u8; 32]).unwrap();
 /// let secret = recover(&shares[..3].to_vec()).unwrap();
 /// assert_eq!(secret, b"my secret");
 /// ```
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(shares_count = shares.len()))
+)]
 pub fn recover(shares: &Vec<VSSShare>) -> Result<Vec<u8>, DerecVSSError> {
     assert!(!shares.is_empty());
 
     // Stage 1: verify consistency across shares and validate each Merkle proof.
     let detected_error = utils::detect_error(shares);
     if let Some(err) = detected_error {
+        #[cfg(feature = "logging")]
+        tracing::warn!(error = %err, "share consistency check failed");
         return Err(err);
     }
 
@@ -234,5 +289,174 @@ pub fn recover(shares: &Vec<VSSShare>) -> Result<Vec<u8>, DerecVSSError> {
     // Stage 3: decrypt the ciphertext with the recovered key.
     // A decryption failure here means insufficient or wrong shares were provided.
     let c = shares[0].encrypted_secret.clone();
-    decrypt_message(&c, &k).map_err(|_| DerecVSSError::InsufficientShares)
+    let secret = decrypt_message(&c, &k).map_err(|_e| {
+        #[cfg(feature = "logging")]
+        tracing::warn!("decryption failed; insufficient or incorrect shares");
+        DerecVSSError::InsufficientShares
+    })?;
+
+    #[cfg(feature = "logging")]
+    tracing::info!(
+        secret_len = secret.len(),
+        "secret reconstructed from shares"
+    );
+
+    Ok(secret)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ENTROPY: &[u8; λ] = &[0u8; λ];
+
+    #[test]
+    fn test_share_rejects_threshold_below_2() {
+        let Err(err) = share(1, 5, b"secret", ENTROPY) else {
+            panic!("threshold < 2 should be rejected");
+        };
+        assert!(matches!(err, DerecVSSError::InvalidAccessStructure));
+    }
+
+    #[test]
+    fn test_share_rejects_threshold_greater_than_n() {
+        let Err(err) = share(5, 3, b"secret", ENTROPY) else {
+            panic!("t > n should be rejected");
+        };
+        assert!(matches!(err, DerecVSSError::InvalidAccessStructure));
+    }
+
+    #[test]
+    fn test_share_rejects_n_exceeding_max() {
+        // max is 2^MERKLE_TREE_DEPTH = 128
+        let Err(err) = share(2, 129, b"secret", ENTROPY) else {
+            panic!("n > 128 should be rejected");
+        };
+        assert!(matches!(err, DerecVSSError::InvalidAccessStructure));
+    }
+
+    #[test]
+    fn test_share_accepts_boundary_values() {
+        // t == n == 2  (minimum valid)
+        let shares = share(2, 2, b"secret", ENTROPY).expect("(2,2) should be valid");
+        assert_eq!(shares.len(), 2);
+
+        // n == 128  (maximum valid)
+        let shares = share(2, 128, b"secret", ENTROPY).expect("(2,128) should be valid");
+        assert_eq!(shares.len(), 128);
+    }
+
+    #[test]
+    fn test_share_produces_correct_number_of_shares() {
+        let shares = share(3, 5, b"my secret", ENTROPY).unwrap();
+        assert_eq!(shares.len(), 5);
+    }
+
+    #[test]
+    fn test_share_all_shares_carry_same_commitment_and_ciphertext() {
+        let shares = share(3, 5, b"my secret", ENTROPY).unwrap();
+        let first_commitment = &shares[0].commitment;
+        let first_ciphertext = &shares[0].encrypted_secret;
+        for s in &shares {
+            assert_eq!(&s.commitment, first_commitment, "commitments must match");
+            assert_eq!(
+                &s.encrypted_secret, first_ciphertext,
+                "ciphertexts must match"
+            );
+        }
+    }
+
+    #[test]
+    fn test_share_is_deterministic() {
+        let shares_a = share(3, 5, b"my secret", ENTROPY).unwrap();
+        let shares_b = share(3, 5, b"my secret", ENTROPY).unwrap();
+        for (a, b) in shares_a.iter().zip(shares_b.iter()) {
+            assert_eq!(a.x, b.x);
+            assert_eq!(a.y, b.y);
+            assert_eq!(a.commitment, b.commitment);
+            assert_eq!(a.encrypted_secret, b.encrypted_secret);
+        }
+    }
+
+    #[test]
+    fn test_verify_accepts_all_valid_shares() {
+        let shares = share(3, 5, b"my secret", ENTROPY).unwrap();
+        for s in &shares {
+            assert!(verify(s), "every generated share should verify");
+        }
+    }
+
+    #[test]
+    fn test_verify_rejects_tampered_x_coordinate() {
+        let mut shares = share(3, 5, b"my secret", ENTROPY).unwrap();
+        shares[0].x[0] ^= 0xFF;
+        assert!(!verify(&shares[0]), "tampered x should fail Merkle proof");
+    }
+
+    #[test]
+    fn test_verify_rejects_tampered_y_coordinate() {
+        let mut shares = share(3, 5, b"my secret", ENTROPY).unwrap();
+        shares[0].y[0] ^= 0xFF;
+        assert!(!verify(&shares[0]), "tampered y should fail Merkle proof");
+    }
+
+    #[test]
+    fn test_recover_exact_threshold() {
+        let shares = share(3, 5, b"my secret", ENTROPY).unwrap();
+        let secret = recover(&shares[..3].to_vec()).unwrap();
+        assert_eq!(secret, b"my secret");
+    }
+
+    #[test]
+    fn test_recover_all_shares() {
+        let shares = share(3, 5, b"my secret", ENTROPY).unwrap();
+        let secret = recover(&shares).unwrap();
+        assert_eq!(secret, b"my secret");
+    }
+
+    #[test]
+    fn test_recover_fails_below_threshold() {
+        let shares = share(3, 5, b"my secret", ENTROPY).unwrap();
+        // Only 2 shares with threshold 3 — reconstruction produces the wrong key.
+        let err = recover(&shares[..2].to_vec()).expect_err("recovery below threshold should fail");
+        assert!(matches!(err, DerecVSSError::InsufficientShares));
+    }
+
+    #[test]
+    fn test_recover_detects_inconsistent_commitments() {
+        let mut shares = share(3, 5, b"my secret", ENTROPY).unwrap();
+        // Replace share[1]'s commitment with one from a different run.
+        let other = share(3, 5, b"other secret", ENTROPY).unwrap();
+        shares[1].commitment = other[1].commitment.clone();
+
+        let err = recover(&shares[..3].to_vec())
+            .expect_err("inconsistent commitments should be detected");
+        assert!(matches!(err, DerecVSSError::InconsistentCommitments));
+    }
+
+    #[test]
+    fn test_recover_detects_inconsistent_ciphertexts() {
+        let mut shares = share(3, 5, b"my secret", ENTROPY).unwrap();
+        let other = share(3, 5, b"other secret", ENTROPY).unwrap();
+        shares[1].encrypted_secret = other[1].encrypted_secret.clone();
+
+        let err = recover(&shares[..3].to_vec())
+            .expect_err("inconsistent ciphertexts should be detected");
+        assert!(matches!(err, DerecVSSError::InconsistentCiphertexts));
+    }
+
+    #[test]
+    fn test_recover_detects_corrupt_share() {
+        let mut shares = share(3, 5, b"my secret", ENTROPY).unwrap();
+        shares[0].y[0] ^= 0xFF;
+
+        let err = recover(&shares[..3].to_vec()).expect_err("corrupt share should be detected");
+        assert!(matches!(err, DerecVSSError::CorruptShares));
+    }
+
+    #[test]
+    fn test_encryption_failure_error_message() {
+        let err = DerecVSSError::EncryptionFailure;
+        assert_eq!(err.to_string(), "encryption failed");
+    }
 }

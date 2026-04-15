@@ -81,10 +81,10 @@ This module does **not**:
 ### Example
 
 ```rust
-use derec_cryptography::pairing::envelope::encryption;
+use derec_cryptography::pairing::envelope;
 
-let ciphertext = encryption::encrypt(b"hello", &receiver_pk).unwrap();
-let plaintext = encryption::decrypt(&ciphertext, &receiver_sk).unwrap();
+let ciphertext = envelope::encrypt(b"hello", &receiver_pk).unwrap();
+let plaintext = envelope::decrypt(&ciphertext, &receiver_sk).unwrap();
 ```
 
 ---
