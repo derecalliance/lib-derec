@@ -53,19 +53,15 @@
 //! WebAssembly bindings are primarily intended for integration with TypeScript
 //! applications.
 
-pub mod primitives;
-pub mod state_machine;
-pub mod protocol;
 pub mod derec_message;
+pub mod primitives;
+pub mod protocol;
 pub mod protocol_version;
 pub mod types;
 mod utils;
 
 mod error;
 pub use error::Error;
-
-#[cfg(target_arch = "wasm32")]
-pub(crate) mod ts_bindings_utils;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod ffi;

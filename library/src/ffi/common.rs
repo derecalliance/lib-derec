@@ -231,24 +231,6 @@ pub(crate) fn write_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
-/// Writes an optional length-prefixed byte slice.
-///
-/// Format:
-///
-/// - 1 byte tag:
-///   - `0` → None
-///   - `1` → Some
-/// - if `Some`: length-prefixed bytes
-pub(crate) fn write_optional_len_prefixed(out: &mut Vec<u8>, bytes: Option<&[u8]>) {
-    match bytes {
-        Some(bytes) => {
-            out.push(1);
-            write_len_prefixed(out, bytes);
-        }
-        None => out.push(0),
-    }
-}
-
 /// Writes a `u32` in little-endian format.
 pub(crate) fn write_u32_le(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_le_bytes());
@@ -276,11 +258,6 @@ pub(crate) fn read_exact<'a>(input: &mut &'a [u8], len: usize) -> Result<&'a [u8
     Ok(head)
 }
 
-/// Reads a single byte from the input.
-pub(crate) fn read_u8(input: &mut &[u8]) -> Result<u8, String> {
-    Ok(read_exact(input, 1)?[0])
-}
-
 /// Reads a `u32` in little-endian format.
 pub(crate) fn read_u32_le(input: &mut &[u8]) -> Result<u32, String> {
     let bytes = read_exact(input, 4)?;
@@ -300,23 +277,4 @@ pub(crate) fn read_len_prefixed_vec(input: &mut &[u8]) -> Result<Vec<u8>, String
     let len = read_u32_le(input)? as usize;
     let bytes = read_exact(input, len)?;
     Ok(bytes.to_vec())
-}
-
-/// Reads an optional length-prefixed byte vector.
-///
-/// Format:
-///
-/// - 1 byte tag:
-///   - `0` → None
-///   - `1` → Some
-///
-/// # Errors
-///
-/// Returns an error if the tag is invalid.
-pub(crate) fn read_optional_len_prefixed_vec(input: &mut &[u8]) -> Result<Option<Vec<u8>>, String> {
-    match read_u8(input)? {
-        0 => Ok(None),
-        1 => Ok(Some(read_len_prefixed_vec(input)?)),
-        _ => Err("invalid optional field tag".to_string()),
-    }
 }

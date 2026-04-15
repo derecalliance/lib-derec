@@ -3,7 +3,7 @@
 pub mod request;
 pub mod response;
 
-use crate::ts_bindings_utils::js_error;
+use crate::wasm::ts_bindings_utils::js_error;
 use derec_proto::{CommittedDeRecShare, DeRecShare};
 use prost::Message as _;
 use wasm_bindgen::prelude::*;

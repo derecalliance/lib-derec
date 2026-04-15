@@ -8,7 +8,7 @@ use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{ContactMessage, SenderKind, TransportProtocol};
 use wasm_bindgen::prelude::*;
 
-use crate::ts_bindings_utils::js_error;
+use crate::wasm::ts_bindings_utils::js_error;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct ContactMessageJs {

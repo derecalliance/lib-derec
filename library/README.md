@@ -192,7 +192,7 @@ let request::ProduceResult {
 
 // Step 3 — Initiator extracts the request and produces the response envelope.
 let request::ExtractResult { request } =
-    request::extract(&pair_request_envelope, &initiator_secret_key.ecies_secret_key).unwrap();
+    request::extract(&pair_request_envelope, initiator_secret_key.ecies_secret_key()).unwrap();
 let response::ProduceResult {
     envelope: pair_response_envelope,
     shared_key: initiator_shared_key,
@@ -205,7 +205,7 @@ let response::ProduceResult {
 
 // Step 4 — Responder extracts the response and finalizes pairing.
 let response::ExtractResult { response } =
-    response::extract(&pair_response_envelope, &responder_secret_key.ecies_secret_key).unwrap();
+    response::extract(&pair_response_envelope, responder_secret_key.ecies_secret_key()).unwrap();
 let response::ProcessResult { shared_key: responder_shared_key } =
     response::process(
         &initiator_contact_message,
@@ -313,6 +313,63 @@ let response::RecoverResult { secret_data } = response::recover(
     }],
 ).unwrap();
 ```
+
+---
+
+## Observability
+
+The library emits structured [tracing](https://docs.rs/tracing) spans and events for every protocol step. Instrumentation is **off by default** and opt-in via the `logging` feature flag — enabling it adds no overhead when no subscriber is active.
+
+### Enabling the feature
+
+```toml
+[dependencies]
+derec-library = { version = "0.0.1-alpha.6", features = ["logging"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+```
+
+### Wiring up a subscriber
+
+Initialize a subscriber once, early in your application (e.g. in `main`):
+
+```rust
+tracing_subscriber::fmt()
+    .with_env_filter(
+        tracing_subscriber::EnvFilter::from_env("DEREC_LOG")
+    )
+    .init();
+```
+
+### Controlling the log level at runtime
+
+Set `DEREC_LOG` before running your application:
+
+```bash
+# Protocol milestones only (contact created, pairing complete, share stored, …)
+DEREC_LOG=info ./my-app
+
+# Intermediate state — sizes, versions, channel IDs
+DEREC_LOG=debug ./my-app
+
+# Full detail including byte lengths from the cryptography layer
+DEREC_LOG=trace ./my-app
+
+# Only DeRec events, silence everything else
+DEREC_LOG=derec_library=debug,derec_cryptography=debug ./my-app
+
+# Mix: DeRec at trace, all other crates at warn
+DEREC_LOG=warn,derec_library=trace,derec_cryptography=trace ./my-app
+```
+
+### What is logged
+
+| Level | Content |
+|-------|---------|
+| `info` | Protocol milestones — contact created, pairing complete, share split, share stored, verification result, secret reconstructed |
+| `debug` | Intermediate state — channel IDs, versions, thresholds, response counts |
+| `trace` | Low-level byte lengths from the cryptography layer |
+
+**Security guarantee**: secret bytes, symmetric keys, and share content are never emitted. Only non-sensitive metadata (lengths, identifiers, roles) appears in events.
 
 ---
 

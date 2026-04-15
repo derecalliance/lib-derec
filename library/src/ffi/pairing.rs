@@ -43,10 +43,9 @@
 //! - `SenderKind` is supplied over FFI as its raw `i32` protobuf enum value
 //! - protobuf decoding and protocol validation are delegated to the core Rust SDK
 
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use crate::ffi::common::{
-    DeRecBuffer, DeRecStatus, empty_buffer, err_status, ok_status, read_len_prefixed_vec,
-    read_optional_len_prefixed_vec, vec_into_buffer, write_len_prefixed,
-    write_optional_len_prefixed,
+    DeRecBuffer, DeRecStatus, empty_buffer, err_status, ok_status, vec_into_buffer,
 };
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{ContactMessage, SenderKind, TransportProtocol};
@@ -471,7 +470,7 @@ pub extern "C" fn produce_pairing_response_message(
 
     let request = match crate::primitives::pairing::request::extract(
         pair_request_message_bytes,
-        &pairing_secret_key_material.ecies_secret_key,
+        pairing_secret_key_material.ecies_secret_key(),
     ) {
         Ok(r) => r.request,
         Err(err) => {
@@ -616,7 +615,7 @@ pub extern "C" fn process_pairing_response_message(
 
     let response = match crate::primitives::pairing::response::extract(
         pair_response_message_bytes,
-        &pairing_secret_key_material.ecies_secret_key,
+        pairing_secret_key_material.ecies_secret_key(),
     ) {
         Ok(r) => r.response,
         Err(err) => {
@@ -651,47 +650,16 @@ pub extern "C" fn process_pairing_response_message(
 
 fn serialize_pairing_secret_key_material(sk: &PairingSecretKeyMaterial) -> Vec<u8> {
     let mut out = Vec::new();
-
-    write_optional_len_prefixed(&mut out, sk.mlkem_decapsulation_key.as_deref());
-
-    write_optional_len_prefixed(
-        &mut out,
-        sk.mlkem_shared_secret.as_ref().map(|x| x.as_slice()),
-    );
-
-    write_len_prefixed(&mut out, &sk.ecies_secret_key);
-
+    sk.serialize_uncompressed(&mut out)
+        .expect("PairingSecretKeyMaterial serialization is infallible");
     out
 }
 
 fn deserialize_pairing_secret_key_material(
     bytes: &[u8],
 ) -> Result<PairingSecretKeyMaterial, String> {
-    let mut input = bytes;
-
-    let mlkem_decapsulation_key = read_optional_len_prefixed_vec(&mut input)?;
-
-    let mlkem_shared_secret = match read_optional_len_prefixed_vec(&mut input)? {
-        Some(vec) => {
-            let array: [u8; 32] = vec
-                .try_into()
-                .map_err(|_| "mlkem_shared_secret must be exactly 32 bytes".to_string())?;
-            Some(array)
-        }
-        None => None,
-    };
-
-    let ecies_secret_key = read_len_prefixed_vec(&mut input)?;
-
-    if !input.is_empty() {
-        return Err("unexpected trailing bytes in secret key material".to_string());
-    }
-
-    Ok(PairingSecretKeyMaterial {
-        mlkem_decapsulation_key,
-        mlkem_shared_secret,
-        ecies_secret_key,
-    })
+    PairingSecretKeyMaterial::deserialize_uncompressed(&mut &bytes[..])
+        .map_err(|e| e.to_string())
 }
 
 fn serialize_pairing_shared_key(

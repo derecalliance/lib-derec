@@ -473,10 +473,7 @@ pub extern "C" fn recover_from_share_responses(
             let crate::primitives::recovery::response::ExtractResult { response } =
                 crate::primitives::recovery::response::extract(input.response_bytes.as_slice(), &input.shared_key)
                     .map_err(|e| e.to_string())?;
-            Ok(OwnedRecoveryResponseExtractedInput {
-                response,
-                shared_key: input.shared_key,
-            })
+            Ok(OwnedRecoveryResponseExtractedInput { response })
         })
         .collect();
 
@@ -494,7 +491,6 @@ pub extern "C" fn recover_from_share_responses(
         .iter()
         .map(|input| RecoveryResponseInput {
             share_response: &input.response,
-            shared_key: &input.shared_key,
         })
         .collect();
 
@@ -522,7 +518,6 @@ struct OwnedRecoveryResponseInput {
 
 struct OwnedRecoveryResponseExtractedInput {
     response: derec_proto::GetShareResponseMessage,
-    shared_key: [u8; 32],
 }
 
 fn deserialize_recovery_response_inputs(

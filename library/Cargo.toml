@@ -36,6 +36,7 @@ thiserror = "2.0.18"
 zeroize = "1.8.2"
 subtle = "2.6.1"
 k256 = { version = "0.13.4", features = ["ecdsa"] }
+tracing = { version = "0.1.44", default-features = false, features = ["attributes"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1", features = ["rt"], default-features = false }
@@ -50,6 +51,7 @@ console_error_panic_hook = "0.1.7"
 
 [features]
 primitives = []
+logging = ["dep:tracing"]
 
 [dev-dependencies]
 rand08 = { package = "rand", version = "0.8.5" }

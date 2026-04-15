@@ -106,7 +106,7 @@ pub fn recover(
                 response::extract(&envelope_bytes, &shared_key)
                     .map_err(js_error_from_lib)?;
 
-            Ok(OwnedRecoveryResponseInput { response, shared_key })
+            Ok(OwnedRecoveryResponseInput { response })
         })
         .collect::<Result<_, JsValue>>()?;
 
@@ -114,7 +114,6 @@ pub fn recover(
         .iter()
         .map(|input| RecoveryResponseInput {
             share_response: &input.response,
-            shared_key: &input.shared_key,
         })
         .collect();
 
@@ -132,7 +131,6 @@ struct WasmRecoveryResponseInput {
 
 struct OwnedRecoveryResponseInput {
     response: derec_proto::GetShareResponseMessage,
-    shared_key: [u8; 32],
 }
 
 fn parse_shared_key(shared_key: &[u8]) -> Result<[u8; 32], JsValue> {
