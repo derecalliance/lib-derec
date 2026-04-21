@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    primitives::sharing::{request, response},
-    ts_bindings_utils::{DeRecMessageJs, derec_message_to_js, js_error, js_error_from_lib, js_to_derec_message},
+    primitives::sharing::response,
+    wasm::ts_bindings_utils::{DeRecMessageJs, derec_message_to_js, js_error, js_error_from_lib, js_to_derec_message},
     types::ChannelId,
 };
-use derec_proto::{CommittedDeRecShare, DeRecMessage};
+use derec_proto::DeRecMessage;
 use prost::Message as _;
 use wasm_bindgen::prelude::*;
 

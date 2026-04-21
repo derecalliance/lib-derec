@@ -9,6 +9,14 @@
 
 export { default as init } from "./derec_library.js";
 
+import { DeRecProtocolWasm } from "./derec_library.js";
+
+/** Higher-level protocol orchestrator. Re-exported from the WASM module. */
+export const DeRecProtocol = DeRecProtocolWasm;
+
+/** Mirrors the Rust SenderKind enum used in pairing. */
+export const SenderKind = Object.freeze({ OwnerNonRecovery: 0, OwnerRecovery: 1, Helper: 2 });
+
 import {
   pairing_request_create_contact,
   pairing_request_encode_contact,
@@ -26,6 +34,10 @@ import {
   verification_response_produce,
   verification_response_extract,
   verification_response_process,
+  discovery_request_produce,
+  discovery_request_extract,
+  discovery_response_produce,
+  discovery_response_process,
   recovery_request_produce,
   recovery_response_produce,
   recovery_response_recover,
@@ -64,6 +76,16 @@ export const primitives = {
       produce: verification_response_produce,
       extract: verification_response_extract,
       process: verification_response_process,
+    },
+  },
+  discovery: {
+    request: {
+      produce: discovery_request_produce,
+      extract: discovery_request_extract,
+    },
+    response: {
+      produce: discovery_response_produce,
+      process: discovery_response_process,
     },
   },
   recovery: {

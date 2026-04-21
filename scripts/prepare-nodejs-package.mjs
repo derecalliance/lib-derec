@@ -26,6 +26,9 @@ const sourceReadmePath = path.join(
 );
 const targetReadmePath = path.join(pkgDir, "README.md");
 
+const wasmDir = path.join(repoRoot, "packages", "nodejs", "wasm");
+const indexFiles = ["index.js", "index.d.ts"];
+
 function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -76,6 +79,12 @@ async function main() {
   );
 
   await copyFile(sourceReadmePath, targetReadmePath);
+
+  await Promise.all(
+    indexFiles.map((f) =>
+      copyFile(path.join(wasmDir, f), path.join(pkgDir, f)),
+    ),
+  );
 
   console.log(`Prepared Node.js package at ${pkgDir}`);
 }

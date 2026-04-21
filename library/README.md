@@ -88,6 +88,7 @@ The SDK provides building blocks for the main protocol flows.
 | Pairing | Establish secure communication between owner and helper |
 | Share Distribution | Split and distribute secret shares |
 | Verification | Ensure helpers still possess shares |
+| Discovery | Ask helpers which secrets and versions they store |
 | Recovery | Retrieve shares and reconstruct the secret |
 | Unpairing | Terminate the helper relationship |
 
@@ -282,34 +283,133 @@ assert!(ok);
 
 ---
 
+### Discovery Flow
+
+```rust
+use derec_library::primitives::discovery::{request, response};
+use derec_library::primitives::discovery::response::{SecretVersionEntry, VersionEntry};
+use derec_library::types::ChannelId;
+
+let channel_id = ChannelId(1);
+// shared_key: [u8; 32] established during pairing (in recovery mode)
+
+// Owner side: produce the discovery request.
+let request::ProduceResult { envelope: request_envelope } =
+    request::produce(channel_id, &shared_key).unwrap();
+
+// Helper side: extract the request, enumerate stored secrets, produce the response.
+let _req = request::extract(&request_envelope, &shared_key).unwrap();
+
+let stored: Vec<SecretVersionEntry> = vec![
+    SecretVersionEntry {
+        secret_id: b"wallet_seed".to_vec(),
+        versions: vec![VersionEntry { version: 1, description: "Main wallet".to_owned() }],
+    },
+    SecretVersionEntry {
+        secret_id: b"ssh_key".to_vec(),
+        versions: vec![
+            VersionEntry { version: 1, description: "Work SSH key".to_owned() },
+            VersionEntry { version: 2, description: "Work SSH key v2".to_owned() },
+        ],
+    },
+];
+let response::ProduceResult { envelope: response_envelope } =
+    response::produce(channel_id, &stored, &shared_key).unwrap();
+
+// Owner side: extract and process the response to get the secret list.
+let response::ExtractResult { response } =
+    response::extract(&response_envelope, &shared_key).unwrap();
+let response::ProcessResult { secret_list } =
+    response::process(&response).unwrap();
+
+// Owner now knows which (secret_id, version, description) tuples to request during recovery.
+for entry in &secret_list {
+    for v in &entry.versions {
+        println!("secret_id={:?}  version={}  description={:?}", entry.secret_id, v.version, v.description);
+    }
+}
+```
+
+---
+
 ### Recovery Flow
+
+Recovery is a three-step process: **pairing** (re-establish a channel with each Helper in recovery
+mode), **discovery** (ask each Helper which secrets it holds), and **share collection**
+(reconstruct the secret).
+
+The application drives each step explicitly. Discovery is only triggered after any required
+out-of-band authentication has been completed.
+
+#### Step 1 — Pair with Helpers in recovery mode
+
+```rust
+use derec_library::protocol::{DeRecEvent, DeRecProtocol};
+use derec_proto::{ContactMessage, SenderKind};
+
+// helper_contacts: Vec<ContactMessage> obtained out-of-band (QR code, deep link, etc.)
+// The application pairs with each Helper individually — recovery can take days.
+
+for contact in helper_contacts {
+    owner.start_pairing(SenderKind::OwnerRecovery, contact).await.unwrap();
+}
+
+// Process incoming messages. PairingComplete { kind: SenderKind::OwnerRecovery, .. }
+// signals that recovery pairing with a Helper is done.
+// loop { let events = owner.process(&incoming_bytes).await?; ... }
+```
+
+#### Step 2 — Request discovery after authentication
+
+```rust
+// Once the Helper has authenticated the Owner (out-of-band), request discovery.
+// The Helper reports all (secret_id, version, description) pairs it holds.
+owner.request_discovery(channel_id).await.unwrap();
+
+// Process incoming messages until SecretsDiscovered is received.
+// loop { let events = owner.process(&incoming_bytes).await?; ... }
+//
+// DeRecEvent::SecretsDiscovered { channel_id, secrets } carries
+// Vec<SecretVersionEntry> — each entry has a secret_id and a list of
+// VersionEntry { version, description } so the Owner can identify secrets
+// by their human-readable labels.
+```
+
+#### Step 3 — Reconstruct the secret
+
+```rust
+// After collecting discovery results from enough Helpers, request the shares.
+owner
+    .recover_secret(secret_id, version, &helper_channel_ids)
+    .await
+    .unwrap();
+
+// The library accumulates responses; SecretRecovered is emitted once a
+// threshold of shares have been collected.
+// loop { let events = owner.process(&incoming_bytes).await?; ... }
+```
+
+#### Primitive-level reference (Helper side)
 
 ```rust
 use derec_library::primitives::recovery::{request, response};
 use derec_library::types::ChannelId;
 
 let channel_id = ChannelId(1);
-let secret_id = b"secret_id";
-let version = 1;
 // shared_key: [u8; 32] established during pairing
 
-// Owner side: produce the recovery request.
-let request::ProduceResult { envelope: request_envelope } =
-    request::produce(channel_id, secret_id, version, &shared_key).unwrap();
-
-// Helper side: extract the request, then produce the response.
+// Helper side: extract the share request and produce a response.
 let request::ExtractResult { request } =
     request::extract(&request_envelope, &shared_key).unwrap();
 let response::ProduceResult { envelope: response_envelope } =
     response::produce(channel_id, secret_id, &request, &stored_share_request, &shared_key).unwrap();
 
-// Owner side: aggregate responses from a threshold of helpers and reconstruct the secret.
+// Owner side: aggregate responses from a threshold of helpers and reconstruct.
 let response::RecoverResult { secret_data } = response::recover(
     secret_id,
     version,
     &[response::RecoveryResponseInput {
         share_response: &share_response,
-        shared_key: &shared_key,
     }],
 ).unwrap();
 ```

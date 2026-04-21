@@ -2,9 +2,8 @@
 
 use crate::{
     primitives::sharing::request,
-    ts_bindings_utils::{
+    wasm::ts_bindings_utils::{
         derec_message_js_to_js_value, derec_message_to_js, js_error, js_error_from_lib,
-        js_to_derec_message,
     },
     types::ChannelId,
 };

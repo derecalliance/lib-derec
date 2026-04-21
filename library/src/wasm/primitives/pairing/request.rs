@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    contact_message_to_js, ContactMessageJs, deserialize_pairing_secret_key_material,
-    get_sender_kind, js_to_contact_message, js_to_transport_protocol,
-    serialize_pairing_secret_key_material, TransportProtocolJs,
+    contact_message_to_js, ContactMessageJs, get_sender_kind, js_to_contact_message,
+    js_to_transport_protocol, serialize_pairing_secret_key_material,
 };
 use crate::{
-    primitives::pairing::{request, response},
-    ts_bindings_utils::{DeRecMessageJs, derec_message_to_js, js_error, js_error_from_lib, js_to_derec_message},
+    primitives::pairing::request,
+    wasm::ts_bindings_utils::{DeRecMessageJs, derec_message_to_js, js_error, js_error_from_lib},
 };
 use derec_proto::{ContactMessage, DeRecMessage};
 use prost::Message as _;

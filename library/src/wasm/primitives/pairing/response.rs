@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     primitives::pairing::{request, response},
-    ts_bindings_utils::{DeRecMessageJs, derec_message_to_js, js_error, js_error_from_lib, js_to_derec_message},
+    wasm::ts_bindings_utils::{DeRecMessageJs, derec_message_to_js, js_error, js_error_from_lib, js_to_derec_message},
 };
 use derec_proto::DeRecMessage;
 use prost::Message as _;
@@ -51,7 +51,7 @@ pub fn produce(
     let request_bytes = request_envelope.encode_to_vec();
 
     let request::ExtractResult { request } =
-        request::extract(&request_bytes, &pairing_sk.ecies_secret_key())
+        request::extract(&request_bytes, pairing_sk.ecies_secret_key())
             .map_err(js_error_from_lib)?;
 
     let response::ProduceResult {
@@ -100,7 +100,7 @@ pub fn process(
     let response_bytes = response_envelope.encode_to_vec();
 
     let response::ExtractResult { response } =
-        response::extract(&response_bytes, &pairing_sk.ecies_secret_key())
+        response::extract(&response_bytes, pairing_sk.ecies_secret_key())
             .map_err(js_error_from_lib)?;
 
     let response::ProcessResult { shared_key } =

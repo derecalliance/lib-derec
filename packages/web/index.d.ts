@@ -3,6 +3,129 @@
 /** Initializes the WebAssembly module. Must be called before using any primitives function. */
 export { default as init } from "./derec_library.js";
 
+// ── Store interfaces ──────────────────────────────────────────────────────────
+
+/** Storage for cryptographic secrets (shared keys and pairing secrets). */
+export interface SecretStore {
+  /** kind 0 = SharedKey (32 bytes), kind 1 = PairingSecret (serialized). */
+  load(channelId: string, kind: 0 | 1): Promise<Uint8Array | null | undefined>;
+  save(channelId: string, kind: 0 | 1, value: Uint8Array): Promise<void>;
+  remove(channelId: string, kind: 0 | 1): Promise<void>;
+}
+
+/** Storage for peer contact messages (protobuf-encoded). */
+export interface ContactStore {
+  load(channelId: string): Promise<Uint8Array | null | undefined>;
+  save(channelId: string, contactBytes: Uint8Array): Promise<void>;
+}
+
+/** Storage for secret shares (raw encoded StoreShareRequestMessage bytes). */
+export interface ShareStore {
+  load(channelId: string, secretId: Uint8Array, version: number): Promise<Uint8Array | null | undefined>;
+  save(channelId: string, secretId: Uint8Array, version: number, encoded: Uint8Array): Promise<void>;
+  loadChannelsForSecret(secretId: Uint8Array, version: number): Promise<string[]>;
+  /** Returns Array of [secretId, versions] tuples. */
+  loadSecretsForChannel(channelId: string): Promise<Array<[Uint8Array, number[]]>>;
+}
+
+/** Outbound message delivery. */
+export interface Transport {
+  send(endpoint: { protocol: string; uri: string }, message: Uint8Array): Promise<void>;
+}
+
+// ── Sender kind ───────────────────────────────────────────────────────────────
+
+export enum SenderKind {
+  OwnerNonRecovery = 0,
+  OwnerRecovery = 1,
+  Helper = 2,
+}
+
+// ── Event types ───────────────────────────────────────────────────────────────
+
+export type DeRecEvent =
+  | { type: "PairingComplete"; channel_id: string; kind: SenderKind }
+  | { type: "ShareStored"; channel_id: string; version: number }
+  | { type: "ShareConfirmed"; channel_id: string; version: number }
+  | { type: "ShareVerified"; channel_id: string; version: number }
+  | { type: "SecretsDiscovered"; channel_id: string; secrets: Array<{ secret_id: Uint8Array; versions: Array<{ version: number; description: string }> }> }
+  | { type: "SecretRecovered"; secret: Uint8Array }
+  | { type: "NoOp" };
+
+// ── Higher-level orchestrator ─────────────────────────────────────────────────
+
+/**
+ * Higher-level DeRec protocol orchestrator.
+ *
+ * Wraps all five protocol flows (pairing, sharing, verification, discovery,
+ * recovery). The application feeds incoming wire bytes to `process()` and
+ * reacts to the returned `DeRecEvent` array.
+ *
+ * Call `await init()` before constructing this class.
+ *
+ * # Kind values for `startPairing`
+ * - `SenderKind.OwnerNonRecovery` — standard sharing setup
+ * - `SenderKind.OwnerRecovery` — recovering a lost secret
+ * - `SenderKind.Helper` — accepting a pairing from an Owner
+ */
+export declare class DeRecProtocol {
+  /**
+   * @param contactStore  JS object implementing `ContactStore`.
+   * @param shareStore    JS object implementing `ShareStore`.
+   * @param secretStore   JS object implementing `SecretStore`.
+   * @param transport     JS object implementing `Transport`.
+   * @param ownTransportUri      URI this node advertises to peers (e.g. `"https://me.example.com/derec"`).
+   * @param ownTransportProtocol Protocol string — currently must be `"https"`.
+   */
+  constructor(
+    contactStore: ContactStore,
+    shareStore: ShareStore,
+    secretStore: SecretStore,
+    transport: Transport,
+    ownTransportUri: string,
+    ownTransportProtocol: string,
+  ): DeRecProtocol;
+
+  /** Generate a contact message (QR / deep link payload). Returns raw protobuf bytes. */
+  createContact(channelId?: bigint | null): Promise<Uint8Array>;
+
+  /**
+   * Begin pairing after receiving a peer's contact out-of-band.
+   * @param kind          Role this node plays in the pairing handshake.
+   * @param contactBytes  Raw protobuf bytes of the peer's ContactMessage.
+   */
+  startPairing(kind: SenderKind, contactBytes: Uint8Array): Promise<void>;
+
+  /**
+   * Request discovery from a Helper (step 2 of recovery).
+   * Call after PairingComplete { kind: 1 } and out-of-band authentication.
+   */
+  requestDiscovery(channelId: bigint): Promise<void>;
+
+  /** Split a secret and send one share to each of the specified Helpers. */
+  protectSecret(
+    secretId: Uint8Array,
+    secretData: Uint8Array,
+    description: string,
+    version: number,
+    threshold: number,
+    helpers: bigint[],
+    keepList: number[],
+  ): Promise<void>;
+
+  /** Send verification challenges to all Helpers holding a share for (secretId, version). */
+  verifyShares(secretId: Uint8Array, version: number): Promise<void>;
+
+  /** Request shares from Helpers to recover a secret. Emits SecretRecovered on success. */
+  recoverSecret(secretId: Uint8Array, version: number, helpers: bigint[]): Promise<void>;
+
+  /**
+   * Feed any incoming wire bytes to the protocol.
+   * Returns an array of `DeRecEvent` objects the application should react to.
+   */
+  process(message: Uint8Array): Promise<DeRecEvent[]>;
+}
+
 export declare const primitives: {
   pairing: {
     request: {
@@ -13,11 +136,11 @@ export declare const primitives: {
       /** Deserializes a ContactMessage from raw protobuf bytes. */
       decode_contact(bytes: Uint8Array): any;
       /** Produces a pairing request envelope from a contact message. */
-      produce(kind: number, transport_protocol: any, contact_message: any): any;
+      produce(kind: SenderKind, transport_protocol: any, contact_message: any): any;
     };
     response: {
       /** Produces a pairing response envelope and derives the initiator-side shared key. */
-      produce(kind: number, pair_request: any, pairing_secret_key_material: Uint8Array): any;
+      produce(kind: SenderKind, pair_request: any, pairing_secret_key_material: Uint8Array): any;
       /** Processes a pairing response envelope and derives the responder-side shared key. */
       process(contact_message: any, pair_response: any, pairing_secret_key_material: Uint8Array): any;
     };
@@ -52,6 +175,26 @@ export declare const primitives: {
       extract(response: any, shared_key: Uint8Array): any;
       /** Verifies a verification response (Owner side, step 3). */
       process(response: any, shared_key: Uint8Array, stored_request: any): boolean;
+    };
+  };
+  discovery: {
+    request: {
+      /** Produces a discovery request envelope (Owner side). */
+      produce(channel_id: bigint, shared_key: Uint8Array): any;
+      /** Decodes and decrypts a discovery request envelope (Helper side). */
+      extract(request: any, shared_key: Uint8Array): any;
+    };
+    response: {
+      /**
+       * Produces a discovery response envelope (Helper side).
+       * `secret_list` is an array of `{ secret_id: Uint8Array, versions: [{ version: number, description: string }] }`.
+       */
+      produce(channel_id: bigint, secret_list: Array<{ secret_id: Uint8Array; versions: Array<{ version: number; description: string }> }>, shared_key: Uint8Array): any;
+      /**
+       * Decodes, decrypts, and processes a discovery response (Owner side).
+       * Returns an array of `{ secret_id: Uint8Array, versions: [{ version: number, description: string }] }`.
+       */
+      process(response: any, shared_key: Uint8Array): Array<{ secret_id: Uint8Array; versions: Array<{ version: number; description: string }> }>;
     };
   };
   recovery: {

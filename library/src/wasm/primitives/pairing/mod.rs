@@ -11,7 +11,7 @@ use wasm_bindgen::prelude::*;
 use crate::wasm::ts_bindings_utils::js_error;
 
 #[derive(serde::Serialize, serde::Deserialize)]
-pub(super) struct ContactMessageJs {
+pub(crate) struct ContactMessageJs {
     pub channel_id: String,
     pub transport_protocol: TransportProtocolJs,
     pub nonce: String,
@@ -20,7 +20,7 @@ pub(super) struct ContactMessageJs {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-pub(super) struct TransportProtocolJs {
+pub(crate) struct TransportProtocolJs {
     pub uri: String,
     pub protocol: String,
 }
@@ -47,7 +47,7 @@ pub(super) fn deserialize_pairing_secret_key_material(
         .map_err(|e| js_error("SERIALIZATION_ERROR", e.to_string()))
 }
 
-pub(super) fn js_to_transport_protocol(val: JsValue) -> Result<TransportProtocol, JsValue> {
+pub(crate) fn js_to_transport_protocol(val: JsValue) -> Result<TransportProtocol, JsValue> {
     let input: TransportProtocolInput = serde_wasm_bindgen::from_value(val)
         .map_err(|e| js_error("DECODE_ERROR", e.to_string()))?;
     let protocol = match input.protocol.to_lowercase().as_str() {
@@ -65,7 +65,7 @@ pub(super) fn js_to_transport_protocol(val: JsValue) -> Result<TransportProtocol
     })
 }
 
-pub(super) fn js_to_contact_message(val: JsValue) -> Result<ContactMessage, JsValue> {
+pub(crate) fn js_to_contact_message(val: JsValue) -> Result<ContactMessage, JsValue> {
     let input: ContactMessageJs = serde_wasm_bindgen::from_value(val)
         .map_err(|e| js_error("DECODE_ERROR", e.to_string()))?;
     let channel_id = input
@@ -98,7 +98,7 @@ pub(super) fn js_to_contact_message(val: JsValue) -> Result<ContactMessage, JsVa
     })
 }
 
-pub(super) fn contact_message_to_js(cm: &ContactMessage) -> ContactMessageJs {
+pub(crate) fn contact_message_to_js(cm: &ContactMessage) -> ContactMessageJs {
     let transport_protocol = cm
         .transport_protocol
         .as_ref()
@@ -116,7 +116,7 @@ pub(super) fn contact_message_to_js(cm: &ContactMessage) -> ContactMessageJs {
     }
 }
 
-pub(super) fn transport_protocol_to_js(tp: &TransportProtocol) -> TransportProtocolJs {
+pub(crate) fn transport_protocol_to_js(tp: &TransportProtocol) -> TransportProtocolJs {
     let protocol = match tp.protocol {
         0 => "https".to_owned(),
         n => format!("unknown({n})"),

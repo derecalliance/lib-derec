@@ -14,6 +14,7 @@
 //! - sharing
 //! - verification
 //! - recovery
+//! - discovery
 //!
 //! Each flow defines its own specialized error type, which is converted into
 //! [`Error`] using `From` conversions. This allows public functions to return
@@ -43,6 +44,9 @@ pub enum Error {
 
     #[error(transparent)]
     Recovery(#[from] crate::primitives::recovery::RecoveryError),
+
+    #[error(transparent)]
+    Discovery(#[from] crate::primitives::discovery::DiscoveryError),
 
     #[error(transparent)]
     Sharing(#[from] crate::primitives::sharing::SharingError),

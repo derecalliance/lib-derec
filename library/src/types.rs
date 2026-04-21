@@ -73,7 +73,7 @@ pub type SharedKey = [u8; 32];
 
 /// A secret to be protected by the DeRec protocol.
 ///
-/// Groups the three pieces of information that identify and describe a secret
+/// Groups the pieces of information that identify and describe a secret
 /// throughout its lifecycle — from initial sharing through verification and
 /// recovery.
 ///
@@ -98,4 +98,11 @@ pub struct Secret {
 
     /// Raw secret bytes to be split and distributed.
     pub data: Vec<u8>,
+
+    /// Human-readable label for this secret.
+    ///
+    /// Forwarded to each Helper inside the `StoreShareRequestMessage` so that
+    /// the Helper can present a meaningful name when the Owner later lists
+    /// stored secrets (e.g. during recovery). May be empty.
+    pub description: String,
 }

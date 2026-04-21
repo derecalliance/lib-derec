@@ -5,11 +5,15 @@
     "type": "git",
     "url": "git+https://github.com/derecalliance/lib-derec"
   },
+  "main": "index.js",
+  "types": "index.d.ts",
   "files": [
     "derec_library_bg.wasm",
     "derec_library_bg.wasm.d.ts",
     "derec_library.js",
     "derec_library.d.ts",
+    "index.js",
+    "index.d.ts",
     "README.md",
     "LICENSE"
   ],
