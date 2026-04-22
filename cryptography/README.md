@@ -26,6 +26,7 @@ This crate provides implementations and utilities for:
 - Cryptographic hashing utilities used in the protocol
 - Primitives required by DeRec pairing flows
 - Envelope encryption for message payload protection
+- Replica fingerprint derivation for device-to-device confirmation
 
 The cryptographic constructions rely on well-established cryptographic libraries,
 including:
@@ -85,6 +86,43 @@ use derec_cryptography::pairing::envelope;
 
 let ciphertext = envelope::encrypt(b"hello", &receiver_pk).unwrap();
 let plaintext = envelope::decrypt(&ciphertext, &receiver_sk).unwrap();
+```
+
+---
+
+## Replica Fingerprint
+
+The module `replica` derives a 16-digit decimal fingerprint from the 32-byte
+shared key established during Replica pairing. Both devices display this
+fingerprint so the user can visually confirm they are pairing with the correct
+peer (similar to Bluetooth pairing).
+
+### Algorithm
+
+1. Compute `H = SHA-256(K)` where `K` is the 32-byte shared key.
+2. Split `H` into 16 consecutive 2-byte chunks.
+3. Interpret each chunk as a big-endian `u16`, then compute `digit = value % 10`.
+4. The result is a 16-element array where each element is a single decimal digit (`0..=9`).
+
+Applications may choose any user-friendly rendering format, for example
+`XXXX-XXXX-XXXX-XXXX`.
+
+### Properties
+
+- **Deterministic** — both peers derive the same fingerprint from the same key.
+- **No secret material leaked** — the fingerprint is a lossy hash of the key;
+  it cannot be reversed to recover the shared key.
+
+### Example
+
+```rust
+use derec_cryptography::replica;
+
+let shared_key = [0xABu8; 32];
+let digits = replica::fingerprint(&shared_key);
+
+assert_eq!(digits.len(), 16);
+assert!(digits.iter().all(|&d| d < 10));
 ```
 
 ---

@@ -43,6 +43,103 @@ let msg = ContactMessage::default();
 
 ---
 
+## Schema Overview
+
+### Roles
+
+The protocol defines three roles via the `SenderKind` enum:
+
+| Value | Role | Description |
+|-------|------|-------------|
+| `OWNER_NON_RECOVERY` | Owner | Standard pairing and sharing flows |
+| `OWNER_RECOVERY` | Owner | Re-pairing with Helpers to recover lost secrets |
+| `HELPER` | Helper | Stores shares and responds to Owner requests |
+| `REPLICA` | Replica | Another device belonging to the same Owner, synchronised via dedicated flows |
+
+### Message Files
+
+| File | Messages | Purpose |
+|------|----------|---------|
+| `contact.proto` | `ContactMessage` | Out-of-band bootstrap for the pairing flow |
+| `pair.proto` | `PairRequestMessage`, `PairResponseMessage`, `SenderKind` | Pairing handshake between Owner and Helper (or Replica) |
+| `unpair.proto` | `UnpairRequestMessage`, `UnpairResponseMessage` | Terminate a channel relationship |
+| `storeshare.proto` | `StoreShareRequestMessage`, `StoreShareResponseMessage` | Distribute secret shares to Helpers |
+| `verify.proto` | `VerifyShareRequestMessage`, `VerifyShareResponseMessage` | Challenge-response share verification |
+| `secretidsversions.proto` | `GetSecretIdsVersionsRequestMessage`, `GetSecretIdsVersionsResponseMessage` | Discovery of stored secrets and versions |
+| `getshare.proto` | `GetShareRequestMessage`, `GetShareResponseMessage` | Retrieve shares during recovery |
+| `replica.proto` | Replica Confirmation and Channels Discovery messages | Replica-specific flows (see below) |
+| `derecmessage.proto` | `DeRecMessage`, `MessageBody` | Top-level envelope wrapping all protocol messages |
+| `result.proto` | `DeRecResult`, `StatusEnum` | Shared result/status types |
+| `error.proto` | `ErrorResponseMessage` | Generic error response |
+| `communicationinfo.proto` | `CommunicationInfo` | Application-level identity information |
+| `parameterrange.proto` | `ParameterRange` | Configuration negotiation during pairing |
+| `transportprotocol.proto` | `TransportProtocol` | Endpoint and protocol for message delivery |
+| `committedderecshare.proto` | `CommittedDeRecShare` | Share data with Merkle proof commitment |
+| `derecsecret.proto` | `DeRecSecret` | Secret metadata |
+
+### Replica Messages (`replica.proto`)
+
+The Replica role introduces two new flows, each with its own request/response
+pair. All messages travel inside the encrypted `DeRecMessage` envelope using
+the Owner↔Replica shared key established during pairing.
+
+#### Replica Confirmation
+
+After pairing with `SenderKind::REPLICA`, both devices must verify they share
+the same key by comparing a fingerprint. This flow formalises that exchange.
+
+| Message | Fields | Direction |
+|---------|--------|-----------|
+| `ReplicaConfirmationRequestMessage` | `fingerprint`, `replica_id`, `timestamp` | Initiator → Receiver |
+| `ReplicaConfirmationResponseMessage` | `result`, `replica_id`, `timestamp` | Receiver → Initiator |
+
+The `fingerprint` is a 16-byte value where each byte is a single decimal digit
+(`0`–`9`), derived from the shared key using SHA-256 (see `derec-cryptography`
+for the algorithm). Applications display this fingerprint for user verification.
+
+#### Channels Discovery
+
+Once the Replica channel is confirmed, the Replica requests the list of all
+active Helper channels from the Owner so it can synchronise its local state.
+
+| Message | Fields | Direction |
+|---------|--------|-----------|
+| `ReplicaChannelsDiscoveryRequestMessage` | `last_batch_index`, `timestamp` | Replica → Owner |
+| `ReplicaChannelsDiscoveryResponseMessage` | `total_batches`, `current_batch`, `repeated entries`, `timestamp` | Owner → Replica |
+| `ReplicaChannelsEntry` | `channel_id`, `shared_key` | (nested in response) |
+
+Responses are paginated. The Replica sets `last_batch_index` to `0` for the
+initial request and increments it as batches are received. Each
+`ReplicaChannelsEntry` carries the Helper channel's identifier and its 32-byte
+shared key.
+
+### MessageBody Envelope
+
+All protocol messages are wrapped in the `MessageBody` oneof inside
+`DeRecMessage`. The current variants are:
+
+| Field number | Variant |
+|:---:|---------|
+| 1 | `PairRequestMessage` |
+| 2 | `PairResponseMessage` |
+| 3 | `UnpairRequestMessage` |
+| 4 | `UnpairResponseMessage` |
+| 5 | `StoreShareRequestMessage` |
+| 6 | `StoreShareResponseMessage` |
+| 7 | `VerifyShareRequestMessage` |
+| 8 | `VerifyShareResponseMessage` |
+| 9 | `GetSecretIdsVersionsRequestMessage` |
+| 10 | `GetSecretIdsVersionsResponseMessage` |
+| 11 | `GetShareRequestMessage` |
+| 12 | `GetShareResponseMessage` |
+| 13 | `ErrorResponseMessage` |
+| 14 | `ReplicaConfirmationRequestMessage` |
+| 15 | `ReplicaConfirmationResponseMessage` |
+| 16 | `ReplicaChannelsDiscoveryRequestMessage` |
+| 17 | `ReplicaChannelsDiscoveryResponseMessage` |
+
+---
+
 ## Relationship with other crates
 
 The DeRec Rust implementation is composed of multiple crates:

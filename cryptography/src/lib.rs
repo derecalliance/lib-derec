@@ -47,4 +47,5 @@
 
 pub mod channel;
 pub mod pairing;
+pub mod replica;
 pub mod vss;

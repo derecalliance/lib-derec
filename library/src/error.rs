@@ -55,6 +55,12 @@ pub enum Error {
     Verification(#[from] crate::primitives::verification::VerificationError),
 
     #[error(transparent)]
+    ReplicaConfirmation(#[from] crate::primitives::replica_confirmation::ReplicaConfirmationError),
+
+    #[error(transparent)]
+    ChannelsDiscovery(#[from] crate::primitives::channels_discovery::ChannelsDiscoveryError),
+
+    #[error(transparent)]
     DeRecMessage(#[from] crate::derec_message::DeRecMessageBuilderError),
 
     #[error(transparent)]

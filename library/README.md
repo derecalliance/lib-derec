@@ -56,7 +56,7 @@ derec-library = "0.0.1-alpha.6"
 
 ## Basic Concepts
 
-The protocol involves two primary roles: **Owner** and **Helper**.
+The protocol involves three roles: **Owner**, **Helper**, and **Replica**.
 
 ### Owner
 
@@ -77,6 +77,17 @@ Responsibilities:
 * Respond to verification challenges
 * Provide shares during recovery
 
+### Replica
+
+Another device belonging to the same Owner. A Replica keeps in sync with the
+Owner so that the same secrets are accessible from multiple devices without
+each application inventing its own synchronisation mechanism.
+
+Responsibilities:
+* Pair with the Owner using `SenderKind::Replica`
+* Confirm the pairing via a fingerprint-based manual verification step
+* Discover existing Helper channels and secrets from the Owner
+
 ---
 
 ## Protocol Flows
@@ -85,12 +96,14 @@ The SDK provides building blocks for the main protocol flows.
 
 | Flow | Purpose |
 |------|--------|
-| Pairing | Establish secure communication between owner and helper |
+| Pairing | Establish secure communication between Owner and Helper (or Replica) |
 | Share Distribution | Split and distribute secret shares |
 | Verification | Ensure helpers still possess shares |
 | Discovery | Ask helpers which secrets and versions they store |
 | Recovery | Retrieve shares and reconstruct the secret |
 | Unpairing | Terminate the helper relationship |
+| Replica Confirmation | Verify Owner↔Replica pairing via fingerprint comparison |
+| Channels Discovery | Sync existing Helper channels from Owner to Replica |
 
 
 ## Quick Intro
@@ -412,6 +425,87 @@ let response::RecoverResult { secret_data } = response::recover(
         share_response: &share_response,
     }],
 ).unwrap();
+```
+
+---
+
+### Replica Confirmation Flow
+
+After pairing with `SenderKind::Replica`, the channel is unconfirmed. Both
+devices must verify they share the same key by comparing a fingerprint derived
+from it (similar to Bluetooth pairing).
+
+```rust
+use derec_library::primitives::replica_confirmation::{request, response};
+use derec_library::types::ChannelId;
+
+let channel_id = ChannelId(42);
+// shared_key: [u8; 32] established during Replica pairing
+
+// Initiator: produce the confirmation request and display the fingerprint.
+let request::ProduceResult {
+    envelope: request_envelope,
+    fingerprint,
+} = request::produce(channel_id, &shared_key, 1).unwrap();
+// Display fingerprint to the user, e.g. "1234-5678-9012-3456"
+
+// Receiver: extract the request and verify the fingerprint.
+let request::ExtractResult { request: req } =
+    request::extract(&request_envelope, &shared_key).unwrap();
+request::verify_fingerprint(&req, &shared_key).unwrap();
+
+// Receiver: after the user visually confirms, produce the response.
+let response::ProduceResult { envelope: response_envelope } =
+    response::produce(channel_id, &shared_key, 2).unwrap();
+
+// Initiator: extract and process the response.
+let response::ExtractResult { response: resp } =
+    response::extract(&response_envelope, &shared_key).unwrap();
+let response::ProcessResult { replica_id } =
+    response::process(&resp).unwrap();
+
+// Both parties now know each other's replica_id, channel is confirmed.
+assert_eq!(replica_id, 2);
+```
+
+---
+
+### Channels Discovery Flow
+
+Once the Replica channel is confirmed, the Replica requests all existing
+Helper channels from the Owner so it can participate in the protocol.
+
+```rust
+use derec_library::primitives::channels_discovery::{request, response};
+use derec_library::primitives::channels_discovery::response::ChannelEntry;
+use derec_library::types::ChannelId;
+
+let replica_channel_id = ChannelId(42);
+// replica_shared_key: [u8; 32] established during Replica pairing
+
+// Replica: request channels (initial request, last_batch_index = 0).
+let request::ProduceResult { envelope: request_envelope } =
+    request::produce(replica_channel_id, &replica_shared_key, 0).unwrap();
+
+// Owner: extract the request and enumerate Helper channels.
+let _req = request::extract(&request_envelope, &replica_shared_key).unwrap();
+
+let helper_channels = vec![
+    ChannelEntry { channel_id: ChannelId(100), shared_key: [0xAAu8; 32] },
+    ChannelEntry { channel_id: ChannelId(200), shared_key: [0xBBu8; 32] },
+];
+let response::ProduceResult { envelope: response_envelope } =
+    response::produce(replica_channel_id, &replica_shared_key, &helper_channels, 1, 1).unwrap();
+
+// Replica: extract and process the response.
+let response::ExtractResult { response: resp } =
+    response::extract(&response_envelope, &replica_shared_key).unwrap();
+let response::ProcessResult { total_batches, current_batch, entries } =
+    response::process(&resp).unwrap();
+
+// Replica now has all Helper channel keys and can participate in the protocol.
+assert_eq!(entries.len(), 2);
+assert_eq!(entries[0].channel_id, ChannelId(100));
 ```
 
 ---

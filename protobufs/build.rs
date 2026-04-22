@@ -16,6 +16,7 @@ fn main() {
         proto_root.join("getshare.proto"),
         proto_root.join("pair.proto"),
         proto_root.join("parameterrange.proto"),
+        proto_root.join("replica.proto"),
         proto_root.join("result.proto"),
         proto_root.join("secretidsversions.proto"),
         proto_root.join("storeshare.proto"),

@@ -1,5 +1,109 @@
 // SPDX-License-Identifier: Apache-2.0
 
+// TODO: New Role - Replica
+//
+//   Context:
+//     The system so far has two roles: Owner and Helper.
+//     The Owner is the actor who creates secrets and protects them by creating shares of the
+//     secret and sending those shares to helpers.
+//     Helpers store shares of the secrets so that the owner can recover the secret later by
+//     gathering enough shares one from each helper.
+//     Owner and helpers must first pair with each other by securely agreeing on a shared key that
+//     is used to encrypt and decrypt messages. The relationship betwen an owner and a helper is
+//     called channel and it is idenfied by a channel id. For each relationship Owner and Helper
+//     there is a single channel id and a single shared key.
+//     The protocol ensures that only Owners have secrets and thanks to the shamir secret sharing
+//     schema used, Helpers never get access to the secret.
+//
+//   Challenge:
+//     The challenge this schema poses is that it is fairly common to have users using multiple
+//     devices for accessing different platforms. For example, I might use by Home Banking app from
+//     my browser and from my mobile phone, or my crypto wallet from my browser and my mobile phone
+//     as well.
+//     In cases like this, there must be a secure way to share a given secret between two devices
+//     that belong to the same Owner. In the case of the Private Key of my crypto wallet, I have to
+//     figure out myself how to share the PK from one device to the other, or the app will have to
+//     do that.
+//     This creates a challenge: every app might use a different mechanism, making interoperability
+//     impossible. Eventually, some apps might not apply the same level of security practices or
+//     prevention mechanisms, leading to insercure replication of sensitive information.
+//
+//   Solution:
+//     Include a new role called Replica in the protocol accompanied by a new pairing flow to pair
+//     Owners and replicas. In this way, Owner and replicas will be in sync, since everytime a
+//     secret is created or re-newed, a helper is paired, each replica will sync.
+//
+//   Pairing Flow
+//     The pairing flow should look almost identically to pairing with a helper (SenderKind either
+//     Helper or OwnerNonRecovery), the differnece is that when SenderKind is Replica (this sender
+//     kind must be added) both apps will have an extra confirmation step the user will have to manually
+//     confirm. Very similar to how bluetooth pairing sometimes works (a pairing code is presented
+//     on both devices and the user must validate they are equal and confirm). Pairing in replica
+//     mode can happen only between owner and replica
+//
+//   Replica Confirmation Flow
+//     After an owner and a replica has paired, they would be in NotConfirmed state (this must be
+//     handled at the application level, is not part of the protocol perse). At that point a new
+//     ReplicaConfirmationRequest must be sent by one of the apps (the one that confirms) to the
+//     opther party, and the party must respond with a ReplicaConfirmationResponse.
+//     Since at this point replica and owner have the shared key, messages can be encrypted and
+//     wrapped into a DeRecMesssage enveloper as any other channel message.
+//     On the replica confirmation flow, each party (owner and replica) must share its own replica_id
+//
+//     message ReplicaConfirmationRequest {
+//         bytes fingerprint = 1;
+//         int32 replica_id = 2;
+//         google.protobuf.Timestamp timestamp = 3;
+//     }
+//
+//     message ReplicaConfirmationResponse {
+//         DeRecResult result = 1;
+//         int32 replica_id = 2;
+//         google.protobuf.Timestamp timestamp = 3;
+//     }
+//
+//   Replica fingerprint generation
+//     The shared key used by the protocol is a AES-256 key, therefore 32 bytes long
+//     K = shared key
+//     H = sha2-256(K)
+//
+//     1. Take the first 2 bytes of H, treat them as a uint32 named D, and let D % 10 be the first digit of our fingerprint.
+//     2. Do this also to the next 2 bytes, and so on, to create 16 digits (from the 32 bytes of H).
+//
+//     this will result in a 16 digits number that can be rendered by the appication with some
+//     user-friendly format such as 1111-2222-3333-4444
+//
+//   Channels Discovery
+//     After an owner and a replica have successfully paired, the replica only has a shared key
+//     with the owner, however, it does not know anything about any other channel_id already
+//     established nor any protected secret. In order to haver the replica synced, the replica will
+//     send a ReplicaChannelsDiscoveryRequest message to the owner as soon as they are paired.
+//     The owner will respond with a ReplicaChannelsDiscoveryResponse.
+//
+//     message ReplicaChannelsDiscoveryRequest {
+//         int32 lastBatchIndex = 1;
+//         google.protobuf.Timestamp timestamp = 2;
+//     }
+//
+//     message ReplicaChannelsDiscoveryResponse {
+//         int32 totalBatches = 1;
+//         int32 currentBatch = 2;
+//         repeated ReplicaChannelsEntry entries = 3;
+//         google.protobuf.Timestamp timestamp = 4;
+//     }
+//
+//     message ReplicaChannelsEntry {
+//         int32 channel_id = 1;
+//         bytes shared_key = 2;
+//     }
+//
+//   Secret Discovery
+//     In the same way that a replica does not know anything about other channels after pairing, it
+//     does not anything about shares and versions already protected. The protocol already has a
+//     flow for this that Owners can use after pairing in recovery mode with owners:
+//     GetSecretIdsVersionsRequestMessage and GetSecretIdsVersionsResponseMessage
+//
+
 use crate::primitives::pairing::error::PairingError;
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp},

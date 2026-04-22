@@ -41,6 +41,17 @@ export enum SenderKind {
   Helper = 2,
 }
 
+// ── Contact message ──────────────────────────────────────────────────────────
+
+/** Plain JS representation of a protobuf ContactMessage, as returned by `createContact`. */
+export interface ContactMessage {
+  channel_id: string;
+  nonce: string;
+  transport_protocol: { uri: string; protocol: string };
+  mlkem_encapsulation_key: Uint8Array;
+  ecies_public_key: Uint8Array;
+}
+
 // ── Event types ───────────────────────────────────────────────────────────────
 
 export type DeRecEvent =
@@ -49,6 +60,8 @@ export type DeRecEvent =
   | { type: "ShareConfirmed"; channel_id: string; version: number }
   | { type: "ShareVerified"; channel_id: string; version: number }
   | { type: "SecretsDiscovered"; channel_id: string; secrets: Array<{ secret_id: Uint8Array; versions: Array<{ version: number; description: string }> }> }
+  | { type: "RecoveryShareReceived"; channel_id: string; shares_received: number }
+  | { type: "RecoveryShareError"; channel_id: string; shares_received: number; error: string }
   | { type: "SecretRecovered"; secret: Uint8Array }
   | { type: "NoOp" };
 
@@ -86,15 +99,16 @@ export declare class DeRecProtocol {
     ownTransportProtocol: string,
   ): DeRecProtocol;
 
-  /** Generate a contact message (QR / deep link payload). Returns raw protobuf bytes. */
-  createContact(channelId?: bigint | null): Promise<Uint8Array>;
+  /** Generate a contact message. Returns a plain JS `ContactMessage` object. */
+  createContact(channelId?: bigint | null): Promise<ContactMessage>;
 
   /**
    * Begin pairing after receiving a peer's contact out-of-band.
-   * @param kind          Role this node plays in the pairing handshake.
-   * @param contactBytes  Raw protobuf bytes of the peer's ContactMessage.
+   * @param kind    Role this node plays in the pairing handshake.
+   * @param contact Plain JS `ContactMessage` object (from `createContact` or decoded from protobuf).
+   * @returns The `channel_id` as a `bigint`.
    */
-  startPairing(kind: SenderKind, contactBytes: Uint8Array): Promise<void>;
+  startPairing(kind: SenderKind, contact: ContactMessage): Promise<bigint>;
 
   /**
    * Request discovery from a Helper (step 2 of recovery).

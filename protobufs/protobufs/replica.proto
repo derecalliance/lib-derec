@@ -1,0 +1,166 @@
+/*
+ * Copyright (c) DeRec Alliance and its Contributors.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
+import "result.proto";
+
+package org.derecalliance.derec.protobuf;
+
+// ReplicaConfirmationRequestMessage is sent after an Owner and a Replica have
+// completed the pairing handshake but before the channel is considered trusted.
+//
+// # Purpose
+//
+// This message initiates the manual confirmation step that distinguishes
+// Replica pairing from Helper pairing. The sender transmits a fingerprint
+// derived from the shared key so that the receiving party can verify it
+// matches the fingerprint displayed on their own device.
+//
+// # Preconditions
+//
+// - The sender MUST have completed pairing with SenderKind = REPLICA
+// - The channel MUST have an established shared key
+// - The fingerprint MUST be derived as specified (SHA-256 of shared key,
+//   chunked into 2-byte pairs, each mod 10, yielding 16 decimal digits)
+//
+// # Security Properties
+//
+// - This message travels inside a DeRecMessage envelope encrypted with
+//   the shared key established during pairing
+// - The fingerprint provides an out-of-band human-verifiable binding to
+//   the shared key, protecting against man-in-the-middle attacks
+//
+// # Outcome
+//
+// The receiver verifies the fingerprint matches its locally computed value
+// and replies with a ReplicaConfirmationResponseMessage.
+message ReplicaConfirmationRequestMessage {
+  // Fingerprint derived from the shared key.
+  //
+  // 16 bytes where each byte is a single decimal digit (0-9).
+  // Applications SHOULD render this as XXXX-XXXX-XXXX-XXXX for
+  // user verification.
+  bytes fingerprint = 1;
+
+  // Unique identifier for this replica within the Owner's device set.
+  //
+  // Assigned by the sending application. Both parties exchange their
+  // replica_id during confirmation so that each side can identify the
+  // other in subsequent synchronisation flows.
+  int32 replicaId = 2;
+
+  // Timestamp indicating when this message was created.
+  google.protobuf.Timestamp timestamp = 3;
+}
+
+// ReplicaConfirmationResponseMessage completes the Replica confirmation flow.
+//
+// # Purpose
+//
+// This message is sent in response to a ReplicaConfirmationRequestMessage.
+// It communicates whether the receiving party accepted or rejected the
+// fingerprint verification and, on success, provides the responder's own
+// replica_id.
+//
+// # Semantics
+//
+// - If `result.status` is OK, the Replica channel is considered confirmed
+//   and both parties may proceed with Channels Discovery and Secret Discovery
+// - If `result.status` indicates failure, the channel MUST NOT be used for
+//   synchronisation and SHOULD be torn down
+message ReplicaConfirmationResponseMessage {
+  // Result of the confirmation verification.
+  DeRecResult result = 1;
+
+  // Unique identifier for this replica within the Owner's device set.
+  int32 replicaId = 2;
+
+  // Timestamp indicating when this message was created.
+  google.protobuf.Timestamp timestamp = 3;
+}
+
+// ReplicaChannelsDiscoveryRequestMessage is sent by a Replica to an Owner
+// after the Replica channel has been confirmed.
+//
+// # Purpose
+//
+// A newly paired Replica has no knowledge of existing Helper channels.
+// This message requests the Owner to enumerate all active channels so the
+// Replica can synchronise its local state.
+//
+// # Batching
+//
+// Because the number of channels may be large, the response is paginated.
+// The `lastBatchIndex` field indicates the last batch the Replica has
+// received (-1 or 0 for the initial request), allowing the Owner to resume
+// from the correct offset.
+message ReplicaChannelsDiscoveryRequestMessage {
+  // Index of the last batch successfully received by the Replica.
+  //
+  // Set to 0 for the initial request. The Owner uses this value to
+  // determine which batch to send next.
+  int32 lastBatchIndex = 1;
+
+  // Timestamp indicating when this message was created.
+  google.protobuf.Timestamp timestamp = 2;
+}
+
+// ReplicaChannelsDiscoveryResponseMessage is sent by an Owner in response
+// to a ReplicaChannelsDiscoveryRequestMessage.
+//
+// # Purpose
+//
+// Provides the Replica with a batch of channel entries, each containing
+// the channel identifier and the shared key for that channel.
+//
+// # Security Properties
+//
+// - This message is encrypted inside a DeRecMessage envelope using the
+//   Owner-Replica shared key
+// - The shared_key values within each entry are therefore protected by
+//   the channel encryption layer
+//
+// # Batching
+//
+// - `totalBatches` indicates the total number of batches the Owner will send
+// - `currentBatch` is the 1-based index of this batch
+// - The Replica SHOULD request subsequent batches until
+//   `currentBatch == totalBatches`
+message ReplicaChannelsDiscoveryResponseMessage {
+  // Total number of batches the Owner will send.
+  int32 totalBatches = 1;
+
+  // 1-based index of the current batch.
+  int32 currentBatch = 2;
+
+  // Channel entries in this batch.
+  repeated ReplicaChannelsEntry entries = 3;
+
+  // Timestamp indicating when this message was created.
+  google.protobuf.Timestamp timestamp = 4;
+}
+
+// ReplicaChannelsEntry represents a single Helper channel that the Replica
+// needs to know about.
+//
+// # Fields
+//
+// - `channelId` identifies the logical channel between the Owner and a Helper
+// - `sharedKey` is the symmetric key used to encrypt/decrypt messages on
+//   that channel
+//
+// # Security Note
+//
+// The shared key is highly sensitive material. It MUST only be transmitted
+// inside an encrypted envelope and MUST be stored securely by the Replica.
+message ReplicaChannelsEntry {
+  // Channel identifier for the Owner-Helper relationship.
+  uint64 channelId = 1;
+
+  // Shared symmetric key for the channel (AES-256, 32 bytes).
+  bytes sharedKey = 2;
+}

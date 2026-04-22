@@ -44,6 +44,17 @@ enum SenderKind {
   // Helpers may initiate pairing in some application flows, though the
   // Owner typically acts as the initiator.
   HELPER = 2;
+
+  // Sender is a Replica — another device belonging to the same Owner.
+  //
+  // Replica pairing follows the same cryptographic handshake as Helper
+  // pairing but adds a mandatory manual confirmation step where both
+  // devices display a fingerprint derived from the shared key and the
+  // user must verify they match (similar to Bluetooth pairing).
+  //
+  // After confirmation, the Replica synchronises channel keys and
+  // secret metadata via dedicated discovery flows.
+  REPLICA = 3;
 }
 
 // PairRequestMessage is the first message in the pairing protocol,
