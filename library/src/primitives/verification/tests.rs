@@ -3,19 +3,23 @@
 use crate::{
     Error,
     derec_message::extract_inner_message,
-    types::ChannelId,
     primitives::verification::{
-        request::{extract as extract_verify_share_request, produce as produce_verify_share_request_message},
-        response::{extract as extract_verify_share_response, produce as produce_verify_share_response_message, process as process_verify_share_response_message},
+        request::{
+            extract as extract_verify_share_request,
+            produce as produce_verify_share_request_message,
+        },
+        response::{
+            extract as extract_verify_share_response,
+            process as process_verify_share_response_message,
+            produce as produce_verify_share_response_message,
+        },
     },
+    types::ChannelId,
 };
 use derec_proto::{DeRecMessage, MessageBody, StatusEnum};
 use prost::Message;
 use sha2::{Digest, Sha384};
 
-// ── helpers ──────────────────────────────────────────────────────────────────
-
-/// Run the complete Helper-side request extraction.
 fn parse_request(
     envelope_bytes: &[u8],
     shared_key: &[u8; 32],
@@ -24,23 +28,18 @@ fn parse_request(
         .expect("extract_verify_share_request failed")
 }
 
-// ── produce_verify_share_request_message ─────────────────────────────────────
-
 #[test]
 fn test_produce_verify_share_request_message_produces_non_empty_envelope() {
     let channel_id = ChannelId(7);
     let shared_key = [23u8; 32];
 
-    let result =
-        produce_verify_share_request_message(channel_id, b"my_secret", 5, &shared_key)
-            .expect("failed to produce verification request");
+    let result = produce_verify_share_request_message(channel_id, b"my_secret", 5, &shared_key)
+        .expect("failed to produce verification request");
 
     assert!(!result.envelope.is_empty());
     let decoded = DeRecMessage::decode(result.envelope.as_slice()).unwrap();
     assert_eq!(decoded.channel_id, u64::from(channel_id));
 }
-
-// ── extract_verify_share_request ─────────────────────────────────────────────
 
 #[test]
 fn test_extract_verify_share_request_extracts_all_fields() {
@@ -58,7 +57,10 @@ fn test_extract_verify_share_request_extracts_all_fields() {
 
     assert_eq!(result.request.secret_id, secret_id.as_slice());
     assert_eq!(result.request.version, version);
-    assert_ne!(result.request.nonce, 0, "nonce must be a non-zero random value");
+    assert_ne!(
+        result.request.nonce, 0,
+        "nonce must be a non-zero random value"
+    );
 }
 
 #[test]
@@ -66,9 +68,8 @@ fn test_extract_verify_share_request_nonce_matches_inner_message() {
     let channel_id = ChannelId(2);
     let shared_key = [31u8; 32];
 
-    let produced =
-        produce_verify_share_request_message(channel_id, b"nonce_check", 3, &shared_key)
-            .expect("failed to produce verification request");
+    let produced = produce_verify_share_request_message(channel_id, b"nonce_check", 3, &shared_key)
+        .expect("failed to produce verification request");
 
     let result = extract_verify_share_request(&produced.envelope, &shared_key)
         .expect("failed to extract verification request");
@@ -92,9 +93,8 @@ fn test_extract_verify_share_request_rejects_tampered_timestamp() {
     let channel_id = ChannelId(4);
     let shared_key = [37u8; 32];
 
-    let produced =
-        produce_verify_share_request_message(channel_id, b"secret", 1, &shared_key)
-            .expect("failed to produce verification request");
+    let produced = produce_verify_share_request_message(channel_id, b"secret", 1, &shared_key)
+        .expect("failed to produce verification request");
 
     let outer = DeRecMessage::decode(produced.envelope.as_slice()).unwrap();
     let message = match extract_inner_message(&outer.message, &shared_key)
@@ -129,22 +129,23 @@ fn test_extract_verify_share_request_rejects_tampered_timestamp() {
     ));
 }
 
-// ── produce_verify_share_response_message ───────────────────────────────────────────
-
 #[test]
 fn test_produce_verify_share_response_message_produces_non_empty_envelope() {
     let channel_id = ChannelId(1);
     let shared_key = [7u8; 32];
 
-    let produced =
-        produce_verify_share_request_message(channel_id, b"secret_id", 4, &shared_key)
-            .expect("failed to produce verification request");
+    let produced = produce_verify_share_request_message(channel_id, b"secret_id", 4, &shared_key)
+        .expect("failed to produce verification request");
 
     let req = parse_request(&produced.envelope, &shared_key);
 
-    let response =
-        produce_verify_share_response_message(channel_id, &req.request, &shared_key, b"share_content")
-            .expect("failed to produce verification response");
+    let response = produce_verify_share_response_message(
+        channel_id,
+        &req.request,
+        &shared_key,
+        b"share_content",
+    )
+    .expect("failed to produce verification response");
 
     assert!(!response.envelope.is_empty());
 }
@@ -162,9 +163,13 @@ fn test_produce_verify_share_response_message_echo_fields() {
 
     let req = parse_request(&produced.envelope, &shared_key);
 
-    let response =
-        produce_verify_share_response_message(channel_id, &req.request, &shared_key, b"share_content")
-            .expect("failed to produce verification response");
+    let response = produce_verify_share_response_message(
+        channel_id,
+        &req.request,
+        &shared_key,
+        b"share_content",
+    )
+    .expect("failed to produce verification response");
 
     let response_outer = DeRecMessage::decode(response.envelope.as_slice()).unwrap();
     let response_message = match extract_inner_message(&response_outer.message, &shared_key)
@@ -189,8 +194,6 @@ fn test_produce_verify_share_response_message_echo_fields() {
     assert_eq!(response_outer.timestamp, response_message.timestamp);
 }
 
-// ── full roundtrip ───────────────────────────────────────────────────────────
-
 #[test]
 fn test_full_verification_flow_success() {
     let channel_id = ChannelId(2);
@@ -214,9 +217,8 @@ fn test_full_verification_flow_success() {
             .expect("failed to produce verification response");
 
     // Owner side.
-    let resp_result =
-        extract_verify_share_response(&response.envelope, &shared_key)
-            .expect("failed to extract verification response");
+    let resp_result = extract_verify_share_response(&response.envelope, &shared_key)
+        .expect("failed to extract verification response");
 
     assert!(matches!(
         process_verify_share_response_message(&resp_result.response, share_content),
@@ -243,9 +245,8 @@ fn test_full_verification_flow_wrong_share_returns_false() {
         produce_verify_share_response_message(channel_id, &req.request, &shared_key, share_content)
             .expect("failed to produce verification response");
 
-    let resp_result =
-        extract_verify_share_response(&response.envelope, &shared_key)
-            .expect("failed to extract verification response");
+    let resp_result = extract_verify_share_response(&response.envelope, &shared_key)
+        .expect("failed to extract verification response");
 
     assert!(matches!(
         process_verify_share_response_message(&resp_result.response, wrong_share_content),
@@ -259,9 +260,8 @@ fn test_verification_hash_is_correct_sha384() {
     let shared_key = [3u8; 32];
     let share_content = b"abc123";
 
-    let produced =
-        produce_verify_share_request_message(channel_id, b"secret", 4, &shared_key)
-            .expect("failed to produce verification request");
+    let produced = produce_verify_share_request_message(channel_id, b"secret", 4, &shared_key)
+        .expect("failed to produce verification request");
 
     let req = parse_request(&produced.envelope, &shared_key);
 
@@ -291,9 +291,8 @@ fn test_verification_fails_with_modified_response_nonce() {
     let shared_key = [5u8; 32];
     let share_content = b"nonce_test_content";
 
-    let produced =
-        produce_verify_share_request_message(channel_id, b"secret", 4, &shared_key)
-            .expect("failed to produce verification request");
+    let produced = produce_verify_share_request_message(channel_id, b"secret", 4, &shared_key)
+        .expect("failed to produce verification request");
 
     let req = parse_request(&produced.envelope, &shared_key);
 
@@ -325,9 +324,8 @@ fn test_verification_fails_with_modified_response_nonce() {
         .expect("failed to build tampered response envelope")
         .encode_to_vec();
 
-    let resp_result =
-        extract_verify_share_response(&tampered_envelope, &shared_key)
-            .expect("failed to extract tampered response");
+    let resp_result = extract_verify_share_response(&tampered_envelope, &shared_key)
+        .expect("failed to extract tampered response");
 
     assert!(matches!(
         process_verify_share_response_message(&resp_result.response, share_content),
@@ -335,17 +333,14 @@ fn test_verification_fails_with_modified_response_nonce() {
     ));
 }
 
-// ── process_verify_share_response_message invariant rejections ────────────────────────────────
-
 #[test]
 fn test_process_verify_share_response_message_rejects_tampered_envelope_timestamp() {
     let channel_id = ChannelId(1);
     let shared_key = [13u8; 32];
     let share_content = b"response_timestamp_test_content";
 
-    let produced =
-        produce_verify_share_request_message(channel_id, b"secret", 4, &shared_key)
-            .expect("failed to produce verification request");
+    let produced = produce_verify_share_request_message(channel_id, b"secret", 4, &shared_key)
+        .expect("failed to produce verification request");
 
     let req = parse_request(&produced.envelope, &shared_key);
 
@@ -380,20 +375,19 @@ fn test_process_verify_share_response_message_rejects_tampered_envelope_timestam
 
     assert!(matches!(
         extract_verify_share_response(&tampered_envelope, &shared_key),
-        Err(Error::Invariant("Envelope timestamp does not match response timestamp"))
+        Err(Error::Invariant(
+            "Envelope timestamp does not match response timestamp"
+        ))
     ));
 }
-
-// ── extract_verify_share_response ────────────────────────────────────────────
 
 #[test]
 fn test_extract_verify_share_response_returns_correct_channel_id() {
     let channel_id = ChannelId(7);
     let shared_key = [23u8; 32];
 
-    let produced =
-        produce_verify_share_request_message(channel_id, b"secret", 1, &shared_key)
-            .expect("failed to produce verification request");
+    let produced = produce_verify_share_request_message(channel_id, b"secret", 1, &shared_key)
+        .expect("failed to produce verification request");
     let req = parse_request(&produced.envelope, &shared_key);
     let response =
         produce_verify_share_response_message(channel_id, &req.request, &shared_key, b"share")
@@ -409,18 +403,16 @@ fn test_extract_verify_share_response_returns_encrypted_bytes() {
     let channel_id = ChannelId(3);
     let shared_key = [11u8; 32];
 
-    let produced =
-        produce_verify_share_request_message(channel_id, b"secret", 2, &shared_key)
-            .expect("failed to produce verification request");
+    let produced = produce_verify_share_request_message(channel_id, b"secret", 2, &shared_key)
+        .expect("failed to produce verification request");
     let req = parse_request(&produced.envelope, &shared_key);
-    let response =
-        produce_verify_share_response_message(
-            channel_id,
-            &req.request,
-            &shared_key,
-            b"share_bytes",
-        )
-        .expect("failed to produce verification response");
+    let response = produce_verify_share_response_message(
+        channel_id,
+        &req.request,
+        &shared_key,
+        b"share_bytes",
+    )
+    .expect("failed to produce verification response");
 
     // Encrypted payload in the envelope must be non-empty.
     assert!(!response.envelope.is_empty());
@@ -431,17 +423,15 @@ fn test_extract_verify_share_response_timestamp_matches_inner() {
     let channel_id = ChannelId(2);
     let shared_key = [31u8; 32];
 
-    let produced =
-        produce_verify_share_request_message(channel_id, b"secret", 4, &shared_key)
-            .expect("failed to produce verification request");
+    let produced = produce_verify_share_request_message(channel_id, b"secret", 4, &shared_key)
+        .expect("failed to produce verification request");
     let req = parse_request(&produced.envelope, &shared_key);
     let response =
         produce_verify_share_response_message(channel_id, &req.request, &shared_key, b"some_share")
             .expect("failed to produce verification response");
 
-    let resp_result =
-        extract_verify_share_response(&response.envelope, &shared_key)
-            .expect("failed to extract verification response");
+    let resp_result = extract_verify_share_response(&response.envelope, &shared_key)
+        .expect("failed to extract verification response");
 
     // Cross-check: the inner response timestamp must match the envelope timestamp.
     let response_outer = DeRecMessage::decode(response.envelope.as_slice()).unwrap();

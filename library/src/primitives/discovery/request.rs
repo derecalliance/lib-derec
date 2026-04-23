@@ -7,8 +7,6 @@ use crate::{
 use derec_proto::{DeRecMessage, GetSecretIdsVersionsRequestMessage, MessageBody};
 use prost::Message;
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
 /// Result of [`produce`].
 pub struct ProduceResult {
     /// Serialized outer [`derec_proto::DeRecMessage`] envelope carrying an encrypted
@@ -21,8 +19,6 @@ pub struct ExtractResult {
     /// The decrypted inner [`derec_proto::GetSecretIdsVersionsRequestMessage`].
     pub request: GetSecretIdsVersionsRequestMessage,
 }
-
-// ─── Functions ────────────────────────────────────────────────────────────────
 
 /// Produces a discovery request envelope asking a Helper which secret IDs and
 /// versions it holds for this Owner.

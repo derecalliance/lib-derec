@@ -201,6 +201,97 @@ Console.WriteLine($"Valid: {isValid}");
 
 ---
 
+## Example: Replica Confirmation Flow
+
+After pairing with `SenderKind.Replica`, both sides must confirm the channel by comparing fingerprints out-of-band.
+
+```csharp
+using DeRec.Library;
+using DeRec.Library.Primitives;
+
+// Initiator side: produce the confirmation request
+var request = ReplicaConfirmation.Request.Produce(
+    channelId: 1,
+    sharedKey: sharedKey,
+    replicaId: 42
+);
+// request.Envelope  — the encrypted message to send
+// request.Fingerprint — display this to the user for comparison
+
+// Receiver side: extract and verify the request
+var extracted = ReplicaConfirmation.Request.Extract(
+    request: request.Envelope,
+    sharedKey: sharedKey
+);
+// extracted.ReplicaId — the replica identifier
+// extracted.Fingerprint — display this to the user; must match the initiator's
+
+// Receiver side: send confirmation response after user approval
+DeRecMessage response = ReplicaConfirmation.Response.Produce(
+    channelId: 1,
+    sharedKey: sharedKey,
+    replicaId: extracted.ReplicaId
+);
+
+// Initiator side: process the confirmation response
+var result = ReplicaConfirmation.Response.Process(
+    response: response,
+    sharedKey: sharedKey
+);
+// result.ReplicaId — confirmed replica identifier
+```
+
+---
+
+## Example: Channels Discovery Flow
+
+After replica confirmation, the Replica can request the Owner's Helper channels in paginated batches.
+
+```csharp
+using DeRec.Library;
+using DeRec.Library.Primitives;
+
+// Replica side: request channels starting from batch 0
+DeRecMessage request = ChannelsDiscovery.Request.Produce(
+    channelId: 1,
+    sharedKey: sharedKey,
+    lastBatchIndex: 0
+);
+
+// Owner side: extract the request
+var extracted = ChannelsDiscovery.Request.Extract(
+    request: request,
+    sharedKey: sharedKey
+);
+// extracted.LastBatchIndex — the batch index the Replica already has
+
+// Owner side: respond with a batch of channel entries
+var entries = new List<ChannelsDiscovery.Response.ChannelEntry>
+{
+    new() { ChannelId = 10, SharedKey = helperSharedKey1 },
+    new() { ChannelId = 20, SharedKey = helperSharedKey2 },
+};
+
+DeRecMessage response = ChannelsDiscovery.Response.Produce(
+    channelId: 1,
+    sharedKey: sharedKey,
+    entries: entries,
+    totalBatches: 1,
+    currentBatch: 0
+);
+
+// Replica side: process the response
+var result = ChannelsDiscovery.Response.Process(
+    response: response,
+    sharedKey: sharedKey
+);
+// result.TotalBatches — total number of batches
+// result.CurrentBatch — index of this batch
+// result.Entries — List<ChannelEntry> with ChannelId and SharedKey
+```
+
+---
+
 ## Key Principles
 
 - All protocol messages are opaque `byte[]`

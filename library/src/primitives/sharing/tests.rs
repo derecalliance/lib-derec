@@ -2,8 +2,19 @@ use crate::{
     Error,
     primitives::sharing::{
         SharingError,
-        request::{ExtractResult as ExtractStoreShareRequestResult, ProduceResult as ProduceStoreShareRequestMessageResult, SplitResult, extract as extract_store_share_request, produce as produce_store_share_request_message, split},
-        response::{ExtractResult as ExtractStoreShareResponseResult, ProduceResult as ProduceStoreShareResponseMessageResult, extract as extract_store_share_response, process as process_store_share_response_message, produce as produce_store_share_response_message},
+        request::{
+            ExtractResult as ExtractStoreShareRequestResult,
+            ProduceResult as ProduceStoreShareRequestMessageResult, SplitResult,
+            extract as extract_store_share_request, produce as produce_store_share_request_message,
+            split,
+        },
+        response::{
+            ExtractResult as ExtractStoreShareResponseResult,
+            ProduceResult as ProduceStoreShareResponseMessageResult,
+            extract as extract_store_share_response,
+            process as process_store_share_response_message,
+            produce as produce_store_share_response_message,
+        },
     },
     types::ChannelId,
 };
@@ -12,6 +23,38 @@ use prost::Message;
 
 fn make_channel_ids(ids: &[u64]) -> Vec<ChannelId> {
     ids.iter().map(|&id| ChannelId(id)).collect()
+}
+
+/// Build a valid `StoreShareRequestMessage` with a `CommittedDeRecShare`
+/// that has been mutated by `mutate`. Returns the `StoreShareRequestMessage`
+/// to pass directly to `produce_store_share_response_message`.
+fn make_request_with_mutated_share(
+    mutate: impl FnOnce(&mut CommittedDeRecShare),
+) -> derec_proto::StoreShareRequestMessage {
+    use crate::derec_message::current_timestamp;
+
+    let secret_id = b"test-id";
+    let secret_data = b"test-data";
+    let channels = make_channel_ids(&[1, 2, 3]);
+    let version = 1;
+
+    let SplitResult { mut shares } =
+        split(&channels, secret_id, version, secret_data, 2).expect("split should succeed");
+
+    let channel_id = ChannelId(1);
+    let committed_share = shares.get_mut(&channel_id).expect("missing share");
+    mutate(committed_share);
+
+    let timestamp = current_timestamp();
+    derec_proto::StoreShareRequestMessage {
+        share: committed_share.encode_to_vec(),
+        share_algorithm: 0,
+        version,
+        keep_list: vec![],
+        version_description: String::new(),
+        timestamp: Some(timestamp),
+        secret_id: secret_id.to_vec(),
+    }
 }
 
 #[test]
@@ -120,8 +163,7 @@ fn test_split_valid_sharing() {
     let version = 7;
 
     let SplitResult { shares } =
-        split(&channels, secret_id, version, secret_data, threshold)
-            .expect("split should succeed");
+        split(&channels, secret_id, version, secret_data, threshold).expect("split should succeed");
 
     assert_eq!(
         shares.len(),
@@ -169,8 +211,7 @@ fn test_produce_store_share_request_message_valid() {
     let shared_key = [42u8; 32];
 
     let SplitResult { shares } =
-        split(&channels, secret_id, version, secret_data, threshold)
-            .expect("split should succeed");
+        split(&channels, secret_id, version, secret_data, threshold).expect("split should succeed");
 
     let channel_id = ChannelId(1);
     let committed_share = shares
@@ -204,8 +245,7 @@ fn test_produce_store_share_request_message_with_keep_list_and_description() {
     let shared_key = [7u8; 32];
 
     let SplitResult { shares } =
-        split(&channels, secret_id, version, secret_data, threshold)
-            .expect("split should succeed");
+        split(&channels, secret_id, version, secret_data, threshold).expect("split should succeed");
 
     let channel_id = ChannelId(2);
     let committed_share = shares
@@ -239,25 +279,25 @@ fn test_produce_store_share_response_message_valid() {
     let shared_key = [42u8; 32];
 
     let SplitResult { shares } =
-        split(&channels, secret_id, version, secret_data, threshold)
-            .expect("split should succeed");
+        split(&channels, secret_id, version, secret_data, threshold).expect("split should succeed");
 
     let channel_id = ChannelId(1);
     let committed_share = shares
         .get(&channel_id)
         .expect("missing share for channel 1");
 
-    let ProduceStoreShareRequestMessageResult { envelope: request_envelope } =
-        produce_store_share_request_message(
-            channel_id,
-            version,
-            secret_id,
-            committed_share,
-            &[],
-            "",
-            &shared_key,
-        )
-        .expect("produce_store_share_request_message should succeed");
+    let ProduceStoreShareRequestMessageResult {
+        envelope: request_envelope,
+    } = produce_store_share_request_message(
+        channel_id,
+        version,
+        secret_id,
+        committed_share,
+        &[],
+        "",
+        &shared_key,
+    )
+    .expect("produce_store_share_request_message should succeed");
 
     let ExtractStoreShareRequestResult { request } =
         extract_store_share_request(&request_envelope, &shared_key)
@@ -312,25 +352,25 @@ fn test_extract_store_share_request_wrong_key() {
     let wrong_key = [99u8; 32];
 
     let SplitResult { shares } =
-        split(&channels, secret_id, version, secret_data, threshold)
-            .expect("split should succeed");
+        split(&channels, secret_id, version, secret_data, threshold).expect("split should succeed");
 
     let channel_id = ChannelId(1);
     let committed_share = shares
         .get(&channel_id)
         .expect("missing share for channel 1");
 
-    let ProduceStoreShareRequestMessageResult { envelope: request_envelope } =
-        produce_store_share_request_message(
-            channel_id,
-            version,
-            secret_id,
-            committed_share,
-            &[],
-            "",
-            &shared_key,
-        )
-        .expect("produce_store_share_request_message should succeed");
+    let ProduceStoreShareRequestMessageResult {
+        envelope: request_envelope,
+    } = produce_store_share_request_message(
+        channel_id,
+        version,
+        secret_id,
+        committed_share,
+        &[],
+        "",
+        &shared_key,
+    )
+    .expect("produce_store_share_request_message should succeed");
 
     let result = extract_store_share_request(&request_envelope, &wrong_key);
     assert!(result.is_err(), "should fail with wrong key");
@@ -347,7 +387,10 @@ fn test_split_rejects_duplicate_channels() {
     let result = split(&channels, secret_id, version, secret_data, threshold);
 
     assert!(
-        matches!(result, Err(Error::Sharing(SharingError::DuplicateChannelId(_)))),
+        matches!(
+            result,
+            Err(Error::Sharing(SharingError::DuplicateChannelId(_)))
+        ),
         "expected DuplicateChannelId error"
     );
 }
@@ -363,7 +406,10 @@ fn test_split_rejects_single_duplicate_channel() {
     let result = split(&channels, secret_id, version, secret_data, threshold);
 
     assert!(
-        matches!(result, Err(Error::Sharing(SharingError::DuplicateChannelId(2)))),
+        matches!(
+            result,
+            Err(Error::Sharing(SharingError::DuplicateChannelId(2)))
+        ),
         "expected DuplicateChannelId(2)"
     );
 }
@@ -378,31 +424,35 @@ fn test_process_store_share_response_message_valid() {
     let shared_key = [42u8; 32];
 
     let SplitResult { shares } =
-        split(&channels, secret_id, version, secret_data, threshold)
-            .expect("split should succeed");
+        split(&channels, secret_id, version, secret_data, threshold).expect("split should succeed");
 
     let channel_id = ChannelId(1);
-    let committed_share = shares.get(&channel_id).expect("missing share for channel 1");
+    let committed_share = shares
+        .get(&channel_id)
+        .expect("missing share for channel 1");
 
-    let ProduceStoreShareRequestMessageResult { envelope: request_envelope } =
-        produce_store_share_request_message(
-            channel_id,
-            version,
-            secret_id,
-            committed_share,
-            &[],
-            "",
-            &shared_key,
-        )
-        .expect("produce_store_share_request_message should succeed");
+    let ProduceStoreShareRequestMessageResult {
+        envelope: request_envelope,
+    } = produce_store_share_request_message(
+        channel_id,
+        version,
+        secret_id,
+        committed_share,
+        &[],
+        "",
+        &shared_key,
+    )
+    .expect("produce_store_share_request_message should succeed");
 
     let ExtractStoreShareRequestResult { request } =
         extract_store_share_request(&request_envelope, &shared_key)
             .expect("extract_store_share_request should succeed");
 
-    let ProduceStoreShareResponseMessageResult { envelope: response_envelope, .. } =
-        produce_store_share_response_message(channel_id, &request, &shared_key)
-            .expect("produce_store_share_response_message should succeed");
+    let ProduceStoreShareResponseMessageResult {
+        envelope: response_envelope,
+        ..
+    } = produce_store_share_response_message(channel_id, &request, &shared_key)
+        .expect("produce_store_share_response_message should succeed");
 
     let ExtractStoreShareResponseResult { response } =
         extract_store_share_response(&response_envelope, &shared_key)
@@ -422,31 +472,35 @@ fn test_process_store_share_response_message_wrong_version() {
     let shared_key = [42u8; 32];
 
     let SplitResult { shares } =
-        split(&channels, secret_id, version, secret_data, threshold)
-            .expect("split should succeed");
+        split(&channels, secret_id, version, secret_data, threshold).expect("split should succeed");
 
     let channel_id = ChannelId(1);
-    let committed_share = shares.get(&channel_id).expect("missing share for channel 1");
+    let committed_share = shares
+        .get(&channel_id)
+        .expect("missing share for channel 1");
 
-    let ProduceStoreShareRequestMessageResult { envelope: request_envelope } =
-        produce_store_share_request_message(
-            channel_id,
-            version,
-            secret_id,
-            committed_share,
-            &[],
-            "",
-            &shared_key,
-        )
-        .expect("produce_store_share_request_message should succeed");
+    let ProduceStoreShareRequestMessageResult {
+        envelope: request_envelope,
+    } = produce_store_share_request_message(
+        channel_id,
+        version,
+        secret_id,
+        committed_share,
+        &[],
+        "",
+        &shared_key,
+    )
+    .expect("produce_store_share_request_message should succeed");
 
     let ExtractStoreShareRequestResult { request } =
         extract_store_share_request(&request_envelope, &shared_key)
             .expect("extract_store_share_request should succeed");
 
-    let ProduceStoreShareResponseMessageResult { envelope: response_envelope, .. } =
-        produce_store_share_response_message(channel_id, &request, &shared_key)
-            .expect("produce_store_share_response_message should succeed");
+    let ProduceStoreShareResponseMessageResult {
+        envelope: response_envelope,
+        ..
+    } = produce_store_share_response_message(channel_id, &request, &shared_key)
+        .expect("produce_store_share_response_message should succeed");
 
     let ExtractStoreShareResponseResult { response } =
         extract_store_share_response(&response_envelope, &shared_key)
@@ -468,69 +522,38 @@ fn test_extract_store_share_response_wrong_key() {
     let wrong_key = [99u8; 32];
 
     let SplitResult { shares } =
-        split(&channels, secret_id, version, secret_data, threshold)
-            .expect("split should succeed");
+        split(&channels, secret_id, version, secret_data, threshold).expect("split should succeed");
 
     let channel_id = ChannelId(1);
-    let committed_share = shares.get(&channel_id).expect("missing share for channel 1");
+    let committed_share = shares
+        .get(&channel_id)
+        .expect("missing share for channel 1");
 
-    let ProduceStoreShareRequestMessageResult { envelope: request_envelope } =
-        produce_store_share_request_message(
-            channel_id,
-            version,
-            secret_id,
-            committed_share,
-            &[],
-            "",
-            &shared_key,
-        )
-        .expect("produce_store_share_request_message should succeed");
+    let ProduceStoreShareRequestMessageResult {
+        envelope: request_envelope,
+    } = produce_store_share_request_message(
+        channel_id,
+        version,
+        secret_id,
+        committed_share,
+        &[],
+        "",
+        &shared_key,
+    )
+    .expect("produce_store_share_request_message should succeed");
 
     let ExtractStoreShareRequestResult { request } =
         extract_store_share_request(&request_envelope, &shared_key)
             .expect("extract_store_share_request should succeed");
 
-    let ProduceStoreShareResponseMessageResult { envelope: response_envelope, .. } =
-        produce_store_share_response_message(channel_id, &request, &shared_key)
-            .expect("produce_store_share_response_message should succeed");
+    let ProduceStoreShareResponseMessageResult {
+        envelope: response_envelope,
+        ..
+    } = produce_store_share_response_message(channel_id, &request, &shared_key)
+        .expect("produce_store_share_response_message should succeed");
 
     let result = extract_store_share_response(&response_envelope, &wrong_key);
     assert!(result.is_err(), "should fail with wrong key");
-}
-
-// ── Merkle commitment / path validation ──────────────────────────────────────
-
-/// Build a valid `StoreShareRequestMessage` with a `CommittedDeRecShare`
-/// that has been mutated by `mutate`. Returns the `StoreShareRequestMessage`
-/// to pass directly to `produce_store_share_response_message`.
-fn make_request_with_mutated_share(
-    mutate: impl FnOnce(&mut CommittedDeRecShare),
-) -> derec_proto::StoreShareRequestMessage {
-    use crate::derec_message::current_timestamp;
-
-    let secret_id = b"test-id";
-    let secret_data = b"test-data";
-    let channels = make_channel_ids(&[1, 2, 3]);
-    let version = 1;
-
-    let SplitResult { mut shares } =
-        split(&channels, secret_id, version, secret_data, 2)
-            .expect("split should succeed");
-
-    let channel_id = ChannelId(1);
-    let committed_share = shares.get_mut(&channel_id).expect("missing share");
-    mutate(committed_share);
-
-    let timestamp = current_timestamp();
-    derec_proto::StoreShareRequestMessage {
-        share: committed_share.encode_to_vec(),
-        share_algorithm: 0,
-        version,
-        keep_list: vec![],
-        version_description: String::new(),
-        timestamp: Some(timestamp),
-        secret_id: secret_id.to_vec(),
-    }
 }
 
 #[test]
@@ -543,10 +566,7 @@ fn test_produce_store_share_response_message_rejects_empty_commitment() {
     let channel_id = ChannelId(1);
 
     let result = produce_store_share_response_message(channel_id, &request, &shared_key);
-    assert!(
-        result.is_err(),
-        "should reject share with empty commitment"
-    );
+    assert!(result.is_err(), "should reject share with empty commitment");
 }
 
 #[test]

@@ -9,5 +9,6 @@ public static partial class Pairing
         OwnerNonRecovery = 0,
         OwnerRecovery = 1,
         Helper = 2,
+        Replica = 3,
     }
 }

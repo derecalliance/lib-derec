@@ -4,22 +4,32 @@ use crate::{
     primitives::{
         recovery::{
             RecoveryError,
-            request::{ExtractResult as ExtractGetShareRequestResult, ProduceResult as ProduceGetShareRequestMessageResult, extract as extract_get_share_request, produce as produce_get_share_request_message},
-            response::{ExtractResult as ExtractGetShareResponseResult, ProduceResult as ProduceGetShareResponseMessageResult, RecoverResult as RecoverFromResponsesResult, RecoveryResponseInput, extract as extract_get_share_response, produce as produce_get_share_response_message, recover as recover_from_share_responses},
+            request::{
+                ExtractResult as ExtractGetShareRequestResult,
+                ProduceResult as ProduceGetShareRequestMessageResult,
+                extract as extract_get_share_request, produce as produce_get_share_request_message,
+            },
+            response::{
+                ExtractResult as ExtractGetShareResponseResult,
+                ProduceResult as ProduceGetShareResponseMessageResult,
+                RecoverResult as RecoverFromResponsesResult, RecoveryResponseInput,
+                extract as extract_get_share_response,
+                produce as produce_get_share_response_message,
+                recover as recover_from_share_responses,
+            },
         },
-        sharing::request::{SplitResult, extract as extract_store_share_request, split as sharing_split},
+        sharing::request::{
+            SplitResult, extract as extract_store_share_request, split as sharing_split,
+        },
     },
+    primitives::make_shared_key,
     types::ChannelId,
 };
 use derec_proto::{
-    CommittedDeRecShare, DeRecResult, DeRecShare, GetShareResponseMessage,
-    MessageBody, StatusEnum, StoreShareRequestMessage,
+    CommittedDeRecShare, DeRecResult, DeRecShare, GetShareResponseMessage, MessageBody, StatusEnum,
+    StoreShareRequestMessage,
 };
 use prost::Message;
-
-fn make_shared_key(byte: u8) -> [u8; 32] {
-    [byte; 32]
-}
 
 fn make_channel_ids(ids: &[u64]) -> Vec<ChannelId> {
     ids.iter().copied().map(ChannelId).collect()
@@ -43,8 +53,6 @@ fn create_committed_share_bytes(secret_id: &[u8], version: i32) -> Vec<u8> {
     committed.encode_to_vec()
 }
 
-/// Builds a `GetShareResponseMessage` envelope (wire bytes) ready for use
-/// in `extract_get_share_response`.
 fn create_response_envelope(
     channel_id: ChannelId,
     shared_key: &[u8; 32],
@@ -139,7 +147,8 @@ fn test_produce_get_share_request_message_empty_secret_id() {
     let empty_secret_id = b"";
     let version = 0;
 
-    let result = produce_get_share_request_message(channel_id, empty_secret_id, version, &shared_key);
+    let result =
+        produce_get_share_request_message(channel_id, empty_secret_id, version, &shared_key);
 
     assert!(matches!(
         result,
@@ -154,7 +163,8 @@ fn test_produce_get_share_request_message_invalid_version() {
     let secret_id = b"secret_id";
     let invalid_version = -1;
 
-    let result = produce_get_share_request_message(channel_id, secret_id, invalid_version, &shared_key);
+    let result =
+        produce_get_share_request_message(channel_id, secret_id, invalid_version, &shared_key);
 
     assert!(matches!(
         result,
@@ -171,9 +181,10 @@ fn test_produce_get_share_response_message_empty_committed_share() {
     let secret_id = b"secret_id";
     let version = 0;
 
-    let ProduceGetShareRequestMessageResult { envelope: request_envelope } =
-        produce_get_share_request_message(channel_id, secret_id, version, &shared_key)
-            .expect("request generation should succeed");
+    let ProduceGetShareRequestMessageResult {
+        envelope: request_envelope,
+    } = produce_get_share_request_message(channel_id, secret_id, version, &shared_key)
+        .expect("request generation should succeed");
 
     let ExtractGetShareRequestResult { request } =
         extract_get_share_request(&request_envelope, &shared_key)
@@ -181,9 +192,10 @@ fn test_produce_get_share_response_message_empty_committed_share() {
 
     let stored_share_envelope =
         create_store_share_request_envelope(channel_id, &shared_key, vec![]);
-    let crate::primitives::sharing::request::ExtractResult { request: stored_share_request } =
-        extract_store_share_request(&stored_share_envelope, &shared_key)
-            .expect("extract_store_share_request should succeed");
+    let crate::primitives::sharing::request::ExtractResult {
+        request: stored_share_request,
+    } = extract_store_share_request(&stored_share_envelope, &shared_key)
+        .expect("extract_store_share_request should succeed");
 
     let result = produce_get_share_response_message(
         channel_id,
@@ -564,9 +576,10 @@ fn test_produce_get_share_response_message_stored_share_timestamp_mismatch() {
     let secret_id = b"secret_id";
     let version = 0;
 
-    let ProduceGetShareRequestMessageResult { envelope: request_envelope } =
-        produce_get_share_request_message(channel_id, secret_id, version, &shared_key)
-            .expect("request generation should succeed");
+    let ProduceGetShareRequestMessageResult {
+        envelope: request_envelope,
+    } = produce_get_share_request_message(channel_id, secret_id, version, &shared_key)
+        .expect("request generation should succeed");
 
     let ExtractGetShareRequestResult { request } =
         extract_get_share_request(&request_envelope, &shared_key)
@@ -606,14 +619,24 @@ fn test_produce_get_share_response_message_stored_share_timestamp_mismatch() {
     ));
 
     // Also verify produce_get_share_response_message works with correct stored share
-    let stored_share_envelope =
-        create_store_share_request_envelope(channel_id, &shared_key, create_committed_share_bytes(secret_id, version));
-    let crate::primitives::sharing::request::ExtractResult { request: stored_share_request } =
-        extract_store_share_request(&stored_share_envelope, &shared_key)
-            .expect("extract should succeed");
+    let stored_share_envelope = create_store_share_request_envelope(
+        channel_id,
+        &shared_key,
+        create_committed_share_bytes(secret_id, version),
+    );
+    let crate::primitives::sharing::request::ExtractResult {
+        request: stored_share_request,
+    } = extract_store_share_request(&stored_share_envelope, &shared_key)
+        .expect("extract should succeed");
 
-    let _ = produce_get_share_response_message(channel_id, secret_id, &request, &stored_share_request, &shared_key)
-        .expect("produce_get_share_response_message should succeed with correct data");
+    let _ = produce_get_share_response_message(
+        channel_id,
+        secret_id,
+        &request,
+        &stored_share_request,
+        &shared_key,
+    )
+    .expect("produce_get_share_response_message should succeed with correct data");
 }
 
 #[test]
@@ -624,9 +647,10 @@ fn test_produce_get_share_response_message_secret_id_mismatch() {
     let stored_secret_id = b"other_secret";
     let version = 0;
 
-    let ProduceGetShareRequestMessageResult { envelope: request_envelope } =
-        produce_get_share_request_message(channel_id, requested_secret_id, version, &shared_key)
-            .expect("request generation should succeed");
+    let ProduceGetShareRequestMessageResult {
+        envelope: request_envelope,
+    } = produce_get_share_request_message(channel_id, requested_secret_id, version, &shared_key)
+        .expect("request generation should succeed");
 
     let ExtractGetShareRequestResult { request } =
         extract_get_share_request(&request_envelope, &shared_key)
@@ -637,9 +661,10 @@ fn test_produce_get_share_response_message_secret_id_mismatch() {
         &shared_key,
         create_committed_share_bytes(stored_secret_id, version),
     );
-    let crate::primitives::sharing::request::ExtractResult { request: stored_share_request } =
-        extract_store_share_request(&stored_share_envelope, &shared_key)
-            .expect("extract_store_share_request should succeed");
+    let crate::primitives::sharing::request::ExtractResult {
+        request: stored_share_request,
+    } = extract_store_share_request(&stored_share_envelope, &shared_key)
+        .expect("extract_store_share_request should succeed");
 
     let result = produce_get_share_response_message(
         channel_id,
@@ -663,9 +688,10 @@ fn test_produce_get_share_response_message_version_mismatch() {
     let requested_version = 7;
     let stored_version = 8;
 
-    let ProduceGetShareRequestMessageResult { envelope: request_envelope } =
-        produce_get_share_request_message(channel_id, secret_id, requested_version, &shared_key)
-            .expect("request generation should succeed");
+    let ProduceGetShareRequestMessageResult {
+        envelope: request_envelope,
+    } = produce_get_share_request_message(channel_id, secret_id, requested_version, &shared_key)
+        .expect("request generation should succeed");
 
     let ExtractGetShareRequestResult { request } =
         extract_get_share_request(&request_envelope, &shared_key)
@@ -676,9 +702,10 @@ fn test_produce_get_share_response_message_version_mismatch() {
         &shared_key,
         create_committed_share_bytes(secret_id, stored_version),
     );
-    let crate::primitives::sharing::request::ExtractResult { request: stored_share_request } =
-        extract_store_share_request(&stored_share_envelope, &shared_key)
-            .expect("extract_store_share_request should succeed");
+    let crate::primitives::sharing::request::ExtractResult {
+        request: stored_share_request,
+    } = extract_store_share_request(&stored_share_envelope, &shared_key)
+        .expect("extract_store_share_request should succeed");
 
     let result = produce_get_share_response_message(
         channel_id,
@@ -704,16 +731,16 @@ fn test_recovery_end_to_end() {
     let threshold = 2;
     let version = 2;
 
-    let SplitResult { shares } =
-        sharing_split(&channel_ids, secret_id, version, secret, threshold)
-            .expect("split should succeed");
+    let SplitResult { shares } = sharing_split(&channel_ids, secret_id, version, secret, threshold)
+        .expect("split should succeed");
 
     let mut response_messages: Vec<GetShareResponseMessage> = Vec::new();
 
     for channel_id in &channel_ids {
-        let ProduceGetShareRequestMessageResult { envelope: request_envelope } =
-            produce_get_share_request_message(*channel_id, secret_id, version, &shared_key)
-                .expect("produce_get_share_request_message should succeed");
+        let ProduceGetShareRequestMessageResult {
+            envelope: request_envelope,
+        } = produce_get_share_request_message(*channel_id, secret_id, version, &shared_key)
+            .expect("produce_get_share_request_message should succeed");
 
         let ExtractGetShareRequestResult { request } =
             extract_get_share_request(&request_envelope, &shared_key)
@@ -744,11 +771,14 @@ fn test_recovery_end_to_end() {
             .expect("build should succeed")
             .encode_to_vec();
 
-        let crate::primitives::sharing::request::ExtractResult { request: stored_share_request } =
-            extract_store_share_request(&stored_share_envelope, &shared_key)
-                .expect("extract_store_share_request should succeed");
+        let crate::primitives::sharing::request::ExtractResult {
+            request: stored_share_request,
+        } = extract_store_share_request(&stored_share_envelope, &shared_key)
+            .expect("extract_store_share_request should succeed");
 
-        let ProduceGetShareResponseMessageResult { envelope: response_envelope } = produce_get_share_response_message(
+        let ProduceGetShareResponseMessageResult {
+            envelope: response_envelope,
+        } = produce_get_share_response_message(
             *channel_id,
             secret_id,
             &request,

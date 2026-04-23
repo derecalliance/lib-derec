@@ -13,8 +13,6 @@ use derec_proto::{
 };
 use prost::Message;
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
 /// One stored version of a secret, paired with its human-readable label.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VersionEntry {
@@ -57,8 +55,6 @@ pub struct ProcessResult {
     /// All secrets and their stored versions reported by the Helper.
     pub secret_list: Vec<SecretVersionEntry>,
 }
-
-// ─── Functions ────────────────────────────────────────────────────────────────
 
 /// Produces a discovery response envelope containing the list of secret IDs and
 /// their share versions stored by the Helper for this Owner.

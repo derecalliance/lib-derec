@@ -46,7 +46,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fingerprint_length_and_range() {
+    fn test_fingerprint_length_and_range() {
         let key = [0x42u8; 32];
         let digits = fingerprint(&key);
         assert_eq!(digits.len(), 16);
@@ -56,16 +56,15 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_is_deterministic() {
+    fn test_fingerprint_is_deterministic() {
         let key = [0x07u8; 32];
         assert_eq!(fingerprint(&key), fingerprint(&key));
     }
 
     #[test]
-    fn different_keys_produce_different_fingerprints() {
+    fn test_different_keys_produce_different_fingerprints() {
         let a = fingerprint(&[0x01u8; 32]);
         let b = fingerprint(&[0x02u8; 32]);
         assert_ne!(a, b);
     }
-
 }

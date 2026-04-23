@@ -12,10 +12,8 @@ use derec_proto::{
 };
 use prost::Message;
 
-/// Current share algorithm identifier.
 const SHARE_ALGORITHM_VSS: i32 = 0;
 
-/// Input required to process a single share response during recovery.
 pub struct RecoveryResponseInput<'a> {
     pub share_response: &'a GetShareResponseMessage,
 }
@@ -34,7 +32,6 @@ pub struct ExtractResult {
 
 /// Result of [`recover`].
 pub struct RecoverResult {
-    /// Reconstructed secret bytes.
     pub secret_data: Vec<u8>,
 }
 
@@ -128,7 +125,11 @@ pub fn produce(
 
     if derec_share.version != request.share_version {
         #[cfg(feature = "logging")]
-        tracing::warn!(expected = request.share_version, got = derec_share.version, "version mismatch between request and stored share");
+        tracing::warn!(
+            expected = request.share_version,
+            got = derec_share.version,
+            "version mismatch between request and stored share"
+        );
         return Err(RecoveryError::VersionMismatch {
             expected: request.share_version,
             got: derec_share.version,

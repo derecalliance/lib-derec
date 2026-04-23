@@ -13,8 +13,6 @@ use prost::Message;
 use sha2::{Digest, Sha384};
 use subtle::ConstantTimeEq;
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
 /// Result of [`produce`].
 pub struct ProduceResult {
     /// Serialized outer [`derec_proto::DeRecMessage`] envelope with the encrypted response payload.
@@ -26,8 +24,6 @@ pub struct ExtractResult {
     /// Decrypted inner [`derec_proto::VerifyShareResponseMessage`].
     pub response: VerifyShareResponseMessage,
 }
-
-// ─── Functions ────────────────────────────────────────────────────────────────
 
 /// Creates a verification response envelope answering a DeRec verification challenge.
 ///
@@ -269,8 +265,14 @@ pub fn process(
 
     if result.status != StatusEnum::Ok as i32 {
         #[cfg(feature = "logging")]
-        tracing::warn!(status = result.status, "verification response status is not Ok");
-        return Err(VerificationError::NonOkStatus { status: result.status }.into());
+        tracing::warn!(
+            status = result.status,
+            "verification response status is not Ok"
+        );
+        return Err(VerificationError::NonOkStatus {
+            status: result.status,
+        }
+        .into());
     }
 
     let expected_hash = hash_content(share_content, response.nonce);

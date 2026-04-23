@@ -44,6 +44,7 @@ mod events;
 mod stores;
 
 use crate::{
+    primitives::channels_discovery::response::ChannelEntry,
     protocol::DeRecProtocol,
     types::{ChannelId, Secret},
     wasm::ts_bindings_utils::js_error,
@@ -55,8 +56,6 @@ use stores::{JsContactStore, JsSecretStore, JsShareStore, JsTransport};
 use wasm_bindgen::prelude::*;
 
 type WasmProtocol = DeRecProtocol<JsContactStore, JsShareStore, JsSecretStore, JsTransport>;
-
-// ── DeRecProtocolWasm ─────────────────────────────────────────────────────────
 
 /// Higher-level DeRec protocol orchestrator for TypeScript/JavaScript consumers.
 ///
@@ -234,6 +233,117 @@ impl DeRecProtocolWasm {
             .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
     }
 
+    /// Start the replica confirmation flow by sending a fingerprint to the peer.
+    ///
+    /// Returns a `Uint8Array` containing the 16-digit fingerprint (each byte 0–9)
+    /// for the application to display to the user.
+    ///
+    /// # Arguments
+    ///
+    /// * `channel_id` — BigInt channel identifier from the `PairingComplete` event.
+    /// * `replica_id` — Caller's replica identifier.
+    #[wasm_bindgen(js_name = "startReplicaConfirmation")]
+    pub async fn start_replica_confirmation(
+        &mut self,
+        channel_id: u64,
+        replica_id: i32,
+    ) -> Result<Vec<u8>, JsValue> {
+        let fingerprint = self
+            .inner
+            .start_replica_confirmation(ChannelId(channel_id), replica_id)
+            .await
+            .map_err(|e| js_error("DEREC_ERROR", e.to_string()))?;
+        Ok(fingerprint.to_vec())
+    }
+
+    /// Confirm a Replica channel after the user verified the fingerprint.
+    ///
+    /// # Arguments
+    ///
+    /// * `channel_id` — BigInt channel identifier.
+    /// * `replica_id` — Responder's replica identifier.
+    #[wasm_bindgen(js_name = "confirmReplica")]
+    pub async fn confirm_replica(
+        &mut self,
+        channel_id: u64,
+        replica_id: i32,
+    ) -> Result<(), JsValue> {
+        self.inner
+            .confirm_replica(ChannelId(channel_id), replica_id)
+            .await
+            .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
+    }
+
+    /// Request channels discovery from the Owner on the given Replica channel.
+    ///
+    /// # Arguments
+    ///
+    /// * `channel_id` — BigInt channel identifier.
+    /// * `last_batch_index` — Index of the last batch received (0 for initial request).
+    #[wasm_bindgen(js_name = "requestChannelsDiscovery")]
+    pub async fn request_channels_discovery(
+        &mut self,
+        channel_id: u64,
+        last_batch_index: i32,
+    ) -> Result<(), JsValue> {
+        self.inner
+            .request_channels_discovery(ChannelId(channel_id), last_batch_index)
+            .await
+            .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
+    }
+
+    /// Respond to a channels discovery request from a Replica.
+    ///
+    /// # Arguments
+    ///
+    /// * `channel_id` — BigInt channel identifier of the Replica channel.
+    /// * `entries` — JS array of `{ channel_id: number, shared_key: Uint8Array }` objects.
+    /// * `total_batches` — Total number of batches.
+    /// * `current_batch` — 1-based index of this batch.
+    #[wasm_bindgen(js_name = "respondChannelsDiscovery")]
+    pub async fn respond_channels_discovery(
+        &mut self,
+        channel_id: u64,
+        entries: JsValue,
+        total_batches: i32,
+        current_batch: i32,
+    ) -> Result<(), JsValue> {
+        #[derive(serde::Deserialize)]
+        struct ChannelEntryJs {
+            channel_id: u64,
+            shared_key: Vec<u8>,
+        }
+
+        let entries_js: Vec<ChannelEntryJs> = serde_wasm_bindgen::from_value(entries)
+            .map_err(|e| js_error("WASM_DESERIALIZE_ERROR", e.to_string()))?;
+
+        let channel_entries: Vec<ChannelEntry> = entries_js
+            .into_iter()
+            .map(|e| {
+                let key: [u8; 32] = e.shared_key.as_slice().try_into().map_err(|_| {
+                    js_error(
+                        "INVALID_SHARED_KEY_LENGTH",
+                        "each entry shared_key must be exactly 32 bytes".to_string(),
+                    )
+                })?;
+                Ok(ChannelEntry {
+                    channel_id: ChannelId(e.channel_id),
+                    shared_key: key,
+                })
+            })
+            .collect::<Result<Vec<_>, JsValue>>()?;
+
+        self.inner
+            .respond_channels_discovery(
+                ChannelId(channel_id),
+                &channel_entries,
+                total_batches,
+                current_batch,
+            )
+            .await
+            .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
+    }
+
     /// Split a secret and send one share to each of the specified Helpers.
     ///
     /// # Arguments
@@ -336,8 +446,6 @@ impl DeRecProtocolWasm {
     }
 }
 
-// ── Parsing helpers ───────────────────────────────────────────────────────────
-
 fn parse_optional_channel_id(val: JsValue) -> Result<Option<ChannelId>, JsValue> {
     if val.is_null() || val.is_undefined() {
         return Ok(None);
@@ -389,9 +497,10 @@ fn parse_sender_kind(kind: u32) -> Result<SenderKind, JsValue> {
         0 => Ok(SenderKind::OwnerNonRecovery),
         1 => Ok(SenderKind::OwnerRecovery),
         2 => Ok(SenderKind::Helper),
+        3 => Ok(SenderKind::Replica),
         _ => Err(js_error(
             "INVALID_SENDER_KIND",
-            format!("invalid sender kind: {kind}, must be 0, 1, or 2"),
+            format!("invalid sender kind: {kind}, must be 0, 1, 2, or 3"),
         )),
     }
 }

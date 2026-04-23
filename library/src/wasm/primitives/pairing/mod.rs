@@ -132,6 +132,7 @@ pub(super) fn get_sender_kind(kind: u32) -> Result<SenderKind, JsValue> {
         0 => Ok(SenderKind::OwnerNonRecovery),
         1 => Ok(SenderKind::OwnerRecovery),
         2 => Ok(SenderKind::Helper),
+        3 => Ok(SenderKind::Replica),
         _ => Err(js_error(
             "INVALID_SENDER_KIND",
             format!("invalid sender kind: {kind}"),

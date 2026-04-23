@@ -6,33 +6,20 @@ use crate::{
     primitives::replica_confirmation::{
         ReplicaConfirmationError,
         request::{
-            ExtractResult as ExtractRequestResult,
-            ProduceResult as ProduceRequestResult,
-            extract as extract_request,
-            produce as produce_request,
-            verify_fingerprint,
+            ExtractResult as ExtractRequestResult, ProduceResult as ProduceRequestResult,
+            extract as extract_request, produce as produce_request, verify_fingerprint,
         },
         response::{
-            ExtractResult as ExtractResponseResult,
-            ProcessResult,
-            ProduceResult as ProduceResponseResult,
-            extract as extract_response,
-            process as process_response,
-            produce as produce_response,
+            ExtractResult as ExtractResponseResult, ProcessResult,
+            ProduceResult as ProduceResponseResult, extract as extract_response,
+            process as process_response, produce as produce_response,
         },
     },
+    primitives::make_shared_key,
     types::ChannelId,
 };
-use derec_proto::{
-    DeRecResult, MessageBody, ReplicaConfirmationResponseMessage, StatusEnum,
-};
+use derec_proto::{DeRecResult, MessageBody, ReplicaConfirmationResponseMessage, StatusEnum};
 use prost::Message;
-
-fn make_shared_key(byte: u8) -> [u8; 32] {
-    [byte; 32]
-}
-
-// ─── request::produce ───────────────────────────────────────────────────────
 
 #[test]
 fn test_produce_request_returns_non_empty_envelope_and_fingerprint() {
@@ -42,8 +29,7 @@ fn test_produce_request_returns_non_empty_envelope_and_fingerprint() {
     let ProduceRequestResult {
         envelope,
         fingerprint,
-    } = produce_request(channel_id, &shared_key, 100)
-        .expect("produce should succeed");
+    } = produce_request(channel_id, &shared_key, 100).expect("produce should succeed");
 
     assert!(!envelope.is_empty());
     assert_eq!(fingerprint.len(), 16);
@@ -60,8 +46,6 @@ fn test_produce_request_fingerprint_matches_crypto() {
 
     assert_eq!(fingerprint, expected);
 }
-
-// ─── request::extract ───────────────────────────────────────────────────────
 
 #[test]
 fn test_produce_extract_request_roundtrip() {
@@ -154,8 +138,6 @@ fn test_extract_request_wrong_message_type_fails() {
     ));
 }
 
-// ─── request::verify_fingerprint ────────────────────────────────────────────
-
 #[test]
 fn test_verify_fingerprint_matching_succeeds() {
     let shared_key = make_shared_key(1);
@@ -188,8 +170,6 @@ fn test_verify_fingerprint_mismatch_fails() {
     ));
 }
 
-// ─── response::produce ──────────────────────────────────────────────────────
-
 #[test]
 fn test_produce_response_returns_non_empty_envelope() {
     let channel_id = ChannelId(1);
@@ -200,8 +180,6 @@ fn test_produce_response_returns_non_empty_envelope() {
 
     assert!(!envelope.is_empty());
 }
-
-// ─── response::extract ──────────────────────────────────────────────────────
 
 #[test]
 fn test_produce_extract_response_roundtrip() {
@@ -264,8 +242,6 @@ fn test_extract_response_mismatched_timestamp_fails() {
     ));
 }
 
-// ─── response::process ──────────────────────────────────────────────────────
-
 #[test]
 fn test_process_response_ok_returns_replica_id() {
     let channel_id = ChannelId(1);
@@ -277,8 +253,7 @@ fn test_process_response_ok_returns_replica_id() {
     let ExtractResponseResult { response } =
         extract_response(&envelope, &shared_key).expect("extract should succeed");
 
-    let ProcessResult { replica_id } =
-        process_response(&response).expect("process should succeed");
+    let ProcessResult { replica_id } = process_response(&response).expect("process should succeed");
 
     assert_eq!(replica_id, 99);
 }
@@ -352,8 +327,6 @@ fn test_process_response_non_ok_status_fails() {
     ));
 }
 
-// ─── Full roundtrip ─────────────────────────────────────────────────────────
-
 #[test]
 fn test_full_replica_confirmation_roundtrip() {
     let channel_id = ChannelId(42);
@@ -370,8 +343,7 @@ fn test_full_replica_confirmation_roundtrip() {
 
     // Responder: extract + verify fingerprint
     let ExtractRequestResult { request } =
-        extract_request(&request_envelope, &shared_key)
-            .expect("extract request should succeed");
+        extract_request(&request_envelope, &shared_key).expect("extract request should succeed");
 
     assert_eq!(request.replica_id, initiator_replica_id);
     verify_fingerprint(&request, &shared_key).expect("fingerprint should match");
@@ -388,8 +360,7 @@ fn test_full_replica_confirmation_roundtrip() {
 
     // Initiator: extract + process
     let ExtractResponseResult { response } =
-        extract_response(&response_envelope, &shared_key)
-            .expect("extract response should succeed");
+        extract_response(&response_envelope, &shared_key).expect("extract response should succeed");
 
     let ProcessResult { replica_id } =
         process_response(&response).expect("process response should succeed");

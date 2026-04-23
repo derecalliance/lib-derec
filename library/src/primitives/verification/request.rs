@@ -4,13 +4,9 @@ use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     types::*,
 };
-use derec_proto::{
-    DeRecMessage, MessageBody, VerifyShareRequestMessage,
-};
+use derec_proto::{DeRecMessage, MessageBody, VerifyShareRequestMessage};
 use prost::Message;
 use rand::{Rng, rng};
-
-// ─── Types ────────────────────────────────────────────────────────────────────
 
 /// Result of [`produce`].
 pub struct ProduceResult {
@@ -23,8 +19,6 @@ pub struct ExtractResult {
     /// Decrypted inner [`derec_proto::VerifyShareRequestMessage`].
     pub request: VerifyShareRequestMessage,
 }
-
-// ─── Functions ────────────────────────────────────────────────────────────────
 
 /// Creates a verification request envelope to initiate the DeRec *verification* flow.
 ///

@@ -6,15 +6,11 @@ use crate::protocol::DeRecEvent;
 use crate::wasm::ts_bindings_utils::js_error;
 use wasm_bindgen::JsValue;
 
-// ── Serde shapes ──────────────────────────────────────────────────────────────
-
 #[derive(serde::Serialize)]
 #[serde(tag = "type")]
 enum DeRecEventJs {
     PairingComplete {
-        /// Decimal string representation of the u64 channel ID.
         channel_id: String,
-        /// Numeric sender-kind value: 0=OwnerNonRecovery, 1=OwnerRecovery, 2=Helper.
         kind: u32,
     },
     ShareStored {
@@ -45,6 +41,25 @@ enum DeRecEventJs {
     SecretRecovered {
         secret: Vec<u8>,
     },
+    ReplicaConfirmationReceived {
+        channel_id: String,
+        replica_id: i32,
+        fingerprint: Vec<u8>,
+    },
+    ReplicaConfirmed {
+        channel_id: String,
+        replica_id: i32,
+    },
+    ChannelsDiscoveryRequested {
+        channel_id: String,
+        last_batch_index: i32,
+    },
+    ChannelsDiscovered {
+        channel_id: String,
+        total_batches: i32,
+        current_batch: i32,
+        entries: Vec<ChannelEntryJs>,
+    },
     NoOp,
 }
 
@@ -60,7 +75,11 @@ struct VersionEntryJs {
     description: String,
 }
 
-// ── Conversion ────────────────────────────────────────────────────────────────
+#[derive(serde::Serialize)]
+struct ChannelEntryJs {
+    channel_id: String,
+    shared_key: Vec<u8>,
+}
 
 pub fn event_to_js(event: DeRecEvent) -> Result<JsValue, JsValue> {
     let js_event = match event {
@@ -111,6 +130,39 @@ pub fn event_to_js(event: DeRecEvent) -> Result<JsValue, JsValue> {
             }
         }
         DeRecEvent::SecretRecovered { secret } => DeRecEventJs::SecretRecovered { secret },
+        DeRecEvent::ReplicaConfirmationReceived { channel_id, replica_id, fingerprint } => {
+            DeRecEventJs::ReplicaConfirmationReceived {
+                channel_id: channel_id.0.to_string(),
+                replica_id,
+                fingerprint: fingerprint.to_vec(),
+            }
+        }
+        DeRecEvent::ReplicaConfirmed { channel_id, replica_id } => {
+            DeRecEventJs::ReplicaConfirmed {
+                channel_id: channel_id.0.to_string(),
+                replica_id,
+            }
+        }
+        DeRecEvent::ChannelsDiscoveryRequested { channel_id, last_batch_index } => {
+            DeRecEventJs::ChannelsDiscoveryRequested {
+                channel_id: channel_id.0.to_string(),
+                last_batch_index,
+            }
+        }
+        DeRecEvent::ChannelsDiscovered { channel_id, total_batches, current_batch, entries } => {
+            DeRecEventJs::ChannelsDiscovered {
+                channel_id: channel_id.0.to_string(),
+                total_batches,
+                current_batch,
+                entries: entries
+                    .into_iter()
+                    .map(|e| ChannelEntryJs {
+                        channel_id: e.channel_id.0.to_string(),
+                        shared_key: e.shared_key.to_vec(),
+                    })
+                    .collect(),
+            }
+        }
         DeRecEvent::NoOp => DeRecEventJs::NoOp,
         // `#[non_exhaustive]` — future variants become NoOp so bindings don't break.
         #[allow(unreachable_patterns)]

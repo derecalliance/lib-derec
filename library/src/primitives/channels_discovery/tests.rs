@@ -6,29 +6,20 @@ use crate::{
     primitives::channels_discovery::{
         ChannelsDiscoveryError,
         request::{
-            ExtractResult as ExtractRequestResult,
-            ProduceResult as ProduceRequestResult,
-            extract as extract_request,
-            produce as produce_request,
+            ExtractResult as ExtractRequestResult, ProduceResult as ProduceRequestResult,
+            extract as extract_request, produce as produce_request,
         },
         response::{
-            ChannelEntry,
-            ExtractResult as ExtractResponseResult,
-            ProcessResult,
-            ProduceResult as ProduceResponseResult,
-            extract as extract_response,
-            process as process_response,
-            produce as produce_response,
+            ChannelEntry, ExtractResult as ExtractResponseResult, ProcessResult,
+            ProduceResult as ProduceResponseResult, extract as extract_response,
+            process as process_response, produce as produce_response,
         },
     },
+    primitives::make_shared_key,
     types::ChannelId,
 };
 use derec_proto::{MessageBody, ReplicaChannelsDiscoveryResponseMessage, ReplicaChannelsEntry};
 use prost::Message;
-
-fn make_shared_key(byte: u8) -> [u8; 32] {
-    [byte; 32]
-}
 
 fn make_entries(keys: &[(u64, u8)]) -> Vec<ChannelEntry> {
     keys.iter()
@@ -38,8 +29,6 @@ fn make_entries(keys: &[(u64, u8)]) -> Vec<ChannelEntry> {
         })
         .collect()
 }
-
-// ─── request::produce ───────────────────────────────────────────────────────
 
 #[test]
 fn test_produce_request_returns_non_empty_envelope() {
@@ -51,8 +40,6 @@ fn test_produce_request_returns_non_empty_envelope() {
 
     assert!(!envelope.is_empty());
 }
-
-// ─── request::extract ───────────────────────────────────────────────────────
 
 #[test]
 fn test_produce_extract_request_roundtrip() {
@@ -143,16 +130,13 @@ fn test_extract_request_wrong_message_type_fails() {
     ));
 }
 
-// ─── response::produce ──────────────────────────────────────────────────────
-
 #[test]
 fn test_produce_response_empty_entries_succeeds() {
     let channel_id = ChannelId(1);
     let shared_key = make_shared_key(1);
 
-    let ProduceResponseResult { envelope } =
-        produce_response(channel_id, &shared_key, &[], 1, 1)
-            .expect("produce with empty entries should succeed");
+    let ProduceResponseResult { envelope } = produce_response(channel_id, &shared_key, &[], 1, 1)
+        .expect("produce with empty entries should succeed");
 
     assert!(!envelope.is_empty());
 }
@@ -164,8 +148,7 @@ fn test_produce_response_with_entries_succeeds() {
     let entries = make_entries(&[(10, 0xAA), (20, 0xBB)]);
 
     let ProduceResponseResult { envelope } =
-        produce_response(channel_id, &shared_key, &entries, 1, 1)
-            .expect("produce should succeed");
+        produce_response(channel_id, &shared_key, &entries, 1, 1).expect("produce should succeed");
 
     assert!(!envelope.is_empty());
 }
@@ -200,8 +183,6 @@ fn test_produce_response_invalid_batch_metadata_fails() {
     ));
 }
 
-// ─── response::extract ──────────────────────────────────────────────────────
-
 #[test]
 fn test_produce_extract_response_roundtrip() {
     let channel_id = ChannelId(1);
@@ -209,8 +190,7 @@ fn test_produce_extract_response_roundtrip() {
     let entries = make_entries(&[(10, 0xAA), (20, 0xBB)]);
 
     let ProduceResponseResult { envelope } =
-        produce_response(channel_id, &shared_key, &entries, 2, 1)
-            .expect("produce should succeed");
+        produce_response(channel_id, &shared_key, &entries, 2, 1).expect("produce should succeed");
 
     let ExtractResponseResult { response } =
         extract_response(&envelope, &shared_key).expect("extract should succeed");
@@ -229,8 +209,7 @@ fn test_extract_response_wrong_key_fails() {
     let wrong_key = make_shared_key(2);
 
     let ProduceResponseResult { envelope } =
-        produce_response(channel_id, &shared_key, &[], 1, 1)
-            .expect("produce should succeed");
+        produce_response(channel_id, &shared_key, &[], 1, 1).expect("produce should succeed");
 
     assert!(extract_response(&envelope, &wrong_key).is_err());
 }
@@ -267,8 +246,6 @@ fn test_extract_response_mismatched_timestamp_fails() {
     ));
 }
 
-// ─── response::process ──────────────────────────────────────────────────────
-
 #[test]
 fn test_process_response_returns_entries() {
     let channel_id = ChannelId(1);
@@ -276,8 +253,7 @@ fn test_process_response_returns_entries() {
     let entries = make_entries(&[(10, 0xAA), (20, 0xBB)]);
 
     let ProduceResponseResult { envelope } =
-        produce_response(channel_id, &shared_key, &entries, 1, 1)
-            .expect("produce should succeed");
+        produce_response(channel_id, &shared_key, &entries, 1, 1).expect("produce should succeed");
 
     let ExtractResponseResult { response } =
         extract_response(&envelope, &shared_key).expect("extract should succeed");
@@ -303,8 +279,7 @@ fn test_process_response_empty_entries_succeeds() {
     let shared_key = make_shared_key(1);
 
     let ProduceResponseResult { envelope } =
-        produce_response(channel_id, &shared_key, &[], 1, 1)
-            .expect("produce should succeed");
+        produce_response(channel_id, &shared_key, &[], 1, 1).expect("produce should succeed");
 
     let ExtractResponseResult { response } =
         extract_response(&envelope, &shared_key).expect("extract should succeed");
@@ -423,41 +398,36 @@ fn test_process_response_empty_shared_key_fails() {
     ));
 }
 
-// ─── Full roundtrip ─────────────────────────────────────────────────────────
-
 #[test]
 fn test_full_channels_discovery_roundtrip() {
     let replica_channel_id = ChannelId(42);
     let replica_shared_key = make_shared_key(7);
 
-    let helper_channels = make_entries(&[
-        (100, 0x11),
-        (200, 0x22),
-        (300, 0x33),
-    ]);
+    let helper_channels = make_entries(&[(100, 0x11), (200, 0x22), (300, 0x33)]);
 
     // Replica → Owner: request channels
-    let ProduceRequestResult { envelope: request_envelope } =
-        produce_request(replica_channel_id, &replica_shared_key, 0)
-            .expect("produce request should succeed");
+    let ProduceRequestResult {
+        envelope: request_envelope,
+    } = produce_request(replica_channel_id, &replica_shared_key, 0)
+        .expect("produce request should succeed");
 
     // Owner: extract request
-    let ExtractRequestResult { request } =
-        extract_request(&request_envelope, &replica_shared_key)
-            .expect("extract request should succeed");
+    let ExtractRequestResult { request } = extract_request(&request_envelope, &replica_shared_key)
+        .expect("extract request should succeed");
 
     assert_eq!(request.last_batch_index, 0);
 
     // Owner → Replica: respond with channels (single batch)
-    let ProduceResponseResult { envelope: response_envelope } =
-        produce_response(
-            replica_channel_id,
-            &replica_shared_key,
-            &helper_channels,
-            1,
-            1,
-        )
-        .expect("produce response should succeed");
+    let ProduceResponseResult {
+        envelope: response_envelope,
+    } = produce_response(
+        replica_channel_id,
+        &replica_shared_key,
+        &helper_channels,
+        1,
+        1,
+    )
+    .expect("produce response should succeed");
 
     // Replica: extract + process
     let ExtractResponseResult { response } =
@@ -478,8 +448,6 @@ fn test_full_channels_discovery_roundtrip() {
     assert_eq!(entries[1].channel_id, ChannelId(200));
     assert_eq!(entries[2].channel_id, ChannelId(300));
 }
-
-// ─── Multi-batch roundtrip ──────────────────────────────────────────────────
 
 #[test]
 fn test_multi_batch_channels_discovery() {

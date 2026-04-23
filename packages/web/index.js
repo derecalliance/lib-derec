@@ -15,7 +15,7 @@ import { DeRecProtocolWasm } from "./derec_library.js";
 export const DeRecProtocol = DeRecProtocolWasm;
 
 /** Mirrors the Rust SenderKind enum used in pairing. */
-export const SenderKind = Object.freeze({ OwnerNonRecovery: 0, OwnerRecovery: 1, Helper: 2 });
+export const SenderKind = Object.freeze({ OwnerNonRecovery: 0, OwnerRecovery: 1, Helper: 2, Replica: 3 });
 
 import {
   pairing_request_create_contact,
@@ -41,6 +41,14 @@ import {
   recovery_request_produce,
   recovery_response_produce,
   recovery_response_recover,
+  replica_confirmation_request_produce,
+  replica_confirmation_request_extract,
+  replica_confirmation_response_produce,
+  replica_confirmation_response_process,
+  channels_discovery_request_produce,
+  channels_discovery_request_extract,
+  channels_discovery_response_produce,
+  channels_discovery_response_process,
 } from "./derec_library.js";
 
 export const primitives = {
@@ -95,6 +103,26 @@ export const primitives = {
     response: {
       produce: recovery_response_produce,
       recover: recovery_response_recover,
+    },
+  },
+  replica_confirmation: {
+    request: {
+      produce: replica_confirmation_request_produce,
+      extract: replica_confirmation_request_extract,
+    },
+    response: {
+      produce: replica_confirmation_response_produce,
+      process: replica_confirmation_response_process,
+    },
+  },
+  channels_discovery: {
+    request: {
+      produce: channels_discovery_request_produce,
+      extract: channels_discovery_request_extract,
+    },
+    response: {
+      produce: channels_discovery_response_produce,
+      process: channels_discovery_response_process,
     },
   },
 };

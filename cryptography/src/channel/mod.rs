@@ -134,10 +134,8 @@ mod tests {
         let key = [0u8; 32];
         let nonce = [0u8; 32];
 
-        // let alice sign-then-encrypt the message for bob
         let ctxt = encrypt_message(msg, &key, &nonce).unwrap();
 
-        // let bob decrypt-then-verify the message from alice
         let received = decrypt_message(&ctxt, &key).unwrap();
 
         assert_eq!(received, msg);

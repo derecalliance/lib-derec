@@ -37,16 +37,6 @@ pub struct Set<T>(T);
 /// Start with [`DeRecProtocolBuilder::new`], call each setter, then call
 /// [`build`](DeRecProtocolBuilder::build) once all slots are filled.
 ///
-/// The five type parameters track which slots have been filled:
-///
-/// | Parameter | Slot             |
-/// |-----------|------------------|
-/// | `Cs`      | contact store    |
-/// | `Sh`      | share store      |
-/// | `Ss`      | secret store     |
-/// | `Tr`      | transport        |
-/// | `Ot`      | own transport    |
-///
 /// Each starts as [`Missing`] and becomes [`Set<T>`] after the corresponding
 /// setter is called. `build()` is only available when all five are `Set<_>`.
 pub struct DeRecProtocolBuilder<ContactStore, ShareStore, SecretStore, Transport, OwnTransport> {

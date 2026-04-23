@@ -39,6 +39,7 @@ export enum SenderKind {
   OwnerNonRecovery = 0,
   OwnerRecovery = 1,
   Helper = 2,
+  Replica = 3,
 }
 
 // ── Contact message ──────────────────────────────────────────────────────────
@@ -63,6 +64,10 @@ export type DeRecEvent =
   | { type: "RecoveryShareReceived"; channel_id: string; shares_received: number }
   | { type: "RecoveryShareError"; channel_id: string; shares_received: number; error: string }
   | { type: "SecretRecovered"; secret: Uint8Array }
+  | { type: "ReplicaConfirmationReceived"; channel_id: string; replica_id: number; fingerprint: Uint8Array }
+  | { type: "ReplicaConfirmed"; channel_id: string; replica_id: number }
+  | { type: "ChannelsDiscoveryRequested"; channel_id: string; last_batch_index: number }
+  | { type: "ChannelsDiscovered"; channel_id: string; total_batches: number; current_batch: number; entries: Array<{ channel_id: string; shared_key: Uint8Array }> }
   | { type: "NoOp" };
 
 // ── Higher-level orchestrator ─────────────────────────────────────────────────
@@ -115,6 +120,29 @@ export declare class DeRecProtocol {
    * Call after PairingComplete { kind: 1 } and out-of-band authentication.
    */
   requestDiscovery(channelId: bigint): Promise<void>;
+
+  /**
+   * Start the replica confirmation flow by sending a fingerprint to the peer.
+   * Returns the 16-digit fingerprint (each byte 0–9) for user display.
+   */
+  startReplicaConfirmation(channelId: bigint, replicaId: number): Promise<Uint8Array>;
+
+  /** Confirm a Replica channel after the user verified the fingerprint. */
+  confirmReplica(channelId: bigint, replicaId: number): Promise<void>;
+
+  /**
+   * Request channels discovery from the Owner on the given Replica channel.
+   * Use `lastBatchIndex = 0` for the initial request.
+   */
+  requestChannelsDiscovery(channelId: bigint, lastBatchIndex: number): Promise<void>;
+
+  /** Respond to a channels discovery request from a Replica. */
+  respondChannelsDiscovery(
+    channelId: bigint,
+    entries: Array<{ channel_id: number; shared_key: Uint8Array }>,
+    totalBatches: number,
+    currentBatch: number,
+  ): Promise<void>;
 
   /** Split a secret and send one share to each of the specified Helpers. */
   protectSecret(
@@ -221,6 +249,34 @@ export declare const primitives: {
       produce(secret_id: Uint8Array, channel_id: bigint, stored_share_request: any, request: any, shared_key: Uint8Array): any;
       /** Recovers the original secret from helper recovery responses (Owner side). */
       recover(responses: any, secret_id: Uint8Array, version: number): Uint8Array;
+    };
+  };
+  replica_confirmation: {
+    request: {
+      /** Produces a replica confirmation request envelope. Returns `{ envelope, fingerprint }`. */
+      produce(channel_id: bigint, shared_key: Uint8Array, replica_id: number): { envelope: any; fingerprint: Uint8Array };
+      /** Decodes and verifies a replica confirmation request. Returns `{ replica_id, fingerprint }`. */
+      extract(request: any, shared_key: Uint8Array): { replica_id: number; fingerprint: Uint8Array };
+    };
+    response: {
+      /** Produces a replica confirmation response envelope. */
+      produce(channel_id: bigint, shared_key: Uint8Array, replica_id: number): any;
+      /** Decodes and processes a replica confirmation response. Returns `{ replica_id }`. */
+      process(response: any, shared_key: Uint8Array): { replica_id: number };
+    };
+  };
+  channels_discovery: {
+    request: {
+      /** Produces a channels discovery request envelope. */
+      produce(channel_id: bigint, shared_key: Uint8Array, last_batch_index: number): any;
+      /** Decodes and decrypts a channels discovery request. Returns `{ last_batch_index }`. */
+      extract(request: any, shared_key: Uint8Array): { last_batch_index: number };
+    };
+    response: {
+      /** Produces a channels discovery response envelope. */
+      produce(channel_id: bigint, shared_key: Uint8Array, entries: Array<{ channel_id: number; shared_key: Uint8Array }>, total_batches: number, current_batch: number): any;
+      /** Decodes and processes a channels discovery response. */
+      process(response: any, shared_key: Uint8Array): { total_batches: number; current_batch: number; entries: Array<{ channel_id: number; shared_key: Uint8Array }> };
     };
   };
 };

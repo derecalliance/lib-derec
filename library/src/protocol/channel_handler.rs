@@ -4,10 +4,15 @@ use crate::{
     Error, Result,
     derec_message::extract_inner_message,
     primitives::{
+        channels_discovery::response::{self as channels_discovery_response},
         discovery::response::{self as discovery_response, SecretVersionEntry, VersionEntry},
         recovery::{
             RecoveryError,
             response::{self as recovery_response, RecoveryResponseInput},
+        },
+        replica_confirmation::{
+            request::verify_fingerprint,
+            response::{self as replica_confirmation_response},
         },
         sharing::response::{self as sharing_response},
         verification::response::{self as verification_response},
@@ -18,9 +23,11 @@ use crate::{
 use super::{DeRecContactStore, DeRecEvent, DeRecShareStore, DeRecTransport, PendingRecovery};
 use derec_proto::{
     DeRecMessage, GetSecretIdsVersionsRequestMessage, GetSecretIdsVersionsResponseMessage,
-    GetShareRequestMessage, GetShareResponseMessage, MessageBody, StoreShareRequestMessage,
-    StoreShareResponseMessage, TransportProtocol, VerifyShareRequestMessage,
-    VerifyShareResponseMessage,
+    GetShareRequestMessage, GetShareResponseMessage, MessageBody,
+    ReplicaChannelsDiscoveryRequestMessage, ReplicaChannelsDiscoveryResponseMessage,
+    ReplicaConfirmationRequestMessage, ReplicaConfirmationResponseMessage,
+    StoreShareRequestMessage, StoreShareResponseMessage, TransportProtocol,
+    VerifyShareRequestMessage, VerifyShareResponseMessage,
 };
 use prost::Message;
 
@@ -92,13 +99,27 @@ where
                 self.on_get_share_response(channel_id, &response, shared_key)
                     .await
             }
+            MessageBody::ReplicaConfirmationRequest(request) => {
+                self.on_replica_confirmation_request(channel_id, &request, shared_key)
+                    .await
+            }
+            MessageBody::ReplicaConfirmationResponse(response) => {
+                self.on_replica_confirmation_response(channel_id, &response)
+                    .await
+            }
+            MessageBody::ReplicaChannelsDiscoveryRequest(request) => {
+                self.on_channels_discovery_request(channel_id, &request)
+                    .await
+            }
+            MessageBody::ReplicaChannelsDiscoveryResponse(response) => {
+                self.on_channels_discovery_response(channel_id, &response)
+                    .await
+            }
             _ => Err(Error::Invariant(
                 "unexpected MessageBody variant in channel message",
             )),
         }
     }
-
-    // ── Sharing ───────────────────────────────────────────────────────────────
 
     /// Helper side: received a share storage request, persist and acknowledge.
     #[cfg_attr(
@@ -153,8 +174,6 @@ where
             version,
         }])
     }
-
-    // ── Verification ──────────────────────────────────────────────────────────
 
     /// Helper side: received a verification challenge, load share and respond.
     #[cfg_attr(
@@ -226,8 +245,6 @@ where
             version,
         }])
     }
-
-    // ── Recovery ──────────────────────────────────────────────────────────────
 
     /// Helper side: received a recovery share request, load share and respond.
     #[cfg_attr(
@@ -361,8 +378,6 @@ where
         Ok(events)
     }
 
-    // ── Discovery ─────────────────────────────────────────────────────────────
-
     /// Helper side: received a discovery request, enumerate stored secrets and respond.
     ///
     /// For each `(secret_id, version)` stored for this channel the Helper loads the
@@ -448,7 +463,113 @@ where
         }])
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    /// Receiver side: received a confirmation request, verify fingerprint and
+    /// emit [`DeRecEvent::ReplicaConfirmationReceived`] so the application can
+    /// display the fingerprint for user verification.
+    ///
+    /// The application should call [`super::DeRecProtocol::confirm_replica`] after
+    /// the user confirms the fingerprint matches the peer device.
+    #[cfg_attr(
+        feature = "logging",
+        tracing::instrument(skip_all, fields(channel_id = channel_id.0, replica_id = request.replica_id))
+    )]
+    async fn on_replica_confirmation_request(
+        &mut self,
+        channel_id: ChannelId,
+        request: &ReplicaConfirmationRequestMessage,
+        shared_key: &SharedKey,
+    ) -> Result<Vec<DeRecEvent>> {
+        verify_fingerprint(request, shared_key)?;
+        let fingerprint = derec_cryptography::replica::fingerprint(shared_key);
+
+        #[cfg(feature = "logging")]
+        tracing::info!("replica confirmation request verified — awaiting user confirmation");
+
+        Ok(vec![DeRecEvent::ReplicaConfirmationReceived {
+            channel_id,
+            replica_id: request.replica_id,
+            fingerprint,
+        }])
+    }
+
+    /// Initiator side: received a confirmation response, validate and emit
+    /// [`DeRecEvent::ReplicaConfirmed`] with the peer's replica_id.
+    #[cfg_attr(
+        feature = "logging",
+        tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+    )]
+    async fn on_replica_confirmation_response(
+        &mut self,
+        channel_id: ChannelId,
+        response: &ReplicaConfirmationResponseMessage,
+    ) -> Result<Vec<DeRecEvent>> {
+        let result = replica_confirmation_response::process(response)?;
+
+        #[cfg(feature = "logging")]
+        tracing::info!(replica_id = result.replica_id, "replica confirmed");
+
+        Ok(vec![DeRecEvent::ReplicaConfirmed {
+            channel_id,
+            replica_id: result.replica_id,
+        }])
+    }
+
+    /// Owner side: received a channels discovery request from a Replica.
+    ///
+    /// The Owner cannot enumerate Helper channels from inside the library (that
+    /// is application-level state), so this handler emits [`DeRecEvent::NoOp`]
+    /// and the application is expected to call
+    /// [`super::DeRecProtocol::respond_channels_discovery`] with the channel
+    /// entries.
+    #[cfg_attr(
+        feature = "logging",
+        tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+    )]
+    async fn on_channels_discovery_request(
+        &mut self,
+        channel_id: ChannelId,
+        request: &ReplicaChannelsDiscoveryRequestMessage,
+    ) -> Result<Vec<DeRecEvent>> {
+        #[cfg(feature = "logging")]
+        tracing::info!(
+            last_batch_index = request.last_batch_index,
+            "channels discovery request received — application must respond"
+        );
+
+        Ok(vec![DeRecEvent::ChannelsDiscoveryRequested {
+            channel_id,
+            last_batch_index: request.last_batch_index,
+        }])
+    }
+
+    /// Replica side: received a channels discovery response, validate and emit
+    /// [`DeRecEvent::ChannelsDiscovered`].
+    #[cfg_attr(
+        feature = "logging",
+        tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+    )]
+    async fn on_channels_discovery_response(
+        &mut self,
+        channel_id: ChannelId,
+        response: &ReplicaChannelsDiscoveryResponseMessage,
+    ) -> Result<Vec<DeRecEvent>> {
+        let result = channels_discovery_response::process(response)?;
+
+        #[cfg(feature = "logging")]
+        tracing::info!(
+            total_batches = result.total_batches,
+            current_batch = result.current_batch,
+            entries_count = result.entries.len(),
+            "channels discovered"
+        );
+
+        Ok(vec![DeRecEvent::ChannelsDiscovered {
+            channel_id,
+            total_batches: result.total_batches,
+            current_batch: result.current_batch,
+            entries: result.entries,
+        }])
+    }
 
     async fn peer_endpoint(&mut self, channel_id: ChannelId) -> Result<TransportProtocol> {
         self.contact_store

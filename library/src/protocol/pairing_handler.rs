@@ -80,6 +80,8 @@ where
     ///   `request.sender_kind == Helper` → respond as `OwnerNonRecovery`.
     /// - **Recovery pairing**: the Helper created the contact; a recovering Owner sent
     ///   the request. `request.sender_kind == OwnerRecovery` → respond as `Helper`.
+    /// - **Replica pairing**: one Owner device created the contact; the other sent the
+    ///   request. `request.sender_kind == Replica` → respond as `Replica`.
     #[cfg_attr(
         feature = "logging",
         tracing::instrument(skip_all, fields(channel_id = channel_id.0))
@@ -94,6 +96,9 @@ where
         let (response_kind, my_kind) = if request.sender_kind == SenderKind::OwnerRecovery as i32 {
             // Recovering Owner sent the request → I am the Helper responding.
             (SenderKind::Helper, SenderKind::Helper)
+        } else if request.sender_kind == SenderKind::Replica as i32 {
+            // Replica sent the request → I am the Owner responding as Replica.
+            (SenderKind::Replica, SenderKind::Replica)
         } else {
             // Helper sent the request → I am the Owner responding.
             (SenderKind::OwnerNonRecovery, SenderKind::OwnerNonRecovery)
@@ -140,6 +145,8 @@ where
     /// - **Recovery pairing**: the recovering Owner sent the request and receives
     ///   the Helper's response. `response.sender_kind == Helper` → my kind is
     ///   `OwnerRecovery`.
+    /// - **Replica pairing**: the Replica sent the request and receives the Owner's
+    ///   response. `response.sender_kind == Replica` → my kind is `Replica`.
     #[cfg_attr(
         feature = "logging",
         tracing::instrument(skip_all, fields(channel_id = channel_id.0))
@@ -169,6 +176,9 @@ where
         let my_kind = if response.sender_kind == SenderKind::Helper as i32 {
             // Helper responded → I am the recovering Owner.
             SenderKind::OwnerRecovery
+        } else if response.sender_kind == SenderKind::Replica as i32 {
+            // Replica responded → I am the Replica that initiated the pairing.
+            SenderKind::Replica
         } else {
             // Owner responded → I am the Helper.
             SenderKind::Helper

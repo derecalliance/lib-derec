@@ -24,12 +24,20 @@ mod pairing_handler;
 
 use crate::{
     Error, Result,
+    primitives::channels_discovery::{
+        request::produce as produce_channels_discovery_request,
+        response::{ChannelEntry, produce as produce_channels_discovery_response},
+    },
     primitives::discovery::request::produce as produce_discovery_request,
     primitives::discovery::response::SecretVersionEntry,
     primitives::pairing::request::{
         create_contact as create_contact_message, produce as produce_pairing_request_message,
     },
     primitives::recovery::request::produce as produce_get_share_request_message,
+    primitives::replica_confirmation::{
+        request::produce as produce_replica_confirmation_request,
+        response::produce as produce_replica_confirmation_response,
+    },
     primitives::sharing::request::{produce as produce_store_share_request_message, split},
     primitives::verification::request::produce as produce_verify_share_request_message,
     types::{ChannelId, Secret},
@@ -73,6 +81,10 @@ pub enum DeRecEvent {
     ///   [`DeRecProtocol::verify_shares`] as needed.
     /// - [`SenderKind::Helper`] — the Helper side completed pairing; no
     ///   additional action is required (the Helper waits for incoming messages).
+    /// - [`SenderKind::Replica`] — a Replica pairing completed; the channel is
+    ///   unconfirmed. The application should initiate the Replica confirmation
+    ///   flow (fingerprint verification) before proceeding with channels or
+    ///   secret discovery.
     PairingComplete { channel_id: ChannelId, kind: SenderKind },
 
     /// A share was accepted and stored locally (Helper side).
@@ -125,6 +137,52 @@ pub enum DeRecEvent {
 
     /// Recovery completed — the reconstructed secret is returned exactly once.
     SecretRecovered { secret: Vec<u8> },
+
+    /// A replica confirmation request was received (receiver side).
+    ///
+    /// The fingerprint has been cryptographically validated against the shared
+    /// key. The application should display `fingerprint` to the user for visual
+    /// comparison with the initiator's device. If the user confirms the match,
+    /// call [`DeRecProtocol::confirm_replica`] to complete the handshake.
+    ReplicaConfirmationReceived {
+        channel_id: ChannelId,
+        /// The peer's replica identifier.
+        replica_id: i32,
+        /// 16-digit fingerprint (each byte 0–9) for user display.
+        fingerprint: [u8; 16],
+    },
+
+    /// Replica confirmation completed (initiator side).
+    ///
+    /// Emitted after the peer's confirmation response is received and validated.
+    /// The application may now proceed with
+    /// [`DeRecProtocol::request_channels_discovery`] or secret discovery.
+    ReplicaConfirmed {
+        channel_id: ChannelId,
+        /// The peer's replica identifier within the Owner's device set.
+        replica_id: i32,
+    },
+
+    /// A Replica requested channels discovery (Owner side).
+    ///
+    /// The application should enumerate all active Helper channels and call
+    /// [`DeRecProtocol::respond_channels_discovery`] with the entries.
+    ChannelsDiscoveryRequested {
+        channel_id: ChannelId,
+        last_batch_index: i32,
+    },
+
+    /// A batch of Helper channel entries was received from the Owner (Replica side).
+    ///
+    /// The Replica should persist the entries and, if `current_batch < total_batches`,
+    /// request the next batch via [`DeRecProtocol::request_channels_discovery`]
+    /// with `last_batch_index = current_batch`.
+    ChannelsDiscovered {
+        channel_id: ChannelId,
+        total_batches: i32,
+        current_batch: i32,
+        entries: Vec<ChannelEntry>,
+    },
 
     /// Well-formed message with no actionable effect (e.g. an ACK).
     NoOp,
@@ -319,6 +377,163 @@ impl<Cs: DeRecContactStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
 
         #[cfg(feature = "logging")]
         tracing::info!("discovery request sent");
+
+        Ok(())
+    }
+
+    /// Start the replica confirmation flow by sending a fingerprint to the peer.
+    ///
+    /// Call this after [`DeRecEvent::PairingComplete { kind: SenderKind::Replica, .. }`]
+    /// has been received. The returned fingerprint (16 decimal digits, each 0–9) should
+    /// be displayed to the user for visual comparison with the peer device.
+    ///
+    /// The peer receives a [`ReplicaConfirmationRequestMessage`], verifies the
+    /// fingerprint, and responds. [`process`] emits [`DeRecEvent::ReplicaConfirmed`]
+    /// when the response arrives.
+    #[cfg_attr(
+        feature = "logging",
+        tracing::instrument(skip_all, fields(channel_id = channel_id.0, replica_id))
+    )]
+    pub async fn start_replica_confirmation(
+        &mut self,
+        channel_id: ChannelId,
+        replica_id: i32,
+    ) -> Result<[u8; 16]> {
+        let Some(SecretValue::SharedKey(shared_key)) = self
+            .secret_store
+            .load(channel_id, SecretKind::SharedKey)
+            .await?
+        else {
+            return Err(Error::InvalidInput(
+                "no shared key for channel — pairing must complete before replica confirmation",
+            ));
+        };
+
+        let endpoint = self.peer_endpoint(channel_id).await?;
+        let result = produce_replica_confirmation_request(channel_id, &shared_key, replica_id)?;
+        self.transport.send(&endpoint, result.envelope).await?;
+
+        #[cfg(feature = "logging")]
+        tracing::info!("replica confirmation request sent");
+
+        Ok(result.fingerprint)
+    }
+
+    /// Confirm a Replica channel after the user has verified the fingerprint.
+    ///
+    /// Call this on the **receiving** side of the confirmation flow after
+    /// the application has displayed the fingerprint and the user confirmed
+    /// it matches the peer device. Sends a
+    /// [`ReplicaConfirmationResponseMessage`] with an OK status.
+    #[cfg_attr(
+        feature = "logging",
+        tracing::instrument(skip_all, fields(channel_id = channel_id.0, replica_id))
+    )]
+    pub async fn confirm_replica(
+        &mut self,
+        channel_id: ChannelId,
+        replica_id: i32,
+    ) -> Result<()> {
+        let Some(SecretValue::SharedKey(shared_key)) = self
+            .secret_store
+            .load(channel_id, SecretKind::SharedKey)
+            .await?
+        else {
+            return Err(Error::InvalidInput(
+                "no shared key for channel — pairing must complete before confirming replica",
+            ));
+        };
+
+        let endpoint = self.peer_endpoint(channel_id).await?;
+        let result = produce_replica_confirmation_response(channel_id, &shared_key, replica_id)?;
+        self.transport.send(&endpoint, result.envelope).await?;
+
+        #[cfg(feature = "logging")]
+        tracing::info!("replica confirmation response sent");
+
+        Ok(())
+    }
+
+    /// Request channels discovery from the Owner on the given Replica channel.
+    ///
+    /// Call this after [`DeRecEvent::ReplicaConfirmed`] to begin synchronising
+    /// Helper channels. Use `last_batch_index = 0` for the initial request.
+    /// After receiving a [`DeRecEvent::ChannelsDiscovered`] batch with
+    /// `current_batch < total_batches`, call again with
+    /// `last_batch_index = current_batch` to fetch the next batch.
+    #[cfg_attr(
+        feature = "logging",
+        tracing::instrument(skip_all, fields(channel_id = channel_id.0, last_batch_index))
+    )]
+    pub async fn request_channels_discovery(
+        &mut self,
+        channel_id: ChannelId,
+        last_batch_index: i32,
+    ) -> Result<()> {
+        let Some(SecretValue::SharedKey(shared_key)) = self
+            .secret_store
+            .load(channel_id, SecretKind::SharedKey)
+            .await?
+        else {
+            return Err(Error::InvalidInput(
+                "no shared key for channel — pairing must complete before channels discovery",
+            ));
+        };
+
+        let endpoint = self.peer_endpoint(channel_id).await?;
+        let msg = produce_channels_discovery_request(channel_id, &shared_key, last_batch_index)?;
+        self.transport.send(&endpoint, msg.envelope).await?;
+
+        #[cfg(feature = "logging")]
+        tracing::info!("channels discovery request sent");
+
+        Ok(())
+    }
+
+    /// Respond to a channels discovery request from a Replica.
+    ///
+    /// Call this on the **Owner** side after receiving a
+    /// [`ReplicaChannelsDiscoveryRequestMessage`] (dispatched via [`process`]).
+    /// The Owner enumerates its Helper channels and sends them to the Replica
+    /// in a single batch or across multiple batches.
+    #[cfg_attr(
+        feature = "logging",
+        tracing::instrument(skip_all, fields(
+            channel_id = channel_id.0,
+            total_batches,
+            current_batch,
+            entries_count = entries.len()
+        ))
+    )]
+    pub async fn respond_channels_discovery(
+        &mut self,
+        channel_id: ChannelId,
+        entries: &[ChannelEntry],
+        total_batches: i32,
+        current_batch: i32,
+    ) -> Result<()> {
+        let Some(SecretValue::SharedKey(shared_key)) = self
+            .secret_store
+            .load(channel_id, SecretKind::SharedKey)
+            .await?
+        else {
+            return Err(Error::InvalidInput(
+                "no shared key for channel — pairing must complete before responding to channels discovery",
+            ));
+        };
+
+        let endpoint = self.peer_endpoint(channel_id).await?;
+        let msg = produce_channels_discovery_response(
+            channel_id,
+            &shared_key,
+            entries,
+            total_batches,
+            current_batch,
+        )?;
+        self.transport.send(&endpoint, msg.envelope).await?;
+
+        #[cfg(feature = "logging")]
+        tracing::info!("channels discovery response sent");
 
         Ok(())
     }
