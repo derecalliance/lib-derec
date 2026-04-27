@@ -3,6 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+
+// TODO: changes made:
+//   1. moved secretId right above version for Consistency
+//   2. accomodated field indexes acccording to point 1
+
 syntax = "proto3";
 
 import "google/protobuf/timestamp.proto";
@@ -93,10 +98,17 @@ message StoreShareRequestMessage {
   // Implementations SHOULD support algorithm 0 for interoperability.
   int32 shareAlgorithm = 2;
 
+
+  // Identifier of the secret to which this share belongs.
+  //
+  // Used by the Helper to associate the share with the correct secret in the
+  // share store under the composite key (channel_id, secret_id, version).
+  bytes secretId = 3;
+
   // Version number of the share.
   //
   // Each resharing event increments this value.
-  int32 version = 3;
+  int32 version = 4;
 
   // List of share versions that MUST be retained by the Helper.
   //
@@ -109,25 +121,19 @@ message StoreShareRequestMessage {
   //
   // This field MUST be ignored if `version` is older than the latest
   // version already stored, to prevent replay attacks.
-  repeated int32 keepList = 4;
+  repeated int32 keepList = 5;
 
   // Optional human-readable description of this share version.
   //
   // This field is visible to the Helper and is not intended to carry
   // sensitive information. It may be used for debugging, labeling, or
   // user-facing display.
-  string versionDescription = 5;
+  string versionDescription = 6;
 
   // Timestamp indicating when this message was created.
   //
   // Used for observability, replay detection, and timeout handling.
-  google.protobuf.Timestamp timestamp = 6;
-
-  // Identifier of the secret to which this share belongs.
-  //
-  // Used by the Helper to associate the share with the correct secret in the
-  // share store under the composite key (channel_id, secret_id, version).
-  bytes secretId = 7;
+  google.protobuf.Timestamp timestamp = 7;
 }
 
 // StoreShareResponseMessage is the response to a StoreShareRequestMessage.
@@ -149,20 +155,20 @@ message StoreShareResponseMessage {
   // Indicates success or failure of the storage/update operation.
   DeRecResult result = 1;
 
-  // Version number from the corresponding request.
-  //
-  // This allows the sender to correlate responses with requests.
-  int32 version = 2;
-
-  // Timestamp indicating when this message was created.
-  //
-  // Used for observability, replay detection, and timeout handling.
-  google.protobuf.Timestamp timestamp = 3;
-
   // Identifier of the secret to which this response refers.
   //
   // Echoed from the corresponding StoreShareRequestMessage so the Owner can
   // correlate responses with the correct secret without inspecting the share
   // bytes.
-  bytes secretId = 4;
+  bytes secretId = 2;
+
+  // Version number from the corresponding request.
+  //
+  // This allows the sender to correlate responses with requests.
+  int32 version = 3;
+
+  // Timestamp indicating when this message was created.
+  //
+  // Used for observability, replay detection, and timeout handling.
+  google.protobuf.Timestamp timestamp = 4;
 }

@@ -102,10 +102,10 @@ peer (similar to Bluetooth pairing).
 1. Compute `H = SHA-256(K)` where `K` is the 32-byte shared key.
 2. Split `H` into 16 consecutive 2-byte chunks.
 3. Interpret each chunk as a big-endian `u16`, then compute `digit = value % 10`.
-4. The result is a 16-element array where each element is a single decimal digit (`0..=9`).
+4. Format the 16 digits as `XXXX-XXXX-XXXX-XXXX`.
 
-Applications may choose any user-friendly rendering format, for example
-`XXXX-XXXX-XXXX-XXXX`.
+The `fingerprint_digits` function is also available for cases that need the raw
+digit array (e.g. protobuf serialization).
 
 ### Properties
 
@@ -119,10 +119,11 @@ Applications may choose any user-friendly rendering format, for example
 use derec_cryptography::replica;
 
 let shared_key = [0xABu8; 32];
-let digits = replica::fingerprint(&shared_key);
+let fp = replica::fingerprint(&shared_key);
 
-assert_eq!(digits.len(), 16);
-assert!(digits.iter().all(|&d| d < 10));
+// Formatted as "XXXX-XXXX-XXXX-XXXX"
+assert_eq!(fp.len(), 19);
+assert!(fp.chars().all(|c| c.is_ascii_digit() || c == '-'));
 ```
 
 ---

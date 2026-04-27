@@ -2,15 +2,13 @@
 
 use std::{future::Future, pin::Pin};
 
-use crate::types::ChannelId;
 use crate::Result;
+use crate::types::ChannelId;
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{ContactMessage, TransportProtocol};
 
 use super::error::{ContactStoreError, SecretStoreError, ShareStoreError};
 
-// ── Future type aliases ───────────────────────────────────────────────────────
-//
 // Each alias is scoped to its own error type and carries a lifetime so the
 // returned future may borrow from `&self` / `&mut self`.  No executor, runtime,
 // or async-framework dependency is introduced: any code that can poll a
@@ -78,7 +76,11 @@ pub trait DeRecSecretStore {
     /// Returns `Ok(None)` when no secret of the requested [`SecretKind`] exists
     /// for `channel_id`.  The returned [`SecretValue`] variant will always match
     /// the requested `kind`.
-    fn load(&self, channel_id: ChannelId, kind: SecretKind) -> SecretStoreFuture<'_, Option<SecretValue>>;
+    fn load(
+        &self,
+        channel_id: ChannelId,
+        kind: SecretKind,
+    ) -> SecretStoreFuture<'_, Option<SecretValue>>;
 
     /// Persist a secret for the given channel.
     ///
@@ -120,7 +122,11 @@ pub trait DeRecContactStore {
     /// Persist the peer's [`ContactMessage`] for the given channel.
     ///
     /// Replaces any previously stored contact for the same `channel_id`.
-    fn save(&mut self, channel_id: ChannelId, contact: ContactMessage) -> ContactStoreFuture<'_, ()>;
+    fn save(
+        &mut self,
+        channel_id: ChannelId,
+        contact: ContactMessage,
+    ) -> ContactStoreFuture<'_, ()>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

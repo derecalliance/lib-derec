@@ -24,9 +24,15 @@ mod pairing_handler;
 
 use crate::{
     Error, Result,
+    primitives::channel_sync::request::produce as produce_channel_sync_request,
     primitives::channels_discovery::{
         request::produce as produce_channels_discovery_request,
         response::{ChannelEntry, produce as produce_channels_discovery_response},
+    },
+    primitives::secret_sync::request::produce as produce_secret_sync_request,
+    primitives::secrets_discovery::{
+        request::produce as produce_secrets_discovery_request,
+        response::{SecretEntry, produce as produce_secrets_discovery_response},
     },
     primitives::discovery::request::produce as produce_discovery_request,
     primitives::discovery::response::SecretVersionEntry,
@@ -55,6 +61,19 @@ pub use traits::{
     ContactStoreFuture, DeRecContactStore, DeRecSecretStore, DeRecShareStore, DeRecTransport,
     SecretKind, SecretStoreFuture, SecretValue, ShareStoreFuture, TransportFuture,
 };
+
+/// Formats a raw 16-digit fingerprint array into the display string `XXXX-XXXX-XXXX-XXXX`.
+///
+/// Each element of `digits` must be a single decimal digit (`0..=9`).
+pub fn format_fingerprint(digits: &[u8; 16]) -> String {
+    format!(
+        "{}{}{}{}-{}{}{}{}-{}{}{}{}-{}{}{}{}",
+        digits[0], digits[1], digits[2], digits[3],
+        digits[4], digits[5], digits[6], digits[7],
+        digits[8], digits[9], digits[10], digits[11],
+        digits[12], digits[13], digits[14], digits[15],
+    )
+}
 
 /// In-progress recovery accumulators keyed by `(secret_id, version)`.
 ///
@@ -148,8 +167,8 @@ pub enum DeRecEvent {
         channel_id: ChannelId,
         /// The peer's replica identifier.
         replica_id: i32,
-        /// 16-digit fingerprint (each byte 0–9) for user display.
-        fingerprint: [u8; 16],
+        /// Fingerprint formatted as `XXXX-XXXX-XXXX-XXXX` for user display.
+        fingerprint: String,
     },
 
     /// Replica confirmation completed (initiator side).
@@ -182,6 +201,48 @@ pub enum DeRecEvent {
         total_batches: i32,
         current_batch: i32,
         entries: Vec<ChannelEntry>,
+    },
+
+    /// A Replica requested secrets discovery (Owner side).
+    ///
+    /// The application should enumerate all protected secrets and call
+    /// [`DeRecProtocol::respond_secrets_discovery`] with the entries.
+    SecretsDiscoveryRequested {
+        channel_id: ChannelId,
+        last_batch_index: i32,
+    },
+
+    /// A batch of secret entries was received from the Owner (Replica side).
+    ///
+    /// The Replica should persist the entries and, if `current_batch < total_batches`,
+    /// request the next batch via [`DeRecProtocol::request_secrets_discovery`]
+    /// with `last_batch_index = current_batch`.
+    ReplicaSecretsDiscovered {
+        channel_id: ChannelId,
+        total_batches: i32,
+        current_batch: i32,
+        entries: Vec<SecretEntry>,
+    },
+
+    /// A Replica notified us about a newly paired Helper channel.
+    ///
+    /// The application should store the channel information so it can
+    /// interact with the Helper transparently.
+    ChannelSynced {
+        channel_id: ChannelId,
+        new_channel_id: ChannelId,
+        new_shared_key: crate::types::SharedKey,
+    },
+
+    /// A Replica notified us about a new secret or secret version.
+    ///
+    /// The application should store the secret metadata.
+    SecretSynced {
+        channel_id: ChannelId,
+        secret_id: Vec<u8>,
+        version: i32,
+        description: String,
+        channel_ids: Vec<ChannelId>,
     },
 
     /// Well-formed message with no actionable effect (e.g. an ACK).
@@ -384,8 +445,8 @@ impl<Cs: DeRecContactStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
     /// Start the replica confirmation flow by sending a fingerprint to the peer.
     ///
     /// Call this after [`DeRecEvent::PairingComplete { kind: SenderKind::Replica, .. }`]
-    /// has been received. The returned fingerprint (16 decimal digits, each 0–9) should
-    /// be displayed to the user for visual comparison with the peer device.
+    /// has been received. The returned fingerprint (formatted as `XXXX-XXXX-XXXX-XXXX`)
+    /// should be displayed to the user for visual comparison with the peer device.
     ///
     /// The peer receives a [`ReplicaConfirmationRequestMessage`], verifies the
     /// fingerprint, and responds. [`process`] emits [`DeRecEvent::ReplicaConfirmed`]
@@ -398,7 +459,7 @@ impl<Cs: DeRecContactStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
         &mut self,
         channel_id: ChannelId,
         replica_id: i32,
-    ) -> Result<[u8; 16]> {
+    ) -> Result<String> {
         let Some(SecretValue::SharedKey(shared_key)) = self
             .secret_store
             .load(channel_id, SecretKind::SharedKey)
@@ -416,7 +477,7 @@ impl<Cs: DeRecContactStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
         #[cfg(feature = "logging")]
         tracing::info!("replica confirmation request sent");
 
-        Ok(result.fingerprint)
+        Ok(format_fingerprint(&result.fingerprint))
     }
 
     /// Confirm a Replica channel after the user has verified the fingerprint.
@@ -534,6 +595,160 @@ impl<Cs: DeRecContactStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
 
         #[cfg(feature = "logging")]
         tracing::info!("channels discovery response sent");
+
+        Ok(())
+    }
+
+    /// Request secrets discovery from the Owner on the given Replica channel.
+    ///
+    /// Call this after [`DeRecEvent::ReplicaConfirmed`] to begin synchronising
+    /// secrets. Use `last_batch_index = 0` for the initial request.
+    /// After receiving a [`DeRecEvent::ReplicaSecretsDiscovered`] batch with
+    /// `current_batch < total_batches`, call again with
+    /// `last_batch_index = current_batch` to fetch the next batch.
+    #[cfg_attr(
+        feature = "logging",
+        tracing::instrument(skip_all, fields(channel_id = channel_id.0, last_batch_index))
+    )]
+    pub async fn request_secrets_discovery(
+        &mut self,
+        channel_id: ChannelId,
+        last_batch_index: i32,
+    ) -> Result<()> {
+        let Some(SecretValue::SharedKey(shared_key)) = self
+            .secret_store
+            .load(channel_id, SecretKind::SharedKey)
+            .await?
+        else {
+            return Err(Error::InvalidInput(
+                "no shared key for channel — pairing must complete before secrets discovery",
+            ));
+        };
+
+        let endpoint = self.peer_endpoint(channel_id).await?;
+        let msg = produce_secrets_discovery_request(channel_id, &shared_key, last_batch_index)?;
+        self.transport.send(&endpoint, msg.envelope).await?;
+
+        #[cfg(feature = "logging")]
+        tracing::info!("secrets discovery request sent");
+
+        Ok(())
+    }
+
+    /// Respond to a secrets discovery request from a Replica.
+    ///
+    /// Call this on the **Owner** side after receiving a
+    /// [`DeRecEvent::SecretsDiscoveryRequested`]. The Owner enumerates its
+    /// protected secrets and sends them to the Replica in one or more batches.
+    #[cfg_attr(
+        feature = "logging",
+        tracing::instrument(skip_all, fields(
+            channel_id = channel_id.0,
+            total_batches,
+            current_batch,
+            entries_count = entries.len()
+        ))
+    )]
+    pub async fn respond_secrets_discovery(
+        &mut self,
+        channel_id: ChannelId,
+        entries: &[SecretEntry],
+        total_batches: i32,
+        current_batch: i32,
+    ) -> Result<()> {
+        let Some(SecretValue::SharedKey(shared_key)) = self
+            .secret_store
+            .load(channel_id, SecretKind::SharedKey)
+            .await?
+        else {
+            return Err(Error::InvalidInput(
+                "no shared key for channel — pairing must complete before responding to secrets discovery",
+            ));
+        };
+
+        let endpoint = self.peer_endpoint(channel_id).await?;
+        let msg = produce_secrets_discovery_response(
+            channel_id,
+            &shared_key,
+            entries,
+            total_batches,
+            current_batch,
+        )?;
+        self.transport.send(&endpoint, msg.envelope).await?;
+
+        #[cfg(feature = "logging")]
+        tracing::info!("secrets discovery response sent");
+
+        Ok(())
+    }
+
+    /// Notify peer Replicas about a newly paired Helper channel.
+    ///
+    /// When a Replica pairs with a new Helper, it calls this method for each
+    /// peer Replica channel to propagate the new Helper's `channel_id` and
+    /// `shared_key`.
+    #[cfg_attr(
+        feature = "logging",
+        tracing::instrument(skip_all, fields(channel_id = channel_id.0, new_channel_id = new_channel_id.0))
+    )]
+    pub async fn sync_channel(
+        &mut self,
+        channel_id: ChannelId,
+        new_channel_id: ChannelId,
+        new_shared_key: &crate::types::SharedKey,
+    ) -> Result<()> {
+        let Some(SecretValue::SharedKey(shared_key)) = self
+            .secret_store
+            .load(channel_id, SecretKind::SharedKey)
+            .await?
+        else {
+            return Err(Error::InvalidInput(
+                "no shared key for channel — pairing must complete before syncing channels",
+            ));
+        };
+
+        let endpoint = self.peer_endpoint(channel_id).await?;
+        let msg = produce_channel_sync_request(channel_id, &shared_key, new_channel_id, new_shared_key)?;
+        self.transport.send(&endpoint, msg.envelope).await?;
+
+        #[cfg(feature = "logging")]
+        tracing::info!("channel sync request sent");
+
+        Ok(())
+    }
+
+    /// Notify peer Replicas about a new secret or secret version.
+    ///
+    /// When a Replica creates or updates a secret, it calls this method for
+    /// each peer Replica channel to propagate the secret metadata.
+    #[cfg_attr(
+        feature = "logging",
+        tracing::instrument(skip_all, fields(channel_id = channel_id.0, version))
+    )]
+    pub async fn sync_secret(
+        &mut self,
+        channel_id: ChannelId,
+        secret_id: &[u8],
+        version: i32,
+        description: &str,
+        channel_ids: &[ChannelId],
+    ) -> Result<()> {
+        let Some(SecretValue::SharedKey(shared_key)) = self
+            .secret_store
+            .load(channel_id, SecretKind::SharedKey)
+            .await?
+        else {
+            return Err(Error::InvalidInput(
+                "no shared key for channel — pairing must complete before syncing secrets",
+            ));
+        };
+
+        let endpoint = self.peer_endpoint(channel_id).await?;
+        let msg = produce_secret_sync_request(channel_id, &shared_key, secret_id, version, description, channel_ids)?;
+        self.transport.send(&endpoint, msg.envelope).await?;
+
+        #[cfg(feature = "logging")]
+        tracing::info!("secret sync request sent");
 
         Ok(())
     }

@@ -11,13 +11,15 @@ public static partial class ReplicaConfirmation
         public sealed class ProduceResult
         {
             public DeRecMessage Envelope { get; init; } = default!;
-            public byte[] Fingerprint { get; init; } = Array.Empty<byte>();
+            /// <summary>Fingerprint formatted as "XXXX-XXXX-XXXX-XXXX".</summary>
+            public string Fingerprint { get; init; } = string.Empty;
         }
 
         public sealed class ExtractResult
         {
             public int ReplicaId { get; init; }
-            public byte[] Fingerprint { get; init; } = Array.Empty<byte>();
+            /// <summary>Fingerprint formatted as "XXXX-XXXX-XXXX-XXXX".</summary>
+            public string Fingerprint { get; init; } = string.Empty;
         }
 
         /// <summary>
@@ -40,7 +42,7 @@ public static partial class ReplicaConfirmation
                 return new ProduceResult
                 {
                     Envelope = DeRecMessage.FromProtoBytes(Utils.CopyBuffer(nativeResult.RequestWireBytes)),
-                    Fingerprint = Utils.CopyBuffer(nativeResult.Fingerprint),
+                    Fingerprint = System.Text.Encoding.UTF8.GetString(Utils.CopyBuffer(nativeResult.Fingerprint)),
                 };
             }
             finally
@@ -73,7 +75,7 @@ public static partial class ReplicaConfirmation
                 return new ExtractResult
                 {
                     ReplicaId = nativeResult.ReplicaId,
-                    Fingerprint = Utils.CopyBuffer(nativeResult.Fingerprint),
+                    Fingerprint = System.Text.Encoding.UTF8.GetString(Utils.CopyBuffer(nativeResult.Fingerprint)),
                 };
             }
             finally

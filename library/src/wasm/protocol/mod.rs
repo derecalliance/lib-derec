@@ -45,6 +45,7 @@ mod stores;
 
 use crate::{
     primitives::channels_discovery::response::ChannelEntry,
+    primitives::secrets_discovery::response::SecretEntry,
     protocol::DeRecProtocol,
     types::{ChannelId, Secret},
     wasm::ts_bindings_utils::js_error,
@@ -235,8 +236,8 @@ impl DeRecProtocolWasm {
 
     /// Start the replica confirmation flow by sending a fingerprint to the peer.
     ///
-    /// Returns a `Uint8Array` containing the 16-digit fingerprint (each byte 0–9)
-    /// for the application to display to the user.
+    /// Returns the fingerprint formatted as `XXXX-XXXX-XXXX-XXXX` for the
+    /// application to display to the user.
     ///
     /// # Arguments
     ///
@@ -247,13 +248,11 @@ impl DeRecProtocolWasm {
         &mut self,
         channel_id: u64,
         replica_id: i32,
-    ) -> Result<Vec<u8>, JsValue> {
-        let fingerprint = self
-            .inner
+    ) -> Result<String, JsValue> {
+        self.inner
             .start_replica_confirmation(ChannelId(channel_id), replica_id)
             .await
-            .map_err(|e| js_error("DEREC_ERROR", e.to_string()))?;
-        Ok(fingerprint.to_vec())
+            .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
     }
 
     /// Confirm a Replica channel after the user verified the fingerprint.
@@ -339,6 +338,129 @@ impl DeRecProtocolWasm {
                 &channel_entries,
                 total_batches,
                 current_batch,
+            )
+            .await
+            .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
+    }
+
+    /// Request secrets discovery from the Owner on the given Replica channel.
+    ///
+    /// # Arguments
+    ///
+    /// * `channel_id` — BigInt channel identifier.
+    /// * `last_batch_index` — Index of the last batch received (0 for initial request).
+    #[wasm_bindgen(js_name = "requestSecretsDiscovery")]
+    pub async fn request_secrets_discovery(
+        &mut self,
+        channel_id: u64,
+        last_batch_index: i32,
+    ) -> Result<(), JsValue> {
+        self.inner
+            .request_secrets_discovery(ChannelId(channel_id), last_batch_index)
+            .await
+            .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
+    }
+
+    /// Respond to a secrets discovery request from a Replica.
+    ///
+    /// # Arguments
+    ///
+    /// * `channel_id` — BigInt channel identifier of the Replica channel.
+    /// * `entries` — JS array of `{ secret_id: Uint8Array, version: number, description: string, channel_ids: number[] }` objects.
+    /// * `total_batches` — Total number of batches.
+    /// * `current_batch` — 1-based index of this batch.
+    #[wasm_bindgen(js_name = "respondSecretsDiscovery")]
+    pub async fn respond_secrets_discovery(
+        &mut self,
+        channel_id: u64,
+        entries: JsValue,
+        total_batches: i32,
+        current_batch: i32,
+    ) -> Result<(), JsValue> {
+        #[derive(serde::Deserialize)]
+        struct SecretEntryJs {
+            secret_id: Vec<u8>,
+            version: i32,
+            description: String,
+            channel_ids: Vec<u64>,
+        }
+
+        let entries_js: Vec<SecretEntryJs> = serde_wasm_bindgen::from_value(entries)
+            .map_err(|e| js_error("WASM_DESERIALIZE_ERROR", e.to_string()))?;
+
+        let secret_entries: Vec<SecretEntry> = entries_js
+            .into_iter()
+            .map(|e| SecretEntry {
+                secret_id: e.secret_id,
+                version: e.version,
+                description: e.description,
+                channel_ids: e.channel_ids.into_iter().map(ChannelId).collect(),
+            })
+            .collect();
+
+        self.inner
+            .respond_secrets_discovery(
+                ChannelId(channel_id),
+                &secret_entries,
+                total_batches,
+                current_batch,
+            )
+            .await
+            .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
+    }
+
+    /// Notify peer Replicas about a newly paired Helper channel.
+    ///
+    /// # Arguments
+    ///
+    /// * `channel_id` — BigInt Replica-to-Replica channel identifier.
+    /// * `new_channel_id` — BigInt channel identifier for the new Helper.
+    /// * `new_shared_key` — 32-byte symmetric key for the new Helper channel.
+    #[wasm_bindgen(js_name = "syncChannel")]
+    pub async fn sync_channel(
+        &mut self,
+        channel_id: u64,
+        new_channel_id: u64,
+        new_shared_key: &[u8],
+    ) -> Result<(), JsValue> {
+        let key: [u8; 32] = new_shared_key.try_into().map_err(|_| {
+            js_error(
+                "INVALID_SHARED_KEY_LENGTH",
+                "new_shared_key must be exactly 32 bytes".to_string(),
+            )
+        })?;
+        self.inner
+            .sync_channel(ChannelId(channel_id), ChannelId(new_channel_id), &key)
+            .await
+            .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
+    }
+
+    /// Notify peer Replicas about a new secret or secret version.
+    ///
+    /// # Arguments
+    ///
+    /// * `channel_id` — BigInt Replica channel identifier.
+    /// * `secret_id` — Application-defined secret identifier.
+    /// * `version` — Version of the secret.
+    /// * `description` — Human-readable label.
+    /// * `channel_ids` — JS array of BigInt/number Helper channel IDs.
+    #[wasm_bindgen(js_name = "syncSecret")]
+    pub async fn sync_secret(
+        &mut self,
+        channel_id: u64,
+        secret_id: &[u8],
+        version: i32,
+        description: String,
+        channel_ids: JsValue,
+    ) -> Result<(), JsValue> {
+        let ids = parse_u64_array(channel_ids)?;
+        self.inner
+            .sync_secret(
+                ChannelId(channel_id),
+                secret_id,
+                version,
+                &description,
+                &ids,
             )
             .await
             .map_err(|e| js_error("DEREC_ERROR", e.to_string()))

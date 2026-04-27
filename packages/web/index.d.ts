@@ -64,10 +64,14 @@ export type DeRecEvent =
   | { type: "RecoveryShareReceived"; channel_id: string; shares_received: number }
   | { type: "RecoveryShareError"; channel_id: string; shares_received: number; error: string }
   | { type: "SecretRecovered"; secret: Uint8Array }
-  | { type: "ReplicaConfirmationReceived"; channel_id: string; replica_id: number; fingerprint: Uint8Array }
+  | { type: "ReplicaConfirmationReceived"; channel_id: string; replica_id: number; fingerprint: string }
   | { type: "ReplicaConfirmed"; channel_id: string; replica_id: number }
   | { type: "ChannelsDiscoveryRequested"; channel_id: string; last_batch_index: number }
   | { type: "ChannelsDiscovered"; channel_id: string; total_batches: number; current_batch: number; entries: Array<{ channel_id: string; shared_key: Uint8Array }> }
+  | { type: "SecretsDiscoveryRequested"; channel_id: string; last_batch_index: number }
+  | { type: "ReplicaSecretsDiscovered"; channel_id: string; total_batches: number; current_batch: number; entries: Array<{ secret_id: Uint8Array; version: number; description: string; channel_ids: string[] }> }
+  | { type: "ChannelSynced"; channel_id: string; new_channel_id: string; new_shared_key: Uint8Array }
+  | { type: "SecretSynced"; channel_id: string; secret_id: Uint8Array; version: number; description: string; channel_ids: string[] }
   | { type: "NoOp" };
 
 // ── Higher-level orchestrator ─────────────────────────────────────────────────
@@ -123,9 +127,9 @@ export declare class DeRecProtocol {
 
   /**
    * Start the replica confirmation flow by sending a fingerprint to the peer.
-   * Returns the 16-digit fingerprint (each byte 0–9) for user display.
+   * Returns the fingerprint formatted as `XXXX-XXXX-XXXX-XXXX`.
    */
-  startReplicaConfirmation(channelId: bigint, replicaId: number): Promise<Uint8Array>;
+  startReplicaConfirmation(channelId: bigint, replicaId: number): Promise<string>;
 
   /** Confirm a Replica channel after the user verified the fingerprint. */
   confirmReplica(channelId: bigint, replicaId: number): Promise<void>;
@@ -143,6 +147,23 @@ export declare class DeRecProtocol {
     totalBatches: number,
     currentBatch: number,
   ): Promise<void>;
+
+  /** Request secrets discovery from the Owner on the given Replica channel. */
+  requestSecretsDiscovery(channelId: bigint, lastBatchIndex: number): Promise<void>;
+
+  /** Respond to a secrets discovery request from a Replica. */
+  respondSecretsDiscovery(
+    channelId: bigint,
+    entries: Array<{ secret_id: Uint8Array; version: number; description: string; channel_ids: bigint[] }>,
+    totalBatches: number,
+    currentBatch: number,
+  ): Promise<void>;
+
+  /** Notify peer Replicas about a newly paired Helper channel. */
+  syncChannel(channelId: bigint, newChannelId: bigint, newSharedKey: Uint8Array): Promise<void>;
+
+  /** Notify peer Replicas about a new secret or secret version. */
+  syncSecret(channelId: bigint, secretId: Uint8Array, version: number, description: string, channelIds: bigint[]): Promise<void>;
 
   /** Split a secret and send one share to each of the specified Helpers. */
   protectSecret(
@@ -253,10 +274,10 @@ export declare const primitives: {
   };
   replica_confirmation: {
     request: {
-      /** Produces a replica confirmation request envelope. Returns `{ envelope, fingerprint }`. */
-      produce(channel_id: bigint, shared_key: Uint8Array, replica_id: number): { envelope: any; fingerprint: Uint8Array };
-      /** Decodes and verifies a replica confirmation request. Returns `{ replica_id, fingerprint }`. */
-      extract(request: any, shared_key: Uint8Array): { replica_id: number; fingerprint: Uint8Array };
+      /** Produces a replica confirmation request envelope. Returns `{ envelope, fingerprint }`. Fingerprint is `XXXX-XXXX-XXXX-XXXX`. */
+      produce(channel_id: bigint, shared_key: Uint8Array, replica_id: number): { envelope: any; fingerprint: string };
+      /** Decodes and verifies a replica confirmation request. Returns `{ replica_id, fingerprint }`. Fingerprint is `XXXX-XXXX-XXXX-XXXX`. */
+      extract(request: any, shared_key: Uint8Array): { replica_id: number; fingerprint: string };
     };
     response: {
       /** Produces a replica confirmation response envelope. */
@@ -277,6 +298,52 @@ export declare const primitives: {
       produce(channel_id: bigint, shared_key: Uint8Array, entries: Array<{ channel_id: number; shared_key: Uint8Array }>, total_batches: number, current_batch: number): any;
       /** Decodes and processes a channels discovery response. */
       process(response: any, shared_key: Uint8Array): { total_batches: number; current_batch: number; entries: Array<{ channel_id: number; shared_key: Uint8Array }> };
+    };
+  };
+  secrets_discovery: {
+    request: {
+      /** Produces a secrets discovery request envelope. */
+      produce(channel_id: bigint, shared_key: Uint8Array, last_batch_index: number): any;
+      /** Decodes and decrypts a secrets discovery request. Returns `{ last_batch_index }`. */
+      extract(request: any, shared_key: Uint8Array): { last_batch_index: number };
+    };
+    response: {
+      /** Produces a secrets discovery response envelope. */
+      produce(channel_id: bigint, shared_key: Uint8Array, entries: Array<{ secret_id: Uint8Array; version: number; description: string; channel_ids: bigint[] }>, total_batches: number, current_batch: number): any;
+      /** Decodes and processes a secrets discovery response. */
+      process(response: any, shared_key: Uint8Array): { total_batches: number; current_batch: number; entries: Array<{ secret_id: Uint8Array; version: number; description: string; channel_ids: bigint[] }> };
+    };
+  };
+  channel_sync: {
+    request: {
+      /** Produces a channel sync request envelope. */
+      produce(channel_id: bigint, shared_key: Uint8Array, new_channel_id: bigint, new_shared_key: Uint8Array): any;
+      /** Decodes and decrypts a channel sync request. */
+      extract(request: any, shared_key: Uint8Array): any;
+      /** Processes a channel sync request. Returns the new channel info. */
+      process(request: any, shared_key: Uint8Array): { channel_id: bigint; shared_key: Uint8Array };
+    };
+    response: {
+      /** Produces a channel sync response envelope. */
+      produce(channel_id: bigint, shared_key: Uint8Array): any;
+      /** Processes a channel sync response. */
+      process(response: any, shared_key: Uint8Array): void;
+    };
+  };
+  secret_sync: {
+    request: {
+      /** Produces a secret sync request envelope. */
+      produce(channel_id: bigint, shared_key: Uint8Array, secret_id: Uint8Array, version: number, description: string, channel_ids: bigint[]): any;
+      /** Decodes and decrypts a secret sync request. */
+      extract(request: any, shared_key: Uint8Array): any;
+      /** Processes a secret sync request. Returns the secret info. */
+      process(request: any, shared_key: Uint8Array): { secret_id: Uint8Array; version: number; description: string; channel_ids: bigint[] };
+    };
+    response: {
+      /** Produces a secret sync response envelope. */
+      produce(channel_id: bigint, shared_key: Uint8Array): any;
+      /** Processes a secret sync response. */
+      process(response: any, shared_key: Uint8Array): void;
     };
   };
 };

@@ -4,6 +4,10 @@ use crate::{
     Error, Result,
     derec_message::extract_inner_message,
     primitives::{
+        channel_sync::{
+            request as channel_sync_request,
+            response as channel_sync_response,
+        },
         channels_discovery::response::{self as channels_discovery_response},
         discovery::response::{self as discovery_response, SecretVersionEntry, VersionEntry},
         recovery::{
@@ -14,6 +18,11 @@ use crate::{
             request::verify_fingerprint,
             response::{self as replica_confirmation_response},
         },
+        secret_sync::{
+            request as secret_sync_request,
+            response as secret_sync_response,
+        },
+        secrets_discovery::response as secrets_discovery_response,
         sharing::response::{self as sharing_response},
         verification::response::{self as verification_response},
     },
@@ -24,8 +33,11 @@ use super::{DeRecContactStore, DeRecEvent, DeRecShareStore, DeRecTransport, Pend
 use derec_proto::{
     DeRecMessage, GetSecretIdsVersionsRequestMessage, GetSecretIdsVersionsResponseMessage,
     GetShareRequestMessage, GetShareResponseMessage, MessageBody,
+    ReplicaChannelSyncRequestMessage, ReplicaChannelSyncResponseMessage,
     ReplicaChannelsDiscoveryRequestMessage, ReplicaChannelsDiscoveryResponseMessage,
     ReplicaConfirmationRequestMessage, ReplicaConfirmationResponseMessage,
+    ReplicaSecretSyncRequestMessage, ReplicaSecretSyncResponseMessage,
+    ReplicaSecretsDiscoveryRequestMessage, ReplicaSecretsDiscoveryResponseMessage,
     StoreShareRequestMessage, StoreShareResponseMessage, TransportProtocol,
     VerifyShareRequestMessage, VerifyShareResponseMessage,
 };
@@ -113,6 +125,30 @@ where
             }
             MessageBody::ReplicaChannelsDiscoveryResponse(response) => {
                 self.on_channels_discovery_response(channel_id, &response)
+                    .await
+            }
+            MessageBody::ReplicaSecretsDiscoveryRequest(request) => {
+                self.on_secrets_discovery_request(channel_id, &request)
+                    .await
+            }
+            MessageBody::ReplicaSecretsDiscoveryResponse(response) => {
+                self.on_secrets_discovery_response(channel_id, &response)
+                    .await
+            }
+            MessageBody::ReplicaChannelSyncRequest(request) => {
+                self.on_channel_sync_request(channel_id, &request, shared_key)
+                    .await
+            }
+            MessageBody::ReplicaChannelSyncResponse(response) => {
+                self.on_channel_sync_response(channel_id, &response)
+                    .await
+            }
+            MessageBody::ReplicaSecretSyncRequest(request) => {
+                self.on_secret_sync_request(channel_id, &request, shared_key)
+                    .await
+            }
+            MessageBody::ReplicaSecretSyncResponse(response) => {
+                self.on_secret_sync_response(channel_id, &response)
                     .await
             }
             _ => Err(Error::Invariant(
@@ -480,7 +516,8 @@ where
         shared_key: &SharedKey,
     ) -> Result<Vec<DeRecEvent>> {
         verify_fingerprint(request, shared_key)?;
-        let fingerprint = derec_cryptography::replica::fingerprint(shared_key);
+        let digits = derec_cryptography::replica::fingerprint_digits(shared_key);
+        let fingerprint = super::format_fingerprint(&digits);
 
         #[cfg(feature = "logging")]
         tracing::info!("replica confirmation request verified — awaiting user confirmation");
@@ -569,6 +606,161 @@ where
             current_batch: result.current_batch,
             entries: result.entries,
         }])
+    }
+
+    /// Owner side: received a secrets discovery request from a Replica.
+    ///
+    /// Emits [`DeRecEvent::SecretsDiscoveryRequested`] so the application can
+    /// enumerate secrets and call
+    /// [`super::DeRecProtocol::respond_secrets_discovery`].
+    #[cfg_attr(
+        feature = "logging",
+        tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+    )]
+    async fn on_secrets_discovery_request(
+        &mut self,
+        channel_id: ChannelId,
+        request: &ReplicaSecretsDiscoveryRequestMessage,
+    ) -> Result<Vec<DeRecEvent>> {
+        #[cfg(feature = "logging")]
+        tracing::info!(
+            last_batch_index = request.last_batch_index,
+            "secrets discovery request received — application must respond"
+        );
+
+        Ok(vec![DeRecEvent::SecretsDiscoveryRequested {
+            channel_id,
+            last_batch_index: request.last_batch_index,
+        }])
+    }
+
+    /// Replica side: received a secrets discovery response, validate and emit
+    /// [`DeRecEvent::ReplicaSecretsDiscovered`].
+    #[cfg_attr(
+        feature = "logging",
+        tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+    )]
+    async fn on_secrets_discovery_response(
+        &mut self,
+        channel_id: ChannelId,
+        response: &ReplicaSecretsDiscoveryResponseMessage,
+    ) -> Result<Vec<DeRecEvent>> {
+        let result = secrets_discovery_response::process(response)?;
+
+        #[cfg(feature = "logging")]
+        tracing::info!(
+            total_batches = result.total_batches,
+            current_batch = result.current_batch,
+            entries_count = result.entries.len(),
+            "secrets discovered"
+        );
+
+        Ok(vec![DeRecEvent::ReplicaSecretsDiscovered {
+            channel_id,
+            total_batches: result.total_batches,
+            current_batch: result.current_batch,
+            entries: result.entries,
+        }])
+    }
+
+    /// Receiving Replica: received a channel sync request, validate and emit
+    /// [`DeRecEvent::ChannelSynced`].
+    #[cfg_attr(
+        feature = "logging",
+        tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+    )]
+    async fn on_channel_sync_request(
+        &mut self,
+        channel_id: ChannelId,
+        request: &ReplicaChannelSyncRequestMessage,
+        shared_key: &SharedKey,
+    ) -> Result<Vec<DeRecEvent>> {
+        let result = channel_sync_request::process(request)?;
+
+        let resp = channel_sync_response::produce(channel_id, shared_key)?;
+        let endpoint = self.peer_endpoint(channel_id).await?;
+        self.transport.send(&endpoint, resp.envelope).await?;
+
+        #[cfg(feature = "logging")]
+        tracing::info!(
+            new_channel_id = result.channel_id.0,
+            "channel sync request processed and acknowledged"
+        );
+
+        Ok(vec![DeRecEvent::ChannelSynced {
+            channel_id,
+            new_channel_id: result.channel_id,
+            new_shared_key: result.shared_key,
+        }])
+    }
+
+    /// Initiator Replica: received a channel sync response (ACK).
+    #[cfg_attr(
+        feature = "logging",
+        tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+    )]
+    async fn on_channel_sync_response(
+        &mut self,
+        _channel_id: ChannelId,
+        response: &ReplicaChannelSyncResponseMessage,
+    ) -> Result<Vec<DeRecEvent>> {
+        channel_sync_response::process(response)?;
+
+        #[cfg(feature = "logging")]
+        tracing::info!("channel sync response acknowledged");
+
+        Ok(vec![DeRecEvent::NoOp])
+    }
+
+    /// Receiving Replica: received a secret sync request, validate and emit
+    /// [`DeRecEvent::SecretSynced`].
+    #[cfg_attr(
+        feature = "logging",
+        tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+    )]
+    async fn on_secret_sync_request(
+        &mut self,
+        channel_id: ChannelId,
+        request: &ReplicaSecretSyncRequestMessage,
+        shared_key: &SharedKey,
+    ) -> Result<Vec<DeRecEvent>> {
+        let result = secret_sync_request::process(request)?;
+
+        let resp = secret_sync_response::produce(channel_id, shared_key)?;
+        let endpoint = self.peer_endpoint(channel_id).await?;
+        self.transport.send(&endpoint, resp.envelope).await?;
+
+        #[cfg(feature = "logging")]
+        tracing::info!(
+            version = result.version,
+            "secret sync request processed and acknowledged"
+        );
+
+        Ok(vec![DeRecEvent::SecretSynced {
+            channel_id,
+            secret_id: result.secret_id,
+            version: result.version,
+            description: result.description,
+            channel_ids: result.channel_ids,
+        }])
+    }
+
+    /// Initiator Replica: received a secret sync response (ACK).
+    #[cfg_attr(
+        feature = "logging",
+        tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+    )]
+    async fn on_secret_sync_response(
+        &mut self,
+        _channel_id: ChannelId,
+        response: &ReplicaSecretSyncResponseMessage,
+    ) -> Result<Vec<DeRecEvent>> {
+        secret_sync_response::process(response)?;
+
+        #[cfg(feature = "logging")]
+        tracing::info!("secret sync response acknowledged");
+
+        Ok(vec![DeRecEvent::NoOp])
     }
 
     async fn peer_endpoint(&mut self, channel_id: ChannelId) -> Result<TransportProtocol> {

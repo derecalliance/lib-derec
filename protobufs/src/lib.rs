@@ -1,5 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
+// TODO: Remove all references to the messages That commented out below
+// ReplicaConfirmationRequest(ReplicaConfirmationRequestMessage),
+// ReplicaConfirmationResponse(ReplicaConfirmationResponseMessage),
+// ReplicaChannelsDiscoveryRequest(ReplicaChannelsDiscoveryRequestMessage),
+// ReplicaChannelsDiscoveryResponse(ReplicaChannelsDiscoveryResponseMessage),
+// ReplicaSecretsDiscoveryRequest(ReplicaSecretsDiscoveryRequestMessage),
+// ReplicaSecretsDiscoveryResponse(ReplicaSecretsDiscoveryResponseMessage),
+// ReplicaChannelSyncRequest(ReplicaChannelSyncRequestMessage),
+// ReplicaChannelSyncResponse(ReplicaChannelSyncResponseMessage),
+// ReplicaSecretSyncRequest(ReplicaSecretSyncRequestMessage),
+// ReplicaSecretSyncResponse(ReplicaSecretSyncResponseMessage),
+
 //! # Protobuf Bindings
 //!
 //! This module exposes the Rust types generated from the DeRec protocol
@@ -76,10 +88,6 @@ pub enum MessageBody {
     GetShareRequest(GetShareRequestMessage),
     GetShareResponse(GetShareResponseMessage),
     ErrorResponse(ErrorResponseMessage),
-    ReplicaConfirmationRequest(ReplicaConfirmationRequestMessage),
-    ReplicaConfirmationResponse(ReplicaConfirmationResponseMessage),
-    ReplicaChannelsDiscoveryRequest(ReplicaChannelsDiscoveryRequestMessage),
-    ReplicaChannelsDiscoveryResponse(ReplicaChannelsDiscoveryResponseMessage),
 }
 
 impl MessageBody {
@@ -108,18 +116,6 @@ impl MessageBody {
             MessageBody::GetShareRequest(m) => ("GetShareRequestMessage", m.encode_to_vec()),
             MessageBody::GetShareResponse(m) => ("GetShareResponseMessage", m.encode_to_vec()),
             MessageBody::ErrorResponse(m) => ("ErrorResponseMessage", m.encode_to_vec()),
-            MessageBody::ReplicaConfirmationRequest(m) => {
-                ("ReplicaConfirmationRequestMessage", m.encode_to_vec())
-            }
-            MessageBody::ReplicaConfirmationResponse(m) => {
-                ("ReplicaConfirmationResponseMessage", m.encode_to_vec())
-            }
-            MessageBody::ReplicaChannelsDiscoveryRequest(m) => {
-                ("ReplicaChannelsDiscoveryRequestMessage", m.encode_to_vec())
-            }
-            MessageBody::ReplicaChannelsDiscoveryResponse(m) => {
-                ("ReplicaChannelsDiscoveryResponseMessage", m.encode_to_vec())
-            }
         };
 
         let any = Any {
@@ -180,22 +176,6 @@ impl MessageBody {
             ),
             "ErrorResponseMessage" => {
                 MessageBody::ErrorResponse(ErrorResponseMessage::decode(any.value.as_slice())?)
-            }
-            "ReplicaConfirmationRequestMessage" => MessageBody::ReplicaConfirmationRequest(
-                ReplicaConfirmationRequestMessage::decode(any.value.as_slice())?,
-            ),
-            "ReplicaConfirmationResponseMessage" => MessageBody::ReplicaConfirmationResponse(
-                ReplicaConfirmationResponseMessage::decode(any.value.as_slice())?,
-            ),
-            "ReplicaChannelsDiscoveryRequestMessage" => {
-                MessageBody::ReplicaChannelsDiscoveryRequest(
-                    ReplicaChannelsDiscoveryRequestMessage::decode(any.value.as_slice())?,
-                )
-            }
-            "ReplicaChannelsDiscoveryResponseMessage" => {
-                MessageBody::ReplicaChannelsDiscoveryResponse(
-                    ReplicaChannelsDiscoveryResponseMessage::decode(any.value.as_slice())?,
-                )
             }
             #[allow(deprecated)]
             unknown => return Err(DecodeError::new(unknown.to_string())),

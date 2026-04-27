@@ -216,7 +216,7 @@ var request = ReplicaConfirmation.Request.Produce(
     replicaId: 42
 );
 // request.Envelope  — the encrypted message to send
-// request.Fingerprint — display this to the user for comparison
+// request.Fingerprint — formatted as "XXXX-XXXX-XXXX-XXXX", display directly
 
 // Receiver side: extract and verify the request
 var extracted = ReplicaConfirmation.Request.Extract(
@@ -224,7 +224,7 @@ var extracted = ReplicaConfirmation.Request.Extract(
     sharedKey: sharedKey
 );
 // extracted.ReplicaId — the replica identifier
-// extracted.Fingerprint — display this to the user; must match the initiator's
+// extracted.Fingerprint — formatted as "XXXX-XXXX-XXXX-XXXX"; must match the initiator's
 
 // Receiver side: send confirmation response after user approval
 DeRecMessage response = ReplicaConfirmation.Response.Produce(
@@ -288,6 +288,126 @@ var result = ChannelsDiscovery.Response.Process(
 // result.TotalBatches — total number of batches
 // result.CurrentBatch — index of this batch
 // result.Entries — List<ChannelEntry> with ChannelId and SharedKey
+```
+
+---
+
+## Example: Secrets Discovery Flow
+
+After replica confirmation, the Replica can request the Owner's protected secrets in paginated batches.
+
+```csharp
+using DeRec.Library;
+using DeRec.Library.Primitives;
+
+// Replica side: request secrets starting from batch 0
+DeRecMessage request = SecretsDiscovery.Request.Produce(
+    channelId: 1,
+    sharedKey: sharedKey,
+    lastBatchIndex: 0
+);
+
+// Owner side: extract the request
+var extracted = SecretsDiscovery.Request.Extract(
+    request: request,
+    sharedKey: sharedKey
+);
+
+// Owner side: respond with a batch of secret entries
+var entries = new List<SecretsDiscovery.Response.SecretEntry>
+{
+    new()
+    {
+        SecretId = new byte[] {1,2,3},
+        Version = 1,
+        Description = "Main wallet",
+        ChannelIds = new List<ulong> { 10, 20 },
+    },
+};
+
+DeRecMessage response = SecretsDiscovery.Response.Produce(
+    channelId: 1,
+    sharedKey: sharedKey,
+    entries: entries,
+    totalBatches: 1,
+    currentBatch: 1
+);
+
+// Replica side: process the response
+var result = SecretsDiscovery.Response.Process(
+    response: response,
+    sharedKey: sharedKey
+);
+// result.Entries — List<SecretEntry> with SecretId, Version, Description, ChannelIds
+```
+
+---
+
+## Example: Channel Sync Flow
+
+When a Replica pairs with a new Helper, it notifies peer Replicas.
+
+```csharp
+using DeRec.Library;
+using DeRec.Library.Primitives;
+
+// Replica A → Replica B: notify about a new Helper
+DeRecMessage request = ChannelSync.Request.Produce(
+    channelId: 1,
+    sharedKey: replicaSharedKey,
+    newChannelId: 300,
+    newSharedKey: newHelperSharedKey
+);
+
+// Replica B: extract the new channel info
+var extracted = ChannelSync.Request.Extract(
+    request: request,
+    sharedKey: replicaSharedKey
+);
+// extracted.ChannelId — the new Helper's channel ID
+// extracted.SharedKey — the new Helper's shared key
+
+// Replica B: acknowledge
+DeRecMessage response = ChannelSync.Response.Produce(
+    channelId: 1,
+    sharedKey: replicaSharedKey
+);
+ChannelSync.Response.Process(response: response, sharedKey: replicaSharedKey);
+```
+
+---
+
+## Example: Secret Sync Flow
+
+When a Replica creates a new secret, it notifies peer Replicas.
+
+```csharp
+using DeRec.Library;
+using DeRec.Library.Primitives;
+
+// Replica A → Replica B: notify about a new secret
+DeRecMessage request = SecretSync.Request.Produce(
+    channelId: 1,
+    sharedKey: replicaSharedKey,
+    secretId: new byte[] {1,2,3},
+    version: 1,
+    description: "Main wallet",
+    channelIds: new List<ulong> { 10, 20 }
+);
+
+// Replica B: extract the secret info
+var extracted = SecretSync.Request.Extract(
+    request: request,
+    sharedKey: replicaSharedKey
+);
+// extracted.SecretId, extracted.Version, extracted.Description, extracted.ChannelIds
+
+// Replica B: acknowledge
+DeRecMessage response = SecretSync.Response.Produce(
+    channelId: 1,
+    sharedKey: replicaSharedKey
+);
+SecretSync.Response.Process(response: response, sharedKey: replicaSharedKey);
 ```
 
 ---

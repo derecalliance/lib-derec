@@ -13,23 +13,18 @@
 //! 1. Compute `H = SHA-256(K)` where `K` is the 32-byte shared key.
 //! 2. Split `H` into 16 consecutive 2-byte chunks.
 //! 3. Interpret each chunk as a big-endian `u16`, then compute `digit = value % 10`.
-//! 4. The result is a 16-element array of decimal digits `[0..=9]`.
+//!
+//! Formatting the 16 digits into `XXXX-XXXX-XXXX-XXXX` is a protocol-layer
+//! concern handled by `derec_library::protocol::format_fingerprint`.
 
 use sha2::{Digest, Sha256};
 
-/// Derives a 16-digit decimal fingerprint from a 32-byte shared key.
+/// Derives the raw 16-digit decimal fingerprint from a 32-byte shared key.
 ///
 /// Each element of the returned array is a single decimal digit (`0..=9`).
-///
-/// # Example
-///
-/// ```
-/// let key = [0xABu8; 32];
-/// let digits = derec_cryptography::replica::fingerprint(&key);
-/// assert_eq!(digits.len(), 16);
-/// assert!(digits.iter().all(|&d| d < 10));
-/// ```
-pub fn fingerprint(shared_key: &[u8; 32]) -> [u8; 16] {
+/// For display formatting (`XXXX-XXXX-XXXX-XXXX`), use
+/// `derec_library::protocol::format_fingerprint`.
+pub fn fingerprint_digits(shared_key: &[u8; 32]) -> [u8; 16] {
     let hash = Sha256::digest(shared_key);
     let mut digits = [0u8; 16];
 
@@ -46,9 +41,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_fingerprint_length_and_range() {
+    fn test_fingerprint_digits_length_and_range() {
         let key = [0x42u8; 32];
-        let digits = fingerprint(&key);
+        let digits = fingerprint_digits(&key);
         assert_eq!(digits.len(), 16);
         for &d in &digits {
             assert!(d < 10, "digit {d} out of range");
@@ -56,15 +51,15 @@ mod tests {
     }
 
     #[test]
-    fn test_fingerprint_is_deterministic() {
+    fn test_fingerprint_digits_is_deterministic() {
         let key = [0x07u8; 32];
-        assert_eq!(fingerprint(&key), fingerprint(&key));
+        assert_eq!(fingerprint_digits(&key), fingerprint_digits(&key));
     }
 
     #[test]
-    fn test_different_keys_produce_different_fingerprints() {
-        let a = fingerprint(&[0x01u8; 32]);
-        let b = fingerprint(&[0x02u8; 32]);
+    fn test_different_keys_produce_different_digits() {
+        let a = fingerprint_digits(&[0x01u8; 32]);
+        let b = fingerprint_digits(&[0x02u8; 32]);
         assert_ne!(a, b);
     }
 }

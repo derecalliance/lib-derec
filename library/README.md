@@ -103,7 +103,10 @@ The SDK provides building blocks for the main protocol flows.
 | Recovery | Retrieve shares and reconstruct the secret |
 | Unpairing | Terminate the helper relationship |
 | Replica Confirmation | Verify Owner↔Replica pairing via fingerprint comparison |
-| Channels Discovery | Sync existing Helper channels from Owner to Replica |
+| Channels Discovery | Initial sync of Helper channels from Owner to Replica |
+| Secrets Discovery | Initial sync of protected secrets from Owner to Replica |
+| Channel Sync | Notify peer Replicas of a newly paired Helper channel |
+| Secret Sync | Notify peer Replicas of a new secret or secret version |
 
 
 ## Quick Intro
@@ -447,7 +450,7 @@ let request::ProduceResult {
     envelope: request_envelope,
     fingerprint,
 } = request::produce(channel_id, &shared_key, 1).unwrap();
-// Display fingerprint to the user, e.g. "1234-5678-9012-3456"
+// fingerprint is already formatted as "XXXX-XXXX-XXXX-XXXX" — display directly
 
 // Receiver: extract the request and verify the fingerprint.
 let request::ExtractResult { request: req } =
@@ -506,6 +509,135 @@ let response::ProcessResult { total_batches, current_batch, entries } =
 // Replica now has all Helper channel keys and can participate in the protocol.
 assert_eq!(entries.len(), 2);
 assert_eq!(entries[0].channel_id, ChannelId(100));
+```
+
+---
+
+### Secrets Discovery Flow
+
+After confirming the Replica channel and completing Channels Discovery, the
+Replica requests all protected secrets from the Owner. Combined with Channels
+Discovery, this enables a full initial sync.
+
+```rust
+use derec_library::primitives::secrets_discovery::{request, response};
+use derec_library::primitives::secrets_discovery::response::SecretEntry;
+use derec_library::types::ChannelId;
+
+let replica_channel_id = ChannelId(42);
+// replica_shared_key: [u8; 32] established during Replica pairing
+
+// Replica: request secrets (initial request, last_batch_index = 0).
+let request::ProduceResult { envelope: request_envelope } =
+    request::produce(replica_channel_id, &replica_shared_key, 0).unwrap();
+
+// Owner: extract the request and enumerate protected secrets.
+let _req = request::extract(&request_envelope, &replica_shared_key).unwrap();
+
+let secrets = vec![
+    SecretEntry {
+        secret_id: b"wallet_seed".to_vec(),
+        version: 1,
+        description: "Main wallet".to_owned(),
+        channel_ids: vec![ChannelId(100), ChannelId(200)],
+    },
+];
+let response::ProduceResult { envelope: response_envelope } =
+    response::produce(replica_channel_id, &replica_shared_key, &secrets, 1, 1).unwrap();
+
+// Replica: extract and process the response.
+let response::ExtractResult { response: resp } =
+    response::extract(&response_envelope, &replica_shared_key).unwrap();
+let response::ProcessResult { total_batches, current_batch, entries } =
+    response::process(&resp).unwrap();
+
+assert_eq!(entries.len(), 1);
+assert_eq!(entries[0].secret_id, b"wallet_seed".to_vec());
+```
+
+---
+
+### Channel Sync Flow
+
+When a Replica pairs with a new Helper, it notifies peer Replicas so they can
+also interact with the Helper transparently.
+
+```rust
+use derec_library::primitives::channel_sync::{request, response};
+use derec_library::types::ChannelId;
+
+let replica_channel_id = ChannelId(42);
+// replica_shared_key: [u8; 32] — key for the Replica-to-Replica channel
+let new_helper_channel_id = ChannelId(300);
+let new_helper_shared_key = [0xCCu8; 32];
+
+// Replica A → Replica B: notify about the new Helper.
+let request::ProduceResult { envelope: request_envelope } =
+    request::produce(
+        replica_channel_id,
+        &replica_shared_key,
+        new_helper_channel_id,
+        &new_helper_shared_key,
+    ).unwrap();
+
+// Replica B: extract and process the request.
+let request::ExtractResult { request: req } =
+    request::extract(&request_envelope, &replica_shared_key).unwrap();
+let request::ProcessRequestResult { channel_id, shared_key } =
+    request::process(&req).unwrap();
+
+assert_eq!(channel_id, ChannelId(300));
+assert_eq!(shared_key, [0xCCu8; 32]);
+
+// Replica B: send acknowledgement.
+let response::ProduceResult { envelope: response_envelope } =
+    response::produce(replica_channel_id, &replica_shared_key).unwrap();
+let response::ExtractResult { response: resp } =
+    response::extract(&response_envelope, &replica_shared_key).unwrap();
+response::process(&resp).unwrap();
+```
+
+---
+
+### Secret Sync Flow
+
+When a Replica creates or updates a secret, it notifies peer Replicas so they
+maintain a consistent view of all protected secrets.
+
+```rust
+use derec_library::primitives::secret_sync::{request, response};
+use derec_library::types::ChannelId;
+
+let replica_channel_id = ChannelId(42);
+// replica_shared_key: [u8; 32] — key for the Replica-to-Replica channel
+
+// Replica A → Replica B: notify about a new secret.
+let request::ProduceResult { envelope: request_envelope } =
+    request::produce(
+        replica_channel_id,
+        &replica_shared_key,
+        b"wallet_seed",
+        1,
+        "Main wallet",
+        &[ChannelId(100), ChannelId(200)],
+    ).unwrap();
+
+// Replica B: extract and process the request.
+let request::ExtractResult { request: req } =
+    request::extract(&request_envelope, &replica_shared_key).unwrap();
+let request::ProcessRequestResult {
+    secret_id, version, description, channel_ids,
+} = request::process(&req).unwrap();
+
+assert_eq!(secret_id, b"wallet_seed".to_vec());
+assert_eq!(version, 1);
+
+// Replica B: send acknowledgement.
+let response::ProduceResult { envelope: response_envelope } =
+    response::produce(replica_channel_id, &replica_shared_key).unwrap();
+let response::ExtractResult { response: resp } =
+    response::extract(&response_envelope, &replica_shared_key).unwrap();
+response::process(&resp).unwrap();
 ```
 
 ---

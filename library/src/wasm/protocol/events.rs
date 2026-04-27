@@ -44,7 +44,7 @@ enum DeRecEventJs {
     ReplicaConfirmationReceived {
         channel_id: String,
         replica_id: i32,
-        fingerprint: Vec<u8>,
+        fingerprint: String,
     },
     ReplicaConfirmed {
         channel_id: String,
@@ -59,6 +59,28 @@ enum DeRecEventJs {
         total_batches: i32,
         current_batch: i32,
         entries: Vec<ChannelEntryJs>,
+    },
+    SecretsDiscoveryRequested {
+        channel_id: String,
+        last_batch_index: i32,
+    },
+    ReplicaSecretsDiscovered {
+        channel_id: String,
+        total_batches: i32,
+        current_batch: i32,
+        entries: Vec<ReplicaSecretEntryJs>,
+    },
+    ChannelSynced {
+        channel_id: String,
+        new_channel_id: String,
+        new_shared_key: Vec<u8>,
+    },
+    SecretSynced {
+        channel_id: String,
+        secret_id: Vec<u8>,
+        version: i32,
+        description: String,
+        channel_ids: Vec<String>,
     },
     NoOp,
 }
@@ -79,6 +101,14 @@ struct VersionEntryJs {
 struct ChannelEntryJs {
     channel_id: String,
     shared_key: Vec<u8>,
+}
+
+#[derive(serde::Serialize)]
+struct ReplicaSecretEntryJs {
+    secret_id: Vec<u8>,
+    version: i32,
+    description: String,
+    channel_ids: Vec<String>,
 }
 
 pub fn event_to_js(event: DeRecEvent) -> Result<JsValue, JsValue> {
@@ -134,7 +164,7 @@ pub fn event_to_js(event: DeRecEvent) -> Result<JsValue, JsValue> {
             DeRecEventJs::ReplicaConfirmationReceived {
                 channel_id: channel_id.0.to_string(),
                 replica_id,
-                fingerprint: fingerprint.to_vec(),
+                fingerprint,
             }
         }
         DeRecEvent::ReplicaConfirmed { channel_id, replica_id } => {
@@ -161,6 +191,44 @@ pub fn event_to_js(event: DeRecEvent) -> Result<JsValue, JsValue> {
                         shared_key: e.shared_key.to_vec(),
                     })
                     .collect(),
+            }
+        }
+        DeRecEvent::SecretsDiscoveryRequested { channel_id, last_batch_index } => {
+            DeRecEventJs::SecretsDiscoveryRequested {
+                channel_id: channel_id.0.to_string(),
+                last_batch_index,
+            }
+        }
+        DeRecEvent::ReplicaSecretsDiscovered { channel_id, total_batches, current_batch, entries } => {
+            DeRecEventJs::ReplicaSecretsDiscovered {
+                channel_id: channel_id.0.to_string(),
+                total_batches,
+                current_batch,
+                entries: entries
+                    .into_iter()
+                    .map(|e| ReplicaSecretEntryJs {
+                        secret_id: e.secret_id,
+                        version: e.version,
+                        description: e.description,
+                        channel_ids: e.channel_ids.into_iter().map(|c| c.0.to_string()).collect(),
+                    })
+                    .collect(),
+            }
+        }
+        DeRecEvent::ChannelSynced { channel_id, new_channel_id, new_shared_key } => {
+            DeRecEventJs::ChannelSynced {
+                channel_id: channel_id.0.to_string(),
+                new_channel_id: new_channel_id.0.to_string(),
+                new_shared_key: new_shared_key.to_vec(),
+            }
+        }
+        DeRecEvent::SecretSynced { channel_id, secret_id, version, description, channel_ids } => {
+            DeRecEventJs::SecretSynced {
+                channel_id: channel_id.0.to_string(),
+                secret_id,
+                version,
+                description,
+                channel_ids: channel_ids.into_iter().map(|c| c.0.to_string()).collect(),
             }
         }
         DeRecEvent::NoOp => DeRecEventJs::NoOp,
