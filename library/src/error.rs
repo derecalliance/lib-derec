@@ -55,28 +55,13 @@ pub enum Error {
     Verification(#[from] crate::primitives::verification::VerificationError),
 
     #[error(transparent)]
-    ReplicaConfirmation(#[from] crate::primitives::replica_confirmation::ReplicaConfirmationError),
-
-    #[error(transparent)]
-    ChannelSync(#[from] crate::primitives::channel_sync::ChannelSyncError),
-
-    #[error(transparent)]
-    ChannelsDiscovery(#[from] crate::primitives::channels_discovery::ChannelsDiscoveryError),
-
-    #[error(transparent)]
-    SecretSync(#[from] crate::primitives::secret_sync::SecretSyncError),
-
-    #[error(transparent)]
-    SecretsDiscovery(#[from] crate::primitives::secrets_discovery::SecretsDiscoveryError),
-
-    #[error(transparent)]
     DeRecMessage(#[from] crate::derec_message::DeRecMessageBuilderError),
 
     #[error(transparent)]
     SecretStore(#[from] crate::protocol::SecretStoreError),
 
     #[error(transparent)]
-    ContactStore(#[from] crate::protocol::ContactStoreError),
+    ChannelStore(#[from] crate::protocol::ChannelStoreError),
 
     #[error(transparent)]
     ShareStore(#[from] crate::protocol::ShareStoreError),

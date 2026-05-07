@@ -438,6 +438,7 @@ dependencies = [
  "rand 0.8.5",
  "serde",
  "serde-wasm-bindgen",
+ "serde_json",
  "sha2 0.11.0",
  "subtle",
  "thiserror",
@@ -445,6 +446,7 @@ dependencies = [
  "tracing",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "web-sys",
  "zeroize",
 ]
 

@@ -6,20 +6,30 @@ use derec_cryptography::pairing::{
     self as cryptography_pairing, PairingSecretKeyMaterial, PairingSharedKey,
 };
 use derec_proto::{
-    ContactMessage, DeRecMessage, DeRecResult, MessageBody, PairRequestMessage,
+    CommunicationInfo, ContactMessage, DeRecMessage, DeRecResult, MessageBody, PairRequestMessage,
     PairResponseMessage, SenderKind, StatusEnum, TransportProtocol,
 };
 use prost::Message;
 
-/// Result of [`produce`].
-pub struct ProduceResult {
+/// Result of [`accept`].
+pub struct AcceptResult {
     /// Serialized outer [`derec_proto::DeRecMessage`] wire bytes carrying an encrypted inner
     /// [`derec_proto::PairResponseMessage`]. Ready to send over transport.
     pub envelope: Vec<u8>,
     /// Transport information extracted from the validated pairing request.
-    pub responder_transport_protocol: TransportProtocol,
+    pub peer_transport_protocol: TransportProtocol,
     /// Final pairing shared key derived by the initiator.
     pub shared_key: PairingSharedKey,
+}
+
+
+/// Result of [`reject`].
+pub struct RejectResult {
+    /// Serialized outer [`derec_proto::DeRecMessage`] wire bytes carrying an encrypted inner
+    /// [`derec_proto::PairResponseMessage`] with `FAIL` status. Ready to send over transport.
+    pub envelope: Vec<u8>,
+    /// Transport information extracted from the pairing request, identifying the peer's endpoint.
+    pub peer_transport_protocol: TransportProtocol,
 }
 
 /// Result of [`extract`].
@@ -34,10 +44,9 @@ pub struct ProcessResult {
     pub shared_key: PairingSharedKey,
 }
 
-/// Produces a pairing response envelope and derives the final pairing shared key on the
-/// **initiator** side.
+/// Accepts a pairing request and derives the final pairing shared key on the
+/// **initiator** side (the party that originally created the contact message).
 ///
-/// This function is executed by the party that originally created the contact message.
 /// After receiving the responder's pairing request, the initiator:
 ///
 /// 1. Validates the provided [`derec_proto::PairRequestMessage`] contents
@@ -48,7 +57,7 @@ pub struct ProcessResult {
 /// 5. Encrypts the serialized inner response message to the responder's ECIES public key
 /// 6. Wraps the encrypted inner bytes into a plain [`derec_proto::DeRecMessage`] envelope
 ///
-/// Because the pairing flow still does not yet rely on the final shared symmetric key for
+/// Because the pairing flow does not yet rely on the final shared symmetric key for
 /// transport, this function uses the pairing-specific **asymmetric** encryption mechanism
 /// for the inner response message.
 ///
@@ -64,12 +73,12 @@ pub struct ProcessResult {
 ///
 /// # Returns
 ///
-/// On success returns [`ProduceResult`] containing:
+/// On success returns [`AcceptResult`] containing:
 ///
 /// - `envelope`: serialized outer [`derec_proto::DeRecMessage`] envelope bytes carrying
 ///   the encrypted inner [`derec_proto::PairResponseMessage`]
 /// - `shared_key`: the initiator-side derived pairing shared key
-/// - `responder_transport_protocol`: responder transport information extracted from the
+/// - `peer_transport_protocol`: peer transport information extracted from the
 ///   validated [`derec_proto::PairRequestMessage`]
 ///
 /// # Errors
@@ -85,29 +94,18 @@ pub struct ProcessResult {
 /// # Security Notes
 ///
 /// - The derived shared key should be treated as sensitive material.
-/// - The returned `responder_transport_protocol` is peer-provided data; apply any
+/// - The returned `peer_transport_protocol` is peer-provided data; apply any
 ///   caller-side validation required by the selected transport layer before using it.
-///
-/// # Example
-///
-/// ```no_run
-/// use derec_library::primitives::pairing::{request, response};
-/// use derec_proto::{Protocol, SenderKind::Helper, TransportProtocol};
-///
-/// // After extracting the pairing request:
-/// // let request::ExtractResult { request } = request::extract(&envelope_bytes, &ecies_secret_key)?;
-/// // let response::ProduceResult { envelope, shared_key, responder_transport_protocol } =
-/// //     response::produce(Helper, &request, &initiator_secret_key)?;
-/// ```
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = request.channel_id, kind = kind as i32))
 )]
-pub fn produce(
+pub fn accept(
     kind: SenderKind,
     request: &PairRequestMessage,
     pairing_secret_key_material: &PairingSecretKeyMaterial,
-) -> Result<ProduceResult, crate::Error> {
+    communication_info: Option<CommunicationInfo>,
+) -> Result<AcceptResult, crate::Error> {
     if request.mlkem_ciphertext.is_empty() {
         #[cfg(feature = "logging")]
         tracing::warn!("pair request missing mlkem_ciphertext");
@@ -120,14 +118,14 @@ pub fn produce(
         return Err(PairingError::InvalidPairRequestMessage("ecies_public_key is empty").into());
     }
 
-    let responder_transport_protocol = request
+    let peer_transport_protocol = request
         .transport_protocol
         .clone()
         .ok_or(PairingError::EmptyTransportUri)?;
 
-    if responder_transport_protocol.uri.trim().is_empty() {
+    if peer_transport_protocol.uri.trim().is_empty() {
         #[cfg(feature = "logging")]
-        tracing::warn!("responder transport URI is empty");
+        tracing::warn!("peer transport URI is empty");
         return Err(PairingError::EmptyTransportUri.into());
     }
 
@@ -139,18 +137,16 @@ pub fn produce(
     let initiator_material = match pairing_secret_key_material {
         cryptography_pairing::PairingSecretKeyMaterial::Initiator(m) => m,
         _ => {
-            return Err(
-                PairingError::Invariant("expected Initiator key material for pairing response")
-                    .into(),
+            return Err(PairingError::Invariant(
+                "expected Initiator key material for pairing response",
             )
+            .into());
         }
     };
 
-    let shared_key = cryptography_pairing::finish_pairing_initiator(
-        initiator_material,
-        &pairing_request,
-    )
-    .map_err(|e| PairingError::FinishPairingInitiator { source: e })?;
+    let shared_key =
+        cryptography_pairing::finish_pairing_initiator(initiator_material, &pairing_request)
+            .map_err(|e| PairingError::FinishPairingInitiator { source: e })?;
 
     let timestamp = current_timestamp();
 
@@ -161,7 +157,7 @@ pub fn produce(
             memo: String::new(),
         }),
         nonce: request.nonce,
-        communication_info: None,
+        communication_info,
         parameter_range: None,
         timestamp: Some(timestamp),
     };
@@ -177,10 +173,79 @@ pub fn produce(
     #[cfg(feature = "logging")]
     tracing::info!("pairing response envelope produced; initiator shared key derived");
 
-    Ok(ProduceResult {
+    Ok(AcceptResult {
         envelope,
         shared_key,
-        responder_transport_protocol,
+        peer_transport_protocol,
+    })
+}
+
+/// Produces a pairing rejection envelope — a [`derec_proto::PairResponseMessage`] with
+/// the given [`StatusEnum`] status and an application-supplied memo.
+///
+/// This function is used when the local user decides to decline an incoming pairing request.
+/// Unlike [`accept`], no shared key is derived and the response signals failure to the peer.
+///
+/// # Arguments
+///
+/// * `kind` - Role of the sender within the DeRec protocol (same semantics as [`accept`]).
+/// * `request` - The decoded [`derec_proto::PairRequestMessage`] from the peer.
+/// * `status` - The [`StatusEnum`] to include in the rejection response (e.g. `Fail`,
+///   `TooFrequent`, `RequestToClose`).
+/// * `memo` - Human-readable reason for the rejection.
+///
+/// # Returns
+///
+/// On success returns [`RejectResult`] containing the encrypted rejection envelope and
+/// the peer's transport endpoint.
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = request.channel_id))
+)]
+pub fn reject(
+    kind: SenderKind,
+    request: &PairRequestMessage,
+    status: StatusEnum,
+    memo: &str,
+    communication_info: Option<CommunicationInfo>,
+) -> Result<RejectResult, crate::Error> {
+    let peer_transport_protocol = request
+        .transport_protocol
+        .clone()
+        .ok_or(PairingError::EmptyTransportUri)?;
+
+    if peer_transport_protocol.uri.trim().is_empty() {
+        return Err(PairingError::EmptyTransportUri.into());
+    }
+
+    let timestamp = current_timestamp();
+
+    let response = PairResponseMessage {
+        sender_kind: kind.into(),
+        result: Some(DeRecResult {
+            status: status as i32,
+            memo: memo.to_owned(),
+        }),
+        nonce: request.nonce,
+        communication_info,
+        parameter_range: None,
+        timestamp: Some(timestamp),
+    };
+
+    let envelope = DeRecMessageBuilder::pairing()
+        .channel_id(request.channel_id.into())
+        .timestamp(timestamp)
+        .message_body(MessageBody::PairResponse(response))
+        .encrypt_pairing(&request.ecies_public_key)?
+        .build()?
+        .encode_to_vec();
+
+    #[cfg(feature = "logging")]
+    tracing::info!("pairing rejection envelope produced");
+
+    Ok(RejectResult {
+        envelope,
+        peer_transport_protocol,
     })
 }
 
@@ -374,16 +439,15 @@ pub fn process(
     let responder_material = match pairing_secret_key_material {
         cryptography_pairing::PairingSecretKeyMaterial::Responder(m) => m,
         _ => {
-            return Err(
-                PairingError::Invariant("expected Responder key material for pairing process")
-                    .into(),
+            return Err(PairingError::Invariant(
+                "expected Responder key material for pairing process",
             )
+            .into());
         }
     };
 
-    let shared_key =
-        cryptography_pairing::finish_pairing_responder(responder_material, &pk)
-            .map_err(|e| PairingError::FinishPairingResponder { source: e })?;
+    let shared_key = cryptography_pairing::finish_pairing_responder(responder_material, &pk)
+        .map_err(|e| PairingError::FinishPairingResponder { source: e })?;
 
     #[cfg(feature = "logging")]
     tracing::info!("pairing complete; responder shared key derived");

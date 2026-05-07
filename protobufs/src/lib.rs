@@ -1,17 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// TODO: Remove all references to the messages That commented out below
-// ReplicaConfirmationRequest(ReplicaConfirmationRequestMessage),
-// ReplicaConfirmationResponse(ReplicaConfirmationResponseMessage),
-// ReplicaChannelsDiscoveryRequest(ReplicaChannelsDiscoveryRequestMessage),
-// ReplicaChannelsDiscoveryResponse(ReplicaChannelsDiscoveryResponseMessage),
-// ReplicaSecretsDiscoveryRequest(ReplicaSecretsDiscoveryRequestMessage),
-// ReplicaSecretsDiscoveryResponse(ReplicaSecretsDiscoveryResponseMessage),
-// ReplicaChannelSyncRequest(ReplicaChannelSyncRequestMessage),
-// ReplicaChannelSyncResponse(ReplicaChannelSyncResponseMessage),
-// ReplicaSecretSyncRequest(ReplicaSecretSyncRequestMessage),
-// ReplicaSecretSyncResponse(ReplicaSecretSyncResponseMessage),
-
 //! # Protobuf Bindings
 //!
 //! This module exposes the Rust types generated from the DeRec protocol

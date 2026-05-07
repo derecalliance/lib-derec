@@ -23,6 +23,7 @@
 //! interface ContactStore {
 //!   load(channelId: string): Promise<Uint8Array | null | undefined>;
 //!   save(channelId: string, contactBytes: Uint8Array): Promise<void>;
+//!   listChannels(): Promise<string[]>;
 //! }
 //! // Uint8Array is the raw protobuf encoding of a ContactMessage.
 //! ```
@@ -30,10 +31,8 @@
 //! ### `ShareStore`
 //! ```ts
 //! interface ShareStore {
-//!   load(channelId: string, secretId: Uint8Array, version: number): Promise<Uint8Array | null | undefined>;
-//!   save(channelId: string, secretId: Uint8Array, version: number, encoded: Uint8Array): Promise<void>;
-//!   loadChannelsForSecret(secretId: Uint8Array, version: number): Promise<string[]>;
-//!   loadSecretsForChannel(channelId: string): Promise<Array<[Uint8Array, number[]]>>;
+//!   load(channelId: string, versions: number[]): Promise<Array<[number, Uint8Array]>>;
+//!   save(channelId: string, version: number, encoded: Uint8Array): Promise<void>;
 //! }
 //! ```
 //!
@@ -55,13 +54,13 @@ use wasm_bindgen_futures::JsFuture;
 use crate::{
     Error,
     protocol::{
-        error::{ContactStoreError, SecretStoreError, ShareStoreError},
+        error::{ChannelStoreError, SecretStoreError, ShareStoreError},
         traits::{
-            ContactStoreFuture, DeRecContactStore, DeRecSecretStore, DeRecShareStore, DeRecTransport,
+            ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecTransport,
             SecretKind, SecretStoreFuture, SecretValue, ShareStoreFuture, TransportFuture,
         },
     },
-    types::ChannelId,
+    types::{Channel, ChannelId, ChannelStatus},
 };
 
 // ── Error helpers ─────────────────────────────────────────────────────────────
@@ -143,6 +142,11 @@ impl DeRecSecretStore for JsSecretStore {
                             .map_err(|e| SecretStoreError::Backend(box_err(e.to_string())))?;
                     Ok(Some(SecretValue::PairingSecret(material)))
                 }
+                SecretKind::PairingContact => {
+                    let contact = ContactMessage::decode(bytes.as_slice())
+                        .map_err(|e| SecretStoreError::Backend(box_err(e.to_string())))?;
+                    Ok(Some(SecretValue::PairingContact(contact)))
+                }
             }
         })
     }
@@ -159,6 +163,9 @@ impl DeRecSecretStore for JsSecretStore {
                         .serialize_uncompressed(&mut buf)
                         .map_err(|e| SecretStoreError::Backend(box_err(format!("{e:?}"))))?;
                     (1u32, buf)
+                }
+                SecretValue::PairingContact(contact) => {
+                    (2u32, contact.encode_to_vec())
                 }
             };
             let js_bytes = Uint8Array::from(bytes.as_slice());
@@ -193,52 +200,175 @@ impl DeRecSecretStore for JsSecretStore {
     }
 }
 
-// ── JsContactStore ────────────────────────────────────────────────────────────
+// ── JsChannelStore ───────────────────────────────────────────────────────────
 
-/// Adapter wrapping a JS `ContactStore` object.
-pub struct JsContactStore(pub JsValue);
+/// Adapter wrapping a JS `ChannelStore` object.
+///
+/// # JS interface contract
+///
+/// ```ts
+/// interface ChannelStore {
+///   load(channelId: string): Promise<Uint8Array | null>;
+///   save(channelId: string, bytes: Uint8Array): Promise<void>;
+///   listChannels(): Promise<string[]>;
+/// }
+/// ```
+///
+/// The bytes are JSON-encoded [`Channel`] records.
+pub struct JsChannelStore(pub JsValue);
 
-impl DeRecContactStore for JsContactStore {
-    fn load(&self, channel_id: ChannelId) -> ContactStoreFuture<'_, Option<ContactMessage>> {
+/// Serializable representation of a [`Channel`] for JS store persistence.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ChannelRecord {
+    channel_id: u64,
+    transport_uri: String,
+    transport_protocol: i32,
+    name: String,
+    #[serde(default = "default_channel_status")]
+    status: String,
+    #[serde(default)]
+    created_at: u64,
+}
+
+fn default_channel_status() -> String {
+    "paired".to_owned()
+}
+
+impl From<&Channel> for ChannelRecord {
+    fn from(ch: &Channel) -> Self {
+        let status = match ch.status {
+            ChannelStatus::Pending => "pending",
+            ChannelStatus::Paired => "paired",
+        };
+        Self {
+            channel_id: ch.id.0,
+            transport_uri: ch.transport.uri.clone(),
+            transport_protocol: ch.transport.protocol,
+            name: ch.name.clone(),
+            status: status.to_owned(),
+            created_at: ch.created_at,
+        }
+    }
+}
+
+impl From<ChannelRecord> for Channel {
+    fn from(rec: ChannelRecord) -> Self {
+        let status = match rec.status.as_str() {
+            "pending" => ChannelStatus::Pending,
+            _ => ChannelStatus::Paired,
+        };
+        Self {
+            id: ChannelId(rec.channel_id),
+            transport: TransportProtocol {
+                uri: rec.transport_uri,
+                protocol: rec.transport_protocol,
+            },
+            name: rec.name,
+            status,
+            created_at: rec.created_at,
+        }
+    }
+}
+
+impl DeRecChannelStore for JsChannelStore {
+    fn load(&self, channel_id: ChannelId) -> ChannelStoreFuture<'_, Option<Channel>> {
         let obj = self.0.clone();
         let channel_str = channel_id.0.to_string();
         Box::pin(async move {
             let args = Array::new();
             args.push(&JsValue::from_str(&channel_str));
             let promise_val = call_method(&obj, "load", &args)
-                .map_err(|e| ContactStoreError::Backend(box_err(e)))?;
+                .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
             let value = resolve_promise(promise_val)
                 .await
-                .map_err(|e| ContactStoreError::Backend(box_err(e)))?;
+                .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
             if value.is_null() || value.is_undefined() {
                 return Ok(None);
             }
             let bytes = Uint8Array::new(&value).to_vec();
-            let msg = ContactMessage::decode(bytes.as_slice())
-                .map_err(|e| ContactStoreError::Backend(box_err(e.to_string())))?;
-            Ok(Some(msg))
+            let record: ChannelRecord = serde_json::from_slice(&bytes)
+                .map_err(|e| ChannelStoreError::Backend(box_err(e.to_string())))?;
+            Ok(Some(record.into()))
         })
     }
 
-    fn save(
-        &mut self,
-        channel_id: ChannelId,
-        contact: ContactMessage,
-    ) -> ContactStoreFuture<'_, ()> {
+    fn channels(&self) -> ChannelStoreFuture<'_, Vec<Channel>> {
         let obj = self.0.clone();
-        let channel_str = channel_id.0.to_string();
-        let bytes = contact.encode_to_vec();
         Box::pin(async move {
+            let args = Array::new();
+            let promise_val = call_method(&obj, "listChannels", &args)
+                .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
+            let value = resolve_promise(promise_val)
+                .await
+                .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
+            let arr = Array::from(&value);
+
+            let mut result = Vec::with_capacity(arr.length() as usize);
+            for i in 0..arr.length() {
+                let item = arr.get(i);
+                let s = item.as_string().ok_or_else(|| {
+                    ChannelStoreError::Backend(box_err("channel id must be a string".to_string()))
+                })?;
+                let id = s
+                    .parse::<u64>()
+                    .map_err(|e| ChannelStoreError::Backend(box_err(e.to_string())))?;
+                let channel_id = ChannelId(id);
+
+                let load_args = Array::new();
+                load_args.push(&JsValue::from_str(&s));
+                let load_promise = call_method(&obj, "load", &load_args)
+                    .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
+                let load_value = resolve_promise(load_promise)
+                    .await
+                    .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
+
+                if load_value.is_null() || load_value.is_undefined() {
+                    continue;
+                }
+                let bytes = Uint8Array::new(&load_value).to_vec();
+                let record: ChannelRecord = serde_json::from_slice(&bytes)
+                    .map_err(|e| ChannelStoreError::Backend(box_err(e.to_string())))?;
+                let channel: Channel = record.into();
+                // Sanity check: the stored channel_id must match the index key
+                debug_assert_eq!(channel.id, channel_id);
+                result.push(channel);
+            }
+            Ok(result)
+        })
+    }
+
+    fn save(&mut self, channel: Channel) -> ChannelStoreFuture<'_, ()> {
+        let obj = self.0.clone();
+        let channel_str = channel.id.0.to_string();
+        let record = ChannelRecord::from(&channel);
+        Box::pin(async move {
+            let bytes = serde_json::to_vec(&record)
+                .map_err(|e| ChannelStoreError::Backend(box_err(e.to_string())))?;
             let js_bytes = Uint8Array::from(bytes.as_slice());
             let args = Array::new();
             args.push(&JsValue::from_str(&channel_str));
             args.push(&js_bytes);
             let promise_val = call_method(&obj, "save", &args)
-                .map_err(|e| ContactStoreError::Backend(box_err(e)))?;
+                .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
             resolve_promise(promise_val)
                 .await
-                .map_err(|e| ContactStoreError::Backend(box_err(e)))?;
+                .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
             Ok(())
+        })
+    }
+
+    fn remove(&mut self, channel_id: ChannelId) -> ChannelStoreFuture<'_, bool> {
+        let obj = self.0.clone();
+        let channel_str = channel_id.0.to_string();
+        Box::pin(async move {
+            let args = Array::new();
+            args.push(&JsValue::from_str(&channel_str));
+            let promise_val = call_method(&obj, "remove", &args)
+                .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
+            let value = resolve_promise(promise_val)
+                .await
+                .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
+            Ok(value.as_bool().unwrap_or(false))
         })
     }
 }
@@ -252,46 +382,72 @@ impl DeRecShareStore for JsShareStore {
     fn load(
         &self,
         channel_id: ChannelId,
-        secret_id: &[u8],
-        version: i32,
-    ) -> ShareStoreFuture<'_, Option<Vec<u8>>> {
+        versions: &[i32],
+    ) -> ShareStoreFuture<'_, Vec<(i32, Vec<u8>)>> {
         let obj = self.0.clone();
         let channel_str = channel_id.0.to_string();
-        let secret_id_vec = secret_id.to_vec();
+        let versions_vec: Vec<i32> = versions.to_vec();
         Box::pin(async move {
-            let js_secret_id = Uint8Array::from(secret_id_vec.as_slice());
+            let js_versions = Array::new();
+            for v in &versions_vec {
+                js_versions.push(&JsValue::from_f64(*v as f64));
+            }
             let args = Array::new();
             args.push(&JsValue::from_str(&channel_str));
-            args.push(&js_secret_id);
-            args.push(&JsValue::from_f64(version as f64));
+            args.push(&js_versions);
             let promise_val = call_method(&obj, "load", &args)
                 .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
             let value = resolve_promise(promise_val)
                 .await
                 .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
-            if value.is_null() || value.is_undefined() {
-                return Ok(None);
+            // Expects Array<[number, Uint8Array]>
+            let arr = Array::from(&value);
+            let mut result = Vec::with_capacity(arr.length() as usize);
+            for i in 0..arr.length() {
+                let entry = Array::from(&arr.get(i));
+                let v = entry.get(0).as_f64().ok_or_else(|| {
+                    ShareStoreError::Backend(box_err("version must be a number".to_string()))
+                })? as i32;
+                let data = Uint8Array::new(&entry.get(1)).to_vec();
+                result.push((v, data));
             }
-            Ok(Some(Uint8Array::new(&value).to_vec()))
+            Ok(result)
+        })
+    }
+
+    fn latest_version(&self) -> ShareStoreFuture<'_, Option<i32>> {
+        let obj = self.0.clone();
+        Box::pin(async move {
+            let args = Array::new();
+            let promise_val = call_method(&obj, "latestVersion", &args)
+                .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
+            let value = resolve_promise(promise_val)
+                .await
+                .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
+            if value.is_null() || value.is_undefined() {
+                Ok(None)
+            } else {
+                let v = value
+                    .as_f64()
+                    .ok_or_else(|| ShareStoreError::Backend(box_err("latestVersion must return a number or null".to_string())))?
+                    as i32;
+                Ok(Some(v))
+            }
         })
     }
 
     fn save(
         &mut self,
         channel_id: ChannelId,
-        secret_id: &[u8],
         version: i32,
         encoded: Vec<u8>,
     ) -> ShareStoreFuture<'_, ()> {
         let obj = self.0.clone();
         let channel_str = channel_id.0.to_string();
-        let secret_id_vec = secret_id.to_vec();
         Box::pin(async move {
-            let js_secret_id = Uint8Array::from(secret_id_vec.as_slice());
             let js_encoded = Uint8Array::from(encoded.as_slice());
             let args = Array::new();
             args.push(&JsValue::from_str(&channel_str));
-            args.push(&js_secret_id);
             args.push(&JsValue::from_f64(version as f64));
             args.push(&js_encoded);
             let promise_val = call_method(&obj, "save", &args)
@@ -303,72 +459,6 @@ impl DeRecShareStore for JsShareStore {
         })
     }
 
-    fn load_channels_for_secret(
-        &self,
-        secret_id: &[u8],
-        version: i32,
-    ) -> ShareStoreFuture<'_, Vec<ChannelId>> {
-        let obj = self.0.clone();
-        let secret_id_vec = secret_id.to_vec();
-        Box::pin(async move {
-            let js_secret_id = Uint8Array::from(secret_id_vec.as_slice());
-            let args = Array::new();
-            args.push(&js_secret_id);
-            args.push(&JsValue::from_f64(version as f64));
-            let promise_val = call_method(&obj, "loadChannelsForSecret", &args)
-                .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
-            let value = resolve_promise(promise_val)
-                .await
-                .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
-            let arr = Array::from(&value);
-            let mut ids = Vec::with_capacity(arr.length() as usize);
-            for i in 0..arr.length() {
-                let item = arr.get(i);
-                let s = item.as_string().ok_or_else(|| {
-                    ShareStoreError::Backend(box_err("channel id must be a string".to_string()))
-                })?;
-                let id = s
-                    .parse::<u64>()
-                    .map_err(|e| ShareStoreError::Backend(box_err(e.to_string())))?;
-                ids.push(ChannelId(id));
-            }
-            Ok(ids)
-        })
-    }
-
-    fn load_secrets_for_channel(
-        &self,
-        channel_id: ChannelId,
-    ) -> ShareStoreFuture<'_, Vec<(Vec<u8>, Vec<i32>)>> {
-        let obj = self.0.clone();
-        let channel_str = channel_id.0.to_string();
-        Box::pin(async move {
-            let args = Array::new();
-            args.push(&JsValue::from_str(&channel_str));
-            let promise_val = call_method(&obj, "loadSecretsForChannel", &args)
-                .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
-            let value = resolve_promise(promise_val)
-                .await
-                .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
-            // Expects Array<[Uint8Array, number[]]>
-            let arr = Array::from(&value);
-            let mut secrets = Vec::with_capacity(arr.length() as usize);
-            for i in 0..arr.length() {
-                let entry = Array::from(&arr.get(i));
-                let secret_id = Uint8Array::new(&entry.get(0)).to_vec();
-                let versions_js = Array::from(&entry.get(1));
-                let mut versions = Vec::with_capacity(versions_js.length() as usize);
-                for j in 0..versions_js.length() {
-                    let v = versions_js.get(j).as_f64().ok_or_else(|| {
-                        ShareStoreError::Backend(box_err("version must be a number".to_string()))
-                    })?;
-                    versions.push(v as i32);
-                }
-                secrets.push((secret_id, versions));
-            }
-            Ok(secrets)
-        })
-    }
 }
 
 // ── JsTransport ───────────────────────────────────────────────────────────────

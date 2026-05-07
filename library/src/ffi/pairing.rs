@@ -105,7 +105,7 @@ pub struct ProducePairingRequestMessageResult {
 /// - `status` indicates success
 /// - `pair_response_message` contains serialized outer `DeRecMessage` bytes
 ///   carrying an encrypted inner `PairResponseMessage`
-/// - `responder_transport_protocol` contains serialized `TransportProtocol` protobuf bytes
+/// - `peer_transport_protocol` contains serialized `TransportProtocol` protobuf bytes
 ///   extracted from the validated pairing request
 /// - `shared_key` contains the derived pairing shared key bytes
 ///
@@ -117,7 +117,7 @@ pub struct ProducePairingRequestMessageResult {
 pub struct ProducePairingResponseMessageResult {
     pub status: DeRecStatus,
     pub response_wire_bytes: DeRecBuffer,
-    pub responder_transport_protocol: DeRecBuffer,
+    pub peer_transport_protocol: DeRecBuffer,
     pub shared_key: DeRecBuffer,
 }
 
@@ -341,6 +341,7 @@ pub extern "C" fn produce_pairing_request_message(
         sender_kind,
         transport_protocol,
         &contact_message,
+        None,
     ) {
         Ok(value) => value,
         Err(err) => {
@@ -423,7 +424,7 @@ pub extern "C" fn produce_pairing_response_message(
         return ProducePairingResponseMessageResult {
             status: err_status("pair_request_message_ptr is null"),
             response_wire_bytes: empty_buffer(),
-            responder_transport_protocol: empty_buffer(),
+            peer_transport_protocol: empty_buffer(),
             shared_key: empty_buffer(),
         };
     }
@@ -432,7 +433,7 @@ pub extern "C" fn produce_pairing_response_message(
         return ProducePairingResponseMessageResult {
             status: err_status("secret_key_material_ptr is null"),
             response_wire_bytes: empty_buffer(),
-            responder_transport_protocol: empty_buffer(),
+            peer_transport_protocol: empty_buffer(),
             shared_key: empty_buffer(),
         };
     }
@@ -443,7 +444,7 @@ pub extern "C" fn produce_pairing_response_message(
             return ProducePairingResponseMessageResult {
                 status: err_status(format!("invalid SenderKind value: {sender_kind}")),
                 response_wire_bytes: empty_buffer(),
-                responder_transport_protocol: empty_buffer(),
+                peer_transport_protocol: empty_buffer(),
                 shared_key: empty_buffer(),
             };
         }
@@ -462,7 +463,7 @@ pub extern "C" fn produce_pairing_response_message(
                 return ProducePairingResponseMessageResult {
                     status: err_status(format!("invalid secret key material: {err}")),
                     response_wire_bytes: empty_buffer(),
-                    responder_transport_protocol: empty_buffer(),
+                    peer_transport_protocol: empty_buffer(),
                     shared_key: empty_buffer(),
                 };
             }
@@ -477,36 +478,37 @@ pub extern "C" fn produce_pairing_response_message(
             return ProducePairingResponseMessageResult {
                 status: err_status(err.to_string()),
                 response_wire_bytes: empty_buffer(),
-                responder_transport_protocol: empty_buffer(),
+                peer_transport_protocol: empty_buffer(),
                 shared_key: empty_buffer(),
             };
         }
     };
 
-    let result = match crate::primitives::pairing::response::produce(
+    let result = match crate::primitives::pairing::response::accept(
         sender_kind,
         &request,
         &pairing_secret_key_material,
+        None,
     ) {
         Ok(value) => value,
         Err(err) => {
             return ProducePairingResponseMessageResult {
                 status: err_status(err.to_string()),
                 response_wire_bytes: empty_buffer(),
-                responder_transport_protocol: empty_buffer(),
+                peer_transport_protocol: empty_buffer(),
                 shared_key: empty_buffer(),
             };
         }
     };
 
     let pair_response_message_bytes = result.envelope;
-    let transport_protocol_bytes = serialize_transport_protocol(&result.responder_transport_protocol);
+    let transport_protocol_bytes = serialize_transport_protocol(&result.peer_transport_protocol);
     let shared_key_bytes = serialize_pairing_shared_key(&result.shared_key);
 
     ProducePairingResponseMessageResult {
         status: ok_status(),
         response_wire_bytes: vec_into_buffer(pair_response_message_bytes),
-        responder_transport_protocol: vec_into_buffer(transport_protocol_bytes),
+        peer_transport_protocol: vec_into_buffer(transport_protocol_bytes),
         shared_key: vec_into_buffer(shared_key_bytes),
     }
 }

@@ -45,7 +45,9 @@ tokio = { version = "1", features = ["rt"], default-features = false }
 wasm-bindgen = { version = "0.2.114", features = ["serde-serialize"] }
 wasm-bindgen-futures = { version = "0.4.44" }
 serde-wasm-bindgen = { version = "0.6.5" }
+serde_json = "1"
 js-sys = { version = "0.3.91" }
+web-sys = { version = "0.3.91", features = ["console"] }
 getrandom_02 = { package = "getrandom", version = "0.2.16", features = ["js"] }
 getrandom_04 = { package = "getrandom", version = "0.4.2", features = ["wasm_js"] }
 console_error_panic_hook = "0.1.7"
@@ -53,6 +55,7 @@ console_error_panic_hook = "0.1.7"
 [features]
 primitives = []
 logging = ["dep:tracing"]
+ffi = []
 
 [dev-dependencies]
 rand08 = { package = "rand", version = "0.8.5" }

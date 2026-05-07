@@ -71,38 +71,103 @@ impl PartialEq<u64> for ChannelId {
 /// and authenticate all subsequent protocol messages on the associated channel.
 pub type SharedKey = [u8; 32];
 
-/// A secret to be protected by the DeRec protocol.
-///
-/// Groups the pieces of information that identify and describe a secret
-/// throughout its lifecycle — from initial sharing through verification and
-/// recovery.
-///
-/// # Versioning
-///
-/// Secrets are versioned so that Helpers can store multiple generations and the
-/// Owner can rotate the secret without losing recovery capability until the new
-/// version has been confirmed by a quorum of Helpers.
-pub struct Secret {
-    /// Application-defined identifier for this secret.
-    ///
-    /// Used by the Owner to distinguish between different protected values and
-    /// by the recovery flow to request the correct share from each Helper.
-    pub id: Vec<u8>,
+/// Selects which channels to target for a discovery request.
+#[derive(Debug, Clone)]
+pub enum Target {
+    /// Send to all paired channels (most common case).
+    All,
+    /// Send to a single channel.
+    Single(ChannelId),
+    /// Send to a specific set of channels.
+    Many(Vec<ChannelId>),
+}
 
-    /// Monotonically increasing version number.
-    ///
-    /// Must be incremented each time the secret data changes. Helpers store
-    /// shares keyed by `(channel_id, version)` and keep the previous version
-    /// until the Owner confirms the new one has been accepted by a threshold.
-    pub version: i32,
+// Post-pairing representation of a peer relationship. A `ContactMessage` is
+// relevant only during pairing (it carries ephemeral keys and nonces). Once
+// pairing completes the only fields that matter are the channel ID, the
+// peer's transport endpoint, and an optional human-readable name.
 
-    /// Raw secret bytes to be split and distributed.
-    pub data: Vec<u8>,
+/// Status of a channel in the protocol lifecycle.
+///
+/// Replica channels start as `Pending` after pairing completes and transition
+/// to `Paired` once fingerprint verification succeeds. Helper/Owner channels
+/// are `Paired` immediately after pairing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChannelStatus {
+    /// Channel is awaiting fingerprint verification (replica only).
+    Pending,
+    /// Channel is fully paired and ready for protocol messages.
+    Paired,
+}
 
-    /// Human-readable label for this secret.
-    ///
-    /// Forwarded to each Helper inside the `StoreShareRequestMessage` so that
-    /// the Helper can present a meaningful name when the Owner later lists
-    /// stored secrets (e.g. during recovery). May be empty.
-    pub description: String,
+/// A channel — the post-pairing representation of a peer.
+///
+/// Stored by [`DeRecChannelStore`](crate::protocol::DeRecChannelStore) and
+/// returned by its `channels()` method.
+#[derive(Clone, Debug)]
+pub struct Channel {
+    /// Unique identifier for this channel.
+    pub id: ChannelId,
+    /// The peer's transport endpoint.
+    pub transport: derec_proto::TransportProtocol,
+    /// Human-readable name for the peer (may be empty).
+    pub name: String,
+    /// Lifecycle status. Messages on `Pending` channels are ignored.
+    pub status: ChannelStatus,
+    /// Unix timestamp (seconds) when the channel was created.
+    pub created_at: u64,
+}
+
+/// Per-helper metadata stored inside the secret bag for recovery.
+///
+/// Each entry records the pairing state of a Helper so that recovery can
+/// re-establish communication channels without external configuration.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HelperInfo {
+    /// Unique channel identifier assigned during pairing.
+    #[prost(uint64, tag = "1")]
+    pub channel_id: u64,
+    /// The Helper's message endpoint URI.
+    #[prost(string, tag = "2")]
+    pub transport_uri: ::prost::alloc::string::String,
+    /// Human-readable memo for the Helper.
+    #[prost(string, tag = "3")]
+    pub name: ::prost::alloc::string::String,
+    /// Symmetric key negotiated during pairing (32 bytes).
+    #[prost(bytes = "vec", tag = "4")]
+    pub shared_key: ::prost::alloc::vec::Vec<u8>,
+}
+
+/// A single user-facing secret within the bag.
+///
+/// The Owner can store multiple logical secrets (credentials, keys, notes)
+/// inside a single secret bag. Each `UserSecret` is independently
+/// identifiable so the application can present, add, or remove individual
+/// entries while the protocol treats the entire bag as one opaque blob.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UserSecret {
+    /// Application-defined identifier.
+    #[prost(bytes = "vec", tag = "1")]
+    pub id: ::prost::alloc::vec::Vec<u8>,
+    /// Human-readable label.
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    /// Raw secret bytes.
+    #[prost(bytes = "vec", tag = "3")]
+    pub data: ::prost::alloc::vec::Vec<u8>,
+}
+
+/// The secret bag — serialized into `DeRecSecret.secret_data`.
+///
+/// This is the actual payload that gets protobuf-encoded, then placed into
+/// the `secret_data` bytes field of the canonical `DeRecSecret` protobuf
+/// message before encryption and distribution.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SecretContainer {
+    /// Snapshot of all paired Helpers at the time of distribution.
+    #[prost(message, repeated, tag = "1")]
+    pub helpers: ::prost::alloc::vec::Vec<HelperInfo>,
+    /// The user-facing secrets the Owner wishes to protect.
+    #[prost(message, repeated, tag = "2")]
+    pub secrets: ::prost::alloc::vec::Vec<UserSecret>,
 }

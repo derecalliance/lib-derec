@@ -124,7 +124,7 @@ pub fn produce(
         envelope,
         initiator_contact_message,
         secret_key,
-    } = request::produce(sender_kind, transport_protocol, &contact_message)
+    } = request::produce(sender_kind, transport_protocol, &contact_message, None)
         .map_err(js_error_from_lib)?;
 
     let envelope_decoded = DeRecMessage::decode(envelope.as_slice())

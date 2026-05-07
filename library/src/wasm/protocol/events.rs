@@ -2,16 +2,24 @@
 
 //! Converts [`DeRecEvent`] values to plain JS objects for TypeScript consumers.
 
-use crate::protocol::DeRecEvent;
+use std::collections::HashMap;
+
+use serde::Serialize;
+
+use crate::protocol::{DeRecEvent, PendingAction};
 use crate::wasm::ts_bindings_utils::js_error;
 use wasm_bindgen::JsValue;
+
+use super::pending_action_wire;
 
 #[derive(serde::Serialize)]
 #[serde(tag = "type")]
 enum DeRecEventJs {
-    PairingComplete {
+    PairingCompleted {
         channel_id: String,
         kind: u32,
+        #[serde(skip_serializing_if = "HashMap::is_empty")]
+        peer_communication_info: HashMap<String, String>,
     },
     ShareStored {
         channel_id: String,
@@ -41,46 +49,24 @@ enum DeRecEventJs {
     SecretRecovered {
         secret: Vec<u8>,
     },
-    ReplicaConfirmationReceived {
+    ActionRequired {
         channel_id: String,
-        replica_id: i32,
-        fingerprint: String,
-    },
-    ReplicaConfirmed {
-        channel_id: String,
-        replica_id: i32,
-    },
-    ChannelsDiscoveryRequested {
-        channel_id: String,
-        last_batch_index: i32,
-    },
-    ChannelsDiscovered {
-        channel_id: String,
-        total_batches: i32,
-        current_batch: i32,
-        entries: Vec<ChannelEntryJs>,
-    },
-    SecretsDiscoveryRequested {
-        channel_id: String,
-        last_batch_index: i32,
-    },
-    ReplicaSecretsDiscovered {
-        channel_id: String,
-        total_batches: i32,
-        current_batch: i32,
-        entries: Vec<ReplicaSecretEntryJs>,
-    },
-    ChannelSynced {
-        channel_id: String,
-        new_channel_id: String,
-        new_shared_key: Vec<u8>,
-    },
-    SecretSynced {
-        channel_id: String,
-        secret_id: Vec<u8>,
-        version: i32,
-        description: String,
-        channel_ids: Vec<String>,
+        /// Opaque serialized PendingAction — pass back to accept() or reject().
+        action: Vec<u8>,
+        /// Human-readable tag: "Pairing", "StoreShare", "VerifyShare", "Discovery", "GetShare".
+        action_kind: String,
+        /// For Pairing actions: key-value pairs from the peer's CommunicationInfo.
+        #[serde(skip_serializing_if = "HashMap::is_empty")]
+        peer_communication_info: HashMap<String, String>,
+        /// For StoreShare actions: the share version number.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        share_version: Option<i32>,
+        /// For StoreShare actions: human-readable description of the secret version.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        share_description: Option<String>,
+        /// For StoreShare actions: the secret identifier (opaque bytes).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        share_secret_id: Option<Vec<u8>>,
     },
     NoOp,
 }
@@ -97,25 +83,51 @@ struct VersionEntryJs {
     description: String,
 }
 
-#[derive(serde::Serialize)]
-struct ChannelEntryJs {
-    channel_id: String,
-    shared_key: Vec<u8>,
+/// Extract `peer_communication_info` from a `PendingAction::Pairing`, or empty map otherwise.
+fn extract_peer_communication_info(action: &PendingAction) -> HashMap<String, String> {
+    match action {
+        PendingAction::Pairing { peer_communication_info, .. } => peer_communication_info.clone(),
+        _ => HashMap::new(),
+    }
 }
 
-#[derive(serde::Serialize)]
-struct ReplicaSecretEntryJs {
-    secret_id: Vec<u8>,
-    version: i32,
-    description: String,
-    channel_ids: Vec<String>,
+/// Extract share version and description from a `PendingAction::StoreShare`, or `(None, None)` otherwise.
+fn extract_share_metadata(action: &PendingAction) -> (Option<i32>, Option<String>, Option<Vec<u8>>) {
+    match action {
+        PendingAction::StoreShare { request, .. } => {
+            let desc = if request.version_description.is_empty() {
+                None
+            } else {
+                Some(request.version_description.clone())
+            };
+            let secret_id = if request.secret_id.is_empty() {
+                None
+            } else {
+                Some(request.secret_id.clone())
+            };
+            (Some(request.version), desc, secret_id)
+        }
+        _ => (None, None, None),
+    }
+}
+
+/// Returns a human-readable tag for the PendingAction variant.
+fn action_kind_label(action: &PendingAction) -> &'static str {
+    match action {
+        PendingAction::Pairing { .. } => "Pairing",
+        PendingAction::StoreShare { .. } => "StoreShare",
+        PendingAction::VerifyShare { .. } => "VerifyShare",
+        PendingAction::Discovery { .. } => "Discovery",
+        PendingAction::GetShare { .. } => "GetShare",
+    }
 }
 
 pub fn event_to_js(event: DeRecEvent) -> Result<JsValue, JsValue> {
     let js_event = match event {
-        DeRecEvent::PairingComplete { channel_id, kind } => DeRecEventJs::PairingComplete {
+        DeRecEvent::PairingCompleted { channel_id, kind, peer_communication_info } => DeRecEventJs::PairingCompleted {
             channel_id: channel_id.0.to_string(),
             kind: kind as u32,
+            peer_communication_info,
         },
         DeRecEvent::ShareStored { channel_id, version } => DeRecEventJs::ShareStored {
             channel_id: channel_id.0.to_string(),
@@ -160,75 +172,20 @@ pub fn event_to_js(event: DeRecEvent) -> Result<JsValue, JsValue> {
             }
         }
         DeRecEvent::SecretRecovered { secret } => DeRecEventJs::SecretRecovered { secret },
-        DeRecEvent::ReplicaConfirmationReceived { channel_id, replica_id, fingerprint } => {
-            DeRecEventJs::ReplicaConfirmationReceived {
+        DeRecEvent::ActionRequired { channel_id, action } => {
+            let kind = action_kind_label(&action).to_owned();
+            let peer_communication_info = extract_peer_communication_info(&action);
+            let (share_version, share_description, share_secret_id) = extract_share_metadata(&action);
+            let action_bytes = pending_action_wire::serialize(action)
+                .map_err(|e| js_error("WASM_SERIALIZE_ERROR", e))?;
+            DeRecEventJs::ActionRequired {
                 channel_id: channel_id.0.to_string(),
-                replica_id,
-                fingerprint,
-            }
-        }
-        DeRecEvent::ReplicaConfirmed { channel_id, replica_id } => {
-            DeRecEventJs::ReplicaConfirmed {
-                channel_id: channel_id.0.to_string(),
-                replica_id,
-            }
-        }
-        DeRecEvent::ChannelsDiscoveryRequested { channel_id, last_batch_index } => {
-            DeRecEventJs::ChannelsDiscoveryRequested {
-                channel_id: channel_id.0.to_string(),
-                last_batch_index,
-            }
-        }
-        DeRecEvent::ChannelsDiscovered { channel_id, total_batches, current_batch, entries } => {
-            DeRecEventJs::ChannelsDiscovered {
-                channel_id: channel_id.0.to_string(),
-                total_batches,
-                current_batch,
-                entries: entries
-                    .into_iter()
-                    .map(|e| ChannelEntryJs {
-                        channel_id: e.channel_id.0.to_string(),
-                        shared_key: e.shared_key.to_vec(),
-                    })
-                    .collect(),
-            }
-        }
-        DeRecEvent::SecretsDiscoveryRequested { channel_id, last_batch_index } => {
-            DeRecEventJs::SecretsDiscoveryRequested {
-                channel_id: channel_id.0.to_string(),
-                last_batch_index,
-            }
-        }
-        DeRecEvent::ReplicaSecretsDiscovered { channel_id, total_batches, current_batch, entries } => {
-            DeRecEventJs::ReplicaSecretsDiscovered {
-                channel_id: channel_id.0.to_string(),
-                total_batches,
-                current_batch,
-                entries: entries
-                    .into_iter()
-                    .map(|e| ReplicaSecretEntryJs {
-                        secret_id: e.secret_id,
-                        version: e.version,
-                        description: e.description,
-                        channel_ids: e.channel_ids.into_iter().map(|c| c.0.to_string()).collect(),
-                    })
-                    .collect(),
-            }
-        }
-        DeRecEvent::ChannelSynced { channel_id, new_channel_id, new_shared_key } => {
-            DeRecEventJs::ChannelSynced {
-                channel_id: channel_id.0.to_string(),
-                new_channel_id: new_channel_id.0.to_string(),
-                new_shared_key: new_shared_key.to_vec(),
-            }
-        }
-        DeRecEvent::SecretSynced { channel_id, secret_id, version, description, channel_ids } => {
-            DeRecEventJs::SecretSynced {
-                channel_id: channel_id.0.to_string(),
-                secret_id,
-                version,
-                description,
-                channel_ids: channel_ids.into_iter().map(|c| c.0.to_string()).collect(),
+                action: action_bytes,
+                action_kind: kind,
+                peer_communication_info,
+                share_version,
+                share_description,
+                share_secret_id,
             }
         }
         DeRecEvent::NoOp => DeRecEventJs::NoOp,
@@ -236,6 +193,7 @@ pub fn event_to_js(event: DeRecEvent) -> Result<JsValue, JsValue> {
         #[allow(unreachable_patterns)]
         _ => DeRecEventJs::NoOp,
     };
-    serde_wasm_bindgen::to_value(&js_event)
+    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    js_event.serialize(&serializer)
         .map_err(|e| js_error("WASM_SERIALIZE_ERROR", e.to_string()))
 }

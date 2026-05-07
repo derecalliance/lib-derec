@@ -33,7 +33,7 @@
 //! // Feed incoming wire bytes; react to returned events.
 //! const events = await protocol.process(rawBytes);
 //! for (const ev of events) {
-//!   if (ev.type === "PairingComplete") { ... }
+//!   if (ev.type === "PairingCompleted") { ... }
 //! }
 //! ```
 //!
@@ -41,22 +41,23 @@
 //! interface contracts.
 
 mod events;
+pub(crate) mod pending_action_wire;
 mod stores;
 
+use std::collections::HashMap;
+
 use crate::{
-    primitives::channels_discovery::response::ChannelEntry,
-    primitives::secrets_discovery::response::SecretEntry,
-    protocol::DeRecProtocol,
-    types::{ChannelId, Secret},
+    protocol::{DeRecFlow, DeRecProtocol, DeRecProtocolBuilder},
+    types::{ChannelId, Target, UserSecret},
     wasm::ts_bindings_utils::js_error,
 };
 use crate::wasm::primitives::pairing::{contact_message_to_js, js_to_contact_message};
 use derec_proto::{SenderKind, TransportProtocol};
-use js_sys::Array;
-use stores::{JsContactStore, JsSecretStore, JsShareStore, JsTransport};
+use js_sys::{Array, Uint8Array};
+use stores::{JsChannelStore, JsSecretStore, JsShareStore, JsTransport};
 use wasm_bindgen::prelude::*;
 
-type WasmProtocol = DeRecProtocol<JsContactStore, JsShareStore, JsSecretStore, JsTransport>;
+type WasmProtocol = DeRecProtocol<JsChannelStore, JsShareStore, JsSecretStore, JsTransport>;
 
 /// Higher-level DeRec protocol orchestrator for TypeScript/JavaScript consumers.
 ///
@@ -77,7 +78,7 @@ type WasmProtocol = DeRecProtocol<JsContactStore, JsShareStore, JsSecretStore, J
 ///
 /// | `type`             | Additional fields                                      |
 /// |--------------------|--------------------------------------------------------|
-/// | `PairingComplete`  | `channel_id: string`, `kind: number`                   |
+/// | `PairingCompleted`  | `channel_id: string`, `kind: number`                   |
 /// | `ShareStored`      | `channel_id: string`, `version: number`                |
 /// | `ShareConfirmed`   | `channel_id: string`, `version: number`                |
 /// | `ShareVerified`    | `channel_id: string`, `version: number`                |
@@ -97,9 +98,10 @@ impl DeRecProtocolWasm {
     ///
     /// # Arguments
     ///
-    /// * `contact_store` — JS object with `load(channelId: string): Promise<Uint8Array|null>` and
-    ///   `save(channelId: string, bytes: Uint8Array): Promise<void>`.
-    ///   The bytes are raw protobuf-encoded `ContactMessage`s.
+    /// * `channel_store` — JS object with `load(channelId: string): Promise<Uint8Array|null>`,
+    ///   `save(channelId: string, bytes: Uint8Array): Promise<void>`, and
+    ///   `listChannels(): Promise<string[]>`.
+    ///   The bytes are JSON-encoded `Channel` records.
     ///
     /// * `share_store` — JS object with `load`, `save`, `loadChannelsForSecret`,
     ///   `loadSecretsForChannel` (see module-level docs for full signatures).
@@ -117,14 +119,22 @@ impl DeRecProtocolWasm {
     ///   (e.g. `"https://my-node.example.com/derec"`).
     ///
     /// * `own_transport_protocol` — Protocol string, currently must be `"https"`.
+    /// # Arguments
+    ///
+    /// * `threshold` — Minimum number of shares required for reconstruction.
+    /// * `keep_versions_count` — Number of recent versions each Helper must retain.
     #[wasm_bindgen(constructor)]
     pub fn new(
-        contact_store: JsValue,
+        channel_store: JsValue,
         share_store: JsValue,
         secret_store: JsValue,
         transport: JsValue,
         own_transport_uri: String,
         own_transport_protocol: String,
+        threshold: u32,
+        keep_versions_count: u32,
+        secret_id: &[u8],
+        communication_info: JsValue,
     ) -> Result<DeRecProtocolWasm, JsValue> {
         let protocol_num = match own_transport_protocol.to_lowercase().as_str() {
             "https" => 0i32,
@@ -139,13 +149,23 @@ impl DeRecProtocolWasm {
             uri: own_transport_uri,
             protocol: protocol_num,
         };
-        let inner = DeRecProtocol::new(
-            JsContactStore(contact_store),
-            JsShareStore(share_store),
-            JsSecretStore(secret_store),
-            JsTransport(transport),
-            own_transport,
-        );
+        let info: HashMap<String, String> = if communication_info.is_null() || communication_info.is_undefined() {
+            HashMap::new()
+        } else {
+            serde_wasm_bindgen::from_value(communication_info)
+                .map_err(|e| js_error("INVALID_COMMUNICATION_INFO", e.to_string()))?
+        };
+        let inner = DeRecProtocolBuilder::new()
+            .with_channel_store(JsChannelStore(channel_store))
+            .with_share_store(JsShareStore(share_store))
+            .with_secret_store(JsSecretStore(secret_store))
+            .with_transport(JsTransport(transport))
+            .with_own_transport(own_transport)
+            .with_threshold(threshold as usize)
+            .with_keep_versions_count(keep_versions_count as usize)
+            .with_secret_id(secret_id.to_vec())
+            .with_communication_info(info)
+            .build();
         Ok(DeRecProtocolWasm { inner })
     }
 
@@ -153,11 +173,11 @@ impl DeRecProtocolWasm {
     ///
     /// Returns a plain JS `ContactMessage` object. The `channel_id` field identifies
     /// the pairing session and will match the `channel_id` in the eventual
-    /// `PairingComplete` event — read it directly from the returned object.
+    /// `PairingCompleted` event — read it directly from the returned object.
     ///
     /// The caller is responsible for serializing the contact for out-of-band
     /// delivery (QR code, deep link, etc.). The peer passes the deserialized object
-    /// to [`startPairing`](Self::start_pairing).
+    /// to [`start`](Self::start) with `FlowKind::Pairing`.
     ///
     /// # Arguments
     ///
@@ -178,369 +198,69 @@ impl DeRecProtocolWasm {
             .map_err(|e| js_error("WASM_SERIALIZE_ERROR", e.to_string()))
     }
 
-    /// Begin pairing after receiving a peer's contact out-of-band.
-    ///
-    /// Accepts the plain JS `ContactMessage` object returned by
-    /// [`createContact`](Self::create_contact) on the peer side (deserialized
-    /// by the caller from whatever out-of-band format was used — QR, deep link, etc.).
-    ///
-    /// Sends a `PairRequestMessage` to the peer and returns the `channel_id`
-    /// extracted from the contact. Store it to correlate the eventual
-    /// [`PairingComplete`] event with the correct peer.
+    /// Unified entry point for initiating any protocol flow.
     ///
     /// # Arguments
     ///
-    /// * `kind`    — Sender role: `0` = OwnerNonRecovery, `1` = OwnerRecovery, `2` = Helper.
-    /// * `contact` — Plain JS `ContactMessage` object as returned by `createContact`.
+    /// * `flow_kind` — Flow discriminant:
+    ///   - `0` = Pairing (params: `{ kind: number, contact: ContactMessage, name?: string }`)
+    ///   - `1` = Discovery (params: `{ target: BigInt | BigInt[] | null }`)
+    ///   - `2` = ProtectSecret (params: `{ secrets: UserSecret[], description?: string }`)
+    ///   - `3` = VerifyShares (params: `{ version: number, target: BigInt | BigInt[] | null }`)
+    ///   - `4` = RecoverSecret (params: `{ secretId: Uint8Array, version: number }`)
     ///
     /// # Returns
     ///
-    /// A `BigInt` representing the `channel_id` from the contact message.
-    ///
-    /// TODO: document the full pairing lifecycle and how to use the returned
-    /// `channel_id` to track pending pairings in application state.
-    #[wasm_bindgen(js_name = "startPairing")]
-    pub async fn start_pairing(
-        &mut self,
-        kind: u32,
-        contact: JsValue,
-    ) -> Result<js_sys::BigInt, JsValue> {
-        let contact = js_to_contact_message(contact)?;
-        let sender_kind = parse_sender_kind(kind)?;
-        let channel_id = self
+    /// `BigInt` for Pairing (the channel_id), `null` for all others.
+    #[wasm_bindgen(js_name = "start")]
+    pub async fn start(&mut self, flow_kind: u32, params: JsValue) -> Result<JsValue, JsValue> {
+        let flow = parse_flow(flow_kind, params)?;
+        let result = self
             .inner
-            .start_pairing(sender_kind, contact)
+            .start(flow)
             .await
             .map_err(|e| js_error("DEREC_ERROR", e.to_string()))?;
-        Ok(js_sys::BigInt::from(channel_id))
-    }
-
-    /// Send a discovery request to the Helper on `channel_id`.
-    ///
-    /// Call this after receiving a `PairingComplete { kind: 1 }` (OwnerRecovery) event
-    /// and completing any required out-of-band authentication with the Helper.
-    ///
-    /// The Helper responds with the list of all secrets it holds for this channel.
-    /// [`process`](Self::process) emits a `SecretsDiscovered` event when the response arrives.
-    ///
-    /// # Arguments
-    ///
-    /// * `channel_id` — BigInt channel identifier from the `PairingComplete` event.
-    #[wasm_bindgen(js_name = "requestDiscovery")]
-    pub async fn request_discovery(&mut self, channel_id: u64) -> Result<(), JsValue> {
-        self.inner
-            .request_discovery(ChannelId(channel_id))
-            .await
-            .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
-    }
-
-    /// Start the replica confirmation flow by sending a fingerprint to the peer.
-    ///
-    /// Returns the fingerprint formatted as `XXXX-XXXX-XXXX-XXXX` for the
-    /// application to display to the user.
-    ///
-    /// # Arguments
-    ///
-    /// * `channel_id` — BigInt channel identifier from the `PairingComplete` event.
-    /// * `replica_id` — Caller's replica identifier.
-    #[wasm_bindgen(js_name = "startReplicaConfirmation")]
-    pub async fn start_replica_confirmation(
-        &mut self,
-        channel_id: u64,
-        replica_id: i32,
-    ) -> Result<String, JsValue> {
-        self.inner
-            .start_replica_confirmation(ChannelId(channel_id), replica_id)
-            .await
-            .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
-    }
-
-    /// Confirm a Replica channel after the user verified the fingerprint.
-    ///
-    /// # Arguments
-    ///
-    /// * `channel_id` — BigInt channel identifier.
-    /// * `replica_id` — Responder's replica identifier.
-    #[wasm_bindgen(js_name = "confirmReplica")]
-    pub async fn confirm_replica(
-        &mut self,
-        channel_id: u64,
-        replica_id: i32,
-    ) -> Result<(), JsValue> {
-        self.inner
-            .confirm_replica(ChannelId(channel_id), replica_id)
-            .await
-            .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
-    }
-
-    /// Request channels discovery from the Owner on the given Replica channel.
-    ///
-    /// # Arguments
-    ///
-    /// * `channel_id` — BigInt channel identifier.
-    /// * `last_batch_index` — Index of the last batch received (0 for initial request).
-    #[wasm_bindgen(js_name = "requestChannelsDiscovery")]
-    pub async fn request_channels_discovery(
-        &mut self,
-        channel_id: u64,
-        last_batch_index: i32,
-    ) -> Result<(), JsValue> {
-        self.inner
-            .request_channels_discovery(ChannelId(channel_id), last_batch_index)
-            .await
-            .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
-    }
-
-    /// Respond to a channels discovery request from a Replica.
-    ///
-    /// # Arguments
-    ///
-    /// * `channel_id` — BigInt channel identifier of the Replica channel.
-    /// * `entries` — JS array of `{ channel_id: number, shared_key: Uint8Array }` objects.
-    /// * `total_batches` — Total number of batches.
-    /// * `current_batch` — 1-based index of this batch.
-    #[wasm_bindgen(js_name = "respondChannelsDiscovery")]
-    pub async fn respond_channels_discovery(
-        &mut self,
-        channel_id: u64,
-        entries: JsValue,
-        total_batches: i32,
-        current_batch: i32,
-    ) -> Result<(), JsValue> {
-        #[derive(serde::Deserialize)]
-        struct ChannelEntryJs {
-            channel_id: u64,
-            shared_key: Vec<u8>,
+        match result {
+            Some(channel_id) => Ok(js_sys::BigInt::from(channel_id).into()),
+            None => Ok(JsValue::NULL),
         }
-
-        let entries_js: Vec<ChannelEntryJs> = serde_wasm_bindgen::from_value(entries)
-            .map_err(|e| js_error("WASM_DESERIALIZE_ERROR", e.to_string()))?;
-
-        let channel_entries: Vec<ChannelEntry> = entries_js
-            .into_iter()
-            .map(|e| {
-                let key: [u8; 32] = e.shared_key.as_slice().try_into().map_err(|_| {
-                    js_error(
-                        "INVALID_SHARED_KEY_LENGTH",
-                        "each entry shared_key must be exactly 32 bytes".to_string(),
-                    )
-                })?;
-                Ok(ChannelEntry {
-                    channel_id: ChannelId(e.channel_id),
-                    shared_key: key,
-                })
-            })
-            .collect::<Result<Vec<_>, JsValue>>()?;
-
-        self.inner
-            .respond_channels_discovery(
-                ChannelId(channel_id),
-                &channel_entries,
-                total_batches,
-                current_batch,
-            )
-            .await
-            .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
     }
 
-    /// Request secrets discovery from the Owner on the given Replica channel.
+    /// Accept a pending action from an `ActionRequired` event.
     ///
     /// # Arguments
     ///
-    /// * `channel_id` — BigInt channel identifier.
-    /// * `last_batch_index` — Index of the last batch received (0 for initial request).
-    #[wasm_bindgen(js_name = "requestSecretsDiscovery")]
-    pub async fn request_secrets_discovery(
-        &mut self,
-        channel_id: u64,
-        last_batch_index: i32,
-    ) -> Result<(), JsValue> {
-        self.inner
-            .request_secrets_discovery(ChannelId(channel_id), last_batch_index)
+    /// * `action_bytes` — Opaque `Uint8Array` from the `action` field of an `ActionRequired` event.
+    ///
+    /// # Returns
+    ///
+    /// An `Array` of event objects (same format as `process()`).
+    pub async fn accept(&mut self, action_bytes: &[u8]) -> Result<JsValue, JsValue> {
+        let action = pending_action_wire::deserialize(action_bytes)
+            .map_err(|e| js_error("DECODE_ERROR", e))?;
+        let rust_events = self
+            .inner
+            .accept(action)
             .await
-            .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
-    }
-
-    /// Respond to a secrets discovery request from a Replica.
-    ///
-    /// # Arguments
-    ///
-    /// * `channel_id` — BigInt channel identifier of the Replica channel.
-    /// * `entries` — JS array of `{ secret_id: Uint8Array, version: number, description: string, channel_ids: number[] }` objects.
-    /// * `total_batches` — Total number of batches.
-    /// * `current_batch` — 1-based index of this batch.
-    #[wasm_bindgen(js_name = "respondSecretsDiscovery")]
-    pub async fn respond_secrets_discovery(
-        &mut self,
-        channel_id: u64,
-        entries: JsValue,
-        total_batches: i32,
-        current_batch: i32,
-    ) -> Result<(), JsValue> {
-        #[derive(serde::Deserialize)]
-        struct SecretEntryJs {
-            secret_id: Vec<u8>,
-            version: i32,
-            description: String,
-            channel_ids: Vec<u64>,
+            .map_err(|e| js_error("DEREC_ERROR", e.to_string()))?;
+        let js_events = Array::new();
+        for event in rust_events {
+            js_events.push(&events::event_to_js(event)?);
         }
-
-        let entries_js: Vec<SecretEntryJs> = serde_wasm_bindgen::from_value(entries)
-            .map_err(|e| js_error("WASM_DESERIALIZE_ERROR", e.to_string()))?;
-
-        let secret_entries: Vec<SecretEntry> = entries_js
-            .into_iter()
-            .map(|e| SecretEntry {
-                secret_id: e.secret_id,
-                version: e.version,
-                description: e.description,
-                channel_ids: e.channel_ids.into_iter().map(ChannelId).collect(),
-            })
-            .collect();
-
-        self.inner
-            .respond_secrets_discovery(
-                ChannelId(channel_id),
-                &secret_entries,
-                total_batches,
-                current_batch,
-            )
-            .await
-            .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
+        Ok(js_events.into())
     }
 
-    /// Notify peer Replicas about a newly paired Helper channel.
+    /// Reject a pending action from an `ActionRequired` event.
     ///
     /// # Arguments
     ///
-    /// * `channel_id` — BigInt Replica-to-Replica channel identifier.
-    /// * `new_channel_id` — BigInt channel identifier for the new Helper.
-    /// * `new_shared_key` — 32-byte symmetric key for the new Helper channel.
-    #[wasm_bindgen(js_name = "syncChannel")]
-    pub async fn sync_channel(
-        &mut self,
-        channel_id: u64,
-        new_channel_id: u64,
-        new_shared_key: &[u8],
-    ) -> Result<(), JsValue> {
-        let key: [u8; 32] = new_shared_key.try_into().map_err(|_| {
-            js_error(
-                "INVALID_SHARED_KEY_LENGTH",
-                "new_shared_key must be exactly 32 bytes".to_string(),
-            )
-        })?;
+    /// * `action_bytes` — Opaque `Uint8Array` from the `action` field of an `ActionRequired` event.
+    /// * `memo` — Human-readable rejection reason.
+    pub async fn reject(&mut self, action_bytes: &[u8], memo: &str) -> Result<(), JsValue> {
+        let action = pending_action_wire::deserialize(action_bytes)
+            .map_err(|e| js_error("DECODE_ERROR", e))?;
         self.inner
-            .sync_channel(ChannelId(channel_id), ChannelId(new_channel_id), &key)
-            .await
-            .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
-    }
-
-    /// Notify peer Replicas about a new secret or secret version.
-    ///
-    /// # Arguments
-    ///
-    /// * `channel_id` — BigInt Replica channel identifier.
-    /// * `secret_id` — Application-defined secret identifier.
-    /// * `version` — Version of the secret.
-    /// * `description` — Human-readable label.
-    /// * `channel_ids` — JS array of BigInt/number Helper channel IDs.
-    #[wasm_bindgen(js_name = "syncSecret")]
-    pub async fn sync_secret(
-        &mut self,
-        channel_id: u64,
-        secret_id: &[u8],
-        version: i32,
-        description: String,
-        channel_ids: JsValue,
-    ) -> Result<(), JsValue> {
-        let ids = parse_u64_array(channel_ids)?;
-        self.inner
-            .sync_secret(
-                ChannelId(channel_id),
-                secret_id,
-                version,
-                &description,
-                &ids,
-            )
-            .await
-            .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
-    }
-
-    /// Split a secret and send one share to each of the specified Helpers.
-    ///
-    /// # Arguments
-    ///
-    /// * `secret_id` — Application-defined identifier for the secret.
-    /// * `secret_data` — Raw secret bytes to protect.
-    /// * `description` — Human-readable label (shown to the Owner during recovery).
-    /// * `version` — Monotonically increasing version number.
-    /// * `threshold` — Minimum number of shares required for reconstruction.
-    /// * `helpers` — `BigInt[]` of channel IDs that should receive a share.
-    /// * `keep_list` — `number[]` of version numbers the Helper must retain. Pass `[]`
-    ///   to apply the default retention policy.
-    #[allow(clippy::too_many_arguments)]
-    #[wasm_bindgen(js_name = "protectSecret")]
-    pub async fn protect_secret(
-        &mut self,
-        secret_id: &[u8],
-        secret_data: &[u8],
-        description: String,
-        version: i32,
-        threshold: u32,
-        helpers: JsValue,
-        keep_list: JsValue,
-    ) -> Result<(), JsValue> {
-        let helper_ids = parse_u64_array(helpers)?;
-        let keep_versions = parse_i32_array(keep_list)?;
-        let secret = Secret {
-            id: secret_id.to_vec(),
-            version,
-            data: secret_data.to_vec(),
-            description,
-        };
-        self.inner
-            .protect_secret(secret, threshold as usize, &helper_ids, &keep_versions)
-            .await
-            .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
-    }
-
-    /// Send verification challenges to all Helpers that hold a share for `(secret_id, version)`.
-    ///
-    /// # Arguments
-    ///
-    /// * `secret_id` — Application-defined secret identifier.
-    /// * `version` — Version to verify.
-    #[wasm_bindgen(js_name = "verifyShares")]
-    pub async fn verify_shares(&mut self, secret_id: &[u8], version: i32) -> Result<(), JsValue> {
-        self.inner
-            .verify_shares(secret_id, version)
-            .await
-            .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
-    }
-
-    /// Request shares from Helpers to recover a secret.
-    ///
-    /// Call this after `SecretsDiscovered` events have been collected from enough
-    /// Helpers and the desired `(secret_id, version)` has been identified.
-    ///
-    /// [`process`](Self::process) emits `SecretRecovered` once a threshold of
-    /// share responses arrive and reconstruction succeeds.
-    ///
-    /// # Arguments
-    ///
-    /// * `secret_id` — Application-defined secret identifier.
-    /// * `version` — Version to recover.
-    /// * `helpers` — `BigInt[]` of channel IDs that hold a share for this secret.
-    #[wasm_bindgen(js_name = "recoverSecret")]
-    pub async fn recover_secret(
-        &mut self,
-        secret_id: &[u8],
-        version: i32,
-        helpers: JsValue,
-    ) -> Result<(), JsValue> {
-        let helper_ids = parse_u64_array(helpers)?;
-        self.inner
-            .recover_secret(secret_id.to_vec(), version, &helper_ids)
+            .reject(action, memo)
             .await
             .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
     }
@@ -559,7 +279,12 @@ impl DeRecProtocolWasm {
             .inner
             .process(message)
             .await
-            .map_err(|e| js_error("DEREC_ERROR", e.to_string()))?;
+            .map_err(|e| {
+                web_sys::console::error_1(
+                    &format!("[wasm-process] error: {e}").into(),
+                );
+                js_error("DEREC_ERROR", e.to_string())
+            })?;
         let js_events = Array::new();
         for event in rust_events {
             js_events.push(&events::event_to_js(event)?);
@@ -573,15 +298,6 @@ fn parse_optional_channel_id(val: JsValue) -> Result<Option<ChannelId>, JsValue>
         return Ok(None);
     }
     Ok(Some(ChannelId(js_value_to_u64(val)?)))
-}
-
-fn parse_u64_array(val: JsValue) -> Result<Vec<ChannelId>, JsValue> {
-    let arr = Array::from(&val);
-    let mut result = Vec::with_capacity(arr.length() as usize);
-    for i in 0..arr.length() {
-        result.push(ChannelId(js_value_to_u64(arr.get(i))?));
-    }
-    Ok(result)
 }
 
 /// Convert a JS BigInt or Number to a Rust `u64`.
@@ -601,19 +317,6 @@ fn js_value_to_u64(val: JsValue) -> Result<u64, JsValue> {
     }
 }
 
-fn parse_i32_array(val: JsValue) -> Result<Vec<i32>, JsValue> {
-    let arr = Array::from(&val);
-    let mut result = Vec::with_capacity(arr.length() as usize);
-    for i in 0..arr.length() {
-        let v = arr
-            .get(i)
-            .as_f64()
-            .ok_or_else(|| js_error("DECODE_ERROR", "version must be a number"))?;
-        result.push(v as i32);
-    }
-    Ok(result)
-}
-
 fn parse_sender_kind(kind: u32) -> Result<SenderKind, JsValue> {
     match kind {
         0 => Ok(SenderKind::OwnerNonRecovery),
@@ -623,6 +326,139 @@ fn parse_sender_kind(kind: u32) -> Result<SenderKind, JsValue> {
         _ => Err(js_error(
             "INVALID_SENDER_KIND",
             format!("invalid sender kind: {kind}, must be 0, 1, 2, or 3"),
+        )),
+    }
+}
+
+/// Parse a JS discovery target into [`Target`].
+///
+/// - `null` / `undefined` → `All`
+/// - `BigInt` or `number` → `Single`
+/// - `Array<BigInt | number>` → `Many`
+fn parse_target(val: JsValue) -> Result<Target, JsValue> {
+    if val.is_null() || val.is_undefined() {
+        return Ok(Target::All);
+    }
+    if val.is_bigint() || val.as_f64().is_some() {
+        let id = js_value_to_u64(val)?;
+        return Ok(Target::Single(ChannelId(id)));
+    }
+    if Array::is_array(&val) {
+        let arr = Array::from(&val);
+        let mut ids = Vec::with_capacity(arr.length() as usize);
+        for i in 0..arr.length() {
+            ids.push(ChannelId(js_value_to_u64(arr.get(i))?));
+        }
+        return Ok(Target::Many(ids));
+    }
+    Err(js_error(
+        "INVALID_DISCOVERY_TARGET",
+        "target must be null (all), a BigInt (single), or an array of BigInts (many)",
+    ))
+}
+
+/// Parse a JS `Array<{ id: Uint8Array, name: string, data: Uint8Array }>` into
+/// a `Vec<UserSecret>`.
+fn parse_user_secrets(val: JsValue) -> Result<Vec<UserSecret>, JsValue> {
+    let arr = Array::from(&val);
+    let mut result = Vec::with_capacity(arr.length() as usize);
+    for i in 0..arr.length() {
+        let entry = arr.get(i);
+        let id = js_sys::Reflect::get(&entry, &JsValue::from_str("id"))
+            .map_err(|e| js_error("DECODE_ERROR", format!("missing id: {e:?}")))?;
+        let name = js_sys::Reflect::get(&entry, &JsValue::from_str("name"))
+            .map_err(|e| js_error("DECODE_ERROR", format!("missing name: {e:?}")))?
+            .as_string()
+            .ok_or_else(|| js_error("DECODE_ERROR", "name must be a string"))?;
+        let data = js_sys::Reflect::get(&entry, &JsValue::from_str("data"))
+            .map_err(|e| js_error("DECODE_ERROR", format!("missing data: {e:?}")))?;
+        result.push(UserSecret {
+            id: Uint8Array::new(&id).to_vec(),
+            name,
+            data: Uint8Array::new(&data).to_vec(),
+        });
+    }
+    Ok(result)
+}
+
+/// Parse a JS flow kind + params into a [`DeRecFlow`].
+///
+/// Flow kinds:
+/// - `0` = Pairing: `{ kind: number, contact: ContactMessage, name?: string }`
+/// - `1` = Discovery: `{ target: BigInt | BigInt[] | null }`
+/// - `2` = ProtectSecret: `{ secrets: UserSecret[], description?: string }`
+/// - `3` = VerifyShares: `{ version: number, target: BigInt | BigInt[] | null }`
+/// - `4` = RecoverSecret: `{ secretId: Uint8Array, version: number }`
+fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
+    match flow_kind {
+        0 => {
+            // Pairing
+            let kind_val = js_sys::Reflect::get(&params, &JsValue::from_str("kind"))
+                .map_err(|e| js_error("DECODE_ERROR", format!("missing kind: {e:?}")))?;
+            let kind = kind_val
+                .as_f64()
+                .ok_or_else(|| js_error("DECODE_ERROR", "kind must be a number"))?
+                as u32;
+            let sender_kind = parse_sender_kind(kind)?;
+            let contact_val = js_sys::Reflect::get(&params, &JsValue::from_str("contact"))
+                .map_err(|e| js_error("DECODE_ERROR", format!("missing contact: {e:?}")))?;
+            let contact = js_to_contact_message(contact_val)?;
+            let name = js_sys::Reflect::get(&params, &JsValue::from_str("name"))
+                .unwrap_or(JsValue::UNDEFINED)
+                .as_string();
+            Ok(DeRecFlow::Pairing {
+                kind: sender_kind,
+                contact,
+                name,
+            })
+        }
+        1 => {
+            // Discovery
+            let target_val = js_sys::Reflect::get(&params, &JsValue::from_str("target"))
+                .unwrap_or(JsValue::UNDEFINED);
+            let target = parse_target(target_val)?;
+            Ok(DeRecFlow::Discovery { target })
+        }
+        2 => {
+            // ProtectSecret
+            let secrets_val = js_sys::Reflect::get(&params, &JsValue::from_str("secrets"))
+                .map_err(|e| js_error("DECODE_ERROR", format!("missing secrets: {e:?}")))?;
+            let secrets = parse_user_secrets(secrets_val)?;
+            let description = js_sys::Reflect::get(&params, &JsValue::from_str("description"))
+                .unwrap_or(JsValue::UNDEFINED)
+                .as_string();
+            Ok(DeRecFlow::ProtectSecret {
+                secrets,
+                description,
+            })
+        }
+        3 => {
+            // VerifyShares
+            let version = js_sys::Reflect::get(&params, &JsValue::from_str("version"))
+                .map_err(|e| js_error("DECODE_ERROR", format!("missing version: {e:?}")))?
+                .as_f64()
+                .ok_or_else(|| js_error("DECODE_ERROR", "version must be a number"))?
+                as i32;
+            let target_val = js_sys::Reflect::get(&params, &JsValue::from_str("target"))
+                .unwrap_or(JsValue::UNDEFINED);
+            let target = parse_target(target_val)?;
+            Ok(DeRecFlow::VerifyShares { version, target })
+        }
+        4 => {
+            // RecoverSecret
+            let secret_id_val = js_sys::Reflect::get(&params, &JsValue::from_str("secretId"))
+                .map_err(|e| js_error("DECODE_ERROR", format!("missing secretId: {e:?}")))?;
+            let secret_id = Uint8Array::new(&secret_id_val).to_vec();
+            let version = js_sys::Reflect::get(&params, &JsValue::from_str("version"))
+                .map_err(|e| js_error("DECODE_ERROR", format!("missing version: {e:?}")))?
+                .as_f64()
+                .ok_or_else(|| js_error("DECODE_ERROR", "version must be a number"))?
+                as i32;
+            Ok(DeRecFlow::RecoverSecret { secret_id, version })
+        }
+        _ => Err(js_error(
+            "INVALID_FLOW_KIND",
+            format!("invalid flow kind: {flow_kind}, must be 0..4"),
         )),
     }
 }

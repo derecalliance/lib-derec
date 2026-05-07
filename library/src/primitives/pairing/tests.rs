@@ -10,10 +10,11 @@ use crate::primitives::pairing::{
         produce as produce_pairing_request_message,
     },
     response::{
+        AcceptResult as ProducePairingResponseMessageResult,
         ExtractResult as ExtractPairingResponseResult,
         ProcessResult as ProcessPairingResponseMessageResult,
-        ProduceResult as ProducePairingResponseMessageResult, extract as extract_pairing_response,
-        process as process_pairing_response_message, produce as produce_pairing_response_message,
+        accept as produce_pairing_response_message, extract as extract_pairing_response,
+        process as process_pairing_response_message,
     },
 };
 use crate::types::ChannelId;
@@ -104,6 +105,7 @@ fn test_produce_pairing_request_message_empty_mlkem_encapsulation_key() {
             protocol: Protocol::Https.into(),
         },
         &invalid_contact_msg,
+        None,
     );
 
     assert!(matches!(
@@ -134,6 +136,7 @@ fn test_produce_pairing_request_message_empty_ecies_public_key() {
             protocol: Protocol::Https.into(),
         },
         &invalid_contact_msg,
+        None,
     );
 
     assert!(matches!(
@@ -164,6 +167,7 @@ fn test_produce_pairing_request_message_empty_transport_uri() {
             protocol: Protocol::Https.into(),
         },
         &invalid_contact_msg,
+        None,
     );
 
     assert!(matches!(
@@ -197,6 +201,7 @@ fn test_produce_pairing_request_message() {
             protocol: Protocol::Https.into(),
         },
         &contact_message,
+        None,
     )
     .expect("failed to produce pairing request message");
 
@@ -243,6 +248,7 @@ fn test_produce_pairing_request_message_initiator_contact_message() {
             protocol: Protocol::Https.into(),
         },
         &contact_message,
+        None,
     )
     .expect("failed to produce pairing request message");
 
@@ -288,6 +294,7 @@ fn test_produce_pairing_response_message_empty_mlkem_ciphertext() {
         SenderKind::OwnerNonRecovery,
         &invalid_pair_request_msg,
         &alice_sk_state,
+        None,
     );
 
     assert!(matches!(
@@ -332,6 +339,7 @@ fn test_produce_pairing_response_message_empty_ecies_public_key() {
         SenderKind::OwnerNonRecovery,
         &invalid_pair_request_msg,
         &alice_sk_state,
+        None,
     );
 
     assert!(matches!(
@@ -373,6 +381,7 @@ fn test_produce_pairing_response_message_missing_transport_protocol() {
         SenderKind::OwnerNonRecovery,
         &invalid_pair_request_msg,
         &alice_sk_state,
+        None,
     );
 
     assert!(matches!(
@@ -416,6 +425,7 @@ fn test_produce_pairing_response_message_empty_transport_uri() {
         SenderKind::OwnerNonRecovery,
         &invalid_pair_request_msg,
         &alice_sk_state,
+        None,
     );
 
     assert!(matches!(
@@ -447,6 +457,7 @@ fn test_extract_pairing_request_rejects_envelope_timestamp_mismatch() {
             protocol: Protocol::Https.into(),
         },
         &alice_contact,
+        None,
     )
     .expect("failed to produce valid pairing request");
 
@@ -488,6 +499,7 @@ fn test_process_pairing_response_message_missing_result() {
             protocol: Protocol::Https.into(),
         },
         &alice_contact,
+        None,
     )
     .expect("failed to produce valid pairing request");
 
@@ -545,6 +557,7 @@ fn test_process_pairing_response_message_result_non_ok() {
             protocol: Protocol::Https.into(),
         },
         &alice_contact,
+        None,
     )
     .expect("failed to produce valid pairing request");
 
@@ -605,6 +618,7 @@ fn test_process_pairing_response_message_invalid_status() {
             protocol: Protocol::Https.into(),
         },
         &alice_contact,
+        None,
     )
     .expect("failed to produce valid pairing request");
 
@@ -665,6 +679,7 @@ fn test_process_pairing_response_message_nonce_mismatch() {
             protocol: Protocol::Https.into(),
         },
         &alice_contact,
+        None,
     )
     .expect("failed to produce valid pairing request");
 
@@ -725,6 +740,7 @@ fn test_process_pairing_response_message_empty_mlkem_encapsulation_key() {
             protocol: Protocol::Https.into(),
         },
         &alice_contact,
+        None,
     )
     .expect("failed to produce valid pairing request");
 
@@ -785,6 +801,7 @@ fn test_process_pairing_response_message_empty_ecies_public_key() {
             protocol: Protocol::Https.into(),
         },
         &alice_contact,
+        None,
     )
     .expect("failed to produce valid pairing request");
 
@@ -845,6 +862,7 @@ fn test_extract_pairing_response_rejects_envelope_timestamp_mismatch() {
             protocol: Protocol::Https.into(),
         },
         &alice_contact,
+        None,
     )
     .expect("failed to produce pairing request");
 
@@ -859,6 +877,7 @@ fn test_extract_pairing_response_rejects_envelope_timestamp_mismatch() {
         SenderKind::OwnerNonRecovery,
         &request,
         &initiator_secret_key,
+        None,
     )
     .expect("failed to produce pairing response");
 
@@ -905,6 +924,7 @@ fn test_alice_bob_pairing_flow() {
             protocol: Protocol::Https.into(),
         },
         &alice_contact,
+        None,
     )
     .expect("failed to produce pairing request");
 
@@ -920,8 +940,8 @@ fn test_alice_bob_pairing_flow() {
     let ProducePairingResponseMessageResult {
         envelope: alice_pair_resp_envelope,
         shared_key: alice_shared_key,
-        responder_transport_protocol: bob_transport_protocol,
-    } = produce_pairing_response_message(alice_kind, &bob_pair_req_msg, &alice_sk_state)
+        peer_transport_protocol: bob_transport_protocol,
+    } = produce_pairing_response_message(alice_kind, &bob_pair_req_msg, &alice_sk_state, None)
         .expect("failed to produce pairing response");
 
     // Bob (responder) decrypts the response.

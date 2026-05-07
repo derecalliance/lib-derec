@@ -8,7 +8,8 @@ use crate::{
 };
 use derec_cryptography::pairing::{self as cryptography_pairing, PairingSecretKeyMaterial};
 use derec_proto::{
-    ContactMessage, DeRecMessage, MessageBody, PairRequestMessage, SenderKind, TransportProtocol,
+    CommunicationInfo, ContactMessage, DeRecMessage, MessageBody, PairRequestMessage, SenderKind,
+    TransportProtocol,
 };
 use prost::Message;
 use rand::{Rng, rng};
@@ -222,6 +223,7 @@ pub fn produce(
     kind: SenderKind,
     transport_protocol: TransportProtocol,
     contact_message: &ContactMessage,
+    communication_info: Option<CommunicationInfo>,
 ) -> Result<ProduceResult, crate::Error> {
     if transport_protocol.uri.trim().is_empty() {
         #[cfg(feature = "logging")]
@@ -272,7 +274,7 @@ pub fn produce(
         ecies_public_key: req_pk.ecies_public_key,
         channel_id: contact_message.channel_id,
         nonce: contact_message.nonce,
-        communication_info: None,
+        communication_info,
         parameter_range: None,
         transport_protocol: Some(transport_protocol),
         timestamp: Some(timestamp),

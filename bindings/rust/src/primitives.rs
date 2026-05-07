@@ -156,8 +156,8 @@ fn run_pairing_flow_test() {
         pair_resp.shared_key.len()
     );
     println!(
-        "pair_response.responder_transport_protocol = {:?}",
-        pair_resp.responder_transport_protocol
+        "pair_response.peer_transport_protocol = {:?}",
+        pair_resp.peer_transport_protocol
     );
 
     if pair_response_wire_bytes.is_empty() {

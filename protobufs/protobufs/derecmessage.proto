@@ -13,12 +13,6 @@ import "verify.proto";
 import "getshare.proto";
 import "secretidsversions.proto";
 import "error.proto";
-import "replica.proto";
-import "replicaconfirmation.proto";
-import "replicachannelsdiscovery.proto";
-import "replicasecretsdiscovery.proto";
-import "replicachannelsync.proto";
-import "replicasecretsync.proto";
 
 package org.derecalliance.derec.protobuf;
 
@@ -177,16 +171,6 @@ message DeRecMessage {
       GetShareRequestMessage getShareRequestMessage = 11;
       GetShareResponseMessage getShareResponseMessage = 12;
       ErrorResponseMessage errorResponseMessage = 13;
-      ReplicaConfirmationRequestMessage replicaConfirmationRequestMessage = 14;
-      ReplicaConfirmationResponseMessage replicaConfirmationResponseMessage = 15;
-      ReplicaChannelsDiscoveryRequestMessage replicaChannelsDiscoveryRequestMessage = 16;
-      ReplicaChannelsDiscoveryResponseMessage replicaChannelsDiscoveryResponseMessage = 17;
-      ReplicaSecretsDiscoveryRequestMessage replicaSecretsDiscoveryRequestMessage = 18;
-      ReplicaSecretsDiscoveryResponseMessage replicaSecretsDiscoveryResponseMessage = 19;
-      ReplicaChannelSyncRequestMessage replicaChannelSyncRequestMessage = 20;
-      ReplicaChannelSyncResponseMessage replicaChannelSyncResponseMessage = 21;
-      ReplicaSecretSyncRequestMessage replicaSecretSyncRequestMessage = 22;
-      ReplicaSecretSyncResponseMessage replicaSecretSyncResponseMessage = 23;
     }
   }
 }

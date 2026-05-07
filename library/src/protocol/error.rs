@@ -21,30 +21,20 @@ pub enum SecretStoreError {
     Backend(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 }
 
-/// Errors produced by [`DeRecContactStore`](super::DeRecContactStore) implementations.
+/// Errors produced by [`DeRecChannelStore`](super::DeRecChannelStore) implementations.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum ContactStoreError {
-    /// A contact with the given `channel_id` already exists.
-    ///
-    /// Returned by [`DeRecContactStore::save`](super::DeRecContactStore::save) when the
-    /// implementation enforces uniqueness and the caller attempts to create a second entry
-    /// for the same channel without an explicit replace/upsert path.
-    #[error("contact already exists for channel {channel_id}")]
+pub enum ChannelStoreError {
+    /// A channel with the given `channel_id` already exists.
+    #[error("channel already exists for {channel_id}")]
     AlreadyExists { channel_id: u64 },
 
-    /// No contact was found for the given `channel_id`.
-    ///
-    /// Implementations that prefer an explicit error over returning `Ok(None)`
-    /// may return this variant from [`DeRecContactStore::load`](super::DeRecContactStore::load).
-    #[error("contact not found for channel {channel_id}")]
+    /// No channel was found for the given `channel_id`.
+    #[error("channel not found for {channel_id}")]
     NotFound { channel_id: u64 },
 
     /// An I/O or serialization error in the underlying storage backend.
-    ///
-    /// The original error is preserved as the `source` so that callers can
-    /// inspect the full error chain via [`std::error::Error::source`].
-    #[error("contact store backend error")]
+    #[error("channel store backend error")]
     Backend(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 }
 
