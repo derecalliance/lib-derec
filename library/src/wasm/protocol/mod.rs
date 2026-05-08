@@ -135,6 +135,7 @@ impl DeRecProtocolWasm {
         keep_versions_count: u32,
         secret_id: &[u8],
         communication_info: JsValue,
+        auto_respond_on_failure: Option<bool>,
     ) -> Result<DeRecProtocolWasm, JsValue> {
         let protocol_num = match own_transport_protocol.to_lowercase().as_str() {
             "https" => 0i32,
@@ -165,6 +166,7 @@ impl DeRecProtocolWasm {
             .with_keep_versions_count(keep_versions_count as usize)
             .with_secret_id(secret_id.to_vec())
             .with_communication_info(info)
+            .with_auto_respond_on_failure(auto_respond_on_failure.unwrap_or(false))
             .build();
         Ok(DeRecProtocolWasm { inner })
     }
@@ -255,12 +257,25 @@ impl DeRecProtocolWasm {
     /// # Arguments
     ///
     /// * `action_bytes` — Opaque `Uint8Array` from the `action` field of an `ActionRequired` event.
+    /// * `status` — Numeric status code from `StatusEnum` (e.g. 2 for FAIL, 10 for REJECTED).
     /// * `memo` — Human-readable rejection reason.
-    pub async fn reject(&mut self, action_bytes: &[u8], memo: &str) -> Result<(), JsValue> {
+    pub async fn reject(
+        &mut self,
+        action_bytes: &[u8],
+        status: i32,
+        memo: &str,
+    ) -> Result<(), JsValue> {
         let action = pending_action_wire::deserialize(action_bytes)
             .map_err(|e| js_error("DECODE_ERROR", e))?;
+        let status_enum =
+            derec_proto::StatusEnum::try_from(status).map_err(|_| {
+                js_error(
+                    "INVALID_STATUS",
+                    format!("invalid StatusEnum value: {status}"),
+                )
+            })?;
         self.inner
-            .reject(action, memo)
+            .reject(action, status_enum, memo)
             .await
             .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
     }
@@ -283,7 +298,12 @@ impl DeRecProtocolWasm {
                 web_sys::console::error_1(
                     &format!("[wasm-process] error: {e}").into(),
                 );
-                js_error("DEREC_ERROR", e.to_string())
+                let channel_id_str = e.channel_id.map(|c| c.0.to_string());
+                if let Some((status, memo)) = e.as_non_ok_status() {
+                    non_ok_status_error(status, memo, channel_id_str.as_deref())
+                } else {
+                    process_error(e.to_string(), channel_id_str.as_deref())
+                }
             })?;
         let js_events = Array::new();
         for event in rust_events {
@@ -291,6 +311,50 @@ impl DeRecProtocolWasm {
         }
         Ok(js_events.into())
     }
+}
+
+/// Produce a structured JS error for `NonOkStatus` responses.
+///
+/// Returns `{ code: "NON_OK_STATUS", message, status, memo, channel_id? }`.
+fn non_ok_status_error(status: i32, memo: &str, channel_id: Option<&str>) -> JsValue {
+    #[derive(serde::Serialize)]
+    struct NonOkStatusError<'a> {
+        code: &'static str,
+        message: String,
+        status: i32,
+        memo: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        channel_id: Option<&'a str>,
+    }
+
+    serde_wasm_bindgen::to_value(&NonOkStatusError {
+        code: "NON_OK_STATUS",
+        message: format!("non-ok status (status={status}): {memo}"),
+        status,
+        memo,
+        channel_id,
+    })
+    .unwrap_or_else(|_| JsValue::from_str("failed to serialize non-ok status error"))
+}
+
+/// Produce a structured JS error for general `process()` failures.
+///
+/// Returns `{ code: "DEREC_ERROR", message, channel_id? }`.
+fn process_error(message: String, channel_id: Option<&str>) -> JsValue {
+    #[derive(serde::Serialize)]
+    struct ProcessErrorJs<'a> {
+        code: &'static str,
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        channel_id: Option<&'a str>,
+    }
+
+    serde_wasm_bindgen::to_value(&ProcessErrorJs {
+        code: "DEREC_ERROR",
+        message,
+        channel_id,
+    })
+    .unwrap_or_else(|_| JsValue::from_str("failed to serialize process error"))
 }
 
 fn parse_optional_channel_id(val: JsValue) -> Result<Option<ChannelId>, JsValue> {

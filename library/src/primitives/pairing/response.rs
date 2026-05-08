@@ -22,7 +22,6 @@ pub struct AcceptResult {
     pub shared_key: PairingSharedKey,
 }
 
-
 /// Result of [`reject`].
 pub struct RejectResult {
     /// Serialized outer [`derec_proto::DeRecMessage`] wire bytes carrying an encrypted inner
@@ -365,10 +364,12 @@ pub fn extract(
 ///
 /// Returns [`crate::Error`] (specifically `Error::Pairing(...)`) in the following cases:
 ///
+/// - [`PairingError::NonOkStatus`] if `result.status != Ok`, carrying the peer's status code
+///   and memo string
+/// - [`PairingError::InvalidPairResponseMessage`] if the response is malformed (e.g. missing result)
 /// - [`PairingError::InvalidContactMessage`] if the contact message is missing required fields
-/// - [`PairingError::InvalidPairResponseMessage`] if the response indicates failure or is malformed
 /// - [`PairingError::ProtocolViolation`] if the response does not match the pairing session
-///   (for example, nonce mismatch or invalid status enum)
+///   (for example, nonce mismatch)
 /// - [`PairingError::Invariant`] if `pairing_secret_key_material` is not the `Responder` variant
 /// - [`PairingError::FinishPairingResponder`] if final pairing derivation fails
 ///
@@ -397,6 +398,21 @@ pub fn process(
     response: &PairResponseMessage,
     pairing_secret_key_material: &PairingSecretKeyMaterial,
 ) -> Result<ProcessResult, crate::Error> {
+    let res = response
+        .result
+        .as_ref()
+        .ok_or(PairingError::InvalidPairResponseMessage("missing result"))?;
+
+    if res.status != StatusEnum::Ok as i32 {
+        #[cfg(feature = "logging")]
+        tracing::warn!(status = res.status, memo = %res.memo, "pair response status is not Ok");
+        return Err(PairingError::NonOkStatus {
+            status: res.status,
+            memo: res.memo.to_owned(),
+        }
+        .into());
+    }
+
     if contact_message.mlkem_encapsulation_key.is_empty() {
         #[cfg(feature = "logging")]
         tracing::warn!("contact message missing mlkem_encapsulation_key");
@@ -407,22 +423,6 @@ pub fn process(
         #[cfg(feature = "logging")]
         tracing::warn!("contact message missing ecies_public_key");
         return Err(PairingError::InvalidContactMessage("ecies_public_key is empty").into());
-    }
-
-    let res = response
-        .result
-        .as_ref()
-        .ok_or(PairingError::InvalidPairResponseMessage("missing result"))?;
-
-    let status = StatusEnum::try_from(res.status)
-        .map_err(|_| PairingError::ProtocolViolation("invalid status enum value"))?;
-
-    if status != StatusEnum::Ok {
-        #[cfg(feature = "logging")]
-        tracing::warn!("pair response status is not Ok");
-        return Err(
-            PairingError::InvalidPairResponseMessage("response indicates non-ok status").into(),
-        );
     }
 
     if response.nonce != contact_message.nonce {

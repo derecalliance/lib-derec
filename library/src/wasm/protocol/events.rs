@@ -29,6 +29,18 @@ enum DeRecEventJs {
         channel_id: String,
         version: i32,
     },
+    ShareRejected {
+        channel_id: String,
+        version: i32,
+        status: i32,
+        memo: String,
+    },
+    SharingComplete {
+        version: i32,
+        confirmed_count: usize,
+        failed_count: usize,
+        threshold_met: bool,
+    },
     ShareVerified {
         channel_id: String,
         version: i32,
@@ -98,7 +110,7 @@ fn extract_share_metadata(action: &PendingAction) -> (Option<i32>, Option<String
             let desc = if request.version_description.is_empty() {
                 None
             } else {
-                Some(request.version_description.clone())
+                Some(request.version_description.to_owned())
             };
             let secret_id = if request.secret_id.is_empty() {
                 None
@@ -106,6 +118,14 @@ fn extract_share_metadata(action: &PendingAction) -> (Option<i32>, Option<String
                 Some(request.secret_id.clone())
             };
             (Some(request.version), desc, secret_id)
+        }
+        PendingAction::VerifyShare { request, .. } => {
+            let secret_id = if request.secret_id.is_empty() {
+                None
+            } else {
+                Some(request.secret_id.clone())
+            };
+            (Some(request.version), None, secret_id)
         }
         _ => (None, None, None),
     }
@@ -136,6 +156,18 @@ pub fn event_to_js(event: DeRecEvent) -> Result<JsValue, JsValue> {
         DeRecEvent::ShareConfirmed { channel_id, version } => DeRecEventJs::ShareConfirmed {
             channel_id: channel_id.0.to_string(),
             version,
+        },
+        DeRecEvent::ShareRejected { channel_id, version, status, memo } => DeRecEventJs::ShareRejected {
+            channel_id: channel_id.0.to_string(),
+            version,
+            status,
+            memo,
+        },
+        DeRecEvent::SharingComplete { version, confirmed_count, failed_count, threshold_met } => DeRecEventJs::SharingComplete {
+            version,
+            confirmed_count,
+            failed_count,
+            threshold_met,
         },
         DeRecEvent::ShareVerified { channel_id, version } => DeRecEventJs::ShareVerified {
             channel_id: channel_id.0.to_string(),

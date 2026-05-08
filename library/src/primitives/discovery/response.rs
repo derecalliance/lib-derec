@@ -149,7 +149,7 @@ pub fn produce(
                 .iter()
                 .map(|v| ProtoVersionEntry {
                     version: v.version,
-                    version_description: v.description.clone(),
+                    version_description: v.description.to_owned(),
                 })
                 .collect(),
         })
@@ -278,7 +278,8 @@ pub fn extract(
 /// Returns [`crate::Error`] (specifically `Error::Discovery(...)`) in the following cases:
 ///
 /// - [`DiscoveryError::MissingResult`] if the response does not contain a `result` field
-/// - [`DiscoveryError::NonOkStatus`] if `result.status != Ok`
+/// - [`DiscoveryError::NonOkStatus`] if `result.status != Ok`, carrying the Helper's
+///   status code and memo string
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(secrets_count = response.secret_list.len()))
@@ -293,9 +294,10 @@ pub fn process(
 
     if result.status != StatusEnum::Ok as i32 {
         #[cfg(feature = "logging")]
-        tracing::warn!(status = result.status, "Helper returned non-OK status");
+        tracing::warn!(status = result.status, memo = %result.memo, "discovery response status is not Ok");
         return Err(DiscoveryError::NonOkStatus {
             status: result.status,
+            memo: result.memo.to_owned(),
         }
         .into());
     }
@@ -310,7 +312,7 @@ pub fn process(
                 .iter()
                 .map(|v| VersionEntry {
                     version: v.version,
-                    description: v.version_description.clone(),
+                    description: v.version_description.to_owned(),
                 })
                 .collect(),
         })

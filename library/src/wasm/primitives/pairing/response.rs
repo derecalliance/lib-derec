@@ -104,6 +104,7 @@ pub fn reject(
     kind: u32,
     raw_message: &[u8],
     pairing_secret_key_material: &[u8],
+    status: i32,
     memo: &str,
 ) -> Result<JsValue, JsValue> {
     let pairing_sk = deserialize_pairing_secret_key_material(pairing_secret_key_material)?;
@@ -112,13 +113,20 @@ pub fn reject(
         request::extract(raw_message, pairing_sk.ecies_secret_key())
             .map_err(js_error_from_lib)?;
 
+    let status_enum = derec_proto::StatusEnum::try_from(status).map_err(|_| {
+        js_error(
+            "INVALID_STATUS",
+            format!("invalid StatusEnum value: {status}"),
+        )
+    })?;
+
     let response::RejectResult {
         envelope,
         peer_transport_protocol,
     } = response::reject(
         get_sender_kind(kind)?,
         &request,
-        derec_proto::StatusEnum::Fail,
+        status_enum,
         memo,
         None,
     )

@@ -1,5 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::types::ChannelId;
+
+/// Error returned by [`DeRecProtocol::process`](super::DeRecProtocol::process).
+///
+/// Wraps the underlying [`crate::Error`] with the `channel_id` extracted from
+/// the inbound message envelope, so consumers always know which channel
+/// produced the error.
+///
+/// `channel_id` is `None` only when the envelope itself could not be decoded
+/// (i.e. the raw bytes are not a valid protobuf `DeRecMessage`).
+#[derive(Debug, thiserror::Error)]
+#[error("{source}")]
+pub struct ProcessError {
+    /// The channel that produced the error, if the envelope was decodable.
+    pub channel_id: Option<ChannelId>,
+    /// The underlying error.
+    #[source]
+    pub source: crate::Error,
+}
+
+impl ProcessError {
+    /// Convenience: extract `(status, memo)` if the underlying error is a
+    /// `NonOkStatus` from any primitive.
+    pub fn as_non_ok_status(&self) -> Option<(i32, &str)> {
+        self.source.as_non_ok_status()
+    }
+}
+
 /// Errors produced by [`DeRecSecretStore`](super::DeRecSecretStore) implementations.
 ///
 /// Individual Verifiable Secret Sharing shares are information-theoretically

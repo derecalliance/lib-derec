@@ -15,6 +15,9 @@ pub enum PairingError {
     #[error("invalid pairing response message: {0}")]
     InvalidPairResponseMessage(&'static str),
 
+    #[error("pairing response indicates a non-OK status (status={status}): {memo}")]
+    NonOkStatus { status: i32, memo: String },
+
     #[error("pairing protocol violation: {0}")]
     ProtocolViolation(&'static str),
 

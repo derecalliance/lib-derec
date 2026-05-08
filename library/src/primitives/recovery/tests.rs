@@ -329,7 +329,7 @@ fn test_recover_from_share_responses_non_ok_status() {
 
     assert!(matches!(
         result,
-        Err(Error::Recovery(RecoveryError::NonOkStatus { status }))
+        Err(Error::Recovery(RecoveryError::NonOkStatus { status, .. }))
             if status == StatusEnum::Fail as i32
     ));
 }

@@ -76,11 +76,12 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
     channel_id: ChannelId,
     request: &StoreShareRequestMessage,
     shared_key: &SharedKey,
+    status: StatusEnum,
     memo: &str,
 ) -> Result<()> {
     let response = StoreShareResponseMessage {
         result: Some(DeRecResult {
-            status: StatusEnum::Fail as i32,
+            status: status as i32,
             memo: memo.to_owned(),
         }),
         secret_id: request.secret_id.clone(),
@@ -117,7 +118,7 @@ pub(in crate::protocol) async fn start<
     threshold: usize,
     keep_versions_count: usize,
     secret_id: &[u8],
-) -> Result<()> {
+) -> Result<(i32, Vec<ChannelId>)> {
     let all_channels = channel_store.channels().await?;
     let mut paired_helpers: Vec<(crate::types::Channel, SharedKey)> = Vec::new();
 
@@ -138,8 +139,8 @@ pub(in crate::protocol) async fn start<
         .iter()
         .map(|(channel, shared_key)| HelperInfo {
             channel_id: channel.id.0,
-            transport_uri: channel.transport.uri.clone(),
-            name: channel.name.clone(),
+            transport_uri: channel.transport.uri.to_owned(),
+            name: channel.name.to_owned(),
             shared_key: shared_key.to_vec(),
         })
         .collect();
@@ -176,6 +177,7 @@ pub(in crate::protocol) async fn start<
     )?;
 
     let desc = description.as_deref().unwrap_or("");
+    let mut sent_channels: Vec<ChannelId> = Vec::new();
 
     for (channel, shared_key) in &paired_helpers {
         let Some(committed_share) = result.shares.get(&channel.id) else {
@@ -197,6 +199,8 @@ pub(in crate::protocol) async fn start<
             .save(channel.id, version, committed_share.encode_to_vec())
             .await?;
 
+        sent_channels.push(channel.id);
+
         #[cfg(feature = "logging")]
         tracing::debug!(channel_id = channel.id.0, "share envelope sent");
     }
@@ -204,7 +208,7 @@ pub(in crate::protocol) async fn start<
     #[cfg(feature = "logging")]
     tracing::info!(version = version, "secret bag distributed to helpers");
 
-    Ok(())
+    Ok((version, sent_channels))
 }
 
 #[cfg_attr(
@@ -235,13 +239,30 @@ fn on_response(
     response: &StoreShareResponseMessage,
 ) -> Result<Vec<DeRecEvent>> {
     let version = response.version;
-    sharing_response::process(version, response)?;
+    match sharing_response::process(version, response) {
+        Ok(()) => {
+            #[cfg(feature = "logging")]
+            tracing::info!("share confirmed by helper");
 
-    #[cfg(feature = "logging")]
-    tracing::info!("share confirmed by helper");
+            Ok(vec![DeRecEvent::ShareConfirmed {
+                channel_id,
+                version,
+            }])
+        }
+        Err(err) => {
+            if let Some((status, memo)) = err.as_non_ok_status() {
+                #[cfg(feature = "logging")]
+                tracing::warn!(status, memo, "share rejected by helper");
 
-    Ok(vec![DeRecEvent::ShareConfirmed {
-        channel_id,
-        version,
-    }])
+                Ok(vec![DeRecEvent::ShareRejected {
+                    channel_id,
+                    version,
+                    status,
+                    memo: memo.to_owned(),
+                }])
+            } else {
+                Err(err)
+            }
+        }
+    }
 }

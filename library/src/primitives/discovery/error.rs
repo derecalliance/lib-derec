@@ -9,6 +9,6 @@ pub enum DiscoveryError {
     #[error("discovery response does not contain a result")]
     MissingResult,
 
-    #[error("discovery response indicates a non-OK status (status={status})")]
-    NonOkStatus { status: i32 },
+    #[error("discovery response indicates a non-OK status (status={status}): {memo}")]
+    NonOkStatus { status: i32, memo: String },
 }

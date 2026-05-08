@@ -122,7 +122,7 @@ pub(crate) fn transport_protocol_to_js(tp: &TransportProtocol) -> TransportProto
         n => format!("unknown({n})"),
     };
     TransportProtocolJs {
-        uri: tp.uri.clone(),
+        uri: tp.uri.to_owned(),
         protocol,
     }
 }

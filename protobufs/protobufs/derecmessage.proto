@@ -138,10 +138,6 @@ message DeRecMessage {
   // decisions without additional protections.
   google.protobuf.Timestamp timestamp = 5;
 
-
-  // TODO: Remove any referencces to MessageType
-  // MessageType messageType = 6;
-
   // Encrypted message payload.
   //
   // This field contains the encrypted bytes of a serialized MessageBody.

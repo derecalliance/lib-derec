@@ -15,8 +15,8 @@ pub enum RecoveryError {
     #[error("share response does not contain a result")]
     MissingResult,
 
-    #[error("share response indicates an error status (status={status})")]
-    NonOkStatus { status: i32 },
+    #[error("share response indicates a non-OK status (status={status}): {memo}")]
+    NonOkStatus { status: i32, memo: String },
 
     #[error("committed_de_rec_share is empty")]
     EmptyCommittedDeRecShare,

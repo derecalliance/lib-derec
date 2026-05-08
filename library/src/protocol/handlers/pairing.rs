@@ -200,11 +200,12 @@ pub(in crate::protocol) async fn reject<Ss: DeRecSecretStore, T: DeRecTransport>
     channel_id: ChannelId,
     request: &PairRequestMessage,
     response_kind: SenderKind,
+    status: StatusEnum,
     memo: &str,
 ) -> Result<()> {
     let comm_info = build_communication_info(communication_info);
     let result =
-        pairing_response::reject(response_kind, request, StatusEnum::Fail, memo, comm_info)?;
+        pairing_response::reject(response_kind, request, status, memo, comm_info)?;
 
     transport
         .send(&result.peer_transport_protocol, result.envelope)
@@ -323,8 +324,8 @@ fn build_communication_info(info: &HashMap<String, String>) -> Option<Communicat
         .iter()
         .filter(|(_, v)| !v.trim().is_empty())
         .map(|(k, v)| derec_proto::CommunicationInfoKeyValue {
-            key: k.clone(),
-            value: Some(derec_proto::communication_info_key_value::Value::StringValue(v.clone())),
+            key: k.to_owned(),
+            value: Some(derec_proto::communication_info_key_value::Value::StringValue(v.to_owned())),
         })
         .collect();
 
@@ -349,7 +350,7 @@ fn extract_communication_info(info: &Option<CommunicationInfo>) -> HashMap<Strin
             {
                 let trimmed = s.trim();
                 if !trimmed.is_empty() {
-                    return Some((e.key.clone(), trimmed.to_owned()));
+                    return Some((e.key.to_owned(), trimmed.to_owned()));
                 }
             }
             None

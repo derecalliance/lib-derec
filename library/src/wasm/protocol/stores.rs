@@ -242,9 +242,9 @@ impl From<&Channel> for ChannelRecord {
         };
         Self {
             channel_id: ch.id.0,
-            transport_uri: ch.transport.uri.clone(),
+            transport_uri: ch.transport.uri.to_owned(),
             transport_protocol: ch.transport.protocol,
-            name: ch.name.clone(),
+            name: ch.name.to_owned(),
             status: status.to_owned(),
             created_at: ch.created_at,
         }
@@ -480,7 +480,7 @@ impl DeRecTransport for JsTransport {
             _ => "unknown",
         }
         .to_owned();
-        let uri = endpoint.uri.clone();
+        let uri = endpoint.uri.to_owned();
         Box::pin(async move {
             let endpoint_js = serde_wasm_bindgen::to_value(&EndpointJs { protocol, uri })
                 .map_err(|_| Error::InvalidInput("failed to serialize endpoint"))?;

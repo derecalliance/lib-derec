@@ -224,7 +224,8 @@ pub fn extract(
 /// Returns [`crate::Error`] wrapping:
 ///
 /// - [`VerificationError::MissingResult`] if `response.result` is absent
-/// - [`VerificationError::NonOkStatus`] if `response.result.status != Ok`
+/// - [`VerificationError::NonOkStatus`] if `response.result.status != Ok`, carrying the
+///   Helper's status code and memo string
 ///
 /// # Security Notes
 ///
@@ -267,10 +268,12 @@ pub fn process(
         #[cfg(feature = "logging")]
         tracing::warn!(
             status = result.status,
+            memo = %result.memo,
             "verification response status is not Ok"
         );
         return Err(VerificationError::NonOkStatus {
             status: result.status,
+            memo: result.memo.to_owned(),
         }
         .into());
     }

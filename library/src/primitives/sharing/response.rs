@@ -291,10 +291,10 @@ pub fn extract(
 ///
 /// Returns [`crate::Error`] if:
 ///
-/// - `response.version != version`
-/// - the `result` field is absent in the response
-/// - [`SharingError::HelperRejected`] if `result.status != Ok`, carrying the
+/// - [`SharingError::NonOkStatus`] if `result.status != Ok`, carrying the
 ///   Helper's status code and memo string
+/// - the `result` field is absent in the response
+/// - `response.version != version`
 ///
 /// # Example
 ///
@@ -314,26 +314,27 @@ pub fn extract(
     tracing::instrument(skip_all, fields(version = version))
 )]
 pub fn process(version: i32, response: &StoreShareResponseMessage) -> Result<(), crate::Error> {
+    // Validate response status before any other checks.
+    let result = response.result.as_ref().ok_or(crate::Error::Invariant(
+        "StoreShareResponseMessage is missing result field",
+    ))?;
+
+    if result.status != StatusEnum::Ok as i32 {
+        #[cfg(feature = "logging")]
+        tracing::warn!(status = result.status, memo = %result.memo, "share response status is not Ok");
+        return Err(SharingError::NonOkStatus {
+            status: result.status,
+            memo: result.memo.to_owned(),
+        }
+        .into());
+    }
+
     if response.version != version {
         #[cfg(feature = "logging")]
         tracing::warn!(expected = version, got = response.version, "version mismatch in share response");
         return Err(crate::Error::Invariant(
             "Response version does not match request version",
         ));
-    }
-
-    let result = response.result.clone().ok_or(crate::Error::Invariant(
-        "StoreShareResponseMessage is missing result field",
-    ))?;
-
-    if result.status != StatusEnum::Ok as i32 {
-        #[cfg(feature = "logging")]
-        tracing::warn!(status = result.status, "helper rejected share storage");
-        return Err(SharingError::HelperRejected {
-            status: result.status,
-            memo: result.memo,
-        }
-        .into());
     }
 
     #[cfg(feature = "logging")]

@@ -586,8 +586,8 @@ fn test_process_pairing_response_message_result_non_ok() {
 
     assert!(matches!(
         result,
-        Err(Error::Pairing(PairingError::InvalidPairResponseMessage(error)))
-            if error == "response indicates non-ok status"
+        Err(Error::Pairing(PairingError::NonOkStatus { status, .. }))
+            if status == StatusEnum::Fail as i32
     ));
 }
 
@@ -647,8 +647,8 @@ fn test_process_pairing_response_message_invalid_status() {
 
     assert!(matches!(
         result,
-        Err(Error::Pairing(PairingError::ProtocolViolation(error)))
-            if error == "invalid status enum value"
+        Err(Error::Pairing(PairingError::NonOkStatus { status, .. }))
+            if status == 15
     ));
 }
 

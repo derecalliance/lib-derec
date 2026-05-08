@@ -27,10 +27,12 @@ use crate::{
     types::ChannelId,
 };
 pub use builder::{BuilderSlotMissingMarker, BuilderSlotSetMarker, DeRecProtocolBuilder};
-use derec_proto::{ContactMessage, DeRecMessage, GetShareResponseMessage, TransportProtocol};
-pub use error::{ChannelStoreError, SecretStoreError, ShareStoreError};
+use derec_proto::{
+    ContactMessage, DeRecMessage, GetShareResponseMessage, StatusEnum, TransportProtocol,
+};
+pub use error::{ChannelStoreError, ProcessError, SecretStoreError, ShareStoreError};
 use prost::Message;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 pub use traits::{
     ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecTransport,
     SecretKind, SecretStoreFuture, SecretValue, ShareStoreFuture, TransportFuture,
@@ -41,6 +43,22 @@ pub use traits::{
 /// Each entry collects [`GetShareResponseMessage`] values for a pending recovery
 /// context until enough shares arrive for reconstruction.
 pub(super) type PendingRecovery = HashMap<(Vec<u8>, i32), Vec<GetShareResponseMessage>>;
+
+/// Tracks an in-progress sharing round.
+///
+/// Created when [`DeRecFlow::ProtectSecret`] is started and consumed when all
+/// targeted Helpers have responded (confirmed, rejected, or timed out).
+struct SharingRound {
+    version: i32,
+    /// Channels that have not yet responded.
+    pending: HashSet<ChannelId>,
+    /// Channels that confirmed storage.
+    confirmed: HashSet<ChannelId>,
+    /// Channels that rejected or timed out.
+    failed: HashSet<ChannelId>,
+    /// Timestamp (seconds since epoch) when the round was started.
+    started_at: u64,
+}
 
 pub use events::{DeRecEvent, DeRecFlow, PendingAction};
 
@@ -103,6 +121,15 @@ pub struct DeRecProtocol<
     /// Key-value pairs included in `CommunicationInfo` within pairing request
     /// and response messages (e.g. `"name"`, `"email"`, `"phone"`).
     pub(crate) communication_info: HashMap<String, String>,
+    /// When `true`, the protocol automatically sends a failure response to the
+    /// peer when processing an inbound request fails (e.g. format errors,
+    /// decryption failures). When `false` (default), inbound processing errors
+    /// are only surfaced as events and no response is sent — the application is
+    /// responsible for deciding how to respond.
+    pub(crate) auto_respond_on_failure: bool,
+    /// Active sharing round, if any. Populated by `start(ProtectSecret)` and
+    /// consumed when all targeted Helpers respond or time out.
+    sharing_round: Option<SharingRound>,
 }
 
 impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecTransport>
@@ -134,6 +161,8 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
             secret_id,
             timeout_in_secs,
             communication_info: HashMap::new(),
+            auto_respond_on_failure: false,
+            sharing_round: None,
         }
     }
 
@@ -210,7 +239,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                 secrets,
                 description,
             } => {
-                handlers::sharing::start(
+                let (version, sent_channels) = handlers::sharing::start(
                     &mut self.channel_store,
                     &mut self.share_store,
                     &mut self.secret_store,
@@ -222,6 +251,15 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     &self.secret_id,
                 )
                 .await?;
+
+                self.sharing_round = Some(SharingRound {
+                    version,
+                    pending: sent_channels.into_iter().collect(),
+                    confirmed: HashSet::new(),
+                    failed: HashSet::new(),
+                    started_at: now_secs(),
+                });
+
                 Ok(None)
             }
             DeRecFlow::VerifyShares { version, target } => {
@@ -344,9 +382,17 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
 
     /// Reject a pending action from an [`DeRecEvent::ActionRequired`] event.
     ///
-    /// Builds and sends a FAIL response to the peer with the given memo.
+    /// Builds and sends a rejection response to the peer with the given status
+    /// and memo. The `status` parameter allows the caller to specify the exact
+    /// failure reason (e.g. [`StatusEnum::Rejected`], [`StatusEnum::Fail`],
+    /// [`StatusEnum::TooFrequent`], etc.).
     #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
-    pub async fn reject(&mut self, action: PendingAction, memo: &str) -> Result<()> {
+    pub async fn reject(
+        &mut self,
+        action: PendingAction,
+        status: StatusEnum,
+        memo: &str,
+    ) -> Result<()> {
         match action {
             PendingAction::Pairing {
                 channel_id,
@@ -361,6 +407,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     channel_id,
                     &request,
                     response_kind,
+                    status,
                     memo,
                 )
                 .await
@@ -376,6 +423,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     channel_id,
                     &request,
                     &shared_key,
+                    status,
                     memo,
                 )
                 .await
@@ -391,6 +439,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     channel_id,
                     &request,
                     &shared_key,
+                    status,
                     memo,
                 )
                 .await
@@ -405,6 +454,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     &self.transport,
                     channel_id,
                     &shared_key,
+                    status,
                     memo,
                 )
                 .await
@@ -419,6 +469,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     &self.transport,
                     channel_id,
                     &shared_key,
+                    status,
                     memo,
                 )
                 .await
@@ -438,13 +489,41 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
         feature = "logging",
         tracing::instrument(skip_all, fields(message_len = message.len()))
     )]
-    pub async fn process(&mut self, message: &[u8]) -> Result<Vec<DeRecEvent>> {
+    pub async fn process(
+        &mut self,
+        message: &[u8],
+    ) -> std::result::Result<Vec<DeRecEvent>, ProcessError> {
         let _ = self.cleanup_expired_channels().await;
 
-        let envelope = DeRecMessage::decode(message).map_err(Error::ProtobufDecode)?;
+        let mut timeout_events = self.check_sharing_round_timeouts();
+
+        let envelope = DeRecMessage::decode(message).map_err(|e| ProcessError {
+            channel_id: None,
+            source: Error::ProtobufDecode(e),
+        })?;
         let channel_id = ChannelId(envelope.channel_id);
 
-        if self.is_message_expired(&envelope, channel_id) {
+        let result = self.process_inner(message, channel_id, &envelope).await;
+        let mut events = result.map_err(|source| ProcessError {
+            channel_id: Some(channel_id),
+            source,
+        })?;
+
+        timeout_events.append(&mut events);
+        let mut events = timeout_events;
+
+        self.update_sharing_round(&mut events);
+
+        Ok(events)
+    }
+
+    async fn process_inner(
+        &mut self,
+        message: &[u8],
+        channel_id: ChannelId,
+        envelope: &DeRecMessage,
+    ) -> Result<Vec<DeRecEvent>> {
+        if self.is_message_expired(envelope, channel_id) {
             return Ok(vec![DeRecEvent::NoOp]);
         }
 
@@ -570,6 +649,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
             &shared_key,
         )
         .await?;
+
         Ok(Some(events))
     }
 
@@ -595,6 +675,98 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
         )
         .await?;
         Ok(Some(events))
+    }
+
+    /// Check if any channels in the active sharing round have timed out.
+    ///
+    /// Returns `ShareRejected` events for timed-out channels and moves them
+    /// from `pending` to `failed` in the round tracker.
+    fn check_sharing_round_timeouts(&mut self) -> Vec<DeRecEvent> {
+        let Some(round) = &mut self.sharing_round else {
+            return vec![];
+        };
+        let now = now_secs();
+        if now.saturating_sub(round.started_at) <= self.timeout_in_secs {
+            return vec![];
+        }
+        let timed_out: Vec<ChannelId> = round.pending.drain().collect();
+        let version = round.version;
+        let mut events = Vec::with_capacity(timed_out.len());
+        for channel_id in timed_out {
+            round.failed.insert(channel_id);
+            events.push(DeRecEvent::ShareRejected {
+                channel_id,
+                version,
+                status: StatusEnum::Fail as i32,
+                memo: "timeout".to_owned(),
+            });
+
+            #[cfg(feature = "logging")]
+            tracing::warn!(
+                channel_id = channel_id.0,
+                version,
+                "sharing round: helper timed out"
+            );
+        }
+        events
+    }
+
+    /// Update the active sharing round based on events produced by `process_inner`.
+    ///
+    /// Moves channels from `pending` to `confirmed` or `failed` as
+    /// `ShareConfirmed` / `ShareRejected` events arrive. When no channels
+    /// remain pending, appends a [`DeRecEvent::SharingComplete`] summary.
+    fn update_sharing_round(&mut self, events: &mut Vec<DeRecEvent>) {
+        if self.sharing_round.is_none() {
+            return;
+        }
+
+        let round = self.sharing_round.as_mut().unwrap();
+        for event in events.iter() {
+            match event {
+                DeRecEvent::ShareConfirmed {
+                    channel_id,
+                    version,
+                } if *version == round.version => {
+                    round.pending.remove(channel_id);
+                    round.confirmed.insert(*channel_id);
+                }
+                DeRecEvent::ShareRejected {
+                    channel_id,
+                    version,
+                    ..
+                } if *version == round.version => {
+                    round.pending.remove(channel_id);
+                    round.failed.insert(*channel_id);
+                }
+                _ => {}
+            }
+        }
+
+        let is_complete = round.pending.is_empty();
+        let version = round.version;
+        let confirmed_count = round.confirmed.len();
+        let failed_count = round.failed.len();
+
+        if is_complete {
+            let threshold_met = confirmed_count >= self.threshold;
+            self.sharing_round = None;
+            events.push(DeRecEvent::SharingComplete {
+                version,
+                confirmed_count,
+                failed_count,
+                threshold_met,
+            });
+
+            #[cfg(feature = "logging")]
+            tracing::info!(
+                version,
+                confirmed_count,
+                failed_count,
+                threshold_met,
+                "sharing round complete"
+            );
+        }
     }
 
     /// Remove pending channels that have exceeded the configured timeout,

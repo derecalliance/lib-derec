@@ -26,6 +26,6 @@ pub enum SharingError {
         source: derec_cryptography::vss::DerecVSSError,
     },
 
-    #[error("Helper rejected the share (status={status}): {memo}")]
-    HelperRejected { status: i32, memo: String },
+    #[error("share response indicates a non-OK status (status={status}): {memo}")]
+    NonOkStatus { status: i32, memo: String },
 }

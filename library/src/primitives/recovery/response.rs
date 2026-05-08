@@ -265,7 +265,8 @@ pub fn extract(
 /// - [`RecoveryError::EmptySecretId`] if `secret_id` is empty
 /// - [`RecoveryError::InvalidVersion`] if `version < 0`
 /// - [`RecoveryError::MissingResult`] if any response is missing the `result` field
-/// - [`RecoveryError::NonOkStatus`] if any response indicates a non-OK status
+/// - [`RecoveryError::NonOkStatus`] if any response indicates a non-OK status, carrying the
+///   Helper's status code and memo string
 /// - [`RecoveryError::EmptyCommittedDeRecShare`] if any response contains empty committed share bytes
 /// - [`RecoveryError::DecodeCommittedDeRecShare`] if committed share decoding fails
 /// - [`RecoveryError::DecodeDeRecShare`] if inner share decoding fails
@@ -355,8 +356,11 @@ fn extract_share_from_response(
         .ok_or(RecoveryError::MissingResult)?;
 
     if result.status != StatusEnum::Ok as i32 {
+        #[cfg(feature = "logging")]
+        tracing::warn!(status = result.status, memo = %result.memo, "recovery share response status is not Ok");
         return Err(RecoveryError::NonOkStatus {
             status: result.status,
+            memo: result.memo.to_owned(),
         }
         .into());
     }

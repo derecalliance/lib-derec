@@ -77,18 +77,19 @@ pub(in crate::protocol) async fn accept<
     Ok(vec![DeRecEvent::NoOp])
 }
 
-/// Reject a verify-share request: send FAIL response.
+/// Reject a verify-share request: send a rejection response with the given status.
 pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport>(
     channel_store: &mut Ch,
     transport: &T,
     channel_id: ChannelId,
     request: &VerifyShareRequestMessage,
     shared_key: &SharedKey,
+    status: StatusEnum,
     memo: &str,
 ) -> Result<()> {
     let response = VerifyShareResponseMessage {
         result: Some(DeRecResult {
-            status: StatusEnum::Fail as i32,
+            status: status as i32,
             memo: memo.to_owned(),
         }),
         secret_id: request.secret_id.clone(),
@@ -203,17 +204,13 @@ async fn on_response<Sh: DeRecShareStore>(
         ))?;
 
     let valid = verification_response::process(response, &committed_share_bytes)?;
+
     if !valid {
-        #[cfg(feature = "logging")]
-        tracing::warn!("verification proof is invalid");
         return Err(Error::Invariant("verification proof is invalid"));
     }
 
     #[cfg(feature = "logging")]
     tracing::info!("share verified");
 
-    Ok(vec![DeRecEvent::ShareVerified {
-        channel_id,
-        version,
-    }])
+    Ok(vec![DeRecEvent::ShareVerified { channel_id, version }])
 }

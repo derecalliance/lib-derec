@@ -48,6 +48,7 @@ pub struct DeRecProtocolBuilder<ChannelStore, ShareStore, SecretStore, Transport
     secret_id: Vec<u8>,
     timeout_in_secs: u64,
     communication_info: HashMap<String, String>,
+    auto_respond_on_failure: bool,
 }
 
 impl
@@ -73,6 +74,7 @@ impl
             secret_id: Vec::new(),
             timeout_in_secs: 300,
             communication_info: HashMap::new(),
+            auto_respond_on_failure: false,
         }
     }
 }
@@ -125,6 +127,14 @@ impl<ChannelStore, ShareStore, SecretStore, Transport, OwnTransport>
         self.communication_info = info;
         self
     }
+
+    /// When `true`, the protocol automatically sends a failure response to the
+    /// peer when processing an inbound request fails (e.g. format errors,
+    /// decryption failures). Default: `false`.
+    pub fn with_auto_respond_on_failure(mut self, enabled: bool) -> Self {
+        self.auto_respond_on_failure = enabled;
+        self
+    }
 }
 
 impl<ShareStore, SecretStore, Transport, OwnTransport>
@@ -151,6 +161,7 @@ impl<ShareStore, SecretStore, Transport, OwnTransport>
             secret_id: self.secret_id,
             timeout_in_secs: self.timeout_in_secs,
             communication_info: self.communication_info,
+            auto_respond_on_failure: self.auto_respond_on_failure,
         }
     }
 }
@@ -185,6 +196,7 @@ impl<ChannelStore, SecretStore, Transport, OwnTransport>
             secret_id: self.secret_id,
             timeout_in_secs: self.timeout_in_secs,
             communication_info: self.communication_info,
+            auto_respond_on_failure: self.auto_respond_on_failure,
         }
     }
 }
@@ -219,6 +231,7 @@ impl<ChannelStore, ShareStore, Transport, OwnTransport>
             secret_id: self.secret_id,
             timeout_in_secs: self.timeout_in_secs,
             communication_info: self.communication_info,
+            auto_respond_on_failure: self.auto_respond_on_failure,
         }
     }
 }
@@ -253,6 +266,7 @@ impl<ChannelStore, ShareStore, SecretStore, OwnTransport>
             secret_id: self.secret_id,
             timeout_in_secs: self.timeout_in_secs,
             communication_info: self.communication_info,
+            auto_respond_on_failure: self.auto_respond_on_failure,
         }
     }
 }
@@ -281,6 +295,7 @@ impl<ChannelStore, ShareStore, SecretStore, Transport>
             secret_id: self.secret_id,
             timeout_in_secs: self.timeout_in_secs,
             communication_info: self.communication_info,
+            auto_respond_on_failure: self.auto_respond_on_failure,
         }
     }
 }
@@ -307,6 +322,7 @@ impl<Cs: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, Tr: DeRec
             self.timeout_in_secs,
         );
         protocol.communication_info = self.communication_info;
+        protocol.auto_respond_on_failure = self.auto_respond_on_failure;
         protocol
     }
 }

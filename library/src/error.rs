@@ -78,3 +78,31 @@ pub enum Error {
     #[error("internal invariant violated: {0}")]
     Invariant(&'static str),
 }
+
+impl Error {
+    /// If this error wraps a `NonOkStatus` from any primitive, return `(status, memo)`.
+    pub fn as_non_ok_status(&self) -> Option<(i32, &str)> {
+        match self {
+            Error::Pairing(crate::primitives::pairing::PairingError::NonOkStatus {
+                status,
+                memo,
+            }) => Some((*status, memo)),
+            Error::Sharing(crate::primitives::sharing::SharingError::NonOkStatus {
+                status,
+                memo,
+            }) => Some((*status, memo)),
+            Error::Verification(
+                crate::primitives::verification::VerificationError::NonOkStatus { status, memo },
+            ) => Some((*status, memo)),
+            Error::Discovery(crate::primitives::discovery::DiscoveryError::NonOkStatus {
+                status,
+                memo,
+            }) => Some((*status, memo)),
+            Error::Recovery(crate::primitives::recovery::RecoveryError::NonOkStatus {
+                status,
+                memo,
+            }) => Some((*status, memo)),
+            _ => None,
+        }
+    }
+}

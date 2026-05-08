@@ -21,7 +21,6 @@ use derec_proto::{
 /// pass this token to [`super::DeRecProtocol::accept`] or
 /// [`super::DeRecProtocol::reject`] to complete the flow.
 pub enum PendingAction {
-    /// Incoming pairing request awaiting user approval.
     Pairing {
         channel_id: ChannelId,
         request: PairRequestMessage,
@@ -30,25 +29,21 @@ pub enum PendingAction {
         response_kind: SenderKind,
         peer_communication_info: HashMap<String, String>,
     },
-    /// Incoming share storage request.
     StoreShare {
         channel_id: ChannelId,
         request: StoreShareRequestMessage,
         shared_key: SharedKey,
     },
-    /// Incoming share verification challenge.
     VerifyShare {
         channel_id: ChannelId,
         request: VerifyShareRequestMessage,
         shared_key: SharedKey,
     },
-    /// Incoming discovery request.
     Discovery {
         channel_id: ChannelId,
         request: GetSecretIdsVersionsRequestMessage,
         shared_key: SharedKey,
     },
-    /// Incoming recovery share request.
     GetShare {
         channel_id: ChannelId,
         request: GetShareRequestMessage,
@@ -58,25 +53,29 @@ pub enum PendingAction {
 
 /// Describes an outbound protocol flow to initiate via [`super::DeRecProtocol::start`].
 pub enum DeRecFlow {
-    /// Begin pairing with a peer whose contact was received out-of-band.
     Pairing {
         kind: SenderKind,
         contact: ContactMessage,
         name: Option<String>,
     },
-    /// Send discovery requests to paired Helpers.
-    Discovery { target: Target },
-    /// Split and distribute a secret to all paired Helpers.
+    Discovery {
+        target: Target,
+    },
     ProtectSecret {
         secrets: Vec<UserSecret>,
         description: Option<String>,
     },
-    /// Send verification challenges to Helpers.
-    VerifyShares { version: i32, target: Target },
-    /// Request shares from Helpers to recover a secret.
-    RecoverSecret { secret_id: Vec<u8>, version: i32 },
+    VerifyShares {
+        version: i32,
+        target: Target,
+    },
+    RecoverSecret {
+        secret_id: Vec<u8>,
+        version: i32,
+    },
 }
 
+// TODO: fix this warning
 /// Events emitted by [`super::DeRecProtocol::process`].
 ///
 /// The application reacts to these instead of routing raw messages manually.
@@ -111,6 +110,32 @@ pub enum DeRecEvent {
 
     /// A Helper confirmed it stored our share (Owner side).
     ShareConfirmed { channel_id: ChannelId, version: i32 },
+
+    /// A Helper rejected or failed to store our share (Owner side).
+    ///
+    /// The protocol absorbs sharing failures and converts them to events
+    /// so the application can display per-participant progress. `status` and
+    /// `memo` come from the Helper's response (or are synthetic for timeouts).
+    ShareRejected {
+        channel_id: ChannelId,
+        version: i32,
+        /// The `StatusEnum` value from the Helper's response.
+        status: i32,
+        /// Human-readable reason from the Helper, or `"timeout"`.
+        memo: String,
+    },
+
+    /// A sharing round has completed (all participants responded or timed out).
+    ///
+    /// Emitted once per [`DeRecFlow::ProtectSecret`] flow after every targeted
+    /// Helper has either confirmed, rejected, or timed out.
+    SharingComplete {
+        version: i32,
+        confirmed_count: usize,
+        failed_count: usize,
+        /// `true` when `confirmed_count >= threshold`.
+        threshold_met: bool,
+    },
 
     /// A Helper's verification proof checked out (Owner side).
     ShareVerified { channel_id: ChannelId, version: i32 },

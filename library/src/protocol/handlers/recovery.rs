@@ -180,17 +180,18 @@ pub(in crate::protocol) async fn accept<
     Ok(vec![DeRecEvent::NoOp])
 }
 
-/// Reject a get-share request: send FAIL response.
+/// Reject a get-share request: send a rejection response with the given status.
 pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport>(
     channel_store: &mut Ch,
     transport: &T,
     channel_id: ChannelId,
     shared_key: &SharedKey,
+    status: StatusEnum,
     memo: &str,
 ) -> Result<()> {
     let response = GetShareResponseMessage {
         result: Some(DeRecResult {
-            status: StatusEnum::Fail as i32,
+            status: status as i32,
             memo: memo.to_owned(),
         }),
         committed_de_rec_share: Vec::new(),
