@@ -16,9 +16,9 @@ struct ProduceResultJs {
     /// Serialized [`CommittedDeRecShare`] protobuf bytes for the Helper to store locally.
     committed_share: Vec<u8>,
     /// Secret identifier extracted from the inner share.
-    secret_id: Vec<u8>,
+    secret_id: u64,
     /// Share-distribution version from the request.
-    version: i32,
+    version: u32,
 }
 
 /// Processes an incoming sharing request on behalf of a Helper, producing a response envelope.
@@ -90,7 +90,7 @@ pub fn produce(
 /// `undefined` on success; throws on failure.
 #[wasm_bindgen(js_name = "sharing_response_process")]
 pub fn process(
-    version: i32,
+    version: u32,
     shared_key: &[u8],
     response: JsValue,
 ) -> Result<(), JsValue> {

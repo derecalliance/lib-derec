@@ -34,22 +34,33 @@ pub use error::{ChannelStoreError, ProcessError, SecretStoreError, ShareStoreErr
 use prost::Message;
 use std::collections::{HashMap, HashSet};
 pub use traits::{
-    ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecTransport,
-    SecretKind, SecretStoreFuture, SecretValue, ShareStoreFuture, TransportFuture,
+    ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecShareStore,
+    DeRecTransport, SecretKind, SecretStoreFuture, SecretValue, Share, ShareStoreFuture,
+    TransportFuture,
 };
 
 /// In-progress recovery accumulators keyed by `(secret_id, version)`.
 ///
 /// Each entry collects [`GetShareResponseMessage`] values for a pending recovery
 /// context until enough shares arrive for reconstruction.
-pub(super) type PendingRecovery = HashMap<(Vec<u8>, i32), Vec<GetShareResponseMessage>>;
+pub(super) type PendingRecovery = HashMap<(u64, u32), Vec<GetShareResponseMessage>>;
+
+/// In-progress unpair requests keyed by `channel_id`, with the `started_at`
+/// (epoch seconds) the orchestrator stamped when it sent the request.
+///
+/// Only populated when [`crate::protocol::events::UnpairAck::Required`] is in
+/// effect: the orchestrator waits for the peer's acknowledgement up to the
+/// configured protocol timeout before dropping local state anyway. With
+/// [`UnpairAck::NotRequired`](crate::protocol::events::UnpairAck::NotRequired)
+/// state is dropped immediately and this map is never touched.
+pub(super) type PendingUnpair = HashMap<ChannelId, u64>;
 
 /// Tracks an in-progress sharing round.
 ///
 /// Created when [`DeRecFlow::ProtectSecret`] is started and consumed when all
 /// targeted Helpers have responded (confirmed, rejected, or timed out).
 struct SharingRound {
-    version: i32,
+    version: u32,
     /// Channels that have not yet responded.
     pending: HashSet<ChannelId>,
     /// Channels that confirmed storage.
@@ -60,7 +71,7 @@ struct SharingRound {
     started_at: u64,
 }
 
-pub use events::{DeRecEvent, DeRecFlow, PendingAction};
+pub use events::{DeRecEvent, DeRecFlow, PendingAction, UnpairAck};
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::utils::now_secs;
@@ -90,7 +101,7 @@ use crate::wasm::now_secs;
 ///   ├── create_contact / start(Pairing)          → pairing
 ///   ├── start(ProtectSecret)                     → sharing
 ///   ├── start(VerifyShares)                      → verification
-///   ├── start(Pairing { OwnerRecovery })
+///   ├── start(Pairing { Owner })           (recovery re-pair)
 ///   │     └── start(Discovery)                   → discovery  (emits SecretsDiscovered)
 ///   └── start(RecoverSecret)                     → recovery   (emits SecretRecovered)
 ///
@@ -108,12 +119,24 @@ pub struct DeRecProtocol<
     pub transport: Transport,
     pub own_transport: TransportProtocol,
     pending_recovery: PendingRecovery,
+    /// Channels with an outstanding unpair request awaiting the peer's
+    /// acknowledgement (Required mode only — see [`UnpairAck`]).
+    pending_unpair: PendingUnpair,
+    /// Whether unpair initiators wait for the peer's acknowledgement before
+    /// dropping local state. Default [`UnpairAck::Required`].
+    pub(crate) unpair_ack: UnpairAck,
+    /// Events produced by [`Self::start`] that don't fit the "no events from
+    /// start; only from process" public contract. Drained at the top of every
+    /// [`Self::process`] call. Today this exists solely for
+    /// `UnpairAck::NotRequired`, which has to surface `Unpaired` immediately
+    /// (no inbound response is coming).
+    pending_start_events: Vec<DeRecEvent>,
     /// Minimum number of shares required for reconstruction.
     threshold: usize,
     /// Number of recent versions each Helper must retain.
     keep_versions_count: usize,
     /// Application-provided secret identifier for this protocol instance.
-    secret_id: Vec<u8>,
+    secret_id: u64,
     /// Timeout in seconds for pending channels. Channels that remain in
     /// `Pending` status beyond this duration are automatically removed
     /// along with their pairing keys. Default: 300 (5 minutes).
@@ -146,7 +169,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
         own_transport: TransportProtocol,
         threshold: usize,
         keep_versions_count: usize,
-        secret_id: Vec<u8>,
+        secret_id: u64,
         timeout_in_secs: u64,
     ) -> Self {
         Self {
@@ -156,6 +179,9 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
             transport,
             own_transport,
             pending_recovery: HashMap::new(),
+            pending_unpair: HashMap::new(),
+            unpair_ack: UnpairAck::Required,
+            pending_start_events: Vec::new(),
             threshold,
             keep_versions_count,
             secret_id,
@@ -210,7 +236,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
             DeRecFlow::Pairing {
                 kind,
                 contact,
-                name,
+                peer_communication_info,
             } => {
                 let channel_id = handlers::pairing::start(
                     &mut self.channel_store,
@@ -220,7 +246,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     &self.communication_info,
                     kind,
                     contact,
-                    name,
+                    peer_communication_info,
                 )
                 .await?;
                 Ok(Some(channel_id))
@@ -248,7 +274,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     description,
                     self.threshold,
                     self.keep_versions_count,
-                    &self.secret_id,
+                    self.secret_id,
                 )
                 .await?;
 
@@ -269,7 +295,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     &self.transport,
                     version,
                     target,
-                    &self.secret_id,
+                    self.secret_id,
                 )
                 .await?;
                 Ok(None)
@@ -284,6 +310,32 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     version,
                 )
                 .await?;
+                Ok(None)
+            }
+            DeRecFlow::Unpair { target, memo } => {
+                // The handler returns immediate `Unpaired` events for the
+                // fire-and-forget (`UnpairAck::NotRequired`) path; the
+                // wait-for-ack path returns nothing here and the events
+                // surface later from `process()` (on the response) or the
+                // timeout sweep.
+                let _events = handlers::unpairing::start(
+                    &mut self.channel_store,
+                    &mut self.share_store,
+                    &mut self.secret_store,
+                    &self.transport,
+                    &mut self.pending_unpair,
+                    target,
+                    memo,
+                    self.unpair_ack,
+                    now_secs(),
+                )
+                .await?;
+                // `start` is fire-and-forget at the API surface — its events
+                // are buffered into the protocol's stream by reusing the
+                // `process()` return path. For callers that need to observe
+                // the immediate `Unpaired` events synchronously, we stash
+                // them on the protocol for the next `process()` to drain.
+                self.pending_start_events.extend(_events);
                 Ok(None)
             }
         }
@@ -370,6 +422,22 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                 handlers::recovery::accept(
                     &mut self.channel_store,
                     &mut self.share_store,
+                    &self.transport,
+                    channel_id,
+                    &request,
+                    &shared_key,
+                )
+                .await
+            }
+            PendingAction::Unpair {
+                channel_id,
+                request,
+                shared_key,
+            } => {
+                handlers::unpairing::accept(
+                    &mut self.channel_store,
+                    &mut self.share_store,
+                    &mut self.secret_store,
                     &self.transport,
                     channel_id,
                     &request,
@@ -474,6 +542,21 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                 )
                 .await
             }
+            PendingAction::Unpair {
+                channel_id,
+                shared_key,
+                ..
+            } => {
+                handlers::unpairing::reject(
+                    &mut self.channel_store,
+                    &self.transport,
+                    channel_id,
+                    &shared_key,
+                    status,
+                    memo,
+                )
+                .await
+            }
         }
     }
 
@@ -495,7 +578,17 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
     ) -> std::result::Result<Vec<DeRecEvent>, ProcessError> {
         let _ = self.cleanup_expired_channels().await;
 
+        let mut start_events = std::mem::take(&mut self.pending_start_events);
         let mut timeout_events = self.check_sharing_round_timeouts();
+        let mut unpair_timeout_events = handlers::unpairing::check_timeouts(
+            &mut self.channel_store,
+            &mut self.share_store,
+            &mut self.secret_store,
+            &mut self.pending_unpair,
+            now_secs(),
+            self.timeout_in_secs,
+        )
+        .await;
 
         let envelope = DeRecMessage::decode(message).map_err(|e| ProcessError {
             channel_id: None,
@@ -509,8 +602,14 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
             source,
         })?;
 
-        timeout_events.append(&mut events);
-        let mut events = timeout_events;
+        // Ordering: deferred-from-start events first (so the app sees them
+        // before any inbound-message reactions), then sharing-round
+        // timeouts, then unpair timeouts, then events produced by this
+        // specific message.
+        start_events.append(&mut timeout_events);
+        start_events.append(&mut unpair_timeout_events);
+        start_events.append(&mut events);
+        let mut events = start_events;
 
         self.update_sharing_round(&mut events);
 
@@ -642,8 +741,11 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
         }
 
         let events = handlers::handle(
+            &mut self.channel_store,
             &mut self.share_store,
+            &mut self.secret_store,
             &mut self.pending_recovery,
+            &mut self.pending_unpair,
             message,
             channel_id,
             &shared_key,

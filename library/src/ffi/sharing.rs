@@ -139,21 +139,14 @@ pub struct ProtectSecretResult {
 /// Zero-length buffers are allowed and interpreted as empty slices.
 #[unsafe(no_mangle)]
 pub extern "C" fn protect_secret(
-    secret_id_ptr: *const u8,
-    secret_id_len: usize,
+    secret_id: u64,
     secret_data_ptr: *const u8,
     secret_data_len: usize,
     channels_ptr: *const u64,
     channels_len: usize,
     threshold: usize,
-    version: i32,
+    version: u32,
 ) -> ProtectSecretResult {
-    if secret_id_ptr.is_null() && secret_id_len > 0 {
-        return ProtectSecretResult {
-            status: err_status("secret_id_ptr is null"),
-            shares_wire_bytes: empty_buffer(),
-        };
-    }
 
     if secret_data_ptr.is_null() && secret_data_len > 0 {
         return ProtectSecretResult {
@@ -168,12 +161,6 @@ pub extern "C" fn protect_secret(
             shares_wire_bytes: empty_buffer(),
         };
     }
-
-    let secret_id: &[u8] = if secret_id_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(secret_id_ptr, secret_id_len) }
-    };
 
     let secret_data: &[u8] = if secret_data_len == 0 {
         &[]
@@ -277,12 +264,11 @@ pub struct ProduceStoreShareRequestMessageResult {
 #[unsafe(no_mangle)]
 pub extern "C" fn produce_store_share_request_message(
     channel_id: u64,
-    version: i32,
-    secret_id_ptr: *const u8,
-    secret_id_len: usize,
+    version: u32,
+    secret_id: u64,
     committed_share_ptr: *const u8,
     committed_share_len: usize,
-    keep_list_ptr: *const i32,
+    keep_list_ptr: *const u32,
     keep_list_len: usize,
     description_ptr: *const u8,
     description_len: usize,
@@ -298,9 +284,6 @@ pub extern "C" fn produce_store_share_request_message(
         };
     }
 
-    if secret_id_ptr.is_null() && secret_id_len > 0 {
-        bail!("secret_id_ptr is null");
-    }
     if committed_share_ptr.is_null() && committed_share_len > 0 {
         bail!("committed_share_ptr is null");
     }
@@ -317,19 +300,13 @@ pub extern "C" fn produce_store_share_request_message(
         bail!("shared_key_len must be exactly 32");
     }
 
-    let secret_id: &[u8] = if secret_id_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(secret_id_ptr, secret_id_len) }
-    };
-
     let committed_share_bytes: &[u8] = if committed_share_len == 0 {
         &[]
     } else {
         unsafe { std::slice::from_raw_parts(committed_share_ptr, committed_share_len) }
     };
 
-    let keep_list: &[i32] = if keep_list_len == 0 {
+    let keep_list: &[u32] = if keep_list_len == 0 {
         &[]
     } else {
         unsafe { std::slice::from_raw_parts(keep_list_ptr, keep_list_len) }
@@ -396,8 +373,8 @@ pub struct ProduceStoreShareResponseMessageResult {
     pub status: DeRecStatus,
     pub wire_bytes: DeRecBuffer,
     pub committed_share_bytes: DeRecBuffer,
-    pub secret_id_bytes: DeRecBuffer,
-    pub version: i32,
+    pub secret_id: u64,
+    pub version: u32,
 }
 
 /// Processes an incoming sharing request on behalf of a Helper.
@@ -451,7 +428,7 @@ pub extern "C" fn produce_store_share_response_message(
                 status: err_status($msg),
                 wire_bytes: empty_buffer(),
                 committed_share_bytes: empty_buffer(),
-                secret_id_bytes: empty_buffer(),
+                secret_id: 0,
                 version: 0,
             }
         };
@@ -499,7 +476,7 @@ pub extern "C" fn produce_store_share_response_message(
         status: ok_status(),
         wire_bytes: vec_into_buffer(result.envelope),
         committed_share_bytes: vec_into_buffer(committed_share_bytes),
-        secret_id_bytes: vec_into_buffer(result.secret_id),
+        secret_id: result.secret_id,
         version: result.version,
     }
 }
@@ -556,7 +533,7 @@ pub struct ProcessStoreShareResponseMessageResult {
 /// Each non-null pointer must point to the corresponding readable range.
 #[unsafe(no_mangle)]
 pub extern "C" fn process_store_share_response_message(
-    version: i32,
+    version: u32,
     shared_key_ptr: *const u8,
     shared_key_len: usize,
     response_bytes_ptr: *const u8,

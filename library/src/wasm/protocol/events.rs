@@ -23,27 +23,27 @@ enum DeRecEventJs {
     },
     ShareStored {
         channel_id: String,
-        version: i32,
+        version: u32,
     },
     ShareConfirmed {
         channel_id: String,
-        version: i32,
+        version: u32,
     },
     ShareRejected {
         channel_id: String,
-        version: i32,
+        version: u32,
         status: i32,
         memo: String,
     },
     SharingComplete {
-        version: i32,
+        version: u32,
         confirmed_count: usize,
         failed_count: usize,
         threshold_met: bool,
     },
     ShareVerified {
         channel_id: String,
-        version: i32,
+        version: u32,
     },
     SecretsDiscovered {
         channel_id: String,
@@ -61,6 +61,14 @@ enum DeRecEventJs {
     SecretRecovered {
         secret: Vec<u8>,
     },
+    Unpaired {
+        channel_id: String,
+    },
+    UnpairRejected {
+        channel_id: String,
+        status: i32,
+        memo: String,
+    },
     ActionRequired {
         channel_id: String,
         /// Opaque serialized PendingAction — pass back to accept() or reject().
@@ -70,28 +78,36 @@ enum DeRecEventJs {
         /// For Pairing actions: key-value pairs from the peer's CommunicationInfo.
         #[serde(skip_serializing_if = "HashMap::is_empty")]
         peer_communication_info: HashMap<String, String>,
+        /// For Pairing actions: the sender_kind from the incoming PairRequestMessage.
+        /// Mirrors the `kind` field on PairingCompleted so callers can distinguish
+        /// Owner, Helper, Replica, etc.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sender_kind: Option<u32>,
         /// For StoreShare actions: the share version number.
         #[serde(skip_serializing_if = "Option::is_none")]
-        share_version: Option<i32>,
+        share_version: Option<u32>,
         /// For StoreShare actions: human-readable description of the secret version.
         #[serde(skip_serializing_if = "Option::is_none")]
         share_description: Option<String>,
-        /// For StoreShare actions: the secret identifier (opaque bytes).
+        /// For StoreShare/VerifyShare actions: the secret identifier (u64) as a
+        /// decimal string. A string (not a JS number) because a u64 can exceed
+        /// `Number.MAX_SAFE_INTEGER`; mirrors the share-store JS convention.
         #[serde(skip_serializing_if = "Option::is_none")]
-        share_secret_id: Option<Vec<u8>>,
+        share_secret_id: Option<String>,
     },
     NoOp,
 }
 
 #[derive(serde::Serialize)]
 struct SecretVersionEntryJs {
-    secret_id: Vec<u8>,
+    /// Secret identifier (u64) as a decimal string — see `share_secret_id`.
+    secret_id: String,
     versions: Vec<VersionEntryJs>,
 }
 
 #[derive(serde::Serialize)]
 struct VersionEntryJs {
-    version: i32,
+    version: u32,
     description: String,
 }
 
@@ -103,8 +119,17 @@ fn extract_peer_communication_info(action: &PendingAction) -> HashMap<String, St
     }
 }
 
+/// Returns the `sender_kind` from the incoming `PairRequestMessage` for Pairing actions,
+/// or `None` for all other action types.
+fn extract_pairing_sender_kind(action: &PendingAction) -> Option<u32> {
+    match action {
+        PendingAction::Pairing { request, .. } => Some(request.sender_kind as u32),
+        _ => None,
+    }
+}
+
 /// Extract share version and description from a `PendingAction::StoreShare`, or `(None, None)` otherwise.
-fn extract_share_metadata(action: &PendingAction) -> (Option<i32>, Option<String>, Option<Vec<u8>>) {
+fn extract_share_metadata(action: &PendingAction) -> (Option<u32>, Option<String>, Option<String>) {
     match action {
         PendingAction::StoreShare { request, .. } => {
             let desc = if request.version_description.is_empty() {
@@ -112,20 +137,10 @@ fn extract_share_metadata(action: &PendingAction) -> (Option<i32>, Option<String
             } else {
                 Some(request.version_description.to_owned())
             };
-            let secret_id = if request.secret_id.is_empty() {
-                None
-            } else {
-                Some(request.secret_id.clone())
-            };
-            (Some(request.version), desc, secret_id)
+            (Some(request.version), desc, Some(request.secret_id.to_string()))
         }
         PendingAction::VerifyShare { request, .. } => {
-            let secret_id = if request.secret_id.is_empty() {
-                None
-            } else {
-                Some(request.secret_id.clone())
-            };
-            (Some(request.version), None, secret_id)
+            (Some(request.version), None, Some(request.secret_id.to_string()))
         }
         _ => (None, None, None),
     }
@@ -139,6 +154,7 @@ fn action_kind_label(action: &PendingAction) -> &'static str {
         PendingAction::VerifyShare { .. } => "VerifyShare",
         PendingAction::Discovery { .. } => "Discovery",
         PendingAction::GetShare { .. } => "GetShare",
+        PendingAction::Unpair { .. } => "Unpair",
     }
 }
 
@@ -178,7 +194,7 @@ pub fn event_to_js(event: DeRecEvent) -> Result<JsValue, JsValue> {
             secrets: secrets
                 .into_iter()
                 .map(|e| SecretVersionEntryJs {
-                    secret_id: e.secret_id,
+                    secret_id: e.secret_id.to_string(),
                     versions: e
                         .versions
                         .into_iter()
@@ -204,9 +220,18 @@ pub fn event_to_js(event: DeRecEvent) -> Result<JsValue, JsValue> {
             }
         }
         DeRecEvent::SecretRecovered { secret } => DeRecEventJs::SecretRecovered { secret },
+        DeRecEvent::Unpaired { channel_id } => DeRecEventJs::Unpaired {
+            channel_id: channel_id.0.to_string(),
+        },
+        DeRecEvent::UnpairRejected { channel_id, status, memo } => DeRecEventJs::UnpairRejected {
+            channel_id: channel_id.0.to_string(),
+            status,
+            memo,
+        },
         DeRecEvent::ActionRequired { channel_id, action } => {
             let kind = action_kind_label(&action).to_owned();
             let peer_communication_info = extract_peer_communication_info(&action);
+            let sender_kind = extract_pairing_sender_kind(&action);
             let (share_version, share_description, share_secret_id) = extract_share_metadata(&action);
             let action_bytes = pending_action_wire::serialize(action)
                 .map_err(|e| js_error("WASM_SERIALIZE_ERROR", e))?;
@@ -215,6 +240,7 @@ pub fn event_to_js(event: DeRecEvent) -> Result<JsValue, JsValue> {
                 action: action_bytes,
                 action_kind: kind,
                 peer_communication_info,
+                sender_kind,
                 share_version,
                 share_description,
                 share_secret_id,

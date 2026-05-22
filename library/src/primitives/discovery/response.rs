@@ -17,7 +17,7 @@ use prost::Message;
 #[derive(Debug, Clone, PartialEq)]
 pub struct VersionEntry {
     /// Numeric version identifier.
-    pub version: i32,
+    pub version: u32,
     /// Human-readable description supplied by the Owner at share-storage time.
     ///
     /// Empty when no description was provided.
@@ -29,7 +29,7 @@ pub struct VersionEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SecretVersionEntry {
     /// Application-defined secret identifier.
-    pub secret_id: Vec<u8>,
+    pub secret_id: u64,
     /// All share versions the Helper currently stores for this secret.
     ///
     /// Each entry includes the version number and the description that was
@@ -91,8 +91,6 @@ pub struct ProcessResult {
 ///
 /// Returns [`crate::Error`] (specifically `Error::Discovery(...)`) in the following cases:
 ///
-/// - [`DiscoveryError::EmptySecretId`] if any entry in `secret_list` has an empty `secret_id`
-///
 /// Returns [`crate::Error`] if outer envelope construction or symmetric encryption fails.
 ///
 /// # Security Notes
@@ -130,20 +128,12 @@ pub fn produce(
     secret_list: &[SecretVersionEntry],
     shared_key: &SharedKey,
 ) -> Result<ProduceResult, crate::Error> {
-    for (index, entry) in secret_list.iter().enumerate() {
-        if entry.secret_id.is_empty() {
-            #[cfg(feature = "logging")]
-            tracing::warn!(index = index, "secret_id is empty in secret list entry");
-            return Err(DiscoveryError::EmptySecretId { index }.into());
-        }
-    }
-
     let timestamp = current_timestamp();
 
     let version_list: Vec<VersionList> = secret_list
         .iter()
         .map(|entry| VersionList {
-            secret_id: entry.secret_id.clone(),
+            secret_id: entry.secret_id,
             versions: entry
                 .versions
                 .iter()
@@ -306,7 +296,7 @@ pub fn process(
         .secret_list
         .iter()
         .map(|entry| SecretVersionEntry {
-            secret_id: entry.secret_id.clone(),
+            secret_id: entry.secret_id,
             versions: entry
                 .versions
                 .iter()

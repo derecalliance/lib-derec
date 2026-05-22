@@ -28,7 +28,7 @@
 //! const channelId = BigInt(contact.channel_id);
 //!
 //! // Owner: receive peer's ContactMessage object and begin pairing.
-//! const channelId = await protocol.startPairing(0, peerContact); // 0 = OwnerNonRecovery
+//! const channelId = await protocol.startPairing(0, peerContact); // 0 = Owner
 //!
 //! // Feed incoming wire bytes; react to returned events.
 //! const events = await protocol.process(rawBytes);
@@ -47,10 +47,16 @@ mod stores;
 use std::collections::HashMap;
 
 use crate::{
-    protocol::{DeRecFlow, DeRecProtocol, DeRecProtocolBuilder},
-    types::{ChannelId, Target, UserSecret},
-    wasm::ts_bindings_utils::js_error,
+    protocol::{
+        DeRecChannelStore, DeRecFlow, DeRecProtocol, DeRecProtocolBuilder, DeRecSecretStore,
+        DeRecShareStore, SecretValue, Share, UnpairAck,
+    },
+    types::{Channel, ChannelId, ChannelStatus, SecretContainer, Target, UserSecret},
+    wasm::{now_secs, ts_bindings_utils::js_error},
 };
+use derec_proto::DeRecSecret;
+use prost::Message;
+use serde::Serialize;
 use crate::wasm::primitives::pairing::{contact_message_to_js, js_to_contact_message};
 use derec_proto::{SenderKind, TransportProtocol};
 use js_sys::{Array, Uint8Array};
@@ -123,6 +129,10 @@ impl DeRecProtocolWasm {
     ///
     /// * `threshold` — Minimum number of shares required for reconstruction.
     /// * `keep_versions_count` — Number of recent versions each Helper must retain.
+    /// * `timeout_in_secs` — General protocol timeout (seconds). Used passively
+    ///   in `process()` to discard expired messages / pending channels / stale
+    ///   sharing rounds. Defaults to 300 when omitted. Active (wall-clock)
+    ///   timeouts remain the application's responsibility.
     #[wasm_bindgen(constructor)]
     pub fn new(
         channel_store: JsValue,
@@ -133,9 +143,15 @@ impl DeRecProtocolWasm {
         own_transport_protocol: String,
         threshold: u32,
         keep_versions_count: u32,
-        secret_id: &[u8],
+        secret_id: u64,
         communication_info: JsValue,
+        timeout_in_secs: Option<u32>,
         auto_respond_on_failure: Option<bool>,
+        // `unpair_ack`: `"required"` (default) makes the unpair initiator
+        // wait for the peer's acknowledgement before dropping local state.
+        // `"not_required"` is fire-and-forget — state is dropped immediately
+        // on `start(Unpair)` and any later response is ignored.
+        unpair_ack: Option<String>,
     ) -> Result<DeRecProtocolWasm, JsValue> {
         let protocol_num = match own_transport_protocol.to_lowercase().as_str() {
             "https" => 0i32,
@@ -156,6 +172,21 @@ impl DeRecProtocolWasm {
             serde_wasm_bindgen::from_value(communication_info)
                 .map_err(|e| js_error("INVALID_COMMUNICATION_INFO", e.to_string()))?
         };
+        let unpair_ack_value = match unpair_ack
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            None | Some("required") => UnpairAck::Required,
+            Some("not_required" | "notrequired" | "fire_and_forget") => UnpairAck::NotRequired,
+            Some(other) => {
+                return Err(js_error(
+                    "INVALID_UNPAIR_ACK",
+                    format!("unknown unpair_ack value: {other:?}; expected \"required\" or \"not_required\""),
+                ));
+            }
+        };
+
         let inner = DeRecProtocolBuilder::new()
             .with_channel_store(JsChannelStore(channel_store))
             .with_share_store(JsShareStore(share_store))
@@ -164,9 +195,11 @@ impl DeRecProtocolWasm {
             .with_own_transport(own_transport)
             .with_threshold(threshold as usize)
             .with_keep_versions_count(keep_versions_count as usize)
-            .with_secret_id(secret_id.to_vec())
+            .with_secret_id(secret_id)
             .with_communication_info(info)
+            .with_timeout_in_secs(timeout_in_secs.map_or(300, u64::from))
             .with_auto_respond_on_failure(auto_respond_on_failure.unwrap_or(false))
+            .with_unpair_ack(unpair_ack_value)
             .build();
         Ok(DeRecProtocolWasm { inner })
     }
@@ -313,6 +346,199 @@ impl DeRecProtocolWasm {
     }
 }
 
+/// Decode the bytes carried by a [`DeRecEvent::SecretRecovered`] event into
+/// the structured secret bag (`SecretContainer`) — the *same* shape the owner
+/// originally protected. The reconstructed bytes are protobuf, so the FE
+/// can't `TextDecoder.decode()` them; this is the canonical unwrapper.
+///
+/// The wire layering is:
+/// ```text
+/// raw share fragments → VSS reconstruct → DeRecSecret { secret_data: bag_bytes }
+///                                                              └─ SecretContainer { helpers, secrets }
+/// ```
+///
+/// Returns a JS object:
+/// ```ts
+/// {
+///   helpers: Array<{
+///     channelId: string,           // u64 as decimal string
+///     transportUri: string,
+///     communicationInfo: Record<string, string>,
+///     sharedKey: Uint8Array,       // 32 bytes
+///   }>,
+///   secrets: Array<{
+///     id: Uint8Array,              // app-defined identifier (binary)
+///     name: string,
+///     data: Uint8Array,            // raw secret bytes (apps that store text decode with TextDecoder)
+///   }>,
+/// }
+/// ```
+#[wasm_bindgen(js_name = "decodeRecoveredSecretBag")]
+pub fn decode_recovered_secret_bag(bytes: &[u8]) -> Result<JsValue, JsValue> {
+    let derec = DeRecSecret::decode(bytes).map_err(|e| {
+        js_error("DECODE_ERROR", format!("DeRecSecret decode failed: {e}"))
+    })?;
+    let bag = SecretContainer::decode(derec.secret_data.as_slice()).map_err(|e| {
+        js_error("DECODE_ERROR", format!("SecretContainer decode failed: {e}"))
+    })?;
+
+    // Note: `Vec<u8>` serializes as `Array<number>` by default via
+    // serde-wasm-bindgen (matches how `SecretRecovered.secret` is exposed
+    // elsewhere — the FE converts to `Uint8Array` at the boundary).
+    #[derive(serde::Serialize)]
+    struct HelperJs {
+        #[serde(rename = "channelId")]
+        channel_id: String,
+        #[serde(rename = "transportUri")]
+        transport_uri: String,
+        #[serde(rename = "communicationInfo")]
+        communication_info: HashMap<String, String>,
+        #[serde(rename = "sharedKey")]
+        shared_key: Vec<u8>,
+    }
+    #[derive(serde::Serialize)]
+    struct UserSecretJs {
+        id: Vec<u8>,
+        name: String,
+        data: Vec<u8>,
+    }
+    #[derive(serde::Serialize)]
+    struct BagJs {
+        helpers: Vec<HelperJs>,
+        secrets: Vec<UserSecretJs>,
+    }
+
+    let payload = BagJs {
+        helpers: bag
+            .helpers
+            .into_iter()
+            .map(|h| HelperJs {
+                channel_id: h.channel_id.to_string(),
+                transport_uri: h.transport_uri,
+                communication_info: h.communication_info,
+                shared_key: h.shared_key,
+            })
+            .collect(),
+        secrets: bag
+            .secrets
+            .into_iter()
+            .map(|s| UserSecretJs {
+                id: s.id,
+                name: s.name,
+                data: s.data,
+            })
+            .collect(),
+    };
+
+    // `Serializer::new().serialize_maps_as_objects(true)` ensures the
+    // `communicationInfo` HashMap comes through as a plain JS object rather
+    // than a `Map` instance.
+    payload
+        .serialize(&serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true))
+        .map_err(|e: serde_wasm_bindgen::Error| js_error("SERIALIZE_ERROR", e.to_string()))
+}
+
+/// Re-populate a set of empty stores from a recovered secret bag, so the
+/// caller can resume in the "normal" (non-recovery) namespace as if the bag
+/// had been distributed by this device originally.
+///
+/// For each helper in the decoded bag, three records are written:
+///   - `channel_store.save(Channel { ... })` — the paired channel record,
+///     including the app's `communication_info` carried in the bag.
+///   - `secret_store.save(channel_id, SharedKey(...))` — the negotiated
+///     symmetric key, restoring the helper's ability to decrypt our messages.
+///   - `share_store.save(channel_id, Share { secret_id, version, bytes: [] })`
+///     — an owner-side tracking entry so subsequent verify-share runs know
+///     which helpers hold this `(secret_id, version)`.
+///
+/// The protocol library treats `communication_info` as opaque; whatever the
+/// owner put there at protect time (typically `{ "name": "Alice" }`) is
+/// restored verbatim.
+///
+/// **Caller's responsibility**: provide stores backed by an *empty* target
+/// namespace (call `clearNamespace` first). This function does not wipe.
+#[wasm_bindgen(js_name = "restoreFromRecoveredBag")]
+pub async fn restore_from_recovered_bag(
+    channel_store: JsValue,
+    secret_store: JsValue,
+    share_store: JsValue,
+    recovered_bytes: &[u8],
+    secret_id: &str,
+    version: u32,
+) -> Result<(), JsValue> {
+    let secret_id_u64 = secret_id.parse::<u64>().map_err(|e| {
+        js_error("INVALID_SECRET_ID", format!("secret_id must be a u64 decimal string: {e}"))
+    })?;
+
+    let derec = DeRecSecret::decode(recovered_bytes).map_err(|e| {
+        js_error("DECODE_ERROR", format!("DeRecSecret decode failed: {e}"))
+    })?;
+    let bag = SecretContainer::decode(derec.secret_data.as_slice()).map_err(|e| {
+        js_error("DECODE_ERROR", format!("SecretContainer decode failed: {e}"))
+    })?;
+
+    let mut ch_store = JsChannelStore(channel_store);
+    let mut sec_store = JsSecretStore(secret_store);
+    let mut sh_store = JsShareStore(share_store);
+
+    let created_at = now_secs();
+    // HTTPS is the only transport the reference app speaks; this mirrors the
+    // value used by the protocol constructor for `own_transport_protocol`.
+    const TRANSPORT_HTTPS: i32 = 0;
+
+    for helper in bag.helpers {
+        let channel_id = ChannelId(helper.channel_id);
+
+        let shared_key: [u8; 32] = helper.shared_key.as_slice().try_into().map_err(|_| {
+            js_error(
+                "INVALID_SHARED_KEY",
+                format!(
+                    "shared_key for channel {} must be 32 bytes, got {}",
+                    helper.channel_id,
+                    helper.shared_key.len()
+                ),
+            )
+        })?;
+
+        let channel = Channel {
+            id: channel_id,
+            transport: derec_proto::TransportProtocol {
+                uri: helper.transport_uri,
+                protocol: TRANSPORT_HTTPS,
+            },
+            communication_info: helper.communication_info,
+            status: ChannelStatus::Paired,
+            created_at,
+        };
+
+        ch_store
+            .save(channel)
+            .await
+            .map_err(|e| js_error("CHANNEL_STORE_SAVE", e.to_string()))?;
+
+        sec_store
+            .save(channel_id, SecretValue::SharedKey(shared_key))
+            .await
+            .map_err(|e| js_error("SECRET_STORE_SAVE", e.to_string()))?;
+
+        sh_store
+            .save(
+                channel_id,
+                Share {
+                    secret_id: secret_id_u64,
+                    version,
+                    // Owner-side tracking entry — the helper holds the real
+                    // share bytes; the owner only records that it was sent.
+                    bytes: Vec::new(),
+                },
+            )
+            .await
+            .map_err(|e| js_error("SHARE_STORE_SAVE", e.to_string()))?;
+    }
+
+    Ok(())
+}
+
 /// Produce a structured JS error for `NonOkStatus` responses.
 ///
 /// Returns `{ code: "NON_OK_STATUS", message, status, memo, channel_id? }`.
@@ -383,13 +609,12 @@ fn js_value_to_u64(val: JsValue) -> Result<u64, JsValue> {
 
 fn parse_sender_kind(kind: u32) -> Result<SenderKind, JsValue> {
     match kind {
-        0 => Ok(SenderKind::OwnerNonRecovery),
-        1 => Ok(SenderKind::OwnerRecovery),
-        2 => Ok(SenderKind::Helper),
-        3 => Ok(SenderKind::Replica),
+        0 => Ok(SenderKind::Owner),
+        1 => Ok(SenderKind::Helper),
+        2 => Ok(SenderKind::Replica),
         _ => Err(js_error(
             "INVALID_SENDER_KIND",
-            format!("invalid sender kind: {kind}, must be 0, 1, 2, or 3"),
+            format!("invalid sender kind: {kind}, valid values are 0 (Owner), 1 (Helper), 2 (Replica)"),
         )),
     }
 }
@@ -448,11 +673,12 @@ fn parse_user_secrets(val: JsValue) -> Result<Vec<UserSecret>, JsValue> {
 /// Parse a JS flow kind + params into a [`DeRecFlow`].
 ///
 /// Flow kinds:
-/// - `0` = Pairing: `{ kind: number, contact: ContactMessage, name?: string }`
+/// - `0` = Pairing: `{ kind: number, contact: ContactMessage, peerCommunicationInfo?: Record<string, string> }`
 /// - `1` = Discovery: `{ target: BigInt | BigInt[] | null }`
 /// - `2` = ProtectSecret: `{ secrets: UserSecret[], description?: string }`
 /// - `3` = VerifyShares: `{ version: number, target: BigInt | BigInt[] | null }`
 /// - `4` = RecoverSecret: `{ secretId: Uint8Array, version: number }`
+/// - `5` = Unpair: `{ target: BigInt | BigInt[] | null, memo?: string }`
 fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
     match flow_kind {
         0 => {
@@ -467,13 +693,20 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
             let contact_val = js_sys::Reflect::get(&params, &JsValue::from_str("contact"))
                 .map_err(|e| js_error("DECODE_ERROR", format!("missing contact: {e:?}")))?;
             let contact = js_to_contact_message(contact_val)?;
-            let name = js_sys::Reflect::get(&params, &JsValue::from_str("name"))
-                .unwrap_or(JsValue::UNDEFINED)
-                .as_string();
+            let raw = js_sys::Reflect::get(&params, &JsValue::from_str("peerCommunicationInfo"))
+                .unwrap_or(JsValue::UNDEFINED);
+            let peer_communication_info: HashMap<String, String> =
+                if raw.is_null() || raw.is_undefined() {
+                    HashMap::new()
+                } else {
+                    serde_wasm_bindgen::from_value(raw).map_err(|e| {
+                        js_error("INVALID_PEER_COMMUNICATION_INFO", e.to_string())
+                    })?
+                };
             Ok(DeRecFlow::Pairing {
                 kind: sender_kind,
                 contact,
-                name,
+                peer_communication_info,
             })
         }
         1 => {
@@ -502,7 +735,7 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
                 .map_err(|e| js_error("DECODE_ERROR", format!("missing version: {e:?}")))?
                 .as_f64()
                 .ok_or_else(|| js_error("DECODE_ERROR", "version must be a number"))?
-                as i32;
+                as u32;
             let target_val = js_sys::Reflect::get(&params, &JsValue::from_str("target"))
                 .unwrap_or(JsValue::UNDEFINED);
             let target = parse_target(target_val)?;
@@ -512,17 +745,27 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
             // RecoverSecret
             let secret_id_val = js_sys::Reflect::get(&params, &JsValue::from_str("secretId"))
                 .map_err(|e| js_error("DECODE_ERROR", format!("missing secretId: {e:?}")))?;
-            let secret_id = Uint8Array::new(&secret_id_val).to_vec();
+            let secret_id = js_value_to_u64(secret_id_val)?;
             let version = js_sys::Reflect::get(&params, &JsValue::from_str("version"))
                 .map_err(|e| js_error("DECODE_ERROR", format!("missing version: {e:?}")))?
                 .as_f64()
                 .ok_or_else(|| js_error("DECODE_ERROR", "version must be a number"))?
-                as i32;
+                as u32;
             Ok(DeRecFlow::RecoverSecret { secret_id, version })
+        }
+        5 => {
+            // Unpair
+            let target_val = js_sys::Reflect::get(&params, &JsValue::from_str("target"))
+                .unwrap_or(JsValue::UNDEFINED);
+            let target = parse_target(target_val)?;
+            let memo = js_sys::Reflect::get(&params, &JsValue::from_str("memo"))
+                .unwrap_or(JsValue::UNDEFINED)
+                .as_string();
+            Ok(DeRecFlow::Unpair { target, memo })
         }
         _ => Err(js_error(
             "INVALID_FLOW_KIND",
-            format!("invalid flow kind: {flow_kind}, must be 0..4"),
+            format!("invalid flow kind: {flow_kind}, must be 0..5"),
         )),
     }
 }

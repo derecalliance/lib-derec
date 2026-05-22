@@ -105,7 +105,7 @@ pub fn produce(
             status: StatusEnum::Ok as i32,
             memo: String::new(),
         }),
-        secret_id: request.secret_id.clone(),
+        secret_id: request.secret_id,
         version: request.version,
         nonce: request.nonce,
         hash,

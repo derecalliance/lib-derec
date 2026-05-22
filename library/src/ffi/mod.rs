@@ -3,4 +3,5 @@ pub mod pairing;
 pub mod protocol_version;
 pub mod recovery;
 pub mod sharing;
+pub mod unpairing;
 pub mod verification;

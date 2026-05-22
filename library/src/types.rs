@@ -110,8 +110,20 @@ pub struct Channel {
     pub id: ChannelId,
     /// The peer's transport endpoint.
     pub transport: derec_proto::TransportProtocol,
-    /// Human-readable name for the peer (may be empty).
-    pub name: String,
+    /// Application-level identity metadata for the peer on this channel.
+    ///
+    /// Free-form key/value pairs — the protocol treats this as opaque and
+    /// never inspects keys or values. Anything an app wants to remember
+    /// about *who* is on the other end (display name, account id, avatar
+    /// URI, ...) lives here. App-level identity logic (e.g. auto-linking
+    /// by display name) reads from this map; the protocol does not.
+    ///
+    /// On the initiator side, this is whatever the caller supplied when
+    /// starting [`DeRecFlow::Pairing`](crate::protocol::DeRecFlow::Pairing).
+    /// On the responder side, it is the peer's own `communication_info`
+    /// extracted from the wire pair-request — the same map that surfaces
+    /// in [`DeRecEvent::PairingCompleted::peer_communication_info`](crate::protocol::DeRecEvent::PairingCompleted).
+    pub communication_info: std::collections::HashMap<String, String>,
     /// Lifecycle status. Messages on `Pending` channels are ignored.
     pub status: ChannelStatus,
     /// Unix timestamp (seconds) when the channel was created.
@@ -130,12 +142,26 @@ pub struct HelperInfo {
     /// The Helper's message endpoint URI.
     #[prost(string, tag = "2")]
     pub transport_uri: ::prost::alloc::string::String,
-    /// Human-readable memo for the Helper.
-    #[prost(string, tag = "3")]
-    pub name: ::prost::alloc::string::String,
     /// Symmetric key negotiated during pairing (32 bytes).
     #[prost(bytes = "vec", tag = "4")]
     pub shared_key: ::prost::alloc::vec::Vec<u8>,
+    /// App-level identity metadata for this helper. Free-form key/value
+    /// pairs — the protocol treats it as opaque, never inspects keys or
+    /// values, and copies it verbatim from
+    /// [`Channel::communication_info`](Channel) at protect-time. A recovering
+    /// owner who decodes the bag can use this to recognise each helper
+    /// (e.g. by a `"name"` key the app set on pairing).
+    ///
+    /// **Wire stability**: the now-removed `name: String` was previously at
+    /// tag 3. Using tag 5 lets prost silently drop the old `name` field
+    /// when decoding legacy bags (empty `communication_info`), and lets
+    /// older codebases silently drop this new field when decoding new
+    /// bags. Degraded but not broken in either direction.
+    #[prost(map = "string, string", tag = "5")]
+    pub communication_info: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 
 /// A single user-facing secret within the bag.

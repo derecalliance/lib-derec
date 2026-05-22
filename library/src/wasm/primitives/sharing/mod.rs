@@ -13,8 +13,8 @@ struct DeRecShareDecodedJs {
     encrypted_secret: Vec<u8>,
     x: Vec<u8>,
     y: Vec<u8>,
-    secret_id: Vec<u8>,
-    version: i32,
+    secret_id: u64,
+    version: u32,
 }
 
 #[derive(serde::Serialize)]

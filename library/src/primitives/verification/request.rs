@@ -93,8 +93,8 @@ pub struct ExtractResult {
 )]
 pub fn produce(
     channel_id: ChannelId,
-    secret_id: impl AsRef<[u8]>,
-    version: i32,
+    secret_id: u64,
+    version: u32,
     shared_key: &SharedKey,
 ) -> Result<ProduceResult, crate::Error> {
     let mut rng = rng();
@@ -103,7 +103,7 @@ pub fn produce(
     let nonce = rng.next_u64();
 
     let message = VerifyShareRequestMessage {
-        secret_id: secret_id.as_ref().to_vec(),
+        secret_id,
         version,
         nonce,
         timestamp: Some(timestamp),

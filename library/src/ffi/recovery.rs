@@ -152,31 +152,17 @@ pub struct RecoverFromShareResponsesResult {
 #[unsafe(no_mangle)]
 pub extern "C" fn produce_get_share_request_message(
     channel_id: u64,
-    secret_id_ptr: *const u8,
-    secret_id_len: usize,
-    version: i32,
+    secret_id: u64,
+    version: u32,
     shared_key_ptr: *const u8,
     shared_key_len: usize,
 ) -> ProduceGetShareRequestMessageResult {
-    if secret_id_ptr.is_null() && secret_id_len > 0 {
-        return ProduceGetShareRequestMessageResult {
-            status: err_status("secret_id_ptr is null"),
-            request_wire_bytes: empty_buffer(),
-        };
-    }
-
     if shared_key_ptr.is_null() && shared_key_len > 0 {
         return ProduceGetShareRequestMessageResult {
             status: err_status("shared_key_ptr is null"),
             request_wire_bytes: empty_buffer(),
         };
     }
-
-    let secret_id: &[u8] = if secret_id_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(secret_id_ptr, secret_id_len) }
-    };
 
     let shared_key_bytes: &[u8] = if shared_key_len == 0 {
         &[]
@@ -263,8 +249,7 @@ pub extern "C" fn produce_get_share_request_message(
 #[unsafe(no_mangle)]
 pub extern "C" fn produce_get_share_response_message(
     channel_id: u64,
-    secret_id_ptr: *const u8,
-    secret_id_len: usize,
+    secret_id: u64,
     request_ptr: *const u8,
     request_len: usize,
     stored_share_ptr: *const u8,
@@ -272,13 +257,6 @@ pub extern "C" fn produce_get_share_response_message(
     shared_key_ptr: *const u8,
     shared_key_len: usize,
 ) -> ProduceGetShareResponseMessageResult {
-    if secret_id_ptr.is_null() && secret_id_len > 0 {
-        return ProduceGetShareResponseMessageResult {
-            status: err_status("secret_id_ptr is null"),
-            response_wire_bytes: empty_buffer(),
-        };
-    }
-
     if request_ptr.is_null() && request_len > 0 {
         return ProduceGetShareResponseMessageResult {
             status: err_status("request_ptr is null"),
@@ -299,12 +277,6 @@ pub extern "C" fn produce_get_share_response_message(
             response_wire_bytes: empty_buffer(),
         };
     }
-
-    let secret_id: &[u8] = if secret_id_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(secret_id_ptr, secret_id_len) }
-    };
 
     let request_bytes: &[u8] = if request_len == 0 {
         &[]
@@ -427,9 +399,8 @@ pub extern "C" fn produce_get_share_response_message(
 pub extern "C" fn recover_from_share_responses(
     responses_ptr: *const u8,
     responses_len: usize,
-    secret_id_ptr: *const u8,
-    secret_id_len: usize,
-    version: i32,
+    secret_id: u64,
+    version: u32,
 ) -> RecoverFromShareResponsesResult {
     if responses_ptr.is_null() && responses_len > 0 {
         return RecoverFromShareResponsesResult {
@@ -438,23 +409,10 @@ pub extern "C" fn recover_from_share_responses(
         };
     }
 
-    if secret_id_ptr.is_null() && secret_id_len > 0 {
-        return RecoverFromShareResponsesResult {
-            status: err_status("secret_id_ptr is null"),
-            secret_data: empty_buffer(),
-        };
-    }
-
     let responses_bytes: &[u8] = if responses_len == 0 {
         &[]
     } else {
         unsafe { std::slice::from_raw_parts(responses_ptr, responses_len) }
-    };
-
-    let secret_id: &[u8] = if secret_id_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(secret_id_ptr, secret_id_len) }
     };
 
     let serialized_inputs = match deserialize_recovery_response_inputs(responses_bytes) {

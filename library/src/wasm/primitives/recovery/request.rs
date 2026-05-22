@@ -23,8 +23,8 @@ use wasm_bindgen::prelude::*;
 #[wasm_bindgen(js_name = "recovery_request_produce")]
 pub fn produce(
     channel_id: u64,
-    secret_id: &[u8],
-    version: i32,
+    secret_id: u64,
+    version: u32,
     shared_key: &[u8],
 ) -> Result<JsValue, JsValue> {
     let shared_key = parse_shared_key(shared_key)?;

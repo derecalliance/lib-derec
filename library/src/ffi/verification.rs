@@ -77,8 +77,8 @@ pub struct ProduceVerifyShareRequestMessageResult {
 pub struct ExtractVerifyShareRequestResult {
     pub status: DeRecStatus,
     pub channel_id: u64,
-    pub secret_id: DeRecBuffer,
-    pub version: i32,
+    pub secret_id: u64,
+    pub version: u32,
     pub nonce: u64,
 }
 
@@ -142,9 +142,8 @@ pub struct VerifyShareResponseResult {
 #[unsafe(no_mangle)]
 pub extern "C" fn produce_verify_share_request_message(
     channel_id: u64,
-    secret_id_ptr: *const u8,
-    secret_id_len: usize,
-    version: i32,
+    secret_id: u64,
+    version: u32,
     shared_key_ptr: *const u8,
     shared_key_len: usize,
 ) -> ProduceVerifyShareRequestMessageResult {
@@ -154,18 +153,9 @@ pub extern "C" fn produce_verify_share_request_message(
         message_type: 0,
     };
 
-    if secret_id_ptr.is_null() && secret_id_len > 0 {
-        return err("secret_id_ptr is null");
-    }
     if shared_key_ptr.is_null() && shared_key_len > 0 {
         return err("shared_key_ptr is null");
     }
-
-    let secret_id: &[u8] = if secret_id_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(secret_id_ptr, secret_id_len) }
-    };
 
     let shared_key_bytes: &[u8] = if shared_key_len == 0 {
         &[]
@@ -221,7 +211,7 @@ pub extern "C" fn extract_verify_share_request(
     let err = |msg: &str| ExtractVerifyShareRequestResult {
         status: err_status(msg),
         channel_id: 0,
-        secret_id: empty_buffer(),
+        secret_id: 0,
         version: 0,
         nonce: 0,
     };
@@ -259,7 +249,7 @@ pub extern "C" fn extract_verify_share_request(
         Ok(r) => ExtractVerifyShareRequestResult {
             status: ok_status(),
             channel_id,
-            secret_id: vec_into_buffer(r.request.secret_id),
+            secret_id: r.request.secret_id,
             version: r.request.version,
             nonce: r.request.nonce,
         },
@@ -293,9 +283,8 @@ pub extern "C" fn extract_verify_share_request(
 #[unsafe(no_mangle)]
 pub extern "C" fn produce_verify_share_response_message(
     channel_id: u64,
-    secret_id_ptr: *const u8,
-    secret_id_len: usize,
-    version: i32,
+    secret_id: u64,
+    version: u32,
     nonce: u64,
     shared_key_ptr: *const u8,
     shared_key_len: usize,
@@ -308,21 +297,12 @@ pub extern "C" fn produce_verify_share_response_message(
         message_type: 0,
     };
 
-    if secret_id_ptr.is_null() && secret_id_len > 0 {
-        return err("secret_id_ptr is null");
-    }
     if shared_key_ptr.is_null() && shared_key_len > 0 {
         return err("shared_key_ptr is null");
     }
     if share_content_ptr.is_null() && share_content_len > 0 {
         return err("share_content_ptr is null");
     }
-
-    let secret_id: &[u8] = if secret_id_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(secret_id_ptr, secret_id_len) }
-    };
 
     let shared_key_bytes: &[u8] = if shared_key_len == 0 {
         &[]
@@ -342,7 +322,7 @@ pub extern "C" fn produce_verify_share_response_message(
     };
 
     let request = derec_proto::VerifyShareRequestMessage {
-        secret_id: secret_id.to_vec(),
+        secret_id,
         version,
         nonce,
         timestamp: None,

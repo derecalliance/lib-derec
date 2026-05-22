@@ -427,6 +427,75 @@ let response::RecoverResult { secret_data } = response::recover(
 
 ---
 
+### Unpairing
+
+Either party may end the relationship for a channel by initiating an
+**unpair flow**. The recipient deletes its state (shared key, channel
+record, stored shares) and acknowledges with an `UnpairResponseMessage`.
+
+The orchestrator exposes two acknowledgement policies via the builder:
+
+- `UnpairAck::Required` (default) — the initiator keeps local state until
+  the peer acknowledges with `Ok` (or the configured protocol timeout
+  elapses, at which point the state is dropped anyway and the `Unpaired`
+  event surfaces).
+- `UnpairAck::NotRequired` — fire-and-forget. State is dropped immediately
+  on `start(Unpair)` and any later response is ignored.
+
+Both policies emit a `DeRecEvent::Unpaired { channel_id }` event on the
+local side once the local state is gone. A peer that refuses to comply
+returns a non-`Ok` status; the initiator surfaces this as
+`DeRecEvent::UnpairRejected { channel_id, status, memo }` and leaves the
+local state intact.
+
+```rust
+use derec_library::primitives::unpairing::{request, response};
+use derec_library::types::ChannelId;
+
+let channel_id = ChannelId(1);
+// shared_key: [u8; 32] established during pairing
+
+// Initiator side: produce and send the unpair request.
+let request = request::produce(channel_id, "decommissioning", &shared_key).unwrap();
+let wire_bytes = request.envelope;
+
+// Responder side: extract the request, drop local state, send Ok response.
+let extracted = request::extract(&wire_bytes, &shared_key).unwrap();
+let response = response::produce(channel_id, &shared_key).unwrap();
+
+// Initiator side: validate the response.
+let ok = response::process(
+    &response::extract(&response.envelope, &shared_key).unwrap().response,
+).unwrap();
+assert!(ok.acknowledged);
+```
+
+When driven through the high-level [`DeRecProtocol`] orchestrator the same
+flow is one call:
+
+```rust,ignore
+use derec_library::protocol::{DeRecFlow, UnpairAck};
+use derec_library::types::Target;
+
+let protocol = DeRecProtocolBuilder::new()
+    .with_unpair_ack(UnpairAck::Required)
+    // … other setters …
+    .build();
+
+protocol.start(DeRecFlow::Unpair {
+    target: Target::Single(channel_id),
+    memo: Some("decommissioning".to_owned()),
+}).await?;
+```
+
+When the peer's `UnpairRequest` arrives on the responder side, the
+orchestrator emits an `ActionRequired { action_kind: "Unpair", .. }`
+event. The application calls `accept(action)` to drop local state and
+send back an `Ok` acknowledgement, or `reject(action, status, memo)` to
+keep local state and reply with a non-`Ok` status.
+
+---
+
 ## Observability
 
 The library emits structured [tracing](https://docs.rs/tracing) spans and events for every protocol step. Instrumentation is **off by default** and opt-in via the `logging` feature flag — enabling it adds no overhead when no subscriber is active.

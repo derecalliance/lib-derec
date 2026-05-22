@@ -11,14 +11,14 @@ use wasm_bindgen::prelude::*;
 /// One stored version paired with its human-readable description, as used in JS.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct VersionEntryJs {
-    version: i32,
+    version: u32,
     description: String,
 }
 
 /// One entry in a discovery response as used in JS: a secret ID with all stored versions.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SecretVersionEntryJs {
-    secret_id: Vec<u8>,
+    secret_id: u64,
     versions: Vec<VersionEntryJs>,
 }
 

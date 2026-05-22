@@ -81,7 +81,6 @@ pub struct ExtractResult {
 /// Returns [`crate::Error`] (specifically `Error::Sharing(...)`) in the following cases:
 ///
 /// - [`SharingError::EmptyChannels`] if `channels` is empty
-/// - [`SharingError::EmptySecretId`] if `secret_id` is empty
 /// - [`SharingError::EmptySecretData`] if `secret_data` is empty
 /// - [`SharingError::DuplicateChannelId`] if `channels` contains any repeated ID
 /// - [`SharingError::InvalidThreshold`] if `threshold` does not satisfy
@@ -124,24 +123,17 @@ pub struct ExtractResult {
 )]
 pub fn split(
     channels: &[ChannelId],
-    secret_id: impl AsRef<[u8]>,
-    version: i32,
+    secret_id: u64,
+    version: u32,
     secret_data: impl AsRef<[u8]>,
     threshold: usize,
 ) -> Result<SplitResult, crate::Error> {
-    let secret_id = secret_id.as_ref();
     let secret_data = secret_data.as_ref();
 
     if channels.is_empty() {
         #[cfg(feature = "logging")]
         tracing::warn!("channels list is empty");
         return Err(SharingError::EmptyChannels.into());
-    }
-
-    if secret_id.is_empty() {
-        #[cfg(feature = "logging")]
-        tracing::warn!("secret_id is empty");
-        return Err(SharingError::EmptySecretId.into());
     }
 
     if secret_data.is_empty() {
@@ -181,7 +173,7 @@ pub fn split(
             encrypted_secret: share.encrypted_secret.clone(),
             x: share.x.clone(),
             y: share.y.clone(),
-            secret_id: secret_id.to_vec(),
+            secret_id,
             version,
         };
 
@@ -262,10 +254,10 @@ pub fn split(
 )]
 pub fn produce(
     channel_id: ChannelId,
-    version: i32,
-    secret_id: impl AsRef<[u8]>,
+    version: u32,
+    secret_id: u64,
     committed_share: &CommittedDeRecShare,
-    keep_list: &[i32],
+    keep_list: &[u32],
     description: impl Into<String>,
     shared_key: &SharedKey,
 ) -> Result<ProduceResult, crate::Error> {
@@ -278,7 +270,7 @@ pub fn produce(
         keep_list: keep_list.to_vec(),
         version_description: description.into(),
         timestamp: Some(timestamp),
-        secret_id: secret_id.as_ref().to_vec(),
+        secret_id,
     };
 
     let envelope = DeRecMessageBuilder::channel()

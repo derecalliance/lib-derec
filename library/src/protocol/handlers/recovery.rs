@@ -69,9 +69,9 @@ fn on_response(
 ) -> Result<Vec<DeRecEvent>> {
     let mut events = Vec::new();
 
-    let keys: Vec<(Vec<u8>, i32)> = pending_recovery.keys().cloned().collect();
+    let keys: Vec<(u64, u32)> = pending_recovery.keys().cloned().collect();
     for key in keys {
-        let (ref secret_id, version) = key;
+        let (secret_id, version) = key;
         let bucket = pending_recovery.get_mut(&key).unwrap();
         bucket.push(response.clone());
 
@@ -142,6 +142,20 @@ fn on_response(
 }
 
 /// Accept a get-share request: load share and send response.
+///
+/// The requested share may live under a sibling channel in the link group —
+/// e.g. when a recovering owner re-pairs and asks for a share on the fresh
+/// channel, the helper still holds the share against the original channel.
+/// Resolution walks the transitive closure (`linked_channels`); BFS in the
+/// channel store returns the requested `channel_id` first, so a share stored
+/// on that channel itself is always preferred over a sibling's.
+///
+/// Returning a sibling's share is safe for recovery: each share carries a
+/// unique x-coordinate, so the requester deduplicates naturally when
+/// reconstructing. (Verification is intentionally *not* given this fallback —
+/// its proof is bound to the specific channel's committed share, and the
+/// requester only sends verify challenges to channels that confirmed
+/// storage.)
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0, version = request.share_version))
@@ -158,18 +172,19 @@ pub(in crate::protocol) async fn accept<
     request: &GetShareRequestMessage,
     shared_key: &SharedKey,
 ) -> Result<Vec<DeRecEvent>> {
+    let linked_ids = channel_store.linked_channels(channel_id).await?;
     let encoded = share_store
-        .load(channel_id, &[request.share_version])
+        .load_many(&linked_ids, request.secret_id, &[request.share_version])
         .await?
         .into_iter()
         .next()
-        .map(|(_, data)| data)
+        .map(|s| s.bytes)
         .ok_or(Error::InvalidInput("no stored share for recovery request"))?;
     let stored =
         StoreShareRequestMessage::decode(encoded.as_slice()).map_err(Error::ProtobufDecode)?;
 
     let resp =
-        recovery_response::produce(channel_id, &request.secret_id, request, &stored, shared_key)?;
+        recovery_response::produce(channel_id, request.secret_id, request, &stored, shared_key)?;
 
     let endpoint = peer_endpoint(channel_store, channel_id).await?;
     transport.send(&endpoint, resp.envelope).await?;
@@ -219,10 +234,10 @@ pub(in crate::protocol) async fn start<
     secret_store: &mut Ss,
     transport: &T,
     pending_recovery: &mut PendingRecovery,
-    secret_id: Vec<u8>,
-    version: i32,
+    secret_id: u64,
+    version: u32,
 ) -> Result<()> {
-    pending_recovery.insert((secret_id.clone(), version), Vec::new());
+    pending_recovery.insert((secret_id, version), Vec::new());
 
     let all_channels = channel_store.channels().await?;
 
@@ -233,7 +248,7 @@ pub(in crate::protocol) async fn start<
             continue;
         };
 
-        let msg = produce_get_share_request_message(channel.id, &secret_id, version, &shared_key)?;
+        let msg = produce_get_share_request_message(channel.id, secret_id, version, &shared_key)?;
         transport.send(&channel.transport, msg.envelope).await?;
 
         #[cfg(feature = "logging")]

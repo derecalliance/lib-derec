@@ -18,21 +18,36 @@
 //! // kind 0 = SharedKey (32 raw bytes), kind 1 = PairingSecret (ark-serialized)
 //! ```
 //!
-//! ### `ContactStore`
+//! ### `ChannelStore`
 //! ```ts
-//! interface ContactStore {
+//! interface ChannelStore {
 //!   load(channelId: string): Promise<Uint8Array | null | undefined>;
 //!   save(channelId: string, contactBytes: Uint8Array): Promise<void>;
 //!   listChannels(): Promise<string[]>;
+//!   // Channel linking (same Owner identity); undirected, idempotent, transitive.
+//!   linkChannel(channelId: string, linkedChannelId: string): Promise<void>;
+//!   // Transitive closure INCLUDING channelId itself.
+//!   linkedChannels(channelId: string): Promise<string[]>;
 //! }
-//! // Uint8Array is the raw protobuf encoding of a ContactMessage.
+//! // Uint8Array is the raw protobuf encoding of a Channel record.
 //! ```
 //!
 //! ### `ShareStore`
 //! ```ts
+//! interface Share { secretId: string; version: number; bytes: Uint8Array }
 //! interface ShareStore {
-//!   load(channelId: string, versions: number[]): Promise<Array<[number, Uint8Array]>>;
-//!   save(channelId: string, version: number, encoded: Uint8Array): Promise<void>;
+//!   // `secretId` is the u64 secret identifier as a decimal string.
+//!   // For `load`/`loadMany`, an empty `versions` array means "all versions of secretId".
+//!   load(channelId: string, secretId: string, versions: number[]): Promise<Share[]>;
+//!   loadMany(channelIds: string[], secretId: string, versions: number[]): Promise<Share[]>;
+//!   // Discovery-only: all secrets and versions for these channels.
+//!   loadAll(channelIds: string[]): Promise<Share[]>;
+//!   save(channelId: string, share: Share): Promise<void>;
+//!   // Drop EVERY share stored under channelId (all secret_ids, all versions).
+//!   // Called when an unpair flow tears down a channel. Implementations must
+//!   // treat a non-existent channel as a no-op.
+//!   removeChannel(channelId: string): Promise<void>;
+//!   latestVersion(): Promise<number | null>;
 //! }
 //! ```
 //!
@@ -56,8 +71,9 @@ use crate::{
     protocol::{
         error::{ChannelStoreError, SecretStoreError, ShareStoreError},
         traits::{
-            ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecTransport,
-            SecretKind, SecretStoreFuture, SecretValue, ShareStoreFuture, TransportFuture,
+            ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore,
+            DeRecShareStore, DeRecTransport, SecretKind, SecretStoreFuture, SecretValue, Share,
+            ShareStoreFuture, TransportFuture,
         },
     },
     types::{Channel, ChannelId, ChannelStatus},
@@ -211,10 +227,13 @@ impl DeRecSecretStore for JsSecretStore {
 ///   load(channelId: string): Promise<Uint8Array | null>;
 ///   save(channelId: string, bytes: Uint8Array): Promise<void>;
 ///   listChannels(): Promise<string[]>;
+///   linkChannel(channelId: string, linkedChannelId: string): Promise<void>;
+///   linkedChannels(channelId: string): Promise<string[]>;
 /// }
 /// ```
 ///
-/// The bytes are JSON-encoded [`Channel`] records.
+/// The bytes are JSON-encoded [`Channel`] records. `linkedChannels` returns the
+/// transitive closure of `channelId` (including `channelId` itself).
 pub struct JsChannelStore(pub JsValue);
 
 /// Serializable representation of a [`Channel`] for JS store persistence.
@@ -223,7 +242,11 @@ struct ChannelRecord {
     channel_id: u64,
     transport_uri: String,
     transport_protocol: i32,
-    name: String,
+    /// App-level identity metadata for the peer. Opaque to the protocol.
+    /// Older stored records used a `name: String` field on this position;
+    /// they deserialize with an empty `communication_info` map.
+    #[serde(default)]
+    communication_info: std::collections::HashMap<String, String>,
     #[serde(default = "default_channel_status")]
     status: String,
     #[serde(default)]
@@ -244,7 +267,7 @@ impl From<&Channel> for ChannelRecord {
             channel_id: ch.id.0,
             transport_uri: ch.transport.uri.to_owned(),
             transport_protocol: ch.transport.protocol,
-            name: ch.name.to_owned(),
+            communication_info: ch.communication_info.clone(),
             status: status.to_owned(),
             created_at: ch.created_at,
         }
@@ -263,7 +286,7 @@ impl From<ChannelRecord> for Channel {
                 uri: rec.transport_uri,
                 protocol: rec.transport_protocol,
             },
-            name: rec.name,
+            communication_info: rec.communication_info,
             status,
             created_at: rec.created_at,
         }
@@ -371,6 +394,54 @@ impl DeRecChannelStore for JsChannelStore {
             Ok(value.as_bool().unwrap_or(false))
         })
     }
+
+    fn link_channel(&mut self, a: ChannelId, b: ChannelId) -> ChannelStoreFuture<'_, ()> {
+        let obj = self.0.clone();
+        let a_str = a.0.to_string();
+        let b_str = b.0.to_string();
+        Box::pin(async move {
+            let args = Array::new();
+            args.push(&JsValue::from_str(&a_str));
+            args.push(&JsValue::from_str(&b_str));
+            let promise_val = call_method(&obj, "linkChannel", &args)
+                .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
+            resolve_promise(promise_val)
+                .await
+                .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
+            Ok(())
+        })
+    }
+
+    fn linked_channels(
+        &self,
+        channel_id: ChannelId,
+    ) -> ChannelStoreFuture<'_, Vec<ChannelId>> {
+        let obj = self.0.clone();
+        let channel_str = channel_id.0.to_string();
+        Box::pin(async move {
+            let args = Array::new();
+            args.push(&JsValue::from_str(&channel_str));
+            let promise_val = call_method(&obj, "linkedChannels", &args)
+                .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
+            let value = resolve_promise(promise_val)
+                .await
+                .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
+            let arr = Array::from(&value);
+            let mut result = Vec::with_capacity(arr.length() as usize);
+            for i in 0..arr.length() {
+                let s = arr.get(i).as_string().ok_or_else(|| {
+                    ChannelStoreError::Backend(box_err(
+                        "linkedChannels must return an array of channel-id strings".to_string(),
+                    ))
+                })?;
+                let id = s
+                    .parse::<u64>()
+                    .map_err(|e| ChannelStoreError::Backend(box_err(e.to_string())))?;
+                result.push(ChannelId(id));
+            }
+            Ok(result)
+        })
+    }
 }
 
 // ── JsShareStore ──────────────────────────────────────────────────────────────
@@ -378,15 +449,47 @@ impl DeRecChannelStore for JsChannelStore {
 /// Adapter wrapping a JS `ShareStore` object.
 pub struct JsShareStore(pub JsValue);
 
+fn share_to_js(share: &Share) -> JsValue {
+    let obj = js_sys::Object::new();
+    js_sys::Reflect::set(&obj, &"secretId".into(), &JsValue::from_str(&share.secret_id.to_string()))
+        .unwrap_or_default();
+    js_sys::Reflect::set(&obj, &"version".into(), &JsValue::from_f64(share.version as f64))
+        .unwrap_or_default();
+    let js_bytes = Uint8Array::from(share.bytes.as_slice());
+    js_sys::Reflect::set(&obj, &"bytes".into(), &js_bytes).unwrap_or_default();
+    obj.into()
+}
+
+fn share_from_js(item: &JsValue) -> Result<Share, ShareStoreError> {
+    let secret_id_str = js_sys::Reflect::get(item, &"secretId".into())
+        .ok()
+        .and_then(|v| v.as_string())
+        .unwrap_or_default();
+    let secret_id = secret_id_str
+        .parse::<u64>()
+        .map_err(|e| ShareStoreError::Backend(box_err(format!("share.secretId must be a numeric string: {e}"))))?;
+    let version = js_sys::Reflect::get(item, &"version".into())
+        .ok()
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| ShareStoreError::Backend(box_err("share.version must be a number".to_string())))?
+        as u32;
+    let bytes_val = js_sys::Reflect::get(item, &"bytes".into())
+        .unwrap_or(JsValue::null());
+    let bytes = Uint8Array::new(&bytes_val).to_vec();
+    Ok(Share { secret_id, version, bytes })
+}
+
 impl DeRecShareStore for JsShareStore {
     fn load(
         &self,
         channel_id: ChannelId,
-        versions: &[i32],
-    ) -> ShareStoreFuture<'_, Vec<(i32, Vec<u8>)>> {
+        secret_id: u64,
+        versions: &[u32],
+    ) -> ShareStoreFuture<'_, Vec<Share>> {
         let obj = self.0.clone();
         let channel_str = channel_id.0.to_string();
-        let versions_vec: Vec<i32> = versions.to_vec();
+        let secret_str = secret_id.to_string();
+        let versions_vec: Vec<u32> = versions.to_vec();
         Box::pin(async move {
             let js_versions = Array::new();
             for v in &versions_vec {
@@ -394,28 +497,23 @@ impl DeRecShareStore for JsShareStore {
             }
             let args = Array::new();
             args.push(&JsValue::from_str(&channel_str));
+            args.push(&JsValue::from_str(&secret_str));
             args.push(&js_versions);
             let promise_val = call_method(&obj, "load", &args)
                 .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
             let value = resolve_promise(promise_val)
                 .await
                 .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
-            // Expects Array<[number, Uint8Array]>
             let arr = Array::from(&value);
             let mut result = Vec::with_capacity(arr.length() as usize);
             for i in 0..arr.length() {
-                let entry = Array::from(&arr.get(i));
-                let v = entry.get(0).as_f64().ok_or_else(|| {
-                    ShareStoreError::Backend(box_err("version must be a number".to_string()))
-                })? as i32;
-                let data = Uint8Array::new(&entry.get(1)).to_vec();
-                result.push((v, data));
+                result.push(share_from_js(&arr.get(i))?);
             }
             Ok(result)
         })
     }
 
-    fn latest_version(&self) -> ShareStoreFuture<'_, Option<i32>> {
+    fn latest_version(&self) -> ShareStoreFuture<'_, Option<u32>> {
         let obj = self.0.clone();
         Box::pin(async move {
             let args = Array::new();
@@ -429,27 +527,22 @@ impl DeRecShareStore for JsShareStore {
             } else {
                 let v = value
                     .as_f64()
-                    .ok_or_else(|| ShareStoreError::Backend(box_err("latestVersion must return a number or null".to_string())))?
-                    as i32;
+                    .ok_or_else(|| ShareStoreError::Backend(box_err(
+                        "latestVersion must return a number or null".to_string(),
+                    )))?
+                    as u32;
                 Ok(Some(v))
             }
         })
     }
 
-    fn save(
-        &mut self,
-        channel_id: ChannelId,
-        version: i32,
-        encoded: Vec<u8>,
-    ) -> ShareStoreFuture<'_, ()> {
+    fn save(&mut self, channel_id: ChannelId, share: Share) -> ShareStoreFuture<'_, ()> {
         let obj = self.0.clone();
         let channel_str = channel_id.0.to_string();
         Box::pin(async move {
-            let js_encoded = Uint8Array::from(encoded.as_slice());
             let args = Array::new();
             args.push(&JsValue::from_str(&channel_str));
-            args.push(&JsValue::from_f64(version as f64));
-            args.push(&js_encoded);
+            args.push(&share_to_js(&share));
             let promise_val = call_method(&obj, "save", &args)
                 .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
             resolve_promise(promise_val)
@@ -459,6 +552,84 @@ impl DeRecShareStore for JsShareStore {
         })
     }
 
+    fn load_many(
+        &self,
+        channel_ids: &[ChannelId],
+        secret_id: u64,
+        versions: &[u32],
+    ) -> ShareStoreFuture<'_, Vec<Share>> {
+        let obj = self.0.clone();
+        let ids_vec: Vec<String> = channel_ids.iter().map(|c| c.0.to_string()).collect();
+        let secret_str = secret_id.to_string();
+        let versions_vec: Vec<u32> = versions.to_vec();
+        Box::pin(async move {
+            let js_ids = Array::new();
+            for id in &ids_vec {
+                js_ids.push(&JsValue::from_str(id));
+            }
+            let js_versions = Array::new();
+            for v in &versions_vec {
+                js_versions.push(&JsValue::from_f64(*v as f64));
+            }
+            let args = Array::new();
+            args.push(&js_ids);
+            args.push(&JsValue::from_str(&secret_str));
+            args.push(&js_versions);
+            let promise_val = call_method(&obj, "loadMany", &args)
+                .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
+            let value = resolve_promise(promise_val)
+                .await
+                .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
+            let arr = Array::from(&value);
+            let mut result = Vec::with_capacity(arr.length() as usize);
+            for i in 0..arr.length() {
+                result.push(share_from_js(&arr.get(i))?);
+            }
+            Ok(result)
+        })
+    }
+
+    fn load_all(
+        &self,
+        channel_ids: &[ChannelId],
+    ) -> ShareStoreFuture<'_, Vec<Share>> {
+        let obj = self.0.clone();
+        let ids_vec: Vec<String> = channel_ids.iter().map(|c| c.0.to_string()).collect();
+        Box::pin(async move {
+            let js_ids = Array::new();
+            for id in &ids_vec {
+                js_ids.push(&JsValue::from_str(id));
+            }
+            let args = Array::new();
+            args.push(&js_ids);
+            let promise_val = call_method(&obj, "loadAll", &args)
+                .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
+            let value = resolve_promise(promise_val)
+                .await
+                .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
+            let arr = Array::from(&value);
+            let mut result = Vec::with_capacity(arr.length() as usize);
+            for i in 0..arr.length() {
+                result.push(share_from_js(&arr.get(i))?);
+            }
+            Ok(result)
+        })
+    }
+
+    fn remove_channel(&mut self, channel_id: ChannelId) -> ShareStoreFuture<'_, ()> {
+        let obj = self.0.clone();
+        let channel_str = channel_id.0.to_string();
+        Box::pin(async move {
+            let args = Array::new();
+            args.push(&JsValue::from_str(&channel_str));
+            let promise_val = call_method(&obj, "removeChannel", &args)
+                .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
+            resolve_promise(promise_val)
+                .await
+                .map_err(|e| ShareStoreError::Backend(box_err(e)))?;
+            Ok(())
+        })
+    }
 }
 
 // ── JsTransport ───────────────────────────────────────────────────────────────

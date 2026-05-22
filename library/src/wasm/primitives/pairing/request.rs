@@ -99,7 +99,7 @@ pub fn decode_contact(bytes: &[u8]) -> Result<JsValue, JsValue> {
 ///
 /// # Arguments
 ///
-/// * `kind` - Sender role: `0` = OwnerNonRecovery, `1` = OwnerRecovery, `2` = Helper
+/// * `kind` - Sender role: `0` = Owner, `1` = Helper, `2` = Replica
 /// * `transport_protocol` - Plain JS object `{ protocol: "https", uri: "https://..." }`
 /// * `contact_message` - Plain JS `ContactMessage` object as returned by `pairing_request_create_contact`
 ///

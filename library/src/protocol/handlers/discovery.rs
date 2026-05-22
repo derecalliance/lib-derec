@@ -55,31 +55,42 @@ pub(in crate::protocol) async fn accept<
     _request: &GetSecretIdsVersionsRequestMessage,
     shared_key: &SharedKey,
 ) -> Result<Vec<DeRecEvent>> {
-    let all_shares = share_store.load(channel_id, &[]).await?;
+    // Linking lives in the channel store: resolve the channel's connected
+    // component (includes `channel_id` itself), then bulk-load every share
+    // held under any of those channels in a single round-trip.
+    let linked_ids = channel_store.linked_channels(channel_id).await?;
+    // Discovery is the one legitimate "no secret_id" load — it enumerates
+    // what the helper holds across all secrets for an owner's link group.
+    let all_shares = share_store.load_all(&linked_ids).await?;
 
-    let secret_list = if all_shares.is_empty() {
-        vec![]
-    } else {
-        let first_msg = StoreShareRequestMessage::decode(all_shares[0].1.as_slice())
-            .map_err(Error::ProtobufDecode)?;
-        let secret_id = first_msg.secret_id;
+    // Group by secret_id across all linked channels, deduplicating by version.
+    // Key: secret_id (u64) → version → description.
+    let mut secret_map: std::collections::HashMap<
+        u64,
+        std::collections::BTreeMap<u32, String>,
+    > = std::collections::HashMap::new();
 
-        let mut version_entries: Vec<VersionEntry> = Vec::with_capacity(all_shares.len());
-        for (version, encoded) in &all_shares {
-            let description = StoreShareRequestMessage::decode(encoded.as_slice())
-                .map(|msg| msg.version_description)
-                .unwrap_or_default();
-            version_entries.push(VersionEntry {
-                version: *version,
-                description,
-            });
-        }
+    for share in all_shares {
+        let description = StoreShareRequestMessage::decode(share.bytes.as_slice())
+            .map(|msg| msg.version_description)
+            .unwrap_or_default();
+        secret_map
+            .entry(share.secret_id)
+            .or_default()
+            .entry(share.version)
+            .or_insert(description);
+    }
 
-        vec![SecretVersionEntry {
+    let secret_list: Vec<SecretVersionEntry> = secret_map
+        .into_iter()
+        .map(|(secret_id, versions)| SecretVersionEntry {
             secret_id,
-            versions: version_entries,
-        }]
-    };
+            versions: versions
+                .into_iter()
+                .map(|(version, description)| VersionEntry { version, description })
+                .collect(),
+        })
+        .collect();
 
     let resp = discovery_response::produce(channel_id, &secret_list, shared_key)?;
 

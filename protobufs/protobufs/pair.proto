@@ -15,35 +15,25 @@ package org.derecalliance.derec.protobuf;
 
 // SenderKind identifies the logical role of the sender in the pairing flow.
 //
-// The role determines:
+// The role determines how the receiver interprets the message and what
+// role each party takes in the resulting channel.
 //
-// - how the receiver interprets the message
-// - whether the pairing is part of a normal operation or a recovery procedure
-// - how the resulting channel should be associated with existing state
-//
-// In particular, recovery mode has special semantics on the Helper side,
-// allowing linkage to previously known secrets belonging to the same user.
+// Helpers are responsible for manually linking channels that belong to the
+// same Owner identity (e.g. after a recovery re-pairing). The protocol does
+// not signal recovery mode — linking is an explicit, application-level action.
 enum SenderKind {
-  // Sender is an Owner operating in normal (non-recovery) mode.
+  // Sender is an Owner.
   //
-  // This is the standard pairing flow used when establishing a new
-  // secret-sharing relationship.
-  OWNER_NON_RECOVERY = 0;
-
-  // Sender is an Owner operating in recovery mode.
-  //
-  // This indicates that the sender is attempting to recover previously
-  // shared secrets. Helpers may use this signal to:
-  //
-  // - link the new pairing to existing identities
-  // - expose additional secret IDs and versions during recovery
-  OWNER_RECOVERY = 1;
+  // Used for all Owner-initiated pairings, whether establishing a new
+  // relationship or re-pairing during recovery. There is no protocol-level
+  // distinction between the two cases.
+  OWNER = 0;
 
   // Sender is acting as a Helper.
   //
   // Helpers may initiate pairing in some application flows, though the
   // Owner typically acts as the initiator.
-  HELPER = 2;
+  HELPER = 1;
 
   // Sender is a Replica — another device belonging to the same Owner.
   //
@@ -54,7 +44,7 @@ enum SenderKind {
   //
   // After confirmation, the Replica synchronises channel keys and
   // secret metadata via dedicated discovery flows.
-  REPLICA = 3;
+  REPLICA = 2;
 }
 
 // PairRequestMessage is the first message in the pairing protocol,

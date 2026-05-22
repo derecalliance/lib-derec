@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::primitives::recovery::error::RecoveryError;
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     types::{ChannelId, SharedKey},
@@ -50,8 +49,6 @@ pub struct ExtractResult {
 ///
 /// Returns [`crate::Error`] (specifically `Error::Recovery(...)`) in the following cases:
 ///
-/// - [`RecoveryError::EmptySecretId`] if `secret_id` is empty
-/// - [`RecoveryError::InvalidVersion`] if `version < 0`
 /// - outer envelope construction or symmetric encryption fails
 ///
 /// # Security Notes
@@ -78,26 +75,14 @@ pub struct ExtractResult {
 )]
 pub fn produce(
     channel_id: ChannelId,
-    secret_id: &[u8],
-    version: i32,
+    secret_id: u64,
+    version: u32,
     shared_key: &SharedKey,
 ) -> Result<ProduceResult, crate::Error> {
-    if secret_id.is_empty() {
-        #[cfg(feature = "logging")]
-        tracing::warn!("secret_id is empty");
-        return Err(RecoveryError::EmptySecretId.into());
-    }
-
-    if version < 0 {
-        #[cfg(feature = "logging")]
-        tracing::warn!(version = version, "version is negative");
-        return Err(RecoveryError::InvalidVersion { version }.into());
-    }
-
     let timestamp = current_timestamp();
 
     let message = GetShareRequestMessage {
-        secret_id: secret_id.to_vec(),
+        secret_id,
         share_version: version,
         timestamp: Some(timestamp),
     };

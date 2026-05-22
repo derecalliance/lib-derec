@@ -61,7 +61,7 @@ internal static class Program
             throw new InvalidOperationException("Pairing test failed: empty pair request secret key material.");
 
         var pairResponse = Pairing.Response.Produce(
-            Pairing.SenderKind.OwnerNonRecovery,
+            Pairing.SenderKind.Owner,
             pairRequest.Envelope,
             contact.SecretKeyMaterial
         );

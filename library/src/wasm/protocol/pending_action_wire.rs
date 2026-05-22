@@ -23,7 +23,7 @@ use crate::types::ChannelId;
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{
     GetSecretIdsVersionsRequestMessage, GetShareRequestMessage, PairRequestMessage,
-    SenderKind, StoreShareRequestMessage, VerifyShareRequestMessage,
+    SenderKind, StoreShareRequestMessage, UnpairRequestMessage, VerifyShareRequestMessage,
 };
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use prost::Message;
@@ -33,6 +33,7 @@ const TAG_STORE_SHARE: u8 = 1;
 const TAG_VERIFY_SHARE: u8 = 2;
 const TAG_DISCOVERY: u8 = 3;
 const TAG_GET_SHARE: u8 = 4;
+const TAG_UNPAIR: u8 = 5;
 
 pub fn serialize(action: PendingAction) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
@@ -96,6 +97,16 @@ pub fn serialize(action: PendingAction) -> Result<Vec<u8>, String> {
             shared_key,
         } => {
             buf.push(TAG_GET_SHARE);
+            buf.extend_from_slice(&channel_id.0.to_be_bytes());
+            buf.extend_from_slice(&shared_key);
+            buf.extend_from_slice(&request.encode_to_vec());
+        }
+        PendingAction::Unpair {
+            channel_id,
+            request,
+            shared_key,
+        } => {
+            buf.push(TAG_UNPAIR);
             buf.extend_from_slice(&channel_id.0.to_be_bytes());
             buf.extend_from_slice(&shared_key);
             buf.extend_from_slice(&request.encode_to_vec());
@@ -192,6 +203,16 @@ pub fn deserialize(bytes: &[u8]) -> Result<PendingAction, String> {
                 shared_key,
             })
         }
+        TAG_UNPAIR => {
+            let (shared_key, request_bytes) = split_shared_key(rest)?;
+            let request = UnpairRequestMessage::decode(request_bytes)
+                .map_err(|e| format!("failed to decode UnpairRequestMessage: {e}"))?;
+            Ok(PendingAction::Unpair {
+                channel_id,
+                request,
+                shared_key,
+            })
+        }
         _ => Err(format!("unknown action tag: {tag}")),
     }
 }
@@ -207,10 +228,9 @@ fn split_shared_key(bytes: &[u8]) -> Result<([u8; 32], &[u8]), String> {
 
 fn i32_to_sender_kind(val: i32) -> Result<SenderKind, String> {
     match val {
-        0 => Ok(SenderKind::OwnerNonRecovery),
-        1 => Ok(SenderKind::OwnerRecovery),
-        2 => Ok(SenderKind::Helper),
-        3 => Ok(SenderKind::Replica),
+        0 => Ok(SenderKind::Owner),
+        1 => Ok(SenderKind::Helper),
+        2 => Ok(SenderKind::Replica),
         _ => Err(format!("invalid SenderKind: {val}")),
     }
 }

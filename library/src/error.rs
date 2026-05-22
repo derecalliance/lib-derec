@@ -55,6 +55,9 @@ pub enum Error {
     Verification(#[from] crate::primitives::verification::VerificationError),
 
     #[error(transparent)]
+    Unpairing(#[from] crate::primitives::unpairing::UnpairingError),
+
+    #[error(transparent)]
     DeRecMessage(#[from] crate::derec_message::DeRecMessageBuilderError),
 
     #[error(transparent)]
@@ -99,6 +102,10 @@ impl Error {
                 memo,
             }) => Some((*status, memo)),
             Error::Recovery(crate::primitives::recovery::RecoveryError::NonOkStatus {
+                status,
+                memo,
+            }) => Some((*status, memo)),
+            Error::Unpairing(crate::primitives::unpairing::UnpairingError::NonOkStatus {
                 status,
                 memo,
             }) => Some((*status, memo)),

@@ -32,7 +32,7 @@ use wasm_bindgen::prelude::*;
 /// A plain JS object representing the outer `DeRecMessage` response envelope.
 #[wasm_bindgen(js_name = "recovery_response_produce")]
 pub fn produce(
-    secret_id: &[u8],
+    secret_id: u64,
     channel_id: u64,
     stored_share_request: JsValue,
     req: JsValue,
@@ -83,8 +83,8 @@ pub fn produce(
 #[wasm_bindgen(js_name = "recovery_response_recover")]
 pub fn recover(
     responses: JsValue,
-    secret_id: &[u8],
-    version: i32,
+    secret_id: u64,
+    version: u32,
 ) -> Result<Vec<u8>, JsValue> {
     let raw_inputs: Vec<WasmRecoveryResponseInput> = serde_wasm_bindgen::from_value(responses)
         .map_err(|e| js_error("WASM_DESERIALIZE_ERROR", e.to_string()))?;

@@ -11,8 +11,8 @@ use wasm_bindgen::prelude::*;
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ExtractResultJs {
     channel_id: u64,
-    secret_id: Vec<u8>,
-    version: i32,
+    secret_id: u64,
+    version: u32,
     nonce: u64,
     hash: Vec<u8>,
 }
@@ -35,8 +35,8 @@ struct ExtractResultJs {
 #[wasm_bindgen(js_name = "verification_response_produce")]
 pub fn produce(
     channel_id: u64,
-    secret_id: &[u8],
-    version: i32,
+    secret_id: u64,
+    version: u32,
     nonce: u64,
     shared_key: &[u8],
     stored_request: JsValue,
@@ -52,7 +52,7 @@ pub fn produce(
     let share_content = stored_envelope.encode_to_vec();
 
     let request_msg = derec_proto::VerifyShareRequestMessage {
-        secret_id: secret_id.to_vec(),
+        secret_id,
         version,
         nonce,
         timestamp: None,

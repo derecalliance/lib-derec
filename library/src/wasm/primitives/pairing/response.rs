@@ -34,7 +34,7 @@ struct RejectResultJs {
 ///
 /// # Arguments
 ///
-/// * `kind` - Sender role: `0` = OwnerNonRecovery, `1` = OwnerRecovery, `2` = Helper
+/// * `kind` - Sender role: `0` = Owner, `1` = Helper, `2` = Replica
 /// * `pair_request` - Outer `DeRecMessage` JS object from `pairing_request_produce`
 /// * `pairing_secret_key_material` - Serialized initiator-side `PairingSecretKeyMaterial`
 ///
@@ -88,7 +88,7 @@ pub fn accept(
 ///
 /// # Arguments
 ///
-/// * `kind` - Sender role: `0` = OwnerNonRecovery, `1` = OwnerRecovery, `2` = Helper
+/// * `kind` - Sender role: `0` = Owner, `1` = Helper, `2` = Replica
 /// * `raw_message` - Raw wire bytes of the incoming `DeRecMessage` (same bytes passed to `process()`)
 /// * `pairing_secret_key_material` - Serialized `PairingSecretKeyMaterial` for the contact
 /// * `memo` - Human-readable rejection reason

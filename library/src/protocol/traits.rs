@@ -118,6 +118,18 @@ pub trait DeRecSecretStore {
 /// - [`save`](DeRecChannelStore::save) silently replaces any previously stored
 ///   channel with the same ID.
 ///
+/// # Channel linking
+///
+/// The channel store also owns the **channel-link graph**: a record that two
+/// channels belong to the same Owner identity (e.g. after a recovery
+/// re-pairing). [`link_channel`](DeRecChannelStore::link_channel) records one
+/// undirected, idempotent, transitive edge;
+/// [`linked_channels`](DeRecChannelStore::linked_channels) returns a channel's
+/// whole connected component. Linking moves no share data — it is pure
+/// relationship metadata. Recovery/discovery resolves the linked set here, then
+/// loads the corresponding shares via
+/// [`DeRecShareStore::load_many`](DeRecShareStore::load_many).
+///
 /// # Executor independence
 ///
 /// Same as [`DeRecSecretStore`] — methods return [`ChannelStoreFuture`], a
@@ -145,6 +157,41 @@ pub trait DeRecChannelStore {
     /// secret bag (to populate `HelperInfo` entries) and when fanning out
     /// recovery requests.
     fn channels(&self) -> ChannelStoreFuture<'_, Vec<Channel>>;
+
+    /// Link two channels as belonging to the same Owner identity.
+    ///
+    /// The relation is **undirected, idempotent, and transitive** (an
+    /// equivalence relation): the order of `a`/`b` is irrelevant, re-linking an
+    /// existing pair (or linking a channel to itself) is a no-op, and if
+    /// `A↔B` and `B↔C` then all three are in one group. Linking moves no share
+    /// data — it only records the relationship.
+    fn link_channel(&mut self, a: ChannelId, b: ChannelId) -> ChannelStoreFuture<'_, ()>;
+
+    /// Return the full set of channels linked to `channel_id`, **including
+    /// `channel_id` itself** (its transitive-closure / connected component).
+    ///
+    /// An unlinked channel returns `[channel_id]`. Order is unspecified. The
+    /// returned IDs are typically fed to
+    /// [`DeRecShareStore::load_many`](DeRecShareStore::load_many) (for a
+    /// specific `secret_id`) or
+    /// [`DeRecShareStore::load_all`](DeRecShareStore::load_all) (discovery) to
+    /// aggregate shares across re-pairings without duplicating data.
+    fn linked_channels(
+        &self,
+        channel_id: ChannelId,
+    ) -> ChannelStoreFuture<'_, Vec<ChannelId>>;
+}
+
+/// A single stored share entry, fully self-describing.
+///
+/// - `secret_id` — numeric identifier of the secret this share belongs to.
+/// - `version`   — version number of the secret.
+/// - `bytes`     — raw encoded [`derec_proto::StoreShareRequestMessage`] bytes.
+#[derive(Debug, Clone)]
+pub struct Share {
+    pub secret_id: u64,
+    pub version: u32,
+    pub bytes: Vec<u8>,
 }
 
 /// Storage backend for secret shares.
@@ -159,49 +206,89 @@ pub trait DeRecChannelStore {
 /// Used by both sides:
 ///
 /// - **Helper** stores the full encoded request received from the Owner.
-/// - **Owner** stores an empty (`vec![]`) tracking record so that
-///   [`super::DeRecProtocol::verify_shares`] can enumerate which helpers hold shares for
-///   a given `(secret_id, version)` via [`load_channels_for_secret`].
+/// - **Owner** stores an empty `bytes` field to record a tracking entry so that
+///   [`super::DeRecProtocol::verify_shares`] can enumerate which helpers hold shares.
+///
+/// # Relation to channel linking
+///
+/// This store is a **pure keyed store** — it never sees the channel-link
+/// graph. Linking lives in [`DeRecChannelStore`]. Callers that need shares
+/// across linked channels resolve the channel set via
+/// [`DeRecChannelStore::linked_channels`] first, then pass it to
+/// [`load_many`](DeRecShareStore::load_many).
+///
+/// # Why `secret_id` is required on filtered loads
+///
+/// Versions are namespaced by `secret_id`: the same `version` number can
+/// legitimately exist for two different secrets (e.g. a helper holds v1 from
+/// owner A and v1 from owner B). A version-only query would conflate them, so
+/// [`load`](DeRecShareStore::load) and
+/// [`load_many`](DeRecShareStore::load_many) both require `secret_id`.
+/// [`load_all`](DeRecShareStore::load_all) — the lone exception — exists
+/// for **discovery**, which by definition enumerates what's stored before any
+/// `secret_id` is known.
 ///
 /// # Executor independence
 ///
 /// Methods return [`ShareStoreFuture`] — no runtime is prescribed.
-///
-/// In the single-secret-bag model each channel holds shares for exactly one
-/// secret, so `secret_id` is implicit and not part of the key.
 pub trait DeRecShareStore {
-    /// Load encoded `StoreShareRequestMessage` entries for a channel.
+    /// Load shares stored for a single channel, scoped to one secret.
     ///
     /// - **Specific versions**: pass the versions you need in `versions`.
-    ///   Missing versions are silently skipped (no error).
-    /// - **All versions**: pass an empty slice to load every version stored
-    ///   for `channel_id`.
-    ///
-    /// Returns `(version, encoded_bytes)` pairs.
+    ///   Missing versions are silently skipped.
+    /// - **All versions of `secret_id`**: pass an empty slice.
     fn load(
         &self,
         channel_id: ChannelId,
-        // TODO: add seccret id
-        versions: &[i32],
-    ) -> ShareStoreFuture<'_, Vec<(i32, Vec<u8>)>>;
+        secret_id: u64,
+        versions: &[u32],
+    ) -> ShareStoreFuture<'_, Vec<Share>>;
+
+    /// Load shares for several channels in one call, scoped to one secret.
+    ///
+    /// Recovery uses this with the set returned by
+    /// [`DeRecChannelStore::linked_channels`], so it is a single round-trip
+    /// regardless of how many channels are linked.
+    ///
+    /// Returns a **flat** list — deduplication (e.g. by `version`) is the
+    /// caller's concern. The `versions` filter has the same semantics as
+    /// [`load`](Self::load) and applies uniformly across all `channel_ids`.
+    fn load_many(
+        &self,
+        channel_ids: &[ChannelId],
+        secret_id: u64,
+        versions: &[u32],
+    ) -> ShareStoreFuture<'_, Vec<Share>>;
+
+    /// Load **every** share stored for the given channels, across all secrets
+    /// and all versions.
+    ///
+    /// This is the only legitimate "no `secret_id`" load — and exists solely
+    /// for **discovery**, which by definition enumerates the helper's holdings
+    /// before any secret is known. Domain callers (recovery, verification)
+    /// must use [`load`](Self::load) or [`load_many`](Self::load_many).
+    fn load_all(
+        &self,
+        channel_ids: &[ChannelId],
+    ) -> ShareStoreFuture<'_, Vec<Share>>;
 
     /// Return the highest version number stored across all channels,
     /// or `None` if no shares exist yet.
-    fn latest_version(&self) -> ShareStoreFuture<'_, Option<i32>>;
+    fn latest_version(&self) -> ShareStoreFuture<'_, Option<u32>>;
 
-    /// Persist the encoded `StoreShareRequestMessage` for `(channel_id, version)`.
+    /// Persist a share for the given channel.
     ///
-    /// Replaces any previously stored entry for the same key.
+    /// Replaces any previously stored entry for the same
+    /// `(channel_id, secret_id, version)` key.
+    fn save(&mut self, channel_id: ChannelId, share: Share) -> ShareStoreFuture<'_, ()>;
+
+    /// Drop **all** shares stored under `channel_id`.
     ///
-    /// Owner-side callers may pass `vec![]` as `encoded` to record a tracking
-    /// entry without storing full share bytes.
-    fn save(
-        &mut self,
-        channel_id: ChannelId,
-        // TODO: add secret id
-        version: i32,
-        encoded: Vec<u8>,
-    ) -> ShareStoreFuture<'_, ()>;
+    /// Used by the [`crate::protocol`] orchestrator when an unpair flow tears
+    /// down a channel — every secret-id / version combination held for that
+    /// channel is removed. Implementations should treat a non-existent channel
+    /// as a no-op (idempotent).
+    fn remove_channel(&mut self, channel_id: ChannelId) -> ShareStoreFuture<'_, ()>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

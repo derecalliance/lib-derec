@@ -4,10 +4,12 @@ pub(super) mod discovery;
 pub(super) mod pairing;
 pub(super) mod recovery;
 pub(super) mod sharing;
+pub(super) mod unpairing;
 pub(super) mod verification;
 
 use super::{
-    DeRecChannelStore, DeRecEvent, DeRecShareStore, DeRecTransport, PendingRecovery,
+    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport,
+    PendingRecovery,
 };
 use crate::{
     Error, Result,
@@ -16,6 +18,7 @@ use crate::{
 };
 use derec_proto::{DeRecMessage, MessageBody, TransportProtocol};
 use prost::Message;
+use std::collections::HashMap;
 
 /// Look up the transport endpoint for a paired channel.
 pub(super) async fn peer_endpoint<Ch: DeRecChannelStore>(
@@ -54,9 +57,17 @@ pub(super) async fn send_channel_message<Ch: DeRecChannelStore, T: DeRecTranspor
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
 )]
-pub(super) async fn handle<Sh: DeRecShareStore>(
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn handle<
+    Ch: DeRecChannelStore,
+    Sh: DeRecShareStore,
+    Ss: DeRecSecretStore,
+>(
+    channel_store: &mut Ch,
     share_store: &mut Sh,
+    secret_store: &mut Ss,
     pending_recovery: &mut PendingRecovery,
+    pending_unpair: &mut HashMap<ChannelId, u64>,
     message: &[u8],
     channel_id: ChannelId,
     shared_key: &SharedKey,
@@ -77,6 +88,18 @@ pub(super) async fn handle<Sh: DeRecShareStore>(
         }
         MessageBody::GetShareRequest(_) | MessageBody::GetShareResponse(_) => {
             recovery::handle(pending_recovery, channel_id, inner, *shared_key)
+        }
+        MessageBody::UnpairRequest(_) | MessageBody::UnpairResponse(_) => {
+            unpairing::handle(
+                channel_store,
+                share_store,
+                secret_store,
+                pending_unpair,
+                channel_id,
+                inner,
+                *shared_key,
+            )
+            .await
         }
         _ => Err(Error::Invariant(
             "unexpected MessageBody variant in channel message",

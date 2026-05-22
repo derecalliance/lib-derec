@@ -76,7 +76,7 @@ pub(in crate::protocol) async fn start<
     communication_info: &HashMap<String, String>,
     kind: SenderKind,
     contact: ContactMessage,
-    name: Option<String>,
+    peer_communication_info: HashMap<String, String>,
 ) -> Result<u64> {
     let channel_id = ChannelId(contact.channel_id);
 
@@ -88,11 +88,6 @@ pub(in crate::protocol) async fn start<
         ))?;
 
     let comm_info = build_communication_info(communication_info);
-    #[cfg(target_arch = "wasm32")]
-    web_sys::console::log_1(&format!(
-        "[wasm start] communication_info map: {:?}, built CommunicationInfo: {:?}",
-        communication_info, comm_info
-    ).into());
     let result = produce_pairing_request_message(kind, own_transport.clone(), &contact, comm_info)?;
 
     secret_store
@@ -110,7 +105,7 @@ pub(in crate::protocol) async fn start<
         .save(crate::types::Channel {
             id: channel_id,
             transport: endpoint.clone(),
-            name: name.unwrap_or_default(),
+            communication_info: peer_communication_info,
             status: crate::types::ChannelStatus::Pending,
             created_at: now_secs(),
         })
@@ -158,11 +153,17 @@ pub(in crate::protocol) async fn accept<
         crate::types::ChannelStatus::Paired
     };
 
+    // Persist the peer's communication_info verbatim on the channel — opaque
+    // to the protocol, available to the app. App-level identity heuristics
+    // (e.g. the backend provisioned actor's auto-link by display name on
+    // re-pairing) read from this map; the protocol does not.
+    let peer_communication_info = extract_communication_info(&request.communication_info);
+
     channel_store
         .save(crate::types::Channel {
             id: channel_id,
             transport: peer_transport,
-            name: String::new(),
+            communication_info: peer_communication_info.clone(),
             status,
             created_at: now_secs(),
         })
@@ -177,9 +178,7 @@ pub(in crate::protocol) async fn accept<
         .await?;
 
     #[cfg(feature = "logging")]
-    tracing::info!("pairing complete (contact creator side)");
-
-    let peer_communication_info = extract_communication_info(&request.communication_info);
+    tracing::info!("pairing complete (responder side)");
 
     Ok(vec![DeRecEvent::PairingCompleted {
         channel_id,
@@ -231,12 +230,12 @@ fn on_request(
     pairing_secret: &PairingSecretKeyMaterial,
 ) -> Vec<DeRecEvent> {
     let peer_communication_info = extract_communication_info(&request.communication_info);
-    let (response_kind, kind) = if request.sender_kind == SenderKind::OwnerRecovery as i32 {
+    let (response_kind, kind) = if request.sender_kind == SenderKind::Owner as i32 {
         (SenderKind::Helper, SenderKind::Helper)
     } else if request.sender_kind == SenderKind::Replica as i32 {
         (SenderKind::Replica, SenderKind::Replica)
     } else {
-        (SenderKind::OwnerNonRecovery, SenderKind::OwnerNonRecovery)
+        (SenderKind::Owner, SenderKind::Owner)
     };
 
     let action = PendingAction::Pairing {
@@ -287,7 +286,7 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
         .await?;
 
     let kind = if response.sender_kind == SenderKind::Helper as i32 {
-        SenderKind::OwnerRecovery
+        SenderKind::Owner
     } else if response.sender_kind == SenderKind::Replica as i32 {
         SenderKind::Replica
     } else {
@@ -302,15 +301,25 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
         crate::types::ChannelStatus::Paired
     };
 
+    let peer_communication_info = extract_communication_info(&response.communication_info);
+
     if let Some(mut channel) = channel_store.load(channel_id).await? {
         channel.status = status;
+        // The peer's self-attested communication_info (from the wire pair-
+        // response) is more authoritative than whatever the app guessed at
+        // pair-start (often `{}` for QR-paste flows). Merge into the channel
+        // record so any name/identity keys the peer sends are persisted —
+        // and end up inside `HelperInfo.communication_info` at protect time.
+        // App-only entries the initiator added pre-pair survive untouched
+        // unless the peer happens to use the same key.
+        for (k, v) in &peer_communication_info {
+            channel.communication_info.insert(k.clone(), v.clone());
+        }
         channel_store.save(channel).await?;
     }
 
     #[cfg(feature = "logging")]
     tracing::info!("pairing complete (initiator side)");
-
-    let peer_communication_info = extract_communication_info(&response.communication_info);
 
     Ok(vec![DeRecEvent::PairingCompleted {
         channel_id,

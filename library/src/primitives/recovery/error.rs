@@ -6,8 +6,8 @@ pub enum RecoveryError {
     #[error("secret_id is empty")]
     EmptySecretId,
 
-    #[error("share version must be >= 0 (got={version})")]
-    InvalidVersion { version: i32 },
+    #[error("invalid share version (got={version})")]
+    InvalidVersion { version: u32 },
 
     #[error("no share responses provided")]
     EmptyResponses,
@@ -37,7 +37,7 @@ pub enum RecoveryError {
     SecretIdMismatch,
 
     #[error("share version mismatch in share response (expected={expected}, got={got})")]
-    VersionMismatch { expected: i32, got: i32 },
+    VersionMismatch { expected: u32, got: u32 },
 
     #[error("failed to reconstruct secret from shares")]
     ReconstructionFailed {

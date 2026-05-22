@@ -54,17 +54,17 @@ pub(in crate::protocol) async fn accept<
     request: &VerifyShareRequestMessage,
     shared_key: &SharedKey,
 ) -> Result<Vec<DeRecEvent>> {
-    let encoded = share_store
-        .load(channel_id, &[request.version])
+    let stored_bytes = share_store
+        .load(channel_id, request.secret_id, &[request.version])
         .await?
         .into_iter()
         .next()
-        .map(|(_, data)| data)
+        .map(|s| s.bytes)
         .ok_or(Error::InvalidInput(
             "no stored share for verification request",
         ))?;
     let stored =
-        StoreShareRequestMessage::decode(encoded.as_slice()).map_err(Error::ProtobufDecode)?;
+        StoreShareRequestMessage::decode(stored_bytes.as_slice()).map_err(Error::ProtobufDecode)?;
 
     let resp = verification_response::produce(channel_id, request, shared_key, &stored.share)?;
 
@@ -92,7 +92,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
             status: status as i32,
             memo: memo.to_owned(),
         }),
-        secret_id: request.secret_id.clone(),
+        secret_id: request.secret_id,
         version: request.version,
         nonce: request.nonce,
         hash: Vec::new(),
@@ -118,9 +118,9 @@ pub(in crate::protocol) async fn start<
     channel_store: &mut Ch,
     secret_store: &mut Ss,
     transport: &T,
-    version: i32,
+    version: u32,
     target: Target,
-    secret_id: &[u8],
+    secret_id: u64,
 ) -> Result<()> {
     let all_channels = channel_store.channels().await?;
     let all_channel_ids: Vec<ChannelId> = all_channels.iter().map(|c| c.id).collect();
@@ -194,11 +194,11 @@ async fn on_response<Sh: DeRecShareStore>(
     let version = response.version;
 
     let committed_share_bytes = share_store
-        .load(channel_id, &[version])
+        .load(channel_id, response.secret_id, &[version])
         .await?
         .into_iter()
         .next()
-        .map(|(_, data)| data)
+        .map(|s| s.bytes)
         .ok_or(Error::InvalidInput(
             "no committed share stored for this channel/version — cannot verify proof",
         ))?;

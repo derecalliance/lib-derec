@@ -11,7 +11,7 @@ use crate::{
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{
     ContactMessage, GetSecretIdsVersionsRequestMessage, GetShareRequestMessage, PairRequestMessage,
-    SenderKind, StoreShareRequestMessage, VerifyShareRequestMessage,
+    SenderKind, StoreShareRequestMessage, UnpairRequestMessage, VerifyShareRequestMessage,
 };
 
 /// An opaque action token emitted inside [`DeRecEvent::ActionRequired`] events.
@@ -49,6 +49,15 @@ pub enum PendingAction {
         request: GetShareRequestMessage,
         shared_key: SharedKey,
     },
+    /// The peer has asked us to drop our state for this channel
+    /// (see [`crate::primitives::unpairing`]). Accepting deletes the local
+    /// channel/share/secret state and sends back an `Ok` response; rejecting
+    /// sends a non-`Ok` response and keeps the state.
+    Unpair {
+        channel_id: ChannelId,
+        request: UnpairRequestMessage,
+        shared_key: SharedKey,
+    },
 }
 
 /// Describes an outbound protocol flow to initiate via [`super::DeRecProtocol::start`].
@@ -56,7 +65,11 @@ pub enum DeRecFlow {
     Pairing {
         kind: SenderKind,
         contact: ContactMessage,
-        name: Option<String>,
+        /// App-level identity metadata for the peer being paired with.
+        /// Stored verbatim on the resulting [`crate::types::Channel`]
+        /// (`channel.communication_info`). The protocol does not inspect
+        /// it — pass an empty map to record nothing.
+        peer_communication_info: std::collections::HashMap<String, String>,
     },
     Discovery {
         target: Target,
@@ -66,13 +79,47 @@ pub enum DeRecFlow {
         description: Option<String>,
     },
     VerifyShares {
-        version: i32,
+        version: u32,
         target: Target,
     },
     RecoverSecret {
-        secret_id: Vec<u8>,
-        version: i32,
+        secret_id: u64,
+        version: u32,
     },
+    /// Initiate an unpair flow against one or more paired channels.
+    ///
+    /// Whether the local state for `target` is dropped immediately (fire-and-
+    /// forget) or only after the peer acknowledges is governed by
+    /// [`crate::protocol::DeRecProtocolBuilder::with_unpair_ack`].
+    Unpair {
+        target: Target,
+        /// Optional human-readable reason embedded into the wire request.
+        /// Pass `None` (or an empty string) to omit.
+        memo: Option<String>,
+    },
+}
+
+/// Determines whether the unpair initiator waits for the peer's
+/// acknowledgement before dropping its local state for the channel.
+///
+/// See [`crate::protocol::DeRecProtocolBuilder::with_unpair_ack`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnpairAck {
+    /// The initiator keeps its local channel/share/secret state until the
+    /// peer's `Ok` response arrives — or until the configured protocol
+    /// timeout elapses, at which point the state is dropped anyway and an
+    /// [`DeRecEvent::Unpaired`] event surfaces.
+    Required,
+    /// The initiator drops its local state immediately after sending the
+    /// request and emits [`DeRecEvent::Unpaired`] right away. Any later
+    /// response is silently ignored.
+    NotRequired,
+}
+
+impl Default for UnpairAck {
+    fn default() -> Self {
+        Self::Required
+    }
 }
 
 // TODO: fix this warning
@@ -86,13 +133,10 @@ pub enum DeRecEvent {
     /// `kind` is the local party's role in the pairing. Applications use this
     /// to decide what to do next:
     ///
-    /// - [`SenderKind::OwnerRecovery`] — the Owner just completed a recovery
-    ///   pairing. Once out-of-band authentication is done, call
-    ///   [`super::DeRecProtocol::start`] with [`DeRecFlow::Discovery`] to ask
-    ///   the Helper which secrets it holds.
-    /// - [`SenderKind::OwnerNonRecovery`] — standard Owner pairing; proceed
-    ///   with [`DeRecFlow::ProtectSecret`] or [`DeRecFlow::VerifyShares`] as
-    ///   needed.
+    /// - [`SenderKind::Owner`] — the Owner completed pairing with a Helper.
+    ///   Call [`super::DeRecProtocol::start`] with [`DeRecFlow::ProtectSecret`]
+    ///   to distribute shares, or [`DeRecFlow::Discovery`] to ask the Helper
+    ///   which secrets it holds (e.g. after a recovery re-pairing).
     /// - [`SenderKind::Helper`] — the Helper side completed pairing; no
     ///   additional action is required (the Helper waits for incoming messages).
     /// - [`SenderKind::Replica`] — a Replica pairing completed; the application
@@ -106,10 +150,10 @@ pub enum DeRecEvent {
     },
 
     /// A share was accepted and stored locally (Helper side).
-    ShareStored { channel_id: ChannelId, version: i32 },
+    ShareStored { channel_id: ChannelId, version: u32 },
 
     /// A Helper confirmed it stored our share (Owner side).
-    ShareConfirmed { channel_id: ChannelId, version: i32 },
+    ShareConfirmed { channel_id: ChannelId, version: u32 },
 
     /// A Helper rejected or failed to store our share (Owner side).
     ///
@@ -118,7 +162,7 @@ pub enum DeRecEvent {
     /// `memo` come from the Helper's response (or are synthetic for timeouts).
     ShareRejected {
         channel_id: ChannelId,
-        version: i32,
+        version: u32,
         /// The `StatusEnum` value from the Helper's response.
         status: i32,
         /// Human-readable reason from the Helper, or `"timeout"`.
@@ -130,7 +174,7 @@ pub enum DeRecEvent {
     /// Emitted once per [`DeRecFlow::ProtectSecret`] flow after every targeted
     /// Helper has either confirmed, rejected, or timed out.
     SharingComplete {
-        version: i32,
+        version: u32,
         confirmed_count: usize,
         failed_count: usize,
         /// `true` when `confirmed_count >= threshold`.
@@ -138,7 +182,7 @@ pub enum DeRecEvent {
     },
 
     /// A Helper's verification proof checked out (Owner side).
-    ShareVerified { channel_id: ChannelId, version: i32 },
+    ShareVerified { channel_id: ChannelId, version: u32 },
 
     /// A Helper reported all secrets it currently stores for this channel (Owner side).
     ///
@@ -191,6 +235,31 @@ pub enum DeRecEvent {
     ActionRequired {
         channel_id: ChannelId,
         action: PendingAction,
+    },
+
+    /// The local channel state for `channel_id` has been dropped as the
+    /// result of an unpair flow.
+    ///
+    /// Surfaces on **both** sides of the flow:
+    ///
+    /// - Initiator: emitted when (a) `UnpairAck::NotRequired` and the request
+    ///   has just been sent, (b) `UnpairAck::Required` and the peer
+    ///   acknowledged with `Ok`, or (c) `UnpairAck::Required` and the
+    ///   configured timeout elapsed without a response.
+    /// - Responder: emitted by [`super::DeRecProtocol::accept`] after the
+    ///   channel/share/secret state for the requesting peer has been removed.
+    Unpaired { channel_id: ChannelId },
+
+    /// The peer answered an outbound unpair request with a non-`Ok` status.
+    ///
+    /// The initiator's local state is **not** dropped — the application
+    /// decides what to do (retry, escalate, or force-delete locally).
+    UnpairRejected {
+        channel_id: ChannelId,
+        /// The `StatusEnum` value from the peer's response.
+        status: i32,
+        /// Human-readable reason from the peer.
+        memo: String,
     },
 
     /// Well-formed message with no actionable effect (e.g. an ACK).

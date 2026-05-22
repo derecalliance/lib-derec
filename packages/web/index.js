@@ -9,16 +9,32 @@
 
 export { default as init } from "./derec_library.js";
 
-import { DeRecProtocolWasm } from "./derec_library.js";
+import {
+  DeRecProtocolWasm,
+  decodeRecoveredSecretBag,
+  restoreFromRecoveredBag,
+} from "./derec_library.js";
 
 /** Higher-level protocol orchestrator. Re-exported from the WASM module. */
 export const DeRecProtocol = DeRecProtocolWasm;
 
+/**
+ * Unwrap the bytes carried by a `SecretRecovered` event into the original
+ * `SecretContainer` bag shape (helpers + secrets).
+ */
+export { decodeRecoveredSecretBag };
+
+/**
+ * Re-populate empty stores from a recovered bag so the app can resume normal
+ * operation. Caller must clear the target namespace first.
+ */
+export { restoreFromRecoveredBag };
+
 /** Mirrors the Rust SenderKind enum used in pairing. */
-export const SenderKind = Object.freeze({ OwnerNonRecovery: 0, OwnerRecovery: 1, Helper: 2, Replica: 3 });
+export const SenderKind = Object.freeze({ Owner: 0, Helper: 1, Replica: 2 });
 
 /** Discriminant values for the `start()` flow parameter. */
-export const FlowKind = Object.freeze({ Pairing: 0, Discovery: 1, ProtectSecret: 2, VerifyShares: 3, RecoverSecret: 4 });
+export const FlowKind = Object.freeze({ Pairing: 0, Discovery: 1, ProtectSecret: 2, VerifyShares: 3, RecoverSecret: 4, Unpair: 5 });
 
 import {
   pairing_request_create_contact,
@@ -45,6 +61,12 @@ import {
   recovery_request_produce,
   recovery_response_produce,
   recovery_response_recover,
+  unpairing_request_produce,
+  unpairing_request_extract,
+  unpairing_response_produce,
+  unpairing_response_reject,
+  unpairing_response_extract,
+  unpairing_response_process,
 } from "./derec_library.js";
 
 export const primitives = {
@@ -100,6 +122,18 @@ export const primitives = {
     response: {
       produce: recovery_response_produce,
       recover: recovery_response_recover,
+    },
+  },
+  unpairing: {
+    request: {
+      produce: unpairing_request_produce,
+      extract: unpairing_request_extract,
+    },
+    response: {
+      produce: unpairing_response_produce,
+      reject: unpairing_response_reject,
+      extract: unpairing_response_extract,
+      process: unpairing_response_process,
     },
   },
 };

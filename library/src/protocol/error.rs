@@ -77,14 +77,14 @@ pub enum ShareStoreError {
     /// `(channel_id, version)` pair as write-once; overwriting a confirmed share
     /// is a protocol violation.
     #[error("share already exists for channel {channel_id} version {version}")]
-    AlreadyExists { channel_id: u64, version: i32 },
+    AlreadyExists { channel_id: u64, version: u32 },
 
     /// No share was found for `(channel_id, version)`.
     ///
     /// Implementations that prefer an explicit error over returning `Ok(None)`
     /// may return this variant from [`DeRecShareStore::load`](super::DeRecShareStore::load).
     #[error("share not found for channel {channel_id} version {version}")]
-    NotFound { channel_id: u64, version: i32 },
+    NotFound { channel_id: u64, version: u32 },
 
     /// An I/O or serialization error in the underlying storage backend.
     ///

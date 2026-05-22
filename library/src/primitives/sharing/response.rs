@@ -19,9 +19,9 @@ pub struct ProduceResult {
     /// The [`CommittedDeRecShare`] extracted from the request.
     pub committed_share: CommittedDeRecShare,
     /// Secret identifier extracted from the inner [`derec_proto::DeRecShare`].
-    pub secret_id: Vec<u8>,
+    pub secret_id: u64,
     /// Share-distribution version extracted from the request.
-    pub version: i32,
+    pub version: u32,
 }
 
 /// Result of [`extract`].
@@ -141,7 +141,7 @@ pub fn produce(
     let inner_share = DeRecShare::decode(committed_share.de_rec_share.as_slice())
         .map_err(crate::Error::ProtobufDecode)?;
 
-    let secret_id = inner_share.secret_id.clone();
+    let secret_id = inner_share.secret_id;
     let version = request.version;
 
     let vss_share = vss::VSSShare {
@@ -313,7 +313,7 @@ pub fn extract(
     feature = "logging",
     tracing::instrument(skip_all, fields(version = version))
 )]
-pub fn process(version: i32, response: &StoreShareResponseMessage) -> Result<(), crate::Error> {
+pub fn process(version: u32, response: &StoreShareResponseMessage) -> Result<(), crate::Error> {
     // Validate response status before any other checks.
     let result = response.result.as_ref().ok_or(crate::Error::Invariant(
         "StoreShareResponseMessage is missing result field",

@@ -34,11 +34,11 @@ struct SplitResultJs {
 /// `CommittedDeRecShare` per helper channel.
 #[wasm_bindgen(js_name = "sharing_request_split")]
 pub fn split(
-    secret_id: &[u8],
+    secret_id: u64,
     secret_data: &[u8],
     channels: JsValue,
     threshold: u32,
-    version: i32,
+    version: u32,
 ) -> Result<JsValue, JsValue> {
     let channel_ids_raw: Vec<u64> = serde_wasm_bindgen::from_value(channels)
         .map_err(|e| js_error("WASM_DESERIALIZE_ERROR", e.to_string()))?;
@@ -81,8 +81,8 @@ pub fn split(
 #[wasm_bindgen(js_name = "sharing_request_produce")]
 pub fn produce(
     channel_id: u64,
-    version: i32,
-    secret_id: &[u8],
+    version: u32,
+    secret_id: u64,
     committed_share: &[u8],
     keep_list: JsValue,
     description: String,
@@ -99,7 +99,7 @@ pub fn produce(
         .try_into()
         .expect("shared_key length validated to be 32");
 
-    let keep_list_raw: Vec<i32> = serde_wasm_bindgen::from_value(keep_list)
+    let keep_list_raw: Vec<u32> = serde_wasm_bindgen::from_value(keep_list)
         .map_err(|e| js_error("WASM_DESERIALIZE_ERROR", e.to_string()))?;
 
     let committed_share_proto = CommittedDeRecShare::decode(committed_share)

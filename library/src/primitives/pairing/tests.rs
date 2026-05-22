@@ -291,7 +291,7 @@ fn test_produce_pairing_response_message_empty_mlkem_ciphertext() {
     };
 
     let result = produce_pairing_response_message(
-        SenderKind::OwnerNonRecovery,
+        SenderKind::Owner,
         &invalid_pair_request_msg,
         &alice_sk_state,
         None,
@@ -336,7 +336,7 @@ fn test_produce_pairing_response_message_empty_ecies_public_key() {
     };
 
     let result = produce_pairing_response_message(
-        SenderKind::OwnerNonRecovery,
+        SenderKind::Owner,
         &invalid_pair_request_msg,
         &alice_sk_state,
         None,
@@ -378,7 +378,7 @@ fn test_produce_pairing_response_message_missing_transport_protocol() {
     };
 
     let result = produce_pairing_response_message(
-        SenderKind::OwnerNonRecovery,
+        SenderKind::Owner,
         &invalid_pair_request_msg,
         &alice_sk_state,
         None,
@@ -422,7 +422,7 @@ fn test_produce_pairing_response_message_empty_transport_uri() {
     };
 
     let result = produce_pairing_response_message(
-        SenderKind::OwnerNonRecovery,
+        SenderKind::Owner,
         &invalid_pair_request_msg,
         &alice_sk_state,
         None,
@@ -509,7 +509,7 @@ fn test_process_pairing_response_message_missing_result() {
         .expect("failed to extract pairing request");
 
     let pair_response_msg = PairResponseMessage {
-        sender_kind: SenderKind::OwnerNonRecovery.into(),
+        sender_kind: SenderKind::Owner.into(),
         result: None,
         nonce: bob_pair_request_msg.nonce,
         communication_info: None,
@@ -567,7 +567,7 @@ fn test_process_pairing_response_message_result_non_ok() {
         .expect("failed to extract pairing request");
 
     let pair_response_msg = PairResponseMessage {
-        sender_kind: SenderKind::OwnerNonRecovery.into(),
+        sender_kind: SenderKind::Owner.into(),
         result: Some(DeRecResult {
             status: StatusEnum::Fail as i32,
             memo: String::new(),
@@ -628,7 +628,7 @@ fn test_process_pairing_response_message_invalid_status() {
         .expect("failed to extract pairing request");
 
     let pair_response_msg = PairResponseMessage {
-        sender_kind: SenderKind::OwnerNonRecovery.into(),
+        sender_kind: SenderKind::Owner.into(),
         result: Some(DeRecResult {
             status: 15,
             memo: String::new(),
@@ -689,7 +689,7 @@ fn test_process_pairing_response_message_nonce_mismatch() {
         .expect("failed to extract pairing request");
 
     let pair_response_msg = PairResponseMessage {
-        sender_kind: SenderKind::OwnerNonRecovery.into(),
+        sender_kind: SenderKind::Owner.into(),
         result: Some(DeRecResult {
             status: StatusEnum::Ok as i32,
             memo: String::new(),
@@ -750,7 +750,7 @@ fn test_process_pairing_response_message_empty_mlkem_encapsulation_key() {
         .expect("failed to extract pairing request");
 
     let pair_response_msg = PairResponseMessage {
-        sender_kind: SenderKind::OwnerNonRecovery.into(),
+        sender_kind: SenderKind::Owner.into(),
         result: Some(DeRecResult {
             status: StatusEnum::Ok as i32,
             memo: String::new(),
@@ -811,7 +811,7 @@ fn test_process_pairing_response_message_empty_ecies_public_key() {
         .expect("failed to extract pairing request");
 
     let pair_response_msg = PairResponseMessage {
-        sender_kind: SenderKind::OwnerNonRecovery.into(),
+        sender_kind: SenderKind::Owner.into(),
         result: Some(DeRecResult {
             status: StatusEnum::Ok as i32,
             memo: String::new(),
@@ -874,7 +874,7 @@ fn test_extract_pairing_response_rejects_envelope_timestamp_mismatch() {
         envelope: response_envelope,
         ..
     } = produce_pairing_response_message(
-        SenderKind::OwnerNonRecovery,
+        SenderKind::Owner,
         &request,
         &initiator_secret_key,
         None,
@@ -895,7 +895,7 @@ fn test_extract_pairing_response_rejects_envelope_timestamp_mismatch() {
 #[test]
 fn test_alice_bob_pairing_flow() {
     let alice_channel_id = ChannelId(42);
-    let alice_kind = SenderKind::OwnerNonRecovery;
+    let alice_kind = SenderKind::Owner;
     let alice_transport_uri = "https://relay.example/alice";
     let bob_transport_uri = "https://relay.example/bob";
 

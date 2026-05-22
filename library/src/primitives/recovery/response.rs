@@ -100,7 +100,7 @@ pub struct RecoverResult {
 )]
 pub fn produce(
     channel_id: ChannelId,
-    _secret_id: &[u8],
+    _secret_id: u64,
     request: &GetShareRequestMessage,
     stored_share_request: &StoreShareRequestMessage,
     shared_key: &SharedKey,
@@ -262,8 +262,6 @@ pub fn extract(
 /// Returns [`crate::Error`] (specifically `Error::Recovery(...)`) in the following cases:
 ///
 /// - [`RecoveryError::EmptyResponses`] if `responses` is empty
-/// - [`RecoveryError::EmptySecretId`] if `secret_id` is empty
-/// - [`RecoveryError::InvalidVersion`] if `version < 0`
 /// - [`RecoveryError::MissingResult`] if any response is missing the `result` field
 /// - [`RecoveryError::NonOkStatus`] if any response indicates a non-OK status, carrying the
 ///   Helper's status code and memo string
@@ -304,26 +302,14 @@ pub fn extract(
     tracing::instrument(skip_all, fields(version = version, responses_count = responses.len()))
 )]
 pub fn recover(
-    secret_id: &[u8],
-    version: i32,
+    secret_id: u64,
+    version: u32,
     responses: &[RecoveryResponseInput<'_>],
 ) -> Result<RecoverResult, crate::Error> {
     if responses.is_empty() {
         #[cfg(feature = "logging")]
         tracing::warn!("responses list is empty");
         return Err(RecoveryError::EmptyResponses.into());
-    }
-
-    if secret_id.is_empty() {
-        #[cfg(feature = "logging")]
-        tracing::warn!("secret_id is empty");
-        return Err(RecoveryError::EmptySecretId.into());
-    }
-
-    if version < 0 {
-        #[cfg(feature = "logging")]
-        tracing::warn!(version = version, "version is negative");
-        return Err(RecoveryError::InvalidVersion { version }.into());
     }
 
     let mut shares = Vec::with_capacity(responses.len());
@@ -347,8 +333,8 @@ pub fn recover(
 
 fn extract_share_from_response(
     response: &GetShareResponseMessage,
-    secret_id: &[u8],
-    version: i32,
+    secret_id: u64,
+    version: u32,
 ) -> Result<VSSShare, crate::Error> {
     let result = response
         .result

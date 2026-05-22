@@ -129,13 +129,12 @@ pub(crate) fn transport_protocol_to_js(tp: &TransportProtocol) -> TransportProto
 
 pub(super) fn get_sender_kind(kind: u32) -> Result<SenderKind, JsValue> {
     match kind {
-        0 => Ok(SenderKind::OwnerNonRecovery),
-        1 => Ok(SenderKind::OwnerRecovery),
-        2 => Ok(SenderKind::Helper),
-        3 => Ok(SenderKind::Replica),
+        0 => Ok(SenderKind::Owner),
+        1 => Ok(SenderKind::Helper),
+        2 => Ok(SenderKind::Replica),
         _ => Err(js_error(
             "INVALID_SENDER_KIND",
-            format!("invalid sender kind: {kind}"),
+            format!("invalid sender kind: {kind}, valid values are 0 (Owner), 1 (Helper), 2 (Replica)"),
         )),
     }
 }

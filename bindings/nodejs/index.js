@@ -214,7 +214,7 @@ console.log("Recovery flow test passed.");
 // ---- Pairing flow ----
 console.log("--------------------   Pairing Functions   --------------------");
 const channelId = 1n;
-const roleHelper = 2;
+const roleHelper = 1;
 const roleOwner = 0;
 // create_contact_message takes { protocol: string, uri: string } and returns
 // { contact_message: ContactMessageJs, secret_key_material: Uint8Array }.

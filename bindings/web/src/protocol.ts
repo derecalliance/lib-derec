@@ -1,138 +1,217 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Protocol smoke tests: exercises all five flows using the higher-level
-// `DeRecProtocol` orchestrator backed by in-memory stores.
+// Protocol smoke tests: exercises pairing, sharing, and discovery+recovery
+// using the low-level `DeRecProtocol` runtime (`start` / `process` / `accept`)
+// backed by in-memory stores.
+//
+// No UI: every `ActionRequired` event a peer receives is auto-accepted via
+// `processAll`. The store implementations mirror the reference app's
+// `stores.ts` algorithms exactly (channel-link graph + BFS closure, keyed
+// share store, recording transport), but are Map-backed instead of
+// localStorage-backed.
 
-import { DeRecProtocol, SenderKind } from "@derec-alliance/web";
-import type { DeRecEvent } from "@derec-alliance/web";
+import { DeRecProtocol, FlowKind, SenderKind } from "@derec-alliance/web";
+import type {
+  ChannelStore,
+  ContactMessage,
+  DeRecEvent,
+  SecretStore,
+  Share,
+  ShareStore,
+  Transport,
+} from "@derec-alliance/web";
 
 // ── Logging helpers ───────────────────────────────────────────────────────────
 
 const kindName = (k: SenderKind): string => {
   switch (k) {
-    case SenderKind.OwnerNonRecovery: return "OwnerNonRecovery";
-    case SenderKind.OwnerRecovery:    return "OwnerRecovery";
-    case SenderKind.Helper:           return "Helper";
-    default:                          return `Unknown(${k})`;
+    case SenderKind.Owner:
+      return "Owner";
+    case SenderKind.Helper:
+      return "Helper";
+    case SenderKind.Replica:
+      return "Replica";
+    default:
+      return `Unknown(${k})`;
   }
 };
 
 // ── In-memory stores ──────────────────────────────────────────────────────────
 
-class InMemorySecretStore {
-  private sharedKeys = new Map<string, Uint8Array>();
-  private pairingSecrets = new Map<string, Uint8Array>();
+// kind 0 = SharedKey (32 raw bytes), kind 1 = PairingSecret (ephemeral),
+// kind 2 = PairingContact (ephemeral). Keyed by `${channelId}:${kind}`.
+class InMemorySecretStore implements SecretStore {
+  private readonly data = new Map<string, Uint8Array>();
 
-  async load(channelId: string, kind: 0 | 1): Promise<Uint8Array | null> {
-    return (
-      (kind === 0
-        ? this.sharedKeys.get(channelId)
-        : this.pairingSecrets.get(channelId)) ?? null
-    );
+  private key(channelId: string, kind: 0 | 1 | 2): string {
+    return `${channelId}:${kind}`;
   }
 
-  async save(channelId: string, kind: 0 | 1, value: Uint8Array): Promise<void> {
-    if (kind === 0) this.sharedKeys.set(channelId, value);
-    else this.pairingSecrets.set(channelId, value);
+  async load(channelId: string, kind: 0 | 1 | 2): Promise<Uint8Array | null> {
+    return this.data.get(this.key(channelId, kind)) ?? null;
   }
 
-  async remove(channelId: string, kind: 0 | 1): Promise<void> {
-    if (kind === 0) this.sharedKeys.delete(channelId);
-    else this.pairingSecrets.delete(channelId);
+  async save(channelId: string, kind: 0 | 1 | 2, value: Uint8Array): Promise<void> {
+    this.data.set(this.key(channelId, kind), value);
+  }
+
+  async remove(channelId: string, kind: 0 | 1 | 2): Promise<void> {
+    this.data.delete(this.key(channelId, kind));
   }
 }
 
-class InMemoryContactStore {
-  private contacts = new Map<string, Uint8Array>();
+// Stores opaque channel-record bytes plus the channel-link graph.
+// Linking is undirected, idempotent, and transitive; `linkedChannels`
+// returns the transitive closure including `channelId` itself.
+class InMemoryChannelStore implements ChannelStore {
+  private readonly channels = new Map<string, Uint8Array>();
+  private readonly links = new Map<string, Set<string>>();
 
   async load(channelId: string): Promise<Uint8Array | null> {
-    return this.contacts.get(channelId) ?? null;
+    return this.channels.get(channelId) ?? null;
   }
 
-  async save(channelId: string, contactBytes: Uint8Array): Promise<void> {
-    this.contacts.set(channelId, contactBytes);
+  async save(channelId: string, bytes: Uint8Array): Promise<void> {
+    this.channels.set(channelId, bytes);
+  }
+
+  async listChannels(): Promise<string[]> {
+    return Array.from(this.channels.keys());
+  }
+
+  async remove(channelId: string): Promise<boolean> {
+    return this.channels.delete(channelId);
+  }
+
+  async linkChannel(a: string, b: string): Promise<void> {
+    if (a === b) return;
+    if (!this.links.has(a)) this.links.set(a, new Set());
+    if (!this.links.has(b)) this.links.set(b, new Set());
+    this.links.get(a)!.add(b);
+    this.links.get(b)!.add(a);
+  }
+
+  /** Transitive closure of `channelId`, including `channelId` itself. */
+  async linkedChannels(channelId: string): Promise<string[]> {
+    const visited = new Set<string>();
+    const queue: string[] = [channelId];
+    while (queue.length > 0) {
+      const curr = queue.shift()!;
+      if (visited.has(curr)) continue;
+      visited.add(curr);
+      for (const linked of this.links.get(curr) ?? []) {
+        if (!visited.has(linked)) queue.push(linked);
+      }
+    }
+    return Array.from(visited);
   }
 }
 
-class InMemoryShareStore {
-  private data = new Map<string, Map<string, Map<number, Uint8Array>>>();
+// Pure keyed share store. It never sees the channel-link graph — recovery
+// resolves the linked channel set via `ChannelStore.linkedChannels` and
+// passes it to `loadMany` (scoped to one `secretId`). Discovery instead
+// uses `loadAll`, which is the one legitimate "no secretId" load — it
+// enumerates the helper's holdings before any secret is known. Versions
+// are namespaced by `secretId`: the same `version` number can exist for
+// two different secrets, so a version-only query would conflate them.
+class InMemoryShareStore implements ShareStore {
+  // Keyed by (channelId, secretId, version). The string secretId mirrors the
+  // wire contract — u64 as a decimal string.
+  private readonly data = new Map<string, Map<string, Map<number, Share>>>();
+  private ownerVersion: number | null = null;
 
-  private hex(bytes: Uint8Array): string {
-    return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-  }
-
-  async load(
-    channelId: string,
-    secretId: Uint8Array,
-    version: number,
-  ): Promise<Uint8Array | null> {
-    return (
-      this.data.get(channelId)?.get(this.hex(secretId))?.get(version) ?? null
-    );
-  }
-
-  async save(
-    channelId: string,
-    secretId: Uint8Array,
-    version: number,
-    encoded: Uint8Array,
-  ): Promise<void> {
-    if (!this.data.has(channelId)) this.data.set(channelId, new Map());
-    const bySecret = this.data.get(channelId)!;
-    const h = this.hex(secretId);
-    if (!bySecret.has(h)) bySecret.set(h, new Map());
-    bySecret.get(h)!.set(version, encoded);
-  }
-
-  async loadChannelsForSecret(
-    secretId: Uint8Array,
-    version: number,
-  ): Promise<string[]> {
-    const h = this.hex(secretId);
-    const result: string[] = [];
-    for (const [channelId, bySecret] of this.data) {
-      if (bySecret.get(h)?.has(version)) result.push(channelId);
+  async load(channelId: string, secretId: string, versions: number[]): Promise<Share[]> {
+    const bySecret = this.data.get(channelId);
+    if (!bySecret) return [];
+    const byVersion = bySecret.get(secretId);
+    if (!byVersion) return [];
+    const filter = versions.length > 0 ? new Set(versions) : null;
+    const result: Share[] = [];
+    for (const [v, share] of byVersion) {
+      if (filter && !filter.has(v)) continue;
+      result.push(share);
     }
     return result;
   }
 
-  async loadSecretsForChannel(
-    channelId: string,
-  ): Promise<Array<[Uint8Array, number[]]>> {
-    const bySecret = this.data.get(channelId);
-    if (!bySecret) return [];
-    return Array.from(bySecret.entries()).map(([h, byVersion]) => [
-      new Uint8Array(h.match(/.{2}/g)!.map((s) => parseInt(s, 16))),
-      Array.from(byVersion.keys()),
-    ]);
+  async save(channelId: string, share: Share): Promise<void> {
+    let bySecret = this.data.get(channelId);
+    if (!bySecret) {
+      bySecret = new Map();
+      this.data.set(channelId, bySecret);
+    }
+    let byVersion = bySecret.get(share.secretId);
+    if (!byVersion) {
+      byVersion = new Map();
+      bySecret.set(share.secretId, byVersion);
+    }
+    byVersion.set(share.version, share);
   }
 
-  copyShare(
-    fromChannelId: string,
-    toChannelId: string,
-    secretId: Uint8Array,
-    version: number,
-  ): void {
-    const bytes = this.data
-      .get(fromChannelId)
-      ?.get(this.hex(secretId))
-      ?.get(version);
-    if (!bytes) return;
-    if (!this.data.has(toChannelId)) this.data.set(toChannelId, new Map());
-    const bySecret = this.data.get(toChannelId)!;
-    const h = this.hex(secretId);
-    if (!bySecret.has(h)) bySecret.set(h, new Map());
-    bySecret.get(h)!.set(version, bytes);
+  /**
+   * Load shares for several channels in one call, scoped to one secret.
+   * Recovery feeds this the set from the channel store's `linkedChannels`.
+   * Flat list — version-dedup is the caller's concern.
+   */
+  async loadMany(channelIds: string[], secretId: string, versions: number[]): Promise<Share[]> {
+    const filter = versions.length > 0 ? new Set(versions) : null;
+    const result: Share[] = [];
+    for (const channelId of channelIds) {
+      const bySecret = this.data.get(channelId);
+      if (!bySecret) continue;
+      const byVersion = bySecret.get(secretId);
+      if (!byVersion) continue;
+      for (const [v, share] of byVersion) {
+        if (filter && !filter.has(v)) continue;
+        result.push(share);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Discovery-only: every share across the given channels — all secrets,
+   * all versions. Recovery/verification must scope by `secretId` instead.
+   */
+  async loadAll(channelIds: string[]): Promise<Share[]> {
+    const result: Share[] = [];
+    for (const channelId of channelIds) {
+      const bySecret = this.data.get(channelId);
+      if (!bySecret) continue;
+      for (const byVersion of bySecret.values()) {
+        for (const share of byVersion.values()) result.push(share);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Drop every share stored under `channelId` (all secret_ids, all versions).
+   * Called by the unpair flow when a channel is torn down. Idempotent — a
+   * non-existent channel is a no-op.
+   */
+  async removeChannel(channelId: string): Promise<void> {
+    this.data.delete(channelId);
+  }
+
+  async latestVersion(): Promise<number | null> {
+    return this.ownerVersion;
+  }
+
+  setOwnerVersion(version: number): void {
+    this.ownerVersion = version;
   }
 }
 
 // ── RecordingTransport ────────────────────────────────────────────────────────
 
-class RecordingTransport {
-  private outbox: Array<{
-    endpoint: { protocol: string; uri: string };
-    message: Uint8Array;
-  }> = [];
+interface OutboundMessage {
+  endpoint: { protocol: string; uri: string };
+  message: Uint8Array;
+}
+
+class RecordingTransport implements Transport {
+  private outbox: OutboundMessage[] = [];
 
   async send(
     endpoint: { protocol: string; uri: string },
@@ -141,27 +220,43 @@ class RecordingTransport {
     this.outbox.push({ endpoint, message });
   }
 
-  drain(): Array<{ endpoint: { protocol: string; uri: string }; message: Uint8Array }> {
+  /** Returns and clears all queued outbound messages. */
+  drain(): OutboundMessage[] {
     return this.outbox.splice(0);
   }
 }
 
-// ── Factory ───────────────────────────────────────────────────────────────────
+// ── Node factory ──────────────────────────────────────────────────────────────
 
-function makeProtocol(endpointUri: string) {
-  const secretStore = new InMemorySecretStore();
-  const contactStore = new InMemoryContactStore();
+interface Node {
+  protocol: DeRecProtocol;
+  transport: RecordingTransport;
+  channelStore: InMemoryChannelStore;
+  shareStore: InMemoryShareStore;
+  secretStore: InMemorySecretStore;
+}
+
+const THRESHOLD = 1;
+const KEEP_VERSIONS_COUNT = 3;
+
+function makeNode(name: string, endpointUri: string, secretId: bigint): Node {
+  const channelStore = new InMemoryChannelStore();
   const shareStore = new InMemoryShareStore();
+  const secretStore = new InMemorySecretStore();
   const transport = new RecordingTransport();
   const protocol = new DeRecProtocol(
-    contactStore,
+    channelStore,
     shareStore,
     secretStore,
     transport,
     endpointUri,
     "https",
+    THRESHOLD,
+    KEEP_VERSIONS_COUNT,
+    secretId,
+    { name },
   );
-  return { protocol, transport, shareStore };
+  return { protocol, transport, channelStore, shareStore, secretStore };
 }
 
 // ── Assertion helper ──────────────────────────────────────────────────────────
@@ -182,32 +277,79 @@ function requireEvent<T extends DeRecEvent["type"]>(
   return ev;
 }
 
-// ── Shared pairing helper ─────────────────────────────────────────────────────
+// ── Choreography helpers ──────────────────────────────────────────────────────
 
+/**
+ * Feed inbound bytes to a node and auto-accept every resulting
+ * `ActionRequired` action (no UI confirmation in the smoke test). Returns the
+ * flat list of events produced by `process` plus every `accept`.
+ */
+async function processAll(node: Node, bytes: Uint8Array): Promise<DeRecEvent[]> {
+  const events = await node.protocol.process(bytes);
+  const out: DeRecEvent[] = [...events];
+  for (const ev of events) {
+    if (ev.type === "ActionRequired") {
+      out.push(...(await node.protocol.accept(ev.action)));
+    }
+  }
+  return out;
+}
+
+/** Drains exactly one queued outbound message or throws. */
+function drainOne(node: Node, label: string): Uint8Array {
+  const [msg] = node.transport.drain();
+  if (!msg) throw new Error(`${label}: expected one outbound message, got none`);
+  return msg.message;
+}
+
+/**
+ * Performs a full pairing handshake.
+ *
+ * `contactCreator` calls `createContact(channelId)` and therefore acts as the
+ * Helper side; `initiator` drives the flow with `FlowKind.Pairing` passing
+ * `kind: SenderKind.Owner`.
+ */
 async function doPair(
-  contactCreator: ReturnType<typeof makeProtocol>,
-  initiator: ReturnType<typeof makeProtocol>,
-  initiatorKind: SenderKind,
+  contactCreator: Node,
+  initiator: Node,
   channelId: bigint,
   label: string,
 ): Promise<void> {
-  const contactBytes = await contactCreator.protocol.createContact(channelId);
-  console.log(`  [${label}/ContactCreator] create_contact  channel_id=${channelId}  (${contactBytes.length} bytes)`);
+  const contact: ContactMessage =
+    await contactCreator.protocol.createContact(channelId);
+  console.log(
+    `  [${label}/ContactCreator] createContact channel_id=${contact.channel_id}`,
+  );
 
-  await initiator.protocol.startPairing(initiatorKind, contactBytes);
-  const [reqMsg] = initiator.transport.drain();
-  if (!reqMsg) throw new Error(`${label}: missing PairRequest`);
-  console.log(`  [${label}/Initiator]     start_pairing(kind=${kindName(initiatorKind)})  → PairRequest: ${reqMsg.message.length} bytes`);
+  await initiator.protocol.start(FlowKind.Pairing, {
+    kind: SenderKind.Owner,
+    contact,
+  });
+  const pairRequest = drainOne(initiator, `${label}/Initiator`);
+  console.log(
+    `  [${label}/Initiator]     start(Pairing, kind=Owner) → PairRequest ${pairRequest.length}B`,
+  );
 
-  const creatorEvents = await contactCreator.protocol.process(reqMsg.message);
-  const creatorPairing = requireEvent(creatorEvents, "PairingComplete", `${label}/ContactCreator`);
-  const [respMsg] = contactCreator.transport.drain();
-  if (!respMsg) throw new Error(`${label}: missing PairResponse`);
-  console.log(`  [${label}/ContactCreator] process(PairRequest)  → PairingComplete(kind=${kindName(creatorPairing.kind)})  PairResponse: ${respMsg.message.length} bytes`);
+  const creatorEvents = await processAll(contactCreator, pairRequest);
+  const creatorPairing = requireEvent(
+    creatorEvents,
+    "PairingCompleted",
+    `${label}/ContactCreator`,
+  );
+  const pairResponse = drainOne(contactCreator, `${label}/ContactCreator`);
+  console.log(
+    `  [${label}/ContactCreator] process(PairRequest) → PairingCompleted(kind=${kindName(creatorPairing.kind)}) PairResponse ${pairResponse.length}B`,
+  );
 
-  const initiatorEvents = await initiator.protocol.process(respMsg.message);
-  const initiatorPairing = requireEvent(initiatorEvents, "PairingComplete", `${label}/Initiator`);
-  console.log(`  [${label}/Initiator]     process(PairResponse) → PairingComplete(kind=${kindName(initiatorPairing.kind)})`);
+  const initiatorEvents = await processAll(initiator, pairResponse);
+  const initiatorPairing = requireEvent(
+    initiatorEvents,
+    "PairingCompleted",
+    `${label}/Initiator`,
+  );
+  console.log(
+    `  [${label}/Initiator]     process(PairResponse) → PairingCompleted(kind=${kindName(initiatorPairing.kind)})`,
+  );
 }
 
 // ── Sub-test: pairing flow ────────────────────────────────────────────────────
@@ -215,10 +357,10 @@ async function doPair(
 async function runPairingFlow(): Promise<void> {
   console.log("=== [Protocol] Pairing Flow ===\n");
 
-  const owner = makeProtocol("https://owner.example.com");
-  const helper = makeProtocol("https://helper.example.com");
+  const owner = makeNode("Owner", "https://owner.example.com", 1n);
+  const helper = makeNode("Helper", "https://helper.example.com", 2n);
 
-  await doPair(owner, helper, SenderKind.Helper, 1n, "Pairing");
+  await doPair(helper, owner, 1n, "Pairing");
 
   console.log("\n✓ Pairing flow passed.\n");
 }
@@ -228,52 +370,67 @@ async function runPairingFlow(): Promise<void> {
 async function runSharingFlow(): Promise<void> {
   console.log("=== [Protocol] Sharing Flow ===\n");
 
-  const owner = makeProtocol("https://owner.example.com");
-  const helperA = makeProtocol("https://helper-a.example.com");
-  const helperB = makeProtocol("https://helper-b.example.com");
+  const ownerSecretId = 42n;
+  const owner = makeNode("Owner", "https://owner.example.com", ownerSecretId);
+  const helperA = makeNode("HelperA", "https://helper-a.example.com", 100n);
+  const helperB = makeNode("HelperB", "https://helper-b.example.com", 200n);
   const channelIdA = 1n;
   const channelIdB = 2n;
 
-  await doPair(owner, helperA, SenderKind.Helper, channelIdA, "Owner↔HelperA");
-  await doPair(owner, helperB, SenderKind.Helper, channelIdB, "Owner↔HelperB");
+  await doPair(helperA, owner, channelIdA, "Owner↔HelperA");
+  await doPair(helperB, owner, channelIdB, "Owner↔HelperB");
   console.log();
 
-  const secretId = new Uint8Array([1, 2, 3]);
   const secretData = new TextEncoder().encode("super-secret-value");
-  const secretVersion = 1;
-
-  await owner.protocol.protectSecret(
-    secretId, secretData, "smoke-test secret", secretVersion,
-    2 /* threshold */, [channelIdA, channelIdB], [],
-  );
+  await owner.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([1]), name: "smoke", data: secretData }],
+    description: "smoke-test secret",
+  });
 
   const outbound = owner.transport.drain();
   if (outbound.length !== 2) {
     throw new Error(`expected 2 StoreShareRequests, got ${outbound.length}`);
   }
-  console.log(`\n  [Owner]  protectSecret  → ${outbound.length} StoreShareRequest(s) dispatched`);
+  console.log(
+    `\n  [Owner] start(ProtectSecret) → ${outbound.length} StoreShareRequest(s)`,
+  );
 
-  const helpers: Array<[ReturnType<typeof makeProtocol>, bigint, string]> = [
-    [helperA, channelIdA, "HelperA"],
-    [helperB, channelIdB, "HelperB"],
+  const helpers: Array<[Node, string]> = [
+    [helperA, "HelperA"],
+    [helperB, "HelperB"],
   ];
 
   for (let i = 0; i < outbound.length; i++) {
-    const msg = outbound[i]!;
-    const [helperSide, , label] = helpers[i]!;
+    const request = outbound[i]!.message;
+    const [helper, hLabel] = helpers[i]!;
 
-    console.log(`\n  [${label}] process(StoreShareRequest)  ${msg.message.length} bytes`);
-    const helperEvents = await helperSide.protocol.process(msg.message);
-    const storeEv = requireEvent(helperEvents, "ShareStored", label);
-    console.log(`          → ShareStored(channel_id=${storeEv.channel_id}, version=${storeEv.version})`);
+    const helperEvents = await processAll(helper, request);
+    const stored = requireEvent(helperEvents, "ShareStored", hLabel);
+    console.log(
+      `  [${hLabel}] processAll(StoreShareRequest) → ShareStored(channel_id=${stored.channel_id}, version=${stored.version})`,
+    );
 
-    const [storeResp] = helperSide.transport.drain();
-    if (!storeResp) throw new Error(`${label}: missing StoreShareResponse`);
-    console.log(`  [${label}] sent StoreShareResponse  ${storeResp.message.length} bytes`);
+    const response = drainOne(helper, hLabel);
+    const ownerEvents = await owner.protocol.process(response);
+    const confirmed = requireEvent(ownerEvents, "ShareConfirmed", "Owner");
+    console.log(
+      `  [Owner]  process(StoreShareResponse) → ShareConfirmed(channel_id=${confirmed.channel_id}, version=${confirmed.version})`,
+    );
+  }
 
-    const ownerEvents = await owner.protocol.process(storeResp.message);
-    const confirmEv = requireEvent(ownerEvents, "ShareConfirmed", "Owner");
-    console.log(`  [Owner]  ShareConfirmed(channel_id=${confirmEv.channel_id}, version=${confirmEv.version})`);
+  const tail = owner.transport.drain();
+  const finalEvents =
+    tail.length > 0 ? await owner.protocol.process(tail[0]!.message) : [];
+  // SharingComplete is emitted once the final confirmation is processed; if it
+  // already arrived in the loop above, re-running process on a drained tail is
+  // a no-op. Accept either ordering.
+  const sharing = [...finalEvents].find((e) => e.type === "SharingComplete") as
+    | Extract<DeRecEvent, { type: "SharingComplete" }>
+    | undefined;
+  if (sharing) {
+    console.log(
+      `  [Owner]  SharingComplete(confirmed=${sharing.confirmed_count}, failed=${sharing.failed_count}, threshold_met=${sharing.threshold_met})`,
+    );
   }
 
   console.log("\n✓ Sharing flow passed.\n");
@@ -284,136 +441,220 @@ async function runSharingFlow(): Promise<void> {
 async function runDiscoveryAndRecoveryFlow(): Promise<void> {
   console.log("=== [Protocol] Discovery & Recovery Flow ===\n");
 
-  const owner = makeProtocol("https://owner.example.com");
-  const helper = makeProtocol("https://helper.example.com");
+  const ownerSecretId = 123n;
+  const owner = makeNode("Owner", "https://owner.example.com", ownerSecretId);
+  const helper = makeNode("Helper", "https://helper.example.com", 7n);
   const channelId = 1n;
   const recoveryChannelId = 100n;
 
-  const secretId = new Uint8Array([10, 20, 30, 40]);
-  const secretData = new TextEncoder().encode("correct horse battery staple");
-  const secretVersion = 1;
+  const description = "wallet seed phrase";
+  const secretBytes = new TextEncoder().encode("correct horse battery staple");
 
-  // ── Initial pairing & sharing ──────────────────────────────────────────────
+  // ── Setup: initial pairing & sharing ───────────────────────────────────────
 
   console.log("  -- Setup: initial pairing & sharing --\n");
 
-  await doPair(owner, helper, SenderKind.Helper, channelId, "InitialPairing");
+  await doPair(helper, owner, channelId, "InitialPairing");
   console.log();
 
-  await owner.protocol.protectSecret(
-    secretId, secretData, "wallet seed phrase", secretVersion,
-    1 /* threshold */, [channelId], [],
-  );
-  const [storeReq] = owner.transport.drain();
-  if (!storeReq) throw new Error("missing StoreShareRequest");
-  console.log(`  [Owner]  protectSecret  → StoreShareRequest: ${storeReq.message.length} bytes`);
+  await owner.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([1]), name: "wallet", data: secretBytes }],
+    description,
+  });
+  const storeReq = drainOne(owner, "Owner");
+  console.log(`  [Owner]  start(ProtectSecret) → StoreShareRequest ${storeReq.length}B`);
 
-  await helper.protocol.process(storeReq.message);
-  const [storeResp] = helper.transport.drain();
-  if (!storeResp) throw new Error("missing StoreShareResponse");
-  const ownerConfirmEvents = await owner.protocol.process(storeResp.message);
-  requireEvent(ownerConfirmEvents, "ShareConfirmed", "Owner");
-  console.log(`  [Helper] share stored  [Owner] ShareConfirmed\n`);
+  const helperStoreEvents = await processAll(helper, storeReq);
+  requireEvent(helperStoreEvents, "ShareStored", "Helper");
+  const storeResp = drainOne(helper, "Helper");
+  const ownerConfirm = await owner.protocol.process(storeResp);
+  requireEvent(ownerConfirm, "ShareConfirmed", "Owner");
+  console.log("  [Helper] share stored  [Owner] ShareConfirmed\n");
 
-  // ── Recovery pairing ───────────────────────────────────────────────────────
+  // ── Recovery: re-pair on a NEW channel ─────────────────────────────────────
 
   console.log("  -- Recovery: re-pair on a new channel --\n");
 
-  const recoveryContactBytes = await helper.protocol.createContact(recoveryChannelId);
-  console.log(`  [Helper] create_contact (recovery)  channel_id=${recoveryChannelId}  (${recoveryContactBytes.length} bytes)`);
+  // The helper provisions a fresh contact for the recovery channel and then
+  // LINKS the original channel to the recovery channel in its channel store.
+  // Linking moves no data; recovery resolves the linked set via
+  // `linkedChannels` and feeds it to `loadMany`.
+  const recoveryContact: ContactMessage =
+    await helper.protocol.createContact(recoveryChannelId);
+  console.log(
+    `  [Helper] createContact (recovery) channel_id=${recoveryContact.channel_id}`,
+  );
 
-  helper.shareStore.copyShare(
+  await helper.channelStore.linkChannel(
     channelId.toString(),
     recoveryChannelId.toString(),
-    secretId,
-    secretVersion,
   );
-  console.log(`  [Helper] share copied to recovery channel (app-layer contact remapping)`);
+  console.log(
+    `  [Helper] linkChannel(${channelId} ↔ ${recoveryChannelId}) (no data moved)`,
+  );
 
-  await owner.protocol.startPairing(SenderKind.OwnerRecovery, recoveryContactBytes);
-  const [recovReq] = owner.transport.drain();
-  if (!recovReq) throw new Error("missing recovery PairRequest");
-  console.log(`  [Owner]  start_pairing(kind=OwnerRecovery)  → PairRequest: ${recovReq.message.length} bytes`);
+  await owner.protocol.start(FlowKind.Pairing, {
+    kind: SenderKind.Owner,
+    contact: recoveryContact,
+  });
+  const recovReq = drainOne(owner, "Owner");
+  console.log(`  [Owner]  start(Pairing, kind=Owner) → PairRequest ${recovReq.length}B`);
 
-  const helperPairEvents = await helper.protocol.process(recovReq.message);
-  const helperPairing = requireEvent(helperPairEvents, "PairingComplete", "Helper");
-  console.log(`  [Helper] process(recovery PairRequest)  → PairingComplete(kind=${kindName(helperPairing.kind)})`);
+  const helperPairEvents = await processAll(helper, recovReq);
+  const helperPairing = requireEvent(
+    helperPairEvents,
+    "PairingCompleted",
+    "Helper",
+  );
+  const recovResp = drainOne(helper, "Helper");
+  console.log(
+    `  [Helper] processAll(recovery PairRequest) → PairingCompleted(kind=${kindName(helperPairing.kind)})`,
+  );
 
-  const [recovResp] = helper.transport.drain();
-  if (!recovResp) throw new Error("missing recovery PairResponse");
-
-  const ownerPairEvents = await owner.protocol.process(recovResp.message);
-  const ownerPairing = requireEvent(ownerPairEvents, "PairingComplete", "Owner");
-  console.log(`  [Owner]  process(recovery PairResponse)  → PairingComplete(kind=${kindName(ownerPairing.kind)})`);
-
-  if (ownerPairing.kind !== SenderKind.OwnerRecovery) {
-    throw new Error(`expected kind=OwnerRecovery, got ${kindName(ownerPairing.kind)}`);
+  const ownerPairEvents = await processAll(owner, recovResp);
+  const ownerPairing = requireEvent(
+    ownerPairEvents,
+    "PairingCompleted",
+    "Owner",
+  );
+  if (ownerPairing.kind !== SenderKind.Owner) {
+    throw new Error(`expected kind=Owner, got ${kindName(ownerPairing.kind)}`);
   }
-  console.log(`\n  Recovery pairing complete  channel_id=${recoveryChannelId}\n`);
+  console.log(
+    `  [Owner]  process(recovery PairResponse) → PairingCompleted(kind=${kindName(ownerPairing.kind)})\n`,
+  );
 
   // ── Discovery ──────────────────────────────────────────────────────────────
 
   console.log("  -- Discovery: Owner asks Helper which secrets it holds --\n");
 
-  await owner.protocol.requestDiscovery(recoveryChannelId);
-  const [discReq] = owner.transport.drain();
-  if (!discReq) throw new Error("missing GetSecretIdsVersionsRequest");
-  console.log(`  [Owner]  requestDiscovery  → GetSecretIdsVersionsRequest: ${discReq.message.length} bytes`);
+  await owner.protocol.start(FlowKind.Discovery, { target: recoveryChannelId });
+  const discReq = drainOne(owner, "Owner");
+  console.log(`  [Owner]  start(Discovery) → DiscoveryRequest ${discReq.length}B`);
 
-  await helper.protocol.process(discReq.message);
-  const [discResp] = helper.transport.drain();
-  if (!discResp) throw new Error("missing GetSecretIdsVersionsResponse");
-  console.log(`  [Helper] process(discovery request)  → GetSecretIdsVersionsResponse: ${discResp.message.length} bytes`);
-
-  const discEvents = await owner.protocol.process(discResp.message);
-  const discEv = requireEvent(discEvents, "SecretsDiscovered", "Owner");
-  console.log(`  [Owner]  SecretsDiscovered  channel_id=${discEv.channel_id}  secrets=${discEv.secrets.length}`);
-
-  const walletEntry = discEv.secrets.find(
-    (s) =>
-      s.secret_id.length === secretId.length &&
-      s.secret_id.every((b, i) => b === secretId[i]),
-  );
-  if (!walletEntry) throw new Error("wallet seed not found in SecretsDiscovered");
-
-  const walletVersion = walletEntry.versions.find((v) => v.version === secretVersion);
-  if (!walletVersion) throw new Error(`version ${secretVersion} not in discovered entry`);
-  if (walletVersion.description !== "wallet seed phrase") {
-    throw new Error(`description mismatch: "${walletVersion.description}"`);
+  const helperDiscEvents = await processAll(helper, discReq);
+  // Discovery on the helper is handled via an auto-accepted ActionRequired.
+  if (helperDiscEvents.length === 0) {
+    throw new Error("Helper produced no events for discovery request");
   }
-  console.log(`    secret_id=${walletEntry.secret_id.length}B  version=${walletVersion.version}  description="${walletVersion.description}"  ✓`);
-  console.log(`\n  Description round-tripped through discovery correctly.\n`);
+  const discResp = drainOne(helper, "Helper");
+  console.log(`  [Helper] processAll(DiscoveryRequest) → DiscoveryResponse ${discResp.length}B`);
+
+  const discEvents = await owner.protocol.process(discResp);
+  const discovered = requireEvent(discEvents, "SecretsDiscovered", "Owner");
+  console.log(
+    `  [Owner]  SecretsDiscovered channel_id=${discovered.channel_id} secrets=${discovered.secrets.length}`,
+  );
+
+  const entry = discovered.secrets.find(
+    (s) => s.secret_id === String(ownerSecretId),
+  );
+  if (!entry) {
+    throw new Error(
+      `secret ${ownerSecretId} not in SecretsDiscovered (got [${discovered.secrets
+        .map((s) => s.secret_id)
+        .join(", ")}])`,
+    );
+  }
+  const versionEntry = entry.versions.find((v) => v.version === 1);
+  if (!versionEntry) throw new Error("version 1 not in discovered entry");
+  if (versionEntry.description !== description) {
+    throw new Error(
+      `description mismatch: "${versionEntry.description}" !== "${description}"`,
+    );
+  }
+  console.log(
+    `    secret_id=${entry.secret_id} version=${versionEntry.version} description="${versionEntry.description}" ✓\n`,
+  );
 
   // ── Recovery ───────────────────────────────────────────────────────────────
 
   console.log("  -- Recovery: collect share and reconstruct secret --\n");
 
-  await owner.protocol.recoverSecret(secretId, secretVersion, [recoveryChannelId]);
-  const [shareReq] = owner.transport.drain();
-  if (!shareReq) throw new Error("missing GetShareRequest");
-  console.log(`  [Owner]  recoverSecret  → GetShareRequest: ${shareReq.message.length} bytes`);
+  await owner.protocol.start(FlowKind.RecoverSecret, {
+    secretId: ownerSecretId,
+    version: 1,
+  });
+  const shareReq = drainOne(owner, "Owner");
+  console.log(`  [Owner]  start(RecoverSecret) → GetShareRequest ${shareReq.length}B`);
 
-  await helper.protocol.process(shareReq.message);
-  const [shareResp] = helper.transport.drain();
-  if (!shareResp) throw new Error("missing GetShareResponse");
-  console.log(`  [Helper] process(GetShareRequest)  → GetShareResponse: ${shareResp.message.length} bytes`);
+  const helperShareEvents = await processAll(helper, shareReq);
+  if (helperShareEvents.length === 0) {
+    throw new Error("Helper produced no events for recovery share request");
+  }
+  const shareResp = drainOne(helper, "Helper");
+  console.log(`  [Helper] processAll(GetShareRequest) → GetShareResponse ${shareResp.length}B`);
 
-  const recovEvents = await owner.protocol.process(shareResp.message);
-  const recovEv = requireEvent(recovEvents, "SecretRecovered", "Owner");
-
-  if (!recovEv.secret || recovEv.secret.length === 0) {
+  const recovEvents = await owner.protocol.process(shareResp);
+  const recovered = requireEvent(recovEvents, "SecretRecovered", "Owner");
+  if (!recovered.secret || recovered.secret.length === 0) {
     throw new Error("SecretRecovered: empty secret bytes");
   }
-  const originalBytes = new TextEncoder().encode("correct horse battery staple");
   if (
-    recovEv.secret.length !== originalBytes.length ||
-    !recovEv.secret.every((b, i) => b === originalBytes[i])
+    recovered.secret.length !== secretBytes.length ||
+    !recovered.secret.every((b, i) => b === secretBytes[i])
   ) {
     throw new Error("SecretRecovered: bytes do not match original secret");
   }
-  console.log(`  [Owner]  SecretRecovered  ${recovEv.secret.length} bytes — matches original ✓`);
+  console.log(
+    `  [Owner]  SecretRecovered ${recovered.secret.length}B — matches original ✓`,
+  );
 
   console.log("\n✓ Discovery & Recovery flow passed.\n");
+}
+
+// ── Sub-test: unpairing flow ──────────────────────────────────────────────────
+//
+// Verifies that an Owner-initiated unpair (Required-ack mode, the default)
+// produces a successful round-trip:
+//   1. Owner → Helper: UnpairRequest
+//   2. Helper processes → ActionRequired(Unpair) → accept() → Unpaired event
+//      + UnpairResponse(Ok) outbound
+//   3. Owner processes the response → Unpaired event + local state dropped
+async function runUnpairingFlow(): Promise<void> {
+  console.log("=== [Protocol] Unpairing Flow ===\n");
+
+  const owner = makeNode("Owner", "https://owner.example.com", 1n);
+  const helper = makeNode("Helper", "https://helper.example.com", 2n);
+  const channelId = 7n;
+
+  await doPair(helper, owner, channelId, "Unpair");
+  console.log();
+
+  // Initiate unpair on the Owner side.
+  await owner.protocol.start(FlowKind.Unpair, {
+    target: channelId,
+    memo: "decommissioning",
+  });
+  const unpairRequest = drainOne(owner, "Owner");
+  console.log(
+    `  [Owner]  start(Unpair) → UnpairRequest ${unpairRequest.length}B`,
+  );
+
+  // Helper auto-accepts (processAll satisfies ActionRequired events).
+  const helperEvents = await processAll(helper, unpairRequest);
+  const helperUnpaired = requireEvent(helperEvents, "Unpaired", "Helper");
+  if (helperUnpaired.channel_id !== channelId.toString()) {
+    throw new Error(
+      `Helper Unpaired channel_id mismatch: ${helperUnpaired.channel_id} ≠ ${channelId}`,
+    );
+  }
+  const unpairResponse = drainOne(helper, "Helper");
+  console.log(
+    `  [Helper] processAll(UnpairRequest) → Unpaired + UnpairResponse ${unpairResponse.length}B`,
+  );
+
+  // Owner processes the Ok response → Unpaired event + state dropped.
+  const ownerEvents = await processAll(owner, unpairResponse);
+  const ownerUnpaired = requireEvent(ownerEvents, "Unpaired", "Owner");
+  if (ownerUnpaired.channel_id !== channelId.toString()) {
+    throw new Error(
+      `Owner Unpaired channel_id mismatch: ${ownerUnpaired.channel_id} ≠ ${channelId}`,
+    );
+  }
+  console.log(`  [Owner]  processAll(UnpairResponse) → Unpaired`);
+
+  console.log("\n✓ Unpairing flow passed.\n");
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -424,6 +665,7 @@ export async function runProtocolSmoke(): Promise<void> {
   await runPairingFlow();
   await runSharingFlow();
   await runDiscoveryAndRecoveryFlow();
+  await runUnpairingFlow();
 
   console.log("━━━ [Protocol] All passed. ━━━\n");
 }

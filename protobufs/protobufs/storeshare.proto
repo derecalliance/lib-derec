@@ -103,12 +103,12 @@ message StoreShareRequestMessage {
   //
   // Used by the Helper to associate the share with the correct secret in the
   // share store under the composite key (channel_id, secret_id, version).
-  bytes secretId = 3;
+  uint64 secretId = 3;
 
   // Version number of the share.
   //
   // Each resharing event increments this value.
-  int32 version = 4;
+  uint32 version = 4;
 
   // List of share versions that MUST be retained by the Helper.
   //
@@ -121,7 +121,7 @@ message StoreShareRequestMessage {
   //
   // This field MUST be ignored if `version` is older than the latest
   // version already stored, to prevent replay attacks.
-  repeated int32 keepList = 5;
+  repeated uint32 keepList = 5;
 
   // Optional human-readable description of this share version.
   //
@@ -160,12 +160,12 @@ message StoreShareResponseMessage {
   // Echoed from the corresponding StoreShareRequestMessage so the Owner can
   // correlate responses with the correct secret without inspecting the share
   // bytes.
-  bytes secretId = 2;
+  uint64 secretId = 2;
 
   // Version number from the corresponding request.
   //
   // This allows the sender to correlate responses with requests.
-  int32 version = 3;
+  uint32 version = 3;
 
   // Timestamp indicating when this message was created.
   //

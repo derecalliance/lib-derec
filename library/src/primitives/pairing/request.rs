@@ -170,7 +170,7 @@ pub fn create_contact(
 /// # Arguments
 ///
 /// * `kind` - Role of the sender within the DeRec protocol (for example
-///   `OwnerNonRecovery`, `OwnerRecovery`, or `Helper`)
+///   `Owner`, `Helper`, or `Replica`)
 /// * `transport_protocol` - Transport endpoint the initiator can use to reach this responder
 ///   for subsequent protocol traffic. The `uri` field must not be empty or whitespace-only.
 /// * `contact_message` - The decoded [`derec_proto::ContactMessage`] received from the

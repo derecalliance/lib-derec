@@ -2,7 +2,7 @@
 
 use super::super::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport,
-    PendingAction, SecretKind, SecretValue,
+    PendingAction, SecretKind, SecretValue, Share,
 };
 use super::peer_endpoint;
 use crate::{
@@ -55,7 +55,11 @@ pub(in crate::protocol) async fn accept<
     let resp = sharing_response::produce(channel_id, request, shared_key)?;
 
     share_store
-        .save(channel_id, version, encoded_request)
+        .save(channel_id, Share {
+            secret_id: request.secret_id,
+            version,
+            bytes: encoded_request,
+        })
         .await?;
 
     let endpoint = peer_endpoint(channel_store, channel_id).await?;
@@ -84,7 +88,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
             status: status as i32,
             memo: memo.to_owned(),
         }),
-        secret_id: request.secret_id.clone(),
+        secret_id: request.secret_id,
         version: request.version,
         timestamp: Some(current_timestamp()),
     };
@@ -117,8 +121,8 @@ pub(in crate::protocol) async fn start<
     description: Option<String>,
     threshold: usize,
     keep_versions_count: usize,
-    secret_id: &[u8],
-) -> Result<(i32, Vec<ChannelId>)> {
+    secret_id: u64,
+) -> Result<(u32, Vec<ChannelId>)> {
     let all_channels = channel_store.channels().await?;
     let mut paired_helpers: Vec<(crate::types::Channel, SharedKey)> = Vec::new();
 
@@ -135,13 +139,16 @@ pub(in crate::protocol) async fn start<
         return Err(Error::InvalidInput("no paired helpers available"));
     }
 
+    // Copy the channel's app-level identity metadata verbatim into the
+    // bag's per-helper record. The protocol never inspects keys — the
+    // recovering owner's app reads whatever the producer put there.
     let helper_infos: Vec<HelperInfo> = paired_helpers
         .iter()
         .map(|(channel, shared_key)| HelperInfo {
             channel_id: channel.id.0,
             transport_uri: channel.transport.uri.to_owned(),
-            name: channel.name.to_owned(),
             shared_key: shared_key.to_vec(),
+            communication_info: channel.communication_info.clone(),
         })
         .collect();
 
@@ -162,8 +169,8 @@ pub(in crate::protocol) async fn start<
 
     let version = share_store.latest_version().await?.map_or(1, |v| v + 1);
 
-    let keep_list: Vec<i32> = {
-        let start = (version - keep_versions_count as i32 + 1).max(1);
+    let keep_list: Vec<u32> = {
+        let start = version.saturating_sub(keep_versions_count as u32 - 1).max(1);
         (start..=version).collect()
     };
 
@@ -175,6 +182,7 @@ pub(in crate::protocol) async fn start<
         &secret_data,
         threshold,
     )?;
+
 
     let desc = description.as_deref().unwrap_or("");
     let mut sent_channels: Vec<ChannelId> = Vec::new();
@@ -196,7 +204,11 @@ pub(in crate::protocol) async fn start<
         transport.send(&channel.transport, msg.envelope).await?;
 
         share_store
-            .save(channel.id, version, committed_share.encode_to_vec())
+            .save(channel.id, Share {
+                secret_id,
+                version,
+                bytes: committed_share.encode_to_vec(),
+            })
             .await?;
 
         sent_channels.push(channel.id);

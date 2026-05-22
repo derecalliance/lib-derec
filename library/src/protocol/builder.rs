@@ -23,7 +23,9 @@
 
 use std::collections::HashMap;
 
-use super::{DeRecChannelStore, DeRecProtocol, DeRecSecretStore, DeRecShareStore, DeRecTransport};
+use super::{
+    DeRecChannelStore, DeRecProtocol, DeRecSecretStore, DeRecShareStore, DeRecTransport, UnpairAck,
+};
 use derec_proto::TransportProtocol;
 
 pub struct BuilderSlotMissingMarker;
@@ -45,10 +47,11 @@ pub struct DeRecProtocolBuilder<ChannelStore, ShareStore, SecretStore, Transport
     own_transport: OwnTransport,
     threshold: usize,
     keep_versions_count: usize,
-    secret_id: Vec<u8>,
+    secret_id: u64,
     timeout_in_secs: u64,
     communication_info: HashMap<String, String>,
     auto_respond_on_failure: bool,
+    unpair_ack: UnpairAck,
 }
 
 impl
@@ -71,10 +74,11 @@ impl
             own_transport: BuilderSlotMissingMarker,
             threshold: 3,
             keep_versions_count: 3,
-            secret_id: Vec::new(),
+            secret_id: 0,
             timeout_in_secs: 300,
             communication_info: HashMap::new(),
             auto_respond_on_failure: false,
+            unpair_ack: UnpairAck::Required,
         }
     }
 }
@@ -107,7 +111,7 @@ impl<ChannelStore, ShareStore, SecretStore, Transport, OwnTransport>
     }
 
     /// Application-provided secret identifier for this protocol instance.
-    pub fn with_secret_id(mut self, secret_id: Vec<u8>) -> Self {
+    pub fn with_secret_id(mut self, secret_id: u64) -> Self {
         self.secret_id = secret_id;
         self
     }
@@ -133,6 +137,18 @@ impl<ChannelStore, ShareStore, SecretStore, Transport, OwnTransport>
     /// decryption failures). Default: `false`.
     pub fn with_auto_respond_on_failure(mut self, enabled: bool) -> Self {
         self.auto_respond_on_failure = enabled;
+        self
+    }
+
+    /// Whether the unpair initiator waits for the peer's acknowledgement
+    /// before dropping local state.
+    ///
+    /// - [`UnpairAck::Required`] (default): keep state until the peer
+    ///   confirms with `Ok` or the configured protocol timeout elapses.
+    /// - [`UnpairAck::NotRequired`]: drop state immediately on
+    ///   `start(Unpair)` and ignore any later response (fire-and-forget).
+    pub fn with_unpair_ack(mut self, ack: UnpairAck) -> Self {
+        self.unpair_ack = ack;
         self
     }
 }
@@ -162,6 +178,7 @@ impl<ShareStore, SecretStore, Transport, OwnTransport>
             timeout_in_secs: self.timeout_in_secs,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
+            unpair_ack: self.unpair_ack,
         }
     }
 }
@@ -197,6 +214,7 @@ impl<ChannelStore, SecretStore, Transport, OwnTransport>
             timeout_in_secs: self.timeout_in_secs,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
+            unpair_ack: self.unpair_ack,
         }
     }
 }
@@ -232,6 +250,7 @@ impl<ChannelStore, ShareStore, Transport, OwnTransport>
             timeout_in_secs: self.timeout_in_secs,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
+            unpair_ack: self.unpair_ack,
         }
     }
 }
@@ -267,6 +286,7 @@ impl<ChannelStore, ShareStore, SecretStore, OwnTransport>
             timeout_in_secs: self.timeout_in_secs,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
+            unpair_ack: self.unpair_ack,
         }
     }
 }
@@ -296,6 +316,7 @@ impl<ChannelStore, ShareStore, SecretStore, Transport>
             timeout_in_secs: self.timeout_in_secs,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
+            unpair_ack: self.unpair_ack,
         }
     }
 }
@@ -323,6 +344,7 @@ impl<Cs: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, Tr: DeRec
         );
         protocol.communication_info = self.communication_info;
         protocol.auto_respond_on_failure = self.auto_respond_on_failure;
+        protocol.unpair_ack = self.unpair_ack;
         protocol
     }
 }
