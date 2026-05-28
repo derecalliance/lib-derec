@@ -16,7 +16,7 @@ use wasm_bindgen::prelude::*;
 #[derive(Serialize, Deserialize, Clone)]
 pub struct GetShareRequestMessage {
     pub secret_id: u64,
-    pub share_version: u32,
+    pub version: u32,
     pub timestamp: Option<Timestamp>,
 }
 
@@ -24,7 +24,7 @@ impl From<derec_proto::GetShareRequestMessage> for GetShareRequestMessage {
     fn from(value: derec_proto::GetShareRequestMessage) -> Self {
         Self {
             secret_id: value.secret_id,
-            share_version: value.share_version,
+            version: value.version,
             timestamp: value.timestamp.map(Into::into),
         }
     }
@@ -34,7 +34,7 @@ impl From<GetShareRequestMessage> for derec_proto::GetShareRequestMessage {
     fn from(value: GetShareRequestMessage) -> Self {
         Self {
             secret_id: value.secret_id,
-            share_version: value.share_version,
+            version: value.version,
             timestamp: value.timestamp.map(Into::into),
         }
     }

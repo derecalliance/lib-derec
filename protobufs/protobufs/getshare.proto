@@ -24,7 +24,7 @@ package org.derecalliance.derec.protobuf;
 // The request identifies a share by:
 //
 // - `secretId`: the identifier of the protected secret
-// - `shareVersion`: the version of the share distribution
+// - `version`: the version of the share distribution
 //
 // The Helper is expected to locate the corresponding share and return it
 // in a GetShareResponseMessage.
@@ -44,7 +44,7 @@ package org.derecalliance.derec.protobuf;
 // # Idempotency
 //
 // This request is idempotent. Repeated requests for the same (secretId,
-// shareVersion) pair SHOULD return the same result.
+// version) pair SHOULD return the same result.
 message GetShareRequestMessage {
 
   // Numeric identifier of the secret for which the share is requested.
@@ -58,7 +58,7 @@ message GetShareRequestMessage {
   // Each time a secret is reshared (e.g., due to updates or changes in
   // helper set), a new version is created. This field specifies which
   // version of the share should be returned.
-  uint32 shareVersion = 2;
+  uint32 version = 2;
 
   // Timestamp indicating when this message was created.
   //
@@ -105,7 +105,7 @@ message GetShareRequestMessage {
 //
 // # Idempotency
 //
-// For a given (secretId, shareVersion), repeated responses SHOULD return
+// For a given (secretId, version), repeated responses SHOULD return
 // the same share data.
 message GetShareResponseMessage {
 
@@ -133,4 +133,19 @@ message GetShareResponseMessage {
   // This value is expressed in UTC and can be used for observability,
   // replay detection, and timeout handling.
   google.protobuf.Timestamp timestamp = 4;
+
+  // Identifier of the secret to which this response refers.
+  //
+  // Echoed from the corresponding GetShareRequestMessage so the Owner can
+  // correlate responses with the correct pending recovery without inspecting
+  // the share bytes. Required when the Owner has multiple recoveries in
+  // progress concurrently, or to defend against stale responses from a
+  // previously-abandoned recovery attempt.
+  uint64 secretId = 5;
+
+  // Version of the share being returned.
+  //
+  // Echoed from the corresponding GetShareRequestMessage for the same
+  // correlation reasons as `secretId`.
+  uint32 version = 6;
 }

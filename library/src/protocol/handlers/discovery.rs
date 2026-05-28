@@ -2,7 +2,7 @@
 
 use super::super::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport,
-    PendingAction, SecretKind, SecretValue,
+    MissingPolicy, PendingAction, SecretKind, SecretValue,
 };
 use super::peer_endpoint;
 use crate::{
@@ -51,20 +51,35 @@ pub(in crate::protocol) async fn start<
     transport: &T,
     target: Target,
 ) -> Result<()> {
-    let channel_ids = match target {
-        Target::All => {
-            let channels = channel_store.channels().await?;
-            channels.into_iter().map(|ch| ch.id).collect::<Vec<_>>()
+    // Filter Target::Single/Many to known channels; user input may include
+    // unpaired ids and those would otherwise trip the invariant check below.
+    let known_channel_ids: std::collections::HashSet<ChannelId> = channel_store
+        .channels()
+        .await?
+        .into_iter()
+        .map(|ch| ch.id)
+        .collect();
+    let channel_ids: Vec<ChannelId> = match target {
+        Target::All => known_channel_ids.iter().copied().collect(),
+        Target::Single(id) => {
+            if known_channel_ids.contains(&id) {
+                vec![id]
+            } else {
+                vec![]
+            }
         }
-        Target::Single(id) => vec![id],
-        Target::Many(ids) => ids,
+        Target::Many(ids) => ids
+            .into_iter()
+            .filter(|id| known_channel_ids.contains(id))
+            .collect(),
     };
 
-    for channel_id in channel_ids {
-        let Some(SecretValue::SharedKey(shared_key)) =
-            // TODO: add a new function load_many
-            secret_store.load(channel_id, SecretKind::SharedKey).await?
-        else {
+    let keys = secret_store
+        .load_many(&channel_ids, SecretKind::SharedKey, MissingPolicy::Fail)
+        .await?;
+
+    for (channel_id, value) in keys {
+        let SecretValue::SharedKey(shared_key) = value else {
             continue;
         };
 

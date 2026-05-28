@@ -56,6 +56,19 @@ class InMemorySecretStore implements SecretStore {
     return this.data.get(this.key(channelId, kind)) ?? null;
   }
 
+  // `missingPolicy` is honored by the Rust adapter; this in-memory impl
+  // always returns nulls in input order and lets the adapter apply the
+  // policy. A real backend (SQL, network) might choose to throw on `"fail"`.
+  async loadMany(
+    channelIds: string[],
+    kind: 0 | 1 | 2,
+    _missingPolicy: "skip" | "fail",
+  ): Promise<Array<Uint8Array | null>> {
+    return channelIds.map(
+      (id) => this.data.get(this.key(id, kind)) ?? null,
+    );
+  }
+
   async save(channelId: string, kind: 0 | 1 | 2, value: Uint8Array): Promise<void> {
     this.data.set(this.key(channelId, kind), value);
   }

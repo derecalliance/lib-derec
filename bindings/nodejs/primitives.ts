@@ -3,41 +3,25 @@
 // Primitives smoke tests: exercises every flow using the low-level
 // `primitives.*` API (raw message produce / extract / process functions).
 //
-// Mirrors the current Rust primitive smoke test
-// (`bindings/rust/src/primitives.rs`) one-for-one, against the post-refactor
-// signatures:
-//   - `secret_id` is a u64 → pass a `bigint`
-//   - `version` is a u32 → pass a `number`
-//   - channel ids are u64 → pass a `bigint`
-//   - shared keys / serialized material are `Uint8Array`
-//   - pairing responses go through `pairing.response.accept` (the old
-//     `pairing.response.produce` was removed) then `pairing.response.process`
-//
-// The `primitives` namespace is the `any`-typed escape hatch from
-// `@derec-alliance/nodejs`; every step's argument/return object shape is
-// documented in `library/src/wasm/primitives/*`. Returns are deliberately
-// untyped, so this file pins the relevant fields explicitly.
+// Mirrors the Rust primitive smoke test (`bindings/rust/src/primitives.rs`).
+// The chain in each flow is request.produce → request.extract → response.produce
+// → response.extract → response.process, matching the current Rust signatures
+// one-for-one.
 
-import { primitives, SenderKind } from "@derec-alliance/nodejs";
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
+import {
+  primitives,
+  SenderKind,
+  type ContactMessage,
+  type GetShareResponseMessage,
+  type PairRequestMessage,
+  type PairResponseMessage,
+  type SecretVersionEntry,
+  type StoreShareRequestMessage,
+} from "@derec-alliance/nodejs";
 
 function sharedKey(byte: number): Uint8Array {
   return new Uint8Array(32).fill(byte);
 }
-
-function asBytes(value: unknown): Uint8Array {
-  if (value instanceof Uint8Array) return value;
-  if (Array.isArray(value)) return new Uint8Array(value as number[]);
-  throw new Error(`expected byte array, got ${typeof value}`);
-}
-
-interface DiscoveredEntry {
-  secret_id: number;
-  versions: Array<{ version: number; description: string }>;
-}
-
-// ── Entry point ───────────────────────────────────────────────────────────────
 
 export function runPrimitivesSmoke(): void {
   console.log("━━━ [Primitives] Starting ━━━\n");
@@ -49,442 +33,211 @@ export function runPrimitivesSmoke(): void {
   const version = 1;
 
   const sharedKeys = new Map<bigint, Uint8Array>();
-  sharedKeys.set(1n, sharedKey(1));
-  sharedKeys.set(2n, sharedKey(2));
-  sharedKeys.set(3n, sharedKey(3));
-
-  const keyFor = (channelId: bigint): Uint8Array => {
-    const key = sharedKeys.get(channelId);
-    if (!key) throw new Error(`missing shared key for channel ${channelId}`);
-    return key;
+  for (const id of channelIds) sharedKeys.set(id, sharedKey(Number(id)));
+  const keyFor = (id: bigint): Uint8Array => {
+    const k = sharedKeys.get(id);
+    if (!k) throw new Error(`missing shared key for channel ${id}`);
+    return k;
   };
 
-  // ── Sharing flow ────────────────────────────────────────────────────────────
+  // ── Sharing ───────────────────────────────────────────────────────────────
 
   console.log("=== [Primitives] Sharing Flow ===");
 
-  const splitResult = primitives.sharing.request.split(
-    secretId,
-    secretData,
+  const { shares } = primitives.sharing.request.split(
     channelIds,
-    threshold,
+    secretId,
     version,
+    secretData,
+    threshold,
   );
-
-  // Wire shape: `{ value: { [channelId: u64]: Uint8Array } }`. Tolerate Map /
-  // array-of-pairs / plain-object encodings since `serde_wasm_bindgen` map
-  // serialization can vary by host.
-  const shares = new Map<bigint, Uint8Array>();
-  const splitValue: unknown = (splitResult as { value?: unknown } | null)?.value;
-
-  if (splitValue instanceof Map) {
-    for (const [k, v] of splitValue.entries()) {
-      shares.set(BigInt(k as string | number | bigint), asBytes(v));
-    }
-  } else if (Array.isArray(splitValue)) {
-    for (const entry of splitValue as unknown[]) {
-      if (Array.isArray(entry) && entry.length === 2) {
-        shares.set(BigInt(entry[0] as string | number | bigint), asBytes(entry[1]));
-      }
-    }
-  } else if (splitValue && typeof splitValue === "object") {
-    for (const [k, v] of Object.entries(splitValue as Record<string, unknown>)) {
-      shares.set(BigInt(k), asBytes(v));
-    }
-  } else {
-    throw new Error(
-      `Unexpected split result shape: ${JSON.stringify(splitResult)}`,
-    );
-  }
-
   if (shares.size !== channelIds.length) {
     throw new Error(
       `Sharing failed: expected ${channelIds.length} shares, got ${shares.size}`,
     );
   }
 
-  // The Helper persists the decrypted StoreShareRequest envelope; recovery and
-  // verification both reuse it as the stored-request input.
-  const storedEnvelopes = new Map<bigint, unknown>();
+  // Helper-side persisted store-share inner request — reused later by
+  // verification and recovery, mirroring how a real helper would persist it.
+  const storedShareRequests = new Map<bigint, StoreShareRequestMessage>();
 
-  for (const [channelId, shareBytes] of shares.entries()) {
-    console.log(
-      `  [split] channel=${channelId}  committed_share=${shareBytes.length} bytes`,
-    );
-    if (shareBytes.length === 0) {
-      throw new Error(
-        `Sharing failed: empty CommittedDeRecShare for channel ${channelId}`,
-      );
-    }
+  for (const id of channelIds) {
+    const key = keyFor(id);
+    const committedShare = shares.get(id);
+    if (!committedShare) throw new Error(`no committed share for channel ${id}`);
 
-    const decoded = primitives.sharing.decode_committed_share(shareBytes) as {
-      de_rec_share?: { version?: number; x?: Uint8Array; y?: Uint8Array };
-      commitment?: Uint8Array;
-      merkle_path?: unknown[];
-    };
-    console.log(
-      `    de_rec_share.version=${decoded.de_rec_share?.version}  ` +
-        `x=${decoded.de_rec_share?.x?.length ?? 0}B  ` +
-        `y=${decoded.de_rec_share?.y?.length ?? 0}B  ` +
-        `commitment=${decoded.commitment?.length ?? 0}B  ` +
-        `merkle_path_nodes=${decoded.merkle_path?.length ?? 0}`,
-    );
-
-    const key = keyFor(channelId);
     const requestEnvelope = primitives.sharing.request.produce(
-      channelId,
-      version,
-      secretId,
-      shareBytes,
-      [],
-      "",
-      key,
-    ) as { channel_id?: unknown };
-    console.log(
-      `  [request.produce] channel=${channelId}  channel_id=${requestEnvelope.channel_id}`,
+      id, version, secretId, committedShare, [], "", key,
     );
-    if (!requestEnvelope.channel_id) {
-      throw new Error(
-        `Sharing failed: invalid StoreShareRequest envelope for channel ${channelId}`,
-      );
-    }
-    storedEnvelopes.set(channelId, requestEnvelope);
+    console.log(`  [request.produce] channel=${id} envelope=${requestEnvelope.envelope.length}B`);
 
-    const processResult = primitives.sharing.response.produce(
-      channelId,
-      key,
-      requestEnvelope,
-    ) as {
-      envelope?: unknown;
-      committed_share?: Uint8Array;
-      secret_id?: number;
-      version?: number;
-    };
-    const responseEnvelope = processResult.envelope ?? processResult;
-    const committedShare = processResult.committed_share;
-    const respSecretId = processResult.secret_id;
-    const respVersion = processResult.version;
-
-    console.log(
-      `  [response.produce] channel=${channelId}  committed_share=${committedShare?.length ?? 0}B  version=${respVersion}`,
+    // Helper side: extract then produce response.
+    const { request } = primitives.sharing.request.extract(
+      requestEnvelope.envelope, key,
     );
-    if (!committedShare || committedShare.length === 0) {
-      throw new Error(
-        `Sharing failed: empty committed_share for channel ${channelId}`,
-      );
+    storedShareRequests.set(id, request);
+
+    const responseResult = primitives.sharing.response.produce(id, request, key);
+    if (responseResult.secret_id !== secretId) {
+      throw new Error(`secret_id mismatch on channel ${id}`);
     }
-    if (respSecretId === undefined || respSecretId !== Number(secretId)) {
-      throw new Error(
-        `Sharing failed: secret_id mismatch for channel ${channelId}: expected ${Number(secretId)}, got ${respSecretId}`,
-      );
-    }
-    if (respVersion !== version) {
-      throw new Error(
-        `Sharing failed: version mismatch for channel ${channelId}: expected ${version}, got ${respVersion}`,
-      );
+    if (responseResult.version !== version) {
+      throw new Error(`version mismatch on channel ${id}`);
     }
 
-    primitives.sharing.response.process(version, key, responseEnvelope);
-    console.log(`  [response.process] channel=${channelId}  validated OK`);
+    // Owner side: extract then process.
+    const { response } = primitives.sharing.response.extract(
+      responseResult.envelope, key,
+    );
+    primitives.sharing.response.process(version, response);
+    console.log(`  [response.process] channel=${id} validated OK`);
   }
 
   console.log("✓ Sharing flow passed.\n");
 
-  // ── Verification flow ───────────────────────────────────────────────────────
+  // ── Verification ──────────────────────────────────────────────────────────
 
   console.log("=== [Primitives] Verification Flow ===");
 
-  const someChannel = 1n;
-  const otherChannel = 2n;
-  const someSharedKey = keyFor(someChannel);
-  const storedEnvelope1 = storedEnvelopes.get(someChannel);
-  const storedEnvelope2 = storedEnvelopes.get(otherChannel);
-  if (!storedEnvelope1 || !storedEnvelope2) {
-    throw new Error("Verification failed: missing stored share envelope(s)");
-  }
+  const verifyChannel = 1n;
+  const verifyKey = keyFor(verifyChannel);
+  const storedFor1 = storedShareRequests.get(1n)!;
+  const storedFor2 = storedShareRequests.get(2n)!;
 
-  const verificationRequest = primitives.verification.request.produce(
-    someChannel,
-    secretId,
-    version,
-    someSharedKey,
-  ) as { channel_id?: unknown };
-  console.log(`  [request.produce] channel_id=${verificationRequest.channel_id}`);
-  if (!verificationRequest.channel_id) {
-    throw new Error("Verification failed: invalid request envelope");
-  }
-
-  const reqResult = primitives.verification.request.extract(
-    verificationRequest,
-    someSharedKey,
-  ) as {
-    channel_id?: bigint | number;
-    secret_id?: bigint | number;
-    version?: number;
-    nonce?: bigint | number;
-  };
-  const reqChannelId = BigInt(reqResult.channel_id ?? 0);
-  const reqSecretId = BigInt(reqResult.secret_id ?? 0);
-  const reqVersion = reqResult.version ?? 0;
-  const reqNonce = BigInt(reqResult.nonce ?? 0);
-  console.log(
-    `  [request.extract] channel_id=${reqChannelId}  secret_id=${reqSecretId}  nonce=${reqNonce}`,
+  // Owner side: produce request.
+  const verifyReqEnvelope = primitives.verification.request.produce(
+    verifyChannel, secretId, version, verifyKey,
   );
 
-  if (reqChannelId !== someChannel) {
-    throw new Error(`expected channel_id ${someChannel}, got ${reqChannelId}`);
-  }
-  if (reqSecretId !== secretId) {
-    throw new Error(`secret_id mismatch: expected ${secretId}, got ${reqSecretId}`);
-  }
-  if (reqVersion !== version) {
-    throw new Error(`version mismatch: expected ${version}, got ${reqVersion}`);
-  }
-  if (reqNonce === 0n) throw new Error("nonce must not be zero");
-
-  const verificationResponse = primitives.verification.response.produce(
-    someChannel,
-    reqSecretId,
-    reqVersion,
-    reqNonce,
-    someSharedKey,
-    storedEnvelope1,
-  ) as { channel_id?: unknown };
-  console.log(`  [response.produce] channel_id=${verificationResponse.channel_id}`);
-  if (!verificationResponse.channel_id) {
-    throw new Error("Verification failed: invalid response envelope");
-  }
-
-  const resultTrue = primitives.verification.response.process(
-    verificationResponse,
-    someSharedKey,
-    storedEnvelope1,
+  // Helper side: extract + produce response (the share content is the inner
+  // `share` field from the stored StoreShareRequest).
+  const { request: verifyRequest } = primitives.verification.request.extract(
+    verifyReqEnvelope.envelope, verifyKey,
   );
-  console.log(`  [response.process] correct share  → ${resultTrue}  (expected true)`);
-  if (!resultTrue) throw new Error("expected true for correct share");
-
-  const resultFalse = primitives.verification.response.process(
-    verificationResponse,
-    someSharedKey,
-    storedEnvelope2,
+  if (verifyRequest.secret_id !== secretId) {
+    throw new Error("verification request secret_id mismatch");
+  }
+  const verifyRespEnvelope = primitives.verification.response.produce(
+    verifyChannel, verifyRequest, verifyKey, storedFor1.share,
   );
-  console.log(`  [response.process] wrong share    → ${resultFalse}  (expected false)`);
-  if (resultFalse) throw new Error("expected false for wrong share");
+
+  // Owner side: extract + process against the correct and wrong share.
+  const { response: verifyResponse } = primitives.verification.response.extract(
+    verifyRespEnvelope.envelope, verifyKey,
+  );
+  const valid = primitives.verification.response.process(verifyResponse, storedFor1.share);
+  if (!valid) throw new Error("expected true for matching share");
+  const invalid = primitives.verification.response.process(verifyResponse, storedFor2.share);
+  if (invalid) throw new Error("expected false for wrong share");
+  console.log(`  [response.process] correct=true wrong=false  ✓`);
 
   console.log("✓ Verification flow passed.\n");
 
-  // ── Discovery flow ──────────────────────────────────────────────────────────
+  // ── Discovery ─────────────────────────────────────────────────────────────
 
   console.log("=== [Primitives] Discovery Flow ===");
 
-  const discoveryChannelId = 1n;
-  const discoverySharedKey = keyFor(discoveryChannelId);
+  const discChannel = 1n;
+  const discKey = keyFor(discChannel);
 
-  const discoveryRequest = primitives.discovery.request.produce(
-    discoveryChannelId,
-    discoverySharedKey,
-  ) as { channel_id?: unknown };
-  console.log(`  [request.produce] channel_id=${discoveryRequest.channel_id}`);
-  if (!discoveryRequest.channel_id) {
-    throw new Error("Discovery failed: invalid request envelope");
-  }
+  const discReqEnvelope = primitives.discovery.request.produce(discChannel, discKey);
+  const _discRequest = primitives.discovery.request.extract(discReqEnvelope.envelope, discKey);
 
-  const discoveryReqExtracted = primitives.discovery.request.extract(
-    discoveryRequest,
-    discoverySharedKey,
-  ) as { channel_id?: bigint | number };
-  console.log(`  [request.extract] channel_id=${discoveryReqExtracted.channel_id}`);
-  if (BigInt(discoveryReqExtracted.channel_id ?? 0) !== discoveryChannelId) {
-    throw new Error("Discovery failed: unexpected channel_id after extract");
-  }
-
-  const helperSecretList = [
+  const helperSecretList: SecretVersionEntry[] = [
     {
       secret_id: secretId,
       versions: [{ version, description: "smoke-test secret" }],
     },
   ];
-  const discoveryResponse = primitives.discovery.response.produce(
-    discoveryChannelId,
-    helperSecretList,
-    discoverySharedKey,
-  ) as { channel_id?: unknown };
-  console.log(`  [response.produce] channel_id=${discoveryResponse.channel_id}`);
-  if (!discoveryResponse.channel_id) {
-    throw new Error("Discovery failed: invalid response envelope");
-  }
-
-  const discoveredSecrets: DiscoveredEntry[] =
-    primitives.discovery.response.process(discoveryResponse, discoverySharedKey);
-  console.log(
-    `  [response.process] ${discoveredSecrets.length} secret(s) discovered`,
+  const discRespEnvelope = primitives.discovery.response.produce(
+    discChannel, helperSecretList, discKey,
   );
-  if (discoveredSecrets.length === 0) {
-    throw new Error("Discovery failed: empty list");
-  }
 
-  const entry = discoveredSecrets[0]!;
-  const firstVersion = entry.versions[0];
-  console.log(
-    `    secret_id=${entry.secret_id}  version=${firstVersion?.version}  description="${firstVersion?.description}"`,
+  const { response: discResponse } = primitives.discovery.response.extract(
+    discRespEnvelope.envelope, discKey,
   );
-  if (entry.secret_id !== Number(secretId)) {
-    throw new Error(
-      `secret_id mismatch: expected ${Number(secretId)}, got ${entry.secret_id}`,
-    );
+  const discResult = primitives.discovery.response.process(discResponse);
+  if (discResult.secret_list.length === 0) {
+    throw new Error("discovery: empty secret_list");
   }
-  if (!firstVersion) throw new Error("no versions");
-  if (firstVersion.version !== version) {
-    throw new Error(`version mismatch: ${firstVersion.version}`);
+  const entry = discResult.secret_list[0]!;
+  if (entry.secret_id !== secretId) {
+    throw new Error(`discovery: secret_id mismatch (${entry.secret_id} vs ${secretId})`);
   }
-  if (firstVersion.description !== "smoke-test secret") {
-    throw new Error(`description mismatch: "${firstVersion.description}"`);
-  }
+  console.log(`  [response.process] ${discResult.secret_list.length} secret(s) discovered`);
 
   console.log("✓ Discovery flow passed.\n");
 
-  // ── Recovery flow ───────────────────────────────────────────────────────────
+  // ── Recovery ──────────────────────────────────────────────────────────────
 
   console.log("=== [Primitives] Recovery Flow ===");
 
-  const storedFor = (channelId: bigint): unknown => {
-    const stored = storedEnvelopes.get(channelId);
-    if (!stored) {
-      throw new Error(`missing stored share envelope for channel ${channelId}`);
-    }
-    return stored;
-  };
+  const collectedResponses: GetShareResponseMessage[] = [];
+  for (const id of channelIds) {
+    const key = keyFor(id);
+    const stored = storedShareRequests.get(id);
+    if (!stored) throw new Error(`missing stored share for channel ${id}`);
 
-  const makeShareReq = (channelId: bigint): unknown =>
-    primitives.recovery.request.produce(
-      channelId,
-      secretId,
-      version,
-      keyFor(channelId),
-    );
-  const makeShareResp = (channelId: bigint, req: unknown): unknown =>
-    primitives.recovery.response.produce(
-      secretId,
-      channelId,
-      storedFor(channelId),
-      req,
-      keyFor(channelId),
-    );
+    const reqEnvelope = primitives.recovery.request.produce(id, secretId, version, key);
+    const { request } = primitives.recovery.request.extract(reqEnvelope.envelope, key);
 
-  const shareRequest1 = makeShareReq(1n);
-  const shareResponse1 = makeShareResp(1n, shareRequest1);
-  const shareRequest2 = makeShareReq(2n);
-  const shareResponse2 = makeShareResp(2n, shareRequest2);
-  const shareRequest3 = makeShareReq(3n);
-  const shareResponse3 = makeShareResp(3n, shareRequest3);
-
-  console.log(`  [request.produce] channels 1, 2, 3  request envelopes generated`);
-  console.log(`  [response.produce] channels 1, 2, 3  response envelopes generated`);
-
-  const recoveryResponses = [
-    { response: shareResponse1, shared_key: keyFor(1n) },
-    { response: shareResponse2, shared_key: keyFor(2n) },
-    { response: shareResponse3, shared_key: keyFor(3n) },
-  ];
-
-  const recovered: Uint8Array = primitives.recovery.response.recover(
-    recoveryResponses,
-    secretId,
-    version,
-  );
-  console.log(`  [response.recover] recovered ${recovered.length} bytes`);
-
-  if (recovered.length === 0) throw new Error("Recovery failed: empty result");
-  if (
-    recovered.length !== secretData.length ||
-    !recovered.every((b, i) => b === secretData[i])
-  ) {
-    throw new Error("Recovery failed: recovered secret does not match original");
+    const respEnvelope = primitives.recovery.response.produce(id, request, stored, key);
+    const { response } = primitives.recovery.response.extract(respEnvelope.envelope, key);
+    collectedResponses.push(response);
   }
-  console.log("  secret bytes match original ✓");
+
+  const recovered = primitives.recovery.response.recover(secretId, version, collectedResponses);
+  if (recovered.secret_data.length !== secretData.length) {
+    throw new Error(`recovery: length mismatch ${recovered.secret_data.length} vs ${secretData.length}`);
+  }
+  if (!recovered.secret_data.every((b, i) => b === secretData[i])) {
+    throw new Error("recovery: bytes do not match original secret");
+  }
+  console.log(`  [response.recover] recovered ${recovered.secret_data.length}B — matches original ✓`);
+
   console.log("✓ Recovery flow passed.\n");
 
-  // ── Pairing flow ────────────────────────────────────────────────────────────
+  // ── Pairing ───────────────────────────────────────────────────────────────
 
   console.log("=== [Primitives] Pairing Flow ===");
 
   const pairingChannelId = 1n;
-  const roleHelper = SenderKind.Helper;
-  const roleOwner = SenderKind.Owner;
 
-  // Initiator creates an out-of-band contact.
-  const createContactResult = primitives.pairing.request.create_contact(
+  // Contact initiator (Owner) creates the out-of-band ContactMessage.
+  const contact = primitives.pairing.request.create_contact(
     pairingChannelId,
-    { protocol: "https", uri: "https://example.com/alice" },
-  ) as { contact_message?: unknown; secret_key_material?: Uint8Array };
-  console.log(
-    `  [request.create_contact] contact_message present=${!!createContactResult.contact_message}  ` +
-      `key_material=${createContactResult.secret_key_material?.length ?? 0}B`,
+    { protocol: 0, uri: "https://example.com/alice" },
   );
-  if (!createContactResult.contact_message) {
-    throw new Error("Pairing failed: missing contact_message");
-  }
-  if (!createContactResult.secret_key_material?.length) {
-    throw new Error("Pairing failed: empty secret_key_material");
-  }
 
-  // Responder produces a pairing request from the contact.
-  const pairingRequestResult = primitives.pairing.request.produce(
-    roleHelper,
-    { protocol: "https", uri: "https://example.com/helper" },
-    createContactResult.contact_message,
-  ) as {
-    envelope?: unknown;
-    initiator_contact_message?: unknown;
-    secret_key_material?: Uint8Array;
-  };
-  console.log(
-    `  [request.produce] envelope present=${!!pairingRequestResult.envelope}`,
+  // Responder (Helper) produces a pairing request from the contact.
+  const pairingRequest = primitives.pairing.request.produce(
+    SenderKind.Helper,
+    { protocol: 0, uri: "https://example.com/helper" },
+    contact.contact_message,
+    null,
   );
-  if (!pairingRequestResult.envelope) {
-    throw new Error("Pairing failed: missing envelope");
-  }
-  const responderSecretKeyMaterial = pairingRequestResult.secret_key_material;
-  if (!responderSecretKeyMaterial?.length) {
-    throw new Error("Pairing failed: empty responder secret_key_material");
-  }
 
-  // Initiator accepts the request and derives the initiator-side shared key.
-  const pairingAcceptResult = primitives.pairing.response.accept(
-    roleOwner,
-    pairingRequestResult.envelope,
-    createContactResult.secret_key_material,
-  ) as { envelope?: unknown; pairing_shared_key?: Uint8Array };
-  console.log(
-    `  [response.accept]  pairing_shared_key=${pairingAcceptResult.pairing_shared_key?.length ?? 0}B`,
+  // Initiator extracts the request and accepts it.
+  const { request: pairRequest }: { request: PairRequestMessage } =
+    primitives.pairing.request.extract(pairingRequest.envelope, contact.secret_key);
+  const accepted = primitives.pairing.response.accept(
+    SenderKind.Owner, pairRequest, contact.secret_key, null,
   );
-  if (!pairingAcceptResult.pairing_shared_key?.length) {
-    throw new Error("Pairing failed: empty pairing_shared_key (accept)");
-  }
-  if (!pairingAcceptResult.envelope) {
-    throw new Error("Pairing failed: missing response envelope (accept)");
-  }
 
-  // Responder processes the response and derives the responder-side shared key.
-  const pairingProcessResult = primitives.pairing.response.process(
-    pairingRequestResult.initiator_contact_message,
-    pairingAcceptResult.envelope,
-    responderSecretKeyMaterial,
-  ) as { pairing_shared_key?: Uint8Array };
-  console.log(
-    `  [response.process] pairing_shared_key=${pairingProcessResult.pairing_shared_key?.length ?? 0}B`,
+  // Responder extracts the response and processes it.
+  const { response: pairResponse }: { response: PairResponseMessage } =
+    primitives.pairing.response.extract(accepted.envelope, pairingRequest.secret_key);
+  const processed = primitives.pairing.response.process(
+    pairingRequest.initiator_contact_message as ContactMessage,
+    pairResponse,
+    pairingRequest.secret_key,
   );
-  if (!pairingProcessResult.pairing_shared_key?.length) {
-    throw new Error("Pairing failed: empty pairing_shared_key (process)");
-  }
 
-  const ownerKey = pairingAcceptResult.pairing_shared_key;
-  const helperKey = pairingProcessResult.pairing_shared_key;
-  const keysMatch =
-    ownerKey.length === helperKey.length &&
-    ownerKey.every((b, i) => b === helperKey[i]);
-  console.log(`  shared keys match: ${keysMatch}`);
-  if (!keysMatch) throw new Error("Pairing failed: shared keys do not match");
+  if (accepted.shared_key.length !== processed.shared_key.length ||
+      !accepted.shared_key.every((b, i) => b === processed.shared_key[i])) {
+    throw new Error("pairing: shared keys do not match");
+  }
+  console.log(`  shared keys match (${accepted.shared_key.length}B)  ✓`);
 
   console.log("✓ Pairing flow passed.\n");
 

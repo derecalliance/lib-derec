@@ -22,6 +22,8 @@ pub struct GetShareResponseMessage {
     pub committed_de_rec_share: Vec<u8>,
     pub result: Option<DeRecResult>,
     pub timestamp: Option<Timestamp>,
+    pub secret_id: u64,
+    pub version: u32,
 }
 
 impl From<derec_proto::GetShareResponseMessage> for GetShareResponseMessage {
@@ -31,6 +33,8 @@ impl From<derec_proto::GetShareResponseMessage> for GetShareResponseMessage {
             committed_de_rec_share: value.committed_de_rec_share,
             result: value.result.map(Into::into),
             timestamp: value.timestamp.map(Into::into),
+            secret_id: value.secret_id,
+            version: value.version,
         }
     }
 }
@@ -42,6 +46,8 @@ impl From<GetShareResponseMessage> for derec_proto::GetShareResponseMessage {
             committed_de_rec_share: value.committed_de_rec_share,
             result: value.result.map(Into::into),
             timestamp: value.timestamp.map(Into::into),
+            secret_id: value.secret_id,
+            version: value.version,
         }
     }
 }

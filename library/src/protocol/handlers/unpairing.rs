@@ -2,7 +2,7 @@
 
 use super::super::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport,
-    PendingAction, SecretKind, SecretValue, events::UnpairAck,
+    MissingPolicy, PendingAction, SecretKind, SecretValue, events::UnpairAck,
 };
 use super::peer_endpoint;
 use crate::derec_message::current_timestamp;
@@ -76,11 +76,12 @@ pub(in crate::protocol) async fn start<
     let memo_str = memo.unwrap_or_default();
     let mut events = Vec::new();
 
-    for channel_id in channel_ids {
-        let Some(SecretValue::SharedKey(shared_key)) =
-            // TODO: add a load_many function
-            secret_store.load(channel_id, SecretKind::SharedKey).await?
-        else {
+    let keys = secret_store
+        .load_many(&channel_ids, SecretKind::SharedKey, MissingPolicy::Fail)
+        .await?;
+
+    for (channel_id, value) in keys {
+        let SecretValue::SharedKey(shared_key) = value else {
             continue;
         };
 

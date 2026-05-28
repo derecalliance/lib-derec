@@ -69,6 +69,8 @@ fn create_response_envelope(
             memo: String::new(),
         }),
         timestamp: Some(timestamp),
+        secret_id: 0,
+        version: 0,
     };
 
     DeRecMessageBuilder::channel()
@@ -99,6 +101,8 @@ fn create_response_envelope_with_mismatched_timestamp(
             memo: String::new(),
         }),
         timestamp: Some(message_timestamp),
+        secret_id: 0,
+        version: 0,
     };
 
     DeRecMessageBuilder::channel()
@@ -437,7 +441,7 @@ fn test_produce_get_share_response_message_request_timestamp_mismatch() {
 
     let tampered_request_message = derec_proto::GetShareRequestMessage {
         secret_id,
-        share_version: version,
+        version,
         timestamp: Some(message_timestamp),
     };
 

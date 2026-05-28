@@ -26,7 +26,7 @@ const sourceReadmePath = path.join(
 );
 const targetReadmePath = path.join(pkgDir, "README.md");
 
-const wasmDir = path.join(repoRoot, "packages", "nodejs", "wasm");
+const nodejsDir = path.join(repoRoot, "packages", "nodejs");
 const indexFiles = ["index.js", "index.d.ts"];
 
 function isPlainObject(value) {
@@ -82,7 +82,7 @@ async function main() {
 
   await Promise.all(
     indexFiles.map((f) =>
-      copyFile(path.join(wasmDir, f), path.join(pkgDir, f)),
+      copyFile(path.join(nodejsDir, f), path.join(pkgDir, f)),
     ),
   );
 

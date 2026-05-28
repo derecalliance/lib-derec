@@ -19,8 +19,9 @@ use std::sync::{Arc, Mutex};
 
 use derec_library::protocol::{
     ChannelStoreFuture, DeRecChannelStore, DeRecEvent, DeRecFlow, DeRecProtocol,
-    DeRecProtocolBuilder, DeRecSecretStore, DeRecShareStore, DeRecTransport, SecretKind,
-    SecretStoreFuture, SecretValue, Share, ShareStoreFuture, TransportFuture,
+    DeRecProtocolBuilder, DeRecSecretStore, DeRecShareStore, DeRecTransport, MissingPolicy,
+    SecretKind, SecretStoreError, SecretStoreFuture, SecretValue, Share, ShareStoreFuture,
+    TransportFuture,
 };
 use derec_library::types::{Channel, ChannelId, Target, UserSecret};
 use derec_proto::{Protocol, SenderKind, TransportProtocol};
@@ -119,6 +120,30 @@ impl DeRecSecretStore for InMemorySecretStore {
             .data
             .get(&(channel_id.0, kind as u8))
             .map(clone_secret_value);
+        Box::pin(std::future::ready(Ok(result)))
+    }
+
+    fn load_many(
+        &self,
+        channel_ids: &[ChannelId],
+        kind: SecretKind,
+        missing_policy: MissingPolicy,
+    ) -> SecretStoreFuture<'_, Vec<(ChannelId, SecretValue)>> {
+        let k = kind as u8;
+        let mut result: Vec<(ChannelId, SecretValue)> = Vec::with_capacity(channel_ids.len());
+        let mut missing: Vec<u64> = Vec::new();
+        for cid in channel_ids {
+            match self.data.get(&(cid.0, k)) {
+                Some(v) => result.push((*cid, clone_secret_value(v))),
+                None => missing.push(cid.0),
+            }
+        }
+        if missing_policy == MissingPolicy::Fail && !missing.is_empty() {
+            return Box::pin(std::future::ready(Err(SecretStoreError::MissingEntries {
+                kind,
+                channel_ids: missing,
+            })));
+        }
         Box::pin(std::future::ready(Ok(result)))
     }
 

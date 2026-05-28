@@ -37,7 +37,7 @@ pub struct RecoverResult {
 ///
 /// 1. Validates that `stored_share_request` contains non-empty committed share bytes
 /// 2. Decodes the embedded [`derec_proto::CommittedDeRecShare`] and inner [`derec_proto::DeRecShare`]
-/// 3. Validates that the stored share matches the requested `secret_id` and `share_version`
+/// 3. Validates that the stored share matches the requested `secret_id` and `version`
 /// 4. Builds and encrypts a [`derec_proto::GetShareResponseMessage`] carrying the committed share
 ///
 /// # Arguments
@@ -65,7 +65,7 @@ pub struct RecoverResult {
 /// - [`RecoveryError::DecodeCommittedDeRecShare`] if the committed share cannot be decoded
 /// - [`RecoveryError::DecodeDeRecShare`] if the inner [`derec_proto::DeRecShare`] cannot be decoded
 /// - [`RecoveryError::SecretIdMismatch`] if the stored share does not match the requested `secret_id`
-/// - [`RecoveryError::VersionMismatch`] if the stored share does not match the requested `share_version`
+/// - [`RecoveryError::VersionMismatch`] if the stored share does not match the requested `version`
 /// - outer response envelope construction or encryption fails
 ///
 /// # Security Notes
@@ -108,7 +108,7 @@ pub struct RecoverResult {
 /// ```
 #[cfg_attr(
     feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0, version = request.share_version))
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0, version = request.version))
 )]
 pub fn produce(
     channel_id: ChannelId,
@@ -135,16 +135,16 @@ pub fn produce(
         return Err(RecoveryError::SecretIdMismatch.into());
     }
 
-    if derec_share.version != request.share_version {
+    if derec_share.version != request.version {
         #[cfg(feature = "logging")]
         tracing::warn!(
-            expected = request.share_version,
+            expected = request.version,
             got = derec_share.version,
             "version mismatch between request and stored share"
         );
 
         return Err(RecoveryError::VersionMismatch {
-            expected: request.share_version,
+            expected: request.version,
             got: derec_share.version,
         }
         .into());
@@ -160,6 +160,8 @@ pub fn produce(
             memo: String::new(),
         }),
         timestamp: Some(timestamp),
+        secret_id: request.secret_id,
+        version: request.version,
     };
 
     let envelope = DeRecMessageBuilder::channel()

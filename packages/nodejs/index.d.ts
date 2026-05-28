@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-export { default as init } from "./derec_library.js";
-
 export interface SecretStore {
   load(channelId: string, kind: 0 | 1 | 2): Promise<Uint8Array | null | undefined>;
   /**

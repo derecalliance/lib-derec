@@ -72,8 +72,8 @@ use crate::{
         error::{ChannelStoreError, SecretStoreError, ShareStoreError},
         traits::{
             ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore,
-            DeRecShareStore, DeRecTransport, SecretKind, SecretStoreFuture, SecretValue, Share,
-            ShareStoreFuture, TransportFuture,
+            DeRecShareStore, DeRecTransport, MissingPolicy, SecretKind, SecretStoreFuture,
+            SecretValue, Share, ShareStoreFuture, TransportFuture,
         },
     },
     types::{Channel, ChannelId, ChannelStatus},
@@ -113,6 +113,32 @@ async fn resolve_promise(val: JsValue) -> Result<JsValue, String> {
         .map_err(|e| format!("promise rejected: {e:?}"))
 }
 
+fn decode_secret_value(kind: SecretKind, bytes: &[u8]) -> Result<SecretValue, SecretStoreError> {
+    match kind {
+        SecretKind::SharedKey => {
+            if bytes.len() != 32 {
+                return Err(SecretStoreError::Backend(box_err(format!(
+                    "shared key must be 32 bytes, got {}",
+                    bytes.len()
+                ))));
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(bytes);
+            Ok(SecretValue::SharedKey(key))
+        }
+        SecretKind::PairingSecret => {
+            let material = PairingSecretKeyMaterial::deserialize_uncompressed(&mut &bytes[..])
+                .map_err(|e| SecretStoreError::Backend(box_err(e.to_string())))?;
+            Ok(SecretValue::PairingSecret(material))
+        }
+        SecretKind::PairingContact => {
+            let contact = ContactMessage::decode(bytes)
+                .map_err(|e| SecretStoreError::Backend(box_err(e.to_string())))?;
+            Ok(SecretValue::PairingContact(contact))
+        }
+    }
+}
+
 // ── JsSecretStore ─────────────────────────────────────────────────────────────
 
 /// Adapter wrapping a JS `SecretStore` object.
@@ -140,30 +166,63 @@ impl DeRecSecretStore for JsSecretStore {
                 return Ok(None);
             }
             let bytes = Uint8Array::new(&value).to_vec();
-            match kind {
-                SecretKind::SharedKey => {
-                    if bytes.len() != 32 {
-                        return Err(SecretStoreError::Backend(box_err(format!(
-                            "shared key must be 32 bytes, got {}",
-                            bytes.len()
-                        ))));
-                    }
-                    let mut key = [0u8; 32];
-                    key.copy_from_slice(&bytes);
-                    Ok(Some(SecretValue::SharedKey(key)))
-                }
-                SecretKind::PairingSecret => {
-                    let material =
-                        PairingSecretKeyMaterial::deserialize_uncompressed(&mut &bytes[..])
-                            .map_err(|e| SecretStoreError::Backend(box_err(e.to_string())))?;
-                    Ok(Some(SecretValue::PairingSecret(material)))
-                }
-                SecretKind::PairingContact => {
-                    let contact = ContactMessage::decode(bytes.as_slice())
-                        .map_err(|e| SecretStoreError::Backend(box_err(e.to_string())))?;
-                    Ok(Some(SecretValue::PairingContact(contact)))
-                }
+            Ok(Some(decode_secret_value(kind, &bytes)?))
+        })
+    }
+
+    fn load_many(
+        &self,
+        channel_ids: &[ChannelId],
+        kind: SecretKind,
+        missing_policy: MissingPolicy,
+    ) -> SecretStoreFuture<'_, Vec<(ChannelId, SecretValue)>> {
+        let obj = self.0.clone();
+        let ids_vec: Vec<String> = channel_ids.iter().map(|c| c.0.to_string()).collect();
+        let raw_ids: Vec<u64> = channel_ids.iter().map(|c| c.0).collect();
+        let kind_num = kind as u32;
+        let policy_str = match missing_policy {
+            MissingPolicy::Skip => "skip",
+            MissingPolicy::Fail => "fail",
+        };
+        Box::pin(async move {
+            let js_ids = Array::new();
+            for id in &ids_vec {
+                js_ids.push(&JsValue::from_str(id));
             }
+            let args = Array::new();
+            args.push(&js_ids);
+            args.push(&JsValue::from_f64(kind_num as f64));
+            args.push(&JsValue::from_str(policy_str));
+            let promise_val = call_method(&obj, "loadMany", &args)
+                .map_err(|e| SecretStoreError::Backend(box_err(e)))?;
+            let value = resolve_promise(promise_val)
+                .await
+                .map_err(|e| SecretStoreError::Backend(box_err(e)))?;
+            let arr = Array::from(&value);
+            let mut result = Vec::with_capacity(arr.length() as usize);
+            let mut missing: Vec<u64> = Vec::new();
+            for i in 0..arr.length() {
+                let cid = *raw_ids.get(i as usize).ok_or_else(|| {
+                    SecretStoreError::Backend(box_err(
+                        "loadMany returned more entries than requested".to_string(),
+                    ))
+                })?;
+                let raw = arr.get(i);
+                if raw.is_null() || raw.is_undefined() {
+                    missing.push(cid);
+                    continue;
+                }
+                let bytes = Uint8Array::new(&raw).to_vec();
+                let value = decode_secret_value(kind, &bytes)?;
+                result.push((ChannelId(cid), value));
+            }
+            if missing_policy == MissingPolicy::Fail && !missing.is_empty() {
+                return Err(SecretStoreError::MissingEntries {
+                    kind,
+                    channel_ids: missing,
+                });
+            }
+            Ok(result)
         })
     }
 

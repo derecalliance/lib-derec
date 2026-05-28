@@ -150,7 +150,6 @@ pub(in crate::protocol) async fn accept<
         })
         .await?;
 
-    // TODO: Shall tue PairingContact also be removed?
     secret_store
         .remove(channel_id, SecretKind::PairingSecret)
         .await?;
@@ -190,7 +189,6 @@ pub(in crate::protocol) async fn reject<Ss: DeRecSecretStore, T: DeRecTransport>
         .send(&result.peer_transport_protocol, result.envelope)
         .await?;
 
-    // TODO: Shall tue PairingContact also be removed?
     secret_store
         .remove(channel_id, SecretKind::PairingSecret)
         .await?;

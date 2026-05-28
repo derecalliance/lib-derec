@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use super::SecretKind;
 use crate::types::ChannelId;
 
 /// Error returned by [`DeRecProtocol::process`](super::DeRecProtocol::process).
@@ -47,6 +48,20 @@ pub enum SecretStoreError {
     /// inspect the full error chain via [`std::error::Error::source`].
     #[error("secret store backend error")]
     Backend(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+
+    /// Returned by [`super::DeRecSecretStore::load_many`] when one or more
+    /// requested channels have no stored secret of the requested
+    /// [`SecretKind`] and the caller requested
+    /// [`super::MissingPolicy::Fail`].
+    ///
+    /// `channel_ids` carries the raw u64 ids of channels that came back empty;
+    /// the protocol orchestrator logs them at `error!` level and surfaces
+    /// the same list to consumers.
+    #[error("secret store: missing {kind:?} entries for channel(s): {channel_ids:?}")]
+    MissingEntries {
+        kind: SecretKind,
+        channel_ids: Vec<u64>,
+    },
 }
 
 /// Errors produced by [`DeRecChannelStore`](super::DeRecChannelStore) implementations.

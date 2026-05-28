@@ -35,7 +35,8 @@ use prost::Message;
 use std::collections::{HashMap, HashSet};
 pub use traits::{
     ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecTransport,
-    SecretKind, SecretStoreFuture, SecretValue, Share, ShareStoreFuture, TransportFuture,
+    MissingPolicy, SecretKind, SecretStoreFuture, SecretValue, Share, ShareStoreFuture,
+    TransportFuture,
 };
 
 /// In-progress recovery accumulators keyed by `(secret_id, version)`.
@@ -528,13 +529,14 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
             }
             PendingAction::GetShare {
                 channel_id,
+                request,
                 shared_key,
-                ..
             } => {
                 handlers::recovery::reject(
                     &mut self.channel_store,
                     &self.transport,
                     channel_id,
+                    &request,
                     &shared_key,
                     status,
                     memo,

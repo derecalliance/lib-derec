@@ -73,7 +73,13 @@ fn categorize(err: &crate::Error) -> (&'static str, &'static str) {
         crate::Error::Verification(e) => ("verification", verification_code(e)),
         crate::Error::Unpairing(e) => ("unpairing", unpairing_code(e)),
         crate::Error::DeRecMessage(_) => ("derec_message", "BUILDER_ERROR"),
-        crate::Error::SecretStore(_) => ("secret_store", "STORE_ERROR"),
+        crate::Error::SecretStore(e) => match e {
+            crate::protocol::SecretStoreError::MissingEntries {
+                kind: crate::protocol::SecretKind::SharedKey,
+                ..
+            } => ("secret_store", "MISSING_SHARED_KEY"),
+            _ => ("secret_store", "STORE_ERROR"),
+        },
         crate::Error::ChannelStore(_) => ("channel_store", "STORE_ERROR"),
         crate::Error::ShareStore(_) => ("share_store", "STORE_ERROR"),
         crate::Error::InvalidInput(_) => ("input", "INVALID_INPUT"),

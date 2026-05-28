@@ -85,7 +85,7 @@ enum DeRecEventJs {
         sender_kind: Option<u32>,
         /// For StoreShare actions: the share version number.
         #[serde(skip_serializing_if = "Option::is_none")]
-        share_version: Option<u32>,
+        version: Option<u32>,
         /// For StoreShare actions: human-readable description of the secret version.
         #[serde(skip_serializing_if = "Option::is_none")]
         share_description: Option<String>,
@@ -232,7 +232,7 @@ pub fn event_to_js(event: DeRecEvent) -> Result<JsValue, JsValue> {
             let kind = action_kind_label(&action).to_owned();
             let peer_communication_info = extract_peer_communication_info(&action);
             let sender_kind = extract_pairing_sender_kind(&action);
-            let (share_version, share_description, share_secret_id) = extract_share_metadata(&action);
+            let (version, share_description, share_secret_id) = extract_share_metadata(&action);
             let action_bytes = pending_action_wire::serialize(action)
                 .map_err(|e| js_error("WASM_SERIALIZE_ERROR", e))?;
             DeRecEventJs::ActionRequired {
@@ -241,7 +241,7 @@ pub fn event_to_js(event: DeRecEvent) -> Result<JsValue, JsValue> {
                 action_kind: kind,
                 peer_communication_info,
                 sender_kind,
-                share_version,
+                version,
                 share_description,
                 share_secret_id,
             }

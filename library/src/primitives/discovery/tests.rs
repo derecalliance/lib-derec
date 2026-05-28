@@ -179,7 +179,7 @@ fn test_extract_discovery_request_wrong_message_type_fails() {
 
     let message = GetShareRequestMessage {
         secret_id: 1,
-        share_version: 1,
+        version: 1,
         timestamp: Some(timestamp),
     };
 
@@ -306,6 +306,8 @@ fn test_extract_discovery_response_wrong_message_type_fails() {
             memo: String::new(),
         }),
         timestamp: Some(timestamp),
+        secret_id: 0,
+        version: 0,
     };
 
     let envelope = DeRecMessageBuilder::channel()

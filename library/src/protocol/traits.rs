@@ -49,6 +49,24 @@ pub enum SecretKind {
     PairingContact = 2,
 }
 
+/// How [`DeRecSecretStore::load_many`] handles channels with no stored secret
+/// of the requested [`SecretKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingPolicy {
+    /// Silently drop missing channels from the returned vector.
+    ///
+    /// Use when missing entries are an expected outcome — e.g. a `Target::Many`
+    /// list that mixes paired and unpaired channels.
+    Skip,
+    /// Return [`SecretStoreError::MissingEntries`] carrying the channel ids
+    /// that had no entry.
+    ///
+    /// Use when every input id is expected to have an entry — e.g. after
+    /// filtering to channels already known to [`DeRecChannelStore`]. A miss
+    /// signals a cross-store invariant violation.
+    Fail,
+}
+
 pub enum SecretValue {
     SharedKey(crate::types::SharedKey),
     PairingSecret(PairingSecretKeyMaterial),
@@ -90,6 +108,24 @@ pub trait DeRecSecretStore {
         channel_id: ChannelId,
         kind: SecretKind,
     ) -> SecretStoreFuture<'_, Option<SecretValue>>;
+
+    /// Load secrets of the same [`SecretKind`] for several channels in one call.
+    ///
+    /// Used by the [`crate::protocol`] orchestrator when broadcasting a request
+    /// (discovery, recovery, verification, sharing, unpairing) to keep the
+    /// per-broadcast roundtrip count constant instead of linear in the number
+    /// of paired channels.
+    ///
+    /// Returns one `(ChannelId, SecretValue)` per channel that has a stored
+    /// secret of the requested kind. `missing_policy` controls how channels
+    /// with no stored entry are handled (see [`MissingPolicy`]). Order of the
+    /// returned tuples is unspecified.
+    fn load_many(
+        &self,
+        channel_ids: &[ChannelId],
+        kind: SecretKind,
+        missing_policy: MissingPolicy,
+    ) -> SecretStoreFuture<'_, Vec<(ChannelId, SecretValue)>>;
 
     /// Persist a secret for the given channel.
     ///

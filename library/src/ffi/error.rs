@@ -71,6 +71,12 @@ pub const DEREC_CODE_PROTOBUF_ENCODE: i32 = 6;
 pub const DEREC_CODE_PROTOCOL_VIOLATION: i32 = 7;
 pub const DEREC_CODE_STORE_ERROR: i32 = 8;
 pub const DEREC_CODE_BUILDER_ERROR: i32 = 9;
+/// `SecretStore::load_many(.., MissingPolicy::Fail)` returned because one or
+/// more channels had no `SharedKey` entry. The formatted `message` carries
+/// the missing channel ids (e.g. `"secret store: missing SharedKey entries
+/// for channel(s): [42, 7]"`). `category` is
+/// [`DEREC_CATEGORY_SECRET_STORE`].
+pub const DEREC_CODE_MISSING_SHARED_KEY: i32 = 10;
 
 pub const DEREC_CODE_ENCRYPTION: i32 = 20;
 pub const DEREC_CODE_KEYGEN: i32 = 21;
@@ -182,7 +188,16 @@ fn categorize(err: &crate::Error) -> (i32, i32) {
         crate::Error::Verification(e) => (DEREC_CATEGORY_VERIFICATION, verification_code(e)),
         crate::Error::Unpairing(e) => (DEREC_CATEGORY_UNPAIRING, unpairing_code(e)),
         crate::Error::DeRecMessage(_) => (DEREC_CATEGORY_DEREC_MESSAGE, DEREC_CODE_BUILDER_ERROR),
-        crate::Error::SecretStore(_) => (DEREC_CATEGORY_SECRET_STORE, DEREC_CODE_STORE_ERROR),
+        crate::Error::SecretStore(e) => {
+            let code = match e {
+                crate::protocol::SecretStoreError::MissingEntries {
+                    kind: crate::protocol::SecretKind::SharedKey,
+                    ..
+                } => DEREC_CODE_MISSING_SHARED_KEY,
+                _ => DEREC_CODE_STORE_ERROR,
+            };
+            (DEREC_CATEGORY_SECRET_STORE, code)
+        }
         crate::Error::ChannelStore(_) => (DEREC_CATEGORY_CHANNEL_STORE, DEREC_CODE_STORE_ERROR),
         crate::Error::ShareStore(_) => (DEREC_CATEGORY_SHARE_STORE, DEREC_CODE_STORE_ERROR),
         crate::Error::InvalidInput(_) => (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_INVALID_INPUT),

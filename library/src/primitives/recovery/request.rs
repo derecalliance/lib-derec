@@ -79,7 +79,7 @@ pub fn produce(
 
     let message = GetShareRequestMessage {
         secret_id,
-        share_version: version,
+        version,
         timestamp: Some(timestamp),
     };
 
@@ -147,7 +147,7 @@ pub fn produce(
 ///     .expect("failed to extract recovery request");
 ///
 /// assert_eq!(request.secret_id, 1);
-/// assert_eq!(request.share_version, 1);
+/// assert_eq!(request.version, 1);
 /// ```
 #[cfg_attr(
     feature = "logging",

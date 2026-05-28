@@ -2,7 +2,7 @@
 
 use super::super::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport,
-    PendingAction, SecretKind, SecretValue,
+    MissingPolicy, PendingAction, SecretKind, SecretValue,
 };
 use super::peer_endpoint;
 use crate::{
@@ -72,10 +72,12 @@ pub(in crate::protocol) async fn start<
             .collect(),
     };
 
-    for channel_id in channel_ids {
-        let Some(SecretValue::SharedKey(shared_key)) =
-            secret_store.load(channel_id, SecretKind::SharedKey).await?
-        else {
+    let keys = secret_store
+        .load_many(&channel_ids, SecretKind::SharedKey, MissingPolicy::Fail)
+        .await?;
+
+    for (channel_id, value) in keys {
+        let SecretValue::SharedKey(shared_key) = value else {
             continue;
         };
 

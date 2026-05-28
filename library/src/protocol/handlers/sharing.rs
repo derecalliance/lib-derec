@@ -2,7 +2,7 @@
 
 use super::super::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport,
-    PendingAction, SecretKind, SecretValue, Share,
+    MissingPolicy, PendingAction, SecretKind, SecretValue, Share,
 };
 use super::peer_endpoint;
 use crate::{
@@ -56,20 +56,29 @@ pub(in crate::protocol) async fn start<
     secret_id: u64,
 ) -> Result<(u32, Vec<ChannelId>)> {
     let all_channels = channel_store.channels().await?;
-    let mut paired_helpers: Vec<(crate::types::Channel, SharedKey)> = Vec::new();
-
-    for channel in all_channels {
-        let Some(SecretValue::SharedKey(shared_key)) =
-            secret_store.load(channel.id, SecretKind::SharedKey).await?
-        else {
-            continue;
-        };
-        paired_helpers.push((channel, shared_key));
-    }
-
-    if paired_helpers.is_empty() {
+    if all_channels.is_empty() {
         return Err(Error::InvalidInput("no paired helpers available"));
     }
+    let channel_ids: Vec<ChannelId> = all_channels.iter().map(|c| c.id).collect();
+    let mut keys: std::collections::HashMap<ChannelId, SharedKey> = secret_store
+        .load_many(&channel_ids, SecretKind::SharedKey, MissingPolicy::Fail)
+        .await?
+        .into_iter()
+        .filter_map(|(cid, v)| match v {
+            SecretValue::SharedKey(k) => Some((cid, k)),
+            _ => None,
+        })
+        .collect();
+
+    let paired_helpers: Vec<(crate::types::Channel, SharedKey)> = all_channels
+        .into_iter()
+        .map(|channel| {
+            let key = keys
+                .remove(&channel.id)
+                .expect("load_many(MissingPolicy::Fail) guarantees an entry per id");
+            (channel, key)
+        })
+        .collect();
 
     // Copy the channel's app-level identity metadata verbatim into the
     // bag's per-helper record. The protocol never inspects keys — the
