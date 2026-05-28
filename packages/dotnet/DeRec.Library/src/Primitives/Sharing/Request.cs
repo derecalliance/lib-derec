@@ -12,38 +12,39 @@ public static partial class Sharing
         public sealed class SplitResult
         {
             /// <summary>
-            /// Serialized map of channel ID → committed share bytes, in the Rust FFI binary format.
+            /// Serialized FFI map of channel ID → committed share bytes.
             /// Use <see cref="DeserializeShares"/> to unpack into a dictionary.
             /// </summary>
             public required byte[] SharesWireBytes { get; init; }
 
-            /// <summary>Unpacks the wire bytes into a channel ID → committed share map.</summary>
             public Dictionary<ulong, byte[]> DeserializeShares() =>
                 SharingWireFormat.DeserializeShares(SharesWireBytes);
         }
 
-        public sealed class ProduceResult
+        public sealed class ExtractResult
         {
-            public required DeRecMessage Envelope { get; init; }
+            public required ulong ChannelId { get; init; }
+            /// <summary>
+            /// Inner <c>StoreShareRequestMessage</c> proto bytes for chaining
+            /// into <see cref="Response.Produce"/>. Also used as the
+            /// stored-share input for <see cref="Recovery.Response.Produce"/>.
+            /// </summary>
+            public required byte[] RequestProtoBytes { get; init; }
         }
 
-        /// <summary>
-        /// Splits a secret into verifiable committed shares, one per helper channel.
-        /// </summary>
         public static SplitResult Split(
-            byte[] secretId,
+            ulong secretId,
             byte[] secretData,
             ulong[] channelIds,
             ulong threshold,
-            int version
+            uint version
         )
         {
-            if (channelIds is null) throw new ArgumentNullException(nameof(channelIds));
+            ArgumentNullException.ThrowIfNull(channelIds);
 
             Native.Sharing.ProtectSecretResult nativeResult =
                 Native.Sharing.protect_secret(
                     secretId,
-                    (UIntPtr)secretId.Length,
                     secretData,
                     (UIntPtr)secretData.Length,
                     channelIds,
@@ -54,8 +55,7 @@ public static partial class Sharing
 
             try
             {
-                Utils.ThrowIfError(nativeResult.Status);
-
+                Utils.ThrowIfError(nativeResult.Error);
                 return new SplitResult
                 {
                     SharesWireBytes = Utils.CopyBuffer(nativeResult.SharesWireBytes),
@@ -64,27 +64,22 @@ public static partial class Sharing
             finally
             {
                 Utils.FreeBuffer(nativeResult.SharesWireBytes);
-                Utils.FreeStatusMessage(nativeResult.Status);
             }
         }
 
-        /// <summary>
-        /// Wraps a committed helper share into an encrypted delivery envelope.
-        /// </summary>
-        public static ProduceResult Produce(
+        public static DeRecMessage Produce(
             ulong channelId,
-            int version,
-            byte[] secretId,
+            uint version,
+            ulong secretId,
             byte[] committedShare,
-            int[] keepList,
+            uint[] keepList,
             string description,
             byte[] sharedKey
         )
         {
-            if (secretId is null) throw new ArgumentNullException(nameof(secretId));
-            if (committedShare is null) throw new ArgumentNullException(nameof(committedShare));
-            if (keepList is null) throw new ArgumentNullException(nameof(keepList));
-            if (sharedKey is null) throw new ArgumentNullException(nameof(sharedKey));
+            ArgumentNullException.ThrowIfNull(committedShare);
+            ArgumentNullException.ThrowIfNull(keepList);
+            ArgumentNullException.ThrowIfNull(sharedKey);
             if (sharedKey.Length != 32)
                 throw new ArgumentException("sharedKey must be exactly 32 bytes.", nameof(sharedKey));
 
@@ -95,7 +90,6 @@ public static partial class Sharing
                     channelId,
                     version,
                     secretId,
-                    (UIntPtr)secretId.Length,
                     committedShare,
                     (UIntPtr)committedShare.Length,
                     keepList,
@@ -108,17 +102,39 @@ public static partial class Sharing
 
             try
             {
-                Utils.ThrowIfError(nativeResult.Status);
-
-                return new ProduceResult
-                {
-                    Envelope = DeRecMessage.FromProtoBytes(Utils.CopyBuffer(nativeResult.WireBytes)),
-                };
+                Utils.ThrowIfError(nativeResult.Error);
+                return DeRecMessage.FromProtoBytes(Utils.CopyBuffer(nativeResult.WireBytes));
             }
             finally
             {
                 Utils.FreeBuffer(nativeResult.WireBytes);
-                Utils.FreeStatusMessage(nativeResult.Status);
+            }
+        }
+
+        public static ExtractResult Extract(DeRecMessage request, byte[] sharedKey)
+        {
+            byte[] requestWireBytes = request.ToProtoBytes();
+
+            Native.Sharing.ExtractStoreShareRequestResult nativeResult =
+                Native.Sharing.extract_store_share_request(
+                    requestWireBytes,
+                    (UIntPtr)requestWireBytes.Length,
+                    sharedKey,
+                    (UIntPtr)sharedKey.Length
+                );
+
+            try
+            {
+                Utils.ThrowIfError(nativeResult.Error);
+                return new ExtractResult
+                {
+                    ChannelId = nativeResult.ChannelId,
+                    RequestProtoBytes = Utils.CopyBuffer(nativeResult.RequestProtoBytes),
+                };
+            }
+            finally
+            {
+                Utils.FreeBuffer(nativeResult.RequestProtoBytes);
             }
         }
     }

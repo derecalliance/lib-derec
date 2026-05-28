@@ -1,183 +1,148 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    deserialize_pairing_secret_key_material, get_sender_kind, js_to_contact_message,
-    transport_protocol_to_js, TransportProtocolJs,
+    CommunicationInfo, ContactMessage, PairRequestMessage, PairResponseMessage, TransportProtocol,
+    deserialize_pairing_secret_key_material, get_sender_kind,
 };
 use crate::{
-    primitives::pairing::{request, response},
-    wasm::ts_bindings_utils::{DeRecMessageJs, derec_message_to_js, js_error, js_error_from_lib, js_to_derec_message},
+    primitives::pairing::response,
+    wasm::{
+        primitives::helpers::{from_js, to_js},
+        ts_bindings_utils::{js_error, js_error_from_lib},
+    },
 };
-use derec_proto::DeRecMessage;
-use prost::Message as _;
+use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ProduceResultJs {
-    envelope: DeRecMessageJs,
-    peer_transport_protocol: TransportProtocolJs,
-    pairing_shared_key: Vec<u8>,
+#[derive(Serialize, Deserialize)]
+pub struct AcceptResult {
+    #[serde(with = "serde_bytes")]
+    pub envelope: Vec<u8>,
+    pub peer_transport_protocol: TransportProtocol,
+    #[serde(with = "serde_bytes")]
+    pub shared_key: Vec<u8>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ProcessResultJs {
-    pairing_shared_key: Vec<u8>,
+#[derive(Serialize, Deserialize)]
+pub struct RejectResult {
+    #[serde(with = "serde_bytes")]
+    pub envelope: Vec<u8>,
+    pub peer_transport_protocol: TransportProtocol,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct RejectResultJs {
-    envelope: Vec<u8>,
-    peer_transport_protocol: TransportProtocolJs,
+#[derive(Serialize, Deserialize)]
+pub struct ExtractResult {
+    pub response: PairResponseMessage,
 }
 
-/// Accepts a pairing request and derives the initiator-side shared key.
-///
-/// # Arguments
-///
-/// * `kind` - Sender role: `0` = Owner, `1` = Helper, `2` = Replica
-/// * `pair_request` - Outer `DeRecMessage` JS object from `pairing_request_produce`
-/// * `pairing_secret_key_material` - Serialized initiator-side `PairingSecretKeyMaterial`
-///
-/// # Returns
-///
-/// A JS object with:
-///
-/// - `envelope`: outer `DeRecMessage` as a plain JS object
-/// - `peer_transport_protocol`: plain JS object
-/// - `pairing_shared_key`: final shared pairing key
+#[derive(Serialize, Deserialize)]
+pub struct ProcessResult {
+    #[serde(with = "serde_bytes")]
+    pub shared_key: Vec<u8>,
+}
+
 #[wasm_bindgen(js_name = "pairing_response_accept")]
 pub fn accept(
     kind: u32,
-    pair_request: JsValue,
-    pairing_secret_key_material: &[u8],
+    request: JsValue,
+    secret_key: &[u8],
+    communication_info: JsValue,
 ) -> Result<JsValue, JsValue> {
-    let pairing_sk = deserialize_pairing_secret_key_material(pairing_secret_key_material)?;
+    let sender_kind = get_sender_kind(kind)?;
+    let pairing_sk = deserialize_pairing_secret_key_material(secret_key)?;
+    let request: PairRequestMessage = from_js(request)?;
+    let request_proto: derec_proto::PairRequestMessage = request.into();
+    let communication_info: Option<CommunicationInfo> =
+        if communication_info.is_null() || communication_info.is_undefined() {
+            None
+        } else {
+            Some(from_js(communication_info)?)
+        };
+    let communication_info_proto: Option<derec_proto::CommunicationInfo> =
+        communication_info.map(Into::into);
 
-    let request_envelope = js_to_derec_message(pair_request, "pair_request")?;
-    let request_bytes = request_envelope.encode_to_vec();
+    let result = response::accept(
+        sender_kind,
+        &request_proto,
+        &pairing_sk,
+        communication_info_proto,
+    )
+    .map_err(js_error_from_lib)?;
 
-    let request::ExtractResult { request } =
-        request::extract(&request_bytes, pairing_sk.ecies_secret_key())
-            .map_err(js_error_from_lib)?;
-
-    let response::AcceptResult {
-        envelope,
-        peer_transport_protocol,
-        shared_key,
-    } = response::accept(get_sender_kind(kind)?, &request, &pairing_sk, None)
-        .map_err(js_error_from_lib)?;
-
-    let envelope_decoded = DeRecMessage::decode(envelope.as_slice())
-        .map_err(|e| js_error("PROTOBUF_DECODE_ERROR", e.to_string()))?;
-
-    let wrapper = ProduceResultJs {
-        envelope: derec_message_to_js(envelope_decoded),
-        peer_transport_protocol: transport_protocol_to_js(&peer_transport_protocol),
-        pairing_shared_key: shared_key.to_vec(),
-    };
-
-    serde_wasm_bindgen::to_value(&wrapper)
-        .map_err(|e| js_error("WASM_SERIALIZE_ERROR", e.to_string()))
+    to_js(&AcceptResult {
+        envelope: result.envelope,
+        peer_transport_protocol: result.peer_transport_protocol.into(),
+        shared_key: result.shared_key.to_vec(),
+    })
 }
 
-/// Produces a pairing rejection envelope (FAIL status) for an incoming pairing request.
-///
-/// Use this when the local user declines an incoming pairing request. The result
-/// is a properly encrypted `PairResponseMessage` with `FAIL` status and a memo
-/// describing the reason.
-///
-/// # Arguments
-///
-/// * `kind` - Sender role: `0` = Owner, `1` = Helper, `2` = Replica
-/// * `raw_message` - Raw wire bytes of the incoming `DeRecMessage` (same bytes passed to `process()`)
-/// * `pairing_secret_key_material` - Serialized `PairingSecretKeyMaterial` for the contact
-/// * `memo` - Human-readable rejection reason
-///
-/// # Returns
-///
-/// A JS object with:
-///
-/// - `envelope`: serialized `DeRecMessage` as `Vec<u8>` (ready to send via transport)
-/// - `peer_transport_protocol`: plain JS object with `{ uri, protocol }`
 #[wasm_bindgen(js_name = "pairing_response_reject")]
 pub fn reject(
     kind: u32,
-    raw_message: &[u8],
-    pairing_secret_key_material: &[u8],
+    request: JsValue,
     status: i32,
     memo: &str,
+    communication_info: JsValue,
 ) -> Result<JsValue, JsValue> {
-    let pairing_sk = deserialize_pairing_secret_key_material(pairing_secret_key_material)?;
-
-    let request::ExtractResult { request } =
-        request::extract(raw_message, pairing_sk.ecies_secret_key())
-            .map_err(js_error_from_lib)?;
-
+    let sender_kind = get_sender_kind(kind)?;
+    let request: PairRequestMessage = from_js(request)?;
+    let request_proto: derec_proto::PairRequestMessage = request.into();
     let status_enum = derec_proto::StatusEnum::try_from(status).map_err(|_| {
         js_error(
             "INVALID_STATUS",
             format!("invalid StatusEnum value: {status}"),
         )
     })?;
+    let communication_info: Option<CommunicationInfo> =
+        if communication_info.is_null() || communication_info.is_undefined() {
+            None
+        } else {
+            Some(from_js(communication_info)?)
+        };
+    let communication_info_proto: Option<derec_proto::CommunicationInfo> =
+        communication_info.map(Into::into);
 
-    let response::RejectResult {
-        envelope,
-        peer_transport_protocol,
-    } = response::reject(
-        get_sender_kind(kind)?,
-        &request,
+    let result = response::reject(
+        sender_kind,
+        &request_proto,
         status_enum,
         memo,
-        None,
+        communication_info_proto,
     )
     .map_err(js_error_from_lib)?;
 
-    let wrapper = RejectResultJs {
-        envelope,
-        peer_transport_protocol: transport_protocol_to_js(&peer_transport_protocol),
-    };
-
-    serde_wasm_bindgen::to_value(&wrapper)
-        .map_err(|e| js_error("WASM_SERIALIZE_ERROR", e.to_string()))
+    to_js(&RejectResult {
+        envelope: result.envelope,
+        peer_transport_protocol: result.peer_transport_protocol.into(),
+    })
 }
 
-/// Processes a pairing response envelope and derives the responder-side shared key.
-///
-/// # Arguments
-///
-/// * `contact_message` - Plain JS `ContactMessage` object from `pairing_request_produce`
-/// * `pair_response` - Outer `DeRecMessage` JS object from `pairing_response_produce`
-/// * `pairing_secret_key_material` - Serialized responder-side `PairingSecretKeyMaterial`
-///
-/// # Returns
-///
-/// A JS object with:
-///
-/// - `pairing_shared_key`: final shared pairing key
+#[wasm_bindgen(js_name = "pairing_response_extract")]
+pub fn extract(envelope_bytes: &[u8], secret_key: &[u8]) -> Result<JsValue, JsValue> {
+    let pairing_sk = deserialize_pairing_secret_key_material(secret_key)?;
+    let result = response::extract(envelope_bytes, pairing_sk.ecies_secret_key())
+        .map_err(js_error_from_lib)?;
+    to_js(&ExtractResult {
+        response: result.response.into(),
+    })
+}
+
 #[wasm_bindgen(js_name = "pairing_response_process")]
 pub fn process(
     contact_message: JsValue,
-    pair_response: JsValue,
-    pairing_secret_key_material: &[u8],
+    response: JsValue,
+    secret_key: &[u8],
 ) -> Result<JsValue, JsValue> {
-    let contact_message = js_to_contact_message(contact_message)?;
-    let pairing_sk = deserialize_pairing_secret_key_material(pairing_secret_key_material)?;
+    let pairing_sk = deserialize_pairing_secret_key_material(secret_key)?;
+    let contact_message: ContactMessage = from_js(contact_message)?;
+    let contact_message_proto: derec_proto::ContactMessage = contact_message.into();
+    let response: PairResponseMessage = from_js(response)?;
+    let response_proto: derec_proto::PairResponseMessage = response.into();
 
-    let response_envelope = js_to_derec_message(pair_response, "pair_response")?;
-    let response_bytes = response_envelope.encode_to_vec();
+    let result = response::process(&contact_message_proto, &response_proto, &pairing_sk)
+        .map_err(js_error_from_lib)?;
 
-    let response::ExtractResult { response } =
-        response::extract(&response_bytes, pairing_sk.ecies_secret_key())
-            .map_err(js_error_from_lib)?;
-
-    let response::ProcessResult { shared_key } =
-        response::process(&contact_message, &response, &pairing_sk)
-            .map_err(js_error_from_lib)?;
-
-    let wrapper = ProcessResultJs {
-        pairing_shared_key: shared_key.to_vec(),
-    };
-
-    serde_wasm_bindgen::to_value(&wrapper)
-        .map_err(|e| js_error("WASM_SERIALIZE_ERROR", e.to_string()))
+    to_js(&ProcessResult {
+        shared_key: result.shared_key.to_vec(),
+    })
 }

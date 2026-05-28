@@ -1,4 +1,6 @@
-﻿using System;
+// SPDX-License-Identifier: Apache-2.0
+
+using System;
 using System.Runtime.InteropServices;
 
 namespace DeRec.Library.Native;
@@ -8,33 +10,57 @@ internal static class Pairing
     [StructLayout(LayoutKind.Sequential)]
     internal struct CreateContactMessageResult
     {
-        public Status Status;
+        public DeRecError Error;
         public Buffer ContactWireBytes;
         public Buffer SecretKeyMaterial;
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    internal struct ProducePairingRequestMessageResult
+    internal struct ProducePairRequestMessageResult
     {
-        public Status Status;
+        public DeRecError Error;
         public Buffer RequestWireBytes;
         public Buffer InitiatorContactMessageWireBytes;
         public Buffer SecretKeyMaterial;
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    internal struct ProducePairingResponseMessageResult
+    internal struct ExtractPairRequestResult
     {
-        public Status Status;
+        public DeRecError Error;
+        public ulong ChannelId;
+        public Buffer RequestProtoBytes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct AcceptPairRequestMessageResult
+    {
+        public DeRecError Error;
         public Buffer ResponseWireBytes;
-        public Buffer ResponderTransportProtocol;
+        public Buffer PeerTransportProtocol;
         public Buffer SharedKey;
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    internal struct ProcessPairingResponseMessageResult
+    internal struct RejectPairRequestMessageResult
     {
-        public Status Status;
+        public DeRecError Error;
+        public Buffer ResponseWireBytes;
+        public Buffer PeerTransportProtocol;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct ExtractPairResponseResult
+    {
+        public DeRecError Error;
+        public ulong ChannelId;
+        public Buffer ResponseProtoBytes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct ProcessPairResponseMessageResult
+    {
+        public DeRecError Error;
         public Buffer SharedKey;
     }
 
@@ -46,30 +72,62 @@ internal static class Pairing
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
-    internal static extern ProducePairingRequestMessageResult produce_pairing_request_message(
+    internal static extern ProducePairRequestMessageResult produce_pair_request_message(
         int senderKind,
         byte[] transportProtocolBytes,
         UIntPtr transportProtocolBytesLen,
         byte[] contactMessageBytes,
-        UIntPtr contactMessageBytesLen
+        UIntPtr contactMessageBytesLen,
+        byte[]? communicationInfoBytes,
+        UIntPtr communicationInfoBytesLen
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
-    internal static extern ProducePairingResponseMessageResult produce_pairing_response_message(
+    internal static extern ExtractPairRequestResult extract_pair_request(
+        byte[] requestBytes,
+        UIntPtr requestBytesLen,
+        byte[] secretKeyMaterial,
+        UIntPtr secretKeyMaterialLen
+    );
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern AcceptPairRequestMessageResult accept_pair_request_message(
         int senderKind,
-        byte[] pairRequestWireBytes,
-        UIntPtr pairRequestWireBytesLen,
-        byte[] pairingSecretKeyMaterial,
-        UIntPtr pairingSecretKeyMaterialLen
+        byte[] requestProtoBytes,
+        UIntPtr requestProtoBytesLen,
+        byte[] secretKeyMaterial,
+        UIntPtr secretKeyMaterialLen,
+        byte[]? communicationInfoBytes,
+        UIntPtr communicationInfoBytesLen
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
-    internal static extern ProcessPairingResponseMessageResult process_pairing_response_message(
+    internal static extern RejectPairRequestMessageResult reject_pair_request_message(
+        int senderKind,
+        byte[] requestProtoBytes,
+        UIntPtr requestProtoBytesLen,
+        int statusEnum,
+        byte[] memoBytes,
+        UIntPtr memoBytesLen,
+        byte[]? communicationInfoBytes,
+        UIntPtr communicationInfoBytesLen
+    );
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern ExtractPairResponseResult extract_pair_response(
+        byte[] responseBytes,
+        UIntPtr responseBytesLen,
+        byte[] secretKeyMaterial,
+        UIntPtr secretKeyMaterialLen
+    );
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern ProcessPairResponseMessageResult process_pair_response_message(
         byte[] contactMessageBytes,
         UIntPtr contactMessageBytesLen,
-        byte[] pairResponseWireBytes,
-        UIntPtr pairResponseWireBytesLen,
-        byte[] pairingSecretKeyMaterial,
-        UIntPtr pairingSecretKeyMaterialLen
+        byte[] responseProtoBytes,
+        UIntPtr responseProtoBytesLen,
+        byte[] secretKeyMaterial,
+        UIntPtr secretKeyMaterialLen
     );
 }

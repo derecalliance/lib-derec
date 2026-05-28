@@ -1,653 +1,584 @@
-//! C FFI exports for the DeRec *pairing* flow.
+// SPDX-License-Identifier: Apache-2.0
+
+//! C FFI for the DeRec pairing flow.
 //!
-//! This module exposes the pairing flow through a C-compatible ABI so that
-//! non-Rust consumers can:
+//! Protocol semantics live in `library/src/primitives/pairing/`. Items below
+//! describe only the FFI surface.
 //!
-//! 1. Create an out-of-band `ContactMessage` payload
-//! 2. Produce a pairing request envelope
-//! 3. Produce a pairing response envelope and derive the initiator-side shared key
-//! 4. Process a pairing response envelope and derive the responder-side shared key
+//! # Pairing secret material
 //!
-//! All exported functions follow the same general pattern:
-//!
-//! - inputs are passed as primitive C values or raw byte buffers
-//! - protocol messages are passed as serialized wire bytes
-//! - opaque key material is passed as serialized byte buffers defined by this FFI layer
-//! - results are returned as `#[repr(C)]` structs containing:
-//!   - a [`DeRecStatus`] indicating success or failure
-//!   - one or more [`DeRecBuffer`] values containing output bytes
-//!
-//! # FFI Conventions
-//!
-//! - string inputs are passed as `(*const u8, usize)` and must be valid UTF-8
-//! - protocol message inputs are passed as raw serialized bytes
-//! - returned protocol outputs are also serialized bytes
-//! - returned buffers must be released by the caller using the common FFI
-//!   buffer-freeing helper exposed elsewhere in the FFI surface
-//! - on error, output buffers are returned empty and details are reported in
-//!   the returned [`DeRecStatus`]
-//!
-//! # Pairing Secret Material
-//!
-//! This module serializes the Rust pairing secret key material into an FFI-specific
-//! binary format so that callers can persist and later pass it back into the
-//! appropriate pairing functions. That format is an implementation detail of this
-//! FFI layer and should be treated as opaque by foreign callers.
-//!
-//! # Notes
-//!
-//! - `ContactMessage` is the only DeRec protocol payload exchanged out-of-band;
-//!   it is returned here as plain serialized protobuf bytes
-//! - pairing request and response outputs are serialized outer `DeRecMessage`
-//!   envelopes whose inner messages are encrypted
-//! - `SenderKind` is supplied over FFI as its raw `i32` protobuf enum value
-//! - protobuf decoding and protocol validation are delegated to the core Rust SDK
+//! [`PairingSecretKeyMaterial`] is serialized into an opaque FFI-specific
+//! blob. Persist it and feed it back into [`extract_pair_request`] /
+//! [`accept_pair_request_message`] / [`reject_pair_request_message`] (on the
+//! contact-initiator side) or [`extract_pair_response`] /
+//! [`process_pair_response_message`] (on the contact-responder side).
 
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use crate::ffi::common::{
-    DeRecBuffer, DeRecStatus, empty_buffer, err_status, ok_status, vec_into_buffer,
+
+use crate::ffi::common::{DeRecBuffer, empty_buffer, vec_into_buffer};
+use crate::ffi::error::{
+    DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_BAD_SHARED_KEY, DEREC_CODE_FFI_BAD_UTF8,
+    DEREC_CODE_FFI_INVALID_ENUM, DEREC_CODE_FFI_NULL_PTR, DeRecError, ffi_error, from_lib_error,
+    success,
 };
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
-use derec_proto::{ContactMessage, SenderKind, TransportProtocol};
-use prost::Message;
+use derec_proto::{
+    CommunicationInfo, ContactMessage, DeRecMessage, PairRequestMessage, PairResponseMessage,
+    SenderKind, StatusEnum, TransportProtocol,
+};
+use prost::Message as _;
 
-/// FFI result returned by [`create_contact_message`].
-///
-/// On success:
-///
-/// - `status` indicates success
-/// - `contact_message` contains plain serialized `ContactMessage` protobuf bytes
-/// - `secret_key_material` contains opaque serialized pairing secret key material
-///   that must be stored by the caller and later supplied to
-///   [`produce_pairing_response_message`]
-///
-/// On failure:
-///
-/// - `status` contains an error
-/// - output buffers are empty
 #[repr(C)]
 pub struct CreateContactMessageResult {
-    pub status: DeRecStatus,
+    pub error: DeRecError,
     pub contact_wire_bytes: DeRecBuffer,
+    /// Opaque pairing secret key material. See module docs.
     pub secret_key_material: DeRecBuffer,
 }
 
-/// FFI result returned by [`produce_pairing_request_message`].
-///
-/// On success:
-///
-/// - `status` indicates success
-/// - `request_wire_bytes` contains serialized outer `DeRecMessage` bytes
-///   carrying an encrypted inner `PairRequestMessage`
-/// - `initiator_contact_message_wire_bytes` contains plain serialized `ContactMessage`
-///   protobuf bytes, providing the responder with the initiator's transport endpoint,
-///   public keys, channel identifier, and nonce needed to complete the pairing flow
-/// - `secret_key_material` contains opaque serialized pairing secret key material
-///   that must be stored by the caller and later supplied to
-///   [`process_pairing_response_message`]
-///
-/// On failure:
-///
-/// - `status` contains an error
-/// - output buffers are empty
 #[repr(C)]
-pub struct ProducePairingRequestMessageResult {
-    pub status: DeRecStatus,
+pub struct ProducePairRequestMessageResult {
+    pub error: DeRecError,
     pub request_wire_bytes: DeRecBuffer,
     pub initiator_contact_message_wire_bytes: DeRecBuffer,
+    /// Opaque pairing secret key material. See module docs.
     pub secret_key_material: DeRecBuffer,
 }
 
-/// FFI result returned by [`produce_pairing_response_message`].
-///
-/// On success:
-///
-/// - `status` indicates success
-/// - `pair_response_message` contains serialized outer `DeRecMessage` bytes
-///   carrying an encrypted inner `PairResponseMessage`
-/// - `peer_transport_protocol` contains serialized `TransportProtocol` protobuf bytes
-///   extracted from the validated pairing request
-/// - `shared_key` contains the derived pairing shared key bytes
-///
-/// On failure:
-///
-/// - `status` contains an error
-/// - output buffers are empty
 #[repr(C)]
-pub struct ProducePairingResponseMessageResult {
-    pub status: DeRecStatus,
+pub struct ExtractPairRequestResult {
+    pub error: DeRecError,
+    pub channel_id: u64,
+    /// Inner `PairRequestMessage` proto bytes for chaining into
+    /// [`accept_pair_request_message`] or [`reject_pair_request_message`].
+    pub request_proto_bytes: DeRecBuffer,
+}
+
+#[repr(C)]
+pub struct AcceptPairRequestMessageResult {
+    pub error: DeRecError,
     pub response_wire_bytes: DeRecBuffer,
     pub peer_transport_protocol: DeRecBuffer,
     pub shared_key: DeRecBuffer,
 }
 
-/// FFI result returned by [`process_pairing_response_message`].
-///
-/// On success:
-///
-/// - `status` indicates success
-/// - `shared_key` contains the derived pairing shared key bytes
-///
-/// On failure:
-///
-/// - `status` contains an error
-/// - output buffers are empty
 #[repr(C)]
-pub struct ProcessPairingResponseMessageResult {
-    pub status: DeRecStatus,
+pub struct RejectPairRequestMessageResult {
+    pub error: DeRecError,
+    pub response_wire_bytes: DeRecBuffer,
+    pub peer_transport_protocol: DeRecBuffer,
+}
+
+#[repr(C)]
+pub struct ExtractPairResponseResult {
+    pub error: DeRecError,
+    pub channel_id: u64,
+    /// Inner `PairResponseMessage` proto bytes for chaining into
+    /// [`process_pair_response_message`].
+    pub response_proto_bytes: DeRecBuffer,
+}
+
+/// `shared_key` is populated only on success; empty on peer rejection (see
+/// [`crate::ffi::error`]).
+#[repr(C)]
+pub struct ProcessPairResponseMessageResult {
+    pub error: DeRecError,
     pub shared_key: DeRecBuffer,
 }
 
-/// Creates a serialized `ContactMessage` and its associated pairing secret key material.
-///
-/// This is the C FFI entry point for the first step of the DeRec pairing flow.
-///
-/// The caller provides:
-///
-/// - `channel_id` as a raw `u64`
-/// - `transport_protocol_ptr` / `transport_protocol_len` as serialized `TransportProtocol`
-///   protobuf bytes
-///
-/// On success, this function returns:
-///
-/// - plain serialized `ContactMessage` protobuf bytes
-/// - opaque secret key material that must be retained by the caller and passed
-///   back into [`produce_pairing_response_message`]
-///
-/// # Arguments
-///
-/// * `channel_id` - Channel identifier used by the pairing flow.
-/// * `transport_protocol_ptr` - Pointer to serialized `TransportProtocol` protobuf bytes.
-/// * `transport_protocol_len` - Length of the serialized `TransportProtocol` buffer.
-///
-/// # Returns
-///
-/// Returns [`CreateContactMessageResult`].
-///
-/// # Errors
-///
-/// The returned `status` indicates failure if:
-///
-/// - `transport_protocol_ptr` is null
-/// - the bytes cannot be decoded as a valid `TransportProtocol`
-/// - the underlying Rust pairing API returns an error
-///
 /// # Safety
 ///
-/// `transport_protocol_ptr` must either be null (in which case an error is returned)
-/// or point to `transport_protocol_len` readable bytes.
+/// Non-null input pointers must point to the corresponding readable byte ranges.
 #[unsafe(no_mangle)]
 pub extern "C" fn create_contact_message(
     channel_id: u64,
     transport_protocol_ptr: *const u8,
     transport_protocol_len: usize,
 ) -> CreateContactMessageResult {
-    if transport_protocol_ptr.is_null() {
-        return CreateContactMessageResult {
-            status: err_status("transport_protocol_ptr is null"),
-            contact_wire_bytes: empty_buffer(),
-            secret_key_material: empty_buffer(),
+    let with_err = |error| CreateContactMessageResult {
+        error,
+        contact_wire_bytes: empty_buffer(),
+        secret_key_material: empty_buffer(),
+    };
+
+    let transport_protocol =
+        match decode_transport_protocol(transport_protocol_ptr, transport_protocol_len) {
+            Ok(t) => t,
+            Err(e) => return with_err(e),
         };
-    }
 
-    let transport_protocol_bytes =
-        unsafe { std::slice::from_raw_parts(transport_protocol_ptr, transport_protocol_len) };
-
-    let transport_protocol = match TransportProtocol::decode(transport_protocol_bytes) {
-        Ok(value) => value,
-        Err(_) => {
-            return CreateContactMessageResult {
-                status: err_status("transport_protocol_bytes is not a valid TransportProtocol"),
-                contact_wire_bytes: empty_buffer(),
-                secret_key_material: empty_buffer(),
-            };
-        }
-    };
-
-    let result = match crate::primitives::pairing::request::create_contact(channel_id.into(), transport_protocol) {
-        Ok(value) => value,
-        Err(err) => {
-            return CreateContactMessageResult {
-                status: err_status(err.to_string()),
-                contact_wire_bytes: empty_buffer(),
-                secret_key_material: empty_buffer(),
-            };
-        }
-    };
-
-    let contact_message_bytes = result.contact_message.encode_to_vec();
-    let secret_key_material_bytes = serialize_pairing_secret_key_material(&result.secret_key);
-
-    CreateContactMessageResult {
-        status: ok_status(),
-        contact_wire_bytes: vec_into_buffer(contact_message_bytes),
-        secret_key_material: vec_into_buffer(secret_key_material_bytes),
+    match crate::primitives::pairing::request::create_contact(channel_id.into(), transport_protocol)
+    {
+        Ok(r) => CreateContactMessageResult {
+            error: success(),
+            contact_wire_bytes: vec_into_buffer(r.contact_message.encode_to_vec()),
+            secret_key_material: vec_into_buffer(serialize_pairing_secret_key_material(
+                &r.secret_key,
+            )),
+        },
+        Err(e) => with_err(from_lib_error(e)),
     }
 }
 
-/// Produces a serialized pairing request envelope from a serialized `ContactMessage`.
-///
-/// This is the C FFI entry point for the second step of the DeRec pairing flow.
-///
-/// The caller provides:
-///
-/// - `sender_kind` as the raw `i32` protobuf enum value of [`SenderKind`]
-/// - `transport_protocol_ptr` / `transport_protocol_len` as serialized `TransportProtocol`
-///   protobuf bytes describing the responder's transport endpoint
-/// - a plain serialized `ContactMessage` protobuf buffer
-///
-/// On success, this function returns:
-///
-/// - serialized outer `DeRecMessage` bytes carrying an encrypted inner
-///   `PairRequestMessage`
-/// - opaque secret key material that must be retained by the caller and later
-///   supplied to [`process_pairing_response_message`]
-///
-/// # Arguments
-///
-/// * `sender_kind` - Raw protobuf enum value of [`SenderKind`].
-/// * `transport_protocol_ptr` - Pointer to serialized `TransportProtocol` protobuf bytes.
-/// * `transport_protocol_len` - Length of the serialized `TransportProtocol` buffer.
-/// * `contact_message_ptr` - Pointer to plain serialized `ContactMessage` protobuf bytes.
-/// * `contact_message_len` - Length of the serialized contact message buffer.
-///
-/// # Returns
-///
-/// Returns [`ProducePairingRequestMessageResult`].
-///
-/// # Errors
-///
-/// The returned `status` indicates failure if:
-///
-/// - `transport_protocol_ptr` is null
-/// - `contact_message_ptr` is null
-/// - the bytes cannot be decoded as a valid `TransportProtocol`
-/// - `sender_kind` is not a valid [`SenderKind`]
-/// - the underlying Rust pairing API returns an error
+/// `communication_info_ptr` may be null / zero-length to indicate no
+/// communication info; otherwise it must be serialized [`CommunicationInfo`]
+/// proto bytes.
 ///
 /// # Safety
 ///
-/// The input pointers must either be null (in which case an error is returned)
-/// or point to the corresponding readable byte ranges.
+/// Non-null input pointers must point to the corresponding readable byte ranges.
 #[unsafe(no_mangle)]
-pub extern "C" fn produce_pairing_request_message(
+pub extern "C" fn produce_pair_request_message(
     sender_kind: i32,
     transport_protocol_ptr: *const u8,
     transport_protocol_len: usize,
     contact_message_ptr: *const u8,
     contact_message_len: usize,
-) -> ProducePairingRequestMessageResult {
-    if transport_protocol_ptr.is_null() {
-        return ProducePairingRequestMessageResult {
-            status: err_status("transport_protocol_ptr is null"),
-            request_wire_bytes: empty_buffer(),
-            initiator_contact_message_wire_bytes: empty_buffer(),
-            secret_key_material: empty_buffer(),
-        };
-    }
-
-    if contact_message_ptr.is_null() {
-        return ProducePairingRequestMessageResult {
-            status: err_status("contact_message_ptr is null"),
-            request_wire_bytes: empty_buffer(),
-            initiator_contact_message_wire_bytes: empty_buffer(),
-            secret_key_material: empty_buffer(),
-        };
-    }
+    communication_info_ptr: *const u8,
+    communication_info_len: usize,
+) -> ProducePairRequestMessageResult {
+    let with_err = |error| ProducePairRequestMessageResult {
+        error,
+        request_wire_bytes: empty_buffer(),
+        initiator_contact_message_wire_bytes: empty_buffer(),
+        secret_key_material: empty_buffer(),
+    };
 
     let sender_kind = match SenderKind::try_from(sender_kind) {
         Ok(v) => v,
         Err(_) => {
-            return ProducePairingRequestMessageResult {
-                status: err_status(format!("invalid SenderKind value: {sender_kind}")),
-                request_wire_bytes: empty_buffer(),
-                initiator_contact_message_wire_bytes: empty_buffer(),
-                secret_key_material: empty_buffer(),
-            };
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_INVALID_ENUM,
+                format!("invalid SenderKind value: {sender_kind}"),
+            ));
         }
     };
-
-    let transport_protocol_bytes =
-        unsafe { std::slice::from_raw_parts(transport_protocol_ptr, transport_protocol_len) };
-
-    let transport_protocol = match TransportProtocol::decode(transport_protocol_bytes) {
-        Ok(value) => value,
-        Err(_) => {
-            return ProducePairingRequestMessageResult {
-                status: err_status("transport_protocol_bytes is not a valid TransportProtocol"),
-                request_wire_bytes: empty_buffer(),
-                initiator_contact_message_wire_bytes: empty_buffer(),
-                secret_key_material: empty_buffer(),
-            };
-        }
-    };
-
+    let transport_protocol =
+        match decode_transport_protocol(transport_protocol_ptr, transport_protocol_len) {
+            Ok(t) => t,
+            Err(e) => return with_err(e),
+        };
     let contact_message_bytes =
-        unsafe { std::slice::from_raw_parts(contact_message_ptr, contact_message_len) };
-
+        match parse_buffer(contact_message_ptr, contact_message_len, "contact_message_ptr") {
+            Ok(b) => b,
+            Err(e) => return with_err(e),
+        };
     let contact_message = match ContactMessage::decode(contact_message_bytes) {
-        Ok(value) => value,
+        Ok(c) => c,
         Err(_) => {
-            return ProducePairingRequestMessageResult {
-                status: err_status("contact_message_bytes is not a valid ContactMessage"),
-                request_wire_bytes: empty_buffer(),
-                initiator_contact_message_wire_bytes: empty_buffer(),
-                secret_key_material: empty_buffer(),
-            };
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                "contact_message_bytes is not a valid ContactMessage",
+            ));
         }
     };
+    let communication_info =
+        match decode_optional_communication_info(communication_info_ptr, communication_info_len) {
+            Ok(c) => c,
+            Err(e) => return with_err(e),
+        };
 
-    let result = match crate::primitives::pairing::request::produce(
+    match crate::primitives::pairing::request::produce(
         sender_kind,
         transport_protocol,
         &contact_message,
-        None,
+        communication_info,
     ) {
-        Ok(value) => value,
-        Err(err) => {
-            return ProducePairingRequestMessageResult {
-                status: err_status(err.to_string()),
-                request_wire_bytes: empty_buffer(),
-                initiator_contact_message_wire_bytes: empty_buffer(),
-                secret_key_material: empty_buffer(),
-            };
-        }
-    };
-
-    let pair_request_message_bytes = result.envelope;
-    let initiator_contact_message_bytes = result.initiator_contact_message.encode_to_vec();
-    let secret_key_material_bytes = serialize_pairing_secret_key_material(&result.secret_key);
-
-    ProducePairingRequestMessageResult {
-        status: ok_status(),
-        request_wire_bytes: vec_into_buffer(pair_request_message_bytes),
-        initiator_contact_message_wire_bytes: vec_into_buffer(initiator_contact_message_bytes),
-        secret_key_material: vec_into_buffer(secret_key_material_bytes),
+        Ok(r) => ProducePairRequestMessageResult {
+            error: success(),
+            request_wire_bytes: vec_into_buffer(r.envelope),
+            initiator_contact_message_wire_bytes: vec_into_buffer(
+                r.initiator_contact_message.encode_to_vec(),
+            ),
+            secret_key_material: vec_into_buffer(serialize_pairing_secret_key_material(
+                &r.secret_key,
+            )),
+        },
+        Err(e) => with_err(from_lib_error(e)),
     }
 }
 
-/// Produces a serialized pairing response envelope and the final shared key.
+/// # Safety
 ///
-/// This is the C FFI entry point for the initiator-side finalization step of the
-/// pairing flow.
-///
-/// The caller provides:
-///
-/// - `sender_kind` as the raw `i32` protobuf enum value of [`SenderKind`]
-/// - serialized outer `DeRecMessage` bytes carrying an encrypted inner
-///   `PairRequestMessage`
-/// - opaque pairing secret key material previously returned by
-///   [`create_contact_message`]
-///
-/// On success, this function returns:
-///
-/// - serialized outer `DeRecMessage` bytes carrying an encrypted inner
-///   `PairResponseMessage`
-/// - serialized `TransportProtocol` protobuf bytes extracted from the request
-/// - the derived pairing shared key bytes
-///
-/// # Arguments
-///
-/// * `sender_kind` - Raw protobuf enum value of [`SenderKind`].
-/// * `pair_request_message_ptr` - Pointer to serialized outer request envelope bytes.
-/// * `pair_request_message_len` - Length of the serialized outer request buffer.
-/// * `secret_key_material_ptr` - Pointer to opaque serialized pairing secret key material.
-/// * `secret_key_material_len` - Length of the secret key material buffer.
-///
-/// # Returns
-///
-/// Returns [`ProducePairingResponseMessageResult`].
-///
-/// # Errors
-///
-/// The returned `status` indicates failure if:
-///
-/// - `pair_request_message_ptr` is null
-/// - `secret_key_material_ptr` is null
-/// - `sender_kind` is not a valid [`SenderKind`]
-/// - the secret key material bytes are not valid for this FFI format
-/// - the underlying Rust pairing API returns an error
+/// Non-null input pointers must point to the corresponding readable byte ranges.
+#[unsafe(no_mangle)]
+pub extern "C" fn extract_pair_request(
+    request_ptr: *const u8,
+    request_len: usize,
+    secret_key_material_ptr: *const u8,
+    secret_key_material_len: usize,
+) -> ExtractPairRequestResult {
+    let with_err = |error| ExtractPairRequestResult {
+        error,
+        channel_id: 0,
+        request_proto_bytes: empty_buffer(),
+    };
+
+    let request_bytes = match parse_buffer(request_ptr, request_len, "request_ptr") {
+        Ok(b) => b,
+        Err(e) => return with_err(e),
+    };
+    let pairing_secret_key_material =
+        match decode_secret_key_material(secret_key_material_ptr, secret_key_material_len) {
+            Ok(m) => m,
+            Err(e) => return with_err(e),
+        };
+
+    let channel_id = match DeRecMessage::decode(request_bytes) {
+        Ok(e) => e.channel_id,
+        Err(e) => {
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                format!("failed to decode envelope: {e}"),
+            ));
+        }
+    };
+
+    match crate::primitives::pairing::request::extract(
+        request_bytes,
+        pairing_secret_key_material.ecies_secret_key(),
+    ) {
+        Ok(r) => ExtractPairRequestResult {
+            error: success(),
+            channel_id,
+            request_proto_bytes: vec_into_buffer(r.request.encode_to_vec()),
+        },
+        Err(e) => with_err(from_lib_error(e)),
+    }
+}
+
+/// `request_proto_ptr` / `request_proto_len` must be the `request_proto_bytes`
+/// returned by [`extract_pair_request`]. `communication_info_ptr` may be null /
+/// zero-length to indicate no communication info.
 ///
 /// # Safety
 ///
-/// The input pointers must either be null (in which case an error is returned)
-/// or point to the corresponding readable byte ranges.
+/// Non-null input pointers must point to the corresponding readable byte ranges.
 #[unsafe(no_mangle)]
-pub extern "C" fn produce_pairing_response_message(
+pub extern "C" fn accept_pair_request_message(
     sender_kind: i32,
-    pair_request_message_ptr: *const u8,
-    pair_request_message_len: usize,
+    request_proto_ptr: *const u8,
+    request_proto_len: usize,
     secret_key_material_ptr: *const u8,
     secret_key_material_len: usize,
-) -> ProducePairingResponseMessageResult {
-    if pair_request_message_ptr.is_null() {
-        return ProducePairingResponseMessageResult {
-            status: err_status("pair_request_message_ptr is null"),
-            response_wire_bytes: empty_buffer(),
-            peer_transport_protocol: empty_buffer(),
-            shared_key: empty_buffer(),
-        };
-    }
-
-    if secret_key_material_ptr.is_null() {
-        return ProducePairingResponseMessageResult {
-            status: err_status("secret_key_material_ptr is null"),
-            response_wire_bytes: empty_buffer(),
-            peer_transport_protocol: empty_buffer(),
-            shared_key: empty_buffer(),
-        };
-    }
+    communication_info_ptr: *const u8,
+    communication_info_len: usize,
+) -> AcceptPairRequestMessageResult {
+    let with_err = |error| AcceptPairRequestMessageResult {
+        error,
+        response_wire_bytes: empty_buffer(),
+        peer_transport_protocol: empty_buffer(),
+        shared_key: empty_buffer(),
+    };
 
     let sender_kind = match SenderKind::try_from(sender_kind) {
         Ok(v) => v,
         Err(_) => {
-            return ProducePairingResponseMessageResult {
-                status: err_status(format!("invalid SenderKind value: {sender_kind}")),
-                response_wire_bytes: empty_buffer(),
-                peer_transport_protocol: empty_buffer(),
-                shared_key: empty_buffer(),
-            };
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_INVALID_ENUM,
+                format!("invalid SenderKind value: {sender_kind}"),
+            ));
         }
     };
-
-    let pair_request_message_bytes =
-        unsafe { std::slice::from_raw_parts(pair_request_message_ptr, pair_request_message_len) };
-
-    let secret_key_material_bytes =
-        unsafe { std::slice::from_raw_parts(secret_key_material_ptr, secret_key_material_len) };
-
+    let request_bytes =
+        match parse_buffer(request_proto_ptr, request_proto_len, "request_proto_ptr") {
+            Ok(b) => b,
+            Err(e) => return with_err(e),
+        };
+    let request = match PairRequestMessage::decode(request_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                format!("failed to decode request: {e}"),
+            ));
+        }
+    };
     let pairing_secret_key_material =
-        match deserialize_pairing_secret_key_material(secret_key_material_bytes) {
-            Ok(value) => value,
-            Err(err) => {
-                return ProducePairingResponseMessageResult {
-                    status: err_status(format!("invalid secret key material: {err}")),
-                    response_wire_bytes: empty_buffer(),
-                    peer_transport_protocol: empty_buffer(),
-                    shared_key: empty_buffer(),
-                };
-            }
+        match decode_secret_key_material(secret_key_material_ptr, secret_key_material_len) {
+            Ok(m) => m,
+            Err(e) => return with_err(e),
+        };
+    let communication_info =
+        match decode_optional_communication_info(communication_info_ptr, communication_info_len) {
+            Ok(c) => c,
+            Err(e) => return with_err(e),
         };
 
-    let request = match crate::primitives::pairing::request::extract(
-        pair_request_message_bytes,
-        pairing_secret_key_material.ecies_secret_key(),
-    ) {
-        Ok(r) => r.request,
-        Err(err) => {
-            return ProducePairingResponseMessageResult {
-                status: err_status(err.to_string()),
-                response_wire_bytes: empty_buffer(),
-                peer_transport_protocol: empty_buffer(),
-                shared_key: empty_buffer(),
-            };
-        }
-    };
-
-    let result = match crate::primitives::pairing::response::accept(
+    match crate::primitives::pairing::response::accept(
         sender_kind,
         &request,
         &pairing_secret_key_material,
-        None,
+        communication_info,
     ) {
-        Ok(value) => value,
-        Err(err) => {
-            return ProducePairingResponseMessageResult {
-                status: err_status(err.to_string()),
-                response_wire_bytes: empty_buffer(),
-                peer_transport_protocol: empty_buffer(),
-                shared_key: empty_buffer(),
-            };
-        }
-    };
-
-    let pair_response_message_bytes = result.envelope;
-    let transport_protocol_bytes = serialize_transport_protocol(&result.peer_transport_protocol);
-    let shared_key_bytes = serialize_pairing_shared_key(&result.shared_key);
-
-    ProducePairingResponseMessageResult {
-        status: ok_status(),
-        response_wire_bytes: vec_into_buffer(pair_response_message_bytes),
-        peer_transport_protocol: vec_into_buffer(transport_protocol_bytes),
-        shared_key: vec_into_buffer(shared_key_bytes),
+        Ok(r) => AcceptPairRequestMessageResult {
+            error: success(),
+            response_wire_bytes: vec_into_buffer(r.envelope),
+            peer_transport_protocol: vec_into_buffer(r.peer_transport_protocol.encode_to_vec()),
+            shared_key: vec_into_buffer(r.shared_key.to_vec()),
+        },
+        Err(e) => with_err(from_lib_error(e)),
     }
 }
 
-/// Processes a serialized pairing response envelope and derives the final shared key.
-///
-/// This is the C FFI entry point for the responder-side completion step of the
-/// pairing flow.
-///
-/// The caller provides:
-///
-/// - a plain serialized `ContactMessage` protobuf
-/// - serialized outer `DeRecMessage` bytes carrying an encrypted inner
-///   `PairResponseMessage`
-/// - opaque pairing secret key material previously returned by
-///   [`produce_pairing_request_message`]
-///
-/// On success, this function returns:
-///
-/// - the derived pairing shared key bytes
-///
-/// # Arguments
-///
-/// * `contact_message_ptr` - Pointer to plain serialized `ContactMessage` bytes.
-/// * `contact_message_len` - Length of the serialized contact message buffer.
-/// * `pair_response_message_ptr` - Pointer to serialized outer response envelope bytes.
-/// * `pair_response_message_len` - Length of the serialized outer response buffer.
-/// * `secret_key_material_ptr` - Pointer to opaque serialized pairing secret key material.
-/// * `secret_key_material_len` - Length of the secret key material buffer.
-///
-/// # Returns
-///
-/// Returns [`ProcessPairingResponseMessageResult`].
-///
-/// # Errors
-///
-/// The returned `status` indicates failure if:
-///
-/// - any required pointer is null
-/// - the secret key material bytes are not valid for this FFI format
-/// - the underlying Rust pairing API returns an error
+/// `request_proto_ptr` / `request_proto_len` must be the `request_proto_bytes`
+/// returned by [`extract_pair_request`]. `status_enum` is the raw `i32` value
+/// of [`StatusEnum`].
 ///
 /// # Safety
 ///
-/// The input pointers must either be null (in which case an error is returned)
-/// or point to the corresponding readable byte ranges.
+/// Non-null input pointers must point to the corresponding readable byte ranges.
 #[unsafe(no_mangle)]
-pub extern "C" fn process_pairing_response_message(
-    contact_message_ptr: *const u8,
-    contact_message_len: usize,
-    pair_response_message_ptr: *const u8,
-    pair_response_message_len: usize,
+pub extern "C" fn reject_pair_request_message(
+    sender_kind: i32,
+    request_proto_ptr: *const u8,
+    request_proto_len: usize,
+    status_enum: i32,
+    memo_ptr: *const u8,
+    memo_len: usize,
+    communication_info_ptr: *const u8,
+    communication_info_len: usize,
+) -> RejectPairRequestMessageResult {
+    let with_err = |error| RejectPairRequestMessageResult {
+        error,
+        response_wire_bytes: empty_buffer(),
+        peer_transport_protocol: empty_buffer(),
+    };
+
+    let sender_kind = match SenderKind::try_from(sender_kind) {
+        Ok(v) => v,
+        Err(_) => {
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_INVALID_ENUM,
+                format!("invalid SenderKind value: {sender_kind}"),
+            ));
+        }
+    };
+    let status_enum_value = match StatusEnum::try_from(status_enum) {
+        Ok(v) => v,
+        Err(_) => {
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_INVALID_ENUM,
+                format!("invalid StatusEnum value: {status_enum}"),
+            ));
+        }
+    };
+    let request_bytes =
+        match parse_buffer(request_proto_ptr, request_proto_len, "request_proto_ptr") {
+            Ok(b) => b,
+            Err(e) => return with_err(e),
+        };
+    let request = match PairRequestMessage::decode(request_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                format!("failed to decode request: {e}"),
+            ));
+        }
+    };
+    let memo_bytes = match parse_buffer(memo_ptr, memo_len, "memo_ptr") {
+        Ok(b) => b,
+        Err(e) => return with_err(e),
+    };
+    let memo = match std::str::from_utf8(memo_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_BAD_UTF8,
+                "memo is not valid UTF-8",
+            ));
+        }
+    };
+    let communication_info =
+        match decode_optional_communication_info(communication_info_ptr, communication_info_len) {
+            Ok(c) => c,
+            Err(e) => return with_err(e),
+        };
+
+    match crate::primitives::pairing::response::reject(
+        sender_kind,
+        &request,
+        status_enum_value,
+        memo,
+        communication_info,
+    ) {
+        Ok(r) => RejectPairRequestMessageResult {
+            error: success(),
+            response_wire_bytes: vec_into_buffer(r.envelope),
+            peer_transport_protocol: vec_into_buffer(r.peer_transport_protocol.encode_to_vec()),
+        },
+        Err(e) => with_err(from_lib_error(e)),
+    }
+}
+
+/// # Safety
+///
+/// Non-null input pointers must point to the corresponding readable byte ranges.
+#[unsafe(no_mangle)]
+pub extern "C" fn extract_pair_response(
+    response_ptr: *const u8,
+    response_len: usize,
     secret_key_material_ptr: *const u8,
     secret_key_material_len: usize,
-) -> ProcessPairingResponseMessageResult {
-    if contact_message_ptr.is_null() {
-        return ProcessPairingResponseMessageResult {
-            status: err_status("contact_message_ptr is null"),
-            shared_key: empty_buffer(),
+) -> ExtractPairResponseResult {
+    let with_err = |error| ExtractPairResponseResult {
+        error,
+        channel_id: 0,
+        response_proto_bytes: empty_buffer(),
+    };
+
+    let response_bytes = match parse_buffer(response_ptr, response_len, "response_ptr") {
+        Ok(b) => b,
+        Err(e) => return with_err(e),
+    };
+    let pairing_secret_key_material =
+        match decode_secret_key_material(secret_key_material_ptr, secret_key_material_len) {
+            Ok(m) => m,
+            Err(e) => return with_err(e),
         };
-    }
 
-    if pair_response_message_ptr.is_null() {
-        return ProcessPairingResponseMessageResult {
-            status: err_status("pair_response_message_ptr is null"),
-            shared_key: empty_buffer(),
-        };
-    }
-
-    if secret_key_material_ptr.is_null() {
-        return ProcessPairingResponseMessageResult {
-            status: err_status("secret_key_material_ptr is null"),
-            shared_key: empty_buffer(),
-        };
-    }
-
-    let contact_message_bytes =
-        unsafe { std::slice::from_raw_parts(contact_message_ptr, contact_message_len) };
-
-    let contact_message = match ContactMessage::decode(contact_message_bytes) {
-        Ok(value) => value,
-        Err(_) => {
-            return ProcessPairingResponseMessageResult {
-                status: err_status("contact_message_bytes is not a valid ContactMessage"),
-                shared_key: empty_buffer(),
-            };
+    let channel_id = match DeRecMessage::decode(response_bytes) {
+        Ok(e) => e.channel_id,
+        Err(e) => {
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                format!("failed to decode envelope: {e}"),
+            ));
         }
     };
 
-    let pair_response_message_bytes =
-        unsafe { std::slice::from_raw_parts(pair_response_message_ptr, pair_response_message_len) };
-
-    let secret_key_material_bytes =
-        unsafe { std::slice::from_raw_parts(secret_key_material_ptr, secret_key_material_len) };
-
-    let pairing_secret_key_material =
-        match deserialize_pairing_secret_key_material(secret_key_material_bytes) {
-            Ok(value) => value,
-            Err(err) => {
-                return ProcessPairingResponseMessageResult {
-                    status: err_status(format!("invalid secret key material: {err}")),
-                    shared_key: empty_buffer(),
-                };
-            }
-        };
-
-    let response = match crate::primitives::pairing::response::extract(
-        pair_response_message_bytes,
+    match crate::primitives::pairing::response::extract(
+        response_bytes,
         pairing_secret_key_material.ecies_secret_key(),
     ) {
-        Ok(r) => r.response,
-        Err(err) => {
-            return ProcessPairingResponseMessageResult {
-                status: err_status(err.to_string()),
-                shared_key: empty_buffer(),
-            };
-        }
+        Ok(r) => ExtractPairResponseResult {
+            error: success(),
+            channel_id,
+            response_proto_bytes: vec_into_buffer(r.response.encode_to_vec()),
+        },
+        Err(e) => with_err(from_lib_error(e)),
+    }
+}
+
+/// `response_proto_ptr` / `response_proto_len` must be the
+/// `response_proto_bytes` returned by [`extract_pair_response`].
+///
+/// # Safety
+///
+/// Non-null input pointers must point to the corresponding readable byte ranges.
+#[unsafe(no_mangle)]
+pub extern "C" fn process_pair_response_message(
+    contact_message_ptr: *const u8,
+    contact_message_len: usize,
+    response_proto_ptr: *const u8,
+    response_proto_len: usize,
+    secret_key_material_ptr: *const u8,
+    secret_key_material_len: usize,
+) -> ProcessPairResponseMessageResult {
+    let with_err = |error| ProcessPairResponseMessageResult {
+        error,
+        shared_key: empty_buffer(),
     };
 
-    let result = match crate::primitives::pairing::response::process(
+    let contact_message_bytes =
+        match parse_buffer(contact_message_ptr, contact_message_len, "contact_message_ptr") {
+            Ok(b) => b,
+            Err(e) => return with_err(e),
+        };
+    let contact_message = match ContactMessage::decode(contact_message_bytes) {
+        Ok(c) => c,
+        Err(_) => {
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                "contact_message_bytes is not a valid ContactMessage",
+            ));
+        }
+    };
+    let response_bytes =
+        match parse_buffer(response_proto_ptr, response_proto_len, "response_proto_ptr") {
+            Ok(b) => b,
+            Err(e) => return with_err(e),
+        };
+    let response = match PairResponseMessage::decode(response_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                format!("failed to decode response: {e}"),
+            ));
+        }
+    };
+    let pairing_secret_key_material =
+        match decode_secret_key_material(secret_key_material_ptr, secret_key_material_len) {
+            Ok(m) => m,
+            Err(e) => return with_err(e),
+        };
+
+    match crate::primitives::pairing::response::process(
         &contact_message,
         &response,
         &pairing_secret_key_material,
     ) {
-        Ok(value) => value,
-        Err(err) => {
-            return ProcessPairingResponseMessageResult {
-                status: err_status(err.to_string()),
-                shared_key: empty_buffer(),
-            };
-        }
-    };
-
-    let shared_key_bytes = serialize_pairing_shared_key(&result.shared_key);
-
-    ProcessPairingResponseMessageResult {
-        status: ok_status(),
-        shared_key: vec_into_buffer(shared_key_bytes),
+        Ok(r) => ProcessPairResponseMessageResult {
+            error: success(),
+            shared_key: vec_into_buffer(r.shared_key.to_vec()),
+        },
+        Err(e) => with_err(from_lib_error(e)),
     }
+}
+
+fn parse_buffer<'a>(ptr: *const u8, len: usize, name: &str) -> Result<&'a [u8], DeRecError> {
+    if ptr.is_null() && len > 0 {
+        return Err(ffi_error(
+            DEREC_CODE_FFI_NULL_PTR,
+            format!("{name} is null"),
+        ));
+    }
+    if len == 0 {
+        Ok(&[])
+    } else {
+        Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+}
+
+fn decode_transport_protocol(ptr: *const u8, len: usize) -> Result<TransportProtocol, DeRecError> {
+    let bytes = parse_buffer(ptr, len, "transport_protocol_ptr")?;
+    TransportProtocol::decode(bytes).map_err(|_| {
+        ffi_error(
+            DEREC_CODE_FFI_BAD_PROTO,
+            "transport_protocol_bytes is not a valid TransportProtocol",
+        )
+    })
+}
+
+fn decode_optional_communication_info(
+    ptr: *const u8,
+    len: usize,
+) -> Result<Option<CommunicationInfo>, DeRecError> {
+    if ptr.is_null() || len == 0 {
+        return Ok(None);
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    CommunicationInfo::decode(bytes).map(Some).map_err(|_| {
+        ffi_error(
+            DEREC_CODE_FFI_BAD_PROTO,
+            "communication_info_bytes is not a valid CommunicationInfo",
+        )
+    })
+}
+
+fn decode_secret_key_material(
+    ptr: *const u8,
+    len: usize,
+) -> Result<PairingSecretKeyMaterial, DeRecError> {
+    let bytes = parse_buffer(ptr, len, "secret_key_material_ptr")?;
+    PairingSecretKeyMaterial::deserialize_uncompressed(&mut &bytes[..]).map_err(|e| {
+        ffi_error(
+            DEREC_CODE_FFI_BAD_SHARED_KEY,
+            format!("invalid secret key material: {e}"),
+        )
+    })
 }
 
 fn serialize_pairing_secret_key_material(sk: &PairingSecretKeyMaterial) -> Vec<u8> {
@@ -655,21 +586,4 @@ fn serialize_pairing_secret_key_material(sk: &PairingSecretKeyMaterial) -> Vec<u
     sk.serialize_uncompressed(&mut out)
         .expect("PairingSecretKeyMaterial serialization is infallible");
     out
-}
-
-fn deserialize_pairing_secret_key_material(
-    bytes: &[u8],
-) -> Result<PairingSecretKeyMaterial, String> {
-    PairingSecretKeyMaterial::deserialize_uncompressed(&mut &bytes[..])
-        .map_err(|e| e.to_string())
-}
-
-fn serialize_pairing_shared_key(
-    shared_key: &derec_cryptography::pairing::PairingSharedKey,
-) -> Vec<u8> {
-    shared_key.to_vec()
-}
-
-fn serialize_transport_protocol(tp: &TransportProtocol) -> Vec<u8> {
-    tp.encode_to_vec()
 }

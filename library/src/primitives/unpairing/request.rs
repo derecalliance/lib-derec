@@ -3,11 +3,11 @@
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     types::{ChannelId, SharedKey},
+    utils::verify_timestamps,
 };
 use derec_proto::{DeRecMessage, MessageBody, UnpairRequestMessage};
 use prost::Message;
 
-/// Result of [`produce`].
 pub struct ProduceResult {
     /// Serialized outer [`derec_proto::DeRecMessage`] envelope carrying an
     /// encrypted inner [`derec_proto::UnpairRequestMessage`]. Ready to send
@@ -15,20 +15,26 @@ pub struct ProduceResult {
     pub envelope: Vec<u8>,
 }
 
-/// Result of [`extract`].
-#[derive(Debug)]
 pub struct ExtractResult {
-    /// Decrypted inner [`derec_proto::UnpairRequestMessage`].
     pub request: UnpairRequestMessage,
 }
 
-/// Creates an unpair request envelope.
+/// Produces an unpair request envelope asking the peer to drop all state
+/// associated with this channel.
 ///
-/// Either party — Owner or Helper — calls this to ask the counter-party to
-/// drop all state associated with `channel_id`. The envelope is symmetrically
-/// encrypted with the channel's `shared_key`; pairing must already be
-/// complete (i.e. the symmetric key is established) for this primitive to be
-/// meaningful.
+/// Either party — **Owner** or **Helper** — may call this to terminate a paired
+/// channel. The envelope is symmetrically encrypted with the channel's
+/// `shared_key`, so pairing must already be complete (i.e. the symmetric key
+/// is established) for this primitive to be meaningful.
+///
+/// This function:
+///
+/// 1. Builds an [`derec_proto::UnpairRequestMessage`] carrying the current
+///    timestamp and the application-supplied `memo`
+/// 2. Serializes the inner message and encrypts it with `shared_key`
+/// 3. Wraps the ciphertext into a plain outer [`derec_proto::DeRecMessage`]
+///    envelope, copying the same timestamp
+/// 4. Returns the serialized envelope bytes ready to send over the transport
 ///
 /// # Arguments
 ///
@@ -36,7 +42,8 @@ pub struct ExtractResult {
 /// * `memo` - Optional human-readable reason embedded in the request. Used
 ///   for logging / display only; the protocol attaches no semantics to it.
 ///   Pass an empty string when no reason is offered.
-/// * `shared_key` - 32-byte symmetric channel key established at pairing time.
+/// * `shared_key` - Previously established 32-byte symmetric channel key used
+///   to encrypt the inner request.
 ///
 /// # Returns
 ///
@@ -59,7 +66,7 @@ pub struct ExtractResult {
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```
 /// use derec_library::primitives::unpairing::request;
 /// use derec_library::types::ChannelId;
 ///
@@ -82,7 +89,7 @@ pub fn produce(
 ) -> Result<ProduceResult, crate::Error> {
     let timestamp = current_timestamp();
 
-    let message = UnpairRequestMessage {
+    let request = UnpairRequestMessage {
         memo: memo.to_owned(),
         timestamp: Some(timestamp),
     };
@@ -90,7 +97,7 @@ pub fn produce(
     let envelope = DeRecMessageBuilder::channel()
         .channel_id(channel_id)
         .timestamp(timestamp)
-        .message_body(MessageBody::UnpairRequest(message))
+        .message_body(MessageBody::UnpairRequest(request))
         .encrypt(shared_key)?
         .build()?
         .encode_to_vec();
@@ -101,23 +108,27 @@ pub fn produce(
     Ok(ProduceResult { envelope })
 }
 
-/// Decrypts and decodes an [`derec_proto::UnpairRequestMessage`] from an
-/// outer [`derec_proto::DeRecMessage`] envelope.
+/// Decrypts and decodes an incoming [`derec_proto::UnpairRequestMessage`]
+/// from an outer [`derec_proto::DeRecMessage`] envelope.
+///
+/// Call this on the **receiving** side after an unpair request envelope is
+/// received over the transport. Once decrypted, the protocol layer can drop
+/// its local state for the channel and reply with an unpair response.
 ///
 /// This function:
 ///
-/// 1. Decodes the outer [`derec_proto::DeRecMessage`] envelope from
-///    `envelope_bytes`.
+/// 1. Decodes the outer [`derec_proto::DeRecMessage`] envelope from `envelope_bytes`
 /// 2. Decrypts and decodes the inner [`derec_proto::UnpairRequestMessage`]
-///    using `shared_key`.
-/// 3. Validates the invariant `envelope.timestamp == request.timestamp`.
+///    using `shared_key`
+/// 3. Validates the invariant `envelope.timestamp == request.timestamp`
 ///
 /// # Arguments
 ///
 /// * `envelope_bytes` - Serialized outer [`derec_proto::DeRecMessage`] bytes
 ///   carrying an encrypted inner [`derec_proto::UnpairRequestMessage`], as
 ///   produced by [`produce`].
-/// * `shared_key` - 32-byte symmetric channel key established at pairing time.
+/// * `shared_key` - Previously established 32-byte symmetric channel key used to
+///   decrypt the inner message.
 ///
 /// # Returns
 ///
@@ -133,6 +144,25 @@ pub fn produce(
 /// - decryption or inner-message decoding fails
 /// - `envelope.timestamp != request.timestamp`
 /// - the inner message is not a [`derec_proto::UnpairRequestMessage`]
+///
+/// # Example
+///
+/// ```
+/// use derec_library::primitives::unpairing::request;
+/// use derec_library::types::ChannelId;
+///
+/// let channel_id = ChannelId(42);
+/// let shared_key = [7u8; 32];
+///
+/// let request::ProduceResult { envelope } =
+///     request::produce(channel_id, "no longer needed", &shared_key)
+///         .expect("failed to build unpair request");
+///
+/// let request::ExtractResult { request } =
+///     request::extract(&envelope, &shared_key).expect("failed to extract");
+///
+/// assert_eq!(request.memo, "no longer needed");
+/// ```
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
@@ -148,19 +178,14 @@ pub fn extract(
         _ => {
             #[cfg(feature = "logging")]
             tracing::warn!("unexpected message type; expected UnpairRequestMessage");
+
             return Err(crate::Error::Invariant(
                 "Invalid message. Expected: UnpairRequestMessage",
             ));
         }
     };
 
-    if envelope.timestamp != request.timestamp {
-        #[cfg(feature = "logging")]
-        tracing::warn!("timestamp invariant violated");
-        return Err(crate::Error::Invariant(
-            "Envelope timestamp does not match request timestamp",
-        ));
-    }
+    verify_timestamps(envelope.timestamp, request.timestamp)?;
 
     #[cfg(feature = "logging")]
     tracing::info!("unpair request extracted and validated");

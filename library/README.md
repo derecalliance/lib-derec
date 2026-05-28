@@ -48,7 +48,7 @@ Or manually in your `Cargo.toml`
 
 ```toml
 [dependencies]
-derec-library = "0.0.1-alpha.6"
+derec-library = "0.0.1-alpha.7"
 ```
 
 > [!WARNING]
@@ -111,9 +111,10 @@ use derec_library::primitives::verification::request;
 use derec_library::types::ChannelId;
 
 let channel_id = ChannelId(1);
-let secret_id = b"example_secret";
-let version = 1;
+let secret_id: u64 = 42;
+let version: u32 = 1;
 // shared_key: [u8; 32] established during pairing
+let shared_key = [0u8; 32];
 
 let result = request::produce(channel_id, secret_id, version, &shared_key).unwrap();
 // result.envelope is already serialized wire bytes, ready to send over transport
@@ -167,7 +168,7 @@ The `transportUri` in protocol messages identifies the helper endpoint.
 ### Pairing Flow
 
 ```rust
-use derec_library::primitives::pairing::{request, response};
+use derec_library::primitives::pairing::{request, response::{self, AcceptResult}};
 use derec_library::types::ChannelId;
 use derec_proto::{Protocol, SenderKind, TransportProtocol};
 
@@ -184,11 +185,8 @@ let request::CreateContactResult {
         protocol: Protocol::Https.into(),
     },
 ).unwrap();
-// Serialize for out-of-band transfer (QR code, deep link, etc.)
-// let contact_bytes = contact_message.encode_to_vec();
 
 // Step 2 — Responder decodes the contact and produces the request envelope.
-let contact = contact_message;
 let request::ProduceResult {
     envelope: pair_request_envelope,
     initiator_contact_message,
@@ -199,35 +197,41 @@ let request::ProduceResult {
         uri: "https://example-helper.com/derec".to_owned(),
         protocol: Protocol::Https.into(),
     },
-    &contact,
+    &contact_message,
+    None, // optional CommunicationInfo
 ).unwrap();
 
-// Step 3 — Initiator extracts the request and produces the response envelope.
-let request::ExtractResult { request } =
+// Step 3 — Initiator extracts the request and accepts it.
+let request::ExtractResult { request: pair_request } =
     request::extract(&pair_request_envelope, initiator_secret_key.ecies_secret_key()).unwrap();
-let response::ProduceResult {
+let AcceptResult {
     envelope: pair_response_envelope,
     shared_key: initiator_shared_key,
     ..
-} = response::produce(
-    SenderKind::OwnerNonRecovery,
-    &request,
+} = response::accept(
+    SenderKind::Owner,
+    &pair_request,
     &initiator_secret_key,
+    None, // optional CommunicationInfo
 ).unwrap();
 
 // Step 4 — Responder extracts the response and finalizes pairing.
-let response::ExtractResult { response } =
+let response::ExtractResult { response: pair_response } =
     response::extract(&pair_response_envelope, responder_secret_key.ecies_secret_key()).unwrap();
 let response::ProcessResult { shared_key: responder_shared_key } =
     response::process(
         &initiator_contact_message,
-        &response,
+        &pair_response,
         &responder_secret_key,
     ).unwrap();
 
 // Both sides now hold the same shared key.
 assert_eq!(initiator_shared_key, responder_shared_key);
 ```
+
+To reject instead of accept, use `response::reject(kind, &request, status, memo, None)`,
+which returns a `RejectResult` containing the response envelope and the peer's transport
+protocol (no shared key is derived).
 
 The `ContactMessage` is exchanged out-of-band, typically using:
 
@@ -242,11 +246,11 @@ The `ContactMessage` is exchanged out-of-band, typically using:
 use derec_library::primitives::sharing::request;
 use derec_library::types::ChannelId;
 
-let secret_id = b"my_secret";
+let secret_id: u64 = 42;
 let secret_data = b"super_secret_value";
 let channels = [ChannelId(1), ChannelId(2), ChannelId(3)];
-let threshold = 2;
-let version = 1;
+let threshold = 2; // minimum 2; must satisfy 2 <= threshold <= channels.len()
+let version: u32 = 1;
 
 let request::SplitResult { shares } = request::split(
     &channels,
@@ -268,26 +272,27 @@ use derec_library::primitives::verification::{request, response};
 use derec_library::types::ChannelId;
 
 let channel_id = ChannelId(1);
-let secret_id = b"secret_id";
-let version = 7;
-// shared_key: [u8; 32] established during pairing
+let secret_id: u64 = 42;
+let version: u32 = 7;
+let shared_key = [0u8; 32]; // established during pairing
 
 // Owner side: produce and send the verification request.
 let result = request::produce(channel_id, secret_id, version, &shared_key).unwrap();
 let request_wire_bytes = result.envelope;
 
-// Helper side: decrypt and extract the challenge fields.
-let request::ExtractResult { request } =
+// Helper side: decrypt and extract the inner request.
+let request::ExtractResult { request: verify_request } =
     request::extract(&request_wire_bytes, &shared_key).unwrap();
 
-// Helper side: produce the response.
-let resp_result = response::produce(channel_id, &request, &shared_key, b"example_share").unwrap();
+// Helper side: produce the response, proving possession of the share.
+let resp_result =
+    response::produce(channel_id, &verify_request, &shared_key, b"example_share").unwrap();
 let response_wire_bytes = resp_result.envelope;
 
 // Owner side: decrypt and verify the proof.
-let response::ExtractResult { response } =
+let response::ExtractResult { response: verify_response } =
     response::extract(&response_wire_bytes, &shared_key).unwrap();
-let ok = response::process(&response, b"example_share").unwrap();
+let ok = response::process(&verify_response, b"example_share").unwrap();
 
 assert!(ok);
 ```
@@ -313,11 +318,11 @@ let _req = request::extract(&request_envelope, &shared_key).unwrap();
 
 let stored: Vec<SecretVersionEntry> = vec![
     SecretVersionEntry {
-        secret_id: b"wallet_seed".to_vec(),
+        secret_id: 1,
         versions: vec![VersionEntry { version: 1, description: "Main wallet".to_owned() }],
     },
     SecretVersionEntry {
-        secret_id: b"ssh_key".to_vec(),
+        secret_id: 2,
         versions: vec![
             VersionEntry { version: 1, description: "Work SSH key".to_owned() },
             VersionEntry { version: 2, description: "Work SSH key v2".to_owned() },
@@ -336,7 +341,7 @@ let response::ProcessResult { secret_list } =
 // Owner now knows which (secret_id, version, description) tuples to request during recovery.
 for entry in &secret_list {
     for v in &entry.versions {
-        println!("secret_id={:?}  version={}  description={:?}", entry.secret_id, v.version, v.description);
+        println!("secret_id={}  version={}  description={:?}", entry.secret_id, v.version, v.description);
     }
 }
 ```
@@ -347,82 +352,43 @@ for entry in &secret_list {
 
 Recovery is a three-step process: **pairing** (re-establish a channel with each Helper in recovery
 mode), **discovery** (ask each Helper which secrets it holds), and **share collection**
-(reconstruct the secret).
+(reconstruct the secret). The end-to-end flow is orchestrated by the [`crate::protocol`] module;
+see its docs and the protocol-level smoke test (`bindings/rust/src/protocol.rs`) for the full
+driver loop.
 
-The application drives each step explicitly. Discovery is only triggered after any required
-out-of-band authentication has been completed.
-
-#### Step 1 — Pair with Helpers in recovery mode
-
-```rust
-use derec_library::protocol::{DeRecEvent, DeRecProtocol};
-use derec_proto::{ContactMessage, SenderKind};
-
-// helper_contacts: Vec<ContactMessage> obtained out-of-band (QR code, deep link, etc.)
-// The application pairs with each Helper individually — recovery can take days.
-
-for contact in helper_contacts {
-    owner.start_pairing(SenderKind::OwnerRecovery, contact).await.unwrap();
-}
-
-// Process incoming messages. PairingComplete { kind: SenderKind::OwnerRecovery, .. }
-// signals that recovery pairing with a Helper is done.
-// loop { let events = owner.process(&incoming_bytes).await?; ... }
-```
-
-#### Step 2 — Request discovery after authentication
-
-```rust
-// Once the Helper has authenticated the Owner (out-of-band), request discovery.
-// The Helper reports all (secret_id, version, description) pairs it holds.
-owner.request_discovery(channel_id).await.unwrap();
-
-// Process incoming messages until SecretsDiscovered is received.
-// loop { let events = owner.process(&incoming_bytes).await?; ... }
-//
-// DeRecEvent::SecretsDiscovered { channel_id, secrets } carries
-// Vec<SecretVersionEntry> — each entry has a secret_id and a list of
-// VersionEntry { version, description } so the Owner can identify secrets
-// by their human-readable labels.
-```
-
-#### Step 3 — Reconstruct the secret
-
-```rust
-// After collecting discovery results from enough Helpers, request the shares.
-owner
-    .recover_secret(secret_id, version, &helper_channel_ids)
-    .await
-    .unwrap();
-
-// The library accumulates responses; SecretRecovered is emitted once a
-// threshold of shares have been collected.
-// loop { let events = owner.process(&incoming_bytes).await?; ... }
-```
-
-#### Primitive-level reference (Helper side)
+The Helper-side primitive surface is:
 
 ```rust
 use derec_library::primitives::recovery::{request, response};
 use derec_library::types::ChannelId;
 
 let channel_id = ChannelId(1);
-// shared_key: [u8; 32] established during pairing
+let shared_key = [0u8; 32]; // established during pairing
+// request_envelope:        outer DeRecMessage bytes carrying a GetShareRequest
+// stored_share_request:    StoreShareRequestMessage the Helper persisted at sharing time
 
 // Helper side: extract the share request and produce a response.
-let request::ExtractResult { request } =
+let request::ExtractResult { request: get_share_request } =
     request::extract(&request_envelope, &shared_key).unwrap();
-let response::ProduceResult { envelope: response_envelope } =
-    response::produce(channel_id, secret_id, &request, &stored_share_request, &shared_key).unwrap();
-
-// Owner side: aggregate responses from a threshold of helpers and reconstruct.
-let response::RecoverResult { secret_data } = response::recover(
-    secret_id,
-    version,
-    &[response::RecoveryResponseInput {
-        share_response: &share_response,
-    }],
+let response::ProduceResult { envelope: response_envelope } = response::produce(
+    channel_id,
+    &get_share_request,
+    &stored_share_request,
+    &shared_key,
 ).unwrap();
+```
+
+The Owner side decrypts each helper response and reconstructs the secret once enough have arrived:
+
+```rust
+use derec_library::primitives::recovery::response;
+
+let secret_id: u64 = 42;
+let version: u32 = 1;
+// responses: Vec<GetShareResponseMessage> collected from `response::extract` per helper.
+let inputs: Vec<&_> = responses.iter().collect();
+let recovered = response::recover(secret_id, version, &inputs).unwrap();
+// recovered.secret_data contains the reconstructed payload.
 ```
 
 ---
@@ -453,21 +419,20 @@ use derec_library::primitives::unpairing::{request, response};
 use derec_library::types::ChannelId;
 
 let channel_id = ChannelId(1);
-// shared_key: [u8; 32] established during pairing
+let shared_key = [0u8; 32]; // established during pairing
 
 // Initiator side: produce and send the unpair request.
-let request = request::produce(channel_id, "decommissioning", &shared_key).unwrap();
-let wire_bytes = request.envelope;
+let req_result = request::produce(channel_id, "decommissioning", &shared_key).unwrap();
 
 // Responder side: extract the request, drop local state, send Ok response.
-let extracted = request::extract(&wire_bytes, &shared_key).unwrap();
-let response = response::produce(channel_id, &shared_key).unwrap();
+let _extracted = request::extract(&req_result.envelope, &shared_key).unwrap();
+let resp_result = response::produce(channel_id, &shared_key).unwrap();
 
-// Initiator side: validate the response.
-let ok = response::process(
-    &response::extract(&response.envelope, &shared_key).unwrap().response,
-).unwrap();
-assert!(ok.acknowledged);
+// Initiator side: extract and validate the response.
+let response::ExtractResult { response: unpair_response } =
+    response::extract(&resp_result.envelope, &shared_key).unwrap();
+let outcome = response::process(&unpair_response).unwrap();
+assert!(outcome.acknowledged);
 ```
 
 When driven through the high-level [`DeRecProtocol`] orchestrator the same
@@ -504,7 +469,7 @@ The library emits structured [tracing](https://docs.rs/tracing) spans and events
 
 ```toml
 [dependencies]
-derec-library = { version = "0.0.1-alpha.6", features = ["logging"] }
+derec-library = { version = "0.0.1-alpha.7", features = ["logging"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ```
 

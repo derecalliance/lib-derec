@@ -1,125 +1,146 @@
-use derec_proto::DeRecMessage;
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::primitives::{
+    discovery::DiscoveryError, pairing::PairingError, recovery::RecoveryError,
+    sharing::SharingError, unpairing::UnpairingError, verification::VerificationError,
+};
+use serde::Serialize;
 use wasm_bindgen::JsValue;
 use wasm_bindgen::prelude::wasm_bindgen;
 
-#[derive(serde::Serialize)]
+#[derive(Serialize)]
 struct TsError {
+    category: &'static str,
     code: &'static str,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    got: Option<u32>,
 }
 
 pub(crate) fn js_error(code: &'static str, message: impl Into<String>) -> JsValue {
-    serde_wasm_bindgen::to_value(&TsError {
+    let payload = TsError {
+        category: "wasm",
         code,
         message: message.into(),
-    })
-    .unwrap_or_else(|_| JsValue::from_str("failed to serialize error"))
+        status: None,
+        memo: None,
+        expected: None,
+        got: None,
+    };
+    serde_wasm_bindgen::to_value(&payload)
+        .unwrap_or_else(|_| JsValue::from_str("failed to serialize error"))
 }
 
 pub(crate) fn js_error_from_lib(err: crate::Error) -> JsValue {
-    js_error("DEREC_ERROR", err.to_string())
+    let (category, code) = categorize(&err);
+    let message = err.to_string();
+    let (status, memo) = err
+        .as_non_ok_status()
+        .map(|(s, m)| (Some(s), Some(m.to_owned())))
+        .unwrap_or((None, None));
+    let (expected, got) = match &err {
+        crate::Error::Sharing(SharingError::VersionMismatch { expected, got })
+        | crate::Error::Recovery(RecoveryError::VersionMismatch { expected, got }) => {
+            (Some(*expected), Some(*got))
+        }
+        _ => (None, None),
+    };
+    let payload = TsError {
+        category,
+        code,
+        message,
+        status,
+        memo,
+        expected,
+        got,
+    };
+    serde_wasm_bindgen::to_value(&payload)
+        .unwrap_or_else(|_| JsValue::from_str("failed to serialize error"))
 }
 
-/// A `DeRecMessage` represented as a plain JS object, safe for TypeScript consumers.
-///
-/// `channel_id` and `timestamp.seconds` are serialized as decimal strings to safely
-/// round-trip `u64`/`i64` through JavaScript, which cannot represent integers above
-/// `Number.MAX_SAFE_INTEGER` (2^53 − 1).
-///
-/// The `message` field contains raw encrypted bytes and is exposed as a byte array.
-#[derive(serde::Serialize, serde::Deserialize)]
-pub(crate) struct DeRecMessageJs {
-    pub protocol_version_major: u32,
-    pub protocol_version_minor: u32,
-    pub sequence: u32,
-    /// Decimal string representation of the u64 channel identifier.
-    pub channel_id: String,
-    pub timestamp: Option<TimestampJs>,
-    /// Encrypted inner message bytes.
-    pub message: Vec<u8>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-pub(crate) struct TimestampJs {
-    /// Decimal string representation of the i64 seconds field.
-    pub seconds: String,
-    pub nanos: i32,
-}
-
-pub(crate) fn derec_message_to_js(msg: DeRecMessage) -> DeRecMessageJs {
-    DeRecMessageJs {
-        protocol_version_major: msg.protocol_version_major,
-        protocol_version_minor: msg.protocol_version_minor,
-        sequence: msg.sequence,
-        channel_id: msg.channel_id.to_string(),
-        timestamp: msg.timestamp.map(|ts| TimestampJs {
-            seconds: ts.seconds.to_string(),
-            nanos: ts.nanos,
-        }),
-        message: msg.message,
+fn categorize(err: &crate::Error) -> (&'static str, &'static str) {
+    match err {
+        crate::Error::Pairing(e) => ("pairing", pairing_code(e)),
+        crate::Error::Recovery(e) => ("recovery", recovery_code(e)),
+        crate::Error::Discovery(e) => ("discovery", discovery_code(e)),
+        crate::Error::Sharing(e) => ("sharing", sharing_code(e)),
+        crate::Error::Verification(e) => ("verification", verification_code(e)),
+        crate::Error::Unpairing(e) => ("unpairing", unpairing_code(e)),
+        crate::Error::DeRecMessage(_) => ("derec_message", "BUILDER_ERROR"),
+        crate::Error::SecretStore(_) => ("secret_store", "STORE_ERROR"),
+        crate::Error::ChannelStore(_) => ("channel_store", "STORE_ERROR"),
+        crate::Error::ShareStore(_) => ("share_store", "STORE_ERROR"),
+        crate::Error::InvalidInput(_) => ("input", "INVALID_INPUT"),
+        crate::Error::ProtobufDecode(_) => ("protobuf", "DECODE_ERROR"),
+        crate::Error::ProtobufEncode(_) => ("protobuf", "ENCODE_ERROR"),
+        crate::Error::Invariant(_) => ("invariant", "INVARIANT_VIOLATED"),
     }
 }
 
-pub(crate) fn js_to_derec_message(
-    js_val: JsValue,
-    context: &'static str,
-) -> Result<DeRecMessage, JsValue> {
-    let js: DeRecMessageJs = serde_wasm_bindgen::from_value(js_val)
-        .map_err(|e| js_error("DECODE_ERROR", format!("{context}: {e}")))?;
-
-    let channel_id = js
-        .channel_id
-        .parse::<u64>()
-        .map_err(|e| js_error("DECODE_ERROR", format!("{context}: invalid channel_id: {e}")))?;
-
-    let timestamp = js.timestamp.map(|ts| {
-        let seconds = ts.seconds.parse::<i64>().unwrap_or(0);
-        prost_types::Timestamp {
-            seconds,
-            nanos: ts.nanos,
-        }
-    });
-
-    Ok(DeRecMessage {
-        protocol_version_major: js.protocol_version_major,
-        protocol_version_minor: js.protocol_version_minor,
-        sequence: js.sequence,
-        channel_id,
-        timestamp,
-        message: js.message,
-    })
+fn pairing_code(e: &PairingError) -> &'static str {
+    match e {
+        PairingError::EmptyTransportUri => "EMPTY_TRANSPORT_URI",
+        PairingError::InvalidContactMessage(_) => "INVALID_CONTACT_MESSAGE",
+        PairingError::InvalidPairRequestMessage(_) => "INVALID_PAIR_REQUEST_MESSAGE",
+        PairingError::InvalidPairResponseMessage(_) => "INVALID_PAIR_RESPONSE_MESSAGE",
+        PairingError::NonOkStatus { .. } => "NON_OK_STATUS",
+        PairingError::ProtocolViolation(_) => "PROTOCOL_VIOLATION",
+        PairingError::Invariant(_) => "INVARIANT",
+        PairingError::ContactMessageKeygen { .. } => "CONTACT_MESSAGE_KEYGEN",
+        PairingError::PairRequestKeygen { .. } => "PAIR_REQUEST_KEYGEN",
+        PairingError::FinishPairingInitiator { .. } => "FINISH_PAIRING_INITIATOR",
+        PairingError::FinishPairingResponder { .. } => "FINISH_PAIRING_RESPONDER",
+        PairingError::PairingEncryption(_) => "PAIRING_ENCRYPTION",
+    }
 }
 
-/// Convert an already-deserialized `DeRecMessageJs` struct into a `DeRecMessage` protobuf.
-pub(crate) fn derec_message_js_struct_to_proto(
-    js: DeRecMessageJs,
-    context: &'static str,
-) -> Result<DeRecMessage, JsValue> {
-    let channel_id = js
-        .channel_id
-        .parse::<u64>()
-        .map_err(|e| js_error("DECODE_ERROR", format!("{context}: invalid channel_id: {e}")))?;
-    let timestamp = js.timestamp.map(|ts| {
-        let seconds = ts.seconds.parse::<i64>().unwrap_or(0);
-        prost_types::Timestamp {
-            seconds,
-            nanos: ts.nanos,
-        }
-    });
-    Ok(DeRecMessage {
-        protocol_version_major: js.protocol_version_major,
-        protocol_version_minor: js.protocol_version_minor,
-        sequence: js.sequence,
-        channel_id,
-        timestamp,
-        message: js.message,
-    })
+fn recovery_code(e: &RecoveryError) -> &'static str {
+    match e {
+        RecoveryError::EmptyResponses => "EMPTY_RESPONSES",
+        RecoveryError::NonOkStatus { .. } => "NON_OK_STATUS",
+        RecoveryError::EmptyCommittedDeRecShare => "EMPTY_COMMITTED_DEREC_SHARE",
+        RecoveryError::DecodeCommittedDeRecShare { .. } => "DECODE_COMMITTED_DEREC_SHARE",
+        RecoveryError::DecodeDeRecShare { .. } => "DECODE_DEREC_SHARE",
+        RecoveryError::SecretIdMismatch => "SECRET_ID_MISMATCH",
+        RecoveryError::VersionMismatch { .. } => "VERSION_MISMATCH",
+        RecoveryError::ReconstructionFailed { .. } => "RECONSTRUCTION_FAILED",
+    }
 }
 
-/// Serialize a `DeRecMessageJs` to a `JsValue`.
-pub(crate) fn derec_message_js_to_js_value(msg_js: DeRecMessageJs) -> Result<JsValue, JsValue> {
-    serde_wasm_bindgen::to_value(&msg_js)
-        .map_err(|e| js_error("WASM_SERIALIZE_ERROR", e.to_string()))
+fn discovery_code(e: &DiscoveryError) -> &'static str {
+    match e {
+        DiscoveryError::NonOkStatus { .. } => "NON_OK_STATUS",
+    }
+}
+
+fn sharing_code(e: &SharingError) -> &'static str {
+    match e {
+        SharingError::EmptyChannels => "EMPTY_CHANNELS",
+        SharingError::DuplicateChannelId(_) => "DUPLICATE_CHANNEL_ID",
+        SharingError::InvalidThreshold { .. } => "INVALID_THRESHOLD",
+        SharingError::EmptySecretData => "EMPTY_SECRET_DATA",
+        SharingError::VssShareFailed { .. } => "VSS_SHARE_FAILED",
+        SharingError::NonOkStatus { .. } => "NON_OK_STATUS",
+        SharingError::VersionMismatch { .. } => "VERSION_MISMATCH",
+    }
+}
+
+fn verification_code(e: &VerificationError) -> &'static str {
+    match e {
+        VerificationError::NonOkStatus { .. } => "NON_OK_STATUS",
+    }
+}
+
+fn unpairing_code(e: &UnpairingError) -> &'static str {
+    match e {
+        UnpairingError::NonOkStatus { .. } => "NON_OK_STATUS",
+    }
 }
 
 #[wasm_bindgen(start)]

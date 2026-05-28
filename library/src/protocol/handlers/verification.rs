@@ -20,6 +20,10 @@ use derec_proto::{
 };
 use prost::Message;
 
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+)]
 pub(in crate::protocol) async fn handle<Sh: DeRecShareStore>(
     share_store: &mut Sh,
     channel_id: ChannelId,
@@ -27,7 +31,7 @@ pub(in crate::protocol) async fn handle<Sh: DeRecShareStore>(
     shared_key: SharedKey,
 ) -> Result<Vec<DeRecEvent>> {
     match inner {
-        MessageBody::VerifyShareRequest(request) => Ok(on_request(channel_id, request, shared_key)),
+        MessageBody::VerifyShareRequest(request) => on_request(channel_id, request, shared_key),
         MessageBody::VerifyShareResponse(response) => {
             on_response(share_store, channel_id, &response).await
         }
@@ -37,78 +41,6 @@ pub(in crate::protocol) async fn handle<Sh: DeRecShareStore>(
     }
 }
 
-/// Accept a verify-share request: load share, compute proof, send response.
-#[cfg_attr(
-    feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0, version = request.version))
-)]
-pub(in crate::protocol) async fn accept<
-    Ch: DeRecChannelStore,
-    Sh: DeRecShareStore,
-    T: DeRecTransport,
->(
-    channel_store: &mut Ch,
-    share_store: &mut Sh,
-    transport: &T,
-    channel_id: ChannelId,
-    request: &VerifyShareRequestMessage,
-    shared_key: &SharedKey,
-) -> Result<Vec<DeRecEvent>> {
-    let stored_bytes = share_store
-        .load(channel_id, request.secret_id, &[request.version])
-        .await?
-        .into_iter()
-        .next()
-        .map(|s| s.bytes)
-        .ok_or(Error::InvalidInput(
-            "no stored share for verification request",
-        ))?;
-    let stored =
-        StoreShareRequestMessage::decode(stored_bytes.as_slice()).map_err(Error::ProtobufDecode)?;
-
-    let resp = verification_response::produce(channel_id, request, shared_key, &stored.share)?;
-
-    let endpoint = peer_endpoint(channel_store, channel_id).await?;
-    transport.send(&endpoint, resp.envelope).await?;
-
-    #[cfg(feature = "logging")]
-    tracing::info!("verification response sent");
-
-    Ok(vec![DeRecEvent::NoOp])
-}
-
-/// Reject a verify-share request: send a rejection response with the given status.
-pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport>(
-    channel_store: &mut Ch,
-    transport: &T,
-    channel_id: ChannelId,
-    request: &VerifyShareRequestMessage,
-    shared_key: &SharedKey,
-    status: StatusEnum,
-    memo: &str,
-) -> Result<()> {
-    let response = VerifyShareResponseMessage {
-        result: Some(DeRecResult {
-            status: status as i32,
-            memo: memo.to_owned(),
-        }),
-        secret_id: request.secret_id,
-        version: request.version,
-        nonce: request.nonce,
-        hash: Vec::new(),
-        timestamp: Some(current_timestamp()),
-    };
-    super::send_channel_message(
-        channel_store,
-        transport,
-        channel_id,
-        MessageBody::VerifyShareResponse(response),
-        shared_key,
-    )
-    .await
-}
-
-/// Send verification challenges to helpers.
 #[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(version = version)))]
 pub(in crate::protocol) async fn start<
     Ch: DeRecChannelStore,
@@ -165,21 +97,94 @@ pub(in crate::protocol) async fn start<
 
 #[cfg_attr(
     feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0, version = response.version))
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0, version = request.version))
+)]
+pub(in crate::protocol) async fn accept<
+    Ch: DeRecChannelStore,
+    Sh: DeRecShareStore,
+    T: DeRecTransport,
+>(
+    channel_store: &mut Ch,
+    share_store: &mut Sh,
+    transport: &T,
+    channel_id: ChannelId,
+    request: &VerifyShareRequestMessage,
+    shared_key: &SharedKey,
+) -> Result<Vec<DeRecEvent>> {
+    let stored_bytes = share_store
+        .load(channel_id, request.secret_id, &[request.version])
+        .await?
+        .into_iter()
+        .next()
+        .map(|s| s.bytes)
+        .ok_or(Error::InvalidInput(
+            "no stored share for verification request",
+        ))?;
+    let stored =
+        StoreShareRequestMessage::decode(stored_bytes.as_slice()).map_err(Error::ProtobufDecode)?;
+
+    let resp = verification_response::produce(channel_id, request, shared_key, &stored.share)?;
+
+    let endpoint = peer_endpoint(channel_store, channel_id).await?;
+    transport.send(&endpoint, resp.envelope).await?;
+
+    #[cfg(feature = "logging")]
+    tracing::info!("verification response sent");
+
+    Ok(vec![DeRecEvent::NoOp])
+}
+
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+)]
+pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport>(
+    channel_store: &mut Ch,
+    transport: &T,
+    channel_id: ChannelId,
+    request: &VerifyShareRequestMessage,
+    shared_key: &SharedKey,
+    status: StatusEnum,
+    memo: &str,
+) -> Result<()> {
+    let response = VerifyShareResponseMessage {
+        result: Some(DeRecResult {
+            status: status as i32,
+            memo: memo.to_owned(),
+        }),
+        secret_id: request.secret_id,
+        version: request.version,
+        nonce: request.nonce,
+        hash: Vec::new(),
+        timestamp: Some(current_timestamp()),
+    };
+    super::send_channel_message(
+        channel_store,
+        transport,
+        channel_id,
+        MessageBody::VerifyShareResponse(response),
+        shared_key,
+    )
+    .await
+}
+
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0, version = request.version))
 )]
 fn on_request(
     channel_id: ChannelId,
     request: VerifyShareRequestMessage,
     shared_key: SharedKey,
-) -> Vec<DeRecEvent> {
-    vec![DeRecEvent::ActionRequired {
+) -> Result<Vec<DeRecEvent>> {
+    Ok(vec![DeRecEvent::ActionRequired {
         channel_id,
         action: PendingAction::VerifyShare {
             channel_id,
             request,
             shared_key,
         },
-    }]
+    }])
 }
 
 #[cfg_attr(
@@ -212,5 +217,8 @@ async fn on_response<Sh: DeRecShareStore>(
     #[cfg(feature = "logging")]
     tracing::info!("share verified");
 
-    Ok(vec![DeRecEvent::ShareVerified { channel_id, version }])
+    Ok(vec![DeRecEvent::ShareVerified {
+        channel_id,
+        version,
+    }])
 }

@@ -16,11 +16,11 @@ use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp},
     types::{ChannelId, SharedKey},
 };
+use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{DeRecMessage, MessageBody, TransportProtocol};
 use prost::Message;
 use std::collections::HashMap;
 
-/// Look up the transport endpoint for a paired channel.
 pub(super) async fn peer_endpoint<Ch: DeRecChannelStore>(
     channel_store: &mut Ch,
     channel_id: ChannelId,
@@ -31,7 +31,6 @@ pub(super) async fn peer_endpoint<Ch: DeRecChannelStore>(
         .ok_or(Error::InvalidInput("no transport endpoint for channel"))
 }
 
-/// Build an encrypted channel message and send it to the peer.
 pub(super) async fn send_channel_message<Ch: DeRecChannelStore, T: DeRecTransport>(
     channel_store: &mut Ch,
     transport: &T,
@@ -52,28 +51,22 @@ pub(super) async fn send_channel_message<Ch: DeRecChannelStore, T: DeRecTranspor
     Ok(())
 }
 
-/// Decrypt the channel envelope and dispatch to the appropriate flow handler.
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
 )]
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn handle<
-    Ch: DeRecChannelStore,
-    Sh: DeRecShareStore,
-    Ss: DeRecSecretStore,
->(
+pub(super) async fn handle<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore>(
     channel_store: &mut Ch,
     share_store: &mut Sh,
     secret_store: &mut Ss,
     pending_recovery: &mut PendingRecovery,
     pending_unpair: &mut HashMap<ChannelId, u64>,
-    message: &[u8],
+    message: &DeRecMessage,
     channel_id: ChannelId,
     shared_key: &SharedKey,
 ) -> Result<Vec<DeRecEvent>> {
-    let envelope = DeRecMessage::decode(message).map_err(Error::ProtobufDecode)?;
-    let inner = crate::derec_message::extract_inner_message(&envelope.message, shared_key)?;
+    let inner = crate::derec_message::extract_inner_message(&message.message, shared_key)?;
 
     match &inner {
         MessageBody::StoreShareRequest(_) | MessageBody::StoreShareResponse(_) => {
@@ -105,4 +98,28 @@ pub(super) async fn handle<
             "unexpected MessageBody variant in channel message",
         )),
     }
+}
+
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+)]
+pub(in crate::protocol) async fn handle_pairing<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
+    channel_store: &mut Ch,
+    secret_store: &mut Ss,
+    message: &DeRecMessage,
+    channel_id: ChannelId,
+    pairing_secret: &PairingSecretKeyMaterial,
+) -> Result<Vec<DeRecEvent>> {
+    let inner =
+        crate::derec_message::extract_inner_pairing_message(&message.message, pairing_secret)?;
+
+    pairing::handle(
+        channel_store,
+        secret_store,
+        &inner,
+        channel_id,
+        pairing_secret,
+    )
+    .await
 }

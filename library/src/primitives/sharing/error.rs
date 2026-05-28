@@ -14,9 +14,6 @@ pub enum SharingError {
     )]
     InvalidThreshold { threshold: usize, channels: usize },
 
-    #[error("secret_id is empty")]
-    EmptySecretId,
-
     #[error("secret_data is empty")]
     EmptySecretData,
 
@@ -28,4 +25,7 @@ pub enum SharingError {
 
     #[error("share response indicates a non-OK status (status={status}): {memo}")]
     NonOkStatus { status: i32, memo: String },
+
+    #[error("share version mismatch in share response (expected={expected}, got={got})")]
+    VersionMismatch { expected: u32, got: u32 },
 }

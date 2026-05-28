@@ -50,7 +50,7 @@ Or manually in your `Cargo.toml`
 
 ```toml
 [dependencies]
-derec-library = "0.0.1-alpha.1"
+derec-library = "0.0.1-alpha.7"
 ```
 
 > [!WARNING]
@@ -69,7 +69,7 @@ cargo build --workspace
 Run tests:
 
 ```bash
-carto test --workspace
+cargo test --workspace
 ```
 
 ---
@@ -87,14 +87,14 @@ make
 This produces two wasm-bindgen packages:
 
 ```bash
-library/target/pkg-node
+library/target/pkg-nodejs
 library/target/pkg-web
 ```
 
 ### Node.js package
 
 ```bash
-library/target/pkg-node
+library/target/pkg-nodejs
 ```
 
 Optimized for Node.js and may rely on built-in modules such as:
@@ -103,7 +103,7 @@ Optimized for Node.js and may rely on built-in modules such as:
 * `path`
 * `util`
 
-### Browser packege
+### Browser package
 
 ```bash
 library/target/pkg-web
@@ -116,16 +116,15 @@ including Node-only dependencies.
 
 ---
 
-## Example Node.js Binding
+## Example bindings
 
-A simple Node.js example can be found in `bindings/node/index.ts`.
-Run it with:
+End-to-end smoke tests live under `bindings/` and exercise every primitive
+flow against the current Rust / WASM / FFI surface:
 
-```bash
-cd bindings/node
-npm install
-./run_test.sh
-```
+- `bindings/rust` — Rust primitive + protocol tests. Run with `cargo run -p derec-rust-binding-smoke-test`.
+- `bindings/nodejs` — Node.js WASM tests. `cd bindings/nodejs && npm install && npx tsc && node index.js`.
+- `bindings/web` — Browser WASM tests. `cd bindings/web && npm install && npm run build` and open via `npm run dev`.
+- `bindings/dotnet` — .NET P/Invoke tests against the C ABI. `cd bindings/dotnet && dotnet run`.
 
 ---
 

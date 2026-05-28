@@ -2,15 +2,13 @@
 
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
-    primitives::unpairing::error::UnpairingError,
+    primitives::unpairing::UnpairingError,
     types::{ChannelId, SharedKey},
+    utils::verify_timestamps,
 };
-use derec_proto::{
-    DeRecMessage, DeRecResult, MessageBody, StatusEnum, UnpairResponseMessage,
-};
+use derec_proto::{DeRecMessage, DeRecResult, MessageBody, StatusEnum, UnpairResponseMessage};
 use prost::Message;
 
-/// Result of [`produce`] and [`reject`].
 pub struct ProduceResult {
     /// Serialized outer [`derec_proto::DeRecMessage`] envelope carrying an
     /// encrypted inner [`derec_proto::UnpairResponseMessage`]. Ready to send
@@ -18,21 +16,18 @@ pub struct ProduceResult {
     pub envelope: Vec<u8>,
 }
 
-/// Result of [`extract`].
 pub struct ExtractResult {
-    /// Decrypted inner [`derec_proto::UnpairResponseMessage`].
     pub response: UnpairResponseMessage,
 }
 
 /// Outcome of [`process`].
-#[derive(Debug)]
 pub struct ProcessResult {
     /// `true` when the responder reported a successful unpair
     /// (`result.status == StatusEnum::Ok`); `false` otherwise.
     pub acknowledged: bool,
 }
 
-/// Builds a **successful** unpair acknowledgement envelope (responder side).
+/// Produces a **successful** unpair acknowledgement envelope on the responder side.
 ///
 /// Called by the party that **received** an [`derec_proto::UnpairRequestMessage`]
 /// after it has dropped (or is about to drop) its local state for the
@@ -50,6 +45,21 @@ pub struct ProcessResult {
 /// # Errors
 ///
 /// Returns [`crate::Error`] if outer envelope construction or encryption fails.
+///
+/// # Example
+///
+/// ```
+/// use derec_library::primitives::unpairing::response;
+/// use derec_library::types::ChannelId;
+///
+/// let channel_id = ChannelId(42);
+/// let shared_key = [7u8; 32];
+///
+/// let response::ProduceResult { envelope } = response::produce(channel_id, &shared_key)
+///     .expect("failed to build unpair response");
+///
+/// assert!(!envelope.is_empty());
+/// ```
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
@@ -58,79 +68,10 @@ pub fn produce(
     channel_id: ChannelId,
     shared_key: &SharedKey,
 ) -> Result<ProduceResult, crate::Error> {
-    let timestamp = current_timestamp();
-
-    let response = UnpairResponseMessage {
-        result: Some(DeRecResult {
-            status: StatusEnum::Ok as i32,
-            memo: String::new(),
-        }),
-        timestamp: Some(timestamp),
-    };
-
-    let envelope = DeRecMessageBuilder::channel()
-        .channel_id(channel_id)
-        .timestamp(timestamp)
-        .message_body(MessageBody::UnpairResponse(response))
-        .encrypt(shared_key)?
-        .build()?
-        .encode_to_vec();
+    let envelope = build_response(channel_id, StatusEnum::Ok, &String::new(), shared_key)?;
 
     #[cfg(feature = "logging")]
     tracing::info!("unpair response (ok) envelope produced");
-
-    Ok(ProduceResult { envelope })
-}
-
-/// Builds a **rejection** unpair envelope (responder side).
-///
-/// Used when the responder cannot or will not honour the unpair request
-/// (for example regulatory retention obligations). The envelope echoes
-/// the chosen [`StatusEnum`] and the application-supplied memo so the
-/// initiator can surface the reason to the user.
-///
-/// # Arguments
-///
-/// * `channel_id` - Channel identifier for the requesting peer.
-/// * `shared_key` - 32-byte symmetric channel key.
-/// * `status` - The [`StatusEnum`] variant to return (e.g. `Fail`,
-///   `Rejected`). Must not be `Ok` — callers MUST use [`produce`] for the
-///   success path.
-/// * `memo` - Human-readable rejection reason.
-///
-/// # Errors
-///
-/// Returns [`crate::Error`] if outer envelope construction or encryption fails.
-#[cfg_attr(
-    feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0, status = status as i32))
-)]
-pub fn reject(
-    channel_id: ChannelId,
-    shared_key: &SharedKey,
-    status: StatusEnum,
-    memo: &str,
-) -> Result<ProduceResult, crate::Error> {
-    let timestamp = current_timestamp();
-
-    let response = UnpairResponseMessage {
-        result: Some(DeRecResult {
-            status: status as i32,
-            memo: memo.to_owned(),
-        }),
-        timestamp: Some(timestamp),
-    };
-
-    let envelope = DeRecMessageBuilder::channel()
-        .channel_id(channel_id)
-        .timestamp(timestamp)
-        .message_body(MessageBody::UnpairResponse(response))
-        .encrypt(shared_key)?
-        .build()?
-        .encode_to_vec();
-
-    #[cfg(feature = "logging")]
-    tracing::info!("unpair response (reject) envelope produced");
 
     Ok(ProduceResult { envelope })
 }
@@ -154,6 +95,32 @@ pub fn reject(
 /// - decryption or inner-message decoding fails
 /// - `envelope.timestamp != response.timestamp`
 /// - the inner message is not a [`derec_proto::UnpairResponseMessage`]
+///
+/// # Example
+///
+/// ```
+/// use derec_library::primitives::unpairing::{request, response};
+/// use derec_library::types::ChannelId;
+///
+/// let channel_id = ChannelId(42);
+/// let shared_key = [7u8; 32];
+///
+/// // Initiator: send an unpair request.
+/// let request::ProduceResult { envelope: req_envelope } =
+///     request::produce(channel_id, "no longer needed", &shared_key)
+///         .expect("produce request failed");
+///
+/// // Responder: extract and ack with a successful response.
+/// let _ = request::extract(&req_envelope, &shared_key).expect("extract request failed");
+/// let response::ProduceResult { envelope: resp_envelope } =
+///     response::produce(channel_id, &shared_key).expect("produce response failed");
+///
+/// // Initiator: extract the response.
+/// let response::ExtractResult { response: ack } =
+///     response::extract(&resp_envelope, &shared_key).expect("extract response failed");
+///
+/// assert!(ack.result.is_some());
+/// ```
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
@@ -175,13 +142,7 @@ pub fn extract(
         }
     };
 
-    if envelope.timestamp != response.timestamp {
-        #[cfg(feature = "logging")]
-        tracing::warn!("timestamp invariant violated");
-        return Err(crate::Error::Invariant(
-            "Envelope timestamp does not match response timestamp",
-        ));
-    }
+    verify_timestamps(envelope.timestamp, response.timestamp)?;
 
     #[cfg(feature = "logging")]
     tracing::info!("unpair response extracted and validated");
@@ -196,20 +157,41 @@ pub fn extract(
 ///   success (`result.status == StatusEnum::Ok`).
 /// - `Err(UnpairingError::NonOkStatus { … })` — the responder rejected the
 ///   unpair; carries the peer's status code and memo.
-/// - `Err(UnpairingError::MissingResult)` — the response carried no result.
+/// - `Err(crate::Error::Invariant(_))` — the response carried no result.
 ///
 /// The initiator's [`crate::protocol`] orchestrator uses the outcome to
 /// decide whether to delete its own local state (success) or surface a
 /// rejection event to the application.
-#[cfg_attr(
-    feature = "logging",
-    tracing::instrument(skip_all)
-)]
+///
+/// # Example
+///
+/// ```
+/// use derec_library::primitives::unpairing::{request, response};
+/// use derec_library::types::ChannelId;
+///
+/// let channel_id = ChannelId(42);
+/// let shared_key = [7u8; 32];
+///
+/// // Initiator → Responder → Initiator roundtrip.
+/// let request::ProduceResult { envelope: req_envelope } =
+///     request::produce(channel_id, "no longer needed", &shared_key)
+///         .expect("produce request failed");
+/// let _ = request::extract(&req_envelope, &shared_key).expect("extract request failed");
+/// let response::ProduceResult { envelope: resp_envelope } =
+///     response::produce(channel_id, &shared_key).expect("produce response failed");
+/// let response::ExtractResult { response: ack } =
+///     response::extract(&resp_envelope, &shared_key).expect("extract response failed");
+///
+/// let response::ProcessResult { acknowledged } =
+///     response::process(&ack).expect("process failed");
+///
+/// assert!(acknowledged);
+/// ```
+#[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
 pub fn process(response: &UnpairResponseMessage) -> Result<ProcessResult, crate::Error> {
-    let result = response
-        .result
-        .as_ref()
-        .ok_or(UnpairingError::MissingResult)?;
+    let result = response.result.as_ref().ok_or(crate::Error::Invariant(
+        "UnpairResponseMessage is missing result field",
+    ))?;
 
     if result.status != StatusEnum::Ok as i32 {
         #[cfg(feature = "logging")]
@@ -229,4 +211,31 @@ pub fn process(response: &UnpairResponseMessage) -> Result<ProcessResult, crate:
     tracing::info!("unpair response acknowledged");
 
     Ok(ProcessResult { acknowledged: true })
+}
+
+fn build_response(
+    channel_id: ChannelId,
+    status: StatusEnum,
+    memo: &str,
+    shared_key: &SharedKey,
+) -> Result<Vec<u8>, crate::Error> {
+    let timestamp = current_timestamp();
+
+    let response = UnpairResponseMessage {
+        result: Some(DeRecResult {
+            status: status as i32,
+            memo: memo.to_owned(),
+        }),
+        timestamp: Some(timestamp),
+    };
+
+    let envelope = DeRecMessageBuilder::channel()
+        .channel_id(channel_id)
+        .timestamp(timestamp)
+        .message_body(MessageBody::UnpairResponse(response))
+        .encrypt(shared_key)?
+        .build()?
+        .encode_to_vec();
+
+    Ok(envelope)
 }

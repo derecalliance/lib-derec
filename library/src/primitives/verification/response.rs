@@ -3,7 +3,8 @@
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     primitives::verification::VerificationError,
-    types::*,
+    types::{ChannelId, SharedKey},
+    utils::verify_timestamps,
 };
 use derec_proto::{
     DeRecMessage, DeRecResult, MessageBody, StatusEnum, VerifyShareRequestMessage,
@@ -13,19 +14,17 @@ use prost::Message;
 use sha2::{Digest, Sha384};
 use subtle::ConstantTimeEq;
 
-/// Result of [`produce`].
 pub struct ProduceResult {
     /// Serialized outer [`derec_proto::DeRecMessage`] envelope with the encrypted response payload.
     pub envelope: Vec<u8>,
 }
 
-/// Result of [`extract`].
 pub struct ExtractResult {
     /// Decrypted inner [`derec_proto::VerifyShareResponseMessage`].
     pub response: VerifyShareResponseMessage,
 }
 
-/// Creates a verification response envelope answering a DeRec verification challenge.
+/// Produces a verification response envelope answering a DeRec verification challenge.
 ///
 /// The responder validates the incoming request and computes:
 ///
@@ -44,9 +43,9 @@ pub struct ExtractResult {
 ///
 /// # Arguments
 ///
-/// * `channel_id` - Channel identifier for the previously paired helper.
+/// * `channel_id` - Channel identifier for the previously paired Helper.
 /// * `request` - The decrypted [`derec_proto::VerifyShareRequestMessage`] previously
-///   returned by the request module's `extract` function.
+///   returned by [`super::request::extract`].
 /// * `shared_key` - Previously established 32-byte symmetric channel key used to encrypt
 ///   the response.
 /// * `share_content` - The share bytes whose possession is being proven.
@@ -72,17 +71,25 @@ pub struct ExtractResult {
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```
 /// use derec_library::primitives::verification::{request, response};
 /// use derec_library::types::ChannelId;
 ///
 /// let channel_id = ChannelId(42);
 /// let shared_key = [7u8; 32];
 ///
-/// // After extracting the incoming request:
-/// // let request::ExtractResult { request } = request::extract(&envelope_bytes, &shared_key)?;
-/// // let response::ProduceResult { envelope } =
-/// //     response::produce(channel_id, &request, &shared_key, b"example_share")?;
+/// // Owner: issue a verification challenge.
+/// let request::ProduceResult { envelope: req_envelope } =
+///     request::produce(channel_id, 1, 1, &shared_key).expect("produce request failed");
+///
+/// // Helper: extract the challenge and answer it with the share bytes.
+/// let request::ExtractResult { request: challenge } =
+///     request::extract(&req_envelope, &shared_key).expect("extract request failed");
+/// let response::ProduceResult { envelope } =
+///     response::produce(channel_id, &challenge, &shared_key, b"example_share")
+///         .expect("produce response failed");
+///
+/// assert!(!envelope.is_empty());
 /// ```
 #[cfg_attr(
     feature = "logging",
@@ -160,6 +167,34 @@ pub fn produce(
 /// - decryption or inner-message decoding fails
 /// - `envelope.timestamp != response.timestamp`
 /// - the inner message is not a [`derec_proto::VerifyShareResponseMessage`]
+///
+/// # Example
+///
+/// ```
+/// use derec_library::primitives::verification::{request, response};
+/// use derec_library::types::ChannelId;
+///
+/// let channel_id = ChannelId(42);
+/// let shared_key = [7u8; 32];
+/// let share_content = b"the share bytes the Helper stores";
+///
+/// // Owner: issue a verification challenge.
+/// let request::ProduceResult { envelope: req_envelope } =
+///     request::produce(channel_id, 1, 1, &shared_key).expect("produce request failed");
+///
+/// // Helper: extract the challenge and answer it.
+/// let request::ExtractResult { request: challenge } =
+///     request::extract(&req_envelope, &shared_key).expect("extract request failed");
+/// let response::ProduceResult { envelope: resp_envelope } =
+///     response::produce(channel_id, &challenge, &shared_key, share_content)
+///         .expect("produce response failed");
+///
+/// // Owner: extract the response.
+/// let response::ExtractResult { response } =
+///     response::extract(&resp_envelope, &shared_key).expect("extract response failed");
+///
+/// assert_eq!(response.nonce, challenge.nonce);
+/// ```
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
@@ -175,19 +210,14 @@ pub fn extract(
         _ => {
             #[cfg(feature = "logging")]
             tracing::warn!("unexpected message type; expected VerifyShareResponseMessage");
+
             return Err(crate::Error::Invariant(
                 "Invalid message. Expected: VerifyShareResponseMessage",
             ));
         }
     };
 
-    if envelope.timestamp != response.timestamp {
-        #[cfg(feature = "logging")]
-        tracing::warn!("timestamp invariant violated");
-        return Err(crate::Error::Invariant(
-            "Envelope timestamp does not match response timestamp",
-        ));
-    }
+    verify_timestamps(envelope.timestamp, response.timestamp)?;
 
     #[cfg(feature = "logging")]
     tracing::info!("verification response extracted and validated");
@@ -223,7 +253,7 @@ pub fn extract(
 ///
 /// Returns [`crate::Error`] wrapping:
 ///
-/// - [`VerificationError::MissingResult`] if `response.result` is absent
+/// - `response.result` is absent (returned as `crate::Error::Invariant`)
 /// - [`VerificationError::NonOkStatus`] if `response.result.status != Ok`, carrying the
 ///   Helper's status code and memo string
 ///
@@ -238,7 +268,7 @@ pub fn extract(
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```
 /// use derec_library::primitives::verification::{request, response};
 /// use derec_library::types::ChannelId;
 ///
@@ -246,10 +276,22 @@ pub fn extract(
 /// let shared_key = [7u8; 32];
 /// let share_content = b"example_share";
 ///
-/// // After extracting the response:
-/// // let response::ExtractResult { response: resp } = response::extract(&envelope_bytes, &shared_key)?;
-/// // let ok = response::process(&resp, share_content)?;
-/// // assert!(ok);
+/// // Owner: issue a verification challenge.
+/// let request::ProduceResult { envelope: req_envelope } =
+///     request::produce(channel_id, 1, 1, &shared_key).expect("produce request failed");
+///
+/// // Helper: answer the challenge with the share bytes.
+/// let request::ExtractResult { request: challenge } =
+///     request::extract(&req_envelope, &shared_key).expect("extract request failed");
+/// let response::ProduceResult { envelope: resp_envelope } =
+///     response::produce(channel_id, &challenge, &shared_key, share_content)
+///         .expect("produce response failed");
+///
+/// // Owner: extract the response and verify the proof against the known share.
+/// let response::ExtractResult { response: resp } =
+///     response::extract(&resp_envelope, &shared_key).expect("extract response failed");
+///
+/// response::process(&resp, share_content).expect("process failed");
 /// ```
 #[cfg_attr(
     feature = "logging",
@@ -259,10 +301,9 @@ pub fn process(
     response: &VerifyShareResponseMessage,
     share_content: impl AsRef<[u8]>,
 ) -> Result<bool, crate::Error> {
-    let result = response
-        .result
-        .as_ref()
-        .ok_or(VerificationError::MissingResult)?;
+    let result = response.result.as_ref().ok_or(crate::Error::Invariant(
+        "VerifyShareResponseMessage is missing result field",
+    ))?;
 
     if result.status != StatusEnum::Ok as i32 {
         #[cfg(feature = "logging")]

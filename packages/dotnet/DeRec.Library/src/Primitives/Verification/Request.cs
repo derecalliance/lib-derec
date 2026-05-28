@@ -10,19 +10,18 @@ public static partial class Verification
     {
         public sealed class ExtractResult
         {
-            public ulong ChannelId { get; init; }
-            public byte[] SecretId { get; init; } = Array.Empty<byte>();
-            public int Version { get; init; }
-            public ulong Nonce { get; init; }
+            public required ulong ChannelId { get; init; }
+            /// <summary>
+            /// Inner <c>VerifyShareRequestMessage</c> proto bytes for chaining
+            /// into <see cref="Response.Produce(ulong, byte[], byte[], DeRecMessage)"/>.
+            /// </summary>
+            public required byte[] RequestProtoBytes { get; init; }
         }
 
-        /// <summary>
-        /// Generates a verification request envelope (Owner side, step 1).
-        /// </summary>
         public static DeRecMessage Produce(
             ulong channelId,
-            byte[] secretId,
-            int version,
+            ulong secretId,
+            uint version,
             byte[] sharedKey
         )
         {
@@ -30,7 +29,6 @@ public static partial class Verification
                 Native.Verification.produce_verify_share_request_message(
                     channelId,
                     secretId,
-                    (UIntPtr)secretId.Length,
                     version,
                     sharedKey,
                     (UIntPtr)sharedKey.Length
@@ -38,20 +36,15 @@ public static partial class Verification
 
             try
             {
-                Utils.ThrowIfError(nativeResult.Status);
-
+                Utils.ThrowIfError(nativeResult.Error);
                 return DeRecMessage.FromProtoBytes(Utils.CopyBuffer(nativeResult.RequestWireBytes));
             }
             finally
             {
                 Utils.FreeBuffer(nativeResult.RequestWireBytes);
-                Utils.FreeStatusMessage(nativeResult.Status);
             }
         }
 
-        /// <summary>
-        /// Decodes and decrypts a verification request envelope (Helper side, step 1).
-        /// </summary>
         public static ExtractResult Extract(DeRecMessage request, byte[] sharedKey)
         {
             byte[] requestWireBytes = request.ToProtoBytes();
@@ -66,20 +59,16 @@ public static partial class Verification
 
             try
             {
-                Utils.ThrowIfError(nativeResult.Status);
-
+                Utils.ThrowIfError(nativeResult.Error);
                 return new ExtractResult
                 {
                     ChannelId = nativeResult.ChannelId,
-                    SecretId = Utils.CopyBuffer(nativeResult.SecretId),
-                    Version = nativeResult.Version,
-                    Nonce = nativeResult.Nonce,
+                    RequestProtoBytes = Utils.CopyBuffer(nativeResult.RequestProtoBytes),
                 };
             }
             finally
             {
-                Utils.FreeBuffer(nativeResult.SecretId);
-                Utils.FreeStatusMessage(nativeResult.Status);
+                Utils.FreeBuffer(nativeResult.RequestProtoBytes);
             }
         }
     }

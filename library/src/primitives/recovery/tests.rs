@@ -1,6 +1,7 @@
 use crate::{
     Error,
     derec_message::{DeRecMessageBuilder, current_timestamp},
+    primitives::make_shared_key,
     primitives::{
         recovery::{
             RecoveryError,
@@ -12,7 +13,7 @@ use crate::{
             response::{
                 ExtractResult as ExtractGetShareResponseResult,
                 ProduceResult as ProduceGetShareResponseMessageResult,
-                RecoverResult as RecoverFromResponsesResult, RecoveryResponseInput,
+                RecoverResult as RecoverFromResponsesResult,
                 extract as extract_get_share_response,
                 produce as produce_get_share_response_message,
                 recover as recover_from_share_responses,
@@ -22,7 +23,6 @@ use crate::{
             SplitResult, extract as extract_store_share_request, split as sharing_split,
         },
     },
-    primitives::make_shared_key,
     types::ChannelId,
 };
 use derec_proto::{
@@ -35,9 +35,9 @@ fn make_channel_ids(ids: &[u64]) -> Vec<ChannelId> {
     ids.iter().copied().map(ChannelId).collect()
 }
 
-fn create_committed_share_bytes(secret_id: &[u8], version: i32) -> Vec<u8> {
+fn create_committed_share_bytes(secret_id: u64, version: u32) -> Vec<u8> {
     let derec_share = DeRecShare {
-        secret_id: secret_id.to_vec(),
+        secret_id,
         version,
         x: vec![1, 2, 3],
         y: vec![4, 5, 6],
@@ -126,7 +126,7 @@ fn create_store_share_request_envelope(
         keep_list: vec![],
         version_description: String::new(),
         timestamp: Some(timestamp),
-        secret_id: vec![],
+        secret_id: 1,
     };
 
     DeRecMessageBuilder::channel()
@@ -141,45 +141,11 @@ fn create_store_share_request_envelope(
 }
 
 #[test]
-fn test_produce_get_share_request_message_empty_secret_id() {
-    let channel_id = ChannelId(1);
-    let shared_key = make_shared_key(1);
-    let empty_secret_id = b"";
-    let version = 0;
-
-    let result =
-        produce_get_share_request_message(channel_id, empty_secret_id, version, &shared_key);
-
-    assert!(matches!(
-        result,
-        Err(Error::Recovery(RecoveryError::EmptySecretId))
-    ));
-}
-
-#[test]
-fn test_produce_get_share_request_message_invalid_version() {
-    let channel_id = ChannelId(1);
-    let shared_key = make_shared_key(1);
-    let secret_id = b"secret_id";
-    let invalid_version = -1;
-
-    let result =
-        produce_get_share_request_message(channel_id, secret_id, invalid_version, &shared_key);
-
-    assert!(matches!(
-        result,
-        Err(Error::Recovery(RecoveryError::InvalidVersion {
-            version: -1
-        }))
-    ));
-}
-
-#[test]
 fn test_produce_get_share_response_message_empty_committed_share() {
     let channel_id = ChannelId(1);
     let shared_key = make_shared_key(1);
-    let secret_id = b"secret_id";
-    let version = 0;
+    let secret_id = 123;
+    let version = 1;
 
     let ProduceGetShareRequestMessageResult {
         envelope: request_envelope,
@@ -199,7 +165,6 @@ fn test_produce_get_share_response_message_empty_committed_share() {
 
     let result = produce_get_share_response_message(
         channel_id,
-        secret_id,
         &request,
         &stored_share_request,
         &shared_key,
@@ -213,10 +178,10 @@ fn test_produce_get_share_response_message_empty_committed_share() {
 
 #[test]
 fn test_recover_from_share_responses_empty_responses() {
-    let secret_id = b"secret_id";
+    let secret_id = 1;
     let version = 0;
 
-    let empty: Vec<RecoveryResponseInput<'_>> = vec![];
+    let empty: Vec<&derec_proto::GetShareResponseMessage> = vec![];
     let result = recover_from_share_responses(secret_id, version, &empty);
 
     assert!(matches!(
@@ -226,62 +191,8 @@ fn test_recover_from_share_responses_empty_responses() {
 }
 
 #[test]
-fn test_recover_from_share_responses_empty_secret_id() {
-    let shared_key = make_shared_key(1);
-    let response_envelope = create_response_envelope(
-        ChannelId(1),
-        &shared_key,
-        Some(StatusEnum::Ok as i32),
-        vec![1],
-    );
-    let ExtractGetShareResponseResult { response } =
-        extract_get_share_response(&response_envelope, &shared_key)
-            .expect("extract should succeed");
-    let responses = vec![RecoveryResponseInput {
-        share_response: &response,
-    }];
-    let empty_secret_id = b"";
-    let version = 0;
-
-    let result = recover_from_share_responses(empty_secret_id, version, &responses);
-
-    assert!(matches!(
-        result,
-        Err(Error::Recovery(RecoveryError::EmptySecretId))
-    ));
-}
-
-#[test]
-fn test_recover_from_share_responses_invalid_version() {
-    let shared_key = make_shared_key(1);
-    let response_envelope = create_response_envelope(
-        ChannelId(1),
-        &shared_key,
-        Some(StatusEnum::Ok as i32),
-        vec![1],
-    );
-    let ExtractGetShareResponseResult { response } =
-        extract_get_share_response(&response_envelope, &shared_key)
-            .expect("extract should succeed");
-    let responses = vec![RecoveryResponseInput {
-        share_response: &response,
-    }];
-    let secret_id = b"secret_id";
-    let invalid_version = -1;
-
-    let result = recover_from_share_responses(secret_id, invalid_version, &responses);
-
-    assert!(matches!(
-        result,
-        Err(Error::Recovery(RecoveryError::InvalidVersion {
-            version: -1
-        }))
-    ));
-}
-
-#[test]
 fn test_recover_from_share_responses_missing_result() {
-    let secret_id = b"secret_id";
+    let secret_id = 123;
     let version = 0;
     let shared_key = make_shared_key(1);
 
@@ -294,21 +205,16 @@ fn test_recover_from_share_responses_missing_result() {
     let ExtractGetShareResponseResult { response } =
         extract_get_share_response(&response_envelope, &shared_key)
             .expect("extract should succeed");
-    let responses = vec![RecoveryResponseInput {
-        share_response: &response,
-    }];
+    let responses = vec![&response];
 
     let result = recover_from_share_responses(secret_id, version, &responses);
 
-    assert!(matches!(
-        result,
-        Err(Error::Recovery(RecoveryError::MissingResult))
-    ));
+    assert!(matches!(result, Err(Error::Invariant(_))));
 }
 
 #[test]
 fn test_recover_from_share_responses_non_ok_status() {
-    let secret_id = b"secret_id";
+    let secret_id = 123;
     let version = 0;
     let shared_key = make_shared_key(1);
 
@@ -321,9 +227,7 @@ fn test_recover_from_share_responses_non_ok_status() {
     let ExtractGetShareResponseResult { response } =
         extract_get_share_response(&response_envelope, &shared_key)
             .expect("extract should succeed");
-    let responses = vec![RecoveryResponseInput {
-        share_response: &response,
-    }];
+    let responses = vec![&response];
 
     let result = recover_from_share_responses(secret_id, version, &responses);
 
@@ -336,7 +240,7 @@ fn test_recover_from_share_responses_non_ok_status() {
 
 #[test]
 fn test_recover_from_share_responses_empty_committed_de_rec_share() {
-    let secret_id = b"secret_id";
+    let secret_id = 123;
     let version = 0;
     let shared_key = make_shared_key(1);
 
@@ -349,9 +253,7 @@ fn test_recover_from_share_responses_empty_committed_de_rec_share() {
     let ExtractGetShareResponseResult { response } =
         extract_get_share_response(&response_envelope, &shared_key)
             .expect("extract should succeed");
-    let responses = vec![RecoveryResponseInput {
-        share_response: &response,
-    }];
+    let responses = vec![&response];
 
     let result = recover_from_share_responses(secret_id, version, &responses);
 
@@ -363,7 +265,7 @@ fn test_recover_from_share_responses_empty_committed_de_rec_share() {
 
 #[test]
 fn test_recover_from_share_responses_decode_committed_derec_share_error() {
-    let secret_id = b"secret_id";
+    let secret_id = 123;
     let version = 0;
     let shared_key = make_shared_key(1);
     let invalid_bytes = vec![0xFF, 0xFF, 0xFF];
@@ -377,9 +279,7 @@ fn test_recover_from_share_responses_decode_committed_derec_share_error() {
     let ExtractGetShareResponseResult { response } =
         extract_get_share_response(&response_envelope, &shared_key)
             .expect("extract should succeed");
-    let responses = vec![RecoveryResponseInput {
-        share_response: &response,
-    }];
+    let responses = vec![&response];
 
     let result = recover_from_share_responses(secret_id, version, &responses);
 
@@ -393,7 +293,7 @@ fn test_recover_from_share_responses_decode_committed_derec_share_error() {
 
 #[test]
 fn test_recover_from_share_responses_decode_derec_share_error() {
-    let secret_id = b"secret_id";
+    let secret_id = 123;
     let version = 0;
     let shared_key = make_shared_key(1);
     let invalid_bytes = vec![0xFF, 0xFF, 0xFF];
@@ -414,9 +314,7 @@ fn test_recover_from_share_responses_decode_derec_share_error() {
     let ExtractGetShareResponseResult { response } =
         extract_get_share_response(&response_envelope, &shared_key)
             .expect("extract should succeed");
-    let responses = vec![RecoveryResponseInput {
-        share_response: &response,
-    }];
+    let responses = vec![&response];
 
     let result = recover_from_share_responses(secret_id, version, &responses);
 
@@ -428,8 +326,8 @@ fn test_recover_from_share_responses_decode_derec_share_error() {
 
 #[test]
 fn test_recover_from_share_responses_secret_id_mismatch() {
-    let requested_secret_id = b"secret_id";
-    let wrong_secret_id = b"other_secret";
+    let requested_secret_id = 123;
+    let wrong_secret_id = 456;
     let version = 0;
     let shared_key = make_shared_key(1);
 
@@ -442,9 +340,7 @@ fn test_recover_from_share_responses_secret_id_mismatch() {
     let ExtractGetShareResponseResult { response } =
         extract_get_share_response(&response_envelope, &shared_key)
             .expect("extract should succeed");
-    let responses = vec![RecoveryResponseInput {
-        share_response: &response,
-    }];
+    let responses = vec![&response];
 
     let result = recover_from_share_responses(requested_secret_id, version, &responses);
 
@@ -456,7 +352,7 @@ fn test_recover_from_share_responses_secret_id_mismatch() {
 
 #[test]
 fn test_recover_from_share_responses_version_mismatch() {
-    let secret_id = b"secret_id";
+    let secret_id = 123;
     let requested_version = 7;
     let wrong_version = 8;
     let shared_key = make_shared_key(1);
@@ -470,9 +366,7 @@ fn test_recover_from_share_responses_version_mismatch() {
     let ExtractGetShareResponseResult { response } =
         extract_get_share_response(&response_envelope, &shared_key)
             .expect("extract should succeed");
-    let responses = vec![RecoveryResponseInput {
-        share_response: &response,
-    }];
+    let responses = vec![&response];
 
     let result = recover_from_share_responses(secret_id, requested_version, &responses);
 
@@ -485,7 +379,7 @@ fn test_recover_from_share_responses_version_mismatch() {
 
 #[test]
 fn test_recover_from_share_responses_reconstruction_failed() {
-    let secret_id = b"secret_id";
+    let secret_id = 123;
     let version = 0;
     let shared_key = make_shared_key(1);
 
@@ -498,9 +392,7 @@ fn test_recover_from_share_responses_reconstruction_failed() {
     let ExtractGetShareResponseResult { response } =
         extract_get_share_response(&response_envelope, &shared_key)
             .expect("extract should succeed");
-    let responses = vec![RecoveryResponseInput {
-        share_response: &response,
-    }];
+    let responses = vec![&response];
 
     let result = recover_from_share_responses(secret_id, version, &responses);
 
@@ -512,7 +404,7 @@ fn test_recover_from_share_responses_reconstruction_failed() {
 
 #[test]
 fn test_extract_get_share_response_timestamp_mismatch() {
-    let secret_id = b"secret_id";
+    let secret_id = 123;
     let version = 0;
     let shared_key = make_shared_key(1);
 
@@ -536,7 +428,7 @@ fn test_extract_get_share_response_timestamp_mismatch() {
 fn test_produce_get_share_response_message_request_timestamp_mismatch() {
     let channel_id = ChannelId(1);
     let shared_key = make_shared_key(1);
-    let secret_id = b"secret_id";
+    let secret_id = 123;
     let version = 0;
 
     let message_timestamp = current_timestamp();
@@ -544,7 +436,7 @@ fn test_produce_get_share_response_message_request_timestamp_mismatch() {
     envelope_timestamp.seconds += 1;
 
     let tampered_request_message = derec_proto::GetShareRequestMessage {
-        secret_id: secret_id.to_vec(),
+        secret_id,
         share_version: version,
         timestamp: Some(message_timestamp),
     };
@@ -573,7 +465,7 @@ fn test_produce_get_share_response_message_request_timestamp_mismatch() {
 fn test_produce_get_share_response_message_stored_share_timestamp_mismatch() {
     let channel_id = ChannelId(1);
     let shared_key = make_shared_key(1);
-    let secret_id = b"secret_id";
+    let secret_id = 123;
     let version = 0;
 
     let ProduceGetShareRequestMessageResult {
@@ -596,7 +488,7 @@ fn test_produce_get_share_response_message_stored_share_timestamp_mismatch() {
         keep_list: vec![],
         version_description: String::new(),
         timestamp: Some(message_timestamp),
-        secret_id: secret_id.to_vec(),
+        secret_id,
     };
 
     let tampered_stored_share_envelope = DeRecMessageBuilder::channel()
@@ -631,7 +523,6 @@ fn test_produce_get_share_response_message_stored_share_timestamp_mismatch() {
 
     let _ = produce_get_share_response_message(
         channel_id,
-        secret_id,
         &request,
         &stored_share_request,
         &shared_key,
@@ -643,8 +534,8 @@ fn test_produce_get_share_response_message_stored_share_timestamp_mismatch() {
 fn test_produce_get_share_response_message_secret_id_mismatch() {
     let channel_id = ChannelId(1);
     let shared_key = make_shared_key(1);
-    let requested_secret_id = b"secret_id";
-    let stored_secret_id = b"other_secret";
+    let requested_secret_id = 123;
+    let stored_secret_id = 567;
     let version = 0;
 
     let ProduceGetShareRequestMessageResult {
@@ -668,7 +559,6 @@ fn test_produce_get_share_response_message_secret_id_mismatch() {
 
     let result = produce_get_share_response_message(
         channel_id,
-        requested_secret_id,
         &request,
         &stored_share_request,
         &shared_key,
@@ -684,7 +574,7 @@ fn test_produce_get_share_response_message_secret_id_mismatch() {
 fn test_produce_get_share_response_message_version_mismatch() {
     let channel_id = ChannelId(1);
     let shared_key = make_shared_key(1);
-    let secret_id = b"secret_id";
+    let secret_id = 123;
     let requested_version = 7;
     let stored_version = 8;
 
@@ -709,7 +599,6 @@ fn test_produce_get_share_response_message_version_mismatch() {
 
     let result = produce_get_share_response_message(
         channel_id,
-        secret_id,
         &request,
         &stored_share_request,
         &shared_key,
@@ -724,7 +613,7 @@ fn test_produce_get_share_response_message_version_mismatch() {
 
 #[test]
 fn test_recovery_end_to_end() {
-    let secret_id = b"real_secret_id";
+    let secret_id = 123;
     let secret = b"real_secret_value";
     let shared_key = make_shared_key(42);
     let channel_ids = make_channel_ids(&[21, 22, 23]);
@@ -759,7 +648,7 @@ fn test_recovery_end_to_end() {
             keep_list: vec![],
             version_description: String::new(),
             timestamp: Some(timestamp),
-            secret_id: secret_id.to_vec(),
+            secret_id,
         };
         let stored_share_envelope = DeRecMessageBuilder::channel()
             .channel_id(*channel_id)
@@ -780,7 +669,6 @@ fn test_recovery_end_to_end() {
             envelope: response_envelope,
         } = produce_get_share_response_message(
             *channel_id,
-            secret_id,
             &request,
             &stored_share_request,
             &shared_key,
@@ -794,12 +682,7 @@ fn test_recovery_end_to_end() {
         response_messages.push(response);
     }
 
-    let responses: Vec<RecoveryResponseInput<'_>> = response_messages
-        .iter()
-        .map(|response| RecoveryResponseInput {
-            share_response: response,
-        })
-        .collect();
+    let responses: Vec<&_> = response_messages.iter().collect();
 
     let RecoverFromResponsesResult { secret_data } =
         recover_from_share_responses(secret_id, version, &responses)

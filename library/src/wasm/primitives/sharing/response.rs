@@ -2,116 +2,92 @@
 
 use crate::{
     primitives::sharing::response,
-    wasm::ts_bindings_utils::{DeRecMessageJs, derec_message_to_js, js_error, js_error_from_lib, js_to_derec_message},
     types::ChannelId,
+    wasm::{
+        primitives::{
+            helpers::{from_js, parse_shared_key, to_js},
+            sharing::request::{CommittedDeRecShare, StoreShareRequestMessage},
+            types::{DeRecResult, Timestamp},
+        },
+        ts_bindings_utils::js_error_from_lib,
+    },
 };
-use derec_proto::DeRecMessage;
-use prost::Message as _;
+use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
-#[derive(serde::Serialize)]
-struct ProduceResultJs {
-    /// Response `DeRecMessage` envelope as a plain JS object — send back to the Owner.
-    envelope: DeRecMessageJs,
-    /// Serialized [`CommittedDeRecShare`] protobuf bytes for the Helper to store locally.
-    committed_share: Vec<u8>,
-    /// Secret identifier extracted from the inner share.
-    secret_id: u64,
-    /// Share-distribution version from the request.
-    version: u32,
+#[derive(Serialize, Deserialize, Clone)]
+pub struct StoreShareResponseMessage {
+    pub result: Option<DeRecResult>,
+    pub version: u32,
+    pub timestamp: Option<Timestamp>,
+    pub secret_id: u64,
 }
 
-/// Processes an incoming sharing request on behalf of a Helper, producing a response envelope.
-///
-/// # Arguments
-///
-/// * `channel_id` - BigInt channel ID
-/// * `shared_key` - `Uint8Array` of exactly 32 bytes
-/// * `request` - Outer `DeRecMessage` JS object from `sharing_request_produce`
-///
-/// # Returns
-///
-/// A JS object with:
-///
-/// - `envelope`: response `DeRecMessage` — send back to the Owner
-/// - `committed_share`: `Uint8Array` — store locally
-/// - `secret_id`: `Uint8Array`
-/// - `version`: number
-#[wasm_bindgen(js_name = "sharing_response_produce")]
-pub fn produce(
-    channel_id: u64,
-    shared_key: &[u8],
-    request: JsValue,
-) -> Result<JsValue, JsValue> {
-    if shared_key.len() != 32 {
-        return Err(js_error(
-            "INVALID_SHARED_KEY",
-            format!("shared_key must be exactly 32 bytes, got {}", shared_key.len()),
-        ));
+impl From<derec_proto::StoreShareResponseMessage> for StoreShareResponseMessage {
+    fn from(value: derec_proto::StoreShareResponseMessage) -> Self {
+        Self {
+            result: value.result.map(Into::into),
+            version: value.version,
+            timestamp: value.timestamp.map(Into::into),
+            secret_id: value.secret_id,
+        }
     }
+}
 
-    let shared_key_arr: &[u8; 32] = shared_key
-        .try_into()
-        .expect("shared_key length validated to be 32");
+impl From<StoreShareResponseMessage> for derec_proto::StoreShareResponseMessage {
+    fn from(value: StoreShareResponseMessage) -> Self {
+        Self {
+            result: value.result.map(Into::into),
+            version: value.version,
+            timestamp: value.timestamp.map(Into::into),
+            secret_id: value.secret_id,
+        }
+    }
+}
 
-    let request_envelope = js_to_derec_message(request, "request")?;
-    let request_bytes = request_envelope.encode_to_vec();
+#[derive(Serialize, Deserialize)]
+pub struct ProduceResult {
+    #[serde(with = "serde_bytes")]
+    pub envelope: Vec<u8>,
+    pub committed_share: CommittedDeRecShare,
+    pub secret_id: u64,
+    pub version: u32,
+}
 
-    let crate::primitives::sharing::request::ExtractResult { request: store_request } =
-        crate::primitives::sharing::request::extract(&request_bytes, shared_key_arr)
-            .map_err(js_error_from_lib)?;
+#[derive(Serialize, Deserialize)]
+pub struct ExtractResult {
+    pub response: StoreShareResponseMessage,
+}
 
-    let result =
-        response::produce(ChannelId(channel_id), &store_request, shared_key_arr)
-            .map_err(js_error_from_lib)?;
+#[wasm_bindgen(js_name = "sharing_response_produce")]
+pub fn produce(channel_id: u64, request: JsValue, shared_key: &[u8]) -> Result<JsValue, JsValue> {
+    let shared_key = parse_shared_key(shared_key)?;
+    let request: StoreShareRequestMessage = from_js(request)?;
+    let request_proto: derec_proto::StoreShareRequestMessage = request.into();
 
-    let response_envelope = DeRecMessage::decode(result.envelope.as_slice())
-        .map_err(|e| js_error("PROTOBUF_DECODE_ERROR", e.to_string()))?;
+    let result = response::produce(ChannelId(channel_id), &request_proto, &shared_key)
+        .map_err(js_error_from_lib)?;
 
-    serde_wasm_bindgen::to_value(&ProduceResultJs {
-        envelope: derec_message_to_js(response_envelope),
-        committed_share: result.committed_share.encode_to_vec(),
+    to_js(&ProduceResult {
+        envelope: result.envelope,
+        committed_share: result.committed_share.into(),
         secret_id: result.secret_id,
         version: result.version,
     })
-    .map_err(|e| js_error("WASM_SERIALIZE_ERROR", e.to_string()))
 }
 
-/// Validates a sharing response received from a Helper.
-///
-/// # Arguments
-///
-/// * `version` - Integer share-distribution version
-/// * `shared_key` - `Uint8Array` of exactly 32 bytes
-/// * `response` - Outer `DeRecMessage` JS object from `sharing_response_produce`
-///
-/// # Returns
-///
-/// `undefined` on success; throws on failure.
+#[wasm_bindgen(js_name = "sharing_response_extract")]
+pub fn extract(envelope_bytes: &[u8], shared_key: &[u8]) -> Result<JsValue, JsValue> {
+    let shared_key = parse_shared_key(shared_key)?;
+    let result = response::extract(envelope_bytes, &shared_key).map_err(js_error_from_lib)?;
+    to_js(&ExtractResult {
+        response: result.response.into(),
+    })
+}
+
 #[wasm_bindgen(js_name = "sharing_response_process")]
-pub fn process(
-    version: u32,
-    shared_key: &[u8],
-    response: JsValue,
-) -> Result<(), JsValue> {
-    if shared_key.len() != 32 {
-        return Err(js_error(
-            "INVALID_SHARED_KEY",
-            format!("shared_key must be exactly 32 bytes, got {}", shared_key.len()),
-        ));
-    }
-
-    let shared_key_arr: &[u8; 32] = shared_key
-        .try_into()
-        .expect("shared_key length validated to be 32");
-
-    let response_envelope = js_to_derec_message(response, "response")?;
-    let response_bytes = response_envelope.encode_to_vec();
-
-    let crate::primitives::sharing::response::ExtractResult { response: store_response } =
-        crate::primitives::sharing::response::extract(&response_bytes, shared_key_arr)
-            .map_err(js_error_from_lib)?;
-
-    crate::primitives::sharing::response::process(version, &store_response)
-        .map_err(js_error_from_lib)
+pub fn process(version: u32, response: JsValue) -> Result<(), JsValue> {
+    let response: StoreShareResponseMessage = from_js(response)?;
+    let response_proto: derec_proto::StoreShareResponseMessage = response.into();
+    response::process(version, &response_proto).map_err(js_error_from_lib)
 }

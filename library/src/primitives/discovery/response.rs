@@ -4,6 +4,7 @@ use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     primitives::discovery::DiscoveryError,
     types::{ChannelId, SharedKey},
+    utils::verify_timestamps,
 };
 use derec_proto::{
     DeRecMessage, DeRecResult, GetSecretIdsVersionsResponseMessage, MessageBody, StatusEnum,
@@ -13,15 +14,44 @@ use derec_proto::{
 };
 use prost::Message;
 
-/// One stored version of a secret, paired with its human-readable label.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VersionEntry {
-    /// Numeric version identifier.
     pub version: u32,
+
     /// Human-readable description supplied by the Owner at share-storage time.
     ///
     /// Empty when no description was provided.
     pub description: String,
+}
+
+impl From<&VersionEntry> for ProtoVersionEntry {
+    fn from(version: &VersionEntry) -> Self {
+        ProtoVersionEntry {
+            version: version.version,
+            version_description: version.description.to_owned(),
+        }
+    }
+}
+
+impl From<VersionEntry> for ProtoVersionEntry {
+    fn from(version: VersionEntry) -> Self {
+        Self::from(&version)
+    }
+}
+
+impl From<ProtoVersionEntry> for VersionEntry {
+    fn from(entry: ProtoVersionEntry) -> Self {
+        Self::from(&entry)
+    }
+}
+
+impl From<&ProtoVersionEntry> for VersionEntry {
+    fn from(entry: &ProtoVersionEntry) -> Self {
+        Self {
+            version: entry.version,
+            description: entry.version_description.to_owned(),
+        }
+    }
 }
 
 /// One entry in a discovery response — a single secret and all versions the
@@ -37,22 +67,47 @@ pub struct SecretVersionEntry {
     pub versions: Vec<VersionEntry>,
 }
 
-/// Result of [`produce`].
+impl From<&SecretVersionEntry> for VersionList {
+    fn from(entry: &SecretVersionEntry) -> Self {
+        VersionList {
+            secret_id: entry.secret_id,
+            versions: entry.versions.iter().map(ProtoVersionEntry::from).collect(),
+        }
+    }
+}
+
+impl From<SecretVersionEntry> for VersionList {
+    fn from(entry: SecretVersionEntry) -> Self {
+        Self::from(&entry)
+    }
+}
+
+impl From<&VersionList> for SecretVersionEntry {
+    fn from(list: &VersionList) -> Self {
+        Self {
+            secret_id: list.secret_id,
+            versions: list.versions.iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<VersionList> for SecretVersionEntry {
+    fn from(list: VersionList) -> Self {
+        Self::from(&list)
+    }
+}
+
 pub struct ProduceResult {
     /// Serialized outer [`derec_proto::DeRecMessage`] envelope carrying an encrypted
     /// [`derec_proto::GetSecretIdsVersionsResponseMessage`].
     pub envelope: Vec<u8>,
 }
 
-/// Result of [`extract`].
 pub struct ExtractResult {
-    /// The decrypted inner [`derec_proto::GetSecretIdsVersionsResponseMessage`].
     pub response: GetSecretIdsVersionsResponseMessage,
 }
 
-/// Result of [`process`].
 pub struct ProcessResult {
-    /// All secrets and their stored versions reported by the Helper.
     pub secret_list: Vec<SecretVersionEntry>,
 }
 
@@ -64,10 +119,9 @@ pub struct ProcessResult {
 /// all `(secret_id, versions)` pairs it holds for the requesting channel and
 /// passes them to this function.
 ///
-/// Each `secret_id` in `secret_list` must be non-empty. The resulting
-/// [`derec_proto::GetSecretIdsVersionsResponseMessage`] is encrypted with the
-/// channel shared key and wrapped in a plain outer [`derec_proto::DeRecMessage`]
-/// envelope.
+/// The resulting [`derec_proto::GetSecretIdsVersionsResponseMessage`] is encrypted
+/// with the channel shared key and wrapped in a plain outer
+/// [`derec_proto::DeRecMessage`] envelope.
 ///
 /// # Arguments
 ///
@@ -89,9 +143,14 @@ pub struct ProcessResult {
 ///
 /// # Errors
 ///
-/// Returns [`crate::Error`] (specifically `Error::Discovery(...)`) in the following cases:
-///
 /// Returns [`crate::Error`] if outer envelope construction or symmetric encryption fails.
+///
+/// # Pre-requisites
+///
+/// The `channel_id` used for this request is a brand new one Owner and Helper just established.
+/// The Owner is usually in recovery-mode when this flow triggers. This means that the Helper
+/// must have already linked this new `channel_id` with previous Owner's channel_ids. Otherwise the
+/// Helper will not be able to return old secrets and versions for the Owner
 ///
 /// # Security Notes
 ///
@@ -100,7 +159,7 @@ pub struct ProcessResult {
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```
 /// use derec_library::primitives::discovery::response::{self, SecretVersionEntry, VersionEntry};
 /// use derec_library::types::ChannelId;
 ///
@@ -109,7 +168,7 @@ pub struct ProcessResult {
 ///
 /// let secret_list = vec![
 ///     SecretVersionEntry {
-///         secret_id: b"my_secret".to_vec(),
+///         secret_id: 1,
 ///         versions: vec![VersionEntry { version: 1, description: "wallet seed".to_owned() }],
 ///     },
 /// ];
@@ -130,27 +189,14 @@ pub fn produce(
 ) -> Result<ProduceResult, crate::Error> {
     let timestamp = current_timestamp();
 
-    let version_list: Vec<VersionList> = secret_list
-        .iter()
-        .map(|entry| VersionList {
-            secret_id: entry.secret_id,
-            versions: entry
-                .versions
-                .iter()
-                .map(|v| ProtoVersionEntry {
-                    version: v.version,
-                    version_description: v.description.to_owned(),
-                })
-                .collect(),
-        })
-        .collect();
+    let secret_list: Vec<VersionList> = secret_list.iter().map(VersionList::from).collect();
 
     let message = GetSecretIdsVersionsResponseMessage {
         result: Some(DeRecResult {
             status: StatusEnum::Ok as i32,
             memo: String::new(),
         }),
-        secret_list: version_list,
+        secret_list,
         timestamp: Some(timestamp),
     };
 
@@ -204,6 +250,31 @@ pub fn produce(
 /// - decryption or inner-message decoding fails
 /// - `envelope.timestamp != response.timestamp`
 /// - the inner message is not a [`derec_proto::GetSecretIdsVersionsResponseMessage`]
+///
+/// # Example
+///
+/// ```
+/// use derec_library::primitives::discovery::response::{self, SecretVersionEntry, VersionEntry};
+/// use derec_library::types::ChannelId;
+///
+/// let channel_id = ChannelId(42);
+/// let shared_key = [7u8; 32];
+///
+/// let secret_list = vec![SecretVersionEntry {
+///     secret_id: 1,
+///     versions: vec![VersionEntry { version: 1, description: "v1".to_owned() }],
+/// }];
+///
+/// let response::ProduceResult { envelope } =
+///     response::produce(channel_id, &secret_list, &shared_key)
+///         .expect("failed to build discovery response");
+///
+/// let response::ExtractResult { response } =
+///     response::extract(&envelope, &shared_key).expect("failed to extract");
+///
+/// assert_eq!(response.secret_list.len(), 1);
+/// assert_eq!(response.secret_list[0].secret_id, 1);
+/// ```
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
@@ -219,19 +290,14 @@ pub fn extract(
         _ => {
             #[cfg(feature = "logging")]
             tracing::warn!("unexpected message type; expected GetSecretIdsVersionsResponseMessage");
+
             return Err(crate::Error::Invariant(
                 "Invalid message. Expected: GetSecretIdsVersionsResponseMessage",
             ));
         }
     };
 
-    if envelope.timestamp != response.timestamp {
-        #[cfg(feature = "logging")]
-        tracing::warn!("timestamp invariant violated");
-        return Err(crate::Error::Invariant(
-            "Envelope timestamp does not match response timestamp",
-        ));
-    }
+    verify_timestamps(envelope.timestamp, response.timestamp)?;
 
     #[cfg(feature = "logging")]
     tracing::info!("discovery response extracted and validated");
@@ -267,9 +333,39 @@ pub fn extract(
 ///
 /// Returns [`crate::Error`] (specifically `Error::Discovery(...)`) in the following cases:
 ///
-/// - [`DiscoveryError::MissingResult`] if the response does not contain a `result` field
+/// - the response does not contain a `result` field (returned as `crate::Error::Invariant`)
 /// - [`DiscoveryError::NonOkStatus`] if `result.status != Ok`, carrying the Helper's
 ///   status code and memo string
+///
+/// # Example
+///
+/// ```
+/// use derec_library::primitives::discovery::response::{
+///     self, ProcessResult, SecretVersionEntry, VersionEntry,
+/// };
+/// use derec_library::types::ChannelId;
+///
+/// let channel_id = ChannelId(42);
+/// let shared_key = [7u8; 32];
+///
+/// let secret_list = vec![SecretVersionEntry {
+///     secret_id: 1,
+///     versions: vec![VersionEntry { version: 1, description: "v1".to_owned() }],
+/// }];
+///
+/// // Helper → Owner roundtrip.
+/// let response::ProduceResult { envelope } =
+///     response::produce(channel_id, &secret_list, &shared_key).expect("produce failed");
+/// let response::ExtractResult { response: resp } =
+///     response::extract(&envelope, &shared_key).expect("extract failed");
+///
+/// let ProcessResult { secret_list: parsed } =
+///     response::process(&resp).expect("process failed");
+///
+/// assert_eq!(parsed.len(), 1);
+/// assert_eq!(parsed[0].secret_id, 1);
+/// assert_eq!(parsed[0].versions[0].version, 1);
+/// ```
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(secrets_count = response.secret_list.len()))
@@ -277,14 +373,14 @@ pub fn extract(
 pub fn process(
     response: &GetSecretIdsVersionsResponseMessage,
 ) -> Result<ProcessResult, crate::Error> {
-    let result = response
-        .result
-        .as_ref()
-        .ok_or(DiscoveryError::MissingResult)?;
+    let result = response.result.as_ref().ok_or(crate::Error::Invariant(
+        "GetSecretIdsVersionsResponseMessage is missing result field",
+    ))?;
 
     if result.status != StatusEnum::Ok as i32 {
         #[cfg(feature = "logging")]
         tracing::warn!(status = result.status, memo = %result.memo, "discovery response status is not Ok");
+
         return Err(DiscoveryError::NonOkStatus {
             status: result.status,
             memo: result.memo.to_owned(),
@@ -292,20 +388,10 @@ pub fn process(
         .into());
     }
 
-    let secret_list = response
+    let secret_list: Vec<SecretVersionEntry> = response
         .secret_list
         .iter()
-        .map(|entry| SecretVersionEntry {
-            secret_id: entry.secret_id,
-            versions: entry
-                .versions
-                .iter()
-                .map(|v| VersionEntry {
-                    version: v.version,
-                    description: v.version_description.to_owned(),
-                })
-                .collect(),
-        })
+        .map(SecretVersionEntry::from)
         .collect();
 
     #[cfg(feature = "logging")]

@@ -12,44 +12,48 @@ public static partial class Sharing
         {
             public required DeRecMessage Envelope { get; init; }
             public required byte[] CommittedShareBytes { get; init; }
-            public required byte[] SecretId { get; init; }
-            public required int Version { get; init; }
+            public required ulong SecretId { get; init; }
+            public required uint Version { get; init; }
         }
 
-        /// <summary>
-        /// Processes an incoming sharing request on behalf of a Helper, producing an acknowledgement envelope.
-        /// </summary>
+        public sealed class ExtractResult
+        {
+            public required ulong ChannelId { get; init; }
+            /// <summary>
+            /// Inner <c>StoreShareResponseMessage</c> proto bytes for chaining
+            /// into <see cref="Process"/>.
+            /// </summary>
+            public required byte[] ResponseProtoBytes { get; init; }
+        }
+
         public static ProduceResult Produce(
             ulong channelId,
-            byte[] sharedKey,
-            DeRecMessage request
+            byte[] requestProtoBytes,
+            byte[] sharedKey
         )
         {
-            if (sharedKey is null) throw new ArgumentNullException(nameof(sharedKey));
+            ArgumentNullException.ThrowIfNull(requestProtoBytes);
+            ArgumentNullException.ThrowIfNull(sharedKey);
             if (sharedKey.Length != 32)
                 throw new ArgumentException("sharedKey must be exactly 32 bytes.", nameof(sharedKey));
-            if (request is null) throw new ArgumentNullException(nameof(request));
-
-            byte[] requestBytes = request.ToProtoBytes();
 
             Native.Sharing.ProduceStoreShareResponseMessageResult nativeResult =
                 Native.Sharing.produce_store_share_response_message(
                     channelId,
+                    requestProtoBytes,
+                    (UIntPtr)requestProtoBytes.Length,
                     sharedKey,
-                    (UIntPtr)sharedKey.Length,
-                    requestBytes,
-                    (UIntPtr)requestBytes.Length
+                    (UIntPtr)sharedKey.Length
                 );
 
             try
             {
-                Utils.ThrowIfError(nativeResult.Status);
-
+                Utils.ThrowIfError(nativeResult.Error);
                 return new ProduceResult
                 {
                     Envelope = DeRecMessage.FromProtoBytes(Utils.CopyBuffer(nativeResult.WireBytes)),
                     CommittedShareBytes = Utils.CopyBuffer(nativeResult.CommittedShareBytes),
-                    SecretId = Utils.CopyBuffer(nativeResult.SecretIdBytes),
+                    SecretId = nativeResult.SecretId,
                     Version = nativeResult.Version,
                 };
             }
@@ -57,44 +61,54 @@ public static partial class Sharing
             {
                 Utils.FreeBuffer(nativeResult.WireBytes);
                 Utils.FreeBuffer(nativeResult.CommittedShareBytes);
-                Utils.FreeBuffer(nativeResult.SecretIdBytes);
-                Utils.FreeStatusMessage(nativeResult.Status);
             }
         }
 
-        /// <summary>
-        /// Validates a sharing response received from a Helper. Throws on failure.
-        /// </summary>
-        public static void Process(
-            int version,
-            byte[] sharedKey,
-            DeRecMessage response
-        )
+        public static ExtractResult Extract(DeRecMessage response, byte[] sharedKey)
         {
-            if (sharedKey is null) throw new ArgumentNullException(nameof(sharedKey));
-            if (sharedKey.Length != 32)
-                throw new ArgumentException("sharedKey must be exactly 32 bytes.", nameof(sharedKey));
-            if (response is null) throw new ArgumentNullException(nameof(response));
+            byte[] responseWireBytes = response.ToProtoBytes();
 
-            byte[] responseBytes = response.ToProtoBytes();
-
-            Native.Sharing.ProcessStoreShareResponseMessageResult nativeResult =
-                Native.Sharing.process_store_share_response_message(
-                    version,
+            Native.Sharing.ExtractStoreShareResponseResult nativeResult =
+                Native.Sharing.extract_store_share_response(
+                    responseWireBytes,
+                    (UIntPtr)responseWireBytes.Length,
                     sharedKey,
-                    (UIntPtr)sharedKey.Length,
-                    responseBytes,
-                    (UIntPtr)responseBytes.Length
+                    (UIntPtr)sharedKey.Length
                 );
 
             try
             {
-                Utils.ThrowIfError(nativeResult.Status);
+                Utils.ThrowIfError(nativeResult.Error);
+                return new ExtractResult
+                {
+                    ChannelId = nativeResult.ChannelId,
+                    ResponseProtoBytes = Utils.CopyBuffer(nativeResult.ResponseProtoBytes),
+                };
             }
             finally
             {
-                Utils.FreeStatusMessage(nativeResult.Status);
+                Utils.FreeBuffer(nativeResult.ResponseProtoBytes);
             }
+        }
+
+        /// <summary>
+        /// Validates the helper's store-share acknowledgement. Throws
+        /// <see cref="DeRecException"/> on peer rejection
+        /// (<see cref="Native.DeRecCode.NonOkStatus"/>) or version mismatch
+        /// (<see cref="Native.DeRecCode.VersionMismatch"/>).
+        /// </summary>
+        public static void Process(uint version, byte[] responseProtoBytes)
+        {
+            ArgumentNullException.ThrowIfNull(responseProtoBytes);
+
+            Native.Sharing.ProcessStoreShareResponseMessageResult nativeResult =
+                Native.Sharing.process_store_share_response_message(
+                    version,
+                    responseProtoBytes,
+                    (UIntPtr)responseProtoBytes.Length
+                );
+
+            Utils.ThrowIfError(nativeResult.Error);
         }
     }
 }

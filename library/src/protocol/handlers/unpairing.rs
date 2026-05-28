@@ -1,42 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unpairing flow handler (orchestrator-side).
-//!
-//! Wraps the [`crate::primitives::unpairing`] primitive with the
-//! state-management logic the orchestrator needs:
-//!
-//! - [`start`]: sends `UnpairRequest` envelopes to the targeted channels and,
-//!   depending on the configured [`UnpairAck`], either drops local state
-//!   immediately (fire-and-forget) or records a pending entry and waits for
-//!   the peer's response.
-//! - [`accept`]: invoked from [`super::super::DeRecProtocol::accept`] when the
-//!   application accepts an [`crate::protocol::PendingAction::Unpair`] action.
-//!   Sends back an `Ok` response and tears down the local state for the
-//!   channel.
-//! - [`reject`]: sends back a non-`Ok` response without touching local state.
-//! - [`handle`]: dispatches incoming `UnpairRequest` / `UnpairResponse`
-//!   envelopes from the channel-message route.
-//!
-//! The actual deletion is performed by [`drop_channel_state`], which removes
-//! the channel record, the shared key, and any per-channel share entries.
-
 use super::super::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport,
     PendingAction, SecretKind, SecretValue, events::UnpairAck,
 };
 use super::peer_endpoint;
+use crate::derec_message::current_timestamp;
 use crate::{
     Error, Result,
     primitives::unpairing::{
         request::produce as produce_unpair_request,
-        response::{
-            self as unpairing_response, process as process_unpair_response,
-        },
+        response::{self as unpairing_response, process as process_unpair_response},
     },
     types::{ChannelId, SharedKey, Target},
 };
-use derec_proto::{MessageBody, StatusEnum, UnpairRequestMessage, UnpairResponseMessage};
+use derec_proto::{
+    DeRecResult, MessageBody, StatusEnum, UnpairRequestMessage, UnpairResponseMessage,
+};
 
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+)]
 pub(in crate::protocol) async fn handle<
     Ch: DeRecChannelStore,
     Sh: DeRecShareStore,
@@ -51,7 +36,7 @@ pub(in crate::protocol) async fn handle<
     shared_key: SharedKey,
 ) -> Result<Vec<DeRecEvent>> {
     match inner {
-        MessageBody::UnpairRequest(request) => Ok(on_request(channel_id, request, shared_key)),
+        MessageBody::UnpairRequest(request) => on_request(channel_id, request, shared_key),
         MessageBody::UnpairResponse(response) => {
             on_response(
                 channel_store,
@@ -69,18 +54,6 @@ pub(in crate::protocol) async fn handle<
     }
 }
 
-/// Send unpair-request envelopes to the targeted channels.
-///
-/// For each channel:
-///
-/// - Load the channel's `shared_key`. Channels without a key are silently
-///   skipped — they were never paired or have already been torn down.
-/// - Produce and send the [`derec_proto::UnpairRequestMessage`].
-/// - If `unpair_ack == UnpairAck::NotRequired`, drop the local state right
-///   away and emit [`DeRecEvent::Unpaired`].
-/// - If `unpair_ack == UnpairAck::Required`, record the channel in
-///   `pending_unpair` along with `started_at` so the protocol can later
-///   time out the wait inside `process()`.
 #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
 #[allow(clippy::too_many_arguments)]
 pub(in crate::protocol) async fn start<
@@ -105,9 +78,9 @@ pub(in crate::protocol) async fn start<
 
     for channel_id in channel_ids {
         let Some(SecretValue::SharedKey(shared_key)) =
+            // TODO: add a load_many function
             secret_store.load(channel_id, SecretKind::SharedKey).await?
         else {
-            // Not (or no longer) paired — nothing to do for this channel.
             continue;
         };
 
@@ -117,8 +90,7 @@ pub(in crate::protocol) async fn start<
 
         match unpair_ack {
             UnpairAck::NotRequired => {
-                drop_channel_state(channel_store, share_store, secret_store, channel_id)
-                    .await?;
+                drop_channel_state(channel_store, share_store, secret_store, channel_id).await?;
                 events.push(DeRecEvent::Unpaired { channel_id });
             }
             UnpairAck::Required => {
@@ -140,8 +112,6 @@ pub(in crate::protocol) async fn start<
     Ok(events)
 }
 
-/// Accept an incoming unpair request: send `Ok` response, drop local state,
-/// emit [`DeRecEvent::Unpaired`].
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
@@ -160,8 +130,6 @@ pub(in crate::protocol) async fn accept<
     _request: &UnpairRequestMessage,
     shared_key: &SharedKey,
 ) -> Result<Vec<DeRecEvent>> {
-    // Send Ok response BEFORE dropping state so the response uses the still-
-    // live channel transport URI and shared key.
     let resp = unpairing_response::produce(channel_id, shared_key)?;
     let endpoint = peer_endpoint(channel_store, channel_id).await?;
     transport.send(&endpoint, resp.envelope).await?;
@@ -174,8 +142,6 @@ pub(in crate::protocol) async fn accept<
     Ok(vec![DeRecEvent::Unpaired { channel_id }])
 }
 
-/// Reject an incoming unpair request: send a non-`Ok` response and keep
-/// local state intact.
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0, status = status as i32))
@@ -188,21 +154,81 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
     status: StatusEnum,
     memo: &str,
 ) -> Result<()> {
-    let resp = unpairing_response::reject(channel_id, shared_key, status, memo)?;
-    let endpoint = peer_endpoint(channel_store, channel_id).await?;
-    transport.send(&endpoint, resp.envelope).await?;
+    let response = UnpairResponseMessage {
+        result: Some(DeRecResult {
+            status: status as i32,
+            memo: memo.to_owned(),
+        }),
+        timestamp: Some(current_timestamp()),
+    };
 
-    #[cfg(feature = "logging")]
-    tracing::info!("unpair rejected by application");
-
-    Ok(())
+    super::send_channel_message(
+        channel_store,
+        transport,
+        channel_id,
+        MessageBody::UnpairResponse(response),
+        shared_key,
+    )
+    .await
 }
 
-/// Resolve the `Target` against the channel store's view of paired channels.
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+)]
+fn on_request(
+    channel_id: ChannelId,
+    request: UnpairRequestMessage,
+    shared_key: SharedKey,
+) -> Result<Vec<DeRecEvent>> {
+    Ok(vec![DeRecEvent::ActionRequired {
+        channel_id,
+        action: PendingAction::Unpair {
+            channel_id,
+            request,
+            shared_key,
+        },
+    }])
+}
+
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+)]
+async fn on_response<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore>(
+    channel_store: &mut Ch,
+    share_store: &mut Sh,
+    secret_store: &mut Ss,
+    pending_unpair: &mut std::collections::HashMap<ChannelId, u64>,
+    channel_id: ChannelId,
+    response: &UnpairResponseMessage,
+) -> Result<Vec<DeRecEvent>> {
+    if pending_unpair.remove(&channel_id).is_none() {
+        return Ok(vec![DeRecEvent::NoOp]);
+    }
+
+    match process_unpair_response(response) {
+        Ok(_) => {
+            drop_channel_state(channel_store, share_store, secret_store, channel_id).await?;
+            Ok(vec![DeRecEvent::Unpaired { channel_id }])
+        }
+        Err(Error::Unpairing(crate::primitives::unpairing::UnpairingError::NonOkStatus {
+            status,
+            memo,
+        })) => Ok(vec![DeRecEvent::UnpairRejected {
+            channel_id,
+            status,
+            memo,
+        }]),
+        Err(e) => Err(e),
+    }
+}
+
 async fn resolve_target<Ch: DeRecChannelStore>(
     channel_store: &mut Ch,
     target: Target,
 ) -> Result<Vec<ChannelId>> {
+    // TODO: this filtering loginc must be moved to channels()
     let all_channels = channel_store.channels().await?;
     let all_channel_ids: Vec<ChannelId> = all_channels.iter().map(|c| c.id).collect();
 
@@ -235,11 +261,10 @@ pub(super) async fn drop_channel_state<
     secret_store: &mut Ss,
     channel_id: ChannelId,
 ) -> Result<()> {
-    // Share entries first — they reference the channel and key by id, so
-    // dropping them before the channel record itself avoids any window where
-    // shares point at a vanished channel.
     share_store.remove_channel(channel_id).await?;
 
+    // TODO: These removes should be condensed intoa  single function, many implementations might
+    // want to have these atomic and ina single db rount-trip
     let _ = secret_store.remove(channel_id, SecretKind::SharedKey).await;
     let _ = secret_store
         .remove(channel_id, SecretKind::PairingSecret)
@@ -252,67 +277,6 @@ pub(super) async fn drop_channel_state<
     Ok(())
 }
 
-fn on_request(
-    channel_id: ChannelId,
-    request: UnpairRequestMessage,
-    shared_key: SharedKey,
-) -> Vec<DeRecEvent> {
-    vec![DeRecEvent::ActionRequired {
-        channel_id,
-        action: PendingAction::Unpair {
-            channel_id,
-            request,
-            shared_key,
-        },
-    }]
-}
-
-#[cfg_attr(
-    feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
-)]
-async fn on_response<
-    Ch: DeRecChannelStore,
-    Sh: DeRecShareStore,
-    Ss: DeRecSecretStore,
->(
-    channel_store: &mut Ch,
-    share_store: &mut Sh,
-    secret_store: &mut Ss,
-    pending_unpair: &mut std::collections::HashMap<ChannelId, u64>,
-    channel_id: ChannelId,
-    response: &UnpairResponseMessage,
-) -> Result<Vec<DeRecEvent>> {
-    // Acknowledgements only matter when we're actually waiting for one — the
-    // `UnpairAck::NotRequired` path has already dropped local state and
-    // never inserted into `pending_unpair`.
-    if pending_unpair.remove(&channel_id).is_none() {
-        // Either we never asked, or we asked under `NotRequired`. Treat the
-        // late response as a benign no-op.
-        return Ok(vec![DeRecEvent::NoOp]);
-    }
-
-    match process_unpair_response(response) {
-        Ok(_) => {
-            drop_channel_state(channel_store, share_store, secret_store, channel_id).await?;
-            Ok(vec![DeRecEvent::Unpaired { channel_id }])
-        }
-        Err(Error::Unpairing(
-            crate::primitives::unpairing::UnpairingError::NonOkStatus { status, memo },
-        )) => Ok(vec![DeRecEvent::UnpairRejected {
-            channel_id,
-            status,
-            memo,
-        }]),
-        Err(e) => Err(e),
-    }
-}
-
-/// Walk `pending_unpair` and emit [`DeRecEvent::Unpaired`] for entries whose
-/// `started_at` is older than `timeout_secs`, dropping their local state.
-///
-/// Called from [`super::super::DeRecProtocol::process`] on every inbound
-/// message so the timeout fires without relying on a separate timer.
 pub(in crate::protocol) async fn check_timeouts<
     Ch: DeRecChannelStore,
     Sh: DeRecShareStore,

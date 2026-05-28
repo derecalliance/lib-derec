@@ -34,9 +34,8 @@ pub use error::{ChannelStoreError, ProcessError, SecretStoreError, ShareStoreErr
 use prost::Message;
 use std::collections::{HashMap, HashSet};
 pub use traits::{
-    ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecShareStore,
-    DeRecTransport, SecretKind, SecretStoreFuture, SecretValue, Share, ShareStoreFuture,
-    TransportFuture,
+    ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecTransport,
+    SecretKind, SecretStoreFuture, SecretValue, Share, ShareStoreFuture, TransportFuture,
 };
 
 /// In-progress recovery accumulators keyed by `(secret_id, version)`.
@@ -596,7 +595,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
         })?;
         let channel_id = ChannelId(envelope.channel_id);
 
-        let result = self.process_inner(message, channel_id, &envelope).await;
+        let result = self.process_inner(&envelope, channel_id).await;
         let mut events = result.map_err(|source| ProcessError {
             channel_id: Some(channel_id),
             source,
@@ -618,11 +617,10 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
 
     async fn process_inner(
         &mut self,
-        message: &[u8],
+        message: &DeRecMessage,
         channel_id: ChannelId,
-        envelope: &DeRecMessage,
     ) -> Result<Vec<DeRecEvent>> {
-        if self.is_message_expired(envelope, channel_id) {
+        if self.is_message_expired(message, channel_id) {
             return Ok(vec![DeRecEvent::NoOp]);
         }
 
@@ -718,7 +716,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
 
     async fn process_channel_message(
         &mut self,
-        message: &[u8],
+        message: &DeRecMessage,
         channel_id: ChannelId,
     ) -> Result<Option<Vec<DeRecEvent>>> {
         let Some(SecretValue::SharedKey(shared_key)) = self
@@ -757,7 +755,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
 
     async fn process_pairing_message(
         &mut self,
-        message: &[u8],
+        message: &DeRecMessage,
         channel_id: ChannelId,
     ) -> Result<Option<Vec<DeRecEvent>>> {
         let Some(SecretValue::PairingSecret(pairing_secret)) = self
@@ -768,7 +766,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
             return Ok(None);
         };
 
-        let events = handlers::pairing::handle(
+        let events = handlers::handle_pairing(
             &mut self.channel_store,
             &mut self.secret_store,
             message,

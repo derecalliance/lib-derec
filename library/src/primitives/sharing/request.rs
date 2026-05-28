@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::primitives::sharing::error::SharingError;
+use crate::primitives::sharing::SharingError;
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
-    types::*,
-    utils::generate_seed,
+    types::{ChannelId, SharedKey},
+    utils::{generate_seed, verify_timestamps},
 };
 use derec_cryptography::vss;
 use derec_proto::{
@@ -20,36 +20,33 @@ use std::collections::HashMap;
 /// encodes that choice using the protocol value `0`.
 const SHARE_ALGORITHM_VSS: i32 = 0;
 
-/// Result of [`split`].
 pub struct SplitResult {
-    /// Mapping from helper [`ChannelId`] to its committed share.
+    /// Mapping from Helper [`ChannelId`] to its committed share.
     pub shares: HashMap<ChannelId, CommittedDeRecShare>,
 }
 
-/// Result of [`produce`].
 pub struct ProduceResult {
     /// Serialized outer [`derec_proto::DeRecMessage`] envelope carrying an encrypted
     /// [`derec_proto::StoreShareRequestMessage`] inner payload.
     pub envelope: Vec<u8>,
 }
 
-/// Result of [`extract`].
 pub struct ExtractResult {
     /// The decrypted inner [`derec_proto::StoreShareRequestMessage`].
     pub request: StoreShareRequestMessage,
 }
 
-/// Splits a secret into verifiable committed shares, one per helper channel.
+/// Splits a secret into verifiable committed shares, one per Helper channel.
 ///
 /// In DeRec, the *sharing* flow splits a secret into independently verifiable
 /// shares using a Verifiable Secret Sharing (VSS) scheme. Each generated share is:
 ///
 /// - Bound to a specific `secret_id` and `version`
 /// - Committed using a Merkle commitment and proof
-/// - Returned as a [`CommittedDeRecShare`] ready to be delivered to its helper
+/// - Returned as a [`CommittedDeRecShare`] ready to be delivered to its Helper
 ///
-/// To send a share to a helper, pass the returned [`CommittedDeRecShare`] to
-/// [`produce`] together with the helper's shared key to produce the encrypted
+/// To send a share to a Helper, pass the returned [`CommittedDeRecShare`] to
+/// [`produce`] together with the Helper's shared key to produce the encrypted
 /// delivery envelope.
 ///
 /// # Deterministic channel/share assignment
@@ -60,7 +57,7 @@ pub struct ExtractResult {
 ///
 /// # Arguments
 ///
-/// * `channels` - Slice of helper [`ChannelId`] values. Each entry receives exactly
+/// * `channels` - Slice of Helper [`ChannelId`] values. Each entry receives exactly
 ///   one committed share. Must not be empty. Duplicate entries are rejected.
 /// * `secret_id` - Identifier of the secret being protected. Embedded into each
 ///   generated share. Must not be empty.
@@ -93,7 +90,7 @@ pub struct ExtractResult {
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```
 /// use derec_library::primitives::sharing::request::{split, SplitResult};
 /// use derec_library::types::ChannelId;
 ///
@@ -101,7 +98,7 @@ pub struct ExtractResult {
 ///
 /// let SplitResult { shares } = split(
 ///     &channels,
-///     b"my_secret_id",
+///     1,
 ///     1,
 ///     b"super_secret_value",
 ///     2,
@@ -130,65 +127,12 @@ pub fn split(
 ) -> Result<SplitResult, crate::Error> {
     let secret_data = secret_data.as_ref();
 
-    if channels.is_empty() {
-        #[cfg(feature = "logging")]
-        tracing::warn!("channels list is empty");
-        return Err(SharingError::EmptyChannels.into());
-    }
-
-    if secret_data.is_empty() {
-        #[cfg(feature = "logging")]
-        tracing::warn!("secret_data is empty");
-        return Err(SharingError::EmptySecretData.into());
-    }
-
-    let mut ordered_channels: Vec<ChannelId> = channels.to_vec();
-    ordered_channels.sort();
-    for pair in ordered_channels.windows(2) {
-        if pair[0] == pair[1] {
-            #[cfg(feature = "logging")]
-            tracing::warn!("duplicate channel ID detected");
-            return Err(SharingError::DuplicateChannelId(pair[0].into()).into());
-        }
-    }
-
+    let ordered_channels = validate_split_inputs(channels, secret_data, threshold)?;
     let channel_count = ordered_channels.len();
-
-    if threshold < 2 || threshold > channel_count {
-        #[cfg(feature = "logging")]
-        tracing::warn!(threshold = threshold, channels = channel_count, "threshold out of valid range");
-        return Err(SharingError::InvalidThreshold {
-            threshold,
-            channels: channel_count,
-        }
-        .into());
-    }
 
     let vss_shares = generate_vss_shares(secret_data, threshold, channel_count)?;
 
-    let mut shares = HashMap::with_capacity(channel_count);
-
-    for (channel_id, share) in ordered_channels.into_iter().zip(vss_shares.into_iter()) {
-        let derec_share = DeRecShare {
-            encrypted_secret: share.encrypted_secret.clone(),
-            x: share.x.clone(),
-            y: share.y.clone(),
-            secret_id,
-            version,
-        };
-
-        let committed_derec_share = CommittedDeRecShare {
-            de_rec_share: derec_share.encode_to_vec(),
-            commitment: share.commitment.clone(),
-            merkle_path: share
-                .merkle_path
-                .iter()
-                .map(|(is_left, hash)| SiblingHash { is_left: *is_left, hash: hash.clone() })
-                .collect(),
-        };
-
-        shares.insert(channel_id, committed_derec_share);
-    }
+    let shares = build_shares(ordered_channels, vss_shares, secret_id, version);
 
     #[cfg(feature = "logging")]
     tracing::info!("secret split into shares");
@@ -196,26 +140,27 @@ pub fn split(
     Ok(SplitResult { shares })
 }
 
-/// Wraps a [`CommittedDeRecShare`] into an encrypted [`derec_proto::DeRecMessage`] envelope
-/// carrying a [`derec_proto::StoreShareRequestMessage`] inner payload.
+/// Produces an encrypted [`derec_proto::DeRecMessage`] envelope wrapping a
+/// [`CommittedDeRecShare`] as a [`derec_proto::StoreShareRequestMessage`] inner payload.
 ///
 /// Call this once for each share returned by [`split`], providing the corresponding
-/// helper's shared key (established during pairing). The resulting wire bytes should be
-/// sent to the helper over the channel transport. On the helper side, the inner
+/// Helper's shared key (established during pairing). The resulting wire bytes should be
+/// sent to the Helper over the channel transport. On the Helper side, the inner
 /// [`derec_proto::StoreShareRequestMessage`] extracted by [`extract`] must be retained
 /// for future verification and recovery flows.
 ///
 /// # Arguments
 ///
-/// * `channel_id` - The helper channel this share belongs to.
+/// * `channel_id` - The Helper channel this share belongs to.
 /// * `version` - Share-distribution version, matching the value passed to [`split`].
 /// * `secret_id` - Identifier of the secret being distributed. Must match the value
 ///   passed to [`split`].
 /// * `committed_share` - The share for this channel, as returned by [`split`].
-/// * `keep_list` - Ordered list of version numbers the helper should retain. Pass an empty
-///   slice to let the helper apply its default retention policy.
+/// * `keep_list` - Ordered list of version numbers the Helper should retain. Pass an empty
+///   slice to let the Helper apply its default retention policy.
 /// * `description` - Human-readable description of this share distribution. May be empty.
-/// * `shared_key` - 256-bit symmetric key shared with this helper, derived during pairing.
+/// * `shared_key` - Previously established 32-byte symmetric channel key used to
+///   encrypt the inner request.
 ///
 /// # Returns
 ///
@@ -230,12 +175,12 @@ pub fn split(
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```
 /// use derec_library::primitives::sharing::request::{split, produce, SplitResult, ProduceResult};
 /// use derec_library::types::ChannelId;
 ///
 /// let channels = [ChannelId(1), ChannelId(2), ChannelId(3)];
-/// let SplitResult { shares } = split(&channels, b"my_secret_id", 1, b"super_secret_value", 2)
+/// let SplitResult { shares } = split(&channels, 1, 1, b"super_secret_value", 2)
 ///     .expect("split failed");
 ///
 /// let shared_key = [42u8; 32];
@@ -243,7 +188,7 @@ pub fn split(
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 ///
 /// let ProduceResult { envelope } =
-///     produce(channel_id, 1, b"my_secret_id", committed_share, &[], "", &shared_key)
+///     produce(channel_id, 1, 1, committed_share, &[], "", &shared_key)
 ///         .expect("produce failed");
 ///
 /// assert!(!envelope.is_empty());
@@ -298,14 +243,15 @@ pub fn produce(
 ///
 /// The extracted [`StoreShareRequestMessage`] should be passed to
 /// [`crate::primitives::sharing::response::produce`] to build the acknowledgement
-/// response. The helper must also persist the [`StoreShareRequestMessage`] itself (e.g.
+/// response. The Helper must also persist the [`StoreShareRequestMessage`] itself (e.g.
 /// as serialized bytes via `.encode_to_vec()`) for future verification and recovery flows.
 ///
 /// # Arguments
 ///
 /// * `envelope_bytes` - Serialized [`derec_proto::DeRecMessage`] wire bytes received from
 ///   the Owner, as produced by [`produce`].
-/// * `shared_key` - 256-bit symmetric key shared with the Owner, established during pairing.
+/// * `shared_key` - Previously established 32-byte symmetric channel key used to
+///   decrypt the inner message.
 ///
 /// # Returns
 ///
@@ -321,6 +267,36 @@ pub fn produce(
 /// - decryption or inner-message decoding fails
 /// - the inner message is not a [`derec_proto::StoreShareRequestMessage`]
 /// - `envelope.timestamp != request.timestamp`
+///
+/// # Security Notes
+///
+/// - The decrypted [`derec_proto::StoreShareRequestMessage`] carries the committed share the
+///   Helper must persist for future verification and recovery; treat it as sensitive material
+///   and store it securely.
+///
+/// # Example
+///
+/// ```
+/// use derec_library::primitives::sharing::request::{split, produce, extract, SplitResult, ProduceResult, ExtractResult};
+/// use derec_library::types::ChannelId;
+///
+/// let channels = [ChannelId(1), ChannelId(2), ChannelId(3)];
+/// let SplitResult { shares } = split(&channels, 1, 1, b"super_secret_value", 2)
+///     .expect("split failed");
+///
+/// let channel_id = ChannelId(1);
+/// let shared_key = [42u8; 32];
+/// let committed_share = shares.get(&channel_id).expect("missing share");
+///
+/// let ProduceResult { envelope } =
+///     produce(channel_id, 1, 1, committed_share, &[], "", &shared_key)
+///         .expect("produce failed");
+///
+/// let ExtractResult { request } = extract(&envelope, &shared_key).expect("extract failed");
+///
+/// assert_eq!(request.secret_id, 1);
+/// assert_eq!(request.version, 1);
+/// ```
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
@@ -342,13 +318,7 @@ pub fn extract(
         }
     };
 
-    if envelope.timestamp != request.timestamp {
-        #[cfg(feature = "logging")]
-        tracing::warn!("timestamp invariant violated");
-        return Err(crate::Error::Invariant(
-            "Envelope timestamp does not match request timestamp",
-        ));
-    }
+    verify_timestamps(envelope.timestamp, request.timestamp)?;
 
     #[cfg(feature = "logging")]
     tracing::info!("share request extracted and validated");
@@ -367,4 +337,86 @@ fn generate_vss_shares(
 
     vss::share(t, n, secret_data, &entropy)
         .map_err(|source| SharingError::VssShareFailed { source })
+}
+
+fn build_shares(
+    ordered_channels: Vec<ChannelId>,
+    vss_shares: Vec<derec_cryptography::vss::VSSShare>,
+    secret_id: u64,
+    version: u32,
+) -> HashMap<ChannelId, CommittedDeRecShare> {
+    let mut shares = HashMap::with_capacity(ordered_channels.len());
+
+    for (channel_id, share) in ordered_channels.into_iter().zip(vss_shares.into_iter()) {
+        let derec_share = DeRecShare {
+            encrypted_secret: share.encrypted_secret.clone(),
+            x: share.x.clone(),
+            y: share.y.clone(),
+            secret_id,
+            version,
+        };
+
+        let committed_derec_share = CommittedDeRecShare {
+            de_rec_share: derec_share.encode_to_vec(),
+            commitment: share.commitment.clone(),
+            merkle_path: share
+                .merkle_path
+                .iter()
+                .map(|(is_left, hash)| SiblingHash {
+                    is_left: *is_left,
+                    hash: hash.clone(),
+                })
+                .collect(),
+        };
+
+        shares.insert(channel_id, committed_derec_share);
+    }
+
+    shares
+}
+
+fn validate_split_inputs(
+    channels: &[ChannelId],
+    secret_data: &[u8],
+    threshold: usize,
+) -> Result<Vec<ChannelId>, crate::Error> {
+    if channels.is_empty() {
+        #[cfg(feature = "logging")]
+        tracing::warn!("channels list is empty");
+        return Err(SharingError::EmptyChannels.into());
+    }
+
+    if secret_data.is_empty() {
+        #[cfg(feature = "logging")]
+        tracing::warn!("secret_data is empty");
+        return Err(SharingError::EmptySecretData.into());
+    }
+
+    let mut ordered_channels: Vec<ChannelId> = channels.to_vec();
+    ordered_channels.sort();
+    for pair in ordered_channels.windows(2) {
+        if pair[0] == pair[1] {
+            #[cfg(feature = "logging")]
+            tracing::warn!("duplicate channel ID detected");
+            return Err(SharingError::DuplicateChannelId(pair[0].into()).into());
+        }
+    }
+
+    let channel_count = ordered_channels.len();
+
+    if threshold < 2 || threshold > channel_count {
+        #[cfg(feature = "logging")]
+        tracing::warn!(
+            threshold = threshold,
+            channels = channel_count,
+            "threshold out of valid range"
+        );
+        return Err(SharingError::InvalidThreshold {
+            threshold,
+            channels: channel_count,
+        }
+        .into());
+    }
+
+    Ok(ordered_channels)
 }

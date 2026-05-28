@@ -1,4 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
+
 pub mod common;
+pub mod discovery;
+pub mod error;
 pub mod pairing;
 pub mod protocol_version;
 pub mod recovery;

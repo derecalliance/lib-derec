@@ -3,17 +3,8 @@
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RecoveryError {
-    #[error("secret_id is empty")]
-    EmptySecretId,
-
-    #[error("invalid share version (got={version})")]
-    InvalidVersion { version: u32 },
-
     #[error("no share responses provided")]
     EmptyResponses,
-
-    #[error("share response does not contain a result")]
-    MissingResult,
 
     #[error("share response indicates a non-OK status (status={status}): {memo}")]
     NonOkStatus { status: i32, memo: String },

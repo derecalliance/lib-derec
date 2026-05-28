@@ -20,13 +20,17 @@ use derec_proto::{
 };
 use prost::Message;
 
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+)]
 pub(in crate::protocol) fn handle(
     channel_id: ChannelId,
     inner: MessageBody,
     shared_key: SharedKey,
 ) -> Result<Vec<DeRecEvent>> {
     match inner {
-        MessageBody::StoreShareRequest(request) => Ok(on_request(channel_id, request, shared_key)),
+        MessageBody::StoreShareRequest(request) => on_request(channel_id, request, shared_key),
         MessageBody::StoreShareResponse(response) => on_response(channel_id, &response),
         _ => Err(Error::Invariant(
             "unexpected MessageBody variant in sharing handler",
@@ -34,78 +38,6 @@ pub(in crate::protocol) fn handle(
     }
 }
 
-#[cfg_attr(
-    feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0, version = request.version))
-)]
-pub(in crate::protocol) async fn accept<
-    Ch: DeRecChannelStore,
-    Sh: DeRecShareStore,
-    T: DeRecTransport,
->(
-    channel_store: &mut Ch,
-    share_store: &mut Sh,
-    transport: &T,
-    channel_id: ChannelId,
-    request: &StoreShareRequestMessage,
-    shared_key: &SharedKey,
-) -> Result<Vec<DeRecEvent>> {
-    let version = request.version;
-    let encoded_request = request.encode_to_vec();
-    let resp = sharing_response::produce(channel_id, request, shared_key)?;
-
-    share_store
-        .save(channel_id, Share {
-            secret_id: request.secret_id,
-            version,
-            bytes: encoded_request,
-        })
-        .await?;
-
-    let endpoint = peer_endpoint(channel_store, channel_id).await?;
-    transport.send(&endpoint, resp.envelope).await?;
-
-    #[cfg(feature = "logging")]
-    tracing::info!("share stored and acknowledged");
-
-    Ok(vec![DeRecEvent::ShareStored {
-        channel_id,
-        version,
-    }])
-}
-
-pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport>(
-    channel_store: &mut Ch,
-    transport: &T,
-    channel_id: ChannelId,
-    request: &StoreShareRequestMessage,
-    shared_key: &SharedKey,
-    status: StatusEnum,
-    memo: &str,
-) -> Result<()> {
-    let response = StoreShareResponseMessage {
-        result: Some(DeRecResult {
-            status: status as i32,
-            memo: memo.to_owned(),
-        }),
-        secret_id: request.secret_id,
-        version: request.version,
-        timestamp: Some(current_timestamp()),
-    };
-    super::send_channel_message(
-        channel_store,
-        transport,
-        channel_id,
-        MessageBody::StoreShareResponse(response),
-        shared_key,
-    )
-    .await
-}
-
-/// Split and distribute a secret to all paired helpers.
-///
-/// The version is automatically derived from the store: `latest_version + 1`
-/// (or `1` if no shares exist yet).
 #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
 pub(in crate::protocol) async fn start<
     Ch: DeRecChannelStore,
@@ -170,7 +102,9 @@ pub(in crate::protocol) async fn start<
     let version = share_store.latest_version().await?.map_or(1, |v| v + 1);
 
     let keep_list: Vec<u32> = {
-        let start = version.saturating_sub(keep_versions_count as u32 - 1).max(1);
+        let start = version
+            .saturating_sub(keep_versions_count as u32 - 1)
+            .max(1);
         (start..=version).collect()
     };
 
@@ -182,7 +116,6 @@ pub(in crate::protocol) async fn start<
         &secret_data,
         threshold,
     )?;
-
 
     let desc = description.as_deref().unwrap_or("");
     let mut sent_channels: Vec<ChannelId> = Vec::new();
@@ -204,11 +137,14 @@ pub(in crate::protocol) async fn start<
         transport.send(&channel.transport, msg.envelope).await?;
 
         share_store
-            .save(channel.id, Share {
-                secret_id,
-                version,
-                bytes: committed_share.encode_to_vec(),
-            })
+            .save(
+                channel.id,
+                Share {
+                    secret_id,
+                    version,
+                    bytes: committed_share.encode_to_vec(),
+                },
+            )
             .await?;
 
         sent_channels.push(channel.id);
@@ -225,21 +161,96 @@ pub(in crate::protocol) async fn start<
 
 #[cfg_attr(
     feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0, version = response.version))
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0, version = request.version))
+)]
+pub(in crate::protocol) async fn accept<
+    Ch: DeRecChannelStore,
+    Sh: DeRecShareStore,
+    T: DeRecTransport,
+>(
+    channel_store: &mut Ch,
+    share_store: &mut Sh,
+    transport: &T,
+    channel_id: ChannelId,
+    request: &StoreShareRequestMessage,
+    shared_key: &SharedKey,
+) -> Result<Vec<DeRecEvent>> {
+    let version = request.version;
+    let encoded_request = request.encode_to_vec();
+    let resp = sharing_response::produce(channel_id, request, shared_key)?;
+
+    share_store
+        .save(
+            channel_id,
+            Share {
+                secret_id: request.secret_id,
+                version,
+                bytes: encoded_request,
+            },
+        )
+        .await?;
+
+    let endpoint = peer_endpoint(channel_store, channel_id).await?;
+    transport.send(&endpoint, resp.envelope).await?;
+
+    #[cfg(feature = "logging")]
+    tracing::info!("share stored and acknowledged");
+
+    Ok(vec![DeRecEvent::ShareStored {
+        channel_id,
+        version,
+    }])
+}
+
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+)]
+pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport>(
+    channel_store: &mut Ch,
+    transport: &T,
+    channel_id: ChannelId,
+    request: &StoreShareRequestMessage,
+    shared_key: &SharedKey,
+    status: StatusEnum,
+    memo: &str,
+) -> Result<()> {
+    let response = StoreShareResponseMessage {
+        result: Some(DeRecResult {
+            status: status as i32,
+            memo: memo.to_owned(),
+        }),
+        secret_id: request.secret_id,
+        version: request.version,
+        timestamp: Some(current_timestamp()),
+    };
+    super::send_channel_message(
+        channel_store,
+        transport,
+        channel_id,
+        MessageBody::StoreShareResponse(response),
+        shared_key,
+    )
+    .await
+}
+
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0, version = request.version))
 )]
 fn on_request(
     channel_id: ChannelId,
     request: StoreShareRequestMessage,
     shared_key: SharedKey,
-) -> Vec<DeRecEvent> {
-    vec![DeRecEvent::ActionRequired {
+) -> Result<Vec<DeRecEvent>> {
+    Ok(vec![DeRecEvent::ActionRequired {
         channel_id,
         action: PendingAction::StoreShare {
             channel_id,
             request,
             shared_key,
         },
-    }]
+    }])
 }
 
 #[cfg_attr(

@@ -12,8 +12,7 @@ use derec_library::primitives::discovery::{
 };
 use derec_library::primitives::pairing::{request as pair_request, response as pair_response};
 use derec_library::primitives::recovery::{
-    request as rec_request,
-    response::{self as rec_response, RecoveryResponseInput},
+    request as rec_request, response as rec_response,
 };
 use derec_library::primitives::sharing::{request as share_request, response as share_response};
 use derec_library::primitives::verification::{request as verif_request, response as verif_response};
@@ -400,7 +399,6 @@ fn run_recovery_flow_test() {
         .request;
     let share_resp_1 = rec_response::produce(
         channel_1,
-        secret_id,
         &get_request_1,
         &stored_request_1,
         shared_key_1,
@@ -418,7 +416,6 @@ fn run_recovery_flow_test() {
         .request;
     let share_resp_2 = rec_response::produce(
         channel_2,
-        secret_id,
         &get_request_2,
         &stored_request_2,
         shared_key_2,
@@ -428,14 +425,7 @@ fn run_recovery_flow_test() {
         .expect("rec_response::extract failed for channel 2")
         .response;
 
-    let inputs = vec![
-        RecoveryResponseInput {
-            share_response: &get_response_1,
-        },
-        RecoveryResponseInput {
-            share_response: &get_response_2,
-        },
-    ];
+    let inputs = vec![&get_response_1, &get_response_2];
 
     let recovered =
         rec_response::recover(secret_id, version, &inputs).expect("rec_response::recover failed");

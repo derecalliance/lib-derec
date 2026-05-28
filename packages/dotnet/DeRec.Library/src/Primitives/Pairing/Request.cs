@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+using System;
+
 namespace DeRec.Library.Primitives;
 
 public static partial class Pairing
@@ -14,12 +16,21 @@ public static partial class Pairing
 
         public sealed class ProduceResult
         {
-            public required byte[] Envelope { get; init; }
+            public required DeRecMessage Envelope { get; init; }
             public required ContactMessage InitiatorContactMessage { get; init; }
             public required byte[] SecretKeyMaterial { get; init; }
         }
 
-        /// <summary>Creates a <c>ContactMessage</c> used to bootstrap pairing.</summary>
+        public sealed class ExtractResult
+        {
+            public required ulong ChannelId { get; init; }
+            /// <summary>
+            /// Inner <c>PairRequestMessage</c> proto bytes for chaining into
+            /// <see cref="Response.Accept"/> or <see cref="Response.Reject"/>.
+            /// </summary>
+            public required byte[] RequestProtoBytes { get; init; }
+        }
+
         public static CreateContactResult CreateContact(ulong channelId, TransportProtocol transportProtocol)
         {
             byte[] transportProtocolBytes = transportProtocol.ToProtoBytes();
@@ -33,8 +44,7 @@ public static partial class Pairing
 
             try
             {
-                Utils.ThrowIfError(nativeResult.Status);
-
+                Utils.ThrowIfError(nativeResult.Error);
                 return new CreateContactResult
                 {
                     ContactMessage = ContactMessage.FromProtoBytes(Utils.CopyBuffer(nativeResult.ContactWireBytes)),
@@ -45,36 +55,40 @@ public static partial class Pairing
             {
                 Utils.FreeBuffer(nativeResult.ContactWireBytes);
                 Utils.FreeBuffer(nativeResult.SecretKeyMaterial);
-                Utils.FreeStatusMessage(nativeResult.Status);
             }
         }
 
-        /// <summary>Produces a pairing request envelope from a contact message.</summary>
+        /// <summary>
+        /// Produces a pairing request envelope from a contact message.
+        /// <paramref name="communicationInfo"/> is optional and may be null.
+        /// </summary>
         public static ProduceResult Produce(
             SenderKind kind,
             TransportProtocol transportProtocol,
-            ContactMessage contactMessage
+            ContactMessage contactMessage,
+            byte[]? communicationInfo = null
         )
         {
             byte[] transportProtocolBytes = transportProtocol.ToProtoBytes();
             byte[] contactMessageBytes = contactMessage.ToProtoBytes();
 
-            Native.Pairing.ProducePairingRequestMessageResult nativeResult =
-                Native.Pairing.produce_pairing_request_message(
+            Native.Pairing.ProducePairRequestMessageResult nativeResult =
+                Native.Pairing.produce_pair_request_message(
                     (int)kind,
                     transportProtocolBytes,
                     (UIntPtr)transportProtocolBytes.Length,
                     contactMessageBytes,
-                    (UIntPtr)contactMessageBytes.Length
+                    (UIntPtr)contactMessageBytes.Length,
+                    communicationInfo,
+                    (UIntPtr)(communicationInfo?.Length ?? 0)
                 );
 
             try
             {
-                Utils.ThrowIfError(nativeResult.Status);
-
+                Utils.ThrowIfError(nativeResult.Error);
                 return new ProduceResult
                 {
-                    Envelope = Utils.CopyBuffer(nativeResult.RequestWireBytes),
+                    Envelope = DeRecMessage.FromProtoBytes(Utils.CopyBuffer(nativeResult.RequestWireBytes)),
                     InitiatorContactMessage = ContactMessage.FromProtoBytes(Utils.CopyBuffer(nativeResult.InitiatorContactMessageWireBytes)),
                     SecretKeyMaterial = Utils.CopyBuffer(nativeResult.SecretKeyMaterial),
                 };
@@ -84,7 +98,33 @@ public static partial class Pairing
                 Utils.FreeBuffer(nativeResult.RequestWireBytes);
                 Utils.FreeBuffer(nativeResult.InitiatorContactMessageWireBytes);
                 Utils.FreeBuffer(nativeResult.SecretKeyMaterial);
-                Utils.FreeStatusMessage(nativeResult.Status);
+            }
+        }
+
+        public static ExtractResult Extract(DeRecMessage request, byte[] secretKeyMaterial)
+        {
+            byte[] requestBytes = request.ToProtoBytes();
+
+            Native.Pairing.ExtractPairRequestResult nativeResult =
+                Native.Pairing.extract_pair_request(
+                    requestBytes,
+                    (UIntPtr)requestBytes.Length,
+                    secretKeyMaterial,
+                    (UIntPtr)secretKeyMaterial.Length
+                );
+
+            try
+            {
+                Utils.ThrowIfError(nativeResult.Error);
+                return new ExtractResult
+                {
+                    ChannelId = nativeResult.ChannelId,
+                    RequestProtoBytes = Utils.CopyBuffer(nativeResult.RequestProtoBytes),
+                };
+            }
+            finally
+            {
+                Utils.FreeBuffer(nativeResult.RequestProtoBytes);
             }
         }
     }

@@ -57,7 +57,7 @@ use crate::{
 use derec_proto::DeRecSecret;
 use prost::Message;
 use serde::Serialize;
-use crate::wasm::primitives::pairing::{contact_message_to_js, js_to_contact_message};
+use crate::wasm::primitives::pairing::ContactMessage as PairingContactMessage;
 use derec_proto::{SenderKind, TransportProtocol};
 use js_sys::{Array, Uint8Array};
 use stores::{JsChannelStore, JsSecretStore, JsShareStore, JsTransport};
@@ -92,7 +92,7 @@ type WasmProtocol = DeRecProtocol<JsChannelStore, JsShareStore, JsSecretStore, J
 /// | `SecretRecovered`  | `secret: Uint8Array`                                   |
 /// | `NoOp`             | _(none)_                                               |
 ///
-/// `SecretVersionEntry = { secret_id: Uint8Array, versions: { version: number, description: string }[] }`
+/// `SecretVersionEntry = { secret_id: bigint, versions: { version: number, description: string }[] }`
 #[wasm_bindgen]
 pub struct DeRecProtocolWasm {
     inner: WasmProtocol,
@@ -229,7 +229,12 @@ impl DeRecProtocolWasm {
             .create_contact(id)
             .await
             .map_err(|e| js_error("DEREC_ERROR", e.to_string()))?;
-        serde_wasm_bindgen::to_value(&contact_message_to_js(&contact))
+        let contact: PairingContactMessage = contact.into();
+        let serializer = serde_wasm_bindgen::Serializer::new()
+            .serialize_large_number_types_as_bigints(true);
+        use serde::Serialize as _;
+        contact
+            .serialize(&serializer)
             .map_err(|e| js_error("WASM_SERIALIZE_ERROR", e.to_string()))
     }
 
@@ -692,7 +697,9 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
             let sender_kind = parse_sender_kind(kind)?;
             let contact_val = js_sys::Reflect::get(&params, &JsValue::from_str("contact"))
                 .map_err(|e| js_error("DECODE_ERROR", format!("missing contact: {e:?}")))?;
-            let contact = js_to_contact_message(contact_val)?;
+            let contact: PairingContactMessage = serde_wasm_bindgen::from_value(contact_val)
+                .map_err(|e| js_error("DECODE_ERROR", e.to_string()))?;
+            let contact: derec_proto::ContactMessage = contact.into();
             let raw = js_sys::Reflect::get(&params, &JsValue::from_str("peerCommunicationInfo"))
                 .unwrap_or(JsValue::UNDEFINED);
             let peer_communication_info: HashMap<String, String> =

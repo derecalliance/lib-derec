@@ -1,77 +1,162 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    primitives::discovery::response::{self, SecretVersionEntry, VersionEntry},
-    wasm::ts_bindings_utils::{derec_message_js_to_js_value, derec_message_to_js, js_error, js_error_from_lib, js_to_derec_message},
+    primitives::discovery::response::{
+        self, SecretVersionEntry as DomainSecretVersionEntry, VersionEntry as DomainVersionEntry,
+    },
+    wasm::{
+        primitives::{
+            helpers::{from_js, parse_shared_key, to_js},
+            types::{DeRecResult, Timestamp},
+        },
+        ts_bindings_utils::js_error_from_lib,
+    },
 };
-use derec_proto::DeRecMessage;
-use prost::Message as _;
+use derec_proto::get_secret_ids_versions_response_message::{
+    VersionList as VersionListProto, version_list::VersionEntry as VersionListEntryProto,
+};
+use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
-/// One stored version paired with its human-readable description, as used in JS.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct VersionEntryJs {
-    version: u32,
-    description: String,
+#[derive(Serialize, Deserialize, Clone)]
+pub struct VersionListEntry {
+    pub version: u32,
+    pub version_description: String,
 }
 
-/// One entry in a discovery response as used in JS: a secret ID with all stored versions.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct SecretVersionEntryJs {
-    secret_id: u64,
-    versions: Vec<VersionEntryJs>,
-}
-
-impl From<SecretVersionEntry> for SecretVersionEntryJs {
-    fn from(e: SecretVersionEntry) -> Self {
+impl From<VersionListEntryProto> for VersionListEntry {
+    fn from(value: VersionListEntryProto) -> Self {
         Self {
-            secret_id: e.secret_id,
-            versions: e
-                .versions
-                .into_iter()
-                .map(|v| VersionEntryJs {
-                    version: v.version,
-                    description: v.description,
-                })
-                .collect(),
+            version: value.version,
+            version_description: value.version_description,
         }
     }
 }
 
-impl From<SecretVersionEntryJs> for SecretVersionEntry {
-    fn from(e: SecretVersionEntryJs) -> Self {
+#[derive(Serialize, Deserialize, Clone)]
+pub struct VersionList {
+    pub secret_id: u64,
+    pub versions: Vec<VersionListEntry>,
+}
+
+impl From<VersionListProto> for VersionList {
+    fn from(value: VersionListProto) -> Self {
         Self {
-            secret_id: e.secret_id,
-            versions: e
-                .versions
-                .into_iter()
-                .map(|v| VersionEntry {
-                    version: v.version,
-                    description: v.description,
-                })
-                .collect(),
+            secret_id: value.secret_id,
+            versions: value.versions.into_iter().map(Into::into).collect(),
         }
     }
 }
 
-/// Produces a discovery response envelope (Helper side).
-///
-/// Called after the Helper receives and extracts a discovery request. The Helper
-/// enumerates all secrets it currently stores for this channel — including the
-/// human-readable description for each version — and passes them here.
-///
-/// # Arguments
-///
-/// * `channel_id` - Recovery channel identifier established during pairing
-/// * `secret_list` - JS array of objects with shape
-///   `{ secret_id: Uint8Array, versions: [{ version: number, description: string }] }`.
-///   Pass an empty array if no secrets are stored for this channel.
-/// * `shared_key` - 32-byte symmetric key established during pairing
-///
-/// # Returns
-///
-/// A plain JS object representing the outer `DeRecMessage` response envelope,
-/// ready to send back to the Owner.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct GetSecretIdsVersionsResponseMessage {
+    pub result: Option<DeRecResult>,
+    pub secret_list: Vec<VersionList>,
+    pub timestamp: Option<Timestamp>,
+}
+
+impl From<derec_proto::GetSecretIdsVersionsResponseMessage>
+    for GetSecretIdsVersionsResponseMessage
+{
+    fn from(value: derec_proto::GetSecretIdsVersionsResponseMessage) -> Self {
+        Self {
+            result: value.result.map(Into::into),
+            secret_list: value.secret_list.into_iter().map(Into::into).collect(),
+            timestamp: value.timestamp.map(Into::into),
+        }
+    }
+}
+
+impl From<GetSecretIdsVersionsResponseMessage>
+    for derec_proto::GetSecretIdsVersionsResponseMessage
+{
+    fn from(value: GetSecretIdsVersionsResponseMessage) -> Self {
+        Self {
+            result: value.result.map(Into::into),
+            secret_list: value
+                .secret_list
+                .into_iter()
+                .map(|v| VersionListProto {
+                    secret_id: v.secret_id,
+                    versions: v
+                        .versions
+                        .into_iter()
+                        .map(|e| VersionListEntryProto {
+                            version: e.version,
+                            version_description: e.version_description,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            timestamp: value.timestamp.map(Into::into),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct VersionEntry {
+    pub version: u32,
+    pub description: String,
+}
+
+impl From<DomainVersionEntry> for VersionEntry {
+    fn from(value: DomainVersionEntry) -> Self {
+        Self {
+            version: value.version,
+            description: value.description,
+        }
+    }
+}
+
+impl From<VersionEntry> for DomainVersionEntry {
+    fn from(value: VersionEntry) -> Self {
+        Self {
+            version: value.version,
+            description: value.description,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SecretVersionEntry {
+    pub secret_id: u64,
+    pub versions: Vec<VersionEntry>,
+}
+
+impl From<DomainSecretVersionEntry> for SecretVersionEntry {
+    fn from(value: DomainSecretVersionEntry) -> Self {
+        Self {
+            secret_id: value.secret_id,
+            versions: value.versions.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<SecretVersionEntry> for DomainSecretVersionEntry {
+    fn from(value: SecretVersionEntry) -> Self {
+        Self {
+            secret_id: value.secret_id,
+            versions: value.versions.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ProduceResult {
+    #[serde(with = "serde_bytes")]
+    pub envelope: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ExtractResult {
+    pub response: GetSecretIdsVersionsResponseMessage,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ProcessResult {
+    pub secret_list: Vec<SecretVersionEntry>,
+}
+
 #[wasm_bindgen(js_name = "discovery_response_produce")]
 pub fn produce(
     channel_id: u64,
@@ -80,62 +165,35 @@ pub fn produce(
 ) -> Result<JsValue, JsValue> {
     let shared_key = parse_shared_key(shared_key)?;
 
-    let entries_js: Vec<SecretVersionEntryJs> = serde_wasm_bindgen::from_value(secret_list)
-        .map_err(|e| js_error("WASM_DESERIALIZE_ERROR", e.to_string()))?;
-
-    let secret_list: Vec<SecretVersionEntry> =
-        entries_js.into_iter().map(SecretVersionEntry::from).collect();
+    let entries: Vec<SecretVersionEntry> = from_js(secret_list)?;
+    let secret_list: Vec<DomainSecretVersionEntry> = entries.into_iter().map(Into::into).collect();
 
     let result = response::produce(channel_id.into(), &secret_list, &shared_key)
         .map_err(js_error_from_lib)?;
 
-    let envelope = DeRecMessage::decode(result.envelope.as_slice())
-        .map_err(|e| js_error("PROTOBUF_DECODE_ERROR", e.to_string()))?;
-    derec_message_js_to_js_value(derec_message_to_js(envelope))
-}
-
-/// Decodes, decrypts, and processes a discovery response envelope (Owner side).
-///
-/// Combines the `extract` and `process` steps into a single call. The Owner
-/// passes the response envelope received from the Helper and receives the full
-/// list of secrets with their versions and descriptions.
-///
-/// # Arguments
-///
-/// * `response` - Outer `DeRecMessage` JS object from `discovery_response_produce`
-/// * `shared_key` - 32-byte symmetric key established during pairing
-///
-/// # Returns
-///
-/// A JS array of objects with shape
-/// `{ secret_id: Uint8Array, versions: [{ version: number, description: string }] }`.
-/// The Owner can inspect `description` to identify secrets by their human-readable
-/// label before calling `recovery_request_produce`.
-#[wasm_bindgen(js_name = "discovery_response_process")]
-pub fn process(resp: JsValue, shared_key: &[u8]) -> Result<JsValue, JsValue> {
-    let shared_key = parse_shared_key(shared_key)?;
-
-    let envelope = js_to_derec_message(resp, "response")?;
-    let envelope_bytes = envelope.encode_to_vec();
-
-    let response::ExtractResult { response } =
-        response::extract(&envelope_bytes, &shared_key).map_err(js_error_from_lib)?;
-
-    let response::ProcessResult { secret_list } =
-        response::process(&response).map_err(js_error_from_lib)?;
-
-    let entries_js: Vec<SecretVersionEntryJs> =
-        secret_list.into_iter().map(SecretVersionEntryJs::from).collect();
-
-    serde_wasm_bindgen::to_value(&entries_js)
-        .map_err(|e| js_error("WASM_SERIALIZE_ERROR", e.to_string()))
-}
-
-fn parse_shared_key(shared_key: &[u8]) -> Result<[u8; 32], JsValue> {
-    shared_key.try_into().map_err(|_| {
-        js_error(
-            "INVALID_SHARED_KEY_LENGTH",
-            "shared_key must be exactly 32 bytes".to_string(),
-        )
+    to_js(&ProduceResult {
+        envelope: result.envelope,
     })
+}
+
+#[wasm_bindgen(js_name = "discovery_response_extract")]
+pub fn extract(envelope_bytes: &[u8], shared_key: &[u8]) -> Result<JsValue, JsValue> {
+    let shared_key = parse_shared_key(shared_key)?;
+    let result = response::extract(envelope_bytes, &shared_key).map_err(js_error_from_lib)?;
+    to_js(&ExtractResult {
+        response: result.response.into(),
+    })
+}
+
+#[wasm_bindgen(js_name = "discovery_response_process")]
+pub fn process(response: JsValue) -> Result<JsValue, JsValue> {
+    let response: GetSecretIdsVersionsResponseMessage = from_js(response)?;
+    let response_proto: derec_proto::GetSecretIdsVersionsResponseMessage = response.into();
+
+    let result = response::process(&response_proto).map_err(js_error_from_lib)?;
+
+    let secret_list: Vec<SecretVersionEntry> =
+        result.secret_list.into_iter().map(Into::into).collect();
+
+    to_js(&ProcessResult { secret_list })
 }

@@ -2,25 +2,23 @@
 
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
-    types::*,
+    types::{ChannelId, SharedKey},
+    utils::verify_timestamps,
 };
 use derec_proto::{DeRecMessage, MessageBody, VerifyShareRequestMessage};
 use prost::Message;
 use rand::{Rng, rng};
 
-/// Result of [`produce`].
 pub struct ProduceResult {
     /// Serialized outer [`derec_proto::DeRecMessage`] envelope with the encrypted request payload.
     pub envelope: Vec<u8>,
 }
 
-/// Result of [`extract`].
 pub struct ExtractResult {
-    /// Decrypted inner [`derec_proto::VerifyShareRequestMessage`].
     pub request: VerifyShareRequestMessage,
 }
 
-/// Creates a verification request envelope to initiate the DeRec *verification* flow.
+/// Produces a verification request envelope to initiate the DeRec *verification* flow.
 ///
 /// In DeRec, verification allows an Owner to challenge a Helper to prove it still holds
 /// the expected share bytes. The Owner sends an encrypted
@@ -41,7 +39,7 @@ pub struct ExtractResult {
 ///
 /// # Arguments
 ///
-/// * `channel_id` - Channel identifier for the previously paired helper.
+/// * `channel_id` - Channel identifier for the previously paired Helper.
 /// * `secret_id` - Identifier of the secret whose share is being verified. Embedded into
 ///   the request.
 /// * `version` - Distribution version to embed in the request. The responder is expected to
@@ -70,7 +68,7 @@ pub struct ExtractResult {
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```
 /// use derec_library::primitives::verification::request;
 /// use derec_library::types::ChannelId;
 ///
@@ -79,7 +77,7 @@ pub struct ExtractResult {
 ///
 /// let result = request::produce(
 ///     channel_id,
-///     b"secret_id",
+///     1,
 ///     7,
 ///     &shared_key,
 /// )
@@ -154,6 +152,25 @@ pub fn produce(
 /// - decryption or inner-message decoding fails
 /// - `envelope.timestamp != request.timestamp`
 /// - the inner message is not a [`derec_proto::VerifyShareRequestMessage`]
+///
+/// # Example
+///
+/// ```
+/// use derec_library::primitives::verification::request;
+/// use derec_library::types::ChannelId;
+///
+/// let channel_id = ChannelId(42);
+/// let shared_key = [7u8; 32];
+///
+/// let request::ProduceResult { envelope } = request::produce(channel_id, 1, 7, &shared_key)
+///     .expect("failed to build verification request");
+///
+/// let request::ExtractResult { request } = request::extract(&envelope, &shared_key)
+///     .expect("failed to extract verification request");
+///
+/// assert_eq!(request.secret_id, 1);
+/// assert_eq!(request.version, 7);
+/// ```
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
@@ -169,19 +186,14 @@ pub fn extract(
         _ => {
             #[cfg(feature = "logging")]
             tracing::warn!("unexpected message type; expected VerifyShareRequestMessage");
+
             return Err(crate::Error::Invariant(
                 "Invalid message. Expected: VerifyShareRequestMessage",
             ));
         }
     };
 
-    if envelope.timestamp != request.timestamp {
-        #[cfg(feature = "logging")]
-        tracing::warn!("timestamp invariant violated");
-        return Err(crate::Error::Invariant(
-            "Envelope timestamp does not match request timestamp",
-        ));
-    }
+    verify_timestamps(envelope.timestamp, request.timestamp)?;
 
     #[cfg(feature = "logging")]
     tracing::info!("verification request extracted and validated");

@@ -1,16 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 
+using System;
+
 namespace DeRec.Library.Primitives;
 
 public static partial class Pairing
 {
     public static class Response
     {
-        public sealed class ProduceResult
+        public sealed class AcceptResult
         {
-            public required byte[] Envelope { get; init; }
-            public required TransportProtocol ResponderTransportProtocol { get; init; }
+            public required DeRecMessage Envelope { get; init; }
+            public required TransportProtocol PeerTransportProtocol { get; init; }
             public required byte[] SharedKey { get; init; }
+        }
+
+        public sealed class RejectResult
+        {
+            public required DeRecMessage Envelope { get; init; }
+            public required TransportProtocol PeerTransportProtocol { get; init; }
+        }
+
+        public sealed class ExtractResult
+        {
+            public required ulong ChannelId { get; init; }
+            /// <summary>
+            /// Inner <c>PairResponseMessage</c> proto bytes for chaining into
+            /// <see cref="Process"/>.
+            /// </summary>
+            public required byte[] ResponseProtoBytes { get; init; }
         }
 
         public sealed class ProcessResult
@@ -19,68 +37,137 @@ public static partial class Pairing
         }
 
         /// <summary>
-        /// Produces a pairing response envelope and derives the initiator-side shared key.
+        /// Accepts a pairing request and derives the shared key.
         /// </summary>
-        public static ProduceResult Produce(
+        public static AcceptResult Accept(
             SenderKind kind,
-            byte[] pairRequest,
-            byte[] pairingSecretKeyMaterial
+            byte[] requestProtoBytes,
+            byte[] secretKeyMaterial,
+            byte[]? communicationInfo = null
         )
         {
-            Native.Pairing.ProducePairingResponseMessageResult nativeResult =
-                Native.Pairing.produce_pairing_response_message(
+            Native.Pairing.AcceptPairRequestMessageResult nativeResult =
+                Native.Pairing.accept_pair_request_message(
                     (int)kind,
-                    pairRequest,
-                    (UIntPtr)pairRequest.Length,
-                    pairingSecretKeyMaterial,
-                    (UIntPtr)pairingSecretKeyMaterial.Length
+                    requestProtoBytes,
+                    (UIntPtr)requestProtoBytes.Length,
+                    secretKeyMaterial,
+                    (UIntPtr)secretKeyMaterial.Length,
+                    communicationInfo,
+                    (UIntPtr)(communicationInfo?.Length ?? 0)
                 );
 
             try
             {
-                Utils.ThrowIfError(nativeResult.Status);
-
-                return new ProduceResult
+                Utils.ThrowIfError(nativeResult.Error);
+                return new AcceptResult
                 {
-                    Envelope = Utils.CopyBuffer(nativeResult.ResponseWireBytes),
-                    ResponderTransportProtocol = TransportProtocol.FromProtoBytes(Utils.CopyBuffer(nativeResult.ResponderTransportProtocol)),
+                    Envelope = DeRecMessage.FromProtoBytes(Utils.CopyBuffer(nativeResult.ResponseWireBytes)),
+                    PeerTransportProtocol = TransportProtocol.FromProtoBytes(Utils.CopyBuffer(nativeResult.PeerTransportProtocol)),
                     SharedKey = Utils.CopyBuffer(nativeResult.SharedKey),
                 };
             }
             finally
             {
                 Utils.FreeBuffer(nativeResult.ResponseWireBytes);
-                Utils.FreeBuffer(nativeResult.ResponderTransportProtocol);
+                Utils.FreeBuffer(nativeResult.PeerTransportProtocol);
                 Utils.FreeBuffer(nativeResult.SharedKey);
-                Utils.FreeStatusMessage(nativeResult.Status);
             }
         }
 
         /// <summary>
-        /// Processes a pairing response envelope and derives the responder-side shared key.
+        /// Rejects a pairing request with a typed status and memo.
         /// </summary>
-        public static ProcessResult Process(
-            ContactMessage contactMessage,
-            byte[] pairResponse,
-            byte[] pairingSecretKeyMaterial
+        public static RejectResult Reject(
+            SenderKind kind,
+            byte[] requestProtoBytes,
+            int statusEnum,
+            string memo,
+            byte[]? communicationInfo = null
         )
         {
-            byte[] contactMessageBytes = contactMessage.ToProtoBytes();
+            byte[] memoBytes = System.Text.Encoding.UTF8.GetBytes(memo ?? string.Empty);
 
-            Native.Pairing.ProcessPairingResponseMessageResult nativeResult =
-                Native.Pairing.process_pairing_response_message(
-                    contactMessageBytes,
-                    (UIntPtr)contactMessageBytes.Length,
-                    pairResponse,
-                    (UIntPtr)pairResponse.Length,
-                    pairingSecretKeyMaterial,
-                    (UIntPtr)pairingSecretKeyMaterial.Length
+            Native.Pairing.RejectPairRequestMessageResult nativeResult =
+                Native.Pairing.reject_pair_request_message(
+                    (int)kind,
+                    requestProtoBytes,
+                    (UIntPtr)requestProtoBytes.Length,
+                    statusEnum,
+                    memoBytes,
+                    (UIntPtr)memoBytes.Length,
+                    communicationInfo,
+                    (UIntPtr)(communicationInfo?.Length ?? 0)
                 );
 
             try
             {
-                Utils.ThrowIfError(nativeResult.Status);
+                Utils.ThrowIfError(nativeResult.Error);
+                return new RejectResult
+                {
+                    Envelope = DeRecMessage.FromProtoBytes(Utils.CopyBuffer(nativeResult.ResponseWireBytes)),
+                    PeerTransportProtocol = TransportProtocol.FromProtoBytes(Utils.CopyBuffer(nativeResult.PeerTransportProtocol)),
+                };
+            }
+            finally
+            {
+                Utils.FreeBuffer(nativeResult.ResponseWireBytes);
+                Utils.FreeBuffer(nativeResult.PeerTransportProtocol);
+            }
+        }
 
+        public static ExtractResult Extract(DeRecMessage response, byte[] secretKeyMaterial)
+        {
+            byte[] responseBytes = response.ToProtoBytes();
+
+            Native.Pairing.ExtractPairResponseResult nativeResult =
+                Native.Pairing.extract_pair_response(
+                    responseBytes,
+                    (UIntPtr)responseBytes.Length,
+                    secretKeyMaterial,
+                    (UIntPtr)secretKeyMaterial.Length
+                );
+
+            try
+            {
+                Utils.ThrowIfError(nativeResult.Error);
+                return new ExtractResult
+                {
+                    ChannelId = nativeResult.ChannelId,
+                    ResponseProtoBytes = Utils.CopyBuffer(nativeResult.ResponseProtoBytes),
+                };
+            }
+            finally
+            {
+                Utils.FreeBuffer(nativeResult.ResponseProtoBytes);
+            }
+        }
+
+        /// <summary>
+        /// Processes a pairing response and derives the shared key. Throws
+        /// <see cref="DeRecException"/> on peer rejection.
+        /// </summary>
+        public static ProcessResult Process(
+            ContactMessage contactMessage,
+            byte[] responseProtoBytes,
+            byte[] secretKeyMaterial
+        )
+        {
+            byte[] contactMessageBytes = contactMessage.ToProtoBytes();
+
+            Native.Pairing.ProcessPairResponseMessageResult nativeResult =
+                Native.Pairing.process_pair_response_message(
+                    contactMessageBytes,
+                    (UIntPtr)contactMessageBytes.Length,
+                    responseProtoBytes,
+                    (UIntPtr)responseProtoBytes.Length,
+                    secretKeyMaterial,
+                    (UIntPtr)secretKeyMaterial.Length
+                );
+
+            try
+            {
+                Utils.ThrowIfError(nativeResult.Error);
                 return new ProcessResult
                 {
                     SharedKey = Utils.CopyBuffer(nativeResult.SharedKey),
@@ -89,7 +176,6 @@ public static partial class Pairing
             finally
             {
                 Utils.FreeBuffer(nativeResult.SharedKey);
-                Utils.FreeStatusMessage(nativeResult.Status);
             }
         }
     }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
 
@@ -10,105 +11,119 @@ public static partial class Recovery
 {
     public static class Response
     {
-        public sealed class RecoveryInput
+        public sealed class ExtractResult
         {
-            public required DeRecMessage Envelope { get; init; }
-            public required byte[] SharedKey { get; init; }
+            public required ulong ChannelId { get; init; }
+            /// <summary>
+            /// Inner <c>GetShareResponseMessage</c> proto bytes. Accumulate
+            /// across helpers and pass to <see cref="Recover"/>.
+            /// </summary>
+            public required byte[] ResponseProtoBytes { get; init; }
         }
 
-        /// <summary>
-        /// Produces a recovery share response envelope (Helper side).
-        /// </summary>
         public static DeRecMessage Produce(
             ulong channelId,
-            byte[] secretId,
-            DeRecMessage request,
-            DeRecMessage storedShareRequest,
+            byte[] requestProtoBytes,
+            byte[] storedShareProtoBytes,
             byte[] sharedKey
         )
         {
-            byte[] requestWireBytes = request.ToProtoBytes();
-            byte[] storedShareRequestWireBytes = storedShareRequest.ToProtoBytes();
-
             Native.Recovery.ProduceGetShareResponseMessageResult nativeResult =
                 Native.Recovery.produce_get_share_response_message(
                     channelId,
-                    secretId,
-                    (UIntPtr)secretId.Length,
-                    requestWireBytes,
-                    (UIntPtr)requestWireBytes.Length,
-                    storedShareRequestWireBytes,
-                    (UIntPtr)storedShareRequestWireBytes.Length,
+                    requestProtoBytes,
+                    (UIntPtr)requestProtoBytes.Length,
+                    storedShareProtoBytes,
+                    (UIntPtr)storedShareProtoBytes.Length,
                     sharedKey,
                     (UIntPtr)sharedKey.Length
                 );
 
             try
             {
-                Utils.ThrowIfError(nativeResult.Status);
-
-                return DeRecMessage.FromProtoBytes(Utils.CopyBuffer(nativeResult.WireBytes));
+                Utils.ThrowIfError(nativeResult.Error);
+                return DeRecMessage.FromProtoBytes(Utils.CopyBuffer(nativeResult.ResponseWireBytes));
             }
             finally
             {
-                Utils.FreeBuffer(nativeResult.WireBytes);
-                Utils.FreeStatusMessage(nativeResult.Status);
+                Utils.FreeBuffer(nativeResult.ResponseWireBytes);
+            }
+        }
+
+        public static ExtractResult Extract(DeRecMessage response, byte[] sharedKey)
+        {
+            byte[] responseWireBytes = response.ToProtoBytes();
+
+            Native.Recovery.ExtractGetShareResponseResult nativeResult =
+                Native.Recovery.extract_get_share_response(
+                    responseWireBytes,
+                    (UIntPtr)responseWireBytes.Length,
+                    sharedKey,
+                    (UIntPtr)sharedKey.Length
+                );
+
+            try
+            {
+                Utils.ThrowIfError(nativeResult.Error);
+                return new ExtractResult
+                {
+                    ChannelId = nativeResult.ChannelId,
+                    ResponseProtoBytes = Utils.CopyBuffer(nativeResult.ResponseProtoBytes),
+                };
+            }
+            finally
+            {
+                Utils.FreeBuffer(nativeResult.ResponseProtoBytes);
             }
         }
 
         /// <summary>
-        /// Reconstructs the original secret from a threshold of helper recovery responses (Owner side).
+        /// Reconstructs the original secret from a quorum of extracted helper
+        /// responses. Each entry is the <c>ResponseProtoBytes</c> returned by
+        /// <see cref="Extract"/>.
         /// </summary>
         public static byte[] Recover(
-            IEnumerable<RecoveryInput> responses,
-            byte[] secretId,
-            int version
+            IEnumerable<byte[]> extractedResponses,
+            ulong secretId,
+            uint version
         )
         {
-            byte[] serializedResponses = SerializeInputs(responses);
+            ArgumentNullException.ThrowIfNull(extractedResponses);
+            byte[] serialized = SerializeResponses(extractedResponses);
 
             Native.Recovery.RecoverFromShareResponsesResult nativeResult =
                 Native.Recovery.recover_from_share_responses(
-                    serializedResponses,
-                    (UIntPtr)serializedResponses.Length,
+                    serialized,
+                    (UIntPtr)serialized.Length,
                     secretId,
-                    (UIntPtr)secretId.Length,
                     version
                 );
 
             try
             {
-                Utils.ThrowIfError(nativeResult.Status);
-
+                Utils.ThrowIfError(nativeResult.Error);
                 return Utils.CopyBuffer(nativeResult.SecretData);
             }
             finally
             {
                 Utils.FreeBuffer(nativeResult.SecretData);
-                Utils.FreeStatusMessage(nativeResult.Status);
             }
         }
 
-        private static byte[] SerializeInputs(IEnumerable<RecoveryInput> responses)
+        private static byte[] SerializeResponses(IEnumerable<byte[]> responses)
         {
-            List<RecoveryInput> list = new(responses);
+            List<byte[]> list = new(responses);
 
             using MemoryStream stream = new();
             using BinaryWriter writer = new(stream);
 
             writer.Write((uint)list.Count);
 
-            foreach (RecoveryInput response in list)
+            foreach (byte[] bytes in list)
             {
-                if (response.Envelope is null) throw new ArgumentNullException(nameof(response.Envelope));
-                if (response.SharedKey is null) throw new ArgumentNullException(nameof(response.SharedKey));
-                if (response.SharedKey.Length != 32)
-                    throw new ArgumentException("SharedKey must be exactly 32 bytes.", nameof(response.SharedKey));
-
-                byte[] envelopeBytes = response.Envelope.ToProtoBytes();
-                writer.Write((uint)envelopeBytes.Length);
-                writer.Write(envelopeBytes);
-                writer.Write(response.SharedKey);
+                ArgumentNullException.ThrowIfNull(bytes);
+                writer.Write((uint)bytes.Length);
+                writer.Write(bytes);
             }
 
             writer.Flush();

@@ -1,0 +1,5 @@
+# TypeScript build output
+*.js
+*.js.map
+*.d.ts
+*.d.ts.map

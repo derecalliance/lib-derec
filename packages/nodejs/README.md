@@ -55,8 +55,13 @@ These represent **opaque wire-level protocol messages**.
 ```ts
 import { primitives } from "@derec-alliance/nodejs";
 
+const channelId = 1n;            // u64 → bigint
+const secretId = 42n;            // u64 → bigint
+const version = 1;               // u32 → number
+const sharedKey = new Uint8Array(32); // established during pairing
+
 const result = primitives.verification.request.produce(channelId, secretId, version, sharedKey);
-// result carries the encoded DeRecMessage envelope, ready to send over transport
+// result carries the encoded DeRecMessage envelope, ready to send over transport.
 ```
 
 ---
@@ -64,37 +69,42 @@ const result = primitives.verification.request.produce(channelId, secretId, vers
 ## Pairing Flow
 
 ```ts
-import { primitives } from "@derec-alliance/nodejs";
+import { primitives, SenderKind } from "@derec-alliance/nodejs";
 
-// Step 1: Owner creates contact message (out-of-band)
+// Step 1: Initiator creates contact message (sent out-of-band).
 const contact = primitives.pairing.request.create_contact(
   1n,
-  { protocol: "https", uri: "https://owner.example.com" }
+  { protocol: "https", uri: "https://owner.example.com" },
 );
 
-// Step 2: Helper produces pairing request
+// Step 2: Responder produces a pairing request from the contact.
 const request = primitives.pairing.request.produce(
-  2, // SenderKind.Helper
+  SenderKind.Helper,
   { protocol: "https", uri: "https://helper.example.com" },
-  contact.contact_message
+  contact.contact_message,
 );
 
-// Step 3: Owner produces pairing response
-const response = primitives.pairing.response.produce(
-  0, // SenderKind.OwnerNonRecovery
+// Step 3: Initiator accepts the request and derives the initiator-side shared key.
+const accepted = primitives.pairing.response.accept(
+  SenderKind.Owner,
   request.envelope,
-  contact.secret_key_material
+  contact.secret_key_material,
 );
 
-// Step 4: Helper processes response and derives shared key
-const result = primitives.pairing.response.process(
+// Step 4: Responder processes the response and derives the responder-side shared key.
+const processed = primitives.pairing.response.process(
   request.initiator_contact_message,
-  response.envelope,
-  request.secret_key_material
+  accepted.envelope,
+  request.secret_key_material,
 );
 
-console.log("Shared key length:", result.pairing_shared_key.length);
+// Both sides hold the same key.
+// accepted.pairing_shared_key  ==  processed.pairing_shared_key
 ```
+
+Use `primitives.pairing.response.reject(kind, request_envelope, status, memo, communication_info)`
+instead of `accept` to reply with a non-OK status. The trailing `communication_info` argument
+may be `null`.
 
 ---
 
@@ -103,19 +113,26 @@ console.log("Shared key length:", result.pairing_shared_key.length);
 ```ts
 import { primitives } from "@derec-alliance/nodejs";
 
-const splitResult = primitives.sharing.request.split(
-  new Uint8Array([1, 2, 3]),                // secret ID
-  new TextEncoder().encode("super-secret"), // secret bytes
-  [1n, 2n, 3n],                             // helper channel IDs
-  2,                                        // threshold
-  1                                         // version
-);
-// splitResult.value: Map<bigint, Uint8Array> — one CommittedDeRecShare per helper
+const secretId = 42n;                                  // u64
+const secretData = new TextEncoder().encode("super-secret");
+const channelIds = [1n, 2n, 3n];
+const threshold = 2;                                   // must be 2 <= threshold <= channelIds.length
+const version = 1;
+// sharedKeys: Map<bigint, Uint8Array> with the 32-byte channel keys
 
-// Wrap each share into an encrypted delivery envelope
+const splitResult = primitives.sharing.request.split(
+  secretId,
+  secretData,
+  channelIds,
+  threshold,
+  version,
+);
+// splitResult.value: Map<bigint, Uint8Array> — one CommittedDeRecShare per helper.
+
+// Wrap each share into an encrypted delivery envelope.
 for (const [channelId, committedShare] of splitResult.value) {
   const envelope = primitives.sharing.request.produce(
-    channelId, version, secretId, committedShare, [], "", sharedKeys.get(channelId)
+    channelId, version, secretId, committedShare, [], "", sharedKeys.get(channelId)!,
   );
 }
 ```
@@ -127,31 +144,37 @@ for (const [channelId, committedShare] of splitResult.value) {
 ```ts
 import { primitives } from "@derec-alliance/nodejs";
 
-// Owner side: produce the recovery request
+const secretId = 42n;          // u64
+const version = 1;             // u32
+
+// Owner side: produce the recovery request.
 const shareRequest = primitives.recovery.request.produce(
-  1n,                        // channel ID
-  new Uint8Array([1, 2, 3]), // secret ID
-  1,                         // version
-  sharedKey
+  1n,                          // channel ID
+  secretId,
+  version,
+  sharedKey,
 );
 
-// Helper side: produce the response
+// Helper side: produce the response using the StoreShareRequest it persisted
+// at sharing time.
 const shareResponse = primitives.recovery.response.produce(
-  new Uint8Array([1, 2, 3]), // secret ID
-  1n,                        // channel ID
+  secretId,
+  1n,                          // channel ID
   storedShareEnvelope,
   shareRequest,
-  sharedKey
+  sharedKey,
 );
 
-// Owner side: aggregate responses and reconstruct the secret
+// Owner side: collect at least `threshold` responses and reconstruct.
 const recovered = primitives.recovery.response.recover(
-  [{ response: shareResponse, shared_key: sharedKey }],
-  new Uint8Array([1, 2, 3]),
-  1
+  [
+    { response: shareResponse, shared_key: sharedKey },
+    // …additional helper responses…
+  ],
+  secretId,
+  version,
 );
-
-console.log(recovered);
+// `recovered` is a Uint8Array carrying the reconstructed secret payload.
 ```
 
 ---

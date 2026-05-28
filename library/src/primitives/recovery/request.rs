@@ -3,25 +3,23 @@
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     types::{ChannelId, SharedKey},
+    utils::verify_timestamps,
 };
 use derec_proto::{DeRecMessage, GetShareRequestMessage, MessageBody};
 use prost::Message;
 
-/// Result of [`produce`].
 pub struct ProduceResult {
     /// Serialized outer [`derec_proto::DeRecMessage`] envelope with the encrypted request payload.
     pub envelope: Vec<u8>,
 }
 
-/// Result of [`extract`].
 pub struct ExtractResult {
-    /// The decrypted inner [`derec_proto::GetShareRequestMessage`].
     pub request: GetShareRequestMessage,
 }
 
 /// Produces a recovery request envelope for a specific `(secret_id, version)` share.
 ///
-/// In the DeRec recovery flow, the recovering owner requests one share from each helper.
+/// In the DeRec recovery flow, the recovering Owner requests one share from each Helper.
 /// The request identifies:
 ///
 /// - `secret_id`: which secret is being recovered
@@ -32,9 +30,9 @@ pub struct ExtractResult {
 ///
 /// # Arguments
 ///
-/// * `channel_id` - Identifier of the previously paired helper channel.
-/// * `secret_id` - Identifier of the secret being recovered. Must not be empty.
-/// * `version` - Version number of the secret share to request. Must be `>= 0`.
+/// * `channel_id` - Identifier of the previously paired Helper channel.
+/// * `secret_id` - Identifier of the secret being recovered.
+/// * `version` - Version number of the secret share to request.
 /// * `shared_key` - Previously established 32-byte symmetric channel key used to encrypt
 ///   the inner request.
 ///
@@ -47,9 +45,7 @@ pub struct ExtractResult {
 ///
 /// # Errors
 ///
-/// Returns [`crate::Error`] (specifically `Error::Recovery(...)`) in the following cases:
-///
-/// - outer envelope construction or symmetric encryption fails
+/// Returns [`crate::Error`] if outer envelope construction or symmetric encryption fails.
 ///
 /// # Security Notes
 ///
@@ -57,14 +53,14 @@ pub struct ExtractResult {
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```
 /// use derec_library::primitives::recovery::request;
 /// use derec_library::types::ChannelId;
 ///
 /// let channel_id = ChannelId(42);
 /// let shared_key = [7u8; 32];
 ///
-/// let result = request::produce(channel_id, b"my_secret", 1, &shared_key)
+/// let result = request::produce(channel_id, 1, 1, &shared_key)
 ///     .expect("failed to build recovery request");
 ///
 /// assert!(!result.envelope.is_empty());
@@ -111,7 +107,7 @@ pub fn produce(
 /// 3. Validates the invariant `envelope.timestamp == request.timestamp`
 ///
 /// Call this on the **Helper** side after receiving a recovery request envelope. The decrypted
-/// request can then be passed to the response module's `produce` function to build a response.
+/// request can then be passed to [`super::response::produce`] to build a response.
 ///
 /// # Arguments
 ///
@@ -134,6 +130,25 @@ pub fn produce(
 /// - decryption or inner-message decoding fails
 /// - `envelope.timestamp != request.timestamp`
 /// - the inner message is not a [`derec_proto::GetShareRequestMessage`]
+///
+/// # Example
+///
+/// ```
+/// use derec_library::primitives::recovery::request;
+/// use derec_library::types::ChannelId;
+///
+/// let channel_id = ChannelId(42);
+/// let shared_key = [7u8; 32];
+///
+/// let request::ProduceResult { envelope } = request::produce(channel_id, 1, 1, &shared_key)
+///     .expect("failed to build recovery request");
+///
+/// let request::ExtractResult { request } = request::extract(&envelope, &shared_key)
+///     .expect("failed to extract recovery request");
+///
+/// assert_eq!(request.secret_id, 1);
+/// assert_eq!(request.share_version, 1);
+/// ```
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
@@ -149,19 +164,14 @@ pub fn extract(
         _ => {
             #[cfg(feature = "logging")]
             tracing::warn!("unexpected message type; expected GetShareRequestMessage");
+
             return Err(crate::Error::Invariant(
                 "Invalid message. Expected: GetShareRequestMessage",
             ));
         }
     };
 
-    if envelope.timestamp != request.timestamp {
-        #[cfg(feature = "logging")]
-        tracing::warn!("timestamp invariant violated");
-        return Err(crate::Error::Invariant(
-            "Envelope timestamp does not match request timestamp",
-        ));
-    }
+    verify_timestamps(envelope.timestamp, request.timestamp)?;
 
     #[cfg(feature = "logging")]
     tracing::info!("recovery request extracted and validated");

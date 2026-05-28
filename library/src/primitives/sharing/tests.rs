@@ -33,7 +33,7 @@ fn make_request_with_mutated_share(
 ) -> derec_proto::StoreShareRequestMessage {
     use crate::derec_message::current_timestamp;
 
-    let secret_id = b"test-id";
+    let secret_id: u64 = 1;
     let secret_data = b"test-data";
     let channels = make_channel_ids(&[1, 2, 3]);
     let version = 1;
@@ -53,13 +53,13 @@ fn make_request_with_mutated_share(
         keep_list: vec![],
         version_description: String::new(),
         timestamp: Some(timestamp),
-        secret_id: secret_id.to_vec(),
+        secret_id,
     }
 }
 
 #[test]
 fn test_split_empty_channels() {
-    let secret_id = b"secret-id";
+    let secret_id: u64 = 1;
     let secret_data = b"secret-data";
     let threshold = 2;
     let version = 1;
@@ -73,24 +73,8 @@ fn test_split_empty_channels() {
 }
 
 #[test]
-fn test_split_empty_secret_id() {
-    let empty_secret_id = b"";
-    let secret_data = b"secret-data";
-    let channels = make_channel_ids(&[1, 2, 3]);
-    let threshold = 2;
-    let version = 1;
-
-    let result = split(&channels, empty_secret_id, version, secret_data, threshold);
-
-    assert!(matches!(
-        result,
-        Err(Error::Sharing(SharingError::EmptySecretId))
-    ));
-}
-
-#[test]
 fn test_split_empty_secret_data() {
-    let secret_id = b"secret-id";
+    let secret_id: u64 = 1;
     let empty_secret_data = b"";
     let channels = make_channel_ids(&[1, 2, 3]);
     let threshold = 2;
@@ -106,7 +90,7 @@ fn test_split_empty_secret_data() {
 
 #[test]
 fn test_split_invalid_threshold_too_low() {
-    let secret_id = b"secret-id";
+    let secret_id: u64 = 1;
     let secret_data = b"secret-data";
     let channels = make_channel_ids(&[1, 2, 3]);
     let too_low_threshold = 1;
@@ -131,7 +115,7 @@ fn test_split_invalid_threshold_too_low() {
 
 #[test]
 fn test_split_invalid_threshold_too_high() {
-    let secret_id = b"secret-id";
+    let secret_id: u64 = 1;
     let secret_data = b"secret-data";
     let channels = make_channel_ids(&[1, 2, 3]);
     let too_high_threshold = 4;
@@ -156,7 +140,7 @@ fn test_split_invalid_threshold_too_high() {
 
 #[test]
 fn test_split_valid_sharing() {
-    let secret_id = b"my_secret_id";
+    let secret_id: u64 = 1;
     let secret_data = b"super_secret_value";
     let channels = make_channel_ids(&[1, 2, 3]);
     let threshold = 2;
@@ -189,7 +173,7 @@ fn test_split_valid_sharing() {
         let inner = DeRecShare::decode(&committed.de_rec_share[..])
             .expect("failed to decode inner DeRecShare");
 
-        assert_eq!(inner.secret_id, secret_id.to_vec());
+        assert_eq!(inner.secret_id, secret_id);
         assert_eq!(inner.version, version);
 
         assert!(
@@ -203,7 +187,7 @@ fn test_split_valid_sharing() {
 
 #[test]
 fn test_produce_store_share_request_message_valid() {
-    let secret_id = b"my_secret_id";
+    let secret_id: u64 = 1;
     let secret_data = b"super_secret_value";
     let channels = make_channel_ids(&[1, 2, 3]);
     let threshold = 2;
@@ -237,7 +221,7 @@ fn test_produce_store_share_request_message_valid() {
 
 #[test]
 fn test_produce_store_share_request_message_with_keep_list_and_description() {
-    let secret_id = b"my_secret_id";
+    let secret_id: u64 = 1;
     let secret_data = b"super_secret_value";
     let channels = make_channel_ids(&[1, 2, 3]);
     let threshold = 2;
@@ -271,7 +255,7 @@ fn test_produce_store_share_request_message_with_keep_list_and_description() {
 
 #[test]
 fn test_produce_store_share_response_message_valid() {
-    let secret_id = b"my_secret_id";
+    let secret_id: u64 = 1;
     let secret_data = b"super_secret_value";
     let channels = make_channel_ids(&[1, 2, 3]);
     let threshold = 2;
@@ -343,7 +327,7 @@ fn test_produce_store_share_response_message_valid() {
 
 #[test]
 fn test_extract_store_share_request_wrong_key() {
-    let secret_id = b"my_secret_id";
+    let secret_id: u64 = 1;
     let secret_data = b"super_secret_value";
     let channels = make_channel_ids(&[1, 2, 3]);
     let threshold = 2;
@@ -378,7 +362,7 @@ fn test_extract_store_share_request_wrong_key() {
 
 #[test]
 fn test_split_rejects_duplicate_channels() {
-    let secret_id = b"secret-id";
+    let secret_id: u64 = 1;
     let secret_data = b"secret-data";
     let channels = make_channel_ids(&[1, 2, 3, 2, 1]);
     let threshold = 2;
@@ -397,7 +381,7 @@ fn test_split_rejects_duplicate_channels() {
 
 #[test]
 fn test_split_rejects_single_duplicate_channel() {
-    let secret_id = b"secret-id";
+    let secret_id: u64 = 1;
     let secret_data = b"secret-data";
     let channels = make_channel_ids(&[1, 2, 2]);
     let threshold = 2;
@@ -416,7 +400,7 @@ fn test_split_rejects_single_duplicate_channel() {
 
 #[test]
 fn test_process_store_share_response_message_valid() {
-    let secret_id = b"my_secret_id";
+    let secret_id: u64 = 1;
     let secret_data = b"super_secret_value";
     let channels = make_channel_ids(&[1, 2, 3]);
     let threshold = 2;
@@ -464,7 +448,7 @@ fn test_process_store_share_response_message_valid() {
 
 #[test]
 fn test_process_store_share_response_message_wrong_version() {
-    let secret_id = b"my_secret_id";
+    let secret_id: u64 = 1;
     let secret_data = b"super_secret_value";
     let channels = make_channel_ids(&[1, 2, 3]);
     let threshold = 2;
@@ -513,7 +497,7 @@ fn test_process_store_share_response_message_wrong_version() {
 
 #[test]
 fn test_extract_store_share_response_wrong_key() {
-    let secret_id = b"my_secret_id";
+    let secret_id: u64 = 1;
     let secret_data = b"super_secret_value";
     let channels = make_channel_ids(&[1, 2, 3]);
     let threshold = 2;

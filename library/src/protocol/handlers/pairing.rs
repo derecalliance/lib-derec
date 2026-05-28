@@ -6,19 +6,14 @@ use super::super::{
 };
 use crate::{
     Error, Result,
-    primitives::pairing::{
-        PairingError,
-        request::produce as produce_pairing_request_message,
-        response::{self as pairing_response},
-    },
+    primitives::pairing::{request, response},
     types::ChannelId,
 };
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{
-    CommunicationInfo, ContactMessage, DeRecMessage, MessageBody, PairRequestMessage, SenderKind,
-    StatusEnum, TransportProtocol,
+    CommunicationInfo, ContactMessage, MessageBody, PairRequestMessage, SenderKind, StatusEnum,
+    TransportProtocol,
 };
-use prost::Message;
 use std::collections::HashMap;
 
 #[cfg_attr(
@@ -28,25 +23,18 @@ use std::collections::HashMap;
 pub(in crate::protocol) async fn handle<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     channel_store: &mut Ch,
     secret_store: &mut Ss,
-    message: &[u8],
+    message: &MessageBody,
     channel_id: ChannelId,
     pairing_secret: &PairingSecretKeyMaterial,
 ) -> Result<Vec<DeRecEvent>> {
-    let outer = DeRecMessage::decode(message).map_err(Error::ProtobufDecode)?;
-    let plaintext = derec_cryptography::pairing::envelope::decrypt(
-        &outer.message,
-        pairing_secret.ecies_secret_key(),
-    )
-    .map_err(PairingError::PairingEncryption)?;
-
-    match MessageBody::decode_from_vec(&plaintext).map_err(Error::ProtobufDecode)? {
-        MessageBody::PairRequest(request) => Ok(on_request(channel_id, &request, pairing_secret)),
+    match message {
+        MessageBody::PairRequest(request) => on_request(channel_id, request, pairing_secret),
         MessageBody::PairResponse(response) => {
             on_response(
                 channel_store,
                 secret_store,
                 channel_id,
-                &response,
+                response,
                 pairing_secret,
             )
             .await
@@ -57,9 +45,6 @@ pub(in crate::protocol) async fn handle<Ch: DeRecChannelStore, Ss: DeRecSecretSt
     }
 }
 
-/// Initiate pairing by sending a PairRequest to the peer.
-///
-/// Returns the `channel_id` extracted from the contact.
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = contact.channel_id))
@@ -88,7 +73,7 @@ pub(in crate::protocol) async fn start<
         ))?;
 
     let comm_info = build_communication_info(communication_info);
-    let result = produce_pairing_request_message(kind, own_transport.clone(), &contact, comm_info)?;
+    let result = request::produce(kind, own_transport.clone(), &contact, comm_info)?;
 
     secret_store
         .save(channel_id, SecretValue::PairingSecret(result.secret_key))
@@ -115,10 +100,10 @@ pub(in crate::protocol) async fn start<
     tracing::info!("pairing request sent");
 
     transport.send(&endpoint, result.envelope).await?;
+
     Ok(channel_id.0)
 }
 
-/// Accept a pairing request: compute shared key and send success response.
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
@@ -139,7 +124,7 @@ pub(in crate::protocol) async fn accept<
     response_kind: SenderKind,
 ) -> Result<Vec<DeRecEvent>> {
     let comm_info = build_communication_info(communication_info);
-    let resp = pairing_response::accept(response_kind, request, pairing_secret, comm_info)?;
+    let resp = response::accept(response_kind, request, pairing_secret, comm_info)?;
 
     secret_store
         .save(channel_id, SecretValue::SharedKey(resp.shared_key))
@@ -153,10 +138,6 @@ pub(in crate::protocol) async fn accept<
         crate::types::ChannelStatus::Paired
     };
 
-    // Persist the peer's communication_info verbatim on the channel — opaque
-    // to the protocol, available to the app. App-level identity heuristics
-    // (e.g. the backend provisioned actor's auto-link by display name on
-    // re-pairing) read from this map; the protocol does not.
     let peer_communication_info = extract_communication_info(&request.communication_info);
 
     channel_store
@@ -169,6 +150,7 @@ pub(in crate::protocol) async fn accept<
         })
         .await?;
 
+    // TODO: Shall tue PairingContact also be removed?
     secret_store
         .remove(channel_id, SecretKind::PairingSecret)
         .await?;
@@ -187,7 +169,6 @@ pub(in crate::protocol) async fn accept<
     }])
 }
 
-/// Reject a pairing request: send FAIL response.
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
@@ -203,13 +184,13 @@ pub(in crate::protocol) async fn reject<Ss: DeRecSecretStore, T: DeRecTransport>
     memo: &str,
 ) -> Result<()> {
     let comm_info = build_communication_info(communication_info);
-    let result =
-        pairing_response::reject(response_kind, request, status, memo, comm_info)?;
+    let result = response::reject(response_kind, request, status, memo, comm_info)?;
 
     transport
         .send(&result.peer_transport_protocol, result.envelope)
         .await?;
 
+    // TODO: Shall tue PairingContact also be removed?
     secret_store
         .remove(channel_id, SecretKind::PairingSecret)
         .await?;
@@ -228,7 +209,7 @@ fn on_request(
     channel_id: ChannelId,
     request: &PairRequestMessage,
     pairing_secret: &PairingSecretKeyMaterial,
-) -> Vec<DeRecEvent> {
+) -> Result<Vec<DeRecEvent>> {
     let peer_communication_info = extract_communication_info(&request.communication_info);
     let (response_kind, kind) = if request.sender_kind == SenderKind::Owner as i32 {
         (SenderKind::Helper, SenderKind::Helper)
@@ -247,7 +228,7 @@ fn on_request(
         peer_communication_info,
     };
 
-    vec![DeRecEvent::ActionRequired { channel_id, action }]
+    Ok(vec![DeRecEvent::ActionRequired { channel_id, action }])
 }
 
 #[cfg_attr(
@@ -273,7 +254,7 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
         }
     };
 
-    let result = pairing_response::process(&contact, response, pairing_secret)?;
+    let result = response::process(&contact, response, pairing_secret)?;
 
     secret_store
         .save(channel_id, SecretValue::SharedKey(result.shared_key))
@@ -293,8 +274,6 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
         SenderKind::Helper
     };
 
-    // Transition channel from Pending to Paired (replicas stay Pending until
-    // fingerprint verification).
     let status = if kind == SenderKind::Replica {
         crate::types::ChannelStatus::Pending
     } else {
@@ -305,13 +284,7 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
 
     if let Some(mut channel) = channel_store.load(channel_id).await? {
         channel.status = status;
-        // The peer's self-attested communication_info (from the wire pair-
-        // response) is more authoritative than whatever the app guessed at
-        // pair-start (often `{}` for QR-paste flows). Merge into the channel
-        // record so any name/identity keys the peer sends are persisted —
-        // and end up inside `HelperInfo.communication_info` at protect time.
-        // App-only entries the initiator added pre-pair survive untouched
-        // unless the peer happens to use the same key.
+
         for (k, v) in &peer_communication_info {
             channel.communication_info.insert(k.clone(), v.clone());
         }
@@ -334,7 +307,9 @@ fn build_communication_info(info: &HashMap<String, String>) -> Option<Communicat
         .filter(|(_, v)| !v.trim().is_empty())
         .map(|(k, v)| derec_proto::CommunicationInfoKeyValue {
             key: k.to_owned(),
-            value: Some(derec_proto::communication_info_key_value::Value::StringValue(v.to_owned())),
+            value: Some(
+                derec_proto::communication_info_key_value::Value::StringValue(v.to_owned()),
+            ),
         })
         .collect();
 

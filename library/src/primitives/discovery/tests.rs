@@ -25,9 +25,9 @@ use derec_proto::{
 };
 use prost::Message;
 
-fn entry(id: &[u8], versions: &[(i32, &str)]) -> SecretVersionEntry {
+fn entry(id: u64, versions: &[(u32, &str)]) -> SecretVersionEntry {
     SecretVersionEntry {
-        secret_id: id.to_vec(),
+        secret_id: id,
         versions: versions
             .iter()
             .map(|(v, desc)| VersionEntry {
@@ -178,7 +178,7 @@ fn test_extract_discovery_request_wrong_message_type_fails() {
     let timestamp = current_timestamp();
 
     let message = GetShareRequestMessage {
-        secret_id: b"id".to_vec(),
+        secret_id: 1,
         share_version: 1,
         timestamp: Some(timestamp),
     };
@@ -216,8 +216,8 @@ fn test_produce_discovery_response_with_secrets_returns_non_empty_envelope() {
     let shared_key = make_shared_key(1);
 
     let secret_list = vec![
-        entry(b"secret_a", &[(1, "first version"), (2, "second version")]),
-        entry(b"secret_b", &[(1, "initial")]),
+        entry(1, &[(1, "first version"), (2, "second version")]),
+        entry(2, &[(1, "initial")]),
     ];
 
     let ProduceResponseResult { envelope } =
@@ -228,46 +228,13 @@ fn test_produce_discovery_response_with_secrets_returns_non_empty_envelope() {
 }
 
 #[test]
-fn test_produce_discovery_response_empty_secret_id_fails() {
-    let channel_id = ChannelId(1);
-    let shared_key = make_shared_key(1);
-
-    let secret_list = vec![
-        entry(b"valid_secret", &[(1, "ok")]),
-        entry(b"", &[(2, "bad")]),
-    ];
-
-    let result = produce_discovery_response(channel_id, &secret_list, &shared_key);
-
-    assert!(matches!(
-        result,
-        Err(Error::Discovery(DiscoveryError::EmptySecretId { index: 1 }))
-    ));
-}
-
-#[test]
-fn test_produce_discovery_response_first_entry_empty_secret_id_fails() {
-    let channel_id = ChannelId(1);
-    let shared_key = make_shared_key(1);
-
-    let secret_list = vec![entry(b"", &[(1, "")])];
-
-    let result = produce_discovery_response(channel_id, &secret_list, &shared_key);
-
-    assert!(matches!(
-        result,
-        Err(Error::Discovery(DiscoveryError::EmptySecretId { index: 0 }))
-    ));
-}
-
-#[test]
 fn test_produce_extract_discovery_response_roundtrip() {
     let channel_id = ChannelId(1);
     let shared_key = make_shared_key(1);
 
     let secret_list = vec![
-        entry(b"secret_a", &[(1, "v1"), (2, "v2")]),
-        entry(b"secret_b", &[(3, "v3")]),
+        entry(1, &[(1, "v1"), (2, "v2")]),
+        entry(2, &[(3, "v3")]),
     ];
 
     let ProduceResponseResult { envelope } =
@@ -278,7 +245,7 @@ fn test_produce_extract_discovery_response_roundtrip() {
         extract_discovery_response(&envelope, &shared_key).expect("extract should succeed");
 
     assert_eq!(response.secret_list.len(), 2);
-    assert_eq!(response.secret_list[0].secret_id, b"secret_a");
+    assert_eq!(response.secret_list[0].secret_id, 1);
     assert_eq!(response.secret_list[0].versions[0].version, 1);
     assert_eq!(
         response.secret_list[0].versions[0].version_description,
@@ -289,7 +256,7 @@ fn test_produce_extract_discovery_response_roundtrip() {
         response.secret_list[0].versions[1].version_description,
         "v2"
     );
-    assert_eq!(response.secret_list[1].secret_id, b"secret_b");
+    assert_eq!(response.secret_list[1].secret_id, 2);
     assert_eq!(response.secret_list[1].versions[0].version, 3);
     assert_eq!(
         response.secret_list[1].versions[0].version_description,
@@ -362,8 +329,8 @@ fn test_process_discovery_response_ok_returns_secret_list() {
     let shared_key = make_shared_key(1);
 
     let secret_list = vec![
-        entry(b"secret_a", &[(1, "first"), (2, "second")]),
-        entry(b"secret_b", &[(3, "third")]),
+        entry(1, &[(1, "first"), (2, "second")]),
+        entry(2, &[(3, "third")]),
     ];
 
     let ProduceResponseResult { envelope } =
@@ -378,12 +345,12 @@ fn test_process_discovery_response_ok_returns_secret_list() {
     } = process_discovery_response(&response).expect("process should succeed");
 
     assert_eq!(parsed.len(), 2);
-    assert_eq!(parsed[0].secret_id, b"secret_a");
+    assert_eq!(parsed[0].secret_id, 1);
     assert_eq!(parsed[0].versions[0].version, 1);
     assert_eq!(parsed[0].versions[0].description, "first");
     assert_eq!(parsed[0].versions[1].version, 2);
     assert_eq!(parsed[0].versions[1].description, "second");
-    assert_eq!(parsed[1].secret_id, b"secret_b");
+    assert_eq!(parsed[1].secret_id, 2);
     assert_eq!(parsed[1].versions[0].version, 3);
     assert_eq!(parsed[1].versions[0].description, "third");
 }
@@ -414,10 +381,7 @@ fn test_process_discovery_response_missing_result_fails() {
 
     let result = process_discovery_response(&response);
 
-    assert!(matches!(
-        result,
-        Err(Error::Discovery(DiscoveryError::MissingResult))
-    ));
+    assert!(matches!(result, Err(Error::Invariant(_))));
 }
 
 #[test]
@@ -462,8 +426,8 @@ fn test_full_discovery_roundtrip() {
 
     // Helper → Owner: produce discovery response
     let secret_list = vec![
-        entry(b"wallet_seed", &[(1, "My main wallet")]),
-        entry(b"ssh_key", &[
+        entry(100, &[(1, "My main wallet")]),
+        entry(200, &[
             (1, "Work SSH key"),
             (2, "Work SSH key v2"),
             (3, "Work SSH key v3"),
@@ -485,11 +449,11 @@ fn test_full_discovery_roundtrip() {
     } = process_discovery_response(&response).expect("process response should succeed");
 
     assert_eq!(result.len(), 2);
-    assert_eq!(result[0].secret_id, b"wallet_seed");
+    assert_eq!(result[0].secret_id, 100);
     assert_eq!(result[0].versions.len(), 1);
     assert_eq!(result[0].versions[0].version, 1);
     assert_eq!(result[0].versions[0].description, "My main wallet");
-    assert_eq!(result[1].secret_id, b"ssh_key");
+    assert_eq!(result[1].secret_id, 200);
     assert_eq!(result[1].versions.len(), 3);
     assert_eq!(result[1].versions[2].version, 3);
     assert_eq!(result[1].versions[2].description, "Work SSH key v3");
@@ -501,7 +465,7 @@ fn test_version_descriptions_are_preserved_through_roundtrip() {
     let shared_key = make_shared_key(5);
 
     let secret_list = vec![SecretVersionEntry {
-        secret_id: b"sensitive_doc".to_vec(),
+        secret_id: 42,
         versions: vec![
             VersionEntry {
                 version: 1,

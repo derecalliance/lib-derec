@@ -11,7 +11,7 @@ use crate::{
     primitives::recovery::{
         RecoveryError,
         request::produce as produce_get_share_request_message,
-        response::{self as recovery_response, RecoveryResponseInput},
+        response::{self as recovery_response},
     },
     types::{ChannelId, SharedKey},
 };
@@ -21,7 +21,10 @@ use derec_proto::{
 };
 use prost::Message;
 
-/// Dispatch an inbound recovery message (request or response).
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+)]
 pub(in crate::protocol) fn handle(
     pending_recovery: &mut PendingRecovery,
     channel_id: ChannelId,
@@ -29,7 +32,7 @@ pub(in crate::protocol) fn handle(
     shared_key: SharedKey,
 ) -> Result<Vec<DeRecEvent>> {
     match inner {
-        MessageBody::GetShareRequest(request) => Ok(on_request(channel_id, request, shared_key)),
+        MessageBody::GetShareRequest(request) => on_request(channel_id, request, shared_key),
         MessageBody::GetShareResponse(response) => {
             on_response(pending_recovery, channel_id, &response)
         }
@@ -37,6 +40,127 @@ pub(in crate::protocol) fn handle(
             "unexpected MessageBody variant in recovery handler",
         )),
     }
+}
+
+#[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(version = version)))]
+pub(in crate::protocol) async fn start<
+    Ch: DeRecChannelStore,
+    Ss: DeRecSecretStore,
+    T: DeRecTransport,
+>(
+    channel_store: &mut Ch,
+    secret_store: &mut Ss,
+    transport: &T,
+    pending_recovery: &mut PendingRecovery,
+    secret_id: u64,
+    version: u32,
+) -> Result<()> {
+    pending_recovery.insert((secret_id, version), Vec::new());
+
+    let all_channels = channel_store.channels().await?;
+
+    for channel in all_channels {
+        // TODO: Not being able to load a shared_key for a channel is completely unexpected,
+        // continuing is not an option. At this point the owner is in recovery mode, it has already
+        // paired with channels, so shared_key for the channel must be there
+        // TODO: add a load_many function to reduce DB roundtrips
+        let Some(SecretValue::SharedKey(shared_key)) =
+            secret_store.load(channel.id, SecretKind::SharedKey).await?
+        else {
+            continue;
+        };
+
+        // TODO: see if we can send all requests in parallel and wait them all together
+        let msg = produce_get_share_request_message(channel.id, secret_id, version, &shared_key)?;
+        transport.send(&channel.transport, msg.envelope).await?;
+
+        #[cfg(feature = "logging")]
+        tracing::debug!(
+            channel_id = channel.id.0,
+            version = version,
+            "share request sent"
+        );
+    }
+
+    #[cfg(feature = "logging")]
+    tracing::info!(
+        version = version,
+        "share requests dispatched to all helpers"
+    );
+
+    Ok(())
+}
+
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0, version = request.share_version))
+)]
+pub(in crate::protocol) async fn accept<
+    Ch: DeRecChannelStore,
+    Sh: DeRecShareStore,
+    T: DeRecTransport,
+>(
+    channel_store: &mut Ch,
+    share_store: &mut Sh,
+    transport: &T,
+    channel_id: ChannelId,
+    request: &GetShareRequestMessage,
+    shared_key: &SharedKey,
+) -> Result<Vec<DeRecEvent>> {
+    let linked_ids = channel_store.linked_channels(channel_id).await?;
+
+    let encoded = share_store
+        .load_many(&linked_ids, request.secret_id, &[request.share_version])
+        .await?
+        .into_iter()
+        .next()
+        .map(|s| s.bytes)
+        .ok_or(Error::InvalidInput("no stored share for recovery request"))?;
+
+    let stored =
+        StoreShareRequestMessage::decode(encoded.as_slice()).map_err(Error::ProtobufDecode)?;
+
+    let resp = recovery_response::produce(channel_id, request, &stored, shared_key)?;
+
+    let endpoint = peer_endpoint(channel_store, channel_id).await?;
+    transport.send(&endpoint, resp.envelope).await?;
+
+    #[cfg(feature = "logging")]
+    tracing::info!("recovery share response sent");
+
+    Ok(vec![DeRecEvent::NoOp])
+}
+
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+)]
+pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport>(
+    channel_store: &mut Ch,
+    transport: &T,
+    channel_id: ChannelId,
+    shared_key: &SharedKey,
+    status: StatusEnum,
+    memo: &str,
+) -> Result<()> {
+    let response = GetShareResponseMessage {
+        result: Some(DeRecResult {
+            status: status as i32,
+            memo: memo.to_owned(),
+        }),
+        committed_de_rec_share: Vec::new(),
+        share_algorithm: 0,
+        timestamp: Some(current_timestamp()),
+    };
+
+    super::send_channel_message(
+        channel_store,
+        transport,
+        channel_id,
+        MessageBody::GetShareResponse(response),
+        shared_key,
+    )
+    .await
 }
 
 #[cfg_attr(
@@ -47,15 +171,15 @@ fn on_request(
     channel_id: ChannelId,
     request: GetShareRequestMessage,
     shared_key: SharedKey,
-) -> Vec<DeRecEvent> {
-    vec![DeRecEvent::ActionRequired {
+) -> Result<Vec<DeRecEvent>> {
+    Ok(vec![DeRecEvent::ActionRequired {
         channel_id,
         action: PendingAction::GetShare {
             channel_id,
             request,
             shared_key,
         },
-    }]
+    }])
 }
 
 #[cfg_attr(
@@ -77,10 +201,7 @@ fn on_response(
 
         let shares_received = bucket.len();
 
-        let inputs: Vec<RecoveryResponseInput<'_>> = bucket
-            .iter()
-            .map(|r| RecoveryResponseInput { share_response: r })
-            .collect();
+        let inputs: Vec<&GetShareResponseMessage> = bucket.iter().collect();
 
         match recovery_response::recover(secret_id, version, &inputs) {
             Ok(result) => {
@@ -138,132 +259,6 @@ fn on_response(
     if events.is_empty() {
         events.push(DeRecEvent::NoOp);
     }
+
     Ok(events)
-}
-
-/// Accept a get-share request: load share and send response.
-///
-/// The requested share may live under a sibling channel in the link group —
-/// e.g. when a recovering owner re-pairs and asks for a share on the fresh
-/// channel, the helper still holds the share against the original channel.
-/// Resolution walks the transitive closure (`linked_channels`); BFS in the
-/// channel store returns the requested `channel_id` first, so a share stored
-/// on that channel itself is always preferred over a sibling's.
-///
-/// Returning a sibling's share is safe for recovery: each share carries a
-/// unique x-coordinate, so the requester deduplicates naturally when
-/// reconstructing. (Verification is intentionally *not* given this fallback —
-/// its proof is bound to the specific channel's committed share, and the
-/// requester only sends verify challenges to channels that confirmed
-/// storage.)
-#[cfg_attr(
-    feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0, version = request.share_version))
-)]
-pub(in crate::protocol) async fn accept<
-    Ch: DeRecChannelStore,
-    Sh: DeRecShareStore,
-    T: DeRecTransport,
->(
-    channel_store: &mut Ch,
-    share_store: &mut Sh,
-    transport: &T,
-    channel_id: ChannelId,
-    request: &GetShareRequestMessage,
-    shared_key: &SharedKey,
-) -> Result<Vec<DeRecEvent>> {
-    let linked_ids = channel_store.linked_channels(channel_id).await?;
-    let encoded = share_store
-        .load_many(&linked_ids, request.secret_id, &[request.share_version])
-        .await?
-        .into_iter()
-        .next()
-        .map(|s| s.bytes)
-        .ok_or(Error::InvalidInput("no stored share for recovery request"))?;
-    let stored =
-        StoreShareRequestMessage::decode(encoded.as_slice()).map_err(Error::ProtobufDecode)?;
-
-    let resp =
-        recovery_response::produce(channel_id, request.secret_id, request, &stored, shared_key)?;
-
-    let endpoint = peer_endpoint(channel_store, channel_id).await?;
-    transport.send(&endpoint, resp.envelope).await?;
-
-    #[cfg(feature = "logging")]
-    tracing::info!("recovery share response sent");
-
-    Ok(vec![DeRecEvent::NoOp])
-}
-
-/// Reject a get-share request: send a rejection response with the given status.
-pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport>(
-    channel_store: &mut Ch,
-    transport: &T,
-    channel_id: ChannelId,
-    shared_key: &SharedKey,
-    status: StatusEnum,
-    memo: &str,
-) -> Result<()> {
-    let response = GetShareResponseMessage {
-        result: Some(DeRecResult {
-            status: status as i32,
-            memo: memo.to_owned(),
-        }),
-        committed_de_rec_share: Vec::new(),
-        share_algorithm: 0,
-        timestamp: Some(current_timestamp()),
-    };
-    super::send_channel_message(
-        channel_store,
-        transport,
-        channel_id,
-        MessageBody::GetShareResponse(response),
-        shared_key,
-    )
-    .await
-}
-
-/// Request shares from all paired helpers to recover a secret.
-#[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(version = version)))]
-pub(in crate::protocol) async fn start<
-    Ch: DeRecChannelStore,
-    Ss: DeRecSecretStore,
-    T: DeRecTransport,
->(
-    channel_store: &mut Ch,
-    secret_store: &mut Ss,
-    transport: &T,
-    pending_recovery: &mut PendingRecovery,
-    secret_id: u64,
-    version: u32,
-) -> Result<()> {
-    pending_recovery.insert((secret_id, version), Vec::new());
-
-    let all_channels = channel_store.channels().await?;
-
-    for channel in all_channels {
-        let Some(SecretValue::SharedKey(shared_key)) =
-            secret_store.load(channel.id, SecretKind::SharedKey).await?
-        else {
-            continue;
-        };
-
-        let msg = produce_get_share_request_message(channel.id, secret_id, version, &shared_key)?;
-        transport.send(&channel.transport, msg.envelope).await?;
-
-        #[cfg(feature = "logging")]
-        tracing::debug!(
-            channel_id = channel.id.0,
-            version = version,
-            "share request sent"
-        );
-    }
-
-    #[cfg(feature = "logging")]
-    tracing::info!(
-        version = version,
-        "share requests dispatched to all helpers"
-    );
-
-    Ok(())
 }
