@@ -4,170 +4,400 @@
 ![Docs.rs](https://docs.rs/derec-library/badge.svg)
 ![License](https://img.shields.io/badge/license-Apache%202.0-blue)
 
-Rust implementation of the **DeRec protocol**, providing tools to securely distribute, store, verify, and recover secret shares across trusted helpers.
+Rust implementation of the **DeRec protocol** — split a secret into shares,
+distribute them across independent helpers, verify possession over time, and
+reconstruct the secret from a threshold of shares when needed. The library is
+transport- and storage-agnostic, supports both native Rust and WebAssembly
+targets, and is the reference implementation maintained by the **DeRec
+Alliance**.
 
-This crate implements the protocol defined by the **DeRec Alliance** and provides APIs for building applications that support decentralized secret recovery.
+> [!WARNING]
+> This is a pre-release version. APIs may change until 0.1.0.
 
-Typical applications include:
+---
 
-- Cryptocurrency wallets
-- Digital identity systems
-- Secure backup systems
-- Key management infrastructure
+## Contents
 
-The library supports both **native Rust environments** and **WebAssembly targets**, enabling use in backend services, mobile apps, and browser-based applications.
+- [What is DeRec?](#what-is-derec)
+- [Installation](#installation)
+- [Two API layers](#two-api-layers)
+- [Quick start (Protocol layer)](#quick-start-protocol-layer)
+- [Builder configuration](#builder-configuration)
+- [Event-driven model](#event-driven-model)
+- [Protocol flows](#protocol-flows)
+- [Storage and transport traits](#storage-and-transport-traits)
+- [Errors](#errors)
+- [Async and executors](#async-and-executors)
+- [WebAssembly support](#webassembly-support)
+- [Transport layer](#transport-layer)
+- [Observability](#observability)
+- [Primitives (advanced)](#primitives-advanced)
+- [Protocol specification](#protocol-specification)
+- [Security considerations](#security-considerations)
+- [License](#license)
+- [Contributing](#contributing)
+- [DeRec Alliance](#derec-alliance)
 
 ---
 
 ## What is DeRec?
 
-The **DeRec protocol** allows a secret to be split into multiple shares and stored by independent helpers.
+DeRec is a **threshold secret-sharing** protocol for decentralized recovery.
+The Owner splits a secret using Verifiable Secret Sharing, distributes the
+shares across trusted Helpers, and can later reconstruct the secret from any
+threshold-sized subset of shares.
 
-When recovery is required, a sufficient number of helpers can provide their shares to reconstruct the original secret.
+Three roles participate:
 
-Key properties:
+- **Owner** — the party that wants to protect a secret. Splits the secret,
+  distributes shares, verifies that helpers still hold them, and drives
+  recovery when needed.
+- **Helper** — a trusted entity that stores one share. Responds to
+  verification challenges, returns the share during recovery, and acknowledges
+  unpair requests.
+- **Replica** — another device belonging to the same Owner. Pairs with
+  `SenderKind::Replica`, confirms via a fingerprint check, and discovers
+  Helper channels and secrets from the Owner so the same secrets are
+  accessible from multiple devices.
 
-- **Threshold secret sharing**
-- **Helper-based recovery**
-- **Verifiable share storage**
-- **Transport-agnostic protocol**
+The protocol is transport-agnostic and produces wire-compatible protobuf
+messages; the library never assumes a specific delivery channel.
 
-This SDK implements the message flows and cryptographic mechanisms required by the protocol.
+Typical applications: cryptocurrency wallets, digital identity, secure backup,
+key management.
 
 ---
 
 ## Installation
 
-Add the crate to your project via `cargo`:
-
 ```bash
 cargo add derec-library
 ```
 
-Or manually in your `Cargo.toml`
-
-```toml
-[dependencies]
-derec-library = "0.0.1-alpha.7"
-```
-
-> [!WARNING]
-> Note: this is a pre-release version. APIs may change until 0.1.0.
-
-## Basic Concepts
-
-The protocol involves three roles: **Owner**, **Helper**, and **Replica**.
-
-### Owner
-
-The party that wants to protect a secret.
-
-Responsibilities:
-* Split the secret into shares
-* Distribute shares to helpers
-* Verify helpers still possess the shares
-* Recover the secret when necessary
-
-### Helper
-
-A trusted entity that stores a share for the Owner.
-
-Responsibilities:
-* Store the share
-* Respond to verification challenges
-* Provide shares during recovery
-
-### Replica
-
-Another device belonging to the same Owner. A Replica keeps in sync with the
-Owner so that the same secrets are accessible from multiple devices without
-each application inventing its own synchronisation mechanism.
-
-Responsibilities:
-* Pair with the Owner using `SenderKind::Replica`
-* Confirm the pairing via a fingerprint-based manual verification step
-* Discover existing Helper channels and secrets from the Owner
+The badge above shows the latest published version.
 
 ---
 
-## Protocol Flows
+## Two API layers
 
-The SDK provides building blocks for the main protocol flows.
+The library exposes two surfaces:
+
+- **Protocol layer (`derec_library::protocol`)** — **start here.** A stateful
+  orchestrator ([`DeRecProtocol`](https://docs.rs/derec-library/latest/derec_library/protocol/struct.DeRecProtocol.html))
+  that owns your storage/transport implementations, manages session state, and
+  drives every flow through a single `start` / `process` / `accept` / `reject`
+  surface. Returns [`DeRecEvent`](https://docs.rs/derec-library/latest/derec_library/protocol/events/enum.DeRecEvent.html)
+  values the application reacts to.
+
+- **Primitives layer (`derec_library::primitives`)** — the lower-level surface:
+  one module per flow exposing `produce` / `extract` / `process` functions that
+  build and decode individual protocol messages. Use this **only when** the
+  protocol layer cannot fit (e.g. you are implementing your own orchestrator,
+  integrating into a system whose event loop you don't control, or need to
+  manipulate messages directly).
+
+Most consumers should only use the protocol layer. The primitives section at
+the bottom of this README is provided for the cases that need it.
+
+---
+
+## Quick start (Protocol layer)
+
+Three steps: implement the storage and transport traits for your environment,
+build a `DeRecProtocol`, drive it with `start` / `process`.
+
+```rust,ignore
+use derec_library::protocol::{
+    DeRecEvent, DeRecFlow, DeRecProtocolBuilder, PendingAction,
+};
+use derec_proto::{Protocol, TransportProtocol};
+
+// 1. Implement the four storage/transport traits for your environment.
+//    See the trait docs:
+//    - DeRecChannelStore  — paired channels
+//    - DeRecShareStore    — secret shares
+//    - DeRecSecretStore   — per-channel key material (sensitive)
+//    - DeRecTransport     — outbound message delivery
+let my_channel_store = /* ... */;
+let my_share_store   = /* ... */;
+let my_secret_store  = /* ... */;
+let my_transport     = /* ... */;
+
+// 2. Build a protocol instance.
+let mut protocol = DeRecProtocolBuilder::new()
+    .with_channel_store(my_channel_store)
+    .with_share_store(my_share_store)
+    .with_secret_store(my_secret_store)
+    .with_transport(my_transport)
+    .with_own_transport(TransportProtocol {
+        uri: "https://my-node.example/derec".to_owned(),
+        protocol: Protocol::Https.into(),
+    })
+    // Optional setters — see "Builder configuration" below.
+    .build();
+
+// 3. Drive flows.
+//
+//    `start` initiates an outbound flow (pairing, sharing, recovery, …).
+//    `process` feeds incoming wire bytes and returns events.
+//    `accept` / `reject` resolve `ActionRequired` events the app must confirm.
+
+// Initiate a pairing flow from a contact message received out-of-band:
+let _channel_id = protocol
+    .start(DeRecFlow::Pairing {
+        kind: derec_proto::SenderKind::Helper,
+        contact: contact_message,
+        peer_communication_info: Default::default(),
+    })
+    .await?;
+
+// Inbound message processing loop:
+loop {
+    let wire_bytes = my_transport_recv().await?;
+    for event in protocol.process(&wire_bytes).await? {
+        match event {
+            DeRecEvent::ActionRequired { action, .. } => {
+                // The peer asked us to do something (pair, store a share, ...).
+                // Confirm with accept, refuse with reject(action, status, memo).
+                protocol.accept(action).await?;
+            }
+            DeRecEvent::SecretRecovered { secret } => {
+                // Recovery completed — use the reconstructed bytes here.
+            }
+            // ... handle other events the application cares about.
+            _ => {}
+        }
+    }
+}
+```
+
+A complete working example lives at `bindings/rust/src/protocol.rs` in the
+repository.
+
+---
+
+## Builder configuration
+
+`DeRecProtocolBuilder` enforces required-slot completion at compile time
+(missing a required setter is a type error, not a runtime panic). Optional
+setters have defaults:
+
+| Setter | Default | Purpose |
+|--------|---------|---------|
+| `with_threshold(n)` | `3` | Minimum shares required to reconstruct the secret. |
+| `with_keep_versions_count(n)` | `3` | Number of recent versions each helper must retain. |
+| `with_secret_id(id)` | `0` | Application-provided identifier for the protocol instance. |
+| `with_timeout(duration)` | `5 minutes` | Staleness boundary for inbound envelopes and pending state. One-second granularity. |
+| `with_communication_info(map)` | empty | Key-value identity metadata embedded in pairing messages. |
+| `with_auto_respond_on_failure(bool)` | `false` | If `true`, the protocol replies to the peer on inbound processing failures; if `false`, errors only surface as events. |
+| `with_unpair_ack(ack)` | `UnpairAck::Required` | Whether the unpair initiator waits for the peer's `Ok` before dropping local state. |
+
+See the [builder rustdoc](https://docs.rs/derec-library/latest/derec_library/protocol/struct.DeRecProtocolBuilder.html)
+for the full per-setter contract.
+
+---
+
+## Event-driven model
+
+`process` returns `Vec<DeRecEvent>`. The application reacts to events; the
+protocol owns the state. The main variants are:
+
+- `ActionRequired { channel_id, action }` — an incoming request needs
+  application confirmation. The app calls `protocol.accept(action)` or
+  `protocol.reject(action, status, memo)` to complete the flow.
+- `PairingCompleted { channel_id, kind, peer_communication_info }`
+- `ShareStored { channel_id, version }` / `ShareConfirmed { … }` /
+  `ShareRejected { … }`
+- `ShareVerified { channel_id, version }`
+- `SecretsDiscovered { channel_id, secrets }`
+- `RecoveryShareReceived { … }` / `SecretRecovered { secret }` /
+  `RecoveryShareError { … }`
+- `Unpaired { channel_id }` / `UnpairRejected { channel_id, status, memo }`
+- `NoOp` — emitted when an inbound message was processed but had no
+  application-visible consequence.
+
+See [`DeRecEvent`](https://docs.rs/derec-library/latest/derec_library/protocol/events/enum.DeRecEvent.html)
+for the complete enum and per-variant docs.
+
+---
+
+## Protocol flows
 
 | Flow | Purpose |
-|------|--------|
-| Pairing | Establish secure communication between Owner and Helper (or Replica) |
-| Share Distribution | Split and distribute secret shares |
-| Verification | Ensure helpers still possess shares |
-| Discovery | Ask helpers which secrets and versions they store |
-| Recovery | Retrieve shares and reconstruct the secret |
-| Unpairing | Terminate the helper relationship |
-
-
-## Quick Intro
-
-```rust
-use derec_library::primitives::verification::request;
-use derec_library::types::ChannelId;
-
-let channel_id = ChannelId(1);
-let secret_id: u64 = 42;
-let version: u32 = 1;
-// shared_key: [u8; 32] established during pairing
-let shared_key = [0u8; 32];
-
-let result = request::produce(channel_id, secret_id, version, &shared_key).unwrap();
-// result.envelope is already serialized wire bytes, ready to send over transport
-let wire_bytes = result.envelope;
-```
-
-See the examples down below for complete protocol flows.
+|------|---------|
+| Pairing | Establish a secure channel between Owner and Helper (or Replica). |
+| Share Distribution | Split a secret and distribute the shares. |
+| Verification | Challenge helpers to prove they still hold their shares. |
+| Discovery | Ask helpers which secrets and versions they store. |
+| Recovery | Re-pair, collect shares, reconstruct the secret. |
+| Unpairing | Tear down a paired channel and drop local state. |
 
 ---
 
-## WebAssembly Support
+## Storage and transport traits
 
-The library also provides WebAssembly bindings so the protocol can run in:
-* Browsers
-* Mobile wallets
-* Web applications
+The library does **not** ship a default backend for storage or transport.
+Consumers implement four traits — the protocol holds them by `&mut self`, so
+implementations need no internal synchronization:
 
-Example JavaScript usage:
+| Trait | Stores |
+|-------|--------|
+| [`DeRecChannelStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecChannelStore.html) | Paired channel records and the channel-link graph. |
+| [`DeRecShareStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecShareStore.html) | Encoded share entries keyed by `(channel_id, secret_id, version)`. |
+| [`DeRecSecretStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecSecretStore.html) | Per-channel cryptographic material (shared keys, pairing secrets, pairing contacts). |
+| [`DeRecTransport`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecTransport.html) | Outbound envelope delivery to peers. |
+
+Each trait's rustdoc states its contract, idempotency expectations, and the
+security classification of the data it holds (`DeRecSecretStore` content is
+keychain-grade; the others need durable storage only).
+
+---
+
+## Errors
+
+Public errors are structured and typed:
+
+- [`Error`](https://docs.rs/derec-library/latest/derec_library/enum.Error.html) — the library-level error type returned by most calls.
+- [`ProcessError`](https://docs.rs/derec-library/latest/derec_library/protocol/error/struct.ProcessError.html) — wraps `Error` with the `channel_id` an inbound message was processed against (if known).
+- [`ChannelStoreError`](https://docs.rs/derec-library/latest/derec_library/protocol/error/enum.ChannelStoreError.html), [`ShareStoreError`](https://docs.rs/derec-library/latest/derec_library/protocol/error/enum.ShareStoreError.html), [`SecretStoreError`](https://docs.rs/derec-library/latest/derec_library/protocol/error/enum.SecretStoreError.html) — surfaced by storage trait implementations.
+
+The protocol never panics on malformed input. Inbound parsing or decryption
+failures surface as events (or as a typed `Error::ProtobufDecode` /
+`Error::DecryptionFailed` etc.); see `with_auto_respond_on_failure` for
+controlling whether such failures are replied to.
+
+---
+
+## Async and executors
+
+Storage and transport methods return type-erased futures
+([`SecretStoreFuture`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/type.SecretStoreFuture.html)
+and friends). No specific executor is prescribed:
+
+- **Native targets** — futures are `Send`, so they can be spawned on
+  multi-threaded executors such as `tokio::spawn`.
+- **`ffi` feature or `wasm32` target** — the `Send` bound is dropped because
+  the host runs single-threaded or callbacks cross an FFI boundary.
+
+Sync backends can implement the trait methods with
+`Box::pin(std::future::ready(...))` at zero cost; async backends use
+`Box::pin(async move { ... })`.
+
+---
+
+## WebAssembly support
+
+The same protocol layer is exposed to JavaScript/TypeScript via
+[`wasm-bindgen`](https://crates.io/crates/wasm-bindgen). Packages:
+
+- [`@derec-alliance/nodejs`](https://www.npmjs.com/package/@derec-alliance/nodejs)
+- [`@derec-alliance/web`](https://www.npmjs.com/package/@derec-alliance/web)
 
 ```ts
 import { primitives } from "@derec-alliance/nodejs"; // or @derec-alliance/web
 
-const result = primitives.verification.request.produce(channelId, secretId, version, sharedKey);
+const result = primitives.verification.request.produce(
+  channelId, secretId, version, sharedKey,
+);
 // result carries the encoded DeRecMessage envelope, ready to send over transport
 ```
 
-Bindings are generated using `wasm-bindgen`.
+The TypeScript bindings expose both the protocol layer (via the
+`DeRecProtocol` class) and the primitives surface. See the package READMEs
+for full TypeScript examples.
 
 ---
 
-## Transport Layer
+## Transport layer
 
-The DeRec protocol is transport agnostic.
+The protocol is transport-agnostic. The `TransportProtocol` value carried in
+contact and pairing messages identifies the peer endpoint; the application's
+[`DeRecTransport`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecTransport.html)
+implementation decides how to deliver bytes (HTTPS, WebSocket, message queue,
+custom relay, …).
 
-Applications may use any communication channel including:
-
-* HTTPS
-* WebSockets
-* Message queues
-* Custom relay servers
-
-> [!INFO]
-> Currently, only the HTTPS transport protocol is supported.
-
-The `transportUri` in protocol messages identifies the helper endpoint.
+> [!NOTE]
+> The on-the-wire `TransportProtocol.protocol` enum currently defines
+> `Https` as the only supported value. New transports can be added by
+> extending the protobuf enum.
 
 ---
 
-## Examples
+## Observability
 
-### Pairing Flow
+The library emits structured [`tracing`](https://docs.rs/tracing) spans and
+events for every protocol step. Instrumentation is **off by default** and
+opt-in via the `logging` feature flag — enabling it adds no overhead when no
+subscriber is active.
 
-```rust
+### Enabling
+
+```toml
+[dependencies]
+derec-library = { version = "*", features = ["logging"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+```
+
+### Wiring up a subscriber
+
+```rust,ignore
+tracing_subscriber::fmt()
+    .with_env_filter(
+        tracing_subscriber::EnvFilter::from_env("DEREC_LOG")
+    )
+    .init();
+```
+
+### Controlling the log level at runtime
+
+```bash
+# Protocol milestones only (contact created, pairing complete, share stored, …)
+DEREC_LOG=info ./my-app
+
+# Intermediate state — sizes, versions, channel IDs
+DEREC_LOG=debug ./my-app
+
+# Full detail including byte lengths from the cryptography layer
+DEREC_LOG=trace ./my-app
+
+# Only DeRec events, silence everything else
+DEREC_LOG=derec_library=debug,derec_cryptography=debug ./my-app
+```
+
+### What is logged
+
+| Level | Content |
+|-------|---------|
+| `info` | Protocol milestones — contact created, pairing complete, share split, share stored, verification result, secret reconstructed. |
+| `debug` | Intermediate state — channel IDs, versions, thresholds, response counts. |
+| `trace` | Low-level byte lengths from the cryptography layer. |
+
+**Security guarantee**: secret bytes, symmetric keys, and share content are
+never emitted. Only non-sensitive metadata (lengths, identifiers, roles)
+appears in events.
+
+---
+
+## Primitives (advanced)
+
+> Use the [protocol layer](#quick-start-protocol-layer) unless you have a
+> specific reason not to. The primitives surface is documented here for
+> embedders who need to construct/parse individual messages directly or are
+> integrating into an orchestrator they already own.
+
+Each flow has a `primitives::<flow>` module with `request` and `response`
+submodules. The general pattern is:
+
+- `produce(...)` — construct an outbound envelope, returning encoded wire
+  bytes.
+- `extract(envelope_bytes, ...)` — decrypt and decode an inbound envelope into
+  the typed inner message.
+- `process(...)` — interpret the decoded inner message (when there's logic
+  beyond decoding).
+
+### Pairing
+
+```rust,ignore
 use derec_library::primitives::pairing::{request, response::{self, ProduceResult as PairResponseProduceResult}};
 use derec_library::types::ChannelId;
 use derec_proto::{Protocol, SenderKind, TransportProtocol};
@@ -212,7 +442,7 @@ let PairResponseProduceResult {
     SenderKind::Owner,
     &pair_request,
     &initiator_secret_key,
-    None, // optional CommunicationInfo
+    None,
 ).unwrap();
 
 // Step 4 — Responder extracts the response and finalizes pairing.
@@ -229,28 +459,24 @@ let response::ProcessResult { shared_key: responder_shared_key } =
 assert_eq!(initiator_shared_key, responder_shared_key);
 ```
 
-To reject the request, build a `PairResponseMessage` with a non-`Ok` `StatusEnum` and
-encrypt it with `DeRecMessageBuilder::pairing()` against the peer's
-`request.ecies_public_key`. The higher-level `DeRecProtocol` orchestrator's
-`reject` method does this for you.
+To reject the request, build a `PairResponseMessage` with a non-`Ok`
+`StatusEnum` and encrypt it with `DeRecMessageBuilder::pairing()` against the
+peer's `request.ecies_public_key`. The protocol-layer `reject` method does
+this for you.
 
-The `ContactMessage` is exchanged out-of-band, typically using:
+The `ContactMessage` is exchanged out-of-band (QR codes, existing messaging
+channels, etc.).
 
-* QR codes
-* Existing communication channels
+### Share Distribution
 
----
-
-### Sharing Flow
-
-```rust
+```rust,ignore
 use derec_library::primitives::sharing::request;
 use derec_library::types::ChannelId;
 
 let secret_id: u64 = 42;
 let secret_data = b"super_secret_value";
 let channels = [ChannelId(1), ChannelId(2), ChannelId(3)];
-let threshold = 2; // minimum 2; must satisfy 2 <= threshold <= channels.len()
+let threshold = 2; // 2 <= threshold <= channels.len()
 let version: u32 = 1;
 
 let request::SplitResult { shares } = request::split(
@@ -264,11 +490,9 @@ let request::SplitResult { shares } = request::split(
 // Pass each share to request::produce() to create encrypted delivery envelopes.
 ```
 
----
+### Verification
 
-### Verification Flow
-
-```rust
+```rust,ignore
 use derec_library::primitives::verification::{request, response};
 use derec_library::types::ChannelId;
 
@@ -298,17 +522,17 @@ let ok = response::process(&verify_response, b"example_share").unwrap();
 assert!(ok);
 ```
 
----
+### Discovery
 
-### Discovery Flow
-
-```rust
-use derec_library::primitives::discovery::{request, response};
-use derec_library::primitives::discovery::response::{SecretVersionEntry, VersionEntry};
+```rust,ignore
+use derec_library::primitives::discovery::{
+    request,
+    response::{self, SecretVersionEntry, VersionEntry},
+};
 use derec_library::types::ChannelId;
 
 let channel_id = ChannelId(1);
-// shared_key: [u8; 32] established during pairing (in recovery mode)
+let shared_key = [0u8; 32]; // established during pairing
 
 // Owner side: produce the discovery request.
 let request::ProduceResult { envelope: request_envelope } =
@@ -339,36 +563,35 @@ let response::ExtractResult { response } =
 let response::ProcessResult { secret_list } =
     response::process(&response).unwrap();
 
-// Owner now knows which (secret_id, version, description) tuples to request during recovery.
 for entry in &secret_list {
     for v in &entry.versions {
-        println!("secret_id={}  version={}  description={:?}", entry.secret_id, v.version, v.description);
+        println!(
+            "secret_id={}  version={}  description={:?}",
+            entry.secret_id, v.version, v.description,
+        );
     }
 }
 ```
 
----
+### Recovery
 
-### Recovery Flow
+Recovery is a three-step process: **pairing** (re-establish a channel with
+each helper in recovery mode), **discovery** (ask each helper which secrets it
+holds), and **share collection** (reconstruct the secret). The end-to-end
+flow is orchestrated by the protocol layer; see `bindings/rust/src/protocol.rs`
+in the repository for the full driver loop.
 
-Recovery is a three-step process: **pairing** (re-establish a channel with each Helper in recovery
-mode), **discovery** (ask each Helper which secrets it holds), and **share collection**
-(reconstruct the secret). The end-to-end flow is orchestrated by the [`crate::protocol`] module;
-see its docs and the protocol-level smoke test (`bindings/rust/src/protocol.rs`) for the full
-driver loop.
+Helper-side primitive surface:
 
-The Helper-side primitive surface is:
-
-```rust
+```rust,ignore
 use derec_library::primitives::recovery::{request, response};
 use derec_library::types::ChannelId;
 
 let channel_id = ChannelId(1);
 let shared_key = [0u8; 32]; // established during pairing
 // request_envelope:        outer DeRecMessage bytes carrying a GetShareRequest
-// stored_share_request:    StoreShareRequestMessage the Helper persisted at sharing time
+// stored_share_request:    StoreShareRequestMessage the helper persisted at sharing time
 
-// Helper side: extract the share request and produce a response.
 let request::ExtractResult { request: get_share_request } =
     request::extract(&request_envelope, &shared_key).unwrap();
 let response::ProduceResult { envelope: response_envelope } = response::produce(
@@ -379,9 +602,10 @@ let response::ProduceResult { envelope: response_envelope } = response::produce(
 ).unwrap();
 ```
 
-The Owner side decrypts each helper response and reconstructs the secret once enough have arrived:
+Owner side — decrypt each helper response, reconstruct the secret once enough
+have arrived:
 
-```rust
+```rust,ignore
 use derec_library::primitives::recovery::response;
 
 let secret_id: u64 = 42;
@@ -392,30 +616,14 @@ let recovered = response::recover(secret_id, version, &inputs).unwrap();
 // recovered.secret_data contains the reconstructed payload.
 ```
 
----
-
 ### Unpairing
 
-Either party may end the relationship for a channel by initiating an
-**unpair flow**. The recipient deletes its state (shared key, channel
-record, stored shares) and acknowledges with an `UnpairResponseMessage`.
+Either party may end a channel by initiating an unpair flow. The recipient
+drops its state (shared key, channel record, stored shares) and acknowledges
+with an `UnpairResponseMessage`. Through the protocol layer this is one call;
+the primitive surface is below.
 
-The orchestrator exposes two acknowledgement policies via the builder:
-
-- `UnpairAck::Required` (default) — the initiator keeps local state until
-  the peer acknowledges with `Ok` (or the configured protocol timeout
-  elapses, at which point the state is dropped anyway and the `Unpaired`
-  event surfaces).
-- `UnpairAck::NotRequired` — fire-and-forget. State is dropped immediately
-  on `start(Unpair)` and any later response is ignored.
-
-Both policies emit a `DeRecEvent::Unpaired { channel_id }` event on the
-local side once the local state is gone. A peer that refuses to comply
-returns a non-`Ok` status; the initiator surfaces this as
-`DeRecEvent::UnpairRejected { channel_id, status, memo }` and leaves the
-local state intact.
-
-```rust
+```rust,ignore
 use derec_library::primitives::unpairing::{request, response};
 use derec_library::types::ChannelId;
 
@@ -436,14 +644,13 @@ let outcome = response::process(&unpair_response).unwrap();
 assert!(outcome.acknowledged);
 ```
 
-When driven through the high-level [`DeRecProtocol`] orchestrator the same
-flow is one call:
+Through the protocol layer:
 
 ```rust,ignore
 use derec_library::protocol::{DeRecFlow, UnpairAck};
 use derec_library::types::Target;
 
-let protocol = DeRecProtocolBuilder::new()
+let mut protocol = DeRecProtocolBuilder::new()
     .with_unpair_ack(UnpairAck::Required)
     // … other setters …
     .build();
@@ -454,111 +661,58 @@ protocol.start(DeRecFlow::Unpair {
 }).await?;
 ```
 
+`UnpairAck::Required` (default) keeps local state until the peer replies
+`Ok`, or until the configured timeout elapses; the `Unpaired` event surfaces
+in either case. `UnpairAck::NotRequired` drops local state immediately on
+`start(Unpair)` and ignores any later response.
+
 When the peer's `UnpairRequest` arrives on the responder side, the
-orchestrator emits an `ActionRequired { action_kind: "Unpair", .. }`
-event. The application calls `accept(action)` to drop local state and
-send back an `Ok` acknowledgement, or `reject(action, status, memo)` to
-keep local state and reply with a non-`Ok` status.
-
----
-
-## Observability
-
-The library emits structured [tracing](https://docs.rs/tracing) spans and events for every protocol step. Instrumentation is **off by default** and opt-in via the `logging` feature flag — enabling it adds no overhead when no subscriber is active.
-
-### Enabling the feature
-
-```toml
-[dependencies]
-derec-library = { version = "0.0.1-alpha.7", features = ["logging"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-```
-
-### Wiring up a subscriber
-
-Initialize a subscriber once, early in your application (e.g. in `main`):
-
-```rust
-tracing_subscriber::fmt()
-    .with_env_filter(
-        tracing_subscriber::EnvFilter::from_env("DEREC_LOG")
-    )
-    .init();
-```
-
-### Controlling the log level at runtime
-
-Set `DEREC_LOG` before running your application:
-
-```bash
-# Protocol milestones only (contact created, pairing complete, share stored, …)
-DEREC_LOG=info ./my-app
-
-# Intermediate state — sizes, versions, channel IDs
-DEREC_LOG=debug ./my-app
-
-# Full detail including byte lengths from the cryptography layer
-DEREC_LOG=trace ./my-app
-
-# Only DeRec events, silence everything else
-DEREC_LOG=derec_library=debug,derec_cryptography=debug ./my-app
-
-# Mix: DeRec at trace, all other crates at warn
-DEREC_LOG=warn,derec_library=trace,derec_cryptography=trace ./my-app
-```
-
-### What is logged
-
-| Level | Content |
-|-------|---------|
-| `info` | Protocol milestones — contact created, pairing complete, share split, share stored, verification result, secret reconstructed |
-| `debug` | Intermediate state — channel IDs, versions, thresholds, response counts |
-| `trace` | Low-level byte lengths from the cryptography layer |
-
-**Security guarantee**: secret bytes, symmetric keys, and share content are never emitted. Only non-sensitive metadata (lengths, identifiers, roles) appears in events.
+orchestrator emits `DeRecEvent::ActionRequired { channel_id, action }` with
+`action` set to `PendingAction::Unpair { .. }`. The application calls
+`protocol.accept(action)` to drop local state and reply `Ok`, or
+`protocol.reject(action, status, memo)` to keep local state and reply with a
+non-`Ok` status.
 
 ---
 
 ## Protocol specification
 
 Full protocol documentation:
-
-https://derec-alliance.gitbook.io/docs/protocol-specification/messages
+<https://derec-alliance.gitbook.io/docs/protocol-specification/messages>
 
 ---
 
-## Security Considerations
+## Security considerations
 
 Applications using this SDK should ensure:
-* Secure storage of secret material
-* Proper authentication of helpers
-* Safe transport channels
-* Protection against replay attacks
 
-The DeRec protocol design assumes helpers are independent and trusted entities.
+- Secure storage of secret material (`DeRecSecretStore` content is
+  keychain-grade — see the trait doc).
+- Proper authentication of helpers.
+- Safe transport channels.
+- Protection against replay attacks beyond the protocol's own timestamp-based
+  staleness check.
+
+The DeRec protocol assumes helpers are independent and trusted entities.
 
 ---
 
 ## License
 
-Licensed under the Apache License, Version 2.0.
-
-See the `LICENSE` file for details.
+Licensed under the Apache License, Version 2.0. See the `LICENSE` file for
+details.
 
 ---
 
 ## Contributing
 
-Contributions are welcome.
-
-Repository: https://github.com/derecalliance/lib-derec
-
-Please open issues or pull requests to discuss improvements.
+Contributions are welcome. Repository:
+<https://github.com/derecalliance/lib-derec>. Please open issues or pull
+requests to discuss improvements.
 
 ---
 
 ## DeRec Alliance
 
-The DeRec Alliance is an open initiative focused on creating standards for decentralized secret recovery.
-
-More information at https://derecalliance.org
+The DeRec Alliance is an open initiative focused on standards for
+decentralized secret recovery. <https://derecalliance.org>
