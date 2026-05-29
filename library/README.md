@@ -218,6 +218,24 @@ protocol owns the state. The main variants are:
 See [`DeRecEvent`](https://docs.rs/derec-library/latest/derec_library/protocol/events/enum.DeRecEvent.html)
 for the complete enum and per-variant docs.
 
+### Channel roles
+
+Each paired channel carries the local node's role — `SenderKind::Owner` or
+`SenderKind::Helper` — fixed at pairing time and stored on
+[`Channel.role`](https://docs.rs/derec-library/latest/derec_library/types/struct.Channel.html).
+The orchestrator enforces flow directionality against this value:
+
+- Outbound: `ProtectSecret`, `VerifyShares`, `Discovery`, and `RecoverSecret`
+  require the local role to be `Owner` on every targeted channel.
+- Inbound: a `StoreShareRequest` / `VerifyShareRequest` /
+  `GetSecretIdsVersionsRequest` / `GetShareRequest` is only honored on a
+  channel where the local role is `Helper`; the corresponding responses
+  require `Owner`.
+- `Unpair` is symmetric — either side may initiate, and the role is not
+  consulted.
+
+A mismatch surfaces as `Error::RoleMismatch { channel_id, expected, actual }`.
+
 ---
 
 ## Protocol flows

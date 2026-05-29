@@ -128,6 +128,14 @@ pub struct Channel {
     pub status: ChannelStatus,
     /// Unix timestamp (seconds) when the channel was created.
     pub created_at: u64,
+    /// This node's role on this channel, fixed at pairing time.
+    ///
+    /// The orchestrator enforces flow directionality against this value: an
+    /// `Owner` may initiate `ProtectSecret` / `VerifyShares` / `Discovery` /
+    /// `RecoverSecret`; a `Helper` may not. Inbound messages are gated the
+    /// other way around — a `StoreShareRequest` is only honored on a channel
+    /// where this node is the `Helper`, and so on.
+    pub role: derec_proto::SenderKind,
 }
 
 /// Per-helper metadata stored inside the secret bag for recovery.

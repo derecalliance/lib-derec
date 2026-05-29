@@ -257,7 +257,7 @@ interface Node {
 const THRESHOLD = 2;
 const KEEP_VERSIONS_COUNT = 3;
 
-function makeNode(name: string, endpointUri: string, secretId: bigint): Node {
+function makeNode(name: string, endpointUri: string): Node {
   const channelStore = new InMemoryChannelStore();
   const shareStore = new InMemoryShareStore();
   const secretStore = new InMemorySecretStore();
@@ -271,7 +271,6 @@ function makeNode(name: string, endpointUri: string, secretId: bigint): Node {
     "https",
     THRESHOLD,
     KEEP_VERSIONS_COUNT,
-    secretId,
     { name },
   );
   return { protocol, transport, channelStore, shareStore, secretStore };
@@ -387,8 +386,8 @@ async function doPair(
 async function runPairingFlow(): Promise<void> {
   console.log("=== [Protocol] Pairing Flow ===\n");
 
-  const owner = makeNode("Owner", "https://owner.example.com", 1n);
-  const helper = makeNode("Helper", "https://helper.example.com", 2n);
+  const owner = makeNode("Owner", "https://owner.example.com");
+  const helper = makeNode("Helper", "https://helper.example.com");
 
   await doPair(helper, owner, 1n, "Pairing");
 
@@ -401,9 +400,9 @@ async function runSharingFlow(): Promise<void> {
   console.log("=== [Protocol] Sharing Flow ===\n");
 
   const ownerSecretId = 42n;
-  const owner = makeNode("Owner", "https://owner.example.com", ownerSecretId);
-  const helperA = makeNode("HelperA", "https://helper-a.example.com", 100n);
-  const helperB = makeNode("HelperB", "https://helper-b.example.com", 200n);
+  const owner = makeNode("Owner", "https://owner.example.com");
+  const helperA = makeNode("HelperA", "https://helper-a.example.com");
+  const helperB = makeNode("HelperB", "https://helper-b.example.com");
   const channelIdA = 1n;
   const channelIdB = 2n;
 
@@ -413,6 +412,8 @@ async function runSharingFlow(): Promise<void> {
 
   const secretData = new TextEncoder().encode("super-secret-value");
   await owner.protocol.start(FlowKind.ProtectSecret, {
+    secretId: ownerSecretId,
+    target: [channelIdA, channelIdB],
     secrets: [{ id: new Uint8Array([1]), name: "smoke", data: secretData }],
     description: "smoke-test secret",
   });
@@ -475,9 +476,9 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
   console.log("=== [Protocol] Discovery & Recovery Flow ===\n");
 
   const ownerSecretId = 123n;
-  const owner = makeNode("Owner", "https://owner.example.com", ownerSecretId);
-  const helperA = makeNode("HelperA", "https://helper-a.example.com", 7n);
-  const helperB = makeNode("HelperB", "https://helper-b.example.com", 8n);
+  const owner = makeNode("Owner", "https://owner.example.com");
+  const helperA = makeNode("HelperA", "https://helper-a.example.com");
+  const helperB = makeNode("HelperB", "https://helper-b.example.com");
   const channelA = 1n;
   const channelB = 2n;
   const recoveryChannelA = 100n;
@@ -495,6 +496,8 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
   console.log();
 
   await owner.protocol.start(FlowKind.ProtectSecret, {
+    secretId: ownerSecretId,
+    target: [channelA, channelB],
     secrets: [{ id: new Uint8Array([1]), name: "wallet", data: secretBytes }],
     description,
   });
@@ -647,8 +650,8 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
 async function runUnpairingFlow(): Promise<void> {
   console.log("=== [Protocol] Unpairing Flow ===\n");
 
-  const owner = makeNode("Owner", "https://owner.example.com", 1n);
-  const helper = makeNode("Helper", "https://helper.example.com", 2n);
+  const owner = makeNode("Owner", "https://owner.example.com");
+  const helper = makeNode("Helper", "https://helper.example.com");
   const channelId = 7n;
 
   await doPair(helper, owner, channelId, "Unpair");

@@ -95,6 +95,7 @@ pub(in crate::protocol) async fn start<
             communication_info: peer_communication_info,
             status: crate::types::ChannelStatus::Pending,
             created_at: now_secs(),
+            role: kind,
         })
         .await?;
 
@@ -149,6 +150,7 @@ pub(in crate::protocol) async fn accept<
             communication_info: peer_communication_info.clone(),
             status,
             created_at: now_secs(),
+            role: kind,
         })
         .await?;
 

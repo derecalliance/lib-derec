@@ -581,6 +581,8 @@ async fn run_sharing_flow() {
     owner
         .protocol
         .start(DeRecFlow::ProtectSecret {
+            secret_id: 42,
+            target: Target::Many(vec![channel_a, channel_b]),
             secrets: vec![UserSecret {
                 id: vec![1, 2, 3],
                 name: "smoke-test secret".to_owned(),
@@ -626,6 +628,7 @@ async fn run_discovery_and_recovery_flow() {
     let recovery_channel_a = ChannelId(100);
     let recovery_channel_b = ChannelId(101);
     let secret_id_bytes = vec![9_u8, 9, 9];
+    let vault_secret_id: u64 = 7777;
     let secret_data = b"correct horse battery staple".to_vec();
 
     // VSS sharing requires threshold ≥ 2, so the discovery+recovery scenario
@@ -643,6 +646,8 @@ async fn run_discovery_and_recovery_flow() {
     owner
         .protocol
         .start(DeRecFlow::ProtectSecret {
+            secret_id: vault_secret_id,
+            target: Target::Many(vec![channel_a, channel_b]),
             secrets: vec![UserSecret {
                 id: secret_id_bytes.clone(),
                 name: "wallet seed".to_owned(),
@@ -688,7 +693,7 @@ async fn run_discovery_and_recovery_flow() {
         helper
             .protocol
             .start(DeRecFlow::Pairing {
-                kind: SenderKind::Owner,
+                kind: SenderKind::Helper,
                 contact: recovery_contact,
                 peer_communication_info: std::collections::HashMap::from([(
                     "name".to_owned(),
@@ -778,11 +783,10 @@ async fn run_discovery_and_recovery_flow() {
         "expected at least one SecretsDiscovered event on owner"
     );
 
-    let discovered_secret_id = u64_from_id_bytes(&secret_id_bytes);
     let entry = discovered
         .iter()
         .flat_map(|(_, secrets)| secrets.iter())
-        .find(|e| e.secret_id == discovered_secret_id)
+        .find(|e| e.secret_id == vault_secret_id)
         .expect("discovered list must contain the distributed secret");
     assert!(
         entry
@@ -798,7 +802,7 @@ async fn run_discovery_and_recovery_flow() {
         .max()
         .expect("discovered secret must have at least one version");
     println!(
-        "Owner discovered secret_id={discovered_secret_id} v{recover_version} across {} helper(s); recovering.",
+        "Owner discovered secret_id={vault_secret_id} v{recover_version} across {} helper(s); recovering.",
         discovered.len()
     );
 
@@ -807,7 +811,7 @@ async fn run_discovery_and_recovery_flow() {
     owner
         .protocol
         .start(DeRecFlow::RecoverSecret {
-            secret_id: discovered_secret_id,
+            secret_id: vault_secret_id,
             version: recover_version,
         })
         .await
@@ -834,16 +838,6 @@ async fn run_discovery_and_recovery_flow() {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Mirror the library's `secret_id` derivation from `UserSecret.id` bytes.
-///
-/// The sharing handler uses the protocol instance's configured `secret_id`
-/// (default `0`), so the discovered secret id is the builder default unless
-/// overridden. Building with the default keeps this simple: the discovered id
-/// is `0`.
-fn u64_from_id_bytes(_id: &[u8]) -> u64 {
-    0
-}
 
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || haystack.len() < needle.len() {

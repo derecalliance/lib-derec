@@ -86,6 +86,7 @@ fn categorize(err: &crate::Error) -> (&'static str, &'static str) {
         crate::Error::ProtobufDecode(_) => ("protobuf", "DECODE_ERROR"),
         crate::Error::ProtobufEncode(_) => ("protobuf", "ENCODE_ERROR"),
         crate::Error::Invariant(_) => ("invariant", "INVARIANT_VIOLATED"),
+        crate::Error::RoleMismatch { .. } => ("input", "ROLE_MISMATCH"),
     }
 }
 

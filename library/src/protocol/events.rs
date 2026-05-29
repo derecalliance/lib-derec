@@ -59,6 +59,18 @@ pub enum PendingAction {
 }
 
 /// Describes an outbound protocol flow to initiate via [`super::DeRecProtocol::start`].
+///
+/// # Role gating
+///
+/// The orchestrator enforces flow directionality against
+/// [`crate::types::Channel::role`] (set at pairing time):
+///
+/// - [`Self::Discovery`], [`Self::ProtectSecret`], [`Self::VerifyShares`],
+///   and [`Self::RecoverSecret`] require this node to be the
+///   [`SenderKind::Owner`] on every targeted channel; otherwise
+///   [`crate::Error::RoleMismatch`] is returned.
+/// - [`Self::Pairing`] creates the channel, so no role exists yet.
+/// - [`Self::Unpair`] is symmetric — either party may initiate.
 pub enum DeRecFlow {
     Pairing {
         kind: SenderKind,
@@ -134,7 +146,9 @@ pub enum UnpairAck {
 pub enum DeRecEvent {
     /// Pairing completed — the shared key for `channel_id` is now persisted.
     ///
-    /// `kind` is the local party's role in the pairing. Applications use this
+    /// `kind` is the local party's role in the pairing, also persisted as
+    /// [`crate::types::Channel::role`] and consulted by the orchestrator on
+    /// every subsequent flow start and inbound message. Applications use it
     /// to decide what to do next:
     ///
     /// - [`SenderKind::Owner`] — the Owner completed pairing with a Helper.

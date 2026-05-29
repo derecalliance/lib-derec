@@ -78,6 +78,11 @@ pub const DEREC_CODE_BUILDER_ERROR: i32 = 9;
 /// [`DEREC_CATEGORY_SECRET_STORE`].
 pub const DEREC_CODE_MISSING_SHARED_KEY: i32 = 10;
 
+/// Flow or inbound message attempted against a channel where this node holds
+/// the wrong [`derec_proto::SenderKind`]. Surfaced as
+/// [`DEREC_CATEGORY_INVALID_INPUT`].
+pub const DEREC_CODE_ROLE_MISMATCH: i32 = 11;
+
 pub const DEREC_CODE_ENCRYPTION: i32 = 20;
 pub const DEREC_CODE_KEYGEN: i32 = 21;
 pub const DEREC_CODE_FINISH_PAIRING_INITIATOR: i32 = 22;
@@ -204,6 +209,9 @@ fn categorize(err: &crate::Error) -> (i32, i32) {
         crate::Error::ProtobufDecode(_) => (DEREC_CATEGORY_PROTOBUF, DEREC_CODE_PROTOBUF_DECODE),
         crate::Error::ProtobufEncode(_) => (DEREC_CATEGORY_PROTOBUF, DEREC_CODE_PROTOBUF_ENCODE),
         crate::Error::Invariant(_) => (DEREC_CATEGORY_INVARIANT, DEREC_CODE_INVARIANT),
+        crate::Error::RoleMismatch { .. } => {
+            (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_ROLE_MISMATCH)
+        }
     }
 }
 

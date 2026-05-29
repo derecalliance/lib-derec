@@ -80,6 +80,15 @@ pub enum Error {
 
     #[error("internal invariant violated: {0}")]
     Invariant(&'static str),
+
+    #[error(
+        "role mismatch on channel {channel_id:?}: expected {expected:?}, got {actual:?}"
+    )]
+    RoleMismatch {
+        channel_id: crate::types::ChannelId,
+        expected: derec_proto::SenderKind,
+        actual: derec_proto::SenderKind,
+    },
 }
 
 impl Error {

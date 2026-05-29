@@ -310,6 +310,9 @@ struct ChannelRecord {
     status: String,
     #[serde(default)]
     created_at: u64,
+    /// Local role on this channel; matches `derec_proto::SenderKind` raw i32.
+    #[serde(default)]
+    role: i32,
 }
 
 fn default_channel_status() -> String {
@@ -329,6 +332,7 @@ impl From<&Channel> for ChannelRecord {
             communication_info: ch.communication_info.clone(),
             status: status.to_owned(),
             created_at: ch.created_at,
+            role: ch.role as i32,
         }
     }
 }
@@ -339,6 +343,8 @@ impl From<ChannelRecord> for Channel {
             "pending" => ChannelStatus::Pending,
             _ => ChannelStatus::Paired,
         };
+        let role = derec_proto::SenderKind::try_from(rec.role)
+            .unwrap_or(derec_proto::SenderKind::Owner);
         Self {
             id: ChannelId(rec.channel_id),
             transport: TransportProtocol {
@@ -348,6 +354,7 @@ impl From<ChannelRecord> for Channel {
             communication_info: rec.communication_info,
             status,
             created_at: rec.created_at,
+            role,
         }
     }
 }

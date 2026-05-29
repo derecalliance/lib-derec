@@ -243,6 +243,14 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                 Ok(Some(channel_id))
             }
             DeRecFlow::Discovery { target } => {
+                let resolved =
+                    handlers::resolve_target(&mut self.channel_store, target.clone()).await?;
+                handlers::require_role(
+                    &self.channel_store,
+                    &resolved,
+                    derec_proto::SenderKind::Owner,
+                )
+                .await?;
                 handlers::discovery::start(
                     &mut self.channel_store,
                     &mut self.secret_store,
@@ -258,6 +266,14 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                 secrets,
                 description,
             } => {
+                let resolved =
+                    handlers::resolve_target(&mut self.channel_store, target.clone()).await?;
+                handlers::require_role(
+                    &self.channel_store,
+                    &resolved,
+                    derec_proto::SenderKind::Owner,
+                )
+                .await?;
                 let (version, sent_channels) = handlers::sharing::start(
                     &mut self.channel_store,
                     &mut self.share_store,
@@ -287,6 +303,14 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                 version,
                 target,
             } => {
+                let resolved =
+                    handlers::resolve_target(&mut self.channel_store, target.clone()).await?;
+                handlers::require_role(
+                    &self.channel_store,
+                    &resolved,
+                    derec_proto::SenderKind::Owner,
+                )
+                .await?;
                 handlers::verification::start(
                     &mut self.channel_store,
                     &mut self.secret_store,
@@ -299,6 +323,19 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                 Ok(None)
             }
             DeRecFlow::RecoverSecret { secret_id, version } => {
+                let all_paired: Vec<crate::types::ChannelId> = self
+                    .channel_store
+                    .channels()
+                    .await?
+                    .iter()
+                    .map(|c| c.id)
+                    .collect();
+                handlers::require_role(
+                    &self.channel_store,
+                    &all_paired,
+                    derec_proto::SenderKind::Owner,
+                )
+                .await?;
                 handlers::recovery::start(
                     &mut self.channel_store,
                     &mut self.secret_store,

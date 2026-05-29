@@ -513,6 +513,8 @@ pub async fn restore_from_recovered_bag(
             communication_info: helper.communication_info,
             status: ChannelStatus::Paired,
             created_at,
+            // Re-established from the recovery bag: this node is the Owner.
+            role: derec_proto::SenderKind::Owner,
         };
 
         ch_store

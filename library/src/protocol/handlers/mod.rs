@@ -17,9 +17,40 @@ use crate::{
     types::{ChannelId, SharedKey, Target},
 };
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
-use derec_proto::{DeRecMessage, MessageBody, TransportProtocol};
+use derec_proto::{DeRecMessage, MessageBody, SenderKind, TransportProtocol};
 use prost::Message;
 use std::collections::HashMap;
+
+/// Assert that every channel in `channel_ids` carries `expected` as its local
+/// role. The protocol's flow directionality (Owner initiates protect/verify/
+/// discovery/recovery, Helper accepts) is enforced through this gate.
+///
+/// Returns the first mismatch as [`crate::Error::RoleMismatch`]; missing
+/// channels are also reported as a mismatch against `SenderKind::Owner` of
+/// the unknown peer (treated as a programming error — the caller asked the
+/// protocol to operate on a channel it doesn't have).
+pub(super) async fn require_role<Ch: DeRecChannelStore>(
+    channel_store: &Ch,
+    channel_ids: &[ChannelId],
+    expected: SenderKind,
+) -> Result<()> {
+    for channel_id in channel_ids {
+        let channel = channel_store
+            .load(*channel_id)
+            .await?
+            .ok_or(Error::InvalidInput(
+                "channel id not present in channel store",
+            ))?;
+        if channel.role != expected {
+            return Err(Error::RoleMismatch {
+                channel_id: *channel_id,
+                expected,
+                actual: channel.role,
+            });
+        }
+    }
+    Ok(())
+}
 
 pub(super) async fn resolve_target<Ch: DeRecChannelStore>(
     channel_store: &mut Ch,
@@ -92,6 +123,10 @@ pub(super) async fn handle<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRec
 ) -> Result<Vec<DeRecEvent>> {
     let inner = crate::derec_message::extract_inner_message(&message.message, shared_key)?;
 
+    if let Some(expected) = expected_role_for_inbound(&inner) {
+        require_role(channel_store, &[channel_id], expected).await?;
+    }
+
     match &inner {
         MessageBody::StoreShareRequest(_) | MessageBody::StoreShareResponse(_) => {
             sharing::handle(channel_id, inner, *shared_key)
@@ -121,6 +156,29 @@ pub(super) async fn handle<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRec
         _ => Err(Error::Invariant(
             "unexpected MessageBody variant in channel message",
         )),
+    }
+}
+
+/// Inbound role-gate table — the local role required on `channel_id` for the
+/// orchestrator to honor a given inbound [`MessageBody`].
+///
+/// Returns `None` for messages that are role-blind (currently the unpair
+/// request/response pair — either side may initiate an unpair).
+fn expected_role_for_inbound(body: &MessageBody) -> Option<SenderKind> {
+    match body {
+        // Helper accepts these; Owner sends them.
+        MessageBody::StoreShareRequest(_)
+        | MessageBody::VerifyShareRequest(_)
+        | MessageBody::GetSecretIdsVersionsRequest(_)
+        | MessageBody::GetShareRequest(_) => Some(SenderKind::Helper),
+        // Owner consumes these; Helper sends them.
+        MessageBody::StoreShareResponse(_)
+        | MessageBody::VerifyShareResponse(_)
+        | MessageBody::GetSecretIdsVersionsResponse(_)
+        | MessageBody::GetShareResponse(_) => Some(SenderKind::Owner),
+        // Symmetric.
+        MessageBody::UnpairRequest(_) | MessageBody::UnpairResponse(_) => None,
+        _ => None,
     }
 }
 
