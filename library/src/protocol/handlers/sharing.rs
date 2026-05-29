@@ -4,7 +4,7 @@ use super::super::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport,
     MissingPolicy, PendingAction, SecretKind, SecretValue, Share,
 };
-use super::peer_endpoint;
+use super::{peer_endpoint, resolve_target};
 use crate::{
     Error, Result,
     derec_message::current_timestamp,
@@ -12,7 +12,7 @@ use crate::{
         request::{produce as produce_store_share_request_message, split},
         response::{self as sharing_response},
     },
-    types::{ChannelId, HelperInfo, SecretContainer, SharedKey, UserSecret},
+    types::{ChannelId, HelperInfo, SecretContainer, SharedKey, Target, UserSecret},
 };
 use derec_proto::{
     DeRecResult, DeRecSecret, MessageBody, StatusEnum, StoreShareRequestMessage,
@@ -39,6 +39,7 @@ pub(in crate::protocol) fn handle(
 }
 
 #[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(secret_id = secret_id)))]
+#[allow(clippy::too_many_arguments)]
 pub(in crate::protocol) async fn start<
     Ch: DeRecChannelStore,
     Sh: DeRecShareStore,
@@ -54,8 +55,9 @@ pub(in crate::protocol) async fn start<
     threshold: usize,
     keep_versions_count: usize,
     secret_id: u64,
+    target: Target,
 ) -> Result<(u32, Vec<ChannelId>)> {
-    let paired_helpers = load_paired_helpers(channel_store, secret_store).await?;
+    let paired_helpers = load_paired_helpers(channel_store, secret_store, target).await?;
 
     let secret_data = build_secret_container(&paired_helpers, secrets, threshold);
 
@@ -263,15 +265,21 @@ fn on_response(
 async fn load_paired_helpers<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     channel_store: &mut Ch,
     secret_store: &mut Ss,
+    target: Target,
 ) -> Result<Vec<(crate::types::Channel, SharedKey)>> {
-    let all_channels = channel_store.channels().await?;
-    if all_channels.is_empty() {
-        return Err(Error::InvalidInput("no paired helpers available"));
+    let selected_ids = resolve_target(channel_store, target).await?;
+    if selected_ids.is_empty() {
+        return Err(Error::InvalidInput("no paired helpers in target set"));
     }
 
-    let channel_ids: Vec<ChannelId> = all_channels.iter().map(|c| c.id).collect();
+    let all_channels = channel_store.channels().await?;
+    let selected_channels: Vec<crate::types::Channel> = all_channels
+        .into_iter()
+        .filter(|c| selected_ids.contains(&c.id))
+        .collect();
+
     let mut keys: std::collections::HashMap<ChannelId, SharedKey> = secret_store
-        .load_many(&channel_ids, SecretKind::SharedKey, MissingPolicy::Fail)
+        .load_many(&selected_ids, SecretKind::SharedKey, MissingPolicy::Fail)
         .await?
         .into_iter()
         .filter_map(|(cid, v)| match v {
@@ -280,7 +288,7 @@ async fn load_paired_helpers<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
         })
         .collect();
 
-    let paired_helpers = all_channels
+    let paired_helpers = selected_channels
         .into_iter()
         .map(|channel| {
             let key = keys

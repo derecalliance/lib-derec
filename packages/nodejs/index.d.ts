@@ -97,10 +97,13 @@ export interface DiscoveryParams {
   target?: Target;
 }
 export interface ProtectSecretParams {
+  secretId: bigint | string;
+  target?: Target;
   secrets: UserSecret[];
   description?: string;
 }
 export interface VerifySharesParams {
+  secretId: bigint | string;
   version: number;
   target?: Target;
 }
@@ -164,7 +167,6 @@ export declare class DeRecProtocol {
     ownTransportProtocol: string,
     threshold: number,
     keepVersionsCount: number,
-    secretId: bigint,
     communicationInfo: Record<string, string>,
     timeoutInSecs?: number | null,
     autoRespondOnFailure?: boolean | null,

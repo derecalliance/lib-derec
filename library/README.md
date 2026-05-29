@@ -186,7 +186,6 @@ setters have defaults:
 |--------|---------|---------|
 | `with_threshold(n)` | `3` | Minimum shares required to reconstruct the secret. |
 | `with_keep_versions_count(n)` | `3` | Number of recent versions each helper must retain. |
-| `with_secret_id(id)` | `0` | Application-provided identifier for the protocol instance. |
 | `with_timeout(duration)` | `5 minutes` | Staleness boundary for inbound envelopes and pending state. One-second granularity. |
 | `with_communication_info(map)` | empty | Key-value identity metadata embedded in pairing messages. |
 | `with_auto_respond_on_failure(bool)` | `false` | If `true`, the protocol replies to the peer on inbound processing failures; if `false`, errors only surface as events. |

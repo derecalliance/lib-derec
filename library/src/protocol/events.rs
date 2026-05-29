@@ -73,10 +73,21 @@ pub enum DeRecFlow {
         target: Target,
     },
     ProtectSecret {
+        /// Vault identifier this share distribution belongs to.
+        ///
+        /// The application owns the channel↔secret mapping; pass the same
+        /// `secret_id` here that identifies the vault `target` was selected
+        /// for.
+        secret_id: u64,
+        /// Helpers to distribute shares to. Typically [`Target::Many`]
+        /// carrying the channel ids the application has tagged as
+        /// protecting this vault.
+        target: Target,
         secrets: Vec<UserSecret>,
         description: Option<String>,
     },
     VerifyShares {
+        secret_id: u64,
         version: u32,
         target: Target,
     },

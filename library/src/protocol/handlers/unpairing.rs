@@ -4,7 +4,7 @@ use super::super::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport,
     MissingPolicy, PendingAction, SecretKind, SecretValue, events::UnpairAck,
 };
-use super::peer_endpoint;
+use super::{peer_endpoint, resolve_target};
 use crate::derec_message::current_timestamp;
 use crate::{
     Error, Result,
@@ -223,30 +223,6 @@ async fn on_response<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecret
         }]),
         Err(e) => Err(e),
     }
-}
-
-async fn resolve_target<Ch: DeRecChannelStore>(
-    channel_store: &mut Ch,
-    target: Target,
-) -> Result<Vec<ChannelId>> {
-    // TODO: this filtering loginc must be moved to channels()
-    let all_channels = channel_store.channels().await?;
-    let all_channel_ids: Vec<ChannelId> = all_channels.iter().map(|c| c.id).collect();
-
-    Ok(match target {
-        Target::All => all_channel_ids,
-        Target::Single(id) => {
-            if all_channel_ids.contains(&id) {
-                vec![id]
-            } else {
-                vec![]
-            }
-        }
-        Target::Many(ids) => ids
-            .into_iter()
-            .filter(|id| all_channel_ids.contains(id))
-            .collect(),
-    })
 }
 
 pub(in crate::protocol) async fn drop_channel_state<

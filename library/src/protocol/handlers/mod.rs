@@ -14,12 +14,36 @@ use super::{
 use crate::{
     Error, Result,
     derec_message::{DeRecMessageBuilder, current_timestamp},
-    types::{ChannelId, SharedKey},
+    types::{ChannelId, SharedKey, Target},
 };
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{DeRecMessage, MessageBody, TransportProtocol};
 use prost::Message;
 use std::collections::HashMap;
+
+pub(super) async fn resolve_target<Ch: DeRecChannelStore>(
+    channel_store: &mut Ch,
+    target: Target,
+) -> Result<Vec<ChannelId>> {
+    // TODO: this filtering logic should be moved to channels()
+    let all_channels = channel_store.channels().await?;
+    let all_channel_ids: Vec<ChannelId> = all_channels.iter().map(|c| c.id).collect();
+
+    Ok(match target {
+        Target::All => all_channel_ids,
+        Target::Single(id) => {
+            if all_channel_ids.contains(&id) {
+                vec![id]
+            } else {
+                vec![]
+            }
+        }
+        Target::Many(ids) => ids
+            .into_iter()
+            .filter(|id| all_channel_ids.contains(id))
+            .collect(),
+    })
+}
 
 pub(super) async fn peer_endpoint<Ch: DeRecChannelStore>(
     channel_store: &mut Ch,

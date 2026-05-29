@@ -137,8 +137,6 @@ pub struct DeRecProtocol<
     threshold: usize,
     /// Configured via [`DeRecProtocolBuilder::with_keep_versions_count`].
     keep_versions_count: usize,
-    /// Configured via [`DeRecProtocolBuilder::with_secret_id`].
-    secret_id: u64,
     /// Configured via [`DeRecProtocolBuilder::with_timeout`].
     timeout_in_secs: u64,
     /// Configured via [`DeRecProtocolBuilder::with_communication_info`].
@@ -164,7 +162,6 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
         own_transport: TransportProtocol,
         threshold: usize,
         keep_versions_count: usize,
-        secret_id: u64,
         timeout_in_secs: u64,
     ) -> Self {
         Self {
@@ -179,7 +176,6 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
             pending_start_events: Vec::new(),
             threshold,
             keep_versions_count,
-            secret_id,
             timeout_in_secs,
             communication_info: HashMap::new(),
             auto_respond_on_failure: false,
@@ -257,6 +253,8 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                 Ok(None)
             }
             DeRecFlow::ProtectSecret {
+                secret_id,
+                target,
                 secrets,
                 description,
             } => {
@@ -269,7 +267,8 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     description,
                     self.threshold,
                     self.keep_versions_count,
-                    self.secret_id,
+                    secret_id,
+                    target,
                 )
                 .await?;
 
@@ -283,14 +282,18 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
 
                 Ok(None)
             }
-            DeRecFlow::VerifyShares { version, target } => {
+            DeRecFlow::VerifyShares {
+                secret_id,
+                version,
+                target,
+            } => {
                 handlers::verification::start(
                     &mut self.channel_store,
                     &mut self.secret_store,
                     &self.transport,
                     version,
                     target,
-                    self.secret_id,
+                    secret_id,
                 )
                 .await?;
                 Ok(None)

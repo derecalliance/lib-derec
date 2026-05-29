@@ -144,7 +144,6 @@ impl DeRecProtocolWasm {
         own_transport_protocol: String,
         threshold: u32,
         keep_versions_count: u32,
-        secret_id: u64,
         communication_info: JsValue,
         timeout_in_secs: Option<u32>,
         auto_respond_on_failure: Option<bool>,
@@ -196,7 +195,6 @@ impl DeRecProtocolWasm {
             .with_own_transport(own_transport)
             .with_threshold(threshold as usize)
             .with_keep_versions_count(keep_versions_count as usize)
-            .with_secret_id(secret_id)
             .with_communication_info(info)
             .with_timeout(Duration::from_secs(timeout_in_secs.map_or(300, u64::from)))
             .with_auto_respond_on_failure(auto_respond_on_failure.unwrap_or(false))
@@ -726,6 +724,12 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
         }
         2 => {
             // ProtectSecret
+            let secret_id_val = js_sys::Reflect::get(&params, &JsValue::from_str("secretId"))
+                .map_err(|e| js_error("DECODE_ERROR", format!("missing secretId: {e:?}")))?;
+            let secret_id = js_value_to_u64(secret_id_val)?;
+            let target_val = js_sys::Reflect::get(&params, &JsValue::from_str("target"))
+                .unwrap_or(JsValue::UNDEFINED);
+            let target = parse_target(target_val)?;
             let secrets_val = js_sys::Reflect::get(&params, &JsValue::from_str("secrets"))
                 .map_err(|e| js_error("DECODE_ERROR", format!("missing secrets: {e:?}")))?;
             let secrets = parse_user_secrets(secrets_val)?;
@@ -733,12 +737,17 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
                 .unwrap_or(JsValue::UNDEFINED)
                 .as_string();
             Ok(DeRecFlow::ProtectSecret {
+                secret_id,
+                target,
                 secrets,
                 description,
             })
         }
         3 => {
             // VerifyShares
+            let secret_id_val = js_sys::Reflect::get(&params, &JsValue::from_str("secretId"))
+                .map_err(|e| js_error("DECODE_ERROR", format!("missing secretId: {e:?}")))?;
+            let secret_id = js_value_to_u64(secret_id_val)?;
             let version = js_sys::Reflect::get(&params, &JsValue::from_str("version"))
                 .map_err(|e| js_error("DECODE_ERROR", format!("missing version: {e:?}")))?
                 .as_f64()
@@ -747,7 +756,11 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
             let target_val = js_sys::Reflect::get(&params, &JsValue::from_str("target"))
                 .unwrap_or(JsValue::UNDEFINED);
             let target = parse_target(target_val)?;
-            Ok(DeRecFlow::VerifyShares { version, target })
+            Ok(DeRecFlow::VerifyShares {
+                secret_id,
+                version,
+                target,
+            })
         }
         4 => {
             // RecoverSecret

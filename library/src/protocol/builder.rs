@@ -50,7 +50,6 @@ pub struct DeRecProtocolBuilder<ChannelStore, ShareStore, SecretStore, Transport
     own_transport: OwnTransport,
     threshold: usize,
     keep_versions_count: usize,
-    secret_id: u64,
     timeout_in_secs: u64,
     communication_info: HashMap<String, String>,
     auto_respond_on_failure: bool,
@@ -76,7 +75,6 @@ impl
             own_transport: BuilderSlotMissingMarker,
             threshold: 3,
             keep_versions_count: 3,
-            secret_id: 0,
             timeout_in_secs: 300,
             communication_info: HashMap::new(),
             auto_respond_on_failure: false,
@@ -101,14 +99,6 @@ impl<ChannelStore, ShareStore, SecretStore, Transport, OwnTransport>
     /// Default: `3`.
     pub fn with_keep_versions_count(mut self, count: usize) -> Self {
         self.keep_versions_count = count;
-        self
-    }
-
-    /// Application-provided secret identifier for this protocol instance.
-    ///
-    /// Default: `0`.
-    pub fn with_secret_id(mut self, secret_id: u64) -> Self {
-        self.secret_id = secret_id;
         self
     }
 
@@ -200,7 +190,6 @@ impl<ShareStore, SecretStore, Transport, OwnTransport>
             own_transport: self.own_transport,
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
-            secret_id: self.secret_id,
             timeout_in_secs: self.timeout_in_secs,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
@@ -238,7 +227,6 @@ impl<ChannelStore, SecretStore, Transport, OwnTransport>
             own_transport: self.own_transport,
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
-            secret_id: self.secret_id,
             timeout_in_secs: self.timeout_in_secs,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
@@ -276,7 +264,6 @@ impl<ChannelStore, ShareStore, Transport, OwnTransport>
             own_transport: self.own_transport,
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
-            secret_id: self.secret_id,
             timeout_in_secs: self.timeout_in_secs,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
@@ -314,7 +301,6 @@ impl<ChannelStore, ShareStore, SecretStore, OwnTransport>
             own_transport: self.own_transport,
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
-            secret_id: self.secret_id,
             timeout_in_secs: self.timeout_in_secs,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
@@ -348,7 +334,6 @@ impl<ChannelStore, ShareStore, SecretStore, Transport>
             own_transport: BuilderSlotSetMarker(own_transport),
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
-            secret_id: self.secret_id,
             timeout_in_secs: self.timeout_in_secs,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
@@ -380,7 +365,6 @@ impl<Cs: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, Tr: DeRec
             self.own_transport.0,
             self.threshold,
             self.keep_versions_count,
-            self.secret_id,
             self.timeout_in_secs,
         );
         protocol.communication_info = self.communication_info;

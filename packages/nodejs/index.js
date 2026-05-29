@@ -29,8 +29,7 @@ const primitives = {
       extract: wasm.pairing_request_extract,
     },
     response: {
-      accept: wasm.pairing_response_accept,
-      reject: wasm.pairing_response_reject,
+      produce: wasm.pairing_response_produce,
       extract: wasm.pairing_response_extract,
       process: wasm.pairing_response_process,
     },
