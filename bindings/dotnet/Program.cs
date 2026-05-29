@@ -13,7 +13,6 @@ internal static class Program
     {
         RunProtocolVersionTest();
         RunPairingFlowTest();
-        RunPairingRejectionTest();
         RunSharingFlowTest();
         RunVerificationFlowTest();
         RunRecoveryFlowTest();
@@ -54,22 +53,22 @@ internal static class Program
         if (pairRequest.SecretKeyMaterial.Length == 0)
             throw new InvalidOperationException("Pairing test failed: empty pair request secret key material.");
 
-        // Contact-initiator side: extract then accept
+        // Contact-initiator side: extract then produce the response
         var extractedRequest = Pairing.Request.Extract(pairRequest.Envelope, contact.SecretKeyMaterial);
         if (extractedRequest.ChannelId != channelId)
             throw new InvalidOperationException("Pairing test failed: channel_id mismatch on extract.");
 
-        var accepted = Pairing.Response.Accept(
+        var produced = Pairing.Response.Produce(
             Pairing.SenderKind.Owner,
             extractedRequest.RequestProtoBytes,
             contact.SecretKeyMaterial
         );
 
-        if (accepted.SharedKey.Length == 0)
+        if (produced.SharedKey.Length == 0)
             throw new InvalidOperationException("Pairing test failed: empty shared key.");
 
         // Contact-responder side: extract then process
-        var extractedResponse = Pairing.Response.Extract(accepted.Envelope, pairRequest.SecretKeyMaterial);
+        var extractedResponse = Pairing.Response.Extract(produced.Envelope, pairRequest.SecretKeyMaterial);
         if (extractedResponse.ChannelId != channelId)
             throw new InvalidOperationException("Pairing test failed: channel_id mismatch on response extract.");
 
@@ -79,63 +78,10 @@ internal static class Program
             pairRequest.SecretKeyMaterial
         );
 
-        if (!accepted.SharedKey.SequenceEqual(processed.SharedKey))
+        if (!produced.SharedKey.SequenceEqual(processed.SharedKey))
             throw new InvalidOperationException("Pairing test failed: shared keys do not match.");
 
         Console.WriteLine("Pairing flow test passed.");
-    }
-
-    private static void RunPairingRejectionTest()
-    {
-        Console.WriteLine("=== Pairing rejection test ===");
-
-        ulong channelId = 7;
-
-        var contact = Pairing.Request.CreateContact(
-            channelId,
-            new TransportProtocol("https://example.com/alice")
-        );
-
-        var pairRequest = Pairing.Request.Produce(
-            Pairing.SenderKind.Helper,
-            new TransportProtocol("https://example.com/helper"),
-            contact.ContactMessage
-        );
-
-        var extractedRequest = Pairing.Request.Extract(pairRequest.Envelope, contact.SecretKeyMaterial);
-
-        // Contact-initiator rejects with a typed status + memo.
-        const int RejectStatusFail = 1; // StatusEnum::Fail
-        const string RejectMemo = "test rejection";
-        var rejected = Pairing.Response.Reject(
-            Pairing.SenderKind.Owner,
-            extractedRequest.RequestProtoBytes,
-            RejectStatusFail,
-            RejectMemo
-        );
-
-        // Contact-responder side: extract → process should throw DeRecException with NonOkStatus.
-        var extractedResponse = Pairing.Response.Extract(rejected.Envelope, pairRequest.SecretKeyMaterial);
-
-        try
-        {
-            Pairing.Response.Process(
-                pairRequest.InitiatorContactMessage,
-                extractedResponse.ResponseProtoBytes,
-                pairRequest.SecretKeyMaterial
-            );
-            throw new InvalidOperationException("Pairing rejection test failed: Process should have thrown.");
-        }
-        catch (DeRecException ex) when (ex.Code == DeRecCode.NonOkStatus)
-        {
-            if (ex.PeerStatus != RejectStatusFail)
-                throw new InvalidOperationException($"Pairing rejection test failed: expected peer_status={RejectStatusFail} but got {ex.PeerStatus}.");
-            if (ex.PeerMemo != RejectMemo)
-                throw new InvalidOperationException($"Pairing rejection test failed: expected peer_memo='{RejectMemo}' but got '{ex.PeerMemo}'.");
-            Console.WriteLine($"Pairing rejection surfaced as DeRecException: category={ex.Category}, code={ex.Code}, peer_status={ex.PeerStatus}, peer_memo='{ex.PeerMemo}'");
-        }
-
-        Console.WriteLine("Pairing rejection test passed.");
     }
 
     private static void RunSharingFlowTest()

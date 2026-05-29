@@ -10,12 +10,11 @@ use crate::primitives::pairing::{
         produce as produce_pairing_request_message,
     },
     response::{
-        AcceptResult as ProducePairingResponseMessageResult,
         ExtractResult as ExtractPairingResponseResult,
         ProcessResult as ProcessPairingResponseMessageResult,
-        RejectResult as RejectPairingResponseResult,
-        accept as produce_pairing_response_message, extract as extract_pairing_response,
-        process as process_pairing_response_message, reject as reject_pairing_response_message,
+        ProduceResult as ProducePairingResponseMessageResult,
+        extract as extract_pairing_response, process as process_pairing_response_message,
+        produce as produce_pairing_response_message,
     },
 };
 use crate::types::ChannelId;
@@ -977,7 +976,7 @@ fn test_alice_bob_pairing_flow() {
 }
 
 #[test]
-fn test_accept_pairing_response_returns_envelope_and_peer_transport() {
+fn test_produce_pairing_response_returns_envelope_and_peer_transport() {
     let alice_channel_id = ChannelId(42);
     let bob_transport_uri = "https://relay.example/bob";
 
@@ -1039,69 +1038,4 @@ fn test_accept_pairing_response_returns_envelope_and_peer_transport() {
     assert!(result.memo.is_empty());
     assert_eq!(response.nonce, bob_pair_request_msg.nonce);
     let _ = shared_key;
-}
-
-#[test]
-fn test_reject_pairing_response_returns_envelope_and_peer_transport() {
-    let alice_channel_id = ChannelId(42);
-    let bob_transport_uri = "https://relay.example/bob";
-    let reject_memo = "not accepting helpers right now";
-
-    let CreateContactMessageResult {
-        contact_message: alice_contact,
-        secret_key: alice_sk_state,
-    } = create_contact_message(
-        alice_channel_id,
-        TransportProtocol {
-            uri: "https://relay.example/alice".to_owned(),
-            protocol: Protocol::Https.into(),
-        },
-    )
-    .expect("failed to create contact message");
-
-    let ProducePairingRequestMessageResult {
-        envelope: bob_request_envelope,
-        secret_key: bob_sk_state,
-        ..
-    } = produce_pairing_request_message(
-        SenderKind::Helper,
-        TransportProtocol {
-            uri: bob_transport_uri.to_owned(),
-            protocol: Protocol::Https.into(),
-        },
-        &alice_contact,
-        None,
-    )
-    .expect("failed to produce pairing request");
-
-    let ExtractPairingRequestResult {
-        request: bob_pair_request_msg,
-    } = extract_pairing_request(&bob_request_envelope, alice_sk_state.ecies_secret_key())
-        .expect("failed to extract pairing request");
-
-    let RejectPairingResponseResult {
-        envelope,
-        peer_transport_protocol,
-    } = reject_pairing_response_message(
-        SenderKind::Owner,
-        &bob_pair_request_msg,
-        StatusEnum::Fail,
-        reject_memo,
-        None,
-    )
-    .expect("reject should succeed");
-
-    assert!(!envelope.is_empty());
-    assert_eq!(peer_transport_protocol.uri, bob_transport_uri);
-    assert_eq!(peer_transport_protocol.protocol, Protocol::Https as i32);
-
-    // The responder must be able to decrypt the envelope and observe the rejection.
-    let ExtractPairingResponseResult { response } =
-        extract_pairing_response(&envelope, bob_sk_state.ecies_secret_key())
-            .expect("failed to extract pairing response");
-
-    let result = response.result.expect("response should carry a result");
-    assert_eq!(result.status, StatusEnum::Fail as i32);
-    assert_eq!(result.memo, reject_memo);
-    assert_eq!(response.nonce, bob_pair_request_msg.nonce);
 }

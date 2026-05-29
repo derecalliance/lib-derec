@@ -8,17 +8,11 @@ public static partial class Pairing
 {
     public static class Response
     {
-        public sealed class AcceptResult
+        public sealed class ProduceResult
         {
             public required DeRecMessage Envelope { get; init; }
             public required TransportProtocol PeerTransportProtocol { get; init; }
             public required byte[] SharedKey { get; init; }
-        }
-
-        public sealed class RejectResult
-        {
-            public required DeRecMessage Envelope { get; init; }
-            public required TransportProtocol PeerTransportProtocol { get; init; }
         }
 
         public sealed class ExtractResult
@@ -37,17 +31,17 @@ public static partial class Pairing
         }
 
         /// <summary>
-        /// Accepts a pairing request and derives the shared key.
+        /// Produces a pairing response envelope and derives the shared key.
         /// </summary>
-        public static AcceptResult Accept(
+        public static ProduceResult Produce(
             SenderKind kind,
             byte[] requestProtoBytes,
             byte[] secretKeyMaterial,
             byte[]? communicationInfo = null
         )
         {
-            Native.Pairing.AcceptPairRequestMessageResult nativeResult =
-                Native.Pairing.accept_pair_request_message(
+            Native.Pairing.ProducePairResponseMessageResult nativeResult =
+                Native.Pairing.produce_pair_response_message(
                     (int)kind,
                     requestProtoBytes,
                     (UIntPtr)requestProtoBytes.Length,
@@ -60,7 +54,7 @@ public static partial class Pairing
             try
             {
                 Utils.ThrowIfError(nativeResult.Error);
-                return new AcceptResult
+                return new ProduceResult
                 {
                     Envelope = DeRecMessage.FromProtoBytes(Utils.CopyBuffer(nativeResult.ResponseWireBytes)),
                     PeerTransportProtocol = TransportProtocol.FromProtoBytes(Utils.CopyBuffer(nativeResult.PeerTransportProtocol)),
@@ -72,47 +66,6 @@ public static partial class Pairing
                 Utils.FreeBuffer(nativeResult.ResponseWireBytes);
                 Utils.FreeBuffer(nativeResult.PeerTransportProtocol);
                 Utils.FreeBuffer(nativeResult.SharedKey);
-            }
-        }
-
-        /// <summary>
-        /// Rejects a pairing request with a typed status and memo.
-        /// </summary>
-        public static RejectResult Reject(
-            SenderKind kind,
-            byte[] requestProtoBytes,
-            int statusEnum,
-            string memo,
-            byte[]? communicationInfo = null
-        )
-        {
-            byte[] memoBytes = System.Text.Encoding.UTF8.GetBytes(memo ?? string.Empty);
-
-            Native.Pairing.RejectPairRequestMessageResult nativeResult =
-                Native.Pairing.reject_pair_request_message(
-                    (int)kind,
-                    requestProtoBytes,
-                    (UIntPtr)requestProtoBytes.Length,
-                    statusEnum,
-                    memoBytes,
-                    (UIntPtr)memoBytes.Length,
-                    communicationInfo,
-                    (UIntPtr)(communicationInfo?.Length ?? 0)
-                );
-
-            try
-            {
-                Utils.ThrowIfError(nativeResult.Error);
-                return new RejectResult
-                {
-                    Envelope = DeRecMessage.FromProtoBytes(Utils.CopyBuffer(nativeResult.ResponseWireBytes)),
-                    PeerTransportProtocol = TransportProtocol.FromProtoBytes(Utils.CopyBuffer(nativeResult.PeerTransportProtocol)),
-                };
-            }
-            finally
-            {
-                Utils.FreeBuffer(nativeResult.ResponseWireBytes);
-                Utils.FreeBuffer(nativeResult.PeerTransportProtocol);
             }
         }
 

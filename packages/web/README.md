@@ -104,8 +104,8 @@ async function main() {
     contact.contact_message,
   );
 
-  // Step 3: Initiator accepts and derives the initiator-side shared key.
-  const accepted = primitives.pairing.response.accept(
+  // Step 3: Initiator produces the response and derives the initiator-side shared key.
+  const produced = primitives.pairing.response.produce(
     SenderKind.Owner,
     request.envelope,
     contact.secret_key_material,
@@ -114,19 +114,21 @@ async function main() {
   // Step 4: Responder processes the response and derives its own shared key.
   const processed = primitives.pairing.response.process(
     request.initiator_contact_message,
-    accepted.envelope,
+    produced.envelope,
     request.secret_key_material,
   );
 
   // Both sides hold the same key now.
-  // accepted.pairing_shared_key  ==  processed.pairing_shared_key
+  // produced.pairing_shared_key  ==  processed.pairing_shared_key
 }
 
 main();
 ```
 
-Use `primitives.pairing.response.reject(kind, request_envelope, status, memo, communication_info)`
-instead of `accept` to reply with a non-OK status. `communication_info` may be `null`.
+To reject the request, build a `PairResponseMessage` with a non-OK status and
+encrypt it against `request.ecies_public_key` using the WASM-exposed pairing
+envelope helpers. The higher-level `DeRecProtocol` orchestrator's `reject`
+method does this for you.
 
 ---
 

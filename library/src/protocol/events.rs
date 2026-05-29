@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Public event and action types emitted / consumed by [`super::DeRecProtocol`].
-
 use std::collections::HashMap;
 
 use crate::{

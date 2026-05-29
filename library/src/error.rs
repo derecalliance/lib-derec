@@ -83,7 +83,6 @@ pub enum Error {
 }
 
 impl Error {
-    /// If this error wraps a `NonOkStatus` from any primitive, return `(status, memo)`.
     pub fn as_non_ok_status(&self) -> Option<(i32, &str)> {
         match self {
             Error::Pairing(crate::primitives::pairing::PairingError::NonOkStatus {

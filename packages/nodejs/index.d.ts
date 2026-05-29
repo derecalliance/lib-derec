@@ -422,14 +422,10 @@ export interface PairingRequestProduceResult extends ProduceResult {
   secret_key: Uint8Array;
 }
 
-export interface AcceptResult extends ProduceResult {
+export interface PairingResponseProduceResult extends ProduceResult {
   peer_transport_protocol: TransportProtocol;
 
   shared_key: Uint8Array;
-}
-
-export interface RejectResult extends ProduceResult {
-  peer_transport_protocol: TransportProtocol;
 }
 
 export interface PairingProcessResult {
@@ -507,19 +503,12 @@ export declare const primitives: {
       extract(envelope_bytes: Uint8Array, secret_key: Uint8Array): { request: PairRequestMessage };
     };
     response: {
-      accept(
+      produce(
         kind: SenderKind,
         request: PairRequestMessage,
         secret_key: Uint8Array,
         communication_info: CommunicationInfo | null,
-      ): AcceptResult;
-      reject(
-        kind: SenderKind,
-        request: PairRequestMessage,
-        status: number,
-        memo: string,
-        communication_info: CommunicationInfo | null,
-      ): RejectResult;
+      ): PairingResponseProduceResult;
 
       extract(envelope_bytes: Uint8Array, secret_key: Uint8Array): { response: PairResponseMessage };
       process(

@@ -38,7 +38,7 @@ pub(in crate::protocol) fn handle(
     }
 }
 
-#[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
+#[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(secret_id = secret_id)))]
 pub(in crate::protocol) async fn start<
     Ch: DeRecChannelStore,
     Sh: DeRecShareStore,
@@ -55,122 +55,33 @@ pub(in crate::protocol) async fn start<
     keep_versions_count: usize,
     secret_id: u64,
 ) -> Result<(u32, Vec<ChannelId>)> {
-    let all_channels = channel_store.channels().await?;
-    if all_channels.is_empty() {
-        return Err(Error::InvalidInput("no paired helpers available"));
-    }
-    let channel_ids: Vec<ChannelId> = all_channels.iter().map(|c| c.id).collect();
-    let mut keys: std::collections::HashMap<ChannelId, SharedKey> = secret_store
-        .load_many(&channel_ids, SecretKind::SharedKey, MissingPolicy::Fail)
-        .await?
-        .into_iter()
-        .filter_map(|(cid, v)| match v {
-            SecretValue::SharedKey(k) => Some((cid, k)),
-            _ => None,
-        })
-        .collect();
+    let paired_helpers = load_paired_helpers(channel_store, secret_store).await?;
 
-    let paired_helpers: Vec<(crate::types::Channel, SharedKey)> = all_channels
-        .into_iter()
-        .map(|channel| {
-            let key = keys
-                .remove(&channel.id)
-                .expect("load_many(MissingPolicy::Fail) guarantees an entry per id");
-            (channel, key)
-        })
-        .collect();
+    let secret_data = build_secret_container(&paired_helpers, secrets, threshold);
 
-    // Copy the channel's app-level identity metadata verbatim into the
-    // bag's per-helper record. The protocol never inspects keys — the
-    // recovering owner's app reads whatever the producer put there.
-    let helper_infos: Vec<HelperInfo> = paired_helpers
-        .iter()
-        .map(|(channel, shared_key)| HelperInfo {
-            channel_id: channel.id.0,
-            transport_uri: channel.transport.uri.to_owned(),
-            shared_key: shared_key.to_vec(),
-            communication_info: channel.communication_info.clone(),
-        })
-        .collect();
-
-    let bag = SecretContainer {
-        helpers: helper_infos,
-        secrets,
-    };
-    let bag_bytes = bag.encode_to_vec();
-
-    let derec_secret = DeRecSecret {
-        secret_data: bag_bytes,
-        creation_time: None,
-        helper_threshold_for_recovery: threshold as i64,
-        helper_threshold_for_confirming_share_receipt: threshold as i64,
-        helpers: Vec::new(),
-    };
-    let secret_data = derec_secret.encode_to_vec();
-
-    let version = share_store.latest_version().await?.map_or(1, |v| v + 1);
-
-    let keep_list: Vec<u32> = {
-        let start = version
-            .saturating_sub(keep_versions_count as u32 - 1)
-            .max(1);
-        (start..=version).collect()
-    };
-
-    let helper_channel_ids: Vec<ChannelId> = paired_helpers.iter().map(|(ch, _)| ch.id).collect();
-    let result = split(
-        &helper_channel_ids,
-        secret_id,
-        version,
+    distribute_shares(
+        share_store,
+        transport,
+        &paired_helpers,
         &secret_data,
         threshold,
-    )?;
-
-    let desc = description.as_deref().unwrap_or("");
-    let mut sent_channels: Vec<ChannelId> = Vec::new();
-
-    for (channel, shared_key) in &paired_helpers {
-        let Some(committed_share) = result.shares.get(&channel.id) else {
-            continue;
-        };
-
-        let msg = produce_store_share_request_message(
-            channel.id,
-            version,
-            secret_id,
-            committed_share,
-            &keep_list,
-            desc,
-            shared_key,
-        )?;
-        transport.send(&channel.transport, msg.envelope).await?;
-
-        share_store
-            .save(
-                channel.id,
-                Share {
-                    secret_id,
-                    version,
-                    bytes: committed_share.encode_to_vec(),
-                },
-            )
-            .await?;
-
-        sent_channels.push(channel.id);
-
-        #[cfg(feature = "logging")]
-        tracing::debug!(channel_id = channel.id.0, "share envelope sent");
-    }
-
-    #[cfg(feature = "logging")]
-    tracing::info!(version = version, "secret bag distributed to helpers");
-
-    Ok((version, sent_channels))
+        keep_versions_count,
+        secret_id,
+        description.as_deref().unwrap_or(""),
+    )
+    .await
 }
 
 #[cfg_attr(
     feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0, version = request.version))
+    tracing::instrument(
+        skip_all,
+        fields(
+            channel_id = channel_id.0,
+            secret_id = request.secret_id,
+            version = request.version
+        )
+    )
 )]
 pub(in crate::protocol) async fn accept<
     Ch: DeRecChannelStore,
@@ -184,6 +95,7 @@ pub(in crate::protocol) async fn accept<
     request: &StoreShareRequestMessage,
     shared_key: &SharedKey,
 ) -> Result<Vec<DeRecEvent>> {
+    let secret_id = request.secret_id;
     let version = request.version;
     let encoded_request = request.encode_to_vec();
     let resp = sharing_response::produce(channel_id, request, shared_key)?;
@@ -192,7 +104,7 @@ pub(in crate::protocol) async fn accept<
         .save(
             channel_id,
             Share {
-                secret_id: request.secret_id,
+                secret_id,
                 version,
                 bytes: encoded_request,
             },
@@ -203,7 +115,12 @@ pub(in crate::protocol) async fn accept<
     transport.send(&endpoint, resp.envelope).await?;
 
     #[cfg(feature = "logging")]
-    tracing::info!("share stored and acknowledged");
+    tracing::info!(
+        channel_id = channel_id.0,
+        secret_id = secret_id,
+        version = version,
+        "share stored and acknowledged"
+    );
 
     Ok(vec![DeRecEvent::ShareStored {
         channel_id,
@@ -213,7 +130,14 @@ pub(in crate::protocol) async fn accept<
 
 #[cfg_attr(
     feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+    tracing::instrument(
+        skip_all,
+        fields(
+            channel_id = channel_id.0,
+            secret_id = request.secret_id,
+            version = request.version
+        )
+    )
 )]
 pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport>(
     channel_store: &mut Ch,
@@ -240,12 +164,30 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
         MessageBody::StoreShareResponse(response),
         shared_key,
     )
-    .await
+    .await?;
+
+    #[cfg(feature = "logging")]
+    tracing::info!(
+        channel_id = channel_id.0,
+        secret_id = request.secret_id,
+        version = request.version,
+        status = status as i32,
+        "share rejection sent"
+    );
+
+    Ok(())
 }
 
 #[cfg_attr(
     feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0, version = request.version))
+    tracing::instrument(
+        skip_all,
+        fields(
+            channel_id = channel_id.0,
+            secret_id = request.secret_id,
+            version = request.version
+        )
+    )
 )]
 fn on_request(
     channel_id: ChannelId,
@@ -264,7 +206,14 @@ fn on_request(
 
 #[cfg_attr(
     feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0, version = response.version))
+    tracing::instrument(
+        skip_all,
+        fields(
+            channel_id = channel_id.0,
+            secret_id = response.secret_id,
+            version = response.version
+        )
+    )
 )]
 fn on_response(
     channel_id: ChannelId,
@@ -274,7 +223,12 @@ fn on_response(
     match sharing_response::process(version, response) {
         Ok(()) => {
             #[cfg(feature = "logging")]
-            tracing::info!("share confirmed by helper");
+            tracing::info!(
+                channel_id = channel_id.0,
+                secret_id = response.secret_id,
+                version = version,
+                "share confirmed by helper"
+            );
 
             Ok(vec![DeRecEvent::ShareConfirmed {
                 channel_id,
@@ -284,7 +238,14 @@ fn on_response(
         Err(err) => {
             if let Some((status, memo)) = err.as_non_ok_status() {
                 #[cfg(feature = "logging")]
-                tracing::warn!(status, memo, "share rejected by helper");
+                tracing::warn!(
+                    channel_id = channel_id.0,
+                    secret_id = response.secret_id,
+                    version = version,
+                    status,
+                    memo,
+                    "share rejected by helper"
+                );
 
                 Ok(vec![DeRecEvent::ShareRejected {
                     channel_id,
@@ -297,4 +258,146 @@ fn on_response(
             }
         }
     }
+}
+
+async fn load_paired_helpers<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
+    channel_store: &mut Ch,
+    secret_store: &mut Ss,
+) -> Result<Vec<(crate::types::Channel, SharedKey)>> {
+    let all_channels = channel_store.channels().await?;
+    if all_channels.is_empty() {
+        return Err(Error::InvalidInput("no paired helpers available"));
+    }
+
+    let channel_ids: Vec<ChannelId> = all_channels.iter().map(|c| c.id).collect();
+    let mut keys: std::collections::HashMap<ChannelId, SharedKey> = secret_store
+        .load_many(&channel_ids, SecretKind::SharedKey, MissingPolicy::Fail)
+        .await?
+        .into_iter()
+        .filter_map(|(cid, v)| match v {
+            SecretValue::SharedKey(k) => Some((cid, k)),
+            _ => None,
+        })
+        .collect();
+
+    let paired_helpers = all_channels
+        .into_iter()
+        .map(|channel| {
+            let key = keys
+                .remove(&channel.id)
+                .expect("load_many(MissingPolicy::Fail) guarantees an entry per id");
+            (channel, key)
+        })
+        .collect();
+
+    Ok(paired_helpers)
+}
+
+fn build_secret_container(
+    paired_helpers: &[(crate::types::Channel, SharedKey)],
+    secrets: Vec<UserSecret>,
+    threshold: usize,
+) -> Vec<u8> {
+    let helper_infos: Vec<HelperInfo> = paired_helpers
+        .iter()
+        .map(|(channel, shared_key)| HelperInfo {
+            channel_id: channel.id.0,
+            transport_uri: channel.transport.uri.to_owned(),
+            shared_key: shared_key.to_vec(),
+            communication_info: channel.communication_info.clone(),
+        })
+        .collect();
+
+    let bag = SecretContainer {
+        helpers: helper_infos,
+        secrets,
+    };
+    let bag_bytes = bag.encode_to_vec();
+
+    let derec_secret = DeRecSecret {
+        secret_data: bag_bytes,
+        creation_time: None,
+        helper_threshold_for_recovery: threshold as i64,
+        helper_threshold_for_confirming_share_receipt: threshold as i64,
+        helpers: Vec::new(),
+    };
+    derec_secret.encode_to_vec()
+}
+
+#[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(secret_id = secret_id)))]
+async fn distribute_shares<Sh: DeRecShareStore, T: DeRecTransport>(
+    share_store: &mut Sh,
+    transport: &T,
+    paired_helpers: &[(crate::types::Channel, SharedKey)],
+    secret_data: &[u8],
+    threshold: usize,
+    keep_versions_count: usize,
+    secret_id: u64,
+    description: &str,
+) -> Result<(u32, Vec<ChannelId>)> {
+    let version = share_store.latest_version().await?.map_or(1, |v| v + 1);
+
+    let keep_list: Vec<u32> = {
+        let start = version
+            .saturating_sub(keep_versions_count as u32 - 1)
+            .max(1);
+        (start..=version).collect()
+    };
+
+    let helper_channel_ids: Vec<ChannelId> = paired_helpers.iter().map(|(ch, _)| ch.id).collect();
+    let result = split(
+        &helper_channel_ids,
+        secret_id,
+        version,
+        secret_data,
+        threshold,
+    )?;
+
+    let mut sent_channels: Vec<ChannelId> = Vec::new();
+    for (channel, shared_key) in paired_helpers {
+        let Some(committed_share) = result.shares.get(&channel.id) else {
+            continue;
+        };
+
+        let msg = produce_store_share_request_message(
+            channel.id,
+            version,
+            secret_id,
+            committed_share,
+            &keep_list,
+            description,
+            shared_key,
+        )?;
+        transport.send(&channel.transport, msg.envelope).await?;
+
+        share_store
+            .save(
+                channel.id,
+                Share {
+                    secret_id,
+                    version,
+                    bytes: committed_share.encode_to_vec(),
+                },
+            )
+            .await?;
+
+        sent_channels.push(channel.id);
+
+        #[cfg(feature = "logging")]
+        tracing::debug!(
+            channel_id = channel.id.0,
+            secret_id = secret_id,
+            version = version,
+            "share envelope sent"
+        );
+    }
+
+    #[cfg(feature = "logging")]
+    tracing::info!(
+        secret_id = secret_id,
+        version = version,
+        "secret bag distributed to helpers"
+    );
+
+    Ok((version, sent_channels))
 }

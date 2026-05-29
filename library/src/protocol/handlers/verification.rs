@@ -41,7 +41,10 @@ pub(in crate::protocol) async fn handle<Sh: DeRecShareStore>(
     }
 }
 
-#[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(version = version)))]
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(secret_id = secret_id, version = version))
+)]
 pub(in crate::protocol) async fn start<
     Ch: DeRecChannelStore,
     Ss: DeRecSecretStore,
@@ -86,20 +89,36 @@ pub(in crate::protocol) async fn start<
             produce_verify_share_request_message(channel_id, secret_id, version, &shared_key)?;
 
         #[cfg(feature = "logging")]
-        tracing::debug!(channel_id = channel_id.0, "verification challenge sent");
+        tracing::debug!(
+            channel_id = channel_id.0,
+            secret_id = secret_id,
+            version = version,
+            "verification challenge sent"
+        );
 
         transport.send(&endpoint, msg.envelope).await?;
     }
 
     #[cfg(feature = "logging")]
-    tracing::info!("verification challenges sent");
+    tracing::info!(
+        secret_id = secret_id,
+        version = version,
+        "verification challenges sent"
+    );
 
     Ok(())
 }
 
 #[cfg_attr(
     feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0, version = request.version))
+    tracing::instrument(
+        skip_all,
+        fields(
+            channel_id = channel_id.0,
+            secret_id = request.secret_id,
+            version = request.version
+        )
+    )
 )]
 pub(in crate::protocol) async fn accept<
     Ch: DeRecChannelStore,
@@ -131,14 +150,26 @@ pub(in crate::protocol) async fn accept<
     transport.send(&endpoint, resp.envelope).await?;
 
     #[cfg(feature = "logging")]
-    tracing::info!("verification response sent");
+    tracing::info!(
+        channel_id = channel_id.0,
+        secret_id = request.secret_id,
+        version = request.version,
+        "verification response sent"
+    );
 
     Ok(vec![DeRecEvent::NoOp])
 }
 
 #[cfg_attr(
     feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+    tracing::instrument(
+        skip_all,
+        fields(
+            channel_id = channel_id.0,
+            secret_id = request.secret_id,
+            version = request.version
+        )
+    )
 )]
 pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport>(
     channel_store: &mut Ch,
@@ -172,7 +203,14 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
 
 #[cfg_attr(
     feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0, version = request.version))
+    tracing::instrument(
+        skip_all,
+        fields(
+            channel_id = channel_id.0,
+            secret_id = request.secret_id,
+            version = request.version
+        )
+    )
 )]
 fn on_request(
     channel_id: ChannelId,
@@ -191,7 +229,14 @@ fn on_request(
 
 #[cfg_attr(
     feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0, version = response.version))
+    tracing::instrument(
+        skip_all,
+        fields(
+            channel_id = channel_id.0,
+            secret_id = response.secret_id,
+            version = response.version
+        )
+    )
 )]
 async fn on_response<Sh: DeRecShareStore>(
     share_store: &mut Sh,
@@ -217,7 +262,12 @@ async fn on_response<Sh: DeRecShareStore>(
     }
 
     #[cfg(feature = "logging")]
-    tracing::info!("share verified");
+    tracing::info!(
+        channel_id = channel_id.0,
+        secret_id = response.secret_id,
+        version = version,
+        "share verified"
+    );
 
     Ok(vec![DeRecEvent::ShareVerified {
         channel_id,

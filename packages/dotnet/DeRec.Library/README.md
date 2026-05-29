@@ -68,26 +68,29 @@ var pairRequest = Pairing.Request.Produce(
     new TransportProtocol("https://example.com/helper"),
     contact.ContactMessage);
 
-// Step 3: Initiator extracts the request, then accepts to derive the shared key.
+// Step 3: Initiator extracts the request, then produces the response and derives the shared key.
 var extractedRequest = Pairing.Request.Extract(pairRequest.Envelope, contact.SecretKeyMaterial);
-var accepted = Pairing.Response.Accept(
+var produced = Pairing.Response.Produce(
     Pairing.SenderKind.Owner,
     extractedRequest.RequestProtoBytes,
     contact.SecretKeyMaterial);
 
 // Step 4: Responder extracts the response, then derives the same shared key.
-var extractedResponse = Pairing.Response.Extract(accepted.Envelope, pairRequest.SecretKeyMaterial);
+var extractedResponse = Pairing.Response.Extract(produced.Envelope, pairRequest.SecretKeyMaterial);
 var processed = Pairing.Response.Process(
     pairRequest.InitiatorContactMessage,
     extractedResponse.ResponseProtoBytes,
     pairRequest.SecretKeyMaterial);
 
-// accepted.SharedKey  ==  processed.SharedKey
+// produced.SharedKey  ==  processed.SharedKey
 ```
 
-To reject instead of accept, call `Pairing.Response.Reject(kind, requestProtoBytes, statusEnum, memo)`.
-A typed `DeRecException` (with `Code == DeRecCode.NonOkStatus`, plus `PeerStatus` / `PeerMemo`)
-is thrown from `Process` when the peer rejected.
+To reject a pairing request, build a `PairResponseMessage` with a non-OK
+`StatusEnum` and encrypt it against `request.ecies_public_key` using the
+pairing envelope primitives. The higher-level `DeRecProtocol` orchestrator's
+`reject` method does this for you. A typed `DeRecException`
+(`Code == DeRecCode.NonOkStatus`, plus `PeerStatus` / `PeerMemo`) is thrown
+from `Process` when the peer rejected.
 
 ---
 

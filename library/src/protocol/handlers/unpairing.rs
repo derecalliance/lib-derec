@@ -249,10 +249,7 @@ async fn resolve_target<Ch: DeRecChannelStore>(
     })
 }
 
-/// Drop every piece of state the protocol holds for `channel_id`.
-///
-/// Idempotent — non-existent entries are no-ops.
-pub(super) async fn drop_channel_state<
+pub(in crate::protocol) async fn drop_channel_state<
     Ch: DeRecChannelStore,
     Sh: DeRecShareStore,
     Ss: DeRecSecretStore,
@@ -265,7 +262,7 @@ pub(super) async fn drop_channel_state<
     share_store.remove_channel(channel_id).await?;
 
     // TODO: These removes should be condensed intoa  single function, many implementations might
-    // want to have these atomic and ina single db rount-trip
+    // want to have these atomic and in single db rount-trip
     let _ = secret_store.remove(channel_id, SecretKind::SharedKey).await;
     let _ = secret_store
         .remove(channel_id, SecretKind::PairingSecret)
@@ -276,40 +273,4 @@ pub(super) async fn drop_channel_state<
 
     let _ = channel_store.remove(channel_id).await?;
     Ok(())
-}
-
-pub(in crate::protocol) async fn check_timeouts<
-    Ch: DeRecChannelStore,
-    Sh: DeRecShareStore,
-    Ss: DeRecSecretStore,
->(
-    channel_store: &mut Ch,
-    share_store: &mut Sh,
-    secret_store: &mut Ss,
-    pending_unpair: &mut std::collections::HashMap<ChannelId, u64>,
-    now: u64,
-    timeout_secs: u64,
-) -> Vec<DeRecEvent> {
-    let expired: Vec<ChannelId> = pending_unpair
-        .iter()
-        .filter_map(|(cid, started_at)| {
-            if now.saturating_sub(*started_at) > timeout_secs {
-                Some(*cid)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let mut events = Vec::with_capacity(expired.len());
-    for cid in expired {
-        pending_unpair.remove(&cid);
-        if drop_channel_state(channel_store, share_store, secret_store, cid)
-            .await
-            .is_ok()
-        {
-            events.push(DeRecEvent::Unpaired { channel_id: cid });
-        }
-    }
-    events
 }

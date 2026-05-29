@@ -33,20 +33,12 @@ internal static class Pairing
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    internal struct AcceptPairRequestMessageResult
+    internal struct ProducePairResponseMessageResult
     {
         public DeRecError Error;
         public Buffer ResponseWireBytes;
         public Buffer PeerTransportProtocol;
         public Buffer SharedKey;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    internal struct RejectPairRequestMessageResult
-    {
-        public DeRecError Error;
-        public Buffer ResponseWireBytes;
-        public Buffer PeerTransportProtocol;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -91,24 +83,12 @@ internal static class Pairing
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
-    internal static extern AcceptPairRequestMessageResult accept_pair_request_message(
+    internal static extern ProducePairResponseMessageResult produce_pair_response_message(
         int senderKind,
         byte[] requestProtoBytes,
         UIntPtr requestProtoBytesLen,
         byte[] secretKeyMaterial,
         UIntPtr secretKeyMaterialLen,
-        byte[]? communicationInfoBytes,
-        UIntPtr communicationInfoBytesLen
-    );
-
-    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
-    internal static extern RejectPairRequestMessageResult reject_pair_request_message(
-        int senderKind,
-        byte[] requestProtoBytes,
-        UIntPtr requestProtoBytesLen,
-        int statusEnum,
-        byte[] memoBytes,
-        UIntPtr memoBytesLen,
         byte[]? communicationInfoBytes,
         UIntPtr communicationInfoBytesLen
     );

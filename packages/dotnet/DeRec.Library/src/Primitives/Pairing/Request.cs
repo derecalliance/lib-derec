@@ -26,7 +26,7 @@ public static partial class Pairing
             public required ulong ChannelId { get; init; }
             /// <summary>
             /// Inner <c>PairRequestMessage</c> proto bytes for chaining into
-            /// <see cref="Response.Accept"/> or <see cref="Response.Reject"/>.
+            /// <see cref="Response.Produce"/>.
             /// </summary>
             public required byte[] RequestProtoBytes { get; init; }
         }

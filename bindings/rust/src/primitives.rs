@@ -3,7 +3,7 @@
 //! Exercises each flow's `produce` / `extract` / `process` round-trip directly
 //! (no `DeRecProtocol` orchestrator). Signatures here track the post-refactor
 //! API: numeric `secret_id: u64`, `version: u32`, pairing responses via
-//! `response::accept`, and recovery driven by re-using the Helper's stored
+//! `response::produce`, and recovery driven by re-using the Helper's stored
 //! `StoreShareRequestMessage`.
 
 use derec_library::primitives::discovery::{
@@ -102,15 +102,14 @@ fn run_pairing_flow_test() {
         pair_request::extract(&pair_req.envelope, contact_result.secret_key.ecies_secret_key())
             .expect("pair_request::extract failed");
 
-    // Initiator accepts the request, derives its shared key, and produces the
-    // pairing response (was `response::produce` in the pre-refactor API).
-    let pair_resp = pair_response::accept(
+    // Initiator produces the pairing response and derives its shared key.
+    let pair_resp = pair_response::produce(
         SenderKind::Owner,
         &extracted_request.request,
         &contact_result.secret_key,
         None,
     )
-    .expect("pair_response::accept failed");
+    .expect("pair_response::produce failed");
 
     assert!(
         !pair_resp.envelope.is_empty(),

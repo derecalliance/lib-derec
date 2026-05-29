@@ -38,7 +38,10 @@ pub(in crate::protocol) fn handle(
     }
 }
 
-#[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(version = version)))]
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(secret_id = secret_id, version = version))
+)]
 pub(in crate::protocol) async fn start<
     Ch: DeRecChannelStore,
     Ss: DeRecSecretStore,
@@ -76,14 +79,16 @@ pub(in crate::protocol) async fn start<
         #[cfg(feature = "logging")]
         tracing::debug!(
             channel_id = channel.id.0,
-            version = version,
+            secret_id,
+            version,
             "share request sent"
         );
     }
 
     #[cfg(feature = "logging")]
     tracing::info!(
-        version = version,
+        secret_id,
+        version,
         "share requests dispatched to all helpers"
     );
 
@@ -92,7 +97,14 @@ pub(in crate::protocol) async fn start<
 
 #[cfg_attr(
     feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0, version = request.version))
+    tracing::instrument(
+        skip_all,
+        fields(
+            channel_id = channel_id.0,
+            secret_id = request.secret_id,
+            version = request.version
+        )
+    )
 )]
 pub(in crate::protocol) async fn accept<
     Ch: DeRecChannelStore,
@@ -125,14 +137,26 @@ pub(in crate::protocol) async fn accept<
     transport.send(&endpoint, resp.envelope).await?;
 
     #[cfg(feature = "logging")]
-    tracing::info!("recovery share response sent");
+    tracing::info!(
+        channel_id = channel_id.0,
+        secret_id = request.secret_id,
+        version = request.version,
+        "recovery share response sent"
+    );
 
     Ok(vec![DeRecEvent::NoOp])
 }
 
 #[cfg_attr(
     feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+    tracing::instrument(
+        skip_all,
+        fields(
+            channel_id = channel_id.0,
+            secret_id = request.secret_id,
+            version = request.version
+        )
+    )
 )]
 pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport>(
     channel_store: &mut Ch,
@@ -167,7 +191,14 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
 
 #[cfg_attr(
     feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+    tracing::instrument(
+        skip_all,
+        fields(
+            channel_id = channel_id.0,
+            secret_id = request.secret_id,
+            version = request.version
+        )
+    )
 )]
 fn on_request(
     channel_id: ChannelId,
@@ -186,7 +217,14 @@ fn on_request(
 
 #[cfg_attr(
     feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+    tracing::instrument(
+        skip_all,
+        fields(
+            channel_id = channel_id.0,
+            secret_id = response.secret_id,
+            version = response.version
+        )
+    )
 )]
 fn on_response(
     pending_recovery: &mut PendingRecovery,
@@ -197,15 +235,11 @@ fn on_response(
     let (secret_id, version) = key;
 
     let Some(bucket) = pending_recovery.get_mut(&key) else {
-        // Stale response from an abandoned or already-completed recovery,
-        // or a response for a recovery this Owner never initiated. Drop it
-        // — log at debug so operators can spot timing issues without
-        // surfacing every misdelivered share.
         #[cfg(feature = "logging")]
         tracing::debug!(
+            channel_id = channel_id.0,
             secret_id,
             version,
-            channel_id = channel_id.0,
             "recovery response has no matching pending recovery; dropping"
         );
         return Ok(vec![DeRecEvent::NoOp]);
@@ -221,7 +255,9 @@ fn on_response(
 
             #[cfg(feature = "logging")]
             tracing::info!(
-                version = version,
+                channel_id = channel_id.0,
+                secret_id,
+                version,
                 shares_received,
                 "secret reconstructed from shares"
             );
@@ -238,9 +274,10 @@ fn on_response(
         {
             #[cfg(feature = "logging")]
             tracing::debug!(
-                version = version,
-                shares_received,
                 channel_id = channel_id.0,
+                secret_id,
+                version,
+                shares_received,
                 "reconstruction not yet possible — insufficient shares"
             );
 
@@ -252,9 +289,10 @@ fn on_response(
         Err(e) => {
             #[cfg(feature = "logging")]
             tracing::warn!(
-                version = version,
-                shares_received,
                 channel_id = channel_id.0,
+                secret_id,
+                version,
+                shares_received,
                 error = %e,
                 "recovery share response received but reconstruction failed"
             );

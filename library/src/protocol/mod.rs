@@ -581,15 +581,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
 
         let mut start_events = std::mem::take(&mut self.pending_start_events);
         let mut timeout_events = self.check_sharing_round_timeouts();
-        let mut unpair_timeout_events = handlers::unpairing::check_timeouts(
-            &mut self.channel_store,
-            &mut self.share_store,
-            &mut self.secret_store,
-            &mut self.pending_unpair,
-            now_secs(),
-            self.timeout_in_secs,
-        )
-        .await;
+        let mut unpair_timeout_events = self.check_unpair_timeouts().await;
 
         let envelope = DeRecMessage::decode(message).map_err(|e| ProcessError {
             channel_id: None,
@@ -809,6 +801,40 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                 version,
                 "sharing round: helper timed out"
             );
+        }
+        events
+    }
+
+    /// Drop local state for any pending unpair whose acknowledgement window has
+    /// elapsed, returning an `Unpaired` event per dropped channel.
+    async fn check_unpair_timeouts(&mut self) -> Vec<DeRecEvent> {
+        let now = now_secs();
+        let expired: Vec<ChannelId> = self
+            .pending_unpair
+            .iter()
+            .filter_map(|(cid, started_at)| {
+                if now.saturating_sub(*started_at) > self.timeout_in_secs {
+                    Some(*cid)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut events = Vec::with_capacity(expired.len());
+        for cid in expired {
+            self.pending_unpair.remove(&cid);
+            if handlers::unpairing::drop_channel_state(
+                &mut self.channel_store,
+                &mut self.share_store,
+                &mut self.secret_store,
+                cid,
+            )
+            .await
+            .is_ok()
+            {
+                events.push(DeRecEvent::Unpaired { channel_id: cid });
+            }
         }
         events
     }

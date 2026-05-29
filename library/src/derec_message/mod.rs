@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{primitives::pairing::PairingError, types::SharedKey};
+use derec_cryptography::pairing::PairingSecretKeyMaterial;
+use derec_proto::MessageBody;
 
 mod builder;
 pub use builder::*;
-
 mod error;
-use derec_cryptography::pairing::PairingSecretKeyMaterial;
-use derec_proto::MessageBody;
 pub use error::*;
 
 #[cfg(test)]

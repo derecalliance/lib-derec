@@ -1,16 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::time::SystemTime;
-
-// use derec_cryptography::envelope::{encryption, signing};
 use thiserror::Error;
 
-/// Errors that can occur while constructing a [`DeRecMessage`] with
-/// [`DeRecMessageBuilder`].
-///
-/// These errors represent missing required envelope fields or structural
-/// violations such as mixing Owner-side and Helper-side message bodies
-/// in the same envelope.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum DeRecMessageBuilderError {

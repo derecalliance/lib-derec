@@ -10,7 +10,6 @@ pub(crate) fn generate_seed<const N: usize>() -> Zeroizing<[u8; N]> {
     entropy
 }
 
-/// Returns the current unix timestamp in seconds.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn now_secs() -> u64 {
     SystemTime::now()

@@ -9,22 +9,21 @@
 //!
 //! [`PairingSecretKeyMaterial`] is serialized into an opaque FFI-specific
 //! blob. Persist it and feed it back into [`extract_pair_request`] /
-//! [`accept_pair_request_message`] / [`reject_pair_request_message`] (on the
-//! contact-initiator side) or [`extract_pair_response`] /
-//! [`process_pair_response_message`] (on the contact-responder side).
+//! [`produce_pair_response_message`] (on the contact-initiator side) or
+//! [`extract_pair_response`] / [`process_pair_response_message`] (on the
+//! contact-responder side).
 
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 
 use crate::ffi::common::{DeRecBuffer, empty_buffer, vec_into_buffer};
 use crate::ffi::error::{
-    DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_BAD_SHARED_KEY, DEREC_CODE_FFI_BAD_UTF8,
-    DEREC_CODE_FFI_INVALID_ENUM, DEREC_CODE_FFI_NULL_PTR, DeRecError, ffi_error, from_lib_error,
-    success,
+    DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_BAD_SHARED_KEY, DEREC_CODE_FFI_INVALID_ENUM,
+    DEREC_CODE_FFI_NULL_PTR, DeRecError, ffi_error, from_lib_error, success,
 };
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{
     CommunicationInfo, ContactMessage, DeRecMessage, PairRequestMessage, PairResponseMessage,
-    SenderKind, StatusEnum, TransportProtocol,
+    SenderKind, TransportProtocol,
 };
 use prost::Message as _;
 
@@ -50,23 +49,16 @@ pub struct ExtractPairRequestResult {
     pub error: DeRecError,
     pub channel_id: u64,
     /// Inner `PairRequestMessage` proto bytes for chaining into
-    /// [`accept_pair_request_message`] or [`reject_pair_request_message`].
+    /// [`produce_pair_response_message`].
     pub request_proto_bytes: DeRecBuffer,
 }
 
 #[repr(C)]
-pub struct AcceptPairRequestMessageResult {
+pub struct ProducePairResponseMessageResult {
     pub error: DeRecError,
     pub response_wire_bytes: DeRecBuffer,
     pub peer_transport_protocol: DeRecBuffer,
     pub shared_key: DeRecBuffer,
-}
-
-#[repr(C)]
-pub struct RejectPairRequestMessageResult {
-    pub error: DeRecError,
-    pub response_wire_bytes: DeRecBuffer,
-    pub peer_transport_protocol: DeRecBuffer,
 }
 
 #[repr(C)]
@@ -255,7 +247,7 @@ pub extern "C" fn extract_pair_request(
 ///
 /// Non-null input pointers must point to the corresponding readable byte ranges.
 #[unsafe(no_mangle)]
-pub extern "C" fn accept_pair_request_message(
+pub extern "C" fn produce_pair_response_message(
     sender_kind: i32,
     request_proto_ptr: *const u8,
     request_proto_len: usize,
@@ -263,8 +255,8 @@ pub extern "C" fn accept_pair_request_message(
     secret_key_material_len: usize,
     communication_info_ptr: *const u8,
     communication_info_len: usize,
-) -> AcceptPairRequestMessageResult {
-    let with_err = |error| AcceptPairRequestMessageResult {
+) -> ProducePairResponseMessageResult {
+    let with_err = |error| ProducePairResponseMessageResult {
         error,
         response_wire_bytes: empty_buffer(),
         peer_transport_protocol: empty_buffer(),
@@ -305,108 +297,17 @@ pub extern "C" fn accept_pair_request_message(
             Err(e) => return with_err(e),
         };
 
-    match crate::primitives::pairing::response::accept(
+    match crate::primitives::pairing::response::produce(
         sender_kind,
         &request,
         &pairing_secret_key_material,
         communication_info,
     ) {
-        Ok(r) => AcceptPairRequestMessageResult {
+        Ok(r) => ProducePairResponseMessageResult {
             error: success(),
             response_wire_bytes: vec_into_buffer(r.envelope),
             peer_transport_protocol: vec_into_buffer(r.peer_transport_protocol.encode_to_vec()),
             shared_key: vec_into_buffer(r.shared_key.to_vec()),
-        },
-        Err(e) => with_err(from_lib_error(e)),
-    }
-}
-
-/// `request_proto_ptr` / `request_proto_len` must be the `request_proto_bytes`
-/// returned by [`extract_pair_request`]. `status_enum` is the raw `i32` value
-/// of [`StatusEnum`].
-///
-/// # Safety
-///
-/// Non-null input pointers must point to the corresponding readable byte ranges.
-#[unsafe(no_mangle)]
-pub extern "C" fn reject_pair_request_message(
-    sender_kind: i32,
-    request_proto_ptr: *const u8,
-    request_proto_len: usize,
-    status_enum: i32,
-    memo_ptr: *const u8,
-    memo_len: usize,
-    communication_info_ptr: *const u8,
-    communication_info_len: usize,
-) -> RejectPairRequestMessageResult {
-    let with_err = |error| RejectPairRequestMessageResult {
-        error,
-        response_wire_bytes: empty_buffer(),
-        peer_transport_protocol: empty_buffer(),
-    };
-
-    let sender_kind = match SenderKind::try_from(sender_kind) {
-        Ok(v) => v,
-        Err(_) => {
-            return with_err(ffi_error(
-                DEREC_CODE_FFI_INVALID_ENUM,
-                format!("invalid SenderKind value: {sender_kind}"),
-            ));
-        }
-    };
-    let status_enum_value = match StatusEnum::try_from(status_enum) {
-        Ok(v) => v,
-        Err(_) => {
-            return with_err(ffi_error(
-                DEREC_CODE_FFI_INVALID_ENUM,
-                format!("invalid StatusEnum value: {status_enum}"),
-            ));
-        }
-    };
-    let request_bytes =
-        match parse_buffer(request_proto_ptr, request_proto_len, "request_proto_ptr") {
-            Ok(b) => b,
-            Err(e) => return with_err(e),
-        };
-    let request = match PairRequestMessage::decode(request_bytes) {
-        Ok(r) => r,
-        Err(e) => {
-            return with_err(ffi_error(
-                DEREC_CODE_FFI_BAD_PROTO,
-                format!("failed to decode request: {e}"),
-            ));
-        }
-    };
-    let memo_bytes = match parse_buffer(memo_ptr, memo_len, "memo_ptr") {
-        Ok(b) => b,
-        Err(e) => return with_err(e),
-    };
-    let memo = match std::str::from_utf8(memo_bytes) {
-        Ok(s) => s,
-        Err(_) => {
-            return with_err(ffi_error(
-                DEREC_CODE_FFI_BAD_UTF8,
-                "memo is not valid UTF-8",
-            ));
-        }
-    };
-    let communication_info =
-        match decode_optional_communication_info(communication_info_ptr, communication_info_len) {
-            Ok(c) => c,
-            Err(e) => return with_err(e),
-        };
-
-    match crate::primitives::pairing::response::reject(
-        sender_kind,
-        &request,
-        status_enum_value,
-        memo,
-        communication_info,
-    ) {
-        Ok(r) => RejectPairRequestMessageResult {
-            error: success(),
-            response_wire_bytes: vec_into_buffer(r.envelope),
-            peer_transport_protocol: vec_into_buffer(r.peer_transport_protocol.encode_to_vec()),
         },
         Err(e) => with_err(from_lib_error(e)),
     }

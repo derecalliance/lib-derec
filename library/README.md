@@ -168,7 +168,7 @@ The `transportUri` in protocol messages identifies the helper endpoint.
 ### Pairing Flow
 
 ```rust
-use derec_library::primitives::pairing::{request, response::{self, AcceptResult}};
+use derec_library::primitives::pairing::{request, response::{self, ProduceResult as PairResponseProduceResult}};
 use derec_library::types::ChannelId;
 use derec_proto::{Protocol, SenderKind, TransportProtocol};
 
@@ -201,14 +201,14 @@ let request::ProduceResult {
     None, // optional CommunicationInfo
 ).unwrap();
 
-// Step 3 — Initiator extracts the request and accepts it.
+// Step 3 — Initiator extracts the request and produces the response.
 let request::ExtractResult { request: pair_request } =
     request::extract(&pair_request_envelope, initiator_secret_key.ecies_secret_key()).unwrap();
-let AcceptResult {
+let PairResponseProduceResult {
     envelope: pair_response_envelope,
     shared_key: initiator_shared_key,
     ..
-} = response::accept(
+} = response::produce(
     SenderKind::Owner,
     &pair_request,
     &initiator_secret_key,
@@ -229,9 +229,10 @@ let response::ProcessResult { shared_key: responder_shared_key } =
 assert_eq!(initiator_shared_key, responder_shared_key);
 ```
 
-To reject instead of accept, use `response::reject(kind, &request, status, memo, None)`,
-which returns a `RejectResult` containing the response envelope and the peer's transport
-protocol (no shared key is derived).
+To reject the request, build a `PairResponseMessage` with a non-`Ok` `StatusEnum` and
+encrypt it with `DeRecMessageBuilder::pairing()` against the peer's
+`request.ecies_public_key`. The higher-level `DeRecProtocol` orchestrator's
+`reject` method does this for you.
 
 The `ContactMessage` is exchanged out-of-band, typically using:
 

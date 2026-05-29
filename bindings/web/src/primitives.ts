@@ -217,27 +217,27 @@ export function runPrimitivesSmoke(): void {
     null,
   );
 
-  // Initiator extracts the request and accepts it.
+  // Initiator extracts the request and produces a response.
   const { request: pairRequest }: { request: PairRequestMessage } =
     primitives.pairing.request.extract(pairingRequest.envelope, contact.secret_key);
-  const accepted = primitives.pairing.response.accept(
+  const produced = primitives.pairing.response.produce(
     SenderKind.Owner, pairRequest, contact.secret_key, null,
   );
 
   // Responder extracts the response and processes it.
   const { response: pairResponse }: { response: PairResponseMessage } =
-    primitives.pairing.response.extract(accepted.envelope, pairingRequest.secret_key);
+    primitives.pairing.response.extract(produced.envelope, pairingRequest.secret_key);
   const processed = primitives.pairing.response.process(
     pairingRequest.initiator_contact_message as ContactMessage,
     pairResponse,
     pairingRequest.secret_key,
   );
 
-  if (accepted.shared_key.length !== processed.shared_key.length ||
-      !accepted.shared_key.every((b, i) => b === processed.shared_key[i])) {
+  if (produced.shared_key.length !== processed.shared_key.length ||
+      !produced.shared_key.every((b, i) => b === processed.shared_key[i])) {
     throw new Error("pairing: shared keys do not match");
   }
-  console.log(`  shared keys match (${accepted.shared_key.length}B)  ✓`);
+  console.log(`  shared keys match (${produced.shared_key.length}B)  ✓`);
 
   console.log("✓ Pairing flow passed.\n");
 

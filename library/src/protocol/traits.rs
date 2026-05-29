@@ -75,6 +75,18 @@ pub enum SecretValue {
     PairingContact(ContactMessage),
 }
 
+/// A single stored share entry, fully self-describing.
+///
+/// - `secret_id` — numeric identifier of the secret this share belongs to.
+/// - `version`   — version number of the secret.
+/// - `bytes`     — raw encoded [`derec_proto::StoreShareRequestMessage`] bytes.
+#[derive(Debug, Clone)]
+pub struct Share {
+    pub secret_id: u64,
+    pub version: u32,
+    pub bytes: Vec<u8>,
+}
+
 /// Keychain-grade storage for cryptographic secrets.
 ///
 /// Only two kinds of material ever need special protection:
@@ -212,22 +224,7 @@ pub trait DeRecChannelStore {
     /// specific `secret_id`) or
     /// [`DeRecShareStore::load_all`](DeRecShareStore::load_all) (discovery) to
     /// aggregate shares across re-pairings without duplicating data.
-    fn linked_channels(
-        &self,
-        channel_id: ChannelId,
-    ) -> ChannelStoreFuture<'_, Vec<ChannelId>>;
-}
-
-/// A single stored share entry, fully self-describing.
-///
-/// - `secret_id` — numeric identifier of the secret this share belongs to.
-/// - `version`   — version number of the secret.
-/// - `bytes`     — raw encoded [`derec_proto::StoreShareRequestMessage`] bytes.
-#[derive(Debug, Clone)]
-pub struct Share {
-    pub secret_id: u64,
-    pub version: u32,
-    pub bytes: Vec<u8>,
+    fn linked_channels(&self, channel_id: ChannelId) -> ChannelStoreFuture<'_, Vec<ChannelId>>;
 }
 
 /// Storage backend for secret shares.
@@ -303,10 +300,7 @@ pub trait DeRecShareStore {
     /// for **discovery**, which by definition enumerates the helper's holdings
     /// before any secret is known. Domain callers (recovery, verification)
     /// must use [`load`](Self::load) or [`load_many`](Self::load_many).
-    fn load_all(
-        &self,
-        channel_ids: &[ChannelId],
-    ) -> ShareStoreFuture<'_, Vec<Share>>;
+    fn load_all(&self, channel_ids: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>>;
 
     /// Return the highest version number stored across all channels,
     /// or `None` if no shares exist yet.
@@ -326,10 +320,6 @@ pub trait DeRecShareStore {
     /// as a no-op (idempotent).
     fn remove_channel(&mut self, channel_id: ChannelId) -> ShareStoreFuture<'_, ()>;
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Transport
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Outbound transport abstraction.
 ///

@@ -6,14 +6,16 @@ use super::super::{
 };
 use crate::{
     Error, Result,
+    derec_message::{DeRecMessageBuilder, current_timestamp},
     primitives::pairing::{request, response},
     types::ChannelId,
 };
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{
-    CommunicationInfo, ContactMessage, MessageBody, PairRequestMessage, SenderKind, StatusEnum,
-    TransportProtocol,
+    CommunicationInfo, ContactMessage, DeRecResult, MessageBody, PairRequestMessage,
+    PairResponseMessage, SenderKind, StatusEnum, TransportProtocol,
 };
+use prost::Message;
 use std::collections::HashMap;
 
 #[cfg_attr(
@@ -124,7 +126,7 @@ pub(in crate::protocol) async fn accept<
     response_kind: SenderKind,
 ) -> Result<Vec<DeRecEvent>> {
     let comm_info = build_communication_info(communication_info);
-    let resp = response::accept(response_kind, request, pairing_secret, comm_info)?;
+    let resp = response::produce(response_kind, request, pairing_secret, comm_info)?;
 
     secret_store
         .save(channel_id, SecretValue::SharedKey(resp.shared_key))
@@ -182,12 +184,36 @@ pub(in crate::protocol) async fn reject<Ss: DeRecSecretStore, T: DeRecTransport>
     status: StatusEnum,
     memo: &str,
 ) -> Result<()> {
-    let comm_info = build_communication_info(communication_info);
-    let result = response::reject(response_kind, request, status, memo, comm_info)?;
+    let peer_transport_protocol =
+        request
+            .transport_protocol
+            .clone()
+            .ok_or(Error::InvalidInput(
+                "pair request missing transport endpoint",
+            ))?;
 
-    transport
-        .send(&result.peer_transport_protocol, result.envelope)
-        .await?;
+    let timestamp = current_timestamp();
+    let response = PairResponseMessage {
+        sender_kind: response_kind.into(),
+        result: Some(DeRecResult {
+            status: status as i32,
+            memo: memo.to_owned(),
+        }),
+        nonce: request.nonce,
+        communication_info: build_communication_info(communication_info),
+        parameter_range: None,
+        timestamp: Some(timestamp),
+    };
+
+    let envelope = DeRecMessageBuilder::pairing()
+        .channel_id(request.channel_id.into())
+        .timestamp(timestamp)
+        .message_body(MessageBody::PairResponse(response))
+        .encrypt_pairing(&request.ecies_public_key)?
+        .build()?
+        .encode_to_vec();
+
+    transport.send(&peer_transport_protocol, envelope).await?;
 
     secret_store
         .remove(channel_id, SecretKind::PairingSecret)
