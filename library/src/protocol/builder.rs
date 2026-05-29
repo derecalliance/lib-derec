@@ -1,27 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Typestate builder for [`DeRecProtocol`].
+//! Typestate builder for [`DeRecProtocol`]. See [`DeRecProtocolBuilder`].
 //!
-//! [`DeRecProtocolBuilder`] enforces at **compile time** that every required
-//! field is supplied before [`build`](DeRecProtocolBuilder::build) is callable.
-//! Calling `build()` on an incomplete builder is a type error — no runtime
-//! panics or `Option` unwrapping needed.
-//!
-//! # Example
-//!
-//! ```rust,ignore
-//! let protocol = DeRecProtocolBuilder::new()
-//!     .with_channel_store(my_channel_store)
-//!     .with_share_store(my_share_store)
-//!     .with_secret_store(my_secret_store)
-//!     .with_transport(my_transport)
-//!     .with_own_transport(TransportProtocol { uri: "https://me.example.com".into(), .. })
-//!     .build();
-//! ```
-//!
-//! The setters may be called in any order.
+//! Each store/transport slot is tracked by its own type parameter, starting
+//! at [`BuilderSlotMissingMarker`] and transitioning to
+//! [`BuilderSlotSetMarker<T>`] when its `with_*` setter runs. Setters only
+//! touch their own slot, which is what makes call order irrelevant.
+//! [`DeRecProtocolBuilder::build`] is reachable only when every slot has
+//! reached [`BuilderSlotSetMarker<_>`].
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use super::{
     DeRecChannelStore, DeRecProtocol, DeRecSecretStore, DeRecShareStore, DeRecTransport, UnpairAck,
@@ -34,11 +23,25 @@ pub struct BuilderSlotSetMarker<T>(T);
 
 /// Typestate builder for [`DeRecProtocol`].
 ///
-/// Start with [`DeRecProtocolBuilder::new`], call each setter, then call
-/// [`build`](DeRecProtocolBuilder::build) once all slots are filled.
+/// Call each store/transport setter, then [`build`](DeRecProtocolBuilder::build).
+/// The "every required slot is filled" constraint is enforced at compile time
+/// by the impl-block bounds — calling `build()` on an incomplete builder is a
+/// type error, not a runtime panic.
 ///
-/// Each starts as [`Missing`] and becomes [`Set<T>`] after the corresponding
-/// setter is called. `build()` is only available when all five are `Set<_>`.
+/// Setters may be called in any order.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let protocol = DeRecProtocolBuilder::new()
+///     .with_channel_store(my_channel_store)
+///     .with_share_store(my_share_store)
+///     .with_secret_store(my_secret_store)
+///     .with_transport(my_transport)
+///     .with_own_transport(TransportProtocol { uri: "https://me.example.com".into(), .. })
+///     // Plus any optional with_* setters to override defaults.
+///     .build();
+/// ```
 pub struct DeRecProtocolBuilder<ChannelStore, ShareStore, SecretStore, Transport, OwnTransport> {
     channel_store: ChannelStore,
     share_store: ShareStore,
@@ -63,8 +66,7 @@ impl
         BuilderSlotMissingMarker,
     >
 {
-    /// Create a new builder with all slots empty and sensible defaults
-    /// (`threshold = 3`, `keep_versions_count = 3`, `timeout_in_secs = 300`).
+    /// Create a new builder. See each `with_*` setter for its default value.
     pub fn new() -> Self {
         Self {
             channel_store: BuilderSlotMissingMarker,
@@ -83,58 +85,78 @@ impl
     }
 }
 
-impl Default
-    for DeRecProtocolBuilder<
-        BuilderSlotMissingMarker,
-        BuilderSlotMissingMarker,
-        BuilderSlotMissingMarker,
-        BuilderSlotMissingMarker,
-        BuilderSlotMissingMarker,
-    >
-{
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<ChannelStore, ShareStore, SecretStore, Transport, OwnTransport>
     DeRecProtocolBuilder<ChannelStore, ShareStore, SecretStore, Transport, OwnTransport>
 {
+    /// Minimum number of shares required to reconstruct the secret.
+    ///
+    /// Default: `3`.
     pub fn with_threshold(mut self, threshold: usize) -> Self {
         self.threshold = threshold;
         self
     }
 
+    /// Number of recent versions each helper must retain.
+    ///
+    /// Default: `3`.
     pub fn with_keep_versions_count(mut self, count: usize) -> Self {
         self.keep_versions_count = count;
         self
     }
 
     /// Application-provided secret identifier for this protocol instance.
+    ///
+    /// Default: `0`.
     pub fn with_secret_id(mut self, secret_id: u64) -> Self {
         self.secret_id = secret_id;
         self
     }
 
-    /// Timeout in seconds for pending channels (default: 300 = 5 minutes).
+    /// Protocol-wide staleness boundary.
     ///
-    /// Channels that remain in `Pending` status beyond this duration are
-    /// automatically removed along with their pairing keys.
-    pub fn with_timeout_in_secs(mut self, secs: u64) -> Self {
-        self.timeout_in_secs = secs;
+    /// Any inbound envelope whose timestamp is older than this is discarded
+    /// on receipt, regardless of flow.
+    ///
+    /// The same threshold is also used to age out local state that is
+    /// waiting on a peer: incomplete pairings, in-flight sharing rounds,
+    /// and outstanding unpair acknowledgements.
+    ///
+    /// # Granularity
+    ///
+    /// **One second is the smallest effective unit.** The protocol's wire
+    /// timestamps (protobuf `Timestamp.seconds`) carry only whole-second
+    /// resolution, so message ages can only be measured to the nearest
+    /// second. As a consequence:
+    ///
+    /// - sub-second precision in the supplied [`Duration`] is truncated
+    ///   ([`Duration::from_millis(2500)`](Duration::from_millis) becomes 2 seconds);
+    /// - any value below one second is clamped to one second, so an
+    ///   accidental [`Duration::ZERO`] does not silently disable the timeout.
+    ///
+    /// Default: 5 minutes.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout_in_secs = timeout.as_secs().max(1);
         self
     }
 
-    /// Key-value pairs included in `CommunicationInfo` within pairing
-    /// messages (e.g. `"name"`, `"email"`, `"phone"`).
+    /// Key-value pairs included in `CommunicationInfo` within pairing request
+    /// and response messages (e.g. `"name"`, `"email"`, `"phone"`).
+    ///
+    /// Default: empty.
     pub fn with_communication_info(mut self, info: HashMap<String, String>) -> Self {
         self.communication_info = info;
         self
     }
 
-    /// When `true`, the protocol automatically sends a failure response to the
-    /// peer when processing an inbound request fails (e.g. format errors,
-    /// decryption failures). Default: `false`.
+    /// Whether the protocol replies to peers on inbound processing failures.
+    ///
+    /// - `true`: on a failed inbound request (e.g. format errors, decryption
+    ///   failures), the protocol automatically sends a failure response to the
+    ///   peer.
+    /// - `false`: inbound processing errors are only surfaced as events and no
+    ///   response is sent — the application decides how to respond.
+    ///
+    /// Default: `false`.
     pub fn with_auto_respond_on_failure(mut self, enabled: bool) -> Self {
         self.auto_respond_on_failure = enabled;
         self
@@ -143,10 +165,12 @@ impl<ChannelStore, ShareStore, SecretStore, Transport, OwnTransport>
     /// Whether the unpair initiator waits for the peer's acknowledgement
     /// before dropping local state.
     ///
-    /// - [`UnpairAck::Required`] (default): keep state until the peer
-    ///   confirms with `Ok` or the configured protocol timeout elapses.
-    /// - [`UnpairAck::NotRequired`]: drop state immediately on
-    ///   `start(Unpair)` and ignore any later response (fire-and-forget).
+    /// - [`UnpairAck::Required`]: keep state until the peer responds with `Ok`,
+    ///   or until the timeout configured via [`Self::with_timeout`] elapses.
+    /// - [`UnpairAck::NotRequired`]: drop state immediately after sending the
+    ///   request; any later response is silently ignored.
+    ///
+    /// Default: [`UnpairAck::Required`].
     pub fn with_unpair_ack(mut self, ack: UnpairAck) -> Self {
         self.unpair_ack = ack;
         self
@@ -156,6 +180,8 @@ impl<ChannelStore, ShareStore, SecretStore, Transport, OwnTransport>
 impl<ShareStore, SecretStore, Transport, OwnTransport>
     DeRecProtocolBuilder<BuilderSlotMissingMarker, ShareStore, SecretStore, Transport, OwnTransport>
 {
+    /// Set the [`DeRecChannelStore`] implementation responsible for persisting
+    /// channel records.
     pub fn with_channel_store<Cs: DeRecChannelStore>(
         self,
         store: Cs,
@@ -192,6 +218,8 @@ impl<ChannelStore, SecretStore, Transport, OwnTransport>
         OwnTransport,
     >
 {
+    /// Set the [`DeRecShareStore`] implementation responsible for persisting
+    /// secret shares.
     pub fn with_share_store<Sh: DeRecShareStore>(
         self,
         store: Sh,
@@ -228,6 +256,8 @@ impl<ChannelStore, ShareStore, Transport, OwnTransport>
         OwnTransport,
     >
 {
+    /// Set the [`DeRecSecretStore`] implementation responsible for persisting
+    /// per-channel key material (pairing secrets, shared keys, pairing contacts).
     pub fn with_secret_store<Ss: DeRecSecretStore>(
         self,
         store: Ss,
@@ -264,6 +294,8 @@ impl<ChannelStore, ShareStore, SecretStore, OwnTransport>
         OwnTransport,
     >
 {
+    /// Set the [`DeRecTransport`] implementation responsible for delivering
+    /// outbound envelopes to peers.
     pub fn with_transport<Tr: DeRecTransport>(
         self,
         transport: Tr,
@@ -294,6 +326,10 @@ impl<ChannelStore, ShareStore, SecretStore, OwnTransport>
 impl<ChannelStore, ShareStore, SecretStore, Transport>
     DeRecProtocolBuilder<ChannelStore, ShareStore, SecretStore, Transport, BuilderSlotMissingMarker>
 {
+    /// The local node's transport endpoint that peers will use to reach it.
+    ///
+    /// Embedded into outgoing contact and pairing messages so peers know
+    /// where to send their replies.
     pub fn with_own_transport(
         self,
         own_transport: TransportProtocol,
@@ -330,6 +366,11 @@ impl<Cs: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, Tr: DeRec
         BuilderSlotSetMarker<TransportProtocol>,
     >
 {
+    /// Consume the builder and return a fully-initialized [`DeRecProtocol`].
+    ///
+    /// The "all required slots set" constraint is enforced by this impl
+    /// block's type bounds — the call is only reachable once every slot has
+    /// been filled, so there is no runtime check and no failure mode.
     pub fn build(self) -> DeRecProtocol<Cs, Sh, Ss, Tr> {
         let mut protocol = DeRecProtocol::new(
             self.channel_store.0,

@@ -7,39 +7,67 @@ use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{ContactMessage, TransportProtocol};
 use std::{future::Future, pin::Pin};
 
-// When building for WASM or FFI targets, futures are `!Send` because the
-// host environment is single-threaded or callbacks cross an FFI boundary.
-// Pure-Rust consumers get `Send` futures so they can use `tokio::spawn` directly.
-
+/// Type-erased future returned by [`DeRecSecretStore`] methods.
+///
+/// `Send` on native targets so multi-threaded executors (e.g. `tokio::spawn`)
+/// can take it; under the `ffi` feature or `wasm32` the `Send` bound is
+/// dropped because callbacks cross an FFI boundary or run in a
+/// single-threaded host. Sync backends can return
+/// `Box::pin(std::future::ready(...))` at zero cost.
 #[cfg(any(feature = "ffi", target_arch = "wasm32"))]
 pub type SecretStoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = std::result::Result<T, SecretStoreError>> + 'a>>;
+/// Type-erased future returned by [`DeRecSecretStore`] methods.
+///
+/// `Send` on native targets so multi-threaded executors (e.g. `tokio::spawn`)
+/// can take it; under the `ffi` feature or `wasm32` the `Send` bound is
+/// dropped because callbacks cross an FFI boundary or run in a
+/// single-threaded host. Sync backends can return
+/// `Box::pin(std::future::ready(...))` at zero cost.
 #[cfg(not(any(feature = "ffi", target_arch = "wasm32")))]
 pub type SecretStoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = std::result::Result<T, SecretStoreError>> + Send + 'a>>;
 
+/// Type-erased future returned by [`DeRecChannelStore`] methods. See
+/// [`SecretStoreFuture`] for the `Send`/non-`Send` rules.
 #[cfg(any(feature = "ffi", target_arch = "wasm32"))]
 pub type ChannelStoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = std::result::Result<T, ChannelStoreError>> + 'a>>;
+/// Type-erased future returned by [`DeRecChannelStore`] methods. See
+/// [`SecretStoreFuture`] for the `Send`/non-`Send` rules.
 #[cfg(not(any(feature = "ffi", target_arch = "wasm32")))]
 pub type ChannelStoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = std::result::Result<T, ChannelStoreError>> + Send + 'a>>;
 
+/// Type-erased future returned by [`DeRecShareStore`] methods. See
+/// [`SecretStoreFuture`] for the `Send`/non-`Send` rules.
 #[cfg(any(feature = "ffi", target_arch = "wasm32"))]
 pub type ShareStoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = std::result::Result<T, ShareStoreError>> + 'a>>;
+/// Type-erased future returned by [`DeRecShareStore`] methods. See
+/// [`SecretStoreFuture`] for the `Send`/non-`Send` rules.
 #[cfg(not(any(feature = "ffi", target_arch = "wasm32")))]
 pub type ShareStoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = std::result::Result<T, ShareStoreError>> + Send + 'a>>;
 
+/// Type-erased future returned by [`DeRecTransport::send`]. See
+/// [`SecretStoreFuture`] for the `Send`/non-`Send` rules.
 #[cfg(any(feature = "ffi", target_arch = "wasm32"))]
 pub type TransportFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
+/// Type-erased future returned by [`DeRecTransport::send`]. See
+/// [`SecretStoreFuture`] for the `Send`/non-`Send` rules.
 #[cfg(not(any(feature = "ffi", target_arch = "wasm32")))]
 pub type TransportFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
+/// Kind of secret material stored by [`DeRecSecretStore`].
+///
+/// Each variant has its own lifecycle (see per-variant docs). Used as the
+/// `kind` argument to [`DeRecSecretStore::load`] and
+/// [`DeRecSecretStore::remove`]; on [`DeRecSecretStore::save`] the kind is
+/// inferred from the [`SecretValue`] variant and need not be passed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretKind {
-    /// The post-pairing symmetric channel key (`SharedKey`).
+    /// The post-pairing symmetric channel key (see [`SecretValue::SharedKey`]).
     SharedKey = 0,
     /// The ephemeral ECIES / ML-KEM key material used during pairing.
     PairingSecret = 1,
@@ -67,35 +95,42 @@ pub enum MissingPolicy {
     Fail,
 }
 
+/// The payload returned by [`DeRecSecretStore::load`] and passed to
+/// [`DeRecSecretStore::save`].
+///
+/// Variants are 1:1 with [`SecretKind`].
 pub enum SecretValue {
+    /// The post-pairing symmetric channel key. Established by pairing and used
+    /// to authenticate and encrypt every subsequent message on the channel.
     SharedKey(crate::types::SharedKey),
+    /// The ephemeral ECIES / ML-KEM key pair created by `start` and consumed
+    /// when the pairing response arrives. Removed once the shared key is
+    /// derived.
     PairingSecret(PairingSecretKeyMaterial),
-    /// The initiator's [`ContactMessage`], needed by `pairing_response::process`
-    /// to derive the shared key. Ephemeral — removed after pairing completes.
+    /// The initiator's [`ContactMessage`], needed by
+    /// [`crate::primitives::pairing::response::process`] to derive the shared
+    /// key. Ephemeral — removed after pairing completes.
     PairingContact(ContactMessage),
 }
 
 /// A single stored share entry, fully self-describing.
-///
-/// - `secret_id` — numeric identifier of the secret this share belongs to.
-/// - `version`   — version number of the secret.
-/// - `bytes`     — raw encoded [`derec_proto::StoreShareRequestMessage`] bytes.
 #[derive(Debug, Clone)]
 pub struct Share {
+    /// Numeric identifier of the secret this share belongs to.
     pub secret_id: u64,
+    /// Version number of the secret.
     pub version: u32,
+    /// Opaque protobuf bytes — see [`DeRecShareStore`] for the per-side format.
     pub bytes: Vec<u8>,
 }
 
-/// Keychain-grade storage for cryptographic secrets.
+/// Keychain-grade storage for the protocol's per-channel cryptographic state.
 ///
-/// Only two kinds of material ever need special protection:
-///
-/// - [`SecretKind::SharedKey`] — the symmetric key that authenticates and
-///   encrypts all post-pairing messages for a channel.
-/// - [`SecretKind::PairingSecret`] — the ephemeral ECIES / ML-KEM key pair
-///   that is alive only between a pairing request and its response.
-///
+/// Holds three kinds of material (see [`SecretKind`]):
+/// [`SecretKind::SharedKey`] and [`SecretKind::PairingSecret`] are
+/// sensitive — implementations should persist them with keychain-grade
+/// protection. [`SecretKind::PairingContact`] is a transient public-key blob
+/// that only needs durable storage.
 ///
 /// # VSS guarantee
 ///
@@ -106,14 +141,20 @@ pub struct Share {
 /// # Executor independence
 ///
 /// Methods return [`SecretStoreFuture`] — a type-erased [`std::future::Future`]
-/// that any executor can poll.  Sync implementations return
+/// that any executor can poll. Sync implementations return
 /// `Box::pin(std::future::ready(...))` at zero cost; async implementations
-/// return `Box::pin(async move { ... })`.  No runtime is prescribed.
+/// return `Box::pin(async move { ... })`. No runtime is prescribed; see
+/// [`SecretStoreFuture`] for the per-target `Send` rules.
+///
+/// # Concurrency
+///
+/// The protocol holds each store by `&mut Self`, so implementations never
+/// see overlapping calls and need no internal synchronization.
 pub trait DeRecSecretStore {
     /// Load a secret for the given channel.
     ///
     /// Returns `Ok(None)` when no secret of the requested [`SecretKind`] exists
-    /// for `channel_id`.  The returned [`SecretValue`] variant will always match
+    /// for `channel_id`. The returned [`SecretValue`] variant will always match
     /// the requested `kind`.
     fn load(
         &self,
@@ -142,8 +183,11 @@ pub trait DeRecSecretStore {
     /// Persist a secret for the given channel.
     ///
     /// The [`SecretKind`] is derived from the [`SecretValue`] variant, so
-    /// callers do not need to pass it explicitly.  An existing entry of the
-    /// same kind is silently overwritten.
+    /// callers do not need to pass it explicitly. An existing entry of the
+    /// same kind is silently overwritten. Implementations should never
+    /// auto-evict — the protocol calls [`Self::remove`] explicitly when a
+    /// secret is no longer needed (this includes ephemeral kinds like
+    /// [`SecretValue::PairingContact`]).
     fn save(&mut self, channel_id: ChannelId, value: SecretValue) -> SecretStoreFuture<'_, ()>;
 
     /// Remove a secret for the given channel.
@@ -155,9 +199,10 @@ pub trait DeRecSecretStore {
 /// Storage backend for paired channels.
 ///
 /// A [`Channel`] is the post-pairing representation of a peer relationship,
-/// retaining only the fields needed for ongoing protocol operations (channel
-/// ID, transport uri, and name). The full [`ContactMessage`] — which
-/// carries ephemeral cryptographic material — is discarded after pairing.
+/// retaining only the fields needed for ongoing protocol operations — see
+/// [`Channel`] for the per-field documentation. The full [`ContactMessage`]
+/// — which carries ephemeral cryptographic material — is discarded after
+/// pairing.
 ///
 /// # Implementor notes
 ///
@@ -180,8 +225,7 @@ pub trait DeRecSecretStore {
 ///
 /// # Executor independence
 ///
-/// Same as [`DeRecSecretStore`] — methods return [`ChannelStoreFuture`], a
-/// type-erased future with no runtime dependency.
+/// Same as [`DeRecSecretStore`]; methods return [`ChannelStoreFuture`].
 pub trait DeRecChannelStore {
     /// Load the [`Channel`] for the given channel ID.
     ///
@@ -229,18 +273,17 @@ pub trait DeRecChannelStore {
 
 /// Storage backend for secret shares.
 ///
-/// Stores raw encoded [`derec_proto::StoreShareRequestMessage`] protobuf bytes keyed by
-/// `(channel_id, secret_id, version)`. The full request is stored rather than just the
-/// share field because:
+/// Each entry is opaque protobuf bytes keyed by `(channel_id, secret_id, version)`.
+/// The byte format depends on which side stored it; the store itself never
+/// decodes:
 ///
-/// - **recovery** needs to return the whole `StoreShareRequestMessage` to the library
-/// - **verification** derives the share content from `StoreShareRequestMessage.share`
-///
-/// Used by both sides:
-///
-/// - **Helper** stores the full encoded request received from the Owner.
-/// - **Owner** stores an empty `bytes` field to record a tracking entry so that
-///   [`super::DeRecProtocol::verify_shares`] can enumerate which helpers hold shares.
+/// - **Helper** stores the encoded [`derec_proto::StoreShareRequestMessage`]
+///   received from the Owner. Recovery returns this whole message to the
+///   library, and verification derives the share content from
+///   `StoreShareRequestMessage.share`.
+/// - **Owner** stores the encoded [`derec_proto::CommittedDeRecShare`] it
+///   sent to each helper, so that the verification handler can replay the
+///   commitment when validating each helper's response.
 ///
 /// # Relation to channel linking
 ///
@@ -263,7 +306,7 @@ pub trait DeRecChannelStore {
 ///
 /// # Executor independence
 ///
-/// Methods return [`ShareStoreFuture`] — no runtime is prescribed.
+/// Same as [`DeRecSecretStore`]; methods return [`ShareStoreFuture`].
 pub trait DeRecShareStore {
     /// Load shares stored for a single channel, scoped to one secret.
     ///
@@ -328,9 +371,12 @@ pub trait DeRecShareStore {
 ///
 /// # Executor independence
 ///
-/// `send` returns [`TransportFuture`] — a type-erased future.  A blocking HTTP
-/// client wraps its call in `Box::pin(std::future::ready(...))`.  An async
-/// client returns `Box::pin(async move { ... })`.  No executor is assumed.
+/// Same as [`DeRecSecretStore`]; `send` returns [`TransportFuture`].
 pub trait DeRecTransport {
+    /// Deliver `message` to `endpoint`.
+    ///
+    /// `endpoint` is the [`TransportProtocol`] the peer advertised during
+    /// pairing. The library calls this from protocol handlers whenever an
+    /// outbound envelope needs to reach a peer.
     fn send(&self, endpoint: &TransportProtocol, message: Vec<u8>) -> TransportFuture<'_>;
 }

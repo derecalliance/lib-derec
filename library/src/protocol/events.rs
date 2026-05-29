@@ -101,23 +101,18 @@ pub enum DeRecFlow {
 /// acknowledgement before dropping its local state for the channel.
 ///
 /// See [`crate::protocol::DeRecProtocolBuilder::with_unpair_ack`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UnpairAck {
     /// The initiator keeps its local channel/share/secret state until the
     /// peer's `Ok` response arrives — or until the configured protocol
     /// timeout elapses, at which point the state is dropped anyway and an
     /// [`DeRecEvent::Unpaired`] event surfaces.
+    #[default]
     Required,
     /// The initiator drops its local state immediately after sending the
     /// request and emits [`DeRecEvent::Unpaired`] right away. Any later
     /// response is silently ignored.
     NotRequired,
-}
-
-impl Default for UnpairAck {
-    fn default() -> Self {
-        Self::Required
-    }
 }
 
 // TODO: fix this warning

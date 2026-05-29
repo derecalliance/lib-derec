@@ -45,6 +45,7 @@ pub(crate) mod pending_action_wire;
 mod stores;
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use crate::{
     protocol::{
@@ -197,7 +198,7 @@ impl DeRecProtocolWasm {
             .with_keep_versions_count(keep_versions_count as usize)
             .with_secret_id(secret_id)
             .with_communication_info(info)
-            .with_timeout_in_secs(timeout_in_secs.map_or(300, u64::from))
+            .with_timeout(Duration::from_secs(timeout_in_secs.map_or(300, u64::from)))
             .with_auto_respond_on_failure(auto_respond_on_failure.unwrap_or(false))
             .with_unpair_ack(unpair_ack_value)
             .build();

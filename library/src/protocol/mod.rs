@@ -15,18 +15,18 @@
 //! reacts to the returned [`DeRecEvent`] values. All routing, state persistence,
 //! and reply sending are handled internally.
 
-pub mod builder;
 pub mod error;
 pub mod events;
 pub mod traits;
 
+mod builder;
 mod handlers;
 
 use crate::{
     Error, Result, primitives::pairing::request::create_contact as create_contact_message,
     types::ChannelId,
 };
-pub use builder::{BuilderSlotMissingMarker, BuilderSlotSetMarker, DeRecProtocolBuilder};
+pub use builder::DeRecProtocolBuilder;
 use derec_proto::{
     ContactMessage, DeRecMessage, GetShareResponseMessage, StatusEnum, TransportProtocol,
 };
@@ -48,10 +48,8 @@ pub(super) type PendingRecovery = HashMap<(u64, u32), Vec<GetShareResponseMessag
 /// In-progress unpair requests keyed by `channel_id`, with the `started_at`
 /// (epoch seconds) the orchestrator stamped when it sent the request.
 ///
-/// Only populated when [`crate::protocol::events::UnpairAck::Required`] is in
-/// effect: the orchestrator waits for the peer's acknowledgement up to the
-/// configured protocol timeout before dropping local state anyway. With
-/// [`UnpairAck::NotRequired`](crate::protocol::events::UnpairAck::NotRequired)
+/// Only populated under [`crate::protocol::events::UnpairAck::Required`];
+/// under [`UnpairAck::NotRequired`](crate::protocol::events::UnpairAck::NotRequired)
 /// state is dropped immediately and this map is never touched.
 pub(super) type PendingUnpair = HashMap<ChannelId, u64>;
 
@@ -113,17 +111,21 @@ pub struct DeRecProtocol<
     SecretStore: DeRecSecretStore,
     Transport: DeRecTransport,
 > {
+    /// Set via [`DeRecProtocolBuilder::with_channel_store`].
     pub channel_store: ChannelStore,
+    /// Set via [`DeRecProtocolBuilder::with_share_store`].
     pub share_store: ShareStore,
+    /// Set via [`DeRecProtocolBuilder::with_secret_store`].
     pub secret_store: SecretStore,
+    /// Set via [`DeRecProtocolBuilder::with_transport`].
     pub transport: Transport,
+    /// Set via [`DeRecProtocolBuilder::with_own_transport`].
     pub own_transport: TransportProtocol,
     pending_recovery: PendingRecovery,
     /// Channels with an outstanding unpair request awaiting the peer's
     /// acknowledgement (Required mode only — see [`UnpairAck`]).
     pending_unpair: PendingUnpair,
-    /// Whether unpair initiators wait for the peer's acknowledgement before
-    /// dropping local state. Default [`UnpairAck::Required`].
+    /// Configured via [`DeRecProtocolBuilder::with_unpair_ack`].
     pub(crate) unpair_ack: UnpairAck,
     /// Events produced by [`Self::start`] that don't fit the "no events from
     /// start; only from process" public contract. Drained at the top of every
@@ -131,24 +133,17 @@ pub struct DeRecProtocol<
     /// `UnpairAck::NotRequired`, which has to surface `Unpaired` immediately
     /// (no inbound response is coming).
     pending_start_events: Vec<DeRecEvent>,
-    /// Minimum number of shares required for reconstruction.
+    /// Configured via [`DeRecProtocolBuilder::with_threshold`].
     threshold: usize,
-    /// Number of recent versions each Helper must retain.
+    /// Configured via [`DeRecProtocolBuilder::with_keep_versions_count`].
     keep_versions_count: usize,
-    /// Application-provided secret identifier for this protocol instance.
+    /// Configured via [`DeRecProtocolBuilder::with_secret_id`].
     secret_id: u64,
-    /// Timeout in seconds for pending channels. Channels that remain in
-    /// `Pending` status beyond this duration are automatically removed
-    /// along with their pairing keys. Default: 300 (5 minutes).
+    /// Configured via [`DeRecProtocolBuilder::with_timeout`].
     timeout_in_secs: u64,
-    /// Key-value pairs included in `CommunicationInfo` within pairing request
-    /// and response messages (e.g. `"name"`, `"email"`, `"phone"`).
+    /// Configured via [`DeRecProtocolBuilder::with_communication_info`].
     pub(crate) communication_info: HashMap<String, String>,
-    /// When `true`, the protocol automatically sends a failure response to the
-    /// peer when processing an inbound request fails (e.g. format errors,
-    /// decryption failures). When `false` (default), inbound processing errors
-    /// are only surfaced as events and no response is sent — the application is
-    /// responsible for deciding how to respond.
+    /// Configured via [`DeRecProtocolBuilder::with_auto_respond_on_failure`].
     pub(crate) auto_respond_on_failure: bool,
     /// Active sharing round, if any. Populated by `start(ProtectSecret)` and
     /// consumed when all targeted Helpers respond or time out.
@@ -314,10 +309,9 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
             }
             DeRecFlow::Unpair { target, memo } => {
                 // The handler returns immediate `Unpaired` events for the
-                // fire-and-forget (`UnpairAck::NotRequired`) path; the
-                // wait-for-ack path returns nothing here and the events
-                // surface later from `process()` (on the response) or the
-                // timeout sweep.
+                // `UnpairAck::NotRequired` path; the wait-for-ack path returns
+                // nothing here and the events surface later from `process()`
+                // (on the response) or the timeout sweep.
                 let _events = handlers::unpairing::start(
                     &mut self.channel_store,
                     &mut self.share_store,
@@ -695,11 +689,12 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
         };
         let msg_secs = ts.seconds as u64;
         let now = now_secs();
-        if now.saturating_sub(msg_secs) > self.timeout_in_secs {
+        let age = now.saturating_sub(msg_secs);
+        if age > self.timeout_in_secs {
             #[cfg(feature = "logging")]
             tracing::warn!(
                 channel_id = channel_id.0,
-                message_age_secs = now.saturating_sub(msg_secs),
+                message_age_secs = age,
                 timeout_secs = self.timeout_in_secs,
                 "message discarded — older than configured timeout"
             );
