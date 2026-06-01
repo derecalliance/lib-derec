@@ -166,25 +166,26 @@ pub(super) async fn handle<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRec
 /// Inbound role-gate table — the local role required on `channel_id` for the
 /// orchestrator to honor a given inbound [`MessageBody`].
 ///
-/// Returns `None` for messages that are role-blind (currently the unpair
-/// request/response pair — either side may initiate an unpair).
+/// Returns `None` for messages that are role-blind (currently only the
+/// `UpdateChannelInfo` request/response pair — either side may initiate it).
 fn expected_role_for_inbound(body: &MessageBody) -> Option<SenderKind> {
     match body {
         // Helper accepts these; Owner sends them.
         MessageBody::StoreShareRequest(_)
         | MessageBody::VerifyShareRequest(_)
         | MessageBody::GetSecretIdsVersionsRequest(_)
-        | MessageBody::GetShareRequest(_) => Some(SenderKind::Helper),
+        | MessageBody::GetShareRequest(_)
+        | MessageBody::UnpairRequest(_) => Some(SenderKind::Helper),
         // Owner consumes these; Helper sends them.
         MessageBody::StoreShareResponse(_)
         | MessageBody::VerifyShareResponse(_)
         | MessageBody::GetSecretIdsVersionsResponse(_)
-        | MessageBody::GetShareResponse(_) => Some(SenderKind::Owner),
+        | MessageBody::GetShareResponse(_)
+        | MessageBody::UnpairResponse(_) => Some(SenderKind::Owner),
         // Symmetric — either Owner or Helper may initiate.
-        MessageBody::UnpairRequest(_)
-        | MessageBody::UnpairResponse(_)
-        | MessageBody::UpdateChannelInfoRequest(_)
-        | MessageBody::UpdateChannelInfoResponse(_) => None,
+        MessageBody::UpdateChannelInfoRequest(_) | MessageBody::UpdateChannelInfoResponse(_) => {
+            None
+        }
         _ => None,
     }
 }

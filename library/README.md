@@ -225,14 +225,15 @@ Each paired channel carries the local node's role — `SenderKind::Owner` or
 [`Channel.role`](https://docs.rs/derec-library/latest/derec_library/types/struct.Channel.html).
 The orchestrator enforces flow directionality against this value:
 
-- Outbound: `ProtectSecret`, `VerifyShares`, `Discovery`, and `RecoverSecret`
-  require the local role to be `Owner` on every targeted channel.
+- Outbound: `ProtectSecret`, `VerifyShares`, `Discovery`, `RecoverSecret`,
+  and `Unpair` require the local role to be `Owner` on every targeted
+  channel.
 - Inbound: a `StoreShareRequest` / `VerifyShareRequest` /
-  `GetSecretIdsVersionsRequest` / `GetShareRequest` is only honored on a
-  channel where the local role is `Helper`; the corresponding responses
-  require `Owner`.
-- `Unpair` is symmetric — either side may initiate, and the role is not
-  consulted.
+  `GetSecretIdsVersionsRequest` / `GetShareRequest` / `UnpairRequest` is
+  only honored on a channel where the local role is `Helper`; the
+  corresponding responses require `Owner`.
+- `UpdateChannelInfo` is symmetric — either side may initiate it, and the
+  role is not consulted.
 
 A mismatch surfaces as `Error::RoleMismatch { channel_id, expected, actual }`.
 

@@ -35,6 +35,7 @@ pub fn run_all() {
     rt.block_on(run_sharing_flow());
     rt.block_on(run_discovery_and_recovery_flow());
     rt.block_on(run_unpairing_flow());
+    rt.block_on(run_update_channel_info_flow());
 }
 
 // ── In-memory channel store ───────────────────────────────────────────────────
@@ -920,5 +921,129 @@ async fn run_unpairing_flow() {
         "helper channel must be removed after unpair"
     );
 
+    // Negative test: a Helper attempting to initiate `Unpair` is refused with
+    // `RoleMismatch` before any bytes hit the wire.
+    let helper_init_channel = ChannelId(8);
+    let mut owner = Peer::new("owner", "https://owner.example.com");
+    let mut helper = Peer::new("helper", "https://helper.example.com");
+    pair(&mut owner, &mut helper, helper_init_channel).await;
+    let result = helper
+        .protocol
+        .start(DeRecFlow::Unpair {
+            target: Target::Single(helper_init_channel),
+            memo: Some("helper trying to unpair".to_owned()),
+        })
+        .await;
+    assert!(
+        matches!(result, Err(derec_library::Error::RoleMismatch { .. })),
+        "Helper-initiated Unpair must be refused with RoleMismatch, got {result:?}"
+    );
+
     println!("Protocol unpairing flow test passed.");
+}
+
+// ── UpdateChannelInfo ─────────────────────────────────────────────────────────
+
+/// Drives a full `UpdateChannelInfo` round-trip: Owner mutates local state via
+/// `set_communication_info` / `set_own_transport`, broadcasts the update,
+/// Helper auto-accepts via `accept(action)`, both sides emit
+/// `ChannelInfoUpdated`, and the channel record on the responder reflects the
+/// new metadata.
+async fn run_update_channel_info_flow() {
+    println!("=== Protocol UpdateChannelInfo flow ===");
+
+    let channel_id = ChannelId(42);
+    let mut owner = Peer::new("owner", "https://owner.example.com");
+    let mut helper = Peer::new("helper", "https://helper.example.com");
+
+    pair(&mut owner, &mut helper, channel_id).await;
+    println!("Pairing complete — preparing UpdateChannelInfo broadcast");
+
+    // Owner mutates local state, then propagates the change.
+    let new_uri = "https://owner.NEW.example.com".to_owned();
+    let new_info: std::collections::HashMap<String, String> = [
+        ("name".to_owned(), "Owner-renamed".to_owned()),
+        ("email".to_owned(), "owner.new@example.com".to_owned()),
+    ]
+    .into_iter()
+    .collect();
+
+    owner.protocol.set_communication_info(new_info.clone());
+    owner.protocol.set_own_transport(TransportProtocol {
+        uri: new_uri.clone(),
+        protocol: Protocol::Https.into(),
+    });
+    // Simulate "the new endpoint is up before the update is sent" — the
+    // pump dispatches by `Peer::uri`, so this is the in-memory equivalent
+    // of starting to listen on the new URI.
+    owner.uri = new_uri.clone();
+
+    owner
+        .protocol
+        .start(DeRecFlow::UpdateChannelInfo {
+            target: Target::Single(channel_id),
+            communication_info: Some(new_info.clone()),
+            transport_protocol: Some(TransportProtocol {
+                uri: new_uri.clone(),
+                protocol: Protocol::Https.into(),
+            }),
+        })
+        .await
+        .expect("owner start(UpdateChannelInfo) failed");
+
+    // pump routes the request to the Helper, then the Helper's response back.
+    let events = pump(&mut owner, &mut helper).await;
+
+    let helper_updated = events.iter().any(|e| {
+        matches!(
+            e,
+            DeRecEvent::ChannelInfoUpdated { channel_id: c, .. } if *c == channel_id
+        )
+    });
+    assert!(
+        helper_updated,
+        "expected ChannelInfoUpdated on the Helper after accept"
+    );
+
+    let owner_updated = events
+        .iter()
+        .filter(|e| matches!(e, DeRecEvent::ChannelInfoUpdated { channel_id: c, .. } if *c == channel_id))
+        .count();
+    assert!(
+        owner_updated >= 2,
+        "expected ChannelInfoUpdated on both Owner and Helper (got {owner_updated})"
+    );
+
+    // Helper's stored Channel must now mirror the Owner's announced metadata.
+    let helper_channel = helper
+        .protocol
+        .channel_store
+        .load(channel_id)
+        .await
+        .expect("helper channel_store.load failed")
+        .expect("helper channel must still exist after UpdateChannelInfo");
+    assert_eq!(
+        helper_channel.transport.uri, new_uri,
+        "helper's stored transport URI must reflect the announced update"
+    );
+    assert_eq!(
+        helper_channel.communication_info, new_info,
+        "helper's stored communication_info must mirror the announced map"
+    );
+
+    // Negative test: an update with neither field set is rejected up front.
+    let empty_result = owner
+        .protocol
+        .start(DeRecFlow::UpdateChannelInfo {
+            target: Target::Single(channel_id),
+            communication_info: None,
+            transport_protocol: None,
+        })
+        .await;
+    assert!(
+        matches!(empty_result, Err(derec_library::Error::InvalidInput(_))),
+        "expected InvalidInput when both fields are None, got {empty_result:?}"
+    );
+
+    println!("Protocol UpdateChannelInfo flow test passed.");
 }

@@ -390,6 +390,14 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                 Ok(None)
             }
             DeRecFlow::Unpair { target, memo } => {
+                let resolved =
+                    handlers::resolve_target(&mut self.channel_store, target.clone()).await?;
+                handlers::require_role(
+                    &self.channel_store,
+                    &resolved,
+                    derec_proto::SenderKind::Owner,
+                )
+                .await?;
                 // The handler returns immediate `Unpaired` events for the
                 // `UnpairAck::NotRequired` path; the wait-for-ack path returns
                 // nothing here and the events surface later from `process()`

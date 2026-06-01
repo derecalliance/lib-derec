@@ -77,11 +77,11 @@ pub enum PendingAction {
 /// [`crate::types::Channel::role`] (set at pairing time):
 ///
 /// - [`Self::Discovery`], [`Self::ProtectSecret`], [`Self::VerifyShares`],
-///   and [`Self::RecoverSecret`] require this node to be the
-///   [`SenderKind::Owner`] on every targeted channel; otherwise
+///   [`Self::RecoverSecret`], and [`Self::Unpair`] require this node to be
+///   the [`SenderKind::Owner`] on every targeted channel; otherwise
 ///   [`crate::Error::RoleMismatch`] is returned.
 /// - [`Self::Pairing`] creates the channel, so no role exists yet.
-/// - [`Self::Unpair`] is symmetric — either party may initiate.
+/// - [`Self::UpdateChannelInfo`] is symmetric — either party may initiate.
 pub enum DeRecFlow {
     Pairing {
         kind: SenderKind,
@@ -120,8 +120,15 @@ pub enum DeRecFlow {
     },
     /// Initiate an unpair flow against one or more paired channels.
     ///
-    /// Whether the local state for `target` is dropped immediately (fire-and-
-    /// forget) or only after the peer acknowledges is governed by
+    /// **Owner-initiated only.** This node must hold
+    /// [`SenderKind::Owner`](derec_proto::SenderKind::Owner) on every channel
+    /// in `target`; otherwise [`crate::Error::RoleMismatch`] is returned.
+    /// Helpers cannot tear down the relationship from the protocol layer —
+    /// they may only refuse an incoming unpair request via
+    /// [`super::DeRecProtocol::reject`].
+    ///
+    /// Whether the local state for `target` is dropped immediately on
+    /// `start(Unpair)` or only after the peer acknowledges is governed by
     /// [`crate::protocol::DeRecProtocolBuilder::with_unpair_ack`].
     Unpair {
         target: Target,
