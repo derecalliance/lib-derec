@@ -1,0 +1,90 @@
+/*
+ * Copyright (c) DeRec Alliance and its Contributors.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
+import "communicationinfo.proto";
+import "result.proto";
+import "transportprotocol.proto";
+
+package org.derecalliance.derec.protobuf;
+
+// UpdateChannelInfoRequestMessage notifies the peer that the sender's
+// communication metadata and/or transport endpoint have changed.
+//
+// # Context
+//
+// Both `communication_info` and `transport_protocol` are exchanged at pairing
+// time only. This message lets either party (Owner or Helper) propagate
+// post-pairing changes without re-pairing.
+//
+// # Semantics
+//
+// Both fields are optional and independent:
+//
+// - `communication_info` absent (no `CommunicationInfo` set) means "do not
+//   modify the communication info stored for the sender." Presence — even
+//   with an empty `communication_info_entries` list — means "replace the
+//   stored map with the supplied one." Updates, additions, and deletions
+//   are all expressed by the difference between the receiver's current map
+//   and the supplied one.
+// - `transport_protocol` absent means "do not modify the transport endpoint
+//   stored for the sender." Presence means "the sender's transport endpoint
+//   is now this value." The receiver MUST route subsequent messages on this
+//   channel to the new endpoint, including the
+//   UpdateChannelInfoResponseMessage for this request.
+//
+// # Endpoint changeover
+//
+// When `transport_protocol` is updated, the receiver sends its response to
+// the new endpoint. The sender's application is therefore responsible for
+// ensuring the new endpoint is reachable BEFORE this request is issued, and
+// for keeping the old endpoint operational long enough for in-flight
+// messages from other peers (and any concurrent operations) to drain.
+message UpdateChannelInfoRequestMessage {
+
+  // Updated communication info for the sender, or absent to leave unchanged.
+  //
+  // Presence (even with an empty entries list) replaces the receiver's
+  // stored map for this channel. Absence leaves it untouched.
+  optional CommunicationInfo communication_info = 1;
+
+  // Updated transport endpoint for the sender, or absent to leave unchanged.
+  //
+  // Presence updates both the URI and protocol enum. The receiver routes
+  // the response to this new endpoint.
+  optional TransportProtocol transport_protocol = 2;
+
+  // Timestamp indicating when this message was created.
+  //
+  // This value is expressed in UTC and is used for envelope-vs-body
+  // timestamp validation, replay detection, and observability.
+  google.protobuf.Timestamp timestamp = 3;
+}
+
+// UpdateChannelInfoResponseMessage is the response to an
+// UpdateChannelInfoRequestMessage.
+//
+// # Semantics
+//
+// On success (`result.status == OK`):
+//
+// - the receiver has persisted the supplied updates
+// - subsequent messages from the receiver MUST use the new endpoint, if
+//   `transport_protocol` was updated
+//
+// On failure:
+//
+// - the receiver's stored state is unchanged
+// - the sender SHOULD inspect `result.memo` for diagnostic context
+message UpdateChannelInfoResponseMessage {
+
+  // Result of processing the update.
+  DeRecResult result = 1;
+
+  // Timestamp indicating when this message was created.
+  google.protobuf.Timestamp timestamp = 2;
+}

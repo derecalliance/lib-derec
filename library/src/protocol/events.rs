@@ -9,7 +9,8 @@ use crate::{
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{
     ContactMessage, GetSecretIdsVersionsRequestMessage, GetShareRequestMessage, PairRequestMessage,
-    SenderKind, StoreShareRequestMessage, UnpairRequestMessage, VerifyShareRequestMessage,
+    SenderKind, StoreShareRequestMessage, TransportProtocol, UnpairRequestMessage,
+    UpdateChannelInfoRequestMessage, VerifyShareRequestMessage,
 };
 
 /// An opaque action token emitted inside [`DeRecEvent::ActionRequired`] events.
@@ -54,6 +55,16 @@ pub enum PendingAction {
     Unpair {
         channel_id: ChannelId,
         request: UnpairRequestMessage,
+        shared_key: SharedKey,
+    },
+    /// The peer has announced an update to their communication info and/or
+    /// transport endpoint. Accepting applies the update to the stored
+    /// [`crate::types::Channel`] and sends back an `Ok` response on the new
+    /// endpoint (when `transport_protocol` was updated); rejecting sends a
+    /// non-`Ok` response and leaves the stored state unchanged.
+    UpdateChannelInfo {
+        channel_id: ChannelId,
+        request: UpdateChannelInfoRequestMessage,
         shared_key: SharedKey,
     },
 }
@@ -117,6 +128,28 @@ pub enum DeRecFlow {
         /// Optional human-readable reason embedded into the wire request.
         /// Pass `None` (or an empty string) to omit.
         memo: Option<String>,
+    },
+    /// Broadcast updated communication info and/or transport endpoint to one
+    /// or more paired channels.
+    ///
+    /// Either party may initiate. Either field may be `None` to leave it
+    /// unchanged; presence of `communication_info` (even with an empty map)
+    /// instructs the peer to replace its stored map for this channel with
+    /// the supplied one. Presence of `transport_protocol` instructs the peer
+    /// to use the new endpoint for the response and all subsequent messages.
+    ///
+    /// The application is responsible for calling
+    /// [`crate::protocol::DeRecProtocol::set_communication_info`] and/or
+    /// [`crate::protocol::DeRecProtocol::set_own_transport`] **before**
+    /// initiating this flow so the local state matches what is announced.
+    /// See the setter docs for the endpoint-changeover discipline.
+    UpdateChannelInfo {
+        target: Target,
+        /// Updated communication info. `None` leaves the peer's stored map
+        /// untouched; `Some(_)` replaces it (an empty `HashMap` clears it).
+        communication_info: Option<std::collections::HashMap<String, String>>,
+        /// Updated transport endpoint. `None` leaves it untouched.
+        transport_protocol: Option<TransportProtocol>,
     },
 }
 
@@ -273,6 +306,38 @@ pub enum DeRecEvent {
     /// The initiator's local state is **not** dropped — the application
     /// decides what to do (retry, escalate, or force-delete locally).
     UnpairRejected {
+        channel_id: ChannelId,
+        /// The `StatusEnum` value from the peer's response.
+        status: i32,
+        /// Human-readable reason from the peer.
+        memo: String,
+    },
+
+    /// The stored [`crate::types::Channel`] for `channel_id` has been updated
+    /// with new communication info and/or transport endpoint.
+    ///
+    /// Surfaces on **both** sides of the flow:
+    ///
+    /// - Responder: emitted by [`super::DeRecProtocol::accept`] after the
+    ///   update has been persisted.
+    /// - Initiator: emitted by [`super::DeRecProtocol::process`] when the
+    ///   peer's `Ok` response arrives.
+    ///
+    /// Each optional field carries the value that was applied (mirroring the
+    /// request), so the application can react (e.g. refresh UI, retire the
+    /// old endpoint).
+    ChannelInfoUpdated {
+        channel_id: ChannelId,
+        /// New communication info, if it was part of the update.
+        communication_info: Option<HashMap<String, String>>,
+        /// New transport endpoint, if it was part of the update.
+        transport_protocol: Option<derec_proto::TransportProtocol>,
+    },
+
+    /// The peer answered an outbound `UpdateChannelInfo` request with a
+    /// non-`Ok` status. The peer's stored state is unchanged. The initiator's
+    /// own state is also unaffected.
+    ChannelInfoUpdateRejected {
         channel_id: ChannelId,
         /// The `StatusEnum` value from the peer's response.
         status: i32,

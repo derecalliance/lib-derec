@@ -12,6 +12,7 @@ import "storeshare.proto";
 import "verify.proto";
 import "getshare.proto";
 import "secretidsversions.proto";
+import "updatechannelinfo.proto";
 import "error.proto";
 
 package org.derecalliance.derec.protobuf;
@@ -167,6 +168,8 @@ message DeRecMessage {
       GetShareRequestMessage getShareRequestMessage = 11;
       GetShareResponseMessage getShareResponseMessage = 12;
       ErrorResponseMessage errorResponseMessage = 13;
+      UpdateChannelInfoRequestMessage updateChannelInfoRequestMessage = 14;
+      UpdateChannelInfoResponseMessage updateChannelInfoResponseMessage = 15;
     }
   }
 }

@@ -248,6 +248,7 @@ A mismatch surfaces as `Error::RoleMismatch { channel_id, expected, actual }`.
 | Discovery | Ask helpers which secrets and versions they store. |
 | Recovery | Re-pair, collect shares, reconstruct the secret. |
 | Unpairing | Tear down a paired channel and drop local state. |
+| Update channel info | Propagate post-pairing changes to communication info and/or transport endpoint. |
 
 ---
 
@@ -337,6 +338,35 @@ custom relay, …).
 > The on-the-wire `TransportProtocol.protocol` enum currently defines
 > `Https` as the only supported value. New transports can be added by
 > extending the protobuf enum.
+
+### Updating channel info post-pairing
+
+A peer's `communication_info` and transport endpoint are exchanged at pairing
+time. To propagate later changes, mutate local state with
+`DeRecProtocol::set_communication_info` / `set_own_transport` and then run
+`start(DeRecFlow::UpdateChannelInfo { ... })` against the target channels.
+Per-field semantics:
+
+- `communication_info: Option<HashMap<String, String>>` — `None` leaves the
+  peer's stored map untouched. `Some(_)` replaces it; an empty map clears it.
+- `transport_protocol: Option<TransportProtocol>` — `None` leaves it
+  untouched. `Some(_)` updates both URI and protocol.
+
+The flow is symmetric — either Owner or Helper may initiate it — and
+auto-applies on the receiver via the standard `ActionRequired` → `accept`
+path. Outcome surfaces as `DeRecEvent::ChannelInfoUpdated` (or
+`ChannelInfoUpdateRejected` if the peer refused).
+
+> [!WARNING]
+> **Endpoint changeover discipline.** When `transport_protocol` is updated,
+> the receiving peer sends its response to the **new** endpoint. The
+> application MUST bring up the new endpoint and start listening on it
+> **before** initiating the flow, and MUST keep the old endpoint
+> operational until every targeted peer has emitted
+> `ChannelInfoUpdated` / `ChannelInfoUpdateRejected` (plus a grace window
+> for in-flight messages from peers not yet aware of the update). Failing
+> to keep both endpoints reachable during this window will cause messages
+> to be lost. See the rustdoc on `set_own_transport` for details.
 
 ---
 

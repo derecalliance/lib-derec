@@ -218,6 +218,48 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
         Ok(result.contact_message)
     }
 
+    /// Replace this node's local communication info.
+    ///
+    /// Only mutates local state — to propagate the change to paired peers,
+    /// follow up with [`DeRecFlow::UpdateChannelInfo`].
+    ///
+    /// # Destructive replacement
+    ///
+    /// The supplied map fully replaces the current value. An empty map will
+    /// be transmitted as "clear all entries" when a subsequent
+    /// `UpdateChannelInfo` flow runs, which the peer will mirror into its
+    /// stored map. Pass the complete new map, not a delta.
+    pub fn set_communication_info(&mut self, info: HashMap<String, String>) {
+        self.communication_info = info;
+    }
+
+    /// Replace this node's local transport endpoint.
+    ///
+    /// Only mutates local state — to propagate the change to paired peers,
+    /// follow up with [`DeRecFlow::UpdateChannelInfo`].
+    ///
+    /// # Endpoint changeover discipline
+    ///
+    /// When `UpdateChannelInfo` is broadcast, each receiving peer routes its
+    /// response (and all subsequent messages) to the NEW endpoint. The
+    /// application MUST therefore:
+    ///
+    /// 1. Bring up the new endpoint and start listening on it **before**
+    ///    initiating the `UpdateChannelInfo` flow.
+    /// 2. Keep the old endpoint operational during the changeover. Peers
+    ///    that have not yet processed the update still route to the old
+    ///    address; in-flight messages may also be targeted there.
+    /// 3. Retire the old endpoint only once every targeted peer has
+    ///    surfaced [`DeRecEvent::ChannelInfoUpdated`] (or
+    ///    [`DeRecEvent::ChannelInfoUpdateRejected`]), plus a grace window
+    ///    for in-flight traffic.
+    ///
+    /// Failing to keep both endpoints reachable during this window will
+    /// cause messages to be lost.
+    pub fn set_own_transport(&mut self, transport: TransportProtocol) {
+        self.own_transport = transport;
+    }
+
     /// Unified entry point for initiating any protocol flow.
     ///
     /// Returns `Some(channel_id)` for [`DeRecFlow::Pairing`], `None` for all others.
@@ -372,6 +414,22 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                 self.pending_start_events.extend(_events);
                 Ok(None)
             }
+            DeRecFlow::UpdateChannelInfo {
+                target,
+                communication_info,
+                transport_protocol,
+            } => {
+                handlers::update_channel_info::start(
+                    &mut self.channel_store,
+                    &mut self.secret_store,
+                    &self.transport,
+                    target,
+                    communication_info,
+                    transport_protocol,
+                )
+                .await?;
+                Ok(None)
+            }
         }
     }
 
@@ -472,6 +530,20 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     &mut self.channel_store,
                     &mut self.share_store,
                     &mut self.secret_store,
+                    &self.transport,
+                    channel_id,
+                    &request,
+                    &shared_key,
+                )
+                .await
+            }
+            PendingAction::UpdateChannelInfo {
+                channel_id,
+                request,
+                shared_key,
+            } => {
+                handlers::update_channel_info::accept(
+                    &mut self.channel_store,
                     &self.transport,
                     channel_id,
                     &request,
@@ -583,6 +655,21 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                 ..
             } => {
                 handlers::unpairing::reject(
+                    &mut self.channel_store,
+                    &self.transport,
+                    channel_id,
+                    &shared_key,
+                    status,
+                    memo,
+                )
+                .await
+            }
+            PendingAction::UpdateChannelInfo {
+                channel_id,
+                shared_key,
+                ..
+            } => {
+                handlers::update_channel_info::reject(
                     &mut self.channel_store,
                     &self.transport,
                     channel_id,

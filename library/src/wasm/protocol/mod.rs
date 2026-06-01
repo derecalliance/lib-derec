@@ -237,6 +237,46 @@ impl DeRecProtocolWasm {
             .map_err(|e| js_error("WASM_SERIALIZE_ERROR", e.to_string()))
     }
 
+    /// Replace this node's local communication info. Does not contact peers —
+    /// follow up with a `start(UpdateChannelInfo, ...)` to propagate.
+    #[wasm_bindgen(js_name = "setCommunicationInfo")]
+    pub fn set_communication_info(&mut self, info: JsValue) -> Result<(), JsValue> {
+        let map: HashMap<String, String> = if info.is_null() || info.is_undefined() {
+            HashMap::new()
+        } else {
+            serde_wasm_bindgen::from_value(info)
+                .map_err(|e| js_error("INVALID_COMMUNICATION_INFO", e.to_string()))?
+        };
+        self.inner.set_communication_info(map);
+        Ok(())
+    }
+
+    /// Replace this node's local transport endpoint. See
+    /// `setCommunicationInfo` for the matching update-propagation flow.
+    /// IMPORTANT: keep the old endpoint operational during the changeover —
+    /// see the Rust docs on `set_own_transport` for the discipline.
+    #[wasm_bindgen(js_name = "setOwnTransport")]
+    pub fn set_own_transport(
+        &mut self,
+        uri: String,
+        protocol: String,
+    ) -> Result<(), JsValue> {
+        let protocol_num = match protocol.to_lowercase().as_str() {
+            "https" => 0i32,
+            other => {
+                return Err(js_error(
+                    "INVALID_PROTOCOL",
+                    format!("unknown protocol: {other}"),
+                ));
+            }
+        };
+        self.inner.set_own_transport(TransportProtocol {
+            uri,
+            protocol: protocol_num,
+        });
+        Ok(())
+    }
+
     /// Unified entry point for initiating any protocol flow.
     ///
     /// # Arguments
@@ -786,9 +826,59 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
                 .as_string();
             Ok(DeRecFlow::Unpair { target, memo })
         }
+        6 => {
+            // UpdateChannelInfo
+            let target_val = js_sys::Reflect::get(&params, &JsValue::from_str("target"))
+                .unwrap_or(JsValue::UNDEFINED);
+            let target = parse_target(target_val)?;
+            let communication_info_val =
+                js_sys::Reflect::get(&params, &JsValue::from_str("communicationInfo"))
+                    .unwrap_or(JsValue::UNDEFINED);
+            let communication_info: Option<HashMap<String, String>> =
+                if communication_info_val.is_null() || communication_info_val.is_undefined() {
+                    None
+                } else {
+                    Some(
+                        serde_wasm_bindgen::from_value(communication_info_val).map_err(|e| {
+                            js_error("INVALID_COMMUNICATION_INFO", e.to_string())
+                        })?,
+                    )
+                };
+            let transport_uri_val = js_sys::Reflect::get(&params, &JsValue::from_str("transportUri"))
+                .unwrap_or(JsValue::UNDEFINED);
+            let transport_protocol = if transport_uri_val.is_null() || transport_uri_val.is_undefined()
+            {
+                None
+            } else {
+                let uri = transport_uri_val.as_string().ok_or_else(|| {
+                    js_error("INVALID_TRANSPORT_URI", "transportUri must be a string")
+                })?;
+                let proto_val =
+                    js_sys::Reflect::get(&params, &JsValue::from_str("transportProtocol"))
+                        .unwrap_or(JsValue::UNDEFINED);
+                let proto = match proto_val.as_string().as_deref() {
+                    None | Some("") | Some("https") => 0i32,
+                    Some(other) => {
+                        return Err(js_error(
+                            "INVALID_PROTOCOL",
+                            format!("unknown transport protocol: {other}"),
+                        ));
+                    }
+                };
+                Some(TransportProtocol {
+                    uri,
+                    protocol: proto,
+                })
+            };
+            Ok(DeRecFlow::UpdateChannelInfo {
+                target,
+                communication_info,
+                transport_protocol,
+            })
+        }
         _ => Err(js_error(
             "INVALID_FLOW_KIND",
-            format!("invalid flow kind: {flow_kind}, must be 0..5"),
+            format!("invalid flow kind: {flow_kind}, must be 0..6"),
         )),
     }
 }

@@ -5,6 +5,7 @@ pub(super) mod pairing;
 pub(super) mod recovery;
 pub(super) mod sharing;
 pub(super) mod unpairing;
+pub(super) mod update_channel_info;
 pub(super) mod verification;
 
 use super::{
@@ -153,6 +154,9 @@ pub(super) async fn handle<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRec
             )
             .await
         }
+        MessageBody::UpdateChannelInfoRequest(_) | MessageBody::UpdateChannelInfoResponse(_) => {
+            update_channel_info::handle(channel_id, inner, *shared_key).await
+        }
         _ => Err(Error::Invariant(
             "unexpected MessageBody variant in channel message",
         )),
@@ -176,8 +180,11 @@ fn expected_role_for_inbound(body: &MessageBody) -> Option<SenderKind> {
         | MessageBody::VerifyShareResponse(_)
         | MessageBody::GetSecretIdsVersionsResponse(_)
         | MessageBody::GetShareResponse(_) => Some(SenderKind::Owner),
-        // Symmetric.
-        MessageBody::UnpairRequest(_) | MessageBody::UnpairResponse(_) => None,
+        // Symmetric — either Owner or Helper may initiate.
+        MessageBody::UnpairRequest(_)
+        | MessageBody::UnpairResponse(_)
+        | MessageBody::UpdateChannelInfoRequest(_)
+        | MessageBody::UpdateChannelInfoResponse(_) => None,
         _ => None,
     }
 }

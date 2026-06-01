@@ -69,6 +69,26 @@ enum DeRecEventJs {
         status: i32,
         memo: String,
     },
+    ChannelInfoUpdated {
+        channel_id: String,
+        /// New communication info, if the update carried it (only populated
+        /// on the responder side after `accept`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        communication_info: Option<HashMap<String, String>>,
+        /// New transport URI, if the update carried it (only populated on
+        /// the responder side after `accept`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        transport_uri: Option<String>,
+        /// New transport protocol (i32 of `Protocol` enum) accompanying
+        /// `transport_uri`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        transport_protocol: Option<i32>,
+    },
+    ChannelInfoUpdateRejected {
+        channel_id: String,
+        status: i32,
+        memo: String,
+    },
     ActionRequired {
         channel_id: String,
         /// Opaque serialized PendingAction — pass back to accept() or reject().
@@ -155,6 +175,7 @@ fn action_kind_label(action: &PendingAction) -> &'static str {
         PendingAction::Discovery { .. } => "Discovery",
         PendingAction::GetShare { .. } => "GetShare",
         PendingAction::Unpair { .. } => "Unpair",
+        PendingAction::UpdateChannelInfo { .. } => "UpdateChannelInfo",
     }
 }
 
@@ -228,6 +249,29 @@ pub fn event_to_js(event: DeRecEvent) -> Result<JsValue, JsValue> {
             status,
             memo,
         },
+        DeRecEvent::ChannelInfoUpdated {
+            channel_id,
+            communication_info,
+            transport_protocol,
+        } => {
+            let (transport_uri, transport_protocol_i32) = match transport_protocol {
+                Some(tp) => (Some(tp.uri), Some(tp.protocol)),
+                None => (None, None),
+            };
+            DeRecEventJs::ChannelInfoUpdated {
+                channel_id: channel_id.0.to_string(),
+                communication_info,
+                transport_uri,
+                transport_protocol: transport_protocol_i32,
+            }
+        }
+        DeRecEvent::ChannelInfoUpdateRejected { channel_id, status, memo } => {
+            DeRecEventJs::ChannelInfoUpdateRejected {
+                channel_id: channel_id.0.to_string(),
+                status,
+                memo,
+            }
+        }
         DeRecEvent::ActionRequired { channel_id, action } => {
             let kind = action_kind_label(&action).to_owned();
             let peer_communication_info = extract_peer_communication_info(&action);

@@ -76,6 +76,8 @@ pub enum MessageBody {
     GetShareRequest(GetShareRequestMessage),
     GetShareResponse(GetShareResponseMessage),
     ErrorResponse(ErrorResponseMessage),
+    UpdateChannelInfoRequest(UpdateChannelInfoRequestMessage),
+    UpdateChannelInfoResponse(UpdateChannelInfoResponseMessage),
 }
 
 impl MessageBody {
@@ -104,6 +106,12 @@ impl MessageBody {
             MessageBody::GetShareRequest(m) => ("GetShareRequestMessage", m.encode_to_vec()),
             MessageBody::GetShareResponse(m) => ("GetShareResponseMessage", m.encode_to_vec()),
             MessageBody::ErrorResponse(m) => ("ErrorResponseMessage", m.encode_to_vec()),
+            MessageBody::UpdateChannelInfoRequest(m) => {
+                ("UpdateChannelInfoRequestMessage", m.encode_to_vec())
+            }
+            MessageBody::UpdateChannelInfoResponse(m) => {
+                ("UpdateChannelInfoResponseMessage", m.encode_to_vec())
+            }
         };
 
         let any = Any {
@@ -165,6 +173,12 @@ impl MessageBody {
             "ErrorResponseMessage" => {
                 MessageBody::ErrorResponse(ErrorResponseMessage::decode(any.value.as_slice())?)
             }
+            "UpdateChannelInfoRequestMessage" => MessageBody::UpdateChannelInfoRequest(
+                UpdateChannelInfoRequestMessage::decode(any.value.as_slice())?,
+            ),
+            "UpdateChannelInfoResponseMessage" => MessageBody::UpdateChannelInfoResponse(
+                UpdateChannelInfoResponseMessage::decode(any.value.as_slice())?,
+            ),
             #[allow(deprecated)]
             unknown => return Err(DecodeError::new(unknown.to_string())),
         };

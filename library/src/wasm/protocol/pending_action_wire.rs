@@ -22,8 +22,9 @@ use crate::protocol::PendingAction;
 use crate::types::ChannelId;
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{
-    GetSecretIdsVersionsRequestMessage, GetShareRequestMessage, PairRequestMessage,
-    SenderKind, StoreShareRequestMessage, UnpairRequestMessage, VerifyShareRequestMessage,
+    GetSecretIdsVersionsRequestMessage, GetShareRequestMessage, PairRequestMessage, SenderKind,
+    StoreShareRequestMessage, UnpairRequestMessage, UpdateChannelInfoRequestMessage,
+    VerifyShareRequestMessage,
 };
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use prost::Message;
@@ -34,6 +35,7 @@ const TAG_VERIFY_SHARE: u8 = 2;
 const TAG_DISCOVERY: u8 = 3;
 const TAG_GET_SHARE: u8 = 4;
 const TAG_UNPAIR: u8 = 5;
+const TAG_UPDATE_CHANNEL_INFO: u8 = 6;
 
 pub fn serialize(action: PendingAction) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
@@ -107,6 +109,16 @@ pub fn serialize(action: PendingAction) -> Result<Vec<u8>, String> {
             shared_key,
         } => {
             buf.push(TAG_UNPAIR);
+            buf.extend_from_slice(&channel_id.0.to_be_bytes());
+            buf.extend_from_slice(&shared_key);
+            buf.extend_from_slice(&request.encode_to_vec());
+        }
+        PendingAction::UpdateChannelInfo {
+            channel_id,
+            request,
+            shared_key,
+        } => {
+            buf.push(TAG_UPDATE_CHANNEL_INFO);
             buf.extend_from_slice(&channel_id.0.to_be_bytes());
             buf.extend_from_slice(&shared_key);
             buf.extend_from_slice(&request.encode_to_vec());
@@ -208,6 +220,16 @@ pub fn deserialize(bytes: &[u8]) -> Result<PendingAction, String> {
             let request = UnpairRequestMessage::decode(request_bytes)
                 .map_err(|e| format!("failed to decode UnpairRequestMessage: {e}"))?;
             Ok(PendingAction::Unpair {
+                channel_id,
+                request,
+                shared_key,
+            })
+        }
+        TAG_UPDATE_CHANNEL_INFO => {
+            let (shared_key, request_bytes) = split_shared_key(rest)?;
+            let request = UpdateChannelInfoRequestMessage::decode(request_bytes)
+                .map_err(|e| format!("failed to decode UpdateChannelInfoRequestMessage: {e}"))?;
+            Ok(PendingAction::UpdateChannelInfo {
                 channel_id,
                 request,
                 shared_key,
