@@ -30,11 +30,47 @@ public static partial class Pairing
             public required byte[] SharedKey { get; init; }
         }
 
+        public sealed class ProducePrePairResult
+        {
+            /// <summary>
+            /// Serialized outer plaintext <see cref="DeRecMessage"/> envelope
+            /// carrying a <c>PrePairResponseMessage</c>. Ready to send over
+            /// transport.
+            /// </summary>
+            public required DeRecMessage Envelope { get; init; }
+        }
+
+        public sealed class ExtractPrePairResult
+        {
+            public required ulong ChannelId { get; init; }
+            /// <summary>
+            /// Inner <c>PrePairResponseMessage</c> proto bytes for chaining into
+            /// <see cref="ProcessPrePair"/>.
+            /// </summary>
+            public required byte[] ResponseProtoBytes { get; init; }
+        }
+
+        public sealed class ProcessPrePairResult
+        {
+            /// <summary>
+            /// Initiator's ML-KEM-768 encapsulation key, validated against the
+            /// contact's <c>contactBindingHash</c>.
+            /// </summary>
+            public required byte[] MlkemEncapsulationKey { get; init; }
+            /// <summary>
+            /// Initiator's ECIES public key, validated against the contact's
+            /// <c>contactBindingHash</c>.
+            /// </summary>
+            public required byte[] EciesPublicKey { get; init; }
+            /// <summary>Nonce echoed from the original <see cref="ContactMessage"/>.</summary>
+            public required ulong Nonce { get; init; }
+        }
+
         /// <summary>
         /// Produces a pairing response envelope and derives the shared key.
         /// </summary>
         public static ProduceResult Produce(
-            SenderKind kind,
+            ulong channelId,
             byte[] requestProtoBytes,
             byte[] secretKeyMaterial,
             byte[]? communicationInfo = null
@@ -42,7 +78,7 @@ public static partial class Pairing
         {
             Native.Pairing.ProducePairResponseMessageResult nativeResult =
                 Native.Pairing.produce_pair_response_message(
-                    (int)kind,
+                    channelId,
                     requestProtoBytes,
                     (UIntPtr)requestProtoBytes.Length,
                     secretKeyMaterial,
@@ -129,6 +165,106 @@ public static partial class Pairing
             finally
             {
                 Utils.FreeBuffer(nativeResult.SharedKey);
+            }
+        }
+
+        /// <summary>
+        /// Contact-creator side: publishes the actual public keys back to the
+        /// scanner in response to a <c>PrePairRequest</c>.
+        /// </summary>
+        public static ProducePrePairResult ProducePrePair(
+            ulong channelId,
+            byte[] requestProtoBytes,
+            byte[] secretKeyMaterial
+        )
+        {
+            Native.Pairing.ProducePrePairResponseMessageResult nativeResult =
+                Native.Pairing.produce_pre_pair_response_message(
+                    channelId,
+                    requestProtoBytes,
+                    (UIntPtr)requestProtoBytes.Length,
+                    secretKeyMaterial,
+                    (UIntPtr)secretKeyMaterial.Length
+                );
+
+            try
+            {
+                Utils.ThrowIfError(nativeResult.Error);
+                return new ProducePrePairResult
+                {
+                    Envelope = DeRecMessage.FromProtoBytes(Utils.CopyBuffer(nativeResult.EnvelopeWireBytes)),
+                };
+            }
+            finally
+            {
+                Utils.FreeBuffer(nativeResult.EnvelopeWireBytes);
+            }
+        }
+
+        /// <summary>
+        /// Scanner-side: decodes an inbound plaintext <c>PrePairResponse</c>
+        /// envelope.
+        /// </summary>
+        public static ExtractPrePairResult ExtractPrePair(DeRecMessage envelope)
+        {
+            byte[] envelopeBytes = envelope.ToProtoBytes();
+
+            Native.Pairing.ExtractPrePairResponseResult nativeResult =
+                Native.Pairing.extract_pre_pair_response(
+                    envelopeBytes,
+                    (UIntPtr)envelopeBytes.Length
+                );
+
+            try
+            {
+                Utils.ThrowIfError(nativeResult.Error);
+                return new ExtractPrePairResult
+                {
+                    ChannelId = nativeResult.ChannelId,
+                    ResponseProtoBytes = Utils.CopyBuffer(nativeResult.ResponseProtoBytes),
+                };
+            }
+            finally
+            {
+                Utils.FreeBuffer(nativeResult.ResponseProtoBytes);
+            }
+        }
+
+        /// <summary>
+        /// Scanner-side: validates the <c>PrePairResponse</c> against the
+        /// contact's SHA-384 binding hash. Returns the validated public keys
+        /// and echoed nonce on success; throws <see cref="DeRecException"/> on
+        /// non-Ok status, nonce mismatch, hash mismatch, or malformed fields.
+        /// </summary>
+        public static ProcessPrePairResult ProcessPrePair(
+            ContactMessage contactMessage,
+            byte[] responseProtoBytes
+        )
+        {
+            byte[] contactMessageBytes = contactMessage.ToProtoBytes();
+
+            Native.Pairing.ProcessPrePairResponseMessageResult nativeResult =
+                Native.Pairing.process_pre_pair_response_message(
+                    contactMessageBytes,
+                    (UIntPtr)contactMessageBytes.Length,
+                    responseProtoBytes,
+                    (UIntPtr)responseProtoBytes.Length
+                );
+
+            try
+            {
+                Utils.ThrowIfError(nativeResult.Error);
+                return new ProcessPrePairResult
+                {
+                    MlkemEncapsulationKey = Utils.CopyBuffer(nativeResult.MlkemEncapsulationKey),
+                    EciesPublicKey = Utils.CopyBuffer(nativeResult.EciesPublicKey),
+                    Nonce = nativeResult.Nonce,
+                };
+            }
+            finally
+            {
+                Utils.FreeBuffer(nativeResult.MlkemEncapsulationKey);
+                Utils.FreeBuffer(nativeResult.EciesPublicKey);
             }
         }
     }

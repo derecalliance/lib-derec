@@ -71,6 +71,11 @@ pub struct PairingContactMessageMaterial {
 ///
 /// Produced by [`contact_message`] and consumed by [`finish_pairing_initiator`].
 /// Always holds an ML-KEM decapsulation key; never holds an ML-KEM shared secret.
+///
+/// The matching public components (`mlkem_encapsulation_key`, `ecies_public_key`)
+/// are also retained here so that the [`CONTACT_MODE_HASHED_KEYS`][PairingContactMessageMaterial]
+/// pre-pair flow can re-publish them after the contact creator has already given
+/// the contact away.
 #[derive(CanonicalSerialize, CanonicalDeserialize, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct InitiatorSecretKeyMaterial {
     /// ML-KEM-1024 decapsulation key. Used in [`finish_pairing_initiator`] to recover
@@ -79,6 +84,13 @@ pub struct InitiatorSecretKeyMaterial {
     /// ECIES secret key. Used to decrypt incoming pairing messages and to derive the
     /// ECDH component of the final shared key.
     pub ecies_secret_key: Vec<u8>,
+    /// ML-KEM-1024 encapsulation key — the public counterpart of
+    /// `mlkem_decapsulation_key`. Republished verbatim in the `PrePairResponse`
+    /// flow when the contact was sent in `HASHED_KEYS` mode.
+    pub mlkem_encapsulation_key: Vec<u8>,
+    /// ECIES public key — the public counterpart of `ecies_secret_key`. Same
+    /// `PrePairResponse` purpose as `mlkem_encapsulation_key`.
+    pub ecies_public_key: Vec<u8>,
 }
 
 /// Secret key material held by the **responder** during pairing.
@@ -244,12 +256,14 @@ pub fn contact_message(
 
     Ok((
         PairingContactMessageMaterial {
-            mlkem_encapsulation_key: ek,
-            ecies_public_key: pk,
+            mlkem_encapsulation_key: ek.clone(),
+            ecies_public_key: pk.clone(),
         },
         InitiatorSecretKeyMaterial {
             mlkem_decapsulation_key: dk,
             ecies_secret_key: sk,
+            mlkem_encapsulation_key: ek,
+            ecies_public_key: pk,
         },
     ))
 }

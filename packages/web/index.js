@@ -16,6 +16,8 @@ export { restoreFromRecoveredBag };
 
 export const SenderKind = Object.freeze({ Owner: 0, Helper: 1, Replica: 2 });
 
+export const ContactMode = Object.freeze({ InlineKeys: 0, HashedKeys: 1 });
+
 export const FlowKind = Object.freeze({ Pairing: 0, Discovery: 1, ProtectSecret: 2, VerifyShares: 3, RecoverSecret: 4, Unpair: 5 });
 
 import {
@@ -29,9 +31,14 @@ import {
   pairing_request_decode_contact,
   pairing_request_produce,
   pairing_request_extract,
+  pairing_request_produce_pre_pair,
+  pairing_request_extract_pre_pair,
   pairing_response_produce,
   pairing_response_extract,
   pairing_response_process,
+  pairing_response_produce_pre_pair,
+  pairing_response_extract_pre_pair,
+  pairing_response_process_pre_pair,
   recovery_request_produce,
   recovery_request_extract,
   recovery_response_produce,
@@ -74,11 +81,16 @@ export const primitives = {
       decode_contact: pairing_request_decode_contact,
       produce: pairing_request_produce,
       extract: pairing_request_extract,
+      produce_pre_pair: pairing_request_produce_pre_pair,
+      extract_pre_pair: pairing_request_extract_pre_pair,
     },
     response: {
       produce: pairing_response_produce,
       extract: pairing_response_extract,
       process: pairing_response_process,
+      produce_pre_pair: pairing_response_produce_pre_pair,
+      extract_pre_pair: pairing_response_extract_pre_pair,
+      process_pre_pair: pairing_response_process_pre_pair,
     },
   },
   recovery: {

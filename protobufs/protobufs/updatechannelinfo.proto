@@ -50,13 +50,13 @@ message UpdateChannelInfoRequestMessage {
   //
   // Presence (even with an empty entries list) replaces the receiver's
   // stored map for this channel. Absence leaves it untouched.
-  optional CommunicationInfo communication_info = 1;
+  optional CommunicationInfo communicationInfo = 1;
 
   // Updated transport endpoint for the sender, or absent to leave unchanged.
   //
   // Presence updates both the URI and protocol enum. The receiver routes
   // the response to this new endpoint.
-  optional TransportProtocol transport_protocol = 2;
+  optional TransportProtocol transportProtocol = 2;
 
   // Timestamp indicating when this message was created.
   //

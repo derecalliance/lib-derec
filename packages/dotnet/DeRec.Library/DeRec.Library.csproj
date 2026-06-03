@@ -45,6 +45,41 @@
           Condition="Exists('runtimes/linux-arm64/native/libderec_library.so')" />
   </ItemGroup>
 
+  <!--
+    Copy the host-RID native library to the consumer's bin/ on plain `dotnet build`
+    (ProjectReference consumers don't get NuGet's RID-resolution).
+    NuGet consumers pick the right RID from `runtimes/<RID>/native/` instead and
+    don't see these Content items.
+  -->
+  <ItemGroup Condition="'$([MSBuild]::IsOSPlatform(OSX))' == 'true' AND '$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)' == 'Arm64'">
+      <Content Include="runtimes/osx-arm64/native/libderec_library.dylib"
+          Condition="Exists('runtimes/osx-arm64/native/libderec_library.dylib')"
+          Link="libderec_library.dylib"
+          Pack="false"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup Condition="'$([MSBuild]::IsOSPlatform(OSX))' == 'true' AND '$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)' == 'X64'">
+      <Content Include="runtimes/osx-x64/native/libderec_library.dylib"
+          Condition="Exists('runtimes/osx-x64/native/libderec_library.dylib')"
+          Link="libderec_library.dylib"
+          Pack="false"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup Condition="'$([MSBuild]::IsOSPlatform(Linux))' == 'true' AND '$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)' == 'Arm64'">
+      <Content Include="runtimes/linux-arm64/native/libderec_library.so"
+          Condition="Exists('runtimes/linux-arm64/native/libderec_library.so')"
+          Link="libderec_library.so"
+          Pack="false"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup Condition="'$([MSBuild]::IsOSPlatform(Linux))' == 'true' AND '$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)' == 'X64'">
+      <Content Include="runtimes/linux-x64/native/libderec_library.so"
+          Condition="Exists('runtimes/linux-x64/native/libderec_library.so')"
+          Link="libderec_library.so"
+          Pack="false"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
   <ItemGroup>
       <Protobuf Include="../../../protobufs/protobufs/*.proto"
           GrpcServices="None"

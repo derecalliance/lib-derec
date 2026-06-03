@@ -6,6 +6,8 @@ const DeRecProtocol = wasm.DeRecProtocolWasm;
 
 const SenderKind = Object.freeze({ Owner: 0, Helper: 1, Replica: 2 });
 
+const ContactMode = Object.freeze({ InlineKeys: 0, HashedKeys: 1 });
+
 const FlowKind = Object.freeze({ Pairing: 0, Discovery: 1, ProtectSecret: 2, VerifyShares: 3, RecoverSecret: 4, Unpair: 5 });
 
 const primitives = {
@@ -27,11 +29,16 @@ const primitives = {
       decode_contact: wasm.pairing_request_decode_contact,
       produce: wasm.pairing_request_produce,
       extract: wasm.pairing_request_extract,
+      produce_pre_pair: wasm.pairing_request_produce_pre_pair,
+      extract_pre_pair: wasm.pairing_request_extract_pre_pair,
     },
     response: {
       produce: wasm.pairing_response_produce,
       extract: wasm.pairing_response_extract,
       process: wasm.pairing_response_process,
+      produce_pre_pair: wasm.pairing_response_produce_pre_pair,
+      extract_pre_pair: wasm.pairing_response_extract_pre_pair,
+      process_pre_pair: wasm.pairing_response_process_pre_pair,
     },
   },
   recovery: {
@@ -89,6 +96,7 @@ module.exports = {
   primitives,
   DeRecProtocol,
   SenderKind,
+  ContactMode,
   FlowKind,
   decodeRecoveredSecretBag,
   restoreFromRecoveredBag,

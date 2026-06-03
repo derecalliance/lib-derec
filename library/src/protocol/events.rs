@@ -25,7 +25,6 @@ pub enum PendingAction {
         request: PairRequestMessage,
         pairing_secret: PairingSecretKeyMaterial,
         kind: SenderKind,
-        response_kind: SenderKind,
         peer_communication_info: HashMap<String, String>,
     },
     StoreShare {

@@ -82,6 +82,7 @@ enum SenderKind {
 // - both parties know each other's public keys
 // - a secure communication channel is established for subsequent protocol flows
 message PairRequestMessage {
+
   // The role of the sender of this message.
   //
   // This informs the responder whether the initiator is:
@@ -105,16 +106,6 @@ message PairRequestMessage {
   // This key is provided to the responder so that future messages can be
   // encrypted toward the initiator.
   bytes eciesPublicKey = 3;
-
-  // Channel identifier chosen by the initiator.
-  //
-  // This value identifies the logical communication channel that will be
-  // established upon successful pairing. The responder MUST use this value
-  // when sending subsequent messages to the initiator.
-  //
-  // Implementations SHOULD ensure uniqueness to avoid collisions between
-  // concurrent or stored pairing sessions.
-  uint64 channelId = 4;
 
   // Sender's application-level identifying information.
   //
@@ -194,12 +185,6 @@ message PairResponseMessage {
   // - failed authentication at the application layer
   // - invalid or malformed request data
   DeRecResult result = 1;
-
-  // The role of the sender of this message.
-  //
-  // This informs the initiator whether the responder is acting as
-  // an Owner or a Helper.
-  SenderKind senderKind = 2;
 
   // Application-level identifying information of the responder.
   //

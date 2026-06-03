@@ -78,6 +78,8 @@ pub enum MessageBody {
     ErrorResponse(ErrorResponseMessage),
     UpdateChannelInfoRequest(UpdateChannelInfoRequestMessage),
     UpdateChannelInfoResponse(UpdateChannelInfoResponseMessage),
+    PrePairRequest(PrePairRequestMessage),
+    PrePairResponse(PrePairResponseMessage),
 }
 
 impl MessageBody {
@@ -112,6 +114,8 @@ impl MessageBody {
             MessageBody::UpdateChannelInfoResponse(m) => {
                 ("UpdateChannelInfoResponseMessage", m.encode_to_vec())
             }
+            MessageBody::PrePairRequest(m) => ("PrePairRequestMessage", m.encode_to_vec()),
+            MessageBody::PrePairResponse(m) => ("PrePairResponseMessage", m.encode_to_vec()),
         };
 
         let any = Any {
@@ -178,6 +182,12 @@ impl MessageBody {
             ),
             "UpdateChannelInfoResponseMessage" => MessageBody::UpdateChannelInfoResponse(
                 UpdateChannelInfoResponseMessage::decode(any.value.as_slice())?,
+            ),
+            "PrePairRequestMessage" => {
+                MessageBody::PrePairRequest(PrePairRequestMessage::decode(any.value.as_slice())?)
+            }
+            "PrePairResponseMessage" => MessageBody::PrePairResponse(
+                PrePairResponseMessage::decode(any.value.as_slice())?,
             ),
             #[allow(deprecated)]
             unknown => return Err(DecodeError::new(unknown.to_string())),

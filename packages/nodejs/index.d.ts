@@ -59,6 +59,20 @@ export enum SenderKind {
   Replica = 2,
 }
 
+/**
+ * Selects how the initiator's public encryption material is delivered in a
+ * `ContactMessage`.
+ *
+ * - `InlineKeys` (default): keys are embedded in the contact itself.
+ * - `HashedKeys`: only a SHA-384 commitment to the keys is in the contact;
+ *   the scanner must fetch the actual keys over the wire via the `PrePair`
+ *   round-trip and verify them against the commitment before pairing.
+ */
+export enum ContactMode {
+  InlineKeys = 0,
+  HashedKeys = 1,
+}
+
 export enum FlowKind {
   Pairing = 0,
   Discovery = 1,
@@ -71,11 +85,18 @@ export enum FlowKind {
 export type UnpairAck = "required" | "not_required";
 
 export interface ContactMessage {
-  channel_id: string;
-  nonce: string;
-  transport_protocol: { uri: string; protocol: string };
-  mlkem_encapsulation_key: Uint8Array;
-  ecies_public_key: Uint8Array;
+  channel_id: bigint;
+  /** `ContactMode` numeric value (0 = INLINE_KEYS, 1 = HASHED_KEYS). */
+  contact_mode: number;
+  transport_protocol?: TransportProtocol;
+  nonce: bigint;
+  /** Present only when `contact_mode === ContactMode.InlineKeys`. */
+  mlkem_encapsulation_key?: Uint8Array;
+  /** Present only when `contact_mode === ContactMode.InlineKeys`. */
+  ecies_public_key?: Uint8Array;
+  /** Present only when `contact_mode === ContactMode.HashedKeys`. SHA-384 digest (48 bytes). */
+  contact_binding_hash?: Uint8Array;
+  timestamp?: Timestamp;
 }
 
 export interface UserSecret {
@@ -283,14 +304,9 @@ export interface CommunicationInfo {
   communication_info_entries: CommunicationInfoKeyValue[];
 }
 
-export interface ContactMessage {
-  channel_id: bigint;
-  transport_protocol?: TransportProtocol;
-  nonce: bigint;
-  mlkem_encapsulation_key: Uint8Array;
-  ecies_public_key: Uint8Array;
-  timestamp?: Timestamp;
-}
+// `ContactMessage` is defined once above (line ~87) and covers both
+// `INLINE_KEYS` and `HASHED_KEYS` modes.
+
 
 export interface ParameterRange {
   min_share_size: bigint;
@@ -309,7 +325,6 @@ export interface PairRequestMessage {
   sender_kind: number;
   mlkem_ciphertext: Uint8Array;
   ecies_public_key: Uint8Array;
-  channel_id: bigint;
   nonce: bigint;
   communication_info?: CommunicationInfo;
   parameter_range?: ParameterRange;
@@ -318,11 +333,26 @@ export interface PairRequestMessage {
 }
 
 export interface PairResponseMessage {
-  sender_kind: number;
   result?: DeRecResult;
   nonce: bigint;
   communication_info?: CommunicationInfo;
   parameter_range?: ParameterRange;
+  timestamp?: Timestamp;
+}
+
+export interface PrePairRequestMessage {
+  nonce: bigint;
+  transport_protocol?: TransportProtocol;
+  timestamp?: Timestamp;
+}
+
+export interface PrePairResponseMessage {
+  result?: DeRecResult;
+  /** Present only when `result.status === Ok`. */
+  mlkem_encapsulation_key?: Uint8Array;
+  /** Present only when `result.status === Ok`. */
+  ecies_public_key?: Uint8Array;
+  nonce: bigint;
   timestamp?: Timestamp;
 }
 
@@ -435,6 +465,35 @@ export interface PairingProcessResult {
   shared_key: Uint8Array;
 }
 
+export interface ProducePrePairResult {
+
+  envelope: Uint8Array;
+}
+
+export interface PrePairRequestExtractResult {
+
+  request: PrePairRequestMessage;
+}
+
+export interface PrePairResponseExtractResult {
+
+  response: PrePairResponseMessage;
+}
+
+export interface ProcessPrePairResult {
+
+  /** Initiator's ML-KEM-768 encapsulation key, validated against the
+   * contact's `contactBindingHash`. */
+  mlkem_encapsulation_key: Uint8Array;
+
+  /** Initiator's ECIES public key, validated against the contact's
+   * `contactBindingHash`. */
+  ecies_public_key: Uint8Array;
+
+  /** Nonce echoed from the original `ContactMessage`. */
+  nonce: bigint;
+}
+
 export interface SplitResult {
   /** Map keyed by channel id (`bigint`). */
   shares: Map<bigint, CommittedDeRecShare>;
@@ -492,7 +551,22 @@ export declare const primitives: {
   };
   pairing: {
     request: {
-      create_contact(channel_id: bigint, transport_protocol: TransportProtocol): CreateContactResult;
+      /**
+       * Creates an out-of-band `ContactMessage` to bootstrap pairing.
+       *
+       * @param channel_id  Identifier for the local pairing session.
+       * @param contact_mode  `ContactMode.InlineKeys` embeds the keys directly;
+       *                      `ContactMode.HashedKeys` embeds only a SHA-384
+       *                      commitment and the scanner must complete a
+       *                      `PrePair` round-trip first.
+       * @param transport_protocol  Endpoint the scanner uses to talk back. For
+       *                            `HashedKeys` mode it MUST be ephemeral.
+       */
+      create_contact(
+        channel_id: bigint,
+        contact_mode: ContactMode | number,
+        transport_protocol: TransportProtocol,
+      ): CreateContactResult;
       encode_contact(contact_message: ContactMessage): Uint8Array;
       decode_contact(bytes: Uint8Array): ContactMessage;
       produce(
@@ -503,10 +577,28 @@ export declare const primitives: {
       ): PairingRequestProduceResult;
 
       extract(envelope_bytes: Uint8Array, secret_key: Uint8Array): { request: PairRequestMessage };
+
+      /**
+       * Scanner-side: build a plaintext `PrePairRequest` envelope when the
+       * contact was sent in `HashedKeys` mode. The keys obtained via the
+       * matching `PrePairResponse` MUST be checked against the contact's
+       * binding hash with `pairing.response.process_pre_pair` before
+       * proceeding to a normal `produce`.
+       */
+      produce_pre_pair(
+        transport_protocol: TransportProtocol,
+        contact_message: ContactMessage,
+      ): ProducePrePairResult;
+
+      /**
+       * Initiator-side: decode an inbound plaintext `PrePairRequest`
+       * envelope.
+       */
+      extract_pre_pair(envelope_bytes: Uint8Array): PrePairRequestExtractResult;
     };
     response: {
       produce(
-        kind: SenderKind,
+        channel_id: bigint,
         request: PairRequestMessage,
         secret_key: Uint8Array,
         communication_info: CommunicationInfo | null,
@@ -518,6 +610,32 @@ export declare const primitives: {
         response: PairResponseMessage,
         secret_key: Uint8Array,
       ): PairingProcessResult;
+
+      /**
+       * Contact-creator side: publish the actual public keys back to the
+       * scanner in response to a `PrePairRequest`.
+       */
+      produce_pre_pair(
+        channel_id: bigint,
+        request: PrePairRequestMessage,
+        secret_key: Uint8Array,
+      ): ProducePrePairResult;
+
+      /**
+       * Scanner-side: decode an inbound plaintext `PrePairResponse`
+       * envelope.
+       */
+      extract_pre_pair(envelope_bytes: Uint8Array): PrePairResponseExtractResult;
+
+      /**
+       * Scanner-side: validate the `PrePairResponse` against the contact's
+       * SHA-384 binding hash. Returns the validated public keys + echoed
+       * nonce on match; throws on mismatch.
+       */
+      process_pre_pair(
+        contact_message: ContactMessage,
+        response: PrePairResponseMessage,
+      ): ProcessPrePairResult;
     };
   };
   recovery: {

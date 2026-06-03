@@ -2,15 +2,20 @@
 
 use crate::derec_message::{DeRecMessageBuilder, current_timestamp};
 use crate::primitives::pairing::PairingError;
+use crate::protocol_version::ProtocolVersion;
+use crate::types::ChannelId;
 use crate::utils::verify_timestamps;
 use derec_cryptography::pairing::{
     self as cryptography_pairing, PairingSecretKeyMaterial, PairingSharedKey,
 };
 use derec_proto::{
-    CommunicationInfo, ContactMessage, DeRecMessage, DeRecResult, MessageBody, PairRequestMessage,
-    PairResponseMessage, SenderKind, StatusEnum, TransportProtocol,
+    CommunicationInfo, ContactMessage, ContactMode, DeRecMessage, DeRecResult, MessageBody,
+    PairRequestMessage, PairResponseMessage, PrePairRequestMessage, PrePairResponseMessage,
+    StatusEnum, TransportProtocol,
 };
 use prost::Message;
+use sha2::{Digest, Sha384};
+use subtle::ConstantTimeEq;
 
 pub struct ProduceResult {
     /// Serialized outer [`derec_proto::DeRecMessage`] wire bytes carrying an encrypted inner
@@ -26,6 +31,30 @@ pub struct ExtractResult {
 
 pub struct ProcessResult {
     pub shared_key: PairingSharedKey,
+}
+
+pub struct ProducePrePairResult {
+    /// Serialized outer [`derec_proto::DeRecMessage`] wire bytes carrying a **plaintext**
+    /// inner [`derec_proto::PrePairResponseMessage`]. Ready to send over transport.
+    pub envelope: Vec<u8>,
+}
+
+pub struct PrePairExtractResult {
+    /// Decoded inner plaintext [`derec_proto::PrePairResponseMessage`].
+    pub response: PrePairResponseMessage,
+}
+
+pub struct ProcessPrePairResult {
+    /// Initiator's ML-KEM-768 encapsulation key, validated against the
+    /// contact's `contactBindingHash`. Safe to pass to
+    /// [`super::request::produce`] as part of a filled-in [`ContactMessage`].
+    pub mlkem_encapsulation_key: Vec<u8>,
+    /// Initiator's ECIES public key, validated against the contact's
+    /// `contactBindingHash`.
+    pub ecies_public_key: Vec<u8>,
+    /// Nonce echoed from the original [`ContactMessage`]. Caller can copy this
+    /// into the synthesized contact when proceeding to a normal pairing request.
+    pub nonce: u64,
 }
 
 /// Produces a pairing response envelope and derives the final pairing shared key on the
@@ -51,7 +80,6 @@ pub struct ProcessResult {
 ///
 /// # Arguments
 ///
-/// * `kind` - Role of the sender within the DeRec protocol
 /// * `request` - The decoded [`derec_proto::PairRequestMessage`] previously returned by
 ///   [`super::request::extract`].
 /// * `pairing_secret_key_material` - Initiator-side pairing secret state previously returned
@@ -125,7 +153,7 @@ pub struct ProcessResult {
 /// ).expect("extract failed");
 ///
 /// let response::ProduceResult { envelope, shared_key, .. } = response::produce(
-///     SenderKind::Owner,
+///     ChannelId(42),
 ///     &pair_request,
 ///     &initiator_key,
 ///     None,
@@ -136,10 +164,10 @@ pub struct ProcessResult {
 /// ```
 #[cfg_attr(
     feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = request.channel_id, kind = kind as i32))
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
 )]
 pub fn produce(
-    kind: SenderKind,
+    channel_id: ChannelId,
     request: &PairRequestMessage,
     pairing_secret_key_material: &PairingSecretKeyMaterial,
     communication_info: Option<CommunicationInfo>,
@@ -169,7 +197,6 @@ pub fn produce(
 
     let timestamp = current_timestamp();
     let response = PairResponseMessage {
-        sender_kind: kind.into(),
         result: Some(DeRecResult {
             status: StatusEnum::Ok as i32,
             memo: String::new(),
@@ -181,7 +208,7 @@ pub fn produce(
     };
 
     let envelope = DeRecMessageBuilder::pairing()
-        .channel_id(request.channel_id.into())
+        .channel_id(channel_id)
         .timestamp(timestamp)
         .message_body(MessageBody::PairResponse(response))
         .encrypt_pairing(&request.ecies_public_key)?
@@ -196,6 +223,102 @@ pub fn produce(
         shared_key,
         peer_transport_protocol,
     })
+}
+
+/// Produces a `PrePairResponseMessage` envelope on the **contact creator** side,
+/// the second leg of the [`derec_proto::ContactMode::HashedKeys`] pairing flow.
+///
+/// In `HASHED_KEYS` mode the contact carries only a SHA-384 commitment to the
+/// initiator's public keys (not the keys themselves), so before the scanner can
+/// build a [`PairRequestMessage`] it must ask the contact creator for the actual
+/// keys. This function builds the reply.
+///
+/// The inner [`PrePairResponseMessage`] is **plaintext** — no shared key exists yet
+/// — so the outer [`DeRecMessage`] envelope is constructed directly rather than
+/// through the encryption-enforcing [`DeRecMessageBuilder`]. The envelope's
+/// `channelId` is the local pairing channel (the same one the request arrived on),
+/// and the response echoes the request's `nonce` so the scanner can correlate it
+/// with the original contact and reject stale or spoofed replies.
+///
+/// # Arguments
+///
+/// * `channel_id` - Identifier of the local pairing channel this response belongs
+///   to. Echoed on the outer envelope so the peer can route the reply.
+/// * `request` - The decoded [`PrePairRequestMessage`] previously returned by
+///   [`super::request::extract_pre_pair`]. Only its `nonce` is consumed.
+/// * `pairing_secret_key_material` - Initiator-side pairing secret state previously
+///   returned by [`super::request::create_contact`]. Must be the
+///   [`PairingSecretKeyMaterial::Initiator`] variant; the responder variant cannot
+///   serve a `PrePairResponse` because it doesn't own the keys.
+///
+/// # Returns
+///
+/// On success returns [`ProducePrePairResult`] containing the serialized outer
+/// [`DeRecMessage`] envelope bytes.
+///
+/// # Errors
+///
+/// Returns [`crate::Error`] (specifically `Error::Pairing(...)`) in the following cases:
+///
+/// - [`PairingError::Invariant`] if `pairing_secret_key_material` is not the
+///   `Initiator` variant
+///
+/// # Security Notes
+///
+/// - The envelope is plaintext; any passive observer can read the public keys
+///   advertised here. The keys are public material, but the transport endpoint
+///   used for this exchange MUST be ephemeral (see the security note on
+///   `PrePairRequestMessage`) so the keys cannot be linked to a long-term
+///   identity by a passive observer.
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+)]
+pub fn produce_pre_pair(
+    channel_id: ChannelId,
+    request: &PrePairRequestMessage,
+    pairing_secret_key_material: &PairingSecretKeyMaterial,
+) -> Result<ProducePrePairResult, crate::Error> {
+    let initiator_material = match pairing_secret_key_material {
+        PairingSecretKeyMaterial::Initiator(m) => m,
+        _ => {
+            #[cfg(feature = "logging")]
+            tracing::warn!("expected Initiator key material for PrePair response");
+
+            return Err(PairingError::Invariant(
+                "expected Initiator key material for PrePair response",
+            )
+            .into());
+        }
+    };
+
+    let timestamp = current_timestamp();
+    let response = PrePairResponseMessage {
+        result: Some(DeRecResult {
+            status: StatusEnum::Ok as i32,
+            memo: String::new(),
+        }),
+        mlkem_encapsulation_key: Some(initiator_material.mlkem_encapsulation_key.clone()),
+        ecies_public_key: Some(initiator_material.ecies_public_key.clone()),
+        nonce: request.nonce,
+        timestamp: Some(timestamp.clone()),
+    };
+
+    let protocol_version = ProtocolVersion::current();
+    let envelope = DeRecMessage {
+        protocol_version_major: protocol_version.major,
+        protocol_version_minor: protocol_version.minor,
+        sequence: 0,
+        channel_id: channel_id.into(),
+        timestamp: Some(timestamp),
+        message: MessageBody::PrePairResponse(response).encode_to_vec(),
+    }
+    .encode_to_vec();
+
+    #[cfg(feature = "logging")]
+    tracing::info!("PrePair response envelope produced");
+
+    Ok(ProducePrePairResult { envelope })
 }
 
 /// Decrypts and decodes an incoming [`derec_proto::PairResponseMessage`] from an outer
@@ -276,7 +399,7 @@ pub fn produce(
 ///     initiator_key.ecies_secret_key(),
 /// ).expect("extract request failed");
 /// let response::ProduceResult { envelope: response_envelope, .. } =
-///     response::produce(SenderKind::Owner, &pair_request, &initiator_key, None)
+///     response::produce(ChannelId(42), &pair_request, &initiator_key, None)
 ///         .expect("produce failed");
 ///
 /// // Responder: decrypt the pairing response.
@@ -320,6 +443,71 @@ pub fn extract(
     tracing::info!("pairing response extracted and validated");
 
     Ok(ExtractResult { response })
+}
+
+/// Decodes a plaintext [`PrePairResponseMessage`] from an outer
+/// [`DeRecMessage`] envelope produced by [`produce_pre_pair`].
+///
+/// Like its request-side counterpart [`super::request::extract_pre_pair`],
+/// the `PrePair` flow carries its inner message **in plaintext** inside the
+/// envelope (no shared key exists yet, and the keys the response is delivering
+/// cannot themselves be used for encryption). This function performs no
+/// decryption — it decodes the envelope, decodes the inner [`MessageBody`],
+/// and validates the envelope-vs-body timestamp invariant.
+///
+/// Status and content validation (confirming `result.status == OK` and
+/// recomputing the SHA-384 binding hash against
+/// [`derec_proto::ContactMessage::contact_binding_hash`]) is the caller's
+/// responsibility — see the receiver checklist on
+/// [`derec_proto::PrePairResponseMessage`].
+///
+/// # Arguments
+///
+/// * `envelope_bytes` - Serialized outer [`DeRecMessage`] wire bytes, as
+///   produced by [`produce_pre_pair`].
+///
+/// # Returns
+///
+/// On success returns [`PrePairExtractResult`] containing the decoded inner
+/// [`PrePairResponseMessage`]. The caller can recover the routing
+/// `channel_id` by decoding the envelope separately if it is not already
+/// known from context.
+///
+/// # Errors
+///
+/// Returns [`crate::Error`] if:
+///
+/// - `envelope_bytes` cannot be decoded as a valid [`DeRecMessage`]
+/// - the inner [`MessageBody`] cannot be decoded
+/// - the inner [`MessageBody`] is not a [`PrePairResponseMessage`]
+/// - `envelope.timestamp != response.timestamp`
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
+)]
+pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, crate::Error> {
+    let envelope = DeRecMessage::decode(envelope_bytes).map_err(crate::Error::ProtobufDecode)?;
+
+    let response = match MessageBody::decode_from_vec(envelope.message.as_slice())
+        .map_err(crate::Error::ProtobufDecode)?
+    {
+        MessageBody::PrePairResponse(r) => r,
+        _ => {
+            #[cfg(feature = "logging")]
+            tracing::warn!("unexpected message type; expected PrePairResponseMessage");
+
+            return Err(crate::Error::Invariant(
+                "Invalid message. Expected: PrePairResponseMessage",
+            ));
+        }
+    };
+
+    verify_timestamps(envelope.timestamp, response.timestamp)?;
+
+    #[cfg(feature = "logging")]
+    tracing::info!("PrePair response envelope decoded and validated");
+
+    Ok(PrePairExtractResult { response })
 }
 
 /// Processes a decrypted pairing response and derives the final pairing shared key on the
@@ -416,7 +604,7 @@ pub fn extract(
 /// ).expect("extract request failed");
 ///
 /// let response::ProduceResult { envelope: response_envelope, shared_key: initiator_shared_key, .. } =
-///     response::produce(SenderKind::Owner, &pair_request, &initiator_key, None)
+///     response::produce(ChannelId(42), &pair_request, &initiator_key, None)
 ///         .expect("produce failed");
 ///
 /// // Responder side: extract the pairing response and derive the shared key.
@@ -442,9 +630,23 @@ pub fn process(
 ) -> Result<ProcessResult, crate::Error> {
     validate_process_inputs(contact_message, response)?;
 
+    let mlkem_encapsulation_key = contact_message
+        .mlkem_encapsulation_key
+        .as_ref()
+        .ok_or(PairingError::InvalidContactMessage(
+            "mlkem_encapsulation_key is missing",
+        ))?
+        .clone();
+    let ecies_public_key = contact_message
+        .ecies_public_key
+        .as_ref()
+        .ok_or(PairingError::InvalidContactMessage(
+            "ecies_public_key is missing",
+        ))?
+        .clone();
     let pk = cryptography_pairing::PairingContactMessageMaterial {
-        mlkem_encapsulation_key: contact_message.mlkem_encapsulation_key.clone(),
-        ecies_public_key: contact_message.ecies_public_key.clone(),
+        mlkem_encapsulation_key,
+        ecies_public_key,
     };
 
     let responder_material = match pairing_secret_key_material {
@@ -464,6 +666,95 @@ pub fn process(
     tracing::info!("pairing complete; responder shared key derived");
 
     Ok(ProcessResult { shared_key })
+}
+
+/// Validates an incoming [`PrePairResponseMessage`] against the original
+/// [`ContactMessage`] and, on success, hands back the initiator's public
+/// keys ready to be used to construct a normal [`PairRequestMessage`].
+///
+/// This is the **scanner**-side check that closes the
+/// [`derec_proto::ContactMode::HashedKeys`] pre-pair leg. Per the receiver
+/// checklist on [`derec_proto::PrePairResponseMessage`], a conforming
+/// implementation MUST:
+///
+/// 1. confirm `result.status == OK`;
+/// 2. recompute `SHA-384(mlkemEncapsulationKey || eciesPublicKey
+///    || u64_be(nonce) || u64_be(channelId))` and verify it matches the
+///    original [`ContactMessage::contact_binding_hash`];
+/// 3. only on match, proceed to construct a normal [`PairRequestMessage`].
+///
+/// This function performs all three checks. The recomputation uses the
+/// `nonce` and `channelId` from the **contact** — the trusted out-of-band
+/// values — so a tampered response that swapped them cannot mask a hash
+/// mismatch by tampering them in parallel.
+///
+/// # Arguments
+///
+/// * `contact_message` - The decoded [`ContactMessage`] received out-of-band.
+///   Its [`ContactMode`] must be [`ContactMode::HashedKeys`] and it must
+///   carry a non-empty `contact_binding_hash`.
+/// * `response` - The decoded [`PrePairResponseMessage`] previously returned
+///   by [`extract_pre_pair`].
+///
+/// # Returns
+///
+/// On success returns [`ProcessPrePairResult`] containing the validated
+/// `mlkem_encapsulation_key`, `ecies_public_key`, and the echoed `nonce`.
+///
+/// # Errors
+///
+/// Returns [`crate::Error`] (specifically `Error::Pairing(...)`) in the following cases:
+///
+/// - [`PairingError::InvalidPairResponseMessage`] if the response is malformed
+///   (missing result, missing/empty keys)
+/// - [`PairingError::NonOkStatus`] if `result.status != Ok`, carrying the
+///   peer's status code and memo string
+/// - [`PairingError::InvalidContactMessage`] if the contact is not in
+///   [`ContactMode::HashedKeys`] or lacks a `contact_binding_hash`
+/// - [`PairingError::ProtocolViolation`] if `response.nonce` does not match
+///   `contact_message.nonce` (session correlation failure) or if the
+///   recomputed binding hash does not match `contact_binding_hash`
+///   (potential MITM on the plaintext pre-pair leg)
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = contact_message.channel_id))
+)]
+pub fn process_pre_pair(
+    contact_message: &ContactMessage,
+    response: &PrePairResponseMessage,
+) -> Result<ProcessPrePairResult, crate::Error> {
+    validate_process_pre_pair_inputs(contact_message, response)?;
+
+    // Safe to unwrap: presence + non-emptiness checked above.
+    let mlkem_encapsulation_key = response.mlkem_encapsulation_key.clone().unwrap();
+    let ecies_public_key = response.ecies_public_key.clone().unwrap();
+    let expected_hash = contact_message.contact_binding_hash.as_ref().unwrap();
+
+    let mut hasher = Sha384::new();
+    hasher.update(&mlkem_encapsulation_key);
+    hasher.update(&ecies_public_key);
+    hasher.update(contact_message.nonce.to_be_bytes());
+    hasher.update(contact_message.channel_id.to_be_bytes());
+    let recomputed = hasher.finalize();
+
+    let matched: bool = recomputed.as_slice().ct_eq(expected_hash.as_slice()).into();
+    if !matched {
+        #[cfg(feature = "logging")]
+        tracing::warn!(
+            "contact binding hash mismatch; published keys do not match the contact commitment"
+        );
+
+        return Err(PairingError::ProtocolViolation("contact binding hash mismatch").into());
+    }
+
+    #[cfg(feature = "logging")]
+    tracing::info!("PrePair response validated against contact binding hash");
+
+    Ok(ProcessPrePairResult {
+        mlkem_encapsulation_key,
+        ecies_public_key,
+        nonce: response.nonce,
+    })
 }
 
 fn validate_produce_inputs(request: &PairRequestMessage) -> Result<(), crate::Error> {
@@ -522,16 +813,101 @@ fn validate_process_inputs(
         .into());
     }
 
-    if contact_message.mlkem_encapsulation_key.is_empty() {
+    let mlkem_present = contact_message
+        .mlkem_encapsulation_key
+        .as_ref()
+        .is_some_and(|v| !v.is_empty());
+    if !mlkem_present {
         #[cfg(feature = "logging")]
         tracing::warn!("contact message missing mlkem_encapsulation_key");
         return Err(PairingError::InvalidContactMessage("mlkem_encapsulation_key is empty").into());
     }
 
-    if contact_message.ecies_public_key.is_empty() {
+    let ecies_present = contact_message
+        .ecies_public_key
+        .as_ref()
+        .is_some_and(|v| !v.is_empty());
+    if !ecies_present {
         #[cfg(feature = "logging")]
         tracing::warn!("contact message missing ecies_public_key");
         return Err(PairingError::InvalidContactMessage("ecies_public_key is empty").into());
+    }
+
+    if response.nonce != contact_message.nonce {
+        #[cfg(feature = "logging")]
+        tracing::warn!("nonce mismatch; possible replay or wrong pairing session");
+        return Err(PairingError::ProtocolViolation("nonce mismatch").into());
+    }
+
+    Ok(())
+}
+
+fn validate_process_pre_pair_inputs(
+    contact_message: &ContactMessage,
+    response: &PrePairResponseMessage,
+) -> Result<(), crate::Error> {
+    let res = response
+        .result
+        .as_ref()
+        .ok_or(PairingError::InvalidPairResponseMessage("missing result"))?;
+
+    if res.status != StatusEnum::Ok as i32 {
+        #[cfg(feature = "logging")]
+        tracing::warn!(
+            status = res.status,
+            memo = %res.memo,
+            "PrePair response status is not Ok"
+        );
+
+        return Err(PairingError::NonOkStatus {
+            status: res.status,
+            memo: res.memo.to_owned(),
+        }
+        .into());
+    }
+
+    if contact_message.contact_mode != ContactMode::HashedKeys as i32 {
+        #[cfg(feature = "logging")]
+        tracing::warn!(
+            contact_mode = contact_message.contact_mode,
+            "PrePair processing requires HASHED_KEYS contact mode"
+        );
+        return Err(PairingError::InvalidContactMessage(
+            "PrePair processing requires HASHED_KEYS contact mode",
+        )
+        .into());
+    }
+
+    let binding_hash_present = contact_message
+        .contact_binding_hash
+        .as_ref()
+        .is_some_and(|h| !h.is_empty());
+    if !binding_hash_present {
+        #[cfg(feature = "logging")]
+        tracing::warn!("contact message missing contact_binding_hash");
+        return Err(PairingError::InvalidContactMessage("contact_binding_hash is missing").into());
+    }
+
+    let mlkem_present = response
+        .mlkem_encapsulation_key
+        .as_ref()
+        .is_some_and(|v| !v.is_empty());
+    if !mlkem_present {
+        #[cfg(feature = "logging")]
+        tracing::warn!("PrePair response missing mlkem_encapsulation_key");
+        return Err(
+            PairingError::InvalidPairResponseMessage("mlkem_encapsulation_key is empty").into(),
+        );
+    }
+
+    let ecies_present = response
+        .ecies_public_key
+        .as_ref()
+        .is_some_and(|v| !v.is_empty());
+    if !ecies_present {
+        #[cfg(feature = "logging")]
+        tracing::warn!("PrePair response missing ecies_public_key");
+        return Err(PairingError::InvalidPairResponseMessage("ecies_public_key is empty").into());
     }
 
     if response.nonce != contact_message.nonce {

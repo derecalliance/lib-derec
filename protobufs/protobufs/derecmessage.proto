@@ -13,6 +13,7 @@ import "verify.proto";
 import "getshare.proto";
 import "secretidsversions.proto";
 import "updatechannelinfo.proto";
+import "prepair.proto";
 import "error.proto";
 
 package org.derecalliance.derec.protobuf;
@@ -170,6 +171,8 @@ message DeRecMessage {
       ErrorResponseMessage errorResponseMessage = 13;
       UpdateChannelInfoRequestMessage updateChannelInfoRequestMessage = 14;
       UpdateChannelInfoResponseMessage updateChannelInfoResponseMessage = 15;
+      PrePairRequestMessage prePairRequestMessage = 16;
+      PrePairResponseMessage prePairResponseMessage = 17;
     }
   }
 }

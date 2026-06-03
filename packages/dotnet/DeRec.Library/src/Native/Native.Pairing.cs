@@ -56,9 +56,51 @@ internal static class Pairing
         public Buffer SharedKey;
     }
 
+    // --- PrePair (HASHED_KEYS) flow -----------------------------------------
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct ProducePrePairRequestMessageResult
+    {
+        public DeRecError Error;
+        public Buffer EnvelopeWireBytes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct ExtractPrePairRequestResult
+    {
+        public DeRecError Error;
+        public ulong ChannelId;
+        public Buffer RequestProtoBytes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct ProducePrePairResponseMessageResult
+    {
+        public DeRecError Error;
+        public Buffer EnvelopeWireBytes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct ExtractPrePairResponseResult
+    {
+        public DeRecError Error;
+        public ulong ChannelId;
+        public Buffer ResponseProtoBytes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct ProcessPrePairResponseMessageResult
+    {
+        public DeRecError Error;
+        public Buffer MlkemEncapsulationKey;
+        public Buffer EciesPublicKey;
+        public ulong Nonce;
+    }
+
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern CreateContactMessageResult create_contact_message(
         ulong channelId,
+        int contactMode,
         byte[] transportProtocolBytes,
         UIntPtr transportProtocolBytesLen
     );
@@ -84,7 +126,7 @@ internal static class Pairing
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern ProducePairResponseMessageResult produce_pair_response_message(
-        int senderKind,
+        ulong channelId,
         byte[] requestProtoBytes,
         UIntPtr requestProtoBytesLen,
         byte[] secretKeyMaterial,
@@ -109,5 +151,44 @@ internal static class Pairing
         UIntPtr responseProtoBytesLen,
         byte[] secretKeyMaterial,
         UIntPtr secretKeyMaterialLen
+    );
+
+    // --- PrePair (HASHED_KEYS) FFI imports ----------------------------------
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern ProducePrePairRequestMessageResult produce_pre_pair_request_message(
+        byte[] transportProtocolBytes,
+        UIntPtr transportProtocolBytesLen,
+        byte[] contactMessageBytes,
+        UIntPtr contactMessageBytesLen
+    );
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern ExtractPrePairRequestResult extract_pre_pair_request(
+        byte[] envelopeBytes,
+        UIntPtr envelopeBytesLen
+    );
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern ProducePrePairResponseMessageResult produce_pre_pair_response_message(
+        ulong channelId,
+        byte[] requestProtoBytes,
+        UIntPtr requestProtoBytesLen,
+        byte[] secretKeyMaterial,
+        UIntPtr secretKeyMaterialLen
+    );
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern ExtractPrePairResponseResult extract_pre_pair_response(
+        byte[] envelopeBytes,
+        UIntPtr envelopeBytesLen
+    );
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern ProcessPrePairResponseMessageResult process_pre_pair_response_message(
+        byte[] contactMessageBytes,
+        UIntPtr contactMessageBytesLen,
+        byte[] responseProtoBytes,
+        UIntPtr responseProtoBytesLen
     );
 }

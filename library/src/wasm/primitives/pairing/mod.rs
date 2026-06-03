@@ -155,10 +155,14 @@ pub struct ContactMessage {
     pub channel_id: u64,
     pub transport_protocol: Option<TransportProtocol>,
     pub nonce: u64,
-    #[serde(with = "serde_bytes")]
-    pub mlkem_encapsulation_key: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    pub ecies_public_key: Vec<u8>,
+    /// `i32` matching `derec_proto::ContactMode` (0 = INLINE_KEYS, 1 = HASHED_KEYS).
+    pub contact_mode: i32,
+    #[serde(with = "serde_bytes", default, skip_serializing_if = "Option::is_none")]
+    pub mlkem_encapsulation_key: Option<Vec<u8>>,
+    #[serde(with = "serde_bytes", default, skip_serializing_if = "Option::is_none")]
+    pub ecies_public_key: Option<Vec<u8>>,
+    #[serde(with = "serde_bytes", default, skip_serializing_if = "Option::is_none")]
+    pub contact_binding_hash: Option<Vec<u8>>,
     pub timestamp: Option<Timestamp>,
 }
 
@@ -168,8 +172,10 @@ impl From<derec_proto::ContactMessage> for ContactMessage {
             channel_id: value.channel_id,
             transport_protocol: value.transport_protocol.map(Into::into),
             nonce: value.nonce,
+            contact_mode: value.contact_mode,
             mlkem_encapsulation_key: value.mlkem_encapsulation_key,
             ecies_public_key: value.ecies_public_key,
+            contact_binding_hash: value.contact_binding_hash,
             timestamp: value.timestamp.map(Into::into),
         }
     }
@@ -181,8 +187,10 @@ impl From<ContactMessage> for derec_proto::ContactMessage {
             channel_id: value.channel_id,
             transport_protocol: value.transport_protocol.map(Into::into),
             nonce: value.nonce,
+            contact_mode: value.contact_mode,
             mlkem_encapsulation_key: value.mlkem_encapsulation_key,
             ecies_public_key: value.ecies_public_key,
+            contact_binding_hash: value.contact_binding_hash,
             timestamp: value.timestamp.map(Into::into),
         }
     }
@@ -195,7 +203,6 @@ pub struct PairRequestMessage {
     pub mlkem_ciphertext: Vec<u8>,
     #[serde(with = "serde_bytes")]
     pub ecies_public_key: Vec<u8>,
-    pub channel_id: u64,
     pub nonce: u64,
     pub communication_info: Option<CommunicationInfo>,
     pub parameter_range: Option<ParameterRange>,
@@ -209,7 +216,6 @@ impl From<derec_proto::PairRequestMessage> for PairRequestMessage {
             sender_kind: value.sender_kind,
             mlkem_ciphertext: value.mlkem_ciphertext,
             ecies_public_key: value.ecies_public_key,
-            channel_id: value.channel_id,
             nonce: value.nonce,
             communication_info: value.communication_info.map(Into::into),
             parameter_range: value.parameter_range.map(Into::into),
@@ -225,7 +231,6 @@ impl From<PairRequestMessage> for derec_proto::PairRequestMessage {
             sender_kind: value.sender_kind,
             mlkem_ciphertext: value.mlkem_ciphertext,
             ecies_public_key: value.ecies_public_key,
-            channel_id: value.channel_id,
             nonce: value.nonce,
             communication_info: value.communication_info.map(Into::into),
             parameter_range: value.parameter_range.map(Into::into),
@@ -237,7 +242,6 @@ impl From<PairRequestMessage> for derec_proto::PairRequestMessage {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PairResponseMessage {
-    pub sender_kind: i32,
     pub result: Option<crate::wasm::primitives::types::DeRecResult>,
     pub nonce: u64,
     pub communication_info: Option<CommunicationInfo>,
@@ -248,7 +252,6 @@ pub struct PairResponseMessage {
 impl From<derec_proto::PairResponseMessage> for PairResponseMessage {
     fn from(value: derec_proto::PairResponseMessage) -> Self {
         Self {
-            sender_kind: value.sender_kind,
             result: value.result.map(Into::into),
             nonce: value.nonce,
             communication_info: value.communication_info.map(Into::into),
@@ -261,11 +264,72 @@ impl From<derec_proto::PairResponseMessage> for PairResponseMessage {
 impl From<PairResponseMessage> for derec_proto::PairResponseMessage {
     fn from(value: PairResponseMessage) -> Self {
         Self {
-            sender_kind: value.sender_kind,
             result: value.result.map(Into::into),
             nonce: value.nonce,
             communication_info: value.communication_info.map(Into::into),
             parameter_range: value.parameter_range.map(Into::into),
+            timestamp: value.timestamp.map(Into::into),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PrePairRequestMessage {
+    pub nonce: u64,
+    pub transport_protocol: Option<TransportProtocol>,
+    pub timestamp: Option<Timestamp>,
+}
+
+impl From<derec_proto::PrePairRequestMessage> for PrePairRequestMessage {
+    fn from(value: derec_proto::PrePairRequestMessage) -> Self {
+        Self {
+            nonce: value.nonce,
+            transport_protocol: value.transport_protocol.map(Into::into),
+            timestamp: value.timestamp.map(Into::into),
+        }
+    }
+}
+
+impl From<PrePairRequestMessage> for derec_proto::PrePairRequestMessage {
+    fn from(value: PrePairRequestMessage) -> Self {
+        Self {
+            nonce: value.nonce,
+            transport_protocol: value.transport_protocol.map(Into::into),
+            timestamp: value.timestamp.map(Into::into),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PrePairResponseMessage {
+    pub result: Option<crate::wasm::primitives::types::DeRecResult>,
+    #[serde(with = "serde_bytes", default, skip_serializing_if = "Option::is_none")]
+    pub mlkem_encapsulation_key: Option<Vec<u8>>,
+    #[serde(with = "serde_bytes", default, skip_serializing_if = "Option::is_none")]
+    pub ecies_public_key: Option<Vec<u8>>,
+    pub nonce: u64,
+    pub timestamp: Option<Timestamp>,
+}
+
+impl From<derec_proto::PrePairResponseMessage> for PrePairResponseMessage {
+    fn from(value: derec_proto::PrePairResponseMessage) -> Self {
+        Self {
+            result: value.result.map(Into::into),
+            mlkem_encapsulation_key: value.mlkem_encapsulation_key,
+            ecies_public_key: value.ecies_public_key,
+            nonce: value.nonce,
+            timestamp: value.timestamp.map(Into::into),
+        }
+    }
+}
+
+impl From<PrePairResponseMessage> for derec_proto::PrePairResponseMessage {
+    fn from(value: PrePairResponseMessage) -> Self {
+        Self {
+            result: value.result.map(Into::into),
+            mlkem_encapsulation_key: value.mlkem_encapsulation_key,
+            ecies_public_key: value.ecies_public_key,
+            nonce: value.nonce,
             timestamp: value.timestamp.map(Into::into),
         }
     }

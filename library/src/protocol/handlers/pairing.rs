@@ -124,10 +124,9 @@ pub(in crate::protocol) async fn accept<
     request: &PairRequestMessage,
     pairing_secret: &PairingSecretKeyMaterial,
     kind: SenderKind,
-    response_kind: SenderKind,
 ) -> Result<Vec<DeRecEvent>> {
     let comm_info = build_communication_info(communication_info);
-    let resp = response::produce(response_kind, request, pairing_secret, comm_info)?;
+    let resp = response::produce(channel_id, request, pairing_secret, comm_info)?;
 
     secret_store
         .save(channel_id, SecretValue::SharedKey(resp.shared_key))
@@ -182,7 +181,6 @@ pub(in crate::protocol) async fn reject<Ss: DeRecSecretStore, T: DeRecTransport>
     communication_info: &HashMap<String, String>,
     channel_id: ChannelId,
     request: &PairRequestMessage,
-    response_kind: SenderKind,
     status: StatusEnum,
     memo: &str,
 ) -> Result<()> {
@@ -196,7 +194,6 @@ pub(in crate::protocol) async fn reject<Ss: DeRecSecretStore, T: DeRecTransport>
 
     let timestamp = current_timestamp();
     let response = PairResponseMessage {
-        sender_kind: response_kind.into(),
         result: Some(DeRecResult {
             status: status as i32,
             memo: memo.to_owned(),
@@ -208,7 +205,7 @@ pub(in crate::protocol) async fn reject<Ss: DeRecSecretStore, T: DeRecTransport>
     };
 
     let envelope = DeRecMessageBuilder::pairing()
-        .channel_id(request.channel_id.into())
+        .channel_id(channel_id)
         .timestamp(timestamp)
         .message_body(MessageBody::PairResponse(response))
         .encrypt_pairing(&request.ecies_public_key)?
@@ -237,12 +234,12 @@ fn on_request(
     pairing_secret: &PairingSecretKeyMaterial,
 ) -> Result<Vec<DeRecEvent>> {
     let peer_communication_info = extract_communication_info(&request.communication_info);
-    let (response_kind, kind) = if request.sender_kind == SenderKind::Owner as i32 {
-        (SenderKind::Helper, SenderKind::Helper)
+    let kind = if request.sender_kind == SenderKind::Owner as i32 {
+        SenderKind::Helper
     } else if request.sender_kind == SenderKind::Replica as i32 {
-        (SenderKind::Replica, SenderKind::Replica)
+        SenderKind::Replica
     } else {
-        (SenderKind::Owner, SenderKind::Owner)
+        SenderKind::Owner
     };
 
     let action = PendingAction::Pairing {
@@ -250,7 +247,6 @@ fn on_request(
         request: request.clone(),
         pairing_secret: pairing_secret.clone(),
         kind,
-        response_kind,
         peer_communication_info,
     };
 
@@ -292,13 +288,12 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
         .remove(channel_id, SecretKind::PairingContact)
         .await?;
 
-    let kind = if response.sender_kind == SenderKind::Helper as i32 {
-        SenderKind::Owner
-    } else if response.sender_kind == SenderKind::Replica as i32 {
-        SenderKind::Replica
-    } else {
-        SenderKind::Helper
-    };
+    // The local role was committed to the channel record at `start` time;
+    // load it now rather than derive it from the peer's response.
+    let channel = channel_store.load(channel_id).await?.ok_or(Error::Invariant(
+        "channel record missing on pair response — start must be called first",
+    ))?;
+    let kind = channel.role;
 
     let status = if kind == SenderKind::Replica {
         crate::types::ChannelStatus::Pending
@@ -308,14 +303,12 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
 
     let peer_communication_info = extract_communication_info(&response.communication_info);
 
-    if let Some(mut channel) = channel_store.load(channel_id).await? {
-        channel.status = status;
-
-        for (k, v) in &peer_communication_info {
-            channel.communication_info.insert(k.clone(), v.clone());
-        }
-        channel_store.save(channel).await?;
+    let mut channel = channel;
+    channel.status = status;
+    for (k, v) in &peer_communication_info {
+        channel.communication_info.insert(k.clone(), v.clone());
     }
+    channel_store.save(channel).await?;
 
     #[cfg(feature = "logging")]
     tracing::info!("pairing complete (initiator side)");

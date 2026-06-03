@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    CommunicationInfo, ContactMessage, PairRequestMessage, TransportProtocol,
+    CommunicationInfo, ContactMessage, PairRequestMessage, PrePairRequestMessage, TransportProtocol,
     deserialize_pairing_secret_key_material, get_sender_kind,
     serialize_pairing_secret_key_material,
 };
@@ -38,12 +38,23 @@ pub struct ExtractResult {
 }
 
 #[wasm_bindgen(js_name = "pairing_request_create_contact")]
-pub fn create_contact(channel_id: u64, transport_protocol: JsValue) -> Result<JsValue, JsValue> {
+pub fn create_contact(
+    channel_id: u64,
+    contact_mode: u32,
+    transport_protocol: JsValue,
+) -> Result<JsValue, JsValue> {
+    let contact_mode = derec_proto::ContactMode::try_from(contact_mode as i32).map_err(|_| {
+        js_error(
+            "INVALID_CONTACT_MODE",
+            format!("invalid contact_mode value: {contact_mode}"),
+        )
+    })?;
     let transport_protocol: TransportProtocol = from_js(transport_protocol)?;
     let transport_protocol_proto: derec_proto::TransportProtocol = transport_protocol.into();
 
-    let result = request::create_contact(channel_id.into(), transport_protocol_proto)
-        .map_err(js_error_from_lib)?;
+    let result =
+        request::create_contact(channel_id.into(), contact_mode, transport_protocol_proto)
+            .map_err(js_error_from_lib)?;
 
     to_js(&CreateContactResult {
         contact_message: result.contact_message.into(),
@@ -108,6 +119,47 @@ pub fn extract(envelope_bytes: &[u8], secret_key: &[u8]) -> Result<JsValue, JsVa
     let result = request::extract(envelope_bytes, pairing_sk.ecies_secret_key())
         .map_err(js_error_from_lib)?;
     to_js(&ExtractResult {
+        request: result.request.into(),
+    })
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ProducePrePairResult {
+    #[serde(with = "serde_bytes")]
+    pub envelope: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PrePairExtractResult {
+    pub request: PrePairRequestMessage,
+}
+
+/// Scanner-side: build the plaintext `PrePairRequest` envelope for a
+/// `HASHED_KEYS` contact.
+#[wasm_bindgen(js_name = "pairing_request_produce_pre_pair")]
+pub fn produce_pre_pair_request(
+    transport_protocol: JsValue,
+    contact_message: JsValue,
+) -> Result<JsValue, JsValue> {
+    let transport_protocol: TransportProtocol = from_js(transport_protocol)?;
+    let transport_protocol_proto: derec_proto::TransportProtocol = transport_protocol.into();
+    let contact_message: ContactMessage = from_js(contact_message)?;
+    let contact_message_proto: derec_proto::ContactMessage = contact_message.into();
+
+    let result =
+        request::produce_pre_pair_request(transport_protocol_proto, &contact_message_proto)
+            .map_err(js_error_from_lib)?;
+
+    to_js(&ProducePrePairResult {
+        envelope: result.envelope,
+    })
+}
+
+/// Initiator-side: decode an inbound plaintext `PrePairRequest` envelope.
+#[wasm_bindgen(js_name = "pairing_request_extract_pre_pair")]
+pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<JsValue, JsValue> {
+    let result = request::extract_pre_pair(envelope_bytes).map_err(js_error_from_lib)?;
+    to_js(&PrePairExtractResult {
         request: result.request.into(),
     })
 }

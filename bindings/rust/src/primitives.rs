@@ -24,6 +24,7 @@ use std::collections::HashMap;
 pub fn run_all() {
     run_protocol_version_test();
     run_pairing_flow_test();
+    run_pairing_flow_hashed_keys_test();
     run_sharing_flow_test();
     run_verification_flow_test();
     run_recovery_flow_test();
@@ -50,6 +51,7 @@ fn run_pairing_flow_test() {
     // Initiator creates an out-of-band contact.
     let contact_result = pair_request::create_contact(
         channel_id,
+        derec_proto::ContactMode::InlineKeys,
         TransportProtocol {
             uri: "https://example.com/alice".to_owned(),
             protocol: Protocol::Https.into(),
@@ -104,7 +106,7 @@ fn run_pairing_flow_test() {
 
     // Initiator produces the pairing response and derives its shared key.
     let pair_resp = pair_response::produce(
-        SenderKind::Owner,
+        channel_id,
         &extracted_request.request,
         &contact_result.secret_key,
         None,
@@ -142,6 +144,157 @@ fn run_pairing_flow_test() {
     );
 
     println!("Pairing flow test passed.");
+}
+
+fn run_pairing_flow_hashed_keys_test() {
+    println!("=== Pairing flow test (HASHED_KEYS + PrePair) ===");
+
+    let channel_id = ChannelId(2);
+
+    // Alice creates a HASHED_KEYS contact. The contact carries only a
+    // SHA-384 commitment to her public keys, not the keys themselves —
+    // it is small enough for a QR code, and Bob will fetch the keys
+    // over the wire via the PrePair leg.
+    let alice_contact_result = pair_request::create_contact(
+        channel_id,
+        derec_proto::ContactMode::HashedKeys,
+        TransportProtocol {
+            uri: "https://example.com/alice/ephemeral".to_owned(),
+            protocol: Protocol::Https.into(),
+        },
+    )
+    .expect("pair_request::create_contact (HASHED_KEYS) failed");
+
+    let alice_contact = alice_contact_result.contact_message.clone();
+    let alice_secret = alice_contact_result.secret_key;
+
+    assert_eq!(
+        alice_contact.contact_mode,
+        derec_proto::ContactMode::HashedKeys as i32,
+        "contact must advertise HASHED_KEYS mode"
+    );
+    assert!(
+        alice_contact.mlkem_encapsulation_key.is_none(),
+        "HASHED_KEYS contact must NOT carry the ML-KEM key inline"
+    );
+    assert!(
+        alice_contact.ecies_public_key.is_none(),
+        "HASHED_KEYS contact must NOT carry the ECIES key inline"
+    );
+    let binding_hash = alice_contact
+        .contact_binding_hash
+        .clone()
+        .expect("HASHED_KEYS contact must carry contact_binding_hash");
+    assert_eq!(
+        binding_hash.len(),
+        48,
+        "contact_binding_hash must be a SHA-384 digest (48 bytes)"
+    );
+
+    // --- PrePair leg --------------------------------------------------------
+
+    // Bob (the scanner) sends a PrePair request asking for the actual keys.
+    // The envelope is plaintext (no shared key exists yet) and routes to
+    // the channel_id from the contact.
+    let bob_prepair_req = pair_request::produce_pre_pair_request(
+        TransportProtocol {
+            uri: "https://example.com/helper/ephemeral".to_owned(),
+            protocol: Protocol::Https.into(),
+        },
+        &alice_contact,
+    )
+    .expect("pair_request::produce_pre_pair_request failed");
+
+    // Alice decodes the inbound plaintext request.
+    let extracted_prepair_req = pair_request::extract_pre_pair(&bob_prepair_req.envelope)
+        .expect("pair_request::extract_pre_pair failed");
+    assert_eq!(
+        extracted_prepair_req.request.nonce, alice_contact.nonce,
+        "PrePair request must echo the contact's nonce"
+    );
+
+    // Alice publishes the public keys back to Bob (plaintext envelope).
+    let alice_prepair_resp = pair_response::produce_pre_pair(
+        channel_id,
+        &extracted_prepair_req.request,
+        &alice_secret,
+    )
+    .expect("pair_response::produce_pre_pair failed");
+
+    // Bob decodes the inbound plaintext response.
+    let extracted_prepair_resp = pair_response::extract_pre_pair(&alice_prepair_resp.envelope)
+        .expect("pair_response::extract_pre_pair failed");
+
+    // Bob recomputes the SHA-384 binding hash and validates it against the
+    // commitment from the original contact. Any tampering on the plaintext
+    // PrePair leg surfaces here.
+    let processed_prepair = pair_response::process_pre_pair(
+        &alice_contact,
+        &extracted_prepair_resp.response,
+    )
+    .expect("pair_response::process_pre_pair failed");
+
+    assert!(
+        !processed_prepair.mlkem_encapsulation_key.is_empty(),
+        "PrePair must return Alice's ML-KEM encapsulation key"
+    );
+    assert!(
+        !processed_prepair.ecies_public_key.is_empty(),
+        "PrePair must return Alice's ECIES public key"
+    );
+    assert_eq!(processed_prepair.nonce, alice_contact.nonce);
+
+    // --- Normal pairing flow ------------------------------------------------
+    //
+    // Bob synthesizes a "filled-in" contact by copying the validated keys
+    // into a clone of the original (HASHED_KEYS) contact. From here on the
+    // flow is identical to the INLINE_KEYS path — `pair_request::produce`
+    // and the rest of the chain do not need to know PrePair happened.
+
+    let mut filled_in_contact = alice_contact.clone();
+    filled_in_contact.mlkem_encapsulation_key =
+        Some(processed_prepair.mlkem_encapsulation_key.clone());
+    filled_in_contact.ecies_public_key = Some(processed_prepair.ecies_public_key.clone());
+
+    let pair_req = pair_request::produce(
+        SenderKind::Helper,
+        TransportProtocol {
+            uri: "https://example.com/helper".to_owned(),
+            protocol: Protocol::Https.into(),
+        },
+        &filled_in_contact,
+        None,
+    )
+    .expect("pair_request::produce failed");
+
+    let extracted_request = pair_request::extract(&pair_req.envelope, alice_secret.ecies_secret_key())
+        .expect("pair_request::extract failed");
+
+    let pair_resp = pair_response::produce(
+        channel_id,
+        &extracted_request.request,
+        &alice_secret,
+        None,
+    )
+    .expect("pair_response::produce failed");
+
+    let extracted_response =
+        pair_response::extract(&pair_resp.envelope, pair_req.secret_key.ecies_secret_key())
+            .expect("pair_response::extract failed");
+
+    let processed = pair_response::process(
+        &pair_req.initiator_contact_message,
+        &extracted_response.response,
+        &pair_req.secret_key,
+    )
+    .expect("pair_response::process failed");
+
+    assert_eq!(
+        pair_resp.shared_key, processed.shared_key,
+        "shared keys derived by both sides must match (HASHED_KEYS path)"
+    );
+
+    println!("Pairing flow test (HASHED_KEYS + PrePair) passed.");
 }
 
 fn run_sharing_flow_test() {

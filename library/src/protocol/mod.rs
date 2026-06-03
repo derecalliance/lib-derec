@@ -206,7 +206,11 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
         #[cfg(feature = "logging")]
         tracing::debug!(channel_id = channel_id.0, "creating contact message");
 
-        let result = create_contact_message(channel_id, self.own_transport.clone())?;
+        let result = create_contact_message(
+            channel_id,
+            derec_proto::ContactMode::InlineKeys,
+            self.own_transport.clone(),
+        )?;
 
         self.secret_store
             .save(channel_id, SecretValue::PairingSecret(result.secret_key))
@@ -453,7 +457,6 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                 request,
                 pairing_secret,
                 kind,
-                response_kind,
                 ..
             } => {
                 handlers::pairing::accept(
@@ -465,7 +468,6 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     &request,
                     &pairing_secret,
                     kind,
-                    response_kind,
                 )
                 .await
             }
@@ -579,7 +581,6 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
             PendingAction::Pairing {
                 channel_id,
                 request,
-                response_kind,
                 ..
             } => {
                 handlers::pairing::reject(
@@ -588,7 +589,6 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     &self.communication_info,
                     channel_id,
                     &request,
-                    response_kind,
                     status,
                     memo,
                 )

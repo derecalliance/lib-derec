@@ -9,12 +9,15 @@
 // one-for-one.
 
 import {
+  ContactMode,
   primitives,
   SenderKind,
   type ContactMessage,
   type GetShareResponseMessage,
   type PairRequestMessage,
   type PairResponseMessage,
+  type PrePairRequestMessage,
+  type PrePairResponseMessage,
   type SecretVersionEntry,
   type StoreShareRequestMessage,
 } from "@derec-alliance/nodejs";
@@ -197,15 +200,17 @@ export function runPrimitivesSmoke(): void {
 
   console.log("✓ Recovery flow passed.\n");
 
-  // ── Pairing ───────────────────────────────────────────────────────────────
+  // ── Pairing (INLINE_KEYS) ─────────────────────────────────────────────────
 
-  console.log("=== [Primitives] Pairing Flow ===");
+  console.log("=== [Primitives] Pairing Flow (INLINE_KEYS) ===");
 
   const pairingChannelId = 1n;
 
-  // Contact initiator (Owner) creates the out-of-band ContactMessage.
+  // Contact initiator (Owner) creates the out-of-band ContactMessage. The
+  // contact carries the keys inline — no PrePair round-trip is needed.
   const contact = primitives.pairing.request.create_contact(
     pairingChannelId,
+    ContactMode.InlineKeys,
     { protocol: 0, uri: "https://example.com/alice" },
   );
 
@@ -221,7 +226,7 @@ export function runPrimitivesSmoke(): void {
   const { request: pairRequest }: { request: PairRequestMessage } =
     primitives.pairing.request.extract(pairingRequest.envelope, contact.secret_key);
   const produced = primitives.pairing.response.produce(
-    SenderKind.Owner, pairRequest, contact.secret_key, null,
+    pairingChannelId, pairRequest, contact.secret_key, null,
   );
 
   // Responder extracts the response and processes it.
@@ -239,7 +244,110 @@ export function runPrimitivesSmoke(): void {
   }
   console.log(`  shared keys match (${produced.shared_key.length}B)  ✓`);
 
-  console.log("✓ Pairing flow passed.\n");
+  console.log("✓ Pairing flow (INLINE_KEYS) passed.\n");
+
+  // ── Pairing (HASHED_KEYS + PrePair) ───────────────────────────────────────
+  //
+  // HASHED_KEYS contacts carry only a SHA-384 commitment to the initiator's
+  // public keys (small enough for QR), so before pairing can proceed the
+  // scanner must fetch the actual keys over the wire via the plaintext
+  // `PrePair` round-trip and verify them against the commitment.
+
+  console.log("=== [Primitives] Pairing Flow (HASHED_KEYS + PrePair) ===");
+
+  const hashedKeysChannelId = 2n;
+
+  // Alice creates a HASHED_KEYS contact. The transport MUST be ephemeral
+  // because the PrePair messages cross the wire as plaintext.
+  const hkContact = primitives.pairing.request.create_contact(
+    hashedKeysChannelId,
+    ContactMode.HashedKeys,
+    { protocol: 0, uri: "https://example.com/alice/ephemeral" },
+  );
+
+  if (hkContact.contact_message.contact_mode !== ContactMode.HashedKeys) {
+    throw new Error("HASHED_KEYS contact must advertise contact_mode = HashedKeys");
+  }
+  if (hkContact.contact_message.mlkem_encapsulation_key !== undefined) {
+    throw new Error("HASHED_KEYS contact must NOT carry the ML-KEM key inline");
+  }
+  if (hkContact.contact_message.ecies_public_key !== undefined) {
+    throw new Error("HASHED_KEYS contact must NOT carry the ECIES key inline");
+  }
+  const bindingHash = hkContact.contact_message.contact_binding_hash;
+  if (!bindingHash || bindingHash.length !== 48) {
+    throw new Error("HASHED_KEYS contact must carry a 48-byte SHA-384 binding hash");
+  }
+  console.log(`  contact carries 48-byte binding hash, no inline keys  ✓`);
+
+  // --- PrePair leg ----------------------------------------------------------
+
+  // Bob (the scanner) sends a plaintext PrePair request asking for the keys.
+  const prePairRequestEnvelope = primitives.pairing.request.produce_pre_pair(
+    { protocol: 0, uri: "https://example.com/helper/ephemeral" },
+    hkContact.contact_message,
+  );
+
+  // Alice decodes the inbound plaintext request.
+  const { request: prePairReq }: { request: PrePairRequestMessage } =
+    primitives.pairing.request.extract_pre_pair(prePairRequestEnvelope.envelope);
+  if (prePairReq.nonce !== hkContact.contact_message.nonce) {
+    throw new Error("PrePair request must echo the contact's nonce");
+  }
+
+  // Alice publishes the public keys back to Bob.
+  const prePairResponseEnvelope = primitives.pairing.response.produce_pre_pair(
+    hashedKeysChannelId, prePairReq, hkContact.secret_key,
+  );
+
+  // Bob decodes the inbound plaintext response.
+  const { response: prePairResp }: { response: PrePairResponseMessage } =
+    primitives.pairing.response.extract_pre_pair(prePairResponseEnvelope.envelope);
+
+  // Bob recomputes the SHA-384 binding hash and validates it against the
+  // commitment from the original contact. Any tampering on the plaintext
+  // PrePair leg surfaces here.
+  const validated = primitives.pairing.response.process_pre_pair(
+    hkContact.contact_message, prePairResp,
+  );
+  console.log(`  PrePair validated (mlkem=${validated.mlkem_encapsulation_key.length}B, ecies=${validated.ecies_public_key.length}B, nonce echoed)  ✓`);
+
+  // --- Normal pairing on top of the validated keys --------------------------
+
+  // Bob synthesizes a "filled-in" contact by copying the validated keys
+  // into a clone of the HASHED_KEYS contact. From here on the flow is
+  // identical to the INLINE_KEYS path.
+  const filledInContact: ContactMessage = {
+    ...hkContact.contact_message,
+    mlkem_encapsulation_key: validated.mlkem_encapsulation_key,
+    ecies_public_key: validated.ecies_public_key,
+  };
+
+  const hkPairingRequest = primitives.pairing.request.produce(
+    SenderKind.Helper,
+    { protocol: 0, uri: "https://example.com/helper" },
+    filledInContact,
+    null,
+  );
+  const { request: hkPairRequest }: { request: PairRequestMessage } =
+    primitives.pairing.request.extract(hkPairingRequest.envelope, hkContact.secret_key);
+  const hkProduced = primitives.pairing.response.produce(
+    hashedKeysChannelId, hkPairRequest, hkContact.secret_key, null,
+  );
+  const { response: hkPairResponse }: { response: PairResponseMessage } =
+    primitives.pairing.response.extract(hkProduced.envelope, hkPairingRequest.secret_key);
+  const hkProcessed = primitives.pairing.response.process(
+    hkPairingRequest.initiator_contact_message as ContactMessage,
+    hkPairResponse,
+    hkPairingRequest.secret_key,
+  );
+  if (hkProduced.shared_key.length !== hkProcessed.shared_key.length ||
+      !hkProduced.shared_key.every((b, i) => b === hkProcessed.shared_key[i])) {
+    throw new Error("HASHED_KEYS pairing: shared keys do not match");
+  }
+  console.log(`  shared keys match (${hkProduced.shared_key.length}B)  ✓`);
+
+  console.log("✓ Pairing flow (HASHED_KEYS + PrePair) passed.\n");
 
   console.log("━━━ [Primitives] All passed. ━━━\n");
 }

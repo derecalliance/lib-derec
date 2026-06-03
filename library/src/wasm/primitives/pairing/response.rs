@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    CommunicationInfo, ContactMessage, PairRequestMessage, PairResponseMessage, TransportProtocol,
-    deserialize_pairing_secret_key_material, get_sender_kind,
+    CommunicationInfo, ContactMessage, PairRequestMessage, PairResponseMessage,
+    PrePairRequestMessage, PrePairResponseMessage, TransportProtocol,
+    deserialize_pairing_secret_key_material,
 };
 use crate::{
     primitives::pairing::response,
@@ -36,12 +37,11 @@ pub struct ProcessResult {
 
 #[wasm_bindgen(js_name = "pairing_response_produce")]
 pub fn produce(
-    kind: u32,
+    channel_id: u64,
     request: JsValue,
     secret_key: &[u8],
     communication_info: JsValue,
 ) -> Result<JsValue, JsValue> {
-    let sender_kind = get_sender_kind(kind)?;
     let pairing_sk = deserialize_pairing_secret_key_material(secret_key)?;
     let request: PairRequestMessage = from_js(request)?;
     let request_proto: derec_proto::PairRequestMessage = request.into();
@@ -55,7 +55,7 @@ pub fn produce(
         communication_info.map(Into::into);
 
     let result = response::produce(
-        sender_kind,
+        crate::types::ChannelId(channel_id),
         &request_proto,
         &pairing_sk,
         communication_info_proto,
@@ -96,5 +96,79 @@ pub fn process(
 
     to_js(&ProcessResult {
         shared_key: result.shared_key.to_vec(),
+    })
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ProducePrePairResult {
+    #[serde(with = "serde_bytes")]
+    pub envelope: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PrePairExtractResult {
+    pub response: PrePairResponseMessage,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ProcessPrePairResult {
+    #[serde(with = "serde_bytes")]
+    pub mlkem_encapsulation_key: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub ecies_public_key: Vec<u8>,
+    pub nonce: u64,
+}
+
+/// Contact-creator side: publish the actual public keys back to the scanner.
+#[wasm_bindgen(js_name = "pairing_response_produce_pre_pair")]
+pub fn produce_pre_pair(
+    channel_id: u64,
+    request: JsValue,
+    secret_key: &[u8],
+) -> Result<JsValue, JsValue> {
+    let pairing_sk = deserialize_pairing_secret_key_material(secret_key)?;
+    let request: PrePairRequestMessage = from_js(request)?;
+    let request_proto: derec_proto::PrePairRequestMessage = request.into();
+
+    let result = response::produce_pre_pair(
+        crate::types::ChannelId(channel_id),
+        &request_proto,
+        &pairing_sk,
+    )
+    .map_err(js_error_from_lib)?;
+
+    to_js(&ProducePrePairResult {
+        envelope: result.envelope,
+    })
+}
+
+/// Scanner-side: decode the inbound plaintext `PrePairResponse` envelope.
+#[wasm_bindgen(js_name = "pairing_response_extract_pre_pair")]
+pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<JsValue, JsValue> {
+    let result = response::extract_pre_pair(envelope_bytes).map_err(js_error_from_lib)?;
+    to_js(&PrePairExtractResult {
+        response: result.response.into(),
+    })
+}
+
+/// Scanner-side: validate the `PrePairResponse` against the contact's
+/// SHA-384 binding hash. Returns the validated keys + nonce on match.
+#[wasm_bindgen(js_name = "pairing_response_process_pre_pair")]
+pub fn process_pre_pair(
+    contact_message: JsValue,
+    response: JsValue,
+) -> Result<JsValue, JsValue> {
+    let contact_message: ContactMessage = from_js(contact_message)?;
+    let contact_message_proto: derec_proto::ContactMessage = contact_message.into();
+    let response: PrePairResponseMessage = from_js(response)?;
+    let response_proto: derec_proto::PrePairResponseMessage = response.into();
+
+    let result = response::process_pre_pair(&contact_message_proto, &response_proto)
+        .map_err(js_error_from_lib)?;
+
+    to_js(&ProcessPrePairResult {
+        mlkem_encapsulation_key: result.mlkem_encapsulation_key,
+        ecies_public_key: result.ecies_public_key,
+        nonce: result.nonce,
     })
 }

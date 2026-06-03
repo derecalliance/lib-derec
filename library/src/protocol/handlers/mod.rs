@@ -163,6 +163,30 @@ pub(super) async fn handle<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRec
     }
 }
 
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+)]
+pub(in crate::protocol) async fn handle_pairing<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
+    channel_store: &mut Ch,
+    secret_store: &mut Ss,
+    message: &DeRecMessage,
+    channel_id: ChannelId,
+    pairing_secret: &PairingSecretKeyMaterial,
+) -> Result<Vec<DeRecEvent>> {
+    let inner =
+        crate::derec_message::extract_inner_pairing_message(&message.message, pairing_secret)?;
+
+    pairing::handle(
+        channel_store,
+        secret_store,
+        &inner,
+        channel_id,
+        pairing_secret,
+    )
+    .await
+}
+
 /// Inbound role-gate table — the local role required on `channel_id` for the
 /// orchestrator to honor a given inbound [`MessageBody`].
 ///
@@ -188,28 +212,4 @@ fn expected_role_for_inbound(body: &MessageBody) -> Option<SenderKind> {
         }
         _ => None,
     }
-}
-
-#[cfg_attr(
-    feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
-)]
-pub(in crate::protocol) async fn handle_pairing<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
-    channel_store: &mut Ch,
-    secret_store: &mut Ss,
-    message: &DeRecMessage,
-    channel_id: ChannelId,
-    pairing_secret: &PairingSecretKeyMaterial,
-) -> Result<Vec<DeRecEvent>> {
-    let inner =
-        crate::derec_message::extract_inner_pairing_message(&message.message, pairing_secret)?;
-
-    pairing::handle(
-        channel_store,
-        secret_store,
-        &inner,
-        channel_id,
-        pairing_secret,
-    )
-    .await
 }

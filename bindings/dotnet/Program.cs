@@ -13,6 +13,7 @@ internal static class Program
     {
         RunProtocolVersionTest();
         RunPairingFlowTest();
+        RunPairingFlowHashedKeysTest();
         RunSharingFlowTest();
         RunVerificationFlowTest();
         RunRecoveryFlowTest();
@@ -32,12 +33,14 @@ internal static class Program
 
     private static void RunPairingFlowTest()
     {
-        Console.WriteLine("=== Pairing flow test ===");
+        Console.WriteLine("=== Pairing flow test (INLINE_KEYS) ===");
 
         ulong channelId = 1;
 
+        // Contact carries the keys inline — no PrePair round-trip is needed.
         var contact = Pairing.Request.CreateContact(
             channelId,
+            ContactMode.InlineKeys,
             new TransportProtocol("https://example.com/alice")
         );
 
@@ -59,7 +62,7 @@ internal static class Program
             throw new InvalidOperationException("Pairing test failed: channel_id mismatch on extract.");
 
         var produced = Pairing.Response.Produce(
-            Pairing.SenderKind.Owner,
+            channelId,
             extractedRequest.RequestProtoBytes,
             contact.SecretKeyMaterial
         );
@@ -81,7 +84,114 @@ internal static class Program
         if (!produced.SharedKey.SequenceEqual(processed.SharedKey))
             throw new InvalidOperationException("Pairing test failed: shared keys do not match.");
 
-        Console.WriteLine("Pairing flow test passed.");
+        Console.WriteLine("Pairing flow test (INLINE_KEYS) passed.");
+    }
+
+    private static void RunPairingFlowHashedKeysTest()
+    {
+        Console.WriteLine("=== Pairing flow test (HASHED_KEYS + PrePair) ===");
+
+        ulong channelId = 2;
+
+        // Alice creates a HASHED_KEYS contact. The transport MUST be ephemeral
+        // because the PrePair messages cross the wire as plaintext.
+        var aliceContact = Pairing.Request.CreateContact(
+            channelId,
+            ContactMode.HashedKeys,
+            new TransportProtocol("https://example.com/alice/ephemeral")
+        );
+
+        if (aliceContact.ContactMessage.ContactMode != ContactMode.HashedKeys)
+            throw new InvalidOperationException("HASHED_KEYS contact must advertise contact_mode = HashedKeys.");
+        if (aliceContact.ContactMessage.MlkemEncapsulationKey is not null)
+            throw new InvalidOperationException("HASHED_KEYS contact must NOT carry the ML-KEM key inline.");
+        if (aliceContact.ContactMessage.EciesPublicKey is not null)
+            throw new InvalidOperationException("HASHED_KEYS contact must NOT carry the ECIES key inline.");
+        if (aliceContact.ContactMessage.ContactBindingHash is not { Length: 48 })
+            throw new InvalidOperationException("HASHED_KEYS contact must carry a 48-byte SHA-384 binding hash.");
+        Console.WriteLine("  contact carries 48-byte binding hash, no inline keys");
+
+        // --- PrePair leg --------------------------------------------------------
+
+        // Bob (the scanner) sends a plaintext PrePair request asking for the keys.
+        var prePairRequestEnvelope = Pairing.Request.ProducePrePair(
+            new TransportProtocol("https://example.com/helper/ephemeral"),
+            aliceContact.ContactMessage
+        );
+
+        // Alice decodes the inbound plaintext request.
+        var extractedPrePairReq = Pairing.Request.ExtractPrePair(prePairRequestEnvelope.Envelope);
+        if (extractedPrePairReq.ChannelId != channelId)
+            throw new InvalidOperationException("PrePair request envelope must route to the contact's channel.");
+
+        // Alice publishes the public keys back to Bob.
+        var prePairResponseEnvelope = Pairing.Response.ProducePrePair(
+            channelId,
+            extractedPrePairReq.RequestProtoBytes,
+            aliceContact.SecretKeyMaterial
+        );
+
+        // Bob decodes the inbound plaintext response.
+        var extractedPrePairResp = Pairing.Response.ExtractPrePair(prePairResponseEnvelope.Envelope);
+        if (extractedPrePairResp.ChannelId != channelId)
+            throw new InvalidOperationException("PrePair response envelope must route to the contact's channel.");
+
+        // Bob recomputes the SHA-384 binding hash and validates it against the
+        // commitment from the original contact. Any tampering on the plaintext
+        // PrePair leg surfaces here.
+        var validated = Pairing.Response.ProcessPrePair(
+            aliceContact.ContactMessage,
+            extractedPrePairResp.ResponseProtoBytes
+        );
+        if (validated.MlkemEncapsulationKey.Length == 0)
+            throw new InvalidOperationException("PrePair validation must return Alice's ML-KEM encapsulation key.");
+        if (validated.EciesPublicKey.Length == 0)
+            throw new InvalidOperationException("PrePair validation must return Alice's ECIES public key.");
+        if (validated.Nonce != aliceContact.ContactMessage.Nonce)
+            throw new InvalidOperationException("PrePair validation must echo the contact's nonce.");
+        Console.WriteLine($"  PrePair validated (mlkem={validated.MlkemEncapsulationKey.Length}B, ecies={validated.EciesPublicKey.Length}B, nonce echoed)");
+
+        // --- Normal pairing on top of the validated keys ------------------------
+
+        // Bob synthesizes a "filled-in" contact by copying the validated keys
+        // into the HASHED_KEYS contact. From here on the flow is identical to
+        // the INLINE_KEYS path.
+        var filledInContact = aliceContact.ContactMessage with
+        {
+            MlkemEncapsulationKey = validated.MlkemEncapsulationKey,
+            EciesPublicKey = validated.EciesPublicKey,
+        };
+
+        var pairRequest = Pairing.Request.Produce(
+            Pairing.SenderKind.Helper,
+            new TransportProtocol("https://example.com/helper"),
+            filledInContact
+        );
+
+        var extractedRequest = Pairing.Request.Extract(pairRequest.Envelope, aliceContact.SecretKeyMaterial);
+        if (extractedRequest.ChannelId != channelId)
+            throw new InvalidOperationException("HASHED_KEYS pairing: channel_id mismatch on extract.");
+
+        var produced = Pairing.Response.Produce(
+            channelId,
+            extractedRequest.RequestProtoBytes,
+            aliceContact.SecretKeyMaterial
+        );
+        if (produced.SharedKey.Length == 0)
+            throw new InvalidOperationException("HASHED_KEYS pairing: empty shared key.");
+
+        var extractedResponse = Pairing.Response.Extract(produced.Envelope, pairRequest.SecretKeyMaterial);
+        var processed = Pairing.Response.Process(
+            pairRequest.InitiatorContactMessage,
+            extractedResponse.ResponseProtoBytes,
+            pairRequest.SecretKeyMaterial
+        );
+
+        if (!produced.SharedKey.SequenceEqual(processed.SharedKey))
+            throw new InvalidOperationException("HASHED_KEYS pairing: shared keys do not match.");
+
+        Console.WriteLine($"  shared keys match ({produced.SharedKey.Length}B)");
+        Console.WriteLine("Pairing flow test (HASHED_KEYS + PrePair) passed.");
     }
 
     private static void RunSharingFlowTest()

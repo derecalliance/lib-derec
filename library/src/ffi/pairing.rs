@@ -22,8 +22,9 @@ use crate::ffi::error::{
 };
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{
-    CommunicationInfo, ContactMessage, DeRecMessage, PairRequestMessage, PairResponseMessage,
-    SenderKind, TransportProtocol,
+    CommunicationInfo, ContactMessage, ContactMode, DeRecMessage, PairRequestMessage,
+    PairResponseMessage, PrePairRequestMessage, PrePairResponseMessage, SenderKind,
+    TransportProtocol,
 };
 use prost::Message as _;
 
@@ -78,12 +79,66 @@ pub struct ProcessPairResponseMessageResult {
     pub shared_key: DeRecBuffer,
 }
 
+// --- PrePair (HASHED_KEYS) flow ----------------------------------------------
+
+#[repr(C)]
+pub struct ProducePrePairRequestMessageResult {
+    pub error: DeRecError,
+    /// Serialized outer plaintext `DeRecMessage` envelope carrying a
+    /// `PrePairRequestMessage`. Ready to send over transport.
+    pub envelope_wire_bytes: DeRecBuffer,
+}
+
+#[repr(C)]
+pub struct ExtractPrePairRequestResult {
+    pub error: DeRecError,
+    /// Channel identifier decoded from the outer envelope's routing field.
+    pub channel_id: u64,
+    /// Inner `PrePairRequestMessage` proto bytes for chaining into
+    /// [`produce_pre_pair_response_message`].
+    pub request_proto_bytes: DeRecBuffer,
+}
+
+#[repr(C)]
+pub struct ProducePrePairResponseMessageResult {
+    pub error: DeRecError,
+    /// Serialized outer plaintext `DeRecMessage` envelope carrying a
+    /// `PrePairResponseMessage`. Ready to send over transport.
+    pub envelope_wire_bytes: DeRecBuffer,
+}
+
+#[repr(C)]
+pub struct ExtractPrePairResponseResult {
+    pub error: DeRecError,
+    /// Channel identifier decoded from the outer envelope's routing field.
+    pub channel_id: u64,
+    /// Inner `PrePairResponseMessage` proto bytes for chaining into
+    /// [`process_pre_pair_response_message`].
+    pub response_proto_bytes: DeRecBuffer,
+}
+
+/// On success the two key buffers hold the validated public keys republished
+/// by the contact creator. On failure (status non-Ok, hash mismatch, etc.)
+/// both buffers are empty; consult `error`.
+#[repr(C)]
+pub struct ProcessPrePairResponseMessageResult {
+    pub error: DeRecError,
+    pub mlkem_encapsulation_key: DeRecBuffer,
+    pub ecies_public_key: DeRecBuffer,
+    /// Nonce echoed from the original `ContactMessage`. Zero on failure.
+    pub nonce: u64,
+}
+
+/// `contact_mode` must be a valid value of [`ContactMode`] (`0` = `INLINE_KEYS`,
+/// `1` = `HASHED_KEYS`).
+///
 /// # Safety
 ///
 /// Non-null input pointers must point to the corresponding readable byte ranges.
 #[unsafe(no_mangle)]
 pub extern "C" fn create_contact_message(
     channel_id: u64,
+    contact_mode: i32,
     transport_protocol_ptr: *const u8,
     transport_protocol_len: usize,
 ) -> CreateContactMessageResult {
@@ -93,14 +148,27 @@ pub extern "C" fn create_contact_message(
         secret_key_material: empty_buffer(),
     };
 
+    let contact_mode = match ContactMode::try_from(contact_mode) {
+        Ok(m) => m,
+        Err(_) => {
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_INVALID_ENUM,
+                format!("invalid ContactMode value: {contact_mode}"),
+            ));
+        }
+    };
+
     let transport_protocol =
         match decode_transport_protocol(transport_protocol_ptr, transport_protocol_len) {
             Ok(t) => t,
             Err(e) => return with_err(e),
         };
 
-    match crate::primitives::pairing::request::create_contact(channel_id.into(), transport_protocol)
-    {
+    match crate::primitives::pairing::request::create_contact(
+        channel_id.into(),
+        contact_mode,
+        transport_protocol,
+    ) {
         Ok(r) => CreateContactMessageResult {
             error: success(),
             contact_wire_bytes: vec_into_buffer(r.contact_message.encode_to_vec()),
@@ -150,11 +218,14 @@ pub extern "C" fn produce_pair_request_message(
             Ok(t) => t,
             Err(e) => return with_err(e),
         };
-    let contact_message_bytes =
-        match parse_buffer(contact_message_ptr, contact_message_len, "contact_message_ptr") {
-            Ok(b) => b,
-            Err(e) => return with_err(e),
-        };
+    let contact_message_bytes = match parse_buffer(
+        contact_message_ptr,
+        contact_message_len,
+        "contact_message_ptr",
+    ) {
+        Ok(b) => b,
+        Err(e) => return with_err(e),
+    };
     let contact_message = match ContactMessage::decode(contact_message_bytes) {
         Ok(c) => c,
         Err(_) => {
@@ -248,7 +319,7 @@ pub extern "C" fn extract_pair_request(
 /// Non-null input pointers must point to the corresponding readable byte ranges.
 #[unsafe(no_mangle)]
 pub extern "C" fn produce_pair_response_message(
-    sender_kind: i32,
+    channel_id: u64,
     request_proto_ptr: *const u8,
     request_proto_len: usize,
     secret_key_material_ptr: *const u8,
@@ -263,15 +334,6 @@ pub extern "C" fn produce_pair_response_message(
         shared_key: empty_buffer(),
     };
 
-    let sender_kind = match SenderKind::try_from(sender_kind) {
-        Ok(v) => v,
-        Err(_) => {
-            return with_err(ffi_error(
-                DEREC_CODE_FFI_INVALID_ENUM,
-                format!("invalid SenderKind value: {sender_kind}"),
-            ));
-        }
-    };
     let request_bytes =
         match parse_buffer(request_proto_ptr, request_proto_len, "request_proto_ptr") {
             Ok(b) => b,
@@ -298,7 +360,7 @@ pub extern "C" fn produce_pair_response_message(
         };
 
     match crate::primitives::pairing::response::produce(
-        sender_kind,
+        crate::types::ChannelId(channel_id),
         &request,
         &pairing_secret_key_material,
         communication_info,
@@ -382,11 +444,14 @@ pub extern "C" fn process_pair_response_message(
         shared_key: empty_buffer(),
     };
 
-    let contact_message_bytes =
-        match parse_buffer(contact_message_ptr, contact_message_len, "contact_message_ptr") {
-            Ok(b) => b,
-            Err(e) => return with_err(e),
-        };
+    let contact_message_bytes = match parse_buffer(
+        contact_message_ptr,
+        contact_message_len,
+        "contact_message_ptr",
+    ) {
+        Ok(b) => b,
+        Err(e) => return with_err(e),
+    };
     let contact_message = match ContactMessage::decode(contact_message_bytes) {
         Ok(c) => c,
         Err(_) => {
@@ -424,6 +489,273 @@ pub extern "C" fn process_pair_response_message(
         Ok(r) => ProcessPairResponseMessageResult {
             error: success(),
             shared_key: vec_into_buffer(r.shared_key.to_vec()),
+        },
+        Err(e) => with_err(from_lib_error(e)),
+    }
+}
+
+// --- PrePair (HASHED_KEYS) FFI functions -------------------------------------
+//
+// PrePair envelopes are plaintext-in-envelope (no shared key exists yet), so
+// neither the produce nor the extract steps take key material — extract is a
+// pure protobuf decode + envelope-vs-body timestamp check. Hash validation
+// happens in `process_pre_pair_response_message`.
+
+/// Builds a plaintext `PrePairRequestMessage` envelope. Used by the scanner
+/// when the contact was sent with `contact_mode == HASHED_KEYS`.
+///
+/// # Safety
+///
+/// Non-null input pointers must point to the corresponding readable byte ranges.
+#[unsafe(no_mangle)]
+pub extern "C" fn produce_pre_pair_request_message(
+    transport_protocol_ptr: *const u8,
+    transport_protocol_len: usize,
+    contact_message_ptr: *const u8,
+    contact_message_len: usize,
+) -> ProducePrePairRequestMessageResult {
+    let with_err = |error| ProducePrePairRequestMessageResult {
+        error,
+        envelope_wire_bytes: empty_buffer(),
+    };
+
+    let transport_protocol =
+        match decode_transport_protocol(transport_protocol_ptr, transport_protocol_len) {
+            Ok(t) => t,
+            Err(e) => return with_err(e),
+        };
+    let contact_message_bytes = match parse_buffer(
+        contact_message_ptr,
+        contact_message_len,
+        "contact_message_ptr",
+    ) {
+        Ok(b) => b,
+        Err(e) => return with_err(e),
+    };
+    let contact_message = match ContactMessage::decode(contact_message_bytes) {
+        Ok(c) => c,
+        Err(_) => {
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                "contact_message_bytes is not a valid ContactMessage",
+            ));
+        }
+    };
+
+    match crate::primitives::pairing::request::produce_pre_pair_request(
+        transport_protocol,
+        &contact_message,
+    ) {
+        Ok(r) => ProducePrePairRequestMessageResult {
+            error: success(),
+            envelope_wire_bytes: vec_into_buffer(r.envelope),
+        },
+        Err(e) => with_err(from_lib_error(e)),
+    }
+}
+
+/// Decodes a plaintext `PrePairRequestMessage` envelope.
+///
+/// # Safety
+///
+/// Non-null input pointers must point to the corresponding readable byte ranges.
+#[unsafe(no_mangle)]
+pub extern "C" fn extract_pre_pair_request(
+    envelope_ptr: *const u8,
+    envelope_len: usize,
+) -> ExtractPrePairRequestResult {
+    let with_err = |error| ExtractPrePairRequestResult {
+        error,
+        channel_id: 0,
+        request_proto_bytes: empty_buffer(),
+    };
+
+    let envelope_bytes = match parse_buffer(envelope_ptr, envelope_len, "envelope_ptr") {
+        Ok(b) => b,
+        Err(e) => return with_err(e),
+    };
+
+    let channel_id = match DeRecMessage::decode(envelope_bytes) {
+        Ok(e) => e.channel_id,
+        Err(e) => {
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                format!("failed to decode envelope: {e}"),
+            ));
+        }
+    };
+
+    match crate::primitives::pairing::request::extract_pre_pair(envelope_bytes) {
+        Ok(r) => ExtractPrePairRequestResult {
+            error: success(),
+            channel_id,
+            request_proto_bytes: vec_into_buffer(r.request.encode_to_vec()),
+        },
+        Err(e) => with_err(from_lib_error(e)),
+    }
+}
+
+/// Builds a plaintext `PrePairResponseMessage` envelope republishing the
+/// initiator's public keys. The keys come from `secret_key_material` (which
+/// retains them alongside the secrets in `HASHED_KEYS` flows).
+///
+/// `request_proto_ptr` / `request_proto_len` must be the `request_proto_bytes`
+/// returned by [`extract_pre_pair_request`].
+///
+/// # Safety
+///
+/// Non-null input pointers must point to the corresponding readable byte ranges.
+#[unsafe(no_mangle)]
+pub extern "C" fn produce_pre_pair_response_message(
+    channel_id: u64,
+    request_proto_ptr: *const u8,
+    request_proto_len: usize,
+    secret_key_material_ptr: *const u8,
+    secret_key_material_len: usize,
+) -> ProducePrePairResponseMessageResult {
+    let with_err = |error| ProducePrePairResponseMessageResult {
+        error,
+        envelope_wire_bytes: empty_buffer(),
+    };
+
+    let request_bytes =
+        match parse_buffer(request_proto_ptr, request_proto_len, "request_proto_ptr") {
+            Ok(b) => b,
+            Err(e) => return with_err(e),
+        };
+    let request = match PrePairRequestMessage::decode(request_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                format!("failed to decode PrePairRequestMessage: {e}"),
+            ));
+        }
+    };
+    let pairing_secret_key_material =
+        match decode_secret_key_material(secret_key_material_ptr, secret_key_material_len) {
+            Ok(m) => m,
+            Err(e) => return with_err(e),
+        };
+
+    match crate::primitives::pairing::response::produce_pre_pair(
+        crate::types::ChannelId(channel_id),
+        &request,
+        &pairing_secret_key_material,
+    ) {
+        Ok(r) => ProducePrePairResponseMessageResult {
+            error: success(),
+            envelope_wire_bytes: vec_into_buffer(r.envelope),
+        },
+        Err(e) => with_err(from_lib_error(e)),
+    }
+}
+
+/// Decodes a plaintext `PrePairResponseMessage` envelope.
+///
+/// # Safety
+///
+/// Non-null input pointers must point to the corresponding readable byte ranges.
+#[unsafe(no_mangle)]
+pub extern "C" fn extract_pre_pair_response(
+    envelope_ptr: *const u8,
+    envelope_len: usize,
+) -> ExtractPrePairResponseResult {
+    let with_err = |error| ExtractPrePairResponseResult {
+        error,
+        channel_id: 0,
+        response_proto_bytes: empty_buffer(),
+    };
+
+    let envelope_bytes = match parse_buffer(envelope_ptr, envelope_len, "envelope_ptr") {
+        Ok(b) => b,
+        Err(e) => return with_err(e),
+    };
+
+    let channel_id = match DeRecMessage::decode(envelope_bytes) {
+        Ok(e) => e.channel_id,
+        Err(e) => {
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                format!("failed to decode envelope: {e}"),
+            ));
+        }
+    };
+
+    match crate::primitives::pairing::response::extract_pre_pair(envelope_bytes) {
+        Ok(r) => ExtractPrePairResponseResult {
+            error: success(),
+            channel_id,
+            response_proto_bytes: vec_into_buffer(r.response.encode_to_vec()),
+        },
+        Err(e) => with_err(from_lib_error(e)),
+    }
+}
+
+/// Scanner-side: validates a decoded `PrePairResponseMessage` against the
+/// original `ContactMessage`'s SHA-384 binding hash. On success returns the
+/// validated public keys and echoed nonce. On any failure (non-Ok status,
+/// hash mismatch, nonce mismatch, missing fields) returns an error and
+/// empty buffers.
+///
+/// `response_proto_ptr` / `response_proto_len` must be the
+/// `response_proto_bytes` returned by [`extract_pre_pair_response`].
+///
+/// # Safety
+///
+/// Non-null input pointers must point to the corresponding readable byte ranges.
+#[unsafe(no_mangle)]
+pub extern "C" fn process_pre_pair_response_message(
+    contact_message_ptr: *const u8,
+    contact_message_len: usize,
+    response_proto_ptr: *const u8,
+    response_proto_len: usize,
+) -> ProcessPrePairResponseMessageResult {
+    let with_err = |error| ProcessPrePairResponseMessageResult {
+        error,
+        mlkem_encapsulation_key: empty_buffer(),
+        ecies_public_key: empty_buffer(),
+        nonce: 0,
+    };
+
+    let contact_message_bytes = match parse_buffer(
+        contact_message_ptr,
+        contact_message_len,
+        "contact_message_ptr",
+    ) {
+        Ok(b) => b,
+        Err(e) => return with_err(e),
+    };
+    let contact_message = match ContactMessage::decode(contact_message_bytes) {
+        Ok(c) => c,
+        Err(_) => {
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                "contact_message_bytes is not a valid ContactMessage",
+            ));
+        }
+    };
+    let response_bytes =
+        match parse_buffer(response_proto_ptr, response_proto_len, "response_proto_ptr") {
+            Ok(b) => b,
+            Err(e) => return with_err(e),
+        };
+    let response = match PrePairResponseMessage::decode(response_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                format!("failed to decode PrePairResponseMessage: {e}"),
+            ));
+        }
+    };
+
+    match crate::primitives::pairing::response::process_pre_pair(&contact_message, &response) {
+        Ok(r) => ProcessPrePairResponseMessageResult {
+            error: success(),
+            mlkem_encapsulation_key: vec_into_buffer(r.mlkem_encapsulation_key),
+            ecies_public_key: vec_into_buffer(r.ecies_public_key),
+            nonce: r.nonce,
         },
         Err(e) => with_err(from_lib_error(e)),
     }

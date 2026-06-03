@@ -10,7 +10,6 @@
 //! - 8 bytes: channel_id (big-endian u64)
 //! - For Pairing:
 //!   - 4 bytes: my_kind (i32 BE)
-//!   - 4 bytes: response_kind (i32 BE)
 //!   - 4 bytes: request_len (u32 BE)
 //!   - N bytes: protobuf-encoded PairRequestMessage
 //!   - remaining: serialized PairingSecretKeyMaterial
@@ -46,13 +45,11 @@ pub fn serialize(action: PendingAction) -> Result<Vec<u8>, String> {
             request,
             pairing_secret,
             kind,
-            response_kind,
             ..
         } => {
             buf.push(TAG_PAIRING);
             buf.extend_from_slice(&channel_id.0.to_be_bytes());
             buf.extend_from_slice(&(kind as i32).to_be_bytes());
-            buf.extend_from_slice(&(response_kind as i32).to_be_bytes());
             let request_bytes = request.encode_to_vec();
             buf.extend_from_slice(&(request_bytes.len() as u32).to_be_bytes());
             buf.extend_from_slice(&request_bytes);
@@ -146,13 +143,12 @@ pub fn deserialize(bytes: &[u8]) -> Result<PendingAction, String> {
 
     match tag {
         TAG_PAIRING => {
-            if rest.len() < 12 {
+            if rest.len() < 8 {
                 return Err("pairing action bytes too short".to_owned());
             }
             let kind_i32 = i32::from_be_bytes(rest[..4].try_into().unwrap());
-            let response_kind_i32 = i32::from_be_bytes(rest[4..8].try_into().unwrap());
-            let request_len = u32::from_be_bytes(rest[8..12].try_into().unwrap()) as usize;
-            let rest = &rest[12..];
+            let request_len = u32::from_be_bytes(rest[4..8].try_into().unwrap()) as usize;
+            let rest = &rest[8..];
             if rest.len() < request_len {
                 return Err("pairing action bytes truncated (request)".to_owned());
             }
@@ -164,14 +160,12 @@ pub fn deserialize(bytes: &[u8]) -> Result<PendingAction, String> {
                     .map_err(|e| format!("failed to deserialize pairing secret: {e}"))?;
 
             let kind = i32_to_sender_kind(kind_i32)?;
-            let response_kind = i32_to_sender_kind(response_kind_i32)?;
 
             Ok(PendingAction::Pairing {
                 channel_id,
                 request,
                 pairing_secret,
                 kind,
-                response_kind,
                 peer_communication_info: std::collections::HashMap::new(),
             })
         }
