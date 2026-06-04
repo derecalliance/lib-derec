@@ -68,44 +68,131 @@ const result = primitives.verification.request.produce(channelId, secretId, vers
 
 ## Pairing Flow
 
-```ts
-import { primitives, SenderKind } from "@derec-alliance/nodejs";
+The `ContactMessage` is exchanged out-of-band (QR codes, existing messaging
+channels, etc.). Two `ContactMode` values select how the public encryption
+material is delivered:
 
-// Step 1: Initiator creates contact message (sent out-of-band).
+| Mode | What the contact carries | Use when |
+|---|---|---|
+| `InlineKeys` (default) | Full ML-KEM encapsulation key + ECIES public key | Out-of-band channel can carry the keys (NFC, messaging). |
+| `HashedKeys` | Only a SHA-384 commitment to the keys | Channel is size-constrained (QR codes). Scanner fetches the actual keys via a plaintext `PrePair` round-trip and verifies them against the hash. |
+
+After the handshake completes, **both modes** rekey the channel id. The
+responder derives `SHA-384(u64_be(originalId) || sharedKey)[..8]` as a
+`bigint`, includes it in the encrypted `PairResponseMessage`, and both sides
+switch their local state to the new id. The new id never appears in plaintext
+on the wire, so a passive observer who only saw pre-rekey traffic cannot link
+the long-running channel to its pairing-time id.
+
+### `InlineKeys` flow
+
+```ts
+import { ContactMode, primitives, SenderKind } from "@derec-alliance/nodejs";
+
+const channelId = 1n;
+
+// Step 1: Initiator creates the out-of-band ContactMessage.
 const contact = primitives.pairing.request.create_contact(
-  1n,
-  { protocol: "https", uri: "https://owner.example.com" },
+  channelId,
+  ContactMode.InlineKeys,
+  { protocol: 0, uri: "https://owner.example.com" },
 );
 
 // Step 2: Responder produces a pairing request from the contact.
 const request = primitives.pairing.request.produce(
   SenderKind.Helper,
-  { protocol: "https", uri: "https://helper.example.com" },
+  { protocol: 0, uri: "https://helper.example.com" },
   contact.contact_message,
+  null, // optional CommunicationInfo
 );
 
-// Step 3: Initiator produces the response and derives the initiator-side shared key.
+// Step 3: Initiator extracts the request and produces the response.
+const { request: pairRequest } =
+  primitives.pairing.request.extract(request.envelope, contact.secret_key);
 const produced = primitives.pairing.response.produce(
-  SenderKind.Owner,
-  request.envelope,
-  contact.secret_key_material,
+  channelId,
+  pairRequest,
+  contact.secret_key,
+  null,
 );
 
-// Step 4: Responder processes the response and derives the responder-side shared key.
+// Step 4: Responder extracts and processes the response.
+const { response: pairResponse } =
+  primitives.pairing.response.extract(produced.envelope, request.secret_key);
 const processed = primitives.pairing.response.process(
   request.initiator_contact_message,
-  produced.envelope,
-  request.secret_key_material,
+  pairResponse,
+  request.secret_key,
 );
 
-// Both sides hold the same key.
-// produced.pairing_shared_key  ==  processed.pairing_shared_key
+// Both sides hold the same shared key and rekeyed channel id.
+// produced.shared_key  ==  processed.shared_key
+// produced.channel_id  ==  processed.channel_id  !==  channelId
+//
+// Rename local channel state from `channelId` to `produced.channel_id`
+// before sending any further traffic.
 ```
 
 To reject the request, build a `PairResponseMessage` with a non-OK status and
 encrypt it against `request.ecies_public_key` using the WASM-exposed pairing
 envelope helpers. The higher-level `DeRecProtocol` orchestrator's `reject`
-method does this for you.
+method does this for you. Rejected responses do not carry a meaningful
+`channel_id` — the rekey only takes effect on `Ok` responses.
+
+### `HashedKeys` flow (PrePair)
+
+`HashedKeys` adds one plaintext round-trip before the regular `InlineKeys`
+handshake. The scanner fetches the actual keys via `PrePair`, verifies them
+against `contact.contact_binding_hash`, and then runs the normal pairing
+flow on a synthesized contact with the keys filled in.
+
+```ts
+import { ContactMode, primitives, SenderKind, type ContactMessage } from "@derec-alliance/nodejs";
+
+const channelId = 7n;
+
+// Initiator: HASHED_KEYS contact (no inline keys, only the binding hash).
+// Transport URI MUST be ephemeral — PrePair envelopes are plaintext.
+const contact = primitives.pairing.request.create_contact(
+  channelId,
+  ContactMode.HashedKeys,
+  { protocol: 0, uri: "https://relay.example.com/ephemeral" },
+);
+
+// Scanner: fetch keys via PrePair.
+const prePairReqEnv = primitives.pairing.request.produce_pre_pair(
+  { protocol: 0, uri: "https://scanner.example.com/ephemeral" },
+  contact.contact_message,
+);
+const { request: prePairReq } =
+  primitives.pairing.request.extract_pre_pair(prePairReqEnv.envelope);
+const prePairRespEnv = primitives.pairing.response.produce_pre_pair(
+  channelId, prePairReq, contact.secret_key,
+);
+const { response: prePairResp } =
+  primitives.pairing.response.extract_pre_pair(prePairRespEnv.envelope);
+
+// Scanner validates the published keys against contact.contact_binding_hash.
+// Throws on mismatch (returns the keys + echoed nonce on match).
+const validated = primitives.pairing.response.process_pre_pair(
+  contact.contact_message, prePairResp,
+);
+
+// Synthesize a "filled-in" contact and run the regular pairing flow.
+const filledInContact: ContactMessage = {
+  ...contact.contact_message,
+  mlkem_encapsulation_key: validated.mlkem_encapsulation_key,
+  ecies_public_key: validated.ecies_public_key,
+};
+// ... continue with primitives.pairing.request.produce / extract /
+// primitives.pairing.response.produce / process against `filledInContact`
+// exactly as in the InlineKeys example.
+```
+
+After the PrePair exchange the application **must** swap the transport
+endpoint to a long-term one via `UpdateChannelInfo`. The ephemeral endpoint
+advertised in the `HashedKeys` contact is intended to be retired immediately
+after pairing.
 
 ---
 

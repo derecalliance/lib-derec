@@ -39,6 +39,7 @@ internal static class Pairing
         public Buffer ResponseWireBytes;
         public Buffer PeerTransportProtocol;
         public Buffer SharedKey;
+        public ulong ChannelId;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -54,9 +55,9 @@ internal static class Pairing
     {
         public DeRecError Error;
         public Buffer SharedKey;
+        public ulong ChannelId;
     }
 
-    // --- PrePair (HASHED_KEYS) flow -----------------------------------------
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct ProducePrePairRequestMessageResult
@@ -153,7 +154,6 @@ internal static class Pairing
         UIntPtr secretKeyMaterialLen
     );
 
-    // --- PrePair (HASHED_KEYS) FFI imports ----------------------------------
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern ProducePrePairRequestMessageResult produce_pre_pair_request_message(

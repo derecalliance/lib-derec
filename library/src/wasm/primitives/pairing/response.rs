@@ -22,6 +22,11 @@ pub struct ProduceResult {
     pub peer_transport_protocol: TransportProtocol,
     #[serde(with = "serde_bytes")]
     pub shared_key: Vec<u8>,
+    /// Post-handshake rekey channel id the responder is committing to.
+    /// Callers MUST atomically rename their local channel record from the
+    /// pre-rekey id (the one passed to `pairing_response_produce`) to this
+    /// value as part of accepting the response.
+    pub channel_id: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -33,6 +38,11 @@ pub struct ExtractResult {
 pub struct ProcessResult {
     #[serde(with = "serde_bytes")]
     pub shared_key: Vec<u8>,
+    /// Post-handshake rekey channel id — already validated against the
+    /// caller's own derivation. Callers MUST atomically rename their local
+    /// channel record from the pre-rekey id (the one in the contact) to
+    /// this value.
+    pub channel_id: u64,
 }
 
 #[wasm_bindgen(js_name = "pairing_response_produce")]
@@ -66,6 +76,7 @@ pub fn produce(
         envelope: result.envelope,
         peer_transport_protocol: result.peer_transport_protocol.into(),
         shared_key: result.shared_key.to_vec(),
+        channel_id: result.channel_id.into(),
     })
 }
 
@@ -96,6 +107,7 @@ pub fn process(
 
     to_js(&ProcessResult {
         shared_key: result.shared_key.to_vec(),
+        channel_id: result.channel_id.into(),
     })
 }
 

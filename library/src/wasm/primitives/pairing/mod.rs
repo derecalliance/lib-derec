@@ -247,6 +247,9 @@ pub struct PairResponseMessage {
     pub communication_info: Option<CommunicationInfo>,
     pub parameter_range: Option<ParameterRange>,
     pub timestamp: Option<Timestamp>,
+    /// Post-handshake rekey channel id; both sides switch their local
+    /// channel record to this value once the response is accepted.
+    pub channel_id: u64,
 }
 
 impl From<derec_proto::PairResponseMessage> for PairResponseMessage {
@@ -257,6 +260,7 @@ impl From<derec_proto::PairResponseMessage> for PairResponseMessage {
             communication_info: value.communication_info.map(Into::into),
             parameter_range: value.parameter_range.map(Into::into),
             timestamp: value.timestamp.map(Into::into),
+            channel_id: value.channel_id,
         }
     }
 }
@@ -269,6 +273,7 @@ impl From<PairResponseMessage> for derec_proto::PairResponseMessage {
             communication_info: value.communication_info.map(Into::into),
             parameter_range: value.parameter_range.map(Into::into),
             timestamp: value.timestamp.map(Into::into),
+            channel_id: value.channel_id,
         }
     }
 }

@@ -536,6 +536,7 @@ fn test_process_pairing_response_message_missing_result() {
         communication_info: None,
         parameter_range: None,
         timestamp: Some(current_timestamp()),
+        channel_id: 0,
     };
 
     let result = process_pairing_response_message(
@@ -597,6 +598,7 @@ fn test_process_pairing_response_message_result_non_ok() {
         communication_info: None,
         parameter_range: None,
         timestamp: Some(current_timestamp()),
+        channel_id: 0,
     };
 
     let result = process_pairing_response_message(
@@ -658,6 +660,7 @@ fn test_process_pairing_response_message_invalid_status() {
         communication_info: None,
         parameter_range: None,
         timestamp: Some(current_timestamp()),
+        channel_id: 0,
     };
 
     let result = process_pairing_response_message(
@@ -719,6 +722,7 @@ fn test_process_pairing_response_message_nonce_mismatch() {
         communication_info: None,
         parameter_range: None,
         timestamp: Some(current_timestamp()),
+        channel_id: 0,
     };
 
     let result = process_pairing_response_message(
@@ -780,6 +784,7 @@ fn test_process_pairing_response_message_empty_mlkem_encapsulation_key() {
         communication_info: None,
         parameter_range: None,
         timestamp: Some(current_timestamp()),
+        channel_id: 0,
     };
 
     let mut invalid_contact = initiator_contact_message;
@@ -841,6 +846,7 @@ fn test_process_pairing_response_message_empty_ecies_public_key() {
         communication_info: None,
         parameter_range: None,
         timestamp: Some(current_timestamp()),
+        channel_id: 0,
     };
 
     let mut invalid_contact = initiator_contact_message;
@@ -959,6 +965,7 @@ fn test_alice_bob_pairing_flow() {
         envelope: alice_pair_resp_envelope,
         shared_key: alice_shared_key,
         peer_transport_protocol: bob_transport_protocol,
+        channel_id: alice_new_channel_id,
     } = produce_pairing_response_message(
         alice_channel_id,
         &bob_pair_req_msg,
@@ -976,6 +983,7 @@ fn test_alice_bob_pairing_flow() {
     // Bob finalizes pairing.
     let ProcessPairingResponseMessageResult {
         shared_key: bob_shared_key,
+        channel_id: bob_new_channel_id,
     } = process_pairing_response_message(
         &initiator_contact_message,
         &alice_pair_resp_msg,
@@ -996,6 +1004,16 @@ fn test_alice_bob_pairing_flow() {
     assert_eq!(alice_shared_key, bob_shared_key);
     assert_eq!(bob_transport_protocol.uri, bob_transport_uri);
     assert_eq!(bob_transport_protocol.protocol, Protocol::Https as i32);
+    // Both sides agree on the rekeyed channel id, derived from the
+    // pre-rekey channel id and the freshly negotiated shared key.
+    assert_eq!(alice_new_channel_id, bob_new_channel_id);
+    assert_ne!(alice_new_channel_id, alice_channel_id);
+    // The wire-level field on the encrypted inner response carries the
+    // same value.
+    assert_eq!(
+        alice_pair_resp_msg.channel_id,
+        u64::from(alice_new_channel_id)
+    );
 }
 
 #[test]
@@ -1040,6 +1058,7 @@ fn test_produce_pairing_response_returns_envelope_and_peer_transport() {
         envelope,
         shared_key,
         peer_transport_protocol,
+        channel_id: _,
     } = produce_pairing_response_message(
         alice_channel_id,
         &bob_pair_request_msg,
@@ -1064,9 +1083,6 @@ fn test_produce_pairing_response_returns_envelope_and_peer_transport() {
     let _ = shared_key;
 }
 
-// ---------------------------------------------------------------------------
-// ContactMode::HashedKeys + PrePair flow
-// ---------------------------------------------------------------------------
 
 fn make_hashed_keys_contact(channel_id: ChannelId) -> ContactMessage {
     create_contact_message(
@@ -1285,9 +1301,6 @@ fn test_extract_pre_pair_rejects_wrong_inner_message_type() {
     assert!(matches!(result, Err(Error::Invariant(_))));
 }
 
-// ---------------------------------------------------------------------------
-// PrePair response (initiator side)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_produce_pre_pair_emits_envelope_carrying_initiator_public_keys() {
@@ -1459,9 +1472,6 @@ fn test_produce_pre_pair_response_keys_match_initiator_contact_keys_in_inline_mo
     );
 }
 
-// ---------------------------------------------------------------------------
-// PrePair response — extract (scanner side)
-// ---------------------------------------------------------------------------
 
 /// Convenience: run the full HASHED_KEYS PrePair leg and return the
 /// envelope Bob sees on the wire from Alice along with the keys Alice
@@ -1575,9 +1585,6 @@ fn test_extract_pre_pair_response_rejects_wrong_inner_message_type() {
     assert!(matches!(result, Err(Error::Invariant(_))));
 }
 
-// ---------------------------------------------------------------------------
-// PrePair response — process (scanner-side hash verification)
-// ---------------------------------------------------------------------------
 
 /// Convenience: run the full HASHED_KEYS PrePair leg and return the artifacts
 /// the scanner side has to call `process_pre_pair` on.
@@ -1746,4 +1753,191 @@ fn test_process_pre_pair_rejects_response_nonce_mismatch() {
         result,
         Err(Error::Pairing(PairingError::ProtocolViolation(_)))
     ));
+}
+
+
+#[test]
+fn test_process_pairing_response_rejects_tampered_channel_id_rekey() {
+    let alice_channel_id = ChannelId(42);
+    let alice_transport_uri = "https://relay.example/alice";
+    let bob_transport_uri = "https://relay.example/bob";
+
+    let CreateContactMessageResult {
+        contact_message: initiator_contact_message,
+        secret_key: alice_sk_state,
+    } = create_contact_message(
+        alice_channel_id,
+        derec_proto::ContactMode::InlineKeys,
+        TransportProtocol {
+            uri: alice_transport_uri.to_owned(),
+            protocol: Protocol::Https.into(),
+        },
+    )
+    .expect("create_contact failed");
+
+    let ProducePairingRequestMessageResult {
+        envelope: bob_pair_req_envelope,
+        secret_key: bob_sk_state,
+        ..
+    } = produce_pairing_request_message(
+        SenderKind::Helper,
+        TransportProtocol {
+            uri: bob_transport_uri.to_owned(),
+            protocol: Protocol::Https.into(),
+        },
+        &initiator_contact_message,
+        None,
+    )
+    .expect("produce_pairing_request failed");
+
+    let ExtractPairingRequestResult {
+        request: bob_pair_req_msg,
+    } = extract_pairing_request(&bob_pair_req_envelope, alice_sk_state.ecies_secret_key())
+        .expect("extract_pairing_request failed");
+
+    let ProducePairingResponseMessageResult {
+        envelope: alice_pair_resp_envelope,
+        ..
+    } = produce_pairing_response_message(
+        alice_channel_id,
+        &bob_pair_req_msg,
+        &alice_sk_state,
+        None,
+    )
+    .expect("produce_pairing_response failed");
+
+    let ExtractPairingResponseResult {
+        response: mut tampered_response,
+    } = extract_pairing_response(&alice_pair_resp_envelope, bob_sk_state.ecies_secret_key())
+        .expect("extract_pairing_response failed");
+
+    // Flip the rekey id away from what process() will derive. The hash is
+    // deterministic over (contact.channel_id, shared_key), so any value other
+    // than the correct derivation must be rejected.
+    tampered_response.channel_id = tampered_response.channel_id.wrapping_add(1);
+
+    let result = process_pairing_response_message(
+        &initiator_contact_message,
+        &tampered_response,
+        &bob_sk_state,
+    );
+
+    assert!(matches!(
+        result,
+        Err(Error::Pairing(PairingError::ProtocolViolation(msg)))
+            if msg == "channel_id rekey mismatch"
+    ));
+}
+
+#[test]
+fn test_pairing_rekey_also_fires_in_hashed_keys_mode() {
+    // The channel-id rekey is part of every pairing handshake regardless
+    // of `ContactMode`. This test runs the full HASHED_KEYS leg (PrePair
+    // → Pair) and asserts the rekey happens on the synthesized contact
+    // exactly like it does for INLINE_KEYS.
+
+    let alice_channel_id = ChannelId(7);
+
+    // Alice creates a HASHED_KEYS contact (no inline keys, only a hash).
+    let CreateContactMessageResult {
+        contact_message: alice_contact,
+        secret_key: alice_sk_state,
+    } = create_contact_message(
+        alice_channel_id,
+        ContactMode::HashedKeys,
+        TransportProtocol {
+            uri: "https://relay.example/alice/ephemeral".to_owned(),
+            protocol: Protocol::Https.into(),
+        },
+    )
+    .expect("create_contact (HASHED_KEYS) failed");
+
+    // Bob runs the PrePair leg to fetch and validate Alice's keys.
+    let ProducePrePairResult {
+        envelope: pre_pair_req_envelope,
+    } = produce_pre_pair_request(
+        TransportProtocol {
+            uri: "https://relay.example/bob/ephemeral".to_owned(),
+            protocol: Protocol::Https.into(),
+        },
+        &alice_contact,
+    )
+    .expect("produce_pre_pair_request failed");
+    let PrePairExtractResult {
+        request: pre_pair_req,
+    } = extract_pre_pair(&pre_pair_req_envelope).expect("extract_pre_pair failed");
+    let ProducePrePairResponseResult {
+        envelope: pre_pair_resp_envelope,
+    } = produce_pre_pair(alice_channel_id, &pre_pair_req, &alice_sk_state)
+        .expect("produce_pre_pair failed");
+    let PrePairResponseExtractResult {
+        response: pre_pair_resp,
+    } = extract_pre_pair_response(&pre_pair_resp_envelope)
+        .expect("extract_pre_pair_response failed");
+    let validated = process_pre_pair(&alice_contact, &pre_pair_resp)
+        .expect("process_pre_pair failed");
+
+    // Bob synthesizes a filled-in contact and runs the regular Pair flow.
+    let filled_in_contact = ContactMessage {
+        mlkem_encapsulation_key: Some(validated.mlkem_encapsulation_key),
+        ecies_public_key: Some(validated.ecies_public_key),
+        ..alice_contact.clone()
+    };
+
+    let ProducePairingRequestMessageResult {
+        envelope: bob_pair_req_envelope,
+        initiator_contact_message,
+        secret_key: bob_sk_state,
+    } = produce_pairing_request_message(
+        SenderKind::Helper,
+        TransportProtocol {
+            uri: "https://relay.example/bob".to_owned(),
+            protocol: Protocol::Https.into(),
+        },
+        &filled_in_contact,
+        None,
+    )
+    .expect("produce_pairing_request_message failed");
+
+    let ExtractPairingRequestResult {
+        request: bob_pair_req_msg,
+    } = extract_pairing_request(&bob_pair_req_envelope, alice_sk_state.ecies_secret_key())
+        .expect("extract_pairing_request failed");
+
+    let ProducePairingResponseMessageResult {
+        envelope: alice_pair_resp_envelope,
+        channel_id: alice_new_channel_id,
+        ..
+    } = produce_pairing_response_message(
+        alice_channel_id,
+        &bob_pair_req_msg,
+        &alice_sk_state,
+        None,
+    )
+    .expect("produce_pairing_response_message failed");
+
+    let ExtractPairingResponseResult {
+        response: alice_pair_resp_msg,
+    } = extract_pairing_response(&alice_pair_resp_envelope, bob_sk_state.ecies_secret_key())
+        .expect("extract_pairing_response failed");
+
+    let ProcessPairingResponseMessageResult {
+        channel_id: bob_new_channel_id,
+        ..
+    } = process_pairing_response_message(
+        &initiator_contact_message,
+        &alice_pair_resp_msg,
+        &bob_sk_state,
+    )
+    .expect("process_pairing_response_message failed");
+
+    // Both sides agree on the rekeyed id...
+    assert_eq!(alice_new_channel_id, bob_new_channel_id);
+    // ...and it differs from the original pre-rekey id.
+    assert_ne!(alice_new_channel_id, alice_channel_id);
+    // The wire-level field on the encrypted inner response carries it too.
+    assert_eq!(
+        alice_pair_resp_msg.channel_id,
+        u64::from(alice_new_channel_id)
+    );
 }

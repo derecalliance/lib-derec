@@ -23,6 +23,12 @@ pub struct ProduceResult {
     pub envelope: Vec<u8>,
     pub peer_transport_protocol: TransportProtocol,
     pub shared_key: PairingSharedKey,
+    /// Channel identifier the responder is committing to for all future
+    /// traffic on this channel — derived from the pre-rekey id and the
+    /// freshly negotiated `shared_key` (see [`derive_rekeyed_channel_id`]).
+    /// Callers MUST rename their local channel record from the old id to
+    /// this value once they finish handling this response.
+    pub channel_id: ChannelId,
 }
 
 pub struct ExtractResult {
@@ -31,6 +37,11 @@ pub struct ExtractResult {
 
 pub struct ProcessResult {
     pub shared_key: PairingSharedKey,
+    /// Channel identifier both peers MUST switch to for all future traffic
+    /// on this channel. Already validated against the local derivation; the
+    /// caller's only remaining job is to atomically rename its channel
+    /// record from the old id to this value (see [`derive_rekeyed_channel_id`]).
+    pub channel_id: ChannelId,
 }
 
 pub struct ProducePrePairResult {
@@ -195,6 +206,12 @@ pub fn produce(
         cryptography_pairing::finish_pairing_initiator(initiator_material, &pairing_request)
             .map_err(|e| PairingError::FinishPairingInitiator { source: e })?;
 
+    // Compute the post-handshake channel id. This message is the only
+    // place this value travels on the wire (and it's encrypted), so a
+    // post-pairing observer cannot link the long-running channel back to
+    // its pre-rekey id without the shared key.
+    let rekeyed_channel_id = derive_rekeyed_channel_id(channel_id, &shared_key);
+
     let timestamp = current_timestamp();
     let response = PairResponseMessage {
         result: Some(DeRecResult {
@@ -205,8 +222,11 @@ pub fn produce(
         communication_info,
         parameter_range: None,
         timestamp: Some(timestamp),
+        channel_id: rekeyed_channel_id.into(),
     };
 
+    // The outer envelope still routes on the *pre-rekey* id; the requester
+    // has no way to know the new id until it decrypts the inner message.
     let envelope = DeRecMessageBuilder::pairing()
         .channel_id(channel_id)
         .timestamp(timestamp)
@@ -222,6 +242,7 @@ pub fn produce(
         envelope,
         shared_key,
         peer_transport_protocol,
+        channel_id: rekeyed_channel_id,
     })
 }
 
@@ -662,10 +683,30 @@ pub fn process(
     let shared_key = cryptography_pairing::finish_pairing_responder(responder_material, &pk)
         .map_err(|e| PairingError::FinishPairingResponder { source: e })?;
 
+    // Validate the rekeyed channel id the responder proposed. A mismatch
+    // means either both sides derived different shared keys (the channel
+    // would be unusable anyway) or the responder is misbehaving / a
+    // forged envelope somehow decrypted; either way we refuse to adopt
+    // the new id.
+    let original_channel_id = ChannelId(contact_message.channel_id);
+    let expected_channel_id = derive_rekeyed_channel_id(original_channel_id, &shared_key);
+    if response.channel_id != u64::from(expected_channel_id) {
+        #[cfg(feature = "logging")]
+        tracing::warn!(
+            advertised = response.channel_id,
+            expected = u64::from(expected_channel_id),
+            "channel id rekey mismatch"
+        );
+        return Err(PairingError::ProtocolViolation("channel_id rekey mismatch").into());
+    }
+
     #[cfg(feature = "logging")]
     tracing::info!("pairing complete; responder shared key derived");
 
-    Ok(ProcessResult { shared_key })
+    Ok(ProcessResult {
+        shared_key,
+        channel_id: expected_channel_id,
+    })
 }
 
 /// Validates an incoming [`PrePairResponseMessage`] against the original
@@ -917,4 +958,34 @@ fn validate_process_pre_pair_inputs(
     }
 
     Ok(())
+}
+
+/// Derives the post-handshake channel id used by the pairing rekey.
+///
+/// Computes:
+///
+/// ```text
+/// SHA-384( u64_be(original_channel_id) || shared_key )
+/// ```
+///
+/// and returns the first 8 bytes interpreted as a big-endian `u64`. Both
+/// sides feed identical inputs (the channel id from the contact / pairing
+/// envelopes and the freshly negotiated shared key) so they reach the same
+/// result independently. The function is deterministic; the only randomness
+/// in the final id is the pairing-time entropy that fed the shared key.
+fn derive_rekeyed_channel_id(
+    original_channel_id: ChannelId,
+    shared_key: &PairingSharedKey,
+) -> ChannelId {
+    let mut hasher = Sha384::new();
+    hasher.update(u64::from(original_channel_id).to_be_bytes());
+    hasher.update(shared_key.as_slice());
+    let digest = hasher.finalize();
+
+    // Safe to unwrap: SHA-384 digests are 48 bytes; the prefix is always
+    // long enough for a u64.
+    let prefix: [u8; 8] = digest[..8]
+        .try_into()
+        .expect("SHA-384 digest has at least 8 bytes");
+    ChannelId(u64::from_be_bytes(prefix))
 }

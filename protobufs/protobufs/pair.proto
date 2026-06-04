@@ -209,4 +209,42 @@ message PairResponseMessage {
   // Used for observability and may assist in replay detection or timeout
   // handling, depending on the implementation.
   google.protobuf.Timestamp timestamp = 7;
+
+  // Derived channel identifier the two parties switch to immediately after
+  // the pairing handshake completes. This message is the only place this
+  // value travels on the wire, and it travels encrypted (inside the pairing
+  // envelope), so a passive observer who only sees the pre-rekey traffic
+  // cannot link the now-paired session to its long-running successor.
+  //
+  // # Derivation
+  //
+  // The responder computes:
+  //
+  //     channelId = u64::from_be_bytes(
+  //         SHA-384(
+  //             u64_be(originalChannelId) || sharedKeyBytes
+  //         )[0..8]
+  //     )
+  //
+  // where `originalChannelId` is the channelId from the contact / pairing
+  // envelopes and `sharedKeyBytes` is the freshly-derived pairing shared
+  // key.
+  //
+  // # Validation
+  //
+  // The requester MUST recompute the same hash with its own derivation of
+  // the shared key and reject the response (closing the would-be channel)
+  // if the value here does not match. A non-matching value indicates either
+  // a key-derivation mismatch (the channel would be unusable anyway) or
+  // tampering by a peer that somehow forged a valid envelope but cannot
+  // produce the SHA-384 preimage.
+  //
+  // # Effect
+  //
+  // Both parties atomically rekey their local channel record from
+  // `originalChannelId` to this value once the handshake is accepted. All
+  // subsequent envelopes on this channel — including the
+  // UpdateChannelInfo handover for the long-term transport — route on the
+  // new id.
+  uint64 channelId = 8;
 }

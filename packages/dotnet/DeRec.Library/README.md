@@ -51,6 +51,24 @@ Console.WriteLine($"DeRec {version.Major}.{version.Minor}");
 
 ## Example: Pairing Flow
 
+The `ContactMessage` is exchanged out-of-band (QR codes, existing messaging
+channels, etc.). Two `ContactMode` values select how the public encryption
+material is delivered:
+
+| Mode | What the contact carries | Use when |
+|---|---|---|
+| `ContactMode.InlineKeys` (default) | Full ML-KEM encapsulation key + ECIES public key | Out-of-band channel can carry the keys (NFC, messaging). |
+| `ContactMode.HashedKeys` | Only a SHA-384 commitment to the keys | Channel is size-constrained (QR codes). Scanner fetches the actual keys via a plaintext `PrePair` round-trip and verifies them against the hash. |
+
+After the handshake completes, **both modes** rekey the channel id. The
+responder derives `SHA-384(u64_be(originalId) || sharedKey)[..8]` as a
+`ulong`, includes it in the encrypted `PairResponseMessage`, and both sides
+switch their local state to the new id. The new id never appears in plaintext
+on the wire, so a passive observer who only saw pre-rekey traffic cannot link
+the long-running channel to its pairing-time id.
+
+### `InlineKeys` flow
+
 ```csharp
 using DeRec.Library;
 using DeRec.Library.Primitives;
@@ -60,6 +78,7 @@ ulong channelId = 1;
 // Step 1: Contact initiator creates the out-of-band ContactMessage.
 var contact = Pairing.Request.CreateContact(
     channelId,
+    ContactMode.InlineKeys,
     new TransportProtocol("https://example.com/alice"));
 
 // Step 2: Contact responder produces the pairing request envelope.
@@ -71,7 +90,7 @@ var pairRequest = Pairing.Request.Produce(
 // Step 3: Initiator extracts the request, then produces the response and derives the shared key.
 var extractedRequest = Pairing.Request.Extract(pairRequest.Envelope, contact.SecretKeyMaterial);
 var produced = Pairing.Response.Produce(
-    Pairing.SenderKind.Owner,
+    channelId,
     extractedRequest.RequestProtoBytes,
     contact.SecretKeyMaterial);
 
@@ -82,7 +101,12 @@ var processed = Pairing.Response.Process(
     extractedResponse.ResponseProtoBytes,
     pairRequest.SecretKeyMaterial);
 
+// Both sides hold the same shared key and rekeyed channel id.
 // produced.SharedKey  ==  processed.SharedKey
+// produced.ChannelId  ==  processed.ChannelId  !=  channelId
+//
+// Rename local channel state from `channelId` to `produced.ChannelId`
+// before sending any further traffic.
 ```
 
 To reject a pairing request, build a `PairResponseMessage` with a non-OK
@@ -90,7 +114,58 @@ To reject a pairing request, build a `PairResponseMessage` with a non-OK
 pairing envelope primitives. The higher-level `DeRecProtocol` orchestrator's
 `reject` method does this for you. A typed `DeRecException`
 (`Code == DeRecCode.NonOkStatus`, plus `PeerStatus` / `PeerMemo`) is thrown
-from `Process` when the peer rejected.
+from `Process` when the peer rejected. Rejected responses do not carry a
+meaningful `ChannelId` — the rekey only takes effect on `Ok` responses.
+
+### `HashedKeys` flow (PrePair)
+
+`HashedKeys` adds one plaintext round-trip before the regular `InlineKeys`
+handshake. The scanner fetches the actual keys via `PrePair`, verifies them
+against `contact.ContactBindingHash`, and then runs the normal pairing flow
+on a synthesized contact with the keys filled in.
+
+```csharp
+using DeRec.Library;
+using DeRec.Library.Primitives;
+
+ulong channelId = 7;
+
+// Initiator: HASHED_KEYS contact (no inline keys, only the binding hash).
+// Transport URI MUST be ephemeral — PrePair envelopes are plaintext.
+var contact = Pairing.Request.CreateContact(
+    channelId,
+    ContactMode.HashedKeys,
+    new TransportProtocol("https://relay.example.com/ephemeral"));
+
+// Scanner: fetch keys via PrePair.
+var prePairReqEnv = Pairing.Request.ProducePrePair(
+    new TransportProtocol("https://scanner.example.com/ephemeral"),
+    contact.ContactMessage);
+var prePairReq = Pairing.Request.ExtractPrePair(prePairReqEnv.Envelope);
+var prePairRespEnv = Pairing.Response.ProducePrePair(
+    channelId, prePairReq.RequestProtoBytes, contact.SecretKeyMaterial);
+var prePairResp = Pairing.Response.ExtractPrePair(prePairRespEnv.Envelope);
+
+// Scanner validates the published keys against contact.ContactBindingHash.
+// Throws DeRecException on mismatch (returns the keys + echoed nonce on match).
+var validated = Pairing.Response.ProcessPrePair(
+    contact.ContactMessage, prePairResp.ResponseProtoBytes);
+
+// Synthesize a "filled-in" contact and run the regular pairing flow.
+var filledInContact = contact.ContactMessage with
+{
+    MlkemEncapsulationKey = validated.MlkemEncapsulationKey,
+    EciesPublicKey = validated.EciesPublicKey,
+};
+// ... continue with Pairing.Request.Produce / Extract /
+// Pairing.Response.Produce / Process against `filledInContact` exactly as
+// in the InlineKeys example.
+```
+
+After the PrePair exchange the application **must** swap the transport
+endpoint to a long-term one via `UpdateChannelInfo`. The ephemeral endpoint
+advertised in the `HashedKeys` contact is intended to be retired immediately
+after pairing.
 
 ---
 

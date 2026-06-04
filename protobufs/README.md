@@ -60,8 +60,9 @@ The protocol defines three roles via the `SenderKind` enum:
 
 | File | Messages | Purpose |
 |------|----------|---------|
-| `contact.proto` | `ContactMessage` | Out-of-band bootstrap for the pairing flow |
-| `pair.proto` | `PairRequestMessage`, `PairResponseMessage`, `SenderKind` | Pairing handshake between Owner and Helper (or Replica) |
+| `contact.proto` | `ContactMessage`, `ContactMode` | Out-of-band bootstrap for the pairing flow. `ContactMode` selects between inline keys and a SHA-384 commitment that the recipient resolves via `prepair.proto`. |
+| `pair.proto` | `PairRequestMessage`, `PairResponseMessage`, `SenderKind` | Pairing handshake between Owner and Helper (or Replica). `PairResponseMessage.channelId` carries the post-handshake rekey id both sides switch to. |
+| `prepair.proto` | `PrePairRequestMessage`, `PrePairResponseMessage` | Plaintext key fetch step used only with `ContactMode = HASHED_KEYS`; the recipient verifies the published keys against the contact's `contactBindingHash` before proceeding to `pair.proto`. |
 | `unpair.proto` | `UnpairRequestMessage`, `UnpairResponseMessage` | Terminate a channel relationship |
 | `storeshare.proto` | `StoreShareRequestMessage`, `StoreShareResponseMessage` | Distribute secret shares to Helpers |
 | `verify.proto` | `VerifyShareRequestMessage`, `VerifyShareResponseMessage` | Challenge-response share verification |
@@ -96,6 +97,10 @@ All protocol messages are wrapped in the `MessageBody` oneof inside
 | 11 | `GetShareRequestMessage` |
 | 12 | `GetShareResponseMessage` |
 | 13 | `ErrorResponseMessage` |
+| 14 | `UpdateChannelInfoRequestMessage` |
+| 15 | `UpdateChannelInfoResponseMessage` |
+| 16 | `PrePairRequestMessage` |
+| 17 | `PrePairResponseMessage` |
 
 ---
 

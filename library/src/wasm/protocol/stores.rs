@@ -79,7 +79,6 @@ use crate::{
     types::{Channel, ChannelId, ChannelStatus},
 };
 
-// ── Error helpers ─────────────────────────────────────────────────────────────
 
 /// A simple string-backed error for wrapping JS call failures.
 #[derive(Debug)]
@@ -97,7 +96,6 @@ fn box_err(msg: String) -> Box<dyn std::error::Error + Send + Sync + 'static> {
     Box::new(JsCallError(msg))
 }
 
-// ── JS bridge helpers ─────────────────────────────────────────────────────────
 
 fn call_method(obj: &JsValue, method: &str, args: &Array) -> Result<JsValue, String> {
     let func_val = js_sys::Reflect::get(obj, &JsValue::from_str(method))
@@ -139,7 +137,6 @@ fn decode_secret_value(kind: SecretKind, bytes: &[u8]) -> Result<SecretValue, Se
     }
 }
 
-// ── JsSecretStore ─────────────────────────────────────────────────────────────
 
 /// Adapter wrapping a JS `SecretStore` object.
 pub struct JsSecretStore(pub JsValue);
@@ -275,7 +272,6 @@ impl DeRecSecretStore for JsSecretStore {
     }
 }
 
-// ── JsChannelStore ───────────────────────────────────────────────────────────
 
 /// Adapter wrapping a JS `ChannelStore` object.
 ///
@@ -510,7 +506,6 @@ impl DeRecChannelStore for JsChannelStore {
     }
 }
 
-// ── JsShareStore ──────────────────────────────────────────────────────────────
 
 /// Adapter wrapping a JS `ShareStore` object.
 pub struct JsShareStore(pub JsValue);
@@ -698,7 +693,6 @@ impl DeRecShareStore for JsShareStore {
     }
 }
 
-// ── JsTransport ───────────────────────────────────────────────────────────────
 
 /// Adapter wrapping a JS `Transport` object.
 pub struct JsTransport(pub JsValue);

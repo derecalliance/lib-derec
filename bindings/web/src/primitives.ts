@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//
 // Primitives smoke tests: exercises every flow using the low-level
 // `primitives.*` API (raw message produce / extract / process functions).
-//
 // Mirrors the Rust primitive smoke test (`bindings/rust/src/primitives.rs`).
 // The chain in each flow is request.produce → request.extract → response.produce
 // → response.extract → response.process, matching the current Rust signatures
@@ -43,7 +41,6 @@ export function runPrimitivesSmoke(): void {
     return k;
   };
 
-  // ── Sharing ───────────────────────────────────────────────────────────────
 
   console.log("=== [Primitives] Sharing Flow ===");
 
@@ -98,7 +95,6 @@ export function runPrimitivesSmoke(): void {
 
   console.log("✓ Sharing flow passed.\n");
 
-  // ── Verification ──────────────────────────────────────────────────────────
 
   console.log("=== [Primitives] Verification Flow ===");
 
@@ -136,7 +132,6 @@ export function runPrimitivesSmoke(): void {
 
   console.log("✓ Verification flow passed.\n");
 
-  // ── Discovery ─────────────────────────────────────────────────────────────
 
   console.log("=== [Primitives] Discovery Flow ===");
 
@@ -171,7 +166,6 @@ export function runPrimitivesSmoke(): void {
 
   console.log("✓ Discovery flow passed.\n");
 
-  // ── Recovery ──────────────────────────────────────────────────────────────
 
   console.log("=== [Primitives] Recovery Flow ===");
 
@@ -200,7 +194,6 @@ export function runPrimitivesSmoke(): void {
 
   console.log("✓ Recovery flow passed.\n");
 
-  // ── Pairing (INLINE_KEYS) ─────────────────────────────────────────────────
 
   console.log("=== [Primitives] Pairing Flow (INLINE_KEYS) ===");
 
@@ -242,12 +235,19 @@ export function runPrimitivesSmoke(): void {
       !produced.shared_key.every((b, i) => b === processed.shared_key[i])) {
     throw new Error("pairing: shared keys do not match");
   }
+  if (produced.channel_id !== processed.channel_id) {
+    throw new Error(
+      `pairing: rekeyed channel id mismatch (produce=${produced.channel_id} process=${processed.channel_id})`,
+    );
+  }
+  if (produced.channel_id === pairingChannelId) {
+    throw new Error("pairing: rekeyed channel id must differ from the pre-rekey id");
+  }
   console.log(`  shared keys match (${produced.shared_key.length}B)  ✓`);
+  console.log(`  channel id rekeyed: ${pairingChannelId} → ${produced.channel_id}  ✓`);
 
   console.log("✓ Pairing flow (INLINE_KEYS) passed.\n");
 
-  // ── Pairing (HASHED_KEYS + PrePair) ───────────────────────────────────────
-  //
   // HASHED_KEYS contacts carry only a SHA-384 commitment to the initiator's
   // public keys (small enough for QR), so before pairing can proceed the
   // scanner must fetch the actual keys over the wire via the plaintext
@@ -280,7 +280,6 @@ export function runPrimitivesSmoke(): void {
   }
   console.log(`  contact carries 48-byte binding hash, no inline keys  ✓`);
 
-  // --- PrePair leg ----------------------------------------------------------
 
   const prePairRequestEnvelope = primitives.pairing.request.produce_pre_pair(
     { protocol: 0, uri: "https://example.com/helper/ephemeral" },
@@ -306,7 +305,6 @@ export function runPrimitivesSmoke(): void {
   );
   console.log(`  PrePair validated (mlkem=${validated.mlkem_encapsulation_key.length}B, ecies=${validated.ecies_public_key.length}B, nonce echoed)  ✓`);
 
-  // --- Normal pairing on top of the validated keys --------------------------
 
   const filledInContact: ContactMessage = {
     ...hkContact.contact_message,
@@ -335,6 +333,14 @@ export function runPrimitivesSmoke(): void {
   if (hkProduced.shared_key.length !== hkProcessed.shared_key.length ||
       !hkProduced.shared_key.every((b, i) => b === hkProcessed.shared_key[i])) {
     throw new Error("HASHED_KEYS pairing: shared keys do not match");
+  }
+  if (hkProduced.channel_id !== hkProcessed.channel_id) {
+    throw new Error(
+      `HASHED_KEYS pairing: rekeyed channel id mismatch (produce=${hkProduced.channel_id} process=${hkProcessed.channel_id})`,
+    );
+  }
+  if (hkProduced.channel_id === hashedKeysChannelId) {
+    throw new Error("HASHED_KEYS pairing: rekeyed channel id must differ from the pre-rekey id");
   }
   console.log(`  shared keys match (${hkProduced.shared_key.length}B)  ✓`);
 

@@ -13,10 +13,23 @@ public static partial class Pairing
             public required DeRecMessage Envelope { get; init; }
             public required TransportProtocol PeerTransportProtocol { get; init; }
             public required byte[] SharedKey { get; init; }
+            /// <summary>
+            /// Post-handshake rekey channel id the responder is committing to.
+            /// Callers MUST atomically rename their local channel record from the
+            /// pre-rekey id (the one passed to <see cref="Produce"/>) to this
+            /// value as part of accepting the response.
+            /// </summary>
+            public required ulong ChannelId { get; init; }
         }
 
         public sealed class ExtractResult
         {
+            /// <summary>
+            /// Channel id taken from the outer envelope's routing field. This
+            /// is the <em>pre-rekey</em> id used to look up the in-flight
+            /// pairing session locally. The post-rekey id lives in the inner
+            /// response and is surfaced by <see cref="Process"/>.
+            /// </summary>
             public required ulong ChannelId { get; init; }
             /// <summary>
             /// Inner <c>PairResponseMessage</c> proto bytes for chaining into
@@ -28,6 +41,13 @@ public static partial class Pairing
         public sealed class ProcessResult
         {
             public required byte[] SharedKey { get; init; }
+            /// <summary>
+            /// Post-handshake rekey channel id — already validated against the
+            /// caller's own derivation. Callers MUST atomically rename their
+            /// local channel record from the pre-rekey id (the one in the
+            /// contact) to this value.
+            /// </summary>
+            public required ulong ChannelId { get; init; }
         }
 
         public sealed class ProducePrePairResult
@@ -95,6 +115,7 @@ public static partial class Pairing
                     Envelope = DeRecMessage.FromProtoBytes(Utils.CopyBuffer(nativeResult.ResponseWireBytes)),
                     PeerTransportProtocol = TransportProtocol.FromProtoBytes(Utils.CopyBuffer(nativeResult.PeerTransportProtocol)),
                     SharedKey = Utils.CopyBuffer(nativeResult.SharedKey),
+                    ChannelId = nativeResult.ChannelId,
                 };
             }
             finally
@@ -160,6 +181,7 @@ public static partial class Pairing
                 return new ProcessResult
                 {
                     SharedKey = Utils.CopyBuffer(nativeResult.SharedKey),
+                    ChannelId = nativeResult.ChannelId,
                 };
             }
             finally

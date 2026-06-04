@@ -445,10 +445,29 @@ submodules. The general pattern is:
 
 ### Pairing
 
+The contact message is exchanged out-of-band (QR codes, existing messaging
+channels, etc.). Two modes select how the initiator's public encryption
+material is delivered:
+
+| `ContactMode` | What's in the contact | When to use |
+|---|---|---|
+| `InlineKeys` (default) | Full ML-KEM encapsulation key + ECIES public key | Out-of-band channel can carry the keys (e.g. NFC, direct messaging). |
+| `HashedKeys` | Only a SHA-384 commitment to the keys (`contact_binding_hash`) | The out-of-band channel is size-constrained (QR codes). The scanner fetches the actual keys over the wire via a `PrePair` round-trip, then verifies them against the hash. |
+
+After the handshake completes, **both modes** rekey the channel id. The
+responder includes
+`channel_id = u64::from_be_bytes( SHA-384(u64_be(originalId) || sharedKey)[..8] )`
+in the encrypted `PairResponseMessage`; both sides switch their local channel
+record to that value and route all future traffic on it. Because the new id
+travels encrypted, a passive observer who only saw the pre-rekey traffic
+cannot link the long-running channel back to its pairing-time id.
+
+#### `InlineKeys` flow
+
 ```rust,ignore
-use derec_library::primitives::pairing::{request, response::{self, ProduceResult as PairResponseProduceResult}};
+use derec_library::primitives::pairing::{request, response};
 use derec_library::types::ChannelId;
-use derec_proto::{Protocol, SenderKind, TransportProtocol};
+use derec_proto::{ContactMode, Protocol, SenderKind, TransportProtocol};
 
 let channel_id = ChannelId(42);
 
@@ -458,6 +477,7 @@ let request::CreateContactResult {
     secret_key: initiator_secret_key,
 } = request::create_contact(
     channel_id,
+    ContactMode::InlineKeys,
     TransportProtocol {
         uri: "https://relay.example/derec".to_owned(),
         protocol: Protocol::Https.into(),
@@ -482,12 +502,13 @@ let request::ProduceResult {
 // Step 3 — Initiator extracts the request and produces the response.
 let request::ExtractResult { request: pair_request } =
     request::extract(&pair_request_envelope, initiator_secret_key.ecies_secret_key()).unwrap();
-let PairResponseProduceResult {
+let response::ProduceResult {
     envelope: pair_response_envelope,
     shared_key: initiator_shared_key,
+    channel_id: rekeyed_channel_id,
     ..
 } = response::produce(
-    SenderKind::Owner,
+    channel_id,
     &pair_request,
     &initiator_secret_key,
     None,
@@ -496,24 +517,90 @@ let PairResponseProduceResult {
 // Step 4 — Responder extracts the response and finalizes pairing.
 let response::ExtractResult { response: pair_response } =
     response::extract(&pair_response_envelope, responder_secret_key.ecies_secret_key()).unwrap();
-let response::ProcessResult { shared_key: responder_shared_key } =
-    response::process(
-        &initiator_contact_message,
-        &pair_response,
-        &responder_secret_key,
-    ).unwrap();
+let response::ProcessResult {
+    shared_key: responder_shared_key,
+    channel_id: responder_rekeyed_id,
+} = response::process(
+    &initiator_contact_message,
+    &pair_response,
+    &responder_secret_key,
+).unwrap();
 
-// Both sides now hold the same shared key.
+// Both sides now hold the same shared key and the same rekeyed channel id;
+// rename local channel state from `channel_id` to `rekeyed_channel_id`
+// before sending any further traffic.
 assert_eq!(initiator_shared_key, responder_shared_key);
+assert_eq!(rekeyed_channel_id, responder_rekeyed_id);
+assert_ne!(rekeyed_channel_id, channel_id);
 ```
 
 To reject the request, build a `PairResponseMessage` with a non-`Ok`
 `StatusEnum` and encrypt it with `DeRecMessageBuilder::pairing()` against the
 peer's `request.ecies_public_key`. The protocol-layer `reject` method does
-this for you.
+this for you. Rejected responses do not carry a meaningful `channel_id` —
+the rekey only takes effect on `Ok` responses.
 
-The `ContactMessage` is exchanged out-of-band (QR codes, existing messaging
-channels, etc.).
+#### `HashedKeys` flow (PrePair)
+
+`HashedKeys` adds one plaintext round-trip before the regular `InlineKeys`
+handshake. The scanner fetches the keys via `PrePair`, verifies them against
+`contact.contact_binding_hash`, and then runs the normal pairing flow on a
+synthesized `ContactMessage` with the keys filled in.
+
+```rust,ignore
+use derec_library::primitives::pairing::{request, response};
+use derec_library::types::ChannelId;
+use derec_proto::{ContactMode, ContactMessage, Protocol, SenderKind, TransportProtocol};
+
+let channel_id = ChannelId(7);
+
+// Initiator: HASHED_KEYS contact (no inline keys, only the binding hash).
+// The transport URI MUST be ephemeral — PrePair envelopes are plaintext.
+let request::CreateContactResult {
+    contact_message: contact,
+    secret_key: initiator_secret_key,
+} = request::create_contact(
+    channel_id,
+    ContactMode::HashedKeys,
+    TransportProtocol {
+        uri: "https://relay.example/ephemeral".to_owned(),
+        protocol: Protocol::Https.into(),
+    },
+).unwrap();
+
+// Scanner: fetch keys via PrePair.
+let request::ProducePrePairResult { envelope: pre_pair_req_env } =
+    request::produce_pre_pair_request(
+        TransportProtocol {
+            uri: "https://relay.example/scanner-ephemeral".to_owned(),
+            protocol: Protocol::Https.into(),
+        },
+        &contact,
+    ).unwrap();
+let request::PrePairExtractResult { request: pre_pair_req } =
+    request::extract_pre_pair(&pre_pair_req_env).unwrap();
+let response::ProducePrePairResult { envelope: pre_pair_resp_env } =
+    response::produce_pre_pair(channel_id, &pre_pair_req, &initiator_secret_key).unwrap();
+let response::PrePairExtractResult { response: pre_pair_resp } =
+    response::extract_pre_pair(&pre_pair_resp_env).unwrap();
+
+// Scanner validates the published keys against `contact.contact_binding_hash`;
+// returns the keys + nonce on match, errors with `ProtocolViolation` on
+// mismatch.
+let validated = response::process_pre_pair(&contact, &pre_pair_resp).unwrap();
+
+// Synthesize a "filled-in" contact and run the regular pairing flow.
+let mut filled_in_contact: ContactMessage = contact.clone();
+filled_in_contact.mlkem_encapsulation_key = Some(validated.mlkem_encapsulation_key);
+filled_in_contact.ecies_public_key = Some(validated.ecies_public_key);
+// ... continue with request::produce / extract / response::produce / process
+// against `filled_in_contact` exactly as in the InlineKeys example.
+```
+
+After the PrePair exchange the application **must** swap the transport
+endpoint to a long-term one via `UpdateChannelInfo`. The ephemeral endpoint
+advertised in the `HashedKeys` contact is intended to be retired immediately
+after pairing.
 
 ### Share Distribution
 

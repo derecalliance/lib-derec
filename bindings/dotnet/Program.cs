@@ -83,6 +83,11 @@ internal static class Program
 
         if (!produced.SharedKey.SequenceEqual(processed.SharedKey))
             throw new InvalidOperationException("Pairing test failed: shared keys do not match.");
+        if (produced.ChannelId != processed.ChannelId)
+            throw new InvalidOperationException($"Pairing test failed: rekeyed channel id mismatch (produce={produced.ChannelId} process={processed.ChannelId}).");
+        if (produced.ChannelId == channelId)
+            throw new InvalidOperationException("Pairing test failed: rekeyed channel id must differ from the pre-rekey id.");
+        Console.WriteLine($"  channel id rekeyed: {channelId} → {produced.ChannelId}");
 
         Console.WriteLine("Pairing flow test (INLINE_KEYS) passed.");
     }
@@ -111,7 +116,6 @@ internal static class Program
             throw new InvalidOperationException("HASHED_KEYS contact must carry a 48-byte SHA-384 binding hash.");
         Console.WriteLine("  contact carries 48-byte binding hash, no inline keys");
 
-        // --- PrePair leg --------------------------------------------------------
 
         // Bob (the scanner) sends a plaintext PrePair request asking for the keys.
         var prePairRequestEnvelope = Pairing.Request.ProducePrePair(
@@ -151,7 +155,6 @@ internal static class Program
             throw new InvalidOperationException("PrePair validation must echo the contact's nonce.");
         Console.WriteLine($"  PrePair validated (mlkem={validated.MlkemEncapsulationKey.Length}B, ecies={validated.EciesPublicKey.Length}B, nonce echoed)");
 
-        // --- Normal pairing on top of the validated keys ------------------------
 
         // Bob synthesizes a "filled-in" contact by copying the validated keys
         // into the HASHED_KEYS contact. From here on the flow is identical to
@@ -189,8 +192,13 @@ internal static class Program
 
         if (!produced.SharedKey.SequenceEqual(processed.SharedKey))
             throw new InvalidOperationException("HASHED_KEYS pairing: shared keys do not match.");
+        if (produced.ChannelId != processed.ChannelId)
+            throw new InvalidOperationException($"HASHED_KEYS pairing: rekeyed channel id mismatch (produce={produced.ChannelId} process={processed.ChannelId}).");
+        if (produced.ChannelId == channelId)
+            throw new InvalidOperationException("HASHED_KEYS pairing: rekeyed channel id must differ from the pre-rekey id.");
 
         Console.WriteLine($"  shared keys match ({produced.SharedKey.Length}B)");
+        Console.WriteLine($"  channel id rekeyed: {channelId} → {produced.ChannelId}");
         Console.WriteLine("Pairing flow test (HASHED_KEYS + PrePair) passed.");
     }
 

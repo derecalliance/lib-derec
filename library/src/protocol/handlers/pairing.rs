@@ -193,6 +193,10 @@ pub(in crate::protocol) async fn reject<Ss: DeRecSecretStore, T: DeRecTransport>
             ))?;
 
     let timestamp = current_timestamp();
+    // Rejection short-circuits before channel_id rekey would happen — the
+    // channel is being torn down, no shared key is derived, and the
+    // requester's `process` exits on the non-Ok status without consulting
+    // this field. Leave the rekey slot zeroed to make that explicit.
     let response = PairResponseMessage {
         result: Some(DeRecResult {
             status: status as i32,
@@ -202,6 +206,7 @@ pub(in crate::protocol) async fn reject<Ss: DeRecSecretStore, T: DeRecTransport>
         communication_info: build_communication_info(communication_info),
         parameter_range: None,
         timestamp: Some(timestamp),
+        channel_id: 0,
     };
 
     let envelope = DeRecMessageBuilder::pairing()

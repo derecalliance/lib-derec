@@ -38,7 +38,6 @@ pub fn run_all() {
     rt.block_on(run_update_channel_info_flow());
 }
 
-// ── In-memory channel store ───────────────────────────────────────────────────
 
 /// Stores paired channels plus the channel-link graph (channels belonging to
 /// the same Owner identity, e.g. after a recovery re-pairing). The link graph
@@ -104,7 +103,6 @@ impl DeRecChannelStore for InMemoryChannelStore {
     }
 }
 
-// ── In-memory secret store ────────────────────────────────────────────────────
 
 #[derive(Default)]
 struct InMemorySecretStore {
@@ -172,7 +170,6 @@ fn clone_secret_value(v: &SecretValue) -> SecretValue {
     }
 }
 
-// ── In-memory share store ─────────────────────────────────────────────────────
 
 /// Stores shares keyed by `(channel_id, secret_id, version)`. Pure keyed
 /// store — channel linking lives in [`InMemoryChannelStore`]; `load_many`
@@ -265,7 +262,6 @@ impl DeRecShareStore for InMemoryShareStore {
     }
 }
 
-// ── In-process transport ──────────────────────────────────────────────────────
 
 /// Buffers outbound `(endpoint, bytes)` instead of performing network I/O.
 /// `drain()` retrieves and clears the pending messages. The buffer is shared
@@ -301,7 +297,6 @@ impl DeRecTransport for InProcessTransport {
     }
 }
 
-// ── Peer wrapper ──────────────────────────────────────────────────────────────
 
 type SmokeProtocol = DeRecProtocol<
     InMemoryChannelStore,
@@ -468,7 +463,6 @@ async fn pump_many(peers: &mut [&mut Peer]) -> Vec<DeRecEvent> {
     all_events
 }
 
-// ── Pairing ───────────────────────────────────────────────────────────────────
 
 /// Drive a full pairing handshake: Owner creates a contact, Helper starts
 /// pairing from it, and bytes are pumped both ways until both sides report
@@ -564,7 +558,6 @@ async fn run_pairing_flow() {
     println!("Protocol pairing flow test passed.");
 }
 
-// ── Sharing ───────────────────────────────────────────────────────────────────
 
 async fn run_sharing_flow() {
     println!("=== Protocol sharing flow test ===");
@@ -619,7 +612,6 @@ async fn run_sharing_flow() {
     println!("Protocol sharing flow test passed.");
 }
 
-// ── Discovery + recovery ──────────────────────────────────────────────────────
 
 async fn run_discovery_and_recovery_flow() {
     println!("=== Protocol discovery & recovery flow test ===");
@@ -638,7 +630,6 @@ async fn run_discovery_and_recovery_flow() {
     let mut helper_a = Peer::new("helper-a", "https://helper-a.example.com");
     let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
 
-    // ── Setup: pair + distribute a secret across both helpers ─────────────────
 
     pair(&mut owner, &mut helper_a, channel_a).await;
     pair(&mut owner, &mut helper_b, channel_b).await;
@@ -677,8 +668,6 @@ async fn run_discovery_and_recovery_flow() {
     );
     println!("Secret distributed and confirmed by both helpers.");
 
-    // ── Recovery: re-pair on fresh channels (Owner-initiated) ─────────────────
-    //
     // A recovering Owner has lost local state, so it pairs again with each
     // Helper on a brand-new channel. The Owner is the pairing initiator here.
     for (helper, fresh_cid, label) in [
@@ -752,8 +741,6 @@ async fn run_discovery_and_recovery_flow() {
         .await
         .expect("owner remove(channel_b) failed");
 
-    // ── Discovery: Owner asks each helper what it holds ───────────────────────
-    //
     // Scope discovery to the *recovery* channels only. The Owner still has
     // the original pairings live in this smoke test (we don't simulate state
     // loss), but a real recovering Owner would only have the recovery
@@ -807,7 +794,6 @@ async fn run_discovery_and_recovery_flow() {
         discovered.len()
     );
 
-    // ── Recovery: request shares and reconstruct the secret ───────────────────
 
     owner
         .protocol
@@ -838,7 +824,6 @@ async fn run_discovery_and_recovery_flow() {
     println!("Protocol discovery & recovery flow test passed.");
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || haystack.len() < needle.len() {
@@ -849,7 +834,6 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-// ── Unpairing ─────────────────────────────────────────────────────────────────
 
 /// Drives a full unpair handshake under [`UnpairAck::Required`]: Owner starts
 /// the flow, Helper auto-accepts (via `deliver`), Owner processes the `Ok`
@@ -942,7 +926,6 @@ async fn run_unpairing_flow() {
     println!("Protocol unpairing flow test passed.");
 }
 
-// ── UpdateChannelInfo ─────────────────────────────────────────────────────────
 
 /// Drives a full `UpdateChannelInfo` round-trip: Owner mutates local state via
 /// `set_communication_info` / `set_own_transport`, broadcasts the update,

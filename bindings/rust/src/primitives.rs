@@ -142,6 +142,14 @@ fn run_pairing_flow_test() {
         pair_resp.shared_key, processed.shared_key,
         "shared keys derived by both sides must match"
     );
+    assert_eq!(
+        pair_resp.channel_id, processed.channel_id,
+        "both sides must derive the same rekeyed channel id"
+    );
+    assert_ne!(
+        pair_resp.channel_id, channel_id,
+        "rekeyed channel id must differ from the pre-rekey id"
+    );
 
     println!("Pairing flow test passed.");
 }
@@ -191,7 +199,6 @@ fn run_pairing_flow_hashed_keys_test() {
         "contact_binding_hash must be a SHA-384 digest (48 bytes)"
     );
 
-    // --- PrePair leg --------------------------------------------------------
 
     // Bob (the scanner) sends a PrePair request asking for the actual keys.
     // The envelope is plaintext (no shared key exists yet) and routes to
@@ -244,8 +251,6 @@ fn run_pairing_flow_hashed_keys_test() {
     );
     assert_eq!(processed_prepair.nonce, alice_contact.nonce);
 
-    // --- Normal pairing flow ------------------------------------------------
-    //
     // Bob synthesizes a "filled-in" contact by copying the validated keys
     // into a clone of the original (HASHED_KEYS) contact. From here on the
     // flow is identical to the INLINE_KEYS path — `pair_request::produce`
@@ -292,6 +297,14 @@ fn run_pairing_flow_hashed_keys_test() {
     assert_eq!(
         pair_resp.shared_key, processed.shared_key,
         "shared keys derived by both sides must match (HASHED_KEYS path)"
+    );
+    assert_eq!(
+        pair_resp.channel_id, processed.channel_id,
+        "both sides must derive the same rekeyed channel id (HASHED_KEYS path)"
+    );
+    assert_ne!(
+        pair_resp.channel_id, channel_id,
+        "rekeyed channel id must differ from the pre-rekey id (HASHED_KEYS path)"
     );
 
     println!("Pairing flow test (HASHED_KEYS + PrePair) passed.");

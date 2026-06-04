@@ -60,6 +60,11 @@ pub struct ProducePairResponseMessageResult {
     pub response_wire_bytes: DeRecBuffer,
     pub peer_transport_protocol: DeRecBuffer,
     pub shared_key: DeRecBuffer,
+    /// Post-handshake rekey channel id the responder is committing to.
+    /// Callers MUST atomically rename their local channel record from the
+    /// pre-rekey id (the one passed to `produce_pair_response_message`) to
+    /// this value as part of accepting the response. Zero on error.
+    pub channel_id: u64,
 }
 
 #[repr(C)]
@@ -77,9 +82,13 @@ pub struct ExtractPairResponseResult {
 pub struct ProcessPairResponseMessageResult {
     pub error: DeRecError,
     pub shared_key: DeRecBuffer,
+    /// Post-handshake rekey channel id — already validated against the
+    /// caller's own derivation. Callers MUST atomically rename their local
+    /// channel record from the pre-rekey id (the one in the contact) to
+    /// this value. Zero on error.
+    pub channel_id: u64,
 }
 
-// --- PrePair (HASHED_KEYS) flow ----------------------------------------------
 
 #[repr(C)]
 pub struct ProducePrePairRequestMessageResult {
@@ -332,6 +341,7 @@ pub extern "C" fn produce_pair_response_message(
         response_wire_bytes: empty_buffer(),
         peer_transport_protocol: empty_buffer(),
         shared_key: empty_buffer(),
+        channel_id: 0,
     };
 
     let request_bytes =
@@ -370,6 +380,7 @@ pub extern "C" fn produce_pair_response_message(
             response_wire_bytes: vec_into_buffer(r.envelope),
             peer_transport_protocol: vec_into_buffer(r.peer_transport_protocol.encode_to_vec()),
             shared_key: vec_into_buffer(r.shared_key.to_vec()),
+            channel_id: r.channel_id.into(),
         },
         Err(e) => with_err(from_lib_error(e)),
     }
@@ -442,6 +453,7 @@ pub extern "C" fn process_pair_response_message(
     let with_err = |error| ProcessPairResponseMessageResult {
         error,
         shared_key: empty_buffer(),
+        channel_id: 0,
     };
 
     let contact_message_bytes = match parse_buffer(
@@ -489,20 +501,16 @@ pub extern "C" fn process_pair_response_message(
         Ok(r) => ProcessPairResponseMessageResult {
             error: success(),
             shared_key: vec_into_buffer(r.shared_key.to_vec()),
+            channel_id: r.channel_id.into(),
         },
         Err(e) => with_err(from_lib_error(e)),
     }
 }
 
-// --- PrePair (HASHED_KEYS) FFI functions -------------------------------------
-//
-// PrePair envelopes are plaintext-in-envelope (no shared key exists yet), so
-// neither the produce nor the extract steps take key material — extract is a
-// pure protobuf decode + envelope-vs-body timestamp check. Hash validation
-// happens in `process_pre_pair_response_message`.
-
 /// Builds a plaintext `PrePairRequestMessage` envelope. Used by the scanner
-/// when the contact was sent with `contact_mode == HASHED_KEYS`.
+/// when the contact was sent with `contact_mode == HASHED_KEYS`. The envelope
+/// is unencrypted — no shared key exists yet — so the caller does not pass
+/// secret key material here.
 ///
 /// # Safety
 ///

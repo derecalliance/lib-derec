@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//
 // Protocol smoke tests: exercises pairing, sharing, and discovery+recovery
 // using the low-level `DeRecProtocol` runtime (`start` / `process` / `accept`)
 // backed by in-memory stores.
-//
 // No UI: every `ActionRequired` event a peer receives is auto-accepted via
 // `processAll`. The store implementations mirror the reference app's
 // `stores.ts` algorithms exactly (channel-link graph + BFS closure, keyed
@@ -21,7 +19,6 @@ import type {
   Transport,
 } from "@derec-alliance/web";
 
-// ── Logging helpers ───────────────────────────────────────────────────────────
 
 const kindName = (k: SenderKind): string => {
   switch (k) {
@@ -36,7 +33,6 @@ const kindName = (k: SenderKind): string => {
   }
 };
 
-// ── In-memory stores ──────────────────────────────────────────────────────────
 
 // kind 0 = SharedKey (32 raw bytes), kind 1 = PairingSecret (ephemeral),
 // kind 2 = PairingContact (ephemeral). Keyed by `${channelId}:${kind}`.
@@ -216,7 +212,6 @@ class InMemoryShareStore implements ShareStore {
   }
 }
 
-// ── RecordingTransport ────────────────────────────────────────────────────────
 
 interface OutboundMessage {
   endpoint: { protocol: string; uri: string };
@@ -239,7 +234,6 @@ class RecordingTransport implements Transport {
   }
 }
 
-// ── Node factory ──────────────────────────────────────────────────────────────
 
 interface Node {
   protocol: DeRecProtocol;
@@ -271,7 +265,6 @@ function makeNode(name: string, endpointUri: string): Node {
   return { protocol, transport, channelStore, shareStore, secretStore };
 }
 
-// ── Assertion helper ──────────────────────────────────────────────────────────
 
 function requireEvent<T extends DeRecEvent["type"]>(
   events: DeRecEvent[],
@@ -289,7 +282,6 @@ function requireEvent<T extends DeRecEvent["type"]>(
   return ev;
 }
 
-// ── Choreography helpers ──────────────────────────────────────────────────────
 
 /**
  * Feed inbound bytes to a node and auto-accept every resulting
@@ -376,7 +368,6 @@ async function doPair(
   );
 }
 
-// ── Sub-test: pairing flow ────────────────────────────────────────────────────
 
 async function runPairingFlow(): Promise<void> {
   console.log("=== [Protocol] Pairing Flow ===\n");
@@ -389,7 +380,6 @@ async function runPairingFlow(): Promise<void> {
   console.log("\n✓ Pairing flow passed.\n");
 }
 
-// ── Sub-test: sharing flow ────────────────────────────────────────────────────
 
 async function runSharingFlow(): Promise<void> {
   console.log("=== [Protocol] Sharing Flow ===\n");
@@ -462,7 +452,6 @@ async function runSharingFlow(): Promise<void> {
   console.log("\n✓ Sharing flow passed.\n");
 }
 
-// ── Sub-test: discovery & recovery flow ──────────────────────────────────────
 
 // VSS sharing requires threshold ≥ 2, so this scenario pairs the Owner with
 // TWO helpers and reconstructs the secret from both shares. Mirrors the Rust
@@ -482,7 +471,6 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
   const description = "wallet seed phrase";
   const secretBytes = new TextEncoder().encode("correct horse battery staple");
 
-  // ── Setup: pair both helpers and distribute the secret to both ────────────
 
   console.log("  -- Setup: initial pairing & sharing --\n");
 
@@ -517,7 +505,6 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
   }
   console.log("  Secret distributed and confirmed by both helpers.\n");
 
-  // ── Recovery re-pair: each helper provisions a fresh contact ───────────────
 
   console.log("  -- Recovery: re-pair on fresh channels --\n");
 
@@ -556,7 +543,6 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
   await owner.channelStore.remove(channelB.toString());
   console.log(`\n  [Owner]  removed original channels ${channelA}, ${channelB} to simulate state loss\n`);
 
-  // ── Discovery: target only the recovery channels ──────────────────────────
 
   console.log("  -- Discovery: Owner asks each helper what it holds --\n");
 
@@ -577,7 +563,6 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
     await owner.protocol.process(resp);
   }
 
-  // ── Recovery: collect shares from both helpers and reconstruct ────────────
 
   console.log("  -- Recovery: collect shares and reconstruct --\n");
 
@@ -621,8 +606,6 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
   console.log("\n✓ Discovery & Recovery flow passed.\n");
 }
 
-// ── Sub-test: unpairing flow ──────────────────────────────────────────────────
-//
 // Verifies that an Owner-initiated unpair (Required-ack mode, the default)
 // produces a successful round-trip:
 //   1. Owner → Helper: UnpairRequest
@@ -675,7 +658,6 @@ async function runUnpairingFlow(): Promise<void> {
   console.log("\n✓ Unpairing flow passed.\n");
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
 
 export async function runProtocolSmoke(): Promise<void> {
   console.log("━━━ [Protocol] Starting ━━━\n");

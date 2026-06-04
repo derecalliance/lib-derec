@@ -338,6 +338,14 @@ export interface PairResponseMessage {
   communication_info?: CommunicationInfo;
   parameter_range?: ParameterRange;
   timestamp?: Timestamp;
+  /**
+   * Post-handshake rekey channel id. Both sides switch their local channel
+   * record to this value once the response is accepted. Derived by the
+   * responder as `SHA-384(u64_be(originalChannelId) || sharedKey)[..8]`
+   * interpreted as big-endian `u64`, and validated by the requester against
+   * its own derivation. Zero on rejection (non-Ok `result.status`).
+   */
+  channel_id: bigint;
 }
 
 export interface PrePairRequestMessage {
@@ -458,11 +466,27 @@ export interface PairingResponseProduceResult extends ProduceResult {
   peer_transport_protocol: TransportProtocol;
 
   shared_key: Uint8Array;
+
+  /**
+   * Post-handshake rekey channel id the responder is committing to.
+   * Callers MUST atomically rename their local channel record from the
+   * pre-rekey id (the one passed to `pairing.response.produce`) to this
+   * value as part of accepting the response.
+   */
+  channel_id: bigint;
 }
 
 export interface PairingProcessResult {
 
   shared_key: Uint8Array;
+
+  /**
+   * Post-handshake rekey channel id — already validated against the
+   * caller's own derivation. Callers MUST atomically rename their local
+   * channel record from the pre-rekey id (the one in the contact) to this
+   * value.
+   */
+  channel_id: bigint;
 }
 
 export interface ProducePrePairResult {
