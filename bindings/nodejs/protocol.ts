@@ -12,7 +12,7 @@
 // share store, recording transport), but are Map-backed instead of
 // localStorage-backed.
 
-import { DeRecProtocol, FlowKind, SenderKind, primitives } from "@derec-alliance/nodejs";
+import { ContactMode, DeRecProtocol, FlowKind, SenderKind, primitives } from "@derec-alliance/nodejs";
 import type {
   ChannelStore,
   ContactMessage,
@@ -344,7 +344,7 @@ async function doPair(
   label: string,
 ): Promise<void> {
   const contact: ContactMessage =
-    await contactCreator.protocol.createContact(channelId);
+    await contactCreator.protocol.createContact(channelId, ContactMode.InlineKeys);
   console.log(
     `  [${label}/ContactCreator] createContact channel_id=${contact.channel_id}`,
   );
@@ -390,6 +390,184 @@ async function runPairingFlow(): Promise<void> {
   await doPair(helper, owner, 1n, "Pairing");
 
   console.log("\n✓ Pairing flow passed.\n");
+}
+
+
+/**
+ * HashedKeys variant of {@link doPair}.
+ *
+ * `contactCreator` advertises only a SHA-384 binding hash over its real keys.
+ * `initiator` scans it, sends a plaintext `PrePairRequest`, validates the
+ * `PrePairResponse` against the binding hash, and then auto-proceeds to a
+ * regular encrypted `PairRequest`. The whole 4-leg chain is driven by feeding
+ * each outbound message into the peer's `processAll` (which auto-accepts the
+ * `ActionRequired::PrePair` and `ActionRequired::Pairing` events).
+ */
+async function doPairHashedKeys(
+  contactCreator: Node,
+  initiator: Node,
+  channelId: bigint,
+  label: string,
+): Promise<void> {
+  const contact: ContactMessage =
+    await contactCreator.protocol.createContact(channelId, ContactMode.HashedKeys);
+  if (contact.contact_mode !== ContactMode.HashedKeys) {
+    throw new Error(`${label}: HashedKeys contact must advertise contact_mode = HashedKeys`);
+  }
+  if (contact.mlkem_encapsulation_key !== undefined) {
+    throw new Error(`${label}: HashedKeys contact must NOT carry the ML-KEM key inline`);
+  }
+  if (contact.ecies_public_key !== undefined) {
+    throw new Error(`${label}: HashedKeys contact must NOT carry the ECIES key inline`);
+  }
+  if (!contact.contact_binding_hash || contact.contact_binding_hash.length !== 48) {
+    throw new Error(`${label}: HashedKeys contact must carry a 48-byte SHA-384 binding hash`);
+  }
+  console.log(
+    `  [${label}/ContactCreator] createContact(HashedKeys) channel_id=${contact.channel_id} (binding-hash only, ${contact.contact_binding_hash.length}B)`,
+  );
+
+  await initiator.protocol.start(FlowKind.Pairing, {
+    kind: SenderKind.Owner,
+    contact,
+  });
+  const prePairRequest = drainOne(initiator, `${label}/Initiator`);
+  console.log(
+    `  [${label}/Initiator]     start(Pairing, kind=Owner) → PrePairRequest ${prePairRequest.length}B`,
+  );
+
+  // Scanner → ContactCreator: PrePairRequest.
+  // ContactCreator auto-accepts via processAll → emits no event, sends
+  // PrePairResponse carrying its real keys.
+  const creatorPrePairEvents = await processAll(contactCreator, prePairRequest);
+  if (creatorPrePairEvents.some((e) => e.type === "PrePairRejected")) {
+    throw new Error(
+      `${label}/ContactCreator: happy path must not emit PrePairRejected`,
+    );
+  }
+  const prePairResponse = drainOne(contactCreator, `${label}/ContactCreator`);
+  console.log(
+    `  [${label}/ContactCreator] processAll(PrePairRequest) → PrePairResponse ${prePairResponse.length}B (silent on this side)`,
+  );
+
+  // ContactCreator → Scanner: PrePairResponse. Scanner validates the
+  // binding hash, synthesizes an inline-shaped contact, and silently
+  // emits a regular PairRequest. No event surfaces on success.
+  const initiatorPrePairEvents = await processAll(initiator, prePairResponse);
+  if (initiatorPrePairEvents.some((e) => e.type === "PrePairRejected")) {
+    throw new Error(
+      `${label}/Initiator: happy path must not emit PrePairRejected`,
+    );
+  }
+  const pairRequest = drainOne(initiator, `${label}/Initiator`);
+  console.log(
+    `  [${label}/Initiator]     process(PrePairResponse) → PairRequest ${pairRequest.length}B (PrePair validated silently)`,
+  );
+
+  // Scanner → ContactCreator: PairRequest. From here the flow is
+  // identical to the InlineKeys path.
+  const creatorPairEvents = await processAll(contactCreator, pairRequest);
+  const creatorPairing = requireEvent(
+    creatorPairEvents,
+    "PairingCompleted",
+    `${label}/ContactCreator`,
+  );
+  const pairResponse = drainOne(contactCreator, `${label}/ContactCreator`);
+  console.log(
+    `  [${label}/ContactCreator] process(PairRequest) → PairingCompleted(kind=${kindName(creatorPairing.kind)}) PairResponse ${pairResponse.length}B`,
+  );
+
+  const initiatorPairEvents = await processAll(initiator, pairResponse);
+  const initiatorPairing = requireEvent(
+    initiatorPairEvents,
+    "PairingCompleted",
+    `${label}/Initiator`,
+  );
+  console.log(
+    `  [${label}/Initiator]     process(PairResponse) → PairingCompleted(kind=${kindName(initiatorPairing.kind)})`,
+  );
+}
+
+
+async function runHashedKeysPairingFlow(): Promise<void> {
+  console.log("=== [Protocol] HashedKeys Pairing Flow ===\n");
+
+  // Happy path: full 4-leg chain ends with PairingCompleted on both sides.
+  const owner = makeNode("Owner", "https://owner.example.com");
+  const helper = makeNode("Helper", "https://helper.example.com");
+  await doPairHashedKeys(helper, owner, 1n, "HashedKeys");
+
+  // Both sides must have a paired channel record + a shared key in their
+  // secret store (kind 0 = SharedKey). The latter is the strongest
+  // end-to-end check that the PrePair → Pair chain converged on the
+  // same key on both sides.
+  const ownerChannel = await owner.channelStore.load("1");
+  const helperChannel = await helper.channelStore.load("1");
+  if (!ownerChannel || !helperChannel) {
+    throw new Error("HashedKeys pairing: both sides must have a stored channel record");
+  }
+  const ownerSharedKey = await owner.secretStore.load("1", 0);
+  const helperSharedKey = await helper.secretStore.load("1", 0);
+  if (!ownerSharedKey || !helperSharedKey) {
+    throw new Error("HashedKeys pairing: both sides must have a stored shared key");
+  }
+  if (
+    ownerSharedKey.length !== helperSharedKey.length ||
+    !ownerSharedKey.every((b, i) => b === helperSharedKey[i])
+  ) {
+    throw new Error("HashedKeys pairing: owner/helper shared keys do not match");
+  }
+  console.log(`  shared keys match (${ownerSharedKey.length}B)  ✓\n`);
+
+  // Negative: tampering the binding hash before the scanner starts must
+  // surface `PREPAIR_HASH_MISMATCH` once the real keys arrive. This is
+  // the security-relevant guarantee of HashedKeys — the scanner refuses
+  // keys that don't match the commitment they originally accepted.
+  console.log("  -- Negative: tampered binding hash --");
+
+  const owner2 = makeNode("Owner", "https://owner.example.com");
+  const helper2 = makeNode("Helper", "https://helper.example.com");
+
+  const contact: ContactMessage =
+    await helper2.protocol.createContact(2n, ContactMode.HashedKeys);
+  if (!contact.contact_binding_hash) {
+    throw new Error("tampered-hash test: contact_binding_hash must be present");
+  }
+  contact.contact_binding_hash[0] = contact.contact_binding_hash[0]! ^ 0xff;
+
+  await owner2.protocol.start(FlowKind.Pairing, {
+    kind: SenderKind.Owner,
+    contact,
+  });
+  const tamperedPrePairRequest = drainOne(owner2, "TamperedHash/Owner");
+  // Helper2 still produces a valid PrePairResponse — the tampering
+  // happens on the scanner's stored contact, so the error surfaces on
+  // the scanner side when validating the real keys against the tampered
+  // commitment.
+  await processAll(helper2, tamperedPrePairRequest);
+  const tamperedPrePairResponse = drainOne(helper2, "TamperedHash/Helper");
+
+  let caught: { code?: string; category?: string; message?: string } | null = null;
+  try {
+    await owner2.protocol.process(tamperedPrePairResponse);
+  } catch (e) {
+    caught = e as { code?: string; category?: string; message?: string };
+  }
+  if (!caught) {
+    throw new Error("tampered binding hash must cause process(PrePairResponse) to throw");
+  }
+  // `process()`'s wasm wrapper flattens every underlying error to
+  // `code: "DEREC_ERROR"` and surfaces the specific failure mode via the
+  // message text — match on that. The message comes from the
+  // `PairingError::PrePairHashMismatch` `#[error("...")]` annotation.
+  if (!caught.message || !caught.message.includes("contact binding hash mismatch")) {
+    throw new Error(
+      `tampered binding hash must surface PrePairHashMismatch, got code=${caught.code} message=${caught.message}`,
+    );
+  }
+  console.log(`  process(PrePairResponse) threw "${caught.message}" ✓\n`);
+
+  console.log("✓ HashedKeys pairing flow passed.\n");
 }
 
 
@@ -528,7 +706,7 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
     [helperA, recoveryChannelA, "HelperA"] as const,
     [helperB, recoveryChannelB, "HelperB"] as const,
   ]) {
-    const contact: ContactMessage = await helper.protocol.createContact(fresh);
+    const contact: ContactMessage = await helper.protocol.createContact(fresh, ContactMode.InlineKeys);
     console.log(`  [${label}] createContact (recovery) channel_id=${contact.channel_id}`);
 
     const origChannel = label === "HelperA" ? channelA : channelB;
@@ -763,6 +941,7 @@ export async function runProtocolSmoke(): Promise<void> {
   console.log("━━━ [Protocol] Starting ━━━\n");
 
   await runPairingFlow();
+  await runHashedKeysPairingFlow();
   await runSharingFlow();
   await runDiscoveryAndRecoveryFlow();
   await runUnpairingFlow();

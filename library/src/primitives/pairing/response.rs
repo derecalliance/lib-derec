@@ -514,9 +514,7 @@ pub fn extract(
 pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, crate::Error> {
     let envelope = DeRecMessage::decode(envelope_bytes).map_err(crate::Error::ProtobufDecode)?;
 
-    let response = match MessageBody::decode_from_vec(envelope.message.as_slice())
-        .map_err(crate::Error::ProtobufDecode)?
-    {
+    let response = match crate::derec_message::extract_inner_plaintext_message(&envelope.message)? {
         MessageBody::PrePairResponse(r) => r,
         _ => {
             #[cfg(feature = "logging")]
@@ -776,12 +774,12 @@ pub fn process_pre_pair(
     let ecies_public_key = response.ecies_public_key.clone().unwrap();
     let expected_hash = contact_message.contact_binding_hash.as_ref().unwrap();
 
-    let mut hasher = Sha384::new();
-    hasher.update(&mlkem_encapsulation_key);
-    hasher.update(&ecies_public_key);
-    hasher.update(contact_message.nonce.to_be_bytes());
-    hasher.update(contact_message.channel_id.to_be_bytes());
-    let recomputed = hasher.finalize();
+    let recomputed = derec_cryptography::pairing::contact_binding_hash(
+        &mlkem_encapsulation_key,
+        &ecies_public_key,
+        contact_message.nonce,
+        contact_message.channel_id,
+    );
 
     let matched: bool = recomputed.as_slice().ct_eq(expected_hash.as_slice()).into();
     if !matched {
@@ -790,7 +788,7 @@ pub fn process_pre_pair(
             "contact binding hash mismatch; published keys do not match the contact commitment"
         );
 
-        return Err(PairingError::ProtocolViolation("contact binding hash mismatch").into());
+        return Err(PairingError::PrePairHashMismatch.into());
     }
 
     #[cfg(feature = "logging")]
@@ -912,27 +910,11 @@ fn validate_process_pre_pair_inputs(
         .into());
     }
 
-    if contact_message.contact_mode != ContactMode::HashedKeys as i32 {
-        #[cfg(feature = "logging")]
-        tracing::warn!(
-            contact_mode = contact_message.contact_mode,
-            "PrePair processing requires HASHED_KEYS contact mode"
-        );
-        return Err(PairingError::InvalidContactMessage(
-            "PrePair processing requires HASHED_KEYS contact mode",
-        )
-        .into());
-    }
-
-    let binding_hash_present = contact_message
-        .contact_binding_hash
-        .as_ref()
-        .is_some_and(|h| !h.is_empty());
-    if !binding_hash_present {
-        #[cfg(feature = "logging")]
-        tracing::warn!("contact message missing contact_binding_hash");
-        return Err(PairingError::InvalidContactMessage("contact_binding_hash is missing").into());
-    }
+    // Shape + mode invariants for the contact. Catches an attacker who
+    // tampered with `contact_mode` between the out-of-band exchange and
+    // this validation point, and rejects malformed contacts that carry
+    // both inline keys and a binding hash.
+    super::request::validate_contact_for_mode(contact_message, ContactMode::HashedKeys)?;
 
     let mlkem_present = response
         .mlkem_encapsulation_key

@@ -69,6 +69,15 @@ enum DeRecEventJs {
         status: i32,
         memo: String,
     },
+    /// The contact creator answered our `PrePairRequest` with a non-Ok
+    /// status (scanner side, `HashedKeys` flow). Distinct from a
+    /// cryptographic hash mismatch, which surfaces as an `Err` from
+    /// `process()` rather than as an event.
+    PrePairRejected {
+        channel_id: String,
+        status: i32,
+        memo: String,
+    },
     ChannelInfoUpdated {
         channel_id: String,
         /// New communication info, if the update carried it (only populated
@@ -170,6 +179,7 @@ fn extract_share_metadata(action: &PendingAction) -> (Option<u32>, Option<String
 fn action_kind_label(action: &PendingAction) -> &'static str {
     match action {
         PendingAction::Pairing { .. } => "Pairing",
+        PendingAction::PrePair { .. } => "PrePair",
         PendingAction::StoreShare { .. } => "StoreShare",
         PendingAction::VerifyShare { .. } => "VerifyShare",
         PendingAction::Discovery { .. } => "Discovery",
@@ -243,6 +253,11 @@ pub fn event_to_js(event: DeRecEvent) -> Result<JsValue, JsValue> {
         DeRecEvent::SecretRecovered { secret } => DeRecEventJs::SecretRecovered { secret },
         DeRecEvent::Unpaired { channel_id } => DeRecEventJs::Unpaired {
             channel_id: channel_id.0.to_string(),
+        },
+        DeRecEvent::PrePairRejected { channel_id, status, memo } => DeRecEventJs::PrePairRejected {
+            channel_id: channel_id.0.to_string(),
+            status,
+            memo,
         },
         DeRecEvent::UnpairRejected { channel_id, status, memo } => DeRecEventJs::UnpairRejected {
             channel_id: channel_id.0.to_string(),

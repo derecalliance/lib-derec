@@ -9,8 +9,8 @@ use crate::{
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{
     ContactMessage, GetSecretIdsVersionsRequestMessage, GetShareRequestMessage, PairRequestMessage,
-    SenderKind, StoreShareRequestMessage, TransportProtocol, UnpairRequestMessage,
-    UpdateChannelInfoRequestMessage, VerifyShareRequestMessage,
+    PrePairRequestMessage, SenderKind, StoreShareRequestMessage, TransportProtocol,
+    UnpairRequestMessage, UpdateChannelInfoRequestMessage, VerifyShareRequestMessage,
 };
 
 /// An opaque action token emitted inside [`DeRecEvent::ActionRequired`] events.
@@ -29,6 +29,26 @@ pub enum PendingAction {
         /// Trace id read from the inbound `PairRequest` envelope. Echoed
         /// verbatim on the `PairResponse` envelope when the application
         /// calls `accept` or `reject`; see `DeRecMessage.traceId`.
+        trace_id: u64,
+    },
+    /// The peer scanned a `HashedKeys`-mode `ContactMessage` and is asking
+    /// for the real pairing public keys via a plaintext `PrePairRequest`.
+    ///
+    /// Accepting fetches `PairingSecret` from the secret store and replies
+    /// with the actual `mlkemEncapsulationKey` / `eciesPublicKey`; the
+    /// scanner then validates the published keys against the contact's
+    /// `contactBindingHash` and proceeds to a normal `PairRequest` flow.
+    /// Rejecting sends back a non-Ok `PrePairResponse` and keeps no state.
+    ///
+    /// Carries no `pairing_secret` — the handler loads it from the secret
+    /// store at `accept` time (single source of truth) and the action stays
+    /// small enough to round-trip cheaply across the WASM boundary.
+    PrePair {
+        channel_id: ChannelId,
+        request: PrePairRequestMessage,
+        /// Trace id read from the inbound `PrePairRequest` envelope. Echoed
+        /// verbatim on the `PrePairResponse` when the application calls
+        /// `accept` or `reject`; see `DeRecMessage.traceId`.
         trace_id: u64,
     },
     StoreShare {
@@ -329,6 +349,22 @@ pub enum DeRecEvent {
         /// The `StatusEnum` value from the peer's response.
         status: i32,
         /// Human-readable reason from the peer.
+        memo: String,
+    },
+
+    /// The contact creator answered our `PrePairRequest` with a non-`Ok`
+    /// status (scanner side, `HashedKeys` flow).
+    ///
+    /// The scanner cannot proceed to a normal `PairRequest` because the
+    /// public keys were never published. Distinct from
+    /// [`crate::primitives::pairing::PairingError::PrePairHashMismatch`],
+    /// which fires when keys *were* published but failed the binding-hash
+    /// check — a cryptographic failure surfaced as `Err`, not an event.
+    PrePairRejected {
+        channel_id: ChannelId,
+        /// The `StatusEnum` value from the contact creator's response.
+        status: i32,
+        /// Human-readable reason from the contact creator.
         memo: String,
     },
 

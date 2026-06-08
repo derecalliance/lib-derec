@@ -6,7 +6,7 @@
 //! back to `accept()` or `reject()` without inspecting them.
 //!
 //! Wire format:
-//! - 1 byte: discriminant (0..6)
+//! - 1 byte: discriminant (0..7)
 //! - 8 bytes: channel_id (big-endian u64)
 //! - 8 bytes: trace_id (u64 BE) — echoed verbatim on the response
 //! - For Pairing:
@@ -18,14 +18,19 @@
 //!   GetShare, Unpair, UpdateChannelInfo):
 //!   - 32 bytes: shared_key
 //!   - remaining: protobuf-encoded request message
+//! - For PrePair (initiator side, before any key material exists):
+//!   - remaining: protobuf-encoded PrePairRequestMessage
+//!   No `shared_key` or `pairing_secret` — the PrePair leg is plaintext
+//!   and the handler loads `PairingSecret` from the secret store at
+//!   accept time (single source of truth).
 
 use crate::protocol::PendingAction;
 use crate::types::ChannelId;
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{
-    GetSecretIdsVersionsRequestMessage, GetShareRequestMessage, PairRequestMessage, SenderKind,
-    StoreShareRequestMessage, UnpairRequestMessage, UpdateChannelInfoRequestMessage,
-    VerifyShareRequestMessage,
+    GetSecretIdsVersionsRequestMessage, GetShareRequestMessage, PairRequestMessage,
+    PrePairRequestMessage, SenderKind, StoreShareRequestMessage, UnpairRequestMessage,
+    UpdateChannelInfoRequestMessage, VerifyShareRequestMessage,
 };
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use prost::Message;
@@ -37,6 +42,7 @@ const TAG_DISCOVERY: u8 = 3;
 const TAG_GET_SHARE: u8 = 4;
 const TAG_UNPAIR: u8 = 5;
 const TAG_UPDATE_CHANNEL_INFO: u8 = 6;
+const TAG_PRE_PAIR: u8 = 7;
 
 pub fn serialize(action: PendingAction) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
@@ -134,6 +140,16 @@ pub fn serialize(action: PendingAction) -> Result<Vec<u8>, String> {
             buf.extend_from_slice(&channel_id.0.to_be_bytes());
             buf.extend_from_slice(&trace_id.to_be_bytes());
             buf.extend_from_slice(&shared_key);
+            buf.extend_from_slice(&request.encode_to_vec());
+        }
+        PendingAction::PrePair {
+            channel_id,
+            request,
+            trace_id,
+        } => {
+            buf.push(TAG_PRE_PAIR);
+            buf.extend_from_slice(&channel_id.0.to_be_bytes());
+            buf.extend_from_slice(&trace_id.to_be_bytes());
             buf.extend_from_slice(&request.encode_to_vec());
         }
     }
@@ -250,6 +266,19 @@ pub fn deserialize(bytes: &[u8]) -> Result<PendingAction, String> {
                 channel_id,
                 request,
                 shared_key,
+                trace_id,
+            })
+        }
+        TAG_PRE_PAIR => {
+            if rest.len() < 8 {
+                return Err("PrePair action bytes too short for trace_id".to_owned());
+            }
+            let trace_id = u64::from_be_bytes(rest[..8].try_into().unwrap());
+            let request = PrePairRequestMessage::decode(&rest[8..])
+                .map_err(|e| format!("failed to decode PrePairRequestMessage: {e}"))?;
+            Ok(PendingAction::PrePair {
+                channel_id,
+                request,
                 trace_id,
             })
         }

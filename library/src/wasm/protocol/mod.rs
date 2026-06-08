@@ -223,15 +223,33 @@ impl DeRecProtocolWasm {
     ///
     /// * `channel_id` — Optional `BigInt` channel identifier. Pass `null` or
     ///   `undefined` to have the library generate a random one.
+    /// * `contact_mode` — `0` for `InlineKeys` (keys embedded directly), `1`
+    ///   for `HashedKeys` (contact carries only a SHA-384 binding hash; the
+    ///   scanner fetches keys via a `PrePair` round-trip). `HashedKeys`
+    ///   requires the protocol's `own_transport` to be ephemeral.
     ///
     /// TODO: document the full pairing lifecycle and how to use the returned
     /// `channel_id` field to track the pending pairing in application state.
     #[wasm_bindgen(js_name = "createContact")]
-    pub async fn create_contact(&mut self, channel_id: JsValue) -> Result<JsValue, JsValue> {
+    pub async fn create_contact(
+        &mut self,
+        channel_id: JsValue,
+        contact_mode: u32,
+    ) -> Result<JsValue, JsValue> {
         let id = parse_optional_channel_id(channel_id)?;
+        let mode = match contact_mode {
+            0 => derec_proto::ContactMode::InlineKeys,
+            1 => derec_proto::ContactMode::HashedKeys,
+            other => {
+                return Err(js_error(
+                    "INVALID_CONTACT_MODE",
+                    format!("unknown contact_mode: {other}; expected 0 (InlineKeys) or 1 (HashedKeys)"),
+                ));
+            }
+        };
         let contact = self
             .inner
-            .create_contact(id)
+            .create_contact(id, mode)
             .await
             .map_err(|e| js_error("DEREC_ERROR", e.to_string()))?;
         let contact: PairingContactMessage = contact.into();

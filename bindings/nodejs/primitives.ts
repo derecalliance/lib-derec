@@ -313,10 +313,15 @@ export function runPrimitivesSmoke(): void {
 
 
   // Bob synthesizes a "filled-in" contact by copying the validated keys
-  // into a clone of the HASHED_KEYS contact. From here on the flow is
-  // identical to the INLINE_KEYS path.
+  // into a clone of the HASHED_KEYS contact, then flips contact_mode to
+  // InlineKeys and drops the binding hash. `produce` enforces the
+  // InlineKeys invariant, so this rewrite is required — it mirrors the
+  // protocol orchestrator's `on_pre_pair_response` logic.
+  const { contact_binding_hash: _omitBindingHash, ...hkContactBase } =
+    hkContact.contact_message;
   const filledInContact: ContactMessage = {
-    ...hkContact.contact_message,
+    ...hkContactBase,
+    contact_mode: ContactMode.InlineKeys,
     mlkem_encapsulation_key: validated.mlkem_encapsulation_key,
     ecies_public_key: validated.ecies_public_key,
   };

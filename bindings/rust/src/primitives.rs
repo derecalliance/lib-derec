@@ -258,10 +258,18 @@ fn run_pairing_flow_hashed_keys_test() {
     // flow is identical to the INLINE_KEYS path — `pair_request::produce`
     // and the rest of the chain do not need to know PrePair happened.
 
+    // Synthesize a "filled-in" contact for the downstream PairRequest flow.
+    // After PrePair, the contact is logically `InlineKeys` — keys are
+    // present locally — so normalize the shape: drop the binding hash and
+    // flip the mode. `pair_request::produce` enforces the InlineKeys
+    // invariant via `validate_contact_for_mode`, which rejects any contact
+    // that still claims `HashedKeys`.
     let mut filled_in_contact = alice_contact.clone();
     filled_in_contact.mlkem_encapsulation_key =
         Some(processed_prepair.mlkem_encapsulation_key.clone());
     filled_in_contact.ecies_public_key = Some(processed_prepair.ecies_public_key.clone());
+    filled_in_contact.contact_mode = derec_proto::ContactMode::InlineKeys as i32;
+    filled_in_contact.contact_binding_hash = None;
 
     let pair_req = pair_request::produce(
         SenderKind::Helper,

@@ -177,6 +177,11 @@ export type DeRecEvent =
   | { type: "Unpaired"; channel_id: string }
 
   | { type: "UnpairRejected"; channel_id: string; status: number; memo: string }
+
+  /** Contact creator answered the scanner's `PrePairRequest` with a
+   *  non-Ok status (HashedKeys flow). Distinct from a cryptographic
+   *  hash mismatch, which surfaces as a thrown error from `process()`. */
+  | { type: "PrePairRejected"; channel_id: string; status: number; memo: string }
   | { type: "NoOp" };
 
 export declare class DeRecProtocol {
@@ -206,7 +211,19 @@ export declare class DeRecProtocol {
     autoReplyTo?: boolean | null,
   );
 
-  createContact(channelId?: bigint | null): Promise<ContactMessage>;
+  /**
+   * Generate an out-of-band contact message used to bootstrap pairing.
+   *
+   * @param channelId  Optional channel identifier. Pass `null` /
+   *                   `undefined` to have the library generate one.
+   * @param contactMode  `ContactMode.InlineKeys` embeds the public keys
+   *                     directly in the contact. `ContactMode.HashedKeys`
+   *                     embeds only a SHA-384 binding hash (keys are
+   *                     fetched later via the `PrePair` round-trip).
+   *                     `HashedKeys` requires `ownTransportUri` to be
+   *                     ephemeral.
+   */
+  createContact(channelId: bigint | null | undefined, contactMode: ContactMode): Promise<ContactMessage>;
 
   start(flowKind: FlowKind.Pairing, params: PairingParams): Promise<bigint>;
   start(flowKind: FlowKind.Discovery, params: DiscoveryParams): Promise<null>;

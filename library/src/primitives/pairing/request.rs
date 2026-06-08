@@ -18,7 +18,6 @@ use derec_proto::{
 use prost::Message;
 use prost_types::Timestamp;
 use rand::{Rng, rng};
-use sha2::{Digest, Sha384};
 
 pub struct CreateContactResult {
     /// Decoded [`derec_proto::ContactMessage`] — serialize with `.encode_to_vec()` before sending out-of-band.
@@ -271,22 +270,23 @@ pub fn produce(
     contact_message: &ContactMessage,
     communication_info: Option<CommunicationInfo>,
 ) -> Result<ProduceResult, crate::Error> {
-    validate_inputs(&transport_protocol, contact_message)?;
+    validate_inputs(
+        &transport_protocol,
+        contact_message,
+        ContactMode::InlineKeys,
+    )?;
 
     let mlkem_encapsulation_key = contact_message
         .mlkem_encapsulation_key
         .as_ref()
-        .ok_or(PairingError::InvalidContactMessage(
-            "mlkem_encapsulation_key is missing",
-        ))?
+        .expect("validate_inputs guarantees mlkem_encapsulation_key is Some")
         .clone();
     let ecies_public_key = contact_message
         .ecies_public_key
         .as_ref()
-        .ok_or(PairingError::InvalidContactMessage(
-            "ecies_public_key is missing",
-        ))?
+        .expect("validate_inputs guarantees ecies_public_key is Some")
         .clone();
+
     let contact_pk = cryptography_pairing::PairingContactMessageMaterial {
         mlkem_encapsulation_key,
         ecies_public_key,
@@ -310,12 +310,13 @@ pub fn produce(
         timestamp: Some(timestamp),
     };
 
-    let ecies_pk = contact_message
-        .ecies_public_key
-        .as_ref()
-        .ok_or(PairingError::InvalidContactMessage(
-            "ecies_public_key is missing",
-        ))?;
+    let ecies_pk =
+        contact_message
+            .ecies_public_key
+            .as_ref()
+            .ok_or(PairingError::InvalidContactMessage(
+                "ecies_public_key is missing",
+            ))?;
     let envelope = DeRecMessageBuilder::pairing()
         .channel_id(contact_message.channel_id.into())
         .timestamp(timestamp)
@@ -388,31 +389,17 @@ pub fn produce_pre_pair_request(
     transport_protocol: TransportProtocol,
     contact_message: &ContactMessage,
 ) -> Result<ProducePrePairResult, crate::Error> {
-    if transport_protocol.uri.trim().is_empty() {
-        #[cfg(feature = "logging")]
-        tracing::warn!("transport URI is empty");
-
-        return Err(PairingError::EmptyTransportUri.into());
-    }
-
-    if contact_message.contact_mode != ContactMode::HashedKeys as i32 {
-        #[cfg(feature = "logging")]
-        tracing::warn!(
-            contact_mode = contact_message.contact_mode,
-            "PrePair flow requires HASHED_KEYS contact mode"
-        );
-
-        return Err(PairingError::InvalidContactMessage(
-            "PrePair flow requires HASHED_KEYS contact mode",
-        )
-        .into());
-    }
+    validate_inputs(
+        &transport_protocol,
+        contact_message,
+        ContactMode::HashedKeys,
+    )?;
 
     let timestamp = current_timestamp();
     let request = PrePairRequestMessage {
         nonce: contact_message.nonce,
         transport_protocol: Some(transport_protocol),
-        timestamp: Some(timestamp.clone()),
+        timestamp: Some(timestamp),
     };
 
     let protocol_version = ProtocolVersion::current();
@@ -585,9 +572,7 @@ pub fn extract(
 pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, crate::Error> {
     let envelope = DeRecMessage::decode(envelope_bytes).map_err(crate::Error::ProtobufDecode)?;
 
-    let request = match MessageBody::decode_from_vec(envelope.message.as_slice())
-        .map_err(crate::Error::ProtobufDecode)?
-    {
+    let request = match crate::derec_message::extract_inner_plaintext_message(&envelope.message)? {
         MessageBody::PrePairRequest(r) => r,
         _ => {
             #[cfg(feature = "logging")]
@@ -607,9 +592,22 @@ pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, c
     Ok(PrePairExtractResult { request })
 }
 
+/// Shared inbound validation for producers that ingest a
+/// [`ContactMessage`] ([`produce`], [`produce_pre_pair_request`]).
+///
+/// Three orthogonal checks:
+///
+/// 1. The caller's own `transport_protocol.uri` is non-empty.
+/// 2. The contact's shape matches `expected_mode` (delegated to
+///    [`validate_contact_for_mode`]).
+/// 3. The contact's `transport_protocol` is present and has a non-empty
+///    URI — required by both modes (it's where the next protocol message
+///    is delivered: a `PairRequest` for `InlineKeys`, a `PrePairRequest`
+///    for `HashedKeys`).
 fn validate_inputs(
     transport_protocol: &TransportProtocol,
     contact_message: &ContactMessage,
+    expected_mode: ContactMode,
 ) -> Result<(), crate::Error> {
     if transport_protocol.uri.trim().is_empty() {
         #[cfg(feature = "logging")]
@@ -618,27 +616,7 @@ fn validate_inputs(
         return Err(PairingError::EmptyTransportUri.into());
     }
 
-    let mlkem_present = contact_message
-        .mlkem_encapsulation_key
-        .as_ref()
-        .is_some_and(|v| !v.is_empty());
-    if !mlkem_present {
-        #[cfg(feature = "logging")]
-        tracing::warn!("contact message missing mlkem_encapsulation_key");
-
-        return Err(PairingError::InvalidContactMessage("mlkem_encapsulation_key is empty").into());
-    }
-
-    let ecies_present = contact_message
-        .ecies_public_key
-        .as_ref()
-        .is_some_and(|v| !v.is_empty());
-    if !ecies_present {
-        #[cfg(feature = "logging")]
-        tracing::warn!("contact message missing ecies_public_key");
-
-        return Err(PairingError::InvalidContactMessage("ecies_public_key is empty").into());
-    }
+    validate_contact_for_mode(contact_message, expected_mode)?;
 
     let initiator_tp =
         contact_message
@@ -653,6 +631,115 @@ fn validate_inputs(
         tracing::warn!("contact message transport_protocol.uri is empty");
 
         return Err(PairingError::InvalidContactMessage("transport_protocol.uri is empty").into());
+    }
+
+    Ok(())
+}
+
+/// Enforces the per-mode field-presence invariant on an incoming
+/// [`ContactMessage`]. Called at every entry point that ingests a contact:
+///
+/// - `produce` requires [`ContactMode::InlineKeys`] (the responder needs
+///   the keys inline).
+/// - `produce_pre_pair_request` and `process_pre_pair_response` require
+///   [`ContactMode::HashedKeys`] (the keys must be fetched via PrePair).
+///
+/// Rejects:
+///
+/// - `contact_mode` not matching `expected`.
+/// - [`ContactMode::InlineKeys`]: missing/empty `mlkem_encapsulation_key`
+///   or `ecies_public_key`, or a non-empty `contact_binding_hash` (would
+///   mean the contact is misshaped — keys present AND a commitment).
+/// - [`ContactMode::HashedKeys`]: any inline key set, or a missing,
+///   empty, or wrong-length `contact_binding_hash` (must be exactly 48
+///   bytes — SHA-384 digest size).
+///
+/// The bidirectional check matters most for `HashedKeys`: if a malformed
+/// `HashedKeys` contact carried inline keys, downstream callers might
+/// consume those keys without ever recomputing the binding hash, defeating
+/// the commitment that's the whole point of the mode.
+pub(crate) fn validate_contact_for_mode(
+    contact: &ContactMessage,
+    expected: ContactMode,
+) -> Result<(), crate::Error> {
+    if contact.contact_mode != expected as i32 {
+        #[cfg(feature = "logging")]
+        tracing::warn!(
+            contact_mode = contact.contact_mode,
+            expected = expected as i32,
+            "contact_mode mismatch"
+        );
+
+        return Err(PairingError::InvalidContactMessage(match expected {
+            ContactMode::InlineKeys => "expected INLINE_KEYS contact mode",
+            ContactMode::HashedKeys => "expected HASHED_KEYS contact mode",
+        })
+        .into());
+    }
+
+    let mlkem_present = contact
+        .mlkem_encapsulation_key
+        .as_ref()
+        .is_some_and(|v| !v.is_empty());
+    let ecies_present = contact
+        .ecies_public_key
+        .as_ref()
+        .is_some_and(|v| !v.is_empty());
+    let hash_present = contact
+        .contact_binding_hash
+        .as_ref()
+        .is_some_and(|v| !v.is_empty());
+
+    match expected {
+        ContactMode::InlineKeys => {
+            if !mlkem_present {
+                return Err(PairingError::InvalidContactMessage(
+                    "inline_keys contact missing mlkem_encapsulation_key",
+                )
+                .into());
+            }
+            if !ecies_present {
+                return Err(PairingError::InvalidContactMessage(
+                    "inline_keys contact missing ecies_public_key",
+                )
+                .into());
+            }
+            if hash_present {
+                return Err(PairingError::InvalidContactMessage(
+                    "inline_keys contact must not carry contact_binding_hash",
+                )
+                .into());
+            }
+        }
+        ContactMode::HashedKeys => {
+            if mlkem_present || ecies_present {
+                return Err(PairingError::InvalidContactMessage(
+                    "hashed_keys contact must not carry inline keys",
+                )
+                .into());
+            }
+            // SHA-384 digest length — the canonical binding-hash size. A
+            // contact carrying a wrong-sized hash is malformed; refuse
+            // rather than let the recomputation pretend it's valid.
+            const BINDING_HASH_LEN: usize = 48;
+            let hash = contact.contact_binding_hash.as_ref().ok_or(
+                PairingError::InvalidContactMessage(
+                    "hashed_keys contact missing contact_binding_hash",
+                ),
+            )?;
+            if hash.is_empty() {
+                return Err(PairingError::InvalidContactMessage(
+                    "hashed_keys contact missing contact_binding_hash",
+                )
+                .into());
+            }
+            if hash.len() != BINDING_HASH_LEN {
+                return Err(PairingError::InvalidContactMessage(
+                    "hashed_keys contact_binding_hash is not a SHA-384 digest",
+                )
+                .into());
+            }
+        }
     }
 
     Ok(())
@@ -709,12 +796,12 @@ fn create_contact_hashed_keys(
     transport_protocol: TransportProtocol,
     pk: &PairingContactMessageMaterial,
 ) -> ContactMessage {
-    let mut hasher = Sha384::new();
-    hasher.update(&pk.mlkem_encapsulation_key);
-    hasher.update(&pk.ecies_public_key);
-    hasher.update(nonce.to_be_bytes());
-    hasher.update(u64::from(channel_id).to_be_bytes());
-    let contact_binding_hash = hasher.finalize().to_vec();
+    let binding_hash = derec_cryptography::pairing::contact_binding_hash(
+        &pk.mlkem_encapsulation_key,
+        &pk.ecies_public_key,
+        nonce,
+        channel_id.into(),
+    );
 
     ContactMessage {
         channel_id: channel_id.into(),
@@ -722,7 +809,7 @@ fn create_contact_hashed_keys(
         contact_mode: ContactMode::HashedKeys as i32,
         mlkem_encapsulation_key: None,
         ecies_public_key: None,
-        contact_binding_hash: Some(contact_binding_hash),
+        contact_binding_hash: Some(binding_hash.to_vec()),
         nonce,
         timestamp: Some(timestamp),
     }

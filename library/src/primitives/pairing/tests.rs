@@ -129,7 +129,7 @@ fn test_produce_pairing_request_message_empty_mlkem_encapsulation_key() {
     assert!(matches!(
         result,
         Err(Error::Pairing(PairingError::InvalidContactMessage(error)))
-            if error == "mlkem_encapsulation_key is empty"
+            if error == "inline_keys contact missing mlkem_encapsulation_key"
     ));
 }
 
@@ -162,7 +162,7 @@ fn test_produce_pairing_request_message_empty_ecies_public_key() {
     assert!(matches!(
         result,
         Err(Error::Pairing(PairingError::InvalidContactMessage(error)))
-            if error == "ecies_public_key is empty"
+            if error == "inline_keys contact missing ecies_public_key"
     ));
 }
 
@@ -1665,7 +1665,7 @@ fn test_process_pre_pair_rejects_tampered_mlkem_key() {
     let result = process_pre_pair(&contact, &response);
     assert!(matches!(
         result,
-        Err(Error::Pairing(PairingError::ProtocolViolation(_)))
+        Err(Error::Pairing(PairingError::PrePairHashMismatch))
     ));
 }
 
@@ -1680,7 +1680,7 @@ fn test_process_pre_pair_rejects_tampered_ecies_key() {
     let result = process_pre_pair(&contact, &response);
     assert!(matches!(
         result,
-        Err(Error::Pairing(PairingError::ProtocolViolation(_)))
+        Err(Error::Pairing(PairingError::PrePairHashMismatch))
     ));
 }
 
@@ -1880,9 +1880,15 @@ fn test_pairing_rekey_also_fires_in_hashed_keys_mode() {
         .expect("process_pre_pair failed");
 
     // Bob synthesizes a filled-in contact and runs the regular Pair flow.
+    // After PrePair, the contact is logically `InlineKeys` (keys present
+    // locally), so normalize the shape: clear the binding hash and flip
+    // the mode. `produce_pairing_request_message` enforces the InlineKeys
+    // invariant.
     let filled_in_contact = ContactMessage {
         mlkem_encapsulation_key: Some(validated.mlkem_encapsulation_key),
         ecies_public_key: Some(validated.ecies_public_key),
+        contact_mode: ContactMode::InlineKeys as i32,
+        contact_binding_hash: None,
         ..alice_contact.clone()
     };
 
@@ -1942,4 +1948,188 @@ fn test_pairing_rekey_also_fires_in_hashed_keys_mode() {
         alice_pair_resp_msg.channel_id,
         u64::from(alice_new_channel_id)
     );
+}
+
+/// Reference contact builders for the `validate_contact_for_mode` tests.
+fn well_formed_inline_keys_contact() -> ContactMessage {
+    ContactMessage {
+        channel_id: 42,
+        transport_protocol: Some(TransportProtocol {
+            uri: "https://relay.example/alice".to_owned(),
+            protocol: Protocol::Https.into(),
+        }),
+        contact_mode: ContactMode::InlineKeys as i32,
+        mlkem_encapsulation_key: Some(vec![1; 1184]),
+        ecies_public_key: Some(vec![2; 33]),
+        contact_binding_hash: None,
+        nonce: 0xCAFE_BABE,
+        timestamp: Some(current_timestamp()),
+    }
+}
+
+fn well_formed_hashed_keys_contact() -> ContactMessage {
+    ContactMessage {
+        channel_id: 42,
+        transport_protocol: Some(TransportProtocol {
+            uri: "https://relay.example/alice/ephemeral".to_owned(),
+            protocol: Protocol::Https.into(),
+        }),
+        contact_mode: ContactMode::HashedKeys as i32,
+        mlkem_encapsulation_key: None,
+        ecies_public_key: None,
+        // 48 bytes — SHA-384 digest length. Value is dummy; the validator
+        // does not recompute against the keys.
+        contact_binding_hash: Some(vec![0xAB; 48]),
+        nonce: 0xDEAD_BEEF,
+        timestamp: Some(current_timestamp()),
+    }
+}
+
+#[test]
+fn test_validate_contact_for_mode_accepts_well_formed_inline_keys() {
+    use crate::primitives::pairing::request::validate_contact_for_mode;
+    let c = well_formed_inline_keys_contact();
+    validate_contact_for_mode(&c, ContactMode::InlineKeys).expect("well-formed inline_keys must pass");
+}
+
+#[test]
+fn test_validate_contact_for_mode_accepts_well_formed_hashed_keys() {
+    use crate::primitives::pairing::request::validate_contact_for_mode;
+    let c = well_formed_hashed_keys_contact();
+    validate_contact_for_mode(&c, ContactMode::HashedKeys).expect("well-formed hashed_keys must pass");
+}
+
+#[test]
+fn test_validate_contact_for_mode_rejects_mode_mismatch() {
+    use crate::primitives::pairing::request::validate_contact_for_mode;
+    let inline = well_formed_inline_keys_contact();
+    let err = validate_contact_for_mode(&inline, ContactMode::HashedKeys).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Pairing(PairingError::InvalidContactMessage(m))
+            if m == "expected HASHED_KEYS contact mode"
+    ));
+
+    let hashed = well_formed_hashed_keys_contact();
+    let err = validate_contact_for_mode(&hashed, ContactMode::InlineKeys).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Pairing(PairingError::InvalidContactMessage(m))
+            if m == "expected INLINE_KEYS contact mode"
+    ));
+}
+
+#[test]
+fn test_validate_contact_for_mode_rejects_inline_missing_mlkem_key() {
+    use crate::primitives::pairing::request::validate_contact_for_mode;
+    let mut c = well_formed_inline_keys_contact();
+    c.mlkem_encapsulation_key = Some(Vec::new());
+    let err = validate_contact_for_mode(&c, ContactMode::InlineKeys).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Pairing(PairingError::InvalidContactMessage(m))
+            if m == "inline_keys contact missing mlkem_encapsulation_key"
+    ));
+
+    let mut c = well_formed_inline_keys_contact();
+    c.mlkem_encapsulation_key = None;
+    let err = validate_contact_for_mode(&c, ContactMode::InlineKeys).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Pairing(PairingError::InvalidContactMessage(m))
+            if m == "inline_keys contact missing mlkem_encapsulation_key"
+    ));
+}
+
+#[test]
+fn test_validate_contact_for_mode_rejects_inline_missing_ecies_key() {
+    use crate::primitives::pairing::request::validate_contact_for_mode;
+    let mut c = well_formed_inline_keys_contact();
+    c.ecies_public_key = None;
+    let err = validate_contact_for_mode(&c, ContactMode::InlineKeys).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Pairing(PairingError::InvalidContactMessage(m))
+            if m == "inline_keys contact missing ecies_public_key"
+    ));
+}
+
+#[test]
+fn test_validate_contact_for_mode_rejects_inline_with_binding_hash() {
+    use crate::primitives::pairing::request::validate_contact_for_mode;
+    // The most defensive case: an inline_keys contact must not also
+    // carry a binding hash — otherwise the contact is in a malformed
+    // dual state that downstream code might branch on incorrectly.
+    let mut c = well_formed_inline_keys_contact();
+    c.contact_binding_hash = Some(vec![0xCD; 48]);
+    let err = validate_contact_for_mode(&c, ContactMode::InlineKeys).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Pairing(PairingError::InvalidContactMessage(m))
+            if m == "inline_keys contact must not carry contact_binding_hash"
+    ));
+}
+
+#[test]
+fn test_validate_contact_for_mode_rejects_hashed_with_inline_keys() {
+    use crate::primitives::pairing::request::validate_contact_for_mode;
+    // Security-relevant: a hashed_keys contact must not carry inline
+    // keys, because downstream callers might use them without ever
+    // recomputing the binding hash — defeating the commitment that's
+    // the whole point of HASHED_KEYS mode.
+    let mut c = well_formed_hashed_keys_contact();
+    c.mlkem_encapsulation_key = Some(vec![1; 1184]);
+    let err = validate_contact_for_mode(&c, ContactMode::HashedKeys).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Pairing(PairingError::InvalidContactMessage(m))
+            if m == "hashed_keys contact must not carry inline keys"
+    ));
+
+    let mut c = well_formed_hashed_keys_contact();
+    c.ecies_public_key = Some(vec![2; 33]);
+    let err = validate_contact_for_mode(&c, ContactMode::HashedKeys).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Pairing(PairingError::InvalidContactMessage(m))
+            if m == "hashed_keys contact must not carry inline keys"
+    ));
+}
+
+#[test]
+fn test_validate_contact_for_mode_rejects_hashed_missing_binding_hash() {
+    use crate::primitives::pairing::request::validate_contact_for_mode;
+    let mut c = well_formed_hashed_keys_contact();
+    c.contact_binding_hash = None;
+    let err = validate_contact_for_mode(&c, ContactMode::HashedKeys).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Pairing(PairingError::InvalidContactMessage(m))
+            if m == "hashed_keys contact missing contact_binding_hash"
+    ));
+
+    let mut c = well_formed_hashed_keys_contact();
+    c.contact_binding_hash = Some(Vec::new());
+    let err = validate_contact_for_mode(&c, ContactMode::HashedKeys).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Pairing(PairingError::InvalidContactMessage(m))
+            if m == "hashed_keys contact missing contact_binding_hash"
+    ));
+}
+
+#[test]
+fn test_validate_contact_for_mode_rejects_hashed_wrong_hash_length() {
+    use crate::primitives::pairing::request::validate_contact_for_mode;
+    // SHA-384 produces a 48-byte digest. A 32-byte hash (looks like
+    // SHA-256) must be rejected — accepting it would let a different
+    // hash function masquerade as the binding commitment.
+    let mut c = well_formed_hashed_keys_contact();
+    c.contact_binding_hash = Some(vec![0xAB; 32]);
+    let err = validate_contact_for_mode(&c, ContactMode::HashedKeys).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Pairing(PairingError::InvalidContactMessage(m))
+            if m == "hashed_keys contact_binding_hash is not a SHA-384 digest"
+    ));
 }

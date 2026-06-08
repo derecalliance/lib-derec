@@ -342,3 +342,25 @@ fn test_trace_id_round_trips_through_proto_encoding() {
 
     assert_eq!(decoded.trace_id, 0xFEED_FACE_BAAD_F00D);
 }
+
+#[test]
+fn test_extract_inner_plaintext_message_round_trips() {
+    let inner = sample_message();
+    let encoded = MessageBody::PairRequest(inner.clone()).encode_to_vec();
+
+    let decoded = extract_inner_plaintext_message(&encoded)
+        .expect("extract_inner_plaintext_message should succeed");
+
+    assert!(
+        matches!(decoded, MessageBody::PairRequest(m) if m == inner),
+        "plaintext extract must round-trip the inner MessageBody"
+    );
+}
+
+#[test]
+fn test_extract_inner_plaintext_message_rejects_garbage() {
+    let err = extract_inner_plaintext_message(b"not a valid protobuf")
+        .expect_err("garbage bytes must not decode as a MessageBody");
+
+    assert!(matches!(err, crate::Error::ProtobufDecode(_)));
+}

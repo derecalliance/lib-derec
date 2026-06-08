@@ -209,9 +209,14 @@ async function main() {
     contact.contact_message, prePairResp,
   );
 
-  // Synthesize a "filled-in" contact and run the regular pairing flow.
+  // Synthesize a "filled-in" contact and run the regular pairing flow. The
+  // mode flip is required — `primitives.pairing.request.produce` enforces
+  // `InlineKeys` and rejects a contact that still advertises `HashedKeys`.
+  const { contact_binding_hash: _omitBindingHash, ...contactBase } =
+    contact.contact_message;
   const filledInContact: ContactMessage = {
-    ...contact.contact_message,
+    ...contactBase,
+    contact_mode: ContactMode.InlineKeys,
     mlkem_encapsulation_key: validated.mlkem_encapsulation_key,
     ecies_public_key: validated.ecies_public_key,
   };
@@ -225,6 +230,33 @@ After the PrePair exchange the application **must** swap the transport
 endpoint to a long-term one via `UpdateChannelInfo`. The ephemeral endpoint
 advertised in the `HashedKeys` contact is intended to be retired immediately
 after pairing.
+
+#### Using `DeRecProtocol` instead
+
+The orchestrator handles the whole chain automatically:
+
+- **Contact creator** — `protocol.createContact(channelId, ContactMode.HashedKeys)`
+  returns the small contact (binding hash only). When the scanner's
+  `PrePairRequest` arrives, `protocol.process(bytes)` emits an
+  `ActionRequired` event with `action_kind: "PrePair"`. Call
+  `protocol.accept(action)` to publish the keys (the library builds the
+  response and routes it), or `protocol.reject(action, status, memo)` to
+  refuse.
+- **Scanner** — `protocol.start(FlowKind.Pairing, { kind, contact })` kicks
+  off the plaintext PrePair leg. On success, no event surfaces and the
+  scanner auto-proceeds to `PairRequest`; the application sees
+  `PairingCompleted` only when the final response lands. Failure modes:
+    - Contact creator rejected → `DeRecEvent` with
+      `type: "PrePairRejected"`, plus `status` / `memo`.
+    - Binding-hash mismatch → `protocol.process(...)` throws a
+      `DeRecException`-shape error whose `message` carries
+      `"contact binding hash mismatch"`. This is security-relevant — the
+      keys published by the peer do not match the commitment the scanner
+      originally accepted.
+
+End-to-end orchestrator-level coverage is in
+`bindings/web/src/protocol.ts::runHashedKeysPairingFlow` (happy path +
+tampered-hash assertion).
 
 ---
 

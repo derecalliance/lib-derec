@@ -98,6 +98,7 @@ fn pairing_code(e: &PairingError) -> &'static str {
         PairingError::InvalidPairResponseMessage(_) => "INVALID_PAIR_RESPONSE_MESSAGE",
         PairingError::NonOkStatus { .. } => "NON_OK_STATUS",
         PairingError::ProtocolViolation(_) => "PROTOCOL_VIOLATION",
+        PairingError::PrePairHashMismatch => "PREPAIR_HASH_MISMATCH",
         PairingError::Invariant(_) => "INVARIANT",
         PairingError::ContactMessageKeygen { .. } => "CONTACT_MESSAGE_KEYGEN",
         PairingError::PairRequestKeygen { .. } => "PAIR_REQUEST_KEYGEN",

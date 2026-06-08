@@ -213,6 +213,11 @@ protocol owns the state. The main variants are:
 - `RecoveryShareReceived { … }` / `SecretRecovered { secret }` /
   `RecoveryShareError { … }`
 - `Unpaired { channel_id }` / `UnpairRejected { channel_id, status, memo }`
+- `PrePairRejected { channel_id, status, memo }` — the contact creator
+  answered our `PrePairRequest` with a non-`Ok` status (scanner side,
+  `HashedKeys` flow). Distinct from a cryptographic binding-hash mismatch,
+  which surfaces as `Error::Pairing(PairingError::PrePairHashMismatch)`
+  from `process()` rather than as an event. See [Pairing modes](#pairing-modes).
 - `NoOp` — emitted when an inbound message was processed but had no
   application-visible consequence.
 
@@ -244,13 +249,65 @@ A mismatch surfaces as `Error::RoleMismatch { channel_id, expected, actual }`.
 
 | Flow | Purpose |
 |------|---------|
-| Pairing | Establish a secure channel between Owner and Helper (or Replica). |
+| Pairing | Establish a secure channel between Owner and Helper (or Replica). Two contact modes — see [Pairing modes](#pairing-modes). |
 | Share Distribution | Split a secret and distribute the shares. |
 | Verification | Challenge helpers to prove they still hold their shares. |
 | Discovery | Ask helpers which secrets and versions they store. |
 | Recovery | Re-pair, collect shares, reconstruct the secret. |
 | Unpairing | Tear down a paired channel and drop local state. |
 | Update channel info | Propagate post-pairing changes to communication info and/or transport endpoint. |
+
+### Pairing modes
+
+`DeRecProtocol::create_contact` takes a `ContactMode` argument; the choice
+travels in the `ContactMessage` and tells the scanner which handshake to run.
+
+| `ContactMode` | Contact carries | When to use |
+|---|---|---|
+| `InlineKeys` | Full ML-KEM encapsulation key + ECIES public key | Out-of-band channel can carry ~1.2 KB (NFC, deep link, direct messaging). |
+| `HashedKeys` | Only a 48-byte SHA-384 commitment to the keys | Out-of-band channel is size-constrained (QR codes). The scanner fetches the real keys over the wire via a plaintext `PrePair` round-trip and verifies them against the commitment. |
+
+The library's primitives section below documents the [`InlineKeys`](#inlinekeys-flow)
+and [`HashedKeys`](#hashedkeys-flow-prepair) message-level handshakes. At
+the orchestrator layer, the choice is invisible to most application code
+after `create_contact` — the difference surfaces only in the events the
+two sides observe during the `HashedKeys` handshake:
+
+- **Contact creator** (the side that called `create_contact`):
+  receives an `ActionRequired { action_kind: "PrePair" }` event when the
+  scanner's `PrePairRequest` arrives. Call `protocol.accept(action)` to
+  publish the keys (the orchestrator builds the response and routes it
+  back to the scanner's transport endpoint), or `protocol.reject(action,
+  status, memo)` to refuse. After accepting, the next inbound message is
+  a regular `PairRequest` — its `ActionRequired` event is identical to
+  the `InlineKeys` path.
+- **Scanner** (the side that called `start(Pairing { contact, .. })`):
+  `PrePair` is silent on success. The library validates the published
+  keys against `contact.contact_binding_hash`, synthesizes an
+  `InlineKeys`-shaped contact, and auto-sends the regular `PairRequest`.
+  The application sees `PairingCompleted` only after the
+  `PairResponse` round-trip lands. Failure modes:
+    - Contact creator rejected → `DeRecEvent::PrePairRejected
+      { channel_id, status, memo }`.
+    - Cryptographic binding-hash mismatch → `process()` returns
+      `Err(Error::Pairing(PairingError::PrePairHashMismatch))`. This
+      is a security-relevant signal — the keys published by the peer do
+      not match the commitment the scanner originally accepted, so the
+      contact may have been swapped or tampered between creation and
+      scan.
+
+Security caveat — the `PrePair` envelopes cross the wire **plaintext**.
+The `TransportProtocol` passed to `create_contact` (HashedKeys) MUST be
+an ephemeral endpoint that an observer cannot link to a long-lived
+identity. After pairing completes, propagate a long-term endpoint via
+`DeRecFlow::UpdateChannelInfo`; retire the ephemeral one.
+
+End-to-end smoke tests covering both happy path and tampered-hash:
+- Rust orchestrator level — `bindings/rust/src/protocol.rs::run_hashed_keys_pairing_flow`.
+- nodejs / web orchestrator level — `bindings/nodejs/protocol.ts::runHashedKeysPairingFlow`
+  and `bindings/web/src/protocol.ts::runHashedKeysPairingFlow`.
+- Primitives level — `bindings/{rust,dotnet,nodejs,web}/{primitives.*,Program.cs}` cover
+  the same flow without an orchestrator (the .NET binding is primitives-only).
 
 ---
 
@@ -650,14 +707,20 @@ let response::PrePairExtractResult { response: pre_pair_resp } =
     response::extract_pre_pair(&pre_pair_resp_env).unwrap();
 
 // Scanner validates the published keys against `contact.contact_binding_hash`;
-// returns the keys + nonce on match, errors with `ProtocolViolation` on
-// mismatch.
+// returns the keys + nonce on match, errors with
+// `PairingError::PrePairHashMismatch` on mismatch.
 let validated = response::process_pre_pair(&contact, &pre_pair_resp).unwrap();
 
-// Synthesize a "filled-in" contact and run the regular pairing flow.
-let mut filled_in_contact: ContactMessage = contact.clone();
-filled_in_contact.mlkem_encapsulation_key = Some(validated.mlkem_encapsulation_key);
-filled_in_contact.ecies_public_key = Some(validated.ecies_public_key);
+// Synthesize a "filled-in" contact and run the regular pairing flow. The
+// mode flip is required — `request::produce` enforces `InlineKeys` and
+// rejects a contact that still advertises `HashedKeys`.
+let filled_in_contact = ContactMessage {
+    mlkem_encapsulation_key: Some(validated.mlkem_encapsulation_key),
+    ecies_public_key: Some(validated.ecies_public_key),
+    contact_mode: ContactMode::InlineKeys as i32,
+    contact_binding_hash: None,
+    ..contact.clone()
+};
 // ... continue with request::produce / extract / response::produce / process
 // against `filled_in_contact` exactly as in the InlineKeys example.
 ```

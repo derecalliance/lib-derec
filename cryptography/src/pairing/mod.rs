@@ -497,6 +497,50 @@ pub fn finish_pairing_initiator(
     Ok(shared_key)
 }
 
+/// SHA-384 binding hash that commits an initiator's pairing public keys to a
+/// `(nonce, channel_id)` session.
+///
+/// Used by `HashedKeys`-mode pairing: the initiator emits a `ContactMessage`
+/// carrying only this 48-byte hash, and the scanner — after fetching the real
+/// keys via a `PrePair` round-trip — recomputes the same hash and compares.
+/// Mismatch means the published keys don't match the contact's commitment
+/// (man-in-the-middle on the PrePair leg, swapped keys, etc.) and pairing
+/// MUST be refused.
+///
+/// # Domain
+///
+/// ```text
+/// SHA-384( mlkem_encapsulation_key
+///       || ecies_public_key
+///       || u64_be(nonce)
+///       || u64_be(channel_id) )
+/// ```
+///
+/// Integers are big-endian and the field order is fixed — both sides must
+/// hash identical bytes, byte-for-byte, for the comparison to succeed.
+///
+/// # Constant-time use
+///
+/// Returns the raw 48-byte digest. Callers MUST compare against
+/// `ContactMessage.contact_binding_hash` with a constant-time equality
+/// (`subtle::ConstantTimeEq`) — otherwise a timing oracle could leak which
+/// prefix of the expected hash an attacker has guessed correctly.
+pub fn contact_binding_hash(
+    mlkem_encapsulation_key: &[u8],
+    ecies_public_key: &[u8],
+    nonce: u64,
+    channel_id: u64,
+) -> [u8; 48] {
+    use sha2::{Digest, Sha384};
+
+    let mut hasher = Sha384::new();
+    hasher.update(mlkem_encapsulation_key);
+    hasher.update(ecies_public_key);
+    hasher.update(nonce.to_be_bytes());
+    hasher.update(channel_id.to_be_bytes());
+    hasher.finalize().into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,5 +555,119 @@ mod tests {
         let bob_shared_key = finish_pairing_initiator(&bob_secrets, &alice_request).unwrap();
 
         assert_eq!(alice_shared_key, bob_shared_key);
+    }
+
+    /// Reference inputs used across the binding-hash tests. `mlkem` and `ecies`
+    /// are short opaque payloads — the function treats them as raw bytes, so
+    /// the exact length doesn't matter for any of the assertions.
+    fn ref_inputs() -> (&'static [u8], &'static [u8], u64, u64) {
+        (
+            b"mlkem_encapsulation_key_bytes",
+            b"ecies_public_key_bytes",
+            0xCAFE_BABE_DEAD_BEEF,
+            0x0102_0304_0506_0708,
+        )
+    }
+
+    #[test]
+    fn contact_binding_hash_is_48_bytes() {
+        let (mlkem, ecies, nonce, channel_id) = ref_inputs();
+        let hash = contact_binding_hash(mlkem, ecies, nonce, channel_id);
+        // SHA-384 always produces a 48-byte digest. The return type already
+        // enforces this; the assertion exists so this test fails loudly if
+        // the helper is ever switched to a different hash function without
+        // updating the signature.
+        assert_eq!(hash.len(), 48);
+    }
+
+    #[test]
+    fn contact_binding_hash_is_deterministic() {
+        let (mlkem, ecies, nonce, channel_id) = ref_inputs();
+        let a = contact_binding_hash(mlkem, ecies, nonce, channel_id);
+        let b = contact_binding_hash(mlkem, ecies, nonce, channel_id);
+        assert_eq!(a, b, "binding hash must be deterministic");
+    }
+
+    #[test]
+    fn contact_binding_hash_is_sensitive_to_mlkem_key() {
+        let (mlkem, ecies, nonce, channel_id) = ref_inputs();
+        let base = contact_binding_hash(mlkem, ecies, nonce, channel_id);
+        let perturbed = contact_binding_hash(b"different_mlkem_key", ecies, nonce, channel_id);
+        assert_ne!(base, perturbed, "changing the mlkem key must change the hash");
+    }
+
+    #[test]
+    fn contact_binding_hash_is_sensitive_to_ecies_key() {
+        let (mlkem, ecies, nonce, channel_id) = ref_inputs();
+        let base = contact_binding_hash(mlkem, ecies, nonce, channel_id);
+        let perturbed = contact_binding_hash(mlkem, b"different_ecies_key", nonce, channel_id);
+        assert_ne!(base, perturbed, "changing the ecies key must change the hash");
+    }
+
+    #[test]
+    fn contact_binding_hash_is_sensitive_to_nonce() {
+        let (mlkem, ecies, nonce, channel_id) = ref_inputs();
+        let base = contact_binding_hash(mlkem, ecies, nonce, channel_id);
+        let perturbed = contact_binding_hash(mlkem, ecies, nonce.wrapping_add(1), channel_id);
+        assert_ne!(base, perturbed, "changing the nonce must change the hash");
+    }
+
+    #[test]
+    fn contact_binding_hash_is_sensitive_to_channel_id() {
+        let (mlkem, ecies, nonce, channel_id) = ref_inputs();
+        let base = contact_binding_hash(mlkem, ecies, nonce, channel_id);
+        let perturbed = contact_binding_hash(mlkem, ecies, nonce, channel_id.wrapping_add(1));
+        assert_ne!(base, perturbed, "changing the channel_id must change the hash");
+    }
+
+    /// Field order matters: swapping the mlkem and ecies key positions must
+    /// produce a different digest (unless they're equal). Without this
+    /// guarantee, an attacker who controls one of the published keys could
+    /// craft a substitution that hashes to the same value.
+    #[test]
+    fn contact_binding_hash_is_sensitive_to_key_field_order() {
+        let mlkem: &[u8] = b"AAAA";
+        let ecies: &[u8] = b"BBBB";
+        let (_, _, nonce, channel_id) = ref_inputs();
+        let normal = contact_binding_hash(mlkem, ecies, nonce, channel_id);
+        let swapped = contact_binding_hash(ecies, mlkem, nonce, channel_id);
+        assert_ne!(
+            normal, swapped,
+            "swapping mlkem and ecies field order must change the hash"
+        );
+    }
+
+    /// Integers must be encoded big-endian. Without that contract, a
+    /// little-endian implementation on the other side of the protocol would
+    /// silently produce a different digest for the same logical input.
+    #[test]
+    fn contact_binding_hash_encodes_integers_big_endian() {
+        let (mlkem, ecies, _, _) = ref_inputs();
+        let nonce: u64 = 0x0102_0304_0506_0708;
+        let channel_id: u64 = 0x1112_1314_1516_1718;
+        let hash = contact_binding_hash(mlkem, ecies, nonce, channel_id);
+
+        // Recompute byte-for-byte with the documented encoding and assert
+        // equality. If anyone changes the helper to write little-endian or
+        // swap the integer order, this test fails immediately.
+        use sha2::{Digest, Sha384};
+        let mut hasher = Sha384::new();
+        hasher.update(mlkem);
+        hasher.update(ecies);
+        hasher.update(nonce.to_be_bytes());
+        hasher.update(channel_id.to_be_bytes());
+        let expected: [u8; 48] = hasher.finalize().into();
+        assert_eq!(hash, expected);
+    }
+
+    /// Empty key inputs are valid input — `Sha384::update(&[])` is a no-op,
+    /// so the digest folds in only the two integer fields. We pin this
+    /// behavior explicitly because the helper is the canonical site for
+    /// the formula; if it ever rejects empty slices, callers that haven't
+    /// validated key non-emptiness upstream would surface confusing errors.
+    #[test]
+    fn contact_binding_hash_accepts_empty_inputs() {
+        let hash = contact_binding_hash(&[], &[], 0, 0);
+        assert_eq!(hash.len(), 48);
     }
 }

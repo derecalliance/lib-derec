@@ -147,15 +147,20 @@ var prePairRespEnv = Pairing.Response.ProducePrePair(
 var prePairResp = Pairing.Response.ExtractPrePair(prePairRespEnv.Envelope);
 
 // Scanner validates the published keys against contact.ContactBindingHash.
-// Throws DeRecException on mismatch (returns the keys + echoed nonce on match).
+// Throws DeRecException with Category=Pairing, Code=PrePairHashMismatch on
+// mismatch (returns the keys + echoed nonce on match).
 var validated = Pairing.Response.ProcessPrePair(
     contact.ContactMessage, prePairResp.ResponseProtoBytes);
 
-// Synthesize a "filled-in" contact and run the regular pairing flow.
+// Synthesize a "filled-in" contact and run the regular pairing flow. The
+// mode flip is required — `Pairing.Request.Produce` enforces `InlineKeys`
+// and rejects a contact that still advertises `HashedKeys`.
 var filledInContact = contact.ContactMessage with
 {
+    ContactMode = ContactMode.InlineKeys,
     MlkemEncapsulationKey = validated.MlkemEncapsulationKey,
     EciesPublicKey = validated.EciesPublicKey,
+    ContactBindingHash = null,
 };
 // ... continue with Pairing.Request.Produce / Extract /
 // Pairing.Response.Produce / Process against `filledInContact` exactly as
@@ -166,6 +171,29 @@ After the PrePair exchange the application **must** swap the transport
 endpoint to a long-term one via `UpdateChannelInfo`. The ephemeral endpoint
 advertised in the `HashedKeys` contact is intended to be retired immediately
 after pairing.
+
+Catch the security-relevant binding-hash mismatch with a typed code:
+
+```csharp
+try
+{
+    var validated = Pairing.Response.ProcessPrePair(
+        contact.ContactMessage, prePairResp.ResponseProtoBytes);
+}
+catch (DeRecException e)
+    when (e.Category == DeRecCategory.Pairing
+       && e.Code == DeRecCode.PrePairHashMismatch)
+{
+    // The keys published by the peer do not match the commitment the
+    // scanner originally accepted — surface to the user as a failed scan,
+    // do NOT proceed to a regular PairRequest.
+}
+```
+
+The .NET package is intentionally scoped to the primitive layer — the
+`DeRecProtocol` orchestrator is not surfaced here. End-to-end primitive-level
+coverage (including the tampered-hash assertion) lives at
+`bindings/dotnet/Program.cs::RunPairingFlowHashedKeysTest`.
 
 ---
 

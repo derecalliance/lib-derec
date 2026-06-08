@@ -32,6 +32,7 @@ pub fn run_all() {
         .expect("failed to build tokio runtime");
 
     rt.block_on(run_pairing_flow());
+    rt.block_on(run_hashed_keys_pairing_flow());
     rt.block_on(run_sharing_flow());
     rt.block_on(run_discovery_and_recovery_flow());
     rt.block_on(run_unpairing_flow());
@@ -482,7 +483,7 @@ async fn pump_many(peers: &mut [&mut Peer]) -> Vec<DeRecEvent> {
 async fn pair(owner: &mut Peer, helper: &mut Peer, channel_id: ChannelId) {
     let contact = owner
         .protocol
-        .create_contact(Some(channel_id))
+        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys)
         .await
         .expect("owner.create_contact failed");
 
@@ -568,6 +569,178 @@ async fn run_pairing_flow() {
     );
 
     println!("Protocol pairing flow test passed.");
+}
+
+
+/// Drive a full HashedKeys pairing handshake: Owner creates a HashedKeys
+/// contact (binding hash only, no inline public keys), Helper kicks off the
+/// PrePair leg, Owner publishes its real keys via `accept_pre_pair`, Helper
+/// validates the hash and auto-proceeds to a regular `PairRequest`, then
+/// both sides reach `PairingCompleted`. The whole multi-leg chain drains
+/// through a single `pump` call.
+async fn pair_hashed_keys(owner: &mut Peer, helper: &mut Peer, channel_id: ChannelId) {
+    let contact = owner
+        .protocol
+        .create_contact(Some(channel_id), derec_proto::ContactMode::HashedKeys)
+        .await
+        .expect("owner.create_contact(HashedKeys) failed");
+
+    assert!(
+        contact.contact_binding_hash.is_some(),
+        "HashedKeys contact must carry a binding hash"
+    );
+    assert!(
+        contact.mlkem_encapsulation_key.is_none() && contact.ecies_public_key.is_none(),
+        "HashedKeys contact must NOT carry inline public keys"
+    );
+
+    helper
+        .protocol
+        .start(DeRecFlow::Pairing {
+            kind: SenderKind::Helper,
+            contact,
+            peer_communication_info: std::collections::HashMap::from([(
+                "name".to_owned(),
+                "helper".to_owned(),
+            )]),
+        })
+        .await
+        .expect("helper start(Pairing) failed");
+
+    // pump's loop chains PrePairRequest -> PrePairResponse -> PairRequest
+    // -> PairResponse in a single drain pass since each hop pushes the
+    // next message back into the queue.
+    let events = pump(helper, owner).await;
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, DeRecEvent::PrePairRejected { .. })),
+        "happy path must not emit PrePairRejected"
+    );
+
+    let pairing_completed = events
+        .iter()
+        .filter(|e| matches!(e, DeRecEvent::PairingCompleted { .. }))
+        .count();
+    assert!(
+        pairing_completed >= 2,
+        "expected PairingCompleted on both sides (got {pairing_completed})"
+    );
+}
+
+async fn run_hashed_keys_pairing_flow() {
+    println!("=== Protocol HashedKeys pairing flow test ===");
+
+    let channel_id = ChannelId(1);
+    let mut owner = Peer::new("owner", "https://owner.example.com");
+    let mut helper = Peer::new("helper", "https://helper.example.com");
+
+    pair_hashed_keys(&mut owner, &mut helper, channel_id).await;
+
+    let owner_channel = owner
+        .protocol
+        .channel_store
+        .load(channel_id)
+        .await
+        .expect("owner channel_store.load failed");
+    let helper_channel = helper
+        .protocol
+        .channel_store
+        .load(channel_id)
+        .await
+        .expect("helper channel_store.load failed");
+    assert!(
+        owner_channel.is_some(),
+        "owner must have a paired channel after HashedKeys pairing"
+    );
+    assert!(
+        helper_channel.is_some(),
+        "helper must have a paired channel after HashedKeys pairing"
+    );
+
+    let owner_fp = owner
+        .protocol
+        .get_fingerprint(channel_id)
+        .await
+        .expect("owner get_fingerprint failed");
+    let helper_fp = helper
+        .protocol
+        .get_fingerprint(channel_id)
+        .await
+        .expect("helper get_fingerprint failed");
+    assert_eq!(
+        owner_fp, helper_fp,
+        "owner and helper fingerprints must match after HashedKeys pairing"
+    );
+
+    println!("Protocol HashedKeys pairing flow test passed.");
+
+    // Negative: tampering the binding hash before the scanner starts must
+    // surface `PrePairHashMismatch` once the real keys arrive — the
+    // security-relevant guarantee of the HashedKeys mode.
+    println!("=== Protocol HashedKeys pairing — tampered binding hash ===");
+
+    let channel_id = ChannelId(2);
+    let mut owner = Peer::new("owner", "https://owner.example.com");
+    let mut helper = Peer::new("helper", "https://helper.example.com");
+
+    let mut contact = owner
+        .protocol
+        .create_contact(Some(channel_id), derec_proto::ContactMode::HashedKeys)
+        .await
+        .expect("owner.create_contact(HashedKeys) failed");
+    contact
+        .contact_binding_hash
+        .as_mut()
+        .expect("HashedKeys contact must carry binding hash")[0] ^= 0xff;
+
+    helper
+        .protocol
+        .start(DeRecFlow::Pairing {
+            kind: SenderKind::Helper,
+            contact,
+            peer_communication_info: std::collections::HashMap::new(),
+        })
+        .await
+        .expect("helper start(Pairing) failed");
+
+    // Hand-route helper -> owner -> helper so we can intercept the
+    // PrePairResponse with `process()` directly and observe the error
+    // instead of having `deliver` panic.
+    let mut from_helper = helper.drain();
+    assert_eq!(
+        from_helper.len(),
+        1,
+        "helper should have queued exactly one PrePairRequest"
+    );
+    let (_, pre_pair_request_bytes) = from_helper.pop().unwrap();
+    let _ = deliver(&mut owner, &pre_pair_request_bytes).await;
+
+    let mut from_owner = owner.drain();
+    assert_eq!(
+        from_owner.len(),
+        1,
+        "owner should have queued exactly one PrePairResponse"
+    );
+    let (_, pre_pair_response_bytes) = from_owner.pop().unwrap();
+    let err = helper
+        .protocol
+        .process(&pre_pair_response_bytes)
+        .await
+        .err()
+        .expect("tampered binding hash must cause process() to return Err");
+    assert!(
+        matches!(
+            err.source,
+            derec_library::Error::Pairing(
+                derec_library::primitives::pairing::PairingError::PrePairHashMismatch
+            )
+        ),
+        "tampered binding hash must surface PrePairHashMismatch, got: {err}"
+    );
+
+    println!("Protocol HashedKeys pairing — tampered binding hash test passed.");
 }
 
 
@@ -688,7 +861,7 @@ async fn run_discovery_and_recovery_flow() {
     ] {
         let recovery_contact = owner
             .protocol
-            .create_contact(Some(fresh_cid))
+            .create_contact(Some(fresh_cid), derec_proto::ContactMode::InlineKeys)
             .await
             .unwrap_or_else(|e| panic!("owner.create_contact (recovery, {label}) failed: {e}"));
 

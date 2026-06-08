@@ -92,6 +92,14 @@ pub const DEREC_CODE_EMPTY_TRANSPORT_URI: i32 = 40;
 pub const DEREC_CODE_INVALID_CONTACT_MESSAGE: i32 = 41;
 pub const DEREC_CODE_INVALID_PAIR_REQUEST_MESSAGE: i32 = 42;
 pub const DEREC_CODE_INVALID_PAIR_RESPONSE_MESSAGE: i32 = 43;
+/// `HashedKeys` pairing — the scanner recomputed the SHA-384 binding hash
+/// over the public keys published in `PrePairResponseMessage` and got a
+/// digest that doesn't match `ContactMessage.contactBindingHash`. Surfaced
+/// as [`DEREC_CATEGORY_PAIRING`]. Distinct from a generic
+/// [`DEREC_CODE_PROTOCOL_VIOLATION`] so applications can flag this with
+/// the security-relevant framing it deserves (the contact the user
+/// scanned does not match the keys they would pair with).
+pub const DEREC_CODE_PREPAIR_HASH_MISMATCH: i32 = 44;
 
 pub const DEREC_CODE_EMPTY_CHANNELS: i32 = 60;
 pub const DEREC_CODE_DUPLICATE_CHANNEL_ID: i32 = 61;
@@ -223,6 +231,7 @@ fn pairing_code(e: &PairingError) -> i32 {
         PairingError::InvalidPairResponseMessage(_) => DEREC_CODE_INVALID_PAIR_RESPONSE_MESSAGE,
         PairingError::NonOkStatus { .. } => DEREC_CODE_NON_OK_STATUS,
         PairingError::ProtocolViolation(_) => DEREC_CODE_PROTOCOL_VIOLATION,
+        PairingError::PrePairHashMismatch => DEREC_CODE_PREPAIR_HASH_MISMATCH,
         PairingError::Invariant(_) => DEREC_CODE_INVARIANT,
         PairingError::ContactMessageKeygen { .. } => DEREC_CODE_KEYGEN,
         PairingError::PairRequestKeygen { .. } => DEREC_CODE_KEYGEN,

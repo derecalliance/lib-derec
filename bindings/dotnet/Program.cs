@@ -158,12 +158,16 @@ internal static class Program
 
 
         // Bob synthesizes a "filled-in" contact by copying the validated keys
-        // into the HASHED_KEYS contact. From here on the flow is identical to
-        // the INLINE_KEYS path.
+        // into the HASHED_KEYS contact, then flips ContactMode to InlineKeys
+        // and drops the binding hash. `Produce` enforces the InlineKeys
+        // invariant, so this rewrite is required — it mirrors the protocol
+        // orchestrator's `on_pre_pair_response` logic.
         var filledInContact = aliceContact.ContactMessage with
         {
+            ContactMode = ContactMode.InlineKeys,
             MlkemEncapsulationKey = validated.MlkemEncapsulationKey,
             EciesPublicKey = validated.EciesPublicKey,
+            ContactBindingHash = null,
         };
 
         var pairRequest = Pairing.Request.Produce(
@@ -200,6 +204,68 @@ internal static class Program
 
         Console.WriteLine($"  shared keys match ({produced.SharedKey.Length}B)");
         Console.WriteLine($"  channel id rekeyed: {channelId} → {produced.ChannelId}");
+
+
+        // Negative: tampering the binding hash before validation must surface
+        // PrePairHashMismatch. This is the security-relevant guarantee of
+        // HASHED_KEYS — the scanner refuses keys that don't match the
+        // commitment they originally accepted, even when the published keys
+        // are otherwise well-formed.
+        Console.WriteLine("  -- Negative: tampered binding hash --");
+
+        ulong tamperedChannelId = 3;
+        var tamperedAlice = Pairing.Request.CreateContact(
+            tamperedChannelId,
+            ContactMode.HashedKeys,
+            new TransportProtocol("https://example.com/alice/ephemeral")
+        );
+
+        if (tamperedAlice.ContactMessage.ContactBindingHash is not { Length: 48 } originalHash)
+            throw new InvalidOperationException("tampered-hash test: contact_binding_hash must be present.");
+        var corruptedHash = (byte[])originalHash.Clone();
+        corruptedHash[0] ^= 0xff;
+        var tamperedContact = tamperedAlice.ContactMessage with
+        {
+            ContactBindingHash = corruptedHash,
+        };
+
+        // Alice still produces a valid PrePairResponse — the tampering
+        // happens on Bob's stored contact, so the error surfaces on Bob's
+        // side when validating the real keys against the tampered commitment.
+        var tamperedPrePairRequest = Pairing.Request.ProducePrePair(
+            new TransportProtocol("https://example.com/helper/ephemeral"),
+            tamperedContact
+        );
+        var tamperedExtractedReq = Pairing.Request.ExtractPrePair(tamperedPrePairRequest.Envelope);
+        var tamperedPrePairResponse = Pairing.Response.ProducePrePair(
+            tamperedChannelId,
+            tamperedExtractedReq.RequestProtoBytes,
+            tamperedAlice.SecretKeyMaterial
+        );
+        var tamperedExtractedResp = Pairing.Response.ExtractPrePair(tamperedPrePairResponse.Envelope);
+
+        DeRecException? caught = null;
+        try
+        {
+            Pairing.Response.ProcessPrePair(
+                tamperedContact,
+                tamperedExtractedResp.ResponseProtoBytes
+            );
+        }
+        catch (DeRecException e)
+        {
+            caught = e;
+        }
+        if (caught is null)
+            throw new InvalidOperationException("tampered binding hash must cause ProcessPrePair to throw.");
+        if (caught.Category != DeRecCategory.Pairing)
+            throw new InvalidOperationException(
+                $"tampered binding hash must throw DeRecCategory.Pairing, got category={caught.Category} code={caught.Code} message={caught.Message}");
+        if (caught.Code != DeRecCode.PrePairHashMismatch)
+            throw new InvalidOperationException(
+                $"tampered binding hash must throw DeRecCode.PrePairHashMismatch ({DeRecCode.PrePairHashMismatch}), got category={caught.Category} code={caught.Code} message={caught.Message}");
+        Console.WriteLine($"  ProcessPrePair threw category={caught.Category} code={caught.Code} ✓");
+
         Console.WriteLine("Pairing flow test (HASHED_KEYS + PrePair) passed.");
     }
 

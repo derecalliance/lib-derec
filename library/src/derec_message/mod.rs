@@ -67,3 +67,18 @@ pub fn extract_inner_pairing_message(
 
     Ok(inner)
 }
+
+/// Decodes the inner [`MessageBody`] from a plaintext envelope.
+///
+/// Used by the `HashedKeys` pre-pair leg, where the `message` field of the
+/// outer [`DeRecMessage`] envelope carries a serialized `MessageBody`
+/// directly — no encryption, because no shared or asymmetric key exists
+/// yet at that point in the protocol.
+///
+/// Pair with [`DeRecMessageBuilder::plaintext`]`().finalize().build()`
+/// for symmetric construction.
+pub fn extract_inner_plaintext_message(
+    message_bytes: &[u8],
+) -> Result<MessageBody, crate::Error> {
+    MessageBody::decode_from_vec(message_bytes).map_err(crate::Error::ProtobufDecode)
+}

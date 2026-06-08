@@ -62,6 +62,18 @@ public static class DeRecCode
     public const int InvalidContactMessage = 41;
     public const int InvalidPairRequestMessage = 42;
     public const int InvalidPairResponseMessage = 43;
+    /// <summary>
+    /// Returned by <c>Pairing.Response.ProcessPrePair</c> when the public keys
+    /// published by the contact creator don't hash to the
+    /// <see cref="ContactMessage.ContactBindingHash"/> carried by the original
+    /// <see cref="ContactMessage"/>. Cryptographically distinguishable from a
+    /// normal rejection — surfaces as a typed error so applications can flag
+    /// it specifically (the contact the user scanned does not match the keys
+    /// they would pair with).
+    /// <see cref="DeRecException.Category"/> is
+    /// <see cref="DeRecCategory.Pairing"/>.
+    /// </summary>
+    public const int PrePairHashMismatch = 44;
 
     public const int EmptyChannels = 60;
     public const int DuplicateChannelId = 61;

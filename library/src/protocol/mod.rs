@@ -28,7 +28,8 @@ use crate::{
 };
 pub use builder::DeRecProtocolBuilder;
 use derec_proto::{
-    ContactMessage, DeRecMessage, GetShareResponseMessage, StatusEnum, TransportProtocol,
+    ContactMessage, ContactMode, DeRecMessage, GetShareResponseMessage, StatusEnum,
+    TransportProtocol,
 };
 pub use error::{ChannelStoreError, ProcessError, SecretStoreError, ShareStoreError};
 use prost::Message;
@@ -206,19 +207,36 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
     /// the library generate a random one. The channel ID is embedded in the
     /// returned [`ContactMessage`] and should be treated as the canonical
     /// identifier for this pairing session going forward.
+    ///
+    /// # Contact mode
+    ///
+    /// - [`ContactMode::InlineKeys`] embeds the initiator's ML-KEM + ECIES
+    ///   public keys directly in the contact. Simplest to use; the contact is
+    ///   ~1.2 KB.
+    /// - [`ContactMode::HashedKeys`] embeds only a SHA-384 binding hash over
+    ///   the keys. The contact stays small enough for a QR code; the scanner
+    ///   obtains the real keys via a `PrePair` round-trip and validates them
+    ///   against the hash. Requires the `own_transport` set on this protocol
+    ///   to be **ephemeral** — the plaintext PrePair traffic must not be
+    ///   linkable to a long-lived endpoint.
     #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
     pub async fn create_contact(
         &mut self,
         channel_id: Option<ChannelId>,
+        contact_mode: ContactMode,
     ) -> Result<ContactMessage> {
         let channel_id = channel_id.unwrap_or_else(|| ChannelId(rand::random::<u64>()));
 
         #[cfg(feature = "logging")]
-        tracing::debug!(channel_id = channel_id.0, "creating contact message");
+        tracing::debug!(
+            channel_id = channel_id.0,
+            contact_mode = contact_mode as i32,
+            "creating contact message"
+        );
 
         let result = create_contact_message(
             channel_id,
-            derec_proto::ContactMode::InlineKeys,
+            contact_mode,
             self.own_transport.clone(),
         )?;
 
@@ -601,6 +619,20 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                 )
                 .await
             }
+            PendingAction::PrePair {
+                channel_id,
+                request,
+                trace_id,
+            } => {
+                handlers::pairing::accept_pre_pair(
+                    &mut self.secret_store,
+                    &self.transport,
+                    channel_id,
+                    &request,
+                    trace_id,
+                )
+                .await
+            }
         }
     }
 
@@ -737,6 +769,21 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     &self.transport,
                     channel_id,
                     &shared_key,
+                    status,
+                    memo,
+                    trace_id,
+                )
+                .await
+            }
+            PendingAction::PrePair {
+                channel_id,
+                request,
+                trace_id,
+            } => {
+                handlers::pairing::reject_pre_pair(
+                    &self.transport,
+                    channel_id,
+                    &request,
                     status,
                     memo,
                     trace_id,
@@ -938,6 +985,70 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
         message: &DeRecMessage,
         channel_id: ChannelId,
     ) -> Result<Option<Vec<DeRecEvent>>> {
+        use derec_proto::MessageBody;
+
+        // Try the plaintext PrePair layer first. PrePair envelopes carry
+        // a serialized `MessageBody` directly (no encryption — no shared
+        // or asymmetric key exists yet), so they decode without crypto
+        // material. ECIES ciphertext for the regular Pair flow won't
+        // realistically decode to a valid `PrePair*` variant; if it ever
+        // did, we fall through to the encrypted path below.
+        if let Ok(inner) =
+            crate::derec_message::extract_inner_plaintext_message(&message.message)
+        {
+            match inner {
+                inner @ MessageBody::PrePairRequest(_) => {
+                    // Initiator side: needs `PairingSecret` to answer.
+                    // Routes through the regular pairing dispatcher
+                    // (`pairing::handle`) — same shape as PairRequest /
+                    // PairResponse handling, just with the inner already
+                    // decoded so we skip the decryption step.
+                    let Some(SecretValue::PairingSecret(pairing_secret)) = self
+                        .secret_store
+                        .load(channel_id, SecretKind::PairingSecret)
+                        .await?
+                    else {
+                        return Ok(None);
+                    };
+                    let events = handlers::pairing::handle(
+                        &mut self.channel_store,
+                        &mut self.secret_store,
+                        &inner,
+                        channel_id,
+                        &pairing_secret,
+                        message.trace_id,
+                    )
+                    .await?;
+                    return Ok(Some(events));
+                }
+                MessageBody::PrePairResponse(resp) => {
+                    // Scanner side: needs the original HashedKeys contact
+                    // (saved at `start` time) to validate the binding hash.
+                    let Some(SecretValue::PairingContact(contact)) = self
+                        .secret_store
+                        .load(channel_id, SecretKind::PairingContact)
+                        .await?
+                    else {
+                        return Ok(None);
+                    };
+                    let events = handlers::pairing::on_pre_pair_response(
+                        &mut self.channel_store,
+                        &mut self.secret_store,
+                        &self.transport,
+                        &self.own_transport,
+                        &self.communication_info,
+                        channel_id,
+                        &contact,
+                        &resp,
+                    )
+                    .await?;
+                    return Ok(Some(events));
+                }
+                _ => {} // Fall through to the encrypted Pair path.
+            }
+        }
+
+        // Regular (encrypted) Pair flow.
         let Some(SecretValue::PairingSecret(pairing_secret)) = self
             .secret_store
             .load(channel_id, SecretKind::PairingSecret)
