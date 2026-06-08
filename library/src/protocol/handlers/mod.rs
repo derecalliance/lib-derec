@@ -87,17 +87,43 @@ pub(super) async fn peer_endpoint<Ch: DeRecChannelStore>(
         .ok_or(Error::InvalidInput("no transport endpoint for channel"))
 }
 
+/// Re-stamp a primitive-produced wire envelope with `trace_id`.
+///
+/// The pairing/sharing/verification/discovery/recovery/unpairing primitives
+/// build their response envelopes via [`DeRecMessageBuilder`] but don't echo
+/// the inbound `traceId` — that's the orchestrator's job (see the field doc
+/// on `DeRecMessage.traceId`). This helper decodes the outer envelope (which
+/// is plaintext), overwrites `trace_id`, and re-encodes. The encrypted inner
+/// `message` field is left untouched, so the cost is one extra proto
+/// round-trip with no crypto work.
+pub(super) fn apply_trace_id(envelope_bytes: Vec<u8>, trace_id: u64) -> Result<Vec<u8>> {
+    let mut envelope = DeRecMessage::decode(envelope_bytes.as_slice()).map_err(|_| {
+        Error::Invariant("primitive produced un-decodable response envelope")
+    })?;
+    envelope.trace_id = trace_id;
+    Ok(envelope.encode_to_vec())
+}
+
+/// Build and dispatch an encrypted channel-mode response envelope.
+///
+/// `inbound_trace_id` is the `trace_id` read off the request envelope that
+/// triggered this response. Echoed verbatim on the outbound envelope so the
+/// requester can correlate (see the field doc on `DeRecMessage.traceId`). Pass
+/// `0` when there is no inbound to echo from (e.g. unsolicited messages that
+/// don't carry a meaningful correlation handle).
 pub(super) async fn send_channel_message<Ch: DeRecChannelStore, T: DeRecTransport>(
     channel_store: &mut Ch,
     transport: &T,
     channel_id: ChannelId,
     body: MessageBody,
     shared_key: &SharedKey,
+    inbound_trace_id: u64,
 ) -> Result<()> {
     let envelope = DeRecMessageBuilder::channel()
         .channel_id(channel_id)
         .timestamp(current_timestamp())
         .message_body(body)
+        .trace_id(inbound_trace_id)
         .encrypt(shared_key)?
         .build()?;
 
@@ -128,19 +154,22 @@ pub(super) async fn handle<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRec
         require_role(channel_store, &[channel_id], expected).await?;
     }
 
+    let inbound_trace_id = message.trace_id;
+
     match &inner {
         MessageBody::StoreShareRequest(_) | MessageBody::StoreShareResponse(_) => {
-            sharing::handle(channel_id, inner, *shared_key)
+            sharing::handle(channel_id, inner, *shared_key, inbound_trace_id)
         }
         MessageBody::VerifyShareRequest(_) | MessageBody::VerifyShareResponse(_) => {
-            verification::handle(share_store, channel_id, inner, *shared_key).await
+            verification::handle(share_store, channel_id, inner, *shared_key, inbound_trace_id)
+                .await
         }
         MessageBody::GetSecretIdsVersionsRequest(_)
         | MessageBody::GetSecretIdsVersionsResponse(_) => {
-            discovery::handle(channel_id, inner, *shared_key)
+            discovery::handle(channel_id, inner, *shared_key, inbound_trace_id)
         }
         MessageBody::GetShareRequest(_) | MessageBody::GetShareResponse(_) => {
-            recovery::handle(pending_recovery, channel_id, inner, *shared_key)
+            recovery::handle(pending_recovery, channel_id, inner, *shared_key, inbound_trace_id)
         }
         MessageBody::UnpairRequest(_) | MessageBody::UnpairResponse(_) => {
             unpairing::handle(
@@ -151,11 +180,12 @@ pub(super) async fn handle<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRec
                 channel_id,
                 inner,
                 *shared_key,
+                inbound_trace_id,
             )
             .await
         }
         MessageBody::UpdateChannelInfoRequest(_) | MessageBody::UpdateChannelInfoResponse(_) => {
-            update_channel_info::handle(channel_id, inner, *shared_key).await
+            update_channel_info::handle(channel_id, inner, *shared_key, inbound_trace_id).await
         }
         _ => Err(Error::Invariant(
             "unexpected MessageBody variant in channel message",

@@ -475,6 +475,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                 channel_id,
                 request,
                 shared_key,
+                trace_id,
             } => {
                 handlers::sharing::accept(
                     &mut self.channel_store,
@@ -483,6 +484,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     channel_id,
                     &request,
                     &shared_key,
+                    trace_id,
                 )
                 .await
             }
@@ -490,6 +492,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                 channel_id,
                 request,
                 shared_key,
+                trace_id,
             } => {
                 handlers::verification::accept(
                     &mut self.channel_store,
@@ -498,6 +501,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     channel_id,
                     &request,
                     &shared_key,
+                    trace_id,
                 )
                 .await
             }
@@ -505,6 +509,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                 channel_id,
                 request,
                 shared_key,
+                trace_id,
             } => {
                 handlers::discovery::accept(
                     &mut self.channel_store,
@@ -513,6 +518,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     channel_id,
                     &request,
                     &shared_key,
+                    trace_id,
                 )
                 .await
             }
@@ -520,6 +526,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                 channel_id,
                 request,
                 shared_key,
+                trace_id,
             } => {
                 handlers::recovery::accept(
                     &mut self.channel_store,
@@ -528,6 +535,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     channel_id,
                     &request,
                     &shared_key,
+                    trace_id,
                 )
                 .await
             }
@@ -535,6 +543,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                 channel_id,
                 request,
                 shared_key,
+                trace_id,
             } => {
                 handlers::unpairing::accept(
                     &mut self.channel_store,
@@ -544,6 +553,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     channel_id,
                     &request,
                     &shared_key,
+                    trace_id,
                 )
                 .await
             }
@@ -551,6 +561,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                 channel_id,
                 request,
                 shared_key,
+                trace_id,
             } => {
                 handlers::update_channel_info::accept(
                     &mut self.channel_store,
@@ -558,6 +569,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     channel_id,
                     &request,
                     &shared_key,
+                    trace_id,
                 )
                 .await
             }
@@ -598,6 +610,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                 channel_id,
                 request,
                 shared_key,
+                trace_id,
             } => {
                 handlers::sharing::reject(
                     &mut self.channel_store,
@@ -607,6 +620,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     &shared_key,
                     status,
                     memo,
+                    trace_id,
                 )
                 .await
             }
@@ -614,6 +628,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                 channel_id,
                 request,
                 shared_key,
+                trace_id,
             } => {
                 handlers::verification::reject(
                     &mut self.channel_store,
@@ -623,12 +638,14 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     &shared_key,
                     status,
                     memo,
+                    trace_id,
                 )
                 .await
             }
             PendingAction::Discovery {
                 channel_id,
                 shared_key,
+                trace_id,
                 ..
             } => {
                 handlers::discovery::reject(
@@ -638,6 +655,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     &shared_key,
                     status,
                     memo,
+                    trace_id,
                 )
                 .await
             }
@@ -645,6 +663,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                 channel_id,
                 request,
                 shared_key,
+                trace_id,
             } => {
                 handlers::recovery::reject(
                     &mut self.channel_store,
@@ -654,12 +673,14 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     &shared_key,
                     status,
                     memo,
+                    trace_id,
                 )
                 .await
             }
             PendingAction::Unpair {
                 channel_id,
                 shared_key,
+                trace_id,
                 ..
             } => {
                 handlers::unpairing::reject(
@@ -669,12 +690,14 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     &shared_key,
                     status,
                     memo,
+                    trace_id,
                 )
                 .await
             }
             PendingAction::UpdateChannelInfo {
                 channel_id,
                 shared_key,
+                trace_id,
                 ..
             } => {
                 handlers::update_channel_info::reject(
@@ -684,6 +707,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     &shared_key,
                     status,
                     memo,
+                    trace_id,
                 )
                 .await
             }

@@ -34,9 +34,12 @@ pub(in crate::protocol) async fn handle<
     channel_id: ChannelId,
     inner: MessageBody,
     shared_key: SharedKey,
+    inbound_trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
     match inner {
-        MessageBody::UnpairRequest(request) => on_request(channel_id, request, shared_key),
+        MessageBody::UnpairRequest(request) => {
+            on_request(channel_id, request, shared_key, inbound_trace_id)
+        }
         MessageBody::UnpairResponse(response) => {
             on_response(
                 channel_store,
@@ -130,10 +133,12 @@ pub(in crate::protocol) async fn accept<
     channel_id: ChannelId,
     _request: &UnpairRequestMessage,
     shared_key: &SharedKey,
+    trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
     let resp = unpairing_response::produce(channel_id, shared_key)?;
+    let envelope = super::apply_trace_id(resp.envelope, trace_id)?;
     let endpoint = peer_endpoint(channel_store, channel_id).await?;
-    transport.send(&endpoint, resp.envelope).await?;
+    transport.send(&endpoint, envelope).await?;
 
     drop_channel_state(channel_store, share_store, secret_store, channel_id).await?;
 
@@ -154,6 +159,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
     shared_key: &SharedKey,
     status: StatusEnum,
     memo: &str,
+    trace_id: u64,
 ) -> Result<()> {
     let response = UnpairResponseMessage {
         result: Some(DeRecResult {
@@ -169,6 +175,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
         channel_id,
         MessageBody::UnpairResponse(response),
         shared_key,
+        trace_id,
     )
     .await
 }
@@ -181,6 +188,7 @@ fn on_request(
     channel_id: ChannelId,
     request: UnpairRequestMessage,
     shared_key: SharedKey,
+    trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
     Ok(vec![DeRecEvent::ActionRequired {
         channel_id,
@@ -188,6 +196,7 @@ fn on_request(
             channel_id,
             request,
             shared_key,
+            trace_id,
         },
     }])
 }

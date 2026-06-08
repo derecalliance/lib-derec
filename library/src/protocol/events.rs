@@ -31,21 +31,28 @@ pub enum PendingAction {
         channel_id: ChannelId,
         request: StoreShareRequestMessage,
         shared_key: SharedKey,
+        /// Trace id read from the inbound request envelope. Echoed verbatim
+        /// on the response envelope when the application calls `accept` or
+        /// `reject`; see `DeRecMessage.traceId`.
+        trace_id: u64,
     },
     VerifyShare {
         channel_id: ChannelId,
         request: VerifyShareRequestMessage,
         shared_key: SharedKey,
+        trace_id: u64,
     },
     Discovery {
         channel_id: ChannelId,
         request: GetSecretIdsVersionsRequestMessage,
         shared_key: SharedKey,
+        trace_id: u64,
     },
     GetShare {
         channel_id: ChannelId,
         request: GetShareRequestMessage,
         shared_key: SharedKey,
+        trace_id: u64,
     },
     /// The peer has asked us to drop our state for this channel
     /// (see [`crate::primitives::unpairing`]). Accepting deletes the local
@@ -55,6 +62,7 @@ pub enum PendingAction {
         channel_id: ChannelId,
         request: UnpairRequestMessage,
         shared_key: SharedKey,
+        trace_id: u64,
     },
     /// The peer has announced an update to their communication info and/or
     /// transport endpoint. Accepting applies the update to the stored
@@ -65,6 +73,7 @@ pub enum PendingAction {
         channel_id: ChannelId,
         request: UpdateChannelInfoRequestMessage,
         shared_key: SharedKey,
+        trace_id: u64,
     },
 }
 

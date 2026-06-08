@@ -28,9 +28,12 @@ pub(in crate::protocol) fn handle(
     channel_id: ChannelId,
     inner: MessageBody,
     shared_key: SharedKey,
+    inbound_trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
     match inner {
-        MessageBody::StoreShareRequest(request) => on_request(channel_id, request, shared_key),
+        MessageBody::StoreShareRequest(request) => {
+            on_request(channel_id, request, shared_key, inbound_trace_id)
+        }
         MessageBody::StoreShareResponse(response) => on_response(channel_id, &response),
         _ => Err(Error::Invariant(
             "unexpected MessageBody variant in sharing handler",
@@ -96,6 +99,7 @@ pub(in crate::protocol) async fn accept<
     channel_id: ChannelId,
     request: &StoreShareRequestMessage,
     shared_key: &SharedKey,
+    trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
     let secret_id = request.secret_id;
     let version = request.version;
@@ -113,8 +117,9 @@ pub(in crate::protocol) async fn accept<
         )
         .await?;
 
+    let envelope = super::apply_trace_id(resp.envelope, trace_id)?;
     let endpoint = peer_endpoint(channel_store, channel_id).await?;
-    transport.send(&endpoint, resp.envelope).await?;
+    transport.send(&endpoint, envelope).await?;
 
     #[cfg(feature = "logging")]
     tracing::info!(
@@ -149,6 +154,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
     shared_key: &SharedKey,
     status: StatusEnum,
     memo: &str,
+    trace_id: u64,
 ) -> Result<()> {
     let response = StoreShareResponseMessage {
         result: Some(DeRecResult {
@@ -165,6 +171,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
         channel_id,
         MessageBody::StoreShareResponse(response),
         shared_key,
+        trace_id,
     )
     .await?;
 
@@ -195,6 +202,7 @@ fn on_request(
     channel_id: ChannelId,
     request: StoreShareRequestMessage,
     shared_key: SharedKey,
+    trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
     Ok(vec![DeRecEvent::ActionRequired {
         channel_id,
@@ -202,6 +210,7 @@ fn on_request(
             channel_id,
             request,
             shared_key,
+            trace_id,
         },
     }])
 }

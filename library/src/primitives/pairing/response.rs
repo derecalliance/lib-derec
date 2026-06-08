@@ -333,6 +333,11 @@ pub fn produce_pre_pair(
         channel_id: channel_id.into(),
         timestamp: Some(timestamp),
         message: MessageBody::PrePairResponse(response).encode_to_vec(),
+        // Echo of the inbound request's `trace_id` is wired in by the
+        // higher-level orchestrator; this low-level primitive currently
+        // constructs the envelope without it. Defaults to 0 (= "no
+        // correlation"), which is wire-equivalent to the unset state.
+        trace_id: 0,
     }
     .encode_to_vec();
 

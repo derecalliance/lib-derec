@@ -150,6 +150,41 @@ message DeRecMessage {
   // containing exactly one protocol message.
   bytes message = 6;
 
+  // Application-supplied correlation token, echoed verbatim by the
+  // responder on the matching response envelope.
+  //
+  // # Purpose
+  //
+  // Lets the side that originated a request match the eventual response to
+  // the in-flight request that produced it, even when:
+  //
+  // - multiple requests are outstanding on the same channel,
+  // - responses arrive out of order with respect to send order,
+  // - the responder takes arbitrary time to reply.
+  //
+  // # Semantics
+  //
+  // - On a request envelope: the requester sets this to any value it can
+  //   use to correlate the response back to the originating call site. A
+  //   random `uint64` is a typical choice; collisions are unlikely at any
+  //   realistic concurrency level.
+  // - On a response envelope: the responder MUST copy the request's
+  //   `traceId` verbatim. The library does this automatically in every
+  //   response producer.
+  // - Zero (the protobuf default when unset) is treated as "no correlation
+  //   requested." Responders still echo the zero on the response envelope;
+  //   requesters that do not care about correlation simply ignore the
+  //   field.
+  //
+  // # Privacy
+  //
+  // This field is plaintext on the wire (the envelope is not encrypted).
+  // The token itself is opaque, so it carries no information about either
+  // peer's identity or intent — it is purely a correlation handle. Passive
+  // observers could already correlate request/response pairs by channelId
+  // and timing; `traceId` does not add to that exposure.
+  uint64 traceId = 7;
+
   // MessageBody defines all possible DeRec protocol messages that can be
   // transported inside the DeRecMessage envelope.
   //

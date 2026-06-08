@@ -1294,6 +1294,7 @@ fn test_extract_pre_pair_rejects_wrong_inner_message_type() {
         channel_id: 42,
         timestamp: Some(timestamp),
         message: body,
+        trace_id: 0,
     }
     .encode_to_vec();
 
@@ -1578,6 +1579,7 @@ fn test_extract_pre_pair_response_rejects_wrong_inner_message_type() {
         channel_id: 42,
         timestamp: Some(timestamp),
         message: body,
+        trace_id: 0,
     }
     .encode_to_vec();
 

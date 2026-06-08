@@ -423,6 +423,11 @@ pub fn produce_pre_pair_request(
         channel_id: contact_message.channel_id,
         timestamp: Some(timestamp),
         message: MessageBody::PrePairRequest(request).encode_to_vec(),
+        // Correlation token is the higher-level orchestrator's concern;
+        // the low-level PrePair primitive currently emits 0 (= "no
+        // correlation"). The `auto_trace_id` helper on the builder
+        // would produce a random one when callers want it.
+        trace_id: 0,
     }
     .encode_to_vec();
 

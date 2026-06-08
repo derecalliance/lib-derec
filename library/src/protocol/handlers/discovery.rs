@@ -28,10 +28,11 @@ pub(in crate::protocol) fn handle(
     channel_id: ChannelId,
     inner: MessageBody,
     shared_key: SharedKey,
+    inbound_trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
     match inner {
         MessageBody::GetSecretIdsVersionsRequest(request) => {
-            on_request(channel_id, request, shared_key)
+            on_request(channel_id, request, shared_key, inbound_trace_id)
         }
         MessageBody::GetSecretIdsVersionsResponse(response) => on_response(channel_id, &response),
         _ => Err(Error::Invariant(
@@ -112,6 +113,7 @@ pub(in crate::protocol) async fn accept<
     channel_id: ChannelId,
     _request: &GetSecretIdsVersionsRequestMessage,
     shared_key: &SharedKey,
+    trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
     let linked_ids = channel_store.linked_channels(channel_id).await?;
     let all_shares = share_store.load_all(&linked_ids).await?;
@@ -149,8 +151,9 @@ pub(in crate::protocol) async fn accept<
 
     let resp = response::produce(channel_id, &secret_list, shared_key)?;
 
+    let envelope = super::apply_trace_id(resp.envelope, trace_id)?;
     let endpoint = peer_endpoint(channel_store, channel_id).await?;
-    transport.send(&endpoint, resp.envelope).await?;
+    transport.send(&endpoint, envelope).await?;
 
     #[cfg(feature = "logging")]
     tracing::info!("discovery response sent");
@@ -169,6 +172,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
     shared_key: &SharedKey,
     status: StatusEnum,
     memo: &str,
+    trace_id: u64,
 ) -> Result<()> {
     let response = GetSecretIdsVersionsResponseMessage {
         result: Some(DeRecResult {
@@ -185,6 +189,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
         channel_id,
         MessageBody::GetSecretIdsVersionsResponse(response),
         shared_key,
+        trace_id,
     )
     .await
 }
@@ -197,6 +202,7 @@ fn on_request(
     channel_id: ChannelId,
     request: GetSecretIdsVersionsRequestMessage,
     shared_key: SharedKey,
+    trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
     Ok(vec![DeRecEvent::ActionRequired {
         channel_id,
@@ -204,6 +210,7 @@ fn on_request(
             channel_id,
             request,
             shared_key,
+            trace_id,
         },
     }])
 }

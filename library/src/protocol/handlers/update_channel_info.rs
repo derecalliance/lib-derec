@@ -32,10 +32,11 @@ pub(in crate::protocol) async fn handle(
     channel_id: ChannelId,
     inner: MessageBody,
     shared_key: SharedKey,
+    inbound_trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
     match inner {
         MessageBody::UpdateChannelInfoRequest(request) => {
-            on_request(channel_id, request, shared_key)
+            on_request(channel_id, request, shared_key, inbound_trace_id)
         }
         MessageBody::UpdateChannelInfoResponse(response) => on_response(channel_id, &response),
         _ => Err(Error::Invariant(
@@ -122,6 +123,7 @@ pub(in crate::protocol) async fn accept<Ch: DeRecChannelStore, T: DeRecTransport
     channel_id: ChannelId,
     request: &UpdateChannelInfoRequestMessage,
     shared_key: &SharedKey,
+    trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
     // Apply the update to the stored channel first, so the response we send
     // below is routed to the (possibly updated) transport endpoint.
@@ -157,6 +159,7 @@ pub(in crate::protocol) async fn accept<Ch: DeRecChannelStore, T: DeRecTransport
         .channel_id(channel_id)
         .timestamp(timestamp)
         .message_body(MessageBody::UpdateChannelInfoResponse(response))
+        .trace_id(trace_id)
         .encrypt(shared_key)?
         .build()?
         .encode_to_vec();
@@ -190,6 +193,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
     shared_key: &SharedKey,
     status: StatusEnum,
     memo: &str,
+    trace_id: u64,
 ) -> Result<()> {
     let timestamp = current_timestamp();
     let response = UpdateChannelInfoResponseMessage {
@@ -204,6 +208,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
         .channel_id(channel_id)
         .timestamp(timestamp)
         .message_body(MessageBody::UpdateChannelInfoResponse(response))
+        .trace_id(trace_id)
         .encrypt(shared_key)?
         .build()?
         .encode_to_vec();
@@ -225,6 +230,7 @@ fn on_request(
     channel_id: ChannelId,
     request: UpdateChannelInfoRequestMessage,
     shared_key: SharedKey,
+    trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
     if request.communication_info.is_none() && request.transport_protocol.is_none() {
         return Err(EMPTY_UPDATE_ERROR);
@@ -236,6 +242,7 @@ fn on_request(
             channel_id,
             request,
             shared_key,
+            trace_id,
         },
     }])
 }

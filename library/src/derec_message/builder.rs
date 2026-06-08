@@ -152,6 +152,7 @@ pub struct DeRecMessageBuilder<State, Mode> {
     pub(crate) channel_id: Option<ChannelId>,
     pub(crate) timestamp: Option<Timestamp>,
     pub(crate) message: Option<MessageBody>,
+    pub(crate) trace_id: Option<u64>,
     encrypted: Vec<u8>,
     _state: PhantomData<State>,
     _mode: PhantomData<Mode>,
@@ -206,6 +207,44 @@ impl<State, Mode> DeRecMessageBuilder<State, Mode> {
         self
     }
 
+    /// Sets the request/response correlation token for the envelope.
+    ///
+    /// On request envelopes the requester chooses any opaque `u64` to identify
+    /// the in-flight call. On response envelopes the responder echoes back the
+    /// value from the request. Both happens automatically when this builder is
+    /// driven by the standard request/response producers, but the value can
+    /// also be set explicitly by callers that need to correlate from outside.
+    ///
+    /// Defaults to zero when not set, which the protocol treats as "no
+    /// correlation requested."
+    ///
+    /// # Arguments
+    ///
+    /// * `trace_id` - opaque correlation token
+    ///
+    /// # Returns
+    ///
+    /// The updated builder.
+    pub fn trace_id(mut self, trace_id: u64) -> Self {
+        self.trace_id = Some(trace_id);
+        self
+    }
+
+    /// Sets a freshly-drawn random `trace_id` on the envelope.
+    ///
+    /// Convenience for request producers that want a new correlation token
+    /// without managing the RNG themselves. Uses the same random source as the
+    /// rest of the library (`rand::rng().next_u64()`).
+    ///
+    /// # Returns
+    ///
+    /// The updated builder with a random `trace_id`.
+    pub fn auto_trace_id(mut self) -> Self {
+        use rand::Rng as _;
+        self.trace_id = Some(rand::rng().next_u64());
+        self
+    }
+
     /// Encodes the inner payload and sets the `message_type` discriminant from a [`MessageBody`].
     ///
     /// This is the preferred alternative to [`message`](Self::message) for all flows that
@@ -249,6 +288,7 @@ impl DeRecMessageBuilder<NotEncrypted, PairingMode> {
             channel_id: None,
             timestamp: None,
             message: None,
+            trace_id: None,
             encrypted: Vec::new(),
             _state: PhantomData,
             _mode: PhantomData,
@@ -293,6 +333,7 @@ impl DeRecMessageBuilder<NotEncrypted, PairingMode> {
             timestamp: self.timestamp,
             sequence: self.sequence,
             channel_id: self.channel_id,
+            trace_id: self.trace_id,
             _state: PhantomData,
             _mode: PhantomData,
         })
@@ -321,6 +362,7 @@ impl DeRecMessageBuilder<NotEncrypted, ChannelMode> {
             channel_id: None,
             timestamp: None,
             message: None,
+            trace_id: None,
             encrypted: Vec::new(),
             _state: PhantomData,
             _mode: PhantomData,
@@ -375,6 +417,7 @@ impl DeRecMessageBuilder<NotEncrypted, ChannelMode> {
             timestamp: self.timestamp,
             sequence: self.sequence,
             channel_id: Some(channel_id),
+            trace_id: self.trace_id,
             _state: PhantomData,
             _mode: PhantomData,
         })
@@ -433,6 +476,7 @@ impl<Mode> DeRecMessageBuilder<Encrypted, Mode> {
                     .ok_or(DeRecMessageBuilderError::MissingTimestamp)?,
             ),
             message: self.encrypted,
+            trace_id: self.trace_id.unwrap_or_default(),
         })
     }
 }

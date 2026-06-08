@@ -27,6 +27,7 @@ fn test_pairing_builder_new_sets_defaults() {
     assert!(builder.channel_id.is_none());
     assert!(builder.timestamp.is_none());
     assert!(builder.message.is_none());
+    assert!(builder.trace_id.is_none());
 }
 
 #[test]
@@ -37,6 +38,7 @@ fn test_channel_builder_new_sets_defaults() {
     assert!(builder.channel_id.is_none());
     assert!(builder.timestamp.is_none());
     assert!(builder.message.is_none());
+    assert!(builder.trace_id.is_none());
 }
 
 #[test]
@@ -244,4 +246,99 @@ fn test_message_overwrites_previous_payload() {
     assert!(
         matches!(builder.message, Some(MessageBody::PairRequest(inner_message)) if inner_message == second),
     );
+}
+
+#[test]
+fn test_trace_id_is_propagated_through_pairing_build() {
+    let (_sk, pk) = pairing_keypair();
+    let timestamp = current_timestamp();
+
+    let envelope = DeRecMessageBuilder::pairing()
+        .channel_id(CHANNEL_ID)
+        .timestamp(timestamp)
+        .message_body(MessageBody::PairRequest(sample_message()))
+        .trace_id(0xCAFEBABE_DEADBEEF)
+        .encrypt_pairing(&pk)
+        .expect("encrypt should succeed")
+        .build()
+        .expect("build should succeed");
+
+    assert_eq!(envelope.trace_id, 0xCAFEBABE_DEADBEEF);
+}
+
+#[test]
+fn test_trace_id_is_propagated_through_channel_build() {
+    let timestamp = current_timestamp();
+
+    let envelope = DeRecMessageBuilder::channel()
+        .channel_id(CHANNEL_ID)
+        .timestamp(timestamp)
+        .message_body(MessageBody::PairRequest(sample_message()))
+        .trace_id(0x0102_0304_0506_0708)
+        .encrypt(&SHARED_KEY)
+        .expect("encrypt should succeed")
+        .build()
+        .expect("build should succeed");
+
+    assert_eq!(envelope.trace_id, 0x0102_0304_0506_0708);
+}
+
+#[test]
+fn test_auto_trace_id_produces_non_zero_value() {
+    let timestamp = current_timestamp();
+    let (_sk, pk) = pairing_keypair();
+
+    let envelope = DeRecMessageBuilder::pairing()
+        .channel_id(CHANNEL_ID)
+        .timestamp(timestamp)
+        .message_body(MessageBody::PairRequest(sample_message()))
+        .auto_trace_id()
+        .encrypt_pairing(&pk)
+        .expect("encrypt should succeed")
+        .build()
+        .expect("build should succeed");
+
+    // The probability of `rand::rng().next_u64()` rolling exactly zero is
+    // 2^-64; the test would have to be re-rolled on the order of the heat
+    // death of the universe to legitimately observe it.
+    assert_ne!(envelope.trace_id, 0);
+}
+
+#[test]
+fn test_trace_id_defaults_to_zero_when_unset() {
+    let (_sk, pk) = pairing_keypair();
+    let timestamp = current_timestamp();
+
+    let envelope = DeRecMessageBuilder::pairing()
+        .channel_id(CHANNEL_ID)
+        .timestamp(timestamp)
+        .message_body(MessageBody::PairRequest(sample_message()))
+        .encrypt_pairing(&pk)
+        .expect("encrypt should succeed")
+        .build()
+        .expect("build should succeed");
+
+    assert_eq!(envelope.trace_id, 0);
+}
+
+#[test]
+fn test_trace_id_round_trips_through_proto_encoding() {
+    let (_sk, pk) = pairing_keypair();
+    let timestamp = current_timestamp();
+
+    let original = DeRecMessageBuilder::pairing()
+        .channel_id(CHANNEL_ID)
+        .timestamp(timestamp)
+        .message_body(MessageBody::PairRequest(sample_message()))
+        .trace_id(0xFEED_FACE_BAAD_F00D)
+        .encrypt_pairing(&pk)
+        .expect("encrypt should succeed")
+        .build()
+        .expect("build should succeed");
+
+    let wire_bytes = original.encode_to_vec();
+    let decoded = derec_proto::DeRecMessage::decode(wire_bytes.as_slice())
+        .expect("envelope should decode");
+
+    assert_eq!(decoded.trace_id, 0xFEED_FACE_BAAD_F00D);
 }

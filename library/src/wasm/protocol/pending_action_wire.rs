@@ -6,14 +6,16 @@
 //! back to `accept()` or `reject()` without inspecting them.
 //!
 //! Wire format:
-//! - 1 byte: discriminant (0..4)
+//! - 1 byte: discriminant (0..6)
 //! - 8 bytes: channel_id (big-endian u64)
 //! - For Pairing:
 //!   - 4 bytes: my_kind (i32 BE)
 //!   - 4 bytes: request_len (u32 BE)
 //!   - N bytes: protobuf-encoded PairRequestMessage
 //!   - remaining: serialized PairingSecretKeyMaterial
-//! - For channel message types (StoreShare, VerifyShare, Discovery, GetShare):
+//! - For channel message types (StoreShare, VerifyShare, Discovery,
+//!   GetShare, Unpair, UpdateChannelInfo):
+//!   - 8 bytes: trace_id (u64 BE) — echoed verbatim on the response
 //!   - 32 bytes: shared_key
 //!   - remaining: protobuf-encoded request message
 
@@ -64,9 +66,11 @@ pub fn serialize(action: PendingAction) -> Result<Vec<u8>, String> {
             channel_id,
             request,
             shared_key,
+            trace_id,
         } => {
             buf.push(TAG_STORE_SHARE);
             buf.extend_from_slice(&channel_id.0.to_be_bytes());
+            buf.extend_from_slice(&trace_id.to_be_bytes());
             buf.extend_from_slice(&shared_key);
             buf.extend_from_slice(&request.encode_to_vec());
         }
@@ -74,9 +78,11 @@ pub fn serialize(action: PendingAction) -> Result<Vec<u8>, String> {
             channel_id,
             request,
             shared_key,
+            trace_id,
         } => {
             buf.push(TAG_VERIFY_SHARE);
             buf.extend_from_slice(&channel_id.0.to_be_bytes());
+            buf.extend_from_slice(&trace_id.to_be_bytes());
             buf.extend_from_slice(&shared_key);
             buf.extend_from_slice(&request.encode_to_vec());
         }
@@ -84,9 +90,11 @@ pub fn serialize(action: PendingAction) -> Result<Vec<u8>, String> {
             channel_id,
             request,
             shared_key,
+            trace_id,
         } => {
             buf.push(TAG_DISCOVERY);
             buf.extend_from_slice(&channel_id.0.to_be_bytes());
+            buf.extend_from_slice(&trace_id.to_be_bytes());
             buf.extend_from_slice(&shared_key);
             buf.extend_from_slice(&request.encode_to_vec());
         }
@@ -94,9 +102,11 @@ pub fn serialize(action: PendingAction) -> Result<Vec<u8>, String> {
             channel_id,
             request,
             shared_key,
+            trace_id,
         } => {
             buf.push(TAG_GET_SHARE);
             buf.extend_from_slice(&channel_id.0.to_be_bytes());
+            buf.extend_from_slice(&trace_id.to_be_bytes());
             buf.extend_from_slice(&shared_key);
             buf.extend_from_slice(&request.encode_to_vec());
         }
@@ -104,9 +114,11 @@ pub fn serialize(action: PendingAction) -> Result<Vec<u8>, String> {
             channel_id,
             request,
             shared_key,
+            trace_id,
         } => {
             buf.push(TAG_UNPAIR);
             buf.extend_from_slice(&channel_id.0.to_be_bytes());
+            buf.extend_from_slice(&trace_id.to_be_bytes());
             buf.extend_from_slice(&shared_key);
             buf.extend_from_slice(&request.encode_to_vec());
         }
@@ -114,9 +126,11 @@ pub fn serialize(action: PendingAction) -> Result<Vec<u8>, String> {
             channel_id,
             request,
             shared_key,
+            trace_id,
         } => {
             buf.push(TAG_UPDATE_CHANNEL_INFO);
             buf.extend_from_slice(&channel_id.0.to_be_bytes());
+            buf.extend_from_slice(&trace_id.to_be_bytes());
             buf.extend_from_slice(&shared_key);
             buf.extend_from_slice(&request.encode_to_vec());
         }
@@ -170,63 +184,69 @@ pub fn deserialize(bytes: &[u8]) -> Result<PendingAction, String> {
             })
         }
         TAG_STORE_SHARE => {
-            let (shared_key, request_bytes) = split_shared_key(rest)?;
+            let (trace_id, shared_key, request_bytes) = split_trace_id_and_shared_key(rest)?;
             let request = StoreShareRequestMessage::decode(request_bytes)
                 .map_err(|e| format!("failed to decode StoreShareRequestMessage: {e}"))?;
             Ok(PendingAction::StoreShare {
                 channel_id,
                 request,
                 shared_key,
+                trace_id,
             })
         }
         TAG_VERIFY_SHARE => {
-            let (shared_key, request_bytes) = split_shared_key(rest)?;
+            let (trace_id, shared_key, request_bytes) = split_trace_id_and_shared_key(rest)?;
             let request = VerifyShareRequestMessage::decode(request_bytes)
                 .map_err(|e| format!("failed to decode VerifyShareRequestMessage: {e}"))?;
             Ok(PendingAction::VerifyShare {
                 channel_id,
                 request,
                 shared_key,
+                trace_id,
             })
         }
         TAG_DISCOVERY => {
-            let (shared_key, request_bytes) = split_shared_key(rest)?;
+            let (trace_id, shared_key, request_bytes) = split_trace_id_and_shared_key(rest)?;
             let request = GetSecretIdsVersionsRequestMessage::decode(request_bytes)
                 .map_err(|e| format!("failed to decode GetSecretIdsVersionsRequestMessage: {e}"))?;
             Ok(PendingAction::Discovery {
                 channel_id,
                 request,
                 shared_key,
+                trace_id,
             })
         }
         TAG_GET_SHARE => {
-            let (shared_key, request_bytes) = split_shared_key(rest)?;
+            let (trace_id, shared_key, request_bytes) = split_trace_id_and_shared_key(rest)?;
             let request = GetShareRequestMessage::decode(request_bytes)
                 .map_err(|e| format!("failed to decode GetShareRequestMessage: {e}"))?;
             Ok(PendingAction::GetShare {
                 channel_id,
                 request,
                 shared_key,
+                trace_id,
             })
         }
         TAG_UNPAIR => {
-            let (shared_key, request_bytes) = split_shared_key(rest)?;
+            let (trace_id, shared_key, request_bytes) = split_trace_id_and_shared_key(rest)?;
             let request = UnpairRequestMessage::decode(request_bytes)
                 .map_err(|e| format!("failed to decode UnpairRequestMessage: {e}"))?;
             Ok(PendingAction::Unpair {
                 channel_id,
                 request,
                 shared_key,
+                trace_id,
             })
         }
         TAG_UPDATE_CHANNEL_INFO => {
-            let (shared_key, request_bytes) = split_shared_key(rest)?;
+            let (trace_id, shared_key, request_bytes) = split_trace_id_and_shared_key(rest)?;
             let request = UpdateChannelInfoRequestMessage::decode(request_bytes)
                 .map_err(|e| format!("failed to decode UpdateChannelInfoRequestMessage: {e}"))?;
             Ok(PendingAction::UpdateChannelInfo {
                 channel_id,
                 request,
                 shared_key,
+                trace_id,
             })
         }
         _ => Err(format!("unknown action tag: {tag}")),
@@ -240,6 +260,15 @@ fn split_shared_key(bytes: &[u8]) -> Result<([u8; 32], &[u8]), String> {
     let mut key = [0u8; 32];
     key.copy_from_slice(&bytes[..32]);
     Ok((key, &bytes[32..]))
+}
+
+fn split_trace_id_and_shared_key(bytes: &[u8]) -> Result<(u64, [u8; 32], &[u8]), String> {
+    if bytes.len() < 8 {
+        return Err("action bytes too short for trace_id".to_owned());
+    }
+    let trace_id = u64::from_be_bytes(bytes[..8].try_into().unwrap());
+    let (shared_key, rest) = split_shared_key(&bytes[8..])?;
+    Ok((trace_id, shared_key, rest))
 }
 
 fn i32_to_sender_kind(val: i32) -> Result<SenderKind, String> {
