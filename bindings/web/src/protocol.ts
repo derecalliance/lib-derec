@@ -8,7 +8,7 @@
 // share store, recording transport), but are Map-backed instead of
 // localStorage-backed.
 
-import { DeRecProtocol, FlowKind, SenderKind } from "@derec-alliance/web";
+import { DeRecProtocol, FlowKind, SenderKind, primitives } from "@derec-alliance/web";
 import type {
   ChannelStore,
   ContactMessage,
@@ -246,7 +246,11 @@ interface Node {
 const THRESHOLD = 2;
 const KEEP_VERSIONS_COUNT = 3;
 
-function makeNode(name: string, endpointUri: string): Node {
+function makeNode(
+  name: string,
+  endpointUri: string,
+  options: { autoReplyTo?: boolean } = {},
+): Node {
   const channelStore = new InMemoryChannelStore();
   const shareStore = new InMemoryShareStore();
   const secretStore = new InMemorySecretStore();
@@ -261,6 +265,10 @@ function makeNode(name: string, endpointUri: string): Node {
     THRESHOLD,
     KEEP_VERSIONS_COUNT,
     { name },
+    null, // timeoutInSecs
+    null, // autoRespondOnFailure
+    null, // unpairAck
+    options.autoReplyTo ?? null,
   );
   return { protocol, transport, channelStore, shareStore, secretStore };
 }
@@ -659,6 +667,86 @@ async function runUnpairingFlow(): Promise<void> {
 }
 
 
+/**
+ * Asserts the `autoReplyTo` constructor flag: with it `true`, every outbound
+ * channel-mode request must carry `request.replyTo = ownTransport` on the
+ * inner request body. Covers half (1) of the replyTo contract; half (2)
+ * (responder honours an inbound `replyTo`) is exercised by the Rust binding
+ * smoke test against the orchestrator handler logic.
+ */
+async function runReplyToFlow(): Promise<void> {
+  console.log("=== [Protocol] replyTo Flow ===\n");
+
+  const channelId = 9n;
+  const ownerUri = "https://owner-reply.example.com";
+  const helperUri = "https://helper-reply.example.com";
+
+  const helper = makeNode("Helper", helperUri);
+  const owner = makeNode("Owner", ownerUri, { autoReplyTo: true });
+
+  await doPair(helper, owner, channelId, "ReplyTo");
+
+  // Trigger an outbound Discovery request; it will be queued on the
+  // owner's transport awaiting delivery.
+  await owner.protocol.start(FlowKind.Discovery, { target: channelId });
+  const outbound = owner.transport.drain();
+  if (outbound.length !== 1) {
+    throw new Error(
+      `expected exactly 1 outbound Discovery request, got ${outbound.length}`,
+    );
+  }
+  const outboundMsg = outbound[0]!;
+  if (outboundMsg.endpoint.uri !== helperUri) {
+    throw new Error(
+      `outbound destination must still be the channel's stored helper endpoint, got ${outboundMsg.endpoint.uri}`,
+    );
+  }
+
+  // Decrypt the request body via the primitive `extract` and verify
+  // `request.reply_to.uri === ownerUri`. The shared key is sitting in the
+  // owner's secret store under kind=0 (SharedKey).
+  const sharedKey = await owner.secretStore.load(channelId.toString(), 0);
+  if (!sharedKey) {
+    throw new Error("owner shared_key must be present after pairing");
+  }
+  const { request: decoded } = primitives.discovery.request.extract(
+    outboundMsg.message,
+    sharedKey,
+  );
+  if (!decoded.reply_to || decoded.reply_to.uri !== ownerUri) {
+    throw new Error(
+      `auto_reply_to must stamp replyTo = ownerUri (${ownerUri}) on the inner request body, got ${JSON.stringify(decoded.reply_to)}`,
+    );
+  }
+
+  // Sanity: a node WITHOUT autoReplyTo must emit `reply_to === undefined`.
+  const helper2 = makeNode("Helper2", helperUri);
+  const ownerDefault = makeNode("OwnerDefault", ownerUri); // no autoReplyTo
+  await doPair(helper2, ownerDefault, channelId, "ReplyTo/Default");
+  await ownerDefault.protocol.start(FlowKind.Discovery, { target: channelId });
+  const defaultOutbound = ownerDefault.transport.drain();
+  const defaultMsg = defaultOutbound[0]!;
+  const defaultSharedKey = await ownerDefault.secretStore.load(
+    channelId.toString(),
+    0,
+  );
+  if (!defaultSharedKey) throw new Error("default owner shared_key missing");
+  const { request: defaultDecoded } = primitives.discovery.request.extract(
+    defaultMsg.message,
+    defaultSharedKey,
+  );
+  if (defaultDecoded.reply_to) {
+    throw new Error(
+      `without auto_reply_to, request.reply_to must be unset; got ${JSON.stringify(defaultDecoded.reply_to)}`,
+    );
+  }
+
+  console.log("  ✓ auto_reply_to stamps replyTo on outbound requests");
+  console.log("  ✓ default (no auto_reply_to) leaves replyTo unset");
+  console.log("\n✓ replyTo flow passed.\n");
+}
+
+
 export async function runProtocolSmoke(): Promise<void> {
   console.log("━━━ [Protocol] Starting ━━━\n");
 
@@ -666,6 +754,7 @@ export async function runProtocolSmoke(): Promise<void> {
   await runSharingFlow();
   await runDiscoveryAndRecoveryFlow();
   await runUnpairingFlow();
+  await runReplyToFlow();
 
   console.log("━━━ [Protocol] All passed. ━━━\n");
 }

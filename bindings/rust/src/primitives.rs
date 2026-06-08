@@ -29,6 +29,8 @@ pub fn run_all() {
     run_verification_flow_test();
     run_recovery_flow_test();
     run_discovery_flow_test();
+    run_envelope_trace_id_test();
+    run_request_reply_to_test();
 }
 
 fn run_protocol_version_test() {
@@ -350,6 +352,7 @@ fn run_sharing_flow_test() {
             &[],
             "",
             &shared_key,
+            None,
         )
         .unwrap_or_else(|e| panic!("share_request::produce failed for {channel:?}: {e}"));
 
@@ -420,6 +423,7 @@ fn run_verification_flow_test() {
         &[],
         "",
         shared_key_1,
+        None,
     )
     .expect("share_request::produce failed for channel 1")
     .envelope;
@@ -432,6 +436,7 @@ fn run_verification_flow_test() {
         &[],
         "",
         shared_key_1,
+        None,
     )
     .expect("share_request::produce failed for channel 2")
     .envelope;
@@ -446,7 +451,7 @@ fn run_verification_flow_test() {
         .request
         .share;
 
-    let produced = verif_request::produce(channel_1, secret_id, version, shared_key_1)
+    let produced = verif_request::produce(channel_1, secret_id, version, shared_key_1, None)
         .expect("verif_request::produce failed");
 
     let request_envelope = derec_proto::DeRecMessage::decode(produced.envelope.as_slice())
@@ -531,6 +536,7 @@ fn run_recovery_flow_test() {
             &[],
             "",
             shared_key_1,
+            None,
         )
         .expect("share_request::produce failed for channel 1")
         .envelope,
@@ -548,6 +554,7 @@ fn run_recovery_flow_test() {
             &[],
             "",
             shared_key_2,
+            None,
         )
         .expect("share_request::produce failed for channel 2")
         .envelope,
@@ -557,7 +564,7 @@ fn run_recovery_flow_test() {
     .request;
 
     // Channel 1 recovery round-trip.
-    let share_req_1 = rec_request::produce(channel_1, secret_id, version, shared_key_1)
+    let share_req_1 = rec_request::produce(channel_1, secret_id, version, shared_key_1, None)
         .expect("rec_request::produce failed for channel 1");
     let get_request_1 = rec_request::extract(&share_req_1.envelope, shared_key_1)
         .expect("rec_request::extract failed for channel 1")
@@ -574,7 +581,7 @@ fn run_recovery_flow_test() {
         .response;
 
     // Channel 2 recovery round-trip.
-    let share_req_2 = rec_request::produce(channel_2, secret_id, version, shared_key_2)
+    let share_req_2 = rec_request::produce(channel_2, secret_id, version, shared_key_2, None)
         .expect("rec_request::produce failed for channel 2");
     let get_request_2 = rec_request::extract(&share_req_2.envelope, shared_key_2)
         .expect("rec_request::extract failed for channel 2")
@@ -610,7 +617,7 @@ fn run_discovery_flow_test() {
     let channel_id = ChannelId(7);
     let shared_key = [11u8; 32];
 
-    let request = disc_request::produce(channel_id, &shared_key)
+    let request = disc_request::produce(channel_id, &shared_key, None)
         .expect("disc_request::produce failed");
     assert!(
         !request.envelope.is_empty(),
@@ -650,6 +657,74 @@ fn run_discovery_flow_test() {
     );
 
     println!("Discovery flow test passed.");
+}
+
+fn run_envelope_trace_id_test() {
+    println!("=== Envelope trace_id helpers test ===");
+
+    let channel_id = ChannelId(42);
+    let shared_key = [9u8; 32];
+
+    // Primitive `produce` emits envelopes with trace_id = 0 (the protobuf
+    // default). Consumers driving the protocol through primitives use
+    // `apply_trace_id` to stamp a correlation token.
+    let result = disc_request::produce(channel_id, &shared_key, None)
+        .expect("disc_request::produce failed");
+
+    let trace_before =
+        derec_library::derec_message::read_trace_id(&result.envelope).expect("read failed");
+    assert_eq!(trace_before, 0, "primitive default trace_id must be 0");
+
+    let stamped =
+        derec_library::derec_message::apply_trace_id(&result.envelope, 0xDEAD_BEEF_F00D_CAFE)
+            .expect("apply failed");
+    let trace_after = derec_library::derec_message::read_trace_id(&stamped).expect("read failed");
+    assert_eq!(
+        trace_after, 0xDEAD_BEEF_F00D_CAFE,
+        "trace_id must round-trip through apply + read"
+    );
+
+    // The encrypted inner payload is untouched — extract still succeeds.
+    let extracted = disc_request::extract(&stamped, &shared_key)
+        .expect("extract on re-stamped envelope failed");
+    assert!(extracted.request.timestamp.is_some());
+
+    println!("Envelope trace_id helpers test passed.");
+}
+
+fn run_request_reply_to_test() {
+    println!("=== Request reply_to round-trip test ===");
+
+    let channel_id = ChannelId(7);
+    let shared_key = [11u8; 32];
+
+    let reply_to = TransportProtocol {
+        uri: "https://replica-a.example.com/derec".to_owned(),
+        protocol: Protocol::Https as i32,
+    };
+
+    let result = disc_request::produce(channel_id, &shared_key, Some(reply_to.clone()))
+        .expect("disc_request::produce failed");
+
+    let extracted = disc_request::extract(&result.envelope, &shared_key)
+        .expect("disc_request::extract failed");
+    assert_eq!(
+        extracted.request.reply_to,
+        Some(reply_to),
+        "reply_to must round-trip on the inner request"
+    );
+
+    // Without it, the field is absent — the default behavior.
+    let plain = disc_request::produce(channel_id, &shared_key, None)
+        .expect("disc_request::produce (no reply_to) failed");
+    let plain_extracted = disc_request::extract(&plain.envelope, &shared_key)
+        .expect("disc_request::extract failed");
+    assert!(
+        plain_extracted.request.reply_to.is_none(),
+        "absent reply_to must decode as None"
+    );
+
+    println!("Request reply_to round-trip test passed.");
 }
 
 fn make_shared_keys(channels: &[ChannelId]) -> HashMap<ChannelId, [u8; 32]> {

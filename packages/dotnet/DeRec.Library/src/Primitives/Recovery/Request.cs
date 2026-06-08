@@ -22,16 +22,22 @@ public static partial class Recovery
             ulong channelId,
             ulong secretId,
             uint version,
-            byte[] sharedKey
+            byte[] sharedKey,
+            TransportProtocol? replyTo = null
         )
         {
+            byte[]? replyToBytes = replyTo?.ToProtoBytes();
+            UIntPtr replyToLen = replyToBytes is null ? UIntPtr.Zero : (UIntPtr)replyToBytes.Length;
+
             Native.Recovery.ProduceGetShareRequestMessageResult nativeResult =
                 Native.Recovery.produce_get_share_request_message(
                     channelId,
                     secretId,
                     version,
                     sharedKey,
-                    (UIntPtr)sharedKey.Length
+                    (UIntPtr)sharedKey.Length,
+                    replyToBytes,
+                    replyToLen
                 );
 
             try

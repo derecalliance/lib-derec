@@ -143,6 +143,15 @@ pub struct DeRecProtocol<
     pub(crate) communication_info: HashMap<String, String>,
     /// Configured via [`DeRecProtocolBuilder::with_auto_respond_on_failure`].
     pub(crate) auto_respond_on_failure: bool,
+    /// Configured via [`DeRecProtocolBuilder::with_auto_reply_to`].
+    ///
+    /// When `true`, every outbound request envelope is stamped with
+    /// `request.reply_to = self.own_transport` so the responder knows which
+    /// endpoint to route the response to. When `false` (the default),
+    /// outbound requests leave `reply_to` unset and the responder falls back
+    /// to the channel's stored peer endpoint. See `replyTo` on each request
+    /// proto for the wire-level semantics.
+    pub(crate) auto_reply_to: bool,
     /// Active sharing round, if any. Populated by `start(ProtectSecret)` and
     /// consumed when all targeted Helpers respond or time out.
     sharing_round: Option<SharingRound>,
@@ -179,6 +188,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
             timeout_in_secs,
             communication_info: HashMap::new(),
             auto_respond_on_failure: false,
+            auto_reply_to: false,
             sharing_round: None,
         }
     }
@@ -269,6 +279,17 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
     /// Returns `Some(channel_id)` for [`DeRecFlow::Pairing`], `None` for all others.
     #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
     pub async fn start(&mut self, flow: DeRecFlow) -> Result<Option<u64>> {
+        // When auto_reply_to is enabled, stamp every outbound channel-mode
+        // request with our own transport so the responder routes its reply
+        // back to us — even if the channel's stored peer endpoint points
+        // elsewhere (e.g. a sibling replica). Pairing has its own dedicated
+        // `transport_protocol` field so it's intentionally excluded here.
+        let reply_to = if self.auto_reply_to {
+            Some(self.own_transport.clone())
+        } else {
+            None
+        };
+
         match flow {
             DeRecFlow::Pairing {
                 kind,
@@ -302,6 +323,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     &mut self.secret_store,
                     &self.transport,
                     target,
+                    reply_to.clone(),
                 )
                 .await?;
                 Ok(None)
@@ -331,6 +353,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     self.keep_versions_count,
                     secret_id,
                     target,
+                    reply_to.clone(),
                 )
                 .await?;
 
@@ -364,6 +387,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     version,
                     target,
                     secret_id,
+                    reply_to.clone(),
                 )
                 .await?;
                 Ok(None)
@@ -389,6 +413,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     &mut self.pending_recovery,
                     secret_id,
                     version,
+                    reply_to.clone(),
                 )
                 .await?;
                 Ok(None)
@@ -416,6 +441,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     memo,
                     self.unpair_ack,
                     now_secs(),
+                    reply_to.clone(),
                 )
                 .await?;
                 // `start` is fire-and-forget at the API surface — its events
@@ -457,6 +483,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                 request,
                 pairing_secret,
                 kind,
+                trace_id,
                 ..
             } => {
                 handlers::pairing::accept(
@@ -468,6 +495,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     &request,
                     &pairing_secret,
                     kind,
+                    trace_id,
                 )
                 .await
             }
@@ -593,6 +621,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
             PendingAction::Pairing {
                 channel_id,
                 request,
+                trace_id,
                 ..
             } => {
                 handlers::pairing::reject(
@@ -603,6 +632,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     &request,
                     status,
                     memo,
+                    trace_id,
                 )
                 .await
             }
@@ -644,14 +674,15 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
             }
             PendingAction::Discovery {
                 channel_id,
+                request,
                 shared_key,
                 trace_id,
-                ..
             } => {
                 handlers::discovery::reject(
                     &mut self.channel_store,
                     &self.transport,
                     channel_id,
+                    &request,
                     &shared_key,
                     status,
                     memo,
@@ -679,14 +710,15 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
             }
             PendingAction::Unpair {
                 channel_id,
+                request,
                 shared_key,
                 trace_id,
-                ..
             } => {
                 handlers::unpairing::reject(
                     &mut self.channel_store,
                     &self.transport,
                     channel_id,
+                    &request,
                     &shared_key,
                     status,
                     memo,

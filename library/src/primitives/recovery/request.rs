@@ -60,7 +60,7 @@ pub struct ExtractResult {
 /// let channel_id = ChannelId(42);
 /// let shared_key = [7u8; 32];
 ///
-/// let result = request::produce(channel_id, 1, 1, &shared_key)
+/// let result = request::produce(channel_id, 1, 1, &shared_key, None)
 ///     .expect("failed to build recovery request");
 ///
 /// assert!(!result.envelope.is_empty());
@@ -74,6 +74,7 @@ pub fn produce(
     secret_id: u64,
     version: u32,
     shared_key: &SharedKey,
+    reply_to: Option<derec_proto::TransportProtocol>,
 ) -> Result<ProduceResult, crate::Error> {
     let timestamp = current_timestamp();
 
@@ -81,6 +82,7 @@ pub fn produce(
         secret_id,
         version,
         timestamp: Some(timestamp),
+        reply_to,
     };
 
     let envelope = DeRecMessageBuilder::channel()

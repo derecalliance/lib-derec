@@ -6,7 +6,14 @@ import {
   DeRecProtocolWasm,
   decodeRecoveredSecretBag,
   restoreFromRecoveredBag,
+  envelope_apply_trace_id,
+  envelope_read_trace_id,
 } from "./derec_library.js";
+
+export const envelope = {
+  apply_trace_id: envelope_apply_trace_id,
+  read_trace_id: envelope_read_trace_id,
+};
 
 export const DeRecProtocol = DeRecProtocolWasm;
 

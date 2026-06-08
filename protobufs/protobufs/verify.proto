@@ -7,6 +7,7 @@ syntax = "proto3";
 
 import "google/protobuf/timestamp.proto";
 import "result.proto";
+import "transportprotocol.proto";
 
 package org.derecalliance.derec.protobuf;
 
@@ -72,6 +73,15 @@ message VerifyShareRequestMessage {
   // - replay detection (in combination with sequence numbers)
   // - timeout handling
   google.protobuf.Timestamp timestamp = 4;
+
+  // Ephemeral transport endpoint at which the requester wants to receive
+  // the response to *this exchange*, overriding the channel's stored peer
+  // endpoint for this round-trip only.
+  //
+  // See `StoreShareRequestMessage.replyTo` for full semantics. Absent =
+  // route to the stored channel endpoint; Present = route this response
+  // here without persisting the endpoint.
+  optional TransportProtocol replyTo = 5;
 }
 
 // VerifyShareResponseMessage contains the result of a verification challenge

@@ -76,7 +76,9 @@ internal static class Sharing
         byte[] description,
         UIntPtr descriptionLen,
         byte[] sharedKey,
-        UIntPtr sharedKeyLen
+        UIntPtr sharedKeyLen,
+        byte[]? replyTo,
+        UIntPtr replyToLen
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]

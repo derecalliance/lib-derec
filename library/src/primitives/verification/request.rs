@@ -80,6 +80,7 @@ pub struct ExtractResult {
 ///     1,
 ///     7,
 ///     &shared_key,
+///     None,
 /// )
 /// .expect("failed to build verification request");
 ///
@@ -94,6 +95,7 @@ pub fn produce(
     secret_id: u64,
     version: u32,
     shared_key: &SharedKey,
+    reply_to: Option<derec_proto::TransportProtocol>,
 ) -> Result<ProduceResult, crate::Error> {
     let mut rng = rng();
 
@@ -105,6 +107,7 @@ pub fn produce(
         version,
         nonce,
         timestamp: Some(timestamp),
+        reply_to,
     };
 
     let envelope = DeRecMessageBuilder::channel()

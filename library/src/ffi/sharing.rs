@@ -20,7 +20,8 @@
 
 use crate::{
     ffi::common::{
-        DeRecBuffer, empty_buffer, vec_into_buffer, write_len_prefixed, write_u32_le, write_u64_le,
+        DeRecBuffer, empty_buffer, parse_optional_transport_protocol, vec_into_buffer,
+        write_len_prefixed, write_u32_le, write_u64_le,
     },
     ffi::error::{
         DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_BAD_SHARED_KEY, DEREC_CODE_FFI_BAD_UTF8,
@@ -133,6 +134,7 @@ pub extern "C" fn protect_secret(
 ///
 /// Non-null input pointers must point to the corresponding readable byte ranges.
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
 pub extern "C" fn produce_store_share_request_message(
     channel_id: u64,
     version: u32,
@@ -145,6 +147,13 @@ pub extern "C" fn produce_store_share_request_message(
     description_len: usize,
     shared_key_ptr: *const u8,
     shared_key_len: usize,
+    // `reply_to` is optional: pass `reply_to_len == 0` for "no override"
+    // (the responder will route to the channel's stored peer endpoint).
+    // When set, the bytes must be a protobuf-encoded `TransportProtocol`;
+    // the responder echoes this exchange's response there without
+    // persisting the endpoint.
+    reply_to_ptr: *const u8,
+    reply_to_len: usize,
 ) -> ProduceStoreShareRequestMessageResult {
     let with_err = |error| ProduceStoreShareRequestMessageResult {
         error,
@@ -193,6 +202,11 @@ pub extern "C" fn produce_store_share_request_message(
         }
     };
 
+    let reply_to = match parse_optional_transport_protocol(reply_to_ptr, reply_to_len) {
+        Ok(rt) => rt,
+        Err(e) => return with_err(e),
+    };
+
     match crate::primitives::sharing::request::produce(
         ChannelId(channel_id),
         version,
@@ -201,6 +215,7 @@ pub extern "C" fn produce_store_share_request_message(
         keep_list,
         description,
         &shared_key,
+        reply_to,
     ) {
         Ok(r) => ProduceStoreShareRequestMessageResult {
             error: success(),

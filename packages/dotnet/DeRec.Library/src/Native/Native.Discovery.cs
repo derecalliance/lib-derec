@@ -47,7 +47,9 @@ internal static class Discovery
     internal static extern ProduceGetSecretIdsVersionsRequestMessageResult produce_get_secret_ids_versions_request_message(
         ulong channelId,
         byte[] sharedKey,
-        UIntPtr sharedKeyLen
+        UIntPtr sharedKeyLen,
+        byte[]? replyTo,
+        UIntPtr replyToLen
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]

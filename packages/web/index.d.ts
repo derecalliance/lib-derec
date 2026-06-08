@@ -195,6 +195,15 @@ export declare class DeRecProtocol {
     autoRespondOnFailure?: boolean | null,
 
     unpairAck?: UnpairAck | null,
+
+    /**
+     * When `true`, every outbound channel-mode request stamps
+     * `request.replyTo = ownTransport` so the responder routes its reply
+     * back here even if the channel's stored peer endpoint points
+     * elsewhere (e.g. replicas talking to a helper that was paired with a
+     * sibling replica). Default `false`.
+     */
+    autoReplyTo?: boolean | null,
   );
 
   createContact(channelId?: bigint | null): Promise<ContactMessage>;
@@ -240,6 +249,26 @@ export interface RecoveredSecretBag {
 
 export declare function decodeRecoveredSecretBag(bytes: Uint8Array): RecoveredSecretBag;
 
+/**
+ * Envelope-level helpers that operate on raw `DeRecMessage` bytes without
+ * touching the encrypted inner payload. Useful for primitive-only consumers
+ * that need to set or read the `traceId` correlation token themselves
+ * (`DeRecProtocol` handles trace_id end-to-end automatically).
+ */
+export declare const envelope: {
+  /**
+   * Re-stamp `traceId` on an outbound envelope. Returns the re-encoded
+   * bytes. The encrypted inner message is untouched.
+   */
+  apply_trace_id(envelope_bytes: Uint8Array, trace_id: bigint): Uint8Array;
+
+  /**
+   * Read `traceId` off an inbound envelope. Returns `0n` when unset (the
+   * protobuf default is indistinguishable from an explicit zero).
+   */
+  read_trace_id(envelope_bytes: Uint8Array): bigint;
+};
+
 export declare function restoreFromRecoveredBag(
   channelStore: ChannelStore,
   secretStore: SecretStore,
@@ -262,6 +291,9 @@ export interface DeRecResult {
 
 export interface GetSecretIdsVersionsRequestMessage {
   timestamp?: Timestamp;
+  /** Ephemeral endpoint where the requester wants the response routed.
+   *  Absent means "use the channel's stored peer endpoint". */
+  reply_to?: TransportProtocol;
 }
 
 export interface VersionList {
@@ -370,6 +402,8 @@ export interface GetShareRequestMessage {
   secret_id: bigint;
   version: number;
   timestamp?: Timestamp;
+  /** Ephemeral response endpoint; see `replyTo` semantics. */
+  reply_to?: TransportProtocol;
 }
 
 export interface GetShareResponseMessage {
@@ -406,6 +440,8 @@ export interface StoreShareRequestMessage {
   version_description: string;
   timestamp?: Timestamp;
   secret_id: bigint;
+  /** Ephemeral response endpoint; see `replyTo` semantics. */
+  reply_to?: TransportProtocol;
 }
 
 export interface StoreShareResponseMessage {
@@ -418,6 +454,8 @@ export interface StoreShareResponseMessage {
 export interface UnpairRequestMessage {
   memo: string;
   timestamp?: Timestamp;
+  /** Ephemeral response endpoint; see `replyTo` semantics. */
+  reply_to?: TransportProtocol;
 }
 
 export interface UnpairResponseMessage {
@@ -430,6 +468,8 @@ export interface VerifyShareRequestMessage {
   version: number;
   nonce: bigint;
   timestamp?: Timestamp;
+  /** Ephemeral response endpoint; see `replyTo` semantics. */
+  reply_to?: TransportProtocol;
 }
 
 export interface VerifyShareResponseMessage {
@@ -566,7 +606,16 @@ export interface DeRecError {
 export declare const primitives: {
   discovery: {
     request: {
-      produce(channel_id: bigint, shared_key: Uint8Array): ProduceResult;
+      /**
+       * @param reply_to  Optional ephemeral response endpoint. `null` /
+       *                  `undefined` means "no override" (the responder
+       *                  routes to the channel's stored peer endpoint).
+       */
+      produce(
+        channel_id: bigint,
+        shared_key: Uint8Array,
+        reply_to?: TransportProtocol | null,
+      ): ProduceResult;
       extract(envelope_bytes: Uint8Array, shared_key: Uint8Array): { request: GetSecretIdsVersionsRequestMessage };
     };
     response: {
@@ -666,7 +715,14 @@ export declare const primitives: {
   };
   recovery: {
     request: {
-      produce(channel_id: bigint, secret_id: bigint, version: number, shared_key: Uint8Array): ProduceResult;
+      produce(
+        channel_id: bigint,
+        secret_id: bigint,
+        version: number,
+        shared_key: Uint8Array,
+        /** See `discovery.request.produce.reply_to`. */
+        reply_to?: TransportProtocol | null,
+      ): ProduceResult;
       extract(envelope_bytes: Uint8Array, shared_key: Uint8Array): { request: GetShareRequestMessage };
     };
     response: {
@@ -697,6 +753,8 @@ export declare const primitives: {
         keep_list: number[],
         description: string,
         shared_key: Uint8Array,
+        /** See `discovery.request.produce.reply_to`. */
+        reply_to?: TransportProtocol | null,
       ): ProduceResult;
       extract(envelope_bytes: Uint8Array, shared_key: Uint8Array): { request: StoreShareRequestMessage };
     };
@@ -712,7 +770,13 @@ export declare const primitives: {
   };
   unpairing: {
     request: {
-      produce(channel_id: bigint, memo: string, shared_key: Uint8Array): ProduceResult;
+      produce(
+        channel_id: bigint,
+        memo: string,
+        shared_key: Uint8Array,
+        /** See `discovery.request.produce.reply_to`. */
+        reply_to?: TransportProtocol | null,
+      ): ProduceResult;
       extract(envelope_bytes: Uint8Array, shared_key: Uint8Array): { request: UnpairRequestMessage };
     };
     response: {
@@ -723,7 +787,14 @@ export declare const primitives: {
   };
   verification: {
     request: {
-      produce(channel_id: bigint, secret_id: bigint, version: number, shared_key: Uint8Array): ProduceResult;
+      produce(
+        channel_id: bigint,
+        secret_id: bigint,
+        version: number,
+        shared_key: Uint8Array,
+        /** See `discovery.request.produce.reply_to`. */
+        reply_to?: TransportProtocol | null,
+      ): ProduceResult;
       extract(envelope_bytes: Uint8Array, shared_key: Uint8Array): { request: VerifyShareRequestMessage };
     };
     response: {

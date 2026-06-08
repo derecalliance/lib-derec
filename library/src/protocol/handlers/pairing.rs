@@ -22,15 +22,19 @@ use std::collections::HashMap;
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
 )]
+#[allow(clippy::too_many_arguments)]
 pub(in crate::protocol) async fn handle<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     channel_store: &mut Ch,
     secret_store: &mut Ss,
     message: &MessageBody,
     channel_id: ChannelId,
     pairing_secret: &PairingSecretKeyMaterial,
+    inbound_trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
     match message {
-        MessageBody::PairRequest(request) => on_request(channel_id, request, pairing_secret),
+        MessageBody::PairRequest(request) => {
+            on_request(channel_id, request, pairing_secret, inbound_trace_id)
+        }
         MessageBody::PairResponse(response) => {
             on_response(
                 channel_store,
@@ -102,7 +106,8 @@ pub(in crate::protocol) async fn start<
     #[cfg(feature = "logging")]
     tracing::info!("pairing request sent");
 
-    transport.send(&endpoint, result.envelope).await?;
+    let envelope = super::apply_trace_id(result.envelope, super::fresh_trace_id())?;
+    transport.send(&endpoint, envelope).await?;
 
     Ok(channel_id.0)
 }
@@ -124,6 +129,7 @@ pub(in crate::protocol) async fn accept<
     request: &PairRequestMessage,
     pairing_secret: &PairingSecretKeyMaterial,
     kind: SenderKind,
+    trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
     let comm_info = build_communication_info(communication_info);
     let resp = response::produce(channel_id, request, pairing_secret, comm_info)?;
@@ -157,8 +163,9 @@ pub(in crate::protocol) async fn accept<
         .remove(channel_id, SecretKind::PairingSecret)
         .await?;
 
+    let envelope = super::apply_trace_id(resp.envelope, trace_id)?;
     transport
-        .send(&resp.peer_transport_protocol, resp.envelope)
+        .send(&resp.peer_transport_protocol, envelope)
         .await?;
 
     #[cfg(feature = "logging")]
@@ -175,6 +182,7 @@ pub(in crate::protocol) async fn accept<
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
 )]
+#[allow(clippy::too_many_arguments)]
 pub(in crate::protocol) async fn reject<Ss: DeRecSecretStore, T: DeRecTransport>(
     secret_store: &mut Ss,
     transport: &T,
@@ -183,6 +191,7 @@ pub(in crate::protocol) async fn reject<Ss: DeRecSecretStore, T: DeRecTransport>
     request: &PairRequestMessage,
     status: StatusEnum,
     memo: &str,
+    trace_id: u64,
 ) -> Result<()> {
     let peer_transport_protocol =
         request
@@ -213,6 +222,7 @@ pub(in crate::protocol) async fn reject<Ss: DeRecSecretStore, T: DeRecTransport>
         .channel_id(channel_id)
         .timestamp(timestamp)
         .message_body(MessageBody::PairResponse(response))
+        .trace_id(trace_id)
         .encrypt_pairing(&request.ecies_public_key)?
         .build()?
         .encode_to_vec();
@@ -237,6 +247,7 @@ fn on_request(
     channel_id: ChannelId,
     request: &PairRequestMessage,
     pairing_secret: &PairingSecretKeyMaterial,
+    trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
     let peer_communication_info = extract_communication_info(&request.communication_info);
     let kind = if request.sender_kind == SenderKind::Owner as i32 {
@@ -253,6 +264,7 @@ fn on_request(
         pairing_secret: pairing_secret.clone(),
         kind,
         peer_communication_info,
+        trace_id,
     };
 
     Ok(vec![DeRecEvent::ActionRequired { channel_id, action }])

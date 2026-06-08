@@ -2,7 +2,8 @@
 
 use crate::{primitives::pairing::PairingError, types::SharedKey};
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
-use derec_proto::MessageBody;
+use derec_proto::{DeRecMessage, MessageBody};
+use prost::Message;
 
 mod builder;
 pub use builder::*;
@@ -22,6 +23,34 @@ pub fn extract_inner_message(
     let inner = MessageBody::decode_from_vec(&decrypted).map_err(crate::Error::ProtobufDecode)?;
 
     Ok(inner)
+}
+
+/// Re-stamp the `trace_id` field on an already-produced DeRecMessage envelope.
+///
+/// The envelope's outer layer is plaintext, so this just decodes the
+/// `DeRecMessage` protobuf, overwrites the `trace_id` field, and re-encodes.
+/// The inner encrypted `message` payload is untouched — no crypto work.
+///
+/// Useful for consumers using primitives directly: the `*::request::produce`
+/// functions emit envelopes with `trace_id = 0` (the protobuf default), so
+/// callers who want correlation can produce + then [`apply_trace_id`] to set
+/// their own. The orchestrator (`DeRecProtocol`) already does this
+/// automatically on every outbound request.
+pub fn apply_trace_id(envelope_bytes: &[u8], trace_id: u64) -> Result<Vec<u8>, crate::Error> {
+    let mut envelope =
+        DeRecMessage::decode(envelope_bytes).map_err(crate::Error::ProtobufDecode)?;
+    envelope.trace_id = trace_id;
+    Ok(envelope.encode_to_vec())
+}
+
+/// Read the `trace_id` field off an inbound DeRecMessage envelope without
+/// touching the encrypted inner payload.
+///
+/// Pair with [`apply_trace_id`] for request/response correlation when
+/// driving the protocol through primitives directly.
+pub fn read_trace_id(envelope_bytes: &[u8]) -> Result<u64, crate::Error> {
+    let envelope = DeRecMessage::decode(envelope_bytes).map_err(crate::Error::ProtobufDecode)?;
+    Ok(envelope.trace_id)
 }
 
 pub fn extract_inner_pairing_message(

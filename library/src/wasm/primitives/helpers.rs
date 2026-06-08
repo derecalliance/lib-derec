@@ -25,3 +25,16 @@ pub(crate) fn from_js<T: serde::de::DeserializeOwned>(value: JsValue) -> Result<
     serde_wasm_bindgen::from_value(value)
         .map_err(|e| js_error("WASM_DESERIALIZE_ERROR", e.to_string()))
 }
+
+/// Parse an optional `TransportProtocol` from a JS value. `null` and
+/// `undefined` both deserialize to `None` — the convention used by every
+/// `produce_*_request` wrapper for `reply_to`.
+pub(crate) fn parse_optional_transport_protocol(
+    value: JsValue,
+) -> Result<Option<derec_proto::TransportProtocol>, JsValue> {
+    if value.is_null() || value.is_undefined() {
+        return Ok(None);
+    }
+    let rt: crate::wasm::primitives::pairing::TransportProtocol = from_js(value)?;
+    Ok(Some(rt.into()))
+}

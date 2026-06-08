@@ -97,7 +97,7 @@ fn test_produce_discovery_request_returns_non_empty_envelope() {
     let shared_key = make_shared_key(1);
 
     let ProduceRequestResult { envelope } =
-        produce_discovery_request(channel_id, &shared_key).expect("produce should succeed");
+        produce_discovery_request(channel_id, &shared_key, None).expect("produce should succeed");
 
     assert!(!envelope.is_empty());
 }
@@ -108,7 +108,7 @@ fn test_produce_extract_discovery_request_roundtrip() {
     let shared_key = make_shared_key(1);
 
     let ProduceRequestResult { envelope } =
-        produce_discovery_request(channel_id, &shared_key).expect("produce should succeed");
+        produce_discovery_request(channel_id, &shared_key, None).expect("produce should succeed");
 
     let ExtractRequestResult { request } =
         extract_discovery_request(&envelope, &shared_key).expect("extract should succeed");
@@ -123,7 +123,7 @@ fn test_extract_discovery_request_wrong_key_fails() {
     let wrong_key = make_shared_key(2);
 
     let ProduceRequestResult { envelope } =
-        produce_discovery_request(channel_id, &shared_key).expect("produce should succeed");
+        produce_discovery_request(channel_id, &shared_key, None).expect("produce should succeed");
 
     let result = extract_discovery_request(&envelope, &wrong_key);
 
@@ -152,6 +152,7 @@ fn test_extract_discovery_request_mismatched_timestamp_fails() {
 
     let message = GetSecretIdsVersionsRequestMessage {
         timestamp: Some(message_timestamp),
+        reply_to: None,
     };
 
     let envelope = DeRecMessageBuilder::channel()
@@ -181,6 +182,7 @@ fn test_extract_discovery_request_wrong_message_type_fails() {
         secret_id: 1,
         version: 1,
         timestamp: Some(timestamp),
+        reply_to: None,
     };
 
     let envelope = DeRecMessageBuilder::channel()
@@ -417,7 +419,7 @@ fn test_full_discovery_roundtrip() {
     // Owner → Helper: produce discovery request
     let ProduceRequestResult {
         envelope: request_envelope,
-    } = produce_discovery_request(channel_id, &shared_key).expect("produce request should succeed");
+    } = produce_discovery_request(channel_id, &shared_key, None).expect("produce request should succeed");
 
     // Helper: extract discovery request
     let ExtractRequestResult { request } =

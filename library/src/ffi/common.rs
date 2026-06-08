@@ -108,3 +108,36 @@ pub(crate) fn read_len_prefixed_vec(input: &mut &[u8]) -> Result<Vec<u8>, String
     let bytes = read_exact(input, len)?;
     Ok(bytes.to_vec())
 }
+
+/// Decode an optional `TransportProtocol` (proto-encoded) from raw FFI bytes.
+///
+/// `len == 0` (or a null pointer with zero length) signals "absent", which
+/// is how request bodies express `reply_to: None`. A non-zero length plus
+/// null pointer is treated as an error. Used by the FFI `produce_*_request`
+/// surfaces to thread `reply_to` into the corresponding primitive.
+pub(crate) fn parse_optional_transport_protocol(
+    ptr: *const u8,
+    len: usize,
+) -> Result<Option<derec_proto::TransportProtocol>, crate::ffi::error::DeRecError> {
+    use crate::ffi::error::{DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_NULL_PTR, ffi_error};
+    use prost::Message as _;
+
+    if len == 0 {
+        return Ok(None);
+    }
+    if ptr.is_null() {
+        return Err(ffi_error(
+            DEREC_CODE_FFI_NULL_PTR,
+            "reply_to_ptr is null but reply_to_len is non-zero",
+        ));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    derec_proto::TransportProtocol::decode(bytes)
+        .map(Some)
+        .map_err(|e| {
+            ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                format!("failed to decode reply_to TransportProtocol: {e}"),
+            )
+        })
+}

@@ -21,7 +21,8 @@
 //! calls to [`extract_get_share_response`].
 
 use crate::ffi::common::{
-    DeRecBuffer, empty_buffer, read_len_prefixed_vec, read_u32_le, vec_into_buffer,
+    DeRecBuffer, empty_buffer, parse_optional_transport_protocol, read_len_prefixed_vec,
+    read_u32_le, vec_into_buffer,
 };
 use crate::ffi::error::{
     DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_BAD_SHARED_KEY, DEREC_CODE_FFI_NULL_PTR, DeRecError,
@@ -78,6 +79,10 @@ pub extern "C" fn produce_get_share_request_message(
     version: u32,
     shared_key_ptr: *const u8,
     shared_key_len: usize,
+    // See `produce_store_share_request_message` for the `reply_to`
+    // semantics — `reply_to_len == 0` means "no override".
+    reply_to_ptr: *const u8,
+    reply_to_len: usize,
 ) -> ProduceGetShareRequestMessageResult {
     let with_err = |error| ProduceGetShareRequestMessageResult {
         error,
@@ -89,11 +94,17 @@ pub extern "C" fn produce_get_share_request_message(
         Err(e) => return with_err(e),
     };
 
+    let reply_to = match parse_optional_transport_protocol(reply_to_ptr, reply_to_len) {
+        Ok(rt) => rt,
+        Err(e) => return with_err(e),
+    };
+
     match crate::primitives::recovery::request::produce(
         channel_id.into(),
         secret_id,
         version,
         &shared_key,
+        reply_to,
     ) {
         Ok(r) => ProduceGetShareRequestMessageResult {
             error: success(),

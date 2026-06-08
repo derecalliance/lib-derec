@@ -4,7 +4,8 @@ use crate::{
     primitives::discovery::request,
     wasm::{
         primitives::{
-            helpers::{parse_shared_key, to_js},
+            helpers::{parse_optional_transport_protocol, parse_shared_key, to_js},
+            pairing::TransportProtocol,
             types::Timestamp,
         },
         ts_bindings_utils::js_error_from_lib,
@@ -16,12 +17,16 @@ use wasm_bindgen::prelude::*;
 #[derive(Serialize, Deserialize)]
 pub struct GetSecretIdsVersionsRequestMessage {
     pub timestamp: Option<Timestamp>,
+    /// Optional ephemeral response endpoint. See `replyTo` on the request
+    /// proto for the routing semantics.
+    pub reply_to: Option<TransportProtocol>,
 }
 
 impl From<derec_proto::GetSecretIdsVersionsRequestMessage> for GetSecretIdsVersionsRequestMessage {
     fn from(value: derec_proto::GetSecretIdsVersionsRequestMessage) -> Self {
         Self {
             timestamp: value.timestamp.map(Into::into),
+            reply_to: value.reply_to.map(Into::into),
         }
     }
 }
@@ -38,9 +43,16 @@ pub struct ExtractResult {
 }
 
 #[wasm_bindgen(js_name = "discovery_request_produce")]
-pub fn produce(channel_id: u64, shared_key: &[u8]) -> Result<JsValue, JsValue> {
+pub fn produce(
+    channel_id: u64,
+    shared_key: &[u8],
+    // Optional `TransportProtocol`. Pass null/undefined for no override.
+    reply_to: JsValue,
+) -> Result<JsValue, JsValue> {
     let shared_key = parse_shared_key(shared_key)?;
-    let result = request::produce(channel_id.into(), &shared_key).map_err(js_error_from_lib)?;
+    let reply_to_proto = parse_optional_transport_protocol(reply_to)?;
+    let result = request::produce(channel_id.into(), &shared_key, reply_to_proto)
+        .map_err(js_error_from_lib)?;
     to_js(&ProduceResult {
         envelope: result.envelope,
     })

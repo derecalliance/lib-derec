@@ -8,7 +8,9 @@
 use std::ffi::CString;
 use std::os::raw::c_char;
 
-use crate::ffi::common::{DeRecBuffer, empty_buffer, vec_into_buffer};
+use crate::ffi::common::{
+    DeRecBuffer, empty_buffer, parse_optional_transport_protocol, vec_into_buffer,
+};
 use crate::ffi::error::{
     DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_BAD_SHARED_KEY, DEREC_CODE_FFI_BAD_UTF8,
     DEREC_CODE_FFI_NULL_PTR, DEREC_CODE_FFI_NUL_IN_STRING, DeRecError, ffi_error, from_lib_error,
@@ -61,6 +63,10 @@ pub extern "C" fn produce_unpair_request_message(
     memo_len: usize,
     shared_key_ptr: *const u8,
     shared_key_len: usize,
+    // See `produce_store_share_request_message` in `sharing.rs` for the
+    // `reply_to` semantics — `reply_to_len == 0` means "no override".
+    reply_to_ptr: *const u8,
+    reply_to_len: usize,
 ) -> ProduceUnpairRequestMessageResult {
     let with_err = |error| ProduceUnpairRequestMessageResult {
         error,
@@ -85,7 +91,17 @@ pub extern "C" fn produce_unpair_request_message(
         Err(e) => return with_err(e),
     };
 
-    match crate::primitives::unpairing::request::produce(channel_id.into(), memo, &shared_key) {
+    let reply_to = match parse_optional_transport_protocol(reply_to_ptr, reply_to_len) {
+        Ok(rt) => rt,
+        Err(e) => return with_err(e),
+    };
+
+    match crate::primitives::unpairing::request::produce(
+        channel_id.into(),
+        memo,
+        &shared_key,
+        reply_to,
+    ) {
         Ok(r) => ProduceUnpairRequestMessageResult {
             error: success(),
             request_wire_bytes: vec_into_buffer(r.envelope),

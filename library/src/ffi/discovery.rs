@@ -24,8 +24,8 @@
 //! ```
 
 use crate::ffi::common::{
-    DeRecBuffer, empty_buffer, read_exact, read_u32_le, vec_into_buffer, write_u32_le,
-    write_u64_le,
+    DeRecBuffer, empty_buffer, parse_optional_transport_protocol, read_exact, read_u32_le,
+    vec_into_buffer, write_u32_le, write_u64_le,
 };
 use crate::ffi::error::{
     DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_BAD_SHARED_KEY, DEREC_CODE_FFI_NULL_PTR, DeRecError,
@@ -77,6 +77,10 @@ pub extern "C" fn produce_get_secret_ids_versions_request_message(
     channel_id: u64,
     shared_key_ptr: *const u8,
     shared_key_len: usize,
+    // See `produce_store_share_request_message` for the `reply_to`
+    // semantics — `reply_to_len == 0` means "no override".
+    reply_to_ptr: *const u8,
+    reply_to_len: usize,
 ) -> ProduceGetSecretIdsVersionsRequestMessageResult {
     let with_err = |error| ProduceGetSecretIdsVersionsRequestMessageResult {
         error,
@@ -88,7 +92,12 @@ pub extern "C" fn produce_get_secret_ids_versions_request_message(
         Err(e) => return with_err(e),
     };
 
-    match crate::primitives::discovery::request::produce(channel_id.into(), &shared_key) {
+    let reply_to = match parse_optional_transport_protocol(reply_to_ptr, reply_to_len) {
+        Ok(rt) => rt,
+        Err(e) => return with_err(e),
+    };
+
+    match crate::primitives::discovery::request::produce(channel_id.into(), &shared_key, reply_to) {
         Ok(r) => ProduceGetSecretIdsVersionsRequestMessageResult {
             error: success(),
             envelope_wire_bytes: vec_into_buffer(r.envelope),

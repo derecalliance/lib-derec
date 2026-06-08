@@ -70,7 +70,7 @@ pub struct ExtractResult {
 /// let channel_id = ChannelId(42);
 /// let shared_key = [7u8; 32];
 ///
-/// let result = request::produce(channel_id, &shared_key)
+/// let result = request::produce(channel_id, &shared_key, None)
 ///     .expect("failed to build discovery request");
 ///
 /// assert!(!result.envelope.is_empty());
@@ -82,11 +82,13 @@ pub struct ExtractResult {
 pub fn produce(
     channel_id: ChannelId,
     shared_key: &SharedKey,
+    reply_to: Option<derec_proto::TransportProtocol>,
 ) -> Result<ProduceResult, crate::Error> {
     let timestamp = current_timestamp();
 
     let message = GetSecretIdsVersionsRequestMessage {
         timestamp: Some(timestamp),
+        reply_to,
     };
 
     let envelope = DeRecMessageBuilder::channel()

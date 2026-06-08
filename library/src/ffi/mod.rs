@@ -2,6 +2,7 @@
 
 pub mod common;
 pub mod discovery;
+pub mod envelope;
 pub mod error;
 pub mod pairing;
 pub mod protocol_version;

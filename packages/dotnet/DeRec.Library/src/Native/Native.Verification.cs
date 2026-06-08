@@ -52,7 +52,9 @@ internal static class Verification
         ulong secretId,
         uint version,
         byte[] sharedKey,
-        UIntPtr sharedKeyLen
+        UIntPtr sharedKeyLen,
+        byte[]? replyTo,
+        UIntPtr replyToLen
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]

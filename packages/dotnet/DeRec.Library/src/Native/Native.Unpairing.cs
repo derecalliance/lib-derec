@@ -50,7 +50,9 @@ internal static class Unpairing
         byte[] memoBytes,
         UIntPtr memoBytesLen,
         byte[] sharedKey,
-        UIntPtr sharedKeyLen
+        UIntPtr sharedKeyLen,
+        byte[]? replyTo,
+        UIntPtr replyToLen
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]

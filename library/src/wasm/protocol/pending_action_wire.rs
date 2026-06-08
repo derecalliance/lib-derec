@@ -8,6 +8,7 @@
 //! Wire format:
 //! - 1 byte: discriminant (0..6)
 //! - 8 bytes: channel_id (big-endian u64)
+//! - 8 bytes: trace_id (u64 BE) — echoed verbatim on the response
 //! - For Pairing:
 //!   - 4 bytes: my_kind (i32 BE)
 //!   - 4 bytes: request_len (u32 BE)
@@ -15,7 +16,6 @@
 //!   - remaining: serialized PairingSecretKeyMaterial
 //! - For channel message types (StoreShare, VerifyShare, Discovery,
 //!   GetShare, Unpair, UpdateChannelInfo):
-//!   - 8 bytes: trace_id (u64 BE) — echoed verbatim on the response
 //!   - 32 bytes: shared_key
 //!   - remaining: protobuf-encoded request message
 
@@ -47,10 +47,12 @@ pub fn serialize(action: PendingAction) -> Result<Vec<u8>, String> {
             request,
             pairing_secret,
             kind,
+            trace_id,
             ..
         } => {
             buf.push(TAG_PAIRING);
             buf.extend_from_slice(&channel_id.0.to_be_bytes());
+            buf.extend_from_slice(&trace_id.to_be_bytes());
             buf.extend_from_slice(&(kind as i32).to_be_bytes());
             let request_bytes = request.encode_to_vec();
             buf.extend_from_slice(&(request_bytes.len() as u32).to_be_bytes());
@@ -157,12 +159,13 @@ pub fn deserialize(bytes: &[u8]) -> Result<PendingAction, String> {
 
     match tag {
         TAG_PAIRING => {
-            if rest.len() < 8 {
+            if rest.len() < 16 {
                 return Err("pairing action bytes too short".to_owned());
             }
-            let kind_i32 = i32::from_be_bytes(rest[..4].try_into().unwrap());
-            let request_len = u32::from_be_bytes(rest[4..8].try_into().unwrap()) as usize;
-            let rest = &rest[8..];
+            let trace_id = u64::from_be_bytes(rest[..8].try_into().unwrap());
+            let kind_i32 = i32::from_be_bytes(rest[8..12].try_into().unwrap());
+            let request_len = u32::from_be_bytes(rest[12..16].try_into().unwrap()) as usize;
+            let rest = &rest[16..];
             if rest.len() < request_len {
                 return Err("pairing action bytes truncated (request)".to_owned());
             }
@@ -181,6 +184,7 @@ pub fn deserialize(bytes: &[u8]) -> Result<PendingAction, String> {
                 pairing_secret,
                 kind,
                 peer_communication_info: std::collections::HashMap::new(),
+                trace_id,
             })
         }
         TAG_STORE_SHARE => {

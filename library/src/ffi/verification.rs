@@ -5,7 +5,9 @@
 //! Protocol semantics live in `library/src/primitives/verification/`. Items
 //! below describe only the FFI surface.
 
-use crate::ffi::common::{DeRecBuffer, empty_buffer, vec_into_buffer};
+use crate::ffi::common::{
+    DeRecBuffer, empty_buffer, parse_optional_transport_protocol, vec_into_buffer,
+};
 use crate::ffi::error::{
     DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_BAD_SHARED_KEY, DEREC_CODE_FFI_NULL_PTR, DeRecError,
     ffi_error, from_lib_error, success,
@@ -61,6 +63,10 @@ pub extern "C" fn produce_verify_share_request_message(
     version: u32,
     shared_key_ptr: *const u8,
     shared_key_len: usize,
+    // See `produce_store_share_request_message` for the `reply_to`
+    // semantics — `reply_to_len == 0` means "no override".
+    reply_to_ptr: *const u8,
+    reply_to_len: usize,
 ) -> ProduceVerifyShareRequestMessageResult {
     let with_err = |error| ProduceVerifyShareRequestMessageResult {
         error,
@@ -72,11 +78,17 @@ pub extern "C" fn produce_verify_share_request_message(
         Err(e) => return with_err(e),
     };
 
+    let reply_to = match parse_optional_transport_protocol(reply_to_ptr, reply_to_len) {
+        Ok(rt) => rt,
+        Err(e) => return with_err(e),
+    };
+
     match crate::primitives::verification::request::produce(
         channel_id.into(),
         secret_id,
         version,
         &shared_key,
+        reply_to,
     ) {
         Ok(r) => ProduceVerifyShareRequestMessageResult {
             error: success(),

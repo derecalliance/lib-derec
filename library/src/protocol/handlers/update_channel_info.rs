@@ -91,6 +91,7 @@ pub(in crate::protocol) async fn start<
             .channel_id(channel_id)
             .timestamp(timestamp)
             .message_body(MessageBody::UpdateChannelInfoRequest(request))
+            .auto_trace_id()
             .encrypt(&shared_key)?
             .build()?
             .encode_to_vec();

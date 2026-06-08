@@ -152,6 +152,11 @@ impl DeRecProtocolWasm {
         // `"not_required"` is fire-and-forget — state is dropped immediately
         // on `start(Unpair)` and any later response is ignored.
         unpair_ack: Option<String>,
+        // `auto_reply_to`: when true, every outbound channel-mode request
+        // stamps `request.replyTo = this.own_transport`. Default `false`.
+        // See `DeRecProtocolBuilder::with_auto_reply_to` for the routing
+        // semantics on the responder side.
+        auto_reply_to: Option<bool>,
     ) -> Result<DeRecProtocolWasm, JsValue> {
         let protocol_num = match own_transport_protocol.to_lowercase().as_str() {
             "https" => 0i32,
@@ -199,6 +204,7 @@ impl DeRecProtocolWasm {
             .with_timeout(Duration::from_secs(timeout_in_secs.map_or(300, u64::from)))
             .with_auto_respond_on_failure(auto_respond_on_failure.unwrap_or(false))
             .with_unpair_ack(unpair_ack_value)
+            .with_auto_reply_to(auto_reply_to.unwrap_or(false))
             .build();
         Ok(DeRecProtocolWasm { inner })
     }

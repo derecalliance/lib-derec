@@ -54,6 +54,7 @@ fn make_request_with_mutated_share(
         version_description: String::new(),
         timestamp: Some(timestamp),
         secret_id,
+        reply_to: None,
     }
 }
 
@@ -210,6 +211,7 @@ fn test_produce_store_share_request_message_valid() {
         &[],
         "",
         &shared_key,
+        None,
     )
     .expect("produce_store_share_request_message should succeed");
 
@@ -244,6 +246,7 @@ fn test_produce_store_share_request_message_with_keep_list_and_description() {
         &[1, 2],
         "initial share distribution",
         &shared_key,
+        None,
     )
     .expect("produce_store_share_request_message should succeed");
 
@@ -280,6 +283,7 @@ fn test_produce_store_share_response_message_valid() {
         &[],
         "",
         &shared_key,
+        None,
     )
     .expect("produce_store_share_request_message should succeed");
 
@@ -353,6 +357,7 @@ fn test_extract_store_share_request_wrong_key() {
         &[],
         "",
         &shared_key,
+        None,
     )
     .expect("produce_store_share_request_message should succeed");
 
@@ -425,6 +430,7 @@ fn test_process_store_share_response_message_valid() {
         &[],
         "",
         &shared_key,
+        None,
     )
     .expect("produce_store_share_request_message should succeed");
 
@@ -473,6 +479,7 @@ fn test_process_store_share_response_message_wrong_version() {
         &[],
         "",
         &shared_key,
+        None,
     )
     .expect("produce_store_share_request_message should succeed");
 
@@ -523,6 +530,7 @@ fn test_extract_store_share_response_wrong_key() {
         &[],
         "",
         &shared_key,
+        None,
     )
     .expect("produce_store_share_request_message should succeed");
 

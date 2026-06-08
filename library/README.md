@@ -190,6 +190,7 @@ setters have defaults:
 | `with_communication_info(map)` | empty | Key-value identity metadata embedded in pairing messages. |
 | `with_auto_respond_on_failure(bool)` | `false` | If `true`, the protocol replies to the peer on inbound processing failures; if `false`, errors only surface as events. |
 | `with_unpair_ack(ack)` | `UnpairAck::Required` | Whether the unpair initiator waits for the peer's `Ok` before dropping local state. |
+| `with_auto_reply_to(bool)` | `false` | If `true`, every outbound request stamps `replyTo = own_transport` so the responder routes the reply back to this node — even if the channel's stored peer endpoint points elsewhere. Useful for replica scenarios. See [Correlation and routing on the wire](#correlation-and-routing-on-the-wire). |
 
 See the [builder rustdoc](https://docs.rs/derec-library/latest/derec_library/protocol/struct.DeRecProtocolBuilder.html)
 for the full per-setter contract.
@@ -250,6 +251,70 @@ A mismatch surfaces as `Error::RoleMismatch { channel_id, expected, actual }`.
 | Recovery | Re-pair, collect shares, reconstruct the secret. |
 | Unpairing | Tear down a paired channel and drop local state. |
 | Update channel info | Propagate post-pairing changes to communication info and/or transport endpoint. |
+
+---
+
+## Correlation and routing on the wire
+
+Two metadata fields cut across every channel-mode exchange:
+
+### `traceId` — request/response correlation
+
+`DeRecMessage.traceId` is an opaque `uint64` correlation token on the
+**plaintext outer envelope**. The requester sets it; the responder echoes it
+verbatim. The orchestrator (`DeRecProtocol`) handles both sides
+automatically — every outbound request gets a fresh random token via
+[`fresh_trace_id`](https://docs.rs/derec-library/latest/derec_library/protocol/handlers/fn.fresh_trace_id.html);
+every response is stamped with the inbound trace id via
+[`apply_trace_id`](https://docs.rs/derec-library/latest/derec_library/derec_message/fn.apply_trace_id.html).
+
+Consumers driving the protocol through **primitives** (not the
+orchestrator) get `trace_id = 0` (the protobuf default) by default and can
+opt in manually using the envelope helpers:
+
+```rust
+use derec_library::derec_message::{apply_trace_id, read_trace_id};
+
+let outbound = apply_trace_id(&envelope_bytes, my_token)?;
+// …send outbound…
+
+let inbound_token = read_trace_id(&response_bytes)?;
+// match `inbound_token` against `my_token` to correlate
+```
+
+The same helpers are surfaced as `envelope.apply_trace_id` /
+`envelope.read_trace_id` on the nodejs/web packages and as
+`apply_trace_id_to_envelope` / `read_trace_id_from_envelope` on the FFI
+(plus a `Envelope.ApplyTraceId` / `Envelope.ReadTraceId` static class on
+the dotnet package). The encrypted inner message is never touched, so
+re-stamping has no crypto cost.
+
+### `replyTo` — ephemeral response routing
+
+`replyTo` is an optional `TransportProtocol` on **request bodies**
+(`StoreShareRequest`, `VerifyShareRequest`, `GetSecretIdsVersionsRequest`,
+`GetShareRequest`, `UnpairRequest`). It tells the responder to route this
+exchange's response to an alternate endpoint — without persisting it (use
+`UpdateChannelInfo` for a permanent change).
+
+The motivating case is replicas: when Replica A sends a request on a
+channel the helper paired with sibling Replica B, the helper's stored peer
+endpoint points at B. `replyTo` lets A say "send the response back to me,"
+without rewriting channel state.
+
+Two ways to set it:
+
+- **Per call (primitives):** every `*::request::produce` takes a trailing
+  `reply_to: Option<TransportProtocol>` parameter.
+- **Protocol-wide:** `DeRecProtocolBuilder::with_auto_reply_to(true)` makes
+  the orchestrator stamp `replyTo = own_transport` on every outbound
+  request automatically.
+
+The responder honours an inbound `replyTo` regardless of how it was set —
+the flag only governs **outbound** population. `PairRequest`,
+`PrePairRequest`, and `UpdateChannelInfoRequest` are intentionally
+excluded: each already carries its own `transportProtocol` field serving
+the same role.
 
 ---
 

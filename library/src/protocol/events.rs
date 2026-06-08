@@ -26,6 +26,10 @@ pub enum PendingAction {
         pairing_secret: PairingSecretKeyMaterial,
         kind: SenderKind,
         peer_communication_info: HashMap<String, String>,
+        /// Trace id read from the inbound `PairRequest` envelope. Echoed
+        /// verbatim on the `PairResponse` envelope when the application
+        /// calls `accept` or `reject`; see `DeRecMessage.traceId`.
+        trace_id: u64,
     },
     StoreShare {
         channel_id: ChannelId,

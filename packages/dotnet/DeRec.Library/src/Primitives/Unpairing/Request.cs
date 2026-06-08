@@ -15,9 +15,11 @@ public static partial class Unpairing
             public required string Memo { get; init; }
         }
 
-        public static DeRecMessage Produce(ulong channelId, string memo, byte[] sharedKey)
+        public static DeRecMessage Produce(ulong channelId, string memo, byte[] sharedKey, TransportProtocol? replyTo = null)
         {
             byte[] memoBytes = System.Text.Encoding.UTF8.GetBytes(memo ?? string.Empty);
+            byte[]? replyToBytes = replyTo?.ToProtoBytes();
+            UIntPtr replyToLen = replyToBytes is null ? UIntPtr.Zero : (UIntPtr)replyToBytes.Length;
 
             Native.Unpairing.ProduceUnpairRequestMessageResult nativeResult =
                 Native.Unpairing.produce_unpair_request_message(
@@ -25,7 +27,9 @@ public static partial class Unpairing
                     memoBytes,
                     (UIntPtr)memoBytes.Length,
                     sharedKey,
-                    (UIntPtr)sharedKey.Length
+                    (UIntPtr)sharedKey.Length,
+                    replyToBytes,
+                    replyToLen
                 );
 
             try

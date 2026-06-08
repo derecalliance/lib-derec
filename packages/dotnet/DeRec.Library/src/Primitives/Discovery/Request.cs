@@ -13,13 +13,18 @@ public static partial class Discovery
             public required ulong ChannelId { get; init; }
         }
 
-        public static DeRecMessage Produce(ulong channelId, byte[] sharedKey)
+        public static DeRecMessage Produce(ulong channelId, byte[] sharedKey, TransportProtocol? replyTo = null)
         {
+            byte[]? replyToBytes = replyTo?.ToProtoBytes();
+            UIntPtr replyToLen = replyToBytes is null ? UIntPtr.Zero : (UIntPtr)replyToBytes.Length;
+
             Native.Discovery.ProduceGetSecretIdsVersionsRequestMessageResult nativeResult =
                 Native.Discovery.produce_get_secret_ids_versions_request_message(
                     channelId,
                     sharedKey,
-                    (UIntPtr)sharedKey.Length
+                    (UIntPtr)sharedKey.Length,
+                    replyToBytes,
+                    replyToLen
                 );
 
             try

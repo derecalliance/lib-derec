@@ -4,7 +4,6 @@ use super::super::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport,
     MissingPolicy, PendingAction, PendingRecovery, SecretKind, SecretValue,
 };
-use super::peer_endpoint;
 use crate::{
     Error, Result,
     derec_message::current_timestamp,
@@ -45,6 +44,7 @@ pub(in crate::protocol) fn handle(
     feature = "logging",
     tracing::instrument(skip_all, fields(secret_id = secret_id, version = version))
 )]
+#[allow(clippy::too_many_arguments)]
 pub(in crate::protocol) async fn start<
     Ch: DeRecChannelStore,
     Ss: DeRecSecretStore,
@@ -56,6 +56,7 @@ pub(in crate::protocol) async fn start<
     pending_recovery: &mut PendingRecovery,
     secret_id: u64,
     version: u32,
+    reply_to: Option<derec_proto::TransportProtocol>,
 ) -> Result<()> {
     pending_recovery.insert((secret_id, version), Vec::new());
 
@@ -76,8 +77,10 @@ pub(in crate::protocol) async fn start<
             .remove(&channel.id)
             .expect("load_many(MissingPolicy::Fail) guarantees an entry per id");
 
-        let msg = request::produce(channel.id, secret_id, version, &shared_key)?;
-        transport.send(&channel.transport, msg.envelope).await?;
+        let msg =
+            request::produce(channel.id, secret_id, version, &shared_key, reply_to.clone())?;
+        let envelope = super::apply_trace_id(msg.envelope, super::fresh_trace_id())?;
+        transport.send(&channel.transport, envelope).await?;
 
         #[cfg(feature = "logging")]
         tracing::debug!(
@@ -138,7 +141,9 @@ pub(in crate::protocol) async fn accept<
     let resp = response::produce(channel_id, request, &stored, shared_key)?;
 
     let envelope = super::apply_trace_id(resp.envelope, trace_id)?;
-    let endpoint = peer_endpoint(channel_store, channel_id).await?;
+    let endpoint =
+        super::resolve_response_endpoint(channel_store, channel_id, request.reply_to.as_ref())
+            .await?;
     transport.send(&endpoint, envelope).await?;
 
     #[cfg(feature = "logging")]
@@ -192,6 +197,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
         MessageBody::GetShareResponse(response),
         shared_key,
         trace_id,
+        request.reply_to.as_ref(),
     )
     .await
 }

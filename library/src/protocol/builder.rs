@@ -54,6 +54,7 @@ pub struct DeRecProtocolBuilder<ChannelStore, ShareStore, SecretStore, Transport
     communication_info: HashMap<String, String>,
     auto_respond_on_failure: bool,
     unpair_ack: UnpairAck,
+    auto_reply_to: bool,
 }
 
 impl
@@ -79,6 +80,7 @@ impl
             communication_info: HashMap::new(),
             auto_respond_on_failure: false,
             unpair_ack: UnpairAck::Required,
+            auto_reply_to: false,
         }
     }
 }
@@ -165,6 +167,31 @@ impl<ChannelStore, ShareStore, SecretStore, Transport, OwnTransport>
         self.unpair_ack = ack;
         self
     }
+
+    /// Whether outbound requests carry an ephemeral `replyTo` set to this
+    /// node's own transport endpoint.
+    ///
+    /// - `true`: every outbound request envelope stamps
+    ///   `request.replyTo = own_transport`. The responder routes its
+    ///   response to that endpoint, ignoring the channel's stored peer
+    ///   endpoint. Useful when two peers share a channel record but reach
+    ///   out from different endpoints (e.g. replicas talking to a helper
+    ///   that was paired with a sibling replica) — without this, the
+    ///   responder would reply to the sibling.
+    /// - `false`: outbound requests leave `replyTo` unset. The responder
+    ///   routes to the channel's stored endpoint, which is correct for the
+    ///   single-device case.
+    ///
+    /// Only affects outbound requests originated through
+    /// [`DeRecProtocol::start`]. Responders always honour an inbound
+    /// `replyTo` regardless of this flag (it is purely a per-request hint
+    /// on the wire).
+    ///
+    /// Default: `false`.
+    pub fn with_auto_reply_to(mut self, enabled: bool) -> Self {
+        self.auto_reply_to = enabled;
+        self
+    }
 }
 
 impl<ShareStore, SecretStore, Transport, OwnTransport>
@@ -194,6 +221,7 @@ impl<ShareStore, SecretStore, Transport, OwnTransport>
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
+            auto_reply_to: self.auto_reply_to,
         }
     }
 }
@@ -231,6 +259,7 @@ impl<ChannelStore, SecretStore, Transport, OwnTransport>
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
+            auto_reply_to: self.auto_reply_to,
         }
     }
 }
@@ -268,6 +297,7 @@ impl<ChannelStore, ShareStore, Transport, OwnTransport>
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
+            auto_reply_to: self.auto_reply_to,
         }
     }
 }
@@ -305,6 +335,7 @@ impl<ChannelStore, ShareStore, SecretStore, OwnTransport>
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
+            auto_reply_to: self.auto_reply_to,
         }
     }
 }
@@ -338,6 +369,7 @@ impl<ChannelStore, ShareStore, SecretStore, Transport>
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
+            auto_reply_to: self.auto_reply_to,
         }
     }
 }
@@ -370,6 +402,7 @@ impl<Cs: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, Tr: DeRec
         protocol.communication_info = self.communication_info;
         protocol.auto_respond_on_failure = self.auto_respond_on_failure;
         protocol.unpair_ack = self.unpair_ack;
+        protocol.auto_reply_to = self.auto_reply_to;
         protocol
     }
 }

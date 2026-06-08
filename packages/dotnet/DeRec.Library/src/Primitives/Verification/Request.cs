@@ -22,16 +22,22 @@ public static partial class Verification
             ulong channelId,
             ulong secretId,
             uint version,
-            byte[] sharedKey
+            byte[] sharedKey,
+            TransportProtocol? replyTo = null
         )
         {
+            byte[]? replyToBytes = replyTo?.ToProtoBytes();
+            UIntPtr replyToLen = replyToBytes is null ? UIntPtr.Zero : (UIntPtr)replyToBytes.Length;
+
             Native.Verification.ProduceVerifyShareRequestMessageResult nativeResult =
                 Native.Verification.produce_verify_share_request_message(
                     channelId,
                     secretId,
                     version,
                     sharedKey,
-                    (UIntPtr)sharedKey.Length
+                    (UIntPtr)sharedKey.Length,
+                    replyToBytes,
+                    replyToLen
                 );
 
             try

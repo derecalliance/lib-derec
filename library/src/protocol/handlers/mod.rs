@@ -87,21 +87,42 @@ pub(super) async fn peer_endpoint<Ch: DeRecChannelStore>(
         .ok_or(Error::InvalidInput("no transport endpoint for channel"))
 }
 
-/// Re-stamp a primitive-produced wire envelope with `trace_id`.
+/// Pick the endpoint to deliver a response to.
 ///
-/// The pairing/sharing/verification/discovery/recovery/unpairing primitives
-/// build their response envelopes via [`DeRecMessageBuilder`] but don't echo
-/// the inbound `traceId` — that's the orchestrator's job (see the field doc
-/// on `DeRecMessage.traceId`). This helper decodes the outer envelope (which
-/// is plaintext), overwrites `trace_id`, and re-encodes. The encrypted inner
-/// `message` field is left untouched, so the cost is one extra proto
-/// round-trip with no crypto work.
+/// If the inbound request carried a `reply_to`, the responder routes there
+/// (ephemeral, this exchange only); otherwise it falls back to the channel's
+/// stored peer endpoint. See `replyTo` on each request proto for the
+/// semantics and the auto-fill switch on the orchestrator
+/// ([`crate::protocol::DeRecProtocolBuilder::with_auto_reply_to`]).
+pub(super) async fn resolve_response_endpoint<Ch: DeRecChannelStore>(
+    channel_store: &mut Ch,
+    channel_id: ChannelId,
+    reply_to: Option<&TransportProtocol>,
+) -> Result<TransportProtocol> {
+    if let Some(endpoint) = reply_to {
+        return Ok(endpoint.clone());
+    }
+    peer_endpoint(channel_store, channel_id).await
+}
+
+/// Draw a fresh correlation token for an outbound request envelope.
+///
+/// Mirrors [`crate::derec_message::DeRecMessageBuilder::auto_trace_id`] but
+/// for the orchestrator-level case where the envelope was built by a
+/// primitive and is then re-stamped via [`apply_trace_id`]. A `0` return is
+/// indistinguishable from "unset", so the chance is 2^-64 of getting a token
+/// that downstream code might interpret as "no correlation requested" — not
+/// worth coding around.
+pub(super) fn fresh_trace_id() -> u64 {
+    use rand::Rng as _;
+    rand::rng().next_u64()
+}
+
+/// Internal wrapper that re-stamps a primitive-produced wire envelope's
+/// `trace_id`. Thin alias for [`crate::derec_message::apply_trace_id`] kept
+/// inside the handlers module so callers can stay terse with `super::`.
 pub(super) fn apply_trace_id(envelope_bytes: Vec<u8>, trace_id: u64) -> Result<Vec<u8>> {
-    let mut envelope = DeRecMessage::decode(envelope_bytes.as_slice()).map_err(|_| {
-        Error::Invariant("primitive produced un-decodable response envelope")
-    })?;
-    envelope.trace_id = trace_id;
-    Ok(envelope.encode_to_vec())
+    crate::derec_message::apply_trace_id(&envelope_bytes, trace_id)
 }
 
 /// Build and dispatch an encrypted channel-mode response envelope.
@@ -111,6 +132,7 @@ pub(super) fn apply_trace_id(envelope_bytes: Vec<u8>, trace_id: u64) -> Result<V
 /// requester can correlate (see the field doc on `DeRecMessage.traceId`). Pass
 /// `0` when there is no inbound to echo from (e.g. unsolicited messages that
 /// don't carry a meaningful correlation handle).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn send_channel_message<Ch: DeRecChannelStore, T: DeRecTransport>(
     channel_store: &mut Ch,
     transport: &T,
@@ -118,6 +140,7 @@ pub(super) async fn send_channel_message<Ch: DeRecChannelStore, T: DeRecTranspor
     body: MessageBody,
     shared_key: &SharedKey,
     inbound_trace_id: u64,
+    reply_to: Option<&TransportProtocol>,
 ) -> Result<()> {
     let envelope = DeRecMessageBuilder::channel()
         .channel_id(channel_id)
@@ -128,7 +151,7 @@ pub(super) async fn send_channel_message<Ch: DeRecChannelStore, T: DeRecTranspor
         .build()?;
 
     let wire_bytes = envelope.encode_to_vec();
-    let endpoint = peer_endpoint(channel_store, channel_id).await?;
+    let endpoint = resolve_response_endpoint(channel_store, channel_id, reply_to).await?;
     transport.send(&endpoint, wire_bytes).await?;
     Ok(())
 }
@@ -213,6 +236,7 @@ pub(in crate::protocol) async fn handle_pairing<Ch: DeRecChannelStore, Ss: DeRec
         &inner,
         channel_id,
         pairing_secret,
+        message.trace_id,
     )
     .await
 }

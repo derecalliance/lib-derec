@@ -19,6 +19,7 @@ internal static class Program
         RunRecoveryFlowTest();
         RunDiscoveryFlowTest();
         RunUnpairingFlowTest();
+        RunEnvelopeAndReplyToTest();
 
         Console.WriteLine("All smoke tests passed.");
     }
@@ -476,5 +477,56 @@ internal static class Program
         var key = new byte[32];
         Array.Fill(key, fill);
         return key;
+    }
+
+    /// <summary>
+    /// Exercises the two cross-cutting envelope features added alongside the
+    /// primitive surface:
+    /// <list type="bullet">
+    ///   <item><description>The optional <c>replyTo</c> parameter on
+    ///   <c>Discovery.Request.Produce</c> (and the other four request types)
+    ///   must accept a <see cref="TransportProtocol"/> without crashing, and
+    ///   the resulting envelope must still extract cleanly.</description></item>
+    ///   <item><description>The <c>Envelope.ApplyTraceId</c> /
+    ///   <c>Envelope.ReadTraceId</c> helpers round-trip the trace_id field
+    ///   on the outer envelope without touching the encrypted inner
+    ///   payload — <c>Extract</c> still succeeds after re-stamping.</description></item>
+    /// </list>
+    /// </summary>
+    private static void RunEnvelopeAndReplyToTest()
+    {
+        Console.WriteLine("=== Envelope + replyTo helpers test ===");
+
+        ulong channelId = 99;
+        byte[] sharedKey = Make32(0x99);
+        var replyTo = new TransportProtocol("https://replica.example.com");
+
+        // Primitive produce defaults to trace_id = 0 and reply_to = null.
+        DeRecMessage envWithout = Discovery.Request.Produce(channelId, sharedKey);
+        if (Envelope.ReadTraceId(envWithout) != 0)
+            throw new InvalidOperationException(
+                "Envelope test failed: primitive-default trace_id must be 0.");
+
+        // Produce again, this time stamping reply_to into the inner body.
+        // The encrypted inner now carries the TransportProtocol; verify the
+        // call accepts replyTo without throwing and the resulting envelope
+        // still extracts cleanly via the channel's shared key.
+        DeRecMessage envWith = Discovery.Request.Produce(channelId, sharedKey, replyTo);
+
+        // Round-trip a trace_id over the envelope with replyTo set.
+        const ulong token = 0xDEADBEEF_F00DCAFEUL;
+        DeRecMessage stamped = Envelope.ApplyTraceId(envWith, token);
+        if (Envelope.ReadTraceId(stamped) != token)
+            throw new InvalidOperationException(
+                "Envelope test failed: trace_id did not round-trip through ApplyTraceId.");
+
+        // The encrypted inner is untouched — Extract still succeeds after
+        // re-stamping, proving the helper only rewrote the outer field.
+        var extracted = Discovery.Request.Extract(stamped, sharedKey);
+        if (extracted.ChannelId != channelId)
+            throw new InvalidOperationException(
+                "Envelope test failed: channel_id mismatch on extract after ApplyTraceId.");
+
+        Console.WriteLine("Envelope + replyTo helpers test passed.");
     }
 }

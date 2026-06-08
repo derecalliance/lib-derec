@@ -5,7 +5,8 @@ use crate::{
     types::ChannelId,
     wasm::{
         primitives::{
-            helpers::{from_js, parse_shared_key, to_js},
+            helpers::{from_js, parse_optional_transport_protocol, parse_shared_key, to_js},
+            pairing::TransportProtocol,
             types::Timestamp,
         },
         ts_bindings_utils::js_error_from_lib,
@@ -80,6 +81,9 @@ pub struct StoreShareRequestMessage {
     pub version_description: String,
     pub timestamp: Option<Timestamp>,
     pub secret_id: u64,
+    /// Optional ephemeral response endpoint. See `replyTo` on the request
+    /// proto for the routing semantics.
+    pub reply_to: Option<TransportProtocol>,
 }
 
 impl From<derec_proto::StoreShareRequestMessage> for StoreShareRequestMessage {
@@ -92,6 +96,7 @@ impl From<derec_proto::StoreShareRequestMessage> for StoreShareRequestMessage {
             version_description: value.version_description,
             timestamp: value.timestamp.map(Into::into),
             secret_id: value.secret_id,
+            reply_to: value.reply_to.map(Into::into),
         }
     }
 }
@@ -106,6 +111,7 @@ impl From<StoreShareRequestMessage> for derec_proto::StoreShareRequestMessage {
             version_description: value.version_description,
             timestamp: value.timestamp.map(Into::into),
             secret_id: value.secret_id,
+            reply_to: value.reply_to.map(Into::into),
         }
     }
 }
@@ -155,6 +161,7 @@ pub fn split(
 }
 
 #[wasm_bindgen(js_name = "sharing_request_produce")]
+#[allow(clippy::too_many_arguments)]
 pub fn produce(
     channel_id: u64,
     version: u32,
@@ -163,11 +170,17 @@ pub fn produce(
     keep_list: JsValue,
     description: String,
     shared_key: &[u8],
+    // Optional `TransportProtocol` (serialized JS object) telling the
+    // responder where to send the response. Pass `null`/`undefined` to
+    // leave it absent (the responder routes to the channel's stored peer
+    // endpoint).
+    reply_to: JsValue,
 ) -> Result<JsValue, JsValue> {
     let shared_key = parse_shared_key(shared_key)?;
     let committed_share: CommittedDeRecShare = from_js(committed_share)?;
     let committed_share_proto: derec_proto::CommittedDeRecShare = committed_share.into();
     let keep_list_raw: Vec<u32> = from_js(keep_list)?;
+    let reply_to_proto = parse_optional_transport_protocol(reply_to)?;
 
     let result = request::produce(
         ChannelId(channel_id),
@@ -177,6 +190,7 @@ pub fn produce(
         &keep_list_raw,
         description,
         &shared_key,
+        reply_to_proto,
     )
     .map_err(js_error_from_lib)?;
 

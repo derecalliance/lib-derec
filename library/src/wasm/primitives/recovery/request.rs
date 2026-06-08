@@ -4,7 +4,8 @@ use crate::{
     primitives::recovery::request,
     wasm::{
         primitives::{
-            helpers::{parse_shared_key, to_js},
+            helpers::{parse_optional_transport_protocol, parse_shared_key, to_js},
+            pairing::TransportProtocol,
             types::Timestamp,
         },
         ts_bindings_utils::js_error_from_lib,
@@ -18,6 +19,9 @@ pub struct GetShareRequestMessage {
     pub secret_id: u64,
     pub version: u32,
     pub timestamp: Option<Timestamp>,
+    /// Optional ephemeral response endpoint. See `replyTo` on the request
+    /// proto for the routing semantics.
+    pub reply_to: Option<TransportProtocol>,
 }
 
 impl From<derec_proto::GetShareRequestMessage> for GetShareRequestMessage {
@@ -26,6 +30,7 @@ impl From<derec_proto::GetShareRequestMessage> for GetShareRequestMessage {
             secret_id: value.secret_id,
             version: value.version,
             timestamp: value.timestamp.map(Into::into),
+            reply_to: value.reply_to.map(Into::into),
         }
     }
 }
@@ -36,6 +41,7 @@ impl From<GetShareRequestMessage> for derec_proto::GetShareRequestMessage {
             secret_id: value.secret_id,
             version: value.version,
             timestamp: value.timestamp.map(Into::into),
+            reply_to: value.reply_to.map(Into::into),
         }
     }
 }
@@ -57,10 +63,14 @@ pub fn produce(
     secret_id: u64,
     version: u32,
     shared_key: &[u8],
+    // Optional `TransportProtocol`. Pass null/undefined for no override.
+    reply_to: JsValue,
 ) -> Result<JsValue, JsValue> {
     let shared_key = parse_shared_key(shared_key)?;
-    let result = request::produce(channel_id.into(), secret_id, version, &shared_key)
-        .map_err(js_error_from_lib)?;
+    let reply_to_proto = parse_optional_transport_protocol(reply_to)?;
+    let result =
+        request::produce(channel_id.into(), secret_id, version, &shared_key, reply_to_proto)
+            .map_err(js_error_from_lib)?;
     to_js(&ProduceResult {
         envelope: result.envelope,
     })

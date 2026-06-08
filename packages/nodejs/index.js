@@ -92,8 +92,14 @@ const decodeRecoveredSecretBag = wasm.decodeRecoveredSecretBag;
 
 const restoreFromRecoveredBag = wasm.restoreFromRecoveredBag;
 
+const envelope = {
+  apply_trace_id: wasm.envelope_apply_trace_id,
+  read_trace_id: wasm.envelope_read_trace_id,
+};
+
 module.exports = {
   primitives,
+  envelope,
   DeRecProtocol,
   SenderKind,
   ContactMode,

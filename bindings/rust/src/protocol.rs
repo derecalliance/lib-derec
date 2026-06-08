@@ -36,6 +36,7 @@ pub fn run_all() {
     rt.block_on(run_discovery_and_recovery_flow());
     rt.block_on(run_unpairing_flow());
     rt.block_on(run_update_channel_info_flow());
+    rt.block_on(run_reply_to_flow());
 }
 
 
@@ -323,6 +324,16 @@ impl Peer {
     }
 
     fn with_threshold(label: &'static str, uri: &str, threshold: usize) -> Self {
+        Self::with_options(label, uri, threshold, false)
+    }
+
+    /// Same as [`Peer::new`] but flips `with_auto_reply_to(true)` on the
+    /// builder so every outbound request stamps `replyTo = own_transport`.
+    fn with_auto_reply_to(label: &'static str, uri: &str) -> Self {
+        Self::with_options(label, uri, 2, true)
+    }
+
+    fn with_options(label: &'static str, uri: &str, threshold: usize, auto_reply_to: bool) -> Self {
         let transport = InProcessTransport::new();
         let protocol = DeRecProtocolBuilder::new()
             .with_channel_store(InMemoryChannelStore::default())
@@ -334,6 +345,7 @@ impl Peer {
                 protocol: Protocol::Https.into(),
             })
             .with_threshold(threshold)
+            .with_auto_reply_to(auto_reply_to)
             .build();
 
         Self {
@@ -1029,4 +1041,122 @@ async fn run_update_channel_info_flow() {
     );
 
     println!("Protocol UpdateChannelInfo flow test passed.");
+}
+
+
+/// Asserts the two halves of the `replyTo` contract:
+///
+/// 1. With `with_auto_reply_to(true)`, every outbound channel-mode request
+///    carries `replyTo = own_transport` on its inner request body.
+/// 2. When a request arrives carrying a `replyTo` that differs from the
+///    channel's stored peer endpoint, the responder routes the response
+///    to `replyTo` (not to the stored endpoint).
+///
+/// Half (1) covers the requester side; half (2) covers the responder side.
+/// Together they prove the wire format and routing override both work
+/// without needing the full replica topology (which lives behind the
+/// replica feature epic).
+async fn run_reply_to_flow() {
+    println!("=== Protocol replyTo flow ===");
+
+    use derec_library::derec_message::{
+        DeRecMessageBuilder, current_timestamp, extract_inner_message,
+    };
+    use derec_proto::{DeRecMessage, GetSecretIdsVersionsRequestMessage, MessageBody};
+    use prost::Message as _;
+
+    let channel_id = ChannelId(7);
+    let mut owner = Peer::with_auto_reply_to("owner-reply", "https://owner-reply.example.com");
+    let mut helper = Peer::new("helper-reply", "https://helper-reply.example.com");
+
+    pair(&mut owner, &mut helper, channel_id).await;
+
+    // --- Half 1: auto_reply_to populates request.reply_to on outbound ----
+    owner
+        .protocol
+        .start(DeRecFlow::Discovery {
+            target: Target::Single(channel_id),
+        })
+        .await
+        .expect("owner start(Discovery) failed");
+
+    let outbound = owner.drain();
+    assert_eq!(
+        outbound.len(),
+        1,
+        "expected exactly one outbound Discovery request, got {}",
+        outbound.len()
+    );
+    let (dest, envelope_bytes) = &outbound[0];
+    assert_eq!(
+        dest.uri, "https://helper-reply.example.com",
+        "outbound request must still route to the channel's stored helper endpoint"
+    );
+
+    // The orchestrator carried our own_transport into the request body.
+    let SecretValue::SharedKey(shared_key) = owner
+        .protocol
+        .secret_store
+        .load(channel_id, SecretKind::SharedKey)
+        .await
+        .expect("owner secret_store.load failed")
+        .expect("owner shared_key must be present")
+    else {
+        panic!("expected SharedKey kind");
+    };
+    let inner =
+        extract_inner_message(&DeRecMessage::decode(envelope_bytes.as_slice()).unwrap().message, &shared_key)
+            .expect("inner decrypt failed");
+    let MessageBody::GetSecretIdsVersionsRequest(req) = inner else {
+        panic!("expected GetSecretIdsVersionsRequest, got {inner:?}");
+    };
+    let reply_to = req.reply_to.expect("auto_reply_to must populate replyTo");
+    assert_eq!(
+        reply_to.uri, "https://owner-reply.example.com",
+        "replyTo.uri must equal the owner's own_transport"
+    );
+
+    // --- Half 2: responder routes to inbound replyTo (not stored endpoint) -
+    // Hand-craft a Discovery request whose replyTo differs from the
+    // owner's URI. Helper's stored peer endpoint still points to the owner,
+    // so a correct implementation must route the response to the phantom
+    // endpoint instead.
+    let phantom_uri = "https://phantom-replica.example.com";
+    let timestamp = current_timestamp();
+    let crafted = GetSecretIdsVersionsRequestMessage {
+        timestamp: Some(timestamp),
+        reply_to: Some(TransportProtocol {
+            uri: phantom_uri.to_owned(),
+            protocol: Protocol::Https.into(),
+        }),
+    };
+    let crafted_envelope = DeRecMessageBuilder::channel()
+        .channel_id(channel_id)
+        .timestamp(timestamp)
+        .message_body(MessageBody::GetSecretIdsVersionsRequest(crafted))
+        .encrypt(&shared_key)
+        .expect("encrypt failed")
+        .build()
+        .expect("build failed")
+        .encode_to_vec();
+
+    // Drain any leftover envelopes from the previous half before feeding
+    // the crafted request — we want only this exchange's outbox.
+    helper.drain();
+    let _ = deliver(&mut helper, &crafted_envelope).await;
+
+    let helper_outbound = helper.drain();
+    assert_eq!(
+        helper_outbound.len(),
+        1,
+        "expected exactly one outbound Discovery response, got {}",
+        helper_outbound.len()
+    );
+    let (response_dest, _) = &helper_outbound[0];
+    assert_eq!(
+        response_dest.uri, phantom_uri,
+        "responder must route to request.replyTo when set, not the channel's stored endpoint"
+    );
+
+    println!("Protocol replyTo flow test passed.");
 }

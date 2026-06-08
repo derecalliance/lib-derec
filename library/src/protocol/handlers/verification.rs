@@ -48,6 +48,7 @@ pub(in crate::protocol) async fn handle<Sh: DeRecShareStore>(
     feature = "logging",
     tracing::instrument(skip_all, fields(secret_id = secret_id, version = version))
 )]
+#[allow(clippy::too_many_arguments)]
 pub(in crate::protocol) async fn start<
     Ch: DeRecChannelStore,
     Ss: DeRecSecretStore,
@@ -59,6 +60,7 @@ pub(in crate::protocol) async fn start<
     version: u32,
     target: Target,
     secret_id: u64,
+    reply_to: Option<derec_proto::TransportProtocol>,
 ) -> Result<()> {
     let all_channels = channel_store.channels().await?;
     let all_channel_ids: Vec<ChannelId> = all_channels.iter().map(|c| c.id).collect();
@@ -88,8 +90,13 @@ pub(in crate::protocol) async fn start<
         };
 
         let endpoint = peer_endpoint(channel_store, channel_id).await?;
-        let msg =
-            produce_verify_share_request_message(channel_id, secret_id, version, &shared_key)?;
+        let msg = produce_verify_share_request_message(
+            channel_id,
+            secret_id,
+            version,
+            &shared_key,
+            reply_to.clone(),
+        )?;
 
         #[cfg(feature = "logging")]
         tracing::debug!(
@@ -99,7 +106,8 @@ pub(in crate::protocol) async fn start<
             "verification challenge sent"
         );
 
-        transport.send(&endpoint, msg.envelope).await?;
+        let envelope = super::apply_trace_id(msg.envelope, super::fresh_trace_id())?;
+        transport.send(&endpoint, envelope).await?;
     }
 
     #[cfg(feature = "logging")]
@@ -151,7 +159,9 @@ pub(in crate::protocol) async fn accept<
     let resp = verification_response::produce(channel_id, request, shared_key, &stored.share)?;
 
     let envelope = super::apply_trace_id(resp.envelope, trace_id)?;
-    let endpoint = peer_endpoint(channel_store, channel_id).await?;
+    let endpoint =
+        super::resolve_response_endpoint(channel_store, channel_id, request.reply_to.as_ref())
+            .await?;
     transport.send(&endpoint, envelope).await?;
 
     #[cfg(feature = "logging")]
@@ -204,6 +214,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
         MessageBody::VerifyShareResponse(response),
         shared_key,
         trace_id,
+        request.reply_to.as_ref(),
     )
     .await
 }

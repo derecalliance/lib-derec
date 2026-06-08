@@ -51,6 +51,7 @@ pub(in crate::protocol) async fn start<
     secret_store: &mut Ss,
     transport: &T,
     target: Target,
+    reply_to: Option<derec_proto::TransportProtocol>,
 ) -> Result<()> {
     // Filter Target::Single/Many to known channels; user input may include
     // unpaired ids and those would otherwise trip the invariant check below.
@@ -85,8 +86,9 @@ pub(in crate::protocol) async fn start<
         };
 
         let endpoint = peer_endpoint(channel_store, channel_id).await?;
-        let msg = request::produce(channel_id, &shared_key)?;
-        transport.send(&endpoint, msg.envelope).await?;
+        let msg = request::produce(channel_id, &shared_key, reply_to.clone())?;
+        let envelope = super::apply_trace_id(msg.envelope, super::fresh_trace_id())?;
+        transport.send(&endpoint, envelope).await?;
 
         #[cfg(feature = "logging")]
         tracing::debug!(channel_id = channel_id.0, "discovery request sent");
@@ -111,7 +113,7 @@ pub(in crate::protocol) async fn accept<
     share_store: &mut Sh,
     transport: &T,
     channel_id: ChannelId,
-    _request: &GetSecretIdsVersionsRequestMessage,
+    request: &GetSecretIdsVersionsRequestMessage,
     shared_key: &SharedKey,
     trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
@@ -152,7 +154,9 @@ pub(in crate::protocol) async fn accept<
     let resp = response::produce(channel_id, &secret_list, shared_key)?;
 
     let envelope = super::apply_trace_id(resp.envelope, trace_id)?;
-    let endpoint = peer_endpoint(channel_store, channel_id).await?;
+    let endpoint =
+        super::resolve_response_endpoint(channel_store, channel_id, request.reply_to.as_ref())
+            .await?;
     transport.send(&endpoint, envelope).await?;
 
     #[cfg(feature = "logging")]
@@ -165,10 +169,12 @@ pub(in crate::protocol) async fn accept<
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
 )]
+#[allow(clippy::too_many_arguments)]
 pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport>(
     channel_store: &mut Ch,
     transport: &T,
     channel_id: ChannelId,
+    request: &GetSecretIdsVersionsRequestMessage,
     shared_key: &SharedKey,
     status: StatusEnum,
     memo: &str,
@@ -190,6 +196,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
         MessageBody::GetSecretIdsVersionsResponse(response),
         shared_key,
         trace_id,
+        request.reply_to.as_ref(),
     )
     .await
 }

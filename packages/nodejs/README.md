@@ -306,6 +306,30 @@ console.log("Valid:", isValid);
 
 ---
 
+## Correlation and routing
+
+Two cross-cutting metadata fields appear on every channel-mode exchange:
+
+- **`traceId`** — opaque `bigint` on the outer envelope, used to correlate
+  responses with requests. The `DeRecProtocol` orchestrator handles this
+  end-to-end (random token on every outbound request, echo on every
+  response). Primitive-only callers can manipulate it directly via
+  `envelope.apply_trace_id(bytes, traceId)` and `envelope.read_trace_id(bytes)`.
+- **`replyTo`** — optional `TransportProtocol` on request bodies, telling
+  the responder to route this exchange's response to an alternate endpoint.
+  Set it per call (every `primitives.*.request.produce` takes a trailing
+  `reply_to` arg) or protocol-wide with the `autoReplyTo` constructor flag
+  on `DeRecProtocol` (stamps `replyTo = ownTransport` on every outbound
+  request). Excludes pairing and `UpdateChannelInfo`, which already carry
+  their own `transportProtocol` field.
+
+The motivating case for `replyTo` is replicas: when Replica A sends a
+request on a channel the helper paired with sibling Replica B, the
+helper's stored peer endpoint points at B. `replyTo` lets A say "send the
+response back to me," without rewriting channel state.
+
+---
+
 ## Package Contents
 
 ```text

@@ -4,7 +4,7 @@ use super::super::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport,
     MissingPolicy, PendingAction, SecretKind, SecretValue, Share,
 };
-use super::{peer_endpoint, resolve_target};
+use super::resolve_target;
 use crate::{
     Error, Result,
     derec_message::current_timestamp,
@@ -59,6 +59,7 @@ pub(in crate::protocol) async fn start<
     keep_versions_count: usize,
     secret_id: u64,
     target: Target,
+    reply_to: Option<derec_proto::TransportProtocol>,
 ) -> Result<(u32, Vec<ChannelId>)> {
     let paired_helpers = load_paired_helpers(channel_store, secret_store, target).await?;
 
@@ -73,6 +74,7 @@ pub(in crate::protocol) async fn start<
         keep_versions_count,
         secret_id,
         description.as_deref().unwrap_or(""),
+        reply_to,
     )
     .await
 }
@@ -118,7 +120,9 @@ pub(in crate::protocol) async fn accept<
         .await?;
 
     let envelope = super::apply_trace_id(resp.envelope, trace_id)?;
-    let endpoint = peer_endpoint(channel_store, channel_id).await?;
+    let endpoint =
+        super::resolve_response_endpoint(channel_store, channel_id, request.reply_to.as_ref())
+            .await?;
     transport.send(&endpoint, envelope).await?;
 
     #[cfg(feature = "logging")]
@@ -172,6 +176,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
         MessageBody::StoreShareResponse(response),
         shared_key,
         trace_id,
+        request.reply_to.as_ref(),
     )
     .await?;
 
@@ -342,6 +347,7 @@ fn build_secret_container(
 }
 
 #[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(secret_id = secret_id)))]
+#[allow(clippy::too_many_arguments)]
 async fn distribute_shares<Sh: DeRecShareStore, T: DeRecTransport>(
     share_store: &mut Sh,
     transport: &T,
@@ -351,6 +357,7 @@ async fn distribute_shares<Sh: DeRecShareStore, T: DeRecTransport>(
     keep_versions_count: usize,
     secret_id: u64,
     description: &str,
+    reply_to: Option<derec_proto::TransportProtocol>,
 ) -> Result<(u32, Vec<ChannelId>)> {
     let version = share_store.latest_version().await?.map_or(1, |v| v + 1);
 
@@ -384,8 +391,10 @@ async fn distribute_shares<Sh: DeRecShareStore, T: DeRecTransport>(
             &keep_list,
             description,
             shared_key,
+            reply_to.clone(),
         )?;
-        transport.send(&channel.transport, msg.envelope).await?;
+        let envelope = super::apply_trace_id(msg.envelope, super::fresh_trace_id())?;
+        transport.send(&channel.transport, envelope).await?;
 
         share_store
             .save(

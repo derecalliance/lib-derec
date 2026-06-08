@@ -12,6 +12,7 @@ syntax = "proto3";
 
 import "google/protobuf/timestamp.proto";
 import "result.proto";
+import "transportprotocol.proto";
 
 package org.derecalliance.derec.protobuf;
 
@@ -134,6 +135,26 @@ message StoreShareRequestMessage {
   //
   // Used for observability, replay detection, and timeout handling.
   google.protobuf.Timestamp timestamp = 7;
+
+  // Ephemeral transport endpoint at which the requester wants to receive
+  // the response to *this exchange*, overriding the channel's stored peer
+  // endpoint for this round-trip only.
+  //
+  // # When to use
+  //
+  // Set when the requester's outbound endpoint does not match the endpoint
+  // the responder has on file for the channel — for example a replica
+  // talking to a helper that was paired with a sibling replica. The
+  // responder routes the response to `replyTo` but does NOT persist this
+  // endpoint; use `UpdateChannelInfoRequestMessage` for permanent changes.
+  //
+  // # Semantics
+  //
+  // - Absent (the default): the responder routes to the endpoint stored on
+  //   its `Channel` record for this `channelId`.
+  // - Present: the responder routes this exchange's response to this
+  //   endpoint and leaves the stored endpoint unchanged.
+  optional TransportProtocol replyTo = 8;
 }
 
 // StoreShareResponseMessage is the response to a StoreShareRequestMessage.

@@ -74,7 +74,8 @@ public static partial class Sharing
             byte[] committedShare,
             uint[] keepList,
             string description,
-            byte[] sharedKey
+            byte[] sharedKey,
+            TransportProtocol? replyTo = null
         )
         {
             ArgumentNullException.ThrowIfNull(committedShare);
@@ -84,6 +85,8 @@ public static partial class Sharing
                 throw new ArgumentException("sharedKey must be exactly 32 bytes.", nameof(sharedKey));
 
             byte[] descriptionBytes = System.Text.Encoding.UTF8.GetBytes(description ?? string.Empty);
+            byte[]? replyToBytes = replyTo?.ToProtoBytes();
+            UIntPtr replyToLen = replyToBytes is null ? UIntPtr.Zero : (UIntPtr)replyToBytes.Length;
 
             Native.Sharing.ProduceStoreShareRequestMessageResult nativeResult =
                 Native.Sharing.produce_store_share_request_message(
@@ -97,7 +100,9 @@ public static partial class Sharing
                     descriptionBytes,
                     (UIntPtr)descriptionBytes.Length,
                     sharedKey,
-                    (UIntPtr)sharedKey.Length
+                    (UIntPtr)sharedKey.Length,
+                    replyToBytes,
+                    replyToLen
                 );
 
             try
