@@ -309,6 +309,10 @@ struct ChannelRecord {
     /// Local role on this channel; matches `derec_proto::SenderKind` raw i32.
     #[serde(default)]
     role: i32,
+    /// Peer's replica id, populated only on replica channels. `#[serde(default)]`
+    /// → `None` so records persisted before replica support deserialize cleanly.
+    #[serde(default)]
+    replica_id: Option<u64>,
 }
 
 fn default_channel_status() -> String {
@@ -329,6 +333,7 @@ impl From<&Channel> for ChannelRecord {
             status: status.to_owned(),
             created_at: ch.created_at,
             role: ch.role as i32,
+            replica_id: ch.replica_id,
         }
     }
 }
@@ -351,6 +356,7 @@ impl From<ChannelRecord> for Channel {
             status,
             created_at: rec.created_at,
             role,
+            replica_id: rec.replica_id,
         }
     }
 }

@@ -10,7 +10,8 @@ use super::super::{
 use crate::{
     Error, Result,
     derec_message::{DeRecMessageBuilder, current_timestamp},
-    primitives::pairing::{request, response},
+    primitives::pairing::{PairingError, request, response},
+    protocol::reserved_keys,
     types::ChannelId,
 };
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
@@ -34,10 +35,11 @@ pub(in crate::protocol) async fn handle<Ch: DeRecChannelStore, Ss: DeRecSecretSt
     channel_id: ChannelId,
     pairing_secret: &PairingSecretKeyMaterial,
     inbound_trace_id: u64,
+    replica_id: Option<u64>,
 ) -> Result<Vec<DeRecEvent>> {
     match message {
         MessageBody::PairRequest(request) => {
-            on_request(channel_id, request, pairing_secret, inbound_trace_id)
+            on_request(channel_id, request, pairing_secret, inbound_trace_id, replica_id)
         }
         MessageBody::PairResponse(response) => {
             on_response(
@@ -46,6 +48,7 @@ pub(in crate::protocol) async fn handle<Ch: DeRecChannelStore, Ss: DeRecSecretSt
                 channel_id,
                 response,
                 pairing_secret,
+                replica_id,
             )
             .await
         }
@@ -83,7 +86,13 @@ pub(in crate::protocol) async fn start<
     kind: SenderKind,
     contact: ContactMessage,
     peer_communication_info: HashMap<String, String>,
+    replica_id: Option<u64>,
 ) -> Result<u64> {
+    // Fail fast at flow-entry — refusing here saves the scanner from
+    // sending a PrePairRequest only to discover (on the response) it can't
+    // produce a PairRequest. Identical refusal for both contact modes.
+    let replica_id_to_inject = require_replica_id_for_kind(kind, replica_id)?;
+
     let channel_id = ChannelId(contact.channel_id);
 
     let endpoint = contact
@@ -118,6 +127,7 @@ pub(in crate::protocol) async fn start<
             peer_communication_info,
             endpoint,
             kind,
+            replica_id_to_inject,
         )
         .await
     }
@@ -141,8 +151,12 @@ pub(in crate::protocol) async fn accept<
     pairing_secret: &PairingSecretKeyMaterial,
     kind: SenderKind,
     trace_id: u64,
+    replica_id: Option<u64>,
 ) -> Result<Vec<DeRecEvent>> {
-    let comm_info = build_communication_info(communication_info);
+    // Gate: replica-mode pairings require a locally-configured replica id.
+    let replica_id_to_inject = require_replica_id_for_kind(kind, replica_id)?;
+
+    let comm_info = build_communication_info(communication_info, replica_id_to_inject);
     let resp = response::produce(channel_id, request, pairing_secret, comm_info)?;
 
     secret_store
@@ -157,7 +171,13 @@ pub(in crate::protocol) async fn accept<
         crate::types::ChannelStatus::Paired
     };
 
-    let peer_communication_info = extract_communication_info(&request.communication_info);
+    // Re-extract from the inbound PairRequest. The dispatcher already
+    // validated presence-vs-kind at `on_request` time, so any error here is
+    // a defensive belt-and-braces (e.g. application driving accept() on a
+    // hand-crafted request).
+    let peer_sender_kind = request_sender_kind(request)?;
+    let (peer_communication_info, peer_replica_id) =
+        extract_communication_info(&request.communication_info, peer_sender_kind)?;
 
     channel_store
         .save(crate::types::Channel {
@@ -167,6 +187,7 @@ pub(in crate::protocol) async fn accept<
             status,
             created_at: now_secs(),
             role: kind,
+            replica_id: peer_replica_id,
         })
         .await?;
 
@@ -222,7 +243,10 @@ pub(in crate::protocol) async fn reject<Ss: DeRecSecretStore, T: DeRecTransport>
             memo: memo.to_owned(),
         }),
         nonce: request.nonce,
-        communication_info: build_communication_info(communication_info),
+        // Rejection refuses the pairing — do not reveal a local replica id
+        // (or any reserved-namespace state) to the peer, regardless of
+        // request.sender_kind.
+        communication_info: build_communication_info(communication_info, None),
         parameter_range: None,
         timestamp: Some(timestamp),
         channel_id: 0,
@@ -274,6 +298,7 @@ pub(in crate::protocol) async fn on_pre_pair_response<
     channel_id: ChannelId,
     original_contact: &ContactMessage,
     response: &PrePairResponseMessage,
+    replica_id: Option<u64>,
 ) -> Result<Vec<DeRecEvent>> {
     // `process_pre_pair` rejects malformed or non-Ok responses — surface
     // the status mismatch as an event the app can react to, propagate the
@@ -322,7 +347,8 @@ pub(in crate::protocol) async fn on_pre_pair_response<
         ))?
         .role;
 
-    let comm_info = build_communication_info(communication_info);
+    let replica_id_to_inject = require_replica_id_for_kind(role, replica_id)?;
+    let comm_info = build_communication_info(communication_info, replica_id_to_inject);
     let result = request::produce(role, own_transport.clone(), &filled_in_contact, comm_info)?;
 
     // Persist the scanner's pairing secret + overwrite the stored
@@ -474,8 +500,9 @@ async fn start_inlined_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRe
     peer_communication_info: HashMap<String, String>,
     endpoint: TransportProtocol,
     kind: SenderKind,
+    replica_id_to_inject: Option<u64>,
 ) -> Result<u64> {
-    let comm_info = build_communication_info(communication_info);
+    let comm_info = build_communication_info(communication_info, replica_id_to_inject);
     let result = request::produce(kind, own_transport.clone(), &contact, comm_info)?;
 
     secret_store
@@ -496,6 +523,7 @@ async fn start_inlined_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRe
             status: crate::types::ChannelStatus::Pending,
             created_at: now_secs(),
             role: kind,
+            replica_id: None,
         })
         .await?;
 
@@ -543,6 +571,7 @@ async fn start_hashed_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRec
             status: crate::types::ChannelStatus::Pending,
             created_at: now_secs(),
             role: kind,
+            replica_id: None,
         })
         .await?;
 
@@ -587,15 +616,25 @@ fn on_request(
     request: &PairRequestMessage,
     pairing_secret: &PairingSecretKeyMaterial,
     trace_id: u64,
+    replica_id: Option<u64>,
 ) -> Result<Vec<DeRecEvent>> {
-    let peer_communication_info = extract_communication_info(&request.communication_info);
-    let kind = if request.sender_kind == SenderKind::Owner as i32 {
-        SenderKind::Helper
-    } else if request.sender_kind == SenderKind::Replica as i32 {
-        SenderKind::Replica
-    } else {
-        SenderKind::Owner
+    let peer_kind = request_sender_kind(request)?;
+
+    // Validate the inbound CommunicationInfo against the peer's declared
+    // kind (presence/absence of `derec.replica_id`). Error here propagates
+    // up through `handle` → `process()` rather than surfacing as an event.
+    let (peer_communication_info, _peer_replica_id) =
+        extract_communication_info(&request.communication_info, peer_kind)?;
+
+    // Derive the LOCAL kind from the peer's. Then refuse if it would be
+    // Replica without a configured local id — refusing here avoids
+    // surfacing an `ActionRequired::Pairing` the app cannot accept.
+    let kind = match peer_kind {
+        SenderKind::Owner => SenderKind::Helper,
+        SenderKind::Helper => SenderKind::Owner,
+        SenderKind::Replica => SenderKind::Replica,
     };
+    let _ = require_replica_id_for_kind(kind, replica_id)?;
 
     let action = PendingAction::Pairing {
         channel_id,
@@ -619,6 +658,7 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     channel_id: ChannelId,
     response: &derec_proto::PairResponseMessage,
     pairing_secret: &PairingSecretKeyMaterial,
+    replica_id: Option<u64>,
 ) -> Result<Vec<DeRecEvent>> {
     let contact = match secret_store
         .load(channel_id, SecretKind::PairingContact)
@@ -660,10 +700,19 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
         crate::types::ChannelStatus::Paired
     };
 
-    let peer_communication_info = extract_communication_info(&response.communication_info);
+    // Validate the inbound CommunicationInfo against the derived peer
+    // kind. Replica responses MUST carry `derec.replica_id`; non-replica
+    // responses MUST NOT. The local id was already validated at start
+    // time via `require_replica_id_for_kind` — this is the receiver-side
+    // half of the same invariant.
+    let peer_kind = derive_peer_kind(kind);
+    let _ = require_replica_id_for_kind(kind, replica_id)?;
+    let (peer_communication_info, peer_replica_id) =
+        extract_communication_info(&response.communication_info, peer_kind)?;
 
     let mut channel = channel;
     channel.status = status;
+    channel.replica_id = peer_replica_id;
     for (k, v) in &peer_communication_info {
         channel.communication_info.insert(k.clone(), v.clone());
     }
@@ -679,9 +728,26 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     }])
 }
 
-fn build_communication_info(info: &HashMap<String, String>) -> Option<CommunicationInfo> {
-    let entries: Vec<_> = info
+/// Build a `CommunicationInfo` proto from the app's free-form key-value
+/// map, optionally injecting the reserved `derec.replica_id` entry.
+///
+/// Callers pass `Some(id)` when the **local** kind on this pairing is
+/// `Replica` (and the protocol was built with `with_replica_id`), `None`
+/// otherwise. The orchestrator-level gate at `start`/`accept`/`process`
+/// entry refuses replica-mode pairings before reaching this helper, so by
+/// the time we get here `replica_id` being `None` always means "no
+/// injection needed."
+///
+/// Any entry the app supplied under the reserved `derec.*` namespace is
+/// **silently dropped** before serialization — the namespace is owned by
+/// the library, not application territory.
+fn build_communication_info(
+    info: &HashMap<String, String>,
+    replica_id_to_inject: Option<u64>,
+) -> Option<CommunicationInfo> {
+    let mut entries: Vec<_> = info
         .iter()
+        .filter(|(k, _)| !is_reserved_key(k))
         .filter(|(_, v)| !v.trim().is_empty())
         .map(|(k, v)| derec_proto::CommunicationInfoKeyValue {
             key: k.to_owned(),
@@ -690,6 +756,17 @@ fn build_communication_info(info: &HashMap<String, String>) -> Option<Communicat
             ),
         })
         .collect();
+
+    if let Some(id) = replica_id_to_inject {
+        entries.push(derec_proto::CommunicationInfoKeyValue {
+            key: reserved_keys::DEREC_REPLICA_ID_KEY.to_owned(),
+            value: Some(
+                derec_proto::communication_info_key_value::Value::StringValue(
+                    reserved_keys::encode_replica_id(id),
+                ),
+            ),
+        });
+    }
 
     if entries.is_empty() {
         return None;
@@ -700,22 +777,320 @@ fn build_communication_info(info: &HashMap<String, String>) -> Option<Communicat
     })
 }
 
-fn extract_communication_info(info: &Option<CommunicationInfo>) -> HashMap<String, String> {
+/// Extract the app-level free-form `CommunicationInfo` into a flat map AND
+/// pull the reserved `derec.replica_id` entry out as a typed `Option<u64>`.
+///
+/// The reserved key is **stripped from the returned map** so apps can't
+/// accidentally observe it (or, in subsequent broadcasts, re-transmit it).
+///
+/// Validation against `peer_kind`:
+/// - `peer_kind == Replica`: the reserved key MUST be present and parse
+///   as a valid hex `u64` (error: [`PairingError::MissingReplicaId`] or
+///   [`Error::InvalidInput`]).
+/// - `peer_kind != Replica`: the reserved key MUST NOT be present (error:
+///   [`PairingError::UnexpectedReplicaId`]). Non-replica pairings have no
+///   business carrying replica identity.
+fn extract_communication_info(
+    info: &Option<CommunicationInfo>,
+    peer_kind: SenderKind,
+) -> Result<(HashMap<String, String>, Option<u64>)> {
     let Some(info) = info.as_ref() else {
-        return HashMap::new();
+        // No comm_info means no reserved entries either; replica pairings
+        // are rejected up-front by the missing-id check below.
+        if peer_kind == SenderKind::Replica {
+            return Err(PairingError::MissingReplicaId {
+                sender_kind: peer_kind,
+            }
+            .into());
+        }
+        return Ok((HashMap::new(), None));
     };
 
-    info.communication_info_entries
-        .iter()
-        .filter_map(|e| {
-            if let Some(derec_proto::communication_info_key_value::Value::StringValue(s)) = &e.value
-            {
-                let trimmed = s.trim();
-                if !trimmed.is_empty() {
-                    return Some((e.key.to_owned(), trimmed.to_owned()));
+    let mut free_form: HashMap<String, String> = HashMap::new();
+    let mut peer_replica_id: Option<u64> = None;
+
+    for e in &info.communication_info_entries {
+        let Some(derec_proto::communication_info_key_value::Value::StringValue(s)) = &e.value
+        else {
+            continue;
+        };
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if e.key == reserved_keys::DEREC_REPLICA_ID_KEY {
+            peer_replica_id = Some(reserved_keys::decode_replica_id(trimmed)?);
+            continue;
+        }
+        if is_reserved_key(&e.key) {
+            // Future reserved keys land here. For now there is only
+            // `derec.replica_id`, so any other `derec.*` entry is foreign
+            // and silently dropped — same as #43's "library owns the
+            // namespace" stance for ContactMode.
+            continue;
+        }
+        free_form.insert(e.key.to_owned(), trimmed.to_owned());
+    }
+
+    match (peer_kind, peer_replica_id) {
+        (SenderKind::Replica, None) => Err(PairingError::MissingReplicaId {
+            sender_kind: peer_kind,
+        }
+        .into()),
+        (k, Some(_)) if k != SenderKind::Replica => Err(PairingError::UnexpectedReplicaId {
+            sender_kind: peer_kind,
+        }
+        .into()),
+        _ => Ok((free_form, peer_replica_id)),
+    }
+}
+
+/// `true` for any key in the reserved `derec.*` namespace (library-owned).
+/// Apps that set such keys themselves are silently overridden.
+fn is_reserved_key(key: &str) -> bool {
+    key.starts_with("derec.")
+}
+
+/// Gate for replica-mode pairings on the local side.
+///
+/// Returns `Some(id)` if `kind == Replica` (and the protocol was configured
+/// with a replica id), `None` for non-replica pairings, or
+/// [`Error::ReplicaIdNotConfigured`] when a replica-mode pairing was
+/// attempted without local identity. The returned `Option<u64>` is exactly
+/// what [`build_communication_info`] expects.
+fn require_replica_id_for_kind(
+    local_kind: SenderKind,
+    configured_replica_id: Option<u64>,
+) -> Result<Option<u64>> {
+    if local_kind != SenderKind::Replica {
+        return Ok(None);
+    }
+    configured_replica_id
+        .map(Some)
+        .ok_or(Error::ReplicaIdNotConfigured)
+}
+
+/// Parse the `sender_kind` field of an incoming `PairRequestMessage` into
+/// the typed [`SenderKind`] enum. The raw field is an `i32` on the wire;
+/// unknown values surface as
+/// [`PairingError::InvalidPairRequestMessage`].
+fn request_sender_kind(request: &PairRequestMessage) -> Result<SenderKind> {
+    SenderKind::try_from(request.sender_kind)
+        .map_err(|_| PairingError::InvalidPairRequestMessage("unknown sender_kind on PairRequest").into())
+}
+
+/// Derive the peer's pairing kind from the local kind (committed on the
+/// channel record at pairing-start time).
+///
+/// `PairResponseMessage` does not carry `sender_kind` over the wire, so the
+/// initiator must look up its own role on the channel and invert it. The
+/// derivation matches [`on_request`]'s rule on the responder side:
+///
+/// | local       | peer         |
+/// |-------------|--------------|
+/// | `Owner`     | `Helper`     |
+/// | `Helper`    | `Owner`      |
+/// | `Replica`   | `Replica`    |
+fn derive_peer_kind(local_kind: SenderKind) -> SenderKind {
+    match local_kind {
+        SenderKind::Owner => SenderKind::Helper,
+        SenderKind::Helper => SenderKind::Owner,
+        SenderKind::Replica => SenderKind::Replica,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entries_of(c: &CommunicationInfo) -> Vec<(String, String)> {
+        c.communication_info_entries
+            .iter()
+            .filter_map(|e| match &e.value {
+                Some(derec_proto::communication_info_key_value::Value::StringValue(s)) => {
+                    Some((e.key.clone(), s.clone()))
                 }
-            }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn build_omits_reserved_key_when_no_replica_id_to_inject() {
+        let mut info = HashMap::new();
+        info.insert("name".to_owned(), "Alice".to_owned());
+
+        let built = build_communication_info(&info, None).expect("entries present");
+        let pairs = entries_of(&built);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0], ("name".to_owned(), "Alice".to_owned()));
+    }
+
+    #[test]
+    fn build_injects_reserved_key_when_replica_id_supplied() {
+        let mut info = HashMap::new();
+        info.insert("name".to_owned(), "Alice".to_owned());
+
+        let built = build_communication_info(&info, Some(0xDEAD_BEEFu64)).expect("entries present");
+        let pairs = entries_of(&built);
+
+        let replica_entry = pairs
+            .iter()
+            .find(|(k, _)| k == reserved_keys::DEREC_REPLICA_ID_KEY)
+            .expect("derec.replica_id should be injected");
+        assert_eq!(replica_entry.1, "deadbeef");
+
+        // The app's free-form `name` is preserved alongside the reserved entry.
+        assert!(pairs.iter().any(|(k, v)| k == "name" && v == "Alice"));
+    }
+
+    #[test]
+    fn build_drops_app_supplied_entries_in_reserved_namespace() {
+        let mut info = HashMap::new();
+        info.insert("name".to_owned(), "Alice".to_owned());
+        // App tries to shadow the reserved key — should be silently dropped.
+        info.insert(
+            reserved_keys::DEREC_REPLICA_ID_KEY.to_owned(),
+            "ffffffffffff".to_owned(),
+        );
+        // App tries any other derec.* key — also dropped (namespace owned).
+        info.insert("derec.foo".to_owned(), "bar".to_owned());
+
+        let built = build_communication_info(&info, Some(1)).expect("entries present");
+        let pairs = entries_of(&built);
+
+        // Only the LIBRARY-injected derec.replica_id and the free-form `name`.
+        assert_eq!(pairs.len(), 2);
+        let replica_entry = pairs
+            .iter()
+            .find(|(k, _)| k == reserved_keys::DEREC_REPLICA_ID_KEY)
+            .unwrap();
+        assert_eq!(replica_entry.1, "1");
+        assert!(!pairs.iter().any(|(k, _)| k == "derec.foo"));
+    }
+
+    #[test]
+    fn extract_strips_reserved_key_and_returns_typed_id() {
+        let info = Some(CommunicationInfo {
+            communication_info_entries: vec![
+                derec_proto::CommunicationInfoKeyValue {
+                    key: "name".to_owned(),
+                    value: Some(
+                        derec_proto::communication_info_key_value::Value::StringValue(
+                            "Bob".to_owned(),
+                        ),
+                    ),
+                },
+                derec_proto::CommunicationInfoKeyValue {
+                    key: reserved_keys::DEREC_REPLICA_ID_KEY.to_owned(),
+                    value: Some(
+                        derec_proto::communication_info_key_value::Value::StringValue(
+                            "cafebabe".to_owned(),
+                        ),
+                    ),
+                },
+            ],
+        });
+
+        let (map, replica_id) = extract_communication_info(&info, SenderKind::Replica).unwrap();
+        // Map carries only the free-form entry; reserved key is gone.
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("name").map(String::as_str), Some("Bob"));
+        assert!(!map.contains_key(reserved_keys::DEREC_REPLICA_ID_KEY));
+        assert_eq!(replica_id, Some(0xCAFE_BABEu64));
+    }
+
+    #[test]
+    fn extract_rejects_replica_pairing_missing_reserved_key() {
+        let info = Some(CommunicationInfo {
+            communication_info_entries: vec![derec_proto::CommunicationInfoKeyValue {
+                key: "name".to_owned(),
+                value: Some(derec_proto::communication_info_key_value::Value::StringValue(
+                    "Bob".to_owned(),
+                )),
+            }],
+        });
+
+        let err =
+            extract_communication_info(&info, SenderKind::Replica).expect_err("must reject");
+        assert!(
+            matches!(
+                err,
+                Error::Pairing(PairingError::MissingReplicaId { sender_kind })
+                    if sender_kind == SenderKind::Replica
+            ),
+            "expected MissingReplicaId, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn extract_rejects_non_replica_pairing_carrying_reserved_key() {
+        let info = Some(CommunicationInfo {
+            communication_info_entries: vec![derec_proto::CommunicationInfoKeyValue {
+                key: reserved_keys::DEREC_REPLICA_ID_KEY.to_owned(),
+                value: Some(derec_proto::communication_info_key_value::Value::StringValue(
+                    "abc".to_owned(),
+                )),
+            }],
+        });
+
+        // Helper-side extraction of a peer pretending to be Owner with replica id.
+        let err =
+            extract_communication_info(&info, SenderKind::Owner).expect_err("must reject");
+        assert!(
+            matches!(
+                err,
+                Error::Pairing(PairingError::UnexpectedReplicaId { sender_kind })
+                    if sender_kind == SenderKind::Owner
+            ),
+            "expected UnexpectedReplicaId, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn extract_rejects_replica_pairing_with_no_communication_info() {
+        // A replica peer that sent no CommunicationInfo at all — no place to
+        // carry the required `derec.replica_id`.
+        let err =
+            extract_communication_info(&None, SenderKind::Replica).expect_err("must reject");
+        assert!(matches!(
+            err,
+            Error::Pairing(PairingError::MissingReplicaId { .. })
+        ));
+    }
+
+    #[test]
+    fn extract_accepts_non_replica_pairing_with_no_communication_info() {
+        let (map, id) = extract_communication_info(&None, SenderKind::Helper).unwrap();
+        assert!(map.is_empty());
+        assert_eq!(id, None);
+    }
+
+    #[test]
+    fn require_replica_id_for_kind_short_circuits_non_replica() {
+        assert_eq!(
+            require_replica_id_for_kind(SenderKind::Owner, None).unwrap(),
             None
-        })
-        .collect()
+        );
+        assert_eq!(
+            require_replica_id_for_kind(SenderKind::Helper, Some(123)).unwrap(),
+            None,
+            "Helper kind ignores configured replica id"
+        );
+    }
+
+    #[test]
+    fn require_replica_id_for_kind_passes_through_for_replica() {
+        assert_eq!(
+            require_replica_id_for_kind(SenderKind::Replica, Some(42)).unwrap(),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn require_replica_id_for_kind_errors_when_replica_unconfigured() {
+        let err = require_replica_id_for_kind(SenderKind::Replica, None).unwrap_err();
+        assert!(matches!(err, Error::ReplicaIdNotConfigured));
+    }
 }

@@ -89,6 +89,14 @@ pub enum Error {
         expected: derec_proto::SenderKind,
         actual: derec_proto::SenderKind,
     },
+
+    /// A replica-mode flow was attempted but the protocol was built without
+    /// [`DeRecProtocolBuilder::with_replica_id`](crate::protocol::DeRecProtocolBuilder::with_replica_id).
+    /// Surfaces at the entry points of every flow that requires a local
+    /// replica identity (initiating a replica-mode pairing, handling an
+    /// inbound `PairRequest` whose `sender_kind == Replica`, etc.).
+    #[error("replica id not configured: build the protocol with .with_replica_id(..) to enable replica flows")]
+    ReplicaIdNotConfigured,
 }
 
 impl Error {

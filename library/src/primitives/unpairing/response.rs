@@ -20,10 +20,7 @@ pub struct ExtractResult {
     pub response: UnpairResponseMessage,
 }
 
-/// Outcome of [`process`].
 pub struct ProcessResult {
-    /// `true` when the responder reported a successful unpair
-    /// (`result.status == StatusEnum::Ok`); `false` otherwise.
     pub acknowledged: bool,
 }
 

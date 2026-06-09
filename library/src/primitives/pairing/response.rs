@@ -51,20 +51,12 @@ pub struct ProducePrePairResult {
 }
 
 pub struct PrePairExtractResult {
-    /// Decoded inner plaintext [`derec_proto::PrePairResponseMessage`].
     pub response: PrePairResponseMessage,
 }
 
 pub struct ProcessPrePairResult {
-    /// Initiator's ML-KEM-768 encapsulation key, validated against the
-    /// contact's `contactBindingHash`. Safe to pass to
-    /// [`super::request::produce`] as part of a filled-in [`ContactMessage`].
     pub mlkem_encapsulation_key: Vec<u8>,
-    /// Initiator's ECIES public key, validated against the contact's
-    /// `contactBindingHash`.
     pub ecies_public_key: Vec<u8>,
-    /// Nonce echoed from the original [`ContactMessage`]. Caller can copy this
-    /// into the synthesized contact when proceeding to a normal pairing request.
     pub nonce: u64,
 }
 
@@ -126,6 +118,21 @@ pub struct ProcessPrePairResult {
 /// - The derived shared key should be treated as sensitive material.
 /// - The returned `peer_transport_protocol` is peer-provided data; apply any
 ///   caller-side validation required by the selected transport layer before using it.
+///
+/// # Channel id rekey
+///
+/// After the handshake completes both sides switch from the pre-rekey
+/// `channel_id` (the contact-time value) to a post-handshake id derived
+/// deterministically from the pre-rekey id and the freshly-negotiated
+/// `shared_key` — see [`derive_rekeyed_channel_id`]. This response is the
+/// **only** place the new id crosses the wire, and it travels inside the
+/// encrypted inner message; a passive observer who saw only pre-rekey
+/// traffic cannot link the long-running channel back to its pairing-time
+/// id without the shared key.
+///
+/// The outer envelope still routes on the pre-rekey id — the requester has
+/// no way to know the new id until it has decrypted the inner message and
+/// derived its own copy of the shared key.
 ///
 /// # Example
 ///
@@ -206,10 +213,6 @@ pub fn produce(
         cryptography_pairing::finish_pairing_initiator(initiator_material, &pairing_request)
             .map_err(|e| PairingError::FinishPairingInitiator { source: e })?;
 
-    // Compute the post-handshake channel id. This message is the only
-    // place this value travels on the wire (and it's encrypted), so a
-    // post-pairing observer cannot link the long-running channel back to
-    // its pre-rekey id without the shared key.
     let rekeyed_channel_id = derive_rekeyed_channel_id(channel_id, &shared_key);
 
     let timestamp = current_timestamp();
@@ -225,8 +228,6 @@ pub fn produce(
         channel_id: rekeyed_channel_id.into(),
     };
 
-    // The outer envelope still routes on the *pre-rekey* id; the requester
-    // has no way to know the new id until it decrypts the inner message.
     let envelope = DeRecMessageBuilder::pairing()
         .channel_id(channel_id)
         .timestamp(timestamp)
@@ -322,7 +323,7 @@ pub fn produce_pre_pair(
         mlkem_encapsulation_key: Some(initiator_material.mlkem_encapsulation_key.clone()),
         ecies_public_key: Some(initiator_material.ecies_public_key.clone()),
         nonce: request.nonce,
-        timestamp: Some(timestamp.clone()),
+        timestamp: Some(timestamp),
     };
 
     let protocol_version = ProtocolVersion::current();
@@ -333,10 +334,6 @@ pub fn produce_pre_pair(
         channel_id: channel_id.into(),
         timestamp: Some(timestamp),
         message: MessageBody::PrePairResponse(response).encode_to_vec(),
-        // Echo of the inbound request's `trace_id` is wired in by the
-        // higher-level orchestrator; this low-level primitive currently
-        // constructs the envelope without it. Defaults to 0 (= "no
-        // correlation"), which is wire-equivalent to the unset state.
         trace_id: 0,
     }
     .encode_to_vec();
@@ -652,56 +649,19 @@ pub fn process(
     response: &PairResponseMessage,
     pairing_secret_key_material: &PairingSecretKeyMaterial,
 ) -> Result<ProcessResult, crate::Error> {
-    validate_process_inputs(contact_message, response)?;
+    let responder_material =
+        validate_process_inputs(contact_message, response, pairing_secret_key_material)?;
 
-    let mlkem_encapsulation_key = contact_message
-        .mlkem_encapsulation_key
-        .as_ref()
-        .ok_or(PairingError::InvalidContactMessage(
-            "mlkem_encapsulation_key is missing",
-        ))?
-        .clone();
-    let ecies_public_key = contact_message
-        .ecies_public_key
-        .as_ref()
-        .ok_or(PairingError::InvalidContactMessage(
-            "ecies_public_key is missing",
-        ))?
-        .clone();
-    let pk = cryptography_pairing::PairingContactMessageMaterial {
-        mlkem_encapsulation_key,
-        ecies_public_key,
-    };
+    let pairing_contact_key_material = build_pairing_contact_material(contact_message);
 
-    let responder_material = match pairing_secret_key_material {
-        cryptography_pairing::PairingSecretKeyMaterial::Responder(m) => m,
-        _ => {
-            return Err(PairingError::Invariant(
-                "expected Responder key material for pairing process",
-            )
-            .into());
-        }
-    };
+    let shared_key = cryptography_pairing::finish_pairing_responder(
+        responder_material,
+        &pairing_contact_key_material,
+    )
+    .map_err(|e| PairingError::FinishPairingResponder { source: e })?;
 
-    let shared_key = cryptography_pairing::finish_pairing_responder(responder_material, &pk)
-        .map_err(|e| PairingError::FinishPairingResponder { source: e })?;
-
-    // Validate the rekeyed channel id the responder proposed. A mismatch
-    // means either both sides derived different shared keys (the channel
-    // would be unusable anyway) or the responder is misbehaving / a
-    // forged envelope somehow decrypted; either way we refuse to adopt
-    // the new id.
-    let original_channel_id = ChannelId(contact_message.channel_id);
-    let expected_channel_id = derive_rekeyed_channel_id(original_channel_id, &shared_key);
-    if response.channel_id != u64::from(expected_channel_id) {
-        #[cfg(feature = "logging")]
-        tracing::warn!(
-            advertised = response.channel_id,
-            expected = u64::from(expected_channel_id),
-            "channel id rekey mismatch"
-        );
-        return Err(PairingError::ProtocolViolation("channel_id rekey mismatch").into());
-    }
+    let expected_channel_id =
+        validate_rekeyed_channel_id(response, ChannelId(contact_message.channel_id), &shared_key)?;
 
     #[cfg(feature = "logging")]
     tracing::info!("pairing complete; responder shared key derived");
@@ -769,27 +729,8 @@ pub fn process_pre_pair(
 ) -> Result<ProcessPrePairResult, crate::Error> {
     validate_process_pre_pair_inputs(contact_message, response)?;
 
-    // Safe to unwrap: presence + non-emptiness checked above.
-    let mlkem_encapsulation_key = response.mlkem_encapsulation_key.clone().unwrap();
-    let ecies_public_key = response.ecies_public_key.clone().unwrap();
-    let expected_hash = contact_message.contact_binding_hash.as_ref().unwrap();
-
-    let recomputed = derec_cryptography::pairing::contact_binding_hash(
-        &mlkem_encapsulation_key,
-        &ecies_public_key,
-        contact_message.nonce,
-        contact_message.channel_id,
-    );
-
-    let matched: bool = recomputed.as_slice().ct_eq(expected_hash.as_slice()).into();
-    if !matched {
-        #[cfg(feature = "logging")]
-        tracing::warn!(
-            "contact binding hash mismatch; published keys do not match the contact commitment"
-        );
-
-        return Err(PairingError::PrePairHashMismatch.into());
-    }
+    let (mlkem_encapsulation_key, ecies_public_key) =
+        validate_contact_binding_hash(contact_message, response)?;
 
     #[cfg(feature = "logging")]
     tracing::info!("PrePair response validated against contact binding hash");
@@ -837,10 +778,14 @@ fn extract_peer_transport_protocol(
     Ok(peer_transport_protocol)
 }
 
-fn validate_process_inputs(
+/// Single chokepoint for `process`'s preconditions. Returning the borrowed
+/// `Responder` half lets the caller skip a redundant match after the gate
+/// passes.
+fn validate_process_inputs<'a>(
     contact_message: &ContactMessage,
     response: &PairResponseMessage,
-) -> Result<(), crate::Error> {
+    pairing_secret_key_material: &'a PairingSecretKeyMaterial,
+) -> Result<&'a cryptography_pairing::ResponderSecretKeyMaterial, crate::Error> {
     let res = response
         .result
         .as_ref()
@@ -883,7 +828,53 @@ fn validate_process_inputs(
         return Err(PairingError::ProtocolViolation("nonce mismatch").into());
     }
 
-    Ok(())
+    match pairing_secret_key_material {
+        PairingSecretKeyMaterial::Responder(m) => Ok(m),
+        PairingSecretKeyMaterial::Initiator(_) => Err(PairingError::Invariant(
+            "expected Responder key material for pairing process",
+        )
+        .into()),
+    }
+}
+
+fn build_pairing_contact_material(
+    contact_message: &ContactMessage,
+) -> cryptography_pairing::PairingContactMessageMaterial {
+    let mlkem_encapsulation_key = contact_message
+        .mlkem_encapsulation_key
+        .as_ref()
+        .expect("validate_process_inputs guarantees mlkem_encapsulation_key is Some")
+        .clone();
+    let ecies_public_key = contact_message
+        .ecies_public_key
+        .as_ref()
+        .expect("validate_process_inputs guarantees ecies_public_key is Some")
+        .clone();
+    cryptography_pairing::PairingContactMessageMaterial {
+        mlkem_encapsulation_key,
+        ecies_public_key,
+    }
+}
+
+/// A rekey-id mismatch means either both sides derived different shared
+/// keys (channel would be unusable anyway) or the responder is misbehaving
+/// / a forged envelope somehow decrypted — either way we refuse the id.
+fn validate_rekeyed_channel_id(
+    response: &PairResponseMessage,
+    original_channel_id: ChannelId,
+    shared_key: &PairingSharedKey,
+) -> Result<ChannelId, crate::Error> {
+    let expected_channel_id = derive_rekeyed_channel_id(original_channel_id, shared_key);
+    if response.channel_id != u64::from(expected_channel_id) {
+        #[cfg(feature = "logging")]
+        tracing::warn!(
+            advertised = response.channel_id,
+            expected = u64::from(expected_channel_id),
+            "channel id rekey mismatch"
+        );
+        return Err(PairingError::ProtocolViolation("channel_id rekey mismatch").into());
+    }
+    Ok(expected_channel_id)
 }
 
 fn validate_process_pre_pair_inputs(
@@ -956,10 +947,7 @@ fn validate_process_pre_pair_inputs(
 /// ```
 ///
 /// and returns the first 8 bytes interpreted as a big-endian `u64`. Both
-/// sides feed identical inputs (the channel id from the contact / pairing
-/// envelopes and the freshly negotiated shared key) so they reach the same
-/// result independently. The function is deterministic; the only randomness
-/// in the final id is the pairing-time entropy that fed the shared key.
+/// sides feed identical inputs so they reach the same result independently.
 fn derive_rekeyed_channel_id(
     original_channel_id: ChannelId,
     shared_key: &PairingSharedKey,
@@ -968,11 +956,55 @@ fn derive_rekeyed_channel_id(
     hasher.update(u64::from(original_channel_id).to_be_bytes());
     hasher.update(shared_key.as_slice());
     let digest = hasher.finalize();
-
-    // Safe to unwrap: SHA-384 digests are 48 bytes; the prefix is always
-    // long enough for a u64.
     let prefix: [u8; 8] = digest[..8]
         .try_into()
         .expect("SHA-384 digest has at least 8 bytes");
     ChannelId(u64::from_be_bytes(prefix))
+}
+
+/// Recompute the contact-binding hash from the keys the contact creator
+/// published in the `PrePairResponse` and compare it (constant-time)
+/// against the commitment carried by the original `ContactMessage`. A
+/// mismatch means the keys the scanner is about to pair with do not match
+/// the contact it scanned — either an attacker swapped the keys on the
+/// plaintext PrePair leg, or the contact itself was tampered between
+/// creation and scanning.
+///
+/// `validate_process_pre_pair_inputs` guarantees the two response key
+/// fields and the contact's `contact_binding_hash` are present, so the
+/// `.expect()`s here are infallible.
+fn validate_contact_binding_hash(
+    contact_message: &ContactMessage,
+    response: &PrePairResponseMessage,
+) -> Result<(Vec<u8>, Vec<u8>), crate::Error> {
+    let mlkem_encapsulation_key = response
+        .mlkem_encapsulation_key
+        .clone()
+        .expect("validate_process_pre_pair_inputs guarantees mlkem_encapsulation_key is Some");
+    let ecies_public_key = response
+        .ecies_public_key
+        .clone()
+        .expect("validate_process_pre_pair_inputs guarantees ecies_public_key is Some");
+    let expected_hash = contact_message
+        .contact_binding_hash
+        .as_ref()
+        .expect("validate_process_pre_pair_inputs guarantees contact_binding_hash is Some");
+
+    let recomputed = derec_cryptography::pairing::contact_binding_hash(
+        &mlkem_encapsulation_key,
+        &ecies_public_key,
+        contact_message.nonce,
+        contact_message.channel_id,
+    );
+
+    let matched: bool = recomputed.as_slice().ct_eq(expected_hash.as_slice()).into();
+    if !matched {
+        #[cfg(feature = "logging")]
+        tracing::warn!(
+            "contact binding hash mismatch; published keys do not match the contact commitment"
+        );
+        return Err(PairingError::PrePairHashMismatch.into());
+    }
+
+    Ok((mlkem_encapsulation_key, ecies_public_key))
 }

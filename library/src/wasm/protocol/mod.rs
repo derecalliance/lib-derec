@@ -579,6 +579,8 @@ pub async fn restore_from_recovered_bag(
             created_at,
             // Re-established from the recovery bag: this node is the Owner.
             role: derec_proto::SenderKind::Owner,
+            // Helper channel record — replicas are not part of the recovery bag.
+            replica_id: None,
         };
 
         ch_store

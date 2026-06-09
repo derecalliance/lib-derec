@@ -53,6 +53,15 @@ public static class DeRecCode
     /// </summary>
     public const int MissingSharedKey = 10;
 
+    /// <summary>
+    /// The protocol was built without a local replica id but a replica-mode
+    /// flow was attempted. Returned by every entry point that requires local
+    /// replica identity.
+    /// <see cref="DeRecException.Category"/> is
+    /// <see cref="DeRecCategory.InvalidInput"/>.
+    /// </summary>
+    public const int ReplicaIdNotConfigured = 12;
+
     public const int Encryption = 20;
     public const int Keygen = 21;
     public const int FinishPairingInitiator = 22;
@@ -74,6 +83,27 @@ public static class DeRecCode
     /// <see cref="DeRecCategory.Pairing"/>.
     /// </summary>
     public const int PrePairHashMismatch = 44;
+
+    /// <summary>
+    /// A replica-mode pairing arrived without the reserved
+    /// <c>derec.replica_id</c> key in <c>CommunicationInfo</c>. Replica
+    /// pairings cannot proceed without a peer-side identity to record on
+    /// the channel; the orchestrator refuses the pairing rather than
+    /// completing it with a missing field.
+    /// <see cref="DeRecException.Category"/> is
+    /// <see cref="DeRecCategory.Pairing"/>.
+    /// </summary>
+    public const int MissingReplicaId = 45;
+
+    /// <summary>
+    /// A non-replica pairing carried the reserved <c>derec.replica_id</c>
+    /// key in <c>CommunicationInfo</c>. The reserved key is only valid for
+    /// replica-mode pairings; its presence on an Owner/Helper pairing
+    /// indicates either a misconfigured peer or a downgrade attempt.
+    /// <see cref="DeRecException.Category"/> is
+    /// <see cref="DeRecCategory.Pairing"/>.
+    /// </summary>
+    public const int UnexpectedReplicaId = 46;
 
     public const int EmptyChannels = 60;
     public const int DuplicateChannelId = 61;

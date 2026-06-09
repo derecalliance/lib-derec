@@ -63,6 +63,25 @@ mod utils;
 mod error;
 pub use error::Error;
 
+/// Generate a fresh **replica identity** using the OS CSPRNG.
+///
+/// Replica identities are per-device `u64` values that uniquely identify each
+/// participant in a replica group. The orchestrator auto-injects this id
+/// under the reserved `derec.replica_id` key in `CommunicationInfo` during
+/// replica-mode pairings (see
+/// [`protocol::DeRecProtocolBuilder::with_replica_id`]).
+///
+/// Persistence contract: the caller **must** persist the returned value once
+/// per device and pass the same id on every subsequent
+/// [`protocol::DeRecProtocolBuilder::with_replica_id`] call. A replica that
+/// changes its id between restarts cannot be re-identified by peers and will
+/// fail re-pairing / vault sync.
+///
+/// Apps that do not use replica flows do not need to call this.
+pub fn generate_replica_id() -> u64 {
+    rand::random()
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 mod ffi;
 

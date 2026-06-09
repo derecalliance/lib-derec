@@ -83,6 +83,11 @@ pub const DEREC_CODE_MISSING_SHARED_KEY: i32 = 10;
 /// [`DEREC_CATEGORY_INVALID_INPUT`].
 pub const DEREC_CODE_ROLE_MISMATCH: i32 = 11;
 
+/// The protocol was constructed without `with_replica_id(..)` but a
+/// replica-mode flow was attempted. Returned by every entry point that
+/// requires local replica identity. `DEREC_CATEGORY_INVALID_INPUT`.
+pub const DEREC_CODE_REPLICA_ID_NOT_CONFIGURED: i32 = 12;
+
 pub const DEREC_CODE_ENCRYPTION: i32 = 20;
 pub const DEREC_CODE_KEYGEN: i32 = 21;
 pub const DEREC_CODE_FINISH_PAIRING_INITIATOR: i32 = 22;
@@ -100,6 +105,15 @@ pub const DEREC_CODE_INVALID_PAIR_RESPONSE_MESSAGE: i32 = 43;
 /// the security-relevant framing it deserves (the contact the user
 /// scanned does not match the keys they would pair with).
 pub const DEREC_CODE_PREPAIR_HASH_MISMATCH: i32 = 44;
+
+/// A replica-mode pairing arrived without the reserved
+/// `derec.replica_id` key in `CommunicationInfo`.
+/// `DEREC_CATEGORY_PAIRING`.
+pub const DEREC_CODE_MISSING_REPLICA_ID: i32 = 45;
+
+/// A non-replica pairing carried the reserved `derec.replica_id` key in
+/// `CommunicationInfo`. `DEREC_CATEGORY_PAIRING`.
+pub const DEREC_CODE_UNEXPECTED_REPLICA_ID: i32 = 46;
 
 pub const DEREC_CODE_EMPTY_CHANNELS: i32 = 60;
 pub const DEREC_CODE_DUPLICATE_CHANNEL_ID: i32 = 61;
@@ -220,6 +234,9 @@ fn categorize(err: &crate::Error) -> (i32, i32) {
         crate::Error::RoleMismatch { .. } => {
             (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_ROLE_MISMATCH)
         }
+        crate::Error::ReplicaIdNotConfigured => {
+            (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_REPLICA_ID_NOT_CONFIGURED)
+        }
     }
 }
 
@@ -232,6 +249,8 @@ fn pairing_code(e: &PairingError) -> i32 {
         PairingError::NonOkStatus { .. } => DEREC_CODE_NON_OK_STATUS,
         PairingError::ProtocolViolation(_) => DEREC_CODE_PROTOCOL_VIOLATION,
         PairingError::PrePairHashMismatch => DEREC_CODE_PREPAIR_HASH_MISMATCH,
+        PairingError::MissingReplicaId { .. } => DEREC_CODE_MISSING_REPLICA_ID,
+        PairingError::UnexpectedReplicaId { .. } => DEREC_CODE_UNEXPECTED_REPLICA_ID,
         PairingError::Invariant(_) => DEREC_CODE_INVARIANT,
         PairingError::ContactMessageKeygen { .. } => DEREC_CODE_KEYGEN,
         PairingError::PairRequestKeygen { .. } => DEREC_CODE_KEYGEN,

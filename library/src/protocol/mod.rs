@@ -17,6 +17,7 @@
 
 pub mod error;
 pub mod events;
+pub mod reserved_keys;
 pub mod traits;
 
 mod builder;
@@ -156,6 +157,15 @@ pub struct DeRecProtocol<
     /// Active sharing round, if any. Populated by `start(ProtectSecret)` and
     /// consumed when all targeted Helpers respond or time out.
     sharing_round: Option<SharingRound>,
+    /// Configured via [`DeRecProtocolBuilder::with_replica_id`].
+    ///
+    /// `Some(id)` enables this node to participate in replica-mode pairings
+    /// (the id is auto-injected under `derec.replica_id` in outbound
+    /// `PairRequest`/`PairResponse`, and required to honour inbound replica
+    /// pairings). `None` disables replica flows entirely — any attempt to
+    /// initiate or accept a replica-mode pairing returns
+    /// [`Error::ReplicaIdNotConfigured`](crate::Error::ReplicaIdNotConfigured).
+    pub(crate) replica_id: Option<u64>,
 }
 
 impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecTransport>
@@ -191,7 +201,20 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
             auto_respond_on_failure: false,
             auto_reply_to: false,
             sharing_round: None,
+            replica_id: None,
         }
+    }
+
+    /// Returns the configured local replica id, or `None` if the protocol
+    /// was built without [`DeRecProtocolBuilder::with_replica_id`].
+    ///
+    /// Apps can use this to surface "replica flows are enabled" to the user,
+    /// or to inspect their own identity for logging/diagnostics. The id is
+    /// the same value that the orchestrator auto-injects under
+    /// `derec.replica_id` in outbound replica-mode `PairRequest` /
+    /// `PairResponse` envelopes.
+    pub fn replica_id(&self) -> Option<u64> {
+        self.replica_id
     }
 
     /// Generate an out-of-band contact message (QR code payload, deep link, …).
@@ -323,6 +346,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     kind,
                     contact,
                     peer_communication_info,
+                    self.replica_id,
                 )
                 .await?;
                 Ok(Some(channel_id))
@@ -514,6 +538,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     &pairing_secret,
                     kind,
                     trace_id,
+                    self.replica_id,
                 )
                 .await
             }
@@ -1017,6 +1042,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                         channel_id,
                         &pairing_secret,
                         message.trace_id,
+                        self.replica_id,
                     )
                     .await?;
                     return Ok(Some(events));
@@ -1040,6 +1066,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                         channel_id,
                         &contact,
                         &resp,
+                        self.replica_id,
                     )
                     .await?;
                     return Ok(Some(events));
@@ -1063,6 +1090,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
             message,
             channel_id,
             &pairing_secret,
+            self.replica_id,
         )
         .await?;
         Ok(Some(events))

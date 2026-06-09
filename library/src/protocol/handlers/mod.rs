@@ -226,6 +226,7 @@ pub(in crate::protocol) async fn handle_pairing<Ch: DeRecChannelStore, Ss: DeRec
     message: &DeRecMessage,
     channel_id: ChannelId,
     pairing_secret: &PairingSecretKeyMaterial,
+    replica_id: Option<u64>,
 ) -> Result<Vec<DeRecEvent>> {
     let inner =
         crate::derec_message::extract_inner_pairing_message(&message.message, pairing_secret)?;
@@ -237,6 +238,7 @@ pub(in crate::protocol) async fn handle_pairing<Ch: DeRecChannelStore, Ss: DeRec
         channel_id,
         pairing_secret,
         message.trace_id,
+        replica_id,
     )
     .await
 }

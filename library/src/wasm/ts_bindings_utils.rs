@@ -87,6 +87,7 @@ fn categorize(err: &crate::Error) -> (&'static str, &'static str) {
         crate::Error::ProtobufEncode(_) => ("protobuf", "ENCODE_ERROR"),
         crate::Error::Invariant(_) => ("invariant", "INVARIANT_VIOLATED"),
         crate::Error::RoleMismatch { .. } => ("input", "ROLE_MISMATCH"),
+        crate::Error::ReplicaIdNotConfigured => ("input", "REPLICA_ID_NOT_CONFIGURED"),
     }
 }
 
@@ -99,6 +100,8 @@ fn pairing_code(e: &PairingError) -> &'static str {
         PairingError::NonOkStatus { .. } => "NON_OK_STATUS",
         PairingError::ProtocolViolation(_) => "PROTOCOL_VIOLATION",
         PairingError::PrePairHashMismatch => "PREPAIR_HASH_MISMATCH",
+        PairingError::MissingReplicaId { .. } => "MISSING_REPLICA_ID",
+        PairingError::UnexpectedReplicaId { .. } => "UNEXPECTED_REPLICA_ID",
         PairingError::Invariant(_) => "INVARIANT",
         PairingError::ContactMessageKeygen { .. } => "CONTACT_MESSAGE_KEYGEN",
         PairingError::PairRequestKeygen { .. } => "PAIR_REQUEST_KEYGEN",

@@ -33,6 +33,7 @@ pub fn run_all() {
 
     rt.block_on(run_pairing_flow());
     rt.block_on(run_hashed_keys_pairing_flow());
+    rt.block_on(run_replica_id_wiring_flow());
     rt.block_on(run_sharing_flow());
     rt.block_on(run_discovery_and_recovery_flow());
     rt.block_on(run_unpairing_flow());
@@ -325,18 +326,32 @@ impl Peer {
     }
 
     fn with_threshold(label: &'static str, uri: &str, threshold: usize) -> Self {
-        Self::with_options(label, uri, threshold, false)
+        Self::with_options(label, uri, threshold, false, None)
     }
 
     /// Same as [`Peer::new`] but flips `with_auto_reply_to(true)` on the
     /// builder so every outbound request stamps `replyTo = own_transport`.
     fn with_auto_reply_to(label: &'static str, uri: &str) -> Self {
-        Self::with_options(label, uri, 2, true)
+        Self::with_options(label, uri, 2, true, None)
     }
 
-    fn with_options(label: &'static str, uri: &str, threshold: usize, auto_reply_to: bool) -> Self {
+    /// Configure a local `replica_id`, enabling this peer to participate in
+    /// replica-mode pairings. The id is generated fresh per peer; pass
+    /// `Some(id)` from the caller side if you need two peers to share the
+    /// same value (e.g. testing peer-identity round-trip).
+    fn with_replica_id(label: &'static str, uri: &str, replica_id: u64) -> Self {
+        Self::with_options(label, uri, 2, false, Some(replica_id))
+    }
+
+    fn with_options(
+        label: &'static str,
+        uri: &str,
+        threshold: usize,
+        auto_reply_to: bool,
+        replica_id: Option<u64>,
+    ) -> Self {
         let transport = InProcessTransport::new();
-        let protocol = DeRecProtocolBuilder::new()
+        let mut builder = DeRecProtocolBuilder::new()
             .with_channel_store(InMemoryChannelStore::default())
             .with_share_store(InMemoryShareStore::default())
             .with_secret_store(InMemorySecretStore::default())
@@ -346,8 +361,11 @@ impl Peer {
                 protocol: Protocol::Https.into(),
             })
             .with_threshold(threshold)
-            .with_auto_reply_to(auto_reply_to)
-            .build();
+            .with_auto_reply_to(auto_reply_to);
+        if let Some(id) = replica_id {
+            builder = builder.with_replica_id(id);
+        }
+        let protocol = builder.build();
 
         Self {
             label,
@@ -741,6 +759,180 @@ async fn run_hashed_keys_pairing_flow() {
     );
 
     println!("Protocol HashedKeys pairing — tampered binding hash test passed.");
+}
+
+
+/// Exercises the `derec.replica_id` wiring added in #53. Three scenarios:
+///
+/// 1. **Happy path**: two replica-configured peers complete a replica-mode
+///    pairing; both sides' `Channel.replica_id` carries the *peer*'s id (the
+///    bytes round-trip through `CommunicationInfo`).
+/// 2. **Initiator missing replica_id**: `start(Pairing { kind: Replica })`
+///    on a protocol built without `with_replica_id` fails fast with
+///    `Error::ReplicaIdNotConfigured` — no bytes hit the wire.
+/// 3. **Responder missing replica_id**: an incoming `PairRequest` with
+///    `sender_kind == Replica` against a contact creator that has no
+///    `replica_id` configured returns the same error from `process()`.
+async fn run_replica_id_wiring_flow() {
+    println!("=== Protocol replica_id wiring flow ===");
+
+    // -- Scenario 1: happy path --
+    let owner_id = 0x1111_2222_3333_4444u64;
+    let helper_id = 0xAAAA_BBBB_CCCC_DDDDu64;
+    let channel_id = ChannelId(1);
+
+    let mut owner = Peer::with_replica_id("owner", "https://owner.example.com", owner_id);
+    let mut helper = Peer::with_replica_id("helper", "https://helper.example.com", helper_id);
+
+    let contact = owner
+        .protocol
+        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys)
+        .await
+        .expect("owner.create_contact failed");
+
+    helper
+        .protocol
+        .start(DeRecFlow::Pairing {
+            kind: SenderKind::Replica,
+            contact,
+            peer_communication_info: std::collections::HashMap::new(),
+        })
+        .await
+        .expect("helper start(Pairing, kind=Replica) failed");
+
+    let helper_to_owner = pump(&mut helper, &mut owner).await;
+    let _owner_to_helper = pump(&mut owner, &mut helper).await;
+
+    assert!(
+        helper_to_owner
+            .iter()
+            .any(|e| matches!(e, DeRecEvent::PairingCompleted { .. })),
+        "expected PairingCompleted for replica pairing"
+    );
+
+    // Both sides' Channel records carry the PEER's replica id (not their own).
+    let owner_channel = owner
+        .protocol
+        .channel_store
+        .load(channel_id)
+        .await
+        .expect("owner channel load")
+        .expect("owner channel must exist");
+    let helper_channel = helper
+        .protocol
+        .channel_store
+        .load(channel_id)
+        .await
+        .expect("helper channel load")
+        .expect("helper channel must exist");
+
+    assert_eq!(
+        owner_channel.replica_id,
+        Some(helper_id),
+        "owner-side Channel.replica_id must carry helper's id, got {:?}",
+        owner_channel.replica_id,
+    );
+    assert_eq!(
+        helper_channel.replica_id,
+        Some(owner_id),
+        "helper-side Channel.replica_id must carry owner's id, got {:?}",
+        helper_channel.replica_id,
+    );
+    assert_eq!(owner_channel.role, SenderKind::Replica);
+    assert_eq!(helper_channel.role, SenderKind::Replica);
+
+    // The reserved key MUST NOT leak into the free-form communication_info
+    // map exposed to the app — extract_communication_info strips it.
+    assert!(
+        !owner_channel
+            .communication_info
+            .contains_key("derec.replica_id"),
+        "owner-side communication_info must not contain reserved key"
+    );
+    assert!(
+        !helper_channel
+            .communication_info
+            .contains_key("derec.replica_id"),
+        "helper-side communication_info must not contain reserved key"
+    );
+
+    println!("  happy path: both sides carry peer replica_id ✓");
+
+
+    // -- Scenario 2: initiator missing replica_id --
+    let mut owner = Peer::with_replica_id("owner", "https://owner.example.com", owner_id);
+    let mut helper_unconfigured = Peer::new("helper", "https://helper.example.com");
+
+    let contact = owner
+        .protocol
+        .create_contact(Some(ChannelId(2)), derec_proto::ContactMode::InlineKeys)
+        .await
+        .expect("owner.create_contact failed");
+
+    let result = helper_unconfigured
+        .protocol
+        .start(DeRecFlow::Pairing {
+            kind: SenderKind::Replica,
+            contact,
+            peer_communication_info: std::collections::HashMap::new(),
+        })
+        .await;
+    assert!(
+        matches!(result, Err(derec_library::Error::ReplicaIdNotConfigured)),
+        "unconfigured initiator must refuse replica-mode start, got {result:?}"
+    );
+    // And: no bytes left the wire.
+    assert!(
+        helper_unconfigured.drain().is_empty(),
+        "no outbound traffic should have been generated"
+    );
+
+    println!("  initiator without replica_id: ReplicaIdNotConfigured ✓");
+
+
+    // -- Scenario 3: responder missing replica_id --
+    // Helper IS configured, Owner is NOT. Helper sends a Replica PairRequest;
+    // Owner's process() must reject it before surfacing any ActionRequired.
+    let mut owner_unconfigured = Peer::new("owner", "https://owner.example.com");
+    let mut helper = Peer::with_replica_id("helper", "https://helper.example.com", helper_id);
+
+    let contact = owner_unconfigured
+        .protocol
+        .create_contact(Some(ChannelId(3)), derec_proto::ContactMode::InlineKeys)
+        .await
+        .expect("owner.create_contact failed");
+
+    helper
+        .protocol
+        .start(DeRecFlow::Pairing {
+            kind: SenderKind::Replica,
+            contact,
+            peer_communication_info: std::collections::HashMap::new(),
+        })
+        .await
+        .expect("helper start should succeed (helper IS configured)");
+
+    let mut from_helper = helper.drain();
+    assert_eq!(
+        from_helper.len(),
+        1,
+        "helper should have queued exactly one PairRequest"
+    );
+    let (_, pair_request_bytes) = from_helper.pop().unwrap();
+    let err = owner_unconfigured
+        .protocol
+        .process(&pair_request_bytes)
+        .await
+        .err()
+        .expect("unconfigured responder must refuse replica-mode PairRequest");
+    assert!(
+        matches!(err.source, derec_library::Error::ReplicaIdNotConfigured),
+        "expected ReplicaIdNotConfigured on responder, got: {err}"
+    );
+
+    println!("  responder without replica_id: ReplicaIdNotConfigured ✓");
+
+    println!("Protocol replica_id wiring flow test passed.");
 }
 
 

@@ -21,7 +21,6 @@ use std::collections::HashMap;
 const SHARE_ALGORITHM_VSS: i32 = 0;
 
 pub struct SplitResult {
-    /// Mapping from Helper [`ChannelId`] to its committed share.
     pub shares: HashMap<ChannelId, CommittedDeRecShare>,
 }
 
@@ -32,7 +31,6 @@ pub struct ProduceResult {
 }
 
 pub struct ExtractResult {
-    /// The decrypted inner [`derec_proto::StoreShareRequestMessage`].
     pub request: StoreShareRequestMessage,
 }
 

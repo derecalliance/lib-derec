@@ -55,6 +55,7 @@ pub struct DeRecProtocolBuilder<ChannelStore, ShareStore, SecretStore, Transport
     auto_respond_on_failure: bool,
     unpair_ack: UnpairAck,
     auto_reply_to: bool,
+    replica_id: Option<u64>,
 }
 
 impl
@@ -81,6 +82,7 @@ impl
             auto_respond_on_failure: false,
             unpair_ack: UnpairAck::Required,
             auto_reply_to: false,
+            replica_id: None,
         }
     }
 }
@@ -192,6 +194,30 @@ impl<ChannelStore, ShareStore, SecretStore, Transport, OwnTransport>
         self.auto_reply_to = enabled;
         self
     }
+
+    /// Configure this node's local **replica identity**.
+    ///
+    /// Required to participate in any replica-mode pairing — when set, the
+    /// orchestrator auto-injects the id (hex-encoded) under the reserved key
+    /// `derec.replica_id` in outbound `PairRequest` / `PairResponse`
+    /// envelopes whose `sender_kind == Replica`, and accepts inbound replica
+    /// pairings that advertise the peer's id under the same key.
+    ///
+    /// Apps that do not use replica flows simply do not call this setter.
+    /// With no replica id configured, the orchestrator rejects every
+    /// replica-mode entry point with
+    /// [`Error::ReplicaIdNotConfigured`](crate::Error::ReplicaIdNotConfigured);
+    /// `Owner` and `Helper` pairings are unaffected.
+    ///
+    /// The id must be **stable across restarts** — persist it on the device
+    /// once and pass the same value on every protocol init. Use
+    /// [`crate::generate_replica_id`] to mint a fresh one with the OS CSPRNG.
+    ///
+    /// Default: unset (replica flows disabled).
+    pub fn with_replica_id(mut self, id: u64) -> Self {
+        self.replica_id = Some(id);
+        self
+    }
 }
 
 impl<ShareStore, SecretStore, Transport, OwnTransport>
@@ -222,6 +248,7 @@ impl<ShareStore, SecretStore, Transport, OwnTransport>
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
+            replica_id: self.replica_id,
         }
     }
 }
@@ -260,6 +287,7 @@ impl<ChannelStore, SecretStore, Transport, OwnTransport>
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
+            replica_id: self.replica_id,
         }
     }
 }
@@ -298,6 +326,7 @@ impl<ChannelStore, ShareStore, Transport, OwnTransport>
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
+            replica_id: self.replica_id,
         }
     }
 }
@@ -336,6 +365,7 @@ impl<ChannelStore, ShareStore, SecretStore, OwnTransport>
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
+            replica_id: self.replica_id,
         }
     }
 }
@@ -370,6 +400,7 @@ impl<ChannelStore, ShareStore, SecretStore, Transport>
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
+            replica_id: self.replica_id,
         }
     }
 }
@@ -403,6 +434,7 @@ impl<Cs: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, Tr: DeRec
         protocol.auto_respond_on_failure = self.auto_respond_on_failure;
         protocol.unpair_ack = self.unpair_ack;
         protocol.auto_reply_to = self.auto_reply_to;
+        protocol.replica_id = self.replica_id;
         protocol
     }
 }

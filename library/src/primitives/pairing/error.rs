@@ -21,15 +21,22 @@ pub enum PairingError {
     #[error("pairing protocol violation: {0}")]
     ProtocolViolation(&'static str),
 
-    /// Returned by the scanner-side `process_pre_pair_response` when the
-    /// public keys published by the contact creator don't hash to the
-    /// `contactBindingHash` carried by the original `ContactMessage`.
-    ///
-    /// Cryptographically distinguishable from a normal rejection — surfaces
-    /// as an error so applications can flag it specifically (the contact
-    /// the user scanned does not match the keys they would pair with).
     #[error("contact binding hash mismatch: published keys do not match the contact commitment")]
     PrePairHashMismatch,
+
+    #[error(
+        "replica-mode pairing (sender_kind={sender_kind:?}) missing the reserved `derec.replica_id` key"
+    )]
+    MissingReplicaId {
+        sender_kind: derec_proto::SenderKind,
+    },
+
+    #[error(
+        "non-replica pairing (sender_kind={sender_kind:?}) carries the reserved `derec.replica_id` key"
+    )]
+    UnexpectedReplicaId {
+        sender_kind: derec_proto::SenderKind,
+    },
 
     #[error("internal invariant violated: {0}")]
     Invariant(&'static str),

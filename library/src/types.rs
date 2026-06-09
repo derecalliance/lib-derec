@@ -136,6 +136,13 @@ pub struct Channel {
     /// other way around — a `StoreShareRequest` is only honored on a channel
     /// where this node is the `Helper`, and so on.
     pub role: derec_proto::SenderKind,
+    /// The peer's replica identity, populated only when `role == Replica`.
+    ///
+    /// Extracted from the peer's `derec.replica_id` entry in
+    /// `CommunicationInfo` during the pair handshake (see Stage 3 wiring).
+    /// `None` on Helper/Owner channels and as a defensive default on
+    /// freshly-paired Replica channels where the peer did not advertise one.
+    pub replica_id: Option<u64>,
 }
 
 /// Per-helper metadata stored inside the secret bag for recovery.

@@ -20,9 +20,7 @@ use prost_types::Timestamp;
 use rand::{Rng, rng};
 
 pub struct CreateContactResult {
-    /// Decoded [`derec_proto::ContactMessage`] — serialize with `.encode_to_vec()` before sending out-of-band.
     pub contact_message: ContactMessage,
-    /// Initiator-side pairing secret key material associated with this contact.
     pub secret_key: PairingSecretKeyMaterial,
 }
 
@@ -30,15 +28,11 @@ pub struct ProduceResult {
     /// Serialized outer [`derec_proto::DeRecMessage`] wire bytes carrying an encrypted inner
     /// [`derec_proto::PairRequestMessage`]. Ready to send over transport.
     pub envelope: Vec<u8>,
-    /// The validated [`derec_proto::ContactMessage`] decoded from the initiator's out-of-band
-    /// contact bytes.
     pub initiator_contact_message: ContactMessage,
-    /// Responder-side pairing secret key material associated with this request.
     pub secret_key: PairingSecretKeyMaterial,
 }
 
 pub struct ExtractResult {
-    /// Decrypted inner pairing request message.
     pub request: PairRequestMessage,
 }
 
@@ -49,7 +43,6 @@ pub struct ProducePrePairResult {
 }
 
 pub struct PrePairExtractResult {
-    /// Decoded inner plaintext [`derec_proto::PrePairRequestMessage`].
     pub request: PrePairRequestMessage,
 }
 
@@ -276,33 +269,15 @@ pub fn produce(
         ContactMode::InlineKeys,
     )?;
 
-    let mlkem_encapsulation_key = contact_message
-        .mlkem_encapsulation_key
-        .as_ref()
-        .expect("validate_inputs guarantees mlkem_encapsulation_key is Some")
-        .clone();
-    let ecies_public_key = contact_message
-        .ecies_public_key
-        .as_ref()
-        .expect("validate_inputs guarantees ecies_public_key is Some")
-        .clone();
-
-    let contact_pk = cryptography_pairing::PairingContactMessageMaterial {
-        mlkem_encapsulation_key,
-        ecies_public_key,
-    };
-
-    let seed = generate_seed::<32>();
-
-    let (req_pk, secret_key) = cryptography_pairing::pairing_request_message(*seed, &contact_pk)
-        .map_err(|e| PairingError::PairRequestKeygen { source: e })?;
+    let (pairing_request_key_material, secret_key) =
+        create_pairing_request_material(contact_message)?;
 
     let timestamp = current_timestamp();
 
     let request = PairRequestMessage {
         sender_kind: kind.into(),
-        mlkem_ciphertext: req_pk.mlkem_ciphertext,
-        ecies_public_key: req_pk.ecies_public_key,
+        mlkem_ciphertext: pairing_request_key_material.mlkem_ciphertext,
+        ecies_public_key: pairing_request_key_material.ecies_public_key.clone(),
         nonce: contact_message.nonce,
         communication_info,
         parameter_range: None,
@@ -310,18 +285,21 @@ pub fn produce(
         timestamp: Some(timestamp),
     };
 
-    let ecies_pk =
-        contact_message
-            .ecies_public_key
-            .as_ref()
-            .ok_or(PairingError::InvalidContactMessage(
-                "ecies_public_key is missing",
-            ))?;
+    // Encrypt with the INITIATOR's ECIES public key (from the contact) —
+    // only the initiator's matching secret key can decrypt. The
+    // responder's own freshly-generated pubkey travels in
+    // `request.ecies_public_key` (above) for the initiator to ECDH against
+    // when finishing the pairing; it is NOT the encryption key here.
     let envelope = DeRecMessageBuilder::pairing()
         .channel_id(contact_message.channel_id.into())
         .timestamp(timestamp)
         .message_body(MessageBody::PairRequest(request))
-        .encrypt_pairing(ecies_pk)?
+        .encrypt_pairing(
+            contact_message
+                .ecies_public_key
+                .as_ref()
+                .expect("validate_inputs guarantees ecies_public_key is Some"),
+        )?
         .build()?
         .encode_to_vec();
 
@@ -410,10 +388,6 @@ pub fn produce_pre_pair_request(
         channel_id: contact_message.channel_id,
         timestamp: Some(timestamp),
         message: MessageBody::PrePairRequest(request).encode_to_vec(),
-        // Correlation token is the higher-level orchestrator's concern;
-        // the low-level PrePair primitive currently emits 0 (= "no
-        // correlation"). The `auto_trace_id` helper on the builder
-        // would produce a random one when callers want it.
         trace_id: 0,
     }
     .encode_to_vec();
@@ -745,11 +719,6 @@ pub(crate) fn validate_contact_for_mode(
     Ok(())
 }
 
-/// Builds a `ContactMessage` for [`ContactMode::InlineKeys`].
-///
-/// The initiator's ML-KEM encapsulation key and ECIES public key are placed
-/// directly in the contact. The responder reads them and proceeds straight to
-/// [`PairRequestMessage`] without any PrePair exchange.
 fn create_contact_inlined_keys(
     channel_id: ChannelId,
     nonce: u64,
@@ -769,26 +738,6 @@ fn create_contact_inlined_keys(
     }
 }
 
-/// Builds a `ContactMessage` for [`ContactMode::HashedKeys`].
-///
-/// The public keys are **not** placed in the contact. Instead, the contact
-/// carries a SHA-384 commitment that binds them to this specific session, per
-/// `contact.proto`:
-///
-/// ```text
-/// contactBindingHash = SHA-384(
-///     mlkemEncapsulationKey
-///     || eciesPublicKey
-///     || u64_be(nonce)
-///     || u64_be(channelId)
-/// )
-/// ```
-///
-/// The responder later retrieves the actual keys via the `PrePair` exchange
-/// and recomputes this hash to verify integrity before constructing the
-/// [`PairRequestMessage`]. Because the keys are revealed through plaintext
-/// `PrePair*` messages, the `transport_protocol` supplied here must be
-/// ephemeral — see the security note on `PrePairRequestMessage`.
 fn create_contact_hashed_keys(
     channel_id: ChannelId,
     nonce: u64,
@@ -813,4 +762,41 @@ fn create_contact_hashed_keys(
         nonce,
         timestamp: Some(timestamp),
     }
+}
+
+/// Build the responder-side pairing key material from the initiator's
+/// `ContactMessage`: encapsulates a fresh ML-KEM ciphertext against the
+/// initiator's encapsulation key, generates an ECIES key pair, and returns
+/// both the on-the-wire request material and the local secret to keep.
+///
+/// Callers must have validated the contact via
+/// [`validate_inputs`]`(.., ContactMode::InlineKeys)` first — the
+/// `.expect()`s below are infallible otherwise.
+fn create_pairing_request_material(
+    contact_message: &ContactMessage,
+) -> Result<
+    (
+        cryptography_pairing::PairingRequestMessageMaterial,
+        cryptography_pairing::ResponderSecretKeyMaterial,
+    ),
+    crate::Error,
+> {
+    let mlkem_encapsulation_key = contact_message
+        .mlkem_encapsulation_key
+        .as_ref()
+        .expect("validate_inputs guarantees mlkem_encapsulation_key is Some")
+        .clone();
+    let ecies_public_key = contact_message
+        .ecies_public_key
+        .as_ref()
+        .expect("validate_inputs guarantees ecies_public_key is Some")
+        .clone();
+
+    let contact_pk = PairingContactMessageMaterial {
+        mlkem_encapsulation_key,
+        ecies_public_key,
+    };
+    let seed = generate_seed::<32>();
+    cryptography_pairing::pairing_request_message(*seed, &contact_pk)
+        .map_err(|e| PairingError::PairRequestKeygen { source: e }.into())
 }
