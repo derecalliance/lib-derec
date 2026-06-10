@@ -220,8 +220,7 @@ pub trait DeRecSecretStore {
 /// [`linked_channels`](DeRecChannelStore::linked_channels) returns a channel's
 /// whole connected component. Linking moves no share data — it is pure
 /// relationship metadata. Recovery/discovery resolves the linked set here, then
-/// loads the corresponding shares via
-/// [`DeRecShareStore::load_many`](DeRecShareStore::load_many).
+/// loads the corresponding shares via [`DeRecShareStore::load_many`].
 ///
 /// # Executor independence
 ///
@@ -263,10 +262,8 @@ pub trait DeRecChannelStore {
     /// `channel_id` itself** (its transitive-closure / connected component).
     ///
     /// An unlinked channel returns `[channel_id]`. Order is unspecified. The
-    /// returned IDs are typically fed to
-    /// [`DeRecShareStore::load_many`](DeRecShareStore::load_many) (for a
-    /// specific `secret_id`) or
-    /// [`DeRecShareStore::load_all`](DeRecShareStore::load_all) (discovery) to
+    /// returned IDs are typically fed to [`DeRecShareStore::load_many`] (for a
+    /// specific `secret_id`) or [`DeRecShareStore::load_all`] (discovery) to
     /// aggregate shares across re-pairings without duplicating data.
     fn linked_channels(&self, channel_id: ChannelId) -> ChannelStoreFuture<'_, Vec<ChannelId>>;
 }

@@ -200,8 +200,9 @@ impl<ChannelStore, ShareStore, SecretStore, Transport, OwnTransport>
     /// Required to participate in any replica-mode pairing — when set, the
     /// orchestrator auto-injects the id (hex-encoded) under the reserved key
     /// `derec.replica_id` in outbound `PairRequest` / `PairResponse`
-    /// envelopes whose `sender_kind == Replica`, and accepts inbound replica
-    /// pairings that advertise the peer's id under the same key.
+    /// envelopes whose `sender_kind` is `ReplicaSource` or
+    /// `ReplicaDestination`, and accepts inbound replica pairings that
+    /// advertise the peer's id under the same key.
     ///
     /// Apps that do not use replica flows simply do not call this setter.
     /// With no replica id configured, the orchestrator rejects every

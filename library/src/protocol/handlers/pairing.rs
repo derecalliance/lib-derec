@@ -781,13 +781,13 @@ fn build_communication_info(
 /// The reserved key is **stripped from the returned map** so apps can't
 /// accidentally observe it (or, in subsequent broadcasts, re-transmit it).
 ///
-/// Validation against `peer_kind`:
-/// - `peer_kind == Replica`: the reserved key MUST be present and parse
-///   as a valid hex `u64` (error: [`PairingError::MissingReplicaId`] or
-///   [`Error::InvalidInput`]).
-/// - `peer_kind != Replica`: the reserved key MUST NOT be present (error:
-///   [`PairingError::UnexpectedReplicaId`]). Non-replica pairings have no
-///   business carrying replica identity.
+/// Validation against `peer_kind` (via [`is_replica_kind`]):
+/// - replica kinds (`ReplicaSource`, `ReplicaDestination`): the reserved
+///   key MUST be present and parse as a valid hex `u64` (error:
+///   [`PairingError::MissingReplicaId`] or [`Error::InvalidInput`]).
+/// - non-replica kinds (`Owner`, `Helper`): the reserved key MUST NOT be
+///   present (error: [`PairingError::UnexpectedReplicaId`]). Non-replica
+///   pairings have no business carrying replica identity.
 fn extract_communication_info(
     info: &Option<CommunicationInfo>,
     peer_kind: SenderKind,
@@ -887,8 +887,9 @@ fn pair_completion_events(
 
 /// Gate for replica-mode pairings on the local side.
 ///
-/// Returns `Some(id)` if `kind == Replica` (and the protocol was configured
-/// with a replica id), `None` for non-replica pairings, or
+/// Returns `Some(id)` when `kind` is `ReplicaSource` or
+/// `ReplicaDestination` (and the protocol was configured with a replica
+/// id), `None` for non-replica pairings, or
 /// [`Error::ReplicaIdNotConfigured`] when a replica-mode pairing was
 /// attempted without local identity. The returned `Option<u64>` is exactly
 /// what [`build_communication_info`] expects.

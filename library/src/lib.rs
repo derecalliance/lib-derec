@@ -14,12 +14,14 @@
 //!
 //! The library implements the core protocol flows defined by DeRec:
 //!
-//! - [`pairing`] — establishes a secure communication channel between an Owner
-//!   and a Helper
-//! - [`sharing`] — generates and distributes secret shares to Helpers
-//! - [`verification`] — periodically checks that Helpers are still storing
-//!   the correct share
-//! - [`recovery`] — reconstructs the secret using shares retrieved from Helpers
+//! - [`primitives::pairing`] — establishes a secure communication channel
+//!   between an Owner and a Helper
+//! - [`primitives::sharing`] — generates and distributes secret shares to
+//!   Helpers
+//! - [`primitives::verification`] — periodically checks that Helpers are
+//!   still storing the correct share
+//! - [`primitives::recovery`] — reconstructs the secret using shares
+//!   retrieved from Helpers
 //!
 //! These flows correspond to the lifecycle of a protected secret:
 //!
@@ -34,8 +36,8 @@
 //! functions required to produce and process protocol messages.
 //!
 //! Protocol messages themselves are defined using **protobuf** and are exposed
-//! through the [`protos`] module. Most applications should interact with the
-//! higher-level APIs instead of manipulating protobuf messages directly.
+//! through the [`derec_proto`] crate. Most applications should interact with
+//! the higher-level APIs instead of manipulating protobuf messages directly.
 //!
 //! ## Error handling
 //!

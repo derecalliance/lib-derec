@@ -75,8 +75,10 @@ pub fn extract_inner_pairing_message(
 /// directly — no encryption, because no shared or asymmetric key exists
 /// yet at that point in the protocol.
 ///
-/// Pair with [`DeRecMessageBuilder::plaintext`]`().finalize().build()`
-/// for symmetric construction.
+/// Counterpart to the plaintext PrePair envelope builder path —
+/// see [`crate::primitives::pairing::request::produce_pre_pair_request`]
+/// and [`crate::primitives::pairing::response::produce_pre_pair`] for the
+/// producers that emit the bytes this function decodes.
 pub fn extract_inner_plaintext_message(
     message_bytes: &[u8],
 ) -> Result<MessageBody, crate::Error> {

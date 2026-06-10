@@ -85,13 +85,15 @@ pub struct Encrypted;
 
 /// Builder mode for pairing messages.
 ///
-/// In this mode, the builder only exposes [`encrypt_pairing`](DeRecMessageBuilder::<NotEncrypted, PairingMode>::encrypt_pairing).
+/// In this mode, the builder only exposes `encrypt_pairing` (see the
+/// `impl DeRecMessageBuilder<NotEncrypted, PairingMode>` block).
 #[derive(Debug)]
 pub struct PairingMode;
 
 /// Builder mode for channel messages.
 ///
-/// In this mode, the builder only exposes [`encrypt`](DeRecMessageBuilder::<NotEncrypted, ChannelMode>::encrypt).
+/// In this mode, the builder only exposes `encrypt` (see the
+/// `impl DeRecMessageBuilder<NotEncrypted, ChannelMode>` block).
 #[derive(Debug)]
 pub struct ChannelMode;
 
@@ -247,10 +249,10 @@ impl<State, Mode> DeRecMessageBuilder<State, Mode> {
 
     /// Encodes the inner payload and sets the `message_type` discriminant from a [`MessageBody`].
     ///
-    /// This is the preferred alternative to [`message`](Self::message) for all flows that
-    /// have a corresponding [`MessageType`] variant.  It serializes the inner message with
-    /// `prost` **and** records the correct `i32` `message_type` value so that [`build`](DeRecMessageBuilder::build)
-    /// can embed it in the outer [`DeRecMessage`] envelope.
+    /// This is the canonical way to attach the inner message — `prost`-encodes the
+    /// payload **and** records the correct `i32` `message_type` value so that
+    /// [`DeRecMessageBuilder::build`] can embed it in the outer [`DeRecMessage`]
+    /// envelope.
     ///
     /// # Arguments
     ///

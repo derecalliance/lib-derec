@@ -153,7 +153,7 @@ pub enum DeRecFlow {
     /// Initiate an unpair flow against one or more paired channels.
     ///
     /// **Owner-initiated only.** This node must hold
-    /// [`SenderKind::Owner`](derec_proto::SenderKind::Owner) on every channel
+    /// [`derec_proto::SenderKind::Owner`] on every channel
     /// in `target`; otherwise [`crate::Error::RoleMismatch`] is returned.
     /// Helpers cannot tear down the relationship from the protocol layer —
     /// they may only refuse an incoming unpair request via

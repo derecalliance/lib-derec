@@ -554,10 +554,12 @@ async fn distribute_shares<Sh: DeRecShareStore, T: DeRecTransport>(
 
 /// Inbound `StoreShareRequest` on a **replica** channel (#59 receiver
 /// side). The payload is the full vault — the sender used
-/// `share_algorithm = REPLICA_VAULT` (#67). We don't introspect the
-/// bytes; we auto-ack the request with `StoreShareResponse(Ok)` and
-/// surface a [`DeRecEvent::ReplicaVaultReceived`] carrying the opaque
-/// payload for the application's vault-install logic.
+/// `share_algorithm = REPLICA_VAULT` (#67). We decode the typed
+/// [`crate::types::ReplicaSecretPayload`] from `request.share`, auto-ack
+/// with `StoreShareResponse(Ok)`, and surface a
+/// [`DeRecEvent::ReplicaVaultReceived`] carrying the decoded
+/// [`crate::types::SecretContainer`] + [`Vec<crate::types::ChannelShare>`]
+/// for the application's vault-install logic.
 pub(in crate::protocol) async fn handle_replica_request<T: DeRecTransport>(
     transport: &T,
     channel: &crate::types::Channel,

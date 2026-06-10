@@ -16,8 +16,9 @@ use crate::{Error, Result};
 /// Auto-injected by the orchestrator on outbound replica pairings and
 /// auto-extracted on inbound (populating `Channel.replica_id`). Validated
 /// per-pairing-kind: replica pairings MUST carry it; non-replica pairings
-/// MUST NOT (see [`PairingError::MissingReplicaId`] /
-/// [`PairingError::UnexpectedReplicaId`](crate::primitives::pairing::PairingError::UnexpectedReplicaId)).
+/// MUST NOT (see
+/// [`crate::primitives::pairing::PairingError::MissingReplicaId`] /
+/// [`crate::primitives::pairing::PairingError::UnexpectedReplicaId`]).
 pub const DEREC_REPLICA_ID_KEY: &str = "derec.replica_id";
 
 /// Encode a `replica_id` for transmission inside `CommunicationInfo`.

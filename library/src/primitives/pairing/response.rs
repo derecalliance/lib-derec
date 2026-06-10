@@ -25,9 +25,9 @@ pub struct ProduceResult {
     pub shared_key: PairingSharedKey,
     /// Channel identifier the responder is committing to for all future
     /// traffic on this channel — derived from the pre-rekey id and the
-    /// freshly negotiated `shared_key` (see [`derive_rekeyed_channel_id`]).
-    /// Callers MUST rename their local channel record from the old id to
-    /// this value once they finish handling this response.
+    /// freshly negotiated `shared_key` via a deterministic hash. Callers
+    /// MUST rename their local channel record from the old id to this
+    /// value once they finish handling this response.
     pub channel_id: ChannelId,
 }
 
@@ -40,7 +40,7 @@ pub struct ProcessResult {
     /// Channel identifier both peers MUST switch to for all future traffic
     /// on this channel. Already validated against the local derivation; the
     /// caller's only remaining job is to atomically rename its channel
-    /// record from the old id to this value (see [`derive_rekeyed_channel_id`]).
+    /// record from the old id to this value.
     pub channel_id: ChannelId,
 }
 
@@ -124,7 +124,7 @@ pub struct ProcessPrePairResult {
 /// After the handshake completes both sides switch from the pre-rekey
 /// `channel_id` (the contact-time value) to a post-handshake id derived
 /// deterministically from the pre-rekey id and the freshly-negotiated
-/// `shared_key` — see [`derive_rekeyed_channel_id`]. This response is the
+/// `shared_key` via a SHA-384 hash. This response is the
 /// **only** place the new id crosses the wire, and it travels inside the
 /// encrypted inner message; a passive observer who saw only pre-rekey
 /// traffic cannot link the long-running channel back to its pairing-time

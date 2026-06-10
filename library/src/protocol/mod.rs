@@ -6,7 +6,7 @@
 //! core protocol flows (pairing, sharing, verification, discovery, recovery). The
 //! caller supplies concrete implementations of:
 //!
-//! - [`DeRecContactStore`] — peer contact storage
+//! - [`DeRecChannelStore`] — paired-channel record storage
 //! - [`DeRecShareStore`] — secret share storage
 //! - [`DeRecSecretStore`] — cryptographic key storage
 //! - [`DeRecTransport`] — outbound message delivery

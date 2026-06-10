@@ -94,7 +94,8 @@ pub enum Error {
     /// [`DeRecProtocolBuilder::with_replica_id`](crate::protocol::DeRecProtocolBuilder::with_replica_id).
     /// Surfaces at the entry points of every flow that requires a local
     /// replica identity (initiating a replica-mode pairing, handling an
-    /// inbound `PairRequest` whose `sender_kind == Replica`, etc.).
+    /// inbound `PairRequest` whose `sender_kind` is `ReplicaSource` or
+    /// `ReplicaDestination`, etc.).
     #[error("replica id not configured: build the protocol with .with_replica_id(..) to enable replica flows")]
     ReplicaIdNotConfigured,
 }
