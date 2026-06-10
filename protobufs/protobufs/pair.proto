@@ -16,11 +16,8 @@ package org.derecalliance.derec.protobuf;
 // SenderKind identifies the logical role of the sender in the pairing flow.
 //
 // The role determines how the receiver interprets the message and what
-// role each party takes in the resulting channel.
-//
-// Helpers are responsible for manually linking channels that belong to the
-// same Owner identity (e.g. after a recovery re-pairing). The protocol does
-// not signal recovery mode — linking is an explicit, application-level action.
+// role each party takes in the resulting channel. Pairs are formed by
+// matching complementary kinds: Owner↔Helper, ReplicaSource↔ReplicaDestination.
 enum SenderKind {
   // Sender is an Owner.
   //
@@ -35,16 +32,26 @@ enum SenderKind {
   // Owner typically acts as the initiator.
   HELPER = 1;
 
-  // Sender is a Replica — another device belonging to the same Owner.
+  // Sender is the Source side of a replica pair — the device that owns
+  // the secrets and pushes them to a destination for backup. The matching
+  // peer kind is REPLICA_DESTINATION.
   //
   // Replica pairing follows the same cryptographic handshake as Helper
-  // pairing but adds a mandatory manual confirmation step where both
-  // devices display a fingerprint derived from the shared key and the
-  // user must verify they match (similar to Bluetooth pairing).
+  // pairing but adds a mandatory fingerprint-verify step before the
+  // channel transitions out of `Pending`. After verification, the Source
+  // calls ProtectSecret targeting the Destination channel; the library
+  // sends a `ReplicaSecretPayload` (full vault + share map) to the
+  // Destination via a normal channel-mode `StoreShareRequest`.
+  REPLICA_SOURCE = 3;
+
+  // Sender is the Destination side of a replica pair — the device that
+  // receives and stores full vault copies from a Source for backup or
+  // recovery purposes. The matching peer kind is REPLICA_SOURCE.
   //
-  // After confirmation, the Replica synchronises channel keys and
-  // secret metadata via dedicated discovery flows.
-  REPLICA = 2;
+  // The Destination never initiates ProtectSecret on this channel; it
+  // only receives `ReplicaSecretPayload` messages and surfaces them to
+  // the application via the `ReplicaVaultReceived` event.
+  REPLICA_DESTINATION = 4;
 }
 
 // PairRequestMessage is the first message in the pairing protocol,

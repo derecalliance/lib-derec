@@ -136,12 +136,14 @@ pub struct Channel {
     /// other way around — a `StoreShareRequest` is only honored on a channel
     /// where this node is the `Helper`, and so on.
     pub role: derec_proto::SenderKind,
-    /// The peer's replica identity, populated only when `role == Replica`.
+    /// The peer's replica identity, populated only when `role` is
+    /// `ReplicaSource` or `ReplicaDestination`.
     ///
     /// Extracted from the peer's `derec.replica_id` entry in
-    /// `CommunicationInfo` during the pair handshake (see Stage 3 wiring).
-    /// `None` on Helper/Owner channels and as a defensive default on
-    /// freshly-paired Replica channels where the peer did not advertise one.
+    /// `CommunicationInfo` during the pair handshake (see #53). `None`
+    /// on Helper/Owner channels and as a defensive default on
+    /// freshly-paired Replica channels where the peer did not advertise
+    /// one.
     pub replica_id: Option<u64>,
 }
 
@@ -198,6 +200,46 @@ pub struct UserSecret {
     pub data: ::prost::alloc::vec::Vec<u8>,
 }
 
+/// Per-replica metadata stored inside the secret bag — mirrors
+/// [`HelperInfo`] but for the replica role and carries the extra
+/// `replica_id` + `sender_kind` fields needed by the replica recovery
+/// model.
+///
+/// **Recovery transitivity**: the `shared_key` here is the symmetric key
+/// the Source negotiated with this Destination during pairing. A
+/// Destination that later needs to act on the Source's behalf (e.g. fetch
+/// a fresher copy from another Destination) uses these `shared_key`s to
+/// authenticate as the Source toward its peers. Any Destination is
+/// effectively a recovery delegate for the Source.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReplicaInfo {
+    /// Channel identifier the Source uses to address this peer.
+    #[prost(uint64, tag = "1")]
+    pub channel_id: u64,
+    /// The peer's message endpoint URI.
+    #[prost(string, tag = "2")]
+    pub transport_uri: ::prost::alloc::string::String,
+    /// Symmetric key negotiated during the pair handshake (32 bytes).
+    #[prost(bytes = "vec", tag = "3")]
+    pub shared_key: ::prost::alloc::vec::Vec<u8>,
+    /// App-level identity metadata for this peer. Same opacity contract
+    /// as [`HelperInfo::communication_info`].
+    #[prost(map = "string, string", tag = "4")]
+    pub communication_info: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
+    /// The peer's `replica_id` — global stable identity of the replica
+    /// device, separate from the per-channel `channel_id`.
+    #[prost(uint64, tag = "5")]
+    pub replica_id: u64,
+    /// Raw `SenderKind` value the peer played in this pair (typically
+    /// `REPLICA_SOURCE` or `REPLICA_DESTINATION`). Carried for future
+    /// conflict-resolution flows; not used by the protocol layer today.
+    #[prost(int32, tag = "6")]
+    pub sender_kind: i32,
+}
+
 /// The secret bag — serialized into `DeRecSecret.secret_data`.
 ///
 /// This is the actual payload that gets protobuf-encoded, then placed into
@@ -211,4 +253,45 @@ pub struct SecretContainer {
     /// The user-facing secrets the Owner wishes to protect.
     #[prost(message, repeated, tag = "2")]
     pub secrets: ::prost::alloc::vec::Vec<UserSecret>,
+    /// Snapshot of all paired Replica Destinations at the time of
+    /// distribution. Always populated regardless of whether the
+    /// distribution had any destination targets — provides a stable
+    /// shape for the bag across all paths.
+    #[prost(message, repeated, tag = "3")]
+    pub replicas: ::prost::alloc::vec::Vec<ReplicaInfo>,
+    /// The `replica_id` of the device that created or last updated this
+    /// version of the bag. Used by Destinations to attribute origin and
+    /// will drive future conflict-resolution logic.
+    #[prost(uint64, tag = "4")]
+    pub owner_replica_id: u64,
+}
+
+/// A single helper's share of the current secret bag — wire-pairs a
+/// `channel_id` with the serialized `CommittedDeRecShare` bytes that
+/// were sent to that helper. Part of [`ReplicaSecretPayload`].
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ChannelShare {
+    /// Channel id of the helper that holds this share.
+    #[prost(uint64, tag = "1")]
+    pub channel_id: u64,
+    /// Serialized `CommittedDeRecShare` bytes — the same payload the
+    /// helper received in their `StoreShareRequest`.
+    #[prost(bytes = "vec", tag = "2")]
+    pub committed_share: ::prost::alloc::vec::Vec<u8>,
+}
+
+/// The composite payload sent to each Replica Destination on a
+/// `ProtectSecret` round. Carries the full vault (`SecretContainer`)
+/// plus the map of `(channel_id → committed_share)` for the same round,
+/// so the Destination can recover via either path — read the vault
+/// directly, or contact each helper using `secret.helpers[i].shared_key`
+/// and request their stored share.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReplicaSecretPayload {
+    /// The full secret bag the Source is committing to this version.
+    #[prost(message, optional, tag = "1")]
+    pub secret: ::core::option::Option<SecretContainer>,
+    /// One entry per helper that received a VSS share on this round.
+    #[prost(message, repeated, tag = "2")]
+    pub shares: ::prost::alloc::vec::Vec<ChannelShare>,
 }

@@ -360,11 +360,12 @@ pub(super) fn get_sender_kind(kind: u32) -> Result<SenderKind, JsValue> {
     match kind {
         0 => Ok(SenderKind::Owner),
         1 => Ok(SenderKind::Helper),
-        2 => Ok(SenderKind::Replica),
+        3 => Ok(SenderKind::ReplicaSource),
+        4 => Ok(SenderKind::ReplicaDestination),
         _ => Err(js_error(
             "INVALID_SENDER_KIND",
             format!(
-                "invalid sender kind: {kind}, valid values are 0 (Owner), 1 (Helper), 2 (Replica)"
+                "invalid sender kind: {kind}, valid values are 0 (Owner), 1 (Helper), 3 (ReplicaSource), 4 (ReplicaDestination)"
             ),
         )),
     }

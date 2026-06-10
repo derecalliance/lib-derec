@@ -161,10 +161,16 @@ pub(super) async fn send_channel_message<Ch: DeRecChannelStore, T: DeRecTranspor
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
 )]
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn handle<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore>(
+pub(super) async fn handle<
+    Ch: DeRecChannelStore,
+    Sh: DeRecShareStore,
+    Ss: DeRecSecretStore,
+    T: super::DeRecTransport,
+>(
     channel_store: &mut Ch,
     share_store: &mut Sh,
     secret_store: &mut Ss,
+    transport: &T,
     pending_recovery: &mut PendingRecovery,
     pending_unpair: &mut HashMap<ChannelId, u64>,
     message: &DeRecMessage,
@@ -181,7 +187,41 @@ pub(super) async fn handle<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRec
 
     match &inner {
         MessageBody::StoreShareRequest(_) | MessageBody::StoreShareResponse(_) => {
-            sharing::handle(channel_id, inner, *shared_key, inbound_trace_id)
+            // Role-based dispatch (#59). On a Helper-role channel the
+            // peer is the Owner pushing a share fragment (existing path).
+            // On a Replica-role channel the peer is another replica
+            // pushing a full vault payload (#67 sender side); we auto-ack
+            // and surface a typed event with the opaque payload.
+            let channel = channel_store
+                .load(channel_id)
+                .await?
+                .ok_or(Error::InvalidInput(
+                    "channel id not present in channel store",
+                ))?;
+            match (channel.role, &inner) {
+                (SenderKind::Helper, MessageBody::StoreShareRequest(_))
+                | (SenderKind::Owner, MessageBody::StoreShareResponse(_)) => {
+                    sharing::handle(channel_id, inner, *shared_key, inbound_trace_id)
+                }
+                (SenderKind::ReplicaDestination, MessageBody::StoreShareRequest(request)) => {
+                    sharing::handle_replica_request(
+                        transport,
+                        &channel,
+                        request.clone(),
+                        *shared_key,
+                        inbound_trace_id,
+                    )
+                    .await
+                }
+                (SenderKind::ReplicaSource, MessageBody::StoreShareResponse(response)) => {
+                    sharing::handle_replica_response(&channel, response)
+                }
+                _ => Err(Error::RoleMismatch {
+                    channel_id,
+                    expected: SenderKind::Helper,
+                    actual: channel.role,
+                }),
+            }
         }
         MessageBody::VerifyShareRequest(_) | MessageBody::VerifyShareResponse(_) => {
             verification::handle(share_store, channel_id, inner, *shared_key, inbound_trace_id)
@@ -246,19 +286,24 @@ pub(in crate::protocol) async fn handle_pairing<Ch: DeRecChannelStore, Ss: DeRec
 /// Inbound role-gate table — the local role required on `channel_id` for the
 /// orchestrator to honor a given inbound [`MessageBody`].
 ///
-/// Returns `None` for messages that are role-blind (currently only the
-/// `UpdateChannelInfo` request/response pair — either side may initiate it).
+/// Returns `None` for messages whose role gate is multi-valued (e.g.
+/// `StoreShareRequest` is valid for both `Helper` channels and `Replica`
+/// channels) — the dispatcher does the branching itself. Also `None` for
+/// truly role-blind messages (`UpdateChannelInfo` — either side may
+/// initiate).
 fn expected_role_for_inbound(body: &MessageBody) -> Option<SenderKind> {
     match body {
+        // Multi-role: Helper (peer is Owner, classic share path) OR
+        // Replica (peer is Replica, vault sync #67). Gate is inlined in
+        // `handle`.
+        MessageBody::StoreShareRequest(_) | MessageBody::StoreShareResponse(_) => None,
         // Helper accepts these; Owner sends them.
-        MessageBody::StoreShareRequest(_)
-        | MessageBody::VerifyShareRequest(_)
+        MessageBody::VerifyShareRequest(_)
         | MessageBody::GetSecretIdsVersionsRequest(_)
         | MessageBody::GetShareRequest(_)
         | MessageBody::UnpairRequest(_) => Some(SenderKind::Helper),
         // Owner consumes these; Helper sends them.
-        MessageBody::StoreShareResponse(_)
-        | MessageBody::VerifyShareResponse(_)
+        MessageBody::VerifyShareResponse(_)
         | MessageBody::GetSecretIdsVersionsResponse(_)
         | MessageBody::GetShareResponse(_)
         | MessageBody::UnpairResponse(_) => Some(SenderKind::Owner),

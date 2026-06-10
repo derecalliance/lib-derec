@@ -25,6 +25,7 @@ Alliance**.
 - [Builder configuration](#builder-configuration)
 - [Event-driven model](#event-driven-model)
 - [Protocol flows](#protocol-flows)
+- [Replica flows](#replica-flows)
 - [Storage and transport traits](#storage-and-transport-traits)
 - [Errors](#errors)
 - [Async and executors](#async-and-executors)
@@ -55,10 +56,18 @@ Three roles participate:
 - **Helper** — a trusted entity that stores one share. Responds to
   verification challenges, returns the share during recovery, and acknowledges
   unpair requests.
-- **Replica** — another device belonging to the same Owner. Pairs with
-  `SenderKind::Replica`, confirms via a fingerprint check, and discovers
-  Helper channels and secrets from the Owner so the same secrets are
-  accessible from multiple devices.
+- **Replica** — a second device belonging to the same Owner that mirrors
+  the Source's vault. Replica pairings are **unidirectional**, just like
+  Owner↔Helper: one side scans as `SenderKind::ReplicaSource` (writes the
+  vault), the other as `SenderKind::ReplicaDestination` (receives it).
+  Pairing is confirmed out of band with a human-readable fingerprint
+  (`DeRecProtocol::get_fingerprint` / `verify_fingerprint`), then
+  `ProtectSecret` distributes the full vault (helpers + secrets +
+  replicas + `owner_replica_id`) to every Destination via a
+  [`ReplicaSecretPayload`](https://docs.rs/derec-library/latest/derec_library/types/struct.ReplicaSecretPayload.html).
+  Destinations surface the typed
+  [`DeRecEvent::ReplicaVaultReceived`](https://docs.rs/derec-library/latest/derec_library/protocol/events/enum.DeRecEvent.html#variant.ReplicaVaultReceived).
+  Configure via `DeRecProtocolBuilder::with_replica_id`.
 
 The protocol is transport-agnostic and produces wire-compatible protobuf
 messages; the library never assumes a specific delivery channel.
@@ -226,18 +235,23 @@ for the complete enum and per-variant docs.
 
 ### Channel roles
 
-Each paired channel carries the local node's role — `SenderKind::Owner` or
-`SenderKind::Helper` — fixed at pairing time and stored on
+Each paired channel carries the local node's role — `SenderKind::Owner`,
+`SenderKind::Helper`, `SenderKind::ReplicaSource`, or
+`SenderKind::ReplicaDestination` — fixed at pairing time and stored on
 [`Channel.role`](https://docs.rs/derec-library/latest/derec_library/types/struct.Channel.html).
 The orchestrator enforces flow directionality against this value:
 
 - Outbound: `ProtectSecret`, `VerifyShares`, `Discovery`, `RecoverSecret`,
-  and `Unpair` require the local role to be `Owner` on every targeted
-  channel.
+  and `Unpair` require the local role to be `Owner` (or `ReplicaSource`
+  for `ProtectSecret`) on every targeted channel.
 - Inbound: a `StoreShareRequest` / `VerifyShareRequest` /
   `GetSecretIdsVersionsRequest` / `GetShareRequest` / `UnpairRequest` is
   only honored on a channel where the local role is `Helper`; the
-  corresponding responses require `Owner`.
+  corresponding responses require `Owner`. A `StoreShareRequest` on a
+  `ReplicaDestination` channel is decoded as a
+  [`ReplicaSecretPayload`](https://docs.rs/derec-library/latest/derec_library/types/struct.ReplicaSecretPayload.html)
+  and surfaces as
+  [`DeRecEvent::ReplicaVaultReceived`](https://docs.rs/derec-library/latest/derec_library/protocol/events/enum.DeRecEvent.html#variant.ReplicaVaultReceived).
 - `UpdateChannelInfo` is symmetric — either side may initiate it, and the
   role is not consulted.
 
@@ -249,8 +263,8 @@ A mismatch surfaces as `Error::RoleMismatch { channel_id, expected, actual }`.
 
 | Flow | Purpose |
 |------|---------|
-| Pairing | Establish a secure channel between Owner and Helper (or Replica). Two contact modes — see [Pairing modes](#pairing-modes). |
-| Share Distribution | Split a secret and distribute the shares. |
+| Pairing | Establish a secure channel between any two SenderKinds (Owner↔Helper or ReplicaSource↔ReplicaDestination). Two contact modes — see [Pairing modes](#pairing-modes). |
+| Share Distribution | Split a secret and distribute the shares to helpers; replica destinations receive the full vault as a [`ReplicaSecretPayload`](https://docs.rs/derec-library/latest/derec_library/types/struct.ReplicaSecretPayload.html). |
 | Verification | Challenge helpers to prove they still hold their shares. |
 | Discovery | Ask helpers which secrets and versions they store. |
 | Recovery | Re-pair, collect shares, reconstruct the secret. |
@@ -308,6 +322,77 @@ End-to-end smoke tests covering both happy path and tampered-hash:
   and `bindings/web/src/protocol.ts::runHashedKeysPairingFlow`.
 - Primitives level — `bindings/{rust,dotnet,nodejs,web}/{primitives.*,Program.cs}` cover
   the same flow without an orchestrator (the .NET binding is primitives-only).
+
+---
+
+## Replica flows
+
+Replicas mirror the Owner's vault onto a second device so the same
+secrets remain accessible after device loss without going through full
+helper-based recovery. The model is **unidirectional**, exactly like
+Owner↔Helper:
+
+| SenderKind            | Role on the pair                                                |
+|-----------------------|-----------------------------------------------------------------|
+| `ReplicaSource`       | Owns the vault. Drives `ProtectSecret` and pushes updates.      |
+| `ReplicaDestination`  | Receives the vault. Stores `SecretContainer` + share map.       |
+
+### Configuring replica identity
+
+Replica pairings carry a stable per-device `u64` id under the reserved
+`derec.replica_id` key in `CommunicationInfo`. Pass it once at builder
+time and the orchestrator handles injection / validation automatically:
+
+```rust
+let mut protocol = DeRecProtocolBuilder::new()
+    .with_replica_id(0xAAAA_AAAA_AAAA_AAAA)
+    // ... other slots ...
+    .build();
+```
+
+Attempting any replica-mode flow on a protocol built without
+`with_replica_id` returns
+[`Error::ReplicaIdNotConfigured`](https://docs.rs/derec-library/latest/derec_library/enum.Error.html#variant.ReplicaIdNotConfigured).
+
+### Fingerprint confirmation
+
+Replica channels start in `ChannelStatus::Pending` after the handshake
+and are not eligible as `ProtectSecret` targets until both sides confirm
+the pair out of band. The protocol derives a deterministic
+human-readable fingerprint from the shared key — same on both
+devices — that users compare visually before each side calls
+`verify_fingerprint`:
+
+```rust
+let local = source.get_fingerprint(channel_id).await?;
+let peer  = destination.get_fingerprint(channel_id).await?; // out of band
+
+source.verify_fingerprint(channel_id, &peer).await?;        // → true
+destination.verify_fingerprint(channel_id, &local).await?;  // → true
+```
+
+`verify_fingerprint` returns `true` on match and transitions the channel
+to `Paired`. A mismatch returns `false` and leaves the channel `Pending`
+so the app can retry.
+
+### Vault distribution
+
+Once the destination is paired (status `Paired`), the source includes it
+as a `ProtectSecret` target alongside helpers. The orchestrator routes
+two payload shapes from the same `start` call:
+
+- Helpers receive the usual VSS share via `StoreShareRequest`.
+- Destinations receive a typed
+  [`ReplicaSecretPayload`](https://docs.rs/derec-library/latest/derec_library/types/struct.ReplicaSecretPayload.html)
+  `{ secret: SecretContainer, shares: Vec<ChannelShare> }` — the full
+  vault plus every helper's share keyed by `channel_id`. This is what
+  lets a destination act in the source's place during recovery without
+  re-running the share collection.
+
+On the destination, the inbound envelope decodes into
+[`DeRecEvent::ReplicaVaultReceived`](https://docs.rs/derec-library/latest/derec_library/protocol/events/enum.DeRecEvent.html#variant.ReplicaVaultReceived)
+with `vault: SecretContainer` and `shares: Vec<ChannelShare>` already
+parsed — the app just installs the secrets.
 
 ---
 

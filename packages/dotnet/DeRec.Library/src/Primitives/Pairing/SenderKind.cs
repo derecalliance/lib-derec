@@ -8,6 +8,7 @@ public static partial class Pairing
     {
         Owner = 0,
         Helper = 1,
-        Replica = 2,
+        ReplicaSource = 3,
+        ReplicaDestination = 4,
     }
 }

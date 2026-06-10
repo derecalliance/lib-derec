@@ -30,8 +30,10 @@ const kindName = (k: SenderKind): string => {
       return "Owner";
     case SenderKind.Helper:
       return "Helper";
-    case SenderKind.Replica:
-      return "Replica";
+    case SenderKind.ReplicaSource:
+      return "ReplicaSource";
+    case SenderKind.ReplicaDestination:
+      return "ReplicaDestination";
     default:
       return `Unknown(${k})`;
   }
@@ -253,7 +255,7 @@ const KEEP_VERSIONS_COUNT = 3;
 function makeNode(
   name: string,
   endpointUri: string,
-  options: { autoReplyTo?: boolean } = {},
+  options: { autoReplyTo?: boolean; replicaId?: bigint } = {},
 ): Node {
   const channelStore = new InMemoryChannelStore();
   const shareStore = new InMemoryShareStore();
@@ -273,6 +275,7 @@ function makeNode(
     null, // autoRespondOnFailure
     null, // unpairAck
     options.autoReplyTo ?? null,
+    options.replicaId ?? null,
   );
   return { protocol, transport, channelStore, shareStore, secretStore };
 }
@@ -937,6 +940,305 @@ async function runReplyToFlow(): Promise<void> {
   console.log("\n✓ replyTo flow passed.\n");
 }
 
+/**
+ * Owner↔Destination replica pair, followed by a full ProtectSecret
+ * fan-out that includes the Destination as one of the targets. Mirrors
+ * `bindings/rust/src/protocol.rs::run_protect_secret_with_replica_targets_flow`
+ * — pair, cross-confirm fingerprints, distribute, and assert the typed
+ * `ReplicaVaultReceived` event carries the decoded `SecretContainer`
+ * (vault.secrets / .helpers / .replicas / .owner_replica_id) plus the
+ * helper share map.
+ */
+async function runReplicaPairingAndVaultSyncFlow(): Promise<void> {
+  console.log("=== [Protocol] Replica pairing + vault sync ===\n");
+
+  const ownerReplicaId = 0xAAAA_AAAA_AAAA_AAAAn;
+  const destReplicaId = 0xBBBB_BBBB_BBBB_BBBBn;
+  const ownerUri = "https://owner.example.com";
+  const helperAUri = "https://helper-a.example.com";
+  const helperBUri = "https://helper-b.example.com";
+  const destUri = "https://replica-destination.example.com";
+
+  const owner = makeNode("Owner", ownerUri, { replicaId: ownerReplicaId });
+  const helperA = makeNode("HelperA", helperAUri);
+  const helperB = makeNode("HelperB", helperBUri);
+  const destination = makeNode("Destination", destUri, { replicaId: destReplicaId });
+
+  const helperAChannel = 1n;
+  const helperBChannel = 2n;
+  const destChannel = 3n;
+  const secretId = 0xC0FFEEn;
+
+  // 1. Classic Owner↔Helper pairs (share targets).
+  await doPair(helperA, owner, helperAChannel, "Owner↔HelperA");
+  await doPair(helperB, owner, helperBChannel, "Owner↔HelperB");
+
+  // 2. Owner creates contact, Destination scans as ReplicaDestination.
+  const replicaContact: ContactMessage =
+    await owner.protocol.createContact(destChannel, ContactMode.InlineKeys);
+  await destination.protocol.start(FlowKind.Pairing, {
+    kind: SenderKind.ReplicaDestination,
+    contact: replicaContact,
+  });
+  const destPairRequest = drainOne(destination, "Destination");
+  const ownerPairEvents = await processAll(owner, destPairRequest);
+  requireEvent(ownerPairEvents, "PairingCompleted", "Owner/replica");
+  const ownerReplicaPaired = requireEvent(
+    ownerPairEvents,
+    "ReplicaPaired",
+    "Owner/replica",
+  );
+  if (BigInt("0x" + ownerReplicaPaired.peer_replica_id) !== destReplicaId) {
+    throw new Error(
+      `Owner-side ReplicaPaired must carry destination replica_id=${destReplicaId}, got ${ownerReplicaPaired.peer_replica_id}`,
+    );
+  }
+  const ownerPairResponse = drainOne(owner, "Owner");
+  const destPairEvents = await processAll(destination, ownerPairResponse);
+  requireEvent(destPairEvents, "PairingCompleted", "Destination/replica");
+  const destReplicaPaired = requireEvent(
+    destPairEvents,
+    "ReplicaPaired",
+    "Destination/replica",
+  );
+  if (BigInt("0x" + destReplicaPaired.peer_replica_id) !== ownerReplicaId) {
+    throw new Error(
+      `Destination-side ReplicaPaired must carry owner replica_id=${ownerReplicaId}, got ${destReplicaPaired.peer_replica_id}`,
+    );
+  }
+  console.log(
+    `  replica pair handshake: owner sees peer=${ownerReplicaPaired.peer_replica_id}, dest sees peer=${destReplicaPaired.peer_replica_id}  ✓`,
+  );
+
+  // 3. Cross-confirm fingerprints — channel is `Pending` until both
+  //    sides verify, and ProtectSecret refuses to target a Pending
+  //    replica channel.
+  const ownerFp = await owner.protocol.getFingerprint(destChannel);
+  const destFp = await destination.protocol.getFingerprint(destChannel);
+  if (ownerFp !== destFp) {
+    throw new Error(
+      `replica fingerprint mismatch: owner=${ownerFp} dest=${destFp}`,
+    );
+  }
+  const ownerConfirmed = await owner.protocol.verifyFingerprint(destChannel, destFp);
+  const destConfirmed = await destination.protocol.verifyFingerprint(destChannel, ownerFp);
+  if (!ownerConfirmed || !destConfirmed) {
+    throw new Error(
+      `verifyFingerprint must return true on both sides (owner=${ownerConfirmed}, dest=${destConfirmed})`,
+    );
+  }
+  console.log(`  fingerprint cross-confirmed (${ownerFp.length} chars)  ✓`);
+
+  // 4. ProtectSecret across both helpers + the destination. Three
+  //    envelopes leave the owner: two VSS shares (one per helper) and
+  //    one ReplicaSecretPayload composite (for the destination).
+  const secretData = new TextEncoder().encode("vault-payload-for-replica-and-helper");
+  await owner.protocol.start(FlowKind.ProtectSecret, {
+    secretId,
+    target: [helperAChannel, helperBChannel, destChannel],
+    secrets: [{ id: new Uint8Array([0x01]), name: "shared-vault", data: secretData }],
+    description: "replica + helper distribution",
+  });
+
+  const outbound = owner.transport.drain();
+  if (outbound.length !== 3) {
+    throw new Error(
+      `expected 3 outbound StoreShareRequests (2 helpers + 1 destination), got ${outbound.length}`,
+    );
+  }
+  const destEnvelope = outbound.find((m) => m.endpoint.uri === destUri);
+  if (!destEnvelope) {
+    throw new Error("one outbound envelope must route to the destination");
+  }
+  console.log(`  ProtectSecret fanned out 3 envelopes (2 helpers + 1 destination)  ✓`);
+
+  // 5. Feed the destination envelope to its peer; expect the typed
+  //    ReplicaVaultReceived event with the full decoded vault.
+  const destEvents = await processAll(destination, destEnvelope.message);
+  const received = destEvents.find((e) => e.type === "ReplicaVaultReceived") as
+    | Extract<DeRecEvent, { type: "ReplicaVaultReceived" }>
+    | undefined;
+  if (!received) {
+    throw new Error(
+      `Destination did not emit ReplicaVaultReceived; got [${destEvents.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  if (BigInt("0x" + received.from_replica_id) !== ownerReplicaId) {
+    throw new Error(
+      `from_replica_id must echo owner's replica_id (${ownerReplicaId}), got ${received.from_replica_id}`,
+    );
+  }
+  if (BigInt(received.secret_id) !== secretId) {
+    throw new Error(`secret_id mismatch: expected ${secretId}, got ${received.secret_id}`);
+  }
+  if (received.vault.secrets.length !== 1) {
+    throw new Error(
+      `vault.secrets.length expected 1, got ${received.vault.secrets.length}`,
+    );
+  }
+  const receivedBytes = received.vault.secrets[0]!.data;
+  if (
+    receivedBytes.length !== secretData.length ||
+    !receivedBytes.every((b, i) => b === secretData[i])
+  ) {
+    throw new Error("vault.secrets[0].data must round-trip the original secret bytes");
+  }
+  if (BigInt("0x" + received.vault.owner_replica_id) !== ownerReplicaId) {
+    throw new Error(
+      `vault.owner_replica_id must echo owner's replica_id (${ownerReplicaId}), got ${received.vault.owner_replica_id}`,
+    );
+  }
+  if (received.vault.helpers.length !== 2) {
+    throw new Error(
+      `vault.helpers.length expected 2, got ${received.vault.helpers.length}`,
+    );
+  }
+  if (received.vault.replicas.length !== 1) {
+    throw new Error(
+      `vault.replicas.length expected 1, got ${received.vault.replicas.length}`,
+    );
+  }
+  const destInfo = received.vault.replicas[0]!;
+  if (BigInt("0x" + destInfo.replica_id) !== destReplicaId) {
+    throw new Error(
+      `ReplicaInfo.replica_id expected ${destReplicaId}, got ${destInfo.replica_id}`,
+    );
+  }
+  if (destInfo.sender_kind !== SenderKind.ReplicaDestination) {
+    throw new Error(
+      `ReplicaInfo.sender_kind must be ReplicaDestination (${SenderKind.ReplicaDestination}), got ${destInfo.sender_kind}`,
+    );
+  }
+  if (received.shares.length !== 2) {
+    throw new Error(
+      `shares.length expected 2 (one per helper), got ${received.shares.length}`,
+    );
+  }
+  console.log(
+    `  ReplicaVaultReceived: vault=${received.vault.secrets.length}secret/${received.vault.helpers.length}helpers/${received.vault.replicas.length}replicas, shares=${received.shares.length}  ✓`,
+  );
+
+  console.log("\n✓ Replica pairing + vault sync flow passed.\n");
+}
+
+
+/**
+ * Asserts the `UpdateChannelInfo` flow end-to-end: owner mutates its
+ * local communication_info + transport endpoint, broadcasts the change,
+ * and both sides emit `ChannelInfoUpdated` events. Mirrors the Rust
+ * binding's `run_update_channel_info_flow`.
+ */
+async function runUpdateChannelInfoFlow(): Promise<void> {
+  console.log("=== [Protocol] UpdateChannelInfo Flow ===\n");
+
+  const channelId = 42n;
+  const helper = makeNode("Helper", "https://helper.example.com");
+  const owner = makeNode("Owner", "https://owner.OLD.example.com");
+
+  await doPair(helper, owner, channelId, "UpdateChannelInfo");
+  console.log();
+
+  const newUri = "https://owner.NEW.example.com";
+  const newInfo = { name: "Owner-renamed", email: "owner.new@example.com" };
+
+  // Mutate local state, then propagate.
+  owner.protocol.setCommunicationInfo(newInfo);
+  owner.protocol.setOwnTransport(newUri, "https");
+
+  await owner.protocol.start(FlowKind.UpdateChannelInfo, {
+    target: channelId,
+    communication_info: newInfo,
+    transport_protocol: { uri: newUri, protocol: 0 },
+  });
+  const updateRequest = drainOne(owner, "Owner");
+  console.log(`  [Owner] start(UpdateChannelInfo) → request ${updateRequest.length}B`);
+
+  const helperEvents = await processAll(helper, updateRequest);
+  const helperUpdated = helperEvents.find((e) => e.type === "ChannelInfoUpdated");
+  if (!helperUpdated) {
+    throw new Error(
+      `Helper must emit ChannelInfoUpdated; got [${helperEvents.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  console.log(`  [Helper] processAll(update) → ChannelInfoUpdated  ✓`);
+
+  const updateResponse = drainOne(helper, "Helper");
+  const ownerEvents = await processAll(owner, updateResponse);
+  const ownerUpdated = ownerEvents.find((e) => e.type === "ChannelInfoUpdated");
+  if (!ownerUpdated) {
+    throw new Error(
+      `Owner must emit ChannelInfoUpdated; got [${ownerEvents.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  console.log(`  [Owner]  process(response) → ChannelInfoUpdated  ✓`);
+
+  console.log("\n✓ UpdateChannelInfo flow passed.\n");
+}
+
+
+/**
+ * Asserts the two sad paths around the constructor `replicaId` argument:
+ * (1) a node without it must refuse to initiate any replica-mode flow,
+ * (2) and must reject an inbound replica-mode PairRequest from a
+ * configured peer. Mirrors the Rust binding's
+ * `run_replica_id_wiring_flow` scenarios 2 + 3.
+ */
+async function runReplicaIdWiringSadPathsFlow(): Promise<void> {
+  console.log("=== [Protocol] Replica id wiring sad-paths ===\n");
+
+  const configuredReplicaId = 0xCAFE_BABE_DEAD_BEEFn;
+
+  // -- Scenario A: initiator without replica_id refuses to scan a
+  //    contact as ReplicaDestination.
+  const contactCreator = makeNode("ContactCreator", "https://creator.example.com", { replicaId: configuredReplicaId });
+  const unconfiguredScanner = makeNode("Scanner", "https://scanner.example.com");
+
+  const contact = await contactCreator.protocol.createContact(500n, ContactMode.InlineKeys);
+
+  let caught: unknown = null;
+  try {
+    await unconfiguredScanner.protocol.start(FlowKind.Pairing, {
+      kind: SenderKind.ReplicaDestination,
+      contact,
+    });
+  } catch (e) {
+    caught = e;
+  }
+  if (caught === null) {
+    throw new Error("scanner without replica_id must refuse to start a replica pair");
+  }
+  if (unconfiguredScanner.transport.drain().length !== 0) {
+    throw new Error("no outbound traffic should have been queued");
+  }
+  console.log("  scanner without replica_id refuses to start replica pair  ✓");
+
+  // -- Scenario B: configured initiator's PairRequest is refused by
+  //    an unconfigured responder.
+  const unconfiguredCreator = makeNode("CreatorB", "https://creator2.example.com");
+  const configuredScanner = makeNode("ScannerB", "https://scanner2.example.com", { replicaId: configuredReplicaId });
+
+  const contact2 = await unconfiguredCreator.protocol.createContact(501n, ContactMode.InlineKeys);
+  await configuredScanner.protocol.start(FlowKind.Pairing, {
+    kind: SenderKind.ReplicaDestination,
+    contact: contact2,
+  });
+  const pairRequest = drainOne(configuredScanner, "ScannerB");
+
+  let caught2: unknown = null;
+  try {
+    await unconfiguredCreator.protocol.process(pairRequest);
+  } catch (e) {
+    caught2 = e;
+  }
+  if (caught2 === null) {
+    throw new Error("unconfigured responder must refuse a replica-mode PairRequest");
+  }
+  console.log("  responder without replica_id refuses inbound replica PairRequest  ✓");
+
+  console.log("\n✓ Replica id wiring sad-paths passed.\n");
+}
+
+
 export async function runProtocolSmoke(): Promise<void> {
   console.log("━━━ [Protocol] Starting ━━━\n");
 
@@ -945,7 +1247,10 @@ export async function runProtocolSmoke(): Promise<void> {
   await runSharingFlow();
   await runDiscoveryAndRecoveryFlow();
   await runUnpairingFlow();
+  await runUpdateChannelInfoFlow();
   await runReplyToFlow();
+  await runReplicaIdWiringSadPathsFlow();
+  await runReplicaPairingAndVaultSyncFlow();
 
   console.log("━━━ [Protocol] All passed. ━━━\n");
 }

@@ -124,7 +124,7 @@ fn test_extract_verify_share_request_rejects_tampered_timestamp() {
     assert!(matches!(
         result,
         Err(Error::Invariant(
-            "Envelope timestamp does not match request timestamp"
+            "Envelope timestamp does not match request/response timestamp"
         ))
     ));
 }
@@ -376,7 +376,7 @@ fn test_process_verify_share_response_message_rejects_tampered_envelope_timestam
     assert!(matches!(
         extract_verify_share_response(&tampered_envelope, &shared_key),
         Err(Error::Invariant(
-            "Envelope timestamp does not match response timestamp"
+            "Envelope timestamp does not match request/response timestamp"
         ))
     ));
 }

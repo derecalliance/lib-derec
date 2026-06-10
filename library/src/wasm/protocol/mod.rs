@@ -41,7 +41,10 @@
 //! interface contracts.
 
 mod events;
-pub(crate) mod pending_action_wire;
+// `pending_action_wire` lives in `crate::protocol` so both WASM and
+// FFI bridges can share the same on-the-wire encoding for the opaque
+// PendingAction blob.
+pub(crate) use crate::protocol::pending_action_wire;
 mod stores;
 
 use std::collections::HashMap;
@@ -157,6 +160,11 @@ impl DeRecProtocolWasm {
         // See `DeRecProtocolBuilder::with_auto_reply_to` for the routing
         // semantics on the responder side.
         auto_reply_to: Option<bool>,
+        // `replica_id`: stable per-device `u64` identity required for any
+        // replica-mode pairing. Pass `null`/`undefined` for Owner-only or
+        // Helper-only deployments. Accepts a JS `bigint` or `number`; see
+        // `DeRecProtocolBuilder::with_replica_id`.
+        replica_id: JsValue,
     ) -> Result<DeRecProtocolWasm, JsValue> {
         let protocol_num = match own_transport_protocol.to_lowercase().as_str() {
             "https" => 0i32,
@@ -192,7 +200,7 @@ impl DeRecProtocolWasm {
             }
         };
 
-        let inner = DeRecProtocolBuilder::new()
+        let mut builder = DeRecProtocolBuilder::new()
             .with_channel_store(JsChannelStore(channel_store))
             .with_share_store(JsShareStore(share_store))
             .with_secret_store(JsSecretStore(secret_store))
@@ -204,8 +212,13 @@ impl DeRecProtocolWasm {
             .with_timeout(Duration::from_secs(timeout_in_secs.map_or(300, u64::from)))
             .with_auto_respond_on_failure(auto_respond_on_failure.unwrap_or(false))
             .with_unpair_ack(unpair_ack_value)
-            .with_auto_reply_to(auto_reply_to.unwrap_or(false))
-            .build();
+            .with_auto_reply_to(auto_reply_to.unwrap_or(false));
+        if !replica_id.is_null() && !replica_id.is_undefined() {
+            let id = js_value_to_u64(replica_id)
+                .map_err(|e| js_error("INVALID_REPLICA_ID", format!("{e:?}")))?;
+            builder = builder.with_replica_id(id);
+        }
+        let inner = builder.build();
         Ok(DeRecProtocolWasm { inner })
     }
 
@@ -327,6 +340,36 @@ impl DeRecProtocolWasm {
             Some(channel_id) => Ok(js_sys::BigInt::from(channel_id).into()),
             None => Ok(JsValue::NULL),
         }
+    }
+
+    /// Derive the human-readable fingerprint for a paired channel. Both
+    /// sides of a replica pair derive the same fingerprint from the
+    /// shared key, enabling out-of-band confirmation before the channel
+    /// transitions from `Pending` to `Paired`.
+    #[wasm_bindgen(js_name = "getFingerprint")]
+    pub async fn get_fingerprint(&mut self, channel_id: JsValue) -> Result<String, JsValue> {
+        let id = js_value_to_u64(channel_id)?;
+        self.inner
+            .get_fingerprint(ChannelId(id))
+            .await
+            .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
+    }
+
+    /// Verify a fingerprint against the channel's locally-derived one. On
+    /// match, the channel transitions from `Pending` to `Paired`. Returns
+    /// `true` when the fingerprint matches and the channel is confirmed,
+    /// `false` otherwise.
+    #[wasm_bindgen(js_name = "verifyFingerprint")]
+    pub async fn verify_fingerprint(
+        &mut self,
+        channel_id: JsValue,
+        fingerprint: String,
+    ) -> Result<bool, JsValue> {
+        let id = js_value_to_u64(channel_id)?;
+        self.inner
+            .verify_fingerprint(ChannelId(id), &fingerprint)
+            .await
+            .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
     }
 
     /// Accept a pending action from an `ActionRequired` event.
@@ -683,10 +726,11 @@ fn parse_sender_kind(kind: u32) -> Result<SenderKind, JsValue> {
     match kind {
         0 => Ok(SenderKind::Owner),
         1 => Ok(SenderKind::Helper),
-        2 => Ok(SenderKind::Replica),
+        3 => Ok(SenderKind::ReplicaSource),
+        4 => Ok(SenderKind::ReplicaDestination),
         _ => Err(js_error(
             "INVALID_SENDER_KIND",
-            format!("invalid sender kind: {kind}, valid values are 0 (Owner), 1 (Helper), 2 (Replica)"),
+            format!("invalid sender kind: {kind}, valid values are 0 (Owner), 1 (Helper), 3 (ReplicaSource), 4 (ReplicaDestination)"),
         )),
     }
 }

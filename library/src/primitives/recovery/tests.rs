@@ -424,7 +424,7 @@ fn test_extract_get_share_response_timestamp_mismatch() {
     assert!(matches!(
         result,
         Err(Error::Invariant(
-            "Envelope timestamp does not match response timestamp"
+            "Envelope timestamp does not match request/response timestamp"
         ))
     ));
 }
@@ -462,7 +462,7 @@ fn test_produce_get_share_response_message_request_timestamp_mismatch() {
     assert!(matches!(
         result,
         Err(Error::Invariant(
-            "Envelope timestamp does not match request timestamp"
+            "Envelope timestamp does not match request/response timestamp"
         ))
     ));
 }
@@ -513,7 +513,7 @@ fn test_produce_get_share_response_message_stored_share_timestamp_mismatch() {
     assert!(matches!(
         result,
         Err(Error::Invariant(
-            "Envelope timestamp does not match request timestamp"
+            "Envelope timestamp does not match request/response timestamp"
         ))
     ));
 

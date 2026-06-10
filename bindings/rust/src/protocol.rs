@@ -34,6 +34,7 @@ pub fn run_all() {
     rt.block_on(run_pairing_flow());
     rt.block_on(run_hashed_keys_pairing_flow());
     rt.block_on(run_replica_id_wiring_flow());
+    rt.block_on(run_protect_secret_with_replica_targets_flow());
     rt.block_on(run_sharing_flow());
     rt.block_on(run_discovery_and_recovery_flow());
     rt.block_on(run_unpairing_flow());
@@ -793,7 +794,7 @@ async fn run_replica_id_wiring_flow() {
     helper
         .protocol
         .start(DeRecFlow::Pairing {
-            kind: SenderKind::Replica,
+            kind: SenderKind::ReplicaDestination,
             contact,
             peer_communication_info: std::collections::HashMap::new(),
         })
@@ -801,13 +802,40 @@ async fn run_replica_id_wiring_flow() {
         .expect("helper start(Pairing, kind=Replica) failed");
 
     let helper_to_owner = pump(&mut helper, &mut owner).await;
-    let _owner_to_helper = pump(&mut owner, &mut helper).await;
+    let owner_to_helper = pump(&mut owner, &mut helper).await;
+    let all_events: Vec<&DeRecEvent> =
+        helper_to_owner.iter().chain(owner_to_helper.iter()).collect();
 
     assert!(
         helper_to_owner
             .iter()
             .any(|e| matches!(e, DeRecEvent::PairingCompleted { .. })),
         "expected PairingCompleted for replica pairing"
+    );
+
+    // Both sides emit ReplicaPaired alongside PairingCompleted, with the
+    // peer's replica id as payload. The local side's role (Source vs
+    // Destination) lives on Channel.role and is asserted further below.
+    // The handshake completes inside a single pump round, so search the
+    // union of both event streams and discriminate by the carried id.
+    let owner_side = all_events.iter().any(|e| matches!(
+        e,
+        DeRecEvent::ReplicaPaired { channel_id: c, peer_replica_id }
+            if *c == channel_id && *peer_replica_id == helper_id
+    ));
+    assert!(
+        owner_side,
+        "owner-side ReplicaPaired must fire carrying helper_id",
+    );
+
+    let helper_side = all_events.iter().any(|e| matches!(
+        e,
+        DeRecEvent::ReplicaPaired { channel_id: c, peer_replica_id }
+            if *c == channel_id && *peer_replica_id == owner_id
+    ));
+    assert!(
+        helper_side,
+        "helper-side ReplicaPaired must fire carrying owner_id",
     );
 
     // Both sides' Channel records carry the PEER's replica id (not their own).
@@ -838,8 +866,11 @@ async fn run_replica_id_wiring_flow() {
         "helper-side Channel.replica_id must carry owner's id, got {:?}",
         helper_channel.replica_id,
     );
-    assert_eq!(owner_channel.role, SenderKind::Replica);
-    assert_eq!(helper_channel.role, SenderKind::Replica);
+    // Helper scanned as ReplicaDestination → helper has local role
+    // ReplicaDestination, owner (contact creator) has the inverted role
+    // ReplicaSource on its side of the channel.
+    assert_eq!(owner_channel.role, SenderKind::ReplicaSource);
+    assert_eq!(helper_channel.role, SenderKind::ReplicaDestination);
 
     // The reserved key MUST NOT leak into the free-form communication_info
     // map exposed to the app — extract_communication_info strips it.
@@ -872,7 +903,7 @@ async fn run_replica_id_wiring_flow() {
     let result = helper_unconfigured
         .protocol
         .start(DeRecFlow::Pairing {
-            kind: SenderKind::Replica,
+            kind: SenderKind::ReplicaDestination,
             contact,
             peer_communication_info: std::collections::HashMap::new(),
         })
@@ -905,7 +936,7 @@ async fn run_replica_id_wiring_flow() {
     helper
         .protocol
         .start(DeRecFlow::Pairing {
-            kind: SenderKind::Replica,
+            kind: SenderKind::ReplicaDestination,
             contact,
             peer_communication_info: std::collections::HashMap::new(),
         })
@@ -933,6 +964,441 @@ async fn run_replica_id_wiring_flow() {
     println!("  responder without replica_id: ReplicaIdNotConfigured ✓");
 
     println!("Protocol replica_id wiring flow test passed.");
+}
+
+
+/// Exercises #67: `ProtectSecret` with a mixed target set of helpers and
+/// replicas. Asserts that each replica target receives one
+/// `StoreShareRequest` carrying the **full vault payload** (tagged with
+/// `share_algorithm = SHARE_ALGORITHM_REPLICA_VAULT = 1`), distinct from
+/// the per-helper VSS share fragments.
+///
+/// Receiver-side dispatch (turning the inbound replica StoreShareRequest
+/// into a `ReplicaVaultReceived` event instead of running the helper
+/// path) lands in #59. This test asserts only the sender side.
+async fn run_protect_secret_with_replica_targets_flow() {
+    println!("=== Protocol ProtectSecret(replica targets) flow ===");
+
+    let owner_id = 0xAAAA_AAAA_AAAA_AAAAu64;
+    let replica_id = 0xBBBB_BBBB_BBBB_BBBBu64;
+    let helper_a_channel = ChannelId(1);
+    let helper_b_channel = ChannelId(2);
+    let replica_channel = ChannelId(3);
+
+    // VSS requires threshold >= 2 and threshold <= helper count, so this
+    // scenario uses 2 helpers + 1 replica. The replica doesn't
+    // participate in the split (it gets the full vault).
+    let mut owner = Peer::with_replica_id("owner", "https://owner.example.com", owner_id);
+    let mut helper_a = Peer::new("helper-a", "https://helper-a.example.com");
+    let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
+    let mut replica =
+        Peer::with_replica_id("replica", "https://replica.example.com", replica_id);
+
+    // 1. Owner pairs with two Helpers (classic share path targets).
+    pair(&mut owner, &mut helper_a, helper_a_channel).await;
+    pair(&mut owner, &mut helper_b, helper_b_channel).await;
+
+    // 2. Owner pairs with another device in Replica mode (vault sync target).
+    let replica_contact = owner
+        .protocol
+        .create_contact(Some(replica_channel), derec_proto::ContactMode::InlineKeys)
+        .await
+        .expect("owner.create_contact failed");
+    replica
+        .protocol
+        .start(DeRecFlow::Pairing {
+            kind: SenderKind::ReplicaDestination,
+            contact: replica_contact,
+            peer_communication_info: std::collections::HashMap::new(),
+        })
+        .await
+        .expect("replica start(Pairing, kind=Replica) failed");
+    let _ = pump(&mut replica, &mut owner).await;
+    let _ = pump(&mut owner, &mut replica).await;
+
+    let owner_replica_channel = owner
+        .protocol
+        .channel_store
+        .load(replica_channel)
+        .await
+        .expect("owner replica channel load")
+        .expect("owner replica channel must exist");
+    // Replica scanned as ReplicaDestination → owner has ReplicaSource role.
+    assert_eq!(owner_replica_channel.role, SenderKind::ReplicaSource);
+
+    // Replica channels start `Pending` and stay there until the app
+    // calls `verify_fingerprint` (the protocol's confirmation gate).
+    // In production each side displays the local fingerprint to the
+    // user, who reads off the other device's fingerprint and confirms
+    // they match; the in-memory smoke test just cross-confirms.
+    let owner_fp = owner
+        .protocol
+        .get_fingerprint(replica_channel)
+        .await
+        .expect("owner fingerprint");
+    let replica_fp = replica
+        .protocol
+        .get_fingerprint(replica_channel)
+        .await
+        .expect("replica fingerprint");
+    assert_eq!(
+        owner_fp, replica_fp,
+        "owner and replica must derive the same fingerprint from K_replica"
+    );
+    let confirmed_owner = owner
+        .protocol
+        .verify_fingerprint(replica_channel, &replica_fp)
+        .await
+        .expect("owner verify_fingerprint");
+    let confirmed_replica = replica
+        .protocol
+        .verify_fingerprint(replica_channel, &owner_fp)
+        .await
+        .expect("replica verify_fingerprint");
+    assert!(
+        confirmed_owner && confirmed_replica,
+        "both sides must accept the matching fingerprint",
+    );
+
+    // 3. Owner protects a secret targeting BOTH helpers and the replica.
+    let secret_data = b"vault-payload-for-replica-and-helper".to_vec();
+    owner
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secret_id: 0xC0FFEE,
+            target: Target::Many(vec![helper_a_channel, helper_b_channel, replica_channel]),
+            secrets: vec![UserSecret {
+                id: vec![0x01],
+                name: "shared-vault".to_owned(),
+                data: secret_data.clone(),
+            }],
+            description: Some("replica + helper distribution".to_owned()),
+        })
+        .await
+        .expect("owner start(ProtectSecret) with replica target failed");
+
+    // 4. Owner's outbox must hold three envelopes — one per helper + one
+    //    for the replica.
+    let outbound = owner.transport.drain();
+    assert_eq!(
+        outbound.len(),
+        3,
+        "expected three outbound StoreShareRequests (two helpers + one replica), got {}",
+        outbound.len()
+    );
+
+    let helper_a_env = outbound
+        .iter()
+        .find(|(tp, _)| tp.uri == helper_a.uri)
+        .expect("one envelope must route to helper-a");
+    let replica_env = outbound
+        .iter()
+        .find(|(tp, _)| tp.uri == replica.uri)
+        .expect("one envelope must route to the replica");
+
+    // 5. Decrypt the inner StoreShareRequest on each side using its
+    //    shared key, and assert payload shape:
+    //    helper → share_algorithm == 0 (VSS share fragment)
+    //    replica → share_algorithm == 1 (full vault, contains secret_data)
+    let helper_a_key = match helper_a
+        .protocol
+        .secret_store
+        .load(helper_a_channel, SecretKind::SharedKey)
+        .await
+        .expect("helper-a key load")
+        .expect("helper-a shared key must exist")
+    {
+        SecretValue::SharedKey(k) => k,
+        _ => panic!("helper-a SharedKey value mismatch"),
+    };
+    let replica_key = match replica
+        .protocol
+        .secret_store
+        .load(replica_channel, SecretKind::SharedKey)
+        .await
+        .expect("replica key load")
+        .expect("replica shared key must exist")
+    {
+        SecretValue::SharedKey(k) => k,
+        _ => panic!("replica SharedKey value mismatch"),
+    };
+
+    let helper_msg = decode_store_share_request(&helper_a_env.1, &helper_a_key);
+    assert_eq!(
+        helper_msg.share_algorithm, 0,
+        "helper envelope must carry VSS share (algorithm 0), got {}",
+        helper_msg.share_algorithm
+    );
+
+    let replica_msg = decode_store_share_request(&replica_env.1, &replica_key);
+    assert_eq!(
+        replica_msg.share_algorithm, 1,
+        "replica envelope must carry full vault (algorithm 1 = REPLICA_VAULT), got {}",
+        replica_msg.share_algorithm
+    );
+
+    // 6. The replica's share bytes are the canonical DeRecSecret bag — it
+    //    must contain the original secret payload, byte-for-byte.
+    assert!(
+        contains_subslice(&replica_msg.share, &secret_data),
+        "replica envelope must contain the original secret payload (full vault)"
+    );
+
+    // 7. Helper share is a VSS fragment whose payload bytes do NOT contain
+    //    the raw secret verbatim (it's a polynomial share + commitment).
+    //    The replica payload's `contains_subslice` check above is the
+    //    counterpart proving the FULL secret is there.
+    assert!(
+        !contains_subslice(&helper_msg.share, &secret_data),
+        "helper VSS fragment must NOT contain the raw secret bytes",
+    );
+
+    // 8. All targets share the same secret_id and version on this round.
+    assert_eq!(helper_msg.secret_id, replica_msg.secret_id);
+    assert_eq!(helper_msg.version, replica_msg.version);
+
+    println!(
+        "  helper envelope: share_algorithm=0 (VSS), {}B  ✓",
+        helper_msg.share.len()
+    );
+    println!(
+        "  replica envelope: share_algorithm=1 (full vault), {}B, contains secret  ✓",
+        replica_msg.share.len()
+    );
+
+
+    // 9. Negative: Helper-role channel (e.g. a Helper trying to push a
+    //    secret to itself) must be refused with RoleMismatch.
+    let mut helper_peer = Peer::new("helper2", "https://helper-2.example.com");
+    let mut owner_peer = Peer::new("owner2", "https://owner-2.example.com");
+    let role_check_channel = ChannelId(99);
+    pair(&mut owner_peer, &mut helper_peer, role_check_channel).await;
+    // helper_peer's view of role_check_channel is `role: Helper`.
+    let result = helper_peer
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secret_id: 1,
+            target: Target::Single(role_check_channel),
+            secrets: vec![UserSecret {
+                id: vec![1],
+                name: "rogue".to_owned(),
+                data: b"x".to_vec(),
+            }],
+            description: None,
+        })
+        .await;
+    assert!(
+        matches!(result, Err(derec_library::Error::RoleMismatch { .. })),
+        "Helper-initiated ProtectSecret must be refused with RoleMismatch, got {result:?}"
+    );
+
+    println!("  helper-initiated ProtectSecret: RoleMismatch ✓");
+
+
+    // 10. End-to-end (#59 receiver side): feed the replica envelope into
+    //     the replica peer's process(). It should auto-ack and emit a
+    //     ReplicaVaultReceived event. Owner then processes the ack and
+    //     emits ReplicaVaultAcked.
+    println!("  -- #59: receiver-side replica dispatch --");
+
+    let replica_events = replica
+        .protocol
+        .process(&replica_env.1)
+        .await
+        .expect("replica.process(StoreShareRequest) must succeed");
+    let received = replica_events
+        .iter()
+        .find_map(|e| match e {
+            DeRecEvent::ReplicaVaultReceived {
+                channel_id: c,
+                from_replica_id,
+                secret_id,
+                version: _,
+                vault,
+                shares,
+            } if *c == replica_channel => Some((
+                *from_replica_id,
+                *secret_id,
+                vault.clone(),
+                shares.clone(),
+            )),
+            _ => None,
+        })
+        .expect("replica.process should emit ReplicaVaultReceived");
+    let (received_from, received_secret_id, vault, shares) = received;
+    assert_eq!(received_from, owner_id, "from_replica_id must be owner's id");
+    assert_eq!(received_secret_id, 0xC0FFEE, "secret_id mismatch");
+    // Typed event: the SecretContainer carries the user-secret bytes
+    // verbatim (one entry, since the test wrote one UserSecret).
+    assert_eq!(vault.secrets.len(), 1, "vault must carry one user secret");
+    assert_eq!(
+        vault.secrets[0].data, secret_data,
+        "vault.secrets[0].data must round-trip the original secret"
+    );
+    // Owner had 2 helpers in this test, so the share map (composite's
+    // `shares` field) must contain one entry per helper, keyed by the
+    // helper channel ids (channel_id is the only identifier shared
+    // between Source and Destination — the Destination needs it to map
+    // each share back to its helper if it ever takes over recovery).
+    assert_eq!(
+        shares.len(),
+        2,
+        "composite must carry the helper-share map (2 helpers)"
+    );
+    let share_channel_ids: std::collections::BTreeSet<u64> =
+        shares.iter().map(|s| s.channel_id).collect();
+    assert_eq!(
+        share_channel_ids,
+        std::collections::BTreeSet::from([helper_a_channel.0, helper_b_channel.0]),
+        "ChannelShare entries must be keyed by the two helper channel ids",
+    );
+    for s in &shares {
+        assert!(
+            !s.committed_share.is_empty(),
+            "ChannelShare.committed_share must be non-empty bytes"
+        );
+    }
+
+    // owner_replica_id round-trips the Source's id verbatim — this is
+    // what lets a Destination attribute the vault back to its origin
+    // during conflict resolution.
+    assert_eq!(
+        vault.owner_replica_id, owner_id,
+        "vault.owner_replica_id must echo the Source's replica_id"
+    );
+
+    // vault.helpers: snapshot of the Source's paired helpers at protect
+    // time. Exactly two entries here (helper-a + helper-b), each with a
+    // non-empty shared_key and the transport_uri the owner saw at pair.
+    assert_eq!(
+        vault.helpers.len(),
+        2,
+        "vault.helpers must contain one entry per paired helper (got {})",
+        vault.helpers.len()
+    );
+    let helper_channel_ids: std::collections::BTreeSet<u64> =
+        vault.helpers.iter().map(|h| h.channel_id).collect();
+    assert_eq!(
+        helper_channel_ids,
+        std::collections::BTreeSet::from([helper_a_channel.0, helper_b_channel.0]),
+        "vault.helpers must carry both helper channel ids"
+    );
+    for h in &vault.helpers {
+        assert_eq!(
+            h.shared_key.len(),
+            32,
+            "HelperInfo.shared_key must be a 32-byte symmetric key"
+        );
+    }
+
+    // vault.replicas: snapshot of the Source's paired Destinations.
+    // ReplicaDestination is the only kind that ends up here in this
+    // scenario — replica_id, sender_kind, channel_id, transport_uri,
+    // and shared_key must all match what the Source negotiated.
+    assert_eq!(
+        vault.replicas.len(),
+        1,
+        "vault.replicas must contain the single Destination (got {})",
+        vault.replicas.len()
+    );
+    let destination = &vault.replicas[0];
+    assert_eq!(
+        destination.replica_id, replica_id,
+        "ReplicaInfo.replica_id must echo the Destination's replica_id"
+    );
+    assert_eq!(
+        destination.channel_id,
+        replica_channel.0,
+        "ReplicaInfo.channel_id must match the Source-side channel id"
+    );
+    assert_eq!(
+        destination.sender_kind,
+        SenderKind::ReplicaDestination as i32,
+        "ReplicaInfo.sender_kind must be ReplicaDestination"
+    );
+    assert_eq!(
+        destination.transport_uri, replica.uri,
+        "ReplicaInfo.transport_uri must echo the Destination's URI"
+    );
+    assert_eq!(
+        destination.shared_key.len(),
+        32,
+        "ReplicaInfo.shared_key must be the 32-byte K_replica"
+    );
+
+    println!(
+        "  replica received: from={:x}, secret_id={:x}, vault: {} secret(s) / {} helper(s) / {} replica(s), {} helper share(s)  ✓",
+        received_from,
+        received_secret_id,
+        vault.secrets.len(),
+        vault.helpers.len(),
+        vault.replicas.len(),
+        shares.len()
+    );
+
+    // Replica auto-acked → drain replica's outbox and feed it to owner.
+    let mut replica_outbound = replica.transport.drain();
+    assert_eq!(
+        replica_outbound.len(),
+        1,
+        "replica must auto-ack with exactly one StoreShareResponse"
+    );
+    let (_, ack_bytes) = replica_outbound.pop().unwrap();
+
+    let owner_events = owner
+        .protocol
+        .process(&ack_bytes)
+        .await
+        .expect("owner.process(StoreShareResponse) on replica channel must succeed");
+    let acked = owner_events
+        .iter()
+        .find_map(|e| match e {
+            DeRecEvent::ReplicaVaultAcked {
+                channel_id: c,
+                from_replica_id,
+                status,
+                memo,
+                ..
+            } if *c == replica_channel => Some((*from_replica_id, *status, memo.clone())),
+            _ => None,
+        })
+        .expect("owner.process should emit ReplicaVaultAcked");
+    assert_eq!(
+        acked.0, replica_id,
+        "ReplicaVaultAcked.from_replica_id must be replica's id"
+    );
+    assert_eq!(acked.1, 0, "expected StatusEnum::Ok (0), got status={}", acked.1);
+    println!(
+        "  owner received ack: from={:x}, status={}, memo={:?}  ✓",
+        acked.0, acked.1, acked.2
+    );
+
+    println!("Protocol ProtectSecret(replica targets) flow test passed.");
+}
+
+
+/// Decode and decrypt a `StoreShareRequest` envelope using the given
+/// shared key. Panics on any malformed input — only used by smoke tests
+/// where the envelope shape is guaranteed by the sender path.
+///
+/// The envelope is a `DeRecMessage` proto whose `message` field carries
+/// the channel-encrypted inner ciphertext; `extract_inner_message` only
+/// handles the decryption step, so we decode the outer envelope here.
+fn decode_store_share_request(
+    envelope_bytes: &[u8],
+    shared_key: &[u8; 32],
+) -> derec_proto::StoreShareRequestMessage {
+    use derec_library::derec_message::extract_inner_message;
+    use prost::Message as _;
+
+    let envelope = derec_proto::DeRecMessage::decode(envelope_bytes)
+        .expect("envelope must be a valid DeRecMessage proto");
+    let inner = extract_inner_message(&envelope.message, shared_key)
+        .expect("envelope inner ciphertext must decrypt with the channel shared key");
+    match inner {
+        derec_proto::MessageBody::StoreShareRequest(req) => req,
+        _ => panic!("expected StoreShareRequest, got {:?}", std::any::type_name_of_val(&inner)),
+    }
 }
 
 

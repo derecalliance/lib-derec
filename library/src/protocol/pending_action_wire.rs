@@ -304,11 +304,13 @@ fn split_trace_id_and_shared_key(bytes: &[u8]) -> Result<(u64, [u8; 32], &[u8]),
     Ok((trace_id, shared_key, rest))
 }
 
+#[allow(dead_code)] // used by wasm only; kept for future ffi callers.
 fn i32_to_sender_kind(val: i32) -> Result<SenderKind, String> {
     match val {
         0 => Ok(SenderKind::Owner),
         1 => Ok(SenderKind::Helper),
-        2 => Ok(SenderKind::Replica),
+        3 => Ok(SenderKind::ReplicaSource),
+        4 => Ok(SenderKind::ReplicaDestination),
         _ => Err(format!("invalid SenderKind: {val}")),
     }
 }

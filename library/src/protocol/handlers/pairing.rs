@@ -165,7 +165,7 @@ pub(in crate::protocol) async fn accept<
 
     let peer_transport = resp.peer_transport_protocol.clone();
 
-    let status = if kind == SenderKind::Replica {
+    let status = if is_replica_kind(kind) {
         crate::types::ChannelStatus::Pending
     } else {
         crate::types::ChannelStatus::Paired
@@ -203,11 +203,12 @@ pub(in crate::protocol) async fn accept<
     #[cfg(feature = "logging")]
     tracing::info!("pairing complete (responder side)");
 
-    Ok(vec![DeRecEvent::PairingCompleted {
+    Ok(pair_completion_events(
         channel_id,
         kind,
         peer_communication_info,
-    }])
+        peer_replica_id,
+    ))
 }
 
 #[cfg_attr(
@@ -629,11 +630,7 @@ fn on_request(
     // Derive the LOCAL kind from the peer's. Then refuse if it would be
     // Replica without a configured local id — refusing here avoids
     // surfacing an `ActionRequired::Pairing` the app cannot accept.
-    let kind = match peer_kind {
-        SenderKind::Owner => SenderKind::Helper,
-        SenderKind::Helper => SenderKind::Owner,
-        SenderKind::Replica => SenderKind::Replica,
-    };
+    let kind = derive_peer_kind(peer_kind);
     let _ = require_replica_id_for_kind(kind, replica_id)?;
 
     let action = PendingAction::Pairing {
@@ -694,7 +691,7 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
         ))?;
     let kind = channel.role;
 
-    let status = if kind == SenderKind::Replica {
+    let status = if is_replica_kind(kind) {
         crate::types::ChannelStatus::Pending
     } else {
         crate::types::ChannelStatus::Paired
@@ -721,11 +718,12 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     #[cfg(feature = "logging")]
     tracing::info!("pairing complete (initiator side)");
 
-    Ok(vec![DeRecEvent::PairingCompleted {
+    Ok(pair_completion_events(
         channel_id,
         kind,
         peer_communication_info,
-    }])
+        peer_replica_id,
+    ))
 }
 
 /// Build a `CommunicationInfo` proto from the app's free-form key-value
@@ -797,7 +795,7 @@ fn extract_communication_info(
     let Some(info) = info.as_ref() else {
         // No comm_info means no reserved entries either; replica pairings
         // are rejected up-front by the missing-id check below.
-        if peer_kind == SenderKind::Replica {
+        if is_replica_kind(peer_kind) {
             return Err(PairingError::MissingReplicaId {
                 sender_kind: peer_kind,
             }
@@ -833,12 +831,12 @@ fn extract_communication_info(
         free_form.insert(e.key.to_owned(), trimmed.to_owned());
     }
 
-    match (peer_kind, peer_replica_id) {
-        (SenderKind::Replica, None) => Err(PairingError::MissingReplicaId {
+    match (is_replica_kind(peer_kind), peer_replica_id.is_some()) {
+        (true, false) => Err(PairingError::MissingReplicaId {
             sender_kind: peer_kind,
         }
         .into()),
-        (k, Some(_)) if k != SenderKind::Replica => Err(PairingError::UnexpectedReplicaId {
+        (false, true) => Err(PairingError::UnexpectedReplicaId {
             sender_kind: peer_kind,
         }
         .into()),
@@ -852,6 +850,41 @@ fn is_reserved_key(key: &str) -> bool {
     key.starts_with("derec.")
 }
 
+/// Build the event stream a pair-handshake-completing handler returns.
+///
+/// Always emits `PairingCompleted` (the universal "handshake done" signal,
+/// observed by every kind of pairing). For replica pairings, also emits
+/// `ReplicaPaired` carrying the peer's replica id. The local side's role
+/// (Source / Destination) is already on the saved `Channel.role`, so
+/// the event doesn't repeat it.
+///
+/// `peer_replica_id` is `Option<u64>` because the extract path uses that
+/// shape, but for replica pairings it is guaranteed `Some` by
+/// [`extract_communication_info`]'s mode validation; the `expect` here
+/// would only fire if a caller pushed an inconsistent (replica kind, no
+/// peer id) tuple in.
+fn pair_completion_events(
+    channel_id: ChannelId,
+    kind: SenderKind,
+    peer_communication_info: HashMap<String, String>,
+    peer_replica_id: Option<u64>,
+) -> Vec<DeRecEvent> {
+    let mut events = vec![DeRecEvent::PairingCompleted {
+        channel_id,
+        kind,
+        peer_communication_info,
+    }];
+    if is_replica_kind(kind) {
+        events.push(DeRecEvent::ReplicaPaired {
+            channel_id,
+            peer_replica_id: peer_replica_id.expect(
+                "replica pairings carry peer_replica_id (extract validates)",
+            ),
+        });
+    }
+    events
+}
+
 /// Gate for replica-mode pairings on the local side.
 ///
 /// Returns `Some(id)` if `kind == Replica` (and the protocol was configured
@@ -863,7 +896,7 @@ fn require_replica_id_for_kind(
     local_kind: SenderKind,
     configured_replica_id: Option<u64>,
 ) -> Result<Option<u64>> {
-    if local_kind != SenderKind::Replica {
+    if !is_replica_kind(local_kind) {
         return Ok(None);
     }
     configured_replica_id
@@ -887,17 +920,30 @@ fn request_sender_kind(request: &PairRequestMessage) -> Result<SenderKind> {
 /// initiator must look up its own role on the channel and invert it. The
 /// derivation matches [`on_request`]'s rule on the responder side:
 ///
-/// | local       | peer         |
-/// |-------------|--------------|
-/// | `Owner`     | `Helper`     |
-/// | `Helper`    | `Owner`      |
-/// | `Replica`   | `Replica`    |
-fn derive_peer_kind(local_kind: SenderKind) -> SenderKind {
+/// | local                 | peer                  |
+/// |-----------------------|-----------------------|
+/// | `Owner`               | `Helper`              |
+/// | `Helper`              | `Owner`               |
+/// | `ReplicaSource`       | `ReplicaDestination`  |
+/// | `ReplicaDestination`  | `ReplicaSource`       |
+pub(in crate::protocol) fn derive_peer_kind(local_kind: SenderKind) -> SenderKind {
     match local_kind {
         SenderKind::Owner => SenderKind::Helper,
         SenderKind::Helper => SenderKind::Owner,
-        SenderKind::Replica => SenderKind::Replica,
+        SenderKind::ReplicaSource => SenderKind::ReplicaDestination,
+        SenderKind::ReplicaDestination => SenderKind::ReplicaSource,
     }
+}
+
+/// Returns `true` for either of the two replica-mode `SenderKind`s.
+/// Centralizes the "is this any kind of replica?" check that several
+/// handlers need (status assignment, replica_id gating, communication
+/// info validation).
+fn is_replica_kind(kind: SenderKind) -> bool {
+    matches!(
+        kind,
+        SenderKind::ReplicaSource | SenderKind::ReplicaDestination
+    )
 }
 
 #[cfg(test)]
@@ -993,7 +1039,7 @@ mod tests {
             ],
         });
 
-        let (map, replica_id) = extract_communication_info(&info, SenderKind::Replica).unwrap();
+        let (map, replica_id) = extract_communication_info(&info, SenderKind::ReplicaSource).unwrap();
         // Map carries only the free-form entry; reserved key is gone.
         assert_eq!(map.len(), 1);
         assert_eq!(map.get("name").map(String::as_str), Some("Bob"));
@@ -1013,12 +1059,12 @@ mod tests {
         });
 
         let err =
-            extract_communication_info(&info, SenderKind::Replica).expect_err("must reject");
+            extract_communication_info(&info, SenderKind::ReplicaSource).expect_err("must reject");
         assert!(
             matches!(
                 err,
                 Error::Pairing(PairingError::MissingReplicaId { sender_kind })
-                    if sender_kind == SenderKind::Replica
+                    if sender_kind == SenderKind::ReplicaSource
             ),
             "expected MissingReplicaId, got {err:?}"
         );
@@ -1053,7 +1099,7 @@ mod tests {
         // A replica peer that sent no CommunicationInfo at all — no place to
         // carry the required `derec.replica_id`.
         let err =
-            extract_communication_info(&None, SenderKind::Replica).expect_err("must reject");
+            extract_communication_info(&None, SenderKind::ReplicaSource).expect_err("must reject");
         assert!(matches!(
             err,
             Error::Pairing(PairingError::MissingReplicaId { .. })
@@ -1083,14 +1129,15 @@ mod tests {
     #[test]
     fn require_replica_id_for_kind_passes_through_for_replica() {
         assert_eq!(
-            require_replica_id_for_kind(SenderKind::Replica, Some(42)).unwrap(),
+            require_replica_id_for_kind(SenderKind::ReplicaSource, Some(42)).unwrap(),
             Some(42)
         );
     }
 
     #[test]
     fn require_replica_id_for_kind_errors_when_replica_unconfigured() {
-        let err = require_replica_id_for_kind(SenderKind::Replica, None).unwrap_err();
+        let err = require_replica_id_for_kind(SenderKind::ReplicaSource, None).unwrap_err();
         assert!(matches!(err, Error::ReplicaIdNotConfigured));
     }
+
 }

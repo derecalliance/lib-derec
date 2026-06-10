@@ -19,6 +19,16 @@ use std::collections::HashMap;
 /// At present the sharing flow uses the library's VSS-based share generation and
 /// encodes that choice using the protocol value `0`.
 const SHARE_ALGORITHM_VSS: i32 = 0;
+/// `share` bytes carry a **full vault payload** (`DeRecSecret` proto)
+/// instead of a single VSS share fragment. Used on replica channels —
+/// every replica holds an identical copy of the vault rather than a
+/// reconstructable fragment of it.
+///
+/// Disambiguates the payload semantics on the wire; the receiver's
+/// `Channel.role` is the authoritative source of truth, but a distinct
+/// `share_algorithm` value lets wire dumps and middle-boxes tell the two
+/// payload shapes apart without channel-state context.
+pub const SHARE_ALGORITHM_REPLICA_VAULT: i32 = 1;
 
 pub struct SplitResult {
     pub shares: HashMap<ChannelId, CommittedDeRecShare>,

@@ -58,7 +58,8 @@ export interface Transport {
 export enum SenderKind {
   Owner = 0,
   Helper = 1,
-  Replica = 2,
+  ReplicaSource = 3,
+  ReplicaDestination = 4,
 }
 
 /**
@@ -82,6 +83,7 @@ export enum FlowKind {
   VerifyShares = 3,
   RecoverSecret = 4,
   Unpair = 5,
+  UpdateChannelInfo = 6,
 }
 
 export type UnpairAck = "required" | "not_required";
@@ -140,6 +142,16 @@ export interface UnpairParams {
 
   memo?: string;
 }
+export interface UpdateChannelInfoParams {
+  target?: Target;
+
+  /** New communication-info map. `null`/absent leaves the peer's stored
+   *  map untouched; pass an empty object to clear it. */
+  communication_info?: Record<string, string>;
+
+  /** New transport endpoint. Absent leaves it untouched. */
+  transport_protocol?: { uri: string; protocol: number };
+}
 
 export type DeRecEvent =
   | { type: "PairingCompleted"; channel_id: string; kind: SenderKind; peer_communication_info?: Record<string, string> }
@@ -182,6 +194,86 @@ export type DeRecEvent =
    *  non-Ok status (HashedKeys flow). Distinct from a cryptographic
    *  hash mismatch, which surfaces as a thrown error from `process()`. */
   | { type: "PrePairRejected"; channel_id: string; status: number; memo: string }
+
+  /** Fires alongside `PairingCompleted` on replica-mode pair handshakes.
+   *  `peer_replica_id` is the peer's hex-encoded `u64` (matches the wire
+   *  `derec.replica_id` representation). The local side's role
+   *  (`ReplicaSource` vs `ReplicaDestination`) is on the persisted
+   *  channel record — replica pairings are unidirectional, so there is
+   *  no separate "role in pair" field. */
+  | {
+      type: "ReplicaPaired";
+      channel_id: string;
+      peer_replica_id: string;
+    }
+  /** A `ReplicaSource` peer pushed a vault sync on a
+   *  `ReplicaDestination` channel. The library decoded the
+   *  `ReplicaSecretPayload`; the app installs `vault.secrets` and
+   *  optionally uses `shares` for recovery. `from_replica_id` and the
+   *  `replica_id` fields inside `vault` are hex-encoded `u64`. */
+  | {
+      type: "ReplicaVaultReceived";
+      channel_id: string;
+      from_replica_id: string;
+      secret_id: string;
+      version: number;
+      vault: {
+        helpers: Array<{
+          channel_id: string;
+          transport_uri: string;
+          shared_key: Uint8Array;
+          communication_info: Record<string, string>;
+        }>;
+        secrets: Array<{
+          id: Uint8Array;
+          name: string;
+          data: Uint8Array;
+        }>;
+        replicas: Array<{
+          channel_id: string;
+          transport_uri: string;
+          shared_key: Uint8Array;
+          communication_info: Record<string, string>;
+          replica_id: string;
+          sender_kind: number;
+        }>;
+        owner_replica_id: string;
+      };
+      shares: Array<{
+        channel_id: string;
+        committed_share: Uint8Array;
+      }>;
+    }
+  /** Peer's ack of a vault sync we sent. `status` is the `StatusEnum`
+   *  integer (0 = Ok), `memo` is the peer's explanation. */
+  | {
+      type: "ReplicaVaultAcked";
+      channel_id: string;
+      from_replica_id: string;
+      secret_id: string;
+      version: number;
+      status: number;
+      memo: string;
+    }
+  /** A peer announced an updated `communication_info` map and/or
+   *  transport endpoint via `start(FlowKind.UpdateChannelInfo)`.
+   *  Surfaces on both sides — the initiator sees its own update echo
+   *  back after the responder accepts. */
+  | {
+      type: "ChannelInfoUpdated";
+      channel_id: string;
+      peer_communication_info?: Record<string, string>;
+      peer_transport_uri?: string;
+    }
+  /** The peer answered our outbound `UpdateChannelInfo` with a
+   *  non-`Ok` status. Local state is not rolled back — the app decides
+   *  whether to retry. */
+  | {
+      type: "ChannelInfoUpdateRejected";
+      channel_id: string;
+      status: number;
+      memo: string;
+    }
   | { type: "NoOp" };
 
 export declare class DeRecProtocol {
@@ -209,6 +301,15 @@ export declare class DeRecProtocol {
      * sibling replica). Default `false`.
      */
     autoReplyTo?: boolean | null,
+    /**
+     * Stable per-device replica id. Required to participate in any
+     * `ReplicaSource` / `ReplicaDestination` pairing — when set, the
+     * orchestrator auto-injects the id under the reserved key
+     * `derec.replica_id` in outbound replica pair envelopes. Apps that
+     * never use replica flows omit this argument. The id must be stable
+     * across restarts (persist it on the device once).
+     */
+    replicaId?: bigint | number | null,
   );
 
   /**
@@ -231,13 +332,42 @@ export declare class DeRecProtocol {
   start(flowKind: FlowKind.VerifyShares, params: VerifySharesParams): Promise<null>;
   start(flowKind: FlowKind.RecoverSecret, params: RecoverSecretParams): Promise<null>;
   start(flowKind: FlowKind.Unpair, params: UnpairParams): Promise<null>;
+  start(flowKind: FlowKind.UpdateChannelInfo, params: UpdateChannelInfoParams): Promise<null>;
   start(flowKind: number, params: unknown): Promise<bigint | null>;
+
+  /**
+   * Replace this node's local <c>communication_info</c> map. Does not
+   * contact peers — follow up with
+   * <c>start(FlowKind.UpdateChannelInfo, ...)</c> to propagate.
+   */
+  setCommunicationInfo(info: Record<string, string>): void;
+
+  /**
+   * Replace this node's local transport endpoint. IMPORTANT: keep the
+   * old endpoint operational during the changeover (see the Rust docs
+   * on the matching setter for the discipline).
+   */
+  setOwnTransport(uri: string, protocol: string): void;
 
   process(message: Uint8Array): Promise<DeRecEvent[]>;
 
   accept(actionBytes: Uint8Array): Promise<DeRecEvent[]>;
 
   reject(actionBytes: Uint8Array, status: number, memo: string): Promise<void>;
+
+  /**
+   * Derive the human-readable fingerprint for a paired channel. Both sides
+   * of a replica pair compute the same fingerprint from the shared key —
+   * users compare them out of band before calling `verifyFingerprint`.
+   */
+  getFingerprint(channelId: bigint | number): Promise<string>;
+
+  /**
+   * Verify `fingerprint` against the channel's locally-derived one. On
+   * match, the channel transitions from `Pending` to `Paired`. Returns
+   * `true` on confirmation, `false` on mismatch.
+   */
+  verifyFingerprint(channelId: bigint | number, fingerprint: string): Promise<boolean>;
 }
 
 export interface RecoveredHelperInfo {

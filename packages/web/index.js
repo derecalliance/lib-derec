@@ -21,7 +21,7 @@ export { decodeRecoveredSecretBag };
 
 export { restoreFromRecoveredBag };
 
-export const SenderKind = Object.freeze({ Owner: 0, Helper: 1, Replica: 2 });
+export const SenderKind = Object.freeze({ Owner: 0, Helper: 1, ReplicaSource: 3, ReplicaDestination: 4 });
 
 export const ContactMode = Object.freeze({ InlineKeys: 0, HashedKeys: 1 });
 

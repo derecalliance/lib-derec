@@ -17,6 +17,7 @@
 
 pub mod error;
 pub mod events;
+pub(crate) mod pending_action_wire;
 pub mod reserved_keys;
 pub mod traits;
 
@@ -378,12 +379,30 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
             } => {
                 let resolved =
                     handlers::resolve_target(&mut self.channel_store, target.clone()).await?;
-                handlers::require_role(
-                    &self.channel_store,
-                    &resolved,
-                    derec_proto::SenderKind::Owner,
-                )
-                .await?;
+                // ProtectSecret accepts channels where the local kind is
+                // Owner (peer is a Helper — the classic share path) OR
+                // Replica (peer is another replica — vault sync, #67).
+                // Channels where the local kind is Helper are not
+                // legitimate ProtectSecret initiators and are refused.
+                for channel_id in &resolved {
+                    let channel = self
+                        .channel_store
+                        .load(*channel_id)
+                        .await?
+                        .ok_or(Error::InvalidInput(
+                            "channel id not present in channel store",
+                        ))?;
+                    if !matches!(
+                        channel.role,
+                        derec_proto::SenderKind::Owner | derec_proto::SenderKind::ReplicaSource
+                    ) {
+                        return Err(Error::RoleMismatch {
+                            channel_id: *channel_id,
+                            expected: derec_proto::SenderKind::Owner,
+                            actual: channel.role,
+                        });
+                    }
+                }
                 let (version, sent_channels) = handlers::sharing::start(
                     &mut self.channel_store,
                     &mut self.share_store,
@@ -396,6 +415,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     secret_id,
                     target,
                     reply_to.clone(),
+                    self.replica_id,
                 )
                 .await?;
 
@@ -994,6 +1014,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
             &mut self.channel_store,
             &mut self.share_store,
             &mut self.secret_store,
+            &self.transport,
             &mut self.pending_recovery,
             &mut self.pending_unpair,
             message,

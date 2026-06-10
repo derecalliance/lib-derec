@@ -4,7 +4,7 @@ const wasm = require("./derec_library.js");
 
 const DeRecProtocol = wasm.DeRecProtocolWasm;
 
-const SenderKind = Object.freeze({ Owner: 0, Helper: 1, Replica: 2 });
+const SenderKind = Object.freeze({ Owner: 0, Helper: 1, ReplicaSource: 3, ReplicaDestination: 4 });
 
 const ContactMode = Object.freeze({ InlineKeys: 0, HashedKeys: 1 });
 

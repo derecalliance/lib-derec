@@ -434,6 +434,75 @@ index.d.ts
 
 ---
 
+## Replica flows
+
+Replicas mirror an Owner's vault onto a second device so the same secrets
+remain reachable after device loss. Pairings are **unidirectional** — one
+side runs as `SenderKind.ReplicaSource` (owns the vault), the other as
+`SenderKind.ReplicaDestination` (receives it). Both must be constructed
+with a stable `replicaId`:
+
+```ts
+const owner = new DeRecProtocol(
+  channelStore, shareStore, secretStore, transport,
+  "https://owner.example.com", "https",
+  /* threshold */ 2, /* keepVersionsCount */ 3,
+  { name: "Owner" },
+  null, null, null, null,
+  /* replicaId */ 0xAAAA_AAAA_AAAA_AAAAn,
+);
+```
+
+A typical Source↔Destination handshake:
+
+```ts
+const contact = await owner.createContact(channelId, ContactMode.InlineKeys);
+await destination.start(FlowKind.Pairing, {
+  kind: SenderKind.ReplicaDestination,
+  contact,
+});
+// pump messages between the two protocols (drain transport → process)
+```
+
+The channel ends up in `Pending` and is NOT eligible as a
+`ProtectSecret` target until both sides confirm a deterministic
+fingerprint derived from the shared key:
+
+```ts
+const localFp = await owner.getFingerprint(channelId);
+const peerFp  = await destination.getFingerprint(channelId); // out of band
+
+await owner.verifyFingerprint(channelId, peerFp);             // → true
+await destination.verifyFingerprint(channelId, localFp);      // → true
+```
+
+Once paired, the Source includes the Destination as a `ProtectSecret`
+target alongside helpers. Helpers receive the usual VSS share via
+`StoreShareRequest`; the Destination receives the full vault as a
+typed `ReplicaVaultReceived` event:
+
+```ts
+{
+  type: "ReplicaVaultReceived",
+  channel_id, from_replica_id, secret_id, version,
+  vault: {
+    helpers:  [...],   // every paired helper (channel_id, transport_uri, shared_key, ...)
+    secrets:  [{ id, name, data }],
+    replicas: [...],   // every paired destination (replica_id, sender_kind, ...)
+    owner_replica_id,  // the Source's replica_id
+  },
+  shares: [{ channel_id, committed_share }, ...],  // helper channel_id → share bytes
+}
+```
+
+`vault` + `shares` give the Destination everything it needs to act in the
+Source's place during recovery.
+
+End-to-end coverage lives in
+[`runReplicaPairingAndVaultSyncFlow`](../../bindings/web/src/protocol.ts).
+
+---
+
 ## Correlation and routing
 
 Two cross-cutting metadata fields appear on every channel-mode exchange:

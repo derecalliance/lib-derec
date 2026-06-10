@@ -21,6 +21,40 @@ enum DeRecEventJs {
         #[serde(skip_serializing_if = "HashMap::is_empty")]
         peer_communication_info: HashMap<String, String>,
     },
+    /// Replica-mode pair handshake completed. Fires alongside
+    /// `PairingCompleted` on replica channels. `peer_replica_id` is the
+    /// peer's hex-encoded `u64` (matches the wire-level
+    /// `derec.replica_id` representation). The local side's role
+    /// (`ReplicaSource` vs `ReplicaDestination`) is on the persisted
+    /// `Channel.role` — replica pairings are unidirectional like
+    /// Owner↔Helper, so there is no separate "role in pair" field.
+    ReplicaPaired {
+        channel_id: String,
+        peer_replica_id: String,
+    },
+    /// A `ReplicaSource` peer pushed a vault sync on a
+    /// `ReplicaDestination` channel. The library has decoded the
+    /// `ReplicaSecretPayload` into typed fields; the app installs
+    /// `vault.secrets` and optionally uses `shares` for recovery.
+    /// `from_replica_id` and the replica/helper ids inside `vault` are
+    /// hex-encoded to match wire conventions.
+    ReplicaVaultReceived {
+        channel_id: String,
+        from_replica_id: String,
+        secret_id: String,
+        version: u32,
+        vault: SecretContainerJs,
+        shares: Vec<ChannelShareJs>,
+    },
+    /// The peer acked a vault sync we sent (#59 sender side).
+    ReplicaVaultAcked {
+        channel_id: String,
+        from_replica_id: String,
+        secret_id: String,
+        version: u32,
+        status: i32,
+        memo: String,
+    },
     ShareStored {
         channel_id: String,
         version: u32,
@@ -140,6 +174,98 @@ struct VersionEntryJs {
     description: String,
 }
 
+/// JS-side mirror of [`crate::types::HelperInfo`]. Shared keys go over
+/// the boundary as raw `Uint8Array`; channel ids and replica ids as
+/// strings to dodge JS u64 precision loss.
+#[derive(serde::Serialize)]
+struct HelperInfoJs {
+    channel_id: String,
+    transport_uri: String,
+    shared_key: Vec<u8>,
+    communication_info: HashMap<String, String>,
+}
+
+#[derive(serde::Serialize)]
+struct ReplicaInfoJs {
+    channel_id: String,
+    transport_uri: String,
+    shared_key: Vec<u8>,
+    communication_info: HashMap<String, String>,
+    replica_id: String,
+    sender_kind: i32,
+}
+
+#[derive(serde::Serialize)]
+struct UserSecretJs {
+    id: Vec<u8>,
+    name: String,
+    data: Vec<u8>,
+}
+
+#[derive(serde::Serialize)]
+pub struct SecretContainerJs {
+    helpers: Vec<HelperInfoJs>,
+    secrets: Vec<UserSecretJs>,
+    replicas: Vec<ReplicaInfoJs>,
+    owner_replica_id: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct ChannelShareJs {
+    channel_id: String,
+    committed_share: Vec<u8>,
+}
+
+impl From<crate::types::SecretContainer> for SecretContainerJs {
+    fn from(v: crate::types::SecretContainer) -> Self {
+        Self {
+            helpers: v
+                .helpers
+                .into_iter()
+                .map(|h| HelperInfoJs {
+                    channel_id: h.channel_id.to_string(),
+                    transport_uri: h.transport_uri,
+                    shared_key: h.shared_key,
+                    communication_info: h.communication_info,
+                })
+                .collect(),
+            secrets: v
+                .secrets
+                .into_iter()
+                .map(|s| UserSecretJs {
+                    id: s.id,
+                    name: s.name,
+                    data: s.data,
+                })
+                .collect(),
+            replicas: v
+                .replicas
+                .into_iter()
+                .map(|r| ReplicaInfoJs {
+                    channel_id: r.channel_id.to_string(),
+                    transport_uri: r.transport_uri,
+                    shared_key: r.shared_key,
+                    communication_info: r.communication_info,
+                    replica_id: crate::protocol::reserved_keys::encode_replica_id(r.replica_id),
+                    sender_kind: r.sender_kind,
+                })
+                .collect(),
+            owner_replica_id: crate::protocol::reserved_keys::encode_replica_id(
+                v.owner_replica_id,
+            ),
+        }
+    }
+}
+
+impl From<crate::types::ChannelShare> for ChannelShareJs {
+    fn from(v: crate::types::ChannelShare) -> Self {
+        Self {
+            channel_id: v.channel_id.to_string(),
+            committed_share: v.committed_share,
+        }
+    }
+}
+
 /// Extract `peer_communication_info` from a `PendingAction::Pairing`, or empty map otherwise.
 fn extract_peer_communication_info(action: &PendingAction) -> HashMap<String, String> {
     match action {
@@ -195,6 +321,40 @@ pub fn event_to_js(event: DeRecEvent) -> Result<JsValue, JsValue> {
             channel_id: channel_id.0.to_string(),
             kind: kind as u32,
             peer_communication_info,
+        },
+        DeRecEvent::ReplicaPaired { channel_id, peer_replica_id } => DeRecEventJs::ReplicaPaired {
+            channel_id: channel_id.0.to_string(),
+            peer_replica_id: crate::protocol::reserved_keys::encode_replica_id(peer_replica_id),
+        },
+        DeRecEvent::ReplicaVaultReceived {
+            channel_id,
+            from_replica_id,
+            secret_id,
+            version,
+            vault,
+            shares,
+        } => DeRecEventJs::ReplicaVaultReceived {
+            channel_id: channel_id.0.to_string(),
+            from_replica_id: crate::protocol::reserved_keys::encode_replica_id(from_replica_id),
+            secret_id: secret_id.to_string(),
+            version,
+            vault: vault.into(),
+            shares: shares.into_iter().map(Into::into).collect(),
+        },
+        DeRecEvent::ReplicaVaultAcked {
+            channel_id,
+            from_replica_id,
+            secret_id,
+            version,
+            status,
+            memo,
+        } => DeRecEventJs::ReplicaVaultAcked {
+            channel_id: channel_id.0.to_string(),
+            from_replica_id: crate::protocol::reserved_keys::encode_replica_id(from_replica_id),
+            secret_id: secret_id.to_string(),
+            version,
+            status,
+            memo,
         },
         DeRecEvent::ShareStored { channel_id, version } => DeRecEventJs::ShareStored {
             channel_id: channel_id.0.to_string(),

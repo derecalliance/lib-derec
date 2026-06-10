@@ -229,8 +229,10 @@ pub enum DeRecEvent {
     ///   which secrets it holds (e.g. after a recovery re-pairing).
     /// - [`SenderKind::Helper`] — the Helper side completed pairing; no
     ///   additional action is required (the Helper waits for incoming messages).
-    /// - [`SenderKind::Replica`] — a Replica pairing completed; the application
-    ///   may use the channel as needed.
+    /// - [`SenderKind::ReplicaSource`] / [`SenderKind::ReplicaDestination`] —
+    ///   a replica pairing completed; the application may use the channel
+    ///   as needed (Source pushes via `ProtectSecret`, Destination receives
+    ///   via [`Self::ReplicaVaultReceived`]).
     PairingCompleted {
         channel_id: ChannelId,
         kind: SenderKind,
@@ -239,8 +241,80 @@ pub enum DeRecEvent {
         peer_communication_info: HashMap<String, String>,
     },
 
+    /// A replica-mode pair handshake completed. Fires **alongside**
+    /// [`Self::PairingCompleted`] on replica channels.
+    ///
+    /// Under the unidirectional replica model, the local side's role
+    /// (`ReplicaSource` or `ReplicaDestination`) is already on
+    /// [`crate::types::Channel::role`] — this event just adds the
+    /// peer's `replica_id`, which the app needs as a `from_replica_id`
+    /// when subsequent vault syncs arrive (#59) or when targeting the
+    /// peer via `ProtectSecret` (#67).
+    ReplicaPaired {
+        /// The channel the pair handshake just completed on.
+        channel_id: ChannelId,
+        /// The peer's replica identity, extracted from
+        /// `derec.replica_id` in the peer's `CommunicationInfo`.
+        peer_replica_id: u64,
+    },
+
     /// A share was accepted and stored locally (Helper side).
     ShareStored { channel_id: ChannelId, version: u32 },
+
+    /// A `ReplicaSource` peer pushed a vault sync on a `ReplicaDestination`
+    /// channel. The library has already auto-acked the inbound
+    /// `StoreShareRequest` and decoded the `ReplicaSecretPayload` into
+    /// typed fields — the application can install `vault` directly,
+    /// optionally using `shares` to verify or to take over the recovery
+    /// flow toward each helper.
+    ///
+    /// **Recovery transitivity**: `vault.helpers[i].shared_key` lets the
+    /// receiver authenticate as the Source toward each helper, and
+    /// `vault.replicas[i].shared_key` does the same toward other
+    /// destinations. Treat the receiving device accordingly — see
+    /// [`crate::types::ReplicaInfo`] for the security note.
+    ReplicaVaultReceived {
+        /// The channel the request arrived on.
+        channel_id: ChannelId,
+        /// The peer's replica identity (from `Channel.replica_id`,
+        /// populated at pair time by #53).
+        from_replica_id: u64,
+        /// `secret_id` echoed from the inbound `StoreShareRequest`.
+        secret_id: u64,
+        /// `version` echoed from the inbound `StoreShareRequest`.
+        version: u32,
+        /// Decoded full vault — same shape the sender wrote. The
+        /// `helpers`, `replicas`, `secrets`, and `owner_replica_id`
+        /// fields carry the canonical roster snapshot for this version.
+        vault: crate::types::SecretContainer,
+        /// Per-helper VSS share map. Each entry pairs a helper's
+        /// `channel_id` with the serialized `CommittedDeRecShare` bytes
+        /// the helper received — sufficient material for the receiver
+        /// to drive a recovery against those helpers if needed.
+        shares: Vec<crate::types::ChannelShare>,
+    },
+
+    /// A replica peer's `StoreShareResponse` to a vault sync we sent
+    /// earlier (#67). Fires on the replica channel, mirroring
+    /// [`Self::ShareConfirmed`] / [`Self::ShareRejected`] on the helper
+    /// side.
+    ///
+    /// `status` and `memo` come straight from the peer's
+    /// `StoreShareResponseMessage.result`. Apps decide whether to retry,
+    /// rebroadcast, or surface the failure to the user.
+    ReplicaVaultAcked {
+        channel_id: ChannelId,
+        /// The peer's replica identity (from `Channel.replica_id`).
+        from_replica_id: u64,
+        /// `secret_id` echoed from the response.
+        secret_id: u64,
+        /// `version` echoed from the response.
+        version: u32,
+        /// The `StatusEnum` value from the peer's response.
+        status: i32,
+        /// Human-readable explanation from the peer (empty on `Ok`).
+        memo: String,
+    },
 
     /// A Helper confirmed it stored our share (Owner side).
     ShareConfirmed { channel_id: ChannelId, version: u32 },

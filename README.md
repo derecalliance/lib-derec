@@ -119,12 +119,25 @@ including Node-only dependencies.
 ## Example bindings
 
 End-to-end smoke tests live under `bindings/` and exercise every primitive
-flow against the current Rust / WASM / FFI surface:
+flow plus the high-level `DeRecProtocol` orchestrator (Owner↔Helper pair,
+ProtectSecret, Discovery, Recovery, replica vault sync) across every SDK:
 
 - `bindings/rust` — Rust primitive + protocol tests. Run with `cargo run -p derec-rust-binding-smoke-test`.
 - `bindings/nodejs` — Node.js WASM tests. `cd bindings/nodejs && npm install && npx tsc && node index.js`.
 - `bindings/web` — Browser WASM tests. `cd bindings/web && npm install && npm run build` and open via `npm run dev`.
-- `bindings/dotnet` — .NET P/Invoke tests against the C ABI. `cd bindings/dotnet && dotnet run`.
+- `bindings/dotnet` — .NET P/Invoke tests against the C ABI, including the orchestrator. `cd bindings/dotnet && dotnet run`.
+
+## Replica feature
+
+Replicas mirror an Owner's vault onto a second device so the same secrets
+remain reachable after device loss. Pairings are **unidirectional** — one
+side runs as `SenderKind::ReplicaSource` (owns the vault), the other as
+`SenderKind::ReplicaDestination` (receives it). After a fingerprint
+cross-confirmation, the Source includes the Destination as a
+`ProtectSecret` target alongside helpers. Helpers receive the usual VSS
+share; the Destination receives the full `SecretContainer` + per-helper
+share map and surfaces it as a typed `ReplicaVaultReceived` event. Each
+SDK README has a focused "Replica flows" section with a runnable example.
 
 ---
 

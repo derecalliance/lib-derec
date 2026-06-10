@@ -190,10 +190,10 @@ catch (DeRecException e)
 }
 ```
 
-The .NET package is intentionally scoped to the primitive layer — the
-`DeRecProtocol` orchestrator is not surfaced here. End-to-end primitive-level
-coverage (including the tampered-hash assertion) lives at
-`bindings/dotnet/Program.cs::RunPairingFlowHashedKeysTest`.
+End-to-end primitive-level coverage (including the tampered-hash assertion)
+lives at `bindings/dotnet/Program.cs::RunPairingFlowHashedKeysTest`. The
+higher-level `DeRecProtocol` orchestrator is also available — see
+[Using `DeRecProtocol` (orchestrator)](#using-derecprotocol-orchestrator).
 
 ---
 
@@ -296,6 +296,117 @@ byte[] recovered = Recovery.Response.Recover(
     secretId,
     version);
 ```
+
+---
+
+## Using `DeRecProtocol` (orchestrator)
+
+The `DeRec.Library.Orchestrator` namespace provides a stateful
+`DeRecProtocol` class that mirrors the Rust orchestrator and the
+`@derec-alliance/nodejs` / `@derec-alliance/web` packages. It owns the
+storage / transport callbacks and drives every flow through a single
+`StartAsync` / `ProcessAsync` / `AcceptAsync` / `RejectAsync` surface —
+events surface as typed `DeRecEvent` subclasses.
+
+```csharp
+using DeRec.Library;
+using DeRec.Library.Orchestrator;
+using DeRec.Library.Primitives;
+
+var channelStore = new InMemoryChannelStore();
+var shareStore   = new InMemoryShareStore();
+var secretStore  = new InMemorySecretStore();
+var transport    = new RecordingTransport();
+
+using var owner = new DeRecProtocol(
+    channelStore, shareStore, secretStore, transport,
+    ownTransportUri: "https://owner.example.com");
+
+// Pair (mirror this on the peer side).
+byte[] contact = await helper.CreateContactAsync(channelId, ContactMode.InlineKeys);
+await owner.StartAsync(FlowKind.Pairing, new PairingParams
+{
+    Kind = (int)Pairing.SenderKind.Owner,
+    Contact = contact,
+});
+// Hand the queued PairRequest from `owner`'s transport to `helper.ProcessAndAcceptAllAsync`,
+// then the PairResponse back to `owner.ProcessAndAcceptAllAsync`.
+// Both sides surface `PairingCompletedEvent` when done.
+
+// Protect a secret across one or more helpers.
+await owner.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+{
+    SecretId = "0xCAFE",
+    TargetValue = Target.Many(helperAId, helperBId).ToJsonValue(),
+    Secrets = new[]
+    {
+        new UserSecret { Id = new byte[] { 1 }, Name = "vault", Data = secretBytes },
+    },
+});
+// Each helper emits `ShareStoredEvent`; the owner emits `ShareConfirmedEvent`
+// per helper and `SharingCompleteEvent` once the round closes.
+```
+
+App-side responsibilities (mirrors the other SDKs):
+
+- Implement `IChannelStore`, `IShareStore`, `ISecretStore`, `ITransport`
+  with persistent backends. `InMemoryChannelStore` / `InMemoryShareStore`
+  / `InMemorySecretStore` / `RecordingTransport` ship for tests.
+- After pairing, link old↔new channel IDs on the helper side
+  (`channelStore.LinkChannel(oldId, newId)`) so recovery can fan out on
+  the new pair while still surfacing shares stored under the old one.
+
+End-to-end coverage:
+`bindings/dotnet/Program.cs::RunOrchestratorPairFlowTest`,
+`RunOrchestratorShareAndDiscoverFlowTest`,
+`RunOrchestratorReplicaPairAndVaultSyncTest`.
+
+---
+
+## Replica flows
+
+Replicas mirror an Owner's vault onto a second device so the same secrets
+remain reachable after device loss. Pairings are **unidirectional** —
+one side runs as `SenderKind.ReplicaSource` (owns the vault), the other
+as `SenderKind.ReplicaDestination` (receives it). Both `DeRecProtocol`
+instances must be constructed with a stable `replicaId`:
+
+```csharp
+using var owner = new DeRecProtocol(
+    channelStore, shareStore, secretStore, transport,
+    ownTransportUri: "https://owner.example.com",
+    replicaId: 0xAAAA_AAAA_AAAA_AAAAUL);
+```
+
+After the handshake, channels start in `Pending` and are not eligible as
+`ProtectSecret` targets until both sides confirm a deterministic
+fingerprint derived from the shared key:
+
+```csharp
+string localFp = await owner.GetFingerprintAsync(channelId);
+string peerFp  = await destination.GetFingerprintAsync(channelId); // out of band
+
+await owner.VerifyFingerprintAsync(channelId, peerFp);             // → true
+await destination.VerifyFingerprintAsync(channelId, localFp);      // → true
+```
+
+The Source then includes the Destination in any `ProtectSecret` target
+alongside helpers. Helpers receive the usual VSS share via
+`StoreShareRequest`; the Destination receives the full vault as a typed
+`ReplicaVaultReceivedEvent`:
+
+```csharp
+var ev = events.OfType<ReplicaVaultReceivedEvent>().First();
+// ev.Vault.Helpers          — every paired helper (channel_id, transport_uri, shared_key, ...)
+// ev.Vault.Secrets[i].Data  — the actual UserSecret bytes
+// ev.Vault.Replicas         — every paired destination (replica_id, sender_kind, ...)
+// ev.Vault.OwnerReplicaId   — the Source's replica_id
+// ev.Shares                 — { ChannelId, CommittedShare } pairs keyed by helper channel id
+```
+
+`ev.Vault` + `ev.Shares` give the Destination everything it needs to act
+in the Source's place during recovery. Smoke parity reference:
+`bindings/dotnet/Program.cs::RunOrchestratorReplicaPairAndVaultSyncTest`.
 
 ---
 
