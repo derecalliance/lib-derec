@@ -31,7 +31,23 @@ fn main() {
         println!("cargo:rerun-if-changed={}", proto.display());
     }
 
+    // `crate::protocol::types::Channel` in derec-library embeds
+    // `TransportProtocol` and `SenderKind` as fields and itself derives
+    // `serde::Serialize` / `Deserialize` so the FFI and WASM bridges
+    // can ship channel records as JSON across the language boundary
+    // without a separate DTO type. Inject serde derives onto those two
+    // prost-generated types so `Channel`'s derives compile. Field names
+    // round-trip as-is; the `SenderKind` enum uses serde's default
+    // representation (variant name as a string).
     prost_build::Config::new()
+        .type_attribute(
+            ".org.derecalliance.derec.protobuf.TransportProtocol",
+            "#[derive(serde::Serialize, serde::Deserialize)]",
+        )
+        .type_attribute(
+            ".org.derecalliance.derec.protobuf.SenderKind",
+            "#[derive(serde::Serialize, serde::Deserialize)]",
+        )
         .out_dir(&out_dir)
         .file_descriptor_set_path(out_dir.join("derec_descriptor.bin"))
         .compile_protos(&proto_files, &[proto_root])

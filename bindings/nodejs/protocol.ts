@@ -12,7 +12,7 @@
 // share store, recording transport), but are Map-backed instead of
 // localStorage-backed.
 
-import { ContactMode, DeRecProtocol, FlowKind, SenderKind, primitives } from "@derec-alliance/nodejs";
+import { ContactMode, DeRecProtocol, DeRecProtocolBuilder, FlowKind, SenderKind, primitives } from "@derec-alliance/nodejs";
 import type {
   ChannelStore,
   ContactMessage,
@@ -261,22 +261,22 @@ function makeNode(
   const shareStore = new InMemoryShareStore();
   const secretStore = new InMemorySecretStore();
   const transport = new RecordingTransport();
-  const protocol = new DeRecProtocol(
-    channelStore,
-    shareStore,
-    secretStore,
-    transport,
-    endpointUri,
-    "https",
-    THRESHOLD,
-    KEEP_VERSIONS_COUNT,
-    { name },
-    null, // timeoutInSecs
-    null, // autoRespondOnFailure
-    null, // unpairAck
-    options.autoReplyTo ?? null,
-    options.replicaId ?? null,
-  );
+  let builder = new DeRecProtocolBuilder()
+    .withChannelStore(channelStore)
+    .withShareStore(shareStore)
+    .withSecretStore(secretStore)
+    .withTransport(transport)
+    .withOwnTransport({ uri: endpointUri, protocol: "https" })
+    .withThreshold(THRESHOLD)
+    .withKeepVersionsCount(KEEP_VERSIONS_COUNT)
+    .withCommunicationInfo({ name });
+  if (options.autoReplyTo !== undefined) {
+    builder = builder.withAutoReplyTo(options.autoReplyTo);
+  }
+  if (options.replicaId !== undefined) {
+    builder = builder.withReplicaId(options.replicaId);
+  }
+  const protocol = builder.build();
   return { protocol, transport, channelStore, shareStore, secretStore };
 }
 
@@ -393,6 +393,60 @@ async function runPairingFlow(): Promise<void> {
   await doPair(helper, owner, 1n, "Pairing");
 
   console.log("\n✓ Pairing flow passed.\n");
+}
+
+
+/**
+ * `verifyFingerprint(wrong)` on a still-`Pending` channel must (a)
+ * return `false` and (b) leave `Channel.status` as `"Pending"`. The
+ * protocol must not downgrade or otherwise mutate the channel on a
+ * failed match.
+ */
+async function runFingerprintMismatchFlow(): Promise<void> {
+  console.log("=== [Protocol] Fingerprint mismatch ===\n");
+
+  const channelId = 5151n;
+  const sharedKey = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) sharedKey[i] = (i * 11 + 5) & 0xff;
+
+  const node = makeNode("Owner", "https://owner.example.com");
+
+  // Pre-seed a Pending channel + its 32-byte SharedKey. Mirrors the
+  // post-replica-pair state where fingerprint verification is still
+  // required to transition the channel to `Paired`.
+  const channelJson = {
+    id: Number(channelId),
+    transport: { uri: "https://peer.example.com", protocol: 0 },
+    communication_info: {},
+    status: "Pending",
+    created_at: 1700000000,
+    role: "ReplicaSource",
+    replica_id: 0xcafe,
+  };
+  await node.channelStore.save(
+    String(channelId),
+    new TextEncoder().encode(JSON.stringify(channelJson)),
+  );
+  await node.secretStore.save(String(channelId), 0, sharedKey);
+
+  const unmatched = await node.protocol.verifyFingerprint(channelId, "0000-0000-0000-0000");
+  if (unmatched) {
+    throw new Error("verifyFingerprint must return false for a wrong fingerprint");
+  }
+
+  // Critical invariant for 5.1: the stored channel record must still
+  // report Pending; the protocol must not have touched it.
+  const storedBytes = await node.channelStore.load(String(channelId));
+  if (!storedBytes) throw new Error("channel record missing after verify");
+  const stored = JSON.parse(new TextDecoder().decode(storedBytes));
+  if (stored.status !== "Pending") {
+    throw new Error(
+      `verifyFingerprint(wrong) must leave Channel.status as Pending; got ${stored.status}`,
+    );
+  }
+  console.log("  verifyFingerprint(wrong) returns false  ✓");
+  console.log("  Channel.status stays Pending after mismatch  ✓");
+  console.log("\n✓ Fingerprint mismatch passed.\n");
 }
 
 
@@ -1010,6 +1064,40 @@ async function runReplicaPairingAndVaultSyncFlow(): Promise<void> {
     `  replica pair handshake: owner sees peer=${ownerReplicaPaired.peer_replica_id}, dest sees peer=${destReplicaPaired.peer_replica_id}  ✓`,
   );
 
+  // Replica channels start `Pending` after pair handshake completion.
+  // `ProtectSecret` must refuse to target a still-Pending channel
+  // because the fingerprint has not been verified out-of-band yet.
+  // Exercise the path before fingerprint confirmation to assert the
+  // gate fires.
+  let rejected = false;
+  try {
+    await owner.protocol.start(FlowKind.ProtectSecret, {
+      secretId,
+      target: destChannel,
+      secrets: [
+        { id: new Uint8Array([0x01]), name: "premature", data: new Uint8Array() },
+      ],
+      description: "must reject — destination still Pending",
+    });
+  } catch (e: unknown) {
+    rejected = true;
+    const wasmErr = e as { code?: string };
+    // The wasm bridge surfaces InvalidInput as a plain Error; we just
+    // confirm the call did throw.
+    void wasmErr;
+  }
+  if (!rejected) {
+    throw new Error(
+      "ProtectSecret targeting a still-Pending replica channel must throw",
+    );
+  }
+  if (owner.transport.drain().length !== 0) {
+    throw new Error(
+      "no outbound traffic should have been queued by the rejected ProtectSecret",
+    );
+  }
+  console.log("  ProtectSecret refuses still-Pending replica target  ✓");
+
   // 3. Cross-confirm fingerprints — channel is `Pending` until both
   //    sides verify, and ProtectSecret refuses to target a Pending
   //    replica channel.
@@ -1118,6 +1206,120 @@ async function runReplicaPairingAndVaultSyncFlow(): Promise<void> {
     `  ReplicaVaultReceived: vault=${received.vault.secrets.length}secret/${received.vault.helpers.length}helpers/${received.vault.replicas.length}replicas, shares=${received.shares.length}  ✓`,
   );
 
+  // Drain helper outboxes from v=1 so the next round sees only v=2.
+  helperA.transport.drain();
+  helperB.transport.drain();
+
+  // Vault version updates: the owner mutates the secret and re-runs
+  // `ProtectSecret`; the destination must receive a fresh
+  // `ReplicaVaultReceived` carrying `version=2` and the new payload.
+  // The protocol auto-increments via `IShareStore.latestVersion()`;
+  // the in-memory store exposes a side-channel setter so this test
+  // can drive that contract without first running a full owner-side
+  // store cycle.
+  owner.shareStore.setOwnerVersion(1);
+  const secretDataV2 = new TextEncoder().encode("vault-payload-after-update");
+  await owner.protocol.start(FlowKind.ProtectSecret, {
+    secretId,
+    target: [helperAChannel, helperBChannel, destChannel],
+    secrets: [{ id: new Uint8Array([0x01]), name: "shared-vault", data: secretDataV2 }],
+    description: "v2 replica + helper distribution",
+  });
+
+  const outbound2 = owner.transport.drain();
+  if (outbound2.length !== 3) {
+    throw new Error(`v2: expected 3 outbound envelopes, got ${outbound2.length}`);
+  }
+  const destEnvelope2 = outbound2.find((m) => m.endpoint.uri === destUri);
+  if (!destEnvelope2) {
+    throw new Error("v2: no envelope routed to the destination");
+  }
+  const destEvents2 = await destination.protocol.process(destEnvelope2.message);
+  const received2 = destEvents2.find((e) => e.type === "ReplicaVaultReceived") as
+    | (DeRecEvent & { type: "ReplicaVaultReceived" })
+    | undefined;
+  if (!received2) {
+    throw new Error(
+      `v2: destination did not emit ReplicaVaultReceived; got [${destEvents2.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  if (received2.version !== 2) {
+    throw new Error(`v2: expected version=2, got ${received2.version}`);
+  }
+  const v2Data = received2.vault.secrets[0]?.data;
+  if (
+    received2.vault.secrets.length !== 1 ||
+    !v2Data ||
+    v2Data.length !== secretDataV2.length ||
+    !Array.from(secretDataV2).every((b, i) => b === v2Data[i])
+  ) {
+    throw new Error("v2: vault.secrets[0].data must round-trip the updated bytes");
+  }
+  console.log(
+    `  ReplicaVaultReceived v=2: secret bytes updated, share count = ${received2.shares.length}  ✓`,
+  );
+
+  // Replica recovery transitivity: the Destination received
+  // `vault.helpers[*].shared_key` inside the vault. Those keys must be
+  // byte-identical to what each helper has stored locally for the
+  // owner channel, because a Destination acting as a recovery delegate
+  // uses them to authenticate as the Source toward each helper.
+  const helperAStored = await helperA.secretStore.load(String(helperAChannel), 0);
+  const helperBStored = await helperB.secretStore.load(String(helperBChannel), 0);
+  if (!helperAStored || !helperBStored) {
+    throw new Error("helpers must have stored their shared keys");
+  }
+  const vaultHelperA = received2.vault.helpers.find(
+    (h) => BigInt(h.channel_id) === helperAChannel,
+  );
+  const vaultHelperB = received2.vault.helpers.find(
+    (h) => BigInt(h.channel_id) === helperBChannel,
+  );
+  if (!vaultHelperA || !vaultHelperB) {
+    throw new Error("vault.helpers missing entry for one of the helpers");
+  }
+  const keysEqual = (a: Uint8Array | number[], b: Uint8Array | number[]) => {
+    const aBytes = a instanceof Uint8Array ? a : new Uint8Array(a);
+    const bBytes = b instanceof Uint8Array ? b : new Uint8Array(b);
+    if (aBytes.length !== bBytes.length) return false;
+    for (let i = 0; i < aBytes.length; i++) {
+      if (aBytes[i] !== bBytes[i]) return false;
+    }
+    return true;
+  };
+  if (!keysEqual(helperAStored, vaultHelperA.shared_key)) {
+    throw new Error(
+      "vault.helpers[HelperA].shared_key must match what HelperA stores locally",
+    );
+  }
+  if (!keysEqual(helperBStored, vaultHelperB.shared_key)) {
+    throw new Error(
+      "vault.helpers[HelperB].shared_key must match what HelperB stores locally",
+    );
+  }
+  console.log(
+    "  vault.helpers[*].shared_key matches each helper's stored key — destination can act in source's stead  ✓",
+  );
+
+  // The vault also carries `vault.secrets[*].data` unencrypted, so
+  // the Destination can fall back to its stored vault without
+  // contacting any helper. The recovery model is "any one of: helper
+  // quorum, vault on a single destination" — both paths recover the
+  // same secret bytes.
+  const v2DataCheck = received2.vault.secrets[0]?.data;
+  if (
+    !v2DataCheck ||
+    v2DataCheck.length !== secretDataV2.length ||
+    !Array.from(secretDataV2).every((b, i) => b === v2DataCheck[i])
+  ) {
+    throw new Error(
+      "vault.secrets[0].data must be the raw recovered bytes",
+    );
+  }
+  console.log(
+    "  vault.secrets[0].data is the raw recovered secret — destination-only recovery is viable  ✓",
+  );
+
   console.log("\n✓ Replica pairing + vault sync flow passed.\n");
 }
 
@@ -1171,6 +1373,25 @@ async function runUpdateChannelInfoFlow(): Promise<void> {
     );
   }
   console.log(`  [Owner]  process(response) → ChannelInfoUpdated  ✓`);
+
+  const helperStoredBytes = await helper.channelStore.load(String(channelId));
+  if (!helperStoredBytes) {
+    throw new Error("helper channel record must still exist after UpdateChannelInfo");
+  }
+  const helperStored = JSON.parse(new TextDecoder().decode(helperStoredBytes));
+  if (helperStored.transport.uri !== newUri) {
+    throw new Error(
+      `helper's stored transport.uri must reflect the announced update; got ${helperStored.transport.uri}`,
+    );
+  }
+  for (const [k, v] of Object.entries(newInfo)) {
+    if (helperStored.communication_info[k] !== v) {
+      throw new Error(
+        `helper's stored communication_info[${k}] must mirror the announced map; got ${helperStored.communication_info[k]}`,
+      );
+    }
+  }
+  console.log("  helper's stored transport.uri + communication_info mirror the update  ✓");
 
   console.log("\n✓ UpdateChannelInfo flow passed.\n");
 }
@@ -1243,6 +1464,7 @@ export async function runProtocolSmoke(): Promise<void> {
   console.log("━━━ [Protocol] Starting ━━━\n");
 
   await runPairingFlow();
+  await runFingerprintMismatchFlow();
   await runHashedKeysPairingFlow();
   await runSharingFlow();
   await runDiscoveryAndRecoveryFlow();

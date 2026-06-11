@@ -274,41 +274,61 @@ export type DeRecEvent =
     }
   | { type: "NoOp" };
 
+/**
+ * Fluent builder for {@link DeRecProtocol}. Mirrors the Rust
+ * `DeRecProtocolBuilder` and the dotnet `DeRecProtocolBuilder`
+ * method-for-method so a developer who already knows one SDK can move
+ * between them without reaching for reference docs.
+ *
+ * Required setters: `withChannelStore`, `withShareStore`,
+ * `withSecretStore`, `withTransport`, `withOwnTransport`. Calling
+ * `build()` without all five throws.
+ */
+export declare class DeRecProtocolBuilder {
+  constructor();
+
+  withChannelStore(store: ChannelStore): DeRecProtocolBuilder;
+  withShareStore(store: ShareStore): DeRecProtocolBuilder;
+  withSecretStore(store: SecretStore): DeRecProtocolBuilder;
+  withTransport(transport: Transport): DeRecProtocolBuilder;
+  withOwnTransport(endpoint: { uri: string; protocol: string }): DeRecProtocolBuilder;
+
+  /** Default: 3. */
+  withThreshold(threshold: number): DeRecProtocolBuilder;
+  /** Default: 3. */
+  withKeepVersionsCount(count: number): DeRecProtocolBuilder;
+  /** Seconds. Default: 300 (5 minutes). Clamped to at least 1. */
+  withTimeout(timeoutInSecs: number): DeRecProtocolBuilder;
+  /** Default: empty. */
+  withCommunicationInfo(info: Record<string, string>): DeRecProtocolBuilder;
+  /** Default: false. */
+  withAutoRespondOnFailure(enabled: boolean): DeRecProtocolBuilder;
+  /** Default: "required". */
+  withUnpairAck(ack: UnpairAck): DeRecProtocolBuilder;
+  /**
+   * When `true`, every outbound channel-mode request stamps
+   * `request.replyTo = ownTransport` so the responder routes its reply
+   * back here even if the channel's stored peer endpoint points
+   * elsewhere. Default: false.
+   */
+  withAutoReplyTo(enabled: boolean): DeRecProtocolBuilder;
+  /**
+   * Stable per-device replica id. Required to participate in any
+   * `ReplicaSource` / `ReplicaDestination` pairing. The id must be
+   * stable across restarts. Default: unset.
+   */
+  withReplicaId(id: bigint | number): DeRecProtocolBuilder;
+
+  /**
+   * Finalize the configuration. Throws if any of the required setters
+   * was not called.
+   */
+  build(): DeRecProtocol;
+}
+
 export declare class DeRecProtocol {
-
-  constructor(
-    channelStore: ChannelStore,
-    shareStore: ShareStore,
-    secretStore: SecretStore,
-    transport: Transport,
-    ownTransportUri: string,
-    ownTransportProtocol: string,
-    threshold: number,
-    keepVersionsCount: number,
-    communicationInfo: Record<string, string>,
-    timeoutInSecs?: number | null,
-    autoRespondOnFailure?: boolean | null,
-
-    unpairAck?: UnpairAck | null,
-
-    /**
-     * When `true`, every outbound channel-mode request stamps
-     * `request.replyTo = ownTransport` so the responder routes its reply
-     * back here even if the channel's stored peer endpoint points
-     * elsewhere (e.g. replicas talking to a helper that was paired with a
-     * sibling replica). Default `false`.
-     */
-    autoReplyTo?: boolean | null,
-    /**
-     * Stable per-device replica id. Required to participate in any
-     * `ReplicaSource` / `ReplicaDestination` pairing — when set, the
-     * orchestrator auto-injects the id under the reserved key
-     * `derec.replica_id` in outbound replica pair envelopes. Apps that
-     * never use replica flows omit this argument. The id must be stable
-     * across restarts (persist it on the device once).
-     */
-    replicaId?: bigint | number | null,
-  );
+  /** Use {@link DeRecProtocolBuilder} to construct instances. */
+  private constructor();
 
   /**
    * Generate an out-of-band contact message used to bootstrap pairing.
@@ -331,7 +351,6 @@ export declare class DeRecProtocol {
   start(flowKind: FlowKind.RecoverSecret, params: RecoverSecretParams): Promise<null>;
   start(flowKind: FlowKind.Unpair, params: UnpairParams): Promise<null>;
   start(flowKind: FlowKind.UpdateChannelInfo, params: UpdateChannelInfoParams): Promise<null>;
-  start(flowKind: number, params: unknown): Promise<bigint | null>;
 
   /**
    * Replace this node's local <c>communication_info</c> map. Does not

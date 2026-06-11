@@ -31,6 +31,9 @@ pub struct ExtractUnpairRequestResult {
     pub channel_id: u64,
     /// Decrypted memo. Release with `derec_free_string`.
     pub memo: *mut c_char,
+    /// prost-encoded inner `UnpairRequestMessage` bytes. SDK consumers
+    /// decode this to inspect optional fields such as `reply_to`.
+    pub request_proto_bytes: DeRecBuffer,
 }
 
 #[repr(C)]
@@ -124,6 +127,7 @@ pub extern "C" fn extract_unpair_request(
         error,
         channel_id: 0,
         memo: std::ptr::null_mut(),
+        request_proto_bytes: empty_buffer(),
     };
 
     let request_bytes = match parse_buffer(request_ptr, request_len, "request_ptr") {
@@ -147,6 +151,7 @@ pub extern "C" fn extract_unpair_request(
 
     match crate::primitives::unpairing::request::extract(request_bytes, &shared_key) {
         Ok(r) => {
+            let request_proto_bytes = vec_into_buffer(r.request.encode_to_vec());
             let memo_c = match CString::new(r.request.memo) {
                 Ok(s) => s.into_raw(),
                 Err(_) => {
@@ -160,6 +165,7 @@ pub extern "C" fn extract_unpair_request(
                 error: success(),
                 channel_id,
                 memo: memo_c,
+                request_proto_bytes,
             }
         }
         Err(e) => with_err(from_lib_error(e)),

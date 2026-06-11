@@ -10,6 +10,7 @@ using System.Threading.Tasks;
 
 using DeRec.Library.Native;
 using NP = DeRec.Library.Native.Protocol;
+using LibPairing = DeRec.Library.Primitives.Pairing;
 
 namespace DeRec.Library.Orchestrator;
 
@@ -56,52 +57,21 @@ public sealed class DeRecProtocol : IDisposable
     private readonly ITransport _transport;
     // ReSharper restore PrivateFieldCanBeConvertedToLocalVariable
 
-    private static readonly JsonSerializerOptions JsonOpts = new()
-    {
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-        PropertyNamingPolicy = null,
-        Converters = { new ByteArrayJsonNumberConverter() },
-    };
+    private static JsonSerializerOptions JsonOpts => DeRecJsonOptions.Wire;
 
     /// <summary>
-    /// Serializes <c>byte[]</c> as a JSON array of numbers — matching
-    /// the Rust <c>serde_json::Vec&lt;u8&gt;</c> wire format used on
-    /// the FFI bridge. The .NET default (base64 string) would round-trip
-    /// fine within .NET but does not match what the Rust deserializer
-    /// expects.
+    /// Construct a protocol instance. Internal — callers go through
+    /// <see cref="DeRecProtocolBuilder"/> so the surface stays in step
+    /// with the Rust / JS SDK builders.
     /// </summary>
-    private sealed class ByteArrayJsonNumberConverter : JsonConverter<byte[]>
-    {
-        public override byte[] Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
-        {
-            if (reader.TokenType != JsonTokenType.StartArray)
-                throw new JsonException($"expected StartArray for byte[], got {reader.TokenType}");
-            var list = new List<byte>(32);
-            while (reader.Read())
-            {
-                if (reader.TokenType == JsonTokenType.EndArray)
-                    return list.ToArray();
-                list.Add(reader.GetByte());
-            }
-            throw new JsonException("unterminated byte[] JSON array");
-        }
-
-        public override void Write(Utf8JsonWriter writer, byte[] value, JsonSerializerOptions options)
-        {
-            writer.WriteStartArray();
-            foreach (byte b in value) writer.WriteNumberValue(b);
-            writer.WriteEndArray();
-        }
-    }
-
-    public DeRecProtocol(
+    internal DeRecProtocol(
         IChannelStore channelStore,
         IShareStore shareStore,
         ISecretStore secretStore,
         ITransport transport,
         string ownTransportUri,
         string ownTransportProtocol = "https",
-        int threshold = 2,
+        int threshold = 3,
         int keepVersionsCount = 3,
         Dictionary<string, string>? communicationInfo = null,
         int timeoutInSecs = 300,
@@ -183,12 +153,6 @@ public sealed class DeRecProtocol : IDisposable
 
         byte[]? commInfoBytes = null;
         UIntPtr commInfoLen = UIntPtr.Zero;
-        if (communicationInfo is { Count: > 0 })
-        {
-            // The Rust side decodes prost-encoded CommunicationInfo. For
-            // chunk 7a we don't need to populate it for the fingerprint
-            // path, so leave null. Chunk 7b/c will add proper encoding.
-        }
 
         var result = NP.derec_protocol_new(
             ref channelCb, ref secretCb, ref shareCb, ref transportCb,
@@ -422,8 +386,6 @@ public sealed class DeRecProtocol : IDisposable
     private static void ThrowOnError(DeRecError err) =>
         DeRec.Library.Utils.ThrowIfError(err);
 
-    // ── Buffer-allocation helper used by every load-style callback ──
-
     private static int WriteOut(byte[]? bytes, out IntPtr outPtr, out UIntPtr outLen)
     {
         if (bytes is null || bytes.Length == 0)
@@ -445,8 +407,6 @@ public sealed class DeRecProtocol : IDisposable
             Marshal.FreeCoTaskMem(ptr);
     }
 
-    // ── Channel store callbacks ───────────────────────────────────
-
     private int ChannelLoadImpl(IntPtr userData, ulong channelId, out IntPtr outPtr, out UIntPtr outLen)
     {
         try
@@ -458,10 +418,15 @@ public sealed class DeRecProtocol : IDisposable
                 outLen = UIntPtr.Zero;
                 return 1;
             }
-            var rec = new ChannelRecordDto(
-                ch.ChannelId, ch.TransportUri, ch.TransportProtocol,
-                ch.CommunicationInfo, ch.Status, ch.CreatedAt, ch.Role, ch.ReplicaId);
-            byte[] json = JsonSerializer.SerializeToUtf8Bytes(rec, JsonOpts);
+            var dto = new ChannelDto(
+                ch.Id,
+                new TransportDto(ch.Transport.Uri, (int)ch.Transport.Protocol),
+                ch.CommunicationInfo,
+                ch.Status.ToString(),
+                ch.CreatedAt,
+                ch.Role.ToString(),
+                ch.ReplicaId);
+            byte[] json = JsonSerializer.SerializeToUtf8Bytes(dto, JsonOpts);
             return WriteOut(json, out outPtr, out outLen);
         }
         catch
@@ -478,12 +443,20 @@ public sealed class DeRecProtocol : IDisposable
         {
             byte[] buf = new byte[(int)len];
             Marshal.Copy(bytes, buf, 0, buf.Length);
-            var rec = JsonSerializer.Deserialize<ChannelRecordDto>(buf, JsonOpts)
-                ?? throw new InvalidOperationException("null ChannelRecord");
+            var dto = JsonSerializer.Deserialize<ChannelDto>(buf, JsonOpts)
+                ?? throw new InvalidOperationException("null Channel JSON");
+            var transport = new TransportProtocol(
+                dto.transport.uri, (Protocol)dto.transport.protocol);
+            var status = Enum.Parse<ChannelStatus>(dto.status ?? nameof(ChannelStatus.Paired));
+            var role = Enum.Parse<LibPairing.SenderKind>(dto.role);
             _channelStore.Save(new Channel(
-                rec.channel_id, rec.transport_uri, rec.transport_protocol,
-                rec.communication_info ?? new(), rec.status ?? "paired",
-                rec.created_at, rec.role, rec.replica_id));
+                dto.id,
+                transport,
+                dto.communication_info ?? new(),
+                status,
+                dto.created_at,
+                role,
+                dto.replica_id));
             return 0;
         }
         catch { return -1; }
@@ -541,8 +514,6 @@ public sealed class DeRecProtocol : IDisposable
         }
     }
 
-    // ── Secret store callbacks ────────────────────────────────────
-
     private int SecretLoadImpl(IntPtr userData, ulong channelId, uint kind, out IntPtr outPtr, out UIntPtr outLen)
     {
         try
@@ -585,8 +556,6 @@ public sealed class DeRecProtocol : IDisposable
         try { _secretStore.Remove(channelId, (SecretKind)kind); return 0; }
         catch { return -1; }
     }
-
-    // ── Share store callbacks ─────────────────────────────────────
 
     private int ShareLoadImpl(
         IntPtr userData, ulong channelId, ulong secretId,
@@ -703,8 +672,6 @@ public sealed class DeRecProtocol : IDisposable
 
     private sealed record ShareRecordDto(string secret_id, uint version, byte[] bytes);
 
-    // ── Transport callback ────────────────────────────────────────
-
     private int TransportSendImpl(IntPtr userData, IntPtr uriPtr, UIntPtr uriLen, int protocol, IntPtr bytes, UIntPtr len)
     {
         try
@@ -720,16 +687,25 @@ public sealed class DeRecProtocol : IDisposable
         catch { return -1; }
     }
 
-    // ── JSON DTOs (wire shapes) ───────────────────────────────────
+    // Mirror the Rust-side `crate::protocol::types::Channel` /
+    // `TransportProtocol` shapes produced by serde's default derives.
+    // Wire field names are snake_case to match serde; `status` and `role`
+    // are variant-name strings ("Pending" / "Paired", "Owner" /
+    // "Helper" / "ReplicaSource" / "ReplicaDestination"). The public
+    // `Channel` record on the dotnet side uses native types
+    // (`TransportProtocol`, `ChannelStatus`, `Pairing.SenderKind`)
+    // and the bridge translates in `ChannelLoadImpl` /
+    // `ChannelSaveImpl`.
 
-    private sealed record ChannelRecordDto(
-        ulong channel_id,
-        string transport_uri,
-        int transport_protocol,
+    private sealed record TransportDto(string uri, int protocol);
+
+    private sealed record ChannelDto(
+        ulong id,
+        TransportDto transport,
         Dictionary<string, string>? communication_info,
         string? status,
         ulong created_at,
-        int role,
+        string role,
         ulong? replica_id);
 
     private sealed record SecretValueDto(uint kind, byte[] bytes);

@@ -16,6 +16,11 @@ public static partial class Recovery
             /// into <see cref="Response.Produce"/>.
             /// </summary>
             public required byte[] RequestProtoBytes { get; init; }
+            /// <summary>
+            /// Optional response endpoint advertised by the sender on
+            /// the inner request. Mirrors the JS bridge surface.
+            /// </summary>
+            public TransportProtocol? ReplyTo { get; init; }
         }
 
         public static DeRecMessage Produce(
@@ -66,10 +71,14 @@ public static partial class Recovery
             try
             {
                 Utils.ThrowIfError(nativeResult.Error);
+                byte[] innerBytes = Utils.CopyBuffer(nativeResult.RequestProtoBytes);
+                var inner = Org.Derecalliance.Derec.Protobuf.GetShareRequestMessage.Parser
+                    .ParseFrom(innerBytes);
                 return new ExtractResult
                 {
                     ChannelId = nativeResult.ChannelId,
-                    RequestProtoBytes = Utils.CopyBuffer(nativeResult.RequestProtoBytes),
+                    RequestProtoBytes = innerBytes,
+                    ReplyTo = TransportProtocol.FromProto(inner.ReplyTo),
                 };
             }
             finally

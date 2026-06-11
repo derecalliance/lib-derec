@@ -12,7 +12,8 @@ use crate::{
         request::{produce as produce_store_share_request_message, split},
         response::{self as sharing_response},
     },
-    types::{ChannelId, HelperInfo, SecretContainer, SharedKey, Target, UserSecret},
+    protocol::types::{HelperInfo, SecretContainer, Target, UserSecret},
+    types::{ChannelId, SharedKey},
 };
 use crate::derec_message::DeRecMessageBuilder;
 use crate::primitives::sharing::request::SHARE_ALGORITHM_REPLICA_VAULT;
@@ -347,8 +348,8 @@ async fn load_paired_targets<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     secret_store: &mut Ss,
     target: Target,
 ) -> Result<(
-    Vec<(crate::types::Channel, SharedKey)>,
-    Vec<(crate::types::Channel, SharedKey)>,
+    Vec<(crate::protocol::types::Channel, SharedKey)>,
+    Vec<(crate::protocol::types::Channel, SharedKey)>,
 )> {
     let selected_ids = resolve_target(channel_store, target).await?;
     if selected_ids.is_empty() {
@@ -356,7 +357,7 @@ async fn load_paired_targets<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     }
 
     let all_channels = channel_store.channels().await?;
-    let selected_channels: Vec<crate::types::Channel> = all_channels
+    let selected_channels: Vec<crate::protocol::types::Channel> = all_channels
         .into_iter()
         .filter(|c| selected_ids.contains(&c.id))
         .collect();
@@ -371,8 +372,8 @@ async fn load_paired_targets<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
         })
         .collect();
 
-    let mut helpers: Vec<(crate::types::Channel, SharedKey)> = Vec::new();
-    let mut replicas: Vec<(crate::types::Channel, SharedKey)> = Vec::new();
+    let mut helpers: Vec<(crate::protocol::types::Channel, SharedKey)> = Vec::new();
+    let mut replicas: Vec<(crate::protocol::types::Channel, SharedKey)> = Vec::new();
     for channel in selected_channels {
         let key = keys
             .remove(&channel.id)
@@ -381,7 +382,7 @@ async fn load_paired_targets<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
             // Local kind == Owner, peer is the Helper. Classic share path.
             SenderKind::Owner => helpers.push((channel, key)),
             // Local kind == ReplicaSource, peer is a ReplicaDestination
-            // ready to receive full vault payloads. Vault sync (#67).
+            // ready to receive full vault payloads (vault-sync path).
             SenderKind::ReplicaSource => replicas.push((channel, key)),
             // Local kind == Helper — we're the helper on this channel, not
             // a legitimate ProtectSecret initiator. The orchestrator-level
@@ -402,8 +403,8 @@ async fn load_paired_targets<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
 /// [`ReplicaSecretPayload`] for the Destination path (via
 /// [`build_replica_composite_bytes`]).
 fn build_secret_container(
-    paired_helpers: &[(crate::types::Channel, SharedKey)],
-    paired_replicas: &[(crate::types::Channel, SharedKey)],
+    paired_helpers: &[(crate::protocol::types::Channel, SharedKey)],
+    paired_replicas: &[(crate::protocol::types::Channel, SharedKey)],
     secrets: Vec<UserSecret>,
     owner_replica_id: u64,
 ) -> SecretContainer {
@@ -417,9 +418,9 @@ fn build_secret_container(
         })
         .collect();
 
-    let replica_infos: Vec<crate::types::ReplicaInfo> = paired_replicas
+    let replica_infos: Vec<crate::protocol::types::ReplicaInfo> = paired_replicas
         .iter()
-        .map(|(channel, shared_key)| crate::types::ReplicaInfo {
+        .map(|(channel, shared_key)| crate::protocol::types::ReplicaInfo {
             channel_id: channel.id.0,
             transport_uri: channel.transport.uri.to_owned(),
             shared_key: shared_key.to_vec(),
@@ -462,11 +463,11 @@ fn build_replica_composite_bytes(
     bag: &SecretContainer,
     split_result: Option<&crate::primitives::sharing::request::SplitResult>,
 ) -> Vec<u8> {
-    let shares: Vec<crate::types::ChannelShare> = split_result
+    let shares: Vec<crate::protocol::types::ChannelShare> = split_result
         .map(|r| {
             r.shares
                 .iter()
-                .map(|(ch_id, committed)| crate::types::ChannelShare {
+                .map(|(ch_id, committed)| crate::protocol::types::ChannelShare {
                     channel_id: ch_id.0,
                     committed_share: committed.encode_to_vec(),
                 })
@@ -474,7 +475,7 @@ fn build_replica_composite_bytes(
         })
         .unwrap_or_default();
 
-    let composite = crate::types::ReplicaSecretPayload {
+    let composite = crate::protocol::types::ReplicaSecretPayload {
         secret: Some(bag.clone()),
         shares,
     };
@@ -486,7 +487,7 @@ fn build_replica_composite_bytes(
 async fn distribute_shares<Sh: DeRecShareStore, T: DeRecTransport>(
     share_store: &mut Sh,
     transport: &T,
-    paired_helpers: &[(crate::types::Channel, SharedKey)],
+    paired_helpers: &[(crate::protocol::types::Channel, SharedKey)],
     split_result: &crate::primitives::sharing::request::SplitResult,
     keep_versions_count: usize,
     secret_id: u64,
@@ -552,23 +553,23 @@ async fn distribute_shares<Sh: DeRecShareStore, T: DeRecTransport>(
     Ok(sent_channels)
 }
 
-/// Inbound `StoreShareRequest` on a **replica** channel (#59 receiver
-/// side). The payload is the full vault — the sender used
-/// `share_algorithm = REPLICA_VAULT` (#67). We decode the typed
-/// [`crate::types::ReplicaSecretPayload`] from `request.share`, auto-ack
+/// Inbound `StoreShareRequest` on a **replica** channel. The payload
+/// is the full vault — the sender used `share_algorithm =
+/// REPLICA_VAULT`. We decode the typed
+/// [`crate::protocol::types::ReplicaSecretPayload`] from `request.share`, auto-ack
 /// with `StoreShareResponse(Ok)`, and surface a
 /// [`DeRecEvent::ReplicaVaultReceived`] carrying the decoded
-/// [`crate::types::SecretContainer`] + [`Vec<crate::types::ChannelShare>`]
+/// [`crate::protocol::types::SecretContainer`] + [`Vec<crate::protocol::types::ChannelShare>`]
 /// for the application's vault-install logic.
 pub(in crate::protocol) async fn handle_replica_request<T: DeRecTransport>(
     transport: &T,
-    channel: &crate::types::Channel,
+    channel: &crate::protocol::types::Channel,
     request: StoreShareRequestMessage,
     shared_key: SharedKey,
     inbound_trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
     let from_replica_id = channel.replica_id.ok_or(Error::Invariant(
-        "replica channel missing peer replica_id (set at pair time per #53)",
+        "replica channel missing peer replica_id (must be set at pair time)",
     ))?;
     let secret_id = request.secret_id;
     let version = request.version;
@@ -578,7 +579,7 @@ pub(in crate::protocol) async fn handle_replica_request<T: DeRecTransport>(
     // wrote it; surfacing the decoded fields on the event matches
     // the existing `SecretsDiscovered` / `SecretRecovered` pattern of
     // handing typed structures to the application.
-    let composite = crate::types::ReplicaSecretPayload::decode(request.share.as_slice())
+    let composite = crate::protocol::types::ReplicaSecretPayload::decode(request.share.as_slice())
         .map_err(crate::Error::ProtobufDecode)?;
     let vault = composite.secret.ok_or(crate::Error::InvalidInput(
         "replica vault payload missing `secret` field",
@@ -641,16 +642,16 @@ pub(in crate::protocol) async fn handle_replica_request<T: DeRecTransport>(
     }])
 }
 
-/// Inbound `StoreShareResponse` on a **replica** channel (#59 sender's
-/// follow-up). Surface the peer's ack as
+/// Inbound `StoreShareResponse` on a **replica** channel — the source's
+/// follow-up to a vault sync. Surface the peer's ack as
 /// [`DeRecEvent::ReplicaVaultAcked`] so the app can decide whether to
 /// retry / rebroadcast / report.
 pub(in crate::protocol) fn handle_replica_response(
-    channel: &crate::types::Channel,
+    channel: &crate::protocol::types::Channel,
     response: &StoreShareResponseMessage,
 ) -> Result<Vec<DeRecEvent>> {
     let from_replica_id = channel.replica_id.ok_or(Error::Invariant(
-        "replica channel missing peer replica_id (set at pair time per #53)",
+        "replica channel missing peer replica_id (must be set at pair time)",
     ))?;
     // Missing `result` on a StoreShareResponse is itself a protocol
     // violation; fall back to a sentinel (StatusEnum::Ok would mislead
@@ -687,7 +688,7 @@ pub(in crate::protocol) fn handle_replica_response(
 #[allow(clippy::too_many_arguments)]
 async fn distribute_composite_to_destinations<T: DeRecTransport>(
     transport: &T,
-    replicas: &[(crate::types::Channel, SharedKey)],
+    replicas: &[(crate::protocol::types::Channel, SharedKey)],
     composite_bytes: &[u8],
     secret_id: u64,
     version: u32,

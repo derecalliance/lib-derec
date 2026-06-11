@@ -11,6 +11,12 @@ public static partial class Discovery
         public sealed class ExtractResult
         {
             public required ulong ChannelId { get; init; }
+            /// <summary>
+            /// Optional response endpoint advertised by the sender on
+            /// the inner request. <c>null</c> when the sender did not set
+            /// one. Mirrors the JS bridge surface.
+            /// </summary>
+            public TransportProtocol? ReplyTo { get; init; }
         }
 
         public static DeRecMessage Produce(ulong channelId, byte[] sharedKey, TransportProtocol? replyTo = null)
@@ -50,8 +56,22 @@ public static partial class Discovery
                     (UIntPtr)sharedKey.Length
                 );
 
-            Utils.ThrowIfError(nativeResult.Error);
-            return new ExtractResult { ChannelId = nativeResult.ChannelId };
+            try
+            {
+                Utils.ThrowIfError(nativeResult.Error);
+                byte[] innerBytes = Utils.CopyBuffer(nativeResult.RequestProtoBytes);
+                var inner = Org.Derecalliance.Derec.Protobuf.GetSecretIdsVersionsRequestMessage.Parser
+                    .ParseFrom(innerBytes);
+                return new ExtractResult
+                {
+                    ChannelId = nativeResult.ChannelId,
+                    ReplyTo = TransportProtocol.FromProto(inner.ReplyTo),
+                };
+            }
+            finally
+            {
+                Utils.FreeBuffer(nativeResult.RequestProtoBytes);
+            }
         }
     }
 }

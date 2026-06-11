@@ -21,6 +21,7 @@ internal static class Unpairing
         public ulong ChannelId;
         /// <summary>Owned C string. Release with derec_free_string.</summary>
         public IntPtr Memo;
+        public Buffer RequestProtoBytes;
     }
 
     [StructLayout(LayoutKind.Sequential)]

@@ -12,7 +12,8 @@ use crate::{
         request::produce as produce_verify_share_request_message,
         response::{self as verification_response},
     },
-    types::{ChannelId, SharedKey, Target},
+    protocol::types::Target,
+    types::{ChannelId, SharedKey},
 };
 use derec_proto::{
     DeRecResult, MessageBody, StatusEnum, StoreShareRequestMessage, VerifyShareRequestMessage,

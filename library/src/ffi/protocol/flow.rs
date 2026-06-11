@@ -22,7 +22,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::protocol::DeRecFlow;
-use crate::types::{ChannelId, Target, UserSecret};
+use crate::protocol::types::{Target, UserSecret};
+use crate::types::ChannelId;
 
 /// Numeric flow-kind identifiers — must match the dotnet `FlowKind` enum.
 pub const FLOW_KIND_PAIRING: u32 = 0;
@@ -135,8 +136,6 @@ fn parse_update_channel_info_flow(params_json: &[u8]) -> Result<DeRecFlow, Strin
     })
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────
-
 fn sender_kind_from_i32(kind: i32) -> Result<SenderKind, String> {
     match kind {
         0 => Ok(SenderKind::Owner),
@@ -181,8 +180,6 @@ fn parse_target(value: Option<Value>) -> Result<Target, String> {
         )),
     }
 }
-
-// ─── JSON wire shapes ────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct PairingParamsJson {

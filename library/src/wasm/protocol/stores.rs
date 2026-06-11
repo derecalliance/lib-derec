@@ -72,11 +72,12 @@ use crate::{
         error::{ChannelStoreError, SecretStoreError, ShareStoreError},
         traits::{
             ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore,
-            DeRecShareStore, DeRecTransport, MissingPolicy, SecretKind, SecretStoreFuture,
-            SecretValue, Share, ShareStoreFuture, TransportFuture,
+            DeRecShareStore, DeRecTransport, SecretStoreFuture, ShareStoreFuture,
+            TransportFuture,
         },
+        types::{Channel, MissingPolicy, SecretKind, SecretValue, Share},
     },
-    types::{Channel, ChannelId, ChannelStatus},
+    types::ChannelId,
 };
 
 
@@ -125,7 +126,7 @@ fn decode_secret_value(kind: SecretKind, bytes: &[u8]) -> Result<SecretValue, Se
             Ok(SecretValue::SharedKey(key))
         }
         SecretKind::PairingSecret => {
-            let material = PairingSecretKeyMaterial::deserialize_uncompressed(&mut &bytes[..])
+            let material = PairingSecretKeyMaterial::deserialize_compressed(&mut &bytes[..])
                 .map_err(|e| SecretStoreError::Backend(box_err(e.to_string())))?;
             Ok(SecretValue::PairingSecret(material))
         }
@@ -232,7 +233,7 @@ impl DeRecSecretStore for JsSecretStore {
                 SecretValue::PairingSecret(material) => {
                     let mut buf = Vec::new();
                     material
-                        .serialize_uncompressed(&mut buf)
+                        .serialize_compressed(&mut buf)
                         .map_err(|e| SecretStoreError::Backend(box_err(format!("{e:?}"))))?;
                     (1u32, buf)
                 }
@@ -291,76 +292,6 @@ impl DeRecSecretStore for JsSecretStore {
 /// transitive closure of `channelId` (including `channelId` itself).
 pub struct JsChannelStore(pub JsValue);
 
-/// Serializable representation of a [`Channel`] for JS store persistence.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ChannelRecord {
-    channel_id: u64,
-    transport_uri: String,
-    transport_protocol: i32,
-    /// App-level identity metadata for the peer. Opaque to the protocol.
-    /// Older stored records used a `name: String` field on this position;
-    /// they deserialize with an empty `communication_info` map.
-    #[serde(default)]
-    communication_info: std::collections::HashMap<String, String>,
-    #[serde(default = "default_channel_status")]
-    status: String,
-    #[serde(default)]
-    created_at: u64,
-    /// Local role on this channel; matches `derec_proto::SenderKind` raw i32.
-    #[serde(default)]
-    role: i32,
-    /// Peer's replica id, populated only on replica channels. `#[serde(default)]`
-    /// → `None` so records persisted before replica support deserialize cleanly.
-    #[serde(default)]
-    replica_id: Option<u64>,
-}
-
-fn default_channel_status() -> String {
-    "paired".to_owned()
-}
-
-impl From<&Channel> for ChannelRecord {
-    fn from(ch: &Channel) -> Self {
-        let status = match ch.status {
-            ChannelStatus::Pending => "pending",
-            ChannelStatus::Paired => "paired",
-        };
-        Self {
-            channel_id: ch.id.0,
-            transport_uri: ch.transport.uri.to_owned(),
-            transport_protocol: ch.transport.protocol,
-            communication_info: ch.communication_info.clone(),
-            status: status.to_owned(),
-            created_at: ch.created_at,
-            role: ch.role as i32,
-            replica_id: ch.replica_id,
-        }
-    }
-}
-
-impl From<ChannelRecord> for Channel {
-    fn from(rec: ChannelRecord) -> Self {
-        let status = match rec.status.as_str() {
-            "pending" => ChannelStatus::Pending,
-            _ => ChannelStatus::Paired,
-        };
-        let role = derec_proto::SenderKind::try_from(rec.role)
-            .unwrap_or(derec_proto::SenderKind::Owner);
-        Self {
-            id: ChannelId(rec.channel_id),
-            transport: TransportProtocol {
-                uri: rec.transport_uri,
-                protocol: rec.transport_protocol,
-            },
-            communication_info: rec.communication_info,
-            status,
-            created_at: rec.created_at,
-            role,
-            replica_id: rec.replica_id,
-        }
-    }
-}
-
 impl DeRecChannelStore for JsChannelStore {
     fn load(&self, channel_id: ChannelId) -> ChannelStoreFuture<'_, Option<Channel>> {
         let obj = self.0.clone();
@@ -377,9 +308,9 @@ impl DeRecChannelStore for JsChannelStore {
                 return Ok(None);
             }
             let bytes = Uint8Array::new(&value).to_vec();
-            let record: ChannelRecord = serde_json::from_slice(&bytes)
+            let channel: Channel = serde_json::from_slice(&bytes)
                 .map_err(|e| ChannelStoreError::Backend(box_err(e.to_string())))?;
-            Ok(Some(record.into()))
+            Ok(Some(channel))
         })
     }
 
@@ -417,9 +348,8 @@ impl DeRecChannelStore for JsChannelStore {
                     continue;
                 }
                 let bytes = Uint8Array::new(&load_value).to_vec();
-                let record: ChannelRecord = serde_json::from_slice(&bytes)
+                let channel: Channel = serde_json::from_slice(&bytes)
                     .map_err(|e| ChannelStoreError::Backend(box_err(e.to_string())))?;
-                let channel: Channel = record.into();
                 // Sanity check: the stored channel_id must match the index key
                 debug_assert_eq!(channel.id, channel_id);
                 result.push(channel);
@@ -431,9 +361,8 @@ impl DeRecChannelStore for JsChannelStore {
     fn save(&mut self, channel: Channel) -> ChannelStoreFuture<'_, ()> {
         let obj = self.0.clone();
         let channel_str = channel.id.0.to_string();
-        let record = ChannelRecord::from(&channel);
         Box::pin(async move {
-            let bytes = serde_json::to_vec(&record)
+            let bytes = serde_json::to_vec(&channel)
                 .map_err(|e| ChannelStoreError::Backend(box_err(e.to_string())))?;
             let js_bytes = Uint8Array::from(bytes.as_slice());
             let args = Array::new();

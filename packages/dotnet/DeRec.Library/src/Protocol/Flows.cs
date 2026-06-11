@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 using DeRec.Library.Primitives;
@@ -25,26 +26,59 @@ public enum FlowKind : uint
 }
 
 /// <summary>
-/// Selects which channels a flow targets. <c>null</c> means "all paired
-/// channels"; a single decimal u64 string means one channel; an array
-/// of decimal u64 strings means a specific set. Mirrors the Target
+/// Selects which channels a flow targets. Construct via the
+/// <see cref="All"/>, <see cref="One"/>, or <see cref="Many"/> factory
+/// members; the wire shape (<c>null</c>, decimal-string, or
+/// string-array) is handled automatically by the JSON converter when
+/// the value is attached to a flow params record. Mirrors the Target
 /// convention used by every other DeRec SDK.
 /// </summary>
+[JsonConverter(typeof(TargetJsonConverter))]
 public abstract record Target
 {
-    public abstract object? ToJsonValue();
     public static Target All { get; } = new AllTarget();
     public static Target One(ulong channelId) => new SingleTarget(channelId);
     public static Target Many(params ulong[] channelIds) => new ManyTarget(channelIds);
 
-    private sealed record AllTarget : Target { public override object? ToJsonValue() => null; }
-    private sealed record SingleTarget(ulong ChannelId) : Target
+    internal sealed record AllTarget : Target;
+    internal sealed record SingleTarget(ulong ChannelId) : Target;
+    internal sealed record ManyTarget(ulong[] ChannelIds) : Target;
+}
+
+/// <summary>
+/// Serializes a <see cref="Target"/> as the on-the-wire shape that
+/// the Rust orchestrator expects: <c>null</c> for
+/// <see cref="Target.All"/>, a decimal-string for
+/// <see cref="Target.One"/>, and an array of decimal-strings for
+/// <see cref="Target.Many"/>.
+/// </summary>
+public sealed class TargetJsonConverter : JsonConverter<Target?>
+{
+    public override Target? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {
-        public override object ToJsonValue() => ChannelId.ToString();
+        throw new NotSupportedException("Target is write-only on the SDK boundary.");
     }
-    private sealed record ManyTarget(ulong[] ChannelIds) : Target
+
+    public override void Write(Utf8JsonWriter writer, Target? value, JsonSerializerOptions options)
     {
-        public override object ToJsonValue() => ChannelIds.Select(c => c.ToString()).ToArray();
+        switch (value)
+        {
+            case null:
+            case Target.AllTarget:
+                writer.WriteNullValue();
+                break;
+            case Target.SingleTarget s:
+                writer.WriteStringValue(s.ChannelId.ToString());
+                break;
+            case Target.ManyTarget m:
+                writer.WriteStartArray();
+                foreach (ulong id in m.ChannelIds)
+                    writer.WriteStringValue(id.ToString());
+                writer.WriteEndArray();
+                break;
+            default:
+                throw new JsonException($"unknown Target variant: {value.GetType()}");
+        }
     }
 }
 
@@ -69,8 +103,7 @@ public sealed record PairingParams
 /// <summary>Params for <see cref="FlowKind.Discovery"/>.</summary>
 public sealed record DiscoveryParams
 {
-    [JsonPropertyName("target")]
-    public object? TargetValue { get; init; }
+    [JsonPropertyName("target")] public Target? Target { get; init; }
 }
 
 /// <summary>
@@ -89,7 +122,7 @@ public sealed record UserSecret
 public sealed record ProtectSecretParams
 {
     [JsonPropertyName("secret_id")] public required string SecretId { get; init; }
-    [JsonPropertyName("target")] public object? TargetValue { get; init; }
+    [JsonPropertyName("target")] public Target? Target { get; init; }
     [JsonPropertyName("secrets")] public required UserSecret[] Secrets { get; init; }
     [JsonPropertyName("description")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -101,7 +134,7 @@ public sealed record VerifySharesParams
 {
     [JsonPropertyName("secret_id")] public required string SecretId { get; init; }
     [JsonPropertyName("version")] public required uint Version { get; init; }
-    [JsonPropertyName("target")] public object? TargetValue { get; init; }
+    [JsonPropertyName("target")] public Target? Target { get; init; }
 }
 
 /// <summary>Params for <see cref="FlowKind.RecoverSecret"/>.</summary>
@@ -114,7 +147,7 @@ public sealed record RecoverSecretParams
 /// <summary>Params for <see cref="FlowKind.Unpair"/>.</summary>
 public sealed record UnpairParams
 {
-    [JsonPropertyName("target")] public object? TargetValue { get; init; }
+    [JsonPropertyName("target")] public Target? Target { get; init; }
     [JsonPropertyName("memo")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Memo { get; init; }
@@ -123,7 +156,7 @@ public sealed record UnpairParams
 /// <summary>Params for <see cref="FlowKind.UpdateChannelInfo"/>.</summary>
 public sealed record UpdateChannelInfoParams
 {
-    [JsonPropertyName("target")] public object? TargetValue { get; init; }
+    [JsonPropertyName("target")] public Target? Target { get; init; }
     [JsonPropertyName("communication_info")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public Dictionary<string, string>? CommunicationInfo { get; init; }
@@ -337,8 +370,9 @@ public sealed record ChannelInfoUpdatedEvent : DeRecEvent
 {
     public override string EventType => "ChannelInfoUpdated";
     public required string ChannelId { get; init; }
-    public Dictionary<string, string>? PeerCommunicationInfo { get; init; }
-    public string? PeerTransportUri { get; init; }
+    public Dictionary<string, string>? CommunicationInfo { get; init; }
+    public string? TransportUri { get; init; }
+    public int? TransportProtocol { get; init; }
 }
 
 public sealed record ChannelInfoUpdateRejectedEvent : DeRecEvent
@@ -522,14 +556,16 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
     private static ChannelInfoUpdatedEvent ParseChannelInfoUpdated(System.Text.Json.JsonElement root)
     {
         Dictionary<string, string>? info = null;
-        if (root.TryGetProperty("peer_communication_info", out var pci))
-            info = ReadStringMap(pci);
-        string? uri = root.TryGetProperty("peer_transport_uri", out var tu) ? tu.GetString() : null;
+        if (root.TryGetProperty("communication_info", out var ci))
+            info = ReadStringMap(ci);
+        string? uri = root.TryGetProperty("transport_uri", out var tu) ? tu.GetString() : null;
+        int? proto = root.TryGetProperty("transport_protocol", out var tp) ? tp.GetInt32() : null;
         return new ChannelInfoUpdatedEvent
         {
             ChannelId = root.GetProperty("channel_id").GetString()!,
-            PeerCommunicationInfo = info,
-            PeerTransportUri = uri,
+            CommunicationInfo = info,
+            TransportUri = uri,
+            TransportProtocol = proto,
         };
     }
 

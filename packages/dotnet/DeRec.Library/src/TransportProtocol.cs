@@ -44,4 +44,14 @@ public sealed record TransportProtocol(string Uri, Protocol Protocol = Protocol.
             Protocol: (Protocol)(int)proto.Protocol
         );
     }
+
+    /// <summary>
+    /// Convert a wire <c>TransportProtocol</c> proto field (optional) to
+    /// a typed <see cref="TransportProtocol"/>. Returns <c>null</c> when
+    /// the proto field is unset.
+    /// </summary>
+    internal static TransportProtocol? FromProto(Org.Derecalliance.Derec.Protobuf.TransportProtocol? proto) =>
+        proto is null
+            ? null
+            : new TransportProtocol(proto.Uri, (Protocol)(int)proto.Protocol);
 }

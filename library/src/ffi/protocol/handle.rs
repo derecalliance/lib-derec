@@ -49,10 +49,12 @@ pub struct DeRecProtocolNewResult {
     pub handle: *mut DeRecProtocolHandle,
 }
 
-fn new_result_err(error: DeRecError) -> DeRecProtocolNewResult {
-    DeRecProtocolNewResult {
-        error,
-        handle: std::ptr::null_mut(),
+impl From<DeRecError> for DeRecProtocolNewResult {
+    fn from(error: DeRecError) -> Self {
+        Self {
+            error,
+            handle: std::ptr::null_mut(),
+        }
     }
 }
 
@@ -97,29 +99,29 @@ pub unsafe extern "C" fn derec_protocol_new(
         || share_store_cb.is_null()
         || transport_cb.is_null()
     {
-        return new_result_err(ffi_error(
+        return ffi_error(
             DEREC_CODE_FFI_NULL_PTR,
             "store/transport callback pointer is null",
-        ));
+        ).into();
     }
 
     let own_uri = if own_transport_uri_len == 0 {
         String::new()
     } else if own_transport_uri_ptr.is_null() {
-        return new_result_err(ffi_error(
+        return ffi_error(
             DEREC_CODE_FFI_NULL_PTR,
             "own_transport_uri_ptr is null but length is non-zero",
-        ));
+        ).into();
     } else {
         let bytes =
             unsafe { std::slice::from_raw_parts(own_transport_uri_ptr, own_transport_uri_len) };
         match std::str::from_utf8(bytes) {
             Ok(s) => s.to_owned(),
             Err(_) => {
-                return new_result_err(ffi_error(
+                return ffi_error(
                     DEREC_CODE_FFI_BAD_PROTO,
                     "own_transport_uri is not valid UTF-8",
-                ));
+                ).into();
             }
         }
     };
@@ -133,10 +135,10 @@ pub unsafe extern "C" fn derec_protocol_new(
         HashMap::new()
     } else {
         if communication_info_ptr.is_null() {
-            return new_result_err(ffi_error(
+            return ffi_error(
                 DEREC_CODE_FFI_NULL_PTR,
                 "communication_info_ptr is null but length is non-zero",
-            ));
+            ).into();
         }
         let bytes = unsafe {
             std::slice::from_raw_parts(communication_info_ptr, communication_info_len)
@@ -159,10 +161,10 @@ pub unsafe extern "C" fn derec_protocol_new(
                 })
                 .collect(),
             Err(_) => {
-                return new_result_err(ffi_error(
+                return ffi_error(
                     DEREC_CODE_FFI_BAD_PROTO,
                     "communication_info is not a valid CommunicationInfo proto",
-                ));
+                ).into();
             }
         }
     };
@@ -171,10 +173,10 @@ pub unsafe extern "C" fn derec_protocol_new(
         0 => crate::protocol::UnpairAck::Required,
         1 => crate::protocol::UnpairAck::NotRequired,
         other => {
-            return new_result_err(ffi_error(
+            return ffi_error(
                 DEREC_CODE_FFI_INVALID_ENUM,
                 format!("invalid unpair_ack: {other}"),
-            ));
+            ).into();
         }
     };
 
@@ -214,10 +216,10 @@ pub unsafe extern "C" fn derec_protocol_new(
     let runtime = match tokio::runtime::Builder::new_current_thread().build() {
         Ok(rt) => rt,
         Err(e) => {
-            return new_result_err(ffi_error(
+            return ffi_error(
                 DEREC_CODE_FFI_BAD_PROTO,
                 format!("failed to build tokio runtime: {e}"),
-            ));
+            ).into();
         }
     };
 
@@ -255,10 +257,12 @@ pub struct DeRecProtocolFingerprintResult {
     pub fingerprint: *mut c_char,
 }
 
-fn fingerprint_err(error: DeRecError) -> DeRecProtocolFingerprintResult {
-    DeRecProtocolFingerprintResult {
-        error,
-        fingerprint: std::ptr::null_mut(),
+impl From<DeRecError> for DeRecProtocolFingerprintResult {
+    fn from(error: DeRecError) -> Self {
+        Self {
+            error,
+            fingerprint: std::ptr::null_mut(),
+        }
     }
 }
 
@@ -275,10 +279,10 @@ pub unsafe extern "C" fn derec_protocol_get_fingerprint(
     channel_id: u64,
 ) -> DeRecProtocolFingerprintResult {
     if handle.is_null() {
-        return fingerprint_err(ffi_error(
+        return ffi_error(
             DEREC_CODE_FFI_NULL_PTR,
             "handle is null",
-        ));
+        ).into();
     }
     let h = unsafe { &mut *handle };
     let result = h
@@ -290,12 +294,12 @@ pub unsafe extern "C" fn derec_protocol_get_fingerprint(
                 error: success(),
                 fingerprint: c.into_raw(),
             },
-            Err(_) => fingerprint_err(ffi_error(
+            Err(_) => ffi_error(
                 DEREC_CODE_FFI_BAD_PROTO,
                 "fingerprint contains NUL byte",
-            )),
+            ).into(),
         },
-        Err(e) => fingerprint_err(from_lib_error(e)),
+        Err(e) => from_lib_error(e).into(),
     }
 }
 
@@ -424,10 +428,12 @@ pub struct DeRecProtocolCreateContactResult {
     pub contact_wire_bytes: DeRecBuffer,
 }
 
-fn create_contact_err(error: DeRecError) -> DeRecProtocolCreateContactResult {
-    DeRecProtocolCreateContactResult {
-        error,
-        contact_wire_bytes: empty_buffer(),
+impl From<DeRecError> for DeRecProtocolCreateContactResult {
+    fn from(error: DeRecError) -> Self {
+        Self {
+            error,
+            contact_wire_bytes: empty_buffer(),
+        }
     }
 }
 
@@ -448,15 +454,15 @@ pub unsafe extern "C" fn derec_protocol_create_contact(
     contact_mode: i32,
 ) -> DeRecProtocolCreateContactResult {
     if handle.is_null() {
-        return create_contact_err(ffi_error(DEREC_CODE_FFI_NULL_PTR, "handle is null"));
+        return ffi_error(DEREC_CODE_FFI_NULL_PTR, "handle is null").into();
     }
     let mode = match derec_proto::ContactMode::try_from(contact_mode) {
         Ok(m) => m,
         Err(_) => {
-            return create_contact_err(ffi_error(
+            return ffi_error(
                 DEREC_CODE_FFI_INVALID_ENUM,
                 format!("invalid ContactMode: {contact_mode}"),
-            ));
+            ).into();
         }
     };
     let id_arg: Option<ChannelId> = if has_channel_id != 0 {
@@ -470,7 +476,7 @@ pub unsafe extern "C" fn derec_protocol_create_contact(
             error: success(),
             contact_wire_bytes: vec_into_buffer(contact.encode_to_vec()),
         },
-        Err(e) => create_contact_err(from_lib_error(e)),
+        Err(e) => from_lib_error(e).into(),
     }
 }
 
@@ -485,18 +491,19 @@ pub struct DeRecProtocolStartResult {
     pub channel_id: u64,
 }
 
-fn start_err(error: DeRecError) -> DeRecProtocolStartResult {
-    DeRecProtocolStartResult {
-        error,
-        has_channel_id: 0,
-        channel_id: 0,
+impl From<DeRecError> for DeRecProtocolStartResult {
+    fn from(error: DeRecError) -> Self {
+        Self {
+            error,
+            has_channel_id: 0,
+            channel_id: 0,
+        }
     }
 }
 
 /// Start a new flow. `flow_kind` matches the constants in
 /// [`crate::ffi::protocol::flow`]. `params_json_*` is a UTF-8 JSON
-/// blob shaped to the matching `*ParamsJson` struct in that module —
-/// for chunk 7b only `Pairing` (flow_kind = 0) is supported.
+/// blob shaped to the matching `*ParamsJson` struct in that module.
 ///
 /// # Safety
 ///
@@ -510,13 +517,13 @@ pub unsafe extern "C" fn derec_protocol_start(
     params_json_len: usize,
 ) -> DeRecProtocolStartResult {
     if handle.is_null() {
-        return start_err(ffi_error(DEREC_CODE_FFI_NULL_PTR, "handle is null"));
+        return ffi_error(DEREC_CODE_FFI_NULL_PTR, "handle is null").into();
     }
     if params_json_len > 0 && params_json_ptr.is_null() {
-        return start_err(ffi_error(
+        return ffi_error(
             DEREC_CODE_FFI_NULL_PTR,
             "params_json_ptr is null but len > 0",
-        ));
+        ).into();
     }
     let params_bytes = if params_json_len == 0 {
         b""[..].to_vec()
@@ -526,7 +533,7 @@ pub unsafe extern "C" fn derec_protocol_start(
 
     let flow = match flow::parse_flow(flow_kind, &params_bytes) {
         Ok(f) => f,
-        Err(e) => return start_err(ffi_error(DEREC_CODE_FFI_BAD_PROTO, e)),
+        Err(e) => return ffi_error(DEREC_CODE_FFI_BAD_PROTO, e).into(),
     };
 
     let h = unsafe { &mut *handle };
@@ -541,7 +548,7 @@ pub unsafe extern "C" fn derec_protocol_start(
             has_channel_id: 0,
             channel_id: 0,
         },
-        Err(e) => start_err(from_lib_error(e)),
+        Err(e) => from_lib_error(e).into(),
     }
 }
 
@@ -555,10 +562,12 @@ pub struct DeRecProtocolEventsResult {
     pub events_json: DeRecBuffer,
 }
 
-fn events_err(error: DeRecError) -> DeRecProtocolEventsResult {
-    DeRecProtocolEventsResult {
-        error,
-        events_json: empty_buffer(),
+impl From<DeRecError> for DeRecProtocolEventsResult {
+    fn from(error: DeRecError) -> Self {
+        Self {
+            error,
+            events_json: empty_buffer(),
+        }
     }
 }
 
@@ -576,13 +585,13 @@ pub unsafe extern "C" fn derec_protocol_process(
     message_len: usize,
 ) -> DeRecProtocolEventsResult {
     if handle.is_null() {
-        return events_err(ffi_error(DEREC_CODE_FFI_NULL_PTR, "handle is null"));
+        return ffi_error(DEREC_CODE_FFI_NULL_PTR, "handle is null").into();
     }
     if message_len > 0 && message_ptr.is_null() {
-        return events_err(ffi_error(
+        return ffi_error(
             DEREC_CODE_FFI_NULL_PTR,
             "message_ptr is null but len > 0",
-        ));
+        ).into();
     }
     let bytes = if message_len == 0 {
         Vec::new()
@@ -599,7 +608,7 @@ pub unsafe extern "C" fn derec_protocol_process(
                 events_json: vec_into_buffer(json),
             }
         }
-        Err(e) => events_err(from_lib_error(e.source)),
+        Err(e) => from_lib_error(e.source).into(),
     }
 }
 
@@ -620,22 +629,22 @@ pub unsafe extern "C" fn derec_protocol_accept(
     action_len: usize,
 ) -> DeRecProtocolEventsResult {
     if handle.is_null() {
-        return events_err(ffi_error(DEREC_CODE_FFI_NULL_PTR, "handle is null"));
+        return ffi_error(DEREC_CODE_FFI_NULL_PTR, "handle is null").into();
     }
     if action_len == 0 || action_ptr.is_null() {
-        return events_err(ffi_error(
+        return ffi_error(
             DEREC_CODE_FFI_NULL_PTR,
             "action_ptr is null or len == 0",
-        ));
+        ).into();
     }
     let bytes = unsafe { std::slice::from_raw_parts(action_ptr, action_len) };
     let action = match crate::protocol::pending_action_wire::deserialize(bytes) {
         Ok(a) => a,
         Err(e) => {
-            return events_err(ffi_error(
+            return ffi_error(
                 DEREC_CODE_FFI_BAD_PROTO,
                 format!("PendingAction decode: {e}"),
-            ));
+            ).into();
         }
     };
     let h = unsafe { &mut *handle };
@@ -647,7 +656,7 @@ pub unsafe extern "C" fn derec_protocol_accept(
                 events_json: vec_into_buffer(json),
             }
         }
-        Err(e) => events_err(from_lib_error(e)),
+        Err(e) => from_lib_error(e).into(),
     }
 }
 

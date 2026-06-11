@@ -45,6 +45,10 @@ pub struct ProduceGetSecretIdsVersionsRequestMessageResult {
 pub struct ExtractGetSecretIdsVersionsRequestResult {
     pub error: DeRecError,
     pub channel_id: u64,
+    /// prost-encoded inner `GetSecretIdsVersionsRequestMessage` bytes.
+    /// Empty buffer when extraction fails. SDK consumers decode this
+    /// to inspect optional fields such as `reply_to`.
+    pub request_proto_bytes: DeRecBuffer,
 }
 
 #[repr(C)]
@@ -119,6 +123,7 @@ pub extern "C" fn extract_get_secret_ids_versions_request(
     let with_err = |error| ExtractGetSecretIdsVersionsRequestResult {
         error,
         channel_id: 0,
+        request_proto_bytes: empty_buffer(),
     };
 
     let request_bytes = match parse_buffer(request_ptr, request_len, "request_ptr") {
@@ -141,9 +146,10 @@ pub extern "C" fn extract_get_secret_ids_versions_request(
     };
 
     match crate::primitives::discovery::request::extract(request_bytes, &shared_key) {
-        Ok(_) => ExtractGetSecretIdsVersionsRequestResult {
+        Ok(r) => ExtractGetSecretIdsVersionsRequestResult {
             error: success(),
             channel_id,
+            request_proto_bytes: vec_into_buffer(r.request.encode_to_vec()),
         },
         Err(e) => with_err(from_lib_error(e)),
     }

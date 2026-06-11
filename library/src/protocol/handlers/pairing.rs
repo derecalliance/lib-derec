@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// TODO: revisit accept vs accept_pre_pair, idem for reject and on_request/on_response. We should
-// be able to come up with a single set of functions
-
 use super::super::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecTransport, PendingAction, SecretKind,
     SecretValue, now_secs,
@@ -166,9 +163,9 @@ pub(in crate::protocol) async fn accept<
     let peer_transport = resp.peer_transport_protocol.clone();
 
     let status = if is_replica_kind(kind) {
-        crate::types::ChannelStatus::Pending
+        crate::protocol::types::ChannelStatus::Pending
     } else {
-        crate::types::ChannelStatus::Paired
+        crate::protocol::types::ChannelStatus::Paired
     };
 
     // Re-extract from the inbound PairRequest. The dispatcher already
@@ -180,7 +177,7 @@ pub(in crate::protocol) async fn accept<
         extract_communication_info(&request.communication_info, peer_sender_kind)?;
 
     channel_store
-        .save(crate::types::Channel {
+        .save(crate::protocol::types::Channel {
             id: channel_id,
             transport: peer_transport,
             communication_info: peer_communication_info.clone(),
@@ -517,11 +514,11 @@ async fn start_inlined_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRe
         .await?;
 
     channel_store
-        .save(crate::types::Channel {
+        .save(crate::protocol::types::Channel {
             id: channel_id,
             transport: endpoint.clone(),
             communication_info: peer_communication_info,
-            status: crate::types::ChannelStatus::Pending,
+            status: crate::protocol::types::ChannelStatus::Pending,
             created_at: now_secs(),
             role: kind,
             replica_id: None,
@@ -565,11 +562,11 @@ async fn start_hashed_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRec
         .await?;
 
     channel_store
-        .save(crate::types::Channel {
+        .save(crate::protocol::types::Channel {
             id: channel_id,
             transport: endpoint.clone(),
             communication_info: peer_communication_info,
-            status: crate::types::ChannelStatus::Pending,
+            status: crate::protocol::types::ChannelStatus::Pending,
             created_at: now_secs(),
             role: kind,
             replica_id: None,
@@ -692,9 +689,9 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     let kind = channel.role;
 
     let status = if is_replica_kind(kind) {
-        crate::types::ChannelStatus::Pending
+        crate::protocol::types::ChannelStatus::Pending
     } else {
-        crate::types::ChannelStatus::Paired
+        crate::protocol::types::ChannelStatus::Paired
     };
 
     // Validate the inbound CommunicationInfo against the derived peer

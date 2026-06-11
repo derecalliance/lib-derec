@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
+pub(crate) mod wire;
+
 use std::collections::HashMap;
 
 use crate::{
     primitives::discovery::response::SecretVersionEntry,
-    types::{ChannelId, SharedKey, Target, UserSecret},
+    protocol::types::{Target, UserSecret},
+    types::{ChannelId, SharedKey},
 };
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{
@@ -90,7 +93,7 @@ pub enum PendingAction {
     },
     /// The peer has announced an update to their communication info and/or
     /// transport endpoint. Accepting applies the update to the stored
-    /// [`crate::types::Channel`] and sends back an `Ok` response on the new
+    /// [`crate::protocol::types::Channel`] and sends back an `Ok` response on the new
     /// endpoint (when `transport_protocol` was updated); rejecting sends a
     /// non-`Ok` response and leaves the stored state unchanged.
     UpdateChannelInfo {
@@ -106,7 +109,7 @@ pub enum PendingAction {
 /// # Role gating
 ///
 /// The orchestrator enforces flow directionality against
-/// [`crate::types::Channel::role`] (set at pairing time):
+/// [`crate::protocol::types::Channel::role`] (set at pairing time):
 ///
 /// - [`Self::Discovery`], [`Self::ProtectSecret`], [`Self::VerifyShares`],
 ///   [`Self::RecoverSecret`], and [`Self::Unpair`] require this node to be
@@ -119,7 +122,7 @@ pub enum DeRecFlow {
         kind: SenderKind,
         contact: ContactMessage,
         /// App-level identity metadata for the peer being paired with.
-        /// Stored verbatim on the resulting [`crate::types::Channel`]
+        /// Stored verbatim on the resulting [`crate::protocol::types::Channel`]
         /// (`channel.communication_info`). The protocol does not inspect
         /// it — pass an empty map to record nothing.
         peer_communication_info: std::collections::HashMap<String, String>,
@@ -210,7 +213,6 @@ pub enum UnpairAck {
     NotRequired,
 }
 
-// TODO: fix this warning
 /// Events emitted by [`super::DeRecProtocol::process`].
 ///
 /// The application reacts to these instead of routing raw messages manually.
@@ -219,7 +221,7 @@ pub enum DeRecEvent {
     /// Pairing completed — the shared key for `channel_id` is now persisted.
     ///
     /// `kind` is the local party's role in the pairing, also persisted as
-    /// [`crate::types::Channel::role`] and consulted by the orchestrator on
+    /// [`crate::protocol::types::Channel::role`] and consulted by the orchestrator on
     /// every subsequent flow start and inbound message. Applications use it
     /// to decide what to do next:
     ///
@@ -246,10 +248,10 @@ pub enum DeRecEvent {
     ///
     /// Under the unidirectional replica model, the local side's role
     /// (`ReplicaSource` or `ReplicaDestination`) is already on
-    /// [`crate::types::Channel::role`] — this event just adds the
+    /// [`crate::protocol::types::Channel::role`] — this event just adds the
     /// peer's `replica_id`, which the app needs as a `from_replica_id`
-    /// when subsequent vault syncs arrive (#59) or when targeting the
-    /// peer via `ProtectSecret` (#67).
+    /// when subsequent vault syncs arrive or when targeting the peer via
+    /// `ProtectSecret`.
     ReplicaPaired {
         /// The channel the pair handshake just completed on.
         channel_id: ChannelId,
@@ -272,12 +274,12 @@ pub enum DeRecEvent {
     /// receiver authenticate as the Source toward each helper, and
     /// `vault.replicas[i].shared_key` does the same toward other
     /// destinations. Treat the receiving device accordingly — see
-    /// [`crate::types::ReplicaInfo`] for the security note.
+    /// [`crate::protocol::types::ReplicaInfo`] for the security note.
     ReplicaVaultReceived {
         /// The channel the request arrived on.
         channel_id: ChannelId,
         /// The peer's replica identity (from `Channel.replica_id`,
-        /// populated at pair time by #53).
+        /// populated at pair time).
         from_replica_id: u64,
         /// `secret_id` echoed from the inbound `StoreShareRequest`.
         secret_id: u64,
@@ -286,16 +288,16 @@ pub enum DeRecEvent {
         /// Decoded full vault — same shape the sender wrote. The
         /// `helpers`, `replicas`, `secrets`, and `owner_replica_id`
         /// fields carry the canonical roster snapshot for this version.
-        vault: crate::types::SecretContainer,
+        vault: crate::protocol::types::SecretContainer,
         /// Per-helper VSS share map. Each entry pairs a helper's
         /// `channel_id` with the serialized `CommittedDeRecShare` bytes
         /// the helper received — sufficient material for the receiver
         /// to drive a recovery against those helpers if needed.
-        shares: Vec<crate::types::ChannelShare>,
+        shares: Vec<crate::protocol::types::ChannelShare>,
     },
 
     /// A replica peer's `StoreShareResponse` to a vault sync we sent
-    /// earlier (#67). Fires on the replica channel, mirroring
+    /// earlier. Fires on the replica channel, mirroring
     /// [`Self::ShareConfirmed`] / [`Self::ShareRejected`] on the helper
     /// side.
     ///
@@ -442,7 +444,7 @@ pub enum DeRecEvent {
         memo: String,
     },
 
-    /// The stored [`crate::types::Channel`] for `channel_id` has been updated
+    /// The stored [`crate::protocol::types::Channel`] for `channel_id` has been updated
     /// with new communication info and/or transport endpoint.
     ///
     /// Surfaces on **both** sides of the flow:

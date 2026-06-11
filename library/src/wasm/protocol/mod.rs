@@ -54,8 +54,9 @@ use crate::{
     protocol::{
         DeRecChannelStore, DeRecFlow, DeRecProtocol, DeRecProtocolBuilder, DeRecSecretStore,
         DeRecShareStore, SecretValue, Share, UnpairAck,
+        types::{Channel, ChannelStatus, SecretContainer, Target, UserSecret},
     },
-    types::{Channel, ChannelId, ChannelStatus, SecretContainer, Target, UserSecret},
+    types::ChannelId,
     wasm::{now_secs, ts_bindings_utils::js_error},
 };
 use derec_proto::DeRecSecret;
@@ -102,102 +103,219 @@ pub struct DeRecProtocolWasm {
     inner: WasmProtocol,
 }
 
-#[wasm_bindgen]
-impl DeRecProtocolWasm {
-    /// Construct a [`DeRecProtocolWasm`] from JS-side store/transport objects.
-    ///
-    /// # Arguments
-    ///
-    /// * `channel_store` — JS object with `load(channelId: string): Promise<Uint8Array|null>`,
-    ///   `save(channelId: string, bytes: Uint8Array): Promise<void>`, and
-    ///   `listChannels(): Promise<string[]>`.
-    ///   The bytes are JSON-encoded `Channel` records.
-    ///
-    /// * `share_store` — JS object with `load`, `save`, `loadChannelsForSecret`,
-    ///   `loadSecretsForChannel` (see module-level docs for full signatures).
-    ///
-    /// * `secret_store` — JS object with
-    ///   `load(channelId: string, kind: 0|1): Promise<Uint8Array|null>`,
-    ///   `save(channelId: string, kind: 0|1, bytes: Uint8Array): Promise<void>`, and
-    ///   `remove(channelId: string, kind: 0|1): Promise<void>`.
-    ///   `kind 0` = `SharedKey` (32 raw bytes); `kind 1` = `PairingSecret` (serialized).
-    ///
-    /// * `transport` — JS object with
-    ///   `send(endpoint: { protocol: string; uri: string }, message: Uint8Array): Promise<void>`.
-    ///
-    /// * `own_transport_uri` — The URI this node advertises to peers during pairing
-    ///   (e.g. `"https://my-node.example.com/derec"`).
-    ///
-    /// * `own_transport_protocol` — Protocol string, currently must be `"https"`.
-    /// # Arguments
-    ///
-    /// * `threshold` — Minimum number of shares required for reconstruction.
-    /// * `keep_versions_count` — Number of recent versions each Helper must retain.
-    /// * `timeout_in_secs` — General protocol timeout (seconds). Used passively
-    ///   in `process()` to discard expired messages / pending channels / stale
-    ///   sharing rounds. Defaults to 300 when omitted. Active (wall-clock)
-    ///   timeouts remain the application's responsibility.
+/// Fluent builder for [`DeRecProtocolWasm`]. Mirrors the Rust
+/// [`crate::protocol::DeRecProtocolBuilder`] and the dotnet
+/// `DeRecProtocolBuilder` method-for-method so a developer who already
+/// knows one SDK can move between them without reaching for reference
+/// docs.
+///
+/// Required setters: `withChannelStore`, `withShareStore`,
+/// `withSecretStore`, `withTransport`, `withOwnTransport`. Calling
+/// `build()` without all five throws.
+///
+/// All optional setters carry the defaults documented on the Rust
+/// builder.
+#[wasm_bindgen(js_name = DeRecProtocolBuilder)]
+pub struct DeRecProtocolBuilderWasm {
+    channel_store: Option<JsValue>,
+    share_store: Option<JsValue>,
+    secret_store: Option<JsValue>,
+    transport: Option<JsValue>,
+    own_transport_uri: Option<String>,
+    own_transport_protocol_num: Option<i32>,
+    threshold: u32,
+    keep_versions_count: u32,
+    communication_info: HashMap<String, String>,
+    timeout_in_secs: u32,
+    auto_respond_on_failure: bool,
+    unpair_ack: UnpairAck,
+    auto_reply_to: bool,
+    replica_id: Option<u64>,
+}
+
+#[wasm_bindgen(js_class = DeRecProtocolBuilder)]
+impl DeRecProtocolBuilderWasm {
     #[wasm_bindgen(constructor)]
-    pub fn new(
-        channel_store: JsValue,
-        share_store: JsValue,
-        secret_store: JsValue,
-        transport: JsValue,
-        own_transport_uri: String,
-        own_transport_protocol: String,
-        threshold: u32,
-        keep_versions_count: u32,
-        communication_info: JsValue,
-        timeout_in_secs: Option<u32>,
-        auto_respond_on_failure: Option<bool>,
-        // `unpair_ack`: `"required"` (default) makes the unpair initiator
-        // wait for the peer's acknowledgement before dropping local state.
-        // `"not_required"` is fire-and-forget — state is dropped immediately
-        // on `start(Unpair)` and any later response is ignored.
-        unpair_ack: Option<String>,
-        // `auto_reply_to`: when true, every outbound channel-mode request
-        // stamps `request.replyTo = this.own_transport`. Default `false`.
-        // See `DeRecProtocolBuilder::with_auto_reply_to` for the routing
-        // semantics on the responder side.
-        auto_reply_to: Option<bool>,
-        // `replica_id`: stable per-device `u64` identity required for any
-        // replica-mode pairing. Pass `null`/`undefined` for Owner-only or
-        // Helper-only deployments. Accepts a JS `bigint` or `number`; see
-        // `DeRecProtocolBuilder::with_replica_id`.
-        replica_id: JsValue,
-    ) -> Result<DeRecProtocolWasm, JsValue> {
-        let protocol_num = match own_transport_protocol.to_lowercase().as_str() {
+    pub fn new() -> DeRecProtocolBuilderWasm {
+        DeRecProtocolBuilderWasm {
+            channel_store: None,
+            share_store: None,
+            secret_store: None,
+            transport: None,
+            own_transport_uri: None,
+            own_transport_protocol_num: None,
+            threshold: 3,
+            keep_versions_count: 3,
+            communication_info: HashMap::new(),
+            timeout_in_secs: 300,
+            auto_respond_on_failure: false,
+            unpair_ack: UnpairAck::Required,
+            auto_reply_to: false,
+            replica_id: None,
+        }
+    }
+
+    #[wasm_bindgen(js_name = withChannelStore)]
+    pub fn with_channel_store(mut self, store: JsValue) -> DeRecProtocolBuilderWasm {
+        self.channel_store = Some(store);
+        self
+    }
+
+    #[wasm_bindgen(js_name = withShareStore)]
+    pub fn with_share_store(mut self, store: JsValue) -> DeRecProtocolBuilderWasm {
+        self.share_store = Some(store);
+        self
+    }
+
+    #[wasm_bindgen(js_name = withSecretStore)]
+    pub fn with_secret_store(mut self, store: JsValue) -> DeRecProtocolBuilderWasm {
+        self.secret_store = Some(store);
+        self
+    }
+
+    #[wasm_bindgen(js_name = withTransport)]
+    pub fn with_transport(mut self, transport: JsValue) -> DeRecProtocolBuilderWasm {
+        self.transport = Some(transport);
+        self
+    }
+
+    /// `endpoint` shape: `{ uri: string, protocol: string }`.
+    /// `protocol` must be `"https"` (the only protocol supported today).
+    #[wasm_bindgen(js_name = withOwnTransport)]
+    pub fn with_own_transport(
+        mut self,
+        endpoint: JsValue,
+    ) -> Result<DeRecProtocolBuilderWasm, JsValue> {
+        #[derive(serde::Deserialize)]
+        struct EndpointShape {
+            uri: String,
+            protocol: String,
+        }
+        let parsed: EndpointShape = serde_wasm_bindgen::from_value(endpoint)
+            .map_err(|e| js_error("INVALID_OWN_TRANSPORT", e.to_string()))?;
+        let protocol_num = match parsed.protocol.to_lowercase().as_str() {
             "https" => 0i32,
             other => {
                 return Err(js_error(
                     "INVALID_PROTOCOL",
                     format!("unknown protocol: {other}"),
-                ))
-            }
-        };
-        let own_transport = TransportProtocol {
-            uri: own_transport_uri,
-            protocol: protocol_num,
-        };
-        let info: HashMap<String, String> = if communication_info.is_null() || communication_info.is_undefined() {
-            HashMap::new()
-        } else {
-            serde_wasm_bindgen::from_value(communication_info)
-                .map_err(|e| js_error("INVALID_COMMUNICATION_INFO", e.to_string()))?
-        };
-        let unpair_ack_value = match unpair_ack
-            .as_deref()
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            None | Some("required") => UnpairAck::Required,
-            Some("not_required" | "notrequired" | "fire_and_forget") => UnpairAck::NotRequired,
-            Some(other) => {
-                return Err(js_error(
-                    "INVALID_UNPAIR_ACK",
-                    format!("unknown unpair_ack value: {other:?}; expected \"required\" or \"not_required\""),
                 ));
             }
+        };
+        self.own_transport_uri = Some(parsed.uri);
+        self.own_transport_protocol_num = Some(protocol_num);
+        Ok(self)
+    }
+
+    /// Minimum number of shares required to reconstruct the secret.
+    /// Default: 3.
+    #[wasm_bindgen(js_name = withThreshold)]
+    pub fn with_threshold(mut self, threshold: u32) -> DeRecProtocolBuilderWasm {
+        self.threshold = threshold;
+        self
+    }
+
+    /// Number of recent versions each helper must retain. Default: 3.
+    #[wasm_bindgen(js_name = withKeepVersionsCount)]
+    pub fn with_keep_versions_count(mut self, count: u32) -> DeRecProtocolBuilderWasm {
+        self.keep_versions_count = count;
+        self
+    }
+
+    /// Protocol-wide staleness boundary (seconds). Clamped to at least
+    /// 1. Default: 300.
+    #[wasm_bindgen(js_name = withTimeout)]
+    pub fn with_timeout(mut self, timeout_in_secs: u32) -> DeRecProtocolBuilderWasm {
+        self.timeout_in_secs = timeout_in_secs.max(1);
+        self
+    }
+
+    /// `info` shape: `Record<string, string>`. Default: empty.
+    #[wasm_bindgen(js_name = withCommunicationInfo)]
+    pub fn with_communication_info(
+        mut self,
+        info: JsValue,
+    ) -> Result<DeRecProtocolBuilderWasm, JsValue> {
+        let parsed: HashMap<String, String> = serde_wasm_bindgen::from_value(info)
+            .map_err(|e| js_error("INVALID_COMMUNICATION_INFO", e.to_string()))?;
+        self.communication_info = parsed;
+        Ok(self)
+    }
+
+    /// Whether the protocol auto-replies on failed inbound processing.
+    /// Default: false.
+    #[wasm_bindgen(js_name = withAutoRespondOnFailure)]
+    pub fn with_auto_respond_on_failure(mut self, enabled: bool) -> DeRecProtocolBuilderWasm {
+        self.auto_respond_on_failure = enabled;
+        self
+    }
+
+    /// `ack` is `"required"` (default) or `"not_required"`.
+    #[wasm_bindgen(js_name = withUnpairAck)]
+    pub fn with_unpair_ack(
+        mut self,
+        ack: String,
+    ) -> Result<DeRecProtocolBuilderWasm, JsValue> {
+        self.unpair_ack = match ack.to_ascii_lowercase().as_str() {
+            "required" => UnpairAck::Required,
+            "not_required" | "notrequired" | "fire_and_forget" => UnpairAck::NotRequired,
+            other => {
+                return Err(js_error(
+                    "INVALID_UNPAIR_ACK",
+                    format!(
+                        "unknown unpair_ack value: {other:?}; expected \"required\" or \"not_required\""
+                    ),
+                ));
+            }
+        };
+        Ok(self)
+    }
+
+    /// Whether outbound requests stamp `replyTo = ownTransport`.
+    /// Default: false.
+    #[wasm_bindgen(js_name = withAutoReplyTo)]
+    pub fn with_auto_reply_to(mut self, enabled: bool) -> DeRecProtocolBuilderWasm {
+        self.auto_reply_to = enabled;
+        self
+    }
+
+    /// `id` is a JS `bigint` or `number`. Default: unset.
+    #[wasm_bindgen(js_name = withReplicaId)]
+    pub fn with_replica_id(
+        mut self,
+        id: JsValue,
+    ) -> Result<DeRecProtocolBuilderWasm, JsValue> {
+        let v = js_value_to_u64(id)
+            .map_err(|e| js_error("INVALID_REPLICA_ID", format!("{e:?}")))?;
+        self.replica_id = Some(v);
+        Ok(self)
+    }
+
+    /// Finalize the configuration. Throws if any of the required
+    /// setters was not called.
+    pub fn build(self) -> Result<DeRecProtocolWasm, JsValue> {
+        let channel_store = self
+            .channel_store
+            .ok_or_else(|| js_error("BUILDER_MISSING", "withChannelStore is required"))?;
+        let share_store = self
+            .share_store
+            .ok_or_else(|| js_error("BUILDER_MISSING", "withShareStore is required"))?;
+        let secret_store = self
+            .secret_store
+            .ok_or_else(|| js_error("BUILDER_MISSING", "withSecretStore is required"))?;
+        let transport = self
+            .transport
+            .ok_or_else(|| js_error("BUILDER_MISSING", "withTransport is required"))?;
+        let own_transport_uri = self
+            .own_transport_uri
+            .ok_or_else(|| js_error("BUILDER_MISSING", "withOwnTransport is required"))?;
+        let own_transport_protocol = self
+            .own_transport_protocol_num
+            .ok_or_else(|| js_error("BUILDER_MISSING", "withOwnTransport is required"))?;
+
+        let own_transport = TransportProtocol {
+            uri: own_transport_uri,
+            protocol: own_transport_protocol,
         };
 
         let mut builder = DeRecProtocolBuilder::new()
@@ -206,21 +324,24 @@ impl DeRecProtocolWasm {
             .with_secret_store(JsSecretStore(secret_store))
             .with_transport(JsTransport(transport))
             .with_own_transport(own_transport)
-            .with_threshold(threshold as usize)
-            .with_keep_versions_count(keep_versions_count as usize)
-            .with_communication_info(info)
-            .with_timeout(Duration::from_secs(timeout_in_secs.map_or(300, u64::from)))
-            .with_auto_respond_on_failure(auto_respond_on_failure.unwrap_or(false))
-            .with_unpair_ack(unpair_ack_value)
-            .with_auto_reply_to(auto_reply_to.unwrap_or(false));
-        if !replica_id.is_null() && !replica_id.is_undefined() {
-            let id = js_value_to_u64(replica_id)
-                .map_err(|e| js_error("INVALID_REPLICA_ID", format!("{e:?}")))?;
+            .with_threshold(self.threshold as usize)
+            .with_keep_versions_count(self.keep_versions_count as usize)
+            .with_communication_info(self.communication_info)
+            .with_timeout(Duration::from_secs(u64::from(self.timeout_in_secs)))
+            .with_auto_respond_on_failure(self.auto_respond_on_failure)
+            .with_unpair_ack(self.unpair_ack)
+            .with_auto_reply_to(self.auto_reply_to);
+        if let Some(id) = self.replica_id {
             builder = builder.with_replica_id(id);
         }
-        let inner = builder.build();
-        Ok(DeRecProtocolWasm { inner })
+        Ok(DeRecProtocolWasm {
+            inner: builder.build(),
+        })
     }
+}
+
+#[wasm_bindgen]
+impl DeRecProtocolWasm {
 
     /// Generate an out-of-band contact message (QR code payload, deep link, …).
     ///
@@ -240,9 +361,6 @@ impl DeRecProtocolWasm {
     ///   for `HashedKeys` (contact carries only a SHA-384 binding hash; the
     ///   scanner fetches keys via a `PrePair` round-trip). `HashedKeys`
     ///   requires the protocol's `own_transport` to be ephemeral.
-    ///
-    /// TODO: document the full pairing lifecycle and how to use the returned
-    /// `channel_id` field to track the pending pairing in application state.
     #[wasm_bindgen(js_name = "createContact")]
     pub async fn create_contact(
         &mut self,
@@ -898,11 +1016,15 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
         }
         6 => {
             // UpdateChannelInfo
+            //
+            // Wire-shape mirrors the dotnet `UpdateChannelInfoParams`:
+            // `{ target, communication_info?, transport_protocol?: { uri, protocol: number } }`.
+            // Field names are snake_case for SDK parity.
             let target_val = js_sys::Reflect::get(&params, &JsValue::from_str("target"))
                 .unwrap_or(JsValue::UNDEFINED);
             let target = parse_target(target_val)?;
             let communication_info_val =
-                js_sys::Reflect::get(&params, &JsValue::from_str("communicationInfo"))
+                js_sys::Reflect::get(&params, &JsValue::from_str("communication_info"))
                     .unwrap_or(JsValue::UNDEFINED);
             let communication_info: Option<HashMap<String, String>> =
                 if communication_info_val.is_null() || communication_info_val.is_undefined() {
@@ -914,30 +1036,24 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
                         })?,
                     )
                 };
-            let transport_uri_val = js_sys::Reflect::get(&params, &JsValue::from_str("transportUri"))
-                .unwrap_or(JsValue::UNDEFINED);
-            let transport_protocol = if transport_uri_val.is_null() || transport_uri_val.is_undefined()
+            let transport_protocol_val =
+                js_sys::Reflect::get(&params, &JsValue::from_str("transport_protocol"))
+                    .unwrap_or(JsValue::UNDEFINED);
+            let transport_protocol = if transport_protocol_val.is_null()
+                || transport_protocol_val.is_undefined()
             {
                 None
             } else {
-                let uri = transport_uri_val.as_string().ok_or_else(|| {
-                    js_error("INVALID_TRANSPORT_URI", "transportUri must be a string")
-                })?;
-                let proto_val =
-                    js_sys::Reflect::get(&params, &JsValue::from_str("transportProtocol"))
-                        .unwrap_or(JsValue::UNDEFINED);
-                let proto = match proto_val.as_string().as_deref() {
-                    None | Some("") | Some("https") => 0i32,
-                    Some(other) => {
-                        return Err(js_error(
-                            "INVALID_PROTOCOL",
-                            format!("unknown transport protocol: {other}"),
-                        ));
-                    }
-                };
+                #[derive(serde::Deserialize)]
+                struct TransportShape {
+                    uri: String,
+                    protocol: i32,
+                }
+                let parsed: TransportShape = serde_wasm_bindgen::from_value(transport_protocol_val)
+                    .map_err(|e| js_error("INVALID_TRANSPORT_PROTOCOL", e.to_string()))?;
                 Some(TransportProtocol {
-                    uri,
-                    protocol: proto,
+                    uri: parsed.uri,
+                    protocol: parsed.protocol,
                 })
             };
             Ok(DeRecFlow::UpdateChannelInfo {

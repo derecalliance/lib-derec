@@ -64,7 +64,7 @@ Three roles participate:
   (`DeRecProtocol::get_fingerprint` / `verify_fingerprint`), then
   `ProtectSecret` distributes the full vault (helpers + secrets +
   replicas + `owner_replica_id`) to every Destination via a
-  [`ReplicaSecretPayload`](https://docs.rs/derec-library/latest/derec_library/types/struct.ReplicaSecretPayload.html).
+  [`ReplicaSecretPayload`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.ReplicaSecretPayload.html).
   Destinations surface the typed
   [`DeRecEvent::ReplicaVaultReceived`](https://docs.rs/derec-library/latest/derec_library/protocol/events/enum.DeRecEvent.html#variant.ReplicaVaultReceived).
   Configure via `DeRecProtocolBuilder::with_replica_id`.
@@ -238,7 +238,7 @@ for the complete enum and per-variant docs.
 Each paired channel carries the local node's role — `SenderKind::Owner`,
 `SenderKind::Helper`, `SenderKind::ReplicaSource`, or
 `SenderKind::ReplicaDestination` — fixed at pairing time and stored on
-[`Channel.role`](https://docs.rs/derec-library/latest/derec_library/types/struct.Channel.html).
+[`Channel.role`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.Channel.html).
 The orchestrator enforces flow directionality against this value:
 
 - Outbound: `ProtectSecret`, `VerifyShares`, `Discovery`, `RecoverSecret`,
@@ -249,7 +249,7 @@ The orchestrator enforces flow directionality against this value:
   only honored on a channel where the local role is `Helper`; the
   corresponding responses require `Owner`. A `StoreShareRequest` on a
   `ReplicaDestination` channel is decoded as a
-  [`ReplicaSecretPayload`](https://docs.rs/derec-library/latest/derec_library/types/struct.ReplicaSecretPayload.html)
+  [`ReplicaSecretPayload`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.ReplicaSecretPayload.html)
   and surfaces as
   [`DeRecEvent::ReplicaVaultReceived`](https://docs.rs/derec-library/latest/derec_library/protocol/events/enum.DeRecEvent.html#variant.ReplicaVaultReceived).
 - `UpdateChannelInfo` is symmetric — either side may initiate it, and the
@@ -264,7 +264,7 @@ A mismatch surfaces as `Error::RoleMismatch { channel_id, expected, actual }`.
 | Flow | Purpose |
 |------|---------|
 | Pairing | Establish a secure channel between any two SenderKinds (Owner↔Helper or ReplicaSource↔ReplicaDestination). Two contact modes — see [Pairing modes](#pairing-modes). |
-| Share Distribution | Split a secret and distribute the shares to helpers; replica destinations receive the full vault as a [`ReplicaSecretPayload`](https://docs.rs/derec-library/latest/derec_library/types/struct.ReplicaSecretPayload.html). |
+| Share Distribution | Split a secret and distribute the shares to helpers; replica destinations receive the full vault as a [`ReplicaSecretPayload`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.ReplicaSecretPayload.html). |
 | Verification | Challenge helpers to prove they still hold their shares. |
 | Discovery | Ask helpers which secrets and versions they store. |
 | Recovery | Re-pair, collect shares, reconstruct the secret. |
@@ -383,7 +383,7 @@ two payload shapes from the same `start` call:
 
 - Helpers receive the usual VSS share via `StoreShareRequest`.
 - Destinations receive a typed
-  [`ReplicaSecretPayload`](https://docs.rs/derec-library/latest/derec_library/types/struct.ReplicaSecretPayload.html)
+  [`ReplicaSecretPayload`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.ReplicaSecretPayload.html)
   `{ secret: SecretContainer, shares: Vec<ChannelShare> }` — the full
   vault plus every helper's share keyed by `channel_id`. This is what
   lets a destination act in the source's place during recovery without
@@ -1042,6 +1042,60 @@ Applications using this SDK should ensure:
   staleness check.
 
 The DeRec protocol assumes helpers are independent and trusted entities.
+
+### Replica destinations inherit Source trust
+
+A `ReplicaDestination` receives the full
+[`SecretContainer`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.SecretContainer.html),
+which embeds every helper's `channel_id` and `shared_key` under
+[`HelperInfo`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.HelperInfo.html).
+Anyone with the vault can therefore authenticate as the Source toward
+every helper. This is intentional — it is what makes Destination-driven
+recovery work — but it means a compromised Destination can impersonate
+the Source against every helper that was paired at the time the vault
+was sent. Pick Destinations with at least the trust level of the Source
+device itself; do not treat them as opaque backups.
+
+### `HashedKeys` requires an ephemeral transport URI
+
+`ContactMode::HashedKeys` ships only a SHA-384 binding hash in the
+contact and serves the actual public keys through a plaintext PrePair
+round-trip on the contact creator's `own_transport`. Any party that can
+reach that URI before the legitimate scanner gets the keys. Use
+`HashedKeys` only with a transport endpoint that is freshly minted for
+this pairing and that you can retire as soon as the PrePair leg
+completes. `ContactMode::InlineKeys` has no such constraint because the
+keys are embedded directly in the (already binding-hash-validated)
+contact bytes.
+
+The recommended pattern is: pair on the ephemeral URI, then — as soon
+as the pairing completes on the contact creator side — call
+`set_own_transport` with the permanent endpoint and start an
+`UpdateChannelInfo` flow against the peer to announce the swap. Once
+the peer acknowledges, retire the ephemeral URI. This keeps the
+plaintext PrePair window tight while letting subsequent traffic ride
+on the long-lived endpoint.
+
+### Replica fingerprint verification is mandatory
+
+Replica channels are created in `ChannelStatus::Pending` and remain
+there until both sides call `verify_fingerprint` with the value the
+peer derived from the shared key — confirmed out of band, the same way
+helper pairings are. The orchestrator enforces this:
+`start(ProtectSecret)` returns
+[`Error::InvalidInput`](https://docs.rs/derec-library/latest/derec_library/enum.Error.html#variant.InvalidInput)
+when a target is still `Pending`. Treat verification as a required step
+in the pairing UX, not an optional confirmation — a scanner that
+auto-pairs without it accepts a MITM-vulnerable replica.
+
+### The `derec.*` namespace in `CommunicationInfo` is library-owned
+
+`CommunicationInfo` is otherwise an opaque app-defined map, but every
+key under the `derec.` prefix is reserved for the protocol. Today the
+library owns `derec.replica_id`; future protocol additions will use the
+same namespace. Application code must not write any `derec.*` entry —
+the orchestrator silently overwrites or strips library-owned keys at
+the protocol boundary, and app-set values are lost without warning.
 
 ---
 

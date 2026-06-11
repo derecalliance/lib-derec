@@ -2,9 +2,9 @@
 
 use super::error::{ChannelStoreError, SecretStoreError, ShareStoreError};
 use crate::Result;
-use crate::types::{Channel, ChannelId};
-use derec_cryptography::pairing::PairingSecretKeyMaterial;
-use derec_proto::{ContactMessage, TransportProtocol};
+use crate::protocol::types::{Channel, MissingPolicy, SecretKind, SecretValue, Share};
+use crate::types::ChannelId;
+use derec_proto::TransportProtocol;
 use std::{future::Future, pin::Pin};
 
 /// Type-erased future returned by [`DeRecSecretStore`] methods.
@@ -58,71 +58,6 @@ pub type TransportFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
 /// [`SecretStoreFuture`] for the `Send`/non-`Send` rules.
 #[cfg(not(any(feature = "ffi", target_arch = "wasm32")))]
 pub type TransportFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
-
-/// Kind of secret material stored by [`DeRecSecretStore`].
-///
-/// Each variant has its own lifecycle (see per-variant docs). Used as the
-/// `kind` argument to [`DeRecSecretStore::load`] and
-/// [`DeRecSecretStore::remove`]; on [`DeRecSecretStore::save`] the kind is
-/// inferred from the [`SecretValue`] variant and need not be passed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SecretKind {
-    /// The post-pairing symmetric channel key (see [`SecretValue::SharedKey`]).
-    SharedKey = 0,
-    /// The ephemeral ECIES / ML-KEM key material used during pairing.
-    PairingSecret = 1,
-    /// The initiator's [`ContactMessage`] stored transiently between
-    /// `start` and pairing completion. Removed once the shared key
-    /// is derived.
-    PairingContact = 2,
-}
-
-/// How [`DeRecSecretStore::load_many`] handles channels with no stored secret
-/// of the requested [`SecretKind`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MissingPolicy {
-    /// Silently drop missing channels from the returned vector.
-    ///
-    /// Use when missing entries are an expected outcome — e.g. a `Target::Many`
-    /// list that mixes paired and unpaired channels.
-    Skip,
-    /// Return [`SecretStoreError::MissingEntries`] carrying the channel ids
-    /// that had no entry.
-    ///
-    /// Use when every input id is expected to have an entry — e.g. after
-    /// filtering to channels already known to [`DeRecChannelStore`]. A miss
-    /// signals a cross-store invariant violation.
-    Fail,
-}
-
-/// The payload returned by [`DeRecSecretStore::load`] and passed to
-/// [`DeRecSecretStore::save`].
-///
-/// Variants are 1:1 with [`SecretKind`].
-pub enum SecretValue {
-    /// The post-pairing symmetric channel key. Established by pairing and used
-    /// to authenticate and encrypt every subsequent message on the channel.
-    SharedKey(crate::types::SharedKey),
-    /// The ephemeral ECIES / ML-KEM key pair created by `start` and consumed
-    /// when the pairing response arrives. Removed once the shared key is
-    /// derived.
-    PairingSecret(PairingSecretKeyMaterial),
-    /// The initiator's [`ContactMessage`], needed by
-    /// [`crate::primitives::pairing::response::process`] to derive the shared
-    /// key. Ephemeral — removed after pairing completes.
-    PairingContact(ContactMessage),
-}
-
-/// A single stored share entry, fully self-describing.
-#[derive(Debug, Clone)]
-pub struct Share {
-    /// Numeric identifier of the secret this share belongs to.
-    pub secret_id: u64,
-    /// Version number of the secret.
-    pub version: u32,
-    /// Opaque protobuf bytes — see [`DeRecShareStore`] for the per-side format.
-    pub bytes: Vec<u8>,
-}
 
 /// Keychain-grade storage for the protocol's per-channel cryptographic state.
 ///
@@ -200,9 +135,9 @@ pub trait DeRecSecretStore {
 ///
 /// A [`Channel`] is the post-pairing representation of a peer relationship,
 /// retaining only the fields needed for ongoing protocol operations — see
-/// [`Channel`] for the per-field documentation. The full [`ContactMessage`]
-/// — which carries ephemeral cryptographic material — is discarded after
-/// pairing.
+/// [`Channel`] for the per-field documentation. The full
+/// [`derec_proto::ContactMessage`] — which carries ephemeral cryptographic
+/// material — is discarded after pairing.
 ///
 /// # Implementor notes
 ///

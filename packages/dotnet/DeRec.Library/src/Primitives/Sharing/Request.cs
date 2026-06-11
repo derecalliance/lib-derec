@@ -30,6 +30,13 @@ public static partial class Sharing
             /// stored-share input for <see cref="Recovery.Response.Produce"/>.
             /// </summary>
             public required byte[] RequestProtoBytes { get; init; }
+            /// <summary>
+            /// Optional response endpoint advertised by the sender on the
+            /// inner request. <c>null</c> when the sender did not set one
+            /// (the responder routes to the channel's stored peer endpoint).
+            /// Mirrors the JS bridge surface.
+            /// </summary>
+            public TransportProtocol? ReplyTo { get; init; }
         }
 
         public static SplitResult Split(
@@ -131,10 +138,14 @@ public static partial class Sharing
             try
             {
                 Utils.ThrowIfError(nativeResult.Error);
+                byte[] requestBytes = Utils.CopyBuffer(nativeResult.RequestProtoBytes);
+                var inner = Org.Derecalliance.Derec.Protobuf.StoreShareRequestMessage.Parser
+                    .ParseFrom(requestBytes);
                 return new ExtractResult
                 {
                     ChannelId = nativeResult.ChannelId,
-                    RequestProtoBytes = Utils.CopyBuffer(nativeResult.RequestProtoBytes),
+                    RequestProtoBytes = requestBytes,
+                    ReplyTo = TransportProtocol.FromProto(inner.ReplyTo),
                 };
             }
             finally

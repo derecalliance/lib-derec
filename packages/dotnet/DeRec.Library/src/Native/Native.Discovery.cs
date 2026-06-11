@@ -19,6 +19,7 @@ internal static class Discovery
     {
         public DeRecError Error;
         public ulong ChannelId;
+        public Buffer RequestProtoBytes;
     }
 
     [StructLayout(LayoutKind.Sequential)]

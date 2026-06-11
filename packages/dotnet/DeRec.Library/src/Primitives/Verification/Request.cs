@@ -16,6 +16,11 @@ public static partial class Verification
             /// into <see cref="Response.Produce(ulong, byte[], byte[], DeRecMessage)"/>.
             /// </summary>
             public required byte[] RequestProtoBytes { get; init; }
+            /// <summary>
+            /// Optional response endpoint advertised by the sender on
+            /// the inner request. Mirrors the JS bridge surface.
+            /// </summary>
+            public TransportProtocol? ReplyTo { get; init; }
         }
 
         public static DeRecMessage Produce(
@@ -66,10 +71,14 @@ public static partial class Verification
             try
             {
                 Utils.ThrowIfError(nativeResult.Error);
+                byte[] innerBytes = Utils.CopyBuffer(nativeResult.RequestProtoBytes);
+                var inner = Org.Derecalliance.Derec.Protobuf.VerifyShareRequestMessage.Parser
+                    .ParseFrom(innerBytes);
                 return new ExtractResult
                 {
                     ChannelId = nativeResult.ChannelId,
-                    RequestProtoBytes = Utils.CopyBuffer(nativeResult.RequestProtoBytes),
+                    RequestProtoBytes = innerBytes,
+                    ReplyTo = TransportProtocol.FromProto(inner.ReplyTo),
                 };
             }
             finally

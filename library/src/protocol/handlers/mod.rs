@@ -15,7 +15,8 @@ use super::{
 use crate::{
     Error, Result,
     derec_message::{DeRecMessageBuilder, current_timestamp},
-    types::{ChannelId, SharedKey, Target},
+    protocol::types::Target,
+    types::{ChannelId, SharedKey},
 };
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{DeRecMessage, MessageBody, SenderKind, TransportProtocol};
@@ -57,7 +58,6 @@ pub(super) async fn resolve_target<Ch: DeRecChannelStore>(
     channel_store: &mut Ch,
     target: Target,
 ) -> Result<Vec<ChannelId>> {
-    // TODO: this filtering logic should be moved to channels()
     let all_channels = channel_store.channels().await?;
     let all_channel_ids: Vec<ChannelId> = all_channels.iter().map(|c| c.id).collect();
 
@@ -187,10 +187,10 @@ pub(super) async fn handle<
 
     match &inner {
         MessageBody::StoreShareRequest(_) | MessageBody::StoreShareResponse(_) => {
-            // Role-based dispatch (#59). On a Helper-role channel the
-            // peer is the Owner pushing a share fragment (existing path).
+            // Role-based dispatch. On a Helper-role channel the peer is
+            // the Owner pushing a share fragment (classic share path).
             // On a Replica-role channel the peer is another replica
-            // pushing a full vault payload (#67 sender side); we auto-ack
+            // pushing a full vault payload (vault-sync path); we auto-ack
             // and surface a typed event with the opaque payload.
             let channel = channel_store
                 .load(channel_id)
@@ -294,8 +294,8 @@ pub(in crate::protocol) async fn handle_pairing<Ch: DeRecChannelStore, Ss: DeRec
 fn expected_role_for_inbound(body: &MessageBody) -> Option<SenderKind> {
     match body {
         // Multi-role: Helper (peer is Owner, classic share path) OR
-        // Replica (peer is Replica, vault sync #67). Gate is inlined in
-        // `handle`.
+        // Replica (peer is Replica, vault-sync path). Gate is inlined
+        // in `handle`.
         MessageBody::StoreShareRequest(_) | MessageBody::StoreShareResponse(_) => None,
         // Helper accepts these; Owner sends them.
         MessageBody::VerifyShareRequest(_)

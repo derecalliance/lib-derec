@@ -27,10 +27,10 @@ public sealed class DeRecMessage
     }
 
     /// <summary>Serializes this envelope back to protobuf wire bytes.</summary>
-    internal byte[] ToProtoBytes() => _protoBytes;
+    public byte[] ToProtoBytes() => _protoBytes;
 
     /// <summary>Deserializes a <see cref="DeRecMessage"/> from protobuf wire bytes.</summary>
-    internal static DeRecMessage FromProtoBytes(byte[] bytes)
+    public static DeRecMessage FromProtoBytes(byte[] bytes)
     {
         var proto = Org.Derecalliance.Derec.Protobuf.DeRecMessage.Parser.ParseFrom(bytes);
         return new DeRecMessage(bytes, proto);

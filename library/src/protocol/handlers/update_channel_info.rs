@@ -8,7 +8,8 @@ use super::{peer_endpoint, resolve_target};
 use crate::derec_message::{DeRecMessageBuilder, current_timestamp};
 use crate::{
     Error, Result,
-    types::{ChannelId, SharedKey, Target},
+    protocol::types::Target,
+    types::{ChannelId, SharedKey},
 };
 use derec_proto::{
     CommunicationInfo, DeRecResult, MessageBody, StatusEnum, TransportProtocol,

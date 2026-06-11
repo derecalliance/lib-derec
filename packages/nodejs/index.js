@@ -3,12 +3,13 @@
 const wasm = require("./derec_library.js");
 
 const DeRecProtocol = wasm.DeRecProtocolWasm;
+const DeRecProtocolBuilder = wasm.DeRecProtocolBuilder;
 
 const SenderKind = Object.freeze({ Owner: 0, Helper: 1, ReplicaSource: 3, ReplicaDestination: 4 });
 
 const ContactMode = Object.freeze({ InlineKeys: 0, HashedKeys: 1 });
 
-const FlowKind = Object.freeze({ Pairing: 0, Discovery: 1, ProtectSecret: 2, VerifyShares: 3, RecoverSecret: 4, Unpair: 5 });
+const FlowKind = Object.freeze({ Pairing: 0, Discovery: 1, ProtectSecret: 2, VerifyShares: 3, RecoverSecret: 4, Unpair: 5, UpdateChannelInfo: 6 });
 
 const primitives = {
   discovery: {
@@ -101,6 +102,7 @@ module.exports = {
   primitives,
   envelope,
   DeRecProtocol,
+  DeRecProtocolBuilder,
   SenderKind,
   ContactMode,
   FlowKind,

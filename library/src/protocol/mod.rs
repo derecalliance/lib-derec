@@ -20,6 +20,7 @@ pub mod events;
 pub(crate) mod pending_action_wire;
 pub mod reserved_keys;
 pub mod traits;
+pub mod types;
 
 mod builder;
 mod handlers;
@@ -38,8 +39,11 @@ use prost::Message;
 use std::collections::{HashMap, HashSet};
 pub use traits::{
     ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecTransport,
-    MissingPolicy, SecretKind, SecretStoreFuture, SecretValue, Share, ShareStoreFuture,
-    TransportFuture,
+    SecretStoreFuture, ShareStoreFuture, TransportFuture,
+};
+pub use types::{
+    Channel, ChannelShare, ChannelStatus, HelperInfo, MissingPolicy, ReplicaInfo,
+    ReplicaSecretPayload, SecretContainer, SecretKind, SecretValue, Share, Target, UserSecret,
 };
 
 /// In-progress recovery accumulators keyed by `(secret_id, version)`.
@@ -381,8 +385,8 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                     handlers::resolve_target(&mut self.channel_store, target.clone()).await?;
                 // ProtectSecret accepts channels where the local kind is
                 // Owner (peer is a Helper — the classic share path) OR
-                // Replica (peer is another replica — vault sync, #67).
-                // Channels where the local kind is Helper are not
+                // ReplicaSource (peer is a ReplicaDestination — vault
+                // sync). Channels where the local kind is Helper are not
                 // legitimate ProtectSecret initiators and are refused.
                 for channel_id in &resolved {
                     let channel = self
@@ -401,6 +405,20 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
                             expected: derec_proto::SenderKind::Owner,
                             actual: channel.role,
                         });
+                    }
+                    // Replica channels start `Pending` after pair-handshake
+                    // completion and only transition to `Paired` once both
+                    // sides confirm the fingerprint out-of-band. Refusing
+                    // `ProtectSecret` against a `Pending` target prevents a
+                    // MITM-leaning peer from receiving the vault before
+                    // verification.
+                    if channel.status
+                        == crate::protocol::types::ChannelStatus::Pending
+                    {
+                        return Err(Error::InvalidInput(
+                            "ProtectSecret target is still Pending — \
+                             verify the fingerprint before distributing",
+                        ));
                     }
                 }
                 let (version, sent_channels) = handlers::sharing::start(
@@ -955,7 +973,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
 
         // Update channel status to Paired.
         if let Some(mut channel) = self.channel_store.load(channel_id).await? {
-            channel.status = crate::types::ChannelStatus::Paired;
+            channel.status = crate::protocol::types::ChannelStatus::Paired;
             self.channel_store.save(channel).await?;
         }
 
@@ -1000,7 +1018,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
         };
 
         if let Some(channel) = self.channel_store.load(channel_id).await? {
-            if channel.status == crate::types::ChannelStatus::Pending {
+            if channel.status == crate::protocol::types::ChannelStatus::Pending {
                 #[cfg(feature = "logging")]
                 tracing::warn!(
                     channel_id = channel_id.0,
@@ -1255,7 +1273,7 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
 
         let mut removed = Vec::new();
         for channel in channels {
-            if channel.status == crate::types::ChannelStatus::Pending
+            if channel.status == crate::protocol::types::ChannelStatus::Pending
                 && now.saturating_sub(channel.created_at) > timeout
             {
                 self.channel_store.remove(channel.id).await?;

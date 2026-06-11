@@ -13,6 +13,11 @@ public static partial class Unpairing
         {
             public required ulong ChannelId { get; init; }
             public required string Memo { get; init; }
+            /// <summary>
+            /// Optional response endpoint advertised by the sender on
+            /// the inner request. Mirrors the JS bridge surface.
+            /// </summary>
+            public TransportProtocol? ReplyTo { get; init; }
         }
 
         public static DeRecMessage Produce(ulong channelId, string memo, byte[] sharedKey, TransportProtocol? replyTo = null)
@@ -61,10 +66,14 @@ public static partial class Unpairing
                 string memo = nativeResult.Memo != IntPtr.Zero
                     ? Marshal.PtrToStringAnsi(nativeResult.Memo) ?? string.Empty
                     : string.Empty;
+                byte[] innerBytes = Utils.CopyBuffer(nativeResult.RequestProtoBytes);
+                var inner = Org.Derecalliance.Derec.Protobuf.UnpairRequestMessage.Parser
+                    .ParseFrom(innerBytes);
                 return new ExtractResult
                 {
                     ChannelId = nativeResult.ChannelId,
                     Memo = memo,
+                    ReplyTo = TransportProtocol.FromProto(inner.ReplyTo),
                 };
             }
             finally
@@ -73,6 +82,7 @@ public static partial class Unpairing
                 {
                     Native.Utils.derec_free_string(nativeResult.Memo);
                 }
+                Utils.FreeBuffer(nativeResult.RequestProtoBytes);
             }
         }
     }

@@ -20,6 +20,7 @@ internal static class Protocol
     public static void RunAll()
     {
         RunOrchestratorFingerprintTest();
+        RunOrchestratorFingerprintMismatchTest();
         RunOrchestratorPairFlowTest();
         RunOrchestratorHashedKeysPairFlowTest();
         RunOrchestratorShareAndDiscoverFlowTest();
@@ -56,19 +57,22 @@ internal static class Protocol
 
         // Pre-seed: a paired channel + its 32-byte SharedKey.
         channelStore.Save(new Channel(
-            ChannelId: channelId,
-            TransportUri: "https://peer.example.com",
-            TransportProtocol: 0,
+            Id: channelId,
+            Transport: new TransportProtocol("https://peer.example.com"),
             CommunicationInfo: new Dictionary<string, string>(),
-            Status: "paired",
+            Status: ChannelStatus.Paired,
             CreatedAt: 1700000000UL,
-            Role: 0,
+            Role: Pairing.SenderKind.Owner,
             ReplicaId: null));
         secretStore.Save(channelId, new SecretValue(SecretKind.SharedKey, sharedKey));
 
-        using var protocol = new DeRecProtocol(
-            channelStore, shareStore, secretStore, transport,
-            ownTransportUri: "https://owner.example.com");
+        using var protocol = new DeRecProtocolBuilder()
+            .WithChannelStore(channelStore)
+            .WithShareStore(shareStore)
+            .WithSecretStore(secretStore)
+            .WithTransport(transport)
+            .WithOwnTransport(new TransportProtocol("https://owner.example.com"))
+            .Build();
 
         string fingerprint = protocol.GetFingerprintAsync(channelId).GetAwaiter().GetResult();
 
@@ -87,6 +91,55 @@ internal static class Protocol
         Console.WriteLine("  verifyFingerprint matches local / rejects wrong  ✓");
 
         Console.WriteLine("Orchestrator getFingerprint test passed.");
+    }
+
+    /// <summary>
+    /// <c>verifyFingerprint(wrong)</c> on a still-<c>Pending</c> channel
+    /// must (a) return <c>false</c> and (b) leave
+    /// <c>Channel.Status</c> as <c>Pending</c>. The protocol must not
+    /// downgrade or otherwise mutate the channel on a failed match.
+    /// </summary>
+    private static void RunOrchestratorFingerprintMismatchTest()
+    {
+        Console.WriteLine("=== Orchestrator fingerprint mismatch test ===");
+
+        const ulong channelId = 5151UL;
+        byte[] sharedKey = new byte[32];
+        for (int i = 0; i < 32; i++) sharedKey[i] = (byte)(i * 11 + 5);
+
+        using var node = MakeNode("Owner", "https://owner.example.com");
+
+        // Pre-seed a Pending channel + its shared key (simulating the
+        // post-replica-pair state where fingerprint verification is
+        // still required to transition to Paired).
+        node.ChannelStore.Save(new Channel(
+            Id: channelId,
+            Transport: new TransportProtocol("https://peer.example.com"),
+            CommunicationInfo: new Dictionary<string, string>(),
+            Status: ChannelStatus.Pending,
+            CreatedAt: 1700000000UL,
+            Role: Pairing.SenderKind.ReplicaSource,
+            ReplicaId: 0xcafeUL));
+        node.SecretStore.Save(channelId, new SecretValue(SecretKind.SharedKey, sharedKey));
+
+        bool unmatched = node.Protocol
+            .VerifyFingerprintAsync(channelId, "0000-0000-0000-0000")
+            .GetAwaiter().GetResult();
+        if (unmatched)
+            throw new InvalidOperationException(
+                "verifyFingerprint must return false for a wrong fingerprint");
+
+        // Critical invariant for 5.1: the stored channel record must
+        // still report Pending; the protocol must not have touched it.
+        var stored = node.ChannelStore.Load(channelId)
+            ?? throw new InvalidOperationException("channel record missing after verify");
+        if (stored.Status != ChannelStatus.Pending)
+            throw new InvalidOperationException(
+                $"verifyFingerprint(wrong) must leave Channel.Status as Pending; got {stored.Status}");
+        Console.WriteLine("  verifyFingerprint(wrong) returns false  ✓");
+        Console.WriteLine("  Channel.Status stays Pending after mismatch  ✓");
+
+        Console.WriteLine("Orchestrator fingerprint mismatch test passed.");
     }
 
     /// <summary>
@@ -114,27 +167,17 @@ internal static class Protocol
         const ulong channelId = 99UL;
 
         // contactCreator → Helper (it created the contact, scanner picks Owner).
-        var helperChannelStore = new InMemoryChannelStore();
-        var helperSecretStore = new InMemorySecretStore();
-        var helperTransport = new RecordingTransport();
-        using var helper = new DeRecProtocol(
-            helperChannelStore, new InMemoryShareStore(), helperSecretStore, helperTransport,
-            ownTransportUri: "https://helper.example.com");
+        using var helper = MakeNode("Helper", "https://helper.example.com");
 
-        var ownerChannelStore = new InMemoryChannelStore();
-        var ownerSecretStore = new InMemorySecretStore();
-        var ownerTransport = new RecordingTransport();
-        using var owner = new DeRecProtocol(
-            ownerChannelStore, new InMemoryShareStore(), ownerSecretStore, ownerTransport,
-            ownTransportUri: "https://owner.example.com");
+        using var owner = MakeNode("Owner", "https://owner.example.com");
 
         // 1. Helper creates the contact, owner scans + starts.
-        byte[] contactBytes = helper.CreateContactAsync(channelId, ContactMode.InlineKeys)
+        byte[] contactBytes = helper.Protocol.CreateContactAsync(channelId, ContactMode.InlineKeys)
             .GetAwaiter().GetResult();
         if (contactBytes.Length == 0)
             throw new InvalidOperationException("create_contact must return non-empty proto bytes");
 
-        ulong? startResult = owner.StartAsync(FlowKind.Pairing, new PairingParams
+        ulong? startResult = owner.Protocol.StartAsync(FlowKind.Pairing, new PairingParams
         {
             Kind = (int)Pairing.SenderKind.Owner,
             Contact = contactBytes,
@@ -144,19 +187,19 @@ internal static class Protocol
         Console.WriteLine($"  start(Pairing, kind=Owner) → channel_id={startResult}  ✓");
 
         // 2. Owner's outbox carries the PairRequest. Feed it to the helper.
-        byte[] pairRequest = ownerTransport.DrainOne();
+        byte[] pairRequest = owner.Transport.DrainOne();
         Console.WriteLine($"  owner emits PairRequest ({pairRequest.Length}B)");
 
-        var helperEvents = helper.ProcessAndAcceptAllAsync(pairRequest).GetAwaiter().GetResult();
+        var helperEvents = helper.Protocol.ProcessAndAcceptAllAsync(pairRequest).GetAwaiter().GetResult();
         var helperPairing = helperEvents.OfType<PairingCompletedEvent>().FirstOrDefault()
             ?? throw new InvalidOperationException(
                 $"helper.process(PairRequest) must emit PairingCompleted; got [{string.Join(", ", helperEvents.Select(e => e.EventType))}]");
         Console.WriteLine($"  helper emits PairingCompleted(kind={helperPairing.Kind})  ✓");
 
-        byte[] pairResponse = helperTransport.DrainOne();
+        byte[] pairResponse = helper.Transport.DrainOne();
         Console.WriteLine($"  helper emits PairResponse ({pairResponse.Length}B)");
 
-        var ownerEvents = owner.ProcessAndAcceptAllAsync(pairResponse).GetAwaiter().GetResult();
+        var ownerEvents = owner.Protocol.ProcessAndAcceptAllAsync(pairResponse).GetAwaiter().GetResult();
         var ownerPairing = ownerEvents.OfType<PairingCompletedEvent>().FirstOrDefault()
             ?? throw new InvalidOperationException(
                 $"owner.process(PairResponse) must emit PairingCompleted; got [{string.Join(", ", ownerEvents.Select(e => e.EventType))}]");
@@ -170,14 +213,14 @@ internal static class Protocol
                 $"both sides must converge on the same channel id; helper={helperPairing.ChannelId} owner={ownerPairing.ChannelId}");
         ulong rekeyedId = ulong.Parse(helperPairing.ChannelId);
 
-        var helperChannel = helperChannelStore.Load(rekeyedId)
+        var helperChannel = helper.ChannelStore.Load(rekeyedId)
             ?? throw new InvalidOperationException("helper channel record must exist after pairing");
-        var ownerChannel = ownerChannelStore.Load(rekeyedId)
+        var ownerChannel = owner.ChannelStore.Load(rekeyedId)
             ?? throw new InvalidOperationException("owner channel record must exist after pairing");
 
-        var helperKey = helperSecretStore.Load(rekeyedId, SecretKind.SharedKey)
+        var helperKey = helper.SecretStore.Load(rekeyedId, SecretKind.SharedKey)
             ?? throw new InvalidOperationException("helper shared_key must exist after pairing");
-        var ownerKey = ownerSecretStore.Load(rekeyedId, SecretKind.SharedKey)
+        var ownerKey = owner.SecretStore.Load(rekeyedId, SecretKind.SharedKey)
             ?? throw new InvalidOperationException("owner shared_key must exist after pairing");
         if (helperKey.Bytes.Length != 32 || ownerKey.Bytes.Length != 32)
             throw new InvalidOperationException("shared_key must be 32 bytes on both sides");
@@ -202,38 +245,20 @@ internal static class Protocol
         const ulong secretId = 0x7777UL;
         byte[] secretData = Encoding.UTF8.GetBytes("orchestrator-shared-secret");
 
-        var ownerCs = new InMemoryChannelStore();
-        var ownerSs = new InMemorySecretStore();
-        var ownerShs = new InMemoryShareStore();
-        var ownerTx = new RecordingTransport();
-        using var owner = new DeRecProtocol(
-            ownerCs, ownerShs, ownerSs, ownerTx,
-            ownTransportUri: "https://owner.example.com");
+        using var owner = MakeNode("Owner", "https://owner.example.com");
 
-        var helperACs = new InMemoryChannelStore();
-        var helperASs = new InMemorySecretStore();
-        var helperAShs = new InMemoryShareStore();
-        var helperATx = new RecordingTransport();
-        using var helperA = new DeRecProtocol(
-            helperACs, helperAShs, helperASs, helperATx,
-            ownTransportUri: "https://helper-a.example.com");
+        using var helperA = MakeNode("HelperA", "https://helper-a.example.com");
 
-        var helperBCs = new InMemoryChannelStore();
-        var helperBSs = new InMemorySecretStore();
-        var helperBShs = new InMemoryShareStore();
-        var helperBTx = new RecordingTransport();
-        using var helperB = new DeRecProtocol(
-            helperBCs, helperBShs, helperBSs, helperBTx,
-            ownTransportUri: "https://helper-b.example.com");
+        using var helperB = MakeNode("HelperB", "https://helper-b.example.com");
 
-        ulong rekeyedA = DoOrchestratorPair(helperA, helperATx, owner, ownerTx, helperAChannel);
-        ulong rekeyedB = DoOrchestratorPair(helperB, helperBTx, owner, ownerTx, helperBChannel);
+        ulong rekeyedA = DoOrchestratorPair(helperA, helperA.Transport, owner, owner.Transport, helperAChannel);
+        ulong rekeyedB = DoOrchestratorPair(helperB, helperB.Transport, owner, owner.Transport, helperBChannel);
         Console.WriteLine($"  paired Owner↔HelperA ({rekeyedA}), Owner↔HelperB ({rekeyedB})  ✓");
 
-        owner.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+        owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
         {
             SecretId = secretId.ToString(),
-            TargetValue = Target.Many(rekeyedA, rekeyedB).ToJsonValue(),
+            Target = Target.Many(rekeyedA, rekeyedB),
             Secrets = new[]
             {
                 new UserSecret { Id = new byte[] { 0x01 }, Name = "smoke", Data = secretData },
@@ -241,19 +266,19 @@ internal static class Protocol
             Description = "orchestrator smoke",
         }).GetAwaiter().GetResult();
 
-        var outbound = ownerTx.DrainAll();
+        var outbound = owner.Transport.DrainAll();
         if (outbound.Count != 2)
             throw new InvalidOperationException($"expected 2 StoreShareRequests, got {outbound.Count}");
 
-        var helpers = new[] { (helperA, helperATx, "HelperA"), (helperB, helperBTx, "HelperB") };
+        var helpers = new[] { (helperA, helperA.Transport, "HelperA"), (helperB, helperB.Transport, "HelperB") };
         for (int i = 0; i < 2; i++)
         {
             var (h, hTx, name) = helpers[i];
-            var hEvents = h.ProcessAndAcceptAllAsync(outbound[i].Bytes).GetAwaiter().GetResult();
+            var hEvents = h.Protocol.ProcessAndAcceptAllAsync(outbound[i].Bytes).GetAwaiter().GetResult();
             var stored = hEvents.OfType<ShareStoredEvent>().FirstOrDefault()
                 ?? throw new InvalidOperationException($"{name} did not emit ShareStored");
             var response = hTx.DrainOne();
-            var oEvents = owner.ProcessAndAcceptAllAsync(response).GetAwaiter().GetResult();
+            var oEvents = owner.Protocol.ProcessAndAcceptAllAsync(response).GetAwaiter().GetResult();
             var confirmed = oEvents.OfType<ShareConfirmedEvent>().FirstOrDefault()
                 ?? throw new InvalidOperationException($"owner did not emit ShareConfirmed for {name}");
             Console.WriteLine($"  {name}: ShareStored(v={stored.Version}) → ShareConfirmed(v={confirmed.Version})  ✓");
@@ -261,7 +286,7 @@ internal static class Protocol
 
         // SharingComplete fires on the last ShareConfirmed processed.
         // Walk one more pump (will be a no-op or carry the event).
-        var tailEvents = PumpAll(ownerTx, owner);
+        var tailEvents = PumpAll(owner.Transport, owner);
         var sharing = tailEvents.OfType<SharingCompleteEvent>().FirstOrDefault();
         // It may have already fired inline; that's fine — what matters is
         // the helpers stored shares + owner saw both ShareConfirmed.
@@ -271,11 +296,11 @@ internal static class Protocol
         // channels rather than `All` — `All` enumerates the channel
         // store and trips on transient/half-paired entries from the
         // earlier handshakes.
-        owner.StartAsync(FlowKind.Discovery, new DiscoveryParams
+        owner.Protocol.StartAsync(FlowKind.Discovery, new DiscoveryParams
         {
-            TargetValue = Target.Many(rekeyedA, rekeyedB).ToJsonValue(),
+            Target = Target.Many(rekeyedA, rekeyedB),
         }).GetAwaiter().GetResult();
-        var discoveryOut = ownerTx.DrainAll();
+        var discoveryOut = owner.Transport.DrainAll();
         if (discoveryOut.Count != 2)
             throw new InvalidOperationException($"expected 2 Discovery requests, got {discoveryOut.Count}");
 
@@ -283,9 +308,9 @@ internal static class Protocol
         for (int i = 0; i < 2; i++)
         {
             var (h, hTx, name) = helpers[i];
-            h.ProcessAndAcceptAllAsync(discoveryOut[i].Bytes).GetAwaiter().GetResult();
+            h.Protocol.ProcessAndAcceptAllAsync(discoveryOut[i].Bytes).GetAwaiter().GetResult();
             var resp = hTx.DrainOne();
-            var oEvents = owner.ProcessAndAcceptAllAsync(resp).GetAwaiter().GetResult();
+            var oEvents = owner.Protocol.ProcessAndAcceptAllAsync(resp).GetAwaiter().GetResult();
             foreach (var disc in oEvents.OfType<SecretsDiscoveredEvent>())
                 foreach (var s in disc.Secrets) discoveredSecretIds.Add(s.SecretId);
         }
@@ -299,30 +324,24 @@ internal static class Protocol
         const ulong recoveryAChannel = 100UL;
         const ulong recoveryBChannel = 101UL;
 
-        var recOwnerCs = new InMemoryChannelStore();
-        var recOwnerSs = new InMemorySecretStore();
-        var recOwnerShs = new InMemoryShareStore();
-        var recOwnerTx = new RecordingTransport();
-        using var recOwner = new DeRecProtocol(
-            recOwnerCs, recOwnerShs, recOwnerSs, recOwnerTx,
-            ownTransportUri: "https://recovery-owner.example.com");
+        using var recOwner = MakeNode("RecOwner", "https://recovery-owner.example.com");
 
-        ulong recA = DoOrchestratorPair(helperA, helperATx, recOwner, recOwnerTx, recoveryAChannel);
-        ulong recB = DoOrchestratorPair(helperB, helperBTx, recOwner, recOwnerTx, recoveryBChannel);
+        ulong recA = DoOrchestratorPair(helperA, helperA.Transport, recOwner, recOwner.Transport, recoveryAChannel);
+        ulong recB = DoOrchestratorPair(helperB, helperB.Transport, recOwner, recOwner.Transport, recoveryBChannel);
         Console.WriteLine($"  recovery re-pair: HelperA({recA}), HelperB({recB})  ✓");
 
         // Each helper links its original channel to its new recovery
         // channel so recovery (which fans out on the recovery channel)
         // surfaces the share stored under the original.
-        helperACs.LinkChannel(rekeyedA, recA);
-        helperBCs.LinkChannel(rekeyedB, recB);
+        helperA.ChannelStore.LinkChannel(rekeyedA, recA);
+        helperB.ChannelStore.LinkChannel(rekeyedB, recB);
 
-        recOwner.StartAsync(FlowKind.RecoverSecret, new RecoverSecretParams
+        recOwner.Protocol.StartAsync(FlowKind.RecoverSecret, new RecoverSecretParams
         {
             SecretId = secretId.ToString(),
             Version = 1,
         }).GetAwaiter().GetResult();
-        var recRequests = recOwnerTx.DrainAll();
+        var recRequests = recOwner.Transport.DrainAll();
         if (recRequests.Count != 2)
             throw new InvalidOperationException($"expected 2 GetShare requests, got {recRequests.Count}");
 
@@ -330,9 +349,9 @@ internal static class Protocol
         for (int i = 0; i < 2; i++)
         {
             var (h, hTx, _) = helpers[i];
-            h.ProcessAndAcceptAllAsync(recRequests[i].Bytes).GetAwaiter().GetResult();
+            h.Protocol.ProcessAndAcceptAllAsync(recRequests[i].Bytes).GetAwaiter().GetResult();
             var resp = hTx.DrainOne();
-            var oEvents = recOwner.ProcessAndAcceptAllAsync(resp).GetAwaiter().GetResult();
+            var oEvents = recOwner.Protocol.ProcessAndAcceptAllAsync(resp).GetAwaiter().GetResult();
             recovered ??= oEvents.OfType<SecretRecoveredEvent>().FirstOrDefault();
         }
         if (recovered is null)
@@ -370,68 +389,73 @@ internal static class Protocol
         const ulong secretId = 0xC0FFEEUL;
         byte[] secretData = Encoding.UTF8.GetBytes("vault-payload-for-replica-and-helper");
 
-        var ownerCs = new InMemoryChannelStore();
-        var ownerSs = new InMemorySecretStore();
-        var ownerShs = new InMemoryShareStore();
-        var ownerTx = new RecordingTransport();
-        using var owner = new DeRecProtocol(
-            ownerCs, ownerShs, ownerSs, ownerTx,
-            ownTransportUri: "https://owner.example.com",
-            replicaId: ownerReplicaId);
+        using var owner = MakeNode("Owner", "https://owner.example.com", new NodeOptions { ReplicaId = ownerReplicaId });
 
-        var helperACs = new InMemoryChannelStore();
-        var helperASs = new InMemorySecretStore();
-        var helperAShs = new InMemoryShareStore();
-        var helperATx = new RecordingTransport();
-        using var helperA = new DeRecProtocol(
-            helperACs, helperAShs, helperASs, helperATx,
-            ownTransportUri: "https://helper-a.example.com");
+        using var helperA = MakeNode("HelperA", "https://helper-a.example.com");
 
-        var helperBCs = new InMemoryChannelStore();
-        var helperBSs = new InMemorySecretStore();
-        var helperBShs = new InMemoryShareStore();
-        var helperBTx = new RecordingTransport();
-        using var helperB = new DeRecProtocol(
-            helperBCs, helperBShs, helperBSs, helperBTx,
-            ownTransportUri: "https://helper-b.example.com");
+        using var helperB = MakeNode("HelperB", "https://helper-b.example.com");
 
-        var destCs = new InMemoryChannelStore();
-        var destSs = new InMemorySecretStore();
-        var destShs = new InMemoryShareStore();
-        var destTx = new RecordingTransport();
-        using var destination = new DeRecProtocol(
-            destCs, destShs, destSs, destTx,
-            ownTransportUri: "https://replica-destination.example.com",
-            replicaId: destReplicaId);
+        using var destination = MakeNode(
+            "Destination", "https://replica-destination.example.com",
+            new NodeOptions { ReplicaId = destReplicaId });
 
-        ulong helperAId = DoOrchestratorPair(helperA, helperATx, owner, ownerTx, helperAChannel);
-        ulong helperBId = DoOrchestratorPair(helperB, helperBTx, owner, ownerTx, helperBChannel);
+        ulong helperAId = DoOrchestratorPair(helperA, helperA.Transport, owner, owner.Transport, helperAChannel);
+        ulong helperBId = DoOrchestratorPair(helperB, helperB.Transport, owner, owner.Transport, helperBChannel);
         Console.WriteLine($"  helper pairs: A={helperAId}, B={helperBId}  ✓");
 
         // Replica pair: owner creates the contact, destination scans as
         // ReplicaDestination. Re-keys to a fresh channel id like every
         // other pair handshake.
         ulong destId = DoOrchestratorPair(
-            owner, ownerTx, destination, destTx, destChannel,
+            owner, owner.Transport, destination, destination.Transport, destChannel,
             initiatorKind: (int)Pairing.SenderKind.ReplicaDestination);
         Console.WriteLine($"  replica pair: destination channel={destId}  ✓");
 
+        // Replica channels start `Pending` after pair handshake
+        // completion. `ProtectSecret` must refuse to target a
+        // still-Pending channel because the fingerprint has not been
+        // verified out-of-band yet. Exercise the path before fingerprint
+        // confirmation to assert the gate fires.
+        try
+        {
+            owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+            {
+                SecretId = secretId.ToString(),
+                Target = Target.One(destId),
+                Secrets = new[]
+                {
+                    new UserSecret { Id = new byte[] { 0x01 }, Name = "premature", Data = secretData },
+                },
+                Description = "must reject — destination still Pending",
+            }).GetAwaiter().GetResult();
+            throw new InvalidOperationException(
+                "ProtectSecret targeting a still-Pending replica channel must fail");
+        }
+        catch (DeRecException e) when (e.Category == DeRecCategory.InvalidInput)
+        {
+            // expected
+        }
+        if (owner.Transport.Outbox.Count != 0)
+            throw new InvalidOperationException(
+                "no outbound traffic should have been queued by the rejected ProtectSecret");
+        Console.WriteLine("  ProtectSecret refuses still-Pending replica target  ✓");
+
         // Cross-confirm fingerprints — channels start `Pending` and
         // ProtectSecret refuses to target a Pending replica channel.
-        string ownerFp = owner.GetFingerprintAsync(destId).GetAwaiter().GetResult();
-        string destFp = destination.GetFingerprintAsync(destId).GetAwaiter().GetResult();
+        string ownerFp = owner.Protocol.GetFingerprintAsync(destId).GetAwaiter().GetResult();
+        string destFp = destination.Protocol.GetFingerprintAsync(destId).GetAwaiter().GetResult();
         if (ownerFp != destFp)
             throw new InvalidOperationException($"replica fingerprint mismatch: owner={ownerFp} dest={destFp}");
-        if (!owner.VerifyFingerprintAsync(destId, destFp).GetAwaiter().GetResult())
+        if (!owner.Protocol.VerifyFingerprintAsync(destId, destFp).GetAwaiter().GetResult())
             throw new InvalidOperationException("owner.VerifyFingerprint must return true");
-        if (!destination.VerifyFingerprintAsync(destId, ownerFp).GetAwaiter().GetResult())
+        if (!destination.Protocol.VerifyFingerprintAsync(destId, ownerFp).GetAwaiter().GetResult())
             throw new InvalidOperationException("destination.VerifyFingerprint must return true");
         Console.WriteLine($"  fingerprint cross-confirmed ({ownerFp.Length} chars)  ✓");
 
-        owner.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+        owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
         {
             SecretId = secretId.ToString(),
-            TargetValue = Target.Many(helperAId, helperBId, destId).ToJsonValue(),
+            Target = Target.Many(helperAId, helperBId, destId),
             Secrets = new[]
             {
                 new UserSecret { Id = new byte[] { 0x01 }, Name = "shared-vault", Data = secretData },
@@ -439,7 +463,7 @@ internal static class Protocol
             Description = "replica + helper distribution",
         }).GetAwaiter().GetResult();
 
-        var outbound = ownerTx.DrainAll();
+        var outbound = owner.Transport.DrainAll();
         if (outbound.Count != 3)
             throw new InvalidOperationException($"expected 3 outbound envelopes, got {outbound.Count}");
 
@@ -447,7 +471,7 @@ internal static class Protocol
             ?? throw new InvalidOperationException("no envelope routed to the destination");
         Console.WriteLine($"  ProtectSecret fanned out 3 envelopes (2 helpers + 1 destination)  ✓");
 
-        var destEvents = destination.ProcessAndAcceptAllAsync(destEnvelope).GetAwaiter().GetResult();
+        var destEvents = destination.Protocol.ProcessAndAcceptAllAsync(destEnvelope).GetAwaiter().GetResult();
         var received = destEvents.OfType<ReplicaVaultReceivedEvent>().FirstOrDefault()
             ?? throw new InvalidOperationException(
                 $"destination did not emit ReplicaVaultReceived; got [{string.Join(", ", destEvents.Select(e => e.EventType))}]");
@@ -475,6 +499,83 @@ internal static class Protocol
         Console.WriteLine(
             $"  ReplicaVaultReceived: vault={received.Vault.Secrets.Count}secret/{received.Vault.Helpers.Count}helpers/{received.Vault.Replicas.Count}replicas, shares={received.Shares.Count}  ✓");
 
+        // Drain the helper outboxes from the v=1 round so the next
+        // round's pump-and-drain sees only v=2 envelopes.
+        helperA.Transport.DrainAll();
+        helperB.Transport.DrainAll();
+
+        // Vault version updates: the owner mutates the secret and
+        // re-runs `ProtectSecret`. The destination must receive a fresh
+        // `ReplicaVaultReceived` carrying `version=2` and the new
+        // payload. The protocol pulls the next version from
+        // `IShareStore.LatestVersion()`; the in-memory store exposes a
+        // side-channel setter so this test can drive that contract
+        // without first running a full helper-side store / confirm
+        // cycle on the owner.
+        owner.ShareStore.SetOwnerVersion(1);
+        byte[] secretDataV2 = Encoding.UTF8.GetBytes("vault-payload-after-update");
+        owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+        {
+            SecretId = secretId.ToString(),
+            Target = Target.Many(helperAId, helperBId, destId),
+            Secrets = new[]
+            {
+                new UserSecret { Id = new byte[] { 0x01 }, Name = "shared-vault", Data = secretDataV2 },
+            },
+            Description = "v2 replica + helper distribution",
+        }).GetAwaiter().GetResult();
+
+        var outbound2 = owner.Transport.DrainAll();
+        if (outbound2.Count != 3)
+            throw new InvalidOperationException($"v2: expected 3 outbound envelopes, got {outbound2.Count}");
+        var destEnvelope2 = outbound2.FirstOrDefault(o => o.Uri == "https://replica-destination.example.com").Bytes
+            ?? throw new InvalidOperationException("v2: no envelope routed to the destination");
+
+        var destEvents2 = destination.Protocol.ProcessAndAcceptAllAsync(destEnvelope2).GetAwaiter().GetResult();
+        var received2 = destEvents2.OfType<ReplicaVaultReceivedEvent>().FirstOrDefault()
+            ?? throw new InvalidOperationException(
+                $"v2: destination did not emit ReplicaVaultReceived; got [{string.Join(", ", destEvents2.Select(e => e.EventType))}]");
+        if (received2.Version != 2u)
+            throw new InvalidOperationException($"v2: expected Version=2, got {received2.Version}");
+        if (received2.Vault.Secrets.Count != 1 || !received2.Vault.Secrets[0].Data.SequenceEqual(secretDataV2))
+            throw new InvalidOperationException("v2: vault.secrets[0].data must round-trip the updated bytes");
+        Console.WriteLine(
+            $"  ReplicaVaultReceived v=2: secret bytes updated, share count = {received2.Shares.Count}  ✓");
+
+        // Replica recovery transitivity: the Destination received
+        // `vault.helpers[*].shared_key` inside the vault. Those keys
+        // must be byte-identical to what each helper has stored locally
+        // for the owner channel, because a Destination acting as a
+        // recovery delegate uses them to authenticate as the Source
+        // toward each helper.
+        var helperAStored = helperA.SecretStore.Load(helperAId, SecretKind.SharedKey)!.Bytes;
+        var helperBStored = helperB.SecretStore.Load(helperBId, SecretKind.SharedKey)!.Bytes;
+        var vaultHelperA = received2.Vault.Helpers
+            .FirstOrDefault(h => ulong.Parse(h.ChannelId) == helperAId)
+            ?? throw new InvalidOperationException("vault.helpers missing entry for HelperA");
+        var vaultHelperB = received2.Vault.Helpers
+            .FirstOrDefault(h => ulong.Parse(h.ChannelId) == helperBId)
+            ?? throw new InvalidOperationException("vault.helpers missing entry for HelperB");
+        if (!helperAStored.SequenceEqual(vaultHelperA.SharedKey))
+            throw new InvalidOperationException(
+                "vault.helpers[HelperA].shared_key must match what HelperA stores locally");
+        if (!helperBStored.SequenceEqual(vaultHelperB.SharedKey))
+            throw new InvalidOperationException(
+                "vault.helpers[HelperB].shared_key must match what HelperB stores locally");
+        Console.WriteLine(
+            "  vault.helpers[*].shared_key matches each helper's stored key — destination can act in source's stead  ✓");
+
+        // The vault also carries `vault.secrets[*].data` unencrypted,
+        // so the Destination can fall back to its stored vault without
+        // contacting any helper. The recovery model is "any one of:
+        // helper quorum, vault on a single destination" — both paths
+        // recover the same secret bytes.
+        if (!received2.Vault.Secrets[0].Data.SequenceEqual(secretDataV2))
+            throw new InvalidOperationException(
+                "vault.secrets[0].data must be the raw recovered bytes");
+        Console.WriteLine(
+            "  vault.secrets[0].data is the raw recovered secret — destination-only recovery is viable  ✓");
+
         Console.WriteLine("Orchestrator replica pair + vault sync test passed.");
     }
 
@@ -494,24 +595,14 @@ internal static class Protocol
         // Helper (contact creator) advertises only the binding hash. The
         // transport MUST be ephemeral since the PrePair envelope crosses
         // the wire as plaintext.
-        var helperCs = new InMemoryChannelStore();
-        var helperSs = new InMemorySecretStore();
-        var helperTx = new RecordingTransport();
-        using var helper = new DeRecProtocol(
-            helperCs, new InMemoryShareStore(), helperSs, helperTx,
-            ownTransportUri: "https://helper.ephemeral.example.com");
+        using var helper = MakeNode("Helper", "https://helper.ephemeral.example.com");
 
-        var ownerCs = new InMemoryChannelStore();
-        var ownerSs = new InMemorySecretStore();
-        var ownerTx = new RecordingTransport();
-        using var owner = new DeRecProtocol(
-            ownerCs, new InMemoryShareStore(), ownerSs, ownerTx,
-            ownTransportUri: "https://owner.example.com");
+        using var owner = MakeNode("Owner", "https://owner.example.com");
 
-        byte[] contactBytes = helper.CreateContactAsync(channelId, ContactMode.HashedKeys)
+        byte[] contactBytes = helper.Protocol.CreateContactAsync(channelId, ContactMode.HashedKeys)
             .GetAwaiter().GetResult();
 
-        owner.StartAsync(FlowKind.Pairing, new PairingParams
+        owner.Protocol.StartAsync(FlowKind.Pairing, new PairingParams
         {
             Kind = (int)Pairing.SenderKind.Owner,
             Contact = contactBytes,
@@ -519,23 +610,23 @@ internal static class Protocol
 
         // Owner→Helper: plaintext PrePairRequest. Helper auto-publishes
         // its keys via processAll.
-        byte[] prePairRequest = ownerTx.DrainOne();
-        helper.ProcessAndAcceptAllAsync(prePairRequest).GetAwaiter().GetResult();
+        byte[] prePairRequest = owner.Transport.DrainOne();
+        helper.Protocol.ProcessAndAcceptAllAsync(prePairRequest).GetAwaiter().GetResult();
 
         // Helper→Owner: plaintext PrePairResponse. Owner validates the
         // binding hash silently and auto-emits a regular PairRequest.
-        byte[] prePairResponse = helperTx.DrainOne();
-        owner.ProcessAndAcceptAllAsync(prePairResponse).GetAwaiter().GetResult();
+        byte[] prePairResponse = helper.Transport.DrainOne();
+        owner.Protocol.ProcessAndAcceptAllAsync(prePairResponse).GetAwaiter().GetResult();
 
         // Owner→Helper: encrypted PairRequest. From here the chain is
         // identical to InlineKeys.
-        byte[] pairRequest = ownerTx.DrainOne();
-        var helperEvents = helper.ProcessAndAcceptAllAsync(pairRequest).GetAwaiter().GetResult();
+        byte[] pairRequest = owner.Transport.DrainOne();
+        var helperEvents = helper.Protocol.ProcessAndAcceptAllAsync(pairRequest).GetAwaiter().GetResult();
         var helperPairing = helperEvents.OfType<PairingCompletedEvent>().FirstOrDefault()
             ?? throw new InvalidOperationException("helper must emit PairingCompleted");
 
-        byte[] pairResponse = helperTx.DrainOne();
-        var ownerEvents = owner.ProcessAndAcceptAllAsync(pairResponse).GetAwaiter().GetResult();
+        byte[] pairResponse = helper.Transport.DrainOne();
+        var ownerEvents = owner.Protocol.ProcessAndAcceptAllAsync(pairResponse).GetAwaiter().GetResult();
         var ownerPairing = ownerEvents.OfType<PairingCompletedEvent>().FirstOrDefault()
             ?? throw new InvalidOperationException("owner must emit PairingCompleted");
 
@@ -543,9 +634,9 @@ internal static class Protocol
             throw new InvalidOperationException("HashedKeys pair: channel id mismatch on both sides");
 
         ulong rekeyedId = ulong.Parse(helperPairing.ChannelId);
-        var helperKey = helperSs.Load(rekeyedId, SecretKind.SharedKey)
+        var helperKey = helper.SecretStore.Load(rekeyedId, SecretKind.SharedKey)
             ?? throw new InvalidOperationException("helper shared_key missing after HashedKeys pair");
-        var ownerKey = ownerSs.Load(rekeyedId, SecretKind.SharedKey)
+        var ownerKey = owner.SecretStore.Load(rekeyedId, SecretKind.SharedKey)
             ?? throw new InvalidOperationException("owner shared_key missing after HashedKeys pair");
         if (!helperKey.Bytes.SequenceEqual(ownerKey.Bytes))
             throw new InvalidOperationException("shared keys must match after HashedKeys pair");
@@ -565,46 +656,36 @@ internal static class Protocol
 
         const ulong channelId = 7UL;
 
-        var helperCs = new InMemoryChannelStore();
-        var helperSs = new InMemorySecretStore();
-        var helperTx = new RecordingTransport();
-        using var helper = new DeRecProtocol(
-            helperCs, new InMemoryShareStore(), helperSs, helperTx,
-            ownTransportUri: "https://helper.example.com");
+        using var helper = MakeNode("Helper", "https://helper.example.com");
 
-        var ownerCs = new InMemoryChannelStore();
-        var ownerSs = new InMemorySecretStore();
-        var ownerTx = new RecordingTransport();
-        using var owner = new DeRecProtocol(
-            ownerCs, new InMemoryShareStore(), ownerSs, ownerTx,
-            ownTransportUri: "https://owner.example.com");
+        using var owner = MakeNode("Owner", "https://owner.example.com");
 
-        ulong rekeyedId = DoOrchestratorPair(helper, helperTx, owner, ownerTx, channelId);
+        ulong rekeyedId = DoOrchestratorPair(helper, helper.Transport, owner, owner.Transport, channelId);
 
-        owner.StartAsync(FlowKind.Unpair, new UnpairParams
+        owner.Protocol.StartAsync(FlowKind.Unpair, new UnpairParams
         {
-            TargetValue = Target.One(rekeyedId).ToJsonValue(),
+            Target = Target.One(rekeyedId),
             Memo = "decommissioning",
         }).GetAwaiter().GetResult();
 
-        byte[] unpairRequest = ownerTx.DrainOne();
-        var helperEvents = helper.ProcessAndAcceptAllAsync(unpairRequest).GetAwaiter().GetResult();
+        byte[] unpairRequest = owner.Transport.DrainOne();
+        var helperEvents = helper.Protocol.ProcessAndAcceptAllAsync(unpairRequest).GetAwaiter().GetResult();
         var helperUnpaired = helperEvents.OfType<UnpairedEvent>().FirstOrDefault()
             ?? throw new InvalidOperationException("helper must emit Unpaired");
         if (helperUnpaired.ChannelId != rekeyedId.ToString())
             throw new InvalidOperationException("Helper.Unpaired channel id mismatch");
 
-        byte[] unpairResponse = helperTx.DrainOne();
-        var ownerEvents = owner.ProcessAndAcceptAllAsync(unpairResponse).GetAwaiter().GetResult();
+        byte[] unpairResponse = helper.Transport.DrainOne();
+        var ownerEvents = owner.Protocol.ProcessAndAcceptAllAsync(unpairResponse).GetAwaiter().GetResult();
         var ownerUnpaired = ownerEvents.OfType<UnpairedEvent>().FirstOrDefault()
             ?? throw new InvalidOperationException("owner must emit Unpaired");
         if (ownerUnpaired.ChannelId != rekeyedId.ToString())
             throw new InvalidOperationException("Owner.Unpaired channel id mismatch");
 
         // Both sides have dropped their channel records.
-        if (helperCs.Load(rekeyedId) is not null)
+        if (helper.ChannelStore.Load(rekeyedId) is not null)
             throw new InvalidOperationException("helper channel record must be gone after Unpaired");
-        if (ownerCs.Load(rekeyedId) is not null)
+        if (owner.ChannelStore.Load(rekeyedId) is not null)
             throw new InvalidOperationException("owner channel record must be gone after Unpaired");
 
         Console.WriteLine($"  unpair channel_id={rekeyedId} → Unpaired on both sides + channel records dropped  ✓");
@@ -623,21 +704,11 @@ internal static class Protocol
 
         const ulong channelId = 42UL;
 
-        var helperCs = new InMemoryChannelStore();
-        var helperSs = new InMemorySecretStore();
-        var helperTx = new RecordingTransport();
-        using var helper = new DeRecProtocol(
-            helperCs, new InMemoryShareStore(), helperSs, helperTx,
-            ownTransportUri: "https://helper.example.com");
+        using var helper = MakeNode("Helper", "https://helper.example.com");
 
-        var ownerCs = new InMemoryChannelStore();
-        var ownerSs = new InMemorySecretStore();
-        var ownerTx = new RecordingTransport();
-        using var owner = new DeRecProtocol(
-            ownerCs, new InMemoryShareStore(), ownerSs, ownerTx,
-            ownTransportUri: "https://owner.OLD.example.com");
+        using var owner = MakeNode("Owner", "https://owner.OLD.example.com");
 
-        ulong rekeyedId = DoOrchestratorPair(helper, helperTx, owner, ownerTx, channelId);
+        ulong rekeyedId = DoOrchestratorPair(helper, helper.Transport, owner, owner.Transport, channelId);
 
         const string newUri = "https://owner.NEW.example.com";
         var newInfo = new Dictionary<string, string>
@@ -647,12 +718,12 @@ internal static class Protocol
         };
 
         // Mutate local state, then propagate.
-        owner.SetCommunicationInfo(newInfo);
-        owner.SetOwnTransport(newUri);
+        owner.Protocol.SetCommunicationInfo(newInfo);
+        owner.Protocol.SetOwnTransport(newUri);
 
-        owner.StartAsync(FlowKind.UpdateChannelInfo, new UpdateChannelInfoParams
+        owner.Protocol.StartAsync(FlowKind.UpdateChannelInfo, new UpdateChannelInfoParams
         {
-            TargetValue = Target.One(rekeyedId).ToJsonValue(),
+            Target = Target.One(rekeyedId),
             CommunicationInfo = newInfo,
             TransportProtocol = new UpdateChannelInfoParams.TransportProtocolDto
             {
@@ -661,8 +732,8 @@ internal static class Protocol
             },
         }).GetAwaiter().GetResult();
 
-        byte[] updateRequest = ownerTx.DrainOne();
-        var helperEvents = helper.ProcessAndAcceptAllAsync(updateRequest).GetAwaiter().GetResult();
+        byte[] updateRequest = owner.Transport.DrainOne();
+        var helperEvents = helper.Protocol.ProcessAndAcceptAllAsync(updateRequest).GetAwaiter().GetResult();
         var helperUpdated = helperEvents.OfType<ChannelInfoUpdatedEvent>().FirstOrDefault()
             ?? throw new InvalidOperationException(
                 $"helper must emit ChannelInfoUpdated; got [{string.Join(", ", helperEvents.Select(e => e.EventType))}]");
@@ -670,20 +741,27 @@ internal static class Protocol
             throw new InvalidOperationException("Helper.ChannelInfoUpdated channel id mismatch");
         Console.WriteLine($"  helper emits ChannelInfoUpdated  ✓");
 
-        byte[] updateResponse = helperTx.DrainOne();
-        var ownerEvents = owner.ProcessAndAcceptAllAsync(updateResponse).GetAwaiter().GetResult();
+        byte[] updateResponse = helper.Transport.DrainOne();
+        var ownerEvents = owner.Protocol.ProcessAndAcceptAllAsync(updateResponse).GetAwaiter().GetResult();
         var ownerUpdated = ownerEvents.OfType<ChannelInfoUpdatedEvent>().FirstOrDefault()
             ?? throw new InvalidOperationException(
                 $"owner must emit ChannelInfoUpdated; got [{string.Join(", ", ownerEvents.Select(e => e.EventType))}]");
         Console.WriteLine($"  owner emits ChannelInfoUpdated  ✓");
 
-        // Helper's stored channel must now mirror the new transport URI.
-        var helperChannel = helperCs.Load(rekeyedId)
+        // Helper's stored channel must now mirror the new transport
+        // URI and communication-info map.
+        var helperChannel = helper.ChannelStore.Load(rekeyedId)
             ?? throw new InvalidOperationException("helper channel record must still exist");
-        if (helperChannel.TransportUri != newUri)
+        if (helperChannel.Transport.Uri != newUri)
             throw new InvalidOperationException(
-                $"helper's stored TransportUri must reflect the announced update; got {helperChannel.TransportUri}");
-        Console.WriteLine($"  helper's stored TransportUri now {helperChannel.TransportUri}  ✓");
+                $"helper's stored Transport.Uri must reflect the announced update; got {helperChannel.Transport.Uri}");
+        foreach (var (k, v) in newInfo)
+        {
+            if (!helperChannel.CommunicationInfo.TryGetValue(k, out var stored) || stored != v)
+                throw new InvalidOperationException(
+                    $"helper's stored CommunicationInfo[{k}] must mirror the announced map; got {stored ?? "<null>"}");
+        }
+        Console.WriteLine("  helper's stored Transport.Uri + CommunicationInfo mirror the update  ✓");
 
         Console.WriteLine("Orchestrator UpdateChannelInfo flow test passed.");
     }
@@ -702,73 +780,53 @@ internal static class Protocol
         const string ownerUri = "https://owner-reply.example.com";
         const string helperUri = "https://helper-reply.example.com";
 
-        var helperCs = new InMemoryChannelStore();
-        var helperSs = new InMemorySecretStore();
-        var helperTx = new RecordingTransport();
-        using var helper = new DeRecProtocol(
-            helperCs, new InMemoryShareStore(), helperSs, helperTx,
-            ownTransportUri: helperUri);
+        using var helper = MakeNode("Helper", helperUri);
+        using var owner = MakeNode("Owner", ownerUri,
+            new NodeOptions { AutoReplyTo = true });
 
-        var ownerCs = new InMemoryChannelStore();
-        var ownerSs = new InMemorySecretStore();
-        var ownerTx = new RecordingTransport();
-        using var owner = new DeRecProtocol(
-            ownerCs, new InMemoryShareStore(), ownerSs, ownerTx,
-            ownTransportUri: ownerUri,
-            autoReplyTo: true);
-
-        ulong rekeyedId = DoOrchestratorPair(helper, helperTx, owner, ownerTx, channelId);
+        ulong rekeyedId = DoOrchestratorPair(helper, helper.Transport, owner, owner.Transport, channelId);
 
         // Trigger an outbound Discovery request. Encrypted body must
         // carry `replyTo = ownerUri`.
-        owner.StartAsync(FlowKind.Discovery, new DiscoveryParams
+        owner.Protocol.StartAsync(FlowKind.Discovery, new DiscoveryParams
         {
-            TargetValue = Target.One(rekeyedId).ToJsonValue(),
+            Target = Target.One(rekeyedId),
         }).GetAwaiter().GetResult();
 
-        var (outUri, _, outBytes) = ownerTx.DrainAll().Single();
+        var (outUri, _, outBytes) = owner.Transport.DrainAll().Single();
         if (outUri != helperUri)
             throw new InvalidOperationException(
                 $"outbound destination must be the channel's stored helper endpoint, got {outUri}");
 
-        // Sanity: a node WITHOUT autoReplyTo. The encrypted inner is
-        // identical apart from the reply_to TransportProtocol proto
-        // (uri string + protocol enum), so the size difference is a
-        // robust proxy for "replyTo was stamped". A field-level check
-        // would require the dotnet primitive surface to expose the
-        // decoded reply_to on Discovery.Request.ExtractResult — open
-        // gap tracked separately.
-        var helperCs2 = new InMemoryChannelStore();
-        var helperSs2 = new InMemorySecretStore();
-        var helperTx2 = new RecordingTransport();
-        using var helper2 = new DeRecProtocol(
-            helperCs2, new InMemoryShareStore(), helperSs2, helperTx2,
-            ownTransportUri: helperUri);
-        var ownerCs2 = new InMemoryChannelStore();
-        var ownerSs2 = new InMemorySecretStore();
-        var ownerTx2 = new RecordingTransport();
-        using var owner2 = new DeRecProtocol(
-            ownerCs2, new InMemoryShareStore(), ownerSs2, ownerTx2,
-            ownTransportUri: ownerUri); // no autoReplyTo
-
-        ulong rekeyedId2 = DoOrchestratorPair(helper2, helperTx2, owner2, ownerTx2, channelId);
-        owner2.StartAsync(FlowKind.Discovery, new DiscoveryParams
-        {
-            TargetValue = Target.One(rekeyedId2).ToJsonValue(),
-        }).GetAwaiter().GetResult();
-        var (_, _, defaultBytes) = ownerTx2.DrainAll().Single();
-
-        // The two envelopes target the same channel id and carry an
-        // otherwise-identical request body — the only payload diff is
-        // the optional reply_to proto. autoReplyTo must produce a
-        // strictly larger envelope.
-        if (outBytes.Length <= defaultBytes.Length)
-        {
+        // Field-level check: decrypt the envelope on the helper side and
+        // assert reply_to == ownerUri on the inner request. Mirrors the
+        // JS smoke (which inspects the same field).
+        byte[] sharedKey = helper.SecretStore.Load(rekeyedId, SecretKind.SharedKey)!.Bytes;
+        var extracted = Discovery.Request.Extract(
+            DeRecMessage.FromProtoBytes(outBytes), sharedKey);
+        if (extracted.ReplyTo is null || extracted.ReplyTo.Uri != ownerUri)
             throw new InvalidOperationException(
-                $"autoReplyTo envelope must be larger than the default (got {outBytes.Length}B vs {defaultBytes.Length}B)");
-        }
+                $"autoReplyTo envelope must stamp reply_to = ownerUri; got {extracted.ReplyTo?.Uri ?? "<null>"}");
+        Console.WriteLine($"  autoReplyTo envelope.reply_to = {extracted.ReplyTo.Uri}  ✓");
 
-        Console.WriteLine($"  autoReplyTo envelope: {outBytes.Length}B (default: {defaultBytes.Length}B, delta = +{outBytes.Length - defaultBytes.Length}B for reply_to TransportProtocol)  ✓");
+        // Sanity: a node WITHOUT autoReplyTo. The same field must be unset.
+        using var helper2 = MakeNode("Helper", helperUri);
+        using var owner2 = MakeNode("Owner", ownerUri); // no autoReplyTo
+
+        ulong rekeyedId2 = DoOrchestratorPair(helper2, helper2.Transport, owner2, owner2.Transport, channelId);
+        owner2.Protocol.StartAsync(FlowKind.Discovery, new DiscoveryParams
+        {
+            Target = Target.One(rekeyedId2),
+        }).GetAwaiter().GetResult();
+        var (_, _, defaultBytes) = owner2.Transport.DrainAll().Single();
+        byte[] sharedKey2 = helper2.SecretStore.Load(rekeyedId2, SecretKind.SharedKey)!.Bytes;
+        var extracted2 = Discovery.Request.Extract(
+            DeRecMessage.FromProtoBytes(defaultBytes), sharedKey2);
+        if (extracted2.ReplyTo is not null)
+            throw new InvalidOperationException(
+                $"default envelope must leave reply_to unset; got {extracted2.ReplyTo.Uri}");
+        Console.WriteLine("  default envelope.reply_to is unset  ✓");
+
         Console.WriteLine("Orchestrator replyTo flow test passed.");
     }
 
@@ -788,27 +846,17 @@ internal static class Protocol
 
         // -- Scenario A: initiator without replica_id refuses to scan
         //    a contact as ReplicaDestination.
-        var creatorCs = new InMemoryChannelStore();
-        var creatorSs = new InMemorySecretStore();
-        var creatorTx = new RecordingTransport();
-        using var contactCreator = new DeRecProtocol(
-            creatorCs, new InMemoryShareStore(), creatorSs, creatorTx,
-            ownTransportUri: "https://creator.example.com",
-            replicaId: configuredReplicaId);
-
-        var unconfiguredCs = new InMemoryChannelStore();
-        var unconfiguredSs = new InMemorySecretStore();
-        var unconfiguredTx = new RecordingTransport();
-        using var unconfiguredScanner = new DeRecProtocol(
-            unconfiguredCs, new InMemoryShareStore(), unconfiguredSs, unconfiguredTx,
-            ownTransportUri: "https://scanner.example.com");
+        using var contactCreator = MakeNode(
+            "ContactCreator", "https://creator.example.com",
+            new NodeOptions { ReplicaId = configuredReplicaId });
+        using var unconfiguredScanner = MakeNode("Scanner", "https://scanner.example.com");
         // NO replicaId on the scanner.
 
-        byte[] contact = contactCreator.CreateContactAsync(channelId, ContactMode.InlineKeys)
+        byte[] contact = contactCreator.Protocol.CreateContactAsync(channelId, ContactMode.InlineKeys)
             .GetAwaiter().GetResult();
         try
         {
-            unconfiguredScanner.StartAsync(FlowKind.Pairing, new PairingParams
+            unconfiguredScanner.Protocol.StartAsync(FlowKind.Pairing, new PairingParams
             {
                 Kind = (int)Pairing.SenderKind.ReplicaDestination,
                 Contact = contact,
@@ -820,40 +868,31 @@ internal static class Protocol
         {
             // expected
         }
-        if (unconfiguredTx.Outbox.Count != 0)
+        if (unconfiguredScanner.Transport.Outbox.Count != 0)
             throw new InvalidOperationException("no outbound traffic should have been queued");
         Console.WriteLine("  scanner without replica_id refuses to start replica pair  ✓");
 
         // -- Scenario B: configured initiator's PairRequest is refused
         //    by an unconfigured responder.
-        var unconfiguredCs2 = new InMemoryChannelStore();
-        var unconfiguredSs2 = new InMemorySecretStore();
-        var unconfiguredTx2 = new RecordingTransport();
-        using var unconfiguredCreator = new DeRecProtocol(
-            unconfiguredCs2, new InMemoryShareStore(), unconfiguredSs2, unconfiguredTx2,
-            ownTransportUri: "https://creator2.example.com");
+        using var unconfiguredCreator = MakeNode("Creator", "https://creator2.example.com");
         // NO replicaId.
 
-        var configuredCs2 = new InMemoryChannelStore();
-        var configuredSs2 = new InMemorySecretStore();
-        var configuredTx2 = new RecordingTransport();
-        using var configuredScanner = new DeRecProtocol(
-            configuredCs2, new InMemoryShareStore(), configuredSs2, configuredTx2,
-            ownTransportUri: "https://scanner2.example.com",
-            replicaId: configuredReplicaId);
+        using var configuredScanner = MakeNode(
+            "Scanner", "https://scanner2.example.com",
+            new NodeOptions { ReplicaId = configuredReplicaId });
 
-        byte[] contact2 = unconfiguredCreator.CreateContactAsync(channelId + 1, ContactMode.InlineKeys)
+        byte[] contact2 = unconfiguredCreator.Protocol.CreateContactAsync(channelId + 1, ContactMode.InlineKeys)
             .GetAwaiter().GetResult();
-        configuredScanner.StartAsync(FlowKind.Pairing, new PairingParams
+        configuredScanner.Protocol.StartAsync(FlowKind.Pairing, new PairingParams
         {
             Kind = (int)Pairing.SenderKind.ReplicaDestination,
             Contact = contact2,
         }).GetAwaiter().GetResult();
 
-        byte[] pairRequest = configuredTx2.DrainOne();
+        byte[] pairRequest = configuredScanner.Transport.DrainOne();
         try
         {
-            unconfiguredCreator.ProcessAndAcceptAllAsync(pairRequest).GetAwaiter().GetResult();
+            unconfiguredCreator.Protocol.ProcessAndAcceptAllAsync(pairRequest).GetAwaiter().GetResult();
             throw new InvalidOperationException(
                 "unconfigured responder must refuse a replica-mode PairRequest");
         }
@@ -874,24 +913,24 @@ internal static class Protocol
     /// Mirrors the JS smoke's <c>doPair</c> helper.
     /// </summary>
     private static ulong DoOrchestratorPair(
-        DeRecProtocol contactCreator, RecordingTransport contactCreatorTx,
-        DeRecProtocol initiator, RecordingTransport initiatorTx,
+        Node contactCreator, RecordingTransport contactCreatorTx,
+        Node initiator, RecordingTransport initiatorTx,
         ulong channelId, int initiatorKind = (int)Pairing.SenderKind.Owner)
     {
-        byte[] contact = contactCreator.CreateContactAsync(channelId, ContactMode.InlineKeys)
+        byte[] contact = contactCreator.Protocol.CreateContactAsync(channelId, ContactMode.InlineKeys)
             .GetAwaiter().GetResult();
-        initiator.StartAsync(FlowKind.Pairing, new PairingParams
+        initiator.Protocol.StartAsync(FlowKind.Pairing, new PairingParams
         {
             Kind = initiatorKind,
             Contact = contact,
         }).GetAwaiter().GetResult();
         byte[] pairRequest = initiatorTx.DrainOne();
-        var creatorEvents = contactCreator.ProcessAndAcceptAllAsync(pairRequest)
+        var creatorEvents = contactCreator.Protocol.ProcessAndAcceptAllAsync(pairRequest)
             .GetAwaiter().GetResult();
         var creatorPairing = creatorEvents.OfType<PairingCompletedEvent>().FirstOrDefault()
             ?? throw new InvalidOperationException("contact creator must emit PairingCompleted");
         byte[] pairResponse = contactCreatorTx.DrainOne();
-        var initEvents = initiator.ProcessAndAcceptAllAsync(pairResponse)
+        var initEvents = initiator.Protocol.ProcessAndAcceptAllAsync(pairResponse)
             .GetAwaiter().GetResult();
         var initPairing = initEvents.OfType<PairingCompletedEvent>().FirstOrDefault()
             ?? throw new InvalidOperationException("initiator must emit PairingCompleted");
@@ -905,12 +944,12 @@ internal static class Protocol
     /// <paramref name="to"/>'s ProcessAndAcceptAll, returning every event
     /// the receiver emits across all messages.
     /// </summary>
-    private static List<DeRecEvent> PumpAll(RecordingTransport from, DeRecProtocol to)
+    private static List<DeRecEvent> PumpAll(RecordingTransport from, Node to)
     {
         var all = new List<DeRecEvent>();
         foreach (var (_, _, bytes) in from.DrainAll())
         {
-            all.AddRange(to.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult());
+            all.AddRange(to.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult());
         }
         return all;
     }
@@ -932,5 +971,67 @@ internal static class Protocol
             if (match) return i;
         }
         return -1;
+    }
+
+    /// <summary>
+    /// In-memory peer composed of fresh stores + a recording transport
+    /// + the <see cref="DeRecProtocol"/> built on top. Mirrors the
+    /// <c>Node</c> wrapper in <c>bindings/nodejs/protocol.ts</c>. Use
+    /// <see cref="MakeNode"/> to construct one.
+    /// </summary>
+    private sealed record Node(
+        DeRecProtocol Protocol,
+        RecordingTransport Transport,
+        InMemoryChannelStore ChannelStore,
+        InMemoryShareStore ShareStore,
+        InMemorySecretStore SecretStore) : IDisposable
+    {
+        public void Dispose() => Protocol.Dispose();
+    }
+
+    /// <summary>
+    /// Options threaded into <see cref="MakeNode"/>. All members are
+    /// optional. Mirrors the <c>options</c> parameter on the JS
+    /// <c>makeNode</c> helper.
+    /// </summary>
+    private sealed record NodeOptions(
+        bool? AutoReplyTo = null,
+        ulong? ReplicaId = null,
+        int? Threshold = null);
+
+    private const int DefaultThreshold = 2;
+
+    /// <summary>
+    /// Construct a fresh node bound to <paramref name="endpointUri"/>.
+    /// <paramref name="name"/> is stored under <c>"name"</c> on the
+    /// communication-info map so peers can see it. Mirrors the JS
+    /// <c>makeNode(name, uri, options)</c> helper 1:1.
+    /// </summary>
+    private static Node MakeNode(
+        string name,
+        string endpointUri,
+        NodeOptions? options = null)
+    {
+        options ??= new NodeOptions();
+
+        var channelStore = new InMemoryChannelStore();
+        var shareStore = new InMemoryShareStore();
+        var secretStore = new InMemorySecretStore();
+        var transport = new RecordingTransport();
+
+        var builder = new DeRecProtocolBuilder()
+            .WithChannelStore(channelStore)
+            .WithShareStore(shareStore)
+            .WithSecretStore(secretStore)
+            .WithTransport(transport)
+            .WithOwnTransport(new TransportProtocol(endpointUri))
+            .WithCommunicationInfo(new Dictionary<string, string> { ["name"] = name })
+            .WithThreshold(options.Threshold ?? DefaultThreshold);
+        if (options.AutoReplyTo is bool autoReplyTo)
+            builder = builder.WithAutoReplyTo(autoReplyTo);
+        if (options.ReplicaId is ulong replicaId)
+            builder = builder.WithReplicaId(replicaId);
+
+        return new Node(builder.Build(), transport, channelStore, shareStore, secretStore);
     }
 }

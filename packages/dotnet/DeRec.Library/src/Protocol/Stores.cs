@@ -8,18 +8,45 @@ using DeRec.Library.Primitives;
 namespace DeRec.Library.Orchestrator;
 
 /// <summary>
-/// Post-pairing peer record persisted in <see cref="IChannelStore"/>.
-/// Wire shape matches the JSON-on-the-FFI <c>ChannelRecord</c> consumed
-/// by the Rust orchestrator.
+/// Lifecycle status of a paired channel.
 /// </summary>
+/// <remarks>
+/// Replica channels start as <see cref="Pending"/> after pairing and
+/// transition to <see cref="Paired"/> once fingerprint verification
+/// succeeds. Helper / Owner channels are <see cref="Paired"/>
+/// immediately after pairing. Names match the Rust-side
+/// <c>ChannelStatus</c> variants verbatim — the bridge round-trips
+/// them as strings on the FFI boundary.
+/// </remarks>
+public enum ChannelStatus
+{
+    Pending,
+    Paired,
+}
+
+/// <summary>
+/// Post-pairing peer record persisted in <see cref="IChannelStore"/>.
+/// </summary>
+/// <remarks>
+/// Mirrors the Rust-side <c>crate::protocol::types::Channel</c> shape
+/// 1:1. The FFI bridge translates between this typed form and the
+/// snake_case JSON wire format internally; consumers only ever see
+/// the strongly-typed values.
+/// </remarks>
+/// <param name="Id">Channel identifier; opaque on this side.</param>
+/// <param name="Transport">The peer's transport endpoint.</param>
+/// <param name="CommunicationInfo">App-level identity metadata for the peer.</param>
+/// <param name="Status">Lifecycle state (<see cref="ChannelStatus"/>).</param>
+/// <param name="CreatedAt">Unix timestamp (seconds) when the channel was created.</param>
+/// <param name="Role">This node's role on the channel, fixed at pairing time.</param>
+/// <param name="ReplicaId">Peer's replica identity (only set for replica roles).</param>
 public sealed record Channel(
-    ulong ChannelId,
-    string TransportUri,
-    int TransportProtocol,
+    ulong Id,
+    TransportProtocol Transport,
     Dictionary<string, string> CommunicationInfo,
-    string Status,
+    ChannelStatus Status,
     ulong CreatedAt,
-    int Role,
+    Pairing.SenderKind Role,
     ulong? ReplicaId);
 
 /// <summary>
@@ -108,7 +135,9 @@ public interface IShareStore
 }
 
 /// <summary>
-/// Outbound message delivery. Stubbed for chunk 7a — wired up in 7b.
+/// Outbound message delivery — the protocol hands the application
+/// the encoded envelope bytes plus the destination endpoint and the
+/// application is responsible for shipping them over the wire.
 /// </summary>
 public interface ITransport
 {
@@ -127,7 +156,7 @@ public sealed class InMemoryChannelStore : IChannelStore
     public Channel? Load(ulong channelId) =>
         _channels.TryGetValue(channelId, out var c) ? c : null;
 
-    public void Save(Channel channel) => _channels[channel.ChannelId] = channel;
+    public void Save(Channel channel) => _channels[channel.Id] = channel;
 
     public bool Remove(ulong channelId) => _channels.Remove(channelId);
 

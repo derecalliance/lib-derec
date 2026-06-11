@@ -8,7 +8,7 @@
 // share store, recording transport), but are Map-backed instead of
 // localStorage-backed.
 
-import { ContactMode, DeRecProtocol, FlowKind, SenderKind, primitives } from "@derec-alliance/web";
+import { ContactMode, DeRecProtocol, DeRecProtocolBuilder, FlowKind, SenderKind, primitives } from "@derec-alliance/web";
 import type {
   ChannelStore,
   ContactMessage,
@@ -257,22 +257,22 @@ function makeNode(
   const shareStore = new InMemoryShareStore();
   const secretStore = new InMemorySecretStore();
   const transport = new RecordingTransport();
-  const protocol = new DeRecProtocol(
-    channelStore,
-    shareStore,
-    secretStore,
-    transport,
-    endpointUri,
-    "https",
-    THRESHOLD,
-    KEEP_VERSIONS_COUNT,
-    { name },
-    null, // timeoutInSecs
-    null, // autoRespondOnFailure
-    null, // unpairAck
-    options.autoReplyTo ?? null,
-    options.replicaId ?? null,
-  );
+  let builder = new DeRecProtocolBuilder()
+    .withChannelStore(channelStore)
+    .withShareStore(shareStore)
+    .withSecretStore(secretStore)
+    .withTransport(transport)
+    .withOwnTransport({ uri: endpointUri, protocol: "https" })
+    .withThreshold(THRESHOLD)
+    .withKeepVersionsCount(KEEP_VERSIONS_COUNT)
+    .withCommunicationInfo({ name });
+  if (options.autoReplyTo !== undefined) {
+    builder = builder.withAutoReplyTo(options.autoReplyTo);
+  }
+  if (options.replicaId !== undefined) {
+    builder = builder.withReplicaId(options.replicaId);
+  }
+  const protocol = builder.build();
   return { protocol, transport, channelStore, shareStore, secretStore };
 }
 

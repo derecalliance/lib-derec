@@ -12,7 +12,8 @@ use crate::{
         request,
         response::{self, SecretVersionEntry, VersionEntry},
     },
-    types::{ChannelId, SharedKey, Target},
+    protocol::types::Target,
+    types::{ChannelId, SharedKey},
 };
 use derec_proto::{
     DeRecResult, GetSecretIdsVersionsRequestMessage, GetSecretIdsVersionsResponseMessage,
@@ -122,7 +123,6 @@ pub(in crate::protocol) async fn accept<
 
     // Group by secret_id across all linked channels, deduplicating by version.
     // Key: secret_id (u64) → version → description.
-    // TODO: evaluate using a HashMap<(secret_id, version), String>
     let mut secret_map: std::collections::HashMap<u64, std::collections::BTreeMap<u32, String>> =
         std::collections::HashMap::new();
 

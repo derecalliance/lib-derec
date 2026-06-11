@@ -6,9 +6,14 @@
 //! the foreign caller.
 //!
 //! The wire format for complex types (Channel, Share, SecretValue) is
-//! JSON — same shape as the WASM bridge's `ChannelRecord` / `ShareRecord`
-//! so the C# side can deserialize with `System.Text.Json` against a
-//! single shared schema.
+//! JSON. `Channel` rides serde directly — its derives produce a stable
+//! shape with a top-level `id` (decimal-serialized u64), a nested
+//! `transport: { uri, protocol }` object, and variant-name strings for
+//! `status` and `role`. `Share` and `SecretValue` keep dedicated record
+//! wrappers because their on-wire shapes differ from their in-memory
+//! ones (e.g. `secret_id` is stringified for JS interop). The same
+//! schema is consumed by the WASM bridge so a single C# / TS
+//! deserializer covers both.
 
 use std::os::raw::c_void;
 
@@ -37,75 +42,48 @@ impl std::error::Error for CallbackError {}
 fn boxed_err(msg: String) -> Box<dyn std::error::Error + Send + Sync + 'static> {
     Box::new(CallbackError(msg))
 }
-use crate::types::{Channel, ChannelId, ChannelStatus};
+
+/// Drives a load-style C callback that writes its result to
+/// `(*out_ptr, *out_len)` and returns a status code, then copies the
+/// bytes into a Rust `Vec` and releases the caller's buffer via
+/// `free_buffer`. Return-code convention is the one documented on
+/// every load callback in this module: `0` = success, `1` = not found,
+/// anything else = backend failure. `label` is the store kind name
+/// (e.g. `"channel store"`) used to disambiguate the error message.
+fn fetch_callback_bytes(
+    user_data: *mut c_void,
+    free_buffer: extern "C" fn(user_data: *mut c_void, ptr: *mut u8, len: usize),
+    label: &str,
+    f: impl FnOnce(*mut *mut u8, *mut usize) -> i32,
+) -> Result<Option<Vec<u8>>, String> {
+    let mut ptr: *mut u8 = std::ptr::null_mut();
+    let mut len: usize = 0;
+    let rc = f(&mut ptr as *mut _, &mut len as *mut _);
+    if rc == 0 {
+        if ptr.is_null() || len == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len).to_vec() };
+        free_buffer(user_data, ptr, len);
+        Ok(Some(bytes))
+    } else if rc == 1 {
+        if !ptr.is_null() && len != 0 {
+            free_buffer(user_data, ptr, len);
+        }
+        Ok(None)
+    } else {
+        if !ptr.is_null() && len != 0 {
+            free_buffer(user_data, ptr, len);
+        }
+        Err(format!("{label} callback failed (rc={rc})"))
+    }
+}
+use crate::protocol::types::Channel;
+use crate::types::ChannelId;
 use derec_proto::TransportProtocol;
 
-/// JSON-on-the-wire shape of a [`Channel`] — mirrors the WASM
-/// `ChannelRecord` so persisted channels round-trip across both SDKs.
-#[derive(serde::Serialize, serde::Deserialize)]
-pub(crate) struct ChannelRecord {
-    pub channel_id: u64,
-    pub transport_uri: String,
-    pub transport_protocol: i32,
-    #[serde(default)]
-    pub communication_info: std::collections::HashMap<String, String>,
-    #[serde(default = "default_channel_status")]
-    pub status: String,
-    #[serde(default)]
-    pub created_at: u64,
-    #[serde(default)]
-    pub role: i32,
-    #[serde(default)]
-    pub replica_id: Option<u64>,
-}
-
-fn default_channel_status() -> String {
-    "paired".to_owned()
-}
-
-impl From<&Channel> for ChannelRecord {
-    fn from(ch: &Channel) -> Self {
-        Self {
-            channel_id: ch.id.0,
-            transport_uri: ch.transport.uri.to_owned(),
-            transport_protocol: ch.transport.protocol,
-            communication_info: ch.communication_info.clone(),
-            status: match ch.status {
-                ChannelStatus::Pending => "pending".to_owned(),
-                ChannelStatus::Paired => "paired".to_owned(),
-            },
-            created_at: ch.created_at,
-            role: ch.role as i32,
-            replica_id: ch.replica_id,
-        }
-    }
-}
-
-impl From<ChannelRecord> for Channel {
-    fn from(rec: ChannelRecord) -> Self {
-        let role = derec_proto::SenderKind::try_from(rec.role)
-            .unwrap_or(derec_proto::SenderKind::Owner);
-        let status = match rec.status.as_str() {
-            "pending" => ChannelStatus::Pending,
-            _ => ChannelStatus::Paired,
-        };
-        Self {
-            id: ChannelId(rec.channel_id),
-            transport: TransportProtocol {
-                uri: rec.transport_uri,
-                protocol: rec.transport_protocol,
-            },
-            communication_info: rec.communication_info,
-            status,
-            created_at: rec.created_at,
-            role,
-            replica_id: rec.replica_id,
-        }
-    }
-}
-
-/// JSON-on-the-wire shape of a [`Share`]. Unused in chunk 7a — wired
-/// up by [`DotnetShareStore`] in chunk 7b.
+/// JSON-on-the-wire shape of a [`Share`] consumed by
+/// [`DotnetShareStore`].
 #[allow(dead_code)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct ShareRecord {
@@ -213,8 +191,6 @@ fn secret_kind_to_u32(kind: SecretKind) -> u32 {
     }
 }
 
-// ─── Callback function signatures ────────────────────────────────────
-
 /// Caller-supplied callbacks for channel persistence.
 ///
 /// All function pointers are invoked synchronously from the protocol's
@@ -232,7 +208,7 @@ fn secret_kind_to_u32(kind: SecretKind) -> u32 {
 pub struct ChannelStoreCallbacks {
     pub user_data: *mut c_void,
     /// Load the channel for `channel_id`. On success writes the
-    /// JSON-encoded [`ChannelRecord`] bytes to `*out_ptr` / `*out_len`
+    /// JSON-encoded [`Channel`] bytes to `*out_ptr` / `*out_len`
     /// and returns 0. Return 1 with `*out_ptr = null` / `*out_len = 0`
     /// for "not found". Any other return code is a backend error.
     pub load: extern "C" fn(
@@ -241,7 +217,7 @@ pub struct ChannelStoreCallbacks {
         out_ptr: *mut *mut u8,
         out_len: *mut usize,
     ) -> i32,
-    /// Persist `bytes` (a JSON-encoded [`ChannelRecord`]) under
+    /// Persist `bytes` (a JSON-encoded [`Channel`]) under
     /// `channel_id`. Returns 0 on success.
     pub save: extern "C" fn(
         user_data: *mut c_void,
@@ -368,7 +344,7 @@ pub struct ShareStoreCallbacks {
     pub free_buffer: extern "C" fn(user_data: *mut c_void, ptr: *mut u8, len: usize),
 }
 
-/// Caller-supplied transport callback. Filled in in chunk 7b.
+/// Caller-supplied transport callback.
 #[repr(C)]
 pub struct TransportCallbacks {
     pub user_data: *mut c_void,
@@ -381,8 +357,6 @@ pub struct TransportCallbacks {
         len: usize,
     ) -> i32,
 }
-
-// ─── Trait adapters ──────────────────────────────────────────────────
 
 pub struct DotnetChannelStore {
     pub(crate) cb: ChannelStoreCallbacks,
@@ -398,29 +372,7 @@ impl DotnetChannelStore {
         &self,
         f: impl FnOnce(*mut *mut u8, *mut usize) -> i32,
     ) -> Result<Option<Vec<u8>>, String> {
-        let mut ptr: *mut u8 = std::ptr::null_mut();
-        let mut len: usize = 0;
-        let rc = f(&mut ptr as *mut _, &mut len as *mut _);
-        if rc == 0 {
-            if ptr.is_null() || len == 0 {
-                Ok(Some(Vec::new()))
-            } else {
-                let bytes = unsafe { std::slice::from_raw_parts(ptr, len).to_vec() };
-                (self.cb.free_buffer)(self.cb.user_data, ptr, len);
-                Ok(Some(bytes))
-            }
-        } else if rc == 1 {
-            // Not-found contract: ignore any returned buffer, just in case.
-            if !ptr.is_null() && len != 0 {
-                (self.cb.free_buffer)(self.cb.user_data, ptr, len);
-            }
-            Ok(None)
-        } else {
-            if !ptr.is_null() && len != 0 {
-                (self.cb.free_buffer)(self.cb.user_data, ptr, len);
-            }
-            Err(format!("channel store callback failed (rc={rc})"))
-        }
+        fetch_callback_bytes(self.cb.user_data, self.cb.free_buffer, "channel store", f)
     }
 }
 
@@ -435,24 +387,23 @@ impl DeRecChannelStore for DotnetChannelStore {
                 Ok(None) => Ok(None),
                 Ok(Some(bytes)) if bytes.is_empty() => Ok(None),
                 Ok(Some(bytes)) => {
-                    let record: ChannelRecord = serde_json::from_slice(&bytes)
+                    let channel: Channel = serde_json::from_slice(&bytes)
                         .map_err(|e| {
                             ChannelStoreError::Backend(
                                 format!("invalid Channel JSON: {e}").into(),
                             )
                         })?;
-                    Ok(Some(record.into()))
+                    Ok(Some(channel))
                 }
             }
         })
     }
 
     fn save(&mut self, channel: Channel) -> ChannelStoreFuture<'_, ()> {
-        let record = ChannelRecord::from(&channel);
         let channel_id = channel.id.0;
         let cb = &self.cb;
         let res = (|| -> Result<(), ChannelStoreError> {
-            let bytes = serde_json::to_vec(&record).map_err(|e| {
+            let bytes = serde_json::to_vec(&channel).map_err(|e| {
                 ChannelStoreError::Backend(format!("Channel JSON: {e}").into())
             })?;
             let rc = (cb.save)(cb.user_data, channel_id, bytes.as_ptr(), bytes.len());
@@ -482,9 +433,9 @@ impl DeRecChannelStore for DotnetChannelStore {
     }
 
     fn channels(&self) -> ChannelStoreFuture<'_, Vec<Channel>> {
-        // For chunk 7a only the load path is exercised; we still need a
-        // functional `channels()` so the protocol can build. Implement
-        // it via `list_channels` + per-id load.
+        // The FFI surface exposes `list_channels` and a per-id `load`,
+        // so the trait's `channels()` materializes by enumerating the
+        // ids and loading each record.
         let list_bytes_res = self.fetch_bytes(|p, l| {
             (self.cb.list_channels)(self.cb.user_data, p, l)
         });
@@ -521,10 +472,10 @@ impl DeRecChannelStore for DotnetChannelStore {
                 }
                 let bytes = unsafe { std::slice::from_raw_parts(ptr, len).to_vec() };
                 (cb.free_buffer)(cb.user_data, ptr, len);
-                let record: ChannelRecord = serde_json::from_slice(&bytes).map_err(|e| {
+                let channel: Channel = serde_json::from_slice(&bytes).map_err(|e| {
                     ChannelStoreError::Backend(format!("Channel JSON: {e}").into())
                 })?;
-                out.push(record.into());
+                out.push(channel);
             }
             Ok(out)
         })();
@@ -583,27 +534,7 @@ impl DotnetSecretStore {
         &self,
         f: impl FnOnce(*mut *mut u8, *mut usize) -> i32,
     ) -> Result<Option<Vec<u8>>, String> {
-        let mut ptr: *mut u8 = std::ptr::null_mut();
-        let mut len: usize = 0;
-        let rc = f(&mut ptr as *mut _, &mut len as *mut _);
-        if rc == 0 {
-            if ptr.is_null() || len == 0 {
-                return Ok(Some(Vec::new()));
-            }
-            let bytes = unsafe { std::slice::from_raw_parts(ptr, len).to_vec() };
-            (self.cb.free_buffer)(self.cb.user_data, ptr, len);
-            Ok(Some(bytes))
-        } else if rc == 1 {
-            if !ptr.is_null() && len != 0 {
-                (self.cb.free_buffer)(self.cb.user_data, ptr, len);
-            }
-            Ok(None)
-        } else {
-            if !ptr.is_null() && len != 0 {
-                (self.cb.free_buffer)(self.cb.user_data, ptr, len);
-            }
-            Err(format!("secret store callback failed (rc={rc})"))
-        }
+        fetch_callback_bytes(self.cb.user_data, self.cb.free_buffer, "secret store", f)
     }
 }
 
@@ -782,27 +713,7 @@ impl DotnetShareStore {
         &self,
         f: impl FnOnce(*mut *mut u8, *mut usize) -> i32,
     ) -> Result<Option<Vec<u8>>, String> {
-        let mut ptr: *mut u8 = std::ptr::null_mut();
-        let mut len: usize = 0;
-        let rc = f(&mut ptr as *mut _, &mut len as *mut _);
-        if rc == 0 {
-            if ptr.is_null() || len == 0 {
-                return Ok(Some(Vec::new()));
-            }
-            let bytes = unsafe { std::slice::from_raw_parts(ptr, len).to_vec() };
-            (self.cb.free_buffer)(self.cb.user_data, ptr, len);
-            Ok(Some(bytes))
-        } else if rc == 1 {
-            if !ptr.is_null() && len != 0 {
-                (self.cb.free_buffer)(self.cb.user_data, ptr, len);
-            }
-            Ok(None)
-        } else {
-            if !ptr.is_null() && len != 0 {
-                (self.cb.free_buffer)(self.cb.user_data, ptr, len);
-            }
-            Err(format!("share store callback failed (rc={rc})"))
-        }
+        fetch_callback_bytes(self.cb.user_data, self.cb.free_buffer, "share store", f)
     }
 }
 
@@ -925,9 +836,8 @@ impl DeRecShareStore for DotnetShareStore {
     }
 }
 
-/// Stub transport for chunk 7a — `send` is implemented (so basic
-/// flows that emit outbound messages don't crash), but the foreign
-/// callback is invoked directly with no buffering.
+/// Transport adapter for the FFI bridge — `send` invokes the
+/// foreign callback directly with no buffering.
 pub struct DotnetTransport {
     pub(crate) cb: TransportCallbacks,
 }

@@ -39,3 +39,54 @@ pub fn decode_replica_id(s: &str) -> Result<u64> {
         Error::InvalidInput("CommunicationInfo `derec.replica_id` is not valid hex u64")
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_replica_id_is_unpadded_lowercase_hex() {
+        assert_eq!(encode_replica_id(0xcafe), "cafe");
+        assert_eq!(encode_replica_id(0), "0");
+        assert_eq!(encode_replica_id(u64::MAX), "ffffffffffffffff");
+    }
+
+    /// 5.6 — A peer that pads the hex string before sending (e.g.
+    /// `"00000000cafe"`) must still decode to the same `u64` as the
+    /// unpadded form. `encode_replica_id` does not pad; `decode_replica_id`
+    /// is lenient, and this invariant has to hold so two peers using
+    /// different conventions interoperate.
+    #[test]
+    fn decode_replica_id_accepts_padded_input() {
+        let id = 0xcafe_u64;
+        // Round-trip the canonical encoder.
+        assert_eq!(decode_replica_id(&encode_replica_id(id)).unwrap(), id);
+        // A peer that pads with leading zeros must still decode cleanly.
+        for padded in ["00cafe", "0000cafe", "00000000cafe", "000000000000cafe"] {
+            assert_eq!(
+                decode_replica_id(padded).unwrap(),
+                id,
+                "padded input {padded:?} must decode to the same id",
+            );
+        }
+        // u64::MAX padded to 16 hex chars stays u64::MAX.
+        assert_eq!(decode_replica_id("ffffffffffffffff").unwrap(), u64::MAX);
+        // Zero in either form.
+        assert_eq!(decode_replica_id("0").unwrap(), 0);
+        assert_eq!(decode_replica_id("0000000000000000").unwrap(), 0);
+    }
+
+    #[test]
+    fn decode_replica_id_rejects_invalid_input() {
+        // Out of u64 range — 17 chars of 'f' is one bit past u64::MAX.
+        assert!(decode_replica_id("fffffffffffffffff").is_err());
+        // Non-hex characters.
+        assert!(decode_replica_id("g").is_err());
+        assert!(decode_replica_id("0x123").is_err());
+        // Whitespace explicitly not tolerated per the docs.
+        assert!(decode_replica_id(" cafe").is_err());
+        assert!(decode_replica_id("cafe ").is_err());
+        // Empty string.
+        assert!(decode_replica_id("").is_err());
+    }
+}

@@ -23,7 +23,8 @@ use derec_library::protocol::{
     SecretKind, SecretStoreError, SecretStoreFuture, SecretValue, Share, ShareStoreFuture,
     TransportFuture,
 };
-use derec_library::types::{Channel, ChannelId, Target, UserSecret};
+use derec_library::protocol::types::{Channel, Target, UserSecret};
+use derec_library::types::ChannelId;
 use derec_proto::{Protocol, SenderKind, TransportProtocol};
 
 pub fn run_all() {
@@ -763,7 +764,7 @@ async fn run_hashed_keys_pairing_flow() {
 }
 
 
-/// Exercises the `derec.replica_id` wiring added in #53. Three scenarios:
+/// Exercises the `derec.replica_id` wiring. Three scenarios:
 ///
 /// 1. **Happy path**: two replica-configured peers complete a replica-mode
 ///    pairing; both sides' `Channel.replica_id` carries the *peer*'s id (the
@@ -967,15 +968,11 @@ async fn run_replica_id_wiring_flow() {
 }
 
 
-/// Exercises #67: `ProtectSecret` with a mixed target set of helpers and
+/// Exercises `ProtectSecret` with a mixed target set of helpers and
 /// replicas. Asserts that each replica target receives one
 /// `StoreShareRequest` carrying the **full vault payload** (tagged with
 /// `share_algorithm = SHARE_ALGORITHM_REPLICA_VAULT = 1`), distinct from
 /// the per-helper VSS share fragments.
-///
-/// Receiver-side dispatch (turning the inbound replica StoreShareRequest
-/// into a `ReplicaVaultReceived` event instead of running the helper
-/// path) lands in #59. This test asserts only the sender side.
 async fn run_protect_secret_with_replica_targets_flow() {
     println!("=== Protocol ProtectSecret(replica targets) flow ===");
 
@@ -1195,11 +1192,11 @@ async fn run_protect_secret_with_replica_targets_flow() {
     println!("  helper-initiated ProtectSecret: RoleMismatch ✓");
 
 
-    // 10. End-to-end (#59 receiver side): feed the replica envelope into
-    //     the replica peer's process(). It should auto-ack and emit a
+    // 10. End-to-end receiver side: feed the replica envelope into the
+    //     replica peer's process(). It should auto-ack and emit a
     //     ReplicaVaultReceived event. Owner then processes the ack and
     //     emits ReplicaVaultAcked.
-    println!("  -- #59: receiver-side replica dispatch --");
+    println!("  -- receiver-side replica dispatch --");
 
     let replica_events = replica
         .protocol
@@ -1902,7 +1899,7 @@ async fn run_reply_to_flow() {
 
     pair(&mut owner, &mut helper, channel_id).await;
 
-    // --- Half 1: auto_reply_to populates request.reply_to on outbound ----
+    // Half 1: auto_reply_to populates request.reply_to on outbound.
     owner
         .protocol
         .start(DeRecFlow::Discovery {
@@ -1947,7 +1944,7 @@ async fn run_reply_to_flow() {
         "replyTo.uri must equal the owner's own_transport"
     );
 
-    // --- Half 2: responder routes to inbound replyTo (not stored endpoint) -
+    // Half 2: responder routes to inbound replyTo (not the stored endpoint).
     // Hand-craft a Discovery request whose replyTo differs from the
     // owner's URI. Helper's stored peer endpoint still points to the owner,
     // so a correct implementation must route the response to the phantom

@@ -447,6 +447,59 @@ index.d.ts
 
 ---
 
+## Security considerations
+
+### Replica destinations inherit Source trust
+
+`ReplicaVaultReceived.vault` carries the full secret container, which
+embeds every helper's `channel_id` and `shared_key`. Anyone holding the
+vault can therefore authenticate as the Source toward every helper.
+This is intentional — it is what makes Destination-driven recovery
+work — but it means a compromised Destination can impersonate the
+Source against every helper paired at the time the vault was sent.
+Pick Destinations with at least the trust level of the Source device
+itself; do not treat them as opaque backups.
+
+### `ContactMode.HashedKeys` requires an ephemeral transport URI
+
+`HashedKeys` ships only a SHA-384 binding hash in the contact and
+serves the actual public keys through a plaintext PrePair round-trip
+on the contact creator's own transport. Any party that can reach that
+URI before the legitimate scanner gets the keys. Use `HashedKeys` only
+with a transport endpoint that is freshly minted for the pairing and
+that you can retire as soon as the PrePair leg completes.
+`ContactMode.InlineKeys` has no such constraint.
+
+The recommended pattern is: pair on the ephemeral URI, then — as soon
+as the pairing completes on the contact creator side — call
+`setOwnTransport` with the permanent endpoint and start an
+`UpdateChannelInfo` flow against the peer to announce the swap. Once
+the peer acknowledges, retire the ephemeral URI. This keeps the
+plaintext PrePair window tight while letting subsequent traffic ride
+on the long-lived endpoint.
+
+### Replica fingerprint verification is mandatory
+
+Replica channels are created with `status: "Pending"` and remain there
+until both sides call `verifyFingerprint` with the value the peer
+derived from the shared key — confirmed out of band. The orchestrator
+enforces this: `start(FlowKind.ProtectSecret, ...)` throws when a
+target is still `Pending`. Treat verification as a required step in
+the pairing UX — a scanner that auto-pairs without it accepts a
+MITM-vulnerable replica.
+
+### The `derec.*` namespace in `communicationInfo` is library-owned
+
+`communicationInfo` is otherwise an opaque app-defined map, but every
+key under the `derec.` prefix is reserved for the protocol. Today the
+library owns `derec.replica_id`; future protocol additions will use
+the same namespace. Application code must not write any `derec.*`
+entry — the orchestrator silently overwrites or strips library-owned
+keys at the protocol boundary, and app-set values are lost without
+warning.
+
+---
+
 ## Documentation
 
 - DeRec Alliance: https://derecalliance.org

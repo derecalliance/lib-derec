@@ -4,6 +4,7 @@ export { default as init } from "./derec_library.js";
 
 import {
   DeRecProtocolWasm,
+  DeRecProtocolBuilder as DeRecProtocolBuilderImpl,
   decodeRecoveredSecretBag,
   restoreFromRecoveredBag,
   envelope_apply_trace_id,
@@ -16,6 +17,7 @@ export const envelope = {
 };
 
 export const DeRecProtocol = DeRecProtocolWasm;
+export const DeRecProtocolBuilder = DeRecProtocolBuilderImpl;
 
 export { decodeRecoveredSecretBag };
 
@@ -25,7 +27,7 @@ export const SenderKind = Object.freeze({ Owner: 0, Helper: 1, ReplicaSource: 3,
 
 export const ContactMode = Object.freeze({ InlineKeys: 0, HashedKeys: 1 });
 
-export const FlowKind = Object.freeze({ Pairing: 0, Discovery: 1, ProtectSecret: 2, VerifyShares: 3, RecoverSecret: 4, Unpair: 5 });
+export const FlowKind = Object.freeze({ Pairing: 0, Discovery: 1, ProtectSecret: 2, VerifyShares: 3, RecoverSecret: 4, Unpair: 5, UpdateChannelInfo: 6 });
 
 import {
   discovery_request_produce,

@@ -12,7 +12,8 @@ use crate::{
         request::produce as produce_unpair_request,
         response::{self as unpairing_response, process as process_unpair_response},
     },
-    types::{ChannelId, SharedKey, Target},
+    protocol::types::Target,
+    types::{ChannelId, SharedKey},
 };
 use derec_proto::{
     DeRecResult, MessageBody, StatusEnum, UnpairRequestMessage, UnpairResponseMessage,
@@ -253,8 +254,6 @@ pub(in crate::protocol) async fn drop_channel_state<
 ) -> Result<()> {
     share_store.remove_channel(channel_id).await?;
 
-    // TODO: These removes should be condensed intoa  single function, many implementations might
-    // want to have these atomic and in single db rount-trip
     let _ = secret_store.remove(channel_id, SecretKind::SharedKey).await;
     let _ = secret_store
         .remove(channel_id, SecretKind::PairingSecret)
