@@ -6,7 +6,6 @@
 
 using System;
 using System.Collections.Generic;
-using System.Globalization;
 using System.Linq;
 using System.Text;
 using DeRec.Library;
@@ -129,8 +128,8 @@ internal static class Protocol
             throw new InvalidOperationException(
                 "verifyFingerprint must return false for a wrong fingerprint");
 
-        // Critical invariant for 5.1: the stored channel record must
-        // still report Pending; the protocol must not have touched it.
+        // Critical invariant: the stored channel record must still
+        // report Pending; the protocol must not have touched it.
         var stored = node.ChannelStore.Load(channelId)
             ?? throw new InvalidOperationException("channel record missing after verify");
         if (stored.Status != ChannelStatus.Pending)
@@ -179,7 +178,7 @@ internal static class Protocol
 
         ulong? startResult = owner.Protocol.StartAsync(FlowKind.Pairing, new PairingParams
         {
-            Kind = (int)Pairing.SenderKind.Owner,
+            Kind = Pairing.SenderKind.Owner,
             Contact = contactBytes,
         }).GetAwaiter().GetResult();
         if (startResult is null)
@@ -408,7 +407,7 @@ internal static class Protocol
         // other pair handshake.
         ulong destId = DoOrchestratorPair(
             owner, owner.Transport, destination, destination.Transport, destChannel,
-            initiatorKind: (int)Pairing.SenderKind.ReplicaDestination);
+            initiatorKind: Pairing.SenderKind.ReplicaDestination);
         Console.WriteLine($"  replica pair: destination channel={destId}  ✓");
 
         // Replica channels start `Pending` after pair handshake
@@ -476,20 +475,20 @@ internal static class Protocol
             ?? throw new InvalidOperationException(
                 $"destination did not emit ReplicaVaultReceived; got [{string.Join(", ", destEvents.Select(e => e.EventType))}]");
 
-        if (ulong.Parse(received.FromReplicaId, NumberStyles.HexNumber) != ownerReplicaId)
+        if (ulong.Parse(received.FromReplicaId) != ownerReplicaId)
             throw new InvalidOperationException($"from_replica_id mismatch (got {received.FromReplicaId})");
         if (ulong.Parse(received.SecretId) != secretId)
             throw new InvalidOperationException($"secret_id mismatch (got {received.SecretId})");
         if (received.Vault.Secrets.Count != 1 || !received.Vault.Secrets[0].Data.SequenceEqual(secretData))
             throw new InvalidOperationException("vault.secrets[0].data must round-trip the original");
-        if (ulong.Parse(received.Vault.OwnerReplicaId, NumberStyles.HexNumber) != ownerReplicaId)
+        if (ulong.Parse(received.Vault.OwnerReplicaId) != ownerReplicaId)
             throw new InvalidOperationException("vault.owner_replica_id mismatch");
         if (received.Vault.Helpers.Count != 2)
             throw new InvalidOperationException($"vault.helpers must be 2, got {received.Vault.Helpers.Count}");
         if (received.Vault.Replicas.Count != 1)
             throw new InvalidOperationException($"vault.replicas must be 1, got {received.Vault.Replicas.Count}");
         var destInfo = received.Vault.Replicas[0];
-        if (ulong.Parse(destInfo.ReplicaId, NumberStyles.HexNumber) != destReplicaId)
+        if (ulong.Parse(destInfo.ReplicaId) != destReplicaId)
             throw new InvalidOperationException("vault.replicas[0].replica_id mismatch");
         if (destInfo.SenderKind != (int)Pairing.SenderKind.ReplicaDestination)
             throw new InvalidOperationException("vault.replicas[0].sender_kind must be ReplicaDestination");
@@ -604,7 +603,7 @@ internal static class Protocol
 
         owner.Protocol.StartAsync(FlowKind.Pairing, new PairingParams
         {
-            Kind = (int)Pairing.SenderKind.Owner,
+            Kind = Pairing.SenderKind.Owner,
             Contact = contactBytes,
         }).GetAwaiter().GetResult();
 
@@ -858,7 +857,7 @@ internal static class Protocol
         {
             unconfiguredScanner.Protocol.StartAsync(FlowKind.Pairing, new PairingParams
             {
-                Kind = (int)Pairing.SenderKind.ReplicaDestination,
+                Kind = Pairing.SenderKind.ReplicaDestination,
                 Contact = contact,
             }).GetAwaiter().GetResult();
             throw new InvalidOperationException(
@@ -885,7 +884,7 @@ internal static class Protocol
             .GetAwaiter().GetResult();
         configuredScanner.Protocol.StartAsync(FlowKind.Pairing, new PairingParams
         {
-            Kind = (int)Pairing.SenderKind.ReplicaDestination,
+            Kind = Pairing.SenderKind.ReplicaDestination,
             Contact = contact2,
         }).GetAwaiter().GetResult();
 
@@ -915,7 +914,7 @@ internal static class Protocol
     private static ulong DoOrchestratorPair(
         Node contactCreator, RecordingTransport contactCreatorTx,
         Node initiator, RecordingTransport initiatorTx,
-        ulong channelId, int initiatorKind = (int)Pairing.SenderKind.Owner)
+        ulong channelId, Pairing.SenderKind initiatorKind = Pairing.SenderKind.Owner)
     {
         byte[] contact = contactCreator.Protocol.CreateContactAsync(channelId, ContactMode.InlineKeys)
             .GetAwaiter().GetResult();

@@ -17,10 +17,6 @@ use prost::Message;
 #[derive(Debug, Clone, PartialEq)]
 pub struct VersionEntry {
     pub version: u32,
-
-    /// Human-readable description supplied by the Owner at share-storage time.
-    ///
-    /// Empty when no description was provided.
     pub description: String,
 }
 
@@ -58,12 +54,7 @@ impl From<&ProtoVersionEntry> for VersionEntry {
 /// Helper holds for it, each paired with its human-readable description.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SecretVersionEntry {
-    /// Application-defined secret identifier.
     pub secret_id: u64,
-    /// All share versions the Helper currently stores for this secret.
-    ///
-    /// Each entry includes the version number and the description that was
-    /// provided by the Owner when the share was originally stored.
     pub versions: Vec<VersionEntry>,
 }
 

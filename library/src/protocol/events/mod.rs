@@ -450,20 +450,16 @@ pub enum DeRecEvent {
     /// Surfaces on **both** sides of the flow:
     ///
     /// - Responder: emitted by [`super::DeRecProtocol::accept`] after the
-    ///   update has been persisted.
+    ///   update has been persisted to the local channel store.
     /// - Initiator: emitted by [`super::DeRecProtocol::process`] when the
     ///   peer's `Ok` response arrives.
     ///
-    /// Each optional field carries the value that was applied (mirroring the
-    /// request), so the application can react (e.g. refresh UI, retire the
-    /// old endpoint).
-    ChannelInfoUpdated {
-        channel_id: ChannelId,
-        /// New communication info, if it was part of the update.
-        communication_info: Option<HashMap<String, String>>,
-        /// New transport endpoint, if it was part of the update.
-        transport_protocol: Option<derec_proto::TransportProtocol>,
-    },
+    /// The new `communication_info` / `transport_protocol` values are
+    /// already on the local
+    /// [`crate::protocol::types::Channel`] by the time the event fires;
+    /// applications that care about the post-update state read it from
+    /// the channel store directly.
+    ChannelInfoUpdated { channel_id: ChannelId },
 
     /// The peer answered an outbound `UpdateChannelInfo` request with a
     /// non-`Ok` status. The peer's stored state is unchanged. The initiator's

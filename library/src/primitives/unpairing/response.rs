@@ -11,8 +11,7 @@ use prost::Message;
 
 pub struct ProduceResult {
     /// Serialized outer [`derec_proto::DeRecMessage`] envelope carrying an
-    /// encrypted inner [`derec_proto::UnpairResponseMessage`]. Ready to send
-    /// over transport.
+    /// encrypted inner [`derec_proto::UnpairResponseMessage`].
     pub envelope: Vec<u8>,
 }
 
@@ -65,7 +64,7 @@ pub fn produce(
     channel_id: ChannelId,
     shared_key: &SharedKey,
 ) -> Result<ProduceResult, crate::Error> {
-    let envelope = build_response(channel_id, StatusEnum::Ok, &String::new(), shared_key)?;
+    let envelope = build_response(channel_id, StatusEnum::Ok, "", shared_key)?;
 
     #[cfg(feature = "logging")]
     tracing::info!("unpair response (ok) envelope produced");

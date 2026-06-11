@@ -6,11 +6,10 @@
 //! public Rust API and may change as the SDK wire formats evolve.
 //!
 //! Field-name conventions:
-//! - `channel_id`, `secret_id` and other `u64` identifiers cross the
-//!   boundary as **decimal strings** to dodge JS `Number.MAX_SAFE_INTEGER`.
-//! - `replica_id`s and `from_replica_id` cross as **hex strings** via
-//!   [`crate::protocol::reserved_keys::encode_replica_id`], matching
-//!   the wire-level `derec.replica_id` convention.
+//! - All `u64` identifiers (`channel_id`, `secret_id`, `replica_id`,
+//!   `from_replica_id`, `owner_replica_id`) cross the boundary as
+//!   **decimal strings** to dodge JS `Number.MAX_SAFE_INTEGER` without
+//!   forcing callers to track which id uses which encoding.
 //! - `peer_communication_info` / `communication_info` are
 //!   `#[serde(skip_serializing_if = "HashMap::is_empty")]` so callers
 //!   never see noise from empty maps.
@@ -114,12 +113,6 @@ pub(crate) enum Event {
     },
     ChannelInfoUpdated {
         channel_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        communication_info: Option<HashMap<String, String>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        transport_uri: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        transport_protocol: Option<i32>,
     },
     ChannelInfoUpdateRejected {
         channel_id: String,
@@ -397,22 +390,9 @@ impl Event {
                 status,
                 memo,
             },
-            DeRecEvent::ChannelInfoUpdated {
-                channel_id,
-                communication_info,
-                transport_protocol,
-            } => {
-                let (transport_uri, transport_protocol_i32) = match transport_protocol {
-                    Some(tp) => (Some(tp.uri), Some(tp.protocol)),
-                    None => (None, None),
-                };
-                Self::ChannelInfoUpdated {
-                    channel_id: channel_id.0.to_string(),
-                    communication_info,
-                    transport_uri,
-                    transport_protocol: transport_protocol_i32,
-                }
-            }
+            DeRecEvent::ChannelInfoUpdated { channel_id } => Self::ChannelInfoUpdated {
+                channel_id: channel_id.0.to_string(),
+            },
             DeRecEvent::ChannelInfoUpdateRejected {
                 channel_id,
                 status,

@@ -89,7 +89,7 @@ public sealed class TargetJsonConverter : JsonConverter<Target?>
 public sealed record PairingParams
 {
     [JsonPropertyName("kind")]
-    public required int Kind { get; init; }
+    public required Pairing.SenderKind Kind { get; init; }
 
     /// <summary>prost-encoded <c>ContactMessage</c> bytes.</summary>
     [JsonPropertyName("contact")]
@@ -194,13 +194,14 @@ public sealed record PairingCompletedEvent : DeRecEvent
     public override string EventType => "PairingCompleted";
 
     public required string ChannelId { get; init; }
-    public required int Kind { get; init; }
+    public required Pairing.SenderKind Kind { get; init; }
     public Dictionary<string, string> PeerCommunicationInfo { get; init; } = new();
 }
 
 /// <summary>
 /// Fired alongside <see cref="PairingCompletedEvent"/> on replica-mode
-/// pairings. Carries the peer's hex-encoded <c>replica_id</c>.
+/// pairings. Carries the peer's <c>replica_id</c> as a decimal-encoded
+/// string.
 /// </summary>
 public sealed record ReplicaPairedEvent : DeRecEvent
 {
@@ -370,9 +371,6 @@ public sealed record ChannelInfoUpdatedEvent : DeRecEvent
 {
     public override string EventType => "ChannelInfoUpdated";
     public required string ChannelId { get; init; }
-    public Dictionary<string, string>? CommunicationInfo { get; init; }
-    public string? TransportUri { get; init; }
-    public int? TransportProtocol { get; init; }
 }
 
 public sealed record ChannelInfoUpdateRejectedEvent : DeRecEvent
@@ -489,7 +487,10 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                 Status = root.GetProperty("status").GetInt32(),
                 Memo = root.GetProperty("memo").GetString() ?? string.Empty,
             },
-            "ChannelInfoUpdated" => ParseChannelInfoUpdated(root),
+            "ChannelInfoUpdated" => new ChannelInfoUpdatedEvent
+            {
+                ChannelId = root.GetProperty("channel_id").GetString()!,
+            },
             "ChannelInfoUpdateRejected" => new ChannelInfoUpdateRejectedEvent
             {
                 ChannelId = root.GetProperty("channel_id").GetString()!,
@@ -550,22 +551,6 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
         {
             ChannelId = root.GetProperty("channel_id").GetString()!,
             Secrets = secrets,
-        };
-    }
-
-    private static ChannelInfoUpdatedEvent ParseChannelInfoUpdated(System.Text.Json.JsonElement root)
-    {
-        Dictionary<string, string>? info = null;
-        if (root.TryGetProperty("communication_info", out var ci))
-            info = ReadStringMap(ci);
-        string? uri = root.TryGetProperty("transport_uri", out var tu) ? tu.GetString() : null;
-        int? proto = root.TryGetProperty("transport_protocol", out var tp) ? tp.GetInt32() : null;
-        return new ChannelInfoUpdatedEvent
-        {
-            ChannelId = root.GetProperty("channel_id").GetString()!,
-            CommunicationInfo = info,
-            TransportUri = uri,
-            TransportProtocol = proto,
         };
     }
 
@@ -645,7 +630,7 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
         var ev = new PairingCompletedEvent
         {
             ChannelId = root.GetProperty("channel_id").GetString()!,
-            Kind = root.GetProperty("kind").GetInt32(),
+            Kind = (Pairing.SenderKind)root.GetProperty("kind").GetInt32(),
         };
         if (root.TryGetProperty("peer_communication_info", out var pci) &&
             pci.ValueKind == System.Text.Json.JsonValueKind.Object)

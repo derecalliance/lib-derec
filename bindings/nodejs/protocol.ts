@@ -1042,7 +1042,7 @@ async function runReplicaPairingAndVaultSyncFlow(): Promise<void> {
     "ReplicaPaired",
     "Owner/replica",
   );
-  if (BigInt("0x" + ownerReplicaPaired.peer_replica_id) !== destReplicaId) {
+  if (BigInt(ownerReplicaPaired.peer_replica_id) !== destReplicaId) {
     throw new Error(
       `Owner-side ReplicaPaired must carry destination replica_id=${destReplicaId}, got ${ownerReplicaPaired.peer_replica_id}`,
     );
@@ -1055,7 +1055,7 @@ async function runReplicaPairingAndVaultSyncFlow(): Promise<void> {
     "ReplicaPaired",
     "Destination/replica",
   );
-  if (BigInt("0x" + destReplicaPaired.peer_replica_id) !== ownerReplicaId) {
+  if (BigInt(destReplicaPaired.peer_replica_id) !== ownerReplicaId) {
     throw new Error(
       `Destination-side ReplicaPaired must carry owner replica_id=${ownerReplicaId}, got ${destReplicaPaired.peer_replica_id}`,
     );
@@ -1151,7 +1151,7 @@ async function runReplicaPairingAndVaultSyncFlow(): Promise<void> {
       `Destination did not emit ReplicaVaultReceived; got [${destEvents.map((e) => e.type).join(", ")}]`,
     );
   }
-  if (BigInt("0x" + received.from_replica_id) !== ownerReplicaId) {
+  if (BigInt(received.from_replica_id) !== ownerReplicaId) {
     throw new Error(
       `from_replica_id must echo owner's replica_id (${ownerReplicaId}), got ${received.from_replica_id}`,
     );
@@ -1171,7 +1171,7 @@ async function runReplicaPairingAndVaultSyncFlow(): Promise<void> {
   ) {
     throw new Error("vault.secrets[0].data must round-trip the original secret bytes");
   }
-  if (BigInt("0x" + received.vault.owner_replica_id) !== ownerReplicaId) {
+  if (BigInt(received.vault.owner_replica_id) !== ownerReplicaId) {
     throw new Error(
       `vault.owner_replica_id must echo owner's replica_id (${ownerReplicaId}), got ${received.vault.owner_replica_id}`,
     );
@@ -1187,7 +1187,7 @@ async function runReplicaPairingAndVaultSyncFlow(): Promise<void> {
     );
   }
   const destInfo = received.vault.replicas[0]!;
-  if (BigInt("0x" + destInfo.replica_id) !== destReplicaId) {
+  if (BigInt(destInfo.replica_id) !== destReplicaId) {
     throw new Error(
       `ReplicaInfo.replica_id expected ${destReplicaId}, got ${destInfo.replica_id}`,
     );

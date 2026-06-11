@@ -358,7 +358,7 @@ fn build_shares(
 ) -> HashMap<ChannelId, CommittedDeRecShare> {
     let mut shares = HashMap::with_capacity(ordered_channels.len());
 
-    for (channel_id, share) in ordered_channels.into_iter().zip(vss_shares.into_iter()) {
+    for (channel_id, share) in ordered_channels.into_iter().zip(vss_shares) {
         let derec_share = DeRecShare {
             encrypted_secret: share.encrypted_secret.clone(),
             x: share.x.clone(),

@@ -325,230 +325,269 @@ impl<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, T: DeRecT
     /// Returns `Some(channel_id)` for [`DeRecFlow::Pairing`], `None` for all others.
     #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
     pub async fn start(&mut self, flow: DeRecFlow) -> Result<Option<u64>> {
-        // When auto_reply_to is enabled, stamp every outbound channel-mode
-        // request with our own transport so the responder routes its reply
-        // back to us — even if the channel's stored peer endpoint points
-        // elsewhere (e.g. a sibling replica). Pairing has its own dedicated
-        // `transport_protocol` field so it's intentionally excluded here.
-        let reply_to = if self.auto_reply_to {
-            Some(self.own_transport.clone())
-        } else {
-            None
-        };
+        // When `auto_reply_to` is enabled, stamp every outbound
+        // channel-mode request with our own transport so the responder
+        // routes its reply back to us — even if the channel's stored
+        // peer endpoint points elsewhere (e.g. a sibling replica).
+        // Pairing has its own dedicated `transport_protocol` field so
+        // it's intentionally excluded.
+        let reply_to = self.auto_reply_to.then(|| self.own_transport.clone());
 
         match flow {
             DeRecFlow::Pairing {
                 kind,
                 contact,
                 peer_communication_info,
-            } => {
-                let channel_id = handlers::pairing::start(
-                    &mut self.channel_store,
-                    &mut self.secret_store,
-                    &self.transport,
-                    &self.own_transport,
-                    &self.communication_info,
-                    kind,
-                    contact,
-                    peer_communication_info,
-                    self.replica_id,
-                )
-                .await?;
-                Ok(Some(channel_id))
-            }
-            DeRecFlow::Discovery { target } => {
-                let resolved =
-                    handlers::resolve_target(&mut self.channel_store, target.clone()).await?;
-                handlers::require_role(
-                    &self.channel_store,
-                    &resolved,
-                    derec_proto::SenderKind::Owner,
-                )
-                .await?;
-                handlers::discovery::start(
-                    &mut self.channel_store,
-                    &mut self.secret_store,
-                    &self.transport,
-                    target,
-                    reply_to.clone(),
-                )
-                .await?;
-                Ok(None)
-            }
+            } => self.start_pairing(kind, contact, peer_communication_info).await,
+            DeRecFlow::Discovery { target } => self.start_discovery(target, reply_to).await,
             DeRecFlow::ProtectSecret {
                 secret_id,
                 target,
                 secrets,
                 description,
             } => {
-                let resolved =
-                    handlers::resolve_target(&mut self.channel_store, target.clone()).await?;
-                // ProtectSecret accepts channels where the local kind is
-                // Owner (peer is a Helper — the classic share path) OR
-                // ReplicaSource (peer is a ReplicaDestination — vault
-                // sync). Channels where the local kind is Helper are not
-                // legitimate ProtectSecret initiators and are refused.
-                for channel_id in &resolved {
-                    let channel = self
-                        .channel_store
-                        .load(*channel_id)
-                        .await?
-                        .ok_or(Error::InvalidInput(
-                            "channel id not present in channel store",
-                        ))?;
-                    if !matches!(
-                        channel.role,
-                        derec_proto::SenderKind::Owner | derec_proto::SenderKind::ReplicaSource
-                    ) {
-                        return Err(Error::RoleMismatch {
-                            channel_id: *channel_id,
-                            expected: derec_proto::SenderKind::Owner,
-                            actual: channel.role,
-                        });
-                    }
-                    // Replica channels start `Pending` after pair-handshake
-                    // completion and only transition to `Paired` once both
-                    // sides confirm the fingerprint out-of-band. Refusing
-                    // `ProtectSecret` against a `Pending` target prevents a
-                    // MITM-leaning peer from receiving the vault before
-                    // verification.
-                    if channel.status
-                        == crate::protocol::types::ChannelStatus::Pending
-                    {
-                        return Err(Error::InvalidInput(
-                            "ProtectSecret target is still Pending — \
-                             verify the fingerprint before distributing",
-                        ));
-                    }
-                }
-                let (version, sent_channels) = handlers::sharing::start(
-                    &mut self.channel_store,
-                    &mut self.share_store,
-                    &mut self.secret_store,
-                    &self.transport,
-                    secrets,
-                    description,
-                    self.threshold,
-                    self.keep_versions_count,
-                    secret_id,
-                    target,
-                    reply_to.clone(),
-                    self.replica_id,
-                )
-                .await?;
-
-                self.sharing_round = Some(SharingRound {
-                    version,
-                    pending: sent_channels.into_iter().collect(),
-                    confirmed: HashSet::new(),
-                    failed: HashSet::new(),
-                    started_at: now_secs(),
-                });
-
-                Ok(None)
+                self.start_protect_secret(secret_id, target, secrets, description, reply_to)
+                    .await
             }
             DeRecFlow::VerifyShares {
                 secret_id,
                 version,
                 target,
-            } => {
-                let resolved =
-                    handlers::resolve_target(&mut self.channel_store, target.clone()).await?;
-                handlers::require_role(
-                    &self.channel_store,
-                    &resolved,
-                    derec_proto::SenderKind::Owner,
-                )
-                .await?;
-                handlers::verification::start(
-                    &mut self.channel_store,
-                    &mut self.secret_store,
-                    &self.transport,
-                    version,
-                    target,
-                    secret_id,
-                    reply_to.clone(),
-                )
-                .await?;
-                Ok(None)
-            }
+            } => self.start_verify_shares(secret_id, version, target, reply_to).await,
             DeRecFlow::RecoverSecret { secret_id, version } => {
-                let all_paired: Vec<crate::types::ChannelId> = self
-                    .channel_store
-                    .channels()
-                    .await?
-                    .iter()
-                    .map(|c| c.id)
-                    .collect();
-                handlers::require_role(
-                    &self.channel_store,
-                    &all_paired,
-                    derec_proto::SenderKind::Owner,
-                )
-                .await?;
-                handlers::recovery::start(
-                    &mut self.channel_store,
-                    &mut self.secret_store,
-                    &self.transport,
-                    &mut self.pending_recovery,
-                    secret_id,
-                    version,
-                    reply_to.clone(),
-                )
-                .await?;
-                Ok(None)
+                self.start_recover_secret(secret_id, version, reply_to).await
             }
-            DeRecFlow::Unpair { target, memo } => {
-                let resolved =
-                    handlers::resolve_target(&mut self.channel_store, target.clone()).await?;
-                handlers::require_role(
-                    &self.channel_store,
-                    &resolved,
-                    derec_proto::SenderKind::Owner,
-                )
-                .await?;
-                // The handler returns immediate `Unpaired` events for the
-                // `UnpairAck::NotRequired` path; the wait-for-ack path returns
-                // nothing here and the events surface later from `process()`
-                // (on the response) or the timeout sweep.
-                let _events = handlers::unpairing::start(
-                    &mut self.channel_store,
-                    &mut self.share_store,
-                    &mut self.secret_store,
-                    &self.transport,
-                    &mut self.pending_unpair,
-                    target,
-                    memo,
-                    self.unpair_ack,
-                    now_secs(),
-                    reply_to.clone(),
-                )
-                .await?;
-                // `start` is fire-and-forget at the API surface — its events
-                // are buffered into the protocol's stream by reusing the
-                // `process()` return path. For callers that need to observe
-                // the immediate `Unpaired` events synchronously, we stash
-                // them on the protocol for the next `process()` to drain.
-                self.pending_start_events.extend(_events);
-                Ok(None)
-            }
+            DeRecFlow::Unpair { target, memo } => self.start_unpair(target, memo, reply_to).await,
             DeRecFlow::UpdateChannelInfo {
                 target,
                 communication_info,
                 transport_protocol,
             } => {
-                handlers::update_channel_info::start(
-                    &mut self.channel_store,
-                    &mut self.secret_store,
-                    &self.transport,
-                    target,
-                    communication_info,
-                    transport_protocol,
-                )
-                .await?;
-                Ok(None)
+                self.start_update_channel_info(target, communication_info, transport_protocol)
+                    .await
             }
         }
+    }
+
+    async fn start_pairing(
+        &mut self,
+        kind: derec_proto::SenderKind,
+        contact: derec_proto::ContactMessage,
+        peer_communication_info: HashMap<String, String>,
+    ) -> Result<Option<u64>> {
+        let channel_id = handlers::pairing::start(
+            &mut self.channel_store,
+            &mut self.secret_store,
+            &self.transport,
+            &self.own_transport,
+            &self.communication_info,
+            kind,
+            contact,
+            peer_communication_info,
+            self.replica_id,
+        )
+        .await?;
+        Ok(Some(channel_id))
+    }
+
+    async fn start_discovery(
+        &mut self,
+        target: crate::protocol::types::Target,
+        reply_to: Option<derec_proto::TransportProtocol>,
+    ) -> Result<Option<u64>> {
+        let resolved =
+            handlers::resolve_target(&mut self.channel_store, target.clone()).await?;
+        handlers::require_role(&self.channel_store, &resolved, derec_proto::SenderKind::Owner)
+            .await?;
+        handlers::discovery::start(
+            &mut self.channel_store,
+            &mut self.secret_store,
+            &self.transport,
+            target,
+            reply_to,
+        )
+        .await?;
+        Ok(None)
+    }
+
+    async fn start_protect_secret(
+        &mut self,
+        secret_id: u64,
+        target: crate::protocol::types::Target,
+        secrets: Vec<crate::protocol::types::UserSecret>,
+        description: Option<String>,
+        reply_to: Option<derec_proto::TransportProtocol>,
+    ) -> Result<Option<u64>> {
+        let resolved =
+            handlers::resolve_target(&mut self.channel_store, target.clone()).await?;
+        // ProtectSecret accepts channels where the local kind is Owner
+        // (peer is a Helper — the classic share path) OR ReplicaSource
+        // (peer is a ReplicaDestination — vault sync). Channels where
+        // the local kind is Helper are not legitimate ProtectSecret
+        // initiators and are refused.
+        for channel_id in &resolved {
+            let channel = self
+                .channel_store
+                .load(*channel_id)
+                .await?
+                .ok_or(Error::InvalidInput(
+                    "channel id not present in channel store",
+                ))?;
+            if !matches!(
+                channel.role,
+                derec_proto::SenderKind::Owner | derec_proto::SenderKind::ReplicaSource
+            ) {
+                return Err(Error::RoleMismatch {
+                    channel_id: *channel_id,
+                    expected: derec_proto::SenderKind::Owner,
+                    actual: channel.role,
+                });
+            }
+            // Replica channels start `Pending` after pair-handshake
+            // completion and only transition to `Paired` once both
+            // sides confirm the fingerprint out-of-band. Refusing
+            // `ProtectSecret` against a `Pending` target prevents a
+            // MITM-leaning peer from receiving the vault before
+            // verification.
+            if channel.status == crate::protocol::types::ChannelStatus::Pending {
+                return Err(Error::InvalidInput(
+                    "ProtectSecret target is still Pending — \
+                     verify the fingerprint before distributing",
+                ));
+            }
+        }
+        let (version, sent_channels) = handlers::sharing::start(
+            &mut self.channel_store,
+            &mut self.share_store,
+            &mut self.secret_store,
+            &self.transport,
+            secrets,
+            description,
+            self.threshold,
+            self.keep_versions_count,
+            secret_id,
+            target,
+            reply_to,
+            self.replica_id,
+        )
+        .await?;
+
+        self.sharing_round = Some(SharingRound {
+            version,
+            pending: sent_channels.into_iter().collect(),
+            confirmed: HashSet::new(),
+            failed: HashSet::new(),
+            started_at: now_secs(),
+        });
+
+        Ok(None)
+    }
+
+    async fn start_verify_shares(
+        &mut self,
+        secret_id: u64,
+        version: u32,
+        target: crate::protocol::types::Target,
+        reply_to: Option<derec_proto::TransportProtocol>,
+    ) -> Result<Option<u64>> {
+        let resolved =
+            handlers::resolve_target(&mut self.channel_store, target.clone()).await?;
+        handlers::require_role(&self.channel_store, &resolved, derec_proto::SenderKind::Owner)
+            .await?;
+        handlers::verification::start(
+            &mut self.channel_store,
+            &mut self.secret_store,
+            &self.transport,
+            version,
+            target,
+            secret_id,
+            reply_to,
+        )
+        .await?;
+        Ok(None)
+    }
+
+    async fn start_recover_secret(
+        &mut self,
+        secret_id: u64,
+        version: u32,
+        reply_to: Option<derec_proto::TransportProtocol>,
+    ) -> Result<Option<u64>> {
+        let all_paired: Vec<crate::types::ChannelId> = self
+            .channel_store
+            .channels()
+            .await?
+            .iter()
+            .map(|c| c.id)
+            .collect();
+        handlers::require_role(
+            &self.channel_store,
+            &all_paired,
+            derec_proto::SenderKind::Owner,
+        )
+        .await?;
+        handlers::recovery::start(
+            &mut self.channel_store,
+            &mut self.secret_store,
+            &self.transport,
+            &mut self.pending_recovery,
+            secret_id,
+            version,
+            reply_to,
+        )
+        .await?;
+        Ok(None)
+    }
+
+    async fn start_unpair(
+        &mut self,
+        target: crate::protocol::types::Target,
+        memo: Option<String>,
+        reply_to: Option<derec_proto::TransportProtocol>,
+    ) -> Result<Option<u64>> {
+        let resolved =
+            handlers::resolve_target(&mut self.channel_store, target.clone()).await?;
+        handlers::require_role(&self.channel_store, &resolved, derec_proto::SenderKind::Owner)
+            .await?;
+        // The handler returns immediate `Unpaired` events for the
+        // `UnpairAck::NotRequired` path; the wait-for-ack path returns
+        // nothing here and the events surface later from `process()`
+        // (on the response) or the timeout sweep. Events are stashed
+        // on the protocol for the next `process()` to drain so callers
+        // observing the synchronous stream see them.
+        let events = handlers::unpairing::start(
+            &mut self.channel_store,
+            &mut self.share_store,
+            &mut self.secret_store,
+            &self.transport,
+            &mut self.pending_unpair,
+            target,
+            memo,
+            self.unpair_ack,
+            now_secs(),
+            reply_to,
+        )
+        .await?;
+        self.pending_start_events.extend(events);
+        Ok(None)
+    }
+
+    async fn start_update_channel_info(
+        &mut self,
+        target: crate::protocol::types::Target,
+        communication_info: Option<HashMap<String, String>>,
+        transport_protocol: Option<derec_proto::TransportProtocol>,
+    ) -> Result<Option<u64>> {
+        handlers::update_channel_info::start(
+            &mut self.channel_store,
+            &mut self.secret_store,
+            &self.transport,
+            target,
+            communication_info,
+            transport_protocol,
+        )
+        .await?;
+        Ok(None)
     }
 
     /// Accept a pending action from an [`DeRecEvent::ActionRequired`] event.

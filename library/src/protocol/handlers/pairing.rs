@@ -35,9 +35,13 @@ pub(in crate::protocol) async fn handle<Ch: DeRecChannelStore, Ss: DeRecSecretSt
     replica_id: Option<u64>,
 ) -> Result<Vec<DeRecEvent>> {
     match message {
-        MessageBody::PairRequest(request) => {
-            on_request(channel_id, request, pairing_secret, inbound_trace_id, replica_id)
-        }
+        MessageBody::PairRequest(request) => on_request(
+            channel_id,
+            request,
+            pairing_secret,
+            inbound_trace_id,
+            replica_id,
+        ),
         MessageBody::PairResponse(response) => {
             on_response(
                 channel_store,
@@ -52,10 +56,6 @@ pub(in crate::protocol) async fn handle<Ch: DeRecChannelStore, Ss: DeRecSecretSt
         MessageBody::PrePairRequest(request) => {
             on_pre_pair_request(channel_id, request, inbound_trace_id)
         }
-        // `PrePairResponse` is handled outside this entry point — its
-        // state requirements (the original contact, not `pairing_secret`)
-        // don't fit `handle`'s signature. See
-        // [`on_pre_pair_response`] for the scanner-side path.
         _ => Err(Error::Invariant(
             "unexpected MessageBody variant in pairing message",
         )),
@@ -453,7 +453,7 @@ pub(in crate::protocol) async fn reject_pre_pair<T: DeRecTransport>(
         mlkem_encapsulation_key: None,
         ecies_public_key: None,
         nonce: request.nonce,
-        timestamp: Some(timestamp.clone()),
+        timestamp: Some(timestamp),
     };
 
     // PrePair envelopes are plaintext — wrap the inner body directly.
@@ -855,11 +855,10 @@ fn is_reserved_key(key: &str) -> bool {
 /// (Source / Destination) is already on the saved `Channel.role`, so
 /// the event doesn't repeat it.
 ///
-/// `peer_replica_id` is `Option<u64>` because the extract path uses that
-/// shape, but for replica pairings it is guaranteed `Some` by
-/// [`extract_communication_info`]'s mode validation; the `expect` here
-/// would only fire if a caller pushed an inconsistent (replica kind, no
-/// peer id) tuple in.
+/// `peer_replica_id.is_some()` and [`is_replica_kind`] are equivalent at
+/// this point — [`extract_communication_info`] rejects inconsistent
+/// combinations upstream — so we branch on the `Option` directly and
+/// emit `ReplicaPaired` iff a peer id is present.
 fn pair_completion_events(
     channel_id: ChannelId,
     kind: SenderKind,
@@ -871,12 +870,10 @@ fn pair_completion_events(
         kind,
         peer_communication_info,
     }];
-    if is_replica_kind(kind) {
+    if let Some(peer_replica_id) = peer_replica_id {
         events.push(DeRecEvent::ReplicaPaired {
             channel_id,
-            peer_replica_id: peer_replica_id.expect(
-                "replica pairings carry peer_replica_id (extract validates)",
-            ),
+            peer_replica_id,
         });
     }
     events
@@ -907,8 +904,9 @@ fn require_replica_id_for_kind(
 /// unknown values surface as
 /// [`PairingError::InvalidPairRequestMessage`].
 fn request_sender_kind(request: &PairRequestMessage) -> Result<SenderKind> {
-    SenderKind::try_from(request.sender_kind)
-        .map_err(|_| PairingError::InvalidPairRequestMessage("unknown sender_kind on PairRequest").into())
+    SenderKind::try_from(request.sender_kind).map_err(|_| {
+        PairingError::InvalidPairRequestMessage("unknown sender_kind on PairRequest").into()
+    })
 }
 
 /// Derive the peer's pairing kind from the local kind (committed on the
@@ -983,7 +981,7 @@ mod tests {
             .iter()
             .find(|(k, _)| k == reserved_keys::DEREC_REPLICA_ID_KEY)
             .expect("derec.replica_id should be injected");
-        assert_eq!(replica_entry.1, "deadbeef");
+        assert_eq!(replica_entry.1, "3735928559");
 
         // The app's free-form `name` is preserved alongside the reserved entry.
         assert!(pairs.iter().any(|(k, v)| k == "name" && v == "Alice"));
@@ -1030,14 +1028,15 @@ mod tests {
                     key: reserved_keys::DEREC_REPLICA_ID_KEY.to_owned(),
                     value: Some(
                         derec_proto::communication_info_key_value::Value::StringValue(
-                            "cafebabe".to_owned(),
+                            "3405691582".to_owned(),
                         ),
                     ),
                 },
             ],
         });
 
-        let (map, replica_id) = extract_communication_info(&info, SenderKind::ReplicaSource).unwrap();
+        let (map, replica_id) =
+            extract_communication_info(&info, SenderKind::ReplicaSource).unwrap();
         // Map carries only the free-form entry; reserved key is gone.
         assert_eq!(map.len(), 1);
         assert_eq!(map.get("name").map(String::as_str), Some("Bob"));
@@ -1050,9 +1049,9 @@ mod tests {
         let info = Some(CommunicationInfo {
             communication_info_entries: vec![derec_proto::CommunicationInfoKeyValue {
                 key: "name".to_owned(),
-                value: Some(derec_proto::communication_info_key_value::Value::StringValue(
-                    "Bob".to_owned(),
-                )),
+                value: Some(
+                    derec_proto::communication_info_key_value::Value::StringValue("Bob".to_owned()),
+                ),
             }],
         });
 
@@ -1073,15 +1072,16 @@ mod tests {
         let info = Some(CommunicationInfo {
             communication_info_entries: vec![derec_proto::CommunicationInfoKeyValue {
                 key: reserved_keys::DEREC_REPLICA_ID_KEY.to_owned(),
-                value: Some(derec_proto::communication_info_key_value::Value::StringValue(
-                    "abc".to_owned(),
-                )),
+                value: Some(
+                    derec_proto::communication_info_key_value::Value::StringValue(
+                        "12345".to_owned(),
+                    ),
+                ),
             }],
         });
 
         // Helper-side extraction of a peer pretending to be Owner with replica id.
-        let err =
-            extract_communication_info(&info, SenderKind::Owner).expect_err("must reject");
+        let err = extract_communication_info(&info, SenderKind::Owner).expect_err("must reject");
         assert!(
             matches!(
                 err,
@@ -1137,5 +1137,4 @@ mod tests {
         let err = require_replica_id_for_kind(SenderKind::ReplicaSource, None).unwrap_err();
         assert!(matches!(err, Error::ReplicaIdNotConfigured));
     }
-
 }

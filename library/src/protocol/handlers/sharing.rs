@@ -5,6 +5,8 @@ use super::super::{
     MissingPolicy, PendingAction, SecretKind, SecretValue, Share,
 };
 use super::resolve_target;
+use crate::derec_message::DeRecMessageBuilder;
+use crate::primitives::sharing::request::SHARE_ALGORITHM_REPLICA_VAULT;
 use crate::{
     Error, Result,
     derec_message::current_timestamp,
@@ -15,8 +17,6 @@ use crate::{
     protocol::types::{HelperInfo, SecretContainer, Target, UserSecret},
     types::{ChannelId, SharedKey},
 };
-use crate::derec_message::DeRecMessageBuilder;
-use crate::primitives::sharing::request::SHARE_ALGORITHM_REPLICA_VAULT;
 use derec_proto::{
     DeRecResult, DeRecSecret, MessageBody, SenderKind, StatusEnum, StoreShareRequestMessage,
     StoreShareResponseMessage,
@@ -70,14 +70,9 @@ pub(in crate::protocol) async fn start<
         return Err(Error::InvalidInput("no paired targets in set"));
     }
 
-    // Build the canonical `SecretContainer` once with full helpers +
-    // replicas + secrets + owner_replica_id. Both the helper-share
-    // payload (DeRecSecret-wrapped, VSS-split) and the Destination
-    // composite payload (ReplicaSecretPayload) derive from this single
-    // value, so all targets see an identical roster snapshot.
-    let bag =
-        build_secret_container(&helpers, &replicas, secrets, owner_replica_id.unwrap_or(0));
-    let derec_secret_bytes = wrap_for_helper_split(&bag, threshold);
+    let secret_vault =
+        build_secret_vault(&helpers, &replicas, secrets, owner_replica_id.unwrap_or(0));
+    let derec_secret_bytes = wrap_for_helper_split(&secret_vault, threshold);
 
     // Version is global across this round; one VSS split feeds both
     // helper distribution and the composite payload sent to Destinations.
@@ -86,8 +81,7 @@ pub(in crate::protocol) async fn start<
 
     // VSS-split the DeRecSecret bytes once. The helper-distribution path
     // and the Destination composite both consume the resulting share map.
-    let helper_channel_ids: Vec<ChannelId> =
-        helpers.iter().map(|(ch, _)| ch.id).collect();
+    let helper_channel_ids: Vec<ChannelId> = helpers.iter().map(|(ch, _)| ch.id).collect();
     let split_result = if !helpers.is_empty() {
         Some(split(
             &helper_channel_ids,
@@ -119,7 +113,7 @@ pub(in crate::protocol) async fn start<
     }
 
     if !replicas.is_empty() {
-        let composite_bytes = build_replica_composite_bytes(&bag, split_result.as_ref());
+        let composite_bytes = build_replica_composite_bytes(&secret_vault, split_result.as_ref());
         let replica_sent = distribute_composite_to_destinations(
             transport,
             &replicas,
@@ -402,7 +396,7 @@ async fn load_paired_targets<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
 /// (via [`wrap_for_helper_split`]) or embed it directly in a
 /// [`ReplicaSecretPayload`] for the Destination path (via
 /// [`build_replica_composite_bytes`]).
-fn build_secret_container(
+fn build_secret_vault(
     paired_helpers: &[(crate::protocol::types::Channel, SharedKey)],
     paired_replicas: &[(crate::protocol::types::Channel, SharedKey)],
     secrets: Vec<UserSecret>,
@@ -420,15 +414,17 @@ fn build_secret_container(
 
     let replica_infos: Vec<crate::protocol::types::ReplicaInfo> = paired_replicas
         .iter()
-        .map(|(channel, shared_key)| crate::protocol::types::ReplicaInfo {
-            channel_id: channel.id.0,
-            transport_uri: channel.transport.uri.to_owned(),
-            shared_key: shared_key.to_vec(),
-            communication_info: channel.communication_info.clone(),
-            replica_id: channel.replica_id.unwrap_or(0),
-            sender_kind: crate::protocol::handlers::pairing::derive_peer_kind(channel.role)
-                as i32,
-        })
+        .map(
+            |(channel, shared_key)| crate::protocol::types::ReplicaInfo {
+                channel_id: channel.id.0,
+                transport_uri: channel.transport.uri.to_owned(),
+                shared_key: shared_key.to_vec(),
+                communication_info: channel.communication_info.clone(),
+                replica_id: channel.replica_id.unwrap_or(0),
+                sender_kind: crate::protocol::handlers::pairing::derive_peer_kind(channel.role)
+                    as i32,
+            },
+        )
         .collect();
 
     SecretContainer {
@@ -600,7 +596,7 @@ pub(in crate::protocol) async fn handle_replica_request<T: DeRecTransport>(
             memo: String::new(),
         }),
         version,
-        timestamp: Some(timestamp.clone()),
+        timestamp: Some(timestamp),
         secret_id,
     };
     let envelope_bytes = DeRecMessageBuilder::channel()
@@ -611,8 +607,6 @@ pub(in crate::protocol) async fn handle_replica_request<T: DeRecTransport>(
         .build()?
         .encode_to_vec();
     let envelope = super::apply_trace_id(envelope_bytes, inbound_trace_id)?;
-    // We already hold the channel, so resolve the endpoint inline rather
-    // than re-loading it via `resolve_response_endpoint`.
     let endpoint = request
         .reply_to
         .clone()
@@ -705,7 +699,7 @@ async fn distribute_composite_to_destinations<T: DeRecTransport>(
             version,
             keep_list: Vec::new(),
             version_description: description.to_owned(),
-            timestamp: Some(timestamp.clone()),
+            timestamp: Some(timestamp),
             secret_id,
             reply_to: reply_to.clone(),
         };

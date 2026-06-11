@@ -183,21 +183,23 @@ public sealed class DeRecProtocol : IDisposable
     public Task<string> GetFingerprintAsync(ulong channelId)
     {
         EnsureNotDisposed();
-        var result = NP.derec_protocol_get_fingerprint(_handle, channelId);
-        try
+        return Task.Run(() =>
         {
-            ThrowOnError(result.Error);
-            if (result.Fingerprint == IntPtr.Zero)
-                throw new InvalidOperationException("get_fingerprint returned null without an error.");
-            string fp = Marshal.PtrToStringUTF8(result.Fingerprint)
-                ?? throw new InvalidOperationException("get_fingerprint returned an invalid UTF-8 string.");
-            return Task.FromResult(fp);
-        }
-        finally
-        {
-            if (result.Fingerprint != IntPtr.Zero)
-                DeRec.Library.Native.Utils.derec_free_string(result.Fingerprint);
-        }
+            var result = NP.derec_protocol_get_fingerprint(_handle, channelId);
+            try
+            {
+                ThrowOnError(result.Error);
+                if (result.Fingerprint == IntPtr.Zero)
+                    throw new InvalidOperationException("get_fingerprint returned null without an error.");
+                return Marshal.PtrToStringUTF8(result.Fingerprint)
+                    ?? throw new InvalidOperationException("get_fingerprint returned an invalid UTF-8 string.");
+            }
+            finally
+            {
+                if (result.Fingerprint != IntPtr.Zero)
+                    DeRec.Library.Native.Utils.derec_free_string(result.Fingerprint);
+            }
+        });
     }
 
     /// <summary>
@@ -210,9 +212,12 @@ public sealed class DeRecProtocol : IDisposable
     {
         EnsureNotDisposed();
         byte[] fpBytes = Encoding.UTF8.GetBytes(fingerprint + '\0');
-        var err = NP.derec_protocol_verify_fingerprint(_handle, channelId, fpBytes, out uint matched);
-        ThrowOnError(err);
-        return Task.FromResult(matched != 0);
+        return Task.Run(() =>
+        {
+            var err = NP.derec_protocol_verify_fingerprint(_handle, channelId, fpBytes, out uint matched);
+            ThrowOnError(err);
+            return matched != 0;
+        });
     }
 
     /// <summary>
@@ -224,17 +229,20 @@ public sealed class DeRecProtocol : IDisposable
     {
         EnsureNotDisposed();
         uint has = channelId.HasValue ? 1u : 0u;
-        var result = NP.derec_protocol_create_contact(
-            _handle, has, channelId ?? 0ul, (int)contactMode);
-        try
+        ulong id = channelId ?? 0ul;
+        return Task.Run(() =>
         {
-            ThrowOnError(result.Error);
-            return Task.FromResult(DeRec.Library.Utils.CopyBuffer(result.ContactWireBytes));
-        }
-        finally
-        {
-            DeRec.Library.Utils.FreeBuffer(result.ContactWireBytes);
-        }
+            var result = NP.derec_protocol_create_contact(_handle, has, id, (int)contactMode);
+            try
+            {
+                ThrowOnError(result.Error);
+                return DeRec.Library.Utils.CopyBuffer(result.ContactWireBytes);
+            }
+            finally
+            {
+                DeRec.Library.Utils.FreeBuffer(result.ContactWireBytes);
+            }
+        });
     }
 
     /// <summary>
@@ -245,10 +253,12 @@ public sealed class DeRecProtocol : IDisposable
     {
         EnsureNotDisposed();
         byte[] json = JsonSerializer.SerializeToUtf8Bytes(@params, JsonOpts);
-        var result = NP.derec_protocol_start(
-            _handle, (uint)flowKind, json, (UIntPtr)json.Length);
-        ThrowOnError(result.Error);
-        return Task.FromResult<ulong?>(result.HasChannelId != 0 ? result.ChannelId : null);
+        return Task.Run<ulong?>(() =>
+        {
+            var result = NP.derec_protocol_start(_handle, (uint)flowKind, json, (UIntPtr)json.Length);
+            ThrowOnError(result.Error);
+            return result.HasChannelId != 0 ? result.ChannelId : null;
+        });
     }
 
     /// <summary>
@@ -260,20 +270,21 @@ public sealed class DeRecProtocol : IDisposable
     public Task<IReadOnlyList<DeRecEvent>> AcceptAsync(byte[] actionBytes)
     {
         EnsureNotDisposed();
-        var result = NP.derec_protocol_accept(
-            _handle, actionBytes, (UIntPtr)actionBytes.Length);
-        try
+        return Task.Run<IReadOnlyList<DeRecEvent>>(() =>
         {
-            ThrowOnError(result.Error);
-            byte[] json = DeRec.Library.Utils.CopyBuffer(result.EventsJson);
-            var events = JsonSerializer.Deserialize<List<DeRecEvent>>(json, JsonOpts)
-                ?? new List<DeRecEvent>();
-            return Task.FromResult<IReadOnlyList<DeRecEvent>>(events);
-        }
-        finally
-        {
-            DeRec.Library.Utils.FreeBuffer(result.EventsJson);
-        }
+            var result = NP.derec_protocol_accept(_handle, actionBytes, (UIntPtr)actionBytes.Length);
+            try
+            {
+                ThrowOnError(result.Error);
+                byte[] json = DeRec.Library.Utils.CopyBuffer(result.EventsJson);
+                return JsonSerializer.Deserialize<List<DeRecEvent>>(json, JsonOpts)
+                    ?? new List<DeRecEvent>();
+            }
+            finally
+            {
+                DeRec.Library.Utils.FreeBuffer(result.EventsJson);
+            }
+        });
     }
 
     /// <summary>
@@ -285,11 +296,13 @@ public sealed class DeRecProtocol : IDisposable
         EnsureNotDisposed();
         byte[]? memoBytes = string.IsNullOrEmpty(memo) ? null : Encoding.UTF8.GetBytes(memo);
         UIntPtr memoLen = (UIntPtr)(memoBytes?.Length ?? 0);
-        var err = NP.derec_protocol_reject(
-            _handle, actionBytes, (UIntPtr)actionBytes.Length,
-            status, memoBytes, memoLen);
-        ThrowOnError(err);
-        return Task.CompletedTask;
+        return Task.Run(() =>
+        {
+            var err = NP.derec_protocol_reject(
+                _handle, actionBytes, (UIntPtr)actionBytes.Length,
+                status, memoBytes, memoLen);
+            ThrowOnError(err);
+        });
     }
 
     /// <summary>
@@ -320,20 +333,21 @@ public sealed class DeRecProtocol : IDisposable
     public Task<IReadOnlyList<DeRecEvent>> ProcessAsync(byte[] message)
     {
         EnsureNotDisposed();
-        var result = NP.derec_protocol_process(
-            _handle, message, (UIntPtr)message.Length);
-        try
+        return Task.Run<IReadOnlyList<DeRecEvent>>(() =>
         {
-            ThrowOnError(result.Error);
-            byte[] json = DeRec.Library.Utils.CopyBuffer(result.EventsJson);
-            var events = JsonSerializer.Deserialize<List<DeRecEvent>>(json, JsonOpts)
-                ?? new List<DeRecEvent>();
-            return Task.FromResult<IReadOnlyList<DeRecEvent>>(events);
-        }
-        finally
-        {
-            DeRec.Library.Utils.FreeBuffer(result.EventsJson);
-        }
+            var result = NP.derec_protocol_process(_handle, message, (UIntPtr)message.Length);
+            try
+            {
+                ThrowOnError(result.Error);
+                byte[] json = DeRec.Library.Utils.CopyBuffer(result.EventsJson);
+                return JsonSerializer.Deserialize<List<DeRecEvent>>(json, JsonOpts)
+                    ?? new List<DeRecEvent>();
+            }
+            finally
+            {
+                DeRec.Library.Utils.FreeBuffer(result.EventsJson);
+            }
+        });
     }
 
     /// <summary>

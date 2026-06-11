@@ -260,8 +260,6 @@ export type DeRecEvent =
   | {
       type: "ChannelInfoUpdated";
       channel_id: string;
-      peer_communication_info?: Record<string, string>;
-      peer_transport_uri?: string;
     }
   /** The peer answered our outbound `UpdateChannelInfo` with a
    *  non-`Ok` status. Local state is not rolled back — the app decides

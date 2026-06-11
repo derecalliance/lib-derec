@@ -18,9 +18,6 @@ use derec_proto::{
 use prost::Message;
 use std::collections::HashMap;
 
-/// Returned when an `UpdateChannelInfo` request has both `communication_info`
-/// and `transport_protocol` set to `None` — a no-op the protocol refuses
-/// rather than silently ack.
 const EMPTY_UPDATE_ERROR: Error = Error::InvalidInput(
     "UpdateChannelInfo requires at least one of communication_info or transport_protocol",
 );
@@ -136,15 +133,17 @@ pub(in crate::protocol) async fn accept<Ch: DeRecChannelStore, T: DeRecTransport
             "channel id not present in channel store",
         ))?;
 
-    let new_communication_info = request.communication_info.as_ref().map(|ci| {
-        let map = extract_communication_info(ci);
-        channel.communication_info = map.clone();
-        map
-    });
+    #[cfg(feature = "logging")]
+    let communication_info_updated = request.communication_info.is_some();
+    #[cfg(feature = "logging")]
+    let transport_protocol_updated = request.transport_protocol.is_some();
 
-    let new_transport_protocol = request.transport_protocol.clone().inspect(|tp| {
-        channel.transport = tp.clone();
-    });
+    if let Some(ci) = request.communication_info.as_ref() {
+        channel.communication_info = extract_communication_info(ci);
+    }
+    if let Some(tp) = request.transport_protocol.clone() {
+        channel.transport = tp;
+    }
 
     channel_store.save(channel).await?;
 
@@ -172,16 +171,12 @@ pub(in crate::protocol) async fn accept<Ch: DeRecChannelStore, T: DeRecTransport
     #[cfg(feature = "logging")]
     tracing::info!(
         channel_id = channel_id.0,
-        communication_info_updated = new_communication_info.is_some(),
-        transport_protocol_updated = new_transport_protocol.is_some(),
+        communication_info_updated,
+        transport_protocol_updated,
         "update_channel_info applied; Ok response sent"
     );
 
-    Ok(vec![DeRecEvent::ChannelInfoUpdated {
-        channel_id,
-        communication_info: new_communication_info,
-        transport_protocol: new_transport_protocol,
-    }])
+    Ok(vec![DeRecEvent::ChannelInfoUpdated { channel_id }])
 }
 
 #[cfg_attr(
@@ -257,10 +252,9 @@ fn on_response(
     channel_id: ChannelId,
     response: &UpdateChannelInfoResponseMessage,
 ) -> Result<Vec<DeRecEvent>> {
-    let result = response
-        .result
-        .as_ref()
-        .ok_or(Error::Invariant("update_channel_info response missing result"))?;
+    let result = response.result.as_ref().ok_or(Error::Invariant(
+        "update_channel_info response missing result",
+    ))?;
 
     if result.status == StatusEnum::Ok as i32 {
         #[cfg(feature = "logging")]
@@ -268,15 +262,7 @@ fn on_response(
             channel_id = channel_id.0,
             "update_channel_info acknowledged"
         );
-        // The initiator's local state is already authoritative — it was
-        // mutated via `DeRecProtocol::set_*` before this flow was started.
-        // The event surfaces the confirmation only; no fields are reported
-        // because the initiator already knows what it sent.
-        Ok(vec![DeRecEvent::ChannelInfoUpdated {
-            channel_id,
-            communication_info: None,
-            transport_protocol: None,
-        }])
+        Ok(vec![DeRecEvent::ChannelInfoUpdated { channel_id }])
     } else {
         #[cfg(feature = "logging")]
         tracing::warn!(
@@ -298,9 +284,9 @@ fn build_communication_info_proto(info: &HashMap<String, String>) -> Communicati
         .iter()
         .map(|(k, v)| derec_proto::CommunicationInfoKeyValue {
             key: k.to_owned(),
-            value: Some(derec_proto::communication_info_key_value::Value::StringValue(
-                v.to_owned(),
-            )),
+            value: Some(
+                derec_proto::communication_info_key_value::Value::StringValue(v.to_owned()),
+            ),
         })
         .collect();
     CommunicationInfo {
@@ -321,4 +307,3 @@ fn extract_communication_info(info: &CommunicationInfo) -> HashMap<String, Strin
         })
         .collect()
 }
-

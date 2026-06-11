@@ -67,7 +67,6 @@ impl
         BuilderSlotMissingMarker,
     >
 {
-    /// Create a new builder. See each `with_*` setter for its default value.
     pub fn new() -> Self {
         Self {
             channel_store: BuilderSlotMissingMarker,

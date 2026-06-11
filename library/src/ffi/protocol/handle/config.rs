@@ -1,0 +1,87 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Runtime-mutable configuration entry points — counterpart to the
+//! `DeRecProtocol::set_*` methods.
+
+use std::collections::HashMap;
+
+use super::DeRecProtocolHandle;
+use crate::ffi::error::{
+    ffi_error, success, DeRecError, DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_NULL_PTR,
+};
+use derec_proto::TransportProtocol;
+
+/// Replace this node's local `communication_info` map. Does not contact
+/// peers — follow up with `start(FlowKind::UpdateChannelInfo)` to
+/// propagate. The body is the same JSON wire shape used elsewhere on
+/// the FFI: a UTF-8 JSON object with string keys + string values.
+///
+/// # Safety
+///
+/// `handle` must be a valid pointer returned by
+/// [`super::derec_protocol_new`]. `info_json_ptr`/`info_json_len` must
+/// describe a readable byte range.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn derec_protocol_set_communication_info(
+    handle: *mut DeRecProtocolHandle,
+    info_json_ptr: *const u8,
+    info_json_len: usize,
+) -> DeRecError {
+    if handle.is_null() {
+        return ffi_error(DEREC_CODE_FFI_NULL_PTR, "handle is null");
+    }
+    let info: HashMap<String, String> = if info_json_len == 0 {
+        HashMap::new()
+    } else if info_json_ptr.is_null() {
+        return ffi_error(DEREC_CODE_FFI_NULL_PTR, "info_json_ptr null with len > 0");
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(info_json_ptr, info_json_len) };
+        match serde_json::from_slice(bytes) {
+            Ok(m) => m,
+            Err(e) => {
+                return ffi_error(
+                    DEREC_CODE_FFI_BAD_PROTO,
+                    format!("invalid communication_info JSON: {e}"),
+                );
+            }
+        }
+    };
+    let h = unsafe { &mut *handle };
+    h.inner.set_communication_info(info);
+    success()
+}
+
+/// Replace this node's local transport endpoint. See
+/// [`crate::protocol::DeRecProtocol::set_own_transport`] for the
+/// changeover discipline (keep the old endpoint up during the
+/// transition).
+///
+/// # Safety
+///
+/// `handle` must be a valid pointer returned by
+/// [`super::derec_protocol_new`]. `uri_ptr`/`uri_len` must describe a
+/// readable byte range.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn derec_protocol_set_own_transport(
+    handle: *mut DeRecProtocolHandle,
+    uri_ptr: *const u8,
+    uri_len: usize,
+    protocol: i32,
+) -> DeRecError {
+    if handle.is_null() {
+        return ffi_error(DEREC_CODE_FFI_NULL_PTR, "handle is null");
+    }
+    if uri_len == 0 || uri_ptr.is_null() {
+        return ffi_error(DEREC_CODE_FFI_NULL_PTR, "uri_ptr null or len == 0");
+    }
+    let uri = {
+        let bytes = unsafe { std::slice::from_raw_parts(uri_ptr, uri_len) };
+        match std::str::from_utf8(bytes) {
+            Ok(s) => s.to_owned(),
+            Err(_) => return ffi_error(DEREC_CODE_FFI_BAD_PROTO, "uri is not valid UTF-8"),
+        }
+    };
+    let h = unsafe { &mut *handle };
+    h.inner.set_own_transport(TransportProtocol { uri, protocol });
+    success()
+}

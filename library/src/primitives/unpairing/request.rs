@@ -10,8 +10,7 @@ use prost::Message;
 
 pub struct ProduceResult {
     /// Serialized outer [`derec_proto::DeRecMessage`] envelope carrying an
-    /// encrypted inner [`derec_proto::UnpairRequestMessage`]. Ready to send
-    /// over transport.
+    /// encrypted inner [`derec_proto::UnpairRequestMessage`].
     pub envelope: Vec<u8>,
 }
 
