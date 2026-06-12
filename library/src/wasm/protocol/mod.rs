@@ -65,10 +65,16 @@ use serde::Serialize;
 use crate::wasm::primitives::pairing::ContactMessage as PairingContactMessage;
 use derec_proto::{SenderKind, TransportProtocol};
 use js_sys::{Array, Uint8Array};
-use stores::{JsChannelStore, JsSecretStore, JsShareStore, JsTransport};
+use stores::{JsChannelStore, JsSecretStore, JsShareStore, JsTransport, JsUserSecretStore};
 use wasm_bindgen::prelude::*;
 
-type WasmProtocol = DeRecProtocol<JsChannelStore, JsShareStore, JsSecretStore, JsTransport>;
+type WasmProtocol = DeRecProtocol<
+    JsChannelStore,
+    JsShareStore,
+    JsSecretStore,
+    JsUserSecretStore,
+    JsTransport,
+>;
 
 /// Higher-level DeRec protocol orchestrator for TypeScript/JavaScript consumers.
 ///
@@ -117,9 +123,11 @@ pub struct DeRecProtocolWasm {
 /// builder.
 #[wasm_bindgen(js_name = DeRecProtocolBuilder)]
 pub struct DeRecProtocolBuilderWasm {
+    secret_id: u64,
     channel_store: Option<JsValue>,
     share_store: Option<JsValue>,
     secret_store: Option<JsValue>,
+    user_secret_store: Option<JsValue>,
     transport: Option<JsValue>,
     own_transport_uri: Option<String>,
     own_transport_protocol_num: Option<i32>,
@@ -135,12 +143,19 @@ pub struct DeRecProtocolBuilderWasm {
 
 #[wasm_bindgen(js_class = DeRecProtocolBuilder)]
 impl DeRecProtocolBuilderWasm {
+    /// `secretId` is a JS `bigint` or `number`. Identifies the single
+    /// vault this protocol instance manages; apps that juggle multiple
+    /// vaults instantiate one protocol per id.
     #[wasm_bindgen(constructor)]
-    pub fn new() -> DeRecProtocolBuilderWasm {
-        DeRecProtocolBuilderWasm {
+    pub fn new(secret_id: JsValue) -> Result<DeRecProtocolBuilderWasm, JsValue> {
+        let secret_id = js_value_to_u64(secret_id)
+            .map_err(|e| js_error("INVALID_SECRET_ID", format!("{e:?}")))?;
+        Ok(DeRecProtocolBuilderWasm {
+            secret_id,
             channel_store: None,
             share_store: None,
             secret_store: None,
+            user_secret_store: None,
             transport: None,
             own_transport_uri: None,
             own_transport_protocol_num: None,
@@ -152,7 +167,7 @@ impl DeRecProtocolBuilderWasm {
             unpair_ack: UnpairAck::Required,
             auto_reply_to: false,
             replica_id: None,
-        }
+        })
     }
 
     #[wasm_bindgen(js_name = withChannelStore)]
@@ -170,6 +185,12 @@ impl DeRecProtocolBuilderWasm {
     #[wasm_bindgen(js_name = withSecretStore)]
     pub fn with_secret_store(mut self, store: JsValue) -> DeRecProtocolBuilderWasm {
         self.secret_store = Some(store);
+        self
+    }
+
+    #[wasm_bindgen(js_name = withUserSecretStore)]
+    pub fn with_user_secret_store(mut self, store: JsValue) -> DeRecProtocolBuilderWasm {
+        self.user_secret_store = Some(store);
         self
     }
 
@@ -303,6 +324,9 @@ impl DeRecProtocolBuilderWasm {
         let secret_store = self
             .secret_store
             .ok_or_else(|| js_error("BUILDER_MISSING", "withSecretStore is required"))?;
+        let user_secret_store = self
+            .user_secret_store
+            .ok_or_else(|| js_error("BUILDER_MISSING", "withUserSecretStore is required"))?;
         let transport = self
             .transport
             .ok_or_else(|| js_error("BUILDER_MISSING", "withTransport is required"))?;
@@ -318,10 +342,11 @@ impl DeRecProtocolBuilderWasm {
             protocol: own_transport_protocol,
         };
 
-        let mut builder = DeRecProtocolBuilder::new()
+        let mut builder = DeRecProtocolBuilder::new(self.secret_id)
             .with_channel_store(JsChannelStore(channel_store))
             .with_share_store(JsShareStore(share_store))
             .with_secret_store(JsSecretStore(secret_store))
+            .with_user_secret_store(JsUserSecretStore(user_secret_store))
             .with_transport(JsTransport(transport))
             .with_own_transport(own_transport)
             .with_threshold(self.threshold as usize)
@@ -361,6 +386,12 @@ impl DeRecProtocolWasm {
     ///   for `HashedKeys` (contact carries only a SHA-384 binding hash; the
     ///   scanner fetches keys via a `PrePair` round-trip). `HashedKeys`
     ///   requires the protocol's `own_transport` to be ephemeral.
+    /// The vault identifier this protocol instance is bound to.
+    #[wasm_bindgen(js_name = "secretId")]
+    pub fn secret_id(&self) -> u64 {
+        self.inner.secret_id()
+    }
+
     #[wasm_bindgen(js_name = "createContact")]
     pub async fn create_contact(
         &mut self,
@@ -745,17 +776,22 @@ pub async fn restore_from_recovered_bag(
         };
 
         ch_store
-            .save(channel)
+            .save(secret_id_u64, channel)
             .await
             .map_err(|e| js_error("CHANNEL_STORE_SAVE", e.to_string()))?;
 
         sec_store
-            .save(channel_id, SecretValue::SharedKey(shared_key))
+            .save(
+                secret_id_u64,
+                channel_id,
+                SecretValue::SharedKey(shared_key),
+            )
             .await
             .map_err(|e| js_error("SECRET_STORE_SAVE", e.to_string()))?;
 
         sh_store
             .save(
+                secret_id_u64,
                 channel_id,
                 Share {
                     secret_id: secret_id_u64,
@@ -954,12 +990,6 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
         }
         2 => {
             // ProtectSecret
-            let secret_id_val = js_sys::Reflect::get(&params, &JsValue::from_str("secretId"))
-                .map_err(|e| js_error("DECODE_ERROR", format!("missing secretId: {e:?}")))?;
-            let secret_id = js_value_to_u64(secret_id_val)?;
-            let target_val = js_sys::Reflect::get(&params, &JsValue::from_str("target"))
-                .unwrap_or(JsValue::UNDEFINED);
-            let target = parse_target(target_val)?;
             let secrets_val = js_sys::Reflect::get(&params, &JsValue::from_str("secrets"))
                 .map_err(|e| js_error("DECODE_ERROR", format!("missing secrets: {e:?}")))?;
             let secrets = parse_user_secrets(secrets_val)?;
@@ -967,8 +997,6 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
                 .unwrap_or(JsValue::UNDEFINED)
                 .as_string();
             Ok(DeRecFlow::ProtectSecret {
-                secret_id,
-                target,
                 secrets,
                 description,
             })

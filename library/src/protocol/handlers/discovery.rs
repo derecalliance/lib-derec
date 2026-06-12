@@ -51,13 +51,14 @@ pub(in crate::protocol) async fn start<
     channel_store: &mut Ch,
     secret_store: &mut Ss,
     transport: &T,
+    secret_id: u64,
     target: Target,
     reply_to: Option<derec_proto::TransportProtocol>,
 ) -> Result<()> {
     // Filter Target::Single/Many to known channels; user input may include
     // unpaired ids and those would otherwise trip the invariant check below.
     let known_channel_ids: std::collections::HashSet<ChannelId> = channel_store
-        .channels()
+        .channels(secret_id)
         .await?
         .into_iter()
         .map(|ch| ch.id)
@@ -78,7 +79,7 @@ pub(in crate::protocol) async fn start<
     };
 
     let keys = secret_store
-        .load_many(&channel_ids, SecretKind::SharedKey, MissingPolicy::Fail)
+        .load_many(secret_id, &channel_ids, SecretKind::SharedKey, MissingPolicy::Fail)
         .await?;
 
     for (channel_id, value) in keys {
@@ -86,7 +87,7 @@ pub(in crate::protocol) async fn start<
             continue;
         };
 
-        let endpoint = peer_endpoint(channel_store, channel_id).await?;
+        let endpoint = peer_endpoint(channel_store, secret_id, channel_id).await?;
         let msg = request::produce(channel_id, &shared_key, reply_to.clone())?;
         let envelope = super::apply_trace_id(msg.envelope, super::fresh_trace_id())?;
         transport.send(&endpoint, envelope).await?;
@@ -113,13 +114,14 @@ pub(in crate::protocol) async fn accept<
     channel_store: &mut Ch,
     share_store: &mut Sh,
     transport: &T,
+    secret_id: u64,
     channel_id: ChannelId,
     request: &GetSecretIdsVersionsRequestMessage,
     shared_key: &SharedKey,
     trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
-    let linked_ids = channel_store.linked_channels(channel_id).await?;
-    let all_shares = share_store.load_all(&linked_ids).await?;
+    let linked_ids = channel_store.linked_channels(secret_id, channel_id).await?;
+    let all_shares = share_store.load_all(secret_id, &linked_ids).await?;
 
     // Group by secret_id across all linked channels, deduplicating by version.
     // Key: secret_id (u64) → version → description.
@@ -154,9 +156,13 @@ pub(in crate::protocol) async fn accept<
     let resp = response::produce(channel_id, &secret_list, shared_key)?;
 
     let envelope = super::apply_trace_id(resp.envelope, trace_id)?;
-    let endpoint =
-        super::resolve_response_endpoint(channel_store, channel_id, request.reply_to.as_ref())
-            .await?;
+    let endpoint = super::resolve_response_endpoint(
+        channel_store,
+        secret_id,
+        channel_id,
+        request.reply_to.as_ref(),
+    )
+    .await?;
     transport.send(&endpoint, envelope).await?;
 
     #[cfg(feature = "logging")]
@@ -173,6 +179,7 @@ pub(in crate::protocol) async fn accept<
 pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport>(
     channel_store: &mut Ch,
     transport: &T,
+    secret_id: u64,
     channel_id: ChannelId,
     request: &GetSecretIdsVersionsRequestMessage,
     shared_key: &SharedKey,
@@ -192,6 +199,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
     super::send_channel_message(
         channel_store,
         transport,
+        secret_id,
         channel_id,
         MessageBody::GetSecretIdsVersionsResponse(response),
         shared_key,

@@ -75,12 +75,12 @@ public sealed record SecretValue(SecretKind Kind, byte[] Bytes);
 /// </summary>
 public interface IChannelStore
 {
-    Channel? Load(ulong channelId);
-    void Save(Channel channel);
-    bool Remove(ulong channelId);
-    IEnumerable<ulong> ListChannelIds();
-    void LinkChannel(ulong a, ulong b);
-    IEnumerable<ulong> LinkedChannels(ulong channelId);
+    Channel? Load(ulong secretId, ulong channelId);
+    void Save(ulong secretId, Channel channel);
+    bool Remove(ulong secretId, ulong channelId);
+    IEnumerable<ulong> ListChannelIds(ulong secretId);
+    void LinkChannel(ulong secretId, ulong a, ulong b);
+    IEnumerable<ulong> LinkedChannels(ulong secretId, ulong channelId);
 }
 
 /// <summary>
@@ -89,9 +89,9 @@ public interface IChannelStore
 /// </summary>
 public interface ISecretStore
 {
-    SecretValue? Load(ulong channelId, SecretKind kind);
-    void Save(ulong channelId, SecretValue value);
-    void Remove(ulong channelId, SecretKind kind);
+    SecretValue? Load(ulong secretId, ulong channelId, SecretKind kind);
+    void Save(ulong secretId, ulong channelId, SecretValue value);
+    void Remove(ulong secretId, ulong channelId, SecretKind kind);
 }
 
 /// <summary>
@@ -111,27 +111,65 @@ public sealed record Share(ulong SecretId, uint Version, byte[] Bytes);
 public interface IShareStore
 {
     /// <summary>
-    /// Shares for a single channel, scoped to one secret. Pass an
-    /// empty <paramref name="versions"/> slice for all versions.
+    /// Shares for a single channel within <paramref name="secretId"/>.
+    /// Pass an empty <paramref name="versions"/> array for all versions.
     /// </summary>
-    IEnumerable<Share> Load(ulong channelId, ulong secretId, uint[] versions);
+    IEnumerable<Share> Load(ulong secretId, ulong channelId, uint[] versions);
     /// <summary>
-    /// Shares across several channels, scoped to one secret. Recovery
-    /// resolves the linked-channel set via
-    /// <see cref="IChannelStore.LinkedChannels"/> first, then calls this.
+    /// Shares across several channels within <paramref name="secretId"/>.
     /// </summary>
-    IEnumerable<Share> LoadMany(ulong[] channelIds, ulong secretId, uint[] versions);
+    IEnumerable<Share> LoadMany(ulong secretId, ulong[] channelIds, uint[] versions);
     /// <summary>
-    /// Every share across the given channels — discovery only (no
-    /// <c>secret_id</c> filter).
+    /// Every share stored under <paramref name="secretId"/> across the
+    /// given channels (used by Discovery for this vault).
     /// </summary>
-    IEnumerable<Share> LoadAll(ulong[] channelIds);
+    IEnumerable<Share> LoadAll(ulong secretId, ulong[] channelIds);
     /// <summary>
-    /// Highest version stored anywhere, or <c>null</c> if empty.
+    /// Highest version stored for <paramref name="secretId"/>, or
+    /// <c>null</c> if no shares exist yet for this vault.
     /// </summary>
-    uint? LatestVersion();
-    void Save(ulong channelId, Share share);
-    void RemoveChannel(ulong channelId);
+    uint? LatestVersion(ulong secretId);
+    void Save(ulong secretId, ulong channelId, Share share);
+    void RemoveChannel(ulong secretId, ulong channelId);
+}
+
+/// <summary>
+/// One user-secret entry inside the vault. Wire-equivalent to the Rust
+/// <c>UserSecret</c> — <see cref="Id"/> is an app-defined identifier,
+/// <see cref="Name"/> is a human-readable label, <see cref="Data"/> is
+/// the raw bytes.
+/// </summary>
+public sealed record UserSecretEntry(byte[] Id, string Name, byte[] Data);
+
+/// <summary>
+/// Snapshot of the user-facing vault contents written every time the
+/// application calls <c>start(FlowKind.ProtectSecret)</c>. The
+/// pair-completion auto-publish hook reads it back so freshly-paired
+/// peers receive the current vault without an explicit re-publish.
+/// </summary>
+public sealed record UserSecrets(uint Version, UserSecretEntry[] Secrets, string? Description);
+
+/// <summary>
+/// Persistence for the user-facing vault contents, keyed by
+/// <c>secret_id</c>. One <c>secret_id</c> maps to at most one stored
+/// <see cref="UserSecrets"/> entry — the most recent snapshot.
+/// </summary>
+public interface IUserSecretStore
+{
+    /// <summary>
+    /// Return the latest snapshot for <paramref name="secretId"/>, or
+    /// <c>null</c> if the application has never published for this id
+    /// on this instance.
+    /// </summary>
+    UserSecrets? LoadLatest(ulong secretId);
+    /// <summary>
+    /// Overwrite the snapshot for <paramref name="secretId"/>.
+    /// </summary>
+    void SaveLatest(ulong secretId, UserSecrets value);
+    /// <summary>
+    /// Drop the snapshot for <paramref name="secretId"/>. Idempotent.
+    /// </summary>
+    void Remove(ulong secretId);
 }
 
 /// <summary>

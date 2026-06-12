@@ -4,7 +4,6 @@ use super::super::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport,
     MissingPolicy, PendingAction, SecretKind, SecretValue, Share,
 };
-use super::resolve_target;
 use crate::derec_message::DeRecMessageBuilder;
 use crate::primitives::sharing::request::SHARE_ALGORITHM_REPLICA_VAULT;
 use crate::{
@@ -14,7 +13,7 @@ use crate::{
         request::{produce as produce_store_share_request_message, split},
         response::{self as sharing_response},
     },
-    protocol::types::{HelperInfo, SecretContainer, Target, UserSecret},
+    protocol::types::{HelperInfo, SecretContainer, UserSecret},
     types::{ChannelId, SharedKey},
 };
 use derec_proto::{
@@ -61,13 +60,17 @@ pub(in crate::protocol) async fn start<
     threshold: usize,
     keep_versions_count: usize,
     secret_id: u64,
-    target: Target,
     reply_to: Option<derec_proto::TransportProtocol>,
     owner_replica_id: Option<u64>,
-) -> Result<(u32, Vec<ChannelId>)> {
-    let (helpers, replicas) = load_paired_targets(channel_store, secret_store, target).await?;
+) -> Result<Option<(u32, Vec<ChannelId>)>> {
+    let (helpers, replicas) =
+        load_all_paired_targets(channel_store, secret_store, secret_id).await?;
+
+    // No paired peers — the vault has nowhere to land. Callers treat
+    // this as a no-op so the auto-publish-on-pair hook can fire safely
+    // even when no helpers/replicas exist yet.
     if helpers.is_empty() && replicas.is_empty() {
-        return Err(Error::InvalidInput("no paired targets in set"));
+        return Ok(None);
     }
 
     let secret_vault =
@@ -76,13 +79,16 @@ pub(in crate::protocol) async fn start<
 
     // Version is global across this round; one VSS split feeds both
     // helper distribution and the composite payload sent to Destinations.
-    let version = share_store.latest_version().await?.map_or(1, |v| v + 1);
+    let version = share_store.latest_version(secret_id).await?.map_or(1, |v| v + 1);
     let description = description.as_deref().unwrap_or("").to_owned();
 
     // VSS-split the DeRecSecret bytes once. The helper-distribution path
     // and the Destination composite both consume the resulting share map.
+    // Below the configured threshold, no split runs — Helpers receive
+    // nothing this round and any paired Replicas receive a "vault-only"
+    // composite (no share material).
     let helper_channel_ids: Vec<ChannelId> = helpers.iter().map(|(ch, _)| ch.id).collect();
-    let split_result = if !helpers.is_empty() {
+    let split_result = if helpers.len() >= threshold {
         Some(split(
             &helper_channel_ids,
             secret_id,
@@ -127,7 +133,7 @@ pub(in crate::protocol) async fn start<
         sent_channels.extend(replica_sent);
     }
 
-    Ok((version, sent_channels))
+    Ok(Some((version, sent_channels)))
 }
 
 #[cfg_attr(
@@ -149,18 +155,19 @@ pub(in crate::protocol) async fn accept<
     channel_store: &mut Ch,
     share_store: &mut Sh,
     transport: &T,
+    secret_id: u64,
     channel_id: ChannelId,
     request: &StoreShareRequestMessage,
     shared_key: &SharedKey,
     trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
-    let secret_id = request.secret_id;
     let version = request.version;
     let encoded_request = request.encode_to_vec();
     let resp = sharing_response::produce(channel_id, request, shared_key)?;
 
     share_store
         .save(
+            secret_id,
             channel_id,
             Share {
                 secret_id,
@@ -171,9 +178,13 @@ pub(in crate::protocol) async fn accept<
         .await?;
 
     let envelope = super::apply_trace_id(resp.envelope, trace_id)?;
-    let endpoint =
-        super::resolve_response_endpoint(channel_store, channel_id, request.reply_to.as_ref())
-            .await?;
+    let endpoint = super::resolve_response_endpoint(
+        channel_store,
+        secret_id,
+        channel_id,
+        request.reply_to.as_ref(),
+    )
+    .await?;
     transport.send(&endpoint, envelope).await?;
 
     #[cfg(feature = "logging")]
@@ -204,6 +215,7 @@ pub(in crate::protocol) async fn accept<
 pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport>(
     channel_store: &mut Ch,
     transport: &T,
+    secret_id: u64,
     channel_id: ChannelId,
     request: &StoreShareRequestMessage,
     shared_key: &SharedKey,
@@ -223,6 +235,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
     super::send_channel_message(
         channel_store,
         transport,
+        secret_id,
         channel_id,
         MessageBody::StoreShareResponse(response),
         shared_key,
@@ -327,37 +340,54 @@ fn on_response(
     }
 }
 
-/// Resolve a target set into `(helpers, replicas)` keyed by channel role.
+/// Resolve all currently-paired publish targets into `(helpers, replicas)`
+/// keyed by channel role.
 ///
 /// Both vectors carry `(Channel, SharedKey)` pairs ready for envelope
-/// construction. `Channel.role` records the **local** kind, so on the
-/// owner's machine a helper-paired channel has `role == Owner` (peer is
-/// a Helper, this is a "helper target") and a replica-paired channel has
-/// `role == Replica`. Channels with `role == Helper` (we're the helper)
-/// are not legitimate `ProtectSecret` initiators and are silently
-/// dropped here — the orchestrator-level role gate refuses them up
-/// front.
-async fn load_paired_targets<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
+/// construction. The protocol publishes the vault to *every* paired
+/// peer that can receive it — apps no longer subset the target — so
+/// selection is driven entirely by channel state:
+/// `role == Owner` (peer is a Helper) lands in `helpers`,
+/// `role == ReplicaSource` (peer is a ReplicaDestination) lands in
+/// `replicas`. Channels with any other `role` (e.g. `Helper` — we're the
+/// helper on the channel) are ignored.
+///
+/// `ChannelStatus::Pending` channels (replicas awaiting fingerprint
+/// verification) are excluded to prevent a MITM-leaning peer from
+/// receiving vault material before the user confirms the fingerprint
+/// out-of-band.
+async fn load_all_paired_targets<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     channel_store: &mut Ch,
     secret_store: &mut Ss,
-    target: Target,
+    secret_id: u64,
 ) -> Result<(
     Vec<(crate::protocol::types::Channel, SharedKey)>,
     Vec<(crate::protocol::types::Channel, SharedKey)>,
 )> {
-    let selected_ids = resolve_target(channel_store, target).await?;
-    if selected_ids.is_empty() {
+    let all_channels = channel_store.channels(secret_id).await?;
+    let selected_channels: Vec<crate::protocol::types::Channel> = all_channels
+        .into_iter()
+        .filter(|c| {
+            matches!(
+                c.role,
+                SenderKind::Owner | SenderKind::ReplicaSource
+            ) && c.status == crate::protocol::types::ChannelStatus::Paired
+        })
+        .collect();
+
+    if selected_channels.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
 
-    let all_channels = channel_store.channels().await?;
-    let selected_channels: Vec<crate::protocol::types::Channel> = all_channels
-        .into_iter()
-        .filter(|c| selected_ids.contains(&c.id))
-        .collect();
+    let selected_ids: Vec<ChannelId> = selected_channels.iter().map(|c| c.id).collect();
 
     let mut keys: std::collections::HashMap<ChannelId, SharedKey> = secret_store
-        .load_many(&selected_ids, SecretKind::SharedKey, MissingPolicy::Fail)
+        .load_many(
+            secret_id,
+            &selected_ids,
+            SecretKind::SharedKey,
+            MissingPolicy::Fail,
+        )
         .await?
         .into_iter()
         .filter_map(|(cid, v)| match v {
@@ -519,6 +549,7 @@ async fn distribute_shares<Sh: DeRecShareStore, T: DeRecTransport>(
 
         share_store
             .save(
+                secret_id,
                 channel.id,
                 Share {
                     secret_id,

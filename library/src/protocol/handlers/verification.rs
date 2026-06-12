@@ -27,6 +27,7 @@ use prost::Message;
 )]
 pub(in crate::protocol) async fn handle<Sh: DeRecShareStore>(
     share_store: &mut Sh,
+    secret_id: u64,
     channel_id: ChannelId,
     inner: MessageBody,
     shared_key: SharedKey,
@@ -37,7 +38,7 @@ pub(in crate::protocol) async fn handle<Sh: DeRecShareStore>(
             on_request(channel_id, request, shared_key, inbound_trace_id)
         }
         MessageBody::VerifyShareResponse(response) => {
-            on_response(share_store, channel_id, &response).await
+            on_response(share_store, secret_id, channel_id, &response).await
         }
         _ => Err(Error::Invariant(
             "unexpected MessageBody variant in verification handler",
@@ -63,7 +64,7 @@ pub(in crate::protocol) async fn start<
     secret_id: u64,
     reply_to: Option<derec_proto::TransportProtocol>,
 ) -> Result<()> {
-    let all_channels = channel_store.channels().await?;
+    let all_channels = channel_store.channels(secret_id).await?;
     let all_channel_ids: Vec<ChannelId> = all_channels.iter().map(|c| c.id).collect();
 
     let channel_ids = match target {
@@ -82,7 +83,12 @@ pub(in crate::protocol) async fn start<
     };
 
     let keys = secret_store
-        .load_many(&channel_ids, SecretKind::SharedKey, MissingPolicy::Fail)
+        .load_many(
+            secret_id,
+            &channel_ids,
+            SecretKind::SharedKey,
+            MissingPolicy::Fail,
+        )
         .await?;
 
     for (channel_id, value) in keys {
@@ -90,7 +96,7 @@ pub(in crate::protocol) async fn start<
             continue;
         };
 
-        let endpoint = peer_endpoint(channel_store, channel_id).await?;
+        let endpoint = peer_endpoint(channel_store, secret_id, channel_id).await?;
         let msg = produce_verify_share_request_message(
             channel_id,
             secret_id,
@@ -140,13 +146,14 @@ pub(in crate::protocol) async fn accept<
     channel_store: &mut Ch,
     share_store: &mut Sh,
     transport: &T,
+    secret_id: u64,
     channel_id: ChannelId,
     request: &VerifyShareRequestMessage,
     shared_key: &SharedKey,
     trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
     let stored_bytes = share_store
-        .load(channel_id, request.secret_id, &[request.version])
+        .load(secret_id, channel_id, &[request.version])
         .await?
         .into_iter()
         .next()
@@ -160,9 +167,13 @@ pub(in crate::protocol) async fn accept<
     let resp = verification_response::produce(channel_id, request, shared_key, &stored.share)?;
 
     let envelope = super::apply_trace_id(resp.envelope, trace_id)?;
-    let endpoint =
-        super::resolve_response_endpoint(channel_store, channel_id, request.reply_to.as_ref())
-            .await?;
+    let endpoint = super::resolve_response_endpoint(
+        channel_store,
+        secret_id,
+        channel_id,
+        request.reply_to.as_ref(),
+    )
+    .await?;
     transport.send(&endpoint, envelope).await?;
 
     #[cfg(feature = "logging")]
@@ -190,6 +201,7 @@ pub(in crate::protocol) async fn accept<
 pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport>(
     channel_store: &mut Ch,
     transport: &T,
+    secret_id: u64,
     channel_id: ChannelId,
     request: &VerifyShareRequestMessage,
     shared_key: &SharedKey,
@@ -211,6 +223,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
     super::send_channel_message(
         channel_store,
         transport,
+        secret_id,
         channel_id,
         MessageBody::VerifyShareResponse(response),
         shared_key,
@@ -261,13 +274,14 @@ fn on_request(
 )]
 async fn on_response<Sh: DeRecShareStore>(
     share_store: &mut Sh,
+    secret_id: u64,
     channel_id: ChannelId,
     response: &VerifyShareResponseMessage,
 ) -> Result<Vec<DeRecEvent>> {
     let version = response.version;
 
     let committed_share_bytes = share_store
-        .load(channel_id, response.secret_id, &[version])
+        .load(secret_id, channel_id, &[version])
         .await?
         .into_iter()
         .next()

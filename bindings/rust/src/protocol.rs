@@ -19,13 +19,18 @@ use std::sync::{Arc, Mutex};
 
 use derec_library::protocol::{
     ChannelStoreFuture, DeRecChannelStore, DeRecEvent, DeRecFlow, DeRecProtocol,
-    DeRecProtocolBuilder, DeRecSecretStore, DeRecShareStore, DeRecTransport, MissingPolicy,
-    SecretKind, SecretStoreError, SecretStoreFuture, SecretValue, Share, ShareStoreFuture,
-    TransportFuture,
+    DeRecProtocolBuilder, DeRecSecretStore, DeRecShareStore, DeRecTransport,
+    DeRecUserSecretStore, MissingPolicy, SecretKind, SecretStoreError, SecretStoreFuture,
+    SecretValue, Share, ShareStoreFuture, TransportFuture,
 };
-use derec_library::protocol::types::{Channel, Target, UserSecret};
+use derec_library::protocol::types::{Channel, Target, UserSecret, UserSecrets};
 use derec_library::types::ChannelId;
 use derec_proto::{Protocol, SenderKind, TransportProtocol};
+
+/// Default vault identifier wired into every `Peer` constructor that
+/// doesn't request a specific one. Tests that exercise multiple vaults
+/// override it explicitly via [`Peer::with_options`].
+const DEFAULT_TEST_SECRET_ID: u64 = 0xDE_2EC;
 
 pub fn run_all() {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -41,6 +46,7 @@ pub fn run_all() {
     rt.block_on(run_unpairing_flow());
     rt.block_on(run_update_channel_info_flow());
     rt.block_on(run_reply_to_flow());
+    rt.block_on(run_auto_publish_on_pair_flow());
 }
 
 
@@ -49,43 +55,63 @@ pub fn run_all() {
 /// is a bidirectional adjacency list; `linked_channels` is a BFS over it.
 #[derive(Default)]
 struct InMemoryChannelStore {
-    data: HashMap<u64, Channel>,
-    links: HashMap<u64, HashSet<u64>>,
+    data: HashMap<(u64, u64), Channel>,
+    links: HashMap<(u64, u64), HashSet<u64>>,
 }
 
 impl DeRecChannelStore for InMemoryChannelStore {
-    fn load(&self, channel_id: ChannelId) -> ChannelStoreFuture<'_, Option<Channel>> {
-        let result = self.data.get(&channel_id.0).cloned();
+    fn load(
+        &self,
+        secret_id: u64,
+        channel_id: ChannelId,
+    ) -> ChannelStoreFuture<'_, Option<Channel>> {
+        let result = self.data.get(&(secret_id, channel_id.0)).cloned();
         Box::pin(std::future::ready(Ok(result)))
     }
 
-    fn save(&mut self, channel: Channel) -> ChannelStoreFuture<'_, ()> {
-        self.data.insert(channel.id.0, channel);
+    fn save(&mut self, secret_id: u64, channel: Channel) -> ChannelStoreFuture<'_, ()> {
+        self.data.insert((secret_id, channel.id.0), channel);
         Box::pin(std::future::ready(Ok(())))
     }
 
-    fn remove(&mut self, channel_id: ChannelId) -> ChannelStoreFuture<'_, bool> {
-        let removed = self.data.remove(&channel_id.0).is_some();
+    fn remove(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+    ) -> ChannelStoreFuture<'_, bool> {
+        let removed = self.data.remove(&(secret_id, channel_id.0)).is_some();
         Box::pin(std::future::ready(Ok(removed)))
     }
 
-    fn channels(&self) -> ChannelStoreFuture<'_, Vec<Channel>> {
-        let entries: Vec<Channel> = self.data.values().cloned().collect();
+    fn channels(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<Channel>> {
+        let entries: Vec<Channel> = self
+            .data
+            .iter()
+            .filter(|((s, _), _)| *s == secret_id)
+            .map(|(_, c)| c.clone())
+            .collect();
         Box::pin(std::future::ready(Ok(entries)))
     }
 
-    fn link_channel(&mut self, a: ChannelId, b: ChannelId) -> ChannelStoreFuture<'_, ()> {
+    fn link_channel(
+        &mut self,
+        secret_id: u64,
+        a: ChannelId,
+        b: ChannelId,
+    ) -> ChannelStoreFuture<'_, ()> {
         let (a, b) = (a.0, b.0);
         if a != b {
-            self.links.entry(a).or_default().insert(b);
-            self.links.entry(b).or_default().insert(a);
+            self.links.entry((secret_id, a)).or_default().insert(b);
+            self.links.entry((secret_id, b)).or_default().insert(a);
         }
         Box::pin(std::future::ready(Ok(())))
     }
 
-    fn linked_channels(&self, channel_id: ChannelId) -> ChannelStoreFuture<'_, Vec<ChannelId>> {
-        // BFS over the link graph; the start node is included so an unlinked
-        // channel returns just itself.
+    fn linked_channels(
+        &self,
+        secret_id: u64,
+        channel_id: ChannelId,
+    ) -> ChannelStoreFuture<'_, Vec<ChannelId>> {
         let mut visited: HashSet<u64> = HashSet::new();
         let mut queue: VecDeque<u64> = VecDeque::new();
         queue.push_back(channel_id.0);
@@ -94,7 +120,7 @@ impl DeRecChannelStore for InMemoryChannelStore {
             if !visited.insert(curr) {
                 continue;
             }
-            if let Some(neighbors) = self.links.get(&curr) {
+            if let Some(neighbors) = self.links.get(&(secret_id, curr)) {
                 for &n in neighbors {
                     if !visited.contains(&n) {
                         queue.push_back(n);
@@ -111,24 +137,26 @@ impl DeRecChannelStore for InMemoryChannelStore {
 
 #[derive(Default)]
 struct InMemorySecretStore {
-    data: HashMap<(u64, u8), SecretValue>,
+    data: HashMap<(u64, u64, u8), SecretValue>,
 }
 
 impl DeRecSecretStore for InMemorySecretStore {
     fn load(
         &self,
+        secret_id: u64,
         channel_id: ChannelId,
         kind: SecretKind,
     ) -> SecretStoreFuture<'_, Option<SecretValue>> {
         let result = self
             .data
-            .get(&(channel_id.0, kind as u8))
+            .get(&(secret_id, channel_id.0, kind as u8))
             .map(clone_secret_value);
         Box::pin(std::future::ready(Ok(result)))
     }
 
     fn load_many(
         &self,
+        secret_id: u64,
         channel_ids: &[ChannelId],
         kind: SecretKind,
         missing_policy: MissingPolicy,
@@ -137,7 +165,7 @@ impl DeRecSecretStore for InMemorySecretStore {
         let mut result: Vec<(ChannelId, SecretValue)> = Vec::with_capacity(channel_ids.len());
         let mut missing: Vec<u64> = Vec::new();
         for cid in channel_ids {
-            match self.data.get(&(cid.0, k)) {
+            match self.data.get(&(secret_id, cid.0, k)) {
                 Some(v) => result.push((*cid, clone_secret_value(v))),
                 None => missing.push(cid.0),
             }
@@ -151,18 +179,28 @@ impl DeRecSecretStore for InMemorySecretStore {
         Box::pin(std::future::ready(Ok(result)))
     }
 
-    fn save(&mut self, channel_id: ChannelId, value: SecretValue) -> SecretStoreFuture<'_, ()> {
+    fn save(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        value: SecretValue,
+    ) -> SecretStoreFuture<'_, ()> {
         let kind = match &value {
             SecretValue::SharedKey(_) => SecretKind::SharedKey as u8,
             SecretValue::PairingSecret(_) => SecretKind::PairingSecret as u8,
             SecretValue::PairingContact(_) => SecretKind::PairingContact as u8,
         };
-        self.data.insert((channel_id.0, kind), value);
+        self.data.insert((secret_id, channel_id.0, kind), value);
         Box::pin(std::future::ready(Ok(())))
     }
 
-    fn remove(&mut self, channel_id: ChannelId, kind: SecretKind) -> SecretStoreFuture<'_, ()> {
-        self.data.remove(&(channel_id.0, kind as u8));
+    fn remove(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        kind: SecretKind,
+    ) -> SecretStoreFuture<'_, ()> {
+        self.data.remove(&(secret_id, channel_id.0, kind as u8));
         Box::pin(std::future::ready(Ok(())))
     }
 }
@@ -188,8 +226,8 @@ struct InMemoryShareStore {
 impl DeRecShareStore for InMemoryShareStore {
     fn load(
         &self,
-        channel_id: ChannelId,
         secret_id: u64,
+        channel_id: ChannelId,
         versions: &[u32],
     ) -> ShareStoreFuture<'_, Vec<Share>> {
         let cid = channel_id.0;
@@ -214,8 +252,8 @@ impl DeRecShareStore for InMemoryShareStore {
 
     fn load_many(
         &self,
-        channel_ids: &[ChannelId],
         secret_id: u64,
+        channel_ids: &[ChannelId],
         versions: &[u32],
     ) -> ShareStoreFuture<'_, Vec<Share>> {
         let cid_set: HashSet<u64> = channel_ids.iter().map(|c| c.0).collect();
@@ -238,31 +276,80 @@ impl DeRecShareStore for InMemoryShareStore {
         Box::pin(std::future::ready(Ok(result)))
     }
 
-    fn load_all(&self, channel_ids: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
+    fn load_all(
+        &self,
+        secret_id: u64,
+        channel_ids: &[ChannelId],
+    ) -> ShareStoreFuture<'_, Vec<Share>> {
         let cid_set: HashSet<u64> = channel_ids.iter().map(|c| c.0).collect();
         let result: Vec<Share> = self
             .data
             .iter()
-            .filter(|((c, _, _), _)| cid_set.contains(c))
-            .map(|(_, s)| s.clone())
+            .filter(|((c, s, _), _)| cid_set.contains(c) && *s == secret_id)
+            .map(|(_, share)| share.clone())
             .collect();
         Box::pin(std::future::ready(Ok(result)))
     }
 
-    fn latest_version(&self) -> ShareStoreFuture<'_, Option<u32>> {
-        let max = self.data.keys().map(|(_, _, v)| *v).max();
+    fn latest_version(&self, secret_id: u64) -> ShareStoreFuture<'_, Option<u32>> {
+        let max = self
+            .data
+            .keys()
+            .filter(|(_, s, _)| *s == secret_id)
+            .map(|(_, _, v)| *v)
+            .max();
         Box::pin(std::future::ready(Ok(max)))
     }
 
-    fn save(&mut self, channel_id: ChannelId, share: Share) -> ShareStoreFuture<'_, ()> {
+    fn save(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        share: Share,
+    ) -> ShareStoreFuture<'_, ()> {
+        let _ = secret_id;
         let key = (channel_id.0, share.secret_id, share.version);
         self.data.insert(key, share);
         Box::pin(std::future::ready(Ok(())))
     }
 
-    fn remove_channel(&mut self, channel_id: ChannelId) -> ShareStoreFuture<'_, ()> {
+    fn remove_channel(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+    ) -> ShareStoreFuture<'_, ()> {
         let cid = channel_id.0;
-        self.data.retain(|(c, _, _), _| *c != cid);
+        self.data
+            .retain(|(c, s, _), _| !(*c == cid && *s == secret_id));
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
+
+/// Per-`secret_id` snapshot of the most recent `start(ProtectSecret)`
+/// bag. Holds at most one entry per id; `save_latest` overwrites.
+#[derive(Default)]
+struct InMemoryUserSecretStore {
+    data: HashMap<u64, UserSecrets>,
+}
+
+impl DeRecUserSecretStore for InMemoryUserSecretStore {
+    fn load_latest(&self, secret_id: u64) -> ShareStoreFuture<'_, Option<UserSecrets>> {
+        let value = self.data.get(&secret_id).cloned();
+        Box::pin(std::future::ready(Ok(value)))
+    }
+
+    fn save_latest(
+        &mut self,
+        secret_id: u64,
+        value: UserSecrets,
+    ) -> ShareStoreFuture<'_, ()> {
+        self.data.insert(secret_id, value);
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn remove(&mut self, secret_id: u64) -> ShareStoreFuture<'_, ()> {
+        self.data.remove(&secret_id);
         Box::pin(std::future::ready(Ok(())))
     }
 }
@@ -307,6 +394,7 @@ type SmokeProtocol = DeRecProtocol<
     InMemoryChannelStore,
     InMemoryShareStore,
     InMemorySecretStore,
+    InMemoryUserSecretStore,
     InProcessTransport,
 >;
 
@@ -328,13 +416,13 @@ impl Peer {
     }
 
     fn with_threshold(label: &'static str, uri: &str, threshold: usize) -> Self {
-        Self::with_options(label, uri, threshold, false, None)
+        Self::with_options(label, uri, threshold, false, None, DEFAULT_TEST_SECRET_ID)
     }
 
     /// Same as [`Peer::new`] but flips `with_auto_reply_to(true)` on the
     /// builder so every outbound request stamps `replyTo = own_transport`.
     fn with_auto_reply_to(label: &'static str, uri: &str) -> Self {
-        Self::with_options(label, uri, 2, true, None)
+        Self::with_options(label, uri, 2, true, None, DEFAULT_TEST_SECRET_ID)
     }
 
     /// Configure a local `replica_id`, enabling this peer to participate in
@@ -342,7 +430,32 @@ impl Peer {
     /// `Some(id)` from the caller side if you need two peers to share the
     /// same value (e.g. testing peer-identity round-trip).
     fn with_replica_id(label: &'static str, uri: &str, replica_id: u64) -> Self {
-        Self::with_options(label, uri, 2, false, Some(replica_id))
+        Self::with_options(
+            label,
+            uri,
+            2,
+            false,
+            Some(replica_id),
+            DEFAULT_TEST_SECRET_ID,
+        )
+    }
+
+    /// Pin a specific `secret_id` on the builder. Used by tests that
+    /// assert the wire `secret_id` against a known value (e.g. recovery
+    /// scenarios where the discovered secret_id must match what the owner
+    /// originally published).
+    fn with_secret_id(label: &'static str, uri: &str, secret_id: u64) -> Self {
+        Self::with_options(label, uri, 2, false, None, secret_id)
+    }
+
+    /// Pin both `secret_id` and `replica_id` on the builder.
+    fn with_secret_id_and_replica_id(
+        label: &'static str,
+        uri: &str,
+        secret_id: u64,
+        replica_id: u64,
+    ) -> Self {
+        Self::with_options(label, uri, 2, false, Some(replica_id), secret_id)
     }
 
     fn with_options(
@@ -351,12 +464,14 @@ impl Peer {
         threshold: usize,
         auto_reply_to: bool,
         replica_id: Option<u64>,
+        secret_id: u64,
     ) -> Self {
         let transport = InProcessTransport::new();
-        let mut builder = DeRecProtocolBuilder::new()
+        let mut builder = DeRecProtocolBuilder::new(secret_id)
             .with_channel_store(InMemoryChannelStore::default())
             .with_share_store(InMemoryShareStore::default())
             .with_secret_store(InMemorySecretStore::default())
+            .with_user_secret_store(InMemoryUserSecretStore::default())
             .with_transport(transport.clone())
             .with_own_transport(TransportProtocol {
                 uri: uri.to_owned(),
@@ -551,16 +666,18 @@ async fn run_pairing_flow() {
 
     pair(&mut owner, &mut helper, channel_id).await;
 
+    let owner_sid = owner.protocol.secret_id();
+    let helper_sid = helper.protocol.secret_id();
     let owner_channel = owner
         .protocol
         .channel_store
-        .load(channel_id)
+        .load(owner_sid, channel_id)
         .await
         .expect("owner channel_store.load failed");
     let helper_channel = helper
         .protocol
         .channel_store
-        .load(channel_id)
+        .load(helper_sid, channel_id)
         .await
         .expect("helper channel_store.load failed");
     assert!(
@@ -658,16 +775,18 @@ async fn run_hashed_keys_pairing_flow() {
 
     pair_hashed_keys(&mut owner, &mut helper, channel_id).await;
 
+    let owner_sid = owner.protocol.secret_id();
+    let helper_sid = helper.protocol.secret_id();
     let owner_channel = owner
         .protocol
         .channel_store
-        .load(channel_id)
+        .load(owner_sid, channel_id)
         .await
         .expect("owner channel_store.load failed");
     let helper_channel = helper
         .protocol
         .channel_store
-        .load(channel_id)
+        .load(helper_sid, channel_id)
         .await
         .expect("helper channel_store.load failed");
     assert!(
@@ -840,17 +959,19 @@ async fn run_replica_id_wiring_flow() {
     );
 
     // Both sides' Channel records carry the PEER's replica id (not their own).
+    let owner_sid = owner.protocol.secret_id();
+    let helper_sid = helper.protocol.secret_id();
     let owner_channel = owner
         .protocol
         .channel_store
-        .load(channel_id)
+        .load(owner_sid, channel_id)
         .await
         .expect("owner channel load")
         .expect("owner channel must exist");
     let helper_channel = helper
         .protocol
         .channel_store
-        .load(channel_id)
+        .load(helper_sid, channel_id)
         .await
         .expect("helper channel load")
         .expect("helper channel must exist");
@@ -985,7 +1106,12 @@ async fn run_protect_secret_with_replica_targets_flow() {
     // VSS requires threshold >= 2 and threshold <= helper count, so this
     // scenario uses 2 helpers + 1 replica. The replica doesn't
     // participate in the split (it gets the full vault).
-    let mut owner = Peer::with_replica_id("owner", "https://owner.example.com", owner_id);
+    let mut owner = Peer::with_secret_id_and_replica_id(
+        "owner",
+        "https://owner.example.com",
+        0xC0FFEE,
+        owner_id,
+    );
     let mut helper_a = Peer::new("helper-a", "https://helper-a.example.com");
     let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
     let mut replica =
@@ -1013,10 +1139,11 @@ async fn run_protect_secret_with_replica_targets_flow() {
     let _ = pump(&mut replica, &mut owner).await;
     let _ = pump(&mut owner, &mut replica).await;
 
+    let owner_sid = owner.protocol.secret_id();
     let owner_replica_channel = owner
         .protocol
         .channel_store
-        .load(replica_channel)
+        .load(owner_sid, replica_channel)
         .await
         .expect("owner replica channel load")
         .expect("owner replica channel must exist");
@@ -1062,8 +1189,6 @@ async fn run_protect_secret_with_replica_targets_flow() {
     owner
         .protocol
         .start(DeRecFlow::ProtectSecret {
-            secret_id: 0xC0FFEE,
-            target: Target::Many(vec![helper_a_channel, helper_b_channel, replica_channel]),
             secrets: vec![UserSecret {
                 id: vec![0x01],
                 name: "shared-vault".to_owned(),
@@ -1097,10 +1222,12 @@ async fn run_protect_secret_with_replica_targets_flow() {
     //    shared key, and assert payload shape:
     //    helper → share_algorithm == 0 (VSS share fragment)
     //    replica → share_algorithm == 1 (full vault, contains secret_data)
+    let helper_a_sid = helper_a.protocol.secret_id();
+    let replica_sid = replica.protocol.secret_id();
     let helper_a_key = match helper_a
         .protocol
         .secret_store
-        .load(helper_a_channel, SecretKind::SharedKey)
+        .load(helper_a_sid, helper_a_channel, SecretKind::SharedKey)
         .await
         .expect("helper-a key load")
         .expect("helper-a shared key must exist")
@@ -1111,7 +1238,7 @@ async fn run_protect_secret_with_replica_targets_flow() {
     let replica_key = match replica
         .protocol
         .secret_store
-        .load(replica_channel, SecretKind::SharedKey)
+        .load(replica_sid, replica_channel, SecretKind::SharedKey)
         .await
         .expect("replica key load")
         .expect("replica shared key must exist")
@@ -1164,38 +1291,10 @@ async fn run_protect_secret_with_replica_targets_flow() {
     );
 
 
-    // 9. Negative: Helper-role channel (e.g. a Helper trying to push a
-    //    secret to itself) must be refused with RoleMismatch.
-    let mut helper_peer = Peer::new("helper2", "https://helper-2.example.com");
-    let mut owner_peer = Peer::new("owner2", "https://owner-2.example.com");
-    let role_check_channel = ChannelId(99);
-    pair(&mut owner_peer, &mut helper_peer, role_check_channel).await;
-    // helper_peer's view of role_check_channel is `role: Helper`.
-    let result = helper_peer
-        .protocol
-        .start(DeRecFlow::ProtectSecret {
-            secret_id: 1,
-            target: Target::Single(role_check_channel),
-            secrets: vec![UserSecret {
-                id: vec![1],
-                name: "rogue".to_owned(),
-                data: b"x".to_vec(),
-            }],
-            description: None,
-        })
-        .await;
-    assert!(
-        matches!(result, Err(derec_library::Error::RoleMismatch { .. })),
-        "Helper-initiated ProtectSecret must be refused with RoleMismatch, got {result:?}"
-    );
-
-    println!("  helper-initiated ProtectSecret: RoleMismatch ✓");
-
-
-    // 10. End-to-end receiver side: feed the replica envelope into the
-    //     replica peer's process(). It should auto-ack and emit a
-    //     ReplicaVaultReceived event. Owner then processes the ack and
-    //     emits ReplicaVaultAcked.
+    // 9. End-to-end receiver side: feed the replica envelope into the
+    //    replica peer's process(). It should auto-ack and emit a
+    //    ReplicaVaultReceived event. Owner then processes the ack and
+    //    emits ReplicaVaultAcked.
     println!("  -- receiver-side replica dispatch --");
 
     let replica_events = replica
@@ -1404,7 +1503,7 @@ async fn run_sharing_flow() {
 
     let channel_a = ChannelId(1);
     let channel_b = ChannelId(2);
-    let mut owner = Peer::new("owner", "https://owner.example.com");
+    let mut owner = Peer::with_secret_id("owner", "https://owner.example.com", 42);
     let mut helper_a = Peer::new("helper-a", "https://helper-a.example.com");
     let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
 
@@ -1415,8 +1514,6 @@ async fn run_sharing_flow() {
     owner
         .protocol
         .start(DeRecFlow::ProtectSecret {
-            secret_id: 42,
-            target: Target::Many(vec![channel_a, channel_b]),
             secrets: vec![UserSecret {
                 id: vec![1, 2, 3],
                 name: "smoke-test secret".to_owned(),
@@ -1466,9 +1563,16 @@ async fn run_discovery_and_recovery_flow() {
 
     // VSS sharing requires threshold ≥ 2, so the discovery+recovery scenario
     // pairs the Owner with two helpers and reconstructs from both shares.
-    let mut owner = Peer::new("owner", "https://owner.example.com");
-    let mut helper_a = Peer::new("helper-a", "https://helper-a.example.com");
-    let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
+    let mut owner =
+        Peer::with_secret_id("owner", "https://owner.example.com", vault_secret_id);
+    // Helpers serving this owner are bound to the same vault id — every
+    // store on the helper side partitions by that id, which is the only
+    // model that's coherent under the new trait surface (one protocol =
+    // one helped-with vault).
+    let mut helper_a =
+        Peer::with_secret_id("helper-a", "https://helper-a.example.com", vault_secret_id);
+    let mut helper_b =
+        Peer::with_secret_id("helper-b", "https://helper-b.example.com", vault_secret_id);
 
 
     pair(&mut owner, &mut helper_a, channel_a).await;
@@ -1478,8 +1582,6 @@ async fn run_discovery_and_recovery_flow() {
     owner
         .protocol
         .start(DeRecFlow::ProtectSecret {
-            secret_id: vault_secret_id,
-            target: Target::Many(vec![channel_a, channel_b]),
             secrets: vec![UserSecret {
                 id: secret_id_bytes.clone(),
                 name: "wallet seed".to_owned(),
@@ -1510,6 +1612,15 @@ async fn run_discovery_and_recovery_flow() {
 
     // A recovering Owner has lost local state, so it pairs again with each
     // Helper on a brand-new channel. The Owner is the pairing initiator here.
+    // Simulate state loss explicitly so the pair-completion auto-publish hook
+    // has nothing to replay against the new channels.
+    owner
+        .protocol
+        .user_secret_store
+        .remove(owner.protocol.secret_id())
+        .await
+        .expect("clearing user_secret_store");
+
     for (helper, fresh_cid, label) in [
         (&mut helper_a, recovery_channel_a, "helper-a"),
         (&mut helper_b, recovery_channel_b, "helper-b"),
@@ -1550,16 +1661,19 @@ async fn run_discovery_and_recovery_flow() {
     // Each helper links its original channel to its new recovery channel so
     // discovery (which resolves the connected component then `load_many`)
     // finds the share stored under the original channel.
+    let helper_a_sid = helper_a.protocol.secret_id();
+    let helper_b_sid = helper_b.protocol.secret_id();
+    let owner_sid = owner.protocol.secret_id();
     helper_a
         .protocol
         .channel_store
-        .link_channel(channel_a, recovery_channel_a)
+        .link_channel(helper_a_sid, channel_a, recovery_channel_a)
         .await
         .expect("helper-a link_channel failed");
     helper_b
         .protocol
         .channel_store
-        .link_channel(channel_b, recovery_channel_b)
+        .link_channel(helper_b_sid, channel_b, recovery_channel_b)
         .await
         .expect("helper-b link_channel failed");
 
@@ -1571,13 +1685,13 @@ async fn run_discovery_and_recovery_flow() {
     owner
         .protocol
         .channel_store
-        .remove(channel_a)
+        .remove(owner_sid, channel_a)
         .await
         .expect("owner remove(channel_a) failed");
     owner
         .protocol
         .channel_store
-        .remove(channel_b)
+        .remove(owner_sid, channel_b)
         .await
         .expect("owner remove(channel_b) failed");
 
@@ -1724,16 +1838,18 @@ async fn run_unpairing_flow() {
         "the Required-ack flow with helper auto-accept must not produce UnpairRejected events"
     );
 
+    let owner_sid = owner.protocol.secret_id();
+    let helper_sid = helper.protocol.secret_id();
     let owner_channel = owner
         .protocol
         .channel_store
-        .load(channel_id)
+        .load(owner_sid, channel_id)
         .await
         .expect("owner channel_store.load failed");
     let helper_channel = helper
         .protocol
         .channel_store
-        .load(channel_id)
+        .load(helper_sid, channel_id)
         .await
         .expect("helper channel_store.load failed");
     assert!(
@@ -1838,10 +1954,11 @@ async fn run_update_channel_info_flow() {
     );
 
     // Helper's stored Channel must now mirror the Owner's announced metadata.
+    let helper_sid = helper.protocol.secret_id();
     let helper_channel = helper
         .protocol
         .channel_store
-        .load(channel_id)
+        .load(helper_sid, channel_id)
         .await
         .expect("helper channel_store.load failed")
         .expect("helper channel must still exist after UpdateChannelInfo");
@@ -1922,10 +2039,11 @@ async fn run_reply_to_flow() {
     );
 
     // The orchestrator carried our own_transport into the request body.
+    let owner_sid = owner.protocol.secret_id();
     let SecretValue::SharedKey(shared_key) = owner
         .protocol
         .secret_store
-        .load(channel_id, SecretKind::SharedKey)
+        .load(owner_sid, channel_id, SecretKind::SharedKey)
         .await
         .expect("owner secret_store.load failed")
         .expect("owner shared_key must be present")
@@ -1987,4 +2105,85 @@ async fn run_reply_to_flow() {
     );
 
     println!("Protocol replyTo flow test passed.");
+}
+
+/// Exercises the auto-publish-on-pair hook: once the application has
+/// handed off a vault bag via `start(ProtectSecret)`, any subsequent
+/// helper-pair (or replica-pair after fingerprint verification) makes
+/// the freshly-paired peer eligible for shares without an explicit
+/// follow-up call. The test pairs two helpers, calls `ProtectSecret`
+/// once, then pairs a third helper and asserts that helper-c received
+/// a share without any additional `start` call from the owner.
+async fn run_auto_publish_on_pair_flow() {
+    println!("=== Protocol auto-publish-on-pair flow ===");
+
+    let channel_a = ChannelId(1);
+    let channel_b = ChannelId(2);
+    let channel_c = ChannelId(3);
+
+    let mut owner = Peer::with_secret_id("owner", "https://owner.example.com", 0xABCDE);
+    let mut helper_a = Peer::new("helper-a", "https://helper-a.example.com");
+    let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
+    let mut helper_c = Peer::new("helper-c", "https://helper-c.example.com");
+
+    pair(&mut owner, &mut helper_a, channel_a).await;
+    pair(&mut owner, &mut helper_b, channel_b).await;
+
+    // First publish: explicit start(ProtectSecret). Both helpers receive
+    // shares; the bag is cached on the protocol for any later pair-trigger.
+    owner
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![UserSecret {
+                id: vec![0x42],
+                name: "vault".to_owned(),
+                data: b"initial-bag".to_vec(),
+            }],
+            description: Some("initial publish".to_owned()),
+        })
+        .await
+        .expect("owner start(ProtectSecret) failed");
+
+    let initial = pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b]).await;
+    let initial_stored = initial
+        .iter()
+        .filter(|e| matches!(e, DeRecEvent::ShareStored { .. }))
+        .count();
+    assert_eq!(
+        initial_stored, 2,
+        "initial publish must store one share per helper (got {initial_stored})"
+    );
+
+    // Pair a third helper. No follow-up `start` call from the owner —
+    // the auto-publish hook fires off the cached bag, fanning out fresh
+    // shares to a, b, AND c. The pump must include every helper so the
+    // SSR envelopes addressed to a and b can be routed.
+    let contact = owner
+        .protocol
+        .create_contact(Some(channel_c), derec_proto::ContactMode::InlineKeys)
+        .await
+        .expect("owner.create_contact(helper-c) failed");
+    helper_c
+        .protocol
+        .start(DeRecFlow::Pairing {
+            kind: SenderKind::Helper,
+            contact,
+            peer_communication_info: std::collections::HashMap::from([(
+                "name".to_owned(),
+                "helper-c".to_owned(),
+            )]),
+        })
+        .await
+        .expect("helper-c start(Pairing) failed");
+    let auto = pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b, &mut helper_c]).await;
+
+    let stored_on_c = auto
+        .iter()
+        .any(|e| matches!(e, DeRecEvent::ShareStored { channel_id, .. } if *channel_id == channel_c));
+    assert!(
+        stored_on_c,
+        "helper-c must receive a share via the pair-completion auto-publish"
+    );
+
+    println!("Protocol auto-publish-on-pair flow test passed.");
 }

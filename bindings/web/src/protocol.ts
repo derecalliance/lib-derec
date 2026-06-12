@@ -17,6 +17,8 @@ import type {
   Share,
   ShareStore,
   Transport,
+  UserSecretStore,
+  UserSecrets,
 } from "@derec-alliance/web";
 
 
@@ -36,81 +38,99 @@ const kindName = (k: SenderKind): string => {
 };
 
 
-// kind 0 = SharedKey (32 raw bytes), kind 1 = PairingSecret (ephemeral),
-// kind 2 = PairingContact (ephemeral). Keyed by `${channelId}:${kind}`.
+// Keyed by `${secretId}:${channelId}:${kind}`.
 class InMemorySecretStore implements SecretStore {
   private readonly data = new Map<string, Uint8Array>();
 
-  private key(channelId: string, kind: 0 | 1 | 2): string {
-    return `${channelId}:${kind}`;
+  private key(secretId: string, channelId: string, kind: 0 | 1 | 2): string {
+    return `${secretId}:${channelId}:${kind}`;
   }
 
-  async load(channelId: string, kind: 0 | 1 | 2): Promise<Uint8Array | null> {
-    return this.data.get(this.key(channelId, kind)) ?? null;
+  async load(
+    secretId: string,
+    channelId: string,
+    kind: 0 | 1 | 2,
+  ): Promise<Uint8Array | null> {
+    return this.data.get(this.key(secretId, channelId, kind)) ?? null;
   }
 
-  // `missingPolicy` is honored by the Rust adapter; this in-memory impl
-  // always returns nulls in input order and lets the adapter apply the
-  // policy. A real backend (SQL, network) might choose to throw on `"fail"`.
   async loadMany(
+    secretId: string,
     channelIds: string[],
     kind: 0 | 1 | 2,
     _missingPolicy: "skip" | "fail",
   ): Promise<Array<Uint8Array | null>> {
     return channelIds.map(
-      (id) => this.data.get(this.key(id, kind)) ?? null,
+      (id) => this.data.get(this.key(secretId, id, kind)) ?? null,
     );
   }
 
-  async save(channelId: string, kind: 0 | 1 | 2, value: Uint8Array): Promise<void> {
-    this.data.set(this.key(channelId, kind), value);
+  async save(
+    secretId: string,
+    channelId: string,
+    kind: 0 | 1 | 2,
+    value: Uint8Array,
+  ): Promise<void> {
+    this.data.set(this.key(secretId, channelId, kind), value);
   }
 
-  async remove(channelId: string, kind: 0 | 1 | 2): Promise<void> {
-    this.data.delete(this.key(channelId, kind));
+  async remove(secretId: string, channelId: string, kind: 0 | 1 | 2): Promise<void> {
+    this.data.delete(this.key(secretId, channelId, kind));
   }
 }
 
-// Stores opaque channel-record bytes plus the channel-link graph.
-// Linking is undirected, idempotent, and transitive; `linkedChannels`
-// returns the transitive closure including `channelId` itself.
+// Stores opaque channel-record bytes plus the channel-link graph,
+// partitioned by `secretId`.
 class InMemoryChannelStore implements ChannelStore {
   private readonly channels = new Map<string, Uint8Array>();
   private readonly links = new Map<string, Set<string>>();
 
-  async load(channelId: string): Promise<Uint8Array | null> {
-    return this.channels.get(channelId) ?? null;
+  private key(secretId: string, channelId: string): string {
+    return `${secretId}:${channelId}`;
   }
 
-  async save(channelId: string, bytes: Uint8Array): Promise<void> {
-    this.channels.set(channelId, bytes);
+  async load(secretId: string, channelId: string): Promise<Uint8Array | null> {
+    return this.channels.get(this.key(secretId, channelId)) ?? null;
   }
 
-  async listChannels(): Promise<string[]> {
-    return Array.from(this.channels.keys());
+  async save(
+    secretId: string,
+    channelId: string,
+    bytes: Uint8Array,
+  ): Promise<void> {
+    this.channels.set(this.key(secretId, channelId), bytes);
   }
 
-  async remove(channelId: string): Promise<boolean> {
-    return this.channels.delete(channelId);
+  async listChannels(secretId: string): Promise<string[]> {
+    const prefix = `${secretId}:`;
+    return Array.from(this.channels.keys())
+      .filter((k) => k.startsWith(prefix))
+      .map((k) => k.slice(prefix.length));
   }
 
-  async linkChannel(a: string, b: string): Promise<void> {
+  async remove(secretId: string, channelId: string): Promise<boolean> {
+    return this.channels.delete(this.key(secretId, channelId));
+  }
+
+  async linkChannel(secretId: string, a: string, b: string): Promise<void> {
     if (a === b) return;
-    if (!this.links.has(a)) this.links.set(a, new Set());
-    if (!this.links.has(b)) this.links.set(b, new Set());
-    this.links.get(a)!.add(b);
-    this.links.get(b)!.add(a);
+    const ka = this.key(secretId, a);
+    const kb = this.key(secretId, b);
+    if (!this.links.has(ka)) this.links.set(ka, new Set());
+    if (!this.links.has(kb)) this.links.set(kb, new Set());
+    this.links.get(ka)!.add(b);
+    this.links.get(kb)!.add(a);
   }
 
   /** Transitive closure of `channelId`, including `channelId` itself. */
-  async linkedChannels(channelId: string): Promise<string[]> {
+  async linkedChannels(secretId: string, channelId: string): Promise<string[]> {
     const visited = new Set<string>();
     const queue: string[] = [channelId];
     while (queue.length > 0) {
       const curr = queue.shift()!;
       if (visited.has(curr)) continue;
       visited.add(curr);
-      for (const linked of this.links.get(curr) ?? []) {
+      for (const linked of this.links.get(this.key(secretId, curr)) ?? []) {
         if (!visited.has(linked)) queue.push(linked);
       }
     }
@@ -118,23 +138,21 @@ class InMemoryChannelStore implements ChannelStore {
   }
 }
 
-// Pure keyed share store. It never sees the channel-link graph — recovery
-// resolves the linked channel set via `ChannelStore.linkedChannels` and
-// passes it to `loadMany` (scoped to one `secretId`). Discovery instead
-// uses `loadAll`, which is the one legitimate "no secretId" load — it
-// enumerates the helper's holdings before any secret is known. Versions
-// are namespaced by `secretId`: the same `version` number can exist for
-// two different secrets, so a version-only query would conflate them.
 class InMemoryShareStore implements ShareStore {
-  // Keyed by (channelId, secretId, version). The string secretId mirrors the
-  // wire contract — u64 as a decimal string.
-  private readonly data = new Map<string, Map<string, Map<number, Share>>>();
-  private ownerVersion: number | null = null;
+  // Keyed by `${secretId}:${channelId}` → version → Share.
+  private readonly data = new Map<string, Map<number, Share>>();
+  private readonly ownerVersions = new Map<string, number>();
 
-  async load(channelId: string, secretId: string, versions: number[]): Promise<Share[]> {
-    const bySecret = this.data.get(channelId);
-    if (!bySecret) return [];
-    const byVersion = bySecret.get(secretId);
+  private key(secretId: string, channelId: string): string {
+    return `${secretId}:${channelId}`;
+  }
+
+  async load(
+    secretId: string,
+    channelId: string,
+    versions: number[],
+  ): Promise<Share[]> {
+    const byVersion = this.data.get(this.key(secretId, channelId));
     if (!byVersion) return [];
     const filter = versions.length > 0 ? new Set(versions) : null;
     const result: Share[] = [];
@@ -145,32 +163,29 @@ class InMemoryShareStore implements ShareStore {
     return result;
   }
 
-  async save(channelId: string, share: Share): Promise<void> {
-    let bySecret = this.data.get(channelId);
-    if (!bySecret) {
-      bySecret = new Map();
-      this.data.set(channelId, bySecret);
-    }
-    let byVersion = bySecret.get(share.secretId);
+  async save(
+    secretId: string,
+    channelId: string,
+    share: Share,
+  ): Promise<void> {
+    const k = this.key(secretId, channelId);
+    let byVersion = this.data.get(k);
     if (!byVersion) {
       byVersion = new Map();
-      bySecret.set(share.secretId, byVersion);
+      this.data.set(k, byVersion);
     }
     byVersion.set(share.version, share);
   }
 
-  /**
-   * Load shares for several channels in one call, scoped to one secret.
-   * Recovery feeds this the set from the channel store's `linkedChannels`.
-   * Flat list — version-dedup is the caller's concern.
-   */
-  async loadMany(channelIds: string[], secretId: string, versions: number[]): Promise<Share[]> {
+  async loadMany(
+    secretId: string,
+    channelIds: string[],
+    versions: number[],
+  ): Promise<Share[]> {
     const filter = versions.length > 0 ? new Set(versions) : null;
     const result: Share[] = [];
     for (const channelId of channelIds) {
-      const bySecret = this.data.get(channelId);
-      if (!bySecret) continue;
-      const byVersion = bySecret.get(secretId);
+      const byVersion = this.data.get(this.key(secretId, channelId));
       if (!byVersion) continue;
       for (const [v, share] of byVersion) {
         if (filter && !filter.has(v)) continue;
@@ -180,37 +195,47 @@ class InMemoryShareStore implements ShareStore {
     return result;
   }
 
-  /**
-   * Discovery-only: every share across the given channels — all secrets,
-   * all versions. Recovery/verification must scope by `secretId` instead.
-   */
-  async loadAll(channelIds: string[]): Promise<Share[]> {
+  async loadAll(secretId: string, channelIds: string[]): Promise<Share[]> {
     const result: Share[] = [];
     for (const channelId of channelIds) {
-      const bySecret = this.data.get(channelId);
-      if (!bySecret) continue;
-      for (const byVersion of bySecret.values()) {
-        for (const share of byVersion.values()) result.push(share);
-      }
+      const byVersion = this.data.get(this.key(secretId, channelId));
+      if (!byVersion) continue;
+      for (const share of byVersion.values()) result.push(share);
     }
     return result;
   }
 
-  /**
-   * Drop every share stored under `channelId` (all secret_ids, all versions).
-   * Called by the unpair flow when a channel is torn down. Idempotent — a
-   * non-existent channel is a no-op.
-   */
-  async removeChannel(channelId: string): Promise<void> {
-    this.data.delete(channelId);
+  async removeChannel(secretId: string, channelId: string): Promise<void> {
+    this.data.delete(this.key(secretId, channelId));
   }
 
-  async latestVersion(): Promise<number | null> {
-    return this.ownerVersion;
+  async latestVersion(secretId: string): Promise<number | null> {
+    return this.ownerVersions.get(secretId) ?? null;
   }
 
-  setOwnerVersion(version: number): void {
-    this.ownerVersion = version;
+  setOwnerVersion(secretId: string, version: number): void {
+    this.ownerVersions.set(secretId, version);
+  }
+}
+
+
+/**
+ * Keyed by `secretId` — at most one `UserSecrets` per id. The most recent
+ * `start(ProtectSecret)` snapshot the protocol stored.
+ */
+class InMemoryUserSecretStore implements UserSecretStore {
+  private readonly data = new Map<string, UserSecrets>();
+
+  async loadLatest(secretId: string): Promise<UserSecrets | null> {
+    return this.data.get(secretId) ?? null;
+  }
+
+  async saveLatest(secretId: string, value: UserSecrets): Promise<void> {
+    this.data.set(secretId, value);
+  }
+
+  async remove(secretId: string): Promise<void> {
+    this.data.delete(secretId);
   }
 }
 
@@ -243,24 +268,32 @@ interface Node {
   channelStore: InMemoryChannelStore;
   shareStore: InMemoryShareStore;
   secretStore: InMemorySecretStore;
+  userSecretStore: InMemoryUserSecretStore;
 }
 
 const THRESHOLD = 2;
 const KEEP_VERSIONS_COUNT = 3;
+const DEFAULT_TEST_SECRET_ID = 0xDE_2ECn;
 
 function makeNode(
   name: string,
   endpointUri: string,
-  options: { autoReplyTo?: boolean; replicaId?: bigint } = {},
+  options: {
+    autoReplyTo?: boolean;
+    replicaId?: bigint;
+    secretId?: bigint;
+  } = {},
 ): Node {
   const channelStore = new InMemoryChannelStore();
   const shareStore = new InMemoryShareStore();
   const secretStore = new InMemorySecretStore();
+  const userSecretStore = new InMemoryUserSecretStore();
   const transport = new RecordingTransport();
-  let builder = new DeRecProtocolBuilder()
+  let builder = new DeRecProtocolBuilder(options.secretId ?? DEFAULT_TEST_SECRET_ID)
     .withChannelStore(channelStore)
     .withShareStore(shareStore)
     .withSecretStore(secretStore)
+    .withUserSecretStore(userSecretStore)
     .withTransport(transport)
     .withOwnTransport({ uri: endpointUri, protocol: "https" })
     .withThreshold(THRESHOLD)
@@ -273,7 +306,7 @@ function makeNode(
     builder = builder.withReplicaId(options.replicaId);
   }
   const protocol = builder.build();
-  return { protocol, transport, channelStore, shareStore, secretStore };
+  return { protocol, transport, channelStore, shareStore, secretStore, userSecretStore };
 }
 
 
@@ -500,13 +533,15 @@ async function runHashedKeysPairingFlow(): Promise<void> {
   // secret store (kind 0 = SharedKey). The latter is the strongest
   // end-to-end check that the PrePair → Pair chain converged on the
   // same key on both sides.
-  const ownerChannel = await owner.channelStore.load("1");
-  const helperChannel = await helper.channelStore.load("1");
+  const ownerSid = String(owner.protocol.secretId());
+  const helperSid = String(helper.protocol.secretId());
+  const ownerChannel = await owner.channelStore.load(ownerSid, "1");
+  const helperChannel = await helper.channelStore.load(helperSid, "1");
   if (!ownerChannel || !helperChannel) {
     throw new Error("HashedKeys pairing: both sides must have a stored channel record");
   }
-  const ownerSharedKey = await owner.secretStore.load("1", 0);
-  const helperSharedKey = await helper.secretStore.load("1", 0);
+  const ownerSharedKey = await owner.secretStore.load(ownerSid, "1", 0);
+  const helperSharedKey = await helper.secretStore.load(helperSid, "1", 0);
   if (!ownerSharedKey || !helperSharedKey) {
     throw new Error("HashedKeys pairing: both sides must have a stored shared key");
   }
@@ -574,7 +609,9 @@ async function runSharingFlow(): Promise<void> {
   console.log("=== [Protocol] Sharing Flow ===\n");
 
   const ownerSecretId = 42n;
-  const owner = makeNode("Owner", "https://owner.example.com");
+  const owner = makeNode("Owner", "https://owner.example.com", {
+    secretId: ownerSecretId,
+  });
   const helperA = makeNode("HelperA", "https://helper-a.example.com");
   const helperB = makeNode("HelperB", "https://helper-b.example.com");
   const channelIdA = 1n;
@@ -586,8 +623,6 @@ async function runSharingFlow(): Promise<void> {
 
   const secretData = new TextEncoder().encode("super-secret-value");
   await owner.protocol.start(FlowKind.ProtectSecret, {
-    secretId: ownerSecretId,
-    target: [channelIdA, channelIdB],
     secrets: [{ id: new Uint8Array([1]), name: "smoke", data: secretData }],
     description: "smoke-test secret",
   });
@@ -649,9 +684,18 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
   console.log("=== [Protocol] Discovery & Recovery Flow ===\n");
 
   const ownerSecretId = 123n;
-  const owner = makeNode("Owner", "https://owner.example.com");
-  const helperA = makeNode("HelperA", "https://helper-a.example.com");
-  const helperB = makeNode("HelperB", "https://helper-b.example.com");
+  const owner = makeNode("Owner", "https://owner.example.com", {
+    secretId: ownerSecretId,
+  });
+  // Helpers serving this owner are bound to the same vault id — every
+  // store on the helper side partitions by that id, matching the
+  // one-protocol-per-vault trait surface.
+  const helperA = makeNode("HelperA", "https://helper-a.example.com", {
+    secretId: ownerSecretId,
+  });
+  const helperB = makeNode("HelperB", "https://helper-b.example.com", {
+    secretId: ownerSecretId,
+  });
   const channelA = 1n;
   const channelB = 2n;
   const recoveryChannelA = 100n;
@@ -668,8 +712,6 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
   console.log();
 
   await owner.protocol.start(FlowKind.ProtectSecret, {
-    secretId: ownerSecretId,
-    target: [channelA, channelB],
     secrets: [{ id: new Uint8Array([1]), name: "wallet", data: secretBytes }],
     description,
   });
@@ -694,6 +736,9 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
   }
   console.log("  Secret distributed and confirmed by both helpers.\n");
 
+  // Simulate state loss explicitly so the pair-completion auto-publish hook
+  // has nothing to replay against the new channels.
+  await owner.userSecretStore.remove(ownerSecretId.toString());
 
   console.log("  -- Recovery: re-pair on fresh channels --\n");
 
@@ -706,6 +751,7 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
 
     const origChannel = label === "HelperA" ? channelA : channelB;
     await helper.channelStore.linkChannel(
+      String(helper.protocol.secretId()),
       origChannel.toString(),
       fresh.toString(),
     );
@@ -728,8 +774,9 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
 
   // Simulate Owner-side state loss: drop the original channels so recovery
   // only fans out to the recovery channels.
-  await owner.channelStore.remove(channelA.toString());
-  await owner.channelStore.remove(channelB.toString());
+  const ownerSidRecovery = String(owner.protocol.secretId());
+  await owner.channelStore.remove(ownerSidRecovery, channelA.toString());
+  await owner.channelStore.remove(ownerSidRecovery, channelB.toString());
   console.log(`\n  [Owner]  removed original channels ${channelA}, ${channelB} to simulate state loss\n`);
 
 
@@ -886,7 +933,11 @@ async function runReplyToFlow(): Promise<void> {
   // Decrypt the request body via the primitive `extract` and verify
   // `request.reply_to.uri === ownerUri`. The shared key is sitting in the
   // owner's secret store under kind=0 (SharedKey).
-  const sharedKey = await owner.secretStore.load(channelId.toString(), 0);
+  const sharedKey = await owner.secretStore.load(
+    String(owner.protocol.secretId()),
+    channelId.toString(),
+    0,
+  );
   if (!sharedKey) {
     throw new Error("owner shared_key must be present after pairing");
   }
@@ -908,6 +959,7 @@ async function runReplyToFlow(): Promise<void> {
   const defaultOutbound = ownerDefault.transport.drain();
   const defaultMsg = defaultOutbound[0]!;
   const defaultSharedKey = await ownerDefault.secretStore.load(
+    String(ownerDefault.protocol.secretId()),
     channelId.toString(),
     0,
   );
@@ -947,7 +999,11 @@ async function runReplicaPairingAndVaultSyncFlow(): Promise<void> {
   const helperBUri = "https://helper-b.example.com";
   const destUri = "https://replica-destination.example.com";
 
-  const owner = makeNode("Owner", ownerUri, { replicaId: ownerReplicaId });
+  const secretId = 0xC0FFEEn;
+  const owner = makeNode("Owner", ownerUri, {
+    replicaId: ownerReplicaId,
+    secretId,
+  });
   const helperA = makeNode("HelperA", helperAUri);
   const helperB = makeNode("HelperB", helperBUri);
   const destination = makeNode("Destination", destUri, { replicaId: destReplicaId });
@@ -955,7 +1011,6 @@ async function runReplicaPairingAndVaultSyncFlow(): Promise<void> {
   const helperAChannel = 1n;
   const helperBChannel = 2n;
   const destChannel = 3n;
-  const secretId = 0xC0FFEEn;
 
   // 1. Classic Owner↔Helper pairs (share targets).
   await doPair(helperA, owner, helperAChannel, "Owner↔HelperA");
@@ -1022,8 +1077,6 @@ async function runReplicaPairingAndVaultSyncFlow(): Promise<void> {
   //    one ReplicaSecretPayload composite (for the destination).
   const secretData = new TextEncoder().encode("vault-payload-for-replica-and-helper");
   await owner.protocol.start(FlowKind.ProtectSecret, {
-    secretId,
-    target: [helperAChannel, helperBChannel, destChannel],
     secrets: [{ id: new Uint8Array([0x01]), name: "shared-vault", data: secretData }],
     description: "replica + helper distribution",
   });

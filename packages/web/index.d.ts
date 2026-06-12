@@ -3,37 +3,43 @@
 export { default as init } from "./derec_library.js";
 
 export interface SecretStore {
-  load(channelId: string, kind: 0 | 1 | 2): Promise<Uint8Array | null | undefined>;
+  load(
+    secretId: string,
+    channelId: string,
+    kind: 0 | 1 | 2,
+  ): Promise<Uint8Array | null | undefined>;
   /**
-   * Load secrets of the same `kind` for several channels in one call. Must
-   * return an array with one entry per input id, in the same order, using
-   * `null` (or `undefined`) for channels with no stored secret of `kind`.
-   *
-   * `missingPolicy` is the caller's preference for how to surface missing
-   * entries:
-   * - `"skip"` — return nulls for missing ids; the caller will drop them.
-   * - `"fail"` — every requested id is expected to have an entry. Stores
-   *   that can detect misses cheaply (e.g. by row count) may throw
-   *   immediately to short-circuit unnecessary work; otherwise return nulls
-   *   as in `"skip"` mode — the Rust adapter detects the misses and surfaces
-   *   them as a structured error.
+   * Load secrets of the same `kind` for several channels in one call,
+   * scoped to `secretId`. Must return an array with one entry per input
+   * id, in the same order, using `null` (or `undefined`) for channels
+   * with no stored secret of `kind`.
    */
   loadMany(
+    secretId: string,
     channelIds: string[],
     kind: 0 | 1 | 2,
     missingPolicy: "skip" | "fail",
   ): Promise<Array<Uint8Array | null | undefined>>;
-  save(channelId: string, kind: 0 | 1 | 2, value: Uint8Array): Promise<void>;
-  remove(channelId: string, kind: 0 | 1 | 2): Promise<void>;
+  save(
+    secretId: string,
+    channelId: string,
+    kind: 0 | 1 | 2,
+    value: Uint8Array,
+  ): Promise<void>;
+  remove(secretId: string, channelId: string, kind: 0 | 1 | 2): Promise<void>;
 }
 
 export interface ChannelStore {
-  load(channelId: string): Promise<Uint8Array | null | undefined>;
-  save(channelId: string, bytes: Uint8Array): Promise<void>;
-  listChannels(): Promise<string[]>;
-  remove(channelId: string): Promise<boolean>;
-  linkChannel(channelId: string, linkedChannelId: string): Promise<void>;
-  linkedChannels(channelId: string): Promise<string[]>;
+  load(secretId: string, channelId: string): Promise<Uint8Array | null | undefined>;
+  save(secretId: string, channelId: string, bytes: Uint8Array): Promise<void>;
+  listChannels(secretId: string): Promise<string[]>;
+  remove(secretId: string, channelId: string): Promise<boolean>;
+  linkChannel(
+    secretId: string,
+    channelId: string,
+    linkedChannelId: string,
+  ): Promise<void>;
+  linkedChannels(secretId: string, channelId: string): Promise<string[]>;
 }
 
 export interface Share {
@@ -43,12 +49,40 @@ export interface Share {
 }
 
 export interface ShareStore {
-  load(channelId: string, secretId: string, versions: number[]): Promise<Share[]>;
-  loadMany(channelIds: string[], secretId: string, versions: number[]): Promise<Share[]>;
+  load(secretId: string, channelId: string, versions: number[]): Promise<Share[]>;
+  loadMany(
+    secretId: string,
+    channelIds: string[],
+    versions: number[],
+  ): Promise<Share[]>;
+  loadAll(secretId: string, channelIds: string[]): Promise<Share[]>;
+  save(secretId: string, channelId: string, share: Share): Promise<void>;
+  latestVersion(secretId: string): Promise<number | null>;
+  removeChannel(secretId: string, channelId: string): Promise<void>;
+}
 
-  loadAll(channelIds: string[]): Promise<Share[]>;
-  save(channelId: string, share: Share): Promise<void>;
-  latestVersion(): Promise<number | null>;
+export interface UserSecretEntry {
+  id: Uint8Array;
+  name: string;
+  data: Uint8Array;
+}
+
+export interface UserSecrets {
+  version: number;
+  secrets: UserSecretEntry[];
+  description?: string;
+}
+
+/**
+ * Persistence for the user-facing vault contents, keyed by `secretId`.
+ * One `secretId` maps to at most one stored snapshot — the most recent
+ * `start(ProtectSecret)` value. Read back by the pair-completion
+ * auto-publish hook so freshly-paired peers receive the current vault.
+ */
+export interface UserSecretStore {
+  loadLatest(secretId: string): Promise<UserSecrets | null | undefined>;
+  saveLatest(secretId: string, value: UserSecrets): Promise<void>;
+  remove(secretId: string): Promise<void>;
 }
 
 export interface Transport {
@@ -122,8 +156,6 @@ export interface DiscoveryParams {
   target?: Target;
 }
 export interface ProtectSecretParams {
-  secretId: bigint | string;
-  target?: Target;
   secrets: UserSecret[];
   description?: string;
 }
@@ -285,11 +317,18 @@ export type DeRecEvent =
  * `build()` without all five throws.
  */
 export declare class DeRecProtocolBuilder {
-  constructor();
+  /**
+   * Construct a builder bound to a specific vault. `secretId`
+   * identifies the single vault this protocol instance manages.
+   * Apps that juggle multiple vaults instantiate one
+   * {@link DeRecProtocol} per id.
+   */
+  constructor(secretId: bigint | number);
 
   withChannelStore(store: ChannelStore): DeRecProtocolBuilder;
   withShareStore(store: ShareStore): DeRecProtocolBuilder;
   withSecretStore(store: SecretStore): DeRecProtocolBuilder;
+  withUserSecretStore(store: UserSecretStore): DeRecProtocolBuilder;
   withTransport(transport: Transport): DeRecProtocolBuilder;
   withOwnTransport(endpoint: { uri: string; protocol: string }): DeRecProtocolBuilder;
 
@@ -329,6 +368,9 @@ export declare class DeRecProtocolBuilder {
 export declare class DeRecProtocol {
   /** Use {@link DeRecProtocolBuilder} to construct instances. */
   private constructor();
+
+  /** The vault identifier this protocol instance is bound to. */
+  secretId(): bigint;
 
   /**
    * Generate an out-of-band contact message used to bootstrap pairing.

@@ -130,17 +130,25 @@ pub enum DeRecFlow {
     Discovery {
         target: Target,
     },
+    /// Publish the current vault bag to the protocol's paired peers.
+    ///
+    /// The vault identifier comes from the
+    /// [`super::DeRecProtocol`] instance (set at construction via
+    /// [`crate::protocol::DeRecProtocolBuilder::new`]) — one protocol
+    /// instance manages exactly one vault.
+    ///
+    /// The target set is derived from the channel store: every paired
+    /// Owner→Helper channel receives a share if the configured threshold
+    /// is met, and every paired Source→ReplicaDestination channel
+    /// receives the full vault payload. Apps that need to drive a single
+    /// peer should pair just that peer; the protocol no longer accepts
+    /// a per-call subset.
+    ///
+    /// When the count of paired Helpers is below
+    /// [`crate::protocol::DeRecProtocolBuilder::with_threshold`], no VSS
+    /// split runs and Helpers receive nothing — the bag still lands on
+    /// any paired Replica destinations in "vault-only" form.
     ProtectSecret {
-        /// Vault identifier this share distribution belongs to.
-        ///
-        /// The application owns the channel↔secret mapping; pass the same
-        /// `secret_id` here that identifies the vault `target` was selected
-        /// for.
-        secret_id: u64,
-        /// Helpers to distribute shares to. Typically [`Target::Many`]
-        /// carrying the channel ids the application has tagged as
-        /// protecting this vault.
-        target: Target,
         secrets: Vec<UserSecret>,
         description: Option<String>,
     },

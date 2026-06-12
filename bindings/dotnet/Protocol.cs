@@ -55,7 +55,7 @@ internal static class Protocol
         var transport = new RecordingTransport();
 
         // Pre-seed: a paired channel + its 32-byte SharedKey.
-        channelStore.Save(new Channel(
+        channelStore.Save(DefaultTestSecretId, new Channel(
             Id: channelId,
             Transport: new TransportProtocol("https://peer.example.com"),
             CommunicationInfo: new Dictionary<string, string>(),
@@ -63,12 +63,13 @@ internal static class Protocol
             CreatedAt: 1700000000UL,
             Role: Pairing.SenderKind.Owner,
             ReplicaId: null));
-        secretStore.Save(channelId, new SecretValue(SecretKind.SharedKey, sharedKey));
+        secretStore.Save(DefaultTestSecretId, channelId, new SecretValue(SecretKind.SharedKey, sharedKey));
 
-        using var protocol = new DeRecProtocolBuilder()
+        using var protocol = new DeRecProtocolBuilder(DefaultTestSecretId)
             .WithChannelStore(channelStore)
             .WithShareStore(shareStore)
             .WithSecretStore(secretStore)
+            .WithUserSecretStore(new InMemoryUserSecretStore())
             .WithTransport(transport)
             .WithOwnTransport(new TransportProtocol("https://owner.example.com"))
             .Build();
@@ -111,7 +112,7 @@ internal static class Protocol
         // Pre-seed a Pending channel + its shared key (simulating the
         // post-replica-pair state where fingerprint verification is
         // still required to transition to Paired).
-        node.ChannelStore.Save(new Channel(
+        node.ChannelStore.Save(node.Protocol.SecretId, new Channel(
             Id: channelId,
             Transport: new TransportProtocol("https://peer.example.com"),
             CommunicationInfo: new Dictionary<string, string>(),
@@ -119,7 +120,7 @@ internal static class Protocol
             CreatedAt: 1700000000UL,
             Role: Pairing.SenderKind.ReplicaSource,
             ReplicaId: 0xcafeUL));
-        node.SecretStore.Save(channelId, new SecretValue(SecretKind.SharedKey, sharedKey));
+        node.SecretStore.Save(node.Protocol.SecretId, channelId, new SecretValue(SecretKind.SharedKey, sharedKey));
 
         bool unmatched = node.Protocol
             .VerifyFingerprintAsync(channelId, "0000-0000-0000-0000")
@@ -130,7 +131,7 @@ internal static class Protocol
 
         // Critical invariant: the stored channel record must still
         // report Pending; the protocol must not have touched it.
-        var stored = node.ChannelStore.Load(channelId)
+        var stored = node.ChannelStore.Load(node.Protocol.SecretId, channelId)
             ?? throw new InvalidOperationException("channel record missing after verify");
         if (stored.Status != ChannelStatus.Pending)
             throw new InvalidOperationException(
@@ -212,14 +213,14 @@ internal static class Protocol
                 $"both sides must converge on the same channel id; helper={helperPairing.ChannelId} owner={ownerPairing.ChannelId}");
         ulong rekeyedId = ulong.Parse(helperPairing.ChannelId);
 
-        var helperChannel = helper.ChannelStore.Load(rekeyedId)
+        var helperChannel = helper.ChannelStore.Load(helper.Protocol.SecretId, rekeyedId)
             ?? throw new InvalidOperationException("helper channel record must exist after pairing");
-        var ownerChannel = owner.ChannelStore.Load(rekeyedId)
+        var ownerChannel = owner.ChannelStore.Load(owner.Protocol.SecretId, rekeyedId)
             ?? throw new InvalidOperationException("owner channel record must exist after pairing");
 
-        var helperKey = helper.SecretStore.Load(rekeyedId, SecretKind.SharedKey)
+        var helperKey = helper.SecretStore.Load(helper.Protocol.SecretId, rekeyedId, SecretKind.SharedKey)
             ?? throw new InvalidOperationException("helper shared_key must exist after pairing");
-        var ownerKey = owner.SecretStore.Load(rekeyedId, SecretKind.SharedKey)
+        var ownerKey = owner.SecretStore.Load(owner.Protocol.SecretId, rekeyedId, SecretKind.SharedKey)
             ?? throw new InvalidOperationException("owner shared_key must exist after pairing");
         if (helperKey.Bytes.Length != 32 || ownerKey.Bytes.Length != 32)
             throw new InvalidOperationException("shared_key must be 32 bytes on both sides");
@@ -244,11 +245,17 @@ internal static class Protocol
         const ulong secretId = 0x7777UL;
         byte[] secretData = Encoding.UTF8.GetBytes("orchestrator-shared-secret");
 
-        using var owner = MakeNode("Owner", "https://owner.example.com");
+        using var owner = MakeNode("Owner", "https://owner.example.com",
+            new NodeOptions(SecretId: secretId));
 
-        using var helperA = MakeNode("HelperA", "https://helper-a.example.com");
+        // Helpers bind their protocol to the owner's vault id — one
+        // helper-protocol-instance per (owner, vault) pair on the helper
+        // side, mirroring the Rust/JS smokes.
+        using var helperA = MakeNode("HelperA", "https://helper-a.example.com",
+            new NodeOptions(SecretId: secretId));
 
-        using var helperB = MakeNode("HelperB", "https://helper-b.example.com");
+        using var helperB = MakeNode("HelperB", "https://helper-b.example.com",
+            new NodeOptions(SecretId: secretId));
 
         ulong rekeyedA = DoOrchestratorPair(helperA, helperA.Transport, owner, owner.Transport, helperAChannel);
         ulong rekeyedB = DoOrchestratorPair(helperB, helperB.Transport, owner, owner.Transport, helperBChannel);
@@ -256,8 +263,6 @@ internal static class Protocol
 
         owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
         {
-            SecretId = secretId.ToString(),
-            Target = Target.Many(rekeyedA, rekeyedB),
             Secrets = new[]
             {
                 new UserSecret { Id = new byte[] { 0x01 }, Name = "smoke", Data = secretData },
@@ -323,7 +328,8 @@ internal static class Protocol
         const ulong recoveryAChannel = 100UL;
         const ulong recoveryBChannel = 101UL;
 
-        using var recOwner = MakeNode("RecOwner", "https://recovery-owner.example.com");
+        using var recOwner = MakeNode("RecOwner", "https://recovery-owner.example.com",
+            new NodeOptions(SecretId: secretId));
 
         ulong recA = DoOrchestratorPair(helperA, helperA.Transport, recOwner, recOwner.Transport, recoveryAChannel);
         ulong recB = DoOrchestratorPair(helperB, helperB.Transport, recOwner, recOwner.Transport, recoveryBChannel);
@@ -332,8 +338,8 @@ internal static class Protocol
         // Each helper links its original channel to its new recovery
         // channel so recovery (which fans out on the recovery channel)
         // surfaces the share stored under the original.
-        helperA.ChannelStore.LinkChannel(rekeyedA, recA);
-        helperB.ChannelStore.LinkChannel(rekeyedB, recB);
+        helperA.ChannelStore.LinkChannel(helperA.Protocol.SecretId, rekeyedA, recA);
+        helperB.ChannelStore.LinkChannel(helperB.Protocol.SecretId, rekeyedB, recB);
 
         recOwner.Protocol.StartAsync(FlowKind.RecoverSecret, new RecoverSecretParams
         {
@@ -388,15 +394,18 @@ internal static class Protocol
         const ulong secretId = 0xC0FFEEUL;
         byte[] secretData = Encoding.UTF8.GetBytes("vault-payload-for-replica-and-helper");
 
-        using var owner = MakeNode("Owner", "https://owner.example.com", new NodeOptions { ReplicaId = ownerReplicaId });
+        using var owner = MakeNode("Owner", "https://owner.example.com",
+            new NodeOptions { ReplicaId = ownerReplicaId, SecretId = secretId });
 
-        using var helperA = MakeNode("HelperA", "https://helper-a.example.com");
+        using var helperA = MakeNode("HelperA", "https://helper-a.example.com",
+            new NodeOptions { SecretId = secretId });
 
-        using var helperB = MakeNode("HelperB", "https://helper-b.example.com");
+        using var helperB = MakeNode("HelperB", "https://helper-b.example.com",
+            new NodeOptions { SecretId = secretId });
 
         using var destination = MakeNode(
             "Destination", "https://replica-destination.example.com",
-            new NodeOptions { ReplicaId = destReplicaId });
+            new NodeOptions { ReplicaId = destReplicaId, SecretId = secretId });
 
         ulong helperAId = DoOrchestratorPair(helperA, helperA.Transport, owner, owner.Transport, helperAChannel);
         ulong helperBId = DoOrchestratorPair(helperB, helperB.Transport, owner, owner.Transport, helperBChannel);
@@ -410,37 +419,9 @@ internal static class Protocol
             initiatorKind: Pairing.SenderKind.ReplicaDestination);
         Console.WriteLine($"  replica pair: destination channel={destId}  ✓");
 
-        // Replica channels start `Pending` after pair handshake
-        // completion. `ProtectSecret` must refuse to target a
-        // still-Pending channel because the fingerprint has not been
-        // verified out-of-band yet. Exercise the path before fingerprint
-        // confirmation to assert the gate fires.
-        try
-        {
-            owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
-            {
-                SecretId = secretId.ToString(),
-                Target = Target.One(destId),
-                Secrets = new[]
-                {
-                    new UserSecret { Id = new byte[] { 0x01 }, Name = "premature", Data = secretData },
-                },
-                Description = "must reject — destination still Pending",
-            }).GetAwaiter().GetResult();
-            throw new InvalidOperationException(
-                "ProtectSecret targeting a still-Pending replica channel must fail");
-        }
-        catch (DeRecException e) when (e.Category == DeRecCategory.InvalidInput)
-        {
-            // expected
-        }
-        if (owner.Transport.Outbox.Count != 0)
-            throw new InvalidOperationException(
-                "no outbound traffic should have been queued by the rejected ProtectSecret");
-        Console.WriteLine("  ProtectSecret refuses still-Pending replica target  ✓");
-
-        // Cross-confirm fingerprints — channels start `Pending` and
-        // ProtectSecret refuses to target a Pending replica channel.
+        // Cross-confirm fingerprints — replica channels start `Pending`
+        // and only become eligible publish targets after fingerprint
+        // verification flips them to `Paired`.
         string ownerFp = owner.Protocol.GetFingerprintAsync(destId).GetAwaiter().GetResult();
         string destFp = destination.Protocol.GetFingerprintAsync(destId).GetAwaiter().GetResult();
         if (ownerFp != destFp)
@@ -453,8 +434,6 @@ internal static class Protocol
 
         owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
         {
-            SecretId = secretId.ToString(),
-            Target = Target.Many(helperAId, helperBId, destId),
             Secrets = new[]
             {
                 new UserSecret { Id = new byte[] { 0x01 }, Name = "shared-vault", Data = secretData },
@@ -511,12 +490,10 @@ internal static class Protocol
         // side-channel setter so this test can drive that contract
         // without first running a full helper-side store / confirm
         // cycle on the owner.
-        owner.ShareStore.SetOwnerVersion(1);
+        owner.ShareStore.SetOwnerVersion(owner.Protocol.SecretId, 1);
         byte[] secretDataV2 = Encoding.UTF8.GetBytes("vault-payload-after-update");
         owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
         {
-            SecretId = secretId.ToString(),
-            Target = Target.Many(helperAId, helperBId, destId),
             Secrets = new[]
             {
                 new UserSecret { Id = new byte[] { 0x01 }, Name = "shared-vault", Data = secretDataV2 },
@@ -547,8 +524,8 @@ internal static class Protocol
         // for the owner channel, because a Destination acting as a
         // recovery delegate uses them to authenticate as the Source
         // toward each helper.
-        var helperAStored = helperA.SecretStore.Load(helperAId, SecretKind.SharedKey)!.Bytes;
-        var helperBStored = helperB.SecretStore.Load(helperBId, SecretKind.SharedKey)!.Bytes;
+        var helperAStored = helperA.SecretStore.Load(helperA.Protocol.SecretId, helperAId, SecretKind.SharedKey)!.Bytes;
+        var helperBStored = helperB.SecretStore.Load(helperB.Protocol.SecretId, helperBId, SecretKind.SharedKey)!.Bytes;
         var vaultHelperA = received2.Vault.Helpers
             .FirstOrDefault(h => ulong.Parse(h.ChannelId) == helperAId)
             ?? throw new InvalidOperationException("vault.helpers missing entry for HelperA");
@@ -633,9 +610,9 @@ internal static class Protocol
             throw new InvalidOperationException("HashedKeys pair: channel id mismatch on both sides");
 
         ulong rekeyedId = ulong.Parse(helperPairing.ChannelId);
-        var helperKey = helper.SecretStore.Load(rekeyedId, SecretKind.SharedKey)
+        var helperKey = helper.SecretStore.Load(helper.Protocol.SecretId, rekeyedId, SecretKind.SharedKey)
             ?? throw new InvalidOperationException("helper shared_key missing after HashedKeys pair");
-        var ownerKey = owner.SecretStore.Load(rekeyedId, SecretKind.SharedKey)
+        var ownerKey = owner.SecretStore.Load(owner.Protocol.SecretId, rekeyedId, SecretKind.SharedKey)
             ?? throw new InvalidOperationException("owner shared_key missing after HashedKeys pair");
         if (!helperKey.Bytes.SequenceEqual(ownerKey.Bytes))
             throw new InvalidOperationException("shared keys must match after HashedKeys pair");
@@ -682,9 +659,9 @@ internal static class Protocol
             throw new InvalidOperationException("Owner.Unpaired channel id mismatch");
 
         // Both sides have dropped their channel records.
-        if (helper.ChannelStore.Load(rekeyedId) is not null)
+        if (helper.ChannelStore.Load(helper.Protocol.SecretId, rekeyedId) is not null)
             throw new InvalidOperationException("helper channel record must be gone after Unpaired");
-        if (owner.ChannelStore.Load(rekeyedId) is not null)
+        if (owner.ChannelStore.Load(owner.Protocol.SecretId, rekeyedId) is not null)
             throw new InvalidOperationException("owner channel record must be gone after Unpaired");
 
         Console.WriteLine($"  unpair channel_id={rekeyedId} → Unpaired on both sides + channel records dropped  ✓");
@@ -749,7 +726,7 @@ internal static class Protocol
 
         // Helper's stored channel must now mirror the new transport
         // URI and communication-info map.
-        var helperChannel = helper.ChannelStore.Load(rekeyedId)
+        var helperChannel = helper.ChannelStore.Load(helper.Protocol.SecretId, rekeyedId)
             ?? throw new InvalidOperationException("helper channel record must still exist");
         if (helperChannel.Transport.Uri != newUri)
             throw new InvalidOperationException(
@@ -800,7 +777,7 @@ internal static class Protocol
         // Field-level check: decrypt the envelope on the helper side and
         // assert reply_to == ownerUri on the inner request. Mirrors the
         // JS smoke (which inspects the same field).
-        byte[] sharedKey = helper.SecretStore.Load(rekeyedId, SecretKind.SharedKey)!.Bytes;
+        byte[] sharedKey = helper.SecretStore.Load(helper.Protocol.SecretId, rekeyedId, SecretKind.SharedKey)!.Bytes;
         var extracted = Discovery.Request.Extract(
             DeRecMessage.FromProtoBytes(outBytes), sharedKey);
         if (extracted.ReplyTo is null || extracted.ReplyTo.Uri != ownerUri)
@@ -818,7 +795,7 @@ internal static class Protocol
             Target = Target.One(rekeyedId2),
         }).GetAwaiter().GetResult();
         var (_, _, defaultBytes) = owner2.Transport.DrainAll().Single();
-        byte[] sharedKey2 = helper2.SecretStore.Load(rekeyedId2, SecretKind.SharedKey)!.Bytes;
+        byte[] sharedKey2 = helper2.SecretStore.Load(helper2.Protocol.SecretId, rekeyedId2, SecretKind.SharedKey)!.Bytes;
         var extracted2 = Discovery.Request.Extract(
             DeRecMessage.FromProtoBytes(defaultBytes), sharedKey2);
         if (extracted2.ReplyTo is not null)
@@ -983,7 +960,8 @@ internal static class Protocol
         RecordingTransport Transport,
         InMemoryChannelStore ChannelStore,
         InMemoryShareStore ShareStore,
-        InMemorySecretStore SecretStore) : IDisposable
+        InMemorySecretStore SecretStore,
+        InMemoryUserSecretStore UserSecretStore) : IDisposable
     {
         public void Dispose() => Protocol.Dispose();
     }
@@ -996,9 +974,17 @@ internal static class Protocol
     private sealed record NodeOptions(
         bool? AutoReplyTo = null,
         ulong? ReplicaId = null,
-        int? Threshold = null);
+        int? Threshold = null,
+        ulong? SecretId = null);
 
     private const int DefaultThreshold = 2;
+
+    /// <summary>
+    /// Default vault identifier wired into every <see cref="MakeNode"/>
+    /// caller that doesn't pin one explicitly via
+    /// <see cref="NodeOptions.SecretId"/>.
+    /// </summary>
+    private const ulong DefaultTestSecretId = 0xDE_2EC;
 
     /// <summary>
     /// Construct a fresh node bound to <paramref name="endpointUri"/>.
@@ -1016,12 +1002,14 @@ internal static class Protocol
         var channelStore = new InMemoryChannelStore();
         var shareStore = new InMemoryShareStore();
         var secretStore = new InMemorySecretStore();
+        var userSecretStore = new InMemoryUserSecretStore();
         var transport = new RecordingTransport();
 
-        var builder = new DeRecProtocolBuilder()
+        var builder = new DeRecProtocolBuilder(options.SecretId ?? DefaultTestSecretId)
             .WithChannelStore(channelStore)
             .WithShareStore(shareStore)
             .WithSecretStore(secretStore)
+            .WithUserSecretStore(userSecretStore)
             .WithTransport(transport)
             .WithOwnTransport(new TransportProtocol(endpointUri))
             .WithCommunicationInfo(new Dictionary<string, string> { ["name"] = name })
@@ -1031,6 +1019,6 @@ internal static class Protocol
         if (options.ReplicaId is ulong replicaId)
             builder = builder.WithReplicaId(replicaId);
 
-        return new Node(builder.Build(), transport, channelStore, shareStore, secretStore);
+        return new Node(builder.Build(), transport, channelStore, shareStore, secretStore, userSecretStore);
     }
 }

@@ -30,9 +30,11 @@ namespace DeRec.Library.Orchestrator;
 /// </summary>
 public sealed class DeRecProtocolBuilder
 {
+    private readonly ulong _secretId;
     private IChannelStore? _channelStore;
     private IShareStore? _shareStore;
     private ISecretStore? _secretStore;
+    private IUserSecretStore? _userSecretStore;
     private ITransport? _transport;
     private TransportProtocol? _ownTransport;
     private int _threshold = 3;
@@ -43,6 +45,18 @@ public sealed class DeRecProtocolBuilder
     private UnpairAck _unpairAck = UnpairAck.Required;
     private bool _autoReplyTo = false;
     private ulong? _replicaId = null;
+
+    /// <summary>
+    /// Construct a builder bound to a specific vault.
+    ///
+    /// <paramref name="secretId"/> identifies the single vault this
+    /// protocol instance manages. Apps that juggle multiple vaults
+    /// instantiate one <see cref="DeRecProtocol"/> per id.
+    /// </summary>
+    public DeRecProtocolBuilder(ulong secretId)
+    {
+        _secretId = secretId;
+    }
 
     /// <summary>Set the channel-store implementation. Required.</summary>
     public DeRecProtocolBuilder WithChannelStore(IChannelStore store)
@@ -62,6 +76,13 @@ public sealed class DeRecProtocolBuilder
     public DeRecProtocolBuilder WithSecretStore(ISecretStore store)
     {
         _secretStore = store ?? throw new ArgumentNullException(nameof(store));
+        return this;
+    }
+
+    /// <summary>Set the user-secret-store implementation. Required.</summary>
+    public DeRecProtocolBuilder WithUserSecretStore(IUserSecretStore store)
+    {
+        _userSecretStore = store ?? throw new ArgumentNullException(nameof(store));
         return this;
     }
 
@@ -168,6 +189,7 @@ public sealed class DeRecProtocolBuilder
         if (_channelStore is null) throw new InvalidOperationException("WithChannelStore is required");
         if (_shareStore is null) throw new InvalidOperationException("WithShareStore is required");
         if (_secretStore is null) throw new InvalidOperationException("WithSecretStore is required");
+        if (_userSecretStore is null) throw new InvalidOperationException("WithUserSecretStore is required");
         if (_transport is null) throw new InvalidOperationException("WithTransport is required");
         if (_ownTransport is null) throw new InvalidOperationException("WithOwnTransport is required");
 
@@ -175,9 +197,11 @@ public sealed class DeRecProtocolBuilder
         int timeoutInSecs = (int)Math.Max(1, Math.Min(secs, int.MaxValue));
 
         return new DeRecProtocol(
+            secretId: _secretId,
             channelStore: _channelStore,
             shareStore: _shareStore,
             secretStore: _secretStore,
+            userSecretStore: _userSecretStore,
             transport: _transport,
             ownTransportUri: _ownTransport.Uri,
             ownTransportProtocol: _ownTransport.Protocol.ToString().ToLowerInvariant(),

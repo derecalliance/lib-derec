@@ -53,6 +53,7 @@ pub(in crate::protocol) async fn start<
     channel_store: &mut Ch,
     secret_store: &mut Ss,
     transport: &T,
+    secret_id: u64,
     target: Target,
     communication_info: Option<HashMap<String, String>>,
     transport_protocol: Option<TransportProtocol>,
@@ -61,13 +62,18 @@ pub(in crate::protocol) async fn start<
         return Err(EMPTY_UPDATE_ERROR);
     }
 
-    let channel_ids = resolve_target(channel_store, target).await?;
+    let channel_ids = resolve_target(channel_store, secret_id, target).await?;
     if channel_ids.is_empty() {
         return Ok(());
     }
 
     let keys = secret_store
-        .load_many(&channel_ids, SecretKind::SharedKey, MissingPolicy::Fail)
+        .load_many(
+            secret_id,
+            &channel_ids,
+            SecretKind::SharedKey,
+            MissingPolicy::Fail,
+        )
         .await?;
 
     let comm_info_proto = communication_info
@@ -94,7 +100,7 @@ pub(in crate::protocol) async fn start<
             .build()?
             .encode_to_vec();
 
-        let endpoint = peer_endpoint(channel_store, channel_id).await?;
+        let endpoint = peer_endpoint(channel_store, secret_id, channel_id).await?;
         transport.send(&endpoint, envelope).await?;
 
         #[cfg(feature = "logging")]
@@ -119,6 +125,7 @@ pub(in crate::protocol) async fn start<
 pub(in crate::protocol) async fn accept<Ch: DeRecChannelStore, T: DeRecTransport>(
     channel_store: &mut Ch,
     transport: &T,
+    secret_id: u64,
     channel_id: ChannelId,
     request: &UpdateChannelInfoRequestMessage,
     shared_key: &SharedKey,
@@ -127,7 +134,7 @@ pub(in crate::protocol) async fn accept<Ch: DeRecChannelStore, T: DeRecTransport
     // Apply the update to the stored channel first, so the response we send
     // below is routed to the (possibly updated) transport endpoint.
     let mut channel = channel_store
-        .load(channel_id)
+        .load(secret_id, channel_id)
         .await?
         .ok_or(Error::InvalidInput(
             "channel id not present in channel store",
@@ -145,7 +152,7 @@ pub(in crate::protocol) async fn accept<Ch: DeRecChannelStore, T: DeRecTransport
         channel.transport = tp;
     }
 
-    channel_store.save(channel).await?;
+    channel_store.save(secret_id, channel).await?;
 
     let timestamp = current_timestamp();
     let response = UpdateChannelInfoResponseMessage {
@@ -165,7 +172,7 @@ pub(in crate::protocol) async fn accept<Ch: DeRecChannelStore, T: DeRecTransport
         .build()?
         .encode_to_vec();
 
-    let endpoint = peer_endpoint(channel_store, channel_id).await?;
+    let endpoint = peer_endpoint(channel_store, secret_id, channel_id).await?;
     transport.send(&endpoint, envelope).await?;
 
     #[cfg(feature = "logging")]
@@ -186,6 +193,7 @@ pub(in crate::protocol) async fn accept<Ch: DeRecChannelStore, T: DeRecTransport
 pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport>(
     channel_store: &mut Ch,
     transport: &T,
+    secret_id: u64,
     channel_id: ChannelId,
     shared_key: &SharedKey,
     status: StatusEnum,
@@ -210,7 +218,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
         .build()?
         .encode_to_vec();
 
-    let endpoint = peer_endpoint(channel_store, channel_id).await?;
+    let endpoint = peer_endpoint(channel_store, secret_id, channel_id).await?;
     transport.send(&endpoint, envelope).await?;
 
     #[cfg(feature = "logging")]

@@ -18,7 +18,8 @@ use crate::ffi::error::{
 };
 use crate::ffi::protocol::stores::{
     ChannelStoreCallbacks, DotnetChannelStore, DotnetSecretStore, DotnetShareStore,
-    DotnetTransport, SecretStoreCallbacks, ShareStoreCallbacks, TransportCallbacks,
+    DotnetTransport, DotnetUserSecretStore, SecretStoreCallbacks, ShareStoreCallbacks,
+    TransportCallbacks, UserSecretStoreCallbacks,
 };
 use crate::protocol::DeRecProtocolBuilder;
 use derec_proto::TransportProtocol;
@@ -31,6 +32,7 @@ pub(super) type Protocol = crate::protocol::DeRecProtocol<
     DotnetChannelStore,
     DotnetShareStore,
     DotnetSecretStore,
+    DotnetUserSecretStore,
     DotnetTransport,
 >;
 
@@ -74,9 +76,11 @@ impl From<DeRecError> for DeRecProtocolNewResult {
 ///   the handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn derec_protocol_new(
+    secret_id: u64,
     channel_store_cb: *const ChannelStoreCallbacks,
     secret_store_cb: *const SecretStoreCallbacks,
     share_store_cb: *const ShareStoreCallbacks,
+    user_secret_store_cb: *const UserSecretStoreCallbacks,
     transport_cb: *const TransportCallbacks,
     own_transport_uri_ptr: *const u8,
     own_transport_uri_len: usize,
@@ -97,6 +101,7 @@ pub unsafe extern "C" fn derec_protocol_new(
     if channel_store_cb.is_null()
         || secret_store_cb.is_null()
         || share_store_cb.is_null()
+        || user_secret_store_cb.is_null()
         || transport_cb.is_null()
     {
         return ffi_error(
@@ -193,14 +198,18 @@ pub unsafe extern "C" fn derec_protocol_new(
     let share_store = DotnetShareStore {
         cb: unsafe { std::ptr::read(share_store_cb) },
     };
+    let user_secret_store = DotnetUserSecretStore {
+        cb: unsafe { std::ptr::read(user_secret_store_cb) },
+    };
     let transport = DotnetTransport {
         cb: unsafe { std::ptr::read(transport_cb) },
     };
 
-    let mut builder = DeRecProtocolBuilder::new()
+    let mut builder = DeRecProtocolBuilder::new(secret_id)
         .with_channel_store(channel_store)
         .with_share_store(share_store)
         .with_secret_store(secret_store)
+        .with_user_secret_store(user_secret_store)
         .with_transport(transport)
         .with_own_transport(own_transport)
         .with_threshold(threshold as usize)

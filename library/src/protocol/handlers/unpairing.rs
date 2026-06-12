@@ -32,6 +32,7 @@ pub(in crate::protocol) async fn handle<
     share_store: &mut Sh,
     secret_store: &mut Ss,
     pending_unpair: &mut std::collections::HashMap<ChannelId, u64>,
+    secret_id: u64,
     channel_id: ChannelId,
     inner: MessageBody,
     shared_key: SharedKey,
@@ -47,6 +48,7 @@ pub(in crate::protocol) async fn handle<
                 share_store,
                 secret_store,
                 pending_unpair,
+                secret_id,
                 channel_id,
                 &response,
             )
@@ -71,18 +73,24 @@ pub(in crate::protocol) async fn start<
     secret_store: &mut Ss,
     transport: &T,
     pending_unpair: &mut std::collections::HashMap<ChannelId, u64>,
+    secret_id: u64,
     target: Target,
     memo: Option<String>,
     unpair_ack: UnpairAck,
     now: u64,
     reply_to: Option<derec_proto::TransportProtocol>,
 ) -> Result<Vec<DeRecEvent>> {
-    let channel_ids = resolve_target(channel_store, target).await?;
+    let channel_ids = resolve_target(channel_store, secret_id, target).await?;
     let memo_str = memo.unwrap_or_default();
     let mut events = Vec::new();
 
     let keys = secret_store
-        .load_many(&channel_ids, SecretKind::SharedKey, MissingPolicy::Fail)
+        .load_many(
+            secret_id,
+            &channel_ids,
+            SecretKind::SharedKey,
+            MissingPolicy::Fail,
+        )
         .await?;
 
     for (channel_id, value) in keys {
@@ -92,12 +100,19 @@ pub(in crate::protocol) async fn start<
 
         let request = produce_unpair_request(channel_id, &memo_str, &shared_key, reply_to.clone())?;
         let envelope = super::apply_trace_id(request.envelope, super::fresh_trace_id())?;
-        let endpoint = peer_endpoint(channel_store, channel_id).await?;
+        let endpoint = peer_endpoint(channel_store, secret_id, channel_id).await?;
         transport.send(&endpoint, envelope).await?;
 
         match unpair_ack {
             UnpairAck::NotRequired => {
-                drop_channel_state(channel_store, share_store, secret_store, channel_id).await?;
+                drop_channel_state(
+                    channel_store,
+                    share_store,
+                    secret_store,
+                    secret_id,
+                    channel_id,
+                )
+                .await?;
                 events.push(DeRecEvent::Unpaired { channel_id });
             }
             UnpairAck::Required => {
@@ -133,6 +148,7 @@ pub(in crate::protocol) async fn accept<
     share_store: &mut Sh,
     secret_store: &mut Ss,
     transport: &T,
+    secret_id: u64,
     channel_id: ChannelId,
     request: &UnpairRequestMessage,
     shared_key: &SharedKey,
@@ -140,12 +156,23 @@ pub(in crate::protocol) async fn accept<
 ) -> Result<Vec<DeRecEvent>> {
     let resp = unpairing_response::produce(channel_id, shared_key)?;
     let envelope = super::apply_trace_id(resp.envelope, trace_id)?;
-    let endpoint =
-        super::resolve_response_endpoint(channel_store, channel_id, request.reply_to.as_ref())
-            .await?;
+    let endpoint = super::resolve_response_endpoint(
+        channel_store,
+        secret_id,
+        channel_id,
+        request.reply_to.as_ref(),
+    )
+    .await?;
     transport.send(&endpoint, envelope).await?;
 
-    drop_channel_state(channel_store, share_store, secret_store, channel_id).await?;
+    drop_channel_state(
+        channel_store,
+        share_store,
+        secret_store,
+        secret_id,
+        channel_id,
+    )
+    .await?;
 
     #[cfg(feature = "logging")]
     tracing::info!("unpair accepted; local state dropped");
@@ -161,6 +188,7 @@ pub(in crate::protocol) async fn accept<
 pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport>(
     channel_store: &mut Ch,
     transport: &T,
+    secret_id: u64,
     channel_id: ChannelId,
     request: &UnpairRequestMessage,
     shared_key: &SharedKey,
@@ -179,6 +207,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
     super::send_channel_message(
         channel_store,
         transport,
+        secret_id,
         channel_id,
         MessageBody::UnpairResponse(response),
         shared_key,
@@ -218,6 +247,7 @@ async fn on_response<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecret
     share_store: &mut Sh,
     secret_store: &mut Ss,
     pending_unpair: &mut std::collections::HashMap<ChannelId, u64>,
+    secret_id: u64,
     channel_id: ChannelId,
     response: &UnpairResponseMessage,
 ) -> Result<Vec<DeRecEvent>> {
@@ -227,7 +257,14 @@ async fn on_response<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecret
 
     match process_unpair_response(response) {
         Ok(_) => {
-            drop_channel_state(channel_store, share_store, secret_store, channel_id).await?;
+            drop_channel_state(
+                channel_store,
+                share_store,
+                secret_store,
+                secret_id,
+                channel_id,
+            )
+            .await?;
             Ok(vec![DeRecEvent::Unpaired { channel_id }])
         }
         Err(Error::Unpairing(crate::primitives::unpairing::UnpairingError::NonOkStatus {
@@ -250,18 +287,21 @@ pub(in crate::protocol) async fn drop_channel_state<
     channel_store: &mut Ch,
     share_store: &mut Sh,
     secret_store: &mut Ss,
+    secret_id: u64,
     channel_id: ChannelId,
 ) -> Result<()> {
-    share_store.remove_channel(channel_id).await?;
+    share_store.remove_channel(secret_id, channel_id).await?;
 
-    let _ = secret_store.remove(channel_id, SecretKind::SharedKey).await;
     let _ = secret_store
-        .remove(channel_id, SecretKind::PairingSecret)
+        .remove(secret_id, channel_id, SecretKind::SharedKey)
         .await;
     let _ = secret_store
-        .remove(channel_id, SecretKind::PairingContact)
+        .remove(secret_id, channel_id, SecretKind::PairingSecret)
+        .await;
+    let _ = secret_store
+        .remove(secret_id, channel_id, SecretKind::PairingContact)
         .await;
 
-    let _ = channel_store.remove(channel_id).await?;
+    let _ = channel_store.remove(secret_id, channel_id).await?;
     Ok(())
 }

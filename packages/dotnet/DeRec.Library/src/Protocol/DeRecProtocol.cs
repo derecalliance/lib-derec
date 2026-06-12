@@ -46,6 +46,10 @@ public sealed class DeRecProtocol : IDisposable
     private readonly NP.ShareStoreSaveDelegate _shareSave;
     private readonly NP.ShareStoreRemoveChannelDelegate _shareRemoveChannel;
     private readonly NP.FreeBufferDelegate _shareFreeBuffer;
+    private readonly NP.UserSecretStoreLoadLatestDelegate _userSecretLoadLatest;
+    private readonly NP.UserSecretStoreSaveLatestDelegate _userSecretSaveLatest;
+    private readonly NP.UserSecretStoreRemoveDelegate _userSecretRemove;
+    private readonly NP.FreeBufferDelegate _userSecretFreeBuffer;
     private readonly NP.TransportSendDelegate _transportSend;
     // ReSharper restore NotAccessedField.Local
 
@@ -54,10 +58,17 @@ public sealed class DeRecProtocol : IDisposable
     private readonly ISecretStore _secretStore;
     // ReSharper disable PrivateFieldCanBeConvertedToLocalVariable
     private readonly IShareStore _shareStore;
+    private readonly IUserSecretStore _userSecretStore;
     private readonly ITransport _transport;
     // ReSharper restore PrivateFieldCanBeConvertedToLocalVariable
 
     private static JsonSerializerOptions JsonOpts => DeRecJsonOptions.Wire;
+
+    /// <summary>
+    /// Identifier of the single vault this protocol instance manages.
+    /// Set at construction via <see cref="DeRecProtocolBuilder"/>.
+    /// </summary>
+    public ulong SecretId { get; }
 
     /// <summary>
     /// Construct a protocol instance. Internal — callers go through
@@ -65,9 +76,11 @@ public sealed class DeRecProtocol : IDisposable
     /// with the Rust / JS SDK builders.
     /// </summary>
     internal DeRecProtocol(
+        ulong secretId,
         IChannelStore channelStore,
         IShareStore shareStore,
         ISecretStore secretStore,
+        IUserSecretStore userSecretStore,
         ITransport transport,
         string ownTransportUri,
         string ownTransportProtocol = "https",
@@ -80,9 +93,11 @@ public sealed class DeRecProtocol : IDisposable
         bool autoReplyTo = false,
         ulong? replicaId = null)
     {
+        SecretId = secretId;
         _channelStore = channelStore;
         _shareStore = shareStore;
         _secretStore = secretStore;
+        _userSecretStore = userSecretStore;
         _transport = transport;
 
         _channelLoad = ChannelLoadImpl;
@@ -105,6 +120,11 @@ public sealed class DeRecProtocol : IDisposable
         _shareSave = ShareSaveImpl;
         _shareRemoveChannel = ShareRemoveChannelImpl;
         _shareFreeBuffer = FreeBufferImpl;
+
+        _userSecretLoadLatest = UserSecretLoadLatestImpl;
+        _userSecretSaveLatest = UserSecretSaveLatestImpl;
+        _userSecretRemove = UserSecretRemoveImpl;
+        _userSecretFreeBuffer = FreeBufferImpl;
 
         _transportSend = TransportSendImpl;
 
@@ -138,6 +158,14 @@ public sealed class DeRecProtocol : IDisposable
             RemoveChannel = Marshal.GetFunctionPointerForDelegate(_shareRemoveChannel),
             FreeBuffer = Marshal.GetFunctionPointerForDelegate(_shareFreeBuffer),
         };
+        var userSecretCb = new NP.UserSecretStoreCallbacks
+        {
+            UserData = IntPtr.Zero,
+            LoadLatest = Marshal.GetFunctionPointerForDelegate(_userSecretLoadLatest),
+            SaveLatest = Marshal.GetFunctionPointerForDelegate(_userSecretSaveLatest),
+            Remove = Marshal.GetFunctionPointerForDelegate(_userSecretRemove),
+            FreeBuffer = Marshal.GetFunctionPointerForDelegate(_userSecretFreeBuffer),
+        };
         var transportCb = new NP.TransportCallbacks
         {
             UserData = IntPtr.Zero,
@@ -155,7 +183,8 @@ public sealed class DeRecProtocol : IDisposable
         UIntPtr commInfoLen = UIntPtr.Zero;
 
         var result = NP.derec_protocol_new(
-            ref channelCb, ref secretCb, ref shareCb, ref transportCb,
+            secretId,
+            ref channelCb, ref secretCb, ref shareCb, ref userSecretCb, ref transportCb,
             uriBytes, (UIntPtr)uriBytes.Length,
             ownProtocolNum,
             (uint)threshold,
@@ -421,11 +450,11 @@ public sealed class DeRecProtocol : IDisposable
             Marshal.FreeCoTaskMem(ptr);
     }
 
-    private int ChannelLoadImpl(IntPtr userData, ulong channelId, out IntPtr outPtr, out UIntPtr outLen)
+    private int ChannelLoadImpl(IntPtr userData, ulong secretId, ulong channelId, out IntPtr outPtr, out UIntPtr outLen)
     {
         try
         {
-            var ch = _channelStore.Load(channelId);
+            var ch = _channelStore.Load(secretId, channelId);
             if (ch is null)
             {
                 outPtr = IntPtr.Zero;
@@ -451,7 +480,7 @@ public sealed class DeRecProtocol : IDisposable
         }
     }
 
-    private int ChannelSaveImpl(IntPtr userData, ulong channelId, IntPtr bytes, UIntPtr len)
+    private int ChannelSaveImpl(IntPtr userData, ulong secretId, ulong channelId, IntPtr bytes, UIntPtr len)
     {
         try
         {
@@ -463,7 +492,7 @@ public sealed class DeRecProtocol : IDisposable
                 dto.transport.uri, (Protocol)dto.transport.protocol);
             var status = Enum.Parse<ChannelStatus>(dto.status ?? nameof(ChannelStatus.Paired));
             var role = Enum.Parse<LibPairing.SenderKind>(dto.role);
-            _channelStore.Save(new Channel(
+            _channelStore.Save(secretId, new Channel(
                 dto.id,
                 transport,
                 dto.communication_info ?? new(),
@@ -476,11 +505,11 @@ public sealed class DeRecProtocol : IDisposable
         catch { return -1; }
     }
 
-    private int ChannelRemoveImpl(IntPtr userData, ulong channelId, out uint outExisted)
+    private int ChannelRemoveImpl(IntPtr userData, ulong secretId, ulong channelId, out uint outExisted)
     {
         try
         {
-            outExisted = _channelStore.Remove(channelId) ? 1u : 0u;
+            outExisted = _channelStore.Remove(secretId, channelId) ? 1u : 0u;
             return 0;
         }
         catch
@@ -490,11 +519,11 @@ public sealed class DeRecProtocol : IDisposable
         }
     }
 
-    private int ChannelListImpl(IntPtr userData, out IntPtr outPtr, out UIntPtr outLen)
+    private int ChannelListImpl(IntPtr userData, ulong secretId, out IntPtr outPtr, out UIntPtr outLen)
     {
         try
         {
-            var ids = new List<ulong>(_channelStore.ListChannelIds());
+            var ids = new List<ulong>(_channelStore.ListChannelIds(secretId));
             byte[] json = JsonSerializer.SerializeToUtf8Bytes(ids, JsonOpts);
             return WriteOut(json, out outPtr, out outLen);
         }
@@ -506,17 +535,17 @@ public sealed class DeRecProtocol : IDisposable
         }
     }
 
-    private int ChannelLinkImpl(IntPtr userData, ulong a, ulong b)
+    private int ChannelLinkImpl(IntPtr userData, ulong secretId, ulong a, ulong b)
     {
-        try { _channelStore.LinkChannel(a, b); return 0; }
+        try { _channelStore.LinkChannel(secretId, a, b); return 0; }
         catch { return -1; }
     }
 
-    private int ChannelLinkedImpl(IntPtr userData, ulong channelId, out IntPtr outPtr, out UIntPtr outLen)
+    private int ChannelLinkedImpl(IntPtr userData, ulong secretId, ulong channelId, out IntPtr outPtr, out UIntPtr outLen)
     {
         try
         {
-            var ids = new List<ulong>(_channelStore.LinkedChannels(channelId));
+            var ids = new List<ulong>(_channelStore.LinkedChannels(secretId, channelId));
             byte[] json = JsonSerializer.SerializeToUtf8Bytes(ids, JsonOpts);
             return WriteOut(json, out outPtr, out outLen);
         }
@@ -528,11 +557,11 @@ public sealed class DeRecProtocol : IDisposable
         }
     }
 
-    private int SecretLoadImpl(IntPtr userData, ulong channelId, uint kind, out IntPtr outPtr, out UIntPtr outLen)
+    private int SecretLoadImpl(IntPtr userData, ulong secretId, ulong channelId, uint kind, out IntPtr outPtr, out UIntPtr outLen)
     {
         try
         {
-            var sv = _secretStore.Load(channelId, (SecretKind)kind);
+            var sv = _secretStore.Load(secretId, channelId, (SecretKind)kind);
             if (sv is null)
             {
                 outPtr = IntPtr.Zero;
@@ -551,7 +580,7 @@ public sealed class DeRecProtocol : IDisposable
         }
     }
 
-    private int SecretSaveImpl(IntPtr userData, ulong channelId, uint kind, IntPtr bytes, UIntPtr len)
+    private int SecretSaveImpl(IntPtr userData, ulong secretId, ulong channelId, uint kind, IntPtr bytes, UIntPtr len)
     {
         try
         {
@@ -559,27 +588,27 @@ public sealed class DeRecProtocol : IDisposable
             Marshal.Copy(bytes, buf, 0, buf.Length);
             var rec = JsonSerializer.Deserialize<SecretValueDto>(buf, JsonOpts)
                 ?? throw new InvalidOperationException("null SecretValue");
-            _secretStore.Save(channelId, new SecretValue((SecretKind)rec.kind, rec.bytes));
+            _secretStore.Save(secretId, channelId, new SecretValue((SecretKind)rec.kind, rec.bytes));
             return 0;
         }
         catch { return -1; }
     }
 
-    private int SecretRemoveImpl(IntPtr userData, ulong channelId, uint kind)
+    private int SecretRemoveImpl(IntPtr userData, ulong secretId, ulong channelId, uint kind)
     {
-        try { _secretStore.Remove(channelId, (SecretKind)kind); return 0; }
+        try { _secretStore.Remove(secretId, channelId, (SecretKind)kind); return 0; }
         catch { return -1; }
     }
 
     private int ShareLoadImpl(
-        IntPtr userData, ulong channelId, ulong secretId,
+        IntPtr userData, ulong secretId, ulong channelId,
         IntPtr versionsJsonPtr, UIntPtr versionsJsonLen,
         out IntPtr outPtr, out UIntPtr outLen)
     {
         try
         {
             uint[] versions = DeserializeJsonArray<uint>(versionsJsonPtr, versionsJsonLen) ?? Array.Empty<uint>();
-            var records = _shareStore.Load(channelId, secretId, versions)
+            var records = _shareStore.Load(secretId, channelId, versions)
                 .Select(s => new ShareRecordDto(s.SecretId.ToString(), s.Version, s.Bytes))
                 .ToList();
             byte[] json = JsonSerializer.SerializeToUtf8Bytes(records, JsonOpts);
@@ -594,9 +623,8 @@ public sealed class DeRecProtocol : IDisposable
     }
 
     private int ShareLoadManyImpl(
-        IntPtr userData,
+        IntPtr userData, ulong secretId,
         IntPtr channelIdsJsonPtr, UIntPtr channelIdsJsonLen,
-        ulong secretId,
         IntPtr versionsJsonPtr, UIntPtr versionsJsonLen,
         out IntPtr outPtr, out UIntPtr outLen)
     {
@@ -604,7 +632,7 @@ public sealed class DeRecProtocol : IDisposable
         {
             ulong[] channelIds = DeserializeJsonArray<ulong>(channelIdsJsonPtr, channelIdsJsonLen) ?? Array.Empty<ulong>();
             uint[] versions = DeserializeJsonArray<uint>(versionsJsonPtr, versionsJsonLen) ?? Array.Empty<uint>();
-            var records = _shareStore.LoadMany(channelIds, secretId, versions)
+            var records = _shareStore.LoadMany(secretId, channelIds, versions)
                 .Select(s => new ShareRecordDto(s.SecretId.ToString(), s.Version, s.Bytes))
                 .ToList();
             byte[] json = JsonSerializer.SerializeToUtf8Bytes(records, JsonOpts);
@@ -619,14 +647,14 @@ public sealed class DeRecProtocol : IDisposable
     }
 
     private int ShareLoadAllImpl(
-        IntPtr userData,
+        IntPtr userData, ulong secretId,
         IntPtr channelIdsJsonPtr, UIntPtr channelIdsJsonLen,
         out IntPtr outPtr, out UIntPtr outLen)
     {
         try
         {
             ulong[] channelIds = DeserializeJsonArray<ulong>(channelIdsJsonPtr, channelIdsJsonLen) ?? Array.Empty<ulong>();
-            var records = _shareStore.LoadAll(channelIds)
+            var records = _shareStore.LoadAll(secretId, channelIds)
                 .Select(s => new ShareRecordDto(s.SecretId.ToString(), s.Version, s.Bytes))
                 .ToList();
             byte[] json = JsonSerializer.SerializeToUtf8Bytes(records, JsonOpts);
@@ -640,11 +668,11 @@ public sealed class DeRecProtocol : IDisposable
         }
     }
 
-    private int ShareLatestVersionImpl(IntPtr userData, out uint outHasVersion, out uint outVersion)
+    private int ShareLatestVersionImpl(IntPtr userData, ulong secretId, out uint outHasVersion, out uint outVersion)
     {
         try
         {
-            var v = _shareStore.LatestVersion();
+            var v = _shareStore.LatestVersion(secretId);
             if (v.HasValue) { outHasVersion = 1; outVersion = v.Value; }
             else { outHasVersion = 0; outVersion = 0; }
             return 0;
@@ -656,7 +684,7 @@ public sealed class DeRecProtocol : IDisposable
         }
     }
 
-    private int ShareSaveImpl(IntPtr userData, ulong channelId, IntPtr shareJsonPtr, UIntPtr shareJsonLen)
+    private int ShareSaveImpl(IntPtr userData, ulong secretId, ulong channelId, IntPtr shareJsonPtr, UIntPtr shareJsonLen)
     {
         try
         {
@@ -664,17 +692,67 @@ public sealed class DeRecProtocol : IDisposable
             Marshal.Copy(shareJsonPtr, buf, 0, buf.Length);
             var rec = JsonSerializer.Deserialize<ShareRecordDto>(buf, JsonOpts)
                 ?? throw new InvalidOperationException("null ShareRecord");
-            _shareStore.Save(channelId, new Share(ulong.Parse(rec.secret_id), rec.version, rec.bytes));
+            _shareStore.Save(secretId, channelId, new Share(ulong.Parse(rec.secret_id), rec.version, rec.bytes));
             return 0;
         }
         catch { return -1; }
     }
 
-    private int ShareRemoveChannelImpl(IntPtr userData, ulong channelId)
+    private int ShareRemoveChannelImpl(IntPtr userData, ulong secretId, ulong channelId)
     {
-        try { _shareStore.RemoveChannel(channelId); return 0; }
+        try { _shareStore.RemoveChannel(secretId, channelId); return 0; }
         catch { return -1; }
     }
+
+    private int UserSecretLoadLatestImpl(
+        IntPtr userData, ulong secretId,
+        out IntPtr outPtr, out UIntPtr outLen)
+    {
+        try
+        {
+            var value = _userSecretStore.LoadLatest(secretId);
+            if (value is null) { outPtr = IntPtr.Zero; outLen = UIntPtr.Zero; return 0; }
+            var dto = new UserSecretsDto(
+                value.Version,
+                value.Secrets.Select(s => new UserSecretDto(s.Id, s.Name, s.Data)).ToArray(),
+                value.Description);
+            byte[] json = JsonSerializer.SerializeToUtf8Bytes(dto, JsonOpts);
+            return WriteOut(json, out outPtr, out outLen);
+        }
+        catch
+        {
+            outPtr = IntPtr.Zero;
+            outLen = UIntPtr.Zero;
+            return -1;
+        }
+    }
+
+    private int UserSecretSaveLatestImpl(
+        IntPtr userData, ulong secretId, IntPtr valueJsonPtr, UIntPtr valueJsonLen)
+    {
+        try
+        {
+            byte[] buf = new byte[(int)valueJsonLen];
+            Marshal.Copy(valueJsonPtr, buf, 0, buf.Length);
+            var dto = JsonSerializer.Deserialize<UserSecretsDto>(buf, JsonOpts)
+                ?? throw new InvalidOperationException("null UserSecrets");
+            var entries = (dto.secrets ?? Array.Empty<UserSecretDto>())
+                .Select(s => new UserSecretEntry(s.id ?? Array.Empty<byte>(), s.name ?? string.Empty, s.data ?? Array.Empty<byte>()))
+                .ToArray();
+            _userSecretStore.SaveLatest(secretId, new UserSecrets(dto.version, entries, dto.description));
+            return 0;
+        }
+        catch { return -1; }
+    }
+
+    private int UserSecretRemoveImpl(IntPtr userData, ulong secretId)
+    {
+        try { _userSecretStore.Remove(secretId); return 0; }
+        catch { return -1; }
+    }
+
+    private sealed record UserSecretsDto(uint version, UserSecretDto[] secrets, string? description);
+    private sealed record UserSecretDto(byte[] id, string name, byte[] data);
 
     private static T[]? DeserializeJsonArray<T>(IntPtr ptr, UIntPtr len)
     {

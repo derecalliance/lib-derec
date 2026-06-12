@@ -73,8 +73,6 @@ fn parse_discovery_flow(params_json: &[u8]) -> Result<DeRecFlow, String> {
 fn parse_protect_secret_flow(params_json: &[u8]) -> Result<DeRecFlow, String> {
     let raw: ProtectSecretParamsJson = serde_json::from_slice(params_json)
         .map_err(|e| format!("invalid ProtectSecretParams JSON: {e}"))?;
-    let secret_id = parse_u64_string(&raw.secret_id)?;
-    let target = parse_target(raw.target)?;
     let secrets: Vec<UserSecret> = raw
         .secrets
         .into_iter()
@@ -85,8 +83,6 @@ fn parse_protect_secret_flow(params_json: &[u8]) -> Result<DeRecFlow, String> {
         })
         .collect();
     Ok(DeRecFlow::ProtectSecret {
-        secret_id,
-        target,
         secrets,
         description: raw.description,
     })
@@ -197,9 +193,6 @@ struct DiscoveryParamsJson {
 
 #[derive(Deserialize)]
 struct ProtectSecretParamsJson {
-    secret_id: String,
-    #[serde(default)]
-    target: Option<Value>,
     secrets: Vec<UserSecretJson>,
     #[serde(default)]
     description: Option<String>,

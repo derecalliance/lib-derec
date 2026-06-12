@@ -2,7 +2,9 @@
 
 use super::error::{ChannelStoreError, SecretStoreError, ShareStoreError};
 use crate::Result;
-use crate::protocol::types::{Channel, MissingPolicy, SecretKind, SecretValue, Share};
+use crate::protocol::types::{
+    Channel, MissingPolicy, SecretKind, SecretValue, Share, UserSecrets,
+};
 use crate::types::ChannelId;
 use derec_proto::TransportProtocol;
 use std::{future::Future, pin::Pin};
@@ -86,49 +88,54 @@ pub type TransportFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 
 /// The protocol holds each store by `&mut Self`, so implementations never
 /// see overlapping calls and need no internal synchronization.
 pub trait DeRecSecretStore {
-    /// Load a secret for the given channel.
+    /// Load a secret for the given `(secret_id, channel_id)` pair.
     ///
-    /// Returns `Ok(None)` when no secret of the requested [`SecretKind`] exists
-    /// for `channel_id`. The returned [`SecretValue`] variant will always match
-    /// the requested `kind`.
+    /// `secret_id` partitions storage so a single backend can serve many
+    /// vaults on the same device (Owner of N vaults, or Helper for N
+    /// Owners). Returns `Ok(None)` when no entry of the requested
+    /// [`SecretKind`] exists for this partition key.
     fn load(
         &self,
+        secret_id: u64,
         channel_id: ChannelId,
         kind: SecretKind,
     ) -> SecretStoreFuture<'_, Option<SecretValue>>;
 
-    /// Load secrets of the same [`SecretKind`] for several channels in one call.
+    /// Load secrets of the same [`SecretKind`] for several channels in
+    /// one call, scoped to `secret_id`.
     ///
-    /// Used by the [`crate::protocol`] orchestrator when broadcasting a request
-    /// (discovery, recovery, verification, sharing, unpairing) to keep the
-    /// per-broadcast roundtrip count constant instead of linear in the number
-    /// of paired channels.
-    ///
-    /// Returns one `(ChannelId, SecretValue)` per channel that has a stored
-    /// secret of the requested kind. `missing_policy` controls how channels
-    /// with no stored entry are handled (see [`MissingPolicy`]). Order of the
-    /// returned tuples is unspecified.
+    /// Used by the [`crate::protocol`] orchestrator when broadcasting a
+    /// request (discovery, recovery, verification, sharing, unpairing) to
+    /// keep the per-broadcast roundtrip count constant instead of linear
+    /// in the number of paired channels.
     fn load_many(
         &self,
+        secret_id: u64,
         channel_ids: &[ChannelId],
         kind: SecretKind,
         missing_policy: MissingPolicy,
     ) -> SecretStoreFuture<'_, Vec<(ChannelId, SecretValue)>>;
 
-    /// Persist a secret for the given channel.
+    /// Persist a secret for the given `(secret_id, channel_id)` pair.
     ///
-    /// The [`SecretKind`] is derived from the [`SecretValue`] variant, so
-    /// callers do not need to pass it explicitly. An existing entry of the
-    /// same kind is silently overwritten. Implementations should never
-    /// auto-evict — the protocol calls [`Self::remove`] explicitly when a
-    /// secret is no longer needed (this includes ephemeral kinds like
-    /// [`SecretValue::PairingContact`]).
-    fn save(&mut self, channel_id: ChannelId, value: SecretValue) -> SecretStoreFuture<'_, ()>;
+    /// The [`SecretKind`] is derived from the [`SecretValue`] variant.
+    /// An existing entry of the same kind under the same partition is
+    /// silently overwritten.
+    fn save(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        value: SecretValue,
+    ) -> SecretStoreFuture<'_, ()>;
 
-    /// Remove a secret for the given channel.
-    ///
+    /// Remove a secret for the given `(secret_id, channel_id)` pair.
     /// Idempotent: removing a non-existent entry is `Ok(())`.
-    fn remove(&mut self, channel_id: ChannelId, kind: SecretKind) -> SecretStoreFuture<'_, ()>;
+    fn remove(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        kind: SecretKind,
+    ) -> SecretStoreFuture<'_, ()>;
 }
 
 /// Storage backend for paired channels.
@@ -161,46 +168,53 @@ pub trait DeRecSecretStore {
 ///
 /// Same as [`DeRecSecretStore`]; methods return [`ChannelStoreFuture`].
 pub trait DeRecChannelStore {
-    /// Load the [`Channel`] for the given channel ID.
+    /// Load the [`Channel`] for `(secret_id, channel_id)`.
     ///
-    /// Returns `Ok(None)` when no channel has been stored for `channel_id`.
-    fn load(&self, channel_id: ChannelId) -> ChannelStoreFuture<'_, Option<Channel>>;
+    /// `secret_id` partitions storage so one backend can serve many
+    /// vaults on the same device. Returns `Ok(None)` when no channel
+    /// exists for this partition key.
+    fn load(
+        &self,
+        secret_id: u64,
+        channel_id: ChannelId,
+    ) -> ChannelStoreFuture<'_, Option<Channel>>;
 
-    /// Persist a [`Channel`].
-    ///
-    /// The channel ID is taken from [`Channel::id`]. Replaces any previously
-    /// stored channel for the same ID.
-    fn save(&mut self, channel: Channel) -> ChannelStoreFuture<'_, ()>;
+    /// Persist a [`Channel`] under `secret_id`. The channel ID is taken
+    /// from [`Channel::id`]. Replaces any previously stored channel for
+    /// the same `(secret_id, channel_id)`.
+    fn save(&mut self, secret_id: u64, channel: Channel) -> ChannelStoreFuture<'_, ()>;
 
-    /// Remove the channel for the given ID.
-    ///
-    /// Returns `true` if a channel was removed, `false` if no channel existed.
-    fn remove(&mut self, channel_id: ChannelId) -> ChannelStoreFuture<'_, bool>;
+    /// Remove the channel for `(secret_id, channel_id)`. Returns `true`
+    /// when an entry was removed, `false` when none existed.
+    fn remove(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+    ) -> ChannelStoreFuture<'_, bool>;
 
-    /// Return all stored channels.
-    ///
-    /// Used by the protocol to enumerate all paired peers when building the
-    /// secret bag (to populate `HelperInfo` entries) and when fanning out
-    /// recovery requests.
-    fn channels(&self) -> ChannelStoreFuture<'_, Vec<Channel>>;
+    /// Return every channel stored under `secret_id`. Used by the
+    /// protocol to enumerate paired peers when building the secret bag
+    /// and when fanning out broadcast flows.
+    fn channels(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<Channel>>;
 
-    /// Link two channels as belonging to the same Owner identity.
-    ///
-    /// The relation is **undirected, idempotent, and transitive** (an
-    /// equivalence relation): the order of `a`/`b` is irrelevant, re-linking an
-    /// existing pair (or linking a channel to itself) is a no-op, and if
-    /// `A↔B` and `B↔C` then all three are in one group. Linking moves no share
-    /// data — it only records the relationship.
-    fn link_channel(&mut self, a: ChannelId, b: ChannelId) -> ChannelStoreFuture<'_, ()>;
+    /// Link two channels under `secret_id` as belonging to the same
+    /// Owner identity. The relation is **undirected, idempotent, and
+    /// transitive** within the partition.
+    fn link_channel(
+        &mut self,
+        secret_id: u64,
+        a: ChannelId,
+        b: ChannelId,
+    ) -> ChannelStoreFuture<'_, ()>;
 
-    /// Return the full set of channels linked to `channel_id`, **including
-    /// `channel_id` itself** (its transitive-closure / connected component).
-    ///
-    /// An unlinked channel returns `[channel_id]`. Order is unspecified. The
-    /// returned IDs are typically fed to [`DeRecShareStore::load_many`] (for a
-    /// specific `secret_id`) or [`DeRecShareStore::load_all`] (discovery) to
-    /// aggregate shares across re-pairings without duplicating data.
-    fn linked_channels(&self, channel_id: ChannelId) -> ChannelStoreFuture<'_, Vec<ChannelId>>;
+    /// Return the full set of channels linked to `channel_id` under
+    /// `secret_id`, **including `channel_id` itself**. An unlinked
+    /// channel returns `[channel_id]`.
+    fn linked_channels(
+        &self,
+        secret_id: u64,
+        channel_id: ChannelId,
+    ) -> ChannelStoreFuture<'_, Vec<ChannelId>>;
 }
 
 /// Storage backend for secret shares.
@@ -240,60 +254,100 @@ pub trait DeRecChannelStore {
 ///
 /// Same as [`DeRecSecretStore`]; methods return [`ShareStoreFuture`].
 pub trait DeRecShareStore {
-    /// Load shares stored for a single channel, scoped to one secret.
+    /// Load shares stored for `(secret_id, channel_id)`.
     ///
     /// - **Specific versions**: pass the versions you need in `versions`.
     ///   Missing versions are silently skipped.
-    /// - **All versions of `secret_id`**: pass an empty slice.
+    /// - **All versions**: pass an empty slice.
     fn load(
         &self,
-        channel_id: ChannelId,
         secret_id: u64,
+        channel_id: ChannelId,
         versions: &[u32],
     ) -> ShareStoreFuture<'_, Vec<Share>>;
 
-    /// Load shares for several channels in one call, scoped to one secret.
-    ///
-    /// Recovery uses this with the set returned by
-    /// [`DeRecChannelStore::linked_channels`], so it is a single round-trip
-    /// regardless of how many channels are linked.
-    ///
-    /// Returns a **flat** list — deduplication (e.g. by `version`) is the
-    /// caller's concern. The `versions` filter has the same semantics as
-    /// [`load`](Self::load) and applies uniformly across all `channel_ids`.
+    /// Load shares for several channels in one call, scoped to
+    /// `secret_id`. Recovery uses this with the set returned by
+    /// [`DeRecChannelStore::linked_channels`], so it is a single
+    /// round-trip regardless of how many channels are linked.
     fn load_many(
         &self,
-        channel_ids: &[ChannelId],
         secret_id: u64,
+        channel_ids: &[ChannelId],
         versions: &[u32],
     ) -> ShareStoreFuture<'_, Vec<Share>>;
 
-    /// Load **every** share stored for the given channels, across all secrets
-    /// and all versions.
-    ///
-    /// This is the only legitimate "no `secret_id`" load — and exists solely
-    /// for **discovery**, which by definition enumerates the helper's holdings
-    /// before any secret is known. Domain callers (recovery, verification)
-    /// must use [`load`](Self::load) or [`load_many`](Self::load_many).
-    fn load_all(&self, channel_ids: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>>;
+    /// Load every share stored under `secret_id` across the given
+    /// channels and every version. Used by Discovery to enumerate the
+    /// helper's holdings for the active vault.
+    fn load_all(
+        &self,
+        secret_id: u64,
+        channel_ids: &[ChannelId],
+    ) -> ShareStoreFuture<'_, Vec<Share>>;
 
-    /// Return the highest version number stored across all channels,
-    /// or `None` if no shares exist yet.
-    fn latest_version(&self) -> ShareStoreFuture<'_, Option<u32>>;
+    /// Return the highest version number stored for `secret_id` across
+    /// all channels, or `None` if no shares exist yet for this vault.
+    fn latest_version(&self, secret_id: u64) -> ShareStoreFuture<'_, Option<u32>>;
 
-    /// Persist a share for the given channel.
-    ///
-    /// Replaces any previously stored entry for the same
-    /// `(channel_id, secret_id, version)` key.
-    fn save(&mut self, channel_id: ChannelId, share: Share) -> ShareStoreFuture<'_, ()>;
+    /// Persist a share for `(secret_id, channel_id)`. Replaces any
+    /// previously stored entry for the same
+    /// `(secret_id, channel_id, share.version)` key. `share.secret_id`
+    /// is denormalized metadata and must match the partition key
+    /// `secret_id` — implementations may assert this.
+    fn save(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        share: Share,
+    ) -> ShareStoreFuture<'_, ()>;
 
-    /// Drop **all** shares stored under `channel_id`.
-    ///
-    /// Used by the [`crate::protocol`] orchestrator when an unpair flow tears
-    /// down a channel — every secret-id / version combination held for that
-    /// channel is removed. Implementations should treat a non-existent channel
-    /// as a no-op (idempotent).
-    fn remove_channel(&mut self, channel_id: ChannelId) -> ShareStoreFuture<'_, ()>;
+    /// Drop every share stored under `(secret_id, channel_id)`. Used
+    /// when an unpair flow tears down a channel. Idempotent.
+    fn remove_channel(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+    ) -> ShareStoreFuture<'_, ()>;
+}
+
+/// Storage for the user-facing vault contents, keyed by `secret_id`.
+///
+/// One `secret_id` maps to at most one [`UserSecrets`] entry — the most
+/// recent snapshot the application handed off via
+/// `start(FlowKind::ProtectSecret)`. The pair-completion auto-publish
+/// hook reads from here so a freshly-paired Helper or Replica receives
+/// the current vault without an explicit re-publish from the app.
+///
+/// # Executor independence
+///
+/// Methods return [`ShareStoreFuture`] — same `Send` rules as the other
+/// store traits. The error type is reused from [`ShareStoreError`]
+/// because the persistence concerns overlap (latest-version bookkeeping,
+/// IO failures); no separate error category was warranted.
+///
+/// # Concurrency
+///
+/// The protocol holds the store by `&mut Self`, so implementations never
+/// see overlapping calls and need no internal synchronization.
+pub trait DeRecUserSecretStore {
+    /// Return the latest [`UserSecrets`] entry for `secret_id`, or
+    /// `Ok(None)` if the application has never published for this
+    /// `secret_id` on this instance.
+    fn load_latest(&self, secret_id: u64) -> ShareStoreFuture<'_, Option<UserSecrets>>;
+
+    /// Persist `value` as the latest entry for `secret_id`, overwriting
+    /// any prior entry. The store keeps only the latest snapshot — older
+    /// versions are recoverable via the helper share quorum if needed.
+    fn save_latest(
+        &mut self,
+        secret_id: u64,
+        value: UserSecrets,
+    ) -> ShareStoreFuture<'_, ()>;
+
+    /// Drop the entry for `secret_id`. Idempotent: removing a
+    /// non-existent entry is `Ok(())`.
+    fn remove(&mut self, secret_id: u64) -> ShareStoreFuture<'_, ()>;
 }
 
 /// Outbound transport abstraction.

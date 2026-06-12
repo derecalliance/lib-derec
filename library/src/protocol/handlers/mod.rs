@@ -33,12 +33,13 @@ use std::collections::HashMap;
 /// protocol to operate on a channel it doesn't have).
 pub(super) async fn require_role<Ch: DeRecChannelStore>(
     channel_store: &Ch,
+    secret_id: u64,
     channel_ids: &[ChannelId],
     expected: SenderKind,
 ) -> Result<()> {
     for channel_id in channel_ids {
         let channel = channel_store
-            .load(*channel_id)
+            .load(secret_id, *channel_id)
             .await?
             .ok_or(Error::InvalidInput(
                 "channel id not present in channel store",
@@ -56,9 +57,10 @@ pub(super) async fn require_role<Ch: DeRecChannelStore>(
 
 pub(super) async fn resolve_target<Ch: DeRecChannelStore>(
     channel_store: &mut Ch,
+    secret_id: u64,
     target: Target,
 ) -> Result<Vec<ChannelId>> {
-    let all_channels = channel_store.channels().await?;
+    let all_channels = channel_store.channels(secret_id).await?;
     let all_channel_ids: Vec<ChannelId> = all_channels.iter().map(|c| c.id).collect();
 
     Ok(match target {
@@ -79,30 +81,26 @@ pub(super) async fn resolve_target<Ch: DeRecChannelStore>(
 
 pub(super) async fn peer_endpoint<Ch: DeRecChannelStore>(
     channel_store: &mut Ch,
+    secret_id: u64,
     channel_id: ChannelId,
 ) -> Result<TransportProtocol> {
-    let channel = channel_store.load(channel_id).await?;
+    let channel = channel_store.load(secret_id, channel_id).await?;
     channel
         .map(|ch| ch.transport)
         .ok_or(Error::InvalidInput("no transport endpoint for channel"))
 }
 
 /// Pick the endpoint to deliver a response to.
-///
-/// If the inbound request carried a `reply_to`, the responder routes there
-/// (ephemeral, this exchange only); otherwise it falls back to the channel's
-/// stored peer endpoint. See `replyTo` on each request proto for the
-/// semantics and the auto-fill switch on the orchestrator
-/// ([`crate::protocol::DeRecProtocolBuilder::with_auto_reply_to`]).
 pub(super) async fn resolve_response_endpoint<Ch: DeRecChannelStore>(
     channel_store: &mut Ch,
+    secret_id: u64,
     channel_id: ChannelId,
     reply_to: Option<&TransportProtocol>,
 ) -> Result<TransportProtocol> {
     if let Some(endpoint) = reply_to {
         return Ok(endpoint.clone());
     }
-    peer_endpoint(channel_store, channel_id).await
+    peer_endpoint(channel_store, secret_id, channel_id).await
 }
 
 /// Draw a fresh correlation token for an outbound request envelope.
@@ -136,6 +134,7 @@ pub(super) fn apply_trace_id(envelope_bytes: Vec<u8>, trace_id: u64) -> Result<V
 pub(super) async fn send_channel_message<Ch: DeRecChannelStore, T: DeRecTransport>(
     channel_store: &mut Ch,
     transport: &T,
+    secret_id: u64,
     channel_id: ChannelId,
     body: MessageBody,
     shared_key: &SharedKey,
@@ -151,7 +150,8 @@ pub(super) async fn send_channel_message<Ch: DeRecChannelStore, T: DeRecTranspor
         .build()?;
 
     let wire_bytes = envelope.encode_to_vec();
-    let endpoint = resolve_response_endpoint(channel_store, channel_id, reply_to).await?;
+    let endpoint =
+        resolve_response_endpoint(channel_store, secret_id, channel_id, reply_to).await?;
     transport.send(&endpoint, wire_bytes).await?;
     Ok(())
 }
@@ -174,26 +174,22 @@ pub(super) async fn handle<
     pending_recovery: &mut PendingRecovery,
     pending_unpair: &mut HashMap<ChannelId, u64>,
     message: &DeRecMessage,
+    secret_id: u64,
     channel_id: ChannelId,
     shared_key: &SharedKey,
 ) -> Result<Vec<DeRecEvent>> {
     let inner = crate::derec_message::extract_inner_message(&message.message, shared_key)?;
 
     if let Some(expected) = expected_role_for_inbound(&inner) {
-        require_role(channel_store, &[channel_id], expected).await?;
+        require_role(channel_store, secret_id, &[channel_id], expected).await?;
     }
 
     let inbound_trace_id = message.trace_id;
 
     match &inner {
         MessageBody::StoreShareRequest(_) | MessageBody::StoreShareResponse(_) => {
-            // Role-based dispatch. On a Helper-role channel the peer is
-            // the Owner pushing a share fragment (classic share path).
-            // On a Replica-role channel the peer is another replica
-            // pushing a full vault payload (vault-sync path); we auto-ack
-            // and surface a typed event with the opaque payload.
             let channel = channel_store
-                .load(channel_id)
+                .load(secret_id, channel_id)
                 .await?
                 .ok_or(Error::InvalidInput(
                     "channel id not present in channel store",
@@ -224,8 +220,15 @@ pub(super) async fn handle<
             }
         }
         MessageBody::VerifyShareRequest(_) | MessageBody::VerifyShareResponse(_) => {
-            verification::handle(share_store, channel_id, inner, *shared_key, inbound_trace_id)
-                .await
+            verification::handle(
+                share_store,
+                secret_id,
+                channel_id,
+                inner,
+                *shared_key,
+                inbound_trace_id,
+            )
+            .await
         }
         MessageBody::GetSecretIdsVersionsRequest(_)
         | MessageBody::GetSecretIdsVersionsResponse(_) => {
@@ -240,6 +243,7 @@ pub(super) async fn handle<
                 share_store,
                 secret_store,
                 pending_unpair,
+                secret_id,
                 channel_id,
                 inner,
                 *shared_key,
@@ -264,6 +268,7 @@ pub(in crate::protocol) async fn handle_pairing<Ch: DeRecChannelStore, Ss: DeRec
     channel_store: &mut Ch,
     secret_store: &mut Ss,
     message: &DeRecMessage,
+    secret_id: u64,
     channel_id: ChannelId,
     pairing_secret: &PairingSecretKeyMaterial,
     replica_id: Option<u64>,
@@ -275,6 +280,7 @@ pub(in crate::protocol) async fn handle_pairing<Ch: DeRecChannelStore, Ss: DeRec
         channel_store,
         secret_store,
         &inner,
+        secret_id,
         channel_id,
         pairing_secret,
         message.trace_id,

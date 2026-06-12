@@ -21,10 +21,11 @@ use prost::Message as _;
 
 use crate::protocol::{
     ChannelStoreError, ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore,
-    DeRecShareStore, DeRecTransport, MissingPolicy, SecretKind, SecretStoreError,
-    SecretStoreFuture, SecretValue, Share, ShareStoreError, ShareStoreFuture,
-    TransportFuture,
+    DeRecShareStore, DeRecTransport, DeRecUserSecretStore, MissingPolicy, SecretKind,
+    SecretStoreError, SecretStoreFuture, SecretValue, Share, ShareStoreError,
+    ShareStoreFuture, TransportFuture,
 };
+use crate::protocol::types::{UserSecret, UserSecrets};
 
 /// Lightweight error wrapper so we can put owned strings into the
 /// trait-object `Backend` variants — matches the WASM bridge's pattern.
@@ -207,55 +208,45 @@ fn secret_kind_to_u32(kind: SecretKind) -> u32 {
 #[repr(C)]
 pub struct ChannelStoreCallbacks {
     pub user_data: *mut c_void,
-    /// Load the channel for `channel_id`. On success writes the
-    /// JSON-encoded [`Channel`] bytes to `*out_ptr` / `*out_len`
-    /// and returns 0. Return 1 with `*out_ptr = null` / `*out_len = 0`
-    /// for "not found". Any other return code is a backend error.
     pub load: extern "C" fn(
         user_data: *mut c_void,
+        secret_id: u64,
         channel_id: u64,
         out_ptr: *mut *mut u8,
         out_len: *mut usize,
     ) -> i32,
-    /// Persist `bytes` (a JSON-encoded [`Channel`]) under
-    /// `channel_id`. Returns 0 on success.
     pub save: extern "C" fn(
         user_data: *mut c_void,
+        secret_id: u64,
         channel_id: u64,
         bytes: *const u8,
         len: usize,
     ) -> i32,
-    /// Remove the channel for `channel_id`. Writes 1 to `*out_existed`
-    /// if a channel was deleted, 0 if it didn't exist. Returns 0 on
-    /// success.
     pub remove: extern "C" fn(
         user_data: *mut c_void,
+        secret_id: u64,
         channel_id: u64,
         out_existed: *mut u32,
     ) -> i32,
-    /// List every channel id currently in the store. Writes a JSON
-    /// `[u64, u64, ...]` array (lowercase decimal) to
-    /// `*out_ptr` / `*out_len`. Returns 0 on success.
     pub list_channels: extern "C" fn(
         user_data: *mut c_void,
+        secret_id: u64,
         out_ptr: *mut *mut u8,
         out_len: *mut usize,
     ) -> i32,
-    /// Record an undirected link between two channels. Returns 0 on
-    /// success.
-    pub link_channel: extern "C" fn(user_data: *mut c_void, a: u64, b: u64) -> i32,
-    /// Return the transitive closure (JSON `[u64, ...]`) of channel
-    /// ids linked to `channel_id`, **including `channel_id` itself**.
-    /// Returns 0 on success.
+    pub link_channel: extern "C" fn(
+        user_data: *mut c_void,
+        secret_id: u64,
+        a: u64,
+        b: u64,
+    ) -> i32,
     pub linked_channels: extern "C" fn(
         user_data: *mut c_void,
+        secret_id: u64,
         channel_id: u64,
         out_ptr: *mut *mut u8,
         out_len: *mut usize,
     ) -> i32,
-    /// Release a buffer the caller previously allocated for one of the
-    /// `out_ptr` parameters above. The shim invokes this immediately
-    /// after copying the bytes out.
     pub free_buffer: extern "C" fn(user_data: *mut c_void, ptr: *mut u8, len: usize),
 }
 
@@ -263,26 +254,28 @@ pub struct ChannelStoreCallbacks {
 #[repr(C)]
 pub struct SecretStoreCallbacks {
     pub user_data: *mut c_void,
-    /// Load a secret of `kind` for `channel_id`. On success writes the
-    /// JSON-encoded [`SecretValueRecord`] to `*out_ptr` / `*out_len`
-    /// and returns 0. Return 1 (with null out) for "not found".
     pub load: extern "C" fn(
         user_data: *mut c_void,
+        secret_id: u64,
         channel_id: u64,
         kind: u32,
         out_ptr: *mut *mut u8,
         out_len: *mut usize,
     ) -> i32,
-    /// Persist `bytes` (a JSON-encoded [`SecretValueRecord`]) under
-    /// `(channel_id, kind)`. Returns 0 on success.
     pub save: extern "C" fn(
         user_data: *mut c_void,
+        secret_id: u64,
         channel_id: u64,
         kind: u32,
         bytes: *const u8,
         len: usize,
     ) -> i32,
-    pub remove: extern "C" fn(user_data: *mut c_void, channel_id: u64, kind: u32) -> i32,
+    pub remove: extern "C" fn(
+        user_data: *mut c_void,
+        secret_id: u64,
+        channel_id: u64,
+        kind: u32,
+    ) -> i32,
     pub free_buffer: extern "C" fn(user_data: *mut c_void, ptr: *mut u8, len: usize),
 }
 
@@ -293,55 +286,132 @@ pub struct SecretStoreCallbacks {
 #[repr(C)]
 pub struct ShareStoreCallbacks {
     pub user_data: *mut c_void,
-    /// `load(channel_id, secret_id, versions_json_ptr, versions_json_len,
-    ///       out_ptr, out_len)` — `versions_json` is a JSON `[u32, ...]`
-    /// (empty array = all versions). Out is a JSON `[ShareRecord, ...]`.
     pub load: extern "C" fn(
         user_data: *mut c_void,
-        channel_id: u64,
         secret_id: u64,
+        channel_id: u64,
         versions_json_ptr: *const u8,
         versions_json_len: usize,
         out_ptr: *mut *mut u8,
         out_len: *mut usize,
     ) -> i32,
-    /// `load_many(channel_ids_json, secret_id, versions_json, out)`
     pub load_many: extern "C" fn(
         user_data: *mut c_void,
+        secret_id: u64,
         channel_ids_json_ptr: *const u8,
         channel_ids_json_len: usize,
-        secret_id: u64,
         versions_json_ptr: *const u8,
         versions_json_len: usize,
         out_ptr: *mut *mut u8,
         out_len: *mut usize,
     ) -> i32,
-    /// `load_all(channel_ids_json, out)`
     pub load_all: extern "C" fn(
         user_data: *mut c_void,
+        secret_id: u64,
         channel_ids_json_ptr: *const u8,
         channel_ids_json_len: usize,
         out_ptr: *mut *mut u8,
         out_len: *mut usize,
     ) -> i32,
-    /// `latest_version(out_has_version, out_version)`. Writes
-    /// `*out_has_version = 1` and `*out_version = v` when a version
-    /// exists; `*out_has_version = 0` when the store is empty.
     pub latest_version: extern "C" fn(
         user_data: *mut c_void,
+        secret_id: u64,
         out_has_version: *mut u32,
         out_version: *mut u32,
     ) -> i32,
-    /// `save(channel_id, share_json_ptr, share_json_len)`
     pub save: extern "C" fn(
         user_data: *mut c_void,
+        secret_id: u64,
         channel_id: u64,
         share_json_ptr: *const u8,
         share_json_len: usize,
     ) -> i32,
-    /// `remove_channel(channel_id)`
-    pub remove_channel: extern "C" fn(user_data: *mut c_void, channel_id: u64) -> i32,
+    pub remove_channel: extern "C" fn(
+        user_data: *mut c_void,
+        secret_id: u64,
+        channel_id: u64,
+    ) -> i32,
     pub free_buffer: extern "C" fn(user_data: *mut c_void, ptr: *mut u8, len: usize),
+}
+
+/// Caller-supplied callbacks for the user-secret store. Methods cross
+/// the FFI keyed by `secret_id`; the `UserSecrets` payload travels as a
+/// JSON buffer matching [`UserSecretsRecord`].
+#[repr(C)]
+pub struct UserSecretStoreCallbacks {
+    pub user_data: *mut c_void,
+    /// `load_latest(secret_id, out_ptr, out_len)` — writes the JSON
+    /// payload (or `out_len = 0` if absent). Caller releases the buffer
+    /// via `free_buffer`.
+    pub load_latest: extern "C" fn(
+        user_data: *mut c_void,
+        secret_id: u64,
+        out_ptr: *mut *mut u8,
+        out_len: *mut usize,
+    ) -> i32,
+    /// `save_latest(secret_id, value_json_ptr, value_json_len)`.
+    pub save_latest: extern "C" fn(
+        user_data: *mut c_void,
+        secret_id: u64,
+        value_json_ptr: *const u8,
+        value_json_len: usize,
+    ) -> i32,
+    /// `remove(secret_id)` — idempotent.
+    pub remove: extern "C" fn(user_data: *mut c_void, secret_id: u64) -> i32,
+    pub free_buffer: extern "C" fn(user_data: *mut c_void, ptr: *mut u8, len: usize),
+}
+
+/// JSON-on-the-wire shape of [`UserSecrets`] consumed by
+/// [`DotnetUserSecretStore`].
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct UserSecretsRecord {
+    pub version: u32,
+    pub secrets: Vec<UserSecretRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct UserSecretRecord {
+    pub id: Vec<u8>,
+    pub name: String,
+    pub data: Vec<u8>,
+}
+
+impl From<&UserSecrets> for UserSecretsRecord {
+    fn from(v: &UserSecrets) -> Self {
+        Self {
+            version: v.version,
+            secrets: v
+                .secrets
+                .iter()
+                .map(|s| UserSecretRecord {
+                    id: s.id.clone(),
+                    name: s.name.clone(),
+                    data: s.data.clone(),
+                })
+                .collect(),
+            description: v.description.clone(),
+        }
+    }
+}
+
+impl From<UserSecretsRecord> for UserSecrets {
+    fn from(r: UserSecretsRecord) -> Self {
+        Self {
+            version: r.version,
+            secrets: r
+                .secrets
+                .into_iter()
+                .map(|s| UserSecret {
+                    id: s.id,
+                    name: s.name,
+                    data: s.data,
+                })
+                .collect(),
+            description: r.description,
+        }
+    }
 }
 
 /// Caller-supplied transport callback.
@@ -377,9 +447,13 @@ impl DotnetChannelStore {
 }
 
 impl DeRecChannelStore for DotnetChannelStore {
-    fn load(&self, channel_id: ChannelId) -> ChannelStoreFuture<'_, Option<Channel>> {
+    fn load(
+        &self,
+        secret_id: u64,
+        channel_id: ChannelId,
+    ) -> ChannelStoreFuture<'_, Option<Channel>> {
         let bytes_res = self.fetch_bytes(|p, l| {
-            (self.cb.load)(self.cb.user_data, channel_id.0, p, l)
+            (self.cb.load)(self.cb.user_data, secret_id, channel_id.0, p, l)
         });
         Box::pin(async move {
             match bytes_res {
@@ -399,14 +473,14 @@ impl DeRecChannelStore for DotnetChannelStore {
         })
     }
 
-    fn save(&mut self, channel: Channel) -> ChannelStoreFuture<'_, ()> {
+    fn save(&mut self, secret_id: u64, channel: Channel) -> ChannelStoreFuture<'_, ()> {
         let channel_id = channel.id.0;
         let cb = &self.cb;
         let res = (|| -> Result<(), ChannelStoreError> {
             let bytes = serde_json::to_vec(&channel).map_err(|e| {
                 ChannelStoreError::Backend(format!("Channel JSON: {e}").into())
             })?;
-            let rc = (cb.save)(cb.user_data, channel_id, bytes.as_ptr(), bytes.len());
+            let rc = (cb.save)(cb.user_data, secret_id, channel_id, bytes.as_ptr(), bytes.len());
             if rc != 0 {
                 return Err(ChannelStoreError::Backend(
                     format!("channel store save failed (rc={rc})").into(),
@@ -417,11 +491,20 @@ impl DeRecChannelStore for DotnetChannelStore {
         Box::pin(async move { res })
     }
 
-    fn remove(&mut self, channel_id: ChannelId) -> ChannelStoreFuture<'_, bool> {
+    fn remove(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+    ) -> ChannelStoreFuture<'_, bool> {
         let cb = &self.cb;
         let res = (|| -> Result<bool, ChannelStoreError> {
             let mut existed: u32 = 0;
-            let rc = (cb.remove)(cb.user_data, channel_id.0, &mut existed as *mut _);
+            let rc = (cb.remove)(
+                cb.user_data,
+                secret_id,
+                channel_id.0,
+                &mut existed as *mut _,
+            );
             if rc != 0 {
                 return Err(ChannelStoreError::Backend(
                     format!("channel store remove failed (rc={rc})").into(),
@@ -432,16 +515,10 @@ impl DeRecChannelStore for DotnetChannelStore {
         Box::pin(async move { res })
     }
 
-    fn channels(&self) -> ChannelStoreFuture<'_, Vec<Channel>> {
-        // The FFI surface exposes `list_channels` and a per-id `load`,
-        // so the trait's `channels()` materializes by enumerating the
-        // ids and loading each record.
+    fn channels(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<Channel>> {
         let list_bytes_res = self.fetch_bytes(|p, l| {
-            (self.cb.list_channels)(self.cb.user_data, p, l)
+            (self.cb.list_channels)(self.cb.user_data, secret_id, p, l)
         });
-        // `fetch_bytes` returns Ok(None) only when the C side returned
-        // 1; list_channels has no "not found" semantics — treat it as
-        // an empty list.
         let cb = &self.cb;
         let res = (|| -> Result<Vec<Channel>, ChannelStoreError> {
             let bytes = match list_bytes_res {
@@ -460,7 +537,13 @@ impl DeRecChannelStore for DotnetChannelStore {
             for id in ids {
                 let mut ptr: *mut u8 = std::ptr::null_mut();
                 let mut len: usize = 0;
-                let rc = (cb.load)(cb.user_data, id, &mut ptr as *mut _, &mut len as *mut _);
+                let rc = (cb.load)(
+                    cb.user_data,
+                    secret_id,
+                    id,
+                    &mut ptr as *mut _,
+                    &mut len as *mut _,
+                );
                 if rc != 0 {
                     if !ptr.is_null() && len != 0 {
                         (cb.free_buffer)(cb.user_data, ptr, len);
@@ -482,9 +565,14 @@ impl DeRecChannelStore for DotnetChannelStore {
         Box::pin(async move { res })
     }
 
-    fn link_channel(&mut self, a: ChannelId, b: ChannelId) -> ChannelStoreFuture<'_, ()> {
+    fn link_channel(
+        &mut self,
+        secret_id: u64,
+        a: ChannelId,
+        b: ChannelId,
+    ) -> ChannelStoreFuture<'_, ()> {
         let cb = &self.cb;
-        let rc = (cb.link_channel)(cb.user_data, a.0, b.0);
+        let rc = (cb.link_channel)(cb.user_data, secret_id, a.0, b.0);
         Box::pin(async move {
             if rc != 0 {
                 Err(ChannelStoreError::Backend(
@@ -498,10 +586,11 @@ impl DeRecChannelStore for DotnetChannelStore {
 
     fn linked_channels(
         &self,
+        secret_id: u64,
         channel_id: ChannelId,
     ) -> ChannelStoreFuture<'_, Vec<ChannelId>> {
         let bytes_res = self.fetch_bytes(|p, l| {
-            (self.cb.linked_channels)(self.cb.user_data, channel_id.0, p, l)
+            (self.cb.linked_channels)(self.cb.user_data, secret_id, channel_id.0, p, l)
         });
         Box::pin(async move {
             let bytes = match bytes_res {
@@ -541,12 +630,13 @@ impl DotnetSecretStore {
 impl DeRecSecretStore for DotnetSecretStore {
     fn load(
         &self,
+        secret_id: u64,
         channel_id: ChannelId,
         kind: SecretKind,
     ) -> SecretStoreFuture<'_, Option<SecretValue>> {
         let kind_u32 = secret_kind_to_u32(kind);
         let bytes_res = self.fetch_bytes(|p, l| {
-            (self.cb.load)(self.cb.user_data, channel_id.0, kind_u32, p, l)
+            (self.cb.load)(self.cb.user_data, secret_id, channel_id.0, kind_u32, p, l)
         });
         Box::pin(async move {
             match bytes_res {
@@ -571,6 +661,7 @@ impl DeRecSecretStore for DotnetSecretStore {
 
     fn load_many(
         &self,
+        secret_id: u64,
         channel_ids: &[ChannelId],
         kind: SecretKind,
         missing_policy: MissingPolicy,
@@ -586,6 +677,7 @@ impl DeRecSecretStore for DotnetSecretStore {
                 let mut len: usize = 0;
                 let rc = (cb.load)(
                     cb.user_data,
+                    secret_id,
                     id.0,
                     kind_u32,
                     &mut ptr as *mut _,
@@ -634,6 +726,7 @@ impl DeRecSecretStore for DotnetSecretStore {
 
     fn save(
         &mut self,
+        secret_id: u64,
         channel_id: ChannelId,
         value: SecretValue,
     ) -> SecretStoreFuture<'_, ()> {
@@ -646,6 +739,7 @@ impl DeRecSecretStore for DotnetSecretStore {
             })?;
             let rc = (cb.save)(
                 cb.user_data,
+                secret_id,
                 channel_id.0,
                 record.kind,
                 bytes.as_ptr(),
@@ -663,12 +757,13 @@ impl DeRecSecretStore for DotnetSecretStore {
 
     fn remove(
         &mut self,
+        secret_id: u64,
         channel_id: ChannelId,
         kind: SecretKind,
     ) -> SecretStoreFuture<'_, ()> {
         let kind_u32 = secret_kind_to_u32(kind);
         let cb = &self.cb;
-        let rc = (cb.remove)(cb.user_data, channel_id.0, kind_u32);
+        let rc = (cb.remove)(cb.user_data, secret_id, channel_id.0, kind_u32);
         Box::pin(async move {
             if rc != 0 {
                 Err(SecretStoreError::Backend(
@@ -720,16 +815,16 @@ impl DotnetShareStore {
 impl DeRecShareStore for DotnetShareStore {
     fn load(
         &self,
-        channel_id: ChannelId,
         secret_id: u64,
+        channel_id: ChannelId,
         versions: &[u32],
     ) -> ShareStoreFuture<'_, Vec<Share>> {
         let versions_json = serde_json::to_vec(versions).unwrap_or_else(|_| b"[]".to_vec());
         let result = self.fetch_bytes(|p, l| {
             (self.cb.load)(
                 self.cb.user_data,
-                channel_id.0,
                 secret_id,
+                channel_id.0,
                 versions_json.as_ptr(),
                 versions_json.len(),
                 p,
@@ -742,8 +837,8 @@ impl DeRecShareStore for DotnetShareStore {
 
     fn load_many(
         &self,
-        channel_ids: &[ChannelId],
         secret_id: u64,
+        channel_ids: &[ChannelId],
         versions: &[u32],
     ) -> ShareStoreFuture<'_, Vec<Share>> {
         let channel_ids_json: Vec<u64> = channel_ids.iter().map(|c| c.0).collect();
@@ -752,9 +847,9 @@ impl DeRecShareStore for DotnetShareStore {
         let result = self.fetch_bytes(|p, l| {
             (self.cb.load_many)(
                 self.cb.user_data,
+                secret_id,
                 channel_ids_bytes.as_ptr(),
                 channel_ids_bytes.len(),
-                secret_id,
                 versions_json.as_ptr(),
                 versions_json.len(),
                 p,
@@ -765,12 +860,17 @@ impl DeRecShareStore for DotnetShareStore {
         Box::pin(async move { res })
     }
 
-    fn load_all(&self, channel_ids: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
+    fn load_all(
+        &self,
+        secret_id: u64,
+        channel_ids: &[ChannelId],
+    ) -> ShareStoreFuture<'_, Vec<Share>> {
         let channel_ids_json: Vec<u64> = channel_ids.iter().map(|c| c.0).collect();
         let channel_ids_bytes = serde_json::to_vec(&channel_ids_json).unwrap_or_default();
         let result = self.fetch_bytes(|p, l| {
             (self.cb.load_all)(
                 self.cb.user_data,
+                secret_id,
                 channel_ids_bytes.as_ptr(),
                 channel_ids_bytes.len(),
                 p,
@@ -781,12 +881,13 @@ impl DeRecShareStore for DotnetShareStore {
         Box::pin(async move { res })
     }
 
-    fn latest_version(&self) -> ShareStoreFuture<'_, Option<u32>> {
+    fn latest_version(&self, secret_id: u64) -> ShareStoreFuture<'_, Option<u32>> {
         let cb = &self.cb;
         let mut has: u32 = 0;
         let mut version: u32 = 0;
         let rc = (cb.latest_version)(
             cb.user_data,
+            secret_id,
             &mut has as *mut _,
             &mut version as *mut _,
         );
@@ -803,14 +904,25 @@ impl DeRecShareStore for DotnetShareStore {
         })
     }
 
-    fn save(&mut self, channel_id: ChannelId, share: Share) -> ShareStoreFuture<'_, ()> {
+    fn save(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        share: Share,
+    ) -> ShareStoreFuture<'_, ()> {
         let cb = &self.cb;
         let res = (|| -> Result<(), ShareStoreError> {
             let record = ShareRecord::from(&share);
             let bytes = serde_json::to_vec(&record).map_err(|e| {
                 ShareStoreError::Backend(boxed_err(format!("Share JSON: {e}")))
             })?;
-            let rc = (cb.save)(cb.user_data, channel_id.0, bytes.as_ptr(), bytes.len());
+            let rc = (cb.save)(
+                cb.user_data,
+                secret_id,
+                channel_id.0,
+                bytes.as_ptr(),
+                bytes.len(),
+            );
             if rc != 0 {
                 return Err(ShareStoreError::Backend(boxed_err(format!(
                     "share store save failed (rc={rc})"
@@ -821,13 +933,87 @@ impl DeRecShareStore for DotnetShareStore {
         Box::pin(async move { res })
     }
 
-    fn remove_channel(&mut self, channel_id: ChannelId) -> ShareStoreFuture<'_, ()> {
+    fn remove_channel(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+    ) -> ShareStoreFuture<'_, ()> {
         let cb = &self.cb;
-        let rc = (cb.remove_channel)(cb.user_data, channel_id.0);
+        let rc = (cb.remove_channel)(cb.user_data, secret_id, channel_id.0);
         Box::pin(async move {
             if rc != 0 {
                 Err(ShareStoreError::Backend(boxed_err(format!(
                     "share store remove_channel failed (rc={rc})"
+                ))))
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
+/// User-secret store adapter for the FFI bridge.
+pub struct DotnetUserSecretStore {
+    pub(crate) cb: UserSecretStoreCallbacks,
+}
+
+unsafe impl Send for DotnetUserSecretStore {}
+unsafe impl Sync for DotnetUserSecretStore {}
+
+impl DotnetUserSecretStore {
+    fn fetch_bytes(
+        &self,
+        f: impl FnOnce(*mut *mut u8, *mut usize) -> i32,
+    ) -> Result<Option<Vec<u8>>, String> {
+        fetch_callback_bytes(self.cb.user_data, self.cb.free_buffer, "user secret store", f)
+    }
+}
+
+impl DeRecUserSecretStore for DotnetUserSecretStore {
+    fn load_latest(&self, secret_id: u64) -> ShareStoreFuture<'_, Option<UserSecrets>> {
+        let result = self.fetch_bytes(|p, l| {
+            (self.cb.load_latest)(self.cb.user_data, secret_id, p, l)
+        });
+        let res = match result {
+            Err(e) => Err(ShareStoreError::Backend(boxed_err(e))),
+            Ok(None) => Ok(None),
+            Ok(Some(bytes)) if bytes.is_empty() => Ok(None),
+            Ok(Some(bytes)) => serde_json::from_slice::<UserSecretsRecord>(&bytes)
+                .map(|r| Some(r.into()))
+                .map_err(|e| ShareStoreError::Backend(boxed_err(format!("UserSecrets JSON: {e}")))),
+        };
+        Box::pin(async move { res })
+    }
+
+    fn save_latest(
+        &mut self,
+        secret_id: u64,
+        value: UserSecrets,
+    ) -> ShareStoreFuture<'_, ()> {
+        let cb = &self.cb;
+        let res = (|| -> Result<(), ShareStoreError> {
+            let record = UserSecretsRecord::from(&value);
+            let bytes = serde_json::to_vec(&record).map_err(|e| {
+                ShareStoreError::Backend(boxed_err(format!("UserSecrets JSON: {e}")))
+            })?;
+            let rc = (cb.save_latest)(cb.user_data, secret_id, bytes.as_ptr(), bytes.len());
+            if rc != 0 {
+                return Err(ShareStoreError::Backend(boxed_err(format!(
+                    "user secret store save_latest failed (rc={rc})"
+                ))));
+            }
+            Ok(())
+        })();
+        Box::pin(async move { res })
+    }
+
+    fn remove(&mut self, secret_id: u64) -> ShareStoreFuture<'_, ()> {
+        let cb = &self.cb;
+        let rc = (cb.remove)(cb.user_data, secret_id);
+        Box::pin(async move {
+            if rc != 0 {
+                Err(ShareStoreError::Backend(boxed_err(format!(
+                    "user secret store remove failed (rc={rc})"
                 ))))
             } else {
                 Ok(())

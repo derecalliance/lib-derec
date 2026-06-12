@@ -118,11 +118,17 @@ public sealed record UserSecret
     [JsonPropertyName("data")] public required byte[] Data { get; init; }
 }
 
-/// <summary>Params for <see cref="FlowKind.ProtectSecret"/>.</summary>
+/// <summary>
+/// Params for <see cref="FlowKind.ProtectSecret"/>.
+///
+/// The vault identifier comes from
+/// <see cref="DeRecProtocol.SecretId"/> (set at construction) and the
+/// target set is the protocol's full roster of paired Owner→Helper +
+/// Source→ReplicaDestination channels — neither field is carried on the
+/// flow params anymore.
+/// </summary>
 public sealed record ProtectSecretParams
 {
-    [JsonPropertyName("secret_id")] public required string SecretId { get; init; }
-    [JsonPropertyName("target")] public Target? Target { get; init; }
     [JsonPropertyName("secrets")] public required UserSecret[] Secrets { get; init; }
     [JsonPropertyName("description")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]

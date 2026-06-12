@@ -16,27 +16,32 @@ internal static class Protocol
 {
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int ChannelStoreLoadDelegate(
-        IntPtr userData, ulong channelId, out IntPtr outPtr, out UIntPtr outLen);
+        IntPtr userData, ulong secretId, ulong channelId,
+        out IntPtr outPtr, out UIntPtr outLen);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int ChannelStoreSaveDelegate(
-        IntPtr userData, ulong channelId, IntPtr bytes, UIntPtr len);
+        IntPtr userData, ulong secretId, ulong channelId,
+        IntPtr bytes, UIntPtr len);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int ChannelStoreRemoveDelegate(
-        IntPtr userData, ulong channelId, out uint outExisted);
+        IntPtr userData, ulong secretId, ulong channelId,
+        out uint outExisted);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int ChannelStoreListDelegate(
-        IntPtr userData, out IntPtr outPtr, out UIntPtr outLen);
+        IntPtr userData, ulong secretId,
+        out IntPtr outPtr, out UIntPtr outLen);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int ChannelStoreLinkDelegate(
-        IntPtr userData, ulong a, ulong b);
+        IntPtr userData, ulong secretId, ulong a, ulong b);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int ChannelStoreLinkedDelegate(
-        IntPtr userData, ulong channelId, out IntPtr outPtr, out UIntPtr outLen);
+        IntPtr userData, ulong secretId, ulong channelId,
+        out IntPtr outPtr, out UIntPtr outLen);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate void FreeBufferDelegate(
@@ -57,15 +62,17 @@ internal static class Protocol
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int SecretStoreLoadDelegate(
-        IntPtr userData, ulong channelId, uint kind, out IntPtr outPtr, out UIntPtr outLen);
+        IntPtr userData, ulong secretId, ulong channelId, uint kind,
+        out IntPtr outPtr, out UIntPtr outLen);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int SecretStoreSaveDelegate(
-        IntPtr userData, ulong channelId, uint kind, IntPtr bytes, UIntPtr len);
+        IntPtr userData, ulong secretId, ulong channelId, uint kind,
+        IntPtr bytes, UIntPtr len);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int SecretStoreRemoveDelegate(
-        IntPtr userData, ulong channelId, uint kind);
+        IntPtr userData, ulong secretId, ulong channelId, uint kind);
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct SecretStoreCallbacks
@@ -79,35 +86,36 @@ internal static class Protocol
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int ShareStoreLoadDelegate(
-        IntPtr userData, ulong channelId, ulong secretId,
+        IntPtr userData, ulong secretId, ulong channelId,
         IntPtr versionsJsonPtr, UIntPtr versionsJsonLen,
         out IntPtr outPtr, out UIntPtr outLen);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int ShareStoreLoadManyDelegate(
-        IntPtr userData,
+        IntPtr userData, ulong secretId,
         IntPtr channelIdsJsonPtr, UIntPtr channelIdsJsonLen,
-        ulong secretId,
         IntPtr versionsJsonPtr, UIntPtr versionsJsonLen,
         out IntPtr outPtr, out UIntPtr outLen);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int ShareStoreLoadAllDelegate(
-        IntPtr userData,
+        IntPtr userData, ulong secretId,
         IntPtr channelIdsJsonPtr, UIntPtr channelIdsJsonLen,
         out IntPtr outPtr, out UIntPtr outLen);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int ShareStoreLatestVersionDelegate(
-        IntPtr userData, out uint outHasVersion, out uint outVersion);
+        IntPtr userData, ulong secretId,
+        out uint outHasVersion, out uint outVersion);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int ShareStoreSaveDelegate(
-        IntPtr userData, ulong channelId, IntPtr shareJsonPtr, UIntPtr shareJsonLen);
+        IntPtr userData, ulong secretId, ulong channelId,
+        IntPtr shareJsonPtr, UIntPtr shareJsonLen);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int ShareStoreRemoveChannelDelegate(
-        IntPtr userData, ulong channelId);
+        IntPtr userData, ulong secretId, ulong channelId);
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct ShareStoreCallbacks
@@ -119,6 +127,30 @@ internal static class Protocol
         public IntPtr LatestVersion;
         public IntPtr Save;
         public IntPtr RemoveChannel;
+        public IntPtr FreeBuffer;
+    }
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate int UserSecretStoreLoadLatestDelegate(
+        IntPtr userData, ulong secretId,
+        out IntPtr outPtr, out UIntPtr outLen);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate int UserSecretStoreSaveLatestDelegate(
+        IntPtr userData, ulong secretId,
+        IntPtr valueJsonPtr, UIntPtr valueJsonLen);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate int UserSecretStoreRemoveDelegate(
+        IntPtr userData, ulong secretId);
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct UserSecretStoreCallbacks
+    {
+        public IntPtr UserData;
+        public IntPtr LoadLatest;
+        public IntPtr SaveLatest;
+        public IntPtr Remove;
         public IntPtr FreeBuffer;
     }
 
@@ -150,9 +182,11 @@ internal static class Protocol
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern DeRecProtocolNewResult derec_protocol_new(
+        ulong secretId,
         ref ChannelStoreCallbacks channelStoreCb,
         ref SecretStoreCallbacks secretStoreCb,
         ref ShareStoreCallbacks shareStoreCb,
+        ref UserSecretStoreCallbacks userSecretStoreCb,
         ref TransportCallbacks transportCb,
         byte[] ownTransportUri, UIntPtr ownTransportUriLen,
         int ownTransportProtocol,

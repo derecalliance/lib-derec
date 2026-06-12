@@ -60,10 +60,15 @@ pub(in crate::protocol) async fn start<
 ) -> Result<()> {
     pending_recovery.insert((secret_id, version), Vec::new());
 
-    let all_channels = channel_store.channels().await?;
+    let all_channels = channel_store.channels(secret_id).await?;
     let channel_ids: Vec<ChannelId> = all_channels.iter().map(|c| c.id).collect();
     let mut keys: std::collections::HashMap<ChannelId, SharedKey> = secret_store
-        .load_many(&channel_ids, SecretKind::SharedKey, MissingPolicy::Fail)
+        .load_many(
+            secret_id,
+            &channel_ids,
+            SecretKind::SharedKey,
+            MissingPolicy::Fail,
+        )
         .await?
         .into_iter()
         .filter_map(|(cid, v)| match v {
@@ -120,15 +125,16 @@ pub(in crate::protocol) async fn accept<
     channel_store: &mut Ch,
     share_store: &mut Sh,
     transport: &T,
+    secret_id: u64,
     channel_id: ChannelId,
     request: &GetShareRequestMessage,
     shared_key: &SharedKey,
     trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
-    let linked_ids = channel_store.linked_channels(channel_id).await?;
+    let linked_ids = channel_store.linked_channels(secret_id, channel_id).await?;
 
     let encoded = share_store
-        .load_many(&linked_ids, request.secret_id, &[request.version])
+        .load_many(secret_id, &linked_ids, &[request.version])
         .await?
         .into_iter()
         .next()
@@ -141,9 +147,13 @@ pub(in crate::protocol) async fn accept<
     let resp = response::produce(channel_id, request, &stored, shared_key)?;
 
     let envelope = super::apply_trace_id(resp.envelope, trace_id)?;
-    let endpoint =
-        super::resolve_response_endpoint(channel_store, channel_id, request.reply_to.as_ref())
-            .await?;
+    let endpoint = super::resolve_response_endpoint(
+        channel_store,
+        secret_id,
+        channel_id,
+        request.reply_to.as_ref(),
+    )
+    .await?;
     transport.send(&endpoint, envelope).await?;
 
     #[cfg(feature = "logging")]
@@ -171,6 +181,7 @@ pub(in crate::protocol) async fn accept<
 pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport>(
     channel_store: &mut Ch,
     transport: &T,
+    secret_id: u64,
     channel_id: ChannelId,
     request: &GetShareRequestMessage,
     shared_key: &SharedKey,
@@ -193,6 +204,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
     super::send_channel_message(
         channel_store,
         transport,
+        secret_id,
         channel_id,
         MessageBody::GetShareResponse(response),
         shared_key,

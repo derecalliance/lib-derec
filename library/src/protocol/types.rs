@@ -154,6 +154,26 @@ pub struct UserSecret {
     pub data: ::prost::alloc::vec::Vec<u8>,
 }
 
+/// Snapshot of the user-facing vault contents persisted by
+/// [`crate::protocol::DeRecUserSecretStore`] for one `secret_id`.
+///
+/// Written every time the application calls
+/// `start(FlowKind::ProtectSecret)`; read by the pair-completion
+/// auto-publish hook so a freshly-paired Helper or Replica receives the
+/// current state without an explicit re-publish from the app.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UserSecrets {
+    /// Vault version this snapshot represents. Monotonically increasing
+    /// per `secret_id` — the protocol bumps it on every publish.
+    pub version: u32,
+    /// User-facing secret entries. Same wire shape as
+    /// [`SecretContainer::secrets`].
+    pub secrets: Vec<UserSecret>,
+    /// Optional human-readable label for this version, forwarded to
+    /// helpers in `StoreShareRequest.description`.
+    pub description: Option<String>,
+}
+
 /// Per-replica metadata stored inside the secret bag — mirrors
 /// [`HelperInfo`] but for the replica role and carries the extra
 /// `replica_id` + `sender_kind` fields needed by the replica recovery

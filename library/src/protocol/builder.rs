@@ -13,7 +13,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use super::{
-    DeRecChannelStore, DeRecProtocol, DeRecSecretStore, DeRecShareStore, DeRecTransport, UnpairAck,
+    DeRecChannelStore, DeRecProtocol, DeRecSecretStore, DeRecShareStore, DeRecTransport,
+    DeRecUserSecretStore, UnpairAck,
 };
 use derec_proto::TransportProtocol;
 
@@ -42,10 +43,19 @@ pub struct BuilderSlotSetMarker<T>(T);
 ///     // Plus any optional with_* setters to override defaults.
 ///     .build();
 /// ```
-pub struct DeRecProtocolBuilder<ChannelStore, ShareStore, SecretStore, Transport, OwnTransport> {
+pub struct DeRecProtocolBuilder<
+    ChannelStore,
+    ShareStore,
+    SecretStore,
+    UserSecretStore,
+    Transport,
+    OwnTransport,
+> {
+    secret_id: u64,
     channel_store: ChannelStore,
     share_store: ShareStore,
     secret_store: SecretStore,
+    user_secret_store: UserSecretStore,
     transport: Transport,
     own_transport: OwnTransport,
     threshold: usize,
@@ -65,13 +75,21 @@ impl
         BuilderSlotMissingMarker,
         BuilderSlotMissingMarker,
         BuilderSlotMissingMarker,
+        BuilderSlotMissingMarker,
     >
 {
-    pub fn new() -> Self {
+    /// Construct a new builder bound to a specific vault.
+    ///
+    /// `secret_id` identifies the single vault this protocol instance
+    /// manages. Apps that juggle multiple vaults instantiate one
+    /// [`DeRecProtocol`] per `secret_id`.
+    pub fn new(secret_id: u64) -> Self {
         Self {
+            secret_id,
             channel_store: BuilderSlotMissingMarker,
             share_store: BuilderSlotMissingMarker,
             secret_store: BuilderSlotMissingMarker,
+            user_secret_store: BuilderSlotMissingMarker,
             transport: BuilderSlotMissingMarker,
             own_transport: BuilderSlotMissingMarker,
             threshold: 3,
@@ -86,8 +104,15 @@ impl
     }
 }
 
-impl<ChannelStore, ShareStore, SecretStore, Transport, OwnTransport>
-    DeRecProtocolBuilder<ChannelStore, ShareStore, SecretStore, Transport, OwnTransport>
+impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, Transport, OwnTransport>
+    DeRecProtocolBuilder<
+        ChannelStore,
+        ShareStore,
+        SecretStore,
+        UserSecretStore,
+        Transport,
+        OwnTransport,
+    >
 {
     /// Minimum number of shares required to reconstruct the secret.
     ///
@@ -220,8 +245,15 @@ impl<ChannelStore, ShareStore, SecretStore, Transport, OwnTransport>
     }
 }
 
-impl<ShareStore, SecretStore, Transport, OwnTransport>
-    DeRecProtocolBuilder<BuilderSlotMissingMarker, ShareStore, SecretStore, Transport, OwnTransport>
+impl<ShareStore, SecretStore, UserSecretStore, Transport, OwnTransport>
+    DeRecProtocolBuilder<
+        BuilderSlotMissingMarker,
+        ShareStore,
+        SecretStore,
+        UserSecretStore,
+        Transport,
+        OwnTransport,
+    >
 {
     /// Set the [`DeRecChannelStore`] implementation responsible for persisting
     /// channel records.
@@ -232,13 +264,16 @@ impl<ShareStore, SecretStore, Transport, OwnTransport>
         BuilderSlotSetMarker<Cs>,
         ShareStore,
         SecretStore,
+        UserSecretStore,
         Transport,
         OwnTransport,
     > {
         DeRecProtocolBuilder {
+            secret_id: self.secret_id,
             channel_store: BuilderSlotSetMarker(store),
             share_store: self.share_store,
             secret_store: self.secret_store,
+            user_secret_store: self.user_secret_store,
             transport: self.transport,
             own_transport: self.own_transport,
             threshold: self.threshold,
@@ -253,11 +288,12 @@ impl<ShareStore, SecretStore, Transport, OwnTransport>
     }
 }
 
-impl<ChannelStore, SecretStore, Transport, OwnTransport>
+impl<ChannelStore, SecretStore, UserSecretStore, Transport, OwnTransport>
     DeRecProtocolBuilder<
         ChannelStore,
         BuilderSlotMissingMarker,
         SecretStore,
+        UserSecretStore,
         Transport,
         OwnTransport,
     >
@@ -271,13 +307,16 @@ impl<ChannelStore, SecretStore, Transport, OwnTransport>
         ChannelStore,
         BuilderSlotSetMarker<Sh>,
         SecretStore,
+        UserSecretStore,
         Transport,
         OwnTransport,
     > {
         DeRecProtocolBuilder {
+            secret_id: self.secret_id,
             channel_store: self.channel_store,
             share_store: BuilderSlotSetMarker(store),
             secret_store: self.secret_store,
+            user_secret_store: self.user_secret_store,
             transport: self.transport,
             own_transport: self.own_transport,
             threshold: self.threshold,
@@ -292,11 +331,12 @@ impl<ChannelStore, SecretStore, Transport, OwnTransport>
     }
 }
 
-impl<ChannelStore, ShareStore, Transport, OwnTransport>
+impl<ChannelStore, ShareStore, UserSecretStore, Transport, OwnTransport>
     DeRecProtocolBuilder<
         ChannelStore,
         ShareStore,
         BuilderSlotMissingMarker,
+        UserSecretStore,
         Transport,
         OwnTransport,
     >
@@ -310,13 +350,16 @@ impl<ChannelStore, ShareStore, Transport, OwnTransport>
         ChannelStore,
         ShareStore,
         BuilderSlotSetMarker<Ss>,
+        UserSecretStore,
         Transport,
         OwnTransport,
     > {
         DeRecProtocolBuilder {
+            secret_id: self.secret_id,
             channel_store: self.channel_store,
             share_store: self.share_store,
             secret_store: BuilderSlotSetMarker(store),
+            user_secret_store: self.user_secret_store,
             transport: self.transport,
             own_transport: self.own_transport,
             threshold: self.threshold,
@@ -331,11 +374,58 @@ impl<ChannelStore, ShareStore, Transport, OwnTransport>
     }
 }
 
-impl<ChannelStore, ShareStore, SecretStore, OwnTransport>
+impl<ChannelStore, ShareStore, SecretStore, Transport, OwnTransport>
     DeRecProtocolBuilder<
         ChannelStore,
         ShareStore,
         SecretStore,
+        BuilderSlotMissingMarker,
+        Transport,
+        OwnTransport,
+    >
+{
+    /// Set the [`DeRecUserSecretStore`] implementation responsible for
+    /// persisting the user-facing vault contents keyed by `secret_id`.
+    /// Written on every `start(FlowKind::ProtectSecret)`; read by the
+    /// pair-completion auto-publish hook so freshly-paired peers
+    /// receive the current vault without an explicit re-publish.
+    pub fn with_user_secret_store<Us: DeRecUserSecretStore>(
+        self,
+        store: Us,
+    ) -> DeRecProtocolBuilder<
+        ChannelStore,
+        ShareStore,
+        SecretStore,
+        BuilderSlotSetMarker<Us>,
+        Transport,
+        OwnTransport,
+    > {
+        DeRecProtocolBuilder {
+            secret_id: self.secret_id,
+            channel_store: self.channel_store,
+            share_store: self.share_store,
+            secret_store: self.secret_store,
+            user_secret_store: BuilderSlotSetMarker(store),
+            transport: self.transport,
+            own_transport: self.own_transport,
+            threshold: self.threshold,
+            keep_versions_count: self.keep_versions_count,
+            timeout_in_secs: self.timeout_in_secs,
+            communication_info: self.communication_info,
+            auto_respond_on_failure: self.auto_respond_on_failure,
+            unpair_ack: self.unpair_ack,
+            auto_reply_to: self.auto_reply_to,
+            replica_id: self.replica_id,
+        }
+    }
+}
+
+impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, OwnTransport>
+    DeRecProtocolBuilder<
+        ChannelStore,
+        ShareStore,
+        SecretStore,
+        UserSecretStore,
         BuilderSlotMissingMarker,
         OwnTransport,
     >
@@ -349,13 +439,16 @@ impl<ChannelStore, ShareStore, SecretStore, OwnTransport>
         ChannelStore,
         ShareStore,
         SecretStore,
+        UserSecretStore,
         BuilderSlotSetMarker<Tr>,
         OwnTransport,
     > {
         DeRecProtocolBuilder {
+            secret_id: self.secret_id,
             channel_store: self.channel_store,
             share_store: self.share_store,
             secret_store: self.secret_store,
+            user_secret_store: self.user_secret_store,
             transport: BuilderSlotSetMarker(transport),
             own_transport: self.own_transport,
             threshold: self.threshold,
@@ -370,8 +463,15 @@ impl<ChannelStore, ShareStore, SecretStore, OwnTransport>
     }
 }
 
-impl<ChannelStore, ShareStore, SecretStore, Transport>
-    DeRecProtocolBuilder<ChannelStore, ShareStore, SecretStore, Transport, BuilderSlotMissingMarker>
+impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, Transport>
+    DeRecProtocolBuilder<
+        ChannelStore,
+        ShareStore,
+        SecretStore,
+        UserSecretStore,
+        Transport,
+        BuilderSlotMissingMarker,
+    >
 {
     /// The local node's transport endpoint that peers will use to reach it.
     ///
@@ -384,13 +484,16 @@ impl<ChannelStore, ShareStore, SecretStore, Transport>
         ChannelStore,
         ShareStore,
         SecretStore,
+        UserSecretStore,
         Transport,
         BuilderSlotSetMarker<TransportProtocol>,
     > {
         DeRecProtocolBuilder {
+            secret_id: self.secret_id,
             channel_store: self.channel_store,
             share_store: self.share_store,
             secret_store: self.secret_store,
+            user_secret_store: self.user_secret_store,
             transport: self.transport,
             own_transport: BuilderSlotSetMarker(own_transport),
             threshold: self.threshold,
@@ -405,11 +508,18 @@ impl<ChannelStore, ShareStore, SecretStore, Transport>
     }
 }
 
-impl<Cs: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, Tr: DeRecTransport>
+impl<
+    Cs: DeRecChannelStore,
+    Sh: DeRecShareStore,
+    Ss: DeRecSecretStore,
+    Us: DeRecUserSecretStore,
+    Tr: DeRecTransport,
+>
     DeRecProtocolBuilder<
         BuilderSlotSetMarker<Cs>,
         BuilderSlotSetMarker<Sh>,
         BuilderSlotSetMarker<Ss>,
+        BuilderSlotSetMarker<Us>,
         BuilderSlotSetMarker<Tr>,
         BuilderSlotSetMarker<TransportProtocol>,
     >
@@ -419,11 +529,13 @@ impl<Cs: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore, Tr: DeRec
     /// The "all required slots set" constraint is enforced by this impl
     /// block's type bounds — the call is only reachable once every slot has
     /// been filled, so there is no runtime check and no failure mode.
-    pub fn build(self) -> DeRecProtocol<Cs, Sh, Ss, Tr> {
+    pub fn build(self) -> DeRecProtocol<Cs, Sh, Ss, Us, Tr> {
         let mut protocol = DeRecProtocol::new(
+            self.secret_id,
             self.channel_store.0,
             self.share_store.0,
             self.secret_store.0,
+            self.user_secret_store.0,
             self.transport.0,
             self.own_transport.0,
             self.threshold,

@@ -29,6 +29,7 @@ pub(in crate::protocol) async fn handle<Ch: DeRecChannelStore, Ss: DeRecSecretSt
     channel_store: &mut Ch,
     secret_store: &mut Ss,
     message: &MessageBody,
+    secret_id: u64,
     channel_id: ChannelId,
     pairing_secret: &PairingSecretKeyMaterial,
     inbound_trace_id: u64,
@@ -46,6 +47,7 @@ pub(in crate::protocol) async fn handle<Ch: DeRecChannelStore, Ss: DeRecSecretSt
             on_response(
                 channel_store,
                 secret_store,
+                secret_id,
                 channel_id,
                 response,
                 pairing_secret,
@@ -80,6 +82,7 @@ pub(in crate::protocol) async fn start<
     transport: &T,
     own_transport: &TransportProtocol,
     communication_info: &HashMap<String, String>,
+    secret_id: u64,
     kind: SenderKind,
     contact: ContactMessage,
     peer_communication_info: HashMap<String, String>,
@@ -105,6 +108,7 @@ pub(in crate::protocol) async fn start<
             secret_store,
             transport,
             own_transport,
+            secret_id,
             channel_id,
             contact,
             peer_communication_info,
@@ -119,6 +123,7 @@ pub(in crate::protocol) async fn start<
             transport,
             own_transport,
             communication_info,
+            secret_id,
             channel_id,
             contact,
             peer_communication_info,
@@ -143,6 +148,7 @@ pub(in crate::protocol) async fn accept<
     secret_store: &mut Ss,
     transport: &T,
     communication_info: &HashMap<String, String>,
+    secret_id: u64,
     channel_id: ChannelId,
     request: &PairRequestMessage,
     pairing_secret: &PairingSecretKeyMaterial,
@@ -157,7 +163,7 @@ pub(in crate::protocol) async fn accept<
     let resp = response::produce(channel_id, request, pairing_secret, comm_info)?;
 
     secret_store
-        .save(channel_id, SecretValue::SharedKey(resp.shared_key))
+        .save(secret_id, channel_id, SecretValue::SharedKey(resp.shared_key))
         .await?;
 
     let peer_transport = resp.peer_transport_protocol.clone();
@@ -177,19 +183,22 @@ pub(in crate::protocol) async fn accept<
         extract_communication_info(&request.communication_info, peer_sender_kind)?;
 
     channel_store
-        .save(crate::protocol::types::Channel {
-            id: channel_id,
-            transport: peer_transport,
-            communication_info: peer_communication_info.clone(),
-            status,
-            created_at: now_secs(),
-            role: kind,
-            replica_id: peer_replica_id,
-        })
+        .save(
+            secret_id,
+            crate::protocol::types::Channel {
+                id: channel_id,
+                transport: peer_transport,
+                communication_info: peer_communication_info.clone(),
+                status,
+                created_at: now_secs(),
+                role: kind,
+                replica_id: peer_replica_id,
+            },
+        )
         .await?;
 
     secret_store
-        .remove(channel_id, SecretKind::PairingSecret)
+        .remove(secret_id, channel_id, SecretKind::PairingSecret)
         .await?;
 
     let envelope = super::apply_trace_id(resp.envelope, trace_id)?;
@@ -217,6 +226,7 @@ pub(in crate::protocol) async fn reject<Ss: DeRecSecretStore, T: DeRecTransport>
     secret_store: &mut Ss,
     transport: &T,
     communication_info: &HashMap<String, String>,
+    secret_id: u64,
     channel_id: ChannelId,
     request: &PairRequestMessage,
     status: StatusEnum,
@@ -262,7 +272,7 @@ pub(in crate::protocol) async fn reject<Ss: DeRecSecretStore, T: DeRecTransport>
     transport.send(&peer_transport_protocol, envelope).await?;
 
     secret_store
-        .remove(channel_id, SecretKind::PairingSecret)
+        .remove(secret_id, channel_id, SecretKind::PairingSecret)
         .await?;
 
     #[cfg(feature = "logging")]
@@ -293,6 +303,7 @@ pub(in crate::protocol) async fn on_pre_pair_response<
     transport: &T,
     own_transport: &TransportProtocol,
     communication_info: &HashMap<String, String>,
+    secret_id: u64,
     channel_id: ChannelId,
     original_contact: &ContactMessage,
     response: &PrePairResponseMessage,
@@ -338,7 +349,7 @@ pub(in crate::protocol) async fn on_pre_pair_response<
     // Drive the regular PairRequest leg. The scanner's role on the
     // channel was committed at `start` time; preserve it.
     let role = channel_store
-        .load(channel_id)
+        .load(secret_id, channel_id)
         .await?
         .ok_or(Error::Invariant(
             "channel record missing on PrePair response — start must be called first",
@@ -353,10 +364,15 @@ pub(in crate::protocol) async fn on_pre_pair_response<
     // contact with the filled-in version. `pair_response::process`
     // later reads back the InlineKeys-shaped contact to verify keys.
     secret_store
-        .save(channel_id, SecretValue::PairingSecret(result.secret_key))
+        .save(
+            secret_id,
+            channel_id,
+            SecretValue::PairingSecret(result.secret_key),
+        )
         .await?;
     secret_store
         .save(
+            secret_id,
             channel_id,
             SecretValue::PairingContact(result.initiator_contact_message),
         )
@@ -389,12 +405,13 @@ pub(in crate::protocol) async fn on_pre_pair_response<
 pub(in crate::protocol) async fn accept_pre_pair<Ss: DeRecSecretStore, T: DeRecTransport>(
     secret_store: &mut Ss,
     transport: &T,
+    secret_id: u64,
     channel_id: ChannelId,
     request: &PrePairRequestMessage,
     trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
     let Some(SecretValue::PairingSecret(pairing_secret)) = secret_store
-        .load(channel_id, SecretKind::PairingSecret)
+        .load(secret_id, channel_id, SecretKind::PairingSecret)
         .await?
     else {
         return Err(Error::Invariant(
@@ -493,6 +510,7 @@ async fn start_inlined_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRe
     transport: &T,
     own_transport: &TransportProtocol,
     communication_info: &HashMap<String, String>,
+    secret_id: u64,
     channel_id: ChannelId,
     contact: ContactMessage,
     peer_communication_info: HashMap<String, String>,
@@ -504,25 +522,33 @@ async fn start_inlined_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRe
     let result = request::produce(kind, own_transport.clone(), &contact, comm_info)?;
 
     secret_store
-        .save(channel_id, SecretValue::PairingSecret(result.secret_key))
+        .save(
+            secret_id,
+            channel_id,
+            SecretValue::PairingSecret(result.secret_key),
+        )
         .await?;
     secret_store
         .save(
+            secret_id,
             channel_id,
             SecretValue::PairingContact(result.initiator_contact_message),
         )
         .await?;
 
     channel_store
-        .save(crate::protocol::types::Channel {
-            id: channel_id,
-            transport: endpoint.clone(),
-            communication_info: peer_communication_info,
-            status: crate::protocol::types::ChannelStatus::Pending,
-            created_at: now_secs(),
-            role: kind,
-            replica_id: None,
-        })
+        .save(
+            secret_id,
+            crate::protocol::types::Channel {
+                id: channel_id,
+                transport: endpoint.clone(),
+                communication_info: peer_communication_info,
+                status: crate::protocol::types::ChannelStatus::Pending,
+                created_at: now_secs(),
+                role: kind,
+                replica_id: None,
+            },
+        )
         .await?;
 
     #[cfg(feature = "logging")]
@@ -547,6 +573,7 @@ async fn start_hashed_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRec
     secret_store: &mut Ss,
     transport: &T,
     own_transport: &TransportProtocol,
+    secret_id: u64,
     channel_id: ChannelId,
     contact: ContactMessage,
     peer_communication_info: HashMap<String, String>,
@@ -558,19 +585,22 @@ async fn start_hashed_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRec
     // Persist the original HashedKeys contact so the eventual
     // PrePairResponse can be validated against its binding hash.
     secret_store
-        .save(channel_id, SecretValue::PairingContact(contact))
+        .save(secret_id, channel_id, SecretValue::PairingContact(contact))
         .await?;
 
     channel_store
-        .save(crate::protocol::types::Channel {
-            id: channel_id,
-            transport: endpoint.clone(),
-            communication_info: peer_communication_info,
-            status: crate::protocol::types::ChannelStatus::Pending,
-            created_at: now_secs(),
-            role: kind,
-            replica_id: None,
-        })
+        .save(
+            secret_id,
+            crate::protocol::types::Channel {
+                id: channel_id,
+                transport: endpoint.clone(),
+                communication_info: peer_communication_info,
+                status: crate::protocol::types::ChannelStatus::Pending,
+                created_at: now_secs(),
+                role: kind,
+                replica_id: None,
+            },
+        )
         .await?;
 
     #[cfg(feature = "logging")]
@@ -649,13 +679,14 @@ fn on_request(
 async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     channel_store: &mut Ch,
     secret_store: &mut Ss,
+    secret_id: u64,
     channel_id: ChannelId,
     response: &derec_proto::PairResponseMessage,
     pairing_secret: &PairingSecretKeyMaterial,
     replica_id: Option<u64>,
 ) -> Result<Vec<DeRecEvent>> {
     let contact = match secret_store
-        .load(channel_id, SecretKind::PairingContact)
+        .load(secret_id, channel_id, SecretKind::PairingContact)
         .await?
     {
         Some(SecretValue::PairingContact(c)) => c,
@@ -669,19 +700,23 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     let result = response::process(&contact, response, pairing_secret)?;
 
     secret_store
-        .save(channel_id, SecretValue::SharedKey(result.shared_key))
+        .save(
+            secret_id,
+            channel_id,
+            SecretValue::SharedKey(result.shared_key),
+        )
         .await?;
     secret_store
-        .remove(channel_id, SecretKind::PairingSecret)
+        .remove(secret_id, channel_id, SecretKind::PairingSecret)
         .await?;
     secret_store
-        .remove(channel_id, SecretKind::PairingContact)
+        .remove(secret_id, channel_id, SecretKind::PairingContact)
         .await?;
 
     // The local role was committed to the channel record at `start` time;
     // load it now rather than derive it from the peer's response.
     let channel = channel_store
-        .load(channel_id)
+        .load(secret_id, channel_id)
         .await?
         .ok_or(Error::Invariant(
             "channel record missing on pair response — start must be called first",
@@ -710,7 +745,7 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     for (k, v) in &peer_communication_info {
         channel.communication_info.insert(k.clone(), v.clone());
     }
-    channel_store.save(channel).await?;
+    channel_store.save(secret_id, channel).await?;
 
     #[cfg(feature = "logging")]
     tracing::info!("pairing complete (initiator side)");
