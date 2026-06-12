@@ -1,0 +1,462 @@
+//! Replica-sync version-progression flow over Postgres.
+//!
+//! Walks the canonical 0→8 sequence:
+//!
+//! ```text
+//! 0. new()                                          → user_secret_store empty
+//! 1. pair replica A                                 → v=1, replicas=1
+//! 2. ProtectSecret([s1])                            → v=2, secrets=1
+//! 3. pair replica B (bootstrap)                     → v=3, replicas=2
+//! 4. pair helper #1 (below threshold)               → v=4, helpers=1
+//! 5. pair helper #2 (below threshold)               → v=5, helpers=2
+//! 6. ProtectSecret([s1, s2])                        → v=6, secrets=2
+//! 7. pair helper #3 (threshold met, VSS split)      → v=7, helpers=3 + shares
+//! 8. pair replica C (full bootstrap + fresh shares) → v=8, replicas=3 + shares
+//! ```
+//!
+//! Each peer owns its own in-memory Postgres database — one device =
+//! one DB, as in the other flows. Replicas and helpers all bind their
+//! protocols to the same `secret_id` as the owner, so the assertions
+//! can read the per-vault state directly.
+
+use derec_library::protocol::events::DeRecEvent;
+use derec_library::protocol::types::{SecretContainer, UserSecret};
+use derec_library::protocol::{
+    ChannelShare, DeRecFlow, DeRecUserSecretStore,
+};
+use derec_library::types::ChannelId;
+use derec_proto::SenderKind;
+use std::collections::HashMap;
+
+use crate::db::Database;
+use crate::peer::{Peer, PeerOptions, pump_many};
+
+const VAULT_SECRET_ID: u64 = 0xABBA;
+const THRESHOLD: usize = 3;
+
+pub async fn run() {
+    println!("=== [Replica sync] version progression v0 → v8 ===");
+
+    let owner_db = Database::open_isolated().await;
+    let replica_a_db = Database::open_isolated().await;
+    let replica_b_db = Database::open_isolated().await;
+    let replica_c_db = Database::open_isolated().await;
+    let helper_1_db = Database::open_isolated().await;
+    let helper_2_db = Database::open_isolated().await;
+    let helper_3_db = Database::open_isolated().await;
+
+    let mut owner = Peer::with_options(
+        owner_db.client(),
+        "Owner",
+        "https://owner.example.com",
+        PeerOptions {
+            secret_id: VAULT_SECRET_ID,
+            threshold: THRESHOLD,
+            replica_id: Some(0x0001),
+        },
+    );
+    let mut replica_a = Peer::with_options(
+        replica_a_db.client(),
+        "ReplicaA",
+        "https://replica-a.example.com",
+        PeerOptions {
+            secret_id: VAULT_SECRET_ID,
+            threshold: THRESHOLD,
+            replica_id: Some(0x000A),
+        },
+    );
+    let mut replica_b = Peer::with_options(
+        replica_b_db.client(),
+        "ReplicaB",
+        "https://replica-b.example.com",
+        PeerOptions {
+            secret_id: VAULT_SECRET_ID,
+            threshold: THRESHOLD,
+            replica_id: Some(0x000B),
+        },
+    );
+    let mut replica_c = Peer::with_options(
+        replica_c_db.client(),
+        "ReplicaC",
+        "https://replica-c.example.com",
+        PeerOptions {
+            secret_id: VAULT_SECRET_ID,
+            threshold: THRESHOLD,
+            replica_id: Some(0x000C),
+        },
+    );
+    let mut helper_1 = Peer::with_options(
+        helper_1_db.client(),
+        "Helper1",
+        "https://helper-1.example.com",
+        PeerOptions {
+            secret_id: VAULT_SECRET_ID,
+            threshold: THRESHOLD,
+            replica_id: None,
+        },
+    );
+    let mut helper_2 = Peer::with_options(
+        helper_2_db.client(),
+        "Helper2",
+        "https://helper-2.example.com",
+        PeerOptions {
+            secret_id: VAULT_SECRET_ID,
+            threshold: THRESHOLD,
+            replica_id: None,
+        },
+    );
+    let mut helper_3 = Peer::with_options(
+        helper_3_db.client(),
+        "Helper3",
+        "https://helper-3.example.com",
+        PeerOptions {
+            secret_id: VAULT_SECRET_ID,
+            threshold: THRESHOLD,
+            replica_id: None,
+        },
+    );
+
+    let cid_a = ChannelId(1);
+    let cid_b = ChannelId(3);
+    let cid_c = ChannelId(8);
+    let cid_h1 = ChannelId(11);
+    let cid_h2 = ChannelId(12);
+    let cid_h3 = ChannelId(13);
+
+    // ── Step 0: brand-new instance ────────────────────────────────
+    assert!(
+        owner
+            .protocol
+            .user_secret_store
+            .load_latest(VAULT_SECRET_ID)
+            .await
+            .unwrap()
+            .is_none(),
+        "step 0: brand-new owner must have no user_secrets snapshot"
+    );
+    println!("  step 0: user_secret_store latest = None  ✓");
+
+    // ── Step 1: pair replica A → v=1 ──────────────────────────────
+    pair_replica_handshake(&mut owner, &mut replica_a, cid_a).await;
+    cross_confirm_fingerprint(&mut owner, &mut replica_a, cid_a).await;
+    let events =
+        pump_many(&mut [&mut owner, &mut replica_a, &mut replica_b, &mut replica_c]).await;
+    let received_a = find_replica_event(&events, cid_a)
+        .expect("step 1: replica A must observe ReplicaVaultReceived");
+    assert_eq!(received_a.version, 1);
+    assert_eq!(received_a.vault.helpers.len(), 0);
+    assert_eq!(received_a.vault.secrets.len(), 0);
+    assert_eq!(received_a.vault.replicas.len(), 1);
+    assert_eq!(received_a.shares.len(), 0);
+    assert_eq!(latest_version(&owner).await, Some(1));
+    println!("  step 1: pair replica A → v=1, vault(h=0,s=0,r=1,shares=0)  ✓");
+
+    // ── Step 2: ProtectSecret([s1]) → v=2 ─────────────────────────
+    let s1 = UserSecret {
+        id: vec![0x01],
+        name: "secret-one".to_owned(),
+        data: b"first-user-secret".to_vec(),
+    };
+    owner
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![s1.clone()],
+            description: Some("v=2 explicit publish".to_owned()),
+        })
+        .await
+        .unwrap();
+    let events =
+        pump_many(&mut [&mut owner, &mut replica_a, &mut replica_b, &mut replica_c]).await;
+    let received_a = find_replica_event(&events, cid_a).expect("step 2: A must see v=2");
+    assert_eq!(received_a.version, 2);
+    assert_eq!(received_a.vault.helpers.len(), 0);
+    assert_eq!(received_a.vault.secrets.len(), 1);
+    assert_eq!(received_a.vault.secrets[0].data, s1.data);
+    assert_eq!(received_a.vault.replicas.len(), 1);
+    assert_eq!(received_a.shares.len(), 0);
+    assert_eq!(latest_version(&owner).await, Some(2));
+    println!("  step 2: ProtectSecret([s1]) → v=2, vault(h=0,s=1,r=1,shares=0)  ✓");
+
+    // ── Step 3: pair replica B → v=3, B bootstraps with s1 ────────
+    pair_replica_handshake(&mut owner, &mut replica_b, cid_b).await;
+    cross_confirm_fingerprint(&mut owner, &mut replica_b, cid_b).await;
+    let events =
+        pump_many(&mut [&mut owner, &mut replica_a, &mut replica_b, &mut replica_c]).await;
+    let received_a = find_replica_event(&events, cid_a).expect("step 3: A must see v=3");
+    let received_b =
+        find_replica_event(&events, cid_b).expect("step 3: B must see v=3 (bootstrap)");
+    for (label, received) in [("A", &received_a), ("B", &received_b)] {
+        assert_eq!(received.version, 3);
+        assert_eq!(received.vault.helpers.len(), 0);
+        assert_eq!(received.vault.secrets.len(), 1, "{label}: bag carries s1");
+        assert_eq!(received.vault.secrets[0].data, s1.data);
+        assert_eq!(received.vault.replicas.len(), 2);
+        assert_eq!(received.shares.len(), 0);
+    }
+    assert_eq!(latest_version(&owner).await, Some(3));
+    println!("  step 3: pair replica B → v=3, vault(h=0,s=1,r=2,shares=0) on A+B  ✓");
+
+    // ── Step 4: pair helper #1 → v=4 (below threshold) ────────────
+    helper_start_pair(&mut owner, &mut helper_1, cid_h1).await;
+    let events = pump_many(&mut [
+        &mut owner,
+        &mut replica_a,
+        &mut replica_b,
+        &mut replica_c,
+        &mut helper_1,
+        &mut helper_2,
+        &mut helper_3,
+    ])
+    .await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, DeRecEvent::ShareStored { .. })),
+        "step 4: no helper may store a share (1 < threshold 3)"
+    );
+    for (label, cid) in [("A", cid_a), ("B", cid_b)] {
+        let received = find_replica_event(&events, cid)
+            .unwrap_or_else(|| panic!("step 4: replica {label} must observe v=4"));
+        assert_eq!(received.version, 4);
+        assert_eq!(received.vault.helpers.len(), 1);
+        assert_eq!(received.vault.secrets.len(), 1);
+        assert_eq!(received.vault.replicas.len(), 2);
+        assert_eq!(received.shares.len(), 0);
+    }
+    assert_eq!(latest_version(&owner).await, Some(4));
+    println!("  step 4: pair helper #1 → v=4, vault(h=1,s=1,r=2,shares=0)  ✓");
+
+    // ── Step 5: pair helper #2 → v=5 ──────────────────────────────
+    helper_start_pair(&mut owner, &mut helper_2, cid_h2).await;
+    let events = pump_many(&mut [
+        &mut owner,
+        &mut replica_a,
+        &mut replica_b,
+        &mut replica_c,
+        &mut helper_1,
+        &mut helper_2,
+        &mut helper_3,
+    ])
+    .await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, DeRecEvent::ShareStored { .. })),
+        "step 5: still below threshold"
+    );
+    let received_b = find_replica_event(&events, cid_b).expect("step 5: B must observe v=5");
+    assert_eq!(received_b.version, 5);
+    assert_eq!(received_b.vault.helpers.len(), 2);
+    assert_eq!(received_b.shares.len(), 0);
+    let _ = find_replica_event(&events, cid_a).expect("step 5: A must observe v=5");
+    assert_eq!(latest_version(&owner).await, Some(5));
+    println!("  step 5: pair helper #2 → v=5, vault(h=2,s=1,r=2,shares=0)  ✓");
+
+    // ── Step 6: ProtectSecret([s1, s2]) → v=6 ─────────────────────
+    let s2 = UserSecret {
+        id: vec![0x02],
+        name: "secret-two".to_owned(),
+        data: b"second-user-secret".to_vec(),
+    };
+    owner
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![s1.clone(), s2.clone()],
+            description: Some("v=6 explicit publish".to_owned()),
+        })
+        .await
+        .unwrap();
+    let events = pump_many(&mut [
+        &mut owner,
+        &mut replica_a,
+        &mut replica_b,
+        &mut replica_c,
+        &mut helper_1,
+        &mut helper_2,
+        &mut helper_3,
+    ])
+    .await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, DeRecEvent::ShareStored { .. })),
+        "step 6: still below threshold"
+    );
+    let received_a = find_replica_event(&events, cid_a).expect("step 6: A must see v=6");
+    assert_eq!(received_a.version, 6);
+    assert_eq!(received_a.vault.secrets.len(), 2);
+    assert!(received_a.vault.secrets.iter().any(|us| us.data == s1.data));
+    assert!(received_a.vault.secrets.iter().any(|us| us.data == s2.data));
+    assert_eq!(received_a.vault.helpers.len(), 2);
+    assert_eq!(received_a.shares.len(), 0);
+    let _ = find_replica_event(&events, cid_b).expect("step 6: B must see v=6");
+    assert_eq!(latest_version(&owner).await, Some(6));
+    println!("  step 6: ProtectSecret([s1, s2]) → v=6, vault(h=2,s=2,r=2,shares=0)  ✓");
+
+    // ── Step 7: pair helper #3 → v=7, threshold met, VSS split ────
+    helper_start_pair(&mut owner, &mut helper_3, cid_h3).await;
+    let events = pump_many(&mut [
+        &mut owner,
+        &mut replica_a,
+        &mut replica_b,
+        &mut replica_c,
+        &mut helper_1,
+        &mut helper_2,
+        &mut helper_3,
+    ])
+    .await;
+    for (label, cid) in [("helper-1", cid_h1), ("helper-2", cid_h2), ("helper-3", cid_h3)] {
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                DeRecEvent::ShareStored { channel_id, version: 7 } if *channel_id == cid
+            )),
+            "step 7: {label} must emit ShareStored at v=7"
+        );
+    }
+    for (label, cid) in [("A", cid_a), ("B", cid_b)] {
+        let received = find_replica_event(&events, cid)
+            .unwrap_or_else(|| panic!("step 7: replica {label} must observe v=7"));
+        assert_eq!(received.version, 7);
+        assert_eq!(received.vault.helpers.len(), 3);
+        assert_eq!(received.vault.secrets.len(), 2);
+        assert_eq!(received.vault.replicas.len(), 2);
+        assert_eq!(received.shares.len(), 3);
+    }
+    assert_eq!(latest_version(&owner).await, Some(7));
+    println!("  step 7: pair helper #3 → v=7, vault(h=3,s=2,r=2,shares=3); all 3 helpers ShareStored  ✓");
+
+    // ── Step 8: pair replica C → v=8, full bootstrap + fresh VSS ──
+    pair_replica_handshake(&mut owner, &mut replica_c, cid_c).await;
+    cross_confirm_fingerprint(&mut owner, &mut replica_c, cid_c).await;
+    let events = pump_many(&mut [
+        &mut owner,
+        &mut replica_a,
+        &mut replica_b,
+        &mut replica_c,
+        &mut helper_1,
+        &mut helper_2,
+        &mut helper_3,
+    ])
+    .await;
+    for (label, cid) in [("helper-1", cid_h1), ("helper-2", cid_h2), ("helper-3", cid_h3)] {
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                DeRecEvent::ShareStored { channel_id, version: 8 } if *channel_id == cid
+            )),
+            "step 8: {label} must emit ShareStored at v=8"
+        );
+    }
+    let received_c = find_replica_event(&events, cid_c).expect("step 8: C must observe v=8");
+    assert_eq!(received_c.version, 8);
+    assert_eq!(received_c.vault.helpers.len(), 3);
+    assert_eq!(received_c.vault.secrets.len(), 2);
+    assert_eq!(received_c.vault.replicas.len(), 3);
+    assert_eq!(received_c.shares.len(), 3);
+    for (label, cid) in [("A", cid_a), ("B", cid_b)] {
+        let received = find_replica_event(&events, cid)
+            .unwrap_or_else(|| panic!("step 8: replica {label} must observe v=8"));
+        assert_eq!(received.version, 8);
+        assert_eq!(received.vault.replicas.len(), 3);
+    }
+    assert_eq!(latest_version(&owner).await, Some(8));
+    println!(
+        "  step 8: pair replica C → v=8, vault(h=3,s=2,r=3,shares=3) on A+B+C; all helpers refreshed  ✓"
+    );
+
+    println!("✓ Replica sync version progression flow passed.\n");
+}
+
+async fn latest_version(owner: &Peer) -> Option<u32> {
+    owner
+        .protocol
+        .user_secret_store
+        .load_latest(VAULT_SECRET_ID)
+        .await
+        .unwrap()
+        .map(|s| s.version)
+}
+
+async fn pair_replica_handshake(
+    owner: &mut Peer,
+    replica: &mut Peer,
+    channel_id: ChannelId,
+) {
+    let contact = owner
+        .protocol
+        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys)
+        .await
+        .expect("owner.create_contact failed");
+    replica
+        .protocol
+        .start(DeRecFlow::Pairing {
+            kind: SenderKind::ReplicaDestination,
+            contact,
+            peer_communication_info: HashMap::new(),
+        })
+        .await
+        .expect("replica start(Pairing) failed");
+    let _ = pump_many(&mut [owner, replica]).await;
+}
+
+async fn cross_confirm_fingerprint(
+    owner: &mut Peer,
+    replica: &mut Peer,
+    channel_id: ChannelId,
+) {
+    let owner_fp = owner.protocol.get_fingerprint(channel_id).await.unwrap();
+    let replica_fp = replica.protocol.get_fingerprint(channel_id).await.unwrap();
+    assert_eq!(owner_fp, replica_fp);
+    let ok_o = owner
+        .protocol
+        .verify_fingerprint(channel_id, &replica_fp)
+        .await
+        .unwrap();
+    let ok_r = replica
+        .protocol
+        .verify_fingerprint(channel_id, &owner_fp)
+        .await
+        .unwrap();
+    assert!(ok_o && ok_r);
+}
+
+async fn helper_start_pair(owner: &mut Peer, helper: &mut Peer, channel_id: ChannelId) {
+    let contact = owner
+        .protocol
+        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys)
+        .await
+        .expect("owner.create_contact failed");
+    helper
+        .protocol
+        .start(DeRecFlow::Pairing {
+            kind: SenderKind::Helper,
+            contact,
+            peer_communication_info: HashMap::new(),
+        })
+        .await
+        .expect("helper start(Pairing) failed");
+}
+
+struct ReceivedVault {
+    version: u32,
+    vault: SecretContainer,
+    shares: Vec<ChannelShare>,
+}
+
+fn find_replica_event(events: &[DeRecEvent], channel_id: ChannelId) -> Option<ReceivedVault> {
+    events.iter().find_map(|e| match e {
+        DeRecEvent::ReplicaVaultReceived {
+            channel_id: cid,
+            version,
+            vault,
+            shares,
+            ..
+        } if *cid == channel_id => Some(ReceivedVault {
+            version: *version,
+            vault: vault.clone(),
+            shares: shares.clone(),
+        }),
+        _ => None,
+    })
+}
