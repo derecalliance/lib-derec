@@ -447,24 +447,10 @@ impl<
         description: Option<String>,
         reply_to: Option<derec_proto::TransportProtocol>,
     ) -> Result<Option<u64>> {
-        // The next-version bump is owned by the share store, but the
-        // user_secret_store needs a version to key the snapshot too —
-        // peek at `latest_version` so the stored entry's version matches
-        // what `publish_vault` will distribute under.
-        let next_version = self
-            .share_store
-            .latest_version(self.secret_id)
-            .await?
-            .map_or(1, |v| v + 1);
-        let snapshot = crate::protocol::types::UserSecrets {
-            version: next_version,
-            secrets: secrets.clone(),
-            description: description.clone(),
-        };
-        self.user_secret_store
-            .save_latest(self.secret_id, snapshot)
-            .await?;
-
+        // `publish_vault` → `sharing::start` owns version bookkeeping
+        // now: it derives the next version from `user_secret_store`
+        // and writes the snapshot at the end of the round. No
+        // separate save_latest call is needed here.
         self.publish_vault(secrets, description, reply_to).await?;
         Ok(None)
     }
@@ -483,6 +469,7 @@ impl<
             &mut self.channel_store,
             &mut self.share_store,
             &mut self.secret_store,
+            &mut self.user_secret_store,
             &self.transport,
             secrets,
             description,
@@ -1013,9 +1000,13 @@ impl<
     /// shares). The replica-side equivalent fires from
     /// `verify_fingerprint` once the channel leaves `Pending`.
     ///
-    /// The hook is a no-op until `start(ProtectSecret)` has cached a bag,
-    /// so peers that pair before the first explicit publish wait for the
-    /// application to drive the initial round.
+    /// The bag comes from `user_secret_store.load_latest()` when one
+    /// has been cached by an earlier `start(ProtectSecret)`. When no
+    /// snapshot exists yet **and** at least one Replica Destination is
+    /// already paired, the hook publishes an empty bag so the roster
+    /// snapshot still reaches every Destination — that's how a
+    /// multi-device sync stays consistent before the application has
+    /// added any user secrets.
     async fn maybe_auto_publish_after_pair(&mut self, events: &[DeRecEvent]) -> Result<()> {
         let helper_just_paired = events.iter().any(|e| {
             matches!(
@@ -1029,12 +1020,30 @@ impl<
         if !helper_just_paired {
             return Ok(());
         }
-        let Some(snapshot) = self.user_secret_store.load_latest(self.secret_id).await? else {
-            return Ok(());
+        let snapshot = self.user_secret_store.load_latest(self.secret_id).await?;
+        let (secrets, description) = match snapshot {
+            Some(s) => (s.secrets, s.description),
+            None => {
+                if !self.has_paired_replica_destination().await? {
+                    return Ok(());
+                }
+                (Vec::new(), None)
+            }
         };
         let reply_to = self.auto_reply_to.then(|| self.own_transport.clone());
-        self.publish_vault(snapshot.secrets, snapshot.description, reply_to)
-            .await
+        self.publish_vault(secrets, description, reply_to).await
+    }
+
+    /// Returns `true` when at least one channel carries the local
+    /// `ReplicaSource` role in `Paired` status — i.e. the peer is a
+    /// Replica Destination that is fully verified and eligible for
+    /// vault sync.
+    async fn has_paired_replica_destination(&self) -> Result<bool> {
+        let channels = self.channel_store.channels(self.secret_id).await?;
+        Ok(channels.iter().any(|c| {
+            c.role == derec_proto::SenderKind::ReplicaSource
+                && c.status == crate::protocol::types::ChannelStatus::Paired
+        }))
     }
 
     async fn process_inner(
@@ -1116,13 +1125,18 @@ impl<
         // Replica destinations only become eligible publish targets once
         // the fingerprint is verified. Mirror the helper-pair hook in
         // `process()` so the newly-confirmed peer receives the current
-        // vault without an explicit follow-up `ProtectSecret` call.
-        if transitioned_replica
-            && let Some(snapshot) = self.user_secret_store.load_latest(self.secret_id).await?
-        {
+        // vault without an explicit follow-up `ProtectSecret` call. The
+        // Pending→Paired transition means at least one Replica
+        // Destination is now paired, so the empty-bag fallback always
+        // applies when no `UserSecrets` snapshot has been cached yet.
+        if transitioned_replica {
+            let snapshot = self.user_secret_store.load_latest(self.secret_id).await?;
+            let (secrets, description) = match snapshot {
+                Some(s) => (s.secrets, s.description),
+                None => (Vec::new(), None),
+            };
             let reply_to = self.auto_reply_to.then(|| self.own_transport.clone());
-            self.publish_vault(snapshot.secrets, snapshot.description, reply_to)
-                .await?;
+            self.publish_vault(secrets, description, reply_to).await?;
         }
 
         Ok(true)

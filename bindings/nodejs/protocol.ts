@@ -294,6 +294,7 @@ function makeNode(
     autoReplyTo?: boolean;
     replicaId?: bigint;
     secretId?: bigint;
+    threshold?: number;
   } = {},
 ): Node {
   const channelStore = new InMemoryChannelStore();
@@ -308,7 +309,7 @@ function makeNode(
     .withUserSecretStore(userSecretStore)
     .withTransport(transport)
     .withOwnTransport({ uri: endpointUri, protocol: "https" })
-    .withThreshold(THRESHOLD)
+    .withThreshold(options.threshold ?? THRESHOLD)
     .withKeepVersionsCount(KEEP_VERSIONS_COUNT)
     .withCommunicationInfo({ name });
   if (options.autoReplyTo !== undefined) {
@@ -1152,6 +1153,18 @@ async function runReplicaPairingAndVaultSyncFlow(): Promise<void> {
   }
   console.log(`  fingerprint cross-confirmed (${ownerFp.length} chars)  ✓`);
 
+  // verifyFingerprint auto-publishes an empty-secret roster snapshot
+  // to every paired peer (2 helpers + 1 replica) so the newly-Paired
+  // Destination receives the current state without an explicit
+  // ProtectSecret call. Drain that round here — the assertions below
+  // target the subsequent explicit publish.
+  const autoPublish = owner.transport.drain();
+  if (autoPublish.length !== 3) {
+    throw new Error(
+      `verifyFingerprint auto-publish must fan out to 2 helpers + 1 replica (v=1, empty secrets), got ${autoPublish.length}`,
+    );
+  }
+
   // 4. ProtectSecret across both helpers + the destination. Three
   //    envelopes leave the owner: two VSS shares (one per helper) and
   //    one ReplicaSecretPayload composite (for the destination).
@@ -1244,13 +1257,14 @@ async function runReplicaPairingAndVaultSyncFlow(): Promise<void> {
   helperB.transport.drain();
 
   // Vault version updates: the owner mutates the secret and re-runs
-  // `ProtectSecret`; the destination must receive a fresh
-  // `ReplicaVaultReceived` carrying `version=2` and the new payload.
-  // The protocol auto-increments via `IShareStore.latestVersion()`;
-  // the in-memory store exposes a side-channel setter so this test
-  // can drive that contract without first running a full owner-side
-  // store cycle.
-  owner.shareStore.setOwnerVersion(secretId.toString(), 1);
+  // `ProtectSecret`. Version progression is now anchored to
+  // `IUserSecretStore.loadLatest()` (the snapshot the previous
+  // round wrote), so each successful publish naturally bumps by 1.
+  //
+  // Sequence in this test:
+  //   v=1: verify_fingerprint auto-publish (already drained above)
+  //   v=2: first explicit ProtectSecret (the `received` round above)
+  //   v=3: this second explicit ProtectSecret
   const secretDataV2 = new TextEncoder().encode("vault-payload-after-update");
   await owner.protocol.start(FlowKind.ProtectSecret, {
     secrets: [{ id: new Uint8Array([0x01]), name: "shared-vault", data: secretDataV2 }],
@@ -1274,8 +1288,8 @@ async function runReplicaPairingAndVaultSyncFlow(): Promise<void> {
       `v2: destination did not emit ReplicaVaultReceived; got [${destEvents2.map((e) => e.type).join(", ")}]`,
     );
   }
-  if (received2.version !== 2) {
-    throw new Error(`v2: expected version=2, got ${received2.version}`);
+  if (received2.version !== 3) {
+    throw new Error(`v2: expected version=3, got ${received2.version}`);
   }
   const v2Data = received2.vault.secrets[0]?.data;
   if (
@@ -1515,6 +1529,372 @@ export async function runProtocolSmoke(): Promise<void> {
   await runReplyToFlow();
   await runReplicaIdWiringSadPathsFlow();
   await runReplicaPairingAndVaultSyncFlow();
+  await runReplicaSyncVersionProgressionFlow();
 
   console.log("━━━ [Protocol] All passed. ━━━\n");
+}
+
+/**
+ * Walks the canonical 0→8 sequence that proves the multi-device sync
+ * invariant: every roster change or user-secret update bumps the
+ * vault version, every paired Replica Destination receives the fresh
+ * snapshot, and Helpers only receive VSS shares once the threshold
+ * is met.
+ *
+ * 0. new()                                          → user_secret_store empty
+ * 1. pair replica A                                 → v=1, replicas=1
+ * 2. ProtectSecret([s1])                            → v=2, secrets=1
+ * 3. pair replica B (bootstrap with s1)             → v=3, replicas=2
+ * 4. pair helper #1 (below threshold)               → v=4, helpers=1
+ * 5. pair helper #2 (below threshold)               → v=5, helpers=2
+ * 6. ProtectSecret([s1, s2])                        → v=6, secrets=2
+ * 7. pair helper #3 (threshold met, VSS split)      → v=7, helpers=3 + shares
+ * 8. pair replica C (full bootstrap + fresh shares) → v=8, replicas=3 + shares
+ */
+async function runReplicaSyncVersionProgressionFlow(): Promise<void> {
+  console.log("\n=== [Protocol] Replica sync — version progression v0→v8 ===\n");
+
+  const VAULT_SECRET_ID = 0xABBAn;
+  const TH = 3;
+  const OWNER_URI = "https://owner.example.com";
+  const REPLICA_A_URI = "https://replica-a.example.com";
+  const REPLICA_B_URI = "https://replica-b.example.com";
+  const REPLICA_C_URI = "https://replica-c.example.com";
+  const HELPER_1_URI = "https://helper-1.example.com";
+  const HELPER_2_URI = "https://helper-2.example.com";
+  const HELPER_3_URI = "https://helper-3.example.com";
+
+  const owner = makeNode("Owner", OWNER_URI, {
+    secretId: VAULT_SECRET_ID,
+    threshold: TH,
+    replicaId: 0x0001n,
+  });
+  const replicaA = makeNode("ReplicaA", REPLICA_A_URI, {
+    secretId: VAULT_SECRET_ID,
+    threshold: TH,
+    replicaId: 0x000An,
+  });
+  const replicaB = makeNode("ReplicaB", REPLICA_B_URI, {
+    secretId: VAULT_SECRET_ID,
+    threshold: TH,
+    replicaId: 0x000Bn,
+  });
+  const replicaC = makeNode("ReplicaC", REPLICA_C_URI, {
+    secretId: VAULT_SECRET_ID,
+    threshold: TH,
+    replicaId: 0x000Cn,
+  });
+  const helper1 = makeNode("Helper1", HELPER_1_URI, {
+    secretId: VAULT_SECRET_ID,
+    threshold: TH,
+  });
+  const helper2 = makeNode("Helper2", HELPER_2_URI, {
+    secretId: VAULT_SECRET_ID,
+    threshold: TH,
+  });
+  const helper3 = makeNode("Helper3", HELPER_3_URI, {
+    secretId: VAULT_SECRET_ID,
+    threshold: TH,
+  });
+
+  const ownerEntry = { node: owner, uri: OWNER_URI };
+  const replicaAEntry = { node: replicaA, uri: REPLICA_A_URI };
+  const replicaBEntry = { node: replicaB, uri: REPLICA_B_URI };
+  const replicaCEntry = { node: replicaC, uri: REPLICA_C_URI };
+  const helper1Entry = { node: helper1, uri: HELPER_1_URI };
+  const helper2Entry = { node: helper2, uri: HELPER_2_URI };
+  const helper3Entry = { node: helper3, uri: HELPER_3_URI };
+  const replicaScope = [ownerEntry, replicaAEntry, replicaBEntry, replicaCEntry];
+  const allScope = [
+    ownerEntry,
+    replicaAEntry,
+    replicaBEntry,
+    replicaCEntry,
+    helper1Entry,
+    helper2Entry,
+    helper3Entry,
+  ];
+
+  const cidA = 1n;
+  const cidB = 3n;
+  const cidC = 8n;
+  const cidH1 = 11n;
+  const cidH2 = 12n;
+  const cidH3 = 13n;
+
+  // Step 0 — brand-new instance.
+  if ((await owner.userSecretStore.loadLatest(VAULT_SECRET_ID.toString())) !== null) {
+    throw new Error("step 0: brand-new instance must have no user_secrets snapshot");
+  }
+  console.log("  step 0: user_secret_store latest = null  ✓");
+
+  // Step 1 — pair replica A → v=1.
+  await pairReplicaHandshake(ownerEntry, replicaAEntry, cidA);
+  await crossConfirmFingerprintAt(ownerEntry, replicaAEntry, cidA);
+  let events = await pumpAll(replicaScope);
+  let recvA = findReplicaEvent(events, cidA);
+  if (!recvA) throw new Error("step 1: A must observe ReplicaVaultReceived");
+  if (recvA.version !== 1) throw new Error(`step 1: expected v=1, got ${recvA.version}`);
+  if (recvA.vault.helpers.length !== 0) throw new Error("step 1: helpers must be empty");
+  if (recvA.vault.secrets.length !== 0) throw new Error("step 1: secrets must be empty");
+  if (recvA.vault.replicas.length !== 1) throw new Error("step 1: replicas must be 1");
+  if (recvA.shares.length !== 0) throw new Error("step 1: shares must be empty");
+  await assertLatestVersion(owner, VAULT_SECRET_ID, 1);
+  console.log("  step 1: pair replica A → v=1, vault(h=0,s=0,r=1,shares=0)  ✓");
+
+  // Step 2 — ProtectSecret([s1]) → v=2.
+  const s1 = { id: new Uint8Array([0x01]), name: "secret-one", data: new TextEncoder().encode("first-user-secret") };
+  await owner.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [s1],
+    description: "v=2 explicit publish",
+  });
+  events = await pumpAll(replicaScope);
+  recvA = findReplicaEvent(events, cidA);
+  if (!recvA || recvA.version !== 2) {
+    throw new Error(`step 2: A must observe v=2, got ${recvA?.version}`);
+  }
+  const recvA2Secret = recvA.vault.secrets[0];
+  if (recvA.vault.secrets.length !== 1 || !recvA2Secret || !equalBytes(recvA2Secret.data, s1.data)) {
+    throw new Error("step 2: vault.secrets[0].data must equal s1");
+  }
+  if (recvA.vault.replicas.length !== 1) throw new Error("step 2: replicas must be 1");
+  if (recvA.shares.length !== 0) throw new Error("step 2: shares must be empty");
+  await assertLatestVersion(owner, VAULT_SECRET_ID, 2);
+  console.log("  step 2: ProtectSecret([s1]) → v=2, vault(h=0,s=1,r=1,shares=0)  ✓");
+
+  // Step 3 — pair replica B → v=3 (B bootstraps with s1).
+  await pairReplicaHandshake(ownerEntry, replicaBEntry, cidB);
+  await crossConfirmFingerprintAt(ownerEntry, replicaBEntry, cidB);
+  events = await pumpAll(replicaScope);
+  recvA = findReplicaEvent(events, cidA);
+  const recvB = findReplicaEvent(events, cidB);
+  if (!recvA || recvA.version !== 3) throw new Error(`step 3: A must observe v=3`);
+  if (!recvB || recvB.version !== 3) throw new Error(`step 3: B must observe v=3 (bootstrap)`);
+  for (const [label, recv] of [["A", recvA], ["B", recvB]] as const) {
+    if (recv.vault.helpers.length !== 0) throw new Error(`step 3 ${label}: helpers must be empty`);
+    const secret = recv.vault.secrets[0];
+    if (recv.vault.secrets.length !== 1 || !secret || !equalBytes(secret.data, s1.data)) {
+      throw new Error(`step 3 ${label}: vault must still carry s1`);
+    }
+    if (recv.vault.replicas.length !== 2) throw new Error(`step 3 ${label}: replicas must be 2`);
+    if (recv.shares.length !== 0) throw new Error(`step 3 ${label}: shares must be empty`);
+  }
+  await assertLatestVersion(owner, VAULT_SECRET_ID, 3);
+  console.log("  step 3: pair replica B → v=3, vault(h=0,s=1,r=2,shares=0) on A+B  ✓");
+
+  // Step 4 — pair helper #1 → v=4 (below threshold).
+  await helperStartPairAt(ownerEntry, helper1Entry, cidH1);
+  events = await pumpAll(allScope);
+  if (events.some((e) => e.type === "ShareStored")) {
+    throw new Error("step 4: no helper may store a share (1 < threshold 3)");
+  }
+  for (const [label, cid] of [["A", cidA], ["B", cidB]] as const) {
+    const r = findReplicaEvent(events, cid);
+    if (!r || r.version !== 4) throw new Error(`step 4 ${label}: must observe v=4`);
+    if (r.vault.helpers.length !== 1) throw new Error(`step 4 ${label}: helpers must be 1`);
+    if (r.vault.secrets.length !== 1) throw new Error(`step 4 ${label}: secrets must be 1`);
+    if (r.vault.replicas.length !== 2) throw new Error(`step 4 ${label}: replicas must be 2`);
+    if (r.shares.length !== 0) throw new Error(`step 4 ${label}: shares must be empty`);
+  }
+  await assertLatestVersion(owner, VAULT_SECRET_ID, 4);
+  console.log("  step 4: pair helper #1 → v=4, vault(h=1,s=1,r=2,shares=0)  ✓");
+
+  // Step 5 — pair helper #2 → v=5.
+  await helperStartPairAt(ownerEntry, helper2Entry, cidH2);
+  events = await pumpAll(allScope);
+  if (events.some((e) => e.type === "ShareStored")) {
+    throw new Error("step 5: still below threshold");
+  }
+  const r5b = findReplicaEvent(events, cidB);
+  if (!r5b || r5b.version !== 5) throw new Error(`step 5: B must observe v=5`);
+  if (r5b.vault.helpers.length !== 2) throw new Error("step 5: helpers must be 2");
+  if (r5b.shares.length !== 0) throw new Error("step 5: shares must be empty");
+  if (!findReplicaEvent(events, cidA)) throw new Error("step 5: A must observe v=5");
+  await assertLatestVersion(owner, VAULT_SECRET_ID, 5);
+  console.log("  step 5: pair helper #2 → v=5, vault(h=2,s=1,r=2,shares=0)  ✓");
+
+  // Step 6 — ProtectSecret([s1, s2]) → v=6.
+  const s2 = { id: new Uint8Array([0x02]), name: "secret-two", data: new TextEncoder().encode("second-user-secret") };
+  await owner.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [s1, s2],
+    description: "v=6 explicit publish",
+  });
+  events = await pumpAll(allScope);
+  if (events.some((e) => e.type === "ShareStored")) {
+    throw new Error("step 6: still below threshold");
+  }
+  recvA = findReplicaEvent(events, cidA);
+  if (!recvA || recvA.version !== 6) throw new Error(`step 6: A must observe v=6`);
+  if (recvA.vault.secrets.length !== 2) throw new Error("step 6: secrets must be 2");
+  if (!recvA.vault.secrets.some((u) => equalBytes(u.data, s1.data))) {
+    throw new Error("step 6: vault must contain s1");
+  }
+  if (!recvA.vault.secrets.some((u) => equalBytes(u.data, s2.data))) {
+    throw new Error("step 6: vault must contain s2");
+  }
+  if (recvA.vault.helpers.length !== 2) throw new Error("step 6: helpers must be 2");
+  if (recvA.shares.length !== 0) throw new Error("step 6: shares must be empty");
+  if (!findReplicaEvent(events, cidB)) throw new Error("step 6: B must observe v=6");
+  await assertLatestVersion(owner, VAULT_SECRET_ID, 6);
+  console.log("  step 6: ProtectSecret([s1, s2]) → v=6, vault(h=2,s=2,r=2,shares=0)  ✓");
+
+  // Step 7 — pair helper #3 → v=7, threshold met, VSS split runs.
+  await helperStartPairAt(ownerEntry, helper3Entry, cidH3);
+  events = await pumpAll(allScope);
+  for (const [label, cid] of [["helper-1", cidH1], ["helper-2", cidH2], ["helper-3", cidH3]] as const) {
+    const stored = events.some(
+      (e) => e.type === "ShareStored" && BigInt(e.channel_id) === cid && e.version === 7,
+    );
+    if (!stored) throw new Error(`step 7: ${label} must emit ShareStored at v=7`);
+  }
+  for (const [label, cid] of [["A", cidA], ["B", cidB]] as const) {
+    const r = findReplicaEvent(events, cid);
+    if (!r || r.version !== 7) throw new Error(`step 7 ${label}: must observe v=7`);
+    if (r.vault.helpers.length !== 3) throw new Error(`step 7 ${label}: helpers must be 3`);
+    if (r.vault.secrets.length !== 2) throw new Error(`step 7 ${label}: secrets must be 2`);
+    if (r.vault.replicas.length !== 2) throw new Error(`step 7 ${label}: replicas must be 2`);
+    if (r.shares.length !== 3) throw new Error(`step 7 ${label}: shares must be 3`);
+  }
+  await assertLatestVersion(owner, VAULT_SECRET_ID, 7);
+  console.log("  step 7: pair helper #3 → v=7, vault(h=3,s=2,r=2,shares=3); all 3 helpers ShareStored  ✓");
+
+  // Step 8 — pair replica C → v=8, full bootstrap + fresh helper VSS.
+  await pairReplicaHandshake(ownerEntry, replicaCEntry, cidC);
+  await crossConfirmFingerprintAt(ownerEntry, replicaCEntry, cidC);
+  events = await pumpAll(allScope);
+  for (const [label, cid] of [["helper-1", cidH1], ["helper-2", cidH2], ["helper-3", cidH3]] as const) {
+    const stored = events.some(
+      (e) => e.type === "ShareStored" && BigInt(e.channel_id) === cid && e.version === 8,
+    );
+    if (!stored) throw new Error(`step 8: ${label} must emit ShareStored at v=8`);
+  }
+  const recvC = findReplicaEvent(events, cidC);
+  if (!recvC || recvC.version !== 8) throw new Error(`step 8: C must observe v=8`);
+  if (recvC.vault.helpers.length !== 3) throw new Error("step 8 C: helpers must be 3");
+  if (recvC.vault.secrets.length !== 2) throw new Error("step 8 C: secrets must be 2");
+  if (recvC.vault.replicas.length !== 3) throw new Error("step 8 C: replicas must be 3");
+  if (recvC.shares.length !== 3) throw new Error("step 8 C: shares must be 3");
+  for (const [label, cid] of [["A", cidA], ["B", cidB]] as const) {
+    const r = findReplicaEvent(events, cid);
+    if (!r || r.version !== 8) throw new Error(`step 8 ${label}: must observe v=8`);
+    if (r.vault.replicas.length !== 3) throw new Error(`step 8 ${label}: replicas must be 3`);
+  }
+  await assertLatestVersion(owner, VAULT_SECRET_ID, 8);
+  console.log("  step 8: pair replica C → v=8, vault(h=3,s=2,r=3,shares=3) on A+B+C; all helpers refreshed  ✓");
+
+  console.log("\n✓ Replica sync version progression flow passed.");
+}
+
+async function assertLatestVersion(owner: Node, secretId: bigint, expected: number) {
+  const snapshot = await owner.userSecretStore.loadLatest(secretId.toString());
+  if (!snapshot || snapshot.version !== expected) {
+    throw new Error(
+      `expected user_secret_store version=${expected}, got ${snapshot?.version}`,
+    );
+  }
+}
+
+async function pairReplicaHandshake(
+  owner: AddressedNode,
+  replica: AddressedNode,
+  channelId: bigint,
+) {
+  const contact = await owner.node.protocol.createContact(
+    channelId,
+    ContactMode.InlineKeys,
+  );
+  await replica.node.protocol.start(FlowKind.Pairing, {
+    kind: SenderKind.ReplicaDestination,
+    contact,
+  });
+  await pumpAll([owner, replica]);
+}
+
+async function crossConfirmFingerprint(owner: Node, replica: Node, channelId: bigint) {
+  const ownerFp = await owner.protocol.getFingerprint(channelId);
+  const replicaFp = await replica.protocol.getFingerprint(channelId);
+  if (ownerFp !== replicaFp) {
+    throw new Error(`fingerprint mismatch: owner=${ownerFp} replica=${replicaFp}`);
+  }
+  if (!(await owner.protocol.verifyFingerprint(channelId, replicaFp))) {
+    throw new Error("owner.verifyFingerprint must return true");
+  }
+  if (!(await replica.protocol.verifyFingerprint(channelId, ownerFp))) {
+    throw new Error("replica.verifyFingerprint must return true");
+  }
+}
+
+async function helperStartPair(owner: Node, helper: Node, channelId: bigint) {
+  const contact = await owner.protocol.createContact(channelId, ContactMode.InlineKeys);
+  await helper.protocol.start(FlowKind.Pairing, {
+    kind: SenderKind.Helper,
+    contact,
+  });
+}
+
+/** Convenience: pass `AddressedNode` so the test body reads uniformly. */
+async function crossConfirmFingerprintAt(
+  owner: AddressedNode,
+  replica: AddressedNode,
+  channelId: bigint,
+) {
+  await crossConfirmFingerprint(owner.node, replica.node, channelId);
+}
+
+async function helperStartPairAt(
+  owner: AddressedNode,
+  helper: AddressedNode,
+  channelId: bigint,
+) {
+  await helperStartPair(owner.node, helper.node, channelId);
+}
+
+/**
+ * Drain every node's outbox and route each message to whichever node
+ * owns the destination URI, recursing until the network goes silent.
+ * URIs must be unique across the input slice.
+ */
+type AddressedNode = { node: Node; uri: string };
+
+async function pumpAll(entries: AddressedNode[]): Promise<DeRecEvent[]> {
+  const collected: DeRecEvent[] = [];
+  for (;;) {
+    let progressed = false;
+    for (const src of entries) {
+      const messages = src.node.transport.drain();
+      for (const m of messages) {
+        const dest = entries.find((e) => e.uri === m.endpoint.uri);
+        if (!dest) {
+          throw new Error(
+            `pumpAll: no peer for destination uri ${m.endpoint.uri}`,
+          );
+        }
+        const events = await processAll(dest.node, m.message);
+        collected.push(...events);
+        progressed = true;
+      }
+    }
+    if (!progressed) return collected;
+  }
+}
+
+function findReplicaEvent(events: DeRecEvent[], channelId: bigint) {
+  for (const ev of events) {
+    if (ev.type === "ReplicaVaultReceived" && BigInt(ev.channel_id) === channelId) {
+      return {
+        version: ev.version,
+        vault: ev.vault,
+        shares: ev.shares,
+      };
+    }
+  }
+  return undefined;
+}
+
+function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
 }

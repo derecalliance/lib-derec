@@ -49,11 +49,13 @@ pub(in crate::protocol) async fn start<
     Ch: DeRecChannelStore,
     Sh: DeRecShareStore,
     Ss: DeRecSecretStore,
+    Us: crate::protocol::DeRecUserSecretStore,
     T: DeRecTransport,
 >(
     channel_store: &mut Ch,
     share_store: &mut Sh,
     secret_store: &mut Ss,
+    user_secret_store: &mut Us,
     transport: &T,
     secrets: Vec<UserSecret>,
     description: Option<String>,
@@ -73,13 +75,25 @@ pub(in crate::protocol) async fn start<
         return Ok(None);
     }
 
+    // Snapshot copies kept for the user_secret_store write at the end.
+    // Both arguments get moved into vault construction below.
+    let snapshot_secrets = secrets.clone();
+    let snapshot_description = description.clone();
+
     let secret_vault =
         build_secret_vault(&helpers, &replicas, secrets, owner_replica_id.unwrap_or(0));
     let derec_secret_bytes = wrap_for_helper_split(&secret_vault, threshold);
 
-    // Version is global across this round; one VSS split feeds both
-    // helper distribution and the composite payload sent to Destinations.
-    let version = share_store.latest_version(secret_id).await?.map_or(1, |v| v + 1);
+    // Version progression is anchored to `user_secret_store` so it
+    // bumps on every round — including roster-only auto-publishes to
+    // Replica Destinations, which never write to `share_store`. The
+    // snapshot saved at the end of this function is the source of
+    // truth that the next round reads.
+    let version = user_secret_store
+        .load_latest(secret_id)
+        .await?
+        .map(|s| s.version + 1)
+        .unwrap_or(1);
     let description = description.as_deref().unwrap_or("").to_owned();
 
     // VSS-split the DeRecSecret bytes once. The helper-distribution path
@@ -132,6 +146,20 @@ pub(in crate::protocol) async fn start<
         .await?;
         sent_channels.extend(replica_sent);
     }
+
+    // Persist the snapshot AFTER successful distribution so an
+    // interrupted round does not leave the version field ahead of
+    // what any peer actually received.
+    user_secret_store
+        .save_latest(
+            secret_id,
+            crate::protocol::types::UserSecrets {
+                version,
+                secrets: snapshot_secrets,
+                description: snapshot_description,
+            },
+        )
+        .await?;
 
     Ok(Some((version, sent_channels)))
 }

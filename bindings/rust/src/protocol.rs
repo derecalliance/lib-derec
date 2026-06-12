@@ -32,21 +32,18 @@ use derec_proto::{Protocol, SenderKind, TransportProtocol};
 /// override it explicitly via [`Peer::with_options`].
 const DEFAULT_TEST_SECRET_ID: u64 = 0xDE_2EC;
 
-pub fn run_all() {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("failed to build tokio runtime");
-
-    rt.block_on(run_pairing_flow());
-    rt.block_on(run_hashed_keys_pairing_flow());
-    rt.block_on(run_replica_id_wiring_flow());
-    rt.block_on(run_protect_secret_with_replica_targets_flow());
-    rt.block_on(run_sharing_flow());
-    rt.block_on(run_discovery_and_recovery_flow());
-    rt.block_on(run_unpairing_flow());
-    rt.block_on(run_update_channel_info_flow());
-    rt.block_on(run_reply_to_flow());
-    rt.block_on(run_auto_publish_on_pair_flow());
+pub async fn run_all() {
+    run_pairing_flow().await;
+    run_hashed_keys_pairing_flow().await;
+    run_replica_id_wiring_flow().await;
+    run_protect_secret_with_replica_targets_flow().await;
+    run_sharing_flow().await;
+    run_discovery_and_recovery_flow().await;
+    run_unpairing_flow().await;
+    run_update_channel_info_flow().await;
+    run_reply_to_flow().await;
+    run_auto_publish_on_pair_flow().await;
+    run_replica_sync_version_progression_flow().await;
 }
 
 
@@ -1184,6 +1181,19 @@ async fn run_protect_secret_with_replica_targets_flow() {
         "both sides must accept the matching fingerprint",
     );
 
+    // Owner's verify_fingerprint auto-publishes an empty-secret roster
+    // snapshot to every paired peer (the multi-device sync invariant —
+    // a newly-Paired Replica must observe the current state without
+    // waiting for the app to drive an explicit ProtectSecret). The
+    // assertions below target the explicit publish; drain the
+    // auto-publish round here so the outbox starts empty.
+    let auto_publish = owner.transport.drain();
+    assert_eq!(
+        auto_publish.len(),
+        3,
+        "verify_fingerprint auto-publish must fan out to 2 helpers + 1 replica (v=1, empty secrets)"
+    );
+
     // 3. Owner protects a secret targeting BOTH helpers and the replica.
     let secret_data = b"vault-payload-for-replica-and-helper".to_vec();
     owner
@@ -2186,4 +2196,443 @@ async fn run_auto_publish_on_pair_flow() {
     );
 
     println!("Protocol auto-publish-on-pair flow test passed.");
+}
+
+
+/// Walks the 0→8 version progression that proves the multi-device
+/// sync invariant: every roster change or user-secret update bumps
+/// the vault version, every paired Replica Destination receives the
+/// fresh snapshot, and Helpers only receive VSS shares once the
+/// threshold is met.
+///
+/// Sequence:
+/// ```text
+/// 0. new()                                          → latest = None
+/// 1. pair replica A                                 → v=1, replicas=1
+/// 2. ProtectSecret([s1])                            → v=2, secrets=1
+/// 3. pair replica B (bootstrap)                     → v=3, replicas=2
+/// 4. pair helper #1 (below threshold)               → v=4, helpers=1
+/// 5. pair helper #2 (below threshold)               → v=5, helpers=2
+/// 6. ProtectSecret([s1, s2])                        → v=6, secrets=2
+/// 7. pair helper #3 (threshold met, VSS split)      → v=7, helpers=3 + shares
+/// 8. pair replica C (full bootstrap + fresh shares) → v=8, replicas=3 + shares
+/// ```
+async fn run_replica_sync_version_progression_flow() {
+    println!("=== Protocol replica sync — version progression v0→v8 ===");
+
+    const VAULT_SECRET_ID: u64 = 0xABBA;
+    const THRESHOLD: usize = 3;
+    let owner_replica_id: u64 = 0x0001;
+    let replica_a_id: u64 = 0x000A;
+    let replica_b_id: u64 = 0x000B;
+    let replica_c_id: u64 = 0x000C;
+
+    let mut owner = Peer::with_options(
+        "owner",
+        "https://owner.example.com",
+        THRESHOLD,
+        false,
+        Some(owner_replica_id),
+        VAULT_SECRET_ID,
+    );
+    let mut replica_a = Peer::with_options(
+        "replica-a",
+        "https://replica-a.example.com",
+        THRESHOLD,
+        false,
+        Some(replica_a_id),
+        VAULT_SECRET_ID,
+    );
+    let mut replica_b = Peer::with_options(
+        "replica-b",
+        "https://replica-b.example.com",
+        THRESHOLD,
+        false,
+        Some(replica_b_id),
+        VAULT_SECRET_ID,
+    );
+    let mut replica_c = Peer::with_options(
+        "replica-c",
+        "https://replica-c.example.com",
+        THRESHOLD,
+        false,
+        Some(replica_c_id),
+        VAULT_SECRET_ID,
+    );
+    let mut helper_1 = Peer::with_options(
+        "helper-1",
+        "https://helper-1.example.com",
+        THRESHOLD,
+        false,
+        None,
+        VAULT_SECRET_ID,
+    );
+    let mut helper_2 = Peer::with_options(
+        "helper-2",
+        "https://helper-2.example.com",
+        THRESHOLD,
+        false,
+        None,
+        VAULT_SECRET_ID,
+    );
+    let mut helper_3 = Peer::with_options(
+        "helper-3",
+        "https://helper-3.example.com",
+        THRESHOLD,
+        false,
+        None,
+        VAULT_SECRET_ID,
+    );
+
+    // ── Step 0: brand-new instance ────────────────────────────────
+    assert!(
+        owner
+            .protocol
+            .user_secret_store
+            .load_latest(VAULT_SECRET_ID)
+            .await
+            .unwrap()
+            .is_none(),
+        "step 0: a brand-new instance has no published vault snapshot"
+    );
+    println!("  step 0: user_secret_store latest = None  ✓");
+
+    // ── Step 1: pair replica A → expect v=1 push to A ─────────────
+    // Channel ids for each peer relationship — fixed up front so the
+    // assertions can filter `ReplicaVaultReceived` events by channel id.
+    let cid_a = ChannelId(1);
+    let cid_b = ChannelId(3);
+    let cid_c = ChannelId(8);
+    let cid_h1 = ChannelId(11);
+    let cid_h2 = ChannelId(12);
+    let cid_h3 = ChannelId(13);
+
+    // Replica destinations need the handshake to land, then the
+    // fingerprint cross-confirmation, before the auto-publish fires.
+    pair_replica_handshake(&mut owner, &mut replica_a, cid_a).await;
+    cross_confirm_fingerprint(&mut owner, &mut replica_a, cid_a).await;
+    let events =
+        pump_many(&mut [&mut owner, &mut replica_a, &mut replica_b, &mut replica_c]).await;
+    let received = find_replica_event(&events, cid_a)
+        .expect("step 1: replica A must emit ReplicaVaultReceived");
+    assert_eq!(received.version, 1, "step 1: replica A must receive v=1");
+    assert_eq!(received.vault.helpers.len(), 0);
+    assert_eq!(received.vault.secrets.len(), 0);
+    assert_eq!(received.vault.replicas.len(), 1);
+    assert_eq!(received.shares.len(), 0);
+    assert_eq!(
+        owner
+            .protocol
+            .user_secret_store
+            .load_latest(VAULT_SECRET_ID)
+            .await
+            .unwrap()
+            .map(|s| s.version),
+        Some(1)
+    );
+    println!("  step 1: pair replica A → v=1, vault(h=0,s=0,r=1,shares=0)  ✓");
+
+    // ── Step 2: ProtectSecret([s1]) → expect v=2 push to A ────────
+    let s1 = UserSecret {
+        id: vec![0x01],
+        name: "secret-one".to_owned(),
+        data: b"first-user-secret".to_vec(),
+    };
+    owner
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![s1.clone()],
+            description: Some("v=2 explicit publish".to_owned()),
+        })
+        .await
+        .expect("ProtectSecret([s1]) failed");
+    let events =
+        pump_many(&mut [&mut owner, &mut replica_a, &mut replica_b, &mut replica_c]).await;
+    let received = find_replica_event(&events, cid_a)
+        .expect("step 2: replica A must emit ReplicaVaultReceived");
+    assert_eq!(received.version, 2);
+    assert_eq!(received.vault.helpers.len(), 0);
+    assert_eq!(received.vault.secrets.len(), 1);
+    assert_eq!(received.vault.secrets[0].data, s1.data);
+    assert_eq!(received.vault.replicas.len(), 1);
+    assert_eq!(received.shares.len(), 0);
+    println!("  step 2: ProtectSecret([s1]) → v=2, vault(h=0,s=1,r=1,shares=0)  ✓");
+
+    // ── Step 3: pair replica B → bootstrap; A also receives v=3 ───
+    pair_replica_handshake(&mut owner, &mut replica_b, cid_b).await;
+    cross_confirm_fingerprint(&mut owner, &mut replica_b, cid_b).await;
+    let events =
+        pump_many(&mut [&mut owner, &mut replica_a, &mut replica_b, &mut replica_c]).await;
+    let received_a =
+        find_replica_event(&events, cid_a).expect("step 3: A must observe v=3");
+    let received_b =
+        find_replica_event(&events, cid_b).expect("step 3: B must observe v=3 (bootstrap)");
+    for (label, received) in [("A", &received_a), ("B", &received_b)] {
+        assert_eq!(received.version, 3, "step 3: replica {label} receives v=3");
+        assert_eq!(received.vault.helpers.len(), 0);
+        assert_eq!(received.vault.secrets.len(), 1);
+        assert_eq!(received.vault.secrets[0].data, s1.data);
+        assert_eq!(received.vault.replicas.len(), 2);
+        assert_eq!(received.shares.len(), 0);
+    }
+    println!("  step 3: pair replica B → v=3, vault(h=0,s=1,r=2,shares=0) on A+B  ✓");
+
+    // ── Step 4: pair helper #1 → auto-publish v=4 (below threshold)
+    helper_start_pair(&mut owner, &mut helper_1, cid_h1).await;
+    let events = pump_many(&mut [
+        &mut owner,
+        &mut replica_a,
+        &mut replica_b,
+        &mut replica_c,
+        &mut helper_1,
+        &mut helper_2,
+        &mut helper_3,
+    ])
+    .await;
+    // helper-1 must not have stored anything (below threshold).
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            DeRecEvent::ShareStored { channel_id, .. } if *channel_id == cid_h1
+        )),
+        "step 4: helper-1 must not store a share (1 < threshold 3)"
+    );
+    for (label, cid) in [("A", cid_a), ("B", cid_b)] {
+        let received = find_replica_event(&events, cid)
+            .unwrap_or_else(|| panic!("step 4: replica {label} must observe v=4"));
+        assert_eq!(received.version, 4);
+        assert_eq!(received.vault.helpers.len(), 1);
+        assert_eq!(received.vault.secrets.len(), 1);
+        assert_eq!(received.vault.replicas.len(), 2);
+        assert_eq!(received.shares.len(), 0, "below threshold, no shares");
+    }
+    println!("  step 4: pair helper #1 → v=4, vault(h=1,s=1,r=2,shares=0)  ✓");
+
+    // ── Step 5: pair helper #2 → auto-publish v=5 ─────────────────
+    helper_start_pair(&mut owner, &mut helper_2, cid_h2).await;
+    let events = pump_many(&mut [
+        &mut owner,
+        &mut replica_a,
+        &mut replica_b,
+        &mut replica_c,
+        &mut helper_1,
+        &mut helper_2,
+        &mut helper_3,
+    ])
+    .await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, DeRecEvent::ShareStored { .. })),
+        "step 5: still below threshold, no helper stores a share"
+    );
+    let received_b =
+        find_replica_event(&events, cid_b).expect("step 5: B must observe v=5");
+    assert_eq!(received_b.version, 5);
+    assert_eq!(received_b.vault.helpers.len(), 2);
+    assert_eq!(received_b.shares.len(), 0);
+    let _ = find_replica_event(&events, cid_a).expect("step 5: A must observe v=5");
+    println!("  step 5: pair helper #2 → v=5, vault(h=2,s=1,r=2,shares=0)  ✓");
+
+    // ── Step 6: ProtectSecret([s1, s2]) → v=6 ─────────────────────
+    let s2 = UserSecret {
+        id: vec![0x02],
+        name: "secret-two".to_owned(),
+        data: b"second-user-secret".to_vec(),
+    };
+    owner
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![s1.clone(), s2.clone()],
+            description: Some("v=6 explicit publish".to_owned()),
+        })
+        .await
+        .expect("ProtectSecret([s1, s2]) failed");
+    let events = pump_many(&mut [
+        &mut owner,
+        &mut replica_a,
+        &mut replica_b,
+        &mut replica_c,
+        &mut helper_1,
+        &mut helper_2,
+        &mut helper_3,
+    ])
+    .await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, DeRecEvent::ShareStored { .. })),
+        "step 6: still below threshold, no helper stores a share"
+    );
+    let received_a = find_replica_event(&events, cid_a).expect("step 6: A must see v=6");
+    assert_eq!(received_a.version, 6);
+    assert_eq!(received_a.vault.secrets.len(), 2);
+    assert!(received_a.vault.secrets.iter().any(|us| us.data == s1.data));
+    assert!(received_a.vault.secrets.iter().any(|us| us.data == s2.data));
+    assert_eq!(received_a.vault.helpers.len(), 2);
+    assert_eq!(received_a.shares.len(), 0);
+    let _ = find_replica_event(&events, cid_b).expect("step 6: B must see v=6");
+    println!("  step 6: ProtectSecret([s1, s2]) → v=6, vault(h=2,s=2,r=2,shares=0)  ✓");
+
+    // ── Step 7: pair helper #3 → threshold met, VSS split ─────────
+    helper_start_pair(&mut owner, &mut helper_3, cid_h3).await;
+    let events = pump_many(&mut [
+        &mut owner,
+        &mut replica_a,
+        &mut replica_b,
+        &mut replica_c,
+        &mut helper_1,
+        &mut helper_2,
+        &mut helper_3,
+    ])
+    .await;
+    for (label, cid) in [("helper-1", cid_h1), ("helper-2", cid_h2), ("helper-3", cid_h3)] {
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                DeRecEvent::ShareStored { channel_id, version: 7 } if *channel_id == cid
+            )),
+            "step 7: {label} must emit ShareStored at v=7"
+        );
+    }
+    for (label, cid) in [("A", cid_a), ("B", cid_b)] {
+        let received = find_replica_event(&events, cid)
+            .unwrap_or_else(|| panic!("step 7: replica {label} must observe v=7"));
+        assert_eq!(received.version, 7);
+        assert_eq!(received.vault.helpers.len(), 3);
+        assert_eq!(received.vault.secrets.len(), 2);
+        assert_eq!(received.vault.replicas.len(), 2);
+        assert_eq!(received.shares.len(), 3, "threshold met → 3 helper shares");
+    }
+    println!("  step 7: pair helper #3 → v=7, vault(h=3,s=2,r=2,shares=3); all 3 helpers ShareStored  ✓");
+
+    // ── Step 8: pair replica C → full bootstrap + fresh helper VSS ─
+    pair_replica_handshake(&mut owner, &mut replica_c, cid_c).await;
+    cross_confirm_fingerprint(&mut owner, &mut replica_c, cid_c).await;
+    let events = pump_many(&mut [
+        &mut owner,
+        &mut replica_a,
+        &mut replica_b,
+        &mut replica_c,
+        &mut helper_1,
+        &mut helper_2,
+        &mut helper_3,
+    ])
+    .await;
+    for (label, cid) in [("helper-1", cid_h1), ("helper-2", cid_h2), ("helper-3", cid_h3)] {
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                DeRecEvent::ShareStored { channel_id, version: 8 } if *channel_id == cid
+            )),
+            "step 8: {label} must emit ShareStored at v=8 (fresh VSS round)"
+        );
+    }
+    let received_c =
+        find_replica_event(&events, cid_c).expect("step 8: replica C must observe v=8");
+    assert_eq!(received_c.version, 8);
+    assert_eq!(received_c.vault.helpers.len(), 3);
+    assert_eq!(received_c.vault.secrets.len(), 2);
+    assert_eq!(received_c.vault.replicas.len(), 3);
+    assert_eq!(received_c.shares.len(), 3);
+    for (label, cid) in [("A", cid_a), ("B", cid_b)] {
+        let received = find_replica_event(&events, cid)
+            .unwrap_or_else(|| panic!("step 8: replica {label} must observe v=8"));
+        assert_eq!(received.version, 8);
+        assert_eq!(received.vault.replicas.len(), 3);
+    }
+    println!(
+        "  step 8: pair replica C → v=8, vault(h=3,s=2,r=3,shares=3) on A+B+C; all helpers refreshed  ✓"
+    );
+
+    println!("Protocol replica sync version progression flow test passed.");
+}
+
+
+/// Drive only the cryptographic pair handshake between an Owner and
+/// a ReplicaDestination. Stops at the `Pending` state — the caller
+/// must call `cross_confirm_fingerprint` afterwards to trigger the
+/// auto-publish on the Pending→Paired transition.
+async fn pair_replica_handshake(owner: &mut Peer, replica: &mut Peer, channel_id: ChannelId) {
+    let contact = owner
+        .protocol
+        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys)
+        .await
+        .expect("owner.create_contact failed");
+    replica
+        .protocol
+        .start(DeRecFlow::Pairing {
+            kind: SenderKind::ReplicaDestination,
+            contact,
+            peer_communication_info: std::collections::HashMap::new(),
+        })
+        .await
+        .expect("replica start(Pairing, ReplicaDestination) failed");
+    let _ = pump(replica, owner).await;
+    let _ = pump(owner, replica).await;
+}
+
+async fn cross_confirm_fingerprint(owner: &mut Peer, replica: &mut Peer, channel_id: ChannelId) {
+    let owner_fp = owner.protocol.get_fingerprint(channel_id).await.unwrap();
+    let replica_fp = replica.protocol.get_fingerprint(channel_id).await.unwrap();
+    assert_eq!(owner_fp, replica_fp);
+    let ok_o = owner
+        .protocol
+        .verify_fingerprint(channel_id, &replica_fp)
+        .await
+        .unwrap();
+    let ok_r = replica
+        .protocol
+        .verify_fingerprint(channel_id, &owner_fp)
+        .await
+        .unwrap();
+    assert!(ok_o && ok_r, "cross-fingerprint verification must succeed");
+}
+
+/// Drive only the helper-side `start(Pairing { kind: Helper })`. The
+/// surrounding `pump_many` (called after this) actually delivers the
+/// PairRequest to the owner and routes everything to quiescence,
+/// including the auto-publish fan-out to any paired Replicas.
+async fn helper_start_pair(owner: &mut Peer, helper: &mut Peer, channel_id: ChannelId) {
+    let contact = owner
+        .protocol
+        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys)
+        .await
+        .expect("owner.create_contact failed");
+    helper
+        .protocol
+        .start(DeRecFlow::Pairing {
+            kind: SenderKind::Helper,
+            contact,
+            peer_communication_info: std::collections::HashMap::new(),
+        })
+        .await
+        .expect("helper start(Pairing) failed");
+}
+
+#[derive(Debug)]
+struct ReceivedVault {
+    version: u32,
+    vault: derec_library::protocol::types::SecretContainer,
+    shares: Vec<derec_library::protocol::types::ChannelShare>,
+}
+
+/// Look up the `ReplicaVaultReceived` event for the channel id and
+/// return a typed view of its fields. Returns `None` if no event for
+/// that channel was emitted in this pump.
+fn find_replica_event(events: &[DeRecEvent], channel_id: ChannelId) -> Option<ReceivedVault> {
+    events.iter().find_map(|e| match e {
+        DeRecEvent::ReplicaVaultReceived {
+            channel_id: cid,
+            version,
+            vault,
+            shares,
+            ..
+        } if *cid == channel_id => Some(ReceivedVault {
+            version: *version,
+            vault: vault.clone(),
+            shares: shares.clone(),
+        }),
+        _ => None,
+    })
 }
