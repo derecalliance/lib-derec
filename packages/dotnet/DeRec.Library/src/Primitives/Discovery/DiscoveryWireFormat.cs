@@ -53,16 +53,48 @@ public static partial class Discovery
             return stream.ToArray();
         }
 
+        // Minimum on-wire size of a `SecretVersionEntry` body: u64
+        // secret_id + u32 versions_count + zero versions = 12 bytes.
+        private const int MinSecretVersionEntryBytes = 12;
+        // Minimum on-wire size of a `VersionEntry` body: u32 version
+        // + u32 desc_len + zero-length description = 8 bytes.
+        private const int MinVersionEntryBytes = 8;
+
         internal static List<SecretVersionEntry> Deserialize(byte[] bytes)
         {
             int offset = 0;
             uint count = ReadU32(bytes, ref offset);
+
+            // The `count` prefix is attacker-controlled (the bytes
+            // originate from a remote peer over the discovery
+            // response). Reject impossibly large values before they
+            // reach `List<>`'s capacity argument; otherwise a 4-byte
+            // payload with count = 0x7FFFFFFF would attempt a
+            // multi-GB pre-allocation, or count > int.MaxValue would
+            // wrap negative and surface an ArgumentOutOfRangeException
+            // instead of our intended parse failure.
+            int remaining = bytes.Length - offset;
+            if (count > (uint)(remaining / MinSecretVersionEntryBytes))
+            {
+                throw new InvalidOperationException(
+                    $"Secret list count={count} exceeds the maximum possible for {remaining} remaining bytes (min {MinSecretVersionEntryBytes}B per entry).");
+            }
+
             var entries = new List<SecretVersionEntry>((int)count);
 
             for (uint i = 0; i < count; i++)
             {
                 ulong secretId = ReadU64(bytes, ref offset);
                 uint versionsCount = ReadU32(bytes, ref offset);
+
+                // Same bound applied to the per-secret versions list.
+                int remainingForVersions = bytes.Length - offset;
+                if (versionsCount > (uint)(remainingForVersions / MinVersionEntryBytes))
+                {
+                    throw new InvalidOperationException(
+                        $"Versions count={versionsCount} for secret_id={secretId} exceeds the maximum possible for {remainingForVersions} remaining bytes (min {MinVersionEntryBytes}B per entry).");
+                }
+
                 var versions = new List<VersionEntry>((int)versionsCount);
 
                 for (uint v = 0; v < versionsCount; v++)
