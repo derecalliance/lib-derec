@@ -190,19 +190,41 @@ pub(crate) fn from_lib_error(err: crate::Error) -> DeRecError {
     }
 }
 
-/// Releases the owned strings carried by a [`DeRecError`]. No-op when both
-/// pointers are null.
+/// Releases the owned strings carried by a [`DeRecError`]. After
+/// returning, `error.message` and `error.peer_memo` are both null —
+/// an accidental second call is a safe no-op.
 ///
 /// # Safety
 ///
-/// `error` must have been returned by the DeRec SDK and not previously freed.
+/// `error` must either be null (in which case this function is a
+/// no-op) or point to a fully-initialized [`DeRecError`] produced by
+/// the DeRec SDK. The function takes the value by pointer so it can
+/// null out `message` and `peer_memo` after freeing them, neutralizing
+/// the obvious double-free vector that a by-value signature creates
+/// — callers that re-invoke `derec_free_error` on the same struct
+/// then see a null-pointer no-op instead of corrupting the heap.
 #[unsafe(no_mangle)]
-pub extern "C" fn derec_free_error(error: DeRecError) {
+pub unsafe extern "C" fn derec_free_error(error: *mut DeRecError) {
+    if error.is_null() {
+        return;
+    }
+    // SAFETY: the caller's contract requires `error` to point to a
+    // fully-initialized `DeRecError`; we reborrow it mutably so the
+    // pointer-nulling step below propagates back to the caller's
+    // struct.
+    let error = unsafe { &mut *error };
     if !error.message.is_null() {
-        unsafe { drop(CString::from_raw(error.message)) };
+        let message = std::mem::replace(&mut error.message, std::ptr::null_mut());
+        // SAFETY: `message` was produced by `CString::into_raw` in
+        // `to_owned_cstring`. We swapped in null above so even if a
+        // future caller invokes us again on the same struct, the
+        // null check above prevents a second `from_raw`.
+        unsafe { drop(CString::from_raw(message)) };
     }
     if !error.peer_memo.is_null() {
-        unsafe { drop(CString::from_raw(error.peer_memo)) };
+        let peer_memo = std::mem::replace(&mut error.peer_memo, std::ptr::null_mut());
+        // SAFETY: same as `message`.
+        unsafe { drop(CString::from_raw(peer_memo)) };
     }
 }
 

@@ -75,7 +75,7 @@ internal static class Utils
         if (error.Category == DeRecCategory.Ok)
         {
             // Success: there are no owned strings, but we still call free for safety.
-            Native.Utils.derec_free_error(error);
+            Native.Utils.derec_free_error(ref error);
             return;
         }
 
@@ -97,7 +97,7 @@ internal static class Utils
             got: error.Got
         );
 
-        Native.Utils.derec_free_error(error);
+        Native.Utils.derec_free_error(ref error);
         throw ex;
     }
 
