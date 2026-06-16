@@ -311,8 +311,21 @@ pub unsafe extern "C" fn derec_protocol_new(
 ///
 /// # Safety
 ///
-/// `handle` must be a pointer previously returned by [`derec_protocol_new`]
-/// and must not have been freed already.
+/// `handle` must satisfy ALL of:
+///
+/// - It is a pointer previously returned by [`derec_protocol_new`], or
+///   it is null.
+/// - It has not already been freed (no double-free).
+/// - **No other thread is executing any `derec_protocol_*` function on
+///   this handle while this call is in flight.** The interior
+///   [`std::sync::Mutex`] protects against aliased `&mut` references
+///   *within* the live allocation, but it cannot protect the
+///   allocation itself from being dropped — a concurrent
+///   `derec_protocol_process` / `accept` / `set_*` call that holds
+///   the lock would be reading freed memory the moment this function
+///   returns. Host bindings (.NET `Dispose`, Node.js / WASM
+///   teardown) are responsible for draining or cancelling in-flight
+///   calls before invoking `derec_protocol_free`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn derec_protocol_free(handle: *mut DeRecProtocolHandle) {
     if handle.is_null() {
