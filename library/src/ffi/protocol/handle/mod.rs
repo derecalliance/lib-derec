@@ -22,7 +22,6 @@ use crate::ffi::protocol::stores::{
     TransportCallbacks, UserSecretStoreCallbacks,
 };
 use crate::protocol::DeRecProtocolBuilder;
-use derec_proto::TransportProtocol;
 
 mod config;
 mod flow;
@@ -66,6 +65,26 @@ impl DeRecProtocolHandle {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+/// Validate a `(uri, protocol)` pair at the FFI boundary using the
+/// library-level [`crate::transport::validate`] rules. Errors are
+/// surfaced through [`crate::ffi::error::from_lib_error`] so the
+/// host sees the same `DEREC_CODE_TRANSPORT_INVALID` regardless of
+/// whether the validator fired from the FFI entry point or from a
+/// wire-decode path inside the protocol.
+pub(super) fn validate_transport(
+    uri: &str,
+    protocol: i32,
+) -> Result<crate::transport::TransportProtocol, DeRecError> {
+    let proto = derec_proto::TransportProtocol {
+        uri: uri.to_owned(),
+        protocol,
+    };
+    // `TryFrom` runs both the enum-discriminant check and the URI
+    // structural validation; a single `?` covers both.
+    crate::transport::TransportProtocol::try_from(&proto)
+        .map_err(|e| crate::ffi::error::from_lib_error(crate::Error::Transport(e)))
 }
 
 /// Result type for [`derec_protocol_new`].
@@ -158,9 +177,25 @@ pub unsafe extern "C" fn derec_protocol_new(
         }
     };
 
-    let own_transport = TransportProtocol {
-        uri: own_uri,
-        protocol: own_transport_protocol,
+    // Empty URI is the deferred-config path: the caller will call
+    // `derec_protocol_set_own_transport` later, at which point
+    // validation runs unconditionally. Non-empty URIs are validated
+    // here so the protocol can't be constructed with a malformed or
+    // downgraded endpoint that would then be propagated to peers
+    // via pairing.
+    let own_transport: crate::transport::TransportProtocol = if own_uri.is_empty() {
+        // Sentinel deferred-config value. The empty URI will be
+        // rejected by the validator the next time the protocol
+        // actually needs to use it (e.g. on the first pair attempt).
+        crate::transport::TransportProtocol::new(
+            String::new(),
+            derec_proto::Protocol::Https,
+        )
+    } else {
+        match validate_transport(&own_uri, own_transport_protocol) {
+            Ok(tp) => tp,
+            Err(e) => return e.into(),
+        }
     };
 
     let info: HashMap<String, String> = if communication_info_len == 0 {

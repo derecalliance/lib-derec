@@ -85,10 +85,7 @@ impl Peer {
             .with_secret_store(secret_store)
             .with_user_secret_store(user_secret_store)
             .with_transport(transport.clone())
-            .with_own_transport(TransportProtocol {
-                uri: uri.to_owned(),
-                protocol: Protocol::Https.into(),
-            })
+            .with_own_transport(uri)
             .with_threshold(options.threshold);
         if let Some(rid) = options.replica_id {
             builder = builder.with_replica_id(rid);

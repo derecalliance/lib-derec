@@ -337,10 +337,17 @@ impl DeRecProtocolBuilderWasm {
             .own_transport_protocol_num
             .ok_or_else(|| js_error("BUILDER_MISSING", "withOwnTransport is required"))?;
 
-        let own_transport = TransportProtocol {
+        let proto_tp = TransportProtocol {
             uri: own_transport_uri,
             protocol: own_transport_protocol,
         };
+        // Library-level structural + scheme/protocol validation —
+        // `TryFrom` runs both the enum-discriminant check and the
+        // URI rules in a single step. Catches plaintext downgrades
+        // and unknown enums before the value can be propagated to
+        // peers via pairing or UpdateChannelInfo.
+        let own_transport = crate::transport::TransportProtocol::try_from(&proto_tp)
+            .map_err(|e| js_error("INVALID_OWN_TRANSPORT", e.to_string()))?;
 
         let mut builder = DeRecProtocolBuilder::new(self.secret_id)
             .with_channel_store(JsChannelStore(channel_store))
@@ -456,10 +463,15 @@ impl DeRecProtocolWasm {
                 ));
             }
         };
-        self.inner.set_own_transport(TransportProtocol {
+        let proto_tp = TransportProtocol {
             uri,
             protocol: protocol_num,
-        });
+        };
+        // Validation runs through the typed `TryFrom` so scheme +
+        // enum mismatches are rejected before the URI is stored.
+        let lib_tp = crate::transport::TransportProtocol::try_from(&proto_tp)
+            .map_err(|e| js_error("INVALID_OWN_TRANSPORT", e.to_string()))?;
+        self.inner.set_own_transport(lib_tp.uri);
         Ok(())
     }
 

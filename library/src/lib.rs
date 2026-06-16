@@ -59,6 +59,7 @@ pub mod derec_message;
 pub mod primitives;
 pub mod protocol;
 pub mod protocol_version;
+pub mod transport;
 pub mod types;
 mod utils;
 

@@ -136,6 +136,13 @@ pub const DEREC_CODE_FFI_INVALID_ENUM: i32 = 104;
 pub const DEREC_CODE_FFI_BAD_SHARED_KEY: i32 = 105;
 pub const DEREC_CODE_FFI_NUL_IN_STRING: i32 = 106;
 
+/// Transport URI/protocol pair failed [`crate::transport::validate`]:
+/// length cap, control character, unknown protocol discriminant, or
+/// URI scheme that doesn't match the declared `Protocol`. Surfaced
+/// as [`DEREC_CATEGORY_INVALID_INPUT`]. The
+/// [`DeRecError::message`](DeRecError) carries the specific reason.
+pub const DEREC_CODE_TRANSPORT_INVALID: i32 = 120;
+
 pub(crate) fn success() -> DeRecError {
     DeRecError {
         category: DEREC_CATEGORY_OK,
@@ -249,6 +256,7 @@ fn categorize(err: &crate::Error) -> (i32, i32) {
         }
         crate::Error::ChannelStore(_) => (DEREC_CATEGORY_CHANNEL_STORE, DEREC_CODE_STORE_ERROR),
         crate::Error::ShareStore(_) => (DEREC_CATEGORY_SHARE_STORE, DEREC_CODE_STORE_ERROR),
+        crate::Error::Transport(_) => (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_TRANSPORT_INVALID),
         crate::Error::InvalidInput(_) => (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_INVALID_INPUT),
         crate::Error::ProtobufDecode(_) => (DEREC_CATEGORY_PROTOBUF, DEREC_CODE_PROTOBUF_DECODE),
         crate::Error::ProtobufEncode(_) => (DEREC_CATEGORY_PROTOBUF, DEREC_CODE_PROTOBUF_ENCODE),

@@ -470,10 +470,7 @@ impl Peer {
             .with_secret_store(InMemorySecretStore::default())
             .with_user_secret_store(InMemoryUserSecretStore::default())
             .with_transport(transport.clone())
-            .with_own_transport(TransportProtocol {
-                uri: uri.to_owned(),
-                protocol: Protocol::Https.into(),
-            })
+            .with_own_transport(uri)
             .with_threshold(threshold)
             .with_auto_reply_to(auto_reply_to);
         if let Some(id) = replica_id {
@@ -1918,10 +1915,7 @@ async fn run_update_channel_info_flow() {
     .collect();
 
     owner.protocol.set_communication_info(new_info.clone());
-    owner.protocol.set_own_transport(TransportProtocol {
-        uri: new_uri.clone(),
-        protocol: Protocol::Https.into(),
-    });
+    owner.protocol.set_own_transport(new_uri.clone());
     // Simulate "the new endpoint is up before the update is sent" — the
     // pump dispatches by `Peer::uri`, so this is the in-memory equivalent
     // of starting to listen on the new URI.

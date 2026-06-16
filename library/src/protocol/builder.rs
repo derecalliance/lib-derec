@@ -476,10 +476,14 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, Transport>
     /// The local node's transport endpoint that peers will use to reach it.
     ///
     /// Embedded into outgoing contact and pairing messages so peers know
-    /// where to send their replies.
+    /// where to send their replies. Accepts any value convertible to
+    /// [`crate::transport::TransportProtocol`] — call sites can pass a
+    /// `&str` (defaults the protocol to `HTTPS`) or build the typed
+    /// value explicitly with
+    /// [`crate::transport::TransportProtocol::new`].
     pub fn with_own_transport(
         self,
-        own_transport: TransportProtocol,
+        own_transport: impl Into<crate::transport::TransportProtocol>,
     ) -> DeRecProtocolBuilder<
         ChannelStore,
         ShareStore,
@@ -488,6 +492,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, Transport>
         Transport,
         BuilderSlotSetMarker<TransportProtocol>,
     > {
+        let own_transport: TransportProtocol = own_transport.into().into();
         DeRecProtocolBuilder {
             secret_id: self.secret_id,
             channel_store: self.channel_store,

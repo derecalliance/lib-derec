@@ -149,6 +149,13 @@ pub(in crate::protocol) async fn accept<Ch: DeRecChannelStore, T: DeRecTransport
         channel.communication_info = extract_communication_info(ci);
     }
     if let Some(tp) = request.transport_protocol.clone() {
+        // Reject peer-supplied endpoints that don't pass library
+        // structural rules (scheme/protocol mismatch, unknown enum
+        // discriminant, oversized URI, control characters). Without
+        // this, a paired peer could persistently redirect channel
+        // traffic to a plaintext or attacker-controlled URI via a
+        // single `UpdateChannelInfo` request.
+        let _ = crate::transport::TransportProtocol::try_from(&tp)?;
         channel.transport = tp;
     }
 

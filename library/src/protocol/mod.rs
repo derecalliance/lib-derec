@@ -344,8 +344,21 @@ impl<
     ///
     /// Failing to keep both endpoints reachable during this window will
     /// cause messages to be lost.
-    pub fn set_own_transport(&mut self, transport: TransportProtocol) {
-        self.own_transport = transport;
+    /// Set the local node's transport endpoint URI.
+    ///
+    /// Accepts any string-like input — `&str`, `String`,
+    /// `Cow<str>`, anything else with [`Into<String>`] — for
+    /// flexibility at call sites that just have a URI in hand. The
+    /// protocol discriminant defaults to [`derec_proto::Protocol::Https`]
+    /// (currently the only defined variant). The wire-level
+    /// validation that runs at the FFI/WASM boundaries still
+    /// rejects mismatched schemes before reaching this setter, so
+    /// even though this method itself is infallible, an upstream
+    /// caller that builds via the FFI / WASM entry points still
+    /// gets the scheme/protocol consistency check.
+    pub fn set_own_transport(&mut self, uri: impl Into<String>) {
+        let tp = crate::transport::TransportProtocol::from(uri.into());
+        self.own_transport = tp.into();
     }
 
     /// Unified entry point for initiating any protocol flow.

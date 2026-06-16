@@ -775,6 +775,14 @@ fn extract_peer_transport_protocol(
         return Err(PairingError::EmptyTransportUri.into());
     }
 
+    // Structural + scheme/protocol consistency check. Rejects peer-
+    // supplied URIs that downgrade the declared protocol (e.g. an
+    // `http://` URI carried with `Protocol::Https`) and unknown
+    // `protocol` discriminants. `TryFrom` runs both the enum
+    // conversion and the URI validation in one step; surfaces as
+    // `crate::Error::Transport`.
+    let _ = crate::transport::TransportProtocol::try_from(&peer_transport_protocol)?;
+
     Ok(peer_transport_protocol)
 }
 

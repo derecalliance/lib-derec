@@ -101,6 +101,7 @@ pub(in crate::protocol) async fn start<
         .ok_or(Error::InvalidInput(
             "contact message has no transport endpoint",
         ))?;
+    let _ = crate::transport::TransportProtocol::try_from(&endpoint)?;
 
     if contact.contact_mode == ContactMode::HashedKeys as i32 {
         start_hashed_keys(
@@ -239,6 +240,7 @@ pub(in crate::protocol) async fn reject<Ss: DeRecSecretStore, T: DeRecTransport>
         .ok_or(Error::InvalidInput(
             "pair request missing transport endpoint",
         ))?;
+    let _ = crate::transport::TransportProtocol::try_from(&peer_transport_protocol)?;
 
     let timestamp = current_timestamp();
     // Rejection short-circuits before channel_id rekey would happen — the
@@ -428,6 +430,7 @@ pub(in crate::protocol) async fn accept_pre_pair<Ss: DeRecSecretStore, T: DeRecT
         .ok_or(Error::InvalidInput(
             "PrePair request missing transport endpoint",
         ))?;
+    let _ = crate::transport::TransportProtocol::try_from(&endpoint)?;
     transport.send(&endpoint, envelope).await?;
 
     #[cfg(feature = "logging")]
@@ -459,6 +462,7 @@ pub(in crate::protocol) async fn reject_pre_pair<T: DeRecTransport>(
         .ok_or(Error::InvalidInput(
             "PrePair request missing transport endpoint",
         ))?;
+    let _ = crate::transport::TransportProtocol::try_from(&endpoint)?;
 
     let timestamp = current_timestamp();
     let response = PrePairResponseMessage {

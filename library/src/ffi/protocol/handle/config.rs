@@ -9,7 +9,6 @@ use super::DeRecProtocolHandle;
 use crate::ffi::error::{
     ffi_error, success, DeRecError, DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_NULL_PTR,
 };
-use derec_proto::TransportProtocol;
 
 /// Replace this node's local `communication_info` map. Does not contact
 /// peers — follow up with `start(FlowKind::UpdateChannelInfo)` to
@@ -63,7 +62,12 @@ pub unsafe extern "C" fn derec_protocol_set_communication_info(
 ///
 /// `handle` must be a valid pointer returned by
 /// [`super::derec_protocol_new`]. `uri_ptr`/`uri_len` must describe a
-/// readable byte range.
+/// readable byte range. The `(uri, protocol)` pair is validated via
+/// [`super::validate_transport`] before it is stored — see that
+/// function's docs for the structural rules (length cap, scheme
+/// match, enum discriminant). Concurrent calls on the same handle
+/// from different threads are safe: the handle's internal mutex
+/// serializes them.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn derec_protocol_set_own_transport(
     handle: *mut DeRecProtocolHandle,
@@ -84,8 +88,15 @@ pub unsafe extern "C" fn derec_protocol_set_own_transport(
             Err(_) => return ffi_error(DEREC_CODE_FFI_BAD_PROTO, "uri is not valid UTF-8"),
         }
     };
+    // Validate before storing — `validate_transport` runs both the
+    // protocol-enum check and the URI rules, so a downgraded scheme
+    // (e.g. `http://` carried with `Protocol::Https`) is rejected
+    // here rather than silently propagated to peers.
+    if let Err(e) = super::validate_transport(&uri, protocol) {
+        return e;
+    }
     let h = unsafe { &*handle };
     let mut inner = h.lock_inner();
-    inner.set_own_transport(TransportProtocol { uri, protocol });
+    inner.set_own_transport(uri);
     success()
 }
