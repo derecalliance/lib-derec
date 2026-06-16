@@ -221,7 +221,7 @@ fn test_full_verification_flow_success() {
         .expect("failed to extract verification response");
 
     assert!(matches!(
-        process_verify_share_response_message(&resp_result.response, share_content),
+        process_verify_share_response_message(&req.request, &resp_result.response, share_content),
         Ok(valid) if valid
     ));
 }
@@ -249,7 +249,11 @@ fn test_full_verification_flow_wrong_share_returns_false() {
         .expect("failed to extract verification response");
 
     assert!(matches!(
-        process_verify_share_response_message(&resp_result.response, wrong_share_content),
+        process_verify_share_response_message(
+            &req.request,
+            &resp_result.response,
+            wrong_share_content
+        ),
         Ok(valid) if !valid
     ));
 }
@@ -327,9 +331,16 @@ fn test_verification_fails_with_modified_response_nonce() {
     let resp_result = extract_verify_share_response(&tampered_envelope, &shared_key)
         .expect("failed to extract tampered response");
 
+    // Tampered response nonce no longer matches the originating request — the
+    // binding gate rejects this before the SHA-384 check.
     assert!(matches!(
-        process_verify_share_response_message(&resp_result.response, share_content),
-        Ok(valid) if !valid
+        process_verify_share_response_message(&req.request, &resp_result.response, share_content),
+        Err(Error::Verification(
+            crate::primitives::verification::VerificationError::ResponseBindingMismatch {
+                field: "nonce",
+                ..
+            }
+        ))
     ));
 }
 
@@ -443,4 +454,133 @@ fn test_extract_verify_share_response_timestamp_matches_inner() {
     };
 
     assert_eq!(resp_result.response.timestamp, inner.timestamp);
+}
+
+/// A response whose nonce differs from the originating request must be
+/// rejected by the binding gate — even if the SHA-384 over (share || nonce)
+/// happens to verify against the response's own nonce. This is the anti-replay
+/// guarantee that lets the owner pin a captured response to one challenge.
+#[test]
+fn test_process_rejects_response_with_mismatched_request_nonce() {
+    let channel_id = ChannelId(1);
+    let shared_key = [41u8; 32];
+    let share_content = b"binding_test_share";
+
+    let req_a = parse_request(
+        &produce_verify_share_request_message(channel_id, 1234, 1, &shared_key, None)
+            .expect("produce A")
+            .envelope,
+        &shared_key,
+    );
+    let req_b = parse_request(
+        &produce_verify_share_request_message(channel_id, 1234, 1, &shared_key, None)
+            .expect("produce B")
+            .envelope,
+        &shared_key,
+    );
+
+    let resp_envelope =
+        produce_verify_share_response_message(channel_id, &req_b.request, &shared_key, share_content)
+            .expect("produce response for B")
+            .envelope;
+    let resp = extract_verify_share_response(&resp_envelope, &shared_key)
+        .expect("extract response for B");
+
+    // Helper computed hash binding to req_b's nonce, but we hand the owner
+    // req_a as the originating request — the binding gate must reject.
+    let result =
+        process_verify_share_response_message(&req_a.request, &resp.response, share_content);
+    assert!(matches!(
+        result,
+        Err(Error::Verification(
+            crate::primitives::verification::VerificationError::ResponseBindingMismatch {
+                field: "nonce",
+                ..
+            }
+        ))
+    ));
+}
+
+#[test]
+fn test_process_rejects_response_with_mismatched_secret_id() {
+    let channel_id = ChannelId(2);
+    let shared_key = [43u8; 32];
+    let share_content = b"binding_test_share_2";
+
+    let req = parse_request(
+        &produce_verify_share_request_message(channel_id, 100, 1, &shared_key, None)
+            .expect("produce")
+            .envelope,
+        &shared_key,
+    );
+
+    let resp = extract_verify_share_response(
+        &produce_verify_share_response_message(channel_id, &req.request, &shared_key, share_content)
+            .expect("produce response")
+            .envelope,
+        &shared_key,
+    )
+    .expect("extract response");
+
+    // Pretend the owner is checking against a different originating request
+    // that carried a different secret_id.
+    let mismatched_request = derec_proto::VerifyShareRequestMessage {
+        secret_id: 999,
+        version: req.request.version,
+        nonce: req.request.nonce,
+        timestamp: req.request.timestamp,
+        reply_to: req.request.reply_to.clone(),
+    };
+    let result =
+        process_verify_share_response_message(&mismatched_request, &resp.response, share_content);
+    assert!(matches!(
+        result,
+        Err(Error::Verification(
+            crate::primitives::verification::VerificationError::ResponseBindingMismatch {
+                field: "secret_id",
+                ..
+            }
+        ))
+    ));
+}
+
+#[test]
+fn test_process_rejects_response_with_mismatched_version() {
+    let channel_id = ChannelId(3);
+    let shared_key = [47u8; 32];
+    let share_content = b"binding_test_share_3";
+
+    let req = parse_request(
+        &produce_verify_share_request_message(channel_id, 100, 1, &shared_key, None)
+            .expect("produce")
+            .envelope,
+        &shared_key,
+    );
+
+    let resp = extract_verify_share_response(
+        &produce_verify_share_response_message(channel_id, &req.request, &shared_key, share_content)
+            .expect("produce response")
+            .envelope,
+        &shared_key,
+    )
+    .expect("extract response");
+
+    let mismatched_request = derec_proto::VerifyShareRequestMessage {
+        secret_id: req.request.secret_id,
+        version: req.request.version + 1,
+        nonce: req.request.nonce,
+        timestamp: req.request.timestamp,
+        reply_to: req.request.reply_to.clone(),
+    };
+    let result =
+        process_verify_share_response_message(&mismatched_request, &resp.response, share_content);
+    assert!(matches!(
+        result,
+        Err(Error::Verification(
+            crate::primitives::verification::VerificationError::ResponseBindingMismatch {
+                field: "version",
+                ..
+            }
+        ))
+    ));
 }

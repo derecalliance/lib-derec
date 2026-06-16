@@ -377,11 +377,19 @@ internal static class Primitives
         // Owner side: extract response, then process against correct share (valid) and wrong share (invalid)
         var extractedResponse = Verification.Response.Extract(responseEnvelope, sharedKey1);
 
-        bool valid = Verification.Response.Process(extractedResponse.ResponseProtoBytes, storedShare1);
+        bool valid = Verification.Response.Process(
+            req.RequestProtoBytes,
+            extractedResponse.ResponseProtoBytes,
+            storedShare1
+        );
         if (!valid)
             throw new InvalidOperationException("Verification test failed: expected valid for matching share.");
 
-        bool invalid = Verification.Response.Process(extractedResponse.ResponseProtoBytes, storedShare2);
+        bool invalid = Verification.Response.Process(
+            req.RequestProtoBytes,
+            extractedResponse.ResponseProtoBytes,
+            storedShare2
+        );
         if (invalid)
             throw new InvalidOperationException("Verification test failed: expected invalid for wrong share.");
 

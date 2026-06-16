@@ -173,6 +173,7 @@ pub(super) async fn handle<
     transport: &T,
     pending_recovery: &mut PendingRecovery,
     pending_unpair: &mut HashMap<ChannelId, u64>,
+    pending_verification: &mut crate::protocol::PendingVerification,
     message: &DeRecMessage,
     secret_id: u64,
     channel_id: ChannelId,
@@ -222,6 +223,7 @@ pub(super) async fn handle<
         MessageBody::VerifyShareRequest(_) | MessageBody::VerifyShareResponse(_) => {
             verification::handle(
                 share_store,
+                pending_verification,
                 secret_id,
                 channel_id,
                 inner,

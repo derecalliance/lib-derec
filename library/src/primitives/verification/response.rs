@@ -236,46 +236,69 @@ pub fn extract(
     Ok(ExtractResult { response })
 }
 
-/// Verifies a DeRec verification response by recomputing the expected SHA-384 digest.
+/// Verifies a DeRec verification response by recomputing the expected SHA-384 digest
+/// AND binding the response back to the request that produced it.
 ///
 /// This function:
 ///
-/// 1. Requires `response.result.status == Ok`
-/// 2. Recomputes:
-///
-/// `expected = SHA384(share_content || response.nonce_be)`
-///
-/// 3. Returns whether `expected == response.hash` using constant-time comparison
+/// 1. Asserts the response's `(nonce, secret_id, version)` triple matches the
+///    corresponding fields on `request`. Anything else (a stale response,
+///    a replay, or a response intended for a different challenge) is rejected
+///    with [`VerificationError::ResponseBindingMismatch`] BEFORE any hash
+///    work happens. This is the anti-replay gate.
+/// 2. Requires `response.result.status == Ok`.
+/// 3. Recomputes `expected = SHA384(share_content || request.nonce_be)` using
+///    the **owner's** request nonce (not the helper-controlled response nonce),
+///    so a helper that crafted a self-consistent `(nonce, hash)` pair from
+///    a different `share_content` cannot pass verification.
+/// 4. Returns whether `expected == response.hash` using constant-time comparison.
 ///
 /// # Arguments
 ///
-/// * `response` - The decrypted [`derec_proto::VerifyShareResponseMessage`] previously
-///   returned by [`extract`].
-/// * `share_content` - The expected share bytes. The digest is recomputed over these bytes.
+/// * `request` — The [`derec_proto::VerifyShareRequestMessage`] originally
+///   produced by [`super::super::request::produce`]. Carries the
+///   authoritative `(nonce, secret_id, version)` the response is expected
+///   to echo. The owner is expected to retain this — see
+///   [`super::super::request::ProduceResult::nonce`] for the wiring.
+/// * `response` — The decrypted [`derec_proto::VerifyShareResponseMessage`]
+///   previously returned by [`extract`].
+/// * `share_content` — The expected share bytes. The digest is recomputed
+///   over these bytes plus `request.nonce`.
 ///
 /// # Returns
 ///
 /// On success returns:
 ///
-/// - `Ok(true)` if the response status is `Ok` and the recomputed digest matches `response.hash`
-/// - `Ok(false)` if the response status is `Ok` but the digest does not match
+/// - `Ok(true)` if every binding check passes, the status is `Ok`, and the
+///   recomputed digest matches `response.hash`.
+/// - `Ok(false)` if every binding check passes and status is `Ok`, but the
+///   digest does not match — i.e. the helper claims the share but cannot
+///   prove possession over the owner's nonce.
 ///
 /// # Errors
 ///
 /// Returns [`crate::Error`] wrapping:
 ///
-/// - `response.result` is absent (returned as `crate::Error::Invariant`)
-/// - [`VerificationError::NonOkStatus`] if `response.result.status != Ok`, carrying the
-///   Helper's status code and memo string
+/// - [`VerificationError::ResponseBindingMismatch`] if `response.nonce`,
+///   `response.secret_id`, or `response.version` does not match `request`.
+/// - `response.result` is absent (returned as `crate::Error::Invariant`).
+/// - [`VerificationError::NonOkStatus`] if `response.result.status != Ok`,
+///   carrying the Helper's status code and memo string.
 ///
 /// # Security Notes
 ///
-/// - This function validates that the responder explicitly marked the operation as successful.
-/// - This function does **not** compare the response against the original request bytes, so it
-///   does not independently verify that the returned `version` or `nonce` match a specific
-///   previously issued request. It only verifies the cryptographic proof against the nonce
-///   present in the response itself.
-/// - The hash comparison is done using constant-time equality to prevent timing side-channels.
+/// - Anti-replay: by hashing against `request.nonce` (the owner's value,
+///   which the helper cannot influence) rather than `response.nonce`, a
+///   captured-and-replayed response is rejected even if its self-consistent
+///   `(nonce, hash)` pair would have passed the cryptographic check on its
+///   own. The owner is responsible for tracking outstanding requests (see
+///   `pending_verification` on [`crate::protocol::DeRecProtocol`]); if no
+///   matching outstanding entry exists, the response should be dropped
+///   before reaching this function.
+/// - Status validation: the function asserts the responder explicitly
+///   marked the operation as successful.
+/// - The hash comparison is done using constant-time equality to prevent
+///   timing side-channels.
 ///
 /// # Example
 ///
@@ -287,9 +310,10 @@ pub fn extract(
 /// let shared_key = [7u8; 32];
 /// let share_content = b"example_share";
 ///
-/// // Owner: issue a verification challenge.
-/// let request::ProduceResult { envelope: req_envelope } =
-///     request::produce(channel_id, 1, 1, &shared_key).expect("produce request failed");
+/// // Owner: issue a verification challenge and remember the request body
+/// // so we can bind the eventual response back to this specific challenge.
+/// let request::ProduceResult { envelope: req_envelope, nonce: _expected_nonce } =
+///     request::produce(channel_id, 1, 1, &shared_key, None).expect("produce request failed");
 ///
 /// // Helper: answer the challenge with the share bytes.
 /// let request::ExtractResult { request: challenge } =
@@ -298,20 +322,50 @@ pub fn extract(
 ///     response::produce(channel_id, &challenge, &shared_key, share_content)
 ///         .expect("produce response failed");
 ///
-/// // Owner: extract the response and verify the proof against the known share.
+/// // Owner: extract the response and verify the proof against the original
+/// // request (which carries the nonce we issued).
 /// let response::ExtractResult { response: resp } =
 ///     response::extract(&resp_envelope, &shared_key).expect("extract response failed");
 ///
-/// response::process(&resp, share_content).expect("process failed");
+/// assert!(response::process(&challenge, &resp, share_content).expect("process failed"));
 /// ```
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(share_content_len = share_content.as_ref().len()))
 )]
 pub fn process(
+    request: &derec_proto::VerifyShareRequestMessage,
     response: &VerifyShareResponseMessage,
     share_content: impl AsRef<[u8]>,
 ) -> Result<bool, crate::Error> {
+    // Anti-replay / cross-binding gate — runs BEFORE the status and
+    // hash checks so a stale/replayed response is rejected even on a
+    // structurally-OK envelope.
+    if response.nonce != request.nonce {
+        return Err(VerificationError::ResponseBindingMismatch {
+            field: "nonce",
+            expected: request.nonce,
+            got: response.nonce,
+        }
+        .into());
+    }
+    if response.secret_id != request.secret_id {
+        return Err(VerificationError::ResponseBindingMismatch {
+            field: "secret_id",
+            expected: request.secret_id,
+            got: response.secret_id,
+        }
+        .into());
+    }
+    if response.version != request.version {
+        return Err(VerificationError::ResponseBindingMismatch {
+            field: "version",
+            expected: u64::from(request.version),
+            got: u64::from(response.version),
+        }
+        .into());
+    }
+
     let result = response.result.as_ref().ok_or(crate::Error::Invariant(
         "VerifyShareResponseMessage is missing result field",
     ))?;
@@ -330,7 +384,12 @@ pub fn process(
         .into());
     }
 
-    let expected_hash = hash_content(share_content, response.nonce);
+    // Hash against the OWNER'S nonce (from `request`), not the helper-
+    // controlled `response.nonce`. The binding gate above guarantees
+    // they are equal here, but reading from `request` explicitly
+    // documents the security invariant: the proof material is bound
+    // to the owner's challenge value.
+    let expected_hash = hash_content(share_content, request.nonce);
 
     let matched: bool = expected_hash.ct_eq(response.hash.as_slice()).into();
 

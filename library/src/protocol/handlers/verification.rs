@@ -27,6 +27,7 @@ use prost::Message;
 )]
 pub(in crate::protocol) async fn handle<Sh: DeRecShareStore>(
     share_store: &mut Sh,
+    pending_verification: &mut crate::protocol::PendingVerification,
     secret_id: u64,
     channel_id: ChannelId,
     inner: MessageBody,
@@ -38,7 +39,14 @@ pub(in crate::protocol) async fn handle<Sh: DeRecShareStore>(
             on_request(channel_id, request, shared_key, inbound_trace_id)
         }
         MessageBody::VerifyShareResponse(response) => {
-            on_response(share_store, secret_id, channel_id, &response).await
+            on_response(
+                share_store,
+                pending_verification,
+                secret_id,
+                channel_id,
+                &response,
+            )
+            .await
         }
         _ => Err(Error::Invariant(
             "unexpected MessageBody variant in verification handler",
@@ -59,6 +67,7 @@ pub(in crate::protocol) async fn start<
     channel_store: &mut Ch,
     secret_store: &mut Ss,
     transport: &T,
+    pending_verification: &mut crate::protocol::PendingVerification,
     version: u32,
     target: Target,
     secret_id: u64,
@@ -104,6 +113,23 @@ pub(in crate::protocol) async fn start<
             &shared_key,
             reply_to.clone(),
         )?;
+
+        // Record the outstanding challenge so the matching inbound
+        // response can be bound back to it. The map is keyed by
+        // `channel_id` — re-issuing `start(VerifyShares)` for the
+        // same channel overwrites any in-flight challenge, and the
+        // newer nonce wins. Stale responses tied to the older nonce
+        // fall through `on_response`'s binding check below.
+        pending_verification.insert(
+            channel_id,
+            derec_proto::VerifyShareRequestMessage {
+                secret_id,
+                version,
+                nonce: msg.nonce,
+                timestamp: None,
+                reply_to: reply_to.clone(),
+            },
+        );
 
         #[cfg(feature = "logging")]
         tracing::debug!(
@@ -274,10 +300,26 @@ fn on_request(
 )]
 async fn on_response<Sh: DeRecShareStore>(
     share_store: &mut Sh,
+    pending_verification: &mut crate::protocol::PendingVerification,
     secret_id: u64,
     channel_id: ChannelId,
     response: &VerifyShareResponseMessage,
 ) -> Result<Vec<DeRecEvent>> {
+    // Replay/freshness gate. Pop the outstanding request for this
+    // channel — if there isn't one, the response is either a replay
+    // of a now-consumed challenge or arrived without any owner-side
+    // request to correspond to. Drop it silently as a NoOp; the
+    // primitive's binding check would fail anyway, but a no-op event
+    // matches the existing pattern used by `unpairing::on_response`.
+    let Some(request) = pending_verification.remove(&channel_id) else {
+        #[cfg(feature = "logging")]
+        tracing::warn!(
+            channel_id = channel_id.0,
+            "verification response with no outstanding challenge; dropping as no-op"
+        );
+        return Ok(vec![DeRecEvent::NoOp]);
+    };
+
     let version = response.version;
 
     let committed_share_bytes = share_store
@@ -290,7 +332,12 @@ async fn on_response<Sh: DeRecShareStore>(
             "no committed share stored for this channel/version — cannot verify proof",
         ))?;
 
-    let valid = verification_response::process(response, &committed_share_bytes)?;
+    // The primitive's `process` enforces (nonce, secret_id, version)
+    // binding against `request` before the SHA-384 check. A binding
+    // mismatch surfaces here as `Error::Verification(...)` and is
+    // returned to the caller so the application sees the failure
+    // explicitly.
+    let valid = verification_response::process(&request, response, &committed_share_bytes)?;
 
     if !valid {
         return Err(Error::Invariant("verification proof is invalid"));

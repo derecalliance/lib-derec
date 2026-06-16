@@ -489,7 +489,7 @@ fn run_verification_flow_test() {
     let resp_result = verif_response::extract(&resp_produced.envelope, shared_key_1)
         .expect("verif_response::extract failed");
 
-    let valid = verif_response::process(&resp_result.response, &share_bytes_1)
+    let valid = verif_response::process(&req_result.request, &resp_result.response, &share_bytes_1)
         .expect("verif_response::process failed (valid case)");
     assert!(valid, "expected a valid verification response");
 
@@ -499,8 +499,12 @@ fn run_verification_flow_test() {
             .expect("second verif_response::produce failed");
     let resp_result_2 = verif_response::extract(&resp_produced_2.envelope, shared_key_1)
         .expect("second verif_response::extract failed");
-    let valid_2 = verif_response::process(&resp_result_2.response, &share_bytes_2)
-        .expect("verif_response::process failed (invalid case)");
+    let valid_2 = verif_response::process(
+        &req_result.request,
+        &resp_result_2.response,
+        &share_bytes_2,
+    )
+    .expect("verif_response::process failed (invalid case)");
     assert!(
         !valid_2,
         "expected an invalid verification response for the wrong share"

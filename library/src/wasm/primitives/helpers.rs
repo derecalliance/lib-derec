@@ -13,6 +13,27 @@ pub(crate) fn parse_shared_key(shared_key: &[u8]) -> Result<[u8; 32], JsValue> {
     })
 }
 
+/// Serialize a `T` into a `JsValue` across the wasm→JS boundary.
+///
+/// # Security: `serialize_large_number_types_as_bigints(true)` is required
+///
+/// Several primitive return types (e.g.
+/// [`crate::wasm::primitives::verification::request::VerifyShareRequestMessage`])
+/// expose `u64` fields directly — `secret_id`, `nonce`, `channel_id`,
+/// and friends. The default `serde_wasm_bindgen` behaviour would
+/// serialize a `u64` as a JS `number`, which can only exactly
+/// represent integers up to `2^53 − 1` (`Number.MAX_SAFE_INTEGER`).
+/// For full 64-bit identifiers and random nonces that is a silent
+/// truncation — distinct values collide after rounding, breaking
+/// equality checks, nonce-uniqueness invariants, and per-secret
+/// routing on the JS side.
+///
+/// Enabling `serialize_large_number_types_as_bigints(true)` forces
+/// every `u64` / `i64` field to cross the boundary as a JS
+/// `BigInt`, preserving the full 64-bit value. **Do not remove
+/// this flag** without understanding the precision/security
+/// implications; the binding `.d.ts` files type these fields as
+/// `bigint` and consumers rely on that contract.
 pub(crate) fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
     let serializer =
         serde_wasm_bindgen::Serializer::new().serialize_large_number_types_as_bigints(true);

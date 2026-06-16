@@ -12,6 +12,19 @@ use rand::{Rng, rng};
 pub struct ProduceResult {
     /// Serialized outer [`derec_proto::DeRecMessage`] envelope with the encrypted request payload.
     pub envelope: Vec<u8>,
+    /// Fresh `u64` nonce that was embedded into the encrypted
+    /// [`derec_proto::VerifyShareRequestMessage`].
+    ///
+    /// The caller MUST retain this value (typically in a
+    /// per-`(channel_id, secret_id, version)` pending-verification
+    /// map) and pass it to
+    /// [`super::response::process`] when the matching response
+    /// arrives. The `process` function uses it to bind the
+    /// cryptographic proof to a specific outstanding challenge —
+    /// preventing replay of a captured-and-stale response and
+    /// rejecting responses whose helper-supplied `nonce` does not
+    /// match anything the owner has outstanding.
+    pub nonce: u64,
 }
 
 pub struct ExtractResult {
@@ -121,7 +134,7 @@ pub fn produce(
     #[cfg(feature = "logging")]
     tracing::info!("verification request envelope produced");
 
-    Ok(ProduceResult { envelope })
+    Ok(ProduceResult { envelope, nonce })
 }
 
 /// Decrypts and decodes a [`derec_proto::VerifyShareRequestMessage`] from an outer

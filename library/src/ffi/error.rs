@@ -324,6 +324,12 @@ fn sharing_code(e: &SharingError) -> i32 {
 fn verification_code(e: &VerificationError) -> i32 {
     match e {
         VerificationError::NonOkStatus { .. } => DEREC_CODE_NON_OK_STATUS,
+        // The response did not echo the outstanding request — a
+        // replay or cross-binding attempt. Reusing the protocol-
+        // violation code because that's the closest existing
+        // semantic (validated wire material that contradicts an
+        // expected session invariant).
+        VerificationError::ResponseBindingMismatch { .. } => DEREC_CODE_PROTOCOL_VIOLATION,
     }
 }
 

@@ -248,6 +248,16 @@ pub extern "C" fn extract_verify_share_response(
     }
 }
 
+/// Verify a `VerifyShareResponseMessage` against the originating
+/// `VerifyShareRequestMessage` and the expected share content.
+///
+/// `request_proto_ptr` / `request_proto_len` must carry the proto-
+/// encoded [`derec_proto::VerifyShareRequestMessage`] the **owner**
+/// previously produced for this challenge (kept by the caller in a
+/// per-`channel_id` pending-verification map). The primitive
+/// rejects any response whose `(nonce, secret_id, version)` triple
+/// doesn't match — that's the anti-replay gate.
+///
 /// `response_proto_ptr` / `response_proto_len` must be the
 /// `response_proto_bytes` returned by [`extract_verify_share_response`].
 ///
@@ -256,6 +266,8 @@ pub extern "C" fn extract_verify_share_response(
 /// Non-null input pointers must point to the corresponding readable byte ranges.
 #[unsafe(no_mangle)]
 pub extern "C" fn process_verify_share_response_message(
+    request_proto_ptr: *const u8,
+    request_proto_len: usize,
     response_proto_ptr: *const u8,
     response_proto_len: usize,
     share_content_ptr: *const u8,
@@ -266,6 +278,10 @@ pub extern "C" fn process_verify_share_response_message(
         is_valid: false,
     };
 
+    let request_bytes = match parse_buffer(request_proto_ptr, request_proto_len, "request_proto_ptr") {
+        Ok(b) => b,
+        Err(e) => return with_err(e),
+    };
     let response_bytes =
         match parse_buffer(response_proto_ptr, response_proto_len, "response_proto_ptr") {
             Ok(b) => b,
@@ -277,6 +293,15 @@ pub extern "C" fn process_verify_share_response_message(
             Err(e) => return with_err(e),
         };
 
+    let request = match derec_proto::VerifyShareRequestMessage::decode(request_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                format!("failed to decode request: {e}"),
+            ));
+        }
+    };
     let response = match VerifyShareResponseMessage::decode(response_bytes) {
         Ok(r) => r,
         Err(e) => {
@@ -287,7 +312,7 @@ pub extern "C" fn process_verify_share_response_message(
         }
     };
 
-    match crate::primitives::verification::response::process(&response, share_content) {
+    match crate::primitives::verification::response::process(&request, &response, share_content) {
         Ok(is_valid) => VerifyShareResponseResult {
             error: success(),
             is_valid,

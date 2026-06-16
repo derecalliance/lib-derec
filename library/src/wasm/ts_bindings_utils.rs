@@ -146,6 +146,7 @@ fn sharing_code(e: &SharingError) -> &'static str {
 fn verification_code(e: &VerificationError) -> &'static str {
     match e {
         VerificationError::NonOkStatus { .. } => "NON_OK_STATUS",
+        VerificationError::ResponseBindingMismatch { .. } => "PROTOCOL_VIOLATION",
     }
 }
 

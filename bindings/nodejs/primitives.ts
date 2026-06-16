@@ -124,9 +124,9 @@ export function runPrimitivesSmoke(): void {
   const { response: verifyResponse } = primitives.verification.response.extract(
     verifyRespEnvelope.envelope, verifyKey,
   );
-  const valid = primitives.verification.response.process(verifyResponse, storedFor1.share);
+  const valid = primitives.verification.response.process(verifyRequest, verifyResponse, storedFor1.share);
   if (!valid) throw new Error("expected true for matching share");
-  const invalid = primitives.verification.response.process(verifyResponse, storedFor2.share);
+  const invalid = primitives.verification.response.process(verifyRequest, verifyResponse, storedFor2.share);
   if (invalid) throw new Error("expected false for wrong share");
   console.log(`  [response.process] correct=true wrong=false  ✓`);
 

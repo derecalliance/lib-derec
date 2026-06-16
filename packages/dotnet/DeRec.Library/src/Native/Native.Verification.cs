@@ -86,6 +86,8 @@ internal static class Verification
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern VerifyShareResponseResult process_verify_share_response_message(
+        byte[] requestProtoBytes,
+        UIntPtr requestProtoBytesLen,
         byte[] responseProtoBytes,
         UIntPtr responseProtoBytesLen,
         byte[] shareContent,

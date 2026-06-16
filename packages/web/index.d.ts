@@ -1012,7 +1012,16 @@ export declare const primitives: {
       ): ProduceResult;
       extract(envelope_bytes: Uint8Array, shared_key: Uint8Array): { response: VerifyShareResponseMessage };
 
-      process(response: VerifyShareResponseMessage, share_content: Uint8Array): boolean;
+      /** `request` must be the request the owner previously produced
+       *  for this challenge (kept by the caller in a per-channel
+       *  pending-verification map). Responses whose
+       *  `(nonce, secret_id, version)` triple doesn't match are
+       *  rejected — that's the anti-replay gate. */
+      process(
+        request: VerifyShareRequestMessage,
+        response: VerifyShareResponseMessage,
+        share_content: Uint8Array,
+      ): boolean;
     };
   };
 };

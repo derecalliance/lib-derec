@@ -95,9 +95,23 @@ pub fn extract(envelope_bytes: &[u8], shared_key: &[u8]) -> Result<JsValue, JsVa
     })
 }
 
+/// Verify a `VerifyShareResponseMessage` against the originating
+/// `VerifyShareRequestMessage` and the expected share content.
+///
+/// `request` must be the request the **owner** previously produced for
+/// this challenge (kept by the caller in a per-`channel_id` pending-
+/// verification map). The primitive rejects any response whose
+/// `(nonce, secret_id, version)` triple doesn't match — that's the
+/// anti-replay gate.
 #[wasm_bindgen(js_name = "verification_response_process")]
-pub fn process(response: JsValue, share_content: &[u8]) -> Result<bool, JsValue> {
+pub fn process(
+    request: JsValue,
+    response: JsValue,
+    share_content: &[u8],
+) -> Result<bool, JsValue> {
+    let request: VerifyShareRequestMessage = from_js(request)?;
+    let request_proto: derec_proto::VerifyShareRequestMessage = request.into();
     let response: VerifyShareResponseMessage = from_js(response)?;
     let response_proto: derec_proto::VerifyShareResponseMessage = response.into();
-    response::process(&response_proto, share_content).map_err(js_error_from_lib)
+    response::process(&request_proto, &response_proto, share_content).map_err(js_error_from_lib)
 }

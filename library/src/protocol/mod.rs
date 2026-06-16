@@ -61,6 +61,22 @@ pub(super) type PendingRecovery = HashMap<(u64, u32), Vec<GetShareResponseMessag
 /// state is dropped immediately and this map is never touched.
 pub(super) type PendingUnpair = HashMap<ChannelId, u64>;
 
+/// In-progress verification challenges keyed by `channel_id`,
+/// recording the full [`derec_proto::VerifyShareRequestMessage`]
+/// that was sent. When the matching response arrives, the entry is
+/// removed and its `(nonce, secret_id, version)` triple is passed
+/// to [`crate::primitives::verification::response::process`] so the
+/// helper's response cannot satisfy any other outstanding challenge.
+///
+/// Replay/freshness gate semantics mirror [`PendingUnpair`]: a
+/// missing entry means there is no outstanding verification for the
+/// channel, and the inbound response is dropped silently
+/// ([`DeRecEvent::NoOp`]). Re-issuing `start(VerifyShares)` for the
+/// same channel overwrites the entry — the most recent challenge
+/// wins, and a response carrying an older nonce is rejected by the
+/// binding check.
+pub(super) type PendingVerification = HashMap<ChannelId, derec_proto::VerifyShareRequestMessage>;
+
 /// Tracks an in-progress sharing round.
 ///
 /// Created when [`DeRecFlow::ProtectSecret`] is started and consumed when all
@@ -136,6 +152,9 @@ pub struct DeRecProtocol<
     /// Channels with an outstanding unpair request awaiting the peer's
     /// acknowledgement (Required mode only — see [`UnpairAck`]).
     pending_unpair: PendingUnpair,
+    /// Channels with an outstanding verification challenge. See
+    /// [`PendingVerification`] for the replay/freshness semantics.
+    pending_verification: PendingVerification,
     /// Configured via [`DeRecProtocolBuilder::with_unpair_ack`].
     pub(crate) unpair_ack: UnpairAck,
     /// Events produced by [`Self::start`] that don't fit the "no events from
@@ -233,6 +252,7 @@ impl<
             own_transport,
             pending_recovery: HashMap::new(),
             pending_unpair: HashMap::new(),
+            pending_verification: HashMap::new(),
             unpair_ack: UnpairAck::Required,
             pending_start_events: Vec::new(),
             threshold,
@@ -544,6 +564,7 @@ impl<
             &mut self.channel_store,
             &mut self.secret_store,
             &self.transport,
+            &mut self.pending_verification,
             version,
             target,
             secret_id,
@@ -1228,6 +1249,7 @@ impl<
             &self.transport,
             &mut self.pending_recovery,
             &mut self.pending_unpair,
+            &mut self.pending_verification,
             message,
             self.secret_id,
             channel_id,
