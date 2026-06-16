@@ -39,9 +39,33 @@ pub(super) type Protocol = crate::protocol::DeRecProtocol<
 /// Opaque handle returned by [`derec_protocol_new`] and consumed by every
 /// other entry point in this module. Holds the protocol instance + the
 /// per-handle tokio runtime used to drive the async core synchronously.
+///
+/// The `inner` protocol is wrapped in [`std::sync::Mutex`] so concurrent
+/// FFI calls from different host threads (.NET worker pool, Node.js
+/// worker_threads, etc.) are safe by construction. Each entry point
+/// locks the mutex for the duration of its call, serializing access to
+/// the protocol state — no `&mut DeRecProtocolHandle` is ever
+/// materialized, so aliased `&mut` references (which would be immediate
+/// undefined behavior) cannot arise even under contention. The tokio
+/// `Runtime` itself is `Sync` and accepts `&self` `block_on`, but
+/// holding the protocol lock across `block_on` also serializes runtime
+/// invocations on the current-thread executor.
 pub struct DeRecProtocolHandle {
     pub(super) runtime: tokio::runtime::Runtime,
-    pub(super) inner: Protocol,
+    pub(super) inner: std::sync::Mutex<Protocol>,
+}
+
+impl DeRecProtocolHandle {
+    /// Lock the inner protocol for exclusive access. Recovers from a
+    /// poisoned mutex (a panic in an earlier entry point) by extracting
+    /// the inner state — panicking across the FFI boundary is itself
+    /// undefined behavior, so the poison-tolerant pattern is the right
+    /// default here.
+    pub(super) fn lock_inner(&self) -> std::sync::MutexGuard<'_, Protocol> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 /// Result type for [`derec_protocol_new`].
@@ -237,7 +261,10 @@ pub unsafe extern "C" fn derec_protocol_new(
         }
     };
 
-    let handle = Box::new(DeRecProtocolHandle { runtime, inner });
+    let handle = Box::new(DeRecProtocolHandle {
+        runtime,
+        inner: std::sync::Mutex::new(inner),
+    });
     DeRecProtocolNewResult {
         error: success(),
         handle: Box::into_raw(handle),

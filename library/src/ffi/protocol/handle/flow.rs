@@ -66,8 +66,9 @@ pub unsafe extern "C" fn derec_protocol_start(
         Err(e) => return ffi_error(DEREC_CODE_FFI_BAD_PROTO, e).into(),
     };
 
-    let h = unsafe { &mut *handle };
-    match h.runtime.block_on(h.inner.start(flow)) {
+    let h = unsafe { &*handle };
+    let mut inner = h.lock_inner();
+    match h.runtime.block_on(inner.start(flow)) {
         Ok(Some(id)) => DeRecProtocolStartResult {
             error: success(),
             has_channel_id: 1,
@@ -127,8 +128,9 @@ pub unsafe extern "C" fn derec_protocol_process(
         unsafe { std::slice::from_raw_parts(message_ptr, message_len) }.to_vec()
     };
 
-    let h = unsafe { &mut *handle };
-    match h.runtime.block_on(h.inner.process(&bytes)) {
+    let h = unsafe { &*handle };
+    let mut inner = h.lock_inner();
+    match h.runtime.block_on(inner.process(&bytes)) {
         Ok(events) => {
             let json = encode_events(events);
             DeRecProtocolEventsResult {
@@ -174,8 +176,9 @@ pub unsafe extern "C" fn derec_protocol_accept(
             .into();
         }
     };
-    let h = unsafe { &mut *handle };
-    match h.runtime.block_on(h.inner.accept(action)) {
+    let h = unsafe { &*handle };
+    let mut inner = h.lock_inner();
+    match h.runtime.block_on(inner.accept(action)) {
         Ok(events) => {
             let json = encode_events(events);
             DeRecProtocolEventsResult {
@@ -241,8 +244,9 @@ pub unsafe extern "C" fn derec_protocol_reject(
         }
     };
 
-    let h = unsafe { &mut *handle };
-    match h.runtime.block_on(h.inner.reject(action, status_enum, &memo)) {
+    let h = unsafe { &*handle };
+    let mut inner = h.lock_inner();
+    match h.runtime.block_on(inner.reject(action, status_enum, &memo)) {
         Ok(()) => success(),
         Err(e) => from_lib_error(e),
     }

@@ -50,10 +50,11 @@ pub unsafe extern "C" fn derec_protocol_get_fingerprint(
     if handle.is_null() {
         return ffi_error(DEREC_CODE_FFI_NULL_PTR, "handle is null").into();
     }
-    let h = unsafe { &mut *handle };
+    let h = unsafe { &*handle };
+    let inner = h.lock_inner();
     let result = h
         .runtime
-        .block_on(h.inner.get_fingerprint(ChannelId(channel_id)));
+        .block_on(inner.get_fingerprint(ChannelId(channel_id)));
     match result {
         Ok(s) => match CString::new(s) {
             Ok(c) => DeRecProtocolFingerprintResult {
@@ -91,10 +92,11 @@ pub unsafe extern "C" fn derec_protocol_verify_fingerprint(
             return ffi_error(DEREC_CODE_FFI_BAD_PROTO, "fingerprint is not valid UTF-8");
         }
     };
-    let h = unsafe { &mut *handle };
+    let h = unsafe { &*handle };
+    let mut inner = h.lock_inner();
     match h
         .runtime
-        .block_on(h.inner.verify_fingerprint(ChannelId(channel_id), &fingerprint))
+        .block_on(inner.verify_fingerprint(ChannelId(channel_id), &fingerprint))
     {
         Ok(matched) => {
             unsafe {
@@ -159,8 +161,9 @@ pub unsafe extern "C" fn derec_protocol_create_contact(
     } else {
         None
     };
-    let h = unsafe { &mut *handle };
-    match h.runtime.block_on(h.inner.create_contact(id_arg, mode)) {
+    let h = unsafe { &*handle };
+    let mut inner = h.lock_inner();
+    match h.runtime.block_on(inner.create_contact(id_arg, mode)) {
         Ok(contact) => DeRecProtocolCreateContactResult {
             error: success(),
             contact_wire_bytes: vec_into_buffer(contact.encode_to_vec()),

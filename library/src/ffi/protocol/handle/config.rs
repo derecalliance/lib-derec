@@ -20,7 +20,9 @@ use derec_proto::TransportProtocol;
 ///
 /// `handle` must be a valid pointer returned by
 /// [`super::derec_protocol_new`]. `info_json_ptr`/`info_json_len` must
-/// describe a readable byte range.
+/// describe a readable byte range. Concurrent calls on the same
+/// handle from different threads are safe: the handle's internal
+/// mutex serializes them.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn derec_protocol_set_communication_info(
     handle: *mut DeRecProtocolHandle,
@@ -46,8 +48,9 @@ pub unsafe extern "C" fn derec_protocol_set_communication_info(
             }
         }
     };
-    let h = unsafe { &mut *handle };
-    h.inner.set_communication_info(info);
+    let h = unsafe { &*handle };
+    let mut inner = h.lock_inner();
+    inner.set_communication_info(info);
     success()
 }
 
@@ -81,7 +84,8 @@ pub unsafe extern "C" fn derec_protocol_set_own_transport(
             Err(_) => return ffi_error(DEREC_CODE_FFI_BAD_PROTO, "uri is not valid UTF-8"),
         }
     };
-    let h = unsafe { &mut *handle };
-    h.inner.set_own_transport(TransportProtocol { uri, protocol });
+    let h = unsafe { &*handle };
+    let mut inner = h.lock_inner();
+    inner.set_own_transport(TransportProtocol { uri, protocol });
     success()
 }
