@@ -1,5 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! Outer-envelope (`DeRecMessage`) parsing, building, and trace-id plumbing.
+//!
+//! # Security: no upper bound on inbound bytes
+//!
+//! Every function in this module that ingests peer wire bytes —
+//! [`extract_inner_message`], [`extract_inner_pairing_message`],
+//! [`extract_inner_plaintext_message`], [`apply_trace_id`], [`read_trace_id`] —
+//! parses whatever it's handed. No caller-side size cap is enforced anywhere
+//! in the library, by design: legitimate envelopes span tens of bytes (acks)
+//! through many MB (replica-vault sync), so any cap tight enough to be useful
+//! against DoS would risk silently truncating a legitimate share or vault and
+//! making the secret unrecoverable.
+//!
+//! The application's transport layer MUST bound inbound message size at a
+//! ceiling consistent with its deployment's max secret size, helper count,
+//! and replica fan-out before handing bytes to the library. See the security
+//! note on [`crate::protocol::DeRecProtocol::process`] for the canonical
+//! statement of this contract.
+//!
+//! Malformed bytes surface as [`crate::Error::ProtobufDecode`]; recursion
+//! depth is bounded by `prost`'s decoder, and the DeRec schema is shallow
+//! enough that no additional caller-side recursion limit is needed.
+
 use crate::{primitives::pairing::PairingError, types::SharedKey};
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{DeRecMessage, MessageBody};

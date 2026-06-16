@@ -1000,6 +1000,37 @@ impl<
     /// 2. Looks up the channel's key material to determine the message kind
     /// 3. Dispatches to the appropriate message handler based on the channel state
     /// 4. Returns the events the application should react to
+    ///
+    /// # Security: bounding inbound message size
+    ///
+    /// This function does **not** enforce an upper bound on `message.len()`,
+    /// and no library entry point that ingests peer wire bytes does either.
+    /// Legitimate envelopes span many orders of magnitude:
+    ///
+    /// - Tens of bytes for empty acks / ping-class messages.
+    /// - A few KB for pairing material and verification proofs.
+    /// - Hundreds of KB to several MB for `StoreShareRequest` carrying a
+    ///   share of a large secret.
+    /// - Many MB for `ReplicaSync` envelopes carrying an entire vault
+    ///   (`O(num_secrets × num_helpers × max_secret_bytes)`).
+    ///
+    /// Any cap tight enough to provide meaningful DoS resistance would risk
+    /// silently truncating a legitimate replica sync — at which point the
+    /// secret can become unrecoverable. The protocol therefore delegates
+    /// inbound-size bounding to the **application's transport layer**,
+    /// which knows the deployment's max secret size, helper count, and
+    /// replica fan-out and can pick a ceiling that fits.
+    ///
+    /// Callers MUST refuse oversized envelopes upstream (e.g. enforce a
+    /// max HTTP body / WebSocket frame size consistent with their
+    /// configuration) before handing bytes to this function.
+    ///
+    /// Malformed bytes — including truncation, varint overflow, and any
+    /// `prost`-level decode failure — surface as
+    /// [`ProcessError`] wrapping [`Error::ProtobufDecode`]. This function
+    /// never panics on adversarial input. Protobuf recursion depth is
+    /// bounded by `prost`'s decoder; DeRec's schema is shallow (~3 levels),
+    /// so no additional caller-side recursion limit is required.
     #[cfg_attr(
         feature = "logging",
         tracing::instrument(skip_all, fields(message_len = message.len()))

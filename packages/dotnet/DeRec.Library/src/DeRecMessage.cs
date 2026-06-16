@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+using System;
+
 namespace DeRec.Library;
 
 /// <summary>
@@ -29,9 +31,27 @@ public sealed class DeRecMessage
     /// <summary>Serializes this envelope back to protobuf wire bytes.</summary>
     public byte[] ToProtoBytes() => _protoBytes;
 
-    /// <summary>Deserializes a <see cref="DeRecMessage"/> from protobuf wire bytes.</summary>
+    /// <summary>
+    /// Deserializes a <see cref="DeRecMessage"/> from protobuf wire bytes.
+    /// </summary>
+    /// <remarks>
+    /// The library does not enforce an upper bound on
+    /// <paramref name="bytes"/>.<c>Length</c>: legitimate envelopes range
+    /// from tens of bytes (acks) to many MB (replica vault sync). Callers
+    /// MUST bound inbound size at the transport layer before reaching this
+    /// method, consistent with their deployment's maximum secret size,
+    /// helper count, and replica fan-out.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">
+    /// Thrown if <paramref name="bytes"/> is <see langword="null"/>.
+    /// </exception>
+    /// <exception cref="Google.Protobuf.InvalidProtocolBufferException">
+    /// Thrown if <paramref name="bytes"/> is not a well-formed
+    /// <c>DeRecMessage</c> envelope.
+    /// </exception>
     public static DeRecMessage FromProtoBytes(byte[] bytes)
     {
+        ArgumentNullException.ThrowIfNull(bytes);
         var proto = Org.Derecalliance.Derec.Protobuf.DeRecMessage.Parser.ParseFrom(bytes);
         return new DeRecMessage(bytes, proto);
     }
