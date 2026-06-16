@@ -2133,3 +2133,119 @@ fn test_validate_contact_for_mode_rejects_hashed_wrong_hash_length() {
             if m == "hashed_keys contact_binding_hash is not a SHA-384 digest"
     ));
 }
+
+// --- Public structural validator (`validate`) ---------------------------
+//
+// Mirrors the `validate_contact_for_mode` cases but exercises the
+// mode-agnostic entry point bindings use at their parse boundary. The
+// happy paths assert the same shape passes; the negative paths assert the
+// same field-level diagnostic surfaces regardless of which mode the
+// contact declares.
+
+#[test]
+fn test_validate_accepts_well_formed_inline_keys() {
+    use crate::primitives::pairing::request::validate;
+    validate(&well_formed_inline_keys_contact()).expect("well-formed inline_keys must pass");
+}
+
+#[test]
+fn test_validate_accepts_well_formed_hashed_keys() {
+    use crate::primitives::pairing::request::validate;
+    validate(&well_formed_hashed_keys_contact()).expect("well-formed hashed_keys must pass");
+}
+
+#[test]
+fn test_validate_rejects_unknown_contact_mode() {
+    use crate::primitives::pairing::request::validate;
+    // ContactMode is currently {0, 1}; anything else must round-trip as
+    // a structural rejection rather than silently being treated as
+    // InlineKeys (proto3 enum default).
+    let mut c = well_formed_inline_keys_contact();
+    c.contact_mode = 7;
+    let err = validate(&c).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Pairing(PairingError::InvalidContactMessage(m))
+            if m == "unknown contact_mode value"
+    ));
+}
+
+#[test]
+fn test_validate_rejects_inline_missing_keys() {
+    use crate::primitives::pairing::request::validate;
+    let mut c = well_formed_inline_keys_contact();
+    c.mlkem_encapsulation_key = None;
+    let err = validate(&c).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Pairing(PairingError::InvalidContactMessage(m))
+            if m == "inline_keys contact missing mlkem_encapsulation_key"
+    ));
+
+    let mut c = well_formed_inline_keys_contact();
+    c.ecies_public_key = None;
+    let err = validate(&c).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Pairing(PairingError::InvalidContactMessage(m))
+            if m == "inline_keys contact missing ecies_public_key"
+    ));
+}
+
+#[test]
+fn test_validate_rejects_inline_with_binding_hash() {
+    use crate::primitives::pairing::request::validate;
+    // Mode/field confusion: a contact that declares InlineKeys but ALSO
+    // carries a binding hash is in a malformed dual state — exactly the
+    // ambiguity the DLV-016 finding flagged.
+    let mut c = well_formed_inline_keys_contact();
+    c.contact_binding_hash = Some(vec![0xCD; 48]);
+    let err = validate(&c).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Pairing(PairingError::InvalidContactMessage(m))
+            if m == "inline_keys contact must not carry contact_binding_hash"
+    ));
+}
+
+#[test]
+fn test_validate_rejects_hashed_with_inline_keys() {
+    use crate::primitives::pairing::request::validate;
+    // Symmetric mode/field confusion: a HashedKeys contact must not
+    // carry inline keys, otherwise the binding-hash commitment is
+    // bypassable.
+    let mut c = well_formed_hashed_keys_contact();
+    c.mlkem_encapsulation_key = Some(vec![1; 1184]);
+    let err = validate(&c).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Pairing(PairingError::InvalidContactMessage(m))
+            if m == "hashed_keys contact must not carry inline keys"
+    ));
+}
+
+#[test]
+fn test_validate_rejects_hashed_missing_binding_hash() {
+    use crate::primitives::pairing::request::validate;
+    let mut c = well_formed_hashed_keys_contact();
+    c.contact_binding_hash = None;
+    let err = validate(&c).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Pairing(PairingError::InvalidContactMessage(m))
+            if m == "hashed_keys contact missing contact_binding_hash"
+    ));
+}
+
+#[test]
+fn test_validate_rejects_hashed_wrong_hash_length() {
+    use crate::primitives::pairing::request::validate;
+    let mut c = well_formed_hashed_keys_contact();
+    c.contact_binding_hash = Some(vec![0xAB; 32]);
+    let err = validate(&c).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Pairing(PairingError::InvalidContactMessage(m))
+            if m == "hashed_keys contact_binding_hash is not a SHA-384 digest"
+    ));
+}

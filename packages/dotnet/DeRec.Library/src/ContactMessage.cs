@@ -44,7 +44,16 @@ public sealed record ContactMessage(
     byte[]? ContactBindingHash
 )
 {
-    /// <summary>Serializes this <see cref="ContactMessage"/> to protobuf wire bytes.</summary>
+    /// <summary>
+    /// Serializes this <see cref="ContactMessage"/> to protobuf wire bytes.
+    /// </summary>
+    /// <remarks>
+    /// Structurally validates the contact's <c>(ContactMode, inline keys,
+    /// binding hash)</c> tuple before emitting bytes — a locally constructed
+    /// instance that violates the per-mode invariant raises
+    /// <see cref="DeRecException"/> instead of producing a wire blob that
+    /// downstream consumers would reject anyway.
+    /// </remarks>
     internal byte[] ToProtoBytes()
     {
         var proto = new Org.Derecalliance.Derec.Protobuf.ContactMessage
@@ -70,12 +79,22 @@ public sealed record ContactMessage(
         {
             proto.ContactBindingHash = Google.Protobuf.ByteString.CopyFrom(hash);
         }
-        return proto.ToByteArray();
+        byte[] bytes = proto.ToByteArray();
+        Validate(bytes);
+        return bytes;
     }
 
-    /// <summary>Deserializes a <see cref="ContactMessage"/> from protobuf wire bytes.</summary>
+    /// <summary>
+    /// Deserializes a <see cref="ContactMessage"/> from protobuf wire bytes
+    /// and structurally validates the result against the per-mode invariant
+    /// documented on the wire format. Throws <see cref="DeRecException"/>
+    /// if the contact is malformed (unknown <see cref="ContactMode"/>,
+    /// mode/field mismatch, wrong binding-hash length).
+    /// </summary>
     internal static ContactMessage FromProtoBytes(byte[] bytes)
     {
+        Validate(bytes);
+
         var proto = Org.Derecalliance.Derec.Protobuf.ContactMessage.Parser.ParseFrom(bytes);
 
         var tp = proto.TransportProtocol is { } protoTp
@@ -104,5 +123,12 @@ public sealed record ContactMessage(
             EciesPublicKey: ecies,
             ContactBindingHash: hash
         );
+    }
+
+    private static void Validate(byte[] bytes)
+    {
+        Native.DeRecError error =
+            Native.Pairing.validate_contact_message(bytes, (UIntPtr)bytes.Length);
+        Utils.ThrowIfError(error);
     }
 }

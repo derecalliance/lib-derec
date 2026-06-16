@@ -636,46 +636,36 @@ fn validate_inputs(
     Ok(())
 }
 
-/// Enforces the per-mode field-presence invariant on an incoming
-/// [`ContactMessage`]. Called at every entry point that ingests a contact:
+/// Structural validator for a decoded [`ContactMessage`]. Enforces the
+/// per-mode field-presence invariants the proto schema documents but cannot
+/// itself express:
 ///
-/// - `produce` requires [`ContactMode::InlineKeys`] (the responder needs
-///   the keys inline).
-/// - `produce_pre_pair_request` and `process_pre_pair_response` require
-///   [`ContactMode::HashedKeys`] (the keys must be fetched via PrePair).
-///
-/// Rejects:
-///
-/// - `contact_mode` not matching `expected`.
-/// - [`ContactMode::InlineKeys`]: missing/empty `mlkem_encapsulation_key`
-///   or `ecies_public_key`, or a non-empty `contact_binding_hash` (would
-///   mean the contact is misshaped — keys present AND a commitment).
-/// - [`ContactMode::HashedKeys`]: any inline key set, or a missing,
-///   empty, or wrong-length `contact_binding_hash` (must be exactly 48
-///   bytes — SHA-384 digest size).
+/// - The declared `contact_mode` must be a known [`ContactMode`] value.
+/// - [`ContactMode::InlineKeys`]: `mlkem_encapsulation_key` and
+///   `ecies_public_key` MUST be present and non-empty; `contact_binding_hash`
+///   MUST be absent (would mean the contact is misshaped — keys present AND
+///   a commitment).
+/// - [`ContactMode::HashedKeys`]: both inline-key fields MUST be absent, and
+///   `contact_binding_hash` MUST be present with exactly 48 bytes (SHA-384
+///   digest size).
 ///
 /// The bidirectional check matters most for `HashedKeys`: if a malformed
 /// `HashedKeys` contact carried inline keys, downstream callers might
 /// consume those keys without ever recomputing the binding hash, defeating
 /// the commitment that's the whole point of the mode.
-pub(crate) fn validate_contact_for_mode(
-    contact: &ContactMessage,
-    expected: ContactMode,
-) -> Result<(), crate::Error> {
-    if contact.contact_mode != expected as i32 {
+///
+/// Bindings should call this at the parse boundary so that any decoded
+/// `ContactMessage` they hand back to application code already satisfies
+/// the invariant.
+pub fn validate(contact: &ContactMessage) -> Result<(), crate::Error> {
+    let mode = ContactMode::try_from(contact.contact_mode).map_err(|_| {
         #[cfg(feature = "logging")]
         tracing::warn!(
             contact_mode = contact.contact_mode,
-            expected = expected as i32,
-            "contact_mode mismatch"
+            "unknown contact_mode value"
         );
-
-        return Err(PairingError::InvalidContactMessage(match expected {
-            ContactMode::InlineKeys => "expected INLINE_KEYS contact mode",
-            ContactMode::HashedKeys => "expected HASHED_KEYS contact mode",
-        })
-        .into());
-    }
+        PairingError::InvalidContactMessage("unknown contact_mode value")
+    })?;
 
     let mlkem_present = contact
         .mlkem_encapsulation_key
@@ -690,7 +680,7 @@ pub(crate) fn validate_contact_for_mode(
         .as_ref()
         .is_some_and(|v| !v.is_empty());
 
-    match expected {
+    match mode {
         ContactMode::InlineKeys => {
             if !mlkem_present {
                 return Err(PairingError::InvalidContactMessage(
@@ -743,6 +733,36 @@ pub(crate) fn validate_contact_for_mode(
     }
 
     Ok(())
+}
+
+/// Asserts the contact is structurally valid AND its declared
+/// `contact_mode` matches the mode the calling flow expects. Used at every
+/// orchestrator entry point that ingests a contact:
+///
+/// - `produce` requires [`ContactMode::InlineKeys`] (the responder needs
+///   the keys inline).
+/// - `produce_pre_pair_request` and `process_pre_pair_response` require
+///   [`ContactMode::HashedKeys`] (the keys must be fetched via PrePair).
+pub(crate) fn validate_contact_for_mode(
+    contact: &ContactMessage,
+    expected: ContactMode,
+) -> Result<(), crate::Error> {
+    if contact.contact_mode != expected as i32 {
+        #[cfg(feature = "logging")]
+        tracing::warn!(
+            contact_mode = contact.contact_mode,
+            expected = expected as i32,
+            "contact_mode mismatch"
+        );
+
+        return Err(PairingError::InvalidContactMessage(match expected {
+            ContactMode::InlineKeys => "expected INLINE_KEYS contact mode",
+            ContactMode::HashedKeys => "expected HASHED_KEYS contact mode",
+        })
+        .into());
+    }
+
+    validate(contact)
 }
 
 fn create_contact_inlined_keys(

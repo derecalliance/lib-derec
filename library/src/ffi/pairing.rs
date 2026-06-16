@@ -189,6 +189,52 @@ pub extern "C" fn create_contact_message(
     }
 }
 
+/// Structurally validate a proto-encoded `ContactMessage`. Returns a
+/// successful [`DeRecError`] iff the contact's `(contact_mode, inline keys,
+/// binding hash)` tuple satisfies the per-mode invariants enforced by the
+/// pairing primitives. Intended for bindings to call at their parse
+/// boundary (e.g. `FromProtoBytes`) so that the decoded value handed to
+/// application code is guaranteed well-formed.
+///
+/// Failure codes:
+/// - [`DEREC_CODE_FFI_BAD_PROTO`] if the bytes do not decode as a
+///   `ContactMessage`.
+/// - The library's `InvalidContactMessage` error code on any structural
+///   violation (unknown `contact_mode`, mode/field mismatch, wrong
+///   binding-hash length).
+///
+/// # Safety
+///
+/// `contact_message_ptr` must point to a readable range of
+/// `contact_message_len` bytes (or be null with `len == 0`).
+#[unsafe(no_mangle)]
+pub extern "C" fn validate_contact_message(
+    contact_message_ptr: *const u8,
+    contact_message_len: usize,
+) -> DeRecError {
+    let contact_message_bytes = match parse_buffer(
+        contact_message_ptr,
+        contact_message_len,
+        "contact_message_ptr",
+    ) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let contact_message = match ContactMessage::decode(contact_message_bytes) {
+        Ok(c) => c,
+        Err(_) => {
+            return ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                "contact_message_bytes is not a valid ContactMessage",
+            );
+        }
+    };
+    match crate::primitives::pairing::request::validate(&contact_message) {
+        Ok(()) => success(),
+        Err(e) => from_lib_error(e),
+    }
+}
+
 /// `communication_info_ptr` may be null / zero-length to indicate no
 /// communication info; otherwise it must be serialized [`CommunicationInfo`]
 /// proto bytes.

@@ -107,6 +107,12 @@ internal static class Pairing
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern DeRecError validate_contact_message(
+        byte[] contactMessageBytes,
+        UIntPtr contactMessageBytesLen
+    );
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern ProducePairRequestMessageResult produce_pair_request_message(
         int senderKind,
         byte[] transportProtocolBytes,

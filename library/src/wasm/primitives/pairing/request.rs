@@ -62,17 +62,36 @@ pub fn create_contact(
     })
 }
 
+/// Structurally validate a JS-side [`ContactMessage`]. Throws on any
+/// mode/field inconsistency (unknown `contact_mode`, mode/field mismatch,
+/// wrong binding-hash length).
+#[wasm_bindgen(js_name = "pairing_contact_message_validate")]
+pub fn validate_contact_message(contact_message: JsValue) -> Result<(), JsValue> {
+    let cm: ContactMessage = from_js(contact_message)?;
+    let cm_proto: derec_proto::ContactMessage = cm.into();
+    request::validate(&cm_proto).map_err(js_error_from_lib)
+}
+
+/// Encodes a [`ContactMessage`] to proto wire bytes. Structurally validates
+/// the input first so a locally-constructed contact that violates the
+/// mode/field invariant is rejected at the boundary rather than silently
+/// serialized.
 #[wasm_bindgen(js_name = "pairing_request_encode_contact")]
 pub fn encode_contact(contact_message: JsValue) -> Result<Vec<u8>, JsValue> {
     let cm: ContactMessage = from_js(contact_message)?;
     let cm_proto: derec_proto::ContactMessage = cm.into();
+    request::validate(&cm_proto).map_err(js_error_from_lib)?;
     Ok(cm_proto.encode_to_vec())
 }
 
+/// Decodes a proto-encoded [`ContactMessage`]. Structurally validates the
+/// decoded value before returning it to application code so consumers can
+/// trust the mode/field invariants documented on the wire format.
 #[wasm_bindgen(js_name = "pairing_request_decode_contact")]
 pub fn decode_contact(bytes: &[u8]) -> Result<JsValue, JsValue> {
     let cm = derec_proto::ContactMessage::decode(bytes)
         .map_err(|e| js_error("PROTOBUF_DECODE_ERROR", e.to_string()))?;
+    request::validate(&cm).map_err(js_error_from_lib)?;
     let cm_js: ContactMessage = cm.into();
     to_js(&cm_js)
 }
