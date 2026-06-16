@@ -1,5 +1,46 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! Unpair flow handlers — initiator side ([`start`], [`on_response`])
+//! and responder side ([`accept`], [`reject`]).
+//!
+//! # Security: response replay is harmless by design
+//!
+//! The on-wire [`UnpairResponseMessage`] carries no nonce or
+//! request-id binding, and the primitive's
+//! [`crate::primitives::unpairing::response::extract`] only checks
+//! the envelope/body timestamp equality (not freshness). A captured
+//! `OK` response can therefore be re-decoded indefinitely under the
+//! long-lived channel key. This flow nevertheless tolerates replay
+//! safely because:
+//!
+//! 1. **Per-channel pending-unpair guard.** [`on_response`] requires
+//!    a matching entry in `pending_unpair: HashMap<ChannelId, u64>`
+//!    (inserted by [`start`] under
+//!    [`crate::protocol::UnpairAck::Required`]) and consumes it
+//!    atomically via `remove`. A replayed response after the
+//!    pending entry has already been consumed sees no entry and
+//!    returns [`DeRecEvent::NoOp`] — no state is touched.
+//! 2. **Destructive-idempotent teardown.** When a pending entry is
+//!    present, the response IS legitimate (or indistinguishable
+//!    from one) and [`drop_channel_state`] runs. That function only
+//!    deletes per-`(secret_id, channel_id)` rows whose store
+//!    [`crate::protocol::DeRecChannelStore::remove`] /
+//!    [`crate::protocol::DeRecShareStore::remove_channel`] /
+//!    [`crate::protocol::DeRecSecretStore::remove`] contracts are
+//!    explicitly idempotent — running them twice on the same key
+//!    converges to the same end state as running them once.
+//! 3. **Channel-id freshness across re-pair.** After teardown the
+//!    `channel_id` is gone from the channel store; any future pair
+//!    handshake mints a fresh cryptographically-derived id, so a
+//!    stale response cannot accidentally target a newly-paired
+//!    channel.
+//!
+//! The worst case under replay is therefore "unpair a channel that's
+//! already unpaired" — the same end state the legitimate flow
+//! produces. No cross-request satisfaction is possible because the
+//! `pending_unpair` map is keyed by `channel_id` and the response
+//! envelope is routed by channel id at the transport layer.
+
 use super::super::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport,
     MissingPolicy, PendingAction, SecretKind, SecretValue, events::UnpairAck,
@@ -238,6 +279,15 @@ fn on_request(
     }])
 }
 
+/// Handle an inbound [`UnpairResponseMessage`] on the initiator
+/// side under [`crate::protocol::UnpairAck::Required`].
+///
+/// The `pending_unpair.remove(&channel_id)` check below is the
+/// flow's replay guard: an `UnpairResponse` is only acted on when a
+/// matching outbound `UnpairRequest` is still in flight for that
+/// `channel_id`. Replayed or stale responses (which the primitive
+/// alone cannot detect — see the module-level Security section)
+/// fall through to [`DeRecEvent::NoOp`] without mutating any state.
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
@@ -251,6 +301,10 @@ async fn on_response<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecret
     channel_id: ChannelId,
     response: &UnpairResponseMessage,
 ) -> Result<Vec<DeRecEvent>> {
+    // Replay/freshness guard. See the module docs for the full
+    // idempotency argument — a missing entry means no in-flight
+    // unpair for this channel, so the response (legitimate or
+    // replayed) is dropped as a no-op.
     if pending_unpair.remove(&channel_id).is_none() {
         return Ok(vec![DeRecEvent::NoOp]);
     }

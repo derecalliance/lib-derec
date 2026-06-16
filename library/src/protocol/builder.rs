@@ -117,7 +117,26 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, Transport, OwnTrans
     /// Minimum number of shares required to reconstruct the secret.
     ///
     /// Default: `3`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `threshold < 2`. A threshold of `0` would let any
+    /// helper reconstruct the secret unilaterally, and a threshold
+    /// of `1` collapses the Shamir/VSS scheme to a single-share
+    /// secret — both defeat the core security guarantee of threshold
+    /// secret sharing. Two is the minimum value that preserves
+    /// secret confidentiality against a single compromised helper.
+    ///
+    /// FFI and WASM entry points reject invalid values at the
+    /// language boundary with `DEREC_CODE_INVALID_THRESHOLD` /
+    /// `INVALID_THRESHOLD` rather than letting the panic propagate.
     pub fn with_threshold(mut self, threshold: usize) -> Self {
+        assert!(
+            threshold >= 2,
+            "DeRecProtocolBuilder::with_threshold: threshold must be >= 2 (got {threshold}). \
+             A threshold of 0 or 1 lets a single helper reconstruct the secret and defeats \
+             the threshold-sharing security guarantee."
+        );
         self.threshold = threshold;
         self
     }
@@ -553,5 +572,200 @@ impl<
         protocol.auto_reply_to = self.auto_reply_to;
         protocol.replica_id = self.replica_id;
         protocol
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Boundary value: threshold == 2 is the minimum valid input.
+    #[test]
+    fn with_threshold_accepts_2() {
+        let b = DeRecProtocolBuilder::new(0).with_threshold(2);
+        assert_eq!(b.threshold, 2);
+    }
+
+    /// Higher thresholds (production default and beyond) pass through.
+    #[test]
+    fn with_threshold_accepts_3_and_above() {
+        let b3 = DeRecProtocolBuilder::new(0).with_threshold(3);
+        assert_eq!(b3.threshold, 3);
+        let b_high = DeRecProtocolBuilder::new(0).with_threshold(100);
+        assert_eq!(b_high.threshold, 100);
+    }
+
+    /// Threshold == 0 collapses the scheme entirely — must panic.
+    #[test]
+    #[should_panic(expected = "threshold must be >= 2 (got 0)")]
+    fn with_threshold_rejects_zero() {
+        let _ = DeRecProtocolBuilder::new(0).with_threshold(0);
+    }
+
+    /// Threshold == 1 lets a single helper reconstruct — must panic.
+    #[test]
+    #[should_panic(expected = "threshold must be >= 2 (got 1)")]
+    fn with_threshold_rejects_one() {
+        let _ = DeRecProtocolBuilder::new(0).with_threshold(1);
+    }
+
+    /// Defense-in-depth: the low-level `DeRecProtocol::new`
+    /// constructor enforces the same floor for callers that bypass
+    /// the typed builder. We construct via the FFI-mode stores so
+    /// the type bound resolves with concrete `DeRecChannelStore`
+    /// etc. implementations.
+    #[test]
+    #[should_panic(expected = "threshold must be >= 2 (got 0)")]
+    fn protocol_new_rejects_zero_threshold() {
+        use crate::protocol::traits::{
+            ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecShareStore,
+            DeRecTransport, DeRecUserSecretStore, SecretStoreFuture, ShareStoreFuture,
+            TransportFuture,
+        };
+        use crate::protocol::types::{Channel, MissingPolicy, SecretKind, SecretValue, Share, UserSecrets};
+        use crate::types::ChannelId;
+        use derec_proto::TransportProtocol;
+
+        struct NoopChannelStore;
+        impl DeRecChannelStore for NoopChannelStore {
+            fn load(&self, _: u64, _: ChannelId) -> ChannelStoreFuture<'_, Option<Channel>> {
+                Box::pin(std::future::ready(Ok(None)))
+            }
+            fn save(&mut self, _: u64, _: Channel) -> ChannelStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn remove(&mut self, _: u64, _: ChannelId) -> ChannelStoreFuture<'_, bool> {
+                Box::pin(std::future::ready(Ok(false)))
+            }
+            fn channels(&self, _: u64) -> ChannelStoreFuture<'_, Vec<Channel>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+            fn link_channel(
+                &mut self,
+                _: u64,
+                _: ChannelId,
+                _: ChannelId,
+            ) -> ChannelStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn linked_channels(
+                &self,
+                _: u64,
+                cid: ChannelId,
+            ) -> ChannelStoreFuture<'_, Vec<ChannelId>> {
+                Box::pin(std::future::ready(Ok(vec![cid])))
+            }
+        }
+
+        struct NoopShareStore;
+        impl DeRecShareStore for NoopShareStore {
+            fn load(
+                &self,
+                _: u64,
+                _: ChannelId,
+                _: &[u32],
+            ) -> ShareStoreFuture<'_, Vec<Share>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+            fn load_many(
+                &self,
+                _: u64,
+                _: &[ChannelId],
+                _: &[u32],
+            ) -> ShareStoreFuture<'_, Vec<Share>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+            fn load_all(
+                &self,
+                _: u64,
+                _: &[ChannelId],
+            ) -> ShareStoreFuture<'_, Vec<Share>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+            fn latest_version(&self, _: u64) -> ShareStoreFuture<'_, Option<u32>> {
+                Box::pin(std::future::ready(Ok(None)))
+            }
+            fn save(&mut self, _: u64, _: ChannelId, _: Share) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn remove_channel(&mut self, _: u64, _: ChannelId) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+        }
+
+        struct NoopSecretStore;
+        impl DeRecSecretStore for NoopSecretStore {
+            fn load(
+                &self,
+                _: u64,
+                _: ChannelId,
+                _: SecretKind,
+            ) -> SecretStoreFuture<'_, Option<SecretValue>> {
+                Box::pin(std::future::ready(Ok(None)))
+            }
+            fn load_many(
+                &self,
+                _: u64,
+                _: &[ChannelId],
+                _: SecretKind,
+                _: MissingPolicy,
+            ) -> SecretStoreFuture<'_, Vec<(ChannelId, SecretValue)>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+            fn save(
+                &mut self,
+                _: u64,
+                _: ChannelId,
+                _: SecretValue,
+            ) -> SecretStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn remove(
+                &mut self,
+                _: u64,
+                _: ChannelId,
+                _: SecretKind,
+            ) -> SecretStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+        }
+
+        struct NoopUserSecretStore;
+        impl DeRecUserSecretStore for NoopUserSecretStore {
+            fn load_latest(&self, _: u64) -> ShareStoreFuture<'_, Option<UserSecrets>> {
+                Box::pin(std::future::ready(Ok(None)))
+            }
+            fn save_latest(&mut self, _: u64, _: UserSecrets) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn remove(&mut self, _: u64) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+        }
+
+        struct NoopTransport;
+        impl DeRecTransport for NoopTransport {
+            fn send(&self, _: &TransportProtocol, _: Vec<u8>) -> TransportFuture<'_> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+        }
+
+        // threshold = 0 — the defense-in-depth assertion in
+        // `DeRecProtocol::new` is what catches this.
+        let _ = DeRecProtocol::new(
+            0,
+            NoopChannelStore,
+            NoopShareStore,
+            NoopSecretStore,
+            NoopUserSecretStore,
+            NoopTransport,
+            TransportProtocol {
+                uri: String::new(),
+                protocol: 0,
+            },
+            0, // ← invalid threshold
+            3,
+            30,
+        );
     }
 }

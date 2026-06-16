@@ -355,7 +355,20 @@ impl DeRecProtocolBuilderWasm {
             .with_secret_store(JsSecretStore(secret_store))
             .with_user_secret_store(JsUserSecretStore(user_secret_store))
             .with_transport(JsTransport(transport))
-            .with_own_transport(own_transport)
+            .with_own_transport(own_transport);
+        // Reject degenerate thresholds before the inner builder's
+        // panic on `< 2` could fire. See
+        // `DeRecProtocolBuilder::with_threshold` for the rationale.
+        if self.threshold < 2 {
+            return Err(js_error(
+                "INVALID_THRESHOLD",
+                format!(
+                    "threshold must be >= 2 (got {}); 0 or 1 lets a single helper reconstruct the secret and defeats threshold sharing",
+                    self.threshold
+                ),
+            ));
+        }
+        let mut builder = builder
             .with_threshold(self.threshold as usize)
             .with_keep_versions_count(self.keep_versions_count as usize)
             .with_communication_info(self.communication_info)

@@ -382,6 +382,20 @@ pub fn produce_pre_pair(
 /// - `envelope.timestamp != response.timestamp`
 /// - the inner message is not a [`derec_proto::PairResponseMessage`]
 ///
+/// # Security: no freshness or replay protection
+///
+/// The timestamp check enforced here only binds the envelope to the
+/// inner body (`envelope.timestamp == body.timestamp`). It does NOT
+/// enforce a freshness window against the receiver's clock and does
+/// NOT detect replays of a previously-captured ciphertext. Pairing
+/// has a small extra mitigation (the per-channel `ContactMessage`
+/// nonce is one-shot, so a replayed PairResponse cannot complete a
+/// fresh pairing once the original session is over), but a recorded
+/// envelope can still be re-decoded and inspected later. Callers
+/// MUST add a freshness window and per-channel anti-replay
+/// (monotonic counter or nonce log) on top before driving any
+/// side-effecting state off the parsed body.
+///
 /// # Example
 ///
 /// ```
@@ -504,6 +518,18 @@ pub fn extract(
 /// - the inner [`MessageBody`] cannot be decoded
 /// - the inner [`MessageBody`] is not a [`PrePairResponseMessage`]
 /// - `envelope.timestamp != response.timestamp`
+///
+/// # Security: no freshness or replay protection
+///
+/// The timestamp check enforced here only binds the envelope to the
+/// inner body (`envelope.timestamp == body.timestamp`). It does NOT
+/// enforce a freshness window against the receiver's clock and does
+/// NOT detect replays of a previously-captured envelope. PrePair
+/// envelopes are plaintext (no shared key yet), so a recorded
+/// envelope can be replayed verbatim by anyone on path. Callers
+/// MUST add a freshness window and per-channel anti-replay
+/// (monotonic counter or nonce log) on top before driving any
+/// side-effecting state off the parsed body.
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))

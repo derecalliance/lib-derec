@@ -154,6 +154,22 @@ pub unsafe extern "C" fn derec_protocol_new(
         .into();
     }
 
+    // Reject degenerate thresholds at the FFI boundary so the Rust
+    // builder's panic on `< 2` never propagates across the language
+    // boundary (panicking across FFI is itself UB). See
+    // [`DeRecProtocolBuilder::with_threshold`] for the security
+    // rationale.
+    if threshold < 2 {
+        return ffi_error(
+            crate::ffi::error::DEREC_CODE_INVALID_THRESHOLD,
+            format!(
+                "threshold must be >= 2 (got {threshold}); 0 or 1 lets a single helper \
+                 reconstruct the secret and defeats threshold sharing"
+            ),
+        )
+        .into();
+    }
+
     let own_uri = if own_transport_uri_len == 0 {
         String::new()
     } else if own_transport_uri_ptr.is_null() {

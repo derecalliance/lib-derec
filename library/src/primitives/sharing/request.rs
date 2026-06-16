@@ -284,6 +284,16 @@ pub fn produce(
 /// - The decrypted [`derec_proto::StoreShareRequestMessage`] carries the committed share the
 ///   Helper must persist for future verification and recovery; treat it as sensitive material
 ///   and store it securely.
+/// - **No freshness or replay protection.** The timestamp check
+///   enforced here only binds the envelope to the inner body
+///   (`envelope.timestamp == body.timestamp`). It does NOT enforce
+///   a freshness window against the receiver's clock and does NOT
+///   detect replays of a previously-captured ciphertext. Because
+///   the channel key is long-lived, a recorded envelope stays
+///   decryptable indefinitely. Callers MUST add a freshness window
+///   and per-channel anti-replay (monotonic counter or nonce log)
+///   on top before driving any side-effecting state off the parsed
+///   body.
 ///
 /// # Example
 ///

@@ -194,6 +194,18 @@ impl<
     /// Construct a new [`DeRecProtocol`] with the provided stores, transport, and own endpoint.
     ///
     /// Prefer [`DeRecProtocolBuilder`] for a compile-time-checked construction path.
+    /// Construct a [`DeRecProtocol`] directly from its components.
+    ///
+    /// Prefer [`DeRecProtocolBuilder`] for the type-checked
+    /// construction path. The builder enforces the same threshold
+    /// floor — see [`DeRecProtocolBuilder::with_threshold`] for the
+    /// security rationale.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `threshold < 2`. A threshold of `0` or `1` collapses
+    /// threshold secret sharing and lets a single helper reconstruct
+    /// the secret unilaterally.
     pub fn new(
         secret_id: u64,
         channel_store: Ch,
@@ -206,6 +218,12 @@ impl<
         keep_versions_count: usize,
         timeout_in_secs: u64,
     ) -> Self {
+        assert!(
+            threshold >= 2,
+            "DeRecProtocol::new: threshold must be >= 2 (got {threshold}). \
+             A threshold of 0 or 1 lets a single helper reconstruct the secret and defeats \
+             the threshold-sharing security guarantee."
+        );
         Self {
             channel_store,
             share_store,
