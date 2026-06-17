@@ -132,10 +132,20 @@ impl MessageBody {
 
         let any = Any::decode(message_bytes)?;
 
-        let type_name = any
-            .type_url
-            .strip_prefix(TYPE_URL_PREFIX)
-            .unwrap_or(&any.type_url);
+        // Canonical wire form is `type.derec.org/<MessageName>` — the encoder
+        // only ever emits the prefixed form, so the parser refuses anything
+        // else. Accepting a bare name would erase the type-domain binding
+        // the prefix provides and create two byte-distinct encodings for
+        // the same logical message (a canonicalization gap that downstream
+        // byte-level dedup / cross-implementation comparisons depend on
+        // not existing).
+        let type_name = any.type_url.strip_prefix(TYPE_URL_PREFIX).ok_or_else(|| {
+            #[allow(deprecated)]
+            DecodeError::new(format!(
+                "type_url `{}` is missing the required `{TYPE_URL_PREFIX}` namespace prefix",
+                any.type_url
+            ))
+        })?;
 
         let body = match type_name {
             "PairRequestMessage" => {
@@ -194,5 +204,73 @@ impl MessageBody {
         };
 
         Ok(body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prost::Message as _;
+    use prost_types::Any;
+
+    fn unpair_request_bytes() -> Vec<u8> {
+        UnpairRequestMessage {
+            memo: "bye".to_owned(),
+            timestamp: None,
+            reply_to: None,
+        }
+        .encode_to_vec()
+    }
+
+    /// The canonical wire form (`type.derec.org/<MessageName>`) emitted by
+    /// `encode_to_vec` must round-trip through `decode_from_vec`.
+    #[test]
+    fn decode_accepts_canonical_prefixed_type_url() {
+        let body = MessageBody::UnpairRequest(UnpairRequestMessage {
+            memo: "bye".to_owned(),
+            timestamp: None,
+            reply_to: None,
+        });
+        let bytes = body.encode_to_vec();
+        let round_tripped =
+            MessageBody::decode_from_vec(&bytes).expect("canonical encoding must decode");
+        assert!(matches!(round_tripped, MessageBody::UnpairRequest(_)));
+    }
+
+    /// A bare `<MessageName>` without the `type.derec.org/` prefix must be
+    /// rejected — accepting it would create a second wire encoding for the
+    /// same logical message and erase the type-domain binding the prefix
+    /// provides.
+    #[test]
+    fn decode_rejects_unprefixed_type_url() {
+        let any = Any {
+            type_url: "UnpairRequestMessage".to_owned(),
+            value: unpair_request_bytes(),
+        };
+        let err = MessageBody::decode_from_vec(&any.encode_to_vec())
+            .expect_err("unprefixed type_url must be rejected");
+        assert!(
+            err.to_string()
+                .contains("is missing the required `type.derec.org/` namespace prefix"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A foreign-namespace prefix (e.g. another protocol's domain) must be
+    /// rejected. Strict prefix matching is what enforces that the `Any`
+    /// payload belongs to the DeRec type domain.
+    #[test]
+    fn decode_rejects_foreign_namespace_prefix() {
+        let any = Any {
+            type_url: "type.example.com/UnpairRequestMessage".to_owned(),
+            value: unpair_request_bytes(),
+        };
+        let err = MessageBody::decode_from_vec(&any.encode_to_vec())
+            .expect_err("foreign-namespace type_url must be rejected");
+        assert!(
+            err.to_string()
+                .contains("is missing the required `type.derec.org/` namespace prefix"),
+            "unexpected error: {err}"
+        );
     }
 }
