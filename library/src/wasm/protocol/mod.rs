@@ -810,6 +810,10 @@ pub async fn restore_from_recovered_bag(
                 Share {
                     secret_id: secret_id_u64,
                     version,
+                    // Owner-side tracking-only entry created from a
+                    // separate test fixture path — there is no producing
+                    // replica here, so `replica_id` is None.
+                    replica_id: None,
                     // Owner-side tracking entry — the helper holds the real
                     // share bytes; the owner only records that it was sent.
                     bytes: Vec::new(),

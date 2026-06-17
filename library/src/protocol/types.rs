@@ -333,6 +333,17 @@ pub struct Share {
     pub secret_id: u64,
     /// Version number of the secret.
     pub version: u32,
+    /// Stable per-device identifier of the replica that produced this
+    /// share, copied from
+    /// [`derec_proto::StoreShareRequestMessage::replica_id`] when the
+    /// helper persisted the write.
+    ///
+    /// `None` when the writer was a non-replica `Owner`. `Some(id)` when
+    /// the writer was `ReplicaSource`. Two distinct replicas may produce
+    /// the same `(secret_id, channel_id, version)` independently
+    /// — see [`crate::protocol::DeRecShareStore::save`] for the
+    /// conceptual storage key and the disambiguation contract.
+    pub replica_id: Option<u64>,
     /// Opaque protobuf bytes — see [`crate::protocol::DeRecShareStore`] for
     /// the per-side format.
     pub bytes: Vec<u8>,

@@ -154,6 +154,15 @@ pub extern "C" fn produce_store_share_request_message(
     // persisting the endpoint.
     reply_to_ptr: *const u8,
     reply_to_len: usize,
+    // Writer's `replica_id` (the producer of this share). The optional
+    // pair follows the existing `has_replica_id` / `replica_id` convention
+    // used at the protocol builder (see [`derec_protocol_new`]):
+    // `has_replica_id == 0` writes `None` on the wire; otherwise the
+    // `replica_id` value is stamped on `StoreShareRequestMessage.replica_id`
+    // so the helper can disambiguate concurrent writes from different
+    // replicas reusing the source's shared key.
+    has_replica_id: u32,
+    replica_id: u64,
 ) -> ProduceStoreShareRequestMessageResult {
     let with_err = |error| ProduceStoreShareRequestMessageResult {
         error,
@@ -207,6 +216,12 @@ pub extern "C" fn produce_store_share_request_message(
         Err(e) => return with_err(e),
     };
 
+    let replica_id_opt = if has_replica_id != 0 {
+        Some(replica_id)
+    } else {
+        None
+    };
+
     match crate::primitives::sharing::request::produce(
         ChannelId(channel_id),
         version,
@@ -216,6 +231,7 @@ pub extern "C" fn produce_store_share_request_message(
         description,
         &shared_key,
         reply_to,
+        replica_id_opt,
     ) {
         Ok(r) => ProduceStoreShareRequestMessageResult {
             error: success(),

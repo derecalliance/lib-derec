@@ -132,6 +132,7 @@ fn create_store_share_request_envelope(
         timestamp: Some(timestamp),
         secret_id: 1,
         reply_to: None,
+        replica_id: None,
     };
 
     DeRecMessageBuilder::channel()
@@ -496,6 +497,7 @@ fn test_produce_get_share_response_message_stored_share_timestamp_mismatch() {
         timestamp: Some(message_timestamp),
         secret_id,
         reply_to: None,
+        replica_id: None,
     };
 
     let tampered_stored_share_envelope = DeRecMessageBuilder::channel()
@@ -657,6 +659,7 @@ fn test_recovery_end_to_end() {
             timestamp: Some(timestamp),
             secret_id,
             reply_to: None,
+        replica_id: None,
         };
         let stored_share_envelope = DeRecMessageBuilder::channel()
             .channel_id(*channel_id)

@@ -155,6 +155,35 @@ message StoreShareRequestMessage {
   // - Present: the responder routes this exchange's response to this
   //   endpoint and leaves the stored endpoint unchanged.
   optional TransportProtocol replyTo = 8;
+
+  // Stable per-device identifier of the replica that produced this share.
+  //
+  // # Why this field exists
+  //
+  // Replica destinations reuse the source's shared keys with helpers (the
+  // keys travel inside the `ReplicaSecretPayload` vault). Two distinct
+  // replicas writing the same `(secretId, channelId, version)` from the
+  // helper's perspective look cryptographically identical — same envelope
+  // key, same channel id. Without this field the helper's `ShareStore`
+  // would coalesce the writes and silently drop one of the two shares.
+  //
+  // # Semantics
+  //
+  // - Absent (default): the writer is a non-replica `Owner` (no
+  //   `replica_id` configured at the builder).
+  // - Present: the writer is `ReplicaSource` and is announcing its
+  //   identity. The helper treats `replica_id` as part of the storage
+  //   key so distinct replicas writing the same version coexist.
+  //
+  // # Out of scope for the protocol
+  //
+  // The protocol does not authenticate the claim; anyone holding the
+  // channel's shared key may write any `replica_id`. The field is
+  // metadata the application uses to detect conflicts (e.g. two
+  // replicas independently bumped `version`). Conflict resolution is
+  // the application's responsibility — the protocol just surfaces what
+  // it knows.
+  optional uint64 replicaId = 9;
 }
 
 // StoreShareResponseMessage is the response to a StoreShareRequestMessage.

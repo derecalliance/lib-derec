@@ -55,6 +55,7 @@ fn make_request_with_mutated_share(
         timestamp: Some(timestamp),
         secret_id,
         reply_to: None,
+        replica_id: None,
     }
 }
 
@@ -212,6 +213,7 @@ fn test_produce_store_share_request_message_valid() {
         "",
         &shared_key,
         None,
+        None,
     )
     .expect("produce_store_share_request_message should succeed");
 
@@ -246,6 +248,7 @@ fn test_produce_store_share_request_message_with_keep_list_and_description() {
         &[1, 2],
         "initial share distribution",
         &shared_key,
+        None,
         None,
     )
     .expect("produce_store_share_request_message should succeed");
@@ -283,6 +286,7 @@ fn test_produce_store_share_response_message_valid() {
         &[],
         "",
         &shared_key,
+        None,
         None,
     )
     .expect("produce_store_share_request_message should succeed");
@@ -358,6 +362,7 @@ fn test_extract_store_share_request_wrong_key() {
         "",
         &shared_key,
         None,
+        None,
     )
     .expect("produce_store_share_request_message should succeed");
 
@@ -431,6 +436,7 @@ fn test_process_store_share_response_message_valid() {
         "",
         &shared_key,
         None,
+        None,
     )
     .expect("produce_store_share_request_message should succeed");
 
@@ -479,6 +485,7 @@ fn test_process_store_share_response_message_wrong_version() {
         &[],
         "",
         &shared_key,
+        None,
         None,
     )
     .expect("produce_store_share_request_message should succeed");
@@ -530,6 +537,7 @@ fn test_extract_store_share_response_wrong_key() {
         &[],
         "",
         &shared_key,
+        None,
         None,
     )
     .expect("produce_store_share_request_message should succeed");
@@ -627,6 +635,7 @@ fn test_extract_store_share_request_rejects_scheme_mismatched_reply_to() {
         String::new(),
         &shared_key,
         Some(malicious_reply_to),
+        None,
     )
     .expect("failed to produce store share request");
 
@@ -638,4 +647,63 @@ fn test_extract_store_share_request_rejects_scheme_mismatched_reply_to() {
             crate::transport::TransportValidationError::SchemeMismatch { .. }
         ))
     ));
+}
+
+/// `produce` stamps `replica_id` onto the wire message and `extract`
+/// round-trips it. Owner case (`None`) and replica case (`Some(_)`)
+/// both pass through unchanged so the helper-side handler can
+/// disambiguate concurrent writes from distinct replicas reusing the
+/// source's shared key.
+#[test]
+fn test_store_share_request_round_trips_replica_id() {
+    let secret_id: u64 = 1;
+    let secret_data = b"replica-id-roundtrip";
+    let channels = make_channel_ids(&[1, 2, 3]);
+    let version = 1;
+
+    let SplitResult { shares } =
+        split(&channels, secret_id, version, secret_data, 2).expect("split should succeed");
+
+    let channel_id = ChannelId(1);
+    let committed_share = shares.get(&channel_id).expect("missing share");
+    let shared_key = [42u8; 32];
+
+    // Owner case: replica_id = None round-trips as None.
+    let owner_env = produce_store_share_request_message(
+        channel_id,
+        version,
+        secret_id,
+        committed_share,
+        &[],
+        String::new(),
+        &shared_key,
+        None,
+        None,
+    )
+    .expect("owner-side produce")
+    .envelope;
+    let owner_extracted =
+        extract_store_share_request(&owner_env, &shared_key).expect("owner-side extract");
+    assert_eq!(owner_extracted.request.replica_id, None);
+
+    // Replica case: stamped id round-trips verbatim.
+    let replica_env = produce_store_share_request_message(
+        channel_id,
+        version,
+        secret_id,
+        committed_share,
+        &[],
+        String::new(),
+        &shared_key,
+        None,
+        Some(0xCAFE_BABE_DEAD_BEEF),
+    )
+    .expect("replica-side produce")
+    .envelope;
+    let replica_extracted = extract_store_share_request(&replica_env, &shared_key)
+        .expect("replica-side extract");
+    assert_eq!(
+        replica_extracted.request.replica_id,
+        Some(0xCAFE_BABE_DEAD_BEEF)
+    );
 }

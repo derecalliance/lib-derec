@@ -18,6 +18,13 @@ use prost::Message;
 pub struct VersionEntry {
     pub version: u32,
     pub description: String,
+    /// Stable per-device identifier of the replica that produced this
+    /// version. `None` for a non-replica `Owner`; `Some(id)` for a
+    /// `ReplicaSource`. Surfaces conflict candidates to the application:
+    /// two distinct `replica_id`s with the same `version` for the same
+    /// `secret_id` indicate concurrent writes the application must
+    /// reconcile before driving recovery.
+    pub replica_id: Option<u64>,
 }
 
 impl From<&VersionEntry> for ProtoVersionEntry {
@@ -25,6 +32,7 @@ impl From<&VersionEntry> for ProtoVersionEntry {
         ProtoVersionEntry {
             version: version.version,
             version_description: version.description.to_owned(),
+            replica_id: version.replica_id,
         }
     }
 }
@@ -46,6 +54,7 @@ impl From<&ProtoVersionEntry> for VersionEntry {
         Self {
             version: entry.version,
             description: entry.version_description.to_owned(),
+            replica_id: entry.replica_id,
         }
     }
 }

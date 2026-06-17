@@ -14,6 +14,15 @@ public static partial class Discovery
     {
         public required uint Version { get; init; }
         public required string Description { get; init; }
+        /// <summary>
+        /// Stable per-device identifier of the replica that produced this
+        /// version. <c>null</c> means a non-replica <c>Owner</c> produced
+        /// it. Two distinct <c>ReplicaId</c>s with the same
+        /// <c>Version</c> for the same <c>SecretId</c> indicate
+        /// concurrent writes the application must reconcile before
+        /// driving recovery.
+        /// </summary>
+        public ulong? ReplicaId { get; init; }
     }
 
     public sealed class SecretVersionEntry
@@ -46,6 +55,18 @@ public static partial class Discovery
                     byte[] descBytes = Encoding.UTF8.GetBytes(v.Description ?? string.Empty);
                     writer.Write((uint)descBytes.Length);
                     writer.Write(descBytes);
+                    // Optional `replica_id` tail: 1-byte flag, then the
+                    // u64 LE only if the flag is set. Matches the Rust
+                    // FFI reader in `library/src/ffi/discovery.rs`.
+                    if (v.ReplicaId is { } replicaId)
+                    {
+                        writer.Write((byte)1);
+                        writer.Write(replicaId);
+                    }
+                    else
+                    {
+                        writer.Write((byte)0);
+                    }
                 }
             }
 
@@ -58,7 +79,9 @@ public static partial class Discovery
         private const int MinSecretVersionEntryBytes = 12;
         // Minimum on-wire size of a `VersionEntry` body: u32 version
         // + u32 desc_len + zero-length description = 8 bytes.
-        private const int MinVersionEntryBytes = 8;
+        // 4 (version) + 4 (desc_len) + 1 (has_replica_id flag) bytes
+        // minimum per version entry.
+        private const int MinVersionEntryBytes = 9;
 
         internal static List<SecretVersionEntry> Deserialize(byte[] bytes)
         {
@@ -108,7 +131,26 @@ public static partial class Discovery
                     }
                     string description = Encoding.UTF8.GetString(bytes, offset, (int)descLen);
                     offset += (int)descLen;
-                    versions.Add(new VersionEntry { Version = version, Description = description });
+                    // Optional `replica_id` tail: 1-byte flag, then the
+                    // u64 LE only if the flag is set.
+                    if (offset + 1 > bytes.Length)
+                    {
+                        throw new InvalidOperationException(
+                            $"Unexpected end of secret list bytes while reading replica_id flag for secret_id={secretId}, version={version}.");
+                    }
+                    byte hasReplicaId = bytes[offset];
+                    offset += 1;
+                    ulong? replicaId = null;
+                    if (hasReplicaId != 0)
+                    {
+                        replicaId = ReadU64(bytes, ref offset);
+                    }
+                    versions.Add(new VersionEntry
+                    {
+                        Version = version,
+                        Description = description,
+                        ReplicaId = replicaId,
+                    });
                 }
 
                 entries.Add(new SecretVersionEntry { SecretId = secretId, Versions = versions });

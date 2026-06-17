@@ -2486,7 +2486,7 @@ async fn run_replica_sync_version_progression_flow() {
         assert!(
             events.iter().any(|e| matches!(
                 e,
-                DeRecEvent::ShareStored { channel_id, version: 7 } if *channel_id == cid
+                DeRecEvent::ShareStored { channel_id, version: 7, .. } if *channel_id == cid
             )),
             "step 7: {label} must emit ShareStored at v=7"
         );
@@ -2519,7 +2519,7 @@ async fn run_replica_sync_version_progression_flow() {
         assert!(
             events.iter().any(|e| matches!(
                 e,
-                DeRecEvent::ShareStored { channel_id, version: 8 } if *channel_id == cid
+                DeRecEvent::ShareStored { channel_id, version: 8, .. } if *channel_id == cid
             )),
             "step 8: {label} must emit ShareStored at v=8 (fresh VSS round)"
         );

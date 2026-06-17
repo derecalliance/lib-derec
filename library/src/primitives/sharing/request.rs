@@ -216,6 +216,7 @@ pub fn produce(
     description: impl Into<String>,
     shared_key: &SharedKey,
     reply_to: Option<derec_proto::TransportProtocol>,
+    replica_id: Option<u64>,
 ) -> Result<ProduceResult, crate::Error> {
     let timestamp = current_timestamp();
 
@@ -228,6 +229,7 @@ pub fn produce(
         timestamp: Some(timestamp),
         secret_id,
         reply_to,
+        replica_id,
     };
 
     let envelope = DeRecMessageBuilder::channel()

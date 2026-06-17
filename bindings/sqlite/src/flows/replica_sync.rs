@@ -309,7 +309,7 @@ pub async fn run() {
         assert!(
             events.iter().any(|e| matches!(
                 e,
-                DeRecEvent::ShareStored { channel_id, version: 7 } if *channel_id == cid
+                DeRecEvent::ShareStored { channel_id, version: 7, .. } if *channel_id == cid
             )),
             "step 7: {label} must emit ShareStored at v=7"
         );
@@ -343,7 +343,7 @@ pub async fn run() {
         assert!(
             events.iter().any(|e| matches!(
                 e,
-                DeRecEvent::ShareStored { channel_id, version: 8 } if *channel_id == cid
+                DeRecEvent::ShareStored { channel_id, version: 8, .. } if *channel_id == cid
             )),
             "step 8: {label} must emit ShareStored at v=8"
         );

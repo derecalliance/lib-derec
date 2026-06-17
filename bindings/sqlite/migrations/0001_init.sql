@@ -29,13 +29,26 @@ CREATE TABLE secrets (
 );
 
 CREATE TABLE shares (
+    -- `replica_id` is part of the conceptual storage key: distinct
+    -- replicas writing the same `(secret_id, channel_id, version)`
+    -- must both survive because the wire layer cannot distinguish
+    -- them (they reuse the source's shared key). NULL means a
+    -- non-replica Owner produced the share.
+    --
+    -- SQLite forbids expressions inside PRIMARY KEY / UNIQUE
+    -- constraints, so the four-tuple uniqueness contract is expressed
+    -- via a separate UNIQUE INDEX with `COALESCE(replica_id, -1)` —
+    -- two Owner re-sends (both replica_id = NULL) still collide and
+    -- ON CONFLICT against the index updates the existing row.
     secret_id       INTEGER NOT NULL,
     channel_id      INTEGER NOT NULL,
     version         INTEGER NOT NULL,
+    replica_id      INTEGER,
     share_secret_id INTEGER NOT NULL,
-    bytes           BLOB    NOT NULL,
-    PRIMARY KEY (secret_id, channel_id, version)
+    bytes           BLOB    NOT NULL
 );
+CREATE UNIQUE INDEX shares_uniq
+    ON shares (secret_id, channel_id, version, COALESCE(replica_id, -1));
 
 CREATE TABLE user_secrets (
     secret_id   INTEGER NOT NULL PRIMARY KEY,

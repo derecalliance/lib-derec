@@ -290,11 +290,37 @@ pub trait DeRecShareStore {
     /// all channels, or `None` if no shares exist yet for this vault.
     fn latest_version(&self, secret_id: u64) -> ShareStoreFuture<'_, Option<u32>>;
 
-    /// Persist a share for `(secret_id, channel_id)`. Replaces any
-    /// previously stored entry for the same
-    /// `(secret_id, channel_id, share.version)` key. `share.secret_id`
-    /// is denormalized metadata and must match the partition key
-    /// `secret_id` — implementations may assert this.
+    /// Persist a share for `(secret_id, channel_id)`.
+    ///
+    /// # Conceptual storage key
+    ///
+    /// The protocol considers the full storage key to be
+    /// `(secret_id, channel_id, share.version, share.replica_id)`.
+    /// Replica destinations reuse the source's channel shared key with
+    /// helpers (the key travels in the `ReplicaSecretPayload` vault), so
+    /// two replicas writing the same `(secret_id, channel_id, version)`
+    /// look cryptographically identical at the wire layer — only
+    /// `share.replica_id` separates them. A naive helper that ignored
+    /// `replica_id` and overwrote on the three-tuple key would silently
+    /// lose one of the two writes.
+    ///
+    /// # Implementation freedom
+    ///
+    /// The trait does not dictate how implementations represent the
+    /// `replica_id` discriminator (separate column, composite primary
+    /// key, write-time conflict log, etc.). The contract is:
+    ///
+    /// - Writes from distinct `replica_id`s for the same
+    ///   `(secret_id, channel_id, version)` MUST both survive — neither
+    ///   may silently overwrite the other.
+    /// - A write that matches an existing entry on all four fields
+    ///   replaces it (idempotent re-send).
+    /// - `load`, `load_many`, and `load_all` return every distinct
+    ///   `(version, replica_id)` entry matching the requested filter;
+    ///   the application performs any per-application coalescing.
+    ///
+    /// `share.secret_id` is denormalized metadata and must match the
+    /// partition key `secret_id` — implementations may assert this.
     fn save(
         &mut self,
         secret_id: u64,

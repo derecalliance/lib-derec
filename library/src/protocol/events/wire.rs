@@ -61,6 +61,10 @@ pub(crate) enum Event {
     ShareStored {
         channel_id: String,
         version: u32,
+        /// Decimal-encoded `replica_id` of the writer, or `None` for a
+        /// non-replica `Owner`. Matches the proto's optional shape so
+        /// JS/.NET callers receive `null` for the absent case.
+        replica_id: Option<String>,
     },
     ShareConfirmed {
         channel_id: String,
@@ -301,9 +305,14 @@ impl Event {
                 status,
                 memo,
             },
-            DeRecEvent::ShareStored { channel_id, version } => Self::ShareStored {
+            DeRecEvent::ShareStored {
+                channel_id,
+                version,
+                replica_id,
+            } => Self::ShareStored {
                 channel_id: channel_id.0.to_string(),
                 version,
+                replica_id: replica_id.map(encode_replica_id),
             },
             DeRecEvent::ShareConfirmed { channel_id, version } => Self::ShareConfirmed {
                 channel_id: channel_id.0.to_string(),

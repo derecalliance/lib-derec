@@ -324,6 +324,16 @@ fn serialize_secret_list(entries: &[SecretVersionEntry]) -> Vec<u8> {
             let desc_bytes = v.description.as_bytes();
             write_u32_le(&mut out, desc_bytes.len() as u32);
             out.extend_from_slice(desc_bytes);
+            // Optional `replica_id` tail: 1-byte flag, then u64 LE
+            // when set. Mirrors the layout the .NET side reads in
+            // `DiscoveryWireFormat.Deserialize`.
+            match v.replica_id {
+                Some(id) => {
+                    out.push(1u8);
+                    write_u64_le(&mut out, id);
+                }
+                None => out.push(0u8),
+            }
         }
     }
     out
@@ -348,9 +358,22 @@ fn deserialize_secret_list(bytes: &[u8]) -> Result<Vec<SecretVersionEntry>, Stri
             let desc_bytes = read_exact(&mut input, desc_len)?;
             let description = String::from_utf8(desc_bytes.to_vec())
                 .map_err(|e| format!("invalid UTF-8 in description: {e}"))?;
+            // Optional `replica_id` tail: `has_replica_id: u8` flag
+            // followed by `replica_id: u64 LE` when set. `has = 0`
+            // means the version came from a non-replica `Owner`.
+            let has_replica_id = read_exact(&mut input, 1)?[0];
+            let replica_id = if has_replica_id != 0 {
+                let id_bytes = read_exact(&mut input, 8)?;
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(id_bytes);
+                Some(u64::from_le_bytes(arr))
+            } else {
+                None
+            };
             versions.push(VersionEntry {
                 version,
                 description,
+                replica_id,
             });
         }
         entries.push(SecretVersionEntry {

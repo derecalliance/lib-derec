@@ -113,6 +113,7 @@ impl ShareRecord {
         Ok(Share {
             secret_id,
             version: self.version,
+            replica_id: None,
             bytes: self.bytes,
         })
     }

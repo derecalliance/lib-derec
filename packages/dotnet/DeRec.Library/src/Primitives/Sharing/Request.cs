@@ -82,7 +82,8 @@ public static partial class Sharing
             uint[] keepList,
             string description,
             byte[] sharedKey,
-            TransportProtocol? replyTo = null
+            TransportProtocol? replyTo = null,
+            ulong? replicaId = null
         )
         {
             ArgumentNullException.ThrowIfNull(committedShare);
@@ -109,7 +110,9 @@ public static partial class Sharing
                     sharedKey,
                     (UIntPtr)sharedKey.Length,
                     replyToBytes,
-                    replyToLen
+                    replyToLen,
+                    replicaId.HasValue ? 1u : 0u,
+                    replicaId ?? 0
                 );
 
             try

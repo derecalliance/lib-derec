@@ -123,10 +123,15 @@ pub(in crate::protocol) async fn accept<
     let linked_ids = channel_store.linked_channels(secret_id, channel_id).await?;
     let all_shares = share_store.load_all(secret_id, &linked_ids).await?;
 
-    // Group by secret_id across all linked channels, deduplicating by version.
-    // Key: secret_id (u64) → version → description.
-    let mut secret_map: std::collections::HashMap<u64, std::collections::BTreeMap<u32, String>> =
-        std::collections::HashMap::new();
+    // Group by secret_id across all linked channels. The inner key
+    // pairs `version` with `replica_id` so two replicas writing the
+    // same numeric version surface as two distinct entries in the
+    // catalog — that's the conflict-visibility surface the App uses
+    // to detect concurrent writes from multiple replicas.
+    let mut secret_map: std::collections::HashMap<
+        u64,
+        std::collections::BTreeMap<(u32, Option<u64>), String>,
+    > = std::collections::HashMap::new();
 
     for share in all_shares {
         let description = StoreShareRequestMessage::decode(share.bytes.as_slice())
@@ -135,7 +140,7 @@ pub(in crate::protocol) async fn accept<
         secret_map
             .entry(share.secret_id)
             .or_default()
-            .entry(share.version)
+            .entry((share.version, share.replica_id))
             .or_insert(description);
     }
 
@@ -145,9 +150,10 @@ pub(in crate::protocol) async fn accept<
             secret_id,
             versions: versions
                 .into_iter()
-                .map(|(version, description)| VersionEntry {
+                .map(|((version, replica_id), description)| VersionEntry {
                     version,
                     description,
+                    replica_id,
                 })
                 .collect(),
         })

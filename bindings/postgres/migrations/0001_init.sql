@@ -29,12 +29,26 @@ CREATE TABLE secrets (
 );
 
 CREATE TABLE shares (
+    -- `replica_id` is part of the conceptual storage key: distinct
+    -- replicas writing the same `(secret_id, channel_id, version)`
+    -- must both survive because the wire layer cannot distinguish
+    -- them (they reuse the source's shared key). NULL means a
+    -- non-replica Owner produced the share.
+    --
+    -- PRIMARY KEY columns must be NOT NULL in Postgres, so the
+    -- uniqueness contract is expressed via a UNIQUE constraint with
+    -- `NULLS NOT DISTINCT` (Postgres 15+) — two NULL-Owner writes for
+    -- the same (secret_id, channel_id, version) still collide, matching
+    -- the trait's idempotent-re-send semantics. ON CONFLICT clauses
+    -- target this constraint name.
     secret_id       BIGINT NOT NULL,
     channel_id      BIGINT NOT NULL,
     version         BIGINT NOT NULL,
+    replica_id      BIGINT,
     share_secret_id BIGINT NOT NULL,
     bytes           BYTEA  NOT NULL,
-    PRIMARY KEY (secret_id, channel_id, version)
+    CONSTRAINT shares_uniq
+        UNIQUE NULLS NOT DISTINCT (secret_id, channel_id, version, replica_id)
 );
 
 CREATE TABLE user_secrets (

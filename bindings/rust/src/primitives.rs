@@ -361,6 +361,7 @@ fn run_sharing_flow_test() {
             "",
             &shared_key,
             None,
+            None,
         )
         .unwrap_or_else(|e| panic!("share_request::produce failed for {channel:?}: {e}"));
 
@@ -432,6 +433,7 @@ fn run_verification_flow_test() {
         "",
         shared_key_1,
         None,
+        None,
     )
     .expect("share_request::produce failed for channel 1")
     .envelope;
@@ -444,6 +446,7 @@ fn run_verification_flow_test() {
         &[],
         "",
         shared_key_1,
+        None,
         None,
     )
     .expect("share_request::produce failed for channel 2")
@@ -549,6 +552,7 @@ fn run_recovery_flow_test() {
             "",
             shared_key_1,
             None,
+            None,
         )
         .expect("share_request::produce failed for channel 1")
         .envelope,
@@ -566,6 +570,7 @@ fn run_recovery_flow_test() {
             &[],
             "",
             shared_key_2,
+            None,
             None,
         )
         .expect("share_request::produce failed for channel 2")
@@ -646,10 +651,12 @@ fn run_discovery_flow_test() {
             VersionEntry {
                 version: 1,
                 description: "wallet seed".to_owned(),
+                replica_id: None,
             },
             VersionEntry {
                 version: 2,
                 description: "wallet seed v2".to_owned(),
+                replica_id: None,
             },
         ],
     }];

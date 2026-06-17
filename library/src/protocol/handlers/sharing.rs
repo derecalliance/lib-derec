@@ -127,6 +127,7 @@ pub(in crate::protocol) async fn start<
             version,
             &description,
             reply_to.clone(),
+            owner_replica_id,
         )
         .await?;
         sent_channels.extend(helper_sent);
@@ -142,6 +143,7 @@ pub(in crate::protocol) async fn start<
             version,
             &description,
             reply_to,
+            owner_replica_id,
         )
         .await?;
         sent_channels.extend(replica_sent);
@@ -190,6 +192,7 @@ pub(in crate::protocol) async fn accept<
     trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
     let version = request.version;
+    let replica_id = request.replica_id;
     let encoded_request = request.encode_to_vec();
     let resp = sharing_response::produce(channel_id, request, shared_key)?;
 
@@ -200,6 +203,7 @@ pub(in crate::protocol) async fn accept<
             Share {
                 secret_id,
                 version,
+                replica_id,
                 bytes: encoded_request,
             },
         )
@@ -226,6 +230,7 @@ pub(in crate::protocol) async fn accept<
     Ok(vec![DeRecEvent::ShareStored {
         channel_id,
         version,
+        replica_id,
     }])
 }
 
@@ -548,6 +553,7 @@ async fn distribute_shares<Sh: DeRecShareStore, T: DeRecTransport>(
     version: u32,
     description: &str,
     reply_to: Option<derec_proto::TransportProtocol>,
+    owner_replica_id: Option<u64>,
 ) -> Result<Vec<ChannelId>> {
     let keep_list: Vec<u32> = {
         let start = version
@@ -571,6 +577,7 @@ async fn distribute_shares<Sh: DeRecShareStore, T: DeRecTransport>(
             description,
             shared_key,
             reply_to.clone(),
+            owner_replica_id,
         )?;
         let envelope = super::apply_trace_id(msg.envelope, super::fresh_trace_id())?;
         transport.send(&channel.transport, envelope).await?;
@@ -582,6 +589,7 @@ async fn distribute_shares<Sh: DeRecShareStore, T: DeRecTransport>(
                 Share {
                     secret_id,
                     version,
+                    replica_id: owner_replica_id,
                     bytes: committed_share.encode_to_vec(),
                 },
             )
@@ -747,6 +755,7 @@ async fn distribute_composite_to_destinations<T: DeRecTransport>(
     version: u32,
     description: &str,
     reply_to: Option<derec_proto::TransportProtocol>,
+    owner_replica_id: Option<u64>,
 ) -> Result<Vec<ChannelId>> {
     let mut sent_channels: Vec<ChannelId> = Vec::with_capacity(replicas.len());
 
@@ -761,6 +770,7 @@ async fn distribute_composite_to_destinations<T: DeRecTransport>(
             timestamp: Some(timestamp),
             secret_id,
             reply_to: reply_to.clone(),
+            replica_id: owner_replica_id,
         };
 
         let envelope_bytes = DeRecMessageBuilder::channel()

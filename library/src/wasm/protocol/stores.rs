@@ -518,7 +518,28 @@ fn share_from_js(item: &JsValue) -> Result<Share, ShareStoreError> {
     let bytes_val = js_sys::Reflect::get(item, &"bytes".into())
         .unwrap_or(JsValue::null());
     let bytes = Uint8Array::new(&bytes_val).to_vec();
-    Ok(Share { secret_id, version, bytes })
+    // `replicaId` is an optional decimal-string on the JS side
+    // (matching `derec.replica_id` and `Channel.replicaId`). Missing /
+    // null / empty string all map to `None`.
+    let replica_id_val = js_sys::Reflect::get(item, &"replicaId".into())
+        .unwrap_or(JsValue::null());
+    let replica_id = if replica_id_val.is_null() || replica_id_val.is_undefined() {
+        None
+    } else {
+        replica_id_val.as_string().and_then(|s| {
+            if s.is_empty() {
+                None
+            } else {
+                s.parse::<u64>().ok()
+            }
+        })
+    };
+    Ok(Share {
+        secret_id,
+        version,
+        replica_id,
+        bytes,
+    })
 }
 
 impl DeRecShareStore for JsShareStore {

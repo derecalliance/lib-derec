@@ -33,6 +33,7 @@ fn entry(id: u64, versions: &[(u32, &str)]) -> SecretVersionEntry {
             .map(|(v, desc)| VersionEntry {
                 version: *v,
                 description: desc.to_string(),
+                replica_id: None,
             })
             .collect(),
     }
@@ -474,14 +475,17 @@ fn test_version_descriptions_are_preserved_through_roundtrip() {
             VersionEntry {
                 version: 1,
                 description: "Draft".to_owned(),
+                replica_id: None,
             },
             VersionEntry {
                 version: 2,
                 description: "Final".to_owned(),
+                replica_id: None,
             },
             VersionEntry {
                 version: 3,
                 description: String::new(),
+                replica_id: None,
             },
         ],
     }];

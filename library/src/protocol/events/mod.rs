@@ -290,7 +290,19 @@ pub enum DeRecEvent {
     },
 
     /// A share was accepted and stored locally (Helper side).
-    ShareStored { channel_id: ChannelId, version: u32 },
+    ///
+    /// `replica_id` is the stable per-device identifier of the writer,
+    /// copied from the inbound `StoreShareRequestMessage.replica_id`.
+    /// `None` indicates the writer was a non-replica `Owner`. The field
+    /// is metadata for the application; see
+    /// [`crate::protocol::DeRecShareStore::save`] for the storage
+    /// disambiguation contract that makes concurrent writes from
+    /// distinct replicas coexist.
+    ShareStored {
+        channel_id: ChannelId,
+        version: u32,
+        replica_id: Option<u64>,
+    },
 
     /// A `ReplicaSource` peer pushed a vault sync on a `ReplicaDestination`
     /// channel. The library has already auto-acked the inbound
