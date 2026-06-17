@@ -69,6 +69,14 @@ pub enum PendingAction {
         shared_key: SharedKey,
         trace_id: u64,
     },
+    /// The peer is asking us to enumerate which `(secret_id, version)`
+    /// tuples we currently hold for them on this channel (see
+    /// [`crate::primitives::discovery`]). Accepting replies with the
+    /// catalog so the asker can correlate it with their own view —
+    /// commonly the precursor an owner uses to drive `Recovery`, but
+    /// useful any time the owner wants to know what a given helper
+    /// still has. Rejecting sends back a non-`Ok` response and
+    /// discloses no catalog content.
     Discovery {
         channel_id: ChannelId,
         request: GetSecretIdsVersionsRequestMessage,
@@ -92,10 +100,23 @@ pub enum PendingAction {
         trace_id: u64,
     },
     /// The peer has announced an update to their communication info and/or
-    /// transport endpoint. Accepting applies the update to the stored
-    /// [`crate::protocol::types::Channel`] and sends back an `Ok` response on the new
-    /// endpoint (when `transport_protocol` was updated); rejecting sends a
-    /// non-`Ok` response and leaves the stored state unchanged.
+    /// transport endpoint.
+    ///
+    /// Calling [`super::DeRecProtocol::accept`] on this action does the
+    /// state mutation **for you**: the orchestrator writes the new fields
+    /// onto the stored [`crate::protocol::types::Channel`] and sends back
+    /// an `Ok` response. When `transport_protocol` is part of the update,
+    /// the response is routed to the **new** endpoint, so subsequent
+    /// outbound traffic on this channel already targets the new address.
+    /// Applications do not need to call any setter themselves on the
+    /// receiving side — receiving-side endpoint changeover is handled
+    /// inside `accept`. The local-node endpoint setters
+    /// [`crate::protocol::DeRecProtocol::set_communication_info`] and
+    /// [`crate::protocol::DeRecProtocol::set_own_transport`] exist for
+    /// the **initiating** side only, where the announcement comes from.
+    ///
+    /// Calling [`super::DeRecProtocol::reject`] sends a non-`Ok`
+    /// response and leaves the stored channel state unchanged.
     UpdateChannelInfo {
         channel_id: ChannelId,
         request: UpdateChannelInfoRequestMessage,

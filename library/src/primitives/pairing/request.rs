@@ -754,7 +754,7 @@ pub fn validate(contact: &ContactMessage) -> Result<(), crate::Error> {
 ///   the keys inline).
 /// - `produce_pre_pair_request` and `process_pre_pair_response` require
 ///   [`ContactMode::HashedKeys`] (the keys must be fetched via PrePair).
-pub(crate) fn validate_contact_for_mode(
+pub(super) fn validate_contact_for_mode(
     contact: &ContactMessage,
     expected: ContactMode,
 ) -> Result<(), crate::Error> {

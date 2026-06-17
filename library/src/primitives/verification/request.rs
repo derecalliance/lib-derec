@@ -16,15 +16,32 @@ pub struct ProduceResult {
     /// Fresh `u64` nonce that was embedded into the encrypted
     /// [`derec_proto::VerifyShareRequestMessage`].
     ///
-    /// The caller MUST retain this value (typically in a
-    /// per-`(channel_id, secret_id, version)` pending-verification
-    /// map) and pass it to
-    /// [`super::response::process`] when the matching response
-    /// arrives. The `process` function uses it to bind the
-    /// cryptographic proof to a specific outstanding challenge —
-    /// preventing replay of a captured-and-stale response and
-    /// rejecting responses whose helper-supplied `nonce` does not
-    /// match anything the owner has outstanding.
+    /// This nonce is the **owner-controlled binding token** for the
+    /// challenge: [`super::response::process`] uses it (together with
+    /// `secret_id` and `version`) to confirm the helper's response
+    /// answers *this specific* outstanding request, preventing replay
+    /// of a captured-and-stale response and rejecting responses whose
+    /// helper-supplied `nonce` does not match anything the owner has
+    /// outstanding.
+    ///
+    /// # Retention
+    ///
+    /// Who keeps this value depends on which layer is driving the flow:
+    ///
+    /// - **Orchestrator users** (`DeRecProtocol::start(VerifyShares)`):
+    ///   the orchestrator stores the full request — nonce included —
+    ///   in
+    ///   [`crate::protocol::PendingVerification`](crate::protocol)
+    ///   automatically. Application code never touches it.
+    /// - **Primitive-direct callers** (driving `request::produce` and
+    ///   `response::process` without the orchestrator, e.g. SDK parity
+    ///   tests): MUST retain this `nonce` (typically in a per-
+    ///   `channel_id` map) and pass the original
+    ///   [`derec_proto::VerifyShareRequestMessage`] back to
+    ///   [`super::response::process`] when the matching response arrives.
+    ///
+    /// In both layers the cryptographic contract is identical; the
+    /// retention machinery is what differs.
     pub nonce: u64,
 }
 

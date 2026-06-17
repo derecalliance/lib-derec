@@ -126,19 +126,42 @@ impl MessageBody {
         any.encode_to_vec()
     }
 
+    /// Decodes a [`MessageBody`] from a [`prost_types::Any`]-wrapped
+    /// protobuf payload.
+    ///
+    /// # Wire format
+    ///
+    /// The expected form is exactly what [`encode_to_vec`](Self::encode_to_vec)
+    /// emits: an `Any` whose `type_url` is `type.derec.org/<MessageName>`
+    /// (e.g. `type.derec.org/PairRequestMessage`) and whose `value` is the
+    /// inner message's proto bytes. The `type.derec.org/` prefix is part
+    /// of the canonical wire format and is enforced strictly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`prost::DecodeError`] in three cases:
+    ///
+    /// 1. The bytes don't decode as a valid `Any`.
+    /// 2. **The `type_url` is missing the `type.derec.org/` prefix** —
+    ///    this includes both the bare-name form (e.g. `PairRequestMessage`
+    ///    with no namespace) AND any foreign-namespace form (e.g.
+    ///    `type.example.com/PairRequestMessage` or `googleapis.com/...`).
+    ///    Only the DeRec namespace is accepted; anything else is refused
+    ///    so the type-domain binding the prefix provides cannot be
+    ///    spoofed.
+    /// 3. The bare message name after the prefix is unknown, or the
+    ///    inner `value` bytes don't decode as that message type.
+    ///
+    /// Strict prefix matching is what stops a peer from shipping two
+    /// byte-distinct encodings of the same logical message — a
+    /// canonicalization gap downstream byte-level dedup or cross-
+    /// implementation comparisons could otherwise be tricked by.
     pub fn decode_from_vec(message_bytes: &[u8]) -> Result<MessageBody, prost::DecodeError> {
         use prost::Message;
         use prost_types::Any;
 
         let any = Any::decode(message_bytes)?;
 
-        // Canonical wire form is `type.derec.org/<MessageName>` — the encoder
-        // only ever emits the prefixed form, so the parser refuses anything
-        // else. Accepting a bare name would erase the type-domain binding
-        // the prefix provides and create two byte-distinct encodings for
-        // the same logical message (a canonicalization gap that downstream
-        // byte-level dedup / cross-implementation comparisons depend on
-        // not existing).
         let type_name = any.type_url.strip_prefix(TYPE_URL_PREFIX).ok_or_else(|| {
             #[allow(deprecated)]
             DecodeError::new(format!(

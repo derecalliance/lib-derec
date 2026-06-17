@@ -2,7 +2,16 @@
 
 //! Outer-envelope (`DeRecMessage`) parsing, building, and trace-id plumbing.
 //!
-//! # Security: no upper bound on inbound bytes
+//! # Security: no upper bound on inbound *byte size*
+//!
+//! This section is **only about how many bytes the parser will accept**.
+//! Semantic validation of decoded content — transport-protocol scheme
+//! consistency, contact-mode/field invariants, timestamp pairing,
+//! `(nonce, secret_id, version)` binding for verification responses,
+//! etc. — runs at the primitive `extract` layer and at the FFI/WASM
+//! seams regardless of how big or small the envelope is. Don't read
+//! this note as "the library skips validation"; it skips one specific
+//! thing: a maximum-byte-length check.
 //!
 //! Every function in this module that ingests peer wire bytes —
 //! [`extract_inner_message`], [`extract_inner_pairing_message`],

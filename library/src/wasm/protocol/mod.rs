@@ -57,7 +57,10 @@ use crate::{
         types::{Channel, ChannelStatus, SecretContainer, Target, UserSecret},
     },
     types::ChannelId,
-    wasm::{now_secs, ts_bindings_utils::js_error},
+    wasm::{
+        now_secs,
+        ts_bindings_utils::{js_error, js_error_from_lib},
+    },
 };
 use derec_proto::DeRecSecret;
 use prost::Message;
@@ -355,20 +358,7 @@ impl DeRecProtocolBuilderWasm {
             .with_secret_store(JsSecretStore(secret_store))
             .with_user_secret_store(JsUserSecretStore(user_secret_store))
             .with_transport(JsTransport(transport))
-            .with_own_transport(own_transport);
-        // Reject degenerate thresholds before the inner builder's
-        // panic on `< 2` could fire. See
-        // `DeRecProtocolBuilder::with_threshold` for the rationale.
-        if self.threshold < 2 {
-            return Err(js_error(
-                "INVALID_THRESHOLD",
-                format!(
-                    "threshold must be >= 2 (got {}); 0 or 1 lets a single helper reconstruct the secret and defeats threshold sharing",
-                    self.threshold
-                ),
-            ));
-        }
-        let mut builder = builder
+            .with_own_transport(own_transport)
             .with_threshold(self.threshold as usize)
             .with_keep_versions_count(self.keep_versions_count as usize)
             .with_communication_info(self.communication_info)
@@ -379,9 +369,8 @@ impl DeRecProtocolBuilderWasm {
         if let Some(id) = self.replica_id {
             builder = builder.with_replica_id(id);
         }
-        Ok(DeRecProtocolWasm {
-            inner: builder.build(),
-        })
+        let inner = builder.build().map_err(js_error_from_lib)?;
+        Ok(DeRecProtocolWasm { inner })
     }
 }
 

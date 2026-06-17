@@ -3,17 +3,60 @@
 //! Higher-level protocol orchestrator for the DeRec protocol.
 //!
 //! This module provides [`DeRecProtocol`], a stateful orchestrator that wraps the
-//! core protocol flows (pairing, sharing, verification, discovery, recovery). The
-//! caller supplies concrete implementations of:
+//! core protocol flows. The caller supplies concrete implementations of:
 //!
 //! - [`DeRecChannelStore`] — paired-channel record storage
 //! - [`DeRecShareStore`] — secret share storage
 //! - [`DeRecSecretStore`] — cryptographic key storage
+//! - [`DeRecUserSecretStore`] — vault-snapshot storage for replica auto-publish
 //! - [`DeRecTransport`] — outbound message delivery
 //!
 //! The application feeds incoming wire bytes to [`DeRecProtocol::process`] and
 //! reacts to the returned [`DeRecEvent`] values. All routing, state persistence,
 //! and reply sending are handled internally.
+//!
+//! # Flows
+//!
+//! Each `DeRecProtocol::start(DeRecFlow::…)` entry point drives one
+//! protocol flow:
+//!
+//! - **Pairing** — establish a channel + derive a shared key with a peer.
+//! - **ProtectSecret** (sharing) — VSS-split the current vault to every
+//!   paired Helper and ship the full vault to every paired Replica.
+//! - **VerifyShares** — challenge a Helper to prove it still holds a
+//!   specific stored share via a SHA-384 commitment (see
+//!   [`PendingVerification`] for the orchestrator-owned request/response
+//!   binding map).
+//! - **Discovery** — ask a Helper which `(secret_id, version)` tuples it
+//!   currently holds for us. Frequently the precursor to `RecoverSecret`
+//!   but useful for routine inventory too.
+//! - **RecoverSecret** — collect enough Helper shares to reconstruct an
+//!   earlier vault version.
+//! - **UpdateChannelInfo** — broadcast updated `communication_info`
+//!   and/or `transport_protocol` to one or more paired peers. Either
+//!   side may initiate. The accompanying setters
+//!   [`DeRecProtocol::set_communication_info`] and
+//!   [`DeRecProtocol::set_own_transport`] update local state first; the
+//!   flow then announces the change. The endpoint-changeover discipline
+//!   on `set_own_transport` is required reading before broadcasting a
+//!   transport update — both endpoints must remain reachable through
+//!   the changeover or in-flight traffic will be lost.
+//! - **Unpair** — Owner-initiated channel teardown. Ack semantics are
+//!   governed by [`DeRecProtocolBuilder::with_unpair_ack`].
+//!
+//! See [`DeRecFlow`] for the per-variant role requirements and field
+//! semantics.
+//!
+//! # Reserved `CommunicationInfo` keys
+//!
+//! `CommunicationInfo` is an opaque app-defined string map *except* for
+//! entries under the `derec.*` namespace, which the library reserves
+//! for its own use (e.g. carrying the sender's `replica_id` on
+//! replica-mode pairing envelopes). Apps SHOULD NOT use this namespace;
+//! the orchestrator silently auto-injects, extracts, and strips
+//! `derec.*` entries at the protocol boundary. See
+//! [`reserved_keys`] for the current set of keys and their wire
+//! encoding.
 
 pub mod error;
 pub mod events;
@@ -75,6 +118,21 @@ pub(super) type PendingUnpair = HashMap<ChannelId, u64>;
 /// same channel overwrites the entry — the most recent challenge
 /// wins, and a response carrying an older nonce is rejected by the
 /// binding check.
+///
+/// # Ownership
+///
+/// Owned end-to-end by [`DeRecProtocol`]. Applications driving the
+/// orchestrator never touch this map: `start(VerifyShares)` inserts,
+/// and the matching `process` call removes (surfacing
+/// [`DeRecEvent::ShareVerified`] or an error). The
+/// "caller MUST retain the request" contract documented on
+/// [`crate::primitives::verification::request::ProduceResult::nonce`]
+/// and [`crate::primitives::verification::response::process`] only
+/// applies to callers driving the primitives directly without the
+/// orchestrator (e.g. binding-level parity tests). The current
+/// in-memory representation does not survive process restart; that
+/// limitation applies to every `pending_*` field on
+/// [`DeRecProtocol`].
 pub(super) type PendingVerification = HashMap<ChannelId, derec_proto::VerifyShareRequestMessage>;
 
 /// Tracks an in-progress sharing round.
@@ -118,17 +176,24 @@ use crate::wasm::now_secs;
 /// # Lifecycle
 ///
 /// ```text
-/// DeRecProtocol::new(channel_store, share_store, secret_store, transport, own_endpoint)
+/// DeRecProtocolBuilder::new(secret_id).<setters>.build()?
 ///   │
 ///   ├── create_contact / start(Pairing)          → pairing
 ///   ├── start(ProtectSecret)                     → sharing
 ///   ├── start(VerifyShares)                      → verification
-///   ├── start(Pairing { Owner })           (recovery re-pair)
-///   │     └── start(Discovery)                   → discovery  (emits SecretsDiscovered)
-///   └── start(RecoverSecret)                     → recovery   (emits SecretRecovered)
+///   ├── start(Pairing { Owner })                 (recovery re-pair)
+///   │     └── start(Discovery)                   → discovery       (emits SecretsDiscovered)
+///   ├── start(RecoverSecret)                     → recovery        (emits SecretRecovered)
+///   ├── start(UpdateChannelInfo)                 → endpoint/info update (either side)
+///   └── start(Unpair)                            → unpair          (Owner-initiated; ack
+///                                                                   semantics governed by
+///                                                                   [`DeRecProtocolBuilder::with_unpair_ack`])
 ///
 /// loop { process(incoming_bytes) → Vec<DeRecEvent> }
 /// ```
+///
+/// See [`DeRecFlow`] for the full set of orchestrator entry points
+/// and the role each requires on the targeted channel(s).
 pub struct DeRecProtocol<
     ChannelStore: DeRecChannelStore,
     ShareStore: DeRecShareStore,
@@ -210,21 +275,19 @@ impl<
     T: DeRecTransport,
 > DeRecProtocol<Ch, Sh, Ss, Us, T>
 {
-    /// Construct a new [`DeRecProtocol`] with the provided stores, transport, and own endpoint.
-    ///
-    /// Prefer [`DeRecProtocolBuilder`] for a compile-time-checked construction path.
     /// Construct a [`DeRecProtocol`] directly from its components.
     ///
     /// Prefer [`DeRecProtocolBuilder`] for the type-checked
-    /// construction path. The builder enforces the same threshold
-    /// floor — see [`DeRecProtocolBuilder::with_threshold`] for the
-    /// security rationale.
+    /// construction path; both entry points run the same runtime
+    /// validation and surface the same errors.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `threshold < 2`. A threshold of `0` or `1` collapses
-    /// threshold secret sharing and lets a single helper reconstruct
-    /// the secret unilaterally.
+    /// Returns [`crate::Error::InvalidInput`] if `threshold < 2`. A
+    /// threshold of `0` or `1` collapses threshold secret sharing and
+    /// lets a single helper reconstruct the secret unilaterally — two
+    /// is the minimum value that preserves secret confidentiality
+    /// against one compromised helper.
     pub fn new(
         secret_id: u64,
         channel_store: Ch,
@@ -236,14 +299,14 @@ impl<
         threshold: usize,
         keep_versions_count: usize,
         timeout_in_secs: u64,
-    ) -> Self {
-        assert!(
-            threshold >= 2,
-            "DeRecProtocol::new: threshold must be >= 2 (got {threshold}). \
-             A threshold of 0 or 1 lets a single helper reconstruct the secret and defeats \
-             the threshold-sharing security guarantee."
-        );
-        Self {
+    ) -> Result<Self> {
+        if threshold < 2 {
+            return Err(crate::Error::InvalidInput(
+                "threshold must be >= 2; 0 or 1 lets a single helper reconstruct the secret \
+                 and defeats threshold sharing",
+            ));
+        }
+        Ok(Self {
             channel_store,
             share_store,
             secret_store,
@@ -264,7 +327,7 @@ impl<
             sharing_round: None,
             replica_id: None,
             secret_id,
-        }
+        })
     }
 
     /// Returns the vault identifier this protocol instance was configured with.

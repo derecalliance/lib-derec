@@ -252,6 +252,17 @@ pub fn produce(
 /// 1. Decodes the outer [`derec_proto::DeRecMessage`] envelope from `envelope_bytes`
 /// 2. Decrypts and decodes the inner [`StoreShareRequestMessage`] using `shared_key`
 /// 3. Validates the invariant `envelope.timestamp == request.timestamp`
+/// 4. If the request carries a `reply_to`, validates it via
+///    [`crate::transport::TransportProtocol::validate`] — same gate the
+///    orchestrator runs and the FFI/WASM seams enforce. A mismatched scheme
+///    or otherwise malformed peer-supplied endpoint is rejected here, so
+///    callers handing the extracted request to
+///    [`crate::primitives::sharing::response::produce`] can trust the
+///    `reply_to` is structurally sound. Note the asymmetry: [`produce`]
+///    on this side does NOT validate the application-supplied `reply_to`
+///    on outbound requests; the FFI/WASM seams do, and Rust-direct callers
+///    using [`produce`] are responsible for handing in a well-formed
+///    `reply_to` themselves.
 ///
 /// The extracted [`StoreShareRequestMessage`] should be passed to
 /// [`crate::primitives::sharing::response::produce`] to build the acknowledgement
@@ -279,6 +290,9 @@ pub fn produce(
 /// - decryption or inner-message decoding fails
 /// - the inner message is not a [`derec_proto::StoreShareRequestMessage`]
 /// - `envelope.timestamp != request.timestamp`
+/// - [`crate::Error::Transport`] if `request.reply_to` is present and fails
+///   [`crate::transport::TransportProtocol::validate`] (unknown protocol
+///   discriminant, mismatched scheme, oversize URI, etc.)
 ///
 /// # Security Notes
 ///

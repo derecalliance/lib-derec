@@ -90,7 +90,9 @@ impl Peer {
         if let Some(rid) = options.replica_id {
             builder = builder.with_replica_id(rid);
         }
-        let protocol = builder.build();
+        let protocol = builder
+            .build()
+            .expect("test fixture: builder.build() should succeed");
 
         Self {
             label,

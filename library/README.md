@@ -143,7 +143,7 @@ let mut protocol = DeRecProtocolBuilder::new()
         protocol: Protocol::Https.into(),
     })
     // Optional setters — see "Builder configuration" below.
-    .build();
+    .build()?;
 
 // 3. Drive flows.
 //
@@ -188,8 +188,12 @@ repository.
 ## Builder configuration
 
 `DeRecProtocolBuilder` enforces required-slot completion at compile time
-(missing a required setter is a type error, not a runtime panic). Optional
-setters have defaults:
+(missing a required setter is a type error, not a runtime panic). Runtime
+invariants — currently `threshold >= 2` — are checked inside
+[`build()`](https://docs.rs/derec-library/latest/derec_library/protocol/struct.DeRecProtocolBuilder.html#method.build),
+which returns `Result<DeRecProtocol, crate::Error>` so invalid
+configurations surface as `Error::InvalidInput` instead of panicking.
+Optional setters have defaults:
 
 | Setter | Default | Purpose |
 |--------|---------|---------|
@@ -347,12 +351,18 @@ time and the orchestrator handles injection / validation automatically:
 let mut protocol = DeRecProtocolBuilder::new()
     .with_replica_id(0xAAAA_AAAA_AAAA_AAAA)
     // ... other slots ...
-    .build();
+    .build()?;
 ```
 
 Attempting any replica-mode flow on a protocol built without
 `with_replica_id` returns
 [`Error::ReplicaIdNotConfigured`](https://docs.rs/derec-library/latest/derec_library/enum.Error.html#variant.ReplicaIdNotConfigured).
+
+The reserved `derec.*` `CommunicationInfo` namespace — including
+`derec.replica_id` and its wire encoding — is documented in
+[`protocol::reserved_keys`](https://docs.rs/derec-library/latest/derec_library/protocol/reserved_keys/index.html).
+Apps should not write to this namespace; the orchestrator strips and
+re-injects entries at the protocol boundary.
 
 ### Fingerprint confirmation
 
@@ -1001,7 +1011,7 @@ use derec_library::types::Target;
 let mut protocol = DeRecProtocolBuilder::new()
     .with_unpair_ack(UnpairAck::Required)
     // … other setters …
-    .build();
+    .build()?;
 
 protocol.start(DeRecFlow::Unpair {
     target: Target::Single(channel_id),
