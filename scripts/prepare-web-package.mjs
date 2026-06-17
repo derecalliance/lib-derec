@@ -25,6 +25,9 @@ const sourceReadmePath = path.join(
 );
 const targetReadmePath = path.join(pkgDir, "README.md");
 
+const webDir = path.join(repoRoot, "packages", "web");
+const indexFiles = ["index.js", "index.d.ts"];
+
 function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -67,6 +70,12 @@ async function main() {
   );
 
   await copyFile(sourceReadmePath, targetReadmePath);
+
+  await Promise.all(
+    indexFiles.map((f) =>
+      copyFile(path.join(webDir, f), path.join(pkgDir, f)),
+    ),
+  );
 
   console.log(`Prepared Web package at ${pkgDir}`);
 }

@@ -1,39 +1,125 @@
+// SPDX-License-Identifier: Apache-2.0
+
 using System;
 using System.Runtime.InteropServices;
 
 namespace DeRec.Library.Native;
 
+// All `byte[] buf, UIntPtr bufLen` parameter pairs in this class follow
+// the global FFI marshaling contract on `Native.Utils` — pass
+// `(UIntPtr)buf.Length`; never a wire-derived value. Every returned
+// `Buffer` field must be released via `Utils.FreeBuffer` (see
+// `Native.Buffer` for the ownership contract).
 internal static class Sharing
 {
     [StructLayout(LayoutKind.Sequential)]
-    internal struct ChannelSharedKeyInput
+    internal struct ProtectSecretResult
     {
-        public ulong ChannelId;
-
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)]
-        public byte[] SharedKey;
+        public DeRecError Error;
+        public Buffer SharesWireBytes;
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    internal struct ProtectSecretResult
+    internal struct ProduceStoreShareRequestMessageResult
     {
-        public Status Status;
-        public Buffer SharesWireBytes;
+        public DeRecError Error;
+        public Buffer WireBytes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct ExtractStoreShareRequestResult
+    {
+        public DeRecError Error;
+        public ulong ChannelId;
+        public Buffer RequestProtoBytes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct ProduceStoreShareResponseMessageResult
+    {
+        public DeRecError Error;
+        public Buffer WireBytes;
+        public Buffer CommittedShareBytes;
+        public ulong SecretId;
+        public uint Version;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct ExtractStoreShareResponseResult
+    {
+        public DeRecError Error;
+        public ulong ChannelId;
+        public Buffer ResponseProtoBytes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct ProcessStoreShareResponseMessageResult
+    {
+        public DeRecError Error;
     }
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern ProtectSecretResult protect_secret(
-        byte[] secretId,
-        UIntPtr secretIdLen,
+        ulong secretId,
         byte[] secretData,
         UIntPtr secretDataLen,
-        ChannelSharedKeyInput[] channels,
+        ulong[] channelIds,
         UIntPtr channelsLen,
         UIntPtr threshold,
-        int version,
-        int[]? keepList,
+        uint version
+    );
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern ProduceStoreShareRequestMessageResult produce_store_share_request_message(
+        ulong channelId,
+        uint version,
+        ulong secretId,
+        byte[] committedShare,
+        UIntPtr committedShareLen,
+        uint[] keepList,
         UIntPtr keepListLen,
-        byte[]? description,
-        UIntPtr descriptionLen
+        byte[] description,
+        UIntPtr descriptionLen,
+        byte[] sharedKey,
+        UIntPtr sharedKeyLen,
+        byte[]? replyTo,
+        UIntPtr replyToLen,
+        // Writer's `replica_id`. `hasReplicaId == 0` writes None on the
+        // wire; otherwise `replicaId` is stamped on
+        // `StoreShareRequestMessage.replicaId`.
+        uint hasReplicaId,
+        ulong replicaId
+    );
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern ExtractStoreShareRequestResult extract_store_share_request(
+        byte[] requestBytes,
+        UIntPtr requestBytesLen,
+        byte[] sharedKey,
+        UIntPtr sharedKeyLen
+    );
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern ProduceStoreShareResponseMessageResult produce_store_share_response_message(
+        ulong channelId,
+        byte[] requestProtoBytes,
+        UIntPtr requestProtoBytesLen,
+        byte[] sharedKey,
+        UIntPtr sharedKeyLen
+    );
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern ExtractStoreShareResponseResult extract_store_share_response(
+        byte[] responseBytes,
+        UIntPtr responseBytesLen,
+        byte[] sharedKey,
+        UIntPtr sharedKeyLen
+    );
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern ProcessStoreShareResponseMessageResult process_store_share_response_message(
+        uint version,
+        byte[] responseProtoBytes,
+        UIntPtr responseProtoBytesLen
     );
 }

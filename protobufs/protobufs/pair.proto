@@ -15,35 +15,43 @@ package org.derecalliance.derec.protobuf;
 
 // SenderKind identifies the logical role of the sender in the pairing flow.
 //
-// The role determines:
-//
-// - how the receiver interprets the message
-// - whether the pairing is part of a normal operation or a recovery procedure
-// - how the resulting channel should be associated with existing state
-//
-// In particular, recovery mode has special semantics on the Helper side,
-// allowing linkage to previously known secrets belonging to the same user.
+// The role determines how the receiver interprets the message and what
+// role each party takes in the resulting channel. Pairs are formed by
+// matching complementary kinds: Owner↔Helper, ReplicaSource↔ReplicaDestination.
 enum SenderKind {
-  // Sender is an Owner operating in normal (non-recovery) mode.
+  // Sender is an Owner.
   //
-  // This is the standard pairing flow used when establishing a new
-  // secret-sharing relationship.
-  OWNER_NON_RECOVERY = 0;
-
-  // Sender is an Owner operating in recovery mode.
-  //
-  // This indicates that the sender is attempting to recover previously
-  // shared secrets. Helpers may use this signal to:
-  //
-  // - link the new pairing to existing identities
-  // - expose additional secret IDs and versions during recovery
-  OWNER_RECOVERY = 1;
+  // Used for all Owner-initiated pairings, whether establishing a new
+  // relationship or re-pairing during recovery. There is no protocol-level
+  // distinction between the two cases.
+  OWNER = 0;
 
   // Sender is acting as a Helper.
   //
   // Helpers may initiate pairing in some application flows, though the
   // Owner typically acts as the initiator.
-  HELPER = 2;
+  HELPER = 1;
+
+  // Sender is the Source side of a replica pair — the device that owns
+  // the secrets and pushes them to a destination for backup. The matching
+  // peer kind is REPLICA_DESTINATION.
+  //
+  // Replica pairing follows the same cryptographic handshake as Helper
+  // pairing but adds a mandatory fingerprint-verify step before the
+  // channel transitions out of `Pending`. After verification, the Source
+  // calls ProtectSecret targeting the Destination channel; the library
+  // sends a `ReplicaSecretPayload` (full vault + share map) to the
+  // Destination via a normal channel-mode `StoreShareRequest`.
+  REPLICA_SOURCE = 3;
+
+  // Sender is the Destination side of a replica pair — the device that
+  // receives and stores full vault copies from a Source for backup or
+  // recovery purposes. The matching peer kind is REPLICA_SOURCE.
+  //
+  // The Destination never initiates ProtectSecret on this channel; it
+  // only receives `ReplicaSecretPayload` messages and surfaces them to
+  // the application via the `ReplicaVaultReceived` event.
+  REPLICA_DESTINATION = 4;
 }
 
 // PairRequestMessage is the first message in the pairing protocol,
@@ -81,6 +89,7 @@ enum SenderKind {
 // - both parties know each other's public keys
 // - a secure communication channel is established for subsequent protocol flows
 message PairRequestMessage {
+
   // The role of the sender of this message.
   //
   // This informs the responder whether the initiator is:
@@ -104,16 +113,6 @@ message PairRequestMessage {
   // This key is provided to the responder so that future messages can be
   // encrypted toward the initiator.
   bytes eciesPublicKey = 3;
-
-  // Channel identifier chosen by the initiator.
-  //
-  // This value identifies the logical communication channel that will be
-  // established upon successful pairing. The responder MUST use this value
-  // when sending subsequent messages to the initiator.
-  //
-  // Implementations SHOULD ensure uniqueness to avoid collisions between
-  // concurrent or stored pairing sessions.
-  uint64 channelId = 4;
 
   // Sender's application-level identifying information.
   //
@@ -194,12 +193,6 @@ message PairResponseMessage {
   // - invalid or malformed request data
   DeRecResult result = 1;
 
-  // The role of the sender of this message.
-  //
-  // This informs the initiator whether the responder is acting as
-  // an Owner or a Helper.
-  SenderKind senderKind = 2;
-
   // Application-level identifying information of the responder.
   //
   // Intended for user-facing identification and display purposes.
@@ -223,4 +216,42 @@ message PairResponseMessage {
   // Used for observability and may assist in replay detection or timeout
   // handling, depending on the implementation.
   google.protobuf.Timestamp timestamp = 7;
+
+  // Derived channel identifier the two parties switch to immediately after
+  // the pairing handshake completes. This message is the only place this
+  // value travels on the wire, and it travels encrypted (inside the pairing
+  // envelope), so a passive observer who only sees the pre-rekey traffic
+  // cannot link the now-paired session to its long-running successor.
+  //
+  // # Derivation
+  //
+  // The responder computes:
+  //
+  //     channelId = u64::from_be_bytes(
+  //         SHA-384(
+  //             u64_be(originalChannelId) || sharedKeyBytes
+  //         )[0..8]
+  //     )
+  //
+  // where `originalChannelId` is the channelId from the contact / pairing
+  // envelopes and `sharedKeyBytes` is the freshly-derived pairing shared
+  // key.
+  //
+  // # Validation
+  //
+  // The requester MUST recompute the same hash with its own derivation of
+  // the shared key and reject the response (closing the would-be channel)
+  // if the value here does not match. A non-matching value indicates either
+  // a key-derivation mismatch (the channel would be unusable anyway) or
+  // tampering by a peer that somehow forged a valid envelope but cannot
+  // produce the SHA-384 preimage.
+  //
+  // # Effect
+  //
+  // Both parties atomically rekey their local channel record from
+  // `originalChannelId` to this value once the handshake is accepted. All
+  // subsequent envelopes on this channel — including the
+  // UpdateChannelInfo handover for the long-term transport — route on the
+  // new id.
+  uint64 channelId = 8;
 }

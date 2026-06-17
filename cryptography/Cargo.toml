@@ -1,6 +1,6 @@
 [package]
 name = "derec-cryptography"
-version = "0.0.1-alpha.6"
+version = "0.0.1-alpha.7"
 edition = "2024"
 license = "Apache-2.0"
 description = "Cryptographic primitives used by the DeRec protocol implementation."
@@ -10,8 +10,12 @@ homepage = "https://derecalliance.org"
 readme = "README.md"
 keywords = ["derec", "decentralized", "cryptography", "secret-sharing", "recovery"]
 
+[features]
+logging = ["dep:tracing"]
+
 [dependencies]
-sha2 = "0.10.9"
+tracing = { version = "0.1.44", default-features = false, features = ["attributes"], optional = true }
+sha2 = "0.11.0"
 aead = "0.5.2"
 aes = "0.8.4"
 aes-gcm = "0.10.3"
@@ -27,6 +31,7 @@ ark-bw6-761 = "0.5.0"
 ark-secp256k1 = "0.5.0"
 thiserror = "2.0.18"
 ml-kem = "0.2.3"
+zeroize = "1.8.2"
 
 k256 = { version = "0.13.4", features = ["ecdsa"] }
 

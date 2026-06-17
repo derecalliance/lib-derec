@@ -6,7 +6,6 @@
 use aes::cipher::KeyInit;
 use aes_gcm::{Aes256Gcm, Key, Nonce, aead::Aead};
 
-/// Custom error type for Derec channel encryption and decryption operations.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum DerecChannelError {
@@ -38,11 +37,17 @@ pub enum DerecChannelError {
 ///
 /// ```
 /// use derec_cryptography::channel::encrypt_message;
+///
 /// let msg = b"hello world";
 /// let key = [0u8; 32];
 /// let nonce = [0u8; 32];
+///
 /// let ciphertext = encrypt_message(msg, &key, &nonce).unwrap();
 /// ```
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(msg_len = msg.len()))
+)]
 pub fn encrypt_message(
     msg: &[u8],
     key: &[u8; 32],
@@ -58,6 +63,10 @@ pub fn encrypt_message(
     let mut ctxt = Vec::new();
     ctxt.extend_from_slice(&nonce[0..12]);
     ctxt.extend_from_slice(&e);
+
+    #[cfg(feature = "logging")]
+    tracing::info!(ciphertext_len = ctxt.len(), "message encrypted");
+
     Ok(ctxt)
 }
 
@@ -78,24 +87,41 @@ pub fn encrypt_message(
 ///
 /// ```
 /// use derec_cryptography::channel::{encrypt_message, decrypt_message};
+///
 /// let msg = b"hello world";
 /// let key = [0u8; 32];
 /// let nonce = [0u8; 32];
 /// let ciphertext = encrypt_message(msg, &key, &nonce).unwrap();
 /// let plaintext = decrypt_message(&ciphertext, &key).unwrap();
+///
 /// assert_eq!(plaintext, msg);
 /// ```
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(ciphertext_len = ctxt.len()))
+)]
 pub fn decrypt_message(ctxt: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, DerecChannelError> {
     if ctxt.len() < 12 {
+        #[cfg(feature = "logging")]
+        tracing::warn!(got = ctxt.len(), "ciphertext too short to contain a nonce");
         return Err(DerecChannelError::CiphertextTooShort { got: ctxt.len() });
     }
 
     let key: &Key<Aes256Gcm> = key.into();
     let cipher = Aes256Gcm::new(key);
 
-    cipher
+    let plaintext = cipher
         .decrypt(Nonce::from_slice(&ctxt[0..12]), &ctxt[12..])
-        .map_err(DerecChannelError::DecryptionError)
+        .map_err(|e| {
+            #[cfg(feature = "logging")]
+            tracing::warn!(error = %e, "AES-GCM decryption failed");
+            DerecChannelError::DecryptionError(e)
+        })?;
+
+    #[cfg(feature = "logging")]
+    tracing::info!(plaintext_len = plaintext.len(), "message decrypted");
+
+    Ok(plaintext)
 }
 
 #[cfg(test)]
@@ -108,10 +134,8 @@ mod tests {
         let key = [0u8; 32];
         let nonce = [0u8; 32];
 
-        // let alice sign-then-encrypt the message for bob
         let ctxt = encrypt_message(msg, &key, &nonce).unwrap();
 
-        // let bob decrypt-then-verify the message from alice
         let received = decrypt_message(&ctxt, &key).unwrap();
 
         assert_eq!(received, msg);

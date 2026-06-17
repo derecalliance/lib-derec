@@ -67,10 +67,11 @@
 use std::marker::PhantomData;
 
 use crate::{
-    derec_message::DeRecMessageBuilderError, protocol_version::ProtocolVersion, types::ChannelId,
+    derec_message::DeRecMessageBuilderError,
+    protocol_version::ProtocolVersion,
+    types::ChannelId,
 };
-use derec_proto::DeRecMessage;
-use prost::Message;
+use derec_proto::{DeRecMessage, MessageBody};
 use prost_types::Timestamp;
 
 /// Typestate marker indicating that the payload has not yet been encrypted.
@@ -84,13 +85,15 @@ pub struct Encrypted;
 
 /// Builder mode for pairing messages.
 ///
-/// In this mode, the builder only exposes [`encrypt_pairing`](DeRecMessageBuilder::<NotEncrypted, PairingMode>::encrypt_pairing).
+/// In this mode, the builder only exposes `encrypt_pairing` (see the
+/// `impl DeRecMessageBuilder<NotEncrypted, PairingMode>` block).
 #[derive(Debug)]
 pub struct PairingMode;
 
 /// Builder mode for channel messages.
 ///
-/// In this mode, the builder only exposes [`encrypt`](DeRecMessageBuilder::<NotEncrypted, ChannelMode>::encrypt).
+/// In this mode, the builder only exposes `encrypt` (see the
+/// `impl DeRecMessageBuilder<NotEncrypted, ChannelMode>` block).
 #[derive(Debug)]
 pub struct ChannelMode;
 
@@ -141,7 +144,7 @@ pub struct ChannelMode;
 /// let envelope = DeRecMessageBuilder::channel()
 ///     .channel_id(channel_id)
 ///     .timestamp(current_timestamp())
-///     .message(&store_share_request)
+///     .message_body(MessageBody::VerifyShareRequest(&verify_request))
 ///     .encrypt(shared_key)?
 ///     .build()?;
 /// ```
@@ -150,7 +153,9 @@ pub struct DeRecMessageBuilder<State, Mode> {
     pub(crate) sequence: Option<u32>,
     pub(crate) channel_id: Option<ChannelId>,
     pub(crate) timestamp: Option<Timestamp>,
-    pub(crate) message: Vec<u8>,
+    pub(crate) message: Option<MessageBody>,
+    pub(crate) trace_id: Option<u64>,
+    encrypted: Vec<u8>,
     _state: PhantomData<State>,
     _mode: PhantomData<Mode>,
 }
@@ -204,27 +209,60 @@ impl<State, Mode> DeRecMessageBuilder<State, Mode> {
         self
     }
 
-    /// Encodes and sets the inner payload message.
+    /// Sets the request/response correlation token for the envelope.
     ///
-    /// The provided protobuf message is serialized with `prost` and its encoded
-    /// bytes become the payload later stored in the outer [`DeRecMessage`]
-    /// envelope.
+    /// On request envelopes the requester chooses any opaque `u64` to identify
+    /// the in-flight call. On response envelopes the responder echoes back the
+    /// value from the request. Both happens automatically when this builder is
+    /// driven by the standard request/response producers, but the value can
+    /// also be set explicitly by callers that need to correlate from outside.
     ///
-    /// The builder does not interpret the content of this payload. It only stores
-    /// the encoded bytes.
+    /// Defaults to zero when not set, which the protocol treats as "no
+    /// correlation requested."
     ///
     /// # Arguments
     ///
-    /// * `message` - inner protobuf message to serialize and store
+    /// * `trace_id` - opaque correlation token
     ///
     /// # Returns
     ///
     /// The updated builder.
-    pub fn message<M>(mut self, message: &M) -> Self
-    where
-        M: Message + Sized,
-    {
-        self.message = message.encode_to_vec();
+    pub fn trace_id(mut self, trace_id: u64) -> Self {
+        self.trace_id = Some(trace_id);
+        self
+    }
+
+    /// Sets a freshly-drawn random `trace_id` on the envelope.
+    ///
+    /// Convenience for request producers that want a new correlation token
+    /// without managing the RNG themselves. Uses the same random source as the
+    /// rest of the library (`rand::rng().next_u64()`).
+    ///
+    /// # Returns
+    ///
+    /// The updated builder with a random `trace_id`.
+    pub fn auto_trace_id(mut self) -> Self {
+        use rand::Rng as _;
+        self.trace_id = Some(rand::rng().next_u64());
+        self
+    }
+
+    /// Encodes the inner payload and sets the `message_type` discriminant from a [`MessageBody`].
+    ///
+    /// This is the canonical way to attach the inner message — `prost`-encodes the
+    /// payload **and** records the correct `i32` `message_type` value so that
+    /// [`DeRecMessageBuilder::build`] can embed it in the outer [`DeRecMessage`]
+    /// envelope.
+    ///
+    /// # Arguments
+    ///
+    /// * `body` - a [`MessageBody`] variant wrapping a reference to the inner protocol message
+    ///
+    /// # Returns
+    ///
+    /// The updated builder.
+    pub fn message_body(mut self, body: MessageBody) -> Self {
+        self.message = Some(body);
         self
     }
 }
@@ -251,7 +289,9 @@ impl DeRecMessageBuilder<NotEncrypted, PairingMode> {
             sequence: None,
             channel_id: None,
             timestamp: None,
-            message: Vec::new(),
+            message: None,
+            trace_id: None,
+            encrypted: Vec::new(),
             _state: PhantomData,
             _mode: PhantomData,
         }
@@ -281,18 +321,21 @@ impl DeRecMessageBuilder<NotEncrypted, PairingMode> {
         self,
         public_key: impl AsRef<[u8]>,
     ) -> Result<DeRecMessageBuilder<Encrypted, PairingMode>, DeRecMessageBuilderError> {
-        if self.message.is_empty() {
+        if self.message.is_none() {
             return Err(DeRecMessageBuilderError::MissingMessage);
         }
 
+        let encoded = self.message.unwrap().encode_to_vec();
         let encrypted =
-            derec_cryptography::pairing::envelope::encrypt(&self.message, public_key.as_ref())?;
+            derec_cryptography::pairing::envelope::encrypt(&encoded, public_key.as_ref())?;
 
         Ok(DeRecMessageBuilder {
-            message: encrypted,
+            message: None,
+            encrypted,
             timestamp: self.timestamp,
             sequence: self.sequence,
             channel_id: self.channel_id,
+            trace_id: self.trace_id,
             _state: PhantomData,
             _mode: PhantomData,
         })
@@ -320,7 +363,9 @@ impl DeRecMessageBuilder<NotEncrypted, ChannelMode> {
             sequence: None,
             channel_id: None,
             timestamp: None,
-            message: Vec::new(),
+            message: None,
+            trace_id: None,
+            encrypted: Vec::new(),
             _state: PhantomData,
             _mode: PhantomData,
         }
@@ -354,7 +399,7 @@ impl DeRecMessageBuilder<NotEncrypted, ChannelMode> {
         self,
         shared_key: &[u8; 32],
     ) -> Result<DeRecMessageBuilder<Encrypted, ChannelMode>, DeRecMessageBuilderError> {
-        if self.message.is_empty() {
+        if self.message.is_none() {
             return Err(DeRecMessageBuilderError::MissingMessage);
         }
 
@@ -365,14 +410,16 @@ impl DeRecMessageBuilder<NotEncrypted, ChannelMode> {
         let mut nonce = [0u8; 32];
         nonce[24..].copy_from_slice(&u64::from(channel_id).to_be_bytes());
 
-        let encrypted =
-            derec_cryptography::channel::encrypt_message(&self.message, shared_key, &nonce)?;
+        let encoded = self.message.unwrap().encode_to_vec();
+        let encrypted = derec_cryptography::channel::encrypt_message(&encoded, shared_key, &nonce)?;
 
         Ok(DeRecMessageBuilder {
-            message: encrypted,
+            message: None,
+            encrypted,
             timestamp: self.timestamp,
             sequence: self.sequence,
             channel_id: Some(channel_id),
+            trace_id: self.trace_id,
             _state: PhantomData,
             _mode: PhantomData,
         })
@@ -414,7 +461,7 @@ impl<Mode> DeRecMessageBuilder<Encrypted, Mode> {
             return Err(DeRecMessageBuilderError::MissingTimestamp);
         }
 
-        if self.message.is_empty() {
+        if self.encrypted.is_empty() {
             return Err(DeRecMessageBuilderError::MissingMessage);
         }
 
@@ -430,7 +477,8 @@ impl<Mode> DeRecMessageBuilder<Encrypted, Mode> {
                 self.timestamp
                     .ok_or(DeRecMessageBuilderError::MissingTimestamp)?,
             ),
-            message: self.message,
+            message: self.encrypted,
+            trace_id: self.trace_id.unwrap_or_default(),
         })
     }
 }

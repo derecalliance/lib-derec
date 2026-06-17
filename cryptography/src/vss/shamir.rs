@@ -56,12 +56,9 @@ use ark_bw6_761::Fr as F;
 /// - The second element is the serialized y-coordinate (as a field element).
 ///
 pub fn share<R: Rng>(
-    secret: &[u8; λ], access: (u64, u64), rng: &mut R
+    secret: &[u8; λ], threshold: u64, total_shares: u64, rng: &mut R
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
-    // parse the desired access structure.
-    // n is the number of shares, while
-    // t <= n is the reconstruction threshold.
-    let (t, n) = access;
+    let (t, n) = (threshold, total_shares);
 
     // let us sample a random degree t-1 polynomial.
     // A degree t - 1 polynomial has t coefficients,
@@ -193,7 +190,7 @@ mod tests {
 
         let mut rng = rand_chacha::ChaCha8Rng::from_seed(seed);
 
-        let shares = share(&secret, (3, 5), &mut rng);
+        let shares = share(&secret, 3, 5, &mut rng);
         let recovered = recover(shares);
 
         assert_eq!(secret, recovered);

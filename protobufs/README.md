@@ -43,6 +43,67 @@ let msg = ContactMessage::default();
 
 ---
 
+## Schema Overview
+
+### Roles
+
+The protocol defines three roles via the `SenderKind` enum:
+
+| Value | Role | Description |
+|-------|------|-------------|
+| `OWNER_NON_RECOVERY` | Owner | Standard pairing and sharing flows |
+| `OWNER_RECOVERY` | Owner | Re-pairing with Helpers to recover lost secrets |
+| `HELPER` | Helper | Stores shares and responds to Owner requests |
+| `REPLICA` | Replica | Another device belonging to the same Owner |
+
+### Message Files
+
+| File | Messages | Purpose |
+|------|----------|---------|
+| `contact.proto` | `ContactMessage`, `ContactMode` | Out-of-band bootstrap for the pairing flow. `ContactMode` selects between inline keys and a SHA-384 commitment that the recipient resolves via `prepair.proto`. |
+| `pair.proto` | `PairRequestMessage`, `PairResponseMessage`, `SenderKind` | Pairing handshake between Owner and Helper (or Replica). `PairResponseMessage.channelId` carries the post-handshake rekey id both sides switch to. |
+| `prepair.proto` | `PrePairRequestMessage`, `PrePairResponseMessage` | Plaintext key fetch step used only with `ContactMode = HASHED_KEYS`; the recipient verifies the published keys against the contact's `contactBindingHash` before proceeding to `pair.proto`. |
+| `unpair.proto` | `UnpairRequestMessage`, `UnpairResponseMessage` | Terminate a channel relationship |
+| `storeshare.proto` | `StoreShareRequestMessage`, `StoreShareResponseMessage` | Distribute secret shares to Helpers |
+| `verify.proto` | `VerifyShareRequestMessage`, `VerifyShareResponseMessage` | Challenge-response share verification |
+| `secretidsversions.proto` | `GetSecretIdsVersionsRequestMessage`, `GetSecretIdsVersionsResponseMessage` | Discovery of stored secrets and versions |
+| `getshare.proto` | `GetShareRequestMessage`, `GetShareResponseMessage` | Retrieve shares during recovery |
+| `derecmessage.proto` | `DeRecMessage`, `MessageBody` | Top-level envelope wrapping all protocol messages |
+| `result.proto` | `DeRecResult`, `StatusEnum` | Shared result/status types |
+| `error.proto` | `ErrorResponseMessage` | Generic error response |
+| `communicationinfo.proto` | `CommunicationInfo` | Application-level identity information |
+| `parameterrange.proto` | `ParameterRange` | Configuration negotiation during pairing |
+| `transportprotocol.proto` | `TransportProtocol` | Endpoint and protocol for message delivery |
+| `committedderecshare.proto` | `CommittedDeRecShare` | Share data with Merkle proof commitment |
+| `derecsecret.proto` | `DeRecSecret` | Secret metadata |
+
+### MessageBody Envelope
+
+All protocol messages are wrapped in the `MessageBody` oneof inside
+`DeRecMessage`. The current variants are:
+
+| Field number | Variant |
+|:---:|---------|
+| 1 | `PairRequestMessage` |
+| 2 | `PairResponseMessage` |
+| 3 | `UnpairRequestMessage` |
+| 4 | `UnpairResponseMessage` |
+| 5 | `StoreShareRequestMessage` |
+| 6 | `StoreShareResponseMessage` |
+| 7 | `VerifyShareRequestMessage` |
+| 8 | `VerifyShareResponseMessage` |
+| 9 | `GetSecretIdsVersionsRequestMessage` |
+| 10 | `GetSecretIdsVersionsResponseMessage` |
+| 11 | `GetShareRequestMessage` |
+| 12 | `GetShareResponseMessage` |
+| 13 | `ErrorResponseMessage` |
+| 14 | `UpdateChannelInfoRequestMessage` |
+| 15 | `UpdateChannelInfoResponseMessage` |
+| 16 | `PrePairRequestMessage` |
+| 17 | `PrePairResponseMessage` |
+
+---
+
 ## Relationship with other crates
 
 The DeRec Rust implementation is composed of multiple crates:

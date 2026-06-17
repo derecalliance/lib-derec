@@ -124,6 +124,12 @@ enum StatusEnum {
   // - structurally invalid messages
   FORMAT_ERROR = 9;
 
+  // The request was rejected by the counter-party
+  //
+  // This might be used to indicate the user or system that received the
+  // requested rejected it.
+  REJECTED = 10;
+
   // The Helper is requesting that the Owner terminate the relationship.
   //
   // The Owner SHOULD respond by sending an UnpairRequestMessage and

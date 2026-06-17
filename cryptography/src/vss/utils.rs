@@ -55,7 +55,7 @@ pub fn build_merkle_tree<R: Rng>(
     rng: &mut R,
 ) -> Vec<Vec<u8>> {
     // merkle tree nodes are of type Vec<u8>,
-    // though we know their size to be 256 B
+    // though we know their size to be 32 bytes (SHA-256 output)
     let merkle_tree_size = (2_u32.pow(depth + 1) - 1) as usize;
     let mut merkle_nodes: Vec<Vec<u8>> = Vec::new();
     //allocate space up front
@@ -159,19 +159,27 @@ pub fn random_oracle(msg: &[u8], rand: &[u8], tag: &[u8]) -> [u8; 4 * λ] {
 
 // A share's hash is SHA256(x || y).
 fn leaf_hash(share: (&Vec<u8>, &Vec<u8>)) -> Vec<u8> {
-    let mut hasher_input = Vec::new();
-    hasher_input.extend_from_slice(share.0);
-    hasher_input.extend_from_slice(share.1);
+    leaf_hash_pub(share.0, share.1)
+}
 
+/// Public entry point for leaf hashing used by [`super::verify`].
+pub fn leaf_hash_pub(x: &[u8], y: &[u8]) -> Vec<u8> {
+    let mut hasher_input = Vec::new();
+    hasher_input.extend_from_slice(x);
+    hasher_input.extend_from_slice(y);
     compute_sha256_hash(&hasher_input)
 }
 
 // computes the intermediate hash of two Merkle nodes
 fn intermediate_hash(left: &[u8], right: &[u8]) -> Vec<u8> {
+    intermediate_hash_pub(left, right)
+}
+
+/// Public entry point for intermediate hashing used by [`super::verify`].
+pub fn intermediate_hash_pub(left: &[u8], right: &[u8]) -> Vec<u8> {
     let mut hasher_input = Vec::new();
     hasher_input.extend_from_slice(left);
     hasher_input.extend_from_slice(right);
-
     compute_sha256_hash(&hasher_input)
 }
 
@@ -201,7 +209,7 @@ mod tests {
         let mut msg: [u8; 1024] = [0u8; 1024];
         rng.fill(&mut msg);
 
-        let shares = vss::share((3, 5), &msg, &rand).unwrap();
+        let shares = vss::share(3, 5, &msg, &rand).unwrap();
         let recovered = vss::recover(&shares).unwrap();
 
         assert_eq!(msg, recovered[..]);
@@ -220,7 +228,7 @@ mod tests {
         let mut msg: [u8; 1024] = [0u8; 1024];
         rng.fill(&mut msg);
 
-        let shares = vss::share((5, 7), &msg, &seed1).unwrap();
+        let shares = vss::share(5, 7, &msg, &seed1).unwrap();
         let share_points: Vec<(Vec<u8>, Vec<u8>)> =
             shares.iter().map(|s| (s.x.clone(), s.y.clone())).collect();
         let merkle_tree = build_merkle_tree(&share_points, 3, &mut thread_rng());

@@ -1,0 +1,126 @@
+/*
+ * Copyright (c) DeRec Alliance and its Contributors.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
+import "result.proto";
+import "transportprotocol.proto";
+
+package org.derecalliance.derec.protobuf;
+
+// PrePairRequestMessage is sent by the recipient of a ContactMessage whose
+// `contactMode == CONTACT_MODE_HASHED_KEYS`. It asks the contact creator for
+// the actual ML-KEM and ECIES public keys that the contact's
+// `contactBindingHash` commits to.
+//
+// # When this is sent
+//
+// `CONTACT_MODE_HASHED_KEYS` contacts carry only a hash of the public keys
+// so they fit in size-constrained out-of-band channels (e.g. QR codes,
+// short URLs). The recipient must obtain the actual keys before it can
+// construct the first encrypted `PairRequestMessage`.
+//
+// # Security
+//
+// This message is plaintext — no shared key has been established yet. The
+// scanner-side integrity check happens after the `PrePairResponseMessage`
+// arrives, by recomputing the hash and matching it against the original
+// `contactBindingHash`. An attacker who intercepts the transport cannot
+// substitute different keys without producing a hash collision.
+//
+// # Envelope
+//
+// The message is wrapped in a `DeRecMessage` envelope just like every
+// other protocol message. The envelope's `channelId` carries the routing
+// key; the envelope's `message` field carries the serialized
+// `PrePairRequestMessage` bytes unencrypted (because no symmetric key
+// exists yet).
+//
+// # Security: transport endpoint is observable
+//
+// Because the envelope is plaintext, the `transportProtocol` field in both
+// `PrePairRequestMessage` and `PrePairResponseMessage` is visible to any
+// passive observer on the network path. The same applies to the
+// `transportProtocol` carried in the `HASHED_KEYS`-mode `ContactMessage`
+// itself if its out-of-band channel can be observed.
+//
+// The protocol relies on this contract from the application to preserve
+// the security guarantees of `HASHED_KEYS` mode:
+//
+// - The `transportProtocol` used during pairing (the one advertised in the
+//   `ContactMessage` and echoed in `PrePairRequestMessage`) MUST be
+//   ephemeral and short-lived — bound to the pairing attempt, not to the
+//   long-term identity of either peer.
+// - Once pairing completes, the application MUST swap to a long-term
+//   endpoint via an `UpdateChannelInfoRequestMessage`. The ephemeral
+//   pairing endpoint is retired after the changeover (see the endpoint-
+//   changeover discipline on `UpdateChannelInfoRequestMessage`).
+//
+// `INLINE_KEYS`-mode contacts do not have this constraint because the
+// `PairRequestMessage` is asymmetrically encrypted; only the
+// `ContactMessage` itself crosses an unencrypted channel, which is by
+// definition the trusted out-of-band one.
+message PrePairRequestMessage {
+
+  // The same `nonce` the original `ContactMessage` advertised. Bound to
+  // the contact session; mismatches indicate a stale or spoofed request
+  // and the receiver MUST refuse to serve the keys.
+  uint64 nonce = 1;
+
+  // Transport endpoint at which the sender expects to receive the
+  // `PrePairResponseMessage`.
+  TransportProtocol transportProtocol = 2;
+
+  // Timestamp indicating when this message was created.
+  //
+  // This value is expressed in UTC and is used for envelope-vs-body
+  // timestamp validation, replay detection, and observability.
+  google.protobuf.Timestamp timestamp = 3;
+}
+
+// PrePairResponseMessage is the contact creator's reply to a
+// `PrePairRequestMessage`. On success it carries the real public keys; on
+// failure it carries only a non-`Ok` `DeRecResult`.
+//
+// # Validation by the receiver
+//
+// The recipient (the original scanner of the `ContactMessage`) MUST:
+//
+// 1. Confirm `result.status == OK`. On non-`Ok`, surface a typed error to
+//    the application and do not proceed.
+// 2. Recompute
+//
+//        SHA-384(mlkemEncapsulationKey || eciesPublicKey
+//                || u64_be(nonce) || u64_be(channelId))
+//
+//    and verify it matches the original `ContactMessage.contactBindingHash`.
+// 3. Only on a match, proceed to construct and send a normal
+//    `PairRequestMessage`.
+//
+// # Envelope
+//
+// Plaintext-in-`DeRecMessage`-envelope, same as `PrePairRequestMessage`.
+message PrePairResponseMessage {
+
+  // Result of processing the `PrePairRequestMessage`. On `OK`, the two
+  // key fields below are present. On any non-`Ok` status, the key fields
+  // MUST be absent.
+  DeRecResult result = 1;
+
+  // Serialized ML-KEM-768 encapsulation key. Present only when
+  // `result.status == OK`.
+  optional bytes mlkemEncapsulationKey = 2;
+
+  // Serialized ECIES public key. Present only when
+  // `result.status == OK`.
+  optional bytes eciesPublicKey = 3;
+
+  // Echoed from the request for session correlation.
+  uint64 nonce = 4;
+
+  // Timestamp indicating when this message was created.
+  google.protobuf.Timestamp timestamp = 5;
+}

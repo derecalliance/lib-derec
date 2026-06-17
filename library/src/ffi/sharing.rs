@@ -1,321 +1,467 @@
-//! C FFI exports for the DeRec *sharing* flow.
+// SPDX-License-Identifier: Apache-2.0
+
+//! C FFI for the DeRec sharing flow.
 //!
-//! This module exposes secret sharing through a C-compatible ABI so that
-//! non-Rust consumers can:
+//! Protocol semantics live in `library/src/primitives/sharing/`. Items below
+//! describe only the FFI surface and the custom binary format used to ferry
+//! the per-channel committed shares.
 //!
-//! 1. Provide a secret ID and secret data
-//! 2. Specify the helper channel set together with their 32-byte shared keys
-//! 3. Specify the recovery threshold
-//! 4. Optionally provide a keep-list and description
-//! 5. Receive one serialized outer `DeRecMessage` envelope per helper
+//! # Committed-shares binary format
 //!
-//! The sharing flow is exposed as a single FFI entry point:
+//! [`protect_secret`] returns its share set as a single FFI container:
 //!
-//! - [`protect_secret`]
-//!
-//! The exported function follows the common FFI pattern used across the SDK:
-//!
-//! - inputs are passed as primitive C values, raw byte buffers, or `#[repr(C)]` arrays
-//! - optional values are represented using nullable pointers
-//! - results are returned as `#[repr(C)]` structs containing:
-//!   - a [`DeRecStatus`] indicating success or failure
-//!   - one or more [`DeRecBuffer`] values containing output bytes
-//!
-//! # FFI Conventions
-//!
-//! - `secret_id` and `secret_data` are passed as `(*const u8, usize)` byte buffers
-//! - `channels` is passed as a pointer to an array of [`ChannelSharedKeyInput`]
-//! - `keep_list` is optional and passed as a nullable pointer to `i32` values plus a length
-//! - `description` is optional and passed as a nullable UTF-8 byte buffer
-//! - returned buffers must be released by the caller using the common FFI
-//!   buffer-freeing helper exposed elsewhere in the FFI surface
-//! - on error, output buffers are returned empty and details are reported in
-//!   the returned [`DeRecStatus`]
-//!
-//! # Serialized Share Map Format
-//!
-//! The sharing result is returned as a single serialized FFI container rather than a native map.
-//! That container has the following layout:
-//!
-//! 1. A 32-bit little-endian count
-//! 2. For each share entry, sorted by channel ID:
-//!    - the channel ID as a 64-bit little-endian integer
-//!    - a length-prefixed serialized outer `DeRecMessage` envelope
-//!
-//! This byte format is specific to the FFI layer and should be treated as an
-//! opaque transport container by foreign callers unless they explicitly choose
-//! to deserialize it.
-//!
-//! # Notes
-//!
-//! - This module does not expose Rust `HashMap` or collection types directly over FFI
-//! - the output of this module is not a recovered secret or a helper response;
-//!   it is the set of encrypted share-storage request envelopes that should be
-//!   delivered to helpers
-//! - each helper entry must include the 32-byte symmetric key previously derived
-//!   during pairing for that channel
+//! ```text
+//! [count: u32 LE]
+//! for each entry (sorted by channel ID):
+//!   [channel_id: u64 LE]
+//!   [share_len: u32 LE]
+//!   [serialized CommittedDeRecShare protobuf]
+//! ```
 
 use crate::{
     ffi::common::{
-        DeRecBuffer, DeRecStatus, empty_buffer, err_status, ok_status, vec_into_buffer,
+        DeRecBuffer, empty_buffer, parse_optional_transport_protocol, vec_into_buffer,
         write_len_prefixed, write_u32_le, write_u64_le,
+    },
+    ffi::error::{
+        DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_BAD_SHARED_KEY, DEREC_CODE_FFI_BAD_UTF8,
+        DEREC_CODE_FFI_NULL_PTR, DeRecError, ffi_error, from_lib_error, success,
     },
     types::ChannelId,
 };
+use derec_proto::{
+    CommittedDeRecShare, DeRecMessage, StoreShareRequestMessage, StoreShareResponseMessage,
+};
+use prost::Message as _;
 use std::collections::HashMap;
+use std::str;
 
-/// One helper channel and its previously established 32-byte shared key.
-///
-/// This structure is consumed by [`protect_secret`] over the C FFI boundary.
-///
-/// The `shared_key` value must be the symmetric channel key previously derived
-/// during the pairing flow for this helper.
-#[repr(C)]
-pub struct ChannelSharedKeyInput {
-    /// Helper channel identifier.
-    pub channel_id: u64,
-
-    /// 32-byte symmetric key established during pairing.
-    pub shared_key: [u8; 32],
-}
-
-/// FFI result returned by [`protect_secret`].
-///
-/// On success:
-///
-/// - `status` indicates success
-/// - `shares` contains a serialized FFI share map, where each entry associates
-///   a channel ID with serialized outer `DeRecMessage` bytes carrying an encrypted
-///   inner `StoreShareRequestMessage`
-///
-/// On failure:
-///
-/// - `status` contains an error
-/// - `shares` is returned empty
 #[repr(C)]
 pub struct ProtectSecretResult {
-    pub status: DeRecStatus,
+    pub error: DeRecError,
+    /// Committed shares in the format documented at the module level.
     pub shares_wire_bytes: DeRecBuffer,
 }
 
-/// Splits a secret into helper shares and returns one serialized outer
-/// `DeRecMessage` envelope per helper channel.
-///
-/// This is the C FFI entry point for the DeRec sharing flow.
-///
-/// The caller provides:
-///
-/// - `secret_id` as raw secret identifier bytes
-/// - `secret_data` as raw secret bytes to protect
-/// - `channels` as an array of [`ChannelSharedKeyInput`] values
-/// - `threshold` as the recovery threshold
-/// - `version` as the share-distribution version
-/// - optionally, a keep-list and a UTF-8 description
-///
-/// On success, this function returns a serialized FFI container representing
-/// a map from channel ID to serialized outer `DeRecMessage` bytes.
-///
-/// Each returned envelope contains an encrypted inner `StoreShareRequestMessage`.
-///
-/// # Arguments
-///
-/// * `secret_id_ptr` - Pointer to secret ID bytes.
-/// * `secret_id_len` - Length of the secret ID buffer.
-/// * `secret_data_ptr` - Pointer to secret data bytes.
-/// * `secret_data_len` - Length of the secret data buffer.
-/// * `channels_ptr` - Pointer to an array of [`ChannelSharedKeyInput`].
-/// * `channels_len` - Number of helper channel entries.
-/// * `threshold` - Recovery threshold to use when generating shares.
-/// * `version` - Share-distribution version number.
-/// * `keep_list_ptr` - Optional pointer to an array of `i32` values representing
-///   the keep-list.
-/// * `keep_list_len` - Number of keep-list entries.
-/// * `description_ptr` - Optional pointer to a UTF-8 description string.
-/// * `description_len` - Length of the description buffer in bytes.
-///
-/// # Returns
-///
-/// Returns [`ProtectSecretResult`].
-///
-/// On success, the `shares` buffer contains:
-///
-/// 1. a 32-bit little-endian entry count
-/// 2. for each share entry:
-///    - channel ID as little-endian `u64`
-///    - a length-prefixed serialized outer `DeRecMessage` envelope
-///
-/// # Errors
-///
-/// The returned `status` indicates failure if:
-///
-/// - `secret_id_ptr` is null while `secret_id_len > 0`
-/// - `secret_data_ptr` is null while `secret_data_len > 0`
-/// - `channels_ptr` is null while `channels_len > 0`
-/// - `keep_list_ptr` is null while `keep_list_len > 0`
-/// - `description_ptr` is null while `description_len > 0`
-/// - `description_ptr` is provided but the bytes are not valid UTF-8
-/// - the underlying Rust sharing API returns an error
-///
+#[repr(C)]
+pub struct ProduceStoreShareRequestMessageResult {
+    pub error: DeRecError,
+    pub wire_bytes: DeRecBuffer,
+}
+
+#[repr(C)]
+pub struct ExtractStoreShareRequestResult {
+    pub error: DeRecError,
+    pub channel_id: u64,
+    /// Inner `StoreShareRequestMessage` proto bytes for chaining into
+    /// [`produce_store_share_response_message`].
+    pub request_proto_bytes: DeRecBuffer,
+}
+
+/// `committed_share_bytes` is the serialized [`CommittedDeRecShare`] the
+/// helper should persist locally for later recovery responses.
+#[repr(C)]
+pub struct ProduceStoreShareResponseMessageResult {
+    pub error: DeRecError,
+    pub wire_bytes: DeRecBuffer,
+    pub committed_share_bytes: DeRecBuffer,
+    pub secret_id: u64,
+    pub version: u32,
+}
+
+#[repr(C)]
+pub struct ExtractStoreShareResponseResult {
+    pub error: DeRecError,
+    pub channel_id: u64,
+    /// Inner `StoreShareResponseMessage` proto bytes for chaining into
+    /// [`process_store_share_response_message`].
+    pub response_proto_bytes: DeRecBuffer,
+}
+
+#[repr(C)]
+pub struct ProcessStoreShareResponseMessageResult {
+    pub error: DeRecError,
+}
+
 /// # Safety
 ///
-/// Each non-null pointer must point to the corresponding readable range:
-///
-/// - `secret_id_ptr` → `secret_id_len` bytes
-/// - `secret_data_ptr` → `secret_data_len` bytes
-/// - `channels_ptr` → `channels_len` [`ChannelSharedKeyInput`] values
-/// - `keep_list_ptr` → `keep_list_len` `i32` values when provided
-/// - `description_ptr` → `description_len` UTF-8 bytes when provided
-///
-/// Nullable pointer handling follows these rules:
-///
-/// - `keep_list_ptr == null` means no keep-list was supplied
-/// - `description_ptr == null` means no description was supplied
-/// - zero-length buffers are allowed and interpreted as empty slices where applicable
+/// Non-null input pointers must point to the corresponding readable byte ranges.
 #[unsafe(no_mangle)]
 pub extern "C" fn protect_secret(
-    secret_id_ptr: *const u8,
-    secret_id_len: usize,
+    secret_id: u64,
     secret_data_ptr: *const u8,
     secret_data_len: usize,
-    channels_ptr: *const ChannelSharedKeyInput,
+    channels_ptr: *const u64,
     channels_len: usize,
     threshold: usize,
-    version: i32,
-    keep_list_ptr: *const i32,
-    keep_list_len: usize,
-    description_ptr: *const u8,
-    description_len: usize,
+    version: u32,
 ) -> ProtectSecretResult {
-    if secret_id_ptr.is_null() && secret_id_len > 0 {
-        return ProtectSecretResult {
-            status: err_status("secret_id_ptr is null"),
-            shares_wire_bytes: empty_buffer(),
-        };
-    }
+    let with_err = |error| ProtectSecretResult {
+        error,
+        shares_wire_bytes: empty_buffer(),
+    };
 
-    if secret_data_ptr.is_null() && secret_data_len > 0 {
-        return ProtectSecretResult {
-            status: err_status("secret_data_ptr is null"),
-            shares_wire_bytes: empty_buffer(),
-        };
-    }
-
+    let secret_data = match parse_buffer(secret_data_ptr, secret_data_len, "secret_data_ptr") {
+        Ok(b) => b,
+        Err(e) => return with_err(e),
+    };
     if channels_ptr.is_null() && channels_len > 0 {
-        return ProtectSecretResult {
-            status: err_status("channels_ptr is null"),
-            shares_wire_bytes: empty_buffer(),
-        };
+        return with_err(ffi_error(DEREC_CODE_FFI_NULL_PTR, "channels_ptr is null"));
     }
-
-    if keep_list_ptr.is_null() && keep_list_len > 0 {
-        return ProtectSecretResult {
-            status: err_status("keep_list_ptr is null"),
-            shares_wire_bytes: empty_buffer(),
-        };
-    }
-
-    if description_ptr.is_null() && description_len > 0 {
-        return ProtectSecretResult {
-            status: err_status("description_ptr is null"),
-            shares_wire_bytes: empty_buffer(),
-        };
-    }
-
-    let secret_id: &[u8] = if secret_id_len == 0 {
-        &[]
+    let channel_ids: Vec<ChannelId> = if channels_len == 0 {
+        vec![]
     } else {
-        unsafe { std::slice::from_raw_parts(secret_id_ptr, secret_id_len) }
+        let raw = unsafe { std::slice::from_raw_parts(channels_ptr, channels_len) };
+        raw.iter().map(|&id| ChannelId(id)).collect()
     };
 
-    let secret_data: &[u8] = if secret_data_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(secret_data_ptr, secret_data_len) }
-    };
-
-    let channels: &[ChannelSharedKeyInput] = if channels_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(channels_ptr, channels_len) }
-    };
-
-    let keep_list: Option<&[i32]> = if keep_list_ptr.is_null() {
-        None
-    } else if keep_list_len == 0 {
-        Some(&[])
-    } else {
-        Some(unsafe { std::slice::from_raw_parts(keep_list_ptr, keep_list_len) })
-    };
-
-    let description: Option<&str> = if description_ptr.is_null() {
-        None
-    } else {
-        let description_bytes: &[u8] = if description_len == 0 {
-            &[]
-        } else {
-            unsafe { std::slice::from_raw_parts(description_ptr, description_len) }
-        };
-
-        match std::str::from_utf8(description_bytes) {
-            Ok(value) => Some(value),
-            Err(_) => {
-                return ProtectSecretResult {
-                    status: err_status("description is not valid UTF-8"),
-                    shares_wire_bytes: empty_buffer(),
-                };
-            }
-        }
-    };
-
-    let mut channel_map: HashMap<ChannelId, [u8; 32]> = HashMap::with_capacity(channels.len());
-
-    for entry in channels {
-        channel_map.insert(ChannelId(entry.channel_id), entry.shared_key);
-    }
-
-    let result = match crate::sharing::protect_secret(
+    match crate::primitives::sharing::request::split(
+        &channel_ids,
         secret_id,
-        secret_data,
-        &channel_map,
-        threshold,
         version,
-        keep_list,
-        description,
+        secret_data,
+        threshold,
     ) {
-        Ok(value) => value,
-        Err(err) => {
-            return ProtectSecretResult {
-                status: err_status(err.to_string()),
-                shares_wire_bytes: empty_buffer(),
-            };
-        }
-    };
-
-    let shares_bytes = serialize_share_envelopes(&result.shares);
-
-    ProtectSecretResult {
-        status: ok_status(),
-        shares_wire_bytes: vec_into_buffer(shares_bytes),
+        Ok(r) => ProtectSecretResult {
+            error: success(),
+            shares_wire_bytes: vec_into_buffer(serialize_committed_shares(&r.shares)),
+        },
+        Err(e) => with_err(from_lib_error(e)),
     }
 }
 
-fn serialize_share_envelopes(shares: &HashMap<crate::types::ChannelId, Vec<u8>>) -> Vec<u8> {
+/// # Safety
+///
+/// Non-null input pointers must point to the corresponding readable byte ranges.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn produce_store_share_request_message(
+    channel_id: u64,
+    version: u32,
+    secret_id: u64,
+    committed_share_ptr: *const u8,
+    committed_share_len: usize,
+    keep_list_ptr: *const u32,
+    keep_list_len: usize,
+    description_ptr: *const u8,
+    description_len: usize,
+    shared_key_ptr: *const u8,
+    shared_key_len: usize,
+    // `reply_to` is optional: pass `reply_to_len == 0` for "no override"
+    // (the responder will route to the channel's stored peer endpoint).
+    // When set, the bytes must be a protobuf-encoded `TransportProtocol`;
+    // the responder echoes this exchange's response there without
+    // persisting the endpoint.
+    reply_to_ptr: *const u8,
+    reply_to_len: usize,
+    // Writer's `replica_id` (the producer of this share). The optional
+    // pair follows the existing `has_replica_id` / `replica_id` convention
+    // used at the protocol builder (see [`derec_protocol_new`]):
+    // `has_replica_id == 0` writes `None` on the wire; otherwise the
+    // `replica_id` value is stamped on `StoreShareRequestMessage.replica_id`
+    // so the helper can disambiguate concurrent writes from different
+    // replicas reusing the source's shared key.
+    has_replica_id: u32,
+    replica_id: u64,
+) -> ProduceStoreShareRequestMessageResult {
+    let with_err = |error| ProduceStoreShareRequestMessageResult {
+        error,
+        wire_bytes: empty_buffer(),
+    };
+
+    let committed_share_bytes =
+        match parse_buffer(committed_share_ptr, committed_share_len, "committed_share_ptr") {
+            Ok(b) => b,
+            Err(e) => return with_err(e),
+        };
+    if keep_list_ptr.is_null() && keep_list_len > 0 {
+        return with_err(ffi_error(DEREC_CODE_FFI_NULL_PTR, "keep_list_ptr is null"));
+    }
+    let keep_list: &[u32] = if keep_list_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(keep_list_ptr, keep_list_len) }
+    };
+    let description_bytes =
+        match parse_buffer(description_ptr, description_len, "description_ptr") {
+            Ok(b) => b,
+            Err(e) => return with_err(e),
+        };
+    let description = match str::from_utf8(description_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_BAD_UTF8,
+                "description is not valid UTF-8",
+            ));
+        }
+    };
+    let shared_key = match parse_shared_key(shared_key_ptr, shared_key_len) {
+        Ok(k) => k,
+        Err(e) => return with_err(e),
+    };
+
+    let committed_share = match CommittedDeRecShare::decode(committed_share_bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                format!("failed to decode CommittedDeRecShare: {e}"),
+            ));
+        }
+    };
+
+    let reply_to = match parse_optional_transport_protocol(reply_to_ptr, reply_to_len) {
+        Ok(rt) => rt,
+        Err(e) => return with_err(e),
+    };
+
+    let replica_id_opt = if has_replica_id != 0 {
+        Some(replica_id)
+    } else {
+        None
+    };
+
+    match crate::primitives::sharing::request::produce(
+        ChannelId(channel_id),
+        version,
+        secret_id,
+        &committed_share,
+        keep_list,
+        description,
+        &shared_key,
+        reply_to,
+        replica_id_opt,
+    ) {
+        Ok(r) => ProduceStoreShareRequestMessageResult {
+            error: success(),
+            wire_bytes: vec_into_buffer(r.envelope),
+        },
+        Err(e) => with_err(from_lib_error(e)),
+    }
+}
+
+/// # Safety
+///
+/// Non-null input pointers must point to the corresponding readable byte ranges.
+#[unsafe(no_mangle)]
+pub extern "C" fn extract_store_share_request(
+    request_ptr: *const u8,
+    request_len: usize,
+    shared_key_ptr: *const u8,
+    shared_key_len: usize,
+) -> ExtractStoreShareRequestResult {
+    let with_err = |error| ExtractStoreShareRequestResult {
+        error,
+        channel_id: 0,
+        request_proto_bytes: empty_buffer(),
+    };
+
+    let request_bytes = match parse_buffer(request_ptr, request_len, "request_ptr") {
+        Ok(b) => b,
+        Err(e) => return with_err(e),
+    };
+    let shared_key = match parse_shared_key(shared_key_ptr, shared_key_len) {
+        Ok(k) => k,
+        Err(e) => return with_err(e),
+    };
+
+    let channel_id = match DeRecMessage::decode(request_bytes) {
+        Ok(e) => e.channel_id,
+        Err(e) => {
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                format!("failed to decode envelope: {e}"),
+            ));
+        }
+    };
+
+    match crate::primitives::sharing::request::extract(request_bytes, &shared_key) {
+        Ok(r) => ExtractStoreShareRequestResult {
+            error: success(),
+            channel_id,
+            request_proto_bytes: vec_into_buffer(r.request.encode_to_vec()),
+        },
+        Err(e) => with_err(from_lib_error(e)),
+    }
+}
+
+/// `request_proto_ptr` / `request_proto_len` must be the `request_proto_bytes`
+/// returned by [`extract_store_share_request`].
+///
+/// # Safety
+///
+/// Non-null input pointers must point to the corresponding readable byte ranges.
+#[unsafe(no_mangle)]
+pub extern "C" fn produce_store_share_response_message(
+    channel_id: u64,
+    request_proto_ptr: *const u8,
+    request_proto_len: usize,
+    shared_key_ptr: *const u8,
+    shared_key_len: usize,
+) -> ProduceStoreShareResponseMessageResult {
+    let with_err = |error| ProduceStoreShareResponseMessageResult {
+        error,
+        wire_bytes: empty_buffer(),
+        committed_share_bytes: empty_buffer(),
+        secret_id: 0,
+        version: 0,
+    };
+
+    let request_bytes =
+        match parse_buffer(request_proto_ptr, request_proto_len, "request_proto_ptr") {
+            Ok(b) => b,
+            Err(e) => return with_err(e),
+        };
+    let shared_key = match parse_shared_key(shared_key_ptr, shared_key_len) {
+        Ok(k) => k,
+        Err(e) => return with_err(e),
+    };
+
+    let request = match StoreShareRequestMessage::decode(request_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                format!("failed to decode request: {e}"),
+            ));
+        }
+    };
+
+    match crate::primitives::sharing::response::produce(
+        ChannelId(channel_id),
+        &request,
+        &shared_key,
+    ) {
+        Ok(r) => ProduceStoreShareResponseMessageResult {
+            error: success(),
+            wire_bytes: vec_into_buffer(r.envelope),
+            committed_share_bytes: vec_into_buffer(r.committed_share.encode_to_vec()),
+            secret_id: r.secret_id,
+            version: r.version,
+        },
+        Err(e) => with_err(from_lib_error(e)),
+    }
+}
+
+/// # Safety
+///
+/// Non-null input pointers must point to the corresponding readable byte ranges.
+#[unsafe(no_mangle)]
+pub extern "C" fn extract_store_share_response(
+    response_ptr: *const u8,
+    response_len: usize,
+    shared_key_ptr: *const u8,
+    shared_key_len: usize,
+) -> ExtractStoreShareResponseResult {
+    let with_err = |error| ExtractStoreShareResponseResult {
+        error,
+        channel_id: 0,
+        response_proto_bytes: empty_buffer(),
+    };
+
+    let response_bytes = match parse_buffer(response_ptr, response_len, "response_ptr") {
+        Ok(b) => b,
+        Err(e) => return with_err(e),
+    };
+    let shared_key = match parse_shared_key(shared_key_ptr, shared_key_len) {
+        Ok(k) => k,
+        Err(e) => return with_err(e),
+    };
+
+    let channel_id = match DeRecMessage::decode(response_bytes) {
+        Ok(e) => e.channel_id,
+        Err(e) => {
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                format!("failed to decode envelope: {e}"),
+            ));
+        }
+    };
+
+    match crate::primitives::sharing::response::extract(response_bytes, &shared_key) {
+        Ok(r) => ExtractStoreShareResponseResult {
+            error: success(),
+            channel_id,
+            response_proto_bytes: vec_into_buffer(r.response.encode_to_vec()),
+        },
+        Err(e) => with_err(from_lib_error(e)),
+    }
+}
+
+/// `response_proto_ptr` / `response_proto_len` must be the
+/// `response_proto_bytes` returned by [`extract_store_share_response`].
+///
+/// # Safety
+///
+/// Non-null input pointers must point to the corresponding readable byte ranges.
+#[unsafe(no_mangle)]
+pub extern "C" fn process_store_share_response_message(
+    version: u32,
+    response_proto_ptr: *const u8,
+    response_proto_len: usize,
+) -> ProcessStoreShareResponseMessageResult {
+    let with_err = |error| ProcessStoreShareResponseMessageResult { error };
+
+    let response_bytes =
+        match parse_buffer(response_proto_ptr, response_proto_len, "response_proto_ptr") {
+            Ok(b) => b,
+            Err(e) => return with_err(e),
+        };
+
+    let response = match StoreShareResponseMessage::decode(response_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                format!("failed to decode response: {e}"),
+            ));
+        }
+    };
+
+    match crate::primitives::sharing::response::process(version, &response) {
+        Ok(()) => ProcessStoreShareResponseMessageResult { error: success() },
+        Err(e) => with_err(from_lib_error(e)),
+    }
+}
+
+fn serialize_committed_shares(shares: &HashMap<ChannelId, CommittedDeRecShare>) -> Vec<u8> {
     let mut entries: Vec<_> = shares.iter().collect();
-    entries
-        .sort_by_key(|(channel_id, _)| <u64 as From<crate::types::ChannelId>>::from(**channel_id));
+    entries.sort_by_key(|(channel_id, _)| <u64 as From<ChannelId>>::from(**channel_id));
 
     let mut out = Vec::new();
 
     let count = u32::try_from(entries.len()).expect("too many share entries");
     write_u32_le(&mut out, count);
 
-    for (channel_id, wire_bytes) in entries {
-        write_u64_le(
-            &mut out,
-            <u64 as From<crate::types::ChannelId>>::from(*channel_id),
-        );
-        write_len_prefixed(&mut out, wire_bytes);
+    for (channel_id, share) in entries {
+        write_u64_le(&mut out, <u64 as From<ChannelId>>::from(*channel_id));
+        write_len_prefixed(&mut out, &share.encode_to_vec());
     }
 
     out
+}
+
+fn parse_buffer<'a>(ptr: *const u8, len: usize, name: &str) -> Result<&'a [u8], DeRecError> {
+    if ptr.is_null() && len > 0 {
+        return Err(ffi_error(
+            DEREC_CODE_FFI_NULL_PTR,
+            format!("{name} is null"),
+        ));
+    }
+    if len == 0 {
+        Ok(&[])
+    } else {
+        Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+}
+
+fn parse_shared_key(ptr: *const u8, len: usize) -> Result<[u8; 32], DeRecError> {
+    let bytes = parse_buffer(ptr, len, "shared_key_ptr")?;
+    bytes.try_into().map_err(|_| {
+        ffi_error(
+            DEREC_CODE_FFI_BAD_SHARED_KEY,
+            "shared_key must be exactly 32 bytes",
+        )
+    })
 }

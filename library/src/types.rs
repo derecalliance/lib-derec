@@ -1,32 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! # Shared Types
+//! # Cross-layer shared types
 //!
-//! This module contains types that are shared across multiple DeRec protocol
-//! flows implemented by this library (pairing, sharing, verification, and
-//! recovery).
-//!
-//! These types represent identifiers or structures that must remain consistent
-//! across the different modules in order to maintain protocol correctness.
+//! Types used by both the primitives layer and the protocol layer. Anything
+//! that's "post-pairing" or orchestrator-specific lives under
+//! [`crate::protocol::types`] instead.
 //!
 //! ## Channel identifiers
 //!
-//! A `ChannelId` uniquely identifies the secure communication channel between
+//! A [`ChannelId`] uniquely identifies the secure communication channel between
 //! an Owner and a Helper for a given pairing instance.
 //!
 //! The identifier is derived deterministically during the pairing process from
 //! the initial `ContactMessage`. Because both parties compute it from the same
 //! contact data, the resulting identifier is **symmetric** — both the Owner and
 //! the Helper obtain the same value without additional coordination.
-//!
-//! Once established, the `ChannelId` is used by the library to associate:
-//!
-//! - protocol state
-//! - stored shares
-//! - verification messages
-//! - recovery interactions
-//!
-//! with the correct peer relationship.
 
 /// Identifier of the secure communication channel between an Owner and a Helper.
 ///
@@ -64,3 +52,9 @@ impl PartialEq<u64> for ChannelId {
         self.0 == *other
     }
 }
+
+/// 32-byte symmetric key shared between an Owner and a Helper after pairing.
+///
+/// A `SharedKey` is established during the pairing flow and used to encrypt
+/// and authenticate all subsequent protocol messages on the associated channel.
+pub type SharedKey = [u8; 32];

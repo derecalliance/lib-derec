@@ -49,27 +49,78 @@ package org.derecalliance.derec.protobuf;
 // The nonce may be transmitted together with the rest of the message or
 // delivered separately by the application, depending on the authentication
 // and pairing UX.
+//
+// # Modes
+//
+// `ContactMessage` supports two delivery modes for the public encryption
+// material, selected by `contactMode`:
+//
+// - `INLINE_KEYS` (default): both `mlkemEncapsulationKey` and
+//   `eciesPublicKey` are present in the contact. The recipient may proceed
+//   directly to `PairRequestMessage`. This is the original, wire-equivalent
+//   behavior — existing contacts (which have no `contactMode` set) are
+//   parsed as `INLINE_KEYS` by virtue of the proto3 default.
+//
+// - `HASHED_KEYS`: `contactBindingHash` is present and both
+//   key fields are absent. The contact is small enough to fit in a QR code
+//   or short URL. The recipient must first exchange a `PrePairRequest` /
+//   `PrePairResponse` pair to obtain the actual keys, then verify them
+//   against the hash before sending `PairRequestMessage`. The hash binding
+//   gives the OOB-shared contact the same MITM resistance as inline-keys
+//   mode despite the keys traveling over the (unauthenticated) transport.
+//   Because the `PrePair*` messages are plaintext, the `transportProtocol`
+//   carried in this mode MUST be ephemeral — see the security note on
+//   `PrePairRequestMessage` for the required ephemeral-then-swap discipline.
+//
+// The mode selector and the per-mode field-presence invariants are enforced
+// by the implementation; mixing fields across modes is a protocol error.
+
+// Selects the delivery mode for the public encryption material in
+// `ContactMessage`. See `ContactMessage` for details.
+enum ContactMode {
+  // Default. `mlkemEncapsulationKey` and `eciesPublicKey` are inlined
+  // in the contact.
+  INLINE_KEYS = 0;
+  // `contactBindingHash` is inlined in the contact; keys are obtained via
+  // `PrePairRequest` / `PrePairResponse` and verified against the hash.
+  HASHED_KEYS = 1;
+}
+
 message ContactMessage {
+
+  // Selects how the public encryption material is delivered. Defaults to
+  // `INLINE_KEYS` (current behavior) when unset.
+  ContactMode contactMode = 1;
 
   // Serialized ML-KEM-768 encapsulation key.
   //
-  // This public key is used by the sender of the first protocol message to
-  // establish confidentiality for the initial pairing exchange.
-  //
-  // The exact cryptographic processing and message construction are defined
-  // by the DeRec pairing protocol and its implementation.
-  bytes mlkemEncapsulationKey = 1;
+  // Present only when `contactMode == INLINE_KEYS`. Used by
+  // the recipient to construct the initial pairing message.
+  optional bytes mlkemEncapsulationKey = 2;
 
   // Serialized ECIES public key.
   //
-  // This public key is used as part of the encryption scheme for the initial
-  // pairing message sent to the creator of this contact.
+  // Present only when `contactMode == INLINE_KEYS`. Used by
+  // the recipient to construct the initial pairing message.
+  optional bytes eciesPublicKey = 3;
+
+  // SHA-384 commitment to the public encryption material.
   //
-  // Together with `mlkemEncapsulationKey`, this field provides the public
-  // encryption material needed before the peers have established a secure
-  // DeRec channel.
-  bytes eciesPublicKey = 2;
- 
+  // Present only when `contactMode == HASHED_KEYS`. Computed
+  // as:
+  //
+  //     SHA-384(
+  //         mlkemEncapsulationKey
+  //         || eciesPublicKey
+  //         || u64_be(nonce)
+  //         || u64_be(channelId)
+  //     )
+  //
+  // The recipient obtains the actual keys via `PrePairRequest` and
+  // recomputes this hash to confirm integrity before proceeding to
+  // `PairRequestMessage`.
+  optional bytes contactBindingHash = 4;
+
   // Channel identifier associated with this contact.
   //
   // This value identifies the communication channel that the creator of this
@@ -87,7 +138,7 @@ message ContactMessage {
   //
   // This value MUST be unique within the scope required by the implementation
   // to disambiguate concurrent or stored pairing sessions.
-  uint64 channelId = 3;
+  uint64 channelId = 5;
 
   // Random nonce used to bind the pairing request to this contact exchange.
   //
@@ -100,7 +151,7 @@ message ContactMessage {
   //
   // Applications may choose to reveal this nonce only after sufficient
   // out-of-band authentication has taken place.
-  uint64 nonce = 4;
+  uint64 nonce = 6;
 
   // Transport information used to reach the creator of this contact.
   //
@@ -114,7 +165,7 @@ message ContactMessage {
   // request. Subsequent protocol exchanges may continue using the same
   // transport information or updated transport details, depending on the
   // protocol and application behavior.
-  TransportProtocol transportProtocol = 5;
+  TransportProtocol transportProtocol = 7;
 
   // Timestamp indicating when the sender created this message.
   //
@@ -123,5 +174,5 @@ message ContactMessage {
   // - replay detection
   // - timeout handling
   // - logging and observability
-  google.protobuf.Timestamp timestamp = 6;
+  google.protobuf.Timestamp timestamp = 8;
 }

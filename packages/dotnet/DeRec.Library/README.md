@@ -33,7 +33,8 @@ All of the following are handled internally in Rust:
 - DeRecMessage envelope construction
 - Protocol validation
 
-The .NET API operates exclusively on **opaque `byte[]` wire payloads**.
+The .NET API operates on `byte[]` wire payloads and a small set of typed
+result objects. Errors surface as [`DeRecException`](#error-handling).
 
 ---
 
@@ -42,48 +43,157 @@ The .NET API operates exclusively on **opaque `byte[]` wire payloads**.
 ```csharp
 using DeRec.Library;
 
-var version = DeRec.Library.Native.ProtocolVersion.derec_protocol_version();
-
-Console.WriteLine(version.Major);
-Console.WriteLine(version.Minor);
+var version = ProtocolVersion.Current();
+Console.WriteLine($"DeRec {version.Major}.{version.Minor}");
 ```
 
 ---
 
 ## Example: Pairing Flow
 
+The `ContactMessage` is exchanged out-of-band (QR codes, existing messaging
+channels, etc.). Two `ContactMode` values select how the public encryption
+material is delivered:
+
+| Mode | What the contact carries | Use when |
+|---|---|---|
+| `ContactMode.InlineKeys` (default) | Full ML-KEM encapsulation key + ECIES public key | Out-of-band channel can carry the keys (NFC, messaging). |
+| `ContactMode.HashedKeys` | Only a SHA-384 commitment to the keys | Channel is size-constrained (QR codes). Scanner fetches the actual keys via a plaintext `PrePair` round-trip and verifies them against the hash. |
+
+After the handshake completes, **both modes** rekey the channel id. The
+responder derives `SHA-384(u64_be(originalId) || sharedKey)[..8]` as a
+`ulong`, includes it in the encrypted `PairResponseMessage`, and both sides
+switch their local state to the new id. The new id never appears in plaintext
+on the wire, so a passive observer who only saw pre-rekey traffic cannot link
+the long-running channel to its pairing-time id.
+
+### `InlineKeys` flow
+
 ```csharp
 using DeRec.Library;
+using DeRec.Library.Primitives;
 
-// Step 1: Owner creates contact message
-var contact = Pairing.CreateContactMessage(
-    channelId: 1,
-    transportUri: "wss://example.com"
-);
+ulong channelId = 1;
 
-// Step 2: Helper produces pairing request
-var request = Pairing.ProducePairingRequestMessage(
-    kind: Pairing.SenderKind.Helper,
-    transportUri: "wss://helper.com",
-    contactMessageBytes: contact.WireBytes
-);
+// Step 1: Contact initiator creates the out-of-band ContactMessage.
+var contact = Pairing.Request.CreateContact(
+    channelId,
+    ContactMode.InlineKeys,
+    new TransportProtocol("https://example.com/alice"));
 
-// Step 3: Owner produces pairing response
-var response = Pairing.ProducePairingResponseMessage(
-    kind: Pairing.SenderKind.SharerNonRecovery,
-    pairRequestWireBytes: request.WireBytes,
-    pairingSecretKeyMaterial: request.SecretKeyMaterial
-);
+// Step 2: Contact responder produces the pairing request envelope.
+var pairRequest = Pairing.Request.Produce(
+    Pairing.SenderKind.Helper,
+    new TransportProtocol("https://example.com/helper"),
+    contact.ContactMessage);
 
-// Step 4: Helper processes response
-var final = Pairing.ProcessPairingResponseMessage(
-    contactMessageBytes: contact.WireBytes,
-    pairResponseWireBytes: response.WireBytes,
-    pairingSecretKeyMaterial: request.SecretKeyMaterial
-);
+// Step 3: Initiator extracts the request, then produces the response and derives the shared key.
+var extractedRequest = Pairing.Request.Extract(pairRequest.Envelope, contact.SecretKeyMaterial);
+var produced = Pairing.Response.Produce(
+    channelId,
+    extractedRequest.RequestProtoBytes,
+    contact.SecretKeyMaterial);
 
-Console.WriteLine($"Shared key length: {final.SharedKey.Length}");
+// Step 4: Responder extracts the response, then derives the same shared key.
+var extractedResponse = Pairing.Response.Extract(produced.Envelope, pairRequest.SecretKeyMaterial);
+var processed = Pairing.Response.Process(
+    pairRequest.InitiatorContactMessage,
+    extractedResponse.ResponseProtoBytes,
+    pairRequest.SecretKeyMaterial);
+
+// Both sides hold the same shared key and rekeyed channel id.
+// produced.SharedKey  ==  processed.SharedKey
+// produced.ChannelId  ==  processed.ChannelId  !=  channelId
+//
+// Rename local channel state from `channelId` to `produced.ChannelId`
+// before sending any further traffic.
 ```
+
+To reject a pairing request, build a `PairResponseMessage` with a non-OK
+`StatusEnum` and encrypt it against `request.ecies_public_key` using the
+pairing envelope primitives. The higher-level `DeRecProtocol` orchestrator's
+`reject` method does this for you. A typed `DeRecException`
+(`Code == DeRecCode.NonOkStatus`, plus `PeerStatus` / `PeerMemo`) is thrown
+from `Process` when the peer rejected. Rejected responses do not carry a
+meaningful `ChannelId` — the rekey only takes effect on `Ok` responses.
+
+### `HashedKeys` flow (PrePair)
+
+`HashedKeys` adds one plaintext round-trip before the regular `InlineKeys`
+handshake. The scanner fetches the actual keys via `PrePair`, verifies them
+against `contact.ContactBindingHash`, and then runs the normal pairing flow
+on a synthesized contact with the keys filled in.
+
+```csharp
+using DeRec.Library;
+using DeRec.Library.Primitives;
+
+ulong channelId = 7;
+
+// Initiator: HASHED_KEYS contact (no inline keys, only the binding hash).
+// Transport URI MUST be ephemeral — PrePair envelopes are plaintext.
+var contact = Pairing.Request.CreateContact(
+    channelId,
+    ContactMode.HashedKeys,
+    new TransportProtocol("https://relay.example.com/ephemeral"));
+
+// Scanner: fetch keys via PrePair.
+var prePairReqEnv = Pairing.Request.ProducePrePair(
+    new TransportProtocol("https://scanner.example.com/ephemeral"),
+    contact.ContactMessage);
+var prePairReq = Pairing.Request.ExtractPrePair(prePairReqEnv.Envelope);
+var prePairRespEnv = Pairing.Response.ProducePrePair(
+    channelId, prePairReq.RequestProtoBytes, contact.SecretKeyMaterial);
+var prePairResp = Pairing.Response.ExtractPrePair(prePairRespEnv.Envelope);
+
+// Scanner validates the published keys against contact.ContactBindingHash.
+// Throws DeRecException with Category=Pairing, Code=PrePairHashMismatch on
+// mismatch (returns the keys + echoed nonce on match).
+var validated = Pairing.Response.ProcessPrePair(
+    contact.ContactMessage, prePairResp.ResponseProtoBytes);
+
+// Synthesize a "filled-in" contact and run the regular pairing flow. The
+// mode flip is required — `Pairing.Request.Produce` enforces `InlineKeys`
+// and rejects a contact that still advertises `HashedKeys`.
+var filledInContact = contact.ContactMessage with
+{
+    ContactMode = ContactMode.InlineKeys,
+    MlkemEncapsulationKey = validated.MlkemEncapsulationKey,
+    EciesPublicKey = validated.EciesPublicKey,
+    ContactBindingHash = null,
+};
+// ... continue with Pairing.Request.Produce / Extract /
+// Pairing.Response.Produce / Process against `filledInContact` exactly as
+// in the InlineKeys example.
+```
+
+After the PrePair exchange the application **must** swap the transport
+endpoint to a long-term one via `UpdateChannelInfo`. The ephemeral endpoint
+advertised in the `HashedKeys` contact is intended to be retired immediately
+after pairing.
+
+Catch the security-relevant binding-hash mismatch with a typed code:
+
+```csharp
+try
+{
+    var validated = Pairing.Response.ProcessPrePair(
+        contact.ContactMessage, prePairResp.ResponseProtoBytes);
+}
+catch (DeRecException e)
+    when (e.Category == DeRecCategory.Pairing
+       && e.Code == DeRecCode.PrePairHashMismatch)
+{
+    // The keys published by the peer do not match the commitment the
+    // scanner originally accepted — surface to the user as a failed scan,
+    // do NOT proceed to a regular PairRequest.
+}
+```
+
+End-to-end primitive-level coverage (including the tampered-hash assertion)
+lives at `bindings/dotnet/Program.cs::RunPairingFlowHashedKeysTest`. The
+higher-level `DeRecProtocol` orchestrator is also available — see
+[Using `DeRecProtocol` (orchestrator)](#using-derecprotocol-orchestrator).
 
 ---
 
@@ -91,44 +201,34 @@ Console.WriteLine($"Shared key length: {final.SharedKey.Length}");
 
 ```csharp
 using DeRec.Library;
+using DeRec.Library.Primitives;
 
-var result = Sharing.ProtectSecret(
-    secretId: new byte[] {1,2,3},
-    secretData: System.Text.Encoding.UTF8.GetBytes("super-secret"),
-    channels: new ulong[] {1,2,3},
-    threshold: 2,
-    version: 1
-);
+ulong secretId = 42;
+byte[] secretData = System.Text.Encoding.UTF8.GetBytes("super-secret");
+ulong[] channelIds = { 1, 2, 3 };
+ulong threshold = 2;  // must satisfy 2 <= threshold <= channelIds.Length
+uint version = 1;
 
-// Opaque wire bytes containing all share messages
-byte[] shareMessages = result.ShareMessageWireBytesArray;
-```
+var splitResult = Sharing.Request.Split(secretId, secretData, channelIds, threshold, version);
 
----
+// channel ID → committed share bytes
+var shares = splitResult.DeserializeShares();
 
-## Example: Recovery Flow
+// Wrap each share into an encrypted delivery envelope.
+foreach (var (channelId, committedShare) in shares)
+{
+    var envelope = Sharing.Request.Produce(
+        channelId,
+        version,
+        secretId,
+        committedShare,
+        keepList: Array.Empty<uint>(),
+        description: string.Empty,
+        sharedKey: sharedKeys[channelId]);
 
-```csharp
-using DeRec.Library;
-
-// Request a share
-byte[] request = Recovery.GenerateShareRequest(
-    secretId: new byte[] {1,2,3},
-    version: 1
-);
-
-// Helper responds with share content
-byte[] response = Recovery.GenerateShareResponse(
-    shareRequestWireBytes: request,
-    shareContent: /* stored share bytes */
-);
-
-// Owner aggregates responses and recovers secret
-byte[] secret = Recovery.RecoverFromShareResponses(
-    shareResponseWireBytesArray: /* aggregated responses */,
-    secretId: new byte[] {1,2,3},
-    version: 1
-);
+    // Send envelope.Envelope over your transport. The helper extracts and
+    // produces an acknowledgement; the owner extracts and processes it.
+}
 ```
 
 ---
@@ -137,37 +237,266 @@ byte[] secret = Recovery.RecoverFromShareResponses(
 
 ```csharp
 using DeRec.Library;
+using DeRec.Library.Primitives;
 
-// Owner generates verification request
-byte[] request = Verification.GenerateVerificationRequest(
-    secretId: new byte[] {1,2,3},
-    version: 1
-);
+ulong channelId = 1;
+ulong secretId = 42;
+uint version = 1;
+// sharedKey: 32 bytes established during pairing.
+// storedShare: byte[] of the inner StoreShareRequestMessage the helper persisted.
 
-// Helper produces response
-byte[] response = Verification.GenerateVerificationResponse(
-    shareContent: /* stored share */,
-    requestWireBytes: request
-);
+// Owner side: produce the verification request.
+DeRecMessage requestEnvelope =
+    Verification.Request.Produce(channelId, secretId, version, sharedKey);
 
-// Owner verifies response
-bool isValid = Verification.VerifyShareResponse(
-    shareContent: /* stored share */,
-    requestWireBytes: request,
-    responseWireBytes: response
-);
+// Helper side: extract and produce the proof response.
+var req = Verification.Request.Extract(requestEnvelope, sharedKey);
+DeRecMessage responseEnvelope = Verification.Response.Produce(
+    channelId,
+    req.RequestProtoBytes,
+    sharedKey,
+    shareContent: storedShare);
 
-Console.WriteLine($"Valid: {isValid}");
+// Owner side: extract and verify the SHA-384 proof.
+var resp = Verification.Response.Extract(responseEnvelope, sharedKey);
+bool isValid = Verification.Response.Process(resp.ResponseProtoBytes, storedShare);
 ```
+
+`Process` returns `true` only when the proof matches the given share content.
+A peer-side non-OK status surfaces as a `DeRecException`.
+
+---
+
+## Example: Recovery Flow
+
+```csharp
+using DeRec.Library;
+using DeRec.Library.Primitives;
+
+ulong secretId = 42;
+uint version = 1;
+
+// Owner side: produce one GetShareRequest per paired helper channel.
+DeRecMessage shareRequest = Recovery.Request.Produce(channelId, secretId, version, sharedKey);
+
+// Helper side: extract, then produce the response using the StoreShareRequest
+// proto bytes the helper persisted at sharing time (see `extract_store_share_request`).
+var helperReq = Recovery.Request.Extract(shareRequest, sharedKey);
+DeRecMessage shareResponse = Recovery.Response.Produce(
+    channelId,
+    helperReq.RequestProtoBytes,
+    storedShareProtoBytes,
+    sharedKey);
+
+// Owner side: extract each response, then reconstruct the secret from a
+// threshold-sized set.
+var helperResp = Recovery.Response.Extract(shareResponse, sharedKey);
+byte[] recovered = Recovery.Response.Recover(
+    new[] { helperResp.ResponseProtoBytes, /* …more helpers… */ },
+    secretId,
+    version);
+```
+
+---
+
+## Using `DeRecProtocol` (orchestrator)
+
+The `DeRec.Library.Orchestrator` namespace provides a stateful
+`DeRecProtocol` class that mirrors the Rust orchestrator and the
+`@derec-alliance/nodejs` / `@derec-alliance/web` packages. It owns the
+storage / transport callbacks and drives every flow through a single
+`StartAsync` / `ProcessAsync` / `AcceptAsync` / `RejectAsync` surface —
+events surface as typed `DeRecEvent` subclasses.
+
+```csharp
+using DeRec.Library;
+using DeRec.Library.Orchestrator;
+using DeRec.Library.Primitives;
+
+var channelStore = new InMemoryChannelStore();
+var shareStore   = new InMemoryShareStore();
+var secretStore  = new InMemorySecretStore();
+var transport    = new RecordingTransport();
+
+using var owner = new DeRecProtocol(
+    channelStore, shareStore, secretStore, transport,
+    ownTransportUri: "https://owner.example.com");
+
+// Pair (mirror this on the peer side).
+byte[] contact = await helper.CreateContactAsync(channelId, ContactMode.InlineKeys);
+await owner.StartAsync(FlowKind.Pairing, new PairingParams
+{
+    Kind = (int)Pairing.SenderKind.Owner,
+    Contact = contact,
+});
+// Hand the queued PairRequest from `owner`'s transport to `helper.ProcessAndAcceptAllAsync`,
+// then the PairResponse back to `owner.ProcessAndAcceptAllAsync`.
+// Both sides surface `PairingCompletedEvent` when done.
+
+// Protect a secret across one or more helpers.
+await owner.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+{
+    SecretId = "0xCAFE",
+    TargetValue = Target.Many(helperAId, helperBId).ToJsonValue(),
+    Secrets = new[]
+    {
+        new UserSecret { Id = new byte[] { 1 }, Name = "vault", Data = secretBytes },
+    },
+});
+// Each helper emits `ShareStoredEvent`; the owner emits `ShareConfirmedEvent`
+// per helper and `SharingCompleteEvent` once the round closes.
+```
+
+App-side responsibilities (mirrors the other SDKs):
+
+- Implement `IChannelStore`, `IShareStore`, `ISecretStore`, `ITransport`
+  with persistent backends. `InMemoryChannelStore` / `InMemoryShareStore`
+  / `InMemorySecretStore` / `RecordingTransport` ship for tests.
+- After pairing, link old↔new channel IDs on the helper side
+  (`channelStore.LinkChannel(oldId, newId)`) so recovery can fan out on
+  the new pair while still surfacing shares stored under the old one.
+
+End-to-end coverage:
+`bindings/dotnet/Program.cs::RunOrchestratorPairFlowTest`,
+`RunOrchestratorShareAndDiscoverFlowTest`,
+`RunOrchestratorReplicaPairAndVaultSyncTest`.
+
+---
+
+## Replica flows
+
+Replicas mirror an Owner's vault onto a second device so the same secrets
+remain reachable after device loss. Pairings are **unidirectional** —
+one side runs as `SenderKind.ReplicaSource` (owns the vault), the other
+as `SenderKind.ReplicaDestination` (receives it). Both `DeRecProtocol`
+instances must be constructed with a stable `replicaId`:
+
+```csharp
+using var owner = new DeRecProtocol(
+    channelStore, shareStore, secretStore, transport,
+    ownTransportUri: "https://owner.example.com",
+    replicaId: 0xAAAA_AAAA_AAAA_AAAAUL);
+```
+
+After the handshake, channels start in `Pending` and are not eligible as
+`ProtectSecret` targets until both sides confirm a deterministic
+fingerprint derived from the shared key:
+
+```csharp
+string localFp = await owner.GetFingerprintAsync(channelId);
+string peerFp  = await destination.GetFingerprintAsync(channelId); // out of band
+
+await owner.VerifyFingerprintAsync(channelId, peerFp);             // → true
+await destination.VerifyFingerprintAsync(channelId, localFp);      // → true
+```
+
+The Source then includes the Destination in any `ProtectSecret` target
+alongside helpers. Helpers receive the usual VSS share via
+`StoreShareRequest`; the Destination receives the full vault as a typed
+`ReplicaVaultReceivedEvent`:
+
+```csharp
+var ev = events.OfType<ReplicaVaultReceivedEvent>().First();
+// ev.Vault.Helpers          — every paired helper (channel_id, transport_uri, shared_key, ...)
+// ev.Vault.Secrets[i].Data  — the actual UserSecret bytes
+// ev.Vault.Replicas         — every paired destination (replica_id, sender_kind, ...)
+// ev.Vault.OwnerReplicaId   — the Source's replica_id
+// ev.Shares                 — { ChannelId, CommittedShare } pairs keyed by helper channel id
+```
+
+`ev.Vault` + `ev.Shares` give the Destination everything it needs to act
+in the Source's place during recovery. Smoke parity reference:
+`bindings/dotnet/Program.cs::RunOrchestratorReplicaPairAndVaultSyncTest`.
+
+---
+
+## Error Handling
+
+All primitive methods throw `DeRecException` on failure. The exception carries
+the typed FFI error envelope:
+
+```csharp
+try
+{
+    Pairing.Response.Process(contactMessage, responseProtoBytes, secretKeyMaterial);
+}
+catch (DeRecException ex) when (ex.Code == DeRecCode.NonOkStatus)
+{
+    // Peer rejected the pairing; details are on the exception.
+    Console.WriteLine($"peer status={ex.PeerStatus}  memo={ex.PeerMemo}");
+}
+catch (DeRecException ex) when (ex.Code == DeRecCode.VersionMismatch)
+{
+    Console.WriteLine($"version mismatch: expected={ex.Expected}  got={ex.Got}");
+}
+```
+
+`DeRecCategory` identifies the protocol phase (`Pairing`, `Sharing`, …);
+`DeRecCode` identifies the specific reason (`NonOkStatus`, `VersionMismatch`,
+`Invariant`, `ProtobufDecode`, …). Both are global — the same value means the
+same thing across categories.
 
 ---
 
 ## Key Principles
 
-- All protocol messages are opaque `byte[]`
+- Protocol messages cross the boundary as opaque `byte[]` / `DeRecMessage`
 - No protobuf types are exposed in .NET
 - No cryptography is performed in .NET
 - Rust is the single source of truth for protocol logic
+
+---
+
+## Security considerations
+
+### Replica destinations inherit Source trust
+
+`ReplicaVaultReceivedEvent.Vault` carries the full `SecretContainer`,
+which embeds every helper's `ChannelId` and `SharedKey` under
+`HelperInfo`. Anyone holding the vault can therefore authenticate as the
+Source toward every helper. This is intentional — it is what makes
+Destination-driven recovery work — but it means a compromised
+Destination can impersonate the Source against every helper paired at
+the time the vault was sent. Pick Destinations with at least the trust
+level of the Source device itself; do not treat them as opaque backups.
+
+### `ContactMode.HashedKeys` requires an ephemeral transport URI
+
+`HashedKeys` ships only a SHA-384 binding hash in the contact and
+serves the actual public keys through a plaintext PrePair round-trip on
+the contact creator's own transport. Any party that can reach that URI
+before the legitimate scanner gets the keys. Use `HashedKeys` only with
+a transport endpoint that is freshly minted for the pairing and that
+you can retire as soon as the PrePair leg completes.
+`ContactMode.InlineKeys` has no such constraint.
+
+The recommended pattern is: pair on the ephemeral URI, then — as soon
+as the pairing completes on the contact creator side — call
+`SetOwnTransport` with the permanent endpoint and start an
+`UpdateChannelInfo` flow against the peer to announce the swap. Once
+the peer acknowledges, retire the ephemeral URI. This keeps the
+plaintext PrePair window tight while letting subsequent traffic ride
+on the long-lived endpoint.
+
+### Replica fingerprint verification is mandatory
+
+Replica channels are created in `ChannelStatus.Pending` and remain
+there until both sides call `VerifyFingerprintAsync` with the value the
+peer derived from the shared key — confirmed out of band. The
+orchestrator enforces this: `StartAsync(FlowKind.ProtectSecret, ...)`
+throws a `DeRecException(Category = DeRecCategory.InvalidInput)` when a
+target is still `Pending`. Treat verification as a required step in the
+pairing UX — a scanner that auto-pairs without it accepts a
+MITM-vulnerable replica.
+
+### The `derec.*` namespace in `CommunicationInfo` is library-owned
+
+`CommunicationInfo` is otherwise an opaque app-defined map, but every
+key under the `derec.` prefix is reserved for the protocol. Today the
+library owns `derec.replica_id`; future protocol additions will use the
+same namespace. Application code must not write any `derec.*` entry —
+the orchestrator silently overwrites or strips library-owned keys at
+the protocol boundary, and app-set values are lost without warning.
 
 ---
 

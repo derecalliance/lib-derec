@@ -1,0 +1,365 @@
+// SPDX-License-Identifier: Apache-2.0
+// Primitives smoke tests: exercises every flow using the low-level
+// `primitives.*` API (raw message produce / extract / process functions).
+// Mirrors the Rust primitive smoke test (`bindings/rust/src/primitives.rs`).
+// The chain in each flow is request.produce → request.extract → response.produce
+// → response.extract → response.process, matching the current Rust signatures
+// one-for-one.
+
+import {
+  ContactMode,
+  primitives,
+  SenderKind,
+  type ContactMessage,
+  type GetShareResponseMessage,
+  type PairRequestMessage,
+  type PairResponseMessage,
+  type PrePairRequestMessage,
+  type PrePairResponseMessage,
+  type SecretVersionEntry,
+  type StoreShareRequestMessage,
+} from "@derec-alliance/nodejs";
+
+function sharedKey(byte: number): Uint8Array {
+  return new Uint8Array(32).fill(byte);
+}
+
+export function runPrimitivesSmoke(): void {
+  console.log("━━━ [Primitives] Starting ━━━\n");
+
+  const secretId = 0x0102_0304_05ffn;
+  const secretData = new Uint8Array([5, 6, 7, 8, 255]);
+  const channelIds: bigint[] = [1n, 2n, 3n];
+  const threshold = 2;
+  const version = 1;
+
+  const sharedKeys = new Map<bigint, Uint8Array>();
+  for (const id of channelIds) sharedKeys.set(id, sharedKey(Number(id)));
+  const keyFor = (id: bigint): Uint8Array => {
+    const k = sharedKeys.get(id);
+    if (!k) throw new Error(`missing shared key for channel ${id}`);
+    return k;
+  };
+
+
+  console.log("=== [Primitives] Sharing Flow ===");
+
+  const { shares } = primitives.sharing.request.split(
+    channelIds,
+    secretId,
+    version,
+    secretData,
+    threshold,
+  );
+  if (shares.size !== channelIds.length) {
+    throw new Error(
+      `Sharing failed: expected ${channelIds.length} shares, got ${shares.size}`,
+    );
+  }
+
+  // Helper-side persisted store-share inner request — reused later by
+  // verification and recovery, mirroring how a real helper would persist it.
+  const storedShareRequests = new Map<bigint, StoreShareRequestMessage>();
+
+  for (const id of channelIds) {
+    const key = keyFor(id);
+    const committedShare = shares.get(id);
+    if (!committedShare) throw new Error(`no committed share for channel ${id}`);
+
+    const requestEnvelope = primitives.sharing.request.produce(
+      id, version, secretId, committedShare, [], "", key,
+    );
+    console.log(`  [request.produce] channel=${id} envelope=${requestEnvelope.envelope.length}B`);
+
+    // Helper side: extract then produce response.
+    const { request } = primitives.sharing.request.extract(
+      requestEnvelope.envelope, key,
+    );
+    storedShareRequests.set(id, request);
+
+    const responseResult = primitives.sharing.response.produce(id, request, key);
+    if (responseResult.secret_id !== secretId) {
+      throw new Error(`secret_id mismatch on channel ${id}`);
+    }
+    if (responseResult.version !== version) {
+      throw new Error(`version mismatch on channel ${id}`);
+    }
+
+    // Owner side: extract then process.
+    const { response } = primitives.sharing.response.extract(
+      responseResult.envelope, key,
+    );
+    primitives.sharing.response.process(version, response);
+    console.log(`  [response.process] channel=${id} validated OK`);
+  }
+
+  console.log("✓ Sharing flow passed.\n");
+
+
+  console.log("=== [Primitives] Verification Flow ===");
+
+  const verifyChannel = 1n;
+  const verifyKey = keyFor(verifyChannel);
+  const storedFor1 = storedShareRequests.get(1n)!;
+  const storedFor2 = storedShareRequests.get(2n)!;
+
+  // Owner side: produce request.
+  const verifyReqEnvelope = primitives.verification.request.produce(
+    verifyChannel, secretId, version, verifyKey,
+  );
+
+  // Helper side: extract + produce response (the share content is the inner
+  // `share` field from the stored StoreShareRequest).
+  const { request: verifyRequest } = primitives.verification.request.extract(
+    verifyReqEnvelope.envelope, verifyKey,
+  );
+  if (verifyRequest.secret_id !== secretId) {
+    throw new Error("verification request secret_id mismatch");
+  }
+  const verifyRespEnvelope = primitives.verification.response.produce(
+    verifyChannel, verifyRequest, verifyKey, storedFor1.share,
+  );
+
+  // Owner side: extract + process against the correct and wrong share.
+  const { response: verifyResponse } = primitives.verification.response.extract(
+    verifyRespEnvelope.envelope, verifyKey,
+  );
+  const valid = primitives.verification.response.process(verifyRequest, verifyResponse, storedFor1.share);
+  if (!valid) throw new Error("expected true for matching share");
+  const invalid = primitives.verification.response.process(verifyRequest, verifyResponse, storedFor2.share);
+  if (invalid) throw new Error("expected false for wrong share");
+  console.log(`  [response.process] correct=true wrong=false  ✓`);
+
+  console.log("✓ Verification flow passed.\n");
+
+
+  console.log("=== [Primitives] Discovery Flow ===");
+
+  const discChannel = 1n;
+  const discKey = keyFor(discChannel);
+
+  const discReqEnvelope = primitives.discovery.request.produce(discChannel, discKey);
+  const _discRequest = primitives.discovery.request.extract(discReqEnvelope.envelope, discKey);
+
+  const helperSecretList: SecretVersionEntry[] = [
+    {
+      secret_id: secretId,
+      versions: [{ version, description: "smoke-test secret" }],
+    },
+  ];
+  const discRespEnvelope = primitives.discovery.response.produce(
+    discChannel, helperSecretList, discKey,
+  );
+
+  const { response: discResponse } = primitives.discovery.response.extract(
+    discRespEnvelope.envelope, discKey,
+  );
+  const discResult = primitives.discovery.response.process(discResponse);
+  if (discResult.secret_list.length === 0) {
+    throw new Error("discovery: empty secret_list");
+  }
+  const entry = discResult.secret_list[0]!;
+  if (entry.secret_id !== secretId) {
+    throw new Error(`discovery: secret_id mismatch (${entry.secret_id} vs ${secretId})`);
+  }
+  console.log(`  [response.process] ${discResult.secret_list.length} secret(s) discovered`);
+
+  console.log("✓ Discovery flow passed.\n");
+
+
+  console.log("=== [Primitives] Recovery Flow ===");
+
+  const collectedResponses: GetShareResponseMessage[] = [];
+  for (const id of channelIds) {
+    const key = keyFor(id);
+    const stored = storedShareRequests.get(id);
+    if (!stored) throw new Error(`missing stored share for channel ${id}`);
+
+    const reqEnvelope = primitives.recovery.request.produce(id, secretId, version, key);
+    const { request } = primitives.recovery.request.extract(reqEnvelope.envelope, key);
+
+    const respEnvelope = primitives.recovery.response.produce(id, request, stored, key);
+    const { response } = primitives.recovery.response.extract(respEnvelope.envelope, key);
+    collectedResponses.push(response);
+  }
+
+  const recovered = primitives.recovery.response.recover(secretId, version, collectedResponses);
+  if (recovered.secret_data.length !== secretData.length) {
+    throw new Error(`recovery: length mismatch ${recovered.secret_data.length} vs ${secretData.length}`);
+  }
+  if (!recovered.secret_data.every((b, i) => b === secretData[i])) {
+    throw new Error("recovery: bytes do not match original secret");
+  }
+  console.log(`  [response.recover] recovered ${recovered.secret_data.length}B — matches original ✓`);
+
+  console.log("✓ Recovery flow passed.\n");
+
+
+  console.log("=== [Primitives] Pairing Flow (INLINE_KEYS) ===");
+
+  const pairingChannelId = 1n;
+
+  // Contact initiator (Owner) creates the out-of-band ContactMessage. The
+  // contact carries the keys inline — no PrePair round-trip is needed.
+  const contact = primitives.pairing.request.create_contact(
+    pairingChannelId,
+    ContactMode.InlineKeys,
+    { protocol: 0, uri: "https://example.com/alice" },
+  );
+
+  // Responder (Helper) produces a pairing request from the contact.
+  const pairingRequest = primitives.pairing.request.produce(
+    SenderKind.Helper,
+    { protocol: 0, uri: "https://example.com/helper" },
+    contact.contact_message,
+    null,
+  );
+
+  // Initiator extracts the request and produces a response.
+  const { request: pairRequest }: { request: PairRequestMessage } =
+    primitives.pairing.request.extract(pairingRequest.envelope, contact.secret_key);
+  const produced = primitives.pairing.response.produce(
+    pairingChannelId, pairRequest, contact.secret_key, null,
+  );
+
+  // Responder extracts the response and processes it.
+  const { response: pairResponse }: { response: PairResponseMessage } =
+    primitives.pairing.response.extract(produced.envelope, pairingRequest.secret_key);
+  const processed = primitives.pairing.response.process(
+    pairingRequest.initiator_contact_message as ContactMessage,
+    pairResponse,
+    pairingRequest.secret_key,
+  );
+
+  if (produced.shared_key.length !== processed.shared_key.length ||
+      !produced.shared_key.every((b, i) => b === processed.shared_key[i])) {
+    throw new Error("pairing: shared keys do not match");
+  }
+  if (produced.channel_id !== processed.channel_id) {
+    throw new Error(
+      `pairing: rekeyed channel id mismatch (produce=${produced.channel_id} process=${processed.channel_id})`,
+    );
+  }
+  if (produced.channel_id === pairingChannelId) {
+    throw new Error("pairing: rekeyed channel id must differ from the pre-rekey id");
+  }
+  console.log(`  shared keys match (${produced.shared_key.length}B)  ✓`);
+  console.log(`  channel id rekeyed: ${pairingChannelId} → ${produced.channel_id}  ✓`);
+
+  console.log("✓ Pairing flow (INLINE_KEYS) passed.\n");
+
+  // HASHED_KEYS contacts carry only a SHA-384 commitment to the initiator's
+  // public keys (small enough for QR), so before pairing can proceed the
+  // scanner must fetch the actual keys over the wire via the plaintext
+  // `PrePair` round-trip and verify them against the commitment.
+
+  console.log("=== [Primitives] Pairing Flow (HASHED_KEYS + PrePair) ===");
+
+  const hashedKeysChannelId = 2n;
+
+  // Alice creates a HASHED_KEYS contact. The transport MUST be ephemeral
+  // because the PrePair messages cross the wire as plaintext.
+  const hkContact = primitives.pairing.request.create_contact(
+    hashedKeysChannelId,
+    ContactMode.HashedKeys,
+    { protocol: 0, uri: "https://example.com/alice/ephemeral" },
+  );
+
+  if (hkContact.contact_message.contact_mode !== ContactMode.HashedKeys) {
+    throw new Error("HASHED_KEYS contact must advertise contact_mode = HashedKeys");
+  }
+  if (hkContact.contact_message.mlkem_encapsulation_key !== undefined) {
+    throw new Error("HASHED_KEYS contact must NOT carry the ML-KEM key inline");
+  }
+  if (hkContact.contact_message.ecies_public_key !== undefined) {
+    throw new Error("HASHED_KEYS contact must NOT carry the ECIES key inline");
+  }
+  const bindingHash = hkContact.contact_message.contact_binding_hash;
+  if (!bindingHash || bindingHash.length !== 48) {
+    throw new Error("HASHED_KEYS contact must carry a 48-byte SHA-384 binding hash");
+  }
+  console.log(`  contact carries 48-byte binding hash, no inline keys  ✓`);
+
+
+  // Bob (the scanner) sends a plaintext PrePair request asking for the keys.
+  const prePairRequestEnvelope = primitives.pairing.request.produce_pre_pair(
+    { protocol: 0, uri: "https://example.com/helper/ephemeral" },
+    hkContact.contact_message,
+  );
+
+  // Alice decodes the inbound plaintext request.
+  const { request: prePairReq }: { request: PrePairRequestMessage } =
+    primitives.pairing.request.extract_pre_pair(prePairRequestEnvelope.envelope);
+  if (prePairReq.nonce !== hkContact.contact_message.nonce) {
+    throw new Error("PrePair request must echo the contact's nonce");
+  }
+
+  // Alice publishes the public keys back to Bob.
+  const prePairResponseEnvelope = primitives.pairing.response.produce_pre_pair(
+    hashedKeysChannelId, prePairReq, hkContact.secret_key,
+  );
+
+  // Bob decodes the inbound plaintext response.
+  const { response: prePairResp }: { response: PrePairResponseMessage } =
+    primitives.pairing.response.extract_pre_pair(prePairResponseEnvelope.envelope);
+
+  // Bob recomputes the SHA-384 binding hash and validates it against the
+  // commitment from the original contact. Any tampering on the plaintext
+  // PrePair leg surfaces here.
+  const validated = primitives.pairing.response.process_pre_pair(
+    hkContact.contact_message, prePairResp,
+  );
+  console.log(`  PrePair validated (mlkem=${validated.mlkem_encapsulation_key.length}B, ecies=${validated.ecies_public_key.length}B, nonce echoed)  ✓`);
+
+
+  // Bob synthesizes a "filled-in" contact by copying the validated keys
+  // into a clone of the HASHED_KEYS contact, then flips contact_mode to
+  // InlineKeys and drops the binding hash. `produce` enforces the
+  // InlineKeys invariant, so this rewrite is required — it mirrors the
+  // protocol orchestrator's `on_pre_pair_response` logic.
+  const { contact_binding_hash: _omitBindingHash, ...hkContactBase } =
+    hkContact.contact_message;
+  const filledInContact: ContactMessage = {
+    ...hkContactBase,
+    contact_mode: ContactMode.InlineKeys,
+    mlkem_encapsulation_key: validated.mlkem_encapsulation_key,
+    ecies_public_key: validated.ecies_public_key,
+  };
+
+  const hkPairingRequest = primitives.pairing.request.produce(
+    SenderKind.Helper,
+    { protocol: 0, uri: "https://example.com/helper" },
+    filledInContact,
+    null,
+  );
+  const { request: hkPairRequest }: { request: PairRequestMessage } =
+    primitives.pairing.request.extract(hkPairingRequest.envelope, hkContact.secret_key);
+  const hkProduced = primitives.pairing.response.produce(
+    hashedKeysChannelId, hkPairRequest, hkContact.secret_key, null,
+  );
+  const { response: hkPairResponse }: { response: PairResponseMessage } =
+    primitives.pairing.response.extract(hkProduced.envelope, hkPairingRequest.secret_key);
+  const hkProcessed = primitives.pairing.response.process(
+    hkPairingRequest.initiator_contact_message as ContactMessage,
+    hkPairResponse,
+    hkPairingRequest.secret_key,
+  );
+  if (hkProduced.shared_key.length !== hkProcessed.shared_key.length ||
+      !hkProduced.shared_key.every((b, i) => b === hkProcessed.shared_key[i])) {
+    throw new Error("HASHED_KEYS pairing: shared keys do not match");
+  }
+  if (hkProduced.channel_id !== hkProcessed.channel_id) {
+    throw new Error(
+      `HASHED_KEYS pairing: rekeyed channel id mismatch (produce=${hkProduced.channel_id} process=${hkProcessed.channel_id})`,
+    );
+  }
+  if (hkProduced.channel_id === hashedKeysChannelId) {
+    throw new Error("HASHED_KEYS pairing: rekeyed channel id must differ from the pre-rekey id");
+  }
+  console.log(`  shared keys match (${hkProduced.shared_key.length}B)  ✓`);
+  console.log(`  channel id rekeyed: ${hashedKeysChannelId} → ${hkProduced.channel_id}  ✓`);
+
+  console.log("✓ Pairing flow (HASHED_KEYS + PrePair) passed.\n");
+
+  console.log("━━━ [Primitives] All passed. ━━━\n");
+}

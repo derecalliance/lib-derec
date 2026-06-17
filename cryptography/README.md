@@ -26,6 +26,7 @@ This crate provides implementations and utilities for:
 - Cryptographic hashing utilities used in the protocol
 - Primitives required by DeRec pairing flows
 - Envelope encryption for message payload protection
+- Replica fingerprint derivation for device-to-device confirmation
 
 The cryptographic constructions rely on well-established cryptographic libraries,
 including:
@@ -81,10 +82,48 @@ This module does **not**:
 ### Example
 
 ```rust
-use derec_cryptography::pairing::envelope::encryption;
+use derec_cryptography::pairing::envelope;
 
-let ciphertext = encryption::encrypt(b"hello", &receiver_pk).unwrap();
-let plaintext = encryption::decrypt(&ciphertext, &receiver_sk).unwrap();
+let ciphertext = envelope::encrypt(b"hello", &receiver_pk).unwrap();
+let plaintext = envelope::decrypt(&ciphertext, &receiver_sk).unwrap();
+```
+
+---
+
+## Replica Fingerprint
+
+The module `replica` derives a 16-digit decimal fingerprint from the 32-byte
+shared key established during Replica pairing. Both devices display this
+fingerprint so the user can visually confirm they are pairing with the correct
+peer (similar to Bluetooth pairing).
+
+### Algorithm
+
+1. Compute `H = SHA-256(K)` where `K` is the 32-byte shared key.
+2. Split `H` into 16 consecutive 2-byte chunks.
+3. Interpret each chunk as a big-endian `u16`, then compute `digit = value % 10`.
+4. Format the 16 digits as `XXXX-XXXX-XXXX-XXXX`.
+
+The `fingerprint_digits` function is also available for cases that need the raw
+digit array (e.g. protobuf serialization).
+
+### Properties
+
+- **Deterministic** — both peers derive the same fingerprint from the same key.
+- **No secret material leaked** — the fingerprint is a lossy hash of the key;
+  it cannot be reversed to recover the shared key.
+
+### Example
+
+```rust
+use derec_cryptography::replica;
+
+let shared_key = [0xABu8; 32];
+let fp = replica::fingerprint(&shared_key);
+
+// Formatted as "XXXX-XXXX-XXXX-XXXX"
+assert_eq!(fp.len(), 19);
+assert!(fp.chars().all(|c| c.is_ascii_digit() || c == '-'));
 ```
 
 ---

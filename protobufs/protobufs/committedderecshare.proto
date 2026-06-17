@@ -66,14 +66,14 @@ message DeRecShare {
   // The value y = f(x).
   bytes y = 3;
 
-  // Secret ID (any length from 1 to 16 bytes) associated with the share.
+  // Numeric identifier of the secret associated with the share.
   //
   // Must be unique for each secret created by a sharer.
-  bytes secretId = 4;
+  uint64 secretId = 4;
 
   // Version number of the share.
   //
   // A helper is entitled to ignore any StoreShareRequestMessage whose
   // version is less than or equal to the last seen version.
-  int32 version = 5;
+  uint32 version = 5;
 }

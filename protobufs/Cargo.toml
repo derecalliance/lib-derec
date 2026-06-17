@@ -1,6 +1,6 @@
 [package]
 name = "derec-proto"
-version = "0.0.1-alpha.6"
+version = "0.0.1-alpha.7"
 edition = "2024"
 license = "Apache-2.0"
 description = "Generated Rust protobuf types for the DeRec protocol."
@@ -21,6 +21,7 @@ include = [
 [dependencies]
 prost = "0.14.3"
 prost-types = "0.14.3"
+serde = { version = "1.0", features = ["derive"] }
 
 [build-dependencies]
 prost-build = "0.14.3"

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 using System.Runtime.InteropServices;
 
 namespace DeRec.Library.Native;
@@ -5,8 +7,8 @@ namespace DeRec.Library.Native;
 [StructLayout(LayoutKind.Sequential)]
 internal struct DeRecProtocolVersion
 {
-    public int Major;
-    public int Minor;
+    public uint Major;
+    public uint Minor;
 }
 
 internal static class ProtocolVersion

@@ -14,12 +14,14 @@
 //!
 //! The library implements the core protocol flows defined by DeRec:
 //!
-//! - [`pairing`] — establishes a secure communication channel between an Owner
-//!   and a Helper
-//! - [`sharing`] — generates and distributes secret shares to Helpers
-//! - [`verification`] — periodically checks that Helpers are still storing
-//!   the correct share
-//! - [`recovery`] — reconstructs the secret using shares retrieved from Helpers
+//! - [`primitives::pairing`] — establishes a secure communication channel
+//!   between an Owner and a Helper
+//! - [`primitives::sharing`] — generates and distributes secret shares to
+//!   Helpers
+//! - [`primitives::verification`] — periodically checks that Helpers are
+//!   still storing the correct share
+//! - [`primitives::recovery`] — reconstructs the secret using shares
+//!   retrieved from Helpers
 //!
 //! These flows correspond to the lifecycle of a protected secret:
 //!
@@ -34,8 +36,8 @@
 //! functions required to produce and process protocol messages.
 //!
 //! Protocol messages themselves are defined using **protobuf** and are exposed
-//! through the [`protos`] module. Most applications should interact with the
-//! higher-level APIs instead of manipulating protobuf messages directly.
+//! through the [`derec_proto`] crate. Most applications should interact with
+//! the higher-level APIs instead of manipulating protobuf messages directly.
 //!
 //! ## Error handling
 //!
@@ -54,21 +56,39 @@
 //! applications.
 
 pub mod derec_message;
-pub mod pairing;
+pub mod primitives;
+pub mod protocol;
 pub mod protocol_version;
-pub mod recovery;
-pub mod sharing;
+pub mod transport;
 pub mod types;
 mod utils;
-pub mod verification;
 
 mod error;
 pub use error::Error;
 
-#[cfg(target_arch = "wasm32")]
-pub(crate) mod ts_bindings_utils;
+/// Generate a fresh **replica identity** using the OS CSPRNG.
+///
+/// Replica identities are per-device `u64` values that uniquely identify each
+/// participant in a replica group. The orchestrator auto-injects this id
+/// under the reserved `derec.replica_id` key in `CommunicationInfo` during
+/// replica-mode pairings (see
+/// [`protocol::DeRecProtocolBuilder::with_replica_id`]).
+///
+/// Persistence contract: the caller **must** persist the returned value once
+/// per device and pass the same id on every subsequent
+/// [`protocol::DeRecProtocolBuilder::with_replica_id`] call. A replica that
+/// changes its id between restarts cannot be re-identified by peers and will
+/// fail re-pairing / vault sync.
+///
+/// Apps that do not use replica flows do not need to call this.
+pub fn generate_replica_id() -> u64 {
+    rand::random()
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 mod ffi;
+
+#[cfg(target_arch = "wasm32")]
+pub mod wasm;
 
 pub type Result<T> = std::result::Result<T, Error>;

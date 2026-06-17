@@ -14,6 +14,7 @@
 //! - sharing
 //! - verification
 //! - recovery
+//! - discovery
 //!
 //! Each flow defines its own specialized error type, which is converted into
 //! [`Error`] using `From` conversions. This allows public functions to return
@@ -39,19 +40,37 @@
 #[non_exhaustive]
 pub enum Error {
     #[error(transparent)]
-    Pairing(#[from] crate::pairing::PairingError),
+    Pairing(#[from] crate::primitives::pairing::PairingError),
 
     #[error(transparent)]
-    Recovery(#[from] crate::recovery::RecoveryError),
+    Recovery(#[from] crate::primitives::recovery::RecoveryError),
 
     #[error(transparent)]
-    Sharing(#[from] crate::sharing::SharingError),
+    Discovery(#[from] crate::primitives::discovery::DiscoveryError),
 
     #[error(transparent)]
-    Verification(#[from] crate::verification::VerificationError),
+    Sharing(#[from] crate::primitives::sharing::SharingError),
+
+    #[error(transparent)]
+    Verification(#[from] crate::primitives::verification::VerificationError),
+
+    #[error(transparent)]
+    Unpairing(#[from] crate::primitives::unpairing::UnpairingError),
 
     #[error(transparent)]
     DeRecMessage(#[from] crate::derec_message::DeRecMessageBuilderError),
+
+    #[error(transparent)]
+    SecretStore(#[from] crate::protocol::SecretStoreError),
+
+    #[error(transparent)]
+    ChannelStore(#[from] crate::protocol::ChannelStoreError),
+
+    #[error(transparent)]
+    ShareStore(#[from] crate::protocol::ShareStoreError),
+
+    #[error(transparent)]
+    Transport(#[from] crate::transport::TransportValidationError),
 
     #[error("invalid input: {0}")]
     InvalidInput(&'static str),
@@ -64,4 +83,53 @@ pub enum Error {
 
     #[error("internal invariant violated: {0}")]
     Invariant(&'static str),
+
+    #[error(
+        "role mismatch on channel {channel_id:?}: expected {expected:?}, got {actual:?}"
+    )]
+    RoleMismatch {
+        channel_id: crate::types::ChannelId,
+        expected: derec_proto::SenderKind,
+        actual: derec_proto::SenderKind,
+    },
+
+    /// A replica-mode flow was attempted but the protocol was built without
+    /// [`DeRecProtocolBuilder::with_replica_id`](crate::protocol::DeRecProtocolBuilder::with_replica_id).
+    /// Surfaces at the entry points of every flow that requires a local
+    /// replica identity (initiating a replica-mode pairing, handling an
+    /// inbound `PairRequest` whose `sender_kind` is `ReplicaSource` or
+    /// `ReplicaDestination`, etc.).
+    #[error("replica id not configured: build the protocol with .with_replica_id(..) to enable replica flows")]
+    ReplicaIdNotConfigured,
+}
+
+impl Error {
+    pub fn as_non_ok_status(&self) -> Option<(i32, &str)> {
+        match self {
+            Error::Pairing(crate::primitives::pairing::PairingError::NonOkStatus {
+                status,
+                memo,
+            }) => Some((*status, memo)),
+            Error::Sharing(crate::primitives::sharing::SharingError::NonOkStatus {
+                status,
+                memo,
+            }) => Some((*status, memo)),
+            Error::Verification(
+                crate::primitives::verification::VerificationError::NonOkStatus { status, memo },
+            ) => Some((*status, memo)),
+            Error::Discovery(crate::primitives::discovery::DiscoveryError::NonOkStatus {
+                status,
+                memo,
+            }) => Some((*status, memo)),
+            Error::Recovery(crate::primitives::recovery::RecoveryError::NonOkStatus {
+                status,
+                memo,
+            }) => Some((*status, memo)),
+            Error::Unpairing(crate::primitives::unpairing::UnpairingError::NonOkStatus {
+                status,
+                memo,
+            }) => Some((*status, memo)),
+            _ => None,
+        }
+    }
 }

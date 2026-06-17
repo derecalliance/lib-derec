@@ -10,9 +10,13 @@
     "derec_library_bg.wasm.d.ts",
     "derec_library.js",
     "derec_library.d.ts",
+    "index.js",
+    "index.d.ts",
     "README.md",
     "LICENSE"
   ],
+  "module": "index.js",
+  "types": "index.d.ts",
   "keywords": [
     "derec",
     "decentralized",
