@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::transport::TransportProtocolExt as _;
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     types::{ChannelId, SharedKey},
@@ -193,6 +194,10 @@ pub fn extract(
     };
 
     verify_timestamps(envelope.timestamp, request.timestamp)?;
+
+    if let Some(reply_to) = request.reply_to.as_ref() {
+        reply_to.validate()?;
+    }
 
     #[cfg(feature = "logging")]
     tracing::info!("discovery request extracted and validated");

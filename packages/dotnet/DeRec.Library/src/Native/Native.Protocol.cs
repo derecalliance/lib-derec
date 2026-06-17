@@ -12,6 +12,14 @@ namespace DeRec.Library.Native;
 /// have <see cref="UnmanagedFunctionPointerAttribute"/> with
 /// <see cref="CallingConvention.Cdecl"/>.
 /// </summary>
+/// <remarks>
+/// All <c>byte[] buf, UIntPtr bufLen</c> parameter pairs in this class
+/// follow the global FFI marshaling contract on <see cref="Utils"/> —
+/// pass <c>(UIntPtr)buf.Length</c>; never a wire-derived value. Every
+/// returned <see cref="Buffer"/> field must be released via
+/// <see cref="DeRec.Library.Utils.FreeBuffer"/> (see
+/// <see cref="Buffer"/> for the ownership contract).
+/// </remarks>
 internal static class Protocol
 {
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]

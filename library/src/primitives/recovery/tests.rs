@@ -698,3 +698,36 @@ fn test_recovery_end_to_end() {
 
     assert_eq!(secret_data, secret);
 }
+
+/// A peer-supplied `reply_to` that declares `Protocol::Https` but ships a
+/// plaintext URI is rejected at extract — the scheme-vs-protocol gate is
+/// what stops a malicious request sender from redirecting our response
+/// onto an HTTP transport.
+#[test]
+fn test_extract_get_share_request_rejects_scheme_mismatched_reply_to() {
+    let channel_id = ChannelId(13);
+    let shared_key = [97u8; 32];
+
+    let malicious_reply_to = derec_proto::TransportProtocol {
+        uri: "http://attacker.example/inbox".to_owned(),
+        protocol: derec_proto::Protocol::Https as i32,
+    };
+
+    let ProduceGetShareRequestMessageResult { envelope } = produce_get_share_request_message(
+        channel_id,
+        1,
+        1,
+        &shared_key,
+        Some(malicious_reply_to),
+    )
+    .expect("failed to produce get share request");
+
+    let result = extract_get_share_request(&envelope, &shared_key);
+
+    assert!(matches!(
+        result,
+        Err(Error::Transport(
+            crate::transport::TransportValidationError::SchemeMismatch { .. }
+        ))
+    ));
+}

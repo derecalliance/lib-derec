@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::primitives::pairing::PairingError;
+use crate::transport::TransportProtocolExt as _;
 use crate::utils::verify_timestamps;
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp},
@@ -518,6 +519,10 @@ pub fn extract(
 
     verify_timestamps(envelope.timestamp, request.timestamp)?;
 
+    if let Some(tp) = request.transport_protocol.as_ref() {
+        tp.validate()?;
+    }
+
     #[cfg(feature = "logging")]
     tracing::info!("pairing request extracted and validated");
 
@@ -586,6 +591,10 @@ pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, c
 
     verify_timestamps(envelope.timestamp, request.timestamp)?;
 
+    if let Some(tp) = request.transport_protocol.as_ref() {
+        tp.validate()?;
+    }
+
     #[cfg(feature = "logging")]
     tracing::info!("PrePair request envelope decoded and validated");
 
@@ -615,6 +624,7 @@ fn validate_inputs(
 
         return Err(PairingError::EmptyTransportUri.into());
     }
+    transport_protocol.validate()?;
 
     validate_contact_for_mode(contact_message, expected_mode)?;
 
@@ -632,6 +642,7 @@ fn validate_inputs(
 
         return Err(PairingError::InvalidContactMessage("transport_protocol.uri is empty").into());
     }
+    initiator_tp.validate()?;
 
     Ok(())
 }

@@ -594,3 +594,48 @@ fn test_produce_store_share_response_message_rejects_tampered_commitment() {
         "should reject share whose commitment does not match Merkle proof"
     );
 }
+
+/// A peer-supplied `reply_to` that declares `Protocol::Https` but ships a
+/// plaintext URI is rejected at extract — the scheme-vs-protocol gate is
+/// what stops a malicious request sender from redirecting our response
+/// onto an HTTP transport.
+#[test]
+fn test_extract_store_share_request_rejects_scheme_mismatched_reply_to() {
+    let secret_id: u64 = 1;
+    let secret_data = b"share-extract-validation";
+    let channels = make_channel_ids(&[1, 2, 3]);
+    let version = 1;
+
+    let SplitResult { shares } =
+        split(&channels, secret_id, version, secret_data, 2).expect("split should succeed");
+
+    let channel_id = ChannelId(1);
+    let committed_share = shares.get(&channel_id).expect("missing share");
+    let shared_key = [1u8; 32];
+
+    let malicious_reply_to = derec_proto::TransportProtocol {
+        uri: "http://attacker.example/inbox".to_owned(),
+        protocol: derec_proto::Protocol::Https as i32,
+    };
+
+    let ProduceStoreShareRequestMessageResult { envelope } = produce_store_share_request_message(
+        channel_id,
+        version,
+        secret_id,
+        committed_share,
+        &[],
+        String::new(),
+        &shared_key,
+        Some(malicious_reply_to),
+    )
+    .expect("failed to produce store share request");
+
+    let result = extract_store_share_request(&envelope, &shared_key);
+
+    assert!(matches!(
+        result,
+        Err(Error::Transport(
+            crate::transport::TransportValidationError::SchemeMismatch { .. }
+        ))
+    ));
+}

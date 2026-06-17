@@ -171,3 +171,35 @@ fn test_inner_request_decodable_via_extract_inner_message() {
     let inner = extract_inner_message(&envelope.message, &shared_key).unwrap();
     assert!(matches!(inner, MessageBody::UnpairRequest(_)));
 }
+
+/// A peer-supplied `reply_to` that declares `Protocol::Https` but ships a
+/// plaintext URI is rejected at extract — the scheme-vs-protocol gate is
+/// what stops a malicious request sender from redirecting our response
+/// onto an HTTP transport.
+#[test]
+fn test_extract_unpair_request_rejects_scheme_mismatched_reply_to() {
+    let channel_id = ChannelId(9);
+    let shared_key = make_shared_key(17);
+
+    let malicious_reply_to = derec_proto::TransportProtocol {
+        uri: "http://attacker.example/inbox".to_owned(),
+        protocol: derec_proto::Protocol::Https as i32,
+    };
+
+    let produced = produce_unpair_request_message(
+        channel_id,
+        "bye",
+        &shared_key,
+        Some(malicious_reply_to),
+    )
+    .expect("failed to produce unpair request");
+
+    let result = extract_unpair_request(&produced.envelope, &shared_key);
+
+    assert!(matches!(
+        result,
+        Err(Error::Transport(
+            crate::transport::TransportValidationError::SchemeMismatch { .. }
+        ))
+    ));
+}

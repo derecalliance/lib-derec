@@ -2249,3 +2249,116 @@ fn test_validate_rejects_hashed_wrong_hash_length() {
             if m == "hashed_keys contact_binding_hash is not a SHA-384 digest"
     ));
 }
+
+/// A peer-supplied `PairRequestMessage.transport_protocol` declaring
+/// `Protocol::Https` but carrying an `http://` URI is rejected on the
+/// initiator side at extract — the producer-side `validate_inputs`
+/// catches well-behaved local builds, and this gate catches a
+/// malicious responder that bypasses it.
+#[test]
+fn test_extract_pairing_request_rejects_scheme_mismatched_transport_protocol() {
+    use crate::derec_message::DeRecMessageBuilder;
+
+    let alice_channel_id = ChannelId(91);
+
+    let CreateContactMessageResult {
+        contact_message: alice_contact,
+        secret_key: alice_sk_state,
+    } = create_contact_message(
+        alice_channel_id,
+        ContactMode::InlineKeys,
+        TransportProtocol {
+            uri: "https://relay.example/alice".to_owned(),
+            protocol: Protocol::Https.into(),
+        },
+    )
+    .expect("failed to create contact message");
+
+    // Hand-craft a PairRequest whose advertised transport_protocol
+    // declares Https but carries an http:// URI — the structurally
+    // malicious payload `validate_inputs` would refuse on the producer
+    // side. Encrypt with the initiator's ECIES public key from the
+    // contact message and seal it in the standard outer envelope.
+    let malicious_transport = TransportProtocol {
+        uri: "http://attacker.example/inbox".to_owned(),
+        protocol: Protocol::Https.into(),
+    };
+    let timestamp = current_timestamp();
+    let request = PairRequestMessage {
+        sender_kind: SenderKind::Helper.into(),
+        mlkem_ciphertext: vec![0u8; 32],
+        ecies_public_key: vec![0u8; 33],
+        nonce: alice_contact.nonce,
+        communication_info: None,
+        parameter_range: None,
+        transport_protocol: Some(malicious_transport),
+        timestamp: Some(timestamp),
+    };
+
+    let envelope = DeRecMessageBuilder::pairing()
+        .channel_id(alice_channel_id)
+        .timestamp(timestamp)
+        .message_body(MessageBody::PairRequest(request))
+        .encrypt_pairing(
+            alice_contact
+                .ecies_public_key
+                .as_ref()
+                .expect("inline-keys contact carries ecies_public_key"),
+        )
+        .expect("encrypt pairing")
+        .build()
+        .expect("build envelope")
+        .encode_to_vec();
+
+    let result = extract_pairing_request(&envelope, alice_sk_state.ecies_secret_key());
+
+    assert!(matches!(
+        result,
+        Err(Error::Transport(
+            crate::transport::TransportValidationError::SchemeMismatch { .. }
+        ))
+    ));
+}
+
+/// Same gate at the plaintext PrePair leg: a `PrePairRequestMessage`
+/// advertising `Protocol::Https` with an `http://` URI is rejected at
+/// extract.
+#[test]
+fn test_extract_pre_pair_rejects_scheme_mismatched_transport_protocol() {
+    use crate::protocol_version::ProtocolVersion;
+    use derec_proto::PrePairRequestMessage;
+
+    let channel_id = ChannelId(92);
+
+    let malicious_transport = TransportProtocol {
+        uri: "http://attacker.example/inbox".to_owned(),
+        protocol: Protocol::Https.into(),
+    };
+    let timestamp = current_timestamp();
+    let request = PrePairRequestMessage {
+        nonce: 0xDEAD_BEEF,
+        transport_protocol: Some(malicious_transport),
+        timestamp: Some(timestamp),
+    };
+
+    let version = ProtocolVersion::current();
+    let envelope = DeRecMessage {
+        protocol_version_major: version.major,
+        protocol_version_minor: version.minor,
+        sequence: 0,
+        channel_id: channel_id.into(),
+        timestamp: Some(timestamp),
+        message: MessageBody::PrePairRequest(request).encode_to_vec(),
+        trace_id: 0,
+    }
+    .encode_to_vec();
+
+    let result = extract_pre_pair(&envelope);
+
+    assert!(matches!(
+        result,
+        Err(Error::Transport(
+            crate::transport::TransportValidationError::SchemeMismatch { .. }
+        ))
+    ));
+}

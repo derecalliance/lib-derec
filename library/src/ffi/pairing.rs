@@ -20,6 +20,7 @@ use crate::ffi::error::{
     DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_BAD_SHARED_KEY, DEREC_CODE_FFI_INVALID_ENUM,
     DEREC_CODE_FFI_NULL_PTR, DeRecError, ffi_error, from_lib_error, success,
 };
+use crate::transport::TransportProtocolExt as _;
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{
     CommunicationInfo, ContactMessage, ContactMode, DeRecMessage, PairRequestMessage,
@@ -831,12 +832,19 @@ fn parse_buffer<'a>(ptr: *const u8, len: usize, name: &str) -> Result<&'a [u8], 
 
 fn decode_transport_protocol(ptr: *const u8, len: usize) -> Result<TransportProtocol, DeRecError> {
     let bytes = parse_buffer(ptr, len, "transport_protocol_ptr")?;
-    TransportProtocol::decode(bytes).map_err(|_| {
+    let tp = TransportProtocol::decode(bytes).map_err(|_| {
         ffi_error(
             DEREC_CODE_FFI_BAD_PROTO,
             "transport_protocol_bytes is not a valid TransportProtocol",
         )
-    })
+    })?;
+    // Reject mismatched-scheme / malformed transport at the FFI seam.
+    // Same gate runs at every primitive `extract`; running it here
+    // means application-supplied transport bytes are validated even
+    // before the primitive sees them.
+    tp.validate()
+        .map_err(|e| from_lib_error(crate::Error::Transport(e)))?;
+    Ok(tp)
 }
 
 fn decode_optional_communication_info(

@@ -54,6 +54,18 @@ public sealed class DeRecException : Exception
 
 internal static class Utils
 {
+    /// <summary>
+    /// Copies the contents of a native-allocated <see cref="Native.Buffer"/>
+    /// into a fresh managed <c>byte[]</c>.
+    /// </summary>
+    /// <remarks>
+    /// Does <b>not</b> release the underlying native allocation. After this
+    /// call returns, the caller still owns <paramref name="buffer"/> and
+    /// MUST invoke <see cref="FreeBuffer"/> on it exactly once — typically
+    /// from a <c>finally</c> block paired with the call site so exception
+    /// paths still release the allocation. See <see cref="Native.Buffer"/>
+    /// for the full ownership contract.
+    /// </remarks>
     public static byte[] CopyBuffer(Native.Buffer buffer)
     {
         int len = checked((int)buffer.Len);
@@ -101,6 +113,28 @@ internal static class Utils
         throw ex;
     }
 
+    /// <summary>
+    /// Releases the native allocation backing a <see cref="Native.Buffer"/>
+    /// returned across the FFI boundary.
+    /// </summary>
+    /// <remarks>
+    /// MUST be called exactly once for every <see cref="Native.Buffer"/>
+    /// the native library returns, regardless of whether the surrounding
+    /// call succeeded or threw. The canonical pattern is:
+    /// <code>
+    /// try {
+    ///     Utils.ThrowIfError(nativeResult.Error);
+    ///     return Utils.CopyBuffer(nativeResult.SomeBuffer);
+    /// } finally {
+    ///     Utils.FreeBuffer(nativeResult.SomeBuffer);
+    /// }
+    /// </code>
+    /// Skipping the call leaks native memory invisibly to the GC; calling
+    /// it twice on the same <see cref="Native.Buffer"/> is undefined
+    /// behavior. Null-pointer safe: harmless to call unconditionally in
+    /// <c>finally</c> when the native side may not have allocated (e.g.
+    /// after an error return).
+    /// </remarks>
     public static void FreeBuffer(Native.Buffer buffer)
     {
         if (buffer.Ptr != IntPtr.Zero)

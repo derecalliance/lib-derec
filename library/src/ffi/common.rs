@@ -115,11 +115,21 @@ pub(crate) fn read_len_prefixed_vec(input: &mut &[u8]) -> Result<Vec<u8>, String
 /// is how request bodies express `reply_to: None`. A non-zero length plus
 /// null pointer is treated as an error. Used by the FFI `produce_*_request`
 /// surfaces to thread `reply_to` into the corresponding primitive.
+///
+/// When bytes decode successfully, runs
+/// [`crate::transport::TransportProtocolExt::validate`] against the value
+/// so callers that reach the library through FFI cannot smuggle a
+/// mismatched-scheme or otherwise malformed `reply_to` past the seam.
+/// Mirrors the validation applied at every primitive `extract` site,
+/// keeping the rejection semantics uniform across SDKs.
 pub(crate) fn parse_optional_transport_protocol(
     ptr: *const u8,
     len: usize,
 ) -> Result<Option<derec_proto::TransportProtocol>, crate::ffi::error::DeRecError> {
-    use crate::ffi::error::{DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_NULL_PTR, ffi_error};
+    use crate::ffi::error::{
+        DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_NULL_PTR, ffi_error, from_lib_error,
+    };
+    use crate::transport::TransportProtocolExt as _;
     use prost::Message as _;
 
     if len == 0 {
@@ -132,12 +142,13 @@ pub(crate) fn parse_optional_transport_protocol(
         ));
     }
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-    derec_proto::TransportProtocol::decode(bytes)
-        .map(Some)
-        .map_err(|e| {
-            ffi_error(
-                DEREC_CODE_FFI_BAD_PROTO,
-                format!("failed to decode reply_to TransportProtocol: {e}"),
-            )
-        })
+    let tp = derec_proto::TransportProtocol::decode(bytes).map_err(|e| {
+        ffi_error(
+            DEREC_CODE_FFI_BAD_PROTO,
+            format!("failed to decode reply_to TransportProtocol: {e}"),
+        )
+    })?;
+    tp.validate()
+        .map_err(|e| from_lib_error(crate::Error::Transport(e)))?;
+    Ok(Some(tp))
 }

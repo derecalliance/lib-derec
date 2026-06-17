@@ -6,6 +6,7 @@ use super::super::{
 };
 use super::{peer_endpoint, resolve_target};
 use crate::derec_message::{DeRecMessageBuilder, current_timestamp};
+use crate::transport::TransportProtocolExt as _;
 use crate::{
     Error, Result,
     protocol::types::Target,
@@ -248,6 +249,10 @@ fn on_request(
         return Err(EMPTY_UPDATE_ERROR);
     }
 
+    if let Some(tp) = request.transport_protocol.as_ref() {
+        tp.validate()?;
+    }
+
     Ok(vec![DeRecEvent::ActionRequired {
         channel_id,
         action: PendingAction::UpdateChannelInfo {
@@ -321,4 +326,41 @@ fn extract_communication_info(info: &CommunicationInfo) -> HashMap<String, Strin
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::derec_message::current_timestamp;
+
+    /// A peer-supplied `UpdateChannelInfoRequest.transport_protocol`
+    /// declaring `Protocol::Https` but carrying an `http://` URI is
+    /// rejected by the handler before any side-effecting action is
+    /// surfaced — the gate runs after the must-update-something
+    /// invariant and before the `ActionRequired` event.
+    #[test]
+    fn on_request_rejects_scheme_mismatched_transport_protocol() {
+        let channel_id = ChannelId(31);
+        let shared_key = [11u8; 32];
+
+        let malicious_transport = derec_proto::TransportProtocol {
+            uri: "http://attacker.example/inbox".to_owned(),
+            protocol: derec_proto::Protocol::Https as i32,
+        };
+
+        let request = UpdateChannelInfoRequestMessage {
+            communication_info: None,
+            transport_protocol: Some(malicious_transport),
+            timestamp: Some(current_timestamp()),
+        };
+
+        let result = on_request(channel_id, request, shared_key, 0);
+
+        assert!(matches!(
+            result,
+            Err(Error::Transport(
+                crate::transport::TransportValidationError::SchemeMismatch { .. }
+            ))
+        ));
+    }
 }

@@ -198,6 +198,34 @@ impl TryFrom<&derec_proto::TransportProtocol> for TransportProtocol {
     }
 }
 
+/// Extension trait that gives the prost wire type
+/// [`derec_proto::TransportProtocol`] the same `validate()` shape as the
+/// library wrapper [`TransportProtocol`]. Defined here because the wire
+/// type lives in another crate — the orphan rule blocks adding an
+/// inherent method.
+///
+/// Brought into scope at every boundary where a remotely-controlled or
+/// application-supplied [`derec_proto::TransportProtocol`] surfaces:
+/// peer-extracted `reply_to` / `transport_protocol` fields inside
+/// `extract` primitives, the orchestrator's `on_request` handlers, and
+/// the FFI seam helpers. Centralising the gate in one impl keeps the
+/// rejection semantics uniform across SDKs through
+/// [`crate::Error::Transport`].
+pub trait TransportProtocolExt {
+    /// Validate the endpoint's structural soundness + scheme/protocol
+    /// consistency. Same rules as [`TransportProtocol::validate`]:
+    /// non-empty URI ≤ [`MAX_TRANSPORT_URI_LEN`] bytes, no control
+    /// characters, known `protocol` discriminant, and the URI scheme
+    /// matches the declared protocol.
+    fn validate(&self) -> Result<(), TransportValidationError>;
+}
+
+impl TransportProtocolExt for derec_proto::TransportProtocol {
+    fn validate(&self) -> Result<(), TransportValidationError> {
+        TransportProtocol::try_from(self).map(|_| ())
+    }
+}
+
 /// Structured error returned by [`TransportProtocol::validate`] and
 /// by [`TryFrom`] conversions from the protobuf wire type. Surfaced
 /// via [`crate::Error::Transport`] and from there into the FFI's

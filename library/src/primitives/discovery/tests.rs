@@ -501,3 +501,31 @@ fn test_version_descriptions_are_preserved_through_roundtrip() {
     assert_eq!(parsed[0].versions[1].description, "Final");
     assert_eq!(parsed[0].versions[2].description, "");
 }
+
+/// A peer-supplied `reply_to` that declares `Protocol::Https` but ships a
+/// plaintext URI is rejected at extract — the scheme-vs-protocol gate is
+/// what stops a malicious request sender from redirecting our response
+/// onto an HTTP transport.
+#[test]
+fn test_extract_discovery_request_rejects_scheme_mismatched_reply_to() {
+    let channel_id = ChannelId(7);
+    let shared_key = [73u8; 32];
+
+    let malicious_reply_to = derec_proto::TransportProtocol {
+        uri: "http://attacker.example/inbox".to_owned(),
+        protocol: derec_proto::Protocol::Https as i32,
+    };
+
+    let ProduceRequestResult { envelope } =
+        produce_discovery_request(channel_id, &shared_key, Some(malicious_reply_to))
+            .expect("failed to produce discovery request");
+
+    let result = extract_discovery_request(&envelope, &shared_key);
+
+    assert!(matches!(
+        result,
+        Err(Error::Transport(
+            crate::transport::TransportValidationError::SchemeMismatch { .. }
+        ))
+    ));
+}
