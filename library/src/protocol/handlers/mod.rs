@@ -302,7 +302,7 @@ pub(in crate::protocol) async fn handle_pairing<Ch: DeRecChannelStore, Ss: DeRec
 fn expected_role_for_inbound(body: &MessageBody) -> Option<SenderKind> {
     match body {
         // Multi-role: Helper (peer is Owner, classic share path) OR
-        // Replica (peer is Replica, vault-sync path). Gate is inlined
+        // Replica (peer is Replica, secret-sync path). Gate is inlined
         // in `handle`.
         MessageBody::StoreShareRequest(_) | MessageBody::StoreShareResponse(_) => None,
         // Helper accepts these; Owner sends them.

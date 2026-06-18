@@ -1,21 +1,21 @@
-//! One user, multiple vaults.
+//! One user, multiple secrets.
 //!
-//! Models a single device that owns two distinct vaults — a wallet
+//! Models a single device that protects two distinct secrets — a wallet
 //! seed and an email password — each backed by its own dedicated
-//! pair of helpers, all sharing one Postgres database. Drives the full
-//! lifecycle for each vault (pair → publish → simulate state loss →
+//! pair of helpers, all sharing one SQLite database. Drives the full
+//! lifecycle for each secret (pair → publish → simulate state loss →
 //! re-pair → discover → recover) and asserts:
 //!
-//! - the owner-side DB rows for the two vaults coexist under their
+//! - the owner-side DB rows for the two secrets coexist under their
 //!   respective `secret_id` partitions,
-//! - each helper only ever sees its own vault's payload — recovery in
-//!   vault WALLET surfaces the wallet bytes and never the email
+//! - each helper only ever sees its own secret's payload — recovery on
+//!   WALLET surfaces the wallet bytes and never the email
 //!   bytes, and vice versa,
-//! - state loss in one vault does not affect the other (clearing
-//!   user_secret_store + dropping channel rows for vault WALLET
-//!   leaves vault EMAIL queryable).
+//! - state loss on one secret does not affect the other (clearing
+//!   user_secret_store + dropping channel rows for WALLET
+//!   leaves EMAIL queryable).
 //!
-//! This is the "real" multi-vault story; `multi_tenancy.rs` covers
+//! This is the "real" multi-secret story; `multi_tenancy.rs` covers
 //! the narrow trait-partitioning contract.
 
 use derec_library::protocol::events::DeRecEvent;
@@ -34,64 +34,64 @@ use crate::flows::assertions::{
 use crate::flows::helpers::{pair_owner_helper, protect_secret};
 use crate::peer::{Peer, pump_many};
 
-const VAULT_WALLET: u64 = 0xDEC0_DE01;
-const VAULT_EMAIL: u64 = 0xDEC0_DE02;
+const WALLET_SECRET_ID: u64 = 0xDEC0_DE01;
+const EMAIL_SECRET_ID: u64 = 0xDEC0_DE02;
 
 pub async fn run() {
-    println!("=== [Multi-vault] one user, wallet vault + email vault ===");
+    println!("=== [Multi-secret] one user, wallet secret + email secret ===");
 
-    let user_db = Database::open_isolated().await;
-    let alice_db = Database::open_isolated().await;
-    let bob_db = Database::open_isolated().await;
-    let carol_db = Database::open_isolated().await;
-    let dave_db = Database::open_isolated().await;
+    let user_db = Database::open_in_memory();
+    let alice_db = Database::open_in_memory();
+    let bob_db = Database::open_in_memory();
+    let carol_db = Database::open_in_memory();
+    let dave_db = Database::open_in_memory();
 
     // Same physical DB → same physical user. Two protocols, one per
-    // vault — that's the architecture (one DeRecProtocol = one
-    // vault). Distinct cids per vault keep the per-vault assertions
+    // secret — that's the architecture (one DeRecProtocol = one
+    // secret). Distinct cids per secret keep the per-secret assertions
     // unambiguous when the same DB hosts both partitions.
     let mut user_wallet = Peer::with_secret_id(
-        user_db.client(),
+        user_db.connection(),
         "User-Wallet",
         "https://user-wallet.example.com",
-        VAULT_WALLET,
+        WALLET_SECRET_ID,
     );
     let mut user_email = Peer::with_secret_id(
-        user_db.client(),
+        user_db.connection(),
         "User-Email",
         "https://user-email.example.com",
-        VAULT_EMAIL,
+        EMAIL_SECRET_ID,
     );
 
-    // Wallet vault helpers (Alice + Bob), bound to VAULT_WALLET.
+    // Wallet helpers (Alice + Bob), bound to WALLET_SECRET_ID.
     let mut alice = Peer::with_secret_id(
-        alice_db.client(),
+        alice_db.connection(),
         "Alice",
         "https://alice.example.com",
-        VAULT_WALLET,
+        WALLET_SECRET_ID,
     );
     let mut bob = Peer::with_secret_id(
-        bob_db.client(),
+        bob_db.connection(),
         "Bob",
         "https://bob.example.com",
-        VAULT_WALLET,
+        WALLET_SECRET_ID,
     );
 
-    // Email vault helpers (Carol + Dave), bound to VAULT_EMAIL.
+    // Email helpers (Carol + Dave), bound to EMAIL_SECRET_ID.
     let mut carol = Peer::with_secret_id(
-        carol_db.client(),
+        carol_db.connection(),
         "Carol",
         "https://carol.example.com",
-        VAULT_EMAIL,
+        EMAIL_SECRET_ID,
     );
     let mut dave = Peer::with_secret_id(
-        dave_db.client(),
+        dave_db.connection(),
         "Dave",
         "https://dave.example.com",
-        VAULT_EMAIL,
+        EMAIL_SECRET_ID,
     );
 
-    // ── Pair each vault with its dedicated helpers ────────────────
+    // ── Pair each secret with its dedicated helpers ───────────────
     let wallet_alice = pair_owner_helper(&mut user_wallet, &mut alice, ChannelId(10)).await;
     let wallet_bob = pair_owner_helper(&mut user_wallet, &mut bob, ChannelId(20)).await;
     let email_carol = pair_owner_helper(&mut user_email, &mut carol, ChannelId(30)).await;
@@ -101,13 +101,13 @@ pub async fn run() {
         wallet_alice.0, wallet_bob.0, email_carol.0, email_dave.0
     );
 
-    // Both vaults coexist on the same `channels` table under
+    // Both secrets coexist on the same `channels` table under
     // distinct `secret_id` partitions.
-    assert_eq!(count_channels(&user_db.client(), VAULT_WALLET).await, 2);
-    assert_eq!(count_channels(&user_db.client(), VAULT_EMAIL).await, 2);
-    println!("  user DB: 2 channels per vault, partitioned by secret_id  ✓");
+    assert_eq!(count_channels(&user_db.connection(), WALLET_SECRET_ID), 2);
+    assert_eq!(count_channels(&user_db.connection(), EMAIL_SECRET_ID), 2);
+    println!("  user DB: 2 channels per secret, partitioned by secret_id  ✓");
 
-    // ── Publish into each vault ───────────────────────────────────
+    // ── Publish into each secret ──────────────────────────────────
     let wallet_payload = b"correct horse battery staple".to_vec();
     let email_payload = b"hunter2-but-much-longer".to_vec();
     protect_secret(
@@ -132,41 +132,41 @@ pub async fn run() {
         "email v1",
     )
     .await;
-    assert_eq!(count_user_secrets(&user_db.client(), VAULT_WALLET).await, 1);
-    assert_eq!(count_user_secrets(&user_db.client(), VAULT_EMAIL).await, 1);
-    assert_eq!(count_shares(&user_db.client(), VAULT_WALLET).await, 2);
-    assert_eq!(count_shares(&user_db.client(), VAULT_EMAIL).await, 2);
-    assert_eq!(count_shares(&alice_db.client(), VAULT_WALLET).await, 1);
-    assert_eq!(count_shares(&bob_db.client(), VAULT_WALLET).await, 1);
-    assert_eq!(count_shares(&carol_db.client(), VAULT_EMAIL).await, 1);
-    assert_eq!(count_shares(&dave_db.client(), VAULT_EMAIL).await, 1);
+    assert_eq!(count_user_secrets(&user_db.connection(), WALLET_SECRET_ID), 1);
+    assert_eq!(count_user_secrets(&user_db.connection(), EMAIL_SECRET_ID), 1);
+    assert_eq!(count_shares(&user_db.connection(), WALLET_SECRET_ID), 2);
+    assert_eq!(count_shares(&user_db.connection(), EMAIL_SECRET_ID), 2);
+    assert_eq!(count_shares(&alice_db.connection(), WALLET_SECRET_ID), 1);
+    assert_eq!(count_shares(&bob_db.connection(), WALLET_SECRET_ID), 1);
+    assert_eq!(count_shares(&carol_db.connection(), EMAIL_SECRET_ID), 1);
+    assert_eq!(count_shares(&dave_db.connection(), EMAIL_SECRET_ID), 1);
     println!(
-        "  publish: each vault has 1 user_secrets row + 2 owner-side shares; helpers each hold 1  ✓"
+        "  publish: each secret has 1 user_secrets row + 2 owner-side shares; helpers each hold 1  ✓"
     );
 
-    // Helpers only ever see their own vault — sanity-check the wallet
-    // helpers never received an email-vault share row, and vice versa.
+    // Helpers only ever see their own secret — sanity-check the wallet
+    // helpers never received an email-secret share row, and vice versa.
     assert_eq!(
-        count_shares(&alice_db.client(), VAULT_EMAIL).await,
+        count_shares(&alice_db.connection(), EMAIL_SECRET_ID),
         0,
-        "Alice (wallet helper) must not hold any email-vault shares"
+        "Alice (wallet helper) must not hold any email-secret shares"
     );
     assert_eq!(
-        count_shares(&carol_db.client(), VAULT_WALLET).await,
+        count_shares(&carol_db.connection(), WALLET_SECRET_ID),
         0,
-        "Carol (email helper) must not hold any wallet-vault shares"
+        "Carol (email helper) must not hold any wallet-secret shares"
     );
-    println!("  helpers see only their own vault's shares  ✓");
+    println!("  helpers see only their own secret's shares  ✓");
 
-    // ── Simulate state loss + recovery on the wallet vault only ───
+    // ── Simulate state loss + recovery on the wallet secret only ──
     // Clearing user_secret_store + dropping the owner-side channels
-    // for VAULT_WALLET. Email vault state stays intact — the
+    // for WALLET_SECRET_ID. Email secret state stays intact — the
     // assertions below prove the email lifecycle survives the wallet
     // recovery.
     user_wallet
         .protocol
         .user_secret_store
-        .remove(VAULT_WALLET)
+        .remove(WALLET_SECRET_ID)
         .await
         .unwrap();
 
@@ -202,30 +202,30 @@ pub async fn run() {
     alice
         .protocol
         .channel_store
-        .link_channel(VAULT_WALLET, wallet_alice, wallet_recovery_alice)
+        .link_channel(WALLET_SECRET_ID, wallet_alice, wallet_recovery_alice)
         .await
         .unwrap();
     bob.protocol
         .channel_store
-        .link_channel(VAULT_WALLET, wallet_bob, wallet_recovery_bob)
+        .link_channel(WALLET_SECRET_ID, wallet_bob, wallet_recovery_bob)
         .await
         .unwrap();
     // Owner drops the originals so recovery does not double-fan-out.
     user_wallet
         .protocol
         .channel_store
-        .remove(VAULT_WALLET, wallet_alice)
+        .remove(WALLET_SECRET_ID, wallet_alice)
         .await
         .unwrap();
     user_wallet
         .protocol
         .channel_store
-        .remove(VAULT_WALLET, wallet_bob)
+        .remove(WALLET_SECRET_ID, wallet_bob)
         .await
         .unwrap();
-    println!("  wallet vault: re-paired on fresh channels, originals dropped  ✓");
+    println!("  wallet secret: re-paired on fresh channels, originals dropped  ✓");
 
-    // Discovery + Recovery on the wallet vault.
+    // Discovery + Recovery on the wallet secret.
     user_wallet
         .protocol
         .start(DeRecFlow::Discovery {
@@ -241,14 +241,14 @@ pub async fn run() {
             _ => None,
         })
         .flatten()
-        .find(|s| s.secret_id == VAULT_WALLET)
+        .find(|s| s.secret_id == WALLET_SECRET_ID)
         .and_then(|s| s.versions.iter().map(|v| v.version).max())
-        .expect("wallet discovery must surface VAULT_WALLET");
+        .expect("wallet discovery must surface WALLET_SECRET_ID");
 
     user_wallet
         .protocol
         .start(DeRecFlow::RecoverSecret {
-            secret_id: VAULT_WALLET,
+            secret_id: WALLET_SECRET_ID,
             version: wallet_version,
         })
         .await
@@ -260,7 +260,7 @@ pub async fn run() {
             DeRecEvent::SecretRecovered { secret } => Some(secret.clone()),
             _ => None,
         })
-        .expect("wallet vault must recover");
+        .expect("wallet secret must recover");
     assert!(
         contains_subslice(&wallet_recovered, &wallet_payload),
         "wallet recovery must surface the wallet bytes"
@@ -269,24 +269,24 @@ pub async fn run() {
         !contains_subslice(&wallet_recovered, &email_payload),
         "wallet recovery must NOT leak the email bytes"
     );
-    println!("  wallet vault recovered the wallet bytes (and only those)  ✓");
+    println!("  wallet secret recovered the wallet bytes (and only those)  ✓");
 
-    // Email vault is untouched — its user_secret_store still holds
+    // Email secret is untouched — its user_secret_store still holds
     // the snapshot, its channels are still in the DB, and its
     // helpers can still serve a recovery on the original channels
     // without a re-pair.
     assert_eq!(
-        count_user_secrets(&user_db.client(), VAULT_EMAIL).await,
+        count_user_secrets(&user_db.connection(), EMAIL_SECRET_ID),
         1,
-        "email vault user_secrets row must survive the wallet recovery"
+        "email secret's user_secrets row must survive the wallet recovery"
     );
     assert_eq!(
-        count_channels(&user_db.client(), VAULT_EMAIL).await,
+        count_channels(&user_db.connection(), EMAIL_SECRET_ID),
         2,
-        "email vault channels must survive the wallet recovery"
+        "email secret's channels must survive the wallet recovery"
     );
 
-    // ── Independent Discovery + Recovery on the email vault ───────
+    // ── Independent Discovery + Recovery on the email secret ──────
     user_email
         .protocol
         .start(DeRecFlow::Discovery {
@@ -302,14 +302,14 @@ pub async fn run() {
             _ => None,
         })
         .flatten()
-        .find(|s| s.secret_id == VAULT_EMAIL)
+        .find(|s| s.secret_id == EMAIL_SECRET_ID)
         .and_then(|s| s.versions.iter().map(|v| v.version).max())
-        .expect("email discovery must surface VAULT_EMAIL");
+        .expect("email discovery must surface EMAIL_SECRET_ID");
 
     user_email
         .protocol
         .start(DeRecFlow::RecoverSecret {
-            secret_id: VAULT_EMAIL,
+            secret_id: EMAIL_SECRET_ID,
             version: email_version,
         })
         .await
@@ -321,7 +321,7 @@ pub async fn run() {
             DeRecEvent::SecretRecovered { secret } => Some(secret.clone()),
             _ => None,
         })
-        .expect("email vault must recover");
+        .expect("email secret must recover");
     assert!(
         contains_subslice(&email_recovered, &email_payload),
         "email recovery must surface the email bytes"
@@ -330,9 +330,9 @@ pub async fn run() {
         !contains_subslice(&email_recovered, &wallet_payload),
         "email recovery must NOT leak the wallet bytes"
     );
-    println!("  email vault recovered the email bytes (and only those)  ✓");
+    println!("  email secret recovered the email bytes (and only those)  ✓");
 
-    println!("✓ Multi-vault flow passed.\n");
+    println!("✓ Multi-secret flow passed.\n");
 }
 
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {

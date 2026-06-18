@@ -161,7 +161,7 @@ message StoreShareRequestMessage {
   // # Why this field exists
   //
   // Replica destinations reuse the source's shared keys with helpers (the
-  // keys travel inside the `ReplicaSecretPayload` vault). Two distinct
+  // keys travel inside the `ReplicaSecretPayload`). Two distinct
   // replicas writing the same `(secretId, channelId, version)` from the
   // helper's perspective look cryptographically identical — same envelope
   // key, same channel id. Without this field the helper's `ShareStore`

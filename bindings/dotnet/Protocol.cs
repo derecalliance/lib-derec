@@ -27,7 +27,7 @@ internal static class Protocol
         RunOrchestratorUpdateChannelInfoFlowTest();
         RunOrchestratorReplyToFlowTest();
         RunOrchestratorReplicaIdWiringSadPathsTest();
-        RunOrchestratorReplicaPairAndVaultSyncTest();
+        RunOrchestratorReplicaPairAndSecretSyncTest();
         RunOrchestratorReplicaSyncVersionProgressionTest();
     }
 
@@ -249,8 +249,8 @@ internal static class Protocol
         using var owner = MakeNode("Owner", "https://owner.example.com",
             new NodeOptions(SecretId: secretId));
 
-        // Helpers bind their protocol to the owner's vault id — one
-        // helper-protocol-instance per (owner, vault) pair on the helper
+        // Helpers bind their protocol to the owner's secret id — one
+        // helper-protocol-instance per (owner, secret) pair on the helper
         // side, mirroring the Rust/JS smokes.
         using var helperA = MakeNode("HelperA", "https://helper-a.example.com",
             new NodeOptions(SecretId: secretId));
@@ -366,7 +366,7 @@ internal static class Protocol
         // SecretRecovered carries the full DeRecSecret bag, not the
         // raw UserSecret bytes — so look for the original payload as a
         // contiguous subarray. (Decoding the bag end-to-end would require
-        // the Google.Protobuf descriptors for SecretContainer/UserSecret;
+        // the Google.Protobuf descriptors for Secret/UserSecret;
         // worth adding via FFI later, but the subarray check is enough
         // to prove the round-trip.)
         bool found = IndexOfSequence(recovered.Secret, secretData) >= 0;
@@ -380,12 +380,12 @@ internal static class Protocol
 
     /// <summary>
     /// Drives the full replica pair + ProtectSecret(includes destination)
-    /// + vault sync pipeline. Mirrors the Rust binding's
+    /// + secret sync pipeline. Mirrors the Rust binding's
     /// <c>run_protect_secret_with_replica_targets_flow</c>.
     /// </summary>
-    private static void RunOrchestratorReplicaPairAndVaultSyncTest()
+    private static void RunOrchestratorReplicaPairAndSecretSyncTest()
     {
-        Console.WriteLine("=== Orchestrator replica pair + vault sync test ===");
+        Console.WriteLine("=== Orchestrator replica pair + secret sync test ===");
 
         const ulong ownerReplicaId = 0xAAAA_AAAA_AAAA_AAAAUL;
         const ulong destReplicaId = 0xBBBB_BBBB_BBBB_BBBBUL;
@@ -393,7 +393,7 @@ internal static class Protocol
         const ulong helperBChannel = 2UL;
         const ulong destChannel = 3UL;
         const ulong secretId = 0xC0FFEEUL;
-        byte[] secretData = Encoding.UTF8.GetBytes("vault-payload-for-replica-and-helper");
+        byte[] secretData = Encoding.UTF8.GetBytes("secret-payload-for-replica-and-helper");
 
         using var owner = MakeNode("Owner", "https://owner.example.com",
             new NodeOptions { ReplicaId = ownerReplicaId, SecretId = secretId });
@@ -447,7 +447,7 @@ internal static class Protocol
         {
             Secrets = new[]
             {
-                new UserSecret { Id = new byte[] { 0x01 }, Name = "shared-vault", Data = secretData },
+                new UserSecret { Id = new byte[] { 0x01 }, Name = "shared-secret", Data = secretData },
             },
             Description = "replica + helper distribution",
         }).GetAwaiter().GetResult();
@@ -461,53 +461,53 @@ internal static class Protocol
         Console.WriteLine($"  ProtectSecret fanned out 3 envelopes (2 helpers + 1 destination)  ✓");
 
         var destEvents = destination.Protocol.ProcessAndAcceptAllAsync(destEnvelope).GetAwaiter().GetResult();
-        var received = destEvents.OfType<ReplicaVaultReceivedEvent>().FirstOrDefault()
+        var received = destEvents.OfType<ReplicaSecretReceivedEvent>().FirstOrDefault()
             ?? throw new InvalidOperationException(
-                $"destination did not emit ReplicaVaultReceived; got [{string.Join(", ", destEvents.Select(e => e.EventType))}]");
+                $"destination did not emit ReplicaSecretReceived; got [{string.Join(", ", destEvents.Select(e => e.EventType))}]");
 
         if (ulong.Parse(received.FromReplicaId) != ownerReplicaId)
             throw new InvalidOperationException($"from_replica_id mismatch (got {received.FromReplicaId})");
         if (ulong.Parse(received.SecretId) != secretId)
             throw new InvalidOperationException($"secret_id mismatch (got {received.SecretId})");
-        if (received.Vault.Secrets.Count != 1 || !received.Vault.Secrets[0].Data.SequenceEqual(secretData))
-            throw new InvalidOperationException("vault.secrets[0].data must round-trip the original");
-        if (ulong.Parse(received.Vault.OwnerReplicaId) != ownerReplicaId)
-            throw new InvalidOperationException("vault.owner_replica_id mismatch");
-        if (received.Vault.Helpers.Count != 2)
-            throw new InvalidOperationException($"vault.helpers must be 2, got {received.Vault.Helpers.Count}");
-        if (received.Vault.Replicas.Count != 1)
-            throw new InvalidOperationException($"vault.replicas must be 1, got {received.Vault.Replicas.Count}");
-        var destInfo = received.Vault.Replicas[0];
+        if (received.Secret.Secrets.Count != 1 || !received.Secret.Secrets[0].Data.SequenceEqual(secretData))
+            throw new InvalidOperationException("secret.secrets[0].data must round-trip the original");
+        if (ulong.Parse(received.Secret.OwnerReplicaId) != ownerReplicaId)
+            throw new InvalidOperationException("secret.owner_replica_id mismatch");
+        if (received.Secret.Helpers.Count != 2)
+            throw new InvalidOperationException($"secret.helpers must be 2, got {received.Secret.Helpers.Count}");
+        if (received.Secret.Replicas.Count != 1)
+            throw new InvalidOperationException($"secret.replicas must be 1, got {received.Secret.Replicas.Count}");
+        var destInfo = received.Secret.Replicas[0];
         if (ulong.Parse(destInfo.ReplicaId) != destReplicaId)
-            throw new InvalidOperationException("vault.replicas[0].replica_id mismatch");
+            throw new InvalidOperationException("secret.replicas[0].replica_id mismatch");
         if (destInfo.SenderKind != (int)Pairing.SenderKind.ReplicaDestination)
-            throw new InvalidOperationException("vault.replicas[0].sender_kind must be ReplicaDestination");
+            throw new InvalidOperationException("secret.replicas[0].sender_kind must be ReplicaDestination");
         if (received.Shares.Count != 2)
             throw new InvalidOperationException($"shares must be 2, got {received.Shares.Count}");
 
         Console.WriteLine(
-            $"  ReplicaVaultReceived: vault={received.Vault.Secrets.Count}secret/{received.Vault.Helpers.Count}helpers/{received.Vault.Replicas.Count}replicas, shares={received.Shares.Count}  ✓");
+            $"  ReplicaSecretReceived: secret={received.Secret.Secrets.Count}secret/{received.Secret.Helpers.Count}helpers/{received.Secret.Replicas.Count}replicas, shares={received.Shares.Count}  ✓");
 
         // Drain the helper outboxes from the v=1 round so the next
         // round's pump-and-drain sees only v=2 envelopes.
         helperA.Transport.DrainAll();
         helperB.Transport.DrainAll();
 
-        // Vault version updates: the owner mutates the secret and
+        // Secret version updates: the owner mutates the secret and
         // re-runs `ProtectSecret`. The destination must receive a fresh
-        // `ReplicaVaultReceived` carrying `version=2` and the new
+        // `ReplicaSecretReceived` carrying `version=2` and the new
         // payload. The protocol pulls the next version from
         // `IShareStore.LatestVersion()`; the in-memory store exposes a
         // side-channel setter so this test can drive that contract
         // without first running a full helper-side store / confirm
         // cycle on the owner.
         owner.ShareStore.SetOwnerVersion(owner.Protocol.SecretId, 1);
-        byte[] secretDataV2 = Encoding.UTF8.GetBytes("vault-payload-after-update");
+        byte[] secretDataV2 = Encoding.UTF8.GetBytes("secret-payload-after-update");
         owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
         {
             Secrets = new[]
             {
-                new UserSecret { Id = new byte[] { 0x01 }, Name = "shared-vault", Data = secretDataV2 },
+                new UserSecret { Id = new byte[] { 0x01 }, Name = "shared-secret", Data = secretDataV2 },
             },
             Description = "v2 replica + helper distribution",
         }).GetAwaiter().GetResult();
@@ -519,51 +519,51 @@ internal static class Protocol
             ?? throw new InvalidOperationException("v2: no envelope routed to the destination");
 
         var destEvents2 = destination.Protocol.ProcessAndAcceptAllAsync(destEnvelope2).GetAwaiter().GetResult();
-        var received2 = destEvents2.OfType<ReplicaVaultReceivedEvent>().FirstOrDefault()
+        var received2 = destEvents2.OfType<ReplicaSecretReceivedEvent>().FirstOrDefault()
             ?? throw new InvalidOperationException(
-                $"v2: destination did not emit ReplicaVaultReceived; got [{string.Join(", ", destEvents2.Select(e => e.EventType))}]");
+                $"v2: destination did not emit ReplicaSecretReceived; got [{string.Join(", ", destEvents2.Select(e => e.EventType))}]");
         if (received2.Version != 3u)
             throw new InvalidOperationException($"v2: expected Version=3, got {received2.Version}");
-        if (received2.Vault.Secrets.Count != 1 || !received2.Vault.Secrets[0].Data.SequenceEqual(secretDataV2))
-            throw new InvalidOperationException("v2: vault.secrets[0].data must round-trip the updated bytes");
+        if (received2.Secret.Secrets.Count != 1 || !received2.Secret.Secrets[0].Data.SequenceEqual(secretDataV2))
+            throw new InvalidOperationException("v2: secret.secrets[0].data must round-trip the updated bytes");
         Console.WriteLine(
-            $"  ReplicaVaultReceived v=2: secret bytes updated, share count = {received2.Shares.Count}  ✓");
+            $"  ReplicaSecretReceived v=2: secret bytes updated, share count = {received2.Shares.Count}  ✓");
 
         // Replica recovery transitivity: the Destination received
-        // `vault.helpers[*].shared_key` inside the vault. Those keys
+        // `secret.helpers[*].shared_key` inside the secret. Those keys
         // must be byte-identical to what each helper has stored locally
         // for the owner channel, because a Destination acting as a
         // recovery delegate uses them to authenticate as the Source
         // toward each helper.
         var helperAStored = helperA.SecretStore.Load(helperA.Protocol.SecretId, helperAId, SecretKind.SharedKey)!.Bytes;
         var helperBStored = helperB.SecretStore.Load(helperB.Protocol.SecretId, helperBId, SecretKind.SharedKey)!.Bytes;
-        var vaultHelperA = received2.Vault.Helpers
+        var secretHelperA = received2.Secret.Helpers
             .FirstOrDefault(h => ulong.Parse(h.ChannelId) == helperAId)
-            ?? throw new InvalidOperationException("vault.helpers missing entry for HelperA");
-        var vaultHelperB = received2.Vault.Helpers
+            ?? throw new InvalidOperationException("secret.helpers missing entry for HelperA");
+        var secretHelperB = received2.Secret.Helpers
             .FirstOrDefault(h => ulong.Parse(h.ChannelId) == helperBId)
-            ?? throw new InvalidOperationException("vault.helpers missing entry for HelperB");
-        if (!helperAStored.SequenceEqual(vaultHelperA.SharedKey))
+            ?? throw new InvalidOperationException("secret.helpers missing entry for HelperB");
+        if (!helperAStored.SequenceEqual(secretHelperA.SharedKey))
             throw new InvalidOperationException(
-                "vault.helpers[HelperA].shared_key must match what HelperA stores locally");
-        if (!helperBStored.SequenceEqual(vaultHelperB.SharedKey))
+                "secret.helpers[HelperA].shared_key must match what HelperA stores locally");
+        if (!helperBStored.SequenceEqual(secretHelperB.SharedKey))
             throw new InvalidOperationException(
-                "vault.helpers[HelperB].shared_key must match what HelperB stores locally");
+                "secret.helpers[HelperB].shared_key must match what HelperB stores locally");
         Console.WriteLine(
-            "  vault.helpers[*].shared_key matches each helper's stored key — destination can act in source's stead  ✓");
+            "  secret.helpers[*].shared_key matches each helper's stored key — destination can act in source's stead  ✓");
 
-        // The vault also carries `vault.secrets[*].data` unencrypted,
-        // so the Destination can fall back to its stored vault without
+        // The secret also carries `secret.secrets[*].data` unencrypted,
+        // so the Destination can fall back to its stored secret without
         // contacting any helper. The recovery model is "any one of:
-        // helper quorum, vault on a single destination" — both paths
+        // helper quorum, secret on a single destination" — both paths
         // recover the same secret bytes.
-        if (!received2.Vault.Secrets[0].Data.SequenceEqual(secretDataV2))
+        if (!received2.Secret.Secrets[0].Data.SequenceEqual(secretDataV2))
             throw new InvalidOperationException(
-                "vault.secrets[0].data must be the raw recovered bytes");
+                "secret.secrets[0].data must be the raw recovered bytes");
         Console.WriteLine(
-            "  vault.secrets[0].data is the raw recovered secret — destination-only recovery is viable  ✓");
+            "  secret.secrets[0].data is the raw recovered secret — destination-only recovery is viable  ✓");
 
-        Console.WriteLine("Orchestrator replica pair + vault sync test passed.");
+        Console.WriteLine("Orchestrator replica pair + secret sync test passed.");
     }
 
     /// <summary>
@@ -895,7 +895,7 @@ internal static class Protocol
     /// <summary>
     /// Walks the canonical 0→8 sequence that proves the multi-device
     /// sync invariant: every roster change or user-secret update bumps
-    /// the vault version, every paired Replica Destination receives
+    /// the secret version, every paired Replica Destination receives
     /// the fresh snapshot, and Helpers only receive VSS shares once
     /// the threshold is met.
     /// </summary>
@@ -903,7 +903,7 @@ internal static class Protocol
     {
         Console.WriteLine("=== Orchestrator replica sync — version progression v0→v8 ===");
 
-        const ulong VaultSecretId = 0xABBA;
+        const ulong TestSecretId = 0xABBA;
         const int Threshold = 3;
         const string OwnerUri = "https://owner.example.com";
         const string ReplicaAUri = "https://replica-a.example.com";
@@ -913,11 +913,11 @@ internal static class Protocol
         const string Helper2Uri = "https://helper-2.example.com";
         const string Helper3Uri = "https://helper-3.example.com";
 
-        var ownerOpts = new NodeOptions { SecretId = VaultSecretId, Threshold = Threshold, ReplicaId = 0x0001UL };
-        var rAOpts = new NodeOptions { SecretId = VaultSecretId, Threshold = Threshold, ReplicaId = 0x000AUL };
-        var rBOpts = new NodeOptions { SecretId = VaultSecretId, Threshold = Threshold, ReplicaId = 0x000BUL };
-        var rCOpts = new NodeOptions { SecretId = VaultSecretId, Threshold = Threshold, ReplicaId = 0x000CUL };
-        var helperOpts = new NodeOptions { SecretId = VaultSecretId, Threshold = Threshold };
+        var ownerOpts = new NodeOptions { SecretId = TestSecretId, Threshold = Threshold, ReplicaId = 0x0001UL };
+        var rAOpts = new NodeOptions { SecretId = TestSecretId, Threshold = Threshold, ReplicaId = 0x000AUL };
+        var rBOpts = new NodeOptions { SecretId = TestSecretId, Threshold = Threshold, ReplicaId = 0x000BUL };
+        var rCOpts = new NodeOptions { SecretId = TestSecretId, Threshold = Threshold, ReplicaId = 0x000CUL };
+        var helperOpts = new NodeOptions { SecretId = TestSecretId, Threshold = Threshold };
 
         using var owner = MakeNode("Owner", OwnerUri, ownerOpts);
         using var replicaA = MakeNode("ReplicaA", ReplicaAUri, rAOpts);
@@ -947,7 +947,7 @@ internal static class Protocol
         const ulong cidH3 = 13UL;
 
         // Step 0 — brand-new instance.
-        if (owner.UserSecretStore.LoadLatest(VaultSecretId) is not null)
+        if (owner.UserSecretStore.LoadLatest(TestSecretId) is not null)
             throw new InvalidOperationException("step 0: brand-new owner must have no snapshot");
         Console.WriteLine("  step 0: user_secret_store latest = null  ✓");
 
@@ -956,14 +956,14 @@ internal static class Protocol
         CrossConfirmFingerprint(owner, replicaA, cidA);
         var events = PumpAll(replicaScope);
         var recvA = FindReplicaEvent(events, cidA)
-            ?? throw new InvalidOperationException("step 1: A must observe ReplicaVaultReceived");
+            ?? throw new InvalidOperationException("step 1: A must observe ReplicaSecretReceived");
         if (recvA.Version != 1) throw new InvalidOperationException($"step 1: expected v=1, got {recvA.Version}");
-        if (recvA.Vault.Helpers.Count != 0) throw new InvalidOperationException("step 1: helpers must be empty");
-        if (recvA.Vault.Secrets.Count != 0) throw new InvalidOperationException("step 1: secrets must be empty");
-        if (recvA.Vault.Replicas.Count != 1) throw new InvalidOperationException("step 1: replicas must be 1");
+        if (recvA.Secret.Helpers.Count != 0) throw new InvalidOperationException("step 1: helpers must be empty");
+        if (recvA.Secret.Secrets.Count != 0) throw new InvalidOperationException("step 1: secrets must be empty");
+        if (recvA.Secret.Replicas.Count != 1) throw new InvalidOperationException("step 1: replicas must be 1");
         if (recvA.Shares.Count != 0) throw new InvalidOperationException("step 1: shares must be empty");
-        AssertLatestVersion(owner, VaultSecretId, 1);
-        Console.WriteLine("  step 1: pair replica A → v=1, vault(h=0,s=0,r=1,shares=0)  ✓");
+        AssertLatestVersion(owner, TestSecretId, 1);
+        Console.WriteLine("  step 1: pair replica A → v=1, secret(h=0,s=0,r=1,shares=0)  ✓");
 
         // Step 2 — ProtectSecret([s1]) → v=2.
         var s1Data = Encoding.UTF8.GetBytes("first-user-secret");
@@ -976,12 +976,12 @@ internal static class Protocol
         recvA = FindReplicaEvent(events, cidA)
             ?? throw new InvalidOperationException("step 2: A must observe v=2");
         if (recvA.Version != 2) throw new InvalidOperationException($"step 2: expected v=2, got {recvA.Version}");
-        if (recvA.Vault.Secrets.Count != 1 || !recvA.Vault.Secrets[0].Data.SequenceEqual(s1Data))
-            throw new InvalidOperationException("step 2: vault.secrets[0].data must equal s1");
-        if (recvA.Vault.Replicas.Count != 1) throw new InvalidOperationException("step 2: replicas must be 1");
+        if (recvA.Secret.Secrets.Count != 1 || !recvA.Secret.Secrets[0].Data.SequenceEqual(s1Data))
+            throw new InvalidOperationException("step 2: secret.secrets[0].data must equal s1");
+        if (recvA.Secret.Replicas.Count != 1) throw new InvalidOperationException("step 2: replicas must be 1");
         if (recvA.Shares.Count != 0) throw new InvalidOperationException("step 2: shares must be empty");
-        AssertLatestVersion(owner, VaultSecretId, 2);
-        Console.WriteLine("  step 2: ProtectSecret([s1]) → v=2, vault(h=0,s=1,r=1,shares=0)  ✓");
+        AssertLatestVersion(owner, TestSecretId, 2);
+        Console.WriteLine("  step 2: ProtectSecret([s1]) → v=2, secret(h=0,s=1,r=1,shares=0)  ✓");
 
         // Step 3 — pair replica B → v=3 (B bootstraps with s1).
         PairReplicaHandshake(owner, replicaB, cidB);
@@ -993,14 +993,14 @@ internal static class Protocol
         if (recvB3 is null || recvB3.Version != 3) throw new InvalidOperationException("step 3: B must observe v=3");
         foreach (var (label, recv) in new[] { ("A", recvA3), ("B", recvB3) })
         {
-            if (recv.Vault.Helpers.Count != 0) throw new InvalidOperationException($"step 3 {label}: helpers must be empty");
-            if (recv.Vault.Secrets.Count != 1 || !recv.Vault.Secrets[0].Data.SequenceEqual(s1Data))
-                throw new InvalidOperationException($"step 3 {label}: vault must carry s1");
-            if (recv.Vault.Replicas.Count != 2) throw new InvalidOperationException($"step 3 {label}: replicas must be 2");
+            if (recv.Secret.Helpers.Count != 0) throw new InvalidOperationException($"step 3 {label}: helpers must be empty");
+            if (recv.Secret.Secrets.Count != 1 || !recv.Secret.Secrets[0].Data.SequenceEqual(s1Data))
+                throw new InvalidOperationException($"step 3 {label}: secret must carry s1");
+            if (recv.Secret.Replicas.Count != 2) throw new InvalidOperationException($"step 3 {label}: replicas must be 2");
             if (recv.Shares.Count != 0) throw new InvalidOperationException($"step 3 {label}: shares must be empty");
         }
-        AssertLatestVersion(owner, VaultSecretId, 3);
-        Console.WriteLine("  step 3: pair replica B → v=3, vault(h=0,s=1,r=2,shares=0) on A+B  ✓");
+        AssertLatestVersion(owner, TestSecretId, 3);
+        Console.WriteLine("  step 3: pair replica B → v=3, secret(h=0,s=1,r=2,shares=0) on A+B  ✓");
 
         // Step 4 — pair helper #1 → v=4 (below threshold).
         HelperStartPair(owner, helper1, cidH1);
@@ -1012,13 +1012,13 @@ internal static class Protocol
             var r = FindReplicaEvent(events, cid)
                 ?? throw new InvalidOperationException($"step 4 {label}: must observe v=4");
             if (r.Version != 4) throw new InvalidOperationException($"step 4 {label}: expected v=4");
-            if (r.Vault.Helpers.Count != 1) throw new InvalidOperationException($"step 4 {label}: helpers must be 1");
-            if (r.Vault.Secrets.Count != 1) throw new InvalidOperationException($"step 4 {label}: secrets must be 1");
-            if (r.Vault.Replicas.Count != 2) throw new InvalidOperationException($"step 4 {label}: replicas must be 2");
+            if (r.Secret.Helpers.Count != 1) throw new InvalidOperationException($"step 4 {label}: helpers must be 1");
+            if (r.Secret.Secrets.Count != 1) throw new InvalidOperationException($"step 4 {label}: secrets must be 1");
+            if (r.Secret.Replicas.Count != 2) throw new InvalidOperationException($"step 4 {label}: replicas must be 2");
             if (r.Shares.Count != 0) throw new InvalidOperationException($"step 4 {label}: shares must be empty");
         }
-        AssertLatestVersion(owner, VaultSecretId, 4);
-        Console.WriteLine("  step 4: pair helper #1 → v=4, vault(h=1,s=1,r=2,shares=0)  ✓");
+        AssertLatestVersion(owner, TestSecretId, 4);
+        Console.WriteLine("  step 4: pair helper #1 → v=4, secret(h=1,s=1,r=2,shares=0)  ✓");
 
         // Step 5 — pair helper #2 → v=5.
         HelperStartPair(owner, helper2, cidH2);
@@ -1028,11 +1028,11 @@ internal static class Protocol
         var r5B = FindReplicaEvent(events, cidB)
             ?? throw new InvalidOperationException("step 5: B must observe v=5");
         if (r5B.Version != 5) throw new InvalidOperationException("step 5: B expected v=5");
-        if (r5B.Vault.Helpers.Count != 2) throw new InvalidOperationException("step 5: helpers must be 2");
+        if (r5B.Secret.Helpers.Count != 2) throw new InvalidOperationException("step 5: helpers must be 2");
         if (r5B.Shares.Count != 0) throw new InvalidOperationException("step 5: shares must be empty");
         if (FindReplicaEvent(events, cidA) is null) throw new InvalidOperationException("step 5: A must observe v=5");
-        AssertLatestVersion(owner, VaultSecretId, 5);
-        Console.WriteLine("  step 5: pair helper #2 → v=5, vault(h=2,s=1,r=2,shares=0)  ✓");
+        AssertLatestVersion(owner, TestSecretId, 5);
+        Console.WriteLine("  step 5: pair helper #2 → v=5, secret(h=2,s=1,r=2,shares=0)  ✓");
 
         // Step 6 — ProtectSecret([s1, s2]) → v=6.
         var s2Data = Encoding.UTF8.GetBytes("second-user-secret");
@@ -1051,16 +1051,16 @@ internal static class Protocol
         recvA = FindReplicaEvent(events, cidA)
             ?? throw new InvalidOperationException("step 6: A must observe v=6");
         if (recvA.Version != 6) throw new InvalidOperationException("step 6: A expected v=6");
-        if (recvA.Vault.Secrets.Count != 2) throw new InvalidOperationException("step 6: secrets must be 2");
-        if (!recvA.Vault.Secrets.Any(u => u.Data.SequenceEqual(s1Data)))
-            throw new InvalidOperationException("step 6: vault must carry s1");
-        if (!recvA.Vault.Secrets.Any(u => u.Data.SequenceEqual(s2Data)))
-            throw new InvalidOperationException("step 6: vault must carry s2");
-        if (recvA.Vault.Helpers.Count != 2) throw new InvalidOperationException("step 6: helpers must be 2");
+        if (recvA.Secret.Secrets.Count != 2) throw new InvalidOperationException("step 6: secrets must be 2");
+        if (!recvA.Secret.Secrets.Any(u => u.Data.SequenceEqual(s1Data)))
+            throw new InvalidOperationException("step 6: secret must carry s1");
+        if (!recvA.Secret.Secrets.Any(u => u.Data.SequenceEqual(s2Data)))
+            throw new InvalidOperationException("step 6: secret must carry s2");
+        if (recvA.Secret.Helpers.Count != 2) throw new InvalidOperationException("step 6: helpers must be 2");
         if (recvA.Shares.Count != 0) throw new InvalidOperationException("step 6: shares must be empty");
         if (FindReplicaEvent(events, cidB) is null) throw new InvalidOperationException("step 6: B must observe v=6");
-        AssertLatestVersion(owner, VaultSecretId, 6);
-        Console.WriteLine("  step 6: ProtectSecret([s1, s2]) → v=6, vault(h=2,s=2,r=2,shares=0)  ✓");
+        AssertLatestVersion(owner, TestSecretId, 6);
+        Console.WriteLine("  step 6: ProtectSecret([s1, s2]) → v=6, secret(h=2,s=2,r=2,shares=0)  ✓");
 
         // Step 7 — pair helper #3 → v=7, threshold met, VSS split runs.
         HelperStartPair(owner, helper3, cidH3);
@@ -1076,13 +1076,13 @@ internal static class Protocol
             var r = FindReplicaEvent(events, cid)
                 ?? throw new InvalidOperationException($"step 7 {label}: must observe v=7");
             if (r.Version != 7) throw new InvalidOperationException($"step 7 {label}: expected v=7");
-            if (r.Vault.Helpers.Count != 3) throw new InvalidOperationException($"step 7 {label}: helpers must be 3");
-            if (r.Vault.Secrets.Count != 2) throw new InvalidOperationException($"step 7 {label}: secrets must be 2");
-            if (r.Vault.Replicas.Count != 2) throw new InvalidOperationException($"step 7 {label}: replicas must be 2");
+            if (r.Secret.Helpers.Count != 3) throw new InvalidOperationException($"step 7 {label}: helpers must be 3");
+            if (r.Secret.Secrets.Count != 2) throw new InvalidOperationException($"step 7 {label}: secrets must be 2");
+            if (r.Secret.Replicas.Count != 2) throw new InvalidOperationException($"step 7 {label}: replicas must be 2");
             if (r.Shares.Count != 3) throw new InvalidOperationException($"step 7 {label}: shares must be 3");
         }
-        AssertLatestVersion(owner, VaultSecretId, 7);
-        Console.WriteLine("  step 7: pair helper #3 → v=7, vault(h=3,s=2,r=2,shares=3); all 3 helpers ShareStored  ✓");
+        AssertLatestVersion(owner, TestSecretId, 7);
+        Console.WriteLine("  step 7: pair helper #3 → v=7, secret(h=3,s=2,r=2,shares=3); all 3 helpers ShareStored  ✓");
 
         // Step 8 — pair replica C → v=8, full bootstrap + fresh VSS.
         PairReplicaHandshake(owner, replicaC, cidC);
@@ -1097,19 +1097,19 @@ internal static class Protocol
         var recvC = FindReplicaEvent(events, cidC)
             ?? throw new InvalidOperationException("step 8: C must observe v=8");
         if (recvC.Version != 8) throw new InvalidOperationException("step 8: C expected v=8");
-        if (recvC.Vault.Helpers.Count != 3) throw new InvalidOperationException("step 8 C: helpers must be 3");
-        if (recvC.Vault.Secrets.Count != 2) throw new InvalidOperationException("step 8 C: secrets must be 2");
-        if (recvC.Vault.Replicas.Count != 3) throw new InvalidOperationException("step 8 C: replicas must be 3");
+        if (recvC.Secret.Helpers.Count != 3) throw new InvalidOperationException("step 8 C: helpers must be 3");
+        if (recvC.Secret.Secrets.Count != 2) throw new InvalidOperationException("step 8 C: secrets must be 2");
+        if (recvC.Secret.Replicas.Count != 3) throw new InvalidOperationException("step 8 C: replicas must be 3");
         if (recvC.Shares.Count != 3) throw new InvalidOperationException("step 8 C: shares must be 3");
         foreach (var (label, cid) in new (string, ulong)[] { ("A", cidA), ("B", cidB) })
         {
             var r = FindReplicaEvent(events, cid)
                 ?? throw new InvalidOperationException($"step 8 {label}: must observe v=8");
             if (r.Version != 8) throw new InvalidOperationException($"step 8 {label}: expected v=8");
-            if (r.Vault.Replicas.Count != 3) throw new InvalidOperationException($"step 8 {label}: replicas must be 3");
+            if (r.Secret.Replicas.Count != 3) throw new InvalidOperationException($"step 8 {label}: replicas must be 3");
         }
-        AssertLatestVersion(owner, VaultSecretId, 8);
-        Console.WriteLine("  step 8: pair replica C → v=8, vault(h=3,s=2,r=3,shares=3) on A+B+C; all helpers refreshed  ✓");
+        AssertLatestVersion(owner, TestSecretId, 8);
+        Console.WriteLine("  step 8: pair replica C → v=8, secret(h=3,s=2,r=3,shares=3) on A+B+C; all helpers refreshed  ✓");
 
         Console.WriteLine("Orchestrator replica sync version progression test passed.");
     }
@@ -1195,17 +1195,17 @@ internal static class Protocol
         }
     }
 
-    private sealed record ReceivedVault(
+    private sealed record ReceivedSecret(
         uint Version,
-        SecretContainer Vault,
+        Secret Secret,
         IReadOnlyList<ChannelShare> Shares);
 
-    private static ReceivedVault? FindReplicaEvent(IEnumerable<DeRecEvent> events, ulong channelId)
+    private static ReceivedSecret? FindReplicaEvent(IEnumerable<DeRecEvent> events, ulong channelId)
     {
         foreach (var ev in events)
         {
-            if (ev is ReplicaVaultReceivedEvent r && ulong.Parse(r.ChannelId) == channelId)
-                return new ReceivedVault(r.Version, r.Vault, r.Shares);
+            if (ev is ReplicaSecretReceivedEvent r && ulong.Parse(r.ChannelId) == channelId)
+                return new ReceivedSecret(r.Version, r.Secret, r.Shares);
         }
         return null;
     }
@@ -1309,7 +1309,7 @@ internal static class Protocol
     private const int DefaultThreshold = 2;
 
     /// <summary>
-    /// Default vault identifier wired into every <see cref="MakeNode"/>
+    /// Default secret identifier wired into every <see cref="MakeNode"/>
     /// caller that doesn't pin one explicitly via
     /// <see cref="NodeOptions.SecretId"/>.
     /// </summary>

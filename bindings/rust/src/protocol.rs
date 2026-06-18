@@ -27,8 +27,8 @@ use derec_library::protocol::types::{Channel, Target, UserSecret, UserSecrets};
 use derec_library::types::ChannelId;
 use derec_proto::{Protocol, SenderKind, TransportProtocol};
 
-/// Default vault identifier wired into every `Peer` constructor that
-/// doesn't request a specific one. Tests that exercise multiple vaults
+/// Default secret identifier wired into every `Peer` constructor that
+/// doesn't request a specific one. Tests that exercise multiple secrets
 /// override it explicitly via [`Peer::with_options`].
 const DEFAULT_TEST_SECRET_ID: u64 = 0xDE_2EC;
 
@@ -1087,9 +1087,9 @@ async fn run_replica_id_wiring_flow() {
 
 /// Exercises `ProtectSecret` with a mixed target set of helpers and
 /// replicas. Asserts that each replica target receives one
-/// `StoreShareRequest` carrying the **full vault payload** (tagged with
-/// `share_algorithm = SHARE_ALGORITHM_REPLICA_VAULT = 1`), distinct from
-/// the per-helper VSS share fragments.
+/// `StoreShareRequest` carrying the **full `Secret` payload** (tagged
+/// with `share_algorithm = SHARE_ALGORITHM_REPLICA_SECRET = 1`),
+/// distinct from the per-helper VSS share fragments.
 async fn run_protect_secret_with_replica_targets_flow() {
     println!("=== Protocol ProtectSecret(replica targets) flow ===");
 
@@ -1101,7 +1101,7 @@ async fn run_protect_secret_with_replica_targets_flow() {
 
     // VSS requires threshold >= 2 and threshold <= helper count, so this
     // scenario uses 2 helpers + 1 replica. The replica doesn't
-    // participate in the split (it gets the full vault).
+    // participate in the split (it gets the full secret).
     let mut owner = Peer::with_secret_id_and_replica_id(
         "owner",
         "https://owner.example.com",
@@ -1117,7 +1117,7 @@ async fn run_protect_secret_with_replica_targets_flow() {
     pair(&mut owner, &mut helper_a, helper_a_channel).await;
     pair(&mut owner, &mut helper_b, helper_b_channel).await;
 
-    // 2. Owner pairs with another device in Replica mode (vault sync target).
+    // 2. Owner pairs with another device in Replica mode (secret sync target).
     let replica_contact = owner
         .protocol
         .create_contact(Some(replica_channel), derec_proto::ContactMode::InlineKeys)
@@ -1194,13 +1194,13 @@ async fn run_protect_secret_with_replica_targets_flow() {
     );
 
     // 3. Owner protects a secret targeting BOTH helpers and the replica.
-    let secret_data = b"vault-payload-for-replica-and-helper".to_vec();
+    let secret_data = b"secret-payload-for-replica-and-helper".to_vec();
     owner
         .protocol
         .start(DeRecFlow::ProtectSecret {
             secrets: vec![UserSecret {
                 id: vec![0x01],
-                name: "shared-vault".to_owned(),
+                name: "shared-secret".to_owned(),
                 data: secret_data.clone(),
             }],
             description: Some("replica + helper distribution".to_owned()),
@@ -1230,7 +1230,7 @@ async fn run_protect_secret_with_replica_targets_flow() {
     // 5. Decrypt the inner StoreShareRequest on each side using its
     //    shared key, and assert payload shape:
     //    helper → share_algorithm == 0 (VSS share fragment)
-    //    replica → share_algorithm == 1 (full vault, contains secret_data)
+    //    replica → share_algorithm == 1 (full secret, contains secret_data)
     let helper_a_sid = helper_a.protocol.secret_id();
     let replica_sid = replica.protocol.secret_id();
     let helper_a_key = match helper_a
@@ -1266,15 +1266,15 @@ async fn run_protect_secret_with_replica_targets_flow() {
     let replica_msg = decode_store_share_request(&replica_env.1, &replica_key);
     assert_eq!(
         replica_msg.share_algorithm, 1,
-        "replica envelope must carry full vault (algorithm 1 = REPLICA_VAULT), got {}",
+        "replica envelope must carry full secret (algorithm 1 = REPLICA_SECRET), got {}",
         replica_msg.share_algorithm
     );
 
-    // 6. The replica's share bytes are the canonical DeRecSecret bag — it
-    //    must contain the original secret payload, byte-for-byte.
+    // 6. The replica's share bytes are the canonical DeRecSecret payload —
+    //    it must contain the original secret data, byte-for-byte.
     assert!(
         contains_subslice(&replica_msg.share, &secret_data),
-        "replica envelope must contain the original secret payload (full vault)"
+        "replica envelope must contain the original secret payload (full secret)"
     );
 
     // 7. Helper share is a VSS fragment whose payload bytes do NOT contain
@@ -1295,15 +1295,15 @@ async fn run_protect_secret_with_replica_targets_flow() {
         helper_msg.share.len()
     );
     println!(
-        "  replica envelope: share_algorithm=1 (full vault), {}B, contains secret  ✓",
+        "  replica envelope: share_algorithm=1 (full secret), {}B, contains secret  ✓",
         replica_msg.share.len()
     );
 
 
     // 9. End-to-end receiver side: feed the replica envelope into the
     //    replica peer's process(). It should auto-ack and emit a
-    //    ReplicaVaultReceived event. Owner then processes the ack and
-    //    emits ReplicaVaultAcked.
+    //    ReplicaSecretReceived event. Owner then processes the ack and
+    //    emits ReplicaSecretAcked.
     println!("  -- receiver-side replica dispatch --");
 
     let replica_events = replica
@@ -1314,31 +1314,31 @@ async fn run_protect_secret_with_replica_targets_flow() {
     let received = replica_events
         .iter()
         .find_map(|e| match e {
-            DeRecEvent::ReplicaVaultReceived {
+            DeRecEvent::ReplicaSecretReceived {
                 channel_id: c,
                 from_replica_id,
                 secret_id,
                 version: _,
-                vault,
+                secret,
                 shares,
             } if *c == replica_channel => Some((
                 *from_replica_id,
                 *secret_id,
-                vault.clone(),
+                secret.clone(),
                 shares.clone(),
             )),
             _ => None,
         })
-        .expect("replica.process should emit ReplicaVaultReceived");
-    let (received_from, received_secret_id, vault, shares) = received;
+        .expect("replica.process should emit ReplicaSecretReceived");
+    let (received_from, received_secret_id, received_secret, shares) = received;
     assert_eq!(received_from, owner_id, "from_replica_id must be owner's id");
     assert_eq!(received_secret_id, 0xC0FFEE, "secret_id mismatch");
-    // Typed event: the SecretContainer carries the user-secret bytes
+    // Typed event: the Secret carries the user-secret bytes
     // verbatim (one entry, since the test wrote one UserSecret).
-    assert_eq!(vault.secrets.len(), 1, "vault must carry one user secret");
+    assert_eq!(received_secret.secrets.len(), 1, "secret must carry one user secret");
     assert_eq!(
-        vault.secrets[0].data, secret_data,
-        "vault.secrets[0].data must round-trip the original secret"
+        received_secret.secrets[0].data, secret_data,
+        "secret.secrets[0].data must round-trip the original user secret"
     );
     // Owner had 2 helpers in this test, so the share map (composite's
     // `shares` field) must contain one entry per helper, keyed by the
@@ -1365,30 +1365,30 @@ async fn run_protect_secret_with_replica_targets_flow() {
     }
 
     // owner_replica_id round-trips the Source's id verbatim — this is
-    // what lets a Destination attribute the vault back to its origin
+    // what lets a Destination attribute the secret back to its origin
     // during conflict resolution.
     assert_eq!(
-        vault.owner_replica_id, owner_id,
-        "vault.owner_replica_id must echo the Source's replica_id"
+        received_secret.owner_replica_id, owner_id,
+        "secret.owner_replica_id must echo the Source's replica_id"
     );
 
-    // vault.helpers: snapshot of the Source's paired helpers at protect
+    // secret.helpers: snapshot of the Source's paired helpers at protect
     // time. Exactly two entries here (helper-a + helper-b), each with a
     // non-empty shared_key and the transport_uri the owner saw at pair.
     assert_eq!(
-        vault.helpers.len(),
+        received_secret.helpers.len(),
         2,
-        "vault.helpers must contain one entry per paired helper (got {})",
-        vault.helpers.len()
+        "secret.helpers must contain one entry per paired helper (got {})",
+        received_secret.helpers.len()
     );
     let helper_channel_ids: std::collections::BTreeSet<u64> =
-        vault.helpers.iter().map(|h| h.channel_id).collect();
+        received_secret.helpers.iter().map(|h| h.channel_id).collect();
     assert_eq!(
         helper_channel_ids,
         std::collections::BTreeSet::from([helper_a_channel.0, helper_b_channel.0]),
-        "vault.helpers must carry both helper channel ids"
+        "secret.helpers must carry both helper channel ids"
     );
-    for h in &vault.helpers {
+    for h in &received_secret.helpers {
         assert_eq!(
             h.shared_key.len(),
             32,
@@ -1396,17 +1396,17 @@ async fn run_protect_secret_with_replica_targets_flow() {
         );
     }
 
-    // vault.replicas: snapshot of the Source's paired Destinations.
+    // secret.replicas: snapshot of the Source's paired Destinations.
     // ReplicaDestination is the only kind that ends up here in this
     // scenario — replica_id, sender_kind, channel_id, transport_uri,
     // and shared_key must all match what the Source negotiated.
     assert_eq!(
-        vault.replicas.len(),
+        received_secret.replicas.len(),
         1,
-        "vault.replicas must contain the single Destination (got {})",
-        vault.replicas.len()
+        "secret.replicas must contain the single Destination (got {})",
+        received_secret.replicas.len()
     );
-    let destination = &vault.replicas[0];
+    let destination = &received_secret.replicas[0];
     assert_eq!(
         destination.replica_id, replica_id,
         "ReplicaInfo.replica_id must echo the Destination's replica_id"
@@ -1432,12 +1432,12 @@ async fn run_protect_secret_with_replica_targets_flow() {
     );
 
     println!(
-        "  replica received: from={:x}, secret_id={:x}, vault: {} secret(s) / {} helper(s) / {} replica(s), {} helper share(s)  ✓",
+        "  replica received: from={:x}, secret_id={:x}, secret: {} entry(s) / {} helper(s) / {} replica(s), {} helper share(s)  ✓",
         received_from,
         received_secret_id,
-        vault.secrets.len(),
-        vault.helpers.len(),
-        vault.replicas.len(),
+        received_secret.secrets.len(),
+        received_secret.helpers.len(),
+        received_secret.replicas.len(),
         shares.len()
     );
 
@@ -1458,7 +1458,7 @@ async fn run_protect_secret_with_replica_targets_flow() {
     let acked = owner_events
         .iter()
         .find_map(|e| match e {
-            DeRecEvent::ReplicaVaultAcked {
+            DeRecEvent::ReplicaSecretAcked {
                 channel_id: c,
                 from_replica_id,
                 status,
@@ -1467,10 +1467,10 @@ async fn run_protect_secret_with_replica_targets_flow() {
             } if *c == replica_channel => Some((*from_replica_id, *status, memo.clone())),
             _ => None,
         })
-        .expect("owner.process should emit ReplicaVaultAcked");
+        .expect("owner.process should emit ReplicaSecretAcked");
     assert_eq!(
         acked.0, replica_id,
-        "ReplicaVaultAcked.from_replica_id must be replica's id"
+        "ReplicaSecretAcked.from_replica_id must be replica's id"
     );
     assert_eq!(acked.1, 0, "expected StatusEnum::Ok (0), got status={}", acked.1);
     println!(
@@ -1567,21 +1567,21 @@ async fn run_discovery_and_recovery_flow() {
     let recovery_channel_a = ChannelId(100);
     let recovery_channel_b = ChannelId(101);
     let secret_id_bytes = vec![9_u8, 9, 9];
-    let vault_secret_id: u64 = 7777;
+    let protected_secret_id: u64 = 7777;
     let secret_data = b"correct horse battery staple".to_vec();
 
     // VSS sharing requires threshold ≥ 2, so the discovery+recovery scenario
     // pairs the Owner with two helpers and reconstructs from both shares.
     let mut owner =
-        Peer::with_secret_id("owner", "https://owner.example.com", vault_secret_id);
-    // Helpers serving this owner are bound to the same vault id — every
+        Peer::with_secret_id("owner", "https://owner.example.com", protected_secret_id);
+    // Helpers serving this owner are bound to the same secret id — every
     // store on the helper side partitions by that id, which is the only
     // model that's coherent under the new trait surface (one protocol =
-    // one helped-with vault).
+    // one helped-with secret).
     let mut helper_a =
-        Peer::with_secret_id("helper-a", "https://helper-a.example.com", vault_secret_id);
+        Peer::with_secret_id("helper-a", "https://helper-a.example.com", protected_secret_id);
     let mut helper_b =
-        Peer::with_secret_id("helper-b", "https://helper-b.example.com", vault_secret_id);
+        Peer::with_secret_id("helper-b", "https://helper-b.example.com", protected_secret_id);
 
 
     pair(&mut owner, &mut helper_a, channel_a).await;
@@ -1737,7 +1737,7 @@ async fn run_discovery_and_recovery_flow() {
     let entry = discovered
         .iter()
         .flat_map(|(_, secrets)| secrets.iter())
-        .find(|e| e.secret_id == vault_secret_id)
+        .find(|e| e.secret_id == protected_secret_id)
         .expect("discovered list must contain the distributed secret");
     assert!(
         entry
@@ -1753,7 +1753,7 @@ async fn run_discovery_and_recovery_flow() {
         .max()
         .expect("discovered secret must have at least one version");
     println!(
-        "Owner discovered secret_id={vault_secret_id} v{recover_version} across {} helper(s); recovering.",
+        "Owner discovered secret_id={protected_secret_id} v{recover_version} across {} helper(s); recovering.",
         discovered.len()
     );
 
@@ -1761,7 +1761,7 @@ async fn run_discovery_and_recovery_flow() {
     owner
         .protocol
         .start(DeRecFlow::RecoverSecret {
-            secret_id: vault_secret_id,
+            secret_id: protected_secret_id,
             version: recover_version,
         })
         .await
@@ -2114,7 +2114,7 @@ async fn run_reply_to_flow() {
 }
 
 /// Exercises the auto-publish-on-pair hook: once the application has
-/// handed off a vault bag via `start(ProtectSecret)`, any subsequent
+/// handed off a secret via `start(ProtectSecret)`, any subsequent
 /// helper-pair (or replica-pair after fingerprint verification) makes
 /// the freshly-paired peer eligible for shares without an explicit
 /// follow-up call. The test pairs two helpers, calls `ProtectSecret`
@@ -2142,8 +2142,8 @@ async fn run_auto_publish_on_pair_flow() {
         .start(DeRecFlow::ProtectSecret {
             secrets: vec![UserSecret {
                 id: vec![0x42],
-                name: "vault".to_owned(),
-                data: b"initial-bag".to_vec(),
+                name: "secret".to_owned(),
+                data: b"initial-payload".to_vec(),
             }],
             description: Some("initial publish".to_owned()),
         })
@@ -2197,7 +2197,7 @@ async fn run_auto_publish_on_pair_flow() {
 
 /// Walks the 0→8 version progression that proves the multi-device
 /// sync invariant: every roster change or user-secret update bumps
-/// the vault version, every paired Replica Destination receives the
+/// the secret version, every paired Replica Destination receives the
 /// fresh snapshot, and Helpers only receive VSS shares once the
 /// threshold is met.
 ///
@@ -2216,7 +2216,7 @@ async fn run_auto_publish_on_pair_flow() {
 async fn run_replica_sync_version_progression_flow() {
     println!("=== Protocol replica sync — version progression v0→v8 ===");
 
-    const VAULT_SECRET_ID: u64 = 0xABBA;
+    const PROTECTED_SECRET_ID: u64 = 0xABBA;
     const THRESHOLD: usize = 3;
     let owner_replica_id: u64 = 0x0001;
     let replica_a_id: u64 = 0x000A;
@@ -2229,7 +2229,7 @@ async fn run_replica_sync_version_progression_flow() {
         THRESHOLD,
         false,
         Some(owner_replica_id),
-        VAULT_SECRET_ID,
+        PROTECTED_SECRET_ID,
     );
     let mut replica_a = Peer::with_options(
         "replica-a",
@@ -2237,7 +2237,7 @@ async fn run_replica_sync_version_progression_flow() {
         THRESHOLD,
         false,
         Some(replica_a_id),
-        VAULT_SECRET_ID,
+        PROTECTED_SECRET_ID,
     );
     let mut replica_b = Peer::with_options(
         "replica-b",
@@ -2245,7 +2245,7 @@ async fn run_replica_sync_version_progression_flow() {
         THRESHOLD,
         false,
         Some(replica_b_id),
-        VAULT_SECRET_ID,
+        PROTECTED_SECRET_ID,
     );
     let mut replica_c = Peer::with_options(
         "replica-c",
@@ -2253,7 +2253,7 @@ async fn run_replica_sync_version_progression_flow() {
         THRESHOLD,
         false,
         Some(replica_c_id),
-        VAULT_SECRET_ID,
+        PROTECTED_SECRET_ID,
     );
     let mut helper_1 = Peer::with_options(
         "helper-1",
@@ -2261,7 +2261,7 @@ async fn run_replica_sync_version_progression_flow() {
         THRESHOLD,
         false,
         None,
-        VAULT_SECRET_ID,
+        PROTECTED_SECRET_ID,
     );
     let mut helper_2 = Peer::with_options(
         "helper-2",
@@ -2269,7 +2269,7 @@ async fn run_replica_sync_version_progression_flow() {
         THRESHOLD,
         false,
         None,
-        VAULT_SECRET_ID,
+        PROTECTED_SECRET_ID,
     );
     let mut helper_3 = Peer::with_options(
         "helper-3",
@@ -2277,7 +2277,7 @@ async fn run_replica_sync_version_progression_flow() {
         THRESHOLD,
         false,
         None,
-        VAULT_SECRET_ID,
+        PROTECTED_SECRET_ID,
     );
 
     // ── Step 0: brand-new instance ────────────────────────────────
@@ -2285,17 +2285,17 @@ async fn run_replica_sync_version_progression_flow() {
         owner
             .protocol
             .user_secret_store
-            .load_latest(VAULT_SECRET_ID)
+            .load_latest(PROTECTED_SECRET_ID)
             .await
             .unwrap()
             .is_none(),
-        "step 0: a brand-new instance has no published vault snapshot"
+        "step 0: a brand-new instance has no published secret snapshot"
     );
     println!("  step 0: user_secret_store latest = None  ✓");
 
     // ── Step 1: pair replica A → expect v=1 push to A ─────────────
     // Channel ids for each peer relationship — fixed up front so the
-    // assertions can filter `ReplicaVaultReceived` events by channel id.
+    // assertions can filter `ReplicaSecretReceived` events by channel id.
     let cid_a = ChannelId(1);
     let cid_b = ChannelId(3);
     let cid_c = ChannelId(8);
@@ -2310,23 +2310,23 @@ async fn run_replica_sync_version_progression_flow() {
     let events =
         pump_many(&mut [&mut owner, &mut replica_a, &mut replica_b, &mut replica_c]).await;
     let received = find_replica_event(&events, cid_a)
-        .expect("step 1: replica A must emit ReplicaVaultReceived");
+        .expect("step 1: replica A must emit ReplicaSecretReceived");
     assert_eq!(received.version, 1, "step 1: replica A must receive v=1");
-    assert_eq!(received.vault.helpers.len(), 0);
-    assert_eq!(received.vault.secrets.len(), 0);
-    assert_eq!(received.vault.replicas.len(), 1);
+    assert_eq!(received.secret.helpers.len(), 0);
+    assert_eq!(received.secret.secrets.len(), 0);
+    assert_eq!(received.secret.replicas.len(), 1);
     assert_eq!(received.shares.len(), 0);
     assert_eq!(
         owner
             .protocol
             .user_secret_store
-            .load_latest(VAULT_SECRET_ID)
+            .load_latest(PROTECTED_SECRET_ID)
             .await
             .unwrap()
             .map(|s| s.version),
         Some(1)
     );
-    println!("  step 1: pair replica A → v=1, vault(h=0,s=0,r=1,shares=0)  ✓");
+    println!("  step 1: pair replica A → v=1, secret(h=0,s=0,r=1,shares=0)  ✓");
 
     // ── Step 2: ProtectSecret([s1]) → expect v=2 push to A ────────
     let s1 = UserSecret {
@@ -2345,14 +2345,14 @@ async fn run_replica_sync_version_progression_flow() {
     let events =
         pump_many(&mut [&mut owner, &mut replica_a, &mut replica_b, &mut replica_c]).await;
     let received = find_replica_event(&events, cid_a)
-        .expect("step 2: replica A must emit ReplicaVaultReceived");
+        .expect("step 2: replica A must emit ReplicaSecretReceived");
     assert_eq!(received.version, 2);
-    assert_eq!(received.vault.helpers.len(), 0);
-    assert_eq!(received.vault.secrets.len(), 1);
-    assert_eq!(received.vault.secrets[0].data, s1.data);
-    assert_eq!(received.vault.replicas.len(), 1);
+    assert_eq!(received.secret.helpers.len(), 0);
+    assert_eq!(received.secret.secrets.len(), 1);
+    assert_eq!(received.secret.secrets[0].data, s1.data);
+    assert_eq!(received.secret.replicas.len(), 1);
     assert_eq!(received.shares.len(), 0);
-    println!("  step 2: ProtectSecret([s1]) → v=2, vault(h=0,s=1,r=1,shares=0)  ✓");
+    println!("  step 2: ProtectSecret([s1]) → v=2, secret(h=0,s=1,r=1,shares=0)  ✓");
 
     // ── Step 3: pair replica B → bootstrap; A also receives v=3 ───
     pair_replica_handshake(&mut owner, &mut replica_b, cid_b).await;
@@ -2365,13 +2365,13 @@ async fn run_replica_sync_version_progression_flow() {
         find_replica_event(&events, cid_b).expect("step 3: B must observe v=3 (bootstrap)");
     for (label, received) in [("A", &received_a), ("B", &received_b)] {
         assert_eq!(received.version, 3, "step 3: replica {label} receives v=3");
-        assert_eq!(received.vault.helpers.len(), 0);
-        assert_eq!(received.vault.secrets.len(), 1);
-        assert_eq!(received.vault.secrets[0].data, s1.data);
-        assert_eq!(received.vault.replicas.len(), 2);
+        assert_eq!(received.secret.helpers.len(), 0);
+        assert_eq!(received.secret.secrets.len(), 1);
+        assert_eq!(received.secret.secrets[0].data, s1.data);
+        assert_eq!(received.secret.replicas.len(), 2);
         assert_eq!(received.shares.len(), 0);
     }
-    println!("  step 3: pair replica B → v=3, vault(h=0,s=1,r=2,shares=0) on A+B  ✓");
+    println!("  step 3: pair replica B → v=3, secret(h=0,s=1,r=2,shares=0) on A+B  ✓");
 
     // ── Step 4: pair helper #1 → auto-publish v=4 (below threshold)
     helper_start_pair(&mut owner, &mut helper_1, cid_h1).await;
@@ -2397,12 +2397,12 @@ async fn run_replica_sync_version_progression_flow() {
         let received = find_replica_event(&events, cid)
             .unwrap_or_else(|| panic!("step 4: replica {label} must observe v=4"));
         assert_eq!(received.version, 4);
-        assert_eq!(received.vault.helpers.len(), 1);
-        assert_eq!(received.vault.secrets.len(), 1);
-        assert_eq!(received.vault.replicas.len(), 2);
+        assert_eq!(received.secret.helpers.len(), 1);
+        assert_eq!(received.secret.secrets.len(), 1);
+        assert_eq!(received.secret.replicas.len(), 2);
         assert_eq!(received.shares.len(), 0, "below threshold, no shares");
     }
-    println!("  step 4: pair helper #1 → v=4, vault(h=1,s=1,r=2,shares=0)  ✓");
+    println!("  step 4: pair helper #1 → v=4, secret(h=1,s=1,r=2,shares=0)  ✓");
 
     // ── Step 5: pair helper #2 → auto-publish v=5 ─────────────────
     helper_start_pair(&mut owner, &mut helper_2, cid_h2).await;
@@ -2425,10 +2425,10 @@ async fn run_replica_sync_version_progression_flow() {
     let received_b =
         find_replica_event(&events, cid_b).expect("step 5: B must observe v=5");
     assert_eq!(received_b.version, 5);
-    assert_eq!(received_b.vault.helpers.len(), 2);
+    assert_eq!(received_b.secret.helpers.len(), 2);
     assert_eq!(received_b.shares.len(), 0);
     let _ = find_replica_event(&events, cid_a).expect("step 5: A must observe v=5");
-    println!("  step 5: pair helper #2 → v=5, vault(h=2,s=1,r=2,shares=0)  ✓");
+    println!("  step 5: pair helper #2 → v=5, secret(h=2,s=1,r=2,shares=0)  ✓");
 
     // ── Step 6: ProtectSecret([s1, s2]) → v=6 ─────────────────────
     let s2 = UserSecret {
@@ -2462,13 +2462,13 @@ async fn run_replica_sync_version_progression_flow() {
     );
     let received_a = find_replica_event(&events, cid_a).expect("step 6: A must see v=6");
     assert_eq!(received_a.version, 6);
-    assert_eq!(received_a.vault.secrets.len(), 2);
-    assert!(received_a.vault.secrets.iter().any(|us| us.data == s1.data));
-    assert!(received_a.vault.secrets.iter().any(|us| us.data == s2.data));
-    assert_eq!(received_a.vault.helpers.len(), 2);
+    assert_eq!(received_a.secret.secrets.len(), 2);
+    assert!(received_a.secret.secrets.iter().any(|us| us.data == s1.data));
+    assert!(received_a.secret.secrets.iter().any(|us| us.data == s2.data));
+    assert_eq!(received_a.secret.helpers.len(), 2);
     assert_eq!(received_a.shares.len(), 0);
     let _ = find_replica_event(&events, cid_b).expect("step 6: B must see v=6");
-    println!("  step 6: ProtectSecret([s1, s2]) → v=6, vault(h=2,s=2,r=2,shares=0)  ✓");
+    println!("  step 6: ProtectSecret([s1, s2]) → v=6, secret(h=2,s=2,r=2,shares=0)  ✓");
 
     // ── Step 7: pair helper #3 → threshold met, VSS split ─────────
     helper_start_pair(&mut owner, &mut helper_3, cid_h3).await;
@@ -2495,12 +2495,12 @@ async fn run_replica_sync_version_progression_flow() {
         let received = find_replica_event(&events, cid)
             .unwrap_or_else(|| panic!("step 7: replica {label} must observe v=7"));
         assert_eq!(received.version, 7);
-        assert_eq!(received.vault.helpers.len(), 3);
-        assert_eq!(received.vault.secrets.len(), 2);
-        assert_eq!(received.vault.replicas.len(), 2);
+        assert_eq!(received.secret.helpers.len(), 3);
+        assert_eq!(received.secret.secrets.len(), 2);
+        assert_eq!(received.secret.replicas.len(), 2);
         assert_eq!(received.shares.len(), 3, "threshold met → 3 helper shares");
     }
-    println!("  step 7: pair helper #3 → v=7, vault(h=3,s=2,r=2,shares=3); all 3 helpers ShareStored  ✓");
+    println!("  step 7: pair helper #3 → v=7, secret(h=3,s=2,r=2,shares=3); all 3 helpers ShareStored  ✓");
 
     // ── Step 8: pair replica C → full bootstrap + fresh helper VSS ─
     pair_replica_handshake(&mut owner, &mut replica_c, cid_c).await;
@@ -2527,18 +2527,18 @@ async fn run_replica_sync_version_progression_flow() {
     let received_c =
         find_replica_event(&events, cid_c).expect("step 8: replica C must observe v=8");
     assert_eq!(received_c.version, 8);
-    assert_eq!(received_c.vault.helpers.len(), 3);
-    assert_eq!(received_c.vault.secrets.len(), 2);
-    assert_eq!(received_c.vault.replicas.len(), 3);
+    assert_eq!(received_c.secret.helpers.len(), 3);
+    assert_eq!(received_c.secret.secrets.len(), 2);
+    assert_eq!(received_c.secret.replicas.len(), 3);
     assert_eq!(received_c.shares.len(), 3);
     for (label, cid) in [("A", cid_a), ("B", cid_b)] {
         let received = find_replica_event(&events, cid)
             .unwrap_or_else(|| panic!("step 8: replica {label} must observe v=8"));
         assert_eq!(received.version, 8);
-        assert_eq!(received.vault.replicas.len(), 3);
+        assert_eq!(received.secret.replicas.len(), 3);
     }
     println!(
-        "  step 8: pair replica C → v=8, vault(h=3,s=2,r=3,shares=3) on A+B+C; all helpers refreshed  ✓"
+        "  step 8: pair replica C → v=8, secret(h=3,s=2,r=3,shares=3) on A+B+C; all helpers refreshed  ✓"
     );
 
     println!("Protocol replica sync version progression flow test passed.");
@@ -2607,26 +2607,26 @@ async fn helper_start_pair(owner: &mut Peer, helper: &mut Peer, channel_id: Chan
 }
 
 #[derive(Debug)]
-struct ReceivedVault {
+struct ReceivedSecret {
     version: u32,
-    vault: derec_library::protocol::types::SecretContainer,
+    secret: derec_library::protocol::types::Secret,
     shares: Vec<derec_library::protocol::types::ChannelShare>,
 }
 
-/// Look up the `ReplicaVaultReceived` event for the channel id and
+/// Look up the `ReplicaSecretReceived` event for the channel id and
 /// return a typed view of its fields. Returns `None` if no event for
 /// that channel was emitted in this pump.
-fn find_replica_event(events: &[DeRecEvent], channel_id: ChannelId) -> Option<ReceivedVault> {
+fn find_replica_event(events: &[DeRecEvent], channel_id: ChannelId) -> Option<ReceivedSecret> {
     events.iter().find_map(|e| match e {
-        DeRecEvent::ReplicaVaultReceived {
+        DeRecEvent::ReplicaSecretReceived {
             channel_id: cid,
             version,
-            vault,
+            secret,
             shares,
             ..
-        } if *cid == channel_id => Some(ReceivedVault {
+        } if *cid == channel_id => Some(ReceivedSecret {
             version: *version,
-            vault: vault.clone(),
+            secret: secret.clone(),
             shares: shares.clone(),
         }),
         _ => None,

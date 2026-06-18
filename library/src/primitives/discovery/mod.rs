@@ -11,7 +11,7 @@
 //! after re-pairing in recovery mode, the Owner has no local record of
 //! prior shares and discovers what's recoverable by asking each Helper
 //! first — but the flow is general-purpose: any time an Owner wants to
-//! confirm a Helper's vault inventory it can issue a discovery request.
+//! confirm a Helper's secret inventory it can issue a discovery request.
 //!
 //! # Submodules
 //!

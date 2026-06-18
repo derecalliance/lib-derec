@@ -340,7 +340,7 @@ await owner.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
     TargetValue = Target.Many(helperAId, helperBId).ToJsonValue(),
     Secrets = new[]
     {
-        new UserSecret { Id = new byte[] { 1 }, Name = "vault", Data = secretBytes },
+        new UserSecret { Id = new byte[] { 1 }, Name = "secret", Data = secretBytes },
     },
 });
 // Each helper emits `ShareStoredEvent`; the owner emits `ShareConfirmedEvent`
@@ -359,15 +359,15 @@ App-side responsibilities (mirrors the other SDKs):
 End-to-end coverage:
 `bindings/dotnet/Program.cs::RunOrchestratorPairFlowTest`,
 `RunOrchestratorShareAndDiscoverFlowTest`,
-`RunOrchestratorReplicaPairAndVaultSyncTest`.
+`RunOrchestratorReplicaPairAndSecretSyncTest`.
 
 ---
 
 ## Replica flows
 
-Replicas mirror an Owner's vault onto a second device so the same secrets
+Replicas mirror an Owner's secret onto a second device so the same secrets
 remain reachable after device loss. Pairings are **unidirectional** —
-one side runs as `SenderKind.ReplicaSource` (owns the vault), the other
+one side runs as `SenderKind.ReplicaSource` (owns the secret), the other
 as `SenderKind.ReplicaDestination` (receives it). Both `DeRecProtocol`
 instances must be constructed with a stable `replicaId`:
 
@@ -392,21 +392,21 @@ await destination.VerifyFingerprintAsync(channelId, localFp);      // → true
 
 The Source then includes the Destination in any `ProtectSecret` target
 alongside helpers. Helpers receive the usual VSS share via
-`StoreShareRequest`; the Destination receives the full vault as a typed
-`ReplicaVaultReceivedEvent`:
+`StoreShareRequest`; the Destination receives the full secret as a typed
+`ReplicaSecretReceivedEvent`:
 
 ```csharp
-var ev = events.OfType<ReplicaVaultReceivedEvent>().First();
-// ev.Vault.Helpers          — every paired helper (channel_id, transport_uri, shared_key, ...)
-// ev.Vault.Secrets[i].Data  — the actual UserSecret bytes
-// ev.Vault.Replicas         — every paired destination (replica_id, sender_kind, ...)
-// ev.Vault.OwnerReplicaId   — the Source's replica_id
-// ev.Shares                 — { ChannelId, CommittedShare } pairs keyed by helper channel id
+var ev = events.OfType<ReplicaSecretReceivedEvent>().First();
+// ev.Secret.Helpers          — every paired helper (channel_id, transport_uri, shared_key, ...)
+// ev.Secret.Secrets[i].Data  — the actual UserSecret bytes
+// ev.Secret.Replicas         — every paired destination (replica_id, sender_kind, ...)
+// ev.Secret.OwnerReplicaId   — the Source's replica_id
+// ev.Shares                  — { ChannelId, CommittedShare } pairs keyed by helper channel id
 ```
 
-`ev.Vault` + `ev.Shares` give the Destination everything it needs to act
+`ev.Secret` + `ev.Shares` give the Destination everything it needs to act
 in the Source's place during recovery. Smoke parity reference:
-`bindings/dotnet/Program.cs::RunOrchestratorReplicaPairAndVaultSyncTest`.
+`bindings/dotnet/Program.cs::RunOrchestratorReplicaPairAndSecretSyncTest`.
 
 ---
 
@@ -451,13 +451,13 @@ same thing across categories.
 
 ### Replica destinations inherit Source trust
 
-`ReplicaVaultReceivedEvent.Vault` carries the full `SecretContainer`,
+`ReplicaSecretReceivedEvent.Secret` carries the full `Secret`,
 which embeds every helper's `ChannelId` and `SharedKey` under
-`HelperInfo`. Anyone holding the vault can therefore authenticate as the
+`HelperInfo`. Anyone holding the secret can therefore authenticate as the
 Source toward every helper. This is intentional — it is what makes
 Destination-driven recovery work — but it means a compromised
 Destination can impersonate the Source against every helper paired at
-the time the vault was sent. Pick Destinations with at least the trust
+the time the secret was sent. Pick Destinations with at least the trust
 level of the Source device itself; do not treat them as opaque backups.
 
 ### `ContactMode.HashedKeys` requires an ephemeral transport URI

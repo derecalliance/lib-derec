@@ -154,7 +154,7 @@ pub struct UserSecret {
     pub data: ::prost::alloc::vec::Vec<u8>,
 }
 
-/// Snapshot of the user-facing vault contents persisted by
+/// Snapshot of the user-facing secret contents persisted by
 /// [`crate::protocol::DeRecUserSecretStore`] for one `secret_id`.
 ///
 /// Written every time the application calls
@@ -163,11 +163,11 @@ pub struct UserSecret {
 /// current state without an explicit re-publish from the app.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UserSecrets {
-    /// Vault version this snapshot represents. Monotonically increasing
+    /// Secret version this snapshot represents. Monotonically increasing
     /// per `secret_id` — the protocol bumps it on every publish.
     pub version: u32,
     /// User-facing secret entries. Same wire shape as
-    /// [`SecretContainer::secrets`].
+    /// [`Secret::secrets`].
     pub secrets: Vec<UserSecret>,
     /// Optional human-readable label for this version, forwarded to
     /// helpers in `StoreShareRequest.description`.
@@ -214,13 +214,15 @@ pub struct ReplicaInfo {
     pub sender_kind: i32,
 }
 
-/// The secret bag — serialized into `DeRecSecret.secret_data`.
+/// The protocol's `secret` — serialized into `DeRecSecret.secret_data`.
 ///
 /// This is the actual payload that gets protobuf-encoded, then placed into
 /// the `secret_data` bytes field of the canonical `DeRecSecret` protobuf
-/// message before encryption and distribution.
+/// message before encryption and distribution. Matches the DeRec
+/// specification's `secret` term (distinct from a `UserSecret` entry,
+/// which is one application-defined item *inside* this struct).
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SecretContainer {
+pub struct Secret {
     /// Snapshot of all paired Helpers at the time of distribution.
     #[prost(message, repeated, tag = "1")]
     pub helpers: ::prost::alloc::vec::Vec<HelperInfo>,
@@ -230,12 +232,12 @@ pub struct SecretContainer {
     /// Snapshot of all paired Replica Destinations at the time of
     /// distribution. Always populated regardless of whether the
     /// distribution had any destination targets — provides a stable
-    /// shape for the bag across all paths.
+    /// shape across all paths.
     #[prost(message, repeated, tag = "3")]
     pub replicas: ::prost::alloc::vec::Vec<ReplicaInfo>,
     /// The `replica_id` of the device that created or last updated this
-    /// version of the bag. Used by Destinations to attribute origin and
-    /// will drive future conflict-resolution logic.
+    /// version of the secret. Used by Destinations to attribute origin
+    /// and will drive future conflict-resolution logic.
     #[prost(uint64, tag = "4")]
     pub owner_replica_id: u64,
 }
@@ -255,16 +257,16 @@ pub struct ChannelShare {
 }
 
 /// The composite payload sent to each Replica Destination on a
-/// `ProtectSecret` round. Carries the full vault (`SecretContainer`)
-/// plus the map of `(channel_id → committed_share)` for the same round,
-/// so the Destination can recover via either path — read the vault
-/// directly, or contact each helper using `secret.helpers[i].shared_key`
-/// and request their stored share.
+/// `ProtectSecret` round. Carries the full [`Secret`] plus the map of
+/// `(channel_id → committed_share)` for the same round, so the
+/// Destination can recover via either path — read the secret directly,
+/// or contact each helper using `secret.helpers[i].shared_key` and
+/// request their stored share.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReplicaSecretPayload {
-    /// The full secret bag the Source is committing to this version.
+    /// The full secret the Source is committing to this version.
     #[prost(message, optional, tag = "1")]
-    pub secret: ::core::option::Option<SecretContainer>,
+    pub secret: ::core::option::Option<Secret>,
     /// One entry per helper that received a VSS share on this round.
     #[prost(message, repeated, tag = "2")]
     pub shares: ::prost::alloc::vec::Vec<ChannelShare>,

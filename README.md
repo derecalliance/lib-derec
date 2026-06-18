@@ -50,7 +50,7 @@ Or manually in your `Cargo.toml`
 
 ```toml
 [dependencies]
-derec-library = "0.0.1-alpha.7"
+derec-library = "0.0.1-alpha.8"
 ```
 
 > [!WARNING]
@@ -120,7 +120,7 @@ including Node-only dependencies.
 
 End-to-end smoke tests live under `bindings/` and exercise every primitive
 flow plus the high-level `DeRecProtocol` orchestrator (Owner↔Helper pair,
-ProtectSecret, Discovery, Recovery, replica vault sync) across every SDK:
+ProtectSecret, Discovery, Recovery, replica secret sync) across every SDK:
 
 - `bindings/rust` — Rust primitive + protocol tests. Run with `cargo run -p derec-rust-binding-smoke-test`.
 - `bindings/nodejs` — Node.js WASM tests. `cd bindings/nodejs && npm install && npx tsc && node index.js`.
@@ -129,14 +129,14 @@ ProtectSecret, Discovery, Recovery, replica vault sync) across every SDK:
 
 ## Replica feature
 
-Replicas mirror an Owner's vault onto a second device so the same secrets
+Replicas mirror an Owner's secret onto a second device so the same secrets
 remain reachable after device loss. Pairings are **unidirectional** — one
-side runs as `SenderKind::ReplicaSource` (owns the vault), the other as
+side runs as `SenderKind::ReplicaSource` (owns the secret), the other as
 `SenderKind::ReplicaDestination` (receives it). After a fingerprint
 cross-confirmation, the Source includes the Destination as a
 `ProtectSecret` target alongside helpers. Helpers receive the usual VSS
-share; the Destination receives the full `SecretContainer` + per-helper
-share map and surfaces it as a typed `ReplicaVaultReceived` event. Each
+share; the Destination receives the full `Secret` + per-helper
+share map and surfaces it as a typed `ReplicaSecretReceived` event. Each
 SDK README has a focused "Replica flows" section with a runnable example.
 
 ---

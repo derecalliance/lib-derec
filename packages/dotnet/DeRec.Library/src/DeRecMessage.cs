@@ -37,7 +37,7 @@ public sealed class DeRecMessage
     /// <remarks>
     /// The library does not enforce an upper bound on
     /// <paramref name="bytes"/>.<c>Length</c>: legitimate envelopes range
-    /// from tens of bytes (acks) to many MB (replica vault sync). Callers
+    /// from tens of bytes (acks) to many MB (replica secret sync). Callers
     /// MUST bound inbound size at the transport layer before reaching this
     /// method, consistent with their deployment's maximum secret size,
     /// helper count, and replica fan-out.

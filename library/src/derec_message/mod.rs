@@ -18,8 +18,8 @@
 //! [`extract_inner_plaintext_message`], [`apply_trace_id`], [`read_trace_id`] —
 //! parses whatever it's handed. No caller-side size cap is enforced anywhere
 //! in the library, by design: legitimate envelopes span tens of bytes (acks)
-//! through many MB (replica-vault sync), so any cap tight enough to be useful
-//! against DoS would risk silently truncating a legitimate share or vault and
+//! through many MB (replica-secret sync), so any cap tight enough to be useful
+//! against DoS would risk silently truncating a legitimate share or secret and
 //! making the secret unrecoverable.
 //!
 //! The application's transport layer MUST bound inbound message size at a

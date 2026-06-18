@@ -78,10 +78,10 @@ impl
         BuilderSlotMissingMarker,
     >
 {
-    /// Construct a new builder bound to a specific vault.
+    /// Construct a new builder bound to a specific secret.
     ///
-    /// `secret_id` identifies the single vault this protocol instance
-    /// manages. Apps that juggle multiple vaults instantiate one
+    /// `secret_id` identifies the single secret this protocol instance
+    /// manages. Apps that juggle multiple secrets instantiate one
     /// [`DeRecProtocol`] per `secret_id`.
     pub fn new(secret_id: u64) -> Self {
         Self {
@@ -390,10 +390,10 @@ impl<ChannelStore, ShareStore, SecretStore, Transport, OwnTransport>
     >
 {
     /// Set the [`DeRecUserSecretStore`] implementation responsible for
-    /// persisting the user-facing vault contents keyed by `secret_id`.
+    /// persisting the user-facing secret contents keyed by `secret_id`.
     /// Written on every `start(FlowKind::ProtectSecret)`; read by the
     /// pair-completion auto-publish hook so freshly-paired peers
-    /// receive the current vault without an explicit re-publish.
+    /// receive the current secret without an explicit re-publish.
     pub fn with_user_secret_store<Us: DeRecUserSecretStore>(
         self,
         store: Us,

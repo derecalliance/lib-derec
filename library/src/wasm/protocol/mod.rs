@@ -54,7 +54,7 @@ use crate::{
     protocol::{
         DeRecChannelStore, DeRecFlow, DeRecProtocol, DeRecProtocolBuilder, DeRecSecretStore,
         DeRecShareStore, SecretValue, Share, UnpairAck,
-        types::{Channel, ChannelStatus, SecretContainer, Target, UserSecret},
+        types::{Channel, ChannelStatus, Secret, Target, UserSecret},
     },
     types::ChannelId,
     wasm::{
@@ -147,8 +147,8 @@ pub struct DeRecProtocolBuilderWasm {
 #[wasm_bindgen(js_class = DeRecProtocolBuilder)]
 impl DeRecProtocolBuilderWasm {
     /// `secretId` is a JS `bigint` or `number`. Identifies the single
-    /// vault this protocol instance manages; apps that juggle multiple
-    /// vaults instantiate one protocol per id.
+    /// secret this protocol instance manages; apps that juggle multiple
+    /// secrets instantiate one protocol per id.
     #[wasm_bindgen(constructor)]
     pub fn new(secret_id: JsValue) -> Result<DeRecProtocolBuilderWasm, JsValue> {
         let secret_id = js_value_to_u64(secret_id)
@@ -395,7 +395,7 @@ impl DeRecProtocolWasm {
     ///   for `HashedKeys` (contact carries only a SHA-384 binding hash; the
     ///   scanner fetches keys via a `PrePair` round-trip). `HashedKeys`
     ///   requires the protocol's `own_transport` to be ephemeral.
-    /// The vault identifier this protocol instance is bound to.
+    /// The secret identifier this protocol instance is bound to.
     #[wasm_bindgen(js_name = "secretId")]
     pub fn secret_id(&self) -> u64 {
         self.inner.secret_id()
@@ -621,14 +621,14 @@ impl DeRecProtocolWasm {
 }
 
 /// Decode the bytes carried by a [`DeRecEvent::SecretRecovered`] event into
-/// the structured secret bag (`SecretContainer`) — the *same* shape the owner
-/// originally protected. The reconstructed bytes are protobuf, so the FE
-/// can't `TextDecoder.decode()` them; this is the canonical unwrapper.
+/// the structured [`Secret`] — the *same* shape the owner originally
+/// protected. The reconstructed bytes are protobuf, so the FE can't
+/// `TextDecoder.decode()` them; this is the canonical unwrapper.
 ///
 /// The wire layering is:
 /// ```text
-/// raw share fragments → VSS reconstruct → DeRecSecret { secret_data: bag_bytes }
-///                                                              └─ SecretContainer { helpers, secrets }
+/// raw share fragments → VSS reconstruct → DeRecSecret { secret_data: secret_bytes }
+///                                                              └─ Secret { helpers, secrets }
 /// ```
 ///
 /// Returns a JS object:
@@ -647,13 +647,13 @@ impl DeRecProtocolWasm {
 ///   }>,
 /// }
 /// ```
-#[wasm_bindgen(js_name = "decodeRecoveredSecretBag")]
-pub fn decode_recovered_secret_bag(bytes: &[u8]) -> Result<JsValue, JsValue> {
+#[wasm_bindgen(js_name = "decodeRecoveredSecret")]
+pub fn decode_recovered_secret(bytes: &[u8]) -> Result<JsValue, JsValue> {
     let derec = DeRecSecret::decode(bytes).map_err(|e| {
         js_error("DECODE_ERROR", format!("DeRecSecret decode failed: {e}"))
     })?;
-    let bag = SecretContainer::decode(derec.secret_data.as_slice()).map_err(|e| {
-        js_error("DECODE_ERROR", format!("SecretContainer decode failed: {e}"))
+    let secret = Secret::decode(derec.secret_data.as_slice()).map_err(|e| {
+        js_error("DECODE_ERROR", format!("Secret decode failed: {e}"))
     })?;
 
     // Note: `Vec<u8>` serializes as `Array<number>` by default via
@@ -677,13 +677,13 @@ pub fn decode_recovered_secret_bag(bytes: &[u8]) -> Result<JsValue, JsValue> {
         data: Vec<u8>,
     }
     #[derive(serde::Serialize)]
-    struct BagJs {
+    struct SecretJs {
         helpers: Vec<HelperJs>,
         secrets: Vec<UserSecretJs>,
     }
 
-    let payload = BagJs {
-        helpers: bag
+    let payload = SecretJs {
+        helpers: secret
             .helpers
             .into_iter()
             .map(|h| HelperJs {
@@ -693,7 +693,7 @@ pub fn decode_recovered_secret_bag(bytes: &[u8]) -> Result<JsValue, JsValue> {
                 shared_key: h.shared_key,
             })
             .collect(),
-        secrets: bag
+        secrets: secret
             .secrets
             .into_iter()
             .map(|s| UserSecretJs {
@@ -712,13 +712,13 @@ pub fn decode_recovered_secret_bag(bytes: &[u8]) -> Result<JsValue, JsValue> {
         .map_err(|e: serde_wasm_bindgen::Error| js_error("SERIALIZE_ERROR", e.to_string()))
 }
 
-/// Re-populate a set of empty stores from a recovered secret bag, so the
-/// caller can resume in the "normal" (non-recovery) namespace as if the bag
-/// had been distributed by this device originally.
+/// Re-populate a set of empty stores from a recovered [`Secret`], so the
+/// caller can resume in the "normal" (non-recovery) namespace as if the
+/// secret had been distributed by this device originally.
 ///
-/// For each helper in the decoded bag, three records are written:
+/// For each helper in the decoded secret, three records are written:
 ///   - `channel_store.save(Channel { ... })` — the paired channel record,
-///     including the app's `communication_info` carried in the bag.
+///     including the app's `communication_info` carried in the secret.
 ///   - `secret_store.save(channel_id, SharedKey(...))` — the negotiated
 ///     symmetric key, restoring the helper's ability to decrypt our messages.
 ///   - `share_store.save(channel_id, Share { secret_id, version, bytes: [] })`
@@ -731,8 +731,8 @@ pub fn decode_recovered_secret_bag(bytes: &[u8]) -> Result<JsValue, JsValue> {
 ///
 /// **Caller's responsibility**: provide stores backed by an *empty* target
 /// namespace (call `clearNamespace` first). This function does not wipe.
-#[wasm_bindgen(js_name = "restoreFromRecoveredBag")]
-pub async fn restore_from_recovered_bag(
+#[wasm_bindgen(js_name = "restoreFromRecoveredSecret")]
+pub async fn restore_from_recovered_secret(
     channel_store: JsValue,
     secret_store: JsValue,
     share_store: JsValue,
@@ -747,8 +747,8 @@ pub async fn restore_from_recovered_bag(
     let derec = DeRecSecret::decode(recovered_bytes).map_err(|e| {
         js_error("DECODE_ERROR", format!("DeRecSecret decode failed: {e}"))
     })?;
-    let bag = SecretContainer::decode(derec.secret_data.as_slice()).map_err(|e| {
-        js_error("DECODE_ERROR", format!("SecretContainer decode failed: {e}"))
+    let restored = Secret::decode(derec.secret_data.as_slice()).map_err(|e| {
+        js_error("DECODE_ERROR", format!("Secret decode failed: {e}"))
     })?;
 
     let mut ch_store = JsChannelStore(channel_store);
@@ -760,7 +760,7 @@ pub async fn restore_from_recovered_bag(
     // value used by the protocol constructor for `own_transport_protocol`.
     const TRANSPORT_HTTPS: i32 = 0;
 
-    for helper in bag.helpers {
+    for helper in restored.helpers {
         let channel_id = ChannelId(helper.channel_id);
 
         let shared_key: [u8; 32] = helper.shared_key.as_slice().try_into().map_err(|_| {

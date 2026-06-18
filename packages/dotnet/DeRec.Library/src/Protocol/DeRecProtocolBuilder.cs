@@ -47,10 +47,10 @@ public sealed class DeRecProtocolBuilder
     private ulong? _replicaId = null;
 
     /// <summary>
-    /// Construct a builder bound to a specific vault.
+    /// Construct a builder bound to a specific secret.
     ///
-    /// <paramref name="secretId"/> identifies the single vault this
-    /// protocol instance manages. Apps that juggle multiple vaults
+    /// <paramref name="secretId"/> identifies the single secret this
+    /// protocol instance manages. Apps that juggle multiple secrets
     /// instantiate one <see cref="DeRecProtocol"/> per id.
     /// </summary>
     public DeRecProtocolBuilder(ulong secretId)

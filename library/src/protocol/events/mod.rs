@@ -151,24 +151,24 @@ pub enum DeRecFlow {
     Discovery {
         target: Target,
     },
-    /// Publish the current vault bag to the protocol's paired peers.
+    /// Publish the current secret to the protocol's paired peers.
     ///
-    /// The vault identifier comes from the
+    /// The secret identifier comes from the
     /// [`super::DeRecProtocol`] instance (set at construction via
     /// [`crate::protocol::DeRecProtocolBuilder::new`]) — one protocol
-    /// instance manages exactly one vault.
+    /// instance manages exactly one secret.
     ///
     /// The target set is derived from the channel store: every paired
     /// Owner→Helper channel receives a share if the configured threshold
     /// is met, and every paired Source→ReplicaDestination channel
-    /// receives the full vault payload. Apps that need to drive a single
+    /// receives the full secret payload. Apps that need to drive a single
     /// peer should pair just that peer; the protocol no longer accepts
     /// a per-call subset.
     ///
     /// When the count of paired Helpers is below
     /// [`crate::protocol::DeRecProtocolBuilder::with_threshold`], no VSS
-    /// split runs and Helpers receive nothing — the bag still lands on
-    /// any paired Replica destinations in "vault-only" form.
+    /// split runs and Helpers receive nothing — the secret still lands on
+    /// any paired Replica destinations in "secret-only" form.
     ProtectSecret {
         secrets: Vec<UserSecret>,
         description: Option<String>,
@@ -263,7 +263,7 @@ pub enum DeRecEvent {
     /// - [`SenderKind::ReplicaSource`] / [`SenderKind::ReplicaDestination`] —
     ///   a replica pairing completed; the application may use the channel
     ///   as needed (Source pushes via `ProtectSecret`, Destination receives
-    ///   via [`Self::ReplicaVaultReceived`]).
+    ///   via [`Self::ReplicaSecretReceived`]).
     PairingCompleted {
         channel_id: ChannelId,
         kind: SenderKind,
@@ -279,7 +279,7 @@ pub enum DeRecEvent {
     /// (`ReplicaSource` or `ReplicaDestination`) is already on
     /// [`crate::protocol::types::Channel::role`] — this event just adds the
     /// peer's `replica_id`, which the app needs as a `from_replica_id`
-    /// when subsequent vault syncs arrive or when targeting the peer via
+    /// when subsequent secret syncs arrive or when targeting the peer via
     /// `ProtectSecret`.
     ReplicaPaired {
         /// The channel the pair handshake just completed on.
@@ -304,19 +304,19 @@ pub enum DeRecEvent {
         replica_id: Option<u64>,
     },
 
-    /// A `ReplicaSource` peer pushed a vault sync on a `ReplicaDestination`
+    /// A `ReplicaSource` peer pushed a secret sync on a `ReplicaDestination`
     /// channel. The library has already auto-acked the inbound
     /// `StoreShareRequest` and decoded the `ReplicaSecretPayload` into
-    /// typed fields — the application can install `vault` directly,
+    /// typed fields — the application can install `secret` directly,
     /// optionally using `shares` to verify or to take over the recovery
     /// flow toward each helper.
     ///
-    /// **Recovery transitivity**: `vault.helpers[i].shared_key` lets the
+    /// **Recovery transitivity**: `secret.helpers[i].shared_key` lets the
     /// receiver authenticate as the Source toward each helper, and
-    /// `vault.replicas[i].shared_key` does the same toward other
+    /// `secret.replicas[i].shared_key` does the same toward other
     /// destinations. Treat the receiving device accordingly — see
     /// [`crate::protocol::types::ReplicaInfo`] for the security note.
-    ReplicaVaultReceived {
+    ReplicaSecretReceived {
         /// The channel the request arrived on.
         channel_id: ChannelId,
         /// The peer's replica identity (from `Channel.replica_id`,
@@ -326,10 +326,10 @@ pub enum DeRecEvent {
         secret_id: u64,
         /// `version` echoed from the inbound `StoreShareRequest`.
         version: u32,
-        /// Decoded full vault — same shape the sender wrote. The
+        /// Decoded full secret — same shape the sender wrote. The
         /// `helpers`, `replicas`, `secrets`, and `owner_replica_id`
         /// fields carry the canonical roster snapshot for this version.
-        vault: crate::protocol::types::SecretContainer,
+        secret: crate::protocol::types::Secret,
         /// Per-helper VSS share map. Each entry pairs a helper's
         /// `channel_id` with the serialized `CommittedDeRecShare` bytes
         /// the helper received — sufficient material for the receiver
@@ -337,7 +337,7 @@ pub enum DeRecEvent {
         shares: Vec<crate::protocol::types::ChannelShare>,
     },
 
-    /// A replica peer's `StoreShareResponse` to a vault sync we sent
+    /// A replica peer's `StoreShareResponse` to a secret sync we sent
     /// earlier. Fires on the replica channel, mirroring
     /// [`Self::ShareConfirmed`] / [`Self::ShareRejected`] on the helper
     /// side.
@@ -345,7 +345,7 @@ pub enum DeRecEvent {
     /// `status` and `memo` come straight from the peer's
     /// `StoreShareResponseMessage.result`. Apps decide whether to retry,
     /// rebroadcast, or surface the failure to the user.
-    ReplicaVaultAcked {
+    ReplicaSecretAcked {
         channel_id: ChannelId,
         /// The peer's replica identity (from `Channel.replica_id`).
         from_replica_id: u64,

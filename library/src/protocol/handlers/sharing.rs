@@ -5,7 +5,7 @@ use super::super::{
     MissingPolicy, PendingAction, SecretKind, SecretValue, Share,
 };
 use crate::derec_message::DeRecMessageBuilder;
-use crate::primitives::sharing::request::SHARE_ALGORITHM_REPLICA_VAULT;
+use crate::primitives::sharing::request::SHARE_ALGORITHM_REPLICA_SECRET;
 use crate::{
     Error, Result,
     derec_message::current_timestamp,
@@ -13,7 +13,7 @@ use crate::{
         request::{produce as produce_store_share_request_message, split},
         response::{self as sharing_response},
     },
-    protocol::types::{HelperInfo, SecretContainer, UserSecret},
+    protocol::types::{HelperInfo, Secret, UserSecret},
     types::{ChannelId, SharedKey},
 };
 use derec_proto::{
@@ -68,7 +68,7 @@ pub(in crate::protocol) async fn start<
     let (helpers, replicas) =
         load_all_paired_targets(channel_store, secret_store, secret_id).await?;
 
-    // No paired peers — the vault has nowhere to land. Callers treat
+    // No paired peers — the secret has nowhere to land. Callers treat
     // this as a no-op so the auto-publish-on-pair hook can fire safely
     // even when no helpers/replicas exist yet.
     if helpers.is_empty() && replicas.is_empty() {
@@ -76,13 +76,13 @@ pub(in crate::protocol) async fn start<
     }
 
     // Snapshot copies kept for the user_secret_store write at the end.
-    // Both arguments get moved into vault construction below.
+    // Both arguments get moved into secret construction below.
     let snapshot_secrets = secrets.clone();
     let snapshot_description = description.clone();
 
-    let secret_vault =
-        build_secret_vault(&helpers, &replicas, secrets, owner_replica_id.unwrap_or(0));
-    let derec_secret_bytes = wrap_for_helper_split(&secret_vault, threshold);
+    let secret =
+        build_secret(&helpers, &replicas, secrets, owner_replica_id.unwrap_or(0));
+    let derec_secret_bytes = wrap_for_helper_split(&secret, threshold);
 
     // Version progression is anchored to `user_secret_store` so it
     // bumps on every round — including roster-only auto-publishes to
@@ -99,7 +99,7 @@ pub(in crate::protocol) async fn start<
     // VSS-split the DeRecSecret bytes once. The helper-distribution path
     // and the Destination composite both consume the resulting share map.
     // Below the configured threshold, no split runs — Helpers receive
-    // nothing this round and any paired Replicas receive a "vault-only"
+    // nothing this round and any paired Replicas receive a "secret-only"
     // composite (no share material).
     let helper_channel_ids: Vec<ChannelId> = helpers.iter().map(|(ch, _)| ch.id).collect();
     let split_result = if helpers.len() >= threshold {
@@ -134,7 +134,7 @@ pub(in crate::protocol) async fn start<
     }
 
     if !replicas.is_empty() {
-        let composite_bytes = build_replica_composite_bytes(&secret_vault, split_result.as_ref());
+        let composite_bytes = build_replica_composite_bytes(&secret, split_result.as_ref());
         let replica_sent = distribute_composite_to_destinations(
             transport,
             &replicas,
@@ -377,7 +377,7 @@ fn on_response(
 /// keyed by channel role.
 ///
 /// Both vectors carry `(Channel, SharedKey)` pairs ready for envelope
-/// construction. The protocol publishes the vault to *every* paired
+/// construction. The protocol publishes the secret to *every* paired
 /// peer that can receive it — apps no longer subset the target — so
 /// selection is driven entirely by channel state:
 /// `role == Owner` (peer is a Helper) lands in `helpers`,
@@ -387,7 +387,7 @@ fn on_response(
 ///
 /// `ChannelStatus::Pending` channels (replicas awaiting fingerprint
 /// verification) are excluded to prevent a MITM-leaning peer from
-/// receiving vault material before the user confirms the fingerprint
+/// receiving secret material before the user confirms the fingerprint
 /// out-of-band.
 async fn load_all_paired_targets<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     channel_store: &mut Ch,
@@ -439,7 +439,7 @@ async fn load_all_paired_targets<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
             // Local kind == Owner, peer is the Helper. Classic share path.
             SenderKind::Owner => helpers.push((channel, key)),
             // Local kind == ReplicaSource, peer is a ReplicaDestination
-            // ready to receive full vault payloads (vault-sync path).
+            // ready to receive full secret payloads (secret-sync path).
             SenderKind::ReplicaSource => replicas.push((channel, key)),
             // Local kind == Helper — we're the helper on this channel, not
             // a legitimate ProtectSecret initiator. The orchestrator-level
@@ -450,21 +450,21 @@ async fn load_all_paired_targets<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     Ok((helpers, replicas))
 }
 
-/// Build the canonical [`SecretContainer`] for this `ProtectSecret`
-/// round — the inner "vault" that contains the full roster snapshot
-/// (helpers + replicas + secrets) plus the owner's replica id.
+/// Build the canonical [`Secret`] for this `ProtectSecret` round —
+/// the inner payload that contains the full roster snapshot (helpers +
+/// replicas + secrets) plus the owner's replica id.
 ///
-/// Returns the [`SecretContainer`] value (not its encoded bytes), so
-/// callers can either wrap it in [`DeRecSecret`] for the helper VSS path
+/// Returns the [`Secret`] value (not its encoded bytes), so callers
+/// can either wrap it in [`DeRecSecret`] for the helper VSS path
 /// (via [`wrap_for_helper_split`]) or embed it directly in a
 /// [`ReplicaSecretPayload`] for the Destination path (via
 /// [`build_replica_composite_bytes`]).
-fn build_secret_vault(
+fn build_secret(
     paired_helpers: &[(crate::protocol::types::Channel, SharedKey)],
     paired_replicas: &[(crate::protocol::types::Channel, SharedKey)],
     secrets: Vec<UserSecret>,
     owner_replica_id: u64,
-) -> SecretContainer {
+) -> Secret {
     let helper_infos: Vec<HelperInfo> = paired_helpers
         .iter()
         .map(|(channel, shared_key)| HelperInfo {
@@ -490,7 +490,7 @@ fn build_secret_vault(
         )
         .collect();
 
-    SecretContainer {
+    Secret {
         helpers: helper_infos,
         secrets,
         replicas: replica_infos,
@@ -498,13 +498,13 @@ fn build_secret_vault(
     }
 }
 
-/// Wrap the `SecretContainer` in a [`DeRecSecret`] envelope ready to be
+/// Wrap the [`Secret`] in a [`DeRecSecret`] envelope ready to be
 /// VSS-split for helper distribution. The helper side reconstructs the
 /// `DeRecSecret` from a `threshold`-sized subset of shares; the inner
-/// `secret_data` then decodes back to the original [`SecretContainer`].
-fn wrap_for_helper_split(bag: &SecretContainer, threshold: usize) -> Vec<u8> {
+/// `secret_data` then decodes back to the original [`Secret`].
+fn wrap_for_helper_split(secret: &Secret, threshold: usize) -> Vec<u8> {
     let derec_secret = DeRecSecret {
-        secret_data: bag.encode_to_vec(),
+        secret_data: secret.encode_to_vec(),
         creation_time: None,
         helper_threshold_for_recovery: threshold as i64,
         helper_threshold_for_confirming_share_receipt: threshold as i64,
@@ -514,12 +514,12 @@ fn wrap_for_helper_split(bag: &SecretContainer, threshold: usize) -> Vec<u8> {
 }
 
 /// Build the encoded [`ReplicaSecretPayload`] bytes sent to each
-/// Destination on this round. Pairs the full [`SecretContainer`] (so the
-/// Destination has the entire vault) with the per-helper share map (so
-/// the Destination can act as a recovery delegate by re-fetching shares
-/// from each helper using `secret.helpers[i].shared_key`).
+/// Destination on this round. Pairs the full [`Secret`] (so the
+/// Destination has the entire payload) with the per-helper share map
+/// (so the Destination can act as a recovery delegate by re-fetching
+/// shares from each helper using `secret.helpers[i].shared_key`).
 fn build_replica_composite_bytes(
-    bag: &SecretContainer,
+    secret: &Secret,
     split_result: Option<&crate::primitives::sharing::request::SplitResult>,
 ) -> Vec<u8> {
     let shares: Vec<crate::protocol::types::ChannelShare> = split_result
@@ -535,7 +535,7 @@ fn build_replica_composite_bytes(
         .unwrap_or_default();
 
     let composite = crate::protocol::types::ReplicaSecretPayload {
-        secret: Some(bag.clone()),
+        secret: Some(secret.clone()),
         shares,
     };
     composite.encode_to_vec()
@@ -610,20 +610,20 @@ async fn distribute_shares<Sh: DeRecShareStore, T: DeRecTransport>(
     tracing::info!(
         secret_id = secret_id,
         version = version,
-        "secret bag distributed to helpers"
+        "secret distributed to helpers"
     );
 
     Ok(sent_channels)
 }
 
 /// Inbound `StoreShareRequest` on a **replica** channel. The payload
-/// is the full vault — the sender used `share_algorithm =
-/// REPLICA_VAULT`. We decode the typed
-/// [`crate::protocol::types::ReplicaSecretPayload`] from `request.share`, auto-ack
-/// with `StoreShareResponse(Ok)`, and surface a
-/// [`DeRecEvent::ReplicaVaultReceived`] carrying the decoded
-/// [`crate::protocol::types::SecretContainer`] + [`Vec<crate::protocol::types::ChannelShare>`]
-/// for the application's vault-install logic.
+/// is the full secret — the sender used `share_algorithm =
+/// REPLICA_SECRET`. We decode the typed
+/// [`crate::protocol::types::ReplicaSecretPayload`] from `request.share`,
+/// auto-ack with `StoreShareResponse(Ok)`, and surface a
+/// [`DeRecEvent::ReplicaSecretReceived`] carrying the decoded
+/// [`crate::protocol::types::Secret`] + [`Vec<crate::protocol::types::ChannelShare>`]
+/// for the application's secret-install logic.
 pub(in crate::protocol) async fn handle_replica_request<T: DeRecTransport>(
     transport: &T,
     channel: &crate::protocol::types::Channel,
@@ -644,18 +644,18 @@ pub(in crate::protocol) async fn handle_replica_request<T: DeRecTransport>(
     // handing typed structures to the application.
     let composite = crate::protocol::types::ReplicaSecretPayload::decode(request.share.as_slice())
         .map_err(crate::Error::ProtobufDecode)?;
-    let vault = composite.secret.ok_or(crate::Error::InvalidInput(
-        "replica vault payload missing `secret` field",
+    let secret = composite.secret.ok_or(crate::Error::InvalidInput(
+        "replica secret payload missing `secret` field",
     ))?;
     let shares = composite.shares;
 
-    // Auto-ack with Ok. We never refuse a replica vault sync — the
+    // Auto-ack with Ok. We never refuse a replica secret sync — the
     // payload is app territory, so any install failures are surfaced
     // out-of-band, not via this response cycle.
     //
     // The standard `sharing_response::produce` validates `share` as a
     // `CommittedDeRecShare` (helper share path); the replica payload is
-    // a full vault instead, so we build the response envelope inline.
+    // a full secret instead, so we build the response envelope inline.
     let timestamp = current_timestamp();
     let response = StoreShareResponseMessage {
         result: Some(DeRecResult {
@@ -686,26 +686,26 @@ pub(in crate::protocol) async fn handle_replica_request<T: DeRecTransport>(
         from_replica_id,
         secret_id,
         version,
-        helpers_in_bag = vault.helpers.len(),
-        replicas_in_bag = vault.replicas.len(),
-        secrets_in_bag = vault.secrets.len(),
+        helpers_in_secret = secret.helpers.len(),
+        replicas_in_secret = secret.replicas.len(),
+        secrets_in_secret = secret.secrets.len(),
         shares_count = shares.len(),
-        "replica vault received; ack sent"
+        "replica secret received; ack sent"
     );
 
-    Ok(vec![DeRecEvent::ReplicaVaultReceived {
+    Ok(vec![DeRecEvent::ReplicaSecretReceived {
         channel_id: channel.id,
         from_replica_id,
         secret_id,
         version,
-        vault,
+        secret,
         shares,
     }])
 }
 
 /// Inbound `StoreShareResponse` on a **replica** channel — the source's
-/// follow-up to a vault sync. Surface the peer's ack as
-/// [`DeRecEvent::ReplicaVaultAcked`] so the app can decide whether to
+/// follow-up to a secret sync. Surface the peer's ack as
+/// [`DeRecEvent::ReplicaSecretAcked`] so the app can decide whether to
 /// retry / rebroadcast / report.
 pub(in crate::protocol) fn handle_replica_response(
     channel: &crate::protocol::types::Channel,
@@ -724,7 +724,7 @@ pub(in crate::protocol) fn handle_replica_response(
         .map(|r| (r.status, r.memo.clone()))
         .unwrap_or((-1, "response missing `result` field".to_owned()));
 
-    Ok(vec![DeRecEvent::ReplicaVaultAcked {
+    Ok(vec![DeRecEvent::ReplicaSecretAcked {
         channel_id: channel.id,
         from_replica_id,
         secret_id: response.secret_id,
@@ -737,10 +737,10 @@ pub(in crate::protocol) fn handle_replica_response(
 /// Sender-side replica path for `ProtectSecret`.
 ///
 /// Each replica target receives a `StoreShareRequestMessage` carrying the
-/// **full vault payload** (the same `DeRecSecret` bytes the helper path
-/// derives its VSS shares from) in `share`, tagged with
-/// [`SHARE_ALGORITHM_REPLICA_VAULT`] so the receiver knows the payload is
-/// the whole vault rather than a single share fragment.
+/// **full `Secret` payload** (the same `DeRecSecret` bytes the helper
+/// path derives its VSS shares from) in `share`, tagged with
+/// [`SHARE_ALGORITHM_REPLICA_SECRET`] so the receiver knows the payload
+/// is the whole secret rather than a single share fragment.
 ///
 /// `version` is shared with the helper path; both sides write the same
 /// version number on this round. `keep_list` semantics don't apply to
@@ -763,7 +763,7 @@ async fn distribute_composite_to_destinations<T: DeRecTransport>(
         let timestamp = current_timestamp();
         let msg = StoreShareRequestMessage {
             share: composite_bytes.to_vec(),
-            share_algorithm: SHARE_ALGORITHM_REPLICA_VAULT,
+            share_algorithm: SHARE_ALGORITHM_REPLICA_SECRET,
             version,
             keep_list: Vec::new(),
             version_description: description.to_owned(),
@@ -790,7 +790,7 @@ async fn distribute_composite_to_destinations<T: DeRecTransport>(
             channel_id = channel.id.0,
             secret_id = secret_id,
             version = version,
-            "replica vault envelope sent"
+            "replica secret envelope sent"
         );
     }
 

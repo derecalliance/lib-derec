@@ -72,10 +72,10 @@ export interface UserSecrets {
 }
 
 /**
- * Persistence for the user-facing vault contents, keyed by `secretId`.
+ * Persistence for the user-facing secret contents, keyed by `secretId`.
  * One `secretId` maps to at most one stored snapshot — the most recent
  * `start(ProtectSecret)` value. Read back by the pair-completion
- * auto-publish hook so freshly-paired peers receive the current vault.
+ * auto-publish hook so freshly-paired peers receive the current secret.
  */
 export interface UserSecretStore {
   loadLatest(secretId: string): Promise<UserSecrets | null | undefined>;
@@ -236,18 +236,18 @@ export type DeRecEvent =
       channel_id: string;
       peer_replica_id: string;
     }
-  /** A `ReplicaSource` peer pushed a vault sync on a
+  /** A `ReplicaSource` peer pushed a secret sync on a
    *  `ReplicaDestination` channel. The library decoded the
-   *  `ReplicaSecretPayload`; the app installs `vault.secrets` and
+   *  `ReplicaSecretPayload`; the app installs `secret.secrets` and
    *  optionally uses `shares` for recovery. `from_replica_id` and the
-   *  `replica_id` fields inside `vault` are hex-encoded `u64`. */
+   *  `replica_id` fields inside `secret` are hex-encoded `u64`. */
   | {
-      type: "ReplicaVaultReceived";
+      type: "ReplicaSecretReceived";
       channel_id: string;
       from_replica_id: string;
       secret_id: string;
       version: number;
-      vault: {
+      secret: {
         helpers: Array<{
           channel_id: string;
           transport_uri: string;
@@ -274,10 +274,10 @@ export type DeRecEvent =
         committed_share: Uint8Array;
       }>;
     }
-  /** Peer's ack of a vault sync we sent. `status` is the `StatusEnum`
+  /** Peer's ack of a secret sync we sent. `status` is the `StatusEnum`
    *  integer (0 = Ok), `memo` is the peer's explanation. */
   | {
-      type: "ReplicaVaultAcked";
+      type: "ReplicaSecretAcked";
       channel_id: string;
       from_replica_id: string;
       secret_id: string;
@@ -316,9 +316,9 @@ export type DeRecEvent =
  */
 export declare class DeRecProtocolBuilder {
   /**
-   * Construct a builder bound to a specific vault. `secretId`
-   * identifies the single vault this protocol instance manages.
-   * Apps that juggle multiple vaults instantiate one
+   * Construct a builder bound to a specific secret. `secretId`
+   * identifies the single secret this protocol instance manages.
+   * Apps that juggle multiple secrets instantiate one
    * {@link DeRecProtocol} per id.
    */
   constructor(secretId: bigint | number);
@@ -367,7 +367,7 @@ export declare class DeRecProtocol {
   /** Use {@link DeRecProtocolBuilder} to construct instances. */
   private constructor();
 
-  /** The vault identifier this protocol instance is bound to. */
+  /** The secret identifier this protocol instance is bound to. */
   secretId(): bigint;
 
   /**
@@ -446,12 +446,12 @@ export interface RecoveredUserSecret {
   data: Uint8Array | number[];
 }
 
-export interface RecoveredSecretBag {
+export interface RecoveredSecret {
   helpers: RecoveredHelperInfo[];
   secrets: RecoveredUserSecret[];
 }
 
-export declare function decodeRecoveredSecretBag(bytes: Uint8Array): RecoveredSecretBag;
+export declare function decodeRecoveredSecret(bytes: Uint8Array): RecoveredSecret;
 
 /**
  * Envelope-level helpers that operate on raw `DeRecMessage` bytes without
@@ -473,7 +473,7 @@ export declare const envelope: {
   read_trace_id(envelope_bytes: Uint8Array): bigint;
 };
 
-export declare function restoreFromRecoveredBag(
+export declare function restoreFromRecoveredSecret(
   channelStore: ChannelStore,
   secretStore: SecretStore,
   shareStore: ShareStore,

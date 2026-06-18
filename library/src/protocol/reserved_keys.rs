@@ -10,7 +10,7 @@
 
 use crate::{Error, Result};
 
-/// Reserved key carrying the sender's hex-encoded `replica_id` on
+/// Reserved key carrying the sender's decimal-encoded `replica_id` on
 /// replica-mode `PairRequest` / `PairResponse` envelopes.
 ///
 /// Auto-injected by the orchestrator on outbound replica pairings and

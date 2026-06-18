@@ -121,12 +121,12 @@ public interface IShareStore
     IEnumerable<Share> LoadMany(ulong secretId, ulong[] channelIds, uint[] versions);
     /// <summary>
     /// Every share stored under <paramref name="secretId"/> across the
-    /// given channels (used by Discovery for this vault).
+    /// given channels (used by Discovery for this secret).
     /// </summary>
     IEnumerable<Share> LoadAll(ulong secretId, ulong[] channelIds);
     /// <summary>
     /// Highest version stored for <paramref name="secretId"/>, or
-    /// <c>null</c> if no shares exist yet for this vault.
+    /// <c>null</c> if no shares exist yet for this secret.
     /// </summary>
     uint? LatestVersion(ulong secretId);
     void Save(ulong secretId, ulong channelId, Share share);
@@ -134,7 +134,7 @@ public interface IShareStore
 }
 
 /// <summary>
-/// One user-secret entry inside the vault. Wire-equivalent to the Rust
+/// One user-secret entry inside the secret. Wire-equivalent to the Rust
 /// <c>UserSecret</c> — <see cref="Id"/> is an app-defined identifier,
 /// <see cref="Name"/> is a human-readable label, <see cref="Data"/> is
 /// the raw bytes.
@@ -142,15 +142,15 @@ public interface IShareStore
 public sealed record UserSecretEntry(byte[] Id, string Name, byte[] Data);
 
 /// <summary>
-/// Snapshot of the user-facing vault contents written every time the
+/// Snapshot of the user-facing secret contents written every time the
 /// application calls <c>start(FlowKind.ProtectSecret)</c>. The
 /// pair-completion auto-publish hook reads it back so freshly-paired
-/// peers receive the current vault without an explicit re-publish.
+/// peers receive the current secret without an explicit re-publish.
 /// </summary>
 public sealed record UserSecrets(uint Version, UserSecretEntry[] Secrets, string? Description);
 
 /// <summary>
-/// Persistence for the user-facing vault contents, keyed by
+/// Persistence for the user-facing secret contents, keyed by
 /// <c>secret_id</c>. One <c>secret_id</c> maps to at most one stored
 /// <see cref="UserSecrets"/> entry — the most recent snapshot.
 /// </summary>

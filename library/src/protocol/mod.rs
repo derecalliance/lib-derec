@@ -8,7 +8,7 @@
 //! - [`DeRecChannelStore`] — paired-channel record storage
 //! - [`DeRecShareStore`] — secret share storage
 //! - [`DeRecSecretStore`] — cryptographic key storage
-//! - [`DeRecUserSecretStore`] — vault-snapshot storage for replica auto-publish
+//! - [`DeRecUserSecretStore`] — secret-snapshot storage for replica auto-publish
 //! - [`DeRecTransport`] — outbound message delivery
 //!
 //! The application feeds incoming wire bytes to [`DeRecProtocol::process`] and
@@ -21,8 +21,8 @@
 //! protocol flow:
 //!
 //! - **Pairing** — establish a channel + derive a shared key with a peer.
-//! - **ProtectSecret** (sharing) — VSS-split the current vault to every
-//!   paired Helper and ship the full vault to every paired Replica.
+//! - **ProtectSecret** (sharing) — VSS-split the current secret to every
+//!   paired Helper and ship the full secret to every paired Replica.
 //! - **VerifyShares** — challenge a Helper to prove it still holds a
 //!   specific stored share via a SHA-384 commitment (see
 //!   [`PendingVerification`] for the orchestrator-owned request/response
@@ -31,7 +31,7 @@
 //!   currently holds for us. Frequently the precursor to `RecoverSecret`
 //!   but useful for routine inventory too.
 //! - **RecoverSecret** — collect enough Helper shares to reconstruct an
-//!   earlier vault version.
+//!   earlier secret version.
 //! - **UpdateChannelInfo** — broadcast updated `communication_info`
 //!   and/or `transport_protocol` to one or more paired peers. Either
 //!   side may initiate. The accompanying setters
@@ -86,8 +86,7 @@ pub use traits::{
 };
 pub use types::{
     Channel, ChannelShare, ChannelStatus, HelperInfo, MissingPolicy, ReplicaInfo,
-    ReplicaSecretPayload, SecretContainer, SecretKind, SecretValue, Share, Target, UserSecret,
-    UserSecrets,
+    ReplicaSecretPayload, Secret, SecretKind, SecretValue, Share, Target, UserSecret, UserSecrets,
 };
 
 /// In-progress recovery accumulators keyed by `(secret_id, version)`.
@@ -259,10 +258,10 @@ pub struct DeRecProtocol<
     /// initiate or accept a replica-mode pairing returns
     /// [`Error::ReplicaIdNotConfigured`](crate::Error::ReplicaIdNotConfigured).
     pub(crate) replica_id: Option<u64>,
-    /// Identifier of the single vault this protocol instance manages.
+    /// Identifier of the single secret this protocol instance manages.
     ///
     /// Set at construction (`DeRecProtocolBuilder::new(secret_id)`) and
-    /// never changes — apps that juggle multiple vaults instantiate one
+    /// never changes — apps that juggle multiple secrets instantiate one
     /// protocol per `secret_id`.
     secret_id: u64,
 }
@@ -330,7 +329,7 @@ impl<
         })
     }
 
-    /// Returns the vault identifier this protocol instance was configured with.
+    /// Returns the secret identifier this protocol instance was configured with.
     pub fn secret_id(&self) -> u64 {
         self.secret_id
     }
@@ -561,11 +560,11 @@ impl<
         description: Option<String>,
         reply_to: Option<derec_proto::TransportProtocol>,
     ) -> Result<Option<u64>> {
-        // `publish_vault` → `sharing::start` owns version bookkeeping
+        // `publish_secret` → `sharing::start` owns version bookkeeping
         // now: it derives the next version from `user_secret_store`
         // and writes the snapshot at the end of the round. No
         // separate save_latest call is needed here.
-        self.publish_vault(secrets, description, reply_to).await?;
+        self.publish_secret(secrets, description, reply_to).await?;
         Ok(None)
     }
 
@@ -573,7 +572,7 @@ impl<
     /// met, build the Replica composite payload with the share material
     /// embedded, and fan both out. A no-op (silent return) when no paired
     /// Helpers or Replicas exist.
-    async fn publish_vault(
+    async fn publish_secret(
         &mut self,
         secrets: Vec<crate::protocol::types::UserSecret>,
         description: Option<String>,
@@ -1074,7 +1073,7 @@ impl<
     /// - A few KB for pairing material and verification proofs.
     /// - Hundreds of KB to several MB for `StoreShareRequest` carrying a
     ///   share of a large secret.
-    /// - Many MB for `ReplicaSync` envelopes carrying an entire vault
+    /// - Many MB for `ReplicaSync` envelopes carrying an entire secret
     ///   (`O(num_secrets × num_helpers × max_secret_bytes)`).
     ///
     /// Any cap tight enough to provide meaningful DoS resistance would risk
@@ -1141,15 +1140,15 @@ impl<
         Ok(events)
     }
 
-    /// Auto-publish the cached vault if `events` contain a
+    /// Auto-publish the cached secret if `events` contain a
     /// helper-side `PairingCompleted` (the freshly-paired Helper needs
     /// shares). The replica-side equivalent fires from
     /// `verify_fingerprint` once the channel leaves `Pending`.
     ///
-    /// The bag comes from `user_secret_store.load_latest()` when one
+    /// The payload comes from `user_secret_store.load_latest()` when one
     /// has been cached by an earlier `start(ProtectSecret)`. When no
     /// snapshot exists yet **and** at least one Replica Destination is
-    /// already paired, the hook publishes an empty bag so the roster
+    /// already paired, the hook publishes an empty payload so the roster
     /// snapshot still reaches every Destination — that's how a
     /// multi-device sync stays consistent before the application has
     /// added any user secrets.
@@ -1177,13 +1176,13 @@ impl<
             }
         };
         let reply_to = self.auto_reply_to.then(|| self.own_transport.clone());
-        self.publish_vault(secrets, description, reply_to).await
+        self.publish_secret(secrets, description, reply_to).await
     }
 
     /// Returns `true` when at least one channel carries the local
     /// `ReplicaSource` role in `Paired` status — i.e. the peer is a
     /// Replica Destination that is fully verified and eligible for
-    /// vault sync.
+    /// secret sync.
     async fn has_paired_replica_destination(&self) -> Result<bool> {
         let channels = self.channel_store.channels(self.secret_id).await?;
         Ok(channels.iter().any(|c| {
@@ -1271,10 +1270,11 @@ impl<
         // Replica destinations only become eligible publish targets once
         // the fingerprint is verified. Mirror the helper-pair hook in
         // `process()` so the newly-confirmed peer receives the current
-        // vault without an explicit follow-up `ProtectSecret` call. The
+        // secret without an explicit follow-up `ProtectSecret` call. The
         // Pending→Paired transition means at least one Replica
-        // Destination is now paired, so the empty-bag fallback always
-        // applies when no `UserSecrets` snapshot has been cached yet.
+        // Destination is now paired, so the empty-payload fallback
+        // always applies when no `UserSecrets` snapshot has been cached
+        // yet.
         if transitioned_replica {
             let snapshot = self.user_secret_store.load_latest(self.secret_id).await?;
             let (secrets, description) = match snapshot {
@@ -1282,7 +1282,7 @@ impl<
                 None => (Vec::new(), None),
             };
             let reply_to = self.auto_reply_to.then(|| self.own_transport.clone());
-            self.publish_vault(secrets, description, reply_to).await?;
+            self.publish_secret(secrets, description, reply_to).await?;
         }
 
         Ok(true)

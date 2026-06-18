@@ -23,7 +23,7 @@ use serde::Serialize;
 use crate::protocol::{
     pending_action_wire,
     reserved_keys::encode_replica_id,
-    types::{ChannelShare, SecretContainer},
+    types::{ChannelShare, Secret},
     DeRecEvent, PendingAction,
 };
 
@@ -42,15 +42,15 @@ pub(crate) enum Event {
         channel_id: String,
         peer_replica_id: String,
     },
-    ReplicaVaultReceived {
+    ReplicaSecretReceived {
         channel_id: String,
         from_replica_id: String,
         secret_id: String,
         version: u32,
-        vault: Container,
+        secret: SecretWire,
         shares: Vec<Share>,
     },
-    ReplicaVaultAcked {
+    ReplicaSecretAcked {
         channel_id: String,
         from_replica_id: String,
         secret_id: String,
@@ -165,7 +165,7 @@ pub struct DiscoveredVersion {
 }
 
 #[derive(Serialize)]
-pub struct Container {
+pub struct SecretWire {
     pub helpers: Vec<Helper>,
     pub secrets: Vec<UserSecret>,
     pub replicas: Vec<Replica>,
@@ -205,8 +205,8 @@ pub struct Share {
     pub committed_share: Vec<u8>,
 }
 
-impl From<SecretContainer> for Container {
-    fn from(v: SecretContainer) -> Self {
+impl From<Secret> for SecretWire {
+    fn from(v: Secret) -> Self {
         Self {
             helpers: v
                 .helpers
@@ -275,29 +275,29 @@ impl Event {
                 channel_id: channel_id.0.to_string(),
                 peer_replica_id: encode_replica_id(peer_replica_id),
             },
-            DeRecEvent::ReplicaVaultReceived {
+            DeRecEvent::ReplicaSecretReceived {
                 channel_id,
                 from_replica_id,
                 secret_id,
                 version,
-                vault,
+                secret,
                 shares,
-            } => Self::ReplicaVaultReceived {
+            } => Self::ReplicaSecretReceived {
                 channel_id: channel_id.0.to_string(),
                 from_replica_id: encode_replica_id(from_replica_id),
                 secret_id: secret_id.to_string(),
                 version,
-                vault: vault.into(),
+                secret: secret.into(),
                 shares: shares.into_iter().map(Into::into).collect(),
             },
-            DeRecEvent::ReplicaVaultAcked {
+            DeRecEvent::ReplicaSecretAcked {
                 channel_id,
                 from_replica_id,
                 secret_id,
                 version,
                 status,
                 memo,
-            } => Self::ReplicaVaultAcked {
+            } => Self::ReplicaSecretAcked {
                 channel_id: channel_id.0.to_string(),
                 from_replica_id: encode_replica_id(from_replica_id),
                 secret_id: secret_id.to_string(),

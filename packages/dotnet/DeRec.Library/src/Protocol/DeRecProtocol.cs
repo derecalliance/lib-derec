@@ -65,7 +65,7 @@ public sealed class DeRecProtocol : IDisposable
     private static JsonSerializerOptions JsonOpts => DeRecJsonOptions.Wire;
 
     /// <summary>
-    /// Identifier of the single vault this protocol instance manages.
+    /// Identifier of the single secret this protocol instance manages.
     /// Set at construction via <see cref="DeRecProtocolBuilder"/>.
     /// </summary>
     public ulong SecretId { get; }
