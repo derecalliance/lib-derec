@@ -311,10 +311,16 @@ pub enum DeRecEvent {
     /// optionally using `shares` to verify or to take over the recovery
     /// flow toward each helper.
     ///
-    /// **Recovery transitivity**: `secret.helpers[i].shared_key` lets the
-    /// receiver authenticate as the Source toward each helper, and
-    /// `secret.replicas[i].shared_key` does the same toward other
-    /// destinations. Treat the receiving device accordingly — see
+    /// **Recovery transitivity**: `secret.helpers[i].shared_key` lets
+    /// the receiver authenticate as the Source toward each helper. For
+    /// replica-to-replica traffic, all replicas share a single
+    /// group-wide channel key (see
+    /// [`crate::protocol::types::ReplicaSecretPayload`] for the handover
+    /// protocol) — the receiver's own
+    /// [`crate::protocol::DeRecSecretStore`] entry for this channel
+    /// holds that group key, so impersonating the Source toward another
+    /// destination is just a normal channel-key load. Treat the
+    /// receiving device accordingly — see
     /// [`crate::protocol::types::ReplicaInfo`] for the security note.
     ReplicaSecretReceived {
         /// The channel the request arrived on.

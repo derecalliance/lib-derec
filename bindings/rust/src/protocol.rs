@@ -44,6 +44,7 @@ pub async fn run_all() {
     run_reply_to_flow().await;
     run_auto_publish_on_pair_flow().await;
     run_replica_sync_version_progression_flow().await;
+    run_replica_group_key_handover_flow().await;
 }
 
 
@@ -1425,11 +1426,6 @@ async fn run_protect_secret_with_replica_targets_flow() {
         destination.transport_uri, replica.uri,
         "ReplicaInfo.transport_uri must echo the Destination's URI"
     );
-    assert_eq!(
-        destination.shared_key.len(),
-        32,
-        "ReplicaInfo.shared_key must be the 32-byte K_replica"
-    );
 
     println!(
         "  replica received: from={:x}, secret_id={:x}, secret: {} entry(s) / {} helper(s) / {} replica(s), {} helper share(s)  ✓",
@@ -2544,6 +2540,182 @@ async fn run_replica_sync_version_progression_flow() {
     println!("Protocol replica sync version progression flow test passed.");
 }
 
+
+/// Exercises the replica-group-key handover protocol.
+///
+/// All replica channels for a given `secret_id` must converge on a
+/// single symmetric "group" key. The first replica pair on a fresh
+/// Source defines K_group implicitly (its pair-handshake key IS the
+/// group key); every subsequent newly-paired Destination starts on
+/// an ephemeral pair-handshake key and is rotated to K_group during
+/// its first `ProtectSecret` round via the
+/// `ReplicaSecretPayload.shared_key` field.
+///
+/// Scenario:
+///
+/// 1. Source pairs Dest1 → K_group emerges as the Source↔Dest1 key.
+/// 2. Source pairs Dest2 → on the verify_fingerprint auto-publish round,
+///    Source's outbox carries one envelope encrypted with K_group (to
+///    Dest1) and one encrypted with Dest2's K_ephemeral (to Dest2).
+///    Dest2 receives the payload, swaps its stored key to K_group,
+///    acks with K_group. After this round, all four channel entries
+///    (Source→Dest1, Source→Dest2, Dest1's own, Dest2's own) hold
+///    identical bytes.
+/// 3. A follow-up `ProtectSecret` round encrypted with K_group reaches
+///    Dest2 and is decrypted cleanly — proves the handover stuck.
+async fn run_replica_group_key_handover_flow() {
+    println!("=== Protocol replica group-key handover flow ===");
+
+    // All three peers share the same `secret_id` — replica channel keys
+    // are stored per `(secret_id, channel_id)`, so the handover assertion
+    // queries on the receiver side must use the same partition the sender
+    // wrote to.
+    let sid = 0xBEEFu64;
+    let owner_replica_id = 0xC0DE_C0DE_C0DE_C0DEu64;
+    let dest1_replica_id = 0xD1D1_D1D1_D1D1_D1D1u64;
+    let dest2_replica_id = 0xD2D2_D2D2_D2D2_D2D2u64;
+    let dest1_channel = ChannelId(1);
+    let dest2_channel = ChannelId(2);
+
+    let mut source = Peer::with_secret_id_and_replica_id(
+        "source",
+        "https://source.example.com",
+        sid,
+        owner_replica_id,
+    );
+    let mut dest1 = Peer::with_options(
+        "dest1",
+        "https://dest1.example.com",
+        2,
+        false,
+        Some(dest1_replica_id),
+        sid,
+    );
+    let mut dest2 = Peer::with_options(
+        "dest2",
+        "https://dest2.example.com",
+        2,
+        false,
+        Some(dest2_replica_id),
+        sid,
+    );
+
+    // ── Step 1: pair Source↔Dest1; K_group implicitly emerges ────
+    pair_replica_handshake(&mut source, &mut dest1, dest1_channel).await;
+    cross_confirm_fingerprint(&mut source, &mut dest1, dest1_channel).await;
+    let _ = pump_many(&mut [&mut source, &mut dest1, &mut dest2]).await;
+
+    let k_after_pair_1 = load_channel_key(&source, sid, dest1_channel).await;
+    let k_on_dest1 = load_channel_key(&dest1, sid, dest1_channel).await;
+    assert_eq!(
+        k_after_pair_1, k_on_dest1,
+        "after pair 1: Source and Dest1 must hold the same channel key (the implicit K_group)"
+    );
+    let k_group = k_after_pair_1;
+    println!("  step 1: pair Source↔Dest1 — K_group emerged, both sides agree  ✓");
+
+    // ── Step 2: pair Source↔Dest2; handover round mutates Dest2's key ──
+    pair_replica_handshake(&mut source, &mut dest2, dest2_channel).await;
+    // Right after pair handshake (before verify_fingerprint triggers the
+    // auto-publish round), both sides have stored a fresh K_ephemeral for
+    // the new channel. The keys must NOT yet equal K_group.
+    let k_ephemeral_source = load_channel_key(&source, sid, dest2_channel).await;
+    let k_ephemeral_dest2 =
+        load_channel_key(&dest2, sid, dest2_channel).await;
+    assert_eq!(
+        k_ephemeral_source, k_ephemeral_dest2,
+        "post-handshake (pre-handover): Source and Dest2 must share the same ephemeral key"
+    );
+    assert_ne!(
+        k_ephemeral_source, k_group,
+        "post-handshake: Dest2's ephemeral key must NOT equal K_group yet"
+    );
+
+    cross_confirm_fingerprint(&mut source, &mut dest2, dest2_channel).await;
+    let _ = pump_many(&mut [&mut source, &mut dest1, &mut dest2]).await;
+
+    // After the handover round, every replica channel entry on both
+    // sides must hold K_group.
+    let k_source_dest1 = load_channel_key(&source, sid, dest1_channel).await;
+    let k_source_dest2 = load_channel_key(&source, sid, dest2_channel).await;
+    let k_dest1 = load_channel_key(&dest1, sid, dest1_channel).await;
+    let k_dest2 = load_channel_key(&dest2, sid, dest2_channel).await;
+    assert_eq!(k_source_dest1, k_group, "Source↔Dest1 must keep K_group");
+    assert_eq!(
+        k_source_dest2, k_group,
+        "Source↔Dest2 must have rotated to K_group after the handover round"
+    );
+    assert_eq!(k_dest1, k_group, "Dest1 channel-key must equal K_group");
+    assert_eq!(
+        k_dest2, k_group,
+        "Dest2 must have rotated its channel key to K_group via the StoreShareRequest.shared_key field"
+    );
+    println!("  step 2: pair Source↔Dest2 — Dest2 rotated K_ephemeral → K_group, all four entries match  ✓");
+
+    // ── Step 3: post-handover round; must decrypt cleanly with K_group ──
+    source
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![UserSecret {
+                id: vec![0x42],
+                name: "post-handover".to_owned(),
+                data: b"k_group payload".to_vec(),
+            }],
+            description: Some("post-handover round".to_owned()),
+        })
+        .await
+        .expect("source start(ProtectSecret) failed");
+    let post_events = pump_many(&mut [&mut source, &mut dest1, &mut dest2]).await;
+
+    let dest2_event = post_events
+        .iter()
+        .find_map(|e| match e {
+            DeRecEvent::ReplicaSecretReceived {
+                channel_id: c,
+                secret,
+                ..
+            } if *c == dest2_channel => Some(secret.clone()),
+            _ => None,
+        })
+        .expect("Dest2 must observe ReplicaSecretReceived after the post-handover round");
+    assert!(
+        dest2_event
+            .secrets
+            .iter()
+            .any(|us| us.data == b"k_group payload"),
+        "Dest2 must successfully decrypt the post-handover payload using K_group"
+    );
+
+    // And on this round, since Dest2's stored key already equals K_group,
+    // the envelope should carry an empty `replica_group_key` field in the
+    // composite — Source's channel-key equals K_group so no handover.
+    let k_source_dest2_final = load_channel_key(&source, sid, dest2_channel).await;
+    assert_eq!(
+        k_source_dest2_final, k_group,
+        "K_group must remain stable across follow-up rounds (no spurious re-rotation)"
+    );
+    println!("  step 3: follow-up ProtectSecret round encrypted with K_group; Dest2 decrypted cleanly  ✓");
+
+    println!("Protocol replica group-key handover flow test passed.");
+}
+
+/// Helper: load a channel's stored 32-byte `SharedKey` from a peer's
+/// secret_store. Panics if missing — we only call this inside the
+/// group-key flow after pairing/sync rounds have completed.
+async fn load_channel_key(peer: &Peer, secret_id: u64, channel_id: ChannelId) -> [u8; 32] {
+    use derec_library::protocol::DeRecSecretStore;
+    let v = peer
+        .protocol
+        .secret_store
+        .load(secret_id, channel_id, derec_library::protocol::SecretKind::SharedKey)
+        .await
+        .expect("secret_store.load failed")
+        .expect("channel key must be present");
+    match v {
+        derec_library::protocol::SecretValue::SharedKey(k) => k,
+        _ => panic!("expected SecretValue::SharedKey"),
+    }
+}
 
 /// Drive only the cryptographic pair handshake between an Owner and
 /// a ReplicaDestination. Stops at the `Pending` state — the caller

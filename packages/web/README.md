@@ -540,6 +540,14 @@ Source against every helper paired at the time the secret was sent.
 Pick Destinations with at least the trust level of the Source device
 itself; do not treat them as opaque backups.
 
+All replicas of one `secret_id` also share a single **group channel
+key**: every replica channel's `SharedKey` entry in the secret store
+holds the same 32 bytes, established at the first replica pair and
+handed to every subsequent joiner via the
+`ReplicaSecretPayload.shared_key` field on its first sync round.
+Compromise of any one Destination therefore exposes that single key;
+the protocol does not provide per-pair forward secrecy across replicas.
+
 ### `ContactMode.HashedKeys` requires an ephemeral transport URI
 
 `HashedKeys` ships only a SHA-384 binding hash in the contact and

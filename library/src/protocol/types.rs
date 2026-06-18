@@ -174,28 +174,26 @@ pub struct UserSecrets {
     pub description: Option<String>,
 }
 
-/// Per-replica metadata stored inside the secret bag — mirrors
+/// Per-replica metadata stored inside the [`Secret`] — mirrors
 /// [`HelperInfo`] but for the replica role and carries the extra
-/// `replica_id` + `sender_kind` fields needed by the replica recovery
-/// model.
+/// `replica_id` + `sender_kind` fields needed by the replica model.
 ///
-/// **Recovery transitivity**: the `shared_key` here is the symmetric key
-/// the Source negotiated with this Destination during pairing. A
-/// Destination that later needs to act on the Source's behalf (e.g. fetch
-/// a fresher copy from another Destination) uses these `shared_key`s to
-/// authenticate as the Source toward its peers. Any Destination is
-/// effectively a recovery delegate for the Source.
+/// **No per-pair key**: all replica channels for a given `secret_id`
+/// converge on a single group key (see [`ReplicaSecretPayload::shared_key`]
+/// for how that key is handed off to a new joiner). Each replica's
+/// `(secret_id, channel_id)` entry in
+/// [`crate::protocol::DeRecSecretStore`] holds that same group key, so
+/// any replica can address any other replica's peers by loading the
+/// channel key from its own secret store — this struct does not need to
+/// carry it.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReplicaInfo {
-    /// Channel identifier the Source uses to address this peer.
+    /// Channel identifier the originator uses to address this peer.
     #[prost(uint64, tag = "1")]
     pub channel_id: u64,
     /// The peer's message endpoint URI.
     #[prost(string, tag = "2")]
     pub transport_uri: ::prost::alloc::string::String,
-    /// Symmetric key negotiated during the pair handshake (32 bytes).
-    #[prost(bytes = "vec", tag = "3")]
-    pub shared_key: ::prost::alloc::vec::Vec<u8>,
     /// App-level identity metadata for this peer. Same opacity contract
     /// as [`HelperInfo::communication_info`].
     #[prost(map = "string, string", tag = "4")]
@@ -262,14 +260,42 @@ pub struct ChannelShare {
 /// Destination can recover via either path — read the secret directly,
 /// or contact each helper using `secret.helpers[i].shared_key` and
 /// request their stored share.
+///
+/// # Group-key handover
+///
+/// All replica channels for a given `secret_id` converge on a single
+/// symmetric "group" key. The `shared_key` field carries that group key
+/// inside the encrypted payload **only** when the sender knows the
+/// receiver doesn't have it yet — i.e. on the first round to a newly
+/// paired Destination. Both sides swap their stored channel key
+/// (`(secret_id, channel_id)` in [`crate::protocol::DeRecSecretStore`])
+/// from the per-pair ephemeral handshake key to the group key:
+///
+/// - **Sender**: swap immediately after the request envelope is sent.
+///   The ack response from the new joiner will already be encrypted
+///   with the group key.
+/// - **Receiver**: swap before encrypting the ack response, so the
+///   ack uses the group key and matches what the sender expects.
+///
+/// On the first-ever replica pair, the group key is implicitly the
+/// pair-handshake key — `shared_key` is left empty, no swap happens,
+/// and the channel-key entry both sides already saved is the group key.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReplicaSecretPayload {
-    /// The full secret the Source is committing to this version.
+    /// The full secret the sender is committing to this version.
     #[prost(message, optional, tag = "1")]
     pub secret: ::core::option::Option<Secret>,
     /// One entry per helper that received a VSS share on this round.
     #[prost(message, repeated, tag = "2")]
     pub shares: ::prost::alloc::vec::Vec<ChannelShare>,
+    /// 32-byte replica-group key. Present only on the first-sync round
+    /// to a newly-paired Destination; empty on every subsequent round
+    /// (since the receiving channel already holds the group key) and
+    /// empty when the receiving Destination is the very first pair for
+    /// this `secret_id` (the pair-handshake key is implicitly the group
+    /// key). See type-level docs for the swap protocol.
+    #[prost(bytes = "vec", tag = "3")]
+    pub shared_key: ::prost::alloc::vec::Vec<u8>,
 }
 
 /// Kind of secret material stored by [`crate::protocol::DeRecSecretStore`].

@@ -336,7 +336,6 @@ public sealed record HelperInfo(
 public sealed record ReplicaInfo(
     string ChannelId,
     string TransportUri,
-    byte[] SharedKey,
     Dictionary<string, string> CommunicationInfo,
     string ReplicaId,
     int SenderKind);
@@ -586,7 +585,6 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             replicas.Add(new ReplicaInfo(
                 r.GetProperty("channel_id").GetString()!,
                 r.GetProperty("transport_uri").GetString()!,
-                ReadByteArray(r.GetProperty("shared_key")),
                 r.TryGetProperty("communication_info", out var rci) ? ReadStringMap(rci) : new(),
                 r.GetProperty("replica_id").GetString()!,
                 r.GetProperty("sender_kind").GetInt32()));

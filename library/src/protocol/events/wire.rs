@@ -185,7 +185,6 @@ pub struct Helper {
 pub struct Replica {
     pub channel_id: String,
     pub transport_uri: String,
-    pub shared_key: Vec<u8>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub communication_info: HashMap<String, String>,
     pub replica_id: String,
@@ -233,7 +232,6 @@ impl From<Secret> for SecretWire {
                 .map(|r| Replica {
                     channel_id: r.channel_id.to_string(),
                     transport_uri: r.transport_uri,
-                    shared_key: r.shared_key,
                     communication_info: r.communication_info,
                     replica_id: encode_replica_id(r.replica_id),
                     sender_kind: r.sender_kind,

@@ -1066,6 +1066,16 @@ the Source against every helper that was paired at the time the secret
 was sent. Pick Destinations with at least the trust level of the Source
 device itself; do not treat them as opaque backups.
 
+The replica group also shares a single **group channel key**: every
+`(secret_id, channel_id)` entry in
+[`DeRecSecretStore`](https://docs.rs/derec-library/latest/derec_library/protocol/trait.DeRecSecretStore.html)
+for a paired replica channel holds the same 32-byte key, established at
+the first replica pair and handed over to every subsequent joiner via
+[`ReplicaSecretPayload.shared_key`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.ReplicaSecretPayload.html)
+on its first sync round. Compromise of any one Destination therefore
+exposes that single key to the attacker; the protocol does not provide
+per-pair forward secrecy across replicas.
+
 ### `HashedKeys` requires an ephemeral transport URI
 
 `ContactMode::HashedKeys` ships only a SHA-384 binding hash in the

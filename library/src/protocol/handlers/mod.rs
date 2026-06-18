@@ -202,6 +202,7 @@ pub(super) async fn handle<
                 }
                 (SenderKind::ReplicaDestination, MessageBody::StoreShareRequest(request)) => {
                     sharing::handle_replica_request(
+                        secret_store,
                         transport,
                         &channel,
                         request.clone(),

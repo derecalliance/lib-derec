@@ -134,11 +134,14 @@ pub(in crate::protocol) async fn start<
     }
 
     if !replicas.is_empty() {
-        let composite_bytes = build_replica_composite_bytes(&secret, split_result.as_ref());
+        let composite = build_replica_composite(&secret, split_result.as_ref());
+        let k_group = current_replica_group_key(&replicas);
         let replica_sent = distribute_composite_to_destinations(
+            secret_store,
             transport,
             &replicas,
-            &composite_bytes,
+            &composite,
+            k_group,
             secret_id,
             version,
             &description,
@@ -478,10 +481,9 @@ fn build_secret(
     let replica_infos: Vec<crate::protocol::types::ReplicaInfo> = paired_replicas
         .iter()
         .map(
-            |(channel, shared_key)| crate::protocol::types::ReplicaInfo {
+            |(channel, _shared_key)| crate::protocol::types::ReplicaInfo {
                 channel_id: channel.id.0,
                 transport_uri: channel.transport.uri.to_owned(),
-                shared_key: shared_key.to_vec(),
                 communication_info: channel.communication_info.clone(),
                 replica_id: channel.replica_id.unwrap_or(0),
                 sender_kind: crate::protocol::handlers::pairing::derive_peer_kind(channel.role)
@@ -513,15 +515,20 @@ fn wrap_for_helper_split(secret: &Secret, threshold: usize) -> Vec<u8> {
     derec_secret.encode_to_vec()
 }
 
-/// Build the encoded [`ReplicaSecretPayload`] bytes sent to each
-/// Destination on this round. Pairs the full [`Secret`] (so the
-/// Destination has the entire payload) with the per-helper share map
-/// (so the Destination can act as a recovery delegate by re-fetching
-/// shares from each helper using `secret.helpers[i].shared_key`).
-fn build_replica_composite_bytes(
+/// Build the typed [`ReplicaSecretPayload`] sent to every Destination on
+/// this round. Pairs the full [`Secret`] (so the Destination has the
+/// entire payload) with the per-helper share map (so the Destination can
+/// act as a recovery delegate by re-fetching shares from each helper
+/// using `secret.helpers[i].shared_key`).
+///
+/// Returns the typed value (not bytes) — the per-channel `shared_key`
+/// handover field is set later by
+/// [`distribute_composite_to_destinations`] when a particular Destination
+/// needs to adopt the group key.
+fn build_replica_composite(
     secret: &Secret,
     split_result: Option<&crate::primitives::sharing::request::SplitResult>,
-) -> Vec<u8> {
+) -> crate::protocol::types::ReplicaSecretPayload {
     let shares: Vec<crate::protocol::types::ChannelShare> = split_result
         .map(|r| {
             r.shares
@@ -534,11 +541,31 @@ fn build_replica_composite_bytes(
         })
         .unwrap_or_default();
 
-    let composite = crate::protocol::types::ReplicaSecretPayload {
+    crate::protocol::types::ReplicaSecretPayload {
         secret: Some(secret.clone()),
         shares,
-    };
-    composite.encode_to_vec()
+        shared_key: Vec::new(),
+    }
+}
+
+/// Resolve the current replica group key from the set of already-paired
+/// Destinations on this `secret_id`. Returns `None` when no Destinations
+/// are paired yet (or only one — that channel's pair-handshake key is
+/// implicitly the group key, no handover needed).
+///
+/// The group key is the `SharedKey` stored on the oldest paired
+/// Destination channel — ordered by `(created_at, channel_id)` so the
+/// answer is deterministic across restarts. That channel is guaranteed
+/// to hold the group key because it set the precedent on its own first
+/// sync round (where `shared_key` was left empty and its pair-handshake
+/// key became the group key).
+fn current_replica_group_key(
+    replicas: &[(crate::protocol::types::Channel, SharedKey)],
+) -> Option<SharedKey> {
+    replicas
+        .iter()
+        .min_by_key(|(ch, _)| (ch.created_at, ch.id.0))
+        .map(|(_, key)| *key)
 }
 
 #[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(secret_id = secret_id)))]
@@ -624,7 +651,23 @@ async fn distribute_shares<Sh: DeRecShareStore, T: DeRecTransport>(
 /// [`DeRecEvent::ReplicaSecretReceived`] carrying the decoded
 /// [`crate::protocol::types::Secret`] + [`Vec<crate::protocol::types::ChannelShare>`]
 /// for the application's secret-install logic.
-pub(in crate::protocol) async fn handle_replica_request<T: DeRecTransport>(
+///
+/// # Group-key handover
+///
+/// If the payload carries a non-empty `shared_key` (32 bytes), the
+/// sender is asking us to adopt the replica-group key for this
+/// `secret_id`. We persist it as this channel's new `SharedKey` in
+/// [`crate::protocol::DeRecSecretStore`] **before** encrypting the ack
+/// — so the ack travels under the group key, matching the sender's
+/// secret store after its own swap. From this round forward, this
+/// channel's traffic uses the group key.
+///
+/// The embedded `shared_key` is delivered inside an already-decrypted
+/// authenticated envelope (the pair-handshake key authenticated the
+/// outer message), so the receiver does not need an additional binding
+/// check.
+pub(in crate::protocol) async fn handle_replica_request<Ss: DeRecSecretStore, T: DeRecTransport>(
+    secret_store: &mut Ss,
     transport: &T,
     channel: &crate::protocol::types::Channel,
     request: StoreShareRequestMessage,
@@ -649,6 +692,33 @@ pub(in crate::protocol) async fn handle_replica_request<T: DeRecTransport>(
     ))?;
     let shares = composite.shares;
 
+    // Group-key handover: if the sender included a 32-byte `shared_key`,
+    // swap our channel key NOW so the ack we're about to encrypt uses
+    // it. An empty `shared_key` means "no handover needed" — either
+    // this is the first-ever replica pair (the pair-handshake key is
+    // implicitly the group key) or the channel already holds it from a
+    // prior round.
+    let ack_key: SharedKey = match composite.shared_key.len() {
+        0 => shared_key,
+        32 => {
+            let k_group: SharedKey = composite
+                .shared_key
+                .as_slice()
+                .try_into()
+                .expect("len-checked above");
+            secret_store
+                .save(secret_id, channel.id, SecretValue::SharedKey(k_group))
+                .await
+                .map_err(crate::Error::SecretStore)?;
+            k_group
+        }
+        _ => {
+            return Err(crate::Error::InvalidInput(
+                "replica_group_key must be empty or 32 bytes",
+            ));
+        }
+    };
+
     // Auto-ack with Ok. We never refuse a replica secret sync — the
     // payload is app territory, so any install failures are surfaced
     // out-of-band, not via this response cycle.
@@ -670,7 +740,7 @@ pub(in crate::protocol) async fn handle_replica_request<T: DeRecTransport>(
         .channel_id(channel.id)
         .timestamp(timestamp)
         .message_body(MessageBody::StoreShareResponse(response))
-        .encrypt(&shared_key)?
+        .encrypt(&ack_key)?
         .build()?
         .encode_to_vec();
     let envelope = super::apply_trace_id(envelope_bytes, inbound_trace_id)?;
@@ -690,6 +760,7 @@ pub(in crate::protocol) async fn handle_replica_request<T: DeRecTransport>(
         replicas_in_secret = secret.replicas.len(),
         secrets_in_secret = secret.secrets.len(),
         shares_count = shares.len(),
+        handover = !composite.shared_key.is_empty(),
         "replica secret received; ack sent"
     );
 
@@ -742,15 +813,31 @@ pub(in crate::protocol) fn handle_replica_response(
 /// [`SHARE_ALGORITHM_REPLICA_SECRET`] so the receiver knows the payload
 /// is the whole secret rather than a single share fragment.
 ///
+/// # Group-key handover
+///
+/// Inside the loop, each Destination's channel key is compared to the
+/// resolved group key. When they differ — i.e. this Destination is a
+/// newly-paired joiner that still holds its pair-handshake key — the
+/// outgoing payload's [`crate::protocol::types::ReplicaSecretPayload::shared_key`]
+/// is set to the group key, and the sender's local
+/// [`crate::protocol::DeRecSecretStore`] entry for this channel is
+/// overwritten with the group key **immediately after the envelope is
+/// sent** (before the ack arrives). The ack will be encrypted with the
+/// group key by the receiver (which performs its own swap before
+/// responding), so the sender's secret store is in the right state by
+/// the time the ack lands.
+///
 /// `version` is shared with the helper path; both sides write the same
 /// version number on this round. `keep_list` semantics don't apply to
 /// replicas (every replica holds every version), so it is left empty.
 #[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(secret_id = secret_id)))]
 #[allow(clippy::too_many_arguments)]
-async fn distribute_composite_to_destinations<T: DeRecTransport>(
+async fn distribute_composite_to_destinations<Ss: DeRecSecretStore, T: DeRecTransport>(
+    secret_store: &mut Ss,
     transport: &T,
     replicas: &[(crate::protocol::types::Channel, SharedKey)],
-    composite_bytes: &[u8],
+    composite: &crate::protocol::types::ReplicaSecretPayload,
+    k_group: Option<SharedKey>,
     secret_id: u64,
     version: u32,
     description: &str,
@@ -759,10 +846,26 @@ async fn distribute_composite_to_destinations<T: DeRecTransport>(
 ) -> Result<Vec<ChannelId>> {
     let mut sent_channels: Vec<ChannelId> = Vec::with_capacity(replicas.len());
 
-    for (channel, shared_key) in replicas {
+    for (channel, channel_key) in replicas {
+        // A Destination needs the group key handed over if (a) a group
+        // key exists for this `secret_id` and (b) this channel's stored
+        // key isn't already that group key. The first-ever paired
+        // Destination has `k_group == Some(its-own-key)` and skips the
+        // handover (no-op swap of K_handshake → K_handshake).
+        let needs_handover = match k_group.as_ref() {
+            Some(g) => channel_key != g,
+            None => false,
+        };
+
+        let mut per_channel = composite.clone();
+        if needs_handover {
+            per_channel.shared_key = k_group.as_ref().unwrap().to_vec();
+        }
+        let composite_bytes = per_channel.encode_to_vec();
+
         let timestamp = current_timestamp();
         let msg = StoreShareRequestMessage {
-            share: composite_bytes.to_vec(),
+            share: composite_bytes,
             share_algorithm: SHARE_ALGORITHM_REPLICA_SECRET,
             version,
             keep_list: Vec::new(),
@@ -777,11 +880,23 @@ async fn distribute_composite_to_destinations<T: DeRecTransport>(
             .channel_id(channel.id)
             .timestamp(timestamp)
             .message_body(MessageBody::StoreShareRequest(msg))
-            .encrypt(shared_key)?
+            .encrypt(channel_key)?
             .build()?
             .encode_to_vec();
         let envelope = super::apply_trace_id(envelope_bytes, super::fresh_trace_id())?;
         transport.send(&channel.transport, envelope).await?;
+
+        if needs_handover {
+            // Swap the stored channel key now: future inbound/outbound on
+            // this channel uses the group key. The receiver performs the
+            // symmetric swap before its ack, so the next message in
+            // either direction lines up.
+            let new_key = k_group.as_ref().expect("handover implies k_group set");
+            secret_store
+                .save(secret_id, channel.id, SecretValue::SharedKey(*new_key))
+                .await
+                .map_err(crate::Error::SecretStore)?;
+        }
 
         sent_channels.push(channel.id);
 
@@ -790,6 +905,7 @@ async fn distribute_composite_to_destinations<T: DeRecTransport>(
             channel_id = channel.id.0,
             secret_id = secret_id,
             version = version,
+            handover = needs_handover,
             "replica secret envelope sent"
         );
     }

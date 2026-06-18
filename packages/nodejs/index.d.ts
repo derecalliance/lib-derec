@@ -262,7 +262,6 @@ export type DeRecEvent =
         replicas: Array<{
           channel_id: string;
           transport_uri: string;
-          shared_key: Uint8Array;
           communication_info: Record<string, string>;
           replica_id: string;
           sender_kind: number;
