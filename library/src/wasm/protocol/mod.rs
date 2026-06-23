@@ -473,7 +473,9 @@ impl DeRecProtocolWasm {
         // enum mismatches are rejected before the URI is stored.
         let lib_tp = crate::transport::TransportProtocol::try_from(&proto_tp)
             .map_err(|e| js_error("INVALID_OWN_TRANSPORT", e.to_string()))?;
-        self.inner.set_own_transport(lib_tp.uri);
+        self.inner
+            .set_own_transport(lib_tp)
+            .map_err(|e| js_error("INVALID_OWN_TRANSPORT", e.to_string()))?;
         Ok(())
     }
 

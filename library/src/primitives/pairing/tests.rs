@@ -2251,10 +2251,12 @@ fn test_validate_rejects_hashed_wrong_hash_length() {
 }
 
 /// A peer-supplied `PairRequestMessage.transport_protocol` declaring
-/// `Protocol::Https` but carrying an `http://` URI is rejected on the
-/// initiator side at extract — the producer-side `validate_inputs`
-/// catches well-behaved local builds, and this gate catches a
-/// malicious responder that bypasses it.
+/// `Protocol::Https` but carrying a URI with an unsupported scheme is
+/// rejected on the initiator side at extract — the producer-side
+/// `validate_inputs` catches well-behaved local builds, and this gate
+/// catches a malicious responder that bypasses it. (`http://` is
+/// intentionally accepted as a dev-mode affordance and is flagged via
+/// `tracing::warn!`; see `crate::transport`.)
 #[test]
 fn test_extract_pairing_request_rejects_scheme_mismatched_transport_protocol() {
     use crate::derec_message::DeRecMessageBuilder;
@@ -2275,12 +2277,13 @@ fn test_extract_pairing_request_rejects_scheme_mismatched_transport_protocol() {
     .expect("failed to create contact message");
 
     // Hand-craft a PairRequest whose advertised transport_protocol
-    // declares Https but carries an http:// URI — the structurally
-    // malicious payload `validate_inputs` would refuse on the producer
-    // side. Encrypt with the initiator's ECIES public key from the
-    // contact message and seal it in the standard outer envelope.
+    // declares Https but carries a URI with an unsupported scheme —
+    // the structurally malicious payload `validate_inputs` would
+    // refuse on the producer side. Encrypt with the initiator's
+    // ECIES public key from the contact message and seal it in the
+    // standard outer envelope.
     let malicious_transport = TransportProtocol {
-        uri: "http://attacker.example/inbox".to_owned(),
+        uri: "ws://attacker.example/inbox".to_owned(),
         protocol: Protocol::Https.into(),
     };
     let timestamp = current_timestamp();
@@ -2321,8 +2324,10 @@ fn test_extract_pairing_request_rejects_scheme_mismatched_transport_protocol() {
 }
 
 /// Same gate at the plaintext PrePair leg: a `PrePairRequestMessage`
-/// advertising `Protocol::Https` with an `http://` URI is rejected at
-/// extract.
+/// advertising `Protocol::Https` with a URI carrying an unsupported
+/// scheme is rejected at extract. (`http://` is intentionally accepted
+/// as a dev-mode affordance and is flagged via `tracing::warn!`; see
+/// `crate::transport`.)
 #[test]
 fn test_extract_pre_pair_rejects_scheme_mismatched_transport_protocol() {
     use crate::protocol_version::ProtocolVersion;
@@ -2331,7 +2336,7 @@ fn test_extract_pre_pair_rejects_scheme_mismatched_transport_protocol() {
     let channel_id = ChannelId(92);
 
     let malicious_transport = TransportProtocol {
-        uri: "http://attacker.example/inbox".to_owned(),
+        uri: "ws://attacker.example/inbox".to_owned(),
         protocol: Protocol::Https.into(),
     };
     let timestamp = current_timestamp();

@@ -444,21 +444,27 @@ impl<
     ///
     /// Failing to keep both endpoints reachable during this window will
     /// cause messages to be lost.
-    /// Set the local node's transport endpoint URI.
+    /// Set the local node's transport endpoint.
     ///
-    /// Accepts any string-like input — `&str`, `String`,
-    /// `Cow<str>`, anything else with [`Into<String>`] — for
-    /// flexibility at call sites that just have a URI in hand. The
-    /// protocol discriminant defaults to [`derec_proto::Protocol::Https`]
-    /// (currently the only defined variant). The wire-level
-    /// validation that runs at the FFI/WASM boundaries still
-    /// rejects mismatched schemes before reaching this setter, so
-    /// even though this method itself is infallible, an upstream
-    /// caller that builds via the FFI / WASM entry points still
-    /// gets the scheme/protocol consistency check.
-    pub fn set_own_transport(&mut self, uri: impl Into<String>) {
-        let tp = crate::transport::TransportProtocol::from(uri.into());
+    /// Accepts anything implementing
+    /// [`IntoOwnTransport`](crate::transport::IntoOwnTransport): a
+    /// typed [`crate::transport::TransportProtocol`], a `&str`, or a
+    /// `String`. Validation runs eagerly — a malformed URI surfaces
+    /// as [`crate::Error::Transport`] instead of being stored and
+    /// later propagated to peers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Transport`] if the supplied value
+    /// fails URI validation (empty, oversize, control characters,
+    /// or scheme mismatch).
+    pub fn set_own_transport(
+        &mut self,
+        own_transport: impl crate::transport::IntoOwnTransport,
+    ) -> crate::Result<()> {
+        let tp = own_transport.into_own_transport()?;
         self.own_transport = tp.into();
+        Ok(())
     }
 
     /// Unified entry point for initiating any protocol flow.

@@ -92,11 +92,14 @@ pub unsafe extern "C" fn derec_protocol_set_own_transport(
     // protocol-enum check and the URI rules, so a downgraded scheme
     // (e.g. `http://` carried with `Protocol::Https`) is rejected
     // here rather than silently propagated to peers.
-    if let Err(e) = super::validate_transport(&uri, protocol) {
-        return e;
-    }
+    let validated_tp = match super::validate_transport(&uri, protocol) {
+        Ok(tp) => tp,
+        Err(e) => return e,
+    };
     let h = unsafe { &*handle };
     let mut inner = h.lock_inner();
-    inner.set_own_transport(uri);
-    success()
+    match inner.set_own_transport(validated_tp) {
+        Ok(()) => success(),
+        Err(e) => crate::ffi::error::from_lib_error(e),
+    }
 }

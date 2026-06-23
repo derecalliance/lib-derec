@@ -1913,7 +1913,10 @@ async fn run_update_channel_info_flow() {
     .collect();
 
     owner.protocol.set_communication_info(new_info.clone());
-    owner.protocol.set_own_transport(new_uri.clone());
+    owner
+        .protocol
+        .set_own_transport(new_uri.clone())
+        .expect("test fixture: valid URI should pass set_own_transport validation");
     // Simulate "the new endpoint is up before the update is sent" — the
     // pump dispatches by `Peer::uri`, so this is the in-memory equivalent
     // of starting to listen on the new URI.

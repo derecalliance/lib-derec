@@ -6,8 +6,10 @@
 //! It mirrors [`derec_proto::TransportProtocol`] (the protobuf wire
 //! type) but holds the protocol enum as a typed value rather than
 //! a raw `i32`, exposes [`TransportProtocol::validate`] as a method,
-//! and is `From<&str>` / `From<String>` for the common case where
-//! the caller just has a URI in hand.
+//! and is `TryFrom<&str>` / `TryFrom<String>` for the common case
+//! where the caller just has a URI in hand and wants the protocol
+//! discriminant derived from the URI scheme in a single validated
+//! step.
 //!
 //! ## Validation rules
 //!
@@ -17,9 +19,12 @@
 //! 2. **No control characters** — bytes `< 0x20` or `= 0x7F` are
 //!    rejected (NUL, embedded newlines, terminal escape codes).
 //! 3. **Scheme matches the protocol** — `Protocol::Https` ⇒ the URI
-//!    must start with `https://`. Catches plaintext / mismatched
-//!    schemes (`http://`, `ws://`, …) being smuggled in alongside an
-//!    HTTPS discriminant.
+//!    must start with `https://`. When the opt-in `unsafe-http` Cargo
+//!    feature is enabled, plaintext `http://` is *also* accepted as a
+//!    development convenience and emits a WARN through `tracing`
+//!    (when the `logging` feature is enabled) so the insecure scheme
+//!    is visible in logs. Other schemes (`ws://`, `file://`, …) are
+//!    always rejected.
 //! 4. **Non-empty URI** — `EmptyUri` is the explicit error.
 //!
 //! Unknown `protocol` discriminants are caught at the *conversion*
@@ -41,10 +46,27 @@ pub const MAX_TRANSPORT_URI_LEN: usize = 2048;
 ///
 /// Use this type in your `DeRecProtocolBuilder` / `set_own_transport`
 /// calls; the library converts to the protobuf wire form internally
-/// when it needs to encode messages. Construct it from a string with
-/// [`From`] / [`Into`] (which defaults the protocol to
-/// [`Protocol::Https`], the only currently-defined variant), or
-/// directly with [`TransportProtocol::new`].
+/// when it needs to encode messages. Construct it from a URI string
+/// with [`TryFrom`] / [`TryInto`] (which parses the URI scheme,
+/// derives the protocol discriminant, and validates in one step),
+/// or directly with [`TransportProtocol::new`] when you already have
+/// a typed [`Protocol`] in hand.
+///
+/// ## Plaintext `http://` is gated behind `unsafe-http` (development only)
+///
+/// By default, [`TransportProtocol::validate`] only accepts
+/// `https://` URIs for [`Protocol::Https`]. The opt-in `unsafe-http`
+/// Cargo feature loosens this so a `http://` URI is also accepted —
+/// useful for local development and integration testing where TLS is
+/// inconvenient. Whenever a plaintext URI is accepted, the library
+/// emits a `tracing::warn!` (under the `logging` feature) so the
+/// insecure scheme is surfaced in operator logs.
+///
+/// The feature flag is intentionally pejorative: enabling it also
+/// lets a peer-supplied `reply_to` downgrade the reply path to
+/// plaintext, since [`validate`](Self::validate) is the same gate
+/// used at the peer-extract boundary. Production builds MUST leave
+/// `unsafe-http` off.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TransportProtocol {
     pub uri: String,
@@ -67,9 +89,8 @@ mod protocol_as_i32 {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Protocol, D::Error> {
         let raw = i32::deserialize(de)?;
-        Protocol::try_from(raw).map_err(|_| {
-            serde::de::Error::custom(format!("unknown Protocol discriminant {raw}"))
-        })
+        Protocol::try_from(raw)
+            .map_err(|_| serde::de::Error::custom(format!("unknown Protocol discriminant {raw}")))
     }
 }
 
@@ -97,40 +118,74 @@ impl TransportProtocol {
         if self.uri.bytes().any(|b| b < 0x20 || b == 0x7F) {
             return Err(TransportValidationError::ControlCharacters);
         }
-        let required_scheme = match self.protocol {
-            Protocol::Https => "https://",
-        };
-        if !self.uri.starts_with(required_scheme) {
-            return Err(TransportValidationError::SchemeMismatch {
-                expected: required_scheme,
-                protocol: self.protocol,
-            });
+        match self.protocol {
+            Protocol::Https => {
+                if self.uri.starts_with("https://") {
+                    // canonical, secure scheme — nothing to flag
+                } else if cfg!(feature = "unsafe-http")
+                    && self.uri.starts_with("http://")
+                {
+                    // Plaintext is accepted only when the opt-in
+                    // `unsafe-http` Cargo feature is set; flag it
+                    // loudly so an operator running with logs
+                    // enabled notices the insecure scheme.
+                    #[cfg(all(feature = "unsafe-http", feature = "logging"))]
+                    tracing::warn!(
+                        uri = %self.uri,
+                        "accepting plaintext http:// transport URI — \
+                         confidentiality and authenticity are NOT provided \
+                         by the transport layer; use https:// in production",
+                    );
+                } else {
+                    return Err(TransportValidationError::SchemeMismatch {
+                        expected: "https://",
+                        protocol: self.protocol,
+                    });
+                }
+            }
         }
         Ok(())
     }
 }
 
-impl From<&str> for TransportProtocol {
-    /// Build a [`TransportProtocol`] from a URI literal, defaulting
-    /// the protocol enum to [`Protocol::Https`] — the only currently
-    /// defined variant. Call [`TransportProtocol::validate`]
-    /// afterwards to confirm the scheme matches.
-    fn from(uri: &str) -> Self {
-        Self {
+impl TryFrom<&str> for TransportProtocol {
+    type Error = TransportValidationError;
+
+    /// Build a validated [`TransportProtocol`] from a URI literal,
+    /// deriving the [`Protocol`] discriminant from the URI scheme:
+    ///
+    /// - `https://…` → [`Protocol::Https`]
+    /// - `http://…`  → [`Protocol::Https`] (development-only; emits
+    ///   a `tracing::warn!` under the `logging` feature — see the
+    ///   struct-level docs)
+    /// - any other scheme → [`TransportValidationError::SchemeMismatch`]
+    ///
+    /// Also runs the full [`validate`](Self::validate) chain (length
+    /// cap, control-character check, non-empty URI), so a successful
+    /// result is a fully-checked endpoint ready to embed in a
+    /// pairing payload.
+    fn try_from(uri: &str) -> Result<Self, Self::Error> {
+        let tp = Self {
             uri: uri.to_owned(),
             protocol: Protocol::Https,
-        }
+        };
+        tp.validate()?;
+        Ok(tp)
     }
 }
 
-impl From<String> for TransportProtocol {
-    /// Same as [`From<&str>`](TransportProtocol#impl-From<%26str>-for-TransportProtocol):
-    /// defaults the protocol to [`Protocol::Https`].
-    fn from(uri: String) -> Self {
-        Self {
+impl TryFrom<String> for TransportProtocol {
+    type Error = TransportValidationError;
+
+    /// Same as [`TryFrom<&str>`](Self#impl-TryFrom<%26str>-for-TransportProtocol),
+    /// but takes ownership of the URI string instead of cloning it.
+    fn try_from(uri: String) -> Result<Self, Self::Error> {
+        let tp = Self {
             uri,
             protocol: Protocol::Https,
-        }
+        };
+        tp.validate()?;
+        Ok(tp)
     }
 }
 
@@ -226,6 +281,42 @@ impl TransportProtocolExt for derec_proto::TransportProtocol {
     }
 }
 
+/// Conversion trait for the `with_own_transport` builder setter.
+///
+/// Lets callers pass either an already-typed [`TransportProtocol`] or
+/// a URI string (`&str` / `String`) without having to construct the
+/// typed value themselves. Implementations either yield an
+/// already-valid endpoint or report a
+/// [`TransportValidationError`]; the
+/// [`DeRecProtocolBuilder`](crate::protocol::DeRecProtocolBuilder)
+/// stashes the result and surfaces failures from `.build()` so the
+/// setter chain stays infallible.
+pub trait IntoOwnTransport {
+    fn into_own_transport(self) -> Result<TransportProtocol, TransportValidationError>;
+}
+
+impl IntoOwnTransport for TransportProtocol {
+    /// Re-runs [`validate`](TransportProtocol::validate) so a builder
+    /// receiving a hand-crafted [`TransportProtocol::new`] with an
+    /// invalid URI still fails at `.build()` time.
+    fn into_own_transport(self) -> Result<TransportProtocol, TransportValidationError> {
+        self.validate()?;
+        Ok(self)
+    }
+}
+
+impl IntoOwnTransport for &str {
+    fn into_own_transport(self) -> Result<TransportProtocol, TransportValidationError> {
+        TransportProtocol::try_from(self)
+    }
+}
+
+impl IntoOwnTransport for String {
+    fn into_own_transport(self) -> Result<TransportProtocol, TransportValidationError> {
+        TransportProtocol::try_from(self)
+    }
+}
+
 /// Structured error returned by [`TransportProtocol::validate`] and
 /// by [`TryFrom`] conversions from the protobuf wire type. Surfaced
 /// via [`crate::Error::Transport`] and from there into the FFI's
@@ -237,14 +328,10 @@ pub enum TransportValidationError {
     #[error("transport uri is empty")]
     EmptyUri,
 
-    #[error(
-        "transport uri length {got} exceeds cap {limit} bytes — refusing to propagate"
-    )]
+    #[error("transport uri length {got} exceeds cap {limit} bytes — refusing to propagate")]
     UriTooLong { got: usize, limit: usize },
 
-    #[error(
-        "transport uri contains control characters (bytes < 0x20 or = 0x7F are not allowed)"
-    )]
+    #[error("transport uri contains control characters (bytes < 0x20 or = 0x7F are not allowed)")]
     ControlCharacters,
 
     #[error("unknown TransportProtocol.protocol discriminant: {0}")]
@@ -265,16 +352,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn from_str_defaults_to_https() {
-        let tp: TransportProtocol = "https://owner.example.com".into();
+    fn try_from_str_derives_https_and_validates() {
+        let tp = TransportProtocol::try_from("https://owner.example.com").unwrap();
         assert_eq!(tp.uri, "https://owner.example.com");
         assert_eq!(tp.protocol, Protocol::Https);
-        tp.validate().unwrap();
     }
 
     #[test]
-    fn validate_rejects_plaintext_scheme() {
-        let tp: TransportProtocol = "http://owner.example.com".into();
+    fn try_from_string_takes_ownership_and_validates() {
+        let uri = String::from("https://owner.example.com");
+        let tp = TransportProtocol::try_from(uri).unwrap();
+        assert_eq!(tp.protocol, Protocol::Https);
+    }
+
+    #[cfg(feature = "unsafe-http")]
+    #[test]
+    fn try_from_str_accepts_plaintext_http_when_unsafe_http_enabled() {
+        // With the opt-in `unsafe-http` feature on, `http://` is
+        // accepted; the library emits a `tracing::warn!` (under the
+        // `logging` feature) so the insecure scheme is visible in logs.
+        let tp = TransportProtocol::try_from("http://owner.example.com").unwrap();
+        assert_eq!(tp.protocol, Protocol::Https);
+    }
+
+    #[cfg(not(feature = "unsafe-http"))]
+    #[test]
+    fn try_from_str_rejects_plaintext_http_by_default() {
+        // Without the `unsafe-http` feature, `http://` is treated the
+        // same as any other unsupported scheme.
+        assert!(matches!(
+            TransportProtocol::try_from("http://owner.example.com"),
+            Err(TransportValidationError::SchemeMismatch {
+                expected: "https://",
+                protocol: Protocol::Https,
+            })
+        ));
+    }
+
+    #[test]
+    fn try_from_str_rejects_unsupported_scheme() {
+        assert!(matches!(
+            TransportProtocol::try_from("ws://owner.example.com"),
+            Err(TransportValidationError::SchemeMismatch {
+                expected: "https://",
+                protocol: Protocol::Https,
+            })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_unsupported_scheme() {
+        let tp = TransportProtocol::new("ws://owner.example.com", Protocol::Https);
         assert!(matches!(
             tp.validate(),
             Err(TransportValidationError::SchemeMismatch {
@@ -296,9 +424,8 @@ mod tests {
     #[test]
     fn validate_rejects_oversize_uri() {
         let oversize = format!("https://{}", "a".repeat(MAX_TRANSPORT_URI_LEN));
-        let tp: TransportProtocol = oversize.into();
         assert!(matches!(
-            tp.validate(),
+            TransportProtocol::try_from(oversize),
             Err(TransportValidationError::UriTooLong { .. })
         ));
     }
@@ -322,7 +449,7 @@ mod tests {
         // `TryFrom` should reject without needing a follow-up
         // `.validate()` call.
         let proto = derec_proto::TransportProtocol {
-            uri: "http://owner.example.com".to_owned(),
+            uri: "ws://owner.example.com".to_owned(),
             protocol: 0, // Https
         };
         let res: Result<TransportProtocol, _> = (&proto).try_into();
@@ -341,5 +468,40 @@ mod tests {
         let proto: derec_proto::TransportProtocol = original.clone().into();
         let back: TransportProtocol = proto.try_into().unwrap();
         assert_eq!(original, back);
+    }
+
+    #[test]
+    fn into_own_transport_accepts_str_string_and_typed() {
+        let from_str = IntoOwnTransport::into_own_transport("https://owner.example.com").unwrap();
+        assert_eq!(from_str.uri, "https://owner.example.com");
+
+        let from_string =
+            IntoOwnTransport::into_own_transport(String::from("https://owner.example.com"))
+                .unwrap();
+        assert_eq!(from_string.uri, "https://owner.example.com");
+
+        let typed = TransportProtocol::new("https://owner.example.com", Protocol::Https);
+        let from_typed = IntoOwnTransport::into_own_transport(typed.clone()).unwrap();
+        assert_eq!(from_typed, typed);
+    }
+
+    #[test]
+    fn into_own_transport_revalidates_typed_value() {
+        // A caller can hand-build a `TransportProtocol::new(...)` that
+        // skips validation. `IntoOwnTransport` runs it through
+        // `validate` so the setter still catches the bad URI.
+        let malformed = TransportProtocol::new("ws://owner.example.com", Protocol::Https);
+        assert!(matches!(
+            IntoOwnTransport::into_own_transport(malformed),
+            Err(TransportValidationError::SchemeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn into_own_transport_rejects_unsupported_str_scheme() {
+        assert!(matches!(
+            IntoOwnTransport::into_own_transport("ws://owner.example.com"),
+            Err(TransportValidationError::SchemeMismatch { .. })
+        ));
     }
 }

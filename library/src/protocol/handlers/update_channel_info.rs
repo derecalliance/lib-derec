@@ -334,17 +334,20 @@ mod tests {
     use crate::derec_message::current_timestamp;
 
     /// A peer-supplied `UpdateChannelInfoRequest.transport_protocol`
-    /// declaring `Protocol::Https` but carrying an `http://` URI is
-    /// rejected by the handler before any side-effecting action is
-    /// surfaced — the gate runs after the must-update-something
-    /// invariant and before the `ActionRequired` event.
+    /// declaring `Protocol::Https` but carrying a URI with an
+    /// unsupported scheme is rejected by the handler before any
+    /// side-effecting action is surfaced — the gate runs after the
+    /// must-update-something invariant and before the `ActionRequired`
+    /// event. (`http://` is intentionally accepted as a dev-mode
+    /// affordance and is flagged via `tracing::warn!`; see
+    /// `crate::transport`.)
     #[test]
     fn on_request_rejects_scheme_mismatched_transport_protocol() {
         let channel_id = ChannelId(31);
         let shared_key = [11u8; 32];
 
         let malicious_transport = derec_proto::TransportProtocol {
-            uri: "http://attacker.example/inbox".to_owned(),
+            uri: "ws://attacker.example/inbox".to_owned(),
             protocol: derec_proto::Protocol::Https as i32,
         };
 

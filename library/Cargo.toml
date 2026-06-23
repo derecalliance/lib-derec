@@ -57,6 +57,12 @@ console_error_panic_hook = "0.1.7"
 primitives = []
 logging = ["dep:tracing"]
 ffi = []
+# Opt-in development affordance: lets `TransportProtocol::validate`
+# accept plaintext `http://` URIs (still emits `tracing::warn!` under
+# `logging`). OFF by default — production callers MUST keep it off,
+# since enabling it also lets a peer-supplied `reply_to` downgrade
+# the reply path to plaintext.
+unsafe-http = []
 
 [dev-dependencies]
 rand08 = { package = "rand", version = "0.8.5" }
