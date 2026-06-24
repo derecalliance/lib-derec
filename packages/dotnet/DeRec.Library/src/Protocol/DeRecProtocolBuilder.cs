@@ -44,6 +44,7 @@ public sealed class DeRecProtocolBuilder
     private bool _autoRespondOnFailure = false;
     private UnpairAck _unpairAck = UnpairAck.Required;
     private bool _autoReplyTo = false;
+    private AutoAcceptPolicy _autoAccept = new();
     private ulong? _replicaId = null;
 
     /// <summary>
@@ -170,6 +171,21 @@ public sealed class DeRecProtocolBuilder
     }
 
     /// <summary>
+    /// Per-flow auto-accept policy. When a flow's property on the
+    /// policy is <c>true</c>, <see cref="DeRecProtocol.ProcessAsync"/>
+    /// internally accepts the inbound request and emits
+    /// <see cref="AutoAcceptedEvent"/> in place of
+    /// <see cref="ActionRequiredEvent"/>. Read the per-property
+    /// caveats on <see cref="AutoAcceptPolicy"/> before enabling.
+    /// Default: every property <c>false</c>.
+    /// </summary>
+    public DeRecProtocolBuilder WithAutoAccept(AutoAcceptPolicy policy)
+    {
+        _autoAccept = policy ?? throw new ArgumentNullException(nameof(policy));
+        return this;
+    }
+
+    /// <summary>
     /// Configure this node's local <c>replica_id</c>. Required for any
     /// replica-mode pairing. Default: unset.
     /// </summary>
@@ -212,6 +228,7 @@ public sealed class DeRecProtocolBuilder
             autoRespondOnFailure: _autoRespondOnFailure,
             unpairAck: _unpairAck,
             autoReplyTo: _autoReplyTo,
+            autoAccept: _autoAccept,
             replicaId: _replicaId);
     }
 }

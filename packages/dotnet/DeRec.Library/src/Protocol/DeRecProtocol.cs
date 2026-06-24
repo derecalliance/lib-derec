@@ -91,6 +91,7 @@ public sealed class DeRecProtocol : IDisposable
         bool autoRespondOnFailure = false,
         UnpairAck unpairAck = UnpairAck.Required,
         bool autoReplyTo = false,
+        AutoAcceptPolicy? autoAccept = null,
         ulong? replicaId = null)
     {
         SecretId = secretId;
@@ -182,6 +183,19 @@ public sealed class DeRecProtocol : IDisposable
         byte[]? commInfoBytes = null;
         UIntPtr commInfoLen = UIntPtr.Zero;
 
+        var policy = autoAccept ?? new AutoAcceptPolicy();
+        var nativeAutoAccept = new NP.DeRecAutoAcceptPolicy
+        {
+            Pairing = policy.Pairing ? 1u : 0u,
+            PrePair = policy.PrePair ? 1u : 0u,
+            StoreShare = policy.StoreShare ? 1u : 0u,
+            VerifyShare = policy.VerifyShare ? 1u : 0u,
+            Discovery = policy.Discovery ? 1u : 0u,
+            GetShare = policy.GetShare ? 1u : 0u,
+            Unpair = policy.Unpair ? 1u : 0u,
+            UpdateChannelInfo = policy.UpdateChannelInfo ? 1u : 0u,
+        };
+
         var result = NP.derec_protocol_new(
             secretId,
             ref channelCb, ref secretCb, ref shareCb, ref userSecretCb, ref transportCb,
@@ -194,6 +208,7 @@ public sealed class DeRecProtocol : IDisposable
             autoRespondOnFailure ? 1u : 0u,
             (int)unpairAck,
             autoReplyTo ? 1u : 0u,
+            nativeAutoAccept,
             replicaId.HasValue ? 1u : 0u,
             replicaId ?? 0ul);
 
@@ -812,4 +827,66 @@ public enum UnpairAck
 {
     Required = 0,
     NotRequired = 1,
+}
+
+/// <summary>
+/// Per-flow auto-accept policy. Mirrors the Rust
+/// <c>AutoAcceptPolicy</c> struct. When a flow's property is
+/// <c>true</c>, <see cref="DeRecProtocol.ProcessAsync"/> internally
+/// runs the equivalent of <see cref="DeRecProtocol.AcceptAsync"/> for
+/// that flow and emits an <see cref="AutoAcceptedEvent"/> in place of
+/// <see cref="ActionRequiredEvent"/>.
+///
+/// <para>
+/// Default = all properties <c>false</c> (no flow auto-accepted —
+/// every incoming request surfaces as <see cref="ActionRequiredEvent"/>
+/// like today).
+/// </para>
+///
+/// <para>
+/// Per-flow caveats (read these before enabling):
+/// <list type="bullet">
+/// <item><see cref="Pairing"/> covers standard and replica pairing.
+/// Replica pairing remains <c>Pending</c> until both sides run
+/// <see cref="DeRecProtocol.VerifyFingerprintAsync"/>, so auto-accept
+/// is safe there. Standard pairing transitions to <c>Paired</c>
+/// immediately.</item>
+/// <item><see cref="PrePair"/> turns this initiator into a
+/// request-amplification oracle (anyone with the contact's nonce can
+/// elicit a key-publish). Keep off unless you control both ends of
+/// the transport.</item>
+/// <item><see cref="Unpair"/> is destructive — accepting deletes the
+/// local channel record before any UI confirmation.</item>
+/// <item><see cref="UpdateChannelInfo"/> silently overwrites the
+/// channel record with the peer's announced transport / communication
+/// info.</item>
+/// </list>
+/// </para>
+/// </summary>
+public sealed class AutoAcceptPolicy
+{
+    public bool Pairing { get; set; } = false;
+    public bool PrePair { get; set; } = false;
+    public bool StoreShare { get; set; } = false;
+    public bool VerifyShare { get; set; } = false;
+    public bool Discovery { get; set; } = false;
+    public bool GetShare { get; set; } = false;
+    public bool Unpair { get; set; } = false;
+    public bool UpdateChannelInfo { get; set; } = false;
+
+    /// <summary>
+    /// Convenience constructor that flips every flow on. Read the
+    /// per-property caveats above before using in production.
+    /// </summary>
+    public static AutoAcceptPolicy All() => new()
+    {
+        Pairing = true,
+        PrePair = true,
+        StoreShare = true,
+        VerifyShare = true,
+        Discovery = true,
+        GetShare = true,
+        Unpair = true,
+        UpdateChannelInfo = true,
+    };
 }

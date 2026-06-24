@@ -390,6 +390,26 @@ public sealed record NoOpEvent : DeRecEvent
 }
 
 /// <summary>
+/// Emitted by <see cref="DeRecProtocol.ProcessAsync"/> in place of
+/// <see cref="ActionRequiredEvent"/> when the configured
+/// <see cref="AutoAcceptPolicy"/> opts in to the inbound action's flow.
+/// The same event vec also carries the flow's completion events
+/// (<see cref="ShareStoredEvent"/>, <see cref="PairingCompletedEvent"/>,
+/// etc.); use this event purely for observability/audit logging.
+/// </summary>
+public sealed record AutoAcceptedEvent : DeRecEvent
+{
+    public override string EventType => "AutoAccepted";
+    public required string ChannelId { get; init; }
+    /// <summary>
+    /// Same label vocabulary as
+    /// <see cref="ActionRequiredEvent"/>'s underlying action kind
+    /// (<c>"Pairing"</c>, <c>"StoreShare"</c>, …).
+    /// </summary>
+    public required string ActionKind { get; init; }
+}
+
+/// <summary>
 /// Placeholder for any DeRecEvent variant not yet fully marshaled
 /// across the FFI. <see cref="Variant"/> carries the Rust discriminant
 /// name so the app can still log "unknown event" cleanly.
@@ -499,6 +519,11 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                 ChannelId = root.GetProperty("channel_id").GetString()!,
                 Status = root.GetProperty("status").GetInt32(),
                 Memo = root.GetProperty("memo").GetString() ?? string.Empty,
+            },
+            "AutoAccepted" => new AutoAcceptedEvent
+            {
+                ChannelId = root.GetProperty("channel_id").GetString()!,
+                ActionKind = root.GetProperty("action_kind").GetString() ?? string.Empty,
             },
             "NoOp" => new NoOpEvent(),
             "Unmapped" => new UnmappedEvent

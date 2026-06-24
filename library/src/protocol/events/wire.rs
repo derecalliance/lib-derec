@@ -149,6 +149,13 @@ pub(crate) enum Event {
         #[serde(skip_serializing_if = "Option::is_none")]
         share_secret_id: Option<String>,
     },
+    AutoAccepted {
+        channel_id: String,
+        /// Same label vocabulary as `ActionRequired.action_kind`
+        /// (`"Pairing"`, `"StoreShare"`, …) so JS/.NET listeners can
+        /// route on a single string field.
+        action_kind: String,
+    },
     NoOp,
 }
 
@@ -409,6 +416,13 @@ impl Event {
                 status,
                 memo,
             },
+            DeRecEvent::AutoAccepted {
+                channel_id,
+                action_kind,
+            } => Self::AutoAccepted {
+                channel_id: channel_id.0.to_string(),
+                action_kind: pending_action_kind_label(action_kind).to_owned(),
+            },
             DeRecEvent::ActionRequired { channel_id, action } => {
                 let action_kind = action_kind_label(&action).to_owned();
                 let peer_communication_info = extract_peer_communication_info(&action);
@@ -437,15 +451,22 @@ impl Event {
 }
 
 fn action_kind_label(action: &PendingAction) -> &'static str {
-    match action {
-        PendingAction::Pairing { .. } => "Pairing",
-        PendingAction::PrePair { .. } => "PrePair",
-        PendingAction::StoreShare { .. } => "StoreShare",
-        PendingAction::VerifyShare { .. } => "VerifyShare",
-        PendingAction::Discovery { .. } => "Discovery",
-        PendingAction::GetShare { .. } => "GetShare",
-        PendingAction::Unpair { .. } => "Unpair",
-        PendingAction::UpdateChannelInfo { .. } => "UpdateChannelInfo",
+    pending_action_kind_label(action.kind())
+}
+
+pub(crate) fn pending_action_kind_label(
+    kind: crate::protocol::events::PendingActionKind,
+) -> &'static str {
+    use crate::protocol::events::PendingActionKind as K;
+    match kind {
+        K::Pairing => "Pairing",
+        K::PrePair => "PrePair",
+        K::StoreShare => "StoreShare",
+        K::VerifyShare => "VerifyShare",
+        K::Discovery => "Discovery",
+        K::GetShare => "GetShare",
+        K::Unpair => "Unpair",
+        K::UpdateChannelInfo => "UpdateChannelInfo",
     }
 }
 

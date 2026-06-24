@@ -141,6 +141,7 @@ pub struct DeRecProtocolBuilderWasm {
     auto_respond_on_failure: bool,
     unpair_ack: UnpairAck,
     auto_reply_to: bool,
+    auto_accept: crate::protocol::AutoAcceptPolicy,
     replica_id: Option<u64>,
 }
 
@@ -169,6 +170,7 @@ impl DeRecProtocolBuilderWasm {
             auto_respond_on_failure: false,
             unpair_ack: UnpairAck::Required,
             auto_reply_to: false,
+            auto_accept: crate::protocol::AutoAcceptPolicy::default(),
             replica_id: None,
         })
     }
@@ -303,6 +305,48 @@ impl DeRecProtocolBuilderWasm {
         self
     }
 
+    /// Per-flow auto-accept policy.
+    ///
+    /// `policy` shape (all fields optional, default `false`):
+    /// `{ pairing, prePair, storeShare, verifyShare, discovery, getShare, unpair, updateChannelInfo }`.
+    ///
+    /// When a field is `true`, `process()` internally accepts the
+    /// matching incoming request and emits an `AutoAccepted` event in
+    /// place of `ActionRequired`. See the Rust-side
+    /// `AutoAcceptPolicy` rustdoc for the per-flow trade-offs.
+    /// Default: every field `false`.
+    #[wasm_bindgen(js_name = withAutoAccept)]
+    pub fn with_auto_accept(
+        mut self,
+        policy: JsValue,
+    ) -> Result<DeRecProtocolBuilderWasm, JsValue> {
+        #[derive(serde::Deserialize, Default)]
+        #[serde(rename_all = "camelCase", default)]
+        struct AutoAcceptPolicyShape {
+            pairing: bool,
+            pre_pair: bool,
+            store_share: bool,
+            verify_share: bool,
+            discovery: bool,
+            get_share: bool,
+            unpair: bool,
+            update_channel_info: bool,
+        }
+        let parsed: AutoAcceptPolicyShape = serde_wasm_bindgen::from_value(policy)
+            .map_err(|e| js_error("INVALID_AUTO_ACCEPT_POLICY", e.to_string()))?;
+        self.auto_accept = crate::protocol::AutoAcceptPolicy {
+            pairing: parsed.pairing,
+            pre_pair: parsed.pre_pair,
+            store_share: parsed.store_share,
+            verify_share: parsed.verify_share,
+            discovery: parsed.discovery,
+            get_share: parsed.get_share,
+            unpair: parsed.unpair,
+            update_channel_info: parsed.update_channel_info,
+        };
+        Ok(self)
+    }
+
     /// `id` is a JS `bigint` or `number`. Default: unset.
     #[wasm_bindgen(js_name = withReplicaId)]
     pub fn with_replica_id(
@@ -365,7 +409,8 @@ impl DeRecProtocolBuilderWasm {
             .with_timeout(Duration::from_secs(u64::from(self.timeout_in_secs)))
             .with_auto_respond_on_failure(self.auto_respond_on_failure)
             .with_unpair_ack(self.unpair_ack)
-            .with_auto_reply_to(self.auto_reply_to);
+            .with_auto_reply_to(self.auto_reply_to)
+            .with_auto_accept(self.auto_accept);
         if let Some(id) = self.replica_id {
             builder = builder.with_replica_id(id);
         }

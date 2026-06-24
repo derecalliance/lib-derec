@@ -292,6 +292,7 @@ function makeNode(
   endpointUri: string,
   options: {
     autoReplyTo?: boolean;
+    autoAccept?: import("@derec-alliance/nodejs").AutoAcceptPolicy;
     replicaId?: bigint;
     secretId?: bigint;
     threshold?: number;
@@ -314,6 +315,9 @@ function makeNode(
     .withCommunicationInfo({ name });
   if (options.autoReplyTo !== undefined) {
     builder = builder.withAutoReplyTo(options.autoReplyTo);
+  }
+  if (options.autoAccept !== undefined) {
+    builder = builder.withAutoAccept(options.autoAccept);
   }
   if (options.replicaId !== undefined) {
     builder = builder.withReplicaId(options.replicaId);
@@ -1530,8 +1534,78 @@ export async function runProtocolSmoke(): Promise<void> {
   await runReplicaIdWiringSadPathsFlow();
   await runReplicaPairingAndSecretSyncFlow();
   await runReplicaSyncVersionProgressionFlow();
+  await runAutoAcceptFlow();
 
   console.log("━━━ [Protocol] All passed. ━━━\n");
+}
+
+// Drives a sharing round with both helpers configured to auto-accept
+// `storeShare`. Asserts that each helper's `process(...)` directly
+// emits `AutoAccepted` + `ShareStored` (no `ActionRequired` for the
+// auto-accepted action), and that the owner still receives
+// `ShareConfirmed` from both.
+async function runAutoAcceptFlow(): Promise<void> {
+  console.log("\n=== [Protocol] Auto-accept flow ===\n");
+  const ownerSecretId = 0xAAAAn;
+  const policy = { storeShare: true } as const;
+
+  const owner = makeNode("Owner", "https://owner.example.com", {
+    secretId: ownerSecretId,
+  });
+  const helperA = makeNode("HelperA", "https://helper-a.example.com", {
+    secretId: ownerSecretId,
+    autoAccept: policy,
+  });
+  const helperB = makeNode("HelperB", "https://helper-b.example.com", {
+    secretId: ownerSecretId,
+    autoAccept: policy,
+  });
+
+  const channelIdA = 1n;
+  const channelIdB = 2n;
+  await doPair(helperA, owner, channelIdA, "Owner↔HelperA");
+  await doPair(helperB, owner, channelIdB, "Owner↔HelperB");
+
+  await owner.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [
+      { id: new Uint8Array([0xAA]), name: "auto-accept smoke", data: new TextEncoder().encode("nodejs-auto-accept") },
+    ],
+    description: "nodejs auto-accept smoke",
+  });
+  const outbound = owner.transport.drain();
+  if (outbound.length !== 2) {
+    throw new Error(`expected 2 StoreShareRequests, got ${outbound.length}`);
+  }
+
+  const helpers: Array<[Node, string]> = [
+    [helperA, "HelperA"],
+    [helperB, "HelperB"],
+  ];
+  for (let i = 0; i < outbound.length; i++) {
+    const request = outbound[i]!.message;
+    const [helper, hLabel] = helpers[i]!;
+    // With auto-accept on, plain process(...) returns AutoAccepted +
+    // ShareStored directly — no follow-up accept() call is needed.
+    const helperEvents = await helper.protocol.process(request);
+
+    const autoAccepted = requireEvent(helperEvents, "AutoAccepted", hLabel);
+    if (autoAccepted.action_kind !== "StoreShare") {
+      throw new Error(
+        `${hLabel}: AutoAccepted.action_kind=${autoAccepted.action_kind}; expected "StoreShare"`,
+      );
+    }
+    if (helperEvents.find((e: DeRecEvent) => e.type === "ActionRequired")) {
+      throw new Error(`${hLabel}: auto-accept should suppress ActionRequired; got one anyway`);
+    }
+    const stored = requireEvent(helperEvents, "ShareStored", hLabel);
+
+    const response = drainOne(helper, hLabel);
+    const ownerEvents = await owner.protocol.process(response);
+    const confirmed = requireEvent(ownerEvents, "ShareConfirmed", "Owner");
+    console.log(`  [${hLabel}] AutoAccepted(StoreShare) → ShareStored(v=${stored.version}) → ShareConfirmed(v=${confirmed.version})  ✓`);
+  }
+
+  console.log("\n✓ Auto-accept flow passed.\n");
 }
 
 /**

@@ -150,7 +150,9 @@ struct SharingRound {
     started_at: u64,
 }
 
-pub use events::{DeRecEvent, DeRecFlow, PendingAction, UnpairAck};
+pub use events::{
+    AutoAcceptPolicy, DeRecEvent, DeRecFlow, PendingAction, PendingActionKind, UnpairAck,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::utils::now_secs;
@@ -246,6 +248,13 @@ pub struct DeRecProtocol<
     /// to the channel's stored peer endpoint. See `replyTo` on each request
     /// proto for the wire-level semantics.
     pub(crate) auto_reply_to: bool,
+    /// Configured via [`DeRecProtocolBuilder::with_auto_accept`].
+    ///
+    /// When a flow's field on the policy is `true`, [`Self::process`]
+    /// invokes the equivalent of [`Self::accept`] internally for that
+    /// flow and emits [`DeRecEvent::AutoAccepted`] in place of
+    /// [`DeRecEvent::ActionRequired`].
+    pub(crate) auto_accept: AutoAcceptPolicy,
     /// Active sharing round, if any. Populated by `start(ProtectSecret)` and
     /// consumed when all targeted Helpers respond or time out.
     sharing_round: Option<SharingRound>,
@@ -323,6 +332,7 @@ impl<
             communication_info: HashMap::new(),
             auto_respond_on_failure: false,
             auto_reply_to: false,
+            auto_accept: AutoAcceptPolicy::default(),
             sharing_round: None,
             replica_id: None,
             secret_id,
@@ -1125,6 +1135,21 @@ impl<
             source,
         })?;
 
+        // Auto-accept intercept: any `ActionRequired` in `events` whose
+        // action kind the configured `AutoAcceptPolicy` opts into is
+        // replaced in-place with `AutoAccepted` + the same flow events
+        // a manual `accept(action)` would have produced. Errors from
+        // the internal `accept_inner` propagate via `ProcessError`
+        // exactly as a manual accept would surface them through the
+        // caller's own error-handling — keeps the contract uniform.
+        events = self
+            .apply_auto_accept(events)
+            .await
+            .map_err(|source| ProcessError {
+                channel_id: Some(channel_id),
+                source,
+            })?;
+
         // Ordering: deferred-from-start events first (so the app sees them
         // before any inbound-message reactions), then sharing-round
         // timeouts, then unpair timeouts, then events produced by this
@@ -1195,6 +1220,35 @@ impl<
             c.role == derec_proto::SenderKind::ReplicaSource
                 && c.status == crate::protocol::types::ChannelStatus::Paired
         }))
+    }
+
+    /// Walk the post-`process_inner` event list and apply the
+    /// [`AutoAcceptPolicy`]: each `ActionRequired` whose action kind
+    /// the policy opts into is replaced with `AutoAccepted` plus the
+    /// flow events `accept_inner(action)` produces. Other events pass
+    /// through unchanged.
+    async fn apply_auto_accept(
+        &mut self,
+        events: Vec<DeRecEvent>,
+    ) -> Result<Vec<DeRecEvent>> {
+        let mut out = Vec::with_capacity(events.len());
+        for event in events {
+            match event {
+                DeRecEvent::ActionRequired { channel_id, action }
+                    if self.auto_accept.allows(&action) =>
+                {
+                    let action_kind = action.kind();
+                    out.push(DeRecEvent::AutoAccepted {
+                        channel_id,
+                        action_kind,
+                    });
+                    let accept_events = self.accept_inner(action).await?;
+                    out.extend(accept_events);
+                }
+                other => out.push(other),
+            }
+        }
+        Ok(out)
     }
 
     async fn process_inner(

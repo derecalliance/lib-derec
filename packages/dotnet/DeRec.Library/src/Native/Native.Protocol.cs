@@ -181,6 +181,25 @@ internal static class Protocol
         public IntPtr Handle;
     }
 
+    /// <summary>
+    /// Per-flow auto-accept policy. Mirrors the Rust
+    /// <c>DeRecAutoAcceptPolicy</c> repr(C) struct one-to-one. Each
+    /// field is a <c>uint</c> (0 = off, non-zero = on) to match the
+    /// rest of the FFI's bool-as-<c>uint</c> convention.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct DeRecAutoAcceptPolicy
+    {
+        public uint Pairing;
+        public uint PrePair;
+        public uint StoreShare;
+        public uint VerifyShare;
+        public uint Discovery;
+        public uint GetShare;
+        public uint Unpair;
+        public uint UpdateChannelInfo;
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     internal struct DeRecProtocolFingerprintResult
     {
@@ -205,6 +224,7 @@ internal static class Protocol
         uint autoRespondOnFailure,
         int unpairAck,
         uint autoReplyTo,
+        DeRecAutoAcceptPolicy autoAccept,
         uint hasReplicaId,
         ulong replicaId);
 

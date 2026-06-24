@@ -1,6 +1,7 @@
 pub mod assertions;
 pub mod helpers;
 
+pub mod auto_accept;
 pub mod discovery_recovery;
 pub mod multi_tenancy;
 pub mod multi_secret;
@@ -19,4 +20,5 @@ pub async fn run_all() {
     multi_tenancy::run().await;
     multi_secret::run().await;
     replica_sync::run().await;
+    auto_accept::run().await;
 }

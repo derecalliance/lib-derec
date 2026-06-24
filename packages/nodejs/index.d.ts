@@ -301,7 +301,46 @@ export type DeRecEvent =
       status: number;
       memo: string;
     }
+  /** Emitted by `process()` in place of `ActionRequired` when the
+   *  configured {@link AutoAcceptPolicy} opts in to the inbound
+   *  action's flow. The same event vec carries the flow's completion
+   *  events (e.g. `ShareStored`, `PairingCompleted`). Use this purely
+   *  for observability — no further action is required. `action_kind`
+   *  is the same label vocabulary as `ActionRequired.action_kind`
+   *  (`"Pairing"`, `"StoreShare"`, …). */
+  | { type: "AutoAccepted"; channel_id: string; action_kind: string }
   | { type: "NoOp" };
+
+/**
+ * Per-flow auto-accept policy. When a field is `true`, `process()`
+ * internally accepts the matching inbound request and emits
+ * `AutoAccepted` in place of `ActionRequired`. Every field defaults
+ * to `false`.
+ *
+ * Per-field caveats (read before enabling in production):
+ * - `pairing` — covers standard and replica pairing. Replica pairing
+ *   remains `Pending` until both sides run `verifyFingerprint()`, so
+ *   auto-accept is safe for replicas. Standard pairing transitions to
+ *   `Paired` immediately.
+ * - `prePair` — turns the initiator into a request-amplification
+ *   oracle. Anyone who knows a HashedKeys contact's nonce can elicit a
+ *   key-publish response. Keep off unless you control both ends of
+ *   the transport.
+ * - `unpair` — destructive. Accepting deletes the local channel
+ *   record before any UI confirmation.
+ * - `updateChannelInfo` — silently overwrites the channel record with
+ *   the peer's announced transport / communication info.
+ */
+export interface AutoAcceptPolicy {
+  pairing?: boolean;
+  prePair?: boolean;
+  storeShare?: boolean;
+  verifyShare?: boolean;
+  discovery?: boolean;
+  getShare?: boolean;
+  unpair?: boolean;
+  updateChannelInfo?: boolean;
+}
 
 /**
  * Fluent builder for {@link DeRecProtocol}. Mirrors the Rust
@@ -348,6 +387,15 @@ export declare class DeRecProtocolBuilder {
    * elsewhere. Default: false.
    */
   withAutoReplyTo(enabled: boolean): DeRecProtocolBuilder;
+  /**
+   * Per-flow auto-accept policy. When a field is `true`, `process()`
+   * internally accepts the matching inbound request and emits
+   * `AutoAccepted` in place of `ActionRequired`. See
+   * {@link AutoAcceptPolicy} for per-field caveats.
+   *
+   * Default: empty policy (every flow off).
+   */
+  withAutoAccept(policy: AutoAcceptPolicy): DeRecProtocolBuilder;
   /**
    * Stable per-device replica id. Required to participate in any
    * `ReplicaSource` / `ReplicaDestination` pairing. The id must be

@@ -65,6 +65,7 @@ pub struct DeRecProtocolBuilder<
     auto_respond_on_failure: bool,
     unpair_ack: UnpairAck,
     auto_reply_to: bool,
+    auto_accept: crate::protocol::AutoAcceptPolicy,
     replica_id: Option<u64>,
 }
 
@@ -99,6 +100,7 @@ impl
             auto_respond_on_failure: false,
             unpair_ack: UnpairAck::Required,
             auto_reply_to: false,
+            auto_accept: crate::protocol::AutoAcceptPolicy::default(),
             replica_id: None,
         }
     }
@@ -224,6 +226,27 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, Transport, OwnTrans
         self
     }
 
+    /// Per-flow opt-in for auto-accepting inbound requests.
+    ///
+    /// When a flow's field on the policy is `true`,
+    /// [`DeRecProtocol::process`] internally runs the equivalent of
+    /// [`DeRecProtocol::accept`] for that flow and emits
+    /// [`crate::protocol::DeRecEvent::AutoAccepted`] in place of
+    /// [`crate::protocol::DeRecEvent::ActionRequired`] (followed in
+    /// the same event vec by the flow's completion events).
+    ///
+    /// Default: [`crate::protocol::AutoAcceptPolicy::default()`] —
+    /// every field `false`, behaviour identical to today's
+    /// `ActionRequired` flow. See the field-level docs on
+    /// [`crate::protocol::AutoAcceptPolicy`] for the per-flow trade-offs.
+    pub fn with_auto_accept(
+        mut self,
+        policy: crate::protocol::AutoAcceptPolicy,
+    ) -> Self {
+        self.auto_accept = policy;
+        self
+    }
+
     /// Configure this node's local **replica identity**.
     ///
     /// Required to participate in any replica-mode pairing — when set, the
@@ -288,6 +311,7 @@ impl<ShareStore, SecretStore, UserSecretStore, Transport, OwnTransport>
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
+            auto_accept: self.auto_accept,
             replica_id: self.replica_id,
         }
     }
@@ -331,6 +355,7 @@ impl<ChannelStore, SecretStore, UserSecretStore, Transport, OwnTransport>
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
+            auto_accept: self.auto_accept,
             replica_id: self.replica_id,
         }
     }
@@ -374,6 +399,7 @@ impl<ChannelStore, ShareStore, UserSecretStore, Transport, OwnTransport>
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
+            auto_accept: self.auto_accept,
             replica_id: self.replica_id,
         }
     }
@@ -420,6 +446,7 @@ impl<ChannelStore, ShareStore, SecretStore, Transport, OwnTransport>
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
+            auto_accept: self.auto_accept,
             replica_id: self.replica_id,
         }
     }
@@ -463,6 +490,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, OwnTransport>
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
+            auto_accept: self.auto_accept,
             replica_id: self.replica_id,
         }
     }
@@ -517,6 +545,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, Transport>
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
             auto_reply_to: self.auto_reply_to,
+            auto_accept: self.auto_accept,
             replica_id: self.replica_id,
         }
     }
@@ -574,6 +603,7 @@ impl<
         protocol.auto_respond_on_failure = self.auto_respond_on_failure;
         protocol.unpair_ack = self.unpair_ack;
         protocol.auto_reply_to = self.auto_reply_to;
+        protocol.auto_accept = self.auto_accept;
         protocol.replica_id = self.replica_id;
         Ok(protocol)
     }
@@ -588,6 +618,26 @@ mod tests {
     fn with_threshold_accepts_2() {
         let b = DeRecProtocolBuilder::new(0).with_threshold(2);
         assert_eq!(b.threshold, 2);
+    }
+
+    /// Builder round-trip: `with_auto_accept` stores the policy on the
+    /// builder so it lands on the eventual `DeRecProtocol`.
+    #[test]
+    fn with_auto_accept_round_trips_policy() {
+        let policy = crate::protocol::AutoAcceptPolicy {
+            store_share: true,
+            verify_share: true,
+            ..Default::default()
+        };
+        let b = DeRecProtocolBuilder::new(0).with_auto_accept(policy);
+        assert_eq!(b.auto_accept, policy);
+    }
+
+    /// Default builder leaves `auto_accept` empty (every flow off).
+    #[test]
+    fn auto_accept_defaults_to_empty_policy() {
+        let b = DeRecProtocolBuilder::new(0);
+        assert_eq!(b.auto_accept, crate::protocol::AutoAcceptPolicy::default());
     }
 
     /// Higher thresholds (production default and beyond) pass through.

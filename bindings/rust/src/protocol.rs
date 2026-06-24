@@ -45,6 +45,7 @@ pub async fn run_all() {
     run_auto_publish_on_pair_flow().await;
     run_replica_sync_version_progression_flow().await;
     run_replica_group_key_handover_flow().await;
+    run_auto_accept_flow().await;
 }
 
 
@@ -423,6 +424,26 @@ impl Peer {
         Self::with_options(label, uri, 2, true, None, DEFAULT_TEST_SECRET_ID)
     }
 
+    /// Configure a per-flow auto-accept policy on the builder. The
+    /// orchestrator will internally accept any inbound action whose
+    /// flow the policy opts into and emit `AutoAccepted` in place of
+    /// `ActionRequired`.
+    fn with_auto_accept(
+        label: &'static str,
+        uri: &str,
+        policy: derec_library::protocol::AutoAcceptPolicy,
+    ) -> Self {
+        Self::with_full_options(
+            label,
+            uri,
+            2,
+            false,
+            None,
+            DEFAULT_TEST_SECRET_ID,
+            policy,
+        )
+    }
+
     /// Configure a local `replica_id`, enabling this peer to participate in
     /// replica-mode pairings. The id is generated fresh per peer; pass
     /// `Some(id)` from the caller side if you need two peers to share the
@@ -464,6 +485,26 @@ impl Peer {
         replica_id: Option<u64>,
         secret_id: u64,
     ) -> Self {
+        Self::with_full_options(
+            label,
+            uri,
+            threshold,
+            auto_reply_to,
+            replica_id,
+            secret_id,
+            derec_library::protocol::AutoAcceptPolicy::default(),
+        )
+    }
+
+    fn with_full_options(
+        label: &'static str,
+        uri: &str,
+        threshold: usize,
+        auto_reply_to: bool,
+        replica_id: Option<u64>,
+        secret_id: u64,
+        auto_accept: derec_library::protocol::AutoAcceptPolicy,
+    ) -> Self {
         let transport = InProcessTransport::new();
         let mut builder = DeRecProtocolBuilder::new(secret_id)
             .with_channel_store(InMemoryChannelStore::default())
@@ -473,7 +514,8 @@ impl Peer {
             .with_transport(transport.clone())
             .with_own_transport(uri)
             .with_threshold(threshold)
-            .with_auto_reply_to(auto_reply_to);
+            .with_auto_reply_to(auto_reply_to)
+            .with_auto_accept(auto_accept);
         if let Some(id) = replica_id {
             builder = builder.with_replica_id(id);
         }
@@ -2806,4 +2848,102 @@ fn find_replica_event(events: &[DeRecEvent], channel_id: ChannelId) -> Option<Re
         }),
         _ => None,
     })
+}
+
+/// Drives a sharing round end-to-end with the Helper configured to
+/// auto-accept `StoreShare` requests. Asserts that the Helper's event
+/// stream contains `AutoAccepted` + `ShareStored` (no `ActionRequired`
+/// for the sharing action) and that the Owner receives its
+/// `ShareConfirmed` ack.
+///
+/// Note: pairing is still gated by `ActionRequired` because the
+/// `AutoAcceptPolicy` only opts in to `store_share`. A real deployment
+/// that wants the full chain automated would set
+/// `AutoAcceptPolicy::all()` (or flip `pairing: true` explicitly) —
+/// see the policy's rustdoc for the per-flow trade-offs.
+async fn run_auto_accept_flow() {
+    use derec_library::protocol::{AutoAcceptPolicy, PendingActionKind};
+
+    println!("=== Protocol auto-accept flow test ===");
+
+    let channel_a = ChannelId(1);
+    let channel_b = ChannelId(2);
+    let policy = AutoAcceptPolicy {
+        store_share: true,
+        ..Default::default()
+    };
+
+    let mut owner = Peer::with_secret_id("owner", "https://owner.example.com", 99);
+    let mut helper_a =
+        Peer::with_auto_accept("helper-a", "https://helper-a.example.com", policy);
+    let mut helper_b =
+        Peer::with_auto_accept("helper-b", "https://helper-b.example.com", policy);
+
+    pair(&mut owner, &mut helper_a, channel_a).await;
+    pair(&mut owner, &mut helper_b, channel_b).await;
+    println!("Pairing complete — distributing a secret (helpers auto-accept StoreShare)");
+
+    owner
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![UserSecret {
+                id: vec![1, 2, 3],
+                name: "auto-accept smoke secret".to_owned(),
+                data: b"auto-accepted-value".to_vec(),
+            }],
+            description: Some("auto-accept smoke".to_owned()),
+        })
+        .await
+        .expect("owner start(ProtectSecret) failed");
+
+    let events = pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b]).await;
+
+    let auto_accepted_count = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                DeRecEvent::AutoAccepted {
+                    action_kind: PendingActionKind::StoreShare,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        auto_accepted_count, 2,
+        "expected AutoAccepted{{StoreShare}} on both helpers (got {auto_accepted_count})"
+    );
+
+    let action_required_for_store_share = events.iter().any(|e| matches!(
+        e,
+        DeRecEvent::ActionRequired {
+            action: derec_library::protocol::PendingAction::StoreShare { .. },
+            ..
+        }
+    ));
+    assert!(
+        !action_required_for_store_share,
+        "auto-accept should suppress ActionRequired{{StoreShare}}"
+    );
+
+    let stored_a = events
+        .iter()
+        .any(|e| matches!(e, DeRecEvent::ShareStored { channel_id: cid, .. } if *cid == channel_a));
+    let stored_b = events
+        .iter()
+        .any(|e| matches!(e, DeRecEvent::ShareStored { channel_id: cid, .. } if *cid == channel_b));
+    assert!(stored_a, "expected ShareStored on helper-a");
+    assert!(stored_b, "expected ShareStored on helper-b");
+
+    let confirmed = events
+        .iter()
+        .filter(|e| matches!(e, DeRecEvent::ShareConfirmed { .. }))
+        .count();
+    assert_eq!(
+        confirmed, 2,
+        "expected ShareConfirmed from both helpers (got {confirmed})"
+    );
+
+    println!("Protocol auto-accept flow test passed.");
 }

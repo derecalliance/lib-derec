@@ -29,6 +29,80 @@ internal static class Protocol
         RunOrchestratorReplicaIdWiringSadPathsTest();
         RunOrchestratorReplicaPairAndSecretSyncTest();
         RunOrchestratorReplicaSyncVersionProgressionTest();
+        RunOrchestratorAutoAcceptFlowTest();
+    }
+
+    /// <summary>
+    /// Drives a sharing round with both helpers configured via
+    /// <see cref="AutoAcceptPolicy"/> to auto-accept <c>StoreShare</c>.
+    /// Asserts that each helper's <see cref="DeRecProtocol.ProcessAsync"/>
+    /// stream contains <see cref="AutoAcceptedEvent"/> + the standard
+    /// <see cref="ShareStoredEvent"/> (and no
+    /// <see cref="ActionRequiredEvent"/> for the auto-accepted action).
+    /// </summary>
+    private static void RunOrchestratorAutoAcceptFlowTest()
+    {
+        Console.WriteLine("=== Orchestrator auto-accept flow test ===");
+
+        const ulong helperAChannel = 1UL;
+        const ulong helperBChannel = 2UL;
+        const ulong secretId = 0xAAAAUL;
+
+        var policy = new AutoAcceptPolicy { StoreShare = true };
+
+        using var owner = MakeNode("Owner", "https://owner.example.com",
+            new NodeOptions(SecretId: secretId));
+        using var helperA = MakeNode("HelperA", "https://helper-a.example.com",
+            new NodeOptions(SecretId: secretId, AutoAccept: policy));
+        using var helperB = MakeNode("HelperB", "https://helper-b.example.com",
+            new NodeOptions(SecretId: secretId, AutoAccept: policy));
+
+        ulong rekeyedA = DoOrchestratorPair(helperA, helperA.Transport, owner, owner.Transport, helperAChannel);
+        ulong rekeyedB = DoOrchestratorPair(helperB, helperB.Transport, owner, owner.Transport, helperBChannel);
+        Console.WriteLine($"  paired Owner↔HelperA ({rekeyedA}), Owner↔HelperB ({rekeyedB})  ✓");
+
+        owner.Protocol.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+        {
+            Secrets = new[]
+            {
+                new UserSecret { Id = new byte[] { 0xAA }, Name = "auto-accept smoke", Data = Encoding.UTF8.GetBytes("dotnet-auto-accept") },
+            },
+            Description = "dotnet auto-accept smoke",
+        }).GetAwaiter().GetResult();
+
+        var outbound = owner.Transport.DrainAll();
+        if (outbound.Count != 2)
+            throw new InvalidOperationException($"expected 2 StoreShareRequests, got {outbound.Count}");
+
+        var helpers = new[] { (helperA, helperA.Transport, "HelperA"), (helperB, helperB.Transport, "HelperB") };
+        for (int i = 0; i < 2; i++)
+        {
+            var (h, hTx, name) = helpers[i];
+            // With auto-accept on, ProcessAsync alone (no AcceptAsync follow-up)
+            // produces AutoAccepted + ShareStored + the outbound response.
+            var hEvents = h.Protocol.ProcessAsync(outbound[i].Bytes).GetAwaiter().GetResult();
+
+            var autoAccepted = hEvents.OfType<AutoAcceptedEvent>().FirstOrDefault()
+                ?? throw new InvalidOperationException($"{name} did not emit AutoAccepted");
+            if (autoAccepted.ActionKind != "StoreShare")
+                throw new InvalidOperationException(
+                    $"{name} AutoAccepted carried action_kind={autoAccepted.ActionKind}; expected StoreShare");
+
+            if (hEvents.OfType<ActionRequiredEvent>().Any())
+                throw new InvalidOperationException(
+                    $"{name} should not emit ActionRequired when StoreShare is auto-accepted");
+
+            var stored = hEvents.OfType<ShareStoredEvent>().FirstOrDefault()
+                ?? throw new InvalidOperationException($"{name} did not emit ShareStored after auto-accept");
+
+            var response = hTx.DrainOne();
+            var oEvents = owner.Protocol.ProcessAndAcceptAllAsync(response).GetAwaiter().GetResult();
+            var confirmed = oEvents.OfType<ShareConfirmedEvent>().FirstOrDefault()
+                ?? throw new InvalidOperationException($"owner did not emit ShareConfirmed for {name}");
+            Console.WriteLine($"  {name}: AutoAccepted(StoreShare) → ShareStored(v={stored.Version}) → ShareConfirmed(v={confirmed.Version})  ✓");
+        }
+
+        Console.WriteLine("Orchestrator auto-accept flow test passed.");
     }
 
     /// <summary>
@@ -1304,7 +1378,8 @@ internal static class Protocol
         bool? AutoReplyTo = null,
         ulong? ReplicaId = null,
         int? Threshold = null,
-        ulong? SecretId = null);
+        ulong? SecretId = null,
+        AutoAcceptPolicy? AutoAccept = null);
 
     private const int DefaultThreshold = 2;
 
@@ -1345,6 +1420,8 @@ internal static class Protocol
             .WithThreshold(options.Threshold ?? DefaultThreshold);
         if (options.AutoReplyTo is bool autoReplyTo)
             builder = builder.WithAutoReplyTo(autoReplyTo);
+        if (options.AutoAccept is AutoAcceptPolicy policy)
+            builder = builder.WithAutoAccept(policy);
         if (options.ReplicaId is ulong replicaId)
             builder = builder.WithReplicaId(replicaId);
 
