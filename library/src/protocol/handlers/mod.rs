@@ -268,14 +268,22 @@ pub(super) async fn handle<
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
 )]
-pub(in crate::protocol) async fn handle_pairing<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
+#[allow(clippy::too_many_arguments)]
+pub(in crate::protocol) async fn handle_pairing<
+    Ch: DeRecChannelStore,
+    Ss: DeRecSecretStore,
+    T: DeRecTransport,
+>(
     channel_store: &mut Ch,
     secret_store: &mut Ss,
+    transport: &T,
+    communication_info: &HashMap<String, String>,
     message: &DeRecMessage,
     secret_id: u64,
     channel_id: ChannelId,
     pairing_secret: &PairingSecretKeyMaterial,
     replica_id: Option<u64>,
+    parameter_range: Option<&derec_proto::ParameterRange>,
 ) -> Result<Vec<DeRecEvent>> {
     let inner =
         crate::derec_message::extract_inner_pairing_message(&message.message, pairing_secret)?;
@@ -283,12 +291,15 @@ pub(in crate::protocol) async fn handle_pairing<Ch: DeRecChannelStore, Ss: DeRec
     pairing::handle(
         channel_store,
         secret_store,
+        transport,
+        communication_info,
         &inner,
         secret_id,
         channel_id,
         pairing_secret,
         message.trace_id,
         replica_id,
+        parameter_range,
     )
     .await
 }

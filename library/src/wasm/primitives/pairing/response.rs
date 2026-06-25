@@ -51,6 +51,7 @@ pub fn produce(
     request: JsValue,
     secret_key: &[u8],
     communication_info: JsValue,
+    parameter_range: JsValue,
 ) -> Result<JsValue, JsValue> {
     let pairing_sk = deserialize_pairing_secret_key_material(secret_key)?;
     let request: PairRequestMessage = from_js(request)?;
@@ -63,12 +64,20 @@ pub fn produce(
         };
     let communication_info_proto: Option<derec_proto::CommunicationInfo> =
         communication_info.map(Into::into);
+    let parameter_range_proto: Option<derec_proto::ParameterRange> =
+        if parameter_range.is_null() || parameter_range.is_undefined() {
+            None
+        } else {
+            let pr: super::ParameterRange = from_js(parameter_range)?;
+            Some(pr.into())
+        };
 
     let result = response::produce(
         crate::types::ChannelId(channel_id),
         &request_proto,
         &pairing_sk,
         communication_info_proto,
+        parameter_range_proto,
     )
     .map_err(js_error_from_lib)?;
 

@@ -47,6 +47,7 @@ pub async fn run_all() {
     run_replica_group_key_handover_flow().await;
     run_auto_accept_flow().await;
     run_start_pairing_rejects_already_paired_channel().await;
+    run_pairing_rejects_incompatible_parameter_range().await;
 }
 
 
@@ -495,6 +496,34 @@ impl Peer {
             secret_id,
             derec_library::protocol::AutoAcceptPolicy::default(),
         )
+    }
+
+    /// Build a peer whose [`derec_proto::ParameterRange`] is advertised
+    /// in every outbound `PairRequest` / `PairResponse` and validated
+    /// against the peer's range on inbound ones.
+    fn with_parameter_range(
+        label: &'static str,
+        uri: &str,
+        range: derec_proto::ParameterRange,
+    ) -> Self {
+        let transport = InProcessTransport::new();
+        let protocol = DeRecProtocolBuilder::new(DEFAULT_TEST_SECRET_ID)
+            .with_channel_store(InMemoryChannelStore::default())
+            .with_share_store(InMemoryShareStore::default())
+            .with_secret_store(InMemorySecretStore::default())
+            .with_user_secret_store(InMemoryUserSecretStore::default())
+            .with_transport(transport.clone())
+            .with_own_transport(uri)
+            .with_threshold(2)
+            .with_parameter_range(range)
+            .build()
+            .expect("test fixture: builder.build() should succeed");
+        Self {
+            label,
+            uri: uri.to_owned(),
+            protocol,
+            transport,
+        }
     }
 
     fn with_full_options(
@@ -3118,4 +3147,125 @@ async fn run_start_pairing_rejects_already_paired_channel() {
 
     println!("  helper.start(Pairing) on already-Paired channel → Err(ChannelAlreadyPaired), no state change  ✓");
     println!("Protocol start(Pairing) rejects already-Paired channel test passed.");
+}
+
+
+/// End-to-end: incompatible `ParameterRange` advertised by the two
+/// sides causes the responder to auto-send a non-Ok `PairResponse`
+/// (status = `IncompatibleParameterRange`) and surface the typed
+/// `PairingError::IncompatibleParameterRange` locally. The initiator
+/// then receives the rejection envelope and surfaces a typed
+/// `NonOkStatus` error.
+async fn run_pairing_rejects_incompatible_parameter_range() {
+    use derec_library::primitives::pairing::PairingError;
+
+    println!("=== Protocol pairing rejects incompatible parameter range ===");
+
+    fn range(min_share_size: i64, max_share_size: i64) -> derec_proto::ParameterRange {
+        derec_proto::ParameterRange {
+            min_share_size,
+            max_share_size,
+            min_time_between_verifications: 0,
+            max_time_between_verifications: i64::MAX,
+            min_time_between_share_updates: 0,
+            max_time_between_share_updates: i64::MAX,
+            min_unresponsive_deletion_timeout: 0,
+            max_unresponsive_deletion_timeout: i64::MAX,
+            min_unresponsive_deactivation_timeout: 0,
+            max_unresponsive_deactivation_timeout: i64::MAX,
+        }
+    }
+
+    // Owner accepts 1GB..=5GB; helper accepts 10MB..=500MB — no overlap.
+    let mut owner = Peer::with_parameter_range(
+        "owner",
+        "https://owner.example.com",
+        range(1_000_000_000, 5_000_000_000),
+    );
+    let mut helper = Peer::with_parameter_range(
+        "helper",
+        "https://helper.example.com",
+        range(10_000_000, 500_000_000),
+    );
+
+    let channel_id = ChannelId(1);
+    let contact = owner
+        .protocol
+        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys)
+        .await
+        .expect("owner.create_contact failed");
+
+    helper
+        .protocol
+        .start(DeRecFlow::Pairing {
+            kind: SenderKind::Helper,
+            contact,
+            peer_communication_info: std::collections::HashMap::new(),
+        })
+        .await
+        .expect("helper start(Pairing) failed");
+
+    // Helper -> Owner: PairRequest. Owner should auto-reject and queue
+    // a non-Ok PairResponse back to helper.
+    let pair_request = helper.drain();
+    assert_eq!(pair_request.len(), 1);
+    let pair_request_bytes = pair_request.into_iter().next().unwrap().1;
+
+    let owner_result = owner.protocol.process(&pair_request_bytes).await;
+    match owner_result {
+        Err(e) => match e.source {
+            derec_library::Error::Pairing(PairingError::IncompatibleParameterRange {
+                field,
+                local_min,
+                peer_max,
+                ..
+            }) => {
+                assert_eq!(field, "shareSize");
+                assert_eq!(local_min, 1_000_000_000);
+                assert_eq!(peer_max, 500_000_000);
+            }
+            other => panic!("expected IncompatibleParameterRange, got {other:?}"),
+        },
+        Ok(events) => {
+            panic!("expected owner.process to error; got {} events", events.len())
+        }
+    }
+    println!("  owner.process(PairRequest) → Err(IncompatibleParameterRange) with mismatched field surfaced  ✓");
+
+    // Owner queued a rejection PairResponse for the helper. Forward it
+    // and assert the initiator surfaces a typed NonOkStatus.
+    let pair_response = owner.drain();
+    assert_eq!(
+        pair_response.len(),
+        1,
+        "owner must auto-send exactly one rejection envelope after parameter mismatch"
+    );
+    let pair_response_bytes = pair_response.into_iter().next().unwrap().1;
+
+    let helper_result = helper.protocol.process(&pair_response_bytes).await;
+    match helper_result {
+        Err(e) => {
+            let (status, memo) = e.source.as_non_ok_status().unwrap_or_else(|| {
+                panic!("expected PairingError::NonOkStatus on helper; got {:?}", e.source)
+            });
+            assert_eq!(
+                status,
+                derec_proto::StatusEnum::IncompatibleParameterRange as i32,
+                "helper must surface StatusEnum::IncompatibleParameterRange from the rejection"
+            );
+            assert!(
+                memo.contains("shareSize"),
+                "rejection memo should name the offending field; got: {memo}"
+            );
+        }
+        Ok(events) => {
+            panic!(
+                "expected helper.process to error on rejection envelope; got {} events",
+                events.len()
+            )
+        }
+    }
+    println!("  helper.process(PairResponse:rejected) → Err(NonOkStatus(IncompatibleParameterRange))  ✓");
+
+    println!("Protocol pairing rejects incompatible parameter range test passed.");
 }

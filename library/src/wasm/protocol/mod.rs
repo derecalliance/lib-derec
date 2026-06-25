@@ -136,6 +136,7 @@ pub struct DeRecProtocolBuilderWasm {
     auto_reply_to: bool,
     auto_accept: crate::protocol::AutoAcceptPolicy,
     replica_id: Option<u64>,
+    parameter_range: Option<derec_proto::ParameterRange>,
 }
 
 #[wasm_bindgen(js_class = DeRecProtocolBuilder)]
@@ -165,6 +166,7 @@ impl DeRecProtocolBuilderWasm {
             auto_reply_to: false,
             auto_accept: crate::protocol::AutoAcceptPolicy::default(),
             replica_id: None,
+            parameter_range: None,
         })
     }
 
@@ -352,6 +354,58 @@ impl DeRecProtocolBuilderWasm {
         Ok(self)
     }
 
+    /// Declare the local node's acceptable parameter range for pair
+    /// negotiation. `range` is a JS object whose keys mirror the
+    /// `ParameterRange` proto (`minShareSize`, `maxShareSize`,
+    /// `minTimeBetweenVerifications`, ...). Each field is `i64` —
+    /// accept either a number or a `BigInt` on the JS side. Default:
+    /// unset (no constraints advertised, every peer range accepted).
+    #[wasm_bindgen(js_name = withParameterRange)]
+    pub fn with_parameter_range(
+        mut self,
+        range: JsValue,
+    ) -> Result<DeRecProtocolBuilderWasm, JsValue> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct In {
+            #[serde(default)]
+            min_share_size: i64,
+            #[serde(default)]
+            max_share_size: i64,
+            #[serde(default)]
+            min_time_between_verifications: i64,
+            #[serde(default)]
+            max_time_between_verifications: i64,
+            #[serde(default)]
+            min_time_between_share_updates: i64,
+            #[serde(default)]
+            max_time_between_share_updates: i64,
+            #[serde(default)]
+            min_unresponsive_deletion_timeout: i64,
+            #[serde(default)]
+            max_unresponsive_deletion_timeout: i64,
+            #[serde(default)]
+            min_unresponsive_deactivation_timeout: i64,
+            #[serde(default)]
+            max_unresponsive_deactivation_timeout: i64,
+        }
+        let parsed: In = serde_wasm_bindgen::from_value(range)
+            .map_err(|e| js_error("INVALID_PARAMETER_RANGE", e.to_string()))?;
+        self.parameter_range = Some(derec_proto::ParameterRange {
+            min_share_size: parsed.min_share_size,
+            max_share_size: parsed.max_share_size,
+            min_time_between_verifications: parsed.min_time_between_verifications,
+            max_time_between_verifications: parsed.max_time_between_verifications,
+            min_time_between_share_updates: parsed.min_time_between_share_updates,
+            max_time_between_share_updates: parsed.max_time_between_share_updates,
+            min_unresponsive_deletion_timeout: parsed.min_unresponsive_deletion_timeout,
+            max_unresponsive_deletion_timeout: parsed.max_unresponsive_deletion_timeout,
+            min_unresponsive_deactivation_timeout: parsed.min_unresponsive_deactivation_timeout,
+            max_unresponsive_deactivation_timeout: parsed.max_unresponsive_deactivation_timeout,
+        });
+        Ok(self)
+    }
+
     /// Finalize the configuration. Throws if any of the required
     /// setters was not called.
     pub fn build(self) -> Result<DeRecProtocolWasm, JsValue> {
@@ -406,6 +460,9 @@ impl DeRecProtocolBuilderWasm {
             .with_auto_accept(self.auto_accept);
         if let Some(id) = self.replica_id {
             builder = builder.with_replica_id(id);
+        }
+        if let Some(range) = self.parameter_range {
+            builder = builder.with_parameter_range(range);
         }
         let inner = builder.build().map_err(js_error_from_lib)?;
         Ok(DeRecProtocolWasm { inner })

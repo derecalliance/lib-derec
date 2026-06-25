@@ -67,6 +67,7 @@ pub struct DeRecProtocolBuilder<
     auto_reply_to: bool,
     auto_accept: crate::protocol::AutoAcceptPolicy,
     replica_id: Option<u64>,
+    parameter_range: Option<derec_proto::ParameterRange>,
 }
 
 impl
@@ -102,6 +103,7 @@ impl
             auto_reply_to: false,
             auto_accept: crate::protocol::AutoAcceptPolicy::default(),
             replica_id: None,
+            parameter_range: None,
         }
     }
 }
@@ -271,6 +273,22 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, Transport, OwnTrans
         self.replica_id = Some(id);
         self
     }
+
+    /// Declare the local node's acceptable [`ParameterRange`](derec_proto::ParameterRange)
+    /// for pair negotiation.
+    ///
+    /// Embedded in outbound `PairRequest` / `PairResponse` envelopes and
+    /// checked against the peer's range on inbound ones: if any field's
+    /// range fails to intersect (e.g. local `minShareSize` exceeds peer
+    /// `maxShareSize`) the pairing is rejected with
+    /// [`Error::Pairing(PairingError::IncompatibleParameterRange { .. })`](crate::Error::Pairing).
+    ///
+    /// Default: unset — the local side advertises no constraints and
+    /// accepts any peer range.
+    pub fn with_parameter_range(mut self, range: derec_proto::ParameterRange) -> Self {
+        self.parameter_range = Some(range);
+        self
+    }
 }
 
 impl<ShareStore, SecretStore, UserSecretStore, Transport, OwnTransport>
@@ -313,6 +331,7 @@ impl<ShareStore, SecretStore, UserSecretStore, Transport, OwnTransport>
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
             replica_id: self.replica_id,
+            parameter_range: self.parameter_range.clone(),
         }
     }
 }
@@ -357,6 +376,7 @@ impl<ChannelStore, SecretStore, UserSecretStore, Transport, OwnTransport>
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
             replica_id: self.replica_id,
+            parameter_range: self.parameter_range.clone(),
         }
     }
 }
@@ -401,6 +421,7 @@ impl<ChannelStore, ShareStore, UserSecretStore, Transport, OwnTransport>
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
             replica_id: self.replica_id,
+            parameter_range: self.parameter_range.clone(),
         }
     }
 }
@@ -448,6 +469,7 @@ impl<ChannelStore, ShareStore, SecretStore, Transport, OwnTransport>
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
             replica_id: self.replica_id,
+            parameter_range: self.parameter_range.clone(),
         }
     }
 }
@@ -492,6 +514,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, OwnTransport>
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
             replica_id: self.replica_id,
+            parameter_range: self.parameter_range.clone(),
         }
     }
 }
@@ -547,6 +570,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, Transport>
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
             replica_id: self.replica_id,
+            parameter_range: self.parameter_range.clone(),
         }
     }
 }
@@ -605,6 +629,7 @@ impl<
         protocol.auto_reply_to = self.auto_reply_to;
         protocol.auto_accept = self.auto_accept;
         protocol.replica_id = self.replica_id;
+        protocol.parameter_range = self.parameter_range;
         Ok(protocol)
     }
 }

@@ -97,13 +97,17 @@ public static partial class Pairing
 
         /// <summary>
         /// Produces a pairing request envelope from a contact message.
-        /// <paramref name="communicationInfo"/> is optional and may be null.
+        /// <paramref name="communicationInfo"/> and <paramref name="parameterRange"/>
+        /// are optional and may be null. Both must be serialized proto
+        /// bytes (<c>CommunicationInfo</c> and <c>ParameterRange</c>
+        /// respectively).
         /// </summary>
         public static ProduceResult Produce(
             SenderKind kind,
             TransportProtocol transportProtocol,
             ContactMessage contactMessage,
-            byte[]? communicationInfo = null
+            byte[]? communicationInfo = null,
+            byte[]? parameterRange = null
         )
         {
             byte[] transportProtocolBytes = transportProtocol.ToProtoBytes();
@@ -117,7 +121,9 @@ public static partial class Pairing
                     contactMessageBytes,
                     (UIntPtr)contactMessageBytes.Length,
                     communicationInfo,
-                    (UIntPtr)(communicationInfo?.Length ?? 0)
+                    (UIntPtr)(communicationInfo?.Length ?? 0),
+                    parameterRange,
+                    (UIntPtr)(parameterRange?.Length ?? 0)
                 );
 
             try

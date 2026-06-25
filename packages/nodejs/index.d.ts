@@ -927,6 +927,7 @@ export declare const primitives: {
         transport_protocol: TransportProtocol,
         contact_message: ContactMessage,
         communication_info: CommunicationInfo | null,
+        parameter_range: ParameterRange | null,
       ): PairingRequestProduceResult;
 
       extract(envelope_bytes: Uint8Array, secret_key: Uint8Array): { request: PairRequestMessage };
@@ -955,6 +956,7 @@ export declare const primitives: {
         request: PairRequestMessage,
         secret_key: Uint8Array,
         communication_info: CommunicationInfo | null,
+        parameter_range: ParameterRange | null,
       ): PairingResponseProduceResult;
 
       extract(envelope_bytes: Uint8Array, secret_key: Uint8Array): { response: PairResponseMessage };

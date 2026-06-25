@@ -276,6 +276,14 @@ pub struct DeRecProtocol<
     /// initiate or accept a replica-mode pairing returns
     /// [`Error::ReplicaIdNotConfigured`](crate::Error::ReplicaIdNotConfigured).
     pub(crate) replica_id: Option<u64>,
+    /// Configured via [`DeRecProtocolBuilder::with_parameter_range`].
+    ///
+    /// `Some(range)` advertises the local node's acceptable bounds in
+    /// outbound `PairRequest` / `PairResponse` envelopes and validates
+    /// the peer's advertised range on inbound ones. `None` declares no
+    /// constraints — every peer range is accepted and outbound
+    /// envelopes omit the field.
+    pub(crate) parameter_range: Option<derec_proto::ParameterRange>,
     /// Identifier of the single secret this protocol instance manages.
     ///
     /// Set at construction (`DeRecProtocolBuilder::new(secret_id)`) and
@@ -345,6 +353,7 @@ impl<
             auto_accept: AutoAcceptPolicy::default(),
             sharing_round: None,
             replica_id: None,
+            parameter_range: None,
             secret_id,
         })
     }
@@ -975,6 +984,7 @@ impl<
             contact,
             peer_communication_info,
             self.replica_id,
+            self.parameter_range.clone(),
         )
         .await?;
         Ok(Some(channel_id))
@@ -1199,6 +1209,7 @@ impl<
                     kind,
                     trace_id,
                     self.replica_id,
+                    self.parameter_range.clone(),
                 )
                 .await
             }
@@ -1527,12 +1538,15 @@ impl<
                     let events = handlers::pairing::handle(
                         &mut self.channel_store,
                         &mut self.secret_store,
+                        &self.transport,
+                        &self.communication_info,
                         &inner,
                         self.secret_id,
                         channel_id,
                         &pairing_secret,
                         message.trace_id,
                         self.replica_id,
+                        self.parameter_range.as_ref(),
                     )
                     .await?;
                     return Ok(Some(events));
@@ -1558,6 +1572,7 @@ impl<
                         &contact,
                         &resp,
                         self.replica_id,
+                        self.parameter_range.clone(),
                     )
                     .await?;
                     return Ok(Some(events));
@@ -1578,11 +1593,14 @@ impl<
         let events = handlers::handle_pairing(
             &mut self.channel_store,
             &mut self.secret_store,
+            &self.transport,
+            &self.communication_info,
             message,
             self.secret_id,
             channel_id,
             &pairing_secret,
             self.replica_id,
+            self.parameter_range.as_ref(),
         )
         .await?;
         Ok(Some(events))

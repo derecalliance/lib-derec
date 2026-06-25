@@ -133,6 +133,16 @@ public static class DeRecCode
     /// </summary>
     public const int UnexpectedReplicaId = 46;
 
+    /// <summary>
+    /// The peer's <c>ParameterRange</c> does not overlap the locally-configured
+    /// one on some field (e.g. local <c>minShareSize</c> &gt; peer
+    /// <c>maxShareSize</c>). <see cref="DeRecException.Message"/> carries the
+    /// field name and both <c>(min, max)</c> pairs.
+    /// <see cref="DeRecException.Category"/> is
+    /// <see cref="DeRecCategory.Pairing"/>.
+    /// </summary>
+    public const int IncompatibleParameterRange = 47;
+
     public const int EmptyChannels = 60;
     public const int DuplicateChannelId = 61;
     public const int InvalidThreshold = 62;

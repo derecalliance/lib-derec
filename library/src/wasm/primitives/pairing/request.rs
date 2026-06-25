@@ -102,6 +102,7 @@ pub fn produce(
     transport_protocol: JsValue,
     contact_message: JsValue,
     communication_info: JsValue,
+    parameter_range: JsValue,
 ) -> Result<JsValue, JsValue> {
     let sender_kind = get_sender_kind(kind)?;
     let transport_protocol: TransportProtocol = from_js(transport_protocol)?;
@@ -116,12 +117,20 @@ pub fn produce(
         };
     let communication_info_proto: Option<derec_proto::CommunicationInfo> =
         communication_info.map(Into::into);
+    let parameter_range_proto: Option<derec_proto::ParameterRange> =
+        if parameter_range.is_null() || parameter_range.is_undefined() {
+            None
+        } else {
+            let pr: super::ParameterRange = from_js(parameter_range)?;
+            Some(pr.into())
+        };
 
     let result = request::produce(
         sender_kind,
         transport_protocol_proto,
         &contact_message_proto,
         communication_info_proto,
+        parameter_range_proto,
     )
     .map_err(js_error_from_lib)?;
 

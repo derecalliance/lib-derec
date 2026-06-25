@@ -132,6 +132,13 @@ pub const DEREC_CODE_MISSING_REPLICA_ID: i32 = 45;
 /// `CommunicationInfo`. `DEREC_CATEGORY_PAIRING`.
 pub const DEREC_CODE_UNEXPECTED_REPLICA_ID: i32 = 46;
 
+/// The peer's [`derec_proto::ParameterRange`] does not overlap the
+/// locally-configured one on some field (e.g. `local.minShareSize >
+/// peer.maxShareSize`). `DEREC_CATEGORY_PAIRING`. The
+/// [`DeRecError::message`](DeRecError) carries the field name and
+/// both `(min, max)` pairs.
+pub const DEREC_CODE_INCOMPATIBLE_PARAMETER_RANGE: i32 = 47;
+
 pub const DEREC_CODE_EMPTY_CHANNELS: i32 = 60;
 pub const DEREC_CODE_DUPLICATE_CHANNEL_ID: i32 = 61;
 pub const DEREC_CODE_INVALID_THRESHOLD: i32 = 62;
@@ -362,6 +369,9 @@ fn pairing_code(e: &PairingError) -> i32 {
         PairingError::PrePairHashMismatch => DEREC_CODE_PREPAIR_HASH_MISMATCH,
         PairingError::MissingReplicaId { .. } => DEREC_CODE_MISSING_REPLICA_ID,
         PairingError::UnexpectedReplicaId { .. } => DEREC_CODE_UNEXPECTED_REPLICA_ID,
+        PairingError::IncompatibleParameterRange { .. } => {
+            DEREC_CODE_INCOMPATIBLE_PARAMETER_RANGE
+        }
         PairingError::Invariant(_) => DEREC_CODE_INVARIANT,
         PairingError::ContactMessageKeygen { .. } => DEREC_CODE_KEYGEN,
         PairingError::PairRequestKeygen { .. } => DEREC_CODE_KEYGEN,

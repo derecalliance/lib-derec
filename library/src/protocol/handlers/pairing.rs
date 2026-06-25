@@ -25,24 +25,55 @@ use std::collections::HashMap;
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
 )]
 #[allow(clippy::too_many_arguments)]
-pub(in crate::protocol) async fn handle<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
+pub(in crate::protocol) async fn handle<
+    Ch: DeRecChannelStore,
+    Ss: DeRecSecretStore,
+    T: DeRecTransport,
+>(
     channel_store: &mut Ch,
     secret_store: &mut Ss,
+    transport: &T,
+    communication_info: &HashMap<String, String>,
     message: &MessageBody,
     secret_id: u64,
     channel_id: ChannelId,
     pairing_secret: &PairingSecretKeyMaterial,
     inbound_trace_id: u64,
     replica_id: Option<u64>,
+    parameter_range: Option<&derec_proto::ParameterRange>,
 ) -> Result<Vec<DeRecEvent>> {
     match message {
-        MessageBody::PairRequest(request) => on_request(
-            channel_id,
-            request,
-            pairing_secret,
-            inbound_trace_id,
-            replica_id,
-        ),
+        MessageBody::PairRequest(request) => {
+            // Auto-reject incompatible parameter ranges before the app
+            // sees an `ActionRequired::Pairing` it could never accept.
+            // The peer is informed via a non-Ok `PairResponse`; the
+            // local app sees the typed error via `process()`.
+            if let Err(err) = crate::primitives::pairing::parameter_range::check_compatibility(
+                parameter_range,
+                request.parameter_range.as_ref(),
+            ) {
+                reject(
+                    secret_store,
+                    transport,
+                    communication_info,
+                    secret_id,
+                    channel_id,
+                    request,
+                    StatusEnum::IncompatibleParameterRange,
+                    &err.to_string(),
+                    inbound_trace_id,
+                )
+                .await?;
+                return Err(err.into());
+            }
+            on_request(
+                channel_id,
+                request,
+                pairing_secret,
+                inbound_trace_id,
+                replica_id,
+            )
+        }
         MessageBody::PairResponse(response) => {
             on_response(
                 channel_store,
@@ -52,6 +83,7 @@ pub(in crate::protocol) async fn handle<Ch: DeRecChannelStore, Ss: DeRecSecretSt
                 response,
                 pairing_secret,
                 replica_id,
+                parameter_range,
             )
             .await
         }
@@ -72,6 +104,7 @@ pub(in crate::protocol) async fn handle<Ch: DeRecChannelStore, Ss: DeRecSecretSt
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = contact.channel_id))
 )]
+#[allow(clippy::too_many_arguments)]
 pub(in crate::protocol) async fn start<
     Ch: DeRecChannelStore,
     Ss: DeRecSecretStore,
@@ -87,6 +120,7 @@ pub(in crate::protocol) async fn start<
     contact: ContactMessage,
     peer_communication_info: HashMap<String, String>,
     replica_id: Option<u64>,
+    parameter_range: Option<derec_proto::ParameterRange>,
 ) -> Result<u64> {
     // Fail fast at flow-entry — refusing here saves the scanner from
     // sending a PrePairRequest only to discover (on the response) it can't
@@ -131,6 +165,7 @@ pub(in crate::protocol) async fn start<
             endpoint,
             kind,
             replica_id_to_inject,
+            parameter_range,
         )
         .await
     }
@@ -156,12 +191,19 @@ pub(in crate::protocol) async fn accept<
     kind: SenderKind,
     trace_id: u64,
     replica_id: Option<u64>,
+    parameter_range: Option<derec_proto::ParameterRange>,
 ) -> Result<Vec<DeRecEvent>> {
     // Gate: replica-mode pairings require a locally-configured replica id.
     let replica_id_to_inject = require_replica_id_for_kind(kind, replica_id)?;
 
     let comm_info = build_communication_info(communication_info, replica_id_to_inject);
-    let resp = response::produce(channel_id, request, pairing_secret, comm_info)?;
+    let resp = response::produce(
+        channel_id,
+        request,
+        pairing_secret,
+        comm_info,
+        parameter_range,
+    )?;
 
     secret_store
         .save(
@@ -328,6 +370,7 @@ fn on_request(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
 )]
+#[allow(clippy::too_many_arguments)]
 async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     channel_store: &mut Ch,
     secret_store: &mut Ss,
@@ -336,7 +379,14 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     response: &derec_proto::PairResponseMessage,
     pairing_secret: &PairingSecretKeyMaterial,
     replica_id: Option<u64>,
+    parameter_range: Option<&derec_proto::ParameterRange>,
 ) -> Result<Vec<DeRecEvent>> {
+    // Gate: peer's advertised ParameterRange must overlap ours.
+    crate::primitives::pairing::parameter_range::check_compatibility(
+        parameter_range,
+        response.parameter_range.as_ref(),
+    )?;
+
     let contact = match secret_store
         .load(secret_id, channel_id, SecretKind::PairingContact)
         .await?
@@ -437,6 +487,7 @@ pub(in crate::protocol) async fn on_pre_pair_response<
     original_contact: &ContactMessage,
     response: &PrePairResponseMessage,
     replica_id: Option<u64>,
+    parameter_range: Option<derec_proto::ParameterRange>,
 ) -> Result<Vec<DeRecEvent>> {
     // `process_pre_pair` rejects malformed or non-Ok responses — surface
     // the status mismatch as an event the app can react to, propagate the
@@ -487,7 +538,13 @@ pub(in crate::protocol) async fn on_pre_pair_response<
 
     let replica_id_to_inject = require_replica_id_for_kind(role, replica_id)?;
     let comm_info = build_communication_info(communication_info, replica_id_to_inject);
-    let result = request::produce(role, own_transport.clone(), &filled_in_contact, comm_info)?;
+    let result = request::produce(
+        role,
+        own_transport.clone(),
+        &filled_in_contact,
+        comm_info,
+        parameter_range.clone(),
+    )?;
 
     // Persist the scanner's pairing secret + overwrite the stored
     // contact with the filled-in version. `pair_response::process`
@@ -657,6 +714,7 @@ pub(in crate::protocol) fn derive_peer_kind(local_kind: SenderKind) -> SenderKin
 /// initiator's public keys inline on the contact, so it can go straight
 /// to building the encrypted `PairRequest` envelope.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn start_inlined_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRecTransport>(
     channel_store: &mut Ch,
     secret_store: &mut Ss,
@@ -670,11 +728,18 @@ async fn start_inlined_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRe
     endpoint: TransportProtocol,
     kind: SenderKind,
     replica_id_to_inject: Option<u64>,
+    parameter_range: Option<derec_proto::ParameterRange>,
 ) -> Result<u64> {
     reject_start_on_paired_channel(channel_store, secret_id, channel_id).await?;
 
     let comm_info = build_communication_info(communication_info, replica_id_to_inject);
-    let result = request::produce(kind, own_transport.clone(), &contact, comm_info)?;
+    let result = request::produce(
+        kind,
+        own_transport.clone(),
+        &contact,
+        comm_info,
+        parameter_range,
+    )?;
 
     secret_store
         .save(
