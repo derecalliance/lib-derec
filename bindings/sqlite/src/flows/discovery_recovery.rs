@@ -188,15 +188,30 @@ pub async fn run() {
             _ => None,
         })
         .expect("expected SecretRecovered on owner");
-    assert!(
-        contains_subslice(&recovered, &secret_payload),
-        "recovered secret must contain the original user-secret bytes"
+
+    let recovered_user_secret = recovered
+        .secrets
+        .iter()
+        .find(|s| s.id == vec![9_u8, 9, 9])
+        .expect("recovered Secret must include the UserSecret with the original id");
+    assert_eq!(
+        recovered_user_secret.data, secret_payload,
+        "recovered UserSecret.data must round-trip through SQLite + VSS"
     );
-    println!("  SecretRecovered: original bytes round-trip through SQLite + VSS  ✓");
+    assert_eq!(
+        recovered_user_secret.name, "wallet seed",
+        "recovered UserSecret.name must round-trip"
+    );
+    println!(
+        "  SecretRecovered → UserSecret '{}' ({}B) round-trips through SQLite + VSS  ✓",
+        recovered_user_secret.name,
+        recovered_user_secret.data.len()
+    );
 
     println!("✓ Discovery + Recovery flow passed.\n");
 }
 
+#[allow(dead_code)]
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || haystack.len() < needle.len() {
         return false;

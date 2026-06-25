@@ -164,7 +164,11 @@ pub(in crate::protocol) async fn accept<
     let resp = response::produce(channel_id, request, pairing_secret, comm_info)?;
 
     secret_store
-        .save(secret_id, channel_id, SecretValue::SharedKey(resp.shared_key))
+        .save(
+            secret_id,
+            channel_id,
+            SecretValue::SharedKey(resp.shared_key),
+        )
         .await?;
 
     let peer_transport = resp.peer_transport_protocol.clone();
@@ -522,6 +526,8 @@ async fn start_inlined_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRe
     kind: SenderKind,
     replica_id_to_inject: Option<u64>,
 ) -> Result<u64> {
+    reject_start_on_paired_channel(channel_store, secret_id, channel_id).await?;
+
     let comm_info = build_communication_info(communication_info, replica_id_to_inject);
     let result = request::produce(kind, own_transport.clone(), &contact, comm_info)?;
 
@@ -584,6 +590,8 @@ async fn start_hashed_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRec
     endpoint: TransportProtocol,
     kind: SenderKind,
 ) -> Result<u64> {
+    reject_start_on_paired_channel(channel_store, secret_id, channel_id).await?;
+
     let result = request::produce_pre_pair_request(own_transport.clone(), &contact)?;
 
     // Persist the original HashedKeys contact so the eventual
@@ -981,6 +989,19 @@ fn is_replica_kind(kind: SenderKind) -> bool {
     )
 }
 
+async fn reject_start_on_paired_channel<Ch: DeRecChannelStore>(
+    channel_store: &Ch,
+    secret_id: u64,
+    channel_id: ChannelId,
+) -> Result<()> {
+    if let Some(channel) = channel_store.load(secret_id, channel_id).await? {
+        if channel.status == crate::protocol::types::ChannelStatus::Paired {
+            return Err(Error::ChannelAlreadyPaired { channel_id });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1175,5 +1196,133 @@ mod tests {
     fn require_replica_id_for_kind_errors_when_replica_unconfigured() {
         let err = require_replica_id_for_kind(SenderKind::ReplicaSource, None).unwrap_err();
         assert!(matches!(err, Error::ReplicaIdNotConfigured));
+    }
+
+    use crate::protocol::traits::ChannelStoreFuture;
+    use crate::protocol::types::{Channel, ChannelStatus};
+
+    /// Single-channel mock that returns whatever record was seeded at
+    /// construction. All mutating methods are stubbed because the
+    /// helper under test only ever calls `load`.
+    struct FixedChannelStore {
+        seeded: Option<Channel>,
+    }
+
+    impl DeRecChannelStore for FixedChannelStore {
+        fn load(&self, _: u64, _: ChannelId) -> ChannelStoreFuture<'_, Option<Channel>> {
+            let v = self.seeded.clone();
+            Box::pin(std::future::ready(Ok(v)))
+        }
+        fn save(&mut self, _: u64, _: Channel) -> ChannelStoreFuture<'_, ()> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+        fn remove(&mut self, _: u64, _: ChannelId) -> ChannelStoreFuture<'_, bool> {
+            Box::pin(std::future::ready(Ok(false)))
+        }
+        fn channels(&self, _: u64) -> ChannelStoreFuture<'_, Vec<Channel>> {
+            Box::pin(std::future::ready(Ok(Vec::new())))
+        }
+        fn link_channel(
+            &mut self,
+            _: u64,
+            _: ChannelId,
+            _: ChannelId,
+        ) -> ChannelStoreFuture<'_, ()> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+        fn linked_channels(
+            &self,
+            _: u64,
+            cid: ChannelId,
+        ) -> ChannelStoreFuture<'_, Vec<ChannelId>> {
+            Box::pin(std::future::ready(Ok(vec![cid])))
+        }
+    }
+
+    fn fake_channel(status: ChannelStatus, role: SenderKind) -> Channel {
+        Channel {
+            id: ChannelId(1),
+            transport: TransportProtocol {
+                uri: "https://example.com".to_owned(),
+                protocol: 0,
+            },
+            communication_info: HashMap::new(),
+            status,
+            created_at: 1_700_000_000,
+            role,
+            replica_id: None,
+        }
+    }
+
+    /// Spin up a single-threaded tokio runtime and drive an async
+    /// closure to completion. Library tests can't use `#[tokio::test]`
+    /// because the crate pulls tokio in with `default-features = false,
+    /// features = ["rt"]` — no `macros` feature.
+    fn run_async<F: std::future::Future<Output = ()>>(f: F) {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime")
+            .block_on(f)
+    }
+
+    #[test]
+    fn reject_start_on_paired_channel_errors_when_channel_already_paired() {
+        run_async(async {
+            let store = FixedChannelStore {
+                seeded: Some(fake_channel(ChannelStatus::Paired, SenderKind::Helper)),
+            };
+            let err = reject_start_on_paired_channel(&store, 42, ChannelId(1))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::ChannelAlreadyPaired { channel_id } if channel_id == ChannelId(1)),
+                "expected Error::ChannelAlreadyPaired for ChannelId(1), got {err:?}"
+            );
+        });
+    }
+
+    /// `Pending` is a legitimate retry state (handshake never finished) —
+    /// re-running `start` must be allowed so the caller can resend a
+    /// PairRequest with fresh secret material.
+    #[test]
+    fn reject_start_on_paired_channel_allows_pending_retry() {
+        run_async(async {
+            let store = FixedChannelStore {
+                seeded: Some(fake_channel(ChannelStatus::Pending, SenderKind::Helper)),
+            };
+            reject_start_on_paired_channel(&store, 42, ChannelId(1))
+                .await
+                .expect("Pending channel must be accepted as a retry candidate");
+        });
+    }
+
+    /// First-time pairing — no record exists yet.
+    #[test]
+    fn reject_start_on_paired_channel_allows_when_no_channel_record() {
+        run_async(async {
+            let store = FixedChannelStore { seeded: None };
+            reject_start_on_paired_channel(&store, 42, ChannelId(1))
+                .await
+                .expect("absent channel record must be accepted");
+        });
+    }
+
+    /// Replica `Paired` is also rejected — replica pairings transition
+    /// to `Paired` after fingerprint verification, and once they're
+    /// there the same overwrite-corruption applies.
+    #[test]
+    fn reject_start_on_paired_channel_errors_for_paired_replica() {
+        run_async(async {
+            let store = FixedChannelStore {
+                seeded: Some(fake_channel(
+                    ChannelStatus::Paired,
+                    SenderKind::ReplicaSource,
+                )),
+            };
+            let err = reject_start_on_paired_channel(&store, 42, ChannelId(1))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::ChannelAlreadyPaired { .. }));
+        });
     }
 }

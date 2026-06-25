@@ -54,7 +54,7 @@ use crate::{
     protocol::{
         DeRecChannelStore, DeRecFlow, DeRecProtocol, DeRecProtocolBuilder, DeRecSecretStore,
         DeRecShareStore, SecretValue, Share, UnpairAck,
-        types::{Channel, ChannelStatus, Secret, Target, UserSecret},
+        types::{Channel, ChannelStatus, Target, UserSecret},
     },
     types::ChannelId,
     wasm::{
@@ -62,9 +62,6 @@ use crate::{
         ts_bindings_utils::{js_error, js_error_from_lib},
     },
 };
-use derec_proto::DeRecSecret;
-use prost::Message;
-use serde::Serialize;
 use crate::wasm::primitives::pairing::ContactMessage as PairingContactMessage;
 use derec_proto::{SenderKind, TransportProtocol};
 use js_sys::{Array, Uint8Array};
@@ -103,7 +100,7 @@ type WasmProtocol = DeRecProtocol<
 /// | `ShareConfirmed`   | `channel_id: string`, `version: number`                |
 /// | `ShareVerified`    | `channel_id: string`, `version: number`                |
 /// | `SecretsDiscovered`| `channel_id: string`, `secrets: SecretVersionEntry[]`  |
-/// | `SecretRecovered`  | `secret: Uint8Array`                                   |
+/// | `SecretRecovered`  | `secret: { helpers, secrets, replicas, owner_replica_id }` (same nested shape as `ReplicaSecretReceived.secret`) |
 /// | `NoOp`             | _(none)_                                               |
 ///
 /// `SecretVersionEntry = { secret_id: bigint, versions: { version: number, description: string }[] }`
@@ -667,103 +664,15 @@ impl DeRecProtocolWasm {
     }
 }
 
-/// Decode the bytes carried by a [`DeRecEvent::SecretRecovered`] event into
-/// the structured [`Secret`] — the *same* shape the owner originally
-/// protected. The reconstructed bytes are protobuf, so the FE can't
-/// `TextDecoder.decode()` them; this is the canonical unwrapper.
-///
-/// The wire layering is:
-/// ```text
-/// raw share fragments → VSS reconstruct → DeRecSecret { secret_data: secret_bytes }
-///                                                              └─ Secret { helpers, secrets }
-/// ```
-///
-/// Returns a JS object:
-/// ```ts
-/// {
-///   helpers: Array<{
-///     channelId: string,           // u64 as decimal string
-///     transportUri: string,
-///     communicationInfo: Record<string, string>,
-///     sharedKey: Uint8Array,       // 32 bytes
-///   }>,
-///   secrets: Array<{
-///     id: Uint8Array,              // app-defined identifier (binary)
-///     name: string,
-///     data: Uint8Array,            // raw secret bytes (apps that store text decode with TextDecoder)
-///   }>,
-/// }
-/// ```
-#[wasm_bindgen(js_name = "decodeRecoveredSecret")]
-pub fn decode_recovered_secret(bytes: &[u8]) -> Result<JsValue, JsValue> {
-    let derec = DeRecSecret::decode(bytes).map_err(|e| {
-        js_error("DECODE_ERROR", format!("DeRecSecret decode failed: {e}"))
-    })?;
-    let secret = Secret::decode(derec.secret_data.as_slice()).map_err(|e| {
-        js_error("DECODE_ERROR", format!("Secret decode failed: {e}"))
-    })?;
-
-    // Note: `Vec<u8>` serializes as `Array<number>` by default via
-    // serde-wasm-bindgen (matches how `SecretRecovered.secret` is exposed
-    // elsewhere — the FE converts to `Uint8Array` at the boundary).
-    #[derive(serde::Serialize)]
-    struct HelperJs {
-        #[serde(rename = "channelId")]
-        channel_id: String,
-        #[serde(rename = "transportUri")]
-        transport_uri: String,
-        #[serde(rename = "communicationInfo")]
-        communication_info: HashMap<String, String>,
-        #[serde(rename = "sharedKey")]
-        shared_key: Vec<u8>,
-    }
-    #[derive(serde::Serialize)]
-    struct UserSecretJs {
-        id: Vec<u8>,
-        name: String,
-        data: Vec<u8>,
-    }
-    #[derive(serde::Serialize)]
-    struct SecretJs {
-        helpers: Vec<HelperJs>,
-        secrets: Vec<UserSecretJs>,
-    }
-
-    let payload = SecretJs {
-        helpers: secret
-            .helpers
-            .into_iter()
-            .map(|h| HelperJs {
-                channel_id: h.channel_id.to_string(),
-                transport_uri: h.transport_uri,
-                communication_info: h.communication_info,
-                shared_key: h.shared_key,
-            })
-            .collect(),
-        secrets: secret
-            .secrets
-            .into_iter()
-            .map(|s| UserSecretJs {
-                id: s.id,
-                name: s.name,
-                data: s.data,
-            })
-            .collect(),
-    };
-
-    // `Serializer::new().serialize_maps_as_objects(true)` ensures the
-    // `communicationInfo` HashMap comes through as a plain JS object rather
-    // than a `Map` instance.
-    payload
-        .serialize(&serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true))
-        .map_err(|e: serde_wasm_bindgen::Error| js_error("SERIALIZE_ERROR", e.to_string()))
-}
-
 /// Re-populate a set of empty stores from a recovered [`Secret`], so the
 /// caller can resume in the "normal" (non-recovery) namespace as if the
 /// secret had been distributed by this device originally.
 ///
-/// For each helper in the decoded secret, three records are written:
+/// `recoveredSecret` is the **typed `Secret` object** carried by the
+/// `SecretRecovered` event (`{ helpers, secrets, replicas,
+/// ownerReplicaId }`), passed verbatim — no protobuf encode required.
+///
+/// For each helper in the recovered secret, three records are written:
 ///   - `channel_store.save(Channel { ... })` — the paired channel record,
 ///     including the app's `communication_info` carried in the secret.
 ///   - `secret_store.save(channel_id, SharedKey(...))` — the negotiated
@@ -783,7 +692,7 @@ pub async fn restore_from_recovered_secret(
     channel_store: JsValue,
     secret_store: JsValue,
     share_store: JsValue,
-    recovered_bytes: &[u8],
+    recovered_secret: JsValue,
     secret_id: &str,
     version: u32,
 ) -> Result<(), JsValue> {
@@ -791,12 +700,24 @@ pub async fn restore_from_recovered_secret(
         js_error("INVALID_SECRET_ID", format!("secret_id must be a u64 decimal string: {e}"))
     })?;
 
-    let derec = DeRecSecret::decode(recovered_bytes).map_err(|e| {
-        js_error("DECODE_ERROR", format!("DeRecSecret decode failed: {e}"))
-    })?;
-    let restored = Secret::decode(derec.secret_data.as_slice()).map_err(|e| {
-        js_error("DECODE_ERROR", format!("Secret decode failed: {e}"))
-    })?;
+    // Mirror the JS-side shape that `SecretRecovered.secret` exposes
+    // (`SecretWire` in `events/wire.rs`). serde-wasm-bindgen converts
+    // the camelCase JS keys back into the snake_case fields the
+    // wire shape uses.
+    #[derive(serde::Deserialize)]
+    struct HelperInput {
+        channel_id: String,
+        transport_uri: String,
+        #[serde(default)]
+        communication_info: HashMap<String, String>,
+        shared_key: Vec<u8>,
+    }
+    #[derive(serde::Deserialize)]
+    struct SecretInput {
+        helpers: Vec<HelperInput>,
+    }
+    let restored: SecretInput = serde_wasm_bindgen::from_value(recovered_secret)
+        .map_err(|e| js_error("INVALID_RECOVERED_SECRET", e.to_string()))?;
 
     let mut ch_store = JsChannelStore(channel_store);
     let mut sec_store = JsSecretStore(secret_store);
@@ -808,14 +729,20 @@ pub async fn restore_from_recovered_secret(
     const TRANSPORT_HTTPS: i32 = 0;
 
     for helper in restored.helpers {
-        let channel_id = ChannelId(helper.channel_id);
+        let channel_id_u64 = helper.channel_id.parse::<u64>().map_err(|e| {
+            js_error(
+                "INVALID_CHANNEL_ID",
+                format!("channel_id must be a u64 decimal string: {e}"),
+            )
+        })?;
+        let channel_id = ChannelId(channel_id_u64);
 
         let shared_key: [u8; 32] = helper.shared_key.as_slice().try_into().map_err(|_| {
             js_error(
                 "INVALID_SHARED_KEY",
                 format!(
                     "shared_key for channel {} must be 32 bytes, got {}",
-                    helper.channel_id,
+                    channel_id_u64,
                     helper.shared_key.len()
                 ),
             )

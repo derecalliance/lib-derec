@@ -46,6 +46,7 @@ pub async fn run_all() {
     run_replica_sync_version_progression_flow().await;
     run_replica_group_key_handover_flow().await;
     run_auto_accept_flow().await;
+    run_start_pairing_rejects_already_paired_channel().await;
 }
 
 
@@ -1814,13 +1815,27 @@ async fn run_discovery_and_recovery_flow() {
         })
         .expect("expected SecretRecovered event on owner");
 
-    // The reconstructed payload is the encoded secret bag; assert the original
-    // secret bytes round-trip inside it.
-    assert!(
-        contains_subslice(&recovered, &secret_data),
-        "recovered secret bag must contain the original secret bytes"
+    // The library now decodes the protect-side wrapping for us — assert the
+    // recovered `Secret` carries the typed `UserSecret` the owner originally
+    // protected (id + name + data all round-trip).
+    let recovered_user_secret = recovered
+        .secrets
+        .iter()
+        .find(|s| s.id == secret_id_bytes)
+        .expect("recovered Secret must include the UserSecret with the original id");
+    assert_eq!(
+        recovered_user_secret.data, secret_data,
+        "recovered UserSecret.data must match the original protected bytes"
     );
-    println!("Owner successfully reconstructed the secret.");
+    assert_eq!(
+        recovered_user_secret.name, "wallet seed",
+        "recovered UserSecret.name must round-trip"
+    );
+    println!(
+        "Owner successfully reconstructed the secret: UserSecret '{}' ({}B) ✓",
+        recovered_user_secret.name,
+        recovered_user_secret.data.len()
+    );
 
     println!("Protocol discovery & recovery flow test passed.");
 }
@@ -2946,4 +2961,116 @@ async fn run_auto_accept_flow() {
     );
 
     println!("Protocol auto-accept flow test passed.");
+}
+
+/// Regression: `start(Pairing, Helper, fresh_contact)` on a channel
+/// id that already finished pairing must error with
+/// `Error::InvalidInput` rather than silently overwriting the
+/// completed-pair state. Guards the defensive
+/// `reject_start_on_paired_channel` check in
+/// `handlers::pairing::start_inlined_keys` / `start_hashed_keys`.
+async fn run_start_pairing_rejects_already_paired_channel() {
+    use derec_library::protocol::types::ChannelStatus;
+    use derec_library::protocol::AutoAcceptPolicy;
+
+    println!("=== Protocol start(Pairing) rejects already-Paired channel ===");
+
+    let channel_id = ChannelId(1000);
+    let policy = AutoAcceptPolicy::all();
+    let mut owner = Peer::with_auto_accept("owner", "https://owner.example.com", policy);
+    let mut helper = Peer::with_auto_accept("helper", "https://helper.example.com", policy);
+
+    // Phase 1: normal pairing → channel(Paired), SharedKey, no PairingSecret/PairingContact.
+    pair(&mut owner, &mut helper, channel_id).await;
+    let secret_id = helper.protocol.secret_id();
+
+    let channel_post_pair = helper
+        .protocol
+        .channel_store
+        .load(secret_id, channel_id)
+        .await
+        .expect("load")
+        .expect("channel exists");
+    assert_eq!(channel_post_pair.status, ChannelStatus::Paired);
+
+    // Phase 2: ask owner for a NEW contact on the same channel_id and
+    // try to re-run helper.start(Pairing). The defensive check at the
+    // top of `start_inlined_keys` should refuse with
+    // `Error::ChannelAlreadyPaired` rather than mutating local state.
+    let fresh_contact = owner
+        .protocol
+        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys)
+        .await
+        .expect("owner.create_contact (round 2)");
+    let result = helper
+        .protocol
+        .start(DeRecFlow::Pairing {
+            kind: SenderKind::Helper,
+            contact: fresh_contact,
+            peer_communication_info: std::collections::HashMap::new(),
+        })
+        .await;
+
+    match result {
+        Err(derec_library::Error::ChannelAlreadyPaired { channel_id: cid }) => {
+            assert_eq!(cid, channel_id, "ChannelAlreadyPaired must carry the offending channel id");
+        }
+        other => panic!(
+            "expected Err(ChannelAlreadyPaired) on start(Pairing) for already-Paired channel; got {other:?}"
+        ),
+    }
+
+    // State must be unchanged from after Phase 1.
+    let channel_post_double_start = helper
+        .protocol
+        .channel_store
+        .load(secret_id, channel_id)
+        .await
+        .expect("load")
+        .expect("channel exists");
+    let shared_key = helper
+        .protocol
+        .secret_store
+        .load(secret_id, channel_id, SecretKind::SharedKey)
+        .await
+        .expect("load SharedKey");
+    let pairing_secret = helper
+        .protocol
+        .secret_store
+        .load(secret_id, channel_id, SecretKind::PairingSecret)
+        .await
+        .expect("load PairingSecret");
+    let pairing_contact = helper
+        .protocol
+        .secret_store
+        .load(secret_id, channel_id, SecretKind::PairingContact)
+        .await
+        .expect("load PairingContact");
+
+    assert_eq!(
+        channel_post_double_start.status,
+        ChannelStatus::Paired,
+        "channel.status must remain Paired after the rejected start"
+    );
+    assert!(shared_key.is_some(), "SharedKey must remain after the rejected start");
+    assert!(
+        pairing_secret.is_none(),
+        "PairingSecret must remain absent after the rejected start"
+    );
+    assert!(
+        pairing_contact.is_none(),
+        "PairingContact must remain absent after the rejected start"
+    );
+
+    // Helper outbox must be empty: the rejected start must not have
+    // queued a (now-stale) PairRequest envelope.
+    let queued = helper.drain();
+    assert!(
+        queued.is_empty(),
+        "rejected start must not queue any outbound envelope; got {} message(s)",
+        queued.len()
+    );
+
+    println!("  helper.start(Pairing) on already-Paired channel → Err(ChannelAlreadyPaired), no state change  ✓");
+    println!("Protocol start(Pairing) rejects already-Paired channel test passed.");
 }

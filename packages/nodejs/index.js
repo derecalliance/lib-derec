@@ -89,8 +89,6 @@ const primitives = {
   },
 };
 
-const decodeRecoveredSecret = wasm.decodeRecoveredSecret;
-
 const restoreFromRecoveredSecret = wasm.restoreFromRecoveredSecret;
 
 const envelope = {
@@ -106,6 +104,5 @@ module.exports = {
   SenderKind,
   ContactMode,
   FlowKind,
-  decodeRecoveredSecret,
   restoreFromRecoveredSecret,
 };

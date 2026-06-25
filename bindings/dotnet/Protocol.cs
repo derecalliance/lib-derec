@@ -437,17 +437,20 @@ internal static class Protocol
         if (recovered is null)
             throw new InvalidOperationException("RecoverSecret must surface SecretRecovered");
 
-        // SecretRecovered carries the full DeRecSecret bag, not the
-        // raw UserSecret bytes — so look for the original payload as a
-        // contiguous subarray. (Decoding the bag end-to-end would require
-        // the Google.Protobuf descriptors for Secret/UserSecret;
-        // worth adding via FFI later, but the subarray check is enough
-        // to prove the round-trip.)
-        bool found = IndexOfSequence(recovered.Secret, secretData) >= 0;
-        if (!found)
+        // The library now decodes the protect-side wrapping for us:
+        // `recovered.Secret` is the typed `Secret` snapshot, and
+        // `Secret.Secrets` is the list of `UserSecret` the owner
+        // originally protected. Assert id + data round-trip.
+        var recoveredUserSecret = recovered.Secret.Secrets.FirstOrDefault(s =>
+            s.Id.SequenceEqual(new byte[] { 0x01 }));
+        if (recoveredUserSecret is null)
             throw new InvalidOperationException(
-                $"Recovered bag must contain the original secret bytes; got {recovered.Secret.Length}B");
-        Console.WriteLine($"  SecretRecovered: bag={recovered.Secret.Length}B contains the original  ✓");
+                "recovered Secret must include the UserSecret with the original id");
+        if (!recoveredUserSecret.Data.SequenceEqual(secretData))
+            throw new InvalidOperationException(
+                $"recovered UserSecret.Data must round-trip; got {recoveredUserSecret.Data.Length}B");
+        Console.WriteLine(
+            $"  SecretRecovered → UserSecret '{recoveredUserSecret.Name}' ({recoveredUserSecret.Data.Length}B) round-trips  ✓");
 
         Console.WriteLine("Orchestrator share + discovery + recovery test passed.");
     }
@@ -1333,24 +1336,6 @@ internal static class Protocol
         return all;
     }
 
-    /// <summary>
-    /// Returns the index of <paramref name="needle"/> in
-    /// <paramref name="haystack"/>, or -1 if not found.
-    /// </summary>
-    private static int IndexOfSequence(byte[] haystack, byte[] needle)
-    {
-        if (needle.Length == 0 || haystack.Length < needle.Length) return -1;
-        for (int i = 0; i <= haystack.Length - needle.Length; i++)
-        {
-            bool match = true;
-            for (int j = 0; j < needle.Length; j++)
-            {
-                if (haystack[i + j] != needle[j]) { match = false; break; }
-            }
-            if (match) return i;
-        }
-        return -1;
-    }
 
     /// <summary>
     /// In-memory peer composed of fresh stores + a recording transport

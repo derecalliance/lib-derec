@@ -171,7 +171,14 @@ loop {
                 protocol.accept(action).await?;
             }
             DeRecEvent::SecretRecovered { secret } => {
-                // Recovery completed — use the reconstructed bytes here.
+                // Recovery completed — `secret` is the typed `Secret` snapshot
+                // the owner originally protected. The user-facing entries live
+                // in `secret.secrets: Vec<UserSecret>`; `helpers`, `replicas`
+                // and `owner_replica_id` carry the roster captured at
+                // distribution time.
+                for entry in &secret.secrets {
+                    println!("recovered {} ({}B)", entry.name, entry.data.len());
+                }
             }
             // ... handle other events the application cares about.
             _ => {}
@@ -223,7 +230,10 @@ protocol owns the state. The main variants are:
   `ShareRejected { … }`
 - `ShareVerified { channel_id, version }`
 - `SecretsDiscovered { channel_id, secrets }`
-- `RecoveryShareReceived { … }` / `SecretRecovered { secret }` /
+- `RecoveryShareReceived { … }` /
+  `SecretRecovered { secret: Secret }` (typed; `secret.secrets` is the
+  list of `UserSecret` the owner protected, alongside the captured
+  helper/replica roster) /
   `RecoveryShareError { … }`
 - `Unpaired { channel_id }` / `UnpairRejected { channel_id, status, memo }`
 - `PrePairRejected { channel_id, status, memo }` — the contact creator

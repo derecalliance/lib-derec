@@ -567,8 +567,27 @@ pub enum DeRecEvent {
         error: String,
     },
 
-    /// Recovery completed — the reconstructed secret is returned exactly once.
-    SecretRecovered { secret: Vec<u8> },
+    /// Recovery completed — the reconstructed
+    /// [`crate::protocol::types::Secret`] is returned exactly once.
+    ///
+    /// The variant mirrors [`Self::ReplicaSecretReceived`]: the
+    /// inner `secret` carries the full typed snapshot
+    /// — `secrets: Vec<UserSecret>` (the user-facing entries the
+    /// owner originally protected) plus the roster snapshot
+    /// (`helpers`, `replicas`, `owner_replica_id`) captured at
+    /// distribution time. Apps that only care about the user-facing
+    /// entries read `secret.secrets`; the roster fields are useful
+    /// when the recovering owner wants to know who held the shares,
+    /// re-pair with the same helpers, or sync replicas after the
+    /// recovery completes.
+    ///
+    /// The library decodes the two-layer (`DeRecSecret` → `Secret`)
+    /// protobuf wrapping internally; a decode failure surfaces as
+    /// [`Self::RecoveryShareError`] for that final share, not as
+    /// `SecretRecovered` with bogus contents.
+    SecretRecovered {
+        secret: crate::protocol::types::Secret,
+    },
 
     /// An incoming request requires application confirmation before the library responds.
     ///

@@ -299,10 +299,21 @@ public sealed record RecoveryShareErrorEvent : DeRecEvent
     public required string Error { get; init; }
 }
 
+/// <summary>
+/// Recovery completed — the reconstructed <see cref="Secret"/> is
+/// returned exactly once. Mirrors
+/// <see cref="ReplicaSecretReceivedEvent.Secret"/>: the nested
+/// <see cref="Secret"/> carries the typed
+/// <c>secrets: IReadOnlyList&lt;UserSecret&gt;</c> the owner originally
+/// protected, plus the roster snapshot (<c>helpers</c>,
+/// <c>replicas</c>, <c>ownerReplicaId</c>) captured at distribution
+/// time. The library handles the two-stage <c>DeRecSecret</c> →
+/// <c>Secret</c> protobuf decode internally.
+/// </summary>
 public sealed record SecretRecoveredEvent : DeRecEvent
 {
     public override string EventType => "SecretRecovered";
-    public required byte[] Secret { get; init; }
+    public required Secret Secret { get; init; }
 }
 
 public sealed record UnpairedEvent : DeRecEvent
@@ -482,7 +493,7 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             },
             "SecretRecovered" => new SecretRecoveredEvent
             {
-                Secret = ReadByteArray(root.GetProperty("secret")),
+                Secret = ParseSecretObject(root.GetProperty("secret")),
             },
             "Unpaired" => new UnpairedEvent
             {
@@ -582,11 +593,18 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
         };
     }
 
-    private static ReplicaSecretReceivedEvent ParseReplicaSecretReceived(System.Text.Json.JsonElement root)
+    /// <summary>
+    /// Parse the nested <c>secret</c> JSON object common to
+    /// <see cref="ReplicaSecretReceivedEvent"/> and
+    /// <see cref="SecretRecoveredEvent"/>. Both events expose the
+    /// identical wire shape — the typed
+    /// <see cref="DeRec.Library.Orchestrator.Secret"/> the owner
+    /// originally protected.
+    /// </summary>
+    private static Secret ParseSecretObject(System.Text.Json.JsonElement secretEl)
     {
-        var secret = root.GetProperty("secret");
         var helpers = new List<HelperInfo>();
-        foreach (var h in secret.GetProperty("helpers").EnumerateArray())
+        foreach (var h in secretEl.GetProperty("helpers").EnumerateArray())
         {
             helpers.Add(new HelperInfo(
                 h.GetProperty("channel_id").GetString()!,
@@ -595,7 +613,7 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                 h.TryGetProperty("communication_info", out var hci) ? ReadStringMap(hci) : new()));
         }
         var secrets = new List<UserSecret>();
-        foreach (var s in secret.GetProperty("secrets").EnumerateArray())
+        foreach (var s in secretEl.GetProperty("secrets").EnumerateArray())
         {
             secrets.Add(new UserSecret
             {
@@ -605,7 +623,7 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             });
         }
         var replicas = new List<ReplicaInfo>();
-        foreach (var r in secret.GetProperty("replicas").EnumerateArray())
+        foreach (var r in secretEl.GetProperty("replicas").EnumerateArray())
         {
             replicas.Add(new ReplicaInfo(
                 r.GetProperty("channel_id").GetString()!,
@@ -614,9 +632,14 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                 r.GetProperty("replica_id").GetString()!,
                 r.GetProperty("sender_kind").GetInt32()));
         }
-        var container = new Secret(
+        return new Secret(
             helpers, secrets, replicas,
-            secret.GetProperty("owner_replica_id").GetString()!);
+            secretEl.GetProperty("owner_replica_id").GetString()!);
+    }
+
+    private static ReplicaSecretReceivedEvent ParseReplicaSecretReceived(System.Text.Json.JsonElement root)
+    {
+        var container = ParseSecretObject(root.GetProperty("secret"));
 
         var shares = new List<ChannelShare>();
         foreach (var s in root.GetProperty("shares").EnumerateArray())

@@ -100,7 +100,10 @@ pub(crate) enum Event {
         error: String,
     },
     SecretRecovered {
-        secret: Vec<u8>,
+        /// Same nested wire shape as
+        /// [`Self::ReplicaSecretReceived::secret`] — the typed
+        /// `Secret` snapshot the owner originally protected.
+        secret: SecretWire,
     },
     Unpaired {
         channel_id: String,
@@ -382,7 +385,9 @@ impl Event {
                 shares_received: shares_received as u32,
                 error,
             },
-            DeRecEvent::SecretRecovered { secret } => Self::SecretRecovered { secret },
+            DeRecEvent::SecretRecovered { secret } => Self::SecretRecovered {
+                secret: secret.into(),
+            },
             DeRecEvent::Unpaired { channel_id } => Self::Unpaired {
                 channel_id: channel_id.0.to_string(),
             },

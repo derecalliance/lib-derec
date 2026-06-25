@@ -214,7 +214,37 @@ export type DeRecEvent =
     }
   | { type: "RecoveryShareReceived"; channel_id: string; shares_received: number }
   | { type: "RecoveryShareError"; channel_id: string; shares_received: number; error: string }
-  | { type: "SecretRecovered"; secret: Uint8Array }
+  /** Recovery completed — the typed `Secret` snapshot the owner
+   *  originally protected. Mirrors `ReplicaSecretReceived.secret`:
+   *  `secrets` is the user-facing `Vec<UserSecret>` the application
+   *  fed to `start(FlowKind.ProtectSecret)`; `helpers`, `replicas`
+   *  and `owner_replica_id` are the roster snapshot captured at
+   *  distribution time. The library handles the two-stage
+   *  `DeRecSecret` → `Secret` protobuf decode internally. */
+  | {
+      type: "SecretRecovered";
+      secret: {
+        helpers: Array<{
+          channel_id: string;
+          transport_uri: string;
+          shared_key: Uint8Array;
+          communication_info: Record<string, string>;
+        }>;
+        secrets: Array<{
+          id: Uint8Array;
+          name: string;
+          data: Uint8Array;
+        }>;
+        replicas: Array<{
+          channel_id: string;
+          transport_uri: string;
+          communication_info: Record<string, string>;
+          replica_id: string;
+          sender_kind: number;
+        }>;
+        owner_replica_id: string;
+      };
+    }
 
   | { type: "Unpaired"; channel_id: string }
 
@@ -474,32 +504,6 @@ export declare class DeRecProtocol {
   verifyFingerprint(channelId: bigint | number, fingerprint: string): Promise<boolean>;
 }
 
-export interface RecoveredHelperInfo {
-
-  channelId: string;
-  transportUri: string;
-
-  communicationInfo: Record<string, string>;
-
-  sharedKey: Uint8Array | number[];
-}
-
-export interface RecoveredUserSecret {
-
-  id: Uint8Array | number[];
-
-  name: string;
-
-  data: Uint8Array | number[];
-}
-
-export interface RecoveredSecret {
-  helpers: RecoveredHelperInfo[];
-  secrets: RecoveredUserSecret[];
-}
-
-export declare function decodeRecoveredSecret(bytes: Uint8Array): RecoveredSecret;
-
 /**
  * Envelope-level helpers that operate on raw `DeRecMessage` bytes without
  * touching the encrypted inner payload. Useful for primitive-only consumers
@@ -520,11 +524,22 @@ export declare const envelope: {
   read_trace_id(envelope_bytes: Uint8Array): bigint;
 };
 
+/**
+ * Re-populate a set of empty stores from a recovered `Secret`, so the
+ * caller can resume in the "normal" (non-recovery) namespace as if the
+ * secret had been distributed by this device originally.
+ *
+ * `recoveredSecret` is the **typed `secret` object** carried by the
+ * `SecretRecovered` event — no protobuf encode required.
+ *
+ * Caller's responsibility: provide stores backed by an *empty* target
+ * namespace.
+ */
 export declare function restoreFromRecoveredSecret(
   channelStore: ChannelStore,
   secretStore: SecretStore,
   shareStore: ShareStore,
-  recoveredBytes: Uint8Array,
+  recoveredSecret: Extract<DeRecEvent, { type: "SecretRecovered" }>["secret"],
   secretId: string,
   version: number,
 ): Promise<void>;

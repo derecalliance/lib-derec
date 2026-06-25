@@ -62,6 +62,15 @@ public static class DeRecCode
     /// </summary>
     public const int ReplicaIdNotConfigured = 12;
 
+    /// <summary>
+    /// <c>start(Pairing)</c> was called for a channel id that already has a
+    /// <c>Paired</c> channel record. Skip the call at the session layer or
+    /// unpair first.
+    /// <see cref="DeRecException.Category"/> is
+    /// <see cref="DeRecCategory.InvalidInput"/>.
+    /// </summary>
+    public const int ChannelAlreadyPaired = 13;
+
     public const int Encryption = 20;
     public const int Keygen = 21;
     public const int FinishPairingInitiator = 22;

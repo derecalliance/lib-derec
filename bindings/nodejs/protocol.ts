@@ -360,16 +360,13 @@ async function processAll(node: Node, bytes: Uint8Array): Promise<DeRecEvent[]> 
   return out;
 }
 
-/** `true` if `haystack` contains `needle` as a contiguous subarray. */
-function containsSubarray(haystack: Uint8Array, needle: Uint8Array): boolean {
-  if (needle.length === 0 || haystack.length < needle.length) return false;
-  outer: for (let i = 0; i <= haystack.length - needle.length; i++) {
-    for (let j = 0; j < needle.length; j++) {
-      if (haystack[i + j] !== needle[j]) continue outer;
-    }
-    return true;
+/** `true` if two `Uint8Array`s are byte-for-byte identical. */
+function byteArraysEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
   }
-  return false;
+  return true;
 }
 
 /** Drains exactly one queued outbound message or throws. */
@@ -898,7 +895,7 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
     throw new Error(`expected 2 GetShareRequests, got ${recRequests.length}`);
   }
 
-  let recovered: Uint8Array | null = null;
+  let recovered: Extract<DeRecEvent, { type: "SecretRecovered" }>["secret"] | null = null;
   for (const env of recRequests) {
     const isA = env.endpoint.uri.includes("helper-a");
     const helper = isA ? helperA : helperB;
@@ -913,17 +910,34 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
     }
   }
 
-  if (!recovered || recovered.length === 0) {
-    throw new Error("Recovery failed: no SecretRecovered event with non-empty bytes");
+  if (!recovered) {
+    throw new Error("Recovery failed: no SecretRecovered event");
   }
-  // The reconstructed payload is the encoded secret (DeRecSecret +
-  // Secret); assert the original secret bytes round-trip inside it.
-  if (!containsSubarray(recovered, secretBytes)) {
+
+  // The library now decodes the protect-side wrapping for us —
+  // `recovered.secrets` is the typed list of `UserSecret` the owner
+  // originally protected. Assert id + name + data all round-trip.
+  const recoveredUserSecret = recovered.secrets.find(
+    (s) => s.id.length === 1 && s.id[0] === 1,
+  );
+  if (!recoveredUserSecret) {
     throw new Error(
-      `SecretRecovered (${recovered.length}B) does not contain the original ${secretBytes.length}B secret`,
+      "recovered Secret must include the UserSecret with the original id [0x01]",
     );
   }
-  console.log(`  [Owner]  SecretRecovered ${recovered.length}B — contains original secret ✓`);
+  if (!byteArraysEqual(recoveredUserSecret.data, secretBytes)) {
+    throw new Error(
+      `recovered UserSecret.data must round-trip; got ${recoveredUserSecret.data.length}B`,
+    );
+  }
+  if (recoveredUserSecret.name !== "wallet") {
+    throw new Error(
+      `recovered UserSecret.name must round-trip; got "${recoveredUserSecret.name}"`,
+    );
+  }
+  console.log(
+    `  [Owner]  SecretRecovered → UserSecret "${recoveredUserSecret.name}" (${recoveredUserSecret.data.length}B) round-trips ✓`,
+  );
 
   console.log("\n✓ Discovery & Recovery flow passed.\n");
 }

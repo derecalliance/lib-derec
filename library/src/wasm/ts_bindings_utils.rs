@@ -89,6 +89,7 @@ fn categorize(err: &crate::Error) -> (&'static str, &'static str) {
         crate::Error::Invariant(_) => ("invariant", "INVARIANT_VIOLATED"),
         crate::Error::RoleMismatch { .. } => ("input", "ROLE_MISMATCH"),
         crate::Error::ReplicaIdNotConfigured => ("input", "REPLICA_ID_NOT_CONFIGURED"),
+        crate::Error::ChannelAlreadyPaired { .. } => ("input", "CHANNEL_ALREADY_PAIRED"),
     }
 }
 
@@ -122,6 +123,7 @@ fn recovery_code(e: &RecoveryError) -> &'static str {
         RecoveryError::SecretIdMismatch => "SECRET_ID_MISMATCH",
         RecoveryError::VersionMismatch { .. } => "VERSION_MISMATCH",
         RecoveryError::ReconstructionFailed { .. } => "RECONSTRUCTION_FAILED",
+        RecoveryError::MalformedRecoveredSecret { .. } => "MALFORMED_RECOVERED_SECRET",
     }
 }
 

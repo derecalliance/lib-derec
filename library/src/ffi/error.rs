@@ -88,6 +88,11 @@ pub const DEREC_CODE_ROLE_MISMATCH: i32 = 11;
 /// requires local replica identity. `DEREC_CATEGORY_INVALID_INPUT`.
 pub const DEREC_CODE_REPLICA_ID_NOT_CONFIGURED: i32 = 12;
 
+/// `start(Pairing)` was called for a `channel_id` that already has a
+/// `Paired` channel record. Returned by both the inline-keys and
+/// hashed-keys branches of `start`. `DEREC_CATEGORY_INVALID_INPUT`.
+pub const DEREC_CODE_CHANNEL_ALREADY_PAIRED: i32 = 13;
+
 pub const DEREC_CODE_ENCRYPTION: i32 = 20;
 pub const DEREC_CODE_KEYGEN: i32 = 21;
 pub const DEREC_CODE_FINISH_PAIRING_INITIATOR: i32 = 22;
@@ -127,6 +132,11 @@ pub const DEREC_CODE_DECODE_COMMITTED_DEREC_SHARE: i32 = 82;
 pub const DEREC_CODE_DECODE_DEREC_SHARE: i32 = 83;
 pub const DEREC_CODE_SECRET_ID_MISMATCH: i32 = 84;
 pub const DEREC_CODE_RECONSTRUCTION_FAILED: i32 = 85;
+
+/// VSS reconstruction succeeded but the resulting bytes did not decode as
+/// the canonical `DeRecSecret` / `Secret` protobuf. Almost always a sign
+/// of share corruption.
+pub const DEREC_CODE_MALFORMED_RECOVERED_SECRET: i32 = 86;
 
 pub const DEREC_CODE_FFI_NULL_PTR: i32 = 100;
 pub const DEREC_CODE_FFI_BAD_LENGTH: i32 = 101;
@@ -267,6 +277,9 @@ fn categorize(err: &crate::Error) -> (i32, i32) {
         crate::Error::ReplicaIdNotConfigured => {
             (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_REPLICA_ID_NOT_CONFIGURED)
         }
+        crate::Error::ChannelAlreadyPaired { .. } => {
+            (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_CHANNEL_ALREADY_PAIRED)
+        }
     }
 }
 
@@ -300,6 +313,7 @@ fn recovery_code(e: &RecoveryError) -> i32 {
         RecoveryError::SecretIdMismatch => DEREC_CODE_SECRET_ID_MISMATCH,
         RecoveryError::VersionMismatch { .. } => DEREC_CODE_VERSION_MISMATCH,
         RecoveryError::ReconstructionFailed { .. } => DEREC_CODE_RECONSTRUCTION_FAILED,
+        RecoveryError::MalformedRecoveredSecret { .. } => DEREC_CODE_MALFORMED_RECOVERED_SECRET,
     }
 }
 

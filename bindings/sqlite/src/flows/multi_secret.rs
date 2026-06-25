@@ -261,15 +261,24 @@ pub async fn run() {
             _ => None,
         })
         .expect("wallet secret must recover");
-    assert!(
-        contains_subslice(&wallet_recovered, &wallet_payload),
+    let wallet_us = wallet_recovered
+        .secrets
+        .iter()
+        .find(|s| s.id == vec![0xAAu8, 0x01])
+        .expect("wallet recovery must include the wallet UserSecret");
+    assert_eq!(
+        wallet_us.data, wallet_payload,
         "wallet recovery must surface the wallet bytes"
     );
+    assert_eq!(wallet_us.name, "wallet-seed");
     assert!(
-        !contains_subslice(&wallet_recovered, &email_payload),
+        wallet_recovered
+            .secrets
+            .iter()
+            .all(|s| s.data != email_payload),
         "wallet recovery must NOT leak the email bytes"
     );
-    println!("  wallet secret recovered the wallet bytes (and only those)  ✓");
+    println!("  wallet secret recovered the wallet UserSecret (and only that)  ✓");
 
     // Email secret is untouched — its user_secret_store still holds
     // the snapshot, its channels are still in the DB, and its
@@ -322,12 +331,21 @@ pub async fn run() {
             _ => None,
         })
         .expect("email secret must recover");
-    assert!(
-        contains_subslice(&email_recovered, &email_payload),
+    let email_us = email_recovered
+        .secrets
+        .iter()
+        .find(|s| s.id == vec![0xEEu8, 0x01])
+        .expect("email recovery must include the email UserSecret");
+    assert_eq!(
+        email_us.data, email_payload,
         "email recovery must surface the email bytes"
     );
+    assert_eq!(email_us.name, "email-password");
     assert!(
-        !contains_subslice(&email_recovered, &wallet_payload),
+        email_recovered
+            .secrets
+            .iter()
+            .all(|s| s.data != wallet_payload),
         "email recovery must NOT leak the wallet bytes"
     );
     println!("  email secret recovered the email bytes (and only those)  ✓");
@@ -335,9 +353,3 @@ pub async fn run() {
     println!("✓ Multi-secret flow passed.\n");
 }
 
-fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return false;
-    }
-    haystack.windows(needle.len()).any(|w| w == needle)
-}
