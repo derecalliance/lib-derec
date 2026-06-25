@@ -585,6 +585,10 @@ pub enum DeRecEvent {
     /// protobuf wrapping internally; a decode failure surfaces as
     /// [`Self::RecoveryShareError`] for that final share, not as
     /// `SecretRecovered` with bogus contents.
+    ///
+    /// Pass `secret` to [`super::DeRecProtocol::restore`] on a fresh
+    /// protocol instance to commit canonical helper / replica state
+    /// and wipe the throwaway recovery-mode channels.
     SecretRecovered {
         secret: crate::protocol::types::Secret,
     },

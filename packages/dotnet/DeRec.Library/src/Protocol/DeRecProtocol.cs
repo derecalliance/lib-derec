@@ -395,6 +395,36 @@ public sealed class DeRecProtocol : IDisposable
     }
 
     /// <summary>
+    /// Rebuild this protocol's <c>secret_id</c> namespace from a recovered
+    /// <see cref="Secret"/>. Mirrors the Rust <c>DeRecProtocol::restore</c>
+    /// — see that method for the full contract. <paramref name="recoveredSecret"/>
+    /// is the <see cref="Secret"/> carried by <see cref="SecretRecoveredEvent.Secret"/>;
+    /// pass it verbatim.
+    /// </summary>
+    /// <exception cref="DeRecException">
+    /// Thrown with <see cref="DeRecCode.AlreadyRestored"/>,
+    /// <see cref="DeRecCode.RestoreConflict"/>, <see cref="DeRecCode.Invariant"/>,
+    /// or a store-category code on failure.
+    /// </exception>
+    public Task RestoreAsync(Secret recoveredSecret, uint version)
+    {
+        EnsureNotDisposed();
+        var dto = new RestoreParamsDto { Version = version, RecoveredSecret = recoveredSecret };
+        byte[] json = JsonSerializer.SerializeToUtf8Bytes(dto, JsonOpts);
+        return Task.Run(() =>
+        {
+            var err = NP.derec_protocol_restore(_handle, json, (UIntPtr)json.Length);
+            ThrowOnError(err);
+        });
+    }
+
+    private sealed record RestoreParamsDto
+    {
+        [JsonPropertyName("version")] public required uint Version { get; init; }
+        [JsonPropertyName("recovered_secret")] public required Secret RecoveredSecret { get; init; }
+    }
+
+    /// <summary>
     /// Replace this node's local <c>communication_info</c> map. Does
     /// not contact peers — follow up with
     /// <c>StartAsync(FlowKind.UpdateChannelInfo, ...)</c> to propagate.

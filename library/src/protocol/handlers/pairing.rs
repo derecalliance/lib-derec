@@ -287,6 +287,129 @@ pub(in crate::protocol) async fn reject<Ss: DeRecSecretStore, T: DeRecTransport>
     Ok(())
 }
 
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+)]
+fn on_request(
+    channel_id: ChannelId,
+    request: &PairRequestMessage,
+    pairing_secret: &PairingSecretKeyMaterial,
+    trace_id: u64,
+    replica_id: Option<u64>,
+) -> Result<Vec<DeRecEvent>> {
+    let peer_kind = request_sender_kind(request)?;
+
+    // Validate the inbound CommunicationInfo against the peer's declared
+    // kind (presence/absence of `derec.replica_id`). Error here propagates
+    // up through `handle` → `process()` rather than surfacing as an event.
+    let (peer_communication_info, _peer_replica_id) =
+        extract_communication_info(&request.communication_info, peer_kind)?;
+
+    // Derive the LOCAL kind from the peer's. Then refuse if it would be
+    // Replica without a configured local id — refusing here avoids
+    // surfacing an `ActionRequired::Pairing` the app cannot accept.
+    let kind = derive_peer_kind(peer_kind);
+    let _ = require_replica_id_for_kind(kind, replica_id)?;
+
+    let action = PendingAction::Pairing {
+        channel_id,
+        request: request.clone(),
+        pairing_secret: pairing_secret.clone(),
+        kind,
+        peer_communication_info,
+        trace_id,
+    };
+
+    Ok(vec![DeRecEvent::ActionRequired { channel_id, action }])
+}
+
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+)]
+async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
+    channel_store: &mut Ch,
+    secret_store: &mut Ss,
+    secret_id: u64,
+    channel_id: ChannelId,
+    response: &derec_proto::PairResponseMessage,
+    pairing_secret: &PairingSecretKeyMaterial,
+    replica_id: Option<u64>,
+) -> Result<Vec<DeRecEvent>> {
+    let contact = match secret_store
+        .load(secret_id, channel_id, SecretKind::PairingContact)
+        .await?
+    {
+        Some(SecretValue::PairingContact(c)) => c,
+        _ => {
+            return Err(Error::InvalidInput(
+                "no pairing contact stored for channel — start must be called first",
+            ));
+        }
+    };
+
+    let result = response::process(&contact, response, pairing_secret)?;
+
+    secret_store
+        .save(
+            secret_id,
+            channel_id,
+            SecretValue::SharedKey(result.shared_key),
+        )
+        .await?;
+    secret_store
+        .remove(secret_id, channel_id, SecretKind::PairingSecret)
+        .await?;
+    secret_store
+        .remove(secret_id, channel_id, SecretKind::PairingContact)
+        .await?;
+
+    // The local role was committed to the channel record at `start` time;
+    // load it now rather than derive it from the peer's response.
+    let channel = channel_store
+        .load(secret_id, channel_id)
+        .await?
+        .ok_or(Error::Invariant(
+            "channel record missing on pair response — start must be called first",
+        ))?;
+    let kind = channel.role;
+
+    let status = if is_replica_kind(kind) {
+        crate::protocol::types::ChannelStatus::Pending
+    } else {
+        crate::protocol::types::ChannelStatus::Paired
+    };
+
+    // Validate the inbound CommunicationInfo against the derived peer
+    // kind. Replica responses MUST carry `derec.replica_id`; non-replica
+    // responses MUST NOT. The local id was already validated at start
+    // time via `require_replica_id_for_kind` — this is the receiver-side
+    // half of the same invariant.
+    let peer_kind = derive_peer_kind(kind);
+    let _ = require_replica_id_for_kind(kind, replica_id)?;
+    let (peer_communication_info, peer_replica_id) =
+        extract_communication_info(&response.communication_info, peer_kind)?;
+
+    let mut channel = channel;
+    channel.status = status;
+    channel.replica_id = peer_replica_id;
+    for (k, v) in &peer_communication_info {
+        channel.communication_info.insert(k.clone(), v.clone());
+    }
+    channel_store.save(secret_id, channel).await?;
+
+    #[cfg(feature = "logging")]
+    tracing::info!("pairing complete (initiator side)");
+
+    Ok(pair_completion_events(
+        channel_id,
+        kind,
+        peer_communication_info,
+        peer_replica_id,
+    ))
+}
+
 /// Inbound `PrePairResponse` on the **scanner side**. Validates the
 /// published keys against the stored contact's `contact_binding_hash`,
 /// synthesizes a filled-in `InlineKeys`-shaped contact, and auto-proceeds
@@ -508,6 +631,28 @@ pub(in crate::protocol) async fn reject_pre_pair<T: DeRecTransport>(
     Ok(())
 }
 
+/// Derive the peer's pairing kind from the local kind (committed on the
+/// channel record at pairing-start time).
+///
+/// `PairResponseMessage` does not carry `sender_kind` over the wire, so the
+/// initiator must look up its own role on the channel and invert it. The
+/// derivation matches [`on_request`]'s rule on the responder side:
+///
+/// | local                 | peer                  |
+/// |-----------------------|-----------------------|
+/// | `Owner`               | `Helper`              |
+/// | `Helper`              | `Owner`               |
+/// | `ReplicaSource`       | `ReplicaDestination`  |
+/// | `ReplicaDestination`  | `ReplicaSource`       |
+pub(in crate::protocol) fn derive_peer_kind(local_kind: SenderKind) -> SenderKind {
+    match local_kind {
+        SenderKind::Owner => SenderKind::Helper,
+        SenderKind::Helper => SenderKind::Owner,
+        SenderKind::ReplicaSource => SenderKind::ReplicaDestination,
+        SenderKind::ReplicaDestination => SenderKind::ReplicaSource,
+    }
+}
+
 /// Scanner-side `InlineKeys` branch of [`start`]. The responder has the
 /// initiator's public keys inline on the contact, so it can go straight
 /// to building the encrypted `PairRequest` envelope.
@@ -645,129 +790,6 @@ fn on_pre_pair_request(
             trace_id,
         },
     }])
-}
-
-#[cfg_attr(
-    feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
-)]
-fn on_request(
-    channel_id: ChannelId,
-    request: &PairRequestMessage,
-    pairing_secret: &PairingSecretKeyMaterial,
-    trace_id: u64,
-    replica_id: Option<u64>,
-) -> Result<Vec<DeRecEvent>> {
-    let peer_kind = request_sender_kind(request)?;
-
-    // Validate the inbound CommunicationInfo against the peer's declared
-    // kind (presence/absence of `derec.replica_id`). Error here propagates
-    // up through `handle` → `process()` rather than surfacing as an event.
-    let (peer_communication_info, _peer_replica_id) =
-        extract_communication_info(&request.communication_info, peer_kind)?;
-
-    // Derive the LOCAL kind from the peer's. Then refuse if it would be
-    // Replica without a configured local id — refusing here avoids
-    // surfacing an `ActionRequired::Pairing` the app cannot accept.
-    let kind = derive_peer_kind(peer_kind);
-    let _ = require_replica_id_for_kind(kind, replica_id)?;
-
-    let action = PendingAction::Pairing {
-        channel_id,
-        request: request.clone(),
-        pairing_secret: pairing_secret.clone(),
-        kind,
-        peer_communication_info,
-        trace_id,
-    };
-
-    Ok(vec![DeRecEvent::ActionRequired { channel_id, action }])
-}
-
-#[cfg_attr(
-    feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
-)]
-async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
-    channel_store: &mut Ch,
-    secret_store: &mut Ss,
-    secret_id: u64,
-    channel_id: ChannelId,
-    response: &derec_proto::PairResponseMessage,
-    pairing_secret: &PairingSecretKeyMaterial,
-    replica_id: Option<u64>,
-) -> Result<Vec<DeRecEvent>> {
-    let contact = match secret_store
-        .load(secret_id, channel_id, SecretKind::PairingContact)
-        .await?
-    {
-        Some(SecretValue::PairingContact(c)) => c,
-        _ => {
-            return Err(Error::InvalidInput(
-                "no pairing contact stored for channel — start must be called first",
-            ));
-        }
-    };
-
-    let result = response::process(&contact, response, pairing_secret)?;
-
-    secret_store
-        .save(
-            secret_id,
-            channel_id,
-            SecretValue::SharedKey(result.shared_key),
-        )
-        .await?;
-    secret_store
-        .remove(secret_id, channel_id, SecretKind::PairingSecret)
-        .await?;
-    secret_store
-        .remove(secret_id, channel_id, SecretKind::PairingContact)
-        .await?;
-
-    // The local role was committed to the channel record at `start` time;
-    // load it now rather than derive it from the peer's response.
-    let channel = channel_store
-        .load(secret_id, channel_id)
-        .await?
-        .ok_or(Error::Invariant(
-            "channel record missing on pair response — start must be called first",
-        ))?;
-    let kind = channel.role;
-
-    let status = if is_replica_kind(kind) {
-        crate::protocol::types::ChannelStatus::Pending
-    } else {
-        crate::protocol::types::ChannelStatus::Paired
-    };
-
-    // Validate the inbound CommunicationInfo against the derived peer
-    // kind. Replica responses MUST carry `derec.replica_id`; non-replica
-    // responses MUST NOT. The local id was already validated at start
-    // time via `require_replica_id_for_kind` — this is the receiver-side
-    // half of the same invariant.
-    let peer_kind = derive_peer_kind(kind);
-    let _ = require_replica_id_for_kind(kind, replica_id)?;
-    let (peer_communication_info, peer_replica_id) =
-        extract_communication_info(&response.communication_info, peer_kind)?;
-
-    let mut channel = channel;
-    channel.status = status;
-    channel.replica_id = peer_replica_id;
-    for (k, v) in &peer_communication_info {
-        channel.communication_info.insert(k.clone(), v.clone());
-    }
-    channel_store.save(secret_id, channel).await?;
-
-    #[cfg(feature = "logging")]
-    tracing::info!("pairing complete (initiator side)");
-
-    Ok(pair_completion_events(
-        channel_id,
-        kind,
-        peer_communication_info,
-        peer_replica_id,
-    ))
 }
 
 /// Build a `CommunicationInfo` proto from the app's free-form key-value
@@ -954,28 +976,6 @@ fn request_sender_kind(request: &PairRequestMessage) -> Result<SenderKind> {
     SenderKind::try_from(request.sender_kind).map_err(|_| {
         PairingError::InvalidPairRequestMessage("unknown sender_kind on PairRequest").into()
     })
-}
-
-/// Derive the peer's pairing kind from the local kind (committed on the
-/// channel record at pairing-start time).
-///
-/// `PairResponseMessage` does not carry `sender_kind` over the wire, so the
-/// initiator must look up its own role on the channel and invert it. The
-/// derivation matches [`on_request`]'s rule on the responder side:
-///
-/// | local                 | peer                  |
-/// |-----------------------|-----------------------|
-/// | `Owner`               | `Helper`              |
-/// | `Helper`              | `Owner`               |
-/// | `ReplicaSource`       | `ReplicaDestination`  |
-/// | `ReplicaDestination`  | `ReplicaSource`       |
-pub(in crate::protocol) fn derive_peer_kind(local_kind: SenderKind) -> SenderKind {
-    match local_kind {
-        SenderKind::Owner => SenderKind::Helper,
-        SenderKind::Helper => SenderKind::Owner,
-        SenderKind::ReplicaSource => SenderKind::ReplicaDestination,
-        SenderKind::ReplicaDestination => SenderKind::ReplicaSource,
-    }
 }
 
 /// Returns `true` for either of the two replica-mode `SenderKind`s.

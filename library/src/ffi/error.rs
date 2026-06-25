@@ -93,6 +93,18 @@ pub const DEREC_CODE_REPLICA_ID_NOT_CONFIGURED: i32 = 12;
 /// hashed-keys branches of `start`. `DEREC_CATEGORY_INVALID_INPUT`.
 pub const DEREC_CODE_CHANNEL_ALREADY_PAIRED: i32 = 13;
 
+/// `derec_protocol_restore` precondition: a `UserSecrets` snapshot
+/// already exists for the protocol's `secret_id`. The application must
+/// clear it before retrying. `DEREC_CATEGORY_INVALID_INPUT`.
+pub const DEREC_CODE_ALREADY_RESTORED: i32 = 14;
+
+/// `derec_protocol_restore` precondition: one or more channels live at
+/// canonical helper / replica ids carried by the recovered `Secret`.
+/// `DeRecError::message` formats the collision list as
+/// `"restore conflict: channel(s) [a, b, ...]"`.
+/// `DEREC_CATEGORY_INVALID_INPUT`.
+pub const DEREC_CODE_RESTORE_CONFLICT: i32 = 15;
+
 pub const DEREC_CODE_ENCRYPTION: i32 = 20;
 pub const DEREC_CODE_KEYGEN: i32 = 21;
 pub const DEREC_CODE_FINISH_PAIRING_INITIATOR: i32 = 22;
@@ -180,6 +192,12 @@ pub(crate) fn ffi_error(code: i32, msg: impl AsRef<str>) -> DeRecError {
 /// Maps a [`crate::Error`] into a typed FFI error. Single source of truth for
 /// category/code mapping — extend the arms here when adding new variants.
 pub(crate) fn from_lib_error(err: crate::Error) -> DeRecError {
+    // Restore errors carry richer per-variant messages (e.g. the
+    // colliding channel-id list on `Conflict`); delegate so callers
+    // see the formatted detail instead of the bare thiserror string.
+    if let crate::Error::Restore(e) = err {
+        return from_restore_error(e);
+    }
     let (category, code) = categorize(&err);
     let message = to_owned_cstring(&err.to_string());
 
@@ -204,6 +222,44 @@ pub(crate) fn from_lib_error(err: crate::Error) -> DeRecError {
         peer_memo,
         expected,
         got,
+    }
+}
+
+/// Map a [`crate::protocol::RestoreError`] to a typed FFI error.
+pub(crate) fn from_restore_error(err: crate::protocol::RestoreError) -> DeRecError {
+    use crate::protocol::RestoreError;
+    match err {
+        RestoreError::AlreadyRestored => DeRecError {
+            category: DEREC_CATEGORY_INVALID_INPUT,
+            code: DEREC_CODE_ALREADY_RESTORED,
+            message: to_owned_cstring(&RestoreError::AlreadyRestored.to_string()),
+            peer_status: 0,
+            peer_memo: std::ptr::null_mut(),
+            expected: 0,
+            got: 0,
+        },
+        RestoreError::Conflict(ids) => {
+            let id_list: Vec<String> = ids.iter().map(|c| c.0.to_string()).collect();
+            let msg = format!("restore conflict: channel(s) [{}]", id_list.join(", "));
+            DeRecError {
+                category: DEREC_CATEGORY_INVALID_INPUT,
+                code: DEREC_CODE_RESTORE_CONFLICT,
+                message: to_owned_cstring(&msg),
+                peer_status: 0,
+                peer_memo: std::ptr::null_mut(),
+                expected: 0,
+                got: 0,
+            }
+        }
+        RestoreError::Invariant(msg) => DeRecError {
+            category: DEREC_CATEGORY_INVARIANT,
+            code: DEREC_CODE_INVARIANT,
+            message: to_owned_cstring(msg),
+            peer_status: 0,
+            peer_memo: std::ptr::null_mut(),
+            expected: 0,
+            got: 0,
+        },
     }
 }
 
@@ -279,6 +335,18 @@ fn categorize(err: &crate::Error) -> (i32, i32) {
         }
         crate::Error::ChannelAlreadyPaired { .. } => {
             (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_CHANNEL_ALREADY_PAIRED)
+        }
+        crate::Error::Restore(e) => {
+            use crate::protocol::RestoreError;
+            match e {
+                RestoreError::AlreadyRestored => {
+                    (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_ALREADY_RESTORED)
+                }
+                RestoreError::Conflict(_) => {
+                    (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_RESTORE_CONFLICT)
+                }
+                RestoreError::Invariant(_) => (DEREC_CATEGORY_INVARIANT, DEREC_CODE_INVARIANT),
+            }
         }
     }
 }

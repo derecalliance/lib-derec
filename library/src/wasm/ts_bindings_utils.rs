@@ -90,6 +90,14 @@ fn categorize(err: &crate::Error) -> (&'static str, &'static str) {
         crate::Error::RoleMismatch { .. } => ("input", "ROLE_MISMATCH"),
         crate::Error::ReplicaIdNotConfigured => ("input", "REPLICA_ID_NOT_CONFIGURED"),
         crate::Error::ChannelAlreadyPaired { .. } => ("input", "CHANNEL_ALREADY_PAIRED"),
+        crate::Error::Restore(e) => {
+            use crate::protocol::RestoreError;
+            match e {
+                RestoreError::AlreadyRestored => ("input", "ALREADY_RESTORED"),
+                RestoreError::Conflict(_) => ("input", "CONFLICT"),
+                RestoreError::Invariant(_) => ("invariant", "INVARIANT"),
+            }
+        }
     }
 }
 

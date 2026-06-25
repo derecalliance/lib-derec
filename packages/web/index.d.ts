@@ -237,13 +237,20 @@ export type DeRecEvent =
           name: string;
           data: Uint8Array;
         }>;
-        replicas: Array<{
-          channel_id: string;
-          transport_uri: string;
-          communication_info: Record<string, string>;
-          replica_id: string;
-          sender_kind: number;
-        }>;
+        /** Replica composite. Absent when this `secret_id` has no
+         *  replica setup. Carries the destination roster, the
+         *  per-helper share map, and the 32-byte group key. Required
+         *  by `restore` to rebuild replica channels without re-pairing. */
+        replicas?: {
+          replicas: Array<{
+            channel_id: string;
+            transport_uri: string;
+            communication_info: Record<string, string>;
+            replica_id: string;
+            sender_kind: number;
+          }>;
+          shared_key: Uint8Array;
+        };
         owner_replica_id: string;
       };
     }
@@ -291,13 +298,18 @@ export type DeRecEvent =
           name: string;
           data: Uint8Array;
         }>;
-        replicas: Array<{
-          channel_id: string;
-          transport_uri: string;
-          communication_info: Record<string, string>;
-          replica_id: string;
-          sender_kind: number;
-        }>;
+        /** Replica composite. Absent when this `secret_id` has no
+         *  replica setup. The same shape as `SecretRecovered.secret.replicas`. */
+        replicas?: {
+          replicas: Array<{
+            channel_id: string;
+            transport_uri: string;
+            communication_info: Record<string, string>;
+            replica_id: string;
+            sender_kind: number;
+          }>;
+          shared_key: Uint8Array;
+        };
         owner_replica_id: string;
       };
       shares: Array<{
@@ -504,6 +516,26 @@ export declare class DeRecProtocol {
    * `true` on confirmation, `false` on mismatch.
    */
   verifyFingerprint(channelId: bigint | number, fingerprint: string): Promise<boolean>;
+
+  /**
+   * Rebuild this protocol's `secret_id` namespace from a recovered
+   * `Secret`. Mirrors the Rust `DeRecProtocol::restore` — pass the
+   * typed `secret` carried by the `SecretRecovered` event verbatim.
+   *
+   * Errors surface as structured objects with a `code` field:
+   *
+   * | code               | meaning                                                          |
+   * |--------------------|------------------------------------------------------------------|
+   * | `ALREADY_RESTORED` | A user-secret snapshot already exists for this `secret_id`.      |
+   * | `CONFLICT`         | Channels live at canonical helper / replica ids. The error       |
+   * |                    | carries `channel_ids: string[]` listing the collisions.          |
+   * | `INVARIANT`        | The recovered `Secret` is internally inconsistent.               |
+   * | `STORAGE`          | A store I/O call failed mid-restore.                             |
+   */
+  restore(
+    recoveredSecret: Extract<DeRecEvent, { type: "SecretRecovered" }>["secret"],
+    version: number,
+  ): Promise<void>;
 }
 
 /**
@@ -525,26 +557,6 @@ export declare const envelope: {
    */
   read_trace_id(envelope_bytes: Uint8Array): bigint;
 };
-
-/**
- * Re-populate a set of empty stores from a recovered `Secret`, so the
- * caller can resume in the "normal" (non-recovery) namespace as if the
- * secret had been distributed by this device originally.
- *
- * `recoveredSecret` is the **typed `secret` object** carried by the
- * `SecretRecovered` event — no protobuf encode required.
- *
- * Caller's responsibility: provide stores backed by an *empty* target
- * namespace.
- */
-export declare function restoreFromRecoveredSecret(
-  channelStore: ChannelStore,
-  secretStore: SecretStore,
-  shareStore: ShareStore,
-  recoveredSecret: Extract<DeRecEvent, { type: "SecretRecovered" }>["secret"],
-  secretId: string,
-  version: number,
-): Promise<void>;
 
 export interface Timestamp {
 

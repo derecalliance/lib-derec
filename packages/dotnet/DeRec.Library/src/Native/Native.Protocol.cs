@@ -289,4 +289,8 @@ internal static class Protocol
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern DeRecError derec_protocol_set_own_transport(
         IntPtr handle, byte[] uri, UIntPtr uriLen, int protocol);
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern DeRecError derec_protocol_restore(
+        IntPtr handle, byte[] paramsJson, UIntPtr paramsJsonLen);
 }

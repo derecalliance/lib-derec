@@ -858,6 +858,45 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
     `  [Owner]  SecretRecovered → UserSecret "${recoveredUserSecret.name}" (${recoveredUserSecret.data.length}B) round-trips ✓`,
   );
 
+  console.log("\n  -- Restore: rebuild a fresh peer from the recovered Secret --\n");
+
+  const restored = makeNode("RestoredOwner", "https://restored.example.com", {
+    secretId: ownerSecretId,
+  });
+  await restored.protocol.restore(recovered, 1);
+
+  const restoredSnapshot = await restored.userSecretStore.loadLatest(
+    ownerSecretId.toString(),
+  );
+  if (!restoredSnapshot) {
+    throw new Error("restore did not commit a UserSecrets snapshot");
+  }
+  if (restoredSnapshot.version !== 1) {
+    throw new Error(
+      `restored snapshot version mismatch: ${restoredSnapshot.version} ≠ 1`,
+    );
+  }
+  const restoredUserSecret = restoredSnapshot.secrets.find(
+    (s) => s.id.length === 1 && s.id[0] === 1,
+  );
+  if (!restoredUserSecret || !byteArraysEqual(restoredUserSecret.data, secretBytes)) {
+    throw new Error("restored snapshot must carry the protected UserSecret");
+  }
+  for (const helper of recovered.helpers) {
+    const channel = await restored.channelStore.load(
+      ownerSecretId.toString(),
+      helper.channel_id,
+    );
+    if (!channel) {
+      throw new Error(
+        `restore did not write helper channel ${helper.channel_id}`,
+      );
+    }
+  }
+  console.log(
+    `  [Restored] restore(recovered, 1) → snapshot v1 (${restoredSnapshot.secrets.length} secret) + ${recovered.helpers.length} helper channel(s) ✓`,
+  );
+
   console.log("\n✓ Discovery & Recovery flow passed.\n");
 }
 
@@ -1165,12 +1204,12 @@ async function runReplicaPairingAndSecretSyncFlow(): Promise<void> {
       `secret.helpers.length expected 2, got ${received.secret.helpers.length}`,
     );
   }
-  if (received.secret.replicas.length !== 1) {
+  if ((received.secret.replicas?.replicas.length ?? 0) !== 1) {
     throw new Error(
-      `secret.replicas.length expected 1, got ${received.secret.replicas.length}`,
+      `secret.replicas.length expected 1, got ${(received.secret.replicas?.replicas.length ?? 0)}`,
     );
   }
-  const destInfo = received.secret.replicas[0]!;
+  const destInfo = received.secret.replicas!.replicas[0]!;
   if (BigInt(destInfo.replica_id) !== destReplicaId) {
     throw new Error(
       `ReplicaInfo.replica_id expected ${destReplicaId}, got ${destInfo.replica_id}`,
@@ -1187,7 +1226,7 @@ async function runReplicaPairingAndSecretSyncFlow(): Promise<void> {
     );
   }
   console.log(
-    `  ReplicaSecretReceived: secret=${received.secret.secrets.length}secret/${received.secret.helpers.length}helpers/${received.secret.replicas.length}replicas, shares=${received.shares.length}  ✓`,
+    `  ReplicaSecretReceived: secret=${received.secret.secrets.length}secret/${received.secret.helpers.length}helpers/${(received.secret.replicas?.replicas.length ?? 0)}replicas, shares=${received.shares.length}  ✓`,
   );
 
   console.log("\n✓ Replica pairing + secret sync flow passed.\n");
@@ -1499,7 +1538,7 @@ async function runReplicaSyncVersionProgressionFlow(): Promise<void> {
   if (recvA.version !== 1) throw new Error(`step 1: expected v=1, got ${recvA.version}`);
   if (recvA.secret.helpers.length !== 0) throw new Error("step 1: helpers must be empty");
   if (recvA.secret.secrets.length !== 0) throw new Error("step 1: secrets must be empty");
-  if (recvA.secret.replicas.length !== 1) throw new Error("step 1: replicas must be 1");
+  if ((recvA.secret.replicas?.replicas.length ?? 0) !== 1) throw new Error("step 1: replicas must be 1");
   if (recvA.shares.length !== 0) throw new Error("step 1: shares must be empty");
   await assertLatestVersion(owner, SECRET_ID, 1);
   console.log("  step 1: pair replica A → v=1, secret(h=0,s=0,r=1,shares=0)  ✓");
@@ -1519,7 +1558,7 @@ async function runReplicaSyncVersionProgressionFlow(): Promise<void> {
   if (recvA.secret.secrets.length !== 1 || !recvA2Secret || !equalBytes(recvA2Secret.data, s1.data)) {
     throw new Error("step 2: secret.secrets[0].data must equal s1");
   }
-  if (recvA.secret.replicas.length !== 1) throw new Error("step 2: replicas must be 1");
+  if ((recvA.secret.replicas?.replicas.length ?? 0) !== 1) throw new Error("step 2: replicas must be 1");
   if (recvA.shares.length !== 0) throw new Error("step 2: shares must be empty");
   await assertLatestVersion(owner, SECRET_ID, 2);
   console.log("  step 2: ProtectSecret([s1]) → v=2, secret(h=0,s=1,r=1,shares=0)  ✓");
@@ -1538,7 +1577,7 @@ async function runReplicaSyncVersionProgressionFlow(): Promise<void> {
     if (recv.secret.secrets.length !== 1 || !secret || !equalBytes(secret.data, s1.data)) {
       throw new Error(`step 3 ${label}: secret must still carry s1`);
     }
-    if (recv.secret.replicas.length !== 2) throw new Error(`step 3 ${label}: replicas must be 2`);
+    if ((recv.secret.replicas?.replicas.length ?? 0) !== 2) throw new Error(`step 3 ${label}: replicas must be 2`);
     if (recv.shares.length !== 0) throw new Error(`step 3 ${label}: shares must be empty`);
   }
   await assertLatestVersion(owner, SECRET_ID, 3);
@@ -1555,7 +1594,7 @@ async function runReplicaSyncVersionProgressionFlow(): Promise<void> {
     if (!r || r.version !== 4) throw new Error(`step 4 ${label}: must observe v=4`);
     if (r.secret.helpers.length !== 1) throw new Error(`step 4 ${label}: helpers must be 1`);
     if (r.secret.secrets.length !== 1) throw new Error(`step 4 ${label}: secrets must be 1`);
-    if (r.secret.replicas.length !== 2) throw new Error(`step 4 ${label}: replicas must be 2`);
+    if ((r.secret.replicas?.replicas.length ?? 0) !== 2) throw new Error(`step 4 ${label}: replicas must be 2`);
     if (r.shares.length !== 0) throw new Error(`step 4 ${label}: shares must be empty`);
   }
   await assertLatestVersion(owner, SECRET_ID, 4);
@@ -1614,7 +1653,7 @@ async function runReplicaSyncVersionProgressionFlow(): Promise<void> {
     if (!r || r.version !== 7) throw new Error(`step 7 ${label}: must observe v=7`);
     if (r.secret.helpers.length !== 3) throw new Error(`step 7 ${label}: helpers must be 3`);
     if (r.secret.secrets.length !== 2) throw new Error(`step 7 ${label}: secrets must be 2`);
-    if (r.secret.replicas.length !== 2) throw new Error(`step 7 ${label}: replicas must be 2`);
+    if ((r.secret.replicas?.replicas.length ?? 0) !== 2) throw new Error(`step 7 ${label}: replicas must be 2`);
     if (r.shares.length !== 3) throw new Error(`step 7 ${label}: shares must be 3`);
   }
   await assertLatestVersion(owner, SECRET_ID, 7);
@@ -1634,12 +1673,12 @@ async function runReplicaSyncVersionProgressionFlow(): Promise<void> {
   if (!recvC || recvC.version !== 8) throw new Error(`step 8: C must observe v=8`);
   if (recvC.secret.helpers.length !== 3) throw new Error("step 8 C: helpers must be 3");
   if (recvC.secret.secrets.length !== 2) throw new Error("step 8 C: secrets must be 2");
-  if (recvC.secret.replicas.length !== 3) throw new Error("step 8 C: replicas must be 3");
+  if ((recvC.secret.replicas?.replicas.length ?? 0) !== 3) throw new Error("step 8 C: replicas must be 3");
   if (recvC.shares.length !== 3) throw new Error("step 8 C: shares must be 3");
   for (const [label, cid] of [["A", cidA], ["B", cidB]] as const) {
     const r = findReplicaEvent(events, cid);
     if (!r || r.version !== 8) throw new Error(`step 8 ${label}: must observe v=8`);
-    if (r.secret.replicas.length !== 3) throw new Error(`step 8 ${label}: replicas must be 3`);
+    if ((r.secret.replicas?.replicas.length ?? 0) !== 3) throw new Error(`step 8 ${label}: replicas must be 3`);
   }
   await assertLatestVersion(owner, SECRET_ID, 8);
   console.log("  step 8: pair replica C → v=8, secret(h=3,s=2,r=3,shares=3) on A+B+C; all helpers refreshed  ✓");

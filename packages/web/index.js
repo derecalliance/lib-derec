@@ -5,7 +5,6 @@ export { default as init } from "./derec_library.js";
 import {
   DeRecProtocolWasm,
   DeRecProtocolBuilder as DeRecProtocolBuilderImpl,
-  restoreFromRecoveredSecret,
   envelope_apply_trace_id,
   envelope_read_trace_id,
 } from "./derec_library.js";
@@ -17,8 +16,6 @@ export const envelope = {
 
 export const DeRecProtocol = DeRecProtocolWasm;
 export const DeRecProtocolBuilder = DeRecProtocolBuilderImpl;
-
-export { restoreFromRecoveredSecret };
 
 export const SenderKind = Object.freeze({ Owner: 0, Helper: 1, ReplicaSource: 3, ReplicaDestination: 4 });
 

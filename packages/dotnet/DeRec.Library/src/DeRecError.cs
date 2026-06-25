@@ -71,6 +71,25 @@ public static class DeRecCode
     /// </summary>
     public const int ChannelAlreadyPaired = 13;
 
+    /// <summary>
+    /// <c>DeRecProtocol.RestoreAsync</c> precondition: a user-secret snapshot
+    /// already exists for this protocol's <c>secret_id</c>. The application
+    /// must clear it before retrying.
+    /// <see cref="DeRecException.Category"/> is
+    /// <see cref="DeRecCategory.InvalidInput"/>.
+    /// </summary>
+    public const int AlreadyRestored = 14;
+
+    /// <summary>
+    /// <c>DeRecProtocol.RestoreAsync</c> precondition: one or more channels
+    /// live at canonical helper / replica ids carried by the recovered
+    /// <c>Secret</c>. <see cref="DeRecException.Message"/> formats the
+    /// collision list as <c>"restore conflict: channel(s) [a, b, ...]"</c>.
+    /// <see cref="DeRecException.Category"/> is
+    /// <see cref="DeRecCategory.InvalidInput"/>.
+    /// </summary>
+    public const int RestoreConflict = 15;
+
     public const int Encryption = 20;
     public const int Keygen = 21;
     public const int FinishPairingInitiator = 22;

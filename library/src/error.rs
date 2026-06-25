@@ -58,6 +58,9 @@ pub enum Error {
     Unpairing(#[from] crate::primitives::unpairing::UnpairingError),
 
     #[error(transparent)]
+    Restore(#[from] crate::protocol::RestoreError),
+
+    #[error(transparent)]
     DeRecMessage(#[from] crate::derec_message::DeRecMessageBuilderError),
 
     #[error(transparent)]

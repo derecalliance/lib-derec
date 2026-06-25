@@ -179,6 +179,11 @@ loop {
                 for entry in &secret.secrets {
                     println!("recovered {} ({}B)", entry.name, entry.data.len());
                 }
+                // Commit the recovered Secret into this fresh protocol's
+                // stores. Wipes the throwaway recovery-mode channels and
+                // reseats canonical helper / replica state at the recovered
+                // version. See `DeRecProtocol::restore`.
+                protocol.restore(&secret, recovered_version).await?;
             }
             // ... handle other events the application cares about.
             _ => {}
@@ -282,6 +287,7 @@ A mismatch surfaces as `Error::RoleMismatch { channel_id, expected, actual }`.
 | Verification | Challenge helpers to prove they still hold their shares. |
 | Discovery | Ask helpers which secrets and versions they store. |
 | Recovery | Re-pair, collect shares, reconstruct the secret. |
+| Restore | Commit a recovered [`Secret`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.Secret.html) into an empty protocol — reseats canonical helper / replica channels at the recovered version and wipes the throwaway recovery-mode channels. Called once, after `Recovery`, via [`DeRecProtocol::restore`](https://docs.rs/derec-library/latest/derec_library/protocol/struct.DeRecProtocol.html#method.restore). |
 | Unpairing | Tear down a paired channel and drop local state. |
 | Update channel info | Propagate post-pairing changes to communication info and/or transport endpoint. |
 

@@ -341,6 +341,25 @@ async function main() {
 main();
 ```
 
+When driving the protocol layer instead of the primitives, the recovering
+device receives a `SecretRecovered` event carrying the typed `secret`. Pass it
+to `protocol.restore(secret, version)` on a fresh `DeRecProtocol` instance to
+commit canonical helper / replica state and wipe the throwaway recovery-mode
+channels — at that point the device resumes normal operation as if the secret
+had been protected here originally.
+
+```ts
+const events = await protocol.process(responseBytes);
+for (const ev of events) {
+  if (ev.type === "SecretRecovered") {
+    await freshProtocol.restore(ev.secret, recoveredVersion);
+  }
+}
+```
+
+Errors surface as objects with a `code` field — `ALREADY_RESTORED`,
+`CONFLICT` (with `channel_ids`), `INVARIANT`, or `STORAGE`.
+
 ---
 
 ## Verification Flow

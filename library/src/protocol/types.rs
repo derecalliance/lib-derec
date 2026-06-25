@@ -172,6 +172,13 @@ pub struct UserSecrets {
     /// Optional human-readable label for this version, forwarded to
     /// helpers in `StoreShareRequest.description`.
     pub description: Option<String>,
+    /// Owner-side cached replica composite for this version, populated
+    /// after the VSS split completes. Lets the Owner resume future
+    /// `ProtectSecret` rounds without re-deriving share material, and
+    /// surfaces under [`Secret::replicas`] on the next snapshot rebuild.
+    /// `None` when this `secret_id` has no replica setup (or before
+    /// the first sharing round commits).
+    pub replicas: Option<Replicas>,
 }
 
 /// Per-replica metadata stored inside the [`Secret`] — mirrors
@@ -227,17 +234,40 @@ pub struct Secret {
     /// The user-facing secrets the Owner wishes to protect.
     #[prost(message, repeated, tag = "2")]
     pub secrets: ::prost::alloc::vec::Vec<UserSecret>,
-    /// Snapshot of all paired Replica Destinations at the time of
-    /// distribution. Always populated regardless of whether the
-    /// distribution had any destination targets — provides a stable
-    /// shape across all paths.
-    #[prost(message, repeated, tag = "3")]
-    pub replicas: ::prost::alloc::vec::Vec<ReplicaInfo>,
+    /// Replica composite: the destination peers, the per-helper share
+    /// map, and the group key. `None` when this `secret_id` has no
+    /// replica setup. See [`Replicas`] for field semantics.
+    #[prost(message, optional, tag = "3")]
+    pub replicas: ::core::option::Option<Replicas>,
     /// The `replica_id` of the device that created or last updated this
     /// version of the secret. Used by Destinations to attribute origin
     /// and will drive future conflict-resolution logic.
     #[prost(uint64, tag = "4")]
     pub owner_replica_id: u64,
+}
+
+/// Replica composite carried inside [`Secret`] — the destination
+/// roster + the 32-byte group key shared by every replica channel.
+///
+/// The per-helper share map is *not* part of this composite: VSS
+/// shares are derived from the encoded `Secret` bytes and so cannot
+/// be embedded inside the `Secret` itself. The wire-level share map
+/// rides on [`ReplicaSecretPayload`] alongside the encoded `Secret`
+/// instead.
+///
+/// `shared_key` must be 32 bytes when [`Self::replicas`] is
+/// non-empty. The library enforces this invariant in
+/// [`crate::protocol::handlers::sharing::build_secret`] (producer
+/// side) and [`crate::protocol::DeRecProtocol::restore`] (consumer
+/// side).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Replicas {
+    /// Snapshot of all paired Replica Destinations at protect time.
+    #[prost(message, repeated, tag = "1")]
+    pub replicas: ::prost::alloc::vec::Vec<ReplicaInfo>,
+    /// 32-byte replica group key.
+    #[prost(bytes = "vec", tag = "2")]
+    pub shared_key: ::prost::alloc::vec::Vec<u8>,
 }
 
 /// A single helper's share of the current secret bag — wire-pairs a
@@ -340,6 +370,7 @@ pub enum MissingPolicy {
 /// passed to [`crate::protocol::DeRecSecretStore::save`].
 ///
 /// Variants are 1:1 with [`SecretKind`].
+#[derive(Clone)]
 pub enum SecretValue {
     /// The post-pairing symmetric channel key. Established by pairing and used
     /// to authenticate and encrypt every subsequent message on the channel.

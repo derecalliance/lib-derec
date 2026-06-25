@@ -32,6 +32,12 @@
 //!   but useful for routine inventory too.
 //! - **RecoverSecret** — collect enough Helper shares to reconstruct an
 //!   earlier secret version.
+//! - **Restore** — [`DeRecProtocol::restore`] commits a recovered
+//!   [`crate::protocol::types::Secret`] into a fresh protocol instance:
+//!   reseats canonical helper / replica channels at the recovered
+//!   version and wipes the throwaway recovery-mode channels. Not a
+//!   [`DeRecFlow`] variant — called once, directly on the protocol,
+//!   after a `SecretRecovered` event surfaces.
 //! - **UpdateChannelInfo** — broadcast updated `communication_info`
 //!   and/or `transport_protocol` to one or more paired peers. Either
 //!   side may initiate. The accompanying setters
@@ -69,7 +75,8 @@ mod builder;
 mod handlers;
 
 use crate::{
-    Error, Result, primitives::pairing::request::create_contact as create_contact_message,
+    Error, Result,
+    primitives::pairing::request::create_contact as create_contact_message,
     types::ChannelId,
 };
 pub use builder::DeRecProtocolBuilder;
@@ -153,6 +160,7 @@ struct SharingRound {
 pub use events::{
     AutoAcceptPolicy, DeRecEvent, DeRecFlow, PendingAction, PendingActionKind, UnpairAck,
 };
+pub use handlers::restore::RestoreError;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::utils::now_secs;
@@ -185,6 +193,7 @@ use crate::wasm::now_secs;
 ///   ├── start(Pairing { Owner })                 (recovery re-pair)
 ///   │     └── start(Discovery)                   → discovery       (emits SecretsDiscovered)
 ///   ├── start(RecoverSecret)                     → recovery        (emits SecretRecovered)
+///   │     └── restore(&secret, version)          → commit recovered secret into canonical state
 ///   ├── start(UpdateChannelInfo)                 → endpoint/info update (either side)
 ///   └── start(Unpair)                            → unpair          (Owner-initiated; ack
 ///                                                                   semantics governed by
@@ -283,6 +292,7 @@ impl<
     T: DeRecTransport,
 > DeRecProtocol<Ch, Sh, Ss, Us, T>
 {
+
     /// Construct a [`DeRecProtocol`] directly from its components.
     ///
     /// Prefer [`DeRecProtocolBuilder`] for the type-checked
@@ -396,11 +406,7 @@ impl<
             "creating contact message"
         );
 
-        let result = create_contact_message(
-            channel_id,
-            contact_mode,
-            self.own_transport.clone(),
-        )?;
+        let result = create_contact_message(channel_id, contact_mode, self.own_transport.clone())?;
 
         self.secret_store
             .save(
@@ -495,19 +501,29 @@ impl<
                 kind,
                 contact,
                 peer_communication_info,
-            } => self.start_pairing(kind, contact, peer_communication_info).await,
+            } => {
+                self.start_pairing(kind, contact, peer_communication_info)
+                    .await
+            }
             DeRecFlow::Discovery { target } => self.start_discovery(target, reply_to).await,
             DeRecFlow::ProtectSecret {
                 secrets,
                 description,
-            } => self.start_protect_secret(secrets, description, reply_to).await,
+            } => {
+                self.start_protect_secret(secrets, description, reply_to)
+                    .await
+            }
             DeRecFlow::VerifyShares {
                 secret_id,
                 version,
                 target,
-            } => self.start_verify_shares(secret_id, version, target, reply_to).await,
+            } => {
+                self.start_verify_shares(secret_id, version, target, reply_to)
+                    .await
+            }
             DeRecFlow::RecoverSecret { secret_id, version } => {
-                self.start_recover_secret(secret_id, version, reply_to).await
+                self.start_recover_secret(secret_id, version, reply_to)
+                    .await
             }
             DeRecFlow::Unpair { target, memo } => self.start_unpair(target, memo, reply_to).await,
             DeRecFlow::UpdateChannelInfo {
@@ -521,229 +537,6 @@ impl<
         }
     }
 
-    async fn start_pairing(
-        &mut self,
-        kind: derec_proto::SenderKind,
-        contact: derec_proto::ContactMessage,
-        peer_communication_info: HashMap<String, String>,
-    ) -> Result<Option<u64>> {
-        let channel_id = handlers::pairing::start(
-            &mut self.channel_store,
-            &mut self.secret_store,
-            &self.transport,
-            &self.own_transport,
-            &self.communication_info,
-            self.secret_id,
-            kind,
-            contact,
-            peer_communication_info,
-            self.replica_id,
-        )
-        .await?;
-        Ok(Some(channel_id))
-    }
-
-    async fn start_discovery(
-        &mut self,
-        target: crate::protocol::types::Target,
-        reply_to: Option<derec_proto::TransportProtocol>,
-    ) -> Result<Option<u64>> {
-        let resolved =
-            handlers::resolve_target(&mut self.channel_store, self.secret_id, target.clone())
-                .await?;
-        handlers::require_role(
-            &self.channel_store,
-            self.secret_id,
-            &resolved,
-            derec_proto::SenderKind::Owner,
-        )
-        .await?;
-        handlers::discovery::start(
-            &mut self.channel_store,
-            &mut self.secret_store,
-            &self.transport,
-            self.secret_id,
-            target,
-            reply_to,
-        )
-        .await?;
-        Ok(None)
-    }
-
-    async fn start_protect_secret(
-        &mut self,
-        secrets: Vec<crate::protocol::types::UserSecret>,
-        description: Option<String>,
-        reply_to: Option<derec_proto::TransportProtocol>,
-    ) -> Result<Option<u64>> {
-        // `publish_secret` → `sharing::start` owns version bookkeeping
-        // now: it derives the next version from `user_secret_store`
-        // and writes the snapshot at the end of the round. No
-        // separate save_latest call is needed here.
-        self.publish_secret(secrets, description, reply_to).await?;
-        Ok(None)
-    }
-
-    /// Run one publish round: VSS-split for Helpers when the threshold is
-    /// met, build the Replica composite payload with the share material
-    /// embedded, and fan both out. A no-op (silent return) when no paired
-    /// Helpers or Replicas exist.
-    async fn publish_secret(
-        &mut self,
-        secrets: Vec<crate::protocol::types::UserSecret>,
-        description: Option<String>,
-        reply_to: Option<derec_proto::TransportProtocol>,
-    ) -> Result<()> {
-        if let Some((version, sent_channels)) = handlers::sharing::start(
-            &mut self.channel_store,
-            &mut self.share_store,
-            &mut self.secret_store,
-            &mut self.user_secret_store,
-            &self.transport,
-            secrets,
-            description,
-            self.threshold,
-            self.keep_versions_count,
-            self.secret_id,
-            reply_to,
-            self.replica_id,
-        )
-        .await?
-        {
-            self.sharing_round = Some(SharingRound {
-                version,
-                pending: sent_channels.into_iter().collect(),
-                confirmed: HashSet::new(),
-                failed: HashSet::new(),
-                started_at: now_secs(),
-            });
-        }
-        Ok(())
-    }
-
-    async fn start_verify_shares(
-        &mut self,
-        secret_id: u64,
-        version: u32,
-        target: crate::protocol::types::Target,
-        reply_to: Option<derec_proto::TransportProtocol>,
-    ) -> Result<Option<u64>> {
-        let resolved =
-            handlers::resolve_target(&mut self.channel_store, self.secret_id, target.clone())
-                .await?;
-        handlers::require_role(
-            &self.channel_store,
-            self.secret_id,
-            &resolved,
-            derec_proto::SenderKind::Owner,
-        )
-        .await?;
-        handlers::verification::start(
-            &mut self.channel_store,
-            &mut self.secret_store,
-            &self.transport,
-            &mut self.pending_verification,
-            version,
-            target,
-            secret_id,
-            reply_to,
-        )
-        .await?;
-        Ok(None)
-    }
-
-    async fn start_recover_secret(
-        &mut self,
-        secret_id: u64,
-        version: u32,
-        reply_to: Option<derec_proto::TransportProtocol>,
-    ) -> Result<Option<u64>> {
-        let all_paired: Vec<crate::types::ChannelId> = self
-            .channel_store
-            .channels(self.secret_id)
-            .await?
-            .iter()
-            .map(|c| c.id)
-            .collect();
-        handlers::require_role(
-            &self.channel_store,
-            self.secret_id,
-            &all_paired,
-            derec_proto::SenderKind::Owner,
-        )
-        .await?;
-        handlers::recovery::start(
-            &mut self.channel_store,
-            &mut self.secret_store,
-            &self.transport,
-            &mut self.pending_recovery,
-            secret_id,
-            version,
-            reply_to,
-        )
-        .await?;
-        Ok(None)
-    }
-
-    async fn start_unpair(
-        &mut self,
-        target: crate::protocol::types::Target,
-        memo: Option<String>,
-        reply_to: Option<derec_proto::TransportProtocol>,
-    ) -> Result<Option<u64>> {
-        let resolved =
-            handlers::resolve_target(&mut self.channel_store, self.secret_id, target.clone())
-                .await?;
-        handlers::require_role(
-            &self.channel_store,
-            self.secret_id,
-            &resolved,
-            derec_proto::SenderKind::Owner,
-        )
-        .await?;
-        // The handler returns immediate `Unpaired` events for the
-        // `UnpairAck::NotRequired` path; the wait-for-ack path returns
-        // nothing here and the events surface later from `process()`
-        // (on the response) or the timeout sweep. Events are stashed
-        // on the protocol for the next `process()` to drain so callers
-        // observing the synchronous stream see them.
-        let events = handlers::unpairing::start(
-            &mut self.channel_store,
-            &mut self.share_store,
-            &mut self.secret_store,
-            &self.transport,
-            &mut self.pending_unpair,
-            self.secret_id,
-            target,
-            memo,
-            self.unpair_ack,
-            now_secs(),
-            reply_to,
-        )
-        .await?;
-        self.pending_start_events.extend(events);
-        Ok(None)
-    }
-
-    async fn start_update_channel_info(
-        &mut self,
-        target: crate::protocol::types::Target,
-        communication_info: Option<HashMap<String, String>>,
-        transport_protocol: Option<derec_proto::TransportProtocol>,
-    ) -> Result<Option<u64>> {
-        handlers::update_channel_info::start(
-            &mut self.channel_store,
-            &mut self.secret_store,
-            &self.transport,
-            self.secret_id,
-            target,
-            communication_info,
-            transport_protocol,
-        )
-        .await?;
-        Ok(None)
-    }
-
     /// Accept a pending action from an [`DeRecEvent::ActionRequired`] event.
     ///
     /// Executes the "do work + send response" path for the given action,
@@ -753,157 +546,6 @@ impl<
         let events = self.accept_inner(action).await?;
         self.maybe_auto_publish_after_pair(&events).await?;
         Ok(events)
-    }
-
-    async fn accept_inner(&mut self, action: PendingAction) -> Result<Vec<DeRecEvent>> {
-        match action {
-            PendingAction::Pairing {
-                channel_id,
-                request,
-                pairing_secret,
-                kind,
-                trace_id,
-                ..
-            } => {
-                handlers::pairing::accept(
-                    &mut self.channel_store,
-                    &mut self.secret_store,
-                    &self.transport,
-                    &self.communication_info,
-                    self.secret_id,
-                    channel_id,
-                    &request,
-                    &pairing_secret,
-                    kind,
-                    trace_id,
-                    self.replica_id,
-                )
-                .await
-            }
-            PendingAction::StoreShare {
-                channel_id,
-                request,
-                shared_key,
-                trace_id,
-            } => {
-                handlers::sharing::accept(
-                    &mut self.channel_store,
-                    &mut self.share_store,
-                    &self.transport,
-                    self.secret_id,
-                    channel_id,
-                    &request,
-                    &shared_key,
-                    trace_id,
-                )
-                .await
-            }
-            PendingAction::VerifyShare {
-                channel_id,
-                request,
-                shared_key,
-                trace_id,
-            } => {
-                handlers::verification::accept(
-                    &mut self.channel_store,
-                    &mut self.share_store,
-                    &self.transport,
-                    self.secret_id,
-                    channel_id,
-                    &request,
-                    &shared_key,
-                    trace_id,
-                )
-                .await
-            }
-            PendingAction::Discovery {
-                channel_id,
-                request,
-                shared_key,
-                trace_id,
-            } => {
-                handlers::discovery::accept(
-                    &mut self.channel_store,
-                    &mut self.share_store,
-                    &self.transport,
-                    self.secret_id,
-                    channel_id,
-                    &request,
-                    &shared_key,
-                    trace_id,
-                )
-                .await
-            }
-            PendingAction::GetShare {
-                channel_id,
-                request,
-                shared_key,
-                trace_id,
-            } => {
-                handlers::recovery::accept(
-                    &mut self.channel_store,
-                    &mut self.share_store,
-                    &self.transport,
-                    self.secret_id,
-                    channel_id,
-                    &request,
-                    &shared_key,
-                    trace_id,
-                )
-                .await
-            }
-            PendingAction::Unpair {
-                channel_id,
-                request,
-                shared_key,
-                trace_id,
-            } => {
-                handlers::unpairing::accept(
-                    &mut self.channel_store,
-                    &mut self.share_store,
-                    &mut self.secret_store,
-                    &self.transport,
-                    self.secret_id,
-                    channel_id,
-                    &request,
-                    &shared_key,
-                    trace_id,
-                )
-                .await
-            }
-            PendingAction::UpdateChannelInfo {
-                channel_id,
-                request,
-                shared_key,
-                trace_id,
-            } => {
-                handlers::update_channel_info::accept(
-                    &mut self.channel_store,
-                    &self.transport,
-                    self.secret_id,
-                    channel_id,
-                    &request,
-                    &shared_key,
-                    trace_id,
-                )
-                .await
-            }
-            PendingAction::PrePair {
-                channel_id,
-                request,
-                trace_id,
-            } => {
-                handlers::pairing::accept_pre_pair(
-                    &mut self.secret_store,
-                    &self.transport,
-                    self.secret_id,
-                    channel_id,
-                    &request,
-                    trace_id,
-                )
-                .await
-            }
-        }
     }
 
     /// Reject a pending action from an [`DeRecEvent::ActionRequired`] event.
@@ -1171,111 +813,6 @@ impl<
         Ok(events)
     }
 
-    /// Auto-publish the cached secret if `events` contain a
-    /// helper-side `PairingCompleted` (the freshly-paired Helper needs
-    /// shares). The replica-side equivalent fires from
-    /// `verify_fingerprint` once the channel leaves `Pending`.
-    ///
-    /// The payload comes from `user_secret_store.load_latest()` when one
-    /// has been cached by an earlier `start(ProtectSecret)`. When no
-    /// snapshot exists yet **and** at least one Replica Destination is
-    /// already paired, the hook publishes an empty payload so the roster
-    /// snapshot still reaches every Destination — that's how a
-    /// multi-device sync stays consistent before the application has
-    /// added any user secrets.
-    async fn maybe_auto_publish_after_pair(&mut self, events: &[DeRecEvent]) -> Result<()> {
-        let helper_just_paired = events.iter().any(|e| {
-            matches!(
-                e,
-                DeRecEvent::PairingCompleted {
-                    kind: derec_proto::SenderKind::Owner,
-                    ..
-                }
-            )
-        });
-        if !helper_just_paired {
-            return Ok(());
-        }
-        let snapshot = self.user_secret_store.load_latest(self.secret_id).await?;
-        let (secrets, description) = match snapshot {
-            Some(s) => (s.secrets, s.description),
-            None => {
-                if !self.has_paired_replica_destination().await? {
-                    return Ok(());
-                }
-                (Vec::new(), None)
-            }
-        };
-        let reply_to = self.auto_reply_to.then(|| self.own_transport.clone());
-        self.publish_secret(secrets, description, reply_to).await
-    }
-
-    /// Returns `true` when at least one channel carries the local
-    /// `ReplicaSource` role in `Paired` status — i.e. the peer is a
-    /// Replica Destination that is fully verified and eligible for
-    /// secret sync.
-    async fn has_paired_replica_destination(&self) -> Result<bool> {
-        let channels = self.channel_store.channels(self.secret_id).await?;
-        Ok(channels.iter().any(|c| {
-            c.role == derec_proto::SenderKind::ReplicaSource
-                && c.status == crate::protocol::types::ChannelStatus::Paired
-        }))
-    }
-
-    /// Walk the post-`process_inner` event list and apply the
-    /// [`AutoAcceptPolicy`]: each `ActionRequired` whose action kind
-    /// the policy opts into is replaced with `AutoAccepted` plus the
-    /// flow events `accept_inner(action)` produces. Other events pass
-    /// through unchanged.
-    async fn apply_auto_accept(
-        &mut self,
-        events: Vec<DeRecEvent>,
-    ) -> Result<Vec<DeRecEvent>> {
-        let mut out = Vec::with_capacity(events.len());
-        for event in events {
-            match event {
-                DeRecEvent::ActionRequired { channel_id, action }
-                    if self.auto_accept.allows(&action) =>
-                {
-                    let action_kind = action.kind();
-                    out.push(DeRecEvent::AutoAccepted {
-                        channel_id,
-                        action_kind,
-                    });
-                    let accept_events = self.accept_inner(action).await?;
-                    out.extend(accept_events);
-                }
-                other => out.push(other),
-            }
-        }
-        Ok(out)
-    }
-
-    async fn process_inner(
-        &mut self,
-        message: &DeRecMessage,
-        channel_id: ChannelId,
-    ) -> Result<Vec<DeRecEvent>> {
-        if self.is_message_expired(message, channel_id) {
-            return Ok(vec![DeRecEvent::NoOp]);
-        }
-
-        if let Some(events) = self.process_channel_message(message, channel_id).await? {
-            return Ok(events);
-        }
-
-        if let Some(events) = self.process_pairing_message(message, channel_id).await? {
-            return Ok(events);
-        }
-
-        #[cfg(feature = "logging")]
-        tracing::warn!(channel_id = channel_id.0, "no key material for channel");
-
-        Err(Error::InvalidInput(
-            "unknown channel_id: no shared key or pairing secret found",
-        ))
-    }
-
     /// Compute the fingerprint for a paired channel.
     ///
     /// Returns a formatted string like `"1234-5678-9012-3456"` derived from
@@ -1346,6 +883,551 @@ impl<
         }
 
         Ok(true)
+    }
+
+    /// Rebuild this protocol's `secret_id` namespace from a
+    /// [`crate::protocol::types::Secret`] handed up by a
+    /// [`DeRecEvent::SecretRecovered`] event. See
+    /// [`crate::protocol::restore`] for the design rationale.
+    ///
+    /// # Caller flow
+    ///
+    /// ```text
+    /// fresh DeRecProtocol → empty stores
+    ///   → re-pair with helpers on a fresh channel-id namespace
+    ///   → start(RecoverSecret { secret_id, version })
+    ///   → SecretRecovered { secret } event arrives
+    ///   → DeRecProtocol::restore(&secret, version)
+    /// ```
+    ///
+    /// On success: canonical helper channels are persisted with
+    /// `SharedKey` + owner-side tracking shares at
+    /// `recovered_version`; canonical replica channels are persisted
+    /// with the group key from `secret.replicas.shared_key`;
+    /// the user-secret snapshot is committed at `recovered_version`;
+    /// the protocol's `replica_id` is adopted from
+    /// `secret.owner_replica_id` if previously unset; every other
+    /// channel under `self.secret_id` (i.e. the recovery-mode
+    /// channels) is unpaired (request sent to the helper, local
+    /// state dropped). The protocol resumes normal operation
+    /// immediately — the next `start(ProtectSecret)` publishes
+    /// `recovered_version + 1` to the restored helpers.
+    ///
+    /// The snapshot write is the commit point — nothing is removed
+    /// before it succeeds. Any mid-flight failure leaves state the
+    /// next `restore` call will detect as one of the precondition
+    /// errors below.
+    ///
+    /// # Errors
+    ///
+    /// Precondition / invariant failures surface as
+    /// [`Error::Restore`](crate::Error::Restore) wrapping one of:
+    ///
+    /// - [`RestoreError::AlreadyRestored`] when a user-secret
+    ///   snapshot exists for this `secret_id`.
+    /// - [`RestoreError::Conflict`] when one or more channels live
+    ///   at canonical helper / replica ids carried by `secret`.
+    /// - [`RestoreError::Invariant`] when the recovered `Secret`
+    ///   is internally inconsistent (e.g. non-empty `replicas` with
+    ///   empty `replicas.shared_key`).
+    ///
+    /// Store I/O failures mid-restore propagate as the underlying
+    /// [`Error::ShareStore`](crate::Error::ShareStore),
+    /// [`Error::ChannelStore`](crate::Error::ChannelStore), or
+    /// [`Error::SecretStore`](crate::Error::SecretStore) variant.
+    #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
+    pub async fn restore(
+        &mut self,
+        secret: &crate::protocol::types::Secret,
+        recovered_version: u32,
+    ) -> Result<()> {
+        let events = handlers::restore::restore(
+            &mut self.channel_store,
+            &mut self.share_store,
+            &mut self.secret_store,
+            &mut self.user_secret_store,
+            &self.transport,
+            &mut self.pending_unpair,
+            &mut self.replica_id,
+            self.secret_id,
+            secret,
+            recovered_version,
+        )
+        .await?;
+        self.pending_start_events.extend(events);
+        Ok(())
+    }
+
+    async fn start_pairing(
+        &mut self,
+        kind: derec_proto::SenderKind,
+        contact: derec_proto::ContactMessage,
+        peer_communication_info: HashMap<String, String>,
+    ) -> Result<Option<u64>> {
+        let channel_id = handlers::pairing::start(
+            &mut self.channel_store,
+            &mut self.secret_store,
+            &self.transport,
+            &self.own_transport,
+            &self.communication_info,
+            self.secret_id,
+            kind,
+            contact,
+            peer_communication_info,
+            self.replica_id,
+        )
+        .await?;
+        Ok(Some(channel_id))
+    }
+
+    async fn start_discovery(
+        &mut self,
+        target: crate::protocol::types::Target,
+        reply_to: Option<derec_proto::TransportProtocol>,
+    ) -> Result<Option<u64>> {
+        let resolved =
+            handlers::resolve_target(&mut self.channel_store, self.secret_id, target.clone())
+                .await?;
+        handlers::require_role(
+            &self.channel_store,
+            self.secret_id,
+            &resolved,
+            derec_proto::SenderKind::Owner,
+        )
+        .await?;
+        handlers::discovery::start(
+            &mut self.channel_store,
+            &mut self.secret_store,
+            &self.transport,
+            self.secret_id,
+            target,
+            reply_to,
+        )
+        .await?;
+        Ok(None)
+    }
+
+    async fn start_protect_secret(
+        &mut self,
+        secrets: Vec<crate::protocol::types::UserSecret>,
+        description: Option<String>,
+        reply_to: Option<derec_proto::TransportProtocol>,
+    ) -> Result<Option<u64>> {
+        self.publish_secret(secrets, description, reply_to).await?;
+        Ok(None)
+    }
+
+    /// Run one publish round: VSS-split for Helpers when the threshold is
+    /// met, build the Replica composite payload with the share material
+    /// embedded, and fan both out. A no-op (silent return) when no paired
+    /// Helpers or Replicas exist.
+    async fn publish_secret(
+        &mut self,
+        secrets: Vec<crate::protocol::types::UserSecret>,
+        description: Option<String>,
+        reply_to: Option<derec_proto::TransportProtocol>,
+    ) -> Result<()> {
+        if let Some((version, sent_channels)) = handlers::sharing::start(
+            &mut self.channel_store,
+            &mut self.share_store,
+            &mut self.secret_store,
+            &mut self.user_secret_store,
+            &self.transport,
+            secrets,
+            description,
+            self.threshold,
+            self.keep_versions_count,
+            self.secret_id,
+            reply_to,
+            self.replica_id,
+        )
+        .await?
+        {
+            self.sharing_round = Some(SharingRound {
+                version,
+                pending: sent_channels.into_iter().collect(),
+                confirmed: HashSet::new(),
+                failed: HashSet::new(),
+                started_at: now_secs(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn start_verify_shares(
+        &mut self,
+        secret_id: u64,
+        version: u32,
+        target: crate::protocol::types::Target,
+        reply_to: Option<derec_proto::TransportProtocol>,
+    ) -> Result<Option<u64>> {
+        let resolved =
+            handlers::resolve_target(&mut self.channel_store, self.secret_id, target.clone())
+                .await?;
+        handlers::require_role(
+            &self.channel_store,
+            self.secret_id,
+            &resolved,
+            derec_proto::SenderKind::Owner,
+        )
+        .await?;
+        handlers::verification::start(
+            &mut self.channel_store,
+            &mut self.secret_store,
+            &self.transport,
+            &mut self.pending_verification,
+            version,
+            target,
+            secret_id,
+            reply_to,
+        )
+        .await?;
+        Ok(None)
+    }
+
+    async fn start_recover_secret(
+        &mut self,
+        secret_id: u64,
+        version: u32,
+        reply_to: Option<derec_proto::TransportProtocol>,
+    ) -> Result<Option<u64>> {
+        let all_paired: Vec<crate::types::ChannelId> = self
+            .channel_store
+            .channels(self.secret_id)
+            .await?
+            .iter()
+            .map(|c| c.id)
+            .collect();
+        handlers::require_role(
+            &self.channel_store,
+            self.secret_id,
+            &all_paired,
+            derec_proto::SenderKind::Owner,
+        )
+        .await?;
+        handlers::recovery::start(
+            &mut self.channel_store,
+            &mut self.secret_store,
+            &self.transport,
+            &mut self.pending_recovery,
+            secret_id,
+            version,
+            reply_to,
+        )
+        .await?;
+        Ok(None)
+    }
+
+    async fn start_unpair(
+        &mut self,
+        target: crate::protocol::types::Target,
+        memo: Option<String>,
+        reply_to: Option<derec_proto::TransportProtocol>,
+    ) -> Result<Option<u64>> {
+        let resolved =
+            handlers::resolve_target(&mut self.channel_store, self.secret_id, target.clone())
+                .await?;
+        handlers::require_role(
+            &self.channel_store,
+            self.secret_id,
+            &resolved,
+            derec_proto::SenderKind::Owner,
+        )
+        .await?;
+        // The handler returns immediate `Unpaired` events for the
+        // `UnpairAck::NotRequired` path; the wait-for-ack path returns
+        // nothing here and the events surface later from `process()`
+        // (on the response) or the timeout sweep. Events are stashed
+        // on the protocol for the next `process()` to drain so callers
+        // observing the synchronous stream see them.
+        let events = handlers::unpairing::start(
+            &mut self.channel_store,
+            &mut self.share_store,
+            &mut self.secret_store,
+            &self.transport,
+            &mut self.pending_unpair,
+            self.secret_id,
+            target,
+            memo,
+            self.unpair_ack,
+            now_secs(),
+            reply_to,
+        )
+        .await?;
+        self.pending_start_events.extend(events);
+        Ok(None)
+    }
+
+    async fn start_update_channel_info(
+        &mut self,
+        target: crate::protocol::types::Target,
+        communication_info: Option<HashMap<String, String>>,
+        transport_protocol: Option<derec_proto::TransportProtocol>,
+    ) -> Result<Option<u64>> {
+        handlers::update_channel_info::start(
+            &mut self.channel_store,
+            &mut self.secret_store,
+            &self.transport,
+            self.secret_id,
+            target,
+            communication_info,
+            transport_protocol,
+        )
+        .await?;
+        Ok(None)
+    }
+
+    async fn accept_inner(&mut self, action: PendingAction) -> Result<Vec<DeRecEvent>> {
+        match action {
+            PendingAction::Pairing {
+                channel_id,
+                request,
+                pairing_secret,
+                kind,
+                trace_id,
+                ..
+            } => {
+                handlers::pairing::accept(
+                    &mut self.channel_store,
+                    &mut self.secret_store,
+                    &self.transport,
+                    &self.communication_info,
+                    self.secret_id,
+                    channel_id,
+                    &request,
+                    &pairing_secret,
+                    kind,
+                    trace_id,
+                    self.replica_id,
+                )
+                .await
+            }
+            PendingAction::StoreShare {
+                channel_id,
+                request,
+                shared_key,
+                trace_id,
+            } => {
+                handlers::sharing::accept(
+                    &mut self.channel_store,
+                    &mut self.share_store,
+                    &self.transport,
+                    self.secret_id,
+                    channel_id,
+                    &request,
+                    &shared_key,
+                    trace_id,
+                )
+                .await
+            }
+            PendingAction::VerifyShare {
+                channel_id,
+                request,
+                shared_key,
+                trace_id,
+            } => {
+                handlers::verification::accept(
+                    &mut self.channel_store,
+                    &mut self.share_store,
+                    &self.transport,
+                    self.secret_id,
+                    channel_id,
+                    &request,
+                    &shared_key,
+                    trace_id,
+                )
+                .await
+            }
+            PendingAction::Discovery {
+                channel_id,
+                request,
+                shared_key,
+                trace_id,
+            } => {
+                handlers::discovery::accept(
+                    &mut self.channel_store,
+                    &mut self.share_store,
+                    &self.transport,
+                    self.secret_id,
+                    channel_id,
+                    &request,
+                    &shared_key,
+                    trace_id,
+                )
+                .await
+            }
+            PendingAction::GetShare {
+                channel_id,
+                request,
+                shared_key,
+                trace_id,
+            } => {
+                handlers::recovery::accept(
+                    &mut self.channel_store,
+                    &mut self.share_store,
+                    &self.transport,
+                    self.secret_id,
+                    channel_id,
+                    &request,
+                    &shared_key,
+                    trace_id,
+                )
+                .await
+            }
+            PendingAction::Unpair {
+                channel_id,
+                request,
+                shared_key,
+                trace_id,
+            } => {
+                handlers::unpairing::accept(
+                    &mut self.channel_store,
+                    &mut self.share_store,
+                    &mut self.secret_store,
+                    &self.transport,
+                    self.secret_id,
+                    channel_id,
+                    &request,
+                    &shared_key,
+                    trace_id,
+                )
+                .await
+            }
+            PendingAction::UpdateChannelInfo {
+                channel_id,
+                request,
+                shared_key,
+                trace_id,
+            } => {
+                handlers::update_channel_info::accept(
+                    &mut self.channel_store,
+                    &self.transport,
+                    self.secret_id,
+                    channel_id,
+                    &request,
+                    &shared_key,
+                    trace_id,
+                )
+                .await
+            }
+            PendingAction::PrePair {
+                channel_id,
+                request,
+                trace_id,
+            } => {
+                handlers::pairing::accept_pre_pair(
+                    &mut self.secret_store,
+                    &self.transport,
+                    self.secret_id,
+                    channel_id,
+                    &request,
+                    trace_id,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Auto-publish the cached secret if `events` contain a
+    /// helper-side `PairingCompleted` (the freshly-paired Helper needs
+    /// shares). The replica-side equivalent fires from
+    /// `verify_fingerprint` once the channel leaves `Pending`.
+    ///
+    /// The payload comes from `user_secret_store.load_latest()` when one
+    /// has been cached by an earlier `start(ProtectSecret)`. When no
+    /// snapshot exists yet **and** at least one Replica Destination is
+    /// already paired, the hook publishes an empty payload so the roster
+    /// snapshot still reaches every Destination — that's how a
+    /// multi-device sync stays consistent before the application has
+    /// added any user secrets.
+    async fn maybe_auto_publish_after_pair(&mut self, events: &[DeRecEvent]) -> Result<()> {
+        let helper_just_paired = events.iter().any(|e| {
+            matches!(
+                e,
+                DeRecEvent::PairingCompleted {
+                    kind: derec_proto::SenderKind::Owner,
+                    ..
+                }
+            )
+        });
+        if !helper_just_paired {
+            return Ok(());
+        }
+        let snapshot = self.user_secret_store.load_latest(self.secret_id).await?;
+        let (secrets, description) = match snapshot {
+            Some(s) => (s.secrets, s.description),
+            None => {
+                if !self.has_paired_replica_destination().await? {
+                    return Ok(());
+                }
+                (Vec::new(), None)
+            }
+        };
+        let reply_to = self.auto_reply_to.then(|| self.own_transport.clone());
+        self.publish_secret(secrets, description, reply_to).await
+    }
+
+    /// Returns `true` when at least one channel carries the local
+    /// `ReplicaSource` role in `Paired` status — i.e. the peer is a
+    /// Replica Destination that is fully verified and eligible for
+    /// secret sync.
+    async fn has_paired_replica_destination(&self) -> Result<bool> {
+        let channels = self.channel_store.channels(self.secret_id).await?;
+        Ok(channels.iter().any(|c| {
+            c.role == derec_proto::SenderKind::ReplicaSource
+                && c.status == crate::protocol::types::ChannelStatus::Paired
+        }))
+    }
+
+    /// Walk the post-`process_inner` event list and apply the
+    /// [`AutoAcceptPolicy`]: each `ActionRequired` whose action kind
+    /// the policy opts into is replaced with `AutoAccepted` plus the
+    /// flow events `accept_inner(action)` produces. Other events pass
+    /// through unchanged.
+    async fn apply_auto_accept(&mut self, events: Vec<DeRecEvent>) -> Result<Vec<DeRecEvent>> {
+        let mut out = Vec::with_capacity(events.len());
+        for event in events {
+            match event {
+                DeRecEvent::ActionRequired { channel_id, action }
+                    if self.auto_accept.allows(&action) =>
+                {
+                    let action_kind = action.kind();
+                    out.push(DeRecEvent::AutoAccepted {
+                        channel_id,
+                        action_kind,
+                    });
+                    let accept_events = self.accept_inner(action).await?;
+                    out.extend(accept_events);
+                }
+                other => out.push(other),
+            }
+        }
+        Ok(out)
+    }
+
+    async fn process_inner(
+        &mut self,
+        message: &DeRecMessage,
+        channel_id: ChannelId,
+    ) -> Result<Vec<DeRecEvent>> {
+        if self.is_message_expired(message, channel_id) {
+            return Ok(vec![DeRecEvent::NoOp]);
+        }
+
+        if let Some(events) = self.process_channel_message(message, channel_id).await? {
+            return Ok(events);
+        }
+
+        if let Some(events) = self.process_pairing_message(message, channel_id).await? {
+            return Ok(events);
+        }
+
+        #[cfg(feature = "logging")]
+        tracing::warn!(channel_id = channel_id.0, "no key material for channel");
+
+        Err(Error::InvalidInput(
+            "unknown channel_id: no shared key or pairing secret found",
+        ))
     }
 
     fn is_message_expired(
@@ -1427,9 +1509,7 @@ impl<
         // material. ECIES ciphertext for the regular Pair flow won't
         // realistically decode to a valid `PrePair*` variant; if it ever
         // did, we fall through to the encrypted path below.
-        if let Ok(inner) =
-            crate::derec_message::extract_inner_plaintext_message(&message.message)
-        {
+        if let Ok(inner) = crate::derec_message::extract_inner_plaintext_message(&message.message) {
             match inner {
                 inner @ MessageBody::PrePairRequest(_) => {
                     // Initiator side: needs `PairingSecret` to answer.
@@ -1650,7 +1730,9 @@ impl<
             if channel.status == crate::protocol::types::ChannelStatus::Pending
                 && now.saturating_sub(channel.created_at) > timeout
             {
-                self.channel_store.remove(self.secret_id, channel.id).await?;
+                self.channel_store
+                    .remove(self.secret_id, channel.id)
+                    .await?;
                 // Clean up any leftover pairing secret for this channel.
                 let _ = self
                     .secret_store

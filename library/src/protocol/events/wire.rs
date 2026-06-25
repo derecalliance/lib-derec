@@ -178,8 +178,19 @@ pub struct DiscoveredVersion {
 pub struct SecretWire {
     pub helpers: Vec<Helper>,
     pub secrets: Vec<UserSecret>,
-    pub replicas: Vec<Replica>,
+    /// Replica composite. Absent when this `secret_id` has no replica
+    /// setup. Carries the destination roster and the 32-byte group key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<ReplicasWire>,
     pub owner_replica_id: String,
+}
+
+#[derive(Serialize)]
+pub struct ReplicasWire {
+    pub replicas: Vec<Replica>,
+    /// 32-byte replica group key. Required by `DeRecProtocol::restore`
+    /// to rebuild replica channel state.
+    pub shared_key: Vec<u8>,
 }
 
 #[derive(Serialize)]
@@ -236,17 +247,20 @@ impl From<Secret> for SecretWire {
                     data: s.data,
                 })
                 .collect(),
-            replicas: v
-                .replicas
-                .into_iter()
-                .map(|r| Replica {
-                    channel_id: r.channel_id.to_string(),
-                    transport_uri: r.transport_uri,
-                    communication_info: r.communication_info,
-                    replica_id: encode_replica_id(r.replica_id),
-                    sender_kind: r.sender_kind,
-                })
-                .collect(),
+            replicas: v.replicas.map(|g| ReplicasWire {
+                replicas: g
+                    .replicas
+                    .into_iter()
+                    .map(|r| Replica {
+                        channel_id: r.channel_id.to_string(),
+                        transport_uri: r.transport_uri,
+                        communication_info: r.communication_info,
+                        replica_id: encode_replica_id(r.replica_id),
+                        sender_kind: r.sender_kind,
+                    })
+                    .collect(),
+                shared_key: g.shared_key,
+            }),
             owner_replica_id: encode_replica_id(v.owner_replica_id),
         }
     }

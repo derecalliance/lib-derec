@@ -162,6 +162,7 @@ pub(in crate::protocol) async fn start<
                 version,
                 secrets: snapshot_secrets,
                 description: snapshot_description,
+                replicas: secret.replicas.clone(),
             },
         )
         .await?;
@@ -376,273 +377,6 @@ fn on_response(
     }
 }
 
-/// Resolve all currently-paired publish targets into `(helpers, replicas)`
-/// keyed by channel role.
-///
-/// Both vectors carry `(Channel, SharedKey)` pairs ready for envelope
-/// construction. The protocol publishes the secret to *every* paired
-/// peer that can receive it — apps no longer subset the target — so
-/// selection is driven entirely by channel state:
-/// `role == Owner` (peer is a Helper) lands in `helpers`,
-/// `role == ReplicaSource` (peer is a ReplicaDestination) lands in
-/// `replicas`. Channels with any other `role` (e.g. `Helper` — we're the
-/// helper on the channel) are ignored.
-///
-/// `ChannelStatus::Pending` channels (replicas awaiting fingerprint
-/// verification) are excluded to prevent a MITM-leaning peer from
-/// receiving secret material before the user confirms the fingerprint
-/// out-of-band.
-async fn load_all_paired_targets<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
-    channel_store: &mut Ch,
-    secret_store: &mut Ss,
-    secret_id: u64,
-) -> Result<(
-    Vec<(crate::protocol::types::Channel, SharedKey)>,
-    Vec<(crate::protocol::types::Channel, SharedKey)>,
-)> {
-    let all_channels = channel_store.channels(secret_id).await?;
-    let selected_channels: Vec<crate::protocol::types::Channel> = all_channels
-        .into_iter()
-        .filter(|c| {
-            matches!(
-                c.role,
-                SenderKind::Owner | SenderKind::ReplicaSource
-            ) && c.status == crate::protocol::types::ChannelStatus::Paired
-        })
-        .collect();
-
-    if selected_channels.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
-    }
-
-    let selected_ids: Vec<ChannelId> = selected_channels.iter().map(|c| c.id).collect();
-
-    let mut keys: std::collections::HashMap<ChannelId, SharedKey> = secret_store
-        .load_many(
-            secret_id,
-            &selected_ids,
-            SecretKind::SharedKey,
-            MissingPolicy::Fail,
-        )
-        .await?
-        .into_iter()
-        .filter_map(|(cid, v)| match v {
-            SecretValue::SharedKey(k) => Some((cid, k)),
-            _ => None,
-        })
-        .collect();
-
-    let mut helpers: Vec<(crate::protocol::types::Channel, SharedKey)> = Vec::new();
-    let mut replicas: Vec<(crate::protocol::types::Channel, SharedKey)> = Vec::new();
-    for channel in selected_channels {
-        let key = keys
-            .remove(&channel.id)
-            .expect("load_many(MissingPolicy::Fail) guarantees an entry per id");
-        match channel.role {
-            // Local kind == Owner, peer is the Helper. Classic share path.
-            SenderKind::Owner => helpers.push((channel, key)),
-            // Local kind == ReplicaSource, peer is a ReplicaDestination
-            // ready to receive full secret payloads (secret-sync path).
-            SenderKind::ReplicaSource => replicas.push((channel, key)),
-            // Local kind == Helper — we're the helper on this channel, not
-            // a legitimate ProtectSecret initiator. The orchestrator-level
-            // role gate refuses these before we get here.
-            _ => {}
-        }
-    }
-    Ok((helpers, replicas))
-}
-
-/// Build the canonical [`Secret`] for this `ProtectSecret` round —
-/// the inner payload that contains the full roster snapshot (helpers +
-/// replicas + secrets) plus the owner's replica id.
-///
-/// Returns the [`Secret`] value (not its encoded bytes), so callers
-/// can either wrap it in [`DeRecSecret`] for the helper VSS path
-/// (via [`wrap_for_helper_split`]) or embed it directly in a
-/// [`ReplicaSecretPayload`] for the Destination path (via
-/// [`build_replica_composite_bytes`]).
-fn build_secret(
-    paired_helpers: &[(crate::protocol::types::Channel, SharedKey)],
-    paired_replicas: &[(crate::protocol::types::Channel, SharedKey)],
-    secrets: Vec<UserSecret>,
-    owner_replica_id: u64,
-) -> Secret {
-    let helper_infos: Vec<HelperInfo> = paired_helpers
-        .iter()
-        .map(|(channel, shared_key)| HelperInfo {
-            channel_id: channel.id.0,
-            transport_uri: channel.transport.uri.to_owned(),
-            shared_key: shared_key.to_vec(),
-            communication_info: channel.communication_info.clone(),
-        })
-        .collect();
-
-    let replica_infos: Vec<crate::protocol::types::ReplicaInfo> = paired_replicas
-        .iter()
-        .map(
-            |(channel, _shared_key)| crate::protocol::types::ReplicaInfo {
-                channel_id: channel.id.0,
-                transport_uri: channel.transport.uri.to_owned(),
-                communication_info: channel.communication_info.clone(),
-                replica_id: channel.replica_id.unwrap_or(0),
-                sender_kind: crate::protocol::handlers::pairing::derive_peer_kind(channel.role)
-                    as i32,
-            },
-        )
-        .collect();
-
-    Secret {
-        helpers: helper_infos,
-        secrets,
-        replicas: replica_infos,
-        owner_replica_id,
-    }
-}
-
-/// Wrap the [`Secret`] in a [`DeRecSecret`] envelope ready to be
-/// VSS-split for helper distribution. The helper side reconstructs the
-/// `DeRecSecret` from a `threshold`-sized subset of shares; the inner
-/// `secret_data` then decodes back to the original [`Secret`].
-fn wrap_for_helper_split(secret: &Secret, threshold: usize) -> Vec<u8> {
-    let derec_secret = DeRecSecret {
-        secret_data: secret.encode_to_vec(),
-        creation_time: None,
-        helper_threshold_for_recovery: threshold as i64,
-        helper_threshold_for_confirming_share_receipt: threshold as i64,
-        helpers: Vec::new(),
-    };
-    derec_secret.encode_to_vec()
-}
-
-/// Build the typed [`ReplicaSecretPayload`] sent to every Destination on
-/// this round. Pairs the full [`Secret`] (so the Destination has the
-/// entire payload) with the per-helper share map (so the Destination can
-/// act as a recovery delegate by re-fetching shares from each helper
-/// using `secret.helpers[i].shared_key`).
-///
-/// Returns the typed value (not bytes) — the per-channel `shared_key`
-/// handover field is set later by
-/// [`distribute_composite_to_destinations`] when a particular Destination
-/// needs to adopt the group key.
-fn build_replica_composite(
-    secret: &Secret,
-    split_result: Option<&crate::primitives::sharing::request::SplitResult>,
-) -> crate::protocol::types::ReplicaSecretPayload {
-    let shares: Vec<crate::protocol::types::ChannelShare> = split_result
-        .map(|r| {
-            r.shares
-                .iter()
-                .map(|(ch_id, committed)| crate::protocol::types::ChannelShare {
-                    channel_id: ch_id.0,
-                    committed_share: committed.encode_to_vec(),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    crate::protocol::types::ReplicaSecretPayload {
-        secret: Some(secret.clone()),
-        shares,
-        shared_key: Vec::new(),
-    }
-}
-
-/// Resolve the current replica group key from the set of already-paired
-/// Destinations on this `secret_id`. Returns `None` when no Destinations
-/// are paired yet (or only one — that channel's pair-handshake key is
-/// implicitly the group key, no handover needed).
-///
-/// The group key is the `SharedKey` stored on the oldest paired
-/// Destination channel — ordered by `(created_at, channel_id)` so the
-/// answer is deterministic across restarts. That channel is guaranteed
-/// to hold the group key because it set the precedent on its own first
-/// sync round (where `shared_key` was left empty and its pair-handshake
-/// key became the group key).
-fn current_replica_group_key(
-    replicas: &[(crate::protocol::types::Channel, SharedKey)],
-) -> Option<SharedKey> {
-    replicas
-        .iter()
-        .min_by_key(|(ch, _)| (ch.created_at, ch.id.0))
-        .map(|(_, key)| *key)
-}
-
-#[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(secret_id = secret_id)))]
-#[allow(clippy::too_many_arguments)]
-async fn distribute_shares<Sh: DeRecShareStore, T: DeRecTransport>(
-    share_store: &mut Sh,
-    transport: &T,
-    paired_helpers: &[(crate::protocol::types::Channel, SharedKey)],
-    split_result: &crate::primitives::sharing::request::SplitResult,
-    keep_versions_count: usize,
-    secret_id: u64,
-    version: u32,
-    description: &str,
-    reply_to: Option<derec_proto::TransportProtocol>,
-    owner_replica_id: Option<u64>,
-) -> Result<Vec<ChannelId>> {
-    let keep_list: Vec<u32> = {
-        let start = version
-            .saturating_sub(keep_versions_count as u32 - 1)
-            .max(1);
-        (start..=version).collect()
-    };
-
-    let mut sent_channels: Vec<ChannelId> = Vec::new();
-    for (channel, shared_key) in paired_helpers {
-        let Some(committed_share) = split_result.shares.get(&channel.id) else {
-            continue;
-        };
-
-        let msg = produce_store_share_request_message(
-            channel.id,
-            version,
-            secret_id,
-            committed_share,
-            &keep_list,
-            description,
-            shared_key,
-            reply_to.clone(),
-            owner_replica_id,
-        )?;
-        let envelope = super::apply_trace_id(msg.envelope, super::fresh_trace_id())?;
-        transport.send(&channel.transport, envelope).await?;
-
-        share_store
-            .save(
-                secret_id,
-                channel.id,
-                Share {
-                    secret_id,
-                    version,
-                    replica_id: owner_replica_id,
-                    bytes: committed_share.encode_to_vec(),
-                },
-            )
-            .await?;
-
-        sent_channels.push(channel.id);
-
-        #[cfg(feature = "logging")]
-        tracing::debug!(
-            channel_id = channel.id.0,
-            secret_id = secret_id,
-            version = version,
-            "share envelope sent"
-        );
-    }
-
-    #[cfg(feature = "logging")]
-    tracing::info!(
-        secret_id = secret_id,
-        version = version,
-        "secret distributed to helpers"
-    );
-
-    Ok(sent_channels)
-}
-
 /// Inbound `StoreShareRequest` on a **replica** channel. The payload
 /// is the full secret — the sender used `share_algorithm =
 /// REPLICA_SECRET`. We decode the typed
@@ -757,7 +491,7 @@ pub(in crate::protocol) async fn handle_replica_request<Ss: DeRecSecretStore, T:
         secret_id,
         version,
         helpers_in_secret = secret.helpers.len(),
-        replicas_in_secret = secret.replicas.len(),
+        replicas_in_secret = secret.replicas.as_ref().map_or(0, |g| g.replicas.len()),
         secrets_in_secret = secret.secrets.len(),
         shares_count = shares.len(),
         handover = !composite.shared_key.is_empty(),
@@ -803,6 +537,292 @@ pub(in crate::protocol) fn handle_replica_response(
         status,
         memo,
     }])
+}
+
+/// Resolve all currently-paired publish targets into `(helpers, replicas)`
+/// keyed by channel role.
+///
+/// Both vectors carry `(Channel, SharedKey)` pairs ready for envelope
+/// construction. The protocol publishes the secret to *every* paired
+/// peer that can receive it — apps no longer subset the target — so
+/// selection is driven entirely by channel state:
+/// `role == Owner` (peer is a Helper) lands in `helpers`,
+/// `role == ReplicaSource` (peer is a ReplicaDestination) lands in
+/// `replicas`. Channels with any other `role` (e.g. `Helper` — we're the
+/// helper on the channel) are ignored.
+///
+/// `ChannelStatus::Pending` channels (replicas awaiting fingerprint
+/// verification) are excluded to prevent a MITM-leaning peer from
+/// receiving secret material before the user confirms the fingerprint
+/// out-of-band.
+async fn load_all_paired_targets<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
+    channel_store: &mut Ch,
+    secret_store: &mut Ss,
+    secret_id: u64,
+) -> Result<(
+    Vec<(crate::protocol::types::Channel, SharedKey)>,
+    Vec<(crate::protocol::types::Channel, SharedKey)>,
+)> {
+    let all_channels = channel_store.channels(secret_id).await?;
+    let selected_channels: Vec<crate::protocol::types::Channel> = all_channels
+        .into_iter()
+        .filter(|c| {
+            matches!(
+                c.role,
+                SenderKind::Owner | SenderKind::ReplicaSource
+            ) && c.status == crate::protocol::types::ChannelStatus::Paired
+        })
+        .collect();
+
+    if selected_channels.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let selected_ids: Vec<ChannelId> = selected_channels.iter().map(|c| c.id).collect();
+
+    let mut keys: std::collections::HashMap<ChannelId, SharedKey> = secret_store
+        .load_many(
+            secret_id,
+            &selected_ids,
+            SecretKind::SharedKey,
+            MissingPolicy::Fail,
+        )
+        .await?
+        .into_iter()
+        .filter_map(|(cid, v)| match v {
+            SecretValue::SharedKey(k) => Some((cid, k)),
+            _ => None,
+        })
+        .collect();
+
+    let mut helpers: Vec<(crate::protocol::types::Channel, SharedKey)> = Vec::new();
+    let mut replicas: Vec<(crate::protocol::types::Channel, SharedKey)> = Vec::new();
+    for channel in selected_channels {
+        let key = keys
+            .remove(&channel.id)
+            .expect("load_many(MissingPolicy::Fail) guarantees an entry per id");
+        match channel.role {
+            // Local kind == Owner, peer is the Helper. Classic share path.
+            SenderKind::Owner => helpers.push((channel, key)),
+            // Local kind == ReplicaSource, peer is a ReplicaDestination
+            // ready to receive full secret payloads (secret-sync path).
+            SenderKind::ReplicaSource => replicas.push((channel, key)),
+            // Local kind == Helper — we're the helper on this channel, not
+            // a legitimate ProtectSecret initiator. The orchestrator-level
+            // role gate refuses these before we get here.
+            _ => {}
+        }
+    }
+    Ok((helpers, replicas))
+}
+
+/// Build the canonical [`Secret`] for this `ProtectSecret` round —
+/// the inner payload that contains the full roster snapshot (helpers +
+/// replicas + secrets) plus the owner's replica id.
+///
+/// `Secret.replicas.shares` is left empty here because the VSS shares
+/// are derived from the Secret bytes — they can't be embedded before
+/// the split. The destination composite and the Owner's local snapshot
+/// repopulate `Secret.replicas.shares` after the split via
+/// [`with_populated_shares`].
+fn build_secret(
+    paired_helpers: &[(crate::protocol::types::Channel, SharedKey)],
+    paired_replicas: &[(crate::protocol::types::Channel, SharedKey)],
+    secrets: Vec<UserSecret>,
+    owner_replica_id: u64,
+) -> Secret {
+    let helper_infos: Vec<HelperInfo> = paired_helpers
+        .iter()
+        .map(|(channel, shared_key)| HelperInfo {
+            channel_id: channel.id.0,
+            transport_uri: channel.transport.uri.to_owned(),
+            shared_key: shared_key.to_vec(),
+            communication_info: channel.communication_info.clone(),
+        })
+        .collect();
+
+    Secret {
+        helpers: helper_infos,
+        secrets,
+        replicas: build_replicas(paired_replicas),
+        owner_replica_id,
+    }
+}
+
+/// Build the [`Replicas`] composite from the current destination
+/// roster. Returns `None` when there are no paired destinations.
+///
+/// All replica channels for one `secret_id` converge on a single group
+/// key, so picking the first destination's `shared_key` is canonical.
+fn build_replicas(
+    paired_replicas: &[(crate::protocol::types::Channel, SharedKey)],
+) -> Option<crate::protocol::types::Replicas> {
+    if paired_replicas.is_empty() {
+        return None;
+    }
+    let replica_infos: Vec<crate::protocol::types::ReplicaInfo> = paired_replicas
+        .iter()
+        .map(
+            |(channel, _shared_key)| crate::protocol::types::ReplicaInfo {
+                channel_id: channel.id.0,
+                transport_uri: channel.transport.uri.to_owned(),
+                communication_info: channel.communication_info.clone(),
+                replica_id: channel.replica_id.unwrap_or(0),
+                sender_kind: crate::protocol::handlers::pairing::derive_peer_kind(channel.role)
+                    as i32,
+            },
+        )
+        .collect();
+    let shared_key = paired_replicas
+        .first()
+        .map(|(_, key)| key.to_vec())
+        .unwrap_or_default();
+    Some(crate::protocol::types::Replicas {
+        replicas: replica_infos,
+        shared_key,
+    })
+}
+
+/// Build the typed [`ReplicaSecretPayload`] sent to every Destination
+/// on this round: the full [`Secret`] plus the per-helper share map
+/// (so the Destination can recover via either path — read the secret
+/// directly, or contact each helper using
+/// `secret.helpers[i].shared_key` and request their stored share).
+///
+/// The per-channel `shared_key` handover field is left empty here and
+/// set later by [`distribute_composite_to_destinations`] when a
+/// particular Destination needs to adopt the group key.
+fn build_replica_composite(
+    secret: &Secret,
+    split_result: Option<&crate::primitives::sharing::request::SplitResult>,
+) -> crate::protocol::types::ReplicaSecretPayload {
+    let shares: Vec<crate::protocol::types::ChannelShare> = split_result
+        .map(|r| {
+            r.shares
+                .iter()
+                .map(|(ch_id, committed)| crate::protocol::types::ChannelShare {
+                    channel_id: ch_id.0,
+                    committed_share: committed.encode_to_vec(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    crate::protocol::types::ReplicaSecretPayload {
+        secret: Some(secret.clone()),
+        shares,
+        shared_key: Vec::new(),
+    }
+}
+
+/// Wrap the [`Secret`] in a [`DeRecSecret`] envelope ready to be
+/// VSS-split for helper distribution. The helper side reconstructs the
+/// `DeRecSecret` from a `threshold`-sized subset of shares; the inner
+/// `secret_data` then decodes back to the original [`Secret`].
+fn wrap_for_helper_split(secret: &Secret, threshold: usize) -> Vec<u8> {
+    let derec_secret = DeRecSecret {
+        secret_data: secret.encode_to_vec(),
+        creation_time: None,
+        helper_threshold_for_recovery: threshold as i64,
+        helper_threshold_for_confirming_share_receipt: threshold as i64,
+        helpers: Vec::new(),
+    };
+    derec_secret.encode_to_vec()
+}
+
+/// Resolve the current replica group key from the set of already-paired
+/// Destinations on this `secret_id`. Returns `None` when no Destinations
+/// are paired yet (or only one — that channel's pair-handshake key is
+/// implicitly the group key, no handover needed).
+///
+/// The group key is the `SharedKey` stored on the oldest paired
+/// Destination channel — ordered by `(created_at, channel_id)` so the
+/// answer is deterministic across restarts. That channel is guaranteed
+/// to hold the group key because it set the precedent on its own first
+/// sync round (where `shared_key` was left empty and its pair-handshake
+/// key became the group key).
+fn current_replica_group_key(
+    replicas: &[(crate::protocol::types::Channel, SharedKey)],
+) -> Option<SharedKey> {
+    replicas
+        .iter()
+        .min_by_key(|(ch, _)| (ch.created_at, ch.id.0))
+        .map(|(_, key)| *key)
+}
+
+#[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(secret_id = secret_id)))]
+#[allow(clippy::too_many_arguments)]
+async fn distribute_shares<Sh: DeRecShareStore, T: DeRecTransport>(
+    share_store: &mut Sh,
+    transport: &T,
+    paired_helpers: &[(crate::protocol::types::Channel, SharedKey)],
+    split_result: &crate::primitives::sharing::request::SplitResult,
+    keep_versions_count: usize,
+    secret_id: u64,
+    version: u32,
+    description: &str,
+    reply_to: Option<derec_proto::TransportProtocol>,
+    owner_replica_id: Option<u64>,
+) -> Result<Vec<ChannelId>> {
+    let keep_list: Vec<u32> = {
+        let start = version
+            .saturating_sub(keep_versions_count as u32 - 1)
+            .max(1);
+        (start..=version).collect()
+    };
+
+    let mut sent_channels: Vec<ChannelId> = Vec::new();
+    for (channel, shared_key) in paired_helpers {
+        let Some(committed_share) = split_result.shares.get(&channel.id) else {
+            continue;
+        };
+
+        let msg = produce_store_share_request_message(
+            channel.id,
+            version,
+            secret_id,
+            committed_share,
+            &keep_list,
+            description,
+            shared_key,
+            reply_to.clone(),
+            owner_replica_id,
+        )?;
+        let envelope = super::apply_trace_id(msg.envelope, super::fresh_trace_id())?;
+        transport.send(&channel.transport, envelope).await?;
+
+        share_store
+            .save(
+                secret_id,
+                channel.id,
+                Share {
+                    secret_id,
+                    version,
+                    replica_id: owner_replica_id,
+                    bytes: committed_share.encode_to_vec(),
+                },
+            )
+            .await?;
+
+        sent_channels.push(channel.id);
+
+        #[cfg(feature = "logging")]
+        tracing::debug!(
+            channel_id = channel.id.0,
+            secret_id = secret_id,
+            version = version,
+            "share envelope sent"
+        );
+    }
+
+    #[cfg(feature = "logging")]
+    tracing::info!(
+        secret_id = secret_id,
+        version = version,
+        "secret distributed to helpers"
+    );
+
+    Ok(sent_channels)
 }
 
 /// Sender-side replica path for `ProtectSecret`.

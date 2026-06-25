@@ -452,6 +452,34 @@ internal static class Protocol
         Console.WriteLine(
             $"  SecretRecovered → UserSecret '{recoveredUserSecret.Name}' ({recoveredUserSecret.Data.Length}B) round-trips  ✓");
 
+        // Restore: build a fresh peer on the same secretId and replay
+        // the recovered Secret — mirrors the real recovery flow where
+        // the device that lost state stands up an empty protocol.
+        using var restored = MakeNode("RestoredOwner", "https://restored.example.com",
+            new NodeOptions(SecretId: secretId));
+        restored.Protocol.RestoreAsync(recovered.Secret, version: 1).GetAwaiter().GetResult();
+
+        var snapshot = restored.UserSecretStore.LoadLatest(secretId)
+            ?? throw new InvalidOperationException("restore must commit a UserSecrets snapshot");
+        if (snapshot.Version != 1)
+            throw new InvalidOperationException(
+                $"restored snapshot version mismatch: {snapshot.Version} != 1");
+        var restoredUserSecret = snapshot.Secrets.FirstOrDefault(s =>
+            s.Id.SequenceEqual(new byte[] { 0x01 }))
+            ?? throw new InvalidOperationException(
+                "restored snapshot must carry the protected UserSecret");
+        if (!restoredUserSecret.Data.SequenceEqual(secretData))
+            throw new InvalidOperationException("restored UserSecret data must round-trip");
+        foreach (var helperInfo in recovered.Secret.Helpers)
+        {
+            var helperChannel = ulong.Parse(helperInfo.ChannelId);
+            if (restored.ChannelStore.Load(secretId, helperChannel) is null)
+                throw new InvalidOperationException(
+                    $"restore did not write helper channel {helperChannel}");
+        }
+        Console.WriteLine(
+            $"  Restored fresh peer: snapshot v1 ({snapshot.Secrets.Length} secret) + {recovered.Secret.Helpers.Count} helper channel(s)  ✓");
+
         Console.WriteLine("Orchestrator share + discovery + recovery test passed.");
     }
 
@@ -552,9 +580,9 @@ internal static class Protocol
             throw new InvalidOperationException("secret.owner_replica_id mismatch");
         if (received.Secret.Helpers.Count != 2)
             throw new InvalidOperationException($"secret.helpers must be 2, got {received.Secret.Helpers.Count}");
-        if (received.Secret.Replicas.Count != 1)
-            throw new InvalidOperationException($"secret.replicas must be 1, got {received.Secret.Replicas.Count}");
-        var destInfo = received.Secret.Replicas[0];
+        if ((received.Secret.Replicas?.ReplicaList.Count ?? 0) != 1)
+            throw new InvalidOperationException($"secret.replicas must be 1, got {(received.Secret.Replicas?.ReplicaList.Count ?? 0)}");
+        var destInfo = received.Secret.Replicas!.ReplicaList[0];
         if (ulong.Parse(destInfo.ReplicaId) != destReplicaId)
             throw new InvalidOperationException("secret.replicas[0].replica_id mismatch");
         if (destInfo.SenderKind != (int)Pairing.SenderKind.ReplicaDestination)
@@ -563,7 +591,7 @@ internal static class Protocol
             throw new InvalidOperationException($"shares must be 2, got {received.Shares.Count}");
 
         Console.WriteLine(
-            $"  ReplicaSecretReceived: secret={received.Secret.Secrets.Count}secret/{received.Secret.Helpers.Count}helpers/{received.Secret.Replicas.Count}replicas, shares={received.Shares.Count}  ✓");
+            $"  ReplicaSecretReceived: secret={received.Secret.Secrets.Count}secret/{received.Secret.Helpers.Count}helpers/{(received.Secret.Replicas?.ReplicaList.Count ?? 0)}replicas, shares={received.Shares.Count}  ✓");
 
         // Drain the helper outboxes from the v=1 round so the next
         // round's pump-and-drain sees only v=2 envelopes.
@@ -1037,7 +1065,7 @@ internal static class Protocol
         if (recvA.Version != 1) throw new InvalidOperationException($"step 1: expected v=1, got {recvA.Version}");
         if (recvA.Secret.Helpers.Count != 0) throw new InvalidOperationException("step 1: helpers must be empty");
         if (recvA.Secret.Secrets.Count != 0) throw new InvalidOperationException("step 1: secrets must be empty");
-        if (recvA.Secret.Replicas.Count != 1) throw new InvalidOperationException("step 1: replicas must be 1");
+        if ((recvA.Secret.Replicas?.ReplicaList.Count ?? 0) != 1) throw new InvalidOperationException("step 1: replicas must be 1");
         if (recvA.Shares.Count != 0) throw new InvalidOperationException("step 1: shares must be empty");
         AssertLatestVersion(owner, TestSecretId, 1);
         Console.WriteLine("  step 1: pair replica A → v=1, secret(h=0,s=0,r=1,shares=0)  ✓");
@@ -1055,7 +1083,7 @@ internal static class Protocol
         if (recvA.Version != 2) throw new InvalidOperationException($"step 2: expected v=2, got {recvA.Version}");
         if (recvA.Secret.Secrets.Count != 1 || !recvA.Secret.Secrets[0].Data.SequenceEqual(s1Data))
             throw new InvalidOperationException("step 2: secret.secrets[0].data must equal s1");
-        if (recvA.Secret.Replicas.Count != 1) throw new InvalidOperationException("step 2: replicas must be 1");
+        if ((recvA.Secret.Replicas?.ReplicaList.Count ?? 0) != 1) throw new InvalidOperationException("step 2: replicas must be 1");
         if (recvA.Shares.Count != 0) throw new InvalidOperationException("step 2: shares must be empty");
         AssertLatestVersion(owner, TestSecretId, 2);
         Console.WriteLine("  step 2: ProtectSecret([s1]) → v=2, secret(h=0,s=1,r=1,shares=0)  ✓");
@@ -1073,7 +1101,7 @@ internal static class Protocol
             if (recv.Secret.Helpers.Count != 0) throw new InvalidOperationException($"step 3 {label}: helpers must be empty");
             if (recv.Secret.Secrets.Count != 1 || !recv.Secret.Secrets[0].Data.SequenceEqual(s1Data))
                 throw new InvalidOperationException($"step 3 {label}: secret must carry s1");
-            if (recv.Secret.Replicas.Count != 2) throw new InvalidOperationException($"step 3 {label}: replicas must be 2");
+            if ((recv.Secret.Replicas?.ReplicaList.Count ?? 0) != 2) throw new InvalidOperationException($"step 3 {label}: replicas must be 2");
             if (recv.Shares.Count != 0) throw new InvalidOperationException($"step 3 {label}: shares must be empty");
         }
         AssertLatestVersion(owner, TestSecretId, 3);
@@ -1091,7 +1119,7 @@ internal static class Protocol
             if (r.Version != 4) throw new InvalidOperationException($"step 4 {label}: expected v=4");
             if (r.Secret.Helpers.Count != 1) throw new InvalidOperationException($"step 4 {label}: helpers must be 1");
             if (r.Secret.Secrets.Count != 1) throw new InvalidOperationException($"step 4 {label}: secrets must be 1");
-            if (r.Secret.Replicas.Count != 2) throw new InvalidOperationException($"step 4 {label}: replicas must be 2");
+            if ((r.Secret.Replicas?.ReplicaList.Count ?? 0) != 2) throw new InvalidOperationException($"step 4 {label}: replicas must be 2");
             if (r.Shares.Count != 0) throw new InvalidOperationException($"step 4 {label}: shares must be empty");
         }
         AssertLatestVersion(owner, TestSecretId, 4);
@@ -1155,7 +1183,7 @@ internal static class Protocol
             if (r.Version != 7) throw new InvalidOperationException($"step 7 {label}: expected v=7");
             if (r.Secret.Helpers.Count != 3) throw new InvalidOperationException($"step 7 {label}: helpers must be 3");
             if (r.Secret.Secrets.Count != 2) throw new InvalidOperationException($"step 7 {label}: secrets must be 2");
-            if (r.Secret.Replicas.Count != 2) throw new InvalidOperationException($"step 7 {label}: replicas must be 2");
+            if ((r.Secret.Replicas?.ReplicaList.Count ?? 0) != 2) throw new InvalidOperationException($"step 7 {label}: replicas must be 2");
             if (r.Shares.Count != 3) throw new InvalidOperationException($"step 7 {label}: shares must be 3");
         }
         AssertLatestVersion(owner, TestSecretId, 7);
@@ -1176,14 +1204,14 @@ internal static class Protocol
         if (recvC.Version != 8) throw new InvalidOperationException("step 8: C expected v=8");
         if (recvC.Secret.Helpers.Count != 3) throw new InvalidOperationException("step 8 C: helpers must be 3");
         if (recvC.Secret.Secrets.Count != 2) throw new InvalidOperationException("step 8 C: secrets must be 2");
-        if (recvC.Secret.Replicas.Count != 3) throw new InvalidOperationException("step 8 C: replicas must be 3");
+        if ((recvC.Secret.Replicas?.ReplicaList.Count ?? 0) != 3) throw new InvalidOperationException("step 8 C: replicas must be 3");
         if (recvC.Shares.Count != 3) throw new InvalidOperationException("step 8 C: shares must be 3");
         foreach (var (label, cid) in new (string, ulong)[] { ("A", cidA), ("B", cidB) })
         {
             var r = FindReplicaEvent(events, cid)
                 ?? throw new InvalidOperationException($"step 8 {label}: must observe v=8");
             if (r.Version != 8) throw new InvalidOperationException($"step 8 {label}: expected v=8");
-            if (r.Secret.Replicas.Count != 3) throw new InvalidOperationException($"step 8 {label}: replicas must be 3");
+            if ((r.Secret.Replicas?.ReplicaList.Count ?? 0) != 3) throw new InvalidOperationException($"step 8 {label}: replicas must be 3");
         }
         AssertLatestVersion(owner, TestSecretId, 8);
         Console.WriteLine("  step 8: pair replica C → v=8, secret(h=3,s=2,r=3,shares=3) on A+B+C; all helpers refreshed  ✓");

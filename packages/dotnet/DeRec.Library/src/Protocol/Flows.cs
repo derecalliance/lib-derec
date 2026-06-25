@@ -339,25 +339,40 @@ public sealed record PrePairRejectedEvent : DeRecEvent
 }
 
 public sealed record HelperInfo(
-    string ChannelId,
-    string TransportUri,
-    byte[] SharedKey,
-    Dictionary<string, string> CommunicationInfo);
+    [property: JsonPropertyName("channel_id")] string ChannelId,
+    [property: JsonPropertyName("transport_uri")] string TransportUri,
+    [property: JsonPropertyName("shared_key")] byte[] SharedKey,
+    [property: JsonPropertyName("communication_info")] Dictionary<string, string> CommunicationInfo);
 
 public sealed record ReplicaInfo(
-    string ChannelId,
-    string TransportUri,
-    Dictionary<string, string> CommunicationInfo,
-    string ReplicaId,
-    int SenderKind);
+    [property: JsonPropertyName("channel_id")] string ChannelId,
+    [property: JsonPropertyName("transport_uri")] string TransportUri,
+    [property: JsonPropertyName("communication_info")] Dictionary<string, string> CommunicationInfo,
+    [property: JsonPropertyName("replica_id")] string ReplicaId,
+    [property: JsonPropertyName("sender_kind")] int SenderKind);
 
 public sealed record Secret(
-    IReadOnlyList<HelperInfo> Helpers,
-    IReadOnlyList<UserSecret> Secrets,
-    IReadOnlyList<ReplicaInfo> Replicas,
-    string OwnerReplicaId);
+    [property: JsonPropertyName("helpers")] IReadOnlyList<HelperInfo> Helpers,
+    [property: JsonPropertyName("secrets")] IReadOnlyList<UserSecret> Secrets,
+    [property: JsonPropertyName("owner_replica_id")] string OwnerReplicaId)
+{
+    /// <summary>
+    /// Replica composite: the destination peers, the per-helper share map,
+    /// and the 32-byte group key. <c>null</c> when this <c>secret_id</c> has
+    /// no replica setup. Required by <see cref="DeRecProtocol.RestoreAsync"/>
+    /// to rebuild replica channels without re-pairing.
+    /// </summary>
+    [JsonPropertyName("replicas")]
+    public Replicas? Replicas { get; init; }
+}
 
-public sealed record ChannelShare(string ChannelId, byte[] CommittedShare);
+public sealed record Replicas(
+    [property: JsonPropertyName("replicas")] IReadOnlyList<ReplicaInfo> ReplicaList,
+    [property: JsonPropertyName("shared_key")] byte[] SharedKey);
+
+public sealed record ChannelShare(
+    [property: JsonPropertyName("channel_id")] string ChannelId,
+    [property: JsonPropertyName("committed_share")] byte[] CommittedShare);
 
 public sealed record ReplicaSecretReceivedEvent : DeRecEvent
 {
@@ -622,19 +637,31 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                 Data = ReadByteArray(s.GetProperty("data")),
             });
         }
-        var replicas = new List<ReplicaInfo>();
-        foreach (var r in secretEl.GetProperty("replicas").EnumerateArray())
+        Replicas? replicas = null;
+        if (secretEl.TryGetProperty("replicas", out var replicasEl)
+            && replicasEl.ValueKind == System.Text.Json.JsonValueKind.Object)
         {
-            replicas.Add(new ReplicaInfo(
-                r.GetProperty("channel_id").GetString()!,
-                r.GetProperty("transport_uri").GetString()!,
-                r.TryGetProperty("communication_info", out var rci) ? ReadStringMap(rci) : new(),
-                r.GetProperty("replica_id").GetString()!,
-                r.GetProperty("sender_kind").GetInt32()));
+            var replicaList = new List<ReplicaInfo>();
+            foreach (var r in replicasEl.GetProperty("replicas").EnumerateArray())
+            {
+                replicaList.Add(new ReplicaInfo(
+                    r.GetProperty("channel_id").GetString()!,
+                    r.GetProperty("transport_uri").GetString()!,
+                    r.TryGetProperty("communication_info", out var rci) ? ReadStringMap(rci) : new(),
+                    r.GetProperty("replica_id").GetString()!,
+                    r.GetProperty("sender_kind").GetInt32()));
+            }
+            var sharedKey = replicasEl.TryGetProperty("shared_key", out var sk)
+                ? ReadByteArray(sk)
+                : Array.Empty<byte>();
+            replicas = new Replicas(replicaList, sharedKey);
         }
         return new Secret(
-            helpers, secrets, replicas,
-            secretEl.GetProperty("owner_replica_id").GetString()!);
+            helpers, secrets,
+            secretEl.GetProperty("owner_replica_id").GetString()!)
+        {
+            Replicas = replicas,
+        };
     }
 
     private static ReplicaSecretReceivedEvent ParseReplicaSecretReceived(System.Text.Json.JsonElement root)

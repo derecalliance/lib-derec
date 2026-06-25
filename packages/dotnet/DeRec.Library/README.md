@@ -297,6 +297,13 @@ byte[] recovered = Recovery.Response.Recover(
     version);
 ```
 
+When driving the orchestrator instead of the primitives, the recovering
+device receives a `SecretRecoveredEvent` carrying the typed `Secret`. Pass it
+to `protocol.RestoreAsync(secret, version)` on a fresh `DeRecProtocol` to
+commit canonical helper / replica state and wipe the throwaway recovery-mode
+channels. Errors throw `DeRecException` with `Code` in
+{`AlreadyRestored`, `RestoreConflict`, `Invariant`, store-category code}.
+
 ---
 
 ## Using `DeRecProtocol` (orchestrator)

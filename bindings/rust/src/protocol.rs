@@ -1444,13 +1444,17 @@ async fn run_protect_secret_with_replica_targets_flow() {
     // ReplicaDestination is the only kind that ends up here in this
     // scenario — replica_id, sender_kind, channel_id, transport_uri,
     // and shared_key must all match what the Source negotiated.
+    let replicas_group = received_secret
+        .replicas
+        .as_ref()
+        .expect("secret.replicas must be populated when a Destination is paired");
     assert_eq!(
-        received_secret.replicas.len(),
+        replicas_group.replicas.len(),
         1,
         "secret.replicas must contain the single Destination (got {})",
-        received_secret.replicas.len()
+        replicas_group.replicas.len()
     );
-    let destination = &received_secret.replicas[0];
+    let destination = &replicas_group.replicas[0];
     assert_eq!(
         destination.replica_id, replica_id,
         "ReplicaInfo.replica_id must echo the Destination's replica_id"
@@ -1476,7 +1480,7 @@ async fn run_protect_secret_with_replica_targets_flow() {
         received_secret_id,
         received_secret.secrets.len(),
         received_secret.helpers.len(),
-        received_secret.replicas.len(),
+        received_secret.replicas.as_ref().map_or(0, |g| g.replicas.len()),
         shares.len()
     );
 
@@ -1836,6 +1840,47 @@ async fn run_discovery_and_recovery_flow() {
         recovered_user_secret.name,
         recovered_user_secret.data.len()
     );
+
+    // Restore: build a fresh peer on the same `secret_id` and replay the
+    // recovered `Secret`. Mirrors the real recovery flow where the device
+    // that lost state stands up an empty protocol, drives recovery, then
+    // commits the result.
+    let mut restored_owner =
+        Peer::with_secret_id("restored-owner", "https://restored.example.com", protected_secret_id);
+    restored_owner
+        .protocol
+        .restore(&recovered, recover_version)
+        .await
+        .expect("restore on a fresh peer must succeed");
+
+    let restored_sid = restored_owner.protocol.secret_id();
+    let restored_snapshot = restored_owner
+        .protocol
+        .user_secret_store
+        .load_latest(restored_sid)
+        .await
+        .expect("load_latest after restore");
+    let restored_snapshot = restored_snapshot.expect("snapshot must be committed");
+    assert_eq!(restored_snapshot.version, recover_version);
+    assert!(
+        restored_snapshot
+            .secrets
+            .iter()
+            .any(|s| s.id == secret_id_bytes && s.data == secret_data),
+        "restored snapshot must carry the protected UserSecret"
+    );
+    for helper in &recovered.helpers {
+        let cid = ChannelId(helper.channel_id);
+        let ch = restored_owner
+            .protocol
+            .channel_store
+            .load(restored_sid, cid)
+            .await
+            .expect("load helper channel after restore")
+            .expect("restored helper channel must exist");
+        assert_eq!(ch.role, derec_proto::SenderKind::Owner);
+    }
+    println!("Restored fresh peer from recovered Secret ✓");
 
     println!("Protocol discovery & recovery flow test passed.");
 }
@@ -2370,7 +2415,7 @@ async fn run_replica_sync_version_progression_flow() {
     assert_eq!(received.version, 1, "step 1: replica A must receive v=1");
     assert_eq!(received.secret.helpers.len(), 0);
     assert_eq!(received.secret.secrets.len(), 0);
-    assert_eq!(received.secret.replicas.len(), 1);
+    assert_eq!(received.secret.replicas.as_ref().map_or(0, |g| g.replicas.len()), 1);
     assert_eq!(received.shares.len(), 0);
     assert_eq!(
         owner
@@ -2406,7 +2451,7 @@ async fn run_replica_sync_version_progression_flow() {
     assert_eq!(received.secret.helpers.len(), 0);
     assert_eq!(received.secret.secrets.len(), 1);
     assert_eq!(received.secret.secrets[0].data, s1.data);
-    assert_eq!(received.secret.replicas.len(), 1);
+    assert_eq!(received.secret.replicas.as_ref().map_or(0, |g| g.replicas.len()), 1);
     assert_eq!(received.shares.len(), 0);
     println!("  step 2: ProtectSecret([s1]) → v=2, secret(h=0,s=1,r=1,shares=0)  ✓");
 
@@ -2424,7 +2469,7 @@ async fn run_replica_sync_version_progression_flow() {
         assert_eq!(received.secret.helpers.len(), 0);
         assert_eq!(received.secret.secrets.len(), 1);
         assert_eq!(received.secret.secrets[0].data, s1.data);
-        assert_eq!(received.secret.replicas.len(), 2);
+        assert_eq!(received.secret.replicas.as_ref().map_or(0, |g| g.replicas.len()), 2);
         assert_eq!(received.shares.len(), 0);
     }
     println!("  step 3: pair replica B → v=3, secret(h=0,s=1,r=2,shares=0) on A+B  ✓");
@@ -2455,7 +2500,7 @@ async fn run_replica_sync_version_progression_flow() {
         assert_eq!(received.version, 4);
         assert_eq!(received.secret.helpers.len(), 1);
         assert_eq!(received.secret.secrets.len(), 1);
-        assert_eq!(received.secret.replicas.len(), 2);
+        assert_eq!(received.secret.replicas.as_ref().map_or(0, |g| g.replicas.len()), 2);
         assert_eq!(received.shares.len(), 0, "below threshold, no shares");
     }
     println!("  step 4: pair helper #1 → v=4, secret(h=1,s=1,r=2,shares=0)  ✓");
@@ -2553,7 +2598,7 @@ async fn run_replica_sync_version_progression_flow() {
         assert_eq!(received.version, 7);
         assert_eq!(received.secret.helpers.len(), 3);
         assert_eq!(received.secret.secrets.len(), 2);
-        assert_eq!(received.secret.replicas.len(), 2);
+        assert_eq!(received.secret.replicas.as_ref().map_or(0, |g| g.replicas.len()), 2);
         assert_eq!(received.shares.len(), 3, "threshold met → 3 helper shares");
     }
     println!("  step 7: pair helper #3 → v=7, secret(h=3,s=2,r=2,shares=3); all 3 helpers ShareStored  ✓");
@@ -2585,13 +2630,13 @@ async fn run_replica_sync_version_progression_flow() {
     assert_eq!(received_c.version, 8);
     assert_eq!(received_c.secret.helpers.len(), 3);
     assert_eq!(received_c.secret.secrets.len(), 2);
-    assert_eq!(received_c.secret.replicas.len(), 3);
+    assert_eq!(received_c.secret.replicas.as_ref().map_or(0, |g| g.replicas.len()), 3);
     assert_eq!(received_c.shares.len(), 3);
     for (label, cid) in [("A", cid_a), ("B", cid_b)] {
         let received = find_replica_event(&events, cid)
             .unwrap_or_else(|| panic!("step 8: replica {label} must observe v=8"));
         assert_eq!(received.version, 8);
-        assert_eq!(received.secret.replicas.len(), 3);
+        assert_eq!(received.secret.replicas.as_ref().map_or(0, |g| g.replicas.len()), 3);
     }
     println!(
         "  step 8: pair replica C → v=8, secret(h=3,s=2,r=3,shares=3) on A+B+C; all helpers refreshed  ✓"

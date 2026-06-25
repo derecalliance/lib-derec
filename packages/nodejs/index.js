@@ -89,8 +89,6 @@ const primitives = {
   },
 };
 
-const restoreFromRecoveredSecret = wasm.restoreFromRecoveredSecret;
-
 const envelope = {
   apply_trace_id: wasm.envelope_apply_trace_id,
   read_trace_id: wasm.envelope_read_trace_id,
@@ -104,5 +102,4 @@ module.exports = {
   SenderKind,
   ContactMode,
   FlowKind,
-  restoreFromRecoveredSecret,
 };

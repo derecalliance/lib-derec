@@ -437,13 +437,16 @@ mod tests {
                     data: b"hunter2".to_vec(),
                 },
             ],
-            replicas: vec![ReplicaInfo {
-                channel_id: 11,
-                transport_uri: "https://replica.example".to_owned(),
-                communication_info: HashMap::new(),
-                replica_id: 0xCAFE,
-                sender_kind: derec_proto::SenderKind::ReplicaDestination as i32,
-            }],
+            replicas: Some(crate::protocol::types::Replicas {
+                replicas: vec![ReplicaInfo {
+                    channel_id: 11,
+                    transport_uri: "https://replica.example".to_owned(),
+                    communication_info: HashMap::new(),
+                    replica_id: 0xCAFE,
+                    sender_kind: derec_proto::SenderKind::ReplicaDestination as i32,
+                }],
+                shared_key: vec![0x55; 32],
+            }),
             owner_replica_id: 0xBEEF,
         }
     }
@@ -468,8 +471,9 @@ mod tests {
 
         assert_eq!(decoded.helpers.len(), 1);
         assert_eq!(decoded.helpers[0].channel_id, 7);
-        assert_eq!(decoded.replicas.len(), 1);
-        assert_eq!(decoded.replicas[0].replica_id, 0xCAFE);
+        let group = decoded.replicas.as_ref().expect("replicas must round-trip");
+        assert_eq!(group.replicas.len(), 1);
+        assert_eq!(group.replicas[0].replica_id, 0xCAFE);
         assert_eq!(decoded.owner_replica_id, 0xBEEF);
     }
 

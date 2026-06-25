@@ -3,6 +3,7 @@
 pub(super) mod discovery;
 pub(super) mod pairing;
 pub(super) mod recovery;
+pub(super) mod restore;
 pub(super) mod sharing;
 pub(super) mod unpairing;
 pub(super) mod update_channel_info;
