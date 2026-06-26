@@ -4,20 +4,19 @@ use crate::primitives::pairing::PairingError;
 use crate::primitives::pairing::{
     request::{
         CreateContactResult as CreateContactMessageResult,
-        ExtractResult as ExtractPairingRequestResult, PrePairExtractResult,
-        ProducePrePairResult, ProduceResult as ProducePairingRequestMessageResult,
+        ExtractResult as ExtractPairingRequestResult, PrePairExtractResult, ProducePrePairResult,
+        ProduceResult as ProducePairingRequestMessageResult,
         create_contact as create_contact_message, extract as extract_pairing_request,
         extract_pre_pair, produce as produce_pairing_request_message, produce_pre_pair_request,
     },
     response::{
         ExtractResult as ExtractPairingResponseResult,
-        PrePairExtractResult as PrePairResponseExtractResult,
-        ProcessPrePairResult, ProcessResult as ProcessPairingResponseMessageResult,
+        PrePairExtractResult as PrePairResponseExtractResult, ProcessPrePairResult,
+        ProcessResult as ProcessPairingResponseMessageResult,
         ProducePrePairResult as ProducePrePairResponseResult,
-        ProduceResult as ProducePairingResponseMessageResult,
-        extract as extract_pairing_response, extract_pre_pair as extract_pre_pair_response,
-        process as process_pairing_response_message, process_pre_pair,
-        produce as produce_pairing_response_message, produce_pre_pair,
+        ProduceResult as ProducePairingResponseMessageResult, extract as extract_pairing_response,
+        extract_pre_pair as extract_pre_pair_response, process as process_pairing_response_message,
+        process_pre_pair, produce as produce_pairing_response_message, produce_pre_pair,
     },
 };
 use crate::types::ChannelId;
@@ -123,7 +122,8 @@ fn test_produce_pairing_request_message_empty_mlkem_encapsulation_key() {
             protocol: Protocol::Https.into(),
         },
         &invalid_contact_msg,
-        None, None,
+        None,
+        None,
     );
 
     assert!(matches!(
@@ -156,7 +156,8 @@ fn test_produce_pairing_request_message_empty_ecies_public_key() {
             protocol: Protocol::Https.into(),
         },
         &invalid_contact_msg,
-        None, None,
+        None,
+        None,
     );
 
     assert!(matches!(
@@ -189,7 +190,8 @@ fn test_produce_pairing_request_message_empty_transport_uri() {
             protocol: Protocol::Https.into(),
         },
         &invalid_contact_msg,
-        None, None,
+        None,
+        None,
     );
 
     assert!(matches!(
@@ -224,7 +226,8 @@ fn test_produce_pairing_request_message() {
             protocol: Protocol::Https.into(),
         },
         &contact_message,
-        None, None,
+        None,
+        None,
     )
     .expect("failed to produce pairing request message");
 
@@ -272,7 +275,8 @@ fn test_produce_pairing_request_message_initiator_contact_message() {
             protocol: Protocol::Https.into(),
         },
         &contact_message,
-        None, None,
+        None,
+        None,
     )
     .expect("failed to produce pairing request message");
 
@@ -318,7 +322,8 @@ fn test_produce_pairing_response_message_empty_mlkem_ciphertext() {
         ChannelId(42),
         &invalid_pair_request_msg,
         &alice_sk_state,
-        None, None,
+        None,
+        None,
     );
 
     assert!(matches!(
@@ -363,7 +368,8 @@ fn test_produce_pairing_response_message_empty_ecies_public_key() {
         ChannelId(42),
         &invalid_pair_request_msg,
         &alice_sk_state,
-        None, None,
+        None,
+        None,
     );
 
     assert!(matches!(
@@ -405,7 +411,8 @@ fn test_produce_pairing_response_message_missing_transport_protocol() {
         ChannelId(42),
         &invalid_pair_request_msg,
         &alice_sk_state,
-        None, None,
+        None,
+        None,
     );
 
     assert!(matches!(
@@ -449,7 +456,8 @@ fn test_produce_pairing_response_message_empty_transport_uri() {
         ChannelId(42),
         &invalid_pair_request_msg,
         &alice_sk_state,
-        None, None,
+        None,
+        None,
     );
 
     assert!(matches!(
@@ -482,7 +490,8 @@ fn test_extract_pairing_request_rejects_envelope_timestamp_mismatch() {
             protocol: Protocol::Https.into(),
         },
         &alice_contact,
-        None, None,
+        None,
+        None,
     )
     .expect("failed to produce valid pairing request");
 
@@ -521,7 +530,8 @@ fn test_process_pairing_response_message_missing_result() {
             protocol: Protocol::Https.into(),
         },
         &alice_contact,
-        None, None,
+        None,
+        None,
     )
     .expect("failed to produce valid pairing request");
 
@@ -580,7 +590,8 @@ fn test_process_pairing_response_message_result_non_ok() {
             protocol: Protocol::Https.into(),
         },
         &alice_contact,
-        None, None,
+        None,
+        None,
     )
     .expect("failed to produce valid pairing request");
 
@@ -642,7 +653,8 @@ fn test_process_pairing_response_message_invalid_status() {
             protocol: Protocol::Https.into(),
         },
         &alice_contact,
-        None, None,
+        None,
+        None,
     )
     .expect("failed to produce valid pairing request");
 
@@ -704,7 +716,8 @@ fn test_process_pairing_response_message_nonce_mismatch() {
             protocol: Protocol::Https.into(),
         },
         &alice_contact,
-        None, None,
+        None,
+        None,
     )
     .expect("failed to produce valid pairing request");
 
@@ -766,7 +779,8 @@ fn test_process_pairing_response_message_empty_mlkem_encapsulation_key() {
             protocol: Protocol::Https.into(),
         },
         &alice_contact,
-        None, None,
+        None,
+        None,
     )
     .expect("failed to produce valid pairing request");
 
@@ -828,7 +842,8 @@ fn test_process_pairing_response_message_empty_ecies_public_key() {
             protocol: Protocol::Https.into(),
         },
         &alice_contact,
-        None, None,
+        None,
+        None,
     )
     .expect("failed to produce valid pairing request");
 
@@ -890,7 +905,8 @@ fn test_extract_pairing_response_rejects_envelope_timestamp_mismatch() {
             protocol: Protocol::Https.into(),
         },
         &alice_contact,
-        None, None,
+        None,
+        None,
     )
     .expect("failed to produce pairing request");
 
@@ -905,7 +921,8 @@ fn test_extract_pairing_response_rejects_envelope_timestamp_mismatch() {
         ChannelId(42),
         &request,
         &initiator_secret_key,
-        None, None,
+        None,
+        None,
     )
     .expect("failed to produce pairing response");
 
@@ -948,7 +965,8 @@ fn test_alice_bob_pairing_flow() {
             protocol: Protocol::Https.into(),
         },
         &alice_contact,
-        None, None,
+        None,
+        None,
     )
     .expect("failed to produce pairing request");
 
@@ -970,7 +988,8 @@ fn test_alice_bob_pairing_flow() {
         alice_channel_id,
         &bob_pair_req_msg,
         &alice_sk_state,
-        None, None,
+        None,
+        None,
     )
     .expect("failed to produce pairing response");
 
@@ -1045,7 +1064,8 @@ fn test_produce_pairing_response_returns_envelope_and_peer_transport() {
             protocol: Protocol::Https.into(),
         },
         &alice_contact,
-        None, None,
+        None,
+        None,
     )
     .expect("failed to produce pairing request");
 
@@ -1063,7 +1083,8 @@ fn test_produce_pairing_response_returns_envelope_and_peer_transport() {
         alice_channel_id,
         &bob_pair_request_msg,
         &alice_sk_state,
-        None, None,
+        None,
+        None,
     )
     .expect("accept should succeed");
 
@@ -1082,7 +1103,6 @@ fn test_produce_pairing_response_returns_envelope_and_peer_transport() {
     assert_eq!(response.nonce, bob_pair_request_msg.nonce);
     let _ = shared_key;
 }
-
 
 fn make_hashed_keys_contact(channel_id: ChannelId) -> ContactMessage {
     create_contact_message(
@@ -1285,8 +1305,7 @@ fn test_extract_pre_pair_rejects_wrong_inner_message_type() {
     // body is plaintext (same encoding as PrePair), so the envelope is
     // structurally valid — `extract_pre_pair` must still reject it.
     let timestamp = current_timestamp();
-    let body =
-        MessageBody::PairResponse(PairResponseMessage::default()).encode_to_vec();
+    let body = MessageBody::PairResponse(PairResponseMessage::default()).encode_to_vec();
     let envelope = DeRecMessage {
         protocol_version_major: 0,
         protocol_version_minor: 0,
@@ -1301,7 +1320,6 @@ fn test_extract_pre_pair_rejects_wrong_inner_message_type() {
     let result = extract_pre_pair(&envelope);
     assert!(matches!(result, Err(Error::Invariant(_))));
 }
-
 
 #[test]
 fn test_produce_pre_pair_emits_envelope_carrying_initiator_public_keys() {
@@ -1403,7 +1421,8 @@ fn test_produce_pre_pair_rejects_responder_secret_key_material() {
             protocol: Protocol::Https.into(),
         },
         &alice_contact,
-        None, None,
+        None,
+        None,
     )
     .expect("produce_pairing_request_message should succeed");
 
@@ -1454,12 +1473,11 @@ fn test_produce_pre_pair_response_keys_match_initiator_contact_keys_in_inline_mo
         produce_pre_pair(channel_id, &dummy_request, &alice_secret)
             .expect("produce_pre_pair should succeed");
     let outer = decode_outer_envelope(&envelope);
-    let response: PrePairResponseMessage = match MessageBody::decode_from_vec(&outer.message)
-        .expect("decode inner")
-    {
-        MessageBody::PrePairResponse(r) => r,
-        _ => panic!("expected PrePairResponse"),
-    };
+    let response: PrePairResponseMessage =
+        match MessageBody::decode_from_vec(&outer.message).expect("decode inner") {
+            MessageBody::PrePairResponse(r) => r,
+            _ => panic!("expected PrePairResponse"),
+        };
 
     assert_eq!(
         response.mlkem_encapsulation_key.as_ref(),
@@ -1472,7 +1490,6 @@ fn test_produce_pre_pair_response_keys_match_initiator_contact_keys_in_inline_mo
         "republished ECIES key must equal the one in the inline contact"
     );
 }
-
 
 /// Convenience: run the full HASHED_KEYS PrePair leg and return the
 /// envelope Bob sees on the wire from Alice along with the keys Alice
@@ -1587,12 +1604,9 @@ fn test_extract_pre_pair_response_rejects_wrong_inner_message_type() {
     assert!(matches!(result, Err(Error::Invariant(_))));
 }
 
-
 /// Convenience: run the full HASHED_KEYS PrePair leg and return the artifacts
 /// the scanner side has to call `process_pre_pair` on.
-fn run_pre_pair_leg(
-    channel_id: ChannelId,
-) -> (ContactMessage, PrePairResponseMessage) {
+fn run_pre_pair_leg(channel_id: ChannelId) -> (ContactMessage, PrePairResponseMessage) {
     let CreateContactMessageResult {
         contact_message: alice_contact,
         secret_key: alice_secret,
@@ -1757,7 +1771,6 @@ fn test_process_pre_pair_rejects_response_nonce_mismatch() {
     ));
 }
 
-
 #[test]
 fn test_process_pairing_response_rejects_tampered_channel_id_rekey() {
     let alice_channel_id = ChannelId(42);
@@ -1788,7 +1801,8 @@ fn test_process_pairing_response_rejects_tampered_channel_id_rekey() {
             protocol: Protocol::Https.into(),
         },
         &initiator_contact_message,
-        None, None,
+        None,
+        None,
     )
     .expect("produce_pairing_request failed");
 
@@ -1804,7 +1818,8 @@ fn test_process_pairing_response_rejects_tampered_channel_id_rekey() {
         alice_channel_id,
         &bob_pair_req_msg,
         &alice_sk_state,
-        None, None,
+        None,
+        None,
     )
     .expect("produce_pairing_response failed");
 
@@ -1876,8 +1891,8 @@ fn test_pairing_rekey_also_fires_in_hashed_keys_mode() {
         response: pre_pair_resp,
     } = extract_pre_pair_response(&pre_pair_resp_envelope)
         .expect("extract_pre_pair_response failed");
-    let validated = process_pre_pair(&alice_contact, &pre_pair_resp)
-        .expect("process_pre_pair failed");
+    let validated =
+        process_pre_pair(&alice_contact, &pre_pair_resp).expect("process_pre_pair failed");
 
     // Bob synthesizes a filled-in contact and runs the regular Pair flow.
     // After PrePair, the contact is logically `InlineKeys` (keys present
@@ -1903,7 +1918,8 @@ fn test_pairing_rekey_also_fires_in_hashed_keys_mode() {
             protocol: Protocol::Https.into(),
         },
         &filled_in_contact,
-        None, None,
+        None,
+        None,
     )
     .expect("produce_pairing_request_message failed");
 
@@ -1920,7 +1936,8 @@ fn test_pairing_rekey_also_fires_in_hashed_keys_mode() {
         alice_channel_id,
         &bob_pair_req_msg,
         &alice_sk_state,
-        None, None,
+        None,
+        None,
     )
     .expect("produce_pairing_response_message failed");
 
@@ -1989,14 +2006,16 @@ fn well_formed_hashed_keys_contact() -> ContactMessage {
 fn test_validate_contact_for_mode_accepts_well_formed_inline_keys() {
     use crate::primitives::pairing::request::validate_contact_for_mode;
     let c = well_formed_inline_keys_contact();
-    validate_contact_for_mode(&c, ContactMode::InlineKeys).expect("well-formed inline_keys must pass");
+    validate_contact_for_mode(&c, ContactMode::InlineKeys)
+        .expect("well-formed inline_keys must pass");
 }
 
 #[test]
 fn test_validate_contact_for_mode_accepts_well_formed_hashed_keys() {
     use crate::primitives::pairing::request::validate_contact_for_mode;
     let c = well_formed_hashed_keys_contact();
-    validate_contact_for_mode(&c, ContactMode::HashedKeys).expect("well-formed hashed_keys must pass");
+    validate_contact_for_mode(&c, ContactMode::HashedKeys)
+        .expect("well-formed hashed_keys must pass");
 }
 
 #[test]

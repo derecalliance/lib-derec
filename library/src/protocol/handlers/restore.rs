@@ -115,6 +115,7 @@ pub(in crate::protocol) async fn restore<
     )
     .await?;
 
+    // TODO: move this logic into write_replica_channels so this code looks cleaner
     if let Some(group) = secret.replicas.as_ref().filter(|g| !g.replicas.is_empty()) {
         write_replica_channels(channel_store, secret_store, secret_id, group).await?;
     }
@@ -205,11 +206,7 @@ async fn check_preconditions<Ch: DeRecChannelStore, Us: DeRecUserSecretStore>(
 
 /// Persist each helper's canonical channel record, its `SharedKey`,
 /// and an empty owner-side tracking [`Share`] at `recovered_version`.
-async fn write_helper_channels<
-    Ch: DeRecChannelStore,
-    Sh: DeRecShareStore,
-    Ss: DeRecSecretStore,
->(
+async fn write_helper_channels<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore>(
     channel_store: &mut Ch,
     share_store: &mut Sh,
     secret_store: &mut Ss,
@@ -384,15 +381,15 @@ async fn unpair_recovery_channels<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::DeRecProtocolBuilder;
     use crate::protocol::traits::{
         ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecTransport,
         DeRecUserSecretStore, SecretStoreFuture, ShareStoreFuture, TransportFuture,
     };
     use crate::protocol::types::{
-        Channel, ChannelStatus, HelperInfo, MissingPolicy, Replicas, ReplicaInfo, Secret,
+        Channel, ChannelStatus, HelperInfo, MissingPolicy, ReplicaInfo, Replicas, Secret,
         SecretKind, SecretValue, Share, UserSecret, UserSecrets,
     };
-    use crate::protocol::DeRecProtocolBuilder;
     use derec_proto::{SenderKind, TransportProtocol};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -502,10 +499,7 @@ mod tests {
             cid: ChannelId,
             kind: SecretKind,
         ) -> SecretStoreFuture<'_, ()> {
-            self.data
-                .lock()
-                .unwrap()
-                .remove(&(sid, cid.0, kind as u8));
+            self.data.lock().unwrap().remove(&(sid, cid.0, kind as u8));
             Box::pin(std::future::ready(Ok(())))
         }
     }
@@ -539,22 +533,13 @@ mod tests {
         ) -> ShareStoreFuture<'_, Vec<Share>> {
             Box::pin(std::future::ready(Ok(Vec::new())))
         }
-        fn load_all(
-            &self,
-            _: u64,
-            _: &[ChannelId],
-        ) -> ShareStoreFuture<'_, Vec<Share>> {
+        fn load_all(&self, _: u64, _: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
             Box::pin(std::future::ready(Ok(Vec::new())))
         }
         fn latest_version(&self, _: u64) -> ShareStoreFuture<'_, Option<u32>> {
             Box::pin(std::future::ready(Ok(None)))
         }
-        fn save(
-            &mut self,
-            sid: u64,
-            cid: ChannelId,
-            share: Share,
-        ) -> ShareStoreFuture<'_, ()> {
+        fn save(&mut self, sid: u64, cid: ChannelId, share: Share) -> ShareStoreFuture<'_, ()> {
             let v = share.version;
             self.data.lock().unwrap().insert((sid, cid.0, v), share);
             Box::pin(std::future::ready(Ok(())))
@@ -573,11 +558,7 @@ mod tests {
             let v = self.data.lock().unwrap().get(&sid).cloned();
             Box::pin(std::future::ready(Ok(v)))
         }
-        fn save_latest(
-            &mut self,
-            sid: u64,
-            value: UserSecrets,
-        ) -> ShareStoreFuture<'_, ()> {
+        fn save_latest(&mut self, sid: u64, value: UserSecrets) -> ShareStoreFuture<'_, ()> {
             self.data.lock().unwrap().insert(sid, value);
             Box::pin(std::future::ready(Ok(())))
         }
@@ -645,10 +626,7 @@ mod tests {
                     channel_id: 11,
                     transport_uri: "https://helper-a.example".to_owned(),
                     shared_key: vec![0xAA; 32],
-                    communication_info: HashMap::from([(
-                        "name".to_owned(),
-                        "HelperA".to_owned(),
-                    )]),
+                    communication_info: HashMap::from([("name".to_owned(), "HelperA".to_owned())]),
                 },
                 HelperInfo {
                     channel_id: 12,
@@ -819,21 +797,23 @@ mod tests {
                         .is_none(),
                     "recovery channel {rcid} must be unpaired"
                 );
-                assert!(rig
-                    .secret_store
-                    .load(secret_id, ChannelId(rcid), SecretKind::SharedKey)
-                    .await
-                    .unwrap()
-                    .is_none());
+                assert!(
+                    rig.secret_store
+                        .load(secret_id, ChannelId(rcid), SecretKind::SharedKey)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
             }
 
             // Canonical state is in place.
-            assert!(rig
-                .channel_store
-                .load(secret_id, ChannelId(11))
-                .await
-                .unwrap()
-                .is_some());
+            assert!(
+                rig.channel_store
+                    .load(secret_id, ChannelId(11))
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
         });
     }
 
@@ -865,12 +845,13 @@ mod tests {
             ));
 
             // No mutation: no canonical channel written.
-            assert!(rig
-                .channel_store
-                .load(secret_id, ChannelId(11))
-                .await
-                .unwrap()
-                .is_none());
+            assert!(
+                rig.channel_store
+                    .load(secret_id, ChannelId(11))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 
@@ -907,12 +888,13 @@ mod tests {
             assert_eq!(ids, vec![ChannelId(11)]);
 
             // No mutation beyond the pre-seed.
-            assert!(rig
-                .user_secret_store
-                .load_latest(secret_id)
-                .await
-                .unwrap()
-                .is_none());
+            assert!(
+                rig.user_secret_store
+                    .load_latest(secret_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 
@@ -933,12 +915,13 @@ mod tests {
             ));
 
             // No mutation.
-            assert!(rig
-                .channel_store
-                .load(secret_id, ChannelId(11))
-                .await
-                .unwrap()
-                .is_none());
+            assert!(
+                rig.channel_store
+                    .load(secret_id, ChannelId(11))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 

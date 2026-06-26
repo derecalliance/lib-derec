@@ -44,10 +44,6 @@ pub(in crate::protocol) async fn handle<
 ) -> Result<Vec<DeRecEvent>> {
     match message {
         MessageBody::PairRequest(request) => {
-            // Auto-reject incompatible parameter ranges before the app
-            // sees an `ActionRequired::Pairing` it could never accept.
-            // The peer is informed via a non-Ok `PairResponse`; the
-            // local app sees the typed error via `process()`.
             if let Err(err) = crate::primitives::pairing::parameter_range::check_compatibility(
                 parameter_range,
                 request.parameter_range.as_ref(),
@@ -122,9 +118,6 @@ pub(in crate::protocol) async fn start<
     replica_id: Option<u64>,
     parameter_range: Option<derec_proto::ParameterRange>,
 ) -> Result<u64> {
-    // Fail fast at flow-entry — refusing here saves the scanner from
-    // sending a PrePairRequest only to discover (on the response) it can't
-    // produce a PairRequest. Identical refusal for both contact modes.
     let replica_id_to_inject = require_replica_id_for_kind(kind, replica_id)?;
 
     let channel_id = ChannelId(contact.channel_id);
@@ -193,7 +186,6 @@ pub(in crate::protocol) async fn accept<
     replica_id: Option<u64>,
     parameter_range: Option<derec_proto::ParameterRange>,
 ) -> Result<Vec<DeRecEvent>> {
-    // Gate: replica-mode pairings require a locally-configured replica id.
     let replica_id_to_inject = require_replica_id_for_kind(kind, replica_id)?;
 
     let comm_info = build_communication_info(communication_info, replica_id_to_inject);
@@ -221,10 +213,6 @@ pub(in crate::protocol) async fn accept<
         crate::protocol::types::ChannelStatus::Paired
     };
 
-    // Re-extract from the inbound PairRequest. The dispatcher already
-    // validated presence-vs-kind at `on_request` time, so any error here is
-    // a defensive belt-and-braces (e.g. application driving accept() on a
-    // hand-crafted request).
     let peer_sender_kind = request_sender_kind(request)?;
     let (peer_communication_info, peer_replica_id) =
         extract_communication_info(&request.communication_info, peer_sender_kind)?;
@@ -272,7 +260,7 @@ pub(in crate::protocol) async fn accept<
 pub(in crate::protocol) async fn reject<Ss: DeRecSecretStore, T: DeRecTransport>(
     secret_store: &mut Ss,
     transport: &T,
-    communication_info: &HashMap<String, String>,
+    _communication_info: &HashMap<String, String>,
     secret_id: u64,
     channel_id: ChannelId,
     request: &PairRequestMessage,
@@ -289,20 +277,14 @@ pub(in crate::protocol) async fn reject<Ss: DeRecSecretStore, T: DeRecTransport>
     let _ = crate::transport::TransportProtocol::try_from(&peer_transport_protocol)?;
 
     let timestamp = current_timestamp();
-    // Rejection short-circuits before channel_id rekey would happen — the
-    // channel is being torn down, no shared key is derived, and the
-    // requester's `process` exits on the non-Ok status without consulting
-    // this field. Leave the rekey slot zeroed to make that explicit.
+
     let response = PairResponseMessage {
         result: Some(DeRecResult {
             status: status as i32,
             memo: memo.to_owned(),
         }),
         nonce: request.nonce,
-        // Rejection refuses the pairing — do not reveal a local replica id
-        // (or any reserved-namespace state) to the peer, regardless of
-        // request.sender_kind.
-        communication_info: build_communication_info(communication_info, None),
+        communication_info: None,
         parameter_range: None,
         timestamp: Some(timestamp),
         channel_id: 0,
@@ -342,15 +324,9 @@ fn on_request(
 ) -> Result<Vec<DeRecEvent>> {
     let peer_kind = request_sender_kind(request)?;
 
-    // Validate the inbound CommunicationInfo against the peer's declared
-    // kind (presence/absence of `derec.replica_id`). Error here propagates
-    // up through `handle` → `process()` rather than surfacing as an event.
     let (peer_communication_info, _peer_replica_id) =
         extract_communication_info(&request.communication_info, peer_kind)?;
 
-    // Derive the LOCAL kind from the peer's. Then refuse if it would be
-    // Replica without a configured local id — refusing here avoids
-    // surfacing an `ActionRequired::Pairing` the app cannot accept.
     let kind = derive_peer_kind(peer_kind);
     let _ = require_replica_id_for_kind(kind, replica_id)?;
 
@@ -415,8 +391,6 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
         .remove(secret_id, channel_id, SecretKind::PairingContact)
         .await?;
 
-    // The local role was committed to the channel record at `start` time;
-    // load it now rather than derive it from the peer's response.
     let channel = channel_store
         .load(secret_id, channel_id)
         .await?
@@ -431,11 +405,6 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
         crate::protocol::types::ChannelStatus::Paired
     };
 
-    // Validate the inbound CommunicationInfo against the derived peer
-    // kind. Replica responses MUST carry `derec.replica_id`; non-replica
-    // responses MUST NOT. The local id was already validated at start
-    // time via `require_replica_id_for_kind` — this is the receiver-side
-    // half of the same invariant.
     let peer_kind = derive_peer_kind(kind);
     let _ = require_replica_id_for_kind(kind, replica_id)?;
     let (peer_communication_info, peer_replica_id) =
