@@ -88,12 +88,17 @@ public static partial class Pairing
 
         /// <summary>
         /// Produces a pairing response envelope and derives the shared key.
+        /// <paramref name="communicationInfo"/> and <paramref name="parameterRange"/>
+        /// are optional and may be null. Both must be serialized proto
+        /// bytes (<c>CommunicationInfo</c> and <c>ParameterRange</c>
+        /// respectively).
         /// </summary>
         public static ProduceResult Produce(
             ulong channelId,
             byte[] requestProtoBytes,
             byte[] secretKeyMaterial,
-            byte[]? communicationInfo = null
+            byte[]? communicationInfo = null,
+            byte[]? parameterRange = null
         )
         {
             Native.Pairing.ProducePairResponseMessageResult nativeResult =
@@ -104,7 +109,9 @@ public static partial class Pairing
                     secretKeyMaterial,
                     (UIntPtr)secretKeyMaterial.Length,
                     communicationInfo,
-                    (UIntPtr)(communicationInfo?.Length ?? 0)
+                    (UIntPtr)(communicationInfo?.Length ?? 0),
+                    parameterRange,
+                    (UIntPtr)(parameterRange?.Length ?? 0)
                 );
 
             try

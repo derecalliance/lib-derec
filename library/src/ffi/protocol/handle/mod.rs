@@ -95,6 +95,41 @@ pub struct DeRecProtocolNewResult {
     pub handle: *mut DeRecProtocolHandle,
 }
 
+/// Per-flow auto-accept policy passed across the C ABI.
+///
+/// Each field is `u32` (0 = off, anything else = on) to match the rest
+/// of the FFI's bool-as-`u32` convention. Mirrors
+/// [`crate::protocol::AutoAcceptPolicy`] one-to-one. Pass a struct
+/// literal with the desired flows enabled; an all-zero struct means
+/// "every flow off" (same as today's behaviour where every request
+/// surfaces as `ActionRequired`).
+#[repr(C)]
+pub struct DeRecAutoAcceptPolicy {
+    pub pairing: u32,
+    pub pre_pair: u32,
+    pub store_share: u32,
+    pub verify_share: u32,
+    pub discovery: u32,
+    pub get_share: u32,
+    pub unpair: u32,
+    pub update_channel_info: u32,
+}
+
+impl From<DeRecAutoAcceptPolicy> for crate::protocol::AutoAcceptPolicy {
+    fn from(p: DeRecAutoAcceptPolicy) -> Self {
+        Self {
+            pairing: p.pairing != 0,
+            pre_pair: p.pre_pair != 0,
+            store_share: p.store_share != 0,
+            verify_share: p.verify_share != 0,
+            discovery: p.discovery != 0,
+            get_share: p.get_share != 0,
+            unpair: p.unpair != 0,
+            update_channel_info: p.update_channel_info != 0,
+        }
+    }
+}
+
 impl From<DeRecError> for DeRecProtocolNewResult {
     fn from(error: DeRecError) -> Self {
         Self {
@@ -137,6 +172,10 @@ pub unsafe extern "C" fn derec_protocol_new(
     // `unpair_ack`: 0 = Required, 1 = NotRequired.
     unpair_ack: i32,
     auto_reply_to: u32,
+    // Per-flow auto-accept toggles. See [`DeRecAutoAcceptPolicy`].
+    // Passed by value to keep the C ABI simple (no allocation, no
+    // null-pointer handling); the all-zero struct is the safe default.
+    auto_accept: DeRecAutoAcceptPolicy,
     // `has_replica_id`: 0 = unset, 1 = use `replica_id` value.
     has_replica_id: u32,
     replica_id: u64,
@@ -277,7 +316,8 @@ pub unsafe extern "C" fn derec_protocol_new(
         .with_timeout(Duration::from_secs(u64::from(timeout_in_secs.max(1))))
         .with_auto_respond_on_failure(auto_respond_on_failure != 0)
         .with_unpair_ack(unpair_ack_value)
-        .with_auto_reply_to(auto_reply_to != 0);
+        .with_auto_reply_to(auto_reply_to != 0)
+        .with_auto_accept(auto_accept.into());
 
     if has_replica_id != 0 {
         builder = builder.with_replica_id(replica_id);

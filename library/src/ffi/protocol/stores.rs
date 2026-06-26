@@ -411,6 +411,10 @@ impl From<UserSecretsRecord> for UserSecrets {
                 })
                 .collect(),
             description: r.description,
+            // The FFI side trades only the user-facing snapshot for
+            // now; the `replicas` cache is rebuilt on the next
+            // ProtectSecret round from live channel state.
+            replicas: None,
         }
     }
 }

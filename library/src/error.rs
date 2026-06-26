@@ -58,6 +58,9 @@ pub enum Error {
     Unpairing(#[from] crate::primitives::unpairing::UnpairingError),
 
     #[error(transparent)]
+    Restore(#[from] crate::protocol::RestoreError),
+
+    #[error(transparent)]
     DeRecMessage(#[from] crate::derec_message::DeRecMessageBuilderError),
 
     #[error(transparent)]
@@ -92,6 +95,13 @@ pub enum Error {
         expected: derec_proto::SenderKind,
         actual: derec_proto::SenderKind,
     },
+
+    /// `start(Pairing)` was called for a `channel_id` that already has
+    /// a `Paired` channel record. Re-pairing would silently overwrite
+    /// the stored `SharedKey`; the caller must skip the call or unpair
+    /// first.
+    #[error("channel {channel_id:?} is already paired")]
+    ChannelAlreadyPaired { channel_id: crate::types::ChannelId },
 
     /// A replica-mode flow was attempted but the protocol was built without
     /// [`DeRecProtocolBuilder::with_replica_id`](crate::protocol::DeRecProtocolBuilder::with_replica_id).

@@ -603,10 +603,12 @@ fn test_produce_store_share_response_message_rejects_tampered_commitment() {
     );
 }
 
-/// A peer-supplied `reply_to` that declares `Protocol::Https` but ships a
-/// plaintext URI is rejected at extract — the scheme-vs-protocol gate is
-/// what stops a malicious request sender from redirecting our response
-/// onto an HTTP transport.
+/// A peer-supplied `reply_to` that declares `Protocol::Https` but ships
+/// a URI with an unsupported scheme is rejected at extract — the
+/// scheme-vs-protocol gate is what stops a malicious request sender
+/// from redirecting our response onto an arbitrary non-HTTP(S) channel.
+/// (`http://` is intentionally accepted as a dev-mode affordance and
+/// is flagged via `tracing::warn!`; see `crate::transport`.)
 #[test]
 fn test_extract_store_share_request_rejects_scheme_mismatched_reply_to() {
     let secret_id: u64 = 1;
@@ -622,7 +624,7 @@ fn test_extract_store_share_request_rejects_scheme_mismatched_reply_to() {
     let shared_key = [1u8; 32];
 
     let malicious_reply_to = derec_proto::TransportProtocol {
-        uri: "http://attacker.example/inbox".to_owned(),
+        uri: "ws://attacker.example/inbox".to_owned(),
         protocol: derec_proto::Protocol::Https as i32,
     };
 

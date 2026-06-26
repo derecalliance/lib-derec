@@ -74,10 +74,10 @@ export interface UserSecrets {
 }
 
 /**
- * Persistence for the user-facing vault contents, keyed by `secretId`.
+ * Persistence for the user-facing secret contents, keyed by `secretId`.
  * One `secretId` maps to at most one stored snapshot — the most recent
  * `start(ProtectSecret)` value. Read back by the pair-completion
- * auto-publish hook so freshly-paired peers receive the current vault.
+ * auto-publish hook so freshly-paired peers receive the current secret.
  */
 export interface UserSecretStore {
   loadLatest(secretId: string): Promise<UserSecrets | null | undefined>;
@@ -216,7 +216,44 @@ export type DeRecEvent =
     }
   | { type: "RecoveryShareReceived"; channel_id: string; shares_received: number }
   | { type: "RecoveryShareError"; channel_id: string; shares_received: number; error: string }
-  | { type: "SecretRecovered"; secret: Uint8Array }
+  /** Recovery completed — the typed `Secret` snapshot the owner
+   *  originally protected. Mirrors `ReplicaSecretReceived.secret`:
+   *  `secrets` is the user-facing `Vec<UserSecret>` the application
+   *  fed to `start(FlowKind.ProtectSecret)`; `helpers`, `replicas`
+   *  and `owner_replica_id` are the roster snapshot captured at
+   *  distribution time. The library handles the two-stage
+   *  `DeRecSecret` → `Secret` protobuf decode internally. */
+  | {
+      type: "SecretRecovered";
+      secret: {
+        helpers: Array<{
+          channel_id: string;
+          transport_uri: string;
+          shared_key: Uint8Array;
+          communication_info: Record<string, string>;
+        }>;
+        secrets: Array<{
+          id: Uint8Array;
+          name: string;
+          data: Uint8Array;
+        }>;
+        /** Replica composite. Absent when this `secret_id` has no
+         *  replica setup. Carries the destination roster, the
+         *  per-helper share map, and the 32-byte group key. Required
+         *  by `restore` to rebuild replica channels without re-pairing. */
+        replicas?: {
+          replicas: Array<{
+            channel_id: string;
+            transport_uri: string;
+            communication_info: Record<string, string>;
+            replica_id: string;
+            sender_kind: number;
+          }>;
+          shared_key: Uint8Array;
+        };
+        owner_replica_id: string;
+      };
+    }
 
   | { type: "Unpaired"; channel_id: string }
 
@@ -238,18 +275,18 @@ export type DeRecEvent =
       channel_id: string;
       peer_replica_id: string;
     }
-  /** A `ReplicaSource` peer pushed a vault sync on a
+  /** A `ReplicaSource` peer pushed a secret sync on a
    *  `ReplicaDestination` channel. The library decoded the
-   *  `ReplicaSecretPayload`; the app installs `vault.secrets` and
+   *  `ReplicaSecretPayload`; the app installs `secret.secrets` and
    *  optionally uses `shares` for recovery. `from_replica_id` and the
-   *  `replica_id` fields inside `vault` are hex-encoded `u64`. */
+   *  `replica_id` fields inside `secret` are hex-encoded `u64`. */
   | {
-      type: "ReplicaVaultReceived";
+      type: "ReplicaSecretReceived";
       channel_id: string;
       from_replica_id: string;
       secret_id: string;
       version: number;
-      vault: {
+      secret: {
         helpers: Array<{
           channel_id: string;
           transport_uri: string;
@@ -261,14 +298,18 @@ export type DeRecEvent =
           name: string;
           data: Uint8Array;
         }>;
-        replicas: Array<{
-          channel_id: string;
-          transport_uri: string;
+        /** Replica composite. Absent when this `secret_id` has no
+         *  replica setup. The same shape as `SecretRecovered.secret.replicas`. */
+        replicas?: {
+          replicas: Array<{
+            channel_id: string;
+            transport_uri: string;
+            communication_info: Record<string, string>;
+            replica_id: string;
+            sender_kind: number;
+          }>;
           shared_key: Uint8Array;
-          communication_info: Record<string, string>;
-          replica_id: string;
-          sender_kind: number;
-        }>;
+        };
         owner_replica_id: string;
       };
       shares: Array<{
@@ -276,10 +317,10 @@ export type DeRecEvent =
         committed_share: Uint8Array;
       }>;
     }
-  /** Peer's ack of a vault sync we sent. `status` is the `StatusEnum`
+  /** Peer's ack of a secret sync we sent. `status` is the `StatusEnum`
    *  integer (0 = Ok), `memo` is the peer's explanation. */
   | {
-      type: "ReplicaVaultAcked";
+      type: "ReplicaSecretAcked";
       channel_id: string;
       from_replica_id: string;
       secret_id: string;
@@ -304,7 +345,46 @@ export type DeRecEvent =
       status: number;
       memo: string;
     }
+  /** Emitted by `process()` in place of `ActionRequired` when the
+   *  configured {@link AutoAcceptPolicy} opts in to the inbound
+   *  action's flow. The same event vec carries the flow's completion
+   *  events (e.g. `ShareStored`, `PairingCompleted`). Use this purely
+   *  for observability — no further action is required. `action_kind`
+   *  is the same label vocabulary as `ActionRequired.action_kind`
+   *  (`"Pairing"`, `"StoreShare"`, …). */
+  | { type: "AutoAccepted"; channel_id: string; action_kind: string }
   | { type: "NoOp" };
+
+/**
+ * Per-flow auto-accept policy. When a field is `true`, `process()`
+ * internally accepts the matching inbound request and emits
+ * `AutoAccepted` in place of `ActionRequired`. Every field defaults
+ * to `false`.
+ *
+ * Per-field caveats (read before enabling in production):
+ * - `pairing` — covers standard and replica pairing. Replica pairing
+ *   remains `Pending` until both sides run `verifyFingerprint()`, so
+ *   auto-accept is safe for replicas. Standard pairing transitions to
+ *   `Paired` immediately.
+ * - `prePair` — turns the initiator into a request-amplification
+ *   oracle. Anyone who knows a HashedKeys contact's nonce can elicit a
+ *   key-publish response. Keep off unless you control both ends of
+ *   the transport.
+ * - `unpair` — destructive. Accepting deletes the local channel
+ *   record before any UI confirmation.
+ * - `updateChannelInfo` — silently overwrites the channel record with
+ *   the peer's announced transport / communication info.
+ */
+export interface AutoAcceptPolicy {
+  pairing?: boolean;
+  prePair?: boolean;
+  storeShare?: boolean;
+  verifyShare?: boolean;
+  discovery?: boolean;
+  getShare?: boolean;
+  unpair?: boolean;
+  updateChannelInfo?: boolean;
+}
 
 /**
  * Fluent builder for {@link DeRecProtocol}. Mirrors the Rust
@@ -318,9 +398,9 @@ export type DeRecEvent =
  */
 export declare class DeRecProtocolBuilder {
   /**
-   * Construct a builder bound to a specific vault. `secretId`
-   * identifies the single vault this protocol instance manages.
-   * Apps that juggle multiple vaults instantiate one
+   * Construct a builder bound to a specific secret. `secretId`
+   * identifies the single secret this protocol instance manages.
+   * Apps that juggle multiple secrets instantiate one
    * {@link DeRecProtocol} per id.
    */
   constructor(secretId: bigint | number);
@@ -352,6 +432,15 @@ export declare class DeRecProtocolBuilder {
    */
   withAutoReplyTo(enabled: boolean): DeRecProtocolBuilder;
   /**
+   * Per-flow auto-accept policy. When a field is `true`, `process()`
+   * internally accepts the matching inbound request and emits
+   * `AutoAccepted` in place of `ActionRequired`. See
+   * {@link AutoAcceptPolicy} for per-field caveats.
+   *
+   * Default: empty policy (every flow off).
+   */
+  withAutoAccept(policy: AutoAcceptPolicy): DeRecProtocolBuilder;
+  /**
    * Stable per-device replica id. Required to participate in any
    * `ReplicaSource` / `ReplicaDestination` pairing. The id must be
    * stable across restarts. Default: unset.
@@ -369,7 +458,7 @@ export declare class DeRecProtocol {
   /** Use {@link DeRecProtocolBuilder} to construct instances. */
   private constructor();
 
-  /** The vault identifier this protocol instance is bound to. */
+  /** The secret identifier this protocol instance is bound to. */
   secretId(): bigint;
 
   /**
@@ -427,33 +516,27 @@ export declare class DeRecProtocol {
    * `true` on confirmation, `false` on mismatch.
    */
   verifyFingerprint(channelId: bigint | number, fingerprint: string): Promise<boolean>;
+
+  /**
+   * Rebuild this protocol's `secret_id` namespace from a recovered
+   * `Secret`. Mirrors the Rust `DeRecProtocol::restore` — pass the
+   * typed `secret` carried by the `SecretRecovered` event verbatim.
+   *
+   * Errors surface as structured objects with a `code` field:
+   *
+   * | code               | meaning                                                          |
+   * |--------------------|------------------------------------------------------------------|
+   * | `ALREADY_RESTORED` | A user-secret snapshot already exists for this `secret_id`.      |
+   * | `CONFLICT`         | Channels live at canonical helper / replica ids. The error       |
+   * |                    | carries `channel_ids: string[]` listing the collisions.          |
+   * | `INVARIANT`        | The recovered `Secret` is internally inconsistent.               |
+   * | `STORAGE`          | A store I/O call failed mid-restore.                             |
+   */
+  restore(
+    recoveredSecret: Extract<DeRecEvent, { type: "SecretRecovered" }>["secret"],
+    version: number,
+  ): Promise<void>;
 }
-
-export interface RecoveredHelperInfo {
-
-  channelId: string;
-  transportUri: string;
-
-  communicationInfo: Record<string, string>;
-
-  sharedKey: Uint8Array | number[];
-}
-
-export interface RecoveredUserSecret {
-
-  id: Uint8Array | number[];
-
-  name: string;
-
-  data: Uint8Array | number[];
-}
-
-export interface RecoveredSecretBag {
-  helpers: RecoveredHelperInfo[];
-  secrets: RecoveredUserSecret[];
-}
-
-export declare function decodeRecoveredSecretBag(bytes: Uint8Array): RecoveredSecretBag;
 
 /**
  * Envelope-level helpers that operate on raw `DeRecMessage` bytes without
@@ -474,15 +557,6 @@ export declare const envelope: {
    */
   read_trace_id(envelope_bytes: Uint8Array): bigint;
 };
-
-export declare function restoreFromRecoveredBag(
-  channelStore: ChannelStore,
-  secretStore: SecretStore,
-  shareStore: ShareStore,
-  recoveredBytes: Uint8Array,
-  secretId: string,
-  version: number,
-): Promise<void>;
 
 export interface Timestamp {
 
@@ -855,6 +929,7 @@ export declare const primitives: {
         transport_protocol: TransportProtocol,
         contact_message: ContactMessage,
         communication_info: CommunicationInfo | null,
+        parameter_range: ParameterRange | null,
       ): PairingRequestProduceResult;
 
       extract(envelope_bytes: Uint8Array, secret_key: Uint8Array): { request: PairRequestMessage };
@@ -883,6 +958,7 @@ export declare const primitives: {
         request: PairRequestMessage,
         secret_key: Uint8Array,
         communication_info: CommunicationInfo | null,
+        parameter_range: ParameterRange | null,
       ): PairingResponseProduceResult;
 
       extract(envelope_bytes: Uint8Array, secret_key: Uint8Array): { response: PairResponseMessage };

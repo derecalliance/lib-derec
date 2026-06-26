@@ -125,7 +125,9 @@ internal static class Pairing
         byte[] contactMessageBytes,
         UIntPtr contactMessageBytesLen,
         byte[]? communicationInfoBytes,
-        UIntPtr communicationInfoBytesLen
+        UIntPtr communicationInfoBytesLen,
+        byte[]? parameterRangeBytes,
+        UIntPtr parameterRangeBytesLen
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
@@ -144,7 +146,9 @@ internal static class Pairing
         byte[] secretKeyMaterial,
         UIntPtr secretKeyMaterialLen,
         byte[]? communicationInfoBytes,
-        UIntPtr communicationInfoBytesLen
+        UIntPtr communicationInfoBytesLen,
+        byte[]? parameterRangeBytes,
+        UIntPtr parameterRangeBytesLen
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]

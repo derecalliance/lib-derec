@@ -154,7 +154,7 @@ pub struct UserSecret {
     pub data: ::prost::alloc::vec::Vec<u8>,
 }
 
-/// Snapshot of the user-facing vault contents persisted by
+/// Snapshot of the user-facing secret contents persisted by
 /// [`crate::protocol::DeRecUserSecretStore`] for one `secret_id`.
 ///
 /// Written every time the application calls
@@ -163,39 +163,44 @@ pub struct UserSecret {
 /// current state without an explicit re-publish from the app.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UserSecrets {
-    /// Vault version this snapshot represents. Monotonically increasing
+    /// Secret version this snapshot represents. Monotonically increasing
     /// per `secret_id` — the protocol bumps it on every publish.
     pub version: u32,
     /// User-facing secret entries. Same wire shape as
-    /// [`SecretContainer::secrets`].
+    /// [`Secret::secrets`].
     pub secrets: Vec<UserSecret>,
     /// Optional human-readable label for this version, forwarded to
     /// helpers in `StoreShareRequest.description`.
     pub description: Option<String>,
+    /// Owner-side cached replica composite for this version, populated
+    /// after the VSS split completes. Lets the Owner resume future
+    /// `ProtectSecret` rounds without re-deriving share material, and
+    /// surfaces under [`Secret::replicas`] on the next snapshot rebuild.
+    /// `None` when this `secret_id` has no replica setup (or before
+    /// the first sharing round commits).
+    pub replicas: Option<Replicas>,
 }
 
-/// Per-replica metadata stored inside the secret bag — mirrors
+/// Per-replica metadata stored inside the [`Secret`] — mirrors
 /// [`HelperInfo`] but for the replica role and carries the extra
-/// `replica_id` + `sender_kind` fields needed by the replica recovery
-/// model.
+/// `replica_id` + `sender_kind` fields needed by the replica model.
 ///
-/// **Recovery transitivity**: the `shared_key` here is the symmetric key
-/// the Source negotiated with this Destination during pairing. A
-/// Destination that later needs to act on the Source's behalf (e.g. fetch
-/// a fresher copy from another Destination) uses these `shared_key`s to
-/// authenticate as the Source toward its peers. Any Destination is
-/// effectively a recovery delegate for the Source.
+/// **No per-pair key**: all replica channels for a given `secret_id`
+/// converge on a single group key (see [`ReplicaSecretPayload::shared_key`]
+/// for how that key is handed off to a new joiner). Each replica's
+/// `(secret_id, channel_id)` entry in
+/// [`crate::protocol::DeRecSecretStore`] holds that same group key, so
+/// any replica can address any other replica's peers by loading the
+/// channel key from its own secret store — this struct does not need to
+/// carry it.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReplicaInfo {
-    /// Channel identifier the Source uses to address this peer.
+    /// Channel identifier the originator uses to address this peer.
     #[prost(uint64, tag = "1")]
     pub channel_id: u64,
     /// The peer's message endpoint URI.
     #[prost(string, tag = "2")]
     pub transport_uri: ::prost::alloc::string::String,
-    /// Symmetric key negotiated during the pair handshake (32 bytes).
-    #[prost(bytes = "vec", tag = "3")]
-    pub shared_key: ::prost::alloc::vec::Vec<u8>,
     /// App-level identity metadata for this peer. Same opacity contract
     /// as [`HelperInfo::communication_info`].
     #[prost(map = "string, string", tag = "4")]
@@ -214,30 +219,55 @@ pub struct ReplicaInfo {
     pub sender_kind: i32,
 }
 
-/// The secret bag — serialized into `DeRecSecret.secret_data`.
+/// The protocol's `secret` — serialized into `DeRecSecret.secret_data`.
 ///
 /// This is the actual payload that gets protobuf-encoded, then placed into
 /// the `secret_data` bytes field of the canonical `DeRecSecret` protobuf
-/// message before encryption and distribution.
+/// message before encryption and distribution. Matches the DeRec
+/// specification's `secret` term (distinct from a `UserSecret` entry,
+/// which is one application-defined item *inside* this struct).
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SecretContainer {
+pub struct Secret {
     /// Snapshot of all paired Helpers at the time of distribution.
     #[prost(message, repeated, tag = "1")]
     pub helpers: ::prost::alloc::vec::Vec<HelperInfo>,
     /// The user-facing secrets the Owner wishes to protect.
     #[prost(message, repeated, tag = "2")]
     pub secrets: ::prost::alloc::vec::Vec<UserSecret>,
-    /// Snapshot of all paired Replica Destinations at the time of
-    /// distribution. Always populated regardless of whether the
-    /// distribution had any destination targets — provides a stable
-    /// shape for the bag across all paths.
-    #[prost(message, repeated, tag = "3")]
-    pub replicas: ::prost::alloc::vec::Vec<ReplicaInfo>,
+    /// Replica composite: the destination peers, the per-helper share
+    /// map, and the group key. `None` when this `secret_id` has no
+    /// replica setup. See [`Replicas`] for field semantics.
+    #[prost(message, optional, tag = "3")]
+    pub replicas: ::core::option::Option<Replicas>,
     /// The `replica_id` of the device that created or last updated this
-    /// version of the bag. Used by Destinations to attribute origin and
-    /// will drive future conflict-resolution logic.
+    /// version of the secret. Used by Destinations to attribute origin
+    /// and will drive future conflict-resolution logic.
     #[prost(uint64, tag = "4")]
     pub owner_replica_id: u64,
+}
+
+/// Replica composite carried inside [`Secret`] — the destination
+/// roster + the 32-byte group key shared by every replica channel.
+///
+/// The per-helper share map is *not* part of this composite: VSS
+/// shares are derived from the encoded `Secret` bytes and so cannot
+/// be embedded inside the `Secret` itself. The wire-level share map
+/// rides on [`ReplicaSecretPayload`] alongside the encoded `Secret`
+/// instead.
+///
+/// `shared_key` must be 32 bytes when [`Self::replicas`] is
+/// non-empty. The library enforces this invariant in
+/// [`crate::protocol::handlers::sharing::build_secret`] (producer
+/// side) and [`crate::protocol::DeRecProtocol::restore`] (consumer
+/// side).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Replicas {
+    /// Snapshot of all paired Replica Destinations at protect time.
+    #[prost(message, repeated, tag = "1")]
+    pub replicas: ::prost::alloc::vec::Vec<ReplicaInfo>,
+    /// 32-byte replica group key.
+    #[prost(bytes = "vec", tag = "2")]
+    pub shared_key: ::prost::alloc::vec::Vec<u8>,
 }
 
 /// A single helper's share of the current secret bag — wire-pairs a
@@ -255,19 +285,47 @@ pub struct ChannelShare {
 }
 
 /// The composite payload sent to each Replica Destination on a
-/// `ProtectSecret` round. Carries the full vault (`SecretContainer`)
-/// plus the map of `(channel_id → committed_share)` for the same round,
-/// so the Destination can recover via either path — read the vault
-/// directly, or contact each helper using `secret.helpers[i].shared_key`
-/// and request their stored share.
+/// `ProtectSecret` round. Carries the full [`Secret`] plus the map of
+/// `(channel_id → committed_share)` for the same round, so the
+/// Destination can recover via either path — read the secret directly,
+/// or contact each helper using `secret.helpers[i].shared_key` and
+/// request their stored share.
+///
+/// # Group-key handover
+///
+/// All replica channels for a given `secret_id` converge on a single
+/// symmetric "group" key. The `shared_key` field carries that group key
+/// inside the encrypted payload **only** when the sender knows the
+/// receiver doesn't have it yet — i.e. on the first round to a newly
+/// paired Destination. Both sides swap their stored channel key
+/// (`(secret_id, channel_id)` in [`crate::protocol::DeRecSecretStore`])
+/// from the per-pair ephemeral handshake key to the group key:
+///
+/// - **Sender**: swap immediately after the request envelope is sent.
+///   The ack response from the new joiner will already be encrypted
+///   with the group key.
+/// - **Receiver**: swap before encrypting the ack response, so the
+///   ack uses the group key and matches what the sender expects.
+///
+/// On the first-ever replica pair, the group key is implicitly the
+/// pair-handshake key — `shared_key` is left empty, no swap happens,
+/// and the channel-key entry both sides already saved is the group key.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReplicaSecretPayload {
-    /// The full secret bag the Source is committing to this version.
+    /// The full secret the sender is committing to this version.
     #[prost(message, optional, tag = "1")]
-    pub secret: ::core::option::Option<SecretContainer>,
+    pub secret: ::core::option::Option<Secret>,
     /// One entry per helper that received a VSS share on this round.
     #[prost(message, repeated, tag = "2")]
     pub shares: ::prost::alloc::vec::Vec<ChannelShare>,
+    /// 32-byte replica-group key. Present only on the first-sync round
+    /// to a newly-paired Destination; empty on every subsequent round
+    /// (since the receiving channel already holds the group key) and
+    /// empty when the receiving Destination is the very first pair for
+    /// this `secret_id` (the pair-handshake key is implicitly the group
+    /// key). See type-level docs for the swap protocol.
+    #[prost(bytes = "vec", tag = "3")]
+    pub shared_key: ::prost::alloc::vec::Vec<u8>,
 }
 
 /// Kind of secret material stored by [`crate::protocol::DeRecSecretStore`].
@@ -312,6 +370,7 @@ pub enum MissingPolicy {
 /// passed to [`crate::protocol::DeRecSecretStore::save`].
 ///
 /// Variants are 1:1 with [`SecretKind`].
+#[derive(Clone)]
 pub enum SecretValue {
     /// The post-pairing symmetric channel key. Established by pairing and used
     /// to authenticate and encrypt every subsequent message on the channel.

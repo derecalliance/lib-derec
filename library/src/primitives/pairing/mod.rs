@@ -3,6 +3,7 @@
 mod error;
 pub use error::*;
 
+pub mod parameter_range;
 pub mod request;
 pub mod response;
 

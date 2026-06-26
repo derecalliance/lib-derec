@@ -78,7 +78,7 @@ pub use error::Error;
 /// per device and pass the same id on every subsequent
 /// [`protocol::DeRecProtocolBuilder::with_replica_id`] call. A replica that
 /// changes its id between restarts cannot be re-identified by peers and will
-/// fail re-pairing / vault sync.
+/// fail re-pairing / secret sync.
 ///
 /// Apps that do not use replica flows do not need to call this.
 pub fn generate_replica_id() -> u64 {

@@ -88,6 +88,23 @@ pub const DEREC_CODE_ROLE_MISMATCH: i32 = 11;
 /// requires local replica identity. `DEREC_CATEGORY_INVALID_INPUT`.
 pub const DEREC_CODE_REPLICA_ID_NOT_CONFIGURED: i32 = 12;
 
+/// `start(Pairing)` was called for a `channel_id` that already has a
+/// `Paired` channel record. Returned by both the inline-keys and
+/// hashed-keys branches of `start`. `DEREC_CATEGORY_INVALID_INPUT`.
+pub const DEREC_CODE_CHANNEL_ALREADY_PAIRED: i32 = 13;
+
+/// `derec_protocol_restore` precondition: a `UserSecrets` snapshot
+/// already exists for the protocol's `secret_id`. The application must
+/// clear it before retrying. `DEREC_CATEGORY_INVALID_INPUT`.
+pub const DEREC_CODE_ALREADY_RESTORED: i32 = 14;
+
+/// `derec_protocol_restore` precondition: one or more channels live at
+/// canonical helper / replica ids carried by the recovered `Secret`.
+/// `DeRecError::message` formats the collision list as
+/// `"restore conflict: channel(s) [a, b, ...]"`.
+/// `DEREC_CATEGORY_INVALID_INPUT`.
+pub const DEREC_CODE_RESTORE_CONFLICT: i32 = 15;
+
 pub const DEREC_CODE_ENCRYPTION: i32 = 20;
 pub const DEREC_CODE_KEYGEN: i32 = 21;
 pub const DEREC_CODE_FINISH_PAIRING_INITIATOR: i32 = 22;
@@ -115,6 +132,13 @@ pub const DEREC_CODE_MISSING_REPLICA_ID: i32 = 45;
 /// `CommunicationInfo`. `DEREC_CATEGORY_PAIRING`.
 pub const DEREC_CODE_UNEXPECTED_REPLICA_ID: i32 = 46;
 
+/// The peer's [`derec_proto::ParameterRange`] does not overlap the
+/// locally-configured one on some field (e.g. `local.minShareSize >
+/// peer.maxShareSize`). `DEREC_CATEGORY_PAIRING`. The
+/// [`DeRecError::message`](DeRecError) carries the field name and
+/// both `(min, max)` pairs.
+pub const DEREC_CODE_INCOMPATIBLE_PARAMETER_RANGE: i32 = 47;
+
 pub const DEREC_CODE_EMPTY_CHANNELS: i32 = 60;
 pub const DEREC_CODE_DUPLICATE_CHANNEL_ID: i32 = 61;
 pub const DEREC_CODE_INVALID_THRESHOLD: i32 = 62;
@@ -127,6 +151,11 @@ pub const DEREC_CODE_DECODE_COMMITTED_DEREC_SHARE: i32 = 82;
 pub const DEREC_CODE_DECODE_DEREC_SHARE: i32 = 83;
 pub const DEREC_CODE_SECRET_ID_MISMATCH: i32 = 84;
 pub const DEREC_CODE_RECONSTRUCTION_FAILED: i32 = 85;
+
+/// VSS reconstruction succeeded but the resulting bytes did not decode as
+/// the canonical `DeRecSecret` / `Secret` protobuf. Almost always a sign
+/// of share corruption.
+pub const DEREC_CODE_MALFORMED_RECOVERED_SECRET: i32 = 86;
 
 pub const DEREC_CODE_FFI_NULL_PTR: i32 = 100;
 pub const DEREC_CODE_FFI_BAD_LENGTH: i32 = 101;
@@ -170,6 +199,12 @@ pub(crate) fn ffi_error(code: i32, msg: impl AsRef<str>) -> DeRecError {
 /// Maps a [`crate::Error`] into a typed FFI error. Single source of truth for
 /// category/code mapping — extend the arms here when adding new variants.
 pub(crate) fn from_lib_error(err: crate::Error) -> DeRecError {
+    // Restore errors carry richer per-variant messages (e.g. the
+    // colliding channel-id list on `Conflict`); delegate so callers
+    // see the formatted detail instead of the bare thiserror string.
+    if let crate::Error::Restore(e) = err {
+        return from_restore_error(e);
+    }
     let (category, code) = categorize(&err);
     let message = to_owned_cstring(&err.to_string());
 
@@ -194,6 +229,44 @@ pub(crate) fn from_lib_error(err: crate::Error) -> DeRecError {
         peer_memo,
         expected,
         got,
+    }
+}
+
+/// Map a [`crate::protocol::RestoreError`] to a typed FFI error.
+pub(crate) fn from_restore_error(err: crate::protocol::RestoreError) -> DeRecError {
+    use crate::protocol::RestoreError;
+    match err {
+        RestoreError::AlreadyRestored => DeRecError {
+            category: DEREC_CATEGORY_INVALID_INPUT,
+            code: DEREC_CODE_ALREADY_RESTORED,
+            message: to_owned_cstring(&RestoreError::AlreadyRestored.to_string()),
+            peer_status: 0,
+            peer_memo: std::ptr::null_mut(),
+            expected: 0,
+            got: 0,
+        },
+        RestoreError::Conflict(ids) => {
+            let id_list: Vec<String> = ids.iter().map(|c| c.0.to_string()).collect();
+            let msg = format!("restore conflict: channel(s) [{}]", id_list.join(", "));
+            DeRecError {
+                category: DEREC_CATEGORY_INVALID_INPUT,
+                code: DEREC_CODE_RESTORE_CONFLICT,
+                message: to_owned_cstring(&msg),
+                peer_status: 0,
+                peer_memo: std::ptr::null_mut(),
+                expected: 0,
+                got: 0,
+            }
+        }
+        RestoreError::Invariant(msg) => DeRecError {
+            category: DEREC_CATEGORY_INVARIANT,
+            code: DEREC_CODE_INVARIANT,
+            message: to_owned_cstring(msg),
+            peer_status: 0,
+            peer_memo: std::ptr::null_mut(),
+            expected: 0,
+            got: 0,
+        },
     }
 }
 
@@ -267,6 +340,21 @@ fn categorize(err: &crate::Error) -> (i32, i32) {
         crate::Error::ReplicaIdNotConfigured => {
             (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_REPLICA_ID_NOT_CONFIGURED)
         }
+        crate::Error::ChannelAlreadyPaired { .. } => {
+            (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_CHANNEL_ALREADY_PAIRED)
+        }
+        crate::Error::Restore(e) => {
+            use crate::protocol::RestoreError;
+            match e {
+                RestoreError::AlreadyRestored => {
+                    (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_ALREADY_RESTORED)
+                }
+                RestoreError::Conflict(_) => {
+                    (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_RESTORE_CONFLICT)
+                }
+                RestoreError::Invariant(_) => (DEREC_CATEGORY_INVARIANT, DEREC_CODE_INVARIANT),
+            }
+        }
     }
 }
 
@@ -281,6 +369,9 @@ fn pairing_code(e: &PairingError) -> i32 {
         PairingError::PrePairHashMismatch => DEREC_CODE_PREPAIR_HASH_MISMATCH,
         PairingError::MissingReplicaId { .. } => DEREC_CODE_MISSING_REPLICA_ID,
         PairingError::UnexpectedReplicaId { .. } => DEREC_CODE_UNEXPECTED_REPLICA_ID,
+        PairingError::IncompatibleParameterRange { .. } => {
+            DEREC_CODE_INCOMPATIBLE_PARAMETER_RANGE
+        }
         PairingError::Invariant(_) => DEREC_CODE_INVARIANT,
         PairingError::ContactMessageKeygen { .. } => DEREC_CODE_KEYGEN,
         PairingError::PairRequestKeygen { .. } => DEREC_CODE_KEYGEN,
@@ -300,6 +391,7 @@ fn recovery_code(e: &RecoveryError) -> i32 {
         RecoveryError::SecretIdMismatch => DEREC_CODE_SECRET_ID_MISMATCH,
         RecoveryError::VersionMismatch { .. } => DEREC_CODE_VERSION_MISMATCH,
         RecoveryError::ReconstructionFailed { .. } => DEREC_CODE_RECONSTRUCTION_FAILED,
+        RecoveryError::MalformedRecoveredSecret { .. } => DEREC_CODE_MALFORMED_RECOVERED_SECRET,
     }
 }
 

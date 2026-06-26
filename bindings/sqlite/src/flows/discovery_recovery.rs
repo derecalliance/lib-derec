@@ -19,7 +19,7 @@ use crate::flows::assertions::{count_channels, count_shares};
 use crate::flows::helpers::{pair_owner_helper, protect_secret};
 use crate::peer::{Peer, pump_many};
 
-const VAULT_SECRET_ID: u64 = 0x7777;
+const PROTECTED_SECRET_ID: u64 = 0x7777;
 
 pub async fn run() {
     println!("=== [Discovery + Recovery] full pipeline over SQLite ===");
@@ -32,19 +32,19 @@ pub async fn run() {
         owner_db.connection(),
         "Owner",
         "https://owner.example.com",
-        VAULT_SECRET_ID,
+        PROTECTED_SECRET_ID,
     );
     let mut helper_a = Peer::with_secret_id(
         helper_a_db.connection(),
         "HelperA",
         "https://helper-a.example.com",
-        VAULT_SECRET_ID,
+        PROTECTED_SECRET_ID,
     );
     let mut helper_b = Peer::with_secret_id(
         helper_b_db.connection(),
         "HelperB",
         "https://helper-b.example.com",
-        VAULT_SECRET_ID,
+        PROTECTED_SECRET_ID,
     );
 
     let cid_a = pair_owner_helper(&mut owner, &mut helper_a, ChannelId(1)).await;
@@ -62,8 +62,8 @@ pub async fn run() {
         "wallet seed phrase",
     )
     .await;
-    assert_eq!(count_shares(&helper_a_db.connection(), VAULT_SECRET_ID), 1);
-    assert_eq!(count_shares(&helper_b_db.connection(), VAULT_SECRET_ID), 1);
+    assert_eq!(count_shares(&helper_a_db.connection(), PROTECTED_SECRET_ID), 1);
+    assert_eq!(count_shares(&helper_b_db.connection(), PROTECTED_SECRET_ID), 1);
     println!("  v1 publish lands one share row on each helper  ✓");
 
     // Simulate Owner state loss: clear the user_secrets snapshot,
@@ -73,7 +73,7 @@ pub async fn run() {
     owner
         .protocol
         .user_secret_store
-        .remove(VAULT_SECRET_ID)
+        .remove(PROTECTED_SECRET_ID)
         .await
         .expect("clearing user_secret_store");
 
@@ -110,13 +110,13 @@ pub async fn run() {
     helper_a
         .protocol
         .channel_store
-        .link_channel(VAULT_SECRET_ID, cid_a, rec_cid_a)
+        .link_channel(PROTECTED_SECRET_ID, cid_a, rec_cid_a)
         .await
         .unwrap();
     helper_b
         .protocol
         .channel_store
-        .link_channel(VAULT_SECRET_ID, cid_b, rec_cid_b)
+        .link_channel(PROTECTED_SECRET_ID, cid_b, rec_cid_b)
         .await
         .unwrap();
 
@@ -124,18 +124,18 @@ pub async fn run() {
     owner
         .protocol
         .channel_store
-        .remove(VAULT_SECRET_ID, cid_a)
+        .remove(PROTECTED_SECRET_ID, cid_a)
         .await
         .unwrap();
     owner
         .protocol
         .channel_store
-        .remove(VAULT_SECRET_ID, cid_b)
+        .remove(PROTECTED_SECRET_ID, cid_b)
         .await
         .unwrap();
     // Sanity: owner now has just the two recovery channels.
     assert_eq!(
-        count_channels(&owner_db.connection(), VAULT_SECRET_ID),
+        count_channels(&owner_db.connection(), PROTECTED_SECRET_ID),
         2,
         "owner channels after dropping originals must be {{rec_a, rec_b}}"
     );
@@ -158,7 +158,7 @@ pub async fn run() {
             _ => None,
         })
         .flatten()
-        .find(|s| s.secret_id == VAULT_SECRET_ID)
+        .find(|s| s.secret_id == PROTECTED_SECRET_ID)
         .expect("discovered list must contain the distributed secret");
     let recover_version = discovered
         .versions
@@ -167,7 +167,7 @@ pub async fn run() {
         .max()
         .expect("discovered secret must have at least one version");
     println!(
-        "  discovery surfaced secret_id={VAULT_SECRET_ID} v={recover_version} via link graph  ✓"
+        "  discovery surfaced secret_id={PROTECTED_SECRET_ID} v={recover_version} via link graph  ✓"
     );
 
     // Recovery — the actual reconstruction. Asserts the original
@@ -175,7 +175,7 @@ pub async fn run() {
     owner
         .protocol
         .start(DeRecFlow::RecoverSecret {
-            secret_id: VAULT_SECRET_ID,
+            secret_id: PROTECTED_SECRET_ID,
             version: recover_version,
         })
         .await
@@ -188,15 +188,30 @@ pub async fn run() {
             _ => None,
         })
         .expect("expected SecretRecovered on owner");
-    assert!(
-        contains_subslice(&recovered, &secret_payload),
-        "recovered bag must contain the original secret bytes"
+
+    let recovered_user_secret = recovered
+        .secrets
+        .iter()
+        .find(|s| s.id == vec![9_u8, 9, 9])
+        .expect("recovered Secret must include the UserSecret with the original id");
+    assert_eq!(
+        recovered_user_secret.data, secret_payload,
+        "recovered UserSecret.data must round-trip through SQLite + VSS"
     );
-    println!("  SecretRecovered: original bytes round-trip through SQLite + VSS  ✓");
+    assert_eq!(
+        recovered_user_secret.name, "wallet seed",
+        "recovered UserSecret.name must round-trip"
+    );
+    println!(
+        "  SecretRecovered → UserSecret '{}' ({}B) round-trips through SQLite + VSS  ✓",
+        recovered_user_secret.name,
+        recovered_user_secret.data.len()
+    );
 
     println!("✓ Discovery + Recovery flow passed.\n");
 }
 
+#[allow(dead_code)]
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || haystack.len() < needle.len() {
         return false;

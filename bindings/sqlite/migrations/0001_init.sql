@@ -1,6 +1,6 @@
 -- Initial schema for the SQLite-backed DeRec stores.
 -- Every protocol-side table is keyed first by `secret_id` so a single
--- backing database can serve multiple vaults on the same device
+-- backing database can serve multiple secrets on the same device
 -- without leakage between them.
 
 CREATE TABLE channels (

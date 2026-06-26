@@ -35,4 +35,19 @@ pub enum RecoveryError {
         #[source]
         source: derec_cryptography::vss::DerecVSSError,
     },
+
+    /// VSS reconstruction succeeded but the resulting bytes did not
+    /// decode as the canonical `DeRecSecret` / `Secret` protobuf
+    /// wrapping the library applies on `start(ProtectSecret)`. The
+    /// shares almost certainly came from a corrupted source (a buggy
+    /// helper, a tampered store) — the math reconstructed *something*,
+    /// just not a protobuf the protocol can interpret.
+    #[error(
+        "recovered bytes did not decode as the canonical DeRecSecret/Secret \
+         protobuf — share corruption likely"
+    )]
+    MalformedRecoveredSecret {
+        #[source]
+        source: prost::DecodeError,
+    },
 }

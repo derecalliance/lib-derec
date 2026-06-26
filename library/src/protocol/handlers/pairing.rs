@@ -25,24 +25,51 @@ use std::collections::HashMap;
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
 )]
 #[allow(clippy::too_many_arguments)]
-pub(in crate::protocol) async fn handle<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
+pub(in crate::protocol) async fn handle<
+    Ch: DeRecChannelStore,
+    Ss: DeRecSecretStore,
+    T: DeRecTransport,
+>(
     channel_store: &mut Ch,
     secret_store: &mut Ss,
+    transport: &T,
+    communication_info: &HashMap<String, String>,
     message: &MessageBody,
     secret_id: u64,
     channel_id: ChannelId,
     pairing_secret: &PairingSecretKeyMaterial,
     inbound_trace_id: u64,
     replica_id: Option<u64>,
+    parameter_range: Option<&derec_proto::ParameterRange>,
 ) -> Result<Vec<DeRecEvent>> {
     match message {
-        MessageBody::PairRequest(request) => on_request(
-            channel_id,
-            request,
-            pairing_secret,
-            inbound_trace_id,
-            replica_id,
-        ),
+        MessageBody::PairRequest(request) => {
+            if let Err(err) = crate::primitives::pairing::parameter_range::check_compatibility(
+                parameter_range,
+                request.parameter_range.as_ref(),
+            ) {
+                reject(
+                    secret_store,
+                    transport,
+                    communication_info,
+                    secret_id,
+                    channel_id,
+                    request,
+                    StatusEnum::IncompatibleParameterRange,
+                    &err.to_string(),
+                    inbound_trace_id,
+                )
+                .await?;
+                return Err(err.into());
+            }
+            on_request(
+                channel_id,
+                request,
+                pairing_secret,
+                inbound_trace_id,
+                replica_id,
+            )
+        }
         MessageBody::PairResponse(response) => {
             on_response(
                 channel_store,
@@ -52,6 +79,7 @@ pub(in crate::protocol) async fn handle<Ch: DeRecChannelStore, Ss: DeRecSecretSt
                 response,
                 pairing_secret,
                 replica_id,
+                parameter_range,
             )
             .await
         }
@@ -72,6 +100,7 @@ pub(in crate::protocol) async fn handle<Ch: DeRecChannelStore, Ss: DeRecSecretSt
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = contact.channel_id))
 )]
+#[allow(clippy::too_many_arguments)]
 pub(in crate::protocol) async fn start<
     Ch: DeRecChannelStore,
     Ss: DeRecSecretStore,
@@ -87,10 +116,8 @@ pub(in crate::protocol) async fn start<
     contact: ContactMessage,
     peer_communication_info: HashMap<String, String>,
     replica_id: Option<u64>,
+    parameter_range: Option<derec_proto::ParameterRange>,
 ) -> Result<u64> {
-    // Fail fast at flow-entry — refusing here saves the scanner from
-    // sending a PrePairRequest only to discover (on the response) it can't
-    // produce a PairRequest. Identical refusal for both contact modes.
     let replica_id_to_inject = require_replica_id_for_kind(kind, replica_id)?;
 
     let channel_id = ChannelId(contact.channel_id);
@@ -131,6 +158,7 @@ pub(in crate::protocol) async fn start<
             endpoint,
             kind,
             replica_id_to_inject,
+            parameter_range,
         )
         .await
     }
@@ -156,15 +184,25 @@ pub(in crate::protocol) async fn accept<
     kind: SenderKind,
     trace_id: u64,
     replica_id: Option<u64>,
+    parameter_range: Option<derec_proto::ParameterRange>,
 ) -> Result<Vec<DeRecEvent>> {
-    // Gate: replica-mode pairings require a locally-configured replica id.
     let replica_id_to_inject = require_replica_id_for_kind(kind, replica_id)?;
 
     let comm_info = build_communication_info(communication_info, replica_id_to_inject);
-    let resp = response::produce(channel_id, request, pairing_secret, comm_info)?;
+    let resp = response::produce(
+        channel_id,
+        request,
+        pairing_secret,
+        comm_info,
+        parameter_range,
+    )?;
 
     secret_store
-        .save(secret_id, channel_id, SecretValue::SharedKey(resp.shared_key))
+        .save(
+            secret_id,
+            channel_id,
+            SecretValue::SharedKey(resp.shared_key),
+        )
         .await?;
 
     let peer_transport = resp.peer_transport_protocol.clone();
@@ -175,10 +213,6 @@ pub(in crate::protocol) async fn accept<
         crate::protocol::types::ChannelStatus::Paired
     };
 
-    // Re-extract from the inbound PairRequest. The dispatcher already
-    // validated presence-vs-kind at `on_request` time, so any error here is
-    // a defensive belt-and-braces (e.g. application driving accept() on a
-    // hand-crafted request).
     let peer_sender_kind = request_sender_kind(request)?;
     let (peer_communication_info, peer_replica_id) =
         extract_communication_info(&request.communication_info, peer_sender_kind)?;
@@ -226,7 +260,7 @@ pub(in crate::protocol) async fn accept<
 pub(in crate::protocol) async fn reject<Ss: DeRecSecretStore, T: DeRecTransport>(
     secret_store: &mut Ss,
     transport: &T,
-    communication_info: &HashMap<String, String>,
+    _communication_info: &HashMap<String, String>,
     secret_id: u64,
     channel_id: ChannelId,
     request: &PairRequestMessage,
@@ -243,20 +277,14 @@ pub(in crate::protocol) async fn reject<Ss: DeRecSecretStore, T: DeRecTransport>
     let _ = crate::transport::TransportProtocol::try_from(&peer_transport_protocol)?;
 
     let timestamp = current_timestamp();
-    // Rejection short-circuits before channel_id rekey would happen — the
-    // channel is being torn down, no shared key is derived, and the
-    // requester's `process` exits on the non-Ok status without consulting
-    // this field. Leave the rekey slot zeroed to make that explicit.
+
     let response = PairResponseMessage {
         result: Some(DeRecResult {
             status: status as i32,
             memo: memo.to_owned(),
         }),
         nonce: request.nonce,
-        // Rejection refuses the pairing — do not reveal a local replica id
-        // (or any reserved-namespace state) to the peer, regardless of
-        // request.sender_kind.
-        communication_info: build_communication_info(communication_info, None),
+        communication_info: None,
         parameter_range: None,
         timestamp: Some(timestamp),
         channel_id: 0,
@@ -281,6 +309,124 @@ pub(in crate::protocol) async fn reject<Ss: DeRecSecretStore, T: DeRecTransport>
     tracing::info!("pairing request rejected");
 
     Ok(())
+}
+
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+)]
+fn on_request(
+    channel_id: ChannelId,
+    request: &PairRequestMessage,
+    pairing_secret: &PairingSecretKeyMaterial,
+    trace_id: u64,
+    replica_id: Option<u64>,
+) -> Result<Vec<DeRecEvent>> {
+    let peer_kind = request_sender_kind(request)?;
+
+    let (peer_communication_info, _peer_replica_id) =
+        extract_communication_info(&request.communication_info, peer_kind)?;
+
+    let kind = derive_peer_kind(peer_kind);
+    let _ = require_replica_id_for_kind(kind, replica_id)?;
+
+    let action = PendingAction::Pairing {
+        channel_id,
+        request: request.clone(),
+        pairing_secret: pairing_secret.clone(),
+        kind,
+        peer_communication_info,
+        trace_id,
+    };
+
+    Ok(vec![DeRecEvent::ActionRequired { channel_id, action }])
+}
+
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+)]
+#[allow(clippy::too_many_arguments)]
+async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
+    channel_store: &mut Ch,
+    secret_store: &mut Ss,
+    secret_id: u64,
+    channel_id: ChannelId,
+    response: &derec_proto::PairResponseMessage,
+    pairing_secret: &PairingSecretKeyMaterial,
+    replica_id: Option<u64>,
+    parameter_range: Option<&derec_proto::ParameterRange>,
+) -> Result<Vec<DeRecEvent>> {
+    // Gate: peer's advertised ParameterRange must overlap ours.
+    crate::primitives::pairing::parameter_range::check_compatibility(
+        parameter_range,
+        response.parameter_range.as_ref(),
+    )?;
+
+    let contact = match secret_store
+        .load(secret_id, channel_id, SecretKind::PairingContact)
+        .await?
+    {
+        Some(SecretValue::PairingContact(c)) => c,
+        _ => {
+            return Err(Error::InvalidInput(
+                "no pairing contact stored for channel — start must be called first",
+            ));
+        }
+    };
+
+    let result = response::process(&contact, response, pairing_secret)?;
+
+    secret_store
+        .save(
+            secret_id,
+            channel_id,
+            SecretValue::SharedKey(result.shared_key),
+        )
+        .await?;
+    secret_store
+        .remove(secret_id, channel_id, SecretKind::PairingSecret)
+        .await?;
+    secret_store
+        .remove(secret_id, channel_id, SecretKind::PairingContact)
+        .await?;
+
+    let channel = channel_store
+        .load(secret_id, channel_id)
+        .await?
+        .ok_or(Error::Invariant(
+            "channel record missing on pair response — start must be called first",
+        ))?;
+    let kind = channel.role;
+
+    let status = if is_replica_kind(kind) {
+        crate::protocol::types::ChannelStatus::Pending
+    } else {
+        crate::protocol::types::ChannelStatus::Paired
+    };
+
+    let peer_kind = derive_peer_kind(kind);
+    let _ = require_replica_id_for_kind(kind, replica_id)?;
+    let (peer_communication_info, peer_replica_id) =
+        extract_communication_info(&response.communication_info, peer_kind)?;
+
+    let mut channel = channel;
+    channel.status = status;
+    channel.replica_id = peer_replica_id;
+    for (k, v) in &peer_communication_info {
+        channel.communication_info.insert(k.clone(), v.clone());
+    }
+    channel_store.save(secret_id, channel).await?;
+
+    #[cfg(feature = "logging")]
+    tracing::info!("pairing complete (initiator side)");
+
+    Ok(pair_completion_events(
+        channel_id,
+        kind,
+        peer_communication_info,
+        peer_replica_id,
+    ))
 }
 
 /// Inbound `PrePairResponse` on the **scanner side**. Validates the
@@ -310,6 +456,7 @@ pub(in crate::protocol) async fn on_pre_pair_response<
     original_contact: &ContactMessage,
     response: &PrePairResponseMessage,
     replica_id: Option<u64>,
+    parameter_range: Option<derec_proto::ParameterRange>,
 ) -> Result<Vec<DeRecEvent>> {
     // `process_pre_pair` rejects malformed or non-Ok responses — surface
     // the status mismatch as an event the app can react to, propagate the
@@ -360,7 +507,13 @@ pub(in crate::protocol) async fn on_pre_pair_response<
 
     let replica_id_to_inject = require_replica_id_for_kind(role, replica_id)?;
     let comm_info = build_communication_info(communication_info, replica_id_to_inject);
-    let result = request::produce(role, own_transport.clone(), &filled_in_contact, comm_info)?;
+    let result = request::produce(
+        role,
+        own_transport.clone(),
+        &filled_in_contact,
+        comm_info,
+        parameter_range.clone(),
+    )?;
 
     // Persist the scanner's pairing secret + overwrite the stored
     // contact with the filled-in version. `pair_response::process`
@@ -504,9 +657,32 @@ pub(in crate::protocol) async fn reject_pre_pair<T: DeRecTransport>(
     Ok(())
 }
 
+/// Derive the peer's pairing kind from the local kind (committed on the
+/// channel record at pairing-start time).
+///
+/// `PairResponseMessage` does not carry `sender_kind` over the wire, so the
+/// initiator must look up its own role on the channel and invert it. The
+/// derivation matches [`on_request`]'s rule on the responder side:
+///
+/// | local                 | peer                  |
+/// |-----------------------|-----------------------|
+/// | `Owner`               | `Helper`              |
+/// | `Helper`              | `Owner`               |
+/// | `ReplicaSource`       | `ReplicaDestination`  |
+/// | `ReplicaDestination`  | `ReplicaSource`       |
+pub(in crate::protocol) fn derive_peer_kind(local_kind: SenderKind) -> SenderKind {
+    match local_kind {
+        SenderKind::Owner => SenderKind::Helper,
+        SenderKind::Helper => SenderKind::Owner,
+        SenderKind::ReplicaSource => SenderKind::ReplicaDestination,
+        SenderKind::ReplicaDestination => SenderKind::ReplicaSource,
+    }
+}
+
 /// Scanner-side `InlineKeys` branch of [`start`]. The responder has the
 /// initiator's public keys inline on the contact, so it can go straight
 /// to building the encrypted `PairRequest` envelope.
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 async fn start_inlined_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRecTransport>(
     channel_store: &mut Ch,
@@ -521,9 +697,18 @@ async fn start_inlined_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRe
     endpoint: TransportProtocol,
     kind: SenderKind,
     replica_id_to_inject: Option<u64>,
+    parameter_range: Option<derec_proto::ParameterRange>,
 ) -> Result<u64> {
+    reject_start_on_paired_channel(channel_store, secret_id, channel_id).await?;
+
     let comm_info = build_communication_info(communication_info, replica_id_to_inject);
-    let result = request::produce(kind, own_transport.clone(), &contact, comm_info)?;
+    let result = request::produce(
+        kind,
+        own_transport.clone(),
+        &contact,
+        comm_info,
+        parameter_range,
+    )?;
 
     secret_store
         .save(
@@ -584,6 +769,8 @@ async fn start_hashed_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRec
     endpoint: TransportProtocol,
     kind: SenderKind,
 ) -> Result<u64> {
+    reject_start_on_paired_channel(channel_store, secret_id, channel_id).await?;
+
     let result = request::produce_pre_pair_request(own_transport.clone(), &contact)?;
 
     // Persist the original HashedKeys contact so the eventual
@@ -637,129 +824,6 @@ fn on_pre_pair_request(
             trace_id,
         },
     }])
-}
-
-#[cfg_attr(
-    feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
-)]
-fn on_request(
-    channel_id: ChannelId,
-    request: &PairRequestMessage,
-    pairing_secret: &PairingSecretKeyMaterial,
-    trace_id: u64,
-    replica_id: Option<u64>,
-) -> Result<Vec<DeRecEvent>> {
-    let peer_kind = request_sender_kind(request)?;
-
-    // Validate the inbound CommunicationInfo against the peer's declared
-    // kind (presence/absence of `derec.replica_id`). Error here propagates
-    // up through `handle` → `process()` rather than surfacing as an event.
-    let (peer_communication_info, _peer_replica_id) =
-        extract_communication_info(&request.communication_info, peer_kind)?;
-
-    // Derive the LOCAL kind from the peer's. Then refuse if it would be
-    // Replica without a configured local id — refusing here avoids
-    // surfacing an `ActionRequired::Pairing` the app cannot accept.
-    let kind = derive_peer_kind(peer_kind);
-    let _ = require_replica_id_for_kind(kind, replica_id)?;
-
-    let action = PendingAction::Pairing {
-        channel_id,
-        request: request.clone(),
-        pairing_secret: pairing_secret.clone(),
-        kind,
-        peer_communication_info,
-        trace_id,
-    };
-
-    Ok(vec![DeRecEvent::ActionRequired { channel_id, action }])
-}
-
-#[cfg_attr(
-    feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
-)]
-async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
-    channel_store: &mut Ch,
-    secret_store: &mut Ss,
-    secret_id: u64,
-    channel_id: ChannelId,
-    response: &derec_proto::PairResponseMessage,
-    pairing_secret: &PairingSecretKeyMaterial,
-    replica_id: Option<u64>,
-) -> Result<Vec<DeRecEvent>> {
-    let contact = match secret_store
-        .load(secret_id, channel_id, SecretKind::PairingContact)
-        .await?
-    {
-        Some(SecretValue::PairingContact(c)) => c,
-        _ => {
-            return Err(Error::InvalidInput(
-                "no pairing contact stored for channel — start must be called first",
-            ));
-        }
-    };
-
-    let result = response::process(&contact, response, pairing_secret)?;
-
-    secret_store
-        .save(
-            secret_id,
-            channel_id,
-            SecretValue::SharedKey(result.shared_key),
-        )
-        .await?;
-    secret_store
-        .remove(secret_id, channel_id, SecretKind::PairingSecret)
-        .await?;
-    secret_store
-        .remove(secret_id, channel_id, SecretKind::PairingContact)
-        .await?;
-
-    // The local role was committed to the channel record at `start` time;
-    // load it now rather than derive it from the peer's response.
-    let channel = channel_store
-        .load(secret_id, channel_id)
-        .await?
-        .ok_or(Error::Invariant(
-            "channel record missing on pair response — start must be called first",
-        ))?;
-    let kind = channel.role;
-
-    let status = if is_replica_kind(kind) {
-        crate::protocol::types::ChannelStatus::Pending
-    } else {
-        crate::protocol::types::ChannelStatus::Paired
-    };
-
-    // Validate the inbound CommunicationInfo against the derived peer
-    // kind. Replica responses MUST carry `derec.replica_id`; non-replica
-    // responses MUST NOT. The local id was already validated at start
-    // time via `require_replica_id_for_kind` — this is the receiver-side
-    // half of the same invariant.
-    let peer_kind = derive_peer_kind(kind);
-    let _ = require_replica_id_for_kind(kind, replica_id)?;
-    let (peer_communication_info, peer_replica_id) =
-        extract_communication_info(&response.communication_info, peer_kind)?;
-
-    let mut channel = channel;
-    channel.status = status;
-    channel.replica_id = peer_replica_id;
-    for (k, v) in &peer_communication_info {
-        channel.communication_info.insert(k.clone(), v.clone());
-    }
-    channel_store.save(secret_id, channel).await?;
-
-    #[cfg(feature = "logging")]
-    tracing::info!("pairing complete (initiator side)");
-
-    Ok(pair_completion_events(
-        channel_id,
-        kind,
-        peer_communication_info,
-        peer_replica_id,
-    ))
 }
 
 /// Build a `CommunicationInfo` proto from the app's free-form key-value
@@ -948,28 +1012,6 @@ fn request_sender_kind(request: &PairRequestMessage) -> Result<SenderKind> {
     })
 }
 
-/// Derive the peer's pairing kind from the local kind (committed on the
-/// channel record at pairing-start time).
-///
-/// `PairResponseMessage` does not carry `sender_kind` over the wire, so the
-/// initiator must look up its own role on the channel and invert it. The
-/// derivation matches [`on_request`]'s rule on the responder side:
-///
-/// | local                 | peer                  |
-/// |-----------------------|-----------------------|
-/// | `Owner`               | `Helper`              |
-/// | `Helper`              | `Owner`               |
-/// | `ReplicaSource`       | `ReplicaDestination`  |
-/// | `ReplicaDestination`  | `ReplicaSource`       |
-pub(in crate::protocol) fn derive_peer_kind(local_kind: SenderKind) -> SenderKind {
-    match local_kind {
-        SenderKind::Owner => SenderKind::Helper,
-        SenderKind::Helper => SenderKind::Owner,
-        SenderKind::ReplicaSource => SenderKind::ReplicaDestination,
-        SenderKind::ReplicaDestination => SenderKind::ReplicaSource,
-    }
-}
-
 /// Returns `true` for either of the two replica-mode `SenderKind`s.
 /// Centralizes the "is this any kind of replica?" check that several
 /// handlers need (status assignment, replica_id gating, communication
@@ -979,6 +1021,19 @@ fn is_replica_kind(kind: SenderKind) -> bool {
         kind,
         SenderKind::ReplicaSource | SenderKind::ReplicaDestination
     )
+}
+
+async fn reject_start_on_paired_channel<Ch: DeRecChannelStore>(
+    channel_store: &Ch,
+    secret_id: u64,
+    channel_id: ChannelId,
+) -> Result<()> {
+    if let Some(channel) = channel_store.load(secret_id, channel_id).await? {
+        if channel.status == crate::protocol::types::ChannelStatus::Paired {
+            return Err(Error::ChannelAlreadyPaired { channel_id });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1175,5 +1230,133 @@ mod tests {
     fn require_replica_id_for_kind_errors_when_replica_unconfigured() {
         let err = require_replica_id_for_kind(SenderKind::ReplicaSource, None).unwrap_err();
         assert!(matches!(err, Error::ReplicaIdNotConfigured));
+    }
+
+    use crate::protocol::traits::ChannelStoreFuture;
+    use crate::protocol::types::{Channel, ChannelStatus};
+
+    /// Single-channel mock that returns whatever record was seeded at
+    /// construction. All mutating methods are stubbed because the
+    /// helper under test only ever calls `load`.
+    struct FixedChannelStore {
+        seeded: Option<Channel>,
+    }
+
+    impl DeRecChannelStore for FixedChannelStore {
+        fn load(&self, _: u64, _: ChannelId) -> ChannelStoreFuture<'_, Option<Channel>> {
+            let v = self.seeded.clone();
+            Box::pin(std::future::ready(Ok(v)))
+        }
+        fn save(&mut self, _: u64, _: Channel) -> ChannelStoreFuture<'_, ()> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+        fn remove(&mut self, _: u64, _: ChannelId) -> ChannelStoreFuture<'_, bool> {
+            Box::pin(std::future::ready(Ok(false)))
+        }
+        fn channels(&self, _: u64) -> ChannelStoreFuture<'_, Vec<Channel>> {
+            Box::pin(std::future::ready(Ok(Vec::new())))
+        }
+        fn link_channel(
+            &mut self,
+            _: u64,
+            _: ChannelId,
+            _: ChannelId,
+        ) -> ChannelStoreFuture<'_, ()> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+        fn linked_channels(
+            &self,
+            _: u64,
+            cid: ChannelId,
+        ) -> ChannelStoreFuture<'_, Vec<ChannelId>> {
+            Box::pin(std::future::ready(Ok(vec![cid])))
+        }
+    }
+
+    fn fake_channel(status: ChannelStatus, role: SenderKind) -> Channel {
+        Channel {
+            id: ChannelId(1),
+            transport: TransportProtocol {
+                uri: "https://example.com".to_owned(),
+                protocol: 0,
+            },
+            communication_info: HashMap::new(),
+            status,
+            created_at: 1_700_000_000,
+            role,
+            replica_id: None,
+        }
+    }
+
+    /// Spin up a single-threaded tokio runtime and drive an async
+    /// closure to completion. Library tests can't use `#[tokio::test]`
+    /// because the crate pulls tokio in with `default-features = false,
+    /// features = ["rt"]` — no `macros` feature.
+    fn run_async<F: std::future::Future<Output = ()>>(f: F) {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime")
+            .block_on(f)
+    }
+
+    #[test]
+    fn reject_start_on_paired_channel_errors_when_channel_already_paired() {
+        run_async(async {
+            let store = FixedChannelStore {
+                seeded: Some(fake_channel(ChannelStatus::Paired, SenderKind::Helper)),
+            };
+            let err = reject_start_on_paired_channel(&store, 42, ChannelId(1))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::ChannelAlreadyPaired { channel_id } if channel_id == ChannelId(1)),
+                "expected Error::ChannelAlreadyPaired for ChannelId(1), got {err:?}"
+            );
+        });
+    }
+
+    /// `Pending` is a legitimate retry state (handshake never finished) —
+    /// re-running `start` must be allowed so the caller can resend a
+    /// PairRequest with fresh secret material.
+    #[test]
+    fn reject_start_on_paired_channel_allows_pending_retry() {
+        run_async(async {
+            let store = FixedChannelStore {
+                seeded: Some(fake_channel(ChannelStatus::Pending, SenderKind::Helper)),
+            };
+            reject_start_on_paired_channel(&store, 42, ChannelId(1))
+                .await
+                .expect("Pending channel must be accepted as a retry candidate");
+        });
+    }
+
+    /// First-time pairing — no record exists yet.
+    #[test]
+    fn reject_start_on_paired_channel_allows_when_no_channel_record() {
+        run_async(async {
+            let store = FixedChannelStore { seeded: None };
+            reject_start_on_paired_channel(&store, 42, ChannelId(1))
+                .await
+                .expect("absent channel record must be accepted");
+        });
+    }
+
+    /// Replica `Paired` is also rejected — replica pairings transition
+    /// to `Paired` after fingerprint verification, and once they're
+    /// there the same overwrite-corruption applies.
+    #[test]
+    fn reject_start_on_paired_channel_errors_for_paired_replica() {
+        run_async(async {
+            let store = FixedChannelStore {
+                seeded: Some(fake_channel(
+                    ChannelStatus::Paired,
+                    SenderKind::ReplicaSource,
+                )),
+            };
+            let err = reject_start_on_paired_channel(&store, 42, ChannelId(1))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::ChannelAlreadyPaired { .. }));
+        });
     }
 }

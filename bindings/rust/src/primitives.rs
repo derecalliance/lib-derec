@@ -85,6 +85,7 @@ fn run_pairing_flow_test() {
         },
         &decoded_contact,
         None,
+        None,
     )
     .expect("pair_request::produce failed");
 
@@ -111,7 +112,7 @@ fn run_pairing_flow_test() {
         channel_id,
         &extracted_request.request,
         &contact_result.secret_key,
-        None,
+        None, None,
     )
     .expect("pair_response::produce failed");
 
@@ -279,6 +280,7 @@ fn run_pairing_flow_hashed_keys_test() {
         },
         &filled_in_contact,
         None,
+        None,
     )
     .expect("pair_request::produce failed");
 
@@ -289,7 +291,7 @@ fn run_pairing_flow_hashed_keys_test() {
         channel_id,
         &extracted_request.request,
         &alice_secret,
-        None,
+        None, None,
     )
     .expect("pair_response::produce failed");
 

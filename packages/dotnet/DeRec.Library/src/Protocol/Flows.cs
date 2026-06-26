@@ -121,7 +121,7 @@ public sealed record UserSecret
 /// <summary>
 /// Params for <see cref="FlowKind.ProtectSecret"/>.
 ///
-/// The vault identifier comes from
+/// The secret identifier comes from
 /// <see cref="DeRecProtocol.SecretId"/> (set at construction) and the
 /// target set is the protocol's full roster of paired Owner→Helper +
 /// Source→ReplicaDestination channels — neither field is carried on the
@@ -299,10 +299,21 @@ public sealed record RecoveryShareErrorEvent : DeRecEvent
     public required string Error { get; init; }
 }
 
+/// <summary>
+/// Recovery completed — the reconstructed <see cref="Secret"/> is
+/// returned exactly once. Mirrors
+/// <see cref="ReplicaSecretReceivedEvent.Secret"/>: the nested
+/// <see cref="Secret"/> carries the typed
+/// <c>secrets: IReadOnlyList&lt;UserSecret&gt;</c> the owner originally
+/// protected, plus the roster snapshot (<c>helpers</c>,
+/// <c>replicas</c>, <c>ownerReplicaId</c>) captured at distribution
+/// time. The library handles the two-stage <c>DeRecSecret</c> →
+/// <c>Secret</c> protobuf decode internally.
+/// </summary>
 public sealed record SecretRecoveredEvent : DeRecEvent
 {
     public override string EventType => "SecretRecovered";
-    public required byte[] Secret { get; init; }
+    public required Secret Secret { get; init; }
 }
 
 public sealed record UnpairedEvent : DeRecEvent
@@ -328,43 +339,55 @@ public sealed record PrePairRejectedEvent : DeRecEvent
 }
 
 public sealed record HelperInfo(
-    string ChannelId,
-    string TransportUri,
-    byte[] SharedKey,
-    Dictionary<string, string> CommunicationInfo);
+    [property: JsonPropertyName("channel_id")] string ChannelId,
+    [property: JsonPropertyName("transport_uri")] string TransportUri,
+    [property: JsonPropertyName("shared_key")] byte[] SharedKey,
+    [property: JsonPropertyName("communication_info")] Dictionary<string, string> CommunicationInfo);
 
 public sealed record ReplicaInfo(
-    string ChannelId,
-    string TransportUri,
-    byte[] SharedKey,
-    Dictionary<string, string> CommunicationInfo,
-    string ReplicaId,
-    int SenderKind);
+    [property: JsonPropertyName("channel_id")] string ChannelId,
+    [property: JsonPropertyName("transport_uri")] string TransportUri,
+    [property: JsonPropertyName("communication_info")] Dictionary<string, string> CommunicationInfo,
+    [property: JsonPropertyName("replica_id")] string ReplicaId,
+    [property: JsonPropertyName("sender_kind")] int SenderKind);
 
-public sealed record VaultUserSecret(byte[] Id, string Name, byte[] Data);
-
-public sealed record SecretContainer(
-    IReadOnlyList<HelperInfo> Helpers,
-    IReadOnlyList<VaultUserSecret> Secrets,
-    IReadOnlyList<ReplicaInfo> Replicas,
-    string OwnerReplicaId);
-
-public sealed record ChannelShare(string ChannelId, byte[] CommittedShare);
-
-public sealed record ReplicaVaultReceivedEvent : DeRecEvent
+public sealed record Secret(
+    [property: JsonPropertyName("helpers")] IReadOnlyList<HelperInfo> Helpers,
+    [property: JsonPropertyName("secrets")] IReadOnlyList<UserSecret> Secrets,
+    [property: JsonPropertyName("owner_replica_id")] string OwnerReplicaId)
 {
-    public override string EventType => "ReplicaVaultReceived";
+    /// <summary>
+    /// Replica composite: the destination peers, the per-helper share map,
+    /// and the 32-byte group key. <c>null</c> when this <c>secret_id</c> has
+    /// no replica setup. Required by <see cref="DeRecProtocol.RestoreAsync"/>
+    /// to rebuild replica channels without re-pairing.
+    /// </summary>
+    [JsonPropertyName("replicas")]
+    public Replicas? Replicas { get; init; }
+}
+
+public sealed record Replicas(
+    [property: JsonPropertyName("replicas")] IReadOnlyList<ReplicaInfo> ReplicaList,
+    [property: JsonPropertyName("shared_key")] byte[] SharedKey);
+
+public sealed record ChannelShare(
+    [property: JsonPropertyName("channel_id")] string ChannelId,
+    [property: JsonPropertyName("committed_share")] byte[] CommittedShare);
+
+public sealed record ReplicaSecretReceivedEvent : DeRecEvent
+{
+    public override string EventType => "ReplicaSecretReceived";
     public required string ChannelId { get; init; }
     public required string FromReplicaId { get; init; }
     public required string SecretId { get; init; }
     public required uint Version { get; init; }
-    public required SecretContainer Vault { get; init; }
+    public required Secret Secret { get; init; }
     public required IReadOnlyList<ChannelShare> Shares { get; init; }
 }
 
-public sealed record ReplicaVaultAckedEvent : DeRecEvent
+public sealed record ReplicaSecretAckedEvent : DeRecEvent
 {
-    public override string EventType => "ReplicaVaultAcked";
+    public override string EventType => "ReplicaSecretAcked";
     public required string ChannelId { get; init; }
     public required string FromReplicaId { get; init; }
     public required string SecretId { get; init; }
@@ -390,6 +413,26 @@ public sealed record ChannelInfoUpdateRejectedEvent : DeRecEvent
 public sealed record NoOpEvent : DeRecEvent
 {
     public override string EventType => "NoOp";
+}
+
+/// <summary>
+/// Emitted by <see cref="DeRecProtocol.ProcessAsync"/> in place of
+/// <see cref="ActionRequiredEvent"/> when the configured
+/// <see cref="AutoAcceptPolicy"/> opts in to the inbound action's flow.
+/// The same event vec also carries the flow's completion events
+/// (<see cref="ShareStoredEvent"/>, <see cref="PairingCompletedEvent"/>,
+/// etc.); use this event purely for observability/audit logging.
+/// </summary>
+public sealed record AutoAcceptedEvent : DeRecEvent
+{
+    public override string EventType => "AutoAccepted";
+    public required string ChannelId { get; init; }
+    /// <summary>
+    /// Same label vocabulary as
+    /// <see cref="ActionRequiredEvent"/>'s underlying action kind
+    /// (<c>"Pairing"</c>, <c>"StoreShare"</c>, …).
+    /// </summary>
+    public required string ActionKind { get; init; }
 }
 
 /// <summary>
@@ -465,7 +508,7 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             },
             "SecretRecovered" => new SecretRecoveredEvent
             {
-                Secret = ReadByteArray(root.GetProperty("secret")),
+                Secret = ParseSecretObject(root.GetProperty("secret")),
             },
             "Unpaired" => new UnpairedEvent
             {
@@ -483,8 +526,8 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                 Status = root.GetProperty("status").GetInt32(),
                 Memo = root.GetProperty("memo").GetString() ?? string.Empty,
             },
-            "ReplicaVaultReceived" => ParseReplicaVaultReceived(root),
-            "ReplicaVaultAcked" => new ReplicaVaultAckedEvent
+            "ReplicaSecretReceived" => ParseReplicaSecretReceived(root),
+            "ReplicaSecretAcked" => new ReplicaSecretAckedEvent
             {
                 ChannelId = root.GetProperty("channel_id").GetString()!,
                 FromReplicaId = root.GetProperty("from_replica_id").GetString()!,
@@ -502,6 +545,11 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                 ChannelId = root.GetProperty("channel_id").GetString()!,
                 Status = root.GetProperty("status").GetInt32(),
                 Memo = root.GetProperty("memo").GetString() ?? string.Empty,
+            },
+            "AutoAccepted" => new AutoAcceptedEvent
+            {
+                ChannelId = root.GetProperty("channel_id").GetString()!,
+                ActionKind = root.GetProperty("action_kind").GetString() ?? string.Empty,
             },
             "NoOp" => new NoOpEvent(),
             "Unmapped" => new UnmappedEvent
@@ -560,11 +608,18 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
         };
     }
 
-    private static ReplicaVaultReceivedEvent ParseReplicaVaultReceived(System.Text.Json.JsonElement root)
+    /// <summary>
+    /// Parse the nested <c>secret</c> JSON object common to
+    /// <see cref="ReplicaSecretReceivedEvent"/> and
+    /// <see cref="SecretRecoveredEvent"/>. Both events expose the
+    /// identical wire shape — the typed
+    /// <see cref="DeRec.Library.Orchestrator.Secret"/> the owner
+    /// originally protected.
+    /// </summary>
+    private static Secret ParseSecretObject(System.Text.Json.JsonElement secretEl)
     {
-        var vault = root.GetProperty("vault");
         var helpers = new List<HelperInfo>();
-        foreach (var h in vault.GetProperty("helpers").EnumerateArray())
+        foreach (var h in secretEl.GetProperty("helpers").EnumerateArray())
         {
             helpers.Add(new HelperInfo(
                 h.GetProperty("channel_id").GetString()!,
@@ -572,28 +627,46 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                 ReadByteArray(h.GetProperty("shared_key")),
                 h.TryGetProperty("communication_info", out var hci) ? ReadStringMap(hci) : new()));
         }
-        var secrets = new List<VaultUserSecret>();
-        foreach (var s in vault.GetProperty("secrets").EnumerateArray())
+        var secrets = new List<UserSecret>();
+        foreach (var s in secretEl.GetProperty("secrets").EnumerateArray())
         {
-            secrets.Add(new VaultUserSecret(
-                ReadByteArray(s.GetProperty("id")),
-                s.GetProperty("name").GetString()!,
-                ReadByteArray(s.GetProperty("data"))));
+            secrets.Add(new UserSecret
+            {
+                Id = ReadByteArray(s.GetProperty("id")),
+                Name = s.GetProperty("name").GetString()!,
+                Data = ReadByteArray(s.GetProperty("data")),
+            });
         }
-        var replicas = new List<ReplicaInfo>();
-        foreach (var r in vault.GetProperty("replicas").EnumerateArray())
+        Replicas? replicas = null;
+        if (secretEl.TryGetProperty("replicas", out var replicasEl)
+            && replicasEl.ValueKind == System.Text.Json.JsonValueKind.Object)
         {
-            replicas.Add(new ReplicaInfo(
-                r.GetProperty("channel_id").GetString()!,
-                r.GetProperty("transport_uri").GetString()!,
-                ReadByteArray(r.GetProperty("shared_key")),
-                r.TryGetProperty("communication_info", out var rci) ? ReadStringMap(rci) : new(),
-                r.GetProperty("replica_id").GetString()!,
-                r.GetProperty("sender_kind").GetInt32()));
+            var replicaList = new List<ReplicaInfo>();
+            foreach (var r in replicasEl.GetProperty("replicas").EnumerateArray())
+            {
+                replicaList.Add(new ReplicaInfo(
+                    r.GetProperty("channel_id").GetString()!,
+                    r.GetProperty("transport_uri").GetString()!,
+                    r.TryGetProperty("communication_info", out var rci) ? ReadStringMap(rci) : new(),
+                    r.GetProperty("replica_id").GetString()!,
+                    r.GetProperty("sender_kind").GetInt32()));
+            }
+            var sharedKey = replicasEl.TryGetProperty("shared_key", out var sk)
+                ? ReadByteArray(sk)
+                : Array.Empty<byte>();
+            replicas = new Replicas(replicaList, sharedKey);
         }
-        var container = new SecretContainer(
-            helpers, secrets, replicas,
-            vault.GetProperty("owner_replica_id").GetString()!);
+        return new Secret(
+            helpers, secrets,
+            secretEl.GetProperty("owner_replica_id").GetString()!)
+        {
+            Replicas = replicas,
+        };
+    }
+
+    private static ReplicaSecretReceivedEvent ParseReplicaSecretReceived(System.Text.Json.JsonElement root)
+    {
+        var container = ParseSecretObject(root.GetProperty("secret"));
 
         var shares = new List<ChannelShare>();
         foreach (var s in root.GetProperty("shares").EnumerateArray())
@@ -603,13 +676,13 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                 ReadByteArray(s.GetProperty("committed_share"))));
         }
 
-        return new ReplicaVaultReceivedEvent
+        return new ReplicaSecretReceivedEvent
         {
             ChannelId = root.GetProperty("channel_id").GetString()!,
             FromReplicaId = root.GetProperty("from_replica_id").GetString()!,
             SecretId = root.GetProperty("secret_id").GetString()!,
             Version = root.GetProperty("version").GetUInt32(),
-            Vault = container,
+            Secret = container,
             Shares = shares,
         };
     }

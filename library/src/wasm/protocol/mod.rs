@@ -52,19 +52,12 @@ use std::time::Duration;
 
 use crate::{
     protocol::{
-        DeRecChannelStore, DeRecFlow, DeRecProtocol, DeRecProtocolBuilder, DeRecSecretStore,
-        DeRecShareStore, SecretValue, Share, UnpairAck,
-        types::{Channel, ChannelStatus, SecretContainer, Target, UserSecret},
+        DeRecFlow, DeRecProtocol, DeRecProtocolBuilder, UnpairAck,
+        types::{Target, UserSecret},
     },
     types::ChannelId,
-    wasm::{
-        now_secs,
-        ts_bindings_utils::{js_error, js_error_from_lib},
-    },
+    wasm::ts_bindings_utils::{js_error, js_error_from_lib},
 };
-use derec_proto::DeRecSecret;
-use prost::Message;
-use serde::Serialize;
 use crate::wasm::primitives::pairing::ContactMessage as PairingContactMessage;
 use derec_proto::{SenderKind, TransportProtocol};
 use js_sys::{Array, Uint8Array};
@@ -103,7 +96,7 @@ type WasmProtocol = DeRecProtocol<
 /// | `ShareConfirmed`   | `channel_id: string`, `version: number`                |
 /// | `ShareVerified`    | `channel_id: string`, `version: number`                |
 /// | `SecretsDiscovered`| `channel_id: string`, `secrets: SecretVersionEntry[]`  |
-/// | `SecretRecovered`  | `secret: Uint8Array`                                   |
+/// | `SecretRecovered`  | `secret: { helpers, secrets, replicas, owner_replica_id }` (same nested shape as `ReplicaSecretReceived.secret`) |
 /// | `NoOp`             | _(none)_                                               |
 ///
 /// `SecretVersionEntry = { secret_id: bigint, versions: { version: number, description: string }[] }`
@@ -141,14 +134,16 @@ pub struct DeRecProtocolBuilderWasm {
     auto_respond_on_failure: bool,
     unpair_ack: UnpairAck,
     auto_reply_to: bool,
+    auto_accept: crate::protocol::AutoAcceptPolicy,
     replica_id: Option<u64>,
+    parameter_range: Option<derec_proto::ParameterRange>,
 }
 
 #[wasm_bindgen(js_class = DeRecProtocolBuilder)]
 impl DeRecProtocolBuilderWasm {
     /// `secretId` is a JS `bigint` or `number`. Identifies the single
-    /// vault this protocol instance manages; apps that juggle multiple
-    /// vaults instantiate one protocol per id.
+    /// secret this protocol instance manages; apps that juggle multiple
+    /// secrets instantiate one protocol per id.
     #[wasm_bindgen(constructor)]
     pub fn new(secret_id: JsValue) -> Result<DeRecProtocolBuilderWasm, JsValue> {
         let secret_id = js_value_to_u64(secret_id)
@@ -169,7 +164,9 @@ impl DeRecProtocolBuilderWasm {
             auto_respond_on_failure: false,
             unpair_ack: UnpairAck::Required,
             auto_reply_to: false,
+            auto_accept: crate::protocol::AutoAcceptPolicy::default(),
             replica_id: None,
+            parameter_range: None,
         })
     }
 
@@ -303,6 +300,48 @@ impl DeRecProtocolBuilderWasm {
         self
     }
 
+    /// Per-flow auto-accept policy.
+    ///
+    /// `policy` shape (all fields optional, default `false`):
+    /// `{ pairing, prePair, storeShare, verifyShare, discovery, getShare, unpair, updateChannelInfo }`.
+    ///
+    /// When a field is `true`, `process()` internally accepts the
+    /// matching incoming request and emits an `AutoAccepted` event in
+    /// place of `ActionRequired`. See the Rust-side
+    /// `AutoAcceptPolicy` rustdoc for the per-flow trade-offs.
+    /// Default: every field `false`.
+    #[wasm_bindgen(js_name = withAutoAccept)]
+    pub fn with_auto_accept(
+        mut self,
+        policy: JsValue,
+    ) -> Result<DeRecProtocolBuilderWasm, JsValue> {
+        #[derive(serde::Deserialize, Default)]
+        #[serde(rename_all = "camelCase", default)]
+        struct AutoAcceptPolicyShape {
+            pairing: bool,
+            pre_pair: bool,
+            store_share: bool,
+            verify_share: bool,
+            discovery: bool,
+            get_share: bool,
+            unpair: bool,
+            update_channel_info: bool,
+        }
+        let parsed: AutoAcceptPolicyShape = serde_wasm_bindgen::from_value(policy)
+            .map_err(|e| js_error("INVALID_AUTO_ACCEPT_POLICY", e.to_string()))?;
+        self.auto_accept = crate::protocol::AutoAcceptPolicy {
+            pairing: parsed.pairing,
+            pre_pair: parsed.pre_pair,
+            store_share: parsed.store_share,
+            verify_share: parsed.verify_share,
+            discovery: parsed.discovery,
+            get_share: parsed.get_share,
+            unpair: parsed.unpair,
+            update_channel_info: parsed.update_channel_info,
+        };
+        Ok(self)
+    }
+
     /// `id` is a JS `bigint` or `number`. Default: unset.
     #[wasm_bindgen(js_name = withReplicaId)]
     pub fn with_replica_id(
@@ -312,6 +351,58 @@ impl DeRecProtocolBuilderWasm {
         let v = js_value_to_u64(id)
             .map_err(|e| js_error("INVALID_REPLICA_ID", format!("{e:?}")))?;
         self.replica_id = Some(v);
+        Ok(self)
+    }
+
+    /// Declare the local node's acceptable parameter range for pair
+    /// negotiation. `range` is a JS object whose keys mirror the
+    /// `ParameterRange` proto (`minShareSize`, `maxShareSize`,
+    /// `minTimeBetweenVerifications`, ...). Each field is `i64` —
+    /// accept either a number or a `BigInt` on the JS side. Default:
+    /// unset (no constraints advertised, every peer range accepted).
+    #[wasm_bindgen(js_name = withParameterRange)]
+    pub fn with_parameter_range(
+        mut self,
+        range: JsValue,
+    ) -> Result<DeRecProtocolBuilderWasm, JsValue> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct In {
+            #[serde(default)]
+            min_share_size: i64,
+            #[serde(default)]
+            max_share_size: i64,
+            #[serde(default)]
+            min_time_between_verifications: i64,
+            #[serde(default)]
+            max_time_between_verifications: i64,
+            #[serde(default)]
+            min_time_between_share_updates: i64,
+            #[serde(default)]
+            max_time_between_share_updates: i64,
+            #[serde(default)]
+            min_unresponsive_deletion_timeout: i64,
+            #[serde(default)]
+            max_unresponsive_deletion_timeout: i64,
+            #[serde(default)]
+            min_unresponsive_deactivation_timeout: i64,
+            #[serde(default)]
+            max_unresponsive_deactivation_timeout: i64,
+        }
+        let parsed: In = serde_wasm_bindgen::from_value(range)
+            .map_err(|e| js_error("INVALID_PARAMETER_RANGE", e.to_string()))?;
+        self.parameter_range = Some(derec_proto::ParameterRange {
+            min_share_size: parsed.min_share_size,
+            max_share_size: parsed.max_share_size,
+            min_time_between_verifications: parsed.min_time_between_verifications,
+            max_time_between_verifications: parsed.max_time_between_verifications,
+            min_time_between_share_updates: parsed.min_time_between_share_updates,
+            max_time_between_share_updates: parsed.max_time_between_share_updates,
+            min_unresponsive_deletion_timeout: parsed.min_unresponsive_deletion_timeout,
+            max_unresponsive_deletion_timeout: parsed.max_unresponsive_deletion_timeout,
+            min_unresponsive_deactivation_timeout: parsed.min_unresponsive_deactivation_timeout,
+            max_unresponsive_deactivation_timeout: parsed.max_unresponsive_deactivation_timeout,
+        });
         Ok(self)
     }
 
@@ -365,9 +456,13 @@ impl DeRecProtocolBuilderWasm {
             .with_timeout(Duration::from_secs(u64::from(self.timeout_in_secs)))
             .with_auto_respond_on_failure(self.auto_respond_on_failure)
             .with_unpair_ack(self.unpair_ack)
-            .with_auto_reply_to(self.auto_reply_to);
+            .with_auto_reply_to(self.auto_reply_to)
+            .with_auto_accept(self.auto_accept);
         if let Some(id) = self.replica_id {
             builder = builder.with_replica_id(id);
+        }
+        if let Some(range) = self.parameter_range {
+            builder = builder.with_parameter_range(range);
         }
         let inner = builder.build().map_err(js_error_from_lib)?;
         Ok(DeRecProtocolWasm { inner })
@@ -395,7 +490,7 @@ impl DeRecProtocolWasm {
     ///   for `HashedKeys` (contact carries only a SHA-384 binding hash; the
     ///   scanner fetches keys via a `PrePair` round-trip). `HashedKeys`
     ///   requires the protocol's `own_transport` to be ephemeral.
-    /// The vault identifier this protocol instance is bound to.
+    /// The secret identifier this protocol instance is bound to.
     #[wasm_bindgen(js_name = "secretId")]
     pub fn secret_id(&self) -> u64 {
         self.inner.secret_id()
@@ -473,7 +568,9 @@ impl DeRecProtocolWasm {
         // enum mismatches are rejected before the URI is stored.
         let lib_tp = crate::transport::TransportProtocol::try_from(&proto_tp)
             .map_err(|e| js_error("INVALID_OWN_TRANSPORT", e.to_string()))?;
-        self.inner.set_own_transport(lib_tp.uri);
+        self.inner
+            .set_own_transport(lib_tp)
+            .map_err(|e| js_error("INVALID_OWN_TRANSPORT", e.to_string()))?;
         Ok(())
     }
 
@@ -618,212 +715,177 @@ impl DeRecProtocolWasm {
         }
         Ok(js_events.into())
     }
+
+    /// Rebuild this protocol's `secret_id` namespace from a recovered
+    /// `Secret`. Mirrors [`crate::protocol::DeRecProtocol::restore`] —
+    /// see that method for the full contract.
+    ///
+    /// `recoveredSecret` is the typed `Secret` object carried by the
+    /// `SecretRecovered` event; pass it verbatim.
+    ///
+    /// Errors surface as structured JS errors with a `code` field:
+    ///
+    /// | code               | meaning                                                          |
+    /// |--------------------|------------------------------------------------------------------|
+    /// | `ALREADY_RESTORED` | A user-secret snapshot already exists for this `secret_id`.      |
+    /// | `CONFLICT`         | Channels live at canonical helper / replica ids. The error       |
+    /// |                    | carries `channel_ids: string[]` listing the collisions.          |
+    /// | `INVARIANT`        | The recovered `Secret` is internally inconsistent.               |
+    /// | `STORAGE`          | A store I/O call failed mid-restore.                             |
+    #[wasm_bindgen(js_name = "restore")]
+    pub async fn restore(
+        &mut self,
+        recovered_secret: JsValue,
+        version: u32,
+    ) -> Result<(), JsValue> {
+        let secret = parse_recovered_secret(recovered_secret)?;
+        self.inner
+            .restore(&secret, version)
+            .await
+            .map_err(|e| match e {
+                crate::Error::Restore(inner) => restore_error_to_js(inner),
+                other => js_error_from_lib(other),
+            })
+    }
 }
 
-/// Decode the bytes carried by a [`DeRecEvent::SecretRecovered`] event into
-/// the structured secret bag (`SecretContainer`) — the *same* shape the owner
-/// originally protected. The reconstructed bytes are protobuf, so the FE
-/// can't `TextDecoder.decode()` them; this is the canonical unwrapper.
-///
-/// The wire layering is:
-/// ```text
-/// raw share fragments → VSS reconstruct → DeRecSecret { secret_data: bag_bytes }
-///                                                              └─ SecretContainer { helpers, secrets }
-/// ```
-///
-/// Returns a JS object:
-/// ```ts
-/// {
-///   helpers: Array<{
-///     channelId: string,           // u64 as decimal string
-///     transportUri: string,
-///     communicationInfo: Record<string, string>,
-///     sharedKey: Uint8Array,       // 32 bytes
-///   }>,
-///   secrets: Array<{
-///     id: Uint8Array,              // app-defined identifier (binary)
-///     name: string,
-///     data: Uint8Array,            // raw secret bytes (apps that store text decode with TextDecoder)
-///   }>,
-/// }
-/// ```
-#[wasm_bindgen(js_name = "decodeRecoveredSecretBag")]
-pub fn decode_recovered_secret_bag(bytes: &[u8]) -> Result<JsValue, JsValue> {
-    let derec = DeRecSecret::decode(bytes).map_err(|e| {
-        js_error("DECODE_ERROR", format!("DeRecSecret decode failed: {e}"))
-    })?;
-    let bag = SecretContainer::decode(derec.secret_data.as_slice()).map_err(|e| {
-        js_error("DECODE_ERROR", format!("SecretContainer decode failed: {e}"))
-    })?;
-
-    // Note: `Vec<u8>` serializes as `Array<number>` by default via
-    // serde-wasm-bindgen (matches how `SecretRecovered.secret` is exposed
-    // elsewhere — the FE converts to `Uint8Array` at the boundary).
-    #[derive(serde::Serialize)]
-    struct HelperJs {
-        #[serde(rename = "channelId")]
+fn parse_recovered_secret(
+    value: JsValue,
+) -> Result<crate::protocol::types::Secret, JsValue> {
+    #[derive(serde::Deserialize)]
+    struct HelperIn {
         channel_id: String,
-        #[serde(rename = "transportUri")]
         transport_uri: String,
-        #[serde(rename = "communicationInfo")]
-        communication_info: HashMap<String, String>,
-        #[serde(rename = "sharedKey")]
         shared_key: Vec<u8>,
+        #[serde(default)]
+        communication_info: HashMap<String, String>,
     }
-    #[derive(serde::Serialize)]
-    struct UserSecretJs {
+    #[derive(serde::Deserialize)]
+    struct ReplicaIn {
+        channel_id: String,
+        transport_uri: String,
+        #[serde(default)]
+        communication_info: HashMap<String, String>,
+        replica_id: String,
+        sender_kind: i32,
+    }
+    #[derive(serde::Deserialize)]
+    struct UserSecretIn {
         id: Vec<u8>,
         name: String,
         data: Vec<u8>,
     }
-    #[derive(serde::Serialize)]
-    struct BagJs {
-        helpers: Vec<HelperJs>,
-        secrets: Vec<UserSecretJs>,
+    #[derive(serde::Deserialize)]
+    struct SecretIn {
+        #[serde(default)]
+        helpers: Vec<HelperIn>,
+        #[serde(default)]
+        secrets: Vec<UserSecretIn>,
+        #[serde(default)]
+        replicas: Option<ReplicasIn>,
+        #[serde(default)]
+        owner_replica_id: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct ReplicasIn {
+        #[serde(default)]
+        replicas: Vec<ReplicaIn>,
+        #[serde(default)]
+        shared_key: Vec<u8>,
     }
 
-    let payload = BagJs {
-        helpers: bag
-            .helpers
-            .into_iter()
-            .map(|h| HelperJs {
-                channel_id: h.channel_id.to_string(),
-                transport_uri: h.transport_uri,
-                communication_info: h.communication_info,
-                shared_key: h.shared_key,
-            })
-            .collect(),
-        secrets: bag
-            .secrets
-            .into_iter()
-            .map(|s| UserSecretJs {
-                id: s.id,
-                name: s.name,
-                data: s.data,
-            })
-            .collect(),
+    let input: SecretIn = serde_wasm_bindgen::from_value(value)
+        .map_err(|e| js_error("INVALID_RECOVERED_SECRET", e.to_string()))?;
+
+    let parse_u64 = |s: &str, ctx: &str| -> Result<u64, JsValue> {
+        if s.is_empty() {
+            return Ok(0);
+        }
+        s.parse::<u64>().map_err(|e| {
+            js_error(
+                "INVALID_RECOVERED_SECRET",
+                format!("{ctx} must be a u64 decimal string: {e}"),
+            )
+        })
     };
 
-    // `Serializer::new().serialize_maps_as_objects(true)` ensures the
-    // `communicationInfo` HashMap comes through as a plain JS object rather
-    // than a `Map` instance.
-    payload
-        .serialize(&serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true))
-        .map_err(|e: serde_wasm_bindgen::Error| js_error("SERIALIZE_ERROR", e.to_string()))
+    let helpers = input
+        .helpers
+        .into_iter()
+        .map(|h| -> Result<_, JsValue> {
+            Ok(crate::protocol::types::HelperInfo {
+                channel_id: parse_u64(&h.channel_id, "helper.channel_id")?,
+                transport_uri: h.transport_uri,
+                shared_key: h.shared_key,
+                communication_info: h.communication_info,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let replicas = input
+        .replicas
+        .map(|g| -> Result<_, JsValue> {
+            let replicas = g
+                .replicas
+                .into_iter()
+                .map(|r| -> Result<_, JsValue> {
+                    Ok(crate::protocol::types::ReplicaInfo {
+                        channel_id: parse_u64(&r.channel_id, "replica.channel_id")?,
+                        transport_uri: r.transport_uri,
+                        communication_info: r.communication_info,
+                        replica_id: parse_u64(&r.replica_id, "replica.replica_id")?,
+                        sender_kind: r.sender_kind,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(crate::protocol::types::Replicas {
+                replicas,
+                shared_key: g.shared_key,
+            })
+        })
+        .transpose()?;
+
+    let secrets = input
+        .secrets
+        .into_iter()
+        .map(|s| crate::protocol::types::UserSecret {
+            id: s.id,
+            name: s.name,
+            data: s.data,
+        })
+        .collect();
+
+    let owner_replica_id = parse_u64(&input.owner_replica_id, "owner_replica_id")?;
+
+    Ok(crate::protocol::types::Secret {
+        helpers,
+        secrets,
+        replicas,
+        owner_replica_id,
+    })
 }
 
-/// Re-populate a set of empty stores from a recovered secret bag, so the
-/// caller can resume in the "normal" (non-recovery) namespace as if the bag
-/// had been distributed by this device originally.
-///
-/// For each helper in the decoded bag, three records are written:
-///   - `channel_store.save(Channel { ... })` — the paired channel record,
-///     including the app's `communication_info` carried in the bag.
-///   - `secret_store.save(channel_id, SharedKey(...))` — the negotiated
-///     symmetric key, restoring the helper's ability to decrypt our messages.
-///   - `share_store.save(channel_id, Share { secret_id, version, bytes: [] })`
-///     — an owner-side tracking entry so subsequent verify-share runs know
-///     which helpers hold this `(secret_id, version)`.
-///
-/// The protocol library treats `communication_info` as opaque; whatever the
-/// owner put there at protect time (typically `{ "name": "Alice" }`) is
-/// restored verbatim.
-///
-/// **Caller's responsibility**: provide stores backed by an *empty* target
-/// namespace (call `clearNamespace` first). This function does not wipe.
-#[wasm_bindgen(js_name = "restoreFromRecoveredBag")]
-pub async fn restore_from_recovered_bag(
-    channel_store: JsValue,
-    secret_store: JsValue,
-    share_store: JsValue,
-    recovered_bytes: &[u8],
-    secret_id: &str,
-    version: u32,
-) -> Result<(), JsValue> {
-    let secret_id_u64 = secret_id.parse::<u64>().map_err(|e| {
-        js_error("INVALID_SECRET_ID", format!("secret_id must be a u64 decimal string: {e}"))
-    })?;
-
-    let derec = DeRecSecret::decode(recovered_bytes).map_err(|e| {
-        js_error("DECODE_ERROR", format!("DeRecSecret decode failed: {e}"))
-    })?;
-    let bag = SecretContainer::decode(derec.secret_data.as_slice()).map_err(|e| {
-        js_error("DECODE_ERROR", format!("SecretContainer decode failed: {e}"))
-    })?;
-
-    let mut ch_store = JsChannelStore(channel_store);
-    let mut sec_store = JsSecretStore(secret_store);
-    let mut sh_store = JsShareStore(share_store);
-
-    let created_at = now_secs();
-    // HTTPS is the only transport the reference app speaks; this mirrors the
-    // value used by the protocol constructor for `own_transport_protocol`.
-    const TRANSPORT_HTTPS: i32 = 0;
-
-    for helper in bag.helpers {
-        let channel_id = ChannelId(helper.channel_id);
-
-        let shared_key: [u8; 32] = helper.shared_key.as_slice().try_into().map_err(|_| {
-            js_error(
-                "INVALID_SHARED_KEY",
-                format!(
-                    "shared_key for channel {} must be 32 bytes, got {}",
-                    helper.channel_id,
-                    helper.shared_key.len()
-                ),
-            )
-        })?;
-
-        let channel = Channel {
-            id: channel_id,
-            transport: derec_proto::TransportProtocol {
-                uri: helper.transport_uri,
-                protocol: TRANSPORT_HTTPS,
-            },
-            communication_info: helper.communication_info,
-            status: ChannelStatus::Paired,
-            created_at,
-            // Re-established from the recovery bag: this node is the Owner.
-            role: derec_proto::SenderKind::Owner,
-            // Helper channel record — replicas are not part of the recovery bag.
-            replica_id: None,
-        };
-
-        ch_store
-            .save(secret_id_u64, channel)
-            .await
-            .map_err(|e| js_error("CHANNEL_STORE_SAVE", e.to_string()))?;
-
-        sec_store
-            .save(
-                secret_id_u64,
-                channel_id,
-                SecretValue::SharedKey(shared_key),
-            )
-            .await
-            .map_err(|e| js_error("SECRET_STORE_SAVE", e.to_string()))?;
-
-        sh_store
-            .save(
-                secret_id_u64,
-                channel_id,
-                Share {
-                    secret_id: secret_id_u64,
-                    version,
-                    // Owner-side tracking-only entry created from a
-                    // separate test fixture path — there is no producing
-                    // replica here, so `replica_id` is None.
-                    replica_id: None,
-                    // Owner-side tracking entry — the helper holds the real
-                    // share bytes; the owner only records that it was sent.
-                    bytes: Vec::new(),
-                },
-            )
-            .await
-            .map_err(|e| js_error("SHARE_STORE_SAVE", e.to_string()))?;
+fn restore_error_to_js(e: crate::protocol::RestoreError) -> JsValue {
+    use crate::protocol::RestoreError;
+    match e {
+        RestoreError::AlreadyRestored => js_error("ALREADY_RESTORED", e.to_string()),
+        RestoreError::Conflict(ids) => {
+            #[derive(serde::Serialize)]
+            struct ConflictError {
+                code: &'static str,
+                message: String,
+                channel_ids: Vec<String>,
+            }
+            serde_wasm_bindgen::to_value(&ConflictError {
+                code: "CONFLICT",
+                message: "restore blocked by pre-existing channels at canonical ids"
+                    .to_owned(),
+                channel_ids: ids.iter().map(|c| c.0.to_string()).collect(),
+            })
+            .unwrap_or_else(|_| js_error("CONFLICT", "restore conflict"))
+        }
+        RestoreError::Invariant(msg) => js_error("INVARIANT", msg.to_string()),
     }
-
-    Ok(())
 }
 
 /// Produce a structured JS error for `NonOkStatus` responses.

@@ -40,17 +40,17 @@ enum SenderKind {
   // pairing but adds a mandatory fingerprint-verify step before the
   // channel transitions out of `Pending`. After verification, the Source
   // calls ProtectSecret targeting the Destination channel; the library
-  // sends a `ReplicaSecretPayload` (full vault + share map) to the
+  // sends a `ReplicaSecretPayload` (full secret + share map) to the
   // Destination via a normal channel-mode `StoreShareRequest`.
   REPLICA_SOURCE = 3;
 
   // Sender is the Destination side of a replica pair — the device that
-  // receives and stores full vault copies from a Source for backup or
+  // receives and stores full secret copies from a Source for backup or
   // recovery purposes. The matching peer kind is REPLICA_SOURCE.
   //
   // The Destination never initiates ProtectSecret on this channel; it
   // only receives `ReplicaSecretPayload` messages and surfaces them to
-  // the application via the `ReplicaVaultReceived` event.
+  // the application via the `ReplicaSecretReceived` event.
   REPLICA_DESTINATION = 4;
 }
 

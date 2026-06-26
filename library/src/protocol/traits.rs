@@ -91,7 +91,7 @@ pub trait DeRecSecretStore {
     /// Load a secret for the given `(secret_id, channel_id)` pair.
     ///
     /// `secret_id` partitions storage so a single backend can serve many
-    /// vaults on the same device (Owner of N vaults, or Helper for N
+    /// secrets on the same device (Owner of N secrets, or Helper for N
     /// Owners). Returns `Ok(None)` when no entry of the requested
     /// [`SecretKind`] exists for this partition key.
     fn load(
@@ -171,7 +171,7 @@ pub trait DeRecChannelStore {
     /// Load the [`Channel`] for `(secret_id, channel_id)`.
     ///
     /// `secret_id` partitions storage so one backend can serve many
-    /// vaults on the same device. Returns `Ok(None)` when no channel
+    /// secrets on the same device. Returns `Ok(None)` when no channel
     /// exists for this partition key.
     fn load(
         &self,
@@ -279,7 +279,7 @@ pub trait DeRecShareStore {
 
     /// Load every share stored under `secret_id` across the given
     /// channels and every version. Used by Discovery to enumerate the
-    /// helper's holdings for the active vault.
+    /// helper's holdings for the active secret.
     fn load_all(
         &self,
         secret_id: u64,
@@ -287,7 +287,7 @@ pub trait DeRecShareStore {
     ) -> ShareStoreFuture<'_, Vec<Share>>;
 
     /// Return the highest version number stored for `secret_id` across
-    /// all channels, or `None` if no shares exist yet for this vault.
+    /// all channels, or `None` if no shares exist yet for this secret.
     fn latest_version(&self, secret_id: u64) -> ShareStoreFuture<'_, Option<u32>>;
 
     /// Persist a share for `(secret_id, channel_id)`.
@@ -297,7 +297,7 @@ pub trait DeRecShareStore {
     /// The protocol considers the full storage key to be
     /// `(secret_id, channel_id, share.version, share.replica_id)`.
     /// Replica destinations reuse the source's channel shared key with
-    /// helpers (the key travels in the `ReplicaSecretPayload` vault), so
+    /// helpers (the key travels in the `ReplicaSecretPayload`), so
     /// two replicas writing the same `(secret_id, channel_id, version)`
     /// look cryptographically identical at the wire layer — only
     /// `share.replica_id` separates them. A naive helper that ignored
@@ -337,13 +337,13 @@ pub trait DeRecShareStore {
     ) -> ShareStoreFuture<'_, ()>;
 }
 
-/// Storage for the user-facing vault contents, keyed by `secret_id`.
+/// Storage for the user-facing secret contents, keyed by `secret_id`.
 ///
 /// One `secret_id` maps to at most one [`UserSecrets`] entry — the most
 /// recent snapshot the application handed off via
 /// `start(FlowKind::ProtectSecret)`. The pair-completion auto-publish
 /// hook reads from here so a freshly-paired Helper or Replica receives
-/// the current vault without an explicit re-publish from the app.
+/// the current secret without an explicit re-publish from the app.
 ///
 /// # Executor independence
 ///

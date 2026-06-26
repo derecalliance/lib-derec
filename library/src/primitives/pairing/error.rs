@@ -38,6 +38,21 @@ pub enum PairingError {
         sender_kind: derec_proto::SenderKind,
     },
 
+    /// The peer's advertised [`ParameterRange`](derec_proto::ParameterRange)
+    /// does not overlap the local one on `field`. `local` and `peer` are
+    /// the offending `(min, max)` pair so the application can render a
+    /// useful diagnostic.
+    #[error(
+        "incompatible parameter range on `{field}`: local=[{local_min}, {local_max}], peer=[{peer_min}, {peer_max}]"
+    )]
+    IncompatibleParameterRange {
+        field: &'static str,
+        local_min: i64,
+        local_max: i64,
+        peer_min: i64,
+        peer_max: i64,
+    },
+
     #[error("internal invariant violated: {0}")]
     Invariant(&'static str),
 

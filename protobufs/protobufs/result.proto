@@ -130,6 +130,15 @@ enum StatusEnum {
   // requested rejected it.
   REJECTED = 10;
 
+  // The pair handshake failed because the two parties' advertised
+  // `ParameterRange` values do not overlap on at least one field
+  // (e.g. local `minShareSize` exceeds peer `maxShareSize`).
+  //
+  // Sent on a `PairResponseMessage`; the `memo` field SHOULD describe
+  // the offending field and the two `(min, max)` pairs so the
+  // initiator can surface a useful diagnostic.
+  INCOMPATIBLE_PARAMETER_RANGE = 11;
+
   // The Helper is requesting that the Owner terminate the relationship.
   //
   // The Owner SHOULD respond by sending an UnpairRequestMessage and

@@ -57,16 +57,16 @@ Three roles participate:
   verification challenges, returns the share during recovery, and acknowledges
   unpair requests.
 - **Replica** — a second device belonging to the same Owner that mirrors
-  the Source's vault. Replica pairings are **unidirectional**, just like
+  the Source's secret. Replica pairings are **unidirectional**, just like
   Owner↔Helper: one side scans as `SenderKind::ReplicaSource` (writes the
-  vault), the other as `SenderKind::ReplicaDestination` (receives it).
+  secret), the other as `SenderKind::ReplicaDestination` (receives it).
   Pairing is confirmed out of band with a human-readable fingerprint
   (`DeRecProtocol::get_fingerprint` / `verify_fingerprint`), then
-  `ProtectSecret` distributes the full vault (helpers + secrets +
+  `ProtectSecret` distributes the full secret (helpers + secrets +
   replicas + `owner_replica_id`) to every Destination via a
   [`ReplicaSecretPayload`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.ReplicaSecretPayload.html).
   Destinations surface the typed
-  [`DeRecEvent::ReplicaVaultReceived`](https://docs.rs/derec-library/latest/derec_library/protocol/events/enum.DeRecEvent.html#variant.ReplicaVaultReceived).
+  [`DeRecEvent::ReplicaSecretReceived`](https://docs.rs/derec-library/latest/derec_library/protocol/events/enum.DeRecEvent.html#variant.ReplicaSecretReceived).
   Configure via `DeRecProtocolBuilder::with_replica_id`.
 
 The protocol is transport-agnostic and produces wire-compatible protobuf
@@ -171,7 +171,19 @@ loop {
                 protocol.accept(action).await?;
             }
             DeRecEvent::SecretRecovered { secret } => {
-                // Recovery completed — use the reconstructed bytes here.
+                // Recovery completed — `secret` is the typed `Secret` snapshot
+                // the owner originally protected. The user-facing entries live
+                // in `secret.secrets: Vec<UserSecret>`; `helpers`, `replicas`
+                // and `owner_replica_id` carry the roster captured at
+                // distribution time.
+                for entry in &secret.secrets {
+                    println!("recovered {} ({}B)", entry.name, entry.data.len());
+                }
+                // Commit the recovered Secret into this fresh protocol's
+                // stores. Wipes the throwaway recovery-mode channels and
+                // reseats canonical helper / replica state at the recovered
+                // version. See `DeRecProtocol::restore`.
+                protocol.restore(&secret, recovered_version).await?;
             }
             // ... handle other events the application cares about.
             _ => {}
@@ -223,7 +235,10 @@ protocol owns the state. The main variants are:
   `ShareRejected { … }`
 - `ShareVerified { channel_id, version }`
 - `SecretsDiscovered { channel_id, secrets }`
-- `RecoveryShareReceived { … }` / `SecretRecovered { secret }` /
+- `RecoveryShareReceived { … }` /
+  `SecretRecovered { secret: Secret }` (typed; `secret.secrets` is the
+  list of `UserSecret` the owner protected, alongside the captured
+  helper/replica roster) /
   `RecoveryShareError { … }`
 - `Unpaired { channel_id }` / `UnpairRejected { channel_id, status, memo }`
 - `PrePairRejected { channel_id, status, memo }` — the contact creator
@@ -255,7 +270,7 @@ The orchestrator enforces flow directionality against this value:
   `ReplicaDestination` channel is decoded as a
   [`ReplicaSecretPayload`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.ReplicaSecretPayload.html)
   and surfaces as
-  [`DeRecEvent::ReplicaVaultReceived`](https://docs.rs/derec-library/latest/derec_library/protocol/events/enum.DeRecEvent.html#variant.ReplicaVaultReceived).
+  [`DeRecEvent::ReplicaSecretReceived`](https://docs.rs/derec-library/latest/derec_library/protocol/events/enum.DeRecEvent.html#variant.ReplicaSecretReceived).
 - `UpdateChannelInfo` is symmetric — either side may initiate it, and the
   role is not consulted.
 
@@ -268,10 +283,11 @@ A mismatch surfaces as `Error::RoleMismatch { channel_id, expected, actual }`.
 | Flow | Purpose |
 |------|---------|
 | Pairing | Establish a secure channel between any two SenderKinds (Owner↔Helper or ReplicaSource↔ReplicaDestination). Two contact modes — see [Pairing modes](#pairing-modes). |
-| Share Distribution | Split a secret and distribute the shares to helpers; replica destinations receive the full vault as a [`ReplicaSecretPayload`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.ReplicaSecretPayload.html). |
+| Share Distribution | Split a secret and distribute the shares to helpers; replica destinations receive the full secret as a [`ReplicaSecretPayload`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.ReplicaSecretPayload.html). |
 | Verification | Challenge helpers to prove they still hold their shares. |
 | Discovery | Ask helpers which secrets and versions they store. |
 | Recovery | Re-pair, collect shares, reconstruct the secret. |
+| Restore | Commit a recovered [`Secret`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.Secret.html) into an empty protocol — reseats canonical helper / replica channels at the recovered version and wipes the throwaway recovery-mode channels. Called once, after `Recovery`, via [`DeRecProtocol::restore`](https://docs.rs/derec-library/latest/derec_library/protocol/struct.DeRecProtocol.html#method.restore). |
 | Unpairing | Tear down a paired channel and drop local state. |
 | Update channel info | Propagate post-pairing changes to communication info and/or transport endpoint. |
 
@@ -331,15 +347,15 @@ End-to-end smoke tests covering both happy path and tampered-hash:
 
 ## Replica flows
 
-Replicas mirror the Owner's vault onto a second device so the same
+Replicas mirror the Owner's secret onto a second device so the same
 secrets remain accessible after device loss without going through full
 helper-based recovery. The model is **unidirectional**, exactly like
 Owner↔Helper:
 
 | SenderKind            | Role on the pair                                                |
 |-----------------------|-----------------------------------------------------------------|
-| `ReplicaSource`       | Owns the vault. Drives `ProtectSecret` and pushes updates.      |
-| `ReplicaDestination`  | Receives the vault. Stores `SecretContainer` + share map.       |
+| `ReplicaSource`       | Owns the secret. Drives `ProtectSecret` and pushes updates.     |
+| `ReplicaDestination`  | Receives the secret. Stores `Secret` + share map.               |
 
 ### Configuring replica identity
 
@@ -385,7 +401,7 @@ destination.verify_fingerprint(channel_id, &local).await?;  // → true
 to `Paired`. A mismatch returns `false` and leaves the channel `Pending`
 so the app can retry.
 
-### Vault distribution
+### Secret distribution
 
 Once the destination is paired (status `Paired`), the source includes it
 as a `ProtectSecret` target alongside helpers. The orchestrator routes
@@ -394,14 +410,14 @@ two payload shapes from the same `start` call:
 - Helpers receive the usual VSS share via `StoreShareRequest`.
 - Destinations receive a typed
   [`ReplicaSecretPayload`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.ReplicaSecretPayload.html)
-  `{ secret: SecretContainer, shares: Vec<ChannelShare> }` — the full
-  vault plus every helper's share keyed by `channel_id`. This is what
+  `{ secret: Secret, shares: Vec<ChannelShare> }` — the full
+  secret plus every helper's share keyed by `channel_id`. This is what
   lets a destination act in the source's place during recovery without
   re-running the share collection.
 
 On the destination, the inbound envelope decodes into
-[`DeRecEvent::ReplicaVaultReceived`](https://docs.rs/derec-library/latest/derec_library/protocol/events/enum.DeRecEvent.html#variant.ReplicaVaultReceived)
-with `vault: SecretContainer` and `shares: Vec<ChannelShare>` already
+[`DeRecEvent::ReplicaSecretReceived`](https://docs.rs/derec-library/latest/derec_library/protocol/events/enum.DeRecEvent.html#variant.ReplicaSecretReceived)
+with `secret: Secret` and `shares: Vec<ChannelShare>` already
 parsed — the app just installs the secrets.
 
 ---
@@ -1056,15 +1072,25 @@ The DeRec protocol assumes helpers are independent and trusted entities.
 ### Replica destinations inherit Source trust
 
 A `ReplicaDestination` receives the full
-[`SecretContainer`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.SecretContainer.html),
+[`Secret`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.Secret.html),
 which embeds every helper's `channel_id` and `shared_key` under
 [`HelperInfo`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.HelperInfo.html).
-Anyone with the vault can therefore authenticate as the Source toward
+Anyone with the secret can therefore authenticate as the Source toward
 every helper. This is intentional — it is what makes Destination-driven
 recovery work — but it means a compromised Destination can impersonate
-the Source against every helper that was paired at the time the vault
+the Source against every helper that was paired at the time the secret
 was sent. Pick Destinations with at least the trust level of the Source
 device itself; do not treat them as opaque backups.
+
+The replica group also shares a single **group channel key**: every
+`(secret_id, channel_id)` entry in
+[`DeRecSecretStore`](https://docs.rs/derec-library/latest/derec_library/protocol/trait.DeRecSecretStore.html)
+for a paired replica channel holds the same 32-byte key, established at
+the first replica pair and handed over to every subsequent joiner via
+[`ReplicaSecretPayload.shared_key`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.ReplicaSecretPayload.html)
+on its first sync round. Compromise of any one Destination therefore
+exposes that single key to the attacker; the protocol does not provide
+per-pair forward secrecy across replicas.
 
 ### `HashedKeys` requires an ephemeral transport URI
 

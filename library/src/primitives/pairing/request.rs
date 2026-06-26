@@ -263,6 +263,7 @@ pub fn produce(
     transport_protocol: TransportProtocol,
     contact_message: &ContactMessage,
     communication_info: Option<CommunicationInfo>,
+    parameter_range: Option<derec_proto::ParameterRange>,
 ) -> Result<ProduceResult, crate::Error> {
     validate_inputs(
         &transport_protocol,
@@ -281,7 +282,7 @@ pub fn produce(
         ecies_public_key: pairing_request_key_material.ecies_public_key.clone(),
         nonce: contact_message.nonce,
         communication_info,
-        parameter_range: None,
+        parameter_range,
         transport_protocol: Some(transport_protocol),
         timestamp: Some(timestamp),
     };

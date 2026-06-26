@@ -62,6 +62,34 @@ public static class DeRecCode
     /// </summary>
     public const int ReplicaIdNotConfigured = 12;
 
+    /// <summary>
+    /// <c>start(Pairing)</c> was called for a channel id that already has a
+    /// <c>Paired</c> channel record. Skip the call at the session layer or
+    /// unpair first.
+    /// <see cref="DeRecException.Category"/> is
+    /// <see cref="DeRecCategory.InvalidInput"/>.
+    /// </summary>
+    public const int ChannelAlreadyPaired = 13;
+
+    /// <summary>
+    /// <c>DeRecProtocol.RestoreAsync</c> precondition: a user-secret snapshot
+    /// already exists for this protocol's <c>secret_id</c>. The application
+    /// must clear it before retrying.
+    /// <see cref="DeRecException.Category"/> is
+    /// <see cref="DeRecCategory.InvalidInput"/>.
+    /// </summary>
+    public const int AlreadyRestored = 14;
+
+    /// <summary>
+    /// <c>DeRecProtocol.RestoreAsync</c> precondition: one or more channels
+    /// live at canonical helper / replica ids carried by the recovered
+    /// <c>Secret</c>. <see cref="DeRecException.Message"/> formats the
+    /// collision list as <c>"restore conflict: channel(s) [a, b, ...]"</c>.
+    /// <see cref="DeRecException.Category"/> is
+    /// <see cref="DeRecCategory.InvalidInput"/>.
+    /// </summary>
+    public const int RestoreConflict = 15;
+
     public const int Encryption = 20;
     public const int Keygen = 21;
     public const int FinishPairingInitiator = 22;
@@ -104,6 +132,16 @@ public static class DeRecCode
     /// <see cref="DeRecCategory.Pairing"/>.
     /// </summary>
     public const int UnexpectedReplicaId = 46;
+
+    /// <summary>
+    /// The peer's <c>ParameterRange</c> does not overlap the locally-configured
+    /// one on some field (e.g. local <c>minShareSize</c> &gt; peer
+    /// <c>maxShareSize</c>). <see cref="DeRecException.Message"/> carries the
+    /// field name and both <c>(min, max)</c> pairs.
+    /// <see cref="DeRecException.Category"/> is
+    /// <see cref="DeRecCategory.Pairing"/>.
+    /// </summary>
+    public const int IncompatibleParameterRange = 47;
 
     public const int EmptyChannels = 60;
     public const int DuplicateChannelId = 61;

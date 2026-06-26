@@ -297,6 +297,25 @@ const recovered = primitives.recovery.response.recover(
 // `recovered` is a Uint8Array carrying the reconstructed secret payload.
 ```
 
+When driving the protocol layer instead of the primitives, the recovering
+device receives a `SecretRecovered` event carrying the typed `secret`. Pass it
+to `protocol.restore(secret, version)` on a fresh `DeRecProtocol` instance to
+commit canonical helper / replica state and wipe the throwaway recovery-mode
+channels — at that point the device resumes normal operation as if the secret
+had been protected here originally.
+
+```ts
+const events = await protocol.process(responseBytes);
+for (const ev of events) {
+  if (ev.type === "SecretRecovered") {
+    await freshProtocol.restore(ev.secret, recoveredVersion);
+  }
+}
+```
+
+Errors surface as objects with a `code` field — `ALREADY_RESTORED`,
+`CONFLICT` (with `channel_ids`), `INVARIANT`, or `STORAGE`.
+
 ---
 
 ## Verification Flow
@@ -340,9 +359,9 @@ console.log("Valid:", isValid);
 
 ## Replica flows
 
-Replicas mirror an Owner's vault onto a second device so the same secrets
+Replicas mirror an Owner's secret onto a second device so the same secrets
 remain reachable after device loss. Pairings are **unidirectional** — one
-side runs as `SenderKind.ReplicaSource` (owns the vault), the other as
+side runs as `SenderKind.ReplicaSource` (owns the secret), the other as
 `SenderKind.ReplicaDestination` (receives it). Both must be constructed
 with a stable `replicaId`:
 
@@ -382,14 +401,14 @@ await destination.verifyFingerprint(channelId, localFp);      // → true
 
 Once paired, the Source includes the Destination as a `ProtectSecret`
 target alongside helpers. Helpers receive the usual VSS share via
-`StoreShareRequest`; the Destination receives the full vault as a
-typed `ReplicaVaultReceived` event:
+`StoreShareRequest`; the Destination receives the full secret as a
+typed `ReplicaSecretReceived` event:
 
 ```ts
 {
-  type: "ReplicaVaultReceived",
+  type: "ReplicaSecretReceived",
   channel_id, from_replica_id, secret_id, version,
-  vault: {
+  secret: {
     helpers:  [...],   // every paired helper (channel_id, transport_uri, shared_key, ...)
     secrets:  [{ id, name, data }],
     replicas: [...],   // every paired destination (replica_id, sender_kind, ...)
@@ -399,11 +418,11 @@ typed `ReplicaVaultReceived` event:
 }
 ```
 
-`vault` + `shares` give the Destination everything it needs to act in the
+`secret` + `shares` give the Destination everything it needs to act in the
 Source's place during recovery.
 
 End-to-end coverage lives in
-[`runReplicaPairingAndVaultSyncFlow`](../../bindings/nodejs/protocol.ts).
+[`runReplicaPairingAndSecretSyncFlow`](../../bindings/nodejs/protocol.ts).
 
 ---
 
@@ -451,14 +470,22 @@ index.d.ts
 
 ### Replica destinations inherit Source trust
 
-`ReplicaVaultReceived.vault` carries the full secret container, which
+`ReplicaSecretReceived.secret` carries the full secret, which
 embeds every helper's `channel_id` and `shared_key`. Anyone holding the
-vault can therefore authenticate as the Source toward every helper.
+secret can therefore authenticate as the Source toward every helper.
 This is intentional — it is what makes Destination-driven recovery
 work — but it means a compromised Destination can impersonate the
-Source against every helper paired at the time the vault was sent.
+Source against every helper paired at the time the secret was sent.
 Pick Destinations with at least the trust level of the Source device
 itself; do not treat them as opaque backups.
+
+All replicas of one `secret_id` also share a single **group channel
+key**: every replica channel's `SharedKey` entry in the secret store
+holds the same 32 bytes, established at the first replica pair and
+handed to every subsequent joiner via the
+`ReplicaSecretPayload.shared_key` field on its first sync round.
+Compromise of any one Destination therefore exposes that single key;
+the protocol does not provide per-pair forward secrecy across replicas.
 
 ### `ContactMode.HashedKeys` requires an ephemeral transport URI
 

@@ -23,7 +23,7 @@ use serde::Serialize;
 use crate::protocol::{
     pending_action_wire,
     reserved_keys::encode_replica_id,
-    types::{ChannelShare, SecretContainer},
+    types::{ChannelShare, Secret},
     DeRecEvent, PendingAction,
 };
 
@@ -42,15 +42,15 @@ pub(crate) enum Event {
         channel_id: String,
         peer_replica_id: String,
     },
-    ReplicaVaultReceived {
+    ReplicaSecretReceived {
         channel_id: String,
         from_replica_id: String,
         secret_id: String,
         version: u32,
-        vault: Container,
+        secret: SecretWire,
         shares: Vec<Share>,
     },
-    ReplicaVaultAcked {
+    ReplicaSecretAcked {
         channel_id: String,
         from_replica_id: String,
         secret_id: String,
@@ -100,7 +100,10 @@ pub(crate) enum Event {
         error: String,
     },
     SecretRecovered {
-        secret: Vec<u8>,
+        /// Same nested wire shape as
+        /// [`Self::ReplicaSecretReceived::secret`] — the typed
+        /// `Secret` snapshot the owner originally protected.
+        secret: SecretWire,
     },
     Unpaired {
         channel_id: String,
@@ -149,6 +152,13 @@ pub(crate) enum Event {
         #[serde(skip_serializing_if = "Option::is_none")]
         share_secret_id: Option<String>,
     },
+    AutoAccepted {
+        channel_id: String,
+        /// Same label vocabulary as `ActionRequired.action_kind`
+        /// (`"Pairing"`, `"StoreShare"`, …) so JS/.NET listeners can
+        /// route on a single string field.
+        action_kind: String,
+    },
     NoOp,
 }
 
@@ -165,11 +175,22 @@ pub struct DiscoveredVersion {
 }
 
 #[derive(Serialize)]
-pub struct Container {
+pub struct SecretWire {
     pub helpers: Vec<Helper>,
     pub secrets: Vec<UserSecret>,
-    pub replicas: Vec<Replica>,
+    /// Replica composite. Absent when this `secret_id` has no replica
+    /// setup. Carries the destination roster and the 32-byte group key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<ReplicasWire>,
     pub owner_replica_id: String,
+}
+
+#[derive(Serialize)]
+pub struct ReplicasWire {
+    pub replicas: Vec<Replica>,
+    /// 32-byte replica group key. Required by `DeRecProtocol::restore`
+    /// to rebuild replica channel state.
+    pub shared_key: Vec<u8>,
 }
 
 #[derive(Serialize)]
@@ -185,7 +206,6 @@ pub struct Helper {
 pub struct Replica {
     pub channel_id: String,
     pub transport_uri: String,
-    pub shared_key: Vec<u8>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub communication_info: HashMap<String, String>,
     pub replica_id: String,
@@ -205,8 +225,8 @@ pub struct Share {
     pub committed_share: Vec<u8>,
 }
 
-impl From<SecretContainer> for Container {
-    fn from(v: SecretContainer) -> Self {
+impl From<Secret> for SecretWire {
+    fn from(v: Secret) -> Self {
         Self {
             helpers: v
                 .helpers
@@ -227,18 +247,20 @@ impl From<SecretContainer> for Container {
                     data: s.data,
                 })
                 .collect(),
-            replicas: v
-                .replicas
-                .into_iter()
-                .map(|r| Replica {
-                    channel_id: r.channel_id.to_string(),
-                    transport_uri: r.transport_uri,
-                    shared_key: r.shared_key,
-                    communication_info: r.communication_info,
-                    replica_id: encode_replica_id(r.replica_id),
-                    sender_kind: r.sender_kind,
-                })
-                .collect(),
+            replicas: v.replicas.map(|g| ReplicasWire {
+                replicas: g
+                    .replicas
+                    .into_iter()
+                    .map(|r| Replica {
+                        channel_id: r.channel_id.to_string(),
+                        transport_uri: r.transport_uri,
+                        communication_info: r.communication_info,
+                        replica_id: encode_replica_id(r.replica_id),
+                        sender_kind: r.sender_kind,
+                    })
+                    .collect(),
+                shared_key: g.shared_key,
+            }),
             owner_replica_id: encode_replica_id(v.owner_replica_id),
         }
     }
@@ -275,29 +297,29 @@ impl Event {
                 channel_id: channel_id.0.to_string(),
                 peer_replica_id: encode_replica_id(peer_replica_id),
             },
-            DeRecEvent::ReplicaVaultReceived {
+            DeRecEvent::ReplicaSecretReceived {
                 channel_id,
                 from_replica_id,
                 secret_id,
                 version,
-                vault,
+                secret,
                 shares,
-            } => Self::ReplicaVaultReceived {
+            } => Self::ReplicaSecretReceived {
                 channel_id: channel_id.0.to_string(),
                 from_replica_id: encode_replica_id(from_replica_id),
                 secret_id: secret_id.to_string(),
                 version,
-                vault: vault.into(),
+                secret: secret.into(),
                 shares: shares.into_iter().map(Into::into).collect(),
             },
-            DeRecEvent::ReplicaVaultAcked {
+            DeRecEvent::ReplicaSecretAcked {
                 channel_id,
                 from_replica_id,
                 secret_id,
                 version,
                 status,
                 memo,
-            } => Self::ReplicaVaultAcked {
+            } => Self::ReplicaSecretAcked {
                 channel_id: channel_id.0.to_string(),
                 from_replica_id: encode_replica_id(from_replica_id),
                 secret_id: secret_id.to_string(),
@@ -377,7 +399,9 @@ impl Event {
                 shares_received: shares_received as u32,
                 error,
             },
-            DeRecEvent::SecretRecovered { secret } => Self::SecretRecovered { secret },
+            DeRecEvent::SecretRecovered { secret } => Self::SecretRecovered {
+                secret: secret.into(),
+            },
             DeRecEvent::Unpaired { channel_id } => Self::Unpaired {
                 channel_id: channel_id.0.to_string(),
             },
@@ -411,6 +435,13 @@ impl Event {
                 status,
                 memo,
             },
+            DeRecEvent::AutoAccepted {
+                channel_id,
+                action_kind,
+            } => Self::AutoAccepted {
+                channel_id: channel_id.0.to_string(),
+                action_kind: pending_action_kind_label(action_kind).to_owned(),
+            },
             DeRecEvent::ActionRequired { channel_id, action } => {
                 let action_kind = action_kind_label(&action).to_owned();
                 let peer_communication_info = extract_peer_communication_info(&action);
@@ -439,15 +470,22 @@ impl Event {
 }
 
 fn action_kind_label(action: &PendingAction) -> &'static str {
-    match action {
-        PendingAction::Pairing { .. } => "Pairing",
-        PendingAction::PrePair { .. } => "PrePair",
-        PendingAction::StoreShare { .. } => "StoreShare",
-        PendingAction::VerifyShare { .. } => "VerifyShare",
-        PendingAction::Discovery { .. } => "Discovery",
-        PendingAction::GetShare { .. } => "GetShare",
-        PendingAction::Unpair { .. } => "Unpair",
-        PendingAction::UpdateChannelInfo { .. } => "UpdateChannelInfo",
+    pending_action_kind_label(action.kind())
+}
+
+pub(crate) fn pending_action_kind_label(
+    kind: crate::protocol::events::PendingActionKind,
+) -> &'static str {
+    use crate::protocol::events::PendingActionKind as K;
+    match kind {
+        K::Pairing => "Pairing",
+        K::PrePair => "PrePair",
+        K::StoreShare => "StoreShare",
+        K::VerifyShare => "VerifyShare",
+        K::Discovery => "Discovery",
+        K::GetShare => "GetShare",
+        K::Unpair => "Unpair",
+        K::UpdateChannelInfo => "UpdateChannelInfo",
     }
 }
 

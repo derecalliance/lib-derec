@@ -238,11 +238,13 @@ pub extern "C" fn validate_contact_message(
 
 /// `communication_info_ptr` may be null / zero-length to indicate no
 /// communication info; otherwise it must be serialized [`CommunicationInfo`]
-/// proto bytes.
+/// proto bytes. `parameter_range_ptr` follows the same convention and
+/// carries serialized [`derec_proto::ParameterRange`] bytes.
 ///
 /// # Safety
 ///
 /// Non-null input pointers must point to the corresponding readable byte ranges.
+#[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]
 pub extern "C" fn produce_pair_request_message(
     sender_kind: i32,
@@ -252,6 +254,8 @@ pub extern "C" fn produce_pair_request_message(
     contact_message_len: usize,
     communication_info_ptr: *const u8,
     communication_info_len: usize,
+    parameter_range_ptr: *const u8,
+    parameter_range_len: usize,
 ) -> ProducePairRequestMessageResult {
     let with_err = |error| ProducePairRequestMessageResult {
         error,
@@ -296,12 +300,18 @@ pub extern "C" fn produce_pair_request_message(
             Ok(c) => c,
             Err(e) => return with_err(e),
         };
+    let parameter_range =
+        match decode_optional_parameter_range(parameter_range_ptr, parameter_range_len) {
+            Ok(p) => p,
+            Err(e) => return with_err(e),
+        };
 
     match crate::primitives::pairing::request::produce(
         sender_kind,
         transport_protocol,
         &contact_message,
         communication_info,
+        parameter_range,
     ) {
         Ok(r) => ProducePairRequestMessageResult {
             error: success(),
@@ -370,9 +380,14 @@ pub extern "C" fn extract_pair_request(
 /// returned by [`extract_pair_request`]. `communication_info_ptr` may be null /
 /// zero-length to indicate no communication info.
 ///
+/// `parameter_range_ptr` may be null / zero-length to indicate no
+/// parameter range; otherwise it must be serialized
+/// [`derec_proto::ParameterRange`] proto bytes.
+///
 /// # Safety
 ///
 /// Non-null input pointers must point to the corresponding readable byte ranges.
+#[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]
 pub extern "C" fn produce_pair_response_message(
     channel_id: u64,
@@ -382,6 +397,8 @@ pub extern "C" fn produce_pair_response_message(
     secret_key_material_len: usize,
     communication_info_ptr: *const u8,
     communication_info_len: usize,
+    parameter_range_ptr: *const u8,
+    parameter_range_len: usize,
 ) -> ProducePairResponseMessageResult {
     let with_err = |error| ProducePairResponseMessageResult {
         error,
@@ -415,12 +432,18 @@ pub extern "C" fn produce_pair_response_message(
             Ok(c) => c,
             Err(e) => return with_err(e),
         };
+    let parameter_range =
+        match decode_optional_parameter_range(parameter_range_ptr, parameter_range_len) {
+            Ok(p) => p,
+            Err(e) => return with_err(e),
+        };
 
     match crate::primitives::pairing::response::produce(
         crate::types::ChannelId(channel_id),
         &request,
         &pairing_secret_key_material,
         communication_info,
+        parameter_range,
     ) {
         Ok(r) => ProducePairResponseMessageResult {
             error: success(),
@@ -859,6 +882,22 @@ fn decode_optional_communication_info(
         ffi_error(
             DEREC_CODE_FFI_BAD_PROTO,
             "communication_info_bytes is not a valid CommunicationInfo",
+        )
+    })
+}
+
+fn decode_optional_parameter_range(
+    ptr: *const u8,
+    len: usize,
+) -> Result<Option<derec_proto::ParameterRange>, DeRecError> {
+    if ptr.is_null() || len == 0 {
+        return Ok(None);
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    derec_proto::ParameterRange::decode(bytes).map(Some).map_err(|_| {
+        ffi_error(
+            DEREC_CODE_FFI_BAD_PROTO,
+            "parameter_range_bytes is not a valid ParameterRange",
         )
     })
 }

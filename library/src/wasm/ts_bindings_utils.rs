@@ -89,6 +89,15 @@ fn categorize(err: &crate::Error) -> (&'static str, &'static str) {
         crate::Error::Invariant(_) => ("invariant", "INVARIANT_VIOLATED"),
         crate::Error::RoleMismatch { .. } => ("input", "ROLE_MISMATCH"),
         crate::Error::ReplicaIdNotConfigured => ("input", "REPLICA_ID_NOT_CONFIGURED"),
+        crate::Error::ChannelAlreadyPaired { .. } => ("input", "CHANNEL_ALREADY_PAIRED"),
+        crate::Error::Restore(e) => {
+            use crate::protocol::RestoreError;
+            match e {
+                RestoreError::AlreadyRestored => ("input", "ALREADY_RESTORED"),
+                RestoreError::Conflict(_) => ("input", "CONFLICT"),
+                RestoreError::Invariant(_) => ("invariant", "INVARIANT"),
+            }
+        }
     }
 }
 
@@ -103,6 +112,7 @@ fn pairing_code(e: &PairingError) -> &'static str {
         PairingError::PrePairHashMismatch => "PREPAIR_HASH_MISMATCH",
         PairingError::MissingReplicaId { .. } => "MISSING_REPLICA_ID",
         PairingError::UnexpectedReplicaId { .. } => "UNEXPECTED_REPLICA_ID",
+        PairingError::IncompatibleParameterRange { .. } => "INCOMPATIBLE_PARAMETER_RANGE",
         PairingError::Invariant(_) => "INVARIANT",
         PairingError::ContactMessageKeygen { .. } => "CONTACT_MESSAGE_KEYGEN",
         PairingError::PairRequestKeygen { .. } => "PAIR_REQUEST_KEYGEN",
@@ -122,6 +132,7 @@ fn recovery_code(e: &RecoveryError) -> &'static str {
         RecoveryError::SecretIdMismatch => "SECRET_ID_MISMATCH",
         RecoveryError::VersionMismatch { .. } => "VERSION_MISMATCH",
         RecoveryError::ReconstructionFailed { .. } => "RECONSTRUCTION_FAILED",
+        RecoveryError::MalformedRecoveredSecret { .. } => "MALFORMED_RECOVERED_SECRET",
     }
 }
 

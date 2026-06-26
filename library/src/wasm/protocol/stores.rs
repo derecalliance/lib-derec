@@ -788,7 +788,15 @@ fn user_secrets_from_js(value: &JsValue) -> Result<UserSecrets, ShareStoreError>
     let description = js_sys::Reflect::get(value, &"description".into())
         .ok()
         .and_then(|v| v.as_string());
-    Ok(UserSecrets { version, secrets, description })
+    // The JS-side store carries only the user-facing snapshot; the
+    // `replicas` cache is rebuilt on the next ProtectSecret round from
+    // live channel state.
+    Ok(UserSecrets {
+        version,
+        secrets,
+        description,
+        replicas: None,
+    })
 }
 
 impl DeRecUserSecretStore for JsUserSecretStore {

@@ -67,11 +67,38 @@ impl Peer {
         )
     }
 
+    /// Construct a peer with the supplied per-flow auto-accept policy.
+    /// Uses default `PeerOptions` for everything else.
+    pub fn with_auto_accept(
+        connection: SharedConnection,
+        label: &'static str,
+        uri: &str,
+        policy: derec_library::protocol::AutoAcceptPolicy,
+    ) -> Self {
+        Self::with_full_options(connection, label, uri, PeerOptions::default(), policy)
+    }
+
     pub fn with_options(
         connection: SharedConnection,
         label: &'static str,
         uri: &str,
         options: PeerOptions,
+    ) -> Self {
+        Self::with_full_options(
+            connection,
+            label,
+            uri,
+            options,
+            derec_library::protocol::AutoAcceptPolicy::default(),
+        )
+    }
+
+    fn with_full_options(
+        connection: SharedConnection,
+        label: &'static str,
+        uri: &str,
+        options: PeerOptions,
+        auto_accept: derec_library::protocol::AutoAcceptPolicy,
     ) -> Self {
         let transport = InProcessTransport::new();
         let channel_store = SqliteChannelStore::new(connection.clone());
@@ -86,7 +113,8 @@ impl Peer {
             .with_user_secret_store(user_secret_store)
             .with_transport(transport.clone())
             .with_own_transport(uri)
-            .with_threshold(options.threshold);
+            .with_threshold(options.threshold)
+            .with_auto_accept(auto_accept);
         if let Some(rid) = options.replica_id {
             builder = builder.with_replica_id(rid);
         }

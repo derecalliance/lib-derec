@@ -189,6 +189,7 @@ pub fn produce(
     request: &PairRequestMessage,
     pairing_secret_key_material: &PairingSecretKeyMaterial,
     communication_info: Option<CommunicationInfo>,
+    parameter_range: Option<derec_proto::ParameterRange>,
 ) -> Result<ProduceResult, crate::Error> {
     validate_produce_inputs(request)?;
 
@@ -223,7 +224,7 @@ pub fn produce(
         }),
         nonce: request.nonce,
         communication_info,
-        parameter_range: None,
+        parameter_range,
         timestamp: Some(timestamp),
         channel_id: rekeyed_channel_id.into(),
     };

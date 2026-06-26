@@ -160,7 +160,7 @@ pub extern "C" fn produce_store_share_request_message(
     // `has_replica_id == 0` writes `None` on the wire; otherwise the
     // `replica_id` value is stamped on `StoreShareRequestMessage.replica_id`
     // so the helper can disambiguate concurrent writes from different
-    // replicas reusing the source's shared key.
+    // replicas that share the same channel key with the helper.
     has_replica_id: u32,
     replica_id: u64,
 ) -> ProduceStoreShareRequestMessageResult {

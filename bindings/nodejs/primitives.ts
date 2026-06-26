@@ -213,13 +213,14 @@ export function runPrimitivesSmoke(): void {
     { protocol: 0, uri: "https://example.com/helper" },
     contact.contact_message,
     null,
+    null,
   );
 
   // Initiator extracts the request and produces a response.
   const { request: pairRequest }: { request: PairRequestMessage } =
     primitives.pairing.request.extract(pairingRequest.envelope, contact.secret_key);
   const produced = primitives.pairing.response.produce(
-    pairingChannelId, pairRequest, contact.secret_key, null,
+    pairingChannelId, pairRequest, contact.secret_key, null, null,
   );
 
   // Responder extracts the response and processes it.
@@ -331,11 +332,12 @@ export function runPrimitivesSmoke(): void {
     { protocol: 0, uri: "https://example.com/helper" },
     filledInContact,
     null,
+    null,
   );
   const { request: hkPairRequest }: { request: PairRequestMessage } =
     primitives.pairing.request.extract(hkPairingRequest.envelope, hkContact.secret_key);
   const hkProduced = primitives.pairing.response.produce(
-    hashedKeysChannelId, hkPairRequest, hkContact.secret_key, null,
+    hashedKeysChannelId, hkPairRequest, hkContact.secret_key, null, null,
   );
   const { response: hkPairResponse }: { response: PairResponseMessage } =
     primitives.pairing.response.extract(hkProduced.envelope, hkPairingRequest.secret_key);

@@ -16,6 +16,117 @@ use derec_proto::{
     UnpairRequestMessage, UpdateChannelInfoRequestMessage, VerifyShareRequestMessage,
 };
 
+/// Lightweight discriminant of [`PendingAction`].
+///
+/// Carries no payload — useful for the
+/// [`DeRecEvent::AutoAccepted`] event (so listeners can route on
+/// "what flow just got auto-accepted" without holding the action's
+/// inner request/key material) and for the
+/// [`AutoAcceptPolicy::allows`] dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PendingActionKind {
+    Pairing,
+    PrePair,
+    StoreShare,
+    VerifyShare,
+    Discovery,
+    GetShare,
+    Unpair,
+    UpdateChannelInfo,
+}
+
+/// Per-flow opt-in for auto-accepting incoming requests.
+///
+/// Default = every field `false` (no flow auto-accepted; `process()`
+/// emits [`DeRecEvent::ActionRequired`] like today). When a field is
+/// `true`, `process()` invokes the equivalent of
+/// [`super::DeRecProtocol::accept`] internally and emits
+/// [`DeRecEvent::AutoAccepted`] **in place of**
+/// [`DeRecEvent::ActionRequired`], followed by the same flow events
+/// the caller would have seen from a manual `accept`.
+///
+/// Wire the policy through
+/// [`super::DeRecProtocolBuilder::with_auto_accept`].
+///
+/// # Per-flow notes
+///
+/// - [`Self::pairing`] covers both standard and replica pairing.
+///   Standard pairing transitions the channel to `Paired` immediately;
+///   auto-accepting it skips any UI confirmation of "User X wants to
+///   pair." Replica pairing leaves the channel in `Pending` until both
+///   sides run `verify_fingerprint()`, so auto-accept here is benign
+///   (channel is inert until the out-of-band fingerprint match).
+/// - [`Self::pre_pair`] gates the plaintext `PrePair` leg of HashedKeys
+///   pairing. The MITM defence is on the *scanner* side
+///   (binding-hash check) and is unaffected by this flag, but enabling
+///   it turns the initiator into a request-amplification oracle: any
+///   party that knows the contact's `nonce` + `channel_id` can elicit
+///   a key-publish response. Prefer to keep this off unless you
+///   control both ends of the transport (LAN, integration tests).
+/// - [`Self::unpair`] is destructive — accepting deletes the local
+///   channel record and any shares/secrets associated with it. The
+///   [`DeRecEvent::Unpaired`] event still fires (after the deletion),
+///   so observability is preserved, but the user has no chance to
+///   intervene before the data is gone. Apps that want a "are you
+///   sure?" gate should keep this off.
+/// - [`Self::update_channel_info`] silently overwrites the stored
+///   channel record with the peer's new transport / communication
+///   info. Cryptographically safe (only the paired peer can send it),
+///   but a compromised peer key gets weaponised faster — outbound
+///   traffic on the channel re-routes to whatever endpoint the peer
+///   announced.
+///
+/// All other fields wrap routine request/response flows and have no
+/// security-sensitive caveats beyond "the caller decided not to gate
+/// them."
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AutoAcceptPolicy {
+    pub pairing: bool,
+    pub pre_pair: bool,
+    pub store_share: bool,
+    pub verify_share: bool,
+    pub discovery: bool,
+    pub get_share: bool,
+    pub unpair: bool,
+    pub update_channel_info: bool,
+}
+
+impl AutoAcceptPolicy {
+    /// Enable auto-accept for every flow. Equivalent to setting every
+    /// field to `true` — read the field-level docs on
+    /// [`AutoAcceptPolicy`] before using this in production; several
+    /// flows are state-changing or expose a request-amplification
+    /// surface.
+    pub fn all() -> Self {
+        Self {
+            pairing: true,
+            pre_pair: true,
+            store_share: true,
+            verify_share: true,
+            discovery: true,
+            get_share: true,
+            unpair: true,
+            update_channel_info: true,
+        }
+    }
+
+    /// `true` when the policy opts in to auto-accepting the given action.
+    /// Used by [`super::DeRecProtocol::process`] at the auto-accept
+    /// intercept site.
+    pub fn allows(&self, action: &PendingAction) -> bool {
+        match action.kind() {
+            PendingActionKind::Pairing => self.pairing,
+            PendingActionKind::PrePair => self.pre_pair,
+            PendingActionKind::StoreShare => self.store_share,
+            PendingActionKind::VerifyShare => self.verify_share,
+            PendingActionKind::Discovery => self.discovery,
+            PendingActionKind::GetShare => self.get_share,
+            PendingActionKind::Unpair => self.unpair,
+            PendingActionKind::UpdateChannelInfo => self.update_channel_info,
+        }
+    }
+}
+
 /// An opaque action token emitted inside [`DeRecEvent::ActionRequired`] events.
 ///
 /// When `process()` receives an incoming protocol request, it returns an
@@ -125,6 +236,25 @@ pub enum PendingAction {
     },
 }
 
+impl PendingAction {
+    /// Return this action's discriminant — used by
+    /// [`AutoAcceptPolicy::allows`] and by the [`DeRecEvent::AutoAccepted`]
+    /// event so callers can route on flow kind without inspecting the
+    /// inner payload.
+    pub fn kind(&self) -> PendingActionKind {
+        match self {
+            PendingAction::Pairing { .. } => PendingActionKind::Pairing,
+            PendingAction::PrePair { .. } => PendingActionKind::PrePair,
+            PendingAction::StoreShare { .. } => PendingActionKind::StoreShare,
+            PendingAction::VerifyShare { .. } => PendingActionKind::VerifyShare,
+            PendingAction::Discovery { .. } => PendingActionKind::Discovery,
+            PendingAction::GetShare { .. } => PendingActionKind::GetShare,
+            PendingAction::Unpair { .. } => PendingActionKind::Unpair,
+            PendingAction::UpdateChannelInfo { .. } => PendingActionKind::UpdateChannelInfo,
+        }
+    }
+}
+
 /// Describes an outbound protocol flow to initiate via [`super::DeRecProtocol::start`].
 ///
 /// # Role gating
@@ -151,24 +281,24 @@ pub enum DeRecFlow {
     Discovery {
         target: Target,
     },
-    /// Publish the current vault bag to the protocol's paired peers.
+    /// Publish the current secret to the protocol's paired peers.
     ///
-    /// The vault identifier comes from the
+    /// The secret identifier comes from the
     /// [`super::DeRecProtocol`] instance (set at construction via
     /// [`crate::protocol::DeRecProtocolBuilder::new`]) — one protocol
-    /// instance manages exactly one vault.
+    /// instance manages exactly one secret.
     ///
     /// The target set is derived from the channel store: every paired
     /// Owner→Helper channel receives a share if the configured threshold
     /// is met, and every paired Source→ReplicaDestination channel
-    /// receives the full vault payload. Apps that need to drive a single
+    /// receives the full secret payload. Apps that need to drive a single
     /// peer should pair just that peer; the protocol no longer accepts
     /// a per-call subset.
     ///
     /// When the count of paired Helpers is below
     /// [`crate::protocol::DeRecProtocolBuilder::with_threshold`], no VSS
-    /// split runs and Helpers receive nothing — the bag still lands on
-    /// any paired Replica destinations in "vault-only" form.
+    /// split runs and Helpers receive nothing — the secret still lands on
+    /// any paired Replica destinations in "secret-only" form.
     ProtectSecret {
         secrets: Vec<UserSecret>,
         description: Option<String>,
@@ -263,7 +393,7 @@ pub enum DeRecEvent {
     /// - [`SenderKind::ReplicaSource`] / [`SenderKind::ReplicaDestination`] —
     ///   a replica pairing completed; the application may use the channel
     ///   as needed (Source pushes via `ProtectSecret`, Destination receives
-    ///   via [`Self::ReplicaVaultReceived`]).
+    ///   via [`Self::ReplicaSecretReceived`]).
     PairingCompleted {
         channel_id: ChannelId,
         kind: SenderKind,
@@ -279,7 +409,7 @@ pub enum DeRecEvent {
     /// (`ReplicaSource` or `ReplicaDestination`) is already on
     /// [`crate::protocol::types::Channel::role`] — this event just adds the
     /// peer's `replica_id`, which the app needs as a `from_replica_id`
-    /// when subsequent vault syncs arrive or when targeting the peer via
+    /// when subsequent secret syncs arrive or when targeting the peer via
     /// `ProtectSecret`.
     ReplicaPaired {
         /// The channel the pair handshake just completed on.
@@ -304,19 +434,25 @@ pub enum DeRecEvent {
         replica_id: Option<u64>,
     },
 
-    /// A `ReplicaSource` peer pushed a vault sync on a `ReplicaDestination`
+    /// A `ReplicaSource` peer pushed a secret sync on a `ReplicaDestination`
     /// channel. The library has already auto-acked the inbound
     /// `StoreShareRequest` and decoded the `ReplicaSecretPayload` into
-    /// typed fields — the application can install `vault` directly,
+    /// typed fields — the application can install `secret` directly,
     /// optionally using `shares` to verify or to take over the recovery
     /// flow toward each helper.
     ///
-    /// **Recovery transitivity**: `vault.helpers[i].shared_key` lets the
-    /// receiver authenticate as the Source toward each helper, and
-    /// `vault.replicas[i].shared_key` does the same toward other
-    /// destinations. Treat the receiving device accordingly — see
+    /// **Recovery transitivity**: `secret.helpers[i].shared_key` lets
+    /// the receiver authenticate as the Source toward each helper. For
+    /// replica-to-replica traffic, all replicas share a single
+    /// group-wide channel key (see
+    /// [`crate::protocol::types::ReplicaSecretPayload`] for the handover
+    /// protocol) — the receiver's own
+    /// [`crate::protocol::DeRecSecretStore`] entry for this channel
+    /// holds that group key, so impersonating the Source toward another
+    /// destination is just a normal channel-key load. Treat the
+    /// receiving device accordingly — see
     /// [`crate::protocol::types::ReplicaInfo`] for the security note.
-    ReplicaVaultReceived {
+    ReplicaSecretReceived {
         /// The channel the request arrived on.
         channel_id: ChannelId,
         /// The peer's replica identity (from `Channel.replica_id`,
@@ -326,10 +462,10 @@ pub enum DeRecEvent {
         secret_id: u64,
         /// `version` echoed from the inbound `StoreShareRequest`.
         version: u32,
-        /// Decoded full vault — same shape the sender wrote. The
+        /// Decoded full secret — same shape the sender wrote. The
         /// `helpers`, `replicas`, `secrets`, and `owner_replica_id`
         /// fields carry the canonical roster snapshot for this version.
-        vault: crate::protocol::types::SecretContainer,
+        secret: crate::protocol::types::Secret,
         /// Per-helper VSS share map. Each entry pairs a helper's
         /// `channel_id` with the serialized `CommittedDeRecShare` bytes
         /// the helper received — sufficient material for the receiver
@@ -337,7 +473,7 @@ pub enum DeRecEvent {
         shares: Vec<crate::protocol::types::ChannelShare>,
     },
 
-    /// A replica peer's `StoreShareResponse` to a vault sync we sent
+    /// A replica peer's `StoreShareResponse` to a secret sync we sent
     /// earlier. Fires on the replica channel, mirroring
     /// [`Self::ShareConfirmed`] / [`Self::ShareRejected`] on the helper
     /// side.
@@ -345,7 +481,7 @@ pub enum DeRecEvent {
     /// `status` and `memo` come straight from the peer's
     /// `StoreShareResponseMessage.result`. Apps decide whether to retry,
     /// rebroadcast, or surface the failure to the user.
-    ReplicaVaultAcked {
+    ReplicaSecretAcked {
         channel_id: ChannelId,
         /// The peer's replica identity (from `Channel.replica_id`).
         from_replica_id: u64,
@@ -431,17 +567,61 @@ pub enum DeRecEvent {
         error: String,
     },
 
-    /// Recovery completed — the reconstructed secret is returned exactly once.
-    SecretRecovered { secret: Vec<u8> },
+    /// Recovery completed — the reconstructed
+    /// [`crate::protocol::types::Secret`] is returned exactly once.
+    ///
+    /// The variant mirrors [`Self::ReplicaSecretReceived`]: the
+    /// inner `secret` carries the full typed snapshot
+    /// — `secrets: Vec<UserSecret>` (the user-facing entries the
+    /// owner originally protected) plus the roster snapshot
+    /// (`helpers`, `replicas`, `owner_replica_id`) captured at
+    /// distribution time. Apps that only care about the user-facing
+    /// entries read `secret.secrets`; the roster fields are useful
+    /// when the recovering owner wants to know who held the shares,
+    /// re-pair with the same helpers, or sync replicas after the
+    /// recovery completes.
+    ///
+    /// The library decodes the two-layer (`DeRecSecret` → `Secret`)
+    /// protobuf wrapping internally; a decode failure surfaces as
+    /// [`Self::RecoveryShareError`] for that final share, not as
+    /// `SecretRecovered` with bogus contents.
+    ///
+    /// Pass `secret` to [`super::DeRecProtocol::restore`] on a fresh
+    /// protocol instance to commit canonical helper / replica state
+    /// and wipe the throwaway recovery-mode channels.
+    SecretRecovered {
+        secret: crate::protocol::types::Secret,
+    },
 
     /// An incoming request requires application confirmation before the library responds.
     ///
-    /// Emitted by [`super::DeRecProtocol::process`] for every incoming request.
+    /// Emitted by [`super::DeRecProtocol::process`] for every incoming request
+    /// that is **not** opted into auto-accept by [`AutoAcceptPolicy`].
     /// The application must call [`super::DeRecProtocol::accept`] or
     /// [`super::DeRecProtocol::reject`] to complete the flow.
     ActionRequired {
         channel_id: ChannelId,
         action: PendingAction,
+    },
+
+    /// The library auto-accepted an incoming request because the
+    /// configured [`AutoAcceptPolicy`] opted in to its flow.
+    ///
+    /// Emitted by [`super::DeRecProtocol::process`] **in place of**
+    /// [`Self::ActionRequired`] for the auto-accepted flow, followed
+    /// (in the same event vec) by the same flow events a manual
+    /// `accept(action)` would have produced (e.g. `ShareStored`,
+    /// `PairingCompleted`, `Unpaired`). Applications use this event
+    /// for observability / audit logging — no further action is
+    /// required from the caller.
+    AutoAccepted {
+        channel_id: ChannelId,
+        /// The action's discriminant. The original
+        /// [`PendingAction`] payload is consumed by the internal
+        /// `accept` and is not surfaced here; routing on the kind is
+        /// enough for observability since the flow-completion events
+        /// that follow carry the per-flow details.
+        action_kind: PendingActionKind,
     },
 
     /// The local channel state for `channel_id` has been dropped as the
@@ -515,4 +695,143 @@ pub enum DeRecEvent {
 
     /// Well-formed message with no actionable effect (e.g. an ACK).
     NoOp,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use derec_proto::{
+        GetSecretIdsVersionsRequestMessage, GetShareRequestMessage, PrePairRequestMessage,
+        StoreShareRequestMessage, UnpairRequestMessage, UpdateChannelInfoRequestMessage,
+        VerifyShareRequestMessage,
+    };
+
+    fn store_share_action() -> PendingAction {
+        PendingAction::StoreShare {
+            channel_id: ChannelId(1),
+            request: StoreShareRequestMessage::default(),
+            shared_key: [0u8; 32],
+            trace_id: 0,
+        }
+    }
+
+    fn verify_share_action() -> PendingAction {
+        PendingAction::VerifyShare {
+            channel_id: ChannelId(1),
+            request: VerifyShareRequestMessage::default(),
+            shared_key: [0u8; 32],
+            trace_id: 0,
+        }
+    }
+
+    fn discovery_action() -> PendingAction {
+        PendingAction::Discovery {
+            channel_id: ChannelId(1),
+            request: GetSecretIdsVersionsRequestMessage::default(),
+            shared_key: [0u8; 32],
+            trace_id: 0,
+        }
+    }
+
+    fn get_share_action() -> PendingAction {
+        PendingAction::GetShare {
+            channel_id: ChannelId(1),
+            request: GetShareRequestMessage::default(),
+            shared_key: [0u8; 32],
+            trace_id: 0,
+        }
+    }
+
+    fn unpair_action() -> PendingAction {
+        PendingAction::Unpair {
+            channel_id: ChannelId(1),
+            request: UnpairRequestMessage::default(),
+            shared_key: [0u8; 32],
+            trace_id: 0,
+        }
+    }
+
+    fn update_channel_info_action() -> PendingAction {
+        PendingAction::UpdateChannelInfo {
+            channel_id: ChannelId(1),
+            request: UpdateChannelInfoRequestMessage::default(),
+            shared_key: [0u8; 32],
+            trace_id: 0,
+        }
+    }
+
+    fn pre_pair_action() -> PendingAction {
+        PendingAction::PrePair {
+            channel_id: ChannelId(1),
+            request: PrePairRequestMessage::default(),
+            trace_id: 0,
+        }
+    }
+
+    #[test]
+    fn pending_action_kind_round_trips_each_variant() {
+        assert_eq!(store_share_action().kind(), PendingActionKind::StoreShare);
+        assert_eq!(verify_share_action().kind(), PendingActionKind::VerifyShare);
+        assert_eq!(discovery_action().kind(), PendingActionKind::Discovery);
+        assert_eq!(get_share_action().kind(), PendingActionKind::GetShare);
+        assert_eq!(unpair_action().kind(), PendingActionKind::Unpair);
+        assert_eq!(
+            update_channel_info_action().kind(),
+            PendingActionKind::UpdateChannelInfo
+        );
+        assert_eq!(pre_pair_action().kind(), PendingActionKind::PrePair);
+    }
+
+    #[test]
+    fn auto_accept_policy_default_is_all_false() {
+        let p = AutoAcceptPolicy::default();
+        assert!(!p.pairing);
+        assert!(!p.pre_pair);
+        assert!(!p.store_share);
+        assert!(!p.verify_share);
+        assert!(!p.discovery);
+        assert!(!p.get_share);
+        assert!(!p.unpair);
+        assert!(!p.update_channel_info);
+    }
+
+    #[test]
+    fn auto_accept_policy_all_is_all_true() {
+        let p = AutoAcceptPolicy::all();
+        assert!(p.pairing);
+        assert!(p.pre_pair);
+        assert!(p.store_share);
+        assert!(p.verify_share);
+        assert!(p.discovery);
+        assert!(p.get_share);
+        assert!(p.unpair);
+        assert!(p.update_channel_info);
+    }
+
+    #[test]
+    fn auto_accept_policy_allows_dispatches_per_flow() {
+        let only_store = AutoAcceptPolicy {
+            store_share: true,
+            ..Default::default()
+        };
+        assert!(only_store.allows(&store_share_action()));
+        assert!(!only_store.allows(&verify_share_action()));
+        assert!(!only_store.allows(&discovery_action()));
+        assert!(!only_store.allows(&get_share_action()));
+        assert!(!only_store.allows(&unpair_action()));
+        assert!(!only_store.allows(&update_channel_info_action()));
+        assert!(!only_store.allows(&pre_pair_action()));
+
+        let none = AutoAcceptPolicy::default();
+        assert!(!none.allows(&store_share_action()));
+
+        let all = AutoAcceptPolicy::all();
+        assert!(all.allows(&store_share_action()));
+        assert!(all.allows(&verify_share_action()));
+        assert!(all.allows(&discovery_action()));
+        assert!(all.allows(&get_share_action()));
+        assert!(all.allows(&unpair_action()));
+        assert!(all.allows(&update_channel_info_action()));
+        assert!(all.allows(&pre_pair_action()));
+    }
 }
