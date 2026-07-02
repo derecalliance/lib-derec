@@ -207,7 +207,7 @@ pub fn produce(
 /// let channel_id = ChannelId(42);
 /// let shared_key = [7u8; 32];
 ///
-/// let request::ProduceResult { envelope } = request::produce(channel_id, 1, 7, &shared_key)
+/// let request::ProduceResult { envelope, .. } = request::produce(channel_id, 1, 7, &shared_key, None)
 ///     .expect("failed to build verification request");
 ///
 /// let request::ExtractResult { request } = request::extract(&envelope, &shared_key)

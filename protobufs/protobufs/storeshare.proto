@@ -65,7 +65,7 @@ package org.derecalliance.derec.protobuf;
 // To prevent replay attacks:
 //
 // - If `version` is less than the latest stored version,
-//   the Helper MUST ignore the `keepList` field
+//  the Helper MUST ignore the `keepList` field
 //
 // This ensures that stale messages cannot cause deletion of newer shares.
 //
@@ -151,9 +151,9 @@ message StoreShareRequestMessage {
   // # Semantics
   //
   // - Absent (the default): the responder routes to the endpoint stored on
-  //   its `Channel` record for this `channelId`.
+  //  its `Channel` record for this `channelId`.
   // - Present: the responder routes this exchange's response to this
-  //   endpoint and leaves the stored endpoint unchanged.
+  //  endpoint and leaves the stored endpoint unchanged.
   optional TransportProtocol replyTo = 8;
 
   // Stable per-device identifier of the replica that produced this share.
@@ -170,10 +170,10 @@ message StoreShareRequestMessage {
   // # Semantics
   //
   // - Absent (default): the writer is a non-replica `Owner` (no
-  //   `replica_id` configured at the builder).
+  //  `replica_id` configured at the builder).
   // - Present: the writer is `ReplicaSource` and is announcing its
-  //   identity. The helper treats `replica_id` as part of the storage
-  //   key so distinct replicas writing the same version coexist.
+  //  identity. The helper treats `replica_id` as part of the storage
+  //  key so distinct replicas writing the same version coexist.
   //
   // # Out of scope for the protocol
   //

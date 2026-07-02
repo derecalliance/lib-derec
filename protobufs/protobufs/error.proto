@@ -39,9 +39,9 @@ package org.derecalliance.derec.protobuf;
 // # Usage Guidelines
 //
 // - This message is intended as a fallback when no more specific response
-//   type is applicable
+//  type is applicable
 // - Protocol-specific errors SHOULD use their corresponding response
-//   messages when available
+//  messages when available
 //
 // # Security Considerations
 //

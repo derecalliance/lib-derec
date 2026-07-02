@@ -28,7 +28,7 @@
 //! Implements functions for Shamir secret sharing, as adapted
 //! from the definition in Fig 7 of https://eprint.iacr.org/2020/800.pdf
 
-use ark_ff::{BigInteger, PrimeField};
+use ark_ff::{BigInteger, PrimeField, Zero};
 use ark_poly::{Polynomial, univariate::DensePolynomial};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::UniformRand;
@@ -56,39 +56,17 @@ use ark_bw6_761::Fr as F;
 /// - The second element is the serialized y-coordinate (as a field element).
 ///
 pub fn share<R: Rng>(
-    secret: &[u8; λ], threshold: u64, total_shares: u64, rng: &mut R
+    secret: &[u8; λ],
+    threshold: u64,
+    total_shares: u64,
+    rng: &mut R,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let (t, n) = (threshold, total_shares);
+    let rng_cell = std::cell::RefCell::new(rng);
 
-    // let us sample a random degree t-1 polynomial.
-    // A degree t - 1 polynomial has t coefficients,
-    // which we sample at random
-    let mut coeffs: Vec<F> = (0..t).map(|_| F::rand(rng)).collect();
+    let sample_coeff = || F::rand(&mut *rng_cell.borrow_mut());
+    let sample_x = || F::rand(&mut *rng_cell.borrow_mut());
 
-    // But we don't want a completely random polynomial,
-    // but rather one whose evaluation at x=0 is the secret.
-    // So, let us replace zero-th coefficient with our secret.
-    let secret_bigint = BigInteger::from_bits_be(&bytes_to_bits_be(secret));
-    coeffs[0] = F::from_bigint(secret_bigint).unwrap();
-
-    // we now have all the right coefficients to define the polynomial
-    let poly = DensePolynomial { coeffs };
-
-    // let us define a function for serializing polynomial evaluations
-    let encode_point = |x: &F| -> Vec<u8> {
-        let mut buffer: Vec<u8> = Vec::new();
-        x.serialize_compressed(&mut buffer).unwrap();
-        buffer
-    };
-
-    // Shamir shares are just evaluations of our polynomial above
-    (0..n)
-        .map(|_| {
-            let x = F::rand(rng);
-            let y = poly.evaluate(&x);
-            (encode_point(&x), encode_point(&y))
-        })
-        .collect()
+    share_with_samplers(secret, threshold, total_shares, sample_coeff, sample_x)
 }
 
 /// Recovers the 256-bit secret from a set of Shamir shares.
@@ -169,6 +147,61 @@ fn bytes_to_bits_be(x: &[u8]) -> Vec<bool> {
     output
 }
 
+// The whole purpose of this function is to enforce via unit tests that no x == 0 exists
+// It does its job by allowing the injection of sampling functions for x (and coeff)
+// See share_with_samplers_rejects_zero_x_coordinate
+fn share_with_samplers<SC, SX>(
+    secret: &[u8; λ],
+    threshold: u64,
+    total_shares: u64,
+    mut sample_coeff: SC,
+    mut sample_x: SX,
+) -> Vec<(Vec<u8>, Vec<u8>)>
+where
+    SC: FnMut() -> F,
+    SX: FnMut() -> F,
+{
+    let (t, n) = (threshold, total_shares);
+
+    // let us sample a random degree t-1 polynomial.
+    // A degree t - 1 polynomial has t coefficients,
+    // which we sample at random
+    let mut coeffs: Vec<F> = (0..t).map(|_| sample_coeff()).collect();
+
+    // But we don't want a completely random polynomial,
+    // but rather one whose evaluation at x=0 is the secret.
+    // So, let us replace zero-th coefficient with our secret.
+    let secret_bigint = BigInteger::from_bits_be(&bytes_to_bits_be(secret));
+    coeffs[0] = F::from_bigint(secret_bigint).unwrap();
+
+    // we now have all the right coefficients to define the polynomial
+    let poly = DensePolynomial { coeffs };
+
+    // let us define a function for serializing polynomial evaluations
+    let encode_point = |x: &F| -> Vec<u8> {
+        let mut buffer: Vec<u8> = Vec::new();
+        x.serialize_compressed(&mut buffer).unwrap();
+        buffer
+    };
+
+    // Shamir shares are just evaluations of our polynomial above
+    (0..n)
+        .map(|_| {
+            // If x == 0, then (0, P(0)) = (0, secret). This check ensures that x is never zero.
+            // In practice, this loop will execute only once as probability of x being 0 is
+            // 1/(2^256), so having this loop executing even twice is neglegible
+            let x = loop {
+                let candidate = sample_x();
+                if !candidate.is_zero() {
+                    break candidate;
+                }
+            };
+            let y = poly.evaluate(&x);
+            (encode_point(&x), encode_point(&y))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +227,39 @@ mod tests {
         let recovered = recover(shares);
 
         assert_eq!(secret, recovered);
+    }
+
+    #[test]
+    fn share_with_samplers_rejects_zero_x_coordinate() {
+        let scripted = vec![
+            F::zero(),      // must be skipped
+            F::zero(),      // must be skipped
+            F::from(42u64), // used for share 0
+            F::from(43u64), // used for share 1
+            F::from(44u64), // used for share 2
+        ];
+        let mut iter = scripted.into_iter();
+        let sample_x = || iter.next().expect("ran out of scripted x values");
+
+        let mut coeff_iter = vec![F::from(1u64), F::from(2u64)].into_iter();
+        let sample_coeff = || coeff_iter.next().expect("ran out of scripted coeffs");
+
+        let secret = [7u8; λ];
+        let shares = share_with_samplers(&secret, 2, 3, sample_coeff, sample_x);
+
+        assert_eq!(shares.len(), 3);
+
+        let actual_xs: Vec<F> = shares
+            .iter()
+            .map(|(x_bytes, _)| F::deserialize_compressed(&x_bytes[..]).unwrap())
+            .collect();
+
+        let expected_xs: Vec<F> = vec![F::from(42u64), F::from(43u64), F::from(44u64)];
+        assert_eq!(actual_xs, expected_xs);
+
+        // Sanity: all x != 0
+        for x in &actual_xs {
+            assert!(!x.is_zero());
+        }
     }
 }

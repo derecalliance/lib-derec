@@ -38,7 +38,7 @@ package org.derecalliance.derec.protobuf;
 //
 // - the request MUST originate from the same secretId channel, OR
 // - the request MUST originate from a channel established in recovery mode
-//   and associated with the same user
+//  and associated with the same user
 //
 // Otherwise, the Helper MUST reject the request.
 //
@@ -109,9 +109,9 @@ message GetShareRequestMessage {
 // # Security Considerations
 //
 // - The share MUST only be returned over an authenticated and encrypted
-//   DeRec channel
+//  DeRec channel
 // - Incorrect or malicious shares may be detected by the Owner during
-//   recovery using commitment verification
+//  recovery using commitment verification
 //
 // # Idempotency
 //

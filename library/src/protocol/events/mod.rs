@@ -376,6 +376,7 @@ pub enum UnpairAck {
 ///
 /// The application reacts to these instead of routing raw messages manually.
 #[non_exhaustive]
+#[allow(clippy::large_enum_variant)]
 pub enum DeRecEvent {
     /// Pairing completed — the shared key for `channel_id` is now persisted.
     ///

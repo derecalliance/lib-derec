@@ -447,6 +447,7 @@ mod tests {
 
     #[derive(Default, Clone)]
     struct InMemSecretStore {
+        #[allow(clippy::type_complexity)]
         data: Arc<Mutex<HashMap<(u64, u64, u8), SecretValue>>>,
     }
     impl DeRecSecretStore for InMemSecretStore {
@@ -506,6 +507,7 @@ mod tests {
 
     #[derive(Default, Clone)]
     struct InMemShareStore {
+        #[allow(clippy::type_complexity)]
         data: Arc<Mutex<HashMap<(u64, u64, u32), Share>>>,
     }
     impl DeRecShareStore for InMemShareStore {

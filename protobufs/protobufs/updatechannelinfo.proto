@@ -26,16 +26,16 @@ package org.derecalliance.derec.protobuf;
 // Both fields are optional and independent:
 //
 // - `communication_info` absent (no `CommunicationInfo` set) means "do not
-//   modify the communication info stored for the sender." Presence — even
-//   with an empty `communication_info_entries` list — means "replace the
-//   stored map with the supplied one." Updates, additions, and deletions
-//   are all expressed by the difference between the receiver's current map
-//   and the supplied one.
+//  modify the communication info stored for the sender." Presence — even
+//  with an empty `communication_info_entries` list — means "replace the
+//  stored map with the supplied one." Updates, additions, and deletions
+//  are all expressed by the difference between the receiver's current map
+//  and the supplied one.
 // - `transport_protocol` absent means "do not modify the transport endpoint
-//   stored for the sender." Presence means "the sender's transport endpoint
-//   is now this value." The receiver MUST route subsequent messages on this
-//   channel to the new endpoint, including the
-//   UpdateChannelInfoResponseMessage for this request.
+//  stored for the sender." Presence means "the sender's transport endpoint
+//  is now this value." The receiver MUST route subsequent messages on this
+//  channel to the new endpoint, including the
+//  UpdateChannelInfoResponseMessage for this request.
 //
 // # Endpoint changeover
 //
@@ -74,7 +74,7 @@ message UpdateChannelInfoRequestMessage {
 //
 // - the receiver has persisted the supplied updates
 // - subsequent messages from the receiver MUST use the new endpoint, if
-//   `transport_protocol` was updated
+//  `transport_protocol` was updated
 //
 // On failure:
 //

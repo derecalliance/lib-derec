@@ -20,9 +20,10 @@
 //!   - remaining: protobuf-encoded request message
 //! - For PrePair (initiator side, before any key material exists):
 //!   - remaining: protobuf-encoded PrePairRequestMessage
-//!   No `shared_key` or `pairing_secret` — the PrePair leg is plaintext
-//!   and the handler loads `PairingSecret` from the secret store at
-//!   accept time (single source of truth).
+//!
+//! No `shared_key` or `pairing_secret` is carried for PrePair — the leg is
+//! plaintext and the handler loads `PairingSecret` from the secret store at
+//! accept time (single source of truth).
 
 use crate::protocol::PendingAction;
 use crate::types::ChannelId;

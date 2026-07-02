@@ -51,13 +51,13 @@ package org.derecalliance.derec.protobuf;
 // the security guarantees of `HASHED_KEYS` mode:
 //
 // - The `transportProtocol` used during pairing (the one advertised in the
-//   `ContactMessage` and echoed in `PrePairRequestMessage`) MUST be
-//   ephemeral and short-lived — bound to the pairing attempt, not to the
-//   long-term identity of either peer.
+//  `ContactMessage` and echoed in `PrePairRequestMessage`) MUST be
+//  ephemeral and short-lived — bound to the pairing attempt, not to the
+//  long-term identity of either peer.
 // - Once pairing completes, the application MUST swap to a long-term
-//   endpoint via an `UpdateChannelInfoRequestMessage`. The ephemeral
-//   pairing endpoint is retired after the changeover (see the endpoint-
-//   changeover discipline on `UpdateChannelInfoRequestMessage`).
+//  endpoint via an `UpdateChannelInfoRequestMessage`. The ephemeral
+//  pairing endpoint is retired after the changeover (see the endpoint-
+//  changeover discipline on `UpdateChannelInfoRequestMessage`).
 //
 // `INLINE_KEYS`-mode contacts do not have this constraint because the
 // `PairRequestMessage` is asymmetrically encrypted; only the
@@ -89,16 +89,18 @@ message PrePairRequestMessage {
 //
 // The recipient (the original scanner of the `ContactMessage`) MUST:
 //
-// 1. Confirm `result.status == OK`. On non-`Ok`, surface a typed error to
-//    the application and do not proceed.
-// 2. Recompute
+// - Confirm `result.status == OK`. On non-`Ok`, surface a typed error to
+//  the application and do not proceed.
+// - Recompute
 //
-//        SHA-384(mlkemEncapsulationKey || eciesPublicKey
-//                || u64_be(nonce) || u64_be(channelId))
+//  ```text
+//  SHA-384(mlkemEncapsulationKey || eciesPublicKey
+//           || u64_be(nonce) || u64_be(channelId))
+//  ```
 //
-//    and verify it matches the original `ContactMessage.contactBindingHash`.
-// 3. Only on a match, proceed to construct and send a normal
-//    `PairRequestMessage`.
+//  and verify it matches the original `ContactMessage.contactBindingHash`.
+// - Only on a match, proceed to construct and send a normal
+//  `PairRequestMessage`.
 //
 // # Envelope
 //

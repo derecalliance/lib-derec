@@ -197,7 +197,7 @@ pub fn split(
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 ///
 /// let ProduceResult { envelope } =
-///     produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, None)
+///     produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, None, None)
 ///         .expect("produce failed");
 ///
 /// assert!(!envelope.is_empty());
@@ -327,7 +327,7 @@ pub fn produce(
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 ///
 /// let ProduceResult { envelope } =
-///     produce(channel_id, 1, 1, committed_share, &[], "", &shared_key)
+///     produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, None, None)
 ///         .expect("produce failed");
 ///
 /// let ExtractResult { request } = extract(&envelope, &shared_key).expect("extract failed");

@@ -230,11 +230,12 @@ pub fn create_contact(
 /// ```
 /// use derec_library::primitives::pairing::request;
 /// use derec_library::types::ChannelId;
-/// use derec_proto::{Protocol, SenderKind, TransportProtocol};
+/// use derec_proto::{ContactMode, Protocol, SenderKind, TransportProtocol};
 ///
 /// // Initiator side: create a contact message out-of-band.
 /// let request::CreateContactResult { contact_message, .. } = request::create_contact(
 ///     ChannelId(42),
+///     ContactMode::InlineKeys,
 ///     TransportProtocol {
 ///         uri: "https://relay.example/initiator".to_owned(),
 ///         protocol: Protocol::Https.into(),
@@ -249,6 +250,7 @@ pub fn create_contact(
 ///         protocol: Protocol::Https.into(),
 ///     },
 ///     &contact_message,
+///     None,
 ///     None,
 /// ).expect("produce failed");
 ///
@@ -457,7 +459,7 @@ pub fn produce_pre_pair_request(
 /// ```
 /// use derec_library::primitives::pairing::request;
 /// use derec_library::types::ChannelId;
-/// use derec_proto::{Protocol, SenderKind, TransportProtocol};
+/// use derec_proto::{ContactMode, Protocol, SenderKind, TransportProtocol};
 ///
 /// // Initiator: create the out-of-band contact message.
 /// let request::CreateContactResult {
@@ -465,6 +467,7 @@ pub fn produce_pre_pair_request(
 ///     secret_key: initiator_key,
 /// } = request::create_contact(
 ///     ChannelId(42),
+///     ContactMode::InlineKeys,
 ///     TransportProtocol {
 ///         uri: "https://relay.example/initiator".to_owned(),
 ///         protocol: Protocol::Https.into(),
@@ -480,6 +483,7 @@ pub fn produce_pre_pair_request(
 ///     },
 ///     &contact_message,
 ///     None,
+///     None,
 /// ).expect("produce failed");
 ///
 /// // Initiator: decrypt the pairing request with the ECIES secret key.
@@ -488,7 +492,6 @@ pub fn produce_pre_pair_request(
 ///         .expect("extract failed");
 ///
 /// assert_eq!(pair_request.nonce, contact_message.nonce);
-/// assert_eq!(pair_request.channel_id, u64::from(ChannelId(42)));
 /// ```
 #[cfg_attr(
     feature = "logging",

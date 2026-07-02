@@ -32,7 +32,7 @@ package org.derecalliance.derec.protobuf;
 //
 // The Helper MUST compute a cryptographic hash over:
 //
-//   committedDeRecShare || nonce
+//  committedDeRecShare || nonce
 //
 // and return the result in a VerifyShareResponseMessage.
 //
@@ -142,7 +142,7 @@ message VerifyShareResponseMessage {
   //
   // This is the SHA-384 hash of:
   //
-  //   committedDeRecShare || nonce
+  //  committedDeRecShare || nonce
   //
   // where `committedDeRecShare` is the exact byte sequence originally
   // stored by the Helper.

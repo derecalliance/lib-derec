@@ -72,12 +72,12 @@ mod tests {
 
     #[test]
     fn accepts_matching_some_timestamps() {
-        assert!(verify_timestamps(Some(ts(1700_000_000)), Some(ts(1700_000_000))).is_ok());
+        assert!(verify_timestamps(Some(ts(1_700_000_000)), Some(ts(1_700_000_000))).is_ok());
     }
 
     #[test]
     fn rejects_mismatched_some_timestamps() {
-        let res = verify_timestamps(Some(ts(1700_000_000)), Some(ts(1700_000_001)));
+        let res = verify_timestamps(Some(ts(1_700_000_000)), Some(ts(1_700_000_001)));
         match res {
             Err(crate::Error::Invariant(msg)) => assert!(msg.contains("does not match"), "msg: {msg}"),
             other => panic!("expected Invariant mismatch, got {other:?}"),
@@ -101,13 +101,13 @@ mod tests {
 
     #[test]
     fn rejects_envelope_none() {
-        let res = verify_timestamps(None, Some(ts(1700_000_000)));
+        let res = verify_timestamps(None, Some(ts(1_700_000_000)));
         assert!(matches!(res, Err(crate::Error::Invariant(_))));
     }
 
     #[test]
     fn rejects_inner_none() {
-        let res = verify_timestamps(Some(ts(1700_000_000)), None);
+        let res = verify_timestamps(Some(ts(1_700_000_000)), None);
         assert!(matches!(res, Err(crate::Error::Invariant(_))));
     }
 }

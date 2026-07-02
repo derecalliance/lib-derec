@@ -168,6 +168,7 @@ pub(in crate::protocol) async fn start<
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
 )]
+#[allow(clippy::too_many_arguments)]
 pub(in crate::protocol) async fn accept<
     Ch: DeRecChannelStore,
     Ss: DeRecSecretStore,
@@ -512,7 +513,7 @@ pub(in crate::protocol) async fn on_pre_pair_response<
         own_transport.clone(),
         &filled_in_contact,
         comm_info,
-        parameter_range.clone(),
+        parameter_range,
     )?;
 
     // Persist the scanner's pairing secret + overwrite the stored
@@ -682,7 +683,6 @@ pub(in crate::protocol) fn derive_peer_kind(local_kind: SenderKind) -> SenderKin
 /// Scanner-side `InlineKeys` branch of [`start`]. The responder has the
 /// initiator's public keys inline on the contact, so it can go straight
 /// to building the encrypted `PairRequest` envelope.
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 async fn start_inlined_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRecTransport>(
     channel_store: &mut Ch,

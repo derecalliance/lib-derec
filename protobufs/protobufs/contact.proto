@@ -31,18 +31,18 @@ package org.derecalliance.derec.protobuf;
 // Typical exchange mechanisms include:
 //
 // - QR codes displayed by either the Owner or Helper and scanned by the other
-//   party
+//  party
 // - distribution inside an application controlled by one of the parties
 // - transmission over an already-existing communication channel when the
-//   parties have a prior relationship
+//  parties have a prior relationship
 //
 // The recipient of this message uses its contents to construct and send the
 // initial pairing request. In particular, the ContactMessage conveys:
 //
 // - the public encryption key material needed to protect the first inbound
-//   pairing message
+//  pairing message
 // - a channel identifier that the recipient must echo in subsequent protocol
-//   messages sent to this contact
+//  messages sent to this contact
 // - a nonce that binds the pairing attempt to the out-of-band contact exchange
 // - the transport information required to deliver the pairing request
 //
@@ -56,21 +56,21 @@ package org.derecalliance.derec.protobuf;
 // material, selected by `contactMode`:
 //
 // - `INLINE_KEYS` (default): both `mlkemEncapsulationKey` and
-//   `eciesPublicKey` are present in the contact. The recipient may proceed
-//   directly to `PairRequestMessage`. This is the original, wire-equivalent
-//   behavior — existing contacts (which have no `contactMode` set) are
-//   parsed as `INLINE_KEYS` by virtue of the proto3 default.
+//  `eciesPublicKey` are present in the contact. The recipient may proceed
+//  directly to `PairRequestMessage`. This is the original, wire-equivalent
+//  behavior — existing contacts (which have no `contactMode` set) are
+//  parsed as `INLINE_KEYS` by virtue of the proto3 default.
 //
 // - `HASHED_KEYS`: `contactBindingHash` is present and both
-//   key fields are absent. The contact is small enough to fit in a QR code
-//   or short URL. The recipient must first exchange a `PrePairRequest` /
-//   `PrePairResponse` pair to obtain the actual keys, then verify them
-//   against the hash before sending `PairRequestMessage`. The hash binding
-//   gives the OOB-shared contact the same MITM resistance as inline-keys
-//   mode despite the keys traveling over the (unauthenticated) transport.
-//   Because the `PrePair*` messages are plaintext, the `transportProtocol`
-//   carried in this mode MUST be ephemeral — see the security note on
-//   `PrePairRequestMessage` for the required ephemeral-then-swap discipline.
+//  key fields are absent. The contact is small enough to fit in a QR code
+//  or short URL. The recipient must first exchange a `PrePairRequest` /
+//  `PrePairResponse` pair to obtain the actual keys, then verify them
+//  against the hash before sending `PairRequestMessage`. The hash binding
+//  gives the OOB-shared contact the same MITM resistance as inline-keys
+//  mode despite the keys traveling over the (unauthenticated) transport.
+//  Because the `PrePair*` messages are plaintext, the `transportProtocol`
+//  carried in this mode MUST be ephemeral — see the security note on
+//  `PrePairRequestMessage` for the required ephemeral-then-swap discipline.
 //
 // The mode selector and the per-mode field-presence invariants are enforced
 // by the implementation; mixing fields across modes is a protocol error.
@@ -109,12 +109,14 @@ message ContactMessage {
   // Present only when `contactMode == HASHED_KEYS`. Computed
   // as:
   //
-  //     SHA-384(
-  //         mlkemEncapsulationKey
-  //         || eciesPublicKey
-  //         || u64_be(nonce)
-  //         || u64_be(channelId)
-  //     )
+  // ```text
+  // SHA-384(
+  //     mlkemEncapsulationKey
+  //     || eciesPublicKey
+  //     || u64_be(nonce)
+  //     || u64_be(channelId)
+  // )
+  // ```
   //
   // The recipient obtains the actual keys via `PrePairRequest` and
   // recomputes this hash to confirm integrity before proceeding to
@@ -159,7 +161,7 @@ message ContactMessage {
   //
   // - the endpoint to which the first protocol message should be sent
   // - the transport protocol that determines how that endpoint is interpreted
-  //   and used
+  //  and used
   //
   // The initiating party uses this field to deliver the initial pairing
   // request. Subsequent protocol exchanges may continue using the same

@@ -362,6 +362,7 @@ impl DeRecUserSecretStore for InMemoryUserSecretStore {
 /// retains a clone.
 #[derive(Clone, Default)]
 struct InProcessTransport {
+    #[allow(clippy::type_complexity)]
     outbox: Arc<Mutex<VecDeque<(TransportProtocol, Vec<u8>)>>>,
 }
 

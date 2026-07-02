@@ -181,6 +181,7 @@ pub(in crate::protocol) async fn start<
         )
     )
 )]
+#[allow(clippy::too_many_arguments)]
 pub(in crate::protocol) async fn accept<
     Ch: DeRecChannelStore,
     Sh: DeRecShareStore,
@@ -249,6 +250,7 @@ pub(in crate::protocol) async fn accept<
         )
     )
 )]
+#[allow(clippy::too_many_arguments)]
 pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport>(
     channel_store: &mut Ch,
     transport: &T,

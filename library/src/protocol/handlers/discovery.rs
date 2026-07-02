@@ -106,6 +106,7 @@ pub(in crate::protocol) async fn start<
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
 )]
+#[allow(clippy::too_many_arguments)]
 pub(in crate::protocol) async fn accept<
     Ch: DeRecChannelStore,
     Sh: DeRecShareStore,

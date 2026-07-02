@@ -314,6 +314,7 @@ impl<
     /// lets a single helper reconstruct the secret unilaterally — two
     /// is the minimum value that preserves secret confidentiality
     /// against one compromised helper.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         secret_id: u64,
         channel_store: Ch,
@@ -984,7 +985,7 @@ impl<
             contact,
             peer_communication_info,
             self.replica_id,
-            self.parameter_range.clone(),
+            self.parameter_range,
         )
         .await?;
         Ok(Some(channel_id))
@@ -1209,7 +1210,7 @@ impl<
                     kind,
                     trace_id,
                     self.replica_id,
-                    self.parameter_range.clone(),
+                    self.parameter_range,
                 )
                 .await
             }
@@ -1572,7 +1573,7 @@ impl<
                         &contact,
                         &resp,
                         self.replica_id,
-                        self.parameter_range.clone(),
+                        self.parameter_range,
                     )
                     .await?;
                     return Ok(Some(events));

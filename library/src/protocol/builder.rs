@@ -331,7 +331,7 @@ impl<ShareStore, SecretStore, UserSecretStore, Transport, OwnTransport>
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
             replica_id: self.replica_id,
-            parameter_range: self.parameter_range.clone(),
+            parameter_range: self.parameter_range,
         }
     }
 }
@@ -376,7 +376,7 @@ impl<ChannelStore, SecretStore, UserSecretStore, Transport, OwnTransport>
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
             replica_id: self.replica_id,
-            parameter_range: self.parameter_range.clone(),
+            parameter_range: self.parameter_range,
         }
     }
 }
@@ -421,7 +421,7 @@ impl<ChannelStore, ShareStore, UserSecretStore, Transport, OwnTransport>
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
             replica_id: self.replica_id,
-            parameter_range: self.parameter_range.clone(),
+            parameter_range: self.parameter_range,
         }
     }
 }
@@ -469,7 +469,7 @@ impl<ChannelStore, ShareStore, SecretStore, Transport, OwnTransport>
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
             replica_id: self.replica_id,
-            parameter_range: self.parameter_range.clone(),
+            parameter_range: self.parameter_range,
         }
     }
 }
@@ -514,7 +514,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, OwnTransport>
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
             replica_id: self.replica_id,
-            parameter_range: self.parameter_range.clone(),
+            parameter_range: self.parameter_range,
         }
     }
 }
@@ -570,7 +570,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, Transport>
             auto_reply_to: self.auto_reply_to,
             auto_accept: self.auto_accept,
             replica_id: self.replica_id,
-            parameter_range: self.parameter_range.clone(),
+            parameter_range: self.parameter_range,
         }
     }
 }

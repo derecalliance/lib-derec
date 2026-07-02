@@ -169,7 +169,7 @@ pub struct ProcessResult {
 /// let secret_list = vec![
 ///     SecretVersionEntry {
 ///         secret_id: 1,
-///         versions: vec![VersionEntry { version: 1, description: "wallet seed".to_owned() }],
+///         versions: vec![VersionEntry { version: 1, description: "wallet seed".to_owned(), replica_id: None }],
 ///     },
 /// ];
 ///
@@ -273,7 +273,7 @@ pub fn produce(
 ///
 /// let secret_list = vec![SecretVersionEntry {
 ///     secret_id: 1,
-///     versions: vec![VersionEntry { version: 1, description: "v1".to_owned() }],
+///     versions: vec![VersionEntry { version: 1, description: "v1".to_owned(), replica_id: None }],
 /// }];
 ///
 /// let response::ProduceResult { envelope } =
@@ -361,7 +361,7 @@ pub fn extract(
 ///
 /// let secret_list = vec![SecretVersionEntry {
 ///     secret_id: 1,
-///     versions: vec![VersionEntry { version: 1, description: "v1".to_owned() }],
+///     versions: vec![VersionEntry { version: 1, description: "v1".to_owned(), replica_id: None }],
 /// }];
 ///
 /// // Helper → Owner roundtrip.

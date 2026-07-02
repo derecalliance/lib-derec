@@ -84,12 +84,12 @@ message CommunicationInfoKeyValue {
 //
 // - This data MUST NOT be relied upon for authentication
 // - Authentication is handled outside the protocol (e.g., in-person,
-//   KYC, or application-specific mechanisms)
+//  KYC, or application-specific mechanisms)
 //
 // # Privacy Considerations
 //
 // - Applications SHOULD avoid including sensitive information unless
-//   necessary for the user experience
+//  necessary for the user experience
 // - Users should be informed about what data is being shared
 //
 // # Interoperability

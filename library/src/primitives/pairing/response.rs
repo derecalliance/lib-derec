@@ -139,7 +139,7 @@ pub struct ProcessPrePairResult {
 /// ```
 /// use derec_library::primitives::pairing::{request, response};
 /// use derec_library::types::ChannelId;
-/// use derec_proto::{Protocol, SenderKind, TransportProtocol};
+/// use derec_proto::{ContactMode, Protocol, SenderKind, TransportProtocol};
 ///
 /// // Initiator side: create the out-of-band contact message.
 /// let request::CreateContactResult {
@@ -147,6 +147,7 @@ pub struct ProcessPrePairResult {
 ///     secret_key: initiator_key,
 /// } = request::create_contact(
 ///     ChannelId(42),
+///     ContactMode::InlineKeys,
 ///     TransportProtocol {
 ///         uri: "https://relay.example/initiator".to_owned(),
 ///         protocol: Protocol::Https.into(),
@@ -162,6 +163,7 @@ pub struct ProcessPrePairResult {
 ///     },
 ///     &contact_message,
 ///     None,
+///     None,
 /// ).expect("produce failed");
 ///
 /// // Initiator side: extract the pairing request, then produce the response.
@@ -174,6 +176,7 @@ pub struct ProcessPrePairResult {
 ///     ChannelId(42),
 ///     &pair_request,
 ///     &initiator_key,
+///     None,
 ///     None,
 /// ).expect("produce failed");
 ///
@@ -402,7 +405,7 @@ pub fn produce_pre_pair(
 /// ```
 /// use derec_library::primitives::pairing::{request, response};
 /// use derec_library::types::ChannelId;
-/// use derec_proto::{Protocol, SenderKind, TransportProtocol};
+/// use derec_proto::{ContactMode, Protocol, SenderKind, TransportProtocol};
 ///
 /// // Initiator: create the out-of-band contact message.
 /// let request::CreateContactResult {
@@ -410,6 +413,7 @@ pub fn produce_pre_pair(
 ///     secret_key: initiator_key,
 /// } = request::create_contact(
 ///     ChannelId(42),
+///     ContactMode::InlineKeys,
 ///     TransportProtocol {
 ///         uri: "https://relay.example/initiator".to_owned(),
 ///         protocol: Protocol::Https.into(),
@@ -429,6 +433,7 @@ pub fn produce_pre_pair(
 ///     },
 ///     &contact_message,
 ///     None,
+///     None,
 /// ).expect("produce failed");
 ///
 /// // Initiator: extract the pairing request, then produce the response.
@@ -437,7 +442,7 @@ pub fn produce_pre_pair(
 ///     initiator_key.ecies_secret_key(),
 /// ).expect("extract request failed");
 /// let response::ProduceResult { envelope: response_envelope, .. } =
-///     response::produce(ChannelId(42), &pair_request, &initiator_key, None)
+///     response::produce(ChannelId(42), &pair_request, &initiator_key, None, None)
 ///         .expect("produce failed");
 ///
 /// // Responder: decrypt the pairing response.
@@ -616,7 +621,7 @@ pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, c
 /// ```
 /// use derec_library::primitives::pairing::{request, response};
 /// use derec_library::types::ChannelId;
-/// use derec_proto::{Protocol, SenderKind, TransportProtocol};
+/// use derec_proto::{ContactMode, Protocol, SenderKind, TransportProtocol};
 ///
 /// // Initiator side: create the out-of-band contact message.
 /// let request::CreateContactResult {
@@ -624,6 +629,7 @@ pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, c
 ///     secret_key: initiator_key,
 /// } = request::create_contact(
 ///     ChannelId(42),
+///     ContactMode::InlineKeys,
 ///     TransportProtocol {
 ///         uri: "https://relay.example/initiator".to_owned(),
 ///         protocol: Protocol::Https.into(),
@@ -643,6 +649,7 @@ pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, c
 ///     },
 ///     &contact_message,
 ///     None,
+///     None,
 /// ).expect("produce failed");
 ///
 /// // Initiator side: extract the pairing request and produce the response.
@@ -652,7 +659,7 @@ pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, c
 /// ).expect("extract request failed");
 ///
 /// let response::ProduceResult { envelope: response_envelope, shared_key: initiator_shared_key, .. } =
-///     response::produce(ChannelId(42), &pair_request, &initiator_key, None)
+///     response::produce(ChannelId(42), &pair_request, &initiator_key, None, None)
 ///         .expect("produce failed");
 ///
 /// // Responder side: extract the pairing response and derive the shared key.
@@ -661,7 +668,7 @@ pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, c
 ///     responder_key.ecies_secret_key(),
 /// ).expect("extract response failed");
 ///
-/// let response::ProcessResult { shared_key: responder_shared_key } =
+/// let response::ProcessResult { shared_key: responder_shared_key, .. } =
 ///     response::process(&initiator_contact_message, &pair_response, &responder_key)
 ///         .expect("process failed");
 ///
