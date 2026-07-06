@@ -36,6 +36,7 @@ use super::super::{
 use crate::{
     Result,
     types::{ChannelId, SharedKey},
+    utils::SenderKindExt as _,
 };
 use std::collections::HashSet;
 
@@ -275,7 +276,7 @@ async fn write_replica_channels<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     for r in &group.replicas {
         let peer_kind = derec_proto::SenderKind::try_from(r.sender_kind)
             .map_err(|_| RestoreError::Invariant("replica.sender_kind invalid"))?;
-        let local_role = super::pairing::derive_peer_kind(peer_kind);
+        let local_role = peer_kind.derive_peer();
         let cid = ChannelId(r.channel_id);
         channel_store
             .save(

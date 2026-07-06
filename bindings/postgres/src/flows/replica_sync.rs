@@ -385,7 +385,7 @@ async fn pair_replica_handshake(
 ) {
     let contact = owner
         .protocol
-        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys)
+        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys, None)
         .await
         .expect("owner.create_contact failed");
     replica
@@ -424,7 +424,7 @@ async fn cross_confirm_fingerprint(
 async fn helper_start_pair(owner: &mut Peer, helper: &mut Peer, channel_id: ChannelId) {
     let contact = owner
         .protocol
-        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys)
+        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys, None)
         .await
         .expect("owner.create_contact failed");
     helper

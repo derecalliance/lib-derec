@@ -15,6 +15,7 @@ use crate::{
     },
     protocol::types::{HelperInfo, Secret, UserSecret},
     types::{ChannelId, SharedKey},
+    utils::SenderKindExt as _,
 };
 use derec_proto::{
     DeRecResult, DeRecSecret, MessageBody, SenderKind, StatusEnum, StoreShareRequestMessage,
@@ -670,8 +671,7 @@ fn build_replicas(
                 transport_uri: channel.transport.uri.to_owned(),
                 communication_info: channel.communication_info.clone(),
                 replica_id: channel.replica_id.unwrap_or(0),
-                sender_kind: crate::protocol::handlers::pairing::derive_peer_kind(channel.role)
-                    as i32,
+                sender_kind: channel.role.derive_peer() as i32,
             },
         )
         .collect();

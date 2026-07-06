@@ -35,6 +35,7 @@ const DEFAULT_TEST_SECRET_ID: u64 = 0xDE_2EC;
 pub async fn run_all() {
     run_pairing_flow().await;
     run_hashed_keys_pairing_flow().await;
+    run_no_keys_pairing_flow().await;
     run_replica_id_wiring_flow().await;
     run_protect_secret_with_replica_targets_flow().await;
     run_sharing_flow().await;
@@ -690,7 +691,7 @@ async fn pump_many(peers: &mut [&mut Peer]) -> Vec<DeRecEvent> {
 async fn pair(owner: &mut Peer, helper: &mut Peer, channel_id: ChannelId) -> ChannelId {
     let contact = owner
         .protocol
-        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys)
+        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys, None)
         .await
         .expect("owner.create_contact failed");
 
@@ -845,7 +846,7 @@ async fn pair_hashed_keys(
 ) -> ChannelId {
     let contact = owner
         .protocol
-        .create_contact(Some(channel_id), derec_proto::ContactMode::HashedKeys)
+        .create_contact(Some(channel_id), derec_proto::ContactMode::HashedKeys, None)
         .await
         .expect("owner.create_contact(HashedKeys) failed");
 
@@ -959,7 +960,7 @@ async fn run_hashed_keys_pairing_flow() {
 
     let mut contact = owner
         .protocol
-        .create_contact(Some(channel_id), derec_proto::ContactMode::HashedKeys)
+        .create_contact(Some(channel_id), derec_proto::ContactMode::HashedKeys, None)
         .await
         .expect("owner.create_contact(HashedKeys) failed");
     contact
@@ -1015,6 +1016,196 @@ async fn run_hashed_keys_pairing_flow() {
     println!("Protocol HashedKeys pairing — tampered binding hash test passed.");
 }
 
+async fn pair_no_keys(
+    owner: &mut Peer,
+    helper: &mut Peer,
+    channel_id: ChannelId,
+    nonce: u64,
+) -> ChannelId {
+    let contact = owner
+        .protocol
+        .create_contact(Some(channel_id), derec_proto::ContactMode::NoKeys, Some(nonce))
+        .await
+        .expect("owner.create_contact_no_keys failed");
+
+    assert_eq!(contact.contact_mode, derec_proto::ContactMode::NoKeys as i32);
+    assert_eq!(contact.nonce, nonce);
+    assert!(contact.mlkem_encapsulation_key.is_none());
+    assert!(contact.ecies_public_key.is_none());
+    assert!(contact.contact_binding_hash.is_none());
+
+    helper
+        .protocol
+        .start(DeRecFlow::Pairing {
+            kind: SenderKind::Helper,
+            contact,
+            peer_communication_info: std::collections::HashMap::from([(
+                "name".to_owned(),
+                "helper".to_owned(),
+            )]),
+        })
+        .await
+        .expect("helper start(Pairing NoKeys) failed");
+
+    // PrePairRequest -> PrePairResponse (keys generated on the fly on the
+    // owner side) -> PairRequest -> PairResponse in one drain.
+    let events = pump(helper, owner).await;
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, DeRecEvent::PrePairRejected { .. })),
+        "happy-path NoKeys must not emit PrePairRejected"
+    );
+
+    let pairing_completed = events
+        .iter()
+        .filter(|e| matches!(e, DeRecEvent::PairingCompleted { .. }))
+        .count();
+    assert!(
+        pairing_completed >= 2,
+        "expected PairingCompleted on both sides (got {pairing_completed})"
+    );
+    extract_paired_channel_id(events.iter(), channel_id)
+        .expect("NoKeys handshake must emit PairingCompleted for the transient channel_id")
+}
+
+async fn run_no_keys_pairing_flow() {
+    println!("=== Protocol NoKeys pairing flow test ===");
+
+    let pairing_channel_id = ChannelId(4321);
+    let nonce = 1234u64;
+    let mut owner = Peer::new("owner", "https://owner.example.com");
+    let mut helper = Peer::new("helper", "https://helper.example.com");
+
+    let channel_id = pair_no_keys(&mut owner, &mut helper, pairing_channel_id, nonce).await;
+    assert_ne!(
+        channel_id, pairing_channel_id,
+        "long-term channel_id must differ from the transient pairing id"
+    );
+
+    let owner_sid = owner.protocol.secret_id();
+    let helper_sid = helper.protocol.secret_id();
+    assert!(
+        owner
+            .protocol
+            .channel_store
+            .load(owner_sid, channel_id)
+            .await
+            .expect("owner channel_store.load failed")
+            .is_some(),
+        "owner must have a paired channel after NoKeys pairing"
+    );
+    assert!(
+        helper
+            .protocol
+            .channel_store
+            .load(helper_sid, channel_id)
+            .await
+            .expect("helper channel_store.load failed")
+            .is_some(),
+        "helper must have a paired channel after NoKeys pairing"
+    );
+
+    // The transient pairing channel_id must no longer resolve on either side.
+    assert!(
+        owner
+            .protocol
+            .channel_store
+            .load(owner_sid, pairing_channel_id)
+            .await
+            .expect("owner channel_store.load failed")
+            .is_none(),
+        "owner must drop the transient pairing channel_id record"
+    );
+    assert!(
+        helper
+            .protocol
+            .channel_store
+            .load(helper_sid, pairing_channel_id)
+            .await
+            .expect("helper channel_store.load failed")
+            .is_none(),
+        "helper must drop the transient pairing channel_id record"
+    );
+
+    let owner_fp = owner
+        .protocol
+        .get_fingerprint(channel_id)
+        .await
+        .expect("owner get_fingerprint failed");
+    let helper_fp = helper
+        .protocol
+        .get_fingerprint(channel_id)
+        .await
+        .expect("helper get_fingerprint failed");
+    assert_eq!(
+        owner_fp, helper_fp,
+        "owner and helper fingerprints must match after NoKeys pairing"
+    );
+
+    println!("Protocol NoKeys pairing flow test passed.");
+
+    // Negative: an incoming PrePairRequest with a nonce that doesn't match
+    // the stored contact's nonce must be rejected at the accept step.
+    println!("=== Protocol NoKeys pairing — wrong nonce ===");
+
+    let pairing_channel_id = ChannelId(9999);
+    let real_nonce = 8888u64;
+    let bad_nonce = 7777u64;
+    let mut owner = Peer::new("owner", "https://owner.example.com");
+    let mut helper = Peer::new("helper", "https://helper.example.com");
+
+    let mut contact = owner
+        .protocol
+        .create_contact(Some(pairing_channel_id), derec_proto::ContactMode::NoKeys, Some(real_nonce))
+        .await
+        .expect("owner.create_contact_no_keys failed");
+    // Tamper the nonce the helper thinks it received.
+    contact.nonce = bad_nonce;
+
+    helper
+        .protocol
+        .start(DeRecFlow::Pairing {
+            kind: SenderKind::Helper,
+            contact,
+            peer_communication_info: std::collections::HashMap::new(),
+        })
+        .await
+        .expect("helper start(Pairing NoKeys, tampered nonce) failed");
+
+    // Deliver the PrePairRequest to the owner but skip `deliver`'s
+    // auto-accept panic-on-error — grab the ActionRequired event via
+    // raw `process` and call accept manually so we can assert on the
+    // specific error.
+    let helper_outbound = helper.drain();
+    assert_eq!(helper_outbound.len(), 1);
+    let (_dest, prepair_bytes) = &helper_outbound[0];
+    let owner_events = owner
+        .protocol
+        .process(prepair_bytes)
+        .await
+        .expect("owner process(PrePairRequest) failed");
+    let pending_action = owner_events.into_iter().find_map(|e| match e {
+        DeRecEvent::ActionRequired { action, .. } => Some(action),
+        _ => None,
+    });
+    let action = pending_action.expect("owner must surface an ActionRequired for the PrePair");
+    let accept_err = owner
+        .protocol
+        .accept(action)
+        .await
+        .err()
+        .expect("accept must fail on nonce mismatch");
+    let msg = accept_err.to_string();
+    assert!(
+        msg.contains("NoKeys PrePair nonce mismatch"),
+        "expected NoKeys nonce-mismatch error, got: {msg}"
+    );
+
+    println!("Protocol NoKeys pairing — wrong nonce test passed.");
+}
+
 
 /// Exercises the `derec.replica_id` wiring. Three scenarios:
 ///
@@ -1040,7 +1231,7 @@ async fn run_replica_id_wiring_flow() {
 
     let contact = owner
         .protocol
-        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys)
+        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys, None)
         .await
         .expect("owner.create_contact failed");
 
@@ -1154,7 +1345,7 @@ async fn run_replica_id_wiring_flow() {
 
     let contact = owner
         .protocol
-        .create_contact(Some(ChannelId(2)), derec_proto::ContactMode::InlineKeys)
+        .create_contact(Some(ChannelId(2)), derec_proto::ContactMode::InlineKeys, None)
         .await
         .expect("owner.create_contact failed");
 
@@ -1187,7 +1378,7 @@ async fn run_replica_id_wiring_flow() {
 
     let contact = owner_unconfigured
         .protocol
-        .create_contact(Some(ChannelId(3)), derec_proto::ContactMode::InlineKeys)
+        .create_contact(Some(ChannelId(3)), derec_proto::ContactMode::InlineKeys, None)
         .await
         .expect("owner.create_contact failed");
 
@@ -1260,7 +1451,7 @@ async fn run_protect_secret_with_replica_targets_flow() {
     // 2. Owner pairs with another device in Replica mode (secret sync target).
     let replica_contact = owner
         .protocol
-        .create_contact(Some(replica_channel), derec_proto::ContactMode::InlineKeys)
+        .create_contact(Some(replica_channel), derec_proto::ContactMode::InlineKeys, None)
         .await
         .expect("owner.create_contact failed");
     replica
@@ -1781,7 +1972,7 @@ async fn run_discovery_and_recovery_flow() {
     ] {
         let recovery_contact = owner
             .protocol
-            .create_contact(Some(fresh_cid), derec_proto::ContactMode::InlineKeys)
+            .create_contact(Some(fresh_cid), derec_proto::ContactMode::InlineKeys, None)
             .await
             .unwrap_or_else(|e| panic!("owner.create_contact (recovery, {label}) failed: {e}"));
 
@@ -2375,7 +2566,7 @@ async fn run_auto_publish_on_pair_flow() {
     // SSR envelopes addressed to a and b can be routed.
     let contact = owner
         .protocol
-        .create_contact(Some(channel_c), derec_proto::ContactMode::InlineKeys)
+        .create_contact(Some(channel_c), derec_proto::ContactMode::InlineKeys, None)
         .await
         .expect("owner.create_contact(helper-c) failed");
     helper_c
@@ -2961,7 +3152,7 @@ async fn pair_replica_handshake(
 ) -> ChannelId {
     let contact = owner
         .protocol
-        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys)
+        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys, None)
         .await
         .expect("owner.create_contact failed");
     replica
@@ -3020,7 +3211,7 @@ async fn cross_confirm_fingerprint(owner: &mut Peer, replica: &mut Peer, channel
 async fn helper_start_pair(owner: &mut Peer, helper: &mut Peer, channel_id: ChannelId) {
     let contact = owner
         .protocol
-        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys)
+        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys, None)
         .await
         .expect("owner.create_contact failed");
     helper
@@ -3195,7 +3386,7 @@ async fn run_start_pairing_rejects_already_paired_channel() {
     // `Error::ChannelAlreadyPaired` rather than mutating local state.
     let fresh_contact = owner
         .protocol
-        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys)
+        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys, None)
         .await
         .expect("owner.create_contact (round 2)");
     let result = helper
@@ -3313,7 +3504,7 @@ async fn run_pairing_rejects_incompatible_parameter_range() {
     let channel_id = ChannelId(1);
     let contact = owner
         .protocol
-        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys)
+        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys, None)
         .await
         .expect("owner.create_contact failed");
 

@@ -2,7 +2,7 @@
 
 use crate::primitives::pairing::PairingError;
 use crate::transport::TransportProtocolExt as _;
-use crate::utils::verify_timestamps;
+use crate::utils::{ContactMessageExt as _, verify_timestamps};
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp},
     protocol_version::ProtocolVersion,
@@ -17,12 +17,21 @@ use derec_proto::{
     PrePairRequestMessage, SenderKind, TransportProtocol,
 };
 use prost::Message;
-use prost_types::Timestamp;
 use rand::{Rng, rng};
 
 pub struct CreateContactResult {
     pub contact_message: ContactMessage,
-    pub secret_key: PairingSecretKeyMaterial,
+    /// Fresh pairing secret material tied to the keys the contact
+    /// creator has committed to.
+    ///
+    /// - [`ContactMode::InlineKeys`] / [`ContactMode::HashedKeys`]:
+    ///   `Some(...)`. Callers MUST persist it — it is required later
+    ///   to finalize pairing (decrypt the incoming `PairRequest` and
+    ///   derive the shared key).
+    /// - [`ContactMode::NoKeys`]: `None`. No key material exists at
+    ///   contact-creation time; the contact creator generates it on
+    ///   the fly when the corresponding `PrePairRequest` arrives.
+    pub secret_key: Option<PairingSecretKeyMaterial>,
 }
 
 pub struct ProduceResult {
@@ -54,53 +63,46 @@ pub struct PrePairExtractResult {
 /// **not wrapped in a `DeRecMessage` envelope** and is **not encrypted**. It is sent as
 /// plain protobuf bytes (serialize the returned `contact_message` with `.encode_to_vec()`).
 ///
-/// The contact contains:
-///
-/// - The initiator's public pairing material
-/// - The initiator's transport information
-/// - The logical `channel_id` associated with the pairing session
-/// - A fresh nonce identifying the pairing session
-/// - A creation timestamp
-///
-/// The returned [`derec_cryptography::pairing::PairingSecretKeyMaterial`] must be stored
-/// locally and treated as secret state; it is required later to finalize the pairing flow
-/// and derive the shared pairing key.
+/// Single entry point for all three `contact_mode` variants. Mode-specific
+/// assembly happens in private helpers (`create_contact_inlined_keys`,
+/// `create_contact_hashed_keys`, `create_contact_no_keys`) invoked here.
 ///
 /// # Arguments
 ///
-/// * `channel_id` - Identifier associated with the generated pairing key material.
-///   This value is embedded into the contact and later copied into pairing messages
-///   so the peer can associate the session with the correct channel.
-/// * `contact_mode` - Selects how the initiator's public pairing material is delivered.
-///   [`ContactMode::InlineKeys`] embeds the keys directly in the contact (current
-///   behavior). [`ContactMode::HashedKeys`] omits the keys and embeds a SHA-384 binding
-///   hash over them; the peer obtains the keys via a separate `PrePair` exchange and
-///   verifies them against the hash. The contact stays small enough for a QR code.
-///   `HashedKeys` requires the transport endpoint advertised here to be ephemeral —
-///   the plaintext `PrePair*` traffic must not be linkable to a long-lived endpoint.
-/// * `transport_protocol` - Transport endpoint and protocol the peer should use for
-///   subsequent DeRec protocol messages after reading the contact.
-///   The `uri` field must not be empty or whitespace-only.
+/// * `channel_id` — Identifier embedded in the contact and copied into subsequent
+///   pairing messages by the recipient.
+/// * `contact_mode` — Selects how the initiator's public pairing material is delivered:
+///   - [`ContactMode::InlineKeys`]: keys are embedded directly in the contact.
+///   - [`ContactMode::HashedKeys`]: only a SHA-384 binding hash is embedded; the peer
+///     obtains the keys via a `PrePair` round-trip and verifies against the hash. The
+///     transport endpoint advertised here MUST be ephemeral — the plaintext `PrePair*`
+///     traffic must not be linkable to a long-lived endpoint.
+///   - [`ContactMode::NoKeys`]: no key material and no commitment. Keys are generated
+///     on the fly by the creator when the corresponding `PrePairRequest` arrives.
+///     Trust rests entirely on the OOB delivery channel being fully trusted.
+/// * `transport_protocol` — Endpoint the recipient uses to reach this initiator with
+///   the next protocol message. The `uri` field must not be empty.
+/// * `nonce` — Correlation nonce embedded in the contact.
+///   - `None`: the library generates a fresh cryptographically-random `u64`. Suitable
+///     default for `InlineKeys` / `HashedKeys` where the nonce is a security parameter.
+///   - `Some(n)`: application-controlled value. Required for `NoKeys` where callers
+///     typically pick a small human-typable value (4–6 decimal digits) for manual entry.
+///     Also valid for `InlineKeys` / `HashedKeys` if the app wants deterministic control.
 ///
 /// # Returns
 ///
-/// On success returns [`CreateContactResult`] containing:
+/// [`CreateContactResult`] with:
 ///
-/// - `contact_message`: decoded [`derec_proto::ContactMessage`] — serialize with
-///   `.encode_to_vec()` before sending out-of-band
-/// - `secret_key`: secret pairing state that must be retained locally
+/// - `contact_message`: decoded [`ContactMessage`] — serialize with `.encode_to_vec()`
+///   before sending out-of-band.
+/// - `secret_key`: `Some(...)` for `InlineKeys` and `HashedKeys` (must be persisted);
+///   `None` for `NoKeys` (no key material at contact-creation time).
 ///
 /// # Errors
 ///
-/// Returns [`crate::Error`] (specifically `Error::Pairing(...)`) in the following cases:
-///
-/// - [`PairingError::EmptyTransportUri`] if `transport_protocol.uri` is empty or whitespace
+/// - [`PairingError::EmptyTransportUri`] if `transport_protocol.uri` is empty.
 /// - [`PairingError::ContactMessageKeygen`] if pairing key generation fails
-///
-/// # Security Notes
-///
-/// - The `contact_message` is public and intended for out-of-band exchange.
-/// - The returned secret key material must be protected.
+///   (`InlineKeys` / `HashedKeys` only — `NoKeys` skips keygen).
 ///
 /// # Example
 ///
@@ -109,21 +111,21 @@ pub struct PrePairExtractResult {
 /// use derec_library::types::ChannelId;
 /// use derec_proto::{ContactMode, Protocol, TransportProtocol};
 ///
-/// let channel_id = ChannelId(42);
-///
 /// let request::CreateContactResult {
 ///     contact_message,
 ///     secret_key,
 /// } = request::create_contact(
-///     channel_id,
+///     ChannelId(42),
 ///     ContactMode::InlineKeys,
 ///     TransportProtocol {
 ///         uri: "https://relay.example/derec".to_owned(),
 ///         protocol: Protocol::Https.into(),
 ///     },
+///     None,
 /// ).expect("Failed to create contact message");
 ///
-/// let _ = (contact_message, secret_key);
+/// assert!(secret_key.is_some());
+/// let _ = contact_message;
 /// ```
 #[cfg_attr(
     feature = "logging",
@@ -133,6 +135,7 @@ pub fn create_contact(
     channel_id: ChannelId,
     contact_mode: ContactMode,
     transport_protocol: TransportProtocol,
+    nonce: Option<u64>,
 ) -> Result<CreateContactResult, crate::Error> {
     if transport_protocol.uri.trim().is_empty() {
         #[cfg(feature = "logging")]
@@ -141,19 +144,22 @@ pub fn create_contact(
         return Err(PairingError::EmptyTransportUri.into());
     }
 
-    let nonce = rng().next_u64();
-    let timestamp = current_timestamp();
-    let seed = generate_seed::<32>();
+    let nonce = nonce.unwrap_or_else(|| rng().next_u64());
 
-    let (pk, secret_key) = cryptography_pairing::contact_message(*seed)
-        .map_err(|e| PairingError::ContactMessageKeygen { source: e })?;
-
-    let contact_message = match contact_mode {
+    let (contact_message, secret_key) = match contact_mode {
         ContactMode::InlineKeys => {
-            create_contact_inlined_keys(channel_id, nonce, timestamp, transport_protocol, pk)
+            let (pk, sk) = generate_pairing_keys()?;
+            let msg = ContactMessage::inline_keys(channel_id, nonce, transport_protocol, pk);
+            (msg, Some(PairingSecretKeyMaterial::Initiator(sk)))
         }
         ContactMode::HashedKeys => {
-            create_contact_hashed_keys(channel_id, nonce, timestamp, transport_protocol, &pk)
+            let (pk, sk) = generate_pairing_keys()?;
+            let msg = ContactMessage::hashed_keys(channel_id, nonce, transport_protocol, &pk);
+            (msg, Some(PairingSecretKeyMaterial::Initiator(sk)))
+        }
+        ContactMode::NoKeys => {
+            let msg = ContactMessage::no_keys(channel_id, nonce, transport_protocol);
+            (msg, None)
         }
     };
 
@@ -162,7 +168,7 @@ pub fn create_contact(
 
     Ok(CreateContactResult {
         contact_message,
-        secret_key: PairingSecretKeyMaterial::Initiator(secret_key),
+        secret_key,
     })
 }
 
@@ -240,6 +246,7 @@ pub fn create_contact(
 ///         uri: "https://relay.example/initiator".to_owned(),
 ///         protocol: Protocol::Https.into(),
 ///     },
+///     None,
 /// ).expect("create_contact failed");
 ///
 /// // Responder side: build the pairing request envelope from the received contact.
@@ -355,8 +362,10 @@ pub fn produce(
 /// Returns [`crate::Error`] (specifically `Error::Pairing(...)`) in the following cases:
 ///
 /// - [`PairingError::EmptyTransportUri`] if `transport_protocol.uri` is empty or whitespace
-/// - [`PairingError::InvalidContactMessage`] if `contact_message.contact_mode` is not
-///   [`ContactMode::HashedKeys`]
+/// - [`PairingError::InvalidContactMessage`] if `contact_message.contact_mode` is neither
+///   [`ContactMode::HashedKeys`] nor [`ContactMode::NoKeys`] — including
+///   [`ContactMode::InlineKeys`] (which carries the keys inline and has no
+///   PrePair step) and any unknown enum value
 ///
 /// # Security Notes
 ///
@@ -371,11 +380,7 @@ pub fn produce_pre_pair_request(
     transport_protocol: TransportProtocol,
     contact_message: &ContactMessage,
 ) -> Result<ProducePrePairResult, crate::Error> {
-    validate_inputs(
-        &transport_protocol,
-        contact_message,
-        ContactMode::HashedKeys,
-    )?;
+    validate_pre_pair_inputs(&transport_protocol, contact_message)?;
 
     let timestamp = current_timestamp();
     let request = PrePairRequestMessage {
@@ -472,6 +477,7 @@ pub fn produce_pre_pair_request(
 ///         uri: "https://relay.example/initiator".to_owned(),
 ///         protocol: Protocol::Https.into(),
 ///     },
+///     None,
 /// ).expect("create_contact failed");
 ///
 /// // Responder: build the pairing request envelope.
@@ -488,7 +494,7 @@ pub fn produce_pre_pair_request(
 ///
 /// // Initiator: decrypt the pairing request with the ECIES secret key.
 /// let request::ExtractResult { request: pair_request } =
-///     request::extract(&envelope, initiator_key.ecies_secret_key())
+///     request::extract(&envelope, initiator_key.as_ref().unwrap().ecies_secret_key())
 ///         .expect("extract failed");
 ///
 /// assert_eq!(pair_request.nonce, contact_message.nonce);
@@ -605,18 +611,6 @@ pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, c
     Ok(PrePairExtractResult { request })
 }
 
-/// Shared inbound validation for producers that ingest a
-/// [`ContactMessage`] ([`produce`], [`produce_pre_pair_request`]).
-///
-/// Three orthogonal checks:
-///
-/// 1. The caller's own `transport_protocol.uri` is non-empty.
-/// 2. The contact's shape matches `expected_mode` (delegated to
-///    [`validate_contact_for_mode`]).
-/// 3. The contact's `transport_protocol` is present and has a non-empty
-///    URI — required by both modes (it's where the next protocol message
-///    is delivered: a `PairRequest` for `InlineKeys`, a `PrePairRequest`
-///    for `HashedKeys`).
 fn validate_inputs(
     transport_protocol: &TransportProtocol,
     contact_message: &ContactMessage,
@@ -630,7 +624,7 @@ fn validate_inputs(
     }
     transport_protocol.validate()?;
 
-    validate_contact_for_mode(contact_message, expected_mode)?;
+    super::validate_contact_for_mode(contact_message, expected_mode)?;
 
     let initiator_tp =
         contact_message
@@ -651,188 +645,23 @@ fn validate_inputs(
     Ok(())
 }
 
-/// Structural validator for a decoded [`ContactMessage`]. Enforces the
-/// per-mode field-presence invariants the proto schema documents but cannot
-/// itself express:
-///
-/// - The declared `contact_mode` must be a known [`ContactMode`] value.
-/// - [`ContactMode::InlineKeys`]: `mlkem_encapsulation_key` and
-///   `ecies_public_key` MUST be present and non-empty; `contact_binding_hash`
-///   MUST be absent (would mean the contact is misshaped — keys present AND
-///   a commitment).
-/// - [`ContactMode::HashedKeys`]: both inline-key fields MUST be absent, and
-///   `contact_binding_hash` MUST be present with exactly 48 bytes (SHA-384
-///   digest size).
-///
-/// The bidirectional check matters most for `HashedKeys`: if a malformed
-/// `HashedKeys` contact carried inline keys, downstream callers might
-/// consume those keys without ever recomputing the binding hash, defeating
-/// the commitment that's the whole point of the mode.
-///
-/// Bindings should call this at the parse boundary so that any decoded
-/// `ContactMessage` they hand back to application code already satisfies
-/// the invariant.
-pub fn validate(contact: &ContactMessage) -> Result<(), crate::Error> {
-    let mode = ContactMode::try_from(contact.contact_mode).map_err(|_| {
-        #[cfg(feature = "logging")]
-        tracing::warn!(
-            contact_mode = contact.contact_mode,
-            "unknown contact_mode value"
-        );
-        PairingError::InvalidContactMessage("unknown contact_mode value")
-    })?;
-
-    let mlkem_present = contact
-        .mlkem_encapsulation_key
-        .as_ref()
-        .is_some_and(|v| !v.is_empty());
-    let ecies_present = contact
-        .ecies_public_key
-        .as_ref()
-        .is_some_and(|v| !v.is_empty());
-    let hash_present = contact
-        .contact_binding_hash
-        .as_ref()
-        .is_some_and(|v| !v.is_empty());
-
-    match mode {
-        ContactMode::InlineKeys => {
-            if !mlkem_present {
-                return Err(PairingError::InvalidContactMessage(
-                    "inline_keys contact missing mlkem_encapsulation_key",
-                )
-                .into());
-            }
-            if !ecies_present {
-                return Err(PairingError::InvalidContactMessage(
-                    "inline_keys contact missing ecies_public_key",
-                )
-                .into());
-            }
-            if hash_present {
-                return Err(PairingError::InvalidContactMessage(
-                    "inline_keys contact must not carry contact_binding_hash",
-                )
-                .into());
-            }
-        }
-        ContactMode::HashedKeys => {
-            if mlkem_present || ecies_present {
-                return Err(PairingError::InvalidContactMessage(
-                    "hashed_keys contact must not carry inline keys",
-                )
-                .into());
-            }
-            // SHA-384 digest length — the canonical binding-hash size. A
-            // contact carrying a wrong-sized hash is malformed; refuse
-            // rather than let the recomputation pretend it's valid.
-            const BINDING_HASH_LEN: usize = 48;
-            let hash = contact.contact_binding_hash.as_ref().ok_or(
-                PairingError::InvalidContactMessage(
-                    "hashed_keys contact missing contact_binding_hash",
-                ),
-            )?;
-            if hash.is_empty() {
-                return Err(PairingError::InvalidContactMessage(
-                    "hashed_keys contact missing contact_binding_hash",
-                )
-                .into());
-            }
-            if hash.len() != BINDING_HASH_LEN {
-                return Err(PairingError::InvalidContactMessage(
-                    "hashed_keys contact_binding_hash is not a SHA-384 digest",
-                )
-                .into());
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Asserts the contact is structurally valid AND its declared
-/// `contact_mode` matches the mode the calling flow expects. Used at every
-/// orchestrator entry point that ingests a contact:
-///
-/// - `produce` requires [`ContactMode::InlineKeys`] (the responder needs
-///   the keys inline).
-/// - `produce_pre_pair_request` and `process_pre_pair_response` require
-///   [`ContactMode::HashedKeys`] (the keys must be fetched via PrePair).
-pub(super) fn validate_contact_for_mode(
-    contact: &ContactMessage,
-    expected: ContactMode,
+fn validate_pre_pair_inputs(
+    transport_protocol: &TransportProtocol,
+    contact_message: &ContactMessage,
 ) -> Result<(), crate::Error> {
-    if contact.contact_mode != expected as i32 {
-        #[cfg(feature = "logging")]
-        tracing::warn!(
-            contact_mode = contact.contact_mode,
-            expected = expected as i32,
-            "contact_mode mismatch"
-        );
-
-        return Err(PairingError::InvalidContactMessage(match expected {
-            ContactMode::InlineKeys => "expected INLINE_KEYS contact mode",
-            ContactMode::HashedKeys => "expected HASHED_KEYS contact mode",
-        })
+    let expected_mode = if contact_message.contact_mode == ContactMode::HashedKeys as i32 {
+        ContactMode::HashedKeys
+    } else if contact_message.contact_mode == ContactMode::NoKeys as i32 {
+        ContactMode::NoKeys
+    } else {
+        return Err(PairingError::InvalidContactMessage(
+            "contact_mode must be HashedKeys or NoKeys for PrePairRequest",
+        )
         .into());
-    }
-
-    validate(contact)
+    };
+    validate_inputs(transport_protocol, contact_message, expected_mode)
 }
 
-fn create_contact_inlined_keys(
-    channel_id: ChannelId,
-    nonce: u64,
-    timestamp: Timestamp,
-    transport_protocol: TransportProtocol,
-    pk: PairingContactMessageMaterial,
-) -> ContactMessage {
-    ContactMessage {
-        channel_id: channel_id.into(),
-        transport_protocol: Some(transport_protocol),
-        contact_mode: ContactMode::InlineKeys as i32,
-        mlkem_encapsulation_key: Some(pk.mlkem_encapsulation_key),
-        ecies_public_key: Some(pk.ecies_public_key),
-        contact_binding_hash: None,
-        nonce,
-        timestamp: Some(timestamp),
-    }
-}
-
-fn create_contact_hashed_keys(
-    channel_id: ChannelId,
-    nonce: u64,
-    timestamp: Timestamp,
-    transport_protocol: TransportProtocol,
-    pk: &PairingContactMessageMaterial,
-) -> ContactMessage {
-    let binding_hash = derec_cryptography::pairing::contact_binding_hash(
-        &pk.mlkem_encapsulation_key,
-        &pk.ecies_public_key,
-        nonce,
-        channel_id.into(),
-    );
-
-    ContactMessage {
-        channel_id: channel_id.into(),
-        transport_protocol: Some(transport_protocol),
-        contact_mode: ContactMode::HashedKeys as i32,
-        mlkem_encapsulation_key: None,
-        ecies_public_key: None,
-        contact_binding_hash: Some(binding_hash.to_vec()),
-        nonce,
-        timestamp: Some(timestamp),
-    }
-}
-
-/// Build the responder-side pairing key material from the initiator's
-/// `ContactMessage`: encapsulates a fresh ML-KEM ciphertext against the
-/// initiator's encapsulation key, generates an ECIES key pair, and returns
-/// both the on-the-wire request material and the local secret to keep.
-///
-/// Callers must have validated the contact via
-/// [`validate_inputs`]`(.., ContactMode::InlineKeys)` first — the
-/// `.expect()`s below are infallible otherwise.
 fn create_pairing_request_material(
     contact_message: &ContactMessage,
 ) -> Result<
@@ -860,4 +689,16 @@ fn create_pairing_request_material(
     let seed = generate_seed::<32>();
     cryptography_pairing::pairing_request_message(*seed, &contact_pk)
         .map_err(|e| PairingError::PairRequestKeygen { source: e }.into())
+}
+
+fn generate_pairing_keys() -> Result<
+    (
+        PairingContactMessageMaterial,
+        derec_cryptography::pairing::InitiatorSecretKeyMaterial,
+    ),
+    crate::Error,
+> {
+    let seed = generate_seed::<32>();
+    cryptography_pairing::contact_message(*seed)
+        .map_err(|e| PairingError::ContactMessageKeygen { source: e }.into())
 }

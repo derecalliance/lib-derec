@@ -266,17 +266,36 @@ public sealed class DeRecProtocol : IDisposable
 
     /// <summary>
     /// Generate an out-of-band contact message used to bootstrap pairing.
-    /// Pass <paramref name="channelId"/> = <c>null</c> to have the library
-    /// mint the channel id; otherwise supply it explicitly.
+    /// Single entry point for all three <see cref="ContactMode"/> variants.
     /// </summary>
-    public Task<byte[]> CreateContactAsync(ulong? channelId, ContactMode contactMode)
+    /// <param name="channelId"><c>null</c> lets the library mint a random id;
+    /// otherwise the supplied value is used verbatim.</param>
+    /// <param name="contactMode">Mode-selects how the initiator's public
+    /// pairing material is delivered.</param>
+    /// <param name="nonce"><c>null</c> lets the library generate a fresh
+    /// cryptographically-random <c>ulong</c>. Required for
+    /// <see cref="ContactMode.NoKeys"/> where callers typically pick a small
+    /// human-typable value; also valid on the other modes if the app wants
+    /// deterministic control.</param>
+    public Task<byte[]> CreateContactAsync(
+        ulong? channelId,
+        ContactMode contactMode,
+        ulong? nonce = null)
     {
         EnsureNotDisposed();
         uint has = channelId.HasValue ? 1u : 0u;
         ulong id = channelId ?? 0ul;
+        uint hasNonce = nonce.HasValue ? 1u : 0u;
+        ulong nonceValue = nonce ?? 0ul;
         return Task.Run(() =>
         {
-            var result = NP.derec_protocol_create_contact(_handle, has, id, (int)contactMode);
+            var result = NP.derec_protocol_create_contact(
+                _handle,
+                has,
+                id,
+                (int)contactMode,
+                hasNonce,
+                nonceValue);
             try
             {
                 ThrowOnError(result.Error);

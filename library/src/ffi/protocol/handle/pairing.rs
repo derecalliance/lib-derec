@@ -169,6 +169,8 @@ pub unsafe extern "C" fn derec_protocol_create_contact(
     has_channel_id: u32,
     channel_id: u64,
     contact_mode: i32,
+    has_nonce: u32,
+    nonce: u64,
 ) -> DeRecProtocolCreateContactResult {
     if handle.is_null() {
         return ffi_error(DEREC_CODE_FFI_NULL_PTR, "handle is null").into();
@@ -188,9 +190,13 @@ pub unsafe extern "C" fn derec_protocol_create_contact(
     } else {
         None
     };
+    let nonce_arg: Option<u64> = if has_nonce != 0 { Some(nonce) } else { None };
     let h = unsafe { &*handle };
     let mut inner = h.lock_inner();
-    match h.runtime.block_on(inner.create_contact(id_arg, mode)) {
+    match h
+        .runtime
+        .block_on(inner.create_contact(id_arg, mode, nonce_arg))
+    {
         Ok(contact) => DeRecProtocolCreateContactResult {
             error: success(),
             contact_wire_bytes: vec_into_buffer(contact.encode_to_vec()),

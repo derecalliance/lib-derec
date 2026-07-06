@@ -52,7 +52,7 @@ package org.derecalliance.derec.protobuf;
 //
 // # Modes
 //
-// `ContactMessage` supports two delivery modes for the public encryption
+// `ContactMessage` supports three delivery modes for the public encryption
 // material, selected by `contactMode`:
 //
 // - `INLINE_KEYS` (default): both `mlkemEncapsulationKey` and
@@ -72,6 +72,22 @@ package org.derecalliance.derec.protobuf;
 //  carried in this mode MUST be ephemeral — see the security note on
 //  `PrePairRequestMessage` for the required ephemeral-then-swap discipline.
 //
+// - `NO_KEYS`: all of `mlkemEncapsulationKey`, `eciesPublicKey`, and
+//  `contactBindingHash` are absent. The contact carries only
+//  `channelId`, `nonce`, and `transportProtocol` — small enough to be
+//  hand-typed or dictated over the phone. There is no cryptographic
+//  binding: the recipient's `PrePairRequest` triggers on-the-fly key
+//  generation on the contact creator, and the returned keys are used
+//  without hash verification. The security model rests **entirely** on
+//  the out-of-band delivery channel being fully trusted (e.g. a
+//  verified email from an already-KYC-authenticated institution). The
+//  `nonce` correlates the incoming request to the intended user; because
+//  the nonce is intentionally small for human typability, applications
+//  MUST rate-limit incoming `PrePairRequest`s per `channelId` and expire
+//  outstanding NoKeys contacts on a short timer. Not appropriate for
+//  peer-to-peer pairing over untrusted channels — use `HASHED_KEYS` or
+//  `INLINE_KEYS` there.
+//
 // The mode selector and the per-mode field-presence invariants are enforced
 // by the implementation; mixing fields across modes is a protocol error.
 
@@ -84,6 +100,12 @@ enum ContactMode {
   // `contactBindingHash` is inlined in the contact; keys are obtained via
   // `PrePairRequest` / `PrePairResponse` and verified against the hash.
   HASHED_KEYS = 1;
+  // No key material and no hash are inlined. The contact carries only
+  // `channelId`, `nonce`, and `transportProtocol`; the contact creator
+  // generates key material on the fly when the corresponding
+  // `PrePairRequest` arrives. Only appropriate when the out-of-band
+  // delivery channel is fully trusted.
+  NO_KEYS = 2;
 }
 
 message ContactMessage {

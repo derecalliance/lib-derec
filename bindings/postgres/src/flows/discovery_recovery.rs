@@ -85,7 +85,7 @@ pub async fn run() {
     ] {
         let contact = owner
             .protocol
-            .create_contact(Some(fresh_cid), derec_proto::ContactMode::InlineKeys)
+            .create_contact(Some(fresh_cid), derec_proto::ContactMode::InlineKeys, None)
             .await
             .unwrap_or_else(|e| panic!("recovery create_contact({label}) failed: {e}"));
         helper

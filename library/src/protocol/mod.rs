@@ -379,16 +379,16 @@ impl<
     /// Generate an out-of-band contact message (QR code payload, deep link, …).
     ///
     /// Either party (Owner or Helper) may call this to begin a pairing session.
-    /// The returned [`ContactMessage`] should be delivered out-of-band to the peer
-    /// (e.g. serialized into a QR code or deep link). The ephemeral pairing secret
-    /// is persisted automatically via `secret_store`.
+    /// The returned [`ContactMessage`] should be delivered out-of-band to the peer.
+    /// Any material the library needs later — either the ephemeral pairing
+    /// secret (`InlineKeys` / `HashedKeys`) or the contact itself (`NoKeys`) —
+    /// is persisted automatically via the configured stores.
     ///
     /// # Channel ID
     ///
     /// Pass `Some(id)` to use a specific channel identifier, or `None` to have
-    /// the library generate a random one. The channel ID is embedded in the
-    /// returned [`ContactMessage`] and should be treated as the canonical
-    /// identifier for this pairing session going forward.
+    /// the library generate a random one. Applications targeting `NoKeys` mode
+    /// typically pass a small human-typable value (4 digits) for manual entry.
     ///
     /// # Contact mode
     ///
@@ -401,11 +401,29 @@ impl<
     ///   against the hash. Requires the `own_transport` set on this protocol
     ///   to be **ephemeral** — the plaintext PrePair traffic must not be
     ///   linkable to a long-lived endpoint.
+    /// - [`ContactMode::NoKeys`] carries no key material and no commitment —
+    ///   only `channel_id`, `nonce`, and `transport_protocol`. Small enough
+    ///   to be hand-typed. Keys are generated on the fly by the creator when
+    ///   the corresponding `PrePairRequest` arrives; trust rests entirely on
+    ///   the OOB delivery channel being fully trusted (e.g. a verified email
+    ///   from an already-KYC-authenticated institution). Applications MUST
+    ///   rate-limit inbound `PrePairRequest`s per `channel_id` and expire
+    ///   outstanding NoKeys contacts on a short timer.
+    ///
+    /// # Nonce
+    ///
+    /// - `None`: the library generates a fresh cryptographically-random
+    ///   `u64`. Recommended default for `InlineKeys` and `HashedKeys` where
+    ///   the nonce is a security parameter.
+    /// - `Some(n)`: application-controlled value. Required for `NoKeys`
+    ///   where the recipient typically types it in; also valid for the
+    ///   other modes if the app wants deterministic control.
     #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
     pub async fn create_contact(
         &mut self,
         channel_id: Option<ChannelId>,
         contact_mode: ContactMode,
+        nonce: Option<u64>,
     ) -> Result<ContactMessage> {
         let channel_id = channel_id.unwrap_or_else(|| ChannelId(rand::random::<u64>()));
 
@@ -416,15 +434,43 @@ impl<
             "creating contact message"
         );
 
-        let result = create_contact_message(channel_id, contact_mode, self.own_transport.clone())?;
+        let result = create_contact_message(
+            channel_id,
+            contact_mode,
+            self.own_transport.clone(),
+            nonce,
+        )?;
 
-        self.secret_store
-            .save(
-                self.secret_id,
-                channel_id,
-                SecretValue::PairingSecret(result.secret_key),
-            )
-            .await?;
+        // Persist the material the eventual `PrePairRequest` /
+        // `PairRequest` handler will need to look up:
+        // - `Some(secret_key)` on InlineKeys / HashedKeys → store as
+        //   `PairingSecret`. Handler decrypts the encrypted PairRequest
+        //   with the ECIES secret and re-publishes keys on the PrePair
+        //   leg (HashedKeys only).
+        // - `None` on NoKeys → store the contact itself as
+        //   `PairingContact` so the incoming PrePairRequest handler can
+        //   (a) authenticate the caller by matching `nonce`, and
+        //   (b) generate fresh key material on the fly for the response.
+        match result.secret_key {
+            Some(secret_key) => {
+                self.secret_store
+                    .save(
+                        self.secret_id,
+                        channel_id,
+                        SecretValue::PairingSecret(secret_key),
+                    )
+                    .await?;
+            }
+            None => {
+                self.secret_store
+                    .save(
+                        self.secret_id,
+                        channel_id,
+                        SecretValue::PairingContact(result.contact_message.clone()),
+                    )
+                    .await?;
+            }
+        }
 
         #[cfg(feature = "logging")]
         tracing::info!(channel_id = channel_id.0, "contact message created");
@@ -1524,32 +1570,31 @@ impl<
         if let Ok(inner) = crate::derec_message::extract_inner_plaintext_message(&message.message) {
             match inner {
                 inner @ MessageBody::PrePairRequest(_) => {
-                    // Initiator side: needs `PairingSecret` to answer.
-                    // Routes through the regular pairing dispatcher
-                    // (`pairing::handle`) — same shape as PairRequest /
-                    // PairResponse handling, just with the inner already
-                    // decoded so we skip the decryption step.
-                    let Some(SecretValue::PairingSecret(pairing_secret)) = self
-                        .secret_store
-                        .load(self.secret_id, channel_id, SecretKind::PairingSecret)
-                        .await?
-                    else {
+                    // Initiator side. Two flavors:
+                    // - HashedKeys: `PairingSecret` was saved at
+                    //   `create_contact` time; the accept path publishes
+                    //   its embedded keys.
+                    // - NoKeys: only `PairingContact` was saved at
+                    //   `create_contact_no_keys` time — no keys exist
+                    //   until the accept path generates them on the fly.
+                    // Route the message iff **either** correlation record
+                    // exists; otherwise silently drop (unknown channel).
+                    let has_pairing_secret = matches!(
+                        self.secret_store
+                            .load(self.secret_id, channel_id, SecretKind::PairingSecret)
+                            .await?,
+                        Some(SecretValue::PairingSecret(_))
+                    );
+                    let has_pairing_contact = matches!(
+                        self.secret_store
+                            .load(self.secret_id, channel_id, SecretKind::PairingContact)
+                            .await?,
+                        Some(SecretValue::PairingContact(_))
+                    );
+                    if !has_pairing_secret && !has_pairing_contact {
                         return Ok(None);
-                    };
-                    let events = handlers::pairing::handle(
-                        &mut self.channel_store,
-                        &mut self.secret_store,
-                        &self.transport,
-                        &self.communication_info,
-                        &inner,
-                        self.secret_id,
-                        channel_id,
-                        &pairing_secret,
-                        message.trace_id,
-                        self.replica_id,
-                        self.parameter_range.as_ref(),
-                    )
-                    .await?;
+                    }
+                    let events = handlers::pairing::handle_pre_pair_request(&inner, channel_id, message.trace_id)?;
                     return Ok(Some(events));
                 }
                 MessageBody::PrePairResponse(resp) => {

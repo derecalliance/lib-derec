@@ -496,26 +496,43 @@ impl DeRecProtocolWasm {
         self.inner.secret_id()
     }
 
+    /// Single entry point for all three contact modes (`InlineKeys`,
+    /// `HashedKeys`, `NoKeys`).
+    ///
+    /// * `channel_id` — `null`/`undefined` lets the library mint a
+    ///   random id; otherwise `bigint` / `number` is used verbatim.
+    /// * `contact_mode` — `0` (InlineKeys), `1` (HashedKeys), `2` (NoKeys).
+    /// * `nonce` — `null`/`undefined` lets the library generate a fresh
+    ///   random `u64`; otherwise the supplied `bigint`/`number` is used.
+    ///   Required for `NoKeys` where callers typically pick a small
+    ///   human-typable value.
     #[wasm_bindgen(js_name = "createContact")]
     pub async fn create_contact(
         &mut self,
         channel_id: JsValue,
         contact_mode: u32,
+        nonce: JsValue,
     ) -> Result<JsValue, JsValue> {
         let id = parse_optional_channel_id(channel_id)?;
         let mode = match contact_mode {
             0 => derec_proto::ContactMode::InlineKeys,
             1 => derec_proto::ContactMode::HashedKeys,
+            2 => derec_proto::ContactMode::NoKeys,
             other => {
                 return Err(js_error(
                     "INVALID_CONTACT_MODE",
-                    format!("unknown contact_mode: {other}; expected 0 (InlineKeys) or 1 (HashedKeys)"),
+                    format!("unknown contact_mode: {other}; expected 0 (InlineKeys), 1 (HashedKeys), or 2 (NoKeys)"),
                 ));
             }
         };
+        let nonce = if nonce.is_null() || nonce.is_undefined() {
+            None
+        } else {
+            Some(js_value_to_u64(nonce)?)
+        };
         let contact = self
             .inner
-            .create_contact(id, mode)
+            .create_contact(id, mode, nonce)
             .await
             .map_err(|e| js_error("DEREC_ERROR", e.to_string()))?;
         let contact: PairingContactMessage = contact.into();

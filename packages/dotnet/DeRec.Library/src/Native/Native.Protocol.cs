@@ -248,7 +248,12 @@ internal static class Protocol
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern DeRecProtocolCreateContactResult derec_protocol_create_contact(
-        IntPtr handle, uint hasChannelId, ulong channelId, int contactMode);
+        IntPtr handle,
+        uint hasChannelId,
+        ulong channelId,
+        int contactMode,
+        uint hasNonce,
+        ulong nonce);
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct DeRecProtocolStartResult

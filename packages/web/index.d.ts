@@ -104,10 +104,20 @@ export enum SenderKind {
  * - `HashedKeys`: only a SHA-384 commitment to the keys is in the contact;
  *   the scanner must fetch the actual keys over the wire via the `PrePair`
  *   round-trip and verify them against the commitment before pairing.
+ * - `NoKeys`: no key material and no commitment. The contact carries only
+ *   `channel_id`, `nonce`, and `transport_protocol` — small enough to be
+ *   hand-typed or dictated. Keys are generated on the fly by the contact
+ *   creator when the `PrePairRequest` arrives; the scanner accepts them
+ *   without cryptographic verification. Trust rests entirely on the OOB
+ *   delivery channel being fully trusted (e.g. a verified email from an
+ *   already-KYC-authenticated institution). Applications MUST rate-limit
+ *   inbound `PrePairRequest`s per channel and expire outstanding NoKeys
+ *   contacts on a short timer.
  */
 export enum ContactMode {
   InlineKeys = 0,
   HashedKeys = 1,
+  NoKeys = 2,
 }
 
 export enum FlowKind {
@@ -124,7 +134,7 @@ export type UnpairAck = "required" | "not_required";
 
 export interface ContactMessage {
   channel_id: bigint;
-  /** `ContactMode` numeric value (0 = INLINE_KEYS, 1 = HASHED_KEYS). */
+  /** `ContactMode` numeric value (0 = INLINE_KEYS, 1 = HASHED_KEYS, 2 = NO_KEYS). */
   contact_mode: number;
   transport_protocol?: TransportProtocol;
   nonce: bigint;
@@ -481,7 +491,24 @@ export declare class DeRecProtocol {
    *                     `HashedKeys` requires `ownTransportUri` to be
    *                     ephemeral.
    */
-  createContact(channelId: bigint | null | undefined, contactMode: ContactMode): Promise<ContactMessage>;
+  /**
+   * Single entry point for all three `ContactMode` variants.
+   *
+   * @param channelId `null`/`undefined` lets the library mint a random id.
+   * @param contactMode `InlineKeys` embeds keys directly; `HashedKeys`
+   * embeds only a SHA-384 commitment (keys fetched via `PrePair`);
+   * `NoKeys` carries no key material — the creator generates keys on the
+   * fly when the `PrePairRequest` arrives. Only appropriate for `NoKeys`
+   * when the OOB delivery channel is fully trusted.
+   * @param nonce `null`/`undefined` lets the library generate a fresh
+   * random `bigint`. Required for `NoKeys` where callers typically pick
+   * a small human-typable value.
+   */
+  createContact(
+    channelId: bigint | null | undefined,
+    contactMode: ContactMode,
+    nonce?: bigint | null,
+  ): Promise<ContactMessage>;
 
   start(flowKind: FlowKind.Pairing, params: PairingParams): Promise<bigint>;
   start(flowKind: FlowKind.Discovery, params: DiscoveryParams): Promise<null>;

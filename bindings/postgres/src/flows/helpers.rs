@@ -21,7 +21,7 @@ pub async fn pair_owner_helper(
 ) -> ChannelId {
     let contact = owner
         .protocol
-        .create_contact(Some(channel_id), ContactMode::InlineKeys)
+        .create_contact(Some(channel_id), ContactMode::InlineKeys, None)
         .await
         .expect("owner.create_contact failed");
 
