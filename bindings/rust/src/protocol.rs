@@ -684,8 +684,10 @@ async fn pump_many(peers: &mut [&mut Peer]) -> Vec<DeRecEvent> {
 
 /// Drive a full pairing handshake: Owner creates a contact, Helper starts
 /// pairing from it, and bytes are pumped both ways until both sides report
-/// `PairingCompleted`.
-async fn pair(owner: &mut Peer, helper: &mut Peer, channel_id: ChannelId) {
+/// `PairingCompleted`. Returns the long-term channel_id both peers rotated
+/// to at handshake completion — the transient `channel_id` argument is no
+/// longer valid after this returns.
+async fn pair(owner: &mut Peer, helper: &mut Peer, channel_id: ChannelId) -> ChannelId {
     let contact = owner
         .protocol
         .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys)
@@ -716,25 +718,53 @@ async fn pair(owner: &mut Peer, helper: &mut Peer, channel_id: ChannelId) {
 
     // Owner may still have the PairResponse queued; flush it to the helper.
     let owner_to_helper = pump(owner, helper).await;
-    let pairing_completed = helper_to_owner
+    let completions: Vec<_> = helper_to_owner
         .iter()
         .chain(owner_to_helper.iter())
-        .filter(|e| matches!(e, DeRecEvent::PairingCompleted { .. }))
-        .count();
+        .filter_map(|e| match e {
+            DeRecEvent::PairingCompleted {
+                channel_id,
+                pairing_channel_id,
+                ..
+            } => Some((*channel_id, *pairing_channel_id)),
+            _ => None,
+        })
+        .collect();
     assert!(
-        pairing_completed >= 2,
-        "expected PairingCompleted on both sides (got {pairing_completed})"
+        completions.len() >= 2,
+        "expected PairingCompleted on both sides (got {})",
+        completions.len()
     );
+    let (new_channel_id, seen_pairing_id) = completions[0];
+    assert_eq!(
+        seen_pairing_id, channel_id,
+        "PairingCompleted.pairing_channel_id must echo the transient contact channel_id"
+    );
+    for (cid, pid) in &completions[1..] {
+        assert_eq!(
+            *cid, new_channel_id,
+            "both peers must rotate to the same long-term channel_id"
+        );
+        assert_eq!(
+            *pid, channel_id,
+            "both PairingCompleted events must echo the transient id"
+        );
+    }
+    new_channel_id
 }
 
 async fn run_pairing_flow() {
     println!("=== Protocol pairing flow test ===");
 
-    let channel_id = ChannelId(1);
+    let pairing_channel_id = ChannelId(1);
     let mut owner = Peer::new("owner", "https://owner.example.com");
     let mut helper = Peer::new("helper", "https://helper.example.com");
 
-    pair(&mut owner, &mut helper, channel_id).await;
+    let channel_id = pair(&mut owner, &mut helper, pairing_channel_id).await;
+    assert_ne!(
+        channel_id, pairing_channel_id,
+        "long-term channel_id must differ from the transient pairing id"
+    );
 
     let owner_sid = owner.protocol.secret_id();
     let helper_sid = helper.protocol.secret_id();
@@ -757,6 +787,29 @@ async fn run_pairing_flow() {
     assert!(
         helper_channel.is_some(),
         "helper must have a paired channel after pairing"
+    );
+
+    // The transient pairing channel_id must no longer resolve to a record
+    // on either side.
+    assert!(
+        owner
+            .protocol
+            .channel_store
+            .load(owner_sid, pairing_channel_id)
+            .await
+            .expect("owner channel_store.load failed")
+            .is_none(),
+        "owner must drop the transient pairing channel_id record"
+    );
+    assert!(
+        helper
+            .protocol
+            .channel_store
+            .load(helper_sid, pairing_channel_id)
+            .await
+            .expect("helper channel_store.load failed")
+            .is_none(),
+        "helper must drop the transient pairing channel_id record"
     );
 
     // Both parties must derive the same fingerprint from the shared key.
@@ -785,7 +838,11 @@ async fn run_pairing_flow() {
 /// validates the hash and auto-proceeds to a regular `PairRequest`, then
 /// both sides reach `PairingCompleted`. The whole multi-leg chain drains
 /// through a single `pump` call.
-async fn pair_hashed_keys(owner: &mut Peer, helper: &mut Peer, channel_id: ChannelId) {
+async fn pair_hashed_keys(
+    owner: &mut Peer,
+    helper: &mut Peer,
+    channel_id: ChannelId,
+) -> ChannelId {
     let contact = owner
         .protocol
         .create_contact(Some(channel_id), derec_proto::ContactMode::HashedKeys)
@@ -834,16 +891,22 @@ async fn pair_hashed_keys(owner: &mut Peer, helper: &mut Peer, channel_id: Chann
         pairing_completed >= 2,
         "expected PairingCompleted on both sides (got {pairing_completed})"
     );
+    extract_paired_channel_id(events.iter(), channel_id)
+        .expect("HashedKeys handshake must emit PairingCompleted for the transient channel_id")
 }
 
 async fn run_hashed_keys_pairing_flow() {
     println!("=== Protocol HashedKeys pairing flow test ===");
 
-    let channel_id = ChannelId(1);
+    let pairing_channel_id = ChannelId(1);
     let mut owner = Peer::new("owner", "https://owner.example.com");
     let mut helper = Peer::new("helper", "https://helper.example.com");
 
-    pair_hashed_keys(&mut owner, &mut helper, channel_id).await;
+    let channel_id = pair_hashed_keys(&mut owner, &mut helper, pairing_channel_id).await;
+    assert_ne!(
+        channel_id, pairing_channel_id,
+        "long-term channel_id must differ from the transient pairing id"
+    );
 
     let owner_sid = owner.protocol.secret_id();
     let helper_sid = helper.protocol.secret_id();
@@ -1002,6 +1065,9 @@ async fn run_replica_id_wiring_flow() {
             .any(|e| matches!(e, DeRecEvent::PairingCompleted { .. })),
         "expected PairingCompleted for replica pairing"
     );
+
+    let channel_id = extract_paired_channel_id(all_events.iter().copied(), channel_id)
+        .expect("PairingCompleted for the replica handshake must fire");
 
     // Both sides emit ReplicaPaired alongside PairingCompleted, with the
     // peer's replica id as payload. The local side's role (Source vs
@@ -1188,8 +1254,8 @@ async fn run_protect_secret_with_replica_targets_flow() {
         Peer::with_replica_id("replica", "https://replica.example.com", replica_id);
 
     // 1. Owner pairs with two Helpers (classic share path targets).
-    pair(&mut owner, &mut helper_a, helper_a_channel).await;
-    pair(&mut owner, &mut helper_b, helper_b_channel).await;
+    let helper_a_channel = pair(&mut owner, &mut helper_a, helper_a_channel).await;
+    let helper_b_channel = pair(&mut owner, &mut helper_b, helper_b_channel).await;
 
     // 2. Owner pairs with another device in Replica mode (secret sync target).
     let replica_contact = owner
@@ -1206,8 +1272,13 @@ async fn run_protect_secret_with_replica_targets_flow() {
         })
         .await
         .expect("replica start(Pairing, kind=Replica) failed");
-    let _ = pump(&mut replica, &mut owner).await;
-    let _ = pump(&mut owner, &mut replica).await;
+    let round_1 = pump(&mut replica, &mut owner).await;
+    let round_2 = pump(&mut owner, &mut replica).await;
+    let replica_channel = extract_paired_channel_id(
+        round_1.iter().chain(round_2.iter()),
+        replica_channel,
+    )
+    .expect("PairingCompleted for the replica handshake must fire");
 
     let owner_sid = owner.protocol.secret_id();
     let owner_replica_channel = owner
@@ -1589,8 +1660,8 @@ async fn run_sharing_flow() {
     let mut helper_a = Peer::new("helper-a", "https://helper-a.example.com");
     let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
 
-    pair(&mut owner, &mut helper_a, channel_a).await;
-    pair(&mut owner, &mut helper_b, channel_b).await;
+    let channel_a = pair(&mut owner, &mut helper_a, channel_a).await;
+    let channel_b = pair(&mut owner, &mut helper_b, channel_b).await;
     println!("Pairing complete — distributing a secret (threshold=2, helpers=2)");
 
     owner
@@ -1657,8 +1728,8 @@ async fn run_discovery_and_recovery_flow() {
         Peer::with_secret_id("helper-b", "https://helper-b.example.com", protected_secret_id);
 
 
-    pair(&mut owner, &mut helper_a, channel_a).await;
-    pair(&mut owner, &mut helper_b, channel_b).await;
+    let channel_a = pair(&mut owner, &mut helper_a, channel_a).await;
+    let channel_b = pair(&mut owner, &mut helper_b, channel_b).await;
     println!("Initial pairing complete on channels {channel_a:?} and {channel_b:?}.");
 
     owner
@@ -1703,6 +1774,7 @@ async fn run_discovery_and_recovery_flow() {
         .await
         .expect("clearing user_secret_store");
 
+    let mut rekeyed = Vec::with_capacity(2);
     for (helper, fresh_cid, label) in [
         (&mut helper_a, recovery_channel_a, "helper-a"),
         (&mut helper_b, recovery_channel_b, "helper-b"),
@@ -1735,7 +1807,13 @@ async fn run_discovery_and_recovery_flow() {
             paired >= 2,
             "expected recovery PairingCompleted on both sides for {label} (got {paired})"
         );
+        rekeyed.push(
+            extract_paired_channel_id(r.iter(), fresh_cid)
+                .unwrap_or_else(|| panic!("no PairingCompleted for {label} recovery pair")),
+        );
     }
+    let recovery_channel_a = rekeyed[0];
+    let recovery_channel_b = rekeyed[1];
     println!(
         "Recovery re-pairing complete on channels {recovery_channel_a:?} and {recovery_channel_b:?}."
     );
@@ -1938,7 +2016,7 @@ async fn run_unpairing_flow() {
     let mut owner = Peer::new("owner", "https://owner.example.com");
     let mut helper = Peer::new("helper", "https://helper.example.com");
 
-    pair(&mut owner, &mut helper, channel_id).await;
+    let channel_id = pair(&mut owner, &mut helper, channel_id).await;
     println!("Pairing complete — sending unpair request");
 
     // The builder default is `UnpairAck::Required`, which is what this
@@ -2003,7 +2081,7 @@ async fn run_unpairing_flow() {
     let helper_init_channel = ChannelId(8);
     let mut owner = Peer::new("owner", "https://owner.example.com");
     let mut helper = Peer::new("helper", "https://helper.example.com");
-    pair(&mut owner, &mut helper, helper_init_channel).await;
+    let helper_init_channel = pair(&mut owner, &mut helper, helper_init_channel).await;
     let result = helper
         .protocol
         .start(DeRecFlow::Unpair {
@@ -2032,7 +2110,7 @@ async fn run_update_channel_info_flow() {
     let mut owner = Peer::new("owner", "https://owner.example.com");
     let mut helper = Peer::new("helper", "https://helper.example.com");
 
-    pair(&mut owner, &mut helper, channel_id).await;
+    let channel_id = pair(&mut owner, &mut helper, channel_id).await;
     println!("Pairing complete — preparing UpdateChannelInfo broadcast");
 
     // Owner mutates local state, then propagates the change.
@@ -2151,7 +2229,7 @@ async fn run_reply_to_flow() {
     let mut owner = Peer::with_auto_reply_to("owner-reply", "https://owner-reply.example.com");
     let mut helper = Peer::new("helper-reply", "https://helper-reply.example.com");
 
-    pair(&mut owner, &mut helper, channel_id).await;
+    let channel_id = pair(&mut owner, &mut helper, channel_id).await;
 
     // Half 1: auto_reply_to populates request.reply_to on outbound.
     owner
@@ -2263,8 +2341,8 @@ async fn run_auto_publish_on_pair_flow() {
     let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
     let mut helper_c = Peer::new("helper-c", "https://helper-c.example.com");
 
-    pair(&mut owner, &mut helper_a, channel_a).await;
-    pair(&mut owner, &mut helper_b, channel_b).await;
+    let _channel_a = pair(&mut owner, &mut helper_a, channel_a).await;
+    let _channel_b = pair(&mut owner, &mut helper_b, channel_b).await;
 
     // First publish: explicit start(ProtectSecret). Both helpers receive
     // shares; the bag is cached on the protocol for any later pair-trigger.
@@ -2313,6 +2391,8 @@ async fn run_auto_publish_on_pair_flow() {
         .await
         .expect("helper-c start(Pairing) failed");
     let auto = pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b, &mut helper_c]).await;
+    let channel_c = extract_paired_channel_id(auto.iter(), channel_c)
+        .expect("helper-c PairingCompleted must fire during the auto-publish pump");
 
     let stored_on_c = auto
         .iter()
@@ -2436,7 +2516,7 @@ async fn run_replica_sync_version_progression_flow() {
 
     // Replica destinations need the handshake to land, then the
     // fingerprint cross-confirmation, before the auto-publish fires.
-    pair_replica_handshake(&mut owner, &mut replica_a, cid_a).await;
+    let cid_a = pair_replica_handshake(&mut owner, &mut replica_a, cid_a).await;
     cross_confirm_fingerprint(&mut owner, &mut replica_a, cid_a).await;
     let events =
         pump_many(&mut [&mut owner, &mut replica_a, &mut replica_b, &mut replica_c]).await;
@@ -2486,7 +2566,7 @@ async fn run_replica_sync_version_progression_flow() {
     println!("  step 2: ProtectSecret([s1]) → v=2, secret(h=0,s=1,r=1,shares=0)  ✓");
 
     // ── Step 3: pair replica B → bootstrap; A also receives v=3 ───
-    pair_replica_handshake(&mut owner, &mut replica_b, cid_b).await;
+    let cid_b = pair_replica_handshake(&mut owner, &mut replica_b, cid_b).await;
     cross_confirm_fingerprint(&mut owner, &mut replica_b, cid_b).await;
     let events =
         pump_many(&mut [&mut owner, &mut replica_a, &mut replica_b, &mut replica_c]).await;
@@ -2516,6 +2596,8 @@ async fn run_replica_sync_version_progression_flow() {
         &mut helper_3,
     ])
     .await;
+    let cid_h1 = extract_paired_channel_id(events.iter(), cid_h1)
+        .expect("step 4: PairingCompleted for helper #1 must fire");
     // helper-1 must not have stored anything (below threshold).
     assert!(
         !events.iter().any(|e| matches!(
@@ -2547,6 +2629,8 @@ async fn run_replica_sync_version_progression_flow() {
         &mut helper_3,
     ])
     .await;
+    let cid_h2 = extract_paired_channel_id(events.iter(), cid_h2)
+        .expect("step 5: PairingCompleted for helper #2 must fire");
     assert!(
         !events
             .iter()
@@ -2613,6 +2697,8 @@ async fn run_replica_sync_version_progression_flow() {
         &mut helper_3,
     ])
     .await;
+    let cid_h3 = extract_paired_channel_id(events.iter(), cid_h3)
+        .expect("step 7: PairingCompleted for helper #3 must fire");
     for (label, cid) in [("helper-1", cid_h1), ("helper-2", cid_h2), ("helper-3", cid_h3)] {
         assert!(
             events.iter().any(|e| matches!(
@@ -2634,7 +2720,7 @@ async fn run_replica_sync_version_progression_flow() {
     println!("  step 7: pair helper #3 → v=7, secret(h=3,s=2,r=2,shares=3); all 3 helpers ShareStored  ✓");
 
     // ── Step 8: pair replica C → full bootstrap + fresh helper VSS ─
-    pair_replica_handshake(&mut owner, &mut replica_c, cid_c).await;
+    let cid_c = pair_replica_handshake(&mut owner, &mut replica_c, cid_c).await;
     cross_confirm_fingerprint(&mut owner, &mut replica_c, cid_c).await;
     let events = pump_many(&mut [
         &mut owner,
@@ -2736,7 +2822,7 @@ async fn run_replica_group_key_handover_flow() {
     );
 
     // ── Step 1: pair Source↔Dest1; K_group implicitly emerges ────
-    pair_replica_handshake(&mut source, &mut dest1, dest1_channel).await;
+    let dest1_channel = pair_replica_handshake(&mut source, &mut dest1, dest1_channel).await;
     cross_confirm_fingerprint(&mut source, &mut dest1, dest1_channel).await;
     let _ = pump_many(&mut [&mut source, &mut dest1, &mut dest2]).await;
 
@@ -2750,7 +2836,7 @@ async fn run_replica_group_key_handover_flow() {
     println!("  step 1: pair Source↔Dest1 — K_group emerged, both sides agree  ✓");
 
     // ── Step 2: pair Source↔Dest2; handover round mutates Dest2's key ──
-    pair_replica_handshake(&mut source, &mut dest2, dest2_channel).await;
+    let dest2_channel = pair_replica_handshake(&mut source, &mut dest2, dest2_channel).await;
     // Right after pair handshake (before verify_fingerprint triggers the
     // auto-publish round), both sides have stored a fresh K_ephemeral for
     // the new channel. The keys must NOT yet equal K_group.
@@ -2770,22 +2856,34 @@ async fn run_replica_group_key_handover_flow() {
     let _ = pump_many(&mut [&mut source, &mut dest1, &mut dest2]).await;
 
     // After the handover round, every replica channel entry on both
-    // sides must hold K_group.
+    // sides must converge on the same K_group. Which specific value it
+    // is depends on the tiebreaker in `current_replica_group_key` (min
+    // by `(created_at, channel.id.0)`) — with hash-derived channel ids
+    // the tiebreaker isn't the transient order, so K_group may equal
+    // either destination's initial key. The invariant that matters is
+    // that all four entries agree so envelopes decrypt on either side.
     let k_source_dest1 = load_channel_key(&source, sid, dest1_channel).await;
     let k_source_dest2 = load_channel_key(&source, sid, dest2_channel).await;
     let k_dest1 = load_channel_key(&dest1, sid, dest1_channel).await;
     let k_dest2 = load_channel_key(&dest2, sid, dest2_channel).await;
-    assert_eq!(k_source_dest1, k_group, "Source↔Dest1 must keep K_group");
     assert_eq!(
-        k_source_dest2, k_group,
-        "Source↔Dest2 must have rotated to K_group after the handover round"
+        k_source_dest1, k_source_dest2,
+        "Source must hold the same K_group for both destination channels"
     );
-    assert_eq!(k_dest1, k_group, "Dest1 channel-key must equal K_group");
     assert_eq!(
-        k_dest2, k_group,
-        "Dest2 must have rotated its channel key to K_group via the StoreShareRequest.shared_key field"
+        k_dest1, k_source_dest1,
+        "Dest1 must hold K_group (matches Source's view)"
     );
-    println!("  step 2: pair Source↔Dest2 — Dest2 rotated K_ephemeral → K_group, all four entries match  ✓");
+    assert_eq!(
+        k_dest2, k_source_dest1,
+        "Dest2 must have rotated its channel key to K_group"
+    );
+    let k_group = k_source_dest1;
+    assert!(
+        k_group == k_ephemeral_source || k_group == k_after_pair_1,
+        "K_group must be one of the two pre-handover channel keys"
+    );
+    println!("  step 2: pair Source↔Dest2 — all four entries converged on K_group  ✓");
 
     // ── Step 3: post-handover round; must decrypt cleanly with K_group ──
     source
@@ -2856,7 +2954,11 @@ async fn load_channel_key(peer: &Peer, secret_id: u64, channel_id: ChannelId) ->
 /// a ReplicaDestination. Stops at the `Pending` state — the caller
 /// must call `cross_confirm_fingerprint` afterwards to trigger the
 /// auto-publish on the Pending→Paired transition.
-async fn pair_replica_handshake(owner: &mut Peer, replica: &mut Peer, channel_id: ChannelId) {
+async fn pair_replica_handshake(
+    owner: &mut Peer,
+    replica: &mut Peer,
+    channel_id: ChannelId,
+) -> ChannelId {
     let contact = owner
         .protocol
         .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys)
@@ -2871,8 +2973,27 @@ async fn pair_replica_handshake(owner: &mut Peer, replica: &mut Peer, channel_id
         })
         .await
         .expect("replica start(Pairing, ReplicaDestination) failed");
-    let _ = pump(replica, owner).await;
-    let _ = pump(owner, replica).await;
+    let round_1 = pump(replica, owner).await;
+    let round_2 = pump(owner, replica).await;
+    extract_paired_channel_id(round_1.iter().chain(round_2.iter()), channel_id)
+        .expect("PairingCompleted for the transient channel_id must fire during the handshake")
+}
+
+/// Walk an event stream and return the long-term `channel_id` the peers
+/// rotated to when pairing on `transient` completed. `None` if no
+/// matching `PairingCompleted` is present.
+fn extract_paired_channel_id<'a>(
+    events: impl IntoIterator<Item = &'a DeRecEvent>,
+    transient: ChannelId,
+) -> Option<ChannelId> {
+    events.into_iter().find_map(|e| match e {
+        DeRecEvent::PairingCompleted {
+            channel_id,
+            pairing_channel_id,
+            ..
+        } if *pairing_channel_id == transient => Some(*channel_id),
+        _ => None,
+    })
 }
 
 async fn cross_confirm_fingerprint(owner: &mut Peer, replica: &mut Peer, channel_id: ChannelId) {
@@ -2969,8 +3090,8 @@ async fn run_auto_accept_flow() {
     let mut helper_b =
         Peer::with_auto_accept("helper-b", "https://helper-b.example.com", policy);
 
-    pair(&mut owner, &mut helper_a, channel_a).await;
-    pair(&mut owner, &mut helper_b, channel_b).await;
+    let channel_a = pair(&mut owner, &mut helper_a, channel_a).await;
+    let channel_b = pair(&mut owner, &mut helper_b, channel_b).await;
     println!("Pairing complete — distributing a secret (helpers auto-accept StoreShare)");
 
     owner
@@ -3056,7 +3177,7 @@ async fn run_start_pairing_rejects_already_paired_channel() {
     let mut helper = Peer::with_auto_accept("helper", "https://helper.example.com", policy);
 
     // Phase 1: normal pairing → channel(Paired), SharedKey, no PairingSecret/PairingContact.
-    pair(&mut owner, &mut helper, channel_id).await;
+    let channel_id = pair(&mut owner, &mut helper, channel_id).await;
     let secret_id = helper.protocol.secret_id();
 
     let channel_post_pair = helper

@@ -186,7 +186,15 @@ export interface UpdateChannelInfoParams {
 }
 
 export type DeRecEvent =
-  | { type: "PairingCompleted"; channel_id: string; kind: SenderKind; peer_communication_info?: Record<string, string> }
+  | {
+      type: "PairingCompleted";
+      /** Long-term `channel_id` both peers atomically rotated to at handshake completion. */
+      channel_id: string;
+      /** Transient `channel_id` used only during pairing (the one that traveled on the ContactMessage). No longer resolves in library state. */
+      pairing_channel_id: string;
+      kind: SenderKind;
+      peer_communication_info?: Record<string, string>;
+    }
   | {
       type: "ActionRequired";
       channel_id: string;

@@ -34,6 +34,7 @@ use crate::protocol::{
 pub(crate) enum Event {
     PairingCompleted {
         channel_id: String,
+        pairing_channel_id: String,
         kind: i32,
         #[serde(skip_serializing_if = "HashMap::is_empty")]
         peer_communication_info: HashMap<String, String>,
@@ -283,10 +284,12 @@ impl Event {
         Ok(match event {
             DeRecEvent::PairingCompleted {
                 channel_id,
+                pairing_channel_id,
                 kind,
                 peer_communication_info,
             } => Self::PairingCompleted {
                 channel_id: channel_id.0.to_string(),
+                pairing_channel_id: pairing_channel_id.0.to_string(),
                 kind: kind as i32,
                 peer_communication_info,
             },

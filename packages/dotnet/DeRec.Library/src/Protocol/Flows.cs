@@ -199,7 +199,20 @@ public sealed record PairingCompletedEvent : DeRecEvent
 {
     public override string EventType => "PairingCompleted";
 
+    /// <summary>
+    /// Long-term <c>channel_id</c> both peers atomically rotated to at the end
+    /// of the handshake. All post-pairing traffic and library state keys on
+    /// this value.
+    /// </summary>
     public required string ChannelId { get; init; }
+
+    /// <summary>
+    /// Transient <c>channel_id</c> that traveled on the <c>ContactMessage</c>
+    /// and the pairing envelopes. No longer resolves in library state after
+    /// this event fires — provided so applications that persisted it can
+    /// rekey their own records.
+    /// </summary>
+    public required string PairingChannelId { get; init; }
     public required Pairing.SenderKind Kind { get; init; }
     public Dictionary<string, string> PeerCommunicationInfo { get; init; } = new();
 }
@@ -709,6 +722,7 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
         var ev = new PairingCompletedEvent
         {
             ChannelId = root.GetProperty("channel_id").GetString()!,
+            PairingChannelId = root.GetProperty("pairing_channel_id").GetString()!,
             Kind = (Pairing.SenderKind)root.GetProperty("kind").GetInt32(),
         };
         if (root.TryGetProperty("peer_communication_info", out var pci) &&

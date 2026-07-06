@@ -197,11 +197,15 @@ pub(in crate::protocol) async fn accept<
         comm_info,
         parameter_range,
     )?;
+    // Long-term id both peers atomically switch to. `channel_id` is the
+    // transient pairing id from the ContactMessage and remains only as
+    // the envelope route for the outgoing PairResponse.
+    let new_channel_id = resp.channel_id;
 
     secret_store
         .save(
             secret_id,
-            channel_id,
+            new_channel_id,
             SecretValue::SharedKey(resp.shared_key),
         )
         .await?;
@@ -222,7 +226,7 @@ pub(in crate::protocol) async fn accept<
         .save(
             secret_id,
             crate::protocol::types::Channel {
-                id: channel_id,
+                id: new_channel_id,
                 transport: peer_transport,
                 communication_info: peer_communication_info.clone(),
                 status,
@@ -233,19 +237,30 @@ pub(in crate::protocol) async fn accept<
         )
         .await?;
 
-    secret_store
-        .remove(secret_id, channel_id, SecretKind::PairingSecret)
-        .await?;
-
+    // Send on the transient id — the peer still routes on it and will
+    // rotate to `new_channel_id` on receipt.
     let envelope = super::apply_trace_id(resp.envelope, trace_id)?;
     transport
         .send(&resp.peer_transport_protocol, envelope)
         .await?;
 
+    // Drop the transient channel state after the wire message is out.
+    // Any inbound message routed to `channel_id` from this point is
+    // rejected as unknown.
+    secret_store
+        .remove(secret_id, channel_id, SecretKind::PairingSecret)
+        .await?;
+    channel_store.remove(secret_id, channel_id).await?;
+
     #[cfg(feature = "logging")]
-    tracing::info!("pairing complete (responder side)");
+    tracing::info!(
+        old_channel_id = channel_id.0,
+        new_channel_id = new_channel_id.0,
+        "pairing complete (responder side); rotated to long-term channel_id"
+    );
 
     Ok(pair_completion_events(
+        new_channel_id,
         channel_id,
         kind,
         peer_communication_info,
@@ -377,20 +392,10 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     };
 
     let result = response::process(&contact, response, pairing_secret)?;
-
-    secret_store
-        .save(
-            secret_id,
-            channel_id,
-            SecretValue::SharedKey(result.shared_key),
-        )
-        .await?;
-    secret_store
-        .remove(secret_id, channel_id, SecretKind::PairingSecret)
-        .await?;
-    secret_store
-        .remove(secret_id, channel_id, SecretKind::PairingContact)
-        .await?;
+    // Long-term id the peer already rotated to on its side; both peers
+    // derive it independently from `original_channel_id || shared_key`.
+    // `channel_id` remains only as the (already-consumed) envelope route.
+    let new_channel_id = result.channel_id;
 
     let channel = channel_store
         .load(secret_id, channel_id)
@@ -412,6 +417,7 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
         extract_communication_info(&response.communication_info, peer_kind)?;
 
     let mut channel = channel;
+    channel.id = new_channel_id;
     channel.status = status;
     channel.replica_id = peer_replica_id;
     for (k, v) in &peer_communication_info {
@@ -419,10 +425,34 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     }
     channel_store.save(secret_id, channel).await?;
 
+    secret_store
+        .save(
+            secret_id,
+            new_channel_id,
+            SecretValue::SharedKey(result.shared_key),
+        )
+        .await?;
+
+    // Drop the transient channel's records after the long-term ones are
+    // in place. Any inbound message routed to `channel_id` from this
+    // point is rejected as unknown.
+    channel_store.remove(secret_id, channel_id).await?;
+    secret_store
+        .remove(secret_id, channel_id, SecretKind::PairingSecret)
+        .await?;
+    secret_store
+        .remove(secret_id, channel_id, SecretKind::PairingContact)
+        .await?;
+
     #[cfg(feature = "logging")]
-    tracing::info!("pairing complete (initiator side)");
+    tracing::info!(
+        old_channel_id = channel_id.0,
+        new_channel_id = new_channel_id.0,
+        "pairing complete (initiator side); rotated to long-term channel_id"
+    );
 
     Ok(pair_completion_events(
+        new_channel_id,
         channel_id,
         kind,
         peer_communication_info,
@@ -964,12 +994,14 @@ fn is_reserved_key(key: &str) -> bool {
 /// emit `ReplicaPaired` iff a peer id is present.
 fn pair_completion_events(
     channel_id: ChannelId,
+    pairing_channel_id: ChannelId,
     kind: SenderKind,
     peer_communication_info: HashMap<String, String>,
     peer_replica_id: Option<u64>,
 ) -> Vec<DeRecEvent> {
     let mut events = vec![DeRecEvent::PairingCompleted {
         channel_id,
+        pairing_channel_id,
         kind,
         peer_communication_info,
     }];

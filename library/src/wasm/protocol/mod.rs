@@ -91,7 +91,7 @@ type WasmProtocol = DeRecProtocol<
 ///
 /// | `type`             | Additional fields                                      |
 /// |--------------------|--------------------------------------------------------|
-/// | `PairingCompleted`  | `channel_id: string`, `kind: number`                   |
+/// | `PairingCompleted`  | `channel_id: string`, `pairing_channel_id: string`, `kind: number` |
 /// | `ShareStored`      | `channel_id: string`, `version: number`                |
 /// | `ShareConfirmed`   | `channel_id: string`, `version: number`                |
 /// | `ShareVerified`    | `channel_id: string`, `version: number`                |

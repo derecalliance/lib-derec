@@ -396,7 +396,18 @@ pub enum DeRecEvent {
     ///   as needed (Source pushes via `ProtectSecret`, Destination receives
     ///   via [`Self::ReplicaSecretReceived`]).
     PairingCompleted {
+        /// Long-term `channel_id` both peers atomically rotated to at the
+        /// end of the handshake. All post-pairing traffic and library
+        /// state for this relationship keys on this value.
         channel_id: ChannelId,
+        /// The transient `channel_id` used only during the pairing
+        /// handshake — the one that traveled on the `ContactMessage` and
+        /// the pairing envelopes. Already replaced with `channel_id` in
+        /// library state; the library will refuse messages routed to it
+        /// from this point on. Provided so applications that persisted
+        /// the pairing id (e.g. displayed it in a UI or mirrored it to
+        /// their own store) can rekey their own records.
+        pairing_channel_id: ChannelId,
         kind: SenderKind,
         /// Key-value pairs extracted from the peer's `CommunicationInfo`
         /// (e.g. `"name"`, `"email"`, `"phone"`). Empty if the peer sent none.
