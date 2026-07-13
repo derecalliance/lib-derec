@@ -172,10 +172,19 @@ pub async fn run() {
 
     let wallet_recovery_alice = ChannelId(110);
     let wallet_recovery_bob = ChannelId(120);
-    for (helper, fresh_cid, label) in [
+    // Capture the rotated long-term id per recovery pair so downstream
+    // link graph + Discovery targets use the id that actually resolves
+    // in the stores (channel-id rekey rotates the transient contact id
+    // at PairingCompleted).
+    let mut rekeyed_wallet_recovery: [(ChannelId, ChannelId); 2] =
+        [(ChannelId(0), ChannelId(0)); 2];
+    for (idx, (helper, fresh_cid, label)) in [
         (&mut alice, wallet_recovery_alice, "Alice"),
         (&mut bob, wallet_recovery_bob, "Bob"),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let contact = user_wallet
             .protocol
             .create_contact(Some(fresh_cid), derec_proto::ContactMode::InlineKeys, None)
@@ -193,8 +202,24 @@ pub async fn run() {
             })
             .await
             .unwrap_or_else(|e| panic!("{label} start(Pairing recovery) failed: {e}"));
-        let _ = pump_many(&mut [&mut user_wallet, helper]).await;
+        let events = pump_many(&mut [&mut user_wallet, helper]).await;
+        let rekeyed = events
+            .iter()
+            .find_map(|e| match e {
+                DeRecEvent::PairingCompleted {
+                    channel_id,
+                    pairing_channel_id,
+                    ..
+                } if *pairing_channel_id == fresh_cid => Some(*channel_id),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("wallet recovery ({label}): missing PairingCompleted for transient {fresh_cid:?}")
+            });
+        rekeyed_wallet_recovery[idx] = (fresh_cid, rekeyed);
     }
+    let wallet_recovery_alice = rekeyed_wallet_recovery[0].1;
+    let wallet_recovery_bob = rekeyed_wallet_recovery[1].1;
 
     // Each wallet helper links original ↔ recovery channel so
     // discovery walks the connected component and finds the share

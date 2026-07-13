@@ -1053,16 +1053,32 @@ internal static class Protocol
         const ulong cidH2 = 12UL;
         const ulong cidH3 = 13UL;
 
+        // Channel-id rekey rotates transient contact ids to fresh
+        // long-term ids at PairingCompleted. Track the mapping so
+        // downstream event lookups target the id that actually
+        // resolves in the stores.
+        var rekeyed = new Dictionary<ulong, ulong>();
+        void CaptureRekey(IEnumerable<DeRecEvent> events)
+        {
+            foreach (var ev in events.OfType<PairingCompletedEvent>())
+                rekeyed[ulong.Parse(ev.PairingChannelId)] = ulong.Parse(ev.ChannelId);
+        }
+        ulong Rk(ulong transient) =>
+            rekeyed.TryGetValue(transient, out var r)
+                ? r
+                : throw new InvalidOperationException($"no rekeyed id for transient cid={transient}");
+
         // Step 0 — brand-new instance.
         if (owner.UserSecretStore.LoadLatest(TestSecretId) is not null)
             throw new InvalidOperationException("step 0: brand-new owner must have no snapshot");
         Console.WriteLine("  step 0: user_secret_store latest = null  ✓");
 
         // Step 1 — pair replica A → v=1.
-        PairReplicaHandshake(owner, replicaA, cidA);
-        CrossConfirmFingerprint(owner, replicaA, cidA);
+        rekeyed[cidA] = PairReplicaHandshake(owner, replicaA, cidA);
+        CrossConfirmFingerprint(owner, replicaA, Rk(cidA));
         var events = PumpAll(replicaScope);
-        var recvA = FindReplicaEvent(events, cidA)
+        CaptureRekey(events);
+        var recvA = FindReplicaEvent(events, Rk(cidA))
             ?? throw new InvalidOperationException("step 1: A must observe ReplicaSecretReceived");
         if (recvA.Version != 1) throw new InvalidOperationException($"step 1: expected v=1, got {recvA.Version}");
         if (recvA.Secret.Helpers.Count != 0) throw new InvalidOperationException("step 1: helpers must be empty");
@@ -1080,7 +1096,8 @@ internal static class Protocol
             Description = "v=2 explicit publish",
         }).GetAwaiter().GetResult();
         events = PumpAll(replicaScope);
-        recvA = FindReplicaEvent(events, cidA)
+        CaptureRekey(events);
+        recvA = FindReplicaEvent(events, Rk(cidA))
             ?? throw new InvalidOperationException("step 2: A must observe v=2");
         if (recvA.Version != 2) throw new InvalidOperationException($"step 2: expected v=2, got {recvA.Version}");
         if (recvA.Secret.Secrets.Count != 1 || !recvA.Secret.Secrets[0].Data.SequenceEqual(s1Data))
@@ -1091,11 +1108,12 @@ internal static class Protocol
         Console.WriteLine("  step 2: ProtectSecret([s1]) → v=2, secret(h=0,s=1,r=1,shares=0)  ✓");
 
         // Step 3 — pair replica B → v=3 (B bootstraps with s1).
-        PairReplicaHandshake(owner, replicaB, cidB);
-        CrossConfirmFingerprint(owner, replicaB, cidB);
+        rekeyed[cidB] = PairReplicaHandshake(owner, replicaB, cidB);
+        CrossConfirmFingerprint(owner, replicaB, Rk(cidB));
         events = PumpAll(replicaScope);
-        var recvA3 = FindReplicaEvent(events, cidA);
-        var recvB3 = FindReplicaEvent(events, cidB);
+        CaptureRekey(events);
+        var recvA3 = FindReplicaEvent(events, Rk(cidA));
+        var recvB3 = FindReplicaEvent(events, Rk(cidB));
         if (recvA3 is null || recvA3.Version != 3) throw new InvalidOperationException("step 3: A must observe v=3");
         if (recvB3 is null || recvB3.Version != 3) throw new InvalidOperationException("step 3: B must observe v=3");
         foreach (var (label, recv) in new[] { ("A", recvA3), ("B", recvB3) })
@@ -1112,11 +1130,12 @@ internal static class Protocol
         // Step 4 — pair helper #1 → v=4 (below threshold).
         HelperStartPair(owner, helper1, cidH1);
         events = PumpAll(allScope);
+        CaptureRekey(events);
         if (events.OfType<ShareStoredEvent>().Any())
             throw new InvalidOperationException("step 4: no helper may store a share (1 < threshold 3)");
         foreach (var (label, cid) in new (string, ulong)[] { ("A", cidA), ("B", cidB) })
         {
-            var r = FindReplicaEvent(events, cid)
+            var r = FindReplicaEvent(events, Rk(cid))
                 ?? throw new InvalidOperationException($"step 4 {label}: must observe v=4");
             if (r.Version != 4) throw new InvalidOperationException($"step 4 {label}: expected v=4");
             if (r.Secret.Helpers.Count != 1) throw new InvalidOperationException($"step 4 {label}: helpers must be 1");
@@ -1130,14 +1149,15 @@ internal static class Protocol
         // Step 5 — pair helper #2 → v=5.
         HelperStartPair(owner, helper2, cidH2);
         events = PumpAll(allScope);
+        CaptureRekey(events);
         if (events.OfType<ShareStoredEvent>().Any())
             throw new InvalidOperationException("step 5: still below threshold");
-        var r5B = FindReplicaEvent(events, cidB)
+        var r5B = FindReplicaEvent(events, Rk(cidB))
             ?? throw new InvalidOperationException("step 5: B must observe v=5");
         if (r5B.Version != 5) throw new InvalidOperationException("step 5: B expected v=5");
         if (r5B.Secret.Helpers.Count != 2) throw new InvalidOperationException("step 5: helpers must be 2");
         if (r5B.Shares.Count != 0) throw new InvalidOperationException("step 5: shares must be empty");
-        if (FindReplicaEvent(events, cidA) is null) throw new InvalidOperationException("step 5: A must observe v=5");
+        if (FindReplicaEvent(events, Rk(cidA)) is null) throw new InvalidOperationException("step 5: A must observe v=5");
         AssertLatestVersion(owner, TestSecretId, 5);
         Console.WriteLine("  step 5: pair helper #2 → v=5, secret(h=2,s=1,r=2,shares=0)  ✓");
 
@@ -1153,9 +1173,10 @@ internal static class Protocol
             Description = "v=6 explicit publish",
         }).GetAwaiter().GetResult();
         events = PumpAll(allScope);
+        CaptureRekey(events);
         if (events.OfType<ShareStoredEvent>().Any())
             throw new InvalidOperationException("step 6: still below threshold");
-        recvA = FindReplicaEvent(events, cidA)
+        recvA = FindReplicaEvent(events, Rk(cidA))
             ?? throw new InvalidOperationException("step 6: A must observe v=6");
         if (recvA.Version != 6) throw new InvalidOperationException("step 6: A expected v=6");
         if (recvA.Secret.Secrets.Count != 2) throw new InvalidOperationException("step 6: secrets must be 2");
@@ -1165,22 +1186,24 @@ internal static class Protocol
             throw new InvalidOperationException("step 6: secret must carry s2");
         if (recvA.Secret.Helpers.Count != 2) throw new InvalidOperationException("step 6: helpers must be 2");
         if (recvA.Shares.Count != 0) throw new InvalidOperationException("step 6: shares must be empty");
-        if (FindReplicaEvent(events, cidB) is null) throw new InvalidOperationException("step 6: B must observe v=6");
+        if (FindReplicaEvent(events, Rk(cidB)) is null) throw new InvalidOperationException("step 6: B must observe v=6");
         AssertLatestVersion(owner, TestSecretId, 6);
         Console.WriteLine("  step 6: ProtectSecret([s1, s2]) → v=6, secret(h=2,s=2,r=2,shares=0)  ✓");
 
         // Step 7 — pair helper #3 → v=7, threshold met, VSS split runs.
         HelperStartPair(owner, helper3, cidH3);
         events = PumpAll(allScope);
+        CaptureRekey(events);
         foreach (var (label, cid) in new (string, ulong)[] { ("helper-1", cidH1), ("helper-2", cidH2), ("helper-3", cidH3) })
         {
+            var expected = Rk(cid);
             if (!events.OfType<ShareStoredEvent>()
-                .Any(e => ulong.Parse(e.ChannelId) == cid && e.Version == 7u))
+                .Any(e => ulong.Parse(e.ChannelId) == expected && e.Version == 7u))
                 throw new InvalidOperationException($"step 7: {label} must emit ShareStored at v=7");
         }
         foreach (var (label, cid) in new (string, ulong)[] { ("A", cidA), ("B", cidB) })
         {
-            var r = FindReplicaEvent(events, cid)
+            var r = FindReplicaEvent(events, Rk(cid))
                 ?? throw new InvalidOperationException($"step 7 {label}: must observe v=7");
             if (r.Version != 7) throw new InvalidOperationException($"step 7 {label}: expected v=7");
             if (r.Secret.Helpers.Count != 3) throw new InvalidOperationException($"step 7 {label}: helpers must be 3");
@@ -1192,16 +1215,18 @@ internal static class Protocol
         Console.WriteLine("  step 7: pair helper #3 → v=7, secret(h=3,s=2,r=2,shares=3); all 3 helpers ShareStored  ✓");
 
         // Step 8 — pair replica C → v=8, full bootstrap + fresh VSS.
-        PairReplicaHandshake(owner, replicaC, cidC);
-        CrossConfirmFingerprint(owner, replicaC, cidC);
+        rekeyed[cidC] = PairReplicaHandshake(owner, replicaC, cidC);
+        CrossConfirmFingerprint(owner, replicaC, Rk(cidC));
         events = PumpAll(allScope);
+        CaptureRekey(events);
         foreach (var (label, cid) in new (string, ulong)[] { ("helper-1", cidH1), ("helper-2", cidH2), ("helper-3", cidH3) })
         {
+            var expected = Rk(cid);
             if (!events.OfType<ShareStoredEvent>()
-                .Any(e => ulong.Parse(e.ChannelId) == cid && e.Version == 8u))
+                .Any(e => ulong.Parse(e.ChannelId) == expected && e.Version == 8u))
                 throw new InvalidOperationException($"step 8: {label} must emit ShareStored at v=8");
         }
-        var recvC = FindReplicaEvent(events, cidC)
+        var recvC = FindReplicaEvent(events, Rk(cidC))
             ?? throw new InvalidOperationException("step 8: C must observe v=8");
         if (recvC.Version != 8) throw new InvalidOperationException("step 8: C expected v=8");
         if (recvC.Secret.Helpers.Count != 3) throw new InvalidOperationException("step 8 C: helpers must be 3");
@@ -1210,7 +1235,7 @@ internal static class Protocol
         if (recvC.Shares.Count != 3) throw new InvalidOperationException("step 8 C: shares must be 3");
         foreach (var (label, cid) in new (string, ulong)[] { ("A", cidA), ("B", cidB) })
         {
-            var r = FindReplicaEvent(events, cid)
+            var r = FindReplicaEvent(events, Rk(cid))
                 ?? throw new InvalidOperationException($"step 8 {label}: must observe v=8");
             if (r.Version != 8) throw new InvalidOperationException($"step 8 {label}: expected v=8");
             if ((r.Secret.Replicas?.ReplicaList.Count ?? 0) != 3) throw new InvalidOperationException($"step 8 {label}: replicas must be 3");
@@ -1229,7 +1254,7 @@ internal static class Protocol
                 $"expected user_secret_store version={expected}, got {snapshot?.Version}");
     }
 
-    private static void PairReplicaHandshake(Node owner, Node replica, ulong channelId)
+    private static ulong PairReplicaHandshake(Node owner, Node replica, ulong channelId)
     {
         byte[] contact = owner.Protocol.CreateContactAsync(channelId, ContactMode.InlineKeys)
             .GetAwaiter().GetResult();
@@ -1240,12 +1265,24 @@ internal static class Protocol
         }).GetAwaiter().GetResult();
         // Drive just the cryptographic handshake — owner-side
         // PairRequest, replica-side PairResponse, both auto-acked.
+        // Collect PairingCompleted events so we can return the rotated
+        // long-term id both peers converged on at rekey.
+        var handshakeEvents = new List<DeRecEvent>();
         var msgs = replica.Transport.DrainAll();
         foreach (var (_, _, bytes) in msgs)
-            owner.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult();
+            handshakeEvents.AddRange(
+                owner.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult());
         msgs = owner.Transport.DrainAll();
         foreach (var (_, _, bytes) in msgs)
-            replica.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult();
+            handshakeEvents.AddRange(
+                replica.Protocol.ProcessAndAcceptAllAsync(bytes).GetAwaiter().GetResult());
+
+        var completed = handshakeEvents
+            .OfType<PairingCompletedEvent>()
+            .FirstOrDefault(e => ulong.Parse(e.PairingChannelId) == channelId)
+            ?? throw new InvalidOperationException(
+                $"PairReplicaHandshake(cid={channelId}): missing PairingCompleted with matching pairing_channel_id");
+        return ulong.Parse(completed.ChannelId);
     }
 
     private static void CrossConfirmFingerprint(Node owner, Node replica, ulong channelId)
