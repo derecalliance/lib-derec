@@ -385,6 +385,172 @@ pub enum SecretValue {
     PairingContact(ContactMessage),
 }
 
+/// Tag identifying which kind of in-flight orchestrator state an entry in
+/// [`crate::protocol::DeRecStateStore`] holds. Used by
+/// [`crate::protocol::DeRecStateStore::load_all`] to filter by category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StateKind {
+    /// Outstanding [`derec_proto::VerifyShareRequestMessage`], one per
+    /// channel. Load-bearing for the replay-defence binding gate.
+    PendingVerification,
+    /// Recovery accumulator, one per `(secret_id, version)`. Holds every
+    /// [`derec_proto::GetShareResponseMessage`] received so far for that
+    /// reconstruction target.
+    PendingRecovery,
+    /// Outstanding unpair acknowledgement, one per channel. Carries the
+    /// `started_at` unix-seconds timestamp so the orchestrator can time
+    /// out unresponsive peers.
+    PendingUnpair,
+    /// Active sharing round. At most one entry exists per `secret_id`
+    /// (a new `start(ProtectSecret)` overwrites any prior round). Holds
+    /// the per-channel tallies (`pending` / `confirmed` / `failed`) and
+    /// the `started_at` timestamp used to time out unresponsive helpers.
+    SharingRound,
+}
+
+/// Secondary-key selector identifying a single row within a given
+/// [`StateKind`] under a `secret_id`. Passed to
+/// [`crate::protocol::DeRecStateStore::load`] and
+/// [`crate::protocol::DeRecStateStore::remove`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum StateKey {
+    /// Row is scoped to one channel.
+    PendingVerification { channel_id: ChannelId },
+    /// Row is scoped to one reconstruction target.
+    PendingRecovery { version: u32 },
+    /// Row is scoped to one channel.
+    PendingUnpair { channel_id: ChannelId },
+    /// At most one row per `secret_id`. No secondary key.
+    SharingRound,
+}
+
+impl StateKey {
+    /// The [`StateKind`] this key selects. Used by store implementations
+    /// that persist rows in a `(secret_id, kind, secondary_key)` schema.
+    pub fn kind(&self) -> StateKind {
+        match self {
+            StateKey::PendingVerification { .. } => StateKind::PendingVerification,
+            StateKey::PendingRecovery { .. } => StateKind::PendingRecovery,
+            StateKey::PendingUnpair { .. } => StateKind::PendingUnpair,
+            StateKey::SharingRound => StateKind::SharingRound,
+        }
+    }
+}
+
+/// The payload of one row in the [`crate::protocol::DeRecStateStore`].
+///
+/// # Write pattern
+///
+/// The library treats [`crate::protocol::DeRecStateStore::save`] as
+/// **full-replacement upsert** — there is no per-item merge or append
+/// semantic at the store level. Accumulator-style state
+/// ([`StateItem::PendingRecovery`] and [`StateItem::SharingRound`]) grows
+/// via load-modify-save cycles from the library. Backends do not need to
+/// implement any append primitive; a naive replace-on-save is correct.
+#[derive(Debug, Clone)]
+pub enum StateItem {
+    /// The full outstanding [`derec_proto::VerifyShareRequestMessage`] the
+    /// orchestrator sent for this channel. Retained so the corresponding
+    /// inbound [`derec_proto::VerifyShareResponseMessage`] can be validated
+    /// against the exact `(nonce, secret_id, version)` triple that was
+    /// minted at request time.
+    ///
+    /// Overwritten in place by a subsequent `save` for the same
+    /// `(secret_id, channel_id)`; the most recent challenge wins.
+    PendingVerification {
+        channel_id: ChannelId,
+        request: derec_proto::VerifyShareRequestMessage,
+    },
+
+    /// Accumulator for one in-progress recovery target.
+    ///
+    /// The library writes this variant one share at a time as each inbound
+    /// [`derec_proto::GetShareResponseMessage`] arrives. The write sequence
+    /// under a single `(secret_id, version)` is:
+    ///
+    /// 1. First response arrives. Library calls `save` with a `shares`
+    ///    vector containing exactly one element.
+    /// 2. Second response arrives. Library `load`s the accumulator,
+    ///    appends the new share to the returned Vec, and `save`s the
+    ///    grown Vec back.
+    /// 3. …repeat until threshold. On threshold met, library `remove`s
+    ///    the accumulator.
+    ///
+    /// Implementations MUST accept `shares` vectors of any length,
+    /// including one. Every `save` replaces the stored value in place
+    /// with the caller-supplied Vec; no append primitive is required.
+    ///
+    /// # Concurrency
+    ///
+    /// See [`crate::protocol::DeRecStateStore`] for the multi-instance
+    /// concurrency contract. Concurrent inbound shares racing on the same
+    /// accumulator will clobber each other via a naive load-modify-save;
+    /// the application layer is responsible for serializing concurrent
+    /// `process()` calls that touch the same `(secret_id, version)` if
+    /// this matters.
+    PendingRecovery {
+        version: u32,
+        shares: Vec<derec_proto::GetShareResponseMessage>,
+    },
+
+    /// Outstanding unpair acknowledgement window. `started_at` is the
+    /// unix-seconds timestamp stamped when the request was sent; the
+    /// orchestrator sweeps expired entries via
+    /// [`crate::protocol::DeRecStateStore::load_all`].
+    PendingUnpair {
+        channel_id: ChannelId,
+        started_at: u64,
+    },
+
+    /// Active sharing round for `secret_id`. Created by
+    /// `start(ProtectSecret)` and cleared by the orchestrator once every
+    /// targeted helper has responded (confirmed, rejected, or timed
+    /// out). At most one entry exists per `secret_id`; a fresh
+    /// `start(ProtectSecret)` overwrites any prior in-flight round.
+    ///
+    /// `pending` / `confirmed` / `failed` partition the round's target
+    /// channels; the union is invariant across the round's lifetime.
+    /// `started_at` is the unix-seconds timestamp used to time out
+    /// unresponsive helpers.
+    SharingRound {
+        version: u32,
+        pending: std::collections::HashSet<ChannelId>,
+        confirmed: std::collections::HashSet<ChannelId>,
+        failed: std::collections::HashSet<ChannelId>,
+        started_at: u64,
+    },
+}
+
+impl StateItem {
+    /// The [`StateKind`] this item is an instance of.
+    pub fn kind(&self) -> StateKind {
+        match self {
+            StateItem::PendingVerification { .. } => StateKind::PendingVerification,
+            StateItem::PendingRecovery { .. } => StateKind::PendingRecovery,
+            StateItem::PendingUnpair { .. } => StateKind::PendingUnpair,
+            StateItem::SharingRound { .. } => StateKind::SharingRound,
+        }
+    }
+
+    /// The [`StateKey`] identifying this item within its `(secret_id, kind)`
+    /// partition. Convenience so callers don't have to hand-construct a
+    /// key that matches the payload.
+    pub fn key(&self) -> StateKey {
+        match self {
+            StateItem::PendingVerification { channel_id, .. } => StateKey::PendingVerification {
+                channel_id: *channel_id,
+            },
+            StateItem::PendingRecovery { version, .. } => StateKey::PendingRecovery {
+                version: *version,
+            },
+            StateItem::PendingUnpair { channel_id, .. } => StateKey::PendingUnpair {
+                channel_id: *channel_id,
+            },
+            StateItem::SharingRound { .. } => StateKey::SharingRound,
+        }
+    }
+}
+
 /// A single stored share entry, fully self-describing.
 #[derive(Debug, Clone)]
 pub struct Share {

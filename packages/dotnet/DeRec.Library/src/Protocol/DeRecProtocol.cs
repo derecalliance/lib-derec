@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -50,6 +51,11 @@ public sealed class DeRecProtocol : IDisposable
     private readonly NP.UserSecretStoreSaveLatestDelegate _userSecretSaveLatest;
     private readonly NP.UserSecretStoreRemoveDelegate _userSecretRemove;
     private readonly NP.FreeBufferDelegate _userSecretFreeBuffer;
+    private readonly NP.StateStoreSaveDelegate _stateSave;
+    private readonly NP.StateStoreLoadDelegate _stateLoad;
+    private readonly NP.StateStoreRemoveDelegate _stateRemove;
+    private readonly NP.StateStoreLoadAllDelegate _stateLoadAll;
+    private readonly NP.FreeBufferDelegate _stateFreeBuffer;
     private readonly NP.TransportSendDelegate _transportSend;
     // ReSharper restore NotAccessedField.Local
 
@@ -59,6 +65,7 @@ public sealed class DeRecProtocol : IDisposable
     // ReSharper disable PrivateFieldCanBeConvertedToLocalVariable
     private readonly IShareStore _shareStore;
     private readonly IUserSecretStore _userSecretStore;
+    private readonly IStateStore _stateStore;
     private readonly ITransport _transport;
     // ReSharper restore PrivateFieldCanBeConvertedToLocalVariable
 
@@ -81,6 +88,7 @@ public sealed class DeRecProtocol : IDisposable
         IShareStore shareStore,
         ISecretStore secretStore,
         IUserSecretStore userSecretStore,
+        IStateStore stateStore,
         ITransport transport,
         string ownTransportUri,
         string ownTransportProtocol = "https",
@@ -99,6 +107,7 @@ public sealed class DeRecProtocol : IDisposable
         _shareStore = shareStore;
         _secretStore = secretStore;
         _userSecretStore = userSecretStore;
+        _stateStore = stateStore;
         _transport = transport;
 
         _channelLoad = ChannelLoadImpl;
@@ -126,6 +135,12 @@ public sealed class DeRecProtocol : IDisposable
         _userSecretSaveLatest = UserSecretSaveLatestImpl;
         _userSecretRemove = UserSecretRemoveImpl;
         _userSecretFreeBuffer = FreeBufferImpl;
+
+        _stateSave = StateSaveImpl;
+        _stateLoad = StateLoadImpl;
+        _stateRemove = StateRemoveImpl;
+        _stateLoadAll = StateLoadAllImpl;
+        _stateFreeBuffer = FreeBufferImpl;
 
         _transportSend = TransportSendImpl;
 
@@ -167,6 +182,15 @@ public sealed class DeRecProtocol : IDisposable
             Remove = Marshal.GetFunctionPointerForDelegate(_userSecretRemove),
             FreeBuffer = Marshal.GetFunctionPointerForDelegate(_userSecretFreeBuffer),
         };
+        var stateCb = new NP.StateStoreCallbacks
+        {
+            UserData = IntPtr.Zero,
+            Save = Marshal.GetFunctionPointerForDelegate(_stateSave),
+            Load = Marshal.GetFunctionPointerForDelegate(_stateLoad),
+            Remove = Marshal.GetFunctionPointerForDelegate(_stateRemove),
+            LoadAll = Marshal.GetFunctionPointerForDelegate(_stateLoadAll),
+            FreeBuffer = Marshal.GetFunctionPointerForDelegate(_stateFreeBuffer),
+        };
         var transportCb = new NP.TransportCallbacks
         {
             UserData = IntPtr.Zero,
@@ -198,7 +222,7 @@ public sealed class DeRecProtocol : IDisposable
 
         var result = NP.derec_protocol_new(
             secretId,
-            ref channelCb, ref secretCb, ref shareCb, ref userSecretCb, ref transportCb,
+            ref channelCb, ref secretCb, ref shareCb, ref userSecretCb, ref stateCb, ref transportCb,
             uriBytes, (UIntPtr)uriBytes.Length,
             ownProtocolNum,
             (uint)threshold,
@@ -266,17 +290,36 @@ public sealed class DeRecProtocol : IDisposable
 
     /// <summary>
     /// Generate an out-of-band contact message used to bootstrap pairing.
-    /// Pass <paramref name="channelId"/> = <c>null</c> to have the library
-    /// mint the channel id; otherwise supply it explicitly.
+    /// Single entry point for all three <see cref="ContactMode"/> variants.
     /// </summary>
-    public Task<byte[]> CreateContactAsync(ulong? channelId, ContactMode contactMode)
+    /// <param name="channelId"><c>null</c> lets the library mint a random id;
+    /// otherwise the supplied value is used verbatim.</param>
+    /// <param name="contactMode">Mode-selects how the initiator's public
+    /// pairing material is delivered.</param>
+    /// <param name="nonce"><c>null</c> lets the library generate a fresh
+    /// cryptographically-random <c>ulong</c>. Required for
+    /// <see cref="ContactMode.NoKeys"/> where callers typically pick a small
+    /// human-typable value; also valid on the other modes if the app wants
+    /// deterministic control.</param>
+    public Task<byte[]> CreateContactAsync(
+        ulong? channelId,
+        ContactMode contactMode,
+        ulong? nonce = null)
     {
         EnsureNotDisposed();
         uint has = channelId.HasValue ? 1u : 0u;
         ulong id = channelId ?? 0ul;
+        uint hasNonce = nonce.HasValue ? 1u : 0u;
+        ulong nonceValue = nonce ?? 0ul;
         return Task.Run(() =>
         {
-            var result = NP.derec_protocol_create_contact(_handle, has, id, (int)contactMode);
+            var result = NP.derec_protocol_create_contact(
+                _handle,
+                has,
+                id,
+                (int)contactMode,
+                hasNonce,
+                nonceValue);
             try
             {
                 ThrowOnError(result.Error);
@@ -290,18 +333,31 @@ public sealed class DeRecProtocol : IDisposable
     }
 
     /// <summary>
-    /// Kick off a new flow. Returns the freshly minted channel id for
-    /// <see cref="FlowKind.Pairing"/>, <c>null</c> otherwise.
+    /// Kick off a new flow. Returns the per-target
+    /// <c>*Started</c> / <c>*Failed</c> events describing what was
+    /// dispatched — for <see cref="FlowKind.Pairing"/> a single
+    /// <see cref="PairingStartedEvent"/> (its <c>ChannelId</c> is the
+    /// freshly minted long-term id); for fan-out flows one event per
+    /// targeted channel.
     /// </summary>
-    public Task<ulong?> StartAsync(FlowKind flowKind, object @params)
+    public Task<IReadOnlyList<DeRecEvent>> StartAsync(FlowKind flowKind, object @params)
     {
         EnsureNotDisposed();
         byte[] json = JsonSerializer.SerializeToUtf8Bytes(@params, JsonOpts);
-        return Task.Run<ulong?>(() =>
+        return Task.Run<IReadOnlyList<DeRecEvent>>(() =>
         {
             var result = NP.derec_protocol_start(_handle, (uint)flowKind, json, (UIntPtr)json.Length);
-            ThrowOnError(result.Error);
-            return result.HasChannelId != 0 ? result.ChannelId : null;
+            try
+            {
+                ThrowOnError(result.Error);
+                byte[] eventsJson = DeRec.Library.Utils.CopyBuffer(result.EventsJson);
+                return JsonSerializer.Deserialize<List<DeRecEvent>>(eventsJson, JsonOpts)
+                    ?? new List<DeRecEvent>();
+            }
+            finally
+            {
+                DeRec.Library.Utils.FreeBuffer(result.EventsJson);
+            }
         });
     }
 
@@ -406,15 +462,25 @@ public sealed class DeRecProtocol : IDisposable
     /// <see cref="DeRecCode.RestoreConflict"/>, <see cref="DeRecCode.Invariant"/>,
     /// or a store-category code on failure.
     /// </exception>
-    public Task RestoreAsync(Secret recoveredSecret, uint version)
+    public Task<IReadOnlyList<DeRecEvent>> RestoreAsync(Secret recoveredSecret, uint version)
     {
         EnsureNotDisposed();
         var dto = new RestoreParamsDto { Version = version, RecoveredSecret = recoveredSecret };
         byte[] json = JsonSerializer.SerializeToUtf8Bytes(dto, JsonOpts);
-        return Task.Run(() =>
+        return Task.Run<IReadOnlyList<DeRecEvent>>(() =>
         {
-            var err = NP.derec_protocol_restore(_handle, json, (UIntPtr)json.Length);
-            ThrowOnError(err);
+            var result = NP.derec_protocol_restore(_handle, json, (UIntPtr)json.Length);
+            try
+            {
+                ThrowOnError(result.Error);
+                byte[] eventsJson = DeRec.Library.Utils.CopyBuffer(result.EventsJson);
+                return JsonSerializer.Deserialize<List<DeRecEvent>>(eventsJson, JsonOpts)
+                    ?? new List<DeRecEvent>();
+            }
+            finally
+            {
+                DeRec.Library.Utils.FreeBuffer(result.EventsJson);
+            }
         });
     }
 
@@ -798,6 +864,163 @@ public sealed class DeRecProtocol : IDisposable
 
     private sealed record UserSecretsDto(uint version, UserSecretDto[] secrets, string? description);
     private sealed record UserSecretDto(byte[] id, string name, byte[] data);
+
+    // Wire shape matches Rust `StateItemRecord` — snake_case field names, byte[]
+    // as JSON number arrays via ByteArrayJsonNumberConverter.
+    private sealed record StateItemDto(
+        uint kind,
+        string? channel_id,
+        uint? version,
+        string? started_at,
+        byte[]? bytes,
+        byte[][]? shares,
+        string[]? pending,
+        string[]? confirmed,
+        string[]? failed);
+
+    // Wire shape matches Rust `StateKeyRecord`.
+    private sealed record StateKeyDto(
+        uint kind,
+        string? channel_id,
+        uint? version);
+
+    private static StateItemDto ToDto(StateItem item) => new(
+        (uint)item.Kind,
+        item.ChannelId?.ToString(),
+        item.Version,
+        item.StartedAt?.ToString(),
+        item.Bytes,
+        item.Shares,
+        item.Pending?.Select(c => c.ToString()).ToArray(),
+        item.Confirmed?.Select(c => c.ToString()).ToArray(),
+        item.Failed?.Select(c => c.ToString()).ToArray());
+
+    private static StateItem FromDto(StateItemDto dto)
+    {
+        var kind = (StateKind)dto.kind;
+        ulong? channelId = dto.channel_id is null
+            ? null
+            : ulong.Parse(dto.channel_id, System.Globalization.CultureInfo.InvariantCulture);
+        ulong? startedAt = dto.started_at is null
+            ? null
+            : ulong.Parse(dto.started_at, System.Globalization.CultureInfo.InvariantCulture);
+        ulong[]? pending = dto.pending?
+            .Select(s => ulong.Parse(s, System.Globalization.CultureInfo.InvariantCulture))
+            .ToArray();
+        ulong[]? confirmed = dto.confirmed?
+            .Select(s => ulong.Parse(s, System.Globalization.CultureInfo.InvariantCulture))
+            .ToArray();
+        ulong[]? failed = dto.failed?
+            .Select(s => ulong.Parse(s, System.Globalization.CultureInfo.InvariantCulture))
+            .ToArray();
+        return new StateItem(
+            kind, channelId, dto.version, startedAt, dto.bytes, dto.shares,
+            pending, confirmed, failed);
+    }
+
+    private static StateKey ParseKeyBuffer(IntPtr ptr, UIntPtr len)
+    {
+        byte[] buf = new byte[(int)len];
+        Marshal.Copy(ptr, buf, 0, buf.Length);
+        var dto = JsonSerializer.Deserialize<StateKeyDto>(buf, JsonOpts)
+            ?? throw new InvalidOperationException("null StateKey");
+        var kind = (StateKind)dto.kind;
+        return kind switch
+        {
+            StateKind.PendingVerification => StateKey.PendingVerification(
+                ulong.Parse(dto.channel_id
+                    ?? throw new InvalidOperationException("PendingVerification requires channel_id"),
+                    System.Globalization.CultureInfo.InvariantCulture)),
+            StateKind.PendingRecovery => StateKey.PendingRecovery(
+                dto.version
+                    ?? throw new InvalidOperationException("PendingRecovery requires version")),
+            StateKind.PendingUnpair => StateKey.PendingUnpair(
+                ulong.Parse(dto.channel_id
+                    ?? throw new InvalidOperationException("PendingUnpair requires channel_id"),
+                    System.Globalization.CultureInfo.InvariantCulture)),
+            StateKind.SharingRound => StateKey.SharingRound(),
+            _ => throw new InvalidOperationException($"unknown StateKind: {dto.kind}"),
+        };
+    }
+
+    private int StateSaveImpl(
+        IntPtr userData, ulong secretId, IntPtr itemJsonPtr, UIntPtr itemJsonLen)
+    {
+        try
+        {
+            byte[] buf = new byte[(int)itemJsonLen];
+            Marshal.Copy(itemJsonPtr, buf, 0, buf.Length);
+            var dto = JsonSerializer.Deserialize<StateItemDto>(buf, JsonOpts)
+                ?? throw new InvalidOperationException("null StateItem");
+            _stateStore.Save(secretId, FromDto(dto));
+            return 0;
+        }
+        catch { return -1; }
+    }
+
+    private int StateLoadImpl(
+        IntPtr userData, ulong secretId,
+        IntPtr keyJsonPtr, UIntPtr keyJsonLen,
+        out IntPtr outPtr, out UIntPtr outLen)
+    {
+        try
+        {
+            var key = ParseKeyBuffer(keyJsonPtr, keyJsonLen);
+            var item = _stateStore.Load(secretId, key);
+            if (item is null)
+            {
+                outPtr = IntPtr.Zero;
+                outLen = UIntPtr.Zero;
+                return 1;
+            }
+            byte[] json = JsonSerializer.SerializeToUtf8Bytes(ToDto(item), JsonOpts);
+            return WriteOut(json, out outPtr, out outLen);
+        }
+        catch
+        {
+            outPtr = IntPtr.Zero;
+            outLen = UIntPtr.Zero;
+            return -1;
+        }
+    }
+
+    private int StateRemoveImpl(
+        IntPtr userData, ulong secretId,
+        IntPtr keyJsonPtr, UIntPtr keyJsonLen,
+        out uint outRemoved)
+    {
+        try
+        {
+            var key = ParseKeyBuffer(keyJsonPtr, keyJsonLen);
+            outRemoved = _stateStore.Remove(secretId, key) ? 1u : 0u;
+            return 0;
+        }
+        catch
+        {
+            outRemoved = 0;
+            return -1;
+        }
+    }
+
+    private int StateLoadAllImpl(
+        IntPtr userData, ulong secretId, uint kind,
+        out IntPtr outPtr, out UIntPtr outLen)
+    {
+        try
+        {
+            var items = _stateStore.LoadAll(secretId, (StateKind)kind)
+                .Select(ToDto)
+                .ToArray();
+            byte[] json = JsonSerializer.SerializeToUtf8Bytes(items, JsonOpts);
+            return WriteOut(json, out outPtr, out outLen);
+        }
+        catch
+        {
+            outPtr = IntPtr.Zero;
+            outLen = UIntPtr.Zero;
+            return -1;
+        }
+    }
 
     private static T[]? DeserializeJsonArray<T>(IntPtr ptr, UIntPtr len)
     {

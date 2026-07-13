@@ -53,30 +53,40 @@ public static partial class Pairing
 
         /// <summary>
         /// Creates an out-of-band <see cref="ContactMessage"/> to bootstrap pairing.
+        /// Single entry point for all three <see cref="ContactMode"/> variants.
         /// </summary>
         /// <param name="channelId">Identifier for the local pairing session.</param>
         /// <param name="contactMode">
         /// <see cref="ContactMode.InlineKeys"/> embeds the keys directly;
         /// <see cref="ContactMode.HashedKeys"/> embeds only a SHA-384 commitment
-        /// and the scanner must complete a <c>PrePair</c> round-trip first. For
-        /// <see cref="ContactMode.HashedKeys"/> the <paramref name="transportProtocol"/>
-        /// MUST be ephemeral.
+        /// and the scanner must complete a <c>PrePair</c> round-trip first;
+        /// <see cref="ContactMode.NoKeys"/> carries no keys — the creator
+        /// generates them on the fly when the <c>PrePairRequest</c> arrives
+        /// (only appropriate when the OOB delivery channel is fully trusted).
         /// </param>
         /// <param name="transportProtocol">Endpoint the scanner uses to reach this initiator.</param>
+        /// <param name="nonce"><c>null</c> lets the library generate a fresh
+        /// random <c>ulong</c>. Required for <see cref="ContactMode.NoKeys"/>
+        /// where callers typically pick a small human-typable value.</param>
         public static CreateContactResult CreateContact(
             ulong channelId,
             ContactMode contactMode,
-            TransportProtocol transportProtocol
+            TransportProtocol transportProtocol,
+            ulong? nonce = null
         )
         {
             byte[] transportProtocolBytes = transportProtocol.ToProtoBytes();
+            uint hasNonce = nonce.HasValue ? 1u : 0u;
+            ulong nonceValue = nonce ?? 0ul;
 
             Native.Pairing.CreateContactMessageResult nativeResult =
                 Native.Pairing.create_contact_message(
                     channelId,
                     (int)contactMode,
                     transportProtocolBytes,
-                    (UIntPtr)transportProtocolBytes.Length
+                    (UIntPtr)transportProtocolBytes.Length,
+                    hasNonce,
+                    nonceValue
                 );
 
             try
@@ -85,6 +95,8 @@ public static partial class Pairing
                 return new CreateContactResult
                 {
                     ContactMessage = ContactMessage.FromProtoBytes(Utils.CopyBuffer(nativeResult.ContactWireBytes)),
+                    // Empty for NoKeys (no key material at contact-creation
+                    // time); populated for InlineKeys / HashedKeys.
                     SecretKeyMaterial = Utils.CopyBuffer(nativeResult.SecretKeyMaterial),
                 };
             }

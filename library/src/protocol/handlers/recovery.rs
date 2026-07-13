@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::super::{
-    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport,
-    MissingPolicy, PendingAction, PendingRecovery, SecretKind, SecretValue,
+    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecStateStore,
+    DeRecTransport, MissingPolicy, PendingAction, SecretKind, SecretValue,
 };
 use crate::{
     Error, Result,
     derec_message::current_timestamp,
     primitives::recovery::{RecoveryError, request, response},
+    protocol::types::{StateItem, StateKey},
     types::{ChannelId, SharedKey},
 };
 use derec_proto::{
@@ -20,19 +21,20 @@ use prost::Message;
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
 )]
-pub(in crate::protocol) fn handle(
-    pending_recovery: &mut PendingRecovery,
+pub(in crate::protocol) async fn handle<St: DeRecStateStore>(
+    state_store: &mut St,
     channel_id: ChannelId,
     inner: MessageBody,
     shared_key: SharedKey,
     inbound_trace_id: u64,
+    secret_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
     match inner {
         MessageBody::GetShareRequest(request) => {
             on_request(channel_id, request, shared_key, inbound_trace_id)
         }
         MessageBody::GetShareResponse(response) => {
-            on_response(pending_recovery, channel_id, &response)
+            on_response(state_store, secret_id, channel_id, &response).await
         }
         _ => Err(Error::Invariant(
             "unexpected MessageBody variant in recovery handler",
@@ -48,17 +50,26 @@ pub(in crate::protocol) fn handle(
 pub(in crate::protocol) async fn start<
     Ch: DeRecChannelStore,
     Ss: DeRecSecretStore,
+    St: DeRecStateStore,
     T: DeRecTransport,
 >(
     channel_store: &mut Ch,
     secret_store: &mut Ss,
+    state_store: &mut St,
     transport: &T,
-    pending_recovery: &mut PendingRecovery,
     secret_id: u64,
     version: u32,
     reply_to: Option<derec_proto::TransportProtocol>,
-) -> Result<()> {
-    pending_recovery.insert((secret_id, version), Vec::new());
+) -> Result<Vec<DeRecEvent>> {
+    state_store
+        .save(
+            secret_id,
+            StateItem::PendingRecovery {
+                version,
+                shares: Vec::new(),
+            },
+        )
+        .await?;
 
     let all_channels = channel_store.channels(secret_id).await?;
     let channel_ids: Vec<ChannelId> = all_channels.iter().map(|c| c.id).collect();
@@ -77,28 +88,52 @@ pub(in crate::protocol) async fn start<
         })
         .collect();
 
+    let mut events = Vec::with_capacity(all_channels.len());
     for channel in all_channels {
         let shared_key = keys
             .remove(&channel.id)
             .expect("load_many(MissingPolicy::Fail) guarantees an entry per id");
 
-        let msg = request::produce(
+        match dispatch_one(
+            transport,
             channel.id,
+            &channel.transport,
             secret_id,
             version,
             &shared_key,
             reply_to.clone(),
-        )?;
-        let envelope = super::apply_trace_id(msg.envelope, super::fresh_trace_id())?;
-        transport.send(&channel.transport, envelope).await?;
-
-        #[cfg(feature = "logging")]
-        tracing::debug!(
-            channel_id = channel.id.0,
-            secret_id,
-            version,
-            "share request sent"
-        );
+        )
+        .await
+        {
+            Ok(()) => {
+                events.push(DeRecEvent::RecoverSecretStarted {
+                    channel_id: channel.id,
+                    version,
+                });
+                #[cfg(feature = "logging")]
+                tracing::debug!(
+                    channel_id = channel.id.0,
+                    secret_id,
+                    version,
+                    "share request sent"
+                );
+            }
+            Err(e) => {
+                events.push(DeRecEvent::RecoverSecretFailed {
+                    channel_id: channel.id,
+                    version,
+                    error: e.to_string(),
+                });
+                #[cfg(feature = "logging")]
+                tracing::warn!(
+                    channel_id = channel.id.0,
+                    secret_id,
+                    version,
+                    error = %e,
+                    "share request dispatch failed"
+                );
+            }
+        }
     }
 
     #[cfg(feature = "logging")]
@@ -108,6 +143,23 @@ pub(in crate::protocol) async fn start<
         "share requests dispatched to all helpers"
     );
 
+    Ok(events)
+}
+
+/// Send a single recovery share request; failure isolated so [`start`]
+/// can surface it as a per-channel `RecoverSecretFailed` event.
+async fn dispatch_one<T: DeRecTransport>(
+    transport: &T,
+    channel_id: ChannelId,
+    endpoint: &derec_proto::TransportProtocol,
+    secret_id: u64,
+    version: u32,
+    shared_key: &SharedKey,
+    reply_to: Option<derec_proto::TransportProtocol>,
+) -> Result<()> {
+    let msg = request::produce(channel_id, secret_id, version, shared_key, reply_to)?;
+    let envelope = super::apply_trace_id(msg.envelope, super::fresh_trace_id())?;
+    transport.send(endpoint, envelope).await?;
     Ok(())
 }
 
@@ -122,6 +174,7 @@ pub(in crate::protocol) async fn start<
         )
     )
 )]
+#[allow(clippy::too_many_arguments)]
 pub(in crate::protocol) async fn accept<
     Ch: DeRecChannelStore,
     Sh: DeRecShareStore,
@@ -183,6 +236,7 @@ pub(in crate::protocol) async fn accept<
         )
     )
 )]
+#[allow(clippy::too_many_arguments)]
 pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport>(
     channel_store: &mut Ch,
     transport: &T,
@@ -258,28 +312,42 @@ fn on_request(
         )
     )
 )]
-fn on_response(
-    pending_recovery: &mut PendingRecovery,
+async fn on_response<St: DeRecStateStore>(
+    state_store: &mut St,
+    secret_id: u64,
     channel_id: ChannelId,
     response: &GetShareResponseMessage,
 ) -> Result<Vec<DeRecEvent>> {
-    let key = (response.secret_id, response.version);
-    let (secret_id, version) = key;
+    if response.secret_id != secret_id {
+        return Err(Error::Invariant(
+            "GetShareResponse.secret_id does not match protocol secret_id",
+        ));
+    }
+    let version = response.version;
+    let state_key = StateKey::PendingRecovery { version };
 
-    let Some(bucket) = pending_recovery.get_mut(&key) else {
-        #[cfg(feature = "logging")]
-        tracing::debug!(
-            channel_id = channel_id.0,
-            secret_id,
-            version,
-            "recovery response has no matching pending recovery; dropping"
-        );
-        return Ok(vec![DeRecEvent::NoOp]);
+    let mut shares = match state_store.load(secret_id, state_key.clone()).await? {
+        Some(StateItem::PendingRecovery { shares, .. }) => shares,
+        Some(_) => {
+            return Err(Error::Invariant(
+                "state store returned wrong StateItem variant for PendingRecovery key",
+            ));
+        }
+        None => {
+            #[cfg(feature = "logging")]
+            tracing::debug!(
+                channel_id = channel_id.0,
+                secret_id,
+                version,
+                "recovery response has no matching pending recovery; dropping"
+            );
+            return Ok(vec![DeRecEvent::NoOp]);
+        }
     };
 
-    bucket.push(response.clone());
-    let shares_received = bucket.len();
-    let inputs: Vec<&GetShareResponseMessage> = bucket.iter().collect();
+    shares.push(response.clone());
+    let shares_received = shares.len();
+    let inputs: Vec<&GetShareResponseMessage> = shares.iter().collect();
 
     let event = match response::recover(secret_id, version, &inputs) {
         Ok(result) => {
@@ -316,7 +384,7 @@ fn on_response(
                 }
             };
 
-            pending_recovery.remove(&key);
+            state_store.remove(secret_id, state_key).await?;
 
             #[cfg(feature = "logging")]
             tracing::info!(
@@ -337,6 +405,15 @@ fn on_response(
                 derec_cryptography::vss::DerecVSSError::InsufficientShares
             ) =>
         {
+            // Persist the appended share so the next inbound response
+            // sees the accumulator grow.
+            state_store
+                .save(
+                    secret_id,
+                    StateItem::PendingRecovery { version, shares },
+                )
+                .await?;
+
             #[cfg(feature = "logging")]
             tracing::debug!(
                 channel_id = channel_id.0,
@@ -352,6 +429,15 @@ fn on_response(
             }
         }
         Err(e) => {
+            // Persist the appended share so a subsequent inbound
+            // response can retry reconstruction with a fuller set.
+            state_store
+                .save(
+                    secret_id,
+                    StateItem::PendingRecovery { version, shares },
+                )
+                .await?;
+
             #[cfg(feature = "logging")]
             tracing::warn!(
                 channel_id = channel_id.0,

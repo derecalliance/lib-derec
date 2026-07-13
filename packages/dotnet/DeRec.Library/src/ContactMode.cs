@@ -19,6 +19,17 @@ namespace DeRec.Library;
 /// constructing the pairing request. The transport endpoint used during this
 /// flow MUST be ephemeral — the <c>PrePair</c> messages are plaintext.
 /// </para>
+/// <para>
+/// <see cref="NoKeys"/> carries no key material and no commitment — only
+/// <c>channelId</c>, <c>nonce</c>, and <c>transportProtocol</c>. Small enough
+/// to be hand-typed or dictated. Keys are generated on the fly by the contact
+/// creator when the corresponding <c>PrePairRequest</c> arrives; the scanner
+/// accepts them without cryptographic verification. Trust rests entirely on
+/// the out-of-band delivery channel being fully trusted (e.g. a verified
+/// email from an already-KYC-authenticated institution). Applications MUST
+/// rate-limit inbound <c>PrePairRequest</c>s per channel and expire
+/// outstanding NoKeys contacts on a short timer.
+/// </para>
 /// </remarks>
 public enum ContactMode
 {
@@ -30,4 +41,11 @@ public enum ContactMode
     /// <c>PrePair</c>.
     /// </summary>
     HashedKeys = 1,
+
+    /// <summary>
+    /// No key material or binding hash embedded. Keys are generated on the
+    /// fly by the contact creator when the <c>PrePairRequest</c> arrives;
+    /// trust rests entirely on a fully-trusted out-of-band delivery channel.
+    /// </summary>
+    NoKeys = 2,
 }

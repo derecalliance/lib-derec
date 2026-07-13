@@ -16,6 +16,7 @@ import type {
   SecretStore,
   Share,
   ShareStore,
+  StateStore,
   Transport,
   UserSecretStore,
   UserSecrets,
@@ -240,6 +241,49 @@ class InMemoryUserSecretStore implements UserSecretStore {
 }
 
 
+// Rows are keyed by `(secretId, kind, channel_id, version)` — extracted
+// from the JSON blob so `loadAll(kind)` can filter without decoding
+// every stored entry.
+class InMemoryStateStore implements StateStore {
+  private readonly data = new Map<string, Uint8Array>();
+
+  private compositeKey(
+    secretId: string,
+    rec: { kind: number; channel_id?: string; version?: number },
+  ): string {
+    return `${secretId}:${rec.kind}:${rec.channel_id ?? ""}:${rec.version ?? ""}`;
+  }
+
+  private parseBlob(bytes: Uint8Array): { kind: number; channel_id?: string; version?: number } {
+    return JSON.parse(new TextDecoder().decode(bytes));
+  }
+
+  async save(secretId: string, itemJson: Uint8Array): Promise<void> {
+    const rec = this.parseBlob(itemJson);
+    this.data.set(this.compositeKey(secretId, rec), itemJson);
+  }
+
+  async load(secretId: string, keyJson: Uint8Array): Promise<Uint8Array | null> {
+    const rec = this.parseBlob(keyJson);
+    return this.data.get(this.compositeKey(secretId, rec)) ?? null;
+  }
+
+  async remove(secretId: string, keyJson: Uint8Array): Promise<boolean> {
+    const rec = this.parseBlob(keyJson);
+    return this.data.delete(this.compositeKey(secretId, rec));
+  }
+
+  async loadAll(secretId: string, kind: 0 | 1 | 2 | 3): Promise<Uint8Array[]> {
+    const prefix = `${secretId}:${kind}:`;
+    const out: Uint8Array[] = [];
+    for (const [k, v] of this.data.entries()) {
+      if (k.startsWith(prefix)) out.push(v);
+    }
+    return out;
+  }
+}
+
+
 interface OutboundMessage {
   endpoint: { protocol: string; uri: string };
   message: Uint8Array;
@@ -269,6 +313,7 @@ interface Node {
   shareStore: InMemoryShareStore;
   secretStore: InMemorySecretStore;
   userSecretStore: InMemoryUserSecretStore;
+  stateStore: InMemoryStateStore;
 }
 
 const THRESHOLD = 2;
@@ -290,12 +335,14 @@ function makeNode(
   const shareStore = new InMemoryShareStore();
   const secretStore = new InMemorySecretStore();
   const userSecretStore = new InMemoryUserSecretStore();
+  const stateStore = new InMemoryStateStore();
   const transport = new RecordingTransport();
   let builder = new DeRecProtocolBuilder(options.secretId ?? DEFAULT_TEST_SECRET_ID)
     .withChannelStore(channelStore)
     .withShareStore(shareStore)
     .withSecretStore(secretStore)
     .withUserSecretStore(userSecretStore)
+    .withStateStore(stateStore)
     .withTransport(transport)
     .withOwnTransport({ uri: endpointUri, protocol: "https" })
     .withThreshold(options.threshold ?? THRESHOLD)
@@ -311,7 +358,7 @@ function makeNode(
     builder = builder.withReplicaId(options.replicaId);
   }
   const protocol = builder.build();
-  return { protocol, transport, channelStore, shareStore, secretStore, userSecretStore };
+  return { protocol, transport, channelStore, shareStore, secretStore, userSecretStore, stateStore };
 }
 
 
@@ -383,13 +430,28 @@ async function doPair(
     `  [${label}/ContactCreator] createContact channel_id=${contact.channel_id}`,
   );
 
-  await initiator.protocol.start(FlowKind.Pairing, {
+  const startEvents = await initiator.protocol.start(FlowKind.Pairing, {
     kind: SenderKind.Owner,
     contact,
   });
+  const startPairing = requireEvent(
+    startEvents,
+    "PairingStarted",
+    `${label}/Initiator`,
+  );
+  if (String(startPairing.channel_id) !== String(contact.channel_id)) {
+    throw new Error(
+      `${label}/Initiator: PairingStarted.channel_id ${startPairing.channel_id} must echo contact.channel_id ${contact.channel_id}`,
+    );
+  }
+  if (startPairing.kind !== SenderKind.Owner) {
+    throw new Error(
+      `${label}/Initiator: PairingStarted.kind must equal the requested local role (Owner), got ${startPairing.kind}`,
+    );
+  }
   const pairRequest = drainOne(initiator, `${label}/Initiator`);
   console.log(
-    `  [${label}/Initiator]     start(Pairing, kind=Owner) → PairRequest ${pairRequest.length}B`,
+    `  [${label}/Initiator]     start(Pairing, kind=Owner) → PairingStarted(channel_id=${startPairing.channel_id}) PairRequest ${pairRequest.length}B`,
   );
 
   const creatorEvents = await processAll(contactCreator, pairRequest);
@@ -918,7 +980,7 @@ async function runUnpairingFlow(): Promise<void> {
 
   // Initiate unpair on the Owner side.
   await owner.protocol.start(FlowKind.Unpair, {
-    target: channelId,
+    channel_id: channelId.toString(),
     memo: "decommissioning",
   });
   const unpairRequest = drainOne(owner, "Owner");

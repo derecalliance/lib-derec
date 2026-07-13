@@ -163,7 +163,7 @@ pub fn produce(
 /// let channel_id = ChannelId(42);
 /// let shared_key = [7u8; 32];
 ///
-/// let request::ProduceResult { envelope } = request::produce(channel_id, &shared_key)
+/// let request::ProduceResult { envelope } = request::produce(channel_id, &shared_key, None)
 ///     .expect("failed to build discovery request");
 ///
 /// let request::ExtractResult { request } = request::extract(&envelope, &shared_key)

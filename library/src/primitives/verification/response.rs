@@ -79,8 +79,8 @@ pub struct ExtractResult {
 /// let shared_key = [7u8; 32];
 ///
 /// // Owner: issue a verification challenge.
-/// let request::ProduceResult { envelope: req_envelope } =
-///     request::produce(channel_id, 1, 1, &shared_key).expect("produce request failed");
+/// let request::ProduceResult { envelope: req_envelope, .. } =
+///     request::produce(channel_id, 1, 1, &shared_key, None).expect("produce request failed");
 ///
 /// // Helper: extract the challenge and answer it with the share bytes.
 /// let request::ExtractResult { request: challenge } =
@@ -190,8 +190,8 @@ pub fn produce(
 /// let share_content = b"the share bytes the Helper stores";
 ///
 /// // Owner: issue a verification challenge.
-/// let request::ProduceResult { envelope: req_envelope } =
-///     request::produce(channel_id, 1, 1, &shared_key).expect("produce request failed");
+/// let request::ProduceResult { envelope: req_envelope, .. } =
+///     request::produce(channel_id, 1, 1, &shared_key, None).expect("produce request failed");
 ///
 /// // Helper: extract the challenge and answer it.
 /// let request::ExtractResult { request: challenge } =

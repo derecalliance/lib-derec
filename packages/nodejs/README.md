@@ -211,9 +211,11 @@ The orchestrator handles the whole chain automatically:
   response and routes it), or `protocol.reject(action, status, memo)` to
   refuse.
 - **Scanner** — `protocol.start(FlowKind.Pairing, { kind, contact })` kicks
-  off the plaintext PrePair leg. On success, no event surfaces and the
-  scanner auto-proceeds to `PairRequest`; the application sees
-  `PairingCompleted` only when the final response lands. Failure modes:
+  off the plaintext PrePair leg. `start()` returns a `DeRecEvent[]`
+  containing one `PairingStarted { channel_id, kind }` event that
+  describes the dispatched handshake; the scanner auto-proceeds to
+  `PairRequest`, and the application sees `PairingCompleted` only when
+  the final response lands via `process()`. Failure modes:
     - Contact creator rejected → `DeRecEvent` with
       `type: "PrePairRejected"`, plus `status` / `memo`.
     - Binding-hash mismatch → `protocol.process(...)` throws a

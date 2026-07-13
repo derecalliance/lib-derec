@@ -63,7 +63,7 @@ enum SenderKind {
 //
 // - The initiator MUST have received a valid ContactMessage from the responder
 // - The initiator MUST use the responder's public encryption material from
-//   the ContactMessage to construct this request
+//  the ContactMessage to construct this request
 //
 // # Purpose
 //
@@ -170,14 +170,14 @@ message PairRequestMessage {
 // # Differences from PairRequestMessage
 //
 // - Does not include encryption public keys, as those were already exchanged
-//   via ContactMessage and PairRequestMessage
+//  via ContactMessage and PairRequestMessage
 // - Includes a Result field indicating success or failure
 //
 // # Semantics
 //
 // - If `result` indicates success, a secure channel is considered established
 // - If `result` indicates failure, the pairing MUST be treated as unsuccessful
-//   and no further protocol messages should be exchanged on this channel
+//  and no further protocol messages should be exchanged on this channel
 //
 // The nonce MUST match the value provided in the request, ensuring that the
 // response corresponds to the same pairing session.
@@ -227,11 +227,13 @@ message PairResponseMessage {
   //
   // The responder computes:
   //
-  //     channelId = u64::from_be_bytes(
-  //         SHA-384(
-  //             u64_be(originalChannelId) || sharedKeyBytes
-  //         )[0..8]
-  //     )
+  // ```text
+  // channelId = u64::from_be_bytes(
+  //     SHA-384(
+  //         u64_be(originalChannelId) || sharedKeyBytes
+  //     )[0..8]
+  // )
+  // ```
   //
   // where `originalChannelId` is the channelId from the contact / pairing
   // envelopes and `sharedKeyBytes` is the freshly-derived pairing shared

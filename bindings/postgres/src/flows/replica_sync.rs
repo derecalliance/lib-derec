@@ -146,7 +146,7 @@ pub async fn run() {
     assert_eq!(received_a.version, 1);
     assert_eq!(received_a.secret.helpers.len(), 0);
     assert_eq!(received_a.secret.secrets.len(), 0);
-    assert_eq!(received_a.secret.replicas.len(), 1);
+    assert_eq!(received_a.secret.replicas.as_ref().unwrap().replicas.len(), 1);
     assert_eq!(received_a.shares.len(), 0);
     assert_eq!(latest_version(&owner).await, Some(1));
     println!("  step 1: pair replica A → v=1, secret(h=0,s=0,r=1,shares=0)  ✓");
@@ -172,7 +172,7 @@ pub async fn run() {
     assert_eq!(received_a.secret.helpers.len(), 0);
     assert_eq!(received_a.secret.secrets.len(), 1);
     assert_eq!(received_a.secret.secrets[0].data, s1.data);
-    assert_eq!(received_a.secret.replicas.len(), 1);
+    assert_eq!(received_a.secret.replicas.as_ref().unwrap().replicas.len(), 1);
     assert_eq!(received_a.shares.len(), 0);
     assert_eq!(latest_version(&owner).await, Some(2));
     println!("  step 2: ProtectSecret([s1]) → v=2, secret(h=0,s=1,r=1,shares=0)  ✓");
@@ -190,7 +190,7 @@ pub async fn run() {
         assert_eq!(received.secret.helpers.len(), 0);
         assert_eq!(received.secret.secrets.len(), 1, "{label}: bag carries s1");
         assert_eq!(received.secret.secrets[0].data, s1.data);
-        assert_eq!(received.secret.replicas.len(), 2);
+        assert_eq!(received.secret.replicas.as_ref().unwrap().replicas.len(), 2);
         assert_eq!(received.shares.len(), 0);
     }
     assert_eq!(latest_version(&owner).await, Some(3));
@@ -220,7 +220,7 @@ pub async fn run() {
         assert_eq!(received.version, 4);
         assert_eq!(received.secret.helpers.len(), 1);
         assert_eq!(received.secret.secrets.len(), 1);
-        assert_eq!(received.secret.replicas.len(), 2);
+        assert_eq!(received.secret.replicas.as_ref().unwrap().replicas.len(), 2);
         assert_eq!(received.shares.len(), 0);
     }
     assert_eq!(latest_version(&owner).await, Some(4));
@@ -320,7 +320,7 @@ pub async fn run() {
         assert_eq!(received.version, 7);
         assert_eq!(received.secret.helpers.len(), 3);
         assert_eq!(received.secret.secrets.len(), 2);
-        assert_eq!(received.secret.replicas.len(), 2);
+        assert_eq!(received.secret.replicas.as_ref().unwrap().replicas.len(), 2);
         assert_eq!(received.shares.len(), 3);
     }
     assert_eq!(latest_version(&owner).await, Some(7));
@@ -352,13 +352,13 @@ pub async fn run() {
     assert_eq!(received_c.version, 8);
     assert_eq!(received_c.secret.helpers.len(), 3);
     assert_eq!(received_c.secret.secrets.len(), 2);
-    assert_eq!(received_c.secret.replicas.len(), 3);
+    assert_eq!(received_c.secret.replicas.as_ref().unwrap().replicas.len(), 3);
     assert_eq!(received_c.shares.len(), 3);
     for (label, cid) in [("A", cid_a), ("B", cid_b)] {
         let received = find_replica_event(&events, cid)
             .unwrap_or_else(|| panic!("step 8: replica {label} must observe v=8"));
         assert_eq!(received.version, 8);
-        assert_eq!(received.secret.replicas.len(), 3);
+        assert_eq!(received.secret.replicas.as_ref().unwrap().replicas.len(), 3);
     }
     assert_eq!(latest_version(&owner).await, Some(8));
     println!(
@@ -385,7 +385,7 @@ async fn pair_replica_handshake(
 ) {
     let contact = owner
         .protocol
-        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys)
+        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys, None)
         .await
         .expect("owner.create_contact failed");
     replica
@@ -424,7 +424,7 @@ async fn cross_confirm_fingerprint(
 async fn helper_start_pair(owner: &mut Peer, helper: &mut Peer, channel_id: ChannelId) {
     let contact = owner
         .protocol
-        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys)
+        .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys, None)
         .await
         .expect("owner.create_contact failed");
     helper

@@ -58,14 +58,14 @@ pub(in crate::protocol) async fn start<
     target: Target,
     communication_info: Option<HashMap<String, String>>,
     transport_protocol: Option<TransportProtocol>,
-) -> Result<()> {
+) -> Result<Vec<DeRecEvent>> {
     if communication_info.is_none() && transport_protocol.is_none() {
         return Err(EMPTY_UPDATE_ERROR);
     }
 
     let channel_ids = resolve_target(channel_store, secret_id, target).await?;
     if channel_ids.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let keys = secret_store
@@ -81,41 +81,88 @@ pub(in crate::protocol) async fn start<
         .as_ref()
         .map(build_communication_info_proto);
 
+    let mut events = Vec::with_capacity(keys.len());
     for (channel_id, value) in keys {
         let SecretValue::SharedKey(shared_key) = value else {
+            events.push(DeRecEvent::UpdateChannelInfoFailed {
+                channel_id,
+                error: "channel has no shared key".to_owned(),
+            });
             continue;
         };
 
-        let timestamp = current_timestamp();
-        let request = UpdateChannelInfoRequestMessage {
-            communication_info: comm_info_proto.clone(),
-            transport_protocol: transport_protocol.clone(),
-            timestamp: Some(timestamp),
-        };
-        let envelope = DeRecMessageBuilder::channel()
-            .channel_id(channel_id)
-            .timestamp(timestamp)
-            .message_body(MessageBody::UpdateChannelInfoRequest(request))
-            .auto_trace_id()
-            .encrypt(&shared_key)?
-            .build()?
-            .encode_to_vec();
-
-        let endpoint = peer_endpoint(channel_store, secret_id, channel_id).await?;
-        transport.send(&endpoint, envelope).await?;
-
-        #[cfg(feature = "logging")]
-        tracing::debug!(
-            channel_id = channel_id.0,
-            has_communication_info = comm_info_proto.is_some(),
-            has_transport_protocol = transport_protocol.is_some(),
-            "update_channel_info request sent"
-        );
+        match dispatch_one(
+            channel_store,
+            transport,
+            secret_id,
+            channel_id,
+            &shared_key,
+            comm_info_proto.clone(),
+            transport_protocol.clone(),
+        )
+        .await
+        {
+            Ok(()) => {
+                events.push(DeRecEvent::UpdateChannelInfoStarted { channel_id });
+                #[cfg(feature = "logging")]
+                tracing::debug!(
+                    channel_id = channel_id.0,
+                    has_communication_info = comm_info_proto.is_some(),
+                    has_transport_protocol = transport_protocol.is_some(),
+                    "update_channel_info request sent"
+                );
+            }
+            Err(e) => {
+                events.push(DeRecEvent::UpdateChannelInfoFailed {
+                    channel_id,
+                    error: e.to_string(),
+                });
+                #[cfg(feature = "logging")]
+                tracing::warn!(
+                    channel_id = channel_id.0,
+                    error = %e,
+                    "update_channel_info dispatch failed"
+                );
+            }
+        }
     }
 
     #[cfg(feature = "logging")]
     tracing::info!("update_channel_info requests dispatched");
 
+    Ok(events)
+}
+
+/// Build and send one `UpdateChannelInfoRequest`; failure isolated so
+/// [`start`] can surface it as a per-channel
+/// `UpdateChannelInfoFailed` event.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_one<Ch: DeRecChannelStore, T: DeRecTransport>(
+    channel_store: &mut Ch,
+    transport: &T,
+    secret_id: u64,
+    channel_id: ChannelId,
+    shared_key: &SharedKey,
+    comm_info_proto: Option<CommunicationInfo>,
+    transport_protocol: Option<TransportProtocol>,
+) -> Result<()> {
+    let timestamp = current_timestamp();
+    let request = UpdateChannelInfoRequestMessage {
+        communication_info: comm_info_proto,
+        transport_protocol,
+        timestamp: Some(timestamp),
+    };
+    let envelope = DeRecMessageBuilder::channel()
+        .channel_id(channel_id)
+        .timestamp(timestamp)
+        .message_body(MessageBody::UpdateChannelInfoRequest(request))
+        .auto_trace_id()
+        .encrypt(shared_key)?
+        .build()?
+        .encode_to_vec();
+
+    let endpoint = peer_endpoint(channel_store, secret_id, channel_id).await?;
+    transport.send(&endpoint, envelope).await?;
     Ok(())
 }
 
@@ -198,6 +245,7 @@ pub(in crate::protocol) async fn accept<Ch: DeRecChannelStore, T: DeRecTransport
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0, status = status as i32))
 )]
+#[allow(clippy::too_many_arguments)]
 pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport>(
     channel_store: &mut Ch,
     transport: &T,

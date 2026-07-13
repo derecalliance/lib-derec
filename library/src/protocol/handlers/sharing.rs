@@ -15,6 +15,7 @@ use crate::{
     },
     protocol::types::{HelperInfo, Secret, UserSecret},
     types::{ChannelId, SharedKey},
+    utils::SenderKindExt as _,
 };
 use derec_proto::{
     DeRecResult, DeRecSecret, MessageBody, SenderKind, StatusEnum, StoreShareRequestMessage,
@@ -64,7 +65,7 @@ pub(in crate::protocol) async fn start<
     secret_id: u64,
     reply_to: Option<derec_proto::TransportProtocol>,
     owner_replica_id: Option<u64>,
-) -> Result<Option<(u32, Vec<ChannelId>)>> {
+) -> Result<Option<SharingRoundResult>> {
     let (helpers, replicas) =
         load_all_paired_targets(channel_store, secret_store, secret_id).await?;
 
@@ -114,10 +115,10 @@ pub(in crate::protocol) async fn start<
         None
     };
 
-    let mut sent_channels: Vec<ChannelId> = Vec::new();
+    let mut outcomes: Vec<(ChannelId, Result<()>)> = Vec::new();
 
     if let Some(ref result) = split_result {
-        let helper_sent = distribute_shares(
+        let helper_outcomes = distribute_shares(
             share_store,
             transport,
             &helpers,
@@ -129,14 +130,14 @@ pub(in crate::protocol) async fn start<
             reply_to.clone(),
             owner_replica_id,
         )
-        .await?;
-        sent_channels.extend(helper_sent);
+        .await;
+        outcomes.extend(helper_outcomes);
     }
 
     if !replicas.is_empty() {
         let composite = build_replica_composite(&secret, split_result.as_ref());
         let k_group = current_replica_group_key(&replicas);
-        let replica_sent = distribute_composite_to_destinations(
+        let replica_outcomes = distribute_composite_to_destinations(
             secret_store,
             transport,
             &replicas,
@@ -148,13 +149,16 @@ pub(in crate::protocol) async fn start<
             reply_to,
             owner_replica_id,
         )
-        .await?;
-        sent_channels.extend(replica_sent);
+        .await;
+        outcomes.extend(replica_outcomes);
     }
 
-    // Persist the snapshot AFTER successful distribution so an
+    // Persist the snapshot AFTER distribution attempts complete so an
     // interrupted round does not leave the version field ahead of
-    // what any peer actually received.
+    // what any peer actually received. Failures on individual channels
+    // are surfaced as `ProtectSecretFailed` events by the caller and
+    // do not block the snapshot — the round remains addressable and
+    // the failed peers can be retried on the next round.
     user_secret_store
         .save_latest(
             secret_id,
@@ -167,7 +171,18 @@ pub(in crate::protocol) async fn start<
         )
         .await?;
 
-    Ok(Some((version, sent_channels)))
+    Ok(Some(SharingRoundResult { version, outcomes }))
+}
+
+/// The output of [`start`] on a round with at least one targeted peer.
+///
+/// `outcomes` carries one `(ChannelId, Result<()>)` per targeted
+/// helper / replica — `Ok(())` on successful dispatch, `Err` on
+/// per-channel transport / store failure. The orchestrator maps each
+/// entry to `ProtectSecretStarted` / `ProtectSecretFailed`.
+pub(in crate::protocol) struct SharingRoundResult {
+    pub(in crate::protocol) version: u32,
+    pub(in crate::protocol) outcomes: Vec<(ChannelId, Result<()>)>,
 }
 
 #[cfg_attr(
@@ -181,6 +196,7 @@ pub(in crate::protocol) async fn start<
         )
     )
 )]
+#[allow(clippy::too_many_arguments)]
 pub(in crate::protocol) async fn accept<
     Ch: DeRecChannelStore,
     Sh: DeRecShareStore,
@@ -249,6 +265,7 @@ pub(in crate::protocol) async fn accept<
         )
     )
 )]
+#[allow(clippy::too_many_arguments)]
 pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport>(
     channel_store: &mut Ch,
     transport: &T,
@@ -668,8 +685,7 @@ fn build_replicas(
                 transport_uri: channel.transport.uri.to_owned(),
                 communication_info: channel.communication_info.clone(),
                 replica_id: channel.replica_id.unwrap_or(0),
-                sender_kind: crate::protocol::handlers::pairing::derive_peer_kind(channel.role)
-                    as i32,
+                sender_kind: channel.role.derive_peer() as i32,
             },
         )
         .collect();
@@ -763,7 +779,7 @@ async fn distribute_shares<Sh: DeRecShareStore, T: DeRecTransport>(
     description: &str,
     reply_to: Option<derec_proto::TransportProtocol>,
     owner_replica_id: Option<u64>,
-) -> Result<Vec<ChannelId>> {
+) -> Vec<(ChannelId, Result<()>)> {
     let keep_list: Vec<u32> = {
         let start = version
             .saturating_sub(keep_versions_count as u32 - 1)
@@ -771,48 +787,49 @@ async fn distribute_shares<Sh: DeRecShareStore, T: DeRecTransport>(
         (start..=version).collect()
     };
 
-    let mut sent_channels: Vec<ChannelId> = Vec::new();
+    let mut results: Vec<(ChannelId, Result<()>)> = Vec::with_capacity(paired_helpers.len());
     for (channel, shared_key) in paired_helpers {
         let Some(committed_share) = split_result.shares.get(&channel.id) else {
+            // Helper wasn't included in the split — either the round is
+            // below threshold or the split map dropped this id. Silent
+            // skip: no `*Started` and no `*Failed`. Matches the previous
+            // continue-based behaviour.
             continue;
         };
 
-        let msg = produce_store_share_request_message(
-            channel.id,
-            version,
-            secret_id,
+        let outcome = dispatch_share_to_helper(
+            share_store,
+            transport,
+            channel,
+            shared_key,
             committed_share,
             &keep_list,
+            secret_id,
+            version,
             description,
-            shared_key,
             reply_to.clone(),
             owner_replica_id,
-        )?;
-        let envelope = super::apply_trace_id(msg.envelope, super::fresh_trace_id())?;
-        transport.send(&channel.transport, envelope).await?;
-
-        share_store
-            .save(
-                secret_id,
-                channel.id,
-                Share {
-                    secret_id,
-                    version,
-                    replica_id: owner_replica_id,
-                    bytes: committed_share.encode_to_vec(),
-                },
-            )
-            .await?;
-
-        sent_channels.push(channel.id);
+        )
+        .await;
 
         #[cfg(feature = "logging")]
-        tracing::debug!(
-            channel_id = channel.id.0,
-            secret_id = secret_id,
-            version = version,
-            "share envelope sent"
-        );
+        match &outcome {
+            Ok(()) => tracing::debug!(
+                channel_id = channel.id.0,
+                secret_id = secret_id,
+                version = version,
+                "share envelope sent"
+            ),
+            Err(e) => tracing::warn!(
+                channel_id = channel.id.0,
+                secret_id = secret_id,
+                version = version,
+                error = %e,
+                "share envelope dispatch failed"
+            ),
+        }
+
+        results.push((channel.id, outcome));
     }
 
     #[cfg(feature = "logging")]
@@ -822,7 +839,50 @@ async fn distribute_shares<Sh: DeRecShareStore, T: DeRecTransport>(
         "secret distributed to helpers"
     );
 
-    Ok(sent_channels)
+    results
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_share_to_helper<Sh: DeRecShareStore, T: DeRecTransport>(
+    share_store: &mut Sh,
+    transport: &T,
+    channel: &crate::protocol::types::Channel,
+    shared_key: &SharedKey,
+    committed_share: &derec_proto::CommittedDeRecShare,
+    keep_list: &[u32],
+    secret_id: u64,
+    version: u32,
+    description: &str,
+    reply_to: Option<derec_proto::TransportProtocol>,
+    owner_replica_id: Option<u64>,
+) -> Result<()> {
+    let msg = produce_store_share_request_message(
+        channel.id,
+        version,
+        secret_id,
+        committed_share,
+        keep_list,
+        description,
+        shared_key,
+        reply_to,
+        owner_replica_id,
+    )?;
+    let envelope = super::apply_trace_id(msg.envelope, super::fresh_trace_id())?;
+    transport.send(&channel.transport, envelope).await?;
+
+    share_store
+        .save(
+            secret_id,
+            channel.id,
+            Share {
+                secret_id,
+                version,
+                replica_id: owner_replica_id,
+                bytes: committed_share.encode_to_vec(),
+            },
+        )
+        .await?;
+    Ok(())
 }
 
 /// Sender-side replica path for `ProtectSecret`.
@@ -863,71 +923,42 @@ async fn distribute_composite_to_destinations<Ss: DeRecSecretStore, T: DeRecTran
     description: &str,
     reply_to: Option<derec_proto::TransportProtocol>,
     owner_replica_id: Option<u64>,
-) -> Result<Vec<ChannelId>> {
-    let mut sent_channels: Vec<ChannelId> = Vec::with_capacity(replicas.len());
-
+) -> Vec<(ChannelId, Result<()>)> {
+    let mut results: Vec<(ChannelId, Result<()>)> = Vec::with_capacity(replicas.len());
     for (channel, channel_key) in replicas {
-        // A Destination needs the group key handed over if (a) a group
-        // key exists for this `secret_id` and (b) this channel's stored
-        // key isn't already that group key. The first-ever paired
-        // Destination has `k_group == Some(its-own-key)` and skips the
-        // handover (no-op swap of K_handshake → K_handshake).
-        let needs_handover = match k_group.as_ref() {
-            Some(g) => channel_key != g,
-            None => false,
-        };
-
-        let mut per_channel = composite.clone();
-        if needs_handover {
-            per_channel.shared_key = k_group.as_ref().unwrap().to_vec();
-        }
-        let composite_bytes = per_channel.encode_to_vec();
-
-        let timestamp = current_timestamp();
-        let msg = StoreShareRequestMessage {
-            share: composite_bytes,
-            share_algorithm: SHARE_ALGORITHM_REPLICA_SECRET,
-            version,
-            keep_list: Vec::new(),
-            version_description: description.to_owned(),
-            timestamp: Some(timestamp),
+        let outcome = dispatch_composite_to_destination(
+            secret_store,
+            transport,
+            channel,
+            channel_key,
+            composite,
+            k_group.as_ref(),
             secret_id,
-            reply_to: reply_to.clone(),
-            replica_id: owner_replica_id,
-        };
-
-        let envelope_bytes = DeRecMessageBuilder::channel()
-            .channel_id(channel.id)
-            .timestamp(timestamp)
-            .message_body(MessageBody::StoreShareRequest(msg))
-            .encrypt(channel_key)?
-            .build()?
-            .encode_to_vec();
-        let envelope = super::apply_trace_id(envelope_bytes, super::fresh_trace_id())?;
-        transport.send(&channel.transport, envelope).await?;
-
-        if needs_handover {
-            // Swap the stored channel key now: future inbound/outbound on
-            // this channel uses the group key. The receiver performs the
-            // symmetric swap before its ack, so the next message in
-            // either direction lines up.
-            let new_key = k_group.as_ref().expect("handover implies k_group set");
-            secret_store
-                .save(secret_id, channel.id, SecretValue::SharedKey(*new_key))
-                .await
-                .map_err(crate::Error::SecretStore)?;
-        }
-
-        sent_channels.push(channel.id);
+            version,
+            description,
+            reply_to.clone(),
+            owner_replica_id,
+        )
+        .await;
 
         #[cfg(feature = "logging")]
-        tracing::debug!(
-            channel_id = channel.id.0,
-            secret_id = secret_id,
-            version = version,
-            handover = needs_handover,
-            "replica secret envelope sent"
-        );
+        match &outcome {
+            Ok(()) => tracing::debug!(
+                channel_id = channel.id.0,
+                secret_id = secret_id,
+                version = version,
+                "replica secret envelope sent"
+            ),
+            Err(e) => tracing::warn!(
+                channel_id = channel.id.0,
+                secret_id = secret_id,
+                version = version,
+                error = %e,
+                "replica secret envelope dispatch failed"
+            ),
+        }
+
+        results.push((channel.id, outcome));
     }
 
     #[cfg(feature = "logging")]
@@ -938,5 +969,72 @@ async fn distribute_composite_to_destinations<Ss: DeRecSecretStore, T: DeRecTran
         "secret bag distributed to replicas"
     );
 
-    Ok(sent_channels)
+    results
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_composite_to_destination<Ss: DeRecSecretStore, T: DeRecTransport>(
+    secret_store: &mut Ss,
+    transport: &T,
+    channel: &crate::protocol::types::Channel,
+    channel_key: &SharedKey,
+    composite: &crate::protocol::types::ReplicaSecretPayload,
+    k_group: Option<&SharedKey>,
+    secret_id: u64,
+    version: u32,
+    description: &str,
+    reply_to: Option<derec_proto::TransportProtocol>,
+    owner_replica_id: Option<u64>,
+) -> Result<()> {
+    // A Destination needs the group key handed over if (a) a group
+    // key exists for this `secret_id` and (b) this channel's stored
+    // key isn't already that group key. The first-ever paired
+    // Destination has `k_group == Some(its-own-key)` and skips the
+    // handover (no-op swap of K_handshake → K_handshake).
+    let needs_handover = match k_group {
+        Some(g) => channel_key != g,
+        None => false,
+    };
+
+    let mut per_channel = composite.clone();
+    if needs_handover {
+        per_channel.shared_key = k_group.expect("handover implies k_group set").to_vec();
+    }
+    let composite_bytes = per_channel.encode_to_vec();
+
+    let timestamp = current_timestamp();
+    let msg = StoreShareRequestMessage {
+        share: composite_bytes,
+        share_algorithm: SHARE_ALGORITHM_REPLICA_SECRET,
+        version,
+        keep_list: Vec::new(),
+        version_description: description.to_owned(),
+        timestamp: Some(timestamp),
+        secret_id,
+        reply_to,
+        replica_id: owner_replica_id,
+    };
+
+    let envelope_bytes = DeRecMessageBuilder::channel()
+        .channel_id(channel.id)
+        .timestamp(timestamp)
+        .message_body(MessageBody::StoreShareRequest(msg))
+        .encrypt(channel_key)?
+        .build()?
+        .encode_to_vec();
+    let envelope = super::apply_trace_id(envelope_bytes, super::fresh_trace_id())?;
+    transport.send(&channel.transport, envelope).await?;
+
+    if needs_handover {
+        // Swap the stored channel key now: future inbound/outbound on
+        // this channel uses the group key. The receiver performs the
+        // symmetric swap before its ack, so the next message in
+        // either direction lines up.
+        let new_key = k_group.expect("handover implies k_group set");
+        secret_store
+            .save(secret_id, channel.id, SecretValue::SharedKey(*new_key))
+            .await
+            .map_err(crate::Error::SecretStore)?;
+    }
+    Ok(())
 }

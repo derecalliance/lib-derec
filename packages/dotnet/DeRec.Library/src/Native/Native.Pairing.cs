@@ -108,7 +108,9 @@ internal static class Pairing
         ulong channelId,
         int contactMode,
         byte[] transportProtocolBytes,
-        UIntPtr transportProtocolBytesLen
+        UIntPtr transportProtocolBytesLen,
+        uint hasNonce,
+        ulong nonce
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]

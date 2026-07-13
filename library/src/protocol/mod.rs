@@ -80,82 +80,23 @@ use crate::{
     types::ChannelId,
 };
 pub use builder::DeRecProtocolBuilder;
-use derec_proto::{
-    ContactMessage, ContactMode, DeRecMessage, GetShareResponseMessage, StatusEnum,
-    TransportProtocol,
+use derec_proto::{ContactMessage, ContactMode, DeRecMessage, StatusEnum, TransportProtocol};
+pub use error::{
+    ChannelStoreError, ProcessError, SecretStoreError, ShareStoreError, StateStoreError,
 };
-pub use error::{ChannelStoreError, ProcessError, SecretStoreError, ShareStoreError};
 use prost::Message;
 use std::collections::{HashMap, HashSet};
 pub use traits::{
-    ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecTransport,
-    DeRecUserSecretStore, SecretStoreFuture, ShareStoreFuture, TransportFuture,
+    ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecStateStore,
+    DeRecTransport, DeRecUserSecretStore, SecretStoreFuture, ShareStoreFuture, StateStoreFuture,
+    TransportFuture,
 };
 pub use types::{
     Channel, ChannelShare, ChannelStatus, HelperInfo, MissingPolicy, ReplicaInfo,
-    ReplicaSecretPayload, Secret, SecretKind, SecretValue, Share, Target, UserSecret, UserSecrets,
+    ReplicaSecretPayload, Secret, SecretKind, SecretValue, Share, StateItem, StateKey, StateKind,
+    Target, UserSecret, UserSecrets,
 };
 
-/// In-progress recovery accumulators keyed by `(secret_id, version)`.
-///
-/// Each entry collects [`GetShareResponseMessage`] values for a pending recovery
-/// context until enough shares arrive for reconstruction.
-pub(super) type PendingRecovery = HashMap<(u64, u32), Vec<GetShareResponseMessage>>;
-
-/// In-progress unpair requests keyed by `channel_id`, with the `started_at`
-/// (epoch seconds) the orchestrator stamped when it sent the request.
-///
-/// Only populated under [`crate::protocol::events::UnpairAck::Required`];
-/// under [`UnpairAck::NotRequired`](crate::protocol::events::UnpairAck::NotRequired)
-/// state is dropped immediately and this map is never touched.
-pub(super) type PendingUnpair = HashMap<ChannelId, u64>;
-
-/// In-progress verification challenges keyed by `channel_id`,
-/// recording the full [`derec_proto::VerifyShareRequestMessage`]
-/// that was sent. When the matching response arrives, the entry is
-/// removed and its `(nonce, secret_id, version)` triple is passed
-/// to [`crate::primitives::verification::response::process`] so the
-/// helper's response cannot satisfy any other outstanding challenge.
-///
-/// Replay/freshness gate semantics mirror [`PendingUnpair`]: a
-/// missing entry means there is no outstanding verification for the
-/// channel, and the inbound response is dropped silently
-/// ([`DeRecEvent::NoOp`]). Re-issuing `start(VerifyShares)` for the
-/// same channel overwrites the entry — the most recent challenge
-/// wins, and a response carrying an older nonce is rejected by the
-/// binding check.
-///
-/// # Ownership
-///
-/// Owned end-to-end by [`DeRecProtocol`]. Applications driving the
-/// orchestrator never touch this map: `start(VerifyShares)` inserts,
-/// and the matching `process` call removes (surfacing
-/// [`DeRecEvent::ShareVerified`] or an error). The
-/// "caller MUST retain the request" contract documented on
-/// [`crate::primitives::verification::request::ProduceResult::nonce`]
-/// and [`crate::primitives::verification::response::process`] only
-/// applies to callers driving the primitives directly without the
-/// orchestrator (e.g. binding-level parity tests). The current
-/// in-memory representation does not survive process restart; that
-/// limitation applies to every `pending_*` field on
-/// [`DeRecProtocol`].
-pub(super) type PendingVerification = HashMap<ChannelId, derec_proto::VerifyShareRequestMessage>;
-
-/// Tracks an in-progress sharing round.
-///
-/// Created when [`DeRecFlow::ProtectSecret`] is started and consumed when all
-/// targeted Helpers have responded (confirmed, rejected, or timed out).
-struct SharingRound {
-    version: u32,
-    /// Channels that have not yet responded.
-    pending: HashSet<ChannelId>,
-    /// Channels that confirmed storage.
-    confirmed: HashSet<ChannelId>,
-    /// Channels that rejected or timed out.
-    failed: HashSet<ChannelId>,
-    /// Timestamp (seconds since epoch) when the round was started.
-    started_at: u64,
-}
 
 pub use events::{
     AutoAcceptPolicy, DeRecEvent, DeRecFlow, PendingAction, PendingActionKind, UnpairAck,
@@ -209,6 +150,7 @@ pub struct DeRecProtocol<
     ShareStore: DeRecShareStore,
     SecretStore: DeRecSecretStore,
     UserSecretStore: DeRecUserSecretStore,
+    StateStore: DeRecStateStore,
     Transport: DeRecTransport,
 > {
     /// Set via [`DeRecProtocolBuilder::with_channel_store`].
@@ -219,25 +161,17 @@ pub struct DeRecProtocol<
     pub secret_store: SecretStore,
     /// Set via [`DeRecProtocolBuilder::with_user_secret_store`].
     pub user_secret_store: UserSecretStore,
+    /// Set via [`DeRecProtocolBuilder::with_state_store`]. Holds
+    /// in-flight orchestrator state (verification challenges, recovery
+    /// accumulators, pending unpair acks) so stateless / load-balanced
+    /// deployments preserve it across process restarts.
+    pub state_store: StateStore,
     /// Set via [`DeRecProtocolBuilder::with_transport`].
     pub transport: Transport,
     /// Set via [`DeRecProtocolBuilder::with_own_transport`].
     pub own_transport: TransportProtocol,
-    pending_recovery: PendingRecovery,
-    /// Channels with an outstanding unpair request awaiting the peer's
-    /// acknowledgement (Required mode only — see [`UnpairAck`]).
-    pending_unpair: PendingUnpair,
-    /// Channels with an outstanding verification challenge. See
-    /// [`PendingVerification`] for the replay/freshness semantics.
-    pending_verification: PendingVerification,
     /// Configured via [`DeRecProtocolBuilder::with_unpair_ack`].
     pub(crate) unpair_ack: UnpairAck,
-    /// Events produced by [`Self::start`] that don't fit the "no events from
-    /// start; only from process" public contract. Drained at the top of every
-    /// [`Self::process`] call. Today this exists solely for
-    /// `UnpairAck::NotRequired`, which has to surface `Unpaired` immediately
-    /// (no inbound response is coming).
-    pending_start_events: Vec<DeRecEvent>,
     /// Configured via [`DeRecProtocolBuilder::with_threshold`].
     threshold: usize,
     /// Configured via [`DeRecProtocolBuilder::with_keep_versions_count`].
@@ -264,9 +198,6 @@ pub struct DeRecProtocol<
     /// flow and emits [`DeRecEvent::AutoAccepted`] in place of
     /// [`DeRecEvent::ActionRequired`].
     pub(crate) auto_accept: AutoAcceptPolicy,
-    /// Active sharing round, if any. Populated by `start(ProtectSecret)` and
-    /// consumed when all targeted Helpers respond or time out.
-    sharing_round: Option<SharingRound>,
     /// Configured via [`DeRecProtocolBuilder::with_replica_id`].
     ///
     /// `Some(id)` enables this node to participate in replica-mode pairings
@@ -298,7 +229,8 @@ impl<
     Ss: DeRecSecretStore,
     Us: DeRecUserSecretStore,
     T: DeRecTransport,
-> DeRecProtocol<Ch, Sh, Ss, Us, T>
+    St: DeRecStateStore,
+> DeRecProtocol<Ch, Sh, Ss, Us, St, T>
 {
 
     /// Construct a [`DeRecProtocol`] directly from its components.
@@ -314,12 +246,14 @@ impl<
     /// lets a single helper reconstruct the secret unilaterally — two
     /// is the minimum value that preserves secret confidentiality
     /// against one compromised helper.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         secret_id: u64,
         channel_store: Ch,
         share_store: Sh,
         secret_store: Ss,
         user_secret_store: Us,
+        state_store: St,
         transport: T,
         own_transport: TransportProtocol,
         threshold: usize,
@@ -337,13 +271,10 @@ impl<
             share_store,
             secret_store,
             user_secret_store,
+            state_store,
             transport,
             own_transport,
-            pending_recovery: HashMap::new(),
-            pending_unpair: HashMap::new(),
-            pending_verification: HashMap::new(),
             unpair_ack: UnpairAck::Required,
-            pending_start_events: Vec::new(),
             threshold,
             keep_versions_count,
             timeout_in_secs,
@@ -351,7 +282,6 @@ impl<
             auto_respond_on_failure: false,
             auto_reply_to: false,
             auto_accept: AutoAcceptPolicy::default(),
-            sharing_round: None,
             replica_id: None,
             parameter_range: None,
             secret_id,
@@ -378,16 +308,16 @@ impl<
     /// Generate an out-of-band contact message (QR code payload, deep link, …).
     ///
     /// Either party (Owner or Helper) may call this to begin a pairing session.
-    /// The returned [`ContactMessage`] should be delivered out-of-band to the peer
-    /// (e.g. serialized into a QR code or deep link). The ephemeral pairing secret
-    /// is persisted automatically via `secret_store`.
+    /// The returned [`ContactMessage`] should be delivered out-of-band to the peer.
+    /// Any material the library needs later — either the ephemeral pairing
+    /// secret (`InlineKeys` / `HashedKeys`) or the contact itself (`NoKeys`) —
+    /// is persisted automatically via the configured stores.
     ///
     /// # Channel ID
     ///
     /// Pass `Some(id)` to use a specific channel identifier, or `None` to have
-    /// the library generate a random one. The channel ID is embedded in the
-    /// returned [`ContactMessage`] and should be treated as the canonical
-    /// identifier for this pairing session going forward.
+    /// the library generate a random one. Applications targeting `NoKeys` mode
+    /// typically pass a small human-typable value (4 digits) for manual entry.
     ///
     /// # Contact mode
     ///
@@ -400,11 +330,29 @@ impl<
     ///   against the hash. Requires the `own_transport` set on this protocol
     ///   to be **ephemeral** — the plaintext PrePair traffic must not be
     ///   linkable to a long-lived endpoint.
+    /// - [`ContactMode::NoKeys`] carries no key material and no commitment —
+    ///   only `channel_id`, `nonce`, and `transport_protocol`. Small enough
+    ///   to be hand-typed. Keys are generated on the fly by the creator when
+    ///   the corresponding `PrePairRequest` arrives; trust rests entirely on
+    ///   the OOB delivery channel being fully trusted (e.g. a verified email
+    ///   from an already-KYC-authenticated institution). Applications MUST
+    ///   rate-limit inbound `PrePairRequest`s per `channel_id` and expire
+    ///   outstanding NoKeys contacts on a short timer.
+    ///
+    /// # Nonce
+    ///
+    /// - `None`: the library generates a fresh cryptographically-random
+    ///   `u64`. Recommended default for `InlineKeys` and `HashedKeys` where
+    ///   the nonce is a security parameter.
+    /// - `Some(n)`: application-controlled value. Required for `NoKeys`
+    ///   where the recipient typically types it in; also valid for the
+    ///   other modes if the app wants deterministic control.
     #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
     pub async fn create_contact(
         &mut self,
         channel_id: Option<ChannelId>,
         contact_mode: ContactMode,
+        nonce: Option<u64>,
     ) -> Result<ContactMessage> {
         let channel_id = channel_id.unwrap_or_else(|| ChannelId(rand::random::<u64>()));
 
@@ -415,15 +363,43 @@ impl<
             "creating contact message"
         );
 
-        let result = create_contact_message(channel_id, contact_mode, self.own_transport.clone())?;
+        let result = create_contact_message(
+            channel_id,
+            contact_mode,
+            self.own_transport.clone(),
+            nonce,
+        )?;
 
-        self.secret_store
-            .save(
-                self.secret_id,
-                channel_id,
-                SecretValue::PairingSecret(result.secret_key),
-            )
-            .await?;
+        // Persist the material the eventual `PrePairRequest` /
+        // `PairRequest` handler will need to look up:
+        // - `Some(secret_key)` on InlineKeys / HashedKeys → store as
+        //   `PairingSecret`. Handler decrypts the encrypted PairRequest
+        //   with the ECIES secret and re-publishes keys on the PrePair
+        //   leg (HashedKeys only).
+        // - `None` on NoKeys → store the contact itself as
+        //   `PairingContact` so the incoming PrePairRequest handler can
+        //   (a) authenticate the caller by matching `nonce`, and
+        //   (b) generate fresh key material on the fly for the response.
+        match result.secret_key {
+            Some(secret_key) => {
+                self.secret_store
+                    .save(
+                        self.secret_id,
+                        channel_id,
+                        SecretValue::PairingSecret(secret_key),
+                    )
+                    .await?;
+            }
+            None => {
+                self.secret_store
+                    .save(
+                        self.secret_id,
+                        channel_id,
+                        SecretValue::PairingContact(result.contact_message.clone()),
+                    )
+                    .await?;
+            }
+        }
 
         #[cfg(feature = "logging")]
         tracing::info!(channel_id = channel_id.0, "contact message created");
@@ -494,9 +470,24 @@ impl<
 
     /// Unified entry point for initiating any protocol flow.
     ///
-    /// Returns `Some(channel_id)` for [`DeRecFlow::Pairing`], `None` for all others.
+    /// Returns the flow's per-target `*Started` / `*Failed` events (one
+    /// `PairingStarted` for [`DeRecFlow::Pairing`]; one per targeted
+    /// channel for fan-out flows). See each `*Started` /
+    /// `*Failed` variant on [`DeRecEvent`] for the per-flow shape.
+    ///
+    /// # Errors
+    ///
+    /// - Programmer errors (invalid input, missing preconditions, role
+    ///   mismatch) surface as `Err` before any fan-out begins. Once
+    ///   fan-out starts for a multi-target flow, per-channel transport
+    ///   failures become `*Failed` events in the returned vec — they do
+    ///   not abort the round.
+    /// - Single-channel flows ([`DeRecFlow::Pairing`],
+    ///   [`DeRecFlow::Unpair`]) return `Err` on send failure — no
+    ///   `*Failed` event exists, so the single-`Err` signal is
+    ///   unambiguous.
     #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
-    pub async fn start(&mut self, flow: DeRecFlow) -> Result<Option<u64>> {
+    pub async fn start(&mut self, flow: DeRecFlow) -> Result<Vec<DeRecEvent>> {
         // When `auto_reply_to` is enabled, stamp every outbound
         // channel-mode request with our own transport so the responder
         // routes its reply back to us — even if the channel's stored
@@ -534,7 +525,9 @@ impl<
                 self.start_recover_secret(secret_id, version, reply_to)
                     .await
             }
-            DeRecFlow::Unpair { target, memo } => self.start_unpair(target, memo, reply_to).await,
+            DeRecFlow::Unpair { channel_id, memo } => {
+                self.start_unpair(channel_id, memo, reply_to).await
+            }
             DeRecFlow::UpdateChannelInfo {
                 target,
                 communication_info,
@@ -552,8 +545,9 @@ impl<
     /// returning the same events that auto-respond would have produced.
     #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
     pub async fn accept(&mut self, action: PendingAction) -> Result<Vec<DeRecEvent>> {
-        let events = self.accept_inner(action).await?;
-        self.maybe_auto_publish_after_pair(&events).await?;
+        let mut events = self.accept_inner(action).await?;
+        let auto_publish_events = self.maybe_auto_publish_after_pair(&events).await?;
+        events.extend(auto_publish_events);
         Ok(events)
     }
 
@@ -770,8 +764,7 @@ impl<
     ) -> std::result::Result<Vec<DeRecEvent>, ProcessError> {
         let _ = self.cleanup_expired_channels().await;
 
-        let mut start_events = std::mem::take(&mut self.pending_start_events);
-        let mut timeout_events = self.check_sharing_round_timeouts();
+        let mut timeout_events = self.check_sharing_round_timeouts().await;
         let mut unpair_timeout_events = self.check_unpair_timeouts().await;
 
         let envelope = DeRecMessage::decode(message).map_err(|e| ProcessError {
@@ -801,23 +794,22 @@ impl<
                 source,
             })?;
 
-        // Ordering: deferred-from-start events first (so the app sees them
-        // before any inbound-message reactions), then sharing-round
-        // timeouts, then unpair timeouts, then events produced by this
-        // specific message.
-        start_events.append(&mut timeout_events);
-        start_events.append(&mut unpair_timeout_events);
-        start_events.append(&mut events);
-        let mut events = start_events;
+        // Ordering: sharing-round timeouts first, then unpair
+        // timeouts, then events produced by this specific message.
+        timeout_events.append(&mut unpair_timeout_events);
+        timeout_events.append(&mut events);
+        let mut events = timeout_events;
 
-        self.update_sharing_round(&mut events);
+        self.update_sharing_round(&mut events).await;
 
-        self.maybe_auto_publish_after_pair(&events)
+        let auto_publish_events = self
+            .maybe_auto_publish_after_pair(&events)
             .await
             .map_err(|source| ProcessError {
                 channel_id: Some(channel_id),
                 source,
             })?;
+        events.extend(auto_publish_events);
 
         Ok(events)
     }
@@ -949,22 +941,20 @@ impl<
         &mut self,
         secret: &crate::protocol::types::Secret,
         recovered_version: u32,
-    ) -> Result<()> {
-        let events = handlers::restore::restore(
+    ) -> Result<Vec<DeRecEvent>> {
+        handlers::restore::restore(
             &mut self.channel_store,
             &mut self.share_store,
             &mut self.secret_store,
             &mut self.user_secret_store,
             &self.transport,
-            &mut self.pending_unpair,
+            &mut self.state_store,
             &mut self.replica_id,
             self.secret_id,
             secret,
             recovered_version,
         )
-        .await?;
-        self.pending_start_events.extend(events);
-        Ok(())
+        .await
     }
 
     async fn start_pairing(
@@ -972,7 +962,7 @@ impl<
         kind: derec_proto::SenderKind,
         contact: derec_proto::ContactMessage,
         peer_communication_info: HashMap<String, String>,
-    ) -> Result<Option<u64>> {
+    ) -> Result<Vec<DeRecEvent>> {
         let channel_id = handlers::pairing::start(
             &mut self.channel_store,
             &mut self.secret_store,
@@ -984,17 +974,20 @@ impl<
             contact,
             peer_communication_info,
             self.replica_id,
-            self.parameter_range.clone(),
+            self.parameter_range,
         )
         .await?;
-        Ok(Some(channel_id))
+        Ok(vec![DeRecEvent::PairingStarted {
+            channel_id: ChannelId(channel_id),
+            kind,
+        }])
     }
 
     async fn start_discovery(
         &mut self,
         target: crate::protocol::types::Target,
         reply_to: Option<derec_proto::TransportProtocol>,
-    ) -> Result<Option<u64>> {
+    ) -> Result<Vec<DeRecEvent>> {
         let resolved =
             handlers::resolve_target(&mut self.channel_store, self.secret_id, target.clone())
                 .await?;
@@ -1013,8 +1006,7 @@ impl<
             target,
             reply_to,
         )
-        .await?;
-        Ok(None)
+        .await
     }
 
     async fn start_protect_secret(
@@ -1022,9 +1014,8 @@ impl<
         secrets: Vec<crate::protocol::types::UserSecret>,
         description: Option<String>,
         reply_to: Option<derec_proto::TransportProtocol>,
-    ) -> Result<Option<u64>> {
-        self.publish_secret(secrets, description, reply_to).await?;
-        Ok(None)
+    ) -> Result<Vec<DeRecEvent>> {
+        self.publish_secret(secrets, description, reply_to).await
     }
 
     /// Run one publish round: VSS-split for Helpers when the threshold is
@@ -1036,8 +1027,8 @@ impl<
         secrets: Vec<crate::protocol::types::UserSecret>,
         description: Option<String>,
         reply_to: Option<derec_proto::TransportProtocol>,
-    ) -> Result<()> {
-        if let Some((version, sent_channels)) = handlers::sharing::start(
+    ) -> Result<Vec<DeRecEvent>> {
+        let Some(round) = handlers::sharing::start(
             &mut self.channel_store,
             &mut self.share_store,
             &mut self.secret_store,
@@ -1052,16 +1043,50 @@ impl<
             self.replica_id,
         )
         .await?
-        {
-            self.sharing_round = Some(SharingRound {
-                version,
-                pending: sent_channels.into_iter().collect(),
-                confirmed: HashSet::new(),
-                failed: HashSet::new(),
-                started_at: now_secs(),
-            });
+        else {
+            return Ok(Vec::new());
+        };
+
+        // Only channels whose dispatch succeeded count as `pending` in
+        // the sharing round accumulator — a peer we couldn't reach on
+        // send won't be responding, so it doesn't gate SharingComplete.
+        let version = round.version;
+        let pending: HashSet<ChannelId> = round
+            .outcomes
+            .iter()
+            .filter_map(|(cid, r)| r.as_ref().ok().map(|_| *cid))
+            .collect();
+
+        if !pending.is_empty() {
+            self.state_store
+                .save(
+                    self.secret_id,
+                    StateItem::SharingRound {
+                        version,
+                        pending,
+                        confirmed: HashSet::new(),
+                        failed: HashSet::new(),
+                        started_at: now_secs(),
+                    },
+                )
+                .await?;
         }
-        Ok(())
+
+        Ok(round
+            .outcomes
+            .into_iter()
+            .map(|(channel_id, res)| match res {
+                Ok(()) => DeRecEvent::ProtectSecretStarted {
+                    channel_id,
+                    version,
+                },
+                Err(e) => DeRecEvent::ProtectSecretFailed {
+                    channel_id,
+                    version,
+                    error: e.to_string(),
+                },
+            })
+            .collect())
     }
 
     async fn start_verify_shares(
@@ -1070,7 +1095,7 @@ impl<
         version: u32,
         target: crate::protocol::types::Target,
         reply_to: Option<derec_proto::TransportProtocol>,
-    ) -> Result<Option<u64>> {
+    ) -> Result<Vec<DeRecEvent>> {
         let resolved =
             handlers::resolve_target(&mut self.channel_store, self.secret_id, target.clone())
                 .await?;
@@ -1085,14 +1110,13 @@ impl<
             &mut self.channel_store,
             &mut self.secret_store,
             &self.transport,
-            &mut self.pending_verification,
+            &mut self.state_store,
             version,
             target,
             secret_id,
             reply_to,
         )
-        .await?;
-        Ok(None)
+        .await
     }
 
     async fn start_recover_secret(
@@ -1100,7 +1124,7 @@ impl<
         secret_id: u64,
         version: u32,
         reply_to: Option<derec_proto::TransportProtocol>,
-    ) -> Result<Option<u64>> {
+    ) -> Result<Vec<DeRecEvent>> {
         let all_paired: Vec<crate::types::ChannelId> = self
             .channel_store
             .channels(self.secret_id)
@@ -1118,54 +1142,51 @@ impl<
         handlers::recovery::start(
             &mut self.channel_store,
             &mut self.secret_store,
+            &mut self.state_store,
             &self.transport,
-            &mut self.pending_recovery,
             secret_id,
             version,
             reply_to,
         )
-        .await?;
-        Ok(None)
+        .await
     }
 
     async fn start_unpair(
         &mut self,
-        target: crate::protocol::types::Target,
+        channel_id: ChannelId,
         memo: Option<String>,
         reply_to: Option<derec_proto::TransportProtocol>,
-    ) -> Result<Option<u64>> {
-        let resolved =
-            handlers::resolve_target(&mut self.channel_store, self.secret_id, target.clone())
-                .await?;
+    ) -> Result<Vec<DeRecEvent>> {
         handlers::require_role(
             &self.channel_store,
             self.secret_id,
-            &resolved,
+            &[channel_id],
             derec_proto::SenderKind::Owner,
         )
         .await?;
-        // The handler returns immediate `Unpaired` events for the
-        // `UnpairAck::NotRequired` path; the wait-for-ack path returns
-        // nothing here and the events surface later from `process()`
-        // (on the response) or the timeout sweep. Events are stashed
-        // on the protocol for the next `process()` to drain so callers
-        // observing the synchronous stream see them.
-        let events = handlers::unpairing::start(
-            &mut self.channel_store,
-            &mut self.share_store,
-            &mut self.secret_store,
-            &self.transport,
-            &mut self.pending_unpair,
-            self.secret_id,
-            target,
-            memo,
-            self.unpair_ack,
-            now_secs(),
-            reply_to,
-        )
-        .await?;
-        self.pending_start_events.extend(events);
-        Ok(None)
+        // The handler returns an immediate `Unpaired` event for the
+        // `UnpairAck::NotRequired` path (interleaved after
+        // `UnpairStarted` here); the wait-for-ack path surfaces
+        // `Unpaired` later from `process()` on the response, or from
+        // the timeout sweep.
+        let mut events = vec![DeRecEvent::UnpairStarted { channel_id }];
+        events.extend(
+            handlers::unpairing::start(
+                &mut self.channel_store,
+                &mut self.share_store,
+                &mut self.secret_store,
+                &self.transport,
+                &mut self.state_store,
+                self.secret_id,
+                channel_id,
+                memo,
+                self.unpair_ack,
+                now_secs(),
+                reply_to,
+            )
+            .await?,
+        );
+        Ok(events)
     }
 
     async fn start_update_channel_info(
@@ -1173,7 +1194,7 @@ impl<
         target: crate::protocol::types::Target,
         communication_info: Option<HashMap<String, String>>,
         transport_protocol: Option<derec_proto::TransportProtocol>,
-    ) -> Result<Option<u64>> {
+    ) -> Result<Vec<DeRecEvent>> {
         handlers::update_channel_info::start(
             &mut self.channel_store,
             &mut self.secret_store,
@@ -1183,8 +1204,7 @@ impl<
             communication_info,
             transport_protocol,
         )
-        .await?;
-        Ok(None)
+        .await
     }
 
     async fn accept_inner(&mut self, action: PendingAction) -> Result<Vec<DeRecEvent>> {
@@ -1209,7 +1229,7 @@ impl<
                     kind,
                     trace_id,
                     self.replica_id,
-                    self.parameter_range.clone(),
+                    self.parameter_range,
                 )
                 .await
             }
@@ -1351,7 +1371,10 @@ impl<
     /// snapshot still reaches every Destination — that's how a
     /// multi-device sync stays consistent before the application has
     /// added any user secrets.
-    async fn maybe_auto_publish_after_pair(&mut self, events: &[DeRecEvent]) -> Result<()> {
+    async fn maybe_auto_publish_after_pair(
+        &mut self,
+        events: &[DeRecEvent],
+    ) -> Result<Vec<DeRecEvent>> {
         let helper_just_paired = events.iter().any(|e| {
             matches!(
                 e,
@@ -1362,14 +1385,14 @@ impl<
             )
         });
         if !helper_just_paired {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let snapshot = self.user_secret_store.load_latest(self.secret_id).await?;
         let (secrets, description) = match snapshot {
             Some(s) => (s.secrets, s.description),
             None => {
                 if !self.has_paired_replica_destination().await? {
-                    return Ok(());
+                    return Ok(Vec::new());
                 }
                 (Vec::new(), None)
             }
@@ -1494,9 +1517,7 @@ impl<
             &mut self.share_store,
             &mut self.secret_store,
             &self.transport,
-            &mut self.pending_recovery,
-            &mut self.pending_unpair,
-            &mut self.pending_verification,
+            &mut self.state_store,
             message,
             self.secret_id,
             channel_id,
@@ -1523,32 +1544,31 @@ impl<
         if let Ok(inner) = crate::derec_message::extract_inner_plaintext_message(&message.message) {
             match inner {
                 inner @ MessageBody::PrePairRequest(_) => {
-                    // Initiator side: needs `PairingSecret` to answer.
-                    // Routes through the regular pairing dispatcher
-                    // (`pairing::handle`) — same shape as PairRequest /
-                    // PairResponse handling, just with the inner already
-                    // decoded so we skip the decryption step.
-                    let Some(SecretValue::PairingSecret(pairing_secret)) = self
-                        .secret_store
-                        .load(self.secret_id, channel_id, SecretKind::PairingSecret)
-                        .await?
-                    else {
+                    // Initiator side. Two flavors:
+                    // - HashedKeys: `PairingSecret` was saved at
+                    //   `create_contact` time; the accept path publishes
+                    //   its embedded keys.
+                    // - NoKeys: only `PairingContact` was saved at
+                    //   `create_contact_no_keys` time — no keys exist
+                    //   until the accept path generates them on the fly.
+                    // Route the message iff **either** correlation record
+                    // exists; otherwise silently drop (unknown channel).
+                    let has_pairing_secret = matches!(
+                        self.secret_store
+                            .load(self.secret_id, channel_id, SecretKind::PairingSecret)
+                            .await?,
+                        Some(SecretValue::PairingSecret(_))
+                    );
+                    let has_pairing_contact = matches!(
+                        self.secret_store
+                            .load(self.secret_id, channel_id, SecretKind::PairingContact)
+                            .await?,
+                        Some(SecretValue::PairingContact(_))
+                    );
+                    if !has_pairing_secret && !has_pairing_contact {
                         return Ok(None);
-                    };
-                    let events = handlers::pairing::handle(
-                        &mut self.channel_store,
-                        &mut self.secret_store,
-                        &self.transport,
-                        &self.communication_info,
-                        &inner,
-                        self.secret_id,
-                        channel_id,
-                        &pairing_secret,
-                        message.trace_id,
-                        self.replica_id,
-                        self.parameter_range.as_ref(),
-                    )
-                    .await?;
+                    }
+                    let events = handlers::pairing::handle_pre_pair_request(&inner, channel_id, message.trace_id)?;
                     return Ok(Some(events));
                 }
                 MessageBody::PrePairResponse(resp) => {
@@ -1572,7 +1592,7 @@ impl<
                         &contact,
                         &resp,
                         self.replica_id,
-                        self.parameter_range.clone(),
+                        self.parameter_range,
                     )
                     .await?;
                     return Ok(Some(events));
@@ -1610,19 +1630,28 @@ impl<
     ///
     /// Returns `ShareRejected` events for timed-out channels and moves them
     /// from `pending` to `failed` in the round tracker.
-    fn check_sharing_round_timeouts(&mut self) -> Vec<DeRecEvent> {
-        let Some(round) = &mut self.sharing_round else {
+    async fn check_sharing_round_timeouts(&mut self) -> Vec<DeRecEvent> {
+        let Ok(Some(StateItem::SharingRound {
+            version,
+            mut pending,
+            confirmed,
+            mut failed,
+            started_at,
+        })) = self
+            .state_store
+            .load(self.secret_id, StateKey::SharingRound)
+            .await
+        else {
             return vec![];
         };
         let now = now_secs();
-        if now.saturating_sub(round.started_at) <= self.timeout_in_secs {
+        if now.saturating_sub(started_at) <= self.timeout_in_secs {
             return vec![];
         }
-        let timed_out: Vec<ChannelId> = round.pending.drain().collect();
-        let version = round.version;
+        let timed_out: Vec<ChannelId> = pending.drain().collect();
         let mut events = Vec::with_capacity(timed_out.len());
         for channel_id in timed_out {
-            round.failed.insert(channel_id);
+            failed.insert(channel_id);
             events.push(DeRecEvent::ShareRejected {
                 channel_id,
                 version,
@@ -1637,6 +1666,21 @@ impl<
                 "sharing round: helper timed out"
             );
         }
+        // Persist the timeout-drained round so a subsequent
+        // `update_sharing_round` can see the mutations.
+        let _ = self
+            .state_store
+            .save(
+                self.secret_id,
+                StateItem::SharingRound {
+                    version,
+                    pending,
+                    confirmed,
+                    failed,
+                    started_at,
+                },
+            )
+            .await;
         events
     }
 
@@ -1644,21 +1688,31 @@ impl<
     /// elapsed, returning an `Unpaired` event per dropped channel.
     async fn check_unpair_timeouts(&mut self) -> Vec<DeRecEvent> {
         let now = now_secs();
-        let expired: Vec<ChannelId> = self
-            .pending_unpair
-            .iter()
-            .filter_map(|(cid, started_at)| {
-                if now.saturating_sub(*started_at) > self.timeout_in_secs {
-                    Some(*cid)
-                } else {
-                    None
-                }
+        let all = match self
+            .state_store
+            .load_all(self.secret_id, StateKind::PendingUnpair)
+            .await
+        {
+            Ok(items) => items,
+            Err(_) => return Vec::new(),
+        };
+        let expired: Vec<ChannelId> = all
+            .into_iter()
+            .filter_map(|item| match item {
+                StateItem::PendingUnpair {
+                    channel_id,
+                    started_at,
+                } if now.saturating_sub(started_at) > self.timeout_in_secs => Some(channel_id),
+                _ => None,
             })
             .collect();
 
         let mut events = Vec::with_capacity(expired.len());
         for cid in expired {
-            self.pending_unpair.remove(&cid);
+            let _ = self
+                .state_store
+                .remove(self.secret_id, StateKey::PendingUnpair { channel_id: cid })
+                .await;
             if handlers::unpairing::drop_channel_state(
                 &mut self.channel_store,
                 &mut self.share_store,
@@ -1680,43 +1734,54 @@ impl<
     /// Moves channels from `pending` to `confirmed` or `failed` as
     /// `ShareConfirmed` / `ShareRejected` events arrive. When no channels
     /// remain pending, appends a [`DeRecEvent::SharingComplete`] summary.
-    fn update_sharing_round(&mut self, events: &mut Vec<DeRecEvent>) {
-        if self.sharing_round.is_none() {
+    async fn update_sharing_round(&mut self, events: &mut Vec<DeRecEvent>) {
+        let Ok(Some(StateItem::SharingRound {
+            version: round_version,
+            mut pending,
+            mut confirmed,
+            mut failed,
+            started_at,
+        })) = self
+            .state_store
+            .load(self.secret_id, StateKey::SharingRound)
+            .await
+        else {
             return;
-        }
+        };
 
-        let round = self.sharing_round.as_mut().unwrap();
         for event in events.iter() {
             match event {
                 DeRecEvent::ShareConfirmed {
                     channel_id,
                     version,
-                } if *version == round.version => {
-                    round.pending.remove(channel_id);
-                    round.confirmed.insert(*channel_id);
+                } if *version == round_version => {
+                    pending.remove(channel_id);
+                    confirmed.insert(*channel_id);
                 }
                 DeRecEvent::ShareRejected {
                     channel_id,
                     version,
                     ..
-                } if *version == round.version => {
-                    round.pending.remove(channel_id);
-                    round.failed.insert(*channel_id);
+                } if *version == round_version => {
+                    pending.remove(channel_id);
+                    failed.insert(*channel_id);
                 }
                 _ => {}
             }
         }
 
-        let is_complete = round.pending.is_empty();
-        let version = round.version;
-        let confirmed_count = round.confirmed.len();
-        let failed_count = round.failed.len();
+        let is_complete = pending.is_empty();
+        let confirmed_count = confirmed.len();
+        let failed_count = failed.len();
 
         if is_complete {
             let threshold_met = confirmed_count >= self.threshold;
-            self.sharing_round = None;
+            let _ = self
+                .state_store
+                .remove(self.secret_id, StateKey::SharingRound)
+                .await;
             events.push(DeRecEvent::SharingComplete {
-                version,
+                version: round_version,
                 confirmed_count,
                 failed_count,
                 threshold_met,
@@ -1724,12 +1789,26 @@ impl<
 
             #[cfg(feature = "logging")]
             tracing::info!(
-                version,
+                version = round_version,
                 confirmed_count,
                 failed_count,
                 threshold_met,
                 "sharing round complete"
             );
+        } else {
+            let _ = self
+                .state_store
+                .save(
+                    self.secret_id,
+                    StateItem::SharingRound {
+                        version: round_version,
+                        pending,
+                        confirmed,
+                        failed,
+                        started_at,
+                    },
+                )
+                .await;
         }
     }
 

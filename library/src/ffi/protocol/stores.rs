@@ -21,9 +21,10 @@ use prost::Message as _;
 
 use crate::protocol::{
     ChannelStoreError, ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore,
-    DeRecShareStore, DeRecTransport, DeRecUserSecretStore, MissingPolicy, SecretKind,
-    SecretStoreError, SecretStoreFuture, SecretValue, Share, ShareStoreError,
-    ShareStoreFuture, TransportFuture,
+    DeRecShareStore, DeRecStateStore, DeRecTransport, DeRecUserSecretStore, MissingPolicy,
+    SecretKind, SecretStoreError, SecretStoreFuture, SecretValue, Share, ShareStoreError,
+    ShareStoreFuture, StateItem, StateKey, StateKind, StateStoreError, StateStoreFuture,
+    TransportFuture,
 };
 use crate::protocol::types::{UserSecret, UserSecrets};
 
@@ -190,6 +191,239 @@ fn secret_kind_to_u32(kind: SecretKind) -> u32 {
         SecretKind::SharedKey => 0,
         SecretKind::PairingSecret => 1,
         SecretKind::PairingContact => 2,
+    }
+}
+
+/// JSON-on-the-wire shape of a [`StateKey`]. `kind` matches
+/// [`StateKind`]:
+/// - `0` = PendingVerification — `channel_id` present (stringified u64)
+/// - `1` = PendingRecovery — `version` present
+/// - `2` = PendingUnpair — `channel_id` present (stringified u64)
+/// - `3` = SharingRound — no secondary key
+///
+/// Absent fields are serialized as JSON `null` on outbound and are
+/// required-per-kind on inbound.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct StateKeyRecord {
+    pub kind: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+}
+
+impl From<&StateKey> for StateKeyRecord {
+    fn from(k: &StateKey) -> Self {
+        match k {
+            StateKey::PendingVerification { channel_id } => Self {
+                kind: 0,
+                channel_id: Some(channel_id.0.to_string()),
+                version: None,
+            },
+            StateKey::PendingRecovery { version } => Self {
+                kind: 1,
+                channel_id: None,
+                version: Some(*version),
+            },
+            StateKey::PendingUnpair { channel_id } => Self {
+                kind: 2,
+                channel_id: Some(channel_id.0.to_string()),
+                version: None,
+            },
+            StateKey::SharingRound => Self {
+                kind: 3,
+                channel_id: None,
+                version: None,
+            },
+        }
+    }
+}
+
+/// JSON-on-the-wire shape of a [`StateItem`]. `kind` matches
+/// [`StateKind`] (identical numbering to [`StateKeyRecord::kind`]):
+/// - `0` = PendingVerification — `channel_id`, `bytes` (prost-encoded
+///   [`derec_proto::VerifyShareRequestMessage`])
+/// - `1` = PendingRecovery — `version`, `shares` (each entry is a
+///   prost-encoded [`derec_proto::GetShareResponseMessage`])
+/// - `2` = PendingUnpair — `channel_id`, `started_at` (stringified u64
+///   unix-seconds)
+/// - `3` = SharingRound — `version`, `pending`, `confirmed`, `failed`
+///   (each channel-id set is stringified u64s), `started_at`
+///   (stringified u64 unix-seconds)
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct StateItemRecord {
+    pub kind: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shares: Option<Vec<Vec<u8>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed: Option<Vec<String>>,
+}
+
+impl From<&StateItem> for StateItemRecord {
+    fn from(v: &StateItem) -> Self {
+        match v {
+            StateItem::PendingVerification { channel_id, request } => Self {
+                kind: 0,
+                channel_id: Some(channel_id.0.to_string()),
+                version: None,
+                started_at: None,
+                bytes: Some(request.encode_to_vec()),
+                shares: None,
+                pending: None,
+                confirmed: None,
+                failed: None,
+            },
+            StateItem::PendingRecovery { version, shares } => Self {
+                kind: 1,
+                channel_id: None,
+                version: Some(*version),
+                started_at: None,
+                bytes: None,
+                shares: Some(shares.iter().map(|s| s.encode_to_vec()).collect()),
+                pending: None,
+                confirmed: None,
+                failed: None,
+            },
+            StateItem::PendingUnpair { channel_id, started_at } => Self {
+                kind: 2,
+                channel_id: Some(channel_id.0.to_string()),
+                version: None,
+                started_at: Some(started_at.to_string()),
+                bytes: None,
+                shares: None,
+                pending: None,
+                confirmed: None,
+                failed: None,
+            },
+            StateItem::SharingRound {
+                version,
+                pending,
+                confirmed,
+                failed,
+                started_at,
+            } => Self {
+                kind: 3,
+                channel_id: None,
+                version: Some(*version),
+                started_at: Some(started_at.to_string()),
+                bytes: None,
+                shares: None,
+                pending: Some(pending.iter().map(|c| c.0.to_string()).collect()),
+                confirmed: Some(confirmed.iter().map(|c| c.0.to_string()).collect()),
+                failed: Some(failed.iter().map(|c| c.0.to_string()).collect()),
+            },
+        }
+    }
+}
+
+fn parse_channel_id_set(
+    raw: Option<Vec<String>>,
+    field: &str,
+) -> Result<std::collections::HashSet<ChannelId>, String> {
+    raw.ok_or_else(|| format!("SharingRound requires {field}"))?
+        .into_iter()
+        .map(|s| {
+            s.parse::<u64>()
+                .map(ChannelId)
+                .map_err(|e| format!("{field} entry not a decimal u64: {e}"))
+        })
+        .collect()
+}
+
+impl StateItemRecord {
+    pub(crate) fn into_item(self) -> Result<StateItem, String> {
+        match self.kind {
+            0 => {
+                let channel_id_str = self
+                    .channel_id
+                    .ok_or_else(|| "PendingVerification requires channel_id".to_string())?;
+                let channel_id = channel_id_str
+                    .parse::<u64>()
+                    .map(ChannelId)
+                    .map_err(|e| format!("channel_id not a decimal u64: {e}"))?;
+                let bytes = self
+                    .bytes
+                    .ok_or_else(|| "PendingVerification requires bytes".to_string())?;
+                let request =
+                    derec_proto::VerifyShareRequestMessage::decode(bytes.as_slice())
+                        .map_err(|e| format!("VerifyShareRequestMessage decode: {e}"))?;
+                Ok(StateItem::PendingVerification { channel_id, request })
+            }
+            1 => {
+                let version = self
+                    .version
+                    .ok_or_else(|| "PendingRecovery requires version".to_string())?;
+                let raw_shares = self
+                    .shares
+                    .ok_or_else(|| "PendingRecovery requires shares".to_string())?;
+                let mut shares = Vec::with_capacity(raw_shares.len());
+                for (i, blob) in raw_shares.into_iter().enumerate() {
+                    let msg = derec_proto::GetShareResponseMessage::decode(blob.as_slice())
+                        .map_err(|e| format!("GetShareResponseMessage[{i}] decode: {e}"))?;
+                    shares.push(msg);
+                }
+                Ok(StateItem::PendingRecovery { version, shares })
+            }
+            2 => {
+                let channel_id_str = self
+                    .channel_id
+                    .ok_or_else(|| "PendingUnpair requires channel_id".to_string())?;
+                let channel_id = channel_id_str
+                    .parse::<u64>()
+                    .map(ChannelId)
+                    .map_err(|e| format!("channel_id not a decimal u64: {e}"))?;
+                let started_at_str = self
+                    .started_at
+                    .ok_or_else(|| "PendingUnpair requires started_at".to_string())?;
+                let started_at = started_at_str
+                    .parse::<u64>()
+                    .map_err(|e| format!("started_at not a decimal u64: {e}"))?;
+                Ok(StateItem::PendingUnpair { channel_id, started_at })
+            }
+            3 => {
+                let version = self
+                    .version
+                    .ok_or_else(|| "SharingRound requires version".to_string())?;
+                let started_at_str = self
+                    .started_at
+                    .ok_or_else(|| "SharingRound requires started_at".to_string())?;
+                let started_at = started_at_str
+                    .parse::<u64>()
+                    .map_err(|e| format!("started_at not a decimal u64: {e}"))?;
+                let pending = parse_channel_id_set(self.pending, "pending")?;
+                let confirmed = parse_channel_id_set(self.confirmed, "confirmed")?;
+                let failed = parse_channel_id_set(self.failed, "failed")?;
+                Ok(StateItem::SharingRound {
+                    version,
+                    pending,
+                    confirmed,
+                    failed,
+                    started_at,
+                })
+            }
+            other => Err(format!("unknown StateKind: {other}")),
+        }
+    }
+}
+
+fn state_kind_to_u32(kind: StateKind) -> u32 {
+    match kind {
+        StateKind::PendingVerification => 0,
+        StateKind::PendingRecovery => 1,
+        StateKind::PendingUnpair => 2,
+        StateKind::SharingRound => 3,
     }
 }
 
@@ -417,6 +651,51 @@ impl From<UserSecretsRecord> for UserSecrets {
             replicas: None,
         }
     }
+}
+
+/// Caller-supplied callbacks for orchestrator in-flight state
+/// ([`DeRecStateStore`]). The item and key travel as JSON buffers
+/// matching [`StateItemRecord`] / [`StateKeyRecord`].
+///
+/// # Return codes
+///
+/// - `load`: `0` = found (record written), `1` = not found (empty
+///   payload), other = backend failure.
+/// - `remove`: `0` = ok (`*out_removed` set to `0` or `1`), other =
+///   backend failure.
+/// - `save` / `load_all`: `0` = ok, other = backend failure.
+#[repr(C)]
+pub struct StateStoreCallbacks {
+    pub user_data: *mut c_void,
+    pub save: extern "C" fn(
+        user_data: *mut c_void,
+        secret_id: u64,
+        item_json_ptr: *const u8,
+        item_json_len: usize,
+    ) -> i32,
+    pub load: extern "C" fn(
+        user_data: *mut c_void,
+        secret_id: u64,
+        key_json_ptr: *const u8,
+        key_json_len: usize,
+        out_ptr: *mut *mut u8,
+        out_len: *mut usize,
+    ) -> i32,
+    pub remove: extern "C" fn(
+        user_data: *mut c_void,
+        secret_id: u64,
+        key_json_ptr: *const u8,
+        key_json_len: usize,
+        out_removed: *mut u32,
+    ) -> i32,
+    pub load_all: extern "C" fn(
+        user_data: *mut c_void,
+        secret_id: u64,
+        kind: u32,
+        out_ptr: *mut *mut u8,
+        out_len: *mut usize,
+    ) -> i32,
+    pub free_buffer: extern "C" fn(user_data: *mut c_void, ptr: *mut u8, len: usize),
 }
 
 /// Caller-supplied transport callback.
@@ -1059,5 +1338,134 @@ impl DeRecTransport for DotnetTransport {
                 Ok(())
             }
         })
+    }
+}
+
+/// Managed-callback adapter for the orchestrator state store. Wire
+/// format matches [`StateItemRecord`] / [`StateKeyRecord`] — JSON
+/// buffers with protobuf-encoded payloads inside byte arrays.
+pub struct DotnetStateStore {
+    pub(crate) cb: StateStoreCallbacks,
+}
+
+unsafe impl Send for DotnetStateStore {}
+unsafe impl Sync for DotnetStateStore {}
+
+impl DeRecStateStore for DotnetStateStore {
+    fn save(&mut self, secret_id: u64, item: StateItem) -> StateStoreFuture<'_, ()> {
+        let cb = &self.cb;
+        let res = (|| -> Result<(), StateStoreError> {
+            let record = StateItemRecord::from(&item);
+            let bytes = serde_json::to_vec(&record).map_err(|e| {
+                StateStoreError::Backend(boxed_err(format!("StateItem JSON: {e}")))
+            })?;
+            let rc = (cb.save)(cb.user_data, secret_id, bytes.as_ptr(), bytes.len());
+            if rc != 0 {
+                return Err(StateStoreError::Backend(boxed_err(format!(
+                    "state store save failed (rc={rc})"
+                ))));
+            }
+            Ok(())
+        })();
+        Box::pin(async move { res })
+    }
+
+    fn load(&self, secret_id: u64, key: StateKey) -> StateStoreFuture<'_, Option<StateItem>> {
+        let cb = &self.cb;
+        let res = (|| -> Result<Option<StateItem>, StateStoreError> {
+            let key_record = StateKeyRecord::from(&key);
+            let key_bytes = serde_json::to_vec(&key_record).map_err(|e| {
+                StateStoreError::Backend(boxed_err(format!("StateKey JSON: {e}")))
+            })?;
+            let bytes = fetch_callback_bytes(
+                cb.user_data,
+                cb.free_buffer,
+                "state store",
+                |p, l| {
+                    (cb.load)(
+                        cb.user_data,
+                        secret_id,
+                        key_bytes.as_ptr(),
+                        key_bytes.len(),
+                        p,
+                        l,
+                    )
+                },
+            )
+            .map_err(|e| StateStoreError::Backend(boxed_err(e)))?;
+            let Some(bytes) = bytes else { return Ok(None) };
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            let record: StateItemRecord = serde_json::from_slice(&bytes).map_err(|e| {
+                StateStoreError::Backend(boxed_err(format!("StateItem JSON: {e}")))
+            })?;
+            let item = record
+                .into_item()
+                .map_err(|e| StateStoreError::Backend(boxed_err(e)))?;
+            Ok(Some(item))
+        })();
+        Box::pin(async move { res })
+    }
+
+    fn remove(&mut self, secret_id: u64, key: StateKey) -> StateStoreFuture<'_, bool> {
+        let cb = &self.cb;
+        let res = (|| -> Result<bool, StateStoreError> {
+            let key_record = StateKeyRecord::from(&key);
+            let key_bytes = serde_json::to_vec(&key_record).map_err(|e| {
+                StateStoreError::Backend(boxed_err(format!("StateKey JSON: {e}")))
+            })?;
+            let mut removed: u32 = 0;
+            let rc = (cb.remove)(
+                cb.user_data,
+                secret_id,
+                key_bytes.as_ptr(),
+                key_bytes.len(),
+                &mut removed as *mut _,
+            );
+            if rc != 0 {
+                return Err(StateStoreError::Backend(boxed_err(format!(
+                    "state store remove failed (rc={rc})"
+                ))));
+            }
+            Ok(removed != 0)
+        })();
+        Box::pin(async move { res })
+    }
+
+    fn load_all(
+        &self,
+        secret_id: u64,
+        kind: StateKind,
+    ) -> StateStoreFuture<'_, Vec<StateItem>> {
+        let cb = &self.cb;
+        let kind_u32 = state_kind_to_u32(kind);
+        let res = (|| -> Result<Vec<StateItem>, StateStoreError> {
+            let bytes = fetch_callback_bytes(
+                cb.user_data,
+                cb.free_buffer,
+                "state store",
+                |p, l| (cb.load_all)(cb.user_data, secret_id, kind_u32, p, l),
+            )
+            .map_err(|e| StateStoreError::Backend(boxed_err(e)))?;
+            let Some(bytes) = bytes else { return Ok(Vec::new()) };
+            if bytes.is_empty() {
+                return Ok(Vec::new());
+            }
+            let records: Vec<StateItemRecord> =
+                serde_json::from_slice(&bytes).map_err(|e| {
+                    StateStoreError::Backend(boxed_err(format!(
+                        "StateItem list JSON: {e}"
+                    )))
+                })?;
+            let mut out = Vec::with_capacity(records.len());
+            for r in records {
+                out.push(r.into_item().map_err(|e| {
+                    StateStoreError::Backend(boxed_err(e))
+                })?);
+            }
+            Ok(out)
+        })();
+        Box::pin(async move { res })
     }
 }

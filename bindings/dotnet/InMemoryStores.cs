@@ -151,6 +151,31 @@ internal sealed class InMemoryUserSecretStore : IUserSecretStore
 }
 
 /// <summary>
+/// Keyed by <c>(secretId, StateKey)</c>. Holds the full
+/// <see cref="StateItem"/> payload — same load-modify-save contract as
+/// the Rust-side in-memory implementation.
+/// </summary>
+internal sealed class InMemoryStateStore : IStateStore
+{
+    private readonly Dictionary<(ulong, StateKey), StateItem> _data = new();
+
+    public void Save(ulong secretId, StateItem item) =>
+        _data[(secretId, item.Key())] = item;
+
+    public StateItem? Load(ulong secretId, StateKey key) =>
+        _data.TryGetValue((secretId, key), out var v) ? v : null;
+
+    public bool Remove(ulong secretId, StateKey key) =>
+        _data.Remove((secretId, key));
+
+    public IEnumerable<StateItem> LoadAll(ulong secretId, StateKind kind) =>
+        _data
+            .Where(kv => kv.Key.Item1 == secretId && kv.Key.Item2.Kind == kind)
+            .Select(kv => kv.Value)
+            .ToArray();
+}
+
+/// <summary>
 /// Captures every outbound message in <see cref="Outbox"/> so tests can
 /// hand-pump envelopes to the peer's
 /// <see cref="DeRec.Library.Orchestrator.DeRecProtocol.ProcessAsync"/>.

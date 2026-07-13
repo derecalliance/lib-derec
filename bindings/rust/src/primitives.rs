@@ -57,8 +57,7 @@ fn run_pairing_flow_test() {
         TransportProtocol {
             uri: "https://example.com/alice".to_owned(),
             protocol: Protocol::Https.into(),
-        },
-    )
+        }, None)
     .expect("pair_request::create_contact failed");
 
     let contact_wire_bytes = contact_result.contact_message.encode_to_vec();
@@ -104,14 +103,14 @@ fn run_pairing_flow_test() {
 
     // Initiator extracts the request using its ECIES secret key.
     let extracted_request =
-        pair_request::extract(&pair_req.envelope, contact_result.secret_key.ecies_secret_key())
+        pair_request::extract(&pair_req.envelope, contact_result.secret_key.as_ref().unwrap().ecies_secret_key())
             .expect("pair_request::extract failed");
 
     // Initiator produces the pairing response and derives its shared key.
     let pair_resp = pair_response::produce(
         channel_id,
         &extracted_request.request,
-        &contact_result.secret_key,
+        contact_result.secret_key.as_ref().unwrap(),
         None, None,
     )
     .expect("pair_response::produce failed");
@@ -172,8 +171,7 @@ fn run_pairing_flow_hashed_keys_test() {
         TransportProtocol {
             uri: "https://example.com/alice/ephemeral".to_owned(),
             protocol: Protocol::Https.into(),
-        },
-    )
+        }, None)
     .expect("pair_request::create_contact (HASHED_KEYS) failed");
 
     let alice_contact = alice_contact_result.contact_message.clone();
@@ -227,7 +225,7 @@ fn run_pairing_flow_hashed_keys_test() {
     let alice_prepair_resp = pair_response::produce_pre_pair(
         channel_id,
         &extracted_prepair_req.request,
-        &alice_secret,
+        alice_secret.as_ref().unwrap(),
     )
     .expect("pair_response::produce_pre_pair failed");
 
@@ -284,13 +282,13 @@ fn run_pairing_flow_hashed_keys_test() {
     )
     .expect("pair_request::produce failed");
 
-    let extracted_request = pair_request::extract(&pair_req.envelope, alice_secret.ecies_secret_key())
+    let extracted_request = pair_request::extract(&pair_req.envelope, alice_secret.as_ref().unwrap().ecies_secret_key())
         .expect("pair_request::extract failed");
 
     let pair_resp = pair_response::produce(
         channel_id,
         &extracted_request.request,
-        &alice_secret,
+        alice_secret.as_ref().unwrap(),
         None, None,
     )
     .expect("pair_response::produce failed");

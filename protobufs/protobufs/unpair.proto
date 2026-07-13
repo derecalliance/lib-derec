@@ -93,7 +93,7 @@ message UnpairRequestMessage {
 // On failure:
 //
 // - the relationship state is undefined and SHOULD be handled by the
-//   application (e.g., retry or escalate)
+//  application (e.g., retry or escalate)
 //
 // # Idempotency
 //

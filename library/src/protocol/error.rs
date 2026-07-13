@@ -81,6 +81,23 @@ pub enum ChannelStoreError {
     Backend(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 }
 
+/// Errors produced by [`DeRecStateStore`](super::DeRecStateStore) implementations.
+///
+/// The state store holds in-flight orchestrator state (outstanding
+/// verification challenges, in-progress recovery accumulators, pending unpair
+/// acknowledgements) so that stateless or load-balanced deployments do not
+/// lose it across process restarts.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum StateStoreError {
+    /// An I/O or serialization error in the underlying storage backend.
+    ///
+    /// The original error is preserved as the `source` so that callers can
+    /// inspect the full error chain via [`std::error::Error::source`].
+    #[error("state store backend error")]
+    Backend(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+}
+
 /// Errors produced by [`DeRecShareStore`](super::DeRecShareStore) implementations.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

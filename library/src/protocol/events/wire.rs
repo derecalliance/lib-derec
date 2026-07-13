@@ -34,6 +34,7 @@ use crate::protocol::{
 pub(crate) enum Event {
     PairingCompleted {
         channel_id: String,
+        pairing_channel_id: String,
         kind: i32,
         #[serde(skip_serializing_if = "HashMap::is_empty")]
         peer_communication_info: HashMap<String, String>,
@@ -160,6 +161,54 @@ pub(crate) enum Event {
         action_kind: String,
     },
     NoOp,
+    PairingStarted {
+        channel_id: String,
+        kind: i32,
+    },
+    DiscoveryStarted {
+        channel_id: String,
+    },
+    DiscoveryFailed {
+        channel_id: String,
+        error: String,
+    },
+    ProtectSecretStarted {
+        channel_id: String,
+        version: u32,
+    },
+    ProtectSecretFailed {
+        channel_id: String,
+        version: u32,
+        error: String,
+    },
+    VerifySharesStarted {
+        channel_id: String,
+        version: u32,
+    },
+    VerifySharesFailed {
+        channel_id: String,
+        version: u32,
+        error: String,
+    },
+    RecoverSecretStarted {
+        channel_id: String,
+        version: u32,
+    },
+    RecoverSecretFailed {
+        channel_id: String,
+        version: u32,
+        error: String,
+    },
+    UnpairStarted {
+        channel_id: String,
+    },
+    UpdateChannelInfoStarted {
+        channel_id: String,
+    },
+    UpdateChannelInfoFailed {
+        channel_id: String,
+        error: String,
+    },
 }
 
 #[derive(Serialize)]
@@ -283,10 +332,12 @@ impl Event {
         Ok(match event {
             DeRecEvent::PairingCompleted {
                 channel_id,
+                pairing_channel_id,
                 kind,
                 peer_communication_info,
             } => Self::PairingCompleted {
                 channel_id: channel_id.0.to_string(),
+                pairing_channel_id: pairing_channel_id.0.to_string(),
                 kind: kind as i32,
                 peer_communication_info,
             },
@@ -461,6 +512,79 @@ impl Event {
                 }
             }
             DeRecEvent::NoOp => Self::NoOp,
+            DeRecEvent::PairingStarted { channel_id, kind } => Self::PairingStarted {
+                channel_id: channel_id.0.to_string(),
+                kind: kind as i32,
+            },
+            DeRecEvent::DiscoveryStarted { channel_id } => Self::DiscoveryStarted {
+                channel_id: channel_id.0.to_string(),
+            },
+            DeRecEvent::DiscoveryFailed { channel_id, error } => Self::DiscoveryFailed {
+                channel_id: channel_id.0.to_string(),
+                error,
+            },
+            DeRecEvent::ProtectSecretStarted {
+                channel_id,
+                version,
+            } => Self::ProtectSecretStarted {
+                channel_id: channel_id.0.to_string(),
+                version,
+            },
+            DeRecEvent::ProtectSecretFailed {
+                channel_id,
+                version,
+                error,
+            } => Self::ProtectSecretFailed {
+                channel_id: channel_id.0.to_string(),
+                version,
+                error,
+            },
+            DeRecEvent::VerifySharesStarted {
+                channel_id,
+                version,
+            } => Self::VerifySharesStarted {
+                channel_id: channel_id.0.to_string(),
+                version,
+            },
+            DeRecEvent::VerifySharesFailed {
+                channel_id,
+                version,
+                error,
+            } => Self::VerifySharesFailed {
+                channel_id: channel_id.0.to_string(),
+                version,
+                error,
+            },
+            DeRecEvent::RecoverSecretStarted {
+                channel_id,
+                version,
+            } => Self::RecoverSecretStarted {
+                channel_id: channel_id.0.to_string(),
+                version,
+            },
+            DeRecEvent::RecoverSecretFailed {
+                channel_id,
+                version,
+                error,
+            } => Self::RecoverSecretFailed {
+                channel_id: channel_id.0.to_string(),
+                version,
+                error,
+            },
+            DeRecEvent::UnpairStarted { channel_id } => Self::UnpairStarted {
+                channel_id: channel_id.0.to_string(),
+            },
+            DeRecEvent::UpdateChannelInfoStarted { channel_id } => {
+                Self::UpdateChannelInfoStarted {
+                    channel_id: channel_id.0.to_string(),
+                }
+            }
+            DeRecEvent::UpdateChannelInfoFailed { channel_id, error } => {
+                Self::UpdateChannelInfoFailed {
+                    channel_id: channel_id.0.to_string(),
+                    error,
+                }
+            }
             // `#[non_exhaustive]` — future variants degrade to NoOp so
             // bridges don't break on a re-genned enum.
             #[allow(unreachable_patterns)]

@@ -18,8 +18,8 @@ use crate::ffi::error::{
 };
 use crate::ffi::protocol::stores::{
     ChannelStoreCallbacks, DotnetChannelStore, DotnetSecretStore, DotnetShareStore,
-    DotnetTransport, DotnetUserSecretStore, SecretStoreCallbacks, ShareStoreCallbacks,
-    TransportCallbacks, UserSecretStoreCallbacks,
+    DotnetStateStore, DotnetTransport, DotnetUserSecretStore, SecretStoreCallbacks,
+    ShareStoreCallbacks, StateStoreCallbacks, TransportCallbacks, UserSecretStoreCallbacks,
 };
 use crate::protocol::DeRecProtocolBuilder;
 
@@ -32,6 +32,7 @@ pub(super) type Protocol = crate::protocol::DeRecProtocol<
     DotnetShareStore,
     DotnetSecretStore,
     DotnetUserSecretStore,
+    DotnetStateStore,
     DotnetTransport,
 >;
 
@@ -159,6 +160,7 @@ pub unsafe extern "C" fn derec_protocol_new(
     secret_store_cb: *const SecretStoreCallbacks,
     share_store_cb: *const ShareStoreCallbacks,
     user_secret_store_cb: *const UserSecretStoreCallbacks,
+    state_store_cb: *const StateStoreCallbacks,
     transport_cb: *const TransportCallbacks,
     own_transport_uri_ptr: *const u8,
     own_transport_uri_len: usize,
@@ -184,6 +186,7 @@ pub unsafe extern "C" fn derec_protocol_new(
         || secret_store_cb.is_null()
         || share_store_cb.is_null()
         || user_secret_store_cb.is_null()
+        || state_store_cb.is_null()
         || transport_cb.is_null()
     {
         return ffi_error(
@@ -299,6 +302,9 @@ pub unsafe extern "C" fn derec_protocol_new(
     let user_secret_store = DotnetUserSecretStore {
         cb: unsafe { std::ptr::read(user_secret_store_cb) },
     };
+    let state_store = DotnetStateStore {
+        cb: unsafe { std::ptr::read(state_store_cb) },
+    };
     let transport = DotnetTransport {
         cb: unsafe { std::ptr::read(transport_cb) },
     };
@@ -308,6 +314,7 @@ pub unsafe extern "C" fn derec_protocol_new(
         .with_share_store(share_store)
         .with_secret_store(secret_store)
         .with_user_secret_store(user_secret_store)
+        .with_state_store(state_store)
         .with_transport(transport)
         .with_own_transport(own_transport)
         .with_threshold(threshold as usize)
@@ -328,7 +335,8 @@ pub unsafe extern "C" fn derec_protocol_new(
         Err(e) => return crate::ffi::error::from_lib_error(e).into(),
     };
 
-    let runtime = match tokio::runtime::Builder::new_current_thread().build() {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .build() {
         Ok(rt) => rt,
         Err(e) => {
             return ffi_error(

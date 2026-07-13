@@ -82,7 +82,7 @@ pub async fn run() {
     owner
         .protocol
         .start(DeRecFlow::Unpair {
-            target: Target::Single(cid),
+            channel_id: cid,
             memo: Some("decommissioning".to_owned()),
         })
         .await

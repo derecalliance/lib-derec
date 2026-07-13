@@ -35,6 +35,7 @@ public sealed class DeRecProtocolBuilder
     private IShareStore? _shareStore;
     private ISecretStore? _secretStore;
     private IUserSecretStore? _userSecretStore;
+    private IStateStore? _stateStore;
     private ITransport? _transport;
     private TransportProtocol? _ownTransport;
     private int _threshold = 3;
@@ -84,6 +85,13 @@ public sealed class DeRecProtocolBuilder
     public DeRecProtocolBuilder WithUserSecretStore(IUserSecretStore store)
     {
         _userSecretStore = store ?? throw new ArgumentNullException(nameof(store));
+        return this;
+    }
+
+    /// <summary>Set the state-store implementation. Required.</summary>
+    public DeRecProtocolBuilder WithStateStore(IStateStore store)
+    {
+        _stateStore = store ?? throw new ArgumentNullException(nameof(store));
         return this;
     }
 
@@ -206,6 +214,7 @@ public sealed class DeRecProtocolBuilder
         if (_shareStore is null) throw new InvalidOperationException("WithShareStore is required");
         if (_secretStore is null) throw new InvalidOperationException("WithSecretStore is required");
         if (_userSecretStore is null) throw new InvalidOperationException("WithUserSecretStore is required");
+        if (_stateStore is null) throw new InvalidOperationException("WithStateStore is required");
         if (_transport is null) throw new InvalidOperationException("WithTransport is required");
         if (_ownTransport is null) throw new InvalidOperationException("WithOwnTransport is required");
 
@@ -218,6 +227,7 @@ public sealed class DeRecProtocolBuilder
             shareStore: _shareStore,
             secretStore: _secretStore,
             userSecretStore: _userSecretStore,
+            stateStore: _stateStore,
             transport: _transport,
             ownTransportUri: _ownTransport.Uri,
             ownTransportProtocol: _ownTransport.Protocol.ToString().ToLowerInvariant(),

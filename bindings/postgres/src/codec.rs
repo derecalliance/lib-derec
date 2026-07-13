@@ -101,5 +101,6 @@ pub fn assemble_user_secrets(
         version,
         description,
         secrets: decode_user_secrets_payload(&payload),
+        replicas: None,
     }
 }

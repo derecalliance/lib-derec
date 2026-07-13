@@ -83,6 +83,35 @@ export interface UserSecretStore {
   remove(secretId: string): Promise<void>;
 }
 
+/**
+ * In-flight orchestrator state persistence. The library treats item
+ * payloads as opaque JSON blobs — `save` writes the blob, `load`
+ * returns the exact blob it received, `remove` drops the row, and
+ * `loadAll` returns every blob whose `kind` matches the requested
+ * category (`0` = PendingVerification, `1` = PendingRecovery,
+ * `2` = PendingUnpair, `3` = SharingRound).
+ *
+ * Rows are keyed by `(secretId, StateKey)` — the `keyJson` buffer is
+ * a JSON object `{ kind, channel_id?, version? }` matching the `kind`
+ * numbering above. The library will `save`/`load`/`remove` under the
+ * same key across a session, so implementations can hash the entire
+ * `keyJson` buffer or unpack its fields (`kind` + `channel_id` +
+ * `version`) as the composite key.
+ *
+ * Save is full-replacement upsert — accumulator-style state
+ * (PendingRecovery and SharingRound) grows via load-modify-save cycles
+ * from the library; no per-row append primitive is required.
+ */
+export interface StateStore {
+  save(secretId: string, itemJson: Uint8Array): Promise<void>;
+  load(
+    secretId: string,
+    keyJson: Uint8Array,
+  ): Promise<Uint8Array | null | undefined>;
+  remove(secretId: string, keyJson: Uint8Array): Promise<boolean>;
+  loadAll(secretId: string, kind: 0 | 1 | 2 | 3): Promise<Uint8Array[]>;
+}
+
 export interface Transport {
   send(endpoint: { protocol: string; uri: string }, message: Uint8Array): Promise<void>;
 }
@@ -102,10 +131,20 @@ export enum SenderKind {
  * - `HashedKeys`: only a SHA-384 commitment to the keys is in the contact;
  *   the scanner must fetch the actual keys over the wire via the `PrePair`
  *   round-trip and verify them against the commitment before pairing.
+ * - `NoKeys`: no key material and no commitment. The contact carries only
+ *   `channel_id`, `nonce`, and `transport_protocol` — small enough to be
+ *   hand-typed or dictated. Keys are generated on the fly by the contact
+ *   creator when the `PrePairRequest` arrives; the scanner accepts them
+ *   without cryptographic verification. Trust rests entirely on the OOB
+ *   delivery channel being fully trusted (e.g. a verified email from an
+ *   already-KYC-authenticated institution). Applications MUST rate-limit
+ *   inbound `PrePairRequest`s per channel and expire outstanding NoKeys
+ *   contacts on a short timer.
  */
 export enum ContactMode {
   InlineKeys = 0,
   HashedKeys = 1,
+  NoKeys = 2,
 }
 
 export enum FlowKind {
@@ -122,7 +161,7 @@ export type UnpairAck = "required" | "not_required";
 
 export interface ContactMessage {
   channel_id: bigint;
-  /** `ContactMode` numeric value (0 = INLINE_KEYS, 1 = HASHED_KEYS). */
+  /** `ContactMode` numeric value (0 = INLINE_KEYS, 1 = HASHED_KEYS, 2 = NO_KEYS). */
   contact_mode: number;
   transport_protocol?: TransportProtocol;
   nonce: bigint;
@@ -168,7 +207,7 @@ export interface RecoverSecretParams {
   version: number;
 }
 export interface UnpairParams {
-  target?: Target;
+  channel_id: string;
 
   memo?: string;
 }
@@ -184,7 +223,15 @@ export interface UpdateChannelInfoParams {
 }
 
 export type DeRecEvent =
-  | { type: "PairingCompleted"; channel_id: string; kind: SenderKind; peer_communication_info?: Record<string, string> }
+  | {
+      type: "PairingCompleted";
+      /** Long-term `channel_id` both peers atomically rotated to at handshake completion. */
+      channel_id: string;
+      /** Transient `channel_id` used only during pairing (the one that traveled on the ContactMessage). No longer resolves in library state. */
+      pairing_channel_id: string;
+      kind: SenderKind;
+      peer_communication_info?: Record<string, string>;
+    }
   | {
       type: "ActionRequired";
       channel_id: string;
@@ -351,7 +398,54 @@ export type DeRecEvent =
    *  is the same label vocabulary as `ActionRequired.action_kind`
    *  (`"Pairing"`, `"StoreShare"`, …). */
   | { type: "AutoAccepted"; channel_id: string; action_kind: string }
-  | { type: "NoOp" };
+  | { type: "NoOp" }
+  /** A pairing handshake was dispatched successfully. `kind` is the
+   *  local party's role — same value the subsequent `PairingCompleted`
+   *  will carry. Emitted by `start(Pairing)`. */
+  | { type: "PairingStarted"; channel_id: string; kind: SenderKind }
+  /** A discovery request was dispatched to `channel_id`. Emitted per
+   *  targeted helper by `start(Discovery)`. */
+  | { type: "DiscoveryStarted"; channel_id: string }
+  /** A discovery request could not be dispatched to `channel_id`. Other
+   *  targeted channels are unaffected. */
+  | { type: "DiscoveryFailed"; channel_id: string; error: string }
+  /** A share-storage request was dispatched to `channel_id`. Emitted per
+   *  targeted peer by `start(ProtectSecret)`. */
+  | { type: "ProtectSecretStarted"; channel_id: string; version: number }
+  /** A share-storage request could not be dispatched to `channel_id`. */
+  | {
+      type: "ProtectSecretFailed";
+      channel_id: string;
+      version: number;
+      error: string;
+    }
+  /** A verify-share challenge was dispatched to `channel_id`. */
+  | { type: "VerifySharesStarted"; channel_id: string; version: number }
+  /** A verify-share challenge could not be dispatched to `channel_id`. */
+  | {
+      type: "VerifySharesFailed";
+      channel_id: string;
+      version: number;
+      error: string;
+    }
+  /** A recovery share request was dispatched to `channel_id`. */
+  | { type: "RecoverSecretStarted"; channel_id: string; version: number }
+  /** A recovery share request could not be dispatched to `channel_id`. */
+  | {
+      type: "RecoverSecretFailed";
+      channel_id: string;
+      version: number;
+      error: string;
+    }
+  /** An unpair request was dispatched to `channel_id`. Followed by an
+   *  `Unpaired` event once the peer acknowledges (or in the same event
+   *  vec, under `UnpairAck.NotRequired`). */
+  | { type: "UnpairStarted"; channel_id: string }
+  /** An update-channel-info request was dispatched to `channel_id`. */
+  | { type: "UpdateChannelInfoStarted"; channel_id: string }
+  /** An update-channel-info request could not be dispatched to
+   *  `channel_id`. */
+  | { type: "UpdateChannelInfoFailed"; channel_id: string; error: string };
 
 /**
  * Per-flow auto-accept policy. When a field is `true`, `process()`
@@ -407,6 +501,7 @@ export declare class DeRecProtocolBuilder {
   withShareStore(store: ShareStore): DeRecProtocolBuilder;
   withSecretStore(store: SecretStore): DeRecProtocolBuilder;
   withUserSecretStore(store: UserSecretStore): DeRecProtocolBuilder;
+  withStateStore(store: StateStore): DeRecProtocolBuilder;
   withTransport(transport: Transport): DeRecProtocolBuilder;
   withOwnTransport(endpoint: { uri: string; protocol: string }): DeRecProtocolBuilder;
 
@@ -471,15 +566,32 @@ export declare class DeRecProtocol {
    *                     `HashedKeys` requires `ownTransportUri` to be
    *                     ephemeral.
    */
-  createContact(channelId: bigint | null | undefined, contactMode: ContactMode): Promise<ContactMessage>;
+  /**
+   * Single entry point for all three `ContactMode` variants.
+   *
+   * @param channelId `null`/`undefined` lets the library mint a random id.
+   * @param contactMode `InlineKeys` embeds keys directly; `HashedKeys`
+   * embeds only a SHA-384 commitment (keys fetched via `PrePair`);
+   * `NoKeys` carries no key material — the creator generates keys on the
+   * fly when the `PrePairRequest` arrives. Only appropriate for `NoKeys`
+   * when the OOB delivery channel is fully trusted.
+   * @param nonce `null`/`undefined` lets the library generate a fresh
+   * random `bigint`. Required for `NoKeys` where callers typically pick
+   * a small human-typable value.
+   */
+  createContact(
+    channelId: bigint | null | undefined,
+    contactMode: ContactMode,
+    nonce?: bigint | null,
+  ): Promise<ContactMessage>;
 
-  start(flowKind: FlowKind.Pairing, params: PairingParams): Promise<bigint>;
-  start(flowKind: FlowKind.Discovery, params: DiscoveryParams): Promise<null>;
-  start(flowKind: FlowKind.ProtectSecret, params: ProtectSecretParams): Promise<null>;
-  start(flowKind: FlowKind.VerifyShares, params: VerifySharesParams): Promise<null>;
-  start(flowKind: FlowKind.RecoverSecret, params: RecoverSecretParams): Promise<null>;
-  start(flowKind: FlowKind.Unpair, params: UnpairParams): Promise<null>;
-  start(flowKind: FlowKind.UpdateChannelInfo, params: UpdateChannelInfoParams): Promise<null>;
+  start(flowKind: FlowKind.Pairing, params: PairingParams): Promise<DeRecEvent[]>;
+  start(flowKind: FlowKind.Discovery, params: DiscoveryParams): Promise<DeRecEvent[]>;
+  start(flowKind: FlowKind.ProtectSecret, params: ProtectSecretParams): Promise<DeRecEvent[]>;
+  start(flowKind: FlowKind.VerifyShares, params: VerifySharesParams): Promise<DeRecEvent[]>;
+  start(flowKind: FlowKind.RecoverSecret, params: RecoverSecretParams): Promise<DeRecEvent[]>;
+  start(flowKind: FlowKind.Unpair, params: UnpairParams): Promise<DeRecEvent[]>;
+  start(flowKind: FlowKind.UpdateChannelInfo, params: UpdateChannelInfoParams): Promise<DeRecEvent[]>;
 
   /**
    * Replace this node's local <c>communication_info</c> map. Does not
@@ -533,7 +645,7 @@ export declare class DeRecProtocol {
   restore(
     recoveredSecret: Extract<DeRecEvent, { type: "SecretRecovered" }>["secret"],
     version: number,
-  ): Promise<void>;
+  ): Promise<DeRecEvent[]>;
 }
 
 /**

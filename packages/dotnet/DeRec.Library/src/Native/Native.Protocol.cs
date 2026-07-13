@@ -163,6 +163,39 @@ internal static class Protocol
     }
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate int StateStoreSaveDelegate(
+        IntPtr userData, ulong secretId,
+        IntPtr itemJsonPtr, UIntPtr itemJsonLen);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate int StateStoreLoadDelegate(
+        IntPtr userData, ulong secretId,
+        IntPtr keyJsonPtr, UIntPtr keyJsonLen,
+        out IntPtr outPtr, out UIntPtr outLen);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate int StateStoreRemoveDelegate(
+        IntPtr userData, ulong secretId,
+        IntPtr keyJsonPtr, UIntPtr keyJsonLen,
+        out uint outRemoved);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate int StateStoreLoadAllDelegate(
+        IntPtr userData, ulong secretId, uint kind,
+        out IntPtr outPtr, out UIntPtr outLen);
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct StateStoreCallbacks
+    {
+        public IntPtr UserData;
+        public IntPtr Save;
+        public IntPtr Load;
+        public IntPtr Remove;
+        public IntPtr LoadAll;
+        public IntPtr FreeBuffer;
+    }
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int TransportSendDelegate(
         IntPtr userData, IntPtr uriPtr, UIntPtr uriLen, int protocol,
         IntPtr bytes, UIntPtr len);
@@ -214,6 +247,7 @@ internal static class Protocol
         ref SecretStoreCallbacks secretStoreCb,
         ref ShareStoreCallbacks shareStoreCb,
         ref UserSecretStoreCallbacks userSecretStoreCb,
+        ref StateStoreCallbacks stateStoreCb,
         ref TransportCallbacks transportCb,
         byte[] ownTransportUri, UIntPtr ownTransportUriLen,
         int ownTransportProtocol,
@@ -248,19 +282,12 @@ internal static class Protocol
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern DeRecProtocolCreateContactResult derec_protocol_create_contact(
-        IntPtr handle, uint hasChannelId, ulong channelId, int contactMode);
-
-    [StructLayout(LayoutKind.Sequential)]
-    internal struct DeRecProtocolStartResult
-    {
-        public DeRecError Error;
-        public uint HasChannelId;
-        public ulong ChannelId;
-    }
-
-    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
-    internal static extern DeRecProtocolStartResult derec_protocol_start(
-        IntPtr handle, uint flowKind, byte[]? paramsJson, UIntPtr paramsJsonLen);
+        IntPtr handle,
+        uint hasChannelId,
+        ulong channelId,
+        int contactMode,
+        uint hasNonce,
+        ulong nonce);
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct DeRecProtocolEventsResult
@@ -268,6 +295,10 @@ internal static class Protocol
         public DeRecError Error;
         public Buffer EventsJson;
     }
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern DeRecProtocolEventsResult derec_protocol_start(
+        IntPtr handle, uint flowKind, byte[]? paramsJson, UIntPtr paramsJsonLen);
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern DeRecProtocolEventsResult derec_protocol_process(
@@ -291,6 +322,6 @@ internal static class Protocol
         IntPtr handle, byte[] uri, UIntPtr uriLen, int protocol);
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
-    internal static extern DeRecError derec_protocol_restore(
+    internal static extern DeRecProtocolEventsResult derec_protocol_restore(
         IntPtr handle, byte[] paramsJson, UIntPtr paramsJsonLen);
 }

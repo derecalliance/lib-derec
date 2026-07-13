@@ -168,7 +168,7 @@ pub fn produce(
 /// let shared_key = [7u8; 32];
 ///
 /// let request::ProduceResult { envelope } =
-///     request::produce(channel_id, "no longer needed", &shared_key)
+///     request::produce(channel_id, "no longer needed", &shared_key, None)
 ///         .expect("failed to build unpair request");
 ///
 /// let request::ExtractResult { request } =

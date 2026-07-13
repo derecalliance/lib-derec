@@ -73,6 +73,9 @@ pub enum Error {
     ShareStore(#[from] crate::protocol::ShareStoreError),
 
     #[error(transparent)]
+    StateStore(#[from] crate::protocol::StateStoreError),
+
+    #[error(transparent)]
     Transport(#[from] crate::transport::TransportValidationError),
 
     #[error("invalid input: {0}")]

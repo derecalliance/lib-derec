@@ -7,6 +7,7 @@ use super::{
 };
 use crate::{
     primitives::pairing::request,
+    utils::ContactMessageExt as _,
     wasm::{
         primitives::helpers::{from_js, to_js},
         ts_bindings_utils::{js_error, js_error_from_lib},
@@ -19,6 +20,9 @@ use wasm_bindgen::prelude::*;
 #[derive(Serialize, Deserialize)]
 pub struct CreateContactResult {
     pub contact_message: ContactMessage,
+    /// Empty for `NoKeys` mode (no keys are generated at
+    /// contact-creation time). Populated for `InlineKeys` and
+    /// `HashedKeys`.
     #[serde(with = "serde_bytes")]
     pub secret_key: Vec<u8>,
 }
@@ -42,6 +46,7 @@ pub fn create_contact(
     channel_id: u64,
     contact_mode: u32,
     transport_protocol: JsValue,
+    nonce: JsValue,
 ) -> Result<JsValue, JsValue> {
     let contact_mode = derec_proto::ContactMode::try_from(contact_mode as i32).map_err(|_| {
         js_error(
@@ -51,14 +56,36 @@ pub fn create_contact(
     })?;
     let transport_protocol: TransportProtocol = from_js(transport_protocol)?;
     let transport_protocol_proto: derec_proto::TransportProtocol = transport_protocol.into();
+    let nonce = if nonce.is_null() || nonce.is_undefined() {
+        None
+    } else if nonce.is_bigint() {
+        Some(
+            u64::try_from(js_sys::BigInt::from(nonce))
+                .map_err(|e| {
+                    js_error("INVALID_NONCE", format!("nonce out of u64 range: {e:?}"))
+                })?,
+        )
+    } else {
+        Some(nonce.as_f64().ok_or_else(|| {
+            js_error("INVALID_NONCE", "nonce must be BigInt, number, or null")
+        })? as u64)
+    };
 
-    let result =
-        request::create_contact(channel_id.into(), contact_mode, transport_protocol_proto)
-            .map_err(js_error_from_lib)?;
+    let result = request::create_contact(
+        channel_id.into(),
+        contact_mode,
+        transport_protocol_proto,
+        nonce,
+    )
+    .map_err(js_error_from_lib)?;
 
+    let secret_key = match result.secret_key.as_ref() {
+        Some(k) => serialize_pairing_secret_key_material(k)?,
+        None => Vec::new(),
+    };
     to_js(&CreateContactResult {
         contact_message: result.contact_message.into(),
-        secret_key: serialize_pairing_secret_key_material(&result.secret_key)?,
+        secret_key,
     })
 }
 
@@ -69,7 +96,7 @@ pub fn create_contact(
 pub fn validate_contact_message(contact_message: JsValue) -> Result<(), JsValue> {
     let cm: ContactMessage = from_js(contact_message)?;
     let cm_proto: derec_proto::ContactMessage = cm.into();
-    request::validate(&cm_proto).map_err(js_error_from_lib)
+    cm_proto.validate().map_err(js_error_from_lib)
 }
 
 /// Encodes a [`ContactMessage`] to proto wire bytes. Structurally validates
@@ -80,7 +107,7 @@ pub fn validate_contact_message(contact_message: JsValue) -> Result<(), JsValue>
 pub fn encode_contact(contact_message: JsValue) -> Result<Vec<u8>, JsValue> {
     let cm: ContactMessage = from_js(contact_message)?;
     let cm_proto: derec_proto::ContactMessage = cm.into();
-    request::validate(&cm_proto).map_err(js_error_from_lib)?;
+    cm_proto.validate().map_err(js_error_from_lib)?;
     Ok(cm_proto.encode_to_vec())
 }
 
@@ -91,7 +118,7 @@ pub fn encode_contact(contact_message: JsValue) -> Result<Vec<u8>, JsValue> {
 pub fn decode_contact(bytes: &[u8]) -> Result<JsValue, JsValue> {
     let cm = derec_proto::ContactMessage::decode(bytes)
         .map_err(|e| js_error("PROTOBUF_DECODE_ERROR", e.to_string()))?;
-    request::validate(&cm).map_err(js_error_from_lib)?;
+    cm.validate().map_err(js_error_from_lib)?;
     let cm_js: ContactMessage = cm.into();
     to_js(&cm_js)
 }

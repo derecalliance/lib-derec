@@ -10,6 +10,7 @@ use crate::{
     primitives::pairing::{PairingError, request, response},
     protocol::reserved_keys,
     types::ChannelId,
+    utils::{ContactMessageExt as _, SenderKindExt as _},
 };
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{
@@ -130,8 +131,8 @@ pub(in crate::protocol) async fn start<
         ))?;
     let _ = crate::transport::TransportProtocol::try_from(&endpoint)?;
 
-    if contact.contact_mode == ContactMode::HashedKeys as i32 {
-        start_hashed_keys(
+    if contact.requires_pre_pair() {
+        start_pre_pair(
             channel_store,
             secret_store,
             transport,
@@ -168,6 +169,7 @@ pub(in crate::protocol) async fn start<
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
 )]
+#[allow(clippy::too_many_arguments)]
 pub(in crate::protocol) async fn accept<
     Ch: DeRecChannelStore,
     Ss: DeRecSecretStore,
@@ -196,18 +198,22 @@ pub(in crate::protocol) async fn accept<
         comm_info,
         parameter_range,
     )?;
+    // Long-term id both peers atomically switch to. `channel_id` is the
+    // transient pairing id from the ContactMessage and remains only as
+    // the envelope route for the outgoing PairResponse.
+    let new_channel_id = resp.channel_id;
 
     secret_store
         .save(
             secret_id,
-            channel_id,
+            new_channel_id,
             SecretValue::SharedKey(resp.shared_key),
         )
         .await?;
 
     let peer_transport = resp.peer_transport_protocol.clone();
 
-    let status = if is_replica_kind(kind) {
+    let status = if kind.is_replica() {
         crate::protocol::types::ChannelStatus::Pending
     } else {
         crate::protocol::types::ChannelStatus::Paired
@@ -221,7 +227,7 @@ pub(in crate::protocol) async fn accept<
         .save(
             secret_id,
             crate::protocol::types::Channel {
-                id: channel_id,
+                id: new_channel_id,
                 transport: peer_transport,
                 communication_info: peer_communication_info.clone(),
                 status,
@@ -232,19 +238,30 @@ pub(in crate::protocol) async fn accept<
         )
         .await?;
 
-    secret_store
-        .remove(secret_id, channel_id, SecretKind::PairingSecret)
-        .await?;
-
+    // Send on the transient id — the peer still routes on it and will
+    // rotate to `new_channel_id` on receipt.
     let envelope = super::apply_trace_id(resp.envelope, trace_id)?;
     transport
         .send(&resp.peer_transport_protocol, envelope)
         .await?;
 
+    // Drop the transient channel state after the wire message is out.
+    // Any inbound message routed to `channel_id` from this point is
+    // rejected as unknown.
+    secret_store
+        .remove(secret_id, channel_id, SecretKind::PairingSecret)
+        .await?;
+    channel_store.remove(secret_id, channel_id).await?;
+
     #[cfg(feature = "logging")]
-    tracing::info!("pairing complete (responder side)");
+    tracing::info!(
+        old_channel_id = channel_id.0,
+        new_channel_id = new_channel_id.0,
+        "pairing complete (responder side); rotated to long-term channel_id"
+    );
 
     Ok(pair_completion_events(
+        new_channel_id,
         channel_id,
         kind,
         peer_communication_info,
@@ -327,7 +344,7 @@ fn on_request(
     let (peer_communication_info, _peer_replica_id) =
         extract_communication_info(&request.communication_info, peer_kind)?;
 
-    let kind = derive_peer_kind(peer_kind);
+    let kind = peer_kind.derive_peer();
     let _ = require_replica_id_for_kind(kind, replica_id)?;
 
     let action = PendingAction::Pairing {
@@ -357,7 +374,6 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     replica_id: Option<u64>,
     parameter_range: Option<&derec_proto::ParameterRange>,
 ) -> Result<Vec<DeRecEvent>> {
-    // Gate: peer's advertised ParameterRange must overlap ours.
     crate::primitives::pairing::parameter_range::check_compatibility(
         parameter_range,
         response.parameter_range.as_ref(),
@@ -376,20 +392,10 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     };
 
     let result = response::process(&contact, response, pairing_secret)?;
-
-    secret_store
-        .save(
-            secret_id,
-            channel_id,
-            SecretValue::SharedKey(result.shared_key),
-        )
-        .await?;
-    secret_store
-        .remove(secret_id, channel_id, SecretKind::PairingSecret)
-        .await?;
-    secret_store
-        .remove(secret_id, channel_id, SecretKind::PairingContact)
-        .await?;
+    // Long-term id the peer already rotated to on its side; both peers
+    // derive it independently from `original_channel_id || shared_key`.
+    // `channel_id` remains only as the (already-consumed) envelope route.
+    let new_channel_id = result.channel_id;
 
     let channel = channel_store
         .load(secret_id, channel_id)
@@ -399,18 +405,19 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
         ))?;
     let kind = channel.role;
 
-    let status = if is_replica_kind(kind) {
+    let status = if kind.is_replica() {
         crate::protocol::types::ChannelStatus::Pending
     } else {
         crate::protocol::types::ChannelStatus::Paired
     };
 
-    let peer_kind = derive_peer_kind(kind);
+    let peer_kind = kind.derive_peer();
     let _ = require_replica_id_for_kind(kind, replica_id)?;
     let (peer_communication_info, peer_replica_id) =
         extract_communication_info(&response.communication_info, peer_kind)?;
 
     let mut channel = channel;
+    channel.id = new_channel_id;
     channel.status = status;
     channel.replica_id = peer_replica_id;
     for (k, v) in &peer_communication_info {
@@ -418,10 +425,34 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     }
     channel_store.save(secret_id, channel).await?;
 
+    secret_store
+        .save(
+            secret_id,
+            new_channel_id,
+            SecretValue::SharedKey(result.shared_key),
+        )
+        .await?;
+
+    // Drop the transient channel's records after the long-term ones are
+    // in place. Any inbound message routed to `channel_id` from this
+    // point is rejected as unknown.
+    channel_store.remove(secret_id, channel_id).await?;
+    secret_store
+        .remove(secret_id, channel_id, SecretKind::PairingSecret)
+        .await?;
+    secret_store
+        .remove(secret_id, channel_id, SecretKind::PairingContact)
+        .await?;
+
     #[cfg(feature = "logging")]
-    tracing::info!("pairing complete (initiator side)");
+    tracing::info!(
+        old_channel_id = channel_id.0,
+        new_channel_id = new_channel_id.0,
+        "pairing complete (initiator side); rotated to long-term channel_id"
+    );
 
     Ok(pair_completion_events(
+        new_channel_id,
         channel_id,
         kind,
         peer_communication_info,
@@ -458,10 +489,12 @@ pub(in crate::protocol) async fn on_pre_pair_response<
     replica_id: Option<u64>,
     parameter_range: Option<derec_proto::ParameterRange>,
 ) -> Result<Vec<DeRecEvent>> {
-    // `process_pre_pair` rejects malformed or non-Ok responses — surface
-    // the status mismatch as an event the app can react to, propagate the
-    // hash mismatch (security-relevant), and let any other error bubble.
-    let validated = match response::process_pre_pair(original_contact, response) {
+    let processed = if original_contact.contact_mode == ContactMode::NoKeys as i32 {
+        response::process_pre_pair_no_keys(original_contact, response)
+    } else {
+        response::process_pre_pair(original_contact, response)
+    };
+    let validated = match processed {
         Ok(v) => v,
         Err(Error::Pairing(crate::primitives::pairing::PairingError::NonOkStatus {
             status,
@@ -484,9 +517,6 @@ pub(in crate::protocol) async fn on_pre_pair_response<
         Err(e) => return Err(e),
     };
 
-    // Hash matched — synthesize the filled-in contact in InlineKeys
-    // shape. `request::produce` enforces the InlineKeys invariant, so
-    // the mode flip and hash clear are both required.
     let filled_in_contact = ContactMessage {
         mlkem_encapsulation_key: Some(validated.mlkem_encapsulation_key),
         ecies_public_key: Some(validated.ecies_public_key),
@@ -495,8 +525,6 @@ pub(in crate::protocol) async fn on_pre_pair_response<
         ..original_contact.clone()
     };
 
-    // Drive the regular PairRequest leg. The scanner's role on the
-    // channel was committed at `start` time; preserve it.
     let role = channel_store
         .load(secret_id, channel_id)
         .await?
@@ -512,7 +540,7 @@ pub(in crate::protocol) async fn on_pre_pair_response<
         own_transport.clone(),
         &filled_in_contact,
         comm_info,
-        parameter_range.clone(),
+        parameter_range,
     )?;
 
     // Persist the scanner's pairing secret + overwrite the stored
@@ -548,15 +576,20 @@ pub(in crate::protocol) async fn on_pre_pair_response<
         "PrePair validated; PairRequest sent (HASHED_KEYS scanner side)"
     );
 
-    // PrePair success is silent on the scanner side. The app sees
-    // `PairingCompleted` later when the PairResponse arrives.
     Ok(vec![])
 }
 
-/// `accept` arm for [`PendingAction::PrePair`]. Loads the initiator's
-/// `PairingSecret`, builds a `PrePairResponse` carrying the real keys,
-/// and sends it back to the scanner's `replyTo` endpoint embedded in
-/// the request.
+/// `accept` arm for [`PendingAction::PrePair`]. Branches on the stored
+/// contact's mode:
+///
+/// - `HashedKeys`: loads the previously-generated `PairingSecret` and
+///   publishes its keys (the scanner will match them against the
+///   contact's binding hash).
+/// - `NoKeys`: no `PairingSecret` exists yet — the contact was created
+///   without any key material. Generates fresh key material on the fly,
+///   persists it as `PairingSecret`, and publishes the keys. First
+///   authenticates the request by matching `request.nonce` against the
+///   stored contact's `nonce`.
 pub(in crate::protocol) async fn accept_pre_pair<Ss: DeRecSecretStore, T: DeRecTransport>(
     secret_store: &mut Ss,
     transport: &T,
@@ -565,6 +598,53 @@ pub(in crate::protocol) async fn accept_pre_pair<Ss: DeRecSecretStore, T: DeRecT
     request: &PrePairRequestMessage,
     trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
+    // NoKeys: no PairingSecret exists at accept time. Load the stored
+    // contact, verify the incoming nonce, and generate keys on the fly.
+    if let Some(SecretValue::PairingContact(contact)) = secret_store
+        .load(secret_id, channel_id, SecretKind::PairingContact)
+        .await?
+        && contact.contact_mode == ContactMode::NoKeys as i32
+    {
+        if request.nonce != contact.nonce {
+            #[cfg(feature = "logging")]
+            tracing::warn!(
+                channel_id = channel_id.0,
+                "NoKeys PrePair nonce mismatch — rejecting"
+            );
+            return Err(crate::primitives::pairing::PairingError::ProtocolViolation(
+                "NoKeys PrePair nonce mismatch",
+            )
+            .into());
+        }
+
+        let result = response::produce_pre_pair_no_keys(channel_id, request)?;
+        secret_store
+            .save(
+                secret_id,
+                channel_id,
+                SecretValue::PairingSecret(result.pairing_secret_key_material),
+            )
+            .await?;
+
+        let envelope = super::apply_trace_id(result.envelope, trace_id)?;
+        let endpoint = request
+            .transport_protocol
+            .clone()
+            .ok_or(Error::InvalidInput(
+                "PrePair request missing transport endpoint",
+            ))?;
+        let _ = crate::transport::TransportProtocol::try_from(&endpoint)?;
+        transport.send(&endpoint, envelope).await?;
+
+        #[cfg(feature = "logging")]
+        tracing::info!(
+            channel_id = channel_id.0,
+            "NoKeys PrePair accepted; fresh keys generated and sent to scanner"
+        );
+
+        return Ok(vec![]);
+    }
+
     let Some(SecretValue::PairingSecret(pairing_secret)) = secret_store
         .load(secret_id, channel_id, SecretKind::PairingSecret)
         .await?
@@ -592,8 +672,6 @@ pub(in crate::protocol) async fn accept_pre_pair<Ss: DeRecSecretStore, T: DeRecT
         "PrePair accepted; published keys sent to scanner"
     );
 
-    // Success is silent on this side too. The next inbound is the
-    // regular PairRequest, which will surface its own `ActionRequired`.
     Ok(vec![])
 }
 
@@ -657,32 +735,9 @@ pub(in crate::protocol) async fn reject_pre_pair<T: DeRecTransport>(
     Ok(())
 }
 
-/// Derive the peer's pairing kind from the local kind (committed on the
-/// channel record at pairing-start time).
-///
-/// `PairResponseMessage` does not carry `sender_kind` over the wire, so the
-/// initiator must look up its own role on the channel and invert it. The
-/// derivation matches [`on_request`]'s rule on the responder side:
-///
-/// | local                 | peer                  |
-/// |-----------------------|-----------------------|
-/// | `Owner`               | `Helper`              |
-/// | `Helper`              | `Owner`               |
-/// | `ReplicaSource`       | `ReplicaDestination`  |
-/// | `ReplicaDestination`  | `ReplicaSource`       |
-pub(in crate::protocol) fn derive_peer_kind(local_kind: SenderKind) -> SenderKind {
-    match local_kind {
-        SenderKind::Owner => SenderKind::Helper,
-        SenderKind::Helper => SenderKind::Owner,
-        SenderKind::ReplicaSource => SenderKind::ReplicaDestination,
-        SenderKind::ReplicaDestination => SenderKind::ReplicaSource,
-    }
-}
-
 /// Scanner-side `InlineKeys` branch of [`start`]. The responder has the
 /// initiator's public keys inline on the contact, so it can go straight
 /// to building the encrypted `PairRequest` envelope.
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 async fn start_inlined_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRecTransport>(
     channel_store: &mut Ch,
@@ -757,7 +812,12 @@ async fn start_inlined_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRe
 /// key material until the PrePair leg completes and the regular
 /// PairRequest is produced.
 #[allow(clippy::too_many_arguments)]
-async fn start_hashed_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRecTransport>(
+/// Scanner-side entry point shared by `HashedKeys` and `NoKeys`: sends a
+/// [`PrePairRequestMessage`] and persists the original contact so
+/// `on_pre_pair_response` can later branch on `contact.contact_mode` to
+/// decide whether to verify a binding hash (HashedKeys) or skip
+/// verification (NoKeys).
+async fn start_pre_pair<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRecTransport>(
     channel_store: &mut Ch,
     secret_store: &mut Ss,
     transport: &T,
@@ -773,8 +833,6 @@ async fn start_hashed_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRec
 
     let result = request::produce_pre_pair_request(own_transport.clone(), &contact)?;
 
-    // Persist the original HashedKeys contact so the eventual
-    // PrePairResponse can be validated against its binding hash.
     secret_store
         .save(secret_id, channel_id, SecretValue::PairingContact(contact))
         .await?;
@@ -795,7 +853,7 @@ async fn start_hashed_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRec
         .await?;
 
     #[cfg(feature = "logging")]
-    tracing::info!("PrePair request sent (HASHED_KEYS scanner side)");
+    tracing::info!("PrePair request sent (scanner side)");
 
     let envelope = super::apply_trace_id(result.envelope, super::fresh_trace_id())?;
     transport.send(&endpoint, envelope).await?;
@@ -803,14 +861,31 @@ async fn start_hashed_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRec
     Ok(channel_id.0)
 }
 
-/// Inbound `PrePairRequest` on the **initiator side** (the party that
-/// created the HashedKeys contact and saved its `PairingSecret`).
+/// Inbound `PrePairRequest` on the **initiator side**. Handled either by
+/// the party that:
 ///
-/// Pure function — surfaces an [`ActionRequired`] event. The application
-/// decides whether to accept (publish the keys) or reject (refuse to
+/// - created a `HashedKeys` contact and saved its `PairingSecret`, or
+/// - created a `NoKeys` contact and saved only its `PairingContact`.
+///
+/// Pure function — surfaces an [`DeRecEvent::ActionRequired`] event. The
+/// application decides whether to accept (publish the keys — for NoKeys
+/// keys are generated on the fly at accept time) or reject (refuse to
 /// participate) by calling [`super::super::DeRecProtocol::accept`] or
-/// [`reject`](super::super::DeRecProtocol::reject) with the carried
+/// [`super::super::DeRecProtocol::reject`] with the carried
 /// [`PendingAction::PrePair`].
+pub(in crate::protocol) fn handle_pre_pair_request(
+    message: &MessageBody,
+    channel_id: ChannelId,
+    trace_id: u64,
+) -> Result<Vec<DeRecEvent>> {
+    let MessageBody::PrePairRequest(request) = message else {
+        return Err(Error::Invariant(
+            "handle_pre_pair_request called with non-PrePairRequest MessageBody",
+        ));
+    };
+    on_pre_pair_request(channel_id, request, trace_id)
+}
+
 fn on_pre_pair_request(
     channel_id: ChannelId,
     request: &PrePairRequestMessage,
@@ -881,7 +956,7 @@ fn build_communication_info(
 /// The reserved key is **stripped from the returned map** so apps can't
 /// accidentally observe it (or, in subsequent broadcasts, re-transmit it).
 ///
-/// Validation against `peer_kind` (via [`is_replica_kind`]):
+/// Validation against `peer_kind` (via [`SenderKindExt::is_replica`]):
 /// - replica kinds (`ReplicaSource`, `ReplicaDestination`): the reserved
 ///   key MUST be present and parse as a valid hex `u64` (error:
 ///   [`PairingError::MissingReplicaId`] or [`Error::InvalidInput`]).
@@ -895,7 +970,7 @@ fn extract_communication_info(
     let Some(info) = info.as_ref() else {
         // No comm_info means no reserved entries either; replica pairings
         // are rejected up-front by the missing-id check below.
-        if is_replica_kind(peer_kind) {
+        if peer_kind.is_replica() {
             return Err(PairingError::MissingReplicaId {
                 sender_kind: peer_kind,
             }
@@ -931,7 +1006,7 @@ fn extract_communication_info(
         free_form.insert(e.key.to_owned(), trimmed.to_owned());
     }
 
-    match (is_replica_kind(peer_kind), peer_replica_id.is_some()) {
+    match (peer_kind.is_replica(), peer_replica_id.is_some()) {
         (true, false) => Err(PairingError::MissingReplicaId {
             sender_kind: peer_kind,
         }
@@ -958,18 +1033,20 @@ fn is_reserved_key(key: &str) -> bool {
 /// (Source / Destination) is already on the saved `Channel.role`, so
 /// the event doesn't repeat it.
 ///
-/// `peer_replica_id.is_some()` and [`is_replica_kind`] are equivalent at
+/// `peer_replica_id.is_some()` and [`SenderKindExt::is_replica`] are equivalent at
 /// this point — [`extract_communication_info`] rejects inconsistent
 /// combinations upstream — so we branch on the `Option` directly and
 /// emit `ReplicaPaired` iff a peer id is present.
 fn pair_completion_events(
     channel_id: ChannelId,
+    pairing_channel_id: ChannelId,
     kind: SenderKind,
     peer_communication_info: HashMap<String, String>,
     peer_replica_id: Option<u64>,
 ) -> Vec<DeRecEvent> {
     let mut events = vec![DeRecEvent::PairingCompleted {
         channel_id,
+        pairing_channel_id,
         kind,
         peer_communication_info,
     }];
@@ -994,7 +1071,7 @@ fn require_replica_id_for_kind(
     local_kind: SenderKind,
     configured_replica_id: Option<u64>,
 ) -> Result<Option<u64>> {
-    if !is_replica_kind(local_kind) {
+    if !local_kind.is_replica() {
         return Ok(None);
     }
     configured_replica_id
@@ -1010,17 +1087,6 @@ fn request_sender_kind(request: &PairRequestMessage) -> Result<SenderKind> {
     SenderKind::try_from(request.sender_kind).map_err(|_| {
         PairingError::InvalidPairRequestMessage("unknown sender_kind on PairRequest").into()
     })
-}
-
-/// Returns `true` for either of the two replica-mode `SenderKind`s.
-/// Centralizes the "is this any kind of replica?" check that several
-/// handlers need (status assignment, replica_id gating, communication
-/// info validation).
-fn is_replica_kind(kind: SenderKind) -> bool {
-    matches!(
-        kind,
-        SenderKind::ReplicaSource | SenderKind::ReplicaDestination
-    )
 }
 
 async fn reject_start_on_paired_channel<Ch: DeRecChannelStore>(

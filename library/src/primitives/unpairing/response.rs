@@ -114,7 +114,7 @@ pub fn produce(
 ///
 /// // Initiator: send an unpair request.
 /// let request::ProduceResult { envelope: req_envelope } =
-///     request::produce(channel_id, "no longer needed", &shared_key)
+///     request::produce(channel_id, "no longer needed", &shared_key, None)
 ///         .expect("produce request failed");
 ///
 /// // Responder: extract and ack with a successful response.
@@ -181,7 +181,7 @@ pub fn extract(
 ///
 /// // Initiator → Responder → Initiator roundtrip.
 /// let request::ProduceResult { envelope: req_envelope } =
-///     request::produce(channel_id, "no longer needed", &shared_key)
+///     request::produce(channel_id, "no longer needed", &shared_key, None)
 ///         .expect("produce request failed");
 /// let _ = request::extract(&req_envelope, &shared_key).expect("extract request failed");
 /// let response::ProduceResult { envelope: resp_envelope } =

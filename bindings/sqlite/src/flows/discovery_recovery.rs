@@ -77,15 +77,24 @@ pub async fn run() {
         .await
         .expect("clearing user_secret_store");
 
-    let rec_cid_a = ChannelId(100);
-    let rec_cid_b = ChannelId(101);
-    for (helper, fresh_cid, label) in [
-        (&mut helper_a, rec_cid_a, "HelperA"),
-        (&mut helper_b, rec_cid_b, "HelperB"),
-    ] {
+    // Post-pair channel-id rekey rotates the transient contact id to a
+    // fresh long-term id. Capture the rotated id from PairingCompleted
+    // for each recovery pair so Discovery targets, link graph, and
+    // channel_store operations all use the id that actually resolves.
+    let rec_cid_a_transient = ChannelId(100);
+    let rec_cid_b_transient = ChannelId(101);
+    let mut rekeyed_recovery: [(ChannelId, ChannelId); 2] =
+        [(ChannelId(0), ChannelId(0)); 2];
+    for (idx, (helper, fresh_cid, label)) in [
+        (&mut helper_a, rec_cid_a_transient, "HelperA"),
+        (&mut helper_b, rec_cid_b_transient, "HelperB"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let contact = owner
             .protocol
-            .create_contact(Some(fresh_cid), derec_proto::ContactMode::InlineKeys)
+            .create_contact(Some(fresh_cid), derec_proto::ContactMode::InlineKeys, None)
             .await
             .unwrap_or_else(|e| panic!("recovery create_contact({label}) failed: {e}"));
         helper
@@ -100,9 +109,28 @@ pub async fn run() {
             })
             .await
             .unwrap_or_else(|e| panic!("{label} start(Pairing recovery) failed: {e}"));
-        let _ = pump_many(&mut [&mut owner, helper]).await;
+        let events = pump_many(&mut [&mut owner, helper]).await;
+        let rekeyed = events
+            .iter()
+            .find_map(|e| match e {
+                DeRecEvent::PairingCompleted {
+                    channel_id,
+                    pairing_channel_id,
+                    ..
+                } if *pairing_channel_id == fresh_cid => Some(*channel_id),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("recovery pair ({label}): missing PairingCompleted for transient {fresh_cid:?}")
+            });
+        rekeyed_recovery[idx] = (fresh_cid, rekeyed);
     }
-    println!("  recovery re-pair complete on fresh channels (100, 101)  ✓");
+    let rec_cid_a = rekeyed_recovery[0].1;
+    let rec_cid_b = rekeyed_recovery[1].1;
+    println!(
+        "  recovery re-pair complete: transient 100→{}, 101→{}  ✓",
+        rec_cid_a.0, rec_cid_b.0
+    );
 
     // Each helper links its original channel ↔ recovery channel so
     // discovery resolves the connected component and finds the

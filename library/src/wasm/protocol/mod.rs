@@ -61,7 +61,9 @@ use crate::{
 use crate::wasm::primitives::pairing::ContactMessage as PairingContactMessage;
 use derec_proto::{SenderKind, TransportProtocol};
 use js_sys::{Array, Uint8Array};
-use stores::{JsChannelStore, JsSecretStore, JsShareStore, JsTransport, JsUserSecretStore};
+use stores::{
+    JsChannelStore, JsSecretStore, JsShareStore, JsStateStore, JsTransport, JsUserSecretStore,
+};
 use wasm_bindgen::prelude::*;
 
 type WasmProtocol = DeRecProtocol<
@@ -69,6 +71,7 @@ type WasmProtocol = DeRecProtocol<
     JsShareStore,
     JsSecretStore,
     JsUserSecretStore,
+    JsStateStore,
     JsTransport,
 >;
 
@@ -91,7 +94,7 @@ type WasmProtocol = DeRecProtocol<
 ///
 /// | `type`             | Additional fields                                      |
 /// |--------------------|--------------------------------------------------------|
-/// | `PairingCompleted`  | `channel_id: string`, `kind: number`                   |
+/// | `PairingCompleted`  | `channel_id: string`, `pairing_channel_id: string`, `kind: number` |
 /// | `ShareStored`      | `channel_id: string`, `version: number`                |
 /// | `ShareConfirmed`   | `channel_id: string`, `version: number`                |
 /// | `ShareVerified`    | `channel_id: string`, `version: number`                |
@@ -124,6 +127,7 @@ pub struct DeRecProtocolBuilderWasm {
     share_store: Option<JsValue>,
     secret_store: Option<JsValue>,
     user_secret_store: Option<JsValue>,
+    state_store: Option<JsValue>,
     transport: Option<JsValue>,
     own_transport_uri: Option<String>,
     own_transport_protocol_num: Option<i32>,
@@ -154,6 +158,7 @@ impl DeRecProtocolBuilderWasm {
             share_store: None,
             secret_store: None,
             user_secret_store: None,
+            state_store: None,
             transport: None,
             own_transport_uri: None,
             own_transport_protocol_num: None,
@@ -191,6 +196,12 @@ impl DeRecProtocolBuilderWasm {
     #[wasm_bindgen(js_name = withUserSecretStore)]
     pub fn with_user_secret_store(mut self, store: JsValue) -> DeRecProtocolBuilderWasm {
         self.user_secret_store = Some(store);
+        self
+    }
+
+    #[wasm_bindgen(js_name = withStateStore)]
+    pub fn with_state_store(mut self, store: JsValue) -> DeRecProtocolBuilderWasm {
+        self.state_store = Some(store);
         self
     }
 
@@ -421,6 +432,9 @@ impl DeRecProtocolBuilderWasm {
         let user_secret_store = self
             .user_secret_store
             .ok_or_else(|| js_error("BUILDER_MISSING", "withUserSecretStore is required"))?;
+        let state_store = self
+            .state_store
+            .ok_or_else(|| js_error("BUILDER_MISSING", "withStateStore is required"))?;
         let transport = self
             .transport
             .ok_or_else(|| js_error("BUILDER_MISSING", "withTransport is required"))?;
@@ -448,6 +462,7 @@ impl DeRecProtocolBuilderWasm {
             .with_share_store(JsShareStore(share_store))
             .with_secret_store(JsSecretStore(secret_store))
             .with_user_secret_store(JsUserSecretStore(user_secret_store))
+            .with_state_store(JsStateStore(state_store))
             .with_transport(JsTransport(transport))
             .with_own_transport(own_transport)
             .with_threshold(self.threshold as usize)
@@ -496,26 +511,43 @@ impl DeRecProtocolWasm {
         self.inner.secret_id()
     }
 
+    /// Single entry point for all three contact modes (`InlineKeys`,
+    /// `HashedKeys`, `NoKeys`).
+    ///
+    /// * `channel_id` — `null`/`undefined` lets the library mint a
+    ///   random id; otherwise `bigint` / `number` is used verbatim.
+    /// * `contact_mode` — `0` (InlineKeys), `1` (HashedKeys), `2` (NoKeys).
+    /// * `nonce` — `null`/`undefined` lets the library generate a fresh
+    ///   random `u64`; otherwise the supplied `bigint`/`number` is used.
+    ///   Required for `NoKeys` where callers typically pick a small
+    ///   human-typable value.
     #[wasm_bindgen(js_name = "createContact")]
     pub async fn create_contact(
         &mut self,
         channel_id: JsValue,
         contact_mode: u32,
+        nonce: JsValue,
     ) -> Result<JsValue, JsValue> {
         let id = parse_optional_channel_id(channel_id)?;
         let mode = match contact_mode {
             0 => derec_proto::ContactMode::InlineKeys,
             1 => derec_proto::ContactMode::HashedKeys,
+            2 => derec_proto::ContactMode::NoKeys,
             other => {
                 return Err(js_error(
                     "INVALID_CONTACT_MODE",
-                    format!("unknown contact_mode: {other}; expected 0 (InlineKeys) or 1 (HashedKeys)"),
+                    format!("unknown contact_mode: {other}; expected 0 (InlineKeys), 1 (HashedKeys), or 2 (NoKeys)"),
                 ));
             }
         };
+        let nonce = if nonce.is_null() || nonce.is_undefined() {
+            None
+        } else {
+            Some(js_value_to_u64(nonce)?)
+        };
         let contact = self
             .inner
-            .create_contact(id, mode)
+            .create_contact(id, mode, nonce)
             .await
             .map_err(|e| js_error("DEREC_ERROR", e.to_string()))?;
         let contact: PairingContactMessage = contact.into();
@@ -587,19 +619,21 @@ impl DeRecProtocolWasm {
     ///
     /// # Returns
     ///
-    /// `BigInt` for Pairing (the channel_id), `null` for all others.
+    /// An `Array` of `*Started` / `*Failed` events describing the
+    /// dispatched requests. Same shape as `process()`.
     #[wasm_bindgen(js_name = "start")]
     pub async fn start(&mut self, flow_kind: u32, params: JsValue) -> Result<JsValue, JsValue> {
         let flow = parse_flow(flow_kind, params)?;
-        let result = self
+        let rust_events = self
             .inner
             .start(flow)
             .await
             .map_err(|e| js_error("DEREC_ERROR", e.to_string()))?;
-        match result {
-            Some(channel_id) => Ok(js_sys::BigInt::from(channel_id).into()),
-            None => Ok(JsValue::NULL),
+        let js_events = Array::new();
+        for event in rust_events {
+            js_events.push(&events::event_to_js(event)?);
         }
+        Ok(js_events.into())
     }
 
     /// Derive the human-readable fingerprint for a paired channel. Both
@@ -737,15 +771,21 @@ impl DeRecProtocolWasm {
         &mut self,
         recovered_secret: JsValue,
         version: u32,
-    ) -> Result<(), JsValue> {
+    ) -> Result<JsValue, JsValue> {
         let secret = parse_recovered_secret(recovered_secret)?;
-        self.inner
+        let rust_events = self
+            .inner
             .restore(&secret, version)
             .await
             .map_err(|e| match e {
                 crate::Error::Restore(inner) => restore_error_to_js(inner),
                 other => js_error_from_lib(other),
-            })
+            })?;
+        let js_events = Array::new();
+        for event in rust_events {
+            js_events.push(&events::event_to_js(event)?);
+        }
+        Ok(js_events.into())
     }
 }
 
@@ -939,7 +979,13 @@ fn parse_optional_channel_id(val: JsValue) -> Result<Option<ChannelId>, JsValue>
     Ok(Some(ChannelId(js_value_to_u64(val)?)))
 }
 
-/// Convert a JS BigInt or Number to a Rust `u64`.
+/// Convert a JS value to a Rust `u64`.
+///
+/// Accepts BigInt, Number, or decimal-string encodings. Strings are
+/// the documented wire convention for u64 identifiers on the JS/TS
+/// surface (see `packages/{nodejs,web}/index.d.ts`) — they dodge
+/// `Number.MAX_SAFE_INTEGER` without forcing every caller to reach for
+/// BigInt.
 fn js_value_to_u64(val: JsValue) -> Result<u64, JsValue> {
     if val.is_bigint() {
         let s = js_sys::BigInt::from(val)
@@ -949,9 +995,14 @@ fn js_value_to_u64(val: JsValue) -> Result<u64, JsValue> {
             .ok_or_else(|| js_error("DECODE_ERROR", "BigInt.toString returned non-string"))?;
         s.parse::<u64>()
             .map_err(|e| js_error("DECODE_ERROR", e.to_string()))
+    } else if let Some(s) = val.as_string() {
+        s.parse::<u64>()
+            .map_err(|e| js_error("DECODE_ERROR", format!("string is not a decimal u64: {e}")))
     } else {
         val.as_f64()
-            .ok_or_else(|| js_error("DECODE_ERROR", "channel_id must be BigInt or number"))
+            .ok_or_else(|| {
+                js_error("DECODE_ERROR", "value must be BigInt, number, or decimal string")
+            })
             .map(|f| f as u64)
     }
 }
@@ -1114,13 +1165,13 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
         }
         5 => {
             // Unpair
-            let target_val = js_sys::Reflect::get(&params, &JsValue::from_str("target"))
-                .unwrap_or(JsValue::UNDEFINED);
-            let target = parse_target(target_val)?;
+            let channel_id_val = js_sys::Reflect::get(&params, &JsValue::from_str("channel_id"))
+                .map_err(|e| js_error("DECODE_ERROR", format!("missing channel_id: {e:?}")))?;
+            let channel_id = ChannelId(js_value_to_u64(channel_id_val)?);
             let memo = js_sys::Reflect::get(&params, &JsValue::from_str("memo"))
                 .unwrap_or(JsValue::UNDEFINED)
                 .as_string();
-            Ok(DeRecFlow::Unpair { target, memo })
+            Ok(DeRecFlow::Unpair { channel_id, memo })
         }
         6 => {
             // UpdateChannelInfo

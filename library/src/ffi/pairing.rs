@@ -21,6 +21,7 @@ use crate::ffi::error::{
     DEREC_CODE_FFI_NULL_PTR, DeRecError, ffi_error, from_lib_error, success,
 };
 use crate::transport::TransportProtocolExt as _;
+use crate::utils::ContactMessageExt as _;
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{
     CommunicationInfo, ContactMessage, ContactMode, DeRecMessage, PairRequestMessage,
@@ -139,8 +140,19 @@ pub struct ProcessPrePairResponseMessageResult {
     pub nonce: u64,
 }
 
-/// `contact_mode` must be a valid value of [`ContactMode`] (`0` = `INLINE_KEYS`,
-/// `1` = `HASHED_KEYS`).
+/// Single entry point for all three modes:
+/// - `contact_mode == 0` (`INLINE_KEYS`) — keys inlined in contact.
+/// - `contact_mode == 1` (`HASHED_KEYS`) — binding hash inlined; keys via PrePair.
+/// - `contact_mode == 2` (`NO_KEYS`) — no key material; keys generated on the
+///   fly by the responder when the `PrePairRequest` arrives.
+///
+/// `has_nonce == 0` lets the library generate a fresh random `u64`.
+/// `has_nonce == 1` uses the supplied `nonce` value verbatim; required for
+/// `NO_KEYS` where callers typically pick a small human-typable value.
+///
+/// On success `secret_key_material` is populated for `INLINE_KEYS` and
+/// `HASHED_KEYS`; it is empty for `NO_KEYS` (no keys exist at
+/// contact-creation time).
 ///
 /// # Safety
 ///
@@ -151,6 +163,8 @@ pub extern "C" fn create_contact_message(
     contact_mode: i32,
     transport_protocol_ptr: *const u8,
     transport_protocol_len: usize,
+    has_nonce: u32,
+    nonce: u64,
 ) -> CreateContactMessageResult {
     let with_err = |error| CreateContactMessageResult {
         error,
@@ -174,17 +188,21 @@ pub extern "C" fn create_contact_message(
             Err(e) => return with_err(e),
         };
 
+    let nonce = if has_nonce != 0 { Some(nonce) } else { None };
+
     match crate::primitives::pairing::request::create_contact(
         channel_id.into(),
         contact_mode,
         transport_protocol,
+        nonce,
     ) {
         Ok(r) => CreateContactMessageResult {
             error: success(),
             contact_wire_bytes: vec_into_buffer(r.contact_message.encode_to_vec()),
-            secret_key_material: vec_into_buffer(serialize_pairing_secret_key_material(
-                &r.secret_key,
-            )),
+            secret_key_material: match r.secret_key {
+                Some(k) => vec_into_buffer(serialize_pairing_secret_key_material(&k)),
+                None => empty_buffer(),
+            },
         },
         Err(e) => with_err(from_lib_error(e)),
     }
@@ -230,7 +248,7 @@ pub extern "C" fn validate_contact_message(
             );
         }
     };
-    match crate::primitives::pairing::request::validate(&contact_message) {
+    match contact_message.validate() {
         Ok(()) => success(),
         Err(e) => from_lib_error(e),
     }
