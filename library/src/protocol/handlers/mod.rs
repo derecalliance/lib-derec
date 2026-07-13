@@ -10,8 +10,8 @@ pub(super) mod update_channel_info;
 pub(super) mod verification;
 
 use super::{
-    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport,
-    PendingRecovery,
+    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecStateStore,
+    DeRecTransport,
 };
 use crate::{
     Error, Result,
@@ -167,14 +167,13 @@ pub(super) async fn handle<
     Sh: DeRecShareStore,
     Ss: DeRecSecretStore,
     T: super::DeRecTransport,
+    St: DeRecStateStore,
 >(
     channel_store: &mut Ch,
     share_store: &mut Sh,
     secret_store: &mut Ss,
     transport: &T,
-    pending_recovery: &mut PendingRecovery,
-    pending_unpair: &mut HashMap<ChannelId, u64>,
-    pending_verification: &mut crate::protocol::PendingVerification,
+    state_store: &mut St,
     message: &DeRecMessage,
     secret_id: u64,
     channel_id: ChannelId,
@@ -225,7 +224,7 @@ pub(super) async fn handle<
         MessageBody::VerifyShareRequest(_) | MessageBody::VerifyShareResponse(_) => {
             verification::handle(
                 share_store,
-                pending_verification,
+                state_store,
                 secret_id,
                 channel_id,
                 inner,
@@ -239,14 +238,22 @@ pub(super) async fn handle<
             discovery::handle(channel_id, inner, *shared_key, inbound_trace_id)
         }
         MessageBody::GetShareRequest(_) | MessageBody::GetShareResponse(_) => {
-            recovery::handle(pending_recovery, channel_id, inner, *shared_key, inbound_trace_id)
+            recovery::handle(
+                state_store,
+                channel_id,
+                inner,
+                *shared_key,
+                inbound_trace_id,
+                secret_id,
+            )
+            .await
         }
         MessageBody::UnpairRequest(_) | MessageBody::UnpairResponse(_) => {
             unpairing::handle(
                 channel_store,
                 share_store,
                 secret_store,
-                pending_unpair,
+                state_store,
                 secret_id,
                 channel_id,
                 inner,

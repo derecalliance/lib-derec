@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::super::{
-    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport,
-    MissingPolicy, PendingAction, SecretKind, SecretValue,
+    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecStateStore,
+    DeRecTransport, MissingPolicy, PendingAction, SecretKind, SecretValue, StateItem, StateKey,
 };
 use super::peer_endpoint;
 use crate::{
@@ -25,9 +25,9 @@ use prost::Message;
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
 )]
-pub(in crate::protocol) async fn handle<Sh: DeRecShareStore>(
+pub(in crate::protocol) async fn handle<Sh: DeRecShareStore, St: DeRecStateStore>(
     share_store: &mut Sh,
-    pending_verification: &mut crate::protocol::PendingVerification,
+    state_store: &mut St,
     secret_id: u64,
     channel_id: ChannelId,
     inner: MessageBody,
@@ -41,7 +41,7 @@ pub(in crate::protocol) async fn handle<Sh: DeRecShareStore>(
         MessageBody::VerifyShareResponse(response) => {
             on_response(
                 share_store,
-                pending_verification,
+                state_store,
                 secret_id,
                 channel_id,
                 &response,
@@ -63,16 +63,17 @@ pub(in crate::protocol) async fn start<
     Ch: DeRecChannelStore,
     Ss: DeRecSecretStore,
     T: DeRecTransport,
+    St: DeRecStateStore,
 >(
     channel_store: &mut Ch,
     secret_store: &mut Ss,
     transport: &T,
-    pending_verification: &mut crate::protocol::PendingVerification,
+    state_store: &mut St,
     version: u32,
     target: Target,
     secret_id: u64,
     reply_to: Option<derec_proto::TransportProtocol>,
-) -> Result<()> {
+) -> Result<Vec<DeRecEvent>> {
     let all_channels = channel_store.channels(secret_id).await?;
     let all_channel_ids: Vec<ChannelId> = all_channels.iter().map(|c| c.id).collect();
 
@@ -100,47 +101,58 @@ pub(in crate::protocol) async fn start<
         )
         .await?;
 
+    let mut events = Vec::with_capacity(keys.len());
     for (channel_id, value) in keys {
         let SecretValue::SharedKey(shared_key) = value else {
+            events.push(DeRecEvent::VerifySharesFailed {
+                channel_id,
+                version,
+                error: "channel has no shared key".to_owned(),
+            });
             continue;
         };
 
-        let endpoint = peer_endpoint(channel_store, secret_id, channel_id).await?;
-        let msg = produce_verify_share_request_message(
-            channel_id,
+        match dispatch_one(
+            channel_store,
+            transport,
+            state_store,
             secret_id,
             version,
+            channel_id,
             &shared_key,
             reply_to.clone(),
-        )?;
-
-        // Record the outstanding challenge so the matching inbound
-        // response can be bound back to it. The map is keyed by
-        // `channel_id` — re-issuing `start(VerifyShares)` for the
-        // same channel overwrites any in-flight challenge, and the
-        // newer nonce wins. Stale responses tied to the older nonce
-        // fall through `on_response`'s binding check below.
-        pending_verification.insert(
-            channel_id,
-            derec_proto::VerifyShareRequestMessage {
-                secret_id,
-                version,
-                nonce: msg.nonce,
-                timestamp: None,
-                reply_to: reply_to.clone(),
-            },
-        );
-
-        #[cfg(feature = "logging")]
-        tracing::debug!(
-            channel_id = channel_id.0,
-            secret_id = secret_id,
-            version = version,
-            "verification challenge sent"
-        );
-
-        let envelope = super::apply_trace_id(msg.envelope, super::fresh_trace_id())?;
-        transport.send(&endpoint, envelope).await?;
+        )
+        .await
+        {
+            Ok(()) => {
+                events.push(DeRecEvent::VerifySharesStarted {
+                    channel_id,
+                    version,
+                });
+                #[cfg(feature = "logging")]
+                tracing::debug!(
+                    channel_id = channel_id.0,
+                    secret_id = secret_id,
+                    version = version,
+                    "verification challenge sent"
+                );
+            }
+            Err(e) => {
+                events.push(DeRecEvent::VerifySharesFailed {
+                    channel_id,
+                    version,
+                    error: e.to_string(),
+                });
+                #[cfg(feature = "logging")]
+                tracing::warn!(
+                    channel_id = channel_id.0,
+                    secret_id = secret_id,
+                    version = version,
+                    error = %e,
+                    "verification challenge dispatch failed"
+                );
+            }
+        }
     }
 
     #[cfg(feature = "logging")]
@@ -150,6 +162,57 @@ pub(in crate::protocol) async fn start<
         "verification challenges sent"
     );
 
+    Ok(events)
+}
+
+/// Dispatch one verification challenge — record the outstanding
+/// challenge in the state store then send. Failure isolated so
+/// [`start`] can surface it as a per-channel `VerifySharesFailed`
+/// event.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_one<
+    Ch: DeRecChannelStore,
+    T: DeRecTransport,
+    St: DeRecStateStore,
+>(
+    channel_store: &mut Ch,
+    transport: &T,
+    state_store: &mut St,
+    secret_id: u64,
+    version: u32,
+    channel_id: ChannelId,
+    shared_key: &SharedKey,
+    reply_to: Option<derec_proto::TransportProtocol>,
+) -> Result<()> {
+    let endpoint = peer_endpoint(channel_store, secret_id, channel_id).await?;
+    let msg =
+        produce_verify_share_request_message(channel_id, secret_id, version, shared_key, reply_to.clone())?;
+
+    // Record the outstanding challenge so the matching inbound
+    // response can be bound back to it. The row is keyed by
+    // `(secret_id, channel_id)` — re-issuing `start(VerifyShares)`
+    // for the same channel overwrites any in-flight challenge via
+    // the state store's full-replacement `save` semantic, and the
+    // newer nonce wins. Stale responses tied to the older nonce
+    // fall through `on_response`'s binding check below.
+    state_store
+        .save(
+            secret_id,
+            StateItem::PendingVerification {
+                channel_id,
+                request: derec_proto::VerifyShareRequestMessage {
+                    secret_id,
+                    version,
+                    nonce: msg.nonce,
+                    timestamp: None,
+                    reply_to,
+                },
+            },
+        )
+        .await?;
+
+    let envelope = super::apply_trace_id(msg.envelope, super::fresh_trace_id())?;
+    transport.send(&endpoint, envelope).await?;
     Ok(())
 }
 
@@ -300,20 +363,30 @@ fn on_request(
         )
     )
 )]
-async fn on_response<Sh: DeRecShareStore>(
+async fn on_response<Sh: DeRecShareStore, St: DeRecStateStore>(
     share_store: &mut Sh,
-    pending_verification: &mut crate::protocol::PendingVerification,
+    state_store: &mut St,
     secret_id: u64,
     channel_id: ChannelId,
     response: &VerifyShareResponseMessage,
 ) -> Result<Vec<DeRecEvent>> {
-    // Replay/freshness gate. Pop the outstanding request for this
-    // channel — if there isn't one, the response is either a replay
-    // of a now-consumed challenge or arrived without any owner-side
-    // request to correspond to. Drop it silently as a NoOp; the
-    // primitive's binding check would fail anyway, but a no-op event
-    // matches the existing pattern used by `unpairing::on_response`.
-    let Some(request) = pending_verification.remove(&channel_id) else {
+    // Replay/freshness gate. Read + delete the outstanding request
+    // for this channel — if there isn't one, the response is either a
+    // replay of a now-consumed challenge or arrived without any
+    // owner-side request to correspond to. Drop it silently as a
+    // NoOp; the primitive's binding check would fail anyway, but a
+    // no-op event matches the existing pattern used by
+    // `unpairing::on_response`.
+    //
+    // `load` + `remove` is two round-trips and not atomic across
+    // instances — see the multi-instance concurrency contract on
+    // [`DeRecStateStore`]. Duplicate `ShareVerified` events emitted
+    // by two racing instances are idempotent from the application's
+    // perspective.
+    let key = StateKey::PendingVerification { channel_id };
+    let Some(StateItem::PendingVerification { request, .. }) =
+        state_store.load(secret_id, key.clone()).await?
+    else {
         #[cfg(feature = "logging")]
         tracing::warn!(
             channel_id = channel_id.0,
@@ -321,6 +394,7 @@ async fn on_response<Sh: DeRecShareStore>(
         );
         return Ok(vec![DeRecEvent::NoOp]);
     };
+    let _ = state_store.remove(secret_id, key).await?;
 
     let version = response.version;
 

@@ -38,6 +38,7 @@ pub async fn run_all() {
     run_no_keys_pairing_flow().await;
     run_replica_id_wiring_flow().await;
     run_protect_secret_with_replica_targets_flow().await;
+    run_protect_secret_per_target_failure_flow().await;
     run_sharing_flow().await;
     run_discovery_and_recovery_flow().await;
     run_unpairing_flow().await;
@@ -365,6 +366,11 @@ impl DeRecUserSecretStore for InMemoryUserSecretStore {
 struct InProcessTransport {
     #[allow(clippy::type_complexity)]
     outbox: Arc<Mutex<VecDeque<(TransportProtocol, Vec<u8>)>>>,
+    /// Fail-list of URIs; `send()` rejects with `Error::Invariant`
+    /// when the endpoint's URI is in this set. Used by the per-target
+    /// failure smoke tests to synthesize a broken-link scenario for one
+    /// channel while leaving the others healthy.
+    failing_uris: Arc<Mutex<HashSet<String>>>,
 }
 
 impl InProcessTransport {
@@ -376,13 +382,31 @@ impl InProcessTransport {
         let mut guard = self.outbox.lock().expect("transport outbox mutex poisoned");
         guard.drain(..).collect()
     }
+
+    /// Mark `uri` as failing — subsequent `send()` calls to this URI
+    /// resolve to `Err`. Additive; call again with a different URI to
+    /// fail multiple endpoints.
+    fn fail_uri(&self, uri: impl Into<String>) {
+        self.failing_uris
+            .lock()
+            .expect("transport failing_uris mutex poisoned")
+            .insert(uri.into());
+    }
 }
 
 impl DeRecTransport for InProcessTransport {
     fn send(&self, endpoint: &TransportProtocol, message: Vec<u8>) -> TransportFuture<'_> {
         let entry = (endpoint.clone(), message);
         let outbox = self.outbox.clone();
+        let failing = self.failing_uris.clone();
         Box::pin(async move {
+            let should_fail = failing
+                .lock()
+                .expect("transport failing_uris mutex poisoned")
+                .contains(&entry.0.uri);
+            if should_fail {
+                return Err(derec_library::Error::Invariant("simulated transport failure"));
+            }
             outbox
                 .lock()
                 .expect("transport outbox mutex poisoned")
@@ -398,8 +422,57 @@ type SmokeProtocol = DeRecProtocol<
     InMemoryShareStore,
     InMemorySecretStore,
     InMemoryUserSecretStore,
+    InMemoryStateStore,
     InProcessTransport,
 >;
+
+/// In-memory state store for the smoke test. Backs the mandatory
+/// [`derec_library::protocol::DeRecStateStore`] slot on the builder;
+/// each row is keyed by `(secret_id, StateKey)` and holds the full
+/// [`derec_library::protocol::StateItem`] payload.
+#[derive(Default, Clone)]
+struct InMemoryStateStore {
+    data: HashMap<(u64, derec_library::protocol::StateKey), derec_library::protocol::StateItem>,
+}
+impl derec_library::protocol::DeRecStateStore for InMemoryStateStore {
+    fn save(
+        &mut self,
+        secret_id: u64,
+        item: derec_library::protocol::StateItem,
+    ) -> derec_library::protocol::StateStoreFuture<'_, ()> {
+        self.data.insert((secret_id, item.key()), item);
+        Box::pin(std::future::ready(Ok(())))
+    }
+    fn load(
+        &self,
+        secret_id: u64,
+        key: derec_library::protocol::StateKey,
+    ) -> derec_library::protocol::StateStoreFuture<'_, Option<derec_library::protocol::StateItem>> {
+        let result = self.data.get(&(secret_id, key)).cloned();
+        Box::pin(std::future::ready(Ok(result)))
+    }
+    fn remove(
+        &mut self,
+        secret_id: u64,
+        key: derec_library::protocol::StateKey,
+    ) -> derec_library::protocol::StateStoreFuture<'_, bool> {
+        let removed = self.data.remove(&(secret_id, key)).is_some();
+        Box::pin(std::future::ready(Ok(removed)))
+    }
+    fn load_all(
+        &self,
+        secret_id: u64,
+        kind: derec_library::protocol::StateKind,
+    ) -> derec_library::protocol::StateStoreFuture<'_, Vec<derec_library::protocol::StateItem>> {
+        let entries: Vec<derec_library::protocol::StateItem> = self
+            .data
+            .iter()
+            .filter(|((s, k), _)| *s == secret_id && k.kind() == kind)
+            .map(|(_, item)| item.clone())
+            .collect();
+        Box::pin(std::future::ready(Ok(entries)))
+    }
+}
 
 /// A protocol instance plus the metadata needed to route messages to it: its
 /// own advertised transport URI and a handle to drain its outbox.
@@ -515,6 +588,7 @@ impl Peer {
             .with_secret_store(InMemorySecretStore::default())
             .with_user_secret_store(InMemoryUserSecretStore::default())
             .with_transport(transport.clone())
+            .with_state_store(InMemoryStateStore::default())
             .with_own_transport(uri)
             .with_threshold(2)
             .with_parameter_range(range)
@@ -544,6 +618,7 @@ impl Peer {
             .with_secret_store(InMemorySecretStore::default())
             .with_user_secret_store(InMemoryUserSecretStore::default())
             .with_transport(transport.clone())
+            .with_state_store(InMemoryStateStore::default())
             .with_own_transport(uri)
             .with_threshold(threshold)
             .with_auto_reply_to(auto_reply_to)
@@ -695,7 +770,7 @@ async fn pair(owner: &mut Peer, helper: &mut Peer, channel_id: ChannelId) -> Cha
         .await
         .expect("owner.create_contact failed");
 
-    helper
+    let start_events = helper
         .protocol
         .start(DeRecFlow::Pairing {
             kind: SenderKind::Helper,
@@ -707,6 +782,32 @@ async fn pair(owner: &mut Peer, helper: &mut Peer, channel_id: ChannelId) -> Cha
         })
         .await
         .expect("helper start(Pairing) failed");
+
+    // start(Pairing) must emit exactly one PairingStarted, carrying the
+    // transient `channel_id` we passed in on the ContactMessage and the
+    // local role we asked to pair as.
+    let pairing_started = start_events
+        .iter()
+        .find_map(|e| match e {
+            DeRecEvent::PairingStarted { channel_id, kind } => Some((*channel_id, *kind)),
+            _ => None,
+        })
+        .expect("start(Pairing) must emit PairingStarted");
+    assert_eq!(
+        pairing_started.0, channel_id,
+        "PairingStarted.channel_id must echo the transient contact channel_id"
+    );
+    assert_eq!(
+        pairing_started.1,
+        SenderKind::Helper,
+        "PairingStarted.kind must echo the local role"
+    );
+    assert!(
+        !start_events
+            .iter()
+            .any(|e| matches!(e, DeRecEvent::PairingCompleted { .. })),
+        "PairingCompleted must not appear in start(Pairing) — it fires from process() after the peer round-trip"
+    );
 
     // Helper -> Owner (PairRequest), Owner -> Helper (PairResponse), etc.
     let helper_to_owner = pump(helper, owner).await;
@@ -1001,8 +1102,7 @@ async fn run_hashed_keys_pairing_flow() {
         .protocol
         .process(&pre_pair_response_bytes)
         .await
-        .err()
-        .expect("tampered binding hash must cause process() to return Err");
+        .expect_err("tampered binding hash must cause process() to return Err");
     assert!(
         matches!(
             err.source,
@@ -1195,8 +1295,7 @@ async fn run_no_keys_pairing_flow() {
         .protocol
         .accept(action)
         .await
-        .err()
-        .expect("accept must fail on nonce mismatch");
+        .expect_err("accept must fail on nonce mismatch");
     let msg = accept_err.to_string();
     assert!(
         msg.contains("NoKeys PrePair nonce mismatch"),
@@ -1403,8 +1502,7 @@ async fn run_replica_id_wiring_flow() {
         .protocol
         .process(&pair_request_bytes)
         .await
-        .err()
-        .expect("unconfigured responder must refuse replica-mode PairRequest");
+        .expect_err("unconfigured responder must refuse replica-mode PairRequest");
     assert!(
         matches!(err.source, derec_library::Error::ReplicaIdNotConfigured),
         "expected ReplicaIdNotConfigured on responder, got: {err}"
@@ -1531,7 +1629,7 @@ async fn run_protect_secret_with_replica_targets_flow() {
 
     // 3. Owner protects a secret targeting BOTH helpers and the replica.
     let secret_data = b"secret-payload-for-replica-and-helper".to_vec();
-    owner
+    let protect_events = owner
         .protocol
         .start(DeRecFlow::ProtectSecret {
             secrets: vec![UserSecret {
@@ -1543,6 +1641,37 @@ async fn run_protect_secret_with_replica_targets_flow() {
         })
         .await
         .expect("owner start(ProtectSecret) with replica target failed");
+
+    // start(ProtectSecret) must emit one ProtectSecretStarted per fanned
+    // channel (2 helpers + 1 replica), all sharing the same version.
+    let protect_started: Vec<(ChannelId, u32)> = protect_events
+        .iter()
+        .filter_map(|e| match e {
+            DeRecEvent::ProtectSecretStarted { channel_id, version } => {
+                Some((*channel_id, *version))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        protect_started.len(),
+        3,
+        "start(ProtectSecret) must emit ProtectSecretStarted for each targeted channel (2 helpers + 1 replica), got {}",
+        protect_started.len()
+    );
+    let first_version = protect_started[0].1;
+    for (_, v) in &protect_started {
+        assert_eq!(
+            *v, first_version,
+            "every ProtectSecretStarted in the round must carry the same version"
+        );
+    }
+    assert!(
+        !protect_events
+            .iter()
+            .any(|e| matches!(e, DeRecEvent::ProtectSecretFailed { .. })),
+        "happy-path ProtectSecret must not emit any ProtectSecretFailed events"
+    );
 
     // 4. Owner's outbox must hold three envelopes — one per helper + one
     //    for the replica.
@@ -1839,6 +1968,96 @@ fn decode_store_share_request(
         derec_proto::MessageBody::StoreShareRequest(req) => req,
         _ => panic!("expected StoreShareRequest, got {:?}", std::any::type_name_of_val(&inner)),
     }
+}
+
+
+/// Fan out a `ProtectSecret` to two helpers where the owner's
+/// transport is set to fail sends to helper-b's endpoint. The round
+/// must emit `ProtectSecretStarted` for helper-a and
+/// `ProtectSecretFailed { error }` for helper-b — the failure on b
+/// must not short-circuit the fan-out or cause the whole call to Err.
+async fn run_protect_secret_per_target_failure_flow() {
+    println!("=== Protocol ProtectSecret per-target failure flow test ===");
+
+    let channel_a = ChannelId(1);
+    let channel_b = ChannelId(2);
+    let mut owner = Peer::with_secret_id("owner", "https://owner.example.com", 42);
+    let mut helper_a = Peer::new("helper-a", "https://helper-a.example.com");
+    let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
+
+    let channel_a = pair(&mut owner, &mut helper_a, channel_a).await;
+    let channel_b = pair(&mut owner, &mut helper_b, channel_b).await;
+
+    // Break the owner→helper-b link BEFORE start(ProtectSecret). helper-a
+    // remains reachable.
+    owner.transport.fail_uri(helper_b.uri.clone());
+
+    let events = owner
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![UserSecret {
+                id: vec![1, 2, 3],
+                name: "per-target-failure".to_owned(),
+                data: b"payload".to_vec(),
+            }],
+            description: None,
+        })
+        .await
+        .expect("start(ProtectSecret) must not Err on per-target failure");
+
+    let (started, failed): (Vec<_>, Vec<_>) = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                DeRecEvent::ProtectSecretStarted { .. } | DeRecEvent::ProtectSecretFailed { .. }
+            )
+        })
+        .partition(|e| matches!(e, DeRecEvent::ProtectSecretStarted { .. }));
+
+    assert_eq!(
+        started.len(),
+        1,
+        "expected exactly one ProtectSecretStarted (helper-a); got {} started + {} failed",
+        started.len(),
+        failed.len()
+    );
+    assert_eq!(
+        failed.len(),
+        1,
+        "expected exactly one ProtectSecretFailed (helper-b); got {} started + {} failed",
+        started.len(),
+        failed.len()
+    );
+
+    match started[0] {
+        DeRecEvent::ProtectSecretStarted { channel_id, .. } => assert_eq!(
+            *channel_id, channel_a,
+            "the started event must be for helper-a"
+        ),
+        _ => unreachable!(),
+    }
+    match failed[0] {
+        DeRecEvent::ProtectSecretFailed {
+            channel_id, error, ..
+        } => {
+            assert_eq!(*channel_id, channel_b, "the failed event must be for helper-b");
+            assert!(
+                !error.is_empty(),
+                "ProtectSecretFailed.error must carry a non-empty message"
+            );
+        }
+        _ => unreachable!(),
+    }
+    println!(
+        "  helper-a: ProtectSecretStarted ✓   helper-b: ProtectSecretFailed(\"{}\")  ✓",
+        match failed[0] {
+            DeRecEvent::ProtectSecretFailed { error, .. } => error.as_str(),
+            _ => "",
+        }
+    );
+
+    println!("Protocol ProtectSecret per-target failure flow test passed.");
 }
 
 
@@ -2217,7 +2436,7 @@ async fn run_unpairing_flow() {
     owner
         .protocol
         .start(DeRecFlow::Unpair {
-            target: Target::Single(channel_id),
+            channel_id,
             memo: Some("decommissioning".to_owned()),
         })
         .await
@@ -2276,7 +2495,7 @@ async fn run_unpairing_flow() {
     let result = helper
         .protocol
         .start(DeRecFlow::Unpair {
-            target: Target::Single(helper_init_channel),
+            channel_id: helper_init_channel,
             memo: Some("helper trying to unpair".to_owned()),
         })
         .await;

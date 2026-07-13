@@ -60,6 +60,7 @@ pub const DEREC_CATEGORY_SHARE_STORE: i32 = 11;
 pub const DEREC_CATEGORY_INVALID_INPUT: i32 = 12;
 pub const DEREC_CATEGORY_PROTOBUF: i32 = 13;
 pub const DEREC_CATEGORY_INVARIANT: i32 = 14;
+pub const DEREC_CATEGORY_STATE_STORE: i32 = 15;
 
 pub const DEREC_CODE_OK: i32 = 0;
 pub const DEREC_CODE_NON_OK_STATUS: i32 = 1;
@@ -329,6 +330,7 @@ fn categorize(err: &crate::Error) -> (i32, i32) {
         }
         crate::Error::ChannelStore(_) => (DEREC_CATEGORY_CHANNEL_STORE, DEREC_CODE_STORE_ERROR),
         crate::Error::ShareStore(_) => (DEREC_CATEGORY_SHARE_STORE, DEREC_CODE_STORE_ERROR),
+        crate::Error::StateStore(_) => (DEREC_CATEGORY_STATE_STORE, DEREC_CODE_STORE_ERROR),
         crate::Error::Transport(_) => (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_TRANSPORT_INVALID),
         crate::Error::InvalidInput(_) => (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_INVALID_INPUT),
         crate::Error::ProtobufDecode(_) => (DEREC_CATEGORY_PROTOBUF, DEREC_CODE_PROTOBUF_DECODE),

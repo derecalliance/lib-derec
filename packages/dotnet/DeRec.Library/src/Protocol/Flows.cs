@@ -153,7 +153,7 @@ public sealed record RecoverSecretParams
 /// <summary>Params for <see cref="FlowKind.Unpair"/>.</summary>
 public sealed record UnpairParams
 {
-    [JsonPropertyName("target")] public Target? Target { get; init; }
+    [JsonPropertyName("channel_id")] public required string ChannelId { get; init; }
     [JsonPropertyName("memo")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Memo { get; init; }
@@ -429,6 +429,96 @@ public sealed record NoOpEvent : DeRecEvent
 }
 
 /// <summary>
+/// Fired by <see cref="DeRecProtocol.StartAsync"/> when a pairing
+/// handshake was dispatched successfully. <see cref="Kind"/> is the
+/// local party's role in the flow (same value that will land on the
+/// subsequent <see cref="PairingCompletedEvent.Kind"/>).
+/// </summary>
+public sealed record PairingStartedEvent : DeRecEvent
+{
+    public override string EventType => "PairingStarted";
+    public required string ChannelId { get; init; }
+    public required Pairing.SenderKind Kind { get; init; }
+}
+
+public sealed record DiscoveryStartedEvent : DeRecEvent
+{
+    public override string EventType => "DiscoveryStarted";
+    public required string ChannelId { get; init; }
+}
+
+public sealed record DiscoveryFailedEvent : DeRecEvent
+{
+    public override string EventType => "DiscoveryFailed";
+    public required string ChannelId { get; init; }
+    public required string Error { get; init; }
+}
+
+public sealed record ProtectSecretStartedEvent : DeRecEvent
+{
+    public override string EventType => "ProtectSecretStarted";
+    public required string ChannelId { get; init; }
+    public required uint Version { get; init; }
+}
+
+public sealed record ProtectSecretFailedEvent : DeRecEvent
+{
+    public override string EventType => "ProtectSecretFailed";
+    public required string ChannelId { get; init; }
+    public required uint Version { get; init; }
+    public required string Error { get; init; }
+}
+
+public sealed record VerifySharesStartedEvent : DeRecEvent
+{
+    public override string EventType => "VerifySharesStarted";
+    public required string ChannelId { get; init; }
+    public required uint Version { get; init; }
+}
+
+public sealed record VerifySharesFailedEvent : DeRecEvent
+{
+    public override string EventType => "VerifySharesFailed";
+    public required string ChannelId { get; init; }
+    public required uint Version { get; init; }
+    public required string Error { get; init; }
+}
+
+public sealed record RecoverSecretStartedEvent : DeRecEvent
+{
+    public override string EventType => "RecoverSecretStarted";
+    public required string ChannelId { get; init; }
+    public required uint Version { get; init; }
+}
+
+public sealed record RecoverSecretFailedEvent : DeRecEvent
+{
+    public override string EventType => "RecoverSecretFailed";
+    public required string ChannelId { get; init; }
+    public required uint Version { get; init; }
+    public required string Error { get; init; }
+}
+
+public sealed record UnpairStartedEvent : DeRecEvent
+{
+    public override string EventType => "UnpairStarted";
+    public required string ChannelId { get; init; }
+}
+
+public sealed record UpdateChannelInfoStartedEvent : DeRecEvent
+{
+    public override string EventType => "UpdateChannelInfoStarted";
+    public required string ChannelId { get; init; }
+}
+
+public sealed record UpdateChannelInfoFailedEvent : DeRecEvent
+{
+    public override string EventType => "UpdateChannelInfoFailed";
+    public required string ChannelId { get; init; }
+    public required string Error { get; init; }
+}
+
+/// <summary>
 /// Emitted by <see cref="DeRecProtocol.ProcessAsync"/> in place of
 /// <see cref="ActionRequiredEvent"/> when the configured
 /// <see cref="AutoAcceptPolicy"/> opts in to the inbound action's flow.
@@ -565,6 +655,66 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                 ActionKind = root.GetProperty("action_kind").GetString() ?? string.Empty,
             },
             "NoOp" => new NoOpEvent(),
+            "PairingStarted" => new PairingStartedEvent
+            {
+                ChannelId = root.GetProperty("channel_id").GetString()!,
+                Kind = (Pairing.SenderKind)root.GetProperty("kind").GetInt32(),
+            },
+            "DiscoveryStarted" => new DiscoveryStartedEvent
+            {
+                ChannelId = root.GetProperty("channel_id").GetString()!,
+            },
+            "DiscoveryFailed" => new DiscoveryFailedEvent
+            {
+                ChannelId = root.GetProperty("channel_id").GetString()!,
+                Error = root.GetProperty("error").GetString() ?? string.Empty,
+            },
+            "ProtectSecretStarted" => new ProtectSecretStartedEvent
+            {
+                ChannelId = root.GetProperty("channel_id").GetString()!,
+                Version = root.GetProperty("version").GetUInt32(),
+            },
+            "ProtectSecretFailed" => new ProtectSecretFailedEvent
+            {
+                ChannelId = root.GetProperty("channel_id").GetString()!,
+                Version = root.GetProperty("version").GetUInt32(),
+                Error = root.GetProperty("error").GetString() ?? string.Empty,
+            },
+            "VerifySharesStarted" => new VerifySharesStartedEvent
+            {
+                ChannelId = root.GetProperty("channel_id").GetString()!,
+                Version = root.GetProperty("version").GetUInt32(),
+            },
+            "VerifySharesFailed" => new VerifySharesFailedEvent
+            {
+                ChannelId = root.GetProperty("channel_id").GetString()!,
+                Version = root.GetProperty("version").GetUInt32(),
+                Error = root.GetProperty("error").GetString() ?? string.Empty,
+            },
+            "RecoverSecretStarted" => new RecoverSecretStartedEvent
+            {
+                ChannelId = root.GetProperty("channel_id").GetString()!,
+                Version = root.GetProperty("version").GetUInt32(),
+            },
+            "RecoverSecretFailed" => new RecoverSecretFailedEvent
+            {
+                ChannelId = root.GetProperty("channel_id").GetString()!,
+                Version = root.GetProperty("version").GetUInt32(),
+                Error = root.GetProperty("error").GetString() ?? string.Empty,
+            },
+            "UnpairStarted" => new UnpairStartedEvent
+            {
+                ChannelId = root.GetProperty("channel_id").GetString()!,
+            },
+            "UpdateChannelInfoStarted" => new UpdateChannelInfoStartedEvent
+            {
+                ChannelId = root.GetProperty("channel_id").GetString()!,
+            },
+            "UpdateChannelInfoFailed" => new UpdateChannelInfoFailedEvent
+            {
+                ChannelId = root.GetProperty("channel_id").GetString()!,
+                Error = root.GetProperty("error").GetString() ?? string.Empty,
+            },
             "Unmapped" => new UnmappedEvent
             {
                 Variant = root.GetProperty("variant").GetString() ?? "unknown",

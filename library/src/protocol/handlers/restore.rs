@@ -29,9 +29,9 @@
 //! preconditions above.
 
 use super::super::{
-    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport,
-    DeRecUserSecretStore, PendingUnpair, SecretValue, UnpairAck,
-    types::{Channel, ChannelStatus, HelperInfo, Replicas, Secret, Share, Target, UserSecrets},
+    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecStateStore,
+    DeRecTransport, DeRecUserSecretStore, SecretValue, UnpairAck,
+    types::{Channel, ChannelStatus, HelperInfo, Replicas, Secret, Share, UserSecrets},
 };
 use crate::{
     Result,
@@ -91,13 +91,14 @@ pub(in crate::protocol) async fn restore<
     Ss: DeRecSecretStore,
     Us: DeRecUserSecretStore,
     T: DeRecTransport,
+    St: DeRecStateStore,
 >(
     channel_store: &mut Ch,
     share_store: &mut Sh,
     secret_store: &mut Ss,
     user_secret_store: &mut Us,
     transport: &T,
-    pending_unpair: &mut PendingUnpair,
+    state_store: &mut St,
     local_replica_id: &mut Option<u64>,
     secret_id: u64,
     secret: &Secret,
@@ -130,7 +131,7 @@ pub(in crate::protocol) async fn restore<
         share_store,
         secret_store,
         transport,
-        pending_unpair,
+        state_store,
         secret_id,
         &existing_channels,
         &canonical_ids,
@@ -345,12 +346,13 @@ async fn unpair_recovery_channels<
     Sh: DeRecShareStore,
     Ss: DeRecSecretStore,
     T: DeRecTransport,
+    St: DeRecStateStore,
 >(
     channel_store: &mut Ch,
     share_store: &mut Sh,
     secret_store: &mut Ss,
     transport: &T,
-    pending_unpair: &mut PendingUnpair,
+    state_store: &mut St,
     secret_id: u64,
     existing_channels: &[Channel],
     canonical_ids: &HashSet<u64>,
@@ -363,20 +365,26 @@ async fn unpair_recovery_channels<
     if recovery_ids.is_empty() {
         return Ok(Vec::new());
     }
-    super::unpairing::start(
-        channel_store,
-        share_store,
-        secret_store,
-        transport,
-        pending_unpair,
-        secret_id,
-        Target::Many(recovery_ids),
-        None,
-        UnpairAck::NotRequired,
-        now_secs(),
-        None,
-    )
-    .await
+    let now = now_secs();
+    let mut events = Vec::new();
+    for channel_id in recovery_ids {
+        let mut per_channel = super::unpairing::start(
+            channel_store,
+            share_store,
+            secret_store,
+            transport,
+            state_store,
+            secret_id,
+            channel_id,
+            None,
+            UnpairAck::NotRequired,
+            now,
+            None,
+        )
+        .await?;
+        events.append(&mut per_channel);
+    }
+    Ok(events)
 }
 
 #[cfg(test)]
@@ -584,8 +592,42 @@ mod tests {
         InMemShareStore,
         InMemSecretStore,
         InMemUserSecretStore,
+        RestoreTestStateStore,
         NoopTransport,
     >;
+
+    #[derive(Default)]
+    struct RestoreTestStateStore;
+    impl crate::protocol::DeRecStateStore for RestoreTestStateStore {
+        fn save(
+            &mut self,
+            _: u64,
+            _: crate::protocol::StateItem,
+        ) -> crate::protocol::StateStoreFuture<'_, ()> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+        fn load(
+            &self,
+            _: u64,
+            _: crate::protocol::StateKey,
+        ) -> crate::protocol::StateStoreFuture<'_, Option<crate::protocol::StateItem>> {
+            Box::pin(std::future::ready(Ok(None)))
+        }
+        fn remove(
+            &mut self,
+            _: u64,
+            _: crate::protocol::StateKey,
+        ) -> crate::protocol::StateStoreFuture<'_, bool> {
+            Box::pin(std::future::ready(Ok(false)))
+        }
+        fn load_all(
+            &self,
+            _: u64,
+            _: crate::protocol::StateKind,
+        ) -> crate::protocol::StateStoreFuture<'_, Vec<crate::protocol::StateItem>> {
+            Box::pin(std::future::ready(Ok(Vec::new())))
+        }
+    }
 
     /// Test bundle — keeps clone handles to every store so the test
     /// can both pre-seed before construction AND inspect after the
@@ -609,6 +651,7 @@ mod tests {
             .with_secret_store(secret_store.clone())
             .with_user_secret_store(user_secret_store.clone())
             .with_transport(NoopTransport)
+            .with_state_store(RestoreTestStateStore)
             .with_own_transport("https://owner.example.com")
             .with_threshold(2)
             .build()
@@ -943,6 +986,7 @@ mod tests {
                 .with_secret_store(InMemSecretStore::default())
                 .with_user_secret_store(InMemUserSecretStore::default())
                 .with_transport(NoopTransport)
+            .with_state_store(RestoreTestStateStore)
                 .with_own_transport("https://owner.example.com")
                 .with_threshold(2)
                 .with_replica_id(0x1234)

@@ -133,6 +133,10 @@ impl AutoAcceptPolicy {
 /// `ActionRequired` event carrying a `PendingAction`. The application must
 /// pass this token to [`super::DeRecProtocol::accept`] or
 /// [`super::DeRecProtocol::reject`] to complete the flow.
+///
+/// `Debug` shows only the [`PendingActionKind`] discriminant plus
+/// `channel_id` so the ephemeral secret material some variants carry
+/// (e.g. [`PairingSecretKeyMaterial`]) never lands in log lines.
 pub enum PendingAction {
     Pairing {
         channel_id: ChannelId,
@@ -236,6 +240,25 @@ pub enum PendingAction {
     },
 }
 
+impl std::fmt::Debug for PendingAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let channel_id = match self {
+            PendingAction::Pairing { channel_id, .. }
+            | PendingAction::PrePair { channel_id, .. }
+            | PendingAction::StoreShare { channel_id, .. }
+            | PendingAction::VerifyShare { channel_id, .. }
+            | PendingAction::Discovery { channel_id, .. }
+            | PendingAction::GetShare { channel_id, .. }
+            | PendingAction::Unpair { channel_id, .. }
+            | PendingAction::UpdateChannelInfo { channel_id, .. } => channel_id,
+        };
+        f.debug_struct("PendingAction")
+            .field("kind", &self.kind())
+            .field("channel_id", &channel_id.0)
+            .finish()
+    }
+}
+
 impl PendingAction {
     /// Return this action's discriminant — used by
     /// [`AutoAcceptPolicy::allows`] and by the [`DeRecEvent::AutoAccepted`]
@@ -312,20 +335,20 @@ pub enum DeRecFlow {
         secret_id: u64,
         version: u32,
     },
-    /// Initiate an unpair flow against one or more paired channels.
+    /// Initiate an unpair flow against a paired channel.
     ///
     /// **Owner-initiated only.** This node must hold
-    /// [`derec_proto::SenderKind::Owner`] on every channel
-    /// in `target`; otherwise [`crate::Error::RoleMismatch`] is returned.
-    /// Helpers cannot tear down the relationship from the protocol layer —
-    /// they may only refuse an incoming unpair request via
+    /// [`derec_proto::SenderKind::Owner`] on `channel_id`; otherwise
+    /// [`crate::Error::RoleMismatch`] is returned. Helpers cannot tear
+    /// down the relationship from the protocol layer — they may only
+    /// refuse an incoming unpair request via
     /// [`super::DeRecProtocol::reject`].
     ///
-    /// Whether the local state for `target` is dropped immediately on
+    /// Whether the local state for `channel_id` is dropped immediately on
     /// `start(Unpair)` or only after the peer acknowledges is governed by
     /// [`crate::protocol::DeRecProtocolBuilder::with_unpair_ack`].
     Unpair {
-        target: Target,
+        channel_id: ChannelId,
         /// Optional human-readable reason embedded into the wire request.
         /// Pass `None` (or an empty string) to omit.
         memo: Option<String>,
@@ -376,6 +399,7 @@ pub enum UnpairAck {
 ///
 /// The application reacts to these instead of routing raw messages manually.
 #[non_exhaustive]
+#[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum DeRecEvent {
     /// Pairing completed — the shared key for `channel_id` is now persisted.
@@ -707,6 +731,96 @@ pub enum DeRecEvent {
 
     /// Well-formed message with no actionable effect (e.g. an ACK).
     NoOp,
+
+    /// A pairing flow was initiated for `channel_id` with the local
+    /// role `kind`. Emitted synchronously from
+    /// [`super::DeRecProtocol::start`] when the `PairRequest` (or
+    /// `PrePairRequest` for `HashedKeys` / `NoKeys` modes) was
+    /// dispatched successfully. Followed by
+    /// [`Self::PairingCompleted`] (or a failure variant) once the peer
+    /// responds. On a local send failure, `start` returns `Err` instead
+    /// — no `PairingStarted` is emitted.
+    PairingStarted {
+        channel_id: ChannelId,
+        /// The local party's role in the pairing (same value that will
+        /// appear on [`Self::PairingCompleted::kind`] and be persisted
+        /// as [`crate::protocol::types::Channel::role`]).
+        kind: SenderKind,
+    },
+
+    /// A discovery request was dispatched to `channel_id`. Emitted per
+    /// targeted channel by [`super::DeRecProtocol::start`]. Followed by
+    /// [`Self::SecretsDiscovered`] once the helper responds.
+    DiscoveryStarted { channel_id: ChannelId },
+
+    /// A discovery request could not be dispatched to `channel_id`.
+    /// Emitted per targeted channel by [`super::DeRecProtocol::start`]
+    /// when the outbound send (or per-channel preparation) failed. The
+    /// remaining channels in the same fan-out are unaffected.
+    DiscoveryFailed {
+        channel_id: ChannelId,
+        error: String,
+    },
+
+    /// A share-storage request was dispatched to `channel_id` for
+    /// `version`. Emitted per targeted helper (and per targeted replica
+    /// destination) by [`super::DeRecProtocol::start`]. Followed by
+    /// [`Self::ShareStored`] / [`Self::ShareConfirmed`] /
+    /// [`Self::ShareRejected`] as the peer responds; the whole round
+    /// finishes with [`Self::SharingComplete`].
+    ProtectSecretStarted { channel_id: ChannelId, version: u32 },
+
+    /// A share-storage request could not be dispatched to `channel_id`
+    /// for `version`. Remaining fan-out targets are unaffected.
+    ProtectSecretFailed {
+        channel_id: ChannelId,
+        version: u32,
+        error: String,
+    },
+
+    /// A verify-share challenge was dispatched to `channel_id` for
+    /// `version`. Followed by [`Self::ShareVerified`] once the helper
+    /// responds.
+    VerifySharesStarted { channel_id: ChannelId, version: u32 },
+
+    /// A verify-share challenge could not be dispatched to `channel_id`
+    /// for `version`.
+    VerifySharesFailed {
+        channel_id: ChannelId,
+        version: u32,
+        error: String,
+    },
+
+    /// A recovery share request was dispatched to `channel_id` for
+    /// `version`. Followed by [`Self::RecoveryShareReceived`] /
+    /// [`Self::RecoveryShareError`] / [`Self::SecretRecovered`] as
+    /// helper responses arrive.
+    RecoverSecretStarted { channel_id: ChannelId, version: u32 },
+
+    /// A recovery share request could not be dispatched to `channel_id`
+    /// for `version`.
+    RecoverSecretFailed {
+        channel_id: ChannelId,
+        version: u32,
+        error: String,
+    },
+
+    /// An unpair request was dispatched to `channel_id`. Followed by
+    /// [`Self::Unpaired`] once the peer acknowledges (or, under
+    /// [`UnpairAck::NotRequired`], emitted in the same event vec
+    /// immediately after `UnpairStarted`).
+    UnpairStarted { channel_id: ChannelId },
+
+    /// An update-channel-info request was dispatched to `channel_id`.
+    /// Followed by [`Self::ChannelInfoUpdated`] once the peer responds.
+    UpdateChannelInfoStarted { channel_id: ChannelId },
+
+    /// An update-channel-info request could not be dispatched to
+    /// `channel_id`.
+    UpdateChannelInfoFailed {
+        channel_id: ChannelId,
+        error: String,
+    },
 }
 
 #[cfg(test)]

@@ -315,6 +315,19 @@ storage / transport callbacks and drives every flow through a single
 `StartAsync` / `ProcessAsync` / `AcceptAsync` / `RejectAsync` surface —
 events surface as typed `DeRecEvent` subclasses.
 
+`StartAsync` returns `IReadOnlyList<DeRecEvent>` describing the requests
+that were dispatched — a single `PairingStartedEvent` for
+`FlowKind.Pairing`, or one `*StartedEvent` per targeted channel for
+fan-out flows (`ProtectSecret`, `VerifyShares`, `RecoverSecret`,
+`Discovery`, `UpdateChannelInfo`). Per-target transport failures on
+fan-out flows surface as `*FailedEvent { ChannelId, Error }` in the
+same list — a single failing target does not short-circuit the round.
+Programmer errors (invalid input, missing preconditions, role
+mismatch) throw `DeRecException` before any target-level event is
+emitted. Follow-up peer-response events (`PairingCompletedEvent`,
+`ShareConfirmedEvent`, `SecretRecoveredEvent`, …) still surface from
+`ProcessAsync`.
+
 ```csharp
 using DeRec.Library;
 using DeRec.Library.Orchestrator;
@@ -331,17 +344,19 @@ using var owner = new DeRecProtocol(
 
 // Pair (mirror this on the peer side).
 byte[] contact = await helper.CreateContactAsync(channelId, ContactMode.InlineKeys);
-await owner.StartAsync(FlowKind.Pairing, new PairingParams
+var startEvents = await owner.StartAsync(FlowKind.Pairing, new PairingParams
 {
     Kind = (int)Pairing.SenderKind.Owner,
     Contact = contact,
 });
+var started = startEvents.OfType<PairingStartedEvent>().First();
+Console.WriteLine($"dispatched pair on channel {started.ChannelId}");
 // Hand the queued PairRequest from `owner`'s transport to `helper.ProcessAndAcceptAllAsync`,
 // then the PairResponse back to `owner.ProcessAndAcceptAllAsync`.
 // Both sides surface `PairingCompletedEvent` when done.
 
 // Protect a secret across one or more helpers.
-await owner.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
+var protectEvents = await owner.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
 {
     SecretId = "0xCAFE",
     TargetValue = Target.Many(helperAId, helperBId).ToJsonValue(),
@@ -350,8 +365,13 @@ await owner.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
         new UserSecret { Id = new byte[] { 1 }, Name = "secret", Data = secretBytes },
     },
 });
-// Each helper emits `ShareStoredEvent`; the owner emits `ShareConfirmedEvent`
-// per helper and `SharingCompleteEvent` once the round closes.
+// One ProtectSecretStartedEvent per targeted channel (helper + replica);
+// any ProtectSecretFailedEvent { ChannelId, Version, Error } here means
+// that specific target's request could not be dispatched — the rest are
+// still in flight.
+// Peer responses arrive via ProcessAsync as ShareStoredEvent /
+// ShareConfirmedEvent per helper + SharingCompleteEvent once the round
+// closes.
 ```
 
 App-side responsibilities (mirrors the other SDKs):

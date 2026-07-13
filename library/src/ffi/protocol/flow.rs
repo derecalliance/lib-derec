@@ -111,7 +111,7 @@ fn parse_unpair_flow(params_json: &[u8]) -> Result<DeRecFlow, String> {
     let raw: UnpairParamsJson = serde_json::from_slice(params_json)
         .map_err(|e| format!("invalid UnpairParams JSON: {e}"))?;
     Ok(DeRecFlow::Unpair {
-        target: parse_target(raw.target)?,
+        channel_id: ChannelId(parse_u64_string(&raw.channel_id)?),
         memo: raw.memo,
     })
 }
@@ -221,8 +221,7 @@ struct RecoverSecretParamsJson {
 
 #[derive(Deserialize)]
 struct UnpairParamsJson {
-    #[serde(default)]
-    target: Option<Value>,
+    channel_id: String,
     #[serde(default)]
     memo: Option<String>,
 }

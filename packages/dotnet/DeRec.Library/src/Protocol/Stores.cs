@@ -182,3 +182,135 @@ public interface ITransport
     void Send(string uri, int protocol, byte[] message);
 }
 
+/// <summary>
+/// Tag identifying which category of in-flight orchestrator state a
+/// <see cref="StateItem"/> belongs to. Numeric values must match the
+/// Rust-side <c>StateKind</c>.
+/// </summary>
+public enum StateKind : uint
+{
+    /// <summary>Outstanding verify-share challenges, one per channel.</summary>
+    PendingVerification = 0,
+    /// <summary>Recovery accumulator, one per (secretId, version).</summary>
+    PendingRecovery = 1,
+    /// <summary>Outstanding unpair acknowledgements, one per channel.</summary>
+    PendingUnpair = 2,
+    /// <summary>Active sharing round, at most one per secretId.</summary>
+    SharingRound = 3,
+}
+
+/// <summary>
+/// Secondary-key selector for one row inside a <see cref="StateKind"/>
+/// under a <c>secretId</c>. Which field is populated is determined by
+/// <see cref="Kind"/>.
+/// </summary>
+/// <param name="Kind">Row category.</param>
+/// <param name="ChannelId">Set for <see cref="StateKind.PendingVerification"/> and <see cref="StateKind.PendingUnpair"/>.</param>
+/// <param name="Version">Set for <see cref="StateKind.PendingRecovery"/>.</param>
+public sealed record StateKey(StateKind Kind, ulong? ChannelId, uint? Version)
+{
+    public static StateKey PendingVerification(ulong channelId) =>
+        new(StateKind.PendingVerification, channelId, null);
+    public static StateKey PendingRecovery(uint version) =>
+        new(StateKind.PendingRecovery, null, version);
+    public static StateKey PendingUnpair(ulong channelId) =>
+        new(StateKind.PendingUnpair, channelId, null);
+    public static StateKey SharingRound() =>
+        new(StateKind.SharingRound, null, null);
+}
+
+/// <summary>
+/// Payload of one row in the state store. Which fields are populated
+/// is determined by <see cref="Kind"/> — the FFI bridge validates and
+/// normalises the JSON wire-form.
+/// </summary>
+/// <param name="Kind">Row category.</param>
+/// <param name="ChannelId">Set for <see cref="StateKind.PendingVerification"/> and <see cref="StateKind.PendingUnpair"/>.</param>
+/// <param name="Version">Set for <see cref="StateKind.PendingRecovery"/> and <see cref="StateKind.SharingRound"/>.</param>
+/// <param name="StartedAt">Unix seconds when the operation was initiated (for <see cref="StateKind.PendingUnpair"/> and <see cref="StateKind.SharingRound"/>).</param>
+/// <param name="Bytes">
+/// Prost-encoded <c>VerifyShareRequestMessage</c> for
+/// <see cref="StateKind.PendingVerification"/>; otherwise null.
+/// </param>
+/// <param name="Shares">
+/// Prost-encoded <c>GetShareResponseMessage</c> blobs, one per
+/// received share, for <see cref="StateKind.PendingRecovery"/>;
+/// otherwise null.
+/// </param>
+/// <param name="Pending">Channel-id set of helpers yet to respond (only for <see cref="StateKind.SharingRound"/>).</param>
+/// <param name="Confirmed">Channel-id set of helpers that confirmed storage (only for <see cref="StateKind.SharingRound"/>).</param>
+/// <param name="Failed">Channel-id set of helpers that rejected or timed out (only for <see cref="StateKind.SharingRound"/>).</param>
+public sealed record StateItem(
+    StateKind Kind,
+    ulong? ChannelId,
+    uint? Version,
+    ulong? StartedAt,
+    byte[]? Bytes,
+    byte[][]? Shares,
+    ulong[]? Pending = null,
+    ulong[]? Confirmed = null,
+    ulong[]? Failed = null)
+{
+    public StateKey Key() => Kind switch
+    {
+        StateKind.PendingVerification => StateKey.PendingVerification(
+            ChannelId ?? throw new InvalidOperationException("PendingVerification requires ChannelId")),
+        StateKind.PendingRecovery => StateKey.PendingRecovery(
+            Version ?? throw new InvalidOperationException("PendingRecovery requires Version")),
+        StateKind.PendingUnpair => StateKey.PendingUnpair(
+            ChannelId ?? throw new InvalidOperationException("PendingUnpair requires ChannelId")),
+        StateKind.SharingRound => StateKey.SharingRound(),
+        _ => throw new InvalidOperationException($"unknown StateKind: {Kind}"),
+    };
+
+    public static StateItem PendingVerification(ulong channelId, byte[] requestBytes) =>
+        new(StateKind.PendingVerification, channelId, null, null, requestBytes, null);
+    public static StateItem PendingRecovery(uint version, byte[][] shares) =>
+        new(StateKind.PendingRecovery, null, version, null, null, shares);
+    public static StateItem PendingUnpair(ulong channelId, ulong startedAt) =>
+        new(StateKind.PendingUnpair, channelId, null, startedAt, null, null);
+    public static StateItem SharingRound(
+        uint version,
+        ulong[] pending,
+        ulong[] confirmed,
+        ulong[] failed,
+        ulong startedAt) =>
+        new(StateKind.SharingRound, null, version, startedAt, null, null, pending, confirmed, failed);
+}
+
+/// <summary>
+/// In-flight orchestrator state persistence. Same per-call-isolation
+/// contract as <see cref="IChannelStore"/>. Backends are treated as
+/// full-replacement upsert stores — accumulator-style state
+/// (<see cref="StateKind.PendingRecovery"/> and
+/// <see cref="StateKind.SharingRound"/>) grows via load-modify-save
+/// cycles from the library.
+/// </summary>
+public interface IStateStore
+{
+    /// <summary>
+    /// Insert or full-replace the row at <c>(secretId, item.Key())</c>.
+    /// Idempotent.
+    /// </summary>
+    void Save(ulong secretId, StateItem item);
+
+    /// <summary>
+    /// Read the row at <c>(secretId, key)</c>. Return <c>null</c> when
+    /// no row exists.
+    /// </summary>
+    StateItem? Load(ulong secretId, StateKey key);
+
+    /// <summary>
+    /// Remove the row at <c>(secretId, key)</c>. Returns <c>true</c> iff
+    /// a row was actually removed. Idempotent — removing a missing
+    /// entry returns <c>false</c>, not an error.
+    /// </summary>
+    bool Remove(ulong secretId, StateKey key);
+
+    /// <summary>
+    /// Return every item of the given <paramref name="kind"/> under this
+    /// <paramref name="secretId"/>.
+    /// </summary>
+    IEnumerable<StateItem> LoadAll(ulong secretId, StateKind kind);
+}
+

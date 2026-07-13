@@ -13,26 +13,6 @@ use crate::ffi::error::{
 use crate::ffi::protocol::events::encode_events;
 use crate::ffi::protocol::flow as flow_params;
 
-/// Result type for [`derec_protocol_start`]. `has_channel_id` is `1`
-/// only for the Pairing flow (which mints a new channel id); other
-/// flows return `0` and the field is undefined.
-#[repr(C)]
-pub struct DeRecProtocolStartResult {
-    pub error: DeRecError,
-    pub has_channel_id: u32,
-    pub channel_id: u64,
-}
-
-impl From<DeRecError> for DeRecProtocolStartResult {
-    fn from(error: DeRecError) -> Self {
-        Self {
-            error,
-            has_channel_id: 0,
-            channel_id: 0,
-        }
-    }
-}
-
 /// Start a new flow. `flow_kind` matches the constants in
 /// [`crate::ffi::protocol::flow`]. `params_json_*` is a UTF-8 JSON blob
 /// shaped to the matching `*ParamsJson` struct in that module.
@@ -48,7 +28,7 @@ pub unsafe extern "C" fn derec_protocol_start(
     flow_kind: u32,
     params_json_ptr: *const u8,
     params_json_len: usize,
-) -> DeRecProtocolStartResult {
+) -> DeRecProtocolEventsResult {
     if handle.is_null() {
         return ffi_error(DEREC_CODE_FFI_NULL_PTR, "handle is null").into();
     }
@@ -69,16 +49,13 @@ pub unsafe extern "C" fn derec_protocol_start(
     let h = unsafe { &*handle };
     let mut inner = h.lock_inner();
     match h.runtime.block_on(inner.start(flow)) {
-        Ok(Some(id)) => DeRecProtocolStartResult {
-            error: success(),
-            has_channel_id: 1,
-            channel_id: id,
-        },
-        Ok(None) => DeRecProtocolStartResult {
-            error: success(),
-            has_channel_id: 0,
-            channel_id: 0,
-        },
+        Ok(events) => {
+            let json = encode_events(events);
+            DeRecProtocolEventsResult {
+                error: success(),
+                events_json: vec_into_buffer(json),
+            }
+        }
         Err(e) => from_lib_error(e).into(),
     }
 }
@@ -290,20 +267,23 @@ pub unsafe extern "C" fn derec_protocol_restore(
     handle: *mut DeRecProtocolHandle,
     params_json_ptr: *const u8,
     params_json_len: usize,
-) -> DeRecError {
+) -> DeRecProtocolEventsResult {
     if handle.is_null() {
-        return ffi_error(DEREC_CODE_FFI_NULL_PTR, "handle is null");
+        return ffi_error(DEREC_CODE_FFI_NULL_PTR, "handle is null").into();
     }
     if params_json_len == 0 || params_json_ptr.is_null() {
         return ffi_error(
             DEREC_CODE_FFI_NULL_PTR,
             "params_json_ptr is null or len == 0",
-        );
+        )
+        .into();
     }
     let bytes = unsafe { std::slice::from_raw_parts(params_json_ptr, params_json_len) };
     let json = match std::str::from_utf8(bytes) {
         Ok(s) => s,
-        Err(_) => return ffi_error(DEREC_CODE_FFI_BAD_UTF8, "params_json is not valid UTF-8"),
+        Err(_) => {
+            return ffi_error(DEREC_CODE_FFI_BAD_UTF8, "params_json is not valid UTF-8").into();
+        }
     };
 
     let params: RestoreParamsJson = match serde_json::from_str(json) {
@@ -312,20 +292,27 @@ pub unsafe extern "C" fn derec_protocol_restore(
             return ffi_error(
                 DEREC_CODE_FFI_BAD_PROTO,
                 format!("restore params JSON: {e}"),
-            );
+            )
+            .into();
         }
     };
 
     let secret = match params.recovered_secret.into_secret() {
         Ok(s) => s,
-        Err(e) => return ffi_error(DEREC_CODE_FFI_BAD_PROTO, e),
+        Err(e) => return ffi_error(DEREC_CODE_FFI_BAD_PROTO, e).into(),
     };
 
     let h = unsafe { &*handle };
     let mut inner = h.lock_inner();
     match h.runtime.block_on(inner.restore(&secret, params.version)) {
-        Ok(()) => success(),
-        Err(e) => from_lib_error(e),
+        Ok(events) => {
+            let json = encode_events(events);
+            DeRecProtocolEventsResult {
+                error: success(),
+                events_json: vec_into_buffer(json),
+            }
+        }
+        Err(e) => from_lib_error(e).into(),
     }
 }
 

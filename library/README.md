@@ -151,14 +151,26 @@ let mut protocol = DeRecProtocolBuilder::new()
 //    `process` feeds incoming wire bytes and returns events.
 //    `accept` / `reject` resolve `ActionRequired` events the app must confirm.
 
-// Initiate a pairing flow from a contact message received out-of-band:
-let _channel_id = protocol
+// Initiate a pairing flow from a contact message received out-of-band.
+// `start` returns per-target `*Started` / `*Failed` events describing
+// what was dispatched — for pairing that's one `PairingStarted` with
+// the fresh `channel_id`. Fan-out flows (ProtectSecret, VerifyShares,
+// RecoverSecret, Discovery, UpdateChannelInfo) return one event per
+// targeted channel. Follow-up events (`PairingCompleted`,
+// `ShareConfirmed`, `SecretRecovered`, …) still surface from
+// `process()` on the peer's response.
+for event in protocol
     .start(DeRecFlow::Pairing {
         kind: derec_proto::SenderKind::Helper,
         contact: contact_message,
         peer_communication_info: Default::default(),
     })
-    .await?;
+    .await?
+{
+    if let DeRecEvent::PairingStarted { channel_id, .. } = event {
+        println!("dispatched pair on channel {}", channel_id.0);
+    }
+}
 
 // Inbound message processing loop:
 loop {
@@ -224,15 +236,29 @@ for the full per-setter contract.
 
 ## Event-driven model
 
-`process` returns `Vec<DeRecEvent>`. The application reacts to events; the
-protocol owns the state. The main variants are:
+Both `start` and `process` return `Vec<DeRecEvent>`. The application
+reacts to events; the protocol owns the state.
+
+`start` emits per-target **dispatch** events describing what was just
+sent — `PairingStarted`, `DiscoveryStarted`, `ProtectSecretStarted`,
+`VerifySharesStarted`, `RecoverSecretStarted`, `UnpairStarted`,
+`UpdateChannelInfoStarted`. Fan-out flows also surface per-target
+failures with the matching `*Failed { channel_id, error }` variant when
+a single target's send hits a transport / store error — those failures
+don't short-circuit the rest of the fan-out. Single-channel flows
+(`Pairing`, `Unpair`) don't have `*Failed` variants; a dispatch error
+returns `Err` from `start` instead. Programmer errors (invalid input,
+missing preconditions, role mismatch) always return `Err` up-front,
+before any target-level events are emitted.
+
+`process` emits the **settlement** events driven by peer responses:
 
 - `ActionRequired { channel_id, action }` — an incoming request needs
   application confirmation. The app calls `protocol.accept(action)` or
   `protocol.reject(action, status, memo)` to complete the flow.
 - `PairingCompleted { channel_id, kind, peer_communication_info }`
 - `ShareStored { channel_id, version }` / `ShareConfirmed { … }` /
-  `ShareRejected { … }`
+  `ShareRejected { … }` / `SharingComplete { … }`
 - `ShareVerified { channel_id, version }`
 - `SecretsDiscovered { channel_id, secrets }`
 - `RecoveryShareReceived { … }` /
@@ -241,6 +267,8 @@ protocol owns the state. The main variants are:
   helper/replica roster) /
   `RecoveryShareError { … }`
 - `Unpaired { channel_id }` / `UnpairRejected { channel_id, status, memo }`
+- `ChannelInfoUpdated { channel_id }` /
+  `ChannelInfoUpdateRejected { channel_id, status, memo }`
 - `PrePairRejected { channel_id, status, memo }` — the contact creator
   answered our `PrePairRequest` with a non-`Ok` status (scanner side,
   `HashedKeys` flow). Distinct from a cryptographic binding-hash mismatch,

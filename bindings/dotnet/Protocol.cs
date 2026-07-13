@@ -145,6 +145,7 @@ internal static class Protocol
             .WithShareStore(shareStore)
             .WithSecretStore(secretStore)
             .WithUserSecretStore(new InMemoryUserSecretStore())
+            .WithStateStore(new InMemoryStateStore())
             .WithTransport(transport)
             .WithOwnTransport(new TransportProtocol("https://owner.example.com"))
             .Build();
@@ -252,14 +253,15 @@ internal static class Protocol
         if (contactBytes.Length == 0)
             throw new InvalidOperationException("create_contact must return non-empty proto bytes");
 
-        ulong? startResult = owner.Protocol.StartAsync(FlowKind.Pairing, new PairingParams
+        var startEvents = owner.Protocol.StartAsync(FlowKind.Pairing, new PairingParams
         {
             Kind = Pairing.SenderKind.Owner,
             Contact = contactBytes,
         }).GetAwaiter().GetResult();
-        if (startResult is null)
-            throw new InvalidOperationException("Pairing start must return a channel id");
-        Console.WriteLine($"  start(Pairing, kind=Owner) → channel_id={startResult}  ✓");
+        var pairingStarted = startEvents.OfType<PairingStartedEvent>().FirstOrDefault()
+            ?? throw new InvalidOperationException(
+                $"start(Pairing) must emit PairingStarted; got [{string.Join(", ", startEvents.Select(e => e.EventType))}]");
+        Console.WriteLine($"  start(Pairing, kind=Owner) → channel_id={pairingStarted.ChannelId}  ✓");
 
         // 2. Owner's outbox carries the PairRequest. Feed it to the helper.
         byte[] pairRequest = owner.Transport.DrainOne();
@@ -756,7 +758,7 @@ internal static class Protocol
 
         owner.Protocol.StartAsync(FlowKind.Unpair, new UnpairParams
         {
-            Target = Target.One(rekeyedId),
+            ChannelId = rekeyedId.ToString(),
             Memo = "decommissioning",
         }).GetAwaiter().GetResult();
 
@@ -1420,6 +1422,7 @@ internal static class Protocol
         var shareStore = new InMemoryShareStore();
         var secretStore = new InMemorySecretStore();
         var userSecretStore = new InMemoryUserSecretStore();
+        var stateStore = new InMemoryStateStore();
         var transport = new RecordingTransport();
 
         var builder = new DeRecProtocolBuilder(options.SecretId ?? DefaultTestSecretId)
@@ -1427,6 +1430,7 @@ internal static class Protocol
             .WithShareStore(shareStore)
             .WithSecretStore(secretStore)
             .WithUserSecretStore(userSecretStore)
+            .WithStateStore(stateStore)
             .WithTransport(transport)
             .WithOwnTransport(new TransportProtocol(endpointUri))
             .WithCommunicationInfo(new Dictionary<string, string> { ["name"] = name })

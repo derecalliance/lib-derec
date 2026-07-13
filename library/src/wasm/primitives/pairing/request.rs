@@ -59,11 +59,9 @@ pub fn create_contact(
     let nonce = if nonce.is_null() || nonce.is_undefined() {
         None
     } else if nonce.is_bigint() {
-        use wasm_bindgen::JsCast as _;
         Some(
-            js_sys::BigInt::from(nonce)
-                .try_into()
-                .map_err(|e: wasm_bindgen::JsValue| {
+            u64::try_from(js_sys::BigInt::from(nonce))
+                .map_err(|e| {
                     js_error("INVALID_NONCE", format!("nonce out of u64 range: {e:?}"))
                 })?,
         )

@@ -85,6 +85,35 @@ export interface UserSecretStore {
   remove(secretId: string): Promise<void>;
 }
 
+/**
+ * In-flight orchestrator state persistence. The library treats item
+ * payloads as opaque JSON blobs — `save` writes the blob, `load`
+ * returns the exact blob it received, `remove` drops the row, and
+ * `loadAll` returns every blob whose `kind` matches the requested
+ * category (`0` = PendingVerification, `1` = PendingRecovery,
+ * `2` = PendingUnpair, `3` = SharingRound).
+ *
+ * Rows are keyed by `(secretId, StateKey)` — the `keyJson` buffer is
+ * a JSON object `{ kind, channel_id?, version? }` matching the `kind`
+ * numbering above. The library will `save`/`load`/`remove` under the
+ * same key across a session, so implementations can hash the entire
+ * `keyJson` buffer or unpack its fields (`kind` + `channel_id` +
+ * `version`) as the composite key.
+ *
+ * Save is full-replacement upsert — accumulator-style state
+ * (PendingRecovery and SharingRound) grows via load-modify-save cycles
+ * from the library; no per-row append primitive is required.
+ */
+export interface StateStore {
+  save(secretId: string, itemJson: Uint8Array): Promise<void>;
+  load(
+    secretId: string,
+    keyJson: Uint8Array,
+  ): Promise<Uint8Array | null | undefined>;
+  remove(secretId: string, keyJson: Uint8Array): Promise<boolean>;
+  loadAll(secretId: string, kind: 0 | 1 | 2 | 3): Promise<Uint8Array[]>;
+}
+
 export interface Transport {
   send(endpoint: { protocol: string; uri: string }, message: Uint8Array): Promise<void>;
 }
@@ -180,7 +209,7 @@ export interface RecoverSecretParams {
   version: number;
 }
 export interface UnpairParams {
-  target?: Target;
+  channel_id: string;
 
   memo?: string;
 }
@@ -371,7 +400,54 @@ export type DeRecEvent =
    *  is the same label vocabulary as `ActionRequired.action_kind`
    *  (`"Pairing"`, `"StoreShare"`, …). */
   | { type: "AutoAccepted"; channel_id: string; action_kind: string }
-  | { type: "NoOp" };
+  | { type: "NoOp" }
+  /** A pairing handshake was dispatched successfully. `kind` is the
+   *  local party's role — same value the subsequent `PairingCompleted`
+   *  will carry. Emitted by `start(Pairing)`. */
+  | { type: "PairingStarted"; channel_id: string; kind: SenderKind }
+  /** A discovery request was dispatched to `channel_id`. Emitted per
+   *  targeted helper by `start(Discovery)`. */
+  | { type: "DiscoveryStarted"; channel_id: string }
+  /** A discovery request could not be dispatched to `channel_id`. Other
+   *  targeted channels are unaffected. */
+  | { type: "DiscoveryFailed"; channel_id: string; error: string }
+  /** A share-storage request was dispatched to `channel_id`. Emitted per
+   *  targeted peer by `start(ProtectSecret)`. */
+  | { type: "ProtectSecretStarted"; channel_id: string; version: number }
+  /** A share-storage request could not be dispatched to `channel_id`. */
+  | {
+      type: "ProtectSecretFailed";
+      channel_id: string;
+      version: number;
+      error: string;
+    }
+  /** A verify-share challenge was dispatched to `channel_id`. */
+  | { type: "VerifySharesStarted"; channel_id: string; version: number }
+  /** A verify-share challenge could not be dispatched to `channel_id`. */
+  | {
+      type: "VerifySharesFailed";
+      channel_id: string;
+      version: number;
+      error: string;
+    }
+  /** A recovery share request was dispatched to `channel_id`. */
+  | { type: "RecoverSecretStarted"; channel_id: string; version: number }
+  /** A recovery share request could not be dispatched to `channel_id`. */
+  | {
+      type: "RecoverSecretFailed";
+      channel_id: string;
+      version: number;
+      error: string;
+    }
+  /** An unpair request was dispatched to `channel_id`. Followed by an
+   *  `Unpaired` event once the peer acknowledges (or in the same event
+   *  vec, under `UnpairAck.NotRequired`). */
+  | { type: "UnpairStarted"; channel_id: string }
+  /** An update-channel-info request was dispatched to `channel_id`. */
+  | { type: "UpdateChannelInfoStarted"; channel_id: string }
+  /** An update-channel-info request could not be dispatched to
+   *  `channel_id`. */
+  | { type: "UpdateChannelInfoFailed"; channel_id: string; error: string };
 
 /**
  * Per-flow auto-accept policy. When a field is `true`, `process()`
@@ -427,6 +503,7 @@ export declare class DeRecProtocolBuilder {
   withShareStore(store: ShareStore): DeRecProtocolBuilder;
   withSecretStore(store: SecretStore): DeRecProtocolBuilder;
   withUserSecretStore(store: UserSecretStore): DeRecProtocolBuilder;
+  withStateStore(store: StateStore): DeRecProtocolBuilder;
   withTransport(transport: Transport): DeRecProtocolBuilder;
   withOwnTransport(endpoint: { uri: string; protocol: string }): DeRecProtocolBuilder;
 
@@ -510,13 +587,13 @@ export declare class DeRecProtocol {
     nonce?: bigint | null,
   ): Promise<ContactMessage>;
 
-  start(flowKind: FlowKind.Pairing, params: PairingParams): Promise<bigint>;
-  start(flowKind: FlowKind.Discovery, params: DiscoveryParams): Promise<null>;
-  start(flowKind: FlowKind.ProtectSecret, params: ProtectSecretParams): Promise<null>;
-  start(flowKind: FlowKind.VerifyShares, params: VerifySharesParams): Promise<null>;
-  start(flowKind: FlowKind.RecoverSecret, params: RecoverSecretParams): Promise<null>;
-  start(flowKind: FlowKind.Unpair, params: UnpairParams): Promise<null>;
-  start(flowKind: FlowKind.UpdateChannelInfo, params: UpdateChannelInfoParams): Promise<null>;
+  start(flowKind: FlowKind.Pairing, params: PairingParams): Promise<DeRecEvent[]>;
+  start(flowKind: FlowKind.Discovery, params: DiscoveryParams): Promise<DeRecEvent[]>;
+  start(flowKind: FlowKind.ProtectSecret, params: ProtectSecretParams): Promise<DeRecEvent[]>;
+  start(flowKind: FlowKind.VerifyShares, params: VerifySharesParams): Promise<DeRecEvent[]>;
+  start(flowKind: FlowKind.RecoverSecret, params: RecoverSecretParams): Promise<DeRecEvent[]>;
+  start(flowKind: FlowKind.Unpair, params: UnpairParams): Promise<DeRecEvent[]>;
+  start(flowKind: FlowKind.UpdateChannelInfo, params: UpdateChannelInfoParams): Promise<DeRecEvent[]>;
 
   /**
    * Replace this node's local <c>communication_info</c> map. Does not
@@ -570,7 +647,7 @@ export declare class DeRecProtocol {
   restore(
     recoveredSecret: Extract<DeRecEvent, { type: "SecretRecovered" }>["secret"],
     version: number,
-  ): Promise<void>;
+  ): Promise<DeRecEvent[]>;
 }
 
 /**

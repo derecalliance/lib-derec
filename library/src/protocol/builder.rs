@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use super::{
-    DeRecChannelStore, DeRecProtocol, DeRecSecretStore, DeRecShareStore, DeRecTransport,
-    DeRecUserSecretStore, UnpairAck,
+    DeRecChannelStore, DeRecProtocol, DeRecSecretStore, DeRecShareStore, DeRecStateStore,
+    DeRecTransport, DeRecUserSecretStore, UnpairAck,
 };
 use derec_proto::TransportProtocol;
 
@@ -48,6 +48,7 @@ pub struct DeRecProtocolBuilder<
     ShareStore,
     SecretStore,
     UserSecretStore,
+    StateStore,
     Transport,
     OwnTransport,
 > {
@@ -56,6 +57,7 @@ pub struct DeRecProtocolBuilder<
     share_store: ShareStore,
     secret_store: SecretStore,
     user_secret_store: UserSecretStore,
+    state_store: StateStore,
     transport: Transport,
     own_transport: OwnTransport,
     threshold: usize,
@@ -78,6 +80,7 @@ impl
         BuilderSlotMissingMarker,
         BuilderSlotMissingMarker,
         BuilderSlotMissingMarker,
+        BuilderSlotMissingMarker,
     >
 {
     /// Construct a new builder bound to a specific secret.
@@ -92,6 +95,7 @@ impl
             share_store: BuilderSlotMissingMarker,
             secret_store: BuilderSlotMissingMarker,
             user_secret_store: BuilderSlotMissingMarker,
+            state_store: BuilderSlotMissingMarker,
             transport: BuilderSlotMissingMarker,
             own_transport: BuilderSlotMissingMarker,
             threshold: 3,
@@ -108,12 +112,13 @@ impl
     }
 }
 
-impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, Transport, OwnTransport>
+impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transport, OwnTransport>
     DeRecProtocolBuilder<
         ChannelStore,
         ShareStore,
         SecretStore,
         UserSecretStore,
+        StateStore,
         Transport,
         OwnTransport,
     >
@@ -291,12 +296,13 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, Transport, OwnTrans
     }
 }
 
-impl<ShareStore, SecretStore, UserSecretStore, Transport, OwnTransport>
+impl<ShareStore, SecretStore, UserSecretStore, StateStore, Transport, OwnTransport>
     DeRecProtocolBuilder<
         BuilderSlotMissingMarker,
         ShareStore,
         SecretStore,
         UserSecretStore,
+        StateStore,
         Transport,
         OwnTransport,
     >
@@ -311,6 +317,7 @@ impl<ShareStore, SecretStore, UserSecretStore, Transport, OwnTransport>
         ShareStore,
         SecretStore,
         UserSecretStore,
+        StateStore,
         Transport,
         OwnTransport,
     > {
@@ -320,6 +327,7 @@ impl<ShareStore, SecretStore, UserSecretStore, Transport, OwnTransport>
             share_store: self.share_store,
             secret_store: self.secret_store,
             user_secret_store: self.user_secret_store,
+            state_store: self.state_store,
             transport: self.transport,
             own_transport: self.own_transport,
             threshold: self.threshold,
@@ -336,12 +344,13 @@ impl<ShareStore, SecretStore, UserSecretStore, Transport, OwnTransport>
     }
 }
 
-impl<ChannelStore, SecretStore, UserSecretStore, Transport, OwnTransport>
+impl<ChannelStore, SecretStore, UserSecretStore, StateStore, Transport, OwnTransport>
     DeRecProtocolBuilder<
         ChannelStore,
         BuilderSlotMissingMarker,
         SecretStore,
         UserSecretStore,
+        StateStore,
         Transport,
         OwnTransport,
     >
@@ -356,6 +365,7 @@ impl<ChannelStore, SecretStore, UserSecretStore, Transport, OwnTransport>
         BuilderSlotSetMarker<Sh>,
         SecretStore,
         UserSecretStore,
+        StateStore,
         Transport,
         OwnTransport,
     > {
@@ -365,6 +375,7 @@ impl<ChannelStore, SecretStore, UserSecretStore, Transport, OwnTransport>
             share_store: BuilderSlotSetMarker(store),
             secret_store: self.secret_store,
             user_secret_store: self.user_secret_store,
+            state_store: self.state_store,
             transport: self.transport,
             own_transport: self.own_transport,
             threshold: self.threshold,
@@ -381,12 +392,13 @@ impl<ChannelStore, SecretStore, UserSecretStore, Transport, OwnTransport>
     }
 }
 
-impl<ChannelStore, ShareStore, UserSecretStore, Transport, OwnTransport>
+impl<ChannelStore, ShareStore, UserSecretStore, StateStore, Transport, OwnTransport>
     DeRecProtocolBuilder<
         ChannelStore,
         ShareStore,
         BuilderSlotMissingMarker,
         UserSecretStore,
+        StateStore,
         Transport,
         OwnTransport,
     >
@@ -401,6 +413,7 @@ impl<ChannelStore, ShareStore, UserSecretStore, Transport, OwnTransport>
         ShareStore,
         BuilderSlotSetMarker<Ss>,
         UserSecretStore,
+        StateStore,
         Transport,
         OwnTransport,
     > {
@@ -410,6 +423,7 @@ impl<ChannelStore, ShareStore, UserSecretStore, Transport, OwnTransport>
             share_store: self.share_store,
             secret_store: BuilderSlotSetMarker(store),
             user_secret_store: self.user_secret_store,
+            state_store: self.state_store,
             transport: self.transport,
             own_transport: self.own_transport,
             threshold: self.threshold,
@@ -426,12 +440,13 @@ impl<ChannelStore, ShareStore, UserSecretStore, Transport, OwnTransport>
     }
 }
 
-impl<ChannelStore, ShareStore, SecretStore, Transport, OwnTransport>
+impl<ChannelStore, ShareStore, SecretStore, StateStore, Transport, OwnTransport>
     DeRecProtocolBuilder<
         ChannelStore,
         ShareStore,
         SecretStore,
         BuilderSlotMissingMarker,
+        StateStore,
         Transport,
         OwnTransport,
     >
@@ -449,6 +464,7 @@ impl<ChannelStore, ShareStore, SecretStore, Transport, OwnTransport>
         ShareStore,
         SecretStore,
         BuilderSlotSetMarker<Us>,
+        StateStore,
         Transport,
         OwnTransport,
     > {
@@ -458,6 +474,7 @@ impl<ChannelStore, ShareStore, SecretStore, Transport, OwnTransport>
             share_store: self.share_store,
             secret_store: self.secret_store,
             user_secret_store: BuilderSlotSetMarker(store),
+            state_store: self.state_store,
             transport: self.transport,
             own_transport: self.own_transport,
             threshold: self.threshold,
@@ -474,12 +491,13 @@ impl<ChannelStore, ShareStore, SecretStore, Transport, OwnTransport>
     }
 }
 
-impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, OwnTransport>
+impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, OwnTransport>
     DeRecProtocolBuilder<
         ChannelStore,
         ShareStore,
         SecretStore,
         UserSecretStore,
+        StateStore,
         BuilderSlotMissingMarker,
         OwnTransport,
     >
@@ -494,6 +512,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, OwnTransport>
         ShareStore,
         SecretStore,
         UserSecretStore,
+        StateStore,
         BuilderSlotSetMarker<Tr>,
         OwnTransport,
     > {
@@ -503,6 +522,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, OwnTransport>
             share_store: self.share_store,
             secret_store: self.secret_store,
             user_secret_store: self.user_secret_store,
+            state_store: self.state_store,
             transport: BuilderSlotSetMarker(transport),
             own_transport: self.own_transport,
             threshold: self.threshold,
@@ -519,12 +539,13 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, OwnTransport>
     }
 }
 
-impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, Transport>
+impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transport>
     DeRecProtocolBuilder<
         ChannelStore,
         ShareStore,
         SecretStore,
         UserSecretStore,
+        StateStore,
         Transport,
         BuilderSlotMissingMarker,
     >
@@ -539,6 +560,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, Transport>
     /// [`build`](DeRecProtocolBuilder::build) so the setter chain stays
     /// infallible — a malformed URI surfaces as
     /// [`crate::Error::Transport`] when `build()` runs.
+    #[allow(clippy::type_complexity)]
     pub fn with_own_transport(
         self,
         own_transport: impl crate::transport::IntoOwnTransport,
@@ -547,6 +569,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, Transport>
         ShareStore,
         SecretStore,
         UserSecretStore,
+        StateStore,
         Transport,
         BuilderSlotSetMarker<
             Result<crate::transport::TransportProtocol, crate::transport::TransportValidationError>,
@@ -559,8 +582,62 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, Transport>
             share_store: self.share_store,
             secret_store: self.secret_store,
             user_secret_store: self.user_secret_store,
+            state_store: self.state_store,
             transport: self.transport,
             own_transport: BuilderSlotSetMarker(own_transport),
+            threshold: self.threshold,
+            keep_versions_count: self.keep_versions_count,
+            timeout_in_secs: self.timeout_in_secs,
+            communication_info: self.communication_info,
+            auto_respond_on_failure: self.auto_respond_on_failure,
+            unpair_ack: self.unpair_ack,
+            auto_reply_to: self.auto_reply_to,
+            auto_accept: self.auto_accept,
+            replica_id: self.replica_id,
+            parameter_range: self.parameter_range,
+        }
+    }
+}
+
+impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, Transport, OwnTransport>
+    DeRecProtocolBuilder<
+        ChannelStore,
+        ShareStore,
+        SecretStore,
+        UserSecretStore,
+        BuilderSlotMissingMarker,
+        Transport,
+        OwnTransport,
+    >
+{
+    /// Set the [`DeRecStateStore`] implementation responsible for
+    /// persisting in-flight orchestrator state (outstanding verification
+    /// challenges, recovery accumulators, pending unpair
+    /// acknowledgements). Required for stateless / load-balanced
+    /// deployments where the process may be recycled between an outbound
+    /// request and its inbound response; see the trait documentation for
+    /// the concurrency contract.
+    pub fn with_state_store<St: DeRecStateStore>(
+        self,
+        store: St,
+    ) -> DeRecProtocolBuilder<
+        ChannelStore,
+        ShareStore,
+        SecretStore,
+        UserSecretStore,
+        BuilderSlotSetMarker<St>,
+        Transport,
+        OwnTransport,
+    > {
+        DeRecProtocolBuilder {
+            secret_id: self.secret_id,
+            channel_store: self.channel_store,
+            share_store: self.share_store,
+            secret_store: self.secret_store,
+            user_secret_store: self.user_secret_store,
+            state_store: BuilderSlotSetMarker(store),
+            transport: self.transport,
+            own_transport: self.own_transport,
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
             timeout_in_secs: self.timeout_in_secs,
@@ -580,6 +657,7 @@ impl<
     Sh: DeRecShareStore,
     Ss: DeRecSecretStore,
     Us: DeRecUserSecretStore,
+    St: DeRecStateStore,
     Tr: DeRecTransport,
 >
     DeRecProtocolBuilder<
@@ -587,6 +665,7 @@ impl<
         BuilderSlotSetMarker<Sh>,
         BuilderSlotSetMarker<Ss>,
         BuilderSlotSetMarker<Us>,
+        BuilderSlotSetMarker<St>,
         BuilderSlotSetMarker<Tr>,
         BuilderSlotSetMarker<
             Result<crate::transport::TransportProtocol, crate::transport::TransportValidationError>,
@@ -609,7 +688,7 @@ impl<
     /// - [`crate::Error::Transport`] if the URI passed to
     ///   [`with_own_transport`](Self::with_own_transport) failed
     ///   validation (malformed scheme, empty URI, …).
-    pub fn build(self) -> crate::Result<DeRecProtocol<Cs, Sh, Ss, Us, Tr>> {
+    pub fn build(self) -> crate::Result<DeRecProtocol<Cs, Sh, Ss, Us, St, Tr>> {
         let own_transport: TransportProtocol = self.own_transport.0?.into();
         let mut protocol = DeRecProtocol::new(
             self.secret_id,
@@ -617,6 +696,7 @@ impl<
             self.share_store.0,
             self.secret_store.0,
             self.user_secret_store.0,
+            self.state_store.0,
             self.transport.0,
             own_transport,
             self.threshold,
@@ -824,6 +904,38 @@ mod tests {
             }
         }
 
+        struct NoopStateStore;
+        impl crate::protocol::DeRecStateStore for NoopStateStore {
+            fn save(
+                &mut self,
+                _: u64,
+                _: crate::protocol::StateItem,
+            ) -> crate::protocol::StateStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn load(
+                &self,
+                _: u64,
+                _: crate::protocol::StateKey,
+            ) -> crate::protocol::StateStoreFuture<'_, Option<crate::protocol::StateItem>> {
+                Box::pin(std::future::ready(Ok(None)))
+            }
+            fn remove(
+                &mut self,
+                _: u64,
+                _: crate::protocol::StateKey,
+            ) -> crate::protocol::StateStoreFuture<'_, bool> {
+                Box::pin(std::future::ready(Ok(false)))
+            }
+            fn load_all(
+                &self,
+                _: u64,
+                _: crate::protocol::StateKind,
+            ) -> crate::protocol::StateStoreFuture<'_, Vec<crate::protocol::StateItem>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+        }
+
         // threshold = 0 — `DeRecProtocol::new` returns
         // `Error::InvalidInput` rather than panicking.
         let result = DeRecProtocol::new(
@@ -832,6 +944,7 @@ mod tests {
             NoopShareStore,
             NoopSecretStore,
             NoopUserSecretStore,
+            NoopStateStore,
             NoopTransport,
             TransportProtocol {
                 uri: String::new(),
@@ -980,12 +1093,45 @@ mod tests {
             }
         }
 
+        struct NoopStateStore;
+        impl crate::protocol::DeRecStateStore for NoopStateStore {
+            fn save(
+                &mut self,
+                _: u64,
+                _: crate::protocol::StateItem,
+            ) -> crate::protocol::StateStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn load(
+                &self,
+                _: u64,
+                _: crate::protocol::StateKey,
+            ) -> crate::protocol::StateStoreFuture<'_, Option<crate::protocol::StateItem>> {
+                Box::pin(std::future::ready(Ok(None)))
+            }
+            fn remove(
+                &mut self,
+                _: u64,
+                _: crate::protocol::StateKey,
+            ) -> crate::protocol::StateStoreFuture<'_, bool> {
+                Box::pin(std::future::ready(Ok(false)))
+            }
+            fn load_all(
+                &self,
+                _: u64,
+                _: crate::protocol::StateKind,
+            ) -> crate::protocol::StateStoreFuture<'_, Vec<crate::protocol::StateItem>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+        }
+
         let result = DeRecProtocolBuilder::new(0)
             .with_channel_store(NoopChannelStore)
             .with_share_store(NoopShareStore)
             .with_secret_store(NoopSecretStore)
             .with_user_secret_store(NoopUserSecretStore)
             .with_transport(NoopTransport)
+            .with_state_store(NoopStateStore)
             .with_own_transport("https://owner.example/derec")
             .with_threshold(1)
             .build();
@@ -1128,12 +1274,45 @@ mod tests {
             }
         }
 
+        struct NoopStateStore;
+        impl crate::protocol::DeRecStateStore for NoopStateStore {
+            fn save(
+                &mut self,
+                _: u64,
+                _: crate::protocol::StateItem,
+            ) -> crate::protocol::StateStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn load(
+                &self,
+                _: u64,
+                _: crate::protocol::StateKey,
+            ) -> crate::protocol::StateStoreFuture<'_, Option<crate::protocol::StateItem>> {
+                Box::pin(std::future::ready(Ok(None)))
+            }
+            fn remove(
+                &mut self,
+                _: u64,
+                _: crate::protocol::StateKey,
+            ) -> crate::protocol::StateStoreFuture<'_, bool> {
+                Box::pin(std::future::ready(Ok(false)))
+            }
+            fn load_all(
+                &self,
+                _: u64,
+                _: crate::protocol::StateKind,
+            ) -> crate::protocol::StateStoreFuture<'_, Vec<crate::protocol::StateItem>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+        }
+
         let result = DeRecProtocolBuilder::new(0)
             .with_channel_store(NoopChannelStore)
             .with_share_store(NoopShareStore)
             .with_secret_store(NoopSecretStore)
             .with_user_secret_store(NoopUserSecretStore)
             .with_transport(NoopTransport)
+            .with_state_store(NoopStateStore)
             .with_own_transport("ws://owner.example/derec")
             .with_threshold(2)
             .build();

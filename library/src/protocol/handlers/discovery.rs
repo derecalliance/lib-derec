@@ -54,7 +54,7 @@ pub(in crate::protocol) async fn start<
     secret_id: u64,
     target: Target,
     reply_to: Option<derec_proto::TransportProtocol>,
-) -> Result<()> {
+) -> Result<Vec<DeRecEvent>> {
     // Filter Target::Single/Many to known channels; user input may include
     // unpaired ids and those would otherwise trip the invariant check below.
     let known_channel_ids: std::collections::HashSet<ChannelId> = channel_store
@@ -82,23 +82,67 @@ pub(in crate::protocol) async fn start<
         .load_many(secret_id, &channel_ids, SecretKind::SharedKey, MissingPolicy::Fail)
         .await?;
 
+    let mut events = Vec::with_capacity(keys.len());
     for (channel_id, value) in keys {
         let SecretValue::SharedKey(shared_key) = value else {
+            events.push(DeRecEvent::DiscoveryFailed {
+                channel_id,
+                error: "channel has no shared key".to_owned(),
+            });
             continue;
         };
 
-        let endpoint = peer_endpoint(channel_store, secret_id, channel_id).await?;
-        let msg = request::produce(channel_id, &shared_key, reply_to.clone())?;
-        let envelope = super::apply_trace_id(msg.envelope, super::fresh_trace_id())?;
-        transport.send(&endpoint, envelope).await?;
-
-        #[cfg(feature = "logging")]
-        tracing::debug!(channel_id = channel_id.0, "discovery request sent");
+        match dispatch_one(
+            channel_store,
+            transport,
+            secret_id,
+            channel_id,
+            &shared_key,
+            reply_to.clone(),
+        )
+        .await
+        {
+            Ok(()) => {
+                events.push(DeRecEvent::DiscoveryStarted { channel_id });
+                #[cfg(feature = "logging")]
+                tracing::debug!(channel_id = channel_id.0, "discovery request sent");
+            }
+            Err(e) => {
+                events.push(DeRecEvent::DiscoveryFailed {
+                    channel_id,
+                    error: e.to_string(),
+                });
+                #[cfg(feature = "logging")]
+                tracing::warn!(
+                    channel_id = channel_id.0,
+                    error = %e,
+                    "discovery request dispatch failed"
+                );
+            }
+        }
     }
 
     #[cfg(feature = "logging")]
     tracing::info!("discovery requests dispatched");
 
+    Ok(events)
+}
+
+/// Send a single discovery request; failure isolated so
+/// [`start`] can surface it as a per-channel `DiscoveryFailed` event
+/// without short-circuiting the rest of the fan-out.
+async fn dispatch_one<Ch: DeRecChannelStore, T: DeRecTransport>(
+    channel_store: &mut Ch,
+    transport: &T,
+    secret_id: u64,
+    channel_id: ChannelId,
+    shared_key: &SharedKey,
+    reply_to: Option<derec_proto::TransportProtocol>,
+) -> Result<()> {
+    let endpoint = peer_endpoint(channel_store, secret_id, channel_id).await?;
+    let msg = request::produce(channel_id, shared_key, reply_to)?;
+    let envelope = super::apply_trace_id(msg.envelope, super::fresh_trace_id())?;
+    transport.send(&endpoint, envelope).await?;
     Ok(())
 }
 

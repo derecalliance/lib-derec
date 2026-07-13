@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::error::{ChannelStoreError, SecretStoreError, ShareStoreError};
+use super::error::{ChannelStoreError, SecretStoreError, ShareStoreError, StateStoreError};
 use crate::Result;
 use crate::protocol::types::{
-    Channel, MissingPolicy, SecretKind, SecretValue, Share, UserSecrets,
+    Channel, MissingPolicy, SecretKind, SecretValue, Share, StateItem, StateKey, StateKind,
+    UserSecrets,
 };
 use crate::types::ChannelId;
 use derec_proto::TransportProtocol;
@@ -60,6 +61,17 @@ pub type TransportFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
 /// [`SecretStoreFuture`] for the `Send`/non-`Send` rules.
 #[cfg(not(any(feature = "ffi", target_arch = "wasm32")))]
 pub type TransportFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+
+/// Type-erased future returned by [`DeRecStateStore`] methods. See
+/// [`SecretStoreFuture`] for the `Send`/non-`Send` rules.
+#[cfg(any(feature = "ffi", target_arch = "wasm32"))]
+pub type StateStoreFuture<'a, T> =
+    Pin<Box<dyn Future<Output = std::result::Result<T, StateStoreError>> + 'a>>;
+/// Type-erased future returned by [`DeRecStateStore`] methods. See
+/// [`SecretStoreFuture`] for the `Send`/non-`Send` rules.
+#[cfg(not(any(feature = "ffi", target_arch = "wasm32")))]
+pub type StateStoreFuture<'a, T> =
+    Pin<Box<dyn Future<Output = std::result::Result<T, StateStoreError>> + Send + 'a>>;
 
 /// Keychain-grade storage for the protocol's per-channel cryptographic state.
 ///
@@ -391,4 +403,93 @@ pub trait DeRecTransport {
     /// pairing. The library calls this from protocol handlers whenever an
     /// outbound envelope needs to reach a peer.
     fn send(&self, endpoint: &TransportProtocol, message: Vec<u8>) -> TransportFuture<'_>;
+}
+
+/// Durable storage for the orchestrator's in-flight protocol state.
+///
+/// The `DeRecProtocol` orchestrator produces short-lived state during
+/// every flow — outstanding verification challenges, in-progress recovery
+/// accumulators, and pending unpair acknowledgements. In long-running
+/// processes this state can live in memory; in stateless deployments
+/// (serverless functions, load-balanced services with instance churn)
+/// the state must survive across process boundaries or replies will
+/// arrive to a live channel with nothing to bind them to.
+///
+/// Every backend chooses its own persistence layer — in-memory `HashMap`
+/// for local development and tests, SQLite for edge or single-process
+/// deployments, Redis / Postgres / DynamoDB for load-balanced or
+/// serverless deployments.
+///
+/// # Contract
+///
+/// - [`save`](DeRecStateStore::save) is a **full-replacement upsert**.
+///   No per-item merge or append semantic. Accumulator-style state
+///   ([`StateItem::PendingRecovery`] and [`StateItem::SharingRound`])
+///   grows via load-modify-save from the library.
+/// - [`load`](DeRecStateStore::load) is a **pure read**. No side effects.
+///   Returns `Ok(None)` when the row does not exist.
+/// - [`remove`](DeRecStateStore::remove) is idempotent: removing a
+///   missing entry is `Ok(false)`, and returning `Ok(true)` iff a row
+///   was actually removed.
+/// - [`load_all`](DeRecStateStore::load_all) returns every item of the
+///   given kind under this `secret_id`, in no guaranteed order.
+///
+/// # Concurrency
+///
+/// The library guarantees at-most-once processing of any given inbound
+/// response only in **single-instance deployments**. In multi-instance /
+/// load-balanced deployments where two instances may hold a
+/// [`DeRecProtocol`](super::DeRecProtocol) against the same
+/// `secret_id` at once:
+///
+/// - `load` + `remove` is not atomic across calls (two round-trips).
+/// - Two instances processing the same inbound response can each `load`
+///   the entry, each `remove` it, and each proceed with response
+///   handling — producing **duplicate events** to the application.
+/// - All library-emitted events (`ShareVerified`, `Unpaired`, etc.) are
+///   idempotent from the application's perspective: on-wire state has
+///   already settled, and a duplicate event does not corrupt anything.
+/// - Concurrent inbound shares racing to modify a
+///   [`StateItem::PendingRecovery`] accumulator, or concurrent inbound
+///   store-share responses racing to update a
+///   [`StateItem::SharingRound`] tally, can clobber each other via naive
+///   load-modify-save. **The application layer is responsible for
+///   serializing concurrent `process()` calls that touch the same
+///   `(secret_id, version)`** if this matters.
+///
+/// # Executor independence
+///
+/// Same as [`DeRecSecretStore`]; methods return [`StateStoreFuture`].
+///
+/// # Concurrency (single-instance)
+///
+/// The protocol holds the store by `&mut Self`, so a single-instance
+/// implementation never sees overlapping calls and needs no internal
+/// synchronization. Multi-instance backends must provide their own
+/// consistency guarantees.
+pub trait DeRecStateStore {
+    /// Insert or full-replace by `(secret_id, item.key())`. Idempotent —
+    /// if the row already exists, the existing entry is replaced in place
+    /// with the caller-supplied `item`.
+    fn save(&mut self, secret_id: u64, item: StateItem) -> StateStoreFuture<'_, ()>;
+
+    /// Read the item at `(secret_id, key)`. Returns `Ok(None)` when no
+    /// row exists. No side effects.
+    fn load(&self, secret_id: u64, key: StateKey) -> StateStoreFuture<'_, Option<StateItem>>;
+
+    /// Remove the item at `(secret_id, key)`. Returns `Ok(true)` iff a
+    /// row was removed. Idempotent — removing a missing entry is
+    /// `Ok(false)`, not an error.
+    fn remove(&mut self, secret_id: u64, key: StateKey) -> StateStoreFuture<'_, bool>;
+
+    /// Return every item of the given `kind` under this `secret_id`, in
+    /// no guaranteed order.
+    ///
+    /// Used by the library to sweep timeouts (walk
+    /// [`StateKind::PendingUnpair`], filter by
+    /// [`StateItem::PendingUnpair::started_at`]) and for
+    /// recovery-accumulator introspection. Data volume per kind is
+    /// bounded by the number of channels or active reconstruction
+    /// targets and is expected to be small.
+    fn load_all(&self, secret_id: u64, kind: StateKind) -> StateStoreFuture<'_, Vec<StateItem>>;
 }
