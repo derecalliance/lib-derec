@@ -1,16 +1,5 @@
-//! Pair flow + Postgres persistence assertions.
-//!
-//! Validates that after a successful Owner↔Helper pair handshake:
-//! - each side's `channels` row exists in its own backing DB,
-//! - each side stores a `SharedKey` row of the same 32 bytes,
-//! - `Channel.role` is the LOCAL role on each side, and
-//! - `linked_channels(c)` returns `[c]` for an unlinked channel; and
-//!   `link_channel(a, b)` is undirected, idempotent, and transitive.
-//!
-//! Each simulated peer owns its own in-memory database — a real
-//! device wouldn't share a DB with the peer on the other side of the
-//! network. The multi-tenancy flow is the one place where two
-//! protocols deliberately share one connection.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use derec_library::protocol::{DeRecChannelStore, SecretKind};
 use derec_library::types::ChannelId;
@@ -39,7 +28,6 @@ pub async fn run() {
     let final_id = pair_owner_helper(&mut owner, &mut helper, ChannelId(1)).await;
     println!("  Owner↔Helper paired on ChannelId({})", final_id.0);
 
-    // (a) channels row populated on each device.
     for (name, conn) in [("owner", owner_db.client()), ("helper", helper_db.client())] {
         assert_eq!(
             count_channels(&conn, DEFAULT_TEST_SECRET_ID).await,
@@ -53,7 +41,6 @@ pub async fn run() {
     }
     println!("  channels row present on both devices  ✓");
 
-    // (b) Channel.role records the LOCAL role on each side.
     let owner_check = PostgresChannelStore::new(owner_db.client());
     let helper_check = PostgresChannelStore::new(helper_db.client());
     let owner_channel = owner_check
@@ -70,7 +57,6 @@ pub async fn run() {
     assert_eq!(helper_channel.role, SenderKind::Helper);
     println!("  Channel.role is local on each side  ✓");
 
-    // (c) Both sides stored the SharedKey, byte-identical.
     for (name, conn) in [("owner", owner_db.client()), ("helper", helper_db.client())] {
         assert!(
             count_secrets(&conn, DEFAULT_TEST_SECRET_ID).await >= 1,
@@ -102,7 +88,6 @@ pub async fn run() {
     );
     println!("  SharedKey 32B round-trips through Postgres and matches on both sides  ✓");
 
-    // (d) linked_channels contract. Use the owner DB.
     let mut link_store = PostgresChannelStore::new(owner_db.client());
     let solo = link_store
         .linked_channels(DEFAULT_TEST_SECRET_ID, final_id)
@@ -121,12 +106,10 @@ pub async fn run() {
         .link_channel(DEFAULT_TEST_SECRET_ID, b, c)
         .await
         .unwrap();
-    // Idempotent: re-linking must not error or double up.
     link_store
         .link_channel(DEFAULT_TEST_SECRET_ID, a, b)
         .await
         .unwrap();
-    // Undirected + transitive: walking from c must reach a.
     let group: HashSet<u64> = link_store
         .linked_channels(DEFAULT_TEST_SECRET_ID, c)
         .await

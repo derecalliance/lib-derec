@@ -1,19 +1,5 @@
-//! Sharing flow + Postgres persistence assertions.
-//!
-//! Drives a full `ProtectSecret` round between an owner and two
-//! helpers, then asserts that:
-//! - each helper's `shares` table has a row keyed by
-//!   `(secret_id, channel_id, version)`, and `Share.secret_id` was
-//!   denormalized correctly,
-//! - the owner's `user_secrets` row carries the v1 snapshot and the
-//!   prost-encoded payload round-trips back to the original bytes,
-//! - `latest_version(secret_id)` reports the right number on the
-//!   owner after each sharing round (1 after one publish, 2 after
-//!   the next).
-//!
-//! Note: `latest_version` on the helper reflects the version space of
-//! shares the helper has received, which is the owner's published
-//! version verbatim.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use derec_library::protocol::events::DeRecEvent;
 use derec_library::protocol::types::UserSecret;
@@ -50,7 +36,6 @@ pub async fn run() {
     let cid_b = pair_owner_helper(&mut owner, &mut helper_b, ChannelId(2)).await;
     println!("  paired Owner↔HelperA({}), Owner↔HelperB({})", cid_a.0, cid_b.0);
 
-    // ProtectSecret round #1.
     let payload = b"postgres-shared-secret".to_vec();
     let events = protect_secret(
         &mut owner,
@@ -88,7 +73,6 @@ pub async fn run() {
         "owner must observe exactly 2 ShareConfirmed (one per helper); got {confirmed:?}"
     );
 
-    // Helpers have stored their share rows.
     for (name, db, channel_id) in [
         ("HelperA", helper_a_db.client(), cid_a.0),
         ("HelperB", helper_b_db.client(), cid_b.0),
@@ -103,7 +87,6 @@ pub async fn run() {
             1,
             "{name}: share row must live under the helper-owner channel"
         );
-        // `Share.secret_id` denormalized field must match the partition key.
         let store = PostgresShareStore::new(db.clone());
         let shares = store
             .load(DEFAULT_TEST_SECRET_ID, ChannelId(channel_id), &[])
@@ -128,8 +111,6 @@ pub async fn run() {
     }
     println!("  helpers stored a v1 share each; latest_version=1 on both  ✓");
 
-    // Owner has the latest UserSecrets snapshot persisted, and the
-    // payload bytes round-trip through Postgres.
     assert_eq!(
         count_user_secrets(&owner_db.client(), DEFAULT_TEST_SECRET_ID).await,
         1,
@@ -150,9 +131,6 @@ pub async fn run() {
     );
     println!("  owner's user_secrets v1 snapshot round-trips, data bytes match  ✓");
 
-    // ProtectSecret round #2 — owner publishes again with new bytes.
-    // Verifies the upsert paths on `shares` (replaces v1→v2 by version)
-    // and on `user_secrets` (single-row-per-secret_id discipline).
     let payload_v2 = b"postgres-shared-secret-v2".to_vec();
     protect_secret(
         &mut owner,

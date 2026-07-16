@@ -1,11 +1,5 @@
-//! Cross-instance persistence: pair + publish on the owner, drop
-//! its `DeRecProtocol`, then rebuild a fresh protocol over the SAME
-//! `SharedConnection` and discover what's stored.
-//!
-//! This proves the trait implementation does not buffer state in the
-//! adapter layer — every value the protocol read or wrote ended up
-//! in Postgres, recoverable by a second protocol attached to the same
-//! database.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use derec_library::protocol::events::DeRecEvent;
 use derec_library::protocol::types::{Target, UserSecret};
@@ -28,7 +22,6 @@ pub async fn run() {
     let helper_a_db = Database::open_isolated().await;
     let helper_b_db = Database::open_isolated().await;
 
-    // ---- session #1 ---------------------------------------------------
     let cid_a;
     let cid_b;
     let mut helper_a = Peer::new(
@@ -62,21 +55,14 @@ pub async fn run() {
         )
         .await;
 
-        // Direct DB assertions before tearing down.
         assert_eq!(count_channels(&owner_db.client(), DEFAULT_TEST_SECRET_ID).await, 2);
         assert_eq!(count_user_secrets(&owner_db.client(), DEFAULT_TEST_SECRET_ID).await, 1);
         assert_eq!(count_shares(&helper_a_db.client(), DEFAULT_TEST_SECRET_ID).await, 1);
         assert_eq!(count_shares(&helper_b_db.client(), DEFAULT_TEST_SECRET_ID).await, 1);
         println!("  session#1: 2 channels, 1 user_secrets row, helpers each hold 1 share  ✓");
 
-        // `owner` is dropped here — its DeRecProtocol with it.
     }
 
-    // ---- session #2 (same DB, fresh protocol) -------------------------
-    // Rebuilding the owner over the same SharedConnection — if our
-    // store impls leak any state into the adapter layer (caches,
-    // unflushed in-memory buffers), discovery against the existing
-    // helpers will not find the secret. Direct DB checks first.
     assert!(
         channel_exists(&owner_db.client(), DEFAULT_TEST_SECRET_ID, cid_a.0).await
     );
@@ -97,9 +83,6 @@ pub async fn run() {
         "https://owner.example.com",
     );
 
-    // Discovery: the rebuilt protocol must see the helpers it paired
-    // with in session #1 (they survived the protocol drop because
-    // their rows are still in Postgres).
     owner
         .protocol
         .start(DeRecFlow::Discovery {

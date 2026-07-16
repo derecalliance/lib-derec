@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 // Primitives smoke tests: exercises every flow using the low-level
 // `primitives.*` API (raw message produce / extract / process functions).
 // Mirrors the Rust primitive smoke test (`bindings/rust/src/primitives.rs`).

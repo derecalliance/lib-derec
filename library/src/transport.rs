@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 //! Library-level transport endpoint type + validation.
 //!
@@ -320,8 +321,7 @@ impl IntoOwnTransport for String {
 /// Structured error returned by [`TransportProtocol::validate`] and
 /// by [`TryFrom`] conversions from the protobuf wire type. Surfaced
 /// via [`crate::Error::Transport`] and from there into the FFI's
-/// [`DeRecError`](crate::ffi::error::DeRecError) and the WASM
-/// `{code, message}` shape.
+/// `DeRecError` and the WASM `{code, message}` shape.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum TransportValidationError {

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
+
 use crate::derec_message::current_timestamp;
 use crate::primitives::pairing::PairingError;
 use crate::types::ChannelId;
@@ -218,10 +221,6 @@ impl ContactMessageExt for ContactMessage {
                     )
                     .into());
                 }
-                // SHA-384 digest length — the canonical binding-hash
-                // size. A contact carrying a wrong-sized hash is
-                // malformed; refuse rather than let the recomputation
-                // pretend it's valid.
                 const BINDING_HASH_LEN: usize = 48;
                 let hash = self.contact_binding_hash.as_ref().ok_or(
                     PairingError::InvalidContactMessage(
@@ -414,8 +413,6 @@ mod tests {
             contact_mode: ContactMode::HashedKeys as i32,
             mlkem_encapsulation_key: None,
             ecies_public_key: None,
-            // 48 bytes — SHA-384 digest length. Value is dummy; the
-            // validator does not recompute against the keys.
             contact_binding_hash: Some(vec![0xAB; 48]),
             nonce: 0xDEAD_BEEF,
             timestamp: Some(ts(1_700_000_000)),

@@ -1,7 +1,5 @@
-//! Direct-SQL assertions used by the flow tests. These read the
-//! backing database without going through the `DeRec*Store` trait
-//! impls, so a flow can prove the trait actually pushed rows to disk
-//! rather than holding them in some in-memory buffer.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use rusqlite::OptionalExtension;
 

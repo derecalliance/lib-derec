@@ -1,5 +1,5 @@
-//! `DeRecSecretStore` over SQLite — persists each `SecretValue` as a
-//! tagged blob keyed by `(secret_id, channel_id, kind)`.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use derec_library::protocol::{
     DeRecSecretStore, MissingPolicy, SecretKind, SecretStoreError, SecretStoreFuture, SecretValue,
@@ -57,9 +57,6 @@ impl DeRecSecretStore for SqliteSecretStore {
         }
 
         let conn = lock(&self.connection);
-        // Build a placeholder list `?, ?, ?, …` for the IN clause —
-        // SQLite has no native array binding. Keeps the same call
-        // shape (single round-trip) the trait expects.
         let placeholders = vec!["?"; channel_ids.len()].join(", ");
         let sql = format!(
             "SELECT channel_id, data FROM secrets \
@@ -88,8 +85,6 @@ impl DeRecSecretStore for SqliteSecretStore {
             found.insert(sql_to_u64(cid), decode_secret_value(&bytes));
         }
 
-        // Preserve request order, and apply MissingPolicy on absent
-        // entries.
         let mut result: Vec<(ChannelId, SecretValue)> = Vec::with_capacity(channel_ids.len());
         let mut missing: Vec<u64> = Vec::new();
         for cid in channel_ids {

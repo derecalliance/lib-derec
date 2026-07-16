@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 //! Cryptographic pairing module for Derec, providing secure key exchange mechanisms using ML-KEM and ECIES.
 //!

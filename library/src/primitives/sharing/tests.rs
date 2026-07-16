@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
+
 use crate::{
     Error,
     primitives::sharing::{
@@ -308,7 +311,6 @@ fn test_produce_store_share_response_message_valid() {
         "response envelope wire bytes must not be empty"
     );
 
-    // Committed share extracted from the request must match what was originally inserted.
     assert_eq!(
         returned_share.commitment, committed_share.commitment,
         "returned commitment must match original"
@@ -670,7 +672,6 @@ fn test_store_share_request_round_trips_replica_id() {
     let committed_share = shares.get(&channel_id).expect("missing share");
     let shared_key = [42u8; 32];
 
-    // Owner case: replica_id = None round-trips as None.
     let owner_env = produce_store_share_request_message(
         channel_id,
         version,
@@ -688,7 +689,6 @@ fn test_store_share_request_round_trips_replica_id() {
         extract_store_share_request(&owner_env, &shared_key).expect("owner-side extract");
     assert_eq!(owner_extracted.request.replica_id, None);
 
-    // Replica case: stamped id round-trips verbatim.
     let replica_env = produce_store_share_request_message(
         channel_id,
         version,

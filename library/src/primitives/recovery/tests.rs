@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
+
 use crate::{
     Error,
     derec_message::{DeRecMessageBuilder, current_timestamp},
@@ -519,7 +522,6 @@ fn test_produce_get_share_response_message_stored_share_timestamp_mismatch() {
         ))
     ));
 
-    // Also verify produce_get_share_response_message works with correct stored share
     let stored_share_envelope = create_store_share_request_envelope(
         channel_id,
         &shared_key,
@@ -644,7 +646,6 @@ fn test_recovery_end_to_end() {
             extract_get_share_request(&request_envelope, &shared_key)
                 .expect("extract_get_share_request should succeed");
 
-        // Wrap the CommittedDeRecShare into an encrypted StoreShareRequestMessage envelope.
         let committed_share = shares
             .get(channel_id)
             .expect("missing committed share for channel");

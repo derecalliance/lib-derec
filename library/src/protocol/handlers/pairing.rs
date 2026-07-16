@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use super::super::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecTransport, PendingAction, SecretKind,
@@ -997,10 +998,10 @@ fn extract_communication_info(
             continue;
         }
         if is_reserved_key(&e.key) {
-            // Future reserved keys land here. For now there is only
-            // `derec.replica_id`, so any other `derec.*` entry is foreign
-            // and silently dropped — same as #43's "library owns the
-            // namespace" stance for ContactMode.
+            // The library owns the `derec.*` namespace. `derec.replica_id`
+            // is the only recognized entry today; any other `derec.*` key
+            // is foreign and silently dropped so peers can't smuggle
+            // application-scoped keys through the reserved prefix.
             continue;
         }
         free_form.insert(e.key.to_owned(), trimmed.to_owned());

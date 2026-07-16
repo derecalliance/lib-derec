@@ -1,6 +1,5 @@
-//! `DeRecChannelStore` over Postgres — persists `Channel` records as
-//! serde-JSON blobs in the `channels` table and the undirected
-//! channel-link graph in `channel_links`.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use derec_library::protocol::types::Channel;
 use derec_library::protocol::{ChannelStoreFuture, DeRecChannelStore};
@@ -75,9 +74,6 @@ impl DeRecChannelStore for PostgresChannelStore {
                 )
                 .await
                 .expect("channel remove failed");
-            // Per-channel link cleanup mirrors the SQLite binding: a
-            // removed channel must not stay reachable through the
-            // graph.
             client
                 .execute(
                     "DELETE FROM channel_links WHERE secret_id = $1 AND (a = $2 OR b = $2)",

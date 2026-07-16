@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 //! # Shamir Secret Sharing Implementation
 //!
@@ -26,7 +27,7 @@
 //!
 
 //! Implements functions for Shamir secret sharing, as adapted
-//! from the definition in Fig 7 of https://eprint.iacr.org/2020/800.pdf
+//! from the definition in Fig 7 of <https://eprint.iacr.org/2020/800.pdf>.
 
 use ark_ff::{BigInteger, PrimeField, Zero};
 use ark_poly::{Polynomial, univariate::DensePolynomial};

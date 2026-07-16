@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
+
 //! Cryptographic encryption primitives for DeRec message protection.
 //!
 //! This module provides ECIES-style hybrid encryption using:

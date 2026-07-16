@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 // Protocol smoke tests: exercises pairing, sharing, and discovery+recovery
 // using the low-level `DeRecProtocol` runtime (`start` / `process` / `accept`)
 // backed by in-memory stores.

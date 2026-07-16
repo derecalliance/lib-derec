@@ -1,7 +1,5 @@
-//! `DeRecUserSecretStore` over Postgres — keeps at most one
-//! `UserSecrets` snapshot per `secret_id`, with `version`,
-//! `description`, and the prost-encoded `Vec<UserSecret>` payload
-//! stored as separate columns.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use derec_library::protocol::DeRecUserSecretStore;
 use derec_library::protocol::ShareStoreFuture;

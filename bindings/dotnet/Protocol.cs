@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 // Protocol smoke tests: exercises the stateful DeRecProtocol orchestrator
 // (handle FFI + storage/transport callbacks + flow start/process/accept
 // surface) across pair, sharing, discovery, recovery, and replica flows.

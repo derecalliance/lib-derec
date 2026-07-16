@@ -1,6 +1,5 @@
-//! In-process transport that buffers outbound `(endpoint, bytes)`
-//! pairs in an `Arc<Mutex<VecDeque>>` so the test driver can drain
-//! them and feed each message to the matching peer.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use derec_library::protocol::{DeRecTransport, TransportFuture};
 use derec_proto::TransportProtocol;

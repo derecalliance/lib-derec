@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 //! This module provides cryptographic primitives for encrypting and decrypting messages
 //! given a (shared) symmetric key using AES-256-GCM authenticated encryption.

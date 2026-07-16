@@ -1,5 +1,5 @@
-//! `DeRecSecretStore` over Postgres — persists each `SecretValue`
-//! as a tagged BYTEA blob keyed by `(secret_id, channel_id, kind)`.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use derec_library::protocol::{
     DeRecSecretStore, MissingPolicy, SecretKind, SecretStoreError, SecretStoreFuture, SecretValue,
@@ -60,9 +60,6 @@ impl DeRecSecretStore for PostgresSecretStore {
                 return Ok(Vec::new());
             }
 
-            // `$1 = ANY($2::bigint[])` is the idiomatic Postgres
-            // alternative to a dynamic IN-list and avoids the
-            // SQL-rebuild step.
             let channel_ids_i64: Vec<i64> =
                 requested.iter().copied().map(u64_to_sql).collect();
             let params: [&(dyn ToSql + Sync); 3] = [&secret_id_i64, &kind_i32, &channel_ids_i64];

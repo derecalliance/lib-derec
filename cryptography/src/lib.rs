@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 //! # DeRec Cryptography
 //!
@@ -9,8 +10,9 @@
 //!
 //! ### `logging` (off by default)
 //!
-//! Enables structured [`tracing`] instrumentation on the [`pairing`] protocol
-//! functions. When active, the crate emits spans and events at three levels:
+//! Enables structured [`tracing`](https://docs.rs/tracing) instrumentation on
+//! the [`pairing`] protocol functions. When active, the crate emits spans and
+//! events at three levels:
 //!
 //! | Level   | What is logged |
 //! |---------|----------------|

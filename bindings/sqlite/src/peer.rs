@@ -1,11 +1,10 @@
-//! Test peer composed of a SQLite-backed protocol + in-process
-//! transport + a label. Multiple peers can share one
-//! `Arc<Mutex<Connection>>` to exercise multi-tenant scenarios.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use std::collections::HashMap;
 
 use derec_library::protocol::{DeRecEvent, DeRecProtocol, DeRecProtocolBuilder};
-use derec_proto::{Protocol, TransportProtocol};
+use derec_proto::TransportProtocol;
 
 use crate::db::SharedConnection;
 use crate::stores::{
@@ -184,9 +183,6 @@ impl Peer {
     }
 
     pub fn drain(&self) -> Vec<(TransportProtocol, Vec<u8>)> {
-        // Returning the tuple shape verbatim keeps the call sites
-        // (which destructure inline) readable without leaking the
-        // transport-internal envelope alias.
         self.transport.drain()
     }
 }

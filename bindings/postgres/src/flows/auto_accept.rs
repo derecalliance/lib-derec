@@ -1,14 +1,5 @@
-//! Per-flow auto-accept policy + Postgres persistence assertions.
-//!
-//! Drives a full `ProtectSecret` round between an owner and two
-//! helpers built via `Peer::with_auto_accept(...)` with
-//! `AutoAcceptPolicy { store_share: true, .. }`. Asserts that:
-//! - the helper's event stream contains `AutoAccepted` for the
-//!   `StoreShare` action kind (with no `ActionRequired` for that
-//!   action — the auto-accept intercept replaced it in place),
-//! - the share row still lands in the helper's `shares` table just
-//!   like a manually-accepted store would,
-//! - the owner still receives `ShareConfirmed` from both helpers.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use derec_library::protocol::events::DeRecEvent;
 use derec_library::protocol::types::UserSecret;

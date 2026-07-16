@@ -1,7 +1,5 @@
-//! Direct-SQL assertions used by the flow tests. These read the
-//! backing database without going through the trait impls, so a
-//! flow can prove the trait actually pushed rows to storage rather
-//! than holding them in some adapter buffer.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use crate::db::{SharedClient, u64_to_sql};
 

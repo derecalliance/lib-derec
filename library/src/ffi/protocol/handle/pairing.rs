@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 //! Pairing-flow entry points: contact creation and the
 //! fingerprint accessors that gate replica channel transitions.

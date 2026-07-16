@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},

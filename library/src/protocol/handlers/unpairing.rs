@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 //! Unpair flow handlers — initiator side ([`start`], [`on_response`])
 //! and responder side ([`accept`], [`reject`]).

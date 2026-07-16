@@ -1,9 +1,5 @@
-//! Discovery + Recovery flow exercised end-to-end over SQLite-backed
-//! stores. Mirrors the Rust binding's `run_discovery_and_recovery_flow`
-//! but with SQLite-specific persistence assertions: the recovering
-//! Owner is rebuilt over a fresh `DeRecProtocol` instance using the
-//! ORIGINAL DB connection — proof that the protocol state survived
-//! the recovery-context teardown via SQLite alone.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use derec_library::protocol::events::DeRecEvent;
 use derec_library::protocol::types::{Target, UserSecret};
@@ -66,10 +62,6 @@ pub async fn run() {
     assert_eq!(count_shares(&helper_b_db.connection(), PROTECTED_SECRET_ID), 1);
     println!("  v1 publish lands one share row on each helper  ✓");
 
-    // Simulate Owner state loss: clear the user_secrets snapshot,
-    // re-pair on fresh channels, drop the originals, and recover via
-    // the new channels. The auto-publish-on-pair hook would replay v1
-    // against the new channels otherwise.
     owner
         .protocol
         .user_secret_store
@@ -77,10 +69,6 @@ pub async fn run() {
         .await
         .expect("clearing user_secret_store");
 
-    // Post-pair channel-id rekey rotates the transient contact id to a
-    // fresh long-term id. Capture the rotated id from PairingCompleted
-    // for each recovery pair so Discovery targets, link graph, and
-    // channel_store operations all use the id that actually resolves.
     let rec_cid_a_transient = ChannelId(100);
     let rec_cid_b_transient = ChannelId(101);
     let mut rekeyed_recovery: [(ChannelId, ChannelId); 2] =
@@ -132,9 +120,6 @@ pub async fn run() {
         rec_cid_a.0, rec_cid_b.0
     );
 
-    // Each helper links its original channel ↔ recovery channel so
-    // discovery resolves the connected component and finds the
-    // stored share via the original channel.
     helper_a
         .protocol
         .channel_store
@@ -148,7 +133,6 @@ pub async fn run() {
         .await
         .unwrap();
 
-    // Drop the Owner's originals so recovery does not double-fan-out.
     owner
         .protocol
         .channel_store
@@ -161,16 +145,12 @@ pub async fn run() {
         .remove(PROTECTED_SECRET_ID, cid_b)
         .await
         .unwrap();
-    // Sanity: owner now has just the two recovery channels.
     assert_eq!(
         count_channels(&owner_db.connection(), PROTECTED_SECRET_ID),
         2,
         "owner channels after dropping originals must be {{rec_a, rec_b}}"
     );
 
-    // Discovery: confirm the helper-side shares are reachable through
-    // the link graph + share store. Validates `linked_channels` +
-    // `load_all` (the discovery code path).
     owner
         .protocol
         .start(DeRecFlow::Discovery {
@@ -198,8 +178,6 @@ pub async fn run() {
         "  discovery surfaced secret_id={PROTECTED_SECRET_ID} v={recover_version} via link graph  ✓"
     );
 
-    // Recovery — the actual reconstruction. Asserts the original
-    // bytes survive the full SQLite round-trip across two helpers.
     owner
         .protocol
         .start(DeRecFlow::RecoverSecret {

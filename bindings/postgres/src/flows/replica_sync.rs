@@ -1,23 +1,5 @@
-//! Replica-sync version-progression flow over Postgres.
-//!
-//! Walks the canonical 0→8 sequence:
-//!
-//! ```text
-//! 0. new()                                          → user_secret_store empty
-//! 1. pair replica A                                 → v=1, replicas=1
-//! 2. ProtectSecret([s1])                            → v=2, secrets=1
-//! 3. pair replica B (bootstrap)                     → v=3, replicas=2
-//! 4. pair helper #1 (below threshold)               → v=4, helpers=1
-//! 5. pair helper #2 (below threshold)               → v=5, helpers=2
-//! 6. ProtectSecret([s1, s2])                        → v=6, secrets=2
-//! 7. pair helper #3 (threshold met, VSS split)      → v=7, helpers=3 + shares
-//! 8. pair replica C (full bootstrap + fresh shares) → v=8, replicas=3 + shares
-//! ```
-//!
-//! Each peer owns its own in-memory Postgres database — one device =
-//! one DB, as in the other flows. Replicas and helpers all bind their
-//! protocols to the same `secret_id` as the owner, so the assertions
-//! can read the per-secret state directly.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use derec_library::protocol::events::DeRecEvent;
 use derec_library::protocol::types::{Secret, UserSecret};
@@ -123,7 +105,6 @@ pub async fn run() {
     let cid_h2 = ChannelId(12);
     let cid_h3 = ChannelId(13);
 
-    // ── Step 0: brand-new instance ────────────────────────────────
     assert!(
         owner
             .protocol
@@ -136,7 +117,6 @@ pub async fn run() {
     );
     println!("  step 0: user_secret_store latest = None  ✓");
 
-    // ── Step 1: pair replica A → v=1 ──────────────────────────────
     pair_replica_handshake(&mut owner, &mut replica_a, cid_a).await;
     cross_confirm_fingerprint(&mut owner, &mut replica_a, cid_a).await;
     let events =
@@ -151,7 +131,6 @@ pub async fn run() {
     assert_eq!(latest_version(&owner).await, Some(1));
     println!("  step 1: pair replica A → v=1, secret(h=0,s=0,r=1,shares=0)  ✓");
 
-    // ── Step 2: ProtectSecret([s1]) → v=2 ─────────────────────────
     let s1 = UserSecret {
         id: vec![0x01],
         name: "secret-one".to_owned(),
@@ -177,7 +156,6 @@ pub async fn run() {
     assert_eq!(latest_version(&owner).await, Some(2));
     println!("  step 2: ProtectSecret([s1]) → v=2, secret(h=0,s=1,r=1,shares=0)  ✓");
 
-    // ── Step 3: pair replica B → v=3, B bootstraps with s1 ────────
     pair_replica_handshake(&mut owner, &mut replica_b, cid_b).await;
     cross_confirm_fingerprint(&mut owner, &mut replica_b, cid_b).await;
     let events =
@@ -196,7 +174,6 @@ pub async fn run() {
     assert_eq!(latest_version(&owner).await, Some(3));
     println!("  step 3: pair replica B → v=3, secret(h=0,s=1,r=2,shares=0) on A+B  ✓");
 
-    // ── Step 4: pair helper #1 → v=4 (below threshold) ────────────
     helper_start_pair(&mut owner, &mut helper_1, cid_h1).await;
     let events = pump_many(&mut [
         &mut owner,
@@ -226,7 +203,6 @@ pub async fn run() {
     assert_eq!(latest_version(&owner).await, Some(4));
     println!("  step 4: pair helper #1 → v=4, secret(h=1,s=1,r=2,shares=0)  ✓");
 
-    // ── Step 5: pair helper #2 → v=5 ──────────────────────────────
     helper_start_pair(&mut owner, &mut helper_2, cid_h2).await;
     let events = pump_many(&mut [
         &mut owner,
@@ -252,7 +228,6 @@ pub async fn run() {
     assert_eq!(latest_version(&owner).await, Some(5));
     println!("  step 5: pair helper #2 → v=5, secret(h=2,s=1,r=2,shares=0)  ✓");
 
-    // ── Step 6: ProtectSecret([s1, s2]) → v=6 ─────────────────────
     let s2 = UserSecret {
         id: vec![0x02],
         name: "secret-two".to_owned(),
@@ -293,7 +268,6 @@ pub async fn run() {
     assert_eq!(latest_version(&owner).await, Some(6));
     println!("  step 6: ProtectSecret([s1, s2]) → v=6, secret(h=2,s=2,r=2,shares=0)  ✓");
 
-    // ── Step 7: pair helper #3 → v=7, threshold met, VSS split ────
     helper_start_pair(&mut owner, &mut helper_3, cid_h3).await;
     let events = pump_many(&mut [
         &mut owner,
@@ -326,7 +300,6 @@ pub async fn run() {
     assert_eq!(latest_version(&owner).await, Some(7));
     println!("  step 7: pair helper #3 → v=7, secret(h=3,s=2,r=2,shares=3); all 3 helpers ShareStored  ✓");
 
-    // ── Step 8: pair replica C → v=8, full bootstrap + fresh VSS ──
     pair_replica_handshake(&mut owner, &mut replica_c, cid_c).await;
     cross_confirm_fingerprint(&mut owner, &mut replica_c, cid_c).await;
     let events = pump_many(&mut [

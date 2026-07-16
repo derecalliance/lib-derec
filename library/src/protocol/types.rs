@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 //! Protocol-layer types.
 //!
@@ -256,10 +257,9 @@ pub struct Secret {
 /// instead.
 ///
 /// `shared_key` must be 32 bytes when [`Self::replicas`] is
-/// non-empty. The library enforces this invariant in
-/// [`crate::protocol::handlers::sharing::build_secret`] (producer
-/// side) and [`crate::protocol::DeRecProtocol::restore`] (consumer
-/// side).
+/// non-empty. The library enforces this invariant on the producer
+/// side during sharing round construction and on the consumer side in
+/// [`crate::protocol::DeRecProtocol::restore`].
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Replicas {
     /// Snapshot of all paired Replica Destinations at protect time.

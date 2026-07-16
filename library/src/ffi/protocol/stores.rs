@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 //! Managed-callback adapters that satisfy the four core protocol traits
 //! ([`DeRecChannelStore`], [`DeRecSecretStore`], [`DeRecShareStore`],

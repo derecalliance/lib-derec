@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
+
 use crate::Error;
 use crate::derec_message::current_timestamp;
 use crate::primitives::pairing::PairingError;
@@ -923,7 +926,6 @@ fn test_alice_bob_pairing_flow() {
     let alice_transport_uri = "https://relay.example/alice";
     let bob_transport_uri = "https://relay.example/bob";
 
-    // Alice creates the contact message.
     let CreateContactMessageResult {
         contact_message: alice_contact,
         secret_key: alice_sk_state,
@@ -936,7 +938,6 @@ fn test_alice_bob_pairing_flow() {
         }, None)
     .expect("failed to create contact message");
 
-    // Bob (responder) produces the pairing request envelope.
     let ProducePairingRequestMessageResult {
         envelope: bob_pair_req_envelope,
         initiator_contact_message,
@@ -955,13 +956,11 @@ fn test_alice_bob_pairing_flow() {
 
     let contact_nonce = initiator_contact_message.nonce;
 
-    // Alice (initiator) decrypts the request.
     let ExtractPairingRequestResult {
         request: bob_pair_req_msg,
     } = extract_pairing_request(&bob_pair_req_envelope, alice_sk_state.as_ref().unwrap().ecies_secret_key())
         .expect("failed to extract pairing request");
 
-    // Alice produces the pairing response envelope.
     let ProducePairingResponseMessageResult {
         envelope: alice_pair_resp_envelope,
         shared_key: alice_shared_key,
@@ -976,13 +975,11 @@ fn test_alice_bob_pairing_flow() {
     )
     .expect("failed to produce pairing response");
 
-    // Bob (responder) decrypts the response.
     let ExtractPairingResponseResult {
         response: alice_pair_resp_msg,
     } = extract_pairing_response(&alice_pair_resp_envelope, bob_sk_state.ecies_secret_key())
         .expect("failed to extract pairing response");
 
-    // Bob finalizes pairing.
     let ProcessPairingResponseMessageResult {
         shared_key: bob_shared_key,
         channel_id: bob_new_channel_id,
@@ -1006,12 +1003,8 @@ fn test_alice_bob_pairing_flow() {
     assert_eq!(alice_shared_key, bob_shared_key);
     assert_eq!(bob_transport_protocol.uri, bob_transport_uri);
     assert_eq!(bob_transport_protocol.protocol, Protocol::Https as i32);
-    // Both sides agree on the rekeyed channel id, derived from the
-    // pre-rekey channel id and the freshly negotiated shared key.
     assert_eq!(alice_new_channel_id, bob_new_channel_id);
     assert_ne!(alice_new_channel_id, alice_channel_id);
-    // The wire-level field on the encrypted inner response carries the
-    // same value.
     assert_eq!(
         alice_pair_resp_msg.channel_id,
         u64::from(alice_new_channel_id)
@@ -1074,7 +1067,6 @@ fn test_produce_pairing_response_returns_envelope_and_peer_transport() {
     assert_eq!(peer_transport_protocol.uri, bob_transport_uri);
     assert_eq!(peer_transport_protocol.protocol, Protocol::Https as i32);
 
-    // The responder must be able to decrypt the envelope and observe an Ok status.
     let ExtractPairingResponseResult { response } =
         extract_pairing_response(&envelope, bob_sk_state.ecies_secret_key())
             .expect("failed to extract pairing response");
@@ -1106,11 +1098,9 @@ fn test_create_contact_message_hashed_keys_omits_keys_and_carries_binding_hash()
     assert_eq!(contact.channel_id, u64::from(channel_id));
     assert_eq!(contact.contact_mode, ContactMode::HashedKeys as i32);
 
-    // Keys MUST be absent in HASHED_KEYS mode (delivered later via PrePair).
     assert!(contact.mlkem_encapsulation_key.is_none());
     assert!(contact.ecies_public_key.is_none());
 
-    // Binding hash MUST be present and SHA-384-sized (48 bytes).
     let hash = contact
         .contact_binding_hash
         .as_ref()
@@ -1136,8 +1126,6 @@ fn test_create_contact_message_hashed_keys_empty_transport_uri() {
 
 #[test]
 fn test_create_contact_message_hashed_keys_fresh_randomness_yields_distinct_hashes() {
-    // Two independent calls draw fresh ML-KEM/ECIES key material, so the
-    // commitments MUST differ even with the same channel_id and transport.
     let a = make_hashed_keys_contact(ChannelId(42));
     let b = make_hashed_keys_contact(ChannelId(42));
     assert_ne!(a.contact_binding_hash, b.contact_binding_hash);
@@ -1157,14 +1145,10 @@ fn test_produce_pre_pair_request_emits_envelope_routed_to_contact_channel() {
         produce_pre_pair_request(bob_transport.clone(), &alice_contact)
             .expect("produce_pre_pair_request should succeed");
 
-    // The outer envelope routes to the contact's channel and carries a timestamp.
     let outer = decode_outer_envelope(&envelope);
     assert_eq!(outer.channel_id, u64::from(channel_id));
     let envelope_ts = outer.timestamp.expect("envelope timestamp must be present");
 
-    // Inner body decodes as a PrePairRequest carrying the contact nonce
-    // and the requester's transport endpoint — and its timestamp matches
-    // the envelope timestamp (the invariant `extract_pre_pair` enforces).
     let inner = match MessageBody::decode_from_vec(outer.message.as_slice())
         .expect("inner MessageBody should decode")
     {
@@ -1201,8 +1185,6 @@ fn test_produce_pre_pair_request_rejects_inline_keys_contact() {
         &alice_contact,
     );
 
-    // PrePair is only meaningful for HASHED_KEYS contacts — INLINE_KEYS
-    // contacts already carry the keys and must use `produce` directly.
     assert!(matches!(
         result,
         Err(Error::Pairing(PairingError::InvalidContactMessage(_)))
@@ -1280,9 +1262,6 @@ fn test_extract_pre_pair_rejects_garbage_bytes() {
 
 #[test]
 fn test_extract_pre_pair_rejects_wrong_inner_message_type() {
-    // Hand-craft an envelope that carries a non-PrePairRequest body. The
-    // body is plaintext (same encoding as PrePair), so the envelope is
-    // structurally valid — `extract_pre_pair` must still reject it.
     let timestamp = current_timestamp();
     let body = MessageBody::PairResponse(PairResponseMessage::default()).encode_to_vec();
     let envelope = DeRecMessage {
@@ -1304,7 +1283,6 @@ fn test_extract_pre_pair_rejects_wrong_inner_message_type() {
 fn test_produce_pre_pair_emits_envelope_carrying_initiator_public_keys() {
     let channel_id = ChannelId(42);
 
-    // Alice creates a HASHED_KEYS contact and keeps the secret material.
     let CreateContactMessageResult {
         contact_message: alice_contact,
         secret_key: alice_secret,
@@ -1317,8 +1295,6 @@ fn test_produce_pre_pair_emits_envelope_carrying_initiator_public_keys() {
         }, None)
     .expect("failed to create HASHED_KEYS contact");
 
-    // Bob builds and Alice extracts the PrePair request so Alice has a
-    // proper PrePairRequestMessage to echo the nonce from.
     let ProducePrePairResult {
         envelope: request_envelope,
     } = produce_pre_pair_request(
@@ -1333,19 +1309,15 @@ fn test_produce_pre_pair_emits_envelope_carrying_initiator_public_keys() {
         request: pre_pair_request,
     } = extract_pre_pair(&request_envelope).expect("extract_pre_pair should succeed");
 
-    // Alice produces the PrePair response envelope.
     let ProducePrePairResponseResult {
         envelope: response_envelope,
     } = produce_pre_pair(channel_id, &pre_pair_request, alice_secret.as_ref().unwrap())
         .expect("produce_pre_pair should succeed");
 
-    // Outer envelope routes back to the same channel and carries a timestamp.
     let outer = decode_outer_envelope(&response_envelope);
     assert_eq!(outer.channel_id, u64::from(channel_id));
     let envelope_ts = outer.timestamp.expect("envelope timestamp must be present");
 
-    // Inner body is a PrePairResponse with Ok status, echoed nonce,
-    // matching timestamp, and both public keys present and non-empty.
     let inner = match MessageBody::decode_from_vec(outer.message.as_slice())
         .expect("inner MessageBody should decode")
     {
@@ -1375,7 +1347,6 @@ fn test_produce_pre_pair_emits_envelope_carrying_initiator_public_keys() {
 fn test_produce_pre_pair_rejects_responder_secret_key_material() {
     let channel_id = ChannelId(42);
 
-    // Alice's contact provides keys for Bob to encapsulate against.
     let alice_contact = create_contact_message(
         channel_id,
         ContactMode::InlineKeys,
@@ -1386,8 +1357,6 @@ fn test_produce_pre_pair_rejects_responder_secret_key_material() {
     .expect("failed to create contact")
     .contact_message;
 
-    // Bob produces a PairRequest, which yields a Responder secret variant —
-    // the kind that MUST NOT be allowed to serve a PrePair response.
     let ProducePairingRequestMessageResult {
         secret_key: bob_secret,
         ..
@@ -1403,8 +1372,6 @@ fn test_produce_pre_pair_rejects_responder_secret_key_material() {
     )
     .expect("produce_pairing_request_message should succeed");
 
-    // A dummy request is fine — validation rejects on the secret variant
-    // before nonce/timestamp are consulted.
     let dummy_request = derec_proto::PrePairRequestMessage {
         nonce: 1234,
         transport_protocol: None,
@@ -1421,11 +1388,6 @@ fn test_produce_pre_pair_rejects_responder_secret_key_material() {
 
 #[test]
 fn test_produce_pre_pair_response_keys_match_initiator_contact_keys_in_inline_mode() {
-    // Sanity check: the keys we republish via PrePair MUST equal the ones a
-    // peer would have received inline. We can't compare against a HASHED_KEYS
-    // contact (it doesn't carry them), so we run create_contact in
-    // INLINE_KEYS mode purely to surface the keys that ended up retained on
-    // the secret material, and confirm they match.
     let channel_id = ChannelId(42);
     let CreateContactMessageResult {
         contact_message: inline_contact,
@@ -1524,7 +1486,6 @@ fn test_extract_pre_pair_response_roundtrip() {
     assert_eq!(result.status, StatusEnum::Ok as i32);
     assert!(result.memo.is_empty());
 
-    // Nonce echoed from the request, keys present and non-empty.
     assert_eq!(response.nonce, pre_pair_request.nonce);
     assert!(
         response
@@ -1559,9 +1520,6 @@ fn test_extract_pre_pair_response_rejects_garbage_bytes() {
 
 #[test]
 fn test_extract_pre_pair_response_rejects_wrong_inner_message_type() {
-    // Hand-craft an envelope that carries a non-PrePairResponse body. The
-    // body is plaintext, so the envelope is structurally valid —
-    // `extract_pre_pair_response` must still reject it.
     let timestamp = current_timestamp();
     let body = MessageBody::PairRequest(PairRequestMessage::default()).encode_to_vec();
     let envelope = DeRecMessage {
@@ -1630,8 +1588,6 @@ fn test_process_pre_pair_returns_keys_and_nonce_on_valid_response() {
         nonce,
     } = process_pre_pair(&contact, &response).expect("process_pre_pair should succeed");
 
-    // Returned keys MUST equal the ones the response advertised — process
-    // hands them back verbatim once the hash check has passed.
     assert_eq!(
         Some(&mlkem_encapsulation_key),
         response.mlkem_encapsulation_key.as_ref()
@@ -1644,8 +1600,6 @@ fn test_process_pre_pair_returns_keys_and_nonce_on_valid_response() {
 fn test_process_pre_pair_rejects_tampered_mlkem_key() {
     let (contact, mut response) = run_pre_pair_leg(ChannelId(42));
 
-    // Flip a byte in the published ML-KEM key; the hash recomputation MUST
-    // surface a binding-hash mismatch.
     let mut tampered = response.mlkem_encapsulation_key.clone().unwrap();
     tampered[0] ^= 0xff;
     response.mlkem_encapsulation_key = Some(tampered);
@@ -1692,8 +1646,6 @@ fn test_process_pre_pair_rejects_non_ok_status() {
 fn test_process_pre_pair_rejects_inline_keys_contact() {
     let (mut contact, response) = run_pre_pair_leg(ChannelId(42));
 
-    // Pretend the contact was an INLINE_KEYS one — the PrePair leg makes
-    // no sense in that mode and process must refuse.
     contact.contact_mode = ContactMode::InlineKeys as i32;
 
     let result = process_pre_pair(&contact, &response);
@@ -1733,9 +1685,6 @@ fn test_process_pre_pair_rejects_response_missing_keys() {
 fn test_process_pre_pair_rejects_response_nonce_mismatch() {
     let (contact, mut response) = run_pre_pair_leg(ChannelId(42));
 
-    // Swap to a nonce that won't match the contact's. The hash recompute
-    // would also catch this, but the explicit nonce check fires first
-    // (matches the existing PairResponse process behavior).
     response.nonce = contact.nonce.wrapping_add(1);
 
     let result = process_pre_pair(&contact, &response);
@@ -1801,9 +1750,6 @@ fn test_process_pairing_response_rejects_tampered_channel_id_rekey() {
     } = extract_pairing_response(&alice_pair_resp_envelope, bob_sk_state.ecies_secret_key())
         .expect("extract_pairing_response failed");
 
-    // Flip the rekey id away from what process() will derive. The hash is
-    // deterministic over (contact.channel_id, shared_key), so any value other
-    // than the correct derivation must be rejected.
     tampered_response.channel_id = tampered_response.channel_id.wrapping_add(1);
 
     let result = process_pairing_response_message(
@@ -1821,14 +1767,9 @@ fn test_process_pairing_response_rejects_tampered_channel_id_rekey() {
 
 #[test]
 fn test_pairing_rekey_also_fires_in_hashed_keys_mode() {
-    // The channel-id rekey is part of every pairing handshake regardless
-    // of `ContactMode`. This test runs the full HASHED_KEYS leg (PrePair
-    // → Pair) and asserts the rekey happens on the synthesized contact
-    // exactly like it does for INLINE_KEYS.
 
     let alice_channel_id = ChannelId(7);
 
-    // Alice creates a HASHED_KEYS contact (no inline keys, only a hash).
     let CreateContactMessageResult {
         contact_message: alice_contact,
         secret_key: alice_sk_state,
@@ -1841,7 +1782,6 @@ fn test_pairing_rekey_also_fires_in_hashed_keys_mode() {
         }, None)
     .expect("create_contact (HASHED_KEYS) failed");
 
-    // Bob runs the PrePair leg to fetch and validate Alice's keys.
     let ProducePrePairResult {
         envelope: pre_pair_req_envelope,
     } = produce_pre_pair_request(
@@ -1866,11 +1806,6 @@ fn test_pairing_rekey_also_fires_in_hashed_keys_mode() {
     let validated =
         process_pre_pair(&alice_contact, &pre_pair_resp).expect("process_pre_pair failed");
 
-    // Bob synthesizes a filled-in contact and runs the regular Pair flow.
-    // After PrePair, the contact is logically `InlineKeys` (keys present
-    // locally), so normalize the shape: clear the binding hash and flip
-    // the mode. `produce_pairing_request_message` enforces the InlineKeys
-    // invariant.
     let filled_in_contact = ContactMessage {
         mlkem_encapsulation_key: Some(validated.mlkem_encapsulation_key),
         ecies_public_key: Some(validated.ecies_public_key),
@@ -1928,11 +1863,8 @@ fn test_pairing_rekey_also_fires_in_hashed_keys_mode() {
     )
     .expect("process_pairing_response_message failed");
 
-    // Both sides agree on the rekeyed id...
     assert_eq!(alice_new_channel_id, bob_new_channel_id);
-    // ...and it differs from the original pre-rekey id.
     assert_ne!(alice_new_channel_id, alice_channel_id);
-    // The wire-level field on the encrypted inner response carries it too.
     assert_eq!(
         alice_pair_resp_msg.channel_id,
         u64::from(alice_new_channel_id)
@@ -1966,8 +1898,6 @@ fn well_formed_hashed_keys_contact() -> ContactMessage {
         contact_mode: ContactMode::HashedKeys as i32,
         mlkem_encapsulation_key: None,
         ecies_public_key: None,
-        // 48 bytes — SHA-384 digest length. Value is dummy; the validator
-        // does not recompute against the keys.
         contact_binding_hash: Some(vec![0xAB; 48]),
         nonce: 0xDEAD_BEEF,
         timestamp: Some(current_timestamp()),
@@ -2048,9 +1978,6 @@ fn test_validate_contact_for_mode_rejects_inline_missing_ecies_key() {
 #[test]
 fn test_validate_contact_for_mode_rejects_inline_with_binding_hash() {
     use crate::primitives::pairing::validate_contact_for_mode;
-    // The most defensive case: an inline_keys contact must not also
-    // carry a binding hash — otherwise the contact is in a malformed
-    // dual state that downstream code might branch on incorrectly.
     let mut c = well_formed_inline_keys_contact();
     c.contact_binding_hash = Some(vec![0xCD; 48]);
     let err = validate_contact_for_mode(&c, ContactMode::InlineKeys).unwrap_err();
@@ -2064,10 +1991,6 @@ fn test_validate_contact_for_mode_rejects_inline_with_binding_hash() {
 #[test]
 fn test_validate_contact_for_mode_rejects_hashed_with_inline_keys() {
     use crate::primitives::pairing::validate_contact_for_mode;
-    // Security-relevant: a hashed_keys contact must not carry inline
-    // keys, because downstream callers might use them without ever
-    // recomputing the binding hash — defeating the commitment that's
-    // the whole point of HASHED_KEYS mode.
     let mut c = well_formed_hashed_keys_contact();
     c.mlkem_encapsulation_key = Some(vec![1; 1184]);
     let err = validate_contact_for_mode(&c, ContactMode::HashedKeys).unwrap_err();
@@ -2112,9 +2035,6 @@ fn test_validate_contact_for_mode_rejects_hashed_missing_binding_hash() {
 #[test]
 fn test_validate_contact_for_mode_rejects_hashed_wrong_hash_length() {
     use crate::primitives::pairing::validate_contact_for_mode;
-    // SHA-384 produces a 48-byte digest. A 32-byte hash (looks like
-    // SHA-256) must be rejected — accepting it would let a different
-    // hash function masquerade as the binding commitment.
     let mut c = well_formed_hashed_keys_contact();
     c.contact_binding_hash = Some(vec![0xAB; 32]);
     let err = validate_contact_for_mode(&c, ContactMode::HashedKeys).unwrap_err();
@@ -2124,9 +2044,6 @@ fn test_validate_contact_for_mode_rejects_hashed_wrong_hash_length() {
             if m == "hashed_keys contact_binding_hash is not a SHA-384 digest"
     ));
 }
-
-// Tests for the mode-agnostic structural validator (`ContactMessageExt::validate`)
-// live alongside the trait definition in `library/src/utils.rs`.
 
 /// A peer-supplied `PairRequestMessage.transport_protocol` declaring
 /// `Protocol::Https` but carrying a URI with an unsupported scheme is
@@ -2153,12 +2070,6 @@ fn test_extract_pairing_request_rejects_scheme_mismatched_transport_protocol() {
         }, None)
     .expect("failed to create contact message");
 
-    // Hand-craft a PairRequest whose advertised transport_protocol
-    // declares Https but carries a URI with an unsupported scheme —
-    // the structurally malicious payload `validate_inputs` would
-    // refuse on the producer side. Encrypt with the initiator's
-    // ECIES public key from the contact message and seal it in the
-    // standard outer envelope.
     let malicious_transport = TransportProtocol {
         uri: "ws://attacker.example/inbox".to_owned(),
         protocol: Protocol::Https.into(),

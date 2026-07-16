@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 //
 // Entry point for the Web smoke test suite.
 // Runs the primitives tests first (low-level message functions), then the

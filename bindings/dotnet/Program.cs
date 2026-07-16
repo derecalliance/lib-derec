@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 // Entry point for the dotnet bindings smoke test. Delegates to
 // `Primitives.RunAll()` (low-level produce/extract/process surface)
 // and `Protocol.RunAll()` (stateful DeRecProtocol orchestrator).

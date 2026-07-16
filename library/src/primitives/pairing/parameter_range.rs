@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-//! Pair-time validation of the
-//! [`ParameterRange`](derec_proto::ParameterRange) each side advertises.
+//! Pair-time validation of the [`derec_proto::ParameterRange`] each
+//! side advertises.
 //!
 //! Two parties' ranges are compatible when, for every field pair, the
 //! intervals overlap — i.e. there exists at least one value both

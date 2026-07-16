@@ -1,11 +1,5 @@
-//! Encode/decode helpers for the typed values the protocol hands to
-//! the store traits. Postgres has no native concept of `SecretValue`
-//! or `UserSecrets`, so every store column that holds a structured
-//! Rust value passes through one of these functions.
-//!
-//! Identical in shape to the SQLite binding's `codec.rs` — the byte
-//! encodings are deliberately not cryptographic, they exist only to
-//! get typed values across the database boundary and back.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
