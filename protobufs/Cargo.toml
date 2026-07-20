@@ -21,8 +21,14 @@ include = [
 [dependencies]
 prost = "0.14.4"
 prost-types = "0.14.4"
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"], optional = true }
 
 [build-dependencies]
 prost-build = "0.14.4"
+
+[features]
+# Injects `serde::Serialize` / `Deserialize` onto the `TransportProtocol`
+# and `SenderKind` types so downstream serde-deriving wrappers (e.g.
+# `derec-library`'s `Channel`) compile. Off by default.
+serde = ["dep:serde"]
 

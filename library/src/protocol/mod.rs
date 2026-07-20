@@ -68,6 +68,7 @@
 
 pub mod error;
 pub mod events;
+#[cfg(any(feature = "ffi", target_arch = "wasm32"))]
 pub(crate) mod pending_action_wire;
 pub mod reserved_keys;
 pub mod traits;

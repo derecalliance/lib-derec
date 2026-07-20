@@ -30,10 +30,12 @@
 ///
 /// This identifier is used internally by the library to associate protocol state
 /// and messages with the correct peer.
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(
+    any(feature = "serde", target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize),
+    serde(transparent)
 )]
-#[serde(transparent)]
 pub struct ChannelId(pub u64);
 
 impl From<u64> for ChannelId {

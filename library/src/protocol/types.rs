@@ -16,6 +16,7 @@
 use crate::types::ChannelId;
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::ContactMessage;
+#[cfg(any(feature = "serde", target_arch = "wasm32"))]
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -35,7 +36,11 @@ pub enum Target {
 /// Replica channels start as `Pending` after pairing completes and transition
 /// to `Paired` once fingerprint verification succeeds. Helper/Owner channels
 /// are `Paired` immediately after pairing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(
+    any(feature = "serde", target_arch = "wasm32"),
+    derive(Serialize, Deserialize)
+)]
 pub enum ChannelStatus {
     /// Channel is awaiting fingerprint verification (replica only).
     Pending,
@@ -56,7 +61,11 @@ pub enum ChannelStatus {
 /// the wire format is not part of the public API and may change
 /// independently. `#[serde(default)]` annotations let bridges decode
 /// legacy bytes that predate later-added fields without erroring.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
+#[cfg_attr(
+    any(feature = "serde", target_arch = "wasm32"),
+    derive(Serialize, Deserialize)
+)]
 pub struct Channel {
     /// Unique identifier for this channel.
     pub id: ChannelId,
@@ -75,13 +84,13 @@ pub struct Channel {
     /// side, it is the peer's own `communication_info` extracted from the
     /// wire pair-request — the same map that surfaces in
     /// [`crate::protocol::DeRecEvent::PairingCompleted::peer_communication_info`].
-    #[serde(default)]
+    #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
     pub communication_info: std::collections::HashMap<String, String>,
     /// Lifecycle status. Messages on `Pending` channels are ignored.
-    #[serde(default)]
+    #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
     pub status: ChannelStatus,
     /// Unix timestamp (seconds) when the channel was created.
-    #[serde(default)]
+    #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
     pub created_at: u64,
     /// This node's role on this channel, fixed at pairing time.
     ///
@@ -99,7 +108,7 @@ pub struct Channel {
     /// Helper/Owner channels and as a defensive default on
     /// freshly-paired Replica channels where the peer did not advertise
     /// one.
-    #[serde(default)]
+    #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
     pub replica_id: Option<u64>,
 }
 
@@ -425,6 +434,7 @@ impl PairingKeyMaterial {
     }
 }
 
+#[cfg(feature = "serde")]
 impl Serialize for PairingKeyMaterial {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -434,6 +444,7 @@ impl Serialize for PairingKeyMaterial {
     }
 }
 
+#[cfg(feature = "serde")]
 impl<'de> Deserialize<'de> for PairingKeyMaterial {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -448,6 +459,7 @@ impl<'de> Deserialize<'de> for PairingKeyMaterial {
 /// [`SecretValue::PairingContact`]. prost messages have no native serde
 /// support, so the value is (de)serialized through its canonical protobuf
 /// byte encoding.
+#[cfg(feature = "serde")]
 mod contact_serde {
     use super::ContactMessage;
     use prost::Message as _;
@@ -474,14 +486,16 @@ mod contact_serde {
 ///
 /// Variants are 1:1 with [`SecretKind`].
 ///
-/// `Serialize` / `Deserialize` are derived so a store implementation can
-/// persist an entry with any serde format instead of hand-rolling a codec.
-/// This is an alternative to the byte-level accessors on the individual
-/// payloads (e.g. [`PairingKeyMaterial::as_bytes`] /
-/// [`PairingKeyMaterial::from_bytes`]); implementors pick whichever fits
-/// their backend. The serde wire format is not part of the public API and
-/// may change independently.
-#[derive(Clone, Serialize, Deserialize)]
+/// With the `serde` feature enabled, `Serialize` / `Deserialize` are
+/// derived so a store implementation can persist an entry with any serde
+/// format instead of hand-rolling a codec. This is an alternative to the
+/// byte-level accessors on the individual payloads (e.g.
+/// [`PairingKeyMaterial::as_bytes`] / [`PairingKeyMaterial::from_bytes`]);
+/// implementors pick whichever fits their backend, and consumers that do
+/// not use serde pay no dependency for it. The serde wire format is not
+/// part of the public API and may change independently.
+#[derive(Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum SecretValue {
     /// The post-pairing symmetric channel key. Established by pairing and used
     /// to authenticate and encrypt every subsequent message on the channel.
@@ -494,7 +508,7 @@ pub enum SecretValue {
     /// The initiator's [`ContactMessage`], needed by
     /// [`crate::primitives::pairing::response::process`] to derive the shared
     /// key. Ephemeral — removed after pairing completes.
-    PairingContact(#[serde(with = "contact_serde")] ContactMessage),
+    PairingContact(#[cfg_attr(feature = "serde", serde(with = "contact_serde"))] ContactMessage),
 }
 
 /// Tag identifying which kind of in-flight orchestrator state an entry in
@@ -686,7 +700,7 @@ pub struct Share {
     pub bytes: Vec<u8>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "serde"))]
 mod tests {
     use super::*;
 

@@ -10,7 +10,7 @@ edition = "2024"
 [workspace]
 
 [dependencies]
-derec-library = { path = "../../library" }
+derec-library = { path = "../../library", features = ["serde"] }
 derec-proto = { path = "../../protobufs" }
 prost = "0.14.3"
 rusqlite = { version = "0.31", features = ["bundled"] }

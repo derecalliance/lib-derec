@@ -86,7 +86,7 @@ pub fn generate_replica_id() -> u64 {
     rand::random()
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "ffi"))]
 mod ffi;
 
 #[cfg(target_arch = "wasm32")]
