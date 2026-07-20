@@ -22,8 +22,8 @@ include = [
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-derec-cryptography = { path = "../cryptography", version = "0.0.1-alpha.8" }
-derec-proto = { path = "../protobufs", version = "0.0.1-alpha.8" }
+derec-cryptography = {  version = "0.0.1-alpha.8" }
+derec-proto = {  version = "0.0.1-alpha.8" }
 prost = "0.14.4"
 prost-types = "0.14.4"
 rand = { version = "0.10.2", features = ["sys_rng"] }
@@ -41,10 +41,6 @@ tracing = { version = "0.1.44", default-features = false, features = ["attribute
 tokio = { version = "1.53.1", features = ["rt"], default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-# The WASM bridge always marshals via serde, so serde / serde_json are
-# non-optional here and `derec-proto` is pulled with its `serde` feature.
-# This keeps `wasm32` building without the caller having to pass
-# `--features serde`, while native builds keep serde fully optional.
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 derec-proto = { path = "../protobufs", version = "0.0.1-alpha.8", features = ["serde"] }
@@ -59,23 +55,9 @@ getrandom_04 = { package = "getrandom", version = "0.4.3", features = ["wasm_js"
 console_error_panic_hook = "0.1.7"
 
 [features]
-primitives = []
 logging = ["dep:tracing"]
-# Native C-ABI bridge. Marshals across the boundary as JSON, so it pulls
-# in serde + serde_json. Off by default; an rlib consumer that does not
-# build the C bridge compiles none of it.
 ffi = ["serde", "dep:serde_json"]
-# Opt-in `serde::Serialize` / `Deserialize` on the public store/channel
-# types so consumers can persist them with any serde format. Off by
-# default — consumers who prefer the byte-level accessors or another
-# format compile no serde at all. Also pulls the matching `derec-proto`
-# serde so `Channel`'s embedded protobuf fields serialize.
 serde = ["dep:serde", "derec-proto/serde"]
-# Opt-in development affordance: lets `TransportProtocol::validate`
-# accept plaintext `http://` URIs (still emits `tracing::warn!` under
-# `logging`). OFF by default — production callers MUST keep it off,
-# since enabling it also lets a peer-supplied `reply_to` downgrade
-# the reply path to plaintext.
 unsafe-http = []
 
 [dev-dependencies]

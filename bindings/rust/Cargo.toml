@@ -7,7 +7,7 @@ edition = "2024"
 tokio = { version = "1.53.1", features = ["macros", "rt"] }
 ark-serialize = { version = "0.6.0", default-features = true }
 derec-cryptography = { path = "../../cryptography" }
-derec-library = { path = "../../library", features = ["primitives"] }
+derec-library = { path = "../../library" }
 derec-proto = { path = "../../protobufs" }
 prost = "0.14.4"
 prost-types = "0.14.4"
