@@ -12,10 +12,10 @@ homepage = "https://derec.org"
 keywords = ["derec", "decentralized", "recovery", "secret-sharing", "sdk"]
 
 include = [
-  "src/**",
-  "Cargo.toml",
-  "README.md",
-  "LICENSE",
+  "/src/**",
+  "/Cargo.toml",
+  "/README.md",
+  "/LICENSE",
 ]
 
 [lib]
