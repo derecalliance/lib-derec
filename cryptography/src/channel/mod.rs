@@ -57,8 +57,9 @@ pub fn encrypt_message(
     let key: &Key<Aes256Gcm> = key.into();
     let cipher = Aes256Gcm::new(key);
 
+    let nonce = Nonce::try_from(&nonce[0..12]).expect("nonce slice is exactly 12 bytes");
     let e = cipher
-        .encrypt(Nonce::from_slice(&nonce[0..12]), msg)
+        .encrypt(&nonce, msg)
         .map_err(DerecChannelError::EncryptionError)?;
 
     let mut ctxt = Vec::new();
@@ -111,8 +112,9 @@ pub fn decrypt_message(ctxt: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, DerecChan
     let key: &Key<Aes256Gcm> = key.into();
     let cipher = Aes256Gcm::new(key);
 
+    let nonce = Nonce::try_from(&ctxt[0..12]).expect("nonce slice is exactly 12 bytes");
     let plaintext = cipher
-        .decrypt(Nonce::from_slice(&ctxt[0..12]), &ctxt[12..])
+        .decrypt(&nonce, &ctxt[12..])
         .map_err(|e| {
             #[cfg(feature = "logging")]
             tracing::warn!(error = %e, "AES-GCM decryption failed");

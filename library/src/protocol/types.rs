@@ -130,10 +130,8 @@ pub struct HelperInfo {
     /// older codebases silently drop this new field when decoding new
     /// bags. Degraded but not broken in either direction.
     #[prost(map = "string, string", tag = "5")]
-    pub communication_info: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
+    pub communication_info:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
 }
 
 /// A single user-facing secret within the bag.
@@ -205,10 +203,8 @@ pub struct ReplicaInfo {
     /// App-level identity metadata for this peer. Same opacity contract
     /// as [`HelperInfo::communication_info`].
     #[prost(map = "string, string", tag = "4")]
-    pub communication_info: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
+    pub communication_info:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     /// The peer's `replica_id` — global stable identity of the replica
     /// device, separate from the per-channel `channel_id`.
     #[prost(uint64, tag = "5")]
@@ -540,9 +536,9 @@ impl StateItem {
             StateItem::PendingVerification { channel_id, .. } => StateKey::PendingVerification {
                 channel_id: *channel_id,
             },
-            StateItem::PendingRecovery { version, .. } => StateKey::PendingRecovery {
-                version: *version,
-            },
+            StateItem::PendingRecovery { version, .. } => {
+                StateKey::PendingRecovery { version: *version }
+            }
             StateItem::PendingUnpair { channel_id, .. } => StateKey::PendingUnpair {
                 channel_id: *channel_id,
             },
@@ -573,4 +569,3 @@ pub struct Share {
     /// the per-side format.
     pub bytes: Vec<u8>,
 }
-

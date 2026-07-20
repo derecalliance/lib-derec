@@ -19,10 +19,10 @@ include = [
 ]
 
 [dependencies]
-prost = "0.14.3"
-prost-types = "0.14.3"
+prost = "0.14.4"
+prost-types = "0.14.4"
 serde = { version = "1.0", features = ["derive"] }
 
 [build-dependencies]
-prost-build = "0.14.3"
+prost-build = "0.14.4"
 
