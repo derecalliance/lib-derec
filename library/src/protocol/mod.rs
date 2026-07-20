@@ -94,9 +94,9 @@ pub use traits::{
     TransportFuture,
 };
 pub use types::{
-    Channel, ChannelShare, ChannelStatus, HelperInfo, MissingPolicy, ReplicaInfo,
-    ReplicaSecretPayload, Secret, SecretKind, SecretValue, Share, StateItem, StateKey, StateKind,
-    Target, UserSecret, UserSecrets,
+    Channel, ChannelShare, ChannelStatus, HelperInfo, MissingPolicy, PairingKeyMaterial,
+    ReplicaInfo, ReplicaSecretPayload, Secret, SecretKind, SecretValue, Share, StateItem, StateKey,
+    StateKind, Target, UserSecret, UserSecrets,
 };
 
 
@@ -388,7 +388,7 @@ impl<
                     .save(
                         self.secret_id,
                         channel_id,
-                        SecretValue::PairingSecret(secret_key),
+                        SecretValue::PairingSecret(PairingKeyMaterial::from_secret(&secret_key)),
                     )
                     .await?;
             }
@@ -1212,7 +1212,6 @@ impl<
             PendingAction::Pairing {
                 channel_id,
                 request,
-                pairing_secret,
                 kind,
                 trace_id,
                 ..
@@ -1225,7 +1224,6 @@ impl<
                     self.secret_id,
                     channel_id,
                     &request,
-                    &pairing_secret,
                     kind,
                     trace_id,
                     self.replica_id,
@@ -1609,6 +1607,7 @@ impl<
         else {
             return Ok(None);
         };
+        let pairing_secret = pairing_secret.to_secret()?;
 
         let events = handlers::handle_pairing(
             &mut self.channel_store,

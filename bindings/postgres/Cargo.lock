@@ -487,8 +487,6 @@ dependencies = [
 name = "derec-postgres-binding-smoke-test"
 version = "0.1.0"
 dependencies = [
- "ark-serialize",
- "derec-cryptography",
  "derec-library",
  "derec-proto",
  "prost",

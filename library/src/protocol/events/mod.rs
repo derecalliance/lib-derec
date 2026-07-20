@@ -10,7 +10,6 @@ use crate::{
     protocol::types::{Target, UserSecret},
     types::{ChannelId, SharedKey},
 };
-use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{
     ContactMessage, GetSecretIdsVersionsRequestMessage, GetShareRequestMessage, PairRequestMessage,
     PrePairRequestMessage, SenderKind, StoreShareRequestMessage, TransportProtocol,
@@ -136,13 +135,15 @@ impl AutoAcceptPolicy {
 /// [`super::DeRecProtocol::reject`] to complete the flow.
 ///
 /// `Debug` shows only the [`PendingActionKind`] discriminant plus
-/// `channel_id` so the ephemeral secret material some variants carry
-/// (e.g. [`PairingSecretKeyMaterial`]) never lands in log lines.
+/// `channel_id`, keeping any peer-supplied request contents out of log
+/// lines. No variant carries private key material — the accept handlers
+/// reload the pairing secret from the secret store (single source of
+/// truth), so the token stays small and safe to persist or ship across a
+/// language boundary.
 pub enum PendingAction {
     Pairing {
         channel_id: ChannelId,
         request: PairRequestMessage,
-        pairing_secret: PairingSecretKeyMaterial,
         kind: SenderKind,
         peer_communication_info: HashMap<String, String>,
         /// Trace id read from the inbound `PairRequest` envelope. Echoed

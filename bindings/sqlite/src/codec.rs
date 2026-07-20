@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use derec_cryptography::pairing::PairingSecretKeyMaterial;
-use derec_library::protocol::types::{Channel, UserSecret, UserSecrets};
+use derec_library::protocol::types::{Channel, PairingKeyMaterial, UserSecret, UserSecrets};
 use derec_library::protocol::{SecretKind, SecretValue};
 use derec_proto::ContactMessage;
 use prost::Message;
@@ -28,11 +26,7 @@ pub fn encode_secret_value(value: &SecretValue) -> Vec<u8> {
     let (tag, payload) = match value {
         SecretValue::SharedKey(key) => (SecretKind::SharedKey as u8, key.to_vec()),
         SecretValue::PairingSecret(material) => {
-            let mut buf = Vec::with_capacity(material.compressed_size());
-            material
-                .serialize_compressed(&mut buf)
-                .expect("ark serialization of PairingSecretKeyMaterial cannot fail");
-            (SecretKind::PairingSecret as u8, buf)
+            (SecretKind::PairingSecret as u8, material.as_bytes().to_vec())
         }
         SecretValue::PairingContact(contact) => {
             (SecretKind::PairingContact as u8, contact.encode_to_vec())
@@ -58,9 +52,7 @@ pub fn decode_secret_value(bytes: &[u8]) -> SecretValue {
             SecretValue::SharedKey(key)
         }
         t if t == SecretKind::PairingSecret as u8 => {
-            let material = PairingSecretKeyMaterial::deserialize_compressed(payload)
-                .expect("failed to ark-decode PairingSecretKeyMaterial");
-            SecretValue::PairingSecret(material)
+            SecretValue::PairingSecret(PairingKeyMaterial::from_bytes(payload.to_vec()))
         }
         t if t == SecretKind::PairingContact as u8 => {
             let contact = ContactMessage::decode(payload)

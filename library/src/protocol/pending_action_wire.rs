@@ -14,7 +14,6 @@
 //!   - 4 bytes: my_kind (i32 BE)
 //!   - 4 bytes: request_len (u32 BE)
 //!   - N bytes: protobuf-encoded PairRequestMessage
-//!   - remaining: serialized PairingSecretKeyMaterial
 //! - For channel message types (StoreShare, VerifyShare, Discovery,
 //!   GetShare, Unpair, UpdateChannelInfo):
 //!   - 32 bytes: shared_key
@@ -22,19 +21,17 @@
 //! - For PrePair (initiator side, before any key material exists):
 //!   - remaining: protobuf-encoded PrePairRequestMessage
 //!
-//! No `shared_key` or `pairing_secret` is carried for PrePair — the leg is
-//! plaintext and the handler loads `PairingSecret` from the secret store at
-//! accept time (single source of truth).
+//! No pairing secret is carried for Pairing or PrePair — both accept
+//! handlers load `PairingSecret` from the secret store at accept time
+//! (single source of truth), so the token never holds private key material.
 
 use crate::protocol::PendingAction;
 use crate::types::ChannelId;
-use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{
     GetSecretIdsVersionsRequestMessage, GetShareRequestMessage, PairRequestMessage,
     PrePairRequestMessage, SenderKind, StoreShareRequestMessage, UnpairRequestMessage,
     UpdateChannelInfoRequestMessage, VerifyShareRequestMessage,
 };
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use prost::Message;
 
 const TAG_PAIRING: u8 = 0;
@@ -53,7 +50,6 @@ pub fn serialize(action: PendingAction) -> Result<Vec<u8>, String> {
         PendingAction::Pairing {
             channel_id,
             request,
-            pairing_secret,
             kind,
             trace_id,
             ..
@@ -65,12 +61,6 @@ pub fn serialize(action: PendingAction) -> Result<Vec<u8>, String> {
             let request_bytes = request.encode_to_vec();
             buf.extend_from_slice(&(request_bytes.len() as u32).to_be_bytes());
             buf.extend_from_slice(&request_bytes);
-            // Serialize PairingSecretKeyMaterial
-            let mut secret_buf = Vec::new();
-            pairing_secret
-                .serialize_uncompressed(&mut secret_buf)
-                .map_err(|e| format!("failed to serialize pairing secret: {e}"))?;
-            buf.extend_from_slice(&secret_buf);
         }
         PendingAction::StoreShare {
             channel_id,
@@ -189,17 +179,12 @@ pub fn deserialize(bytes: &[u8]) -> Result<PendingAction, String> {
             }
             let request = PairRequestMessage::decode(&rest[..request_len])
                 .map_err(|e| format!("failed to decode PairRequestMessage: {e}"))?;
-            let secret_bytes = &rest[request_len..];
-            let pairing_secret =
-                PairingSecretKeyMaterial::deserialize_uncompressed(&mut &secret_bytes[..])
-                    .map_err(|e| format!("failed to deserialize pairing secret: {e}"))?;
 
             let kind = i32_to_sender_kind(kind_i32)?;
 
             Ok(PendingAction::Pairing {
                 channel_id,
                 request,
-                pairing_secret,
                 kind,
                 peer_communication_info: std::collections::HashMap::new(),
                 trace_id,

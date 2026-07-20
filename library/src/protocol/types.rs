@@ -17,6 +17,7 @@ use crate::types::ChannelId;
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::ContactMessage;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 /// Selects which channels to target for a discovery request.
 #[derive(Debug, Clone)]
@@ -362,23 +363,138 @@ pub enum MissingPolicy {
     Fail,
 }
 
+/// Opaque, serialized pairing key material as held by
+/// [`crate::protocol::DeRecSecretStore`] under [`SecretValue::PairingSecret`].
+///
+/// This is the store-boundary form of the ephemeral key pair the pairing
+/// handshake produces. The protocol deliberately exposes it as an opaque
+/// byte blob rather than a cryptographic type, so a store implementation can
+/// persist and reload it without depending on `derec-cryptography` or any
+/// serialization framework: call [`as_bytes`](Self::as_bytes) to obtain the
+/// bytes to persist on `save`, and hand the same bytes back to
+/// [`from_bytes`](Self::from_bytes) on `load`.
+///
+/// The byte layout is a library-internal detail, is not part of the public
+/// API, and may change between versions; treat the blob as opaque and never
+/// interpret it.
+///
+/// The bytes are held in [`zeroize::Zeroizing`] so the plaintext key material
+/// is wiped from memory on drop.
+#[derive(Clone)]
+pub struct PairingKeyMaterial(Zeroizing<Vec<u8>>);
+
+impl PairingKeyMaterial {
+    /// Wrap raw bytes previously obtained from [`as_bytes`](Self::as_bytes)
+    /// and persisted by a store.
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
+
+    /// The opaque bytes to persist. Round-trips through
+    /// [`from_bytes`](Self::from_bytes).
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+
+    /// Serialize live pairing secret key material into the store-boundary
+    /// form.
+    ///
+    /// Library-internal: the pairing handlers call this before handing the
+    /// value to the secret store, keeping the `ark-serialize` encoding an
+    /// implementation detail that never crosses the public API.
+    pub(crate) fn from_secret(material: &PairingSecretKeyMaterial) -> Self {
+        use ark_serialize::CanonicalSerialize as _;
+        let mut buf = Vec::with_capacity(material.compressed_size());
+        material
+            .serialize_compressed(&mut buf)
+            .expect("ark serialization of PairingSecretKeyMaterial is infallible");
+        Self(Zeroizing::new(buf))
+    }
+
+    /// Reconstruct live pairing secret key material from the store-boundary
+    /// form.
+    ///
+    /// Library-internal: the pairing handlers call this after loading the
+    /// value from the secret store. A decode failure means the persisted
+    /// bytes were corrupted or truncated, which is an internal invariant
+    /// violation rather than valid caller input.
+    pub(crate) fn to_secret(&self) -> crate::Result<PairingSecretKeyMaterial> {
+        use ark_serialize::CanonicalDeserialize as _;
+        PairingSecretKeyMaterial::deserialize_compressed(self.0.as_slice())
+            .map_err(|_| crate::Error::Invariant("stored PairingSecret bytes failed to decode"))
+    }
+}
+
+impl Serialize for PairingKeyMaterial {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.as_slice().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PairingKeyMaterial {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        Ok(Self(Zeroizing::new(bytes)))
+    }
+}
+
+/// Serde adapter for the prost [`ContactMessage`] carried by
+/// [`SecretValue::PairingContact`]. prost messages have no native serde
+/// support, so the value is (de)serialized through its canonical protobuf
+/// byte encoding.
+mod contact_serde {
+    use super::ContactMessage;
+    use prost::Message as _;
+    use serde::{Deserialize as _, Deserializer, Serialize as _, Serializer};
+
+    pub(super) fn serialize<S>(contact: &ContactMessage, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        contact.encode_to_vec().serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<ContactMessage, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        ContactMessage::decode(bytes.as_slice()).map_err(serde::de::Error::custom)
+    }
+}
+
 /// The payload returned by [`crate::protocol::DeRecSecretStore::load`] and
 /// passed to [`crate::protocol::DeRecSecretStore::save`].
 ///
 /// Variants are 1:1 with [`SecretKind`].
-#[derive(Clone)]
+///
+/// `Serialize` / `Deserialize` are derived so a store implementation can
+/// persist an entry with any serde format instead of hand-rolling a codec.
+/// This is an alternative to the byte-level accessors on the individual
+/// payloads (e.g. [`PairingKeyMaterial::as_bytes`] /
+/// [`PairingKeyMaterial::from_bytes`]); implementors pick whichever fits
+/// their backend. The serde wire format is not part of the public API and
+/// may change independently.
+#[derive(Clone, Serialize, Deserialize)]
 pub enum SecretValue {
     /// The post-pairing symmetric channel key. Established by pairing and used
     /// to authenticate and encrypt every subsequent message on the channel.
     SharedKey(crate::types::SharedKey),
-    /// The ephemeral ECIES / ML-KEM key pair created by `start` and consumed
-    /// when the pairing response arrives. Removed once the shared key is
-    /// derived.
-    PairingSecret(PairingSecretKeyMaterial),
+    /// The ephemeral ECIES / ML-KEM key material created by `start` and
+    /// consumed when the pairing response arrives. Removed once the shared
+    /// key is derived. Held as an opaque [`PairingKeyMaterial`] blob so
+    /// store implementors never touch a cryptography primitive.
+    PairingSecret(PairingKeyMaterial),
     /// The initiator's [`ContactMessage`], needed by
     /// [`crate::primitives::pairing::response::process`] to derive the shared
     /// key. Ephemeral — removed after pairing completes.
-    PairingContact(ContactMessage),
+    PairingContact(#[serde(with = "contact_serde")] ContactMessage),
 }
 
 /// Tag identifying which kind of in-flight orchestrator state an entry in
@@ -568,4 +684,50 @@ pub struct Share {
     /// Opaque protobuf bytes — see [`crate::protocol::DeRecShareStore`] for
     /// the per-side format.
     pub bytes: Vec<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `SecretValue` variant round-trips through serde — the path a
+    /// store implementation takes when it opts for serde over the
+    /// byte-level accessors. Exercises the custom `PairingKeyMaterial`
+    /// impls and the prost `ContactMessage` adapter.
+    #[test]
+    fn secret_value_serde_round_trips_all_variants() {
+        let cases = [
+            SecretValue::SharedKey([7u8; 32]),
+            SecretValue::PairingSecret(PairingKeyMaterial::from_bytes(vec![1, 2, 3, 4, 5])),
+            SecretValue::PairingContact(ContactMessage {
+                nonce: 42,
+                ..Default::default()
+            }),
+        ];
+
+        for value in cases {
+            let json = serde_json::to_vec(&value).expect("serialize");
+            let decoded: SecretValue = serde_json::from_slice(&json).expect("deserialize");
+            match (&value, &decoded) {
+                (SecretValue::SharedKey(a), SecretValue::SharedKey(b)) => assert_eq!(a, b),
+                (SecretValue::PairingSecret(a), SecretValue::PairingSecret(b)) => {
+                    assert_eq!(a.as_bytes(), b.as_bytes())
+                }
+                (SecretValue::PairingContact(a), SecretValue::PairingContact(b)) => {
+                    assert_eq!(a, b)
+                }
+                _ => panic!("variant changed across serde round-trip"),
+            }
+        }
+    }
+
+    /// The serde form and the `from_bytes`/`as_bytes` form describe the
+    /// same opaque blob, so a value serialized one way decodes the other.
+    #[test]
+    fn pairing_key_material_serde_matches_byte_accessors() {
+        let material = PairingKeyMaterial::from_bytes(vec![9, 8, 7, 6]);
+        let json = serde_json::to_vec(&material).expect("serialize");
+        let decoded: PairingKeyMaterial = serde_json::from_slice(&json).expect("deserialize");
+        assert_eq!(material.as_bytes(), decoded.as_bytes());
+    }
 }

@@ -10,8 +10,6 @@ edition = "2024"
 [workspace]
 
 [dependencies]
-ark-serialize = { version = "0.6.0", default-features = true }
-derec-cryptography = { path = "../../cryptography" }
 derec-library = { path = "../../library" }
 derec-proto = { path = "../../protobufs" }
 prost = "0.14.3"

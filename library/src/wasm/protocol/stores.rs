@@ -59,8 +59,6 @@
 //! }
 //! ```
 
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{ContactMessage, TransportProtocol};
 use js_sys::{Array, Function, Promise, Uint8Array};
 use prost::Message as _;
@@ -77,8 +75,8 @@ use crate::{
             ShareStoreFuture, StateStoreFuture, TransportFuture,
         },
         types::{
-            Channel, MissingPolicy, SecretKind, SecretValue, Share, StateItem, StateKey,
-            StateKind, UserSecret, UserSecrets,
+            Channel, MissingPolicy, PairingKeyMaterial, SecretKind, SecretValue, Share,
+            StateItem, StateKey, StateKind, UserSecret, UserSecrets,
         },
     },
     types::ChannelId,
@@ -129,11 +127,9 @@ fn decode_secret_value(kind: SecretKind, bytes: &[u8]) -> Result<SecretValue, Se
             key.copy_from_slice(bytes);
             Ok(SecretValue::SharedKey(key))
         }
-        SecretKind::PairingSecret => {
-            let material = PairingSecretKeyMaterial::deserialize_compressed(&mut &bytes[..])
-                .map_err(|e| SecretStoreError::Backend(box_err(e.to_string())))?;
-            Ok(SecretValue::PairingSecret(material))
-        }
+        SecretKind::PairingSecret => Ok(SecretValue::PairingSecret(
+            PairingKeyMaterial::from_bytes(bytes.to_vec()),
+        )),
         SecretKind::PairingContact => {
             let contact = ContactMessage::decode(bytes)
                 .map_err(|e| SecretStoreError::Backend(box_err(e.to_string())))?;
@@ -246,13 +242,7 @@ impl DeRecSecretStore for JsSecretStore {
         Box::pin(async move {
             let (kind_num, bytes) = match &value {
                 SecretValue::SharedKey(key) => (0u32, key.to_vec()),
-                SecretValue::PairingSecret(material) => {
-                    let mut buf = Vec::new();
-                    material
-                        .serialize_compressed(&mut buf)
-                        .map_err(|e| SecretStoreError::Backend(box_err(format!("{e:?}"))))?;
-                    (1u32, buf)
-                }
+                SecretValue::PairingSecret(material) => (1u32, material.as_bytes().to_vec()),
                 SecretValue::PairingContact(contact) => {
                     (2u32, contact.encode_to_vec())
                 }
