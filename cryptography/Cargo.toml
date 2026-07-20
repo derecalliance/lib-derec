@@ -6,7 +6,7 @@ license = "Apache-2.0"
 description = "Cryptographic primitives used by the DeRec protocol implementation."
 repository = "https://github.com/derecalliance/lib-derec"
 documentation = "https://derec-alliance.gitbook.io/docs/sdk/rust"
-homepage = "https://derecalliance.org"
+homepage = "https://derec.org"
 readme = "README.md"
 keywords = ["derec", "decentralized", "cryptography", "secret-sharing", "recovery"]
 
@@ -32,6 +32,5 @@ ark-secp256k1 = "0.6.0"
 thiserror = "2.0.19"
 ml-kem = "0.2.3"
 zeroize = { version = "1.9.0", features = ["derive"] }
-
 k256 = { version = "0.14.0", features = ["ecdsa"] }
 

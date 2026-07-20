@@ -8,7 +8,7 @@ description = "Rust SDK for the DeRec protocol, including native and WebAssembly
 readme = "README.md"
 repository = "https://github.com/derecalliance/lib-derec"
 documentation = "https://derec-alliance.gitbook.io/docs/sdk/rust"
-homepage = "https://derecalliance.org"
+homepage = "https://derec.org"
 keywords = ["derec", "decentralized", "recovery", "secret-sharing", "sdk"]
 
 include = [
@@ -22,10 +22,8 @@ include = [
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# derec-cryptography =  "0.0.1-alpha.6"
-# derec-proto =  "0.0.1-alpha.6"
-derec-cryptography = { path = "../cryptography" }
-derec-proto = { path = "../protobufs" }
+derec-cryptography = { path = "../cryptography", version = "0.0.1-alpha.8" }
+derec-proto = { path = "../protobufs", version = "0.0.1-alpha.8" }
 prost = "0.14.4"
 prost-types = "0.14.4"
 rand = { version = "0.10.2", features = ["sys_rng"] }
@@ -49,7 +47,7 @@ tokio = { version = "1.53.1", features = ["rt"], default-features = false }
 # `--features serde`, while native builds keep serde fully optional.
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-derec-proto = { path = "../protobufs", features = ["serde"] }
+derec-proto = { path = "../protobufs", version = "0.0.1-alpha.8", features = ["serde"] }
 wasm-bindgen = { version = "0.2.126", features = ["serde-serialize"] }
 wasm-bindgen-futures = { version = "0.4.76" }
 serde-wasm-bindgen = { version = "0.6.5" }

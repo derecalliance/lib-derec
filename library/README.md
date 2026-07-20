@@ -1181,4 +1181,4 @@ requests to discuss improvements.
 ## DeRec Alliance
 
 The DeRec Alliance is an open initiative focused on standards for
-decentralized secret recovery. <https://derecalliance.org>
+decentralized secret recovery. <https://derec.org>

@@ -169,4 +169,4 @@ See the `LICENSE` file for details.
 
 The DeRec Alliance is an open initiative focused on creating standards for decentralized secret recovery.
 
-More information at https://derecalliance.org
+More information at https://derec.org

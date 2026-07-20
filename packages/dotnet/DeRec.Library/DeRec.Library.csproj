@@ -13,7 +13,7 @@
     <Description>.NET bindings for derec-library, the Rust SDK for the DeRec protocol.</Description>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
     <RepositoryUrl>https://github.com/derecalliance/lib-derec</RepositoryUrl>
-    <PackageProjectUrl>https://derecalliance.org</PackageProjectUrl>
+    <PackageProjectUrl>https://derec.org</PackageProjectUrl>
     <PackageTags>derec recovery secret-sharing sdk dotnet</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>

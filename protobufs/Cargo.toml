@@ -6,6 +6,7 @@ license = "Apache-2.0"
 description = "Generated Rust protobuf types for the DeRec protocol."
 repository = "https://github.com/derecalliance/lib-derec"
 documentation = "https://docs.rs/derec-proto"
+homepage = "https://derec.org"
 readme = "README.md"
 keywords = ["derec", "recovery", "decentralized", "protobuf", "protocol"]
 
@@ -27,8 +28,5 @@ serde = { version = "1.0.229", features = ["derive"], optional = true }
 prost-build = "0.14.4"
 
 [features]
-# Injects `serde::Serialize` / `Deserialize` onto the `TransportProtocol`
-# and `SenderKind` types so downstream serde-deriving wrappers (e.g.
-# `derec-library`'s `Channel`) compile. Off by default.
 serde = ["dep:serde"]
 
