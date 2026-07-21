@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 //! WASM bindings for envelope-level helpers that operate on raw
 //! `DeRecMessage` bytes. Mirrors the FFI shape in `crate::ffi::envelope`.

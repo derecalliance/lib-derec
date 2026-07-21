@@ -1,22 +1,5 @@
-//! One user, multiple secrets.
-//!
-//! Models a single device that protects two distinct secrets — a wallet
-//! seed and an email password — each backed by its own dedicated
-//! pair of helpers, all sharing one SQLite database. Drives the full
-//! lifecycle for each secret (pair → publish → simulate state loss →
-//! re-pair → discover → recover) and asserts:
-//!
-//! - the owner-side DB rows for the two secrets coexist under their
-//!   respective `secret_id` partitions,
-//! - each helper only ever sees its own secret's payload — recovery on
-//!   WALLET surfaces the wallet bytes and never the email
-//!   bytes, and vice versa,
-//! - state loss on one secret does not affect the other (clearing
-//!   user_secret_store + dropping channel rows for WALLET
-//!   leaves EMAIL queryable).
-//!
-//! This is the "real" multi-secret story; `multi_tenancy.rs` covers
-//! the narrow trait-partitioning contract.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use derec_library::protocol::events::DeRecEvent;
 use derec_library::protocol::types::{Target, UserSecret};
@@ -46,10 +29,6 @@ pub async fn run() {
     let carol_db = Database::open_in_memory();
     let dave_db = Database::open_in_memory();
 
-    // Same physical DB → same physical user. Two protocols, one per
-    // secret — that's the architecture (one DeRecProtocol = one
-    // secret). Distinct cids per secret keep the per-secret assertions
-    // unambiguous when the same DB hosts both partitions.
     let mut user_wallet = Peer::with_secret_id(
         user_db.connection(),
         "User-Wallet",
@@ -63,7 +42,6 @@ pub async fn run() {
         EMAIL_SECRET_ID,
     );
 
-    // Wallet helpers (Alice + Bob), bound to WALLET_SECRET_ID.
     let mut alice = Peer::with_secret_id(
         alice_db.connection(),
         "Alice",
@@ -77,7 +55,6 @@ pub async fn run() {
         WALLET_SECRET_ID,
     );
 
-    // Email helpers (Carol + Dave), bound to EMAIL_SECRET_ID.
     let mut carol = Peer::with_secret_id(
         carol_db.connection(),
         "Carol",
@@ -91,7 +68,6 @@ pub async fn run() {
         EMAIL_SECRET_ID,
     );
 
-    // ── Pair each secret with its dedicated helpers ───────────────
     let wallet_alice = pair_owner_helper(&mut user_wallet, &mut alice, ChannelId(10)).await;
     let wallet_bob = pair_owner_helper(&mut user_wallet, &mut bob, ChannelId(20)).await;
     let email_carol = pair_owner_helper(&mut user_email, &mut carol, ChannelId(30)).await;
@@ -101,13 +77,10 @@ pub async fn run() {
         wallet_alice.0, wallet_bob.0, email_carol.0, email_dave.0
     );
 
-    // Both secrets coexist on the same `channels` table under
-    // distinct `secret_id` partitions.
     assert_eq!(count_channels(&user_db.connection(), WALLET_SECRET_ID), 2);
     assert_eq!(count_channels(&user_db.connection(), EMAIL_SECRET_ID), 2);
     println!("  user DB: 2 channels per secret, partitioned by secret_id  ✓");
 
-    // ── Publish into each secret ──────────────────────────────────
     let wallet_payload = b"correct horse battery staple".to_vec();
     let email_payload = b"hunter2-but-much-longer".to_vec();
     protect_secret(
@@ -144,8 +117,6 @@ pub async fn run() {
         "  publish: each secret has 1 user_secrets row + 2 owner-side shares; helpers each hold 1  ✓"
     );
 
-    // Helpers only ever see their own secret — sanity-check the wallet
-    // helpers never received an email-secret share row, and vice versa.
     assert_eq!(
         count_shares(&alice_db.connection(), EMAIL_SECRET_ID),
         0,
@@ -158,11 +129,6 @@ pub async fn run() {
     );
     println!("  helpers see only their own secret's shares  ✓");
 
-    // ── Simulate state loss + recovery on the wallet secret only ──
-    // Clearing user_secret_store + dropping the owner-side channels
-    // for WALLET_SECRET_ID. Email secret state stays intact — the
-    // assertions below prove the email lifecycle survives the wallet
-    // recovery.
     user_wallet
         .protocol
         .user_secret_store
@@ -172,10 +138,6 @@ pub async fn run() {
 
     let wallet_recovery_alice = ChannelId(110);
     let wallet_recovery_bob = ChannelId(120);
-    // Capture the rotated long-term id per recovery pair so downstream
-    // link graph + Discovery targets use the id that actually resolves
-    // in the stores (channel-id rekey rotates the transient contact id
-    // at PairingCompleted).
     let mut rekeyed_wallet_recovery: [(ChannelId, ChannelId); 2] =
         [(ChannelId(0), ChannelId(0)); 2];
     for (idx, (helper, fresh_cid, label)) in [
@@ -221,9 +183,6 @@ pub async fn run() {
     let wallet_recovery_alice = rekeyed_wallet_recovery[0].1;
     let wallet_recovery_bob = rekeyed_wallet_recovery[1].1;
 
-    // Each wallet helper links original ↔ recovery channel so
-    // discovery walks the connected component and finds the share
-    // stored under the original cid.
     alice
         .protocol
         .channel_store
@@ -235,7 +194,6 @@ pub async fn run() {
         .link_channel(WALLET_SECRET_ID, wallet_bob, wallet_recovery_bob)
         .await
         .unwrap();
-    // Owner drops the originals so recovery does not double-fan-out.
     user_wallet
         .protocol
         .channel_store
@@ -250,7 +208,6 @@ pub async fn run() {
         .unwrap();
     println!("  wallet secret: re-paired on fresh channels, originals dropped  ✓");
 
-    // Discovery + Recovery on the wallet secret.
     user_wallet
         .protocol
         .start(DeRecFlow::Discovery {
@@ -305,10 +262,6 @@ pub async fn run() {
     );
     println!("  wallet secret recovered the wallet UserSecret (and only that)  ✓");
 
-    // Email secret is untouched — its user_secret_store still holds
-    // the snapshot, its channels are still in the DB, and its
-    // helpers can still serve a recovery on the original channels
-    // without a re-pair.
     assert_eq!(
         count_user_secrets(&user_db.connection(), EMAIL_SECRET_ID),
         1,
@@ -320,7 +273,6 @@ pub async fn run() {
         "email secret's channels must survive the wallet recovery"
     );
 
-    // ── Independent Discovery + Recovery on the email secret ──────
     user_email
         .protocol
         .start(DeRecFlow::Discovery {
@@ -377,4 +329,3 @@ pub async fn run() {
 
     println!("✓ Multi-secret flow passed.\n");
 }
-

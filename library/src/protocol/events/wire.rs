@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 //! Wire-shape mirror of [`super::DeRecEvent`] shared by the FFI and
 //! WASM bridges. Internal — bridges import these types to drive

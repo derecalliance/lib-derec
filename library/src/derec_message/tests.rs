@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
+
 use super::*;
 use crate::{
     derec_message::DeRecMessageBuilder, protocol_version::ProtocolVersion, types::ChannelId,
@@ -298,9 +301,6 @@ fn test_auto_trace_id_produces_non_zero_value() {
         .build()
         .expect("build should succeed");
 
-    // The probability of `rand::rng().next_u64()` rolling exactly zero is
-    // 2^-64; the test would have to be re-rolled on the order of the heat
-    // death of the universe to legitimately observe it.
     assert_ne!(envelope.trace_id, 0);
 }
 

@@ -1,6 +1,5 @@
-//! `DeRecChannelStore` over SQLite — persists `Channel` records as
-//! serde-JSON blobs in the `channels` table and the undirected
-//! channel-link graph in `channel_links`.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use derec_library::protocol::{ChannelStoreFuture, DeRecChannelStore};
 use derec_library::protocol::types::Channel;
@@ -63,8 +62,6 @@ impl DeRecChannelStore for SqliteChannelStore {
                 rusqlite::params![u64_to_sql(secret_id), u64_to_sql(channel_id.0)],
             )
             .expect("channel remove failed");
-        // Drop the per-channel link rows too — a channel that no
-        // longer exists must not stay reachable through the graph.
         conn.execute(
             "DELETE FROM channel_links WHERE secret_id = ?1 AND (a = ?2 OR b = ?2)",
             rusqlite::params![u64_to_sql(secret_id), u64_to_sql(channel_id.0)],
@@ -100,7 +97,6 @@ impl DeRecChannelStore for SqliteChannelStore {
     ) -> ChannelStoreFuture<'_, ()> {
         if a.0 != b.0 {
             let conn = lock(&self.connection);
-            // Two rows so a lookup from either side hits the index.
             conn.execute(
                 "INSERT OR IGNORE INTO channel_links (secret_id, a, b) VALUES (?1, ?2, ?3)",
                 rusqlite::params![u64_to_sql(secret_id), u64_to_sql(a.0), u64_to_sql(b.0)],
@@ -121,9 +117,6 @@ impl DeRecChannelStore for SqliteChannelStore {
         channel_id: ChannelId,
     ) -> ChannelStoreFuture<'_, Vec<ChannelId>> {
         let conn = lock(&self.connection);
-        // BFS over the link graph for `secret_id`. The starting
-        // channel is part of its own component even if no links
-        // exist, per the trait contract.
         let mut visited: HashSet<u64> = HashSet::new();
         let mut queue: VecDeque<u64> = VecDeque::new();
         queue.push_back(channel_id.0);

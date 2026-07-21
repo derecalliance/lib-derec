@@ -1,10 +1,5 @@
-//! Primitive-level smoke tests for the current `derec_library::primitives` API.
-//!
-//! Exercises each flow's `produce` / `extract` / `process` round-trip directly
-//! (no `DeRecProtocol` orchestrator). Signatures here track the post-refactor
-//! API: numeric `secret_id: u64`, `version: u32`, pairing responses via
-//! `response::produce`, and recovery driven by re-using the Helper's stored
-//! `StoreShareRequestMessage`.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use derec_library::primitives::discovery::{
     request as disc_request,
@@ -50,7 +45,6 @@ fn run_pairing_flow_test() {
 
     let channel_id = ChannelId(1);
 
-    // Initiator creates an out-of-band contact.
     let contact_result = pair_request::create_contact(
         channel_id,
         derec_proto::ContactMode::InlineKeys,
@@ -74,8 +68,6 @@ fn run_pairing_flow_test() {
     assert_eq!(transport.uri, "https://example.com/alice");
     assert_eq!(transport.protocol(), Protocol::Https);
 
-    // Responder produces a pairing request from the contact. The current API
-    // takes an optional `CommunicationInfo` as the final argument.
     let pair_req = pair_request::produce(
         SenderKind::Helper,
         TransportProtocol {
@@ -101,12 +93,10 @@ fn run_pairing_flow_test() {
     assert_eq!(initiator_tp.uri, "https://example.com/alice");
     assert_eq!(initiator_tp.protocol(), Protocol::Https);
 
-    // Initiator extracts the request using its ECIES secret key.
     let extracted_request =
         pair_request::extract(&pair_req.envelope, contact_result.secret_key.as_ref().unwrap().ecies_secret_key())
             .expect("pair_request::extract failed");
 
-    // Initiator produces the pairing response and derives its shared key.
     let pair_resp = pair_response::produce(
         channel_id,
         &extracted_request.request,
@@ -124,7 +114,6 @@ fn run_pairing_flow_test() {
         "initiator shared key must not be empty"
     );
 
-    // Responder extracts and processes the response, deriving its shared key.
     let extracted_response =
         pair_response::extract(&pair_resp.envelope, pair_req.secret_key.ecies_secret_key())
             .expect("pair_response::extract failed");
@@ -161,10 +150,6 @@ fn run_pairing_flow_hashed_keys_test() {
 
     let channel_id = ChannelId(2);
 
-    // Alice creates a HASHED_KEYS contact. The contact carries only a
-    // SHA-384 commitment to her public keys, not the keys themselves —
-    // it is small enough for a QR code, and Bob will fetch the keys
-    // over the wire via the PrePair leg.
     let alice_contact_result = pair_request::create_contact(
         channel_id,
         derec_proto::ContactMode::HashedKeys,
@@ -200,10 +185,6 @@ fn run_pairing_flow_hashed_keys_test() {
         "contact_binding_hash must be a SHA-384 digest (48 bytes)"
     );
 
-
-    // Bob (the scanner) sends a PrePair request asking for the actual keys.
-    // The envelope is plaintext (no shared key exists yet) and routes to
-    // the channel_id from the contact.
     let bob_prepair_req = pair_request::produce_pre_pair_request(
         TransportProtocol {
             uri: "https://example.com/helper/ephemeral".to_owned(),
@@ -213,7 +194,6 @@ fn run_pairing_flow_hashed_keys_test() {
     )
     .expect("pair_request::produce_pre_pair_request failed");
 
-    // Alice decodes the inbound plaintext request.
     let extracted_prepair_req = pair_request::extract_pre_pair(&bob_prepair_req.envelope)
         .expect("pair_request::extract_pre_pair failed");
     assert_eq!(
@@ -221,7 +201,6 @@ fn run_pairing_flow_hashed_keys_test() {
         "PrePair request must echo the contact's nonce"
     );
 
-    // Alice publishes the public keys back to Bob (plaintext envelope).
     let alice_prepair_resp = pair_response::produce_pre_pair(
         channel_id,
         &extracted_prepair_req.request,
@@ -229,13 +208,9 @@ fn run_pairing_flow_hashed_keys_test() {
     )
     .expect("pair_response::produce_pre_pair failed");
 
-    // Bob decodes the inbound plaintext response.
     let extracted_prepair_resp = pair_response::extract_pre_pair(&alice_prepair_resp.envelope)
         .expect("pair_response::extract_pre_pair failed");
 
-    // Bob recomputes the SHA-384 binding hash and validates it against the
-    // commitment from the original contact. Any tampering on the plaintext
-    // PrePair leg surfaces here.
     let processed_prepair = pair_response::process_pre_pair(
         &alice_contact,
         &extracted_prepair_resp.response,
@@ -252,17 +227,6 @@ fn run_pairing_flow_hashed_keys_test() {
     );
     assert_eq!(processed_prepair.nonce, alice_contact.nonce);
 
-    // Bob synthesizes a "filled-in" contact by copying the validated keys
-    // into a clone of the original (HASHED_KEYS) contact. From here on the
-    // flow is identical to the INLINE_KEYS path — `pair_request::produce`
-    // and the rest of the chain do not need to know PrePair happened.
-
-    // Synthesize a "filled-in" contact for the downstream PairRequest flow.
-    // After PrePair, the contact is logically `InlineKeys` — keys are
-    // present locally — so normalize the shape: drop the binding hash and
-    // flip the mode. `pair_request::produce` enforces the InlineKeys
-    // invariant via `validate_contact_for_mode`, which rejects any contact
-    // that still claims `HashedKeys`.
     let mut filled_in_contact = alice_contact.clone();
     filled_in_contact.mlkem_encapsulation_key =
         Some(processed_prepair.mlkem_encapsulation_key.clone());
@@ -496,7 +460,6 @@ fn run_verification_flow_test() {
         .expect("verif_response::process failed (valid case)");
     assert!(valid, "expected a valid verification response");
 
-    // The same proof must not validate against a different share.
     let resp_produced_2 =
         verif_response::produce(channel_1, &req_result.request, shared_key_1, &share_bytes_1)
             .expect("second verif_response::produce failed");
@@ -540,8 +503,6 @@ fn run_recovery_flow_test() {
         .get(&channel_2)
         .expect("missing shared key for channel 2");
 
-    // Reproduce what a Helper persists during sharing: the decrypted
-    // `StoreShareRequestMessage`.
     let stored_request_1 = share_request::extract(
         &share_request::produce(
             channel_1,
@@ -580,7 +541,6 @@ fn run_recovery_flow_test() {
     .expect("share_request::extract failed for channel 2")
     .request;
 
-    // Channel 1 recovery round-trip.
     let share_req_1 = rec_request::produce(channel_1, secret_id, version, shared_key_1, None)
         .expect("rec_request::produce failed for channel 1");
     let get_request_1 = rec_request::extract(&share_req_1.envelope, shared_key_1)
@@ -597,7 +557,6 @@ fn run_recovery_flow_test() {
         .expect("rec_response::extract failed for channel 1")
         .response;
 
-    // Channel 2 recovery round-trip.
     let share_req_2 = rec_request::produce(channel_2, secret_id, version, shared_key_2, None)
         .expect("rec_request::produce failed for channel 2");
     let get_request_2 = rec_request::extract(&share_req_2.envelope, shared_key_2)
@@ -684,9 +643,6 @@ fn run_envelope_trace_id_test() {
     let channel_id = ChannelId(42);
     let shared_key = [9u8; 32];
 
-    // Primitive `produce` emits envelopes with trace_id = 0 (the protobuf
-    // default). Consumers driving the protocol through primitives use
-    // `apply_trace_id` to stamp a correlation token.
     let result = disc_request::produce(channel_id, &shared_key, None)
         .expect("disc_request::produce failed");
 
@@ -703,7 +659,6 @@ fn run_envelope_trace_id_test() {
         "trace_id must round-trip through apply + read"
     );
 
-    // The encrypted inner payload is untouched — extract still succeeds.
     let extracted = disc_request::extract(&stamped, &shared_key)
         .expect("extract on re-stamped envelope failed");
     assert!(extracted.request.timestamp.is_some());
@@ -733,7 +688,6 @@ fn run_request_reply_to_test() {
         "reply_to must round-trip on the inner request"
     );
 
-    // Without it, the field is absent — the default behavior.
     let plain = disc_request::produce(channel_id, &shared_key, None)
         .expect("disc_request::produce (no reply_to) failed");
     let plain_extracted = disc_request::extract(&plain.envelope, &shared_key)

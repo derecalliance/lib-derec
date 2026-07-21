@@ -20,6 +20,7 @@ Alliance**.
 
 - [What is DeRec?](#what-is-derec)
 - [Installation](#installation)
+- [Cargo features](#cargo-features)
 - [Two API layers](#two-api-layers)
 - [Quick start (Protocol layer)](#quick-start-protocol-layer)
 - [Builder configuration](#builder-configuration)
@@ -84,6 +85,28 @@ cargo add derec-library
 ```
 
 The badge above shows the latest published version.
+
+---
+
+## Cargo features
+
+Every feature is **off by default** — a default build compiles no serde, no
+FFI layer, and no logging, so a pure-Rust consumer pays for none of them.
+
+| Feature | Enables |
+| --- | --- |
+| `serde` | `serde::Serialize` / `Deserialize` on the public store and channel types (`SecretValue`, `PairingKeyMaterial`, `Channel`, `ChannelStatus`, `TransportProtocol`), so a store implementation can persist them with any serde format. Without it, use the byte-level accessors (e.g. `PairingKeyMaterial::as_bytes` / `from_bytes`) or your own codec. Also pulls the matching `derec-proto/serde`. The serde wire format is not part of the public API and may change. |
+| `logging` | `tracing` spans and events across the protocol and primitives layers. Adds no overhead when no subscriber is installed. |
+| `ffi` | The native C-ABI bridge for host languages that link the shared library. Implies `serde` + `serde_json`. Pure-Rust consumers do not need this. |
+| `unsafe-http` | **Development only.** Lets `TransportProtocol::validate` accept plaintext `http://` endpoints. Production builds MUST leave this off — enabling it also lets a peer-supplied `replyTo` downgrade the reply path to plaintext. |
+
+```toml
+[dependencies]
+derec-library = { version = "*", features = ["serde"] }
+```
+
+The `wasm32` target pulls serde in automatically, so WebAssembly builds need
+no extra feature flags.
 
 ---
 
@@ -1181,4 +1204,4 @@ requests to discuss improvements.
 ## DeRec Alliance
 
 The DeRec Alliance is an open initiative focused on standards for
-decentralized secret recovery. <https://derecalliance.org>
+decentralized secret recovery. <https://derec.org>

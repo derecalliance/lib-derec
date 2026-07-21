@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
@@ -256,10 +257,10 @@ pub fn extract(
 /// # Arguments
 ///
 /// * `request` — The [`derec_proto::VerifyShareRequestMessage`] originally
-///   produced by [`super::super::request::produce`]. Carries the
+///   produced by [`crate::primitives::verification::request::produce`]. Carries the
 ///   authoritative `(nonce, secret_id, version)` the response is expected
 ///   to echo. The owner is expected to retain this — see
-///   [`super::super::request::ProduceResult::nonce`] for the wiring.
+///   [`crate::primitives::verification::request::ProduceResult::nonce`] for the wiring.
 /// * `response` — The decrypted [`derec_proto::VerifyShareResponseMessage`]
 ///   previously returned by [`extract`].
 /// * `share_content` — The expected share bytes. The digest is recomputed

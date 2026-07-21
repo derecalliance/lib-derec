@@ -1,23 +1,5 @@
-//! Replica-sync version-progression flow over Postgres.
-//!
-//! Walks the canonical 0→8 sequence:
-//!
-//! ```text
-//! 0. new()                                          → user_secret_store empty
-//! 1. pair replica A                                 → v=1, replicas=1
-//! 2. ProtectSecret([s1])                            → v=2, secrets=1
-//! 3. pair replica B (bootstrap)                     → v=3, replicas=2
-//! 4. pair helper #1 (below threshold)               → v=4, helpers=1
-//! 5. pair helper #2 (below threshold)               → v=5, helpers=2
-//! 6. ProtectSecret([s1, s2])                        → v=6, secrets=2
-//! 7. pair helper #3 (threshold met, VSS split)      → v=7, helpers=3 + shares
-//! 8. pair replica C (full bootstrap + fresh shares) → v=8, replicas=3 + shares
-//! ```
-//!
-//! Each peer owns its own in-memory Postgres database — one device =
-//! one DB, as in the other flows. Replicas and helpers all bind their
-//! protocols to the same `secret_id` as the owner, so the assertions
-//! can read the per-secret state directly.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use derec_library::protocol::events::DeRecEvent;
 use derec_library::protocol::types::{Secret, UserSecret};
@@ -123,7 +105,27 @@ pub async fn run() {
     let cid_h2 = ChannelId(12);
     let cid_h3 = ChannelId(13);
 
-    // ── Step 0: brand-new instance ────────────────────────────────
+    let mut rekeyed: std::collections::HashMap<ChannelId, ChannelId> =
+        std::collections::HashMap::new();
+    let capture_rekey =
+        |rekeyed: &mut std::collections::HashMap<ChannelId, ChannelId>, events: &[DeRecEvent]| {
+            for ev in events {
+                if let DeRecEvent::PairingCompleted {
+                    channel_id,
+                    pairing_channel_id,
+                    ..
+                } = ev
+                {
+                    rekeyed.insert(*pairing_channel_id, *channel_id);
+                }
+            }
+        };
+    let rk = |rekeyed: &std::collections::HashMap<ChannelId, ChannelId>, cid: ChannelId| {
+        *rekeyed
+            .get(&cid)
+            .unwrap_or_else(|| panic!("no rekeyed id for transient {cid:?}"))
+    };
+
     assert!(
         owner
             .protocol
@@ -136,12 +138,13 @@ pub async fn run() {
     );
     println!("  step 0: user_secret_store latest = None  ✓");
 
-    // ── Step 1: pair replica A → v=1 ──────────────────────────────
-    pair_replica_handshake(&mut owner, &mut replica_a, cid_a).await;
-    cross_confirm_fingerprint(&mut owner, &mut replica_a, cid_a).await;
+    let rek_a = pair_replica_handshake(&mut owner, &mut replica_a, cid_a).await;
+    rekeyed.insert(cid_a, rek_a);
+    cross_confirm_fingerprint(&mut owner, &mut replica_a, rk(&rekeyed, cid_a)).await;
     let events =
         pump_many(&mut [&mut owner, &mut replica_a, &mut replica_b, &mut replica_c]).await;
-    let received_a = find_replica_event(&events, cid_a)
+    capture_rekey(&mut rekeyed, &events);
+    let received_a = find_replica_event(&events, rk(&rekeyed, cid_a))
         .expect("step 1: replica A must observe ReplicaSecretReceived");
     assert_eq!(received_a.version, 1);
     assert_eq!(received_a.secret.helpers.len(), 0);
@@ -151,7 +154,6 @@ pub async fn run() {
     assert_eq!(latest_version(&owner).await, Some(1));
     println!("  step 1: pair replica A → v=1, secret(h=0,s=0,r=1,shares=0)  ✓");
 
-    // ── Step 2: ProtectSecret([s1]) → v=2 ─────────────────────────
     let s1 = UserSecret {
         id: vec![0x01],
         name: "secret-one".to_owned(),
@@ -167,7 +169,8 @@ pub async fn run() {
         .unwrap();
     let events =
         pump_many(&mut [&mut owner, &mut replica_a, &mut replica_b, &mut replica_c]).await;
-    let received_a = find_replica_event(&events, cid_a).expect("step 2: A must see v=2");
+    capture_rekey(&mut rekeyed, &events);
+    let received_a = find_replica_event(&events, rk(&rekeyed, cid_a)).expect("step 2: A must see v=2");
     assert_eq!(received_a.version, 2);
     assert_eq!(received_a.secret.helpers.len(), 0);
     assert_eq!(received_a.secret.secrets.len(), 1);
@@ -177,14 +180,15 @@ pub async fn run() {
     assert_eq!(latest_version(&owner).await, Some(2));
     println!("  step 2: ProtectSecret([s1]) → v=2, secret(h=0,s=1,r=1,shares=0)  ✓");
 
-    // ── Step 3: pair replica B → v=3, B bootstraps with s1 ────────
-    pair_replica_handshake(&mut owner, &mut replica_b, cid_b).await;
-    cross_confirm_fingerprint(&mut owner, &mut replica_b, cid_b).await;
+    let rek_b = pair_replica_handshake(&mut owner, &mut replica_b, cid_b).await;
+    rekeyed.insert(cid_b, rek_b);
+    cross_confirm_fingerprint(&mut owner, &mut replica_b, rk(&rekeyed, cid_b)).await;
     let events =
         pump_many(&mut [&mut owner, &mut replica_a, &mut replica_b, &mut replica_c]).await;
-    let received_a = find_replica_event(&events, cid_a).expect("step 3: A must see v=3");
+    capture_rekey(&mut rekeyed, &events);
+    let received_a = find_replica_event(&events, rk(&rekeyed, cid_a)).expect("step 3: A must see v=3");
     let received_b =
-        find_replica_event(&events, cid_b).expect("step 3: B must see v=3 (bootstrap)");
+        find_replica_event(&events, rk(&rekeyed, cid_b)).expect("step 3: B must see v=3 (bootstrap)");
     for (label, received) in [("A", &received_a), ("B", &received_b)] {
         assert_eq!(received.version, 3);
         assert_eq!(received.secret.helpers.len(), 0);
@@ -196,7 +200,6 @@ pub async fn run() {
     assert_eq!(latest_version(&owner).await, Some(3));
     println!("  step 3: pair replica B → v=3, secret(h=0,s=1,r=2,shares=0) on A+B  ✓");
 
-    // ── Step 4: pair helper #1 → v=4 (below threshold) ────────────
     helper_start_pair(&mut owner, &mut helper_1, cid_h1).await;
     let events = pump_many(&mut [
         &mut owner,
@@ -208,6 +211,7 @@ pub async fn run() {
         &mut helper_3,
     ])
     .await;
+    capture_rekey(&mut rekeyed, &events);
     assert!(
         !events
             .iter()
@@ -215,7 +219,7 @@ pub async fn run() {
         "step 4: no helper may store a share (1 < threshold 3)"
     );
     for (label, cid) in [("A", cid_a), ("B", cid_b)] {
-        let received = find_replica_event(&events, cid)
+        let received = find_replica_event(&events, rk(&rekeyed, cid))
             .unwrap_or_else(|| panic!("step 4: replica {label} must observe v=4"));
         assert_eq!(received.version, 4);
         assert_eq!(received.secret.helpers.len(), 1);
@@ -226,7 +230,6 @@ pub async fn run() {
     assert_eq!(latest_version(&owner).await, Some(4));
     println!("  step 4: pair helper #1 → v=4, secret(h=1,s=1,r=2,shares=0)  ✓");
 
-    // ── Step 5: pair helper #2 → v=5 ──────────────────────────────
     helper_start_pair(&mut owner, &mut helper_2, cid_h2).await;
     let events = pump_many(&mut [
         &mut owner,
@@ -238,21 +241,21 @@ pub async fn run() {
         &mut helper_3,
     ])
     .await;
+    capture_rekey(&mut rekeyed, &events);
     assert!(
         !events
             .iter()
             .any(|e| matches!(e, DeRecEvent::ShareStored { .. })),
         "step 5: still below threshold"
     );
-    let received_b = find_replica_event(&events, cid_b).expect("step 5: B must observe v=5");
+    let received_b = find_replica_event(&events, rk(&rekeyed, cid_b)).expect("step 5: B must observe v=5");
     assert_eq!(received_b.version, 5);
     assert_eq!(received_b.secret.helpers.len(), 2);
     assert_eq!(received_b.shares.len(), 0);
-    let _ = find_replica_event(&events, cid_a).expect("step 5: A must observe v=5");
+    let _ = find_replica_event(&events, rk(&rekeyed, cid_a)).expect("step 5: A must observe v=5");
     assert_eq!(latest_version(&owner).await, Some(5));
     println!("  step 5: pair helper #2 → v=5, secret(h=2,s=1,r=2,shares=0)  ✓");
 
-    // ── Step 6: ProtectSecret([s1, s2]) → v=6 ─────────────────────
     let s2 = UserSecret {
         id: vec![0x02],
         name: "secret-two".to_owned(),
@@ -276,24 +279,24 @@ pub async fn run() {
         &mut helper_3,
     ])
     .await;
+    capture_rekey(&mut rekeyed, &events);
     assert!(
         !events
             .iter()
             .any(|e| matches!(e, DeRecEvent::ShareStored { .. })),
         "step 6: still below threshold"
     );
-    let received_a = find_replica_event(&events, cid_a).expect("step 6: A must see v=6");
+    let received_a = find_replica_event(&events, rk(&rekeyed, cid_a)).expect("step 6: A must see v=6");
     assert_eq!(received_a.version, 6);
     assert_eq!(received_a.secret.secrets.len(), 2);
     assert!(received_a.secret.secrets.iter().any(|us| us.data == s1.data));
     assert!(received_a.secret.secrets.iter().any(|us| us.data == s2.data));
     assert_eq!(received_a.secret.helpers.len(), 2);
     assert_eq!(received_a.shares.len(), 0);
-    let _ = find_replica_event(&events, cid_b).expect("step 6: B must see v=6");
+    let _ = find_replica_event(&events, rk(&rekeyed, cid_b)).expect("step 6: B must see v=6");
     assert_eq!(latest_version(&owner).await, Some(6));
     println!("  step 6: ProtectSecret([s1, s2]) → v=6, secret(h=2,s=2,r=2,shares=0)  ✓");
 
-    // ── Step 7: pair helper #3 → v=7, threshold met, VSS split ────
     helper_start_pair(&mut owner, &mut helper_3, cid_h3).await;
     let events = pump_many(&mut [
         &mut owner,
@@ -305,17 +308,19 @@ pub async fn run() {
         &mut helper_3,
     ])
     .await;
+    capture_rekey(&mut rekeyed, &events);
     for (label, cid) in [("helper-1", cid_h1), ("helper-2", cid_h2), ("helper-3", cid_h3)] {
+        let expected = rk(&rekeyed, cid);
         assert!(
             events.iter().any(|e| matches!(
                 e,
-                DeRecEvent::ShareStored { channel_id, version: 7, .. } if *channel_id == cid
+                DeRecEvent::ShareStored { channel_id, version: 7, .. } if *channel_id == expected
             )),
             "step 7: {label} must emit ShareStored at v=7"
         );
     }
     for (label, cid) in [("A", cid_a), ("B", cid_b)] {
-        let received = find_replica_event(&events, cid)
+        let received = find_replica_event(&events, rk(&rekeyed, cid))
             .unwrap_or_else(|| panic!("step 7: replica {label} must observe v=7"));
         assert_eq!(received.version, 7);
         assert_eq!(received.secret.helpers.len(), 3);
@@ -326,9 +331,9 @@ pub async fn run() {
     assert_eq!(latest_version(&owner).await, Some(7));
     println!("  step 7: pair helper #3 → v=7, secret(h=3,s=2,r=2,shares=3); all 3 helpers ShareStored  ✓");
 
-    // ── Step 8: pair replica C → v=8, full bootstrap + fresh VSS ──
-    pair_replica_handshake(&mut owner, &mut replica_c, cid_c).await;
-    cross_confirm_fingerprint(&mut owner, &mut replica_c, cid_c).await;
+    let rek_c = pair_replica_handshake(&mut owner, &mut replica_c, cid_c).await;
+    rekeyed.insert(cid_c, rek_c);
+    cross_confirm_fingerprint(&mut owner, &mut replica_c, rk(&rekeyed, cid_c)).await;
     let events = pump_many(&mut [
         &mut owner,
         &mut replica_a,
@@ -339,23 +344,25 @@ pub async fn run() {
         &mut helper_3,
     ])
     .await;
+    capture_rekey(&mut rekeyed, &events);
     for (label, cid) in [("helper-1", cid_h1), ("helper-2", cid_h2), ("helper-3", cid_h3)] {
+        let expected = rk(&rekeyed, cid);
         assert!(
             events.iter().any(|e| matches!(
                 e,
-                DeRecEvent::ShareStored { channel_id, version: 8, .. } if *channel_id == cid
+                DeRecEvent::ShareStored { channel_id, version: 8, .. } if *channel_id == expected
             )),
             "step 8: {label} must emit ShareStored at v=8"
         );
     }
-    let received_c = find_replica_event(&events, cid_c).expect("step 8: C must observe v=8");
+    let received_c = find_replica_event(&events, rk(&rekeyed, cid_c)).expect("step 8: C must observe v=8");
     assert_eq!(received_c.version, 8);
     assert_eq!(received_c.secret.helpers.len(), 3);
     assert_eq!(received_c.secret.secrets.len(), 2);
     assert_eq!(received_c.secret.replicas.as_ref().unwrap().replicas.len(), 3);
     assert_eq!(received_c.shares.len(), 3);
     for (label, cid) in [("A", cid_a), ("B", cid_b)] {
-        let received = find_replica_event(&events, cid)
+        let received = find_replica_event(&events, rk(&rekeyed, cid))
             .unwrap_or_else(|| panic!("step 8: replica {label} must observe v=8"));
         assert_eq!(received.version, 8);
         assert_eq!(received.secret.replicas.as_ref().unwrap().replicas.len(), 3);
@@ -382,7 +389,7 @@ async fn pair_replica_handshake(
     owner: &mut Peer,
     replica: &mut Peer,
     channel_id: ChannelId,
-) {
+) -> ChannelId {
     let contact = owner
         .protocol
         .create_contact(Some(channel_id), derec_proto::ContactMode::InlineKeys, None)
@@ -397,7 +404,20 @@ async fn pair_replica_handshake(
         })
         .await
         .expect("replica start(Pairing) failed");
-    let _ = pump_many(&mut [owner, replica]).await;
+    let events = pump_many(&mut [owner, replica]).await;
+    events
+        .iter()
+        .find_map(|e| match e {
+            DeRecEvent::PairingCompleted {
+                channel_id: rekeyed,
+                pairing_channel_id,
+                ..
+            } if *pairing_channel_id == channel_id => Some(*rekeyed),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!("pair_replica_handshake: missing PairingCompleted for transient {channel_id:?}")
+        })
 }
 
 async fn cross_confirm_fingerprint(

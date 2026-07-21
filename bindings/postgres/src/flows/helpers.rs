@@ -1,6 +1,5 @@
-//! Shared per-flow helpers: pair handshake driver, ProtectSecret
-//! pump, etc. Keep these protocol-agnostic — they manipulate `Peer`s
-//! and drive the network, never the Postgres schema directly.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use derec_library::protocol::events::DeRecEvent;
 use derec_library::protocol::types::UserSecret;
@@ -73,4 +72,3 @@ pub async fn protect_secret(
     }
     pump_many(&mut all).await
 }
-

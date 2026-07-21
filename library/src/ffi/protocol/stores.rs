@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 //! Managed-callback adapters that satisfy the four core protocol traits
 //! ([`DeRecChannelStore`], [`DeRecSecretStore`], [`DeRecShareStore`],
@@ -123,8 +124,8 @@ impl ShareRecord {
 /// JSON-on-the-wire shape of [`SecretValue`]. `kind` matches
 /// [`SecretKind`]:
 /// - `0` = SharedKey — `bytes` is the 32-byte symmetric key
-/// - `1` = PairingSecret — `bytes` is the ark-serialize encoding of
-///   [`PairingSecretKeyMaterial`]
+/// - `1` = PairingSecret — `bytes` is the opaque
+///   [`PairingKeyMaterial`](crate::protocol::PairingKeyMaterial) blob
 /// - `2` = PairingContact — `bytes` is the prost-encoded
 ///   [`derec_proto::ContactMessage`]
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -142,14 +143,10 @@ impl TryFrom<&SecretValue> for SecretValueRecord {
                 kind: 0,
                 bytes: k.to_vec(),
             }),
-            SecretValue::PairingSecret(sk) => {
-                use ark_serialize::CanonicalSerialize as _;
-                let mut buf = Vec::new();
-                sk.serialize_compressed(&mut buf).map_err(|e| {
-                    format!("failed to serialize PairingSecretKeyMaterial: {e}")
-                })?;
-                Ok(Self { kind: 1, bytes: buf })
-            }
+            SecretValue::PairingSecret(sk) => Ok(Self {
+                kind: 1,
+                bytes: sk.as_bytes().to_vec(),
+            }),
             SecretValue::PairingContact(c) => Ok(Self {
                 kind: 2,
                 bytes: c.encode_to_vec(),
@@ -168,14 +165,9 @@ impl SecretValueRecord {
                     .map_err(|_| "SharedKey payload must be 32 bytes".to_string())?;
                 Ok(SecretValue::SharedKey(arr))
             }
-            1 => {
-                use ark_serialize::CanonicalDeserialize as _;
-                let sk = derec_cryptography::pairing::PairingSecretKeyMaterial::deserialize_compressed(
-                    self.bytes.as_slice(),
-                )
-                .map_err(|e| format!("failed to deserialize PairingSecretKeyMaterial: {e}"))?;
-                Ok(SecretValue::PairingSecret(sk))
-            }
+            1 => Ok(SecretValue::PairingSecret(
+                crate::protocol::PairingKeyMaterial::from_bytes(self.bytes),
+            )),
             2 => {
                 let cm = derec_proto::ContactMessage::decode(self.bytes.as_slice())
                     .map_err(|e| format!("failed to decode ContactMessage: {e}"))?;

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 //! JSON encoder for [`DeRecEvent`] streams emitted by the orchestrator
 //! across the FFI boundary. The wire shape lives in

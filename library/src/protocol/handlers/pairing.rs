@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use super::super::{
-    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecTransport, PendingAction, SecretKind,
-    SecretValue, now_secs,
+    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecTransport, PairingKeyMaterial,
+    PendingAction, SecretKind, SecretValue, now_secs,
 };
 use crate::{
     Error, Result,
@@ -63,13 +64,7 @@ pub(in crate::protocol) async fn handle<
                 .await?;
                 return Err(err.into());
             }
-            on_request(
-                channel_id,
-                request,
-                pairing_secret,
-                inbound_trace_id,
-                replica_id,
-            )
+            on_request(channel_id, request, inbound_trace_id, replica_id)
         }
         MessageBody::PairResponse(response) => {
             on_response(
@@ -182,7 +177,6 @@ pub(in crate::protocol) async fn accept<
     secret_id: u64,
     channel_id: ChannelId,
     request: &PairRequestMessage,
-    pairing_secret: &PairingSecretKeyMaterial,
     kind: SenderKind,
     trace_id: u64,
     replica_id: Option<u64>,
@@ -190,11 +184,21 @@ pub(in crate::protocol) async fn accept<
 ) -> Result<Vec<DeRecEvent>> {
     let replica_id_to_inject = require_replica_id_for_kind(kind, replica_id)?;
 
+    let Some(SecretValue::PairingSecret(pairing_secret)) = secret_store
+        .load(secret_id, channel_id, SecretKind::PairingSecret)
+        .await?
+    else {
+        return Err(Error::Invariant(
+            "Pair accept: missing PairingSecret (initiator state lost)",
+        ));
+    };
+    let pairing_secret = pairing_secret.to_secret()?;
+
     let comm_info = build_communication_info(communication_info, replica_id_to_inject);
     let resp = response::produce(
         channel_id,
         request,
-        pairing_secret,
+        &pairing_secret,
         comm_info,
         parameter_range,
     )?;
@@ -335,7 +339,6 @@ pub(in crate::protocol) async fn reject<Ss: DeRecSecretStore, T: DeRecTransport>
 fn on_request(
     channel_id: ChannelId,
     request: &PairRequestMessage,
-    pairing_secret: &PairingSecretKeyMaterial,
     trace_id: u64,
     replica_id: Option<u64>,
 ) -> Result<Vec<DeRecEvent>> {
@@ -350,7 +353,6 @@ fn on_request(
     let action = PendingAction::Pairing {
         channel_id,
         request: request.clone(),
-        pairing_secret: pairing_secret.clone(),
         kind,
         peer_communication_info,
         trace_id,
@@ -550,7 +552,7 @@ pub(in crate::protocol) async fn on_pre_pair_response<
         .save(
             secret_id,
             channel_id,
-            SecretValue::PairingSecret(result.secret_key),
+            SecretValue::PairingSecret(PairingKeyMaterial::from_secret(&result.secret_key)),
         )
         .await?;
     secret_store
@@ -622,7 +624,9 @@ pub(in crate::protocol) async fn accept_pre_pair<Ss: DeRecSecretStore, T: DeRecT
             .save(
                 secret_id,
                 channel_id,
-                SecretValue::PairingSecret(result.pairing_secret_key_material),
+                SecretValue::PairingSecret(PairingKeyMaterial::from_secret(
+                    &result.pairing_secret_key_material,
+                )),
             )
             .await?;
 
@@ -653,6 +657,7 @@ pub(in crate::protocol) async fn accept_pre_pair<Ss: DeRecSecretStore, T: DeRecT
             "PrePair accept: missing PairingSecret (initiator state lost)",
         ));
     };
+    let pairing_secret = pairing_secret.to_secret()?;
 
     let result = response::produce_pre_pair(channel_id, request, &pairing_secret)?;
     let envelope = super::apply_trace_id(result.envelope, trace_id)?;
@@ -769,7 +774,7 @@ async fn start_inlined_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRe
         .save(
             secret_id,
             channel_id,
-            SecretValue::PairingSecret(result.secret_key),
+            SecretValue::PairingSecret(PairingKeyMaterial::from_secret(&result.secret_key)),
         )
         .await?;
     secret_store
@@ -997,10 +1002,10 @@ fn extract_communication_info(
             continue;
         }
         if is_reserved_key(&e.key) {
-            // Future reserved keys land here. For now there is only
-            // `derec.replica_id`, so any other `derec.*` entry is foreign
-            // and silently dropped — same as #43's "library owns the
-            // namespace" stance for ContactMode.
+            // The library owns the `derec.*` namespace. `derec.replica_id`
+            // is the only recognized entry today; any other `derec.*` key
+            // is foreign and silently dropped so peers can't smuggle
+            // application-scoped keys through the reserved prefix.
             continue;
         }
         free_form.insert(e.key.to_owned(), trimmed.to_owned());

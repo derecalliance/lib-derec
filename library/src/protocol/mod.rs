@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 //! Higher-level protocol orchestrator for the DeRec protocol.
 //!
@@ -25,8 +26,9 @@
 //!   paired Helper and ship the full secret to every paired Replica.
 //! - **VerifyShares** — challenge a Helper to prove it still holds a
 //!   specific stored share via a SHA-384 commitment (see
-//!   [`PendingVerification`] for the orchestrator-owned request/response
-//!   binding map).
+//!   [`StateItem::PendingVerification`](crate::protocol::types::StateItem)
+//!   for the orchestrator-owned request/response binding row in the
+//!   state store).
 //! - **Discovery** — ask a Helper which `(secret_id, version)` tuples it
 //!   currently holds for us. Frequently the precursor to `RecoverSecret`
 //!   but useful for routine inventory too.
@@ -66,6 +68,7 @@
 
 pub mod error;
 pub mod events;
+#[cfg(any(feature = "ffi", target_arch = "wasm32"))]
 pub(crate) mod pending_action_wire;
 pub mod reserved_keys;
 pub mod traits;
@@ -92,9 +95,9 @@ pub use traits::{
     TransportFuture,
 };
 pub use types::{
-    Channel, ChannelShare, ChannelStatus, HelperInfo, MissingPolicy, ReplicaInfo,
-    ReplicaSecretPayload, Secret, SecretKind, SecretValue, Share, StateItem, StateKey, StateKind,
-    Target, UserSecret, UserSecrets,
+    Channel, ChannelShare, ChannelStatus, HelperInfo, MissingPolicy, PairingKeyMaterial,
+    ReplicaInfo, ReplicaSecretPayload, Secret, SecretKind, SecretValue, Share, StateItem, StateKey,
+    StateKind, Target, UserSecret, UserSecrets,
 };
 
 
@@ -386,7 +389,7 @@ impl<
                     .save(
                         self.secret_id,
                         channel_id,
-                        SecretValue::PairingSecret(secret_key),
+                        SecretValue::PairingSecret(PairingKeyMaterial::from_secret(&secret_key)),
                     )
                     .await?;
             }
@@ -888,8 +891,7 @@ impl<
 
     /// Rebuild this protocol's `secret_id` namespace from a
     /// [`crate::protocol::types::Secret`] handed up by a
-    /// [`DeRecEvent::SecretRecovered`] event. See
-    /// [`crate::protocol::restore`] for the design rationale.
+    /// [`DeRecEvent::SecretRecovered`] event.
     ///
     /// # Caller flow
     ///
@@ -922,7 +924,7 @@ impl<
     /// # Errors
     ///
     /// Precondition / invariant failures surface as
-    /// [`Error::Restore`](crate::Error::Restore) wrapping one of:
+    /// [`crate::Error::Restore`] wrapping one of:
     ///
     /// - [`RestoreError::AlreadyRestored`] when a user-secret
     ///   snapshot exists for this `secret_id`.
@@ -933,9 +935,8 @@ impl<
     ///   empty `replicas.shared_key`).
     ///
     /// Store I/O failures mid-restore propagate as the underlying
-    /// [`Error::ShareStore`](crate::Error::ShareStore),
-    /// [`Error::ChannelStore`](crate::Error::ChannelStore), or
-    /// [`Error::SecretStore`](crate::Error::SecretStore) variant.
+    /// [`crate::Error::ShareStore`], [`crate::Error::ChannelStore`],
+    /// or [`crate::Error::SecretStore`] variant.
     #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
     pub async fn restore(
         &mut self,
@@ -1212,7 +1213,6 @@ impl<
             PendingAction::Pairing {
                 channel_id,
                 request,
-                pairing_secret,
                 kind,
                 trace_id,
                 ..
@@ -1225,7 +1225,6 @@ impl<
                     self.secret_id,
                     channel_id,
                     &request,
-                    &pairing_secret,
                     kind,
                     trace_id,
                     self.replica_id,
@@ -1609,6 +1608,7 @@ impl<
         else {
             return Ok(None);
         };
+        let pairing_secret = pairing_secret.to_secret()?;
 
         let events = handlers::handle_pairing(
             &mut self.channel_store,

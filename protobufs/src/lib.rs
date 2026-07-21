@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 //! # Protobuf Bindings
 //!
@@ -41,12 +42,12 @@ use prost::DecodeError;
 
 const TYPE_URL_PREFIX: &str = "type.derec.org/";
 
-/// Carries a reference to an inner DeRec protocol message together with its [`MessageType`]
+/// Carries a reference to an inner DeRec protocol message together with its `MessageType`
 /// discriminant.
 ///
-/// Pass a `MessageBody` variant to [`DeRecMessageBuilder::message_body`] so that the builder
-/// can encode the inner message *and* set the correct `message_type` field on the outer
-/// [`DeRecMessage`] envelope in a single call.
+/// Pass a `MessageBody` variant to the higher-level `DeRecMessageBuilder::message_body`
+/// (defined in `derec-library`) so the builder can encode the inner message *and* set the
+/// correct `message_type` field on the outer [`DeRecMessage`] envelope in a single call.
 ///
 /// # Example
 ///

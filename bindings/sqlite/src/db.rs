@@ -1,4 +1,5 @@
-//! In-memory SQLite database wrapper + migration runner.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use rusqlite::Connection;
 use std::sync::{Arc, Mutex};

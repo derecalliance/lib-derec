@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 //! Protocol-layer types.
 //!
@@ -15,7 +16,9 @@
 use crate::types::ChannelId;
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::ContactMessage;
+#[cfg(any(feature = "serde", target_arch = "wasm32"))]
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 /// Selects which channels to target for a discovery request.
 #[derive(Debug, Clone)]
@@ -33,7 +36,11 @@ pub enum Target {
 /// Replica channels start as `Pending` after pairing completes and transition
 /// to `Paired` once fingerprint verification succeeds. Helper/Owner channels
 /// are `Paired` immediately after pairing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(
+    any(feature = "serde", target_arch = "wasm32"),
+    derive(Serialize, Deserialize)
+)]
 pub enum ChannelStatus {
     /// Channel is awaiting fingerprint verification (replica only).
     Pending,
@@ -54,7 +61,11 @@ pub enum ChannelStatus {
 /// the wire format is not part of the public API and may change
 /// independently. `#[serde(default)]` annotations let bridges decode
 /// legacy bytes that predate later-added fields without erroring.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
+#[cfg_attr(
+    any(feature = "serde", target_arch = "wasm32"),
+    derive(Serialize, Deserialize)
+)]
 pub struct Channel {
     /// Unique identifier for this channel.
     pub id: ChannelId,
@@ -73,13 +84,13 @@ pub struct Channel {
     /// side, it is the peer's own `communication_info` extracted from the
     /// wire pair-request — the same map that surfaces in
     /// [`crate::protocol::DeRecEvent::PairingCompleted::peer_communication_info`].
-    #[serde(default)]
+    #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
     pub communication_info: std::collections::HashMap<String, String>,
     /// Lifecycle status. Messages on `Pending` channels are ignored.
-    #[serde(default)]
+    #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
     pub status: ChannelStatus,
     /// Unix timestamp (seconds) when the channel was created.
-    #[serde(default)]
+    #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
     pub created_at: u64,
     /// This node's role on this channel, fixed at pairing time.
     ///
@@ -97,7 +108,7 @@ pub struct Channel {
     /// Helper/Owner channels and as a defensive default on
     /// freshly-paired Replica channels where the peer did not advertise
     /// one.
-    #[serde(default)]
+    #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
     pub replica_id: Option<u64>,
 }
 
@@ -129,10 +140,8 @@ pub struct HelperInfo {
     /// older codebases silently drop this new field when decoding new
     /// bags. Degraded but not broken in either direction.
     #[prost(map = "string, string", tag = "5")]
-    pub communication_info: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
+    pub communication_info:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
 }
 
 /// A single user-facing secret within the bag.
@@ -204,10 +213,8 @@ pub struct ReplicaInfo {
     /// App-level identity metadata for this peer. Same opacity contract
     /// as [`HelperInfo::communication_info`].
     #[prost(map = "string, string", tag = "4")]
-    pub communication_info: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
+    pub communication_info:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     /// The peer's `replica_id` — global stable identity of the replica
     /// device, separate from the per-channel `channel_id`.
     #[prost(uint64, tag = "5")]
@@ -256,10 +263,9 @@ pub struct Secret {
 /// instead.
 ///
 /// `shared_key` must be 32 bytes when [`Self::replicas`] is
-/// non-empty. The library enforces this invariant in
-/// [`crate::protocol::handlers::sharing::build_secret`] (producer
-/// side) and [`crate::protocol::DeRecProtocol::restore`] (consumer
-/// side).
+/// non-empty. The library enforces this invariant on the producer
+/// side during sharing round construction and on the consumer side in
+/// [`crate::protocol::DeRecProtocol::restore`].
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Replicas {
     /// Snapshot of all paired Replica Destinations at protect time.
@@ -366,23 +372,143 @@ pub enum MissingPolicy {
     Fail,
 }
 
+/// Opaque, serialized pairing key material as held by
+/// [`crate::protocol::DeRecSecretStore`] under [`SecretValue::PairingSecret`].
+///
+/// This is the store-boundary form of the ephemeral key pair the pairing
+/// handshake produces. The protocol deliberately exposes it as an opaque
+/// byte blob rather than a cryptographic type, so a store implementation can
+/// persist and reload it without depending on `derec-cryptography` or any
+/// serialization framework: call [`as_bytes`](Self::as_bytes) to obtain the
+/// bytes to persist on `save`, and hand the same bytes back to
+/// [`from_bytes`](Self::from_bytes) on `load`.
+///
+/// The byte layout is a library-internal detail, is not part of the public
+/// API, and may change between versions; treat the blob as opaque and never
+/// interpret it.
+///
+/// The bytes are held in [`zeroize::Zeroizing`] so the plaintext key material
+/// is wiped from memory on drop.
+#[derive(Clone)]
+pub struct PairingKeyMaterial(Zeroizing<Vec<u8>>);
+
+impl PairingKeyMaterial {
+    /// Wrap raw bytes previously obtained from [`as_bytes`](Self::as_bytes)
+    /// and persisted by a store.
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
+
+    /// The opaque bytes to persist. Round-trips through
+    /// [`from_bytes`](Self::from_bytes).
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+
+    /// Serialize live pairing secret key material into the store-boundary
+    /// form.
+    ///
+    /// Library-internal: the pairing handlers call this before handing the
+    /// value to the secret store, keeping the `ark-serialize` encoding an
+    /// implementation detail that never crosses the public API.
+    pub(crate) fn from_secret(material: &PairingSecretKeyMaterial) -> Self {
+        use ark_serialize::CanonicalSerialize as _;
+        let mut buf = Vec::with_capacity(material.compressed_size());
+        material
+            .serialize_compressed(&mut buf)
+            .expect("ark serialization of PairingSecretKeyMaterial is infallible");
+        Self(Zeroizing::new(buf))
+    }
+
+    /// Reconstruct live pairing secret key material from the store-boundary
+    /// form.
+    ///
+    /// Library-internal: the pairing handlers call this after loading the
+    /// value from the secret store. A decode failure means the persisted
+    /// bytes were corrupted or truncated, which is an internal invariant
+    /// violation rather than valid caller input.
+    pub(crate) fn to_secret(&self) -> crate::Result<PairingSecretKeyMaterial> {
+        use ark_serialize::CanonicalDeserialize as _;
+        PairingSecretKeyMaterial::deserialize_compressed(self.0.as_slice())
+            .map_err(|_| crate::Error::Invariant("stored PairingSecret bytes failed to decode"))
+    }
+}
+
+#[cfg(feature = "serde")]
+impl Serialize for PairingKeyMaterial {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.as_slice().serialize(serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for PairingKeyMaterial {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        Ok(Self(Zeroizing::new(bytes)))
+    }
+}
+
+/// Serde adapter for the prost [`ContactMessage`] carried by
+/// [`SecretValue::PairingContact`]. prost messages have no native serde
+/// support, so the value is (de)serialized through its canonical protobuf
+/// byte encoding.
+#[cfg(feature = "serde")]
+mod contact_serde {
+    use super::ContactMessage;
+    use prost::Message as _;
+    use serde::{Deserialize as _, Deserializer, Serialize as _, Serializer};
+
+    pub(super) fn serialize<S>(contact: &ContactMessage, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        contact.encode_to_vec().serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<ContactMessage, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        ContactMessage::decode(bytes.as_slice()).map_err(serde::de::Error::custom)
+    }
+}
+
 /// The payload returned by [`crate::protocol::DeRecSecretStore::load`] and
 /// passed to [`crate::protocol::DeRecSecretStore::save`].
 ///
 /// Variants are 1:1 with [`SecretKind`].
+///
+/// With the `serde` feature enabled, `Serialize` / `Deserialize` are
+/// derived so a store implementation can persist an entry with any serde
+/// format instead of hand-rolling a codec. This is an alternative to the
+/// byte-level accessors on the individual payloads (e.g.
+/// [`PairingKeyMaterial::as_bytes`] / [`PairingKeyMaterial::from_bytes`]);
+/// implementors pick whichever fits their backend, and consumers that do
+/// not use serde pay no dependency for it. The serde wire format is not
+/// part of the public API and may change independently.
 #[derive(Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum SecretValue {
     /// The post-pairing symmetric channel key. Established by pairing and used
     /// to authenticate and encrypt every subsequent message on the channel.
     SharedKey(crate::types::SharedKey),
-    /// The ephemeral ECIES / ML-KEM key pair created by `start` and consumed
-    /// when the pairing response arrives. Removed once the shared key is
-    /// derived.
-    PairingSecret(PairingSecretKeyMaterial),
+    /// The ephemeral ECIES / ML-KEM key material created by `start` and
+    /// consumed when the pairing response arrives. Removed once the shared
+    /// key is derived. Held as an opaque [`PairingKeyMaterial`] blob so
+    /// store implementors never touch a cryptography primitive.
+    PairingSecret(PairingKeyMaterial),
     /// The initiator's [`ContactMessage`], needed by
     /// [`crate::primitives::pairing::response::process`] to derive the shared
     /// key. Ephemeral — removed after pairing completes.
-    PairingContact(ContactMessage),
+    PairingContact(#[cfg_attr(feature = "serde", serde(with = "contact_serde"))] ContactMessage),
 }
 
 /// Tag identifying which kind of in-flight orchestrator state an entry in
@@ -540,9 +666,9 @@ impl StateItem {
             StateItem::PendingVerification { channel_id, .. } => StateKey::PendingVerification {
                 channel_id: *channel_id,
             },
-            StateItem::PendingRecovery { version, .. } => StateKey::PendingRecovery {
-                version: *version,
-            },
+            StateItem::PendingRecovery { version, .. } => {
+                StateKey::PendingRecovery { version: *version }
+            }
             StateItem::PendingUnpair { channel_id, .. } => StateKey::PendingUnpair {
                 channel_id: *channel_id,
             },
@@ -574,3 +700,48 @@ pub struct Share {
     pub bytes: Vec<u8>,
 }
 
+#[cfg(all(test, feature = "serde"))]
+mod tests {
+    use super::*;
+
+    /// Every `SecretValue` variant round-trips through serde — the path a
+    /// store implementation takes when it opts for serde over the
+    /// byte-level accessors. Exercises the custom `PairingKeyMaterial`
+    /// impls and the prost `ContactMessage` adapter.
+    #[test]
+    fn secret_value_serde_round_trips_all_variants() {
+        let cases = [
+            SecretValue::SharedKey([7u8; 32]),
+            SecretValue::PairingSecret(PairingKeyMaterial::from_bytes(vec![1, 2, 3, 4, 5])),
+            SecretValue::PairingContact(ContactMessage {
+                nonce: 42,
+                ..Default::default()
+            }),
+        ];
+
+        for value in cases {
+            let json = serde_json::to_vec(&value).expect("serialize");
+            let decoded: SecretValue = serde_json::from_slice(&json).expect("deserialize");
+            match (&value, &decoded) {
+                (SecretValue::SharedKey(a), SecretValue::SharedKey(b)) => assert_eq!(a, b),
+                (SecretValue::PairingSecret(a), SecretValue::PairingSecret(b)) => {
+                    assert_eq!(a.as_bytes(), b.as_bytes())
+                }
+                (SecretValue::PairingContact(a), SecretValue::PairingContact(b)) => {
+                    assert_eq!(a, b)
+                }
+                _ => panic!("variant changed across serde round-trip"),
+            }
+        }
+    }
+
+    /// The serde form and the `from_bytes`/`as_bytes` form describe the
+    /// same opaque blob, so a value serialized one way decodes the other.
+    #[test]
+    fn pairing_key_material_serde_matches_byte_accessors() {
+        let material = PairingKeyMaterial::from_bytes(vec![9, 8, 7, 6]);
+        let json = serde_json::to_vec(&material).expect("serialize");
+        let decoded: PairingKeyMaterial = serde_json::from_slice(&json).expect("deserialize");
+        assert_eq!(material.as_bytes(), decoded.as_bytes());
+    }
+}

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 //! Opaque [`DeRecProtocolHandle`] + FFI entry points. Each
 //! `derec_protocol_*` function is the FFI counterpart of a method on

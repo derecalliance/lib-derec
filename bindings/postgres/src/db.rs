@@ -1,11 +1,5 @@
-//! Postgres database wrapper + per-Database schema isolation.
-//!
-//! Postgres has no in-memory mode (the docker-compose file mounts
-//! `/var/lib/postgresql/data` as a tmpfs to approximate that), so
-//! isolation between simulated "devices" is done by giving each
-//! `Database::open_isolated()` call its own randomly-named schema.
-//! `search_path` is pinned to that schema for the connection, so
-//! every store query reads/writes only the per-device tables.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use std::sync::Arc;
 use tokio_postgres::{Client, NoTls};
@@ -54,8 +48,6 @@ impl Database {
                      Did you run `docker compose up -d` in bindings/postgres?"
                 )
             });
-        // The connection actor drives the wire protocol — spawn it
-        // onto the current Tokio runtime and forget the handle.
         tokio::spawn(async move {
             if let Err(e) = connection.await {
                 eprintln!("postgres connection error: {e}");

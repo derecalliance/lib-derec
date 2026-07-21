@@ -1,10 +1,5 @@
-//! Postgres-backed smoke test for the DeRec store traits.
-//!
-//! Same flow set as the SQLite binding but persists every store
-//! method through tokio-postgres against an isolated schema per
-//! "device" (peer). Requires a Postgres container running locally —
-//! `docker compose up -d` from this directory will spin one up on
-//! the expected port (15432).
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 mod codec;
 mod db;

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
+
 use std::fmt;
 
 /// DeRec protocol version supported by this SDK.

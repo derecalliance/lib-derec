@@ -611,7 +611,7 @@ warning.
 
 ## Documentation
 
-- DeRec Alliance: https://derecalliance.org
+- DeRec Alliance: https://derec.org
 - Protocol specification: https://derec-alliance.gitbook.io/docs/protocol-specification/protocol-overview
 - Rust SDK: https://github.com/derecalliance/lib-derec
 

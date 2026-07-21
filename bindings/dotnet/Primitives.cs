@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 // Primitive smoke tests: exercises the low-level produce/extract/process
 // surface for each flow (pairing, sharing, verification, recovery,
 // discovery, unpairing) plus the cross-cutting envelope/replyTo helpers.

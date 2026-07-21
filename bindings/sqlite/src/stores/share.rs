@@ -1,8 +1,5 @@
-//! `DeRecShareStore` over SQLite — persists opaque share bytes plus
-//! the denormalized `Share.secret_id` field alongside the partition
-//! key `secret_id`. The denormalized column is kept as documented by
-//! the trait: it must match the partition key, and an assertion
-//! enforces that on save.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use derec_library::protocol::{DeRecShareStore, ShareStoreFuture};
 use derec_library::protocol::types::Share;
@@ -169,21 +166,12 @@ impl DeRecShareStore for SqliteShareStore {
         channel_id: ChannelId,
         share: Share,
     ) -> ShareStoreFuture<'_, ()> {
-        // The trait contract: the denormalized `share.secret_id` MUST
-        // match the partition key. Cheap invariant check makes the
-        // bug obvious if any caller ever violates it.
         debug_assert_eq!(
             share.secret_id, secret_id,
             "DeRecShareStore::save invariant: share.secret_id ({}) must match partition secret_id ({})",
             share.secret_id, secret_id,
         );
         let conn = lock(&self.connection);
-        // The full storage key is (secret_id, channel_id, version,
-        // replica_id) per the trait contract — distinct replicas
-        // writing the same numeric version must both survive.
-        // The migration's PRIMARY KEY uses `COALESCE(replica_id, -1)`
-        // so the NULL-Owner write is its own slot. ON CONFLICT updates
-        // the existing slot in place (idempotent re-send).
         conn.execute(
             "INSERT INTO shares (secret_id, channel_id, version, replica_id, share_secret_id, bytes) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -222,7 +210,7 @@ fn map_share_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Share> {
     Ok(Share {
         secret_id: sql_to_u64(row.get::<_, i64>(0)?),
         version: row.get::<_, i64>(1)? as u32,
-        replica_id: row.get::<_, Option<i64>>(2)?.map(|v| sql_to_u64(v)),
+        replica_id: row.get::<_, Option<i64>>(2)?.map(sql_to_u64),
         bytes: row.get::<_, Vec<u8>>(3)?,
     })
 }

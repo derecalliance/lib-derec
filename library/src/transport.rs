@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 //! Library-level transport endpoint type + validation.
 //!
@@ -33,6 +34,7 @@
 //! the typed [`TransportProtocol`] in the first place.
 
 use derec_proto::Protocol;
+#[cfg(any(feature = "serde", target_arch = "wasm32"))]
 use serde::{Deserialize, Serialize};
 
 /// Maximum accepted transport URI length, in bytes.
@@ -67,7 +69,11 @@ pub const MAX_TRANSPORT_URI_LEN: usize = 2048;
 /// plaintext, since [`validate`](Self::validate) is the same gate
 /// used at the peer-extract boundary. Production builds MUST leave
 /// `unsafe-http` off.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    any(feature = "serde", target_arch = "wasm32"),
+    derive(Serialize, Deserialize)
+)]
 pub struct TransportProtocol {
     pub uri: String,
     /// Serialized as the protobuf enum's `i32` discriminant so the
@@ -75,10 +81,14 @@ pub struct TransportProtocol {
     /// — important because every binding's JSON Channel marshaller
     /// round-trips this field via the proto-style `{uri, protocol: 0}`
     /// representation.
-    #[serde(with = "protocol_as_i32")]
+    #[cfg_attr(
+        any(feature = "serde", target_arch = "wasm32"),
+        serde(with = "protocol_as_i32")
+    )]
     pub protocol: Protocol,
 }
 
+#[cfg(any(feature = "serde", target_arch = "wasm32"))]
 mod protocol_as_i32 {
     use super::Protocol;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -320,8 +330,7 @@ impl IntoOwnTransport for String {
 /// Structured error returned by [`TransportProtocol::validate`] and
 /// by [`TryFrom`] conversions from the protobuf wire type. Surfaced
 /// via [`crate::Error::Transport`] and from there into the FFI's
-/// [`DeRecError`](crate::ffi::error::DeRecError) and the WASM
-/// `{code, message}` shape.
+/// `DeRecError` and the WASM `{code, message}` shape.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum TransportValidationError {

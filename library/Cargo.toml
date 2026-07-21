@@ -8,62 +8,59 @@ description = "Rust SDK for the DeRec protocol, including native and WebAssembly
 readme = "README.md"
 repository = "https://github.com/derecalliance/lib-derec"
 documentation = "https://derec-alliance.gitbook.io/docs/sdk/rust"
-homepage = "https://derecalliance.org"
+homepage = "https://derec.org"
 keywords = ["derec", "decentralized", "recovery", "secret-sharing", "sdk"]
 
 include = [
-  "src/**",
-  "Cargo.toml",
-  "README.md",
-  "LICENSE",
+  "/src/**",
+  "/Cargo.toml",
+  "/README.md",
+  "/LICENSE",
 ]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# derec-cryptography =  "0.0.1-alpha.6"
-# derec-proto =  "0.0.1-alpha.6"
-derec-cryptography = { path = "../cryptography" }
-derec-proto = { path = "../protobufs" }
-prost = "0.14.3"
-prost-types = "0.14.3"
-rand = { version = "0.10.0", features = ["sys_rng"] }
+derec-cryptography = {  version = "0.0.1-alpha.8" }
+derec-proto = {  version = "0.0.1-alpha.8" }
+prost = "0.14.4"
+prost-types = "0.14.4"
+rand = { version = "0.10.2", features = ["sys_rng"] }
 sha2 = "0.11.0"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1"
-ark-serialize = { version = "0.5.0", default-features = true }
-thiserror = "2.0.18"
-zeroize = "1.8.2"
+serde = { version = "1.0.229", features = ["derive"], optional = true }
+serde_json = { version = "1.0.151", optional = true }
+ark-serialize = { version = "0.6.0", default-features = true }
+thiserror = "2.0.19"
+zeroize = "1.9.0"
 subtle = "2.6.1"
-k256 = { version = "0.13.4", features = ["ecdsa"] }
+k256 = { version = "0.14.0", features = ["ecdsa"] }
 tracing = { version = "0.1.44", default-features = false, features = ["attributes"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { version = "1", features = ["rt"], default-features = false }
+tokio = { version = "1.53.1", features = ["rt"], default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen = { version = "0.2.114", features = ["serde-serialize"] }
-wasm-bindgen-futures = { version = "0.4.44" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+derec-proto = { version = "0.0.1-alpha.8", features = ["serde"] }
+wasm-bindgen = { version = "0.2.126", features = ["serde-serialize"] }
+wasm-bindgen-futures = { version = "0.4.76" }
 serde-wasm-bindgen = { version = "0.6.5" }
-serde_bytes = "0.11"
-js-sys = { version = "0.3.91" }
-web-sys = { version = "0.3.91", features = ["console"] }
-getrandom_02 = { package = "getrandom", version = "0.2.16", features = ["js"] }
-getrandom_04 = { package = "getrandom", version = "0.4.2", features = ["wasm_js"] }
+serde_bytes = "0.11.19"
+js-sys = { version = "0.3.103" }
+web-sys = { version = "0.3.103", features = ["console"] }
+getrandom_02 = { package = "getrandom", version = "0.2.17", features = ["js"] }
+getrandom_04 = { package = "getrandom", version = "0.4.3", features = ["wasm_js"] }
 console_error_panic_hook = "0.1.7"
 
 [features]
-primitives = []
 logging = ["dep:tracing"]
-ffi = []
-# Opt-in development affordance: lets `TransportProtocol::validate`
-# accept plaintext `http://` URIs (still emits `tracing::warn!` under
-# `logging`). OFF by default — production callers MUST keep it off,
-# since enabling it also lets a peer-supplied `reply_to` downgrade
-# the reply path to plaintext.
+ffi = ["serde", "dep:serde_json"]
+serde = ["dep:serde", "derec-proto/serde"]
 unsafe-http = []
 
 [dev-dependencies]
 rand08 = { package = "rand", version = "0.8.5" }
+serde_json = "1.0.151"
 

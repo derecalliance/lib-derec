@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 //! This module provides cryptographic primitives for key establishment using
 //! Elliptic Curve Integrated Encryption Scheme (ECIES) operations over secp256k1.

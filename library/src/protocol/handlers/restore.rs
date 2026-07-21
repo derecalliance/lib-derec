@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 //! Post-recovery rebuild handler.
 //!
@@ -67,8 +68,8 @@ pub enum RestoreError {
 
     /// The recovered [`Secret`] is internally inconsistent. Only
     /// reachable when a `Secret` was hand-crafted — library-produced
-    /// ones always satisfy the invariants (see
-    /// [`super::sharing::build_secret`]).
+    /// ones always satisfy the invariants (rebuilt inside the sharing
+    /// handler during a `start(ProtectSecret)` round).
     #[error("recovered Secret is internally inconsistent: {0}")]
     Invariant(&'static str),
 }
@@ -117,7 +118,6 @@ pub(in crate::protocol) async fn restore<
     )
     .await?;
 
-    // TODO: move this logic into write_replica_channels so this code looks cleaner
     if let Some(group) = secret.replicas.as_ref().filter(|g| !g.replicas.is_empty()) {
         write_replica_channels(channel_store, secret_store, secret_id, group).await?;
     }

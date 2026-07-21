@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 // In-memory store + recording transport helpers used by the smoke
 // tests. Lives here (not in the published `DeRec.Library` package) so
 // the library surface stays free of test-only types.

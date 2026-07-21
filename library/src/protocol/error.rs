@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use super::SecretKind;
 use crate::types::ChannelId;
@@ -33,7 +34,7 @@ impl ProcessError {
 ///
 /// Individual Verifiable Secret Sharing shares are information-theoretically
 /// secure, so "secret" here refers only to [`SharedKey`](crate::types::SharedKey) and
-/// [`PairingSecretKeyMaterial`](derec_cryptography::pairing::PairingSecretKeyMaterial)
+/// [`PairingKeyMaterial`](super::PairingKeyMaterial)
 /// — the two kinds of data stored in this trait.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

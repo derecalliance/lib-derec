@@ -1,6 +1,5 @@
-//! `DeRecShareStore` over Postgres — persists opaque share bytes
-//! plus the denormalized `Share.secret_id` field alongside the
-//! partition key `secret_id`.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use derec_library::protocol::types::Share;
 use derec_library::protocol::{DeRecShareStore, ShareStoreFuture};
@@ -157,11 +156,6 @@ impl DeRecShareStore for PostgresShareStore {
         let share_secret_id_i64 = u64_to_sql(share.secret_id);
         let bytes = share.bytes;
         Box::pin(async move {
-            // ON CONFLICT targets the `shares_uniq` constraint (UNIQUE
-            // NULLS NOT DISTINCT) so a re-send for the same
-            // (secret_id, channel_id, version, replica_id) is idempotent
-            // — including when replica_id is NULL for two distinct
-            // Owner re-sends.
             client
                 .execute(
                     "INSERT INTO shares (secret_id, channel_id, version, replica_id, share_secret_id, bytes) \
