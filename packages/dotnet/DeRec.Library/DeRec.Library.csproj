@@ -50,29 +50,34 @@
     (ProjectReference consumers don't get NuGet's RID-resolution).
     NuGet consumers pick the right RID from `runtimes/<RID>/native/` instead and
     don't see these Content items.
+
+    The `_IsPacking != true` guard is required: during `dotnet pack` the host RID's
+    dylib is also a `<None Pack="true">` item above. Without the guard the two items
+    collide on the same file and the `Pack="false"` Content item wins, silently
+    dropping the host RID from the produced package.
   -->
-  <ItemGroup Condition="'$([MSBuild]::IsOSPlatform(OSX))' == 'true' AND '$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)' == 'Arm64'">
+  <ItemGroup Condition="'$(_IsPacking)' != 'true' AND '$([MSBuild]::IsOSPlatform(OSX))' == 'true' AND '$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)' == 'Arm64'">
       <Content Include="runtimes/osx-arm64/native/libderec_library.dylib"
           Condition="Exists('runtimes/osx-arm64/native/libderec_library.dylib')"
           Link="libderec_library.dylib"
           Pack="false"
           CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
-  <ItemGroup Condition="'$([MSBuild]::IsOSPlatform(OSX))' == 'true' AND '$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)' == 'X64'">
+  <ItemGroup Condition="'$(_IsPacking)' != 'true' AND '$([MSBuild]::IsOSPlatform(OSX))' == 'true' AND '$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)' == 'X64'">
       <Content Include="runtimes/osx-x64/native/libderec_library.dylib"
           Condition="Exists('runtimes/osx-x64/native/libderec_library.dylib')"
           Link="libderec_library.dylib"
           Pack="false"
           CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
-  <ItemGroup Condition="'$([MSBuild]::IsOSPlatform(Linux))' == 'true' AND '$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)' == 'Arm64'">
+  <ItemGroup Condition="'$(_IsPacking)' != 'true' AND '$([MSBuild]::IsOSPlatform(Linux))' == 'true' AND '$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)' == 'Arm64'">
       <Content Include="runtimes/linux-arm64/native/libderec_library.so"
           Condition="Exists('runtimes/linux-arm64/native/libderec_library.so')"
           Link="libderec_library.so"
           Pack="false"
           CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
-  <ItemGroup Condition="'$([MSBuild]::IsOSPlatform(Linux))' == 'true' AND '$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)' == 'X64'">
+  <ItemGroup Condition="'$(_IsPacking)' != 'true' AND '$([MSBuild]::IsOSPlatform(Linux))' == 'true' AND '$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)' == 'X64'">
       <Content Include="runtimes/linux-x64/native/libderec_library.so"
           Condition="Exists('runtimes/linux-x64/native/libderec_library.so')"
           Link="libderec_library.so"
