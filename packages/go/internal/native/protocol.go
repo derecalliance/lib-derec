@@ -50,11 +50,9 @@ type DeRecProtocolCreateContactResult struct {
 }
 
 // AutoAcceptPolicy is the per-flow auto-accept toggle set carried by the
-// packed JSON config's "auto_accept" object, field for field matching
-// PackedAutoAcceptPolicy in library/src/ffi/protocol/handle/mod.rs
-// (booleans, since JSON has a native boolean type — unlike the deprecated
-// 21-arg derec_protocol_new, which used u32-as-bool for a flat C struct
-// passed by value).
+// JSON config's "auto_accept" object, field for field matching
+// AutoAcceptConfig in library/src/ffi/protocol/handle/mod.rs (booleans,
+// since JSON has a native boolean type).
 type AutoAcceptPolicy struct {
 	Pairing           bool `json:"pairing"`
 	PrePair           bool `json:"pre_pair"`
@@ -66,11 +64,11 @@ type AutoAcceptPolicy struct {
 	UpdateChannelInfo bool `json:"update_channel_info"`
 }
 
-// ProtocolConfig carries every derec_protocol_new_packed argument beyond
+// ProtocolConfig carries every derec_protocol_new argument beyond
 // the six callback structs and the communication_info proto buffer, in
-// idiomatic Go form. protocolNew renders it into the packed JSON config
-// buffer the FFI expects — package protocol is responsible for converting
-// its own idiomatic Config into this shape.
+// idiomatic Go form. protocolNew renders it into the JSON config buffer
+// the FFI expects — package protocol is responsible for converting its
+// own idiomatic Config into this shape.
 type ProtocolConfig struct {
 	SecretID uint64
 
@@ -82,7 +80,7 @@ type ProtocolConfig struct {
 
 	// CommunicationInfo is a proto-encoded derecpb.CommunicationInfo, or
 	// nil for none. Stays a separate buffer argument alongside the JSON
-	// config — same wire convention as the deprecated derec_protocol_new.
+	// config.
 	CommunicationInfo []byte
 
 	TimeoutInSecs        uint32
@@ -94,17 +92,18 @@ type ProtocolConfig struct {
 
 	// ReplicaID configures this node's local replica_id. nil leaves it
 	// unset (omitted from the JSON config, matching the "absent or null
-	// means no replica id" convention documented on PackedProtocolConfig).
+	// means no replica id" convention documented on ProtocolConfig in
+	// library/src/ffi/protocol/handle/mod.rs).
 	ReplicaID *uint64
 }
 
-// packedProtocolConfig is the JSON shape derec_protocol_new_packed expects,
-// field-for-field matching PackedProtocolConfig in
+// protocolConfigJSON is the JSON shape derec_protocol_new expects,
+// field-for-field matching ProtocolConfig in
 // library/src/ffi/protocol/handle/mod.rs. secret_id/replica_id are decimal
 // strings rather than JSON numbers: u64 values above 2^53 lose precision
 // once round-tripped through JSON's float64-backed number type in common
 // encoders, including Go's encoding/json.
-type packedProtocolConfig struct {
+type protocolConfigJSON struct {
 	SecretID             string           `json:"secret_id"`
 	OwnTransportURI      string           `json:"own_transport_uri"`
 	OwnTransportProtocol int32            `json:"own_transport_protocol"`
@@ -119,8 +118,8 @@ type packedProtocolConfig struct {
 }
 
 var (
-	protocolNewPackedOnce sync.Once
-	protocolNewPackedFn   func(
+	protocolNewOnce sync.Once
+	protocolNewFn   func(
 		configJSONPtr *byte, configJSONLen uintptr,
 		communicationInfoPtr *byte, communicationInfoLen uintptr,
 		channelCB *ChannelStoreCallbacks,
@@ -197,19 +196,18 @@ var (
 	) DeRecProtocolCreateContactResult
 )
 
-// protocolNew wraps derec_protocol_new_packed: the scalar configuration in
-// cfg is rendered into a single JSON buffer (the packed entry point's only
-// alternative to the deprecated derec_protocol_new's 21 flat arguments,
-// which purego cannot call — it panics with "too many stack arguments"
-// past a handful of parameters). The six callback structs are still passed
-// as individual pointers into cb, which must outlive the returned handle —
-// see builtCallbacks' doc comment.
+// protocolNew wraps derec_protocol_new: the scalar configuration in
+// cfg is rendered into a single JSON buffer, since purego cannot marshal
+// many native arguments in a single call — it panics with "too many stack
+// arguments" past a handful of parameters. The six callback structs are
+// still passed as individual pointers into cb, which must outlive the
+// returned handle — see builtCallbacks' doc comment.
 func protocolNew(cfg ProtocolConfig, cb *builtCallbacks) (uintptr, error) {
-	protocolNewPackedOnce.Do(func() {
-		purego.RegisterFunc(&protocolNewPackedFn, symbol("derec_protocol_new_packed"))
+	protocolNewOnce.Do(func() {
+		purego.RegisterFunc(&protocolNewFn, symbol("derec_protocol_new"))
 	})
 
-	packed := packedProtocolConfig{
+	cfgJSON := protocolConfigJSON{
 		SecretID:             strconv.FormatUint(cfg.SecretID, 10),
 		OwnTransportURI:      cfg.OwnTransportURI,
 		OwnTransportProtocol: cfg.OwnTransportProtocol,
@@ -223,15 +221,15 @@ func protocolNew(cfg ProtocolConfig, cb *builtCallbacks) (uintptr, error) {
 	}
 	if cfg.ReplicaID != nil {
 		id := strconv.FormatUint(*cfg.ReplicaID, 10)
-		packed.ReplicaID = &id
+		cfgJSON.ReplicaID = &id
 	}
 
-	configJSON, err := json.Marshal(packed)
+	configJSON, err := json.Marshal(cfgJSON)
 	if err != nil {
-		return 0, fmt.Errorf("native: marshal packed protocol config: %w", err)
+		return 0, fmt.Errorf("native: marshal protocol config: %w", err)
 	}
 
-	res := protocolNewPackedFn(
+	res := protocolNewFn(
 		bytePtr(configJSON), uintptr(len(configJSON)),
 		bytePtr(cfg.CommunicationInfo), uintptr(len(cfg.CommunicationInfo)),
 		&cb.Channel, &cb.Secret, &cb.Share, &cb.UserSecret, &cb.State, &cb.Transport,
@@ -240,7 +238,7 @@ func protocolNew(cfg ProtocolConfig, cb *builtCallbacks) (uintptr, error) {
 		return 0, err
 	}
 	if res.Handle == 0 {
-		return 0, fmt.Errorf("native: derec_protocol_new_packed returned a null handle without an error")
+		return 0, fmt.Errorf("native: derec_protocol_new returned a null handle without an error")
 	}
 	return res.Handle, nil
 }
@@ -254,7 +252,7 @@ func ProtocolFree(handle uintptr) {
 	protocolFreeFn(handle)
 }
 
-// ProtocolInstance bundles a live derec_protocol_new_packed handle with the
+// ProtocolInstance bundles a live derec_protocol_new handle with the
 // builtCallbacks (and, transitively, the storeHandle/storeSet registration)
 // that must outlive it. Exported so package protocol can hold and release
 // one without depending on native's unexported storeSet/builtCallbacks
@@ -267,7 +265,7 @@ type ProtocolInstance struct {
 
 // NewProtocolInstance registers the six store/transport implementations
 // under a fresh handle, builds their C callback tables (buildCallbacks),
-// and calls derec_protocol_new_packed. On any failure the store
+// and calls derec_protocol_new. On any failure the store
 // registration is released before returning, so no dangling entry survives
 // a failed construction.
 func NewProtocolInstance(

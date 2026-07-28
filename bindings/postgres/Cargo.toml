@@ -15,3 +15,11 @@ serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["macros", "rt"] }
 tokio-postgres = "0.7.18"
 uuid = { version = "1.24.0", features = ["v4"] }
+
+# This is a self-contained workspace, so it does not inherit the repo root's
+# path redirect for the derec crates. derec-library depends on
+# derec-cryptography by version; patch it to the local source so this smoke
+# test builds against the in-tree crates rather than a crates.io release.
+[patch.crates-io]
+derec-cryptography = { path = "../../cryptography" }
+derec-proto = { path = "../../protobufs" }

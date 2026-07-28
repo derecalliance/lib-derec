@@ -198,7 +198,6 @@ public sealed class DeRecProtocol : IDisposable
             Send = Marshal.GetFunctionPointerForDelegate(_transportSend),
         };
 
-        byte[] uriBytes = Encoding.UTF8.GetBytes(ownTransportUri);
         int ownProtocolNum = ownTransportProtocol.ToLowerInvariant() switch
         {
             "https" => 0,
@@ -209,33 +208,32 @@ public sealed class DeRecProtocol : IDisposable
         UIntPtr commInfoLen = UIntPtr.Zero;
 
         var policy = autoAccept ?? new AutoAcceptPolicy();
-        var nativeAutoAccept = new NP.DeRecAutoAcceptPolicy
-        {
-            Pairing = policy.Pairing ? 1u : 0u,
-            PrePair = policy.PrePair ? 1u : 0u,
-            StoreShare = policy.StoreShare ? 1u : 0u,
-            VerifyShare = policy.VerifyShare ? 1u : 0u,
-            Discovery = policy.Discovery ? 1u : 0u,
-            GetShare = policy.GetShare ? 1u : 0u,
-            Unpair = policy.Unpair ? 1u : 0u,
-            UpdateChannelInfo = policy.UpdateChannelInfo ? 1u : 0u,
-        };
+        var config = new ProtocolConfigDto(
+            SecretId: secretId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            OwnTransportUri: ownTransportUri,
+            OwnTransportProtocol: ownProtocolNum,
+            Threshold: (uint)threshold,
+            KeepVersionsCount: (uint)keepVersionsCount,
+            TimeoutInSecs: (uint)timeoutInSecs,
+            AutoRespondOnFailure: autoRespondOnFailure,
+            UnpairAck: (int)unpairAck,
+            AutoReplyTo: autoReplyTo,
+            AutoAccept: new AutoAcceptConfigDto(
+                Pairing: policy.Pairing,
+                PrePair: policy.PrePair,
+                StoreShare: policy.StoreShare,
+                VerifyShare: policy.VerifyShare,
+                Discovery: policy.Discovery,
+                GetShare: policy.GetShare,
+                Unpair: policy.Unpair,
+                UpdateChannelInfo: policy.UpdateChannelInfo),
+            ReplicaId: replicaId?.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        byte[] configJsonBytes = JsonSerializer.SerializeToUtf8Bytes(config, JsonOpts);
 
         var result = NP.derec_protocol_new(
-            secretId,
-            ref channelCb, ref secretCb, ref shareCb, ref userSecretCb, ref stateCb, ref transportCb,
-            uriBytes, (UIntPtr)uriBytes.Length,
-            ownProtocolNum,
-            (uint)threshold,
-            (uint)keepVersionsCount,
+            configJsonBytes, (UIntPtr)configJsonBytes.Length,
             commInfoBytes, commInfoLen,
-            (uint)timeoutInSecs,
-            autoRespondOnFailure ? 1u : 0u,
-            (int)unpairAck,
-            autoReplyTo ? 1u : 0u,
-            nativeAutoAccept,
-            replicaId.HasValue ? 1u : 0u,
-            replicaId ?? 0ul);
+            ref channelCb, ref secretCb, ref shareCb, ref userSecretCb, ref stateCb, ref transportCb);
 
         ThrowOnError(result.Error);
         _handle = result.Handle;
@@ -1070,6 +1068,37 @@ public sealed class DeRecProtocol : IDisposable
         ulong? replica_id);
 
     private sealed record SecretValueDto(uint kind, byte[] bytes);
+
+    // Wire shape for `derec_protocol_new`'s `config_json` argument.
+    // Field names match Rust `ProtocolConfig` exactly (see
+    // library/src/ffi/protocol/handle/mod.rs). `SecretId`/`ReplicaId` are
+    // decimal strings, not JSON numbers, so u64 values above 2^53 survive
+    // the round trip through System.Text.Json without precision loss.
+    // `ReplicaId` is omitted entirely (not `null`) when there is no
+    // replica id, per `JsonOpts`'s `WhenWritingNull` ignore condition.
+    private sealed record ProtocolConfigDto(
+        [property: JsonPropertyName("secret_id")] string SecretId,
+        [property: JsonPropertyName("own_transport_uri")] string OwnTransportUri,
+        [property: JsonPropertyName("own_transport_protocol")] int OwnTransportProtocol,
+        [property: JsonPropertyName("threshold")] uint Threshold,
+        [property: JsonPropertyName("keep_versions_count")] uint KeepVersionsCount,
+        [property: JsonPropertyName("timeout_in_secs")] uint TimeoutInSecs,
+        [property: JsonPropertyName("auto_respond_on_failure")] bool AutoRespondOnFailure,
+        [property: JsonPropertyName("unpair_ack")] int UnpairAck,
+        [property: JsonPropertyName("auto_reply_to")] bool AutoReplyTo,
+        [property: JsonPropertyName("auto_accept")] AutoAcceptConfigDto AutoAccept,
+        [property: JsonPropertyName("replica_id")] string? ReplicaId);
+
+    // Field-for-field equivalent of Rust `AutoAcceptConfig`.
+    private sealed record AutoAcceptConfigDto(
+        [property: JsonPropertyName("pairing")] bool Pairing,
+        [property: JsonPropertyName("pre_pair")] bool PrePair,
+        [property: JsonPropertyName("store_share")] bool StoreShare,
+        [property: JsonPropertyName("verify_share")] bool VerifyShare,
+        [property: JsonPropertyName("discovery")] bool Discovery,
+        [property: JsonPropertyName("get_share")] bool GetShare,
+        [property: JsonPropertyName("unpair")] bool Unpair,
+        [property: JsonPropertyName("update_channel_info")] bool UpdateChannelInfo);
 }
 
 /// <summary>

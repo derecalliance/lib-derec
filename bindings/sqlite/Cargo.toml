@@ -16,3 +16,11 @@ prost = "0.14.4"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["macros", "rt"] }
+
+# This is a self-contained workspace, so it does not inherit the repo root's
+# path redirect for the derec crates. derec-library depends on
+# derec-cryptography by version; patch it to the local source so this smoke
+# test builds against the in-tree crates rather than a crates.io release.
+[patch.crates-io]
+derec-cryptography = { path = "../../cryptography" }
+derec-proto = { path = "../../protobufs" }

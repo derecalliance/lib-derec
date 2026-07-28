@@ -368,9 +368,9 @@ func newTestStores() (ChannelStore, ShareStore, SecretStore, UserSecretStore, St
 // TestNew_ConstructsRealProtocolHandleAndCloses is the end-to-end
 // validation of M3 Tasks 2-4: New assembles the six store/transport
 // implementations into their C callback tables and drives a genuine
-// derec_protocol_new_packed round trip through the compiled derec-library
+// derec_protocol_new round trip through the compiled derec-library
 // dylib. A non-nil *DeRecProtocol with no error means the FFI accepted the
-// packed JSON config and every callback pointer, and stored them into a
+// JSON config and every callback pointer, and stored them into a
 // live Rust-side protocol handle.
 func TestNew_ConstructsRealProtocolHandleAndCloses(t *testing.T) {
 	channel, share, secret, userSecret, state, transport := newTestStores()
@@ -403,7 +403,7 @@ func TestNew_ConstructsRealProtocolHandleAndCloses(t *testing.T) {
 // TestNew_TwoInstancesBothConstructAndClose builds two independent
 // protocol instances back to back, proving the Task 4 shared-callback fix
 // (purego.NewCallback registered once, reused across instances) holds
-// under a real derec_protocol_new_packed construction, not just the
+// under a real derec_protocol_new construction, not just the
 // unit-level buildCallbacks tests in internal/native.
 func TestNew_TwoInstancesBothConstructAndClose(t *testing.T) {
 	channel1, share1, secret1, userSecret1, state1, transport1 := newTestStores()

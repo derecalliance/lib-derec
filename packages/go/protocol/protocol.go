@@ -16,7 +16,7 @@ import (
 // UnpairAck controls whether the unpair initiator waits for the peer's
 // acknowledgement before dropping local channel state. Mirrors
 // derec_library::protocol::UnpairAck; values match the Rust enum and the
-// unpair_ack field documented on derec_protocol_new_packed.
+// unpair_ack field documented on derec_protocol_new.
 type UnpairAck int32
 
 const (
@@ -117,7 +117,7 @@ type DeRecProtocol struct {
 // New constructs a DeRecProtocol bound to the given store/transport
 // implementations and config. It assembles the C callback tables backing
 // each store (internal/native's buildCallbacks) and then calls
-// derec_protocol_new_packed — the first genuine C-ABI round trip a
+// derec_protocol_new — the first genuine C-ABI round trip a
 // protocol instance makes. On error the store registration is released before
 // returning; callers only need to call Close on success.
 func New(
@@ -286,7 +286,7 @@ func (p *DeRecProtocol) Process(message []byte) ([]Event, error) {
 }
 
 // encodeCommunicationInfo proto-encodes info as a derecpb.CommunicationInfo,
-// the wire shape derec_protocol_new_packed expects for its
+// the wire shape derec_protocol_new expects for its
 // communication_info argument. A nil/empty map encodes to nil bytes,
 // matching the FFI's "no entries" convention (communication_info_len == 0).
 func encodeCommunicationInfo(info map[string]string) ([]byte, error) {

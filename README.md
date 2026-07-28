@@ -50,7 +50,7 @@ Or manually in your `Cargo.toml`
 
 ```toml
 [dependencies]
-derec-library = "0.0.1-alpha.8"
+derec-library = "0.0.1-alpha.9"
 ```
 
 > [!WARNING]
@@ -126,6 +126,13 @@ ProtectSecret, Discovery, Recovery, replica secret sync) across every SDK:
 - `bindings/nodejs` — Node.js WASM tests. `cd bindings/nodejs && npm install && npx tsc && node index.js`.
 - `bindings/web` — Browser WASM tests. `cd bindings/web && npm install && npm run build` and open via `npm run dev`.
 - `bindings/dotnet` — .NET P/Invoke tests against the C ABI, including the orchestrator. `cd bindings/dotnet && dotnet run`.
+- `bindings/go` — Go purego (no cgo) tests against the C ABI, including the orchestrator. `cd bindings/go && go run .`.
+
+Two reference storage backends implementing all six store traits over a real
+database also live here and run the full protocol suite:
+
+- `bindings/sqlite` — SQLite-backed stores. `cd bindings/sqlite && cargo run`.
+- `bindings/postgres` — Postgres-backed stores (needs a Postgres reachable at `DATABASE_URL`, default `postgres://postgres:postgres@localhost:15432/derec_test`). `cd bindings/postgres && cargo run`.
 
 ## Replica feature
 
@@ -144,7 +151,7 @@ SDK README has a focused "Replica flows" section with a runnable example.
 ## Protocol Documentation
 
 * [Full protocol specification](https://github.com/derecalliance/protocol)
-* [Developer documentation](https://derecalliance.gitbook.io/docs)
+* [Developer documentation](https://derec-alliance.gitbook.io/docs)
 
 ---
 

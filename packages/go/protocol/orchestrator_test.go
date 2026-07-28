@@ -309,7 +309,7 @@ func pairOrchestratorPeers(t *testing.T, owner, helper *orchestratorPeer, pairin
 // pairing -> protect-secret -> share-stored flow. This exercises the
 // entire M3 orchestrator stack together — Rust calling back into the Go
 // store implementations, the Go transport callback routing messages
-// between independent instances, event decoding, and the packed FFI
+// between independent instances, event decoding, and the JSON-config FFI
 // protocol construction — all under real (not stubbed) load.
 //
 // Two Helpers, not one: DeRecProtocolBuilder rejects Threshold < 2

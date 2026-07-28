@@ -215,25 +215,6 @@ internal static class Protocol
         public IntPtr Handle;
     }
 
-    /// <summary>
-    /// Per-flow auto-accept policy. Mirrors the Rust
-    /// <c>DeRecAutoAcceptPolicy</c> repr(C) struct one-to-one. Each
-    /// field is a <c>uint</c> (0 = off, non-zero = on) to match the
-    /// rest of the FFI's bool-as-<c>uint</c> convention.
-    /// </summary>
-    [StructLayout(LayoutKind.Sequential)]
-    internal struct DeRecAutoAcceptPolicy
-    {
-        public uint Pairing;
-        public uint PrePair;
-        public uint StoreShare;
-        public uint VerifyShare;
-        public uint Discovery;
-        public uint GetShare;
-        public uint Unpair;
-        public uint UpdateChannelInfo;
-    }
-
     [StructLayout(LayoutKind.Sequential)]
     internal struct DeRecProtocolFingerprintResult
     {
@@ -241,27 +222,25 @@ internal static class Protocol
         public IntPtr Fingerprint;
     }
 
+    /// <summary>
+    /// Constructs a protocol handle. Scalar configuration is bundled into a
+    /// single JSON buffer (see <c>ProtocolConfig</c> in the Rust FFI crate
+    /// for the exact shape); <c>communicationInfo</c> is a separate proto
+    /// buffer. Bundling the scalar config into JSON keeps the native
+    /// signature small enough for every FFI consumer (Go via purego, .NET)
+    /// to call — some callers cannot marshal many native arguments in a
+    /// single call.
+    /// </summary>
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern DeRecProtocolNewResult derec_protocol_new(
-        ulong secretId,
+        byte[] configJson, UIntPtr configJsonLen,
+        byte[]? communicationInfo, UIntPtr communicationInfoLen,
         ref ChannelStoreCallbacks channelStoreCb,
         ref SecretStoreCallbacks secretStoreCb,
         ref ShareStoreCallbacks shareStoreCb,
         ref UserSecretStoreCallbacks userSecretStoreCb,
         ref StateStoreCallbacks stateStoreCb,
-        ref TransportCallbacks transportCb,
-        byte[] ownTransportUri, UIntPtr ownTransportUriLen,
-        int ownTransportProtocol,
-        uint threshold,
-        uint keepVersionsCount,
-        byte[]? communicationInfo, UIntPtr communicationInfoLen,
-        uint timeoutInSecs,
-        uint autoRespondOnFailure,
-        int unpairAck,
-        uint autoReplyTo,
-        DeRecAutoAcceptPolicy autoAccept,
-        uint hasReplicaId,
-        ulong replicaId);
+        ref TransportCallbacks transportCb);
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern void derec_protocol_free(IntPtr handle);
