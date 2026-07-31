@@ -37,8 +37,8 @@ pub(super) type Protocol = crate::protocol::DeRecProtocol<
     DotnetTransport,
 >;
 
-/// Opaque handle returned by [`derec_protocol_new`] and consumed by every
-/// other entry point in this module. Holds the protocol instance + the
+/// Opaque handle returned by [`derec_protocol_new`] and consumed by
+/// every other entry point in this module. Holds the protocol instance + the
 /// per-handle tokio runtime used to drive the async core synchronously.
 ///
 /// The `inner` protocol is wrapped in [`std::sync::Mutex`] so concurrent
@@ -89,47 +89,57 @@ pub(super) fn validate_transport(
         .map_err(|e| crate::ffi::error::from_lib_error(crate::Error::Transport(e)))
 }
 
+/// Decode a serialized [`derec_proto::CommunicationInfo`] proto buffer
+/// into the `<String, String>` map the core protocol accepts. Used by
+/// [`derec_protocol_new`], which takes `communication_info` as
+/// a proto buffer separate from the rest of its JSON configuration.
+///
+/// # Safety
+///
+/// `ptr` must be valid for reads of `len` bytes when `len != 0`.
+unsafe fn decode_communication_info(
+    ptr: *const u8,
+    len: usize,
+) -> Result<HashMap<String, String>, DeRecError> {
+    if len == 0 {
+        return Ok(HashMap::new());
+    }
+    if ptr.is_null() {
+        return Err(ffi_error(
+            DEREC_CODE_FFI_NULL_PTR,
+            "communication_info_ptr is null but length is non-zero",
+        ));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    match derec_proto::CommunicationInfo::decode(bytes) {
+        Ok(c) => Ok(c
+            .communication_info_entries
+            .into_iter()
+            .filter_map(|e| {
+                let s = match e.value? {
+                    derec_proto::communication_info_key_value::Value::StringValue(s) => s,
+                    // Binary entries have nowhere to land in the core
+                    // protocol's `<String, String>` map; skip them.
+                    derec_proto::communication_info_key_value::Value::BytesValue(_) => {
+                        return None;
+                    }
+                };
+                Some((e.key, s))
+            })
+            .collect()),
+        Err(_) => Err(ffi_error(
+            DEREC_CODE_FFI_BAD_PROTO,
+            "communication_info is not a valid CommunicationInfo proto",
+        )),
+    }
+}
+
 /// Result type for [`derec_protocol_new`].
 #[repr(C)]
 pub struct DeRecProtocolNewResult {
     pub error: DeRecError,
     /// On success, the opaque handle. On error, null.
     pub handle: *mut DeRecProtocolHandle,
-}
-
-/// Per-flow auto-accept policy passed across the C ABI.
-///
-/// Each field is `u32` (0 = off, anything else = on) to match the rest
-/// of the FFI's bool-as-`u32` convention. Mirrors
-/// [`crate::protocol::AutoAcceptPolicy`] one-to-one. Pass a struct
-/// literal with the desired flows enabled; an all-zero struct means
-/// "every flow off" (same as today's behaviour where every request
-/// surfaces as `ActionRequired`).
-#[repr(C)]
-pub struct DeRecAutoAcceptPolicy {
-    pub pairing: u32,
-    pub pre_pair: u32,
-    pub store_share: u32,
-    pub verify_share: u32,
-    pub discovery: u32,
-    pub get_share: u32,
-    pub unpair: u32,
-    pub update_channel_info: u32,
-}
-
-impl From<DeRecAutoAcceptPolicy> for crate::protocol::AutoAcceptPolicy {
-    fn from(p: DeRecAutoAcceptPolicy) -> Self {
-        Self {
-            pairing: p.pairing != 0,
-            pre_pair: p.pre_pair != 0,
-            store_share: p.store_share != 0,
-            verify_share: p.verify_share != 0,
-            discovery: p.discovery != 0,
-            get_share: p.get_share != 0,
-            unpair: p.unpair != 0,
-            update_channel_info: p.update_channel_info != 0,
-        }
-    }
 }
 
 impl From<DeRecError> for DeRecProtocolNewResult {
@@ -141,47 +151,38 @@ impl From<DeRecError> for DeRecProtocolNewResult {
     }
 }
 
-/// Construct a new [`crate::protocol::DeRecProtocol`] instance bound to
-/// the caller-supplied store/transport callbacks. Buffer-passing
-/// convention for the callbacks is documented on each `*Callbacks`
-/// struct in [`super::super::stores`].
+/// Construction logic for [`derec_protocol_new`]: takes the
+/// already-parsed/validated scalar configuration plus the 6
+/// store/transport callback pointers,
+/// reads each callback struct, builds the [`DeRecProtocolBuilder`],
+/// and wraps the result in a handle bound to a fresh single-thread
+/// tokio runtime.
 ///
 /// # Safety
 ///
-/// - All pointers passed in must be valid for the documented direction
-///   (`*const` = readable, `*mut` = writable) and length.
-/// - `channel_store_cb`/`secret_store_cb`/`share_store_cb`/`transport_cb`
-///   must outlive the returned handle.
-/// - The caller must invoke [`derec_protocol_free`] exactly once to release
-///   the handle.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn derec_protocol_new(
+/// - All 6 callback pointers must be valid for reads of their pointee
+///   struct.
+/// - `channel_store_cb`/`secret_store_cb`/`share_store_cb`/`user_secret_store_cb`/
+///   `state_store_cb`/`transport_cb` must outlive the returned handle.
+#[allow(clippy::too_many_arguments)]
+unsafe fn construct_protocol(
     secret_id: u64,
+    own_transport: crate::transport::TransportProtocol,
+    threshold: u32,
+    keep_versions_count: u32,
+    communication_info: HashMap<String, String>,
+    timeout_in_secs: u32,
+    auto_respond_on_failure: bool,
+    unpair_ack: crate::protocol::UnpairAck,
+    auto_reply_to: bool,
+    auto_accept: crate::protocol::AutoAcceptPolicy,
+    replica_id: Option<u64>,
     channel_store_cb: *const ChannelStoreCallbacks,
     secret_store_cb: *const SecretStoreCallbacks,
     share_store_cb: *const ShareStoreCallbacks,
     user_secret_store_cb: *const UserSecretStoreCallbacks,
     state_store_cb: *const StateStoreCallbacks,
     transport_cb: *const TransportCallbacks,
-    own_transport_uri_ptr: *const u8,
-    own_transport_uri_len: usize,
-    own_transport_protocol: i32,
-    threshold: u32,
-    keep_versions_count: u32,
-    communication_info_ptr: *const u8,
-    communication_info_len: usize,
-    timeout_in_secs: u32,
-    auto_respond_on_failure: u32,
-    // `unpair_ack`: 0 = Required, 1 = NotRequired.
-    unpair_ack: i32,
-    auto_reply_to: u32,
-    // Per-flow auto-accept toggles. See [`DeRecAutoAcceptPolicy`].
-    // Passed by value to keep the C ABI simple (no allocation, no
-    // null-pointer handling); the all-zero struct is the safe default.
-    auto_accept: DeRecAutoAcceptPolicy,
-    // `has_replica_id`: 0 = unset, 1 = use `replica_id` value.
-    has_replica_id: u32,
-    replica_id: u64,
 ) -> DeRecProtocolNewResult {
     if channel_store_cb.is_null()
         || secret_store_cb.is_null()
@@ -196,100 +197,6 @@ pub unsafe extern "C" fn derec_protocol_new(
         )
         .into();
     }
-
-    let own_uri = if own_transport_uri_len == 0 {
-        String::new()
-    } else if own_transport_uri_ptr.is_null() {
-        return ffi_error(
-            DEREC_CODE_FFI_NULL_PTR,
-            "own_transport_uri_ptr is null but length is non-zero",
-        )
-        .into();
-    } else {
-        let bytes =
-            unsafe { std::slice::from_raw_parts(own_transport_uri_ptr, own_transport_uri_len) };
-        match std::str::from_utf8(bytes) {
-            Ok(s) => s.to_owned(),
-            Err(_) => {
-                return ffi_error(
-                    DEREC_CODE_FFI_BAD_PROTO,
-                    "own_transport_uri is not valid UTF-8",
-                )
-                .into();
-            }
-        }
-    };
-
-    // Empty URI is the deferred-config path: the caller will call
-    // `derec_protocol_set_own_transport` later, at which point
-    // validation runs unconditionally. Non-empty URIs are validated
-    // here so the protocol can't be constructed with a malformed or
-    // downgraded endpoint that would then be propagated to peers
-    // via pairing.
-    let own_transport: crate::transport::TransportProtocol = if own_uri.is_empty() {
-        // Sentinel deferred-config value. The empty URI will be
-        // rejected by the validator the next time the protocol
-        // actually needs to use it (e.g. on the first pair attempt).
-        crate::transport::TransportProtocol::new(
-            String::new(),
-            derec_proto::Protocol::Https,
-        )
-    } else {
-        match validate_transport(&own_uri, own_transport_protocol) {
-            Ok(tp) => tp,
-            Err(e) => return e.into(),
-        }
-    };
-
-    let info: HashMap<String, String> = if communication_info_len == 0 {
-        HashMap::new()
-    } else {
-        if communication_info_ptr.is_null() {
-            return ffi_error(
-                DEREC_CODE_FFI_NULL_PTR,
-                "communication_info_ptr is null but length is non-zero",
-            )
-            .into();
-        }
-        let bytes =
-            unsafe { std::slice::from_raw_parts(communication_info_ptr, communication_info_len) };
-        match derec_proto::CommunicationInfo::decode(bytes) {
-            Ok(c) => c
-                .communication_info_entries
-                .into_iter()
-                .filter_map(|e| {
-                    let s = match e.value? {
-                        derec_proto::communication_info_key_value::Value::StringValue(s) => s,
-                        // Binary entries have nowhere to land in the core
-                        // protocol's `<String, String>` map; skip them.
-                        derec_proto::communication_info_key_value::Value::BytesValue(_) => {
-                            return None;
-                        }
-                    };
-                    Some((e.key, s))
-                })
-                .collect(),
-            Err(_) => {
-                return ffi_error(
-                    DEREC_CODE_FFI_BAD_PROTO,
-                    "communication_info is not a valid CommunicationInfo proto",
-                )
-                .into();
-            }
-        }
-    };
-
-    let unpair_ack_value = match unpair_ack {
-        0 => crate::protocol::UnpairAck::Required,
-        1 => crate::protocol::UnpairAck::NotRequired,
-        other => {
-            return ffi_error(
-                DEREC_CODE_FFI_INVALID_ENUM,
-                format!("invalid unpair_ack: {other}"),
-            )
-            .into();
-        }
-    };
 
     let channel_store = DotnetChannelStore {
         cb: unsafe { std::ptr::read(channel_store_cb) },
@@ -320,14 +227,14 @@ pub unsafe extern "C" fn derec_protocol_new(
         .with_own_transport(own_transport)
         .with_threshold(threshold as usize)
         .with_keep_versions_count(keep_versions_count as usize)
-        .with_communication_info(info)
+        .with_communication_info(communication_info)
         .with_timeout(Duration::from_secs(u64::from(timeout_in_secs.max(1))))
-        .with_auto_respond_on_failure(auto_respond_on_failure != 0)
-        .with_unpair_ack(unpair_ack_value)
-        .with_auto_reply_to(auto_reply_to != 0)
-        .with_auto_accept(auto_accept.into());
+        .with_auto_respond_on_failure(auto_respond_on_failure)
+        .with_unpair_ack(unpair_ack)
+        .with_auto_reply_to(auto_reply_to)
+        .with_auto_accept(auto_accept);
 
-    if has_replica_id != 0 {
+    if let Some(replica_id) = replica_id {
         builder = builder.with_replica_id(replica_id);
     }
 
@@ -336,8 +243,7 @@ pub unsafe extern "C" fn derec_protocol_new(
         Err(e) => return crate::ffi::error::from_lib_error(e).into(),
     };
 
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .build() {
+    let runtime = match tokio::runtime::Builder::new_current_thread().build() {
         Ok(rt) => rt,
         Err(e) => {
             return ffi_error(
@@ -358,15 +264,232 @@ pub unsafe extern "C" fn derec_protocol_new(
     }
 }
 
-/// Release a handle previously returned by [`derec_protocol_new`]. Safe
-/// to call with a null pointer.
+/// Per-flow auto-accept policy as decoded from JSON by
+/// [`derec_protocol_new`]. One boolean per flow (`true` = the
+/// protocol auto-accepts that flow's incoming requests instead of
+/// surfacing them as `ActionRequired`).
+#[derive(serde::Deserialize)]
+struct AutoAcceptConfig {
+    pairing: bool,
+    pre_pair: bool,
+    store_share: bool,
+    verify_share: bool,
+    discovery: bool,
+    get_share: bool,
+    unpair: bool,
+    update_channel_info: bool,
+}
+
+impl From<AutoAcceptConfig> for crate::protocol::AutoAcceptPolicy {
+    fn from(p: AutoAcceptConfig) -> Self {
+        Self {
+            pairing: p.pairing,
+            pre_pair: p.pre_pair,
+            store_share: p.store_share,
+            verify_share: p.verify_share,
+            discovery: p.discovery,
+            get_share: p.get_share,
+            unpair: p.unpair,
+            update_channel_info: p.update_channel_info,
+        }
+    }
+}
+
+/// JSON configuration shape accepted by [`derec_protocol_new`].
+///
+/// `secret_id` and `replica_id` are decimal strings rather than JSON
+/// numbers: `u64` values above 2^53 lose precision once round-tripped
+/// through JSON's `f64`-backed number type in common encoders
+/// (including Go's `encoding/json`).
+#[derive(serde::Deserialize)]
+struct ProtocolConfig {
+    secret_id: String,
+    own_transport_uri: String,
+    own_transport_protocol: i32,
+    threshold: u32,
+    keep_versions_count: u32,
+    timeout_in_secs: u32,
+    auto_respond_on_failure: bool,
+    // 0 = Required, 1 = NotRequired.
+    unpair_ack: i32,
+    auto_reply_to: bool,
+    auto_accept: AutoAcceptConfig,
+    // Absent or `null` means "no replica id".
+    #[serde(default)]
+    replica_id: Option<String>,
+}
+
+/// Constructs a [`crate::protocol::DeRecProtocol`] with scalar config
+/// bundled as JSON, for FFI callers that cannot pass many native
+/// arguments in a single call — e.g. Go via `purego` (no cgo), which
+/// panics with "too many stack arguments" past a handful of
+/// parameters. Scalar configuration is bundled into a single JSON
+/// buffer; `communication_info` stays a separate proto-encoded
+/// `CommunicationInfo` buffer; the 6 store/transport callback structs
+/// are still passed as individual pointers, since purego marshals
+/// pointer-sized arguments natively.
+///
+/// `config_json` must deserialize to the following shape — all field
+/// names `snake_case`, all fields required unless noted:
+///
+/// ```json
+/// {
+///   "secret_id": "12345678901234567890",
+///   "own_transport_uri": "https://example.com/derec",
+///   "own_transport_protocol": 1,
+///   "threshold": 3,
+///   "keep_versions_count": 2,
+///   "timeout_in_secs": 30,
+///   "auto_respond_on_failure": false,
+///   "unpair_ack": 0,
+///   "auto_reply_to": false,
+///   "auto_accept": {
+///     "pairing": false,
+///     "pre_pair": false,
+///     "store_share": false,
+///     "verify_share": false,
+///     "discovery": false,
+///     "get_share": false,
+///     "unpair": false,
+///     "update_channel_info": false
+///   },
+///   "replica_id": null
+/// }
+/// ```
+///
+/// - `secret_id`: decimal-string `u64`.
+/// - `own_transport_uri`: may be `""` for the deferred-config path;
+///   `derec_protocol_set_own_transport` must be called before pairing
+///   in that case.
+/// - `own_transport_protocol`: [`derec_proto::Protocol`] discriminant.
+/// - `unpair_ack`: `0` = Required, `1` = NotRequired.
+/// - `auto_accept`: one boolean per flow.
+/// - `replica_id`: decimal-string `u64`, or absent/`null` for "no
+///   replica id".
+///
+/// # Safety
+///
+/// - `config_json_ptr` must be valid for reads of `config_json_len`
+///   bytes.
+/// - `communication_info_ptr` must be valid for reads of
+///   `communication_info_len` bytes when the length is non-zero.
+/// - All 6 callback pointers must be valid for reads of their pointee
+///   struct, and must outlive the returned handle.
+/// - The caller must invoke [`derec_protocol_free`] exactly once to
+///   release the returned handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn derec_protocol_new(
+    config_json_ptr: *const u8,
+    config_json_len: usize,
+    communication_info_ptr: *const u8,
+    communication_info_len: usize,
+    channel_store_cb: *const ChannelStoreCallbacks,
+    secret_store_cb: *const SecretStoreCallbacks,
+    share_store_cb: *const ShareStoreCallbacks,
+    user_secret_store_cb: *const UserSecretStoreCallbacks,
+    state_store_cb: *const StateStoreCallbacks,
+    transport_cb: *const TransportCallbacks,
+) -> DeRecProtocolNewResult {
+    if config_json_ptr.is_null() {
+        return ffi_error(DEREC_CODE_FFI_NULL_PTR, "config_json_ptr is null").into();
+    }
+    let json_bytes = unsafe { std::slice::from_raw_parts(config_json_ptr, config_json_len) };
+    let config: ProtocolConfig = match serde_json::from_slice(json_bytes) {
+        Ok(c) => c,
+        Err(e) => {
+            return ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                format!("config_json is not valid: {e}"),
+            )
+            .into();
+        }
+    };
+
+    let secret_id: u64 = match config.secret_id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return ffi_error(DEREC_CODE_FFI_BAD_PROTO, "secret_id is not a valid u64").into();
+        }
+    };
+
+    let replica_id: Option<u64> = match config.replica_id {
+        Some(s) => match s.parse() {
+            Ok(id) => Some(id),
+            Err(_) => {
+                return ffi_error(DEREC_CODE_FFI_BAD_PROTO, "replica_id is not a valid u64")
+                    .into();
+            }
+        },
+        None => None,
+    };
+
+    // Empty URI is the deferred-config path: the caller will call
+    // `derec_protocol_set_own_transport` later, at which point
+    // validation runs unconditionally. Non-empty URIs are validated
+    // here so the protocol can't be constructed with a malformed or
+    // downgraded endpoint that would then be propagated to peers
+    // via pairing.
+    let own_transport: crate::transport::TransportProtocol = if config.own_transport_uri.is_empty()
+    {
+        crate::transport::TransportProtocol::new(String::new(), derec_proto::Protocol::Https)
+    } else {
+        match validate_transport(&config.own_transport_uri, config.own_transport_protocol) {
+            Ok(tp) => tp,
+            Err(e) => return e.into(),
+        }
+    };
+
+    let info = match unsafe {
+        decode_communication_info(communication_info_ptr, communication_info_len)
+    } {
+        Ok(i) => i,
+        Err(e) => return e.into(),
+    };
+
+    let unpair_ack_value = match config.unpair_ack {
+        0 => crate::protocol::UnpairAck::Required,
+        1 => crate::protocol::UnpairAck::NotRequired,
+        other => {
+            return ffi_error(
+                DEREC_CODE_FFI_INVALID_ENUM,
+                format!("invalid unpair_ack: {other}"),
+            )
+            .into();
+        }
+    };
+
+    unsafe {
+        construct_protocol(
+            secret_id,
+            own_transport,
+            config.threshold,
+            config.keep_versions_count,
+            info,
+            config.timeout_in_secs,
+            config.auto_respond_on_failure,
+            unpair_ack_value,
+            config.auto_reply_to,
+            config.auto_accept.into(),
+            replica_id,
+            channel_store_cb,
+            secret_store_cb,
+            share_store_cb,
+            user_secret_store_cb,
+            state_store_cb,
+            transport_cb,
+        )
+    }
+}
+
+/// Release a handle previously returned by [`derec_protocol_new`].
+/// Safe to call with a null pointer.
 ///
 /// # Safety
 ///
 /// `handle` must satisfy ALL of:
 ///
-/// - It is a pointer previously returned by [`derec_protocol_new`], or
-///   it is null.
+/// - It is a pointer previously returned by [`derec_protocol_new`],
+///   or it is null.
 /// - It has not already been freed (no double-free).
 /// - **No other thread is executing any `derec_protocol_*` function on
 ///   this handle while this call is in flight.** The interior

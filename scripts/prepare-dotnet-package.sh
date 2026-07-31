@@ -34,11 +34,11 @@ build_target() {
   case "$rust_target" in
     aarch64-apple-darwin)
       log "Building $rust_target with cargo build"
-      cargo build --release --target "$rust_target"
+      cargo build --release --features ffi --target "$rust_target"
       ;;
     x86_64-apple-darwin|x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu)
       log "Building $rust_target with cargo zigbuild"
-      cargo zigbuild --release --target "$rust_target"
+      cargo zigbuild --release --features ffi --target "$rust_target"
       ;;
     *)
       echo "Unsupported build target in script: $rust_target" >&2
@@ -52,16 +52,9 @@ stage_target() {
   local rid="$2"
   local libname="$3"
 
-  local source_lib
-
-  case "$rust_target" in
-    aarch64-apple-darwin)
-      source_lib="$WORKSPACE_TARGET_DIR/release/$libname"
-      ;;
-    *)
-      source_lib="$WORKSPACE_TARGET_DIR/$rust_target/release/$libname"
-      ;;
-  esac
+  # Every target is built with `--target`, so its artifact always lands in the
+  # target-triple subdirectory (never the host default `target/release`).
+  local source_lib="$WORKSPACE_TARGET_DIR/$rust_target/release/$libname"
 
   local runtime_dir="$RUNTIMES_DIR/$rid/native"
 

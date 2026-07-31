@@ -1,8 +1,8 @@
 .DEFAULT_GOAL := all
 
-.PHONY: all native nodejs web dotnet
+.PHONY: all native nodejs web dotnet go
 
-all: native nodejs web dotnet
+all: native nodejs web dotnet go
 
 native:
 	cargo build --release
@@ -17,3 +17,7 @@ web: native
 
 dotnet: native
 	../scripts/prepare-dotnet-package.sh
+
+go: native
+	../scripts/prepare-go-package.sh
+	cd ../packages/go && CGO_ENABLED=0 go test ./...

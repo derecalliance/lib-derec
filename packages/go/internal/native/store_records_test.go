@@ -1,0 +1,544 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 DeRec Alliance. All rights reserved.
+
+package native
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
+
+// --- Channel: JSON rides serde directly on the Rust side (see
+// library/src/ffi/protocol/stores.rs doc comment), so EncodeChannel's
+// output must match Channel's derived Serialize shape byte-for-byte:
+// bare-number id (ChannelId is #[serde(transparent)]), nested transport
+// object with a plain-int protocol field, and PascalCase enum strings for
+// status/role (Rust's default unit-variant serde form, not SCREAMING_CASE).
+
+func TestEncodeChannel_MatchesRustJSONShape(t *testing.T) {
+	replicaID := uint64(42)
+	ch := Channel{
+		ID: 123456789,
+		Transport: TransportEndpoint{
+			URI:      "https://example.com/derec",
+			Protocol: 0,
+		},
+		CommunicationInfo: map[string]string{"name": "helper"},
+		Status:            ChannelStatusPaired,
+		CreatedAt:         1700000000,
+		Role:              SenderKindReplicaDestination,
+		ReplicaID:         &replicaID,
+	}
+
+	got, err := EncodeChannel(ch)
+	if err != nil {
+		t.Fatalf("EncodeChannel: %v", err)
+	}
+
+	want := `{"id":123456789,"transport":{"uri":"https://example.com/derec","protocol":0},` +
+		`"communication_info":{"name":"helper"},"status":"Paired","created_at":1700000000,` +
+		`"role":"ReplicaDestination","replica_id":42}`
+	if string(got) != want {
+		t.Fatalf("EncodeChannel mismatch:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func TestEncodeChannel_EmptyCommunicationInfoIsEmptyObjectNotNull(t *testing.T) {
+	ch := Channel{
+		ID:        1,
+		Transport: TransportEndpoint{URI: "https://h.example.com", Protocol: 0},
+		Status:    ChannelStatusPending,
+		Role:      SenderKindOwner,
+	}
+	got, err := EncodeChannel(ch)
+	if err != nil {
+		t.Fatalf("EncodeChannel: %v", err)
+	}
+	if !strings.Contains(string(got), `"communication_info":{}`) {
+		t.Fatalf("expected empty object for nil CommunicationInfo (Rust HashMap never serializes as null), got: %s", got)
+	}
+	if strings.Contains(string(got), `"replica_id":null`) == false {
+		t.Fatalf("expected replica_id:null for nil ReplicaID (Option<u64> has no skip_serializing_if), got: %s", got)
+	}
+}
+
+// DecodeChannel against a hand-written sample matching the exact shape
+// produced by Rust's serde derive (see library/src/protocol/types.rs).
+func TestDecodeChannel_KnownGoodRustSample(t *testing.T) {
+	sample := `{"id":987654321,"transport":{"uri":"https://owner.example.com","protocol":0},` +
+		`"communication_info":{"name":"owner"},"status":"Pending","created_at":42,` +
+		`"role":"ReplicaSource","replica_id":null}`
+
+	ch, err := DecodeChannel([]byte(sample))
+	if err != nil {
+		t.Fatalf("DecodeChannel: %v", err)
+	}
+	if ch.ID != 987654321 {
+		t.Errorf("ID = %d, want 987654321", ch.ID)
+	}
+	if ch.Transport.URI != "https://owner.example.com" || ch.Transport.Protocol != 0 {
+		t.Errorf("Transport = %+v", ch.Transport)
+	}
+	if ch.CommunicationInfo["name"] != "owner" {
+		t.Errorf("CommunicationInfo = %v", ch.CommunicationInfo)
+	}
+	if ch.Status != ChannelStatusPending {
+		t.Errorf("Status = %v, want Pending", ch.Status)
+	}
+	if ch.CreatedAt != 42 {
+		t.Errorf("CreatedAt = %d, want 42", ch.CreatedAt)
+	}
+	if ch.Role != SenderKindReplicaSource {
+		t.Errorf("Role = %v, want ReplicaSource", ch.Role)
+	}
+	if ch.ReplicaID != nil {
+		t.Errorf("ReplicaID = %v, want nil", ch.ReplicaID)
+	}
+}
+
+func TestChannelRoundTrip(t *testing.T) {
+	replicaID := uint64(7)
+	orig := Channel{
+		ID:                5,
+		Transport:         TransportEndpoint{URI: "https://x.example.com", Protocol: 0},
+		CommunicationInfo: map[string]string{"a": "1", "b": "2"},
+		Status:            ChannelStatusPaired,
+		CreatedAt:         999,
+		Role:              SenderKindHelper,
+		ReplicaID:         &replicaID,
+	}
+	wire, err := EncodeChannel(orig)
+	if err != nil {
+		t.Fatalf("EncodeChannel: %v", err)
+	}
+	got, err := DecodeChannel(wire)
+	if err != nil {
+		t.Fatalf("DecodeChannel: %v", err)
+	}
+	if got.ID != orig.ID || got.Transport != orig.Transport || got.Status != orig.Status ||
+		got.CreatedAt != orig.CreatedAt || got.Role != orig.Role || *got.ReplicaID != *orig.ReplicaID {
+		t.Fatalf("round trip mismatch: got %+v, want %+v", got, orig)
+	}
+	if len(got.CommunicationInfo) != 2 || got.CommunicationInfo["a"] != "1" || got.CommunicationInfo["b"] != "2" {
+		t.Fatalf("CommunicationInfo mismatch: %v", got.CommunicationInfo)
+	}
+}
+
+// --- Share: wire shape is ShareRecord { secret_id: String, version: u32,
+// bytes: Vec<u8> } — secret_id stringified, bytes a number array (serde_json's
+// default Vec<u8> representation, not base64).
+
+func TestEncodeShare_MatchesRustJSONShape(t *testing.T) {
+	s := Share{SecretID: 18446744073709551615, Version: 3, Bytes: []byte{1, 2, 255}}
+	got, err := EncodeShare(s)
+	if err != nil {
+		t.Fatalf("EncodeShare: %v", err)
+	}
+	want := `{"secret_id":"18446744073709551615","version":3,"bytes":[1,2,255]}`
+	if string(got) != want {
+		t.Fatalf("EncodeShare mismatch:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func TestEncodeShare_DropsReplicaID(t *testing.T) {
+	rid := uint64(9)
+	s := Share{SecretID: 1, Version: 1, ReplicaID: &rid, Bytes: []byte{9}}
+	got, err := EncodeShare(s)
+	if err != nil {
+		t.Fatalf("EncodeShare: %v", err)
+	}
+	if strings.Contains(string(got), "replica") {
+		t.Fatalf("ShareRecord must never carry replica_id (matches Rust ShareRecord), got: %s", got)
+	}
+}
+
+func TestDecodeShare_KnownGoodRustSample(t *testing.T) {
+	sample := `{"secret_id":"42","version":7,"bytes":[10,20,30]}`
+	s, err := DecodeShare([]byte(sample))
+	if err != nil {
+		t.Fatalf("DecodeShare: %v", err)
+	}
+	if s.SecretID != 42 || s.Version != 7 {
+		t.Errorf("got SecretID=%d Version=%d", s.SecretID, s.Version)
+	}
+	if string(s.Bytes) != string([]byte{10, 20, 30}) {
+		t.Errorf("Bytes = %v", s.Bytes)
+	}
+	if s.ReplicaID != nil {
+		t.Errorf("ReplicaID must decode to nil (matches Rust ShareRecord::into_share), got %v", s.ReplicaID)
+	}
+}
+
+func TestShareListRoundTrip(t *testing.T) {
+	shares := []Share{
+		{SecretID: 1, Version: 1, Bytes: []byte{1}},
+		{SecretID: 2, Version: 2, Bytes: []byte{}},
+	}
+	wire, err := EncodeShareList(shares)
+	if err != nil {
+		t.Fatalf("EncodeShareList: %v", err)
+	}
+	got, err := DecodeShareList(wire)
+	if err != nil {
+		t.Fatalf("DecodeShareList: %v", err)
+	}
+	if len(got) != 2 || got[0].SecretID != 1 || got[1].SecretID != 2 {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestDecodeShareList_EmptyArray(t *testing.T) {
+	got, err := DecodeShareList([]byte(`[]`))
+	if err != nil {
+		t.Fatalf("DecodeShareList: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected empty slice, got %v", got)
+	}
+}
+
+// --- SecretValue: wire shape is SecretValueRecord { kind: u32, bytes: Vec<u8> }.
+
+func TestSecretValueRoundTrip_AllKinds(t *testing.T) {
+	cases := []SecretValue{
+		{Kind: SecretKindSharedKey, Bytes: make([]byte, 32)},
+		{Kind: SecretKindPairingSecret, Bytes: []byte{1, 2, 3}},
+		{Kind: SecretKindPairingContact, Bytes: []byte{4, 5, 6, 7}},
+	}
+	for _, want := range cases {
+		wire, err := EncodeSecretValue(want)
+		if err != nil {
+			t.Fatalf("EncodeSecretValue(kind=%d): %v", want.Kind, err)
+		}
+		got, err := DecodeSecretValue(wire)
+		if err != nil {
+			t.Fatalf("DecodeSecretValue(kind=%d): %v", want.Kind, err)
+		}
+		if got.Kind != want.Kind || string(got.Bytes) != string(want.Bytes) {
+			t.Fatalf("round trip mismatch: got %+v, want %+v", got, want)
+		}
+	}
+}
+
+func TestEncodeSecretValue_MatchesRustJSONShape(t *testing.T) {
+	got, err := EncodeSecretValue(SecretValue{Kind: SecretKindPairingContact, Bytes: []byte{1, 2}})
+	if err != nil {
+		t.Fatalf("EncodeSecretValue: %v", err)
+	}
+	want := `{"kind":2,"bytes":[1,2]}`
+	if string(got) != want {
+		t.Fatalf("mismatch:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func TestDecodeSecretValue_RejectsBadSharedKeyLength(t *testing.T) {
+	// Rust: "SharedKey payload must be 32 bytes" — SecretValueRecord::into_value.
+	sample := `{"kind":0,"bytes":[1,2,3]}`
+	if _, err := DecodeSecretValue([]byte(sample)); err == nil {
+		t.Fatal("expected error for SharedKey payload != 32 bytes")
+	}
+}
+
+func TestDecodeSecretValue_RejectsUnknownKind(t *testing.T) {
+	sample := `{"kind":9,"bytes":[]}`
+	if _, err := DecodeSecretValue([]byte(sample)); err == nil {
+		t.Fatal("expected error for unknown SecretKind")
+	}
+}
+
+// --- StateKey: wire shape is StateKeyRecord { kind: u32, channel_id:
+// Option<String>, version: Option<u32> }, absent fields omitted.
+
+func TestStateKeyRoundTrip_AllKinds(t *testing.T) {
+	cid := uint64(10)
+	ver := uint32(3)
+	cases := []StateKey{
+		{Kind: StateKindPendingVerification, ChannelID: &cid},
+		{Kind: StateKindPendingRecovery, Version: &ver},
+		{Kind: StateKindPendingUnpair, ChannelID: &cid},
+		{Kind: StateKindSharingRound},
+	}
+	for _, want := range cases {
+		wire, err := EncodeStateKey(want)
+		if err != nil {
+			t.Fatalf("EncodeStateKey(kind=%d): %v", want.Kind, err)
+		}
+		got, err := DecodeStateKey(wire)
+		if err != nil {
+			t.Fatalf("DecodeStateKey(kind=%d): %v", want.Kind, err)
+		}
+		if got.Kind != want.Kind {
+			t.Fatalf("Kind mismatch: got %d want %d", got.Kind, want.Kind)
+		}
+		if (got.ChannelID == nil) != (want.ChannelID == nil) {
+			t.Fatalf("ChannelID presence mismatch for kind=%d", want.Kind)
+		}
+		if want.ChannelID != nil && *got.ChannelID != *want.ChannelID {
+			t.Fatalf("ChannelID mismatch: got %v want %v", got.ChannelID, want.ChannelID)
+		}
+		if (got.Version == nil) != (want.Version == nil) {
+			t.Fatalf("Version presence mismatch for kind=%d", want.Kind)
+		}
+	}
+}
+
+func TestEncodeStateKey_OmitsAbsentFields(t *testing.T) {
+	got, err := EncodeStateKey(StateKey{Kind: StateKindSharingRound})
+	if err != nil {
+		t.Fatalf("EncodeStateKey: %v", err)
+	}
+	want := `{"kind":3}`
+	if string(got) != want {
+		t.Fatalf("mismatch:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func TestDecodeStateKey_KnownGoodRustSample(t *testing.T) {
+	sample := `{"kind":0,"channel_id":"55"}`
+	k, err := DecodeStateKey([]byte(sample))
+	if err != nil {
+		t.Fatalf("DecodeStateKey: %v", err)
+	}
+	if k.Kind != StateKindPendingVerification || k.ChannelID == nil || *k.ChannelID != 55 {
+		t.Fatalf("got %+v", k)
+	}
+}
+
+// --- StateItem: wire shape is StateItemRecord (see stores.rs). Field
+// presence is driven by Kind, per StateItem's From/into_item impls.
+
+func TestStateItemRoundTrip_PendingVerification(t *testing.T) {
+	cid := uint64(11)
+	want := StateItem{Kind: StateKindPendingVerification, ChannelID: &cid, Bytes: []byte{1, 2, 3}}
+	wire, err := EncodeStateItem(want)
+	if err != nil {
+		t.Fatalf("EncodeStateItem: %v", err)
+	}
+	got, err := DecodeStateItem(wire)
+	if err != nil {
+		t.Fatalf("DecodeStateItem: %v", err)
+	}
+	if got.Kind != want.Kind || *got.ChannelID != *want.ChannelID || string(got.Bytes) != string(want.Bytes) {
+		t.Fatalf("mismatch: got %+v want %+v", got, want)
+	}
+}
+
+func TestStateItemRoundTrip_PendingRecovery(t *testing.T) {
+	ver := uint32(4)
+	want := StateItem{Kind: StateKindPendingRecovery, Version: &ver, Shares: [][]byte{{1, 2}, {3, 4, 5}}}
+	wire, err := EncodeStateItem(want)
+	if err != nil {
+		t.Fatalf("EncodeStateItem: %v", err)
+	}
+	got, err := DecodeStateItem(wire)
+	if err != nil {
+		t.Fatalf("DecodeStateItem: %v", err)
+	}
+	if got.Kind != want.Kind || *got.Version != *want.Version || len(got.Shares) != 2 {
+		t.Fatalf("mismatch: got %+v want %+v", got, want)
+	}
+}
+
+// PendingRecovery with zero shares must still emit "shares":[] on the wire
+// (Rust always wraps Some(...) for this variant, even over an empty vec —
+// it is not the same as the field being entirely absent).
+func TestEncodeStateItem_PendingRecoveryEmptySharesStillPresent(t *testing.T) {
+	ver := uint32(1)
+	got, err := EncodeStateItem(StateItem{Kind: StateKindPendingRecovery, Version: &ver, Shares: [][]byte{}})
+	if err != nil {
+		t.Fatalf("EncodeStateItem: %v", err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	sharesRaw, ok := raw["shares"]
+	if !ok {
+		t.Fatalf("expected \"shares\" key to be present even when empty, got: %s", got)
+	}
+	if string(sharesRaw) != "[]" {
+		t.Fatalf("expected shares:[], got %s", sharesRaw)
+	}
+}
+
+func TestStateItemRoundTrip_PendingUnpair(t *testing.T) {
+	cid := uint64(20)
+	sa := uint64(1700000000)
+	want := StateItem{Kind: StateKindPendingUnpair, ChannelID: &cid, StartedAt: &sa}
+	wire, err := EncodeStateItem(want)
+	if err != nil {
+		t.Fatalf("EncodeStateItem: %v", err)
+	}
+	got, err := DecodeStateItem(wire)
+	if err != nil {
+		t.Fatalf("DecodeStateItem: %v", err)
+	}
+	if got.Kind != want.Kind || *got.ChannelID != *want.ChannelID || *got.StartedAt != *want.StartedAt {
+		t.Fatalf("mismatch: got %+v want %+v", got, want)
+	}
+}
+
+func TestStateItemRoundTrip_SharingRound(t *testing.T) {
+	ver := uint32(2)
+	sa := uint64(1234)
+	want := StateItem{
+		Kind:      StateKindSharingRound,
+		Version:   &ver,
+		StartedAt: &sa,
+		Pending:   []uint64{1, 2},
+		Confirmed: []uint64{3},
+		Failed:    []uint64{},
+	}
+	wire, err := EncodeStateItem(want)
+	if err != nil {
+		t.Fatalf("EncodeStateItem: %v", err)
+	}
+	got, err := DecodeStateItem(wire)
+	if err != nil {
+		t.Fatalf("DecodeStateItem: %v", err)
+	}
+	if got.Kind != want.Kind || *got.Version != *want.Version || *got.StartedAt != *want.StartedAt {
+		t.Fatalf("mismatch: got %+v want %+v", got, want)
+	}
+	if len(got.Pending) != 2 || len(got.Confirmed) != 1 || len(got.Failed) != 0 {
+		t.Fatalf("set mismatch: got %+v", got)
+	}
+}
+
+func TestDecodeStateItem_KnownGoodRustSample_SharingRound(t *testing.T) {
+	sample := `{"kind":3,"version":5,"started_at":"1700000000","pending":["1","2"],"confirmed":[],"failed":["3"]}`
+	item, err := DecodeStateItem([]byte(sample))
+	if err != nil {
+		t.Fatalf("DecodeStateItem: %v", err)
+	}
+	if item.Kind != StateKindSharingRound || *item.Version != 5 || *item.StartedAt != 1700000000 {
+		t.Fatalf("got %+v", item)
+	}
+	if len(item.Pending) != 2 || item.Pending[0] != 1 || item.Pending[1] != 2 {
+		t.Fatalf("Pending = %v", item.Pending)
+	}
+	if len(item.Confirmed) != 0 {
+		t.Fatalf("Confirmed = %v", item.Confirmed)
+	}
+	if len(item.Failed) != 1 || item.Failed[0] != 3 {
+		t.Fatalf("Failed = %v", item.Failed)
+	}
+}
+
+func TestDecodeStateItem_SharingRoundRequiresAllThreeSets(t *testing.T) {
+	// Rust: parse_channel_id_set errors "SharingRound requires {field}" when
+	// the field is absent entirely (None), not merely empty.
+	sample := `{"kind":3,"version":1,"started_at":"1"}`
+	if _, err := DecodeStateItem([]byte(sample)); err == nil {
+		t.Fatal("expected error when pending/confirmed/failed are absent")
+	}
+}
+
+func TestStateItemKey(t *testing.T) {
+	cid := uint64(5)
+	item := StateItem{Kind: StateKindPendingVerification, ChannelID: &cid}
+	key := item.Key()
+	if key.Kind != StateKindPendingVerification || key.ChannelID == nil || *key.ChannelID != 5 {
+		t.Fatalf("Key() = %+v", key)
+	}
+}
+
+// --- UserSecrets: wire shape is UserSecretsRecord { version, secrets:
+// [UserSecretRecord], description: Option<String> }.
+
+func TestUserSecretsRoundTrip(t *testing.T) {
+	desc := "v1"
+	want := UserSecrets{
+		Version: 1,
+		Secrets: []UserSecret{
+			{ID: []byte{1}, Name: "a", Data: []byte{9, 9}},
+			{ID: []byte{2}, Name: "b", Data: []byte{}},
+		},
+		Description: &desc,
+	}
+	wire, err := EncodeUserSecrets(want)
+	if err != nil {
+		t.Fatalf("EncodeUserSecrets: %v", err)
+	}
+	got, err := DecodeUserSecrets(wire)
+	if err != nil {
+		t.Fatalf("DecodeUserSecrets: %v", err)
+	}
+	if got.Version != want.Version || len(got.Secrets) != 2 || *got.Description != desc {
+		t.Fatalf("mismatch: got %+v", got)
+	}
+	if got.Secrets[0].Name != "a" || string(got.Secrets[0].Data) != string([]byte{9, 9}) {
+		t.Fatalf("Secrets[0] = %+v", got.Secrets[0])
+	}
+}
+
+func TestEncodeUserSecrets_NoDescriptionOmitsField(t *testing.T) {
+	got, err := EncodeUserSecrets(UserSecrets{Version: 1, Secrets: nil})
+	if err != nil {
+		t.Fatalf("EncodeUserSecrets: %v", err)
+	}
+	want := `{"version":1,"secrets":[]}`
+	if string(got) != want {
+		t.Fatalf("mismatch:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+// --- uint array helpers used for channel-id / version lists that cross
+// the FFI as plain JSON number arrays (Vec<u64>/Vec<u32>, never
+// stringified).
+
+func TestUint64ArrayRoundTrip(t *testing.T) {
+	want := []uint64{1, 2, 18446744073709551615}
+	wire, err := EncodeUint64Array(want)
+	if err != nil {
+		t.Fatalf("EncodeUint64Array: %v", err)
+	}
+	if string(wire) != `[1,2,18446744073709551615]` {
+		t.Fatalf("unexpected wire shape (must be a plain number array, not strings): %s", wire)
+	}
+	got, err := DecodeUint64Array(wire)
+	if err != nil {
+		t.Fatalf("DecodeUint64Array: %v", err)
+	}
+	if len(got) != 3 || got[2] != 18446744073709551615 {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestUint32ArrayRoundTrip(t *testing.T) {
+	want := []uint32{7, 8}
+	wire, err := EncodeUint32Array(want)
+	if err != nil {
+		t.Fatalf("EncodeUint32Array: %v", err)
+	}
+	got, err := DecodeUint32Array(wire)
+	if err != nil {
+		t.Fatalf("DecodeUint32Array: %v", err)
+	}
+	if len(got) != 2 || got[0] != 7 || got[1] != 8 {
+		t.Fatalf("got %v", got)
+	}
+}
+
+// --- JSONByteArray: the core reason a naive struct-tag []byte field would
+// be wrong here — Go's encoding/json base64-encodes []byte by default,
+// but serde_json's default Vec<u8> representation is a number array.
+
+func TestJsonByteArray_MarshalsAsNumberArrayNotBase64(t *testing.T) {
+	b := JSONByteArray{0, 1, 255}
+	out, err := json.Marshal(b)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if string(out) != "[0,1,255]" {
+		t.Fatalf("expected number array, got %s (base64 would be wrong here)", out)
+	}
+}
+
+func TestJsonByteArray_UnmarshalRejectsOutOfRange(t *testing.T) {
+	var b JSONByteArray
+	if err := json.Unmarshal([]byte("[1,2,300]"), &b); err == nil {
+		t.Fatal("expected error for byte value out of range")
+	}
+}

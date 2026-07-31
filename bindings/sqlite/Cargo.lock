@@ -419,7 +419,7 @@ dependencies = [
 
 [[package]]
 name = "derec-cryptography"
-version = "0.0.1-alpha.8"
+version = "0.0.1-alpha.9"
 dependencies = [
  "aead",
  "aes",
@@ -443,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "derec-library"
-version = "0.0.1-alpha.8"
+version = "0.0.1-alpha.9"
 dependencies = [
  "ark-serialize",
  "console_error_panic_hook",
@@ -472,7 +472,7 @@ dependencies = [
 
 [[package]]
 name = "derec-proto"
-version = "0.0.1-alpha.8"
+version = "0.0.1-alpha.9"
 dependencies = [
  "prost",
  "prost-build",

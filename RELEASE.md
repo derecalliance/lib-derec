@@ -345,6 +345,78 @@ This confirms that the correct native library is resolved for the host platform.
 
 ---
 
+## Publishing Go SDK
+
+The Go SDK lives at `packages/go` (module
+`github.com/derecalliance/lib-derec/packages/go`). It is a `purego`-based,
+no-cgo binding over the C ABI. **Go has no binary package registry** — the
+module is published by pushing a git tag, and consumers fetch the source via
+`go get`. Because of that, the per-platform native libraries are **embedded
+in the module and committed to the repository** (unlike the .NET/npm packages,
+whose native artifacts are built at pack time).
+
+### Build and stage the native libraries
+
+```bash
+cd library
+make go
+```
+
+`make go` runs `scripts/prepare-go-package.sh`, which cross-compiles the native
+library (with `--features ffi`) for all four supported platforms and stages
+each into the Go embed tree:
+
+```
+packages/go/internal/native/lib/darwin_arm64/libderec_library.dylib
+packages/go/internal/native/lib/darwin_amd64/libderec_library.dylib
+packages/go/internal/native/lib/linux_amd64/libderec_library.so
+packages/go/internal/native/lib/linux_arm64/libderec_library.so
+```
+
+The same cross-compilation prerequisites as the .NET build apply
+(`cargo-zigbuild`, `zig`, the four rustup targets).
+
+### Verify before tagging
+
+```bash
+cd packages/go && CGO_ENABLED=0 go test ./...
+cd ../bindings/go && CGO_ENABLED=0 go run .
+```
+
+Both must pass. Confirm each staged lib exports the FFI surface, e.g.
+`nm -gU packages/go/internal/native/lib/darwin_arm64/libderec_library.dylib | grep derec_protocol_new`.
+
+### Commit and tag
+
+Commit the SDK **including the regenerated native libs**, then push a
+module-scoped tag. Go modules in a subdirectory use the
+`<subdir>/vX.Y.Z` tag format (semver, prerelease suffixes allowed):
+
+```bash
+git tag packages/go/vX.Y.Z
+git push origin packages/go/vX.Y.Z
+```
+
+Replace `X.Y.Z` with the released version (e.g. `packages/go/v0.0.1-alpha.9`).
+This is distinct from the repository-wide `vX.Y.Z` tag in the Git Tagging
+section below.
+
+### Verify the release
+
+```bash
+go install github.com/derecalliance/lib-derec/packages/go/...@vX.Y.Z
+```
+
+Or in a test project:
+
+```bash
+go get github.com/derecalliance/lib-derec/packages/go@vX.Y.Z
+```
+
+`pkg.go.dev` indexes the module on its first fetch; the README renders there.
+
+---
+
 ## Release Checklist
 
 Before publishing a release:
