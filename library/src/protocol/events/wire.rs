@@ -21,9 +21,8 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
+use crate::protocol::utils::{pending_action_wire, reserved_keys::encode_replica_id};
 use crate::protocol::{
-    pending_action_wire,
-    reserved_keys::encode_replica_id,
     types::{ChannelShare, Secret},
     DeRecEvent, PendingAction,
 };

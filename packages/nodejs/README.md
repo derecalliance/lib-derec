@@ -318,6 +318,13 @@ for (const ev of events) {
 Errors surface as objects with a `code` field — `ALREADY_RESTORED`,
 `CONFLICT` (with `channel_ids`), `INVARIANT`, or `STORAGE`.
 
+> **Secret format:** the recoverable secret (the bytes helpers store and
+> recovery reconstructs) is `[version byte] · payload` — v1's payload is
+> **gzip (RFC 1952)** compressed **JSON**, with byte fields as **standard
+> base64 with padding (RFC 4648 §4)** and `u64` fields as decimal strings.
+> See the `derec-library` `protocol::types::secret` reference documentation
+> for the full field schema.
+
 ---
 
 ## Verification Flow

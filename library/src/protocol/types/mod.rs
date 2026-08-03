@@ -20,6 +20,10 @@ use derec_proto::ContactMessage;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+pub mod secret;
+
+pub use secret::{HelperInfo, ReplicaInfo, Replicas, Secret, UserSecret};
+
 /// Selects which channels to target for a discovery request.
 #[derive(Debug, Clone)]
 pub enum Target {
@@ -112,57 +116,6 @@ pub struct Channel {
     pub replica_id: Option<u64>,
 }
 
-/// Per-helper metadata stored inside the secret bag for recovery.
-///
-/// Each entry records the pairing state of a Helper so that recovery can
-/// re-establish communication channels without external configuration.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct HelperInfo {
-    /// Unique channel identifier assigned during pairing.
-    #[prost(uint64, tag = "1")]
-    pub channel_id: u64,
-    /// The Helper's message endpoint URI.
-    #[prost(string, tag = "2")]
-    pub transport_uri: ::prost::alloc::string::String,
-    /// Symmetric key negotiated during pairing (32 bytes).
-    #[prost(bytes = "vec", tag = "4")]
-    pub shared_key: ::prost::alloc::vec::Vec<u8>,
-    /// App-level identity metadata for this helper. Free-form key/value
-    /// pairs — the protocol treats it as opaque, never inspects keys or
-    /// values, and copies it verbatim from [`Channel::communication_info`]
-    /// at protect-time. A recovering owner who decodes the bag can use
-    /// this to recognise each helper (e.g. by a `"name"` key the app set
-    /// on pairing).
-    ///
-    /// **Wire stability**: the now-removed `name: String` was previously at
-    /// tag 3. Using tag 5 lets prost silently drop the old `name` field
-    /// when decoding legacy bags (empty `communication_info`), and lets
-    /// older codebases silently drop this new field when decoding new
-    /// bags. Degraded but not broken in either direction.
-    #[prost(map = "string, string", tag = "5")]
-    pub communication_info:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-}
-
-/// A single user-facing secret within the bag.
-///
-/// The Owner can store multiple logical secrets (credentials, keys, notes)
-/// inside a single secret bag. Each `UserSecret` is independently
-/// identifiable so the application can present, add, or remove individual
-/// entries while the protocol treats the entire bag as one opaque blob.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct UserSecret {
-    /// Application-defined identifier.
-    #[prost(bytes = "vec", tag = "1")]
-    pub id: ::prost::alloc::vec::Vec<u8>,
-    /// Human-readable label.
-    #[prost(string, tag = "2")]
-    pub name: ::prost::alloc::string::String,
-    /// Raw secret bytes.
-    #[prost(bytes = "vec", tag = "3")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
-}
-
 /// Snapshot of the user-facing secret contents persisted by
 /// [`crate::protocol::DeRecUserSecretStore`] for one `secret_id`.
 ///
@@ -190,93 +143,7 @@ pub struct UserSecrets {
     pub replicas: Option<Replicas>,
 }
 
-/// Per-replica metadata stored inside the [`Secret`] — mirrors
-/// [`HelperInfo`] but for the replica role and carries the extra
-/// `replica_id` + `sender_kind` fields needed by the replica model.
-///
-/// **No per-pair key**: all replica channels for a given `secret_id`
-/// converge on a single group key (see [`ReplicaSecretPayload::shared_key`]
-/// for how that key is handed off to a new joiner). Each replica's
-/// `(secret_id, channel_id)` entry in
-/// [`crate::protocol::DeRecSecretStore`] holds that same group key, so
-/// any replica can address any other replica's peers by loading the
-/// channel key from its own secret store — this struct does not need to
-/// carry it.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ReplicaInfo {
-    /// Channel identifier the originator uses to address this peer.
-    #[prost(uint64, tag = "1")]
-    pub channel_id: u64,
-    /// The peer's message endpoint URI.
-    #[prost(string, tag = "2")]
-    pub transport_uri: ::prost::alloc::string::String,
-    /// App-level identity metadata for this peer. Same opacity contract
-    /// as [`HelperInfo::communication_info`].
-    #[prost(map = "string, string", tag = "4")]
-    pub communication_info:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-    /// The peer's `replica_id` — global stable identity of the replica
-    /// device, separate from the per-channel `channel_id`.
-    #[prost(uint64, tag = "5")]
-    pub replica_id: u64,
-    /// Raw `SenderKind` value the peer played in this pair (typically
-    /// `REPLICA_SOURCE` or `REPLICA_DESTINATION`). Carried for future
-    /// conflict-resolution flows; not used by the protocol layer today.
-    #[prost(int32, tag = "6")]
-    pub sender_kind: i32,
-}
-
-/// The protocol's `secret` — serialized into `DeRecSecret.secret_data`.
-///
-/// This is the actual payload that gets protobuf-encoded, then placed into
-/// the `secret_data` bytes field of the canonical `DeRecSecret` protobuf
-/// message before encryption and distribution. Matches the DeRec
-/// specification's `secret` term (distinct from a `UserSecret` entry,
-/// which is one application-defined item *inside* this struct).
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct Secret {
-    /// Snapshot of all paired Helpers at the time of distribution.
-    #[prost(message, repeated, tag = "1")]
-    pub helpers: ::prost::alloc::vec::Vec<HelperInfo>,
-    /// The user-facing secrets the Owner wishes to protect.
-    #[prost(message, repeated, tag = "2")]
-    pub secrets: ::prost::alloc::vec::Vec<UserSecret>,
-    /// Replica composite: the destination peers, the per-helper share
-    /// map, and the group key. `None` when this `secret_id` has no
-    /// replica setup. See [`Replicas`] for field semantics.
-    #[prost(message, optional, tag = "3")]
-    pub replicas: ::core::option::Option<Replicas>,
-    /// The `replica_id` of the device that created or last updated this
-    /// version of the secret. Used by Destinations to attribute origin
-    /// and will drive future conflict-resolution logic.
-    #[prost(uint64, tag = "4")]
-    pub owner_replica_id: u64,
-}
-
-/// Replica composite carried inside [`Secret`] — the destination
-/// roster + the 32-byte group key shared by every replica channel.
-///
-/// The per-helper share map is *not* part of this composite: VSS
-/// shares are derived from the encoded `Secret` bytes and so cannot
-/// be embedded inside the `Secret` itself. The wire-level share map
-/// rides on [`ReplicaSecretPayload`] alongside the encoded `Secret`
-/// instead.
-///
-/// `shared_key` must be 32 bytes when [`Self::replicas`] is
-/// non-empty. The library enforces this invariant on the producer
-/// side during sharing round construction and on the consumer side in
-/// [`crate::protocol::DeRecProtocol::restore`].
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct Replicas {
-    /// Snapshot of all paired Replica Destinations at protect time.
-    #[prost(message, repeated, tag = "1")]
-    pub replicas: ::prost::alloc::vec::Vec<ReplicaInfo>,
-    /// 32-byte replica group key.
-    #[prost(bytes = "vec", tag = "2")]
-    pub shared_key: ::prost::alloc::vec::Vec<u8>,
-}
-
-/// A single helper's share of the current secret bag — wire-pairs a
+/// A single helper's share of the current secret — wire-pairs a
 /// `channel_id` with the serialized `CommittedDeRecShare` bytes that
 /// were sent to that helper. Part of [`ReplicaSecretPayload`].
 #[derive(Clone, PartialEq, ::prost::Message)]

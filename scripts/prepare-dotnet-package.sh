@@ -10,6 +10,12 @@ DOTNET_PKG_DIR="$ROOT_DIR/packages/dotnet/DeRec.Library"
 RUNTIMES_DIR="$DOTNET_PKG_DIR/runtimes"
 
 # Rust target -> NuGet RID -> expected library filename
+#
+# Windows (x86_64-pc-windows-msvc -> win-x64 -> derec_library.dll) is not built
+# here yet: the release pipeline produces no Windows artifact. The .csproj already
+# has a guarded win-x64 pack slot, so a future Windows CI target only needs to
+# cross-build the DLL and stage it at runtimes/win-x64/native/ — adding an entry
+# below is what would build it here, but is not required for the csproj to pack it.
 TARGETS=(
   "aarch64-apple-darwin|osx-arm64|libderec_library.dylib"
   "x86_64-apple-darwin|osx-x64|libderec_library.dylib"

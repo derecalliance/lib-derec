@@ -43,6 +43,15 @@
           Pack="true"
           PackagePath="runtimes/linux-arm64/native/"
           Condition="Exists('runtimes/linux-arm64/native/libderec_library.so')" />
+
+      <!-- Windows is not produced by the release build yet. This slot is a
+           no-op until a `derec_library.dll` is staged at
+           runtimes/win-x64/native/, at which point `dotnet pack` includes it
+           automatically. See the README's "Platform support" section. -->
+      <None Include="runtimes/win-x64/native/derec_library.dll"
+          Pack="true"
+          PackagePath="runtimes/win-x64/native/"
+          Condition="Exists('runtimes/win-x64/native/derec_library.dll')" />
   </ItemGroup>
 
   <!--
@@ -81,6 +90,13 @@
       <Content Include="runtimes/linux-x64/native/libderec_library.so"
           Condition="Exists('runtimes/linux-x64/native/libderec_library.so')"
           Link="libderec_library.so"
+          Pack="false"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(_IsPacking)' != 'true' AND '$([MSBuild]::IsOSPlatform(Windows))' == 'true' AND '$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)' == 'X64'">
+      <Content Include="runtimes/win-x64/native/derec_library.dll"
+          Condition="Exists('runtimes/win-x64/native/derec_library.dll')"
+          Link="derec_library.dll"
           Pack="false"
           CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>

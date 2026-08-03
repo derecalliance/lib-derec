@@ -20,6 +20,35 @@ dotnet add package DeRec.Library
 
 No additional native dependencies are required. The package includes the native DeRec library.
 
+### Platform support
+
+| Platform | Architectures | Status |
+| --- | --- | --- |
+| macOS | arm64, x64 | ✅ Supported — native library ships in the package |
+| Linux | arm64, x64 | ✅ Supported — native library ships in the package |
+| Windows | x64 | ⚠️ Not yet supported — see below |
+
+**Windows is not supported by the published package yet.** The release build does
+not produce a Windows native library, so no `win-x64` binary ships today. Package
+support is *wired but dormant*: the `.csproj` already declares the
+`runtimes/win-x64/native/derec_library.dll` slot behind an `Exists(...)` guard, so
+it stays a no-op until a DLL is staged there. Automated Windows artifacts are
+planned.
+
+To produce and pack the Windows DLL yourself (no Windows machine is needed to
+*build* it — only to *validate* that it loads):
+
+1. Cross-compile the Rust core to Windows from any OS — e.g.
+   `x86_64-pc-windows-msvc` via [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin),
+   or `x86_64-pc-windows-gnu` via MinGW.
+2. Stage the resulting `derec_library.dll` at
+   `packages/dotnet/DeRec.Library/runtimes/win-x64/native/`.
+3. Run `dotnet pack` — the DLL is included automatically, and the produced package
+   gains a `win-x64` runtime alongside the four Unix RIDs.
+
+Cross-building alone does not confirm the artifact works at runtime; loading and
+running it is only validated on a Windows environment (e.g. a Windows CI runner).
+
 ---
 
 ## Design Overview
@@ -303,6 +332,13 @@ to `protocol.RestoreAsync(secret, version)` on a fresh `DeRecProtocol` to
 commit canonical helper / replica state and wipe the throwaway recovery-mode
 channels. Errors throw `DeRecException` with `Code` in
 {`AlreadyRestored`, `RestoreConflict`, `Invariant`, store-category code}.
+
+> **Secret format:** the `recovered` bytes above (and the recoverable secret
+> data underlying `Secret`) are `[version byte] · payload` — v1's payload is
+> **gzip (RFC 1952)** compressed **JSON**, with byte fields as **standard
+> base64 with padding (RFC 4648 §4)** and `u64` fields as decimal strings.
+> See the `derec-library` `protocol::types::secret` reference documentation
+> for the full field schema.
 
 ---
 
