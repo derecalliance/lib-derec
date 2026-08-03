@@ -733,12 +733,15 @@ fn build_replica_composite(
 }
 
 /// Wrap the [`Secret`] in a [`DeRecSecret`] envelope ready to be
-/// VSS-split for helper distribution. The helper side reconstructs the
-/// `DeRecSecret` from a `threshold`-sized subset of shares; the inner
-/// `secret_data` then decodes back to the original [`Secret`].
+/// VSS-split for helper distribution. The inner `secret_data` is the
+/// secret's JSON encoding (gzip-compressed; see [`crate::protocol::types::secret`]);
+/// the outer
+/// `DeRecSecret` envelope remains protobuf. The helper side reconstructs
+/// the `DeRecSecret` from a `threshold`-sized subset of shares and decodes
+/// `secret_data` back to the original [`Secret`].
 fn wrap_for_helper_split(secret: &Secret, threshold: usize) -> Vec<u8> {
     let derec_secret = DeRecSecret {
-        secret_data: secret.encode_to_vec(),
+        secret_data: secret.encode(),
         creation_time: None,
         helper_threshold_for_recovery: threshold as i64,
         helper_threshold_for_confirming_share_receipt: threshold as i64,
@@ -967,7 +970,7 @@ async fn distribute_composite_to_destinations<Ss: DeRecSecretStore, T: DeRecTran
         secret_id = secret_id,
         version = version,
         count = replicas.len(),
-        "secret bag distributed to replicas"
+        "secret distributed to replicas"
     );
 
     results

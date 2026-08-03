@@ -124,7 +124,7 @@ pub unsafe extern "C" fn derec_protocol_process(
 /// [`crate::protocol::DeRecProtocol::accept`]. The `action_bytes` blob
 /// is the exact payload the caller received in the event — the FFI
 /// wire format is the encoding produced by
-/// [`crate::protocol::pending_action_wire::serialize`].
+/// [`crate::protocol::utils::pending_action_wire::serialize`].
 ///
 /// # Safety
 ///
@@ -144,7 +144,7 @@ pub unsafe extern "C" fn derec_protocol_accept(
         return ffi_error(DEREC_CODE_FFI_NULL_PTR, "action_ptr is null or len == 0").into();
     }
     let bytes = unsafe { std::slice::from_raw_parts(action_ptr, action_len) };
-    let action = match crate::protocol::pending_action_wire::deserialize(bytes) {
+    let action = match crate::protocol::utils::pending_action_wire::deserialize(bytes) {
         Ok(a) => a,
         Err(e) => {
             return ffi_error(
@@ -194,7 +194,7 @@ pub unsafe extern "C" fn derec_protocol_reject(
         return ffi_error(DEREC_CODE_FFI_NULL_PTR, "action_ptr is null or len == 0");
     }
     let bytes = unsafe { std::slice::from_raw_parts(action_ptr, action_len) };
-    let action = match crate::protocol::pending_action_wire::deserialize(bytes) {
+    let action = match crate::protocol::utils::pending_action_wire::deserialize(bytes) {
         Ok(a) => a,
         Err(e) => {
             return ffi_error(DEREC_CODE_FFI_BAD_PROTO, format!("PendingAction decode: {e}"));

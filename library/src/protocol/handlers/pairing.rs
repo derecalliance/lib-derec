@@ -9,7 +9,7 @@ use crate::{
     Error, Result,
     derec_message::{DeRecMessageBuilder, current_timestamp},
     primitives::pairing::{PairingError, request, response},
-    protocol::reserved_keys,
+    protocol::utils::reserved_keys,
     types::ChannelId,
     utils::{ContactMessageExt as _, SenderKindExt as _},
 };

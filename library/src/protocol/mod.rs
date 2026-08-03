@@ -63,16 +63,14 @@
 //! replica-mode pairing envelopes). Apps SHOULD NOT use this namespace;
 //! the orchestrator silently auto-injects, extracts, and strips
 //! `derec.*` entries at the protocol boundary. See
-//! [`reserved_keys`] for the current set of keys and their wire
+//! [`utils::reserved_keys`] for the current set of keys and their wire
 //! encoding.
 
 pub mod error;
 pub mod events;
-#[cfg(any(feature = "ffi", target_arch = "wasm32"))]
-pub(crate) mod pending_action_wire;
-pub mod reserved_keys;
 pub mod traits;
 pub mod types;
+pub mod utils;
 
 mod builder;
 mod handlers;

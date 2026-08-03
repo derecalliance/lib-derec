@@ -34,6 +34,7 @@ Alliance**.
 - [Transport layer](#transport-layer)
 - [Observability](#observability)
 - [Primitives (advanced)](#primitives-advanced)
+- [Secret format](#secret-format)
 - [Protocol specification](#protocol-specification)
 - [Security considerations](#security-considerations)
 - [License](#license)
@@ -1097,6 +1098,34 @@ orchestrator emits `DeRecEvent::ActionRequired { channel_id, action }` with
 `protocol.accept(action)` to drop local state and reply `Ok`, or
 `protocol.reject(action, status, memo)` to keep local state and reply with a
 non-`Ok` status.
+
+---
+
+## Secret format
+
+The recoverable secret — the bytes reconstructed from a threshold of shares
+(`recovered.secret_data` in [Recovery](#recovery) above) — is `[version byte]
+· payload`. The leading byte is the format major version; for v1 the payload
+is **gzip (RFC 1952) compressed JSON**. Within that JSON:
+
+- every byte-array field (`shared_key`, `id`, `data`, …) is **standard base64
+  with padding (RFC 4648 §4)** — never base64url;
+- every `u64` field is a JSON **decimal string** (e.g. `"1000000"`), not a
+  JSON number, to avoid precision loss;
+- object keys are `snake_case`.
+
+This format is deliberately independent of the DeRec wire protocol: transport
+messages (`DeRecMessage`, `StoreShareRequest`, `ReplicaSecretPayload`, etc.)
+remain protobuf and are unaffected. Only the recoverable secret placed in
+`secret_data` uses this versioned envelope (v1: JSON + base64 + gzip), which
+makes it a self-describing, cross-application interoperability surface — any
+implementation can read the version byte, gunzip, parse the JSON, and
+base64-decode the byte fields without sharing code or a compiled schema with
+the producer.
+
+The full field-by-field schema, encoding pipeline, and versioning rules are
+normatively defined in the crate documentation for the
+`derec_library::protocol::types::secret` module.
 
 ---
 

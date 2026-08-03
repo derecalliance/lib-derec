@@ -229,6 +229,12 @@ recovered, err := recovery.Response.Recover([]recovery.ShareResponse{
 
 `Recover` requires every response to agree on the same Merkle root and ciphertext; an inconsistent or below-threshold set is reported as a `*derec.Error`, not a corrupted result.
 
+> **Secret format:** `recovered` is `[version byte] · payload` — v1's payload
+> is **gzip (RFC 1952)** compressed **JSON**, with byte fields as **standard
+> base64 with padding (RFC 4648 §4)** and `u64` fields as decimal strings.
+> See the `derec-library` `protocol::types::secret` reference documentation
+> for the full field schema.
+
 ---
 
 ## Discovery Flow

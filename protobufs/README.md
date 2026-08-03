@@ -77,6 +77,17 @@ The protocol defines three roles via the `SenderKind` enum:
 | `committedderecshare.proto` | `CommittedDeRecShare` | Share data with Merkle proof commitment |
 | `derecsecret.proto` | `DeRecSecret` | Secret metadata |
 
+### `DeRecSecret.secretData`
+
+`secretData` is `bytes` and opaque to this crate — this schema only describes
+its envelope, not its contents. When produced by `derec-library`, those bytes
+are the recoverable secret: a **1-byte version prefix** followed by a
+versioned payload (v1 = **gzip (RFC 1952)** compressed **JSON**, with byte
+fields as **standard base64 with padding (RFC 4648 §4)** and `u64` fields as
+decimal strings). This format is independent of the protobuf wire protocol
+described in this crate; its full field schema is defined in the
+`derec-library` documentation (the `protocol::types::secret` module).
+
 ### MessageBody Envelope
 
 All protocol messages are wrapped in the `MessageBody` oneof inside

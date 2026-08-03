@@ -206,7 +206,7 @@ pub trait DeRecChannelStore {
     ) -> ChannelStoreFuture<'_, bool>;
 
     /// Return every channel stored under `secret_id`. Used by the
-    /// protocol to enumerate paired peers when building the secret bag
+    /// protocol to enumerate paired peers when building the secret
     /// and when fanning out broadcast flows.
     fn channels(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<Channel>>;
 

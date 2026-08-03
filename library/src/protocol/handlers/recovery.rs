@@ -147,8 +147,6 @@ pub(in crate::protocol) async fn start<
     Ok(events)
 }
 
-/// Send a single recovery share request; failure isolated so [`start`]
-/// can surface it as a per-channel `RecoverSecretFailed` event.
 async fn dispatch_one<T: DeRecTransport>(
     transport: &T,
     channel_id: ChannelId,
@@ -352,18 +350,6 @@ async fn on_response<St: DeRecStateStore>(
 
     let event = match response::recover(secret_id, version, &inputs) {
         Ok(result) => {
-            // Two-stage decode of the canonical protect-side wrapping
-            // (`handlers::sharing::wrap_for_helper_split`):
-            //   raw VSS bytes  → DeRecSecret { secret_data: <encoded Secret> }
-            //   inner field    → Secret { helpers, secrets, replicas, owner_replica_id }
-            // The typed `Secret` is what we hand to the application via
-            // `DeRecEvent::SecretRecovered`, matching the symmetry with the
-            // input-side `start(ProtectSecret, secrets: Vec<UserSecret>)`
-            // call. A decode failure here means the math reconstructed
-            // *something* but not a wire-shape the protocol recognises —
-            // share corruption — and surfaces as
-            // `RecoveryShareError`, leaving the bucket intact so further
-            // shares can still arrive and retry.
             let typed_secret = match decode_recovered_secret(&result.secret_data) {
                 Ok(s) => s,
                 Err(e) => {
@@ -406,13 +392,8 @@ async fn on_response<St: DeRecStateStore>(
                 derec_cryptography::vss::DerecVSSError::InsufficientShares
             ) =>
         {
-            // Persist the appended share so the next inbound response
-            // sees the accumulator grow.
             state_store
-                .save(
-                    secret_id,
-                    StateItem::PendingRecovery { version, shares },
-                )
+                .save(secret_id, StateItem::PendingRecovery { version, shares })
                 .await?;
 
             #[cfg(feature = "logging")]
@@ -430,13 +411,8 @@ async fn on_response<St: DeRecStateStore>(
             }
         }
         Err(e) => {
-            // Persist the appended share so a subsequent inbound
-            // response can retry reconstruction with a fuller set.
             state_store
-                .save(
-                    secret_id,
-                    StateItem::PendingRecovery { version, shares },
-                )
+                .save(secret_id, StateItem::PendingRecovery { version, shares })
                 .await?;
 
             #[cfg(feature = "logging")]
@@ -462,8 +438,9 @@ async fn on_response<St: DeRecStateStore>(
 
 /// Two-stage decode of the protect-side wrapping produced by
 /// [`super::sharing::wrap_for_helper_split`]: the outer `DeRecSecret`
-/// envelope (created at distribution time) carries the inner `Secret`
-/// snapshot as its `secret_data` field, both as protobuf bytes.
+/// envelope (created at distribution time, protobuf) carries the inner
+/// `Secret` snapshot as its `secret_data` field, encoded as the secret's
+/// JSON encoding (gzip-compressed; see [`crate::protocol::types::secret`]).
 ///
 /// VSS reconstructs the *outer* bytes, so this helper applies both
 /// decode steps and returns the typed [`crate::protocol::types::Secret`]
@@ -474,11 +451,16 @@ async fn on_response<St: DeRecStateStore>(
 /// when either layer fails to decode — the math reconstructed
 /// *something* but not a wire-shape the protocol recognises.
 fn decode_recovered_secret(outer_bytes: &[u8]) -> Result<crate::protocol::types::Secret> {
-    let derec_secret = DeRecSecret::decode(outer_bytes)
-        .map_err(|source| RecoveryError::MalformedRecoveredSecret { source })?;
+    let derec_secret =
+        DeRecSecret::decode(outer_bytes).map_err(|e| RecoveryError::MalformedRecoveredSecret {
+            source: Box::new(e),
+        })?;
     let secret =
-        crate::protocol::types::Secret::decode(derec_secret.secret_data.as_slice())
-            .map_err(|source| RecoveryError::MalformedRecoveredSecret { source })?;
+        crate::protocol::types::Secret::decode(&derec_secret.secret_data).map_err(|e| {
+            RecoveryError::MalformedRecoveredSecret {
+                source: Box::new(e),
+            }
+        })?;
     Ok(secret)
 }
 
@@ -495,7 +477,7 @@ mod tests {
     /// `decode_recovered_secret` is its inverse.
     fn encode_protect_wrapping(secret: &Secret) -> Vec<u8> {
         let derec_secret = derec_proto::DeRecSecret {
-            secret_data: secret.encode_to_vec(),
+            secret_data: secret.encode(),
             creation_time: None,
             helper_threshold_for_recovery: 2,
             helper_threshold_for_confirming_share_receipt: 2,
@@ -564,12 +546,10 @@ mod tests {
         assert_eq!(decoded.owner_replica_id, 0xBEEF);
     }
 
-    /// Empty `secret_data` inside a well-formed `DeRecSecret` decodes
-    /// into a default-initialised `Secret` (all-empty rosters, no
-    /// secrets). The protect side never produces this, but the decode
-    /// helper must not panic if it ever sees it.
+    /// Empty `secret_data` is not a valid gzip stream, so the inner
+    /// secret decode rejects it. The protect side never produces this.
     #[test]
-    fn decode_recovered_secret_handles_empty_inner_secret() {
+    fn decode_recovered_secret_rejects_empty_inner_secret() {
         let wrapped = derec_proto::DeRecSecret {
             secret_data: Vec::new(),
             creation_time: None,
@@ -579,9 +559,10 @@ mod tests {
         }
         .encode_to_vec();
 
-        let decoded = decode_recovered_secret(&wrapped).expect("empty inner must decode");
-        assert!(decoded.secrets.is_empty());
-        assert!(decoded.helpers.is_empty());
+        let err = decode_recovered_secret(&wrapped).expect_err("empty inner must fail");
+        let Error::Recovery(RecoveryError::MalformedRecoveredSecret { .. }) = err else {
+            panic!("expected MalformedRecoveredSecret, got {err:?}");
+        };
     }
 
     #[test]
@@ -590,6 +571,40 @@ mod tests {
         // bytes that don't form a valid protobuf tag.
         let garbage = vec![0xFFu8; 32];
         let err = decode_recovered_secret(&garbage).expect_err("garbage outer must fail");
+        let Error::Recovery(RecoveryError::MalformedRecoveredSecret { .. }) = err else {
+            panic!("expected MalformedRecoveredSecret, got {err:?}");
+        };
+    }
+
+    #[test]
+    fn decode_recovered_secret_rejects_non_gzip_inner() {
+        // Valid outer DeRecSecret, but secret_data is not a gzip stream.
+        let wrapped = derec_proto::DeRecSecret {
+            secret_data: vec![0x01, 0x02, 0x03, 0x04],
+            creation_time: None,
+            helper_threshold_for_recovery: 1,
+            helper_threshold_for_confirming_share_receipt: 1,
+            helpers: Vec::new(),
+        }
+        .encode_to_vec();
+
+        let err = decode_recovered_secret(&wrapped).expect_err("non-gzip inner must fail");
+        let Error::Recovery(RecoveryError::MalformedRecoveredSecret { .. }) = err else {
+            panic!("expected MalformedRecoveredSecret, got {err:?}");
+        };
+    }
+
+    #[test]
+    fn decode_recovered_secret_rejects_unknown_version() {
+        let wrapped = derec_proto::DeRecSecret {
+            secret_data: vec![0xFF, 0x00],
+            creation_time: None,
+            helper_threshold_for_recovery: 1,
+            helper_threshold_for_confirming_share_receipt: 1,
+            helpers: Vec::new(),
+        }
+        .encode_to_vec();
+        let err = decode_recovered_secret(&wrapped).expect_err("unknown version must fail");
         let Error::Recovery(RecoveryError::MalformedRecoveredSecret { .. }) = err else {
             panic!("expected MalformedRecoveredSecret, got {err:?}");
         };

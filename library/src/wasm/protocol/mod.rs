@@ -42,10 +42,10 @@
 //! interface contracts.
 
 mod events;
-// `pending_action_wire` lives in `crate::protocol` so both WASM and
-// FFI bridges can share the same on-the-wire encoding for the opaque
+// `pending_action_wire` lives in `crate::protocol::utils` so both WASM
+// and FFI bridges can share the same on-the-wire encoding for the opaque
 // PendingAction blob.
-pub(crate) use crate::protocol::pending_action_wire;
+pub(crate) use crate::protocol::utils::pending_action_wire;
 mod stores;
 
 use std::collections::HashMap;
