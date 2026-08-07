@@ -1353,8 +1353,8 @@ async fn run_replica_id_wiring_flow() {
         "helper-side Channel.replica_id must carry owner's id, got {:?}",
         helper_channel.replica_id,
     );
-    assert_eq!(owner_channel.role, SenderKind::ReplicaSource);
-    assert_eq!(helper_channel.role, SenderKind::ReplicaDestination);
+    assert_eq!(owner_channel.peer_role, SenderKind::ReplicaDestination);
+    assert_eq!(helper_channel.peer_role, SenderKind::ReplicaSource);
 
     assert!(
         !owner_channel
@@ -1498,7 +1498,7 @@ async fn run_protect_secret_with_replica_targets_flow() {
         .await
         .expect("owner replica channel load")
         .expect("owner replica channel must exist");
-    assert_eq!(owner_replica_channel.role, SenderKind::ReplicaSource);
+    assert_eq!(owner_replica_channel.peer_role, SenderKind::ReplicaDestination);
 
     let owner_fp = owner
         .protocol
@@ -2224,7 +2224,7 @@ async fn run_discovery_and_recovery_flow() {
             .await
             .expect("load helper channel after restore")
             .expect("restored helper channel must exist");
-        assert_eq!(ch.role, derec_proto::SenderKind::Owner);
+        assert_eq!(ch.peer_role, derec_proto::SenderKind::Helper);
     }
     println!("Restored fresh peer from recovered Secret ✓");
 

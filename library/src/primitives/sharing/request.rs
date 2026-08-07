@@ -27,7 +27,7 @@ const SHARE_ALGORITHM_VSS: i32 = 0;
 /// reconstructable fragment of it.
 ///
 /// Disambiguates the payload semantics on the wire; the receiver's
-/// `Channel.role` is the authoritative source of truth, but a distinct
+/// `Channel.peer_role` is the authoritative source of truth, but a distinct
 /// `share_algorithm` value lets wire dumps and middle-boxes tell the two
 /// payload shapes apart without channel-state context.
 pub const SHARE_ALGORITHM_REPLICA_SECRET: i32 = 1;

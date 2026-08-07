@@ -53,9 +53,9 @@ pub async fn run() {
         .await
         .expect("helper channel load failed")
         .expect("helper channel must exist");
-    assert_eq!(owner_channel.role, SenderKind::Owner);
-    assert_eq!(helper_channel.role, SenderKind::Helper);
-    println!("  Channel.role is local on each side  ✓");
+    assert_eq!(owner_channel.peer_role, SenderKind::Helper);
+    assert_eq!(helper_channel.peer_role, SenderKind::Owner);
+    println!("  Channel.peer_role names the other end on each side  ✓");
 
     for (name, conn) in [("owner", owner_db.connection()), ("helper", helper_db.connection())] {
         assert!(

@@ -37,7 +37,6 @@ use super::super::{
 use crate::{
     Result,
     types::{ChannelId, SharedKey},
-    utils::SenderKindExt as _,
 };
 use std::collections::HashSet;
 
@@ -84,6 +83,37 @@ pub enum RestoreError {
 /// (`UnpairAck::NotRequired`). The returned events come from the
 /// recovery-channel wipe and should be drained into the protocol's
 /// `pending_start_events`.
+///
+/// # Sequence
+///
+/// 1. **Preconditions.** Validate the protocol can restore and collect
+///    what the rest of the flow needs (the canonical id set plus the
+///    current channel list, reused for the wipe).
+///    [`RestoreError::AlreadyRestored`] when a snapshot is already
+///    committed, [`RestoreError::Invariant`] when
+///    `secret.replicas.shared_key` is mis-sized, and
+///    [`RestoreError::Conflict`] when an existing channel sits at a
+///    canonical helper / replica id. All three are reported before any
+///    store mutation. Channels *not* at canonical ids are recovery
+///    channels — wiped in step 5, never flagged as collisions.
+/// 2. **Helper channels.** Persist each helper's canonical channel
+///    record, its `SharedKey`, and an empty owner-side tracking
+///    [`Share`] at `recovered_version`.
+/// 3. **Replica channels.** Persist each destination's canonical
+///    channel record with the group key as its `SharedKey`. Each
+///    restored channel's `peer_role` is the `sender_kind` the recovered
+///    `Secret` carries for that peer.
+/// 4. **Commit.** Write the user-secret snapshot at
+///    `recovered_version`. This write is the commit point — nothing is
+///    removed before it succeeds, so any earlier failure is fully
+///    retryable. `owner_replica_id` is adopted from the recovered
+///    `Secret` only when the builder left the local replica id unset;
+///    zero is the "no replica id" sentinel and is never adopted.
+/// 5. **Wipe.** Send unpair requests to every channel not at a
+///    canonical id — the recovery-mode channels minted to drive
+///    `start(RecoverSecret)` — and drop their local state.
+///    `UnpairAck::NotRequired` is forced so the wipe is synchronous
+///    regardless of the protocol's configured ack mode.
 #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
 #[allow(clippy::too_many_arguments)]
 pub(in crate::protocol) async fn restore<
@@ -150,16 +180,6 @@ pub(in crate::protocol) async fn restore<
     Ok(events)
 }
 
-/// Validate that the protocol is in a state where restore can run AND
-/// collect the data the rest of the flow needs (canonical id set +
-/// the current channel list, reused for the recovery-channel wipe).
-///
-/// Surfaces [`RestoreError::AlreadyRestored`] when a snapshot is
-/// already committed, [`RestoreError::Invariant`] when
-/// `secret.replicas.shared_key` is mis-sized, and
-/// [`RestoreError::Conflict`] when an existing channel sits at a
-/// canonical helper / replica id. All three are reported before any
-/// store mutation.
 async fn check_preconditions<Ch: DeRecChannelStore, Us: DeRecUserSecretStore>(
     user_secret_store: &Us,
     channel_store: &Ch,
@@ -179,8 +199,6 @@ async fn check_preconditions<Ch: DeRecChannelStore, Us: DeRecUserSecretStore>(
         }
     }
 
-    // Channels not at canonical ids are recovery channels — wiped
-    // after the commit, not flagged as collisions.
     let canonical_ids: HashSet<u64> = secret
         .helpers
         .iter()
@@ -206,8 +224,6 @@ async fn check_preconditions<Ch: DeRecChannelStore, Us: DeRecUserSecretStore>(
     Ok((canonical_ids, existing_channels))
 }
 
-/// Persist each helper's canonical channel record, its `SharedKey`,
-/// and an empty owner-side tracking [`Share`] at `recovered_version`.
 async fn write_helper_channels<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore>(
     channel_store: &mut Ch,
     share_store: &mut Sh,
@@ -235,7 +251,7 @@ async fn write_helper_channels<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: D
                     communication_info: h.communication_info.clone(),
                     status: ChannelStatus::Paired,
                     created_at: now_secs(),
-                    role: derec_proto::SenderKind::Owner,
+                    peer_role: derec_proto::SenderKind::Helper,
                     replica_id: None,
                 },
             )
@@ -259,12 +275,6 @@ async fn write_helper_channels<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: D
     Ok(())
 }
 
-/// Persist each replica destination's canonical channel record
-/// (with the group key as its `SharedKey`). The local role on each
-/// restored channel is the inverse of the peer's `sender_kind`
-/// carried in the recovered `Secret`.
-///
-/// Caller guarantees `group.replicas` is non-empty.
 async fn write_replica_channels<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     channel_store: &mut Ch,
     secret_store: &mut Ss,
@@ -277,7 +287,6 @@ async fn write_replica_channels<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     for r in &group.replicas {
         let peer_kind = derec_proto::SenderKind::try_from(r.sender_kind)
             .map_err(|_| RestoreError::Invariant("replica.sender_kind invalid"))?;
-        let local_role = peer_kind.derive_peer();
         let cid = ChannelId(r.channel_id);
         channel_store
             .save(
@@ -291,7 +300,7 @@ async fn write_replica_channels<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
                     communication_info: r.communication_info.clone(),
                     status: ChannelStatus::Paired,
                     created_at: now_secs(),
-                    role: local_role,
+                    peer_role: peer_kind,
                     replica_id: Some(r.replica_id),
                 },
             )
@@ -303,9 +312,6 @@ async fn write_replica_channels<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     Ok(())
 }
 
-/// Commit the user-secret snapshot at `recovered_version`. This write
-/// is the commit point — nothing is removed before it succeeds, so any
-/// earlier failure is fully retryable.
 async fn commit_snapshot<Us: DeRecUserSecretStore>(
     user_secret_store: &mut Us,
     secret_id: u64,
@@ -326,20 +332,12 @@ async fn commit_snapshot<Us: DeRecUserSecretStore>(
     Ok(())
 }
 
-/// Adopt `owner_replica_id` from the recovered `Secret` when the
-/// builder left the local replica id unset. Zero is the "no replica
-/// id" sentinel — don't adopt it.
 fn adopt_owner_replica_id(local_replica_id: &mut Option<u64>, owner_replica_id: u64) {
     if local_replica_id.is_none() && owner_replica_id != 0 {
         *local_replica_id = Some(owner_replica_id);
     }
 }
 
-/// Send unpair requests to every channel that isn't at a canonical id
-/// (i.e. the recovery-mode channels minted to drive
-/// `start(RecoverSecret)`) and drop local state. Forces
-/// `UnpairAck::NotRequired` so the wipe is synchronous regardless of
-/// the protocol's configured ack mode.
 #[allow(clippy::too_many_arguments)]
 async fn unpair_recovery_channels<
     Ch: DeRecChannelStore,
@@ -392,242 +390,28 @@ mod tests {
     use super::*;
     use crate::protocol::DeRecProtocolBuilder;
     use crate::protocol::traits::{
-        ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecTransport,
-        DeRecUserSecretStore, SecretStoreFuture, ShareStoreFuture, TransportFuture,
+        DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecUserSecretStore,
     };
     use crate::protocol::types::{
-        Channel, ChannelStatus, HelperInfo, MissingPolicy, ReplicaInfo, Replicas, Secret,
-        SecretKind, SecretValue, Share, UserSecret, UserSecrets,
+        Channel, ChannelStatus, HelperInfo, ReplicaInfo, Replicas, Secret, SecretKind, SecretValue,
+        UserSecret, UserSecrets,
     };
     use derec_proto::{SenderKind, TransportProtocol};
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
 
-    // ---- In-memory store impls, shared across both test paths ----------
-    //
-    // `Arc<Mutex<...>>` so we can pre-seed the inner data BEFORE building
-    // the protocol (the protocol owns the impl, so the only mutation
-    // path post-construction is through the trait).
-
-    #[derive(Default, Clone)]
-    struct InMemChannelStore {
-        data: Arc<Mutex<HashMap<(u64, u64), Channel>>>,
-    }
-    impl DeRecChannelStore for InMemChannelStore {
-        fn load(&self, sid: u64, cid: ChannelId) -> ChannelStoreFuture<'_, Option<Channel>> {
-            let v = self.data.lock().unwrap().get(&(sid, cid.0)).cloned();
-            Box::pin(std::future::ready(Ok(v)))
-        }
-        fn save(&mut self, sid: u64, c: Channel) -> ChannelStoreFuture<'_, ()> {
-            self.data.lock().unwrap().insert((sid, c.id.0), c);
-            Box::pin(std::future::ready(Ok(())))
-        }
-        fn remove(&mut self, sid: u64, cid: ChannelId) -> ChannelStoreFuture<'_, bool> {
-            let removed = self.data.lock().unwrap().remove(&(sid, cid.0)).is_some();
-            Box::pin(std::future::ready(Ok(removed)))
-        }
-        fn channels(&self, sid: u64) -> ChannelStoreFuture<'_, Vec<Channel>> {
-            let v: Vec<Channel> = self
-                .data
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|((s, _), _)| *s == sid)
-                .map(|(_, c)| c.clone())
-                .collect();
-            Box::pin(std::future::ready(Ok(v)))
-        }
-        fn link_channel(
-            &mut self,
-            _: u64,
-            _: ChannelId,
-            _: ChannelId,
-        ) -> ChannelStoreFuture<'_, ()> {
-            Box::pin(std::future::ready(Ok(())))
-        }
-        fn linked_channels(
-            &self,
-            _: u64,
-            cid: ChannelId,
-        ) -> ChannelStoreFuture<'_, Vec<ChannelId>> {
-            Box::pin(std::future::ready(Ok(vec![cid])))
-        }
-    }
-
-    #[derive(Default, Clone)]
-    struct InMemSecretStore {
-        #[allow(clippy::type_complexity)]
-        data: Arc<Mutex<HashMap<(u64, u64, u8), SecretValue>>>,
-    }
-    impl DeRecSecretStore for InMemSecretStore {
-        fn load(
-            &self,
-            sid: u64,
-            cid: ChannelId,
-            kind: SecretKind,
-        ) -> SecretStoreFuture<'_, Option<SecretValue>> {
-            let v = self
-                .data
-                .lock()
-                .unwrap()
-                .get(&(sid, cid.0, kind as u8))
-                .cloned();
-            Box::pin(std::future::ready(Ok(v)))
-        }
-        fn load_many(
-            &self,
-            sid: u64,
-            cids: &[ChannelId],
-            kind: SecretKind,
-            _: MissingPolicy,
-        ) -> SecretStoreFuture<'_, Vec<(ChannelId, SecretValue)>> {
-            let mut out = Vec::new();
-            for c in cids {
-                if let Some(v) = self.data.lock().unwrap().get(&(sid, c.0, kind as u8)) {
-                    out.push((*c, v.clone()));
-                }
-            }
-            Box::pin(std::future::ready(Ok(out)))
-        }
-        fn save(
-            &mut self,
-            sid: u64,
-            cid: ChannelId,
-            value: SecretValue,
-        ) -> SecretStoreFuture<'_, ()> {
-            let k = match &value {
-                SecretValue::SharedKey(_) => SecretKind::SharedKey as u8,
-                SecretValue::PairingSecret(_) => SecretKind::PairingSecret as u8,
-                SecretValue::PairingContact(_) => SecretKind::PairingContact as u8,
-            };
-            self.data.lock().unwrap().insert((sid, cid.0, k), value);
-            Box::pin(std::future::ready(Ok(())))
-        }
-        fn remove(
-            &mut self,
-            sid: u64,
-            cid: ChannelId,
-            kind: SecretKind,
-        ) -> SecretStoreFuture<'_, ()> {
-            self.data.lock().unwrap().remove(&(sid, cid.0, kind as u8));
-            Box::pin(std::future::ready(Ok(())))
-        }
-    }
-
-    #[derive(Default, Clone)]
-    struct InMemShareStore {
-        #[allow(clippy::type_complexity)]
-        data: Arc<Mutex<HashMap<(u64, u64, u32), Share>>>,
-    }
-    impl DeRecShareStore for InMemShareStore {
-        fn load(
-            &self,
-            sid: u64,
-            cid: ChannelId,
-            versions: &[u32],
-        ) -> ShareStoreFuture<'_, Vec<Share>> {
-            let lock = self.data.lock().unwrap();
-            let out: Vec<Share> = lock
-                .iter()
-                .filter(|((s, c, v), _)| {
-                    *s == sid && *c == cid.0 && (versions.is_empty() || versions.contains(v))
-                })
-                .map(|(_, s)| s.clone())
-                .collect();
-            Box::pin(std::future::ready(Ok(out)))
-        }
-        fn load_many(
-            &self,
-            _: u64,
-            _: &[ChannelId],
-            _: &[u32],
-        ) -> ShareStoreFuture<'_, Vec<Share>> {
-            Box::pin(std::future::ready(Ok(Vec::new())))
-        }
-        fn load_all(&self, _: u64, _: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
-            Box::pin(std::future::ready(Ok(Vec::new())))
-        }
-        fn latest_version(&self, _: u64) -> ShareStoreFuture<'_, Option<u32>> {
-            Box::pin(std::future::ready(Ok(None)))
-        }
-        fn save(&mut self, sid: u64, cid: ChannelId, share: Share) -> ShareStoreFuture<'_, ()> {
-            let v = share.version;
-            self.data.lock().unwrap().insert((sid, cid.0, v), share);
-            Box::pin(std::future::ready(Ok(())))
-        }
-        fn remove_channel(&mut self, _: u64, _: ChannelId) -> ShareStoreFuture<'_, ()> {
-            Box::pin(std::future::ready(Ok(())))
-        }
-    }
-
-    #[derive(Default, Clone)]
-    struct InMemUserSecretStore {
-        data: Arc<Mutex<HashMap<u64, UserSecrets>>>,
-    }
-    impl DeRecUserSecretStore for InMemUserSecretStore {
-        fn load_latest(&self, sid: u64) -> ShareStoreFuture<'_, Option<UserSecrets>> {
-            let v = self.data.lock().unwrap().get(&sid).cloned();
-            Box::pin(std::future::ready(Ok(v)))
-        }
-        fn save_latest(&mut self, sid: u64, value: UserSecrets) -> ShareStoreFuture<'_, ()> {
-            self.data.lock().unwrap().insert(sid, value);
-            Box::pin(std::future::ready(Ok(())))
-        }
-        fn remove(&mut self, sid: u64) -> ShareStoreFuture<'_, ()> {
-            self.data.lock().unwrap().remove(&sid);
-            Box::pin(std::future::ready(Ok(())))
-        }
-    }
-
-    #[derive(Default, Clone)]
-    struct NoopTransport;
-    impl DeRecTransport for NoopTransport {
-        fn send(&self, _: &TransportProtocol, _: Vec<u8>) -> TransportFuture<'_> {
-            Box::pin(std::future::ready(Ok(())))
-        }
-    }
+    use crate::protocol::test::{
+        InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
+        InMemUserSecretStore, NoopTransport, run_async,
+    };
 
     type TestProto = crate::protocol::DeRecProtocol<
         InMemChannelStore,
         InMemShareStore,
         InMemSecretStore,
         InMemUserSecretStore,
-        RestoreTestStateStore,
+        InMemStateStore,
         NoopTransport,
     >;
-
-    #[derive(Default)]
-    struct RestoreTestStateStore;
-    impl crate::protocol::DeRecStateStore for RestoreTestStateStore {
-        fn save(
-            &mut self,
-            _: u64,
-            _: crate::protocol::StateItem,
-        ) -> crate::protocol::StateStoreFuture<'_, ()> {
-            Box::pin(std::future::ready(Ok(())))
-        }
-        fn load(
-            &self,
-            _: u64,
-            _: crate::protocol::StateKey,
-        ) -> crate::protocol::StateStoreFuture<'_, Option<crate::protocol::StateItem>> {
-            Box::pin(std::future::ready(Ok(None)))
-        }
-        fn remove(
-            &mut self,
-            _: u64,
-            _: crate::protocol::StateKey,
-        ) -> crate::protocol::StateStoreFuture<'_, bool> {
-            Box::pin(std::future::ready(Ok(false)))
-        }
-        fn load_all(
-            &self,
-            _: u64,
-            _: crate::protocol::StateKind,
-        ) -> crate::protocol::StateStoreFuture<'_, Vec<crate::protocol::StateItem>> {
-            Box::pin(std::future::ready(Ok(Vec::new())))
-        }
-    }
 
     /// Test bundle — keeps clone handles to every store so the test
     /// can both pre-seed before construction AND inspect after the
@@ -651,7 +435,7 @@ mod tests {
             .with_secret_store(secret_store.clone())
             .with_user_secret_store(user_secret_store.clone())
             .with_transport(NoopTransport)
-            .with_state_store(RestoreTestStateStore)
+            .with_state_store(InMemStateStore)
             .with_own_transport("https://owner.example.com")
             .with_threshold(2)
             .build()
@@ -707,13 +491,6 @@ mod tests {
         }
     }
 
-    fn run_async<F: std::future::Future<Output = ()>>(f: F) {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("test runtime")
-            .block_on(f)
-    }
-
     // ---------------- Happy path ----------------
 
     #[test]
@@ -736,7 +513,7 @@ mod tests {
                     .unwrap()
                     .expect("helper channel must be persisted");
                 assert_eq!(ch.status, ChannelStatus::Paired);
-                assert_eq!(ch.role, SenderKind::Owner);
+                assert_eq!(ch.peer_role, SenderKind::Helper);
                 assert!(ch.replica_id.is_none());
                 let sk = rig
                     .secret_store
@@ -763,7 +540,7 @@ mod tests {
                 .unwrap()
                 .expect("replica channel must be persisted");
             assert_eq!(rep.status, ChannelStatus::Paired);
-            assert_eq!(rep.role, SenderKind::ReplicaSource);
+            assert_eq!(rep.peer_role, SenderKind::ReplicaDestination);
             assert_eq!(rep.replica_id, Some(0xCAFE));
             let rep_sk = rig
                 .secret_store
@@ -818,7 +595,7 @@ mod tests {
                         communication_info: HashMap::new(),
                         status: ChannelStatus::Paired,
                         created_at: 1,
-                        role: SenderKind::Owner,
+                        peer_role: SenderKind::Helper,
                         replica_id: None,
                     },
                 );
@@ -918,7 +695,7 @@ mod tests {
                     communication_info: HashMap::new(),
                     status: ChannelStatus::Paired,
                     created_at: 1,
-                    role: SenderKind::Owner,
+                    peer_role: SenderKind::Helper,
                     replica_id: None,
                 },
             );
@@ -986,7 +763,7 @@ mod tests {
                 .with_secret_store(InMemSecretStore::default())
                 .with_user_secret_store(InMemUserSecretStore::default())
                 .with_transport(NoopTransport)
-            .with_state_store(RestoreTestStateStore)
+            .with_state_store(InMemStateStore)
                 .with_own_transport("https://owner.example.com")
                 .with_threshold(2)
                 .with_replica_id(0x1234)

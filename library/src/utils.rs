@@ -332,22 +332,28 @@ impl ContactMessageExt for ContactMessage {
 /// [`ContactMessage`] and [`crate::transport::TransportProtocolExt`] does
 /// for [`derec_proto::TransportProtocol`].
 pub(crate) trait SenderKindExt {
-    /// Derive the peer's pairing kind from the local kind, following the
-    /// pair-completion role-inversion rule:
+    /// The kind on the other side of a pairing, following the
+    /// role-inversion rule:
     ///
-    /// | local                 | peer                  |
+    /// | this side             | other side            |
     /// |-----------------------|-----------------------|
     /// | `Owner`               | `Helper`              |
     /// | `Helper`              | `Owner`               |
     /// | `ReplicaSource`       | `ReplicaDestination`  |
     /// | `ReplicaDestination`  | `ReplicaSource`       |
     ///
+    /// Self-inverse: `k.counterparty().counterparty() == k`. It reads in
+    /// both directions, which matters because the wire declares the
+    /// *sender's* own kind while
+    /// [`Channel::peer_role`](crate::protocol::types::Channel::peer_role)
+    /// records the *peer's* — converting either way is this one call.
+    ///
     /// [`PairResponseMessage`] does not carry `sender_kind` over the wire,
-    /// so the initiator must look up its own role on the channel record
-    /// (committed at pairing-start time) and invert it via this helper.
+    /// so the initiator recovers its own role from the channel record
+    /// (committed at pairing-start time) through this helper.
     ///
     /// [`PairResponseMessage`]: derec_proto::PairResponseMessage
-    fn derive_peer(&self) -> SenderKind;
+    fn counterparty(&self) -> SenderKind;
 
     /// Returns `true` for either replica-mode `SenderKind`
     /// ([`SenderKind::ReplicaSource`] or [`SenderKind::ReplicaDestination`]).
@@ -359,7 +365,7 @@ pub(crate) trait SenderKindExt {
 }
 
 impl SenderKindExt for SenderKind {
-    fn derive_peer(&self) -> SenderKind {
+    fn counterparty(&self) -> SenderKind {
         match self {
             SenderKind::Owner => SenderKind::Helper,
             SenderKind::Helper => SenderKind::Owner,

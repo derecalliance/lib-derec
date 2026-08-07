@@ -286,11 +286,11 @@ impl PendingAction {
 /// # Role gating
 ///
 /// The orchestrator enforces flow directionality against
-/// [`crate::protocol::types::Channel::role`] (set at pairing time):
+/// [`crate::protocol::types::Channel::peer_role`] (set at pairing time):
 ///
 /// - [`Self::Discovery`], [`Self::ProtectSecret`], [`Self::VerifyShares`],
-///   [`Self::RecoverSecret`], and [`Self::Unpair`] require this node to be
-///   the [`SenderKind::Owner`] on every targeted channel; otherwise
+///   [`Self::RecoverSecret`], and [`Self::Unpair`] require the peer to be
+///   a [`SenderKind::Helper`] on every targeted channel; otherwise
 ///   [`crate::Error::RoleMismatch`] is returned.
 /// - [`Self::Pairing`] creates the channel, so no role exists yet.
 /// - [`Self::UpdateChannelInfo`] is symmetric — either party may initiate.
@@ -407,10 +407,11 @@ pub enum UnpairAck {
 pub enum DeRecEvent {
     /// Pairing completed — the shared key for `channel_id` is now persisted.
     ///
-    /// `kind` is the local party's role in the pairing, also persisted as
-    /// [`crate::protocol::types::Channel::role`] and consulted by the orchestrator on
-    /// every subsequent flow start and inbound message. Applications use it
-    /// to decide what to do next:
+    /// `kind` is the local party's role in the pairing. The channel record
+    /// stores its inverse — the peer's role — on
+    /// [`crate::protocol::types::Channel::peer_role`], which the
+    /// orchestrator consults on every subsequent flow start and inbound
+    /// message. Applications use `kind` to decide what to do next:
     ///
     /// - [`SenderKind::Owner`] — the Owner completed pairing with a Helper.
     ///   Call [`super::DeRecProtocol::start`] with [`DeRecFlow::ProtectSecret`]
@@ -444,9 +445,9 @@ pub enum DeRecEvent {
     /// A replica-mode pair handshake completed. Fires **alongside**
     /// [`Self::PairingCompleted`] on replica channels.
     ///
-    /// Under the unidirectional replica model, the local side's role
-    /// (`ReplicaSource` or `ReplicaDestination`) is already on
-    /// [`crate::protocol::types::Channel::role`] — this event just adds the
+    /// Under the unidirectional replica model, the peer's role
+    /// (`ReplicaDestination` or `ReplicaSource`) is already on
+    /// [`crate::protocol::types::Channel::peer_role`] — this event just adds the
     /// peer's `replica_id`, which the app needs as a `from_replica_id`
     /// when subsequent secret syncs arrive or when targeting the peer via
     /// `ProtectSecret`.
@@ -746,8 +747,9 @@ pub enum DeRecEvent {
     PairingStarted {
         channel_id: ChannelId,
         /// The local party's role in the pairing (same value that will
-        /// appear on [`Self::PairingCompleted::kind`] and be persisted
-        /// as [`crate::protocol::types::Channel::role`]).
+        /// appear on [`Self::PairingCompleted::kind`]; the channel record
+        /// persists its inverse as
+        /// [`crate::protocol::types::Channel::peer_role`]).
         kind: SenderKind,
     },
 

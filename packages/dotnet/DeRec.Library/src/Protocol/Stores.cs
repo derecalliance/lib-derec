@@ -39,7 +39,12 @@ public enum ChannelStatus
 /// <param name="CommunicationInfo">App-level identity metadata for the peer.</param>
 /// <param name="Status">Lifecycle state (<see cref="ChannelStatus"/>).</param>
 /// <param name="CreatedAt">Unix timestamp (seconds) when the channel was created.</param>
-/// <param name="Role">This node's role on the channel, fixed at pairing time.</param>
+/// <param name="PeerRole">
+/// The <em>peer's</em> role on the channel, fixed at pairing time. A
+/// channel row describes the participant on the other end, so a
+/// helper-pairing held by an Owner carries <c>Helper</c> here, and the
+/// Helper's own row for the same channel carries <c>Owner</c>.
+/// </param>
 /// <param name="ReplicaId">Peer's replica identity (only set for replica roles).</param>
 public sealed record Channel(
     ulong Id,
@@ -47,7 +52,7 @@ public sealed record Channel(
     Dictionary<string, string> CommunicationInfo,
     ChannelStatus Status,
     ulong CreatedAt,
-    Pairing.SenderKind Role,
+    Pairing.SenderKind PeerRole,
     ulong? ReplicaId);
 
 /// <summary>
@@ -206,18 +211,25 @@ public enum StateKind : uint
 /// <see cref="Kind"/>.
 /// </summary>
 /// <param name="Kind">Row category.</param>
+/// <param name="Kind">Row category.</param>
 /// <param name="ChannelId">Set for <see cref="StateKind.PendingVerification"/> and <see cref="StateKind.PendingUnpair"/>.</param>
+/// <param name="SecretId">
+/// The secret being recovered, set for <see cref="StateKind.PendingRecovery"/>.
+/// Not necessarily the <c>secretId</c> partitioning the store: a recovering
+/// device runs an ephemeral instance whose own id owns the partition while
+/// the target belongs to the wire.
+/// </param>
 /// <param name="Version">Set for <see cref="StateKind.PendingRecovery"/>.</param>
-public sealed record StateKey(StateKind Kind, ulong? ChannelId, uint? Version)
+public sealed record StateKey(StateKind Kind, ulong? ChannelId, ulong? SecretId, uint? Version)
 {
     public static StateKey PendingVerification(ulong channelId) =>
-        new(StateKind.PendingVerification, channelId, null);
-    public static StateKey PendingRecovery(uint version) =>
-        new(StateKind.PendingRecovery, null, version);
+        new(StateKind.PendingVerification, channelId, null, null);
+    public static StateKey PendingRecovery(ulong secretId, uint version) =>
+        new(StateKind.PendingRecovery, null, secretId, version);
     public static StateKey PendingUnpair(ulong channelId) =>
-        new(StateKind.PendingUnpair, channelId, null);
+        new(StateKind.PendingUnpair, channelId, null, null);
     public static StateKey SharingRound() =>
-        new(StateKind.SharingRound, null, null);
+        new(StateKind.SharingRound, null, null, null);
 }
 
 /// <summary>
@@ -227,6 +239,7 @@ public sealed record StateKey(StateKind Kind, ulong? ChannelId, uint? Version)
 /// </summary>
 /// <param name="Kind">Row category.</param>
 /// <param name="ChannelId">Set for <see cref="StateKind.PendingVerification"/> and <see cref="StateKind.PendingUnpair"/>.</param>
+/// <param name="SecretId">The secret being recovered, set for <see cref="StateKind.PendingRecovery"/>. See <see cref="StateKey"/>.</param>
 /// <param name="Version">Set for <see cref="StateKind.PendingRecovery"/> and <see cref="StateKind.SharingRound"/>.</param>
 /// <param name="StartedAt">Unix seconds when the operation was initiated (for <see cref="StateKind.PendingUnpair"/> and <see cref="StateKind.SharingRound"/>).</param>
 /// <param name="Bytes">
@@ -244,6 +257,7 @@ public sealed record StateKey(StateKind Kind, ulong? ChannelId, uint? Version)
 public sealed record StateItem(
     StateKind Kind,
     ulong? ChannelId,
+    ulong? SecretId,
     uint? Version,
     ulong? StartedAt,
     byte[]? Bytes,
@@ -257,6 +271,7 @@ public sealed record StateItem(
         StateKind.PendingVerification => StateKey.PendingVerification(
             ChannelId ?? throw new InvalidOperationException("PendingVerification requires ChannelId")),
         StateKind.PendingRecovery => StateKey.PendingRecovery(
+            SecretId ?? throw new InvalidOperationException("PendingRecovery requires SecretId"),
             Version ?? throw new InvalidOperationException("PendingRecovery requires Version")),
         StateKind.PendingUnpair => StateKey.PendingUnpair(
             ChannelId ?? throw new InvalidOperationException("PendingUnpair requires ChannelId")),
@@ -265,18 +280,18 @@ public sealed record StateItem(
     };
 
     public static StateItem PendingVerification(ulong channelId, byte[] requestBytes) =>
-        new(StateKind.PendingVerification, channelId, null, null, requestBytes, null);
-    public static StateItem PendingRecovery(uint version, byte[][] shares) =>
-        new(StateKind.PendingRecovery, null, version, null, null, shares);
+        new(StateKind.PendingVerification, channelId, null, null, null, requestBytes, null);
+    public static StateItem PendingRecovery(ulong secretId, uint version, byte[][] shares) =>
+        new(StateKind.PendingRecovery, null, secretId, version, null, null, shares);
     public static StateItem PendingUnpair(ulong channelId, ulong startedAt) =>
-        new(StateKind.PendingUnpair, channelId, null, startedAt, null, null);
+        new(StateKind.PendingUnpair, channelId, null, null, startedAt, null, null);
     public static StateItem SharingRound(
         uint version,
         ulong[] pending,
         ulong[] confirmed,
         ulong[] failed,
         ulong startedAt) =>
-        new(StateKind.SharingRound, null, version, startedAt, null, null, pending, confirmed, failed);
+        new(StateKind.SharingRound, null, null, version, startedAt, null, null, pending, confirmed, failed);
 }
 
 /// <summary>

@@ -21,7 +21,7 @@ type Channel struct {
 	CommunicationInfo map[string]string
 	Status            ChannelStatus
 	CreatedAt         uint64
-	Role              SenderKind
+	PeerRole          SenderKind
 	ReplicaID         *uint64
 }
 
@@ -210,11 +210,17 @@ const (
 // StateKey selects one row inside a StateKind under a secretID. Which
 // field is populated is determined by Kind:
 //   - PendingVerification, PendingUnpair: ChannelID.
-//   - PendingRecovery: Version.
-//   - SharingRound: neither (at most one row per secretID).
+//   - PendingRecovery: SecretID, Version.
+//   - SharingRound: none (at most one row per secretID).
+//
+// SecretID names the secret being recovered, which is not necessarily
+// the secretID partitioning the store: a recovering device runs an
+// ephemeral instance whose own id owns the partition while the target
+// belongs to the wire.
 type StateKey struct {
 	Kind      StateKind
 	ChannelID *uint64
+	SecretID  *uint64
 	Version   *uint32
 }
 
@@ -223,14 +229,15 @@ type StateKey struct {
 // variants:
 //   - PendingVerification: ChannelID, Bytes (prost-encoded
 //     VerifyShareRequestMessage).
-//   - PendingRecovery: Version, Shares (each entry a prost-encoded
-//     GetShareResponseMessage).
+//   - PendingRecovery: SecretID (the secret being recovered), Version,
+//     Shares (each entry a prost-encoded GetShareResponseMessage).
 //   - PendingUnpair: ChannelID, StartedAt (unix seconds).
 //   - SharingRound: Version, Pending/Confirmed/Failed (channel-id sets),
 //     StartedAt (unix seconds).
 type StateItem struct {
 	Kind      StateKind
 	ChannelID *uint64
+	SecretID  *uint64
 	Version   *uint32
 	StartedAt *uint64
 	Bytes     []byte
@@ -247,7 +254,7 @@ func (i StateItem) Key() StateKey {
 	case StateKindPendingVerification:
 		return StateKey{Kind: StateKindPendingVerification, ChannelID: i.ChannelID}
 	case StateKindPendingRecovery:
-		return StateKey{Kind: StateKindPendingRecovery, Version: i.Version}
+		return StateKey{Kind: StateKindPendingRecovery, SecretID: i.SecretID, Version: i.Version}
 	case StateKindPendingUnpair:
 		return StateKey{Kind: StateKindPendingUnpair, ChannelID: i.ChannelID}
 	default:

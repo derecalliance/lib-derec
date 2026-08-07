@@ -27,7 +27,7 @@ func TestEncodeChannel_MatchesRustJSONShape(t *testing.T) {
 		CommunicationInfo: map[string]string{"name": "helper"},
 		Status:            ChannelStatusPaired,
 		CreatedAt:         1700000000,
-		Role:              SenderKindReplicaDestination,
+		PeerRole:          SenderKindReplicaDestination,
 		ReplicaID:         &replicaID,
 	}
 
@@ -38,7 +38,7 @@ func TestEncodeChannel_MatchesRustJSONShape(t *testing.T) {
 
 	want := `{"id":123456789,"transport":{"uri":"https://example.com/derec","protocol":0},` +
 		`"communication_info":{"name":"helper"},"status":"Paired","created_at":1700000000,` +
-		`"role":"ReplicaDestination","replica_id":42}`
+		`"peer_role":"ReplicaDestination","replica_id":42}`
 	if string(got) != want {
 		t.Fatalf("EncodeChannel mismatch:\n got: %s\nwant: %s", got, want)
 	}
@@ -49,7 +49,7 @@ func TestEncodeChannel_EmptyCommunicationInfoIsEmptyObjectNotNull(t *testing.T) 
 		ID:        1,
 		Transport: TransportEndpoint{URI: "https://h.example.com", Protocol: 0},
 		Status:    ChannelStatusPending,
-		Role:      SenderKindOwner,
+		PeerRole:  SenderKindOwner,
 	}
 	got, err := EncodeChannel(ch)
 	if err != nil {
@@ -68,7 +68,7 @@ func TestEncodeChannel_EmptyCommunicationInfoIsEmptyObjectNotNull(t *testing.T) 
 func TestDecodeChannel_KnownGoodRustSample(t *testing.T) {
 	sample := `{"id":987654321,"transport":{"uri":"https://owner.example.com","protocol":0},` +
 		`"communication_info":{"name":"owner"},"status":"Pending","created_at":42,` +
-		`"role":"ReplicaSource","replica_id":null}`
+		`"peer_role":"ReplicaSource","replica_id":null}`
 
 	ch, err := DecodeChannel([]byte(sample))
 	if err != nil {
@@ -89,8 +89,8 @@ func TestDecodeChannel_KnownGoodRustSample(t *testing.T) {
 	if ch.CreatedAt != 42 {
 		t.Errorf("CreatedAt = %d, want 42", ch.CreatedAt)
 	}
-	if ch.Role != SenderKindReplicaSource {
-		t.Errorf("Role = %v, want ReplicaSource", ch.Role)
+	if ch.PeerRole != SenderKindReplicaSource {
+		t.Errorf("PeerRole = %v, want ReplicaSource", ch.PeerRole)
 	}
 	if ch.ReplicaID != nil {
 		t.Errorf("ReplicaID = %v, want nil", ch.ReplicaID)
@@ -105,7 +105,7 @@ func TestChannelRoundTrip(t *testing.T) {
 		CommunicationInfo: map[string]string{"a": "1", "b": "2"},
 		Status:            ChannelStatusPaired,
 		CreatedAt:         999,
-		Role:              SenderKindHelper,
+		PeerRole:          SenderKindHelper,
 		ReplicaID:         &replicaID,
 	}
 	wire, err := EncodeChannel(orig)
@@ -117,7 +117,7 @@ func TestChannelRoundTrip(t *testing.T) {
 		t.Fatalf("DecodeChannel: %v", err)
 	}
 	if got.ID != orig.ID || got.Transport != orig.Transport || got.Status != orig.Status ||
-		got.CreatedAt != orig.CreatedAt || got.Role != orig.Role || *got.ReplicaID != *orig.ReplicaID {
+		got.CreatedAt != orig.CreatedAt || got.PeerRole != orig.PeerRole || *got.ReplicaID != *orig.ReplicaID {
 		t.Fatalf("round trip mismatch: got %+v, want %+v", got, orig)
 	}
 	if len(got.CommunicationInfo) != 2 || got.CommunicationInfo["a"] != "1" || got.CommunicationInfo["b"] != "2" {
@@ -252,10 +252,11 @@ func TestDecodeSecretValue_RejectsUnknownKind(t *testing.T) {
 
 func TestStateKeyRoundTrip_AllKinds(t *testing.T) {
 	cid := uint64(10)
+	sid := uint64(0xA0)
 	ver := uint32(3)
 	cases := []StateKey{
 		{Kind: StateKindPendingVerification, ChannelID: &cid},
-		{Kind: StateKindPendingRecovery, Version: &ver},
+		{Kind: StateKindPendingRecovery, SecretID: &sid, Version: &ver},
 		{Kind: StateKindPendingUnpair, ChannelID: &cid},
 		{Kind: StateKindSharingRound},
 	}
@@ -325,8 +326,9 @@ func TestStateItemRoundTrip_PendingVerification(t *testing.T) {
 }
 
 func TestStateItemRoundTrip_PendingRecovery(t *testing.T) {
+	sid := uint64(0xA0)
 	ver := uint32(4)
-	want := StateItem{Kind: StateKindPendingRecovery, Version: &ver, Shares: [][]byte{{1, 2}, {3, 4, 5}}}
+	want := StateItem{Kind: StateKindPendingRecovery, SecretID: &sid, Version: &ver, Shares: [][]byte{{1, 2}, {3, 4, 5}}}
 	wire, err := EncodeStateItem(want)
 	if err != nil {
 		t.Fatalf("EncodeStateItem: %v", err)
@@ -344,8 +346,9 @@ func TestStateItemRoundTrip_PendingRecovery(t *testing.T) {
 // (Rust always wraps Some(...) for this variant, even over an empty vec —
 // it is not the same as the field being entirely absent).
 func TestEncodeStateItem_PendingRecoveryEmptySharesStillPresent(t *testing.T) {
+	sid := uint64(0xA0)
 	ver := uint32(1)
-	got, err := EncodeStateItem(StateItem{Kind: StateKindPendingRecovery, Version: &ver, Shares: [][]byte{}})
+	got, err := EncodeStateItem(StateItem{Kind: StateKindPendingRecovery, SecretID: &sid, Version: &ver, Shares: [][]byte{}})
 	if err != nil {
 		t.Fatalf("EncodeStateItem: %v", err)
 	}
@@ -540,5 +543,85 @@ func TestJsonByteArray_UnmarshalRejectsOutOfRange(t *testing.T) {
 	var b JSONByteArray
 	if err := json.Unmarshal([]byte("[1,2,300]"), &b); err == nil {
 		t.Fatal("expected error for byte value out of range")
+	}
+}
+
+// --- PendingRecovery carries the secret being recovered --------------
+//
+// The recovering device runs an ephemeral instance, so the secret named
+// in a PendingRecovery row is not the secret_id partitioning the store.
+// Both the key and the item must carry it, or the Rust side rejects the
+// row and every recovered share is dropped.
+
+func TestStateKeyRoundTrip_PendingRecoveryCarriesSecretID(t *testing.T) {
+	sid := uint64(0xA0)
+	ver := uint32(3)
+	wire, err := EncodeStateKey(StateKey{Kind: StateKindPendingRecovery, SecretID: &sid, Version: &ver})
+	if err != nil {
+		t.Fatalf("EncodeStateKey: %v", err)
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(wire, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if string(raw["secret_id"]) != `"160"` {
+		t.Fatalf("secret_id must be a stringified u64, got: %s", wire)
+	}
+
+	got, err := DecodeStateKey(wire)
+	if err != nil {
+		t.Fatalf("DecodeStateKey: %v", err)
+	}
+	if got.SecretID == nil || *got.SecretID != sid {
+		t.Fatalf("SecretID mismatch: got %+v want %d", got.SecretID, sid)
+	}
+}
+
+func TestEncodeStateKey_PendingRecoveryRequiresSecretID(t *testing.T) {
+	ver := uint32(3)
+	if _, err := EncodeStateKey(StateKey{Kind: StateKindPendingRecovery, Version: &ver}); err == nil {
+		t.Fatal("expected an error when SecretID is absent")
+	}
+}
+
+func TestStateItemRoundTrip_PendingRecoveryCarriesSecretID(t *testing.T) {
+	sid := uint64(0xA0)
+	ver := uint32(4)
+	want := StateItem{
+		Kind:     StateKindPendingRecovery,
+		SecretID: &sid,
+		Version:  &ver,
+		Shares:   [][]byte{{1, 2}},
+	}
+	wire, err := EncodeStateItem(want)
+	if err != nil {
+		t.Fatalf("EncodeStateItem: %v", err)
+	}
+	got, err := DecodeStateItem(wire)
+	if err != nil {
+		t.Fatalf("DecodeStateItem: %v", err)
+	}
+	if got.SecretID == nil || *got.SecretID != sid {
+		t.Fatalf("SecretID mismatch: got %+v want %d", got.SecretID, sid)
+	}
+}
+
+func TestStateItemKey_PendingRecoveryPropagatesSecretID(t *testing.T) {
+	sid := uint64(0xA0)
+	ver := uint32(4)
+	key := StateItem{Kind: StateKindPendingRecovery, SecretID: &sid, Version: &ver}.Key()
+	if key.SecretID == nil || *key.SecretID != sid {
+		t.Fatalf("Key() dropped SecretID: %+v", key)
+	}
+	if key.Version == nil || *key.Version != ver {
+		t.Fatalf("Key() dropped Version: %+v", key)
+	}
+}
+
+func TestDecodeStateItem_PendingRecoveryRequiresSecretID(t *testing.T) {
+	wire := []byte(`{"kind":1,"version":4,"shares":[]}`)
+	if _, err := DecodeStateItem(wire); err == nil {
+		t.Fatal("expected an error when secret_id is absent")
 	}
 }

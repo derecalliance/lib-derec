@@ -148,7 +148,7 @@ var _ transportSender = (*mockTransportSender)(nil)
 // --- ChannelStore dispatch ------------------------------------------------
 
 func TestDispatchChannelLoad_Found(t *testing.T) {
-	want := Channel{ID: 7, Status: ChannelStatusPaired, Role: SenderKindOwner, CommunicationInfo: map[string]string{}}
+	want := Channel{ID: 7, Status: ChannelStatusPaired, PeerRole: SenderKindOwner, CommunicationInfo: map[string]string{}}
 	s := &storeSet{channel: &mockChannelStore{
 		loadFn: func(secretID, channelID uint64) (Channel, bool, error) {
 			if secretID != 100 || channelID != 7 {
@@ -165,7 +165,7 @@ func TestDispatchChannelLoad_Found(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecodeChannel: %v", err)
 	}
-	if got.ID != want.ID || got.Role != want.Role {
+	if got.ID != want.ID || got.PeerRole != want.PeerRole {
 		t.Fatalf("decoded = %+v, want %+v", got, want)
 	}
 }
@@ -226,7 +226,7 @@ func TestDispatchChannelSave_RecordsValue(t *testing.T) {
 			return nil
 		},
 	}}
-	ch := Channel{ID: 9, Status: ChannelStatusPending, Role: SenderKindHelper, CommunicationInfo: map[string]string{}}
+	ch := Channel{ID: 9, Status: ChannelStatusPending, PeerRole: SenderKindHelper, CommunicationInfo: map[string]string{}}
 	payload, err := EncodeChannel(ch)
 	if err != nil {
 		t.Fatalf("EncodeChannel: %v", err)
@@ -235,7 +235,7 @@ func TestDispatchChannelSave_RecordsValue(t *testing.T) {
 	if status != ffiStatusOK {
 		t.Fatalf("status = %d, want ffiStatusOK", status)
 	}
-	if savedSecretID != 55 || saved.ID != 9 || saved.Role != SenderKindHelper {
+	if savedSecretID != 55 || saved.ID != 9 || saved.PeerRole != SenderKindHelper {
 		t.Fatalf("mock did not record expected save: secretID=%d channel=%+v", savedSecretID, saved)
 	}
 }

@@ -10,7 +10,7 @@
 //! JSON. `Channel` rides serde directly — its derives produce a stable
 //! shape with a top-level `id` (decimal-serialized u64), a nested
 //! `transport: { uri, protocol }` object, and variant-name strings for
-//! `status` and `role`. `Share` and `SecretValue` keep dedicated record
+//! `status` and `peer_role`. `Share` and `SecretValue` keep dedicated record
 //! wrappers because their on-wire shapes differ from their in-memory
 //! ones (e.g. `secret_id` is stringified for JS interop). The same
 //! schema is consumed by the WASM bridge so a single C# / TS
@@ -189,7 +189,8 @@ fn secret_kind_to_u32(kind: SecretKind) -> u32 {
 /// JSON-on-the-wire shape of a [`StateKey`]. `kind` matches
 /// [`StateKind`]:
 /// - `0` = PendingVerification — `channel_id` present (stringified u64)
-/// - `1` = PendingRecovery — `version` present
+/// - `1` = PendingRecovery — `secret_id` (stringified u64, the secret
+///   being recovered) and `version` present
 /// - `2` = PendingUnpair — `channel_id` present (stringified u64)
 /// - `3` = SharingRound — no secondary key
 ///
@@ -201,6 +202,8 @@ pub(crate) struct StateKeyRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<u32>,
 }
 
@@ -210,21 +213,25 @@ impl From<&StateKey> for StateKeyRecord {
             StateKey::PendingVerification { channel_id } => Self {
                 kind: 0,
                 channel_id: Some(channel_id.0.to_string()),
+                secret_id: None,
                 version: None,
             },
-            StateKey::PendingRecovery { version } => Self {
+            StateKey::PendingRecovery { secret_id, version } => Self {
                 kind: 1,
                 channel_id: None,
+                secret_id: Some(secret_id.to_string()),
                 version: Some(*version),
             },
             StateKey::PendingUnpair { channel_id } => Self {
                 kind: 2,
                 channel_id: Some(channel_id.0.to_string()),
+                secret_id: None,
                 version: None,
             },
             StateKey::SharingRound => Self {
                 kind: 3,
                 channel_id: None,
+                secret_id: None,
                 version: None,
             },
         }
@@ -235,7 +242,8 @@ impl From<&StateKey> for StateKeyRecord {
 /// [`StateKind`] (identical numbering to [`StateKeyRecord::kind`]):
 /// - `0` = PendingVerification — `channel_id`, `bytes` (prost-encoded
 ///   [`derec_proto::VerifyShareRequestMessage`])
-/// - `1` = PendingRecovery — `version`, `shares` (each entry is a
+/// - `1` = PendingRecovery — `secret_id` (stringified u64, the secret
+///   being recovered), `version`, `shares` (each entry is a
 ///   prost-encoded [`derec_proto::GetShareResponseMessage`])
 /// - `2` = PendingUnpair — `channel_id`, `started_at` (stringified u64
 ///   unix-seconds)
@@ -247,6 +255,8 @@ pub(crate) struct StateItemRecord {
     pub kind: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -269,6 +279,7 @@ impl From<&StateItem> for StateItemRecord {
             StateItem::PendingVerification { channel_id, request } => Self {
                 kind: 0,
                 channel_id: Some(channel_id.0.to_string()),
+                secret_id: None,
                 version: None,
                 started_at: None,
                 bytes: Some(request.encode_to_vec()),
@@ -277,9 +288,14 @@ impl From<&StateItem> for StateItemRecord {
                 confirmed: None,
                 failed: None,
             },
-            StateItem::PendingRecovery { version, shares } => Self {
+            StateItem::PendingRecovery {
+                secret_id,
+                version,
+                shares,
+            } => Self {
                 kind: 1,
                 channel_id: None,
+                secret_id: Some(secret_id.to_string()),
                 version: Some(*version),
                 started_at: None,
                 bytes: None,
@@ -291,6 +307,7 @@ impl From<&StateItem> for StateItemRecord {
             StateItem::PendingUnpair { channel_id, started_at } => Self {
                 kind: 2,
                 channel_id: Some(channel_id.0.to_string()),
+                secret_id: None,
                 version: None,
                 started_at: Some(started_at.to_string()),
                 bytes: None,
@@ -308,6 +325,7 @@ impl From<&StateItem> for StateItemRecord {
             } => Self {
                 kind: 3,
                 channel_id: None,
+                secret_id: None,
                 version: Some(*version),
                 started_at: Some(started_at.to_string()),
                 bytes: None,
@@ -354,6 +372,11 @@ impl StateItemRecord {
                 Ok(StateItem::PendingVerification { channel_id, request })
             }
             1 => {
+                let secret_id = self
+                    .secret_id
+                    .ok_or_else(|| "PendingRecovery requires secret_id".to_string())?
+                    .parse::<u64>()
+                    .map_err(|e| format!("secret_id not a decimal u64: {e}"))?;
                 let version = self
                     .version
                     .ok_or_else(|| "PendingRecovery requires version".to_string())?;
@@ -366,7 +389,11 @@ impl StateItemRecord {
                         .map_err(|e| format!("GetShareResponseMessage[{i}] decode: {e}"))?;
                     shares.push(msg);
                 }
-                Ok(StateItem::PendingRecovery { version, shares })
+                Ok(StateItem::PendingRecovery {
+                    secret_id,
+                    version,
+                    shares,
+                })
             }
             2 => {
                 let channel_id_str = self

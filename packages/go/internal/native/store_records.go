@@ -66,7 +66,7 @@ type channelWire struct {
 	CommunicationInfo map[string]string `json:"communication_info"`
 	Status            ChannelStatus     `json:"status"`
 	CreatedAt         uint64            `json:"created_at"`
-	Role              SenderKind        `json:"role"`
+	PeerRole          SenderKind        `json:"peer_role"`
 	ReplicaID         *uint64           `json:"replica_id"`
 }
 
@@ -91,7 +91,7 @@ func EncodeChannel(c Channel) ([]byte, error) {
 		CommunicationInfo: info,
 		Status:            c.Status,
 		CreatedAt:         c.CreatedAt,
-		Role:              c.Role,
+		PeerRole:          c.PeerRole,
 		ReplicaID:         c.ReplicaID,
 	}
 	return json.Marshal(w)
@@ -110,7 +110,7 @@ func DecodeChannel(data []byte) (Channel, error) {
 		CommunicationInfo: w.CommunicationInfo,
 		Status:            w.Status,
 		CreatedAt:         w.CreatedAt,
-		Role:              w.Role,
+		PeerRole:          w.PeerRole,
 		ReplicaID:         w.ReplicaID,
 	}, nil
 }
@@ -228,6 +228,7 @@ func DecodeSecretValue(data []byte) (SecretValue, error) {
 type stateKeyWire struct {
 	Kind      uint32  `json:"kind"`
 	ChannelID *string `json:"channel_id,omitempty"`
+	SecretID  *string `json:"secret_id,omitempty"`
 	Version   *uint32 `json:"version,omitempty"`
 }
 
@@ -244,9 +245,14 @@ func EncodeStateKey(k StateKey) ([]byte, error) {
 		cid := strconv.FormatUint(*k.ChannelID, 10)
 		w.ChannelID = &cid
 	case StateKindPendingRecovery:
+		if k.SecretID == nil {
+			return nil, fmt.Errorf("native: StateKey PendingRecovery requires SecretID")
+		}
 		if k.Version == nil {
 			return nil, fmt.Errorf("native: StateKey PendingRecovery requires Version")
 		}
+		sid := strconv.FormatUint(*k.SecretID, 10)
+		w.SecretID = &sid
 		v := *k.Version
 		w.Version = &v
 	case StateKindSharingRound:
@@ -277,11 +283,18 @@ func DecodeStateKey(data []byte) (StateKey, error) {
 		}
 		return StateKey{Kind: StateKind(w.Kind), ChannelID: &cid}, nil
 	case StateKindPendingRecovery:
+		if w.SecretID == nil {
+			return StateKey{}, fmt.Errorf("native: StateKey PendingRecovery requires secret_id")
+		}
 		if w.Version == nil {
 			return StateKey{}, fmt.Errorf("native: StateKey PendingRecovery requires version")
 		}
+		sid, err := strconv.ParseUint(*w.SecretID, 10, 64)
+		if err != nil {
+			return StateKey{}, fmt.Errorf("native: secret_id not a decimal u64: %w", err)
+		}
 		v := *w.Version
-		return StateKey{Kind: StateKindPendingRecovery, Version: &v}, nil
+		return StateKey{Kind: StateKindPendingRecovery, SecretID: &sid, Version: &v}, nil
 	case StateKindSharingRound:
 		return StateKey{Kind: StateKindSharingRound}, nil
 	default:
@@ -299,6 +312,7 @@ func DecodeStateKey(data []byte) (StateKey, error) {
 type stateItemWire struct {
 	Kind      uint32           `json:"kind"`
 	ChannelID *string          `json:"channel_id,omitempty"`
+	SecretID  *string          `json:"secret_id,omitempty"`
 	Version   *uint32          `json:"version,omitempty"`
 	StartedAt *string          `json:"started_at,omitempty"`
 	Bytes     *JSONByteArray   `json:"bytes,omitempty"`
@@ -345,9 +359,14 @@ func EncodeStateItem(item StateItem) ([]byte, error) {
 		b := JSONByteArray(item.Bytes)
 		w.Bytes = &b
 	case StateKindPendingRecovery:
+		if item.SecretID == nil {
+			return nil, fmt.Errorf("native: PendingRecovery StateItem requires SecretID")
+		}
 		if item.Version == nil {
 			return nil, fmt.Errorf("native: PendingRecovery StateItem requires Version")
 		}
+		sid := strconv.FormatUint(*item.SecretID, 10)
+		w.SecretID = &sid
 		v := *item.Version
 		w.Version = &v
 		shares := make([]JSONByteArray, len(item.Shares))
@@ -411,18 +430,25 @@ func DecodeStateItem(data []byte) (StateItem, error) {
 		}
 		return StateItem{Kind: StateKindPendingVerification, ChannelID: &cid, Bytes: []byte(*w.Bytes)}, nil
 	case StateKindPendingRecovery:
+		if w.SecretID == nil {
+			return StateItem{}, fmt.Errorf("native: PendingRecovery requires secret_id")
+		}
 		if w.Version == nil {
 			return StateItem{}, fmt.Errorf("native: PendingRecovery requires version")
 		}
 		if w.Shares == nil {
 			return StateItem{}, fmt.Errorf("native: PendingRecovery requires shares")
 		}
+		sid, err := strconv.ParseUint(*w.SecretID, 10, 64)
+		if err != nil {
+			return StateItem{}, fmt.Errorf("native: secret_id not a decimal u64: %w", err)
+		}
 		shares := make([][]byte, len(*w.Shares))
 		for i, s := range *w.Shares {
 			shares[i] = []byte(s)
 		}
 		v := *w.Version
-		return StateItem{Kind: StateKindPendingRecovery, Version: &v, Shares: shares}, nil
+		return StateItem{Kind: StateKindPendingRecovery, SecretID: &sid, Version: &v, Shares: shares}, nil
 	case StateKindPendingUnpair:
 		if w.ChannelID == nil {
 			return StateItem{}, fmt.Errorf("native: PendingUnpair requires channel_id")

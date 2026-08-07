@@ -119,7 +119,7 @@ func TestBuildCallbacks_NilStoreSet(t *testing.T) {
 // unit-test floor.
 
 func TestChannelStoreCallbacks_LoadCallback_RealRoundTrip(t *testing.T) {
-	want := Channel{ID: 77, Status: ChannelStatusPaired, Role: SenderKindOwner, CommunicationInfo: map[string]string{}}
+	want := Channel{ID: 77, Status: ChannelStatusPaired, PeerRole: SenderKindOwner, CommunicationInfo: map[string]string{}}
 	s := &storeSet{channel: &mockChannelStore{
 		loadFn: func(secretID, channelID uint64) (Channel, bool, error) {
 			return want, true, nil
@@ -210,7 +210,7 @@ func TestChannelStoreCallbacks_SaveCallback_RealRoundTrip(t *testing.T) {
 	var save func(userData uintptr, secretID, channelID uint64, bytesPtr *byte, length uintptr) int32
 	purego.RegisterFunc(&save, built.Channel.Save)
 
-	payload, err := EncodeChannel(Channel{ID: 5, Status: ChannelStatusPending, Role: SenderKindHelper, CommunicationInfo: map[string]string{}})
+	payload, err := EncodeChannel(Channel{ID: 5, Status: ChannelStatusPending, PeerRole: SenderKindHelper, CommunicationInfo: map[string]string{}})
 	if err != nil {
 		t.Fatalf("EncodeChannel: %v", err)
 	}
@@ -218,7 +218,7 @@ func TestChannelStoreCallbacks_SaveCallback_RealRoundTrip(t *testing.T) {
 	if rc != ffiStatusOK {
 		t.Fatalf("rc = %d, want ffiStatusOK", rc)
 	}
-	if saved.ID != 5 || saved.Role != SenderKindHelper {
+	if saved.ID != 5 || saved.PeerRole != SenderKindHelper {
 		t.Fatalf("saved = %+v", saved)
 	}
 }

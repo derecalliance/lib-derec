@@ -306,25 +306,31 @@ for the complete enum and per-variant docs.
 
 ### Channel roles
 
-Each paired channel carries the local node's role — `SenderKind::Owner`,
+A channel row describes the participant on the other end, so each paired
+channel carries the **peer's** role — `SenderKind::Owner`,
 `SenderKind::Helper`, `SenderKind::ReplicaSource`, or
 `SenderKind::ReplicaDestination` — fixed at pairing time and stored on
-[`Channel.role`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.Channel.html).
+[`Channel.peer_role`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.Channel.html).
+The two sides of one channel therefore hold opposite values: an Owner's
+row for its helper reads `Helper`, and that helper's row for the Owner
+reads `Owner`. This node's own role is always the inverse
+(`Owner` ↔ `Helper`, `ReplicaSource` ↔ `ReplicaDestination`).
+
 The orchestrator enforces flow directionality against this value:
 
 - Outbound: `ProtectSecret`, `VerifyShares`, `Discovery`, `RecoverSecret`,
-  and `Unpair` require the local role to be `Owner` (or `ReplicaSource`
-  for `ProtectSecret`) on every targeted channel.
+  and `Unpair` require the peer to be a `Helper` (or a
+  `ReplicaDestination` for `ProtectSecret`) on every targeted channel.
 - Inbound: a `StoreShareRequest` / `VerifyShareRequest` /
   `GetSecretIdsVersionsRequest` / `GetShareRequest` / `UnpairRequest` is
-  only honored on a channel where the local role is `Helper`; the
-  corresponding responses require `Owner`. A `StoreShareRequest` on a
-  `ReplicaDestination` channel is decoded as a
+  only honored when it arrives from a peer recorded as `Owner`; the
+  corresponding responses require a `Helper` peer. A `StoreShareRequest`
+  on a `ReplicaSource` channel is decoded as a
   [`ReplicaSecretPayload`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.ReplicaSecretPayload.html)
   and surfaces as
   [`DeRecEvent::ReplicaSecretReceived`](https://docs.rs/derec-library/latest/derec_library/protocol/events/enum.DeRecEvent.html#variant.ReplicaSecretReceived).
 - `UpdateChannelInfo` is symmetric — either side may initiate it, and the
-  role is not consulted.
+  peer role is not consulted.
 
 A mismatch surfaces as `Error::RoleMismatch { channel_id, expected, actual }`.
 

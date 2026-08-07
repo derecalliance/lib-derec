@@ -96,15 +96,22 @@ pub struct Channel {
     /// Unix timestamp (seconds) when the channel was created.
     #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
     pub created_at: u64,
-    /// This node's role on this channel, fixed at pairing time.
+    /// The **peer's** role on this channel, fixed at pairing time.
     ///
-    /// The orchestrator enforces flow directionality against this value: an
-    /// `Owner` may initiate `ProtectSecret` / `VerifyShares` / `Discovery` /
-    /// `RecoverSecret`; a `Helper` may not. Inbound messages are gated the
-    /// other way around — a `StoreShareRequest` is only honored on a channel
-    /// where this node is the `Helper`, and so on.
-    pub role: derec_proto::SenderKind,
-    /// The peer's replica identity, populated only when `role` is
+    /// A channel row describes the participant on the other end, so this
+    /// is what that participant is to us — a helper-pairing held by an
+    /// Owner stores `Helper`, and the Helper's own row for the same
+    /// channel stores `Owner`. This node's own role on the channel is
+    /// always the inverse (`Owner` ↔ `Helper`, `ReplicaSource` ↔
+    /// `ReplicaDestination`).
+    ///
+    /// The orchestrator enforces flow directionality against this value:
+    /// `ProtectSecret` / `VerifyShares` / `Discovery` / `RecoverSecret`
+    /// target channels whose peer is a `Helper`. Inbound messages are
+    /// gated the same way — a `StoreShareRequest` is only honored when
+    /// it arrives from a peer recorded as `Owner`, and so on.
+    pub peer_role: derec_proto::SenderKind,
+    /// The peer's replica identity, populated only when `peer_role` is
     /// `ReplicaSource` or `ReplicaDestination`.
     ///
     /// Extracted from the peer's `derec.replica_id` entry in
@@ -386,9 +393,11 @@ pub enum StateKind {
     /// Outstanding [`derec_proto::VerifyShareRequestMessage`], one per
     /// channel. Load-bearing for the replay-defence binding gate.
     PendingVerification,
-    /// Recovery accumulator, one per `(secret_id, version)`. Holds every
+    /// Recovery accumulator, one per `(recovered secret_id, version)`
+    /// within a partition. Holds every
     /// [`derec_proto::GetShareResponseMessage`] received so far for that
-    /// reconstruction target.
+    /// reconstruction target. See [`StateKey::PendingRecovery`] on why
+    /// the recovered id is distinct from the partitioning one.
     PendingRecovery,
     /// Outstanding unpair acknowledgement, one per channel. Carries the
     /// `started_at` unix-seconds timestamp so the orchestrator can time
@@ -410,7 +419,14 @@ pub enum StateKey {
     /// Row is scoped to one channel.
     PendingVerification { channel_id: ChannelId },
     /// Row is scoped to one reconstruction target.
-    PendingRecovery { version: u32 },
+    ///
+    /// `secret_id` is the secret *being recovered*, which is not
+    /// necessarily the `secret_id` naming the partition this row lives
+    /// in: a recovering device runs an ephemeral instance whose own id
+    /// owns the partition, while the target belongs to the wire. Keying
+    /// on it lets one instance recover several secrets concurrently at
+    /// the same version without their accumulators colliding.
+    PendingRecovery { secret_id: u64, version: u32 },
     /// Row is scoped to one channel.
     PendingUnpair { channel_id: ChannelId },
     /// At most one row per `secret_id`. No secondary key.
@@ -459,7 +475,7 @@ pub enum StateItem {
     ///
     /// The library writes this variant one share at a time as each inbound
     /// [`derec_proto::GetShareResponseMessage`] arrives. The write sequence
-    /// under a single `(secret_id, version)` is:
+    /// under a single `(recovered secret_id, version)` is:
     ///
     /// 1. First response arrives. Library calls `save` with a `shares`
     ///    vector containing exactly one element.
@@ -479,9 +495,14 @@ pub enum StateItem {
     /// concurrency contract. Concurrent inbound shares racing on the same
     /// accumulator will clobber each other via a naive load-modify-save;
     /// the application layer is responsible for serializing concurrent
-    /// `process()` calls that touch the same `(secret_id, version)` if
-    /// this matters.
+    /// `process()` calls that touch the same `(recovered secret_id,
+    /// version)` if this matters. Recoveries of *different* secrets do
+    /// not contend: they occupy separate rows even at the same version.
     PendingRecovery {
+        /// The secret being recovered. See
+        /// [`StateKey::PendingRecovery`] — this is a wire-level id and
+        /// may differ from the `secret_id` partitioning the row.
+        secret_id: u64,
         version: u32,
         shares: Vec<derec_proto::GetShareResponseMessage>,
     },
@@ -533,9 +554,12 @@ impl StateItem {
             StateItem::PendingVerification { channel_id, .. } => StateKey::PendingVerification {
                 channel_id: *channel_id,
             },
-            StateItem::PendingRecovery { version, .. } => {
-                StateKey::PendingRecovery { version: *version }
-            }
+            StateItem::PendingRecovery {
+                secret_id, version, ..
+            } => StateKey::PendingRecovery {
+                secret_id: *secret_id,
+                version: *version,
+            },
             StateItem::PendingUnpair { channel_id, .. } => StateKey::PendingUnpair {
                 channel_id: *channel_id,
             },

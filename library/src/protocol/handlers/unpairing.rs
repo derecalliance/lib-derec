@@ -62,6 +62,17 @@ use derec_proto::{
     DeRecResult, MessageBody, StatusEnum, UnpairRequestMessage, UnpairResponseMessage,
 };
 
+/// Route an inbound unpair message.
+///
+/// On the initiator side under [`crate::protocol::UnpairAck::Required`],
+/// the [`crate::protocol::DeRecStateStore::remove`] of the
+/// `PendingUnpair` row is the flow's replay guard: an `UnpairResponse`
+/// is acted on only while a matching outbound `UnpairRequest` is still
+/// in flight for that `channel_id`. `remove` returning `false` means no
+/// row existed, so the response — legitimate, stale, or replayed, a
+/// distinction the primitive alone cannot make (see the module-level
+/// Security section) — falls through to [`DeRecEvent::NoOp`] without
+/// mutating any state.
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
@@ -265,6 +276,33 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
     .await
 }
 
+pub(in crate::protocol) async fn drop_channel_state<
+    Ch: DeRecChannelStore,
+    Sh: DeRecShareStore,
+    Ss: DeRecSecretStore,
+>(
+    channel_store: &mut Ch,
+    share_store: &mut Sh,
+    secret_store: &mut Ss,
+    secret_id: u64,
+    channel_id: ChannelId,
+) -> Result<()> {
+    share_store.remove_channel(secret_id, channel_id).await?;
+
+    let _ = secret_store
+        .remove(secret_id, channel_id, SecretKind::SharedKey)
+        .await;
+    let _ = secret_store
+        .remove(secret_id, channel_id, SecretKind::PairingSecret)
+        .await;
+    let _ = secret_store
+        .remove(secret_id, channel_id, SecretKind::PairingContact)
+        .await;
+
+    let _ = channel_store.remove(secret_id, channel_id).await?;
+    Ok(())
+}
+
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
@@ -286,15 +324,6 @@ fn on_request(
     }])
 }
 
-/// Handle an inbound [`UnpairResponseMessage`] on the initiator
-/// side under [`crate::protocol::UnpairAck::Required`].
-///
-/// The [`crate::protocol::DeRecStateStore::remove`] call below is the
-/// flow's replay guard: an `UnpairResponse` is only acted on when a
-/// matching outbound `UnpairRequest` is still in flight for that
-/// `channel_id`. Replayed or stale responses (which the primitive
-/// alone cannot detect — see the module-level Security section)
-/// fall through to [`DeRecEvent::NoOp`] without mutating any state.
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
@@ -313,10 +342,6 @@ async fn on_response<
     channel_id: ChannelId,
     response: &UnpairResponseMessage,
 ) -> Result<Vec<DeRecEvent>> {
-    // Replay/freshness guard. See the module docs for the full
-    // idempotency argument — `remove` returns `false` when no row
-    // existed for this channel, i.e. no in-flight unpair, so the
-    // response (legitimate or replayed) is dropped as a no-op.
     if !state_store
         .remove(secret_id, StateKey::PendingUnpair { channel_id })
         .await?
@@ -346,31 +371,4 @@ async fn on_response<
         }]),
         Err(e) => Err(e),
     }
-}
-
-pub(in crate::protocol) async fn drop_channel_state<
-    Ch: DeRecChannelStore,
-    Sh: DeRecShareStore,
-    Ss: DeRecSecretStore,
->(
-    channel_store: &mut Ch,
-    share_store: &mut Sh,
-    secret_store: &mut Ss,
-    secret_id: u64,
-    channel_id: ChannelId,
-) -> Result<()> {
-    share_store.remove_channel(secret_id, channel_id).await?;
-
-    let _ = secret_store
-        .remove(secret_id, channel_id, SecretKind::SharedKey)
-        .await;
-    let _ = secret_store
-        .remove(secret_id, channel_id, SecretKind::PairingSecret)
-        .await;
-    let _ = secret_store
-        .remove(secret_id, channel_id, SecretKind::PairingContact)
-        .await;
-
-    let _ = channel_store.remove(secret_id, channel_id).await?;
-    Ok(())
 }

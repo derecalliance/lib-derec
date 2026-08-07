@@ -5,6 +5,8 @@ package protocol
 
 import (
 	"errors"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
@@ -282,35 +284,63 @@ var _ UserSecretStore = (*inMemoryUserSecretStore)(nil)
 
 type inMemoryStateStore struct {
 	mu   sync.Mutex
-	data map[uint64]map[StateKey]StateItem
+	data map[uint64]map[string]StateItem
+}
+
+// stateKeyID renders a StateKey as a comparable value.
+//
+// StateKey cannot be used as a map key directly: its ChannelID/SecretID/
+// Version fields are pointers, and Go compares pointer fields by address.
+// A key rebuilt for Load would never match the one Save derived from
+// item.Key(), so every lookup would miss.
+func stateKeyID(k StateKey) string {
+	optU64 := func(v *uint64) string {
+		if v == nil {
+			return ""
+		}
+		return strconv.FormatUint(*v, 10)
+	}
+	optU32 := func(v *uint32) string {
+		if v == nil {
+			return ""
+		}
+		return strconv.FormatUint(uint64(*v), 10)
+	}
+	return strings.Join([]string{
+		strconv.FormatUint(uint64(k.Kind), 10),
+		optU64(k.ChannelID),
+		optU64(k.SecretID),
+		optU32(k.Version),
+	}, ":")
 }
 
 func newInMemoryStateStore() *inMemoryStateStore {
-	return &inMemoryStateStore{data: make(map[uint64]map[StateKey]StateItem)}
+	return &inMemoryStateStore{data: make(map[uint64]map[string]StateItem)}
 }
 
 func (s *inMemoryStateStore) Save(secretID uint64, item StateItem) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.data[secretID] == nil {
-		s.data[secretID] = make(map[StateKey]StateItem)
+		s.data[secretID] = make(map[string]StateItem)
 	}
-	s.data[secretID][item.Key()] = item
+	s.data[secretID][stateKeyID(item.Key())] = item
 	return nil
 }
 
 func (s *inMemoryStateStore) Load(secretID uint64, key StateKey) (StateItem, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	item, ok := s.data[secretID][key]
+	item, ok := s.data[secretID][stateKeyID(key)]
 	return item, ok, nil
 }
 
 func (s *inMemoryStateStore) Remove(secretID uint64, key StateKey) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, existed := s.data[secretID][key]
-	delete(s.data[secretID], key)
+	id := stateKeyID(key)
+	_, existed := s.data[secretID][id]
+	delete(s.data[secretID], id)
 	return existed, nil
 }
 
@@ -318,12 +348,72 @@ func (s *inMemoryStateStore) LoadAll(secretID uint64, kind StateKind) ([]StateIt
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []StateItem
-	for key, item := range s.data[secretID] {
-		if key.Kind == kind {
+	for _, item := range s.data[secretID] {
+		if item.Kind == kind {
 			out = append(out, item)
 		}
 	}
 	return out, nil
+}
+
+// A key rebuilt from equal values must find the row Save stored, or the
+// store silently loses every row it is given.
+func TestInMemoryStateStore_LoadsRowSavedUnderAnEquivalentKey(t *testing.T) {
+	s := newInMemoryStateStore()
+	sid, ver := uint64(0xA0), uint32(3)
+	if err := s.Save(1, StateItem{
+		Kind:     StateKindPendingRecovery,
+		SecretID: &sid,
+		Version:  &ver,
+		Shares:   [][]byte{{1}},
+	}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	// Same values, freshly allocated — as the library rebuilds them.
+	sid2, ver2 := uint64(0xA0), uint32(3)
+	got, ok, err := s.Load(1, StateKey{
+		Kind:     StateKindPendingRecovery,
+		SecretID: &sid2,
+		Version:  &ver2,
+	})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !ok {
+		t.Fatal("row not found: the map key compared pointers, not values")
+	}
+	if len(got.Shares) != 1 {
+		t.Fatalf("wrong row loaded: %+v", got)
+	}
+}
+
+// Recoveries of two different secrets at the same version must occupy
+// separate rows.
+func TestInMemoryStateStore_SeparatesConcurrentRecoveryTargets(t *testing.T) {
+	s := newInMemoryStateStore()
+	ver := uint32(1)
+	sidA, sidB := uint64(0xA0), uint64(0xB0)
+	for sid, shares := range map[*uint64][][]byte{
+		&sidA: {{1}},
+		&sidB: {{2}, {3}},
+	} {
+		if err := s.Save(1, StateItem{
+			Kind: StateKindPendingRecovery, SecretID: sid, Version: &ver, Shares: shares,
+		}); err != nil {
+			t.Fatalf("Save: %v", err)
+		}
+	}
+
+	got, ok, err := s.Load(1, StateKey{
+		Kind: StateKindPendingRecovery, SecretID: &sidA, Version: &ver,
+	})
+	if err != nil || !ok {
+		t.Fatalf("Load(A): ok=%v err=%v", ok, err)
+	}
+	if len(got.Shares) != 1 {
+		t.Fatalf("vault A row was clobbered by vault B: %+v", got)
+	}
 }
 
 var _ StateStore = (*inMemoryStateStore)(nil)

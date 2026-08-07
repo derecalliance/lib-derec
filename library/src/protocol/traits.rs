@@ -456,7 +456,8 @@ pub trait DeRecTransport {
 ///   [`StateItem::SharingRound`] tally, can clobber each other via naive
 ///   load-modify-save. **The application layer is responsible for
 ///   serializing concurrent `process()` calls that touch the same
-///   `(secret_id, version)`** if this matters.
+///   `(recovered secret_id, version)`** if this matters. Recoveries of
+///   different secrets occupy separate rows and do not contend.
 ///
 /// # Executor independence
 ///

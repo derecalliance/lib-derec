@@ -577,7 +577,7 @@ public sealed class DeRecProtocol : IDisposable
                 ch.CommunicationInfo,
                 ch.Status.ToString(),
                 ch.CreatedAt,
-                ch.Role.ToString(),
+                ch.PeerRole.ToString(),
                 ch.ReplicaId);
             byte[] json = JsonSerializer.SerializeToUtf8Bytes(dto, JsonOpts);
             return WriteOut(json, out outPtr, out outLen);
@@ -601,14 +601,14 @@ public sealed class DeRecProtocol : IDisposable
             var transport = new TransportProtocol(
                 dto.transport.uri, (Protocol)dto.transport.protocol);
             var status = Enum.Parse<ChannelStatus>(dto.status ?? nameof(ChannelStatus.Paired));
-            var role = Enum.Parse<LibPairing.SenderKind>(dto.role);
+            var peerRole = Enum.Parse<LibPairing.SenderKind>(dto.peer_role);
             _channelStore.Save(secretId, new Channel(
                 dto.id,
                 transport,
                 dto.communication_info ?? new(),
                 status,
                 dto.created_at,
-                role,
+                peerRole,
                 dto.replica_id));
             return 0;
         }
@@ -869,6 +869,7 @@ public sealed class DeRecProtocol : IDisposable
     private sealed record StateItemDto(
         uint kind,
         string? channel_id,
+        string? secret_id,
         uint? version,
         string? started_at,
         byte[]? bytes,
@@ -881,11 +882,13 @@ public sealed class DeRecProtocol : IDisposable
     private sealed record StateKeyDto(
         uint kind,
         string? channel_id,
+        string? secret_id,
         uint? version);
 
     private static StateItemDto ToDto(StateItem item) => new(
         (uint)item.Kind,
         item.ChannelId?.ToString(),
+        item.SecretId?.ToString(),
         item.Version,
         item.StartedAt?.ToString(),
         item.Bytes,
@@ -900,6 +903,9 @@ public sealed class DeRecProtocol : IDisposable
         ulong? channelId = dto.channel_id is null
             ? null
             : ulong.Parse(dto.channel_id, System.Globalization.CultureInfo.InvariantCulture);
+        ulong? secretId = dto.secret_id is null
+            ? null
+            : ulong.Parse(dto.secret_id, System.Globalization.CultureInfo.InvariantCulture);
         ulong? startedAt = dto.started_at is null
             ? null
             : ulong.Parse(dto.started_at, System.Globalization.CultureInfo.InvariantCulture);
@@ -913,7 +919,7 @@ public sealed class DeRecProtocol : IDisposable
             .Select(s => ulong.Parse(s, System.Globalization.CultureInfo.InvariantCulture))
             .ToArray();
         return new StateItem(
-            kind, channelId, dto.version, startedAt, dto.bytes, dto.shares,
+            kind, channelId, secretId, dto.version, startedAt, dto.bytes, dto.shares,
             pending, confirmed, failed);
     }
 
@@ -931,6 +937,9 @@ public sealed class DeRecProtocol : IDisposable
                     ?? throw new InvalidOperationException("PendingVerification requires channel_id"),
                     System.Globalization.CultureInfo.InvariantCulture)),
             StateKind.PendingRecovery => StateKey.PendingRecovery(
+                ulong.Parse(dto.secret_id
+                    ?? throw new InvalidOperationException("PendingRecovery requires secret_id"),
+                    System.Globalization.CultureInfo.InvariantCulture),
                 dto.version
                     ?? throw new InvalidOperationException("PendingRecovery requires version")),
             StateKind.PendingUnpair => StateKey.PendingUnpair(
@@ -1064,7 +1073,7 @@ public sealed class DeRecProtocol : IDisposable
         Dictionary<string, string>? communication_info,
         string? status,
         ulong created_at,
-        string role,
+        string peer_role,
         ulong? replica_id);
 
     private sealed record SecretValueDto(uint kind, byte[] bytes);

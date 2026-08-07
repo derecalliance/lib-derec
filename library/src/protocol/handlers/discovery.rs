@@ -43,6 +43,15 @@ pub(in crate::protocol) fn handle(
     }
 }
 
+/// Dispatch a discovery request to each targeted channel.
+///
+/// `Target::Single` / `Target::Many` are filtered down to channels this
+/// `secret_id` actually holds — caller-supplied ids may name unpaired
+/// channels, which would otherwise trip the shared-key invariant below.
+///
+/// Dispatch failure is isolated per channel and surfaced as
+/// `DiscoveryFailed` rather than short-circuiting the fan-out, so one
+/// unreachable helper cannot suppress the rest.
 #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
 pub(in crate::protocol) async fn start<
     Ch: DeRecChannelStore,
@@ -56,8 +65,6 @@ pub(in crate::protocol) async fn start<
     target: Target,
     reply_to: Option<derec_proto::TransportProtocol>,
 ) -> Result<Vec<DeRecEvent>> {
-    // Filter Target::Single/Many to known channels; user input may include
-    // unpaired ids and those would otherwise trip the invariant check below.
     let known_channel_ids: std::collections::HashSet<ChannelId> = channel_store
         .channels(secret_id)
         .await?
@@ -129,24 +136,14 @@ pub(in crate::protocol) async fn start<
     Ok(events)
 }
 
-/// Send a single discovery request; failure isolated so
-/// [`start`] can surface it as a per-channel `DiscoveryFailed` event
-/// without short-circuiting the rest of the fan-out.
-async fn dispatch_one<Ch: DeRecChannelStore, T: DeRecTransport>(
-    channel_store: &mut Ch,
-    transport: &T,
-    secret_id: u64,
-    channel_id: ChannelId,
-    shared_key: &SharedKey,
-    reply_to: Option<derec_proto::TransportProtocol>,
-) -> Result<()> {
-    let endpoint = peer_endpoint(channel_store, secret_id, channel_id).await?;
-    let msg = request::produce(channel_id, shared_key, reply_to)?;
-    let envelope = super::apply_trace_id(msg.envelope, super::fresh_trace_id())?;
-    transport.send(&endpoint, envelope).await?;
-    Ok(())
-}
-
+/// Answer a peer's discovery request with the catalog of secrets held
+/// for it across every linked channel.
+///
+/// Entries are grouped by `secret_id`, then keyed by
+/// `(version, replica_id)`. Pairing the version with the replica that
+/// wrote it means two replicas publishing the same numeric version
+/// surface as two distinct catalog entries — the conflict-visibility
+/// surface the application relies on to detect concurrent writes.
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
@@ -169,11 +166,6 @@ pub(in crate::protocol) async fn accept<
     let linked_ids = channel_store.linked_channels(secret_id, channel_id).await?;
     let all_shares = share_store.load_all(secret_id, &linked_ids).await?;
 
-    // Group by secret_id across all linked channels. The inner key
-    // pairs `version` with `replica_id` so two replicas writing the
-    // same numeric version surface as two distinct entries in the
-    // catalog — that's the conflict-visibility surface the App uses
-    // to detect concurrent writes from multiple replicas.
     let mut secret_map: std::collections::HashMap<
         u64,
         std::collections::BTreeMap<(u32, Option<u64>), String>,
@@ -302,4 +294,19 @@ fn on_response(
         channel_id,
         secrets: result.secret_list,
     }])
+}
+
+async fn dispatch_one<Ch: DeRecChannelStore, T: DeRecTransport>(
+    channel_store: &mut Ch,
+    transport: &T,
+    secret_id: u64,
+    channel_id: ChannelId,
+    shared_key: &SharedKey,
+    reply_to: Option<derec_proto::TransportProtocol>,
+) -> Result<()> {
+    let endpoint = peer_endpoint(channel_store, secret_id, channel_id).await?;
+    let msg = request::produce(channel_id, shared_key, reply_to)?;
+    let envelope = super::apply_trace_id(msg.envelope, super::fresh_trace_id())?;
+    transport.send(&endpoint, envelope).await?;
+    Ok(())
 }

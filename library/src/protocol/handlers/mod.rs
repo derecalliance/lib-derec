@@ -25,14 +25,182 @@ use derec_proto::{DeRecMessage, MessageBody, SenderKind, TransportProtocol};
 use prost::Message;
 use std::collections::HashMap;
 
-/// Assert that every channel in `channel_ids` carries `expected` as its local
-/// role. The protocol's flow directionality (Owner initiates protect/verify/
-/// discovery/recovery, Helper accepts) is enforced through this gate.
+/// Route a decrypted channel message to its flow handler.
 ///
-/// Returns the first mismatch as [`crate::Error::RoleMismatch`]; missing
-/// channels are also reported as a mismatch against `SenderKind::Owner` of
-/// the unknown peer (treated as a programming error — the caller asked the
-/// protocol to operate on a channel it doesn't have).
+/// Each inbound body names the peer role permitted to have sent it, and
+/// the channel's recorded `peer_role` must match before the body is
+/// honoured: requests (`VerifyShare`, `GetSecretIdsVersions`, `GetShare`,
+/// `Unpair`) are accepted only from an `Owner` peer, and their responses
+/// only from a `Helper` peer.
+///
+/// Two families opt out of that single-valued gate. `StoreShare` traffic
+/// is multi-valued — an `Owner` peer drives the classic share path while
+/// a `Replica` peer drives secret sync — so the dispatcher branches on
+/// `peer_role` itself below. `UpdateChannelInfo` is role-blind: either
+/// side may initiate it.
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+)]
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn handle<
+    Ch: DeRecChannelStore,
+    Sh: DeRecShareStore,
+    Ss: DeRecSecretStore,
+    T: super::DeRecTransport,
+    St: DeRecStateStore,
+>(
+    channel_store: &mut Ch,
+    share_store: &mut Sh,
+    secret_store: &mut Ss,
+    transport: &T,
+    state_store: &mut St,
+    message: &DeRecMessage,
+    secret_id: u64,
+    channel_id: ChannelId,
+    shared_key: &SharedKey,
+) -> Result<Vec<DeRecEvent>> {
+    let inner = crate::derec_message::extract_inner_message(&message.message, shared_key)?;
+
+    if let Some(expected) = expected_role_for_inbound(&inner) {
+        require_role(channel_store, secret_id, &[channel_id], expected).await?;
+    }
+
+    let inbound_trace_id = message.trace_id;
+
+    match &inner {
+        MessageBody::StoreShareRequest(_) | MessageBody::StoreShareResponse(_) => {
+            let channel = channel_store
+                .load(secret_id, channel_id)
+                .await?
+                .ok_or(Error::InvalidInput(
+                    "channel id not present in channel store",
+                ))?;
+            match (channel.peer_role, &inner) {
+                (SenderKind::Owner, MessageBody::StoreShareRequest(_))
+                | (SenderKind::Helper, MessageBody::StoreShareResponse(_)) => {
+                    sharing::handle(channel_id, inner, *shared_key, inbound_trace_id)
+                }
+                (SenderKind::ReplicaSource, MessageBody::StoreShareRequest(request)) => {
+                    sharing::handle_replica_request(
+                        secret_store,
+                        transport,
+                        &channel,
+                        request.clone(),
+                        *shared_key,
+                        inbound_trace_id,
+                    )
+                    .await
+                }
+                (SenderKind::ReplicaDestination, MessageBody::StoreShareResponse(response)) => {
+                    sharing::handle_replica_response(&channel, response)
+                }
+                _ => Err(Error::RoleMismatch {
+                    channel_id,
+                    expected: SenderKind::Owner,
+                    actual: channel.peer_role,
+                }),
+            }
+        }
+        MessageBody::VerifyShareRequest(_) | MessageBody::VerifyShareResponse(_) => {
+            verification::handle(
+                share_store,
+                state_store,
+                secret_id,
+                channel_id,
+                inner,
+                *shared_key,
+                inbound_trace_id,
+            )
+            .await
+        }
+        MessageBody::GetSecretIdsVersionsRequest(_)
+        | MessageBody::GetSecretIdsVersionsResponse(_) => {
+            discovery::handle(channel_id, inner, *shared_key, inbound_trace_id)
+        }
+        MessageBody::GetShareRequest(_) | MessageBody::GetShareResponse(_) => {
+            recovery::handle(
+                state_store,
+                channel_id,
+                inner,
+                *shared_key,
+                inbound_trace_id,
+                secret_id,
+            )
+            .await
+        }
+        MessageBody::UnpairRequest(_) | MessageBody::UnpairResponse(_) => {
+            unpairing::handle(
+                channel_store,
+                share_store,
+                secret_store,
+                state_store,
+                secret_id,
+                channel_id,
+                inner,
+                *shared_key,
+                inbound_trace_id,
+            )
+            .await
+        }
+        MessageBody::UpdateChannelInfoRequest(_) | MessageBody::UpdateChannelInfoResponse(_) => {
+            update_channel_info::handle(channel_id, inner, *shared_key, inbound_trace_id).await
+        }
+        _ => Err(Error::Invariant(
+            "unexpected MessageBody variant in channel message",
+        )),
+    }
+}
+
+#[cfg_attr(
+    feature = "logging",
+    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+)]
+#[allow(clippy::too_many_arguments)]
+pub(in crate::protocol) async fn handle_pairing<
+    Ch: DeRecChannelStore,
+    Ss: DeRecSecretStore,
+    T: DeRecTransport,
+>(
+    channel_store: &mut Ch,
+    secret_store: &mut Ss,
+    transport: &T,
+    communication_info: &HashMap<String, String>,
+    message: &DeRecMessage,
+    secret_id: u64,
+    channel_id: ChannelId,
+    pairing_secret: &PairingSecretKeyMaterial,
+    replica_id: Option<u64>,
+    parameter_range: Option<&derec_proto::ParameterRange>,
+) -> Result<Vec<DeRecEvent>> {
+    let inner =
+        crate::derec_message::extract_inner_pairing_message(&message.message, pairing_secret)?;
+
+    pairing::handle(
+        channel_store,
+        secret_store,
+        transport,
+        communication_info,
+        &inner,
+        secret_id,
+        channel_id,
+        pairing_secret,
+        message.trace_id,
+        replica_id,
+        parameter_range,
+    )
+    .await
+}
+
+/// Assert that every channel in `channel_ids` records `expected` as its
+/// **peer's** role. The protocol's flow directionality (protect / verify /
+/// discovery / recovery run against Helper peers; Helpers accept them from
+/// Owner peers) is enforced through this gate.
+///
+/// Returns the first mismatch as [`crate::Error::RoleMismatch`]; a missing
+/// channel is reported as [`crate::Error::InvalidInput`] (treated as a
+/// programming error — the caller asked the protocol to operate on a
+/// channel it doesn't have).
 pub(super) async fn require_role<Ch: DeRecChannelStore>(
     channel_store: &Ch,
     secret_id: u64,
@@ -46,11 +214,11 @@ pub(super) async fn require_role<Ch: DeRecChannelStore>(
             .ok_or(Error::InvalidInput(
                 "channel id not present in channel store",
             ))?;
-        if channel.role != expected {
+        if channel.peer_role != expected {
             return Err(Error::RoleMismatch {
                 channel_id: *channel_id,
                 expected,
-                actual: channel.role,
+                actual: channel.peer_role,
             });
         }
     }
@@ -158,185 +326,17 @@ pub(super) async fn send_channel_message<Ch: DeRecChannelStore, T: DeRecTranspor
     Ok(())
 }
 
-#[cfg_attr(
-    feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
-)]
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn handle<
-    Ch: DeRecChannelStore,
-    Sh: DeRecShareStore,
-    Ss: DeRecSecretStore,
-    T: super::DeRecTransport,
-    St: DeRecStateStore,
->(
-    channel_store: &mut Ch,
-    share_store: &mut Sh,
-    secret_store: &mut Ss,
-    transport: &T,
-    state_store: &mut St,
-    message: &DeRecMessage,
-    secret_id: u64,
-    channel_id: ChannelId,
-    shared_key: &SharedKey,
-) -> Result<Vec<DeRecEvent>> {
-    let inner = crate::derec_message::extract_inner_message(&message.message, shared_key)?;
-
-    if let Some(expected) = expected_role_for_inbound(&inner) {
-        require_role(channel_store, secret_id, &[channel_id], expected).await?;
-    }
-
-    let inbound_trace_id = message.trace_id;
-
-    match &inner {
-        MessageBody::StoreShareRequest(_) | MessageBody::StoreShareResponse(_) => {
-            let channel = channel_store
-                .load(secret_id, channel_id)
-                .await?
-                .ok_or(Error::InvalidInput(
-                    "channel id not present in channel store",
-                ))?;
-            match (channel.role, &inner) {
-                (SenderKind::Helper, MessageBody::StoreShareRequest(_))
-                | (SenderKind::Owner, MessageBody::StoreShareResponse(_)) => {
-                    sharing::handle(channel_id, inner, *shared_key, inbound_trace_id)
-                }
-                (SenderKind::ReplicaDestination, MessageBody::StoreShareRequest(request)) => {
-                    sharing::handle_replica_request(
-                        secret_store,
-                        transport,
-                        &channel,
-                        request.clone(),
-                        *shared_key,
-                        inbound_trace_id,
-                    )
-                    .await
-                }
-                (SenderKind::ReplicaSource, MessageBody::StoreShareResponse(response)) => {
-                    sharing::handle_replica_response(&channel, response)
-                }
-                _ => Err(Error::RoleMismatch {
-                    channel_id,
-                    expected: SenderKind::Helper,
-                    actual: channel.role,
-                }),
-            }
-        }
-        MessageBody::VerifyShareRequest(_) | MessageBody::VerifyShareResponse(_) => {
-            verification::handle(
-                share_store,
-                state_store,
-                secret_id,
-                channel_id,
-                inner,
-                *shared_key,
-                inbound_trace_id,
-            )
-            .await
-        }
-        MessageBody::GetSecretIdsVersionsRequest(_)
-        | MessageBody::GetSecretIdsVersionsResponse(_) => {
-            discovery::handle(channel_id, inner, *shared_key, inbound_trace_id)
-        }
-        MessageBody::GetShareRequest(_) | MessageBody::GetShareResponse(_) => {
-            recovery::handle(
-                state_store,
-                channel_id,
-                inner,
-                *shared_key,
-                inbound_trace_id,
-                secret_id,
-            )
-            .await
-        }
-        MessageBody::UnpairRequest(_) | MessageBody::UnpairResponse(_) => {
-            unpairing::handle(
-                channel_store,
-                share_store,
-                secret_store,
-                state_store,
-                secret_id,
-                channel_id,
-                inner,
-                *shared_key,
-                inbound_trace_id,
-            )
-            .await
-        }
-        MessageBody::UpdateChannelInfoRequest(_) | MessageBody::UpdateChannelInfoResponse(_) => {
-            update_channel_info::handle(channel_id, inner, *shared_key, inbound_trace_id).await
-        }
-        _ => Err(Error::Invariant(
-            "unexpected MessageBody variant in channel message",
-        )),
-    }
-}
-
-#[cfg_attr(
-    feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
-)]
-#[allow(clippy::too_many_arguments)]
-pub(in crate::protocol) async fn handle_pairing<
-    Ch: DeRecChannelStore,
-    Ss: DeRecSecretStore,
-    T: DeRecTransport,
->(
-    channel_store: &mut Ch,
-    secret_store: &mut Ss,
-    transport: &T,
-    communication_info: &HashMap<String, String>,
-    message: &DeRecMessage,
-    secret_id: u64,
-    channel_id: ChannelId,
-    pairing_secret: &PairingSecretKeyMaterial,
-    replica_id: Option<u64>,
-    parameter_range: Option<&derec_proto::ParameterRange>,
-) -> Result<Vec<DeRecEvent>> {
-    let inner =
-        crate::derec_message::extract_inner_pairing_message(&message.message, pairing_secret)?;
-
-    pairing::handle(
-        channel_store,
-        secret_store,
-        transport,
-        communication_info,
-        &inner,
-        secret_id,
-        channel_id,
-        pairing_secret,
-        message.trace_id,
-        replica_id,
-        parameter_range,
-    )
-    .await
-}
-
-/// Inbound role-gate table — the local role required on `channel_id` for the
-/// orchestrator to honor a given inbound [`MessageBody`].
-///
-/// Returns `None` for messages whose role gate is multi-valued (e.g.
-/// `StoreShareRequest` is valid for both `Helper` channels and `Replica`
-/// channels) — the dispatcher does the branching itself. Also `None` for
-/// truly role-blind messages (`UpdateChannelInfo` — either side may
-/// initiate).
 fn expected_role_for_inbound(body: &MessageBody) -> Option<SenderKind> {
     match body {
-        // Multi-role: Helper (peer is Owner, classic share path) OR
-        // Replica (peer is Replica, secret-sync path). Gate is inlined
-        // in `handle`.
         MessageBody::StoreShareRequest(_) | MessageBody::StoreShareResponse(_) => None,
-        // Helper accepts these; Owner sends them.
         MessageBody::VerifyShareRequest(_)
         | MessageBody::GetSecretIdsVersionsRequest(_)
         | MessageBody::GetShareRequest(_)
-        | MessageBody::UnpairRequest(_) => Some(SenderKind::Helper),
-        // Owner consumes these; Helper sends them.
+        | MessageBody::UnpairRequest(_) => Some(SenderKind::Owner),
         MessageBody::VerifyShareResponse(_)
         | MessageBody::GetSecretIdsVersionsResponse(_)
         | MessageBody::GetShareResponse(_)
-        | MessageBody::UnpairResponse(_) => Some(SenderKind::Owner),
-        // Symmetric — either Owner or Helper may initiate.
+        | MessageBody::UnpairResponse(_) => Some(SenderKind::Helper),
         MessageBody::UpdateChannelInfoRequest(_) | MessageBody::UpdateChannelInfoResponse(_) => {
             None
         }

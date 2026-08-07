@@ -245,17 +245,34 @@ class InMemoryUserSecretStore implements UserSecretStore {
 // Rows are keyed by `(secretId, kind, channel_id, version)` — extracted
 // from the JSON blob so `loadAll(kind)` can filter without decoding
 // every stored entry.
+interface StateRecord {
+  kind: number;
+  channel_id?: string;
+  secret_id?: string;
+  version?: number;
+}
+
 class InMemoryStateStore implements StateStore {
   private readonly data = new Map<string, Uint8Array>();
 
   private compositeKey(
     secretId: string,
-    rec: { kind: number; channel_id?: string; version?: number },
+    rec: StateRecord,
   ): string {
-    return `${secretId}:${rec.kind}:${rec.channel_id ?? ""}:${rec.version ?? ""}`;
+    // secret_id is part of the key: a PendingRecovery row names the
+    // secret being recovered, which differs from `secretId` when
+    // recovering from an ephemeral instance, and two vaults can be
+    // recovered concurrently at the same version.
+    return [
+      secretId,
+      rec.kind,
+      rec.channel_id ?? "",
+      rec.secret_id ?? "",
+      rec.version ?? "",
+    ].join(":");
   }
 
-  private parseBlob(bytes: Uint8Array): { kind: number; channel_id?: string; version?: number } {
+  private parseBlob(bytes: Uint8Array): StateRecord {
     return JSON.parse(new TextDecoder().decode(bytes));
   }
 

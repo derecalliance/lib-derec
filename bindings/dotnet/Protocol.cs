@@ -137,7 +137,7 @@ internal static class Protocol
             CommunicationInfo: new Dictionary<string, string>(),
             Status: ChannelStatus.Paired,
             CreatedAt: 1700000000UL,
-            Role: Pairing.SenderKind.Owner,
+            PeerRole: Pairing.SenderKind.Helper,
             ReplicaId: null));
         secretStore.Save(DefaultTestSecretId, channelId, new SecretValue(SecretKind.SharedKey, sharedKey));
 
@@ -195,7 +195,7 @@ internal static class Protocol
             CommunicationInfo: new Dictionary<string, string>(),
             Status: ChannelStatus.Pending,
             CreatedAt: 1700000000UL,
-            Role: Pairing.SenderKind.ReplicaSource,
+            PeerRole: Pairing.SenderKind.ReplicaDestination,
             ReplicaId: 0xcafeUL));
         node.SecretStore.Save(node.Protocol.SecretId, channelId, new SecretValue(SecretKind.SharedKey, sharedKey));
 

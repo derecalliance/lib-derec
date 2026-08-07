@@ -75,6 +75,13 @@ pub mod utils;
 mod builder;
 mod handlers;
 
+/// In-memory store and transport doubles shared by the unit tests
+/// throughout this module. Lives at the `protocol` level because the
+/// doubles implement the [`traits`] store interfaces and the rigs build
+/// a whole [`DeRecProtocol`] — neither is specific to [`handlers`].
+#[cfg(test)]
+mod test;
+
 use crate::{
     Error, Result,
     primitives::pairing::request::create_contact as create_contact_message,
@@ -860,7 +867,7 @@ impl<
         // Update channel status to Paired.
         let mut transitioned_replica = false;
         if let Some(mut channel) = self.channel_store.load(self.secret_id, channel_id).await? {
-            transitioned_replica = channel.role == derec_proto::SenderKind::ReplicaSource
+            transitioned_replica = channel.peer_role == derec_proto::SenderKind::ReplicaDestination
                 && channel.status == crate::protocol::types::ChannelStatus::Pending;
             channel.status = crate::protocol::types::ChannelStatus::Paired;
             self.channel_store.save(self.secret_id, channel).await?;
@@ -994,7 +1001,8 @@ impl<
             &self.channel_store,
             self.secret_id,
             &resolved,
-            derec_proto::SenderKind::Owner,
+            // Owner-initiated flow: every target must be a Helper peer.
+            derec_proto::SenderKind::Helper,
         )
         .await?;
         handlers::discovery::start(
@@ -1102,7 +1110,8 @@ impl<
             &self.channel_store,
             self.secret_id,
             &resolved,
-            derec_proto::SenderKind::Owner,
+            // Owner-initiated flow: every target must be a Helper peer.
+            derec_proto::SenderKind::Helper,
         )
         .await?;
         handlers::verification::start(
@@ -1124,25 +1133,20 @@ impl<
         version: u32,
         reply_to: Option<derec_proto::TransportProtocol>,
     ) -> Result<Vec<DeRecEvent>> {
-        let all_paired: Vec<crate::types::ChannelId> = self
-            .channel_store
-            .channels(self.secret_id)
-            .await?
-            .iter()
-            .map(|c| c.id)
-            .collect();
-        handlers::require_role(
-            &self.channel_store,
-            self.secret_id,
-            &all_paired,
-            derec_proto::SenderKind::Owner,
-        )
-        .await?;
+        // No blanket role gate here: an instance legitimately holds
+        // replica channels alongside its helper pairings, and requiring
+        // every channel to be Owner-role would abort the recovery over a
+        // peer that was never a recovery target. The handler selects the
+        // Owner-role, `Paired` channels itself.
         handlers::recovery::start(
             &mut self.channel_store,
             &mut self.secret_store,
             &mut self.state_store,
             &self.transport,
+            // Local: our channels, keys and state. Target: the secret
+            // asked for on the wire. Equal for an in-place re-request,
+            // distinct when recovering from an ephemeral instance.
+            self.secret_id,
             secret_id,
             version,
             reply_to,
@@ -1160,7 +1164,8 @@ impl<
             &self.channel_store,
             self.secret_id,
             &[channel_id],
-            derec_proto::SenderKind::Owner,
+            // Owner-initiated teardown: the peer must be a Helper.
+            derec_proto::SenderKind::Helper,
         )
         .await?;
         // The handler returns an immediate `Unpaired` event for the
@@ -1398,14 +1403,13 @@ impl<
         self.publish_secret(secrets, description, reply_to).await
     }
 
-    /// Returns `true` when at least one channel carries the local
-    /// `ReplicaSource` role in `Paired` status — i.e. the peer is a
-    /// Replica Destination that is fully verified and eligible for
-    /// secret sync.
+    /// Returns `true` when at least one channel records a
+    /// `ReplicaDestination` peer in `Paired` status — i.e. a Destination
+    /// that is fully verified and eligible for secret sync.
     async fn has_paired_replica_destination(&self) -> Result<bool> {
         let channels = self.channel_store.channels(self.secret_id).await?;
         Ok(channels.iter().any(|c| {
-            c.role == derec_proto::SenderKind::ReplicaSource
+            c.peer_role == derec_proto::SenderKind::ReplicaDestination
                 && c.status == crate::protocol::types::ChannelStatus::Paired
         }))
     }

@@ -167,7 +167,7 @@ func TestChannelStore_SaveLoadRemoveThroughInterface(t *testing.T) {
 		ID:        1,
 		Transport: TransportEndpoint{URI: "https://h.example.com", Protocol: 0},
 		Status:    ChannelStatusPaired,
-		Role:      SenderKindOwner,
+		PeerRole:  SenderKindOwner,
 	}
 	if err := store.Save(100, ch); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -177,7 +177,7 @@ func TestChannelStore_SaveLoadRemoveThroughInterface(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("Load: got=%v ok=%v err=%v", got, ok, err)
 	}
-	if got.ID != 1 || got.Role != SenderKindOwner {
+	if got.ID != 1 || got.PeerRole != SenderKindOwner {
 		t.Fatalf("Load mismatch: %+v", got)
 	}
 
