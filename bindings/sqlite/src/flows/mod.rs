@@ -6,8 +6,8 @@ pub mod helpers;
 
 pub mod auto_accept;
 pub mod discovery_recovery;
-pub mod multi_tenancy;
 pub mod multi_secret;
+pub mod multi_tenancy;
 pub mod pairing;
 pub mod persistence;
 pub mod replica_sync;

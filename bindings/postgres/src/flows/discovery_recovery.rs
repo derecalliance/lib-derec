@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-use derec_library::protocol::events::DeRecEvent;
-use derec_library::protocol::types::{Target, UserSecret};
 use derec_library::protocol::DeRecChannelStore;
 use derec_library::protocol::DeRecFlow;
 use derec_library::protocol::DeRecUserSecretStore;
+use derec_library::protocol::events::DeRecEvent;
+use derec_library::protocol::types::{Target, UserSecret};
 use derec_library::types::ChannelId;
 use derec_proto::SenderKind;
 use std::collections::HashMap;
@@ -58,8 +58,14 @@ pub async fn run() {
         "wallet seed phrase",
     )
     .await;
-    assert_eq!(count_shares(&helper_a_db.client(), PROTECTED_SECRET_ID).await, 1);
-    assert_eq!(count_shares(&helper_b_db.client(), PROTECTED_SECRET_ID).await, 1);
+    assert_eq!(
+        count_shares(&helper_a_db.client(), PROTECTED_SECRET_ID).await,
+        1
+    );
+    assert_eq!(
+        count_shares(&helper_b_db.client(), PROTECTED_SECRET_ID).await,
+        1
+    );
     println!("  v1 publish lands one share row on each helper  ✓");
 
     owner
@@ -108,7 +114,9 @@ pub async fn run() {
                 _ => None,
             })
             .unwrap_or_else(|| {
-                panic!("recovery pair ({label}): missing PairingCompleted for transient {fresh_cid:?}")
+                panic!(
+                    "recovery pair ({label}): missing PairingCompleted for transient {fresh_cid:?}"
+                )
             });
         rekeyed_recovery[idx] = (fresh_cid, rekeyed);
     }

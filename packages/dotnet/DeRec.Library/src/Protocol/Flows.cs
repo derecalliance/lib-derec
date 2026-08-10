@@ -500,6 +500,13 @@ public sealed record RecoverSecretFailedEvent : DeRecEvent
     public required string Error { get; init; }
 }
 
+public sealed record UnpairFailedEvent : DeRecEvent
+{
+    public override string EventType => "UnpairFailed";
+    public required string ChannelId { get; init; }
+    public required string Error { get; init; }
+}
+
 public sealed record UnpairStartedEvent : DeRecEvent
 {
     public override string EventType => "UnpairStarted";
@@ -701,6 +708,11 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             {
                 ChannelId = root.GetProperty("channel_id").GetString()!,
                 Version = root.GetProperty("version").GetUInt32(),
+                Error = root.GetProperty("error").GetString() ?? string.Empty,
+            },
+            "UnpairFailed" => new UnpairFailedEvent
+            {
+                ChannelId = root.GetProperty("channel_id").GetString()!,
                 Error = root.GetProperty("error").GetString() ?? string.Empty,
             },
             "UnpairStarted" => new UnpairStartedEvent

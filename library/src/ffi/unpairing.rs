@@ -14,7 +14,7 @@ use crate::ffi::common::{
 };
 use crate::ffi::error::{
     DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_BAD_SHARED_KEY, DEREC_CODE_FFI_BAD_UTF8,
-    DEREC_CODE_FFI_NULL_PTR, DEREC_CODE_FFI_NUL_IN_STRING, DeRecError, ffi_error, from_lib_error,
+    DEREC_CODE_FFI_NUL_IN_STRING, DEREC_CODE_FFI_NULL_PTR, DeRecError, ffi_error, from_lib_error,
     success,
 };
 use derec_proto::{DeRecMessage, UnpairResponseMessage};

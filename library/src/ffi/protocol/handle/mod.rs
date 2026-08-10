@@ -14,8 +14,8 @@ use std::time::Duration;
 use prost::Message as _;
 
 use crate::ffi::error::{
-    ffi_error, success, DeRecError, DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_INVALID_ENUM,
-    DEREC_CODE_FFI_NULL_PTR,
+    DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_INVALID_ENUM, DEREC_CODE_FFI_NULL_PTR, DeRecError,
+    ffi_error, success,
 };
 use crate::ffi::protocol::stores::{
     ChannelStoreCallbacks, DotnetChannelStore, DotnetSecretStore, DotnetShareStore,
@@ -416,8 +416,7 @@ pub unsafe extern "C" fn derec_protocol_new(
         Some(s) => match s.parse() {
             Ok(id) => Some(id),
             Err(_) => {
-                return ffi_error(DEREC_CODE_FFI_BAD_PROTO, "replica_id is not a valid u64")
-                    .into();
+                return ffi_error(DEREC_CODE_FFI_BAD_PROTO, "replica_id is not a valid u64").into();
             }
         },
         None => None,

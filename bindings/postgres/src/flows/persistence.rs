@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-use derec_library::protocol::events::DeRecEvent;
-use derec_library::protocol::types::{Target, UserSecret};
 use derec_library::protocol::DeRecFlow;
 use derec_library::protocol::DeRecUserSecretStore;
+use derec_library::protocol::events::DeRecEvent;
+use derec_library::protocol::types::{Target, UserSecret};
 use derec_library::types::ChannelId;
 
 use crate::db::Database;
-use crate::flows::assertions::{
-    channel_exists, count_channels, count_shares, count_user_secrets,
-};
+use crate::flows::assertions::{channel_exists, count_channels, count_shares, count_user_secrets};
 use crate::flows::helpers::{pair_owner_helper, protect_secret};
 use crate::peer::{DEFAULT_TEST_SECRET_ID, Peer, pump_many};
 use crate::stores::PostgresUserSecretStore;
@@ -55,20 +53,27 @@ pub async fn run() {
         )
         .await;
 
-        assert_eq!(count_channels(&owner_db.client(), DEFAULT_TEST_SECRET_ID).await, 2);
-        assert_eq!(count_user_secrets(&owner_db.client(), DEFAULT_TEST_SECRET_ID).await, 1);
-        assert_eq!(count_shares(&helper_a_db.client(), DEFAULT_TEST_SECRET_ID).await, 1);
-        assert_eq!(count_shares(&helper_b_db.client(), DEFAULT_TEST_SECRET_ID).await, 1);
+        assert_eq!(
+            count_channels(&owner_db.client(), DEFAULT_TEST_SECRET_ID).await,
+            2
+        );
+        assert_eq!(
+            count_user_secrets(&owner_db.client(), DEFAULT_TEST_SECRET_ID).await,
+            1
+        );
+        assert_eq!(
+            count_shares(&helper_a_db.client(), DEFAULT_TEST_SECRET_ID).await,
+            1
+        );
+        assert_eq!(
+            count_shares(&helper_b_db.client(), DEFAULT_TEST_SECRET_ID).await,
+            1
+        );
         println!("  session#1: 2 channels, 1 user_secrets row, helpers each hold 1 share  ✓");
-
     }
 
-    assert!(
-        channel_exists(&owner_db.client(), DEFAULT_TEST_SECRET_ID, cid_a.0).await
-    );
-    assert!(
-        channel_exists(&owner_db.client(), DEFAULT_TEST_SECRET_ID, cid_b.0).await
-    );
+    assert!(channel_exists(&owner_db.client(), DEFAULT_TEST_SECRET_ID, cid_a.0).await);
+    assert!(channel_exists(&owner_db.client(), DEFAULT_TEST_SECRET_ID, cid_b.0).await);
     let preserved_snapshot = PostgresUserSecretStore::new(owner_db.client())
         .load_latest(DEFAULT_TEST_SECRET_ID)
         .await
@@ -106,9 +111,7 @@ pub async fn run() {
         "rebuilt owner must discover the v1 secret published in session #1; \
          got {discovered_secret_ids:?}"
     );
-    println!(
-        "  rebuilt owner discovered the v1 secret via the resurrected channels  ✓"
-    );
+    println!("  rebuilt owner discovered the v1 secret via the resurrected channels  ✓");
 
     println!("✓ Persistence flow passed.\n");
 }

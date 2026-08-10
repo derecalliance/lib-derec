@@ -480,12 +480,16 @@ fn test_process_rejects_response_with_mismatched_request_nonce() {
         &shared_key,
     );
 
-    let resp_envelope =
-        produce_verify_share_response_message(channel_id, &req_b.request, &shared_key, share_content)
-            .expect("produce response for B")
-            .envelope;
-    let resp = extract_verify_share_response(&resp_envelope, &shared_key)
-        .expect("extract response for B");
+    let resp_envelope = produce_verify_share_response_message(
+        channel_id,
+        &req_b.request,
+        &shared_key,
+        share_content,
+    )
+    .expect("produce response for B")
+    .envelope;
+    let resp =
+        extract_verify_share_response(&resp_envelope, &shared_key).expect("extract response for B");
 
     // Helper computed hash binding to req_b's nonce, but we hand the owner
     // req_a as the originating request — the binding gate must reject.
@@ -516,9 +520,14 @@ fn test_process_rejects_response_with_mismatched_secret_id() {
     );
 
     let resp = extract_verify_share_response(
-        &produce_verify_share_response_message(channel_id, &req.request, &shared_key, share_content)
-            .expect("produce response")
-            .envelope,
+        &produce_verify_share_response_message(
+            channel_id,
+            &req.request,
+            &shared_key,
+            share_content,
+        )
+        .expect("produce response")
+        .envelope,
         &shared_key,
     )
     .expect("extract response");
@@ -559,9 +568,14 @@ fn test_process_rejects_response_with_mismatched_version() {
     );
 
     let resp = extract_verify_share_response(
-        &produce_verify_share_response_message(channel_id, &req.request, &shared_key, share_content)
-            .expect("produce response")
-            .envelope,
+        &produce_verify_share_response_message(
+            channel_id,
+            &req.request,
+            &shared_key,
+            share_content,
+        )
+        .expect("produce response")
+        .envelope,
         &shared_key,
     )
     .expect("extract response");

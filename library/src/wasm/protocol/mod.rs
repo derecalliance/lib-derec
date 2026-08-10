@@ -51,6 +51,7 @@ mod stores;
 use std::collections::HashMap;
 use std::time::Duration;
 
+use crate::wasm::primitives::pairing::ContactMessage as PairingContactMessage;
 use crate::{
     protocol::{
         DeRecFlow, DeRecProtocol, DeRecProtocolBuilder, UnpairAck,
@@ -59,7 +60,6 @@ use crate::{
     types::ChannelId,
     wasm::ts_bindings_utils::{js_error, js_error_from_lib},
 };
-use crate::wasm::primitives::pairing::ContactMessage as PairingContactMessage;
 use derec_proto::{SenderKind, TransportProtocol};
 use js_sys::{Array, Uint8Array};
 use stores::{
@@ -285,10 +285,7 @@ impl DeRecProtocolBuilderWasm {
 
     /// `ack` is `"required"` (default) or `"not_required"`.
     #[wasm_bindgen(js_name = withUnpairAck)]
-    pub fn with_unpair_ack(
-        mut self,
-        ack: String,
-    ) -> Result<DeRecProtocolBuilderWasm, JsValue> {
+    pub fn with_unpair_ack(mut self, ack: String) -> Result<DeRecProtocolBuilderWasm, JsValue> {
         self.unpair_ack = match ack.to_ascii_lowercase().as_str() {
             "required" => UnpairAck::Required,
             "not_required" | "notrequired" | "fire_and_forget" => UnpairAck::NotRequired,
@@ -356,12 +353,9 @@ impl DeRecProtocolBuilderWasm {
 
     /// `id` is a JS `bigint` or `number`. Default: unset.
     #[wasm_bindgen(js_name = withReplicaId)]
-    pub fn with_replica_id(
-        mut self,
-        id: JsValue,
-    ) -> Result<DeRecProtocolBuilderWasm, JsValue> {
-        let v = js_value_to_u64(id)
-            .map_err(|e| js_error("INVALID_REPLICA_ID", format!("{e:?}")))?;
+    pub fn with_replica_id(mut self, id: JsValue) -> Result<DeRecProtocolBuilderWasm, JsValue> {
+        let v =
+            js_value_to_u64(id).map_err(|e| js_error("INVALID_REPLICA_ID", format!("{e:?}")))?;
         self.replica_id = Some(v);
         Ok(self)
     }
@@ -487,7 +481,6 @@ impl DeRecProtocolBuilderWasm {
 
 #[wasm_bindgen]
 impl DeRecProtocolWasm {
-
     /// Generate an out-of-band contact message (QR code payload, deep link, …).
     ///
     /// Returns a plain JS `ContactMessage` object. The `channel_id` field identifies
@@ -537,7 +530,9 @@ impl DeRecProtocolWasm {
             other => {
                 return Err(js_error(
                     "INVALID_CONTACT_MODE",
-                    format!("unknown contact_mode: {other}; expected 0 (InlineKeys), 1 (HashedKeys), or 2 (NoKeys)"),
+                    format!(
+                        "unknown contact_mode: {other}; expected 0 (InlineKeys), 1 (HashedKeys), or 2 (NoKeys)"
+                    ),
                 ));
             }
         };
@@ -552,8 +547,8 @@ impl DeRecProtocolWasm {
             .await
             .map_err(|e| js_error("DEREC_ERROR", e.to_string()))?;
         let contact: PairingContactMessage = contact.into();
-        let serializer = serde_wasm_bindgen::Serializer::new()
-            .serialize_large_number_types_as_bigints(true);
+        let serializer =
+            serde_wasm_bindgen::Serializer::new().serialize_large_number_types_as_bigints(true);
         use serde::Serialize as _;
         contact
             .serialize(&serializer)
@@ -579,11 +574,7 @@ impl DeRecProtocolWasm {
     /// IMPORTANT: keep the old endpoint operational during the changeover —
     /// see the Rust docs on `set_own_transport` for the discipline.
     #[wasm_bindgen(js_name = "setOwnTransport")]
-    pub fn set_own_transport(
-        &mut self,
-        uri: String,
-        protocol: String,
-    ) -> Result<(), JsValue> {
+    pub fn set_own_transport(&mut self, uri: String, protocol: String) -> Result<(), JsValue> {
         let protocol_num = match protocol.to_lowercase().as_str() {
             "https" => 0i32,
             other => {
@@ -706,13 +697,12 @@ impl DeRecProtocolWasm {
     ) -> Result<(), JsValue> {
         let action = pending_action_wire::deserialize(action_bytes)
             .map_err(|e| js_error("DECODE_ERROR", e))?;
-        let status_enum =
-            derec_proto::StatusEnum::try_from(status).map_err(|_| {
-                js_error(
-                    "INVALID_STATUS",
-                    format!("invalid StatusEnum value: {status}"),
-                )
-            })?;
+        let status_enum = derec_proto::StatusEnum::try_from(status).map_err(|_| {
+            js_error(
+                "INVALID_STATUS",
+                format!("invalid StatusEnum value: {status}"),
+            )
+        })?;
         self.inner
             .reject(action, status_enum, memo)
             .await
@@ -729,21 +719,15 @@ impl DeRecProtocolWasm {
     ///
     /// * `message` — Raw wire bytes of an incoming `DeRecMessage`.
     pub async fn process(&mut self, message: &[u8]) -> Result<JsValue, JsValue> {
-        let rust_events = self
-            .inner
-            .process(message)
-            .await
-            .map_err(|e| {
-                web_sys::console::error_1(
-                    &format!("[wasm-process] error: {e}").into(),
-                );
-                let channel_id_str = e.channel_id.map(|c| c.0.to_string());
-                if let Some((status, memo)) = e.as_non_ok_status() {
-                    non_ok_status_error(status, memo, channel_id_str.as_deref())
-                } else {
-                    process_error(e.to_string(), channel_id_str.as_deref())
-                }
-            })?;
+        let rust_events = self.inner.process(message).await.map_err(|e| {
+            web_sys::console::error_1(&format!("[wasm-process] error: {e}").into());
+            let channel_id_str = e.channel_id.map(|c| c.0.to_string());
+            if let Some((status, memo)) = e.as_non_ok_status() {
+                non_ok_status_error(status, memo, channel_id_str.as_deref())
+            } else {
+                process_error(e.to_string(), channel_id_str.as_deref())
+            }
+        })?;
         let js_events = Array::new();
         for event in rust_events {
             js_events.push(&events::event_to_js(event)?);
@@ -790,9 +774,7 @@ impl DeRecProtocolWasm {
     }
 }
 
-fn parse_recovered_secret(
-    value: JsValue,
-) -> Result<crate::protocol::types::Secret, JsValue> {
+fn parse_recovered_secret(value: JsValue) -> Result<crate::protocol::types::Secret, JsValue> {
     #[derive(serde::Deserialize)]
     struct HelperIn {
         channel_id: String,
@@ -919,8 +901,7 @@ fn restore_error_to_js(e: crate::protocol::RestoreError) -> JsValue {
             }
             serde_wasm_bindgen::to_value(&ConflictError {
                 code: "CONFLICT",
-                message: "restore blocked by pre-existing channels at canonical ids"
-                    .to_owned(),
+                message: "restore blocked by pre-existing channels at canonical ids".to_owned(),
                 channel_ids: ids.iter().map(|c| c.0.to_string()).collect(),
             })
             .unwrap_or_else(|_| js_error("CONFLICT", "restore conflict"))
@@ -1002,7 +983,10 @@ fn js_value_to_u64(val: JsValue) -> Result<u64, JsValue> {
     } else {
         val.as_f64()
             .ok_or_else(|| {
-                js_error("DECODE_ERROR", "value must be BigInt, number, or decimal string")
+                js_error(
+                    "DECODE_ERROR",
+                    "value must be BigInt, number, or decimal string",
+                )
             })
             .map(|f| f as u64)
     }
@@ -1016,7 +1000,9 @@ fn parse_sender_kind(kind: u32) -> Result<SenderKind, JsValue> {
         4 => Ok(SenderKind::ReplicaDestination),
         _ => Err(js_error(
             "INVALID_SENDER_KIND",
-            format!("invalid sender kind: {kind}, valid values are 0 (Owner), 1 (Helper), 3 (ReplicaSource), 4 (ReplicaDestination)"),
+            format!(
+                "invalid sender kind: {kind}, valid values are 0 (Owner), 1 (Helper), 3 (ReplicaSource), 4 (ReplicaDestination)"
+            ),
         )),
     }
 }
@@ -1103,9 +1089,8 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
                 if raw.is_null() || raw.is_undefined() {
                     HashMap::new()
                 } else {
-                    serde_wasm_bindgen::from_value(raw).map_err(|e| {
-                        js_error("INVALID_PEER_COMMUNICATION_INFO", e.to_string())
-                    })?
+                    serde_wasm_bindgen::from_value(raw)
+                        .map_err(|e| js_error("INVALID_PEER_COMMUNICATION_INFO", e.to_string()))?
                 };
             Ok(DeRecFlow::Pairing {
                 kind: sender_kind,
@@ -1191,9 +1176,8 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
                     None
                 } else {
                     Some(
-                        serde_wasm_bindgen::from_value(communication_info_val).map_err(|e| {
-                            js_error("INVALID_COMMUNICATION_INFO", e.to_string())
-                        })?,
+                        serde_wasm_bindgen::from_value(communication_info_val)
+                            .map_err(|e| js_error("INVALID_COMMUNICATION_INFO", e.to_string()))?,
                     )
                 };
             let transport_protocol_val =

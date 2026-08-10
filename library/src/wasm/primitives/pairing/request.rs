@@ -2,8 +2,8 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use super::{
-    CommunicationInfo, ContactMessage, PairRequestMessage, PrePairRequestMessage, TransportProtocol,
-    deserialize_pairing_secret_key_material, get_sender_kind,
+    CommunicationInfo, ContactMessage, PairRequestMessage, PrePairRequestMessage,
+    TransportProtocol, deserialize_pairing_secret_key_material, get_sender_kind,
     serialize_pairing_secret_key_material,
 };
 use crate::{
@@ -62,14 +62,15 @@ pub fn create_contact(
     } else if nonce.is_bigint() {
         Some(
             u64::try_from(js_sys::BigInt::from(nonce))
-                .map_err(|e| {
-                    js_error("INVALID_NONCE", format!("nonce out of u64 range: {e:?}"))
-                })?,
+                .map_err(|e| js_error("INVALID_NONCE", format!("nonce out of u64 range: {e:?}")))?,
         )
     } else {
-        Some(nonce.as_f64().ok_or_else(|| {
-            js_error("INVALID_NONCE", "nonce must be BigInt, number, or null")
-        })? as u64)
+        Some(
+            nonce
+                .as_f64()
+                .ok_or_else(|| js_error("INVALID_NONCE", "nonce must be BigInt, number, or null"))?
+                as u64,
+        )
     };
 
     let result = request::create_contact(

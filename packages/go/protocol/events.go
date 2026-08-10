@@ -43,6 +43,7 @@ const (
 	EventTypeVerifySharesFailed        = "VerifySharesFailed"
 	EventTypeRecoverSecretStarted      = "RecoverSecretStarted"
 	EventTypeRecoverSecretFailed       = "RecoverSecretFailed"
+	EventTypeUnpairFailed              = "UnpairFailed"
 	EventTypeUnpairStarted             = "UnpairStarted"
 	EventTypeUpdateChannelInfoStarted  = "UpdateChannelInfoStarted"
 	EventTypeUpdateChannelInfoFailed   = "UpdateChannelInfoFailed"
@@ -111,7 +112,8 @@ type Event struct {
 	SharesReceived uint32 `json:"shares_received"`
 
 	// RecoveryShareError, DiscoveryFailed, ProtectSecretFailed,
-	// VerifySharesFailed, RecoverSecretFailed, UpdateChannelInfoFailed.
+	// VerifySharesFailed, RecoverSecretFailed, UnpairFailed,
+	// UpdateChannelInfoFailed.
 	Error string `json:"error"`
 
 	// ActionRequired, AutoAccepted.

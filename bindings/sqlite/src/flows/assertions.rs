@@ -49,11 +49,7 @@ pub fn count_shares(conn: &SharedConnection, secret_id: u64) -> i64 {
     .expect("count_shares failed")
 }
 
-pub fn count_shares_for_channel(
-    conn: &SharedConnection,
-    secret_id: u64,
-    channel_id: u64,
-) -> i64 {
+pub fn count_shares_for_channel(conn: &SharedConnection, secret_id: u64, channel_id: u64) -> i64 {
     let conn = lock(conn);
     conn.query_row(
         "SELECT COUNT(*) FROM shares WHERE secret_id = ?1 AND channel_id = ?2",

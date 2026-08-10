@@ -58,11 +58,7 @@ impl DeRecChannelStore for PostgresChannelStore {
         })
     }
 
-    fn remove(
-        &mut self,
-        secret_id: u64,
-        channel_id: ChannelId,
-    ) -> ChannelStoreFuture<'_, bool> {
+    fn remove(&mut self, secret_id: u64, channel_id: ChannelId) -> ChannelStoreFuture<'_, bool> {
         let client = self.client.clone();
         let secret_id_i64 = u64_to_sql(secret_id);
         let channel_id_i64 = u64_to_sql(channel_id.0);

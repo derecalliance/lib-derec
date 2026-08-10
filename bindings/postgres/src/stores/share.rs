@@ -40,8 +40,7 @@ impl DeRecShareStore for PostgresShareStore {
                     .await
                     .expect("share load failed")
             } else {
-                let params: [&(dyn ToSql + Sync); 3] =
-                    [&secret_id_i64, &channel_id_i64, &versions];
+                let params: [&(dyn ToSql + Sync); 3] = [&secret_id_i64, &channel_id_i64, &versions];
                 client
                     .query(
                         "SELECT share_secret_id, version, replica_id, bytes FROM shares \
@@ -80,8 +79,7 @@ impl DeRecShareStore for PostgresShareStore {
                     .await
                     .expect("load_many failed")
             } else {
-                let params: [&(dyn ToSql + Sync); 3] =
-                    [&secret_id_i64, &channel_ids, &versions];
+                let params: [&(dyn ToSql + Sync); 3] = [&secret_id_i64, &channel_ids, &versions];
                 client
                     .query(
                         "SELECT share_secret_id, version, replica_id, bytes FROM shares \

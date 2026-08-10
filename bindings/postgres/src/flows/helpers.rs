@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use derec_library::protocol::DeRecFlow;
 use derec_library::protocol::events::DeRecEvent;
 use derec_library::protocol::types::UserSecret;
-use derec_library::protocol::DeRecFlow;
 use derec_library::types::ChannelId;
 use derec_proto::{ContactMode, SenderKind};
 use std::collections::HashMap;
@@ -29,10 +29,7 @@ pub async fn pair_owner_helper(
         .start(DeRecFlow::Pairing {
             kind: SenderKind::Helper,
             contact,
-            peer_communication_info: HashMap::from([(
-                "name".to_owned(),
-                helper.label.to_owned(),
-            )]),
+            peer_communication_info: HashMap::from([("name".to_owned(), helper.label.to_owned())]),
         })
         .await
         .expect("helper.start(Pairing) failed");

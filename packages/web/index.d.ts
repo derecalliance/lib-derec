@@ -443,6 +443,7 @@ export type DeRecEvent =
   /** An unpair request was dispatched to `channel_id`. Followed by an
    *  `Unpaired` event once the peer acknowledges (or in the same event
    *  vec, under `UnpairAck.NotRequired`). */
+  | { type: "UnpairFailed"; channel_id: string; error: string }
   | { type: "UnpairStarted"; channel_id: string }
   /** An update-channel-info request was dispatched to `channel_id`. */
   | { type: "UpdateChannelInfoStarted"; channel_id: string }

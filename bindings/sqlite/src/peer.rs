@@ -239,10 +239,7 @@ pub async fn pump_many(peers: &mut [&mut Peer]) -> Vec<DeRecEvent> {
                             .map(|p| p.uri.as_str())
                             .collect::<Vec<_>>()
                             .join(", ");
-                        panic!(
-                            "no peer for destination uri {} (have {known})",
-                            tp.uri
-                        )
+                        panic!("no peer for destination uri {} (have {known})", tp.uri)
                     });
                 pending.push((dest, bytes));
             }

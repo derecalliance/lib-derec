@@ -112,8 +112,6 @@ pub fn extract_inner_pairing_message(
 /// see [`crate::primitives::pairing::request::produce_pre_pair_request`]
 /// and [`crate::primitives::pairing::response::produce_pre_pair`] for the
 /// producers that emit the bytes this function decodes.
-pub fn extract_inner_plaintext_message(
-    message_bytes: &[u8],
-) -> Result<MessageBody, crate::Error> {
+pub fn extract_inner_plaintext_message(message_bytes: &[u8]) -> Result<MessageBody, crate::Error> {
     MessageBody::decode_from_vec(message_bytes).map_err(crate::Error::ProtobufDecode)
 }

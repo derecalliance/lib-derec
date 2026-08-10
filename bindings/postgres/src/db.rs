@@ -7,15 +7,11 @@ use tokio_postgres::{Client, NoTls};
 /// Migrations bundled into the binary at compile time. Adding a
 /// migration is two lines: drop a new `.sql` file under `migrations/`
 /// and append an entry here with a strictly increasing `version`.
-const MIGRATIONS: &[(i64, &str, &str)] = &[(
-    1,
-    "0001_init",
-    include_str!("../migrations/0001_init.sql"),
-)];
+const MIGRATIONS: &[(i64, &str, &str)] =
+    &[(1, "0001_init", include_str!("../migrations/0001_init.sql"))];
 
 /// Connection string default; override via `DATABASE_URL`.
-const DEFAULT_DATABASE_URL: &str =
-    "postgres://postgres:postgres@localhost:15432/derec_test";
+const DEFAULT_DATABASE_URL: &str = "postgres://postgres:postgres@localhost:15432/derec_test";
 
 /// Schema-name prefix. The startup-side cleanup walks
 /// `information_schema.schemata` for everything matching this prefix
@@ -38,8 +34,7 @@ impl Database {
     /// new schema, pin `search_path` to it for this connection, and
     /// apply every pending migration against it.
     pub async fn open_isolated() -> Self {
-        let url =
-            std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_owned());
+        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_owned());
         let (client, connection) = tokio_postgres::connect(&url, NoTls)
             .await
             .unwrap_or_else(|e| {
@@ -126,8 +121,7 @@ async fn apply_migrations(client: &Client) {
 /// invocations don't bloat the database. Errors are surfaced as
 /// panics — this is a smoke-test harness, not production code.
 pub async fn cleanup_stale_schemas() {
-    let url =
-        std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_owned());
+    let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_owned());
     let (client, connection) = tokio_postgres::connect(&url, NoTls)
         .await
         .unwrap_or_else(|e| {

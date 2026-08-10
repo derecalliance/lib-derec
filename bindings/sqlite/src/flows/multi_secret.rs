@@ -1,19 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-use derec_library::protocol::events::DeRecEvent;
-use derec_library::protocol::types::{Target, UserSecret};
 use derec_library::protocol::DeRecChannelStore;
 use derec_library::protocol::DeRecFlow;
 use derec_library::protocol::DeRecUserSecretStore;
+use derec_library::protocol::events::DeRecEvent;
+use derec_library::protocol::types::{Target, UserSecret};
 use derec_library::types::ChannelId;
 use derec_proto::SenderKind;
 use std::collections::HashMap;
 
 use crate::db::Database;
-use crate::flows::assertions::{
-    count_channels, count_shares, count_user_secrets,
-};
+use crate::flows::assertions::{count_channels, count_shares, count_user_secrets};
 use crate::flows::helpers::{pair_owner_helper, protect_secret};
 use crate::peer::{Peer, pump_many};
 
@@ -105,8 +103,14 @@ pub async fn run() {
         "email v1",
     )
     .await;
-    assert_eq!(count_user_secrets(&user_db.connection(), WALLET_SECRET_ID), 1);
-    assert_eq!(count_user_secrets(&user_db.connection(), EMAIL_SECRET_ID), 1);
+    assert_eq!(
+        count_user_secrets(&user_db.connection(), WALLET_SECRET_ID),
+        1
+    );
+    assert_eq!(
+        count_user_secrets(&user_db.connection(), EMAIL_SECRET_ID),
+        1
+    );
     assert_eq!(count_shares(&user_db.connection(), WALLET_SECRET_ID), 2);
     assert_eq!(count_shares(&user_db.connection(), EMAIL_SECRET_ID), 2);
     assert_eq!(count_shares(&alice_db.connection(), WALLET_SECRET_ID), 1);

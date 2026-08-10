@@ -247,10 +247,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     /// every field `false`, behaviour identical to today's
     /// `ActionRequired` flow. See the field-level docs on
     /// [`crate::protocol::AutoAcceptPolicy`] for the per-flow trade-offs.
-    pub fn with_auto_accept(
-        mut self,
-        policy: crate::protocol::AutoAcceptPolicy,
-    ) -> Self {
+    pub fn with_auto_accept(mut self, policy: crate::protocol::AutoAcceptPolicy) -> Self {
         self.auto_accept = policy;
         self
     }
@@ -777,7 +774,9 @@ mod tests {
             DeRecTransport, DeRecUserSecretStore, SecretStoreFuture, ShareStoreFuture,
             TransportFuture,
         };
-        use crate::protocol::types::{Channel, MissingPolicy, SecretKind, SecretValue, Share, UserSecrets};
+        use crate::protocol::types::{
+            Channel, MissingPolicy, SecretKind, SecretValue, Share, UserSecrets,
+        };
         use crate::types::ChannelId;
         use derec_proto::TransportProtocol;
 
@@ -814,12 +813,7 @@ mod tests {
 
         struct NoopShareStore;
         impl DeRecShareStore for NoopShareStore {
-            fn load(
-                &self,
-                _: u64,
-                _: ChannelId,
-                _: &[u32],
-            ) -> ShareStoreFuture<'_, Vec<Share>> {
+            fn load(&self, _: u64, _: ChannelId, _: &[u32]) -> ShareStoreFuture<'_, Vec<Share>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn load_many(
@@ -830,11 +824,7 @@ mod tests {
             ) -> ShareStoreFuture<'_, Vec<Share>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
-            fn load_all(
-                &self,
-                _: u64,
-                _: &[ChannelId],
-            ) -> ShareStoreFuture<'_, Vec<Share>> {
+            fn load_all(&self, _: u64, _: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn latest_version(&self, _: u64) -> ShareStoreFuture<'_, Option<u32>> {
@@ -867,20 +857,10 @@ mod tests {
             ) -> SecretStoreFuture<'_, Vec<(ChannelId, SecretValue)>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
-            fn save(
-                &mut self,
-                _: u64,
-                _: ChannelId,
-                _: SecretValue,
-            ) -> SecretStoreFuture<'_, ()> {
+            fn save(&mut self, _: u64, _: ChannelId, _: SecretValue) -> SecretStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
-            fn remove(
-                &mut self,
-                _: u64,
-                _: ChannelId,
-                _: SecretKind,
-            ) -> SecretStoreFuture<'_, ()> {
+            fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
         }
@@ -918,7 +898,8 @@ mod tests {
                 &self,
                 _: u64,
                 _: crate::protocol::StateKey,
-            ) -> crate::protocol::StateStoreFuture<'_, Option<crate::protocol::StateItem>> {
+            ) -> crate::protocol::StateStoreFuture<'_, Option<crate::protocol::StateItem>>
+            {
                 Box::pin(std::future::ready(Ok(None)))
             }
             fn remove(
@@ -932,7 +913,8 @@ mod tests {
                 &self,
                 _: u64,
                 _: crate::protocol::StateKind,
-            ) -> crate::protocol::StateStoreFuture<'_, Vec<crate::protocol::StateItem>> {
+            ) -> crate::protocol::StateStoreFuture<'_, Vec<crate::protocol::StateItem>>
+            {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
         }
@@ -1006,12 +988,7 @@ mod tests {
         }
         struct NoopShareStore;
         impl DeRecShareStore for NoopShareStore {
-            fn load(
-                &self,
-                _: u64,
-                _: ChannelId,
-                _: &[u32],
-            ) -> ShareStoreFuture<'_, Vec<Share>> {
+            fn load(&self, _: u64, _: ChannelId, _: &[u32]) -> ShareStoreFuture<'_, Vec<Share>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn load_many(
@@ -1022,11 +999,7 @@ mod tests {
             ) -> ShareStoreFuture<'_, Vec<Share>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
-            fn load_all(
-                &self,
-                _: u64,
-                _: &[ChannelId],
-            ) -> ShareStoreFuture<'_, Vec<Share>> {
+            fn load_all(&self, _: u64, _: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn latest_version(&self, _: u64) -> ShareStoreFuture<'_, Option<u32>> {
@@ -1058,20 +1031,10 @@ mod tests {
             ) -> SecretStoreFuture<'_, Vec<(ChannelId, SecretValue)>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
-            fn save(
-                &mut self,
-                _: u64,
-                _: ChannelId,
-                _: SecretValue,
-            ) -> SecretStoreFuture<'_, ()> {
+            fn save(&mut self, _: u64, _: ChannelId, _: SecretValue) -> SecretStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
-            fn remove(
-                &mut self,
-                _: u64,
-                _: ChannelId,
-                _: SecretKind,
-            ) -> SecretStoreFuture<'_, ()> {
+            fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
         }
@@ -1107,7 +1070,8 @@ mod tests {
                 &self,
                 _: u64,
                 _: crate::protocol::StateKey,
-            ) -> crate::protocol::StateStoreFuture<'_, Option<crate::protocol::StateItem>> {
+            ) -> crate::protocol::StateStoreFuture<'_, Option<crate::protocol::StateItem>>
+            {
                 Box::pin(std::future::ready(Ok(None)))
             }
             fn remove(
@@ -1121,7 +1085,8 @@ mod tests {
                 &self,
                 _: u64,
                 _: crate::protocol::StateKind,
-            ) -> crate::protocol::StateStoreFuture<'_, Vec<crate::protocol::StateItem>> {
+            ) -> crate::protocol::StateStoreFuture<'_, Vec<crate::protocol::StateItem>>
+            {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
         }
@@ -1187,12 +1152,7 @@ mod tests {
         }
         struct NoopShareStore;
         impl DeRecShareStore for NoopShareStore {
-            fn load(
-                &self,
-                _: u64,
-                _: ChannelId,
-                _: &[u32],
-            ) -> ShareStoreFuture<'_, Vec<Share>> {
+            fn load(&self, _: u64, _: ChannelId, _: &[u32]) -> ShareStoreFuture<'_, Vec<Share>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn load_many(
@@ -1203,11 +1163,7 @@ mod tests {
             ) -> ShareStoreFuture<'_, Vec<Share>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
-            fn load_all(
-                &self,
-                _: u64,
-                _: &[ChannelId],
-            ) -> ShareStoreFuture<'_, Vec<Share>> {
+            fn load_all(&self, _: u64, _: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn latest_version(&self, _: u64) -> ShareStoreFuture<'_, Option<u32>> {
@@ -1239,20 +1195,10 @@ mod tests {
             ) -> SecretStoreFuture<'_, Vec<(ChannelId, SecretValue)>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
-            fn save(
-                &mut self,
-                _: u64,
-                _: ChannelId,
-                _: SecretValue,
-            ) -> SecretStoreFuture<'_, ()> {
+            fn save(&mut self, _: u64, _: ChannelId, _: SecretValue) -> SecretStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
-            fn remove(
-                &mut self,
-                _: u64,
-                _: ChannelId,
-                _: SecretKind,
-            ) -> SecretStoreFuture<'_, ()> {
+            fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
         }
@@ -1288,7 +1234,8 @@ mod tests {
                 &self,
                 _: u64,
                 _: crate::protocol::StateKey,
-            ) -> crate::protocol::StateStoreFuture<'_, Option<crate::protocol::StateItem>> {
+            ) -> crate::protocol::StateStoreFuture<'_, Option<crate::protocol::StateItem>>
+            {
                 Box::pin(std::future::ready(Ok(None)))
             }
             fn remove(
@@ -1302,7 +1249,8 @@ mod tests {
                 &self,
                 _: u64,
                 _: crate::protocol::StateKind,
-            ) -> crate::protocol::StateStoreFuture<'_, Vec<crate::protocol::StateItem>> {
+            ) -> crate::protocol::StateStoreFuture<'_, Vec<crate::protocol::StateItem>>
+            {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
         }

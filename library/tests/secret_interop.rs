@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::io::Read as _;
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use derec_library::protocol::types::{HelperInfo, Secret, UserSecret};
 use flate2::read::GzDecoder;
 use serde_json::Value;

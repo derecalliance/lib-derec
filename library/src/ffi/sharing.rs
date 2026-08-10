@@ -170,11 +170,14 @@ pub extern "C" fn produce_store_share_request_message(
         wire_bytes: empty_buffer(),
     };
 
-    let committed_share_bytes =
-        match parse_buffer(committed_share_ptr, committed_share_len, "committed_share_ptr") {
-            Ok(b) => b,
-            Err(e) => return with_err(e),
-        };
+    let committed_share_bytes = match parse_buffer(
+        committed_share_ptr,
+        committed_share_len,
+        "committed_share_ptr",
+    ) {
+        Ok(b) => b,
+        Err(e) => return with_err(e),
+    };
     if keep_list_ptr.is_null() && keep_list_len > 0 {
         return with_err(ffi_error(DEREC_CODE_FFI_NULL_PTR, "keep_list_ptr is null"));
     }
@@ -183,11 +186,11 @@ pub extern "C" fn produce_store_share_request_message(
     } else {
         unsafe { std::slice::from_raw_parts(keep_list_ptr, keep_list_len) }
     };
-    let description_bytes =
-        match parse_buffer(description_ptr, description_len, "description_ptr") {
-            Ok(b) => b,
-            Err(e) => return with_err(e),
-        };
+    let description_bytes = match parse_buffer(description_ptr, description_len, "description_ptr")
+    {
+        Ok(b) => b,
+        Err(e) => return with_err(e),
+    };
     let description = match str::from_utf8(description_bytes) {
         Ok(s) => s,
         Err(_) => {

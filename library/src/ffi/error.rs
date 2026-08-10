@@ -340,12 +340,14 @@ fn categorize(err: &crate::Error) -> (i32, i32) {
         crate::Error::RoleMismatch { .. } => {
             (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_ROLE_MISMATCH)
         }
-        crate::Error::ReplicaIdNotConfigured => {
-            (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_REPLICA_ID_NOT_CONFIGURED)
-        }
-        crate::Error::ChannelAlreadyPaired { .. } => {
-            (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_CHANNEL_ALREADY_PAIRED)
-        }
+        crate::Error::ReplicaIdNotConfigured => (
+            DEREC_CATEGORY_INVALID_INPUT,
+            DEREC_CODE_REPLICA_ID_NOT_CONFIGURED,
+        ),
+        crate::Error::ChannelAlreadyPaired { .. } => (
+            DEREC_CATEGORY_INVALID_INPUT,
+            DEREC_CODE_CHANNEL_ALREADY_PAIRED,
+        ),
         crate::Error::Restore(e) => {
             use crate::protocol::RestoreError;
             match e {
@@ -372,9 +374,7 @@ fn pairing_code(e: &PairingError) -> i32 {
         PairingError::PrePairHashMismatch => DEREC_CODE_PREPAIR_HASH_MISMATCH,
         PairingError::MissingReplicaId { .. } => DEREC_CODE_MISSING_REPLICA_ID,
         PairingError::UnexpectedReplicaId { .. } => DEREC_CODE_UNEXPECTED_REPLICA_ID,
-        PairingError::IncompatibleParameterRange { .. } => {
-            DEREC_CODE_INCOMPATIBLE_PARAMETER_RANGE
-        }
+        PairingError::IncompatibleParameterRange { .. } => DEREC_CODE_INCOMPATIBLE_PARAMETER_RANGE,
         PairingError::Invariant(_) => DEREC_CODE_INVARIANT,
         PairingError::ContactMessageKeygen { .. } => DEREC_CODE_KEYGEN,
         PairingError::PairRequestKeygen { .. } => DEREC_CODE_KEYGEN,

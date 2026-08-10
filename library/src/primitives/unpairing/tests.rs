@@ -7,7 +7,9 @@ use crate::{
     primitives::{
         make_shared_key,
         unpairing::{
-            request::{extract as extract_unpair_request, produce as produce_unpair_request_message},
+            request::{
+                extract as extract_unpair_request, produce as produce_unpair_request_message,
+            },
             response::{
                 extract as extract_unpair_response, process as process_unpair_response_message,
                 produce as produce_unpair_response_message,
@@ -189,13 +191,9 @@ fn test_extract_unpair_request_rejects_scheme_mismatched_reply_to() {
         protocol: derec_proto::Protocol::Https as i32,
     };
 
-    let produced = produce_unpair_request_message(
-        channel_id,
-        "bye",
-        &shared_key,
-        Some(malicious_reply_to),
-    )
-    .expect("failed to produce unpair request");
+    let produced =
+        produce_unpair_request_message(channel_id, "bye", &shared_key, Some(malicious_reply_to))
+            .expect("failed to produce unpair request");
 
     let result = extract_unpair_request(&produced.envelope, &shared_key);
 

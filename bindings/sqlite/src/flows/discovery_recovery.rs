@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-use derec_library::protocol::events::DeRecEvent;
-use derec_library::protocol::types::{Target, UserSecret};
 use derec_library::protocol::DeRecChannelStore;
 use derec_library::protocol::DeRecFlow;
 use derec_library::protocol::DeRecUserSecretStore;
+use derec_library::protocol::events::DeRecEvent;
+use derec_library::protocol::types::{Target, UserSecret};
 use derec_library::types::ChannelId;
 use derec_proto::SenderKind;
 use std::collections::HashMap;
@@ -58,8 +58,14 @@ pub async fn run() {
         "wallet seed phrase",
     )
     .await;
-    assert_eq!(count_shares(&helper_a_db.connection(), PROTECTED_SECRET_ID), 1);
-    assert_eq!(count_shares(&helper_b_db.connection(), PROTECTED_SECRET_ID), 1);
+    assert_eq!(
+        count_shares(&helper_a_db.connection(), PROTECTED_SECRET_ID),
+        1
+    );
+    assert_eq!(
+        count_shares(&helper_b_db.connection(), PROTECTED_SECRET_ID),
+        1
+    );
     println!("  v1 publish lands one share row on each helper  ✓");
 
     owner
@@ -71,8 +77,7 @@ pub async fn run() {
 
     let rec_cid_a_transient = ChannelId(100);
     let rec_cid_b_transient = ChannelId(101);
-    let mut rekeyed_recovery: [(ChannelId, ChannelId); 2] =
-        [(ChannelId(0), ChannelId(0)); 2];
+    let mut rekeyed_recovery: [(ChannelId, ChannelId); 2] = [(ChannelId(0), ChannelId(0)); 2];
     for (idx, (helper, fresh_cid, label)) in [
         (&mut helper_a, rec_cid_a_transient, "HelperA"),
         (&mut helper_b, rec_cid_b_transient, "HelperB"),
@@ -109,7 +114,9 @@ pub async fn run() {
                 _ => None,
             })
             .unwrap_or_else(|| {
-                panic!("recovery pair ({label}): missing PairingCompleted for transient {fresh_cid:?}")
+                panic!(
+                    "recovery pair ({label}): missing PairingCompleted for transient {fresh_cid:?}"
+                )
             });
         rekeyed_recovery[idx] = (fresh_cid, rekeyed);
     }
@@ -222,7 +229,5 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || haystack.len() < needle.len() {
         return false;
     }
-    haystack
-        .windows(needle.len())
-        .any(|w| w == needle)
+    haystack.windows(needle.len()).any(|w| w == needle)
 }

@@ -120,12 +120,10 @@ fn parse_unpair_flow(params_json: &[u8]) -> Result<DeRecFlow, String> {
 fn parse_update_channel_info_flow(params_json: &[u8]) -> Result<DeRecFlow, String> {
     let raw: UpdateChannelInfoParamsJson = serde_json::from_slice(params_json)
         .map_err(|e| format!("invalid UpdateChannelInfoParams JSON: {e}"))?;
-    let transport = raw
-        .transport_protocol
-        .map(|t| TransportProtocol {
-            uri: t.uri,
-            protocol: t.protocol,
-        });
+    let transport = raw.transport_protocol.map(|t| TransportProtocol {
+        uri: t.uri,
+        protocol: t.protocol,
+    });
     Ok(DeRecFlow::UpdateChannelInfo {
         target: parse_target(raw.target)?,
         communication_info: raw.communication_info,

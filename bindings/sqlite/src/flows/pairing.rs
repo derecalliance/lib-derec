@@ -28,7 +28,10 @@ pub async fn run() {
     let final_id = pair_owner_helper(&mut owner, &mut helper, ChannelId(1)).await;
     println!("  Owner↔Helper paired on ChannelId({})", final_id.0);
 
-    for (name, conn) in [("owner", owner_db.connection()), ("helper", helper_db.connection())] {
+    for (name, conn) in [
+        ("owner", owner_db.connection()),
+        ("helper", helper_db.connection()),
+    ] {
         assert_eq!(
             count_channels(&conn, DEFAULT_TEST_SECRET_ID),
             1,
@@ -57,7 +60,10 @@ pub async fn run() {
     assert_eq!(helper_channel.peer_role, SenderKind::Owner);
     println!("  Channel.peer_role names the other end on each side  ✓");
 
-    for (name, conn) in [("owner", owner_db.connection()), ("helper", helper_db.connection())] {
+    for (name, conn) in [
+        ("owner", owner_db.connection()),
+        ("helper", helper_db.connection()),
+    ] {
         assert!(
             count_secrets(&conn, DEFAULT_TEST_SECRET_ID) >= 1,
             "{name}: expected at least 1 SharedKey row"
@@ -122,9 +128,7 @@ pub async fn run() {
         group, expected,
         "channel-link graph must be undirected and transitive"
     );
-    println!(
-        "  link_channel: undirected + idempotent + transitive (a—b—c → {{a,b,c}})  ✓"
-    );
+    println!("  link_channel: undirected + idempotent + transitive (a—b—c → {{a,b,c}})  ✓");
 
     println!("✓ Pairing flow passed.\n");
 }

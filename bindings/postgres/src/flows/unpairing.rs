@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use derec_library::protocol::DeRecFlow;
 use derec_library::protocol::events::DeRecEvent;
 use derec_library::protocol::types::UserSecret;
-use derec_library::protocol::DeRecFlow;
 use derec_library::types::ChannelId;
 
 use crate::db::Database;
@@ -22,11 +22,7 @@ pub async fn run() {
     let helper_db = Database::open_isolated().await;
 
     let mut owner = Peer::new(owner_db.client(), "Owner", "https://owner.example.com");
-    let mut helper = Peer::new(
-        helper_db.client(),
-        "Helper",
-        "https://helper.example.com",
-    );
+    let mut helper = Peer::new(helper_db.client(), "Helper", "https://helper.example.com");
 
     let helper2_db = Database::open_isolated().await;
     let mut helper2 = Peer::new(

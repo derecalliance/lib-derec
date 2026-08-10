@@ -225,6 +225,19 @@ impl DeRecTransport for NoopTransport {
     }
 }
 
+/// Transport double whose every send fails, standing in for a peer that
+/// has gone away — the expected condition when a recovering device tears
+/// down its ephemeral channels.
+#[derive(Default, Clone)]
+pub(crate) struct FailingTransport;
+impl DeRecTransport for FailingTransport {
+    fn send(&self, _: &TransportProtocol, _: Vec<u8>) -> TransportFuture<'_> {
+        Box::pin(std::future::ready(Err(crate::Error::InvalidInput(
+            "transport unreachable",
+        ))))
+    }
+}
+
 /// Transport double that records every outbound `(endpoint, envelope)`
 /// in send order, so a test can assert both *that* a message went out
 /// and *what* it carried.

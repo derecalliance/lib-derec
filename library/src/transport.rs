@@ -132,9 +132,7 @@ impl TransportProtocol {
             Protocol::Https => {
                 if self.uri.starts_with("https://") {
                     // canonical, secure scheme — nothing to flag
-                } else if cfg!(feature = "unsafe-http")
-                    && self.uri.starts_with("http://")
-                {
+                } else if cfg!(feature = "unsafe-http") && self.uri.starts_with("http://") {
                     // Plaintext is accepted only when the opt-in
                     // `unsafe-http` Cargo feature is set; flag it
                     // loudly so an operator running with logs

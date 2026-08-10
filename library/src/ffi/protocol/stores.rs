@@ -20,14 +20,13 @@ use std::os::raw::c_void;
 
 use prost::Message as _;
 
-use crate::protocol::{
-    ChannelStoreError, ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore,
-    DeRecShareStore, DeRecStateStore, DeRecTransport, DeRecUserSecretStore, MissingPolicy,
-    SecretKind, SecretStoreError, SecretStoreFuture, SecretValue, Share, ShareStoreError,
-    ShareStoreFuture, StateItem, StateKey, StateKind, StateStoreError, StateStoreFuture,
-    TransportFuture,
-};
 use crate::protocol::types::{UserSecret, UserSecrets};
+use crate::protocol::{
+    ChannelStoreError, ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecShareStore,
+    DeRecStateStore, DeRecTransport, DeRecUserSecretStore, MissingPolicy, SecretKind,
+    SecretStoreError, SecretStoreFuture, SecretValue, Share, ShareStoreError, ShareStoreFuture,
+    StateItem, StateKey, StateKind, StateStoreError, StateStoreFuture, TransportFuture,
+};
 
 /// Lightweight error wrapper so we can put owned strings into the
 /// trait-object `Backend` variants — matches the WASM bridge's pattern.
@@ -276,7 +275,10 @@ pub(crate) struct StateItemRecord {
 impl From<&StateItem> for StateItemRecord {
     fn from(v: &StateItem) -> Self {
         match v {
-            StateItem::PendingVerification { channel_id, request } => Self {
+            StateItem::PendingVerification {
+                channel_id,
+                request,
+            } => Self {
                 kind: 0,
                 channel_id: Some(channel_id.0.to_string()),
                 secret_id: None,
@@ -304,7 +306,10 @@ impl From<&StateItem> for StateItemRecord {
                 confirmed: None,
                 failed: None,
             },
-            StateItem::PendingUnpair { channel_id, started_at } => Self {
+            StateItem::PendingUnpair {
+                channel_id,
+                started_at,
+            } => Self {
                 kind: 2,
                 channel_id: Some(channel_id.0.to_string()),
                 secret_id: None,
@@ -366,10 +371,12 @@ impl StateItemRecord {
                 let bytes = self
                     .bytes
                     .ok_or_else(|| "PendingVerification requires bytes".to_string())?;
-                let request =
-                    derec_proto::VerifyShareRequestMessage::decode(bytes.as_slice())
-                        .map_err(|e| format!("VerifyShareRequestMessage decode: {e}"))?;
-                Ok(StateItem::PendingVerification { channel_id, request })
+                let request = derec_proto::VerifyShareRequestMessage::decode(bytes.as_slice())
+                    .map_err(|e| format!("VerifyShareRequestMessage decode: {e}"))?;
+                Ok(StateItem::PendingVerification {
+                    channel_id,
+                    request,
+                })
             }
             1 => {
                 let secret_id = self
@@ -409,7 +416,10 @@ impl StateItemRecord {
                 let started_at = started_at_str
                     .parse::<u64>()
                     .map_err(|e| format!("started_at not a decimal u64: {e}"))?;
-                Ok(StateItem::PendingUnpair { channel_id, started_at })
+                Ok(StateItem::PendingUnpair {
+                    channel_id,
+                    started_at,
+                })
             }
             3 => {
                 let version = self
@@ -488,12 +498,7 @@ pub struct ChannelStoreCallbacks {
         out_ptr: *mut *mut u8,
         out_len: *mut usize,
     ) -> i32,
-    pub link_channel: extern "C" fn(
-        user_data: *mut c_void,
-        secret_id: u64,
-        a: u64,
-        b: u64,
-    ) -> i32,
+    pub link_channel: extern "C" fn(user_data: *mut c_void, secret_id: u64, a: u64, b: u64) -> i32,
     pub linked_channels: extern "C" fn(
         user_data: *mut c_void,
         secret_id: u64,
@@ -524,12 +529,8 @@ pub struct SecretStoreCallbacks {
         bytes: *const u8,
         len: usize,
     ) -> i32,
-    pub remove: extern "C" fn(
-        user_data: *mut c_void,
-        secret_id: u64,
-        channel_id: u64,
-        kind: u32,
-    ) -> i32,
+    pub remove:
+        extern "C" fn(user_data: *mut c_void, secret_id: u64, channel_id: u64, kind: u32) -> i32,
     pub free_buffer: extern "C" fn(user_data: *mut c_void, ptr: *mut u8, len: usize),
 }
 
@@ -580,11 +581,8 @@ pub struct ShareStoreCallbacks {
         share_json_ptr: *const u8,
         share_json_len: usize,
     ) -> i32,
-    pub remove_channel: extern "C" fn(
-        user_data: *mut c_void,
-        secret_id: u64,
-        channel_id: u64,
-    ) -> i32,
+    pub remove_channel:
+        extern "C" fn(user_data: *mut c_void, secret_id: u64, channel_id: u64) -> i32,
     pub free_buffer: extern "C" fn(user_data: *mut c_void, ptr: *mut u8, len: usize),
 }
 
@@ -755,21 +753,17 @@ impl DeRecChannelStore for DotnetChannelStore {
         secret_id: u64,
         channel_id: ChannelId,
     ) -> ChannelStoreFuture<'_, Option<Channel>> {
-        let bytes_res = self.fetch_bytes(|p, l| {
-            (self.cb.load)(self.cb.user_data, secret_id, channel_id.0, p, l)
-        });
+        let bytes_res = self
+            .fetch_bytes(|p, l| (self.cb.load)(self.cb.user_data, secret_id, channel_id.0, p, l));
         Box::pin(async move {
             match bytes_res {
                 Err(e) => Err(ChannelStoreError::Backend(e.into())),
                 Ok(None) => Ok(None),
                 Ok(Some(bytes)) if bytes.is_empty() => Ok(None),
                 Ok(Some(bytes)) => {
-                    let channel: Channel = serde_json::from_slice(&bytes)
-                        .map_err(|e| {
-                            ChannelStoreError::Backend(
-                                format!("invalid Channel JSON: {e}").into(),
-                            )
-                        })?;
+                    let channel: Channel = serde_json::from_slice(&bytes).map_err(|e| {
+                        ChannelStoreError::Backend(format!("invalid Channel JSON: {e}").into())
+                    })?;
                     Ok(Some(channel))
                 }
             }
@@ -780,10 +774,15 @@ impl DeRecChannelStore for DotnetChannelStore {
         let channel_id = channel.id.0;
         let cb = &self.cb;
         let res = (|| -> Result<(), ChannelStoreError> {
-            let bytes = serde_json::to_vec(&channel).map_err(|e| {
-                ChannelStoreError::Backend(format!("Channel JSON: {e}").into())
-            })?;
-            let rc = (cb.save)(cb.user_data, secret_id, channel_id, bytes.as_ptr(), bytes.len());
+            let bytes = serde_json::to_vec(&channel)
+                .map_err(|e| ChannelStoreError::Backend(format!("Channel JSON: {e}").into()))?;
+            let rc = (cb.save)(
+                cb.user_data,
+                secret_id,
+                channel_id,
+                bytes.as_ptr(),
+                bytes.len(),
+            );
             if rc != 0 {
                 return Err(ChannelStoreError::Backend(
                     format!("channel store save failed (rc={rc})").into(),
@@ -794,11 +793,7 @@ impl DeRecChannelStore for DotnetChannelStore {
         Box::pin(async move { res })
     }
 
-    fn remove(
-        &mut self,
-        secret_id: u64,
-        channel_id: ChannelId,
-    ) -> ChannelStoreFuture<'_, bool> {
+    fn remove(&mut self, secret_id: u64, channel_id: ChannelId) -> ChannelStoreFuture<'_, bool> {
         let cb = &self.cb;
         let res = (|| -> Result<bool, ChannelStoreError> {
             let mut existed: u32 = 0;
@@ -819,9 +814,8 @@ impl DeRecChannelStore for DotnetChannelStore {
     }
 
     fn channels(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<Channel>> {
-        let list_bytes_res = self.fetch_bytes(|p, l| {
-            (self.cb.list_channels)(self.cb.user_data, secret_id, p, l)
-        });
+        let list_bytes_res =
+            self.fetch_bytes(|p, l| (self.cb.list_channels)(self.cb.user_data, secret_id, p, l));
         let cb = &self.cb;
         let res = (|| -> Result<Vec<Channel>, ChannelStoreError> {
             let bytes = match list_bytes_res {
@@ -858,9 +852,8 @@ impl DeRecChannelStore for DotnetChannelStore {
                 }
                 let bytes = unsafe { std::slice::from_raw_parts(ptr, len).to_vec() };
                 (cb.free_buffer)(cb.user_data, ptr, len);
-                let channel: Channel = serde_json::from_slice(&bytes).map_err(|e| {
-                    ChannelStoreError::Backend(format!("Channel JSON: {e}").into())
-                })?;
+                let channel: Channel = serde_json::from_slice(&bytes)
+                    .map_err(|e| ChannelStoreError::Backend(format!("Channel JSON: {e}").into()))?;
                 out.push(channel);
             }
             Ok(out)
@@ -905,9 +898,7 @@ impl DeRecChannelStore for DotnetChannelStore {
                 return Ok(vec![channel_id]);
             }
             let ids: Vec<u64> = serde_json::from_slice(&bytes).map_err(|e| {
-                ChannelStoreError::Backend(boxed_err(format!(
-                    "linked_channels JSON: {e}"
-                )))
+                ChannelStoreError::Backend(boxed_err(format!("linked_channels JSON: {e}")))
             })?;
             Ok(ids.into_iter().map(ChannelId).collect())
         })
@@ -947,11 +938,9 @@ impl DeRecSecretStore for DotnetSecretStore {
                 Ok(None) => Ok(None),
                 Ok(Some(bytes)) if bytes.is_empty() => Ok(None),
                 Ok(Some(bytes)) => {
-                    let record: SecretValueRecord = serde_json::from_slice(&bytes)
-                        .map_err(|e| {
-                            SecretStoreError::Backend(
-                                format!("SecretValue JSON: {e}").into(),
-                            )
+                    let record: SecretValueRecord =
+                        serde_json::from_slice(&bytes).map_err(|e| {
+                            SecretStoreError::Backend(format!("SecretValue JSON: {e}").into())
                         })?;
                     let value = record.into_value().map_err(|e| {
                         SecretStoreError::Backend(format!("SecretValue: {e}").into())
@@ -1007,13 +996,12 @@ impl DeRecSecretStore for DotnetSecretStore {
                 }
                 let bytes = unsafe { std::slice::from_raw_parts(ptr, len).to_vec() };
                 (cb.free_buffer)(cb.user_data, ptr, len);
-                let record: SecretValueRecord = serde_json::from_slice(&bytes)
-                    .map_err(|e| {
-                        SecretStoreError::Backend(format!("SecretValue JSON: {e}").into())
-                    })?;
-                let value = record.into_value().map_err(|e| {
-                    SecretStoreError::Backend(format!("SecretValue: {e}").into())
+                let record: SecretValueRecord = serde_json::from_slice(&bytes).map_err(|e| {
+                    SecretStoreError::Backend(format!("SecretValue JSON: {e}").into())
                 })?;
+                let value = record
+                    .into_value()
+                    .map_err(|e| SecretStoreError::Backend(format!("SecretValue: {e}").into()))?;
                 out.push((*id, value));
             }
             if !missing.is_empty() && matches!(missing_policy, MissingPolicy::Fail) {
@@ -1089,7 +1077,10 @@ unsafe impl Send for DotnetShareStore {}
 unsafe impl Sync for DotnetShareStore {}
 
 impl DotnetShareStore {
-    fn fetch_share_list(&self, bytes: Result<Option<Vec<u8>>, String>) -> Result<Vec<Share>, ShareStoreError> {
+    fn fetch_share_list(
+        &self,
+        bytes: Result<Option<Vec<u8>>, String>,
+    ) -> Result<Vec<Share>, ShareStoreError> {
         let bytes = match bytes {
             Err(e) => return Err(ShareStoreError::Backend(boxed_err(e))),
             Ok(None) => return Ok(Vec::new()),
@@ -1098,12 +1089,14 @@ impl DotnetShareStore {
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
-        let records: Vec<ShareRecord> = serde_json::from_slice(&bytes).map_err(|e| {
-            ShareStoreError::Backend(boxed_err(format!("ShareRecord JSON: {e}")))
-        })?;
+        let records: Vec<ShareRecord> = serde_json::from_slice(&bytes)
+            .map_err(|e| ShareStoreError::Backend(boxed_err(format!("ShareRecord JSON: {e}"))))?;
         records
             .into_iter()
-            .map(|r| r.into_share().map_err(|e| ShareStoreError::Backend(boxed_err(e))))
+            .map(|r| {
+                r.into_share()
+                    .map_err(|e| ShareStoreError::Backend(boxed_err(e)))
+            })
             .collect()
     }
 
@@ -1216,9 +1209,8 @@ impl DeRecShareStore for DotnetShareStore {
         let cb = &self.cb;
         let res = (|| -> Result<(), ShareStoreError> {
             let record = ShareRecord::from(&share);
-            let bytes = serde_json::to_vec(&record).map_err(|e| {
-                ShareStoreError::Backend(boxed_err(format!("Share JSON: {e}")))
-            })?;
+            let bytes = serde_json::to_vec(&record)
+                .map_err(|e| ShareStoreError::Backend(boxed_err(format!("Share JSON: {e}"))))?;
             let rc = (cb.save)(
                 cb.user_data,
                 secret_id,
@@ -1268,15 +1260,19 @@ impl DotnetUserSecretStore {
         &self,
         f: impl FnOnce(*mut *mut u8, *mut usize) -> i32,
     ) -> Result<Option<Vec<u8>>, String> {
-        fetch_callback_bytes(self.cb.user_data, self.cb.free_buffer, "user secret store", f)
+        fetch_callback_bytes(
+            self.cb.user_data,
+            self.cb.free_buffer,
+            "user secret store",
+            f,
+        )
     }
 }
 
 impl DeRecUserSecretStore for DotnetUserSecretStore {
     fn load_latest(&self, secret_id: u64) -> ShareStoreFuture<'_, Option<UserSecrets>> {
-        let result = self.fetch_bytes(|p, l| {
-            (self.cb.load_latest)(self.cb.user_data, secret_id, p, l)
-        });
+        let result =
+            self.fetch_bytes(|p, l| (self.cb.load_latest)(self.cb.user_data, secret_id, p, l));
         let res = match result {
             Err(e) => Err(ShareStoreError::Backend(boxed_err(e))),
             Ok(None) => Ok(None),
@@ -1288,11 +1284,7 @@ impl DeRecUserSecretStore for DotnetUserSecretStore {
         Box::pin(async move { res })
     }
 
-    fn save_latest(
-        &mut self,
-        secret_id: u64,
-        value: UserSecrets,
-    ) -> ShareStoreFuture<'_, ()> {
+    fn save_latest(&mut self, secret_id: u64, value: UserSecrets) -> ShareStoreFuture<'_, ()> {
         let cb = &self.cb;
         let res = (|| -> Result<(), ShareStoreError> {
             let record = UserSecretsRecord::from(&value);
@@ -1375,9 +1367,8 @@ impl DeRecStateStore for DotnetStateStore {
         let cb = &self.cb;
         let res = (|| -> Result<(), StateStoreError> {
             let record = StateItemRecord::from(&item);
-            let bytes = serde_json::to_vec(&record).map_err(|e| {
-                StateStoreError::Backend(boxed_err(format!("StateItem JSON: {e}")))
-            })?;
+            let bytes = serde_json::to_vec(&record)
+                .map_err(|e| StateStoreError::Backend(boxed_err(format!("StateItem JSON: {e}"))))?;
             let rc = (cb.save)(cb.user_data, secret_id, bytes.as_ptr(), bytes.len());
             if rc != 0 {
                 return Err(StateStoreError::Backend(boxed_err(format!(
@@ -1393,14 +1384,10 @@ impl DeRecStateStore for DotnetStateStore {
         let cb = &self.cb;
         let res = (|| -> Result<Option<StateItem>, StateStoreError> {
             let key_record = StateKeyRecord::from(&key);
-            let key_bytes = serde_json::to_vec(&key_record).map_err(|e| {
-                StateStoreError::Backend(boxed_err(format!("StateKey JSON: {e}")))
-            })?;
-            let bytes = fetch_callback_bytes(
-                cb.user_data,
-                cb.free_buffer,
-                "state store",
-                |p, l| {
+            let key_bytes = serde_json::to_vec(&key_record)
+                .map_err(|e| StateStoreError::Backend(boxed_err(format!("StateKey JSON: {e}"))))?;
+            let bytes =
+                fetch_callback_bytes(cb.user_data, cb.free_buffer, "state store", |p, l| {
                     (cb.load)(
                         cb.user_data,
                         secret_id,
@@ -1409,16 +1396,14 @@ impl DeRecStateStore for DotnetStateStore {
                         p,
                         l,
                     )
-                },
-            )
-            .map_err(|e| StateStoreError::Backend(boxed_err(e)))?;
+                })
+                .map_err(|e| StateStoreError::Backend(boxed_err(e)))?;
             let Some(bytes) = bytes else { return Ok(None) };
             if bytes.is_empty() {
                 return Ok(None);
             }
-            let record: StateItemRecord = serde_json::from_slice(&bytes).map_err(|e| {
-                StateStoreError::Backend(boxed_err(format!("StateItem JSON: {e}")))
-            })?;
+            let record: StateItemRecord = serde_json::from_slice(&bytes)
+                .map_err(|e| StateStoreError::Backend(boxed_err(format!("StateItem JSON: {e}"))))?;
             let item = record
                 .into_item()
                 .map_err(|e| StateStoreError::Backend(boxed_err(e)))?;
@@ -1431,9 +1416,8 @@ impl DeRecStateStore for DotnetStateStore {
         let cb = &self.cb;
         let res = (|| -> Result<bool, StateStoreError> {
             let key_record = StateKeyRecord::from(&key);
-            let key_bytes = serde_json::to_vec(&key_record).map_err(|e| {
-                StateStoreError::Backend(boxed_err(format!("StateKey JSON: {e}")))
-            })?;
+            let key_bytes = serde_json::to_vec(&key_record)
+                .map_err(|e| StateStoreError::Backend(boxed_err(format!("StateKey JSON: {e}"))))?;
             let mut removed: u32 = 0;
             let rc = (cb.remove)(
                 cb.user_data,
@@ -1452,36 +1436,30 @@ impl DeRecStateStore for DotnetStateStore {
         Box::pin(async move { res })
     }
 
-    fn load_all(
-        &self,
-        secret_id: u64,
-        kind: StateKind,
-    ) -> StateStoreFuture<'_, Vec<StateItem>> {
+    fn load_all(&self, secret_id: u64, kind: StateKind) -> StateStoreFuture<'_, Vec<StateItem>> {
         let cb = &self.cb;
         let kind_u32 = state_kind_to_u32(kind);
         let res = (|| -> Result<Vec<StateItem>, StateStoreError> {
-            let bytes = fetch_callback_bytes(
-                cb.user_data,
-                cb.free_buffer,
-                "state store",
-                |p, l| (cb.load_all)(cb.user_data, secret_id, kind_u32, p, l),
-            )
-            .map_err(|e| StateStoreError::Backend(boxed_err(e)))?;
-            let Some(bytes) = bytes else { return Ok(Vec::new()) };
+            let bytes =
+                fetch_callback_bytes(cb.user_data, cb.free_buffer, "state store", |p, l| {
+                    (cb.load_all)(cb.user_data, secret_id, kind_u32, p, l)
+                })
+                .map_err(|e| StateStoreError::Backend(boxed_err(e)))?;
+            let Some(bytes) = bytes else {
+                return Ok(Vec::new());
+            };
             if bytes.is_empty() {
                 return Ok(Vec::new());
             }
-            let records: Vec<StateItemRecord> =
-                serde_json::from_slice(&bytes).map_err(|e| {
-                    StateStoreError::Backend(boxed_err(format!(
-                        "StateItem list JSON: {e}"
-                    )))
-                })?;
+            let records: Vec<StateItemRecord> = serde_json::from_slice(&bytes).map_err(|e| {
+                StateStoreError::Backend(boxed_err(format!("StateItem list JSON: {e}")))
+            })?;
             let mut out = Vec::with_capacity(records.len());
             for r in records {
-                out.push(r.into_item().map_err(|e| {
-                    StateStoreError::Backend(boxed_err(e))
-                })?);
+                out.push(
+                    r.into_item()
+                        .map_err(|e| StateStoreError::Backend(boxed_err(e)))?,
+                );
             }
             Ok(out)
         })();

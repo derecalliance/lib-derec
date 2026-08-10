@@ -290,7 +290,13 @@ before any target-level events are emitted.
   list of `UserSecret` the owner protected, alongside the captured
   helper/replica roster) /
   `RecoveryShareError { … }`
-- `Unpaired { channel_id }` / `UnpairRejected { channel_id, status, memo }`
+- `Unpaired { channel_id }` / `UnpairRejected { channel_id, status, memo }` /
+  `UnpairFailed { channel_id, error }` — emitted by `restore` when an
+  ephemeral recovery channel's teardown could not be delivered. The
+  teardown is fire-and-forget, so local state is dropped anyway and an
+  `Unpaired` for the same channel follows; the pair means "gone locally,
+  peer not told"
+
 - `ChannelInfoUpdated { channel_id }` /
   `ChannelInfoUpdateRejected { channel_id, status, memo }`
 - `PrePairRejected { channel_id, status, memo }` — the contact creator

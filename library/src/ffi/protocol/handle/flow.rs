@@ -6,10 +6,10 @@
 //! runtime and returns either a typed result or a JSON event array.
 
 use super::DeRecProtocolHandle;
-use crate::ffi::common::{empty_buffer, vec_into_buffer, DeRecBuffer};
+use crate::ffi::common::{DeRecBuffer, empty_buffer, vec_into_buffer};
 use crate::ffi::error::{
-    ffi_error, from_lib_error, success, DeRecError, DEREC_CODE_FFI_BAD_PROTO,
-    DEREC_CODE_FFI_BAD_UTF8, DEREC_CODE_FFI_INVALID_ENUM, DEREC_CODE_FFI_NULL_PTR,
+    DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_BAD_UTF8, DEREC_CODE_FFI_INVALID_ENUM,
+    DEREC_CODE_FFI_NULL_PTR, DeRecError, ffi_error, from_lib_error, success,
 };
 use crate::ffi::protocol::events::encode_events;
 use crate::ffi::protocol::flow as flow_params;
@@ -34,7 +34,11 @@ pub unsafe extern "C" fn derec_protocol_start(
         return ffi_error(DEREC_CODE_FFI_NULL_PTR, "handle is null").into();
     }
     if params_json_len > 0 && params_json_ptr.is_null() {
-        return ffi_error(DEREC_CODE_FFI_NULL_PTR, "params_json_ptr is null but len > 0").into();
+        return ffi_error(
+            DEREC_CODE_FFI_NULL_PTR,
+            "params_json_ptr is null but len > 0",
+        )
+        .into();
     }
     let params_bytes = if params_json_len == 0 {
         b""[..].to_vec()
@@ -197,7 +201,10 @@ pub unsafe extern "C" fn derec_protocol_reject(
     let action = match crate::protocol::utils::pending_action_wire::deserialize(bytes) {
         Ok(a) => a,
         Err(e) => {
-            return ffi_error(DEREC_CODE_FFI_BAD_PROTO, format!("PendingAction decode: {e}"));
+            return ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                format!("PendingAction decode: {e}"),
+            );
         }
     };
     let memo = if memo_len == 0 {

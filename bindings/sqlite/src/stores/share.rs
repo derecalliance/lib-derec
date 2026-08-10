@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-use derec_library::protocol::{DeRecShareStore, ShareStoreFuture};
 use derec_library::protocol::types::Share;
+use derec_library::protocol::{DeRecShareStore, ShareStoreFuture};
 use derec_library::types::ChannelId;
 
 use crate::codec::{sql_to_u64, u64_to_sql};

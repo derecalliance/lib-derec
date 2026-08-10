@@ -70,12 +70,13 @@ pub(super) async fn handle<
 
     match &inner {
         MessageBody::StoreShareRequest(_) | MessageBody::StoreShareResponse(_) => {
-            let channel = channel_store
-                .load(secret_id, channel_id)
-                .await?
-                .ok_or(Error::InvalidInput(
-                    "channel id not present in channel store",
-                ))?;
+            let channel =
+                channel_store
+                    .load(secret_id, channel_id)
+                    .await?
+                    .ok_or(Error::InvalidInput(
+                        "channel id not present in channel store",
+                    ))?;
             match (channel.peer_role, &inner) {
                 (SenderKind::Owner, MessageBody::StoreShareRequest(_))
                 | (SenderKind::Helper, MessageBody::StoreShareResponse(_)) => {
@@ -208,12 +209,13 @@ pub(super) async fn require_role<Ch: DeRecChannelStore>(
     expected: SenderKind,
 ) -> Result<()> {
     for channel_id in channel_ids {
-        let channel = channel_store
-            .load(secret_id, *channel_id)
-            .await?
-            .ok_or(Error::InvalidInput(
-                "channel id not present in channel store",
-            ))?;
+        let channel =
+            channel_store
+                .load(secret_id, *channel_id)
+                .await?
+                .ok_or(Error::InvalidInput(
+                    "channel id not present in channel store",
+                ))?;
         if channel.peer_role != expected {
             return Err(Error::RoleMismatch {
                 channel_id: *channel_id,

@@ -70,18 +70,17 @@ use crate::{
     protocol::{
         error::{ChannelStoreError, SecretStoreError, ShareStoreError, StateStoreError},
         traits::{
-            ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecStateStore,
-            DeRecTransport, DeRecUserSecretStore, DeRecShareStore, SecretStoreFuture,
+            ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecShareStore,
+            DeRecStateStore, DeRecTransport, DeRecUserSecretStore, SecretStoreFuture,
             ShareStoreFuture, StateStoreFuture, TransportFuture,
         },
         types::{
-            Channel, MissingPolicy, PairingKeyMaterial, SecretKind, SecretValue, Share,
-            StateItem, StateKey, StateKind, UserSecret, UserSecrets,
+            Channel, MissingPolicy, PairingKeyMaterial, SecretKind, SecretValue, Share, StateItem,
+            StateKey, StateKind, UserSecret, UserSecrets,
         },
     },
     types::ChannelId,
 };
-
 
 /// A simple string-backed error for wrapping JS call failures.
 #[derive(Debug)]
@@ -98,7 +97,6 @@ impl std::error::Error for JsCallError {}
 fn box_err(msg: String) -> Box<dyn std::error::Error + Send + Sync + 'static> {
     Box::new(JsCallError(msg))
 }
-
 
 fn call_method(obj: &JsValue, method: &str, args: &Array) -> Result<JsValue, String> {
     let func_val = js_sys::Reflect::get(obj, &JsValue::from_str(method))
@@ -137,7 +135,6 @@ fn decode_secret_value(kind: SecretKind, bytes: &[u8]) -> Result<SecretValue, Se
         }
     }
 }
-
 
 /// Adapter wrapping a JS `SecretStore` object.
 pub struct JsSecretStore(pub JsValue);
@@ -243,9 +240,7 @@ impl DeRecSecretStore for JsSecretStore {
             let (kind_num, bytes) = match &value {
                 SecretValue::SharedKey(key) => (0u32, key.to_vec()),
                 SecretValue::PairingSecret(material) => (1u32, material.as_bytes().to_vec()),
-                SecretValue::PairingContact(contact) => {
-                    (2u32, contact.encode_to_vec())
-                }
+                SecretValue::PairingContact(contact) => (2u32, contact.encode_to_vec()),
             };
             let js_bytes = Uint8Array::from(bytes.as_slice());
             let args = Array::new();
@@ -286,7 +281,6 @@ impl DeRecSecretStore for JsSecretStore {
         })
     }
 }
-
 
 /// Adapter wrapping a JS `ChannelStore` object.
 ///
@@ -401,11 +395,7 @@ impl DeRecChannelStore for JsChannelStore {
         })
     }
 
-    fn remove(
-        &mut self,
-        secret_id: u64,
-        channel_id: ChannelId,
-    ) -> ChannelStoreFuture<'_, bool> {
+    fn remove(&mut self, secret_id: u64, channel_id: ChannelId) -> ChannelStoreFuture<'_, bool> {
         let obj = self.0.clone();
         let secret_str = secret_id.to_string();
         let channel_str = channel_id.0.to_string();
@@ -481,16 +471,23 @@ impl DeRecChannelStore for JsChannelStore {
     }
 }
 
-
 /// Adapter wrapping a JS `ShareStore` object.
 pub struct JsShareStore(pub JsValue);
 
 fn share_to_js(share: &Share) -> JsValue {
     let obj = js_sys::Object::new();
-    js_sys::Reflect::set(&obj, &"secretId".into(), &JsValue::from_str(&share.secret_id.to_string()))
-        .unwrap_or_default();
-    js_sys::Reflect::set(&obj, &"version".into(), &JsValue::from_f64(share.version as f64))
-        .unwrap_or_default();
+    js_sys::Reflect::set(
+        &obj,
+        &"secretId".into(),
+        &JsValue::from_str(&share.secret_id.to_string()),
+    )
+    .unwrap_or_default();
+    js_sys::Reflect::set(
+        &obj,
+        &"version".into(),
+        &JsValue::from_f64(share.version as f64),
+    )
+    .unwrap_or_default();
     let js_bytes = Uint8Array::from(share.bytes.as_slice());
     js_sys::Reflect::set(&obj, &"bytes".into(), &js_bytes).unwrap_or_default();
     obj.into()
@@ -501,22 +498,23 @@ fn share_from_js(item: &JsValue) -> Result<Share, ShareStoreError> {
         .ok()
         .and_then(|v| v.as_string())
         .unwrap_or_default();
-    let secret_id = secret_id_str
-        .parse::<u64>()
-        .map_err(|e| ShareStoreError::Backend(box_err(format!("share.secretId must be a numeric string: {e}"))))?;
+    let secret_id = secret_id_str.parse::<u64>().map_err(|e| {
+        ShareStoreError::Backend(box_err(format!(
+            "share.secretId must be a numeric string: {e}"
+        )))
+    })?;
     let version = js_sys::Reflect::get(item, &"version".into())
         .ok()
         .and_then(|v| v.as_f64())
-        .ok_or_else(|| ShareStoreError::Backend(box_err("share.version must be a number".to_string())))?
-        as u32;
-    let bytes_val = js_sys::Reflect::get(item, &"bytes".into())
-        .unwrap_or(JsValue::null());
+        .ok_or_else(|| {
+            ShareStoreError::Backend(box_err("share.version must be a number".to_string()))
+        })? as u32;
+    let bytes_val = js_sys::Reflect::get(item, &"bytes".into()).unwrap_or(JsValue::null());
     let bytes = Uint8Array::new(&bytes_val).to_vec();
     // `replicaId` is an optional decimal-string on the JS side
     // (matching `derec.replica_id` and `Channel.replicaId`). Missing /
     // null / empty string all map to `None`.
-    let replica_id_val = js_sys::Reflect::get(item, &"replicaId".into())
-        .unwrap_or(JsValue::null());
+    let replica_id_val = js_sys::Reflect::get(item, &"replicaId".into()).unwrap_or(JsValue::null());
     let replica_id = if replica_id_val.is_null() || replica_id_val.is_undefined() {
         None
     } else {
@@ -584,12 +582,11 @@ impl DeRecShareStore for JsShareStore {
             if value.is_null() || value.is_undefined() {
                 Ok(None)
             } else {
-                let v = value
-                    .as_f64()
-                    .ok_or_else(|| ShareStoreError::Backend(box_err(
+                let v = value.as_f64().ok_or_else(|| {
+                    ShareStoreError::Backend(box_err(
                         "latestVersion must return a number or null".to_string(),
-                    )))?
-                    as u32;
+                    ))
+                })? as u32;
                 Ok(Some(v))
             }
         })
@@ -707,7 +704,6 @@ impl DeRecShareStore for JsShareStore {
     }
 }
 
-
 /// Adapter wrapping a JS `UserSecretStore` object.
 ///
 /// JS interface contract:
@@ -757,12 +753,9 @@ fn user_secrets_from_js(value: &JsValue) -> Result<UserSecrets, ShareStoreError>
         .ok()
         .and_then(|v| v.as_f64())
         .ok_or_else(|| {
-            ShareStoreError::Backend(box_err(
-                "userSecrets.version must be a number".to_string(),
-            ))
+            ShareStoreError::Backend(box_err("userSecrets.version must be a number".to_string()))
         })? as u32;
-    let entries_val = js_sys::Reflect::get(value, &"secrets".into())
-        .unwrap_or(JsValue::null());
+    let entries_val = js_sys::Reflect::get(value, &"secrets".into()).unwrap_or(JsValue::null());
     let entries_arr = Array::from(&entries_val);
     let mut secrets = Vec::with_capacity(entries_arr.length() as usize);
     for i in 0..entries_arr.length() {
@@ -813,11 +806,7 @@ impl DeRecUserSecretStore for JsUserSecretStore {
         })
     }
 
-    fn save_latest(
-        &mut self,
-        secret_id: u64,
-        value: UserSecrets,
-    ) -> ShareStoreFuture<'_, ()> {
+    fn save_latest(&mut self, secret_id: u64, value: UserSecrets) -> ShareStoreFuture<'_, ()> {
         let obj = self.0.clone();
         let secret_str = secret_id.to_string();
         let js_value = user_secrets_to_js(&value);
@@ -849,7 +838,6 @@ impl DeRecUserSecretStore for JsUserSecretStore {
         })
     }
 }
-
 
 /// Adapter wrapping a JS `Transport` object.
 pub struct JsTransport(pub JsValue);
@@ -958,7 +946,10 @@ struct StateItemRecord {
 impl From<&StateItem> for StateItemRecord {
     fn from(v: &StateItem) -> Self {
         match v {
-            StateItem::PendingVerification { channel_id, request } => Self {
+            StateItem::PendingVerification {
+                channel_id,
+                request,
+            } => Self {
                 kind: 0,
                 channel_id: Some(channel_id.0.to_string()),
                 secret_id: None,
@@ -986,7 +977,10 @@ impl From<&StateItem> for StateItemRecord {
                 confirmed: None,
                 failed: None,
             },
-            StateItem::PendingUnpair { channel_id, started_at } => Self {
+            StateItem::PendingUnpair {
+                channel_id,
+                started_at,
+            } => Self {
                 kind: 2,
                 channel_id: Some(channel_id.0.to_string()),
                 secret_id: None,
@@ -1048,10 +1042,12 @@ impl StateItemRecord {
                 let bytes = self
                     .bytes
                     .ok_or_else(|| "PendingVerification requires bytes".to_string())?;
-                let request =
-                    derec_proto::VerifyShareRequestMessage::decode(bytes.as_slice())
-                        .map_err(|e| format!("VerifyShareRequestMessage decode: {e}"))?;
-                Ok(StateItem::PendingVerification { channel_id, request })
+                let request = derec_proto::VerifyShareRequestMessage::decode(bytes.as_slice())
+                    .map_err(|e| format!("VerifyShareRequestMessage decode: {e}"))?;
+                Ok(StateItem::PendingVerification {
+                    channel_id,
+                    request,
+                })
             }
             1 => {
                 let secret_id = self
@@ -1091,7 +1087,10 @@ impl StateItemRecord {
                 let started_at = started_at_str
                     .parse::<u64>()
                     .map_err(|e| format!("started_at not a decimal u64: {e}"))?;
-                Ok(StateItem::PendingUnpair { channel_id, started_at })
+                Ok(StateItem::PendingUnpair {
+                    channel_id,
+                    started_at,
+                })
             }
             3 => {
                 let version = self
@@ -1216,11 +1215,7 @@ impl DeRecStateStore for JsStateStore {
         })
     }
 
-    fn load_all(
-        &self,
-        secret_id: u64,
-        kind: StateKind,
-    ) -> StateStoreFuture<'_, Vec<StateItem>> {
+    fn load_all(&self, secret_id: u64, kind: StateKind) -> StateStoreFuture<'_, Vec<StateItem>> {
         let obj = self.0.clone();
         let secret_str = secret_id.to_string();
         let kind_num = state_kind_to_u32(kind);

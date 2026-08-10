@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
 
-use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::types::secret::SecretError;
@@ -16,7 +16,8 @@ use crate::protocol::types::{HelperInfo, ReplicaInfo, Replicas, Secret, UserSecr
 
 fn gzip(data: &[u8]) -> Vec<u8> {
     let mut enc = GzEncoder::new(Vec::new(), Compression::default());
-    enc.write_all(data).expect("gzip write into Vec is infallible");
+    enc.write_all(data)
+        .expect("gzip write into Vec is infallible");
     enc.finish().expect("gzip finish into Vec is infallible")
 }
 
@@ -29,7 +30,7 @@ fn gunzip(data: &[u8]) -> Result<Vec<u8>, SecretError> {
 }
 
 mod base64_bytes {
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use serde::{Deserialize as _, Deserializer, Serializer};
 
     #[allow(clippy::ptr_arg)]
@@ -83,7 +84,11 @@ struct HelperJson {
     transport_uri: String,
     #[serde(with = "base64_bytes")]
     shared_key: Vec<u8>,
-    #[serde(default, deserialize_with = "de_map", skip_serializing_if = "HashMap::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "de_map",
+        skip_serializing_if = "HashMap::is_empty"
+    )]
     communication_info: HashMap<String, String>,
 }
 
@@ -111,7 +116,11 @@ struct ReplicaInfoJson {
     #[serde(with = "u64_string")]
     replica_id: u64,
     sender_kind: i32,
-    #[serde(default, deserialize_with = "de_map", skip_serializing_if = "HashMap::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "de_map",
+        skip_serializing_if = "HashMap::is_empty"
+    )]
     communication_info: HashMap<String, String>,
 }
 
@@ -160,12 +169,20 @@ impl From<HelperJson> for HelperInfo {
 
 impl From<&UserSecret> for UserSecretJson {
     fn from(u: &UserSecret) -> Self {
-        UserSecretJson { id: u.id.clone(), name: u.name.clone(), data: u.data.clone() }
+        UserSecretJson {
+            id: u.id.clone(),
+            name: u.name.clone(),
+            data: u.data.clone(),
+        }
     }
 }
 impl From<UserSecretJson> for UserSecret {
     fn from(j: UserSecretJson) -> Self {
-        UserSecret { id: j.id, name: j.name, data: j.data }
+        UserSecret {
+            id: j.id,
+            name: j.name,
+            data: j.data,
+        }
     }
 }
 
@@ -212,8 +229,8 @@ impl From<ReplicaInfoJson> for ReplicaInfo {
 /// Encode the v1 payload (no version prefix): gzip-compressed JSON.
 pub fn encode(secret: &Secret) -> Vec<u8> {
     let dto = SecretJson::from(secret);
-    let json = serde_json::to_vec(&dto)
-        .expect("Secret JSON serialization is infallible for owned data");
+    let json =
+        serde_json::to_vec(&dto).expect("Secret JSON serialization is infallible for owned data");
     gzip(&json)
 }
 
@@ -277,9 +294,18 @@ mod tests {
         secret.replicas = None;
         secret.helpers[0].communication_info.clear();
         let json = String::from_utf8(gunzip(&encode(&secret)).unwrap()).unwrap();
-        assert!(!json.contains("replicas"), "absent replicas must be omitted");
-        assert!(!json.contains("communication_info"), "empty communication_info must be omitted");
-        assert!(!json.contains("version"), "v1 JSON must not carry a version field");
+        assert!(
+            !json.contains("replicas"),
+            "absent replicas must be omitted"
+        );
+        assert!(
+            !json.contains("communication_info"),
+            "empty communication_info must be omitted"
+        );
+        assert!(
+            !json.contains("version"),
+            "v1 JSON must not carry a version field"
+        );
     }
 
     #[test]

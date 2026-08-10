@@ -45,8 +45,7 @@
 
 use super::super::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecStateStore,
-    DeRecTransport, PendingAction, SecretKind, SecretValue, StateItem, StateKey,
-    events::UnpairAck,
+    DeRecTransport, PendingAction, SecretKind, SecretValue, StateItem, StateKey, events::UnpairAck,
 };
 use super::peer_endpoint;
 use crate::derec_message::current_timestamp;

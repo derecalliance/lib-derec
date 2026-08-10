@@ -176,10 +176,7 @@ pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<JsValue, JsValue> {
 /// Scanner-side: validate the `PrePairResponse` against the contact's
 /// SHA-384 binding hash. Returns the validated keys + nonce on match.
 #[wasm_bindgen(js_name = "pairing_response_process_pre_pair")]
-pub fn process_pre_pair(
-    contact_message: JsValue,
-    response: JsValue,
-) -> Result<JsValue, JsValue> {
+pub fn process_pre_pair(contact_message: JsValue, response: JsValue) -> Result<JsValue, JsValue> {
     let contact_message: ContactMessage = from_js(contact_message)?;
     let contact_message_proto: derec_proto::ContactMessage = contact_message.into();
     let response: PrePairResponseMessage = from_js(response)?;

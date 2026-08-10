@@ -928,9 +928,7 @@ async fn dispatch_composite_to_destination<Ss: DeRecSecretStore, T: DeRecTranspo
 #[cfg(test)]
 mod tests {
     use crate::primitives::sharing::request;
-    use crate::protocol::test::{
-        InMemChannelStore, InMemShareStore, NoopTransport, run_async,
-    };
+    use crate::protocol::test::{InMemChannelStore, InMemShareStore, NoopTransport, run_async};
     use crate::types::{ChannelId, SharedKey};
     use derec_proto::{Protocol, TransportProtocol};
 

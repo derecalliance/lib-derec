@@ -535,6 +535,13 @@ func TestDecodeEvents_RecoverSecretFailed(t *testing.T) {
 	}
 }
 
+func TestDecodeEvents_UnpairFailed(t *testing.T) {
+	ev := decodeOne(t, `{"type": "UnpairFailed", "channel_id": "99", "error": "transport unreachable"}`)
+	if ev.Type != EventTypeUnpairFailed || ev.ChannelID != "99" || ev.Error != "transport unreachable" {
+		t.Fatalf("UnpairFailed decoded wrong: %+v", ev)
+	}
+}
+
 func TestDecodeEvents_UnpairStarted(t *testing.T) {
 	ev := decodeOne(t, `{"type": "UnpairStarted", "channel_id": "11"}`)
 	if ev.Type != EventTypeUnpairStarted || ev.ChannelID != "11" {

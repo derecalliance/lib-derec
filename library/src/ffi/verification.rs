@@ -279,10 +279,11 @@ pub extern "C" fn process_verify_share_response_message(
         is_valid: false,
     };
 
-    let request_bytes = match parse_buffer(request_proto_ptr, request_proto_len, "request_proto_ptr") {
-        Ok(b) => b,
-        Err(e) => return with_err(e),
-    };
+    let request_bytes =
+        match parse_buffer(request_proto_ptr, request_proto_len, "request_proto_ptr") {
+            Ok(b) => b,
+            Err(e) => return with_err(e),
+        };
     let response_bytes =
         match parse_buffer(response_proto_ptr, response_proto_len, "response_proto_ptr") {
             Ok(b) => b,

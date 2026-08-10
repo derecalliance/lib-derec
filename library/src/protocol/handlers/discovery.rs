@@ -87,7 +87,12 @@ pub(in crate::protocol) async fn start<
     };
 
     let keys = secret_store
-        .load_many(secret_id, &channel_ids, SecretKind::SharedKey, MissingPolicy::Fail)
+        .load_many(
+            secret_id,
+            &channel_ids,
+            SecretKind::SharedKey,
+            MissingPolicy::Fail,
+        )
         .await?;
 
     let mut events = Vec::with_capacity(keys.len());

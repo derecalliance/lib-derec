@@ -147,12 +147,13 @@ pub(in crate::protocol) async fn accept<Ch: DeRecChannelStore, T: DeRecTransport
     shared_key: &SharedKey,
     trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
-    let mut channel = channel_store
-        .load(secret_id, channel_id)
-        .await?
-        .ok_or(Error::InvalidInput(
-            "channel id not present in channel store",
-        ))?;
+    let mut channel =
+        channel_store
+            .load(secret_id, channel_id)
+            .await?
+            .ok_or(Error::InvalidInput(
+                "channel id not present in channel store",
+            ))?;
 
     #[cfg(feature = "logging")]
     let communication_info_updated = request.communication_info.is_some();

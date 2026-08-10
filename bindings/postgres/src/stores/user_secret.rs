@@ -39,11 +39,7 @@ impl DeRecUserSecretStore for PostgresUserSecretStore {
         })
     }
 
-    fn save_latest(
-        &mut self,
-        secret_id: u64,
-        value: UserSecrets,
-    ) -> ShareStoreFuture<'_, ()> {
+    fn save_latest(&mut self, secret_id: u64, value: UserSecrets) -> ShareStoreFuture<'_, ()> {
         let client = self.client.clone();
         let secret_id = u64_to_sql(secret_id);
         let version_i64 = value.version as i64;

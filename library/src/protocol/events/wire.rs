@@ -23,8 +23,8 @@ use serde::Serialize;
 
 use crate::protocol::utils::{pending_action_wire, reserved_keys::encode_replica_id};
 use crate::protocol::{
-    types::{ChannelShare, Secret},
     DeRecEvent, PendingAction,
+    types::{ChannelShare, Secret},
 };
 
 /// Canonical wire-shape of [`super::DeRecEvent`]. Consumed by the FFI
@@ -197,6 +197,10 @@ pub(crate) enum Event {
     RecoverSecretFailed {
         channel_id: String,
         version: u32,
+        error: String,
+    },
+    UnpairFailed {
+        channel_id: String,
         error: String,
     },
     UnpairStarted {
@@ -387,7 +391,10 @@ impl Event {
                 version,
                 replica_id: replica_id.map(encode_replica_id),
             },
-            DeRecEvent::ShareConfirmed { channel_id, version } => Self::ShareConfirmed {
+            DeRecEvent::ShareConfirmed {
+                channel_id,
+                version,
+            } => Self::ShareConfirmed {
                 channel_id: channel_id.0.to_string(),
                 version,
             },
@@ -413,11 +420,17 @@ impl Event {
                 failed_count: failed_count as u32,
                 threshold_met,
             },
-            DeRecEvent::ShareVerified { channel_id, version } => Self::ShareVerified {
+            DeRecEvent::ShareVerified {
+                channel_id,
+                version,
+            } => Self::ShareVerified {
                 channel_id: channel_id.0.to_string(),
                 version,
             },
-            DeRecEvent::SecretsDiscovered { channel_id, secrets } => Self::SecretsDiscovered {
+            DeRecEvent::SecretsDiscovered {
+                channel_id,
+                secrets,
+            } => Self::SecretsDiscovered {
                 channel_id: channel_id.0.to_string(),
                 secrets: secrets
                     .into_iter()
@@ -497,8 +510,7 @@ impl Event {
                 let action_kind = action_kind_label(&action).to_owned();
                 let peer_communication_info = extract_peer_communication_info(&action);
                 let sender_kind = extract_pairing_sender_kind(&action);
-                let (version, share_description, share_secret_id) =
-                    extract_share_metadata(&action);
+                let (version, share_description, share_secret_id) = extract_share_metadata(&action);
                 let action_bytes = pending_action_wire::serialize(action)?;
                 Self::ActionRequired {
                     channel_id: channel_id.0.to_string(),
@@ -574,11 +586,13 @@ impl Event {
             DeRecEvent::UnpairStarted { channel_id } => Self::UnpairStarted {
                 channel_id: channel_id.0.to_string(),
             },
-            DeRecEvent::UpdateChannelInfoStarted { channel_id } => {
-                Self::UpdateChannelInfoStarted {
-                    channel_id: channel_id.0.to_string(),
-                }
-            }
+            DeRecEvent::UnpairFailed { channel_id, error } => Self::UnpairFailed {
+                channel_id: channel_id.0.to_string(),
+                error,
+            },
+            DeRecEvent::UpdateChannelInfoStarted { channel_id } => Self::UpdateChannelInfoStarted {
+                channel_id: channel_id.0.to_string(),
+            },
             DeRecEvent::UpdateChannelInfoFailed { channel_id, error } => {
                 Self::UpdateChannelInfoFailed {
                     channel_id: channel_id.0.to_string(),
@@ -615,9 +629,10 @@ pub(crate) fn pending_action_kind_label(
 
 fn extract_peer_communication_info(action: &PendingAction) -> HashMap<String, String> {
     match action {
-        PendingAction::Pairing { peer_communication_info, .. } => {
-            peer_communication_info.clone()
-        }
+        PendingAction::Pairing {
+            peer_communication_info,
+            ..
+        } => peer_communication_info.clone(),
         _ => HashMap::new(),
     }
 }
@@ -629,9 +644,7 @@ fn extract_pairing_sender_kind(action: &PendingAction) -> Option<i32> {
     }
 }
 
-fn extract_share_metadata(
-    action: &PendingAction,
-) -> (Option<u32>, Option<String>, Option<String>) {
+fn extract_share_metadata(action: &PendingAction) -> (Option<u32>, Option<String>, Option<String>) {
     match action {
         PendingAction::StoreShare { request, .. } => {
             let desc = if request.version_description.is_empty() {
@@ -639,7 +652,11 @@ fn extract_share_metadata(
             } else {
                 Some(request.version_description.clone())
             };
-            (Some(request.version), desc, Some(request.secret_id.to_string()))
+            (
+                Some(request.version),
+                desc,
+                Some(request.secret_id.to_string()),
+            )
         }
         PendingAction::VerifyShare { request, .. } => (
             Some(request.version),
@@ -647,5 +664,29 @@ fn extract_share_metadata(
             Some(request.secret_id.to_string()),
         ),
         _ => (None, None, None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ChannelId;
+
+    /// Both the FFI and WASM bridges serialize through
+    /// [`Event::from_event`], so mapping a variant here is what makes it
+    /// visible to every SDK. An unmapped variant silently degrades to
+    /// `NoOp`, which is indistinguishable from "nothing happened".
+    #[test]
+    fn unpair_failed_maps_to_the_wire_instead_of_degrading_to_noop() {
+        let mapped = Event::from_event(DeRecEvent::UnpairFailed {
+            channel_id: ChannelId(99),
+            error: "transport unreachable".to_owned(),
+        })
+        .expect("UnpairFailed must map");
+
+        let json = serde_json::to_value(&mapped).expect("serializes");
+        assert_eq!(json["type"], "UnpairFailed");
+        assert_eq!(json["channel_id"], "99");
+        assert_eq!(json["error"], "transport unreachable");
     }
 }

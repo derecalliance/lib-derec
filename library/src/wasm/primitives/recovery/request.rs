@@ -69,9 +69,14 @@ pub fn produce(
 ) -> Result<JsValue, JsValue> {
     let shared_key = parse_shared_key(shared_key)?;
     let reply_to_proto = parse_optional_transport_protocol(reply_to)?;
-    let result =
-        request::produce(channel_id.into(), secret_id, version, &shared_key, reply_to_proto)
-            .map_err(js_error_from_lib)?;
+    let result = request::produce(
+        channel_id.into(),
+        secret_id,
+        version,
+        &shared_key,
+        reply_to_proto,
+    )
+    .map_err(js_error_from_lib)?;
     to_js(&ProduceResult {
         envelope: result.envelope,
     })

@@ -30,10 +30,22 @@ pub fn fingerprint(shared_key: &[u8; 32]) -> String {
     let digits = compute_digits(shared_key);
     format!(
         "{}{}{}{}-{}{}{}{}-{}{}{}{}-{}{}{}{}",
-        digits[0], digits[1], digits[2], digits[3],
-        digits[4], digits[5], digits[6], digits[7],
-        digits[8], digits[9], digits[10], digits[11],
-        digits[12], digits[13], digits[14], digits[15],
+        digits[0],
+        digits[1],
+        digits[2],
+        digits[3],
+        digits[4],
+        digits[5],
+        digits[6],
+        digits[7],
+        digits[8],
+        digits[9],
+        digits[10],
+        digits[11],
+        digits[12],
+        digits[13],
+        digits[14],
+        digits[15],
     )
 }
 

@@ -9,9 +9,7 @@ use derec_library::protocol::{
 use derec_library::types::ChannelId;
 
 use crate::db::Database;
-use crate::flows::assertions::{
-    count_channels, count_shares, count_user_secrets,
-};
+use crate::flows::assertions::{count_channels, count_shares, count_user_secrets};
 use crate::flows::helpers::{pair_owner_helper, protect_secret};
 use crate::peer::Peer;
 
@@ -75,8 +73,18 @@ pub async fn run() {
     assert_eq!(count_channels(&shared_db.connection(), SECRET_B_ID), 2);
     println!("  shared `channels` table: 2 rows under each secret_id  ✓");
 
-    let a_chans = owner_a.protocol.channel_store.channels(SECRET_A_ID).await.unwrap();
-    let b_chans = owner_b.protocol.channel_store.channels(SECRET_B_ID).await.unwrap();
+    let a_chans = owner_a
+        .protocol
+        .channel_store
+        .channels(SECRET_A_ID)
+        .await
+        .unwrap();
+    let b_chans = owner_b
+        .protocol
+        .channel_store
+        .channels(SECRET_B_ID)
+        .await
+        .unwrap();
     assert_eq!(a_chans.len(), 2);
     assert_eq!(b_chans.len(), 2);
     for c in &a_chans {
@@ -120,7 +128,12 @@ pub async fn run() {
     match owner_a
         .protocol
         .secret_store
-        .load_many(SECRET_A_ID, &[b1], SecretKind::SharedKey, MissingPolicy::Fail)
+        .load_many(
+            SECRET_A_ID,
+            &[b1],
+            SecretKind::SharedKey,
+            MissingPolicy::Fail,
+        )
         .await
     {
         Ok(v) => panic!(
@@ -131,13 +144,9 @@ pub async fn run() {
             assert_eq!(kind, SecretKind::SharedKey);
             assert_eq!(channel_ids, vec![b1.0]);
         }
-        Err(other) => panic!(
-            "unexpected error variant for cross-secret load_many: {other:?}"
-        ),
+        Err(other) => panic!("unexpected error variant for cross-secret load_many: {other:?}"),
     }
-    println!(
-        "  SecretStore::load_many(MissingPolicy::Fail) reports partitioned miss  ✓"
-    );
+    println!("  SecretStore::load_many(MissingPolicy::Fail) reports partitioned miss  ✓");
 
     protect_secret(
         &mut owner_a,
@@ -165,12 +174,20 @@ pub async fn run() {
     assert_eq!(count_user_secrets(&shared_db.connection(), SECRET_B_ID), 1);
     assert_eq!(count_shares(&shared_db.connection(), SECRET_A_ID), 2);
     assert_eq!(count_shares(&shared_db.connection(), SECRET_B_ID), 2);
-    println!(
-        "  publish into both secrets: each has 1 user_secret + 2 owner-side share rows  ✓"
-    );
+    println!("  publish into both secrets: each has 1 user_secret + 2 owner-side share rows  ✓");
 
-    let lv_a = owner_a.protocol.share_store.latest_version(SECRET_A_ID).await.unwrap();
-    let lv_b = owner_b.protocol.share_store.latest_version(SECRET_B_ID).await.unwrap();
+    let lv_a = owner_a
+        .protocol
+        .share_store
+        .latest_version(SECRET_A_ID)
+        .await
+        .unwrap();
+    let lv_b = owner_b
+        .protocol
+        .share_store
+        .latest_version(SECRET_B_ID)
+        .await
+        .unwrap();
     assert_eq!(lv_a, Some(1));
     assert_eq!(lv_b, Some(1));
     let cross = owner_a
@@ -193,7 +210,12 @@ pub async fn run() {
         .remove(SECRET_A_ID)
         .await
         .unwrap();
-    let secret_a_channels = owner_a.protocol.channel_store.channels(SECRET_A_ID).await.unwrap();
+    let secret_a_channels = owner_a
+        .protocol
+        .channel_store
+        .channels(SECRET_A_ID)
+        .await
+        .unwrap();
     for c in &secret_a_channels {
         owner_a
             .protocol

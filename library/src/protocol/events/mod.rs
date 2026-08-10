@@ -810,6 +810,19 @@ pub enum DeRecEvent {
         error: String,
     },
 
+    /// An unpair request could not be dispatched to `channel_id`.
+    ///
+    /// Emitted by [`super::DeRecProtocol::restore`] when tearing down the
+    /// ephemeral recovery channels. The teardown is fire-and-forget, so
+    /// the peer's reachability was never load-bearing: local state is
+    /// dropped anyway and a [`Self::Unpaired`] for the same channel
+    /// follows. The pair reports "the channel is gone locally, but the
+    /// peer was not told" — the application may notify it out-of-band.
+    UnpairFailed {
+        channel_id: ChannelId,
+        error: String,
+    },
+
     /// An unpair request was dispatched to `channel_id`. Followed by
     /// [`Self::Unpaired`] once the peer acknowledges (or, under
     /// [`UnpairAck::NotRequired`], emitted in the same event vec

@@ -19,11 +19,7 @@ pub async fn run() {
     let helper_db = Database::open_isolated().await;
 
     let mut owner = Peer::new(owner_db.client(), "Owner", "https://owner.example.com");
-    let mut helper = Peer::new(
-        helper_db.client(),
-        "Helper",
-        "https://helper.example.com",
-    );
+    let mut helper = Peer::new(helper_db.client(), "Helper", "https://helper.example.com");
 
     let final_id = pair_owner_helper(&mut owner, &mut helper, ChannelId(1)).await;
     println!("  Owner↔Helper paired on ChannelId({})", final_id.0);
@@ -122,9 +118,7 @@ pub async fn run() {
         group, expected,
         "channel-link graph must be undirected and transitive"
     );
-    println!(
-        "  link_channel: undirected + idempotent + transitive (a—b—c → {{a,b,c}})  ✓"
-    );
+    println!("  link_channel: undirected + idempotent + transitive (a—b—c → {{a,b,c}})  ✓");
 
     println!("✓ Pairing flow passed.\n");
 }

@@ -594,7 +594,10 @@ mod tests {
         let (mlkem, ecies, nonce, channel_id) = ref_inputs();
         let base = contact_binding_hash(mlkem, ecies, nonce, channel_id);
         let perturbed = contact_binding_hash(b"different_mlkem_key", ecies, nonce, channel_id);
-        assert_ne!(base, perturbed, "changing the mlkem key must change the hash");
+        assert_ne!(
+            base, perturbed,
+            "changing the mlkem key must change the hash"
+        );
     }
 
     #[test]
@@ -602,7 +605,10 @@ mod tests {
         let (mlkem, ecies, nonce, channel_id) = ref_inputs();
         let base = contact_binding_hash(mlkem, ecies, nonce, channel_id);
         let perturbed = contact_binding_hash(mlkem, b"different_ecies_key", nonce, channel_id);
-        assert_ne!(base, perturbed, "changing the ecies key must change the hash");
+        assert_ne!(
+            base, perturbed,
+            "changing the ecies key must change the hash"
+        );
     }
 
     #[test]
@@ -618,7 +624,10 @@ mod tests {
         let (mlkem, ecies, nonce, channel_id) = ref_inputs();
         let base = contact_binding_hash(mlkem, ecies, nonce, channel_id);
         let perturbed = contact_binding_hash(mlkem, ecies, nonce, channel_id.wrapping_add(1));
-        assert_ne!(base, perturbed, "changing the channel_id must change the hash");
+        assert_ne!(
+            base, perturbed,
+            "changing the channel_id must change the hash"
+        );
     }
 
     /// Field order matters: swapping the mlkem and ecies key positions must

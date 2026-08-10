@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-use derec_library::protocol::events::DeRecEvent;
-use derec_library::protocol::types::UserSecret;
 use derec_library::protocol::DeRecShareStore;
 use derec_library::protocol::DeRecUserSecretStore;
+use derec_library::protocol::events::DeRecEvent;
+use derec_library::protocol::types::UserSecret;
 use derec_library::types::ChannelId;
 
 use crate::db::Database;
@@ -34,7 +34,10 @@ pub async fn run() {
 
     let cid_a = pair_owner_helper(&mut owner, &mut helper_a, ChannelId(1)).await;
     let cid_b = pair_owner_helper(&mut owner, &mut helper_b, ChannelId(2)).await;
-    println!("  paired Owner↔HelperA({}), Owner↔HelperB({})", cid_a.0, cid_b.0);
+    println!(
+        "  paired Owner↔HelperA({}), Owner↔HelperB({})",
+        cid_a.0, cid_b.0
+    );
 
     let payload = b"postgres-shared-secret".to_vec();
     let events = protect_secret(
@@ -92,7 +95,11 @@ pub async fn run() {
             .load(DEFAULT_TEST_SECRET_ID, ChannelId(channel_id), &[])
             .await
             .expect("share load failed");
-        assert_eq!(shares.len(), 1, "{name}: load must return the one stored share");
+        assert_eq!(
+            shares.len(),
+            1,
+            "{name}: load must return the one stored share"
+        );
         assert_eq!(
             shares[0].secret_id, DEFAULT_TEST_SECRET_ID,
             "{name}: Share.secret_id must equal the partition key"

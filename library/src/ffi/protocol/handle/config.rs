@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use super::DeRecProtocolHandle;
 use crate::ffi::error::{
-    ffi_error, success, DeRecError, DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_NULL_PTR,
+    DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_NULL_PTR, DeRecError, ffi_error, success,
 };
 
 /// Replace this node's local `communication_info` map. Does not contact

@@ -17,9 +17,10 @@ pub fn decode_channel(bytes: &[u8]) -> Channel {
 pub fn encode_secret_value(value: &SecretValue) -> Vec<u8> {
     let (tag, payload) = match value {
         SecretValue::SharedKey(key) => (SecretKind::SharedKey as u8, key.to_vec()),
-        SecretValue::PairingSecret(material) => {
-            (SecretKind::PairingSecret as u8, material.as_bytes().to_vec())
-        }
+        SecretValue::PairingSecret(material) => (
+            SecretKind::PairingSecret as u8,
+            material.as_bytes().to_vec(),
+        ),
         SecretValue::PairingContact(contact) => {
             (SecretKind::PairingContact as u8, contact.encode_to_vec())
         }
@@ -47,8 +48,8 @@ pub fn decode_secret_value(bytes: &[u8]) -> SecretValue {
             SecretValue::PairingSecret(PairingKeyMaterial::from_bytes(payload.to_vec()))
         }
         t if t == SecretKind::PairingContact as u8 => {
-            let contact = ContactMessage::decode(payload)
-                .expect("failed to prost-decode ContactMessage");
+            let contact =
+                ContactMessage::decode(payload).expect("failed to prost-decode ContactMessage");
             SecretValue::PairingContact(contact)
         }
         other => panic!("unknown SecretValue tag byte: {other}"),

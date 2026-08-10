@@ -55,14 +55,7 @@ pub(in crate::protocol) async fn handle<Sh: DeRecShareStore, St: DeRecStateStore
             on_request(channel_id, request, shared_key, inbound_trace_id)
         }
         MessageBody::VerifyShareResponse(response) => {
-            on_response(
-                share_store,
-                state_store,
-                secret_id,
-                channel_id,
-                &response,
-            )
-            .await
+            on_response(share_store, state_store, secret_id, channel_id, &response).await
         }
         _ => Err(Error::Invariant(
             "unexpected MessageBody variant in verification handler",
@@ -393,11 +386,7 @@ async fn on_response<Sh: DeRecShareStore, St: DeRecStateStore>(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn dispatch_one<
-    Ch: DeRecChannelStore,
-    T: DeRecTransport,
-    St: DeRecStateStore,
->(
+async fn dispatch_one<Ch: DeRecChannelStore, T: DeRecTransport, St: DeRecStateStore>(
     channel_store: &mut Ch,
     transport: &T,
     state_store: &mut St,
@@ -408,8 +397,13 @@ async fn dispatch_one<
     reply_to: Option<derec_proto::TransportProtocol>,
 ) -> Result<()> {
     let endpoint = peer_endpoint(channel_store, secret_id, channel_id).await?;
-    let msg =
-        produce_verify_share_request_message(channel_id, secret_id, version, shared_key, reply_to.clone())?;
+    let msg = produce_verify_share_request_message(
+        channel_id,
+        secret_id,
+        version,
+        shared_key,
+        reply_to.clone(),
+    )?;
 
     state_store
         .save(

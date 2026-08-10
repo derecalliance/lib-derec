@@ -199,11 +199,7 @@ pub trait DeRecChannelStore {
 
     /// Remove the channel for `(secret_id, channel_id)`. Returns `true`
     /// when an entry was removed, `false` when none existed.
-    fn remove(
-        &mut self,
-        secret_id: u64,
-        channel_id: ChannelId,
-    ) -> ChannelStoreFuture<'_, bool>;
+    fn remove(&mut self, secret_id: u64, channel_id: ChannelId) -> ChannelStoreFuture<'_, bool>;
 
     /// Return every channel stored under `secret_id`. Used by the
     /// protocol to enumerate paired peers when building the secret
@@ -343,11 +339,8 @@ pub trait DeRecShareStore {
 
     /// Drop every share stored under `(secret_id, channel_id)`. Used
     /// when an unpair flow tears down a channel. Idempotent.
-    fn remove_channel(
-        &mut self,
-        secret_id: u64,
-        channel_id: ChannelId,
-    ) -> ShareStoreFuture<'_, ()>;
+    fn remove_channel(&mut self, secret_id: u64, channel_id: ChannelId)
+    -> ShareStoreFuture<'_, ()>;
 }
 
 /// Storage for the user-facing secret contents, keyed by `secret_id`.
@@ -378,11 +371,7 @@ pub trait DeRecUserSecretStore {
     /// Persist `value` as the latest entry for `secret_id`, overwriting
     /// any prior entry. The store keeps only the latest snapshot — older
     /// versions are recoverable via the helper share quorum if needed.
-    fn save_latest(
-        &mut self,
-        secret_id: u64,
-        value: UserSecrets,
-    ) -> ShareStoreFuture<'_, ()>;
+    fn save_latest(&mut self, secret_id: u64, value: UserSecrets) -> ShareStoreFuture<'_, ()>;
 
     /// Drop the entry for `secret_id`. Idempotent: removing a
     /// non-existent entry is `Ok(())`.

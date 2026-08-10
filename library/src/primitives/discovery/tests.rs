@@ -236,10 +236,7 @@ fn test_produce_extract_discovery_response_roundtrip() {
     let channel_id = ChannelId(1);
     let shared_key = make_shared_key(1);
 
-    let secret_list = vec![
-        entry(1, &[(1, "v1"), (2, "v2")]),
-        entry(2, &[(3, "v3")]),
-    ];
+    let secret_list = vec![entry(1, &[(1, "v1"), (2, "v2")]), entry(2, &[(3, "v3")])];
 
     let ProduceResponseResult { envelope } =
         produce_discovery_response(channel_id, &secret_list, &shared_key)
@@ -421,7 +418,8 @@ fn test_full_discovery_roundtrip() {
     // Owner → Helper: produce discovery request
     let ProduceRequestResult {
         envelope: request_envelope,
-    } = produce_discovery_request(channel_id, &shared_key, None).expect("produce request should succeed");
+    } = produce_discovery_request(channel_id, &shared_key, None)
+        .expect("produce request should succeed");
 
     // Helper: extract discovery request
     let ExtractRequestResult { request } =
@@ -433,11 +431,14 @@ fn test_full_discovery_roundtrip() {
     // Helper → Owner: produce discovery response
     let secret_list = vec![
         entry(100, &[(1, "My main wallet")]),
-        entry(200, &[
-            (1, "Work SSH key"),
-            (2, "Work SSH key v2"),
-            (3, "Work SSH key v3"),
-        ]),
+        entry(
+            200,
+            &[
+                (1, "Work SSH key"),
+                (2, "Work SSH key v2"),
+                (3, "Work SSH key v3"),
+            ],
+        ),
     ];
 
     let ProduceResponseResult {

@@ -220,9 +220,9 @@ impl MessageBody {
             "PrePairRequestMessage" => {
                 MessageBody::PrePairRequest(PrePairRequestMessage::decode(any.value.as_slice())?)
             }
-            "PrePairResponseMessage" => MessageBody::PrePairResponse(
-                PrePairResponseMessage::decode(any.value.as_slice())?,
-            ),
+            "PrePairResponseMessage" => {
+                MessageBody::PrePairResponse(PrePairResponseMessage::decode(any.value.as_slice())?)
+            }
             #[allow(deprecated)]
             unknown => return Err(DecodeError::new(unknown.to_string())),
         };

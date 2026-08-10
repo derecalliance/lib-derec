@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-use derec_library::protocol::{ChannelStoreFuture, DeRecChannelStore};
 use derec_library::protocol::types::Channel;
+use derec_library::protocol::{ChannelStoreFuture, DeRecChannelStore};
 use derec_library::types::ChannelId;
 use std::collections::{HashSet, VecDeque};
 
@@ -50,11 +50,7 @@ impl DeRecChannelStore for SqliteChannelStore {
         Box::pin(std::future::ready(Ok(())))
     }
 
-    fn remove(
-        &mut self,
-        secret_id: u64,
-        channel_id: ChannelId,
-    ) -> ChannelStoreFuture<'_, bool> {
+    fn remove(&mut self, secret_id: u64, channel_id: ChannelId) -> ChannelStoreFuture<'_, bool> {
         let conn = lock(&self.connection);
         let affected = conn
             .execute(

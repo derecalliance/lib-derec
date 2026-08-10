@@ -5,9 +5,7 @@ use derec_library::protocol::DeRecUserSecretStore;
 use derec_library::protocol::ShareStoreFuture;
 use derec_library::protocol::types::UserSecrets;
 
-use crate::codec::{
-    assemble_user_secrets, encode_user_secrets_payload, u64_to_sql,
-};
+use crate::codec::{assemble_user_secrets, encode_user_secrets_payload, u64_to_sql};
 use crate::db::{SharedConnection, lock};
 
 pub struct SqliteUserSecretStore {
@@ -40,11 +38,7 @@ impl DeRecUserSecretStore for SqliteUserSecretStore {
         Box::pin(std::future::ready(Ok(value)))
     }
 
-    fn save_latest(
-        &mut self,
-        secret_id: u64,
-        value: UserSecrets,
-    ) -> ShareStoreFuture<'_, ()> {
+    fn save_latest(&mut self, secret_id: u64, value: UserSecrets) -> ShareStoreFuture<'_, ()> {
         let conn = lock(&self.connection);
         let payload = encode_user_secrets_payload(&value.secrets);
         conn.execute(

@@ -702,8 +702,8 @@ fn test_store_share_request_round_trips_replica_id() {
     )
     .expect("replica-side produce")
     .envelope;
-    let replica_extracted = extract_store_share_request(&replica_env, &shared_key)
-        .expect("replica-side extract");
+    let replica_extracted =
+        extract_store_share_request(&replica_env, &shared_key).expect("replica-side extract");
     assert_eq!(
         replica_extracted.request.replica_id,
         Some(0xCAFE_BABE_DEAD_BEEF)

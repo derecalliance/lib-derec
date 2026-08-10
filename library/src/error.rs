@@ -91,9 +91,7 @@ pub enum Error {
     #[error("internal invariant violated: {0}")]
     Invariant(&'static str),
 
-    #[error(
-        "role mismatch on channel {channel_id:?}: expected {expected:?}, got {actual:?}"
-    )]
+    #[error("role mismatch on channel {channel_id:?}: expected {expected:?}, got {actual:?}")]
     RoleMismatch {
         channel_id: crate::types::ChannelId,
         expected: derec_proto::SenderKind,
@@ -113,7 +111,9 @@ pub enum Error {
     /// replica identity (initiating a replica-mode pairing, handling an
     /// inbound `PairRequest` whose `sender_kind` is `ReplicaSource` or
     /// `ReplicaDestination`, etc.).
-    #[error("replica id not configured: build the protocol with .with_replica_id(..) to enable replica flows")]
+    #[error(
+        "replica id not configured: build the protocol with .with_replica_id(..) to enable replica flows"
+    )]
     ReplicaIdNotConfigured,
 }
 

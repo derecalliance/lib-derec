@@ -112,8 +112,27 @@ pub enum RestoreError {
 /// 5. **Wipe.** Send unpair requests to every channel not at a
 ///    canonical id — the recovery-mode channels minted to drive
 ///    `start(RecoverSecret)` — and drop their local state.
-///    `UnpairAck::NotRequired` is forced so the wipe is synchronous
-///    regardless of the protocol's configured ack mode.
+///
+///    `UnpairAck::NotRequired` is forced here, deliberately, and does
+///    not follow the protocol's configured ack mode. Waiting on an
+///    acknowledgement would keep the ephemeral channels alive for up to
+///    the unpair timeout, and those channels are indistinguishable from
+///    the canonical ones to
+///    [`sharing`](super::sharing) — which selects purely on
+///    `peer_role == Helper && status == Paired` — so a subsequent
+///    `ProtectSecret` would double-send to every helper. The ephemeral
+///    channels must be gone by the time this call returns.
+///
+///    For the same reason the wipe cannot fail the restore. An old
+///    helper that has gone away is the expected condition during
+///    recovery, and the commit in step 4 has already happened —
+///    returning `Err` here would strand the caller with committed
+///    canonical state, un-torn-down ephemeral channels, and
+///    [`RestoreError::AlreadyRestored`] blocking any retry. Instead each
+///    undeliverable teardown surfaces as
+///    [`DeRecEvent::UnpairFailed`] and local state is dropped anyway, so
+///    every wiped channel still yields exactly one
+///    [`DeRecEvent::Unpaired`].
 #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
 #[allow(clippy::too_many_arguments)]
 pub(in crate::protocol) async fn restore<
@@ -166,7 +185,7 @@ pub(in crate::protocol) async fn restore<
         &existing_channels,
         &canonical_ids,
     )
-    .await?;
+    .await;
 
     #[cfg(feature = "logging")]
     tracing::info!(
@@ -354,19 +373,19 @@ async fn unpair_recovery_channels<
     secret_id: u64,
     existing_channels: &[Channel],
     canonical_ids: &HashSet<u64>,
-) -> Result<Vec<DeRecEvent>> {
+) -> Vec<DeRecEvent> {
     let recovery_ids: Vec<ChannelId> = existing_channels
         .iter()
         .filter(|c| !canonical_ids.contains(&c.id.0))
         .map(|c| c.id)
         .collect();
     if recovery_ids.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
     let now = now_secs();
     let mut events = Vec::new();
     for channel_id in recovery_ids {
-        let mut per_channel = super::unpairing::start(
+        match super::unpairing::start(
             channel_store,
             share_store,
             secret_store,
@@ -379,10 +398,30 @@ async fn unpair_recovery_channels<
             now,
             None,
         )
-        .await?;
-        events.append(&mut per_channel);
+        .await
+        {
+            Ok(mut per_channel) => events.append(&mut per_channel),
+            Err(e) => {
+                events.push(DeRecEvent::UnpairFailed {
+                    channel_id,
+                    error: e.to_string(),
+                });
+                if super::unpairing::drop_channel_state(
+                    channel_store,
+                    share_store,
+                    secret_store,
+                    secret_id,
+                    channel_id,
+                )
+                .await
+                .is_ok()
+                {
+                    events.push(DeRecEvent::Unpaired { channel_id });
+                }
+            }
+        }
     }
-    Ok(events)
+    events
 }
 
 #[cfg(test)]
@@ -640,6 +679,95 @@ mod tests {
         });
     }
 
+    /// An old helper that has gone away is the *expected* condition
+    /// during recovery, so a failed teardown must not undo a committed
+    /// restore.
+    #[test]
+    fn restore_succeeds_when_recovery_channel_unpair_cannot_be_delivered() {
+        run_async(async {
+            let secret_id: u64 = 0xDE_2EC;
+            let channel_store = InMemChannelStore::default();
+            let secret_store = InMemSecretStore::default();
+            let share_store = InMemShareStore::default();
+            let user_secret_store = InMemUserSecretStore::default();
+            let mut protocol = DeRecProtocolBuilder::new(secret_id)
+                .with_channel_store(channel_store.clone())
+                .with_share_store(share_store.clone())
+                .with_secret_store(secret_store.clone())
+                .with_user_secret_store(user_secret_store.clone())
+                .with_transport(crate::protocol::test::FailingTransport)
+                .with_state_store(InMemStateStore)
+                .with_own_transport("https://owner.example.com")
+                .with_threshold(2)
+                .build()
+                .expect("test rig builds");
+
+            channel_store.data.lock().unwrap().insert(
+                (secret_id, 99),
+                Channel {
+                    id: ChannelId(99),
+                    transport: TransportProtocol {
+                        uri: "https://gone.example".to_owned(),
+                        protocol: 0,
+                    },
+                    communication_info: HashMap::new(),
+                    status: ChannelStatus::Paired,
+                    created_at: 1,
+                    peer_role: SenderKind::Helper,
+                    replica_id: None,
+                },
+            );
+            secret_store.data.lock().unwrap().insert(
+                (secret_id, 99, SecretKind::SharedKey as u8),
+                SecretValue::SharedKey([0x77; 32]),
+            );
+
+            let events = protocol
+                .restore(&fixture_secret(), 7)
+                .await
+                .expect("an unreachable peer must not fail the restore");
+
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    DeRecEvent::UnpairFailed { channel_id, .. } if *channel_id == ChannelId(99)
+                )),
+                "the undeliverable teardown must be reported, got {events:?}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, DeRecEvent::Unpaired { channel_id } if *channel_id == ChannelId(99))),
+                "local state is dropped regardless, so Unpaired still fires"
+            );
+
+            assert!(
+                channel_store
+                    .load(secret_id, ChannelId(99))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "the ephemeral channel must not survive a failed send"
+            );
+            assert!(
+                user_secret_store
+                    .load_latest(secret_id)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "the recovered snapshot stays committed"
+            );
+            assert!(
+                channel_store
+                    .load(secret_id, ChannelId(11))
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "canonical helper channels stay in place"
+            );
+        });
+    }
+
     // ---------------- Preconditions ----------------
 
     #[test]
@@ -763,7 +891,7 @@ mod tests {
                 .with_secret_store(InMemSecretStore::default())
                 .with_user_secret_store(InMemUserSecretStore::default())
                 .with_transport(NoopTransport)
-            .with_state_store(InMemStateStore)
+                .with_state_store(InMemStateStore)
                 .with_own_transport("https://owner.example.com")
                 .with_threshold(2)
                 .with_replica_id(0x1234)

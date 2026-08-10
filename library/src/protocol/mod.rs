@@ -83,8 +83,7 @@ mod handlers;
 mod test;
 
 use crate::{
-    Error, Result,
-    primitives::pairing::request::create_contact as create_contact_message,
+    Error, Result, primitives::pairing::request::create_contact as create_contact_message,
     types::ChannelId,
 };
 pub use builder::DeRecProtocolBuilder;
@@ -104,7 +103,6 @@ pub use types::{
     ReplicaInfo, ReplicaSecretPayload, Secret, SecretKind, SecretValue, Share, StateItem, StateKey,
     StateKind, Target, UserSecret, UserSecrets,
 };
-
 
 pub use events::{
     AutoAcceptPolicy, DeRecEvent, DeRecFlow, PendingAction, PendingActionKind, UnpairAck,
@@ -240,7 +238,6 @@ impl<
     St: DeRecStateStore,
 > DeRecProtocol<Ch, Sh, Ss, Us, St, T>
 {
-
     /// Construct a [`DeRecProtocol`] directly from its components.
     ///
     /// Prefer [`DeRecProtocolBuilder`] for the type-checked
@@ -371,12 +368,8 @@ impl<
             "creating contact message"
         );
 
-        let result = create_contact_message(
-            channel_id,
-            contact_mode,
-            self.own_transport.clone(),
-            nonce,
-        )?;
+        let result =
+            create_contact_message(channel_id, contact_mode, self.own_transport.clone(), nonce)?;
 
         // Persist the material the eventual `PrePairRequest` /
         // `PairRequest` handler will need to look up:
@@ -810,13 +803,13 @@ impl<
 
         self.update_sharing_round(&mut events).await;
 
-        let auto_publish_events = self
-            .maybe_auto_publish_after_pair(&events)
-            .await
-            .map_err(|source| ProcessError {
-                channel_id: Some(channel_id),
-                source,
-            })?;
+        let auto_publish_events =
+            self.maybe_auto_publish_after_pair(&events)
+                .await
+                .map_err(|source| ProcessError {
+                    channel_id: Some(channel_id),
+                    source,
+                })?;
         events.extend(auto_publish_events);
 
         Ok(events)
@@ -1569,7 +1562,11 @@ impl<
                     if !has_pairing_secret && !has_pairing_contact {
                         return Ok(None);
                     }
-                    let events = handlers::pairing::handle_pre_pair_request(&inner, channel_id, message.trace_id)?;
+                    let events = handlers::pairing::handle_pre_pair_request(
+                        &inner,
+                        channel_id,
+                        message.trace_id,
+                    )?;
                     return Ok(Some(events));
                 }
                 MessageBody::PrePairResponse(resp) => {
