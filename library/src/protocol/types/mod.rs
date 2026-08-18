@@ -53,6 +53,67 @@ pub enum ChannelStatus {
     Paired,
 }
 
+/// Policy governing automatic removal of expired `Pending` channels.
+///
+/// [`crate::protocol::DeRecProtocol::process`] consults this on every
+/// call. It does not affect
+/// [`crate::protocol::DeRecProtocol::remove_expired_channels`], which
+/// always sweeps at the threshold it is given — that is what makes
+/// [`Self::Disabled`] mean "the application drives cleanup itself"
+/// rather than "cleanup never happens".
+///
+/// Configured via
+/// [`crate::protocol::DeRecProtocolBuilder::with_remove_expired_channels`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    any(feature = "serde", target_arch = "wasm32"),
+    derive(Serialize, Deserialize)
+)]
+pub enum ExpiredChannelCleanup {
+    /// No automatic sweep during `process()`. The application drives
+    /// cleanup itself via
+    /// [`crate::protocol::DeRecProtocol::remove_expired_channels`].
+    Disabled,
+    /// `process()` removes `Pending` channels older than this.
+    Enabled { timeout_in_secs: u64 },
+}
+
+impl Default for ExpiredChannelCleanup {
+    fn default() -> Self {
+        Self::Enabled {
+            timeout_in_secs: 300,
+        }
+    }
+}
+
+impl ExpiredChannelCleanup {
+    /// Enable automatic cleanup with the given timeout.
+    ///
+    /// Performs no validation. A zero is clamped to one second by
+    /// [`crate::protocol::DeRecProtocolBuilder::with_remove_expired_channels`],
+    /// the single normalization point.
+    pub fn from_secs(secs: u64) -> Self {
+        Self::Enabled {
+            timeout_in_secs: secs,
+        }
+    }
+
+    /// Build a policy from the flat `(enabled, timeout_in_secs)` pair the
+    /// FFI and WASM layers carry. When `enabled` is `false` the timeout is
+    /// ignored and the result is [`Self::Disabled`].
+    ///
+    /// This is the marshalling seam for the SDKs: they forward both values
+    /// verbatim and this function decides what they mean, so the rule is
+    /// written and tested once rather than in every binding.
+    pub fn new(enabled: bool, timeout_in_secs: u64) -> Self {
+        if enabled {
+            Self::Enabled { timeout_in_secs }
+        } else {
+            Self::Disabled
+        }
+    }
+}
+
 /// A channel — the post-pairing representation of a peer.
 ///
 /// Stored by [`crate::protocol::DeRecChannelStore`] and returned by its
@@ -90,7 +151,9 @@ pub struct Channel {
     /// [`crate::protocol::DeRecEvent::PairingCompleted::peer_communication_info`].
     #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
     pub communication_info: std::collections::HashMap<String, String>,
-    /// Lifecycle status. Messages on `Pending` channels are ignored.
+    /// Lifecycle status. Messages on `Pending` channels are ignored, and
+    /// `Pending` channels are subject to automatic removal — see
+    /// [`ExpiredChannelCleanup`].
     #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
     pub status: ChannelStatus,
     /// Unix timestamp (seconds) when the channel was created.
@@ -634,5 +697,60 @@ mod tests {
         let json = serde_json::to_vec(&material).expect("serialize");
         let decoded: PairingKeyMaterial = serde_json::from_slice(&json).expect("deserialize");
         assert_eq!(material.as_bytes(), decoded.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod expired_channel_cleanup_tests {
+    use super::ExpiredChannelCleanup;
+
+    /// Constructors do not validate — normalization is the builder's job,
+    /// so a zero survives construction intact.
+    #[test]
+    fn from_secs_does_not_clamp() {
+        assert_eq!(
+            ExpiredChannelCleanup::from_secs(0),
+            ExpiredChannelCleanup::Enabled { timeout_in_secs: 0 }
+        );
+    }
+
+    #[test]
+    fn from_secs_preserves_value() {
+        assert_eq!(
+            ExpiredChannelCleanup::from_secs(900),
+            ExpiredChannelCleanup::Enabled {
+                timeout_in_secs: 900
+            }
+        );
+    }
+
+    /// The marshalling seam: a disabled policy discards its timeout here,
+    /// in Rust, so no SDK has to make that decision.
+    #[test]
+    fn new_disabled_discards_timeout() {
+        assert_eq!(
+            ExpiredChannelCleanup::new(false, 900),
+            ExpiredChannelCleanup::Disabled
+        );
+    }
+
+    #[test]
+    fn new_enabled_keeps_timeout() {
+        assert_eq!(
+            ExpiredChannelCleanup::new(true, 900),
+            ExpiredChannelCleanup::Enabled {
+                timeout_in_secs: 900
+            }
+        );
+    }
+
+    #[test]
+    fn default_matches_historical_behaviour() {
+        assert_eq!(
+            ExpiredChannelCleanup::default(),
+            ExpiredChannelCleanup::Enabled {
+                timeout_in_secs: 300
+            }
+        );
     }
 }

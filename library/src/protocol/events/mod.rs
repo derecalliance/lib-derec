@@ -64,6 +64,20 @@ pub enum PendingActionKind {
 ///   party that knows the contact's `nonce` + `channel_id` can elicit
 ///   a key-publish response. Prefer to keep this off unless you
 ///   control both ends of the transport (LAN, integration tests).
+/// - [`Self::store_share`] is the helper's only admission-control point
+///   for inbound shares. The protocol enforces no size, quota or rate
+///   limit of its own, and the negotiated `maxShareSize` from
+///   [`derec_proto::ParameterRange`] is checked for range overlap at
+///   pairing time only — never against an actual share. While this flag
+///   is `false`, the [`DeRecEvent::ActionRequired`] carrying
+///   [`PendingAction::StoreShare`] hands the application the decoded
+///   [`derec_proto::StoreShareRequestMessage`], which is where a size or
+///   quota decision belongs — see
+///   [`super::DeRecProtocol::reject`] for a worked example. Setting it
+///   `true` removes that opportunity entirely: every share from every
+///   paired Owner is stored unconditionally, at whatever size it
+///   arrives. Keep it `false` in any deployment with per-user storage
+///   limits.
 /// - [`Self::unpair`] is destructive — accepting deletes the local
 ///   channel record and any shares/secrets associated with it. The
 ///   [`DeRecEvent::Unpaired`] event still fires (after the deletion),
@@ -78,8 +92,10 @@ pub enum PendingActionKind {
 ///   announced.
 ///
 /// All other fields wrap routine request/response flows and have no
-/// security-sensitive caveats beyond "the caller decided not to gate
-/// them."
+/// caveats beyond "the caller decided not to gate them." Note that this
+/// applies to gating alone: auto-accept never relaxes an invariant the
+/// protocol enforces itself, only the application's opportunity to
+/// refuse.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AutoAcceptPolicy {
     pub pairing: bool,

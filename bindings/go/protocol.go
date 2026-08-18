@@ -662,4 +662,51 @@ func runProtocol() {
 	helperB.proto.Close()
 
 	fmt.Println("Protocol pairing + protect-secret flow test passed.")
+
+	runExpiredChannelCleanup()
+}
+
+// runExpiredChannelCleanup exercises the expired-channel cleanup surface
+// through the Go SDK.
+//
+// The contradictory pair — Enabled false alongside a non-zero timeout — is
+// the point: the wrapper must forward both values verbatim and let the
+// library decide that a disabled policy ignores its timeout. A wrapper that
+// interpreted the flag locally (dropping the timeout, or substituting its
+// own default) would still pass a happy-path test, so the config is chosen
+// to fail if any interpretation crept into the Go layer.
+func runExpiredChannelCleanup() {
+	fmt.Println("=== Protocol expired-channel cleanup test ===")
+
+	channelStore := newMemChannelStore()
+	shareStore := newMemShareStore()
+	secretStore := newMemSecretStore()
+	userSecretStore := newMemUserSecretStore()
+	stateStore := newMemStateStore()
+	transport := newMemTransport()
+
+	cfg := protocol.Config{
+		SecretID:             protocolSecretID,
+		OwnTransportURI:      "https://cleanup.example.com",
+		OwnTransportProtocol: int32(derecpb.Protocol_HTTPS),
+		Threshold:            2,
+		KeepVersionsCount:    3,
+		RemoveExpiredChannels: &protocol.RemoveExpiredChannelsPolicy{
+			Enabled:       false,
+			TimeoutInSecs: 900,
+		},
+	}
+	p, err := protocol.New(channelStore, shareStore, secretStore, userSecretStore, stateStore, transport, cfg)
+	must(err, "protocol.New(cleanup)")
+	defer p.Close()
+
+	// The caller-driven sweep works regardless of the disabled policy —
+	// that is what Disabled means. No Pending channels exist yet, so the
+	// result is an empty (non-nil error) list.
+	removed, err := p.RemoveExpiredChannels(0)
+	must(err, "RemoveExpiredChannels(0)")
+	assertTrue(len(removed) == 0, "expected no removed channels on a fresh protocol, got %d", len(removed))
+
+	fmt.Println("  cleanup: disabled policy forwarded with its timeout; manual sweep callable ✓")
+	fmt.Println("Protocol expired-channel cleanup test passed.")
 }

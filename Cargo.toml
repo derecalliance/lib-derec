@@ -6,8 +6,3 @@ members = [
     "protobufs",
     "bindings/rust",
 ]
-
-[patch.crates-io]
-derec-cryptography = { path = "cryptography" }
-derec-proto = { path = "protobufs" }
-derec-library = { path = "library" }

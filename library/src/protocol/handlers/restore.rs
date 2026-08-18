@@ -209,13 +209,14 @@ async fn check_preconditions<Ch: DeRecChannelStore, Us: DeRecUserSecretStore>(
         return Err(RestoreError::AlreadyRestored.into());
     }
 
-    if let Some(group) = &secret.replicas {
-        if !group.replicas.is_empty() && group.shared_key.len() != 32 {
-            return Err(RestoreError::Invariant(
-                "recovered Secret carries replicas but replicas.shared_key is missing or wrong size",
-            )
-            .into());
-        }
+    if let Some(group) = &secret.replicas
+        && !group.replicas.is_empty()
+        && group.shared_key.len() != 32
+    {
+        return Err(RestoreError::Invariant(
+            "recovered Secret carries replicas but replicas.shared_key is missing or wrong size",
+        )
+        .into());
     }
 
     let canonical_ids: HashSet<u64> = secret

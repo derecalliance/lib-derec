@@ -4,7 +4,10 @@
 package protocol
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
+	"strconv"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -34,6 +37,28 @@ const (
 // surfacing it for the application to accept explicitly. Zero value is
 // "every flow off" (today's behavior: every request surfaces for the
 // application to decide).
+//
+// Per-flow caveats, read before enabling in production:
+//
+//   - Pairing covers standard and replica pairing. Replica pairing
+//     remains Pending until both sides verify fingerprints, so
+//     auto-accept is safe there; standard pairing becomes Paired at once.
+//   - PrePair turns the initiator into a request-amplification oracle —
+//     anyone knowing a HashedKeys contact's nonce can elicit a
+//     key-publish. Keep off unless you control both ends of the transport.
+//   - StoreShare is the helper's only admission-control point for inbound
+//     shares. The protocol enforces no size, quota or rate limit of its
+//     own, and maxShareSize is checked for range overlap at pairing time
+//     only, never against an actual share. While false, ActionRequired
+//     carries the decoded request, so the application can inspect the
+//     share and Reject with StatusEnum_SIZE_LIMIT_EXCEEDED. Setting it
+//     true removes that opportunity entirely: every share from every
+//     paired Owner is stored unconditionally, at whatever size it
+//     arrives. Keep off in any deployment with per-user storage limits.
+//   - Unpair is destructive — accepting deletes the local channel record
+//     before any UI confirmation.
+//   - UpdateChannelInfo silently overwrites the channel record with the
+//     peer's announced transport / communication info.
 type AutoAcceptPolicy struct {
 	Pairing           bool
 	PrePair           bool
@@ -91,6 +116,26 @@ type Config struct {
 	// ReplicaID configures this node's local replica_id, required for
 	// any replica-mode pairing. Default: unset.
 	ReplicaID *uint64
+	// RemoveExpiredChannels configures automatic removal of expired
+	// Pending channels during Process. nil leaves the library's own
+	// default in force.
+	//
+	// Pending covers both an in-flight pairing handshake and a replica
+	// channel awaiting out-of-band fingerprint verification, and one
+	// timeout governs both. Fingerprint verification is paced by a
+	// human, so deployments that pair replicas should raise
+	// TimeoutInSecs, or set Enabled false and call
+	// RemoveExpiredChannels on their own schedule.
+	RemoveExpiredChannels *RemoveExpiredChannelsPolicy
+}
+
+// RemoveExpiredChannelsPolicy configures the automatic expired-channel
+// sweep. Both fields are always forwarded to the library, including when
+// Enabled is false — the library decides that a disabled policy ignores
+// its timeout.
+type RemoveExpiredChannelsPolicy struct {
+	Enabled       bool
+	TimeoutInSecs uint64
 }
 
 // DeRecProtocol is the orchestrator instance bound to a set of
@@ -193,6 +238,12 @@ func New(
 		},
 		ReplicaID: config.ReplicaID,
 	}
+	if config.RemoveExpiredChannels != nil {
+		nativeCfg.RemoveExpiredChannels = &native.RemoveExpiredChannelsPolicy{
+			Enabled:       config.RemoveExpiredChannels.Enabled,
+			TimeoutInSecs: config.RemoveExpiredChannels.TimeoutInSecs,
+		}
+	}
 
 	instance, err := native.NewProtocolInstance(
 		channelStore, secretStore, shareStore, userSecretStore, stateStore, transport,
@@ -244,6 +295,37 @@ func (p *DeRecProtocol) VerifyFingerprint(channelID uint64, fingerprint string) 
 		return false, errors.New("protocol: VerifyFingerprint: protocol is closed")
 	}
 	return p.instance.VerifyFingerprint(channelID, fingerprint)
+}
+
+// RemoveExpiredChannels removes Pending channels older than
+// olderThanSecs, along with their pairing keys, returning the ids
+// removed.
+//
+// Independent of Config.RemoveExpiredChannels — this sweeps at the
+// threshold given even when that policy is disabled. The age comparison
+// is strict, so a channel created within the current second survives
+// even olderThanSecs == 0.
+func (p *DeRecProtocol) RemoveExpiredChannels(olderThanSecs uint64) ([]uint64, error) {
+	if p.closed {
+		return nil, errors.New("protocol: RemoveExpiredChannels: protocol is closed")
+	}
+	raw, err := p.instance.RemoveExpiredChannels(olderThanSecs)
+	if err != nil {
+		return nil, err
+	}
+	var decimal []string
+	if err := json.Unmarshal(raw, &decimal); err != nil {
+		return nil, fmt.Errorf("protocol: RemoveExpiredChannels: decode ids: %w", err)
+	}
+	ids := make([]uint64, 0, len(decimal))
+	for _, s := range decimal {
+		id, err := strconv.ParseUint(s, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("protocol: RemoveExpiredChannels: parse id %q: %w", s, err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
 }
 
 // SetOwnTransport replaces this node's local transport endpoint. Only

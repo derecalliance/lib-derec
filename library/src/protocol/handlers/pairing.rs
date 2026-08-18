@@ -1034,10 +1034,10 @@ async fn reject_start_on_paired_channel<Ch: DeRecChannelStore>(
     secret_id: u64,
     channel_id: ChannelId,
 ) -> Result<()> {
-    if let Some(channel) = channel_store.load(secret_id, channel_id).await? {
-        if channel.status == crate::protocol::types::ChannelStatus::Paired {
-            return Err(Error::ChannelAlreadyPaired { channel_id });
-        }
+    if let Some(channel) = channel_store.load(secret_id, channel_id).await?
+        && channel.status == crate::protocol::types::ChannelStatus::Paired
+    {
+        return Err(Error::ChannelAlreadyPaired { channel_id });
     }
     Ok(())
 }

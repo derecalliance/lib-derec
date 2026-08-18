@@ -254,6 +254,17 @@ internal static class Protocol
         IntPtr handle, ulong channelId, byte[] fingerprintUtf8, out uint outMatched);
 
     [StructLayout(LayoutKind.Sequential)]
+    internal struct DeRecRemovedChannelsResult
+    {
+        public DeRecError Error;
+        public Buffer Channels;
+    }
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern DeRecRemovedChannelsResult derec_protocol_remove_expired_channels(
+        IntPtr handle, ulong olderThanSecs);
+
+    [StructLayout(LayoutKind.Sequential)]
     internal struct DeRecProtocolCreateContactResult
     {
         public DeRecError Error;

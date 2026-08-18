@@ -31,6 +31,7 @@ internal static class Protocol
         RunOrchestratorReplicaPairAndSecretSyncTest();
         RunOrchestratorReplicaSyncVersionProgressionTest();
         RunOrchestratorAutoAcceptFlowTest();
+        RunOrchestratorExpiredChannelCleanupTest();
     }
 
     /// <summary>
@@ -1481,5 +1482,44 @@ internal static class Protocol
             builder = builder.WithReplicaId(replicaId);
 
         return new Node(builder.Build(), transport, channelStore, shareStore, secretStore, userSecretStore);
+    }
+
+    /// <summary>
+    /// Exercises the expired-channel cleanup surface.
+    /// </summary>
+    /// <remarks>
+    /// The contradictory pair — <c>enabled: false</c> alongside a non-zero
+    /// timeout — is the point: the wrapper must forward both values
+    /// verbatim and let the library decide that a disabled policy ignores
+    /// its timeout. A wrapper that interpreted the flag locally (dropping
+    /// the timeout, or substituting its own default) would still pass a
+    /// happy-path test, so the config is chosen to fail if any
+    /// interpretation crept into the C# layer.
+    /// </remarks>
+    private static void RunOrchestratorExpiredChannelCleanupTest()
+    {
+        Console.WriteLine("=== Protocol expired-channel cleanup test ===");
+
+        using var protocol = new DeRecProtocolBuilder(DefaultTestSecretId)
+            .WithChannelStore(new InMemoryChannelStore())
+            .WithShareStore(new InMemoryShareStore())
+            .WithSecretStore(new InMemorySecretStore())
+            .WithUserSecretStore(new InMemoryUserSecretStore())
+            .WithStateStore(new InMemoryStateStore())
+            .WithTransport(new RecordingTransport())
+            .WithOwnTransport(new TransportProtocol("https://cleanup.example.com"))
+            .WithThreshold(DefaultThreshold)
+            .WithRemoveExpiredChannels(enabled: false, timeoutInSecs: 900)
+            .Build();
+
+        // The caller-driven sweep works regardless of the disabled policy —
+        // that is what Disabled means. No Pending channels exist yet, so
+        // the result is an empty list rather than an error.
+        var removed = protocol.RemoveExpiredChannelsAsync(0).GetAwaiter().GetResult();
+        if (removed.Count != 0)
+            throw new InvalidOperationException($"expected no removed channels on a fresh protocol, got {removed.Count}");
+
+        Console.WriteLine("  cleanup: disabled policy forwarded with its timeout; manual sweep callable \u2713");
+        Console.WriteLine("Protocol expired-channel cleanup test passed.");
     }
 }

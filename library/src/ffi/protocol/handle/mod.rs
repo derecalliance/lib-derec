@@ -176,6 +176,7 @@ unsafe fn construct_protocol(
     unpair_ack: crate::protocol::UnpairAck,
     auto_reply_to: bool,
     auto_accept: crate::protocol::AutoAcceptPolicy,
+    expired_channel_cleanup: crate::protocol::ExpiredChannelCleanup,
     replica_id: Option<u64>,
     channel_store_cb: *const ChannelStoreCallbacks,
     secret_store_cb: *const SecretStoreCallbacks,
@@ -232,7 +233,8 @@ unsafe fn construct_protocol(
         .with_auto_respond_on_failure(auto_respond_on_failure)
         .with_unpair_ack(unpair_ack)
         .with_auto_reply_to(auto_reply_to)
-        .with_auto_accept(auto_accept);
+        .with_auto_accept(auto_accept)
+        .with_remove_expired_channels(expired_channel_cleanup);
 
     if let Some(replica_id) = replica_id {
         builder = builder.with_replica_id(replica_id);
@@ -301,6 +303,28 @@ impl From<AutoAcceptConfig> for crate::protocol::AutoAcceptPolicy {
 /// numbers: `u64` values above 2^53 lose precision once round-tripped
 /// through JSON's `f64`-backed number type in common encoders
 /// (including Go's `encoding/json`).
+/// Automatic expired-channel cleanup, as carried in the
+/// [`derec_protocol_new`] config JSON.
+///
+/// Both fields are always transported. Deciding that a disabled policy
+/// ignores its timeout is a protocol decision and happens in
+/// [`crate::protocol::ExpiredChannelCleanup::new`], not here — this shim
+/// only marshals.
+#[derive(serde::Deserialize)]
+struct RemoveExpiredChannelsConfig {
+    enabled: bool,
+    timeout_in_secs: u64,
+}
+
+impl Default for RemoveExpiredChannelsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timeout_in_secs: 300,
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct ProtocolConfig {
     secret_id: String,
@@ -314,6 +338,8 @@ struct ProtocolConfig {
     unpair_ack: i32,
     auto_reply_to: bool,
     auto_accept: AutoAcceptConfig,
+    #[serde(default)]
+    remove_expired_channels: RemoveExpiredChannelsConfig,
     // Absent or `null` means "no replica id".
     #[serde(default)]
     replica_id: Option<String>,
@@ -353,6 +379,7 @@ struct ProtocolConfig {
 ///     "unpair": false,
 ///     "update_channel_info": false
 ///   },
+///   "remove_expired_channels": { "enabled": true, "timeout_in_secs": 300 },
 ///   "replica_id": null
 /// }
 /// ```
@@ -364,6 +391,10 @@ struct ProtocolConfig {
 /// - `own_transport_protocol`: [`derec_proto::Protocol`] discriminant.
 /// - `unpair_ack`: `0` = Required, `1` = NotRequired.
 /// - `auto_accept`: one boolean per flow.
+/// - `remove_expired_channels`: automatic removal of expired `Pending`
+///   channels. Optional — omitted means `{ "enabled": true,
+///   "timeout_in_secs": 300 }`. Both fields are always sent; when
+///   `enabled` is `false` the timeout is ignored by the library.
 /// - `replica_id`: decimal-string `u64`, or absent/`null` for "no
 ///   replica id".
 ///
@@ -469,6 +500,10 @@ pub unsafe extern "C" fn derec_protocol_new(
             unpair_ack_value,
             config.auto_reply_to,
             config.auto_accept.into(),
+            crate::protocol::ExpiredChannelCleanup::new(
+                config.remove_expired_channels.enabled,
+                config.remove_expired_channels.timeout_in_secs,
+            ),
             replica_id,
             channel_store_cb,
             secret_store_cb,

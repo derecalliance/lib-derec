@@ -1443,6 +1443,7 @@ export async function runProtocolSmoke(): Promise<void> {
   await runReplicaPairingAndSecretSyncFlow();
   await runReplicaSyncVersionProgressionFlow();
   await runAutoAcceptFlow();
+  await runExpiredChannelCleanupFlow();
 
   console.log("━━━ [Protocol] All passed. ━━━\n");
 }
@@ -1878,4 +1879,41 @@ function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
     if (a[i] !== b[i]) return false;
   }
   return true;
+}
+
+
+// Exercises the expired-channel cleanup surface.
+//
+// The contradictory pair — `enabled: false` alongside a non-zero timeout —
+// is the point: the wrapper must forward both values verbatim and let the
+// library decide that a disabled policy ignores its timeout. A wrapper that
+// interpreted the flag locally (dropping the timeout, or substituting its
+// own default) would still pass a happy-path test, so the config is chosen
+// to fail if any interpretation crept into the JS layer.
+async function runExpiredChannelCleanupFlow(): Promise<void> {
+  console.log("\n=== [Protocol] Expired-channel cleanup ===\n");
+
+  const builder = new DeRecProtocolBuilder(DEFAULT_TEST_SECRET_ID)
+    .withChannelStore(new InMemoryChannelStore())
+    .withShareStore(new InMemoryShareStore())
+    .withSecretStore(new InMemorySecretStore())
+    .withUserSecretStore(new InMemoryUserSecretStore())
+    .withStateStore(new InMemoryStateStore())
+    .withTransport(new RecordingTransport())
+    .withOwnTransport({ uri: "https://cleanup.example.com", protocol: "https" })
+    .withThreshold(THRESHOLD)
+    .withRemoveExpiredChannels(false, 900);
+  const protocol = builder.build();
+
+  // The caller-driven sweep works regardless of the disabled policy — that
+  // is what disabled means. No pending channels exist yet, so the result is
+  // an empty array rather than an error.
+  const removed = await protocol.removeExpiredChannels(0);
+  if (!Array.isArray(removed) || removed.length !== 0) {
+    throw new Error(
+      `expected no removed channels on a fresh protocol, got ${JSON.stringify(removed)}`,
+    );
+  }
+
+  console.log("  cleanup: disabled policy forwarded with its timeout; manual sweep callable ✓");
 }

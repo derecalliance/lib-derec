@@ -25,6 +25,11 @@ which provides a higher-level API and complete protocol flows.
 > The Rust types in this crate are generated from `.proto` schema files.
 > Changes should be made in the schema definitions rather than editing the generated code directly.
 
+> [!IMPORTANT]
+> Code generation runs in this crate's build script, so the Protocol Buffers
+> compiler (`protoc`) must be installed and on your `PATH` (or located via the
+> `PROTOC` environment variable) to build this crate.
+
 ---
 
 ## Example

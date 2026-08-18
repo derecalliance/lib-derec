@@ -48,6 +48,7 @@ public sealed class DeRecProtocolBuilder
     private bool _autoReplyTo = false;
     private AutoAcceptPolicy _autoAccept = new();
     private ulong? _replicaId = null;
+    private RemoveExpiredChannelsPolicy? _removeExpiredChannels = null;
 
     /// <summary>
     /// Construct a builder bound to a specific secret.
@@ -205,6 +206,25 @@ public sealed class DeRecProtocolBuilder
     }
 
     /// <summary>
+    /// Configure automatic removal of expired <c>Pending</c> channels
+    /// during <see cref="DeRecProtocol.ProcessAsync"/>. Not calling this
+    /// leaves the library's own default in force.
+    /// </summary>
+    /// <remarks>
+    /// Both values are forwarded to the library, including when
+    /// <paramref name="enabled"/> is <c>false</c> — the library decides
+    /// that a disabled policy ignores its timeout. A timeout of <c>0</c>
+    /// is clamped to 1 by the library. See
+    /// <see cref="RemoveExpiredChannelsPolicy"/> for why replica
+    /// deployments usually need a value larger than the default.
+    /// </remarks>
+    public DeRecProtocolBuilder WithRemoveExpiredChannels(bool enabled, ulong timeoutInSecs)
+    {
+        _removeExpiredChannels = new RemoveExpiredChannelsPolicy(enabled, timeoutInSecs);
+        return this;
+    }
+
+    /// <summary>
     /// Finalize the configuration. Throws
     /// <see cref="InvalidOperationException"/> if any of the required
     /// setters was not called.
@@ -240,6 +260,7 @@ public sealed class DeRecProtocolBuilder
             unpairAck: _unpairAck,
             autoReplyTo: _autoReplyTo,
             autoAccept: _autoAccept,
-            replicaId: _replicaId);
+            replicaId: _replicaId,
+            removeExpiredChannels: _removeExpiredChannels);
     }
 }

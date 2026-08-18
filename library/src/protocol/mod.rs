@@ -99,9 +99,9 @@ pub use traits::{
     TransportFuture,
 };
 pub use types::{
-    Channel, ChannelShare, ChannelStatus, HelperInfo, MissingPolicy, PairingKeyMaterial,
-    ReplicaInfo, ReplicaSecretPayload, Secret, SecretKind, SecretValue, Share, StateItem, StateKey,
-    StateKind, Target, UserSecret, UserSecrets,
+    Channel, ChannelShare, ChannelStatus, ExpiredChannelCleanup, HelperInfo, MissingPolicy,
+    PairingKeyMaterial, ReplicaInfo, ReplicaSecretPayload, Secret, SecretKind, SecretValue, Share,
+    StateItem, StateKey, StateKind, Target, UserSecret, UserSecrets,
 };
 
 pub use events::{
@@ -184,6 +184,8 @@ pub struct DeRecProtocol<
     keep_versions_count: usize,
     /// Configured via [`DeRecProtocolBuilder::with_timeout`].
     timeout_in_secs: u64,
+    /// Configured via [`DeRecProtocolBuilder::with_remove_expired_channels`].
+    pub(crate) expired_channel_cleanup: crate::protocol::ExpiredChannelCleanup,
     /// Configured via [`DeRecProtocolBuilder::with_communication_info`].
     pub(crate) communication_info: HashMap<String, String>,
     /// Configured via [`DeRecProtocolBuilder::with_auto_respond_on_failure`].
@@ -289,6 +291,7 @@ impl<
             auto_accept: AutoAcceptPolicy::default(),
             replica_id: None,
             parameter_range: None,
+            expired_channel_cleanup: crate::protocol::ExpiredChannelCleanup::default(),
             secret_id,
         })
     }
@@ -558,6 +561,60 @@ impl<
     /// and memo. The `status` parameter allows the caller to specify the exact
     /// failure reason (e.g. [`StatusEnum::Rejected`], [`StatusEnum::Fail`],
     /// [`StatusEnum::TooFrequent`], etc.).
+    ///
+    /// # Helper-side admission control
+    ///
+    /// This is where a helper enforces its own limits on inbound shares.
+    /// The protocol imposes none of its own: it does not bound share
+    /// size, storage per sharer, or update frequency, and the
+    /// `maxShareSize` negotiated from [`derec_proto::ParameterRange`] is
+    /// only checked for range overlap at pairing time, never against an
+    /// actual share.
+    ///
+    /// [`PendingAction::StoreShare`] carries the already-decrypted,
+    /// already-parsed [`derec_proto::StoreShareRequestMessage`], so the
+    /// application inspects the share without touching wire bytes,
+    /// envelopes or key material:
+    ///
+    /// ```rust,ignore
+    /// for event in protocol.process(&wire_bytes).await? {
+    ///     let DeRecEvent::ActionRequired { action, channel_id } = event else { continue };
+    ///     match &action {
+    ///         PendingAction::StoreShare { request, .. } => {
+    ///             // `channel_id` maps to a user in the application's own
+    ///             // store, so the limit can be per-user, per-plan, or
+    ///             // whatever the deployment needs.
+    ///             let limit = my_app.share_limit_for(channel_id);
+    ///             if request.share.len() > limit {
+    ///                 protocol
+    ///                     .reject(
+    ///                         action,
+    ///                         StatusEnum::SizeLimitExceeded,
+    ///                         &format!("share exceeds the {limit}-byte limit"),
+    ///                     )
+    ///                     .await?;
+    ///             } else {
+    ///                 protocol.accept(action).await?;
+    ///             }
+    ///         }
+    ///         _ => { protocol.accept(action).await?; }
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// The owner receives a `StoreShareResponse` carrying that status and
+    /// memo, surfacing as [`DeRecEvent::ShareRejected`] on its side — so
+    /// the failure is attributable rather than a silent timeout.
+    ///
+    /// [`StatusEnum::SizeLimitExceeded`] is the protocol's designated code
+    /// for this case; [`StatusEnum::TooFrequent`] covers rate limiting and
+    /// [`StatusEnum::Rejected`] a user-declined request.
+    ///
+    /// This gate exists only while
+    /// [`AutoAcceptPolicy::store_share`](crate::protocol::AutoAcceptPolicy::store_share)
+    /// is `false`. Enabling it makes `process()` accept and store every
+    /// inbound share internally, and no `ActionRequired` is emitted to
+    /// reject.
     #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
     pub async fn reject(
         &mut self,
@@ -725,6 +782,18 @@ impl<
     /// 3. Dispatches to the appropriate message handler based on the channel state
     /// 4. Returns the events the application should react to
     ///
+    /// # Expired channel cleanup
+    ///
+    /// Each call first removes `Pending` channels that have exceeded the
+    /// configured
+    /// [`ExpiredChannelCleanup`]
+    /// timeout, along with their pairing keys. Removal is **lazy**: it
+    /// happens only when this function runs, so an idle node retains
+    /// expired channels until the next inbound message arrives. The
+    /// removed ids are discarded on this path — call
+    /// [`remove_expired_channels`](Self::remove_expired_channels)
+    /// directly to observe them.
+    ///
     /// # Security: bounding inbound message size
     ///
     /// This function does **not** enforce an upper bound on `message.len()`,
@@ -763,7 +832,11 @@ impl<
         &mut self,
         message: &[u8],
     ) -> std::result::Result<Vec<DeRecEvent>, ProcessError> {
-        let _ = self.cleanup_expired_channels().await;
+        if let crate::protocol::ExpiredChannelCleanup::Enabled { timeout_in_secs } =
+            self.expired_channel_cleanup
+        {
+            let _ = self.remove_expired_channels(timeout_in_secs).await;
+        }
 
         let mut timeout_events = self.check_sharing_round_timeouts().await;
         let mut unpair_timeout_events = self.check_unpair_timeouts().await;
@@ -1495,15 +1568,15 @@ impl<
             return Ok(None);
         };
 
-        if let Some(channel) = self.channel_store.load(self.secret_id, channel_id).await? {
-            if channel.status == crate::protocol::types::ChannelStatus::Pending {
-                #[cfg(feature = "logging")]
-                tracing::warn!(
-                    channel_id = channel_id.0,
-                    "message ignored — channel is pending fingerprint verification"
-                );
-                return Ok(Some(vec![DeRecEvent::NoOp]));
-            }
+        if let Some(channel) = self.channel_store.load(self.secret_id, channel_id).await?
+            && channel.status == crate::protocol::types::ChannelStatus::Pending
+        {
+            #[cfg(feature = "logging")]
+            tracing::warn!(
+                channel_id = channel_id.0,
+                "message ignored — channel is pending fingerprint verification"
+            );
+            return Ok(Some(vec![DeRecEvent::NoOp]));
         }
 
         let events = handlers::handle(
@@ -1811,14 +1884,36 @@ impl<
         }
     }
 
-    /// Remove pending channels that have exceeded the configured timeout,
-    /// along with their associated pairing keys.
+    /// Remove `Pending` channels older than `older_than_secs`, along with
+    /// their pairing keys. Returns the ids that were removed.
     ///
-    /// Called automatically during [`process`](Self::process), but can also be
-    /// invoked manually by the application.
-    async fn cleanup_expired_channels(&mut self) -> Result<Vec<ChannelId>> {
+    /// This is **independent of**
+    /// [`DeRecProtocolBuilder::with_remove_expired_channels`]: it sweeps at
+    /// the threshold it is given even when the policy is
+    /// [`crate::protocol::ExpiredChannelCleanup::Disabled`]. That is what
+    /// makes `Disabled` mean "the application drives cleanup itself".
+    ///
+    /// `older_than_secs` is not clamped. The minimum-of-one-second rule
+    /// exists to stop the *automatic* sweep from deleting just-started
+    /// pairings on every [`process`](Self::process) call; an explicit call
+    /// is a deliberate act, so `remove_expired_channels(0)` is permitted
+    /// and sweeps the most aggressively the predicate allows.
+    ///
+    /// The comparison is strict — a channel is removed when its age is
+    /// **greater than** `older_than_secs`. Ages are whole seconds, taken
+    /// from `created_at`, so `remove_expired_channels(0)` removes every
+    /// `Pending` channel created in an earlier second but leaves one
+    /// created within the current second.
+    ///
+    /// Called automatically during [`process`](Self::process) when the
+    /// configured policy is
+    /// [`crate::protocol::ExpiredChannelCleanup::Enabled`].
+    pub async fn remove_expired_channels(
+        &mut self,
+        older_than_secs: u64,
+    ) -> Result<Vec<ChannelId>> {
         let now = now_secs();
-        let timeout = self.timeout_in_secs;
+        let timeout = older_than_secs;
         let channels = self.channel_store.channels(self.secret_id).await?;
 
         let mut removed = Vec::new();
@@ -1850,5 +1945,239 @@ impl<
             }
         }
         Ok(removed)
+    }
+}
+
+#[cfg(test)]
+mod expired_channel_sweep_tests {
+    use super::*;
+    use crate::protocol::test::{
+        InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
+        InMemUserSecretStore, NoopTransport, run_async,
+    };
+    use crate::protocol::types::{Channel, ChannelStatus, ExpiredChannelCleanup, SecretValue};
+
+    const SECRET_ID: u64 = 0xC1;
+
+    fn endpoint() -> derec_proto::TransportProtocol {
+        derec_proto::TransportProtocol {
+            uri: "https://peer.example.com".to_owned(),
+            protocol: derec_proto::Protocol::Https as i32,
+        }
+    }
+
+    /// Seed one channel whose `created_at` is `age_secs` in the past.
+    async fn seed(
+        channels: &mut InMemChannelStore,
+        cid: u64,
+        status: ChannelStatus,
+        age_secs: u64,
+    ) {
+        channels
+            .save(
+                SECRET_ID,
+                Channel {
+                    id: ChannelId(cid),
+                    transport: endpoint(),
+                    communication_info: std::collections::HashMap::new(),
+                    status,
+                    created_at: now_secs().saturating_sub(age_secs),
+                    peer_role: derec_proto::SenderKind::ReplicaDestination,
+                    replica_id: Some(7),
+                },
+            )
+            .await
+            .expect("seed channel");
+    }
+
+    fn build(
+        channels: InMemChannelStore,
+        policy: ExpiredChannelCleanup,
+        timeout_in_secs: u64,
+    ) -> DeRecProtocol<
+        InMemChannelStore,
+        InMemShareStore,
+        InMemSecretStore,
+        InMemUserSecretStore,
+        InMemStateStore,
+        NoopTransport,
+    > {
+        DeRecProtocolBuilder::new(SECRET_ID)
+            .with_channel_store(channels)
+            .with_share_store(InMemShareStore::default())
+            .with_secret_store(InMemSecretStore::default())
+            .with_user_secret_store(InMemUserSecretStore::default())
+            .with_transport(NoopTransport)
+            .with_state_store(InMemStateStore)
+            .with_own_transport("https://owner.example.com")
+            .with_threshold(2)
+            .with_timeout(std::time::Duration::from_secs(timeout_in_secs))
+            .with_remove_expired_channels(policy)
+            .build()
+            .expect("test protocol builds")
+    }
+
+    /// The manual sweep honours its own argument, not the configured
+    /// policy — `Disabled` means "I drive this myself", not "off".
+    #[test]
+    fn manual_sweep_works_under_disabled_policy() {
+        run_async(async {
+            let channels = InMemChannelStore::default();
+            let mut seeded = channels.clone();
+            seed(&mut seeded, 1, ChannelStatus::Pending, 600).await;
+
+            let mut protocol = build(channels.clone(), ExpiredChannelCleanup::Disabled, 300);
+            let removed = protocol
+                .remove_expired_channels(60)
+                .await
+                .expect("sweep succeeds");
+
+            assert_eq!(removed, vec![ChannelId(1)]);
+            assert!(channels.data.lock().unwrap().is_empty());
+        });
+    }
+
+    /// `Disabled` suppresses the automatic sweep inside `process()`, so an
+    /// over-age channel survives because nothing swept it.
+    #[test]
+    fn disabled_policy_leaves_channel_for_manual_sweep() {
+        run_async(async {
+            let channels = InMemChannelStore::default();
+            let mut seeded = channels.clone();
+            seed(&mut seeded, 1, ChannelStatus::Pending, 600).await;
+
+            let mut protocol = build(channels.clone(), ExpiredChannelCleanup::Disabled, 300);
+            let _ = protocol.process(&[]).await;
+
+            assert_eq!(channels.data.lock().unwrap().len(), 1);
+        });
+    }
+
+    /// The policy's timeout governs the automatic sweep, not
+    /// `timeout_in_secs` — verified by setting them to different values
+    /// and choosing an age between the two.
+    #[test]
+    fn policy_timeout_governs_not_protocol_timeout() {
+        run_async(async {
+            let channels = InMemChannelStore::default();
+            let mut seeded = channels.clone();
+            seed(&mut seeded, 1, ChannelStatus::Pending, 120).await;
+
+            let mut protocol = build(
+                channels.clone(),
+                ExpiredChannelCleanup::Enabled {
+                    timeout_in_secs: 60,
+                },
+                3600,
+            );
+            let _ = protocol.process(&[]).await;
+
+            assert!(channels.data.lock().unwrap().is_empty());
+        });
+    }
+
+    /// `Paired` channels are never swept, regardless of age.
+    #[test]
+    fn paired_channels_are_never_removed() {
+        run_async(async {
+            let channels = InMemChannelStore::default();
+            let mut seeded = channels.clone();
+            seed(&mut seeded, 1, ChannelStatus::Paired, 99_999).await;
+
+            let mut protocol = build(channels.clone(), ExpiredChannelCleanup::default(), 300);
+            let removed = protocol
+                .remove_expired_channels(1)
+                .await
+                .expect("sweep succeeds");
+
+            assert!(removed.is_empty());
+            assert_eq!(channels.data.lock().unwrap().len(), 1);
+        });
+    }
+
+    /// Removing a channel also drops its pairing material, so a stale
+    /// handshake leaves nothing behind in the secret store.
+    #[test]
+    fn removal_drops_pairing_material() {
+        run_async(async {
+            let channels = InMemChannelStore::default();
+            let secrets = InMemSecretStore::default();
+            let mut seeded = channels.clone();
+            let mut seeded_secrets = secrets.clone();
+            seed(&mut seeded, 1, ChannelStatus::Pending, 600).await;
+            seeded_secrets
+                .save(
+                    SECRET_ID,
+                    ChannelId(1),
+                    SecretValue::PairingContact(Default::default()),
+                )
+                .await
+                .expect("seed pairing contact");
+
+            let mut protocol = DeRecProtocolBuilder::new(SECRET_ID)
+                .with_channel_store(channels.clone())
+                .with_share_store(InMemShareStore::default())
+                .with_secret_store(secrets.clone())
+                .with_user_secret_store(InMemUserSecretStore::default())
+                .with_transport(NoopTransport)
+                .with_state_store(InMemStateStore)
+                .with_own_transport("https://owner.example.com")
+                .with_threshold(2)
+                .with_remove_expired_channels(ExpiredChannelCleanup::Disabled)
+                .build()
+                .expect("test protocol builds");
+
+            let removed = protocol
+                .remove_expired_channels(60)
+                .await
+                .expect("sweep succeeds");
+
+            assert_eq!(removed, vec![ChannelId(1)]);
+            assert!(secrets.data.lock().unwrap().is_empty());
+        });
+    }
+
+    /// An explicit zero is not clamped — the minimum-of-1 rule guards the
+    /// automatic sweep only. A `Pending` channel from an earlier second
+    /// goes; the `Paired` one stays.
+    #[test]
+    fn explicit_zero_sweeps_pending_from_earlier_seconds() {
+        run_async(async {
+            let channels = InMemChannelStore::default();
+            let mut seeded = channels.clone();
+            seed(&mut seeded, 1, ChannelStatus::Pending, 1).await;
+            seed(&mut seeded, 2, ChannelStatus::Paired, 1).await;
+
+            let mut protocol = build(channels.clone(), ExpiredChannelCleanup::Disabled, 300);
+            let removed = protocol
+                .remove_expired_channels(0)
+                .await
+                .expect("sweep succeeds");
+
+            assert_eq!(removed, vec![ChannelId(1)]);
+            assert_eq!(channels.data.lock().unwrap().len(), 1);
+        });
+    }
+
+    /// The comparison is strict, so a channel created within the current
+    /// second survives even the most aggressive threshold. This pins the
+    /// boundary the automatic sweep relies on to avoid deleting pairings
+    /// the instant they start.
+    #[test]
+    fn zero_age_channel_survives_zero_threshold() {
+        run_async(async {
+            let channels = InMemChannelStore::default();
+            let mut seeded = channels.clone();
+            seed(&mut seeded, 1, ChannelStatus::Pending, 0).await;
+
+            let mut protocol = build(channels.clone(), ExpiredChannelCleanup::Disabled, 300);
+            let removed = protocol
+                .remove_expired_channels(0)
+                .await
+                .expect("sweep succeeds");
+
+            assert!(removed.is_empty());
+            assert_eq!(channels.data.lock().unwrap().len(), 1);
+        });
     }
 }

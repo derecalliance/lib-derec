@@ -136,6 +136,10 @@ pub struct DeRecProtocolBuilderWasm {
     keep_versions_count: u32,
     communication_info: HashMap<String, String>,
     timeout_in_secs: u32,
+    /// `None` until `withRemoveExpiredChannels` is called, so an
+    /// unconfigured builder leaves the library's own default in force
+    /// rather than restating it here.
+    remove_expired_channels: Option<(bool, u32)>,
     auto_respond_on_failure: bool,
     unpair_ack: UnpairAck,
     auto_reply_to: bool,
@@ -167,6 +171,7 @@ impl DeRecProtocolBuilderWasm {
             keep_versions_count: 3,
             communication_info: HashMap::new(),
             timeout_in_secs: 300,
+            remove_expired_channels: None,
             auto_respond_on_failure: false,
             unpair_ack: UnpairAck::Required,
             auto_reply_to: false,
@@ -260,6 +265,24 @@ impl DeRecProtocolBuilderWasm {
     #[wasm_bindgen(js_name = withTimeout)]
     pub fn with_timeout(mut self, timeout_in_secs: u32) -> DeRecProtocolBuilderWasm {
         self.timeout_in_secs = timeout_in_secs.max(1);
+        self
+    }
+
+    /// Configure automatic removal of expired `Pending` channels during
+    /// `process()`.
+    ///
+    /// Both arguments are always forwarded to the library. When `enabled`
+    /// is `false` the library ignores `timeout_in_secs`; that decision is
+    /// not made here. A timeout of `0` is clamped to 1 by the library.
+    ///
+    /// Not calling this leaves the library's default in force.
+    #[wasm_bindgen(js_name = withRemoveExpiredChannels)]
+    pub fn with_remove_expired_channels(
+        mut self,
+        enabled: bool,
+        timeout_in_secs: u32,
+    ) -> DeRecProtocolBuilderWasm {
+        self.remove_expired_channels = Some((enabled, timeout_in_secs));
         self
     }
 
@@ -468,6 +491,11 @@ impl DeRecProtocolBuilderWasm {
             .with_unpair_ack(self.unpair_ack)
             .with_auto_reply_to(self.auto_reply_to)
             .with_auto_accept(self.auto_accept);
+        if let Some((enabled, timeout_in_secs)) = self.remove_expired_channels {
+            builder = builder.with_remove_expired_channels(
+                crate::protocol::ExpiredChannelCleanup::new(enabled, u64::from(timeout_in_secs)),
+            );
+        }
         if let Some(id) = self.replica_id {
             builder = builder.with_replica_id(id);
         }
@@ -656,6 +684,32 @@ impl DeRecProtocolWasm {
             .verify_fingerprint(ChannelId(id), &fingerprint)
             .await
             .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
+    }
+
+    /// Remove `Pending` channels older than `older_than_secs`, along with
+    /// their pairing keys.
+    ///
+    /// Independent of the configured cleanup policy — it sweeps at the
+    /// threshold given, even when the policy is disabled. The age
+    /// comparison is strict, so a channel created within the current
+    /// second survives even `0`.
+    ///
+    /// # Returns
+    ///
+    /// An `Array` of removed channel ids as decimal strings.
+    #[wasm_bindgen(js_name = removeExpiredChannels)]
+    pub async fn remove_expired_channels(
+        &mut self,
+        older_than_secs: u32,
+    ) -> Result<JsValue, JsValue> {
+        let ids = self
+            .inner
+            .remove_expired_channels(u64::from(older_than_secs))
+            .await
+            .map_err(|e| js_error("DEREC_ERROR", e.to_string()))?;
+        let decimal: Vec<String> = ids.iter().map(|c| c.0.to_string()).collect();
+        serde_wasm_bindgen::to_value(&decimal)
+            .map_err(|e| js_error("WASM_SERIALIZE_ERROR", e.to_string()))
     }
 
     /// Accept a pending action from an `ActionRequired` event.

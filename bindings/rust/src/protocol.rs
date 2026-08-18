@@ -8,8 +8,8 @@ use derec_library::protocol::types::{Channel, Target, UserSecret, UserSecrets};
 use derec_library::protocol::{
     ChannelStoreFuture, DeRecChannelStore, DeRecEvent, DeRecFlow, DeRecProtocol,
     DeRecProtocolBuilder, DeRecSecretStore, DeRecShareStore, DeRecTransport, DeRecUserSecretStore,
-    MissingPolicy, SecretKind, SecretStoreError, SecretStoreFuture, SecretValue, Share,
-    ShareStoreFuture, TransportFuture,
+    ExpiredChannelCleanup, MissingPolicy, SecretKind, SecretStoreError, SecretStoreFuture,
+    SecretValue, Share, ShareStoreFuture, TransportFuture,
 };
 use derec_library::types::ChannelId;
 use derec_proto::{Protocol, SenderKind, TransportProtocol};
@@ -37,6 +37,7 @@ pub async fn run_all() {
     run_auto_accept_flow().await;
     run_start_pairing_rejects_already_paired_channel().await;
     run_pairing_rejects_incompatible_parameter_range().await;
+    run_expired_channel_cleanup_flow().await;
 }
 
 /// Stores paired channels plus the channel-link graph (channels belonging to
@@ -519,6 +520,37 @@ impl Peer {
         replica_id: u64,
     ) -> Self {
         Self::with_options(label, uri, 2, false, Some(replica_id), secret_id)
+    }
+
+    /// Build a replica-capable peer with an explicit expired-channel
+    /// cleanup policy, so a test can assert the automatic sweep is
+    /// suppressed independently of the caller-driven one.
+    fn with_expired_channel_cleanup(
+        label: &'static str,
+        uri: &str,
+        replica_id: u64,
+        policy: ExpiredChannelCleanup,
+    ) -> Self {
+        let transport = InProcessTransport::new();
+        let protocol = DeRecProtocolBuilder::new(DEFAULT_TEST_SECRET_ID)
+            .with_channel_store(InMemoryChannelStore::default())
+            .with_share_store(InMemoryShareStore::default())
+            .with_secret_store(InMemorySecretStore::default())
+            .with_user_secret_store(InMemoryUserSecretStore::default())
+            .with_transport(transport.clone())
+            .with_state_store(InMemoryStateStore::default())
+            .with_own_transport(uri)
+            .with_threshold(2)
+            .with_replica_id(replica_id)
+            .with_remove_expired_channels(policy)
+            .build()
+            .expect("test fixture: builder.build() should succeed");
+        Self {
+            label,
+            uri: uri.to_owned(),
+            protocol,
+            transport,
+        }
     }
 
     fn with_options(
@@ -3671,4 +3703,57 @@ async fn run_pairing_rejects_incompatible_parameter_range() {
     );
 
     println!("Protocol pairing rejects incompatible parameter range test passed.");
+}
+
+/// Expired-channel cleanup: the policy governs the automatic sweep inside
+/// `process`, while `remove_expired_channels` is driven by the caller and
+/// ignores the policy entirely.
+///
+/// Replica pairing is the scenario that motivates the option — both sides
+/// sit in `Pending` until an out-of-band fingerprint comparison, which is
+/// paced by a human rather than the protocol.
+async fn run_expired_channel_cleanup_flow() {
+    let mut owner = Peer::with_expired_channel_cleanup(
+        "owner",
+        "https://owner.example.com",
+        11,
+        ExpiredChannelCleanup::Disabled,
+    );
+    let mut replica = Peer::with_expired_channel_cleanup(
+        "replica",
+        "https://replica.example.com",
+        12,
+        ExpiredChannelCleanup::Disabled,
+    );
+
+    let channel_id = pair_replica_handshake(&mut owner, &mut replica, ChannelId(0xEC_0001)).await;
+
+    // Both ends are Pending until fingerprints are compared. With the
+    // policy disabled nothing sweeps them, however much traffic arrives.
+    let owner_removed = owner
+        .protocol
+        .remove_expired_channels(0)
+        .await
+        .expect("owner remove_expired_channels");
+    assert!(
+        owner_removed.is_empty(),
+        "a channel created in the current second survives the strict `>` boundary"
+    );
+
+    // Still usable afterwards: the fingerprint round-trip completes, which
+    // it could not do had the sweep dropped the channel or its keys.
+    cross_confirm_fingerprint(&mut owner, &mut replica, channel_id).await;
+
+    // Paired channels are never swept, at any threshold.
+    let after_pairing = owner
+        .protocol
+        .remove_expired_channels(0)
+        .await
+        .expect("owner remove_expired_channels after verification");
+    assert!(
+        after_pairing.is_empty(),
+        "Paired channels are out of scope for the sweep"
+    );
+
+    println!("  ✓ expired channel cleanup: policy and manual sweep are independent");
 }

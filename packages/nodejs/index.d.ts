@@ -464,6 +464,16 @@ export type DeRecEvent =
  *   oracle. Anyone who knows a HashedKeys contact's nonce can elicit a
  *   key-publish response. Keep off unless you control both ends of
  *   the transport.
+ * - `storeShare` — the helper's only admission-control point for
+ *   inbound shares. The protocol enforces no size, quota or rate limit
+ *   of its own, and `maxShareSize` is checked for range overlap at
+ *   pairing time only, never against an actual share. While this is
+ *   `false`, `ActionRequired` carries the decoded request, so the
+ *   application can inspect the share and call `reject()` with
+ *   `StatusEnum.SizeLimitExceeded`. Setting it `true` removes that
+ *   opportunity entirely: every share from every paired Owner is stored
+ *   unconditionally, at whatever size it arrives. Keep off in any
+ *   deployment with per-user storage limits.
  * - `unpair` — destructive. Accepting deletes the local channel
  *   record before any UI confirmation.
  * - `updateChannelInfo` — silently overwrites the channel record with
@@ -541,6 +551,23 @@ export declare class DeRecProtocolBuilder {
    * stable across restarts. Default: unset.
    */
   withReplicaId(id: bigint | number): DeRecProtocolBuilder;
+  /**
+   * Automatic removal of expired `Pending` channels during `process()`.
+   *
+   * Both arguments are always forwarded to the library. When `enabled` is
+   * `false` the library ignores `timeoutInSecs`; that decision is not made
+   * in this binding. A timeout of `0` is clamped to 1 by the library.
+   *
+   * `Pending` covers both an in-flight pairing handshake and a replica
+   * channel awaiting out-of-band fingerprint verification, and one timeout
+   * governs both. Fingerprint verification is paced by a human, so
+   * deployments that pair replicas should raise the timeout, or disable it
+   * and call {@link DeRecProtocol.removeExpiredChannels} on their own
+   * schedule.
+   *
+   * Not calling this leaves the library's default in force.
+   */
+  withRemoveExpiredChannels(enabled: boolean, timeoutInSecs: number): DeRecProtocolBuilder;
 
   /**
    * Finalize the configuration. Throws if any of the required setters
@@ -628,6 +655,16 @@ export declare class DeRecProtocol {
    * `true` on confirmation, `false` on mismatch.
    */
   verifyFingerprint(channelId: bigint | number, fingerprint: string): Promise<boolean>;
+  /**
+   * Remove `Pending` channels older than `olderThanSecs`, along with their
+   * pairing keys. Resolves to the removed channel ids as decimal strings.
+   *
+   * Independent of the configured cleanup policy — this sweeps at the
+   * threshold given even when that policy is disabled. The age comparison
+   * is strict, so a channel created within the current second survives
+   * even `0`.
+   */
+  removeExpiredChannels(olderThanSecs: number): Promise<string[]>;
 
   /**
    * Rebuild this protocol's `secret_id` namespace from a recovered

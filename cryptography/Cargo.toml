@@ -2,6 +2,7 @@
 name = "derec-cryptography"
 version = "0.0.1-alpha.10"
 edition = "2024"
+rust-version = "1.88"
 license = "Apache-2.0"
 description = "Cryptographic primitives used by the DeRec protocol implementation."
 repository = "https://github.com/derecalliance/lib-derec"
@@ -9,6 +10,13 @@ documentation = "https://derec-alliance.gitbook.io/docs/sdk/rust"
 homepage = "https://derec.org"
 readme = "README.md"
 keywords = ["derec", "decentralized", "cryptography", "secret-sharing", "recovery"]
+
+include = [
+  "/src/**",
+  "/Cargo.toml",
+  "/README.md",
+  "/LICENSE",
+]
 
 [features]
 logging = ["dep:tracing"]

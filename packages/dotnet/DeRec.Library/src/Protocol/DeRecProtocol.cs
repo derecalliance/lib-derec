@@ -101,7 +101,8 @@ public sealed class DeRecProtocol : IDisposable
         UnpairAck unpairAck = UnpairAck.Required,
         bool autoReplyTo = false,
         AutoAcceptPolicy? autoAccept = null,
-        ulong? replicaId = null)
+        ulong? replicaId = null,
+        RemoveExpiredChannelsPolicy? removeExpiredChannels = null)
     {
         SecretId = secretId;
         _channelStore = channelStore;
@@ -227,6 +228,11 @@ public sealed class DeRecProtocol : IDisposable
                 GetShare: policy.GetShare,
                 Unpair: policy.Unpair,
                 UpdateChannelInfo: policy.UpdateChannelInfo),
+            RemoveExpiredChannels: removeExpiredChannels is null
+                ? null
+                : new RemoveExpiredChannelsConfigDto(
+                    Enabled: removeExpiredChannels.Enabled,
+                    TimeoutInSecs: removeExpiredChannels.TimeoutInSecs),
             ReplicaId: replicaId?.ToString(System.Globalization.CultureInfo.InvariantCulture));
         byte[] configJsonBytes = JsonSerializer.SerializeToUtf8Bytes(config, JsonOpts);
 
@@ -284,6 +290,38 @@ public sealed class DeRecProtocol : IDisposable
             var err = NP.derec_protocol_verify_fingerprint(_handle, channelId, fpBytes, out uint matched);
             ThrowOnError(err);
             return matched != 0;
+        });
+    }
+
+    /// <summary>
+    /// Remove <c>Pending</c> channels older than <paramref name="olderThanSecs"/>,
+    /// along with their pairing keys, and return the ids removed.
+    /// </summary>
+    /// <remarks>
+    /// Independent of the cleanup policy the protocol was constructed with —
+    /// this sweeps at the threshold given even when that policy is disabled.
+    /// The age comparison is strict, so a channel created within the current
+    /// second survives even <c>0</c>.
+    /// </remarks>
+    public Task<IReadOnlyList<ulong>> RemoveExpiredChannelsAsync(ulong olderThanSecs)
+    {
+        EnsureNotDisposed();
+        return Task.Run<IReadOnlyList<ulong>>(() =>
+        {
+            var result = NP.derec_protocol_remove_expired_channels(_handle, olderThanSecs);
+            try
+            {
+                ThrowOnError(result.Error);
+                byte[] json = DeRec.Library.Utils.CopyBuffer(result.Channels);
+                var ids = JsonSerializer.Deserialize<List<string>>(json, JsonOpts)
+                    ?? new List<string>();
+                return ids.ConvertAll(id =>
+                    ulong.Parse(id, System.Globalization.CultureInfo.InvariantCulture));
+            }
+            finally
+            {
+                DeRec.Library.Utils.FreeBuffer(result.Channels);
+            }
         });
     }
 
@@ -1096,7 +1134,18 @@ public sealed class DeRecProtocol : IDisposable
         [property: JsonPropertyName("unpair_ack")] int UnpairAck,
         [property: JsonPropertyName("auto_reply_to")] bool AutoReplyTo,
         [property: JsonPropertyName("auto_accept")] AutoAcceptConfigDto AutoAccept,
+        [property: JsonPropertyName("remove_expired_channels")] RemoveExpiredChannelsConfigDto? RemoveExpiredChannels,
         [property: JsonPropertyName("replica_id")] string? ReplicaId);
+
+    // Field-for-field equivalent of Rust `RemoveExpiredChannelsConfig`.
+    // Both fields are always serialized, including when Enabled is false —
+    // the library decides that a disabled policy ignores its timeout.
+    // The whole object is omitted (not `null`) when the caller did not
+    // configure a policy, so Rust's `#[serde(default)]` supplies the
+    // default rather than this wrapper restating it.
+    private sealed record RemoveExpiredChannelsConfigDto(
+        [property: JsonPropertyName("enabled")] bool Enabled,
+        [property: JsonPropertyName("timeout_in_secs")] ulong TimeoutInSecs);
 
     // Field-for-field equivalent of Rust `AutoAcceptConfig`.
     private sealed record AutoAcceptConfigDto(
@@ -1147,6 +1196,17 @@ public enum UnpairAck
 /// request-amplification oracle (anyone with the contact's nonce can
 /// elicit a key-publish). Keep off unless you control both ends of
 /// the transport.</item>
+/// <item><see cref="StoreShare"/> is the helper's only admission-control
+/// point for inbound shares. The protocol enforces no size, quota or
+/// rate limit of its own, and <c>maxShareSize</c> is checked for range
+/// overlap at pairing time only, never against an actual share. While
+/// this is <c>false</c>, the <see cref="ActionRequiredEvent"/> carries
+/// the decoded request, so the application can inspect the share and
+/// call <see cref="DeRecProtocol.RejectAsync"/> with
+/// <c>StatusEnum.SizeLimitExceeded</c>. Setting it <c>true</c> removes
+/// that opportunity entirely: every share from every paired Owner is
+/// stored unconditionally, at whatever size it arrives. Keep off in any
+/// deployment with per-user storage limits.</item>
 /// <item><see cref="Unpair"/> is destructive — accepting deletes the
 /// local channel record before any UI confirmation.</item>
 /// <item><see cref="UpdateChannelInfo"/> silently overwrites the
@@ -1155,6 +1215,30 @@ public enum UnpairAck
 /// </list>
 /// </para>
 /// </summary>
+/// <summary>
+/// Automatic removal of expired <c>Pending</c> channels during
+/// <see cref="DeRecProtocol.ProcessAsync"/>.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Pass <c>null</c> (the default) to leave the library's own default in
+/// force. Both properties are always sent to the library, including when
+/// <see cref="Enabled"/> is <c>false</c> — the library decides that a
+/// disabled policy ignores its timeout.
+/// </para>
+/// <para>
+/// <c>Pending</c> covers both an in-flight pairing handshake and a
+/// replica channel awaiting out-of-band fingerprint verification, and one
+/// timeout governs both. Fingerprint verification is paced by a human, so
+/// deployments that pair replicas should raise
+/// <see cref="TimeoutInSecs"/> or set <see cref="Enabled"/> to
+/// <c>false</c> and call
+/// <see cref="DeRecProtocol.RemoveExpiredChannelsAsync"/> on their own
+/// schedule.
+/// </para>
+/// </remarks>
+public sealed record RemoveExpiredChannelsPolicy(bool Enabled, ulong TimeoutInSecs);
+
 public sealed class AutoAcceptPolicy
 {
     public bool Pairing { get; set; } = false;

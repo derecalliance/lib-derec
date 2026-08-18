@@ -49,6 +49,16 @@ type DeRecProtocolCreateContactResult struct {
 	ContactWireBytes DeRecBuffer
 }
 
+// DeRecRemovedChannelsResult mirrors #[repr(C)] struct
+// DeRecRemovedChannelsResult in
+// library/src/ffi/protocol/handle/config.rs: the standard DeRecError
+// envelope plus a UTF-8 JSON array of removed channel ids as decimal
+// strings, released via bytesFromBuffer.
+type DeRecRemovedChannelsResult struct {
+	Error    DeRecError
+	Channels DeRecBuffer
+}
+
 // AutoAcceptPolicy is the per-flow auto-accept toggle set carried by the
 // JSON config's "auto_accept" object, field for field matching
 // AutoAcceptConfig in library/src/ffi/protocol/handle/mod.rs (booleans,
@@ -62,6 +72,19 @@ type AutoAcceptPolicy struct {
 	GetShare          bool `json:"get_share"`
 	Unpair            bool `json:"unpair"`
 	UpdateChannelInfo bool `json:"update_channel_info"`
+}
+
+// RemoveExpiredChannelsPolicy is the automatic expired-channel cleanup
+// setting carried by the JSON config's "remove_expired_channels" object,
+// field for field matching RemoveExpiredChannelsConfig in
+// library/src/ffi/protocol/handle/mod.rs.
+//
+// Both fields are always marshalled, including when Enabled is false. The
+// library decides that a disabled policy ignores its timeout — see
+// ExpiredChannelCleanup::new.
+type RemoveExpiredChannelsPolicy struct {
+	Enabled       bool   `json:"enabled"`
+	TimeoutInSecs uint64 `json:"timeout_in_secs"`
 }
 
 // ProtocolConfig carries every derec_protocol_new argument beyond
@@ -90,6 +113,12 @@ type ProtocolConfig struct {
 	AutoReplyTo bool
 	AutoAccept  AutoAcceptPolicy
 
+	// RemoveExpiredChannels configures the automatic sweep of expired
+	// Pending channels during Process. nil omits the key from the JSON
+	// config so the library's own default applies, matching the
+	// ReplicaID convention above.
+	RemoveExpiredChannels *RemoveExpiredChannelsPolicy
+
 	// ReplicaID configures this node's local replica_id. nil leaves it
 	// unset (omitted from the JSON config, matching the "absent or null
 	// means no replica id" convention documented on ProtocolConfig in
@@ -104,17 +133,18 @@ type ProtocolConfig struct {
 // once round-tripped through JSON's float64-backed number type in common
 // encoders, including Go's encoding/json.
 type protocolConfigJSON struct {
-	SecretID             string           `json:"secret_id"`
-	OwnTransportURI      string           `json:"own_transport_uri"`
-	OwnTransportProtocol int32            `json:"own_transport_protocol"`
-	Threshold            uint32           `json:"threshold"`
-	KeepVersionsCount    uint32           `json:"keep_versions_count"`
-	TimeoutInSecs        uint32           `json:"timeout_in_secs"`
-	AutoRespondOnFailure bool             `json:"auto_respond_on_failure"`
-	UnpairAck            int32            `json:"unpair_ack"`
-	AutoReplyTo          bool             `json:"auto_reply_to"`
-	AutoAccept           AutoAcceptPolicy `json:"auto_accept"`
-	ReplicaID            *string          `json:"replica_id,omitempty"`
+	SecretID              string                       `json:"secret_id"`
+	OwnTransportURI       string                       `json:"own_transport_uri"`
+	OwnTransportProtocol  int32                        `json:"own_transport_protocol"`
+	Threshold             uint32                       `json:"threshold"`
+	KeepVersionsCount     uint32                       `json:"keep_versions_count"`
+	TimeoutInSecs         uint32                       `json:"timeout_in_secs"`
+	AutoRespondOnFailure  bool                         `json:"auto_respond_on_failure"`
+	UnpairAck             int32                        `json:"unpair_ack"`
+	AutoReplyTo           bool                         `json:"auto_reply_to"`
+	AutoAccept            AutoAcceptPolicy             `json:"auto_accept"`
+	RemoveExpiredChannels *RemoveExpiredChannelsPolicy `json:"remove_expired_channels,omitempty"`
+	ReplicaID             *string                      `json:"replica_id,omitempty"`
 }
 
 var (
@@ -141,6 +171,11 @@ var (
 		handle uintptr, channelID uint64,
 		fingerprintPtr *byte, outMatched *uint32,
 	) DeRecError
+
+	protocolRemoveExpiredChannelsOnce sync.Once
+	protocolRemoveExpiredChannelsFn   func(
+		handle uintptr, olderThanSecs uint64,
+	) DeRecRemovedChannelsResult
 
 	protocolSetOwnTransportOnce sync.Once
 	protocolSetOwnTransportFn   func(
@@ -218,6 +253,8 @@ func protocolNew(cfg ProtocolConfig, cb *builtCallbacks) (uintptr, error) {
 		UnpairAck:            cfg.UnpairAck,
 		AutoReplyTo:          cfg.AutoReplyTo,
 		AutoAccept:           cfg.AutoAccept,
+
+		RemoveExpiredChannels: cfg.RemoveExpiredChannels,
 	}
 	if cfg.ReplicaID != nil {
 		id := strconv.FormatUint(*cfg.ReplicaID, 10)
@@ -323,6 +360,26 @@ func (p *ProtocolInstance) GetFingerprint(channelID uint64) (string, error) {
 		return "", err
 	}
 	return stringFromCString(res.Fingerprint), nil
+}
+
+// RemoveExpiredChannels wraps derec_protocol_remove_expired_channels:
+// removes Pending channels older than olderThanSecs along with their
+// pairing keys, returning the UTF-8 JSON array of removed channel ids as
+// decimal strings.
+//
+// Independent of the configured cleanup policy — it sweeps at the
+// threshold given even when that policy is disabled. The age comparison
+// is strict, so a channel created within the current second survives
+// even olderThanSecs == 0.
+func (p *ProtocolInstance) RemoveExpiredChannels(olderThanSecs uint64) ([]byte, error) {
+	protocolRemoveExpiredChannelsOnce.Do(func() {
+		purego.RegisterFunc(&protocolRemoveExpiredChannelsFn, symbol("derec_protocol_remove_expired_channels"))
+	})
+	res := protocolRemoveExpiredChannelsFn(p.handle, olderThanSecs)
+	if err := errorFrom(res.Error); err != nil {
+		return nil, err
+	}
+	return bytesFromBuffer(res.Channels), nil
 }
 
 // VerifyFingerprint wraps derec_protocol_verify_fingerprint: compares

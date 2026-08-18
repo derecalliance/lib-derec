@@ -25,6 +25,7 @@ Alliance**.
 - [Quick start (Protocol layer)](#quick-start-protocol-layer)
 - [Builder configuration](#builder-configuration)
 - [Event-driven model](#event-driven-model)
+- [Helper-side admission control](#helper-side-admission-control)
 - [Protocol flows](#protocol-flows)
 - [Replica flows](#replica-flows)
 - [Storage and transport traits](#storage-and-transport-traits)
@@ -247,7 +248,8 @@ Optional setters have defaults:
 |--------|---------|---------|
 | `with_threshold(n)` | `3` | Minimum shares required to reconstruct the secret. |
 | `with_keep_versions_count(n)` | `3` | Number of recent versions each helper must retain. |
-| `with_timeout(duration)` | `5 minutes` | Staleness boundary for inbound envelopes and pending state. One-second granularity. |
+| `with_timeout(duration)` | `5 minutes` | Staleness boundary for inbound envelopes, sharing-round timeouts and unpair timeouts. One-second granularity. |
+| `with_remove_expired_channels(policy)` | `Enabled { timeout_in_secs: 300 }` | Automatic removal of expired `Pending` channels during `process()`. `Disabled` leaves it to the application via `remove_expired_channels`. Replica pairings await human fingerprint verification while `Pending`, so deployments using replicas should raise the timeout or disable it. |
 | `with_communication_info(map)` | empty | Key-value identity metadata embedded in pairing messages. |
 | `with_auto_respond_on_failure(bool)` | `false` | If `true`, the protocol replies to the peer on inbound processing failures; if `false`, errors only surface as events. |
 | `with_unpair_ack(ack)` | `UnpairAck::Required` | Whether the unpair initiator waits for the peer's `Ok` before dropping local state. |
@@ -339,6 +341,101 @@ The orchestrator enforces flow directionality against this value:
   peer role is not consulted.
 
 A mismatch surfaces as `Error::RoleMismatch { channel_id, expected, actual }`.
+
+---
+
+## Helper-side admission control
+
+**The protocol enforces no limits of its own on inbound shares.** It does
+not bound share size, storage consumed per sharer, or how often an owner
+may push updates. A helper that needs those limits enforces them itself,
+and this section is how.
+
+`ParameterRange.maxShareSize` does not do this for you. It is exchanged
+during pairing and checked for *range overlap* between the two peers'
+advertised ranges; the negotiated value is never compared against an
+actual share afterwards. Treat it as a compatibility handshake, not an
+enforced ceiling.
+
+### Where the decision belongs
+
+Not before `process()`. Reading a share's size from raw wire bytes would
+mean decoding the envelope, resolving the channel's shared key,
+decrypting the inner message and parsing the protobuf — reimplementing
+the protocol's receive path outside the protocol.
+
+Instead, `process()` does that work and hands back the decoded request in
+an `ActionRequired` event. `PendingAction::StoreShare` carries the
+already-decrypted `StoreShareRequestMessage`, so the application inspects
+the share without touching wire bytes or key material:
+
+```rust,ignore
+for event in protocol.process(&wire_bytes).await? {
+    let DeRecEvent::ActionRequired { action, channel_id } = event else { continue };
+    match &action {
+        PendingAction::StoreShare { request, .. } => {
+            // `channel_id` maps to a user in the application's own store,
+            // so the limit can be per-user, per-plan, or whatever the
+            // deployment needs.
+            let limit = my_app.share_limit_for(channel_id);
+            if request.share.len() > limit {
+                protocol
+                    .reject(
+                        action,
+                        StatusEnum::SizeLimitExceeded,
+                        &format!("share exceeds the {limit}-byte limit"),
+                    )
+                    .await?;
+            } else {
+                protocol.accept(action).await?;
+            }
+        }
+        _ => { protocol.accept(action).await?; }
+    }
+}
+```
+
+The owner receives a `StoreShareResponse` carrying that status and memo,
+surfacing as `ShareRejected { channel_id, version, status, memo }` on its
+side — so a refusal is attributable rather than a silent timeout.
+
+Status codes for the common cases:
+
+| Status | Use for |
+|--------|---------|
+| `SizeLimitExceeded` | share too large, or storage quota for this sharer exhausted |
+| `TooFrequent` | rate limiting — the owner is updating faster than the helper allows |
+| `Rejected` | a user or operator declined the request |
+| `Fail` | anything else; put the detail in `memo` |
+
+### `auto_accept.store_share` removes this gate
+
+> [!IMPORTANT]
+> Setting `AutoAcceptPolicy::store_share = true` means `process()`
+> accepts and stores every inbound share internally. No `ActionRequired`
+> is emitted, so **there is no opportunity to reject** — every share from
+> every paired Owner is stored unconditionally, at whatever size it
+> arrives.
+
+Keep it `false` in any deployment with per-user storage limits. It is
+`false` by default; only an explicit
+`with_auto_accept(...)` turns it on, including via
+`AutoAcceptPolicy::all()`.
+
+### This is policy, not DoS protection
+
+By the time `ActionRequired` fires, the message has already been
+received, decrypted and parsed. Rejecting here protects your *storage*,
+not the CPU and memory spent getting there.
+
+`process()` deliberately imposes no upper bound on inbound message size —
+legitimate envelopes range from tens of bytes to many megabytes, and any
+cap tight enough to resist abuse risks truncating a legitimate replica
+sync, which can render a secret unrecoverable. Applications must bound
+inbound message size at the **transport** layer (max HTTP body,
+WebSocket frame size) sized to their deployment's secret size, helper
+count and replica fan-out. The two mechanisms are complementary: the
+transport cap protects resources, `reject` enforces policy.
 
 ---
 
