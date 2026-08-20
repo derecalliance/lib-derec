@@ -589,16 +589,16 @@ pub enum StateKind {
     /// `started_at` unix-seconds timestamp so the orchestrator can time
     /// out unresponsive peers.
     PendingUnpair,
-    /// Active replica catch-up. At most one entry exists per `secret_id`
-    /// (a new `start(SyncCheck)` overwrites any prior one). Holds the
-    /// versions members have reported so far, so the asker can pick the
-    /// member holding the newest state once every peer has answered.
-    PendingSyncCheck,
     /// Active sharing round. At most one entry exists per `secret_id`
     /// (a new `start(ProtectSecret)` overwrites any prior round). Holds
     /// the per-channel tallies (`pending` / `confirmed` / `failed`) and
     /// the `started_at` timestamp used to time out unresponsive helpers.
     SharingRound,
+    /// Active replica catch-up. At most one entry exists per `secret_id`
+    /// (a new `start(SyncCheck)` overwrites any prior one). Holds the
+    /// versions members have reported so far, so the asker can pick the
+    /// member holding the newest state once every peer has answered.
+    PendingSyncCheck,
 }
 
 /// Secondary-key selector identifying a single row within a given

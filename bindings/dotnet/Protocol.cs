@@ -8,7 +8,9 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.IO;
 using System.Text;
+using System.Text.Json;
 using DeRec.Library;
 using DeRec.Library.Orchestrator;
 using DeRec.Library.Primitives;
@@ -23,6 +25,7 @@ internal static class Protocol
         RunOrchestratorFingerprintMismatchTest();
         RunOrchestratorPairFlowTest();
         RunOrchestratorHashedKeysPairFlowTest();
+        RunOrchestratorNoKeysPairFlowTest();
         RunOrchestratorShareAndDiscoverFlowTest();
         RunOrchestratorUnpairingFlowTest();
         RunOrchestratorUpdateChannelInfoFlowTest();
@@ -33,6 +36,89 @@ internal static class Protocol
         RunOrchestratorAutoAcceptFlowTest();
         RunOrchestratorExpiredChannelCleanupTest();
         RunOrchestratorTickTest();
+        RunEnumFixtureTest();
+    }
+
+    /// <summary>
+    /// Every enum this SDK mirrors must know every variant the Rust core can
+    /// emit. <c>ChannelStatus</c> once gained <c>Unpairing</c> that never
+    /// reached .NET, and nothing here noticed, because the suite only ever
+    /// exercised the variants .NET already declared.
+    /// <c>bindings/test_fixture/enums.json</c> is the external source of truth
+    /// that closes that gap; Rust asserts it stays complete.
+    /// </summary>
+    private static void RunEnumFixtureTest()
+    {
+        Console.WriteLine("=== Protocol enum fixture test ===");
+
+        // bindings/dotnet -> repo root
+        string path = Path.Combine("..", "..", "bindings", "test_fixture", "enums.json");
+        if (!File.Exists(path))
+        {
+            throw new Exception($"enum fixture not found at {Path.GetFullPath(path)}");
+        }
+        using var doc = JsonDocument.Parse(File.ReadAllText(path));
+        var enums = doc.RootElement.GetProperty("enums");
+
+        AssertNamedEnum<ChannelStatus>(enums, "ChannelStatus");
+        AssertNamedEnum<ReplicaRole>(enums, "ReplicaRole");
+        AssertNumericEnum<StateKind>(enums, "StateKind");
+        AssertNumericEnum<SecretKind>(enums, "SecretKind");
+
+        Console.WriteLine("  every fixture variant is known to this SDK  ✓");
+        Console.WriteLine("Protocol enum fixture test passed.\n");
+    }
+
+    /// <summary>Variant-name enums: every fixture name must parse.</summary>
+    private static void AssertNamedEnum<TEnum>(JsonElement enums, string enumName)
+        where TEnum : struct, Enum
+    {
+        var variants = enums.GetProperty(enumName).GetProperty("variants");
+        int seen = 0;
+        foreach (var v in variants.EnumerateArray())
+        {
+            string wire = v.GetProperty("wire").GetString()!;
+            if (!Enum.TryParse<TEnum>(wire, out _))
+            {
+                throw new Exception(
+                    $"{enumName}.{wire} is in the fixture but not in this SDK — "
+                    + "the Rust core can emit it and .NET would reject it");
+            }
+            seen++;
+        }
+        int declared = Enum.GetValues(typeof(TEnum)).Length;
+        if (seen != declared)
+        {
+            throw new Exception($"{enumName}: fixture lists {seen} variants, .NET declares {declared}");
+        }
+    }
+
+    /// <summary>Numeric enums: names and values must both agree.</summary>
+    private static void AssertNumericEnum<TEnum>(JsonElement enums, string enumName)
+        where TEnum : struct, Enum
+    {
+        var variants = enums.GetProperty(enumName).GetProperty("variants");
+        int seen = 0;
+        foreach (var v in variants.EnumerateArray())
+        {
+            string name = v.GetProperty("name").GetString()!;
+            long wire = v.GetProperty("wire").GetInt64();
+            if (!Enum.TryParse<TEnum>(name, out var parsed))
+            {
+                throw new Exception($"{enumName}.{name} is in the fixture but not in this SDK");
+            }
+            long actual = Convert.ToInt64(parsed);
+            if (actual != wire)
+            {
+                throw new Exception($"{enumName}.{name}: .NET has {actual}, fixture says {wire}");
+            }
+            seen++;
+        }
+        int declared = Enum.GetValues(typeof(TEnum)).Length;
+        if (seen != declared)
+        {
+            throw new Exception($"{enumName}: fixture lists {seen} variants, .NET declares {declared}");
+        }
     }
 
     /// <summary>
@@ -772,6 +858,76 @@ internal static class Protocol
 
         Console.WriteLine($"  paired via HashedKeys + PrePair (channel_id={rekeyedId}, shared_key={helperKey.Bytes.Length}B)  ✓");
         Console.WriteLine("Orchestrator HashedKeys pair flow test passed.");
+    }
+
+    /// <summary>
+    /// The third contact mode. <c>NoKeys</c> carries no key material and no
+    /// binding hash — the creator generates keys on the fly when the
+    /// <c>PrePairRequest</c> arrives, authenticating it by nonce alone.
+    /// </summary>
+    /// <remarks>
+    /// This mode was exposed by the SDK but never exercised here. It has the
+    /// weakest security properties of the three — trust rests entirely on the
+    /// out-of-band channel that delivered the contact — so it is the one most
+    /// worth covering.
+    /// </remarks>
+    private static void RunOrchestratorNoKeysPairFlowTest()
+    {
+        Console.WriteLine("=== Orchestrator NoKeys pair flow test ===");
+
+        const ulong channelId = 201UL;
+
+        // Same wire choreography as HashedKeys: the contact is inert, so the
+        // PrePair leg is what carries the keys.
+        using var helper = MakeNode("Helper", "https://helper.nokeys.example.com");
+        using var owner = MakeNode("Owner", "https://owner.nokeys.example.com");
+
+        byte[] contactBytes = helper.Protocol.CreateContactAsync(channelId, ContactMode.NoKeys)
+            .GetAwaiter().GetResult();
+
+        owner.Protocol.StartAsync(FlowKind.Pairing, new PairingParams
+        {
+            Kind = Pairing.SenderKind.Owner,
+            Contact = contactBytes,
+        }).GetAwaiter().GetResult();
+
+        byte[] prePairRequest = owner.Transport.DrainOne();
+        helper.Protocol.ProcessAndAcceptAllAsync(prePairRequest).GetAwaiter().GetResult();
+
+        byte[] prePairResponse = helper.Transport.DrainOne();
+        owner.Protocol.ProcessAndAcceptAllAsync(prePairResponse).GetAwaiter().GetResult();
+
+        byte[] pairRequest = owner.Transport.DrainOne();
+        var helperEvents = helper.Protocol.ProcessAndAcceptAllAsync(pairRequest).GetAwaiter().GetResult();
+        var helperPairing = helperEvents.OfType<PairingCompletedEvent>().FirstOrDefault()
+            ?? throw new InvalidOperationException("helper must emit PairingCompleted");
+
+        byte[] pairResponse = helper.Transport.DrainOne();
+        var ownerEvents = owner.Protocol.ProcessAndAcceptAllAsync(pairResponse).GetAwaiter().GetResult();
+        var ownerPairing = ownerEvents.OfType<PairingCompletedEvent>().FirstOrDefault()
+            ?? throw new InvalidOperationException("owner must emit PairingCompleted");
+
+        if (helperPairing.ChannelId != ownerPairing.ChannelId)
+            throw new InvalidOperationException("NoKeys pair: channel id mismatch on both sides");
+
+        ulong rekeyedId = ulong.Parse(helperPairing.ChannelId);
+        var helperKey = helper.SecretStore.Load(helper.Protocol.SecretId, rekeyedId, SecretKind.SharedKey)
+            ?? throw new InvalidOperationException("helper shared_key missing after NoKeys pair");
+        var ownerKey = owner.SecretStore.Load(owner.Protocol.SecretId, rekeyedId, SecretKind.SharedKey)
+            ?? throw new InvalidOperationException("owner shared_key missing after NoKeys pair");
+        if (!helperKey.Bytes.SequenceEqual(ownerKey.Bytes))
+            throw new InvalidOperationException("shared keys must match after NoKeys pair");
+
+        // The creator stores the contact under NoKeys so it can authenticate
+        // the PrePairRequest by nonce. Once the handshake has rekeyed, that
+        // row is spent and must not survive — it used to.
+        if (helper.SecretStore.Load(helper.Protocol.SecretId, channelId, SecretKind.PairingContact) is not null)
+            throw new InvalidOperationException(
+                "the transient PairingContact must not outlive a completed NoKeys handshake");
+
+        Console.WriteLine($"  paired via NoKeys + PrePair (channel_id={rekeyedId}, shared_key={helperKey.Bytes.Length}B)  ✓");
+        Console.WriteLine("  the spent transient PairingContact was dropped  ✓");
+        Console.WriteLine("Orchestrator NoKeys pair flow test passed.");
     }
 
     /// <summary>

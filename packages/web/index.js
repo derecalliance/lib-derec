@@ -20,9 +20,9 @@ export const DeRecProtocolBuilder = DeRecProtocolBuilderImpl;
 
 export const SenderKind = Object.freeze({ Owner: 0, Helper: 1, ReplicaSource: 3, ReplicaDestination: 4 });
 
-export const ContactMode = Object.freeze({ InlineKeys: 0, HashedKeys: 1 });
+export const ContactMode = Object.freeze({ InlineKeys: 0, HashedKeys: 1, NoKeys: 2 });
 
-export const FlowKind = Object.freeze({ Pairing: 0, Discovery: 1, ProtectSecret: 2, VerifyShares: 3, RecoverSecret: 4, Unpair: 5, UpdateChannelInfo: 6 });
+export const FlowKind = Object.freeze({ Pairing: 0, Discovery: 1, ProtectSecret: 2, VerifyShares: 3, RecoverSecret: 4, Unpair: 5, UpdateChannelInfo: 6, SyncCheck: 7, RemoveReplica: 8 });
 
 import {
   discovery_request_produce,

@@ -4,12 +4,12 @@
 use derec_library::protocol::types::ChannelQuery;
 use derec_library::protocol::{DeRecChannelStore, SecretKind};
 use derec_library::types::ChannelId;
-use derec_proto::SenderKind;
+use derec_proto::{ContactMode, SenderKind};
 use std::collections::HashSet;
 
 use crate::db::Database;
 use crate::flows::assertions::{channel_exists, count_channels, count_secrets};
-use crate::flows::helpers::pair_owner_helper;
+use crate::flows::helpers::{pair_owner_helper, pair_owner_helper_with_mode};
 use crate::peer::{DEFAULT_TEST_SECRET_ID, Peer};
 use crate::stores::{PostgresChannelStore, PostgresSecretStore};
 
@@ -137,5 +137,46 @@ pub async fn run() {
     );
     println!("  link_channel: undirected + idempotent + transitive (a—b—c → {{a,b,c}})  ✓");
 
+    every_contact_mode_pairs_and_persists().await;
+
     println!("✓ Pairing flow passed.\n");
+}
+
+/// All three contact modes must reach the same persisted end state.
+///
+/// `HashedKeys` and `NoKeys` add a `PrePair` round-trip before the handshake
+/// proper, and this backend only ever exercised `InlineKeys` — so two of the
+/// three were never proven to persist anything here at all.
+async fn every_contact_mode_pairs_and_persists() {
+    for (i, mode) in [
+        ContactMode::InlineKeys,
+        ContactMode::HashedKeys,
+        ContactMode::NoKeys,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let owner_db = Database::open_isolated().await;
+        let helper_db = Database::open_isolated().await;
+        let mut owner = Peer::new(owner_db.client(), "Owner", "https://owner.example.com");
+        let mut helper = Peer::new(helper_db.client(), "Helper", "https://helper.example.com");
+
+        let channel =
+            pair_owner_helper_with_mode(&mut owner, &mut helper, ChannelId(900 + i as u64), mode)
+                .await;
+
+        for (label, db) in [("owner", &owner_db), ("helper", &helper_db)] {
+            assert!(
+                channel_exists(&db.client(), DEFAULT_TEST_SECRET_ID, channel.0).await,
+                "{label} must hold the paired channel after a {mode:?} handshake"
+            );
+            assert_eq!(
+                count_secrets(&db.client(), DEFAULT_TEST_SECRET_ID).await,
+                1,
+                "{label} keeps exactly the shared key after a {mode:?} handshake — \
+                 no transient pairing material may survive"
+            );
+        }
+    }
+    println!("  InlineKeys, HashedKeys and NoKeys all persist the same end state  ✓");
 }

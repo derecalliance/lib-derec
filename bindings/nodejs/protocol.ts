@@ -661,28 +661,42 @@ async function runFingerprintMismatchFlow(): Promise<void> {
  * each outbound message into the peer's `processAll` (which auto-accepts the
  * `ActionRequired::PrePair` and `ActionRequired::Pairing` events).
  */
-async function doPairHashedKeys(
+/**
+ * Drives the two contact modes that need a PrePair leg. They share the whole
+ * wire choreography and differ only in what the contact carries: `HashedKeys`
+ * commits to the keys with a SHA-384 hash, `NoKeys` carries nothing at all and
+ * the creator generates keys on the fly, authenticating the request by nonce.
+ */
+async function doPairViaPrePair(
   contactCreator: Node,
   initiator: Node,
   channelId: bigint,
   label: string,
+  mode: ContactMode.HashedKeys | ContactMode.NoKeys,
 ): Promise<{ longTermChannelId: string }> {
+  const modeName = mode === ContactMode.HashedKeys ? "HashedKeys" : "NoKeys";
   const contact: ContactMessage =
-    await contactCreator.protocol.createContact(channelId, ContactMode.HashedKeys);
-  if (contact.contact_mode !== ContactMode.HashedKeys) {
-    throw new Error(`${label}: HashedKeys contact must advertise contact_mode = HashedKeys`);
+    await contactCreator.protocol.createContact(channelId, mode);
+  if (contact.contact_mode !== mode) {
+    throw new Error(`${label}: contact must advertise contact_mode = ${modeName}`);
   }
   if (contact.mlkem_encapsulation_key !== undefined) {
-    throw new Error(`${label}: HashedKeys contact must NOT carry the ML-KEM key inline`);
+    throw new Error(`${label}: ${modeName} contact must NOT carry the ML-KEM key inline`);
   }
   if (contact.ecies_public_key !== undefined) {
-    throw new Error(`${label}: HashedKeys contact must NOT carry the ECIES key inline`);
+    throw new Error(`${label}: ${modeName} contact must NOT carry the ECIES key inline`);
   }
-  if (!contact.contact_binding_hash || contact.contact_binding_hash.length !== 48) {
-    throw new Error(`${label}: HashedKeys contact must carry a 48-byte SHA-384 binding hash`);
+  if (mode === ContactMode.HashedKeys) {
+    if (!contact.contact_binding_hash || contact.contact_binding_hash.length !== 48) {
+      throw new Error(`${label}: HashedKeys contact must carry a 48-byte SHA-384 binding hash`);
+    }
+  } else if (contact.contact_binding_hash !== undefined) {
+    throw new Error(
+      `${label}: NoKeys contact must carry no binding hash — there is nothing to commit to`,
+    );
   }
   console.log(
-    `  [${label}/ContactCreator] createContact(HashedKeys) channel_id=${contact.channel_id} (binding-hash only, ${contact.contact_binding_hash.length}B)`,
+    `  [${label}/ContactCreator] createContact(${modeName}) channel_id=${contact.channel_id}`,
   );
 
   await initiator.protocol.start(FlowKind.Pairing, {
@@ -751,13 +765,69 @@ async function doPairHashedKeys(
 }
 
 
+/**
+ * The third contact mode, which the SDK exposed but never exercised.
+ *
+ * `NoKeys` carries no key material and no commitment, so trust rests entirely
+ * on the out-of-band channel that delivered the contact — the weakest of the
+ * three, and therefore the one most worth covering.
+ */
+async function runNoKeysPairingFlow(): Promise<void> {
+  console.log("=== [Protocol] NoKeys Pairing Flow ===\n");
+
+  const owner = makeNode("Owner", "https://owner.example.com");
+  const helper = makeNode("Helper", "https://helper.example.com");
+  const { longTermChannelId } = await doPairViaPrePair(
+    helper,
+    owner,
+    3n,
+    "NoKeys",
+    ContactMode.NoKeys,
+  );
+
+  const ownerSid = String(owner.protocol.secretId());
+  const helperSid = String(helper.protocol.secretId());
+  const ownerSharedKey = await owner.secretStore.load(ownerSid, longTermChannelId, 0);
+  const helperSharedKey = await helper.secretStore.load(helperSid, longTermChannelId, 0);
+  if (!ownerSharedKey || !helperSharedKey) {
+    throw new Error("NoKeys pairing: both sides must have a stored shared key");
+  }
+  if (
+    ownerSharedKey.length !== helperSharedKey.length ||
+    !ownerSharedKey.every((b, i) => b === helperSharedKey[i])
+  ) {
+    throw new Error("NoKeys pairing: owner/helper shared keys do not match");
+  }
+  console.log(`  shared keys match (${ownerSharedKey.length}B)  ✓`);
+
+  // The creator stores the contact under NoKeys so it can authenticate the
+  // PrePairRequest by nonce. Once the handshake has rekeyed onto the long-term
+  // channel that row is spent, and it used to outlive the handshake.
+  const strandedContact = await helper.secretStore.load(helperSid, "3", 2);
+  if (strandedContact) {
+    throw new Error(
+      "NoKeys pairing: the transient PairingContact must not outlive the handshake",
+    );
+  }
+  console.log("  the spent transient PairingContact was dropped  ✓\n");
+
+  console.log("✓ NoKeys pairing flow passed.\n");
+}
+
+
 async function runHashedKeysPairingFlow(): Promise<void> {
   console.log("=== [Protocol] HashedKeys Pairing Flow ===\n");
 
   // Happy path: full 4-leg chain ends with PairingCompleted on both sides.
   const owner = makeNode("Owner", "https://owner.example.com");
   const helper = makeNode("Helper", "https://helper.example.com");
-  const { longTermChannelId } = await doPairHashedKeys(helper, owner, 1n, "HashedKeys");
+  const { longTermChannelId } = await doPairViaPrePair(
+    helper,
+    owner,
+    1n,
+    "HashedKeys",
+    ContactMode.HashedKeys,
+  );
 
   // Both sides must have a paired channel record + a shared key in their
   // secret store (kind 0 = SharedKey) under the rotated long-term
@@ -1760,12 +1830,14 @@ async function runReplicaIdWiringSadPathsFlow(): Promise<void> {
 }
 
 
+
 export async function runProtocolSmoke(): Promise<void> {
   console.log("━━━ [Protocol] Starting ━━━\n");
 
   await runPairingFlow();
   await runFingerprintMismatchFlow();
   await runHashedKeysPairingFlow();
+  await runNoKeysPairingFlow();
   await runSharingFlow();
   await runDiscoveryAndRecoveryFlow();
   await runUnpairingFlow();

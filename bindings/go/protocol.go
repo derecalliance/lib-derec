@@ -12,6 +12,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"strconv"
 	"sync"
@@ -421,6 +422,7 @@ type peer struct {
 	transport    *memTransport
 	shareStore   *memShareStore
 	channelStore *memChannelStore
+	secretStore  *memSecretStore
 }
 
 func newPeer(label, uri string, threshold uint32) *peer {
@@ -448,6 +450,7 @@ func newPeer(label, uri string, threshold uint32) *peer {
 		transport:    transport,
 		shareStore:   shareStore,
 		channelStore: channelStore,
+		secretStore:  secretStore,
 	}
 }
 
@@ -549,7 +552,18 @@ func pumpMany(peers []*peer) []protocol.Event {
 // bindings/rust/src/protocol.rs. Returns the long-term channel_id both
 // peers rotated to.
 func pairPeers(owner, helper *peer, pairingChannelID uint64) uint64 {
-	contact, err := owner.proto.CreateContact(&pairingChannelID, protocol.ContactModeInlineKeys, nil)
+	return pairPeersWithMode(owner, helper, pairingChannelID, protocol.ContactModeInlineKeys)
+}
+
+// pairPeersWithMode is pairPeers over any contact mode.
+//
+// HashedKeys and NoKeys insert a PrePair round-trip before the handshake
+// proper: the scanner asks for the real keys, and the contact creator either
+// republishes the ones it committed to (HashedKeys) or generates them on the
+// spot (NoKeys). pump follows the chain, so the extra legs need no special
+// handling here — only the mode the contact is minted with differs.
+func pairPeersWithMode(owner, helper *peer, pairingChannelID uint64, mode protocol.ContactMode) uint64 {
+	contact, err := owner.proto.CreateContact(&pairingChannelID, mode, nil)
 	must(err, "owner.CreateContact")
 	assertTrue(contact.ChannelID == pairingChannelID, "CreateContact.ChannelID = %d, want %d", contact.ChannelID, pairingChannelID)
 
@@ -607,6 +621,56 @@ func pairPeers(owner, helper *peer, pairingChannelID uint64) uint64 {
 // rejects Threshold < 2, and the sharing handler only VSS-splits shares to
 // Helpers once helpers.len() >= threshold — a single Helper would never
 // observe a real ShareStored event.
+// runEveryContactModePairs proves this SDK can pair over all three contact
+// modes. It only ever exercised InlineKeys, so the two modes with a PrePair
+// leg — the ones where the wire choreography actually differs — were never
+// driven from Go at all.
+func runEveryContactModePairs() {
+	fmt.Println("=== Protocol contact-mode pairing test ===")
+
+	const threshold = 2
+	modes := []struct {
+		name string
+		mode protocol.ContactMode
+	}{
+		{"InlineKeys", protocol.ContactModeInlineKeys},
+		{"HashedKeys", protocol.ContactModeHashedKeys},
+		{"NoKeys", protocol.ContactModeNoKeys},
+	}
+
+	for i, m := range modes {
+		owner := newPeer("owner", fmt.Sprintf("https://owner-%d.example.com", i), threshold)
+		helper := newPeer("helper", fmt.Sprintf("https://helper-%d.example.com", i), threshold)
+
+		channelID := pairPeersWithMode(owner, helper, uint64(900+i), m.mode)
+		assertTrue(channelID != uint64(900+i),
+			"%s: both peers must rotate off the transient pairing id", m.name)
+
+		// The strongest end-to-end check: the handshake converged on one key.
+		ownerKey, ok, err := owner.secretStore.Load(protocolSecretID, channelID, 0)
+		must(err, fmt.Sprintf("%s owner secretStore.Load", m.name))
+		assertTrue(ok, "%s: owner must hold a shared key", m.name)
+		helperKey, ok, err := helper.secretStore.Load(protocolSecretID, channelID, 0)
+		must(err, fmt.Sprintf("%s helper secretStore.Load", m.name))
+		assertTrue(ok, "%s: helper must hold a shared key", m.name)
+		assertTrue(bytes.Equal(ownerKey.Bytes, helperKey.Bytes),
+			"%s: owner and helper shared keys must match", m.name)
+
+		// NoKeys stores the contact on the creator so it can authenticate the
+		// PrePairRequest by nonce. Once the handshake has rekeyed that row is
+		// spent and must not survive — it used to.
+		_, stranded, err := owner.secretStore.Load(protocolSecretID, uint64(900+i), 2)
+		must(err, fmt.Sprintf("%s owner transient contact lookup", m.name))
+		assertTrue(!stranded,
+			"%s: the transient PairingContact must not outlive the handshake", m.name)
+
+		fmt.Printf("  %s paired → channel_id=%d, shared_key=%dB, no transient state left  ✓\n",
+			m.name, channelID, len(ownerKey.Bytes))
+	}
+
+	fmt.Println("Protocol contact-mode pairing test passed.")
+}
+
 func runProtocol() {
 	fmt.Println("=== Protocol pairing + protect-secret flow test ===")
 

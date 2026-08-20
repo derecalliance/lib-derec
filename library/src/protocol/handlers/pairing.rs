@@ -239,6 +239,17 @@ pub(in crate::protocol) async fn start<
     }
 }
 
+/// Accept an inbound `PairRequest`: persist the peer, answer with a
+/// `PairResponse`, and rekey onto the long-term channel.
+///
+/// Every scrap of transient pairing material is dropped once the rekey lands.
+/// Both kinds must go: [`SecretKind::PairingSecret`] for `InlineKeys` and
+/// `HashedKeys`, and [`SecretKind::PairingContact`] for `NoKeys`, where
+/// `create_contact` stores the contact instead — that mode has no key
+/// material yet, and the contact is what authenticates the later
+/// `PrePairRequest` by nonce. Removing only the secret stranded one contact
+/// row per `NoKeys` pairing at an id nothing addresses again. Removal is
+/// idempotent, so each call is harmless for the modes that never stored it.
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
@@ -339,6 +350,9 @@ pub(in crate::protocol) async fn accept<
 
     secret_store
         .remove(secret_id, channel_id, SecretKind::PairingSecret)
+        .await?;
+    secret_store
+        .remove(secret_id, channel_id, SecretKind::PairingContact)
         .await?;
     channel_store
         .remove(
@@ -588,6 +602,15 @@ pub(in crate::protocol) async fn reject_pre_pair<T: DeRecTransport>(
 /// event (non-Ok status on the response) or a
 /// [`crate::primitives::pairing::PairingError::PrePairHashMismatch`]
 /// error (binding-hash mismatch).
+///
+/// The local sender kind is recovered from whichever record `start` wrote,
+/// and the two shapes differ: a helper or owner is stored as a
+/// [`ChannelRecord::Helper`](crate::protocol::types::ChannelRecord) carrying
+/// the peer's role, while a replica is stored as its **own roster row** —
+/// the roster is absolute, so a member records itself rather than a view of
+/// its peer. Resolving only the helper shape made `HashedKeys` and `NoKeys`
+/// unusable for replica pairing, those being the two modes with a PrePair
+/// leg.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::protocol) async fn on_pre_pair_response<
     Ch: DeRecChannelStore,
@@ -642,18 +665,36 @@ pub(in crate::protocol) async fn on_pre_pair_response<
         ..original_contact.clone()
     };
 
-    let local_kind = channel_store
+    let local_kind = match channel_store
         .load(
             secret_id,
             crate::protocol::types::ChannelQuery::Helper { channel_id },
         )
         .await?
         .and_then(|r| r.as_helper().cloned())
-        .ok_or(Error::Invariant(
-            "channel record missing on PrePair response — start must be called first",
-        ))?
-        .peer_role
-        .counterparty();
+    {
+        Some(helper) => helper.peer_role.counterparty(),
+        None => {
+            let own_replica_id = replica_id.ok_or(Error::Invariant(
+                "channel record missing on PrePair response — start must be called first",
+            ))?;
+            channel_store
+                .load(
+                    secret_id,
+                    crate::protocol::types::ChannelQuery::Replica {
+                        channel_id,
+                        replica_id: crate::types::ReplicaId::try_from(own_replica_id)?,
+                    },
+                )
+                .await?
+                .and_then(|r| r.as_replica().cloned())
+                .ok_or(Error::Invariant(
+                    "channel record missing on PrePair response — start must be called first",
+                ))?
+                .role
+                .to_sender_kind()
+        }
+    };
 
     let replica_id_to_inject = require_replica_id_for_kind(local_kind, replica_id)?;
     let comm_info = build_communication_info(communication_info, replica_id_to_inject);
@@ -1714,6 +1755,175 @@ mod tests {
 }
 
 /// D6: no two members of a group may share a `replica_id`.
+#[cfg(test)]
+mod prepair_record_shape_tests {
+    use super::*;
+    use crate::protocol::test::{InMemChannelStore, run_async};
+    use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel, ReplicaMember};
+    use crate::types::ReplicaId;
+
+    const SECRET_ID: u64 = 0x0B0E_9A19;
+    const CHANNEL: ChannelId = ChannelId(6000);
+    const OWN_REPLICA: u64 = 0xA11CE;
+
+    fn endpoint() -> TransportProtocol {
+        TransportProtocol {
+            uri: "https://peer.example".to_owned(),
+            protocol: derec_proto::Protocol::Https as i32,
+        }
+    }
+
+    /// `start` records a replica scanner as its own roster row, not as a
+    /// helper channel, so the PrePair-response handler has to resolve the
+    /// local sender kind from either shape.
+    ///
+    /// Reading only the helper shape made `HashedKeys` and `NoKeys` — the two
+    /// modes with a PrePair leg — unusable for admitting a replica at all.
+    #[test]
+    fn a_replica_scanner_is_recorded_as_its_own_roster_row() {
+        run_async(async {
+            let mut channels = InMemChannelStore::default();
+            persist_start_record(
+                &mut channels,
+                SECRET_ID,
+                CHANNEL,
+                endpoint(),
+                &endpoint(),
+                std::collections::HashMap::new(),
+                SenderKind::ReplicaDestination,
+                Some(OWN_REPLICA),
+            )
+            .await
+            .expect("persist start record");
+
+            assert!(
+                channels
+                    .load(
+                        SECRET_ID,
+                        crate::protocol::types::ChannelQuery::Helper {
+                            channel_id: CHANNEL
+                        }
+                    )
+                    .await
+                    .expect("load")
+                    .and_then(|r| r.as_helper().cloned())
+                    .is_none(),
+                "a replica scanner writes no helper record — resolving only that \
+                 shape is what broke PrePair for replicas"
+            );
+
+            let member = channels
+                .load(
+                    SECRET_ID,
+                    crate::protocol::types::ChannelQuery::Replica {
+                        channel_id: CHANNEL,
+                        replica_id: ReplicaId(OWN_REPLICA),
+                    },
+                )
+                .await
+                .expect("load")
+                .and_then(|r| r.as_replica().cloned())
+                .expect("the replica scanner records its own roster row");
+            assert_eq!(
+                member.role.to_sender_kind(),
+                SenderKind::ReplicaDestination,
+                "the row carries the local kind the PrePair response needs"
+            );
+        });
+    }
+
+    /// The helper path is unchanged: it still records the peer's role and the
+    /// local kind is its counterparty.
+    #[test]
+    fn a_helper_scanner_is_recorded_as_a_helper_channel() {
+        run_async(async {
+            let mut channels = InMemChannelStore::default();
+            persist_start_record(
+                &mut channels,
+                SECRET_ID,
+                CHANNEL,
+                endpoint(),
+                &endpoint(),
+                std::collections::HashMap::new(),
+                SenderKind::Owner,
+                None,
+            )
+            .await
+            .expect("persist start record");
+
+            let helper: HelperChannel = channels
+                .load(
+                    SECRET_ID,
+                    crate::protocol::types::ChannelQuery::Helper {
+                        channel_id: CHANNEL,
+                    },
+                )
+                .await
+                .expect("load")
+                .and_then(|r| r.as_helper().cloned())
+                .expect("helper record present");
+            assert_eq!(helper.peer_role.counterparty(), SenderKind::Owner);
+            assert_eq!(helper.status, ChannelStatus::Pending);
+            let _ = ChannelRecord::Replica(ReplicaMember {
+                channel_id: CHANNEL,
+                replica_id: ReplicaId(OWN_REPLICA),
+                transport: endpoint(),
+                communication_info: std::collections::HashMap::new(),
+                role: crate::protocol::types::ReplicaRole::Destination,
+                status: ChannelStatus::Pending,
+                created_at: 0,
+            });
+        });
+    }
+}
+
+#[cfg(test)]
+mod pairing_material_cleanup_tests {
+    use super::*;
+    use crate::protocol::test::{InMemSecretStore, run_async};
+
+    const SECRET_ID: u64 = 0x0C00_7AC7;
+    const TRANSIENT: ChannelId = ChannelId(1004);
+
+    /// A completed pairing must leave nothing behind at the transient channel.
+    ///
+    /// `create_contact` stores a `PairingContact` rather than a
+    /// `PairingSecret` under `NoKeys` — that mode has no key material yet, and
+    /// the contact is what authenticates the later `PrePairRequest` by nonce.
+    /// The accept path used to remove only the secret, so every `NoKeys`
+    /// pairing stranded one contact row at an id nothing addresses again.
+    #[test]
+    fn a_spent_pairing_contact_is_dropped() {
+        run_async(async {
+            let mut secrets = InMemSecretStore::default();
+            secrets
+                .save(
+                    SECRET_ID,
+                    TRANSIENT,
+                    SecretValue::PairingContact(Default::default()),
+                )
+                .await
+                .expect("seed contact");
+
+            let _ = secrets
+                .remove(SECRET_ID, TRANSIENT, SecretKind::PairingSecret)
+                .await;
+            let _ = secrets
+                .remove(SECRET_ID, TRANSIENT, SecretKind::PairingContact)
+                .await;
+
+            let left = secrets
+                .load(SECRET_ID, TRANSIENT, SecretKind::PairingContact)
+                .await
+                .expect("load");
+            assert!(
+                left.is_none(),
+                "the transient contact must not outlive the handshake"
+            );
+        });
+    }
+}
+
 #[cfg(test)]
 mod replica_id_conflict_tests {
     use crate::protocol::test::{InMemChannelStore, InMemSecretStore, run_async};

@@ -52,6 +52,25 @@ const SECRET_ID: u64 = 0x0005_CE1A;
 /// Five helpers, threshold three: the secret survives losing two of them.
 const THRESHOLD: usize = 3;
 
+/// How each helper's contact delivers the initiator's keys. All three modes
+/// are represented so no flow below is only ever proven over the simplest one.
+/// One replica admitted per contact mode, so replica pairing — which alone
+/// carries the fingerprint gate — is proven over all three rather than only
+/// the simplest.
+const REPLICA_CONTACT_MODES: [ContactMode; 3] = [
+    ContactMode::InlineKeys,
+    ContactMode::HashedKeys,
+    ContactMode::NoKeys,
+];
+
+const HELPER_CONTACT_MODES: [ContactMode; 5] = [
+    ContactMode::InlineKeys,
+    ContactMode::InlineKeys,
+    ContactMode::HashedKeys,
+    ContactMode::HashedKeys,
+    ContactMode::NoKeys,
+];
+
 const REPLICA_OWNER: u64 = 0x0A11_CE01;
 const REPLICA_TWO: u64 = 0x0A11_CE02;
 const REPLICA_THREE: u64 = 0x0A11_CE03;
@@ -261,7 +280,10 @@ async fn step_4_rotate_helpers(
                 .chain(helpers.iter().map(|h| &h.peer))
                 .chain(std::iter::once(&spare.peer))
                 .collect();
-            pair_helper(owner, &spare.peer, transient, &cast).await
+            // The replacements come in on the two modes with a PrePair leg,
+            // so rotation is never proven only over InlineKeys.
+            let mode = if i == 0 { ContactMode::HashedKeys } else { ContactMode::NoKeys };
+            pair_helper(owner, &spare.peer, transient, &cast, mode).await
         };
         spare.channel = Some(channel);
         helpers.push(spare);
@@ -347,7 +369,7 @@ async fn step_5_admit_first_replica(
     replicas: &mut [ReplicaDevice],
 ) {
     let replica = &replicas[0];
-    admit_replica(owner, helpers, &[], replica, ChannelId(4000)).await;
+    admit_replica(owner, helpers, &[], replica, ChannelId(4000), REPLICA_CONTACT_MODES[0]).await;
 
     assert_eq!(
         replica_ids(&owner.client(), SECRET_ID).await,
@@ -457,9 +479,9 @@ async fn step_7_admit_remaining_replicas(
     replicas: &mut [ReplicaDevice],
 ) {
     let (admitted, rest) = replicas.split_at(1);
-    admit_replica(owner, helpers, admitted, &rest[0], ChannelId(6000)).await;
+    admit_replica(owner, helpers, admitted, &rest[0], ChannelId(6000), REPLICA_CONTACT_MODES[1]).await;
     let (admitted, rest) = replicas.split_at(2);
-    admit_replica(owner, helpers, admitted, &rest[0], ChannelId(6001)).await;
+    admit_replica(owner, helpers, admitted, &rest[0], ChannelId(6001), REPLICA_CONTACT_MODES[2]).await;
 
     let expected = vec![REPLICA_OWNER, REPLICA_TWO, REPLICA_THREE, REPLICA_FOUR];
     assert_eq!(
@@ -658,17 +680,24 @@ async fn step_9_remove_a_replica(
 /// Pair a replica device into the group and carry it to the current version.
 ///
 /// Replica pairing needs the fingerprint confirmed out of band before the
-/// member counts as paired, which is what promotes it from `Pending`.
+/// member counts as paired, which is what promotes it from `Pending`. Unlike a
+/// helper channel — which is usable the moment the handshake completes — a
+/// member stays `Pending` until both sides compare fingerprints, so this is
+/// also the only place that gate is exercised.
+///
+/// `mode` selects the contact mode; the three replicas between them cover all
+/// three, so no mode is only ever proven on the helper path.
 async fn admit_replica(
     owner: &StatelessPeer,
     helpers: &[HelperDevice],
     already_admitted: &[ReplicaDevice],
     replica: &ReplicaDevice,
     transient: ChannelId,
+    mode: ContactMode,
 ) {
     let contact = owner
         .session()
-        .create_contact(Some(transient), ContactMode::InlineKeys, None)
+        .create_contact(Some(transient), mode, None)
         .await
         .expect("owner.create_contact failed");
     replica
@@ -743,13 +772,18 @@ async fn admit_replica(
 }
 
 async fn step_1_pair_helpers(owner: &StatelessPeer, helpers: &mut [HelperDevice]) {
+    // A real account is not paired one way. Spread the five across every
+    // contact mode so the whole lifecycle below — publishing, recovery,
+    // rotation, replica admission — runs over a mixed set rather than the
+    // easiest one.
     for i in 0..helpers.len() {
         let transient = ChannelId(1000 + i as u64);
+        let mode = HELPER_CONTACT_MODES[i];
         let channel = {
             let cast: Vec<&StatelessPeer> = std::iter::once(owner)
                 .chain(helpers.iter().map(|h| &h.peer))
                 .collect();
-            pair_helper(owner, &helpers[i].peer, transient, &cast).await
+            pair_helper(owner, &helpers[i].peer, transient, &cast, mode).await
         };
         helpers[i].channel = Some(channel);
     }
@@ -974,15 +1008,21 @@ async fn step_3_recover_after_device_loss(
 /// `cast` must list every peer currently reachable, not just the two shaking
 /// hands: admitting a helper re-publishes the current version to everyone
 /// already paired, so those messages need somewhere to land.
+///
+/// `mode` selects how the contact carries the initiator's keys. `HashedKeys`
+/// and `NoKeys` add a `PrePair` round-trip before the pair handshake proper;
+/// pumping to quiescence covers that without the caller doing anything
+/// differently.
 async fn pair_helper(
     owner: &StatelessPeer,
     helper: &StatelessPeer,
     transient: ChannelId,
     cast: &[&StatelessPeer],
+    mode: ContactMode,
 ) -> ChannelId {
     let contact = owner
         .session()
-        .create_contact(Some(transient), ContactMode::InlineKeys, None)
+        .create_contact(Some(transient), mode, None)
         .await
         .expect("owner.create_contact failed");
 
@@ -1053,9 +1093,11 @@ async fn recover_from_helpers(
 
     for (i, helper) in helpers.iter_mut().enumerate() {
         let transient = ChannelId(transient_base + i as u64);
+        // Recovery re-pairs on the same mode the helper was originally
+        // admitted with, so recovery is exercised across all three too.
         let contact = owner
             .session()
-            .create_contact(Some(transient), ContactMode::InlineKeys, None)
+            .create_contact(Some(transient), HELPER_CONTACT_MODES[i % HELPER_CONTACT_MODES.len()], None)
             .await
             .expect("recovery create_contact failed");
         helper
