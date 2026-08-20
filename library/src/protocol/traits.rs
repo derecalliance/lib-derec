@@ -11,68 +11,110 @@ use crate::types::ChannelId;
 use derec_proto::TransportProtocol;
 use std::{future::Future, pin::Pin};
 
+// The `Send` contract, and why it is keyed on the target only.
+//
+// Every future below is `Send` on native targets and non-`Send` on `wasm32`.
+// The distinction MUST stay keyed on `target_arch`. It must never be keyed on
+// a Cargo feature — including `ffi`, where it used to live.
+//
+// Cargo features are additive and unified across an entire build graph, so a
+// feature-keyed bound is not a property of the crate that asked for it: any
+// crate anywhere in the graph enabling that feature silently removes `Send`
+// for every other consumer in the same build. A service that never asked for
+// FFI would stop compiling because a sibling crate started producing a dylib,
+// and the resulting error points at the service's own handler rather than at
+// the cause. A `target_arch` condition cannot be flipped that way.
+//
+// The FFI shim does not need the relaxation: its store adapters already
+// declare `Send`/`Sync` over their `*mut c_void` user data, and the shim
+// drives futures on a `new_current_thread` runtime, so nothing crosses a
+// thread regardless of the bound.
+//
+// `assert_store_futures_are_send` below fails the build if this is ever
+// undone.
+
 /// Type-erased future returned by [`DeRecSecretStore`] methods.
 ///
-/// `Send` on native targets so multi-threaded executors (e.g. `tokio::spawn`)
-/// can take it; under the `ffi` feature or `wasm32` the `Send` bound is
-/// dropped because callbacks cross an FFI boundary or run in a
-/// single-threaded host. Sync backends can return
+/// `Send` on every native target so multi-threaded executors (e.g.
+/// `tokio::spawn`, an axum handler pool) can take it. Only `wasm32` drops the
+/// bound, because its store adapters hold `JsValue`, which is not `Send`.
+///
+/// The condition is deliberately **`target_arch` alone, never a Cargo
+/// feature** — see the `Send` contract note below. Sync backends can return
 /// `Box::pin(std::future::ready(...))` at zero cost.
-#[cfg(any(feature = "ffi", target_arch = "wasm32"))]
+#[cfg(target_arch = "wasm32")]
 pub type SecretStoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = std::result::Result<T, SecretStoreError>> + 'a>>;
 /// Type-erased future returned by [`DeRecSecretStore`] methods.
 ///
-/// `Send` on native targets so multi-threaded executors (e.g. `tokio::spawn`)
-/// can take it; under the `ffi` feature or `wasm32` the `Send` bound is
-/// dropped because callbacks cross an FFI boundary or run in a
-/// single-threaded host. Sync backends can return
+/// `Send` on every native target so multi-threaded executors (e.g.
+/// `tokio::spawn`, an axum handler pool) can take it. Only `wasm32` drops the
+/// bound, because its store adapters hold `JsValue`, which is not `Send`.
+///
+/// The condition is deliberately **`target_arch` alone, never a Cargo
+/// feature** — see the `Send` contract note below. Sync backends can return
 /// `Box::pin(std::future::ready(...))` at zero cost.
-#[cfg(not(any(feature = "ffi", target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 pub type SecretStoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = std::result::Result<T, SecretStoreError>> + Send + 'a>>;
 
 /// Type-erased future returned by [`DeRecChannelStore`] methods. See
-/// [`SecretStoreFuture`] for the `Send`/non-`Send` rules.
-#[cfg(any(feature = "ffi", target_arch = "wasm32"))]
+/// [`SecretStoreFuture`] for the `Send` rules.
+#[cfg(target_arch = "wasm32")]
 pub type ChannelStoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = std::result::Result<T, ChannelStoreError>> + 'a>>;
 /// Type-erased future returned by [`DeRecChannelStore`] methods. See
-/// [`SecretStoreFuture`] for the `Send`/non-`Send` rules.
-#[cfg(not(any(feature = "ffi", target_arch = "wasm32")))]
+/// [`SecretStoreFuture`] for the `Send` rules.
+#[cfg(not(target_arch = "wasm32"))]
 pub type ChannelStoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = std::result::Result<T, ChannelStoreError>> + Send + 'a>>;
 
 /// Type-erased future returned by [`DeRecShareStore`] methods. See
-/// [`SecretStoreFuture`] for the `Send`/non-`Send` rules.
-#[cfg(any(feature = "ffi", target_arch = "wasm32"))]
+/// [`SecretStoreFuture`] for the `Send` rules.
+#[cfg(target_arch = "wasm32")]
 pub type ShareStoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = std::result::Result<T, ShareStoreError>> + 'a>>;
 /// Type-erased future returned by [`DeRecShareStore`] methods. See
-/// [`SecretStoreFuture`] for the `Send`/non-`Send` rules.
-#[cfg(not(any(feature = "ffi", target_arch = "wasm32")))]
+/// [`SecretStoreFuture`] for the `Send` rules.
+#[cfg(not(target_arch = "wasm32"))]
 pub type ShareStoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = std::result::Result<T, ShareStoreError>> + Send + 'a>>;
 
 /// Type-erased future returned by [`DeRecTransport::send`]. See
-/// [`SecretStoreFuture`] for the `Send`/non-`Send` rules.
-#[cfg(any(feature = "ffi", target_arch = "wasm32"))]
+/// [`SecretStoreFuture`] for the `Send` rules.
+#[cfg(target_arch = "wasm32")]
 pub type TransportFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
 /// Type-erased future returned by [`DeRecTransport::send`]. See
-/// [`SecretStoreFuture`] for the `Send`/non-`Send` rules.
-#[cfg(not(any(feature = "ffi", target_arch = "wasm32")))]
+/// [`SecretStoreFuture`] for the `Send` rules.
+#[cfg(not(target_arch = "wasm32"))]
 pub type TransportFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
 /// Type-erased future returned by [`DeRecStateStore`] methods. See
-/// [`SecretStoreFuture`] for the `Send`/non-`Send` rules.
-#[cfg(any(feature = "ffi", target_arch = "wasm32"))]
+/// [`SecretStoreFuture`] for the `Send` rules.
+#[cfg(target_arch = "wasm32")]
 pub type StateStoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = std::result::Result<T, StateStoreError>> + 'a>>;
 /// Type-erased future returned by [`DeRecStateStore`] methods. See
-/// [`SecretStoreFuture`] for the `Send`/non-`Send` rules.
-#[cfg(not(any(feature = "ffi", target_arch = "wasm32")))]
+/// [`SecretStoreFuture`] for the `Send` rules.
+#[cfg(not(target_arch = "wasm32"))]
 pub type StateStoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = std::result::Result<T, StateStoreError>> + Send + 'a>>;
+
+/// Fails to compile if any store future loses `Send` on a native target.
+///
+/// The bound is load-bearing for every threaded host — `tokio::spawn`, axum,
+/// actix all require it — and it was previously possible to remove it from a
+/// distance by enabling a Cargo feature. This makes that a build error in the
+/// crate that caused it rather than a confusing one in a consumer.
+#[cfg(not(target_arch = "wasm32"))]
+const _: () = {
+    const fn require_send<T: Send>() {}
+    require_send::<SecretStoreFuture<'static, ()>>();
+    require_send::<ChannelStoreFuture<'static, ()>>();
+    require_send::<ShareStoreFuture<'static, ()>>();
+    require_send::<StateStoreFuture<'static, ()>>();
+    require_send::<TransportFuture<'static>>();
+};
 
 /// Keychain-grade storage for the protocol's per-channel cryptographic state.
 ///
