@@ -205,10 +205,6 @@ pub async fn run() {
     println!("✓ E2E stateless flow passed.\n");
 }
 
-// ---------------------------------------------------------------------------
-// Step 4 — helper rotation
-// ---------------------------------------------------------------------------
-
 /// Drop two helpers and take on two replacements — routine hygiene when a
 /// helper is decommissioned or a friend changes phone.
 ///
@@ -341,10 +337,6 @@ async fn step_4_rotate_helpers(
     retired
 }
 
-// ---------------------------------------------------------------------------
-// Step 5 — first replica
-// ---------------------------------------------------------------------------
-
 /// Admit a second device of the same user into a replica group.
 ///
 /// Unlike a helper, a replica holds the **whole** secret, so admission is
@@ -393,10 +385,6 @@ async fn step_5_admit_first_replica(
     assert_helpers(helpers, "step 5", 1).await;
     println!("  step 5: replica admitted — roster of 2 on both devices, replica synced  ✓");
 }
-
-// ---------------------------------------------------------------------------
-// Step 6 — recovery with a replica group in place
-// ---------------------------------------------------------------------------
 
 /// Lose the owner device again, now that the protected secret carries a
 /// replica roster.
@@ -463,10 +451,6 @@ async fn step_6_recover_with_a_replica_in_the_roster(
     );
 }
 
-// ---------------------------------------------------------------------------
-// Step 7 — remaining replicas
-// ---------------------------------------------------------------------------
-
 async fn step_7_admit_remaining_replicas(
     owner: &StatelessPeer,
     helpers: &[HelperDevice],
@@ -512,10 +496,6 @@ async fn step_7_admit_remaining_replicas(
     assert_helpers(helpers, "step 7", 3).await;
     println!("  step 7: two more replicas admitted — all 4 devices share one roster  ✓");
 }
-
-// ---------------------------------------------------------------------------
-// Step 8 — protect more secrets
-// ---------------------------------------------------------------------------
 
 async fn step_8_protect_more_secrets(
     owner: &StatelessPeer,
@@ -590,10 +570,6 @@ async fn step_8_protect_more_secrets(
 
     secrets
 }
-
-// ---------------------------------------------------------------------------
-// Step 9 — remove a replica
-// ---------------------------------------------------------------------------
 
 /// Retire one of the user's devices from the group.
 ///
@@ -766,10 +742,6 @@ async fn admit_replica(
     pump(&cast).await;
 }
 
-// ---------------------------------------------------------------------------
-// Step 1 — pairing
-// ---------------------------------------------------------------------------
-
 async fn step_1_pair_helpers(owner: &StatelessPeer, helpers: &mut [HelperDevice]) {
     for i in 0..helpers.len() {
         let transient = ChannelId(1000 + i as u64);
@@ -813,10 +785,6 @@ async fn step_1_pair_helpers(owner: &StatelessPeer, helpers: &mut [HelperDevice]
     }
     println!("  step 1: owner paired 5 helpers — 5 channels + 5 key rows, 1 each helper-side  ✓");
 }
-
-// ---------------------------------------------------------------------------
-// Step 2 — protect secrets
-// ---------------------------------------------------------------------------
 
 /// The user secrets this account holds, in the order they were added.
 fn seed_secrets() -> Vec<UserSecret> {
@@ -911,10 +879,6 @@ async fn step_2_protect_secrets(
     all
 }
 
-// ---------------------------------------------------------------------------
-// Step 3 — device loss and recovery
-// ---------------------------------------------------------------------------
-
 /// The owner's device is gone. A replacement, with the same identity and
 /// endpoint but empty storage, re-pairs with each helper on a fresh channel,
 /// discovers what they hold, recovers the latest version and commits it.
@@ -1004,10 +968,6 @@ async fn step_3_recover_after_device_loss(
         expected.len()
     );
 }
-
-// ---------------------------------------------------------------------------
-// Shared operations
-// ---------------------------------------------------------------------------
 
 /// Drive an InlineKeys pair handshake between the owner and a helper.
 ///
@@ -1291,10 +1251,6 @@ async fn assert_replica(replica: &ReplicaDevice, step: &str, members: i64) {
     )
     .await;
 }
-
-// ---------------------------------------------------------------------------
-// Step 10 — a stranded round, resolved without any inbound message
-// ---------------------------------------------------------------------------
 
 /// The failure the rest of this scenario never produces: a helper that simply
 /// stops answering.

@@ -2628,7 +2628,7 @@ mod sharing_round_outcome_tests {
             .expect("seed round");
     }
 
-    /// C2 — a round with no further traffic still reaches a terminal state.
+    /// A round with no further traffic still reaches a terminal state.
     ///
     /// Timeouts are otherwise only evaluated inside `process`, so a publish
     /// whose helpers all go quiet has nothing left to trigger it. `tick` is
@@ -2698,7 +2698,7 @@ mod sharing_round_outcome_tests {
         });
     }
 
-    /// C2 — `tick` runs the unpair sweep too, not only the sharing round.
+    /// `tick` runs the unpair sweep too, not only the sharing round.
     ///
     /// An unpair sent under `UnpairAck::Required` keeps local state alive
     /// until the peer acknowledges. A peer that never answers would otherwise
@@ -2748,7 +2748,7 @@ mod sharing_round_outcome_tests {
         });
     }
 
-    /// C2 — a pending unpair still inside its window survives a `tick`.
+    /// A pending unpair still inside its window survives a `tick`.
     #[test]
     fn tick_leaves_a_recent_unpair_pending() {
         run_async(async {
@@ -2787,7 +2787,7 @@ mod sharing_round_outcome_tests {
         });
     }
 
-    /// C2 — expired-channel cleanup is part of `tick`, and follows the same
+    /// Expired-channel cleanup is part of `tick`, and follows the same
     /// configuration `process` honours rather than a rule of its own.
     ///
     /// Disabled is the default, so a `tick` on a protocol that never opted in

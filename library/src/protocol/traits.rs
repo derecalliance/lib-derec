@@ -11,28 +11,6 @@ use crate::types::ChannelId;
 use derec_proto::TransportProtocol;
 use std::{future::Future, pin::Pin};
 
-// The `Send` contract, and why it is keyed on the target only.
-//
-// Every future below is `Send` on native targets and non-`Send` on `wasm32`.
-// The distinction MUST stay keyed on `target_arch`. It must never be keyed on
-// a Cargo feature — including `ffi`, where it used to live.
-//
-// Cargo features are additive and unified across an entire build graph, so a
-// feature-keyed bound is not a property of the crate that asked for it: any
-// crate anywhere in the graph enabling that feature silently removes `Send`
-// for every other consumer in the same build. A service that never asked for
-// FFI would stop compiling because a sibling crate started producing a dylib,
-// and the resulting error points at the service's own handler rather than at
-// the cause. A `target_arch` condition cannot be flipped that way.
-//
-// The FFI shim does not need the relaxation: its store adapters already
-// declare `Send`/`Sync` over their `*mut c_void` user data, and the shim
-// drives futures on a `new_current_thread` runtime, so nothing crosses a
-// thread regardless of the bound.
-//
-// `assert_store_futures_are_send` below fails the build if this is ever
-// undone.
-
 /// Type-erased future returned by [`DeRecSecretStore`] methods.
 ///
 /// `Send` on every native target so multi-threaded executors (e.g.
@@ -102,10 +80,16 @@ pub type StateStoreFuture<'a, T> =
 
 /// Fails to compile if any store future loses `Send` on a native target.
 ///
-/// The bound is load-bearing for every threaded host — `tokio::spawn`, axum,
-/// actix all require it — and it was previously possible to remove it from a
-/// distance by enabling a Cargo feature. This makes that a build error in the
-/// crate that caused it rather than a confusing one in a consumer.
+/// The bound is load-bearing for every threaded host — `tokio::spawn`, axum
+/// and actix all require it.
+///
+/// The `Send` distinction must stay keyed on `target_arch`, never on a Cargo
+/// feature. Features are additive and unified across an entire build graph, so
+/// a feature-keyed bound is not a property of the crate that requested it: any
+/// crate anywhere in the graph enabling it would strip `Send` from every other
+/// consumer of the same build, and the resulting error would point at that
+/// consumer's own code rather than at the cause. This assertion turns that
+/// mistake into a build failure here instead.
 #[cfg(not(target_arch = "wasm32"))]
 const _: () = {
     const fn require_send<T: Send>() {}
@@ -684,4 +668,443 @@ pub trait DeRecStateStore {
     /// bounded by the number of channels or active reconstruction
     /// targets and is expected to be small.
     fn load_all(&self, secret_id: u64, kind: StateKind) -> StateStoreFuture<'_, Vec<StateItem>>;
+}
+
+impl<T: DeRecSecretStore + ?Sized> DeRecSecretStore for Box<T> {
+    fn load(
+        &self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        kind: SecretKind,
+    ) -> SecretStoreFuture<'_, Option<SecretValue>> {
+        (**self).load(secret_id, channel_id, kind)
+    }
+    fn load_many(
+        &self,
+        secret_id: u64,
+        channel_ids: &[ChannelId],
+        kind: SecretKind,
+        missing_policy: MissingPolicy,
+    ) -> SecretStoreFuture<'_, Vec<(ChannelId, SecretValue)>> {
+        (**self).load_many(secret_id, channel_ids, kind, missing_policy)
+    }
+    fn save(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        value: SecretValue,
+    ) -> SecretStoreFuture<'_, ()> {
+        (**self).save(secret_id, channel_id, value)
+    }
+    fn remove(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        kind: SecretKind,
+    ) -> SecretStoreFuture<'_, ()> {
+        (**self).remove(secret_id, channel_id, kind)
+    }
+}
+
+impl<T: DeRecChannelStore + ?Sized> DeRecChannelStore for Box<T> {
+    fn load(
+        &self,
+        secret_id: u64,
+        query: ChannelQuery,
+    ) -> ChannelStoreFuture<'_, Option<ChannelRecord>> {
+        (**self).load(secret_id, query)
+    }
+    fn save(&mut self, secret_id: u64, record: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
+        (**self).save(secret_id, record)
+    }
+    fn remove(&mut self, secret_id: u64, query: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
+        (**self).remove(secret_id, query)
+    }
+    fn helpers(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+        (**self).helpers(secret_id)
+    }
+    fn replicas(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
+        (**self).replicas(secret_id)
+    }
+    fn link_channel(
+        &mut self,
+        secret_id: u64,
+        a: ChannelId,
+        b: ChannelId,
+    ) -> ChannelStoreFuture<'_, ()> {
+        (**self).link_channel(secret_id, a, b)
+    }
+    fn linked_channels(
+        &self,
+        secret_id: u64,
+        channel_id: ChannelId,
+    ) -> ChannelStoreFuture<'_, Vec<ChannelId>> {
+        (**self).linked_channels(secret_id, channel_id)
+    }
+}
+
+impl<T: DeRecShareStore + ?Sized> DeRecShareStore for Box<T> {
+    fn load(
+        &self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        versions: &[u32],
+    ) -> ShareStoreFuture<'_, Vec<Share>> {
+        (**self).load(secret_id, channel_id, versions)
+    }
+    fn load_many(
+        &self,
+        secret_id: u64,
+        channel_ids: &[ChannelId],
+        versions: &[u32],
+    ) -> ShareStoreFuture<'_, Vec<Share>> {
+        (**self).load_many(secret_id, channel_ids, versions)
+    }
+    fn load_all(
+        &self,
+        secret_id: u64,
+        channel_ids: &[ChannelId],
+    ) -> ShareStoreFuture<'_, Vec<Share>> {
+        (**self).load_all(secret_id, channel_ids)
+    }
+    fn latest_version(&self, secret_id: u64) -> ShareStoreFuture<'_, Option<u32>> {
+        (**self).latest_version(secret_id)
+    }
+    fn save(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        share: Share,
+    ) -> ShareStoreFuture<'_, ()> {
+        (**self).save(secret_id, channel_id, share)
+    }
+    fn remove_channel(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+    ) -> ShareStoreFuture<'_, ()> {
+        (**self).remove_channel(secret_id, channel_id)
+    }
+}
+
+impl<T: DeRecUserSecretStore + ?Sized> DeRecUserSecretStore for Box<T> {
+    fn load_latest(&self, secret_id: u64) -> ShareStoreFuture<'_, Option<UserSecrets>> {
+        (**self).load_latest(secret_id)
+    }
+    fn save_latest(&mut self, secret_id: u64, value: UserSecrets) -> ShareStoreFuture<'_, ()> {
+        (**self).save_latest(secret_id, value)
+    }
+    fn remove(&mut self, secret_id: u64) -> ShareStoreFuture<'_, ()> {
+        (**self).remove(secret_id)
+    }
+}
+
+impl<T: DeRecStateStore + ?Sized> DeRecStateStore for Box<T> {
+    fn save(&mut self, secret_id: u64, item: StateItem) -> StateStoreFuture<'_, ()> {
+        (**self).save(secret_id, item)
+    }
+    fn load(&self, secret_id: u64, key: StateKey) -> StateStoreFuture<'_, Option<StateItem>> {
+        (**self).load(secret_id, key)
+    }
+    fn remove(&mut self, secret_id: u64, key: StateKey) -> StateStoreFuture<'_, bool> {
+        (**self).remove(secret_id, key)
+    }
+    fn load_all(&self, secret_id: u64, kind: StateKind) -> StateStoreFuture<'_, Vec<StateItem>> {
+        (**self).load_all(secret_id, kind)
+    }
+}
+
+impl<T: DeRecTransport + ?Sized> DeRecTransport for Box<T> {
+    fn send(&self, endpoint: &TransportProtocol, message: Vec<u8>) -> TransportFuture<'_> {
+        (**self).send(endpoint, message)
+    }
+}
+
+impl<T: DeRecSecretStore + ?Sized> DeRecSecretStore for &mut T {
+    fn load(
+        &self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        kind: SecretKind,
+    ) -> SecretStoreFuture<'_, Option<SecretValue>> {
+        (**self).load(secret_id, channel_id, kind)
+    }
+    fn load_many(
+        &self,
+        secret_id: u64,
+        channel_ids: &[ChannelId],
+        kind: SecretKind,
+        missing_policy: MissingPolicy,
+    ) -> SecretStoreFuture<'_, Vec<(ChannelId, SecretValue)>> {
+        (**self).load_many(secret_id, channel_ids, kind, missing_policy)
+    }
+    fn save(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        value: SecretValue,
+    ) -> SecretStoreFuture<'_, ()> {
+        (**self).save(secret_id, channel_id, value)
+    }
+    fn remove(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        kind: SecretKind,
+    ) -> SecretStoreFuture<'_, ()> {
+        (**self).remove(secret_id, channel_id, kind)
+    }
+}
+
+impl<T: DeRecChannelStore + ?Sized> DeRecChannelStore for &mut T {
+    fn load(
+        &self,
+        secret_id: u64,
+        query: ChannelQuery,
+    ) -> ChannelStoreFuture<'_, Option<ChannelRecord>> {
+        (**self).load(secret_id, query)
+    }
+    fn save(&mut self, secret_id: u64, record: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
+        (**self).save(secret_id, record)
+    }
+    fn remove(&mut self, secret_id: u64, query: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
+        (**self).remove(secret_id, query)
+    }
+    fn helpers(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+        (**self).helpers(secret_id)
+    }
+    fn replicas(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
+        (**self).replicas(secret_id)
+    }
+    fn link_channel(
+        &mut self,
+        secret_id: u64,
+        a: ChannelId,
+        b: ChannelId,
+    ) -> ChannelStoreFuture<'_, ()> {
+        (**self).link_channel(secret_id, a, b)
+    }
+    fn linked_channels(
+        &self,
+        secret_id: u64,
+        channel_id: ChannelId,
+    ) -> ChannelStoreFuture<'_, Vec<ChannelId>> {
+        (**self).linked_channels(secret_id, channel_id)
+    }
+}
+
+impl<T: DeRecShareStore + ?Sized> DeRecShareStore for &mut T {
+    fn load(
+        &self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        versions: &[u32],
+    ) -> ShareStoreFuture<'_, Vec<Share>> {
+        (**self).load(secret_id, channel_id, versions)
+    }
+    fn load_many(
+        &self,
+        secret_id: u64,
+        channel_ids: &[ChannelId],
+        versions: &[u32],
+    ) -> ShareStoreFuture<'_, Vec<Share>> {
+        (**self).load_many(secret_id, channel_ids, versions)
+    }
+    fn load_all(
+        &self,
+        secret_id: u64,
+        channel_ids: &[ChannelId],
+    ) -> ShareStoreFuture<'_, Vec<Share>> {
+        (**self).load_all(secret_id, channel_ids)
+    }
+    fn latest_version(&self, secret_id: u64) -> ShareStoreFuture<'_, Option<u32>> {
+        (**self).latest_version(secret_id)
+    }
+    fn save(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+        share: Share,
+    ) -> ShareStoreFuture<'_, ()> {
+        (**self).save(secret_id, channel_id, share)
+    }
+    fn remove_channel(
+        &mut self,
+        secret_id: u64,
+        channel_id: ChannelId,
+    ) -> ShareStoreFuture<'_, ()> {
+        (**self).remove_channel(secret_id, channel_id)
+    }
+}
+
+impl<T: DeRecUserSecretStore + ?Sized> DeRecUserSecretStore for &mut T {
+    fn load_latest(&self, secret_id: u64) -> ShareStoreFuture<'_, Option<UserSecrets>> {
+        (**self).load_latest(secret_id)
+    }
+    fn save_latest(&mut self, secret_id: u64, value: UserSecrets) -> ShareStoreFuture<'_, ()> {
+        (**self).save_latest(secret_id, value)
+    }
+    fn remove(&mut self, secret_id: u64) -> ShareStoreFuture<'_, ()> {
+        (**self).remove(secret_id)
+    }
+}
+
+impl<T: DeRecStateStore + ?Sized> DeRecStateStore for &mut T {
+    fn save(&mut self, secret_id: u64, item: StateItem) -> StateStoreFuture<'_, ()> {
+        (**self).save(secret_id, item)
+    }
+    fn load(&self, secret_id: u64, key: StateKey) -> StateStoreFuture<'_, Option<StateItem>> {
+        (**self).load(secret_id, key)
+    }
+    fn remove(&mut self, secret_id: u64, key: StateKey) -> StateStoreFuture<'_, bool> {
+        (**self).remove(secret_id, key)
+    }
+    fn load_all(&self, secret_id: u64, kind: StateKind) -> StateStoreFuture<'_, Vec<StateItem>> {
+        (**self).load_all(secret_id, kind)
+    }
+}
+
+impl<T: DeRecTransport + ?Sized> DeRecTransport for &mut T {
+    fn send(&self, endpoint: &TransportProtocol, message: Vec<u8>) -> TransportFuture<'_> {
+        (**self).send(endpoint, message)
+    }
+}
+
+/// A transport can be shared; a store cannot.
+///
+/// `Arc` never yields `&mut T`, and every store trait has at least one
+/// `&mut self` method, so `Arc<dyn DeRecChannelStore>` and friends cannot
+/// exist. [`DeRecTransport`] is the one trait whose methods are all `&self`,
+/// which is also why it is the one worth sharing — a transport is typically a
+/// pooled client held across requests.
+///
+/// Use [`Box<T>`](Box) or `&mut T` for the stores; both are implemented for
+/// every trait here.
+impl<T: DeRecTransport + ?Sized> DeRecTransport for std::sync::Arc<T> {
+    fn send(&self, endpoint: &TransportProtocol, message: Vec<u8>) -> TransportFuture<'_> {
+        (**self).send(endpoint, message)
+    }
+}
+
+#[cfg(test)]
+mod pointer_forwarding_tests {
+    use super::*;
+    use crate::protocol::test::{
+        InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
+        InMemUserSecretStore, NoopTransport, run_async,
+    };
+    use crate::protocol::{DeRecProtocol, DeRecProtocolBuilder};
+
+    const SECRET_ID: u64 = 0x0B0_9ED;
+
+    /// A protocol whose backends are all type-erased. Naming this type at all
+    /// is the point: without the blanket impls it does not satisfy the
+    /// builder's bounds, and an application cannot choose a backend at run
+    /// time without threading six type parameters everywhere.
+    type ErasedProtocol = DeRecProtocol<
+        Box<dyn DeRecChannelStore>,
+        Box<dyn DeRecShareStore>,
+        Box<dyn DeRecSecretStore>,
+        Box<dyn DeRecUserSecretStore>,
+        Box<dyn DeRecStateStore>,
+        std::sync::Arc<NoopTransport>,
+    >;
+
+    fn build_erased() -> ErasedProtocol {
+        DeRecProtocolBuilder::new(SECRET_ID)
+            .with_channel_store(Box::new(InMemChannelStore::default()) as Box<dyn DeRecChannelStore>)
+            .with_share_store(Box::new(InMemShareStore::default()) as Box<dyn DeRecShareStore>)
+            .with_secret_store(Box::new(InMemSecretStore::default()) as Box<dyn DeRecSecretStore>)
+            .with_user_secret_store(
+                Box::new(InMemUserSecretStore::default()) as Box<dyn DeRecUserSecretStore>
+            )
+            .with_state_store(
+                Box::new(InMemPersistedStateStore::default()) as Box<dyn DeRecStateStore>
+            )
+            .with_transport(std::sync::Arc::new(NoopTransport))
+            .with_own_transport("https://erased.example.com")
+            .with_threshold(2)
+            .build()
+            .expect("a fully type-erased protocol must build")
+    }
+
+    /// The forwarding has to work through the pointer, not merely compile.
+    /// A `&mut self` method reached through a `Box<dyn _>` is the case that
+    /// would break if the impls forwarded to the wrong receiver.
+    #[test]
+    fn an_erased_protocol_reads_back_what_it_wrote() {
+        run_async(async {
+            let mut protocol = build_erased();
+
+            protocol
+                .state_store
+                .save(
+                    SECRET_ID,
+                    StateItem::PendingUnpair {
+                        channel_id: ChannelId(4242),
+                        started_at: 1_700_000_000,
+                    },
+                )
+                .await
+                .expect("save through Box<dyn DeRecStateStore>");
+
+            let loaded = protocol
+                .state_store
+                .load(
+                    SECRET_ID,
+                    StateKey::PendingUnpair {
+                        channel_id: ChannelId(4242),
+                    },
+                )
+                .await
+                .expect("load through Box<dyn DeRecStateStore>");
+            assert!(
+                loaded.is_some(),
+                "the write must be visible through the box"
+            );
+
+            let removed = protocol
+                .state_store
+                .remove(
+                    SECRET_ID,
+                    StateKey::PendingUnpair {
+                        channel_id: ChannelId(4242),
+                    },
+                )
+                .await
+                .expect("remove through Box<dyn DeRecStateStore>");
+            assert!(removed, "remove reports it deleted the row");
+        });
+    }
+
+    /// `tick` exercises several backends behind their boxes in one call, so a
+    /// forwarding mistake in any of them surfaces here.
+    #[test]
+    fn an_erased_protocol_ticks() {
+        run_async(async {
+            let mut protocol = build_erased();
+            let events = protocol.tick().await;
+            assert!(events.is_empty(), "idle tick; got {events:?}");
+        });
+    }
+
+    /// `&mut T` satisfies the bounds too, which is what lets a caller lend a
+    /// store it still owns.
+    #[test]
+    fn a_borrowed_store_satisfies_the_bound() {
+        fn assert_store<S: DeRecStateStore>() {}
+        assert_store::<&mut InMemPersistedStateStore>();
+        assert_store::<Box<InMemPersistedStateStore>>();
+        assert_store::<Box<dyn DeRecStateStore>>();
+    }
+
+    /// A transport is the one thing worth sharing, and the only trait whose
+    /// methods are all `&self` — so `Arc` works there and nowhere else.
+    #[test]
+    fn a_transport_can_be_shared_behind_an_arc() {
+        fn assert_transport<T: DeRecTransport>() {}
+        assert_transport::<std::sync::Arc<NoopTransport>>();
+        assert_transport::<std::sync::Arc<dyn DeRecTransport>>();
+        assert_transport::<Box<dyn DeRecTransport>>();
+    }
 }

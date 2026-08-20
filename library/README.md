@@ -30,6 +30,7 @@ Alliance**.
 - [Replica flows](#replica-flows)
 - [Correlation and routing on the wire](#correlation-and-routing-on-the-wire)
 - [Storage and transport traits](#storage-and-transport-traits)
+- [Choosing backends at run time](#choosing-backends-at-run-time)
 - [Errors](#errors)
 - [Async and executors](#async-and-executors)
 - [WebAssembly support](#webassembly-support)
@@ -667,6 +668,36 @@ so implementations need no internal synchronization:
 Each trait's rustdoc states its contract, idempotency expectations, and the
 security classification of the data it holds (`DeRecSecretStore` content is
 keychain-grade; the others need durable storage only).
+
+### Choosing backends at run time
+
+`DeRecProtocol` is generic over all six, so by default the concrete backends
+are baked into its type. To pick one at run time — Postgres in production,
+in-memory under test — box the trait objects; the library implements every
+trait for `Box<T>` and `&mut T`, so an erased protocol satisfies the builder's
+bounds without any wrapper of your own:
+
+```rust,ignore
+type AnyProtocol = DeRecProtocol<
+    Box<dyn DeRecChannelStore>,
+    Box<dyn DeRecShareStore>,
+    Box<dyn DeRecSecretStore>,
+    Box<dyn DeRecUserSecretStore>,
+    Box<dyn DeRecStateStore>,
+    Arc<dyn DeRecTransport>,
+>;
+
+let protocol = DeRecProtocolBuilder::new(secret_id)
+    .with_channel_store(Box::new(PostgresChannelStore::new(db)) as Box<dyn DeRecChannelStore>)
+    // ...the rest of the stores, then a transport shared across requests:
+    .with_transport(Arc::clone(&http))
+    .build()?;
+```
+
+`Arc<T>` is implemented for `DeRecTransport` only. Every store has `&mut self`
+methods and `Arc` never yields `&mut T`, so a store behind an `Arc` cannot
+compile. The transport is the one `&self`-only trait — which is also the one
+worth sharing, since it is typically a pooled client.
 
 ---
 
