@@ -792,6 +792,21 @@ export declare class DeRecProtocol {
 
   process(message: Uint8Array): Promise<DeRecEvent[]>;
 
+  /**
+   * Advance time-driven state without an inbound message.
+   *
+   * Timeouts are otherwise only evaluated by `process`, so a publish whose
+   * helpers all go quiet has nothing left to close it: the round stays open
+   * and no `SharingComplete` is ever emitted. Call this from a timer —
+   * `setInterval`, a service-worker alarm, a job runner — at an interval
+   * shorter than the configured timeout.
+   *
+   * Safe to call at any time; with nothing in flight it resolves to an empty
+   * array. It mutates the same round state an inbound response does, so it
+   * must be serialized against `process` for the same `secretId`.
+   */
+  tick(): Promise<DeRecEvent[]>;
+
   accept(actionBytes: Uint8Array): Promise<DeRecEvent[]>;
 
   reject(actionBytes: Uint8Array, status: number, memo: string): Promise<void>;

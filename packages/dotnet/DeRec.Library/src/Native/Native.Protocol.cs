@@ -297,6 +297,9 @@ internal static class Protocol
         IntPtr handle, byte[] message, UIntPtr messageLen);
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern DeRecProtocolEventsResult derec_protocol_tick(IntPtr handle);
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern DeRecProtocolEventsResult derec_protocol_accept(
         IntPtr handle, byte[] action, UIntPtr actionLen);
 

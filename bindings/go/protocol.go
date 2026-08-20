@@ -616,6 +616,14 @@ func runProtocol() {
 	helperA := newPeer("helper-a", "https://helper-a.example.com", threshold)
 	helperB := newPeer("helper-b", "https://helper-b.example.com", threshold)
 
+	// Tick before anything is in flight: proves the symbol resolves through
+	// purego (a registration failure only surfaces at call time) and that an
+	// idle protocol is a safe thing for a scheduler to poke.
+	idleEvents, err := owner.proto.Tick()
+	must(err, "owner.Tick on an idle protocol")
+	assertTrue(len(idleEvents) == 0, "idle Tick must produce no events, got %d", len(idleEvents))
+	fmt.Println("  Tick on an idle protocol returns no events  ✓")
+
 	channelA := pairPeers(owner, helperA, 1)
 	channelB := pairPeers(owner, helperB, 2)
 	assertTrue(channelA != 1 && channelB != 2, "long-term channel_id must differ from the transient pairing id (got channelA=%d, channelB=%d)", channelA, channelB)

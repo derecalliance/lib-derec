@@ -573,6 +573,14 @@ async function runPairingFlow(): Promise<void> {
   const owner = makeNode("Owner", "https://owner.example.com");
   const helper = makeNode("Helper", "https://helper.example.com");
 
+  // Tick before anything is in flight: proves the binding is wired and that
+  // an idle protocol is safe for a timer to poke.
+  const idle = await owner.protocol.tick();
+  if (idle.length !== 0) {
+    throw new Error(`idle tick must produce no events, got ${idle.length}`);
+  }
+  console.log("  tick() on an idle protocol returns no events  ✓");
+
   await doPair(helper, owner, 1n, "Pairing");
 
   console.log("\n✓ Pairing flow passed.\n");

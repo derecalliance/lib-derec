@@ -367,6 +367,29 @@ func (p *DeRecProtocol) Process(message []byte) ([]Event, error) {
 	return decodeEvents(eventsJSON)
 }
 
+// Tick advances time-driven state without an inbound message, returning the
+// resulting events.
+//
+// Timeouts are otherwise only evaluated by Process, so a publish whose
+// helpers all go quiet has nothing left to close it: the round stays open
+// and no SharingComplete is ever emitted. Call this from a scheduler — a
+// time.Ticker, a cron job, a queue heartbeat — at an interval shorter than
+// the configured timeout.
+//
+// Safe to call at any time; with nothing in flight it returns no events. It
+// mutates the same round state an inbound response does, so it must be
+// serialized against Process for the same secret_id.
+func (p *DeRecProtocol) Tick() ([]Event, error) {
+	if p.closed {
+		return nil, errors.New("protocol: Tick: protocol is closed")
+	}
+	eventsJSON, err := p.instance.Tick()
+	if err != nil {
+		return nil, err
+	}
+	return decodeEvents(eventsJSON)
+}
+
 // encodeCommunicationInfo proto-encodes info as a derecpb.CommunicationInfo,
 // the wire shape derec_protocol_new expects for its
 // communication_info argument. A nil/empty map encodes to nil bytes,

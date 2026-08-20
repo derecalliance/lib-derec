@@ -21,8 +21,12 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 pub mod secret;
+#[cfg(any(feature = "serde", target_arch = "wasm32"))]
+pub mod state_record;
 
 pub use secret::{HelperInfo, ReplicaInfo, Replicas, Secret, UserSecret};
+#[cfg(any(feature = "serde", target_arch = "wasm32"))]
+pub use state_record::{StateItemRecord, StateKeyRecord, SyncCheckReport};
 
 /// Selects which channels to target for a discovery request.
 #[derive(Debug, Clone)]

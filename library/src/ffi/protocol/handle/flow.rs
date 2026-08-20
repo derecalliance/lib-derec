@@ -124,6 +124,34 @@ pub unsafe extern "C" fn derec_protocol_process(
     }
 }
 
+/// Advance time-driven state without an inbound message. See
+/// [`crate::protocol::DeRecProtocol::tick`].
+///
+/// Intended for a scheduler — a timer, a cron job, a queue heartbeat —
+/// in deployments where nothing else would ever evaluate timeouts. Safe
+/// to call on an idle protocol: it returns an empty event array.
+///
+/// # Safety
+///
+/// `handle` must be a valid pointer returned by
+/// [`super::derec_protocol_new`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn derec_protocol_tick(
+    handle: *mut DeRecProtocolHandle,
+) -> DeRecProtocolEventsResult {
+    if handle.is_null() {
+        return ffi_error(DEREC_CODE_FFI_NULL_PTR, "handle is null").into();
+    }
+
+    let h = unsafe { &*handle };
+    let mut inner = h.lock_inner();
+    let events = h.runtime.block_on(inner.tick());
+    DeRecProtocolEventsResult {
+        error: success(),
+        events_json: vec_into_buffer(encode_events(events)),
+    }
+}
+
 /// Accept a pending action from an `ActionRequired` event. See
 /// [`crate::protocol::DeRecProtocol::accept`]. The `action_bytes` blob
 /// is the exact payload the caller received in the event — the FFI

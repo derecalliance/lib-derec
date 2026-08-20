@@ -491,6 +491,44 @@ public sealed class DeRecProtocol : IDisposable
     }
 
     /// <summary>
+    /// Advance time-driven state without an inbound message.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Timeouts are otherwise only evaluated by <see cref="ProcessAsync"/>, so
+    /// a publish whose helpers all go quiet has nothing left to close it: the
+    /// round stays open and no <c>SharingComplete</c> is ever raised. Call
+    /// this from a scheduler — a timer, a hosted background service, a cron
+    /// trigger — at an interval shorter than the configured timeout.
+    /// </para>
+    /// <para>
+    /// Safe to call at any time; with nothing in flight it returns an empty
+    /// list. It mutates the same round state an inbound response does, so it
+    /// must be serialized against <see cref="ProcessAsync"/> for the same
+    /// <c>secret_id</c>.
+    /// </para>
+    /// </remarks>
+    public Task<IReadOnlyList<DeRecEvent>> TickAsync()
+    {
+        EnsureNotDisposed();
+        return Task.Run<IReadOnlyList<DeRecEvent>>(() =>
+        {
+            var result = NP.derec_protocol_tick(_handle);
+            try
+            {
+                ThrowOnError(result.Error);
+                byte[] json = DeRec.Library.Utils.CopyBuffer(result.EventsJson);
+                return JsonSerializer.Deserialize<List<DeRecEvent>>(json, JsonOpts)
+                    ?? new List<DeRecEvent>();
+            }
+            finally
+            {
+                DeRec.Library.Utils.FreeBuffer(result.EventsJson);
+            }
+        });
+    }
+
+    /// <summary>
     /// Rebuild this protocol's <c>secret_id</c> namespace from a recovered
     /// <see cref="Secret"/>. Mirrors the Rust <c>DeRecProtocol::restore</c>
     /// — see that method for the full contract. <paramref name="recoveredSecret"/>

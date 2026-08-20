@@ -763,6 +763,24 @@ impl DeRecProtocolWasm {
             .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
     }
 
+    /// Advance time-driven state without an inbound message.
+    ///
+    /// Timeouts are otherwise only evaluated by `process`, so a publish whose
+    /// helpers all go quiet has nothing left to close it. Call this from a
+    /// timer — `setInterval`, a service-worker alarm, a job runner — at an
+    /// interval shorter than the configured timeout.
+    ///
+    /// Returns an `Array` of plain JS event objects, empty when nothing was
+    /// in flight. Safe to call at any time.
+    pub async fn tick(&mut self) -> Result<JsValue, JsValue> {
+        let rust_events = self.inner.tick().await;
+        let js_events = Array::new();
+        for event in rust_events {
+            js_events.push(&events::event_to_js(event)?);
+        }
+        Ok(js_events.into())
+    }
+
     /// Feed any incoming wire bytes to the protocol.
     ///
     /// Returns an `Array` of plain JS event objects (see struct-level docs for shapes).

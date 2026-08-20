@@ -8,9 +8,9 @@ use derec_library::protocol::types::{Target, UserSecret};
 use derec_library::types::ChannelId;
 
 use crate::db::Database;
-use crate::flows::assertions::{channel_exists, count_channels, count_shares, count_user_secrets};
+use crate::flows::assertions::{channel_exists, count_channels, count_pending_verifications, count_shares, count_user_secrets};
 use crate::flows::helpers::{pair_owner_helper, protect_secret};
-use crate::peer::{DEFAULT_TEST_SECRET_ID, Peer, pump_many};
+use crate::peer::{DEFAULT_TEST_SECRET_ID, Peer, deliver, pump_many};
 use crate::stores::PostgresUserSecretStore;
 
 pub async fn run() {
@@ -113,5 +113,91 @@ pub async fn run() {
     );
     println!("  rebuilt owner discovered the v1 secret via the resurrected channels  ✓");
 
+    in_flight_state_survives_a_restart(&owner_db, &mut helper_a, cid_a).await;
+
     println!("✓ Persistence flow passed.\n");
+}
+
+/// In-flight orchestrator state must outlive the process, not just durable
+/// state.
+///
+/// A verification challenge is recorded as `StateItem::PendingVerification`,
+/// and the response is honoured only while that row exists — it is what binds
+/// the response to a challenge this device actually issued. If the row lives
+/// in memory, a restart between challenge and response makes the orchestrator
+/// drop a legitimate answer as unsolicited.
+///
+/// So: issue the challenge, destroy the protocol **before** the helper
+/// answers, rebuild it against the same database, and require the answer to
+/// be accepted. Against an in-memory state store this yields `NoOp` instead
+/// of `ShareVerified`.
+async fn in_flight_state_survives_a_restart(
+    owner_db: &Database,
+    helper: &mut Peer,
+    channel_id: ChannelId,
+) {
+    {
+        let mut owner = Peer::new(
+            owner_db.client(),
+            "Owner-Session3",
+            "https://owner.example.com",
+        );
+        owner
+            .protocol
+            .start(DeRecFlow::VerifyShares {
+                secret_id: DEFAULT_TEST_SECRET_ID,
+                version: 1,
+                target: Target::Single(channel_id),
+            })
+            .await
+            .expect("owner.start(VerifyShares) must succeed");
+
+        assert_eq!(
+            count_pending_verifications(&owner_db.client(), DEFAULT_TEST_SECRET_ID).await,
+            1,
+            "the challenge must be recorded in protocol_state, not held in memory"
+        );
+
+        // Carry the challenge to the helper while its issuer is still alive.
+        // This harness models the wire as a per-peer outbox, so the request
+        // has to leave before the drop or it would be lost with the sender —
+        // which is not what a restart does to a message already sent.
+        for (_endpoint, bytes) in owner.drain() {
+            deliver(helper, &bytes).await;
+        }
+        // The helper's answer is now sitting on the wire, and the owner is
+        // dropped before it can be consumed.
+    }
+
+    assert_eq!(
+        count_pending_verifications(&owner_db.client(), DEFAULT_TEST_SECRET_ID).await,
+        1,
+        "the pending challenge must outlive the protocol instance that issued it"
+    );
+    println!("  session#3: challenge issued, owner dropped before the helper answered  ✓");
+
+    let mut owner = Peer::new(
+        owner_db.client(),
+        "Owner-Session4",
+        "https://owner.example.com",
+    );
+
+    let mut events = Vec::new();
+    for (_endpoint, bytes) in helper.drain() {
+        events.extend(deliver(&mut owner, &bytes).await);
+    }
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            DeRecEvent::ShareVerified { version, .. } if *version == 1
+        )),
+        "a rebuilt owner must honour the response to a challenge it issued in a \
+         previous process; got {events:?}"
+    );
+    assert_eq!(
+        count_pending_verifications(&owner_db.client(), DEFAULT_TEST_SECRET_ID).await,
+        0,
+        "the row must be consumed once the response is accepted"
+    );
+    println!("  rebuilt owner accepted the response and consumed the pending row  ✓");
 }

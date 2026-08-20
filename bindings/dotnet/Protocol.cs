@@ -32,6 +32,38 @@ internal static class Protocol
         RunOrchestratorReplicaSyncVersionProgressionTest();
         RunOrchestratorAutoAcceptFlowTest();
         RunOrchestratorExpiredChannelCleanupTest();
+        RunOrchestratorTickTest();
+    }
+
+    /// <summary>
+    /// <see cref="DeRecProtocol.TickAsync"/> is what a scheduler calls in a
+    /// deployment where nothing else would ever evaluate timeouts. On an idle
+    /// protocol it must be a harmless no-op — proving the P/Invoke resolves
+    /// and that a timer can poke a quiet partition safely.
+    /// </summary>
+    private static void RunOrchestratorTickTest()
+    {
+        Console.WriteLine("=== Protocol tick test ===");
+
+        using var protocol = new DeRecProtocolBuilder(DefaultTestSecretId)
+            .WithChannelStore(new InMemoryChannelStore())
+            .WithShareStore(new InMemoryShareStore())
+            .WithSecretStore(new InMemorySecretStore())
+            .WithUserSecretStore(new InMemoryUserSecretStore())
+            .WithStateStore(new InMemoryStateStore())
+            .WithTransport(new RecordingTransport())
+            .WithOwnTransport(new TransportProtocol("https://tick.example.com"))
+            .WithThreshold(DefaultThreshold)
+            .Build();
+
+        var events = protocol.TickAsync().GetAwaiter().GetResult();
+        if (events.Count != 0)
+        {
+            throw new Exception($"idle TickAsync must produce no events, got {events.Count}");
+        }
+
+        Console.WriteLine("  TickAsync on an idle protocol returns no events  ✓");
+        Console.WriteLine("Protocol tick test passed.\n");
     }
 
     /// <summary>

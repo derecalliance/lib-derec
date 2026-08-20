@@ -60,3 +60,26 @@ CREATE TABLE user_secrets (
     description TEXT,
     payload     BYTEA  NOT NULL
 );
+
+-- In-flight orchestrator state: verification challenges, recovery
+-- accumulators, pending unpair acks, the active sharing round and the active
+-- catch-up. Persisting it is the whole point of the state store — a response
+-- arriving after a process restart is dropped as unsolicited if the request
+-- that expected it did not survive.
+--
+-- `StateKey`'s secondary key differs per kind, so it is flattened into two
+-- integer columns rather than modelled per variant:
+--   PendingVerification / PendingUnpair -> sub_a = channel_id
+--   PendingRecovery                     -> sub_a = recovered secret_id,
+--                                          sub_b = version
+--   PendingSyncCheck / SharingRound     -> no secondary key, both 0
+-- `kind` is part of the key, so the two channel-keyed kinds cannot collide.
+CREATE TABLE protocol_state (
+    secret_id BIGINT NOT NULL,
+    kind      BIGINT NOT NULL,
+    sub_a     BIGINT NOT NULL,
+    sub_b     BIGINT NOT NULL,
+    data      BYTEA  NOT NULL,
+    PRIMARY KEY (secret_id, kind, sub_a, sub_b)
+);
+

@@ -196,6 +196,9 @@ var (
 		messagePtr *byte, messageLen uintptr,
 	) DeRecProtocolEventsResult
 
+	protocolTickOnce sync.Once
+	protocolTickFn   func(handle uintptr) DeRecProtocolEventsResult
+
 	protocolStartOnce sync.Once
 	protocolStartFn   func(
 		handle uintptr, flowKind uint32,
@@ -448,6 +451,21 @@ func (p *ProtocolInstance) Process(message []byte) ([]byte, error) {
 		purego.RegisterFunc(&protocolProcessFn, symbol("derec_protocol_process"))
 	})
 	res := protocolProcessFn(p.handle, bytePtr(message), uintptr(len(message)))
+	if err := errorFrom(res.Error); err != nil {
+		return nil, err
+	}
+	return bytesFromBuffer(res.EventsJSON), nil
+}
+
+// Tick wraps derec_protocol_tick: advances time-driven state without an
+// inbound message, returning the resulting events as a UTF-8 JSON array in
+// the same shape as Process. Safe to call at any time; with nothing in
+// flight the array is empty.
+func (p *ProtocolInstance) Tick() ([]byte, error) {
+	protocolTickOnce.Do(func() {
+		purego.RegisterFunc(&protocolTickFn, symbol("derec_protocol_tick"))
+	})
+	res := protocolTickFn(p.handle)
 	if err := errorFrom(res.Error); err != nil {
 		return nil, err
 	}

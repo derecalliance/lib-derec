@@ -865,14 +865,7 @@ impl<
         &mut self,
         message: &[u8],
     ) -> std::result::Result<Vec<DeRecEvent>, ProcessError> {
-        if let crate::protocol::ExpiredChannelCleanup::Enabled { timeout_in_secs } =
-            self.expired_channel_cleanup
-        {
-            let _ = self.remove_expired_channels(timeout_in_secs).await;
-        }
-
-        let mut timeout_events = self.check_sharing_round_timeouts().await;
-        let mut unpair_timeout_events = self.check_unpair_timeouts().await;
+        let mut timeout_events = self.run_timeout_sweeps().await;
 
         let envelope = DeRecMessage::decode(message).map_err(|e| ProcessError {
             channel_id: None,
@@ -901,9 +894,9 @@ impl<
                 source,
             })?;
 
-        // Ordering: sharing-round timeouts first, then unpair
-        // timeouts, then events produced by this specific message.
-        timeout_events.append(&mut unpair_timeout_events);
+        // Ordering: timeout events first (sharing-round then unpair, as
+        // `run_timeout_sweeps` orders them), then events produced by this
+        // specific message.
         timeout_events.append(&mut events);
         let mut events = timeout_events;
 
@@ -1791,6 +1784,83 @@ impl<
     ///
     /// Returns `ShareRejected` events for timed-out channels and moves them
     /// from `pending` to `failed` in the round tracker.
+    /// Advance every time-driven part of the protocol without an inbound
+    /// message, returning whatever that produced.
+    ///
+    /// # Why this exists
+    ///
+    /// Timeouts are otherwise only evaluated inside [`Self::process`], so they
+    /// advance only when traffic arrives. A publish whose helpers all go quiet
+    /// has nothing left to trigger it: the round stays open, no
+    /// [`DeRecEvent::SharingComplete`] is ever emitted, and an application
+    /// waiting on that event waits forever. The same applies to an
+    /// unacknowledged unpair.
+    ///
+    /// A long-lived embedded application could rely on incidental traffic. A
+    /// service that rebuilds the protocol per request has no background loop
+    /// at all, so this is the entry point its scheduler calls — a cron tick, a
+    /// timer task, a queue heartbeat.
+    ///
+    /// # What it does
+    ///
+    /// Exactly what [`Self::process`] does about time, minus the message:
+    ///
+    /// 1. Expired-channel cleanup, if
+    ///    [`DeRecProtocolBuilder::with_remove_expired_channels`] enabled it.
+    ///    Disabled by default, in which case this step is skipped and
+    ///    [`Self::remove_expired_channels`] remains available for explicit
+    ///    control.
+    /// 2. Sharing-round timeouts — every helper still pending past the
+    ///    configured window is failed with
+    ///    [`DeRecEvent::ShareRejected`], every member still pending is
+    ///    reported [`DeRecEvent::ReplicaSyncFailed`].
+    /// 3. Unpair-acknowledgement timeouts.
+    /// 4. The round tally, which is what turns a fully-drained round into
+    ///    [`DeRecEvent::SharingComplete`] and clears its state row. Step 2
+    ///    only marks the participants; without this the round would report
+    ///    failures and still never close.
+    ///
+    /// # Calling it
+    ///
+    /// Idempotent and safe to call at any time: with nothing in flight it
+    /// touches no state and returns an empty vector. Store failures are
+    /// swallowed the same way [`Self::process`] swallows them, so a transient
+    /// backend error means work is retried on the next call rather than
+    /// surfaced here.
+    ///
+    /// Cadence should be shorter than
+    /// [`DeRecProtocolBuilder::with_timeout`], since that bounds how long a
+    /// stalled round can sit before this notices it.
+    ///
+    /// Concurrency is the caller's, as everywhere else: this mutates the same
+    /// round state an inbound response does, so it must be serialized against
+    /// [`Self::process`] for the same `secret_id`. See
+    /// [`DeRecStateStore`](crate::protocol::DeRecStateStore).
+    #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
+    pub async fn tick(&mut self) -> Vec<DeRecEvent> {
+        let mut events = self.run_timeout_sweeps().await;
+        self.update_sharing_round(&mut events).await;
+        events
+    }
+
+    /// The time-driven sweeps, shared by [`Self::tick`] and [`Self::process`]
+    /// so the two cannot drift.
+    ///
+    /// Deliberately does **not** run the round tally: `process` runs it once
+    /// at the end, over these events together with the message's own, and
+    /// running it here as well would reorder what `process` reports.
+    async fn run_timeout_sweeps(&mut self) -> Vec<DeRecEvent> {
+        if let crate::protocol::ExpiredChannelCleanup::Enabled { timeout_in_secs } =
+            self.expired_channel_cleanup
+        {
+            let _ = self.remove_expired_channels(timeout_in_secs).await;
+        }
+
+        let mut events = self.check_sharing_round_timeouts().await;
+        events.append(&mut self.check_unpair_timeouts().await);
+        events
+    }
+
     async fn check_sharing_round_timeouts(&mut self) -> Vec<DeRecEvent> {
         let Ok(Some(StateItem::SharingRound(round))) = self
             .state_store
@@ -1999,6 +2069,38 @@ impl<
                 threshold_met,
             });
 
+            // Publisher-side half of the removal rule. A member told to leave
+            // completes its departure when it acknowledges the version that
+            // excludes it — which is what `synced_replicas` records. The
+            // receive-side reconciliation cannot do this job here: a publisher
+            // never receives the roster it just sent, so without this the
+            // device that ran the removal would keep the row forever and go on
+            // addressing a member that has already torn itself down.
+            let mut removed_replicas: Vec<u64> = Vec::new();
+            if let Ok(roster) = self.channel_store.replicas(self.secret_id).await {
+                for member in roster {
+                    if member.status != crate::protocol::types::ChannelStatus::Unpairing
+                        || !synced_replicas.contains(&member.replica_id)
+                    {
+                        continue;
+                    }
+                    if self
+                        .channel_store
+                        .remove(
+                            self.secret_id,
+                            crate::protocol::types::ChannelQuery::Replica {
+                                channel_id: member.channel_id,
+                                replica_id: member.replica_id,
+                            },
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        removed_replicas.push(member.replica_id.0);
+                    }
+                }
+            }
+
             // The replica leg is reported separately: different success rule,
             // different key. Emitted only when the round had a replica leg at
             // all, so a helpers-only publish stays silent here.
@@ -2022,6 +2124,11 @@ impl<
                     synced,
                     behind,
                 });
+            }
+
+            removed_replicas.sort_unstable();
+            for replica_id in removed_replicas {
+                events.push(DeRecEvent::ReplicaRemoved { replica_id });
             }
 
             #[cfg(feature = "logging")]
@@ -2520,6 +2627,408 @@ mod sharing_round_outcome_tests {
             )
             .await
             .expect("seed round");
+    }
+
+    /// C2 — a round with no further traffic still reaches a terminal state.
+    ///
+    /// Timeouts are otherwise only evaluated inside `process`, so a publish
+    /// whose helpers all go quiet has nothing left to trigger it. `tick` is
+    /// the entry point a scheduler calls, and it must both fail the silent
+    /// participants *and* close the round: reporting failures while leaving
+    /// the round open would still strand an application waiting on
+    /// `SharingComplete`.
+    #[test]
+    fn tick_closes_a_round_that_no_message_will_ever_finish() {
+        run_async(async {
+            let mut protocol = build(2);
+            protocol.timeout_in_secs = 60;
+
+            // A round started well outside the timeout window, with one helper
+            // and one member that never answered.
+            protocol
+                .state_store
+                .save(
+                    SECRET_ID,
+                    StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                        version: 3,
+                        pending: [ChannelId(9001)].into_iter().collect(),
+                        confirmed: [ChannelId(9002)].into_iter().collect(),
+                        failed: HashSet::new(),
+                        pending_replicas: [ReplicaId(1002)].into_iter().collect(),
+                        synced_replicas: HashSet::new(),
+                        behind_replicas: HashSet::new(),
+                        started_at: now_secs().saturating_sub(600),
+                    })),
+                )
+                .await
+                .expect("seed round");
+
+            let events = protocol.tick().await;
+
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    DeRecEvent::ShareRejected { channel_id, memo, .. }
+                        if *channel_id == ChannelId(9001) && memo == "timeout"
+                )),
+                "the silent helper is failed; got {events:?}"
+            );
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    DeRecEvent::ReplicaSyncFailed { replica_id, reason, .. }
+                        if *replica_id == 1002 && reason == "timeout"
+                )),
+                "the silent member is reported behind; got {events:?}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, DeRecEvent::SharingComplete { version: 3, .. })),
+                "the round must actually close, not just report failures; got {events:?}"
+            );
+            assert!(
+                protocol
+                    .state_store
+                    .load(SECRET_ID, StateKey::SharingRound)
+                    .await
+                    .expect("load")
+                    .is_none(),
+                "a closed round leaves no state row behind"
+            );
+        });
+    }
+
+    /// C2 — `tick` runs the unpair sweep too, not only the sharing round.
+    ///
+    /// An unpair sent under `UnpairAck::Required` keeps local state alive
+    /// until the peer acknowledges. A peer that never answers would otherwise
+    /// pin that state forever, since nothing else would arrive to trigger the
+    /// check.
+    #[test]
+    fn tick_expires_an_unacknowledged_unpair() {
+        run_async(async {
+            let mut protocol = build(2);
+            protocol.timeout_in_secs = 60;
+
+            protocol
+                .state_store
+                .save(
+                    SECRET_ID,
+                    StateItem::PendingUnpair {
+                        channel_id: ChannelId(4242),
+                        started_at: now_secs().saturating_sub(600),
+                    },
+                )
+                .await
+                .expect("seed pending unpair");
+
+            let events = protocol.tick().await;
+
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    DeRecEvent::Unpaired { channel_id } if *channel_id == ChannelId(4242)
+                )),
+                "the unacknowledged unpair completes on the timeout; got {events:?}"
+            );
+            assert!(
+                protocol
+                    .state_store
+                    .load(
+                        SECRET_ID,
+                        StateKey::PendingUnpair {
+                            channel_id: ChannelId(4242)
+                        }
+                    )
+                    .await
+                    .expect("load")
+                    .is_none(),
+                "the pending row is consumed"
+            );
+        });
+    }
+
+    /// C2 — a pending unpair still inside its window survives a `tick`.
+    #[test]
+    fn tick_leaves_a_recent_unpair_pending() {
+        run_async(async {
+            let mut protocol = build(2);
+            protocol.timeout_in_secs = 600;
+
+            protocol
+                .state_store
+                .save(
+                    SECRET_ID,
+                    StateItem::PendingUnpair {
+                        channel_id: ChannelId(4242),
+                        started_at: now_secs(),
+                    },
+                )
+                .await
+                .expect("seed pending unpair");
+
+            let events = protocol.tick().await;
+
+            assert!(events.is_empty(), "got {events:?}");
+            assert!(
+                protocol
+                    .state_store
+                    .load(
+                        SECRET_ID,
+                        StateKey::PendingUnpair {
+                            channel_id: ChannelId(4242)
+                        }
+                    )
+                    .await
+                    .expect("load")
+                    .is_some(),
+                "the acknowledgement window has not elapsed"
+            );
+        });
+    }
+
+    /// C2 — expired-channel cleanup is part of `tick`, and follows the same
+    /// configuration `process` honours rather than a rule of its own.
+    ///
+    /// Disabled is the default, so a `tick` on a protocol that never opted in
+    /// must leave a stale pending channel alone; `remove_expired_channels`
+    /// stays available for callers that want to sweep explicitly.
+    #[test]
+    fn tick_honours_the_expired_channel_policy() {
+        run_async(async {
+            for (cleanup, expect_removed) in [
+                (crate::protocol::ExpiredChannelCleanup::Disabled, false),
+                (
+                    crate::protocol::ExpiredChannelCleanup::Enabled { timeout_in_secs: 1 },
+                    true,
+                ),
+            ] {
+                let mut protocol = build(2);
+                protocol.expired_channel_cleanup = cleanup;
+                protocol
+                    .channel_store
+                    .save(
+                        SECRET_ID,
+                        crate::protocol::types::ChannelRecord::Helper(
+                            crate::protocol::types::HelperChannel {
+                                channel_id: ChannelId(77),
+                                transport: derec_proto::TransportProtocol {
+                                    uri: "https://stale.example".to_owned(),
+                                    protocol: derec_proto::Protocol::Https as i32,
+                                },
+                                communication_info: std::collections::HashMap::new(),
+                                peer_role: derec_proto::SenderKind::Helper,
+                                status: crate::protocol::types::ChannelStatus::Pending,
+                                created_at: now_secs().saturating_sub(3600),
+                            },
+                        ),
+                    )
+                    .await
+                    .expect("seed stale pending channel");
+
+                let _ = protocol.tick().await;
+
+                let gone = protocol
+                    .channel_store
+                    .helpers(SECRET_ID)
+                    .await
+                    .expect("helpers")
+                    .is_empty();
+                assert_eq!(
+                    gone, expect_removed,
+                    "cleanup {cleanup:?}: expected removed={expect_removed}"
+                );
+            }
+        });
+    }
+
+    /// `tick` is safe to call on an idle protocol — the common case for a
+    /// scheduler firing on a quiet partition.
+    #[test]
+    fn tick_on_an_idle_protocol_does_nothing() {
+        run_async(async {
+            let mut protocol = build(2);
+            let events = protocol.tick().await;
+            assert!(events.is_empty(), "got {events:?}");
+        });
+    }
+
+    /// A round still inside its window is left alone: `tick` must not cut
+    /// short a publish whose helpers are merely slow.
+    #[test]
+    fn tick_leaves_a_round_inside_its_window_open() {
+        run_async(async {
+            let mut protocol = build(2);
+            protocol.timeout_in_secs = 600;
+            seed_round(&mut protocol, 4, &[9001], &[1002]).await;
+
+            let events = protocol.tick().await;
+
+            assert!(events.is_empty(), "got {events:?}");
+            assert!(
+                protocol
+                    .state_store
+                    .load(SECRET_ID, StateKey::SharingRound)
+                    .await
+                    .expect("load")
+                    .is_some(),
+                "the round is still in flight"
+            );
+        });
+    }
+
+    /// The publisher drops a departing member's row once that member has
+    /// acknowledged the version excluding it.
+    ///
+    /// Reconciliation normally runs when a roster *arrives*, but the device
+    /// that ran the removal never receives the roster it just sent. Without a
+    /// publisher-side pass it would keep the flagged row forever and keep
+    /// addressing a member that has already torn itself down — the removal
+    /// would converge everywhere except on the device that ordered it.
+    #[test]
+    fn the_publisher_drops_a_departing_member_once_it_acknowledges() {
+        run_async(async {
+            let mut protocol = build(2);
+            seed_round(&mut protocol, 7, &[9001], &[1002, 1003]).await;
+
+            for (id, status) in [
+                (1002u64, crate::protocol::types::ChannelStatus::Paired),
+                (1003, crate::protocol::types::ChannelStatus::Unpairing),
+            ] {
+                protocol
+                    .channel_store
+                    .save(
+                        SECRET_ID,
+                        crate::protocol::types::ChannelRecord::Replica(
+                            crate::protocol::types::ReplicaMember {
+                                channel_id: ChannelId(5001),
+                                replica_id: ReplicaId(id),
+                                transport: derec_proto::TransportProtocol {
+                                    uri: "https://peer.example".to_owned(),
+                                    protocol: derec_proto::Protocol::Https as i32,
+                                },
+                                communication_info: std::collections::HashMap::new(),
+                                role: crate::protocol::types::ReplicaRole::Destination,
+                                status,
+                                created_at: 0,
+                            },
+                        ),
+                    )
+                    .await
+                    .expect("seed member");
+            }
+
+            let mut events = vec![
+                DeRecEvent::ShareConfirmed {
+                    channel_id: ChannelId(9001),
+                    version: 7,
+                },
+                DeRecEvent::ReplicaSecretAcked {
+                    channel_id: ChannelId(5001),
+                    from_replica_id: 1002,
+                    secret_id: SECRET_ID,
+                    version: 7,
+                    status: 0,
+                    memo: String::new(),
+                },
+                DeRecEvent::ReplicaSecretAcked {
+                    channel_id: ChannelId(5001),
+                    from_replica_id: 1003,
+                    secret_id: SECRET_ID,
+                    version: 7,
+                    status: 0,
+                    memo: String::new(),
+                },
+            ];
+            protocol.update_sharing_round(&mut events).await;
+
+            let remaining: Vec<u64> = protocol
+                .channel_store
+                .replicas(SECRET_ID)
+                .await
+                .expect("roster")
+                .into_iter()
+                .map(|m| m.replica_id.0)
+                .collect();
+            assert_eq!(
+                remaining,
+                vec![1002],
+                "the acknowledged departing member is gone; the other survives"
+            );
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    DeRecEvent::ReplicaRemoved { replica_id } if *replica_id == 1003
+                )),
+                "the removal is reported to the application; got {events:?}"
+            );
+        });
+    }
+
+    /// A member flagged as leaving that has **not** acknowledged keeps its row.
+    ///
+    /// Its departure is not complete until it has seen the excluding version,
+    /// and dropping it early would stop the publisher addressing the very
+    /// member it still needs to reach.
+    #[test]
+    fn a_departing_member_that_has_not_answered_is_kept() {
+        run_async(async {
+            let mut protocol = build(2);
+            seed_round(&mut protocol, 7, &[9001], &[1002]).await;
+
+            protocol
+                .channel_store
+                .save(
+                    SECRET_ID,
+                    crate::protocol::types::ChannelRecord::Replica(
+                        crate::protocol::types::ReplicaMember {
+                            channel_id: ChannelId(5001),
+                            replica_id: ReplicaId(1003),
+                            transport: derec_proto::TransportProtocol {
+                                uri: "https://peer.example".to_owned(),
+                                protocol: derec_proto::Protocol::Https as i32,
+                            },
+                            communication_info: std::collections::HashMap::new(),
+                            role: crate::protocol::types::ReplicaRole::Destination,
+                            status: crate::protocol::types::ChannelStatus::Unpairing,
+                            created_at: 0,
+                        },
+                    ),
+                )
+                .await
+                .expect("seed member");
+
+            let mut events = vec![
+                DeRecEvent::ShareConfirmed {
+                    channel_id: ChannelId(9001),
+                    version: 7,
+                },
+                DeRecEvent::ReplicaSecretAcked {
+                    channel_id: ChannelId(5001),
+                    from_replica_id: 1002,
+                    secret_id: SECRET_ID,
+                    version: 7,
+                    status: 0,
+                    memo: String::new(),
+                },
+            ];
+            protocol.update_sharing_round(&mut events).await;
+
+            let remaining: Vec<u64> = protocol
+                .channel_store
+                .replicas(SECRET_ID)
+                .await
+                .expect("roster")
+                .into_iter()
+                .map(|m| m.replica_id.0)
+                .collect();
+            assert_eq!(
+                remaining,
+                vec![1003],
+                "an unacknowledged departure leaves the row in place"
+            );
+        });
     }
 
     /// The regression a shared group channel creates: two members answering on
