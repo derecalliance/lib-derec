@@ -14,20 +14,43 @@ namespace DeRec.Bindings.Smoke;
 
 internal sealed class InMemoryChannelStore : IChannelStore
 {
-    private readonly Dictionary<(ulong, ulong), Channel> _channels = new();
+    // Two maps, mirroring the two primary keys the interface defines: a
+    // helper channel is unique per channelId, while a replica-group member is
+    // unique per replicaId and moves between channels during an admission
+    // handover.
+    private readonly Dictionary<(ulong, ulong), HelperChannel> _helpers = new();
+    private readonly Dictionary<(ulong, ulong), ReplicaMember> _members = new();
     private readonly Dictionary<(ulong, ulong), HashSet<ulong>> _links = new();
 
-    public Channel? Load(ulong secretId, ulong channelId) =>
-        _channels.TryGetValue((secretId, channelId), out var c) ? c : null;
+    public ChannelRecord? Load(ulong secretId, ulong channelId, ulong replicaId)
+    {
+        if (replicaId == 0)
+        {
+            return _helpers.TryGetValue((secretId, channelId), out var h)
+                ? ChannelRecord.Of(h)
+                : null;
+        }
+        return _members.TryGetValue((secretId, replicaId), out var m)
+            ? ChannelRecord.Of(m)
+            : null;
+    }
 
-    public void Save(ulong secretId, Channel channel) =>
-        _channels[(secretId, channel.Id)] = channel;
+    public void Save(ulong secretId, ChannelRecord record)
+    {
+        if (record.Helper is { } h) _helpers[(secretId, h.ChannelId)] = h;
+        if (record.Replica is { } m) _members[(secretId, m.ReplicaId)] = m;
+    }
 
-    public bool Remove(ulong secretId, ulong channelId) =>
-        _channels.Remove((secretId, channelId));
+    public bool Remove(ulong secretId, ulong channelId, ulong replicaId) =>
+        replicaId == 0
+            ? _helpers.Remove((secretId, channelId))
+            : _members.Remove((secretId, replicaId));
 
-    public IEnumerable<ulong> ListChannelIds(ulong secretId) =>
-        _channels.Keys.Where(k => k.Item1 == secretId).Select(k => k.Item2);
+    public IEnumerable<HelperChannel> ListHelpers(ulong secretId) =>
+        _helpers.Where(kv => kv.Key.Item1 == secretId).Select(kv => kv.Value);
+
+    public IEnumerable<ReplicaMember> ListReplicas(ulong secretId) =>
+        _members.Where(kv => kv.Key.Item1 == secretId).Select(kv => kv.Value);
 
     public void LinkChannel(ulong secretId, ulong a, ulong b)
     {

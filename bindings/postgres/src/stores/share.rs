@@ -33,7 +33,7 @@ impl DeRecShareStore for PostgresShareStore {
             let rows = if versions.is_empty() {
                 client
                     .query(
-                        "SELECT share_secret_id, version, replica_id, bytes FROM shares \
+                        "SELECT share_secret_id, version, bytes FROM shares \
                          WHERE secret_id = $1 AND channel_id = $2",
                         &[&secret_id_i64, &channel_id_i64],
                     )
@@ -43,7 +43,7 @@ impl DeRecShareStore for PostgresShareStore {
                 let params: [&(dyn ToSql + Sync); 3] = [&secret_id_i64, &channel_id_i64, &versions];
                 client
                     .query(
-                        "SELECT share_secret_id, version, replica_id, bytes FROM shares \
+                        "SELECT share_secret_id, version, bytes FROM shares \
                          WHERE secret_id = $1 AND channel_id = $2 AND version = ANY($3::bigint[])",
                         &params,
                     )
@@ -72,7 +72,7 @@ impl DeRecShareStore for PostgresShareStore {
                 let params: [&(dyn ToSql + Sync); 2] = [&secret_id_i64, &channel_ids];
                 client
                     .query(
-                        "SELECT share_secret_id, version, replica_id, bytes FROM shares \
+                        "SELECT share_secret_id, version, bytes FROM shares \
                          WHERE secret_id = $1 AND channel_id = ANY($2::bigint[])",
                         &params,
                     )
@@ -82,7 +82,7 @@ impl DeRecShareStore for PostgresShareStore {
                 let params: [&(dyn ToSql + Sync); 3] = [&secret_id_i64, &channel_ids, &versions];
                 client
                     .query(
-                        "SELECT share_secret_id, version, replica_id, bytes FROM shares \
+                        "SELECT share_secret_id, version, bytes FROM shares \
                          WHERE secret_id = $1 AND channel_id = ANY($2::bigint[]) \
                          AND version = ANY($3::bigint[])",
                         &params,
@@ -109,7 +109,7 @@ impl DeRecShareStore for PostgresShareStore {
             let params: [&(dyn ToSql + Sync); 2] = [&secret_id_i64, &channel_ids];
             let rows = client
                 .query(
-                    "SELECT share_secret_id, version, replica_id, bytes FROM shares \
+                    "SELECT share_secret_id, version, bytes FROM shares \
                      WHERE secret_id = $1 AND channel_id = ANY($2::bigint[])",
                     &params,
                 )
@@ -150,14 +150,13 @@ impl DeRecShareStore for PostgresShareStore {
         let secret_id_i64 = u64_to_sql(secret_id);
         let channel_id_i64 = u64_to_sql(channel_id.0);
         let version_i64 = share.version as i64;
-        let replica_id_i64: Option<i64> = share.replica_id.map(u64_to_sql);
         let share_secret_id_i64 = u64_to_sql(share.secret_id);
         let bytes = share.bytes;
         Box::pin(async move {
             client
                 .execute(
-                    "INSERT INTO shares (secret_id, channel_id, version, replica_id, share_secret_id, bytes) \
-                     VALUES ($1, $2, $3, $4, $5, $6)
+                    "INSERT INTO shares (secret_id, channel_id, version, share_secret_id, bytes) \
+                     VALUES ($1, $2, $3, $4, $5)
                      ON CONFLICT ON CONSTRAINT shares_uniq DO UPDATE SET
                          share_secret_id = EXCLUDED.share_secret_id,
                          bytes           = EXCLUDED.bytes",
@@ -165,7 +164,6 @@ impl DeRecShareStore for PostgresShareStore {
                         &secret_id_i64,
                         &channel_id_i64,
                         &version_i64,
-                        &replica_id_i64,
                         &share_secret_id_i64,
                         &bytes,
                     ],
@@ -201,7 +199,6 @@ fn row_to_share(row: tokio_postgres::Row) -> Share {
     Share {
         secret_id: sql_to_u64(row.get::<_, i64>(0)),
         version: row.get::<_, i64>(1) as u32,
-        replica_id: row.get::<_, Option<i64>>(2).map(sql_to_u64),
-        bytes: row.get::<_, Vec<u8>>(3),
+        bytes: row.get::<_, Vec<u8>>(2),
     }
 }

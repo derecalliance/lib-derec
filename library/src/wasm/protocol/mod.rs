@@ -100,7 +100,7 @@ type WasmProtocol = DeRecProtocol<
 /// | `ShareConfirmed`   | `channel_id: string`, `version: number`                |
 /// | `ShareVerified`    | `channel_id: string`, `version: number`                |
 /// | `SecretsDiscovered`| `channel_id: string`, `secrets: SecretVersionEntry[]`  |
-/// | `SecretRecovered`  | `secret: { helpers, secrets, replicas, owner_replica_id }` (same nested shape as `ReplicaSecretReceived.secret`) |
+/// | `SecretRecovered`  | `secret: { helpers, secrets, replicas }` (same nested shape as `ReplicaSecretReceived.secret`) |
 /// | `NoOp`             | _(none)_                                               |
 ///
 /// `SecretVersionEntry = { secret_id: bigint, versions: { version: number, description: string }[] }`
@@ -839,12 +839,12 @@ fn parse_recovered_secret(value: JsValue) -> Result<crate::protocol::types::Secr
     }
     #[derive(serde::Deserialize)]
     struct ReplicaIn {
-        channel_id: String,
+        replica_id: String,
         transport_uri: String,
+        /// `"Source"` or `"Destination"`.
+        role: String,
         #[serde(default)]
         communication_info: HashMap<String, String>,
-        replica_id: String,
-        sender_kind: i32,
     }
     #[derive(serde::Deserialize)]
     struct UserSecretIn {
@@ -860,13 +860,13 @@ fn parse_recovered_secret(value: JsValue) -> Result<crate::protocol::types::Secr
         secrets: Vec<UserSecretIn>,
         #[serde(default)]
         replicas: Option<ReplicasIn>,
-        #[serde(default)]
-        owner_replica_id: String,
     }
     #[derive(serde::Deserialize)]
     struct ReplicasIn {
         #[serde(default)]
-        replicas: Vec<ReplicaIn>,
+        channel_id: String,
+        #[serde(default)]
+        members: Vec<ReplicaIn>,
         #[serde(default)]
         shared_key: Vec<u8>,
     }
@@ -902,21 +902,33 @@ fn parse_recovered_secret(value: JsValue) -> Result<crate::protocol::types::Secr
     let replicas = input
         .replicas
         .map(|g| -> Result<_, JsValue> {
-            let replicas = g
-                .replicas
+            let members = g
+                .members
                 .into_iter()
                 .map(|r| -> Result<_, JsValue> {
+                    let role = match r.role.as_str() {
+                        "Source" => crate::protocol::types::ReplicaRole::Source,
+                        "Destination" => crate::protocol::types::ReplicaRole::Destination,
+                        other => {
+                            return Err(js_error(
+                                "INVALID_RECOVERED_SECRET",
+                                format!(
+                                    "replica.role must be \"Source\" or \"Destination\", got {other:?}"
+                                ),
+                            ));
+                        }
+                    };
                     Ok(crate::protocol::types::ReplicaInfo {
-                        channel_id: parse_u64(&r.channel_id, "replica.channel_id")?,
-                        transport_uri: r.transport_uri,
-                        communication_info: r.communication_info,
                         replica_id: parse_u64(&r.replica_id, "replica.replica_id")?,
-                        sender_kind: r.sender_kind,
+                        transport_uri: r.transport_uri,
+                        role: role as i32,
+                        communication_info: r.communication_info,
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(crate::protocol::types::Replicas {
-                replicas,
+                channel_id: parse_u64(&g.channel_id, "replicas.channel_id")?,
+                members,
                 shared_key: g.shared_key,
             })
         })
@@ -932,13 +944,10 @@ fn parse_recovered_secret(value: JsValue) -> Result<crate::protocol::types::Secr
         })
         .collect();
 
-    let owner_replica_id = parse_u64(&input.owner_replica_id, "owner_replica_id")?;
-
     Ok(crate::protocol::types::Secret {
         helpers,
         secrets,
         replicas,
-        owner_replica_id,
     })
 }
 
@@ -1260,9 +1269,44 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
                 transport_protocol,
             })
         }
+        8 => {
+            // RemoveReplica: `{ replica_id, memo? }`. `replica_id` is a
+            // decimal string so large values survive JS number handling.
+            let replica_id_val = js_sys::Reflect::get(&params, &JsValue::from_str("replica_id"))
+                .unwrap_or(JsValue::UNDEFINED);
+            // A decimal string, so ids above 2^53 survive JS number handling.
+            let replica_id: u64 = replica_id_val
+                .as_string()
+                .ok_or_else(|| {
+                    js_error(
+                        "INVALID_FLOW_PARAMS",
+                        "replica_id must be a decimal string".to_owned(),
+                    )
+                })?
+                .parse::<u64>()
+                .map_err(|e| {
+                    js_error(
+                        "INVALID_FLOW_PARAMS",
+                        format!("replica_id must be a decimal u64: {e}"),
+                    )
+                })?;
+            let memo_val = js_sys::Reflect::get(&params, &JsValue::from_str("memo"))
+                .unwrap_or(JsValue::UNDEFINED);
+            let memo = if memo_val.is_null() || memo_val.is_undefined() {
+                None
+            } else {
+                memo_val.as_string()
+            };
+            Ok(DeRecFlow::RemoveReplica { replica_id, memo })
+        }
+        7 => {
+            // SyncCheck takes no parameters: the group and this device's own
+            // version are both read from the stores.
+            Ok(DeRecFlow::SyncCheck)
+        }
         _ => Err(js_error(
             "INVALID_FLOW_KIND",
-            format!("invalid flow kind: {flow_kind}, must be 0..6"),
+            format!("invalid flow kind: {flow_kind}, must be 0..8"),
         )),
     }
 }

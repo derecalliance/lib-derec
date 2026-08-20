@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use derec_library::protocol::types::ChannelQuery;
 use derec_library::protocol::{DeRecChannelStore, SecretKind};
 use derec_library::types::ChannelId;
 use derec_proto::SenderKind;
@@ -40,15 +41,31 @@ pub async fn run() {
     let owner_check = PostgresChannelStore::new(owner_db.client());
     let helper_check = PostgresChannelStore::new(helper_db.client());
     let owner_channel = owner_check
-        .load(DEFAULT_TEST_SECRET_ID, final_id)
+        .load(
+            DEFAULT_TEST_SECRET_ID,
+            ChannelQuery::Helper {
+                channel_id: final_id,
+            },
+        )
         .await
         .expect("owner channel load failed")
         .expect("owner channel must exist");
     let helper_channel = helper_check
-        .load(DEFAULT_TEST_SECRET_ID, final_id)
+        .load(
+            DEFAULT_TEST_SECRET_ID,
+            ChannelQuery::Helper {
+                channel_id: final_id,
+            },
+        )
         .await
         .expect("helper channel load failed")
         .expect("helper channel must exist");
+    let owner_channel = owner_channel
+        .as_helper()
+        .expect("an owner-helper pairing stores a helper channel");
+    let helper_channel = helper_channel
+        .as_helper()
+        .expect("an owner-helper pairing stores a helper channel");
     assert_eq!(owner_channel.peer_role, SenderKind::Helper);
     assert_eq!(helper_channel.peer_role, SenderKind::Owner);
     println!("  Channel.peer_role names the other end on each side  ✓");

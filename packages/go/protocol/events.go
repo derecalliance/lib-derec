@@ -16,6 +16,14 @@ const (
 	EventTypePairingCompleted          = "PairingCompleted"
 	EventTypeReplicaPaired             = "ReplicaPaired"
 	EventTypeReplicaSecretReceived     = "ReplicaSecretReceived"
+	EventTypeReplicaSecretInstalled    = "ReplicaSecretInstalled"
+	EventTypeReplicaSyncRejected       = "ReplicaSyncRejected"
+	EventTypeReplicaSyncFailed         = "ReplicaSyncFailed"
+	EventTypeReplicaSyncComplete       = "ReplicaSyncComplete"
+	EventTypeSyncCheckComplete         = "SyncCheckComplete"
+	EventTypeReplicaRemoved            = "ReplicaRemoved"
+	EventTypeReplicaSourceChanged      = "ReplicaSourceChanged"
+	EventTypeSelfRemovedFromGroup      = "SelfRemovedFromGroup"
 	EventTypeReplicaSecretAcked        = "ReplicaSecretAcked"
 	EventTypeShareStored               = "ShareStored"
 	EventTypeShareConfirmed            = "ShareConfirmed"
@@ -84,7 +92,8 @@ type Event struct {
 	Kind                  int32             `json:"kind"`
 	PeerCommunicationInfo map[string]string `json:"peer_communication_info"`
 
-	// ReplicaPaired, ReplicaSecretReceived, ReplicaSecretAcked.
+	// ReplicaPaired, ReplicaSecretReceived, ReplicaSecretInstalled,
+	// ReplicaSecretAcked.
 	PeerReplicaID string         `json:"peer_replica_id"`
 	FromReplicaID string         `json:"from_replica_id"`
 	SecretID      string         `json:"secret_id"`
@@ -97,8 +106,28 @@ type Event struct {
 	Status int32  `json:"status"`
 	Memo   string `json:"memo"`
 
-	// ShareStored.
+	// ShareStored, ReplicaSyncRejected, ReplicaSyncFailed. On the two
+	// replica events this names the member: they are keyed by replicaID, not
+	// channelID, because every member answers on the one group channel.
 	ReplicaID *string `json:"replica_id"`
+
+	// ReplicaSyncFailed — the transport or encoding failure, rendered for
+	// display. Distinct from Error, which the flow-level *Failed events use.
+	Reason string `json:"reason"`
+
+	// ReplicaSyncComplete. Synced acknowledged; Behind refused, timed out, or
+	// were unreachable. Behind is the application's retry list — the library
+	// keeps no durable per-member sync state.
+	Synced []string `json:"synced"`
+	Behind []string `json:"behind"`
+
+	// SyncCheckComplete. LocalVersion is what this device held when the
+	// catch-up ran, GroupVersion the newest any member reported, and
+	// FetchedFrom names the member the state was pulled from — nil when this
+	// device was already current, in which case no hydration event follows.
+	LocalVersion *uint32 `json:"local_version"`
+	GroupVersion *uint32 `json:"group_version"`
+	FetchedFrom  *string `json:"fetched_from"`
 
 	// SharingComplete.
 	ConfirmedCount uint32 `json:"confirmed_count"`
@@ -133,10 +162,9 @@ type Event struct {
 // explicit `json:"id"`/`"name"`/`"data"` tags that match the wire field
 // names, so it decodes this event's secrets directly.
 type Secret struct {
-	Helpers        []Helper     `json:"helpers"`
-	Secrets        []UserSecret `json:"secrets"`
-	Replicas       *Replicas    `json:"replicas"`
-	OwnerReplicaID string       `json:"owner_replica_id"`
+	Helpers  []Helper     `json:"helpers"`
+	Secrets  []UserSecret `json:"secrets"`
+	Replicas *Replicas    `json:"replicas"`
 }
 
 // MarshalJSON implements json.Marshaler. Secret decodes with the default
@@ -158,23 +186,26 @@ func (s Secret) MarshalJSON() ([]byte, error) {
 		secrets = []UserSecret{}
 	}
 	return json.Marshal(struct {
-		Helpers        []Helper     `json:"helpers"`
-		Secrets        []UserSecret `json:"secrets"`
-		Replicas       *Replicas    `json:"replicas,omitempty"`
-		OwnerReplicaID string       `json:"owner_replica_id"`
+		Helpers  []Helper     `json:"helpers"`
+		Secrets  []UserSecret `json:"secrets"`
+		Replicas *Replicas    `json:"replicas,omitempty"`
 	}{
-		Helpers:        helpers,
-		Secrets:        secrets,
-		Replicas:       s.Replicas,
-		OwnerReplicaID: s.OwnerReplicaID,
+		Helpers:  helpers,
+		Secrets:  secrets,
+		Replicas: s.Replicas,
 	})
 }
 
-// Replicas mirrors ReplicasWire in wire.rs — the replica roster plus the
-// 32-byte replica group key, present on Secret only when the secret_id has
-// a replica setup.
+// Replicas mirrors ReplicasWire in wire.rs — the full member roster plus
+// the two things every member shares: one channel and one 32-byte group
+// key. Present on Secret only when the secret_id has a replica setup.
+//
+// Members includes the writer and the source: the roster names its source
+// by Role, so a reader can identify where the secret originated without a
+// separate field.
 type Replicas struct {
-	Replicas  []Replica `json:"replicas"`
+	ChannelID string    `json:"channel_id"`
+	Members   []Replica `json:"members"`
 	SharedKey []byte    `json:"shared_key"`
 }
 
@@ -185,15 +216,17 @@ type Replicas struct {
 // Rust's `replicas` field is a plain (non-Option) Vec and would reject a
 // null.
 func (r Replicas) MarshalJSON() ([]byte, error) {
-	replicas := r.Replicas
-	if replicas == nil {
-		replicas = []Replica{}
+	members := r.Members
+	if members == nil {
+		members = []Replica{}
 	}
 	return json.Marshal(struct {
-		Replicas  []Replica            `json:"replicas"`
+		ChannelID string               `json:"channel_id"`
+		Members   []Replica            `json:"members"`
 		SharedKey native.JSONByteArray `json:"shared_key"`
 	}{
-		Replicas:  replicas,
+		ChannelID: r.ChannelID,
+		Members:   members,
 		SharedKey: native.JSONByteArray(r.SharedKey),
 	})
 }
@@ -226,14 +259,14 @@ func (h Helper) MarshalJSON() ([]byte, error) {
 	})
 }
 
-// Replica mirrors the Replica wire DTO in wire.rs — one entry of Secret's
-// replica-destination roster.
+// Replica mirrors the Replica wire DTO in wire.rs — one member of Secret's
+// replica group. Role is "Source" or "Destination"; exactly one member of a
+// group carries "Source".
 type Replica struct {
-	ChannelID         string            `json:"channel_id"`
-	TransportURI      string            `json:"transport_uri"`
-	CommunicationInfo map[string]string `json:"communication_info"`
 	ReplicaID         string            `json:"replica_id"`
-	SenderKind        int32             `json:"sender_kind"`
+	TransportURI      string            `json:"transport_uri"`
+	Role              string            `json:"role"`
+	CommunicationInfo map[string]string `json:"communication_info"`
 }
 
 // MarshalJSON implements json.Marshaler, omitting CommunicationInfo when
@@ -243,17 +276,15 @@ type Replica struct {
 // for the omitempty behavior, not a number-array encoding.
 func (r Replica) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
-		ChannelID         string            `json:"channel_id"`
-		TransportURI      string            `json:"transport_uri"`
-		CommunicationInfo map[string]string `json:"communication_info,omitempty"`
 		ReplicaID         string            `json:"replica_id"`
-		SenderKind        int32             `json:"sender_kind"`
+		TransportURI      string            `json:"transport_uri"`
+		Role              string            `json:"role"`
+		CommunicationInfo map[string]string `json:"communication_info,omitempty"`
 	}{
-		ChannelID:         r.ChannelID,
-		TransportURI:      r.TransportURI,
-		CommunicationInfo: r.CommunicationInfo,
 		ReplicaID:         r.ReplicaID,
-		SenderKind:        r.SenderKind,
+		TransportURI:      r.TransportURI,
+		Role:              r.Role,
+		CommunicationInfo: r.CommunicationInfo,
 	})
 }
 

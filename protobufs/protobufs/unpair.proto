@@ -76,6 +76,20 @@ message UnpairRequestMessage {
   // route to the stored channel endpoint; Present = route this response
   // here without persisting the endpoint.
   optional TransportProtocol replyTo = 3;
+
+  // Identity of the replica-group member that initiated this unpair.
+  //
+  // A replica-originated unpair MUST carry it; an owner-originated one MUST
+  // NOT. Its presence is what tells the receiver which path the message
+  // belongs to, exactly as on `StoreShareRequestMessage`. Asserted on send
+  // and on receive; a violation is a protocol error.
+  //
+  // Removing a replica is not the same operation as unpairing a helper. A
+  // helper channel serves exactly one peer, so unpairing deletes it. Every
+  // member of a replica group shares one channel, so deleting it would sever
+  // the whole group — replica removal edits a member row instead, and this
+  // field says which row.
+  optional uint64 replicaId = 4;
 }
 
 // UnpairResponseMessage is the response to an UnpairRequestMessage.

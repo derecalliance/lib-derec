@@ -354,6 +354,38 @@ pub enum DeRecFlow {
         secret_id: u64,
         version: u32,
     },
+    /// Ask the replica group whether this device is behind, and catch up if
+    /// it is.
+    ///
+    /// **Replica-only.** Requires a configured `replica_id` and at least one
+    /// other group member. Every member is asked which version it holds; the
+    /// one holding the newest state is then asked for it, and the reply is
+    /// hydrated exactly as an inbound sync would be. Ties resolve to the
+    /// group's `Source`.
+    ///
+    /// A member reporting an *older* version than this device is ignored —
+    /// the check never turns into a publish. Nothing here writes to a peer.
+    ///
+    /// Nothing triggers this automatically: the library provides the
+    /// mechanism and the application chooses when to run it (a user action, a
+    /// timer, app start). Concludes with [`DeRecEvent::SyncCheckComplete`],
+    /// plus the usual hydration event when a fetch actually happened.
+    SyncCheck,
+    /// Remove a member from the replica group.
+    ///
+    /// **Replica-only.** `replica_id` names the member being removed. Naming
+    /// this device is a voluntary departure; naming another is an eviction.
+    /// Either way every member is told, then the roster is republished without
+    /// that member.
+    ///
+    /// A member tears down only once it has been told to leave *and* has seen
+    /// a newer roster excluding it. Absence alone never destroys a copy of the
+    /// secret — a publisher that silently omitted a member would otherwise
+    /// destroy that member's state instead of merely forgetting it.
+    RemoveReplica {
+        replica_id: u64,
+        memo: Option<String>,
+    },
     /// Initiate an unpair flow against a paired channel.
     ///
     /// **Owner-initiated only.** This node must hold
@@ -519,13 +551,43 @@ pub enum DeRecEvent {
         /// `version` echoed from the inbound `StoreShareRequest`.
         version: u32,
         /// Decoded full secret — same shape the sender wrote. The
-        /// `helpers`, `replicas`, `secrets`, and `owner_replica_id`
-        /// fields carry the canonical roster snapshot for this version.
+        /// `helpers`, `replicas` and `secrets` fields carry the canonical
+        /// roster snapshot for this version.
         secret: crate::protocol::types::Secret,
         /// Per-helper VSS share map. Each entry pairs a helper's
         /// `channel_id` with the serialized `CommittedDeRecShare` bytes
         /// the helper received — sufficient material for the receiver
         /// to drive a recovery against those helpers if needed.
+        shares: Vec<crate::protocol::types::ChannelShare>,
+    },
+
+    /// The first sync for a `secret_id` this device had no snapshot for —
+    /// the secret now exists here.
+    ///
+    /// Distinguished from [`Self::ReplicaSecretReceived`], which reports a
+    /// later version of a secret the device already held. Both are hydrated
+    /// by the library before the event fires; the difference is what the
+    /// application should show the user, since only this one changes the set
+    /// of secrets on the device.
+    ///
+    /// This is **not** a recovery. Recovery reconstructs a secret from helper
+    /// shares and is driven by the application through
+    /// [`crate::protocol::DeRecProtocol::restore`]; this arrives unsolicited
+    /// from a group member and is applied on receipt.
+    ReplicaSecretInstalled {
+        /// The channel the request arrived on. During an admission handover
+        /// this is the ephemeral pairing channel, not the group channel —
+        /// the group's own id is `secret.replicas.channel_id`.
+        channel_id: ChannelId,
+        /// The member that wrote this version, from the payload.
+        from_replica_id: u64,
+        /// `secret_id` echoed from the inbound `StoreShareRequest`.
+        secret_id: u64,
+        /// `version` echoed from the inbound `StoreShareRequest`.
+        version: u32,
+        /// Decoded full secret, already written to the stores.
+        secret: crate::protocol::types::Secret,
+        /// Per-helper VSS share map, as on [`Self::ReplicaSecretReceived`].
         shares: Vec<crate::protocol::types::ChannelShare>,
     },
 
@@ -549,6 +611,108 @@ pub enum DeRecEvent {
         status: i32,
         /// Human-readable explanation from the peer (empty on `Ok`).
         memo: String,
+    },
+
+    /// A group member accepted a secret sync we sent.
+    ///
+    /// Keyed by `replica_id`, not `channel_id`: every member answers on the
+    /// one group channel, so the channel cannot say who replied.
+    ReplicaSyncRejected {
+        /// The member that refused, from the response payload.
+        replica_id: u64,
+        /// `secret_id` echoed from the response.
+        secret_id: u64,
+        /// `version` echoed from the response.
+        version: u32,
+        /// The `StatusEnum` value from the member's response.
+        /// `VERSION_CONFLICT` means the round must be resolved and
+        /// republished at a new version — see [`Self::ReplicaSyncComplete`].
+        status: i32,
+        /// Human-readable explanation from the member.
+        memo: String,
+    },
+
+    /// A secret sync could not be delivered to a member at all.
+    ///
+    /// Distinct from [`Self::ReplicaSyncRejected`], which is the member
+    /// answering "no": here nothing was sent, so no acknowledgement can ever
+    /// arrive. The member is reported once, at dispatch, and appears in
+    /// [`Self::ReplicaSyncComplete::behind`].
+    ReplicaSyncFailed {
+        /// The member that could not be reached.
+        replica_id: u64,
+        /// The version this round was publishing.
+        version: u32,
+        /// The transport or encoding failure, rendered for display.
+        reason: String,
+    },
+
+    /// A member was removed from the group and its roster row dropped.
+    ///
+    /// Fires on the members that remain. The departing device instead reports
+    /// [`Self::SelfRemovedFromGroup`].
+    ReplicaRemoved {
+        /// The member that left or was evicted.
+        replica_id: u64,
+    },
+
+    /// The group's [`crate::protocol::types::ReplicaRole::Source`] moved to a
+    /// different member, because the previous source is leaving.
+    ///
+    /// Fires on the device that ran the removal, naming the successor it chose,
+    /// and on any member whose own row is promoted by an arriving roster. A
+    /// member that is neither is unaffected: it learns the new source from
+    /// `ReplicaInfo.role` like any other roster field.
+    ReplicaSourceChanged {
+        /// The member that now holds the source role.
+        replica_id: u64,
+    },
+
+    /// This device has left the group and dropped its entire `secret_id`
+    /// partition — group channel, helper channels, shares, secrets and the
+    /// user-secret snapshot.
+    ///
+    /// Fires only after both halves of the safety rule hold: this device was
+    /// told to leave, and has since seen a roster excluding it.
+    SelfRemovedFromGroup {
+        /// The version whose roster completed the removal.
+        version: u32,
+    },
+
+    /// A replica catch-up finished.
+    ///
+    /// `group_version` is the newest version any member reported; it is `0`
+    /// when no member answered. `fetched_from` names the member the state was
+    /// pulled from, and is `None` when this device was already current — in
+    /// which case no hydration event follows.
+    SyncCheckComplete {
+        /// The version this device held when the check started.
+        local_version: u32,
+        /// The newest version any member reported.
+        group_version: u32,
+        /// The member the newest state was pulled from, if a fetch happened.
+        fetched_from: Option<u64>,
+    },
+
+    /// The replica leg of a publishing round finished.
+    ///
+    /// Reported separately from [`Self::SharingComplete`] because the two
+    /// populations have different success rules and different keys. Replicas
+    /// are **best-effort**: a member in `behind` does not fail the round. A
+    /// replica holds a full copy and contributes nothing to the recovery
+    /// quorum, so blocking on one offline device would freeze writes for the
+    /// whole group while buying no safety.
+    ///
+    /// `behind` is the application's retry list. The library keeps no durable
+    /// per-member sync state, so an application that wants convergence across
+    /// restarts must persist this itself or republish to the whole group.
+    ReplicaSyncComplete {
+        /// The version this round was publishing.
+        version: u32,
+        /// Members that acknowledged.
+        synced: Vec<u64>,
+        /// Members that refused, timed out, or could not be reached.
+        behind: Vec<u64>,
     },
 
     /// A Helper confirmed it stored our share (Owner side).
@@ -784,11 +948,16 @@ pub enum DeRecEvent {
     },
 
     /// A share-storage request was dispatched to `channel_id` for
-    /// `version`. Emitted per targeted helper (and per targeted replica
-    /// destination) by [`super::DeRecProtocol::start`]. Followed by
-    /// [`Self::ShareStored`] / [`Self::ShareConfirmed`] /
-    /// [`Self::ShareRejected`] as the peer responds; the whole round
-    /// finishes with [`Self::SharingComplete`].
+    /// `version`. Emitted **per targeted helper** by
+    /// [`super::DeRecProtocol::start`]. Followed by [`Self::ShareStored`] /
+    /// [`Self::ShareConfirmed`] / [`Self::ShareRejected`] as the peer
+    /// responds; the helper leg finishes with [`Self::SharingComplete`].
+    ///
+    /// The replica leg is **not** reported here. This event is keyed by
+    /// channel, and every member of a group shares one — emitting per member
+    /// would yield indistinguishable duplicates. Members report through
+    /// [`Self::ReplicaSyncFailed`] at dispatch and
+    /// [`Self::ReplicaSyncComplete`] at the end, both keyed by `replica_id`.
     ProtectSecretStarted { channel_id: ChannelId, version: u32 },
 
     /// A share-storage request could not be dispatched to `channel_id`

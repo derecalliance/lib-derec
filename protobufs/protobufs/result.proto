@@ -139,6 +139,40 @@ enum StatusEnum {
   // initiator can surface a useful diagnostic.
   INCOMPATIBLE_PARAMETER_RANGE = 11;
 
+  // A share already exists for this (secretId, version) with different
+  // content, so the write was refused.
+  //
+  // Exactly one writer owns a version. A recipient stores the first write
+  // it sees at a version; a later write carrying different bytes is
+  // rejected with this status rather than overwriting or coexisting. A
+  // byte-identical re-send is an idempotent retry and returns `OK`.
+  //
+  // Because a single writer always derives `version` as
+  // `latest_version + 1`, it can never rewrite a version with different
+  // content. Receiving this status therefore means a *second* writer
+  // published concurrently — typically the same user acting on two
+  // devices at once. Resolution is the application's responsibility: the
+  // round has failed and should be republished at a new version.
+  VERSION_CONFLICT = 13;
+
+  // A replica pairing named a `replicaId` that is already in use by another
+  // member of the group — including the recipient itself.
+  //
+  // Every member of a group must be uniquely identified: the roster is keyed
+  // by `replicaId`, and messages between members are attributed by it. Two
+  // members sharing an id would overwrite each other's roster row and make
+  // every acknowledgement ambiguous.
+  //
+  // `replicaId` is assigned by the application, so a collision is a
+  // configuration fault — most often the same identity reused on two devices,
+  // such as a cloned device image. Resolution is the application's: assign a
+  // distinct id and pair again. The protocol cannot pick one, because it
+  // cannot know which device is meant to keep the original.
+  //
+  // Reported before fingerprint verification: there is no point asking a user
+  // to confirm a pairing that cannot be completed.
+  REPLICA_ID_CONFLICT = 14;
+
   // The Helper is requesting that the Owner terminate the relationship.
   //
   // The Owner SHOULD respond by sending an UnpairRequestMessage and

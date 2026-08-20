@@ -20,7 +20,7 @@ use std::collections::HashMap;
 ///
 /// At present the sharing flow uses the library's VSS-based share generation and
 /// encodes that choice using the protocol value `0`.
-const SHARE_ALGORITHM_VSS: i32 = 0;
+pub(crate) const SHARE_ALGORITHM_VSS: i32 = 0;
 /// `share` bytes carry a **full `Secret` payload** (`DeRecSecret` proto)
 /// instead of a single VSS share fragment. Used on replica channels —
 /// every replica holds an identical copy of the secret rather than a
@@ -198,7 +198,7 @@ pub fn split(
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 ///
 /// let ProduceResult { envelope } =
-///     produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, None, None)
+///     produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, None)
 ///         .expect("produce failed");
 ///
 /// assert!(!envelope.is_empty());
@@ -217,7 +217,6 @@ pub fn produce(
     description: impl Into<String>,
     shared_key: &SharedKey,
     reply_to: Option<derec_proto::TransportProtocol>,
-    replica_id: Option<u64>,
 ) -> Result<ProduceResult, crate::Error> {
     let timestamp = current_timestamp();
 
@@ -230,7 +229,10 @@ pub fn produce(
         timestamp: Some(timestamp),
         secret_id,
         reply_to,
-        replica_id,
+        // Helper-bound: `SHARE_ALGORITHM_VSS` implies no replica identity.
+        // Helpers know nothing about replicas — see
+        // `StoreShareRequestMessage.replicaId`.
+        replica_id: None,
     };
 
     let envelope = DeRecMessageBuilder::channel()
@@ -328,7 +330,7 @@ pub fn produce(
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 ///
 /// let ProduceResult { envelope } =
-///     produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, None, None)
+///     produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, None)
 ///         .expect("produce failed");
 ///
 /// let ExtractResult { request } = extract(&envelope, &shared_key).expect("extract failed");

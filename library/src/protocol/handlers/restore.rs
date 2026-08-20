@@ -32,7 +32,10 @@
 use super::super::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecStateStore,
     DeRecTransport, DeRecUserSecretStore, SecretValue, UnpairAck,
-    types::{Channel, ChannelStatus, HelperInfo, Replicas, Secret, Share, UserSecrets},
+    types::{
+        ChannelRecord, ChannelStatus, HelperChannel, HelperInfo, ReplicaMember, ReplicaRole,
+        Replicas, Secret, Share, UserSecrets,
+    },
 };
 use crate::{
     Result,
@@ -77,8 +80,7 @@ pub enum RestoreError {
 /// persisted with `SharedKey` + owner-side tracking shares at
 /// `recovered_version`; canonical replica channels are persisted with
 /// the group key from `secret.replicas.shared_key`; the user-secret
-/// snapshot is committed at `recovered_version`; `local_replica_id`
-/// adopts `secret.owner_replica_id` if previously unset; every
+/// snapshot is committed at `recovered_version`; every
 /// recovery-mode channel under `secret_id` is unpaired
 /// (`UnpairAck::NotRequired`). The returned events come from the
 /// recovery-channel wipe and should be drained into the protocol's
@@ -99,16 +101,21 @@ pub enum RestoreError {
 /// 2. **Helper channels.** Persist each helper's canonical channel
 ///    record, its `SharedKey`, and an empty owner-side tracking
 ///    [`Share`] at `recovered_version`.
-/// 3. **Replica channels.** Persist each destination's canonical
-///    channel record with the group key as its `SharedKey`. Each
-///    restored channel's `peer_role` is the `sender_kind` the recovered
-///    `Secret` carries for that peer.
+/// 3. **Replica members.** Persist every member of the roster against the
+///    one group channel, with the group key as that channel's `SharedKey`.
+///    Each member's `role` is taken verbatim from the roster: it is a
+///    property of the group, not of the reader.
+///
+///    The device's own `replica_id` is **not** adopted from the recovered
+///    `Secret`. The roster names its source, but a recovering device
+///    claiming that identity is a takeover, which is a separate decision
+///    with its own convergence rules. A device that was built without a
+///    `replica_id` still has none after restore and cannot publish as a
+///    replica until the application configures one.
 /// 4. **Commit.** Write the user-secret snapshot at
 ///    `recovered_version`. This write is the commit point — nothing is
 ///    removed before it succeeds, so any earlier failure is fully
-///    retryable. `owner_replica_id` is adopted from the recovered
-///    `Secret` only when the builder left the local replica id unset;
-///    zero is the "no replica id" sentinel and is never adopted.
+///    retryable.
 /// 5. **Wipe.** Send unpair requests to every channel not at a
 ///    canonical id — the recovery-mode channels minted to drive
 ///    `start(RecoverSecret)` — and drop their local state.
@@ -149,7 +156,6 @@ pub(in crate::protocol) async fn restore<
     user_secret_store: &mut Us,
     transport: &T,
     state_store: &mut St,
-    local_replica_id: &mut Option<u64>,
     secret_id: u64,
     secret: &Secret,
     recovered_version: u32,
@@ -167,13 +173,11 @@ pub(in crate::protocol) async fn restore<
     )
     .await?;
 
-    if let Some(group) = secret.replicas.as_ref().filter(|g| !g.replicas.is_empty()) {
+    if let Some(group) = secret.replicas.as_ref().filter(|g| !g.members.is_empty()) {
         write_replica_channels(channel_store, secret_store, secret_id, group).await?;
     }
 
     commit_snapshot(user_secret_store, secret_id, secret, recovered_version).await?;
-
-    adopt_owner_replica_id(local_replica_id, secret.owner_replica_id);
 
     let events = unpair_recovery_channels(
         channel_store,
@@ -191,7 +195,7 @@ pub(in crate::protocol) async fn restore<
     tracing::info!(
         secret_id,
         helpers_restored = secret.helpers.len(),
-        replicas_restored = secret.replicas.as_ref().map_or(0, |g| g.replicas.len()),
+        replicas_restored = secret.replicas.as_ref().map_or(0, |g| g.members.len()),
         user_secrets_restored = secret.secrets.len(),
         "DeRecProtocol restored from recovered Secret"
     );
@@ -204,13 +208,13 @@ async fn check_preconditions<Ch: DeRecChannelStore, Us: DeRecUserSecretStore>(
     channel_store: &Ch,
     secret_id: u64,
     secret: &Secret,
-) -> Result<(HashSet<u64>, Vec<Channel>)> {
+) -> Result<(HashSet<u64>, Vec<HelperChannel>)> {
     if user_secret_store.load_latest(secret_id).await?.is_some() {
         return Err(RestoreError::AlreadyRestored.into());
     }
 
     if let Some(group) = &secret.replicas
-        && !group.replicas.is_empty()
+        && !group.members.is_empty()
         && group.shared_key.len() != 32
     {
         return Err(RestoreError::Invariant(
@@ -219,23 +223,19 @@ async fn check_preconditions<Ch: DeRecChannelStore, Us: DeRecUserSecretStore>(
         .into());
     }
 
+    // Every member shares the group channel, so the roster contributes one id
+    // rather than one per member.
     let canonical_ids: HashSet<u64> = secret
         .helpers
         .iter()
         .map(|h| h.channel_id)
-        .chain(
-            secret
-                .replicas
-                .as_ref()
-                .into_iter()
-                .flat_map(|g| g.replicas.iter().map(|r| r.channel_id)),
-        )
+        .chain(secret.replicas.as_ref().map(|g| g.channel_id))
         .collect();
-    let existing_channels = channel_store.channels(secret_id).await?;
+    let existing_channels = channel_store.helpers(secret_id).await?;
     let collisions: Vec<ChannelId> = existing_channels
         .iter()
-        .filter(|c| canonical_ids.contains(&c.id.0))
-        .map(|c| c.id)
+        .filter(|c| canonical_ids.contains(&c.channel_id.0))
+        .map(|c| c.channel_id)
         .collect();
     if !collisions.is_empty() {
         return Err(RestoreError::Conflict(collisions).into());
@@ -262,8 +262,8 @@ async fn write_helper_channels<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: D
         channel_store
             .save(
                 secret_id,
-                Channel {
-                    id: cid,
+                ChannelRecord::Helper(HelperChannel {
+                    channel_id: cid,
                     transport: derec_proto::TransportProtocol {
                         uri: h.transport_uri.clone(),
                         protocol: derec_proto::Protocol::Https as i32,
@@ -272,8 +272,7 @@ async fn write_helper_channels<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: D
                     status: ChannelStatus::Paired,
                     created_at: now_secs(),
                     peer_role: derec_proto::SenderKind::Helper,
-                    replica_id: None,
-                },
+                }),
             )
             .await?;
         secret_store
@@ -286,7 +285,6 @@ async fn write_helper_channels<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: D
                 Share {
                     secret_id,
                     version: recovered_version,
-                    replica_id: None,
                     bytes: Vec::new(),
                 },
             )
@@ -304,31 +302,32 @@ async fn write_replica_channels<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     let group_key: SharedKey = group.shared_key.as_slice().try_into().map_err(|_| {
         RestoreError::Invariant("replicas.shared_key must be 32 bytes when replicas is non-empty")
     })?;
-    for r in &group.replicas {
-        let peer_kind = derec_proto::SenderKind::try_from(r.sender_kind)
-            .map_err(|_| RestoreError::Invariant("replica.sender_kind invalid"))?;
-        let cid = ChannelId(r.channel_id);
+    let cid = ChannelId(group.channel_id);
+    for r in &group.members {
         channel_store
             .save(
                 secret_id,
-                Channel {
-                    id: cid,
+                ChannelRecord::Replica(ReplicaMember {
+                    channel_id: cid,
+                    replica_id: crate::types::ReplicaId::try_from(r.replica_id)?,
                     transport: derec_proto::TransportProtocol {
                         uri: r.transport_uri.clone(),
                         protocol: derec_proto::Protocol::Https as i32,
                     },
                     communication_info: r.communication_info.clone(),
+                    role: ReplicaRole::from_i32(r.role).ok_or(RestoreError::Invariant(
+                        "roster member carries an unknown role",
+                    ))?,
                     status: ChannelStatus::Paired,
                     created_at: now_secs(),
-                    peer_role: peer_kind,
-                    replica_id: Some(r.replica_id),
-                },
+                }),
             )
             .await?;
-        secret_store
-            .save(secret_id, cid, SecretValue::SharedKey(group_key))
-            .await?;
     }
+    // One key at the one channel every member is addressed on.
+    secret_store
+        .save(secret_id, cid, SecretValue::SharedKey(group_key))
+        .await?;
     Ok(())
 }
 
@@ -352,12 +351,6 @@ async fn commit_snapshot<Us: DeRecUserSecretStore>(
     Ok(())
 }
 
-fn adopt_owner_replica_id(local_replica_id: &mut Option<u64>, owner_replica_id: u64) {
-    if local_replica_id.is_none() && owner_replica_id != 0 {
-        *local_replica_id = Some(owner_replica_id);
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn unpair_recovery_channels<
     Ch: DeRecChannelStore,
@@ -372,13 +365,13 @@ async fn unpair_recovery_channels<
     transport: &T,
     state_store: &mut St,
     secret_id: u64,
-    existing_channels: &[Channel],
+    existing_channels: &[HelperChannel],
     canonical_ids: &HashSet<u64>,
 ) -> Vec<DeRecEvent> {
     let recovery_ids: Vec<ChannelId> = existing_channels
         .iter()
-        .filter(|c| !canonical_ids.contains(&c.id.0))
-        .map(|c| c.id)
+        .filter(|c| !canonical_ids.contains(&c.channel_id.0))
+        .map(|c| c.channel_id)
         .collect();
     if recovery_ids.is_empty() {
         return Vec::new();
@@ -433,8 +426,8 @@ mod tests {
         DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecUserSecretStore,
     };
     use crate::protocol::types::{
-        Channel, ChannelStatus, HelperInfo, ReplicaInfo, Replicas, Secret, SecretKind, SecretValue,
-        UserSecret, UserSecrets,
+        ChannelQuery, ChannelRecord, ChannelStatus, HelperInfo, ReplicaInfo, ReplicaRole, Replicas,
+        Secret, SecretKind, SecretValue, UserSecret, UserSecrets,
     };
     use derec_proto::{SenderKind, TransportProtocol};
     use std::collections::HashMap;
@@ -518,16 +511,23 @@ mod tests {
                 },
             ],
             replicas: Some(Replicas {
-                replicas: vec![ReplicaInfo {
-                    channel_id: 21,
-                    transport_uri: "https://replica.example".to_owned(),
-                    communication_info: HashMap::new(),
-                    replica_id: 0xCAFE,
-                    sender_kind: SenderKind::ReplicaDestination as i32,
-                }],
+                channel_id: 21,
+                members: vec![
+                    ReplicaInfo {
+                        replica_id: 0xBEEF,
+                        transport_uri: "https://owner.example".to_owned(),
+                        role: ReplicaRole::Source as i32,
+                        communication_info: HashMap::new(),
+                    },
+                    ReplicaInfo {
+                        replica_id: 0xCAFE,
+                        transport_uri: "https://replica.example".to_owned(),
+                        role: ReplicaRole::Destination as i32,
+                        communication_info: HashMap::new(),
+                    },
+                ],
                 shared_key: vec![0xCC; 32],
             }),
-            owner_replica_id: 0xBEEF,
         }
     }
 
@@ -548,13 +548,20 @@ mod tests {
             for hid in [11_u64, 12] {
                 let ch = rig
                     .channel_store
-                    .load(secret_id, ChannelId(hid))
+                    .load(
+                        secret_id,
+                        ChannelQuery::Helper {
+                            channel_id: ChannelId(hid),
+                        },
+                    )
                     .await
                     .unwrap()
                     .expect("helper channel must be persisted");
+                let ChannelRecord::Helper(ch) = ch else {
+                    panic!("a helper query must never return a replica record");
+                };
                 assert_eq!(ch.status, ChannelStatus::Paired);
                 assert_eq!(ch.peer_role, SenderKind::Helper);
-                assert!(ch.replica_id.is_none());
                 let sk = rig
                     .secret_store
                     .load(secret_id, ChannelId(hid), SecretKind::SharedKey)
@@ -571,17 +578,26 @@ mod tests {
                 assert_eq!(shares[0].version, 7);
             }
 
-            // Replica channel: role inverted from peer's sender_kind,
-            // group key persisted.
+            // Replica member: the roster records each member's own role
+            // verbatim — it is absolute, not relative to the reader.
             let rep = rig
                 .channel_store
-                .load(secret_id, ChannelId(21))
+                .load(
+                    secret_id,
+                    ChannelQuery::Replica {
+                        channel_id: ChannelId(21),
+                        replica_id: crate::types::ReplicaId(0xCAFE),
+                    },
+                )
                 .await
                 .unwrap()
-                .expect("replica channel must be persisted");
+                .expect("replica member must be persisted");
+            let ChannelRecord::Replica(rep) = rep else {
+                panic!("a replica query must never return a helper record");
+            };
             assert_eq!(rep.status, ChannelStatus::Paired);
-            assert_eq!(rep.peer_role, SenderKind::ReplicaDestination);
-            assert_eq!(rep.replica_id, Some(0xCAFE));
+            assert_eq!(rep.role, ReplicaRole::Destination);
+            assert_eq!(rep.replica_id.0, 0xCAFE);
             let rep_sk = rig
                 .secret_store
                 .load(secret_id, ChannelId(21), SecretKind::SharedKey)
@@ -606,8 +622,15 @@ mod tests {
             assert_eq!(snapshot.secrets[0].data, b"correct horse battery staple");
             assert_eq!(snapshot.secrets[1].name, "api token");
 
-            // replica_id adopted (builder default was None).
-            assert_eq!(rig.protocol.replica_id(), Some(0xBEEF));
+            // The device does not take the source's identity. The roster
+            // names its source, but adopting that id is a takeover — a
+            // separate decision with its own convergence rules — so a device
+            // built without a replica_id still has none after restore.
+            assert_eq!(
+                rig.protocol.replica_id(),
+                None,
+                "restore must not adopt the roster source's replica_id"
+            );
         });
     }
 
@@ -624,10 +647,10 @@ mod tests {
             // Each needs a SharedKey in `secret_store` so the unpair
             // handler can build the encrypted request envelope.
             for rcid in [99_u64, 100] {
-                rig.channel_store.data.lock().unwrap().insert(
+                rig.channel_store.helper_rows.lock().unwrap().insert(
                     (secret_id, rcid),
-                    Channel {
-                        id: ChannelId(rcid),
+                    HelperChannel {
+                        channel_id: ChannelId(rcid),
                         transport: TransportProtocol {
                             uri: format!("https://recovery-{rcid}.example"),
                             protocol: 0,
@@ -636,7 +659,6 @@ mod tests {
                         status: ChannelStatus::Paired,
                         created_at: 1,
                         peer_role: SenderKind::Helper,
-                        replica_id: None,
                     },
                 );
                 rig.secret_store.data.lock().unwrap().insert(
@@ -654,7 +676,12 @@ mod tests {
             for rcid in [99_u64, 100] {
                 assert!(
                     rig.channel_store
-                        .load(secret_id, ChannelId(rcid))
+                        .load(
+                            secret_id,
+                            ChannelQuery::Helper {
+                                channel_id: ChannelId(rcid),
+                            },
+                        )
                         .await
                         .unwrap()
                         .is_none(),
@@ -672,7 +699,12 @@ mod tests {
             // Canonical state is in place.
             assert!(
                 rig.channel_store
-                    .load(secret_id, ChannelId(11))
+                    .load(
+                        secret_id,
+                        ChannelQuery::Helper {
+                            channel_id: ChannelId(11),
+                        },
+                    )
                     .await
                     .unwrap()
                     .is_some()
@@ -703,10 +735,10 @@ mod tests {
                 .build()
                 .expect("test rig builds");
 
-            channel_store.data.lock().unwrap().insert(
+            channel_store.helper_rows.lock().unwrap().insert(
                 (secret_id, 99),
-                Channel {
-                    id: ChannelId(99),
+                HelperChannel {
+                    channel_id: ChannelId(99),
                     transport: TransportProtocol {
                         uri: "https://gone.example".to_owned(),
                         protocol: 0,
@@ -715,7 +747,6 @@ mod tests {
                     status: ChannelStatus::Paired,
                     created_at: 1,
                     peer_role: SenderKind::Helper,
-                    replica_id: None,
                 },
             );
             secret_store.data.lock().unwrap().insert(
@@ -744,7 +775,12 @@ mod tests {
 
             assert!(
                 channel_store
-                    .load(secret_id, ChannelId(99))
+                    .load(
+                        secret_id,
+                        ChannelQuery::Helper {
+                            channel_id: ChannelId(99),
+                        },
+                    )
                     .await
                     .unwrap()
                     .is_none(),
@@ -760,7 +796,12 @@ mod tests {
             );
             assert!(
                 channel_store
-                    .load(secret_id, ChannelId(11))
+                    .load(
+                        secret_id,
+                        ChannelQuery::Helper {
+                            channel_id: ChannelId(11),
+                        },
+                    )
                     .await
                     .unwrap()
                     .is_some(),
@@ -799,7 +840,12 @@ mod tests {
             // No mutation: no canonical channel written.
             assert!(
                 rig.channel_store
-                    .load(secret_id, ChannelId(11))
+                    .load(
+                        secret_id,
+                        ChannelQuery::Helper {
+                            channel_id: ChannelId(11),
+                        },
+                    )
                     .await
                     .unwrap()
                     .is_none()
@@ -813,10 +859,10 @@ mod tests {
             let secret_id: u64 = 0xDE_2EC;
             let mut rig = build_rig(secret_id);
             // Pre-seed a channel sitting at canonical helper id 11.
-            rig.channel_store.data.lock().unwrap().insert(
+            rig.channel_store.helper_rows.lock().unwrap().insert(
                 (secret_id, 11),
-                Channel {
-                    id: ChannelId(11),
+                HelperChannel {
+                    channel_id: ChannelId(11),
                     transport: TransportProtocol {
                         uri: "https://collision.example".to_owned(),
                         protocol: 0,
@@ -825,7 +871,6 @@ mod tests {
                     status: ChannelStatus::Paired,
                     created_at: 1,
                     peer_role: SenderKind::Helper,
-                    replica_id: None,
                 },
             );
 
@@ -869,7 +914,12 @@ mod tests {
             // No mutation.
             assert!(
                 rig.channel_store
-                    .load(secret_id, ChannelId(11))
+                    .load(
+                        secret_id,
+                        ChannelQuery::Helper {
+                            channel_id: ChannelId(11),
+                        },
+                    )
                     .await
                     .unwrap()
                     .is_none()

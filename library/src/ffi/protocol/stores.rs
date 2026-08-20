@@ -80,8 +80,47 @@ fn fetch_callback_bytes(
         Err(format!("{label} callback failed (rc={rc})"))
     }
 }
-use crate::protocol::types::Channel;
+use crate::protocol::types::{ChannelQuery, ChannelRecord, HelperChannel, ReplicaMember};
 use crate::types::ChannelId;
+
+/// Flatten a query into the `(channel_id, replica_id)` pair the vtable takes.
+/// `replica_id == 0` addresses the helper channel; see [`ChannelStoreCallbacks`].
+fn query_key(query: ChannelQuery) -> (u64, u64) {
+    match query {
+        ChannelQuery::Helper { channel_id } => (channel_id.0, 0),
+        ChannelQuery::Replica {
+            channel_id,
+            replica_id,
+        } => (channel_id.0, replica_id.0),
+    }
+}
+
+/// The address a record is stored at, derived from the record itself so a
+/// caller cannot save one under the wrong key.
+fn record_key(record: &ChannelRecord) -> (u64, u64) {
+    match record {
+        ChannelRecord::Helper(h) => (h.channel_id.0, 0),
+        ChannelRecord::Replica(r) => (r.channel_id.0, r.replica_id.0),
+    }
+}
+
+/// Decode a listing callback's JSON array; an absent or empty buffer is an
+/// empty list, not an error.
+fn decode_list<T: serde::de::DeserializeOwned>(
+    bytes_res: Result<Option<Vec<u8>>, String>,
+    label: &str,
+) -> Result<Vec<T>, ChannelStoreError> {
+    let bytes = match bytes_res {
+        Err(e) => return Err(ChannelStoreError::Backend(boxed_err(e))),
+        Ok(None) => return Ok(Vec::new()),
+        Ok(Some(b)) => b,
+    };
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|e| ChannelStoreError::Backend(format!("{label} JSON: {e}").into()))
+}
 use derec_proto::TransportProtocol;
 
 /// JSON-on-the-wire shape of a [`Share`] consumed by
@@ -114,7 +153,6 @@ impl ShareRecord {
         Ok(Share {
             secret_id,
             version: self.version,
-            replica_id: None,
             bytes: self.bytes,
         })
     }
@@ -227,6 +265,12 @@ impl From<&StateKey> for StateKeyRecord {
                 secret_id: None,
                 version: None,
             },
+            StateKey::PendingSyncCheck => Self {
+                kind: 4,
+                channel_id: None,
+                secret_id: None,
+                version: None,
+            },
             StateKey::SharingRound => Self {
                 kind: 3,
                 channel_id: None,
@@ -270,6 +314,26 @@ pub(crate) struct StateItemRecord {
     pub confirmed: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed: Option<Vec<String>>,
+    /// Replica-leg accounting, keyed by `replica_id`. Absent on rows written
+    /// before the leg existed, which decode as empty rather than failing —
+    /// an in-flight round predating the split simply has no member state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_replicas: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synced_replicas: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behind_replicas: Option<Vec<String>>,
+    /// Catch-up accounting: members still to answer, and what those that
+    /// have answered reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported: Option<Vec<SyncCheckReport>>,
+}
+/// One member's answer in an in-flight catch-up. A nested record rather than
+/// a packed string so the pair stays self-describing for every binding.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct SyncCheckReport {
+    pub replica_id: String,
+    pub version: u32,
 }
 
 impl From<&StateItem> for StateItemRecord {
@@ -289,6 +353,10 @@ impl From<&StateItem> for StateItemRecord {
                 pending: None,
                 confirmed: None,
                 failed: None,
+                pending_replicas: None,
+                synced_replicas: None,
+                behind_replicas: None,
+                reported: None,
             },
             StateItem::PendingRecovery {
                 secret_id,
@@ -305,6 +373,10 @@ impl From<&StateItem> for StateItemRecord {
                 pending: None,
                 confirmed: None,
                 failed: None,
+                pending_replicas: None,
+                synced_replicas: None,
+                behind_replicas: None,
+                reported: None,
             },
             StateItem::PendingUnpair {
                 channel_id,
@@ -320,27 +392,96 @@ impl From<&StateItem> for StateItemRecord {
                 pending: None,
                 confirmed: None,
                 failed: None,
+                pending_replicas: None,
+                synced_replicas: None,
+                behind_replicas: None,
+                reported: None,
             },
-            StateItem::SharingRound {
-                version,
+            StateItem::PendingSyncCheck {
+                local_version,
                 pending,
-                confirmed,
-                failed,
+                reported,
                 started_at,
             } => Self {
-                kind: 3,
+                kind: 4,
                 channel_id: None,
                 secret_id: None,
-                version: Some(*version),
+                version: Some(*local_version),
                 started_at: Some(started_at.to_string()),
                 bytes: None,
                 shares: None,
-                pending: Some(pending.iter().map(|c| c.0.to_string()).collect()),
-                confirmed: Some(confirmed.iter().map(|c| c.0.to_string()).collect()),
-                failed: Some(failed.iter().map(|c| c.0.to_string()).collect()),
+                pending: None,
+                confirmed: None,
+                failed: None,
+                pending_replicas: Some(pending.iter().map(|r| r.0.to_string()).collect()),
+                synced_replicas: None,
+                behind_replicas: None,
+                reported: Some(
+                    reported
+                        .iter()
+                        .map(|(id, version)| SyncCheckReport {
+                            replica_id: id.0.to_string(),
+                            version: *version,
+                        })
+                        .collect(),
+                ),
+            },
+            StateItem::SharingRound(round) => Self {
+                kind: 3,
+                channel_id: None,
+                secret_id: None,
+                version: Some(round.version),
+                started_at: Some(round.started_at.to_string()),
+                bytes: None,
+                shares: None,
+                pending: Some(round.pending.iter().map(|c| c.0.to_string()).collect()),
+                confirmed: Some(round.confirmed.iter().map(|c| c.0.to_string()).collect()),
+                failed: Some(round.failed.iter().map(|c| c.0.to_string()).collect()),
+                pending_replicas: Some(
+                    round
+                        .pending_replicas
+                        .iter()
+                        .map(|r| r.0.to_string())
+                        .collect(),
+                ),
+                synced_replicas: Some(
+                    round
+                        .synced_replicas
+                        .iter()
+                        .map(|r| r.0.to_string())
+                        .collect(),
+                ),
+                behind_replicas: Some(
+                    round
+                        .behind_replicas
+                        .iter()
+                        .map(|r| r.0.to_string())
+                        .collect(),
+                ),
+                reported: None,
             },
         }
     }
+}
+
+/// Decode a replica-id set. An absent field is an empty set, not an error:
+/// the replica leg postdates the helper one, so a row written by an older
+/// build carries no member state and has none to recover.
+fn parse_replica_id_set(
+    raw: Option<Vec<String>>,
+    field: &str,
+) -> Result<std::collections::HashSet<crate::types::ReplicaId>, String> {
+    raw.unwrap_or_default()
+        .into_iter()
+        .map(|s| {
+            s.parse::<u64>()
+                .map_err(|e| format!("{field} entry not a decimal u64: {e}"))
+                .and_then(|v| {
+                    crate::types::ReplicaId::try_from(v)
+                        .map_err(|e| format!("{field} entry is not a valid replica_id: {e}"))
+                })
+        })
+        .collect()
 }
 
 fn parse_channel_id_set(
@@ -434,11 +575,51 @@ impl StateItemRecord {
                 let pending = parse_channel_id_set(self.pending, "pending")?;
                 let confirmed = parse_channel_id_set(self.confirmed, "confirmed")?;
                 let failed = parse_channel_id_set(self.failed, "failed")?;
-                Ok(StateItem::SharingRound {
-                    version,
+                let pending_replicas =
+                    parse_replica_id_set(self.pending_replicas, "pending_replicas")?;
+                let synced_replicas =
+                    parse_replica_id_set(self.synced_replicas, "synced_replicas")?;
+                let behind_replicas =
+                    parse_replica_id_set(self.behind_replicas, "behind_replicas")?;
+                Ok(StateItem::SharingRound(Box::new(
+                    crate::protocol::types::SharingRoundState {
+                        version,
+                        pending,
+                        confirmed,
+                        failed,
+                        pending_replicas,
+                        synced_replicas,
+                        behind_replicas,
+                        started_at,
+                    },
+                )))
+            }
+            4 => {
+                let local_version = self
+                    .version
+                    .ok_or_else(|| "PendingSyncCheck requires version".to_string())?;
+                let started_at = self
+                    .started_at
+                    .ok_or_else(|| "PendingSyncCheck requires started_at".to_string())?
+                    .parse::<u64>()
+                    .map_err(|e| format!("started_at not a decimal u64: {e}"))?;
+                let pending = parse_replica_id_set(self.pending_replicas, "pending_replicas")?;
+                let mut reported = std::collections::HashMap::new();
+                for entry in self.reported.unwrap_or_default() {
+                    let id = entry
+                        .replica_id
+                        .parse::<u64>()
+                        .map_err(|e| format!("reported.replica_id not a decimal u64: {e}"))
+                        .and_then(|v| {
+                            crate::types::ReplicaId::try_from(v)
+                                .map_err(|e| format!("reported.replica_id invalid: {e}"))
+                        })?;
+                    reported.insert(id, entry.version);
+                }
+                Ok(StateItem::PendingSyncCheck {
+                    local_version,
                     pending,
-                    confirmed,
-                    failed,
+                    reported,
                     started_at,
                 })
             }
@@ -453,6 +634,7 @@ fn state_kind_to_u32(kind: StateKind) -> u32 {
         StateKind::PendingRecovery => 1,
         StateKind::PendingUnpair => 2,
         StateKind::SharingRound => 3,
+        StateKind::PendingSyncCheck => 4,
     }
 }
 
@@ -469,6 +651,30 @@ fn state_kind_to_u32(kind: StateKind) -> u32 {
 /// - `1` on "not found" (only meaningful for `load`)
 /// - any other value indicates a backend failure; the shim wraps it as
 ///   [`ChannelStoreError::Backend`]
+///
+/// # Addressing a record
+///
+/// `load`, `save` and `remove` take a `(channel_id, replica_id)` pair. A
+/// `replica_id` of `0` — the value [`crate::types::ReplicaId`] reserves as
+/// "absent" — addresses the helper channel at `channel_id`.
+///
+/// Any other value addresses that member of the replica group, and the member
+/// is keyed by **`replica_id` alone**. The accompanying `channel_id` is
+/// context, not part of the key: a member moves between channels during an
+/// admission handover while remaining the same member, and a lookup that
+/// required both to match would miss it exactly when the move needs to be
+/// observed. Backends therefore keep two maps — helpers by `channel_id`,
+/// members by `replica_id` — not one keyed by the pair.
+///
+/// The `bytes` payload of `save`, and the buffer `load` returns, are a
+/// JSON-encoded [`crate::protocol::types::ChannelRecord`]. `list_helpers` and
+/// `list_replicas` return a JSON array of
+/// [`crate::protocol::types::HelperChannel`] and
+/// [`crate::protocol::types::ReplicaMember`] respectively.
+///
+/// The order `list_replicas` returns is significant in exactly one situation —
+/// it selects the successor when the group's source is removed. See
+/// [`crate::protocol::DeRecChannelStore::replicas`] for the full contract.
 #[repr(C)]
 pub struct ChannelStoreCallbacks {
     pub user_data: *mut c_void,
@@ -476,6 +682,7 @@ pub struct ChannelStoreCallbacks {
         user_data: *mut c_void,
         secret_id: u64,
         channel_id: u64,
+        replica_id: u64,
         out_ptr: *mut *mut u8,
         out_len: *mut usize,
     ) -> i32,
@@ -483,6 +690,7 @@ pub struct ChannelStoreCallbacks {
         user_data: *mut c_void,
         secret_id: u64,
         channel_id: u64,
+        replica_id: u64,
         bytes: *const u8,
         len: usize,
     ) -> i32,
@@ -490,9 +698,16 @@ pub struct ChannelStoreCallbacks {
         user_data: *mut c_void,
         secret_id: u64,
         channel_id: u64,
+        replica_id: u64,
         out_existed: *mut u32,
     ) -> i32,
-    pub list_channels: extern "C" fn(
+    pub list_helpers: extern "C" fn(
+        user_data: *mut c_void,
+        secret_id: u64,
+        out_ptr: *mut *mut u8,
+        out_len: *mut usize,
+    ) -> i32,
+    pub list_replicas: extern "C" fn(
         user_data: *mut c_void,
         secret_id: u64,
         out_ptr: *mut *mut u8,
@@ -751,35 +966,41 @@ impl DeRecChannelStore for DotnetChannelStore {
     fn load(
         &self,
         secret_id: u64,
-        channel_id: ChannelId,
-    ) -> ChannelStoreFuture<'_, Option<Channel>> {
-        let bytes_res = self
-            .fetch_bytes(|p, l| (self.cb.load)(self.cb.user_data, secret_id, channel_id.0, p, l));
+        query: ChannelQuery,
+    ) -> ChannelStoreFuture<'_, Option<ChannelRecord>> {
+        let (channel_id, replica_id) = query_key(query);
+        let bytes_res = self.fetch_bytes(|p, l| {
+            (self.cb.load)(self.cb.user_data, secret_id, channel_id, replica_id, p, l)
+        });
         Box::pin(async move {
             match bytes_res {
                 Err(e) => Err(ChannelStoreError::Backend(e.into())),
                 Ok(None) => Ok(None),
                 Ok(Some(bytes)) if bytes.is_empty() => Ok(None),
                 Ok(Some(bytes)) => {
-                    let channel: Channel = serde_json::from_slice(&bytes).map_err(|e| {
-                        ChannelStoreError::Backend(format!("invalid Channel JSON: {e}").into())
+                    let record: ChannelRecord = serde_json::from_slice(&bytes).map_err(|e| {
+                        ChannelStoreError::Backend(
+                            format!("invalid ChannelRecord JSON: {e}").into(),
+                        )
                     })?;
-                    Ok(Some(channel))
+                    Ok(Some(record))
                 }
             }
         })
     }
 
-    fn save(&mut self, secret_id: u64, channel: Channel) -> ChannelStoreFuture<'_, ()> {
-        let channel_id = channel.id.0;
+    fn save(&mut self, secret_id: u64, record: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
+        let (channel_id, replica_id) = record_key(&record);
         let cb = &self.cb;
         let res = (|| -> Result<(), ChannelStoreError> {
-            let bytes = serde_json::to_vec(&channel)
-                .map_err(|e| ChannelStoreError::Backend(format!("Channel JSON: {e}").into()))?;
+            let bytes = serde_json::to_vec(&record).map_err(|e| {
+                ChannelStoreError::Backend(format!("ChannelRecord JSON: {e}").into())
+            })?;
             let rc = (cb.save)(
                 cb.user_data,
                 secret_id,
                 channel_id,
+                replica_id,
                 bytes.as_ptr(),
                 bytes.len(),
             );
@@ -793,14 +1014,16 @@ impl DeRecChannelStore for DotnetChannelStore {
         Box::pin(async move { res })
     }
 
-    fn remove(&mut self, secret_id: u64, channel_id: ChannelId) -> ChannelStoreFuture<'_, bool> {
+    fn remove(&mut self, secret_id: u64, query: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
+        let (channel_id, replica_id) = query_key(query);
         let cb = &self.cb;
         let res = (|| -> Result<bool, ChannelStoreError> {
             let mut existed: u32 = 0;
             let rc = (cb.remove)(
                 cb.user_data,
                 secret_id,
-                channel_id.0,
+                channel_id,
+                replica_id,
                 &mut existed as *mut _,
             );
             if rc != 0 {
@@ -813,52 +1036,16 @@ impl DeRecChannelStore for DotnetChannelStore {
         Box::pin(async move { res })
     }
 
-    fn channels(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<Channel>> {
-        let list_bytes_res =
-            self.fetch_bytes(|p, l| (self.cb.list_channels)(self.cb.user_data, secret_id, p, l));
-        let cb = &self.cb;
-        let res = (|| -> Result<Vec<Channel>, ChannelStoreError> {
-            let bytes = match list_bytes_res {
-                Err(e) => return Err(ChannelStoreError::Backend(boxed_err(e))),
-                Ok(None) => Vec::new(),
-                Ok(Some(b)) => b,
-            };
-            let ids: Vec<u64> = if bytes.is_empty() {
-                Vec::new()
-            } else {
-                serde_json::from_slice(&bytes).map_err(|e| {
-                    ChannelStoreError::Backend(format!("list_channels JSON: {e}").into())
-                })?
-            };
-            let mut out = Vec::with_capacity(ids.len());
-            for id in ids {
-                let mut ptr: *mut u8 = std::ptr::null_mut();
-                let mut len: usize = 0;
-                let rc = (cb.load)(
-                    cb.user_data,
-                    secret_id,
-                    id,
-                    &mut ptr as *mut _,
-                    &mut len as *mut _,
-                );
-                if rc != 0 {
-                    if !ptr.is_null() && len != 0 {
-                        (cb.free_buffer)(cb.user_data, ptr, len);
-                    }
-                    continue;
-                }
-                if ptr.is_null() || len == 0 {
-                    continue;
-                }
-                let bytes = unsafe { std::slice::from_raw_parts(ptr, len).to_vec() };
-                (cb.free_buffer)(cb.user_data, ptr, len);
-                let channel: Channel = serde_json::from_slice(&bytes)
-                    .map_err(|e| ChannelStoreError::Backend(format!("Channel JSON: {e}").into()))?;
-                out.push(channel);
-            }
-            Ok(out)
-        })();
-        Box::pin(async move { res })
+    fn helpers(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+        let bytes_res =
+            self.fetch_bytes(|p, l| (self.cb.list_helpers)(self.cb.user_data, secret_id, p, l));
+        Box::pin(async move { decode_list(bytes_res, "list_helpers") })
+    }
+
+    fn replicas(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
+        let bytes_res =
+            self.fetch_bytes(|p, l| (self.cb.list_replicas)(self.cb.user_data, secret_id, p, l));
+        Box::pin(async move { decode_list(bytes_res, "list_replicas") })
     }
 
     fn link_channel(

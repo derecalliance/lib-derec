@@ -338,14 +338,14 @@ struct SecretJsonIn {
     secrets: Vec<UserSecretJsonIn>,
     #[serde(default)]
     replicas: Option<ReplicasJsonIn>,
-    #[serde(default)]
-    owner_replica_id: String,
 }
 
 #[derive(serde::Deserialize)]
 struct ReplicasJsonIn {
     #[serde(default)]
-    replicas: Vec<ReplicaJsonIn>,
+    channel_id: String,
+    #[serde(default)]
+    members: Vec<ReplicaJsonIn>,
     #[serde(default)]
     shared_key: Vec<u8>,
 }
@@ -361,12 +361,12 @@ struct HelperJsonIn {
 
 #[derive(serde::Deserialize)]
 struct ReplicaJsonIn {
-    channel_id: String,
+    replica_id: String,
     transport_uri: String,
+    /// `"Source"` or `"Destination"`.
+    role: String,
     #[serde(default)]
     communication_info: std::collections::HashMap<String, String>,
-    replica_id: String,
-    sender_kind: i32,
 }
 
 #[derive(serde::Deserialize)]
@@ -402,21 +402,30 @@ impl SecretJsonIn {
         let replicas = self
             .replicas
             .map(|g| -> Result<_, String> {
-                let replicas = g
-                    .replicas
+                let members = g
+                    .members
                     .into_iter()
                     .map(|r| -> Result<_, String> {
+                        let role = match r.role.as_str() {
+                            "Source" => crate::protocol::types::ReplicaRole::Source,
+                            "Destination" => crate::protocol::types::ReplicaRole::Destination,
+                            other => {
+                                return Err(format!(
+                                    "replica.role must be \"Source\" or \"Destination\", got {other:?}"
+                                ));
+                            }
+                        };
                         Ok(crate::protocol::types::ReplicaInfo {
-                            channel_id: parse_u64(&r.channel_id, "replica.channel_id")?,
-                            transport_uri: r.transport_uri,
-                            communication_info: r.communication_info,
                             replica_id: parse_u64(&r.replica_id, "replica.replica_id")?,
-                            sender_kind: r.sender_kind,
+                            transport_uri: r.transport_uri,
+                            role: role as i32,
+                            communication_info: r.communication_info,
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(crate::protocol::types::Replicas {
-                    replicas,
+                    channel_id: parse_u64(&g.channel_id, "replicas.channel_id")?,
+                    members,
                     shared_key: g.shared_key,
                 })
             })
@@ -436,7 +445,6 @@ impl SecretJsonIn {
             helpers,
             secrets,
             replicas,
-            owner_replica_id: parse_u64(&self.owner_replica_id, "owner_replica_id")?,
         })
     }
 }

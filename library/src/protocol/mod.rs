@@ -99,9 +99,10 @@ pub use traits::{
     TransportFuture,
 };
 pub use types::{
-    Channel, ChannelShare, ChannelStatus, ExpiredChannelCleanup, HelperInfo, MissingPolicy,
-    PairingKeyMaterial, ReplicaInfo, ReplicaSecretPayload, Secret, SecretKind, SecretValue, Share,
-    StateItem, StateKey, StateKind, Target, UserSecret, UserSecrets,
+    ChannelQuery, ChannelRecord, ChannelShare, ChannelStatus, ExpiredChannelCleanup, HelperChannel,
+    HelperInfo, MissingPolicy, PairingKeyMaterial, ReplicaInfo, ReplicaMember, ReplicaRole,
+    ReplicaSecretPayload, Secret, SecretKind, SecretValue, Share, StateItem, StateKey, StateKind,
+    Target, UserSecret, UserSecrets,
 };
 
 pub use events::{
@@ -529,6 +530,35 @@ impl<
                 self.start_recover_secret(secret_id, version, reply_to)
                     .await
             }
+            DeRecFlow::SyncCheck => {
+                handlers::sync_check::start(
+                    &mut self.channel_store,
+                    &mut self.secret_store,
+                    &self.user_secret_store,
+                    &mut self.state_store,
+                    &self.transport,
+                    self.secret_id,
+                    self.replica_id,
+                    &self.own_transport,
+                )
+                .await
+            }
+            DeRecFlow::RemoveReplica { replica_id, memo } => {
+                // Announcing is the whole of `start`: the flag it leaves keeps
+                // the member out of the next roster while still on the
+                // distribution list, which is how an evicted member learns it
+                // may tear down. The application publishes that roster.
+                handlers::remove_replica::start(
+                    &mut self.channel_store,
+                    &mut self.secret_store,
+                    &self.transport,
+                    self.secret_id,
+                    replica_id,
+                    memo,
+                    self.replica_id,
+                )
+                .await
+            }
             DeRecFlow::Unpair { channel_id, memo } => {
                 self.start_unpair(channel_id, memo, reply_to).await
             }
@@ -658,6 +688,7 @@ impl<
                     status,
                     memo,
                     trace_id,
+                    self.replica_id,
                 )
                 .await
             }
@@ -696,6 +727,7 @@ impl<
                     status,
                     memo,
                     trace_id,
+                    self.replica_id,
                 )
                 .await
             }
@@ -715,6 +747,7 @@ impl<
                     status,
                     memo,
                     trace_id,
+                    self.replica_id,
                 )
                 .await
             }
@@ -930,13 +963,29 @@ impl<
             return Ok(false);
         }
 
-        // Update channel status to Paired.
+        // Verification promotes every member sharing this group channel,
+        // this device's own row included — the whole group becomes usable at
+        // once, which is what makes the roster reconstructible from stores.
         let mut transitioned_replica = false;
-        if let Some(mut channel) = self.channel_store.load(self.secret_id, channel_id).await? {
-            transitioned_replica = channel.peer_role == derec_proto::SenderKind::ReplicaDestination
-                && channel.status == crate::protocol::types::ChannelStatus::Pending;
-            channel.status = crate::protocol::types::ChannelStatus::Paired;
-            self.channel_store.save(self.secret_id, channel).await?;
+        let members = self.channel_store.replicas(self.secret_id).await?;
+        for mut member in members {
+            if member.channel_id != channel_id
+                || member.status != crate::protocol::types::ChannelStatus::Pending
+            {
+                continue;
+            }
+            if member.role == crate::protocol::types::ReplicaRole::Destination
+                && Some(member.replica_id.0) != self.replica_id
+            {
+                transitioned_replica = true;
+            }
+            member.status = crate::protocol::types::ChannelStatus::Paired;
+            self.channel_store
+                .save(
+                    self.secret_id,
+                    crate::protocol::types::ChannelRecord::Replica(member),
+                )
+                .await?;
         }
 
         // Replica destinations only become eligible publish targets once
@@ -1021,7 +1070,6 @@ impl<
             &mut self.user_secret_store,
             &self.transport,
             &mut self.state_store,
-            &mut self.replica_id,
             self.secret_id,
             secret,
             recovered_version,
@@ -1112,6 +1160,7 @@ impl<
             self.threshold,
             self.keep_versions_count,
             self.secret_id,
+            &self.own_transport,
             reply_to,
             self.replica_id,
         )
@@ -1120,32 +1169,58 @@ impl<
             return Ok(Vec::new());
         };
 
-        // Only channels whose dispatch succeeded count as `pending` in
-        // the sharing round accumulator — a peer we couldn't reach on
-        // send won't be responding, so it doesn't gate SharingComplete.
+        // Only targets whose dispatch succeeded count as pending — a peer we
+        // couldn't reach on send won't be responding, so it must not gate the
+        // round's completion. An undeliverable member is reported once here,
+        // where the transport error is still available, and lands in `behind`.
         let version = round.version;
         let pending: HashSet<ChannelId> = round
             .outcomes
             .iter()
             .filter_map(|(cid, r)| r.as_ref().ok().map(|_| *cid))
             .collect();
+        let pending_replicas: HashSet<crate::types::ReplicaId> = round
+            .replica_outcomes
+            .iter()
+            .filter_map(|(rid, r)| r.as_ref().ok().map(|_| *rid))
+            .collect();
+        let behind_replicas: HashSet<crate::types::ReplicaId> = round
+            .replica_outcomes
+            .iter()
+            .filter_map(|(rid, r)| r.as_ref().err().map(|_| *rid))
+            .collect();
 
-        if !pending.is_empty() {
+        let mut undeliverable: Vec<DeRecEvent> = round
+            .replica_outcomes
+            .iter()
+            .filter_map(|(rid, r)| {
+                r.as_ref().err().map(|e| DeRecEvent::ReplicaSyncFailed {
+                    replica_id: rid.0,
+                    version,
+                    reason: e.to_string(),
+                })
+            })
+            .collect();
+
+        if !pending.is_empty() || !pending_replicas.is_empty() {
             self.state_store
                 .save(
                     self.secret_id,
-                    StateItem::SharingRound {
+                    StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
                         version,
                         pending,
                         confirmed: HashSet::new(),
                         failed: HashSet::new(),
+                        pending_replicas,
+                        synced_replicas: HashSet::new(),
+                        behind_replicas,
                         started_at: now_secs(),
-                    },
+                    })),
                 )
                 .await?;
         }
 
-        Ok(round
+        let mut started: Vec<DeRecEvent> = round
             .outcomes
             .into_iter()
             .map(|(channel_id, res)| match res {
@@ -1159,7 +1234,9 @@ impl<
                     error: e.to_string(),
                 },
             })
-            .collect())
+            .collect();
+        started.append(&mut undeliverable);
+        Ok(started)
     }
 
     async fn start_verify_shares(
@@ -1290,6 +1367,7 @@ impl<
                     &mut self.channel_store,
                     &mut self.secret_store,
                     &self.transport,
+                    &self.own_transport,
                     &self.communication_info,
                     self.secret_id,
                     channel_id,
@@ -1316,6 +1394,7 @@ impl<
                     &request,
                     &shared_key,
                     trace_id,
+                    self.replica_id,
                 )
                 .await
             }
@@ -1473,10 +1552,11 @@ impl<
     /// `ReplicaDestination` peer in `Paired` status — i.e. a Destination
     /// that is fully verified and eligible for secret sync.
     async fn has_paired_replica_destination(&self) -> Result<bool> {
-        let channels = self.channel_store.channels(self.secret_id).await?;
-        Ok(channels.iter().any(|c| {
-            c.peer_role == derec_proto::SenderKind::ReplicaDestination
-                && c.status == crate::protocol::types::ChannelStatus::Paired
+        let members = self.channel_store.replicas(self.secret_id).await?;
+        Ok(members.iter().any(|m| {
+            m.role == crate::protocol::types::ReplicaRole::Destination
+                && m.status == crate::protocol::types::ChannelStatus::Paired
+                && Some(m.replica_id.0) != self.replica_id
         }))
     }
 
@@ -1568,8 +1648,14 @@ impl<
             return Ok(None);
         };
 
-        if let Some(channel) = self.channel_store.load(self.secret_id, channel_id).await?
-            && channel.status == crate::protocol::types::ChannelStatus::Pending
+        if let Some(record) = self
+            .channel_store
+            .load(
+                self.secret_id,
+                crate::protocol::types::ChannelQuery::Helper { channel_id },
+            )
+            .await?
+            && record.status() == crate::protocol::types::ChannelStatus::Pending
         {
             #[cfg(feature = "logging")]
             tracing::warn!(
@@ -1583,12 +1669,15 @@ impl<
             &mut self.channel_store,
             &mut self.share_store,
             &mut self.secret_store,
+            &mut self.user_secret_store,
             &self.transport,
             &mut self.state_store,
+            &self.own_transport,
             message,
             self.secret_id,
             channel_id,
             &shared_key,
+            self.replica_id,
         )
         .await?;
 
@@ -1703,19 +1792,24 @@ impl<
     /// Returns `ShareRejected` events for timed-out channels and moves them
     /// from `pending` to `failed` in the round tracker.
     async fn check_sharing_round_timeouts(&mut self) -> Vec<DeRecEvent> {
-        let Ok(Some(StateItem::SharingRound {
-            version,
-            mut pending,
-            confirmed,
-            mut failed,
-            started_at,
-        })) = self
+        let Ok(Some(StateItem::SharingRound(round))) = self
             .state_store
             .load(self.secret_id, StateKey::SharingRound)
             .await
         else {
             return vec![];
         };
+        let crate::protocol::types::SharingRoundState {
+            version,
+            mut pending,
+            confirmed,
+            mut failed,
+            mut pending_replicas,
+            synced_replicas,
+            mut behind_replicas,
+            started_at,
+        } = *round;
+
         let now = now_secs();
         if now.saturating_sub(started_at) <= self.timeout_in_secs {
             return vec![];
@@ -1738,19 +1832,41 @@ impl<
                 "sharing round: helper timed out"
             );
         }
+        // Members time out on the same clock. A member that never answered is
+        // behind, not a round failure — see `ReplicaSyncComplete`.
+        let timed_out_replicas: Vec<crate::types::ReplicaId> = pending_replicas.drain().collect();
+        for replica_id in timed_out_replicas {
+            behind_replicas.insert(replica_id);
+            events.push(DeRecEvent::ReplicaSyncFailed {
+                replica_id: replica_id.0,
+                version,
+                reason: "timeout".to_owned(),
+            });
+
+            #[cfg(feature = "logging")]
+            tracing::warn!(
+                replica_id = replica_id.0,
+                version,
+                "sharing round: replica timed out"
+            );
+        }
+
         // Persist the timeout-drained round so a subsequent
         // `update_sharing_round` can see the mutations.
         let _ = self
             .state_store
             .save(
                 self.secret_id,
-                StateItem::SharingRound {
+                StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
                     version,
                     pending,
                     confirmed,
                     failed,
+                    pending_replicas,
+                    synced_replicas,
+                    behind_replicas,
                     started_at,
-                },
+                })),
             )
             .await;
         events
@@ -1807,19 +1923,23 @@ impl<
     /// `ShareConfirmed` / `ShareRejected` events arrive. When no channels
     /// remain pending, appends a [`DeRecEvent::SharingComplete`] summary.
     async fn update_sharing_round(&mut self, events: &mut Vec<DeRecEvent>) {
-        let Ok(Some(StateItem::SharingRound {
-            version: round_version,
-            mut pending,
-            mut confirmed,
-            mut failed,
-            started_at,
-        })) = self
+        let Ok(Some(StateItem::SharingRound(round))) = self
             .state_store
             .load(self.secret_id, StateKey::SharingRound)
             .await
         else {
             return;
         };
+        let crate::protocol::types::SharingRoundState {
+            version: round_version,
+            mut pending,
+            mut confirmed,
+            mut failed,
+            mut pending_replicas,
+            mut synced_replicas,
+            mut behind_replicas,
+            started_at,
+        } = *round;
 
         for event in events.iter() {
             match event {
@@ -1838,11 +1958,31 @@ impl<
                     pending.remove(channel_id);
                     failed.insert(*channel_id);
                 }
+                DeRecEvent::ReplicaSecretAcked {
+                    from_replica_id,
+                    version,
+                    ..
+                } if *version == round_version => {
+                    if let Ok(replica_id) = crate::types::ReplicaId::try_from(*from_replica_id) {
+                        pending_replicas.remove(&replica_id);
+                        synced_replicas.insert(replica_id);
+                    }
+                }
+                DeRecEvent::ReplicaSyncRejected {
+                    replica_id,
+                    version,
+                    ..
+                } if *version == round_version => {
+                    if let Ok(replica_id) = crate::types::ReplicaId::try_from(*replica_id) {
+                        pending_replicas.remove(&replica_id);
+                        behind_replicas.insert(replica_id);
+                    }
+                }
                 _ => {}
             }
         }
 
-        let is_complete = pending.is_empty();
+        let is_complete = pending.is_empty() && pending_replicas.is_empty();
         let confirmed_count = confirmed.len();
         let failed_count = failed.len();
 
@@ -1859,6 +1999,31 @@ impl<
                 threshold_met,
             });
 
+            // The replica leg is reported separately: different success rule,
+            // different key. Emitted only when the round had a replica leg at
+            // all, so a helpers-only publish stays silent here.
+            if !synced_replicas.is_empty() || !behind_replicas.is_empty() {
+                let mut synced: Vec<u64> = synced_replicas.iter().map(|r| r.0).collect();
+                let mut behind: Vec<u64> = behind_replicas.iter().map(|r| r.0).collect();
+                // Sets are unordered; sort so the event is reproducible.
+                synced.sort_unstable();
+                behind.sort_unstable();
+
+                #[cfg(feature = "logging")]
+                tracing::info!(
+                    version = round_version,
+                    synced_count = synced.len(),
+                    behind_count = behind.len(),
+                    "replica sync round complete"
+                );
+
+                events.push(DeRecEvent::ReplicaSyncComplete {
+                    version: round_version,
+                    synced,
+                    behind,
+                });
+            }
+
             #[cfg(feature = "logging")]
             tracing::info!(
                 version = round_version,
@@ -1872,13 +2037,16 @@ impl<
                 .state_store
                 .save(
                     self.secret_id,
-                    StateItem::SharingRound {
+                    StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
                         version: round_version,
                         pending,
                         confirmed,
                         failed,
+                        pending_replicas,
+                        synced_replicas,
+                        behind_replicas,
                         started_at,
-                    },
+                    })),
                 )
                 .await;
         }
@@ -1914,7 +2082,7 @@ impl<
     ) -> Result<Vec<ChannelId>> {
         let now = now_secs();
         let timeout = older_than_secs;
-        let channels = self.channel_store.channels(self.secret_id).await?;
+        let channels = self.channel_store.helpers(self.secret_id).await?;
 
         let mut removed = Vec::new();
         for channel in channels {
@@ -1922,26 +2090,71 @@ impl<
                 && now.saturating_sub(channel.created_at) > timeout
             {
                 self.channel_store
-                    .remove(self.secret_id, channel.id)
+                    .remove(
+                        self.secret_id,
+                        crate::protocol::types::ChannelQuery::Helper {
+                            channel_id: channel.channel_id,
+                        },
+                    )
                     .await?;
                 // Clean up any leftover pairing secret for this channel.
                 let _ = self
                     .secret_store
-                    .remove(self.secret_id, channel.id, SecretKind::PairingSecret)
+                    .remove(
+                        self.secret_id,
+                        channel.channel_id,
+                        SecretKind::PairingSecret,
+                    )
                     .await;
                 let _ = self
                     .secret_store
-                    .remove(self.secret_id, channel.id, SecretKind::PairingContact)
+                    .remove(
+                        self.secret_id,
+                        channel.channel_id,
+                        SecretKind::PairingContact,
+                    )
                     .await;
 
                 #[cfg(feature = "logging")]
                 tracing::info!(
-                    channel_id = channel.id.0,
+                    channel_id = channel.channel_id.0,
                     elapsed_secs = now.saturating_sub(channel.created_at),
                     "expired pending channel removed"
                 );
 
-                removed.push(channel.id);
+                removed.push(channel.channel_id);
+            }
+        }
+
+        // A replica pairing that never completed leaves a Pending member row
+        // that expires on the same clock. This device's own row is never a
+        // pending pairing, so it is exempt.
+        for member in self.channel_store.replicas(self.secret_id).await? {
+            if member.status == crate::protocol::types::ChannelStatus::Pending
+                && Some(member.replica_id.0) != self.replica_id
+                && now.saturating_sub(member.created_at) > timeout
+            {
+                self.channel_store
+                    .remove(
+                        self.secret_id,
+                        crate::protocol::types::ChannelQuery::Replica {
+                            channel_id: member.channel_id,
+                            replica_id: member.replica_id,
+                        },
+                    )
+                    .await?;
+
+                #[cfg(feature = "logging")]
+                tracing::info!(
+                    channel_id = member.channel_id.0,
+                    replica_id = member.replica_id.0,
+                    elapsed_secs = now.saturating_sub(member.created_at),
+                    "expired pending replica member removed"
+                );
+
+                if !removed.contains(&member.channel_id) {
+                    removed.push(member.channel_id);
+                }
             }
         }
         Ok(removed)
@@ -1955,7 +2168,10 @@ mod expired_channel_sweep_tests {
         InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
         InMemUserSecretStore, NoopTransport, run_async,
     };
-    use crate::protocol::types::{Channel, ChannelStatus, ExpiredChannelCleanup, SecretValue};
+    use crate::protocol::types::{
+        ChannelRecord, ChannelStatus, ExpiredChannelCleanup, HelperChannel, ReplicaMember,
+        ReplicaRole, SecretValue,
+    };
 
     const SECRET_ID: u64 = 0xC1;
 
@@ -1976,15 +2192,14 @@ mod expired_channel_sweep_tests {
         channels
             .save(
                 SECRET_ID,
-                Channel {
-                    id: ChannelId(cid),
+                ChannelRecord::Helper(HelperChannel {
+                    channel_id: ChannelId(cid),
                     transport: endpoint(),
                     communication_info: std::collections::HashMap::new(),
                     status,
                     created_at: now_secs().saturating_sub(age_secs),
-                    peer_role: derec_proto::SenderKind::ReplicaDestination,
-                    replica_id: Some(7),
-                },
+                    peer_role: derec_proto::SenderKind::Helper,
+                }),
             )
             .await
             .expect("seed channel");
@@ -2033,7 +2248,65 @@ mod expired_channel_sweep_tests {
                 .expect("sweep succeeds");
 
             assert_eq!(removed, vec![ChannelId(1)]);
-            assert!(channels.data.lock().unwrap().is_empty());
+            assert!(channels.helper_rows.lock().unwrap().is_empty());
+        });
+    }
+
+    /// Seed one replica member on the group channel.
+    async fn seed_member(
+        channels: &mut InMemChannelStore,
+        replica_id: u64,
+        status: ChannelStatus,
+        age_secs: u64,
+    ) {
+        channels
+            .save(
+                SECRET_ID,
+                ChannelRecord::Replica(ReplicaMember {
+                    channel_id: ChannelId(9000),
+                    replica_id: crate::types::ReplicaId(replica_id),
+                    transport: endpoint(),
+                    communication_info: std::collections::HashMap::new(),
+                    role: ReplicaRole::Destination,
+                    status,
+                    created_at: now_secs().saturating_sub(age_secs),
+                }),
+            )
+            .await
+            .expect("seed member");
+    }
+
+    /// A replica pairing that never completed expires like any other, but
+    /// this device's own row is exempt: it is a roster entry, not a pending
+    /// handshake, and sweeping it would erase the group's self-reference.
+    #[test]
+    fn sweep_removes_expired_replica_members_but_never_this_device() {
+        run_async(async {
+            let channels = InMemChannelStore::default();
+            let mut seeded = channels.clone();
+            seed_member(&mut seeded, 7, ChannelStatus::Pending, 600).await;
+            seed_member(&mut seeded, 8, ChannelStatus::Paired, 600).await;
+            seed_member(&mut seeded, 9, ChannelStatus::Pending, 600).await;
+
+            let mut protocol = build(channels.clone(), ExpiredChannelCleanup::Disabled, 300);
+            protocol.replica_id = Some(9);
+            let removed = protocol
+                .remove_expired_channels(60)
+                .await
+                .expect("sweep succeeds");
+
+            assert_eq!(
+                removed,
+                vec![ChannelId(9000)],
+                "members share one channel, so the group is reported once"
+            );
+            let rows = channels.member_rows.lock().unwrap();
+            assert!(
+                !rows.contains_key(&(SECRET_ID, 7)),
+                "expired pending member"
+            );
+            assert!(rows.contains_key(&(SECRET_ID, 8)), "paired member survives");
+            assert!(rows.contains_key(&(SECRET_ID, 9)), "own row is exempt");
         });
     }
 
@@ -2049,7 +2322,7 @@ mod expired_channel_sweep_tests {
             let mut protocol = build(channels.clone(), ExpiredChannelCleanup::Disabled, 300);
             let _ = protocol.process(&[]).await;
 
-            assert_eq!(channels.data.lock().unwrap().len(), 1);
+            assert_eq!(channels.helper_rows.lock().unwrap().len(), 1);
         });
     }
 
@@ -2072,7 +2345,7 @@ mod expired_channel_sweep_tests {
             );
             let _ = protocol.process(&[]).await;
 
-            assert!(channels.data.lock().unwrap().is_empty());
+            assert!(channels.helper_rows.lock().unwrap().is_empty());
         });
     }
 
@@ -2091,7 +2364,7 @@ mod expired_channel_sweep_tests {
                 .expect("sweep succeeds");
 
             assert!(removed.is_empty());
-            assert_eq!(channels.data.lock().unwrap().len(), 1);
+            assert_eq!(channels.helper_rows.lock().unwrap().len(), 1);
         });
     }
 
@@ -2155,7 +2428,7 @@ mod expired_channel_sweep_tests {
                 .expect("sweep succeeds");
 
             assert_eq!(removed, vec![ChannelId(1)]);
-            assert_eq!(channels.data.lock().unwrap().len(), 1);
+            assert_eq!(channels.helper_rows.lock().unwrap().len(), 1);
         });
     }
 
@@ -2177,7 +2450,300 @@ mod expired_channel_sweep_tests {
                 .expect("sweep succeeds");
 
             assert!(removed.is_empty());
-            assert_eq!(channels.data.lock().unwrap().len(), 1);
+            assert_eq!(channels.helper_rows.lock().unwrap().len(), 1);
+        });
+    }
+}
+
+/// Round-outcome accounting for the two populations a publish targets.
+///
+/// Exercises the flows in §9a of the replica-group spec directly against the
+/// accumulator, without standing up a full peer mesh: the accumulator is the
+/// component that decides what an application is told about a round, and it is
+/// the piece that a shared group channel breaks.
+#[cfg(test)]
+mod sharing_round_outcome_tests {
+    use super::*;
+    use crate::protocol::test::{
+        InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
+        InMemUserSecretStore, NoopTransport, run_async,
+    };
+    use crate::types::ReplicaId;
+
+    const SECRET_ID: u64 = 0xF00D;
+
+    // The persisting double: the accumulator reads back what it wrote, so a
+    // no-op state store would make every assertion here vacuous.
+    type TestProtocol = DeRecProtocol<
+        InMemChannelStore,
+        InMemShareStore,
+        InMemSecretStore,
+        InMemUserSecretStore,
+        InMemPersistedStateStore,
+        NoopTransport,
+    >;
+
+    fn build(threshold: usize) -> TestProtocol {
+        DeRecProtocolBuilder::new(SECRET_ID)
+            .with_channel_store(InMemChannelStore::default())
+            .with_share_store(InMemShareStore::default())
+            .with_secret_store(InMemSecretStore::default())
+            .with_user_secret_store(InMemUserSecretStore::default())
+            .with_transport(NoopTransport)
+            .with_state_store(InMemPersistedStateStore::default())
+            .with_own_transport("https://owner.example.com")
+            .with_threshold(threshold)
+            .build()
+            .expect("test protocol builds")
+    }
+
+    async fn seed_round(
+        protocol: &mut TestProtocol,
+        version: u32,
+        helpers: &[u64],
+        members: &[u64],
+    ) {
+        protocol
+            .state_store
+            .save(
+                SECRET_ID,
+                StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                    version,
+                    pending: helpers.iter().copied().map(ChannelId).collect(),
+                    confirmed: HashSet::new(),
+                    failed: HashSet::new(),
+                    pending_replicas: members.iter().copied().map(ReplicaId).collect(),
+                    synced_replicas: HashSet::new(),
+                    behind_replicas: HashSet::new(),
+                    started_at: now_secs(),
+                })),
+            )
+            .await
+            .expect("seed round");
+    }
+
+    /// The regression a shared group channel creates: two members answering on
+    /// one channel must settle independently. Keyed on `ChannelId` they would
+    /// collapse, and the first ack would complete the round for both.
+    #[test]
+    fn members_on_one_channel_settle_independently() {
+        run_async(async {
+            let mut protocol = build(2);
+            seed_round(&mut protocol, 4, &[9001], &[1002, 1003]).await;
+
+            // Only member 1002 answers.
+            let mut events = vec![
+                DeRecEvent::ShareConfirmed {
+                    channel_id: ChannelId(9001),
+                    version: 4,
+                },
+                DeRecEvent::ReplicaSecretAcked {
+                    channel_id: ChannelId(5001),
+                    from_replica_id: 1002,
+                    secret_id: SECRET_ID,
+                    version: 4,
+                    status: 0,
+                    memo: String::new(),
+                },
+            ];
+            protocol.update_sharing_round(&mut events).await;
+
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, DeRecEvent::SharingComplete { .. })),
+                "the round must stay open while member 1003 has not answered"
+            );
+
+            // 1003 answers on the same channel; now the round closes.
+            let mut events = vec![DeRecEvent::ReplicaSecretAcked {
+                channel_id: ChannelId(5001),
+                from_replica_id: 1003,
+                secret_id: SECRET_ID,
+                version: 4,
+                status: 0,
+                memo: String::new(),
+            }];
+            protocol.update_sharing_round(&mut events).await;
+
+            let sync = events
+                .iter()
+                .find_map(|e| match e {
+                    DeRecEvent::ReplicaSyncComplete { synced, behind, .. } => {
+                        Some((synced.clone(), behind.clone()))
+                    }
+                    _ => None,
+                })
+                .expect("replica leg must report its own completion");
+            assert_eq!(sync, (vec![1002, 1003], vec![]));
+        });
+    }
+
+    /// F2: a member that never answers is `behind`, and does not fail the
+    /// round — the helper leg alone decides `threshold_met`.
+    #[test]
+    fn an_unreachable_member_leaves_the_round_successful() {
+        run_async(async {
+            let mut protocol = build(2);
+            seed_round(&mut protocol, 4, &[9001, 9002], &[1003]).await;
+
+            let mut events = vec![
+                DeRecEvent::ShareConfirmed {
+                    channel_id: ChannelId(9001),
+                    version: 4,
+                },
+                DeRecEvent::ShareConfirmed {
+                    channel_id: ChannelId(9002),
+                    version: 4,
+                },
+                DeRecEvent::ReplicaSyncFailed {
+                    replica_id: 1003,
+                    version: 4,
+                    reason: "transport unreachable".to_owned(),
+                },
+            ];
+            // A dispatch failure never entered `pending_replicas`, so the round
+            // is settled by the helper leg alone; drain the member by hand to
+            // mirror what `start` records at dispatch time.
+            protocol
+                .state_store
+                .save(
+                    SECRET_ID,
+                    StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                        version: 4,
+                        pending: HashSet::from([ChannelId(9001), ChannelId(9002)]),
+                        confirmed: HashSet::new(),
+                        failed: HashSet::new(),
+                        pending_replicas: HashSet::new(),
+                        synced_replicas: HashSet::new(),
+                        behind_replicas: HashSet::from([ReplicaId(1003)]),
+                        started_at: now_secs(),
+                    })),
+                )
+                .await
+                .expect("seed");
+            protocol.update_sharing_round(&mut events).await;
+
+            let complete = events
+                .iter()
+                .find_map(|e| match e {
+                    DeRecEvent::SharingComplete { threshold_met, .. } => Some(*threshold_met),
+                    _ => None,
+                })
+                .expect("helper leg must complete");
+            assert!(
+                complete,
+                "an unreachable replica must not fail the helper round"
+            );
+
+            let sync = events
+                .iter()
+                .find_map(|e| match e {
+                    DeRecEvent::ReplicaSyncComplete { synced, behind, .. } => {
+                        Some((synced.clone(), behind.clone()))
+                    }
+                    _ => None,
+                })
+                .expect("replica leg must report its own completion");
+            assert_eq!(sync, (vec![], vec![1003]), "the member is reported behind");
+        });
+    }
+
+    /// F1: a member refusing with a conflict lands in `behind`, reported
+    /// separately from the helper leg's own verdict.
+    #[test]
+    fn a_conflicting_member_is_reported_behind() {
+        run_async(async {
+            let mut protocol = build(3);
+            seed_round(&mut protocol, 4, &[9001, 9002, 9003], &[1002, 1003]).await;
+
+            let mut events = vec![
+                DeRecEvent::ShareConfirmed {
+                    channel_id: ChannelId(9001),
+                    version: 4,
+                },
+                DeRecEvent::ShareConfirmed {
+                    channel_id: ChannelId(9002),
+                    version: 4,
+                },
+                DeRecEvent::ShareRejected {
+                    channel_id: ChannelId(9003),
+                    version: 4,
+                    status: derec_proto::StatusEnum::VersionConflict as i32,
+                    memo: "conflict".to_owned(),
+                },
+                DeRecEvent::ReplicaSyncRejected {
+                    replica_id: 1002,
+                    secret_id: SECRET_ID,
+                    version: 4,
+                    status: derec_proto::StatusEnum::VersionConflict as i32,
+                    memo: "conflict".to_owned(),
+                },
+                DeRecEvent::ReplicaSecretAcked {
+                    channel_id: ChannelId(5001),
+                    from_replica_id: 1003,
+                    secret_id: SECRET_ID,
+                    version: 4,
+                    status: 0,
+                    memo: String::new(),
+                },
+            ];
+            protocol.update_sharing_round(&mut events).await;
+
+            let (confirmed, failed, threshold_met) = events
+                .iter()
+                .find_map(|e| match e {
+                    DeRecEvent::SharingComplete {
+                        confirmed_count,
+                        failed_count,
+                        threshold_met,
+                        ..
+                    } => Some((*confirmed_count, *failed_count, *threshold_met)),
+                    _ => None,
+                })
+                .expect("helper leg must complete");
+            assert_eq!((confirmed, failed), (2, 1));
+            assert!(!threshold_met, "2 of 3 helpers is under a threshold of 3");
+
+            let sync = events
+                .iter()
+                .find_map(|e| match e {
+                    DeRecEvent::ReplicaSyncComplete { synced, behind, .. } => {
+                        Some((synced.clone(), behind.clone()))
+                    }
+                    _ => None,
+                })
+                .expect("replica leg must report its own completion");
+            assert_eq!(sync, (vec![1003], vec![1002]));
+        });
+    }
+
+    /// A publish with no replica group stays silent on the replica leg rather
+    /// than reporting an empty one.
+    #[test]
+    fn a_helpers_only_round_emits_no_replica_summary() {
+        run_async(async {
+            let mut protocol = build(2);
+            seed_round(&mut protocol, 2, &[9001], &[]).await;
+
+            let mut events = vec![DeRecEvent::ShareConfirmed {
+                channel_id: ChannelId(9001),
+                version: 2,
+            }];
+            protocol.update_sharing_round(&mut events).await;
+
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, DeRecEvent::SharingComplete { .. })),
+                "the helper leg still completes"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, DeRecEvent::ReplicaSyncComplete { .. })),
+                "a round with no replica leg must not report one"
+            );
         });
     }
 }

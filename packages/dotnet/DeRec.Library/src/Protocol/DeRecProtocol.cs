@@ -33,7 +33,8 @@ public sealed class DeRecProtocol : IDisposable
     private readonly NP.ChannelStoreLoadDelegate _channelLoad;
     private readonly NP.ChannelStoreSaveDelegate _channelSave;
     private readonly NP.ChannelStoreRemoveDelegate _channelRemove;
-    private readonly NP.ChannelStoreListDelegate _channelList;
+    private readonly NP.ChannelStoreListDelegate _channelListHelpers;
+    private readonly NP.ChannelStoreListDelegate _channelListReplicas;
     private readonly NP.ChannelStoreLinkDelegate _channelLink;
     private readonly NP.ChannelStoreLinkedDelegate _channelLinked;
     private readonly NP.FreeBufferDelegate _channelFreeBuffer;
@@ -115,7 +116,8 @@ public sealed class DeRecProtocol : IDisposable
         _channelLoad = ChannelLoadImpl;
         _channelSave = ChannelSaveImpl;
         _channelRemove = ChannelRemoveImpl;
-        _channelList = ChannelListImpl;
+        _channelListHelpers = ChannelListHelpersImpl;
+        _channelListReplicas = ChannelListReplicasImpl;
         _channelLink = ChannelLinkImpl;
         _channelLinked = ChannelLinkedImpl;
         _channelFreeBuffer = FreeBufferImpl;
@@ -152,7 +154,8 @@ public sealed class DeRecProtocol : IDisposable
             Load = Marshal.GetFunctionPointerForDelegate(_channelLoad),
             Save = Marshal.GetFunctionPointerForDelegate(_channelSave),
             Remove = Marshal.GetFunctionPointerForDelegate(_channelRemove),
-            ListChannels = Marshal.GetFunctionPointerForDelegate(_channelList),
+            ListHelpers = Marshal.GetFunctionPointerForDelegate(_channelListHelpers),
+            ListReplicas = Marshal.GetFunctionPointerForDelegate(_channelListReplicas),
             LinkChannel = Marshal.GetFunctionPointerForDelegate(_channelLink),
             LinkedChannels = Marshal.GetFunctionPointerForDelegate(_channelLinked),
             FreeBuffer = Marshal.GetFunctionPointerForDelegate(_channelFreeBuffer),
@@ -598,25 +601,54 @@ public sealed class DeRecProtocol : IDisposable
             Marshal.FreeCoTaskMem(ptr);
     }
 
-    private int ChannelLoadImpl(IntPtr userData, ulong secretId, ulong channelId, out IntPtr outPtr, out UIntPtr outLen)
+    private static HelperChannelDto ToDto(HelperChannel h) => new(
+        h.ChannelId,
+        new TransportDto(h.Transport.Uri, (int)h.Transport.Protocol),
+        h.CommunicationInfo,
+        h.PeerRole.ToString(),
+        h.Status.ToString(),
+        h.CreatedAt);
+
+    private static ReplicaMemberDto ToDto(ReplicaMember m) => new(
+        m.ChannelId,
+        m.ReplicaId,
+        new TransportDto(m.Transport.Uri, (int)m.Transport.Protocol),
+        m.CommunicationInfo,
+        m.Role.ToString(),
+        m.Status.ToString(),
+        m.CreatedAt);
+
+    private static HelperChannel FromDto(HelperChannelDto d) => new(
+        d.channel_id,
+        new TransportProtocol(d.transport.uri, (Protocol)d.transport.protocol),
+        d.communication_info ?? new(),
+        Enum.Parse<ChannelStatus>(d.status ?? nameof(ChannelStatus.Paired)),
+        d.created_at,
+        Enum.Parse<LibPairing.SenderKind>(d.peer_role));
+
+    private static ReplicaMember FromDto(ReplicaMemberDto d) => new(
+        d.channel_id,
+        d.replica_id,
+        new TransportProtocol(d.transport.uri, (Protocol)d.transport.protocol),
+        d.communication_info ?? new(),
+        Enum.Parse<ReplicaRole>(d.role),
+        Enum.Parse<ChannelStatus>(d.status ?? nameof(ChannelStatus.Paired)),
+        d.created_at);
+
+    private int ChannelLoadImpl(IntPtr userData, ulong secretId, ulong channelId, ulong replicaId, out IntPtr outPtr, out UIntPtr outLen)
     {
         try
         {
-            var ch = _channelStore.Load(secretId, channelId);
-            if (ch is null)
+            var record = _channelStore.Load(secretId, channelId, replicaId);
+            if (record is null)
             {
                 outPtr = IntPtr.Zero;
                 outLen = UIntPtr.Zero;
                 return 1;
             }
-            var dto = new ChannelDto(
-                ch.Id,
-                new TransportDto(ch.Transport.Uri, (int)ch.Transport.Protocol),
-                ch.CommunicationInfo,
-                ch.Status.ToString(),
-                ch.CreatedAt,
-                ch.PeerRole.ToString(),
-                ch.ReplicaId);
+            var dto = new ChannelRecordDto(
+                record.Helper is null ? null : ToDto(record.Helper),
+                record.Replica is null ? null : ToDto(record.Replica));
             byte[] json = JsonSerializer.SerializeToUtf8Bytes(dto, JsonOpts);
             return WriteOut(json, out outPtr, out outLen);
         }
@@ -628,36 +660,32 @@ public sealed class DeRecProtocol : IDisposable
         }
     }
 
-    private int ChannelSaveImpl(IntPtr userData, ulong secretId, ulong channelId, IntPtr bytes, UIntPtr len)
+    private int ChannelSaveImpl(IntPtr userData, ulong secretId, ulong channelId, ulong replicaId, IntPtr bytes, UIntPtr len)
     {
         try
         {
             byte[] buf = new byte[(int)len];
             Marshal.Copy(bytes, buf, 0, buf.Length);
-            var dto = JsonSerializer.Deserialize<ChannelDto>(buf, JsonOpts)
-                ?? throw new InvalidOperationException("null Channel JSON");
-            var transport = new TransportProtocol(
-                dto.transport.uri, (Protocol)dto.transport.protocol);
-            var status = Enum.Parse<ChannelStatus>(dto.status ?? nameof(ChannelStatus.Paired));
-            var peerRole = Enum.Parse<LibPairing.SenderKind>(dto.peer_role);
-            _channelStore.Save(secretId, new Channel(
-                dto.id,
-                transport,
-                dto.communication_info ?? new(),
-                status,
-                dto.created_at,
-                peerRole,
-                dto.replica_id));
+            var dto = JsonSerializer.Deserialize<ChannelRecordDto>(buf, JsonOpts)
+                ?? throw new InvalidOperationException("null ChannelRecord JSON");
+            var record = (dto.Helper, dto.Replica) switch
+            {
+                ({ } h, null) => ChannelRecord.Of(FromDto(h)),
+                (null, { } r) => ChannelRecord.Of(FromDto(r)),
+                _ => throw new InvalidOperationException(
+                    "ChannelRecord JSON must carry exactly one of Helper / Replica"),
+            };
+            _channelStore.Save(secretId, record);
             return 0;
         }
         catch { return -1; }
     }
 
-    private int ChannelRemoveImpl(IntPtr userData, ulong secretId, ulong channelId, out uint outExisted)
+    private int ChannelRemoveImpl(IntPtr userData, ulong secretId, ulong channelId, ulong replicaId, out uint outExisted)
     {
         try
         {
-            outExisted = _channelStore.Remove(secretId, channelId) ? 1u : 0u;
+            outExisted = _channelStore.Remove(secretId, channelId, replicaId) ? 1u : 0u;
             return 0;
         }
         catch
@@ -667,12 +695,32 @@ public sealed class DeRecProtocol : IDisposable
         }
     }
 
-    private int ChannelListImpl(IntPtr userData, ulong secretId, out IntPtr outPtr, out UIntPtr outLen)
+    private int ChannelListHelpersImpl(IntPtr userData, ulong secretId, out IntPtr outPtr, out UIntPtr outLen)
     {
         try
         {
-            var ids = new List<ulong>(_channelStore.ListChannelIds(secretId));
-            byte[] json = JsonSerializer.SerializeToUtf8Bytes(ids, JsonOpts);
+            var dtos = new List<HelperChannelDto>();
+            foreach (var h in _channelStore.ListHelpers(secretId))
+                dtos.Add(ToDto(h));
+            byte[] json = JsonSerializer.SerializeToUtf8Bytes(dtos, JsonOpts);
+            return WriteOut(json, out outPtr, out outLen);
+        }
+        catch
+        {
+            outPtr = IntPtr.Zero;
+            outLen = UIntPtr.Zero;
+            return -1;
+        }
+    }
+
+    private int ChannelListReplicasImpl(IntPtr userData, ulong secretId, out IntPtr outPtr, out UIntPtr outLen)
+    {
+        try
+        {
+            var dtos = new List<ReplicaMemberDto>();
+            foreach (var m in _channelStore.ListReplicas(secretId))
+                dtos.Add(ToDto(m));
+            byte[] json = JsonSerializer.SerializeToUtf8Bytes(dtos, JsonOpts);
             return WriteOut(json, out outPtr, out outLen);
         }
         catch
@@ -914,7 +962,10 @@ public sealed class DeRecProtocol : IDisposable
         byte[][]? shares,
         string[]? pending,
         string[]? confirmed,
-        string[]? failed);
+        string[]? failed,
+        string[]? pending_replicas,
+        string[]? synced_replicas,
+        string[]? behind_replicas);
 
     // Wire shape matches Rust `StateKeyRecord`.
     private sealed record StateKeyDto(
@@ -933,7 +984,10 @@ public sealed class DeRecProtocol : IDisposable
         item.Shares,
         item.Pending?.Select(c => c.ToString()).ToArray(),
         item.Confirmed?.Select(c => c.ToString()).ToArray(),
-        item.Failed?.Select(c => c.ToString()).ToArray());
+        item.Failed?.Select(c => c.ToString()).ToArray(),
+        item.PendingReplicas?.Select(r => r.ToString()).ToArray(),
+        item.SyncedReplicas?.Select(r => r.ToString()).ToArray(),
+        item.BehindReplicas?.Select(r => r.ToString()).ToArray());
 
     private static StateItem FromDto(StateItemDto dto)
     {
@@ -956,9 +1010,18 @@ public sealed class DeRecProtocol : IDisposable
         ulong[]? failed = dto.failed?
             .Select(s => ulong.Parse(s, System.Globalization.CultureInfo.InvariantCulture))
             .ToArray();
+        ulong[]? pendingReplicas = dto.pending_replicas?
+            .Select(s => ulong.Parse(s, System.Globalization.CultureInfo.InvariantCulture))
+            .ToArray();
+        ulong[]? syncedReplicas = dto.synced_replicas?
+            .Select(s => ulong.Parse(s, System.Globalization.CultureInfo.InvariantCulture))
+            .ToArray();
+        ulong[]? behindReplicas = dto.behind_replicas?
+            .Select(s => ulong.Parse(s, System.Globalization.CultureInfo.InvariantCulture))
+            .ToArray();
         return new StateItem(
             kind, channelId, secretId, dto.version, startedAt, dto.bytes, dto.shares,
-            pending, confirmed, failed);
+            pending, confirmed, failed, pendingReplicas, syncedReplicas, behindReplicas);
     }
 
     private static StateKey ParseKeyBuffer(IntPtr ptr, UIntPtr len)
@@ -1093,26 +1156,38 @@ public sealed class DeRecProtocol : IDisposable
         catch { return -1; }
     }
 
-    // Mirror the Rust-side `crate::protocol::types::Channel` /
-    // `TransportProtocol` shapes produced by serde's default derives.
-    // Wire field names are snake_case to match serde; `status` and `role`
-    // are variant-name strings ("Pending" / "Paired", "Owner" /
-    // "Helper" / "ReplicaSource" / "ReplicaDestination"). The public
-    // `Channel` record on the dotnet side uses native types
-    // (`TransportProtocol`, `ChannelStatus`, `Pairing.SenderKind`)
-    // and the bridge translates in `ChannelLoadImpl` /
-    // `ChannelSaveImpl`.
+    // Mirror the Rust-side `crate::protocol::types::ChannelRecord` /
+    // `HelperChannel` / `ReplicaMember` / `TransportProtocol` shapes produced
+    // by serde's default derives. Wire field names are snake_case to match
+    // serde; `status`, `peer_role` and `role` are variant-name strings
+    // ("Pending" / "Paired", "Owner" / "Helper" / "ReplicaSource" /
+    // "ReplicaDestination", "Source" / "Destination"). `ChannelRecord` is an
+    // externally tagged enum, so exactly one of `Helper` / `Replica` is
+    // present. The public records on the dotnet side use native types and the
+    // bridge translates in `ChannelLoadImpl` / `ChannelSaveImpl`.
 
     private sealed record TransportDto(string uri, int protocol);
 
-    private sealed record ChannelDto(
-        ulong id,
+    private sealed record HelperChannelDto(
+        ulong channel_id,
         TransportDto transport,
         Dictionary<string, string>? communication_info,
-        string? status,
-        ulong created_at,
         string peer_role,
-        ulong? replica_id);
+        string? status,
+        ulong created_at);
+
+    private sealed record ReplicaMemberDto(
+        ulong channel_id,
+        ulong replica_id,
+        TransportDto transport,
+        Dictionary<string, string>? communication_info,
+        string role,
+        string? status,
+        ulong created_at);
+
+    private sealed record ChannelRecordDto(
+        HelperChannelDto? Helper,
+        ReplicaMemberDto? Replica);
 
     private sealed record SecretValueDto(uint kind, byte[] bytes);
 

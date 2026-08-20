@@ -132,14 +132,13 @@ internal static class Protocol
         var transport = new RecordingTransport();
 
         // Pre-seed: a paired channel + its 32-byte SharedKey.
-        channelStore.Save(DefaultTestSecretId, new Channel(
-            Id: channelId,
+        channelStore.Save(DefaultTestSecretId, ChannelRecord.Of(new HelperChannel(
+            ChannelId: channelId,
             Transport: new TransportProtocol("https://peer.example.com"),
             CommunicationInfo: new Dictionary<string, string>(),
             Status: ChannelStatus.Paired,
             CreatedAt: 1700000000UL,
-            PeerRole: Pairing.SenderKind.Helper,
-            ReplicaId: null));
+            PeerRole: Pairing.SenderKind.Helper)));
         secretStore.Save(DefaultTestSecretId, channelId, new SecretValue(SecretKind.SharedKey, sharedKey));
 
         using var protocol = new DeRecProtocolBuilder(DefaultTestSecretId)
@@ -190,14 +189,14 @@ internal static class Protocol
         // Pre-seed a Pending channel + its shared key (simulating the
         // post-replica-pair state where fingerprint verification is
         // still required to transition to Paired).
-        node.ChannelStore.Save(node.Protocol.SecretId, new Channel(
-            Id: channelId,
+        node.ChannelStore.Save(node.Protocol.SecretId, ChannelRecord.Of(new ReplicaMember(
+            ChannelId: channelId,
+            ReplicaId: 0xcafeUL,
             Transport: new TransportProtocol("https://peer.example.com"),
             CommunicationInfo: new Dictionary<string, string>(),
+            Role: ReplicaRole.Destination,
             Status: ChannelStatus.Pending,
-            CreatedAt: 1700000000UL,
-            PeerRole: Pairing.SenderKind.ReplicaDestination,
-            ReplicaId: 0xcafeUL));
+            CreatedAt: 1700000000UL)));
         node.SecretStore.Save(node.Protocol.SecretId, channelId, new SecretValue(SecretKind.SharedKey, sharedKey));
 
         bool unmatched = node.Protocol
@@ -209,11 +208,11 @@ internal static class Protocol
 
         // Critical invariant: the stored channel record must still
         // report Pending; the protocol must not have touched it.
-        var stored = node.ChannelStore.Load(node.Protocol.SecretId, channelId)
-            ?? throw new InvalidOperationException("channel record missing after verify");
+        var stored = node.ChannelStore.Load(node.Protocol.SecretId, channelId, 0xcafeUL)
+            ?? throw new InvalidOperationException("member record missing after verify");
         if (stored.Status != ChannelStatus.Pending)
             throw new InvalidOperationException(
-                $"verifyFingerprint(wrong) must leave Channel.Status as Pending; got {stored.Status}");
+                $"verifyFingerprint(wrong) must leave the member Status as Pending; got {stored.Status}");
         Console.WriteLine("  verifyFingerprint(wrong) returns false  ✓");
         Console.WriteLine("  Channel.Status stays Pending after mismatch  ✓");
 
@@ -292,9 +291,9 @@ internal static class Protocol
                 $"both sides must converge on the same channel id; helper={helperPairing.ChannelId} owner={ownerPairing.ChannelId}");
         ulong rekeyedId = ulong.Parse(helperPairing.ChannelId);
 
-        var helperChannel = helper.ChannelStore.Load(helper.Protocol.SecretId, rekeyedId)
+        var helperChannel = helper.ChannelStore.Load(helper.Protocol.SecretId, rekeyedId, 0)
             ?? throw new InvalidOperationException("helper channel record must exist after pairing");
-        var ownerChannel = owner.ChannelStore.Load(owner.Protocol.SecretId, rekeyedId)
+        var ownerChannel = owner.ChannelStore.Load(owner.Protocol.SecretId, rekeyedId, 0)
             ?? throw new InvalidOperationException("owner channel record must exist after pairing");
 
         var helperKey = helper.SecretStore.Load(helper.Protocol.SecretId, rekeyedId, SecretKind.SharedKey)
@@ -477,7 +476,7 @@ internal static class Protocol
         foreach (var helperInfo in recovered.Secret.Helpers)
         {
             var helperChannel = ulong.Parse(helperInfo.ChannelId);
-            if (restored.ChannelStore.Load(secretId, helperChannel) is null)
+            if (restored.ChannelStore.Load(secretId, helperChannel, 0) is null)
                 throw new InvalidOperationException(
                     $"restore did not write helper channel {helperChannel}");
         }
@@ -570,7 +569,8 @@ internal static class Protocol
         Console.WriteLine($"  ProtectSecret fanned out 3 envelopes (2 helpers + 1 destination)  ✓");
 
         var destEvents = destination.Protocol.ProcessAndAcceptAllAsync(destEnvelope).GetAwaiter().GetResult();
-        var received = destEvents.OfType<ReplicaSecretReceivedEvent>().FirstOrDefault()
+        // First sync for this secret_id on the destination: an install.
+        var received = destEvents.OfType<ReplicaSecretInstalledEvent>().FirstOrDefault()
             ?? throw new InvalidOperationException(
                 $"destination did not emit ReplicaSecretReceived; got [{string.Join(", ", destEvents.Select(e => e.EventType))}]");
 
@@ -580,22 +580,23 @@ internal static class Protocol
             throw new InvalidOperationException($"secret_id mismatch (got {received.SecretId})");
         if (received.Secret.Secrets.Count != 1 || !received.Secret.Secrets[0].Data.SequenceEqual(secretData))
             throw new InvalidOperationException("secret.secrets[0].data must round-trip the original");
-        if (ulong.Parse(received.Secret.OwnerReplicaId) != ownerReplicaId)
-            throw new InvalidOperationException("secret.owner_replica_id mismatch");
         if (received.Secret.Helpers.Count != 2)
             throw new InvalidOperationException($"secret.helpers must be 2, got {received.Secret.Helpers.Count}");
-        if ((received.Secret.Replicas?.ReplicaList.Count ?? 0) != 1)
-            throw new InvalidOperationException($"secret.replicas must be 1, got {(received.Secret.Replicas?.ReplicaList.Count ?? 0)}");
-        var destInfo = received.Secret.Replicas!.ReplicaList[0];
+        // The roster names every member including the writer, so the source
+        // is identified by its role rather than by a separate field.
+        if ((received.Secret.Replicas?.Members.Count ?? 0) != 2)
+            throw new InvalidOperationException($"secret.replicas.members must be 2, got {(received.Secret.Replicas?.Members.Count ?? 0)}");
+        var sourceInfo = received.Secret.Replicas!.Members.Single(m => m.Role == "Source");
+        if (ulong.Parse(sourceInfo.ReplicaId) != ownerReplicaId)
+            throw new InvalidOperationException("the roster's Source member must be the owner");
+        var destInfo = received.Secret.Replicas!.Members.Single(m => m.Role == "Destination");
         if (ulong.Parse(destInfo.ReplicaId) != destReplicaId)
-            throw new InvalidOperationException("secret.replicas[0].replica_id mismatch");
-        if (destInfo.SenderKind != (int)Pairing.SenderKind.ReplicaDestination)
-            throw new InvalidOperationException("secret.replicas[0].sender_kind must be ReplicaDestination");
+            throw new InvalidOperationException("the roster's Destination member mismatch");
         if (received.Shares.Count != 2)
             throw new InvalidOperationException($"shares must be 2, got {received.Shares.Count}");
 
         Console.WriteLine(
-            $"  ReplicaSecretReceived: secret={received.Secret.Secrets.Count}secret/{received.Secret.Helpers.Count}helpers/{(received.Secret.Replicas?.ReplicaList.Count ?? 0)}replicas, shares={received.Shares.Count}  ✓");
+            $"  ReplicaSecretReceived: secret={received.Secret.Secrets.Count}secret/{received.Secret.Helpers.Count}helpers/{(received.Secret.Replicas?.Members.Count ?? 0)}replicas, shares={received.Shares.Count}  ✓");
 
         // Drain the helper outboxes from the v=1 round so the next
         // round's pump-and-drain sees only v=2 envelopes.
@@ -779,9 +780,9 @@ internal static class Protocol
             throw new InvalidOperationException("Owner.Unpaired channel id mismatch");
 
         // Both sides have dropped their channel records.
-        if (helper.ChannelStore.Load(helper.Protocol.SecretId, rekeyedId) is not null)
+        if (helper.ChannelStore.Load(helper.Protocol.SecretId, rekeyedId, 0) is not null)
             throw new InvalidOperationException("helper channel record must be gone after Unpaired");
-        if (owner.ChannelStore.Load(owner.Protocol.SecretId, rekeyedId) is not null)
+        if (owner.ChannelStore.Load(owner.Protocol.SecretId, rekeyedId, 0) is not null)
             throw new InvalidOperationException("owner channel record must be gone after Unpaired");
 
         Console.WriteLine($"  unpair channel_id={rekeyedId} → Unpaired on both sides + channel records dropped  ✓");
@@ -846,7 +847,7 @@ internal static class Protocol
 
         // Helper's stored channel must now mirror the new transport
         // URI and communication-info map.
-        var helperChannel = helper.ChannelStore.Load(helper.Protocol.SecretId, rekeyedId)
+        var helperChannel = helper.ChannelStore.Load(helper.Protocol.SecretId, rekeyedId, 0)?.Helper
             ?? throw new InvalidOperationException("helper channel record must still exist");
         if (helperChannel.Transport.Uri != newUri)
             throw new InvalidOperationException(
@@ -1085,7 +1086,7 @@ internal static class Protocol
         if (recvA.Version != 1) throw new InvalidOperationException($"step 1: expected v=1, got {recvA.Version}");
         if (recvA.Secret.Helpers.Count != 0) throw new InvalidOperationException("step 1: helpers must be empty");
         if (recvA.Secret.Secrets.Count != 0) throw new InvalidOperationException("step 1: secrets must be empty");
-        if ((recvA.Secret.Replicas?.ReplicaList.Count ?? 0) != 1) throw new InvalidOperationException("step 1: replicas must be 1");
+        if ((recvA.Secret.Replicas?.Members.Count ?? 0) != 2) throw new InvalidOperationException("step 1: roster must be 2 (source + A)");
         if (recvA.Shares.Count != 0) throw new InvalidOperationException("step 1: shares must be empty");
         AssertLatestVersion(owner, TestSecretId, 1);
         Console.WriteLine("  step 1: pair replica A → v=1, secret(h=0,s=0,r=1,shares=0)  ✓");
@@ -1104,7 +1105,7 @@ internal static class Protocol
         if (recvA.Version != 2) throw new InvalidOperationException($"step 2: expected v=2, got {recvA.Version}");
         if (recvA.Secret.Secrets.Count != 1 || !recvA.Secret.Secrets[0].Data.SequenceEqual(s1Data))
             throw new InvalidOperationException("step 2: secret.secrets[0].data must equal s1");
-        if ((recvA.Secret.Replicas?.ReplicaList.Count ?? 0) != 1) throw new InvalidOperationException("step 2: replicas must be 1");
+        if ((recvA.Secret.Replicas?.Members.Count ?? 0) != 2) throw new InvalidOperationException("step 2: roster must be 2 (source + A)");
         if (recvA.Shares.Count != 0) throw new InvalidOperationException("step 2: shares must be empty");
         AssertLatestVersion(owner, TestSecretId, 2);
         Console.WriteLine("  step 2: ProtectSecret([s1]) → v=2, secret(h=0,s=1,r=1,shares=0)  ✓");
@@ -1123,7 +1124,7 @@ internal static class Protocol
             if (recv.Secret.Helpers.Count != 0) throw new InvalidOperationException($"step 3 {label}: helpers must be empty");
             if (recv.Secret.Secrets.Count != 1 || !recv.Secret.Secrets[0].Data.SequenceEqual(s1Data))
                 throw new InvalidOperationException($"step 3 {label}: secret must carry s1");
-            if ((recv.Secret.Replicas?.ReplicaList.Count ?? 0) != 2) throw new InvalidOperationException($"step 3 {label}: replicas must be 2");
+            if ((recv.Secret.Replicas?.Members.Count ?? 0) != 3) throw new InvalidOperationException($"step 3 {label}: roster must be 3");
             if (recv.Shares.Count != 0) throw new InvalidOperationException($"step 3 {label}: shares must be empty");
         }
         AssertLatestVersion(owner, TestSecretId, 3);
@@ -1135,16 +1136,8 @@ internal static class Protocol
         CaptureRekey(events);
         if (events.OfType<ShareStoredEvent>().Any())
             throw new InvalidOperationException("step 4: no helper may store a share (1 < threshold 3)");
-        foreach (var (label, cid) in new (string, ulong)[] { ("A", cidA), ("B", cidB) })
-        {
-            var r = FindReplicaEvent(events, Rk(cid))
-                ?? throw new InvalidOperationException($"step 4 {label}: must observe v=4");
-            if (r.Version != 4) throw new InvalidOperationException($"step 4 {label}: expected v=4");
-            if (r.Secret.Helpers.Count != 1) throw new InvalidOperationException($"step 4 {label}: helpers must be 1");
-            if (r.Secret.Secrets.Count != 1) throw new InvalidOperationException($"step 4 {label}: secrets must be 1");
-            if ((r.Secret.Replicas?.ReplicaList.Count ?? 0) != 2) throw new InvalidOperationException($"step 4 {label}: replicas must be 2");
-            if (r.Shares.Count != 0) throw new InvalidOperationException($"step 4 {label}: shares must be empty");
-        }
+        AssertHydrated(replicaA, TestSecretId, "A", 4, 1, 1, 3);
+        AssertHydrated(replicaB, TestSecretId, "B", 4, 1, 1, 3);
         AssertLatestVersion(owner, TestSecretId, 4);
         Console.WriteLine("  step 4: pair helper #1 → v=4, secret(h=1,s=1,r=2,shares=0)  ✓");
 
@@ -1154,12 +1147,8 @@ internal static class Protocol
         CaptureRekey(events);
         if (events.OfType<ShareStoredEvent>().Any())
             throw new InvalidOperationException("step 5: still below threshold");
-        var r5B = FindReplicaEvent(events, Rk(cidB))
-            ?? throw new InvalidOperationException("step 5: B must observe v=5");
-        if (r5B.Version != 5) throw new InvalidOperationException("step 5: B expected v=5");
-        if (r5B.Secret.Helpers.Count != 2) throw new InvalidOperationException("step 5: helpers must be 2");
-        if (r5B.Shares.Count != 0) throw new InvalidOperationException("step 5: shares must be empty");
-        if (FindReplicaEvent(events, Rk(cidA)) is null) throw new InvalidOperationException("step 5: A must observe v=5");
+        AssertHydrated(replicaA, TestSecretId, "A", 5, 2, 1, 3);
+        AssertHydrated(replicaB, TestSecretId, "B", 5, 2, 1, 3);
         AssertLatestVersion(owner, TestSecretId, 5);
         Console.WriteLine("  step 5: pair helper #2 → v=5, secret(h=2,s=1,r=2,shares=0)  ✓");
 
@@ -1178,17 +1167,14 @@ internal static class Protocol
         CaptureRekey(events);
         if (events.OfType<ShareStoredEvent>().Any())
             throw new InvalidOperationException("step 6: still below threshold");
-        recvA = FindReplicaEvent(events, Rk(cidA))
-            ?? throw new InvalidOperationException("step 6: A must observe v=6");
-        if (recvA.Version != 6) throw new InvalidOperationException("step 6: A expected v=6");
-        if (recvA.Secret.Secrets.Count != 2) throw new InvalidOperationException("step 6: secrets must be 2");
-        if (!recvA.Secret.Secrets.Any(u => u.Data.SequenceEqual(s1Data)))
-            throw new InvalidOperationException("step 6: secret must carry s1");
-        if (!recvA.Secret.Secrets.Any(u => u.Data.SequenceEqual(s2Data)))
-            throw new InvalidOperationException("step 6: secret must carry s2");
-        if (recvA.Secret.Helpers.Count != 2) throw new InvalidOperationException("step 6: helpers must be 2");
-        if (recvA.Shares.Count != 0) throw new InvalidOperationException("step 6: shares must be empty");
-        if (FindReplicaEvent(events, Rk(cidB)) is null) throw new InvalidOperationException("step 6: B must observe v=6");
+        AssertHydrated(replicaA, TestSecretId, "A", 6, 2, 2, 3);
+        AssertHydrated(replicaB, TestSecretId, "B", 6, 2, 2, 3);
+        // Both user secrets reached the destination, not just the count.
+        var snapshotA = replicaA.UserSecretStore.LoadLatest(TestSecretId)!;
+        if (!snapshotA.Secrets.Any(u => u.Data.SequenceEqual(s1Data)))
+            throw new InvalidOperationException("step 6: A's snapshot must carry s1");
+        if (!snapshotA.Secrets.Any(u => u.Data.SequenceEqual(s2Data)))
+            throw new InvalidOperationException("step 6: A's snapshot must carry s2");
         AssertLatestVersion(owner, TestSecretId, 6);
         Console.WriteLine("  step 6: ProtectSecret([s1, s2]) → v=6, secret(h=2,s=2,r=2,shares=0)  ✓");
 
@@ -1203,16 +1189,8 @@ internal static class Protocol
                 .Any(e => ulong.Parse(e.ChannelId) == expected && e.Version == 7u))
                 throw new InvalidOperationException($"step 7: {label} must emit ShareStored at v=7");
         }
-        foreach (var (label, cid) in new (string, ulong)[] { ("A", cidA), ("B", cidB) })
-        {
-            var r = FindReplicaEvent(events, Rk(cid))
-                ?? throw new InvalidOperationException($"step 7 {label}: must observe v=7");
-            if (r.Version != 7) throw new InvalidOperationException($"step 7 {label}: expected v=7");
-            if (r.Secret.Helpers.Count != 3) throw new InvalidOperationException($"step 7 {label}: helpers must be 3");
-            if (r.Secret.Secrets.Count != 2) throw new InvalidOperationException($"step 7 {label}: secrets must be 2");
-            if ((r.Secret.Replicas?.ReplicaList.Count ?? 0) != 2) throw new InvalidOperationException($"step 7 {label}: replicas must be 2");
-            if (r.Shares.Count != 3) throw new InvalidOperationException($"step 7 {label}: shares must be 3");
-        }
+        AssertHydrated(replicaA, TestSecretId, "A", 7, 3, 2, 3);
+        AssertHydrated(replicaB, TestSecretId, "B", 7, 3, 2, 3);
         AssertLatestVersion(owner, TestSecretId, 7);
         Console.WriteLine("  step 7: pair helper #3 → v=7, secret(h=3,s=2,r=2,shares=3); all 3 helpers ShareStored  ✓");
 
@@ -1230,22 +1208,53 @@ internal static class Protocol
         }
         var recvC = FindReplicaEvent(events, Rk(cidC))
             ?? throw new InvalidOperationException("step 8: C must observe v=8");
-        if (recvC.Version != 8) throw new InvalidOperationException("step 8: C expected v=8");
-        if (recvC.Secret.Helpers.Count != 3) throw new InvalidOperationException("step 8 C: helpers must be 3");
-        if (recvC.Secret.Secrets.Count != 2) throw new InvalidOperationException("step 8 C: secrets must be 2");
-        if ((recvC.Secret.Replicas?.ReplicaList.Count ?? 0) != 3) throw new InvalidOperationException("step 8 C: replicas must be 3");
+        if (!recvC.Installed)
+            throw new InvalidOperationException("step 8: C is new to the secret, so this is an install");
         if (recvC.Shares.Count != 3) throw new InvalidOperationException("step 8 C: shares must be 3");
-        foreach (var (label, cid) in new (string, ulong)[] { ("A", cidA), ("B", cidB) })
-        {
-            var r = FindReplicaEvent(events, Rk(cid))
-                ?? throw new InvalidOperationException($"step 8 {label}: must observe v=8");
-            if (r.Version != 8) throw new InvalidOperationException($"step 8 {label}: expected v=8");
-            if ((r.Secret.Replicas?.ReplicaList.Count ?? 0) != 3) throw new InvalidOperationException($"step 8 {label}: replicas must be 3");
-        }
+        AssertHydrated(replicaA, TestSecretId, "A", 8, 3, 2, 4);
+        AssertHydrated(replicaB, TestSecretId, "B", 8, 3, 2, 4);
+        AssertHydrated(replicaC, TestSecretId, "C", 8, 3, 2, 4);
         AssertLatestVersion(owner, TestSecretId, 8);
         Console.WriteLine("  step 8: pair replica C → v=8, secret(h=3,s=2,r=3,shares=3) on A+B+C; all helpers refreshed  ✓");
 
         Console.WriteLine("Orchestrator replica sync version progression test passed.");
+    }
+
+    /// <summary>
+    /// Assert a replica hydrated a round: its own snapshot and stores now
+    /// match what the source published.
+    /// </summary>
+    /// <remarks>
+    /// Checked against the peer's stores rather than its events because
+    /// members share one group channel once they have hydrated — the arrival
+    /// channel no longer identifies who received what, and the stores are the
+    /// thing the group model actually promises.
+    /// </remarks>
+    private static void AssertHydrated(
+        Node peer, ulong secretId, string label, uint version, int helpers, int secrets, int members)
+    {
+        var snapshot = peer.UserSecretStore.LoadLatest(secretId)
+            ?? throw new InvalidOperationException($"replica {label} must hold a snapshot");
+        if (snapshot.Version != version)
+            throw new InvalidOperationException(
+                $"replica {label} must hold v={version}, got {snapshot.Version}");
+        if (snapshot.Secrets.Length != secrets)
+            throw new InvalidOperationException(
+                $"replica {label} secret count: expected {secrets}, got {snapshot.Secrets.Length}");
+
+        var storedHelpers = peer.ChannelStore.ListHelpers(secretId).Count();
+        if (storedHelpers != helpers)
+            throw new InvalidOperationException(
+                $"replica {label} must have materialised {helpers} helper channel(s), got {storedHelpers}");
+
+        var roster = peer.ChannelStore.ListReplicas(secretId).ToList();
+        if (roster.Count != members)
+            throw new InvalidOperationException(
+                $"replica {label} roster size: expected {members}, got {roster.Count}");
+        var sources = roster.Count(m => m.Role == ReplicaRole.Source);
+        if (sources != 1)
+            throw new InvalidOperationException(
+                $"replica {label} roster must name exactly one source, got {sources}");
     }
 
     private static void AssertLatestVersion(Node owner, ulong secretId, uint expected)
@@ -1344,14 +1353,19 @@ internal static class Protocol
     private sealed record ReceivedSecret(
         uint Version,
         Secret Secret,
-        IReadOnlyList<ChannelShare> Shares);
+        IReadOnlyList<ChannelShare> Shares,
+        bool Installed);
 
+    /// Matches both sync arrivals and records which fired: a device's first
+    /// sync for a secret_id installs it, every later one updates it.
     private static ReceivedSecret? FindReplicaEvent(IEnumerable<DeRecEvent> events, ulong channelId)
     {
         foreach (var ev in events)
         {
+            if (ev is ReplicaSecretInstalledEvent i && ulong.Parse(i.ChannelId) == channelId)
+                return new ReceivedSecret(i.Version, i.Secret, i.Shares, true);
             if (ev is ReplicaSecretReceivedEvent r && ulong.Parse(r.ChannelId) == channelId)
-                return new ReceivedSecret(r.Version, r.Secret, r.Shares);
+                return new ReceivedSecret(r.Version, r.Secret, r.Shares, false);
         }
         return null;
     }

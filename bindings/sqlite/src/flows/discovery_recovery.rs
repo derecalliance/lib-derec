@@ -5,7 +5,7 @@ use derec_library::protocol::DeRecChannelStore;
 use derec_library::protocol::DeRecFlow;
 use derec_library::protocol::DeRecUserSecretStore;
 use derec_library::protocol::events::DeRecEvent;
-use derec_library::protocol::types::{Target, UserSecret};
+use derec_library::protocol::types::{ChannelQuery, Target, UserSecret};
 use derec_library::types::ChannelId;
 use derec_proto::SenderKind;
 use std::collections::HashMap;
@@ -143,13 +143,19 @@ pub async fn run() {
     owner
         .protocol
         .channel_store
-        .remove(PROTECTED_SECRET_ID, cid_a)
+        .remove(
+            PROTECTED_SECRET_ID,
+            ChannelQuery::Helper { channel_id: cid_a },
+        )
         .await
         .unwrap();
     owner
         .protocol
         .channel_store
-        .remove(PROTECTED_SECRET_ID, cid_b)
+        .remove(
+            PROTECTED_SECRET_ID,
+            ChannelQuery::Helper { channel_id: cid_b },
+        )
         .await
         .unwrap();
     assert_eq!(

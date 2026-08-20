@@ -3,11 +3,25 @@
 -- backing database can serve multiple secrets on the same device
 -- without leakage between them.
 
+-- Helper channels: unique per channel_id, one row per pairing.
 CREATE TABLE channels (
     secret_id  INTEGER NOT NULL,
     channel_id INTEGER NOT NULL,
     data       BLOB    NOT NULL,
     PRIMARY KEY (secret_id, channel_id)
+);
+
+-- Replica-group members. Keyed by `replica_id`, NOT by `channel_id`: every
+-- member of a group shares one channel, so a channel-keyed table would
+-- collide at the second member. `channel_id` is stored as an ordinary column
+-- because a member moves between channels during an admission handover while
+-- remaining the same member.
+CREATE TABLE replica_members (
+    secret_id  INTEGER NOT NULL,
+    replica_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    data       BLOB    NOT NULL,
+    PRIMARY KEY (secret_id, replica_id)
 );
 
 -- Undirected adjacency list for the channel-link graph. Each link is
@@ -28,27 +42,17 @@ CREATE TABLE secrets (
     PRIMARY KEY (secret_id, channel_id, kind)
 );
 
+-- One share per `(secret_id, channel_id, version)`. A helper stores exactly
+-- one share per version and knows nothing about replicas: `replica_id` is
+-- absent from the helper path entirely, so it is not part of this key.
 CREATE TABLE shares (
-    -- `replica_id` is part of the conceptual storage key: distinct
-    -- replicas writing the same `(secret_id, channel_id, version)`
-    -- must both survive because the wire layer cannot distinguish
-    -- them (they reuse the source's shared key). NULL means a
-    -- non-replica Owner produced the share.
-    --
-    -- SQLite forbids expressions inside PRIMARY KEY / UNIQUE
-    -- constraints, so the four-tuple uniqueness contract is expressed
-    -- via a separate UNIQUE INDEX with `COALESCE(replica_id, -1)` —
-    -- two Owner re-sends (both replica_id = NULL) still collide and
-    -- ON CONFLICT against the index updates the existing row.
     secret_id       INTEGER NOT NULL,
     channel_id      INTEGER NOT NULL,
     version         INTEGER NOT NULL,
-    replica_id      INTEGER,
     share_secret_id INTEGER NOT NULL,
-    bytes           BLOB    NOT NULL
+    bytes           BLOB    NOT NULL,
+    PRIMARY KEY (secret_id, channel_id, version)
 );
-CREATE UNIQUE INDEX shares_uniq
-    ON shares (secret_id, channel_id, version, COALESCE(replica_id, -1));
 
 CREATE TABLE user_secrets (
     secret_id   INTEGER NOT NULL PRIMARY KEY,

@@ -12,34 +12,83 @@ use crate::protocol::traits::{
     ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecTransport,
     DeRecUserSecretStore, SecretStoreFuture, ShareStoreFuture, TransportFuture,
 };
-use crate::protocol::types::{Channel, MissingPolicy, SecretKind, SecretValue, Share, UserSecrets};
+use crate::protocol::types::{
+    ChannelQuery, ChannelRecord, HelperChannel, MissingPolicy, ReplicaMember, SecretKind,
+    SecretValue, Share, UserSecrets,
+};
 use crate::protocol::{DeRecStateStore, StateItem, StateKey, StateKind, StateStoreFuture};
 use crate::types::ChannelId;
 use derec_proto::TransportProtocol;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// Two maps, mirroring the two primary keys the trait defines.
 #[derive(Default, Clone)]
 pub(crate) struct InMemChannelStore {
-    pub(crate) data: Arc<Mutex<HashMap<(u64, u64), Channel>>>,
+    pub(crate) helper_rows: Arc<Mutex<HashMap<(u64, u64), HelperChannel>>>,
+    pub(crate) member_rows: Arc<Mutex<HashMap<(u64, u64), ReplicaMember>>>,
 }
 
 impl DeRecChannelStore for InMemChannelStore {
-    fn load(&self, sid: u64, cid: ChannelId) -> ChannelStoreFuture<'_, Option<Channel>> {
-        let v = self.data.lock().unwrap().get(&(sid, cid.0)).cloned();
-        Box::pin(std::future::ready(Ok(v)))
+    fn load(&self, sid: u64, query: ChannelQuery) -> ChannelStoreFuture<'_, Option<ChannelRecord>> {
+        let found = match query {
+            ChannelQuery::Helper { channel_id } => self
+                .helper_rows
+                .lock()
+                .unwrap()
+                .get(&(sid, channel_id.0))
+                .cloned()
+                .map(ChannelRecord::Helper),
+            ChannelQuery::Replica { replica_id, .. } => self
+                .member_rows
+                .lock()
+                .unwrap()
+                .get(&(sid, replica_id.0))
+                .cloned()
+                .map(ChannelRecord::Replica),
+        };
+        Box::pin(std::future::ready(Ok(found)))
     }
-    fn save(&mut self, sid: u64, c: Channel) -> ChannelStoreFuture<'_, ()> {
-        self.data.lock().unwrap().insert((sid, c.id.0), c);
+
+    fn save(&mut self, sid: u64, record: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
+        match record {
+            ChannelRecord::Helper(h) => {
+                self.helper_rows
+                    .lock()
+                    .unwrap()
+                    .insert((sid, h.channel_id.0), h);
+            }
+            ChannelRecord::Replica(r) => {
+                self.member_rows
+                    .lock()
+                    .unwrap()
+                    .insert((sid, r.replica_id.0), r);
+            }
+        }
         Box::pin(std::future::ready(Ok(())))
     }
-    fn remove(&mut self, sid: u64, cid: ChannelId) -> ChannelStoreFuture<'_, bool> {
-        let removed = self.data.lock().unwrap().remove(&(sid, cid.0)).is_some();
+
+    fn remove(&mut self, sid: u64, query: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
+        let removed = match query {
+            ChannelQuery::Helper { channel_id } => self
+                .helper_rows
+                .lock()
+                .unwrap()
+                .remove(&(sid, channel_id.0))
+                .is_some(),
+            ChannelQuery::Replica { replica_id, .. } => self
+                .member_rows
+                .lock()
+                .unwrap()
+                .remove(&(sid, replica_id.0))
+                .is_some(),
+        };
         Box::pin(std::future::ready(Ok(removed)))
     }
-    fn channels(&self, sid: u64) -> ChannelStoreFuture<'_, Vec<Channel>> {
-        let v: Vec<Channel> = self
-            .data
+
+    fn helpers(&self, sid: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+        let v: Vec<HelperChannel> = self
+            .helper_rows
             .lock()
             .unwrap()
             .iter()
@@ -48,9 +97,23 @@ impl DeRecChannelStore for InMemChannelStore {
             .collect();
         Box::pin(std::future::ready(Ok(v)))
     }
+
+    fn replicas(&self, sid: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
+        let v: Vec<ReplicaMember> = self
+            .member_rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((s, _), _)| *s == sid)
+            .map(|(_, m)| m.clone())
+            .collect();
+        Box::pin(std::future::ready(Ok(v)))
+    }
+
     fn link_channel(&mut self, _: u64, _: ChannelId, _: ChannelId) -> ChannelStoreFuture<'_, ()> {
         Box::pin(std::future::ready(Ok(())))
     }
+
     fn linked_channels(&self, _: u64, cid: ChannelId) -> ChannelStoreFuture<'_, Vec<ChannelId>> {
         Box::pin(std::future::ready(Ok(vec![cid])))
     }

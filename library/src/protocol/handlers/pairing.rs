@@ -90,6 +90,33 @@ pub(in crate::protocol) async fn handle<
                 .await?;
                 return Err(err.into());
             }
+            // A colliding id is refused before the application is asked to
+            // confirm anything: the pairing cannot complete, so surfacing an
+            // ActionRequired for it would only waste a user's decision.
+            let peer_kind = request_sender_kind(request)?;
+            if peer_kind.is_replica() {
+                let (_, peer_replica_id) =
+                    extract_communication_info(&request.communication_info, peer_kind)?;
+                if let Some(peer_replica_id) = peer_replica_id
+                    && replica_id_is_taken(channel_store, secret_id, peer_replica_id).await?
+                {
+                    reject(
+                        secret_store,
+                        transport,
+                        communication_info,
+                        secret_id,
+                        channel_id,
+                        request,
+                        StatusEnum::ReplicaIdConflict,
+                        "replica id already in use by a member of this group",
+                        inbound_trace_id,
+                    )
+                    .await?;
+                    return Err(Error::ReplicaIdConflict {
+                        replica_id: peer_replica_id,
+                    });
+                }
+            }
             on_request(channel_id, request, inbound_trace_id, replica_id)
         }
         MessageBody::PairResponse(response) => {
@@ -189,6 +216,7 @@ pub(in crate::protocol) async fn start<
             peer_communication_info,
             endpoint,
             kind,
+            replica_id,
         )
         .await
     } else {
@@ -224,6 +252,7 @@ pub(in crate::protocol) async fn accept<
     channel_store: &mut Ch,
     secret_store: &mut Ss,
     transport: &T,
+    own_transport: &TransportProtocol,
     communication_info: &HashMap<String, String>,
     secret_id: u64,
     channel_id: ChannelId,
@@ -276,20 +305,32 @@ pub(in crate::protocol) async fn accept<
     let (peer_communication_info, peer_replica_id) =
         extract_communication_info(&request.communication_info, peer_sender_kind)?;
 
-    channel_store
-        .save(
+    persist_peer_record(
+        channel_store,
+        secret_id,
+        new_channel_id,
+        peer_transport,
+        peer_communication_info.clone(),
+        peer_sender_kind,
+        peer_replica_id,
+        status,
+    )
+    .await?;
+
+    // The responder is a group member too, and only it knows its own id and
+    // endpoint. Without this row the roster it publishes would omit itself.
+    if kind.is_replica() {
+        persist_own_member(
+            channel_store,
             secret_id,
-            crate::protocol::types::Channel {
-                id: new_channel_id,
-                transport: peer_transport,
-                communication_info: peer_communication_info.clone(),
-                status,
-                created_at: now_secs(),
-                peer_role: peer_sender_kind,
-                replica_id: peer_replica_id,
-            },
+            new_channel_id,
+            own_transport,
+            kind,
+            replica_id,
+            status,
         )
         .await?;
+    }
 
     let envelope = super::apply_trace_id(resp.envelope, trace_id)?;
     transport
@@ -299,7 +340,12 @@ pub(in crate::protocol) async fn accept<
     secret_store
         .remove(secret_id, channel_id, SecretKind::PairingSecret)
         .await?;
-    channel_store.remove(secret_id, channel_id).await?;
+    channel_store
+        .remove(
+            secret_id,
+            crate::protocol::types::ChannelQuery::Helper { channel_id },
+        )
+        .await?;
 
     #[cfg(feature = "logging")]
     tracing::info!(
@@ -597,8 +643,12 @@ pub(in crate::protocol) async fn on_pre_pair_response<
     };
 
     let local_kind = channel_store
-        .load(secret_id, channel_id)
+        .load(
+            secret_id,
+            crate::protocol::types::ChannelQuery::Helper { channel_id },
+        )
         .await?
+        .and_then(|r| r.as_helper().cloned())
         .ok_or(Error::Invariant(
             "channel record missing on PrePair response — start must be called first",
         ))?
@@ -713,13 +763,45 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
 
     let new_channel_id = result.channel_id;
 
-    let channel = channel_store
-        .load(secret_id, channel_id)
+    // Which flow is this? A helper pairing left a `HelperChannel`
+    // placeholder; a replica pairing left this device's own member row.
+    // Try the helper key first — testing the local `ReplicaId` alone would
+    // be wrong, since a device may have one configured while pairing with a
+    // helper.
+    let helper_placeholder = channel_store
+        .load(
+            secret_id,
+            crate::protocol::types::ChannelQuery::Helper { channel_id },
+        )
         .await?
-        .ok_or(Error::Invariant(
-            "channel record missing on pair response — start must be called first",
-        ))?;
-    let kind = channel.peer_role.counterparty();
+        .and_then(|r| r.as_helper().cloned());
+
+    let own_member = match (helper_placeholder.as_ref(), replica_id) {
+        (None, Some(own)) => channel_store
+            .load(
+                secret_id,
+                crate::protocol::types::ChannelQuery::Replica {
+                    channel_id,
+                    replica_id: crate::types::ReplicaId::try_from(own)?,
+                },
+            )
+            .await?
+            .and_then(|r| r.as_replica().cloned()),
+        _ => None,
+    };
+
+    // The peer's kind: from the placeholder for a helper pairing, or the
+    // counterpart of our own role for a replica one.
+    let peer_kind = match (helper_placeholder.as_ref(), own_member.as_ref()) {
+        (Some(placeholder), _) => placeholder.peer_role,
+        (None, Some(mine)) => mine.role.counterparty().to_sender_kind(),
+        (None, None) => {
+            return Err(Error::Invariant(
+                "no pairing record on pair response — start must be called first",
+            ));
+        }
+    };
+    let kind = peer_kind.counterparty();
 
     let status = if kind.is_replica() {
         crate::protocol::types::ChannelStatus::Pending
@@ -727,19 +809,78 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
         crate::protocol::types::ChannelStatus::Paired
     };
 
-    let peer_kind = channel.peer_role;
     let _ = require_replica_id_for_kind(kind, replica_id)?;
     let (peer_communication_info, peer_replica_id) =
         extract_communication_info(&response.communication_info, peer_kind)?;
 
-    let mut channel = channel;
-    channel.id = new_channel_id;
-    channel.status = status;
-    channel.replica_id = peer_replica_id;
-    for (k, v) in &peer_communication_info {
-        channel.communication_info.insert(k.clone(), v.clone());
+    // The responder announced its id only now, so this is the first chance to
+    // see a collision. Unlike the responder, the initiator has no way to tell
+    // the peer — a `PairResponse` is the last leg of the handshake. It stops
+    // hard and cleans up its own side; the peer is left holding a pairing
+    // channel that its expiry sweep will collect.
+    if let Some(peer_replica_id) = peer_replica_id
+        && replica_id_is_taken(channel_store, secret_id, peer_replica_id).await?
+    {
+        abandon_pairing(
+            channel_store,
+            secret_store,
+            secret_id,
+            channel_id,
+            replica_id,
+        )
+        .await?;
+        return Err(Error::ReplicaIdConflict {
+            replica_id: peer_replica_id,
+        });
     }
-    channel_store.save(secret_id, channel).await?;
+
+    // The peer's endpoint comes from the contact we already loaded, so
+    // dropping the placeholder for replica pairings costs nothing.
+    let peer_transport = helper_placeholder
+        .as_ref()
+        .map(|p| p.transport.clone())
+        .or_else(|| contact.transport_protocol.clone())
+        .ok_or(Error::InvalidInput(
+            "no transport endpoint for the pairing peer",
+        ))?;
+
+    let mut merged_info = helper_placeholder
+        .as_ref()
+        .map(|p| p.communication_info.clone())
+        .unwrap_or_default();
+    for (k, v) in &peer_communication_info {
+        merged_info.insert(k.clone(), v.clone());
+    }
+
+    persist_peer_record(
+        channel_store,
+        secret_id,
+        new_channel_id,
+        peer_transport,
+        merged_info,
+        peer_kind,
+        peer_replica_id,
+        status,
+    )
+    .await?;
+
+    // A replica initiator's own row was written under the contact-time id at
+    // `start`; point it at the rekeyed group channel. A member row is keyed by
+    // `replica_id` alone, so this is a field update — re-keying it would
+    // delete the row this save just wrote.
+    if let Some(mine) = own_member {
+        channel_store
+            .save(
+                secret_id,
+                crate::protocol::types::ChannelRecord::Replica(
+                    crate::protocol::types::ReplicaMember {
+                        channel_id: new_channel_id,
+                        ..mine
+                    },
+                ),
+            )
+            .await?;
+    }
 
     secret_store
         .save(
@@ -749,7 +890,12 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
         )
         .await?;
 
-    channel_store.remove(secret_id, channel_id).await?;
+    channel_store
+        .remove(
+            secret_id,
+            crate::protocol::types::ChannelQuery::Helper { channel_id },
+        )
+        .await?;
     secret_store
         .remove(secret_id, channel_id, SecretKind::PairingSecret)
         .await?;
@@ -815,20 +961,17 @@ async fn start_inlined_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRe
         )
         .await?;
 
-    channel_store
-        .save(
-            secret_id,
-            crate::protocol::types::Channel {
-                id: channel_id,
-                transport: endpoint.clone(),
-                communication_info: peer_communication_info,
-                status: crate::protocol::types::ChannelStatus::Pending,
-                created_at: now_secs(),
-                peer_role: kind.counterparty(),
-                replica_id: None,
-            },
-        )
-        .await?;
+    persist_start_record(
+        channel_store,
+        secret_id,
+        channel_id,
+        endpoint.clone(),
+        own_transport,
+        peer_communication_info,
+        kind,
+        replica_id_to_inject,
+    )
+    .await?;
 
     #[cfg(feature = "logging")]
     tracing::info!("pairing request sent");
@@ -851,6 +994,7 @@ async fn start_pre_pair<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRecTra
     peer_communication_info: HashMap<String, String>,
     endpoint: TransportProtocol,
     kind: SenderKind,
+    replica_id: Option<u64>,
 ) -> Result<u64> {
     reject_start_on_paired_channel(channel_store, secret_id, channel_id).await?;
 
@@ -860,20 +1004,17 @@ async fn start_pre_pair<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRecTra
         .save(secret_id, channel_id, SecretValue::PairingContact(contact))
         .await?;
 
-    channel_store
-        .save(
-            secret_id,
-            crate::protocol::types::Channel {
-                id: channel_id,
-                transport: endpoint.clone(),
-                communication_info: peer_communication_info,
-                status: crate::protocol::types::ChannelStatus::Pending,
-                created_at: now_secs(),
-                peer_role: kind.counterparty(),
-                replica_id: None,
-            },
-        )
-        .await?;
+    persist_start_record(
+        channel_store,
+        secret_id,
+        channel_id,
+        endpoint.clone(),
+        own_transport,
+        peer_communication_info,
+        kind,
+        replica_id,
+    )
+    .await?;
 
     #[cfg(feature = "logging")]
     tracing::info!("PrePair request sent (scanner side)");
@@ -1034,11 +1175,233 @@ async fn reject_start_on_paired_channel<Ch: DeRecChannelStore>(
     secret_id: u64,
     channel_id: ChannelId,
 ) -> Result<()> {
-    if let Some(channel) = channel_store.load(secret_id, channel_id).await?
-        && channel.status == crate::protocol::types::ChannelStatus::Paired
+    if let Some(record) = channel_store
+        .load(
+            secret_id,
+            crate::protocol::types::ChannelQuery::Helper { channel_id },
+        )
+        .await?
+        && record.status() == crate::protocol::types::ChannelStatus::Paired
     {
         return Err(Error::ChannelAlreadyPaired { channel_id });
     }
+    Ok(())
+}
+
+/// Persist the peer's record for a completed handshake.
+///
+/// Helper pairings write a [`HelperChannel`] — that flow is unchanged. Replica
+/// pairings write the peer's [`ReplicaMember`], which requires its
+/// `replica_id`; by this point the peer has announced it.
+#[allow(clippy::too_many_arguments)]
+async fn persist_peer_record<Ch: DeRecChannelStore>(
+    channel_store: &mut Ch,
+    secret_id: u64,
+    channel_id: ChannelId,
+    transport: TransportProtocol,
+    communication_info: HashMap<String, String>,
+    peer_kind: SenderKind,
+    peer_replica_id: Option<u64>,
+    status: crate::protocol::types::ChannelStatus,
+) -> Result<()> {
+    use crate::protocol::types::{ChannelRecord, HelperChannel, ReplicaMember, ReplicaRole};
+    let record = match ReplicaRole::from_sender_kind(peer_kind) {
+        Some(role) => {
+            let replica_id = peer_replica_id
+                .ok_or(Error::Invariant(
+                    "replica pairing completed without the peer's replica_id",
+                ))
+                .and_then(crate::types::ReplicaId::try_from)?;
+            ChannelRecord::Replica(ReplicaMember {
+                channel_id,
+                replica_id,
+                transport,
+                communication_info,
+                role,
+                status,
+                created_at: now_secs(),
+            })
+        }
+        None => ChannelRecord::Helper(HelperChannel {
+            channel_id,
+            transport,
+            communication_info,
+            peer_role: peer_kind,
+            status,
+            created_at: now_secs(),
+        }),
+    };
+    channel_store.save(secret_id, record).await?;
+    Ok(())
+}
+
+/// Drop everything this pairing created, leaving no trace of a handshake that
+/// cannot complete.
+///
+/// This device's own member row is removed **only when it is the sole member
+/// row** — that means no group existed before this pairing, so the row was
+/// created by it and points at a transient channel about to disappear.
+/// Leaving it would strand a later publish on a dead channel with no key. A
+/// device already in a group keeps its row: that is its identity there, and
+/// this failed pairing has no claim on it.
+async fn abandon_pairing<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
+    channel_store: &mut Ch,
+    secret_store: &mut Ss,
+    secret_id: u64,
+    channel_id: ChannelId,
+    local_replica_id: Option<u64>,
+) -> Result<()> {
+    let roster = channel_store.replicas(secret_id).await?;
+    if let Some(own) = local_replica_id
+        && roster.len() == 1
+        && roster[0].replica_id.0 == own
+    {
+        channel_store
+            .remove(
+                secret_id,
+                crate::protocol::types::ChannelQuery::Replica {
+                    channel_id: roster[0].channel_id,
+                    replica_id: roster[0].replica_id,
+                },
+            )
+            .await?;
+    }
+
+    let _ = secret_store
+        .remove(secret_id, channel_id, SecretKind::PairingSecret)
+        .await;
+    let _ = secret_store
+        .remove(secret_id, channel_id, SecretKind::PairingContact)
+        .await;
+    channel_store
+        .remove(
+            secret_id,
+            crate::protocol::types::ChannelQuery::Helper { channel_id },
+        )
+        .await?;
+    Ok(())
+}
+
+/// Whether `candidate` is already held by a member of this group.
+///
+/// The roster includes this device's own row, so a peer that announced the
+/// same id as us collides too — the common case, since both ends of a first
+/// pairing are usually configured by the same person.
+async fn replica_id_is_taken<Ch: DeRecChannelStore>(
+    channel_store: &Ch,
+    secret_id: u64,
+    candidate: u64,
+) -> Result<bool> {
+    Ok(channel_store
+        .replicas(secret_id)
+        .await?
+        .iter()
+        .any(|m| m.replica_id.0 == candidate))
+}
+
+/// Write this device's own member row when it *initiates* a replica pairing.
+///
+/// The initiator knows its identity and role at `start`, and the peer's role is
+/// simply the counterpart — which is what lets the handshake proceed without
+/// recording anything about a peer whose `replica_id` has not arrived yet.
+/// Helper pairings write a [`HelperChannel`] placeholder instead, unchanged.
+#[allow(clippy::too_many_arguments)]
+async fn persist_start_record<Ch: DeRecChannelStore>(
+    channel_store: &mut Ch,
+    secret_id: u64,
+    channel_id: ChannelId,
+    peer_endpoint: TransportProtocol,
+    own_transport: &TransportProtocol,
+    peer_communication_info: HashMap<String, String>,
+    own_kind: SenderKind,
+    own_replica_id: Option<u64>,
+) -> Result<()> {
+    use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel};
+    if own_kind.is_replica() {
+        return persist_own_member(
+            channel_store,
+            secret_id,
+            channel_id,
+            own_transport,
+            own_kind,
+            own_replica_id,
+            ChannelStatus::Pending,
+        )
+        .await;
+    }
+    channel_store
+        .save(
+            secret_id,
+            ChannelRecord::Helper(HelperChannel {
+                channel_id,
+                transport: peer_endpoint,
+                communication_info: peer_communication_info,
+                peer_role: own_kind.counterparty(),
+                status: ChannelStatus::Pending,
+                created_at: now_secs(),
+            }),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Write this device's own row into the replica roster.
+///
+/// Both ends of a replica handshake do this — the initiator at `start`, the
+/// responder when it accepts — because the roster is absolute, not a view from
+/// one side. A group whose members cannot name themselves cannot be published.
+///
+/// Never called for helper pairings: a helper channel has exactly two ends and
+/// one record, so there is no self-row to write.
+async fn persist_own_member<Ch: DeRecChannelStore>(
+    channel_store: &mut Ch,
+    secret_id: u64,
+    channel_id: ChannelId,
+    own_transport: &TransportProtocol,
+    own_kind: SenderKind,
+    own_replica_id: Option<u64>,
+    status: crate::protocol::types::ChannelStatus,
+) -> Result<()> {
+    use crate::protocol::types::{ChannelQuery, ChannelRecord, ReplicaMember, ReplicaRole};
+    let role = ReplicaRole::from_sender_kind(own_kind).ok_or(Error::Invariant(
+        "own member row requested for a non-replica pairing",
+    ))?;
+    let replica_id = own_replica_id
+        .ok_or(Error::ReplicaIdNotConfigured)
+        .and_then(crate::types::ReplicaId::try_from)?;
+
+    // A device already in a group keeps the row it has. Its `channel_id` is
+    // the group's, and a later pairing mints an ephemeral channel for the
+    // *joiner* only — moving this row onto it would redefine the group's
+    // channel, and with it the group key, on every admission.
+    if channel_store
+        .load(
+            secret_id,
+            ChannelQuery::Replica {
+                channel_id,
+                replica_id,
+            },
+        )
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    channel_store
+        .save(
+            secret_id,
+            ChannelRecord::Replica(ReplicaMember {
+                channel_id,
+                replica_id,
+                transport: own_transport.clone(),
+                communication_info: HashMap::new(),
+                role,
+                status,
+                created_at: now_secs(),
+            }),
+        )
+        .await?;
     Ok(())
 }
 
@@ -1232,24 +1595,29 @@ mod tests {
     }
 
     use crate::protocol::traits::ChannelStoreFuture;
-    use crate::protocol::types::{Channel, ChannelStatus};
+    use crate::protocol::types::{
+        ChannelQuery, ChannelRecord, ChannelStatus, HelperChannel, ReplicaMember,
+    };
 
     struct FixedChannelStore {
-        seeded: Option<Channel>,
+        seeded: Option<ChannelRecord>,
     }
 
     impl DeRecChannelStore for FixedChannelStore {
-        fn load(&self, _: u64, _: ChannelId) -> ChannelStoreFuture<'_, Option<Channel>> {
+        fn load(&self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, Option<ChannelRecord>> {
             let v = self.seeded.clone();
             Box::pin(std::future::ready(Ok(v)))
         }
-        fn save(&mut self, _: u64, _: Channel) -> ChannelStoreFuture<'_, ()> {
+        fn save(&mut self, _: u64, _: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
             Box::pin(std::future::ready(Ok(())))
         }
-        fn remove(&mut self, _: u64, _: ChannelId) -> ChannelStoreFuture<'_, bool> {
+        fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
             Box::pin(std::future::ready(Ok(false)))
         }
-        fn channels(&self, _: u64) -> ChannelStoreFuture<'_, Vec<Channel>> {
+        fn helpers(&self, _: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+            Box::pin(std::future::ready(Ok(Vec::new())))
+        }
+        fn replicas(&self, _: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
             Box::pin(std::future::ready(Ok(Vec::new())))
         }
         fn link_channel(
@@ -1269,9 +1637,9 @@ mod tests {
         }
     }
 
-    fn fake_channel(status: ChannelStatus, peer_role: SenderKind) -> Channel {
-        Channel {
-            id: ChannelId(1),
+    fn fake_channel(status: ChannelStatus, peer_role: SenderKind) -> ChannelRecord {
+        ChannelRecord::Helper(HelperChannel {
+            channel_id: ChannelId(1),
             transport: TransportProtocol {
                 uri: "https://example.com".to_owned(),
                 protocol: 0,
@@ -1280,8 +1648,7 @@ mod tests {
             status,
             created_at: 1_700_000_000,
             peer_role,
-            replica_id: None,
-        }
+        })
     }
 
     fn run_async<F: std::future::Future<Output = ()>>(f: F) {
@@ -1342,6 +1709,149 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(err, Error::ChannelAlreadyPaired { .. }));
+        });
+    }
+}
+
+/// D6: no two members of a group may share a `replica_id`.
+#[cfg(test)]
+mod replica_id_conflict_tests {
+    use crate::protocol::test::{InMemChannelStore, InMemSecretStore, run_async};
+    use crate::protocol::types::{ChannelRecord, ChannelStatus, ReplicaMember, ReplicaRole};
+    use crate::protocol::{DeRecChannelStore, DeRecSecretStore, SecretKind, SecretValue};
+    use crate::types::{ChannelId, ReplicaId};
+
+    const SECRET_ID: u64 = 0xD6;
+    const GROUP: ChannelId = ChannelId(5001);
+    const PAIRING: ChannelId = ChannelId(77);
+
+    async fn seed_member(channels: &mut InMemChannelStore, id: u64, channel_id: ChannelId) {
+        channels
+            .save(
+                SECRET_ID,
+                ChannelRecord::Replica(ReplicaMember {
+                    channel_id,
+                    replica_id: ReplicaId(id),
+                    transport: derec_proto::TransportProtocol {
+                        uri: "https://peer.example".to_owned(),
+                        protocol: derec_proto::Protocol::Https as i32,
+                    },
+                    communication_info: std::collections::HashMap::new(),
+                    role: ReplicaRole::Source,
+                    status: ChannelStatus::Paired,
+                    created_at: 0,
+                }),
+            )
+            .await
+            .expect("seed member");
+    }
+
+    /// The roster carries this device's own row, so a peer announcing our own
+    /// id collides — the common case, since both ends of a first pairing are
+    /// usually configured by one person.
+    #[test]
+    fn our_own_id_counts_as_taken() {
+        run_async(async {
+            let mut channels = InMemChannelStore::default();
+            seed_member(&mut channels, 1001, GROUP).await;
+
+            assert!(
+                super::replica_id_is_taken(&channels, SECRET_ID, 1001)
+                    .await
+                    .expect("check"),
+                "a peer announcing our own id must be refused"
+            );
+            assert!(
+                !super::replica_id_is_taken(&channels, SECRET_ID, 1002)
+                    .await
+                    .expect("check"),
+                "a distinct id is free"
+            );
+        });
+    }
+
+    /// A device not yet in a group created its own row during this handshake,
+    /// pointing at a channel that is about to disappear. Abandoning must take
+    /// it with them, or a later publish resolves the group to a dead channel.
+    #[test]
+    fn abandoning_a_first_pairing_removes_the_row_it_created() {
+        run_async(async {
+            let mut channels = InMemChannelStore::default();
+            let mut secrets = InMemSecretStore::default();
+            seed_member(&mut channels, 1001, PAIRING).await;
+            secrets
+                .save(SECRET_ID, PAIRING, SecretValue::SharedKey([0x22; 32]))
+                .await
+                .expect("seed key");
+
+            super::abandon_pairing(&mut channels, &mut secrets, SECRET_ID, PAIRING, Some(1001))
+                .await
+                .expect("abandon succeeds");
+
+            assert!(
+                channels
+                    .replicas(SECRET_ID)
+                    .await
+                    .expect("roster")
+                    .is_empty(),
+                "the row this pairing created must not outlive it"
+            );
+        });
+    }
+
+    /// A device already in a group keeps its identity: the failed pairing has
+    /// no claim on it, and removing it would evict the device from a group it
+    /// legitimately belongs to.
+    #[test]
+    fn abandoning_keeps_an_existing_group_membership() {
+        run_async(async {
+            let mut channels = InMemChannelStore::default();
+            let mut secrets = InMemSecretStore::default();
+            seed_member(&mut channels, 1001, GROUP).await;
+            seed_member(&mut channels, 1002, GROUP).await;
+
+            super::abandon_pairing(&mut channels, &mut secrets, SECRET_ID, PAIRING, Some(1001))
+                .await
+                .expect("abandon succeeds");
+
+            let roster = channels.replicas(SECRET_ID).await.expect("roster");
+            assert_eq!(
+                roster.len(),
+                2,
+                "an established group survives a failed pairing attempt"
+            );
+        });
+    }
+
+    /// The transient pairing channel and its key go, whichever case applies.
+    #[test]
+    fn abandoning_clears_the_pairing_channel() {
+        run_async(async {
+            let mut channels = InMemChannelStore::default();
+            let mut secrets = InMemSecretStore::default();
+            secrets
+                .save(
+                    SECRET_ID,
+                    PAIRING,
+                    SecretValue::PairingSecret(
+                        crate::protocol::types::PairingKeyMaterial::from_bytes(vec![0x01, 0x02]),
+                    ),
+                )
+                .await
+                .expect("seed pairing secret");
+
+            super::abandon_pairing(&mut channels, &mut secrets, SECRET_ID, PAIRING, Some(1001))
+                .await
+                .expect("abandon succeeds");
+
+            assert!(
+                secrets
+                    .load(SECRET_ID, PAIRING, SecretKind::PairingSecret)
+                    .await
+                    .expect("load")
+                    .is_none(),
+                "the pairing secret must not survive an abandoned handshake"
+            );
         });
     }
 }

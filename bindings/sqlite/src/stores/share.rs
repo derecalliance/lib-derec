@@ -29,7 +29,7 @@ impl DeRecShareStore for SqliteShareStore {
         let result = if versions.is_empty() {
             let mut stmt = conn
                 .prepare(
-                    "SELECT share_secret_id, version, replica_id, bytes FROM shares \
+                    "SELECT share_secret_id, version, bytes FROM shares \
                      WHERE secret_id = ?1 AND channel_id = ?2",
                 )
                 .expect("share load prepare failed");
@@ -43,7 +43,7 @@ impl DeRecShareStore for SqliteShareStore {
         } else {
             let placeholders = vec!["?"; versions.len()].join(", ");
             let sql = format!(
-                "SELECT share_secret_id, version, replica_id, bytes FROM shares \
+                "SELECT share_secret_id, version, bytes FROM shares \
                  WHERE secret_id = ? AND channel_id = ? AND version IN ({placeholders})"
             );
             let mut stmt = conn.prepare(&sql).expect("share load prepare failed");
@@ -83,7 +83,7 @@ impl DeRecShareStore for SqliteShareStore {
             }
             (
                 format!(
-                    "SELECT share_secret_id, version, replica_id, bytes FROM shares \
+                    "SELECT share_secret_id, version, bytes FROM shares \
                      WHERE secret_id = ? AND channel_id IN ({cid_placeholders})"
                 ),
                 p,
@@ -100,7 +100,7 @@ impl DeRecShareStore for SqliteShareStore {
             }
             (
                 format!(
-                    "SELECT share_secret_id, version, replica_id, bytes FROM shares \
+                    "SELECT share_secret_id, version, bytes FROM shares \
                      WHERE secret_id = ? AND channel_id IN ({cid_placeholders}) \
                      AND version IN ({ver_placeholders})"
                 ),
@@ -130,7 +130,7 @@ impl DeRecShareStore for SqliteShareStore {
         let conn = lock(&self.connection);
         let cid_placeholders = vec!["?"; channel_ids.len()].join(", ");
         let sql = format!(
-            "SELECT share_secret_id, version, replica_id, bytes FROM shares \
+            "SELECT share_secret_id, version, bytes FROM shares \
              WHERE secret_id = ? AND channel_id IN ({cid_placeholders})"
         );
         let mut stmt = conn.prepare(&sql).expect("load_all prepare failed");
@@ -173,16 +173,15 @@ impl DeRecShareStore for SqliteShareStore {
         );
         let conn = lock(&self.connection);
         conn.execute(
-            "INSERT INTO shares (secret_id, channel_id, version, replica_id, share_secret_id, bytes) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(secret_id, channel_id, version, COALESCE(replica_id, -1)) DO UPDATE SET
+            "INSERT INTO shares (secret_id, channel_id, version, share_secret_id, bytes) \
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(secret_id, channel_id, version) DO UPDATE SET
                  share_secret_id = excluded.share_secret_id,
                  bytes           = excluded.bytes",
             rusqlite::params![
                 u64_to_sql(secret_id),
                 u64_to_sql(channel_id.0),
                 share.version as i64,
-                share.replica_id.map(u64_to_sql),
                 u64_to_sql(share.secret_id),
                 share.bytes,
             ],
@@ -210,8 +209,7 @@ fn map_share_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Share> {
     Ok(Share {
         secret_id: sql_to_u64(row.get::<_, i64>(0)?),
         version: row.get::<_, i64>(1)? as u32,
-        replica_id: row.get::<_, Option<i64>>(2)?.map(sql_to_u64),
-        bytes: row.get::<_, Vec<u8>>(3)?,
+        bytes: row.get::<_, Vec<u8>>(2)?,
     })
 }
 

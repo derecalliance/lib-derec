@@ -74,7 +74,7 @@ pub struct ExtractResult {
 /// let channel_id = ChannelId(42);
 /// let shared_key = [7u8; 32];
 ///
-/// let result = request::produce(channel_id, "no longer needed", &shared_key, None)
+/// let result = request::produce(channel_id, "no longer needed", &shared_key, None, None)
 ///     .expect("failed to build unpair request");
 ///
 /// assert!(!result.envelope.is_empty());
@@ -83,11 +83,17 @@ pub struct ExtractResult {
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0, memo_len = memo.len()))
 )]
+/// `replica_id` names the departing member on the replica path and MUST be
+/// absent on the owner ↔ helper path — its presence is what tells the receiver
+/// which operation this is. A helper channel serves one peer, so unpairing it
+/// deletes the channel; a replica group shares one channel, so removal edits a
+/// member row and this says which.
 pub fn produce(
     channel_id: ChannelId,
     memo: &str,
     shared_key: &SharedKey,
     reply_to: Option<derec_proto::TransportProtocol>,
+    replica_id: Option<u64>,
 ) -> Result<ProduceResult, crate::Error> {
     let timestamp = current_timestamp();
 
@@ -95,6 +101,7 @@ pub fn produce(
         memo: memo.to_owned(),
         timestamp: Some(timestamp),
         reply_to,
+        replica_id,
     };
 
     let envelope = DeRecMessageBuilder::channel()
@@ -169,7 +176,7 @@ pub fn produce(
 /// let shared_key = [7u8; 32];
 ///
 /// let request::ProduceResult { envelope } =
-///     request::produce(channel_id, "no longer needed", &shared_key, None)
+///     request::produce(channel_id, "no longer needed", &shared_key, None, None)
 ///         .expect("failed to build unpair request");
 ///
 /// let request::ExtractResult { request } =

@@ -92,12 +92,13 @@ func TestDecodeEvents_ReplicaSecretReceived(t *testing.T) {
 				{"id": [9,9], "name": "n1", "data": [10,11]}
 			],
 			"replicas": {
-				"replicas": [
-					{"channel_id": "21", "transport_uri": "https://r1", "communication_info": {}, "replica_id": "0xCAFE", "sender_kind": 4}
+				"channel_id": "21",
+				"members": [
+					{"replica_id": "48879", "transport_uri": "https://src", "role": "Source", "communication_info": {}},
+					{"replica_id": "0xCAFE", "transport_uri": "https://r1", "role": "Destination", "communication_info": {}}
 				],
 				"shared_key": [1,2,3,4]
-			},
-			"owner_replica_id": "48879"
+			}
 		},
 		"shares": [
 			{"channel_id": "1", "committed_share": [5,6,7]}
@@ -129,16 +130,28 @@ func TestDecodeEvents_ReplicaSecretReceived(t *testing.T) {
 	if ev.Secret.Replicas == nil {
 		t.Fatal("expected non-nil Replicas")
 	}
-	if len(ev.Secret.Replicas.Replicas) != 1 ||
-		ev.Secret.Replicas.Replicas[0].ReplicaID != "0xCAFE" ||
-		ev.Secret.Replicas.Replicas[0].SenderKind != 4 {
-		t.Fatalf("Replicas: got %+v", ev.Secret.Replicas.Replicas)
+	if ev.Secret.Replicas.ChannelID != "21" {
+		t.Fatalf("group channel_id: got %q", ev.Secret.Replicas.ChannelID)
+	}
+	if len(ev.Secret.Replicas.Members) != 2 {
+		t.Fatalf("Members: got %+v", ev.Secret.Replicas.Members)
+	}
+	// The roster names its source by role rather than a separate field.
+	var sources []string
+	for _, m := range ev.Secret.Replicas.Members {
+		if m.Role == "Source" {
+			sources = append(sources, m.ReplicaID)
+		}
+	}
+	if len(sources) != 1 || sources[0] != "48879" {
+		t.Fatalf("roster must name exactly one source, got %v", sources)
+	}
+	if ev.Secret.Replicas.Members[1].ReplicaID != "0xCAFE" ||
+		ev.Secret.Replicas.Members[1].Role != "Destination" {
+		t.Fatalf("destination member: got %+v", ev.Secret.Replicas.Members[1])
 	}
 	if string(ev.Secret.Replicas.SharedKey) != string([]byte{1, 2, 3, 4}) {
 		t.Fatalf("group shared_key: got %v", ev.Secret.Replicas.SharedKey)
-	}
-	if ev.Secret.OwnerReplicaID != "48879" {
-		t.Fatalf("OwnerReplicaID: got %q", ev.Secret.OwnerReplicaID)
 	}
 	if len(ev.Shares) != 1 || ev.Shares[0].ChannelID != "1" ||
 		string(ev.Shares[0].CommittedShare) != string([]byte{5, 6, 7}) {
@@ -314,14 +327,13 @@ func TestDecodeEvents_SecretRecovered(t *testing.T) {
 		"type": "SecretRecovered",
 		"secret": {
 			"helpers": [],
-			"secrets": [{"id": [1], "name": "n", "data": [2]}],
-			"owner_replica_id": "7"
+			"secrets": [{"id": [1], "name": "n", "data": [2]}]
 		}
 	}`)
 	if ev.Type != EventTypeSecretRecovered {
 		t.Fatalf("Type: got %q", ev.Type)
 	}
-	if ev.Secret == nil || ev.Secret.OwnerReplicaID != "7" || len(ev.Secret.Secrets) != 1 {
+	if ev.Secret == nil || len(ev.Secret.Secrets) != 1 {
 		t.Fatalf("Secret: got %+v", ev.Secret)
 	}
 	// SecretRecovered carries no channel_id in wire.rs.

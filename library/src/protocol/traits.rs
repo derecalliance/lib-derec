@@ -4,8 +4,8 @@
 use super::error::{ChannelStoreError, SecretStoreError, ShareStoreError, StateStoreError};
 use crate::Result;
 use crate::protocol::types::{
-    Channel, MissingPolicy, SecretKind, SecretValue, Share, StateItem, StateKey, StateKind,
-    UserSecrets,
+    ChannelQuery, ChannelRecord, HelperChannel, MissingPolicy, ReplicaMember, SecretKind,
+    SecretValue, Share, StateItem, StateKey, StateKind, UserSecrets,
 };
 use crate::types::ChannelId;
 use derec_proto::TransportProtocol;
@@ -153,18 +153,10 @@ pub trait DeRecSecretStore {
 
 /// Storage backend for paired channels.
 ///
-/// A [`Channel`] is the post-pairing representation of a peer relationship,
-/// retaining only the fields needed for ongoing protocol operations — see
-/// [`Channel`] for the per-field documentation. The full
-/// [`derec_proto::ContactMessage`] — which carries ephemeral cryptographic
-/// material — is discarded after pairing.
-///
-/// # Implementor notes
-///
-/// - [`load`](DeRecChannelStore::load) returns `Ok(None)` when no channel
-///   exists for the given ID.
-/// - [`save`](DeRecChannelStore::save) silently replaces any previously stored
-///   channel with the same ID.
+/// Holds two kinds of record, keyed differently: [`HelperChannel`] by
+/// `(secret_id, channel_id)` and [`ReplicaMember`] by
+/// `(secret_id, replica_id)`. Because the keys differ, an implementation may
+/// back each kind with its own table.
 ///
 /// # Channel linking
 ///
@@ -181,34 +173,86 @@ pub trait DeRecSecretStore {
 ///
 /// Same as [`DeRecSecretStore`]; methods return [`ChannelStoreFuture`].
 pub trait DeRecChannelStore {
-    /// Load the [`Channel`] for `(secret_id, channel_id)`.
+    /// Load the record addressed by `query`, or `Ok(None)` when none exists.
     ///
-    /// `secret_id` partitions storage so one backend can serve many
-    /// secrets on the same device. Returns `Ok(None)` when no channel
-    /// exists for this partition key.
+    /// The query is typed because the two kinds are keyed differently:
+    /// [`HelperChannel`] by `(secret_id, channel_id)`, [`ReplicaMember`] by
+    /// `(secret_id, replica_id)` — every member of a group shares one
+    /// `channel_id`, so it cannot identify them.
     fn load(
         &self,
         secret_id: u64,
-        channel_id: ChannelId,
-    ) -> ChannelStoreFuture<'_, Option<Channel>>;
+        query: ChannelQuery,
+    ) -> ChannelStoreFuture<'_, Option<ChannelRecord>>;
 
-    /// Persist a [`Channel`] under `secret_id`. The channel ID is taken
-    /// from [`Channel::id`]. Replaces any previously stored channel for
-    /// the same `(secret_id, channel_id)`.
-    fn save(&mut self, secret_id: u64, channel: Channel) -> ChannelStoreFuture<'_, ()>;
+    /// Persist a record, replacing any entry with the same key.
+    fn save(&mut self, secret_id: u64, record: ChannelRecord) -> ChannelStoreFuture<'_, ()>;
 
-    /// Remove the channel for `(secret_id, channel_id)`. Returns `true`
-    /// when an entry was removed, `false` when none existed.
-    fn remove(&mut self, secret_id: u64, channel_id: ChannelId) -> ChannelStoreFuture<'_, bool>;
+    /// Remove the record addressed by `query`.
+    ///
+    /// Removing one [`ChannelQuery::Replica`] removes **that member only** —
+    /// the group channel and every other member survive.
+    fn remove(&mut self, secret_id: u64, query: ChannelQuery) -> ChannelStoreFuture<'_, bool>;
 
-    /// Return every channel stored under `secret_id`. Used by the
-    /// protocol to enumerate paired peers when building the secret
-    /// and when fanning out broadcast flows.
-    fn channels(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<Channel>>;
+    /// Every helper channel stored under `secret_id`.
+    fn helpers(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>>;
 
-    /// Link two channels under `secret_id` as belonging to the same
-    /// Owner identity. The relation is **undirected, idempotent, and
-    /// transitive** within the partition.
+    /// Every replica-group member, **including this device's own row**.
+    /// Callers fanning out exclude themselves by [`ReplicaId`].
+    ///
+    /// # Order selects the successor when the source leaves
+    ///
+    /// The returned order is otherwise insignificant, with one exception that
+    /// makes it worth defining deliberately.
+    ///
+    /// A replica group has exactly one member holding
+    /// [`crate::protocol::types::ReplicaRole::Source`]. When that member is
+    /// removed, a successor must be chosen, and the protocol takes **the first
+    /// element of this list that is neither the departing member nor itself
+    /// leaving**. Implementing `replicas` is therefore how an application
+    /// chooses its own succession policy — order by an `added_at` column, by a
+    /// user-chosen preference, by whatever a backend says — without the
+    /// protocol having to model one.
+    ///
+    /// The choice is read **once**, on the single device that runs the removal,
+    /// and is then published in the roster as
+    /// [`crate::protocol::types::ReplicaInfo::role`]. Every other member reads
+    /// the result rather than repeating the decision, so implementations on
+    /// different devices need not — and generally will not — agree on order.
+    /// Nothing else in the protocol consults it.
+    ///
+    /// An implementation that returns an arbitrary order is **correct**; it
+    /// simply delegates the choice to whatever its storage happens to yield.
+    /// Note that this is the default for the usual backings: `HashMap`
+    /// iteration is unspecified and varies between runs, and so is a SQL
+    /// `SELECT` with no `ORDER BY`. Add an explicit ordering to make the
+    /// succession predictable.
+    ///
+    /// A source that is the group's only member leaves no successor, and the
+    /// group dissolves with it.
+    fn replicas(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>>;
+
+    /// Link two channels as belonging to the same Owner identity.
+    ///
+    /// # Scope: the owner ↔ helper pair only
+    ///
+    /// The graph exists for one situation. An owner that lost its state
+    /// re-pairs with a helper on a *fresh* channel, and the helper must still
+    /// find the shares it stored under the old one. Linking the two lets
+    /// [`Self::linked_channels`] reach them.
+    ///
+    /// **The library never writes links.** It is the helper-side application
+    /// that recognises a returning owner — an out-of-band judgement the
+    /// protocol cannot make — and records the link. The library only reads
+    /// the graph, in exactly two places, both helper-side responders:
+    /// answering `GetSecretIdsVersions` and answering `GetShare`.
+    ///
+    /// **Replica groups do not use it.** Members share one `channel_id` and
+    /// are identified by [`ReplicaId`], so there is nothing to link: a member
+    /// that changes channel during an admission handover keeps its row, and a
+    /// catch-up resolves peers through the roster. The replica paths never
+    /// consult this graph, and wiring them into it would conflate two
+    /// unrelated notions of "the same peer".
     fn link_channel(
         &mut self,
         secret_id: u64,
@@ -216,9 +260,10 @@ pub trait DeRecChannelStore {
         b: ChannelId,
     ) -> ChannelStoreFuture<'_, ()>;
 
-    /// Return the full set of channels linked to `channel_id` under
-    /// `secret_id`, **including `channel_id` itself**. An unlinked
-    /// channel returns `[channel_id]`.
+    /// Every channel linked to `channel_id`, **including itself**.
+    ///
+    /// Read only on the helper side, to reach shares stored under a channel
+    /// the owner has since replaced. See [`Self::link_channel`] for scope.
     fn linked_channels(
         &self,
         secret_id: u64,
@@ -301,32 +346,22 @@ pub trait DeRecShareStore {
 
     /// Persist a share for `(secret_id, channel_id)`.
     ///
-    /// # Conceptual storage key
+    /// # Storage key
     ///
-    /// The protocol considers the full storage key to be
-    /// `(secret_id, channel_id, share.version, share.replica_id)`.
-    /// Replica destinations reuse the source's channel shared key with
-    /// helpers (the key travels in the `ReplicaSecretPayload`), so
-    /// two replicas writing the same `(secret_id, channel_id, version)`
-    /// look cryptographically identical at the wire layer — only
-    /// `share.replica_id` separates them. A naive helper that ignored
-    /// `replica_id` and overwrote on the three-tuple key would silently
-    /// lose one of the two writes.
+    /// `(secret_id, channel_id, share.version)`. Exactly one share
+    /// exists per key — a version has exactly one writer.
     ///
-    /// # Implementation freedom
+    /// The protocol enforces that before calling here: a second write
+    /// at an existing version carrying **different** content is refused
+    /// with [`derec_proto::StatusEnum::VersionConflict`] and never
+    /// reaches the store, while a byte-identical re-send is an
+    /// idempotent retry. Implementations therefore overwrite on the
+    /// three-tuple key and need no notion of who wrote a version.
     ///
-    /// The trait does not dictate how implementations represent the
-    /// `replica_id` discriminator (separate column, composite primary
-    /// key, write-time conflict log, etc.). The contract is:
-    ///
-    /// - Writes from distinct `replica_id`s for the same
-    ///   `(secret_id, channel_id, version)` MUST both survive — neither
-    ///   may silently overwrite the other.
-    /// - A write that matches an existing entry on all four fields
-    ///   replaces it (idempotent re-send).
-    /// - `load`, `load_many`, and `load_all` return every distinct
-    ///   `(version, replica_id)` entry matching the requested filter;
-    ///   the application performs any per-application coalescing.
+    /// Helpers in particular hold no replica identity: `replica_id` is
+    /// omitted from helper-bound requests entirely, so there is no
+    /// writer to disambiguate. See
+    /// `StoreShareRequestMessage.replicaId`.
     ///
     /// `share.secret_id` is denormalized metadata and must match the
     /// partition key `secret_id` — implementations may assert this.

@@ -95,8 +95,8 @@ pub(in crate::protocol) async fn start<
     secret_id: u64,
     reply_to: Option<derec_proto::TransportProtocol>,
 ) -> Result<Vec<DeRecEvent>> {
-    let all_channels = channel_store.channels(secret_id).await?;
-    let all_channel_ids: Vec<ChannelId> = all_channels.iter().map(|c| c.id).collect();
+    let all_channels = channel_store.helpers(secret_id).await?;
+    let all_channel_ids: Vec<ChannelId> = all_channels.iter().map(|c| c.channel_id).collect();
 
     let channel_ids = match target {
         Target::All => all_channel_ids,

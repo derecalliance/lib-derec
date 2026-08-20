@@ -28,11 +28,61 @@ export interface SecretStore {
   remove(secretId: string, channelId: string, kind: 0 | 1 | 2): Promise<void>;
 }
 
+/**
+ * Channel-record persistence.
+ *
+ * A record is addressed by `(channelId, replicaId)`. A `replicaId` of `"0"` —
+ * the value the protocol reserves as "absent" — addresses the helper channel
+ * at `channelId`.
+ *
+ * Any other value addresses that member of the replica group, and the member
+ * is keyed by **`replicaId` alone**. The accompanying `channelId` is context,
+ * not part of the key: a member moves between channels during an admission
+ * handover while remaining the same member, and a lookup that required both to
+ * match would miss it exactly when the move needs to be observed. Keep two
+ * maps — helpers by `channelId`, members by `replicaId` — not one keyed by the
+ * pair.
+ *
+ * `load`/`save` bytes are a JSON-encoded `ChannelRecord`: an externally
+ * tagged union carrying exactly one of `Helper` or `Replica`. `listHelpers`
+ * and `listReplicas` return a JSON-encoded array of the corresponding
+ * records. All payloads are opaque to the application — persist them
+ * verbatim.
+ */
 export interface ChannelStore {
-  load(secretId: string, channelId: string): Promise<Uint8Array | null | undefined>;
-  save(secretId: string, channelId: string, bytes: Uint8Array): Promise<void>;
-  listChannels(secretId: string): Promise<string[]>;
-  remove(secretId: string, channelId: string): Promise<boolean>;
+  load(
+    secretId: string,
+    channelId: string,
+    replicaId: string,
+  ): Promise<Uint8Array | null | undefined>;
+  save(
+    secretId: string,
+    channelId: string,
+    replicaId: string,
+    bytes: Uint8Array,
+  ): Promise<void>;
+  remove(secretId: string, channelId: string, replicaId: string): Promise<boolean>;
+  /** JSON array of the helper channels stored under `secretId`. */
+  listHelpers(secretId: string): Promise<Uint8Array | null | undefined>;
+  /**
+   * JSON array of the replica-group members stored under `secretId`,
+   * including this device's own row.
+   *
+   * The order is significant in exactly one situation. A group has one member
+   * holding the `Source` role; when it is removed, the protocol promotes the
+   * first element of this array that is neither the departing member nor
+   * itself leaving. Ordering this array is therefore how an application
+   * chooses its succession policy. The choice is read once, on the single
+   * device running the removal, and is then published in the roster, so
+   * implementations on different devices need not agree on order. Nothing else
+   * consults it.
+   *
+   * Returning an arbitrary order is correct and simply delegates the choice to
+   * the storage — note that a SQL `SELECT` without `ORDER BY` and `Map`
+   * insertion order after arbitrary edits are both effectively arbitrary.
+   * Order explicitly to make succession predictable.
+   */
+  listReplicas(secretId: string): Promise<Uint8Array | null | undefined>;
   linkChannel(
     secretId: string,
     channelId: string,
@@ -110,7 +160,7 @@ export interface StateStore {
     keyJson: Uint8Array,
   ): Promise<Uint8Array | null | undefined>;
   remove(secretId: string, keyJson: Uint8Array): Promise<boolean>;
-  loadAll(secretId: string, kind: 0 | 1 | 2 | 3): Promise<Uint8Array[]>;
+  loadAll(secretId: string, kind: 0 | 1 | 2 | 3 | 4): Promise<Uint8Array[]>;
 }
 
 export interface Transport {
@@ -156,6 +206,15 @@ export enum FlowKind {
   RecoverSecret = 4,
   Unpair = 5,
   UpdateChannelInfo = 6,
+  /** Ask the replica group whether this device is behind, and catch up if it
+   *  is. Replica-only, and takes no parameters — the group and this device's
+   *  own version both come from the stores. */
+  SyncCheck = 7,
+  /** Remove a member from the replica group. Replica-only. Naming this device
+   *  is a voluntary departure; naming another is an eviction. Params:
+   *  `{ replica_id: string; memo?: string }` — `replica_id` is a decimal
+   *  string so ids above 2^53 survive JS number handling. */
+  RemoveReplica = 8,
 }
 
 export type UnpairAck = "required" | "not_required";
@@ -253,6 +312,47 @@ export type DeRecEvent =
   | { type: "ShareConfirmed"; channel_id: string; version: number }
   | { type: "ShareRejected"; channel_id: string; version: number; status: number; memo: string }
   | { type: "SharingComplete"; version: number; confirmed_count: number; failed_count: number; threshold_met: boolean }
+  /** A group member refused a secret sync. Keyed by `replica_id`, not
+   *  `channel_id`: every member answers on the one group channel. A
+   *  `VERSION_CONFLICT` status means the round must be resolved and
+   *  republished at a new version. */
+  | {
+      type: "ReplicaSyncRejected";
+      replica_id: string;
+      secret_id: string;
+      version: number;
+      status: number;
+      memo: string;
+    }
+  /** A secret sync could not be delivered to a member at all — distinct from
+   *  `ReplicaSyncRejected`, which is the member answering "no". */
+  | { type: "ReplicaSyncFailed"; replica_id: string; version: number; reason: string }
+  /** A member left the group and its roster row was dropped. Fires on the
+   *  members that remain. */
+  | { type: "ReplicaRemoved"; replica_id: string }
+  /** The group's source role moved to another member because the previous
+   *  source is leaving. Fires on the device that chose the successor — which
+   *  it does by the order its channel store returns members in — and on the
+   *  successor itself when the roster promoting it arrives. */
+  | { type: "ReplicaSourceChanged"; replica_id: string }
+  /** This device left the group and dropped its whole `secret_id` partition —
+   *  group channel, helper channels, shares, secrets and the snapshot. Fires
+   *  only once it was told to leave *and* has since seen a roster excluding
+   *  it; absence alone never destroys a copy of the secret. */
+  | { type: "SelfRemovedFromGroup"; version: number }
+  /** A replica catch-up finished. `fetched_from` is absent when this device
+   *  was already current, in which case no hydration event follows. */
+  | {
+      type: "SyncCheckComplete";
+      local_version: number;
+      group_version: number;
+      fetched_from?: string;
+    }
+  /** The replica leg of a publishing round finished. Reported separately from
+   *  `SharingComplete`: replicas are best-effort, so a member in `behind` does
+   *  not fail the round. `behind` is the application's retry list — the
+   *  library keeps no durable per-member sync state. */
+  | { type: "ReplicaSyncComplete"; version: number; synced: string[]; behind: string[] }
   | { type: "ShareVerified"; channel_id: string; version: number }
   | {
       type: "SecretsDiscovered";
@@ -265,9 +365,8 @@ export type DeRecEvent =
   /** Recovery completed — the typed `Secret` snapshot the owner
    *  originally protected. Mirrors `ReplicaSecretReceived.secret`:
    *  `secrets` is the user-facing `Vec<UserSecret>` the application
-   *  fed to `start(FlowKind.ProtectSecret)`; `helpers`, `replicas`
-   *  and `owner_replica_id` are the roster snapshot captured at
-   *  distribution time. The library handles the two-stage
+   *  fed to `start(FlowKind.ProtectSecret)`; `helpers` and `replicas`
+   *  are the roster snapshot captured at distribution time. The library handles the two-stage
    *  `DeRecSecret` → `Secret` protobuf decode internally. */
   | {
       type: "SecretRecovered";
@@ -284,20 +383,23 @@ export type DeRecEvent =
           data: Uint8Array;
         }>;
         /** Replica composite. Absent when this `secret_id` has no
-         *  replica setup. Carries the destination roster, the
-         *  per-helper share map, and the 32-byte group key. Required
-         *  by `restore` to rebuild replica channels without re-pairing. */
+         *  replica setup. Carries the full member roster, the one channel
+         *  they share, and the 32-byte group key. Required by `restore` to
+         *  rebuild replica state without re-pairing. */
         replicas?: {
-          replicas: Array<{
-            channel_id: string;
-            transport_uri: string;
-            communication_info: Record<string, string>;
+          /** The one channel every member is addressed on. */
+          channel_id: string;
+          /** Every member of the group, including the writer. Exactly one
+           *  carries `role: "Source"` — that member is where the secret
+           *  originated, which is why no separate owner field is needed. */
+          members: Array<{
             replica_id: string;
-            sender_kind: number;
+            transport_uri: string;
+            role: "Source" | "Destination";
+            communication_info: Record<string, string>;
           }>;
           shared_key: Uint8Array;
         };
-        owner_replica_id: string;
       };
     }
 
@@ -347,16 +449,68 @@ export type DeRecEvent =
         /** Replica composite. Absent when this `secret_id` has no
          *  replica setup. The same shape as `SecretRecovered.secret.replicas`. */
         replicas?: {
-          replicas: Array<{
-            channel_id: string;
-            transport_uri: string;
-            communication_info: Record<string, string>;
+          /** The one channel every member is addressed on. */
+          channel_id: string;
+          /** Every member of the group, including the writer. Exactly one
+           *  carries `role: "Source"` — that member is where the secret
+           *  originated, which is why no separate owner field is needed. */
+          members: Array<{
             replica_id: string;
-            sender_kind: number;
+            transport_uri: string;
+            role: "Source" | "Destination";
+            communication_info: Record<string, string>;
           }>;
           shared_key: Uint8Array;
         };
-        owner_replica_id: string;
+      };
+      shares: Array<{
+        channel_id: string;
+        committed_share: Uint8Array;
+      }>;
+    }
+  /** The first sync for a `secret_id` this device had no snapshot for —
+   *  the secret now exists here. Same payload as `ReplicaSecretReceived`,
+   *  which reports a later version of a secret the device already held.
+   *  Both are written to the stores by the library before the event is
+   *  delivered; the distinct type is what tells an application the set of
+   *  secrets on the device changed.
+   *
+   *  This is not a recovery: recovery reconstructs a secret from helper
+   *  shares and is driven by the application through `restore`. */
+  | {
+      type: "ReplicaSecretInstalled";
+      channel_id: string;
+      from_replica_id: string;
+      secret_id: string;
+      version: number;
+      secret: {
+        helpers: Array<{
+          channel_id: string;
+          transport_uri: string;
+          shared_key: Uint8Array;
+          communication_info: Record<string, string>;
+        }>;
+        secrets: Array<{
+          id: Uint8Array;
+          name: string;
+          data: Uint8Array;
+        }>;
+        /** Replica composite. Absent when this `secret_id` has no
+         *  replica setup. The same shape as `SecretRecovered.secret.replicas`. */
+        replicas?: {
+          /** The one channel every member is addressed on. */
+          channel_id: string;
+          /** Every member of the group, including the writer. Exactly one
+           *  carries `role: "Source"` — that member is where the secret
+           *  originated, which is why no separate owner field is needed. */
+          members: Array<{
+            replica_id: string;
+            transport_uri: string;
+            role: "Source" | "Destination";
+            communication_info: Record<string, string>;
+          }>;
+          shared_key: Uint8Array;
+        };
       };
       shares: Array<{
         channel_id: string;

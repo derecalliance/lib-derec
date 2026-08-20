@@ -115,6 +115,23 @@ pub enum Error {
         "replica id not configured: build the protocol with .with_replica_id(..) to enable replica flows"
     )]
     ReplicaIdNotConfigured,
+
+    /// A replica pairing named a `replica_id` already held by another member
+    /// of the group — including this device itself.
+    ///
+    /// The roster is keyed by `replica_id` and messages between members are
+    /// attributed by it, so two members sharing one would overwrite each
+    /// other's row and make every acknowledgement ambiguous. Raised before
+    /// fingerprint verification: there is no point asking a user to confirm a
+    /// pairing that cannot complete.
+    ///
+    /// `replica_id` is assigned by the application, so this is a
+    /// configuration fault — most often the same identity reused on two
+    /// devices. Resolution is the application's: assign a distinct id and
+    /// pair again. The protocol cannot choose, because it cannot know which
+    /// device is meant to keep the original.
+    #[error("replica id {replica_id} is already in use by another member of the group")]
+    ReplicaIdConflict { replica_id: u64 },
 }
 
 impl Error {

@@ -75,8 +75,9 @@ use crate::{
             ShareStoreFuture, StateStoreFuture, TransportFuture,
         },
         types::{
-            Channel, MissingPolicy, PairingKeyMaterial, SecretKind, SecretValue, Share, StateItem,
-            StateKey, StateKind, UserSecret, UserSecrets,
+            ChannelQuery, ChannelRecord, HelperChannel, MissingPolicy, PairingKeyMaterial,
+            ReplicaMember, SecretKind, SecretValue, Share, StateItem, StateKey, StateKind,
+            UserSecret, UserSecrets,
         },
     },
     types::ChannelId,
@@ -288,31 +289,97 @@ impl DeRecSecretStore for JsSecretStore {
 ///
 /// ```ts
 /// interface ChannelStore {
-///   load(channelId: string): Promise<Uint8Array | null>;
-///   save(channelId: string, bytes: Uint8Array): Promise<void>;
-///   listChannels(): Promise<string[]>;
-///   linkChannel(channelId: string, linkedChannelId: string): Promise<void>;
-///   linkedChannels(channelId: string): Promise<string[]>;
+///   load(secretId: string, channelId: string, replicaId: string): Promise<Uint8Array | null>;
+///   save(secretId: string, channelId: string, replicaId: string, bytes: Uint8Array): Promise<void>;
+///   remove(secretId: string, channelId: string, replicaId: string): Promise<boolean>;
+///   listHelpers(secretId: string): Promise<Uint8Array | null>;
+///   listReplicas(secretId: string): Promise<Uint8Array | null>;
+///   linkChannel(secretId: string, channelId: string, linkedChannelId: string): Promise<void>;
+///   linkedChannels(secretId: string, channelId: string): Promise<string[]>;
 /// }
 /// ```
 ///
-/// The bytes are JSON-encoded [`Channel`] records. `linkedChannels` returns the
-/// transitive closure of `channelId` (including `channelId` itself).
+/// A record is addressed by `(channelId, replicaId)`. A `replicaId` of `"0"` —
+/// the value [`crate::types::ReplicaId`] reserves as "absent" — addresses the
+/// helper channel at `channelId`.
+///
+/// Any other value addresses that member of the replica group, and the member
+/// is keyed by **`replicaId` alone**. The accompanying `channelId` is context,
+/// not part of the key: a member moves between channels during an admission
+/// handover while remaining the same member, and a lookup that required both
+/// to match would miss it exactly when the move needs to be observed. Backends
+/// therefore keep two maps — helpers by `channelId`, members by `replicaId` —
+/// not one keyed by the pair.
+///
+/// `load`/`save` bytes are a JSON-encoded [`ChannelRecord`]. `listHelpers` and
+/// `listReplicas` return a JSON array of [`HelperChannel`] and
+/// [`ReplicaMember`] respectively. `linkedChannels` returns the transitive
+/// closure of `channelId` (including `channelId` itself).
+///
+/// The order `listReplicas` returns is significant in exactly one situation —
+/// it selects the successor when the group's source is removed. See
+/// [`crate::protocol::DeRecChannelStore::replicas`] for the full contract.
 pub struct JsChannelStore(pub JsValue);
+
+/// Flatten a query into the `(channelId, replicaId)` string pair the JS
+/// interface takes. `replicaId == "0"` addresses the helper channel.
+fn query_key(query: ChannelQuery) -> (String, String) {
+    match query {
+        ChannelQuery::Helper { channel_id } => (channel_id.0.to_string(), "0".to_owned()),
+        ChannelQuery::Replica {
+            channel_id,
+            replica_id,
+        } => (channel_id.0.to_string(), replica_id.0.to_string()),
+    }
+}
+
+/// The address a record is stored at, derived from the record itself so a
+/// caller cannot save one under the wrong key.
+fn record_key(record: &ChannelRecord) -> (String, String) {
+    match record {
+        ChannelRecord::Helper(h) => (h.channel_id.0.to_string(), "0".to_owned()),
+        ChannelRecord::Replica(r) => (r.channel_id.0.to_string(), r.replica_id.0.to_string()),
+    }
+}
+
+/// Call a listing method and decode its JSON array. A `null`/`undefined` or
+/// empty buffer is an empty list, not an error.
+async fn list_records<T: serde::de::DeserializeOwned>(
+    obj: &JsValue,
+    method: &str,
+    secret_str: &str,
+) -> Result<Vec<T>, ChannelStoreError> {
+    let args = Array::new();
+    args.push(&JsValue::from_str(secret_str));
+    let promise_val =
+        call_method(obj, method, &args).map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
+    let value = resolve_promise(promise_val)
+        .await
+        .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
+    if value.is_null() || value.is_undefined() {
+        return Ok(Vec::new());
+    }
+    let bytes = Uint8Array::new(&value).to_vec();
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_slice(&bytes).map_err(|e| ChannelStoreError::Backend(box_err(e.to_string())))
+}
 
 impl DeRecChannelStore for JsChannelStore {
     fn load(
         &self,
         secret_id: u64,
-        channel_id: ChannelId,
-    ) -> ChannelStoreFuture<'_, Option<Channel>> {
+        query: ChannelQuery,
+    ) -> ChannelStoreFuture<'_, Option<ChannelRecord>> {
         let obj = self.0.clone();
         let secret_str = secret_id.to_string();
-        let channel_str = channel_id.0.to_string();
+        let (channel_str, replica_str) = query_key(query);
         Box::pin(async move {
             let args = Array::new();
             args.push(&JsValue::from_str(&secret_str));
             args.push(&JsValue::from_str(&channel_str));
+            args.push(&JsValue::from_str(&replica_str));
             let promise_val = call_method(&obj, "load", &args)
                 .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
             let value = resolve_promise(promise_val)
@@ -322,69 +389,27 @@ impl DeRecChannelStore for JsChannelStore {
                 return Ok(None);
             }
             let bytes = Uint8Array::new(&value).to_vec();
-            let channel: Channel = serde_json::from_slice(&bytes)
-                .map_err(|e| ChannelStoreError::Backend(box_err(e.to_string())))?;
-            Ok(Some(channel))
-        })
-    }
-
-    fn channels(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<Channel>> {
-        let obj = self.0.clone();
-        let secret_str = secret_id.to_string();
-        Box::pin(async move {
-            let args = Array::new();
-            args.push(&JsValue::from_str(&secret_str));
-            let promise_val = call_method(&obj, "listChannels", &args)
-                .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
-            let value = resolve_promise(promise_val)
-                .await
-                .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
-            let arr = Array::from(&value);
-
-            let mut result = Vec::with_capacity(arr.length() as usize);
-            for i in 0..arr.length() {
-                let item = arr.get(i);
-                let s = item.as_string().ok_or_else(|| {
-                    ChannelStoreError::Backend(box_err("channel id must be a string".to_string()))
-                })?;
-                let id = s
-                    .parse::<u64>()
-                    .map_err(|e| ChannelStoreError::Backend(box_err(e.to_string())))?;
-                let channel_id = ChannelId(id);
-
-                let load_args = Array::new();
-                load_args.push(&JsValue::from_str(&secret_str));
-                load_args.push(&JsValue::from_str(&s));
-                let load_promise = call_method(&obj, "load", &load_args)
-                    .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
-                let load_value = resolve_promise(load_promise)
-                    .await
-                    .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
-
-                if load_value.is_null() || load_value.is_undefined() {
-                    continue;
-                }
-                let bytes = Uint8Array::new(&load_value).to_vec();
-                let channel: Channel = serde_json::from_slice(&bytes)
-                    .map_err(|e| ChannelStoreError::Backend(box_err(e.to_string())))?;
-                debug_assert_eq!(channel.id, channel_id);
-                result.push(channel);
+            if bytes.is_empty() {
+                return Ok(None);
             }
-            Ok(result)
+            let record: ChannelRecord = serde_json::from_slice(&bytes)
+                .map_err(|e| ChannelStoreError::Backend(box_err(e.to_string())))?;
+            Ok(Some(record))
         })
     }
 
-    fn save(&mut self, secret_id: u64, channel: Channel) -> ChannelStoreFuture<'_, ()> {
+    fn save(&mut self, secret_id: u64, record: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
         let obj = self.0.clone();
         let secret_str = secret_id.to_string();
-        let channel_str = channel.id.0.to_string();
+        let (channel_str, replica_str) = record_key(&record);
         Box::pin(async move {
-            let bytes = serde_json::to_vec(&channel)
+            let bytes = serde_json::to_vec(&record)
                 .map_err(|e| ChannelStoreError::Backend(box_err(e.to_string())))?;
             let js_bytes = Uint8Array::from(bytes.as_slice());
             let args = Array::new();
             args.push(&JsValue::from_str(&secret_str));
             args.push(&JsValue::from_str(&channel_str));
+            args.push(&JsValue::from_str(&replica_str));
             args.push(&js_bytes);
             let promise_val = call_method(&obj, "save", &args)
                 .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
@@ -395,14 +420,15 @@ impl DeRecChannelStore for JsChannelStore {
         })
     }
 
-    fn remove(&mut self, secret_id: u64, channel_id: ChannelId) -> ChannelStoreFuture<'_, bool> {
+    fn remove(&mut self, secret_id: u64, query: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
         let obj = self.0.clone();
         let secret_str = secret_id.to_string();
-        let channel_str = channel_id.0.to_string();
+        let (channel_str, replica_str) = query_key(query);
         Box::pin(async move {
             let args = Array::new();
             args.push(&JsValue::from_str(&secret_str));
             args.push(&JsValue::from_str(&channel_str));
+            args.push(&JsValue::from_str(&replica_str));
             let promise_val = call_method(&obj, "remove", &args)
                 .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
             let value = resolve_promise(promise_val)
@@ -410,6 +436,18 @@ impl DeRecChannelStore for JsChannelStore {
                 .map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
             Ok(value.as_bool().unwrap_or(false))
         })
+    }
+
+    fn helpers(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+        let obj = self.0.clone();
+        let secret_str = secret_id.to_string();
+        Box::pin(async move { list_records(&obj, "listHelpers", &secret_str).await })
+    }
+
+    fn replicas(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
+        let obj = self.0.clone();
+        let secret_str = secret_id.to_string();
+        Box::pin(async move { list_records(&obj, "listReplicas", &secret_str).await })
     }
 
     fn link_channel(
@@ -514,22 +552,9 @@ fn share_from_js(item: &JsValue) -> Result<Share, ShareStoreError> {
     // `replicaId` is an optional decimal-string on the JS side
     // (matching `derec.replica_id` and `Channel.replicaId`). Missing /
     // null / empty string all map to `None`.
-    let replica_id_val = js_sys::Reflect::get(item, &"replicaId".into()).unwrap_or(JsValue::null());
-    let replica_id = if replica_id_val.is_null() || replica_id_val.is_undefined() {
-        None
-    } else {
-        replica_id_val.as_string().and_then(|s| {
-            if s.is_empty() {
-                None
-            } else {
-                s.parse::<u64>().ok()
-            }
-        })
-    };
     Ok(Share {
         secret_id,
         version,
-        replica_id,
         bytes,
     })
 }
@@ -908,6 +933,12 @@ impl From<&StateKey> for StateKeyRecord {
                 secret_id: None,
                 version: None,
             },
+            StateKey::PendingSyncCheck => Self {
+                kind: 4,
+                channel_id: None,
+                secret_id: None,
+                version: None,
+            },
             StateKey::SharingRound => Self {
                 kind: 3,
                 channel_id: None,
@@ -941,6 +972,26 @@ struct StateItemRecord {
     confirmed: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     failed: Option<Vec<String>>,
+    /// Replica-leg accounting, keyed by `replica_id`. Absent on rows written
+    /// before the leg existed, which decode as empty rather than failing —
+    /// an in-flight round predating the split simply has no member state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_replicas: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    synced_replicas: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    behind_replicas: Option<Vec<String>>,
+    /// Catch-up accounting: members still to answer, and what those that
+    /// have answered reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reported: Option<Vec<SyncCheckReport>>,
+}
+/// One member's answer in an in-flight catch-up. A nested record rather than
+/// a packed string so the pair stays self-describing for every binding.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SyncCheckReport {
+    replica_id: String,
+    version: u32,
 }
 
 impl From<&StateItem> for StateItemRecord {
@@ -960,6 +1011,10 @@ impl From<&StateItem> for StateItemRecord {
                 pending: None,
                 confirmed: None,
                 failed: None,
+                pending_replicas: None,
+                synced_replicas: None,
+                behind_replicas: None,
+                reported: None,
             },
             StateItem::PendingRecovery {
                 secret_id,
@@ -976,6 +1031,10 @@ impl From<&StateItem> for StateItemRecord {
                 pending: None,
                 confirmed: None,
                 failed: None,
+                pending_replicas: None,
+                synced_replicas: None,
+                behind_replicas: None,
+                reported: None,
             },
             StateItem::PendingUnpair {
                 channel_id,
@@ -991,27 +1050,96 @@ impl From<&StateItem> for StateItemRecord {
                 pending: None,
                 confirmed: None,
                 failed: None,
+                pending_replicas: None,
+                synced_replicas: None,
+                behind_replicas: None,
+                reported: None,
             },
-            StateItem::SharingRound {
-                version,
+            StateItem::PendingSyncCheck {
+                local_version,
                 pending,
-                confirmed,
-                failed,
+                reported,
                 started_at,
             } => Self {
-                kind: 3,
+                kind: 4,
                 channel_id: None,
                 secret_id: None,
-                version: Some(*version),
+                version: Some(*local_version),
                 started_at: Some(started_at.to_string()),
                 bytes: None,
                 shares: None,
-                pending: Some(pending.iter().map(|c| c.0.to_string()).collect()),
-                confirmed: Some(confirmed.iter().map(|c| c.0.to_string()).collect()),
-                failed: Some(failed.iter().map(|c| c.0.to_string()).collect()),
+                pending: None,
+                confirmed: None,
+                failed: None,
+                pending_replicas: Some(pending.iter().map(|r| r.0.to_string()).collect()),
+                synced_replicas: None,
+                behind_replicas: None,
+                reported: Some(
+                    reported
+                        .iter()
+                        .map(|(id, version)| SyncCheckReport {
+                            replica_id: id.0.to_string(),
+                            version: *version,
+                        })
+                        .collect(),
+                ),
+            },
+            StateItem::SharingRound(round) => Self {
+                kind: 3,
+                channel_id: None,
+                secret_id: None,
+                version: Some(round.version),
+                started_at: Some(round.started_at.to_string()),
+                bytes: None,
+                shares: None,
+                pending: Some(round.pending.iter().map(|c| c.0.to_string()).collect()),
+                confirmed: Some(round.confirmed.iter().map(|c| c.0.to_string()).collect()),
+                failed: Some(round.failed.iter().map(|c| c.0.to_string()).collect()),
+                pending_replicas: Some(
+                    round
+                        .pending_replicas
+                        .iter()
+                        .map(|r| r.0.to_string())
+                        .collect(),
+                ),
+                synced_replicas: Some(
+                    round
+                        .synced_replicas
+                        .iter()
+                        .map(|r| r.0.to_string())
+                        .collect(),
+                ),
+                behind_replicas: Some(
+                    round
+                        .behind_replicas
+                        .iter()
+                        .map(|r| r.0.to_string())
+                        .collect(),
+                ),
+                reported: None,
             },
         }
     }
+}
+
+/// Decode a replica-id set. An absent field is an empty set, not an error:
+/// the replica leg postdates the helper one, so a row written by an older
+/// build carries no member state and has none to recover.
+fn parse_replica_id_set(
+    raw: Option<Vec<String>>,
+    field: &str,
+) -> Result<std::collections::HashSet<crate::types::ReplicaId>, String> {
+    raw.unwrap_or_default()
+        .into_iter()
+        .map(|s| {
+            s.parse::<u64>()
+                .map_err(|e| format!("{field} entry not a decimal u64: {e}"))
+                .and_then(|v| {
+                    crate::types::ReplicaId::try_from(v)
+                        .map_err(|e| format!("{field} entry is not a valid replica_id: {e}"))
+                })
+        })
+        .collect()
 }
 
 fn parse_channel_id_set(
@@ -1105,11 +1233,51 @@ impl StateItemRecord {
                 let pending = parse_channel_id_set(self.pending, "pending")?;
                 let confirmed = parse_channel_id_set(self.confirmed, "confirmed")?;
                 let failed = parse_channel_id_set(self.failed, "failed")?;
-                Ok(StateItem::SharingRound {
-                    version,
+                let pending_replicas =
+                    parse_replica_id_set(self.pending_replicas, "pending_replicas")?;
+                let synced_replicas =
+                    parse_replica_id_set(self.synced_replicas, "synced_replicas")?;
+                let behind_replicas =
+                    parse_replica_id_set(self.behind_replicas, "behind_replicas")?;
+                Ok(StateItem::SharingRound(Box::new(
+                    crate::protocol::types::SharingRoundState {
+                        version,
+                        pending,
+                        confirmed,
+                        failed,
+                        pending_replicas,
+                        synced_replicas,
+                        behind_replicas,
+                        started_at,
+                    },
+                )))
+            }
+            4 => {
+                let local_version = self
+                    .version
+                    .ok_or_else(|| "PendingSyncCheck requires version".to_string())?;
+                let started_at = self
+                    .started_at
+                    .ok_or_else(|| "PendingSyncCheck requires started_at".to_string())?
+                    .parse::<u64>()
+                    .map_err(|e| format!("started_at not a decimal u64: {e}"))?;
+                let pending = parse_replica_id_set(self.pending_replicas, "pending_replicas")?;
+                let mut reported = std::collections::HashMap::new();
+                for entry in self.reported.unwrap_or_default() {
+                    let id = entry
+                        .replica_id
+                        .parse::<u64>()
+                        .map_err(|e| format!("reported.replica_id not a decimal u64: {e}"))
+                        .and_then(|v| {
+                            crate::types::ReplicaId::try_from(v)
+                                .map_err(|e| format!("reported.replica_id invalid: {e}"))
+                        })?;
+                    reported.insert(id, entry.version);
+                }
+                Ok(StateItem::PendingSyncCheck {
+                    local_version,
                     pending,
-                    confirmed,
-                    failed,
+                    reported,
                     started_at,
                 })
             }
@@ -1124,6 +1292,7 @@ fn state_kind_to_u32(kind: StateKind) -> u32 {
         StateKind::PendingRecovery => 1,
         StateKind::PendingUnpair => 2,
         StateKind::SharingRound => 3,
+        StateKind::PendingSyncCheck => 4,
     }
 }
 

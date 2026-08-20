@@ -91,6 +91,9 @@ pub fn produce(
     let message = GetSecretIdsVersionsRequestMessage {
         timestamp: Some(timestamp),
         reply_to,
+        // Owner ↔ helper exchange: the replica path sets this, this one
+        // never does. Its absence is what marks the message helper-bound.
+        replica_id: None,
     };
 
     let envelope = DeRecMessageBuilder::channel()

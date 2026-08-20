@@ -24,6 +24,16 @@ public enum FlowKind : uint
     RecoverSecret = 4,
     Unpair = 5,
     UpdateChannelInfo = 6,
+    /// <summary>
+    /// Ask the replica group whether this device is behind, and catch up if
+    /// it is. Replica-only; takes no parameters.
+    /// </summary>
+    SyncCheck = 7,
+    /// <summary>
+    /// Remove a member from the replica group. Replica-only. Naming this
+    /// device is a voluntary departure; naming another is an eviction.
+    /// </summary>
+    RemoveReplica = 8,
 }
 
 /// <summary>
@@ -358,30 +368,35 @@ public sealed record HelperInfo(
     [property: JsonPropertyName("shared_key")] byte[] SharedKey,
     [property: JsonPropertyName("communication_info")] Dictionary<string, string> CommunicationInfo);
 
+/// <summary>
+/// One member of the replica group. <c>Role</c> is <c>"Source"</c> or
+/// <c>"Destination"</c>; exactly one member of a group carries
+/// <c>"Source"</c>, and that member is the one the secret originated from.
+/// </summary>
 public sealed record ReplicaInfo(
-    [property: JsonPropertyName("channel_id")] string ChannelId,
-    [property: JsonPropertyName("transport_uri")] string TransportUri,
-    [property: JsonPropertyName("communication_info")] Dictionary<string, string> CommunicationInfo,
     [property: JsonPropertyName("replica_id")] string ReplicaId,
-    [property: JsonPropertyName("sender_kind")] int SenderKind);
+    [property: JsonPropertyName("transport_uri")] string TransportUri,
+    [property: JsonPropertyName("role")] string Role,
+    [property: JsonPropertyName("communication_info")] Dictionary<string, string> CommunicationInfo);
 
 public sealed record Secret(
     [property: JsonPropertyName("helpers")] IReadOnlyList<HelperInfo> Helpers,
-    [property: JsonPropertyName("secrets")] IReadOnlyList<UserSecret> Secrets,
-    [property: JsonPropertyName("owner_replica_id")] string OwnerReplicaId)
+    [property: JsonPropertyName("secrets")] IReadOnlyList<UserSecret> Secrets)
 {
     /// <summary>
-    /// Replica composite: the destination peers, the per-helper share map,
-    /// and the 32-byte group key. <c>null</c> when this <c>secret_id</c> has
-    /// no replica setup. Required by <see cref="DeRecProtocol.RestoreAsync"/>
-    /// to rebuild replica channels without re-pairing.
+    /// The replica group: every member (including the writer), the one
+    /// channel they share, and the 32-byte group key. <c>null</c> when this
+    /// <c>secret_id</c> has no replica setup. Required by
+    /// <see cref="DeRecProtocol.RestoreAsync"/> to rebuild replica state
+    /// without re-pairing.
     /// </summary>
     [JsonPropertyName("replicas")]
     public Replicas? Replicas { get; init; }
 }
 
 public sealed record Replicas(
-    [property: JsonPropertyName("replicas")] IReadOnlyList<ReplicaInfo> ReplicaList,
+    [property: JsonPropertyName("channel_id")] string ChannelId,
+    [property: JsonPropertyName("members")] IReadOnlyList<ReplicaInfo> Members,
     [property: JsonPropertyName("shared_key")] byte[] SharedKey);
 
 public sealed record ChannelShare(
@@ -397,6 +412,112 @@ public sealed record ReplicaSecretReceivedEvent : DeRecEvent
     public required uint Version { get; init; }
     public required Secret Secret { get; init; }
     public required IReadOnlyList<ChannelShare> Shares { get; init; }
+}
+
+/// <summary>
+/// A member left the group and its roster row was dropped. Fires on the
+/// members that remain.
+/// </summary>
+public sealed record ReplicaRemovedEvent : DeRecEvent
+{
+    public override string EventType => "ReplicaRemoved";
+    public required string ReplicaId { get; init; }
+}
+
+/// <summary>
+/// The group's source role moved to another member because the previous
+/// source is leaving. Fires on the device that chose the successor — which it
+/// does by the order its channel store returns members in — and on the
+/// successor itself when the roster promoting it arrives.
+/// </summary>
+public sealed record ReplicaSourceChangedEvent : DeRecEvent
+{
+    public override string EventType => "ReplicaSourceChanged";
+    public required string ReplicaId { get; init; }
+}
+
+/// <summary>
+/// This device left the group and dropped its whole <c>SecretId</c>
+/// partition. Fires only once it was told to leave and has since seen a
+/// roster excluding it.
+/// </summary>
+public sealed record SelfRemovedFromGroupEvent : DeRecEvent
+{
+    public override string EventType => "SelfRemovedFromGroup";
+    public required uint Version { get; init; }
+}
+
+/// <summary>
+/// A replica catch-up finished. <c>FetchedFrom</c> is null when this device
+/// was already current, in which case no hydration event follows.
+/// </summary>
+public sealed record SyncCheckCompleteEvent : DeRecEvent
+{
+    public override string EventType => "SyncCheckComplete";
+    public required uint LocalVersion { get; init; }
+    public required uint GroupVersion { get; init; }
+    public string? FetchedFrom { get; init; }
+}
+
+/// <summary>
+/// The first sync for a <c>SecretId</c> this device had no snapshot for —
+/// the secret now exists here. Distinguished from
+/// <see cref="ReplicaSecretReceivedEvent"/>, which reports a later version of
+/// a secret the device already held. Both are written to the stores by the
+/// library before the event is surfaced.
+/// </summary>
+public sealed record ReplicaSecretInstalledEvent : DeRecEvent
+{
+    public override string EventType => "ReplicaSecretInstalled";
+    public required string ChannelId { get; init; }
+    public required string FromReplicaId { get; init; }
+    public required string SecretId { get; init; }
+    public required uint Version { get; init; }
+    public required Secret Secret { get; init; }
+    public required IReadOnlyList<ChannelShare> Shares { get; init; }
+}
+
+/// <summary>
+/// A group member refused a secret sync. Keyed by <c>ReplicaId</c>, not
+/// <c>ChannelId</c>: every member answers on the one group channel.
+/// A <c>VERSION_CONFLICT</c> status means the round must be resolved and
+/// republished at a new version.
+/// </summary>
+public sealed record ReplicaSyncRejectedEvent : DeRecEvent
+{
+    public override string EventType => "ReplicaSyncRejected";
+    public required string ReplicaId { get; init; }
+    public required string SecretId { get; init; }
+    public required uint Version { get; init; }
+    public required int Status { get; init; }
+    public required string Memo { get; init; }
+}
+
+/// <summary>
+/// A secret sync could not be delivered to a member at all — distinct from
+/// <see cref="ReplicaSyncRejectedEvent"/>, which is the member answering "no".
+/// </summary>
+public sealed record ReplicaSyncFailedEvent : DeRecEvent
+{
+    public override string EventType => "ReplicaSyncFailed";
+    public required string ReplicaId { get; init; }
+    public required uint Version { get; init; }
+    public required string Reason { get; init; }
+}
+
+/// <summary>
+/// The replica leg of a publishing round finished. Reported separately from
+/// <see cref="SharingCompleteEvent"/>: replicas are best-effort, so a member
+/// in <c>Behind</c> does not fail the round. <c>Behind</c> is the
+/// application's retry list — the library keeps no durable per-member sync
+/// state.
+/// </summary>
+public sealed record ReplicaSyncCompleteEvent : DeRecEvent
+{
+    public override string EventType => "ReplicaSyncComplete";
+    public required uint Version { get; init; }
+    public required IReadOnlyList<string> Synced { get; init; }
+    public required IReadOnlyList<string> Behind { get; init; }
 }
 
 public sealed record ReplicaSecretAckedEvent : DeRecEvent
@@ -638,6 +759,47 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                 Memo = root.GetProperty("memo").GetString() ?? string.Empty,
             },
             "ReplicaSecretReceived" => ParseReplicaSecretReceived(root),
+            "ReplicaSecretInstalled" => ParseReplicaSecretInstalled(root),
+            "ReplicaSyncRejected" => new ReplicaSyncRejectedEvent
+            {
+                ReplicaId = root.GetProperty("replica_id").GetString()!,
+                SecretId = root.GetProperty("secret_id").GetString()!,
+                Version = root.GetProperty("version").GetUInt32(),
+                Status = root.GetProperty("status").GetInt32(),
+                Memo = root.GetProperty("memo").GetString()!,
+            },
+            "ReplicaSyncFailed" => new ReplicaSyncFailedEvent
+            {
+                ReplicaId = root.GetProperty("replica_id").GetString()!,
+                Version = root.GetProperty("version").GetUInt32(),
+                Reason = root.GetProperty("reason").GetString()!,
+            },
+            "ReplicaRemoved" => new ReplicaRemovedEvent
+            {
+                ReplicaId = root.GetProperty("replica_id").GetString()!,
+            },
+            "ReplicaSourceChanged" => new ReplicaSourceChangedEvent
+            {
+                ReplicaId = root.GetProperty("replica_id").GetString()!,
+            },
+            "SelfRemovedFromGroup" => new SelfRemovedFromGroupEvent
+            {
+                Version = root.GetProperty("version").GetUInt32(),
+            },
+            "SyncCheckComplete" => new SyncCheckCompleteEvent
+            {
+                LocalVersion = root.GetProperty("local_version").GetUInt32(),
+                GroupVersion = root.GetProperty("group_version").GetUInt32(),
+                FetchedFrom = root.TryGetProperty("fetched_from", out var ff)
+                    ? ff.GetString()
+                    : null,
+            },
+            "ReplicaSyncComplete" => new ReplicaSyncCompleteEvent
+            {
+                Version = root.GetProperty("version").GetUInt32(),
+                Synced = ReadStringList(root.GetProperty("synced")),
+                Behind = ReadStringList(root.GetProperty("behind")),
+            },
             "ReplicaSecretAcked" => new ReplicaSecretAckedEvent
             {
                 ChannelId = root.GetProperty("channel_id").GetString()!,
@@ -743,6 +905,13 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
         return bytes.ToArray();
     }
 
+    private static List<string> ReadStringList(System.Text.Json.JsonElement el)
+    {
+        var out_ = new List<string>(el.GetArrayLength());
+        foreach (var item in el.EnumerateArray()) out_.Add(item.GetString()!);
+        return out_;
+    }
+
     private static Dictionary<string, string> ReadStringMap(System.Text.Json.JsonElement el)
     {
         var dict = new Dictionary<string, string>();
@@ -817,24 +986,24 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
         if (secretEl.TryGetProperty("replicas", out var replicasEl)
             && replicasEl.ValueKind == System.Text.Json.JsonValueKind.Object)
         {
-            var replicaList = new List<ReplicaInfo>();
-            foreach (var r in replicasEl.GetProperty("replicas").EnumerateArray())
+            var members = new List<ReplicaInfo>();
+            foreach (var r in replicasEl.GetProperty("members").EnumerateArray())
             {
-                replicaList.Add(new ReplicaInfo(
-                    r.GetProperty("channel_id").GetString()!,
-                    r.GetProperty("transport_uri").GetString()!,
-                    r.TryGetProperty("communication_info", out var rci) ? ReadStringMap(rci) : new(),
+                members.Add(new ReplicaInfo(
                     r.GetProperty("replica_id").GetString()!,
-                    r.GetProperty("sender_kind").GetInt32()));
+                    r.GetProperty("transport_uri").GetString()!,
+                    r.GetProperty("role").GetString()!,
+                    r.TryGetProperty("communication_info", out var rci) ? ReadStringMap(rci) : new()));
             }
             var sharedKey = replicasEl.TryGetProperty("shared_key", out var sk)
                 ? ReadByteArray(sk)
                 : Array.Empty<byte>();
-            replicas = new Replicas(replicaList, sharedKey);
+            replicas = new Replicas(
+                replicasEl.GetProperty("channel_id").GetString()!,
+                members,
+                sharedKey);
         }
-        return new Secret(
-            helpers, secrets,
-            secretEl.GetProperty("owner_replica_id").GetString()!)
+        return new Secret(helpers, secrets)
         {
             Replicas = replicas,
         };
@@ -853,6 +1022,29 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
         }
 
         return new ReplicaSecretReceivedEvent
+        {
+            ChannelId = root.GetProperty("channel_id").GetString()!,
+            FromReplicaId = root.GetProperty("from_replica_id").GetString()!,
+            SecretId = root.GetProperty("secret_id").GetString()!,
+            Version = root.GetProperty("version").GetUInt32(),
+            Secret = container,
+            Shares = shares,
+        };
+    }
+
+    private static ReplicaSecretInstalledEvent ParseReplicaSecretInstalled(System.Text.Json.JsonElement root)
+    {
+        var container = ParseSecretObject(root.GetProperty("secret"));
+
+        var shares = new List<ChannelShare>();
+        foreach (var s in root.GetProperty("shares").EnumerateArray())
+        {
+            shares.Add(new ChannelShare(
+                s.GetProperty("channel_id").GetString()!,
+                ReadByteArray(s.GetProperty("committed_share"))));
+        }
+
+        return new ReplicaSecretInstalledEvent
         {
             ChannelId = root.GetProperty("channel_id").GetString()!,
             FromReplicaId = root.GetProperty("from_replica_id").GetString()!,

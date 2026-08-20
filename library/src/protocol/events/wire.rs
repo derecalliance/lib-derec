@@ -51,6 +51,17 @@ pub(crate) enum Event {
         secret: SecretWire,
         shares: Vec<Share>,
     },
+    /// The first sync for a `secret_id` this device had no snapshot for.
+    /// Same payload as `ReplicaSecretReceived`; the distinct name is what
+    /// tells an application the set of secrets on the device changed.
+    ReplicaSecretInstalled {
+        channel_id: String,
+        from_replica_id: String,
+        secret_id: String,
+        version: u32,
+        secret: SecretWire,
+        shares: Vec<Share>,
+    },
     ReplicaSecretAcked {
         channel_id: String,
         from_replica_id: String,
@@ -58,6 +69,51 @@ pub(crate) enum Event {
         version: u32,
         status: i32,
         memo: String,
+    },
+    /// A member refused a secret sync. Keyed by `replica_id`, not
+    /// `channel_id`: every member answers on the one group channel.
+    ReplicaSyncRejected {
+        replica_id: String,
+        secret_id: String,
+        version: u32,
+        status: i32,
+        memo: String,
+    },
+    /// A secret sync could not be delivered to a member at all.
+    ReplicaSyncFailed {
+        replica_id: String,
+        version: u32,
+        reason: String,
+    },
+    /// A member left the group; its roster row was dropped. Fires on the
+    /// members that remain.
+    ReplicaRemoved {
+        replica_id: String,
+    },
+    /// The group's source role moved to another member because the previous
+    /// source is leaving. Fires on the device that chose, and on the successor.
+    ReplicaSourceChanged {
+        replica_id: String,
+    },
+    /// This device left the group and dropped its whole `secret_id` partition.
+    SelfRemovedFromGroup {
+        version: u32,
+    },
+    /// A replica catch-up finished. `fetched_from` is absent when this device
+    /// was already current, in which case no hydration event follows.
+    SyncCheckComplete {
+        local_version: u32,
+        group_version: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fetched_from: Option<String>,
+    },
+    /// The replica leg of a publishing round finished. Reported separately
+    /// from `SharingComplete`: replicas are best-effort, so a member in
+    /// `behind` does not fail the round.
+    ReplicaSyncComplete {
+        version: u32,
+        synced: Vec<String>,
+        behind: Vec<String>,
     },
     ShareStored {
         channel_id: String,
@@ -231,16 +287,19 @@ pub struct DiscoveredVersion {
 pub struct SecretWire {
     pub helpers: Vec<Helper>,
     pub secrets: Vec<UserSecret>,
-    /// Replica composite. Absent when this `secret_id` has no replica
-    /// setup. Carries the destination roster and the 32-byte group key.
+    /// The replica group. Absent when this `secret_id` has no replica
+    /// setup. Carries the full member roster and the 32-byte group key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replicas: Option<ReplicasWire>,
-    pub owner_replica_id: String,
 }
 
 #[derive(Serialize)]
 pub struct ReplicasWire {
-    pub replicas: Vec<Replica>,
+    /// The one channel every member is addressed on.
+    pub channel_id: String,
+    /// Every member of the group, including the source and the writer. The
+    /// source is the member whose `role` is `Source`.
+    pub members: Vec<Replica>,
     /// 32-byte replica group key. Required by `DeRecProtocol::restore`
     /// to rebuild replica channel state.
     pub shared_key: Vec<u8>,
@@ -257,12 +316,12 @@ pub struct Helper {
 
 #[derive(Serialize)]
 pub struct Replica {
-    pub channel_id: String,
+    pub replica_id: String,
     pub transport_uri: String,
+    /// `"Source"` or `"Destination"` — the member's role in the group.
+    pub role: String,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub communication_info: HashMap<String, String>,
-    pub replica_id: String,
-    pub sender_kind: i32,
 }
 
 #[derive(Serialize)]
@@ -301,20 +360,21 @@ impl From<Secret> for SecretWire {
                 })
                 .collect(),
             replicas: v.replicas.map(|g| ReplicasWire {
-                replicas: g
-                    .replicas
+                channel_id: g.channel_id.to_string(),
+                members: g
+                    .members
                     .into_iter()
                     .map(|r| Replica {
-                        channel_id: r.channel_id.to_string(),
-                        transport_uri: r.transport_uri,
-                        communication_info: r.communication_info,
                         replica_id: encode_replica_id(r.replica_id),
-                        sender_kind: r.sender_kind,
+                        transport_uri: r.transport_uri,
+                        role: crate::protocol::types::ReplicaRole::from_i32(r.role)
+                            .map(|role| format!("{role:?}"))
+                            .unwrap_or_default(),
+                        communication_info: r.communication_info,
                     })
                     .collect(),
                 shared_key: g.shared_key,
             }),
-            owner_replica_id: encode_replica_id(v.owner_replica_id),
         }
     }
 }
@@ -366,6 +426,68 @@ impl Event {
                 version,
                 secret: secret.into(),
                 shares: shares.into_iter().map(Into::into).collect(),
+            },
+            DeRecEvent::ReplicaSecretInstalled {
+                channel_id,
+                from_replica_id,
+                secret_id,
+                version,
+                secret,
+                shares,
+            } => Self::ReplicaSecretInstalled {
+                channel_id: channel_id.0.to_string(),
+                from_replica_id: encode_replica_id(from_replica_id),
+                secret_id: secret_id.to_string(),
+                version,
+                secret: secret.into(),
+                shares: shares.into_iter().map(Into::into).collect(),
+            },
+            DeRecEvent::ReplicaSyncRejected {
+                replica_id,
+                secret_id,
+                version,
+                status,
+                memo,
+            } => Self::ReplicaSyncRejected {
+                replica_id: encode_replica_id(replica_id),
+                secret_id: secret_id.to_string(),
+                version,
+                status,
+                memo,
+            },
+            DeRecEvent::ReplicaSyncFailed {
+                replica_id,
+                version,
+                reason,
+            } => Self::ReplicaSyncFailed {
+                replica_id: encode_replica_id(replica_id),
+                version,
+                reason,
+            },
+            DeRecEvent::ReplicaRemoved { replica_id } => Self::ReplicaRemoved {
+                replica_id: encode_replica_id(replica_id),
+            },
+            DeRecEvent::ReplicaSourceChanged { replica_id } => Self::ReplicaSourceChanged {
+                replica_id: encode_replica_id(replica_id),
+            },
+            DeRecEvent::SelfRemovedFromGroup { version } => Self::SelfRemovedFromGroup { version },
+            DeRecEvent::SyncCheckComplete {
+                local_version,
+                group_version,
+                fetched_from,
+            } => Self::SyncCheckComplete {
+                local_version,
+                group_version,
+                fetched_from: fetched_from.map(encode_replica_id),
+            },
+            DeRecEvent::ReplicaSyncComplete {
+                version,
+                synced,
+                behind,
+            } => Self::ReplicaSyncComplete {
+                version,
+                synced: synced.into_iter().map(encode_replica_id).collect(),
+                behind: behind.into_iter().map(encode_replica_id).collect(),
             },
             DeRecEvent::ReplicaSecretAcked {
                 channel_id,

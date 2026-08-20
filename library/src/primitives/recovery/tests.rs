@@ -73,6 +73,7 @@ fn create_response_envelope(
         timestamp: Some(timestamp),
         secret_id: 0,
         version: 0,
+        replica_id: None,
     };
 
     DeRecMessageBuilder::channel()
@@ -105,6 +106,7 @@ fn create_response_envelope_with_mismatched_timestamp(
         timestamp: Some(message_timestamp),
         secret_id: 0,
         version: 0,
+        replica_id: None,
     };
 
     DeRecMessageBuilder::channel()
@@ -448,6 +450,7 @@ fn test_produce_get_share_response_message_request_timestamp_mismatch() {
         version,
         timestamp: Some(message_timestamp),
         reply_to: None,
+        replica_id: None,
     };
 
     let tampered_request_envelope = DeRecMessageBuilder::channel()

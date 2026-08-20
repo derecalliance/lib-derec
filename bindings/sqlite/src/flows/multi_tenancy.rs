@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-use derec_library::protocol::types::UserSecret;
+use derec_library::protocol::types::{ChannelQuery, UserSecret};
 use derec_library::protocol::{
     DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecUserSecretStore, MissingPolicy,
     SecretKind, SecretStoreError,
@@ -76,36 +76,36 @@ pub async fn run() {
     let a_chans = owner_a
         .protocol
         .channel_store
-        .channels(SECRET_A_ID)
+        .helpers(SECRET_A_ID)
         .await
         .unwrap();
     let b_chans = owner_b
         .protocol
         .channel_store
-        .channels(SECRET_B_ID)
+        .helpers(SECRET_B_ID)
         .await
         .unwrap();
     assert_eq!(a_chans.len(), 2);
     assert_eq!(b_chans.len(), 2);
     for c in &a_chans {
         assert!(
-            c.id == a1 || c.id == a2,
+            c.channel_id == a1 || c.channel_id == a2,
             "secret A enumerate returned a non-A channel: {:?}",
-            c.id
+            c.channel_id
         );
     }
     for c in &b_chans {
         assert!(
-            c.id == b1 || c.id == b2,
+            c.channel_id == b1 || c.channel_id == b2,
             "secret B enumerate returned a non-B channel: {:?}",
-            c.id
+            c.channel_id
         );
     }
     assert!(
         owner_a
             .protocol
             .channel_store
-            .load(SECRET_A_ID, b1)
+            .load(SECRET_A_ID, ChannelQuery::Helper { channel_id: b1 })
             .await
             .unwrap()
             .is_none(),
@@ -116,7 +116,7 @@ pub async fn run() {
         owner_b
             .protocol
             .channel_store
-            .load(SECRET_B_ID, a1)
+            .load(SECRET_B_ID, ChannelQuery::Helper { channel_id: a1 })
             .await
             .unwrap()
             .is_none(),
@@ -213,26 +213,31 @@ pub async fn run() {
     let secret_a_channels = owner_a
         .protocol
         .channel_store
-        .channels(SECRET_A_ID)
+        .helpers(SECRET_A_ID)
         .await
         .unwrap();
     for c in &secret_a_channels {
         owner_a
             .protocol
             .channel_store
-            .remove(SECRET_A_ID, c.id)
+            .remove(
+                SECRET_A_ID,
+                ChannelQuery::Helper {
+                    channel_id: c.channel_id,
+                },
+            )
             .await
             .unwrap();
         owner_a
             .protocol
             .secret_store
-            .remove(SECRET_A_ID, c.id, SecretKind::SharedKey)
+            .remove(SECRET_A_ID, c.channel_id, SecretKind::SharedKey)
             .await
             .unwrap();
         owner_a
             .protocol
             .share_store
-            .remove_channel(SECRET_A_ID, c.id)
+            .remove_channel(SECRET_A_ID, c.channel_id)
             .await
             .unwrap();
     }

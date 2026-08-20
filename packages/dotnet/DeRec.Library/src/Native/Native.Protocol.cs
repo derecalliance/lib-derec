@@ -25,17 +25,17 @@ internal static class Protocol
 {
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int ChannelStoreLoadDelegate(
-        IntPtr userData, ulong secretId, ulong channelId,
+        IntPtr userData, ulong secretId, ulong channelId, ulong replicaId,
         out IntPtr outPtr, out UIntPtr outLen);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int ChannelStoreSaveDelegate(
-        IntPtr userData, ulong secretId, ulong channelId,
+        IntPtr userData, ulong secretId, ulong channelId, ulong replicaId,
         IntPtr bytes, UIntPtr len);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int ChannelStoreRemoveDelegate(
-        IntPtr userData, ulong secretId, ulong channelId,
+        IntPtr userData, ulong secretId, ulong channelId, ulong replicaId,
         out uint outExisted);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
@@ -63,7 +63,8 @@ internal static class Protocol
         public IntPtr Load;
         public IntPtr Save;
         public IntPtr Remove;
-        public IntPtr ListChannels;
+        public IntPtr ListHelpers;
+        public IntPtr ListReplicas;
         public IntPtr LinkChannel;
         public IntPtr LinkedChannels;
         public IntPtr FreeBuffer;

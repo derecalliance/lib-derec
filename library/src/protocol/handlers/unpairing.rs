@@ -151,7 +151,9 @@ pub(in crate::protocol) async fn start<
         }
     };
 
-    let request = produce_unpair_request(channel_id, &memo_str, &shared_key, reply_to)?;
+    // Helper unpair: no member is named, which is what marks this the
+    // owner ↔ helper path rather than a replica-group removal.
+    let request = produce_unpair_request(channel_id, &memo_str, &shared_key, reply_to, None)?;
     let envelope = super::apply_trace_id(request.envelope, super::fresh_trace_id())?;
     let endpoint = peer_endpoint(channel_store, secret_id, channel_id).await?;
     transport.send(&endpoint, envelope).await?;
@@ -298,7 +300,12 @@ pub(in crate::protocol) async fn drop_channel_state<
         .remove(secret_id, channel_id, SecretKind::PairingContact)
         .await;
 
-    let _ = channel_store.remove(secret_id, channel_id).await?;
+    let _ = channel_store
+        .remove(
+            secret_id,
+            crate::protocol::types::ChannelQuery::Helper { channel_id },
+        )
+        .await?;
     Ok(())
 }
 

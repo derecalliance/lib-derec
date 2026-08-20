@@ -34,7 +34,6 @@ fn entry(id: u64, versions: &[(u32, &str)]) -> SecretVersionEntry {
             .map(|(v, desc)| VersionEntry {
                 version: *v,
                 description: desc.to_string(),
-                replica_id: None,
             })
             .collect(),
     }
@@ -52,6 +51,7 @@ fn build_response_envelope(
         result,
         secret_list,
         timestamp: Some(timestamp),
+        replica_id: None,
     };
 
     DeRecMessageBuilder::channel()
@@ -80,6 +80,7 @@ fn build_response_envelope_with_mismatched_timestamp(
         }),
         secret_list: vec![],
         timestamp: Some(message_timestamp),
+        replica_id: None,
     };
 
     DeRecMessageBuilder::channel()
@@ -155,6 +156,7 @@ fn test_extract_discovery_request_mismatched_timestamp_fails() {
     let message = GetSecretIdsVersionsRequestMessage {
         timestamp: Some(message_timestamp),
         reply_to: None,
+        replica_id: None,
     };
 
     let envelope = DeRecMessageBuilder::channel()
@@ -185,6 +187,7 @@ fn test_extract_discovery_request_wrong_message_type_fails() {
         version: 1,
         timestamp: Some(timestamp),
         reply_to: None,
+        replica_id: None,
     };
 
     let envelope = DeRecMessageBuilder::channel()
@@ -309,6 +312,7 @@ fn test_extract_discovery_response_wrong_message_type_fails() {
         timestamp: Some(timestamp),
         secret_id: 0,
         version: 0,
+        replica_id: None,
     };
 
     let envelope = DeRecMessageBuilder::channel()
@@ -477,17 +481,14 @@ fn test_version_descriptions_are_preserved_through_roundtrip() {
             VersionEntry {
                 version: 1,
                 description: "Draft".to_owned(),
-                replica_id: None,
             },
             VersionEntry {
                 version: 2,
                 description: "Final".to_owned(),
-                replica_id: None,
             },
             VersionEntry {
                 version: 3,
                 description: String::new(),
-                replica_id: None,
             },
         ],
     }];

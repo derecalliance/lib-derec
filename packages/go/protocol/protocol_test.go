@@ -20,49 +20,87 @@ import (
 // from whatever goroutine the caller drives process()/accept()/start()
 // from), one type per store interface in package protocol.
 
+// Two maps, mirroring the two primary keys the interface defines: a helper
+// channel is unique per channelID, while a replica-group member is unique per
+// replicaID and moves between channels during an admission handover.
 type inMemoryChannelStore struct {
-	mu    sync.Mutex
-	data  map[[2]uint64]Channel
-	links map[[2]uint64]map[uint64]struct{}
+	mu      sync.Mutex
+	helpers map[[2]uint64]HelperChannel
+	members map[[2]uint64]ReplicaMember
+	links   map[[2]uint64]map[uint64]struct{}
 }
 
 func newInMemoryChannelStore() *inMemoryChannelStore {
 	return &inMemoryChannelStore{
-		data:  make(map[[2]uint64]Channel),
-		links: make(map[[2]uint64]map[uint64]struct{}),
+		helpers: make(map[[2]uint64]HelperChannel),
+		members: make(map[[2]uint64]ReplicaMember),
+		links:   make(map[[2]uint64]map[uint64]struct{}),
 	}
 }
 
-func (s *inMemoryChannelStore) Load(secretID, channelID uint64) (Channel, bool, error) {
+func (s *inMemoryChannelStore) Load(secretID, channelID, replicaID uint64) (ChannelRecord, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	c, ok := s.data[[2]uint64{secretID, channelID}]
-	return c, ok, nil
+	if replicaID == 0 {
+		h, ok := s.helpers[[2]uint64{secretID, channelID}]
+		if !ok {
+			return ChannelRecord{}, false, nil
+		}
+		return ChannelRecord{Helper: &h}, true, nil
+	}
+	m, ok := s.members[[2]uint64{secretID, replicaID}]
+	if !ok {
+		return ChannelRecord{}, false, nil
+	}
+	return ChannelRecord{Replica: &m}, true, nil
 }
 
-func (s *inMemoryChannelStore) Save(secretID uint64, channel Channel) error {
+func (s *inMemoryChannelStore) Save(secretID uint64, record ChannelRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data[[2]uint64{secretID, channel.ID}] = channel
+	if record.Helper != nil {
+		s.helpers[[2]uint64{secretID, record.Helper.ChannelID}] = *record.Helper
+	}
+	if record.Replica != nil {
+		s.members[[2]uint64{secretID, record.Replica.ReplicaID}] = *record.Replica
+	}
 	return nil
 }
 
-func (s *inMemoryChannelStore) Remove(secretID, channelID uint64) (bool, error) {
+func (s *inMemoryChannelStore) Remove(secretID, channelID, replicaID uint64) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	key := [2]uint64{secretID, channelID}
-	_, existed := s.data[key]
-	delete(s.data, key)
+	if replicaID == 0 {
+		key := [2]uint64{secretID, channelID}
+		_, existed := s.helpers[key]
+		delete(s.helpers, key)
+		return existed, nil
+	}
+	key := [2]uint64{secretID, replicaID}
+	_, existed := s.members[key]
+	delete(s.members, key)
 	return existed, nil
 }
 
-func (s *inMemoryChannelStore) ListChannels(secretID uint64) ([]uint64, error) {
+func (s *inMemoryChannelStore) ListHelpers(secretID uint64) ([]HelperChannel, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var out []uint64
-	for key := range s.data {
+	var out []HelperChannel
+	for key, h := range s.helpers {
 		if key[0] == secretID {
-			out = append(out, key[1])
+			out = append(out, h)
+		}
+	}
+	return out, nil
+}
+
+func (s *inMemoryChannelStore) ListReplicas(secretID uint64) ([]ReplicaMember, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []ReplicaMember
+	for key, m := range s.members {
+		if key[0] == secretID {
+			out = append(out, m)
 		}
 	}
 	return out, nil

@@ -25,6 +25,10 @@ pub struct GetShareResponseMessage {
     pub timestamp: Option<Timestamp>,
     pub secret_id: u64,
     pub version: u32,
+    /// Identity of the replica-group member this message concerns, present
+    /// only on the replica catch-up path. `null` on the owner ↔ helper path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_id: Option<u64>,
 }
 
 impl From<derec_proto::GetShareResponseMessage> for GetShareResponseMessage {
@@ -36,6 +40,7 @@ impl From<derec_proto::GetShareResponseMessage> for GetShareResponseMessage {
             timestamp: value.timestamp.map(Into::into),
             secret_id: value.secret_id,
             version: value.version,
+            replica_id: value.replica_id,
         }
     }
 }
@@ -49,6 +54,7 @@ impl From<GetShareResponseMessage> for derec_proto::GetShareResponseMessage {
             timestamp: value.timestamp.map(Into::into),
             secret_id: value.secret_id,
             version: value.version,
+            replica_id: value.replica_id,
         }
     }
 }

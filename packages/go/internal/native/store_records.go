@@ -54,20 +54,34 @@ func (b *JSONByteArray) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// --- Channel -----------------------------------------------------------
+// --- Channel records ------------------------------------------------------
 
-// channelWire mirrors Channel's own serde derive exactly (see
-// library/src/protocol/types.rs): field names, presence, and nesting are
-// load-bearing — Channel crosses the FFI boundary as this shape directly,
-// with no separate record wrapper.
-type channelWire struct {
-	ID                uint64            `json:"id"`
+// helperChannelWire / replicaMemberWire mirror the Rust serde derives (see
+// library/src/protocol/types/mod.rs): field names, presence, and nesting are
+// load-bearing. channelRecordWire mirrors ChannelRecord, an externally
+// tagged enum, so exactly one of Helper / Replica is present.
+type helperChannelWire struct {
+	ChannelID         uint64            `json:"channel_id"`
 	Transport         transportWire     `json:"transport"`
 	CommunicationInfo map[string]string `json:"communication_info"`
+	PeerRole          SenderKind        `json:"peer_role"`
 	Status            ChannelStatus     `json:"status"`
 	CreatedAt         uint64            `json:"created_at"`
-	PeerRole          SenderKind        `json:"peer_role"`
-	ReplicaID         *uint64           `json:"replica_id"`
+}
+
+type replicaMemberWire struct {
+	ChannelID         uint64            `json:"channel_id"`
+	ReplicaID         uint64            `json:"replica_id"`
+	Transport         transportWire     `json:"transport"`
+	CommunicationInfo map[string]string `json:"communication_info"`
+	Role              ReplicaRole       `json:"role"`
+	Status            ChannelStatus     `json:"status"`
+	CreatedAt         uint64            `json:"created_at"`
+}
+
+type channelRecordWire struct {
+	Helper  *helperChannelWire `json:"Helper,omitempty"`
+	Replica *replicaMemberWire `json:"Replica,omitempty"`
 }
 
 type transportWire struct {
@@ -75,44 +89,119 @@ type transportWire struct {
 	Protocol int32  `json:"protocol"`
 }
 
-// EncodeChannel produces the JSON a ChannelStoreCallbacks.save/load
-// response must carry, matching Channel's derived Serialize output
-// byte-for-byte (field names, PascalCase enum strings, bare-number id).
-func EncodeChannel(c Channel) ([]byte, error) {
-	info := c.CommunicationInfo
+// nonNilInfo normalizes an absent map to `{}`. Rust's
+// HashMap<String,String> has no Option wrapper here, so it never
+// serializes as `null`.
+func nonNilInfo(info map[string]string) map[string]string {
 	if info == nil {
-		// Rust's HashMap<String,String> has no Option wrapper here, so an
-		// absent map always serializes as `{}`, never `null`.
-		info = map[string]string{}
+		return map[string]string{}
 	}
-	w := channelWire{
-		ID:                c.ID,
-		Transport:         transportWire{URI: c.Transport.URI, Protocol: c.Transport.Protocol},
-		CommunicationInfo: info,
-		Status:            c.Status,
-		CreatedAt:         c.CreatedAt,
-		PeerRole:          c.PeerRole,
-		ReplicaID:         c.ReplicaID,
-	}
-	return json.Marshal(w)
+	return info
 }
 
-// DecodeChannel parses a Channel from a ChannelStoreCallbacks.load/save
-// wire payload.
-func DecodeChannel(data []byte) (Channel, error) {
-	var w channelWire
-	if err := json.Unmarshal(data, &w); err != nil {
-		return Channel{}, fmt.Errorf("native: decode Channel: %w", err)
+func helperToWire(h HelperChannel) helperChannelWire {
+	return helperChannelWire{
+		ChannelID:         h.ChannelID,
+		Transport:         transportWire{URI: h.Transport.URI, Protocol: h.Transport.Protocol},
+		CommunicationInfo: nonNilInfo(h.CommunicationInfo),
+		PeerRole:          h.PeerRole,
+		Status:            h.Status,
+		CreatedAt:         h.CreatedAt,
 	}
-	return Channel{
-		ID:                w.ID,
+}
+
+func memberToWire(m ReplicaMember) replicaMemberWire {
+	return replicaMemberWire{
+		ChannelID:         m.ChannelID,
+		ReplicaID:         m.ReplicaID,
+		Transport:         transportWire{URI: m.Transport.URI, Protocol: m.Transport.Protocol},
+		CommunicationInfo: nonNilInfo(m.CommunicationInfo),
+		Role:              m.Role,
+		Status:            m.Status,
+		CreatedAt:         m.CreatedAt,
+	}
+}
+
+func helperFromWire(w helperChannelWire) HelperChannel {
+	return HelperChannel{
+		ChannelID:         w.ChannelID,
 		Transport:         TransportEndpoint{URI: w.Transport.URI, Protocol: w.Transport.Protocol},
 		CommunicationInfo: w.CommunicationInfo,
+		PeerRole:          w.PeerRole,
 		Status:            w.Status,
 		CreatedAt:         w.CreatedAt,
-		PeerRole:          w.PeerRole,
+	}
+}
+
+func memberFromWire(w replicaMemberWire) ReplicaMember {
+	return ReplicaMember{
+		ChannelID:         w.ChannelID,
 		ReplicaID:         w.ReplicaID,
-	}, nil
+		Transport:         TransportEndpoint{URI: w.Transport.URI, Protocol: w.Transport.Protocol},
+		CommunicationInfo: w.CommunicationInfo,
+		Role:              w.Role,
+		Status:            w.Status,
+		CreatedAt:         w.CreatedAt,
+	}
+}
+
+// EncodeChannelRecord produces the JSON a ChannelStoreCallbacks.save/load
+// response must carry, matching ChannelRecord's derived Serialize output
+// byte-for-byte.
+func EncodeChannelRecord(r ChannelRecord) ([]byte, error) {
+	switch {
+	case r.Helper != nil && r.Replica != nil:
+		return nil, fmt.Errorf("native: ChannelRecord carries both Helper and Replica")
+	case r.Helper != nil:
+		w := helperToWire(*r.Helper)
+		return json.Marshal(channelRecordWire{Helper: &w})
+	case r.Replica != nil:
+		w := memberToWire(*r.Replica)
+		return json.Marshal(channelRecordWire{Replica: &w})
+	default:
+		return nil, fmt.Errorf("native: ChannelRecord carries neither Helper nor Replica")
+	}
+}
+
+// DecodeChannelRecord parses a ChannelRecord from a
+// ChannelStoreCallbacks.load/save wire payload.
+func DecodeChannelRecord(data []byte) (ChannelRecord, error) {
+	var w channelRecordWire
+	if err := json.Unmarshal(data, &w); err != nil {
+		return ChannelRecord{}, fmt.Errorf("native: decode ChannelRecord: %w", err)
+	}
+	switch {
+	case w.Helper != nil && w.Replica != nil:
+		return ChannelRecord{}, fmt.Errorf("native: ChannelRecord JSON carries both variants")
+	case w.Helper != nil:
+		h := helperFromWire(*w.Helper)
+		return ChannelRecord{Helper: &h}, nil
+	case w.Replica != nil:
+		m := memberFromWire(*w.Replica)
+		return ChannelRecord{Replica: &m}, nil
+	default:
+		return ChannelRecord{}, fmt.Errorf("native: ChannelRecord JSON carries neither variant")
+	}
+}
+
+// EncodeHelperChannelList produces the JSON a
+// ChannelStoreCallbacks.list_helpers response must carry.
+func EncodeHelperChannelList(helpers []HelperChannel) ([]byte, error) {
+	out := make([]helperChannelWire, 0, len(helpers))
+	for _, h := range helpers {
+		out = append(out, helperToWire(h))
+	}
+	return json.Marshal(out)
+}
+
+// EncodeReplicaMemberList produces the JSON a
+// ChannelStoreCallbacks.list_replicas response must carry.
+func EncodeReplicaMemberList(members []ReplicaMember) ([]byte, error) {
+	out := make([]replicaMemberWire, 0, len(members))
+	for _, m := range members {
+		out = append(out, memberToWire(m))
+	}
+	return json.Marshal(out)
 }
 
 // --- Share ---------------------------------------------------------------
@@ -320,6 +409,20 @@ type stateItemWire struct {
 	Pending   *[]string        `json:"pending,omitempty"`
 	Confirmed *[]string        `json:"confirmed,omitempty"`
 	Failed    *[]string        `json:"failed,omitempty"`
+	// Replica-leg accounting, keyed by replica_id. Absent on rows written
+	// before the leg existed, which decode as empty rather than failing.
+	PendingReplicas *[]string `json:"pending_replicas,omitempty"`
+	SyncedReplicas  *[]string `json:"synced_replicas,omitempty"`
+	BehindReplicas  *[]string `json:"behind_replicas,omitempty"`
+}
+
+// parseOptionalUint64Strings decodes an id set whose absence is legitimate,
+// unlike parseUint64Strings which requires the field.
+func parseOptionalUint64Strings(raw *[]string, field string) ([]uint64, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	return parseUint64Strings(raw, field)
 }
 
 func stringifyUint64s(ids []uint64) []string {
@@ -402,6 +505,12 @@ func EncodeStateItem(item StateItem) ([]byte, error) {
 		w.Pending = &pending
 		w.Confirmed = &confirmed
 		w.Failed = &failed
+		pendingReplicas := stringifyUint64s(item.PendingReplicas)
+		syncedReplicas := stringifyUint64s(item.SyncedReplicas)
+		behindReplicas := stringifyUint64s(item.BehindReplicas)
+		w.PendingReplicas = &pendingReplicas
+		w.SyncedReplicas = &syncedReplicas
+		w.BehindReplicas = &behindReplicas
 	default:
 		return nil, fmt.Errorf("native: unknown StateKind: %d", item.Kind)
 	}
@@ -488,14 +597,31 @@ func DecodeStateItem(data []byte) (StateItem, error) {
 		if err != nil {
 			return StateItem{}, err
 		}
+		// The replica leg postdates the helper one: a row written by an older
+		// build carries no member state, so an absent field decodes as empty.
+		pendingReplicas, err := parseOptionalUint64Strings(w.PendingReplicas, "pending_replicas")
+		if err != nil {
+			return StateItem{}, err
+		}
+		syncedReplicas, err := parseOptionalUint64Strings(w.SyncedReplicas, "synced_replicas")
+		if err != nil {
+			return StateItem{}, err
+		}
+		behindReplicas, err := parseOptionalUint64Strings(w.BehindReplicas, "behind_replicas")
+		if err != nil {
+			return StateItem{}, err
+		}
 		v := *w.Version
 		return StateItem{
-			Kind:      StateKindSharingRound,
-			Version:   &v,
-			StartedAt: &sa,
-			Pending:   pending,
-			Confirmed: confirmed,
-			Failed:    failed,
+			Kind:            StateKindSharingRound,
+			Version:         &v,
+			StartedAt:       &sa,
+			Pending:         pending,
+			Confirmed:       confirmed,
+			Failed:          failed,
+			PendingReplicas: pendingReplicas,
+			SyncedReplicas:  syncedReplicas,
+			BehindReplicas:  behindReplicas,
 		}, nil
 	default:
 		return StateItem{}, fmt.Errorf("native: unknown StateKind: %d", w.Kind)

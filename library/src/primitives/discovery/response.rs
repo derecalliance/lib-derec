@@ -19,13 +19,6 @@ use prost::Message;
 pub struct VersionEntry {
     pub version: u32,
     pub description: String,
-    /// Stable per-device identifier of the replica that produced this
-    /// version. `None` for a non-replica `Owner`; `Some(id)` for a
-    /// `ReplicaSource`. Surfaces conflict candidates to the application:
-    /// two distinct `replica_id`s with the same `version` for the same
-    /// `secret_id` indicate concurrent writes the application must
-    /// reconcile before driving recovery.
-    pub replica_id: Option<u64>,
 }
 
 impl From<&VersionEntry> for ProtoVersionEntry {
@@ -33,7 +26,6 @@ impl From<&VersionEntry> for ProtoVersionEntry {
         ProtoVersionEntry {
             version: version.version,
             version_description: version.description.to_owned(),
-            replica_id: version.replica_id,
         }
     }
 }
@@ -55,7 +47,6 @@ impl From<&ProtoVersionEntry> for VersionEntry {
         Self {
             version: entry.version,
             description: entry.version_description.to_owned(),
-            replica_id: entry.replica_id,
         }
     }
 }
@@ -170,7 +161,7 @@ pub struct ProcessResult {
 /// let secret_list = vec![
 ///     SecretVersionEntry {
 ///         secret_id: 1,
-///         versions: vec![VersionEntry { version: 1, description: "wallet seed".to_owned(), replica_id: None }],
+///         versions: vec![VersionEntry { version: 1, description: "wallet seed".to_owned() }],
 ///     },
 /// ];
 ///
@@ -199,6 +190,9 @@ pub fn produce(
         }),
         secret_list,
         timestamp: Some(timestamp),
+        // Owner ↔ helper exchange: the replica path sets this, this one
+        // never does. Its absence is what marks the message helper-bound.
+        replica_id: None,
     };
 
     let envelope = DeRecMessageBuilder::channel()
@@ -274,7 +268,7 @@ pub fn produce(
 ///
 /// let secret_list = vec![SecretVersionEntry {
 ///     secret_id: 1,
-///     versions: vec![VersionEntry { version: 1, description: "v1".to_owned(), replica_id: None }],
+///     versions: vec![VersionEntry { version: 1, description: "v1".to_owned() }],
 /// }];
 ///
 /// let response::ProduceResult { envelope } =
@@ -362,7 +356,7 @@ pub fn extract(
 ///
 /// let secret_list = vec![SecretVersionEntry {
 ///     secret_id: 1,
-///     versions: vec![VersionEntry { version: 1, description: "v1".to_owned(), replica_id: None }],
+///     versions: vec![VersionEntry { version: 1, description: "v1".to_owned() }],
 /// }];
 ///
 /// // Helper → Owner roundtrip.

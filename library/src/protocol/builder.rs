@@ -827,23 +827,31 @@ mod tests {
             TransportFuture,
         };
         use crate::protocol::types::{
-            Channel, MissingPolicy, SecretKind, SecretValue, Share, UserSecrets,
+            ChannelQuery, ChannelRecord, HelperChannel, MissingPolicy, ReplicaMember, SecretKind,
+            SecretValue, Share, UserSecrets,
         };
         use crate::types::ChannelId;
         use derec_proto::TransportProtocol;
 
         struct NoopChannelStore;
         impl DeRecChannelStore for NoopChannelStore {
-            fn load(&self, _: u64, _: ChannelId) -> ChannelStoreFuture<'_, Option<Channel>> {
+            fn load(
+                &self,
+                _: u64,
+                _: ChannelQuery,
+            ) -> ChannelStoreFuture<'_, Option<ChannelRecord>> {
                 Box::pin(std::future::ready(Ok(None)))
             }
-            fn save(&mut self, _: u64, _: Channel) -> ChannelStoreFuture<'_, ()> {
+            fn save(&mut self, _: u64, _: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
-            fn remove(&mut self, _: u64, _: ChannelId) -> ChannelStoreFuture<'_, bool> {
+            fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(std::future::ready(Ok(false)))
             }
-            fn channels(&self, _: u64) -> ChannelStoreFuture<'_, Vec<Channel>> {
+            fn helpers(&self, _: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+            fn replicas(&self, _: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn link_channel(
@@ -1003,23 +1011,31 @@ mod tests {
             TransportFuture,
         };
         use crate::protocol::types::{
-            Channel, MissingPolicy, SecretKind, SecretValue, Share, UserSecrets,
+            ChannelQuery, ChannelRecord, HelperChannel, MissingPolicy, ReplicaMember, SecretKind,
+            SecretValue, Share, UserSecrets,
         };
         use crate::types::ChannelId;
         use derec_proto::TransportProtocol;
 
         struct NoopChannelStore;
         impl DeRecChannelStore for NoopChannelStore {
-            fn load(&self, _: u64, _: ChannelId) -> ChannelStoreFuture<'_, Option<Channel>> {
+            fn load(
+                &self,
+                _: u64,
+                _: ChannelQuery,
+            ) -> ChannelStoreFuture<'_, Option<ChannelRecord>> {
                 Box::pin(std::future::ready(Ok(None)))
             }
-            fn save(&mut self, _: u64, _: Channel) -> ChannelStoreFuture<'_, ()> {
+            fn save(&mut self, _: u64, _: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
-            fn remove(&mut self, _: u64, _: ChannelId) -> ChannelStoreFuture<'_, bool> {
+            fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(std::future::ready(Ok(false)))
             }
-            fn channels(&self, _: u64) -> ChannelStoreFuture<'_, Vec<Channel>> {
+            fn helpers(&self, _: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+            fn replicas(&self, _: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn link_channel(
@@ -1167,23 +1183,31 @@ mod tests {
             TransportFuture,
         };
         use crate::protocol::types::{
-            Channel, MissingPolicy, SecretKind, SecretValue, Share, UserSecrets,
+            ChannelQuery, ChannelRecord, HelperChannel, MissingPolicy, ReplicaMember, SecretKind,
+            SecretValue, Share, UserSecrets,
         };
         use crate::types::ChannelId;
         use derec_proto::TransportProtocol;
 
         struct NoopChannelStore;
         impl DeRecChannelStore for NoopChannelStore {
-            fn load(&self, _: u64, _: ChannelId) -> ChannelStoreFuture<'_, Option<Channel>> {
+            fn load(
+                &self,
+                _: u64,
+                _: ChannelQuery,
+            ) -> ChannelStoreFuture<'_, Option<ChannelRecord>> {
                 Box::pin(std::future::ready(Ok(None)))
             }
-            fn save(&mut self, _: u64, _: Channel) -> ChannelStoreFuture<'_, ()> {
+            fn save(&mut self, _: u64, _: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
-            fn remove(&mut self, _: u64, _: ChannelId) -> ChannelStoreFuture<'_, bool> {
+            fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(std::future::ready(Ok(false)))
             }
-            fn channels(&self, _: u64) -> ChannelStoreFuture<'_, Vec<Channel>> {
+            fn helpers(&self, _: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+            fn replicas(&self, _: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn link_channel(

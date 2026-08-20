@@ -128,8 +128,8 @@ pub(in crate::protocol) async fn start<
         )
         .await?;
 
-    let all_channels: Vec<crate::protocol::types::Channel> = channel_store
-        .channels(local_secret_id)
+    let all_channels: Vec<crate::protocol::types::HelperChannel> = channel_store
+        .helpers(local_secret_id)
         .await?
         .into_iter()
         .filter(|c| {
@@ -137,7 +137,7 @@ pub(in crate::protocol) async fn start<
                 && c.status == crate::protocol::types::ChannelStatus::Paired
         })
         .collect();
-    let channel_ids: Vec<ChannelId> = all_channels.iter().map(|c| c.id).collect();
+    let channel_ids: Vec<ChannelId> = all_channels.iter().map(|c| c.channel_id).collect();
     let mut keys: std::collections::HashMap<ChannelId, SharedKey> = secret_store
         .load_many(
             local_secret_id,
@@ -156,12 +156,12 @@ pub(in crate::protocol) async fn start<
     let mut events = Vec::with_capacity(all_channels.len());
     for channel in all_channels {
         let shared_key = keys
-            .remove(&channel.id)
+            .remove(&channel.channel_id)
             .expect("load_many(MissingPolicy::Fail) guarantees an entry per id");
 
         match dispatch_one(
             transport,
-            channel.id,
+            channel.channel_id,
             &channel.transport,
             target_secret_id,
             version,
@@ -172,12 +172,12 @@ pub(in crate::protocol) async fn start<
         {
             Ok(()) => {
                 events.push(DeRecEvent::RecoverSecretStarted {
-                    channel_id: channel.id,
+                    channel_id: channel.channel_id,
                     version,
                 });
                 #[cfg(feature = "logging")]
                 tracing::debug!(
-                    channel_id = channel.id.0,
+                    channel_id = channel.channel_id.0,
                     target_secret_id,
                     version,
                     "share request sent"
@@ -185,13 +185,13 @@ pub(in crate::protocol) async fn start<
             }
             Err(e) => {
                 events.push(DeRecEvent::RecoverSecretFailed {
-                    channel_id: channel.id,
+                    channel_id: channel.channel_id,
                     version,
                     error: e.to_string(),
                 });
                 #[cfg(feature = "logging")]
                 tracing::warn!(
-                    channel_id = channel.id.0,
+                    channel_id = channel.channel_id.0,
                     target_secret_id,
                     version,
                     error = %e,
@@ -296,6 +296,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
     status: StatusEnum,
     memo: &str,
     trace_id: u64,
+    local_replica_id: Option<u64>,
 ) -> Result<()> {
     let response = GetShareResponseMessage {
         result: Some(DeRecResult {
@@ -307,6 +308,9 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
         timestamp: Some(current_timestamp()),
         secret_id: request.secret_id,
         version: request.version,
+        // Answer on the path the request arrived on: a member asking gets a
+        // member's answer, a helper exchange stays helper-bound.
+        replica_id: local_replica_id.filter(|_| request.replica_id.is_some()),
     };
 
     super::send_channel_message(
@@ -541,7 +545,9 @@ mod recovery_ids_tests {
         InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, RecordingTransport,
         run_async,
     };
-    use crate::protocol::types::{Channel, ChannelStatus, SecretValue};
+    use crate::protocol::types::{
+        ChannelRecord, ChannelStatus, HelperChannel, ReplicaMember, ReplicaRole, SecretValue,
+    };
     use crate::types::ChannelId;
     use derec_proto::{DeRecMessage, SenderKind, TransportProtocol};
     use prost::Message;
@@ -585,8 +591,9 @@ mod recovery_ids_tests {
     /// Seed a channel with an explicit peer role and status.
     ///
     /// `peer_role` is what the *other end* is, so a helper-pairing an
-    /// Owner holds is `SenderKind::Helper`; replica channels are
-    /// `ReplicaSource` / `ReplicaDestination` from the peer's side.
+    /// Owner holds is `SenderKind::Helper`. A replica `peer_role` seeds a
+    /// group member instead, keyed on `replica_id = cid` so tests can name
+    /// the member with the same literal they use for the channel.
     #[allow(clippy::too_many_arguments)]
     async fn seed_channel_as(
         channels: &mut InMemChannelStore,
@@ -597,21 +604,27 @@ mod recovery_ids_tests {
         peer_role: SenderKind,
         status: ChannelStatus,
     ) {
-        channels
-            .save(
-                sid,
-                Channel {
-                    id: ChannelId(cid),
-                    transport: endpoint(&format!("https://helper-{cid}.example")),
-                    communication_info: Default::default(),
-                    status,
-                    created_at: 1,
-                    peer_role,
-                    replica_id: None,
-                },
-            )
-            .await
-            .expect("channel saved");
+        let transport = endpoint(&format!("https://helper-{cid}.example"));
+        let record = match ReplicaRole::from_sender_kind(peer_role) {
+            Some(role) => ChannelRecord::Replica(ReplicaMember {
+                channel_id: ChannelId(cid),
+                replica_id: crate::types::ReplicaId(cid),
+                transport,
+                communication_info: Default::default(),
+                role,
+                status,
+                created_at: 1,
+            }),
+            None => ChannelRecord::Helper(HelperChannel {
+                channel_id: ChannelId(cid),
+                transport,
+                communication_info: Default::default(),
+                status,
+                created_at: 1,
+                peer_role,
+            }),
+        };
+        channels.save(sid, record).await.expect("channel saved");
         secrets
             .save(sid, ChannelId(cid), SecretValue::SharedKey([key_byte; 32]))
             .await
@@ -659,6 +672,7 @@ mod recovery_ids_tests {
                 timestamp: Some(current_timestamp()),
                 secret_id,
                 version,
+                replica_id: None,
             })
             .collect()
     }
@@ -1517,16 +1531,23 @@ mod tests {
                 },
             ],
             replicas: Some(crate::protocol::types::Replicas {
-                replicas: vec![ReplicaInfo {
-                    channel_id: 11,
-                    transport_uri: "https://replica.example".to_owned(),
-                    communication_info: HashMap::new(),
-                    replica_id: 0xCAFE,
-                    sender_kind: derec_proto::SenderKind::ReplicaDestination as i32,
-                }],
+                channel_id: 11,
+                members: vec![
+                    ReplicaInfo {
+                        replica_id: 0xBEEF,
+                        transport_uri: "https://owner.example".to_owned(),
+                        role: crate::protocol::types::ReplicaRole::Source as i32,
+                        communication_info: HashMap::new(),
+                    },
+                    ReplicaInfo {
+                        replica_id: 0xCAFE,
+                        transport_uri: "https://replica.example".to_owned(),
+                        role: crate::protocol::types::ReplicaRole::Destination as i32,
+                        communication_info: HashMap::new(),
+                    },
+                ],
                 shared_key: vec![0x55; 32],
             }),
-            owner_replica_id: 0xBEEF,
         }
     }
 
@@ -1551,9 +1572,15 @@ mod tests {
         assert_eq!(decoded.helpers.len(), 1);
         assert_eq!(decoded.helpers[0].channel_id, 7);
         let group = decoded.replicas.as_ref().expect("replicas must round-trip");
-        assert_eq!(group.replicas.len(), 1);
-        assert_eq!(group.replicas[0].replica_id, 0xCAFE);
-        assert_eq!(decoded.owner_replica_id, 0xBEEF);
+        assert_eq!(group.channel_id, 11);
+        assert_eq!(group.members.len(), 2);
+        // The roster names its source by role rather than a separate field.
+        let source = group
+            .members
+            .iter()
+            .find(|m| m.role == crate::protocol::types::ReplicaRole::Source as i32)
+            .expect("the roster names exactly one source");
+        assert_eq!(source.replica_id, 0xBEEF);
     }
 
     /// Empty `secret_data` is not a valid gzip stream, so the inner

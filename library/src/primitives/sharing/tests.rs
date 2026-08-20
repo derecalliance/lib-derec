@@ -216,7 +216,6 @@ fn test_produce_store_share_request_message_valid() {
         "",
         &shared_key,
         None,
-        None,
     )
     .expect("produce_store_share_request_message should succeed");
 
@@ -251,7 +250,6 @@ fn test_produce_store_share_request_message_with_keep_list_and_description() {
         &[1, 2],
         "initial share distribution",
         &shared_key,
-        None,
         None,
     )
     .expect("produce_store_share_request_message should succeed");
@@ -289,7 +287,6 @@ fn test_produce_store_share_response_message_valid() {
         &[],
         "",
         &shared_key,
-        None,
         None,
     )
     .expect("produce_store_share_request_message should succeed");
@@ -364,7 +361,6 @@ fn test_extract_store_share_request_wrong_key() {
         "",
         &shared_key,
         None,
-        None,
     )
     .expect("produce_store_share_request_message should succeed");
 
@@ -438,7 +434,6 @@ fn test_process_store_share_response_message_valid() {
         "",
         &shared_key,
         None,
-        None,
     )
     .expect("produce_store_share_request_message should succeed");
 
@@ -487,7 +482,6 @@ fn test_process_store_share_response_message_wrong_version() {
         &[],
         "",
         &shared_key,
-        None,
         None,
     )
     .expect("produce_store_share_request_message should succeed");
@@ -539,7 +533,6 @@ fn test_extract_store_share_response_wrong_key() {
         &[],
         "",
         &shared_key,
-        None,
         None,
     )
     .expect("produce_store_share_request_message should succeed");
@@ -639,7 +632,6 @@ fn test_extract_store_share_request_rejects_scheme_mismatched_reply_to() {
         String::new(),
         &shared_key,
         Some(malicious_reply_to),
-        None,
     )
     .expect("failed to produce store share request");
 
@@ -653,15 +645,12 @@ fn test_extract_store_share_request_rejects_scheme_mismatched_reply_to() {
     ));
 }
 
-/// `produce` stamps `replica_id` onto the wire message and `extract`
-/// round-trips it. Owner case (`None`) and replica case (`Some(_)`)
-/// both pass through unchanged so the helper-side handler can
-/// disambiguate concurrent writes from distinct replicas reusing the
-/// source's shared key.
+/// Helper-bound requests carry no writer identity: the audience
+/// invariant is enforced by construction, not by the caller.
 #[test]
-fn test_store_share_request_round_trips_replica_id() {
+fn helper_bound_request_never_carries_a_replica_id() {
     let secret_id: u64 = 1;
-    let secret_data = b"replica-id-roundtrip";
+    let secret_data = b"helper-bound-has-no-replica-id";
     let channels = make_channel_ids(&[1, 2, 3]);
     let version = 1;
 
@@ -672,7 +661,7 @@ fn test_store_share_request_round_trips_replica_id() {
     let committed_share = shares.get(&channel_id).expect("missing share");
     let shared_key = [42u8; 32];
 
-    let owner_env = produce_store_share_request_message(
+    let envelope = produce_store_share_request_message(
         channel_id,
         version,
         secret_id,
@@ -681,31 +670,19 @@ fn test_store_share_request_round_trips_replica_id() {
         String::new(),
         &shared_key,
         None,
-        None,
     )
-    .expect("owner-side produce")
+    .expect("helper-bound produce")
     .envelope;
-    let owner_extracted =
-        extract_store_share_request(&owner_env, &shared_key).expect("owner-side extract");
-    assert_eq!(owner_extracted.request.replica_id, None);
 
-    let replica_env = produce_store_share_request_message(
-        channel_id,
-        version,
-        secret_id,
-        committed_share,
-        &[],
-        String::new(),
-        &shared_key,
-        None,
-        Some(0xCAFE_BABE_DEAD_BEEF),
-    )
-    .expect("replica-side produce")
-    .envelope;
-    let replica_extracted =
-        extract_store_share_request(&replica_env, &shared_key).expect("replica-side extract");
+    let extracted =
+        extract_store_share_request(&envelope, &shared_key).expect("helper-bound extract");
+
+    // Helpers know nothing about replicas. `SHARE_ALGORITHM_VSS` is
+    // helper-bound, so the writer identity is unconditionally absent —
+    // there is no argument by which a caller could set it.
     assert_eq!(
-        replica_extracted.request.replica_id,
-        Some(0xCAFE_BABE_DEAD_BEEF)
+        extracted.request.share_algorithm,
+        crate::primitives::sharing::request::SHARE_ALGORITHM_VSS
     );
+    assert_eq!(extracted.request.replica_id, None);
 }

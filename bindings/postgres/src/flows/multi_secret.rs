@@ -5,7 +5,7 @@ use derec_library::protocol::DeRecChannelStore;
 use derec_library::protocol::DeRecFlow;
 use derec_library::protocol::DeRecUserSecretStore;
 use derec_library::protocol::events::DeRecEvent;
-use derec_library::protocol::types::{Target, UserSecret};
+use derec_library::protocol::types::{ChannelQuery, Target, UserSecret};
 use derec_library::types::ChannelId;
 use derec_proto::SenderKind;
 use std::collections::HashMap;
@@ -201,13 +201,23 @@ pub async fn run() {
     user_wallet
         .protocol
         .channel_store
-        .remove(WALLET_SECRET_ID, wallet_alice)
+        .remove(
+            WALLET_SECRET_ID,
+            ChannelQuery::Helper {
+                channel_id: wallet_alice,
+            },
+        )
         .await
         .unwrap();
     user_wallet
         .protocol
         .channel_store
-        .remove(WALLET_SECRET_ID, wallet_bob)
+        .remove(
+            WALLET_SECRET_ID,
+            ChannelQuery::Helper {
+                channel_id: wallet_bob,
+            },
+        )
         .await
         .unwrap();
     println!("  wallet secret: re-paired on fresh channels, originals dropped  ✓");

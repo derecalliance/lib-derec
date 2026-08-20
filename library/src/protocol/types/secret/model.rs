@@ -60,42 +60,36 @@ pub struct UserSecret {
     pub data: ::prost::alloc::vec::Vec<u8>,
 }
 
-/// Per-replica metadata stored inside the [`Secret`] — mirrors
-/// [`HelperInfo`] but for the replica role and carries the extra
-/// `replica_id` + `sender_kind` fields needed by the replica model. In
-/// the recoverable JSON encoding (see [`crate::protocol::types::secret`]), `channel_id` and `replica_id`
-/// serialize as decimal strings and `sender_kind` as an integer.
+/// One member of the replica group, as carried inside the [`Secret`].
 ///
-/// **No per-pair key**: all replica channels for a given `secret_id`
-/// converge on a single group key (see [`crate::protocol::types::ReplicaSecretPayload::shared_key`]
-/// for how that key is handed off to a new joiner). Each replica's
-/// `(secret_id, channel_id)` entry in
-/// [`crate::protocol::DeRecSecretStore`] holds that same group key, so
-/// any replica can address any other replica's peers by loading the
-/// channel key from its own secret store — this struct does not need to
-/// carry it.
+/// Mirrors [`crate::protocol::types::ReplicaMember`] minus the group-level
+/// fields: `channel_id` and the group key live on [`Replicas`], because every
+/// member shares them. In the recoverable JSON encoding (see
+/// [`crate::protocol::types::secret`]) `replica_id` serializes as a decimal
+/// string and `role` as its variant name.
+///
+/// The roster is **absolute**: `role` is what this member is within the group,
+/// not what it is relative to whoever is reading. A device that has only paired
+/// and not yet hydrated may hold a provisional role for its admitter; the
+/// roster overwrites it. See [`crate::protocol::types::ReplicaRole`].
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReplicaInfo {
-    /// Channel identifier the originator uses to address this peer.
+    /// The member's `replica_id` — its global stable identity, and the key it
+    /// is stored under.
     #[prost(uint64, tag = "1")]
-    pub channel_id: u64,
-    /// The peer's message endpoint URI.
+    pub replica_id: u64,
+    /// The member's message endpoint URI.
     #[prost(string, tag = "2")]
     pub transport_uri: ::prost::alloc::string::String,
-    /// App-level identity metadata for this peer. Same opacity contract
+    /// The member's [`crate::protocol::types::ReplicaRole`] discriminant.
+    /// Exactly one member of a group carries `Source`.
+    #[prost(int32, tag = "3")]
+    pub role: i32,
+    /// App-level identity metadata for this member. Same opacity contract
     /// as [`HelperInfo::communication_info`].
     #[prost(map = "string, string", tag = "4")]
     pub communication_info:
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-    /// The peer's `replica_id` — global stable identity of the replica
-    /// device, separate from the per-channel `channel_id`.
-    #[prost(uint64, tag = "5")]
-    pub replica_id: u64,
-    /// Raw `SenderKind` value the peer played in this pair (typically
-    /// `REPLICA_SOURCE` or `REPLICA_DESTINATION`). Carried for future
-    /// conflict-resolution flows; not used by the protocol layer today.
-    #[prost(int32, tag = "6")]
-    pub sender_kind: i32,
 }
 
 /// The protocol's `secret` — serialized into `DeRecSecret.secret_data`.
@@ -124,15 +118,15 @@ pub struct Secret {
     /// replica setup. See [`Replicas`] for field semantics.
     #[prost(message, optional, tag = "3")]
     pub replicas: ::core::option::Option<Replicas>,
-    /// The `replica_id` of the device that created or last updated this
-    /// version of the secret. Used by Destinations to attribute origin
-    /// and will drive future conflict-resolution logic.
-    #[prost(uint64, tag = "4")]
-    pub owner_replica_id: u64,
 }
 
-/// Replica composite carried inside [`Secret`] — the destination
-/// roster + the 32-byte group key shared by every replica channel.
+/// The replica group carried inside [`Secret`] — the full member roster plus
+/// the two things every member shares: one `channel_id` and one group key.
+///
+/// The roster includes the **source and the reader itself**. A group whose
+/// members cannot name themselves is not reconstructible from the payload, so
+/// omitting any member — including the writer — is a defect, not an
+/// optimization.
 ///
 /// The per-helper share map is *not* part of this composite: VSS
 /// shares are derived from the encoded `Secret` (see
@@ -141,16 +135,19 @@ pub struct Secret {
 /// rides on [`crate::protocol::types::ReplicaSecretPayload`] alongside the encoded `Secret`
 /// instead.
 ///
-/// `shared_key` must be 32 bytes when [`Self::replicas`] is
+/// `shared_key` must be 32 bytes when [`Self::members`] is
 /// non-empty. The library enforces this invariant on the producer
 /// side during sharing round construction and on the consumer side in
 /// [`crate::protocol::DeRecProtocol::restore`].
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Replicas {
-    /// Snapshot of all paired Replica Destinations at protect time.
+    /// Every member of the group, including the source and the writer.
     #[prost(message, repeated, tag = "1")]
-    pub replicas: ::prost::alloc::vec::Vec<ReplicaInfo>,
+    pub members: ::prost::alloc::vec::Vec<ReplicaInfo>,
     /// 32-byte replica group key.
     #[prost(bytes = "vec", tag = "2")]
     pub shared_key: ::prost::alloc::vec::Vec<u8>,
+    /// The one channel every member is addressed on.
+    #[prost(uint64, tag = "3")]
+    pub channel_id: u64,
 }

@@ -27,49 +27,87 @@ const protocolSecretID = uint64(0xDE2EC)
 
 // -- In-memory store implementations, one per protocol.*Store interface --
 
+// Two maps, mirroring the two primary keys the interface defines: a helper
+// channel is unique per channelID, while a replica-group member is unique per
+// replicaID and moves between channels during an admission handover.
 type memChannelStore struct {
-	mu    sync.Mutex
-	data  map[[2]uint64]protocol.Channel
-	links map[[2]uint64]map[uint64]struct{}
+	mu      sync.Mutex
+	helpers map[[2]uint64]protocol.HelperChannel
+	members map[[2]uint64]protocol.ReplicaMember
+	links   map[[2]uint64]map[uint64]struct{}
 }
 
 func newMemChannelStore() *memChannelStore {
 	return &memChannelStore{
-		data:  make(map[[2]uint64]protocol.Channel),
-		links: make(map[[2]uint64]map[uint64]struct{}),
+		helpers: make(map[[2]uint64]protocol.HelperChannel),
+		members: make(map[[2]uint64]protocol.ReplicaMember),
+		links:   make(map[[2]uint64]map[uint64]struct{}),
 	}
 }
 
-func (s *memChannelStore) Load(secretID, channelID uint64) (protocol.Channel, bool, error) {
+func (s *memChannelStore) Load(secretID, channelID, replicaID uint64) (protocol.ChannelRecord, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	c, ok := s.data[[2]uint64{secretID, channelID}]
-	return c, ok, nil
+	if replicaID == 0 {
+		h, ok := s.helpers[[2]uint64{secretID, channelID}]
+		if !ok {
+			return protocol.ChannelRecord{}, false, nil
+		}
+		return protocol.ChannelRecord{Helper: &h}, true, nil
+	}
+	m, ok := s.members[[2]uint64{secretID, replicaID}]
+	if !ok {
+		return protocol.ChannelRecord{}, false, nil
+	}
+	return protocol.ChannelRecord{Replica: &m}, true, nil
 }
 
-func (s *memChannelStore) Save(secretID uint64, channel protocol.Channel) error {
+func (s *memChannelStore) Save(secretID uint64, record protocol.ChannelRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data[[2]uint64{secretID, channel.ID}] = channel
+	if record.Helper != nil {
+		s.helpers[[2]uint64{secretID, record.Helper.ChannelID}] = *record.Helper
+	}
+	if record.Replica != nil {
+		s.members[[2]uint64{secretID, record.Replica.ReplicaID}] = *record.Replica
+	}
 	return nil
 }
 
-func (s *memChannelStore) Remove(secretID, channelID uint64) (bool, error) {
+func (s *memChannelStore) Remove(secretID, channelID, replicaID uint64) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	key := [2]uint64{secretID, channelID}
-	_, existed := s.data[key]
-	delete(s.data, key)
+	if replicaID == 0 {
+		key := [2]uint64{secretID, channelID}
+		_, existed := s.helpers[key]
+		delete(s.helpers, key)
+		return existed, nil
+	}
+	key := [2]uint64{secretID, replicaID}
+	_, existed := s.members[key]
+	delete(s.members, key)
 	return existed, nil
 }
 
-func (s *memChannelStore) ListChannels(secretID uint64) ([]uint64, error) {
+func (s *memChannelStore) ListHelpers(secretID uint64) ([]protocol.HelperChannel, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var out []uint64
-	for key := range s.data {
+	var out []protocol.HelperChannel
+	for key, h := range s.helpers {
 		if key[0] == secretID {
-			out = append(out, key[1])
+			out = append(out, h)
+		}
+	}
+	return out, nil
+}
+
+func (s *memChannelStore) ListReplicas(secretID uint64) ([]protocol.ReplicaMember, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []protocol.ReplicaMember
+	for key, m := range s.members {
+		if key[0] == secretID {
+			out = append(out, m)
 		}
 	}
 	return out, nil
@@ -592,7 +630,7 @@ func runProtocol() {
 		{"owner/channelB", owner.channelStore, channelB},
 		{"helper-b/channelB", helperB.channelStore, channelB},
 	} {
-		_, ok, err := check.store.Load(protocolSecretID, check.cid)
+		_, ok, err := check.store.Load(protocolSecretID, check.cid, 0)
 		must(err, fmt.Sprintf("%s channelStore.Load", check.label))
 		assertTrue(ok, "%s channelStore must have the paired channel", check.label)
 	}

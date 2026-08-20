@@ -23,6 +23,10 @@ pub struct GetShareRequestMessage {
     /// Optional ephemeral response endpoint. See `replyTo` on the request
     /// proto for the routing semantics.
     pub reply_to: Option<TransportProtocol>,
+    /// Identity of the replica-group member this message concerns, present
+    /// only on the replica catch-up path. `null` on the owner ↔ helper path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_id: Option<u64>,
 }
 
 impl From<derec_proto::GetShareRequestMessage> for GetShareRequestMessage {
@@ -32,6 +36,7 @@ impl From<derec_proto::GetShareRequestMessage> for GetShareRequestMessage {
             version: value.version,
             timestamp: value.timestamp.map(Into::into),
             reply_to: value.reply_to.map(Into::into),
+            replica_id: value.replica_id,
         }
     }
 }
@@ -43,6 +48,7 @@ impl From<GetShareRequestMessage> for derec_proto::GetShareRequestMessage {
             version: value.version,
             timestamp: value.timestamp.map(Into::into),
             reply_to: value.reply_to.map(Into::into),
+            replica_id: value.replica_id,
         }
     }
 }

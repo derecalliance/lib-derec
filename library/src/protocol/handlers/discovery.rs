@@ -66,10 +66,10 @@ pub(in crate::protocol) async fn start<
     reply_to: Option<derec_proto::TransportProtocol>,
 ) -> Result<Vec<DeRecEvent>> {
     let known_channel_ids: std::collections::HashSet<ChannelId> = channel_store
-        .channels(secret_id)
+        .helpers(secret_id)
         .await?
         .into_iter()
-        .map(|ch| ch.id)
+        .map(|ch| ch.channel_id)
         .collect();
     let channel_ids: Vec<ChannelId> = match target {
         Target::All => known_channel_ids.iter().copied().collect(),
@@ -144,11 +144,11 @@ pub(in crate::protocol) async fn start<
 /// Answer a peer's discovery request with the catalog of secrets held
 /// for it across every linked channel.
 ///
-/// Entries are grouped by `secret_id`, then keyed by
-/// `(version, replica_id)`. Pairing the version with the replica that
-/// wrote it means two replicas publishing the same numeric version
-/// surface as two distinct catalog entries — the conflict-visibility
-/// surface the application relies on to detect concurrent writes.
+/// Entries are grouped by `secret_id`, then keyed by `version`. A helper
+/// holds exactly one share per `(secret_id, version)` — a second write
+/// carrying different content is refused with `VERSION_CONFLICT` rather
+/// than stored alongside — so a version identifies a share unambiguously
+/// and needs no writer to disambiguate it.
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
@@ -171,10 +171,8 @@ pub(in crate::protocol) async fn accept<
     let linked_ids = channel_store.linked_channels(secret_id, channel_id).await?;
     let all_shares = share_store.load_all(secret_id, &linked_ids).await?;
 
-    let mut secret_map: std::collections::HashMap<
-        u64,
-        std::collections::BTreeMap<(u32, Option<u64>), String>,
-    > = std::collections::HashMap::new();
+    let mut secret_map: std::collections::HashMap<u64, std::collections::BTreeMap<u32, String>> =
+        std::collections::HashMap::new();
 
     for share in all_shares {
         let description = StoreShareRequestMessage::decode(share.bytes.as_slice())
@@ -183,7 +181,7 @@ pub(in crate::protocol) async fn accept<
         secret_map
             .entry(share.secret_id)
             .or_default()
-            .entry((share.version, share.replica_id))
+            .entry(share.version)
             .or_insert(description);
     }
 
@@ -193,10 +191,9 @@ pub(in crate::protocol) async fn accept<
             secret_id,
             versions: versions
                 .into_iter()
-                .map(|((version, replica_id), description)| VersionEntry {
+                .map(|(version, description)| VersionEntry {
                     version,
                     description,
-                    replica_id,
                 })
                 .collect(),
         })
@@ -235,6 +232,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
     status: StatusEnum,
     memo: &str,
     trace_id: u64,
+    local_replica_id: Option<u64>,
 ) -> Result<()> {
     let response = GetSecretIdsVersionsResponseMessage {
         result: Some(DeRecResult {
@@ -243,6 +241,9 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
         }),
         secret_list: Vec::new(),
         timestamp: Some(current_timestamp()),
+        // Answer on the path the request arrived on: a member asking gets a
+        // member's answer, a helper exchange stays helper-bound.
+        replica_id: local_replica_id.filter(|_| request.replica_id.is_some()),
     };
 
     super::send_channel_message(

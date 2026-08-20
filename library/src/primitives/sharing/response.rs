@@ -101,7 +101,7 @@ pub struct ExtractResult {
 ///
 /// // Owner: build the sharing request envelope.
 /// let request::ProduceResult { envelope: req_envelope } =
-///     request::produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, None, None)
+///     request::produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, None)
 ///         .expect("produce request failed");
 ///
 /// // Helper: extract the request, then build the response.
@@ -138,6 +138,9 @@ pub fn produce(
         version: request.version,
         timestamp: Some(timestamp),
         secret_id: request.secret_id,
+        // Helper-bound acknowledgement. Helpers hold no replica identity
+        // in either direction — see `StoreShareRequestMessage.replicaId`.
+        replica_id: None,
     };
 
     let envelope = DeRecMessageBuilder::channel()
@@ -221,7 +224,7 @@ pub fn produce(
 ///
 /// // Owner → Helper → Owner roundtrip.
 /// let request::ProduceResult { envelope: req_envelope } =
-///     request::produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, None, None)
+///     request::produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, None)
 ///         .expect("produce request failed");
 /// let request::ExtractResult { request: share_request } =
 ///     request::extract(&req_envelope, &shared_key).expect("extract request failed");
@@ -312,7 +315,7 @@ pub fn extract(
 ///
 /// // Owner → Helper → Owner roundtrip.
 /// let request::ProduceResult { envelope: req_envelope } =
-///     request::produce(channel_id, version, 1, committed_share, &[], "", &shared_key, None, None)
+///     request::produce(channel_id, version, 1, committed_share, &[], "", &shared_key, None)
 ///         .expect("produce request failed");
 /// let request::ExtractResult { request: share_request } =
 ///     request::extract(&req_envelope, &shared_key).expect("extract request failed");

@@ -181,24 +181,12 @@ pub fn produce(
     // leave it absent (the responder routes to the channel's stored peer
     // endpoint).
     reply_to: JsValue,
-    // Optional writer `replica_id` as a JS `Option<u64>` (passed as
-    // `null`/`undefined` for "non-replica Owner", or a `bigint` /
-    // decimal string for the producing replica's id). Stamped onto the
-    // outbound `StoreShareRequestMessage.replicaId` — see the proto's
-    // `replicaId` doc for the disambiguation contract.
-    replica_id: JsValue,
 ) -> Result<JsValue, JsValue> {
     let shared_key = parse_shared_key(shared_key)?;
     let committed_share: CommittedDeRecShare = from_js(committed_share)?;
     let committed_share_proto: derec_proto::CommittedDeRecShare = committed_share.into();
     let keep_list_raw: Vec<u32> = from_js(keep_list)?;
     let reply_to_proto = parse_optional_transport_protocol(reply_to)?;
-    let replica_id_opt: Option<u64> = if replica_id.is_null() || replica_id.is_undefined() {
-        None
-    } else {
-        Some(from_js(replica_id)?)
-    };
-
     let result = request::produce(
         ChannelId(channel_id),
         version,
@@ -208,7 +196,6 @@ pub fn produce(
         description,
         &shared_key,
         reply_to_proto,
-        replica_id_opt,
     )
     .map_err(js_error_from_lib)?;
 

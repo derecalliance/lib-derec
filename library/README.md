@@ -148,7 +148,7 @@ use derec_proto::{Protocol, TransportProtocol};
 
 // 1. Implement the four storage/transport traits for your environment.
 //    See the trait docs:
-//    - DeRecChannelStore  — paired channels
+//    - DeRecChannelStore  — helper channels + replica-group members
 //    - DeRecShareStore    — secret shares
 //    - DeRecSecretStore   — per-channel key material (sensitive)
 //    - DeRecTransport     — outbound message delivery
@@ -655,7 +655,7 @@ implementations need no internal synchronization:
 
 | Trait | Stores |
 |-------|--------|
-| [`DeRecChannelStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecChannelStore.html) | Paired channel records and the channel-link graph. |
+| [`DeRecChannelStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecChannelStore.html) | Helper channels (keyed by `channel_id`), replica-group members (keyed by `replica_id`), and the channel-link graph. |
 | [`DeRecShareStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecShareStore.html) | Encoded share entries keyed by `(channel_id, secret_id, version)`. |
 | [`DeRecSecretStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecSecretStore.html) | Per-channel cryptographic material (shared keys, pairing secrets, pairing contacts). |
 | [`DeRecTransport`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecTransport.html) | Outbound envelope delivery to peers. |

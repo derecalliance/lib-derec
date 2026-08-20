@@ -26,15 +26,28 @@ public enum ChannelStatus
 }
 
 /// <summary>
-/// Post-pairing peer record persisted in <see cref="IChannelStore"/>.
+/// A member's role within a replica group.
 /// </summary>
 /// <remarks>
-/// Mirrors the Rust-side <c>crate::protocol::types::Channel</c> shape
-/// 1:1. The FFI bridge translates between this typed form and the
-/// snake_case JSON wire format internally; consumers only ever see
-/// the strongly-typed values.
+/// Exactly one member of a group is the <c>Source</c>. This is a property of
+/// <em>membership</em>, not of a channel: all members share one channel, so
+/// the channel cannot carry it. The value is absolute — every member records
+/// the same role for a given peer, regardless of who is reading.
 /// </remarks>
-/// <param name="Id">Channel identifier; opaque on this side.</param>
+public enum ReplicaRole
+{
+    Source,
+    Destination,
+}
+
+/// <summary>
+/// A channel to a single helper, or to the owner from a helper's side.
+/// </summary>
+/// <remarks>
+/// Mirrors the Rust-side <c>crate::protocol::types::HelperChannel</c> shape
+/// 1:1. Keyed by <c>(secretId, channelId)</c>.
+/// </remarks>
+/// <param name="ChannelId">Channel identifier; opaque on this side.</param>
 /// <param name="Transport">The peer's transport endpoint.</param>
 /// <param name="CommunicationInfo">App-level identity metadata for the peer.</param>
 /// <param name="Status">Lifecycle state (<see cref="ChannelStatus"/>).</param>
@@ -45,15 +58,62 @@ public enum ChannelStatus
 /// helper-pairing held by an Owner carries <c>Helper</c> here, and the
 /// Helper's own row for the same channel carries <c>Owner</c>.
 /// </param>
-/// <param name="ReplicaId">Peer's replica identity (only set for replica roles).</param>
-public sealed record Channel(
-    ulong Id,
+public sealed record HelperChannel(
+    ulong ChannelId,
     TransportProtocol Transport,
     Dictionary<string, string> CommunicationInfo,
     ChannelStatus Status,
     ulong CreatedAt,
-    Pairing.SenderKind PeerRole,
-    ulong? ReplicaId);
+    Pairing.SenderKind PeerRole);
+
+/// <summary>
+/// One member of a replica group, including this device itself.
+/// </summary>
+/// <remarks>
+/// Mirrors the Rust-side <c>crate::protocol::types::ReplicaMember</c> shape
+/// 1:1. Keyed by <c>(secretId, replicaId)</c>: every member shares one
+/// <c>ChannelId</c>, so the channel cannot be the key. Storing this device's
+/// own row is what makes the roster reconstructible from stores alone.
+/// </remarks>
+/// <param name="ChannelId">The group channel. Identical for every member.</param>
+/// <param name="ReplicaId">This member's identity — the primary key within the group.</param>
+/// <param name="Transport">This member's transport endpoint.</param>
+/// <param name="CommunicationInfo">App-level identity metadata for the member.</param>
+/// <param name="Role">This member's role (<see cref="ReplicaRole"/>).</param>
+/// <param name="Status">Lifecycle state (<see cref="ChannelStatus"/>).</param>
+/// <param name="CreatedAt">Unix timestamp (seconds) when the row was created.</param>
+public sealed record ReplicaMember(
+    ulong ChannelId,
+    ulong ReplicaId,
+    TransportProtocol Transport,
+    Dictionary<string, string> CommunicationInfo,
+    ReplicaRole Role,
+    ChannelStatus Status,
+    ulong CreatedAt);
+
+/// <summary>
+/// A record held by <see cref="IChannelStore"/>: either a helper channel or
+/// one replica-group member. Exactly one of the two properties is non-null.
+/// </summary>
+public sealed record ChannelRecord(HelperChannel? Helper, ReplicaMember? Replica)
+{
+    public static ChannelRecord Of(HelperChannel helper) => new(helper, null);
+    public static ChannelRecord Of(ReplicaMember member) => new(null, member);
+
+    /// <summary>The channel this record names, whichever variant it is.</summary>
+    public ulong ChannelId => Helper?.ChannelId ?? Replica?.ChannelId
+        ?? throw new InvalidOperationException("ChannelRecord holds neither variant");
+
+    /// <summary>
+    /// The replica id this record is keyed by, or <c>0</c> for a helper
+    /// channel — the value the Rust side reserves as "absent".
+    /// </summary>
+    public ulong ReplicaId => Replica?.ReplicaId ?? 0;
+
+    /// <summary>Lifecycle state, whichever variant it is.</summary>
+    public ChannelStatus Status => Helper?.Status ?? Replica?.Status
+        ?? throw new InvalidOperationException("ChannelRecord holds neither variant");
+}
 
 /// <summary>
 /// Kind selector for <see cref="ISecretStore"/>. Numeric values must
@@ -79,12 +139,50 @@ public sealed record SecretValue(SecretKind Kind, byte[] Bytes);
 /// overlapping calls (the protocol holds the store by <c>&amp;mut self</c>
 /// on the Rust side, serialising access).
 /// </summary>
+/// <remarks>
+/// A record is addressed by <c>(channelId, replicaId)</c>. A <c>replicaId</c>
+/// of <c>0</c> — the value the protocol reserves as "absent" — addresses the
+/// helper channel at <c>channelId</c>.
+/// <para>
+/// Any other value addresses that member of the replica group, and the member
+/// is keyed by <b><c>replicaId</c> alone</b>. The accompanying
+/// <c>channelId</c> is context, not part of the key: a member moves between
+/// channels during an admission handover while remaining the same member, and
+/// a lookup that required both to match would miss it exactly when the move
+/// needs to be observed. Keep two maps — helpers by <c>channelId</c>, members
+/// by <c>replicaId</c> — not one keyed by the pair.
+/// </para>
+/// </remarks>
 public interface IChannelStore
 {
-    Channel? Load(ulong secretId, ulong channelId);
-    void Save(ulong secretId, Channel channel);
-    bool Remove(ulong secretId, ulong channelId);
-    IEnumerable<ulong> ListChannelIds(ulong secretId);
+    ChannelRecord? Load(ulong secretId, ulong channelId, ulong replicaId);
+    void Save(ulong secretId, ChannelRecord record);
+    bool Remove(ulong secretId, ulong channelId, ulong replicaId);
+    IEnumerable<HelperChannel> ListHelpers(ulong secretId);
+
+    /// <summary>
+    /// Every replica-group member stored under <paramref name="secretId"/>,
+    /// including this device's own row.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The order is significant in exactly one situation. A group has one
+    /// member holding the <c>Source</c> role; when it is removed, the protocol
+    /// promotes the first element of this sequence that is neither the
+    /// departing member nor itself leaving. Ordering this sequence is
+    /// therefore how an application chooses its succession policy. The choice
+    /// is read once, on the single device running the removal, and is then
+    /// published in the roster, so implementations on different devices need
+    /// not agree on order. Nothing else consults it.
+    /// </para>
+    /// <para>
+    /// Returning an arbitrary order is correct and simply delegates the choice
+    /// to the storage — note that a SQL <c>SELECT</c> without <c>ORDER BY</c>
+    /// and <c>Dictionary</c> enumeration are both arbitrary. Order explicitly
+    /// to make succession predictable.
+    /// </para>
+    /// </remarks>
+    IEnumerable<ReplicaMember> ListReplicas(ulong secretId);
     void LinkChannel(ulong secretId, ulong a, ulong b);
     IEnumerable<ulong> LinkedChannels(ulong secretId, ulong channelId);
 }
@@ -203,6 +301,11 @@ public enum StateKind : uint
     PendingUnpair = 2,
     /// <summary>Active sharing round, at most one per secretId.</summary>
     SharingRound = 3,
+    /// <summary>
+    /// Active replica catch-up, at most one row per <c>secretId</c>. Holds
+    /// the versions members have reported so far.
+    /// </summary>
+    PendingSyncCheck = 4,
 }
 
 /// <summary>
@@ -254,6 +357,14 @@ public sealed record StateKey(StateKind Kind, ulong? ChannelId, ulong? SecretId,
 /// <param name="Pending">Channel-id set of helpers yet to respond (only for <see cref="StateKind.SharingRound"/>).</param>
 /// <param name="Confirmed">Channel-id set of helpers that confirmed storage (only for <see cref="StateKind.SharingRound"/>).</param>
 /// <param name="Failed">Channel-id set of helpers that rejected or timed out (only for <see cref="StateKind.SharingRound"/>).</param>
+/// <param name="PendingReplicas">
+/// Replica-id set of group members yet to respond (only for
+/// <see cref="StateKind.SharingRound"/>). The replica leg is keyed by
+/// <c>replicaId</c>, not <c>channelId</c>: every member of a group answers on
+/// the one shared channel, so a channel-keyed set would collapse them.
+/// </param>
+/// <param name="SyncedReplicas">Replica-id set of members that acknowledged.</param>
+/// <param name="BehindReplicas">Replica-id set of members that refused, timed out, or were unreachable.</param>
 public sealed record StateItem(
     StateKind Kind,
     ulong? ChannelId,
@@ -264,7 +375,10 @@ public sealed record StateItem(
     byte[][]? Shares,
     ulong[]? Pending = null,
     ulong[]? Confirmed = null,
-    ulong[]? Failed = null)
+    ulong[]? Failed = null,
+    ulong[]? PendingReplicas = null,
+    ulong[]? SyncedReplicas = null,
+    ulong[]? BehindReplicas = null)
 {
     public StateKey Key() => Kind switch
     {
@@ -290,8 +404,14 @@ public sealed record StateItem(
         ulong[] pending,
         ulong[] confirmed,
         ulong[] failed,
-        ulong startedAt) =>
-        new(StateKind.SharingRound, null, null, version, startedAt, null, null, pending, confirmed, failed);
+        ulong startedAt,
+        ulong[]? pendingReplicas = null,
+        ulong[]? syncedReplicas = null,
+        ulong[]? behindReplicas = null) =>
+        new(StateKind.SharingRound, null, null, version, startedAt, null, null, pending, confirmed, failed,
+            pendingReplicas ?? Array.Empty<ulong>(),
+            syncedReplicas ?? Array.Empty<ulong>(),
+            behindReplicas ?? Array.Empty<ulong>());
 }
 
 /// <summary>

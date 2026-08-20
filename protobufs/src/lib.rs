@@ -242,6 +242,7 @@ mod tests {
             memo: "bye".to_owned(),
             timestamp: None,
             reply_to: None,
+            replica_id: None,
         }
         .encode_to_vec()
     }
@@ -254,6 +255,7 @@ mod tests {
             memo: "bye".to_owned(),
             timestamp: None,
             reply_to: None,
+            replica_id: None,
         });
         let bytes = body.encode_to_vec();
         let round_tripped =

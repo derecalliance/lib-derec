@@ -268,7 +268,7 @@ For applications that don't want to drive the primitive produce/extract/process 
 
 `protocol.New` takes six application-supplied interfaces backing all persistence and transport:
 
-- `protocol.ChannelStore` — paired channels, keyed by `(secretID, channelID)`
+- `protocol.ChannelStore` — channel records, keyed by `(secretID, channelID, replicaID)`. A `replicaID` of `0` addresses the helper channel; any other value addresses that member of the replica group
 - `protocol.SecretStore` — pairing/session secret material
 - `protocol.ShareStore` — stored shares
 - `protocol.UserSecretStore` — the latest user-facing secret snapshot per `secretID`

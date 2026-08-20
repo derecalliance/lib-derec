@@ -1,21 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-use derec_library::protocol::types::{Channel, PairingKeyMaterial, UserSecret, UserSecrets};
+use derec_library::protocol::types::{
+    ChannelRecord, HelperChannel, PairingKeyMaterial, ReplicaMember, UserSecret, UserSecrets,
+};
 use derec_library::protocol::{SecretKind, SecretValue};
 use derec_proto::ContactMessage;
 use prost::Message;
 
-/// Channel ↔ bytes. The library already derives serde
-/// `Serialize`/`Deserialize` on `Channel` for the JSON-over-FFI
+/// Channel record ↔ bytes. The library already derives serde
+/// `Serialize`/`Deserialize` on these types for the JSON-over-FFI
 /// bridges, so we reuse that representation rather than rolling a new
 /// one.
-pub fn encode_channel(channel: &Channel) -> Vec<u8> {
-    serde_json::to_vec(channel).expect("failed to JSON-encode Channel")
+pub fn encode_channel(record: &ChannelRecord) -> Vec<u8> {
+    serde_json::to_vec(record).expect("failed to JSON-encode ChannelRecord")
 }
 
-pub fn decode_channel(bytes: &[u8]) -> Channel {
-    serde_json::from_slice(bytes).expect("failed to JSON-decode Channel")
+pub fn decode_channel(bytes: &[u8]) -> ChannelRecord {
+    serde_json::from_slice(bytes).expect("failed to JSON-decode ChannelRecord")
+}
+
+/// Unwrap a stored record as a helper channel. The two record kinds live in
+/// separate tables, so a mismatch means the row was written to the wrong one.
+pub fn decode_helper(bytes: &[u8]) -> HelperChannel {
+    match decode_channel(bytes) {
+        ChannelRecord::Helper(h) => h,
+        ChannelRecord::Replica(_) => panic!("replica member found in the helper channel table"),
+    }
+}
+
+/// Unwrap a stored record as a replica-group member.
+pub fn decode_member(bytes: &[u8]) -> ReplicaMember {
+    match decode_channel(bytes) {
+        ChannelRecord::Replica(m) => m,
+        ChannelRecord::Helper(_) => panic!("helper channel found in the replica member table"),
+    }
 }
 
 /// `SecretValue` ↔ bytes. The encoding is `[kind_tag, payload..]`

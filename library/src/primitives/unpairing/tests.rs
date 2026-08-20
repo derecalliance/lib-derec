@@ -26,8 +26,9 @@ fn test_produce_unpair_request_produces_non_empty_envelope() {
     let channel_id = ChannelId(7);
     let shared_key = make_shared_key(11);
 
-    let result = produce_unpair_request_message(channel_id, "no longer needed", &shared_key, None)
-        .expect("failed to produce unpair request");
+    let result =
+        produce_unpair_request_message(channel_id, "no longer needed", &shared_key, None, None)
+            .expect("failed to produce unpair request");
 
     assert!(!result.envelope.is_empty());
     let decoded = DeRecMessage::decode(result.envelope.as_slice()).unwrap();
@@ -39,7 +40,7 @@ fn test_produce_unpair_request_accepts_empty_memo() {
     let channel_id = ChannelId(7);
     let shared_key = make_shared_key(11);
 
-    let result = produce_unpair_request_message(channel_id, "", &shared_key, None)
+    let result = produce_unpair_request_message(channel_id, "", &shared_key, None, None)
         .expect("failed to produce unpair request with empty memo");
 
     let extracted = extract_unpair_request(&result.envelope, &shared_key)
@@ -53,7 +54,7 @@ fn test_extract_unpair_request_returns_original_memo() {
     let shared_key = make_shared_key(29);
     let memo = "explicit user choice";
 
-    let produced = produce_unpair_request_message(channel_id, memo, &shared_key, None)
+    let produced = produce_unpair_request_message(channel_id, memo, &shared_key, None, None)
         .expect("failed to produce unpair request");
 
     let result = extract_unpair_request(&produced.envelope, &shared_key)
@@ -69,7 +70,7 @@ fn test_extract_unpair_request_rejects_wrong_make_shared_key() {
     let producing_key = make_shared_key(1);
     let other_key = make_shared_key(2);
 
-    let produced = produce_unpair_request_message(channel_id, "x", &producing_key, None)
+    let produced = produce_unpair_request_message(channel_id, "x", &producing_key, None, None)
         .expect("failed to produce unpair request");
 
     let result = extract_unpair_request(&produced.envelope, &other_key);
@@ -81,7 +82,7 @@ fn test_extract_unpair_request_rejects_tampered_timestamp() {
     let channel_id = ChannelId(5);
     let shared_key = make_shared_key(7);
 
-    let produced = produce_unpair_request_message(channel_id, "m", &shared_key, None)
+    let produced = produce_unpair_request_message(channel_id, "m", &shared_key, None, None)
         .expect("failed to produce unpair request");
 
     // Mutate the outer envelope timestamp so the invariant
@@ -145,7 +146,7 @@ fn test_full_unpair_round_trip_ok() {
     let shared_key = make_shared_key(99);
     let memo = "device decommissioned";
 
-    let request = produce_unpair_request_message(channel_id, memo, &shared_key, None)
+    let request = produce_unpair_request_message(channel_id, memo, &shared_key, None, None)
         .expect("failed to produce unpair request");
 
     // Responder extracts the request, validates memo round-trip, sends Ok.
@@ -169,7 +170,8 @@ fn test_inner_request_decodable_via_extract_inner_message() {
     let channel_id = ChannelId(8);
     let shared_key = make_shared_key(5);
 
-    let produced = produce_unpair_request_message(channel_id, "x", &shared_key, None).unwrap();
+    let produced =
+        produce_unpair_request_message(channel_id, "x", &shared_key, None, None).unwrap();
     let envelope = DeRecMessage::decode(produced.envelope.as_slice()).unwrap();
     let inner = extract_inner_message(&envelope.message, &shared_key).unwrap();
     assert!(matches!(inner, MessageBody::UnpairRequest(_)));
@@ -191,9 +193,14 @@ fn test_extract_unpair_request_rejects_scheme_mismatched_reply_to() {
         protocol: derec_proto::Protocol::Https as i32,
     };
 
-    let produced =
-        produce_unpair_request_message(channel_id, "bye", &shared_key, Some(malicious_reply_to))
-            .expect("failed to produce unpair request");
+    let produced = produce_unpair_request_message(
+        channel_id,
+        "bye",
+        &shared_key,
+        Some(malicious_reply_to),
+        None,
+    )
+    .expect("failed to produce unpair request");
 
     let result = extract_unpair_request(&produced.envelope, &shared_key);
 

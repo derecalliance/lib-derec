@@ -34,6 +34,12 @@ pub const FLOW_KIND_VERIFY_SHARES: u32 = 3;
 pub const FLOW_KIND_RECOVER_SECRET: u32 = 4;
 pub const FLOW_KIND_UNPAIR: u32 = 5;
 pub const FLOW_KIND_UPDATE_CHANNEL_INFO: u32 = 6;
+/// Replica catch-up. Takes no parameters: the group and this device's own
+/// version are both read from the stores.
+pub const FLOW_KIND_SYNC_CHECK: u32 = 7;
+/// Remove a member from the replica group. Params:
+/// `{ "replica_id": "<decimal>", "memo": "<optional>" }`.
+pub const FLOW_KIND_REMOVE_REPLICA: u32 = 8;
 
 /// Top-level dispatcher — picks the right decoder based on `flow_kind`.
 pub fn parse_flow(flow_kind: u32, params_json: &[u8]) -> Result<DeRecFlow, String> {
@@ -45,6 +51,8 @@ pub fn parse_flow(flow_kind: u32, params_json: &[u8]) -> Result<DeRecFlow, Strin
         FLOW_KIND_RECOVER_SECRET => parse_recover_secret_flow(params_json),
         FLOW_KIND_UNPAIR => parse_unpair_flow(params_json),
         FLOW_KIND_UPDATE_CHANNEL_INFO => parse_update_channel_info_flow(params_json),
+        FLOW_KIND_SYNC_CHECK => Ok(DeRecFlow::SyncCheck),
+        FLOW_KIND_REMOVE_REPLICA => parse_remove_replica_flow(params_json),
         other => Err(format!("unknown FlowKind: {other}")),
     }
 }
@@ -239,4 +247,26 @@ struct UpdateChannelInfoParamsJson {
 struct TransportProtocolJson {
     uri: String,
     protocol: i32,
+}
+
+/// `{ "replica_id": "<decimal u64>", "memo": "<optional>" }` — `replica_id` is
+/// a decimal string so values above 2^53 survive a JSON round trip through
+/// hosts whose numbers are doubles.
+fn parse_remove_replica_flow(params_json: &[u8]) -> Result<DeRecFlow, String> {
+    #[derive(serde::Deserialize)]
+    struct Params {
+        replica_id: String,
+        #[serde(default)]
+        memo: Option<String>,
+    }
+    let p: Params = serde_json::from_slice(params_json)
+        .map_err(|e| format!("RemoveReplica params JSON: {e}"))?;
+    let replica_id = p
+        .replica_id
+        .parse::<u64>()
+        .map_err(|e| format!("replica_id must be a decimal u64: {e}"))?;
+    Ok(DeRecFlow::RemoveReplica {
+        replica_id,
+        memo: p.memo,
+    })
 }

@@ -147,26 +147,55 @@ pub(in crate::protocol) async fn accept<Ch: DeRecChannelStore, T: DeRecTransport
     shared_key: &SharedKey,
     trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
-    let mut channel =
-        channel_store
-            .load(secret_id, channel_id)
-            .await?
-            .ok_or(Error::InvalidInput(
-                "channel id not present in channel store",
-            ))?;
+    let channel = channel_store
+        .load(
+            secret_id,
+            crate::protocol::types::ChannelQuery::Helper { channel_id },
+        )
+        .await?
+        .ok_or(Error::InvalidInput(
+            "channel id not present in channel store",
+        ))?;
 
     #[cfg(feature = "logging")]
     let communication_info_updated = request.communication_info.is_some();
     #[cfg(feature = "logging")]
     let transport_protocol_updated = request.transport_protocol.is_some();
 
-    if let Some(ci) = request.communication_info.as_ref() {
-        channel.communication_info = extract_communication_info(ci);
-    }
-    if let Some(tp) = request.transport_protocol.clone() {
-        let _ = crate::transport::TransportProtocol::try_from(&tp)?;
-        channel.transport = tp;
-    }
+    let new_info = request
+        .communication_info
+        .as_ref()
+        .map(extract_communication_info);
+    let new_transport = match request.transport_protocol.clone() {
+        Some(tp) => {
+            let _ = crate::transport::TransportProtocol::try_from(&tp)?;
+            Some(tp)
+        }
+        None => None,
+    };
+
+    // Either record kind can carry an endpoint change; the fields live on the
+    // variants rather than the enum.
+    let channel = match channel {
+        crate::protocol::types::ChannelRecord::Helper(mut h) => {
+            if let Some(ci) = new_info {
+                h.communication_info = ci;
+            }
+            if let Some(tp) = new_transport {
+                h.transport = tp;
+            }
+            crate::protocol::types::ChannelRecord::Helper(h)
+        }
+        crate::protocol::types::ChannelRecord::Replica(mut r) => {
+            if let Some(ci) = new_info {
+                r.communication_info = ci;
+            }
+            if let Some(tp) = new_transport {
+                r.transport = tp;
+            }
+            crate::protocol::types::ChannelRecord::Replica(r)
+        }
+    };
 
     channel_store.save(secret_id, channel).await?;
 
