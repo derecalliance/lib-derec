@@ -279,19 +279,25 @@ pub unsafe extern "C" fn derec_protocol_reject(
 ///                   "shared_key": [..32 bytes..],
 ///                   "communication_info": {} }],
 ///     "secrets": [{ "id": [..], "name": "...", "data": [..] }],
-///     "replicas": [{ "channel_id": "21", "transport_uri": "...",
-///                    "replica_id": "0xCAFE", "sender_kind": 3,
-///                    "communication_info": {} }],
-///     "owner_replica_id": "48879",
-///     "replica_group_shared_key": [..32 bytes..]
+///     "replicas": {
+///       "channel_id": "21",
+///       "members": [{ "replica_id": "51966", "transport_uri": "...",
+///                     "role": "Source", "communication_info": {} }],
+///       "shared_key": [..32 bytes..]
+///     }
 ///   }
 /// }
 /// ```
 ///
 /// Field names mirror `SecretWire` in `protocol/events/wire.rs` — the
-/// same shape `SecretRecovered` carries. `channel_id`, `replica_id`,
-/// and `owner_replica_id` are decimal `u64` strings (empty / absent
-/// means zero).
+/// same shape `SecretRecovered` carries. `channel_id` and `replica_id`
+/// are decimal `u64` strings (empty / absent means zero).
+///
+/// `replicas` is an **object**, not an array, and is omitted entirely when
+/// the `secret_id` has no replica group. Every member of the group shares
+/// the one `channel_id` and the one `shared_key` it carries, so neither is
+/// repeated per member; a member is identified by `replica_id` alone, and
+/// the group's source is the member whose `role` is `"Source"`.
 ///
 /// # Safety
 ///

@@ -238,7 +238,7 @@ pub enum PendingAction {
     ///
     /// Calling [`super::DeRecProtocol::accept`] on this action does the
     /// state mutation **for you**: the orchestrator writes the new fields
-    /// onto the stored [`crate::protocol::types::Channel`] and sends back
+    /// onto the stored [`crate::protocol::types::HelperChannel`] and sends back
     /// an `Ok` response. When `transport_protocol` is part of the update,
     /// the response is routed to the **new** endpoint, so subsequent
     /// outbound traffic on this channel already targets the new address.
@@ -302,7 +302,7 @@ impl PendingAction {
 /// # Role gating
 ///
 /// The orchestrator enforces flow directionality against
-/// [`crate::protocol::types::Channel::peer_role`] (set at pairing time):
+/// [`crate::protocol::types::HelperChannel::peer_role`] (set at pairing time):
 ///
 /// - [`Self::Discovery`], [`Self::ProtectSecret`], [`Self::VerifyShares`],
 ///   [`Self::RecoverSecret`], and [`Self::Unpair`] require the peer to be
@@ -315,7 +315,7 @@ pub enum DeRecFlow {
         kind: SenderKind,
         contact: ContactMessage,
         /// App-level identity metadata for the peer being paired with.
-        /// Stored verbatim on the resulting [`crate::protocol::types::Channel`]
+        /// Stored verbatim on the resulting [`crate::protocol::types::HelperChannel`]
         /// (`channel.communication_info`). The protocol does not inspect
         /// it — pass an empty map to record nothing.
         peer_communication_info: std::collections::HashMap<String, String>,
@@ -457,7 +457,7 @@ pub enum DeRecEvent {
     ///
     /// `kind` is the local party's role in the pairing. The channel record
     /// stores its inverse — the peer's role — on
-    /// [`crate::protocol::types::Channel::peer_role`], which the
+    /// [`crate::protocol::types::HelperChannel::peer_role`], which the
     /// orchestrator consults on every subsequent flow start and inbound
     /// message. Applications use `kind` to decide what to do next:
     ///
@@ -495,7 +495,7 @@ pub enum DeRecEvent {
     ///
     /// Under the unidirectional replica model, the peer's role
     /// (`ReplicaDestination` or `ReplicaSource`) is already on
-    /// [`crate::protocol::types::Channel::peer_role`] — this event just adds the
+    /// [`crate::protocol::types::HelperChannel::peer_role`] — this event just adds the
     /// peer's `replica_id`, which the app needs as a `from_replica_id`
     /// when subsequent secret syncs arrive or when targeting the peer via
     /// `ProtectSecret`.
@@ -794,7 +794,7 @@ pub enum DeRecEvent {
     /// inner `secret` carries the full typed snapshot
     /// — `secrets: Vec<UserSecret>` (the user-facing entries the
     /// owner originally protected) plus the roster snapshot
-    /// (`helpers`, `replicas`, `owner_replica_id`) captured at
+    /// (`helpers` and `replicas`) captured at
     /// distribution time. Apps that only care about the user-facing
     /// entries read `secret.secrets`; the roster fields are useful
     /// when the recovering owner wants to know who held the shares,
@@ -885,7 +885,7 @@ pub enum DeRecEvent {
         memo: String,
     },
 
-    /// The stored [`crate::protocol::types::Channel`] for `channel_id` has been updated
+    /// The stored [`crate::protocol::types::HelperChannel`] for `channel_id` has been updated
     /// with new communication info and/or transport endpoint.
     ///
     /// Surfaces on **both** sides of the flow:
@@ -897,7 +897,7 @@ pub enum DeRecEvent {
     ///
     /// The new `communication_info` / `transport_protocol` values are
     /// already on the local
-    /// [`crate::protocol::types::Channel`] by the time the event fires;
+    /// [`crate::protocol::types::HelperChannel`] by the time the event fires;
     /// applications that care about the post-update state read it from
     /// the channel store directly.
     ChannelInfoUpdated { channel_id: ChannelId },
@@ -929,7 +929,7 @@ pub enum DeRecEvent {
         /// The local party's role in the pairing (same value that will
         /// appear on [`Self::PairingCompleted::kind`]; the channel record
         /// persists its inverse as
-        /// [`crate::protocol::types::Channel::peer_role`]).
+        /// [`crate::protocol::types::HelperChannel::peer_role`]).
         kind: SenderKind,
     },
 

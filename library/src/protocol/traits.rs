@@ -240,7 +240,7 @@ pub trait DeRecChannelStore {
     fn helpers(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>>;
 
     /// Every replica-group member, **including this device's own row**.
-    /// Callers fanning out exclude themselves by [`ReplicaId`].
+    /// Callers fanning out exclude themselves by [`crate::types::ReplicaId`].
     ///
     /// # Order selects the successor when the source leaves
     ///
@@ -290,7 +290,7 @@ pub trait DeRecChannelStore {
     /// answering `GetSecretIdsVersions` and answering `GetShare`.
     ///
     /// **Replica groups do not use it.** Members share one `channel_id` and
-    /// are identified by [`ReplicaId`], so there is nothing to link: a member
+    /// are identified by [`crate::types::ReplicaId`], so there is nothing to link: a member
     /// that changes channel during an admission handover keeps its row, and a
     /// catch-up resolves peers through the roster. The replica paths never
     /// consult this graph, and wiring them into it would conflate two
@@ -458,7 +458,131 @@ pub trait DeRecUserSecretStore {
 /// Outbound transport abstraction.
 ///
 /// The library calls `send` whenever it needs to deliver bytes to a peer.
-/// The `endpoint` value comes from the `TransportProtocol` stored during pairing.
+/// The `endpoint` value comes from the `TransportProtocol` stored during
+/// pairing.
+///
+/// # This is a mailbox, not a phone call
+///
+/// The protocol is peer-to-peer and symmetric: **every participant has an
+/// address, and answering someone means posting to their address.** There is
+/// no notion of "the connection this message arrived on". A reply produced
+/// while handling an inbound message is not returned to the caller — it is
+/// handed to `send`, addressed to the peer's endpoint, and
+/// [`DeRecProtocol::process`](super::DeRecProtocol::process) returns only
+/// [`DeRecEvent`](super::DeRecEvent)s describing what happened.
+///
+/// When both sides are reachable services this is all that is needed, and the
+/// natural implementation is a one-way push — an HTTP `POST` to
+/// `endpoint.uri`, a queue publish, an email. A reply simply arrives at the
+/// peer later as a fresh inbound message.
+///
+/// # When the peer has no address
+///
+/// A phone, a browser tab, or anything behind NAT cannot be posted to. It
+/// advertised *something* as its endpoint during pairing, but nothing can
+/// reach it, so a push-style `send` drops the reply and the exchange stalls.
+/// Nothing errors: `process` returned events, the handler looks successful,
+/// and the peer simply never hears back.
+///
+/// Such a deployment has to answer on the connection the request came in on,
+/// which means capturing what the protocol emits instead of sending it. Two
+/// things make that work:
+///
+/// 1. **Build the protocol per request**, giving it a transport that collects
+///    into a buffer. Per-request construction is what makes a collector safe:
+///    the buffer belongs to one exchange and cannot mix with another's.
+/// 2. **Match the reply by `trace_id`.** A single `process` call can emit
+///    *several* messages — admitting a helper also republishes to every other
+///    helper — and only one of them answers the caller holding the connection.
+///    Responses echo the inbound envelope's `trace_id`, so
+///    [`read_trace_id`](crate::derec_message::read_trace_id) separates the
+///    reply from genuine fan-out. Returning the whole buffer, or blindly
+///    returning its first entry, is the mistake this exists to prevent;
+///    everything that is not the reply still has to reach its own endpoint.
+///
+/// ```
+/// use std::sync::{Arc, Mutex};
+/// use derec_library::derec_message::{apply_trace_id, read_trace_id};
+/// use derec_library::protocol::{DeRecTransport, TransportFuture};
+/// use derec_proto::{DeRecMessage, Protocol, TransportProtocol};
+/// use prost::Message as _;
+///
+/// /// A transport that keeps what the protocol emitted instead of sending it.
+/// #[derive(Clone, Default)]
+/// struct Collector(Arc<Mutex<Vec<(TransportProtocol, Vec<u8>)>>>);
+///
+/// impl Collector {
+///     fn take(&self) -> Vec<(TransportProtocol, Vec<u8>)> {
+///         std::mem::take(&mut *self.0.lock().expect("collector poisoned"))
+///     }
+/// }
+///
+/// impl DeRecTransport for Collector {
+///     fn send(&self, endpoint: &TransportProtocol, message: Vec<u8>) -> TransportFuture<'_> {
+///         let entry = (endpoint.clone(), message);
+///         let out = Arc::clone(&self.0);
+///         Box::pin(async move {
+///             out.lock().expect("collector poisoned").push(entry);
+///             Ok(())
+///         })
+///     }
+/// }
+///
+/// /// Split what one `process` call emitted into the answer for this caller
+/// /// and everything still owed to somebody else.
+/// fn split_reply(
+///     inbound: &[u8],
+///     emitted: Vec<(TransportProtocol, Vec<u8>)>,
+/// ) -> (Option<Vec<u8>>, Vec<(TransportProtocol, Vec<u8>)>) {
+///     // A zero trace_id means "no correlation requested", so it never
+///     // identifies a reply.
+///     let wanted = read_trace_id(inbound).unwrap_or(0);
+///     let (mut reply, mut elsewhere) = (None, Vec::new());
+///     for (endpoint, bytes) in emitted {
+///         let echoes = wanted != 0
+///             && read_trace_id(&bytes).map(|t| t == wanted).unwrap_or(false);
+///         if echoes && reply.is_none() {
+///             reply = Some(bytes);
+///         } else {
+///             elsewhere.push((endpoint, bytes));
+///         }
+///     }
+///     (reply, elsewhere)
+/// }
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let envelope = || DeRecMessage::default().encode_to_vec();
+/// let peer = TransportProtocol {
+///     uri: "https://peer.example".to_owned(),
+///     protocol: Protocol::Https as i32,
+/// };
+///
+/// let inbound = apply_trace_id(&envelope(), 0xA11CE)?;
+///
+/// // Stand in for one `process` call: the answer to this caller, plus an
+/// // unrelated message fanned out to another peer.
+/// let collector = Collector::default();
+/// let rt = tokio::runtime::Builder::new_current_thread().build()?;
+/// rt.block_on(async {
+///     collector.send(&peer, apply_trace_id(&envelope(), 0xA11CE).unwrap()).await.unwrap();
+///     collector.send(&peer, apply_trace_id(&envelope(), 0xB0B).unwrap()).await.unwrap();
+/// });
+///
+/// let (reply, elsewhere) = split_reply(&inbound, collector.take());
+/// assert!(reply.is_some(), "the echoed trace_id identifies the answer");
+/// assert_eq!(elsewhere.len(), 1, "fan-out still has to be delivered");
+/// # Ok(())
+/// # }
+/// ```
+///
+/// The application then returns `reply` as the HTTP response body and pushes
+/// `elsewhere` however it normally would. See the "Serving DeRec over
+/// request/response transports" section of the crate README for the full
+/// handler.
+///
+/// Every SDK exposes the same correlation primitive: `Envelope.ReadTraceId`
+/// (.NET), `envelope.ReadTraceID` (Go), `envelope_read_trace_id` (WASM /
+/// TypeScript), `read_trace_id_from_envelope` (C FFI).
 ///
 /// # Executor independence
 ///

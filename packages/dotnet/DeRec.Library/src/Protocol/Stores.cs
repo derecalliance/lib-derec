@@ -23,6 +23,13 @@ public enum ChannelStatus
 {
     Pending,
     Paired,
+
+    /// <summary>
+    /// A replica-group member that has been told to leave and is awaiting
+    /// the roster version that completes its removal. Never set on a helper
+    /// channel.
+    /// </summary>
+    Unpairing,
 }
 
 /// <summary>
@@ -281,6 +288,26 @@ public interface IUserSecretStore
 /// the encoded envelope bytes plus the destination endpoint and the
 /// application is responsible for shipping them over the wire.
 /// </summary>
+/// <remarks>
+/// <para>
+/// This is a <b>mailbox</b>, not a request/response channel: every peer has
+/// an address, and a reply is posted to that address rather than returned
+/// from <c>ProcessAsync</c>. Where both sides are reachable services, a
+/// one-way push is all that is needed.
+/// </para>
+/// <para>
+/// A peer that cannot be addressed — a phone, a browser, anything behind NAT
+/// — breaks that silently: the reply is handed to <c>Send</c>, goes nowhere,
+/// and nothing reports an error. Such a service must answer on the connection
+/// the request arrived on, by building the protocol per request with an
+/// <c>ITransport</c> that collects into a buffer instead of sending, then
+/// returning the collected message whose trace id matches the inbound
+/// envelope's (<see cref="DeRec.Library.Envelope.ReadTraceId(byte[])"/>).
+/// One call can emit several messages, so the rest of the buffer is genuine
+/// fan-out and still has to be delivered. See "Serving DeRec over
+/// request/response transports" in the Rust SDK README for the full pattern.
+/// </para>
+/// </remarks>
 public interface ITransport
 {
     void Send(string uri, int protocol, byte[] message);

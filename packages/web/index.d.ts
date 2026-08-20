@@ -142,7 +142,7 @@ export interface UserSecretStore {
  * returns the exact blob it received, `remove` drops the row, and
  * `loadAll` returns every blob whose `kind` matches the requested
  * category (`0` = PendingVerification, `1` = PendingRecovery,
- * `2` = PendingUnpair, `3` = SharingRound).
+ * `2` = PendingUnpair, `3` = SharingRound, `4` = PendingSyncCheck).
  *
  * Rows are keyed by `(secretId, StateKey)` — the `keyJson` buffer is
  * a JSON object `{ kind, channel_id?, version? }` matching the `kind`
@@ -165,6 +165,24 @@ export interface StateStore {
   loadAll(secretId: string, kind: 0 | 1 | 2 | 3 | 4): Promise<Uint8Array[]>;
 }
 
+/**
+ * Outbound message delivery.
+ *
+ * This is a mailbox, not a request/response channel: every peer has an
+ * address, and a reply is posted to that address rather than returned from
+ * `process`. Where both sides are reachable services, a one-way push is all
+ * that is needed.
+ *
+ * A peer that cannot be addressed — a phone, a browser, anything behind NAT —
+ * breaks that silently: the reply is handed to `send`, goes nowhere, and
+ * nothing reports an error. Such a service must answer on the connection the
+ * request arrived on, by building the protocol per request with a `Transport`
+ * that collects into a buffer instead of sending, then returning the collected
+ * message whose trace id matches the inbound envelope's
+ * (`envelope_read_trace_id`). One call can emit several messages, so the rest
+ * of the buffer is genuine fan-out and still has to be delivered. See "Serving
+ * DeRec over request/response transports" in the Rust SDK README.
+ */
 export interface Transport {
   send(endpoint: { protocol: string; uri: string }, message: Uint8Array): Promise<void>;
 }

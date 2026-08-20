@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-//! Managed-callback adapters that satisfy the four core protocol traits
-//! ([`DeRecChannelStore`], [`DeRecSecretStore`], [`DeRecShareStore`],
+//! Managed-callback adapters that satisfy the protocol's store and
+//! transport traits ([`DeRecChannelStore`], [`DeRecSecretStore`],
+//! [`DeRecShareStore`], [`DeRecUserSecretStore`], [`DeRecStateStore`],
 //! [`DeRecTransport`]) by delegating to C function pointers supplied by
 //! the foreign caller.
 //!

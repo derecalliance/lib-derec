@@ -1021,8 +1021,7 @@ impl<
     /// `recovered_version`; canonical replica channels are persisted
     /// with the group key from `secret.replicas.shared_key`;
     /// the user-secret snapshot is committed at `recovered_version`;
-    /// the protocol's `replica_id` is adopted from
-    /// `secret.owner_replica_id` if previously unset; every other
+    /// every other
     /// channel under `self.secret_id` (i.e. the recovery-mode
     /// channels) is unpaired (request sent to the helper, local
     /// state dropped). The protocol resumes normal operation
@@ -1835,7 +1834,7 @@ impl<
     /// Concurrency is the caller's, as everywhere else: this mutates the same
     /// round state an inbound response does, so it must be serialized against
     /// [`Self::process`] for the same `secret_id`. See
-    /// [`DeRecStateStore`](crate::protocol::DeRecStateStore).
+    /// [`DeRecStateStore`].
     #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
     pub async fn tick(&mut self) -> Vec<DeRecEvent> {
         let mut events = self.run_timeout_sweeps().await;

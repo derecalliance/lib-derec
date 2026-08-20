@@ -39,8 +39,7 @@
 //! or empty as "not present"). Schema:
 //!
 //! ```text
-//! Secret      { owner_replica_id:str<u64>, helpers:[Helper], secrets:[UserSecret],
-//!               replicas?:Replicas }
+//! Secret      { helpers:[Helper], secrets:[UserSecret], replicas?:Replicas }
 //! Helper      { channel_id:str<u64>, transport_uri:str, shared_key:base64,
 //!               communication_info?:{str:str} }
 //! UserSecret  { id:base64, name:str, data:base64 }

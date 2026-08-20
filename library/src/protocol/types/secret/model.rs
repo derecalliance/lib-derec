@@ -24,7 +24,7 @@ pub struct HelperInfo {
     pub shared_key: ::prost::alloc::vec::Vec<u8>,
     /// App-level identity metadata for this helper. Free-form key/value
     /// pairs — the protocol treats it as opaque, never inspects keys or
-    /// values, and copies it verbatim from [`crate::protocol::types::Channel::communication_info`]
+    /// values, and copies it verbatim from [`crate::protocol::types::HelperChannel::communication_info`]
     /// at protect-time. A recovering owner who decodes the secret can use
     /// this to recognise each helper (e.g. by a `"name"` key the app set
     /// on pairing).

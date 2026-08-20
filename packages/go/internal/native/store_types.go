@@ -128,8 +128,9 @@ type TransportEndpoint struct {
 
 // ChannelStatus is a channel's lifecycle status, mirroring the Rust-side
 // ChannelStatus enum. It marshals to/from the exact strings produced by
-// Rust's default serde derive for a unit-variant enum ("Pending"/"Paired"),
-// not the SCREAMING_SNAKE_CASE convention protobuf enums use.
+// Rust's default serde derive for a unit-variant enum
+// ("Pending"/"Paired"/"Unpairing"), not the SCREAMING_SNAKE_CASE convention
+// protobuf enums use.
 type ChannelStatus int
 
 const (
@@ -139,6 +140,10 @@ const (
 	// ChannelStatusPaired marks a channel fully paired and ready for
 	// protocol messages.
 	ChannelStatusPaired
+	// ChannelStatusUnpairing marks a replica-group member that has been
+	// told to leave and is awaiting the roster version that completes its
+	// removal. Never set on a helper channel.
+	ChannelStatusUnpairing
 )
 
 func (s ChannelStatus) String() string {
@@ -147,6 +152,8 @@ func (s ChannelStatus) String() string {
 		return "Pending"
 	case ChannelStatusPaired:
 		return "Paired"
+	case ChannelStatusUnpairing:
+		return "Unpairing"
 	default:
 		return fmt.Sprintf("ChannelStatus(%d)", int(s))
 	}
@@ -155,7 +162,7 @@ func (s ChannelStatus) String() string {
 // MarshalJSON implements json.Marshaler.
 func (s ChannelStatus) MarshalJSON() ([]byte, error) {
 	str := s.String()
-	if s != ChannelStatusPending && s != ChannelStatusPaired {
+	if s != ChannelStatusPending && s != ChannelStatusPaired && s != ChannelStatusUnpairing {
 		return nil, fmt.Errorf("native: unknown ChannelStatus: %d", int(s))
 	}
 	return json.Marshal(str)
@@ -172,6 +179,8 @@ func (s *ChannelStatus) UnmarshalJSON(data []byte) error {
 		*s = ChannelStatusPending
 	case "Paired":
 		*s = ChannelStatusPaired
+	case "Unpairing":
+		*s = ChannelStatusUnpairing
 	default:
 		return fmt.Errorf("native: unknown ChannelStatus: %q", str)
 	}

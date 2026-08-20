@@ -784,7 +784,8 @@ impl DeRecProtocolWasm {
     /// Feed any incoming wire bytes to the protocol.
     ///
     /// Returns an `Array` of plain JS event objects (see struct-level docs for shapes).
-    /// All five flows (pairing, sharing, verification, discovery, recovery) are
+    /// Every inbound flow — pairing, sharing, verification, discovery,
+    /// recovery, unpairing, channel-info updates and the replica flows — is
     /// handled through this single entry point.
     ///
     /// # Arguments

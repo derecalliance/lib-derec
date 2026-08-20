@@ -83,8 +83,9 @@ type (
 )
 
 const (
-	ChannelStatusPending = native.ChannelStatusPending
-	ChannelStatusPaired  = native.ChannelStatusPaired
+	ChannelStatusPending   = native.ChannelStatusPending
+	ChannelStatusPaired    = native.ChannelStatusPaired
+	ChannelStatusUnpairing = native.ChannelStatusUnpairing
 
 	SenderKindOwner              = native.SenderKindOwner
 	SenderKindHelper             = native.SenderKindHelper
@@ -102,6 +103,7 @@ const (
 	StateKindPendingRecovery     = native.StateKindPendingRecovery
 	StateKindPendingUnpair       = native.StateKindPendingUnpair
 	StateKindSharingRound        = native.StateKindSharingRound
+	StateKindPendingSyncCheck    = native.StateKindPendingSyncCheck
 )
 
 // ChannelStore persists channel records plus the channel-link graph used to
@@ -240,6 +242,22 @@ type StateStore interface {
 // endpoint; the application is responsible for shipping them over the
 // wire (HTTP, WebSocket, etc. — the library makes no transport
 // assumptions). Mirrors derec_library::protocol::DeRecTransport.
+//
+// This is a mailbox, not a request/response channel: every peer has an
+// address, and a reply is posted to that address rather than returned from
+// Process. Where both sides are reachable services, a one-way push is all
+// that is needed.
+//
+// A peer that cannot be addressed — a phone, a browser, anything behind NAT —
+// breaks that silently: the reply is handed to Send, goes nowhere, and
+// nothing reports an error. Such a service must answer on the connection the
+// request arrived on, by building the protocol per request with a Transport
+// that collects into a buffer instead of sending, then returning the
+// collected message whose trace id matches the inbound envelope's
+// (envelope.ReadTraceID). One call can emit several messages, so the rest of
+// the buffer is genuine fan-out and still has to be delivered. See "Serving
+// DeRec over request/response transports" in the Rust SDK README for the full
+// pattern.
 type Transport interface {
 	// Send delivers message to uri over the given transport protocol
 	// (0 = HTTPS, the only value currently defined —see

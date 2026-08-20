@@ -8,7 +8,7 @@ namespace DeRec.Library.Native;
 
 /// <summary>
 /// P/Invoke surface for the stateful <c>DeRecProtocol</c> orchestrator FFI.
-/// Callbacks for the four store/transport traits are passed in as
+/// Callbacks for the store and transport traits are passed in as
 /// function pointers in the layout structs below — each delegate MUST
 /// have <see cref="UnmanagedFunctionPointerAttribute"/> with
 /// <see cref="CallingConvention.Cdecl"/>.

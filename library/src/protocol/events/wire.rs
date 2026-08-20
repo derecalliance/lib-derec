@@ -8,7 +8,7 @@
 //!
 //! Field-name conventions:
 //! - All `u64` identifiers (`channel_id`, `secret_id`, `replica_id`,
-//!   `from_replica_id`, `owner_replica_id`) cross the boundary as
+//!   `from_replica_id`) cross the boundary as
 //!   **decimal strings** to dodge JS `Number.MAX_SAFE_INTEGER` without
 //!   forcing callers to track which id uses which encoding.
 //! - `peer_communication_info` / `communication_info` are

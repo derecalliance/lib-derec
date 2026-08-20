@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-//! JS-side adapters for the four protocol traits.
+//! JS-side adapters for the protocol's store and transport traits.
 //!
 //! Each adapter holds a `JsValue` pointing to a JS object that implements the
 //! corresponding interface.  Trait methods call into JS via `js_sys::Reflect`,

@@ -28,6 +28,7 @@ Alliance**.
 - [Helper-side admission control](#helper-side-admission-control)
 - [Protocol flows](#protocol-flows)
 - [Replica flows](#replica-flows)
+- [Correlation and routing on the wire](#correlation-and-routing-on-the-wire)
 - [Storage and transport traits](#storage-and-transport-traits)
 - [Errors](#errors)
 - [Async and executors](#async-and-executors)
@@ -66,7 +67,7 @@ Three roles participate:
   Pairing is confirmed out of band with a human-readable fingerprint
   (`DeRecProtocol::get_fingerprint` / `verify_fingerprint`), then
   `ProtectSecret` distributes the full secret (helpers + secrets +
-  replicas + `owner_replica_id`) to every Destination via a
+  replicas) to every Destination via a
   [`ReplicaSecretPayload`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.ReplicaSecretPayload.html).
   Destinations surface the typed
   [`DeRecEvent::ReplicaSecretReceived`](https://docs.rs/derec-library/latest/derec_library/protocol/events/enum.DeRecEvent.html#variant.ReplicaSecretReceived).
@@ -211,7 +212,7 @@ loop {
                 // Recovery completed — `secret` is the typed `Secret` snapshot
                 // the owner originally protected. The user-facing entries live
                 // in `secret.secrets: Vec<UserSecret>`; `helpers`, `replicas`
-                // and `owner_replica_id` carry the roster captured at
+                // carry the roster captured at
                 // distribution time.
                 for entry in &secret.secrets {
                     println!("recovered {} ({}B)", entry.name, entry.data.len());
@@ -650,14 +651,17 @@ the same role.
 ## Storage and transport traits
 
 The library does **not** ship a default backend for storage or transport.
-Consumers implement four traits — the protocol holds them by `&mut self`, so
-implementations need no internal synchronization:
+Consumers implement six traits — five stores plus the transport. All are
+required to build a protocol instance. The protocol holds them by `&mut self`,
+so implementations need no internal synchronization:
 
 | Trait | Stores |
 |-------|--------|
 | [`DeRecChannelStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecChannelStore.html) | Helper channels (keyed by `channel_id`), replica-group members (keyed by `replica_id`), and the channel-link graph. |
 | [`DeRecShareStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecShareStore.html) | Encoded share entries keyed by `(channel_id, secret_id, version)`. |
 | [`DeRecSecretStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecSecretStore.html) | Per-channel cryptographic material (shared keys, pairing secrets, pairing contacts). |
+| [`DeRecUserSecretStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecUserSecretStore.html) | The latest user-facing secret snapshot per `secret_id` — what a freshly-paired peer is sent. |
+| [`DeRecStateStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecStateStore.html) | In-flight orchestrator state: verification challenges, recovery accumulators, pending unpairs, the active sharing round and catch-up. Must be durable in any deployment that can restart mid-flow. |
 | [`DeRecTransport`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecTransport.html) | Outbound envelope delivery to peers. |
 
 Each trait's rustdoc states its contract, idempotency expectations, and the
@@ -733,6 +737,79 @@ custom relay, …).
 > The on-the-wire `TransportProtocol.protocol` enum currently defines
 > `Https` as the only supported value. New transports can be added by
 > extending the protobuf enum.
+
+### Serving DeRec over request/response transports
+
+The protocol is a **mailbox**: every participant has an address, and answering
+someone means posting to their address. A reply produced while handling an
+inbound message is not returned to the caller — it is handed to
+`DeRecTransport::send`, addressed to the peer's endpoint, while `process()`
+returns only the `DeRecEvent`s describing what happened.
+
+When both sides are reachable services, that is all you need. The transport is
+a one-way push and an HTTP handler acknowledges rather than answers:
+
+```rust,ignore
+async fn inbound(State(app): State<App>, body: Bytes) -> StatusCode {
+    let mut protocol = app.build_protocol(HttpPush(app.http.clone()));
+    let events = protocol.process(&body).await.expect("process");
+    app.on_events(events).await;
+    StatusCode::ACCEPTED // the reply is already on its way, separately
+}
+```
+
+**A peer with no address breaks this silently.** A phone, a browser tab or
+anything behind NAT advertised an endpoint at pairing time that nothing can
+actually reach, so a push-style `send` drops the reply on the floor. Nothing
+errors — `process` returned events and the handler looks successful — the peer
+just never hears back.
+
+Those deployments must answer on the connection the request arrived on, which
+means capturing what the protocol emits instead of pushing it:
+
+```rust,ignore
+async fn inbound(State(app): State<App>, body: Bytes) -> Result<Bytes, StatusCode> {
+    // 1. Build per request, with a transport that collects rather than sends.
+    let collector = Collector::default();
+    let mut protocol = app.build_protocol(collector.clone());
+
+    let events = protocol
+        .process(&body)
+        .await
+        .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+    app.on_events(events).await;
+
+    // 2. One `process` can emit several messages. Only the one echoing this
+    //    request's trace_id answers the caller; the rest is real fan-out and
+    //    still has to reach its own endpoint.
+    let (reply, elsewhere) = split_reply(&body, collector.take());
+    for (endpoint, bytes) in elsewhere {
+        app.deliver_out_of_band(endpoint, bytes).await;
+    }
+
+    Ok(reply.map(Bytes::from).unwrap_or_default())
+}
+```
+
+Two details carry this, and both are easy to miss:
+
+- **Per-request construction.** The collector's buffer must belong to exactly
+  one exchange, or concurrent requests mix their replies. This is the same
+  per-request pattern a stateless deployment uses anyway.
+- **Correlation by `trace_id`.** Admitting a helper also republishes to every
+  *other* helper, so the buffer routinely holds messages for several peers.
+  Responses echo the inbound envelope's `trace_id`;
+  `derec_message::read_trace_id` tells them apart. Returning the whole buffer —
+  or blindly returning its first entry — is the mistake to avoid.
+
+`Collector` and `split_reply` are about twenty lines each; a complete, compiled
+version of both is in the [`DeRecTransport` rustdoc][transport-doc].
+
+Every SDK exposes the same correlation primitive: `Envelope.ReadTraceId`
+(.NET), `envelope.ReadTraceID` (Go), `envelope_read_trace_id`
+(TypeScript/WASM), `read_trace_id_from_envelope` (C FFI).
+
+[transport-doc]: https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecTransport.html
 
 ### Updating channel info post-pairing
 
