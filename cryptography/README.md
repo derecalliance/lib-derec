@@ -128,6 +128,24 @@ assert!(fp.chars().all(|c| c.is_ascii_digit() || c == '-'));
 
 ---
 
+## Cargo features
+
+Off by default — a default build pulls in no logging machinery.
+
+| Feature | Enables |
+| --- | --- |
+| `logging` | `tracing` spans and events across the cryptography layer: key generation, envelope encrypt/decrypt, VSS split and recover, and fingerprint derivation. Adds no overhead when no subscriber is installed, and never records key material or plaintext. |
+
+```toml
+[dependencies]
+derec-cryptography = { version = "*", features = ["logging"] }
+```
+
+`derec-library`'s own `logging` feature does **not** enable this one — turn it
+on here as well to see the cryptography layer's spans alongside the protocol's.
+
+---
+
 ## Relationship with other crates
 
 The DeRec Rust implementation is composed of multiple crates:

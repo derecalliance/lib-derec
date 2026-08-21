@@ -1,6 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+//! Inbound dispatch, and the per-flow handlers it routes to.
+//!
+//! Everything arriving at [`DeRecProtocol::process`](crate::protocol::DeRecProtocol::process)
+//! lands here once the envelope is decrypted. Dispatch does three things
+//! before a handler ever sees a message:
+//!
+//! 1. **Routes on the `MessageBody` variant** to the owning flow module.
+//! 2. **Chooses the path** for message types that serve both the owner↔helper
+//!    and the replica-group relationships. The discriminator is the presence
+//!    of `replica_id` on the payload, not the channel it arrived on — several
+//!    request types are legal on either path and mean different things.
+//! 3. **Enforces the role gate**, rejecting a message whose sender does not
+//!    hold the role that message requires on that channel.
+//!
+//! Handlers are internal: applications drive flows through
+//! [`DeRecFlow`](crate::protocol::DeRecFlow) and observe them through
+//! [`DeRecEvent`](crate::protocol::DeRecEvent).
+
 pub(super) mod discovery;
 pub(super) mod pairing;
 pub(super) mod recovery;

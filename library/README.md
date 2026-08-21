@@ -99,7 +99,7 @@ FFI layer, and no logging, so a pure-Rust consumer pays for none of them.
 
 | Feature | Enables |
 | --- | --- |
-| `serde` | `serde::Serialize` / `Deserialize` on the public store and channel types (`SecretValue`, `PairingKeyMaterial`, `Channel`, `ChannelStatus`, `TransportProtocol`), so a store implementation can persist them with any serde format. Without it, use the byte-level accessors (e.g. `PairingKeyMaterial::as_bytes` / `from_bytes`) or your own codec. Also pulls the matching `derec-proto/serde`. The serde wire format is not part of the public API and may change. |
+| `serde` | `serde::Serialize` / `Deserialize` on the public store and channel types (`SecretValue`, `PairingKeyMaterial`, `ChannelRecord`, `HelperChannel`, `ReplicaMember`, `ChannelStatus`, `TransportProtocol`), so a store implementation can persist them with any serde format. Without it, use the byte-level accessors (e.g. `PairingKeyMaterial::as_bytes` / `from_bytes`) or your own codec. Also pulls the matching `derec-proto/serde`. The serde wire format is not part of the public API and may change. |
 | `logging` | `tracing` spans and events across the protocol and primitives layers. Adds no overhead when no subscriber is installed. |
 | `ffi` | The native C-ABI bridge for host languages that link the shared library. Implies `serde` + `serde_json`. Pure-Rust consumers do not need this. |
 | `unsafe-http` | **Development only.** Lets `TransportProtocol::validate` accept plaintext `http://` endpoints. Production builds MUST leave this off — enabling it also lets a peer-supplied `replyTo` downgrade the reply path to plaintext. |
@@ -320,7 +320,7 @@ A channel row describes the participant on the other end, so each paired
 channel carries the **peer's** role — `SenderKind::Owner`,
 `SenderKind::Helper`, `SenderKind::ReplicaSource`, or
 `SenderKind::ReplicaDestination` — fixed at pairing time and stored on
-[`Channel.peer_role`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.Channel.html).
+[`HelperChannel.peer_role`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.HelperChannel.html).
 The two sides of one channel therefore hold opposite values: an Owner's
 row for its helper reads `Helper`, and that helper's row for the Owner
 reads `Owner`. This node's own role is always the inverse
@@ -539,7 +539,7 @@ Attempting any replica-mode flow on a protocol built without
 
 The reserved `derec.*` `CommunicationInfo` namespace — including
 `derec.replica_id` and its wire encoding — is documented in
-[`protocol::reserved_keys`](https://docs.rs/derec-library/latest/derec_library/protocol/reserved_keys/index.html).
+[`protocol::utils::reserved_keys`](https://docs.rs/derec-library/latest/derec_library/protocol/utils/reserved_keys/index.html).
 Apps should not write to this namespace; the orchestrator strips and
 re-injects entries at the protocol boundary.
 

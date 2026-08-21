@@ -120,6 +120,24 @@ All protocol messages are wrapped in the `MessageBody` oneof inside
 
 ---
 
+## Cargo features
+
+Off by default — a default build compiles no serde.
+
+| Feature | Enables |
+| --- | --- |
+| `serde` | `serde::Serialize` / `Deserialize` on the hand-written wrapper types the SDKs exchange — `TransportProtocol` and `SenderKind`. The generated prost message types are unaffected; they cross process boundaries as protobuf. Enabled automatically by `derec-library`'s own `serde` feature, so consumers of the library rarely set it directly. |
+
+```toml
+[dependencies]
+derec-proto = { version = "*", features = ["serde"] }
+```
+
+The serde shapes are an implementation detail of the SDK bridges, not a
+stable wire format — protobuf encoding is the contract between peers.
+
+---
+
 ## Relationship with other crates
 
 The DeRec Rust implementation is composed of multiple crates:

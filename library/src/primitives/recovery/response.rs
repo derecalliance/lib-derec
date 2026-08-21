@@ -1,6 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+//! `GetShareResponse` — the Helper's side of recovery, and the
+//! reconstruction that consumes it.
+//!
+//! Three steps, in the order a recovery runs them:
+//!
+//! - [`produce`] — Helper side. Wraps a stored share in a response envelope.
+//! - [`extract`] — Owner side. Decrypts and validates one response.
+//! - [`recover`] — Owner side. Combines a quorum of extracted shares back into
+//!   the secret.
+//!
+//! [`recover`] is where the threshold is enforced, and it verifies before it
+//! reconstructs: every share must carry the same Merkle root and the same
+//! ciphertext, and each must prove membership under that root. A set that
+//! disagrees is rejected rather than combined, so a single corrupted or
+//! malicious share cannot steer the result.
+
 use crate::primitives::recovery::RecoveryError;
 use crate::utils::verify_timestamps;
 use crate::{

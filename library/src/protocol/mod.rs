@@ -143,11 +143,18 @@ use crate::wasm::now_secs;
 ///   ├── start(RecoverSecret)                     → recovery        (emits SecretRecovered)
 ///   │     └── restore(&secret, version)          → commit recovered secret into canonical state
 ///   ├── start(UpdateChannelInfo)                 → endpoint/info update (either side)
-///   └── start(Unpair)                            → unpair          (Owner-initiated; ack
-///                                                                   semantics governed by
-///                                                                   [`DeRecProtocolBuilder::with_unpair_ack`])
+///   ├── start(Unpair)                            → unpair          (Owner-initiated; ack
+///   │                                                               semantics governed by
+///   │                                                               [`DeRecProtocolBuilder::with_unpair_ack`])
+///   ├── start(SyncCheck)                         → replica catch-up (replica-only; asks the
+///   │                                                                group whether this device
+///   │                                                                is behind)
+///   └── start(RemoveReplica)                     → replica removal (replica-only; voluntary
+///                                                                   departure or eviction)
 ///
 /// loop { process(incoming_bytes) → Vec<DeRecEvent> }
+///
+/// tick()  → Vec<DeRecEvent>   (time-driven only; no inbound message required)
 /// ```
 ///
 /// See [`DeRecFlow`] for the full set of orchestrator entry points
