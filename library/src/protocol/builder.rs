@@ -299,7 +299,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     /// Configure this node's local **replica identity**.
     ///
     /// Required to participate in any replica-mode pairing — when set, the
-    /// orchestrator auto-injects the id (hex-encoded) under the reserved key
+    /// orchestrator auto-injects the id (decimal-encoded) under the reserved key
     /// `derec.replica_id` in outbound `PairRequest` / `PairResponse`
     /// envelopes whose `sender_kind` is `ReplicaSource` or
     /// `ReplicaDestination`, and accepts inbound replica pairings that

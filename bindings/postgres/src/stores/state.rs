@@ -53,7 +53,11 @@ fn key_columns(key: &StateKey) -> (i64, i64, i64) {
         StateKey::PendingRecovery { secret_id, version } => {
             (kind, u64_to_sql(*secret_id), i64::from(*version))
         }
-        StateKey::PendingSyncCheck | StateKey::SharingRound => (kind, 0, 0),
+        // The round's version is its secondary key: several rounds can be
+        // open at once, so a single row per kind would let one overwrite
+        // another.
+        StateKey::SharingRound { version } => (kind, i64::from(*version), 0),
+        StateKey::PendingSyncCheck => (kind, 0, 0),
     }
 }
 

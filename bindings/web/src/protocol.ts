@@ -2237,3 +2237,24 @@ async function runExpiredChannelCleanupFlow(): Promise<void> {
 
   console.log("  cleanup: disabled policy forwarded with its timeout; manual sweep callable ✓");
 }
+
+
+/**
+ * Compile-time proof that both new flows are reachable from TypeScript without
+ * widening `start`.
+ *
+ * `SyncCheck` (7) and `RemoveReplica` (8) were in the `FlowKind` enum and
+ * accepted at runtime, but `start` declared overloads only up to kind 6, so
+ * dispatching them meant casting to a looser signature. This function is never
+ * called — it exists so `tsc` fails if those overloads are dropped again.
+ */
+export function _startOverloadsCoverEveryFlowKind(protocol: DeRecProtocol): void {
+  void (() => protocol.start(FlowKind.SyncCheck));
+  void (() => protocol.start(FlowKind.SyncCheck, {}));
+  void (() =>
+    protocol.start(FlowKind.RemoveReplica, {
+      replica_id: "51966",
+      memo: "retired device",
+    }));
+  void (() => protocol.start(FlowKind.RemoveReplica, { replica_id: "51966" }));
+}

@@ -44,10 +44,25 @@ export interface SecretStore {
  * pair.
  *
  * `load`/`save` bytes are a JSON-encoded `ChannelRecord`: an externally
- * tagged union carrying exactly one of `Helper` or `Replica`. `listHelpers`
- * and `listReplicas` return a JSON-encoded array of the corresponding
- * records. All payloads are opaque to the application — persist them
- * verbatim.
+ * tagged union carrying exactly one of `Helper` or `Replica`.
+ *
+ * `listHelpers` and `listReplicas` are **not** arrays of that union — they
+ * return a JSON array of the **inner** records with the tag stripped:
+ * `[{ channel_id, transport, ... }, ...]`, `HelperChannel` for the first and
+ * `ReplicaMember` for the second. Wrapping each element back in
+ * `{ "Helper": ... }` will not decode.
+ *
+ * Build that array by **splicing the stored bytes as text** — the payloads are
+ * opaque, so persist and re-emit them verbatim:
+ *
+ * ```js
+ * const inner = rows.map((r) => new TextDecoder().decode(r));
+ * return new TextEncoder().encode(`[${inner.join(",")}]`);
+ * ```
+ *
+ * Do not `JSON.parse` and re-serialise. Every id in these records is a `u64`,
+ * and `JSON.parse` silently rounds anything above 2^53 — the corruption only
+ * appears once a real id happens to be large. `bindings/web` implements this.
  */
 export interface ChannelStore {
   load(
@@ -308,6 +323,19 @@ export interface UpdateChannelInfoParams {
   transport_protocol?: { uri: string; protocol: number };
 }
 
+/** `SyncCheck` takes no parameters: the group and this device's own version
+ *  are both read from the stores. The argument may be omitted entirely. */
+export type SyncCheckParams = Record<string, never>;
+
+export interface RemoveReplicaParams {
+  /** The member to remove, as a **decimal** `u64` string — the same form
+   *  `ReplicaPaired.peer_replica_id` hands back. A value naming no current
+   *  member is rejected; it is not silently ignored. */
+  replica_id: string;
+
+  memo?: string;
+}
+
 export type DeRecEvent =
   | {
       type: "PairingCompleted";
@@ -439,8 +467,10 @@ export type DeRecEvent =
   | { type: "PrePairRejected"; channel_id: string; status: number; memo: string }
 
   /** Fires alongside `PairingCompleted` on replica-mode pair handshakes.
-   *  `peer_replica_id` is the peer's hex-encoded `u64` (matches the wire
-   *  `derec.replica_id` representation). The local side's role
+   *  `peer_replica_id` is the peer's `u64` as a **decimal** string,
+   *  matching the wire `derec.replica_id` representation and every other
+   *  id across this boundary. Pass it back verbatim — `RemoveReplica`
+   *  expects the same decimal form. The local side's role
    *  (`ReplicaSource` vs `ReplicaDestination`) is on the persisted
    *  channel record — replica pairings are unidirectional, so there is
    *  no separate "role in pair" field. */
@@ -453,7 +483,8 @@ export type DeRecEvent =
    *  `ReplicaDestination` channel. The library decoded the
    *  `ReplicaSecretPayload`; the app installs `secret.secrets` and
    *  optionally uses `shares` for recovery. `from_replica_id` and the
-   *  `replica_id` fields inside `secret` are hex-encoded `u64`. */
+   *  `replica_id` fields inside `secret` are `u64` as **decimal**
+   *  strings. */
   | {
       type: "ReplicaSecretReceived";
       channel_id: string;
@@ -801,6 +832,16 @@ export declare class DeRecProtocol {
   start(flowKind: FlowKind.RecoverSecret, params: RecoverSecretParams): Promise<DeRecEvent[]>;
   start(flowKind: FlowKind.Unpair, params: UnpairParams): Promise<DeRecEvent[]>;
   start(flowKind: FlowKind.UpdateChannelInfo, params: UpdateChannelInfoParams): Promise<DeRecEvent[]>;
+  start(flowKind: FlowKind.SyncCheck, params?: SyncCheckParams): Promise<DeRecEvent[]>;
+
+  /** Announce a member's removal. This does **not** remove anything on its
+   *  own and emits no `ReplicaRemoved`: it tells every member and flags the
+   *  target locally. The removal completes only once the application
+   *  publishes a roster omitting that member — an ordinary
+   *  `start(FlowKind.ProtectSecret)` — at which point `ReplicaRemoved`
+   *  fires. A group with no secret to publish therefore cannot complete a
+   *  removal. */
+  start(flowKind: FlowKind.RemoveReplica, params: RemoveReplicaParams): Promise<DeRecEvent[]>;
 
   /**
    * Replace this node's local <c>communication_info</c> map. Does not

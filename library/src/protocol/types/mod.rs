@@ -606,10 +606,12 @@ pub enum StateKind {
     /// `started_at` unix-seconds timestamp so the orchestrator can time
     /// out unresponsive peers.
     PendingUnpair,
-    /// Active sharing round. At most one entry exists per `secret_id`
-    /// (a new `start(ProtectSecret)` overwrites any prior round). Holds
-    /// the per-channel tallies (`pending` / `confirmed` / `failed`) and
-    /// the `started_at` timestamp used to time out unresponsive helpers.
+    /// Active sharing round, one row per in-flight version. Several can be
+    /// open at once: publishes are started by the pair-completion hook and by
+    /// the promotion inside `verify_fingerprint`, not only by
+    /// `start(ProtectSecret)`. Holds the per-channel tallies (`pending` /
+    /// `confirmed` / `failed`), the per-member tallies, and the `started_at`
+    /// timestamp used to time out unresponsive peers.
     SharingRound,
     /// Active replica catch-up. At most one entry exists per `secret_id`
     /// (a new `start(SyncCheck)` overwrites any prior one). Holds the
@@ -639,8 +641,20 @@ pub enum StateKey {
     PendingUnpair { channel_id: ChannelId },
     /// At most one row per `secret_id`. No secondary key.
     PendingSyncCheck,
-    /// At most one row per `secret_id`. No secondary key.
-    SharingRound,
+    /// Row is scoped to one publishing round, identified by the version it
+    /// distributes.
+    ///
+    /// Keying on the version is load-bearing rather than cosmetic. Rounds are
+    /// not started only by `start(ProtectSecret)`: the pair-completion hook
+    /// and the promotion inside `verify_fingerprint` both publish, and both
+    /// run while handling an *inbound* message. A single unkeyed row meant a
+    /// round started that way silently replaced one already in flight, after
+    /// which neither completed — responses for the replaced round arrived
+    /// against state that no longer existed, and no `SharingComplete` was
+    /// emitted for either. An application could not prevent this, because it
+    /// cannot see the library's round state. Distinct versions now accumulate
+    /// independently.
+    SharingRound { version: u32 },
 }
 
 impl StateKey {
@@ -652,7 +666,7 @@ impl StateKey {
             StateKey::PendingRecovery { .. } => StateKind::PendingRecovery,
             StateKey::PendingUnpair { .. } => StateKind::PendingUnpair,
             StateKey::PendingSyncCheck => StateKind::PendingSyncCheck,
-            StateKey::SharingRound => StateKind::SharingRound,
+            StateKey::SharingRound { .. } => StateKind::SharingRound,
         }
     }
 }
@@ -727,11 +741,12 @@ pub enum StateItem {
         started_at: u64,
     },
 
-    /// Active sharing round for `secret_id`. Created by
-    /// `start(ProtectSecret)` and cleared by the orchestrator once every
-    /// targeted helper has responded (confirmed, rejected, or timed
-    /// out). At most one entry exists per `secret_id`; a fresh
-    /// `start(ProtectSecret)` overwrites any prior in-flight round.
+    /// Active sharing round, keyed by the version it distributes. Created by
+    /// a publish — `start(ProtectSecret)`, the pair-completion hook, or the
+    /// promotion inside `verify_fingerprint` — and cleared by the orchestrator
+    /// once every targeted peer has responded (confirmed, rejected, or timed
+    /// out). Rounds at different versions are independent and settle
+    /// separately; one never displaces another.
     ///
     /// `pending` / `confirmed` / `failed` partition the round's target
     /// channels; the union is invariant across the round's lifetime.
@@ -810,7 +825,9 @@ impl StateItem {
                 channel_id: *channel_id,
             },
             StateItem::PendingSyncCheck { .. } => StateKey::PendingSyncCheck,
-            StateItem::SharingRound { .. } => StateKey::SharingRound,
+            StateItem::SharingRound(round) => StateKey::SharingRound {
+                version: round.version,
+            },
         }
     }
 }

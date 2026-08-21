@@ -27,7 +27,8 @@ use prost::Message;
 /// - `1` = PendingRecovery — `secret_id` (stringified u64, the secret
 ///   being recovered) and `version` present
 /// - `2` = PendingUnpair — `channel_id` present (stringified u64)
-/// - `3` = SharingRound — no secondary key
+/// - `3` = SharingRound — `version` present (the round's version, which is
+///   its secondary key)
 ///
 /// Absent fields are serialized as JSON `null` on outbound and are
 /// required-per-kind on inbound.
@@ -69,11 +70,11 @@ impl From<&StateKey> for StateKeyRecord {
                 secret_id: None,
                 version: None,
             },
-            StateKey::SharingRound => Self {
+            StateKey::SharingRound { version } => Self {
                 kind: 3,
                 channel_id: None,
                 secret_id: None,
-                version: None,
+                version: Some(*version),
             },
         }
     }

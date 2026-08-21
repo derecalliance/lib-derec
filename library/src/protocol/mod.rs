@@ -1950,83 +1950,96 @@ impl<
     }
 
     async fn check_sharing_round_timeouts(&mut self) -> Vec<DeRecEvent> {
-        let Ok(Some(StateItem::SharingRound(round))) = self
+        // More than one round can be open: the pair-completion hook and the
+        // promotion inside `verify_fingerprint` both publish, and either can
+        // run while an application-initiated round is still in flight. Each is
+        // keyed by its version and ages on its own clock, so they are swept
+        // independently rather than as a single row.
+        let Ok(rounds) = self
             .state_store
-            .load(self.secret_id, StateKey::SharingRound)
+            .load_all(self.secret_id, StateKind::SharingRound)
             .await
         else {
             return vec![];
         };
-        let crate::protocol::types::SharingRoundState {
-            version,
-            mut pending,
-            confirmed,
-            mut failed,
-            mut pending_replicas,
-            synced_replicas,
-            mut behind_replicas,
-            started_at,
-        } = *round;
 
         let now = now_secs();
-        if now.saturating_sub(started_at) <= self.timeout_in_secs {
-            return vec![];
-        }
-        let timed_out: Vec<ChannelId> = pending.drain().collect();
-        let mut events = Vec::with_capacity(timed_out.len());
-        for channel_id in timed_out {
-            failed.insert(channel_id);
-            events.push(DeRecEvent::ShareRejected {
-                channel_id,
-                version,
-                status: StatusEnum::Fail as i32,
-                memo: "timeout".to_owned(),
-            });
+        let mut events = Vec::new();
 
-            #[cfg(feature = "logging")]
-            tracing::warn!(
-                channel_id = channel_id.0,
+        for item in rounds {
+            let StateItem::SharingRound(round) = item else {
+                continue;
+            };
+            let crate::protocol::types::SharingRoundState {
                 version,
-                "sharing round: helper timed out"
-            );
-        }
-        // Members time out on the same clock. A member that never answered is
-        // behind, not a round failure — see `ReplicaSyncComplete`.
-        let timed_out_replicas: Vec<crate::types::ReplicaId> = pending_replicas.drain().collect();
-        for replica_id in timed_out_replicas {
-            behind_replicas.insert(replica_id);
-            events.push(DeRecEvent::ReplicaSyncFailed {
-                replica_id: replica_id.0,
-                version,
-                reason: "timeout".to_owned(),
-            });
+                mut pending,
+                confirmed,
+                mut failed,
+                mut pending_replicas,
+                synced_replicas,
+                mut behind_replicas,
+                started_at,
+            } = *round;
 
-            #[cfg(feature = "logging")]
-            tracing::warn!(
-                replica_id = replica_id.0,
-                version,
-                "sharing round: replica timed out"
-            );
-        }
-
-        // Persist the timeout-drained round so a subsequent
-        // `update_sharing_round` can see the mutations.
-        let _ = self
-            .state_store
-            .save(
-                self.secret_id,
-                StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+            if now.saturating_sub(started_at) <= self.timeout_in_secs {
+                continue;
+            }
+            let timed_out: Vec<ChannelId> = pending.drain().collect();
+            for channel_id in timed_out {
+                failed.insert(channel_id);
+                events.push(DeRecEvent::ShareRejected {
+                    channel_id,
                     version,
-                    pending,
-                    confirmed,
-                    failed,
-                    pending_replicas,
-                    synced_replicas,
-                    behind_replicas,
-                    started_at,
-                })),
-            )
-            .await;
+                    status: StatusEnum::Fail as i32,
+                    memo: "timeout".to_owned(),
+                });
+
+                #[cfg(feature = "logging")]
+                tracing::warn!(
+                    channel_id = channel_id.0,
+                    version,
+                    "sharing round: helper timed out"
+                );
+            }
+            // Members time out on the same clock. A member that never answered
+            // is behind, not a round failure — see `ReplicaSyncComplete`.
+            let timed_out_replicas: Vec<crate::types::ReplicaId> =
+                pending_replicas.drain().collect();
+            for replica_id in timed_out_replicas {
+                behind_replicas.insert(replica_id);
+                events.push(DeRecEvent::ReplicaSyncFailed {
+                    replica_id: replica_id.0,
+                    version,
+                    reason: "timeout".to_owned(),
+                });
+
+                #[cfg(feature = "logging")]
+                tracing::warn!(
+                    replica_id = replica_id.0,
+                    version,
+                    "sharing round: replica timed out"
+                );
+            }
+
+            // Persist the timeout-drained round so a subsequent
+            // `update_sharing_round` can see the mutations.
+            let _ = self
+                .state_store
+                .save(
+                    self.secret_id,
+                    StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                        version,
+                        pending,
+                        confirmed,
+                        failed,
+                        pending_replicas,
+                        synced_replicas,
+                        behind_replicas,
+                        started_at,
+                    })),
+                )
+                .await;
+        }
         events
     }
 
@@ -2081,24 +2094,75 @@ impl<
     /// `ShareConfirmed` / `ShareRejected` events arrive. When no channels
     /// remain pending, appends a [`DeRecEvent::SharingComplete`] summary.
     async fn update_sharing_round(&mut self, events: &mut Vec<DeRecEvent>) {
-        let Ok(Some(StateItem::SharingRound(round))) = self
+        // Every open round is offered the same event list and takes only the
+        // entries carrying its own version. Rounds overlap whenever a publish
+        // fires from an inbound path — the pair-completion hook, or the
+        // promotion inside `verify_fingerprint` — while another is in flight,
+        // so settling just one of them would strand the rest.
+        let Ok(rounds) = self
             .state_store
-            .load(self.secret_id, StateKey::SharingRound)
+            .load_all(self.secret_id, StateKind::SharingRound)
             .await
         else {
             return;
         };
-        let crate::protocol::types::SharingRoundState {
-            version: round_version,
-            mut pending,
-            mut confirmed,
-            mut failed,
-            mut pending_replicas,
-            mut synced_replicas,
-            mut behind_replicas,
-            started_at,
-        } = *round;
 
+        // Collected separately: pushing into `events` while iterating it would
+        // let one round's completion be re-examined by the next.
+        let mut produced: Vec<DeRecEvent> = Vec::new();
+
+        for item in rounds {
+            let StateItem::SharingRound(round) = item else {
+                continue;
+            };
+            let crate::protocol::types::SharingRoundState {
+                version: round_version,
+                mut pending,
+                mut confirmed,
+                mut failed,
+                mut pending_replicas,
+                mut synced_replicas,
+                mut behind_replicas,
+                started_at,
+            } = *round;
+
+            self.settle_one_round(
+                events,
+                &mut produced,
+                round_version,
+                &mut pending,
+                &mut confirmed,
+                &mut failed,
+                &mut pending_replicas,
+                &mut synced_replicas,
+                &mut behind_replicas,
+                started_at,
+            )
+            .await;
+        }
+
+        events.append(&mut produced);
+    }
+
+    /// Apply `inbound` to one round and either complete it or persist it.
+    ///
+    /// Split out of [`Self::update_sharing_round`] so the per-round body stays
+    /// readable now that several rounds can be open at once.
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_one_round(
+        &mut self,
+        inbound: &[DeRecEvent],
+        produced: &mut Vec<DeRecEvent>,
+        round_version: u32,
+        pending: &mut std::collections::HashSet<ChannelId>,
+        confirmed: &mut std::collections::HashSet<ChannelId>,
+        failed: &mut std::collections::HashSet<ChannelId>,
+        pending_replicas: &mut std::collections::HashSet<crate::types::ReplicaId>,
+        synced_replicas: &mut std::collections::HashSet<crate::types::ReplicaId>,
+        behind_replicas: &mut std::collections::HashSet<crate::types::ReplicaId>,
+        started_at: u64,
+    ) {
+        let events = inbound;
         for event in events.iter() {
             match event {
                 DeRecEvent::ShareConfirmed {
@@ -2148,9 +2212,14 @@ impl<
             let threshold_met = confirmed_count >= self.threshold;
             let _ = self
                 .state_store
-                .remove(self.secret_id, StateKey::SharingRound)
+                .remove(
+                    self.secret_id,
+                    StateKey::SharingRound {
+                        version: round_version,
+                    },
+                )
                 .await;
-            events.push(DeRecEvent::SharingComplete {
+            produced.push(DeRecEvent::SharingComplete {
                 version: round_version,
                 confirmed_count,
                 failed_count,
@@ -2207,7 +2276,7 @@ impl<
                     "replica sync round complete"
                 );
 
-                events.push(DeRecEvent::ReplicaSyncComplete {
+                produced.push(DeRecEvent::ReplicaSyncComplete {
                     version: round_version,
                     synced,
                     behind,
@@ -2216,7 +2285,7 @@ impl<
 
             removed_replicas.sort_unstable();
             for replica_id in removed_replicas {
-                events.push(DeRecEvent::ReplicaRemoved { replica_id });
+                produced.push(DeRecEvent::ReplicaRemoved { replica_id });
             }
 
             #[cfg(feature = "logging")]
@@ -2234,12 +2303,12 @@ impl<
                     self.secret_id,
                     StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
                         version: round_version,
-                        pending,
-                        confirmed,
-                        failed,
-                        pending_replicas,
-                        synced_replicas,
-                        behind_replicas,
+                        pending: std::mem::take(pending),
+                        confirmed: std::mem::take(confirmed),
+                        failed: std::mem::take(failed),
+                        pending_replicas: std::mem::take(pending_replicas),
+                        synced_replicas: std::mem::take(synced_replicas),
+                        behind_replicas: std::mem::take(behind_replicas),
                         started_at,
                     })),
                 )
@@ -2717,6 +2786,89 @@ mod sharing_round_outcome_tests {
             .expect("seed round");
     }
 
+    /// Two rounds open at once each settle on their own.
+    ///
+    /// Rounds are not started only by `start(ProtectSecret)`: the
+    /// pair-completion hook and the promotion inside `verify_fingerprint` both
+    /// publish while handling an *inbound* message, so a second round can open
+    /// under an application that never asked for one. When the row was keyed by
+    /// `secret_id` alone the newcomer replaced its predecessor and **neither**
+    /// finished — responses for the replaced round landed against state that no
+    /// longer existed, and no `SharingComplete` was emitted for either. The
+    /// application could not defend against it, having no view of round state.
+    #[test]
+    fn two_open_rounds_settle_independently() {
+        run_async(async {
+            let mut protocol = build(2);
+            seed_round(&mut protocol, 7, &[9001], &[]).await;
+            seed_round(&mut protocol, 8, &[9002], &[]).await;
+
+            // Both rows survive; the second did not displace the first.
+            for version in [7u32, 8] {
+                assert!(
+                    protocol
+                        .state_store
+                        .load(SECRET_ID, StateKey::SharingRound { version })
+                        .await
+                        .expect("load")
+                        .is_some(),
+                    "round v{version} must still be in flight"
+                );
+            }
+
+            // Answer only v7. Its event carries the version, so v8 must ignore it.
+            let mut events = vec![DeRecEvent::ShareConfirmed {
+                channel_id: ChannelId(9001),
+                version: 7,
+            }];
+            protocol.update_sharing_round(&mut events).await;
+
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, DeRecEvent::SharingComplete { version: 7, .. })),
+                "v7 completes once its only helper confirms; got {events:?}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, DeRecEvent::SharingComplete { version: 8, .. })),
+                "v8 has an outstanding helper and must not complete; got {events:?}"
+            );
+            assert!(
+                protocol
+                    .state_store
+                    .load(SECRET_ID, StateKey::SharingRound { version: 7 })
+                    .await
+                    .expect("load")
+                    .is_none(),
+                "a completed round leaves no row"
+            );
+
+            // v8 is untouched and still settles on its own answer.
+            let mut events = vec![DeRecEvent::ShareConfirmed {
+                channel_id: ChannelId(9002),
+                version: 8,
+            }];
+            protocol.update_sharing_round(&mut events).await;
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, DeRecEvent::SharingComplete { version: 8, .. })),
+                "v8 completes when its own helper answers; got {events:?}"
+            );
+            assert!(
+                protocol
+                    .state_store
+                    .load(SECRET_ID, StateKey::SharingRound { version: 8 })
+                    .await
+                    .expect("load")
+                    .is_none(),
+                "a completed round leaves no row"
+            );
+        });
+    }
+
     /// A round with no further traffic still reaches a terminal state.
     ///
     /// Timeouts are otherwise only evaluated inside `process`, so a publish
@@ -2778,7 +2930,7 @@ mod sharing_round_outcome_tests {
             assert!(
                 protocol
                     .state_store
-                    .load(SECRET_ID, StateKey::SharingRound)
+                    .load(SECRET_ID, StateKey::SharingRound { version: 3 })
                     .await
                     .expect("load")
                     .is_none(),
@@ -2957,7 +3109,7 @@ mod sharing_round_outcome_tests {
             assert!(
                 protocol
                     .state_store
-                    .load(SECRET_ID, StateKey::SharingRound)
+                    .load(SECRET_ID, StateKey::SharingRound { version: 4 })
                     .await
                     .expect("load")
                     .is_some(),

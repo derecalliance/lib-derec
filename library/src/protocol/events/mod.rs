@@ -373,10 +373,29 @@ pub enum DeRecFlow {
     SyncCheck,
     /// Remove a member from the replica group.
     ///
-    /// **Replica-only.** `replica_id` names the member being removed. Naming
-    /// this device is a voluntary departure; naming another is an eviction.
-    /// Either way every member is told, then the roster is republished without
-    /// that member.
+    /// **Replica-only.** `replica_id` names the member being removed — as a
+    /// plain `u64`, matching the decimal form ids take everywhere else.
+    /// Naming this device is a voluntary departure; naming another is an
+    /// eviction. A `replica_id` that names no current member is rejected with
+    /// [`crate::Error::InvalidInput`] rather than silently doing nothing.
+    ///
+    /// # Announcing is all this flow does
+    ///
+    /// `start` tells every member, including the departing one, and flags that
+    /// member locally. **It removes nothing on its own, and emits no
+    /// [`DeRecEvent::ReplicaRemoved`].** The flag keeps the member out of the
+    /// next roster while leaving it on the distribution list, which is how it
+    /// learns it may tear down.
+    ///
+    /// The removal completes only when **the application publishes a roster
+    /// that omits the member** — an ordinary
+    /// [`DeRecFlow::ProtectSecret`]. `ReplicaRemoved` fires when that round
+    /// completes, not before. An application that calls this flow and then
+    /// waits for the event without publishing waits forever.
+    ///
+    /// One consequence is worth stating plainly: **a group with no secret to
+    /// publish cannot complete a removal**, because there is no roster to
+    /// send. The member stays flagged until something is published.
     ///
     /// A member tears down only once it has been told to leave *and* has seen
     /// a newer roster excluding it. Absence alone never destroys a copy of the
