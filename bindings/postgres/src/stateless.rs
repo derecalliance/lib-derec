@@ -29,9 +29,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use derec_library::protocol::{
-    AutoAcceptPolicy, DeRecEvent, DeRecProtocolBuilder, PendingAction,
-};
+use derec_library::protocol::{AutoAcceptPolicy, DeRecEvent, DeRecProtocolBuilder, PendingAction};
 use derec_proto::TransportProtocol;
 
 use crate::db::SharedClient;

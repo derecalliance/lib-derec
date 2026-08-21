@@ -162,7 +162,11 @@ pub async fn assert_tables(
             expected.replica_members,
             actual.replica_members,
         ),
-        ("channel_links", expected.channel_links, actual.channel_links),
+        (
+            "channel_links",
+            expected.channel_links,
+            actual.channel_links,
+        ),
         ("secrets", expected.secrets, actual.secrets),
         ("shares", expected.shares, actual.shares),
         ("user_secrets", expected.user_secrets, actual.user_secrets),
@@ -177,7 +181,10 @@ pub async fn assert_tables(
             diffs.push(format!("{name}: expected {want}, got {got}"));
         }
     }
-    panic!("[{step}] {who} table state wrong —\n    {}", diffs.join("\n    "));
+    panic!(
+        "[{step}] {who} table state wrong —\n    {}",
+        diffs.join("\n    ")
+    );
 }
 
 /// Distinct `version` values present in `shares` for this partition.

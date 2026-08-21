@@ -15,9 +15,7 @@
 //! readable by any backend.
 
 use derec_library::protocol::types::state_record::StateItemRecord;
-use derec_library::protocol::{
-    DeRecStateStore, StateItem, StateKey, StateKind, StateStoreFuture,
-};
+use derec_library::protocol::{DeRecStateStore, StateItem, StateKey, StateKind, StateStoreFuture};
 
 use crate::db::{SharedClient, u64_to_sql};
 

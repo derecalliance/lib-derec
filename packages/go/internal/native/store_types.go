@@ -134,8 +134,12 @@ type TransportEndpoint struct {
 type ChannelStatus int
 
 const (
-	// ChannelStatusPending marks a channel awaiting fingerprint
-	// verification (replica pairing only).
+	// ChannelStatusPending marks a channel awaiting out-of-band fingerprint
+	// confirmation: every replica pairing, and every pairing made over
+	// ContactModeNoKeys — that mode commits to nothing, so the fingerprint
+	// is the only check that catches a key substituted on its plaintext
+	// PrePair leg. Such a channel is not a publish target, not a recovery
+	// source, and inbound messages on it are ignored.
 	ChannelStatusPending ChannelStatus = iota
 	// ChannelStatusPaired marks a channel fully paired and ready for
 	// protocol messages.

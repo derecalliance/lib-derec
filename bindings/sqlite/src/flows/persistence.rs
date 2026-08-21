@@ -9,8 +9,7 @@ use derec_library::types::ChannelId;
 
 use crate::db::Database;
 use crate::flows::assertions::{
-    channel_exists, count_channels, count_pending_verifications, count_shares,
-    count_user_secrets,
+    channel_exists, count_channels, count_pending_verifications, count_shares, count_user_secrets,
 };
 use crate::flows::helpers::{pair_owner_helper, protect_secret};
 use crate::peer::{DEFAULT_TEST_SECRET_ID, Peer, deliver, pump_many};
@@ -164,7 +163,8 @@ async fn in_flight_state_survives_a_restart(
             .await
             .expect("owner.start(VerifyShares) must succeed");
 
-        pending_before = count_pending_verifications(&owner_db.connection(), DEFAULT_TEST_SECRET_ID);
+        pending_before =
+            count_pending_verifications(&owner_db.connection(), DEFAULT_TEST_SECRET_ID);
         assert_eq!(
             pending_before, 1,
             "the challenge must be recorded in protocol_state, not held in memory"

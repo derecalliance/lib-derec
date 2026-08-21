@@ -35,7 +35,7 @@
 use std::collections::HashMap;
 
 use derec_library::protocol::events::DeRecEvent;
-use derec_library::protocol::types::{Secret, Target, UserSecret};
+use derec_library::protocol::types::{ChannelQuery, ChannelStatus, Secret, Target, UserSecret};
 use derec_library::protocol::{DeRecChannelStore, DeRecFlow};
 use derec_library::types::ChannelId;
 use derec_proto::{ContactMode, SenderKind};
@@ -208,8 +208,10 @@ pub async fn run() {
     step_7_admit_remaining_replicas(&owner, &helpers, &mut replicas).await;
     let secrets = step_8_protect_more_secrets(&owner, &helpers, &replicas, secrets).await;
     step_9_remove_a_replica(&owner, &helpers, &mut replicas, &secrets).await;
-    step_10_a_silent_helper_is_resolved_by_a_scheduled_tick(&mut owner, &helpers, &replicas, &secrets)
-        .await;
+    step_10_a_silent_helper_is_resolved_by_a_scheduled_tick(
+        &mut owner, &helpers, &replicas, &secrets,
+    )
+    .await;
     assert!(!retired.is_empty(), "step 4 retired two helper devices");
 
     let total: usize = owner.invocations()
@@ -282,7 +284,11 @@ async fn step_4_rotate_helpers(
                 .collect();
             // The replacements come in on the two modes with a PrePair leg,
             // so rotation is never proven only over InlineKeys.
-            let mode = if i == 0 { ContactMode::HashedKeys } else { ContactMode::NoKeys };
+            let mode = if i == 0 {
+                ContactMode::HashedKeys
+            } else {
+                ContactMode::NoKeys
+            };
             pair_helper(owner, &spare.peer, transient, &cast, mode).await
         };
         spare.channel = Some(channel);
@@ -369,7 +375,15 @@ async fn step_5_admit_first_replica(
     replicas: &mut [ReplicaDevice],
 ) {
     let replica = &replicas[0];
-    admit_replica(owner, helpers, &[], replica, ChannelId(4000), REPLICA_CONTACT_MODES[0]).await;
+    admit_replica(
+        owner,
+        helpers,
+        &[],
+        replica,
+        ChannelId(4000),
+        REPLICA_CONTACT_MODES[0],
+    )
+    .await;
 
     assert_eq!(
         replica_ids(&owner.client(), SECRET_ID).await,
@@ -479,9 +493,25 @@ async fn step_7_admit_remaining_replicas(
     replicas: &mut [ReplicaDevice],
 ) {
     let (admitted, rest) = replicas.split_at(1);
-    admit_replica(owner, helpers, admitted, &rest[0], ChannelId(6000), REPLICA_CONTACT_MODES[1]).await;
+    admit_replica(
+        owner,
+        helpers,
+        admitted,
+        &rest[0],
+        ChannelId(6000),
+        REPLICA_CONTACT_MODES[1],
+    )
+    .await;
     let (admitted, rest) = replicas.split_at(2);
-    admit_replica(owner, helpers, admitted, &rest[0], ChannelId(6001), REPLICA_CONTACT_MODES[2]).await;
+    admit_replica(
+        owner,
+        helpers,
+        admitted,
+        &rest[0],
+        ChannelId(6001),
+        REPLICA_CONTACT_MODES[2],
+    )
+    .await;
 
     let expected = vec![REPLICA_OWNER, REPLICA_TWO, REPLICA_THREE, REPLICA_FOUR];
     assert_eq!(
@@ -849,7 +879,14 @@ async fn step_2_protect_secrets(
 
     // A real account grows: two secrets first, then a third added later. Each
     // publish is a full version, so the second supersedes the first.
-    protect(owner, helpers, &[], all[..2].to_vec(), "initial two secrets").await;
+    protect(
+        owner,
+        helpers,
+        &[],
+        all[..2].to_vec(),
+        "initial two secrets",
+    )
+    .await;
     assert_eq!(
         snapshot_version(&owner.client(), SECRET_ID).await,
         Some(1),
@@ -1037,7 +1074,7 @@ async fn pair_helper(
         .unwrap_or_else(|e| panic!("[{}] start(Pairing) failed: {e}", helper.label));
 
     let events = pump(cast).await;
-    events
+    let channel = events
         .iter()
         .find_map(|e| match e {
             DeRecEvent::PairingCompleted {
@@ -1052,7 +1089,97 @@ async fn pair_helper(
                 "[{}] no PairingCompleted for transient {transient:?}",
                 helper.label
             )
-        })
+        });
+
+    confirm_fingerprint_if_needed(owner, helper, channel, mode, cast).await;
+
+    channel
+}
+
+/// Complete the out-of-band leg a [`ContactMode::NoKeys`] pairing requires.
+///
+/// That mode commits to nothing — no inlined keys, no binding hash — so the
+/// handshake alone does not make the channel usable. Both sides hold it
+/// `Pending` until the fingerprints, derived from the established shared key,
+/// are compared out of band. A real application shows them to the user; this
+/// models that step, and asserts the channel really was closed until it ran.
+///
+/// A no-op for the other two modes, whose contacts bind the keys already.
+async fn confirm_fingerprint_if_needed(
+    owner: &StatelessPeer,
+    helper: &StatelessPeer,
+    channel: ChannelId,
+    mode: ContactMode,
+    cast: &[&StatelessPeer],
+) {
+    if mode != ContactMode::NoKeys {
+        return;
+    }
+
+    for (peer, label) in [(owner, "owner"), (helper, helper.label.as_str())] {
+        assert_eq!(
+            helper_status(peer, channel).await,
+            ChannelStatus::Pending,
+            "[{label}] a NoKeys channel must not be usable before confirmation"
+        );
+    }
+
+    let owner_fp = owner
+        .session()
+        .get_fingerprint(channel)
+        .await
+        .expect("owner get_fingerprint");
+    let helper_fp = helper
+        .session()
+        .get_fingerprint(channel)
+        .await
+        .expect("helper get_fingerprint");
+    assert_eq!(
+        owner_fp, helper_fp,
+        "[{}] both sides must derive one fingerprint",
+        helper.label
+    );
+
+    assert!(
+        owner
+            .session()
+            .verify_fingerprint(channel, &helper_fp)
+            .await
+            .expect("owner verify_fingerprint")
+    );
+    assert!(
+        helper
+            .session()
+            .verify_fingerprint(channel, &owner_fp)
+            .await
+            .expect("helper verify_fingerprint")
+    );
+
+    // Confirmation is the moment this channel becomes a publish target, so the
+    // owner republishes here rather than at handshake time. That round is on
+    // the wire and has to land, exactly like the one an `InlineKeys` admission
+    // starts.
+    pump(cast).await;
+
+    for (peer, label) in [(owner, "owner"), (helper, helper.label.as_str())] {
+        assert_eq!(
+            helper_status(peer, channel).await,
+            ChannelStatus::Paired,
+            "[{label}] a confirmed NoKeys channel must be usable"
+        );
+    }
+}
+
+/// Read a helper channel's status straight from Postgres, through a throwaway
+/// session like every other operation here.
+async fn helper_status(peer: &StatelessPeer, channel_id: ChannelId) -> ChannelStatus {
+    peer.session()
+        .channel_store
+        .load(SECRET_ID, ChannelQuery::Helper { channel_id })
+        .await
+        .expect("channel_store.load")
+        .expect("channel present")
+        .status()
 }
 
 /// Publish `secrets` as a new version to every paired helper and replica.
@@ -1097,7 +1224,11 @@ async fn recover_from_helpers(
         // admitted with, so recovery is exercised across all three too.
         let contact = owner
             .session()
-            .create_contact(Some(transient), HELPER_CONTACT_MODES[i % HELPER_CONTACT_MODES.len()], None)
+            .create_contact(
+                Some(transient),
+                HELPER_CONTACT_MODES[i % HELPER_CONTACT_MODES.len()],
+                None,
+            )
             .await
             .expect("recovery create_contact failed");
         helper
@@ -1112,7 +1243,12 @@ async fn recover_from_helpers(
                 )]),
             })
             .await
-            .unwrap_or_else(|e| panic!("[{}] recovery start(Pairing) failed: {e}", helper.peer.label));
+            .unwrap_or_else(|e| {
+                panic!(
+                    "[{}] recovery start(Pairing) failed: {e}",
+                    helper.peer.label
+                )
+            });
 
         let events = pump(&[owner, &helper.peer]).await;
         let rekeyed = events
@@ -1131,6 +1267,18 @@ async fn recover_from_helpers(
                     helper.peer.label
                 )
             });
+
+        // Recovery re-pairs on the original mode, so a `NoKeys` helper needs
+        // the same out-of-band confirmation here that admitted it the first
+        // time — an unconfirmed channel is not a usable recovery source.
+        confirm_fingerprint_if_needed(
+            owner,
+            &helper.peer,
+            rekeyed,
+            HELPER_CONTACT_MODES[i % HELPER_CONTACT_MODES.len()],
+            &[owner, &helper.peer],
+        )
+        .await;
 
         // Application-side judgement: this new channel is the same owner as
         // the old one, so shares stored under the old channel stay reachable.
@@ -1238,9 +1386,7 @@ fn assert_secrets_round_tripped(recovered: &Secret, expected: &[UserSecret], ste
             .secrets
             .iter()
             .find(|s| s.id == want.id)
-            .unwrap_or_else(|| {
-                panic!("[{step}] recovered secret set is missing id {:?}", want.id)
-            });
+            .unwrap_or_else(|| panic!("[{step}] recovered secret set is missing id {:?}", want.id));
         assert_eq!(got.name, want.name, "[{step}] name for id {:?}", want.id);
         assert_eq!(got.data, want.data, "[{step}] data for id {:?}", want.id);
     }

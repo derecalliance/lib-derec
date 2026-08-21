@@ -12,9 +12,13 @@ namespace DeRec.Library.Orchestrator;
 /// Lifecycle status of a paired channel.
 /// </summary>
 /// <remarks>
-/// Replica channels start as <see cref="Pending"/> after pairing and
-/// transition to <see cref="Paired"/> once fingerprint verification
-/// succeeds. Helper / Owner channels are <see cref="Paired"/>
+/// A channel starts as <see cref="Pending"/> after pairing and transitions
+/// to <see cref="Paired"/> once fingerprint verification succeeds. Two
+/// cases take that path: every replica channel, and every channel paired
+/// over <c>ContactMode.NoKeys</c> — that mode commits to nothing, so the
+/// fingerprint is the only check that catches a key substituted on its
+/// plaintext <c>PrePair</c> leg. Helper / Owner channels paired over
+/// <c>InlineKeys</c> or <c>HashedKeys</c> are <see cref="Paired"/>
 /// immediately after pairing. Names match the Rust-side
 /// <c>ChannelStatus</c> variants verbatim — the bridge round-trips
 /// them as strings on the FFI boundary.

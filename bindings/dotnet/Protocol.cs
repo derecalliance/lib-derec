@@ -408,6 +408,10 @@ internal static class Protocol
             throw new InvalidOperationException(
                 $"both sides must converge on the same channel id; helper={helperPairing.ChannelId} owner={ownerPairing.ChannelId}");
         ulong rekeyedId = ulong.Parse(helperPairing.ChannelId);
+        // Every mode rekeys onto a long-term id derived from the shared key.
+        if (rekeyedId == channelId)
+            throw new InvalidOperationException(
+                "the long-term channel id must differ from the transient pairing id");
 
         var helperChannel = helper.ChannelStore.Load(helper.Protocol.SecretId, rekeyedId, 0)
             ?? throw new InvalidOperationException("helper channel record must exist after pairing");
@@ -849,6 +853,10 @@ internal static class Protocol
             throw new InvalidOperationException("HashedKeys pair: channel id mismatch on both sides");
 
         ulong rekeyedId = ulong.Parse(helperPairing.ChannelId);
+        // Every mode rekeys onto a long-term id derived from the shared key.
+        if (rekeyedId == channelId)
+            throw new InvalidOperationException(
+                "the long-term channel id must differ from the transient pairing id");
         var helperKey = helper.SecretStore.Load(helper.Protocol.SecretId, rekeyedId, SecretKind.SharedKey)
             ?? throw new InvalidOperationException("helper shared_key missing after HashedKeys pair");
         var ownerKey = owner.SecretStore.Load(owner.Protocol.SecretId, rekeyedId, SecretKind.SharedKey)
@@ -911,6 +919,10 @@ internal static class Protocol
             throw new InvalidOperationException("NoKeys pair: channel id mismatch on both sides");
 
         ulong rekeyedId = ulong.Parse(helperPairing.ChannelId);
+        // Every mode rekeys onto a long-term id derived from the shared key.
+        if (rekeyedId == channelId)
+            throw new InvalidOperationException(
+                "the long-term channel id must differ from the transient pairing id");
         var helperKey = helper.SecretStore.Load(helper.Protocol.SecretId, rekeyedId, SecretKind.SharedKey)
             ?? throw new InvalidOperationException("helper shared_key missing after NoKeys pair");
         var ownerKey = owner.SecretStore.Load(owner.Protocol.SecretId, rekeyedId, SecretKind.SharedKey)
@@ -927,6 +939,41 @@ internal static class Protocol
 
         Console.WriteLine($"  paired via NoKeys + PrePair (channel_id={rekeyedId}, shared_key={helperKey.Bytes.Length}B)  ✓");
         Console.WriteLine("  the spent transient PairingContact was dropped  ✓");
+
+        // The gate. NoKeys commits to nothing, so completing the handshake is
+        // not enough — nothing yet binds the keys that arrived over the
+        // plaintext PrePair leg to the contact delivered out of band. Both
+        // sides hold the channel Pending until the fingerprints are compared.
+        foreach (var (label, node) in new[] { ("helper", helper), ("owner", owner) })
+        {
+            var channel = node.ChannelStore.Load(node.Protocol.SecretId, rekeyedId, 0)
+                ?? throw new InvalidOperationException($"{label} channel missing after NoKeys pair");
+            if (channel.Status != ChannelStatus.Pending)
+                throw new InvalidOperationException(
+                    $"{label}: an unverified NoKeys channel must be Pending; got {channel.Status}");
+        }
+        Console.WriteLine("  both sides hold the channel Pending until confirmed  ✓");
+
+        string helperFingerprint = helper.Protocol.GetFingerprintAsync(rekeyedId).GetAwaiter().GetResult();
+        string ownerFingerprint = owner.Protocol.GetFingerprintAsync(rekeyedId).GetAwaiter().GetResult();
+        if (helperFingerprint != ownerFingerprint)
+            throw new InvalidOperationException("both sides must derive one fingerprint after a NoKeys pair");
+
+        if (!helper.Protocol.VerifyFingerprintAsync(rekeyedId, ownerFingerprint).GetAwaiter().GetResult())
+            throw new InvalidOperationException("helper verifyFingerprint must match");
+        if (!owner.Protocol.VerifyFingerprintAsync(rekeyedId, helperFingerprint).GetAwaiter().GetResult())
+            throw new InvalidOperationException("owner verifyFingerprint must match");
+
+        foreach (var (label, node) in new[] { ("helper", helper), ("owner", owner) })
+        {
+            var channel = node.ChannelStore.Load(node.Protocol.SecretId, rekeyedId, 0)
+                ?? throw new InvalidOperationException($"{label} channel missing after verify");
+            if (channel.Status != ChannelStatus.Paired)
+                throw new InvalidOperationException(
+                    $"{label}: a confirmed NoKeys channel must be Paired; got {channel.Status}");
+        }
+        Console.WriteLine("  confirming the fingerprint opens the channel on both sides  ✓");
+
         Console.WriteLine("Orchestrator NoKeys pair flow test passed.");
     }
 
@@ -1589,7 +1636,15 @@ internal static class Protocol
             ?? throw new InvalidOperationException("initiator must emit PairingCompleted");
         if (creatorPairing.ChannelId != initPairing.ChannelId)
             throw new InvalidOperationException("pair handshake channel id mismatch");
-        return ulong.Parse(creatorPairing.ChannelId);
+
+        // Every mode rekeys onto a long-term id derived from the shared key.
+        // The responder cannot pick it — the initiator re-derives the same
+        // value and rejects any other — so this holds whatever the mode.
+        ulong rekeyed = ulong.Parse(creatorPairing.ChannelId);
+        if (rekeyed == channelId)
+            throw new InvalidOperationException(
+                "the long-term channel id must differ from the transient pairing id");
+        return rekeyed;
     }
 
     /// <summary>

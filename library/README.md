@@ -251,7 +251,7 @@ Optional setters have defaults:
 | `with_threshold(n)` | `3` | Minimum shares required to reconstruct the secret. |
 | `with_keep_versions_count(n)` | `3` | Number of recent versions each helper must retain. |
 | `with_timeout(duration)` | `5 minutes` | Staleness boundary for inbound envelopes, sharing-round timeouts and unpair timeouts. One-second granularity. |
-| `with_remove_expired_channels(policy)` | `Enabled { timeout_in_secs: 300 }` | Automatic removal of expired `Pending` channels during `process()`. `Disabled` leaves it to the application via `remove_expired_channels`. Replica pairings await human fingerprint verification while `Pending`, so deployments using replicas should raise the timeout or disable it. |
+| `with_remove_expired_channels(policy)` | `Enabled { timeout_in_secs: 300 }` | Automatic removal of expired `Pending` channels during `process()`. `Disabled` leaves it to the application via `remove_expired_channels`. Replica pairings and `NoKeys` pairings await human fingerprint confirmation while `Pending`, so deployments using either should raise the timeout or disable it — the default gives a user five minutes to compare a fingerprint out of band. |
 | `with_communication_info(map)` | empty | Key-value identity metadata embedded in pairing messages. |
 | `with_auto_respond_on_failure(bool)` | `false` | If `true`, the protocol replies to the peer on inbound processing failures; if `false`, errors only surface as events. |
 | `with_unpair_ack(ack)` | `UnpairAck::Required` | Whether the unpair initiator waits for the peer's `Ok` before dropping local state. |
@@ -463,6 +463,22 @@ travels in the `ContactMessage` and tells the scanner which handshake to run.
 |---|---|---|
 | `InlineKeys` | Full ML-KEM encapsulation key + ECIES public key | Out-of-band channel can carry ~1.2 KB (NFC, deep link, direct messaging). |
 | `HashedKeys` | Only a 48-byte SHA-384 commitment to the keys | Out-of-band channel is size-constrained (QR codes). The scanner fetches the real keys over the wire via a plaintext `PrePair` round-trip and verifies them against the commitment. |
+| `NoKeys` | `channel_id`, `nonce` and the transport endpoint — nothing else | Out-of-band channel is a human one: hand-typed, dictated over the phone, or an institutional email. Requires a caller-supplied `nonce`. **The channel stays unusable until the fingerprint is confirmed** — see below. |
+
+> **`NoKeys` is the one mode with no cryptographic binding to the keys.**
+> `InlineKeys` carries them in the contact; `HashedKeys` carries a commitment
+> the scanner checks the fetched keys against. `NoKeys` carries neither, and
+> its `PrePair` leg is plaintext, so an attacker who intercepts that exchange
+> can substitute their own keys — the nonce does not prevent it, because the
+> nonce is in the same plaintext.
+>
+> The library therefore holds a `NoKeys` channel in `ChannelStatus::Pending`
+> until [`verify_fingerprint`](#fingerprint-confirmation) succeeds: it is not
+> a `ProtectSecret` target, not a recovery source, and inbound messages on it
+> are ignored. A man-in-the-middle leaves the two sides with different shared
+> keys and so different fingerprints, which is exactly what the comparison
+> catches. Applications MUST also rate-limit inbound `PrePairRequest`s per
+> `channel_id` and expire outstanding `NoKeys` contacts on a short timer.
 
 The library's primitives section below documents the [`InlineKeys`](#inlinekeys-flow)
 and [`HashedKeys`](#hashedkeys-flow-prepair) message-level handshakes. At
@@ -545,12 +561,22 @@ re-injects entries at the protocol boundary.
 
 ### Fingerprint confirmation
 
-Replica channels start in `ChannelStatus::Pending` after the handshake
-and are not eligible as `ProtectSecret` targets until both sides confirm
-the pair out of band. The protocol derives a deterministic
-human-readable fingerprint from the shared key — same on both
-devices — that users compare visually before each side calls
-`verify_fingerprint`:
+Two kinds of channel start in `ChannelStatus::Pending` after the handshake
+and are not eligible as `ProtectSecret` targets until both sides confirm the
+pair out of band:
+
+- **Every replica channel**, whatever the contact mode — admitting another
+  device to the group is a human decision.
+- **Every `NoKeys` channel**, including owner↔helper ones. That mode commits
+  to nothing, so the fingerprint is the only check that catches a key
+  substituted on its plaintext `PrePair` leg.
+
+A `Pending` channel fails closed: nothing is published to it, it is not used
+as a recovery source, and inbound messages on it are ignored.
+
+The protocol derives a deterministic human-readable fingerprint from the
+shared key — same on both devices — that users compare visually before each
+side calls `verify_fingerprint`:
 
 ```rust
 let local = source.get_fingerprint(channel_id).await?;
@@ -563,6 +589,10 @@ destination.verify_fingerprint(channel_id, &local).await?;  // → true
 `verify_fingerprint` returns `true` on match and transitions the channel
 to `Paired`. A mismatch returns `false` and leaves the channel `Pending`
 so the app can retry.
+
+Confirmation is also the moment the peer becomes reachable, so the current
+snapshot is published to it then — a `NoKeys` helper was not an eligible
+target at handshake time, and the pairing-time auto-publish skipped it.
 
 ### Secret distribution
 
@@ -948,15 +978,16 @@ submodules. The general pattern is:
 ### Pairing
 
 The contact message is exchanged out-of-band (QR codes, existing messaging
-channels, etc.). Two modes select how the initiator's public encryption
+channels, etc.). Three modes select how the initiator's public encryption
 material is delivered:
 
 | `ContactMode` | What's in the contact | When to use |
 |---|---|---|
 | `InlineKeys` (default) | Full ML-KEM encapsulation key + ECIES public key | Out-of-band channel can carry the keys (e.g. NFC, direct messaging). |
 | `HashedKeys` | Only a SHA-384 commitment to the keys (`contact_binding_hash`) | The out-of-band channel is size-constrained (QR codes). The scanner fetches the actual keys over the wire via a `PrePair` round-trip, then verifies them against the hash. |
+| `NoKeys` | `channel_id`, `nonce` and the transport endpoint only | The out-of-band channel is human — hand-typed or dictated. Nothing commits to the keys, so the channel stays `Pending` until the fingerprint is confirmed. See [Pairing modes](#pairing-modes). |
 
-After the handshake completes, **both modes** rekey the channel id. The
+After the handshake completes, **every mode** rekeys the channel id. The
 responder includes
 `channel_id = u64::from_be_bytes( SHA-384(u64_be(originalId) || sharedKey)[..8] )`
 in the encrypted `PairResponseMessage`; both sides switch their local channel

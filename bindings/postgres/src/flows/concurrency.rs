@@ -30,9 +30,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use derec_library::protocol::DeRecFlow;
 use derec_library::protocol::events::DeRecEvent;
 use derec_library::protocol::types::UserSecret;
-use derec_library::protocol::DeRecFlow;
 use derec_library::types::ChannelId;
 use derec_proto::{ContactMode, SenderKind};
 use tokio::sync::Mutex;
@@ -202,7 +202,11 @@ async fn one_partition_serializes_under_an_application_lock() {
     for (i, helper) in [&helper_a, &helper_b].into_iter().enumerate() {
         let contact = owner
             .session()
-            .create_contact(Some(ChannelId(800 + i as u64)), ContactMode::InlineKeys, None)
+            .create_contact(
+                Some(ChannelId(800 + i as u64)),
+                ContactMode::InlineKeys,
+                None,
+            )
             .await
             .expect("create_contact");
         helper
@@ -340,7 +344,11 @@ async fn a_scheduled_tick_shares_the_same_lock_as_inbound_messages() {
     for (i, helper) in [&helper_a, &helper_b].into_iter().enumerate() {
         let contact = owner
             .session()
-            .create_contact(Some(ChannelId(900 + i as u64)), ContactMode::InlineKeys, None)
+            .create_contact(
+                Some(ChannelId(900 + i as u64)),
+                ContactMode::InlineKeys,
+                None,
+            )
             .await
             .expect("create_contact");
         helper

@@ -41,16 +41,33 @@ pub enum Target {
 
 /// Status of a channel in the protocol lifecycle.
 ///
-/// Replica channels start as `Pending` after pairing completes and transition
-/// to `Paired` once fingerprint verification succeeds. Helper/Owner channels
-/// are `Paired` immediately after pairing.
+/// A channel starts as `Pending` after pairing completes and transitions to
+/// `Paired` once fingerprint verification succeeds. Two cases take that path:
+///
+/// - **Replica channels**, always. Admitting a second device to the group is
+///   a human decision.
+/// - **[`derec_proto::ContactMode::NoKeys`] channels**, whatever the kind.
+///   That mode inlines neither the keys nor a commitment to them, so nothing
+///   binds what the scanner received over the plaintext `PrePair` leg to the
+///   contact delivered out of band. The fingerprint, derived from the
+///   established shared key, is the only check that detects a substituted
+///   key — it is to `NoKeys` what `contact_binding_hash` is to
+///   [`derec_proto::ContactMode::HashedKeys`].
+///
+/// Helper/Owner channels paired over
+/// [`derec_proto::ContactMode::InlineKeys`] or
+/// [`derec_proto::ContactMode::HashedKeys`] are `Paired` immediately: the
+/// contact carried the keys, or a commitment already verified against them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[cfg_attr(
     any(feature = "serde", target_arch = "wasm32"),
     derive(Serialize, Deserialize)
 )]
 pub enum ChannelStatus {
-    /// Channel is awaiting fingerprint verification (replica only).
+    /// Channel is awaiting out-of-band fingerprint confirmation: every
+    /// replica pairing, and every
+    /// [`derec_proto::ContactMode::NoKeys`] pairing. Not a publish target,
+    /// not a recovery source, and inbound messages on it are ignored.
     Pending,
     /// Channel is fully paired and ready for protocol messages.
     #[default]

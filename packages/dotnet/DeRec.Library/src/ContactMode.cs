@@ -31,6 +31,16 @@ namespace DeRec.Library;
 /// rate-limit inbound <c>PrePairRequest</c>s per channel and expire
 /// outstanding NoKeys contacts on a short timer.
 /// </para>
+/// <para>
+/// Because nothing binds the published keys to the contact, a <c>NoKeys</c>
+/// channel is held in <c>ChannelStatus.Pending</c> until
+/// <c>VerifyFingerprintAsync</c> succeeds on both sides: it is not a
+/// publish target, not a recovery source, and inbound messages on it are
+/// ignored. A man-in-the-middle on the plaintext <c>PrePair</c> leg leaves
+/// the two sides with different shared keys and so different fingerprints,
+/// which is what the comparison catches — the role
+/// <c>contactBindingHash</c> plays for <see cref="HashedKeys"/>.
+/// </para>
 /// </remarks>
 public enum ContactMode
 {
@@ -47,6 +57,8 @@ public enum ContactMode
     /// No key material or binding hash embedded. Keys are generated on the
     /// fly by the contact creator when the <c>PrePairRequest</c> arrives;
     /// trust rests entirely on a fully-trusted out-of-band delivery channel.
+    /// The channel stays <c>ChannelStatus.Pending</c> — unusable — until both
+    /// sides confirm the fingerprint out of band.
     /// </summary>
     NoKeys = 2,
 }

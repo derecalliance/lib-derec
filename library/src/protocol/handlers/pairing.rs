@@ -239,6 +239,41 @@ pub(in crate::protocol) async fn start<
     }
 }
 
+/// Status a channel takes once the handshake completes: `Pending` when the
+/// pair must still be confirmed out of band, `Paired` when it is usable
+/// immediately.
+///
+/// Two cases await confirmation.
+///
+/// Replica pairings always do — two devices claiming the same user are
+/// admitted to a group, and the fingerprint is what a human compares to
+/// authorise that.
+///
+/// [`ContactMode::NoKeys`] pairings do as well, whatever the kind. That mode
+/// carries neither key material nor a commitment, and its `PrePair` leg is
+/// plaintext, so nothing binds the keys the scanner receives to the contact
+/// that was delivered out of band — an observer can substitute its own and
+/// both sides pair with it. The fingerprint is derived from the *established
+/// shared key*, so a substitution yields two different fingerprints; it is
+/// therefore the check that plays the role the binding hash plays for
+/// [`ContactMode::HashedKeys`], and the channel must not carry secrets until
+/// it passes.
+///
+/// [`ContactMode::InlineKeys`] and [`ContactMode::HashedKeys`] helper
+/// pairings are `Paired` at once: the contact itself carries the keys, or a
+/// commitment the scanner has already verified them against.
+fn completed_pairing_status(
+    kind: SenderKind,
+    contact_mode: Option<i32>,
+) -> crate::protocol::types::ChannelStatus {
+    let awaits_confirmation = kind.is_replica() || contact_mode == Some(ContactMode::NoKeys as i32);
+    if awaits_confirmation {
+        crate::protocol::types::ChannelStatus::Pending
+    } else {
+        crate::protocol::types::ChannelStatus::Paired
+    }
+}
+
 /// Accept an inbound `PairRequest`: persist the peer, answer with a
 /// `PairResponse`, and rekey onto the long-term channel.
 ///
@@ -306,11 +341,19 @@ pub(in crate::protocol) async fn accept<
 
     let peer_transport = resp.peer_transport_protocol.clone();
 
-    let status = if kind.is_replica() {
-        crate::protocol::types::ChannelStatus::Pending
-    } else {
-        crate::protocol::types::ChannelStatus::Paired
+    // The contact is still stored at this point — the transient material is
+    // dropped further down — so the mode this pairing ran under is readable
+    // here. Only `NoKeys` leaves one on the responder side; the other modes
+    // store a `PairingSecret` instead.
+    let contact_mode = match secret_store
+        .load(secret_id, channel_id, SecretKind::PairingContact)
+        .await?
+    {
+        Some(SecretValue::PairingContact(contact)) => Some(contact.contact_mode),
+        _ => None,
     };
+
+    let status = completed_pairing_status(kind, contact_mode);
 
     let peer_sender_kind = request_sender_kind(request)?;
     let (peer_communication_info, peer_replica_id) =
@@ -657,12 +700,27 @@ pub(in crate::protocol) async fn on_pre_pair_response<
         Err(e) => return Err(e),
     };
 
+    // The keys have arrived, so the contact is now inline-keys-shaped and can
+    // drive `request::produce` like any other.
     let filled_in_contact = ContactMessage {
         mlkem_encapsulation_key: Some(validated.mlkem_encapsulation_key),
         ecies_public_key: Some(validated.ecies_public_key),
         contact_mode: ContactMode::InlineKeys as i32,
         contact_binding_hash: None,
         ..original_contact.clone()
+    };
+
+    // What gets *stored*, though, must keep the mode the handshake actually
+    // ran under — it is what decides whether the finished channel waits for a
+    // fingerprint. For `HashedKeys` the relabel above is truthful: the keys
+    // were just checked against the commitment, so they are worth exactly what
+    // inlined keys are worth. For `NoKeys` nothing verified them, and calling
+    // the contact `InlineKeys` would claim a trust level the flow never
+    // earned. This value never reaches the wire and is dropped on rekey;
+    // `response::process` reads only the key fields from it.
+    let stored_contact = ContactMessage {
+        contact_mode: original_contact.contact_mode,
+        ..filled_in_contact.clone()
     };
 
     let local_kind = match channel_store
@@ -717,7 +775,7 @@ pub(in crate::protocol) async fn on_pre_pair_response<
         .save(
             secret_id,
             channel_id,
-            SecretValue::PairingContact(result.initiator_contact_message),
+            SecretValue::PairingContact(stored_contact),
         )
         .await?;
 
@@ -844,11 +902,7 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     };
     let kind = peer_kind.counterparty();
 
-    let status = if kind.is_replica() {
-        crate::protocol::types::ChannelStatus::Pending
-    } else {
-        crate::protocol::types::ChannelStatus::Paired
-    };
+    let status = completed_pairing_status(kind, Some(contact.contact_mode));
 
     let _ = require_replica_id_for_kind(kind, replica_id)?;
     let (peer_communication_info, peer_replica_id) =
@@ -2063,5 +2117,81 @@ mod replica_id_conflict_tests {
                 "the pairing secret must not survive an abandoned handshake"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_gate_tests {
+    use super::completed_pairing_status;
+    use crate::protocol::types::ChannelStatus;
+    use derec_proto::{ContactMode, SenderKind};
+
+    /// The two key-bearing modes are usable the moment the handshake lands:
+    /// the contact carried the keys outright, or a commitment the scanner has
+    /// already checked them against.
+    #[test]
+    fn helper_pairings_with_a_key_binding_are_paired_at_once() {
+        for mode in [ContactMode::InlineKeys, ContactMode::HashedKeys] {
+            for kind in [SenderKind::Owner, SenderKind::Helper] {
+                assert_eq!(
+                    completed_pairing_status(kind, Some(mode as i32)),
+                    ChannelStatus::Paired,
+                    "{kind:?} over {mode:?} must not wait for a fingerprint"
+                );
+            }
+        }
+    }
+
+    /// `NoKeys` binds nothing to the contact, so the fingerprint is the only
+    /// check that catches a substituted key and the channel stays inert until
+    /// it passes — helper pairings included, which is what this gate changed.
+    #[test]
+    fn no_keys_pairings_wait_for_the_fingerprint() {
+        for kind in [
+            SenderKind::Owner,
+            SenderKind::Helper,
+            SenderKind::ReplicaSource,
+            SenderKind::ReplicaDestination,
+        ] {
+            assert_eq!(
+                completed_pairing_status(kind, Some(ContactMode::NoKeys as i32)),
+                ChannelStatus::Pending,
+                "{kind:?} over NoKeys must wait for a fingerprint"
+            );
+        }
+    }
+
+    /// Replica pairings are gated whatever the contact mode — admitting a
+    /// second device to the group is a human decision on every path.
+    #[test]
+    fn replica_pairings_wait_regardless_of_mode() {
+        for mode in [
+            ContactMode::InlineKeys,
+            ContactMode::HashedKeys,
+            ContactMode::NoKeys,
+        ] {
+            for kind in [SenderKind::ReplicaSource, SenderKind::ReplicaDestination] {
+                assert_eq!(
+                    completed_pairing_status(kind, Some(mode as i32)),
+                    ChannelStatus::Pending,
+                    "{kind:?} over {mode:?} must wait for a fingerprint"
+                );
+            }
+        }
+    }
+
+    /// The responder stores a contact only for `NoKeys`; the other modes leave
+    /// a `PairingSecret` instead, so the mode reads as absent and the decision
+    /// falls to the kind alone.
+    #[test]
+    fn an_absent_contact_leaves_the_decision_to_the_kind() {
+        assert_eq!(
+            completed_pairing_status(SenderKind::Helper, None),
+            ChannelStatus::Paired
+        );
+        assert_eq!(
+            completed_pairing_status(SenderKind::ReplicaDestination, None),
+            ChannelStatus::Pending
+        );
     }
 }

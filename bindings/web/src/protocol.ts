@@ -553,6 +553,15 @@ async function doPair(
   // Both peers rotate to the same long-term id at handshake completion —
   // return it so downstream assertions can key on it instead of the
   // transient pairing_channel_id, which is removed once the rekey lands.
+  // Every mode rekeys onto a long-term id derived from the shared key. The
+  // responder cannot pick it — the initiator re-derives the same value and
+  // rejects any other — so this holds whatever the contact mode.
+  if (initiatorPairing.channel_id === String(channelId)) {
+    throw new Error(
+      `${label}: the long-term channel id must differ from the transient pairing id`,
+    );
+  }
+
   return { longTermChannelId: initiatorPairing.channel_id };
 }
 
@@ -679,6 +688,15 @@ async function doPairViaPrePair(
   // Both peers rotate to the same long-term id at handshake completion —
   // return it so downstream assertions can key on it instead of the
   // transient pairing_channel_id, which is removed once the rekey lands.
+  // Every mode rekeys onto a long-term id derived from the shared key. The
+  // responder cannot pick it — the initiator re-derives the same value and
+  // rejects any other — so this holds whatever the contact mode.
+  if (initiatorPairing.channel_id === String(channelId)) {
+    throw new Error(
+      `${label}: the long-term channel id must differ from the transient pairing id`,
+    );
+  }
+
   return { longTermChannelId: initiatorPairing.channel_id };
 }
 
@@ -728,6 +746,54 @@ async function runNoKeysPairingFlow(): Promise<void> {
     );
   }
   console.log("  the spent transient PairingContact was dropped  ✓\n");
+
+  // The gate. NoKeys inlines neither the keys nor a commitment to them, so
+  // nothing binds what arrived over the plaintext PrePair leg to the contact
+  // delivered out of band. Both sides hold the channel Pending until the
+  // fingerprints — derived from the established shared key — are compared.
+  const helperStatus = async (node: Node, sid: string): Promise<string> => {
+    const bytes = await node.channelStore.load(sid, longTermChannelId, "0");
+    if (!bytes) throw new Error("NoKeys pairing: channel record missing");
+    return JSON.parse(new TextDecoder().decode(bytes)).Helper.status;
+  };
+
+  for (const [label, node, sid] of [
+    ["owner", owner, ownerSid],
+    ["helper", helper, helperSid],
+  ] as const) {
+    const status = await helperStatus(node, sid);
+    if (status !== "Pending") {
+      throw new Error(
+        `NoKeys pairing: ${label} channel must be Pending before confirmation; got ${status}`,
+      );
+    }
+  }
+  console.log("  both sides hold the channel Pending until confirmed  ✓");
+
+  const ownerFingerprint = await owner.protocol.getFingerprint(BigInt(longTermChannelId));
+  const helperFingerprint = await helper.protocol.getFingerprint(BigInt(longTermChannelId));
+  if (ownerFingerprint !== helperFingerprint) {
+    throw new Error("NoKeys pairing: both sides must derive one fingerprint");
+  }
+  if (!(await owner.protocol.verifyFingerprint(BigInt(longTermChannelId), helperFingerprint))) {
+    throw new Error("NoKeys pairing: owner verifyFingerprint must match");
+  }
+  if (!(await helper.protocol.verifyFingerprint(BigInt(longTermChannelId), ownerFingerprint))) {
+    throw new Error("NoKeys pairing: helper verifyFingerprint must match");
+  }
+
+  for (const [label, node, sid] of [
+    ["owner", owner, ownerSid],
+    ["helper", helper, helperSid],
+  ] as const) {
+    const status = await helperStatus(node, sid);
+    if (status !== "Paired") {
+      throw new Error(
+        `NoKeys pairing: ${label} channel must be Paired once confirmed; got ${status}`,
+      );
+    }
+  }
+  console.log("  confirming the fingerprint opens the channel on both sides  ✓\n");
 
   console.log("✓ NoKeys pairing flow passed.\n");
 }

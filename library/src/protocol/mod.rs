@@ -952,6 +952,17 @@ impl<
     /// If the fingerprint matches, the channel status is updated from `Pending`
     /// to `Paired`, enabling it to process protocol messages. Returns `true` on
     /// match, `false` otherwise. Returns an error if the channel has no shared key.
+    ///
+    /// This is the confirmation step for both gated cases: every replica
+    /// pairing, and every [`derec_proto::ContactMode::NoKeys`] pairing —
+    /// helper channels included, since that mode binds nothing to the contact
+    /// and a man-in-the-middle on its plaintext `PrePair` leg would leave the
+    /// two sides holding different shared keys, and so different fingerprints.
+    /// Compare the two values out of band before calling this.
+    ///
+    /// On a promotion the current snapshot is published to the newly usable
+    /// peer, because it was not an eligible target while `Pending` and the
+    /// pairing-time hook therefore skipped it.
     #[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(channel_id = channel_id.0)))]
     pub async fn verify_fingerprint(
         &mut self,
@@ -961,6 +972,33 @@ impl<
         let local = self.get_fingerprint(channel_id).await?;
         if local != fingerprint {
             return Ok(false);
+        }
+
+        // A `NoKeys` helper pairing is held `Pending` for the same reason a
+        // replica one is: nothing else binds the keys to the contact that was
+        // delivered out of band, so this call is the confirmation. Without
+        // this branch such a channel could never leave `Pending`, and the
+        // gate would be a deadlock rather than a gate.
+        let mut transitioned_helper = false;
+        if let Some(record) = self
+            .channel_store
+            .load(
+                self.secret_id,
+                crate::protocol::types::ChannelQuery::Helper { channel_id },
+            )
+            .await?
+            && let Some(helper) = record.as_helper()
+            && helper.status == crate::protocol::types::ChannelStatus::Pending
+        {
+            let mut helper = helper.clone();
+            helper.status = crate::protocol::types::ChannelStatus::Paired;
+            self.channel_store
+                .save(
+                    self.secret_id,
+                    crate::protocol::types::ChannelRecord::Helper(helper),
+                )
+                .await?;
+            transitioned_helper = true;
         }
 
         // Verification promotes every member sharing this group channel,
@@ -996,14 +1034,31 @@ impl<
         // Destination is now paired, so the empty-payload fallback
         // always applies when no `UserSecrets` snapshot has been cached
         // yet.
-        if transitioned_replica {
+        //
+        // A promoted helper needs the same push for a different reason:
+        // `maybe_auto_publish_after_pair` already fired when the handshake
+        // completed, but the channel was `Pending` then, so
+        // `load_all_paired_targets` skipped it and it received nothing. This
+        // is the first moment it is an eligible target, and nothing else
+        // would re-publish before the next explicit `ProtectSecret`.
+        if transitioned_replica || transitioned_helper {
             let snapshot = self.user_secret_store.load_latest(self.secret_id).await?;
-            let (secrets, description) = match snapshot {
-                Some(s) => (s.secrets, s.description),
-                None => (Vec::new(), None),
+            let payload = match snapshot {
+                Some(s) => Some((s.secrets, s.description)),
+                // With no snapshot there is nothing a helper can be sent —
+                // an empty payload carries only the roster, which is useful
+                // to a Destination and inert to a helper. A replica
+                // transition implies a Destination is now paired, so the
+                // fallback always applies there.
+                None if transitioned_replica || self.has_paired_replica_destination().await? => {
+                    Some((Vec::new(), None))
+                }
+                None => None,
             };
-            let reply_to = self.auto_reply_to.then(|| self.own_transport.clone());
-            self.publish_secret(secrets, description, reply_to).await?;
+            if let Some((secrets, description)) = payload {
+                let reply_to = self.auto_reply_to.then(|| self.own_transport.clone());
+                self.publish_secret(secrets, description, reply_to).await?;
+            }
         }
 
         Ok(true)
@@ -1510,6 +1565,15 @@ impl<
     /// shares). The replica-side equivalent fires from
     /// `verify_fingerprint` once the channel leaves `Pending`.
     ///
+    /// The completion event is not on its own enough: a `NoKeys` pairing
+    /// completes into `ChannelStatus::Pending` and is not a publish target
+    /// until its fingerprint is confirmed. Publishing then would bump the
+    /// version for every *other* helper while reaching the new one with
+    /// nothing, and `verify_fingerprint` would publish again the moment the
+    /// gate opened — two rounds where the flow calls for one. So the hook
+    /// fires only for a helper that is already usable, and the gated case is
+    /// left to `verify_fingerprint`.
+    ///
     /// The payload comes from `user_secret_store.load_latest()` when one
     /// has been cached by an earlier `start(ProtectSecret)`. When no
     /// snapshot exists yet **and** at least one Replica Destination is
@@ -1521,16 +1585,34 @@ impl<
         &mut self,
         events: &[DeRecEvent],
     ) -> Result<Vec<DeRecEvent>> {
-        let helper_just_paired = events.iter().any(|e| {
-            matches!(
-                e,
-                DeRecEvent::PairingCompleted {
-                    kind: derec_proto::SenderKind::Owner,
-                    ..
-                }
-            )
-        });
-        if !helper_just_paired {
+        let mut a_usable_helper_just_paired = false;
+        for event in events {
+            let DeRecEvent::PairingCompleted {
+                kind: derec_proto::SenderKind::Owner,
+                channel_id,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            if self
+                .channel_store
+                .load(
+                    self.secret_id,
+                    crate::protocol::types::ChannelQuery::Helper {
+                        channel_id: *channel_id,
+                    },
+                )
+                .await?
+                .is_some_and(|record| {
+                    record.status() == crate::protocol::types::ChannelStatus::Paired
+                })
+            {
+                a_usable_helper_just_paired = true;
+                break;
+            }
+        }
+        if !a_usable_helper_just_paired {
             return Ok(Vec::new());
         }
         let snapshot = self.user_secret_store.load_latest(self.secret_id).await?;
@@ -3259,6 +3341,181 @@ mod sharing_round_outcome_tests {
                     .any(|e| matches!(e, DeRecEvent::ReplicaSyncComplete { .. })),
                 "a round with no replica leg must not report one"
             );
+        });
+    }
+}
+
+#[cfg(test)]
+mod helper_fingerprint_gate_tests {
+    use super::*;
+    use crate::protocol::test::{
+        InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
+        InMemUserSecretStore, NoopTransport, run_async,
+    };
+    use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel, SecretValue};
+
+    const SECRET_ID: u64 = 0xF1;
+    const CHANNEL: ChannelId = ChannelId(77);
+
+    fn endpoint() -> derec_proto::TransportProtocol {
+        derec_proto::TransportProtocol {
+            uri: "https://helper.example.com".to_owned(),
+            protocol: derec_proto::Protocol::Https as i32,
+        }
+    }
+
+    /// A helper channel mid-gate: pairing completed, fingerprint not yet
+    /// compared. This is the state a `NoKeys` helper pairing now lands in.
+    async fn seed_pending_helper(
+        channels: &mut InMemChannelStore,
+        secrets: &mut InMemSecretStore,
+        status: ChannelStatus,
+    ) {
+        channels
+            .save(
+                SECRET_ID,
+                ChannelRecord::Helper(HelperChannel {
+                    channel_id: CHANNEL,
+                    transport: endpoint(),
+                    communication_info: std::collections::HashMap::new(),
+                    status,
+                    created_at: now_secs(),
+                    peer_role: derec_proto::SenderKind::Helper,
+                }),
+            )
+            .await
+            .expect("seed helper channel");
+        secrets
+            .save(SECRET_ID, CHANNEL, SecretValue::SharedKey([7u8; 32]))
+            .await
+            .expect("seed shared key");
+    }
+
+    fn build(
+        channels: InMemChannelStore,
+        secrets: InMemSecretStore,
+    ) -> DeRecProtocol<
+        InMemChannelStore,
+        InMemShareStore,
+        InMemSecretStore,
+        InMemUserSecretStore,
+        InMemStateStore,
+        NoopTransport,
+    > {
+        DeRecProtocolBuilder::new(SECRET_ID)
+            .with_channel_store(channels)
+            .with_share_store(InMemShareStore::default())
+            .with_secret_store(secrets)
+            .with_user_secret_store(InMemUserSecretStore::default())
+            .with_transport(NoopTransport)
+            .with_state_store(InMemStateStore)
+            .with_own_transport("https://owner.example.com")
+            .with_threshold(2)
+            .build()
+            .expect("test protocol builds")
+    }
+
+    async fn status_of(channels: &mut InMemChannelStore) -> ChannelStatus {
+        channels
+            .load(
+                SECRET_ID,
+                crate::protocol::types::ChannelQuery::Helper {
+                    channel_id: CHANNEL,
+                },
+            )
+            .await
+            .expect("load helper")
+            .expect("helper row present")
+            .status()
+    }
+
+    /// The gate opens. Without this the `Pending` status a `NoKeys` helper
+    /// pairing lands in would be terminal — `verify_fingerprint` only ever
+    /// walked `replicas()`, so the channel could never become usable.
+    #[test]
+    fn a_matching_fingerprint_promotes_a_pending_helper() {
+        run_async(async {
+            let channels = InMemChannelStore::default();
+            let secrets = InMemSecretStore::default();
+            let (mut seeded_ch, mut seeded_se) = (channels.clone(), secrets.clone());
+            seed_pending_helper(&mut seeded_ch, &mut seeded_se, ChannelStatus::Pending).await;
+
+            let mut protocol = build(channels.clone(), secrets.clone());
+            let fingerprint = protocol
+                .get_fingerprint(CHANNEL)
+                .await
+                .expect("fingerprint derives from the shared key");
+
+            assert!(
+                protocol
+                    .verify_fingerprint(CHANNEL, &fingerprint)
+                    .await
+                    .expect("verify_fingerprint"),
+                "a matching fingerprint must verify"
+            );
+
+            let mut check = channels.clone();
+            assert_eq!(
+                status_of(&mut check).await,
+                ChannelStatus::Paired,
+                "a verified helper channel must become usable"
+            );
+        });
+    }
+
+    /// A mismatch is the MITM case the gate exists for: the channel stays
+    /// inert so nothing can be shared over it.
+    #[test]
+    fn a_wrong_fingerprint_leaves_the_helper_pending() {
+        run_async(async {
+            let channels = InMemChannelStore::default();
+            let secrets = InMemSecretStore::default();
+            let (mut seeded_ch, mut seeded_se) = (channels.clone(), secrets.clone());
+            seed_pending_helper(&mut seeded_ch, &mut seeded_se, ChannelStatus::Pending).await;
+
+            let mut protocol = build(channels.clone(), secrets.clone());
+            assert!(
+                !protocol
+                    .verify_fingerprint(CHANNEL, "not-the-fingerprint")
+                    .await
+                    .expect("verify_fingerprint"),
+                "a mismatched fingerprint must not verify"
+            );
+
+            let mut check = channels.clone();
+            assert_eq!(
+                status_of(&mut check).await,
+                ChannelStatus::Pending,
+                "a failed comparison must leave the channel inert"
+            );
+        });
+    }
+
+    /// An already-`Paired` helper — the `InlineKeys` / `HashedKeys` case — is
+    /// untouched, so re-confirming a channel is harmless and the promotion
+    /// branch cannot re-fire the publish hook.
+    #[test]
+    fn verifying_an_already_paired_helper_changes_nothing() {
+        run_async(async {
+            let channels = InMemChannelStore::default();
+            let secrets = InMemSecretStore::default();
+            let (mut seeded_ch, mut seeded_se) = (channels.clone(), secrets.clone());
+            seed_pending_helper(&mut seeded_ch, &mut seeded_se, ChannelStatus::Paired).await;
+
+            let mut protocol = build(channels.clone(), secrets.clone());
+            let fingerprint = protocol
+                .get_fingerprint(CHANNEL)
+                .await
+                .expect("fingerprint");
+            assert!(
+                protocol
+                    .verify_fingerprint(CHANNEL, &fingerprint)
+                    .await
+                    .expect("verify_fingerprint")
+            );
+
+            let mut check = channels.clone();
+            assert_eq!(status_of(&mut check).await, ChannelStatus::Paired);
         });
     }
 }

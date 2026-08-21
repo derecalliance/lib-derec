@@ -1213,27 +1213,37 @@ async fn run_no_keys_pairing_flow() {
         "long-term channel_id must differ from the transient pairing id"
     );
 
+    use derec_library::protocol::types::ChannelStatus;
+
     let owner_sid = owner.protocol.secret_id();
     let helper_sid = helper.protocol.secret_id();
-    assert!(
-        owner
-            .protocol
-            .channel_store
-            .load(owner_sid, ChannelQuery::Helper { channel_id })
-            .await
-            .expect("owner channel_store.load failed")
-            .is_some(),
-        "owner must have a paired channel after NoKeys pairing"
+
+    // The gate. `NoKeys` binds nothing to the contact, so both sides hold the
+    // channel inert until the fingerprint is compared out of band — unlike
+    // `InlineKeys` / `HashedKeys`, which are usable the moment pairing lands.
+    let owner_channel = owner
+        .protocol
+        .channel_store
+        .load(owner_sid, ChannelQuery::Helper { channel_id })
+        .await
+        .expect("owner channel_store.load failed")
+        .expect("owner must have a channel after NoKeys pairing");
+    assert_eq!(
+        owner_channel.status(),
+        ChannelStatus::Pending,
+        "an unverified NoKeys channel must not be usable on the owner side"
     );
-    assert!(
-        helper
-            .protocol
-            .channel_store
-            .load(helper_sid, ChannelQuery::Helper { channel_id })
-            .await
-            .expect("helper channel_store.load failed")
-            .is_some(),
-        "helper must have a paired channel after NoKeys pairing"
+    let helper_channel = helper
+        .protocol
+        .channel_store
+        .load(helper_sid, ChannelQuery::Helper { channel_id })
+        .await
+        .expect("helper channel_store.load failed")
+        .expect("helper must have a channel after NoKeys pairing");
+    assert_eq!(
+        helper_channel.status(),
+        ChannelStatus::Pending,
+        "an unverified NoKeys channel must not be usable on the helper side"
     );
 
     assert!(
@@ -1281,6 +1291,66 @@ async fn run_no_keys_pairing_flow() {
         owner_fp, helper_fp,
         "owner and helper fingerprints must match after NoKeys pairing"
     );
+
+    // A wrong comparison must not open the gate — this is the MITM case, where
+    // the two sides derived different shared keys and so different
+    // fingerprints.
+    assert!(
+        !owner
+            .protocol
+            .verify_fingerprint(channel_id, "0000-0000-0000-0000")
+            .await
+            .expect("owner verify_fingerprint failed"),
+        "a mismatched fingerprint must not verify"
+    );
+    let still_pending = owner
+        .protocol
+        .channel_store
+        .load(owner_sid, ChannelQuery::Helper { channel_id })
+        .await
+        .expect("owner channel_store.load failed")
+        .expect("owner channel present");
+    assert_eq!(
+        still_pending.status(),
+        ChannelStatus::Pending,
+        "a failed comparison must leave the channel inert"
+    );
+
+    // The real comparison opens it, on both sides independently.
+    assert!(
+        owner
+            .protocol
+            .verify_fingerprint(channel_id, &helper_fp)
+            .await
+            .expect("owner verify_fingerprint failed"),
+        "matching fingerprints must verify on the owner side"
+    );
+    assert!(
+        helper
+            .protocol
+            .verify_fingerprint(channel_id, &owner_fp)
+            .await
+            .expect("helper verify_fingerprint failed"),
+        "matching fingerprints must verify on the helper side"
+    );
+
+    for (label, peer, sid) in [
+        ("owner", &mut owner, owner_sid),
+        ("helper", &mut helper, helper_sid),
+    ] {
+        let channel = peer
+            .protocol
+            .channel_store
+            .load(sid, ChannelQuery::Helper { channel_id })
+            .await
+            .expect("channel_store.load failed")
+            .expect("channel present");
+        assert_eq!(
+            channel.status(),
+            ChannelStatus::Paired,
+            "{label} channel must be usable once the fingerprint is confirmed"
+        );
+    }
 
     println!("Protocol NoKeys pairing flow test passed.");
 

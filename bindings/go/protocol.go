@@ -664,6 +664,53 @@ func runEveryContactModePairs() {
 		assertTrue(!stranded,
 			"%s: the transient PairingContact must not outlive the handshake", m.name)
 
+		// The gate. NoKeys inlines neither the keys nor a commitment to them,
+		// so nothing binds what arrived over the plaintext PrePair leg to the
+		// contact delivered out of band. Both sides hold the channel Pending
+		// until the fingerprints are compared; the other two modes are usable
+		// straight away.
+		wantStatus := protocol.ChannelStatusPaired
+		if m.mode == protocol.ContactModeNoKeys {
+			wantStatus = protocol.ChannelStatusPending
+		}
+		for _, side := range []struct {
+			label string
+			peer  *peer
+		}{{"owner", owner}, {"helper", helper}} {
+			rec, ok, err := side.peer.channelStore.Load(protocolSecretID, channelID, 0)
+			must(err, fmt.Sprintf("%s %s channelStore.Load", m.name, side.label))
+			assertTrue(ok, "%s: %s must hold the channel", m.name, side.label)
+			assertTrue(rec.Helper.Status == wantStatus,
+				"%s: %s channel status = %v, want %v", m.name, side.label, rec.Helper.Status, wantStatus)
+		}
+
+		if m.mode == protocol.ContactModeNoKeys {
+			ownerFP, err := owner.proto.GetFingerprint(channelID)
+			must(err, "owner GetFingerprint")
+			helperFP, err := helper.proto.GetFingerprint(channelID)
+			must(err, "helper GetFingerprint")
+			assertTrue(ownerFP == helperFP, "both sides must derive one fingerprint")
+
+			matched, err := owner.proto.VerifyFingerprint(channelID, helperFP)
+			must(err, "owner VerifyFingerprint")
+			assertTrue(matched, "owner VerifyFingerprint must match")
+			matched, err = helper.proto.VerifyFingerprint(channelID, ownerFP)
+			must(err, "helper VerifyFingerprint")
+			assertTrue(matched, "helper VerifyFingerprint must match")
+
+			for _, side := range []struct {
+				label string
+				peer  *peer
+			}{{"owner", owner}, {"helper", helper}} {
+				rec, ok, err := side.peer.channelStore.Load(protocolSecretID, channelID, 0)
+				must(err, fmt.Sprintf("%s channelStore.Load after verify", side.label))
+				assertTrue(ok, "%s must still hold the channel", side.label)
+				assertTrue(rec.Helper.Status == protocol.ChannelStatusPaired,
+					"%s: a confirmed NoKeys channel must be Paired, got %v", side.label, rec.Helper.Status)
+			}
+			fmt.Println("  NoKeys held Pending until the fingerprint confirmed it  ✓")
+		}
+
 		fmt.Printf("  %s paired → channel_id=%d, shared_key=%dB, no transient state left  ✓\n",
 			m.name, channelID, len(ownerKey.Bytes))
 	}

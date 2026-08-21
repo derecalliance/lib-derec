@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-use derec_library::protocol::types::ChannelQuery;
+use derec_library::protocol::types::{ChannelQuery, ChannelStatus};
 use derec_library::protocol::{DeRecChannelStore, SecretKind};
 use derec_library::types::ChannelId;
 use derec_proto::{ContactMode, SenderKind};
@@ -142,11 +142,18 @@ pub async fn run() {
     println!("✓ Pairing flow passed.\n");
 }
 
-/// All three contact modes must reach the same persisted end state.
+/// All three contact modes must reach the same persisted end state, and
+/// `NoKeys` must reach it only after the fingerprint is confirmed.
 ///
 /// `HashedKeys` and `NoKeys` add a `PrePair` round-trip before the handshake
 /// proper, and this backend only ever exercised `InlineKeys` — so two of the
 /// three were never proven to persist anything here at all.
+///
+/// The rows the three modes leave behind are identical; the channel *status*
+/// is not. `NoKeys` inlines neither the keys nor a commitment to them, so
+/// nothing binds what the scanner received to the contact that was delivered
+/// out of band. Its channel is held `Pending` — unusable for sharing — until
+/// `verify_fingerprint` confirms both sides derived the same shared key.
 async fn every_contact_mode_pairs_and_persists() {
     for (i, mode) in [
         ContactMode::InlineKeys,
@@ -161,9 +168,16 @@ async fn every_contact_mode_pairs_and_persists() {
         let mut owner = Peer::new(owner_db.client(), "Owner", "https://owner.example.com");
         let mut helper = Peer::new(helper_db.client(), "Helper", "https://helper.example.com");
 
-        let channel =
-            pair_owner_helper_with_mode(&mut owner, &mut helper, ChannelId(900 + i as u64), mode)
-                .await;
+        let transient = ChannelId(900 + i as u64);
+        let channel = pair_owner_helper_with_mode(&mut owner, &mut helper, transient, mode).await;
+
+        // Every mode rekeys onto a long-term id derived from the shared key.
+        // The responder cannot pick it: the initiator re-derives the same value
+        // and rejects any other, so this holds regardless of contact mode.
+        assert_ne!(
+            channel, transient,
+            "{mode:?}: the long-term channel id must differ from the transient pairing id"
+        );
 
         for (label, db) in [("owner", &owner_db), ("helper", &helper_db)] {
             assert!(
@@ -177,6 +191,67 @@ async fn every_contact_mode_pairs_and_persists() {
                  no transient pairing material may survive"
             );
         }
+
+        let expected = if mode == ContactMode::NoKeys {
+            ChannelStatus::Pending
+        } else {
+            ChannelStatus::Paired
+        };
+        for (label, peer) in [("owner", &mut owner), ("helper", &mut helper)] {
+            assert_eq!(
+                channel_status(peer, channel).await,
+                expected,
+                "{label} channel status after a {mode:?} handshake"
+            );
+        }
+
+        if mode == ContactMode::NoKeys {
+            let owner_fp = owner
+                .protocol
+                .get_fingerprint(channel)
+                .await
+                .expect("owner get_fingerprint");
+            let helper_fp = helper
+                .protocol
+                .get_fingerprint(channel)
+                .await
+                .expect("helper get_fingerprint");
+            assert_eq!(owner_fp, helper_fp, "both sides derive one fingerprint");
+
+            assert!(
+                owner
+                    .protocol
+                    .verify_fingerprint(channel, &helper_fp)
+                    .await
+                    .expect("owner verify_fingerprint")
+            );
+            assert!(
+                helper
+                    .protocol
+                    .verify_fingerprint(channel, &owner_fp)
+                    .await
+                    .expect("helper verify_fingerprint")
+            );
+
+            for (label, peer) in [("owner", &mut owner), ("helper", &mut helper)] {
+                assert_eq!(
+                    channel_status(peer, channel).await,
+                    ChannelStatus::Paired,
+                    "{label} NoKeys channel must be usable once confirmed"
+                );
+            }
+        }
     }
     println!("  InlineKeys, HashedKeys and NoKeys all persist the same end state  ✓");
+    println!("  NoKeys is held Pending until the fingerprint is confirmed  ✓");
+}
+
+async fn channel_status(peer: &mut Peer, channel_id: ChannelId) -> ChannelStatus {
+    peer.protocol
+        .channel_store
+        .load(DEFAULT_TEST_SECRET_ID, ChannelQuery::Helper { channel_id })
+        .await
+        .expect("channel_store.load")
+        .expect("channel present")
+        .status()
 }

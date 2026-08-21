@@ -211,6 +211,14 @@ export enum SenderKind {
  *   already-KYC-authenticated institution). Applications MUST rate-limit
  *   inbound `PrePairRequest`s per channel and expire outstanding NoKeys
  *   contacts on a short timer.
+ *
+ *   Because nothing binds the published keys to the contact, the channel is
+ *   held `Pending` until `verifyFingerprint` succeeds on both sides: it is
+ *   not a publish target, not a recovery source, and inbound messages on it
+ *   are ignored. A man-in-the-middle on the plaintext `PrePair` leg leaves
+ *   the two sides with different shared keys and so different fingerprints,
+ *   which is what the comparison catches — the role `contact_binding_hash`
+ *   plays for `HashedKeys`.
  */
 export enum ContactMode {
   InlineKeys = 0,
@@ -732,12 +740,12 @@ export declare class DeRecProtocolBuilder {
    * `false` the library ignores `timeoutInSecs`; that decision is not made
    * in this binding. A timeout of `0` is clamped to 1 by the library.
    *
-   * `Pending` covers both an in-flight pairing handshake and a replica
-   * channel awaiting out-of-band fingerprint verification, and one timeout
-   * governs both. Fingerprint verification is paced by a human, so
-   * deployments that pair replicas should raise the timeout, or disable it
-   * and call {@link DeRecProtocol.removeExpiredChannels} on their own
-   * schedule.
+   * `Pending` covers an in-flight pairing handshake and any channel
+   * awaiting out-of-band fingerprint confirmation — every replica pairing,
+   * and every `NoKeys` pairing — and one timeout governs all of them.
+   * Confirmation is paced by a human, so deployments that pair replicas or
+   * use `NoKeys` should raise the timeout, or disable it and call
+   * {@link DeRecProtocol.removeExpiredChannels} on their own schedule.
    *
    * Not calling this leaves the library's default in force.
    */
@@ -833,8 +841,10 @@ export declare class DeRecProtocol {
 
   /**
    * Derive the human-readable fingerprint for a paired channel. Both sides
-   * of a replica pair compute the same fingerprint from the shared key —
-   * users compare them out of band before calling `verifyFingerprint`.
+   * compute the same value from the shared key — users compare them out of
+   * band before calling `verifyFingerprint`. Required for every replica
+   * pairing and every `NoKeys` pairing, which stay unusable until it
+   * succeeds.
    */
   getFingerprint(channelId: bigint | number): Promise<string>;
 
