@@ -190,10 +190,9 @@ pub struct DeRecProtocol<
     threshold: usize,
     /// Configured via [`DeRecProtocolBuilder::with_keep_versions_count`].
     keep_versions_count: usize,
-    /// Configured via [`DeRecProtocolBuilder::with_timeout`].
-    timeout_in_secs: u64,
-    /// Configured via [`DeRecProtocolBuilder::with_remove_expired_channels`].
-    pub(crate) expired_channel_cleanup: crate::protocol::ExpiredChannelCleanup,
+    /// Configured via [`Timeouts`](crate::protocol::types::Timeouts).
+    /// Configured via [`DeRecProtocolBuilder::with_timeouts`].
+    pub(crate) timeouts: crate::protocol::types::Timeouts,
     /// Configured via [`DeRecProtocolBuilder::with_communication_info`].
     pub(crate) communication_info: HashMap<String, String>,
     /// Configured via [`DeRecProtocolBuilder::with_auto_respond_on_failure`].
@@ -273,7 +272,7 @@ impl<
         own_transport: TransportProtocol,
         threshold: usize,
         keep_versions_count: usize,
-        timeout_in_secs: u64,
+        timeouts: crate::protocol::types::Timeouts,
     ) -> Result<Self> {
         if threshold < 2 {
             return Err(crate::Error::InvalidInput(
@@ -292,14 +291,13 @@ impl<
             unpair_ack: UnpairAck::Required,
             threshold,
             keep_versions_count,
-            timeout_in_secs,
+            timeouts,
             communication_info: HashMap::new(),
             auto_respond_on_failure: false,
             auto_reply_to: false,
             auto_accept: AutoAcceptPolicy::default(),
             replica_id: None,
             parameter_range: None,
-            expired_channel_cleanup: crate::protocol::ExpiredChannelCleanup::default(),
             secret_id,
         })
     }
@@ -1703,12 +1701,12 @@ impl<
         let msg_secs = ts.seconds as u64;
         let now = now_secs();
         let age = now.saturating_sub(msg_secs);
-        if age > self.timeout_in_secs {
+        if age > self.timeouts.inbound_message.as_secs() {
             #[cfg(feature = "logging")]
             tracing::warn!(
                 channel_id = channel_id.0,
                 message_age_secs = age,
-                timeout_secs = self.timeout_in_secs,
+                timeout_secs = self.timeouts.inbound_message.as_secs(),
                 "message discarded — older than configured timeout"
             );
             return true;
@@ -1894,7 +1892,7 @@ impl<
     /// Exactly what [`Self::process`] does about time, minus the message:
     ///
     /// 1. Expired-channel cleanup, if
-    ///    [`DeRecProtocolBuilder::with_remove_expired_channels`] enabled it.
+    ///    [`Timeouts::expired_channels`](crate::protocol::types::Timeouts::expired_channels) enabled it.
     ///    Disabled by default, in which case this step is skipped and
     ///    [`Self::remove_expired_channels`] remains available for explicit
     ///    control.
@@ -1917,7 +1915,7 @@ impl<
     /// surfaced here.
     ///
     /// Cadence should be shorter than
-    /// [`DeRecProtocolBuilder::with_timeout`], since that bounds how long a
+    /// [`Timeouts`](crate::protocol::types::Timeouts), since that bounds how long a
     /// stalled round can sit before this notices it.
     ///
     /// Concurrency is the caller's, as everywhere else: this mutates the same
@@ -1939,7 +1937,7 @@ impl<
     /// running it here as well would reorder what `process` reports.
     async fn run_timeout_sweeps(&mut self) -> Vec<DeRecEvent> {
         if let crate::protocol::ExpiredChannelCleanup::Enabled { timeout_in_secs } =
-            self.expired_channel_cleanup
+            self.timeouts.expired_channels
         {
             let _ = self.remove_expired_channels(timeout_in_secs).await;
         }
@@ -1981,7 +1979,7 @@ impl<
                 started_at,
             } = *round;
 
-            if now.saturating_sub(started_at) <= self.timeout_in_secs {
+            if now.saturating_sub(started_at) <= self.timeouts.sharing_round.as_secs() {
                 continue;
             }
             let timed_out: Vec<ChannelId> = pending.drain().collect();
@@ -2061,7 +2059,9 @@ impl<
                 StateItem::PendingUnpair {
                     channel_id,
                     started_at,
-                } if now.saturating_sub(started_at) > self.timeout_in_secs => Some(channel_id),
+                } if now.saturating_sub(started_at) > self.timeouts.unpair_ack.as_secs() => {
+                    Some(channel_id)
+                }
                 _ => None,
             })
             .collect();
@@ -2320,7 +2320,7 @@ impl<
     /// their pairing keys. Returns the ids that were removed.
     ///
     /// This is **independent of**
-    /// [`DeRecProtocolBuilder::with_remove_expired_channels`]: it sweeps at
+    /// [`Timeouts::expired_channels`](crate::protocol::types::Timeouts::expired_channels): it sweeps at
     /// the threshold it is given even when the policy is
     /// [`crate::protocol::ExpiredChannelCleanup::Disabled`]. That is what
     /// makes `Disabled` mean "the application drives cleanup itself".
@@ -2490,8 +2490,12 @@ mod expired_channel_sweep_tests {
             .with_state_store(InMemStateStore)
             .with_own_transport("https://owner.example.com")
             .with_threshold(2)
-            .with_timeout(std::time::Duration::from_secs(timeout_in_secs))
-            .with_remove_expired_channels(policy)
+            .with_timeouts(crate::protocol::types::Timeouts {
+                sharing_round: std::time::Duration::from_secs(timeout_in_secs),
+                unpair_ack: std::time::Duration::from_secs(timeout_in_secs),
+                inbound_message: std::time::Duration::from_secs(timeout_in_secs),
+                expired_channels: policy,
+            })
             .build()
             .expect("test protocol builds")
     }
@@ -2660,7 +2664,10 @@ mod expired_channel_sweep_tests {
                 .with_state_store(InMemStateStore)
                 .with_own_transport("https://owner.example.com")
                 .with_threshold(2)
-                .with_remove_expired_channels(ExpiredChannelCleanup::Disabled)
+                .with_timeouts(crate::protocol::types::Timeouts {
+                    expired_channels: ExpiredChannelCleanup::Disabled,
+                    ..Default::default()
+                })
                 .build()
                 .expect("test protocol builds");
 
@@ -2881,7 +2888,7 @@ mod sharing_round_outcome_tests {
     fn tick_closes_a_round_that_no_message_will_ever_finish() {
         run_async(async {
             let mut protocol = build(2);
-            protocol.timeout_in_secs = 60;
+            protocol.timeouts.sharing_round = std::time::Duration::from_secs(60);
 
             // A round started well outside the timeout window, with one helper
             // and one member that never answered.
@@ -2949,7 +2956,7 @@ mod sharing_round_outcome_tests {
     fn tick_expires_an_unacknowledged_unpair() {
         run_async(async {
             let mut protocol = build(2);
-            protocol.timeout_in_secs = 60;
+            protocol.timeouts.unpair_ack = std::time::Duration::from_secs(60);
 
             protocol
                 .state_store
@@ -2994,7 +3001,7 @@ mod sharing_round_outcome_tests {
     fn tick_leaves_a_recent_unpair_pending() {
         run_async(async {
             let mut protocol = build(2);
-            protocol.timeout_in_secs = 600;
+            protocol.timeouts.unpair_ack = std::time::Duration::from_secs(600);
 
             protocol
                 .state_store
@@ -3045,7 +3052,7 @@ mod sharing_round_outcome_tests {
                 ),
             ] {
                 let mut protocol = build(2);
-                protocol.expired_channel_cleanup = cleanup;
+                protocol.timeouts.expired_channels = cleanup;
                 protocol
                     .channel_store
                     .save(
@@ -3100,7 +3107,7 @@ mod sharing_round_outcome_tests {
     fn tick_leaves_a_round_inside_its_window_open() {
         run_async(async {
             let mut protocol = build(2);
-            protocol.timeout_in_secs = 600;
+            protocol.timeouts.sharing_round = std::time::Duration::from_secs(600);
             seed_round(&mut protocol, 4, &[9001], &[1002]).await;
 
             let events = protocol.tick().await;
@@ -3668,6 +3675,174 @@ mod helper_fingerprint_gate_tests {
 
             let mut check = channels.clone();
             assert_eq!(status_of(&mut check).await, ChannelStatus::Paired);
+        });
+    }
+}
+
+/// The four waiting periods, and the property that makes them four rather
+/// than one: each governs only its own concern.
+///
+/// They were a single `timeout_in_secs` until it forced a bad trade —
+/// shortening the sharing round so a stalled publish surfaced sooner also
+/// narrowed the replay window every inbound message is judged against. The
+/// independence asserted here is the whole reason the split exists, so it is
+/// tested directly rather than left implied.
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+    use crate::protocol::test::{
+        InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
+        InMemUserSecretStore, NoopTransport, run_async,
+    };
+    use crate::protocol::types::Timeouts;
+    use std::time::Duration;
+
+    const SECRET_ID: u64 = 0x7180;
+
+    type TestProtocol = DeRecProtocol<
+        InMemChannelStore,
+        InMemShareStore,
+        InMemSecretStore,
+        InMemUserSecretStore,
+        InMemPersistedStateStore,
+        NoopTransport,
+    >;
+
+    fn build_with(timeouts: Timeouts) -> TestProtocol {
+        DeRecProtocolBuilder::new(SECRET_ID)
+            .with_channel_store(InMemChannelStore::default())
+            .with_share_store(InMemShareStore::default())
+            .with_secret_store(InMemSecretStore::default())
+            .with_user_secret_store(InMemUserSecretStore::default())
+            .with_transport(NoopTransport)
+            .with_state_store(InMemPersistedStateStore::default())
+            .with_own_transport("https://owner.example.com")
+            .with_threshold(2)
+            .with_timeouts(timeouts)
+            .build()
+            .expect("test protocol builds")
+    }
+
+    /// An envelope whose timestamp is `age_secs` in the past.
+    fn envelope_aged(age_secs: u64) -> DeRecMessage {
+        DeRecMessage {
+            timestamp: Some(prost_types::Timestamp {
+                seconds: now_secs().saturating_sub(age_secs) as i64,
+                nanos: 0,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The defaults are load-bearing — every binding omits fields and relies
+    /// on these, so a change here changes behaviour for all seven surfaces.
+    #[test]
+    fn defaults_are_the_documented_values() {
+        let d = Timeouts::default();
+        assert_eq!(d.inbound_message, Duration::from_secs(300));
+        assert_eq!(d.sharing_round, Duration::from_secs(60));
+        assert_eq!(d.unpair_ack, Duration::from_secs(60));
+        assert_eq!(
+            d.expired_channels,
+            crate::protocol::ExpiredChannelCleanup::Enabled {
+                timeout_in_secs: 300
+            }
+        );
+    }
+
+    /// The staleness boundary had no test at all before the split, despite
+    /// being the replay-defence window.
+    #[test]
+    fn inbound_message_bounds_how_stale_an_envelope_may_be() {
+        let protocol = build_with(Timeouts {
+            inbound_message: Duration::from_secs(120),
+            ..Default::default()
+        });
+
+        assert!(
+            !protocol.is_message_expired(&envelope_aged(60), ChannelId(1)),
+            "an envelope inside the window is accepted"
+        );
+        assert!(
+            !protocol.is_message_expired(&envelope_aged(120), ChannelId(1)),
+            "the boundary itself is inclusive"
+        );
+        assert!(
+            protocol.is_message_expired(&envelope_aged(121), ChannelId(1)),
+            "an envelope past the window is discarded"
+        );
+    }
+
+    /// A timestampless envelope is not judged stale — the timestamp
+    /// invariant is enforced elsewhere, and treating "absent" as "expired"
+    /// here would mask it.
+    #[test]
+    fn an_envelope_without_a_timestamp_is_not_expired() {
+        let protocol = build_with(Timeouts::default());
+        let envelope = DeRecMessage {
+            timestamp: None,
+            ..Default::default()
+        };
+        assert!(!protocol.is_message_expired(&envelope, ChannelId(1)));
+    }
+
+    /// **The point of the split.** Shortening the liveness budgets must not
+    /// narrow the security boundary. Under the old single knob, asking for a
+    /// 1-second sharing round also meant refusing every message more than a
+    /// second old.
+    #[test]
+    fn shortening_the_liveness_budgets_leaves_the_replay_window_alone() {
+        let protocol = build_with(Timeouts {
+            sharing_round: Duration::from_secs(1),
+            unpair_ack: Duration::from_secs(1),
+            ..Default::default()
+        });
+
+        assert_eq!(protocol.timeouts.inbound_message, Duration::from_secs(300));
+        assert!(
+            !protocol.is_message_expired(&envelope_aged(290), ChannelId(1)),
+            "a message well inside the default replay window is still accepted \
+             even though both liveness budgets are one second"
+        );
+    }
+
+    /// And the converse: a long replay window does not keep a stalled round
+    /// open. Both directions matter — one knob meant either mistake was
+    /// reachable by tuning the other concern.
+    #[test]
+    fn a_long_replay_window_does_not_extend_the_sharing_round() {
+        run_async(async {
+            let mut protocol = build_with(Timeouts {
+                inbound_message: Duration::from_secs(3600),
+                sharing_round: Duration::from_secs(1),
+                ..Default::default()
+            });
+
+            protocol
+                .state_store
+                .save(
+                    SECRET_ID,
+                    StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                        version: 1,
+                        pending: [ChannelId(9001)].into_iter().collect(),
+                        confirmed: HashSet::new(),
+                        failed: HashSet::new(),
+                        pending_replicas: HashSet::new(),
+                        synced_replicas: HashSet::new(),
+                        behind_replicas: HashSet::new(),
+                        started_at: now_secs().saturating_sub(30),
+                    })),
+                )
+                .await
+                .expect("seed round");
+
+            let events = protocol.tick().await;
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, DeRecEvent::SharingComplete { version: 1, .. })),
+                "the round times out on its own budget, not the replay window; got {events:?}"
+            );
         });
     }
 }

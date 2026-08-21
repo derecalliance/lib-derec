@@ -325,6 +325,32 @@ export interface UpdateChannelInfoParams {
   transport_protocol?: { uri: string; protocol: number };
 }
 
+/**
+ * How long the protocol waits on each thing that can keep it waiting. Every
+ * field is optional; omit one to keep the library's default for it.
+ */
+export interface Timeouts {
+  /** Staleness boundary for inbound envelopes — the replay-defence window.
+   *  Any message older than this is discarded on receipt, whatever the flow.
+   *  Lowering it starts refusing legitimately old messages from slow
+   *  transports or skewed clocks. Library default: 300. */
+  inbound_message_secs?: number;
+  /** How long a publishing round waits on a peer that has not answered.
+   *  Bounds how long `SharingComplete` can be delayed by one unreachable
+   *  peer. Library default: 60. */
+  sharing_round_secs?: number;
+  /** How long to wait for an unpair acknowledgement before dropping local
+   *  channel state anyway. Library default: 60. */
+  unpair_ack_secs?: number;
+  /** Removal of channels still awaiting out-of-band fingerprint
+   *  confirmation — every replica pairing, and every `NoKeys` pairing.
+   *  Unlike the others this can be disabled, leaving the sweep to the
+   *  application via `removeExpiredChannels`. The budget is a **human** one:
+   *  someone comparing a fingerprint, possibly over the phone. Library
+   *  default: `{ enabled: true, timeout_in_secs: 300 }`. */
+  expired_channels?: { enabled: boolean; timeout_in_secs: number };
+}
+
 /** `SyncCheck` takes no parameters: the group and this device's own version
  *  are both read from the stores. The argument may be omitted entirely. */
 export type SyncCheckParams = Record<string, never>;
@@ -367,6 +393,20 @@ export type DeRecEvent =
   | { type: "ShareStored"; channel_id: string; version: number }
   | { type: "ShareConfirmed"; channel_id: string; version: number }
   | { type: "ShareRejected"; channel_id: string; version: number; status: number; memo: string }
+  /** A publishing round finished — every targeted helper confirmed,
+   *  rejected, or timed out.
+   *
+   *  **A mixed round waits for the replica leg.** The counts here describe
+   *  helpers only and are known the instant the helpers answer, but the
+   *  event is withheld until every replica member has also acknowledged,
+   *  refused, or timed out. One unreachable member therefore delays it by
+   *  up to the configured timeout, which is easy to mistake for a hang.
+   *  Nothing is lost — the round always terminates and a silent member is
+   *  reported in `ReplicaSyncComplete.behind` rather than failing it.
+   *
+   *  Drive per-helper progress from `ShareConfirmed` instead: those land as
+   *  each helper answers, with no cross-population wait. A helpers-only
+   *  round is unaffected. */
   | { type: "SharingComplete"; version: number; confirmed_count: number; failed_count: number; threshold_met: boolean }
   /** A group member refused a secret sync. Keyed by `replica_id`, not
    *  `channel_id`: every member answers on the one group channel. A
@@ -734,8 +774,21 @@ export declare class DeRecProtocolBuilder {
   withThreshold(threshold: number): DeRecProtocolBuilder;
   /** Default: 3. */
   withKeepVersionsCount(count: number): DeRecProtocolBuilder;
-  /** Seconds. Default: 300 (5 minutes). Clamped to at least 1. */
-  withTimeout(timeoutInSecs: number): DeRecProtocolBuilder;
+  /**
+   * Configure how long the protocol waits on each thing that can keep it
+   * waiting. Every field is optional and **absent means "keep the library
+   * default"**; not calling this at all leaves all four at their defaults.
+   *
+   * These were one setting until it became clear they answer different
+   * questions. `inbound_message_secs` is a **security** boundary — how stale
+   * a message may be and still be accepted — so it has to tolerate transport
+   * latency and clock skew. The other three are **liveness** budgets: how
+   * long to keep hoping a peer will answer.
+   *
+   * Values are forwarded verbatim; clamping, and the meaning of a disabled
+   * `expired_channels`, are library decisions rather than this binding's.
+   */
+  withTimeouts(timeouts: Timeouts): DeRecProtocolBuilder;
   /** Default: empty. */
   withCommunicationInfo(info: Record<string, string>): DeRecProtocolBuilder;
   /** Default: false. */
@@ -764,23 +817,6 @@ export declare class DeRecProtocolBuilder {
    * stable across restarts. Default: unset.
    */
   withReplicaId(id: bigint | number): DeRecProtocolBuilder;
-  /**
-   * Automatic removal of expired `Pending` channels during `process()`.
-   *
-   * Both arguments are always forwarded to the library. When `enabled` is
-   * `false` the library ignores `timeoutInSecs`; that decision is not made
-   * in this binding. A timeout of `0` is clamped to 1 by the library.
-   *
-   * `Pending` covers an in-flight pairing handshake and any channel
-   * awaiting out-of-band fingerprint confirmation — every replica pairing,
-   * and every `NoKeys` pairing — and one timeout governs all of them.
-   * Confirmation is paced by a human, so deployments that pair replicas or
-   * use `NoKeys` should raise the timeout, or disable it and call
-   * {@link DeRecProtocol.removeExpiredChannels} on their own schedule.
-   *
-   * Not calling this leaves the library's default in force.
-   */
-  withRemoveExpiredChannels(enabled: boolean, timeoutInSecs: number): DeRecProtocolBuilder;
 
   /**
    * Finalize the configuration. Throws if any of the required setters

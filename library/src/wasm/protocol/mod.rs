@@ -109,6 +109,50 @@ pub struct DeRecProtocolWasm {
     inner: WasmProtocol,
 }
 
+/// JS-side shape of [`crate::protocol::types::Timeouts`]. Every field is
+/// optional; absent means the library's default stands. Mirrors the FFI
+/// `"timeouts"` config object so the two bindings cannot drift.
+#[derive(serde::Deserialize)]
+struct TimeoutsJs {
+    #[serde(default)]
+    inbound_message_secs: Option<u64>,
+    #[serde(default)]
+    sharing_round_secs: Option<u64>,
+    #[serde(default)]
+    unpair_ack_secs: Option<u64>,
+    #[serde(default)]
+    expired_channels: Option<ExpiredChannelsJs>,
+}
+
+#[derive(serde::Deserialize)]
+struct ExpiredChannelsJs {
+    enabled: bool,
+    timeout_in_secs: u64,
+}
+
+impl TimeoutsJs {
+    fn to_timeouts(&self) -> crate::protocol::types::Timeouts {
+        let d = crate::protocol::types::Timeouts::default();
+        crate::protocol::types::Timeouts {
+            inbound_message: self
+                .inbound_message_secs
+                .map_or(d.inbound_message, Duration::from_secs),
+            sharing_round: self
+                .sharing_round_secs
+                .map_or(d.sharing_round, Duration::from_secs),
+            unpair_ack: self
+                .unpair_ack_secs
+                .map_or(d.unpair_ack, Duration::from_secs),
+            expired_channels: self
+                .expired_channels
+                .as_ref()
+                .map_or(d.expired_channels, |e| {
+                    crate::protocol::ExpiredChannelCleanup::new(e.enabled, e.timeout_in_secs)
+                }),
+        }
+    }
+}
+
 /// Fluent builder for [`DeRecProtocolWasm`]. Mirrors the Rust
 /// [`crate::protocol::DeRecProtocolBuilder`] and the dotnet
 /// `DeRecProtocolBuilder` method-for-method so a developer who already
@@ -135,11 +179,10 @@ pub struct DeRecProtocolBuilderWasm {
     threshold: u32,
     keep_versions_count: u32,
     communication_info: HashMap<String, String>,
-    timeout_in_secs: u32,
-    /// `None` until `withRemoveExpiredChannels` is called, so an
-    /// unconfigured builder leaves the library's own default in force
-    /// rather than restating it here.
-    remove_expired_channels: Option<(bool, u32)>,
+    /// `None` until `withTimeouts` is called, so an unconfigured builder
+    /// leaves the library's own defaults in force rather than restating them
+    /// here.
+    timeouts: Option<TimeoutsJs>,
     auto_respond_on_failure: bool,
     unpair_ack: UnpairAck,
     auto_reply_to: bool,
@@ -170,8 +213,7 @@ impl DeRecProtocolBuilderWasm {
             threshold: 3,
             keep_versions_count: 3,
             communication_info: HashMap::new(),
-            timeout_in_secs: 300,
-            remove_expired_channels: None,
+            timeouts: None,
             auto_respond_on_failure: false,
             unpair_ack: UnpairAck::Required,
             auto_reply_to: false,
@@ -260,30 +302,29 @@ impl DeRecProtocolBuilderWasm {
         self
     }
 
-    /// Protocol-wide staleness boundary (seconds). Clamped to at least
-    /// 1. Default: 300.
-    #[wasm_bindgen(js_name = withTimeout)]
-    pub fn with_timeout(mut self, timeout_in_secs: u32) -> DeRecProtocolBuilderWasm {
-        self.timeout_in_secs = timeout_in_secs.max(1);
-        self
-    }
-
-    /// Configure automatic removal of expired `Pending` channels during
-    /// `process()`.
+    /// Configure the four waiting periods in one call.
     ///
-    /// Both arguments are always forwarded to the library. When `enabled`
-    /// is `false` the library ignores `timeout_in_secs`; that decision is
-    /// not made here. A timeout of `0` is clamped to 1 by the library.
+    /// Object shape — every field optional, and **absent means "keep the
+    /// library default"**:
     ///
-    /// Not calling this leaves the library's default in force.
-    #[wasm_bindgen(js_name = withRemoveExpiredChannels)]
-    pub fn with_remove_expired_channels(
-        mut self,
-        enabled: bool,
-        timeout_in_secs: u32,
-    ) -> DeRecProtocolBuilderWasm {
-        self.remove_expired_channels = Some((enabled, timeout_in_secs));
-        self
+    /// ```text
+    /// {
+    ///   inbound_message_secs?: number,   // staleness / replay window
+    ///   sharing_round_secs?:   number,
+    ///   unpair_ack_secs?:      number,
+    ///   expired_channels?:     { enabled: boolean, timeout_in_secs: number },
+    /// }
+    /// ```
+    ///
+    /// Values are forwarded verbatim; clamping and the meaning of a disabled
+    /// `expired_channels` are library decisions, not this shim's. Not calling
+    /// this leaves every default in force.
+    #[wasm_bindgen(js_name = withTimeouts)]
+    pub fn with_timeouts(mut self, timeouts: JsValue) -> Result<DeRecProtocolBuilderWasm, JsValue> {
+        let parsed: TimeoutsJs = serde_wasm_bindgen::from_value(timeouts)
+            .map_err(|e| js_error("INVALID_TIMEOUTS", e.to_string()))?;
+        self.timeouts = Some(parsed);
+        Ok(self)
     }
 
     /// `info` shape: `Record<string, string>`. Default: empty.
@@ -486,15 +527,12 @@ impl DeRecProtocolBuilderWasm {
             .with_threshold(self.threshold as usize)
             .with_keep_versions_count(self.keep_versions_count as usize)
             .with_communication_info(self.communication_info)
-            .with_timeout(Duration::from_secs(u64::from(self.timeout_in_secs)))
             .with_auto_respond_on_failure(self.auto_respond_on_failure)
             .with_unpair_ack(self.unpair_ack)
             .with_auto_reply_to(self.auto_reply_to)
             .with_auto_accept(self.auto_accept);
-        if let Some((enabled, timeout_in_secs)) = self.remove_expired_channels {
-            builder = builder.with_remove_expired_channels(
-                crate::protocol::ExpiredChannelCleanup::new(enabled, u64::from(timeout_in_secs)),
-            );
+        if let Some(t) = self.timeouts {
+            builder = builder.with_timeouts(t.to_timeouts());
         }
         if let Some(id) = self.replica_id {
             builder = builder.with_replica_id(id);

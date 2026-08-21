@@ -98,9 +98,10 @@ type Config struct {
 	// pairing-request and pairing-response CommunicationInfo. Default:
 	// empty.
 	CommunicationInfo map[string]string
-	// Timeout is the protocol-wide staleness boundary, truncated to
-	// seconds and clamped to at least 1 second. Default: 5 minutes.
-	Timeout time.Duration
+	// Timeouts configures how long the protocol waits on each thing that
+	// can keep it waiting. nil, or a zero field inside it, leaves the
+	// library's own default in force. See Timeouts.
+	Timeouts *Timeouts
 	// AutoRespondOnFailure controls whether the protocol auto-replies on
 	// failed inbound processing. Default: false.
 	AutoRespondOnFailure bool
@@ -116,17 +117,39 @@ type Config struct {
 	// ReplicaID configures this node's local replica_id, required for
 	// any replica-mode pairing. Default: unset.
 	ReplicaID *uint64
-	// RemoveExpiredChannels configures automatic removal of expired
-	// Pending channels during Process. nil leaves the library's own
-	// default in force.
-	//
-	// Pending covers both an in-flight pairing handshake and a replica
-	// channel awaiting out-of-band fingerprint verification, and one
-	// timeout governs both. Fingerprint verification is paced by a
-	// human, so deployments that pair replicas should raise
-	// TimeoutInSecs, or set Enabled false and call
-	// RemoveExpiredChannels on their own schedule.
-	RemoveExpiredChannels *RemoveExpiredChannelsPolicy
+}
+
+// Timeouts configures how long the protocol waits on each thing that can keep
+// it waiting. A zero field means "use the library default"; the defaults live
+// in the Rust library, not here.
+//
+// These were one knob until it became clear they answer different questions.
+// InboundMessage is a security boundary — it bounds how stale a message may be
+// and still be accepted, so it must tolerate transport latency and clock skew.
+// The other three are liveness budgets: how long to keep hoping a peer will
+// answer. Collapsing them meant tightening the replay window every time
+// someone wanted rounds to settle faster.
+type Timeouts struct {
+	// InboundMessage is the staleness boundary for inbound envelopes: any
+	// message older than this is discarded on receipt, whatever the flow.
+	// This is the replay-defence window, and lowering it starts refusing
+	// legitimately old messages from slow transports or skewed clocks.
+	// Default: 300s.
+	InboundMessage time.Duration
+	// SharingRound bounds how long a publishing round waits on a peer that
+	// has not answered. It is what limits how long SharingComplete can be
+	// delayed by one unreachable peer. Default: 60s.
+	SharingRound time.Duration
+	// UnpairAck bounds the wait for an unpair acknowledgement before local
+	// channel state is dropped anyway. Default: 60s.
+	UnpairAck time.Duration
+	// ExpiredChannels governs removal of channels still awaiting out-of-band
+	// fingerprint confirmation — every replica pairing, and every NoKeys
+	// pairing. Unlike the others it can be disabled, leaving the sweep to
+	// the application. The budget is a human one: someone comparing a
+	// fingerprint, possibly over the phone. nil leaves the default
+	// (enabled, 300s) in force.
+	ExpiredChannels *RemoveExpiredChannelsPolicy
 }
 
 // RemoveExpiredChannelsPolicy configures the automatic expired-channel
@@ -201,13 +224,28 @@ func New(
 	if keepVersionsCount == 0 {
 		keepVersionsCount = 3
 	}
-	timeout := config.Timeout
-	if timeout == 0 {
-		timeout = 5 * time.Minute
-	}
-	timeoutInSecs := uint32(timeout.Truncate(time.Second).Seconds())
-	if timeoutInSecs == 0 {
-		timeoutInSecs = 1
+	// Timeouts are forwarded verbatim; an unset field is omitted so the
+	// library applies its own default rather than this wrapper choosing one.
+	var nativeTimeouts *native.TimeoutsConfig
+	if config.Timeouts != nil {
+		secs := func(d time.Duration) *uint64 {
+			if d == 0 {
+				return nil
+			}
+			v := uint64(d.Truncate(time.Second).Seconds())
+			return &v
+		}
+		nativeTimeouts = &native.TimeoutsConfig{
+			InboundMessageSecs: secs(config.Timeouts.InboundMessage),
+			SharingRoundSecs:   secs(config.Timeouts.SharingRound),
+			UnpairAckSecs:      secs(config.Timeouts.UnpairAck),
+		}
+		if p := config.Timeouts.ExpiredChannels; p != nil {
+			nativeTimeouts.ExpiredChannels = &native.RemoveExpiredChannelsPolicy{
+				Enabled:       p.Enabled,
+				TimeoutInSecs: p.TimeoutInSecs,
+			}
+		}
 	}
 
 	commInfo, err := encodeCommunicationInfo(config.CommunicationInfo)
@@ -222,7 +260,7 @@ func New(
 		Threshold:            threshold,
 		KeepVersionsCount:    keepVersionsCount,
 		CommunicationInfo:    commInfo,
-		TimeoutInSecs:        timeoutInSecs,
+		Timeouts:             nativeTimeouts,
 		AutoRespondOnFailure: config.AutoRespondOnFailure,
 		UnpairAck:            int32(config.UnpairAck),
 		AutoReplyTo:          config.AutoReplyTo,
@@ -238,13 +276,6 @@ func New(
 		},
 		ReplicaID: config.ReplicaID,
 	}
-	if config.RemoveExpiredChannels != nil {
-		nativeCfg.RemoveExpiredChannels = &native.RemoveExpiredChannelsPolicy{
-			Enabled:       config.RemoveExpiredChannels.Enabled,
-			TimeoutInSecs: config.RemoveExpiredChannels.TimeoutInSecs,
-		}
-	}
-
 	instance, err := native.NewProtocolInstance(
 		channelStore, secretStore, shareStore, userSecretStore, stateStore, transport,
 		nativeCfg,

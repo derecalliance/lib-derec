@@ -848,9 +848,11 @@ func runExpiredChannelCleanup() {
 		OwnTransportProtocol: int32(derecpb.Protocol_HTTPS),
 		Threshold:            2,
 		KeepVersionsCount:    3,
-		RemoveExpiredChannels: &protocol.RemoveExpiredChannelsPolicy{
-			Enabled:       false,
-			TimeoutInSecs: 900,
+		Timeouts: &protocol.Timeouts{
+			ExpiredChannels: &protocol.RemoveExpiredChannelsPolicy{
+				Enabled:       false,
+				TimeoutInSecs: 900,
+			},
 		},
 	}
 	p, err := protocol.New(channelStore, shareStore, secretStore, userSecretStore, stateStore, transport, cfg)

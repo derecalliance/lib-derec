@@ -23,7 +23,7 @@ namespace DeRec.Library.Orchestrator;
 /// <para>
 /// Optional setters all carry the defaults documented on the Rust
 /// builder: <see cref="WithThreshold"/> (3), <see cref="WithKeepVersionsCount"/> (3),
-/// <see cref="WithTimeout"/> (5 minutes), <see cref="WithCommunicationInfo"/> (empty),
+/// <see cref="WithTimeouts"/> (library defaults), <see cref="WithCommunicationInfo"/> (empty),
 /// <see cref="WithAutoRespondOnFailure"/> (false),
 /// <see cref="WithUnpairAck"/> (<see cref="UnpairAck.Required"/>),
 /// <see cref="WithAutoReplyTo"/> (false), <see cref="WithReplicaId"/> (unset).
@@ -41,14 +41,13 @@ public sealed class DeRecProtocolBuilder
     private TransportProtocol? _ownTransport;
     private int _threshold = 3;
     private int _keepVersionsCount = 3;
-    private TimeSpan _timeout = TimeSpan.FromSeconds(300);
     private Dictionary<string, string> _communicationInfo = new();
     private bool _autoRespondOnFailure = false;
     private UnpairAck _unpairAck = UnpairAck.Required;
     private bool _autoReplyTo = false;
     private AutoAcceptPolicy _autoAccept = new();
     private ulong? _replicaId = null;
-    private RemoveExpiredChannelsPolicy? _removeExpiredChannels = null;
+    private Timeouts? _timeouts = null;
 
     /// <summary>
     /// Construct a builder bound to a specific secret.
@@ -131,12 +130,21 @@ public sealed class DeRecProtocolBuilder
     }
 
     /// <summary>
-    /// Protocol-wide staleness boundary. Truncated to seconds; clamped
-    /// to at least 1 second. Default: 5 minutes.
+    /// Configure how long the protocol waits on each thing that can keep it
+    /// waiting. Not calling this leaves every library default in force, as
+    /// does leaving any individual field of <see cref="Timeouts"/> null.
     /// </summary>
-    public DeRecProtocolBuilder WithTimeout(TimeSpan timeout)
+    /// <remarks>
+    /// These were one setting until it became clear they answer different
+    /// questions. <see cref="Timeouts.InboundMessage"/> is a security
+    /// boundary — how stale a message may be and still be accepted — so it
+    /// must tolerate transport latency and clock skew. The other three are
+    /// liveness budgets. Values are forwarded verbatim; clamping and
+    /// defaulting are library decisions.
+    /// </remarks>
+    public DeRecProtocolBuilder WithTimeouts(Timeouts timeouts)
     {
-        _timeout = timeout;
+        _timeouts = timeouts;
         return this;
     }
 
@@ -207,23 +215,6 @@ public sealed class DeRecProtocolBuilder
 
     /// <summary>
     /// Configure automatic removal of expired <c>Pending</c> channels
-    /// during <see cref="DeRecProtocol.ProcessAsync"/>. Not calling this
-    /// leaves the library's own default in force.
-    /// </summary>
-    /// <remarks>
-    /// Both values are forwarded to the library, including when
-    /// <paramref name="enabled"/> is <c>false</c> — the library decides
-    /// that a disabled policy ignores its timeout. A timeout of <c>0</c>
-    /// is clamped to 1 by the library. See
-    /// <see cref="RemoveExpiredChannelsPolicy"/> for why replica
-    /// deployments usually need a value larger than the default.
-    /// </remarks>
-    public DeRecProtocolBuilder WithRemoveExpiredChannels(bool enabled, ulong timeoutInSecs)
-    {
-        _removeExpiredChannels = new RemoveExpiredChannelsPolicy(enabled, timeoutInSecs);
-        return this;
-    }
-
     /// <summary>
     /// Finalize the configuration. Throws
     /// <see cref="InvalidOperationException"/> if any of the required
@@ -239,9 +230,6 @@ public sealed class DeRecProtocolBuilder
         if (_transport is null) throw new InvalidOperationException("WithTransport is required");
         if (_ownTransport is null) throw new InvalidOperationException("WithOwnTransport is required");
 
-        long secs = (long)Math.Floor(_timeout.TotalSeconds);
-        int timeoutInSecs = (int)Math.Max(1, Math.Min(secs, int.MaxValue));
-
         return new DeRecProtocol(
             secretId: _secretId,
             channelStore: _channelStore,
@@ -255,12 +243,11 @@ public sealed class DeRecProtocolBuilder
             threshold: _threshold,
             keepVersionsCount: _keepVersionsCount,
             communicationInfo: _communicationInfo,
-            timeoutInSecs: timeoutInSecs,
             autoRespondOnFailure: _autoRespondOnFailure,
             unpairAck: _unpairAck,
             autoReplyTo: _autoReplyTo,
             autoAccept: _autoAccept,
             replicaId: _replicaId,
-            removeExpiredChannels: _removeExpiredChannels);
+            timeouts: _timeouts);
     }
 }

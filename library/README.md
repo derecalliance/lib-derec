@@ -613,6 +613,34 @@ On the destination, the inbound envelope decodes into
 with `secret: Secret` and `shares: Vec<ChannelShare>` already
 parsed — the app just installs the secrets.
 
+#### When a mixed round reports
+
+A round that targets both helpers and replica members reports **only once
+both populations have settled**. `SharingComplete` and `ReplicaSyncComplete`
+are emitted together, at that moment.
+
+The counts on `SharingComplete` describe helpers only and are known the
+instant the helpers answer — but the event is held until every member has
+acknowledged, refused, or timed out. So **one unreachable member delays it by
+up to `with_timeout`**, even though the helpers confirmed in milliseconds.
+
+Nothing is lost and the round always terminates: the timeout sweep closes it,
+and a member that never answered is reported in `behind` rather than failing
+the round. The application is simply told late, which is easy to mistake for a
+hang.
+
+Two things follow for application authors:
+
+- **Do not drive a "your secret is protected" indicator from
+  `SharingComplete` alone** if replicas are in play. Watch the per-peer
+  `ShareConfirmed` events instead — those land as each helper answers, with no
+  cross-population wait.
+- **Call `tick()` on a schedule.** Timeouts only advance inside `process` and
+  `tick`, so an idle protocol with a stranded round never closes it at all.
+
+A helpers-only round is unaffected and completes as soon as the helpers
+answer.
+
 ---
 
 ## Correlation and routing on the wire

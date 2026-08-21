@@ -97,13 +97,12 @@ public sealed class DeRecProtocol : IDisposable
         int threshold = 3,
         int keepVersionsCount = 3,
         Dictionary<string, string>? communicationInfo = null,
-        int timeoutInSecs = 300,
         bool autoRespondOnFailure = false,
         UnpairAck unpairAck = UnpairAck.Required,
         bool autoReplyTo = false,
         AutoAcceptPolicy? autoAccept = null,
         ulong? replicaId = null,
-        RemoveExpiredChannelsPolicy? removeExpiredChannels = null)
+        Timeouts? timeouts = null)
     {
         SecretId = secretId;
         _channelStore = channelStore;
@@ -218,7 +217,6 @@ public sealed class DeRecProtocol : IDisposable
             OwnTransportProtocol: ownProtocolNum,
             Threshold: (uint)threshold,
             KeepVersionsCount: (uint)keepVersionsCount,
-            TimeoutInSecs: (uint)timeoutInSecs,
             AutoRespondOnFailure: autoRespondOnFailure,
             UnpairAck: (int)unpairAck,
             AutoReplyTo: autoReplyTo,
@@ -231,11 +229,17 @@ public sealed class DeRecProtocol : IDisposable
                 GetShare: policy.GetShare,
                 Unpair: policy.Unpair,
                 UpdateChannelInfo: policy.UpdateChannelInfo),
-            RemoveExpiredChannels: removeExpiredChannels is null
+            Timeouts: timeouts is null
                 ? null
-                : new RemoveExpiredChannelsConfigDto(
-                    Enabled: removeExpiredChannels.Enabled,
-                    TimeoutInSecs: removeExpiredChannels.TimeoutInSecs),
+                : new TimeoutsConfigDto(
+                    InboundMessageSecs: ToSecs(timeouts.InboundMessage),
+                    SharingRoundSecs: ToSecs(timeouts.SharingRound),
+                    UnpairAckSecs: ToSecs(timeouts.UnpairAck),
+                    ExpiredChannels: timeouts.ExpiredChannels is null
+                        ? null
+                        : new RemoveExpiredChannelsConfigDto(
+                            Enabled: timeouts.ExpiredChannels.Enabled,
+                            TimeoutInSecs: timeouts.ExpiredChannels.TimeoutInSecs)),
             ReplicaId: replicaId?.ToString(System.Globalization.CultureInfo.InvariantCulture));
         byte[] configJsonBytes = JsonSerializer.SerializeToUtf8Bytes(config, JsonOpts);
 
@@ -1242,12 +1246,11 @@ public sealed class DeRecProtocol : IDisposable
         [property: JsonPropertyName("own_transport_protocol")] int OwnTransportProtocol,
         [property: JsonPropertyName("threshold")] uint Threshold,
         [property: JsonPropertyName("keep_versions_count")] uint KeepVersionsCount,
-        [property: JsonPropertyName("timeout_in_secs")] uint TimeoutInSecs,
         [property: JsonPropertyName("auto_respond_on_failure")] bool AutoRespondOnFailure,
         [property: JsonPropertyName("unpair_ack")] int UnpairAck,
         [property: JsonPropertyName("auto_reply_to")] bool AutoReplyTo,
         [property: JsonPropertyName("auto_accept")] AutoAcceptConfigDto AutoAccept,
-        [property: JsonPropertyName("remove_expired_channels")] RemoveExpiredChannelsConfigDto? RemoveExpiredChannels,
+        [property: JsonPropertyName("timeouts")] TimeoutsConfigDto? Timeouts,
         [property: JsonPropertyName("replica_id")] string? ReplicaId);
 
     // Field-for-field equivalent of Rust `RemoveExpiredChannelsConfig`.
@@ -1259,6 +1262,19 @@ public sealed class DeRecProtocol : IDisposable
     private sealed record RemoveExpiredChannelsConfigDto(
         [property: JsonPropertyName("enabled")] bool Enabled,
         [property: JsonPropertyName("timeout_in_secs")] ulong TimeoutInSecs);
+
+    // Field-for-field equivalent of Rust `TimeoutsConfig`. Every field is
+    // omitted when null so Rust's `#[serde(default)]` supplies the default —
+    // the values live there, not in this wrapper.
+    private sealed record TimeoutsConfigDto(
+        [property: JsonPropertyName("inbound_message_secs")] ulong? InboundMessageSecs,
+        [property: JsonPropertyName("sharing_round_secs")] ulong? SharingRoundSecs,
+        [property: JsonPropertyName("unpair_ack_secs")] ulong? UnpairAckSecs,
+        [property: JsonPropertyName("expired_channels")] RemoveExpiredChannelsConfigDto? ExpiredChannels);
+
+    /// Whole seconds, or null when the caller left the value unset.
+    private static ulong? ToSecs(TimeSpan? span) =>
+        span is null ? null : (ulong)Math.Max(0, Math.Floor(span.Value.TotalSeconds));
 
     // Field-for-field equivalent of Rust `AutoAcceptConfig`.
     private sealed record AutoAcceptConfigDto(
@@ -1351,6 +1367,47 @@ public enum UnpairAck
 /// </para>
 /// </remarks>
 public sealed record RemoveExpiredChannelsPolicy(bool Enabled, ulong TimeoutInSecs);
+
+/// <summary>
+/// How long the protocol waits on each thing that can keep it waiting. A
+/// <c>null</c> property means "use the library default"; the defaults live in
+/// the Rust library, not here.
+/// </summary>
+/// <remarks>
+/// <para>
+/// These were one setting until it became clear they answer different
+/// questions. <see cref="InboundMessage"/> is a <b>security</b> boundary — it
+/// bounds how stale a message may be and still be accepted, so it must
+/// tolerate transport latency and clock skew. The other three are
+/// <b>liveness</b> budgets: how long to keep hoping a peer will answer.
+/// </para>
+/// </remarks>
+/// <param name="InboundMessage">
+/// Staleness boundary for inbound envelopes — the replay-defence window. Any
+/// message older than this is discarded on receipt, whatever the flow.
+/// Lowering it starts refusing legitimately old messages from slow transports
+/// or skewed clocks. Library default: 300s.
+/// </param>
+/// <param name="SharingRound">
+/// How long a publishing round waits on a peer that has not answered. This
+/// bounds how long <c>SharingCompleteEvent</c> can be delayed by one
+/// unreachable peer. Library default: 60s.
+/// </param>
+/// <param name="UnpairAck">
+/// How long to wait for an unpair acknowledgement before dropping local
+/// channel state anyway. Library default: 60s.
+/// </param>
+/// <param name="ExpiredChannels">
+/// Removal of channels still awaiting out-of-band fingerprint confirmation.
+/// Unlike the others this can be disabled. The budget is a <b>human</b> one —
+/// someone comparing a fingerprint, possibly over the phone. Library default:
+/// enabled at 300s.
+/// </param>
+public sealed record Timeouts(
+    TimeSpan? InboundMessage = null,
+    TimeSpan? SharingRound = null,
+    TimeSpan? UnpairAck = null,
+    RemoveExpiredChannelsPolicy? ExpiredChannels = null);
 
 public sealed class AutoAcceptPolicy
 {

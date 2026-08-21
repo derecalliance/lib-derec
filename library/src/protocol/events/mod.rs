@@ -725,6 +725,17 @@ pub enum DeRecEvent {
     /// `behind` is the application's retry list. The library keeps no durable
     /// per-member sync state, so an application that wants convergence across
     /// restarts must persist this itself or republish to the whole group.
+    ///
+    /// # Best-effort governs the *outcome*, not the timing
+    ///
+    /// A member that never answers does not fail the round — but it does
+    /// delay the report. This event and [`Self::SharingComplete`] are emitted
+    /// together, once both populations have settled, so an unreachable member
+    /// holds *both* back until it times out
+    /// ([`Timeouts::sharing_round`](crate::protocol::types::Timeouts::sharing_round)).
+    /// Per-peer events ([`Self::ShareConfirmed`],
+    /// [`Self::ReplicaSecretAcked`]) are not delayed and can be watched
+    /// instead where promptness matters.
     ReplicaSyncComplete {
         /// The version this round was publishing.
         version: u32,
@@ -753,8 +764,37 @@ pub enum DeRecEvent {
 
     /// A sharing round has completed (all participants responded or timed out).
     ///
-    /// Emitted once per [`DeRecFlow::ProtectSecret`] flow after every targeted
-    /// Helper has either confirmed, rejected, or timed out.
+    /// Emitted once per round after every targeted Helper has either
+    /// confirmed, rejected, or timed out.
+    ///
+    /// # It also waits for the replica leg
+    ///
+    /// A round that targeted replica group members as well as Helpers does
+    /// **not** report until *both* populations have settled. The counts below
+    /// describe Helpers only, and they are known as soon as the Helpers answer
+    /// — but the event is withheld until every member has acknowledged,
+    /// refused, or timed out.
+    ///
+    /// The practical consequence: **one unreachable member delays this event
+    /// by up to the configured timeout**
+    /// ([`Timeouts::sharing_round`](crate::protocol::types::Timeouts::sharing_round)),
+    /// even though the Helpers may have confirmed in milliseconds. An
+    /// application waiting on `SharingComplete` to tell the user their secret
+    /// is protected will appear to hang for that window. Nothing is lost and
+    /// the round does terminate — the timeout sweep closes it — but the
+    /// application is told late.
+    ///
+    /// A Helpers-only round is unaffected and completes as soon as the Helpers
+    /// answer.
+    ///
+    /// If the two legs need to be observed independently, watch the per-peer
+    /// events instead: [`DeRecEvent::ShareConfirmed`] /
+    /// [`DeRecEvent::ShareRejected`] land as each Helper answers, without
+    /// waiting for anyone else.
+    ///
+    /// The replica leg reports separately via
+    /// [`DeRecEvent::ReplicaSyncComplete`], which is emitted at the same
+    /// moment as this event when the round had members.
     SharingComplete {
         version: u32,
         confirmed_count: usize,

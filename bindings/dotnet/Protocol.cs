@@ -1766,7 +1766,8 @@ internal static class Protocol
             .WithTransport(new RecordingTransport())
             .WithOwnTransport(new TransportProtocol("https://cleanup.example.com"))
             .WithThreshold(DefaultThreshold)
-            .WithRemoveExpiredChannels(enabled: false, timeoutInSecs: 900)
+            .WithTimeouts(new Timeouts(
+                ExpiredChannels: new RemoveExpiredChannelsPolicy(Enabled: false, TimeoutInSecs: 900)))
             .Build();
 
         // The caller-driven sweep works regardless of the disabled policy —

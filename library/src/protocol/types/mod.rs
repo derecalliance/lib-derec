@@ -18,6 +18,7 @@ use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::ContactMessage;
 #[cfg(any(feature = "serde", target_arch = "wasm32"))]
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use zeroize::Zeroizing;
 
 pub mod secret;
@@ -87,7 +88,7 @@ pub enum ChannelStatus {
 /// rather than "cleanup never happens".
 ///
 /// Configured via
-/// [`crate::protocol::DeRecProtocolBuilder::with_remove_expired_channels`].
+/// [`crate::protocol::types::Timeouts::expired_channels`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(
     any(feature = "serde", target_arch = "wasm32"),
@@ -110,11 +111,97 @@ impl Default for ExpiredChannelCleanup {
     }
 }
 
+/// How long the protocol waits on each thing it can be kept waiting by.
+///
+/// These were one knob until it became clear they answer different questions.
+/// [`inbound_message`](Self::inbound_message) is a **security** boundary — it
+/// bounds how stale a message may be and still be accepted, so it has to
+/// tolerate transport latency and clock skew. The other three are **liveness**
+/// budgets: how long to keep hoping a peer will answer before giving up on it.
+/// A value that suits one is wrong for the others, and collapsing them meant
+/// tightening the replay window every time someone wanted rounds to settle
+/// faster.
+///
+/// Unspecified fields keep their default:
+///
+/// ```
+/// use derec_library::protocol::types::Timeouts;
+/// use std::time::Duration;
+///
+/// let timeouts = Timeouts {
+///     sharing_round: Duration::from_secs(30),
+///     ..Default::default()
+/// };
+/// assert_eq!(timeouts.sharing_round, Duration::from_secs(30));
+/// assert_eq!(timeouts.inbound_message, Duration::from_secs(300));
+/// ```
+///
+/// # Granularity
+///
+/// **One second is the smallest effective unit.** Wire timestamps
+/// (protobuf `Timestamp.seconds`) carry whole seconds only, so ages can be
+/// measured no finer. Sub-second precision is truncated and any value below
+/// one second is clamped to one, so an accidental [`Duration::ZERO`] cannot
+/// silently disable a timeout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Timeouts {
+    /// Staleness boundary for **inbound envelopes**: any message whose
+    /// timestamp is older than this is discarded on receipt, whatever the
+    /// flow. This is the replay-defence window.
+    ///
+    /// Lower is not safer in any simple sense. The protocol is
+    /// transport-agnostic — a store-and-forward transport, a phone that was
+    /// offline, or a peer whose clock is a minute out all produce legitimately
+    /// old messages, and this value is what decides whether they are refused.
+    ///
+    /// Default: **300 seconds**.
+    pub inbound_message: Duration,
+    /// How long a publishing round waits for a peer that has not answered.
+    /// On expiry the silent helpers are failed, the silent members are
+    /// reported behind, and the round closes.
+    ///
+    /// This is what bounds how long
+    /// [`DeRecEvent::SharingComplete`](crate::protocol::events::DeRecEvent::SharingComplete)
+    /// can be delayed by one unreachable peer, so it is the one to shorten if
+    /// a stalled round should surface quickly.
+    ///
+    /// Default: **60 seconds**.
+    pub sharing_round: Duration,
+    /// How long to wait for a peer to acknowledge an unpair before dropping
+    /// the local channel state anyway. Expiry only discards local state; the
+    /// unpair itself was already sent.
+    ///
+    /// Default: **60 seconds**.
+    pub unpair_ack: Duration,
+    /// When to remove a channel still awaiting out-of-band fingerprint
+    /// confirmation — every replica pairing, and every
+    /// [`derec_proto::ContactMode::NoKeys`] pairing.
+    ///
+    /// Unlike the others this can be [`ExpiredChannelCleanup::Disabled`],
+    /// leaving the sweep to the application. The budget is a **human** one:
+    /// someone comparing a fingerprint out of band, possibly over the phone.
+    /// Shortening it below a minute or so will strand real pairings.
+    ///
+    /// Default: `Enabled { timeout_in_secs: 300 }`.
+    pub expired_channels: ExpiredChannelCleanup,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            inbound_message: Duration::from_secs(300),
+            sharing_round: Duration::from_secs(60),
+            unpair_ack: Duration::from_secs(60),
+            expired_channels: ExpiredChannelCleanup::default(),
+        }
+    }
+}
+
 impl ExpiredChannelCleanup {
     /// Enable automatic cleanup with the given timeout.
     ///
     /// Performs no validation. A zero is clamped to one second by
-    /// [`crate::protocol::DeRecProtocolBuilder::with_remove_expired_channels`],
+    /// [`crate::protocol::types::Timeouts::expired_channels`],
     /// the single normalization point.
     pub fn from_secs(secs: u64) -> Self {
         Self::Enabled {

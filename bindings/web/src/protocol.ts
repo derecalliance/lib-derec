@@ -2222,7 +2222,7 @@ async function runExpiredChannelCleanupFlow(): Promise<void> {
     .withTransport(new RecordingTransport())
     .withOwnTransport({ uri: "https://cleanup.example.com", protocol: "https" })
     .withThreshold(THRESHOLD)
-    .withRemoveExpiredChannels(false, 900);
+    .withTimeouts({ expired_channels: { enabled: false, timeout_in_secs: 900 } });
   const protocol = builder.build();
 
   // The caller-driven sweep works regardless of the disabled policy — that

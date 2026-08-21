@@ -588,7 +588,10 @@ impl Peer {
             .with_own_transport(uri)
             .with_threshold(2)
             .with_replica_id(replica_id)
-            .with_remove_expired_channels(policy)
+            .with_timeouts(derec_library::protocol::types::Timeouts {
+                expired_channels: policy,
+                ..Default::default()
+            })
             .build()
             .expect("test fixture: builder.build() should succeed");
         Self {

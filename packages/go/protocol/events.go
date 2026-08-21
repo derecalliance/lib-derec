@@ -129,7 +129,16 @@ type Event struct {
 	GroupVersion *uint32 `json:"group_version"`
 	FetchedFrom  *string `json:"fetched_from"`
 
-	// SharingComplete.
+	// SharingComplete. These counts describe helpers only.
+	//
+	// A mixed round waits for the replica leg: the counts are known the
+	// instant the helpers answer, but the event is withheld until every
+	// replica member has also acknowledged, refused, or timed out. One
+	// unreachable member therefore delays it by up to the configured timeout,
+	// which is easy to mistake for a hang. Nothing is lost — the round always
+	// terminates, and a silent member lands in ReplicaSyncComplete's Behind
+	// rather than failing it. Drive per-helper progress from ShareConfirmed
+	// instead; a helpers-only round is unaffected.
 	ConfirmedCount uint32 `json:"confirmed_count"`
 	FailedCount    uint32 `json:"failed_count"`
 	ThresholdMet   bool   `json:"threshold_met"`

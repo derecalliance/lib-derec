@@ -63,8 +63,7 @@ pub struct DeRecProtocolBuilder<
     own_transport: OwnTransport,
     threshold: usize,
     keep_versions_count: usize,
-    timeout_in_secs: u64,
-    expired_channel_cleanup: crate::protocol::ExpiredChannelCleanup,
+    timeouts: crate::protocol::types::Timeouts,
     communication_info: HashMap<String, String>,
     auto_respond_on_failure: bool,
     unpair_ack: UnpairAck,
@@ -102,8 +101,7 @@ impl
             own_transport: BuilderSlotMissingMarker,
             threshold: 3,
             keep_versions_count: 3,
-            timeout_in_secs: 300,
-            expired_channel_cleanup: crate::protocol::ExpiredChannelCleanup::default(),
+            timeouts: crate::protocol::types::Timeouts::default(),
             communication_info: HashMap::new(),
             auto_respond_on_failure: false,
             unpair_ack: UnpairAck::Required,
@@ -147,71 +145,51 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
         self
     }
 
-    /// Protocol-wide staleness boundary.
+    /// Configure how long the protocol waits on each thing that can keep it
+    /// waiting.
     ///
-    /// Any inbound envelope whose timestamp is older than this is discarded
-    /// on receipt, regardless of flow.
+    /// One call sets all four; anything left unspecified keeps its default:
     ///
-    /// The same threshold is also used to age out local state that is
-    /// waiting on a peer: incomplete pairings, in-flight sharing rounds,
-    /// and outstanding unpair acknowledgements.
+    /// ```no_run
+    /// # use derec_library::protocol::types::Timeouts;
+    /// # use std::time::Duration;
+    /// # let builder = derec_library::protocol::DeRecProtocolBuilder::new(1);
+    /// builder.with_timeouts(Timeouts {
+    ///     sharing_round: Duration::from_secs(30),
+    ///     ..Default::default()
+    /// })
+    /// # ;
+    /// ```
     ///
-    /// # Granularity
+    /// These used to be a single knob, which forced a bad trade: shortening
+    /// the sharing round to make a stalled publish surface sooner also
+    /// narrowed the replay window every inbound message is judged against.
+    /// [`Timeouts::inbound_message`](crate::protocol::types::Timeouts::inbound_message)
+    /// is a security boundary and the other
+    /// three are liveness budgets; they are configured separately because
+    /// they answer different questions. See
+    /// [`Timeouts`](crate::protocol::types::Timeouts) for what each one
+    /// governs and how to choose it.
     ///
-    /// **One second is the smallest effective unit.** The protocol's wire
-    /// timestamps (protobuf `Timestamp.seconds`) carry only whole-second
-    /// resolution, so message ages can only be measured to the nearest
-    /// second. As a consequence:
-    ///
-    /// - sub-second precision in the supplied [`Duration`] is truncated
-    ///   ([`Duration::from_millis(2500)`](Duration::from_millis) becomes 2 seconds);
-    /// - any value below one second is clamped to one second, so an
-    ///   accidental [`Duration::ZERO`] does not silently disable the timeout.
-    ///
-    /// Default: 5 minutes.
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout_in_secs = timeout.as_secs().max(1);
-        self
-    }
-
-    /// Configure automatic removal of expired `Pending` channels during
-    /// [`crate::protocol::DeRecProtocol::process`].
-    ///
-    /// A timeout of `0` is clamped to one second — this is the single
-    /// normalization point, so the clamp applies however the policy was
+    /// Every value is clamped to at least one second — this is the single
+    /// normalization point, so the clamp applies however the value was
     /// constructed.
-    ///
-    /// # Choosing a value
-    ///
-    /// `Pending` covers two situations the sweep cannot tell apart:
-    ///
-    /// - a pairing handshake still in flight, which flips to `Paired` when
-    ///   the peer responds;
-    /// - a replica channel awaiting out-of-band fingerprint verification,
-    ///   which stays `Pending` until
-    ///   [`crate::protocol::DeRecProtocol::verify_fingerprint`] succeeds.
-    ///
-    /// The second is paced by a human comparing digits, so the default of
-    /// 5 minutes will delete replica pairings mid-verification. Deployments
-    /// that pair replicas should either raise this value or select
-    /// [`crate::protocol::ExpiredChannelCleanup::Disabled`] and drive
-    /// [`crate::protocol::DeRecProtocol::remove_expired_channels`] on their
-    /// own schedule.
-    ///
-    /// Default: `Enabled { timeout_in_secs: 300 }`.
-    pub fn with_remove_expired_channels(
-        mut self,
-        policy: crate::protocol::ExpiredChannelCleanup,
-    ) -> Self {
-        self.expired_channel_cleanup = match policy {
-            crate::protocol::ExpiredChannelCleanup::Enabled { timeout_in_secs } => {
-                crate::protocol::ExpiredChannelCleanup::Enabled {
-                    timeout_in_secs: timeout_in_secs.max(1),
+    pub fn with_timeouts(mut self, timeouts: crate::protocol::types::Timeouts) -> Self {
+        let secs = |d: Duration| d.as_secs().max(1);
+        self.timeouts = crate::protocol::types::Timeouts {
+            inbound_message: Duration::from_secs(secs(timeouts.inbound_message)),
+            sharing_round: Duration::from_secs(secs(timeouts.sharing_round)),
+            unpair_ack: Duration::from_secs(secs(timeouts.unpair_ack)),
+            expired_channels: match timeouts.expired_channels {
+                crate::protocol::ExpiredChannelCleanup::Enabled { timeout_in_secs } => {
+                    crate::protocol::ExpiredChannelCleanup::Enabled {
+                        timeout_in_secs: timeout_in_secs.max(1),
+                    }
                 }
-            }
-            crate::protocol::ExpiredChannelCleanup::Disabled => {
-                crate::protocol::ExpiredChannelCleanup::Disabled
-            }
+                crate::protocol::ExpiredChannelCleanup::Disabled => {
+                    crate::protocol::ExpiredChannelCleanup::Disabled
+                }
+            },
         };
         self
     }
@@ -243,7 +221,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     /// before dropping local state.
     ///
     /// - [`UnpairAck::Required`]: keep state until the peer responds with `Ok`,
-    ///   or until the timeout configured via [`Self::with_timeout`] elapses.
+    ///   or until the timeout configured via [`Self::with_timeouts`] elapses.
     /// - [`UnpairAck::NotRequired`]: drop state immediately after sending the
     ///   request; any later response is silently ignored.
     ///
@@ -374,8 +352,7 @@ impl<ShareStore, SecretStore, UserSecretStore, StateStore, Transport, OwnTranspo
             own_transport: self.own_transport,
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
-            timeout_in_secs: self.timeout_in_secs,
-            expired_channel_cleanup: self.expired_channel_cleanup,
+            timeouts: self.timeouts,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -423,8 +400,7 @@ impl<ChannelStore, SecretStore, UserSecretStore, StateStore, Transport, OwnTrans
             own_transport: self.own_transport,
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
-            timeout_in_secs: self.timeout_in_secs,
-            expired_channel_cleanup: self.expired_channel_cleanup,
+            timeouts: self.timeouts,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -472,8 +448,7 @@ impl<ChannelStore, ShareStore, UserSecretStore, StateStore, Transport, OwnTransp
             own_transport: self.own_transport,
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
-            timeout_in_secs: self.timeout_in_secs,
-            expired_channel_cleanup: self.expired_channel_cleanup,
+            timeouts: self.timeouts,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -524,8 +499,7 @@ impl<ChannelStore, ShareStore, SecretStore, StateStore, Transport, OwnTransport>
             own_transport: self.own_transport,
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
-            timeout_in_secs: self.timeout_in_secs,
-            expired_channel_cleanup: self.expired_channel_cleanup,
+            timeouts: self.timeouts,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -573,8 +547,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, OwnTran
             own_transport: self.own_transport,
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
-            timeout_in_secs: self.timeout_in_secs,
-            expired_channel_cleanup: self.expired_channel_cleanup,
+            timeouts: self.timeouts,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -634,8 +607,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             own_transport: BuilderSlotSetMarker(own_transport),
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
-            timeout_in_secs: self.timeout_in_secs,
-            expired_channel_cleanup: self.expired_channel_cleanup,
+            timeouts: self.timeouts,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -688,8 +660,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, Transport, OwnTrans
             own_transport: self.own_transport,
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
-            timeout_in_secs: self.timeout_in_secs,
-            expired_channel_cleanup: self.expired_channel_cleanup,
+            timeouts: self.timeouts,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -750,7 +721,7 @@ impl<
             own_transport,
             self.threshold,
             self.keep_versions_count,
-            self.timeout_in_secs,
+            self.timeouts,
         )?;
         protocol.communication_info = self.communication_info;
         protocol.auto_respond_on_failure = self.auto_respond_on_failure;
@@ -759,7 +730,6 @@ impl<
         protocol.auto_accept = self.auto_accept;
         protocol.replica_id = self.replica_id;
         protocol.parameter_range = self.parameter_range;
-        protocol.expired_channel_cleanup = self.expired_channel_cleanup;
         Ok(protocol)
     }
 }
@@ -995,7 +965,7 @@ mod tests {
             },
             0, // ← invalid threshold
             3,
-            30,
+            crate::protocol::types::Timeouts::default(),
         );
         assert!(matches!(result, Err(crate::Error::InvalidInput(_))));
     }
@@ -1354,42 +1324,93 @@ mod tests {
     /// zero would expire every `Pending` channel on the next `process()`
     /// call — including pairings that had only just started.
     #[test]
-    fn with_remove_expired_channels_clamps_zero_from_constructor() {
-        let b = DeRecProtocolBuilder::new(0)
-            .with_remove_expired_channels(crate::protocol::ExpiredChannelCleanup::from_secs(0));
+    fn with_timeouts_expired_channels_clamps_zero_from_constructor() {
+        let b = DeRecProtocolBuilder::new(0).with_timeouts(crate::protocol::types::Timeouts {
+            expired_channels: crate::protocol::ExpiredChannelCleanup::from_secs(0),
+            ..Default::default()
+        });
         assert_eq!(
-            b.expired_channel_cleanup,
+            b.timeouts.expired_channels,
             crate::protocol::ExpiredChannelCleanup::Enabled { timeout_in_secs: 1 }
         );
     }
 
     #[test]
-    fn with_remove_expired_channels_clamps_zero_from_new() {
-        let b = DeRecProtocolBuilder::new(0)
-            .with_remove_expired_channels(crate::protocol::ExpiredChannelCleanup::new(true, 0));
+    fn with_timeouts_expired_channels_clamps_zero_from_new() {
+        let b = DeRecProtocolBuilder::new(0).with_timeouts(crate::protocol::types::Timeouts {
+            expired_channels: crate::protocol::ExpiredChannelCleanup::new(true, 0),
+            ..Default::default()
+        });
         assert_eq!(
-            b.expired_channel_cleanup,
+            b.timeouts.expired_channels,
             crate::protocol::ExpiredChannelCleanup::Enabled { timeout_in_secs: 1 }
         );
     }
 
     #[test]
-    fn with_remove_expired_channels_clamps_zero_from_literal() {
-        let b = DeRecProtocolBuilder::new(0).with_remove_expired_channels(
-            crate::protocol::ExpiredChannelCleanup::Enabled { timeout_in_secs: 0 },
-        );
+    fn with_timeouts_expired_channels_clamps_zero_from_literal() {
+        let b = DeRecProtocolBuilder::new(0).with_timeouts(crate::protocol::types::Timeouts {
+            expired_channels: crate::protocol::ExpiredChannelCleanup::Enabled {
+                timeout_in_secs: 0,
+            },
+            ..Default::default()
+        });
         assert_eq!(
-            b.expired_channel_cleanup,
+            b.timeouts.expired_channels,
             crate::protocol::ExpiredChannelCleanup::Enabled { timeout_in_secs: 1 }
         );
     }
 
+    /// The three `Duration` budgets clamp to one second, for the same
+    /// reason the sweep does: wire timestamps carry whole seconds, so a
+    /// zero would mean "expire everything on the next pass" rather than
+    /// "no timeout".
     #[test]
-    fn with_remove_expired_channels_preserves_disabled() {
-        let b = DeRecProtocolBuilder::new(0)
-            .with_remove_expired_channels(crate::protocol::ExpiredChannelCleanup::Disabled);
+    fn with_timeouts_clamps_every_duration_to_at_least_one_second() {
+        let b = DeRecProtocolBuilder::new(0).with_timeouts(crate::protocol::types::Timeouts {
+            inbound_message: Duration::ZERO,
+            sharing_round: Duration::ZERO,
+            unpair_ack: Duration::from_millis(400),
+            ..Default::default()
+        });
+        assert_eq!(b.timeouts.inbound_message, Duration::from_secs(1));
+        assert_eq!(b.timeouts.sharing_round, Duration::from_secs(1));
+        assert_eq!(b.timeouts.unpair_ack, Duration::from_secs(1));
+    }
+
+    /// Sub-second precision is truncated, not rounded — 2.5s is 2s.
+    #[test]
+    fn with_timeouts_truncates_sub_second_precision() {
+        let b = DeRecProtocolBuilder::new(0).with_timeouts(crate::protocol::types::Timeouts {
+            sharing_round: Duration::from_millis(2500),
+            ..Default::default()
+        });
+        assert_eq!(b.timeouts.sharing_round, Duration::from_secs(2));
+    }
+
+    /// Setting one field leaves the other three at their defaults — the
+    /// struct-update ergonomics every binding relies on.
+    #[test]
+    fn with_timeouts_leaves_unspecified_fields_at_their_defaults() {
+        let d = crate::protocol::types::Timeouts::default();
+        let b = DeRecProtocolBuilder::new(0).with_timeouts(crate::protocol::types::Timeouts {
+            sharing_round: Duration::from_secs(30),
+            ..Default::default()
+        });
+        assert_eq!(b.timeouts.sharing_round, Duration::from_secs(30));
+        assert_eq!(b.timeouts.inbound_message, d.inbound_message);
+        assert_eq!(b.timeouts.unpair_ack, d.unpair_ack);
+        assert_eq!(b.timeouts.expired_channels, d.expired_channels);
+    }
+
+    #[test]
+    fn with_timeouts_expired_channels_preserves_disabled() {
+        let b = DeRecProtocolBuilder::new(0).with_timeouts(crate::protocol::types::Timeouts {
+            expired_channels: crate::protocol::ExpiredChannelCleanup::Disabled,
+            ..Default::default()
+        });
         assert_eq!(
-            b.expired_channel_cleanup,
+            b.timeouts.expired_channels,
             crate::protocol::ExpiredChannelCleanup::Disabled
         );
     }
@@ -1398,7 +1419,7 @@ mod tests {
     fn builder_defaults_to_enabled_300() {
         let b = DeRecProtocolBuilder::new(0);
         assert_eq!(
-            b.expired_channel_cleanup,
+            b.timeouts.expired_channels,
             crate::protocol::ExpiredChannelCleanup::Enabled {
                 timeout_in_secs: 300
             }

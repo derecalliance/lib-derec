@@ -281,6 +281,26 @@ public sealed record ShareRejectedEvent : DeRecEvent
     public required string Memo { get; init; }
 }
 
+/// <summary>
+/// A publishing round finished — every targeted helper confirmed, rejected,
+/// or timed out.
+/// </summary>
+/// <remarks>
+/// <para>
+/// <b>A mixed round waits for the replica leg.</b> The counts here describe
+/// helpers only and are known the instant the helpers answer, but the event is
+/// withheld until every replica member has also acknowledged, refused, or
+/// timed out. One unreachable member therefore delays it by up to the
+/// configured timeout, which is easy to mistake for a hang. Nothing is lost —
+/// the round always terminates, and a silent member is reported in
+/// <c>ReplicaSyncCompleteEvent.Behind</c> rather than failing it.
+/// </para>
+/// <para>
+/// Drive per-helper progress from <c>ShareConfirmedEvent</c> instead: those
+/// land as each helper answers, with no cross-population wait. A helpers-only
+/// round is unaffected.
+/// </para>
+/// </remarks>
 public sealed record SharingCompleteEvent : DeRecEvent
 {
     public override string EventType => "SharingComplete";

@@ -134,7 +134,15 @@ impl StatelessPeer {
             .with_threshold(self.options.threshold)
             .with_auto_accept(self.auto_accept);
         if let Some(secs) = self.timeout_in_secs {
-            builder = builder.with_timeout(std::time::Duration::from_secs(secs));
+            // Only the liveness budgets are shortened. `inbound_message` is the
+            // staleness window every message is judged against and stays at the
+            // default — narrowing it here would start discarding the scenario's
+            // own traffic rather than closing rounds faster.
+            builder = builder.with_timeouts(derec_library::protocol::types::Timeouts {
+                sharing_round: std::time::Duration::from_secs(secs),
+                unpair_ack: std::time::Duration::from_secs(secs),
+                ..Default::default()
+            });
         }
         if let Some(rid) = self.options.replica_id {
             builder = builder.with_replica_id(rid);

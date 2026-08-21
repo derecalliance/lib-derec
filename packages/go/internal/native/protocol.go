@@ -87,6 +87,19 @@ type RemoveExpiredChannelsPolicy struct {
 	TimeoutInSecs uint64 `json:"timeout_in_secs"`
 }
 
+// TimeoutsConfig is the JSON config's "timeouts" object, field for field
+// matching TimeoutsConfig in library/src/ffi/protocol/handle/mod.rs.
+//
+// Every field is optional and omitted when nil: absent means "use the library
+// default". The defaults live in the Rust Timeouts type, so a value omitted
+// here follows the protocol rather than a constant frozen into this shim.
+type TimeoutsConfig struct {
+	InboundMessageSecs *uint64                      `json:"inbound_message_secs,omitempty"`
+	SharingRoundSecs   *uint64                      `json:"sharing_round_secs,omitempty"`
+	UnpairAckSecs      *uint64                      `json:"unpair_ack_secs,omitempty"`
+	ExpiredChannels    *RemoveExpiredChannelsPolicy `json:"expired_channels,omitempty"`
+}
+
 // ProtocolConfig carries every derec_protocol_new argument beyond
 // the six callback structs and the communication_info proto buffer, in
 // idiomatic Go form. protocolNew renders it into the JSON config buffer
@@ -106,18 +119,15 @@ type ProtocolConfig struct {
 	// config.
 	CommunicationInfo []byte
 
-	TimeoutInSecs        uint32
+	// Timeouts configures the four waiting periods. nil omits the key so
+	// every library default applies; individual fields inside may also be
+	// omitted for the same effect.
+	Timeouts             *TimeoutsConfig
 	AutoRespondOnFailure bool
 	// UnpairAck: 0 = Required, 1 = NotRequired.
 	UnpairAck   int32
 	AutoReplyTo bool
 	AutoAccept  AutoAcceptPolicy
-
-	// RemoveExpiredChannels configures the automatic sweep of expired
-	// Pending channels during Process. nil omits the key from the JSON
-	// config so the library's own default applies, matching the
-	// ReplicaID convention above.
-	RemoveExpiredChannels *RemoveExpiredChannelsPolicy
 
 	// ReplicaID configures this node's local replica_id. nil leaves it
 	// unset (omitted from the JSON config, matching the "absent or null
@@ -133,18 +143,17 @@ type ProtocolConfig struct {
 // once round-tripped through JSON's float64-backed number type in common
 // encoders, including Go's encoding/json.
 type protocolConfigJSON struct {
-	SecretID              string                       `json:"secret_id"`
-	OwnTransportURI       string                       `json:"own_transport_uri"`
-	OwnTransportProtocol  int32                        `json:"own_transport_protocol"`
-	Threshold             uint32                       `json:"threshold"`
-	KeepVersionsCount     uint32                       `json:"keep_versions_count"`
-	TimeoutInSecs         uint32                       `json:"timeout_in_secs"`
-	AutoRespondOnFailure  bool                         `json:"auto_respond_on_failure"`
-	UnpairAck             int32                        `json:"unpair_ack"`
-	AutoReplyTo           bool                         `json:"auto_reply_to"`
-	AutoAccept            AutoAcceptPolicy             `json:"auto_accept"`
-	RemoveExpiredChannels *RemoveExpiredChannelsPolicy `json:"remove_expired_channels,omitempty"`
-	ReplicaID             *string                      `json:"replica_id,omitempty"`
+	SecretID             string           `json:"secret_id"`
+	OwnTransportURI      string           `json:"own_transport_uri"`
+	OwnTransportProtocol int32            `json:"own_transport_protocol"`
+	Threshold            uint32           `json:"threshold"`
+	KeepVersionsCount    uint32           `json:"keep_versions_count"`
+	AutoRespondOnFailure bool             `json:"auto_respond_on_failure"`
+	UnpairAck            int32            `json:"unpair_ack"`
+	AutoReplyTo          bool             `json:"auto_reply_to"`
+	AutoAccept           AutoAcceptPolicy `json:"auto_accept"`
+	Timeouts             *TimeoutsConfig  `json:"timeouts,omitempty"`
+	ReplicaID            *string          `json:"replica_id,omitempty"`
 }
 
 var (
@@ -251,13 +260,12 @@ func protocolNew(cfg ProtocolConfig, cb *builtCallbacks) (uintptr, error) {
 		OwnTransportProtocol: cfg.OwnTransportProtocol,
 		Threshold:            cfg.Threshold,
 		KeepVersionsCount:    cfg.KeepVersionsCount,
-		TimeoutInSecs:        cfg.TimeoutInSecs,
 		AutoRespondOnFailure: cfg.AutoRespondOnFailure,
 		UnpairAck:            cfg.UnpairAck,
 		AutoReplyTo:          cfg.AutoReplyTo,
 		AutoAccept:           cfg.AutoAccept,
 
-		RemoveExpiredChannels: cfg.RemoveExpiredChannels,
+		Timeouts: cfg.Timeouts,
 	}
 	if cfg.ReplicaID != nil {
 		id := strconv.FormatUint(*cfg.ReplicaID, 10)

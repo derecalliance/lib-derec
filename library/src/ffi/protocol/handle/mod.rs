@@ -171,12 +171,11 @@ unsafe fn construct_protocol(
     threshold: u32,
     keep_versions_count: u32,
     communication_info: HashMap<String, String>,
-    timeout_in_secs: u32,
+    timeouts: crate::protocol::types::Timeouts,
     auto_respond_on_failure: bool,
     unpair_ack: crate::protocol::UnpairAck,
     auto_reply_to: bool,
     auto_accept: crate::protocol::AutoAcceptPolicy,
-    expired_channel_cleanup: crate::protocol::ExpiredChannelCleanup,
     replica_id: Option<u64>,
     channel_store_cb: *const ChannelStoreCallbacks,
     secret_store_cb: *const SecretStoreCallbacks,
@@ -229,12 +228,11 @@ unsafe fn construct_protocol(
         .with_threshold(threshold as usize)
         .with_keep_versions_count(keep_versions_count as usize)
         .with_communication_info(communication_info)
-        .with_timeout(Duration::from_secs(u64::from(timeout_in_secs.max(1))))
+        .with_timeouts(timeouts)
         .with_auto_respond_on_failure(auto_respond_on_failure)
         .with_unpair_ack(unpair_ack)
         .with_auto_reply_to(auto_reply_to)
-        .with_auto_accept(auto_accept)
-        .with_remove_expired_channels(expired_channel_cleanup);
+        .with_auto_accept(auto_accept);
 
     if let Some(replica_id) = replica_id {
         builder = builder.with_replica_id(replica_id);
@@ -325,6 +323,48 @@ impl Default for RemoveExpiredChannelsConfig {
     }
 }
 
+/// The four waiting periods, as carried in the [`derec_protocol_new`] config
+/// JSON under `"timeouts"`.
+///
+/// Every field is optional and **absent means "use the library default"** —
+/// the defaults live in [`crate::protocol::types::Timeouts`], not here, so a
+/// binding that omits a field gets whatever the protocol currently considers
+/// right rather than a value frozen into the shim.
+#[derive(serde::Deserialize, Default)]
+struct TimeoutsConfig {
+    #[serde(default)]
+    inbound_message_secs: Option<u64>,
+    #[serde(default)]
+    sharing_round_secs: Option<u64>,
+    #[serde(default)]
+    unpair_ack_secs: Option<u64>,
+    #[serde(default)]
+    expired_channels: Option<RemoveExpiredChannelsConfig>,
+}
+
+impl TimeoutsConfig {
+    fn to_timeouts(&self) -> crate::protocol::types::Timeouts {
+        let d = crate::protocol::types::Timeouts::default();
+        crate::protocol::types::Timeouts {
+            inbound_message: self
+                .inbound_message_secs
+                .map_or(d.inbound_message, Duration::from_secs),
+            sharing_round: self
+                .sharing_round_secs
+                .map_or(d.sharing_round, Duration::from_secs),
+            unpair_ack: self
+                .unpair_ack_secs
+                .map_or(d.unpair_ack, Duration::from_secs),
+            expired_channels: self
+                .expired_channels
+                .as_ref()
+                .map_or(d.expired_channels, |e| {
+                    crate::protocol::ExpiredChannelCleanup::new(e.enabled, e.timeout_in_secs)
+                }),
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct ProtocolConfig {
     secret_id: String,
@@ -332,14 +372,13 @@ struct ProtocolConfig {
     own_transport_protocol: i32,
     threshold: u32,
     keep_versions_count: u32,
-    timeout_in_secs: u32,
     auto_respond_on_failure: bool,
     // 0 = Required, 1 = NotRequired.
     unpair_ack: i32,
     auto_reply_to: bool,
     auto_accept: AutoAcceptConfig,
     #[serde(default)]
-    remove_expired_channels: RemoveExpiredChannelsConfig,
+    timeouts: TimeoutsConfig,
     // Absent or `null` means "no replica id".
     #[serde(default)]
     replica_id: Option<String>,
@@ -495,15 +534,11 @@ pub unsafe extern "C" fn derec_protocol_new(
             config.threshold,
             config.keep_versions_count,
             info,
-            config.timeout_in_secs,
+            config.timeouts.to_timeouts(),
             config.auto_respond_on_failure,
             unpair_ack_value,
             config.auto_reply_to,
             config.auto_accept.into(),
-            crate::protocol::ExpiredChannelCleanup::new(
-                config.remove_expired_channels.enabled,
-                config.remove_expired_channels.timeout_in_secs,
-            ),
             replica_id,
             channel_store_cb,
             secret_store_cb,
