@@ -4,4 +4,4 @@ go 1.23
 
 require github.com/ebitengine/purego v0.10.2
 
-require google.golang.org/protobuf v1.36.11
+require google.golang.org/protobuf v1.36.12
