@@ -249,9 +249,12 @@ Optional setters have defaults:
 |--------|---------|---------|
 | `with_threshold(n)` | `3` | Minimum shares required to reconstruct the secret. |
 | `with_keep_versions_count(n)` | `3` | Number of recent versions each helper must retain. |
-| `with_timeout(duration)` | `5 minutes` | Staleness boundary for inbound envelopes, sharing-round timeouts and unpair timeouts. One-second granularity. |
-| `with_remove_expired_channels(policy)` | `Enabled { timeout_in_secs: 300 }` | Automatic removal of expired `Pending` channels during `process()`. `Disabled` leaves it to the application via `remove_expired_channels`. Replica pairings and `NoKeys` pairings await human fingerprint confirmation while `Pending`, so deployments using either should raise the timeout or disable it — the default gives a user five minutes to compare a fingerprint out of band. |
+| `with_timeouts(timeouts)` | see [Timeouts](#timeouts) | All four waiting periods in one call; unspecified fields keep their default. `inbound_message` 300s is the staleness/replay window, `sharing_round` and `unpair_ack` 60s are liveness budgets, `expired_channels` `Enabled { 300 }` sweeps channels awaiting fingerprint confirmation. |
+| `with_unsafe_http(bool)` | `false` | Accept plaintext `http://` endpoints. **Development only.** Loopback is accepted for your own endpoint regardless; see [Transport endpoints and plaintext](#transport-endpoints-and-plaintext). |
 | `with_communication_info(map)` | empty | Key-value identity metadata embedded in pairing messages. |
+| `with_replica_id(id)` | unset | This device's replica identity. Required for any replica-mode pairing; application-assigned and rejected if `0`. |
+| `with_auto_accept(policy)` | every flow off | Per-flow opt-in to auto-accepting inbound requests instead of surfacing `ActionRequired`. Read the per-flow caveats before enabling — several are state-changing. |
+| `with_parameter_range(range)` | unset | Advertised protocol parameter bounds, checked for overlap at pairing time. |
 | `with_auto_respond_on_failure(bool)` | `false` | If `true`, the protocol replies to the peer on inbound processing failures; if `false`, errors only surface as events. |
 | `with_unpair_ack(ack)` | `UnpairAck::Required` | Whether the unpair initiator waits for the peer's `Ok` before dropping local state. |
 | `with_auto_reply_to(bool)` | `false` | If `true`, every outbound request stamps `replyTo = own_transport` so the responder routes the reply back to this node — even if the channel's stored peer endpoint points elsewhere. Useful for replica scenarios. See [Correlation and routing on the wire](#correlation-and-routing-on-the-wire). |

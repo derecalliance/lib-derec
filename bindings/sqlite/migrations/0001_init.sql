@@ -72,8 +72,16 @@ CREATE TABLE user_secrets (
 --   PendingVerification / PendingUnpair -> sub_a = channel_id
 --   PendingRecovery                     -> sub_a = recovered secret_id,
 --                                          sub_b = version
---   PendingSyncCheck / SharingRound     -> no secondary key, both 0
+--   SharingRound                        -> sub_a = version
+--   PendingSyncCheck                    -> no secondary key, both 0
 -- `kind` is part of the key, so the two channel-keyed kinds cannot collide.
+--
+-- SharingRound's version is load-bearing, not decoration. Several rounds can
+-- be open at once: publishes are started by the pair-completion hook and by
+-- the promotion inside `verify_fingerprint`, not only by `start(ProtectSecret)`.
+-- Keying it on `kind` alone would let a new round silently replace one already
+-- in flight, after which neither completes and no `SharingComplete` is emitted
+-- for either.
 CREATE TABLE protocol_state (
     secret_id INTEGER NOT NULL,
     kind      INTEGER NOT NULL,

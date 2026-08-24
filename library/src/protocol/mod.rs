@@ -1909,10 +1909,12 @@ impl<
     /// Exactly what [`Self::process`] does about time, minus the message:
     ///
     /// 1. Expired-channel cleanup, if
-    ///    [`Timeouts::expired_channels`](crate::protocol::types::Timeouts::expired_channels) enabled it.
-    ///    Disabled by default, in which case this step is skipped and
-    ///    [`Self::remove_expired_channels`] remains available for explicit
-    ///    control.
+    ///    [`Timeouts::expired_channels`](crate::protocol::types::Timeouts::expired_channels)
+    ///    enabled it — which it is **by default**
+    ///    (`Enabled { timeout_in_secs: 300 }`). Setting it to
+    ///    [`crate::protocol::ExpiredChannelCleanup::Disabled`]
+    ///    skips this step and leaves [`Self::remove_expired_channels`] for
+    ///    explicit control.
     /// 2. Sharing-round timeouts — every helper still pending past the
     ///    configured window is failed with
     ///    [`DeRecEvent::ShareRejected`], every member still pending is

@@ -632,7 +632,13 @@ pub enum DeRecEvent {
         memo: String,
     },
 
-    /// A group member accepted a secret sync we sent.
+    /// A group member **refused** a secret sync we sent.
+    ///
+    /// The member answered and declined — distinct from
+    /// [`Self::ReplicaSyncFailed`], where no usable answer arrived at all
+    /// (transport error, encoding error, or timeout). Either way the member
+    /// lands in `behind` on [`Self::ReplicaSyncComplete`] rather than failing
+    /// the round; replicas are best-effort.
     ///
     /// Keyed by `replica_id`, not `channel_id`: every member answers on the
     /// one group channel, so the channel cannot say who replied.
