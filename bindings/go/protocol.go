@@ -869,3 +869,52 @@ func runExpiredChannelCleanup() {
 	fmt.Println("  cleanup: disabled policy forwarded with its timeout; manual sweep callable ✓")
 	fmt.Println("Protocol expired-channel cleanup test passed.")
 }
+
+// runUnsafeHTTP proves the unsafe_http setting survives the JSON config
+// boundary and actually changes behaviour.
+//
+// Worth its own test because the failure mode is silent: the Rust side reads
+// the field with serde's `default`, so a name mismatch between this SDK and
+// the FFI config would deserialize as `false` and the setting would appear to
+// do nothing — with every other test still passing. Exactly the shape of the
+// bug that made three enum variants `undefined` in the JS shims.
+func runUnsafeHTTP() {
+	fmt.Println("=== Protocol unsafe_http config test ===")
+
+	build := func(uri string, allow bool) error {
+		cfg := protocol.Config{
+			SecretID:             protocolSecretID,
+			OwnTransportURI:      uri,
+			OwnTransportProtocol: int32(derecpb.Protocol_HTTPS),
+			Threshold:            2,
+			KeepVersionsCount:    3,
+			UnsafeHTTP:           allow,
+		}
+		p, err := protocol.New(
+			newMemChannelStore(), newMemShareStore(), newMemSecretStore(),
+			newMemUserSecretStore(), newMemStateStore(), newMemTransport(), cfg,
+		)
+		if err != nil {
+			return err
+		}
+		p.Close()
+		return nil
+	}
+
+	// Loopback is free — a local dev server needs no configuration.
+	must(build("http://127.0.0.1:8080", false), "loopback plaintext with unsafe_http=false")
+	fmt.Println("  loopback http accepted with unsafe_http=false  ✓")
+
+	// A LAN address is not, until asked for. If the field name did not match
+	// the FFI config, this would build and the assertion would fail here.
+	if err := build("http://192.168.1.42:8080", false); err == nil {
+		panic("LAN plaintext must be refused when unsafe_http=false — " +
+			"the setting is not reaching the library")
+	}
+	fmt.Println("  LAN http refused with unsafe_http=false  ✓")
+
+	must(build("http://192.168.1.42:8080", true), "LAN plaintext with unsafe_http=true")
+	fmt.Println("  LAN http accepted with unsafe_http=true  ✓")
+
+	fmt.Println("Protocol unsafe_http config test passed.")
+}

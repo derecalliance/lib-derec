@@ -183,6 +183,7 @@ pub struct DeRecProtocolBuilderWasm {
     /// leaves the library's own defaults in force rather than restating them
     /// here.
     timeouts: Option<TimeoutsJs>,
+    unsafe_http: bool,
     auto_respond_on_failure: bool,
     unpair_ack: UnpairAck,
     auto_reply_to: bool,
@@ -214,6 +215,7 @@ impl DeRecProtocolBuilderWasm {
             keep_versions_count: 3,
             communication_info: HashMap::new(),
             timeouts: None,
+            unsafe_http: false,
             auto_respond_on_failure: false,
             unpair_ack: UnpairAck::Required,
             auto_reply_to: false,
@@ -299,6 +301,21 @@ impl DeRecProtocolBuilderWasm {
     #[wasm_bindgen(js_name = withKeepVersionsCount)]
     pub fn with_keep_versions_count(mut self, count: u32) -> DeRecProtocolBuilderWasm {
         self.keep_versions_count = count;
+        self
+    }
+
+    /// Accept plaintext `http://` transport endpoints. **Development only.**
+    /// Default `false`.
+    ///
+    /// With it `false`, plaintext is accepted only for an endpoint this
+    /// device configured for *itself* that names loopback (`localhost`,
+    /// `127.0.0.1`, `::1`) — so a local dev server needs no configuration.
+    /// With it `true`, plaintext is accepted for any host on any path,
+    /// including endpoints a peer supplies. That is what makes the LAN case
+    /// work (a phone against a laptop), and why the name is blunt.
+    #[wasm_bindgen(js_name = withUnsafeHttp)]
+    pub fn with_unsafe_http(mut self, allow: bool) -> DeRecProtocolBuilderWasm {
+        self.unsafe_http = allow;
         self
     }
 
@@ -530,7 +547,8 @@ impl DeRecProtocolBuilderWasm {
             .with_auto_respond_on_failure(self.auto_respond_on_failure)
             .with_unpair_ack(self.unpair_ack)
             .with_auto_reply_to(self.auto_reply_to)
-            .with_auto_accept(self.auto_accept);
+            .with_auto_accept(self.auto_accept)
+            .with_unsafe_http(self.unsafe_http);
         if let Some(t) = self.timeouts {
             builder = builder.with_timeouts(t.to_timeouts());
         }

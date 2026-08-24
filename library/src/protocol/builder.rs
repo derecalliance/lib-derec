@@ -64,6 +64,7 @@ pub struct DeRecProtocolBuilder<
     threshold: usize,
     keep_versions_count: usize,
     timeouts: crate::protocol::types::Timeouts,
+    unsafe_http: bool,
     communication_info: HashMap<String, String>,
     auto_respond_on_failure: bool,
     unpair_ack: UnpairAck,
@@ -102,6 +103,7 @@ impl
             threshold: 3,
             keep_versions_count: 3,
             timeouts: crate::protocol::types::Timeouts::default(),
+            unsafe_http: false,
             communication_info: HashMap::new(),
             auto_respond_on_failure: false,
             unpair_ack: UnpairAck::Required,
@@ -191,6 +193,40 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
                 }
             },
         };
+        self
+    }
+
+    /// Accept plaintext `http://` transport endpoints. **Development only.**
+    ///
+    /// Default: `false`, which is the production posture.
+    ///
+    /// # What it changes
+    ///
+    /// With it `false`, plaintext is accepted in exactly one situation: an
+    /// endpoint **this device configured for itself** that names loopback
+    /// (`localhost`, `127.0.0.1`, `::1`). That covers running a dev server on
+    /// your own machine with no configuration at all.
+    ///
+    /// With it `true`, plaintext is accepted for **any host, on any path** —
+    /// this device's own endpoint and any endpoint a peer supplies, including
+    /// public hosts. That is what makes it usable for the case it exists for:
+    /// testing a phone against a laptop across a LAN, where neither side is
+    /// loopback. It is also why the name is blunt.
+    ///
+    /// See [`TransportPolicy`](crate::transport::TransportPolicy) for the
+    /// full table, including why loopback is free for your own endpoint but
+    /// not for one a peer names.
+    ///
+    /// # This is a guardrail, not transport security
+    ///
+    /// The SDK opens no sockets — delivery is the application's
+    /// [`DeRecTransport`](crate::protocol::DeRecTransport). Nothing here can
+    /// stop an application sending plaintext; what it does is refuse to
+    /// record, propagate or reply to a plaintext endpoint. Leaving it `false`
+    /// does not make a deployment secure on its own, and setting it `true`
+    /// does not by itself send anything in the clear.
+    pub fn with_unsafe_http(mut self, allow: bool) -> Self {
+        self.unsafe_http = allow;
         self
     }
 
@@ -353,6 +389,7 @@ impl<ShareStore, SecretStore, UserSecretStore, StateStore, Transport, OwnTranspo
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
+            unsafe_http: self.unsafe_http,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -401,6 +438,7 @@ impl<ChannelStore, SecretStore, UserSecretStore, StateStore, Transport, OwnTrans
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
+            unsafe_http: self.unsafe_http,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -449,6 +487,7 @@ impl<ChannelStore, ShareStore, UserSecretStore, StateStore, Transport, OwnTransp
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
+            unsafe_http: self.unsafe_http,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -500,6 +539,7 @@ impl<ChannelStore, ShareStore, SecretStore, StateStore, Transport, OwnTransport>
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
+            unsafe_http: self.unsafe_http,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -548,6 +588,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, OwnTran
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
+            unsafe_http: self.unsafe_http,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -608,6 +649,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
+            unsafe_http: self.unsafe_http,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -661,6 +703,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, Transport, OwnTrans
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
+            unsafe_http: self.unsafe_http,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -710,6 +753,10 @@ impl<
     ///   validation (malformed scheme, empty URI, …).
     pub fn build(self) -> crate::Result<DeRecProtocol<Cs, Sh, Ss, Us, St, Tr>> {
         let own_transport: TransportProtocol = self.own_transport.0?.into();
+        // Deferred to here rather than to `with_own_transport`: the setters
+        // may be called in either order, so this is the first point at which
+        // both the endpoint and the policy are known.
+        crate::transport::TransportPolicy::new(self.unsafe_http).check_own(&own_transport)?;
         let mut protocol = DeRecProtocol::new(
             self.secret_id,
             self.channel_store.0,
@@ -730,6 +777,7 @@ impl<
         protocol.auto_accept = self.auto_accept;
         protocol.replica_id = self.replica_id;
         protocol.parameter_range = self.parameter_range;
+        protocol.unsafe_http = self.unsafe_http;
         Ok(protocol)
     }
 }

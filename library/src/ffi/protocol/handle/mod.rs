@@ -172,6 +172,7 @@ unsafe fn construct_protocol(
     keep_versions_count: u32,
     communication_info: HashMap<String, String>,
     timeouts: crate::protocol::types::Timeouts,
+    unsafe_http: bool,
     auto_respond_on_failure: bool,
     unpair_ack: crate::protocol::UnpairAck,
     auto_reply_to: bool,
@@ -229,6 +230,7 @@ unsafe fn construct_protocol(
         .with_keep_versions_count(keep_versions_count as usize)
         .with_communication_info(communication_info)
         .with_timeouts(timeouts)
+        .with_unsafe_http(unsafe_http)
         .with_auto_respond_on_failure(auto_respond_on_failure)
         .with_unpair_ack(unpair_ack)
         .with_auto_reply_to(auto_reply_to)
@@ -379,6 +381,10 @@ struct ProtocolConfig {
     auto_accept: AutoAcceptConfig,
     #[serde(default)]
     timeouts: TimeoutsConfig,
+    /// Accept plaintext `http://` endpoints. Absent means `false`, the
+    /// production posture. See `DeRecProtocolBuilder::with_unsafe_http`.
+    #[serde(default)]
+    unsafe_http: bool,
     // Absent or `null` means "no replica id".
     #[serde(default)]
     replica_id: Option<String>,
@@ -535,6 +541,7 @@ pub unsafe extern "C" fn derec_protocol_new(
             config.keep_versions_count,
             info,
             config.timeouts.to_timeouts(),
+            config.unsafe_http,
             config.auto_respond_on_failure,
             unpair_ack_value,
             config.auto_reply_to,

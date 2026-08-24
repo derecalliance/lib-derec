@@ -787,6 +787,27 @@ export declare class DeRecProtocolBuilder {
    * `expired_channels`, are library decisions rather than this binding's.
    */
   withTimeouts(timeouts: Timeouts): DeRecProtocolBuilder;
+
+  /**
+   * Accept plaintext `http://` transport endpoints. **Development only.**
+   * Default: `false`.
+   *
+   * With `false`, plaintext is accepted in exactly one situation: an endpoint
+   * this device configured for **itself** that names loopback (`localhost`,
+   * `127.0.0.1`, `::1`). A local dev server therefore needs no configuration
+   * at all.
+   *
+   * With `true`, plaintext is accepted for **any host on any path**,
+   * including endpoints a peer supplies. That is what makes the LAN case
+   * work — a phone talking to a laptop, where neither side is loopback — and
+   * why the name is blunt.
+   *
+   * This is a guardrail, not transport security. The SDK opens no sockets;
+   * delivery is your `Transport`. Nothing here stops an application sending
+   * plaintext — it governs which endpoints the protocol will record,
+   * propagate to peers, and reply to.
+   */
+  withUnsafeHttp(allow: boolean): DeRecProtocolBuilder;
   /** Default: empty. */
   withCommunicationInfo(info: Record<string, string>): DeRecProtocolBuilder;
   /** Default: false. */

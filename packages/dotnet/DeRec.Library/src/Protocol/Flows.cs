@@ -189,6 +189,47 @@ public sealed record UpdateChannelInfoParams
 }
 
 /// <summary>
+/// Params for <see cref="FlowKind.SyncCheck"/>.
+/// </summary>
+/// <remarks>
+/// The flow takes none: the group and this device's own version are both read
+/// from the stores. Present so every flow kind has a params type and
+/// <see cref="DeRecProtocol.StartAsync"/> reads uniformly at the call site.
+/// </remarks>
+public sealed record SyncCheckParams;
+
+/// <summary>
+/// Params for <see cref="FlowKind.RemoveReplica"/>.
+/// </summary>
+/// <remarks>
+/// <para>
+/// <see cref="ReplicaId"/> is a <b>decimal</b> string — the same form
+/// <c>ReplicaPairedEvent.PeerReplicaId</c> hands back, and the form every
+/// other id takes across this boundary. A string rather than a
+/// <see cref="ulong"/> so values above 2^53 survive the JSON round trip
+/// through hosts whose numbers are doubles. Naming no current member is
+/// rejected, not silently ignored.
+/// </para>
+/// <para>
+/// <b>Starting this flow removes nothing on its own</b> and emits no
+/// <c>ReplicaRemovedEvent</c>. It tells every member and flags the target
+/// locally; the removal completes only once the application publishes a
+/// roster omitting that member — an ordinary
+/// <see cref="FlowKind.ProtectSecret"/> — at which point
+/// <c>ReplicaRemovedEvent</c> fires. A group with no secret to publish
+/// therefore cannot complete a removal.
+/// </para>
+/// </remarks>
+public sealed record RemoveReplicaParams
+{
+    [JsonPropertyName("replica_id")] public required string ReplicaId { get; init; }
+
+    [JsonPropertyName("memo")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Memo { get; init; }
+}
+
+/// <summary>
 /// Common parent for every <see cref="DeRecEvent"/> the orchestrator
 /// can emit. Concrete variants are differentiated by their
 /// <see cref="EventType"/> discriminator — produced by the

@@ -48,6 +48,7 @@ public sealed class DeRecProtocolBuilder
     private AutoAcceptPolicy _autoAccept = new();
     private ulong? _replicaId = null;
     private Timeouts? _timeouts = null;
+    private bool _unsafeHttp = false;
 
     /// <summary>
     /// Construct a builder bound to a specific secret.
@@ -145,6 +146,36 @@ public sealed class DeRecProtocolBuilder
     public DeRecProtocolBuilder WithTimeouts(Timeouts timeouts)
     {
         _timeouts = timeouts;
+        return this;
+    }
+
+    /// <summary>
+    /// Accept plaintext <c>http://</c> transport endpoints.
+    /// <b>Development only.</b> Default: <c>false</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// With <c>false</c>, plaintext is accepted in exactly one situation: an
+    /// endpoint this device configured for <em>itself</em> that names loopback
+    /// (<c>localhost</c>, <c>127.0.0.1</c>, <c>::1</c>). A local dev server
+    /// therefore needs no configuration at all.
+    /// </para>
+    /// <para>
+    /// With <c>true</c>, plaintext is accepted for any host on any path,
+    /// including endpoints a peer supplies. That is what makes the LAN case
+    /// work — a phone talking to a laptop, where neither side is loopback —
+    /// and why the name is blunt.
+    /// </para>
+    /// <para>
+    /// This is a guardrail, not transport security. The SDK opens no sockets;
+    /// delivery is your <c>ITransport</c>. Nothing here stops an application
+    /// sending plaintext — it governs which endpoints the protocol will
+    /// record, propagate to peers, and reply to.
+    /// </para>
+    /// </remarks>
+    public DeRecProtocolBuilder WithUnsafeHttp(bool allow)
+    {
+        _unsafeHttp = allow;
         return this;
     }
 
@@ -248,6 +279,7 @@ public sealed class DeRecProtocolBuilder
             autoReplyTo: _autoReplyTo,
             autoAccept: _autoAccept,
             replicaId: _replicaId,
-            timeouts: _timeouts);
+            timeouts: _timeouts,
+            unsafeHttp: _unsafeHttp);
     }
 }

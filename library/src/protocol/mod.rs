@@ -193,6 +193,8 @@ pub struct DeRecProtocol<
     /// Configured via [`Timeouts`](crate::protocol::types::Timeouts).
     /// Configured via [`DeRecProtocolBuilder::with_timeouts`].
     pub(crate) timeouts: crate::protocol::types::Timeouts,
+    /// Configured via [`DeRecProtocolBuilder::with_unsafe_http`].
+    pub(crate) unsafe_http: bool,
     /// Configured via [`DeRecProtocolBuilder::with_communication_info`].
     pub(crate) communication_info: HashMap<String, String>,
     /// Configured via [`DeRecProtocolBuilder::with_auto_respond_on_failure`].
@@ -292,6 +294,7 @@ impl<
             threshold,
             keep_versions_count,
             timeouts,
+            unsafe_http: false,
             communication_info: HashMap::new(),
             auto_respond_on_failure: false,
             auto_reply_to: false,
@@ -943,6 +946,14 @@ impl<
         };
 
         Ok(derec_cryptography::replica::fingerprint(&shared_key))
+    }
+
+    /// The scheme policy this protocol applies to every transport endpoint
+    /// that reaches it. Built from
+    /// [`DeRecProtocolBuilder::with_unsafe_http`]; see
+    /// [`TransportPolicy`](crate::transport::TransportPolicy).
+    pub(crate) fn transport_policy(&self) -> crate::transport::TransportPolicy {
+        crate::transport::TransportPolicy::new(self.unsafe_http)
     }
 
     /// Verify that a fingerprint matches the one derived from a channel's shared key.
@@ -1744,6 +1755,8 @@ impl<
             return Ok(Some(vec![DeRecEvent::NoOp]));
         }
 
+        // Read before the mutable borrows below begin.
+        let transport_policy = self.transport_policy();
         let events = handlers::handle(
             &mut self.channel_store,
             &mut self.share_store,
@@ -1757,6 +1770,7 @@ impl<
             channel_id,
             &shared_key,
             self.replica_id,
+            transport_policy,
         )
         .await?;
 
@@ -1849,6 +1863,8 @@ impl<
             return Ok(None);
         };
         let pairing_secret = pairing_secret.to_secret()?;
+        // Read before the mutable borrows below begin.
+        let transport_policy = self.transport_policy();
 
         let events = handlers::handle_pairing(
             &mut self.channel_store,
@@ -1861,6 +1877,7 @@ impl<
             &pairing_secret,
             self.replica_id,
             self.parameter_range.as_ref(),
+            transport_policy,
         )
         .await?;
         Ok(Some(events))
@@ -3844,5 +3861,180 @@ mod timeout_tests {
                 "the round times out on its own budget, not the replay window; got {events:?}"
             );
         });
+    }
+}
+
+/// The scheme policy as the orchestrator applies it, rather than as
+/// [`crate::transport::TransportPolicy`] defines it in isolation.
+///
+/// Three things can introduce a transport endpoint, and only one of them is
+/// pairing — which is why validating at pairing alone would leave two doors
+/// open. All three are funnelled through `handlers::peer_supplied_endpoints`
+/// so the rule has one definition; these tests check the funnel is wired, not
+/// that the rule is right (`transport_policy_tests` does that).
+#[cfg(test)]
+mod transport_gate_tests {
+    use super::*;
+    use crate::protocol::test::{
+        InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, InMemShareStore,
+        InMemUserSecretStore, NoopTransport, run_async,
+    };
+
+    const SECRET_ID: u64 = 0x60A7;
+
+    fn builder_with(
+        own: &str,
+        unsafe_http: bool,
+    ) -> crate::Result<
+        DeRecProtocol<
+            InMemChannelStore,
+            InMemShareStore,
+            InMemSecretStore,
+            InMemUserSecretStore,
+            InMemPersistedStateStore,
+            NoopTransport,
+        >,
+    > {
+        DeRecProtocolBuilder::new(SECRET_ID)
+            .with_channel_store(InMemChannelStore::default())
+            .with_share_store(InMemShareStore::default())
+            .with_secret_store(InMemSecretStore::default())
+            .with_user_secret_store(InMemUserSecretStore::default())
+            .with_transport(NoopTransport)
+            .with_state_store(InMemPersistedStateStore::default())
+            .with_own_transport(own)
+            .with_threshold(2)
+            .with_unsafe_http(unsafe_http)
+            .build()
+    }
+
+    /// The zero-config developer case: a loopback dev server just works.
+    #[test]
+    fn own_loopback_needs_no_configuration() {
+        run_async(async {
+            for uri in [
+                "http://localhost:8080",
+                "http://127.0.0.1:8080",
+                "http://[::1]:8080",
+            ] {
+                assert!(builder_with(uri, false).is_ok(), "{uri} should build");
+            }
+        });
+    }
+
+    /// The LAN case — a phone talking to a laptop — is what the flag exists
+    /// for, and it is refused until you ask for it.
+    #[test]
+    fn own_lan_plaintext_needs_the_flag() {
+        run_async(async {
+            let Err(err) = builder_with("http://192.168.1.42:8080", false) else {
+                panic!("LAN plaintext must not build by default");
+            };
+            assert!(
+                matches!(
+                    err,
+                    crate::Error::Transport(
+                        crate::transport::TransportValidationError::PlaintextRefused { .. }
+                    )
+                ),
+                "expected a plaintext refusal, got {err:?}"
+            );
+            assert!(builder_with("http://192.168.1.42:8080", true).is_ok());
+        });
+    }
+
+    /// Order of the two setters must not matter — the policy is applied at
+    /// `build`, not when either one is called.
+    #[test]
+    fn setter_order_does_not_matter() {
+        run_async(async {
+            let built = DeRecProtocolBuilder::new(SECRET_ID)
+                .with_unsafe_http(true)
+                .with_channel_store(InMemChannelStore::default())
+                .with_share_store(InMemShareStore::default())
+                .with_secret_store(InMemSecretStore::default())
+                .with_user_secret_store(InMemUserSecretStore::default())
+                .with_transport(NoopTransport)
+                .with_state_store(InMemPersistedStateStore::default())
+                .with_own_transport("http://192.168.1.42:8080")
+                .with_threshold(2)
+                .build();
+            assert!(built.is_ok(), "unsafe_http set before the endpoint");
+        });
+    }
+
+    /// `https` is unaffected by any of this.
+    #[test]
+    fn https_builds_under_either_setting() {
+        run_async(async {
+            assert!(builder_with("https://owner.example.com", false).is_ok());
+            assert!(builder_with("https://owner.example.com", true).is_ok());
+        });
+    }
+
+    /// The accessor the funnel depends on must actually see every field a
+    /// peer controls. If a new message type gains a `reply_to` or a
+    /// transport, this is what should fail first.
+    #[test]
+    fn every_peer_supplied_endpoint_is_reachable_from_the_funnel() {
+        use derec_proto::{MessageBody, TransportProtocol};
+        let ep = || {
+            Some(TransportProtocol {
+                uri: "http://127.0.0.1:9999".to_owned(),
+                protocol: derec_proto::Protocol::Https as i32,
+            })
+        };
+
+        let bodies = [
+            MessageBody::StoreShareRequest(derec_proto::StoreShareRequestMessage {
+                reply_to: ep(),
+                ..Default::default()
+            }),
+            MessageBody::VerifyShareRequest(derec_proto::VerifyShareRequestMessage {
+                reply_to: ep(),
+                ..Default::default()
+            }),
+            MessageBody::GetSecretIdsVersionsRequest(
+                derec_proto::GetSecretIdsVersionsRequestMessage {
+                    reply_to: ep(),
+                    ..Default::default()
+                },
+            ),
+            MessageBody::GetShareRequest(derec_proto::GetShareRequestMessage {
+                reply_to: ep(),
+                ..Default::default()
+            }),
+            MessageBody::UnpairRequest(derec_proto::UnpairRequestMessage {
+                reply_to: ep(),
+                ..Default::default()
+            }),
+            MessageBody::UpdateChannelInfoRequest(derec_proto::UpdateChannelInfoRequestMessage {
+                transport_protocol: ep(),
+                ..Default::default()
+            }),
+            MessageBody::PairRequest(derec_proto::PairRequestMessage {
+                transport_protocol: ep(),
+                ..Default::default()
+            }),
+            MessageBody::PrePairRequest(derec_proto::PrePairRequestMessage {
+                transport_protocol: ep(),
+                ..Default::default()
+            }),
+        ];
+
+        for body in &bodies {
+            let found: Vec<_> = handlers::peer_supplied_endpoints(body).collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "the funnel missed the peer endpoint on {body:?}"
+            );
+            // And the strict policy refuses it — peer loopback is not free.
+            assert!(
+                crate::transport::TransportPolicy::new(false)
+                    .check_peer(found[0])
+                    .is_err()
+            );
+        }
     }
 }

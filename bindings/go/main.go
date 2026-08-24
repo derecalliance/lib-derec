@@ -23,6 +23,7 @@ func main() {
 	fmt.Println("── Protocol smoke tests ────────────────────────────────────")
 	runProtocol()
 	runEveryContactModePairs()
+	runUnsafeHTTP()
 
 	fmt.Println()
 	fmt.Println("All smoke tests passed.")

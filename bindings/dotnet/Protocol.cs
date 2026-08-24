@@ -26,6 +26,8 @@ internal static class Protocol
         RunOrchestratorPairFlowTest();
         RunOrchestratorHashedKeysPairFlowTest();
         RunOrchestratorNoKeysPairFlowTest();
+        RunUnsafeHttpConfigTest();
+        RunNewFlowParamsTest();
         RunOrchestratorShareAndDiscoverFlowTest();
         RunOrchestratorUnpairingFlowTest();
         RunOrchestratorUpdateChannelInfoFlowTest();
@@ -1690,7 +1692,8 @@ internal static class Protocol
         ulong? ReplicaId = null,
         int? Threshold = null,
         ulong? SecretId = null,
-        AutoAcceptPolicy? AutoAccept = null);
+        AutoAcceptPolicy? AutoAccept = null,
+        bool UnsafeHttp = false);
 
     private const int DefaultThreshold = 2;
 
@@ -1707,6 +1710,116 @@ internal static class Protocol
     /// communication-info map so peers can see it. Mirrors the JS
     /// <c>makeNode(name, uri, options)</c> helper 1:1.
     /// </summary>
+
+    /// <summary>
+    /// The <c>unsafe_http</c> setting must survive this SDK's JSON serializer
+    /// and actually change behaviour.
+    /// </summary>
+    /// <remarks>
+    /// Its own test because the failure is silent: the Rust side reads the
+    /// field with serde's <c>default</c>, so a property-name mismatch here
+    /// would deserialize as <c>false</c> and the setting would appear to do
+    /// nothing, with every other test still green. .NET has its own
+    /// serializer, so Go passing this proves nothing about this path.
+    /// </remarks>
+    private static void RunUnsafeHttpConfigTest()
+    {
+        Console.WriteLine("=== Orchestrator unsafe_http config test ===");
+
+        static bool Builds(string uri, bool allow)
+        {
+            try
+            {
+                using var node = MakeNode("Dev", uri, new NodeOptions(UnsafeHttp: allow));
+                return true;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        if (!Builds("http://127.0.0.1:8080", false))
+            throw new InvalidOperationException(
+                "loopback plaintext must build with unsafe_http=false");
+        Console.WriteLine("  loopback http accepted with unsafe_http=false  ✓");
+
+        if (Builds("http://192.168.1.42:8080", false))
+            throw new InvalidOperationException(
+                "LAN plaintext must be refused with unsafe_http=false");
+        Console.WriteLine("  LAN http refused with unsafe_http=false  ✓");
+
+        if (!Builds("http://192.168.1.42:8080", true))
+            throw new InvalidOperationException(
+                "LAN plaintext must build with unsafe_http=true — the setting is " +
+                "not reaching the library");
+        Console.WriteLine("  LAN http accepted with unsafe_http=true  ✓");
+
+        Console.WriteLine("Orchestrator unsafe_http config test passed.");
+    }
+
+
+    /// <summary>
+    /// The two newest flows must be reachable with a typed params record that
+    /// serializes to the shape Rust parses.
+    /// </summary>
+    /// <remarks>
+    /// <c>StartAsync</c> takes <c>object</c>, so a wrong shape is not a
+    /// compile error — it fails at the FFI boundary, or worse deserializes
+    /// with a missing optional and does nothing. .NET was the only SDK
+    /// without records for flow kinds 7 and 8; this pins them.
+    /// </remarks>
+    private static void RunNewFlowParamsTest()
+    {
+        Console.WriteLine("=== Orchestrator SyncCheck/RemoveReplica params test ===");
+
+        string syncJson = JsonSerializer.Serialize(new SyncCheckParams());
+        if (syncJson != "{}")
+            throw new InvalidOperationException(
+                $"SyncCheckParams must serialize to an empty object, got {syncJson}");
+        Console.WriteLine("  SyncCheckParams serializes to {}  ✓");
+
+        string removeJson = JsonSerializer.Serialize(
+            new RemoveReplicaParams { ReplicaId = "51966", Memo = "retired device" });
+        if (!removeJson.Contains("\"replica_id\":\"51966\""))
+            throw new InvalidOperationException(
+                $"replica_id must be a decimal string under that exact key, got {removeJson}");
+        if (!removeJson.Contains("\"memo\":\"retired device\""))
+            throw new InvalidOperationException($"memo missing from {removeJson}");
+        Console.WriteLine("  RemoveReplicaParams carries a decimal replica_id + memo  ✓");
+
+        // memo is optional and must be omitted rather than sent as null —
+        // Rust reads it with `#[serde(default)]` on an Option.
+        string noMemo = JsonSerializer.Serialize(new RemoveReplicaParams { ReplicaId = "7" });
+        if (noMemo.Contains("memo"))
+            throw new InvalidOperationException($"absent memo must be omitted, got {noMemo}");
+        Console.WriteLine("  an absent memo is omitted, not sent as null  ✓");
+
+        // And the flow actually reaches the library: an unknown member is
+        // rejected, which proves the params were parsed rather than ignored.
+        using var node = MakeNode("Replica", "https://replica.example.com",
+            new NodeOptions(ReplicaId: 0xA11CE01UL));
+        try
+        {
+            node.Protocol.StartAsync(FlowKind.RemoveReplica,
+                new RemoveReplicaParams { ReplicaId = "999999" })
+                .GetAwaiter().GetResult();
+            throw new InvalidOperationException(
+                "removing a member that does not exist must fail");
+        }
+        catch (InvalidOperationException)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            // Expected: the library parsed the params and refused the target.
+        }
+        Console.WriteLine("  RemoveReplica reaches the library and rejects an unknown member  ✓");
+
+        Console.WriteLine("Orchestrator SyncCheck/RemoveReplica params test passed.");
+    }
+
     private static Node MakeNode(
         string name,
         string endpointUri,
@@ -1729,6 +1842,7 @@ internal static class Protocol
             .WithStateStore(stateStore)
             .WithTransport(transport)
             .WithOwnTransport(new TransportProtocol(endpointUri))
+            .WithUnsafeHttp(options.UnsafeHttp)
             .WithCommunicationInfo(new Dictionary<string, string> { ["name"] = name })
             .WithThreshold(options.Threshold ?? DefaultThreshold);
         if (options.AutoReplyTo is bool autoReplyTo)

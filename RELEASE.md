@@ -415,9 +415,10 @@ go get github.com/derecalliance/lib-derec/packages/go@vX.Y.Z
 
 Before publishing a release:
 
-- [ ] Version updated in Cargo.toml
-- [ ] Changelog updated
-- [ ] `make all` succeeds
+- [ ] Version updated in `library/Cargo.toml` (everything else derives from it
+      via `scripts/get-version.sh` — do not edit package manifests individually)
+- [ ] Release notes written, including any **breaking** changes
+- [ ] `make all` succeeds — run it **last**, immediately before publishing
 - [ ] Test installation of all SDKs
 
 ---

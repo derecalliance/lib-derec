@@ -287,6 +287,9 @@ fn on_request(
         return Err(EMPTY_UPDATE_ERROR);
     }
 
+    // Structure only. Whether the announced endpoint's *scheme* is
+    // acceptable was settled by `TransportPolicy` in `handlers::handle`,
+    // where every peer-supplied endpoint is checked in one place.
     if let Some(tp) = request.transport_protocol.as_ref() {
         tp.validate()?;
     }

@@ -102,7 +102,6 @@ FFI layer, and no logging, so a pure-Rust consumer pays for none of them.
 | `serde` | `serde::Serialize` / `Deserialize` on the public store and channel types (`SecretValue`, `PairingKeyMaterial`, `ChannelRecord`, `HelperChannel`, `ReplicaMember`, `ChannelStatus`, `TransportProtocol`), so a store implementation can persist them with any serde format. Without it, use the byte-level accessors (e.g. `PairingKeyMaterial::as_bytes` / `from_bytes`) or your own codec. Also pulls the matching `derec-proto/serde`. The serde wire format is not part of the public API and may change. |
 | `logging` | `tracing` spans and events across the protocol and primitives layers. Adds no overhead when no subscriber is installed. |
 | `ffi` | The native C-ABI bridge for host languages that link the shared library. Implies `serde` + `serde_json`. Pure-Rust consumers do not need this. |
-| `unsafe-http` | **Development only.** Lets `TransportProtocol::validate` accept plaintext `http://` endpoints. Production builds MUST leave this off — enabling it also lets a peer-supplied `replyTo` downgrade the reply path to plaintext. |
 
 ```toml
 [dependencies]
@@ -453,6 +452,57 @@ transport cap protects resources, `reject` enforces policy.
 | Restore | Commit a recovered [`Secret`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.Secret.html) into an empty protocol — reseats canonical helper / replica channels at the recovered version and wipes the throwaway recovery-mode channels. Called once, after `Recovery`, via [`DeRecProtocol::restore`](https://docs.rs/derec-library/latest/derec_library/protocol/struct.DeRecProtocol.html#method.restore). |
 | Unpairing | Tear down a paired channel and drop local state. |
 | Update channel info | Propagate post-pairing changes to communication info and/or transport endpoint. |
+
+### Transport endpoints and plaintext
+
+Every transport endpoint the protocol handles is checked in two stages.
+
+**Structure** — non-empty, within the length cap, no control characters, and a
+scheme consistent with the declared protocol. Always applied; `ws://` and
+`file://` are refused everywhere.
+
+**Scheme policy** — whether a plaintext `http://` endpoint may actually be
+used. This depends on how you are deployed, so it is configuration rather than
+a fixed rule:
+
+```rust
+builder.with_unsafe_http(true)   // development only; default is false
+```
+
+| Endpoint | `https` | plaintext loopback | plaintext, any other host |
+|---|---|---|---|
+| **Your own** — `with_own_transport`, and the `reply_to` you stamp on outbound requests | always | **always**, with a warning | needs `with_unsafe_http(true)` |
+| **A peer's** — a contact's endpoint, an `UpdateChannelInfo` announcement, a request's `reply_to` | always | needs `with_unsafe_http(true)` | needs `with_unsafe_http(true)` |
+
+So **a local dev server needs no configuration at all** — `http://localhost:8080`
+as your own endpoint just works. Testing across a LAN, a phone against a
+laptop, needs `with_unsafe_http(true)` on both sides, because neither is
+loopback.
+
+Loopback is free for *your own* endpoint because it names a service on your
+machine: the bytes never reach a network. It is not free for one a **peer**
+names, because there the address is chosen by somebody else and points at
+*your* machine — a peer should not be able to nominate your localhost as a
+reply address without you having opted into plaintext at all.
+
+Recognition is deliberately literal: `localhost`, `127.0.0.1`, `::1`, nothing
+else. No DNS resolution, no private-range classification. Both would need full
+URI parsing, and getting that wrong in a security check is how
+`http://127.0.0.1@evil.com/` slips past — so userinfo is refused outright and
+the wider case is what `with_unsafe_http` is for.
+
+> **This is a guardrail, not transport security.** The SDK opens no sockets —
+> delivery is your `DeRecTransport`. Nothing here stops an application sending
+> plaintext; what it does is refuse to record a plaintext endpoint, refuse to
+> propagate one to peers during pairing, and refuse to reply to one. Leaving
+> `with_unsafe_http` at its default does not by itself make a deployment
+> secure, and turning it on does not by itself send anything in the clear.
+
+This was a Cargo feature (`unsafe-http`) until it became clear a compile-time
+switch is unreachable for the four SDKs that install a prebuilt binary from a
+package manager: a .NET or Node developer has no compilation step in which to
+enable it. The setting is available identically in Rust, .NET, Go, Node.js and
+Web.
 
 ### Pairing modes
 

@@ -122,7 +122,10 @@ type ProtocolConfig struct {
 	// Timeouts configures the four waiting periods. nil omits the key so
 	// every library default applies; individual fields inside may also be
 	// omitted for the same effect.
-	Timeouts             *TimeoutsConfig
+	Timeouts *TimeoutsConfig
+	// UnsafeHTTP accepts plaintext http:// transport endpoints. Development
+	// only; false is the production posture.
+	UnsafeHTTP           bool
 	AutoRespondOnFailure bool
 	// UnpairAck: 0 = Required, 1 = NotRequired.
 	UnpairAck   int32
@@ -153,6 +156,7 @@ type protocolConfigJSON struct {
 	AutoReplyTo          bool             `json:"auto_reply_to"`
 	AutoAccept           AutoAcceptPolicy `json:"auto_accept"`
 	Timeouts             *TimeoutsConfig  `json:"timeouts,omitempty"`
+	UnsafeHTTP           bool             `json:"unsafe_http"`
 	ReplicaID            *string          `json:"replica_id,omitempty"`
 }
 
@@ -265,7 +269,8 @@ func protocolNew(cfg ProtocolConfig, cb *builtCallbacks) (uintptr, error) {
 		AutoReplyTo:          cfg.AutoReplyTo,
 		AutoAccept:           cfg.AutoAccept,
 
-		Timeouts: cfg.Timeouts,
+		Timeouts:   cfg.Timeouts,
+		UnsafeHTTP: cfg.UnsafeHTTP,
 	}
 	if cfg.ReplicaID != nil {
 		id := strconv.FormatUint(*cfg.ReplicaID, 10)

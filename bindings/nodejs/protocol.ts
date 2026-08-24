@@ -417,6 +417,7 @@ function makeNode(
     replicaId?: bigint;
     secretId?: bigint;
     threshold?: number;
+    unsafeHttp?: boolean;
   } = {},
 ): Node {
   const channelStore = new InMemoryChannelStore();
@@ -444,6 +445,9 @@ function makeNode(
   }
   if (options.replicaId !== undefined) {
     builder = builder.withReplicaId(options.replicaId);
+  }
+  if (options.unsafeHttp !== undefined) {
+    builder = builder.withUnsafeHttp(options.unsafeHttp);
   }
   const protocol = builder.build();
   return { protocol, transport, channelStore, shareStore, secretStore, userSecretStore, stateStore };
@@ -1904,6 +1908,7 @@ export async function runProtocolSmoke(): Promise<void> {
   await runFingerprintMismatchFlow();
   await runHashedKeysPairingFlow();
   await runNoKeysPairingFlow();
+  runUnsafeHttpConfigFlow();
   await runSharingFlow();
   await runDiscoveryAndRecoveryFlow();
   await runUnpairingFlow();
@@ -2495,4 +2500,44 @@ export function _startOverloadsCoverEveryFlowKind(protocol: DeRecProtocol): void
       memo: "retired device",
     }));
   void (() => protocol.start(FlowKind.RemoveReplica, { replica_id: "51966" }));
+}
+
+/**
+ * `unsafeHttp` must survive the WASM boundary and actually change behaviour.
+ *
+ * Its own test because the failure is silent: an unset field on the Rust side
+ * defaults to `false`, so a name mismatch would make the setting a no-op with
+ * every other test still green — the same shape as the enum variants that
+ * were declared in `index.d.ts` but `undefined` at run time.
+ */
+export function runUnsafeHttpConfigFlow(): void {
+  console.log("=== [Protocol] unsafe_http config ===\n");
+
+  const builds = (uri: string, unsafeHttp: boolean): boolean => {
+    try {
+      makeNode("Dev", uri, { unsafeHttp });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  if (!builds("http://127.0.0.1:8080", false)) {
+    throw new Error("loopback plaintext must build with unsafeHttp=false");
+  }
+  console.log("  loopback http accepted with unsafeHttp=false  ✓");
+
+  if (builds("http://192.168.1.42:8080", false)) {
+    throw new Error("LAN plaintext must be refused with unsafeHttp=false");
+  }
+  console.log("  LAN http refused with unsafeHttp=false  ✓");
+
+  if (!builds("http://192.168.1.42:8080", true)) {
+    throw new Error(
+      "LAN plaintext must build with unsafeHttp=true — the setting is not reaching the library",
+    );
+  }
+  console.log("  LAN http accepted with unsafeHttp=true  ✓");
+
+  console.log("\n✓ unsafe_http config passed.\n");
 }

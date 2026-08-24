@@ -83,8 +83,18 @@ pub(super) async fn handle<
     channel_id: ChannelId,
     shared_key: &SharedKey,
     local_replica_id: Option<u64>,
+    transport_policy: crate::transport::TransportPolicy,
 ) -> Result<Vec<DeRecEvent>> {
     let inner = crate::derec_message::extract_inner_message(&message.message, shared_key)?;
+
+    // The single point every inbound channel message passes through, and so
+    // the single place the scheme policy is applied to anything a peer chose.
+    // A `reply_to` overrides the endpoint agreed at pairing for one response
+    // and an `UpdateChannelInfo` replaces it outright, so pairing-time
+    // validation alone would not cover either.
+    for endpoint in peer_supplied_endpoints(&inner) {
+        transport_policy.check_peer(endpoint)?;
+    }
 
     if let Some(expected) = expected_role_for_inbound(&inner) {
         require_role(channel_store, secret_id, &[channel_id], expected).await?;
@@ -332,9 +342,16 @@ pub(in crate::protocol) async fn handle_pairing<
     pairing_secret: &PairingSecretKeyMaterial,
     replica_id: Option<u64>,
     parameter_range: Option<&derec_proto::ParameterRange>,
+    transport_policy: crate::transport::TransportPolicy,
 ) -> Result<Vec<DeRecEvent>> {
     let inner =
         crate::derec_message::extract_inner_pairing_message(&message.message, pairing_secret)?;
+
+    // Same single gate as the channel path: the endpoint a peer offers at
+    // pairing is the one every later message to it is addressed to.
+    for endpoint in peer_supplied_endpoints(&inner) {
+        transport_policy.check_peer(endpoint)?;
+    }
 
     pairing::handle(
         channel_store,
@@ -492,6 +509,40 @@ pub(super) async fn send_channel_message<Ch: DeRecChannelStore, T: DeRecTranspor
         resolve_response_endpoint(channel_store, secret_id, channel_id, reply_to).await?;
     transport.send(&endpoint, wire_bytes).await?;
     Ok(())
+}
+
+/// Every transport endpoint an inbound message carries that a **peer** chose.
+///
+/// Three kinds appear:
+///
+/// - `PairRequest` / `PrePairRequest` `transport_protocol` — the endpoint the
+///   peer will be addressed on, agreed at pairing and stored on the channel.
+/// - `reply_to`, on the five request types that have one. It *overrides* that
+///   agreed endpoint for one response, which is why checking only at pairing
+///   time would not be enough.
+/// - `UpdateChannelInfoRequest.transport_protocol`, which *replaces* the
+///   agreed endpoint outright.
+///
+/// Collected here so [`crate::transport::TransportPolicy`] has a single
+/// application point, rather than a copy in each response path and each
+/// handler.
+pub(in crate::protocol) fn peer_supplied_endpoints(
+    body: &MessageBody,
+) -> impl Iterator<Item = &TransportProtocol> {
+    let endpoint = match body {
+        MessageBody::StoreShareRequest(r) => r.reply_to.as_ref(),
+        MessageBody::VerifyShareRequest(r) => r.reply_to.as_ref(),
+        MessageBody::GetSecretIdsVersionsRequest(r) => r.reply_to.as_ref(),
+        MessageBody::GetShareRequest(r) => r.reply_to.as_ref(),
+        MessageBody::UnpairRequest(r) => r.reply_to.as_ref(),
+        MessageBody::UpdateChannelInfoRequest(r) => r.transport_protocol.as_ref(),
+        // Pairing: the endpoint the peer will be addressed on from here on.
+        // This is the one the agreed channel record is built from.
+        MessageBody::PairRequest(r) => r.transport_protocol.as_ref(),
+        MessageBody::PrePairRequest(r) => r.transport_protocol.as_ref(),
+        _ => None,
+    };
+    endpoint.into_iter()
 }
 
 fn expected_role_for_inbound(body: &MessageBody) -> Option<SenderKind> {

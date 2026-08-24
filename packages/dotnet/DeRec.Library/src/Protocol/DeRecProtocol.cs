@@ -102,7 +102,8 @@ public sealed class DeRecProtocol : IDisposable
         bool autoReplyTo = false,
         AutoAcceptPolicy? autoAccept = null,
         ulong? replicaId = null,
-        Timeouts? timeouts = null)
+        Timeouts? timeouts = null,
+        bool unsafeHttp = false)
     {
         SecretId = secretId;
         _channelStore = channelStore;
@@ -240,6 +241,7 @@ public sealed class DeRecProtocol : IDisposable
                         : new RemoveExpiredChannelsConfigDto(
                             Enabled: timeouts.ExpiredChannels.Enabled,
                             TimeoutInSecs: timeouts.ExpiredChannels.TimeoutInSecs)),
+            UnsafeHttp: unsafeHttp,
             ReplicaId: replicaId?.ToString(System.Globalization.CultureInfo.InvariantCulture));
         byte[] configJsonBytes = JsonSerializer.SerializeToUtf8Bytes(config, JsonOpts);
 
@@ -1251,6 +1253,7 @@ public sealed class DeRecProtocol : IDisposable
         [property: JsonPropertyName("auto_reply_to")] bool AutoReplyTo,
         [property: JsonPropertyName("auto_accept")] AutoAcceptConfigDto AutoAccept,
         [property: JsonPropertyName("timeouts")] TimeoutsConfigDto? Timeouts,
+        [property: JsonPropertyName("unsafe_http")] bool UnsafeHttp,
         [property: JsonPropertyName("replica_id")] string? ReplicaId);
 
     // Field-for-field equivalent of Rust `RemoveExpiredChannelsConfig`.

@@ -572,10 +572,10 @@ pub(in crate::protocol) async fn start<
     secret_id: u64,
     own_transport: &derec_proto::TransportProtocol,
     reply_to: Option<derec_proto::TransportProtocol>,
-    owner_replica_id: Option<u64>,
+    local_replica_id: Option<u64>,
 ) -> Result<Option<SharingRoundResult>> {
     let (helpers, replicas) =
-        load_all_paired_targets(channel_store, secret_store, secret_id, owner_replica_id).await?;
+        load_all_paired_targets(channel_store, secret_store, secret_id, local_replica_id).await?;
 
     if helpers.is_empty() && replicas.is_empty() {
         return Ok(None);
@@ -588,7 +588,7 @@ pub(in crate::protocol) async fn start<
     // members cannot name themselves is not reconstructible from the payload.
     // The dispatch list above is the same set minus self.
     let roster = channel_store.replicas(secret_id).await?;
-    let group_channel = group_channel_of(&roster, owner_replica_id)?;
+    let group_channel = group_channel_of(&roster, local_replica_id)?;
     let group_key = match group_channel {
         Some(channel_id) => match secret_store
             .load(secret_id, channel_id, SecretKind::SharedKey)
@@ -670,7 +670,7 @@ pub(in crate::protocol) async fn start<
             version,
             &description,
             reply_to,
-            owner_replica_id,
+            local_replica_id,
         )
         .await;
         replica_outcomes.extend(replica_results);
@@ -1312,7 +1312,7 @@ async fn distribute_composite_to_destinations<Ss: DeRecSecretStore, T: DeRecTran
     version: u32,
     description: &str,
     reply_to: Option<derec_proto::TransportProtocol>,
-    owner_replica_id: Option<u64>,
+    local_replica_id: Option<u64>,
 ) -> Vec<(crate::types::ReplicaId, Result<()>)> {
     let mut results: Vec<(crate::types::ReplicaId, Result<()>)> =
         Vec::with_capacity(replicas.len());
@@ -1328,7 +1328,7 @@ async fn distribute_composite_to_destinations<Ss: DeRecSecretStore, T: DeRecTran
             version,
             description,
             reply_to.clone(),
-            owner_replica_id,
+            local_replica_id,
         )
         .await;
 
@@ -1375,7 +1375,7 @@ async fn dispatch_composite_to_destination<Ss: DeRecSecretStore, T: DeRecTranspo
     version: u32,
     description: &str,
     reply_to: Option<derec_proto::TransportProtocol>,
-    owner_replica_id: Option<u64>,
+    local_replica_id: Option<u64>,
 ) -> Result<()> {
     let needs_handover = match k_group {
         Some(g) => channel_key != g,
@@ -1398,7 +1398,7 @@ async fn dispatch_composite_to_destination<Ss: DeRecSecretStore, T: DeRecTranspo
         timestamp: Some(timestamp),
         secret_id,
         reply_to,
-        replica_id: owner_replica_id,
+        replica_id: local_replica_id,
     };
 
     let envelope_bytes = DeRecMessageBuilder::channel()

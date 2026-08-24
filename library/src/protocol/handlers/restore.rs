@@ -933,9 +933,8 @@ mod tests {
     fn restore_does_not_overwrite_explicit_replica_id() {
         run_async(async {
             let secret_id: u64 = 0xDE_2EC;
-            // Builder configured WITH a replica id — restore must
-            // leave it alone even though the Secret carries a
-            // non-zero owner_replica_id.
+            // Builder configured WITH a replica id — restore must leave it
+            // alone even though the recovered Secret names a source member.
             let mut protocol = DeRecProtocolBuilder::new(secret_id)
                 .with_channel_store(InMemChannelStore::default())
                 .with_share_store(InMemShareStore::default())

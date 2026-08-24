@@ -102,6 +102,20 @@ type Config struct {
 	// can keep it waiting. nil, or a zero field inside it, leaves the
 	// library's own default in force. See Timeouts.
 	Timeouts *Timeouts
+	// UnsafeHTTP accepts plaintext http:// transport endpoints. Development
+	// only. Default: false, the production posture.
+	//
+	// With it false, plaintext is accepted only for an endpoint this device
+	// configured for itself that names loopback (localhost, 127.0.0.1, ::1),
+	// so a local dev server needs no configuration. With it true, plaintext
+	// is accepted for any host on any path, including endpoints a peer
+	// supplies — which is what makes the LAN case work (a phone against a
+	// laptop), and why the name is blunt.
+	//
+	// This is a guardrail, not transport security: the SDK opens no sockets,
+	// so nothing here stops an application sending plaintext. It governs
+	// which endpoints the protocol will record, propagate and reply to.
+	UnsafeHTTP bool
 	// AutoRespondOnFailure controls whether the protocol auto-replies on
 	// failed inbound processing. Default: false.
 	AutoRespondOnFailure bool
@@ -261,6 +275,7 @@ func New(
 		KeepVersionsCount:    keepVersionsCount,
 		CommunicationInfo:    commInfo,
 		Timeouts:             nativeTimeouts,
+		UnsafeHTTP:           config.UnsafeHTTP,
 		AutoRespondOnFailure: config.AutoRespondOnFailure,
 		UnpairAck:            int32(config.UnpairAck),
 		AutoReplyTo:          config.AutoReplyTo,
