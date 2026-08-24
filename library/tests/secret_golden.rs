@@ -5,13 +5,15 @@
 use std::collections::HashMap;
 use std::io::Read as _;
 
-use derec_library::protocol::types::{HelperInfo, ReplicaInfo, Replicas, Secret, UserSecret};
+use derec_library::protocol::types::{
+    HelperInfo, ReplicaInfo, ReplicaRole, Replicas, Secret, UserSecret,
+};
 use flate2::read::GzDecoder;
 
 fn assert_matches_golden(secret: &Secret, fixture: &[u8]) {
     let encoded = secret.encode();
     let (&major, payload) = encoded.split_first().expect("non-empty encoding");
-    assert_eq!(major, 1, "golden vector is version 1");
+    assert_eq!(major, 2, "golden vector is version 2");
     let mut json = Vec::new();
     GzDecoder::new(payload)
         .read_to_end(&mut json)
@@ -39,13 +41,12 @@ fn golden_secret() -> Secret {
             data: vec![0x0B, 0x0C],
         }],
         replicas: None,
-        owner_replica_id: 1,
     }
 }
 
 /// Exercises the full schema surface the minimal vector leaves unpinned: a
-/// populated replica group, non-empty `communication_info`, and a non-zero
-/// `sender_kind`. Maps carry a single entry to keep serialization
+/// populated replica group carrying both roles, and non-empty
+/// `communication_info`. Maps carry a single entry to keep serialization
 /// deterministic (`HashMap` order is unspecified for multiple entries).
 fn golden_secret_full() -> Secret {
     Secret {
@@ -61,29 +62,36 @@ fn golden_secret_full() -> Secret {
             data: vec![0x0B, 0x0C],
         }],
         replicas: Some(Replicas {
-            replicas: vec![ReplicaInfo {
-                channel_id: 3,
-                transport_uri: "r".to_owned(),
-                communication_info: HashMap::from([("a".to_owned(), "b".to_owned())]),
-                replica_id: 4,
-                sender_kind: 2,
-            }],
+            channel_id: 5,
+            members: vec![
+                ReplicaInfo {
+                    replica_id: 4,
+                    transport_uri: "r".to_owned(),
+                    role: ReplicaRole::Source as i32,
+                    communication_info: HashMap::from([("a".to_owned(), "b".to_owned())]),
+                },
+                ReplicaInfo {
+                    replica_id: 6,
+                    transport_uri: "r2".to_owned(),
+                    role: ReplicaRole::Destination as i32,
+                    communication_info: HashMap::new(),
+                },
+            ],
             shared_key: vec![0x04, 0x05, 0x06],
         }),
-        owner_replica_id: 1,
     }
 }
 
 #[test]
 fn encoder_matches_golden_json() {
-    assert_matches_golden(&golden_secret(), include_bytes!("golden/secret_v1.json"));
+    assert_matches_golden(&golden_secret(), include_bytes!("golden/secret_v2.json"));
 }
 
 #[test]
 fn encoder_matches_golden_json_full() {
     assert_matches_golden(
         &golden_secret_full(),
-        include_bytes!("golden/secret_v1_full.json"),
+        include_bytes!("golden/secret_v2_full.json"),
     );
 }
 

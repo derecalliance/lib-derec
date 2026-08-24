@@ -88,6 +88,17 @@ package org.derecalliance.derec.protobuf;
 //  peer-to-peer pairing over untrusted channels — use `HASHED_KEYS` or
 //  `INLINE_KEYS` there.
 //
+//  Because nothing binds the published keys to the contact, a `NO_KEYS`
+//  channel MUST NOT be used until the pair is confirmed out of band. An
+//  implementation MUST hold it unusable — no secrets sent, inbound
+//  messages ignored — until both sides compare the human-readable
+//  fingerprint derived from the established shared key and it matches. A
+//  man-in-the-middle on the `PrePair` leg yields two different shared
+//  keys and therefore two different fingerprints, so this comparison is
+//  what `HASHED_KEYS` gets from its `contactBindingHash` and `NO_KEYS`
+//  can get no other way. This is a requirement of the mode, not a
+//  deployment choice.
+//
 // The mode selector and the per-mode field-presence invariants are enforced
 // by the implementation; mixing fields across modes is a protocol error.
 
@@ -104,7 +115,9 @@ enum ContactMode {
   // `channelId`, `nonce`, and `transportProtocol`; the contact creator
   // generates key material on the fly when the corresponding
   // `PrePairRequest` arrives. Only appropriate when the out-of-band
-  // delivery channel is fully trusted.
+  // delivery channel is fully trusted, and the channel stays unusable
+  // until both sides confirm the fingerprint out of band — nothing else
+  // binds the published keys to the contact.
   NO_KEYS = 2;
 }
 

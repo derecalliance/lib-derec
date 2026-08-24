@@ -5,8 +5,10 @@
 use std::collections::HashMap;
 use std::io::Read as _;
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
-use derec_library::protocol::types::{HelperInfo, Secret, UserSecret};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use derec_library::protocol::types::{
+    HelperInfo, ReplicaInfo, ReplicaRole, Replicas, Secret, UserSecret,
+};
 use flate2::read::GzDecoder;
 use serde_json::Value;
 
@@ -24,8 +26,24 @@ fn recovered_secret_decodes_without_the_protocol() {
             name: "Gmail".to_owned(),
             data: b"correct horse battery staple".to_vec(),
         }],
-        replicas: None,
-        owner_replica_id: 0xAAAA_BBBB,
+        replicas: Some(Replicas {
+            channel_id: 5001,
+            shared_key: vec![0xCD; 32],
+            members: vec![
+                ReplicaInfo {
+                    replica_id: 1001,
+                    transport_uri: "https://alice.example.org/derec".to_owned(),
+                    role: ReplicaRole::Source as i32,
+                    communication_info: HashMap::new(),
+                },
+                ReplicaInfo {
+                    replica_id: 1002,
+                    transport_uri: "https://alice-2.example.org/derec".to_owned(),
+                    role: ReplicaRole::Destination as i32,
+                    communication_info: HashMap::new(),
+                },
+            ],
+        }),
     };
 
     // The bytes a helper stores / recovery reconstructs into secret_data.
@@ -33,15 +51,13 @@ fn recovered_secret_decodes_without_the_protocol() {
 
     // --- independent decoder: version byte → gzip → JSON → base64, no DeRec code ---
     let (&major, payload) = encoded.split_first().expect("non-empty encoding");
-    assert_eq!(major, 1, "version prefix");
+    assert_eq!(major, 2, "version prefix");
 
     let mut json = Vec::new();
     GzDecoder::new(payload)
         .read_to_end(&mut json)
         .expect("payload must be valid gzip (RFC 1952)");
     let v: Value = serde_json::from_slice(&json).expect("payload must be valid JSON");
-
-    assert_eq!(v["owner_replica_id"], "2863315899"); // 0xAAAABBBB as decimal string
 
     let s = &v["secrets"][0];
     assert_eq!(s["name"], "Gmail");
@@ -54,4 +70,21 @@ fn recovered_secret_decodes_without_the_protocol() {
     assert_eq!(h["channel_id"], "1000000");
     let key = STANDARD.decode(h["shared_key"].as_str().unwrap()).unwrap();
     assert_eq!(key, vec![0xAB; 32]);
+
+    // The roster answers "who originated this secret" on its own, with no
+    // separate field to consult: exactly one member carries role "Source".
+    let group = &v["replicas"];
+    assert_eq!(group["channel_id"], "5001");
+    let members = group["members"].as_array().expect("members is an array");
+    let sources: Vec<&Value> = members.iter().filter(|m| m["role"] == "Source").collect();
+    assert_eq!(sources.len(), 1, "exactly one source in the roster");
+    assert_eq!(sources[0]["replica_id"], "1001");
+    assert_eq!(
+        sources[0]["transport_uri"],
+        "https://alice.example.org/derec"
+    );
+    let group_key = STANDARD
+        .decode(group["shared_key"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(group_key, vec![0xCD; 32]);
 }

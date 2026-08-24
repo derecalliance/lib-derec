@@ -5,9 +5,11 @@ pub mod assertions;
 pub mod helpers;
 
 pub mod auto_accept;
+pub mod concurrency;
 pub mod discovery_recovery;
-pub mod multi_tenancy;
+pub mod e2e_stateless;
 pub mod multi_secret;
+pub mod multi_tenancy;
 pub mod pairing;
 pub mod persistence;
 pub mod replica_sync;
@@ -23,5 +25,7 @@ pub async fn run_all() {
     multi_tenancy::run().await;
     multi_secret::run().await;
     replica_sync::run().await;
+    e2e_stateless::run().await;
+    concurrency::run().await;
     auto_accept::run().await;
 }

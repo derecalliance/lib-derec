@@ -89,40 +89,98 @@ class InMemorySecretStore implements SecretStore {
 // Stores opaque channel-record bytes plus the channel-link graph,
 // partitioned by `secretId`.
 class InMemoryChannelStore implements ChannelStore {
-  private readonly channels = new Map<string, Uint8Array>();
+  // Two maps, mirroring the two primary keys the interface defines: a
+  // helper channel is unique per channelId, while a replica-group member is
+  // unique per replicaId and moves between channels during an admission
+  // handover — so a member must stay findable when its channel changes.
+  private readonly helpers = new Map<string, Uint8Array>();
+  private readonly members = new Map<string, Uint8Array>();
   private readonly links = new Map<string, Set<string>>();
 
-  private key(secretId: string, channelId: string): string {
-    return `${secretId}:${channelId}`;
+  private key(secretId: string, id: string): string {
+    return `${secretId}:${id}`;
   }
 
-  async load(secretId: string, channelId: string): Promise<Uint8Array | null> {
-    return this.channels.get(this.key(secretId, channelId)) ?? null;
+  private mapFor(replicaId: string): Map<string, Uint8Array> {
+    return replicaId === "0" ? this.helpers : this.members;
+  }
+
+  private idFor(channelId: string, replicaId: string): string {
+    return replicaId === "0" ? channelId : replicaId;
+  }
+
+  async load(
+    secretId: string,
+    channelId: string,
+    replicaId: string,
+  ): Promise<Uint8Array | null> {
+    return (
+      this.mapFor(replicaId).get(
+        this.key(secretId, this.idFor(channelId, replicaId)),
+      ) ?? null
+    );
   }
 
   async save(
     secretId: string,
     channelId: string,
+    replicaId: string,
     bytes: Uint8Array,
   ): Promise<void> {
-    this.channels.set(this.key(secretId, channelId), bytes);
+    this.mapFor(replicaId).set(
+      this.key(secretId, this.idFor(channelId, replicaId)),
+      bytes,
+    );
   }
 
-  async listChannels(secretId: string): Promise<string[]> {
+  async remove(
+    secretId: string,
+    channelId: string,
+    replicaId: string,
+  ): Promise<boolean> {
+    return this.mapFor(replicaId).delete(
+      this.key(secretId, this.idFor(channelId, replicaId)),
+    );
+  }
+
+  // The listing callbacks return a JSON array of the inner records.
+  //
+  // The stored bytes are spliced as text rather than parsed and
+  // re-serialized: channel and replica ids are u64, and round-tripping
+  // them through JSON.parse would silently round every value above
+  // 2**53 to the nearest double. A record is always the externally
+  // tagged `{"<variant>":{...}}` serde emits, so stripping the wrapper
+  // is a prefix/suffix slice.
+  private list(secretId: string, variant: "Helper" | "Replica"): Uint8Array {
+    const source = variant === "Helper" ? this.helpers : this.members;
     const prefix = `${secretId}:`;
-    return Array.from(this.channels.keys())
-      .filter((k) => k.startsWith(prefix))
-      .map((k) => k.slice(prefix.length));
+    const tag = `{"${variant}":`;
+    const inner: string[] = [];
+    for (const [k, v] of source) {
+      if (!k.startsWith(prefix)) continue;
+      const text = new TextDecoder().decode(v);
+      if (!text.startsWith(tag)) continue;
+      inner.push(text.slice(tag.length, -1));
+    }
+    return new TextEncoder().encode(`[${inner.join(",")}]`);
   }
 
-  async remove(secretId: string, channelId: string): Promise<boolean> {
-    return this.channels.delete(this.key(secretId, channelId));
+  async listHelpers(secretId: string): Promise<Uint8Array> {
+    return this.list(secretId, "Helper");
+  }
+
+  async listReplicas(secretId: string): Promise<Uint8Array> {
+    return this.list(secretId, "Replica");
+  }
+
+  private linkKey(secretId: string, channelId: string): string {
+    return `${secretId}:${channelId}`;
   }
 
   async linkChannel(secretId: string, a: string, b: string): Promise<void> {
     if (a === b) return;
-    const ka = this.key(secretId, a);
-    const kb = this.key(secretId, b);
+    const ka = this.linkKey(secretId, a);
+    const kb = this.linkKey(secretId, b);
     if (!this.links.has(ka)) this.links.set(ka, new Set());
     if (!this.links.has(kb)) this.links.set(kb, new Set());
     this.links.get(ka)!.add(b);
@@ -137,7 +195,7 @@ class InMemoryChannelStore implements ChannelStore {
       const curr = queue.shift()!;
       if (visited.has(curr)) continue;
       visited.add(curr);
-      for (const linked of this.links.get(this.key(secretId, curr)) ?? []) {
+      for (const linked of this.links.get(this.linkKey(secretId, curr)) ?? []) {
         if (!visited.has(linked)) queue.push(linked);
       }
     }
@@ -257,17 +315,34 @@ class InMemoryUserSecretStore implements UserSecretStore {
 // Rows are keyed by `(secretId, kind, channel_id, version)` — extracted
 // from the JSON blob so `loadAll(kind)` can filter without decoding
 // every stored entry.
+interface StateRecord {
+  kind: number;
+  channel_id?: string;
+  secret_id?: string;
+  version?: number;
+}
+
 class InMemoryStateStore implements StateStore {
   private readonly data = new Map<string, Uint8Array>();
 
   private compositeKey(
     secretId: string,
-    rec: { kind: number; channel_id?: string; version?: number },
+    rec: StateRecord,
   ): string {
-    return `${secretId}:${rec.kind}:${rec.channel_id ?? ""}:${rec.version ?? ""}`;
+    // secret_id is part of the key: a PendingRecovery row names the
+    // secret being recovered, which differs from `secretId` when
+    // recovering from an ephemeral instance, and two vaults can be
+    // recovered concurrently at the same version.
+    return [
+      secretId,
+      rec.kind,
+      rec.channel_id ?? "",
+      rec.secret_id ?? "",
+      rec.version ?? "",
+    ].join(":");
   }
 
-  private parseBlob(bytes: Uint8Array): { kind: number; channel_id?: string; version?: number } {
+  private parseBlob(bytes: Uint8Array): StateRecord {
     return JSON.parse(new TextDecoder().decode(bytes));
   }
 
@@ -342,6 +417,7 @@ function makeNode(
     replicaId?: bigint;
     secretId?: bigint;
     threshold?: number;
+    unsafeHttp?: boolean;
   } = {},
 ): Node {
   const channelStore = new InMemoryChannelStore();
@@ -369,6 +445,9 @@ function makeNode(
   }
   if (options.replicaId !== undefined) {
     builder = builder.withReplicaId(options.replicaId);
+  }
+  if (options.unsafeHttp !== undefined) {
+    builder = builder.withUnsafeHttp(options.unsafeHttp);
   }
   const protocol = builder.build();
   return { protocol, transport, channelStore, shareStore, secretStore, userSecretStore, stateStore };
@@ -488,6 +567,15 @@ async function doPair(
     `  [${label}/Initiator]     process(PairResponse) → PairingCompleted(kind=${kindName(initiatorPairing.kind)})`,
   );
   // Both peers rotate to the same long-term id at handshake completion.
+  // Every mode rekeys onto a long-term id derived from the shared key. The
+  // responder cannot pick it — the initiator re-derives the same value and
+  // rejects any other — so this holds whatever the contact mode.
+  if (initiatorPairing.channel_id === String(channelId)) {
+    throw new Error(
+      `${label}: the long-term channel id must differ from the transient pairing id`,
+    );
+  }
+
   return { longTermChannelId: initiatorPairing.channel_id };
 }
 
@@ -497,6 +585,14 @@ async function runPairingFlow(): Promise<void> {
 
   const owner = makeNode("Owner", "https://owner.example.com");
   const helper = makeNode("Helper", "https://helper.example.com");
+
+  // Tick before anything is in flight: proves the binding is wired and that
+  // an idle protocol is safe for a timer to poke.
+  const idle = await owner.protocol.tick();
+  if (idle.length !== 0) {
+    throw new Error(`idle tick must produce no events, got ${idle.length}`);
+  }
+  console.log("  tick() on an idle protocol returns no events  ✓");
 
   await doPair(helper, owner, 1n, "Pairing");
 
@@ -522,19 +618,23 @@ async function runFingerprintMismatchFlow(): Promise<void> {
   // Pre-seed a Pending channel + its 32-byte SharedKey. Mirrors the
   // post-replica-pair state where fingerprint verification is still
   // required to transition the channel to `Paired`.
+  const replicaId = 0xcafe;
   const channelJson = {
-    id: Number(channelId),
-    transport: { uri: "https://peer.example.com", protocol: 0 },
-    communication_info: {},
-    status: "Pending",
-    created_at: 1700000000,
-    role: "ReplicaSource",
-    replica_id: 0xcafe,
+    Replica: {
+      channel_id: Number(channelId),
+      replica_id: replicaId,
+      transport: { uri: "https://peer.example.com", protocol: 0 },
+      communication_info: {},
+      role: "Destination",
+      status: "Pending",
+      created_at: 1700000000,
+    },
   };
   const nodeSid = String(node.protocol.secretId());
   await node.channelStore.save(
     nodeSid,
     String(channelId),
+    String(replicaId),
     new TextEncoder().encode(JSON.stringify(channelJson)),
   );
   await node.secretStore.save(nodeSid, String(channelId), 0, sharedKey);
@@ -546,12 +646,16 @@ async function runFingerprintMismatchFlow(): Promise<void> {
 
   // Critical invariant for 5.1: the stored channel record must still
   // report Pending; the protocol must not have touched it.
-  const storedBytes = await node.channelStore.load(nodeSid, String(channelId));
-  if (!storedBytes) throw new Error("channel record missing after verify");
-  const stored = JSON.parse(new TextDecoder().decode(storedBytes));
+  const storedBytes = await node.channelStore.load(
+    nodeSid,
+    String(channelId),
+    String(replicaId),
+  );
+  if (!storedBytes) throw new Error("member record missing after verify");
+  const stored = JSON.parse(new TextDecoder().decode(storedBytes)).Replica;
   if (stored.status !== "Pending") {
     throw new Error(
-      `verifyFingerprint(wrong) must leave Channel.status as Pending; got ${stored.status}`,
+      `verifyFingerprint(wrong) must leave the member status as Pending; got ${stored.status}`,
     );
   }
   console.log("  verifyFingerprint(wrong) returns false  ✓");
@@ -570,28 +674,42 @@ async function runFingerprintMismatchFlow(): Promise<void> {
  * each outbound message into the peer's `processAll` (which auto-accepts the
  * `ActionRequired::PrePair` and `ActionRequired::Pairing` events).
  */
-async function doPairHashedKeys(
+/**
+ * Drives the two contact modes that need a PrePair leg. They share the whole
+ * wire choreography and differ only in what the contact carries: `HashedKeys`
+ * commits to the keys with a SHA-384 hash, `NoKeys` carries nothing at all and
+ * the creator generates keys on the fly, authenticating the request by nonce.
+ */
+async function doPairViaPrePair(
   contactCreator: Node,
   initiator: Node,
   channelId: bigint,
   label: string,
+  mode: ContactMode.HashedKeys | ContactMode.NoKeys,
 ): Promise<{ longTermChannelId: string }> {
+  const modeName = mode === ContactMode.HashedKeys ? "HashedKeys" : "NoKeys";
   const contact: ContactMessage =
-    await contactCreator.protocol.createContact(channelId, ContactMode.HashedKeys);
-  if (contact.contact_mode !== ContactMode.HashedKeys) {
-    throw new Error(`${label}: HashedKeys contact must advertise contact_mode = HashedKeys`);
+    await contactCreator.protocol.createContact(channelId, mode);
+  if (contact.contact_mode !== mode) {
+    throw new Error(`${label}: contact must advertise contact_mode = ${modeName}`);
   }
   if (contact.mlkem_encapsulation_key !== undefined) {
-    throw new Error(`${label}: HashedKeys contact must NOT carry the ML-KEM key inline`);
+    throw new Error(`${label}: ${modeName} contact must NOT carry the ML-KEM key inline`);
   }
   if (contact.ecies_public_key !== undefined) {
-    throw new Error(`${label}: HashedKeys contact must NOT carry the ECIES key inline`);
+    throw new Error(`${label}: ${modeName} contact must NOT carry the ECIES key inline`);
   }
-  if (!contact.contact_binding_hash || contact.contact_binding_hash.length !== 48) {
-    throw new Error(`${label}: HashedKeys contact must carry a 48-byte SHA-384 binding hash`);
+  if (mode === ContactMode.HashedKeys) {
+    if (!contact.contact_binding_hash || contact.contact_binding_hash.length !== 48) {
+      throw new Error(`${label}: HashedKeys contact must carry a 48-byte SHA-384 binding hash`);
+    }
+  } else if (contact.contact_binding_hash !== undefined) {
+    throw new Error(
+      `${label}: NoKeys contact must carry no binding hash — there is nothing to commit to`,
+    );
   }
   console.log(
-    `  [${label}/ContactCreator] createContact(HashedKeys) channel_id=${contact.channel_id} (binding-hash only, ${contact.contact_binding_hash.length}B)`,
+    `  [${label}/ContactCreator] createContact(${modeName}) channel_id=${contact.channel_id}`,
   );
 
   await initiator.protocol.start(FlowKind.Pairing, {
@@ -656,7 +774,114 @@ async function doPairHashedKeys(
   // Both peers rotate to the same long-term id at handshake completion —
   // return it so downstream assertions can key on it instead of the
   // transient pairing_channel_id.
+  // Every mode rekeys onto a long-term id derived from the shared key. The
+  // responder cannot pick it — the initiator re-derives the same value and
+  // rejects any other — so this holds whatever the contact mode.
+  if (initiatorPairing.channel_id === String(channelId)) {
+    throw new Error(
+      `${label}: the long-term channel id must differ from the transient pairing id`,
+    );
+  }
+
   return { longTermChannelId: initiatorPairing.channel_id };
+}
+
+
+/**
+ * The third contact mode, which the SDK exposed but never exercised.
+ *
+ * `NoKeys` carries no key material and no commitment, so trust rests entirely
+ * on the out-of-band channel that delivered the contact — the weakest of the
+ * three, and therefore the one most worth covering.
+ */
+async function runNoKeysPairingFlow(): Promise<void> {
+  console.log("=== [Protocol] NoKeys Pairing Flow ===\n");
+
+  const owner = makeNode("Owner", "https://owner.example.com");
+  const helper = makeNode("Helper", "https://helper.example.com");
+  const { longTermChannelId } = await doPairViaPrePair(
+    helper,
+    owner,
+    3n,
+    "NoKeys",
+    ContactMode.NoKeys,
+  );
+
+  const ownerSid = String(owner.protocol.secretId());
+  const helperSid = String(helper.protocol.secretId());
+  const ownerSharedKey = await owner.secretStore.load(ownerSid, longTermChannelId, 0);
+  const helperSharedKey = await helper.secretStore.load(helperSid, longTermChannelId, 0);
+  if (!ownerSharedKey || !helperSharedKey) {
+    throw new Error("NoKeys pairing: both sides must have a stored shared key");
+  }
+  if (
+    ownerSharedKey.length !== helperSharedKey.length ||
+    !ownerSharedKey.every((b, i) => b === helperSharedKey[i])
+  ) {
+    throw new Error("NoKeys pairing: owner/helper shared keys do not match");
+  }
+  console.log(`  shared keys match (${ownerSharedKey.length}B)  ✓`);
+
+  // The creator stores the contact under NoKeys so it can authenticate the
+  // PrePairRequest by nonce. Once the handshake has rekeyed onto the long-term
+  // channel that row is spent, and it used to outlive the handshake.
+  const strandedContact = await helper.secretStore.load(helperSid, "3", 2);
+  if (strandedContact) {
+    throw new Error(
+      "NoKeys pairing: the transient PairingContact must not outlive the handshake",
+    );
+  }
+  console.log("  the spent transient PairingContact was dropped  ✓\n");
+
+  // The gate. NoKeys inlines neither the keys nor a commitment to them, so
+  // nothing binds what arrived over the plaintext PrePair leg to the contact
+  // delivered out of band. Both sides hold the channel Pending until the
+  // fingerprints — derived from the established shared key — are compared.
+  const helperStatus = async (node: Node, sid: string): Promise<string> => {
+    const bytes = await node.channelStore.load(sid, longTermChannelId, "0");
+    if (!bytes) throw new Error("NoKeys pairing: channel record missing");
+    return JSON.parse(new TextDecoder().decode(bytes)).Helper.status;
+  };
+
+  for (const [label, node, sid] of [
+    ["owner", owner, ownerSid],
+    ["helper", helper, helperSid],
+  ] as const) {
+    const status = await helperStatus(node, sid);
+    if (status !== "Pending") {
+      throw new Error(
+        `NoKeys pairing: ${label} channel must be Pending before confirmation; got ${status}`,
+      );
+    }
+  }
+  console.log("  both sides hold the channel Pending until confirmed  ✓");
+
+  const ownerFingerprint = await owner.protocol.getFingerprint(BigInt(longTermChannelId));
+  const helperFingerprint = await helper.protocol.getFingerprint(BigInt(longTermChannelId));
+  if (ownerFingerprint !== helperFingerprint) {
+    throw new Error("NoKeys pairing: both sides must derive one fingerprint");
+  }
+  if (!(await owner.protocol.verifyFingerprint(BigInt(longTermChannelId), helperFingerprint))) {
+    throw new Error("NoKeys pairing: owner verifyFingerprint must match");
+  }
+  if (!(await helper.protocol.verifyFingerprint(BigInt(longTermChannelId), ownerFingerprint))) {
+    throw new Error("NoKeys pairing: helper verifyFingerprint must match");
+  }
+
+  for (const [label, node, sid] of [
+    ["owner", owner, ownerSid],
+    ["helper", helper, helperSid],
+  ] as const) {
+    const status = await helperStatus(node, sid);
+    if (status !== "Paired") {
+      throw new Error(
+        `NoKeys pairing: ${label} channel must be Paired once confirmed; got ${status}`,
+      );
+    }
+  }
+  console.log("  confirming the fingerprint opens the channel on both sides  ✓\n");
+
+  console.log("✓ NoKeys pairing flow passed.\n");
 }
 
 
@@ -666,7 +891,13 @@ async function runHashedKeysPairingFlow(): Promise<void> {
   // Happy path: full 4-leg chain ends with PairingCompleted on both sides.
   const owner = makeNode("Owner", "https://owner.example.com");
   const helper = makeNode("Helper", "https://helper.example.com");
-  const { longTermChannelId } = await doPairHashedKeys(helper, owner, 1n, "HashedKeys");
+  const { longTermChannelId } = await doPairViaPrePair(
+    helper,
+    owner,
+    1n,
+    "HashedKeys",
+    ContactMode.HashedKeys,
+  );
 
   // Both sides must have a paired channel record + a shared key in their
   // secret store (kind 0 = SharedKey) under the rotated long-term
@@ -674,8 +905,8 @@ async function runHashedKeysPairingFlow(): Promise<void> {
   // PrePair → Pair chain converged on the same key on both sides.
   const ownerSid = String(owner.protocol.secretId());
   const helperSid = String(helper.protocol.secretId());
-  const ownerChannel = await owner.channelStore.load(ownerSid, longTermChannelId);
-  const helperChannel = await helper.channelStore.load(helperSid, longTermChannelId);
+  const ownerChannel = await owner.channelStore.load(ownerSid, longTermChannelId, "0");
+  const helperChannel = await helper.channelStore.load(helperSid, longTermChannelId, "0");
   if (!ownerChannel || !helperChannel) {
     throw new Error("HashedKeys pairing: both sides must have a stored channel record");
   }
@@ -939,8 +1170,8 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
   // The originals are keyed by their rekeyed long-term ids, not the
   // transient contact ids they were minted from.
   const ownerSid = String(owner.protocol.secretId());
-  await owner.channelStore.remove(ownerSid, originalRekeyedA);
-  await owner.channelStore.remove(ownerSid, originalRekeyedB);
+  await owner.channelStore.remove(ownerSid, originalRekeyedA, "0");
+  await owner.channelStore.remove(ownerSid, originalRekeyedB, "0");
   console.log(`\n  [Owner]  removed original channels ${originalRekeyedA}, ${originalRekeyedB} to simulate state loss\n`);
 
 
@@ -1054,6 +1285,7 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
     const channel = await restored.channelStore.load(
       ownerSecretId.toString(),
       helper.channel_id,
+      "0",
     );
     if (!channel) {
       throw new Error(
@@ -1340,14 +1572,15 @@ async function runReplicaPairingAndSecretSyncFlow(): Promise<void> {
   console.log(`  ProtectSecret fanned out 3 envelopes (2 helpers + 1 destination)  ✓`);
 
   // 5. Feed the destination envelope to its peer; expect the typed
-  //    ReplicaSecretReceived event with the full decoded secret.
+  //    sync event with the full decoded secret. This is the destination's
+  //    first sync for this secret_id, so it installs rather than updates.
   const destEvents = await processAll(destination, destEnvelope.message);
-  const received = destEvents.find((e) => e.type === "ReplicaSecretReceived") as
-    | Extract<DeRecEvent, { type: "ReplicaSecretReceived" }>
+  const received = destEvents.find((e) => e.type === "ReplicaSecretInstalled") as
+    | Extract<DeRecEvent, { type: "ReplicaSecretInstalled" }>
     | undefined;
   if (!received) {
     throw new Error(
-      `Destination did not emit ReplicaSecretReceived; got [${destEvents.map((e) => e.type).join(", ")}]`,
+      `Destination did not emit ReplicaSecretInstalled; got [${destEvents.map((e) => e.type).join(", ")}]`,
     );
   }
   if (BigInt(received.from_replica_id) !== ownerReplicaId) {
@@ -1370,30 +1603,27 @@ async function runReplicaPairingAndSecretSyncFlow(): Promise<void> {
   ) {
     throw new Error("secret.secrets[0].data must round-trip the original secret bytes");
   }
-  if (BigInt(received.secret.owner_replica_id) !== ownerReplicaId) {
-    throw new Error(
-      `secret.owner_replica_id must echo owner's replica_id (${ownerReplicaId}), got ${received.secret.owner_replica_id}`,
-    );
-  }
   if (received.secret.helpers.length !== 2) {
     throw new Error(
       `secret.helpers.length expected 2, got ${received.secret.helpers.length}`,
     );
   }
-  if ((received.secret.replicas?.replicas.length ?? 0) !== 1) {
+  // The roster names every member including the writer, so the source is
+  // identified by its role rather than by a separate field.
+  const members = received.secret.replicas?.members ?? [];
+  if (members.length !== 2) {
+    throw new Error(`secret.replicas.members expected 2, got ${members.length}`);
+  }
+  const sources = members.filter((m) => m.role === "Source");
+  if (sources.length !== 1 || BigInt(sources[0]!.replica_id) !== ownerReplicaId) {
     throw new Error(
-      `secret.replicas.length expected 1, got ${(received.secret.replicas?.replicas.length ?? 0)}`,
+      `the roster must name exactly one Source, and it must be the owner (${ownerReplicaId})`,
     );
   }
-  const destInfo = received.secret.replicas!.replicas[0]!;
+  const destInfo = members.find((m) => m.role === "Destination")!;
   if (BigInt(destInfo.replica_id) !== destReplicaId) {
     throw new Error(
-      `ReplicaInfo.replica_id expected ${destReplicaId}, got ${destInfo.replica_id}`,
-    );
-  }
-  if (destInfo.sender_kind !== SenderKind.ReplicaDestination) {
-    throw new Error(
-      `ReplicaInfo.sender_kind must be ReplicaDestination (${SenderKind.ReplicaDestination}), got ${destInfo.sender_kind}`,
+      `the roster's Destination member expected ${destReplicaId}, got ${destInfo.replica_id}`,
     );
   }
   if (received.shares.length !== 2) {
@@ -1402,7 +1632,7 @@ async function runReplicaPairingAndSecretSyncFlow(): Promise<void> {
     );
   }
   console.log(
-    `  ReplicaSecretReceived: secret=${received.secret.secrets.length}secret/${received.secret.helpers.length}helpers/${(received.secret.replicas?.replicas.length ?? 0)}replicas, shares=${received.shares.length}  ✓`,
+    `  ReplicaSecretInstalled: secret=${received.secret.secrets.length}secret/${received.secret.helpers.length}helpers/${(received.secret.replicas?.members.length ?? 0)}members, shares=${received.shares.length}  ✓`,
   );
 
   // Drain helper outboxes from v=1 so the next round sees only v=2.
@@ -1583,11 +1813,12 @@ async function runUpdateChannelInfoFlow(): Promise<void> {
   const helperStoredBytes = await helper.channelStore.load(
     String(helper.protocol.secretId()),
     longTermChannelId,
+    "0",
   );
   if (!helperStoredBytes) {
     throw new Error("helper channel record must still exist after UpdateChannelInfo");
   }
-  const helperStored = JSON.parse(new TextDecoder().decode(helperStoredBytes));
+  const helperStored = JSON.parse(new TextDecoder().decode(helperStoredBytes)).Helper;
   if (helperStored.transport.uri !== newUri) {
     throw new Error(
       `helper's stored transport.uri must reflect the announced update; got ${helperStored.transport.uri}`,
@@ -1669,12 +1900,15 @@ async function runReplicaIdWiringSadPathsFlow(): Promise<void> {
 }
 
 
+
 export async function runProtocolSmoke(): Promise<void> {
   console.log("━━━ [Protocol] Starting ━━━\n");
 
   await runPairingFlow();
   await runFingerprintMismatchFlow();
   await runHashedKeysPairingFlow();
+  await runNoKeysPairingFlow();
+  runUnsafeHttpConfigFlow();
   await runSharingFlow();
   await runDiscoveryAndRecoveryFlow();
   await runUnpairingFlow();
@@ -1684,6 +1918,7 @@ export async function runProtocolSmoke(): Promise<void> {
   await runReplicaPairingAndSecretSyncFlow();
   await runReplicaSyncVersionProgressionFlow();
   await runAutoAcceptFlow();
+  await runExpiredChannelCleanupFlow();
 
   console.log("━━━ [Protocol] All passed. ━━━\n");
 }
@@ -1876,11 +2111,12 @@ async function runReplicaSyncVersionProgressionFlow(): Promise<void> {
   let events = await pumpAll(replicaScope);
   captureRekey(events);
   let recvA = findReplicaEvent(events, rk(cidA));
-  if (!recvA) throw new Error("step 1: A must observe ReplicaSecretReceived");
+  if (!recvA) throw new Error("step 1: A must observe a sync");
+  if (!recvA.installed) throw new Error("step 1: A had no snapshot, so this installs the secret");
   if (recvA.version !== 1) throw new Error(`step 1: expected v=1, got ${recvA.version}`);
   if (recvA.secret.helpers.length !== 0) throw new Error("step 1: helpers must be empty");
   if (recvA.secret.secrets.length !== 0) throw new Error("step 1: secrets must be empty");
-  if ((recvA.secret.replicas?.replicas.length ?? 0) !== 1) throw new Error("step 1: replicas must be 1");
+  if ((recvA.secret.replicas?.members.length ?? 0) !== 2) throw new Error("step 1: roster must be 2 (source + A)");
   if (recvA.shares.length !== 0) throw new Error("step 1: shares must be empty");
   await assertLatestVersion(owner, PROTECTED_SECRET_ID, 1);
   console.log("  step 1: pair replica A → v=1, secret(h=0,s=0,r=1,shares=0)  ✓");
@@ -1901,7 +2137,7 @@ async function runReplicaSyncVersionProgressionFlow(): Promise<void> {
   if (recvA.secret.secrets.length !== 1 || !recvA2Secret || !equalBytes(recvA2Secret.data, s1.data)) {
     throw new Error("step 2: secret.secrets[0].data must equal s1");
   }
-  if ((recvA.secret.replicas?.replicas.length ?? 0) !== 1) throw new Error("step 2: replicas must be 1");
+  if ((recvA.secret.replicas?.members.length ?? 0) !== 2) throw new Error("step 2: roster must be 2 (source + A)");
   if (recvA.shares.length !== 0) throw new Error("step 2: shares must be empty");
   await assertLatestVersion(owner, PROTECTED_SECRET_ID, 2);
   console.log("  step 2: ProtectSecret([s1]) → v=2, secret(h=0,s=1,r=1,shares=0)  ✓");
@@ -1922,7 +2158,7 @@ async function runReplicaSyncVersionProgressionFlow(): Promise<void> {
     if (recv.secret.secrets.length !== 1 || !secret || !equalBytes(secret.data, s1.data)) {
       throw new Error(`step 3 ${label}: secret must still carry s1`);
     }
-    if ((recv.secret.replicas?.replicas.length ?? 0) !== 2) throw new Error(`step 3 ${label}: replicas must be 2`);
+    if ((recv.secret.replicas?.members.length ?? 0) !== 3) throw new Error(`step 3 ${label}: roster must be 3`);
     if (recv.shares.length !== 0) throw new Error(`step 3 ${label}: shares must be empty`);
   }
   await assertLatestVersion(owner, PROTECTED_SECRET_ID, 3);
@@ -1935,14 +2171,8 @@ async function runReplicaSyncVersionProgressionFlow(): Promise<void> {
   if (events.some((e) => e.type === "ShareStored")) {
     throw new Error("step 4: no helper may store a share (1 < threshold 3)");
   }
-  for (const [label, cid] of [["A", cidA], ["B", cidB]] as const) {
-    const r = findReplicaEvent(events, rk(cid));
-    if (!r || r.version !== 4) throw new Error(`step 4 ${label}: must observe v=4`);
-    if (r.secret.helpers.length !== 1) throw new Error(`step 4 ${label}: helpers must be 1`);
-    if (r.secret.secrets.length !== 1) throw new Error(`step 4 ${label}: secrets must be 1`);
-    if ((r.secret.replicas?.replicas.length ?? 0) !== 2) throw new Error(`step 4 ${label}: replicas must be 2`);
-    if (r.shares.length !== 0) throw new Error(`step 4 ${label}: shares must be empty`);
-  }
+  await assertHydrated(replicaAEntry.node, PROTECTED_SECRET_ID, "A", 4, 1, 1, 3);
+  await assertHydrated(replicaBEntry.node, PROTECTED_SECRET_ID, "B", 4, 1, 1, 3);
   await assertLatestVersion(owner, PROTECTED_SECRET_ID, 4);
   console.log("  step 4: pair helper #1 → v=4, secret(h=1,s=1,r=2,shares=0)  ✓");
 
@@ -1953,11 +2183,8 @@ async function runReplicaSyncVersionProgressionFlow(): Promise<void> {
   if (events.some((e) => e.type === "ShareStored")) {
     throw new Error("step 5: still below threshold");
   }
-  const r5b = findReplicaEvent(events, rk(cidB));
-  if (!r5b || r5b.version !== 5) throw new Error(`step 5: B must observe v=5`);
-  if (r5b.secret.helpers.length !== 2) throw new Error("step 5: helpers must be 2");
-  if (r5b.shares.length !== 0) throw new Error("step 5: shares must be empty");
-  if (!findReplicaEvent(events, rk(cidA))) throw new Error("step 5: A must observe v=5");
+  await assertHydrated(replicaAEntry.node, PROTECTED_SECRET_ID, "A", 5, 2, 1, 3);
+  await assertHydrated(replicaBEntry.node, PROTECTED_SECRET_ID, "B", 5, 2, 1, 3);
   await assertLatestVersion(owner, PROTECTED_SECRET_ID, 5);
   console.log("  step 5: pair helper #2 → v=5, secret(h=2,s=1,r=2,shares=0)  ✓");
 
@@ -1972,18 +2199,18 @@ async function runReplicaSyncVersionProgressionFlow(): Promise<void> {
   if (events.some((e) => e.type === "ShareStored")) {
     throw new Error("step 6: still below threshold");
   }
-  recvA = findReplicaEvent(events, rk(cidA));
-  if (!recvA || recvA.version !== 6) throw new Error(`step 6: A must observe v=6`);
-  if (recvA.secret.secrets.length !== 2) throw new Error("step 6: secrets must be 2");
-  if (!recvA.secret.secrets.some((u) => equalBytes(u.data, s1.data))) {
-    throw new Error("step 6: secret must contain s1");
+  await assertHydrated(replicaAEntry.node, PROTECTED_SECRET_ID, "A", 6, 2, 2, 3);
+  await assertHydrated(replicaBEntry.node, PROTECTED_SECRET_ID, "B", 6, 2, 2, 3);
+  // Both user secrets reached the destination, not just the count.
+  const snapshotA = await replicaAEntry.node.userSecretStore.loadLatest(
+    PROTECTED_SECRET_ID.toString(),
+  );
+  if (!snapshotA?.secrets.some((u) => equalBytes(u.data, s1.data))) {
+    throw new Error("step 6: A's snapshot must carry s1");
   }
-  if (!recvA.secret.secrets.some((u) => equalBytes(u.data, s2.data))) {
-    throw new Error("step 6: secret must contain s2");
+  if (!snapshotA?.secrets.some((u) => equalBytes(u.data, s2.data))) {
+    throw new Error("step 6: A's snapshot must carry s2");
   }
-  if (recvA.secret.helpers.length !== 2) throw new Error("step 6: helpers must be 2");
-  if (recvA.shares.length !== 0) throw new Error("step 6: shares must be empty");
-  if (!findReplicaEvent(events, rk(cidB))) throw new Error("step 6: B must observe v=6");
   await assertLatestVersion(owner, PROTECTED_SECRET_ID, 6);
   console.log("  step 6: ProtectSecret([s1, s2]) → v=6, secret(h=2,s=2,r=2,shares=0)  ✓");
 
@@ -1997,14 +2224,8 @@ async function runReplicaSyncVersionProgressionFlow(): Promise<void> {
     );
     if (!stored) throw new Error(`step 7: ${label} must emit ShareStored at v=7`);
   }
-  for (const [label, cid] of [["A", cidA], ["B", cidB]] as const) {
-    const r = findReplicaEvent(events, rk(cid));
-    if (!r || r.version !== 7) throw new Error(`step 7 ${label}: must observe v=7`);
-    if (r.secret.helpers.length !== 3) throw new Error(`step 7 ${label}: helpers must be 3`);
-    if (r.secret.secrets.length !== 2) throw new Error(`step 7 ${label}: secrets must be 2`);
-    if ((r.secret.replicas?.replicas.length ?? 0) !== 2) throw new Error(`step 7 ${label}: replicas must be 2`);
-    if (r.shares.length !== 3) throw new Error(`step 7 ${label}: shares must be 3`);
-  }
+  await assertHydrated(replicaAEntry.node, PROTECTED_SECRET_ID, "A", 7, 3, 2, 3);
+  await assertHydrated(replicaBEntry.node, PROTECTED_SECRET_ID, "B", 7, 3, 2, 3);
   await assertLatestVersion(owner, PROTECTED_SECRET_ID, 7);
   console.log("  step 7: pair helper #3 → v=7, secret(h=3,s=2,r=2,shares=3); all 3 helpers ShareStored  ✓");
 
@@ -2022,15 +2243,11 @@ async function runReplicaSyncVersionProgressionFlow(): Promise<void> {
   }
   const recvC = findReplicaEvent(events, rk(cidC));
   if (!recvC || recvC.version !== 8) throw new Error(`step 8: C must observe v=8`);
-  if (recvC.secret.helpers.length !== 3) throw new Error("step 8 C: helpers must be 3");
-  if (recvC.secret.secrets.length !== 2) throw new Error("step 8 C: secrets must be 2");
-  if ((recvC.secret.replicas?.replicas.length ?? 0) !== 3) throw new Error("step 8 C: replicas must be 3");
+  if (!recvC.installed) throw new Error("step 8: C is new to the secret, so this installs it");
   if (recvC.shares.length !== 3) throw new Error("step 8 C: shares must be 3");
-  for (const [label, cid] of [["A", cidA], ["B", cidB]] as const) {
-    const r = findReplicaEvent(events, rk(cid));
-    if (!r || r.version !== 8) throw new Error(`step 8 ${label}: must observe v=8`);
-    if ((r.secret.replicas?.replicas.length ?? 0) !== 3) throw new Error(`step 8 ${label}: replicas must be 3`);
-  }
+  await assertHydrated(replicaAEntry.node, PROTECTED_SECRET_ID, "A", 8, 3, 2, 4);
+  await assertHydrated(replicaBEntry.node, PROTECTED_SECRET_ID, "B", 8, 3, 2, 4);
+  await assertHydrated(replicaCEntry.node, PROTECTED_SECRET_ID, "C", 8, 3, 2, 4);
   await assertLatestVersion(owner, PROTECTED_SECRET_ID, 8);
   console.log("  step 8: pair replica C → v=8, secret(h=3,s=2,r=3,shares=3) on A+B+C; all helpers refreshed  ✓");
 
@@ -2144,13 +2361,75 @@ async function pumpAll(entries: AddressedNode[]): Promise<DeRecEvent[]> {
   }
 }
 
+
+/**
+ * Assert a replica hydrated a round: its own snapshot and stores now match
+ * what the source published.
+ *
+ * Checked against the peer's stores rather than its events because members
+ * share one group channel once they have hydrated — the arrival channel no
+ * longer identifies who received what, and the stores are the thing the group
+ * model actually promises.
+ */
+async function assertHydrated(
+  peer: { userSecretStore: InMemoryUserSecretStore; channelStore: InMemoryChannelStore },
+  secretId: bigint,
+  label: string,
+  version: number,
+  helpers: number,
+  secrets: number,
+  members: number,
+): Promise<void> {
+  const sid = secretId.toString();
+  const snapshot = await peer.userSecretStore.loadLatest(sid);
+  if (!snapshot) throw new Error(`replica ${label} must hold a snapshot`);
+  if (snapshot.version !== version) {
+    throw new Error(`replica ${label} must hold v=${version}, got ${snapshot.version}`);
+  }
+  if ((snapshot.secrets?.length ?? 0) !== secrets) {
+    throw new Error(
+      `replica ${label} secret count: expected ${secrets}, got ${snapshot.secrets?.length ?? 0}`,
+    );
+  }
+
+  const storedHelpers = JSON.parse(
+    new TextDecoder().decode(await peer.channelStore.listHelpers(sid)),
+  );
+  if (storedHelpers.length !== helpers) {
+    throw new Error(
+      `replica ${label} must have materialised ${helpers} helper channel(s), got ${storedHelpers.length}`,
+    );
+  }
+
+  const roster = JSON.parse(
+    new TextDecoder().decode(await peer.channelStore.listReplicas(sid)),
+  );
+  if (roster.length !== members) {
+    throw new Error(`replica ${label} roster size: expected ${members}, got ${roster.length}`);
+  }
+  const sources = roster.filter((m: { role: string }) => m.role === "Source").length;
+  if (sources !== 1) {
+    throw new Error(`replica ${label} roster must name exactly one source, got ${sources}`);
+  }
+}
+
+/**
+ * Look up the sync event for a channel.
+ *
+ * Matches both arrival events and records which fired: a device's first sync
+ * for a `secret_id` installs the secret, every later one updates it.
+ */
 function findReplicaEvent(events: DeRecEvent[], channelId: bigint) {
   for (const ev of events) {
-    if (ev.type === "ReplicaSecretReceived" && BigInt(ev.channel_id) === channelId) {
+    if (
+      (ev.type === "ReplicaSecretReceived" || ev.type === "ReplicaSecretInstalled") &&
+      BigInt(ev.channel_id) === channelId
+    ) {
       return {
         version: ev.version,
         secret: ev.secret,
         shares: ev.shares,
+        installed: ev.type === "ReplicaSecretInstalled",
       };
     }
   }
@@ -2163,4 +2442,102 @@ function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
     if (a[i] !== b[i]) return false;
   }
   return true;
+}
+
+
+// Exercises the expired-channel cleanup surface.
+//
+// The contradictory pair — `enabled: false` alongside a non-zero timeout —
+// is the point: the wrapper must forward both values verbatim and let the
+// library decide that a disabled policy ignores its timeout. A wrapper that
+// interpreted the flag locally (dropping the timeout, or substituting its
+// own default) would still pass a happy-path test, so the config is chosen
+// to fail if any interpretation crept into the JS layer.
+async function runExpiredChannelCleanupFlow(): Promise<void> {
+  console.log("[Protocol] expired-channel cleanup");
+
+  const builder = new DeRecProtocolBuilder(DEFAULT_TEST_SECRET_ID)
+    .withChannelStore(new InMemoryChannelStore())
+    .withShareStore(new InMemoryShareStore())
+    .withSecretStore(new InMemorySecretStore())
+    .withUserSecretStore(new InMemoryUserSecretStore())
+    .withStateStore(new InMemoryStateStore())
+    .withTransport(new RecordingTransport())
+    .withOwnTransport({ uri: "https://cleanup.example.com", protocol: "https" })
+    .withThreshold(THRESHOLD)
+    .withTimeouts({ expired_channels: { enabled: false, timeout_in_secs: 900 } });
+  const protocol = builder.build();
+
+  // The caller-driven sweep works regardless of the disabled policy — that
+  // is what disabled means. No pending channels exist yet, so the result is
+  // an empty array rather than an error.
+  const removed = await protocol.removeExpiredChannels(0);
+  if (!Array.isArray(removed) || removed.length !== 0) {
+    throw new Error(
+      `expected no removed channels on a fresh protocol, got ${JSON.stringify(removed)}`,
+    );
+  }
+
+  console.log("  cleanup: disabled policy forwarded with its timeout; manual sweep callable ✓");
+}
+
+
+/**
+ * Compile-time proof that both new flows are reachable from TypeScript without
+ * widening `start`.
+ *
+ * `SyncCheck` (7) and `RemoveReplica` (8) were in the `FlowKind` enum and
+ * accepted at runtime, but `start` declared overloads only up to kind 6, so
+ * dispatching them meant casting to a looser signature. This function is never
+ * called — it exists so `tsc` fails if those overloads are dropped again.
+ */
+export function _startOverloadsCoverEveryFlowKind(protocol: DeRecProtocol): void {
+  void (() => protocol.start(FlowKind.SyncCheck));
+  void (() => protocol.start(FlowKind.SyncCheck, {}));
+  void (() =>
+    protocol.start(FlowKind.RemoveReplica, {
+      replica_id: "51966",
+      memo: "retired device",
+    }));
+  void (() => protocol.start(FlowKind.RemoveReplica, { replica_id: "51966" }));
+}
+
+/**
+ * `unsafeHttp` must survive the WASM boundary and actually change behaviour.
+ *
+ * Its own test because the failure is silent: an unset field on the Rust side
+ * defaults to `false`, so a name mismatch would make the setting a no-op with
+ * every other test still green — the same shape as the enum variants that
+ * were declared in `index.d.ts` but `undefined` at run time.
+ */
+export function runUnsafeHttpConfigFlow(): void {
+  console.log("=== [Protocol] unsafe_http config ===\n");
+
+  const builds = (uri: string, unsafeHttp: boolean): boolean => {
+    try {
+      makeNode("Dev", uri, { unsafeHttp });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  if (!builds("http://127.0.0.1:8080", false)) {
+    throw new Error("loopback plaintext must build with unsafeHttp=false");
+  }
+  console.log("  loopback http accepted with unsafeHttp=false  ✓");
+
+  if (builds("http://192.168.1.42:8080", false)) {
+    throw new Error("LAN plaintext must be refused with unsafeHttp=false");
+  }
+  console.log("  LAN http refused with unsafeHttp=false  ✓");
+
+  if (!builds("http://192.168.1.42:8080", true)) {
+    throw new Error(
+      "LAN plaintext must build with unsafeHttp=true — the setting is not reaching the library",
+    );
+  }
+  console.log("  LAN http accepted with unsafeHttp=true  ✓");
+
+  console.log("\n✓ unsafe_http config passed.\n");
 }

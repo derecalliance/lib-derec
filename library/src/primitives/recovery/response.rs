@@ -1,6 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+//! `GetShareResponse` — the Helper's side of recovery, and the
+//! reconstruction that consumes it.
+//!
+//! Three steps, in the order a recovery runs them:
+//!
+//! - [`produce`] — Helper side. Wraps a stored share in a response envelope.
+//! - [`extract`] — Owner side. Decrypts and validates one response.
+//! - [`recover`] — Owner side. Combines a quorum of extracted shares back into
+//!   the secret.
+//!
+//! [`recover`] is where the threshold is enforced, and it verifies before it
+//! reconstructs: every share must carry the same Merkle root and the same
+//! ciphertext, and each must prove membership under that root. A set that
+//! disagrees is rejected rather than combined, so a single corrupted or
+//! malicious share cannot steer the result.
+
 use crate::primitives::recovery::RecoveryError;
 use crate::utils::verify_timestamps;
 use crate::{
@@ -89,7 +105,7 @@ pub struct RecoverResult {
 ///         .expect("split failed");
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 /// let sharing::request::ProduceResult { envelope: share_envelope } =
-///     sharing::request::produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, None, None)
+///     sharing::request::produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, None)
 ///         .expect("share produce failed");
 /// let sharing::request::ExtractResult { request: stored_share_request } =
 ///     sharing::request::extract(&share_envelope, &shared_key).expect("share extract failed");
@@ -163,6 +179,9 @@ pub fn produce(
         timestamp: Some(timestamp),
         secret_id: request.secret_id,
         version: request.version,
+        // Owner ↔ helper exchange: the replica path sets this, this one
+        // never does. Its absence is what marks the message helper-bound.
+        replica_id: None,
     };
 
     let envelope = DeRecMessageBuilder::channel()
@@ -244,7 +263,7 @@ pub fn produce(
 ///         .expect("split failed");
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 /// let sharing::request::ProduceResult { envelope: share_envelope } =
-///     sharing::request::produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, None, None)
+///     sharing::request::produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, None)
 ///         .expect("share produce failed");
 /// let sharing::request::ExtractResult { request: stored_share_request } =
 ///     sharing::request::extract(&share_envelope, &shared_key).expect("share extract failed");
@@ -361,7 +380,7 @@ pub fn extract(
 /// for &channel_id in &channels[..2] {
 ///     let committed_share = shares.get(&channel_id).expect("missing share");
 ///     let sharing::request::ProduceResult { envelope } =
-///         sharing::request::produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, None, None)
+///         sharing::request::produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, None)
 ///             .expect("share produce failed");
 ///     let sharing::request::ExtractResult { request } =
 ///         sharing::request::extract(&envelope, &shared_key).expect("share extract failed");

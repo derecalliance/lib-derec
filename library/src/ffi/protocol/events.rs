@@ -7,7 +7,7 @@
 //! — every event is a JSON object with a `"type"` discriminator and the
 //! variant payload as sibling fields.
 
-use crate::protocol::{events::wire, DeRecEvent};
+use crate::protocol::{DeRecEvent, events::wire};
 
 /// Encode an event stream to a UTF-8 JSON array (`[ {...}, {...}, ... ]`)
 /// ready to ship over the FFI boundary as a `DeRecBuffer`. Events whose

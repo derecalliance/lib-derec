@@ -7,12 +7,13 @@
 //
 // # Layering
 //
-// The domain types (Channel, Share, SecretValue, StateItem, StateKey,
+// The domain types (ChannelRecord, Share, SecretValue, StateItem, StateKey,
 // UserSecret, UserSecrets, and the small enums) and the wire codecs that
 // convert them to/from the JSON each C callback carries both live in
 // internal/native (store_types.go, store_records.go), not in this
-// package. This package re-exports them via type aliases (`type Channel =
-// native.Channel`, etc.) rather than defining new types.
+// package. This package re-exports them via type aliases (`type
+// ChannelRecord = native.ChannelRecord`, etc.) rather than defining new
+// types.
 //
 // That placement is dictated by the hard no-import-cycle constraint:
 // internal/native (the purego bridge, wired up in the next task) must be
@@ -25,10 +26,11 @@
 // definition per type.
 //
 // A second benefit of aliasing (rather than duplicating and converting):
-// because `protocol.Channel` and `native.Channel` are the identical type,
+// because `protocol.ChannelRecord` and `native.ChannelRecord` are the
+// identical type,
 // a value that satisfies e.g. protocol.ChannelStore automatically
 // satisfies any structurally-identical interface internal/native declares
-// over native.Channel — Go's structural interface typing lets the next
+// over native.ChannelRecord — Go's structural interface typing lets the next
 // task hand a protocol.ChannelStore implementation to native's callback
 // wiring with no adapter shim, despite native never importing this
 // package.
@@ -41,8 +43,17 @@ import "github.com/derecalliance/lib-derec/packages/go/internal/native"
 // internal/native/store_records.go for the JSON codecs that give each
 // type's wire shape its meaning.
 type (
-	// Channel is the post-pairing representation of a peer.
-	Channel = native.Channel
+	// HelperChannel is a channel to a single helper, or to the owner
+	// from a helper's side.
+	HelperChannel = native.HelperChannel
+	// ReplicaMember is one member of a replica group, including this
+	// device itself.
+	ReplicaMember = native.ReplicaMember
+	// ChannelRecord is what a ChannelStore holds at one address: either
+	// a helper channel or one replica-group member.
+	ChannelRecord = native.ChannelRecord
+	// ReplicaRole is a member's role within a replica group.
+	ReplicaRole = native.ReplicaRole
 	// TransportEndpoint is a peer's advertised transport.
 	TransportEndpoint = native.TransportEndpoint
 	// ChannelStatus is a channel's lifecycle status.
@@ -72,13 +83,17 @@ type (
 )
 
 const (
-	ChannelStatusPending = native.ChannelStatusPending
-	ChannelStatusPaired  = native.ChannelStatusPaired
+	ChannelStatusPending   = native.ChannelStatusPending
+	ChannelStatusPaired    = native.ChannelStatusPaired
+	ChannelStatusUnpairing = native.ChannelStatusUnpairing
 
 	SenderKindOwner              = native.SenderKindOwner
 	SenderKindHelper             = native.SenderKindHelper
 	SenderKindReplicaSource      = native.SenderKindReplicaSource
 	SenderKindReplicaDestination = native.SenderKindReplicaDestination
+
+	ReplicaRoleSource      = native.ReplicaRoleSource
+	ReplicaRoleDestination = native.ReplicaRoleDestination
 
 	SecretKindSharedKey      = native.SecretKindSharedKey
 	SecretKindPairingSecret  = native.SecretKindPairingSecret
@@ -88,28 +103,58 @@ const (
 	StateKindPendingRecovery     = native.StateKindPendingRecovery
 	StateKindPendingUnpair       = native.StateKindPendingUnpair
 	StateKindSharingRound        = native.StateKindSharingRound
+	StateKindPendingSyncCheck    = native.StateKindPendingSyncCheck
 )
 
-// ChannelStore persists paired channels, keyed by (secretID, channelID),
-// plus the channel-link graph used to group channels belonging to the
-// same Owner identity (e.g. after a recovery re-pairing). Mirrors
-// derec_library::protocol::DeRecChannelStore. Implementations must be
-// safe to call repeatedly but are never called concurrently for the same
-// protocol instance — the Rust core serializes access to a store's
-// methods via &mut self.
+// ChannelStore persists channel records plus the channel-link graph used to
+// group channels belonging to the same Owner identity (e.g. after a recovery
+// re-pairing). Mirrors derec_library::protocol::DeRecChannelStore.
+// Implementations must be safe to call repeatedly but are never called
+// concurrently for the same protocol instance — the Rust core serializes
+// access to a store's methods via &mut self.
+//
+// A record is addressed by (channelID, replicaID). A replicaID of 0 — the
+// value the protocol reserves as "absent" — addresses the helper channel at
+// channelID.
+//
+// Any other value addresses that member of the replica group, and the member
+// is keyed by replicaID ALONE. The accompanying channelID is context, not
+// part of the key: a member moves between channels during an admission
+// handover while remaining the same member, and a lookup that required both
+// to match would miss it exactly when the move needs to be observed. Keep two
+// maps — helpers by channelID, members by replicaID — not one keyed by the
+// pair.
 type ChannelStore interface {
-	// Load returns the channel at (secretID, channelID), or ok=false if
-	// none is stored.
-	Load(secretID, channelID uint64) (channel Channel, ok bool, err error)
-	// Save inserts or replaces the channel at (secretID, channel.ID).
-	Save(secretID uint64, channel Channel) error
-	// Remove deletes the channel at (secretID, channelID). Returns
-	// whether an entry actually existed; removing a missing entry is not
-	// an error.
-	Remove(secretID, channelID uint64) (existed bool, err error)
-	// ListChannels returns the ids of every channel stored under
-	// secretID.
-	ListChannels(secretID uint64) ([]uint64, error)
+	// Load returns the record at (secretID, channelID, replicaID), or
+	// ok=false if none is stored.
+	Load(secretID, channelID, replicaID uint64) (record ChannelRecord, ok bool, err error)
+	// Save inserts or replaces the record at its own address. Deriving
+	// the key from the record is what keeps a record from being stored
+	// under the wrong one.
+	Save(secretID uint64, record ChannelRecord) error
+	// Remove deletes the record at (secretID, channelID, replicaID).
+	// Returns whether an entry actually existed; removing a missing
+	// entry is not an error.
+	Remove(secretID, channelID, replicaID uint64) (existed bool, err error)
+	// ListHelpers returns every helper channel stored under secretID.
+	ListHelpers(secretID uint64) ([]HelperChannel, error)
+	// ListReplicas returns every replica-group member stored under
+	// secretID, including this device's own row.
+	//
+	// The order is significant in exactly one situation. A group has one
+	// member holding the Source role; when it is removed, the protocol
+	// promotes the first element of this slice that is neither the departing
+	// member nor itself leaving. Ordering this slice is therefore how an
+	// application chooses its succession policy. The choice is read once, on
+	// the single device running the removal, and is then published in the
+	// roster, so implementations on different devices need not agree on
+	// order. Nothing else consults it.
+	//
+	// Returning an arbitrary order is correct and simply delegates the choice
+	// to the storage — note that a SQL SELECT without ORDER BY and Go map
+	// iteration are both arbitrary. Order explicitly to make succession
+	// predictable.
+	ListReplicas(secretID uint64) ([]ReplicaMember, error)
 	// LinkChannel records a as belonging to the same Owner identity as
 	// b (and vice versa) — a symmetric relation.
 	LinkChannel(secretID, a, b uint64) error
@@ -197,6 +242,22 @@ type StateStore interface {
 // endpoint; the application is responsible for shipping them over the
 // wire (HTTP, WebSocket, etc. — the library makes no transport
 // assumptions). Mirrors derec_library::protocol::DeRecTransport.
+//
+// This is a mailbox, not a request/response channel: every peer has an
+// address, and a reply is posted to that address rather than returned from
+// Process. Where both sides are reachable services, a one-way push is all
+// that is needed.
+//
+// A peer that cannot be addressed — a phone, a browser, anything behind NAT —
+// breaks that silently: the reply is handed to Send, goes nowhere, and
+// nothing reports an error. Such a service must answer on the connection the
+// request arrived on, by building the protocol per request with a Transport
+// that collects into a buffer instead of sending, then returning the
+// collected message whose trace id matches the inbound envelope's
+// (envelope.ReadTraceID). One call can emit several messages, so the rest of
+// the buffer is genuine fan-out and still has to be delivered. See "Serving
+// DeRec over request/response transports" in the Rust SDK README for the full
+// pattern.
 type Transport interface {
 	// Send delivers message to uri over the given transport protocol
 	// (0 = HTTPS, the only value currently defined —see

@@ -1,0 +1,441 @@
+{
+  "$schema_note": "Every enum the Rust core encodes onto a wire an SDK decodes. Each entry lists every variant with the exact value that crosses the boundary: a serde variant-name string, or a numeric discriminant. Rust asserts this file is complete (library/src/protocol/types/mod.rs, enum_fixture_tests); each SDK asserts it can decode every entry. Adding a variant in Rust breaks an exhaustive match there, and updating that fails the SDK tests until every SDK is updated too.",
+  "enums": {
+    "ChannelStatus": {
+      "encoding": "name",
+      "note": "serde variant names on ChannelRecord",
+      "variants": [
+        {
+          "name": "Pending",
+          "wire": "Pending"
+        },
+        {
+          "name": "Paired",
+          "wire": "Paired"
+        },
+        {
+          "name": "Unpairing",
+          "wire": "Unpairing"
+        }
+      ]
+    },
+    "ReplicaRole": {
+      "encoding": "name",
+      "note": "serde variant names on ReplicaMember and roster ReplicaInfo",
+      "variants": [
+        {
+          "name": "Source",
+          "wire": "Source"
+        },
+        {
+          "name": "Destination",
+          "wire": "Destination"
+        }
+      ]
+    },
+    "PendingActionKind": {
+      "encoding": "name",
+      "note": "ActionRequired.action_kind / AutoAccepted.action_kind",
+      "variants": [
+        {
+          "name": "Pairing",
+          "wire": "Pairing"
+        },
+        {
+          "name": "PrePair",
+          "wire": "PrePair"
+        },
+        {
+          "name": "StoreShare",
+          "wire": "StoreShare"
+        },
+        {
+          "name": "VerifyShare",
+          "wire": "VerifyShare"
+        },
+        {
+          "name": "Discovery",
+          "wire": "Discovery"
+        },
+        {
+          "name": "GetShare",
+          "wire": "GetShare"
+        },
+        {
+          "name": "Unpair",
+          "wire": "Unpair"
+        },
+        {
+          "name": "UpdateChannelInfo",
+          "wire": "UpdateChannelInfo"
+        }
+      ]
+    },
+    "DeRecEvent": {
+      "encoding": "name",
+      "note": "the serde `type` discriminator on every emitted event",
+      "variants": [
+        {
+          "name": "ActionRequired",
+          "wire": "ActionRequired"
+        },
+        {
+          "name": "AutoAccepted",
+          "wire": "AutoAccepted"
+        },
+        {
+          "name": "ChannelInfoUpdated",
+          "wire": "ChannelInfoUpdated"
+        },
+        {
+          "name": "ChannelInfoUpdateRejected",
+          "wire": "ChannelInfoUpdateRejected"
+        },
+        {
+          "name": "DiscoveryFailed",
+          "wire": "DiscoveryFailed"
+        },
+        {
+          "name": "DiscoveryStarted",
+          "wire": "DiscoveryStarted"
+        },
+        {
+          "name": "NoOp",
+          "wire": "NoOp"
+        },
+        {
+          "name": "PairingCompleted",
+          "wire": "PairingCompleted"
+        },
+        {
+          "name": "PairingStarted",
+          "wire": "PairingStarted"
+        },
+        {
+          "name": "PrePairRejected",
+          "wire": "PrePairRejected"
+        },
+        {
+          "name": "ProtectSecretFailed",
+          "wire": "ProtectSecretFailed"
+        },
+        {
+          "name": "ProtectSecretStarted",
+          "wire": "ProtectSecretStarted"
+        },
+        {
+          "name": "RecoverSecretFailed",
+          "wire": "RecoverSecretFailed"
+        },
+        {
+          "name": "RecoverSecretStarted",
+          "wire": "RecoverSecretStarted"
+        },
+        {
+          "name": "RecoveryShareError",
+          "wire": "RecoveryShareError"
+        },
+        {
+          "name": "RecoveryShareReceived",
+          "wire": "RecoveryShareReceived"
+        },
+        {
+          "name": "ReplicaPaired",
+          "wire": "ReplicaPaired"
+        },
+        {
+          "name": "ReplicaRemoved",
+          "wire": "ReplicaRemoved"
+        },
+        {
+          "name": "ReplicaSecretAcked",
+          "wire": "ReplicaSecretAcked"
+        },
+        {
+          "name": "ReplicaSecretInstalled",
+          "wire": "ReplicaSecretInstalled"
+        },
+        {
+          "name": "ReplicaSecretReceived",
+          "wire": "ReplicaSecretReceived"
+        },
+        {
+          "name": "ReplicaSourceChanged",
+          "wire": "ReplicaSourceChanged"
+        },
+        {
+          "name": "ReplicaSyncComplete",
+          "wire": "ReplicaSyncComplete"
+        },
+        {
+          "name": "ReplicaSyncFailed",
+          "wire": "ReplicaSyncFailed"
+        },
+        {
+          "name": "ReplicaSyncRejected",
+          "wire": "ReplicaSyncRejected"
+        },
+        {
+          "name": "SecretRecovered",
+          "wire": "SecretRecovered"
+        },
+        {
+          "name": "SecretsDiscovered",
+          "wire": "SecretsDiscovered"
+        },
+        {
+          "name": "SelfRemovedFromGroup",
+          "wire": "SelfRemovedFromGroup"
+        },
+        {
+          "name": "ShareConfirmed",
+          "wire": "ShareConfirmed"
+        },
+        {
+          "name": "ShareRejected",
+          "wire": "ShareRejected"
+        },
+        {
+          "name": "ShareStored",
+          "wire": "ShareStored"
+        },
+        {
+          "name": "ShareVerified",
+          "wire": "ShareVerified"
+        },
+        {
+          "name": "SharingComplete",
+          "wire": "SharingComplete"
+        },
+        {
+          "name": "SyncCheckComplete",
+          "wire": "SyncCheckComplete"
+        },
+        {
+          "name": "Unpaired",
+          "wire": "Unpaired"
+        },
+        {
+          "name": "UnpairFailed",
+          "wire": "UnpairFailed"
+        },
+        {
+          "name": "UnpairRejected",
+          "wire": "UnpairRejected"
+        },
+        {
+          "name": "UnpairStarted",
+          "wire": "UnpairStarted"
+        },
+        {
+          "name": "UpdateChannelInfoFailed",
+          "wire": "UpdateChannelInfoFailed"
+        },
+        {
+          "name": "UpdateChannelInfoStarted",
+          "wire": "UpdateChannelInfoStarted"
+        },
+        {
+          "name": "VerifySharesFailed",
+          "wire": "VerifySharesFailed"
+        },
+        {
+          "name": "VerifySharesStarted",
+          "wire": "VerifySharesStarted"
+        }
+      ]
+    },
+    "SecretKind": {
+      "encoding": "number",
+      "note": "kind argument on the secret-store callbacks",
+      "variants": [
+        {
+          "name": "SharedKey",
+          "wire": 0
+        },
+        {
+          "name": "PairingSecret",
+          "wire": 1
+        },
+        {
+          "name": "PairingContact",
+          "wire": 2
+        }
+      ]
+    },
+    "StateKind": {
+      "encoding": "number",
+      "note": "StateItemRecord.kind and the state-store loadAll argument",
+      "variants": [
+        {
+          "name": "PendingVerification",
+          "wire": 0
+        },
+        {
+          "name": "PendingRecovery",
+          "wire": 1
+        },
+        {
+          "name": "PendingUnpair",
+          "wire": 2
+        },
+        {
+          "name": "SharingRound",
+          "wire": 3
+        },
+        {
+          "name": "PendingSyncCheck",
+          "wire": 4
+        }
+      ]
+    },
+    "FlowKind": {
+      "encoding": "number",
+      "note": "flow selector on the protocol start entry point",
+      "variants": [
+        {
+          "name": "Pairing",
+          "wire": 0
+        },
+        {
+          "name": "Discovery",
+          "wire": 1
+        },
+        {
+          "name": "ProtectSecret",
+          "wire": 2
+        },
+        {
+          "name": "VerifyShares",
+          "wire": 3
+        },
+        {
+          "name": "RecoverSecret",
+          "wire": 4
+        },
+        {
+          "name": "Unpair",
+          "wire": 5
+        },
+        {
+          "name": "UpdateChannelInfo",
+          "wire": 6
+        },
+        {
+          "name": "SyncCheck",
+          "wire": 7
+        },
+        {
+          "name": "RemoveReplica",
+          "wire": 8
+        }
+      ]
+    },
+    "SenderKind": {
+      "encoding": "number",
+      "note": "protobuf SenderKind; note 2 is unused",
+      "variants": [
+        {
+          "name": "Owner",
+          "wire": 0
+        },
+        {
+          "name": "Helper",
+          "wire": 1
+        },
+        {
+          "name": "ReplicaSource",
+          "wire": 3
+        },
+        {
+          "name": "ReplicaDestination",
+          "wire": 4
+        }
+      ]
+    },
+    "ContactMode": {
+      "encoding": "number",
+      "note": "protobuf ContactMode; SDKs re-declare this rather than re-export the generated type",
+      "variants": [
+        {
+          "name": "InlineKeys",
+          "wire": 0
+        },
+        {
+          "name": "HashedKeys",
+          "wire": 1
+        },
+        {
+          "name": "NoKeys",
+          "wire": 2
+        }
+      ]
+    },
+    "StatusEnum": {
+      "encoding": "number",
+      "note": "protobuf result status; 12 is deliberately unassigned",
+      "variants": [
+        {
+          "name": "Ok",
+          "wire": 0
+        },
+        {
+          "name": "Partial",
+          "wire": 1
+        },
+        {
+          "name": "Fail",
+          "wire": 2
+        },
+        {
+          "name": "SizeLimitExceeded",
+          "wire": 3
+        },
+        {
+          "name": "TooFrequent",
+          "wire": 4
+        },
+        {
+          "name": "UnknownSecretId",
+          "wire": 5
+        },
+        {
+          "name": "UnknownShareVersion",
+          "wire": 6
+        },
+        {
+          "name": "DecryptionFailed",
+          "wire": 7
+        },
+        {
+          "name": "VerificationFailed",
+          "wire": 8
+        },
+        {
+          "name": "FormatError",
+          "wire": 9
+        },
+        {
+          "name": "Rejected",
+          "wire": 10
+        },
+        {
+          "name": "IncompatibleParameterRange",
+          "wire": 11
+        },
+        {
+          "name": "VersionConflict",
+          "wire": 13
+        },
+        {
+          "name": "ReplicaIdConflict",
+          "wire": 14
+        },
+        {
+          "name": "RequestToClose",
+          "wire": 99
+        }
+      ]
+    }
+  }
+}

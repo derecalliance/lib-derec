@@ -23,6 +23,10 @@ pub struct GetShareRequestMessage {
     /// Optional ephemeral response endpoint. See `replyTo` on the request
     /// proto for the routing semantics.
     pub reply_to: Option<TransportProtocol>,
+    /// Identity of the replica-group member this message concerns, present
+    /// only on the replica catch-up path. `null` on the owner ↔ helper path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_id: Option<u64>,
 }
 
 impl From<derec_proto::GetShareRequestMessage> for GetShareRequestMessage {
@@ -32,6 +36,7 @@ impl From<derec_proto::GetShareRequestMessage> for GetShareRequestMessage {
             version: value.version,
             timestamp: value.timestamp.map(Into::into),
             reply_to: value.reply_to.map(Into::into),
+            replica_id: value.replica_id,
         }
     }
 }
@@ -43,6 +48,7 @@ impl From<GetShareRequestMessage> for derec_proto::GetShareRequestMessage {
             version: value.version,
             timestamp: value.timestamp.map(Into::into),
             reply_to: value.reply_to.map(Into::into),
+            replica_id: value.replica_id,
         }
     }
 }
@@ -69,9 +75,14 @@ pub fn produce(
 ) -> Result<JsValue, JsValue> {
     let shared_key = parse_shared_key(shared_key)?;
     let reply_to_proto = parse_optional_transport_protocol(reply_to)?;
-    let result =
-        request::produce(channel_id.into(), secret_id, version, &shared_key, reply_to_proto)
-            .map_err(js_error_from_lib)?;
+    let result = request::produce(
+        channel_id.into(),
+        secret_id,
+        version,
+        &shared_key,
+        reply_to_proto,
+    )
+    .map_err(js_error_from_lib)?;
     to_js(&ProduceResult {
         envelope: result.envelope,
     })

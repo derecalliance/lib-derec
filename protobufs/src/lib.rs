@@ -220,9 +220,9 @@ impl MessageBody {
             "PrePairRequestMessage" => {
                 MessageBody::PrePairRequest(PrePairRequestMessage::decode(any.value.as_slice())?)
             }
-            "PrePairResponseMessage" => MessageBody::PrePairResponse(
-                PrePairResponseMessage::decode(any.value.as_slice())?,
-            ),
+            "PrePairResponseMessage" => {
+                MessageBody::PrePairResponse(PrePairResponseMessage::decode(any.value.as_slice())?)
+            }
             #[allow(deprecated)]
             unknown => return Err(DecodeError::new(unknown.to_string())),
         };
@@ -242,6 +242,7 @@ mod tests {
             memo: "bye".to_owned(),
             timestamp: None,
             reply_to: None,
+            replica_id: None,
         }
         .encode_to_vec()
     }
@@ -254,6 +255,7 @@ mod tests {
             memo: "bye".to_owned(),
             timestamp: None,
             reply_to: None,
+            replica_id: None,
         });
         let bytes = body.encode_to_vec();
         let round_tripped =

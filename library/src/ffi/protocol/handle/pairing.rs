@@ -10,10 +10,10 @@ use std::os::raw::c_char;
 use prost::Message as _;
 
 use super::DeRecProtocolHandle;
-use crate::ffi::common::{empty_buffer, vec_into_buffer, DeRecBuffer};
+use crate::ffi::common::{DeRecBuffer, empty_buffer, vec_into_buffer};
 use crate::ffi::error::{
-    ffi_error, from_lib_error, success, DeRecError, DEREC_CODE_FFI_BAD_PROTO,
-    DEREC_CODE_FFI_INVALID_ENUM, DEREC_CODE_FFI_NULL_PTR,
+    DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_INVALID_ENUM, DEREC_CODE_FFI_NULL_PTR, DeRecError,
+    ffi_error, from_lib_error, success,
 };
 use crate::types::ChannelId;
 
@@ -103,7 +103,10 @@ pub unsafe extern "C" fn derec_protocol_verify_fingerprint(
     out_matched: *mut u32,
 ) -> DeRecError {
     if handle.is_null() || fingerprint_ptr.is_null() || out_matched.is_null() {
-        return ffi_error(DEREC_CODE_FFI_NULL_PTR, "null pointer in verify_fingerprint");
+        return ffi_error(
+            DEREC_CODE_FFI_NULL_PTR,
+            "null pointer in verify_fingerprint",
+        );
     }
     // Fail-closed: zero the output BEFORE any fallible work so every
     // error path below leaves the caller's slot at `0`. The success

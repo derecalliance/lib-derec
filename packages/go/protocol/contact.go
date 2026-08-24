@@ -31,6 +31,14 @@ const (
 	// generates key material on the fly when the corresponding
 	// PrePairRequest arrives; trust rests entirely on the out-of-band
 	// delivery channel being fully trusted.
+	//
+	// Because nothing binds the published keys to the contact, the channel
+	// is held at ChannelStatusPending until VerifyFingerprint succeeds on
+	// both sides: it is not a publish target, not a recovery source, and
+	// inbound messages on it are ignored. A man-in-the-middle on the
+	// plaintext PrePair leg leaves the two sides with different shared keys
+	// and so different fingerprints, which is what the comparison catches —
+	// the role the binding hash plays for ContactModeHashedKeys.
 	ContactModeNoKeys ContactMode = 2
 )
 

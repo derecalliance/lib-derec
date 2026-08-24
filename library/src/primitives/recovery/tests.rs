@@ -16,8 +16,7 @@ use crate::{
             response::{
                 ExtractResult as ExtractGetShareResponseResult,
                 ProduceResult as ProduceGetShareResponseMessageResult,
-                RecoverResult as RecoverFromResponsesResult,
-                extract as extract_get_share_response,
+                RecoverResult as RecoverFromResponsesResult, extract as extract_get_share_response,
                 produce as produce_get_share_response_message,
                 recover as recover_from_share_responses,
             },
@@ -74,6 +73,7 @@ fn create_response_envelope(
         timestamp: Some(timestamp),
         secret_id: 0,
         version: 0,
+        replica_id: None,
     };
 
     DeRecMessageBuilder::channel()
@@ -106,6 +106,7 @@ fn create_response_envelope_with_mismatched_timestamp(
         timestamp: Some(message_timestamp),
         secret_id: 0,
         version: 0,
+        replica_id: None,
     };
 
     DeRecMessageBuilder::channel()
@@ -449,6 +450,7 @@ fn test_produce_get_share_response_message_request_timestamp_mismatch() {
         version,
         timestamp: Some(message_timestamp),
         reply_to: None,
+        replica_id: None,
     };
 
     let tampered_request_envelope = DeRecMessageBuilder::channel()
@@ -551,8 +553,14 @@ fn test_produce_get_share_response_message_secret_id_mismatch() {
 
     let ProduceGetShareRequestMessageResult {
         envelope: request_envelope,
-    } = produce_get_share_request_message(channel_id, requested_secret_id, version, &shared_key, None)
-        .expect("request generation should succeed");
+    } = produce_get_share_request_message(
+        channel_id,
+        requested_secret_id,
+        version,
+        &shared_key,
+        None,
+    )
+    .expect("request generation should succeed");
 
     let ExtractGetShareRequestResult { request } =
         extract_get_share_request(&request_envelope, &shared_key)
@@ -591,8 +599,14 @@ fn test_produce_get_share_response_message_version_mismatch() {
 
     let ProduceGetShareRequestMessageResult {
         envelope: request_envelope,
-    } = produce_get_share_request_message(channel_id, secret_id, requested_version, &shared_key, None)
-        .expect("request generation should succeed");
+    } = produce_get_share_request_message(
+        channel_id,
+        secret_id,
+        requested_version,
+        &shared_key,
+        None,
+    )
+    .expect("request generation should succeed");
 
     let ExtractGetShareRequestResult { request } =
         extract_get_share_request(&request_envelope, &shared_key)
@@ -660,7 +674,7 @@ fn test_recovery_end_to_end() {
             timestamp: Some(timestamp),
             secret_id,
             reply_to: None,
-        replica_id: None,
+            replica_id: None,
         };
         let stored_share_envelope = DeRecMessageBuilder::channel()
             .channel_id(*channel_id)
@@ -719,14 +733,9 @@ fn test_extract_get_share_request_rejects_scheme_mismatched_reply_to() {
         protocol: derec_proto::Protocol::Https as i32,
     };
 
-    let ProduceGetShareRequestMessageResult { envelope } = produce_get_share_request_message(
-        channel_id,
-        1,
-        1,
-        &shared_key,
-        Some(malicious_reply_to),
-    )
-    .expect("failed to produce get share request");
+    let ProduceGetShareRequestMessageResult { envelope } =
+        produce_get_share_request_message(channel_id, 1, 1, &shared_key, Some(malicious_reply_to))
+            .expect("failed to produce get share request");
 
     let result = extract_get_share_request(&envelope, &shared_key);
 

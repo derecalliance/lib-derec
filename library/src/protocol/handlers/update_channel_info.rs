@@ -134,39 +134,6 @@ pub(in crate::protocol) async fn start<
     Ok(events)
 }
 
-/// Build and send one `UpdateChannelInfoRequest`; failure isolated so
-/// [`start`] can surface it as a per-channel
-/// `UpdateChannelInfoFailed` event.
-#[allow(clippy::too_many_arguments)]
-async fn dispatch_one<Ch: DeRecChannelStore, T: DeRecTransport>(
-    channel_store: &mut Ch,
-    transport: &T,
-    secret_id: u64,
-    channel_id: ChannelId,
-    shared_key: &SharedKey,
-    comm_info_proto: Option<CommunicationInfo>,
-    transport_protocol: Option<TransportProtocol>,
-) -> Result<()> {
-    let timestamp = current_timestamp();
-    let request = UpdateChannelInfoRequestMessage {
-        communication_info: comm_info_proto,
-        transport_protocol,
-        timestamp: Some(timestamp),
-    };
-    let envelope = DeRecMessageBuilder::channel()
-        .channel_id(channel_id)
-        .timestamp(timestamp)
-        .message_body(MessageBody::UpdateChannelInfoRequest(request))
-        .auto_trace_id()
-        .encrypt(shared_key)?
-        .build()?
-        .encode_to_vec();
-
-    let endpoint = peer_endpoint(channel_store, secret_id, channel_id).await?;
-    transport.send(&endpoint, envelope).await?;
-    Ok(())
-}
-
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
@@ -180,10 +147,11 @@ pub(in crate::protocol) async fn accept<Ch: DeRecChannelStore, T: DeRecTransport
     shared_key: &SharedKey,
     trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
-    // Apply the update to the stored channel first, so the response we send
-    // below is routed to the (possibly updated) transport endpoint.
-    let mut channel = channel_store
-        .load(secret_id, channel_id)
+    let channel = channel_store
+        .load(
+            secret_id,
+            crate::protocol::types::ChannelQuery::Helper { channel_id },
+        )
         .await?
         .ok_or(Error::InvalidInput(
             "channel id not present in channel store",
@@ -194,19 +162,40 @@ pub(in crate::protocol) async fn accept<Ch: DeRecChannelStore, T: DeRecTransport
     #[cfg(feature = "logging")]
     let transport_protocol_updated = request.transport_protocol.is_some();
 
-    if let Some(ci) = request.communication_info.as_ref() {
-        channel.communication_info = extract_communication_info(ci);
-    }
-    if let Some(tp) = request.transport_protocol.clone() {
-        // Reject peer-supplied endpoints that don't pass library
-        // structural rules (scheme/protocol mismatch, unknown enum
-        // discriminant, oversized URI, control characters). Without
-        // this, a paired peer could persistently redirect channel
-        // traffic to a plaintext or attacker-controlled URI via a
-        // single `UpdateChannelInfo` request.
-        let _ = crate::transport::TransportProtocol::try_from(&tp)?;
-        channel.transport = tp;
-    }
+    let new_info = request
+        .communication_info
+        .as_ref()
+        .map(extract_communication_info);
+    let new_transport = match request.transport_protocol.clone() {
+        Some(tp) => {
+            let _ = crate::transport::TransportProtocol::try_from(&tp)?;
+            Some(tp)
+        }
+        None => None,
+    };
+
+    // Either record kind can carry an endpoint change; the fields live on the
+    // variants rather than the enum.
+    let channel = match channel {
+        crate::protocol::types::ChannelRecord::Helper(mut h) => {
+            if let Some(ci) = new_info {
+                h.communication_info = ci;
+            }
+            if let Some(tp) = new_transport {
+                h.transport = tp;
+            }
+            crate::protocol::types::ChannelRecord::Helper(h)
+        }
+        crate::protocol::types::ChannelRecord::Replica(mut r) => {
+            if let Some(ci) = new_info {
+                r.communication_info = ci;
+            }
+            if let Some(tp) = new_transport {
+                r.transport = tp;
+            }
+            crate::protocol::types::ChannelRecord::Replica(r)
+        }
+    };
 
     channel_store.save(secret_id, channel).await?;
 
@@ -298,6 +287,9 @@ fn on_request(
         return Err(EMPTY_UPDATE_ERROR);
     }
 
+    // Structure only. Whether the announced endpoint's *scheme* is
+    // acceptable was settled by `TransportPolicy` in `handlers::handle`,
+    // where every peer-supplied endpoint is checked in one place.
     if let Some(tp) = request.transport_protocol.as_ref() {
         tp.validate()?;
     }
@@ -375,6 +367,36 @@ fn extract_communication_info(info: &CommunicationInfo) -> HashMap<String, Strin
             }
         })
         .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_one<Ch: DeRecChannelStore, T: DeRecTransport>(
+    channel_store: &mut Ch,
+    transport: &T,
+    secret_id: u64,
+    channel_id: ChannelId,
+    shared_key: &SharedKey,
+    comm_info_proto: Option<CommunicationInfo>,
+    transport_protocol: Option<TransportProtocol>,
+) -> Result<()> {
+    let timestamp = current_timestamp();
+    let request = UpdateChannelInfoRequestMessage {
+        communication_info: comm_info_proto,
+        transport_protocol,
+        timestamp: Some(timestamp),
+    };
+    let envelope = DeRecMessageBuilder::channel()
+        .channel_id(channel_id)
+        .timestamp(timestamp)
+        .message_body(MessageBody::UpdateChannelInfoRequest(request))
+        .auto_trace_id()
+        .encrypt(shared_key)?
+        .build()?
+        .encode_to_vec();
+
+    let endpoint = peer_endpoint(channel_store, secret_id, channel_id).await?;
+    transport.send(&endpoint, envelope).await?;
+    Ok(())
 }
 
 #[cfg(test)]

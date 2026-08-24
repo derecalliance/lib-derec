@@ -8,9 +8,9 @@ const DeRecProtocolBuilder = wasm.DeRecProtocolBuilder;
 
 const SenderKind = Object.freeze({ Owner: 0, Helper: 1, ReplicaSource: 3, ReplicaDestination: 4 });
 
-const ContactMode = Object.freeze({ InlineKeys: 0, HashedKeys: 1 });
+const ContactMode = Object.freeze({ InlineKeys: 0, HashedKeys: 1, NoKeys: 2 });
 
-const FlowKind = Object.freeze({ Pairing: 0, Discovery: 1, ProtectSecret: 2, VerifyShares: 3, RecoverSecret: 4, Unpair: 5, UpdateChannelInfo: 6 });
+const FlowKind = Object.freeze({ Pairing: 0, Discovery: 1, ProtectSecret: 2, VerifyShares: 3, RecoverSecret: 4, Unpair: 5, UpdateChannelInfo: 6, SyncCheck: 7, RemoveReplica: 8 });
 
 const primitives = {
   discovery: {

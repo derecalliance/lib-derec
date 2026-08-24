@@ -94,12 +94,10 @@ impl DeRecSecretStore for SqliteSecretStore {
             }
         }
         if missing_policy == MissingPolicy::Fail && !missing.is_empty() {
-            return Box::pin(std::future::ready(Err(
-                SecretStoreError::MissingEntries {
-                    kind,
-                    channel_ids: missing,
-                },
-            )));
+            return Box::pin(std::future::ready(Err(SecretStoreError::MissingEntries {
+                kind,
+                channel_ids: missing,
+            })));
         }
         Box::pin(std::future::ready(Ok(result)))
     }

@@ -20,12 +20,13 @@
 //! 2. **No control characters** — bytes `< 0x20` or `= 0x7F` are
 //!    rejected (NUL, embedded newlines, terminal escape codes).
 //! 3. **Scheme matches the protocol** — `Protocol::Https` ⇒ the URI
-//!    must start with `https://`. When the opt-in `unsafe-http` Cargo
-//!    feature is enabled, plaintext `http://` is *also* accepted as a
-//!    development convenience and emits a WARN through `tracing`
-//!    (when the `logging` feature is enabled) so the insecure scheme
-//!    is visible in logs. Other schemes (`ws://`, `file://`, …) are
-//!    always rejected.
+//!    must start with `https://` or `http://`. Other schemes
+//!    (`ws://`, `file://`, …) are always rejected.
+//!
+//! Whether plaintext `http://` is *acceptable* is a separate question,
+//! answered by [`TransportPolicy`] rather than here: it depends on how
+//! the application is deployed, which a validator with no configuration
+//! cannot know.
 //! 4. **Non-empty URI** — `EmptyUri` is the explicit error.
 //!
 //! Unknown `protocol` discriminants are caught at the *conversion*
@@ -54,21 +55,18 @@ pub const MAX_TRANSPORT_URI_LEN: usize = 2048;
 /// or directly with [`TransportProtocol::new`] when you already have
 /// a typed [`Protocol`] in hand.
 ///
-/// ## Plaintext `http://` is gated behind `unsafe-http` (development only)
+/// ## Plaintext `http://`
 ///
-/// By default, [`TransportProtocol::validate`] only accepts
-/// `https://` URIs for [`Protocol::Https`]. The opt-in `unsafe-http`
-/// Cargo feature loosens this so a `http://` URI is also accepted —
-/// useful for local development and integration testing where TLS is
-/// inconvenient. Whenever a plaintext URI is accepted, the library
-/// emits a `tracing::warn!` (under the `logging` feature) so the
-/// insecure scheme is surfaced in operator logs.
+/// [`validate`](Self::validate) accepts both http-family schemes,
+/// because both are structurally consistent with [`Protocol::Https`].
+/// Whether plaintext may actually be *used* is decided by
+/// [`TransportPolicy`], configured through
+/// [`with_unsafe_http`](crate::protocol::DeRecProtocolBuilder::with_unsafe_http).
 ///
-/// The feature flag is intentionally pejorative: enabling it also
-/// lets a peer-supplied `reply_to` downgrade the reply path to
-/// plaintext, since [`validate`](Self::validate) is the same gate
-/// used at the peer-extract boundary. Production builds MUST leave
-/// `unsafe-http` off.
+/// This was a Cargo feature until it became clear that a compile-time
+/// switch is unreachable for the four SDKs that install a prebuilt
+/// binary from a package manager — a .NET or Node developer has no
+/// compilation step in which to enable it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(
     any(feature = "serde", target_arch = "wasm32"),
@@ -113,8 +111,21 @@ impl TransportProtocol {
         }
     }
 
-    /// Validate the endpoint's structural soundness + scheme/protocol
-    /// consistency. See the module docs for the rules.
+    /// Validate the endpoint's **structure**: non-empty, within the length
+    /// cap, no control characters, and a scheme consistent with the declared
+    /// [`Protocol`] discriminant.
+    ///
+    /// # This does not decide `http` versus `https`
+    ///
+    /// Both are structurally consistent with [`Protocol::Https`], so both pass
+    /// here. Whether plaintext is *acceptable* is deployment policy, and a
+    /// function with no configuration cannot answer it — see
+    /// [`TransportPolicy`], which the orchestrator applies at every point a
+    /// transport endpoint enters it.
+    ///
+    /// A caller reaching past [`crate::protocol::DeRecProtocol`] to the
+    /// primitives owns that decision itself: run
+    /// [`TransportPolicy::check_peer`] on any endpoint decoded from a peer.
     pub fn validate(&self) -> Result<(), TransportValidationError> {
         if self.uri.is_empty() {
             return Err(TransportValidationError::EmptyUri);
@@ -130,23 +141,10 @@ impl TransportProtocol {
         }
         match self.protocol {
             Protocol::Https => {
-                if self.uri.starts_with("https://") {
-                    // canonical, secure scheme — nothing to flag
-                } else if cfg!(feature = "unsafe-http")
-                    && self.uri.starts_with("http://")
-                {
-                    // Plaintext is accepted only when the opt-in
-                    // `unsafe-http` Cargo feature is set; flag it
-                    // loudly so an operator running with logs
-                    // enabled notices the insecure scheme.
-                    #[cfg(all(feature = "unsafe-http", feature = "logging"))]
-                    tracing::warn!(
-                        uri = %self.uri,
-                        "accepting plaintext http:// transport URI — \
-                         confidentiality and authenticity are NOT provided \
-                         by the transport layer; use https:// in production",
-                    );
-                } else {
+                // Both http-family schemes are structurally consistent with
+                // this discriminant. Choosing between them is
+                // `TransportPolicy`'s job, not this function's.
+                if !self.uri.starts_with("https://") && !self.uri.starts_with("http://") {
                     return Err(TransportValidationError::SchemeMismatch {
                         expected: "https://",
                         protocol: self.protocol,
@@ -354,6 +352,18 @@ pub enum TransportValidationError {
         expected: &'static str,
         protocol: Protocol,
     },
+
+    /// Structurally fine, but plaintext where policy does not allow it.
+    /// Distinct from [`Self::SchemeMismatch`] so an application can tell
+    /// "this endpoint is malformed" from "this endpoint is plaintext and you
+    /// have not opted in" — the second is fixed by configuration, the first
+    /// is not.
+    #[error(
+        "plaintext http:// transport endpoint refused ({uri}) — {reason}. \
+         Enable `unsafe_http` on the protocol builder to accept plaintext \
+         during development; never enable it in production"
+    )]
+    PlaintextRefused { uri: String, reason: &'static str },
 }
 
 #[cfg(test)]
@@ -374,27 +384,24 @@ mod tests {
         assert_eq!(tp.protocol, Protocol::Https);
     }
 
-    #[cfg(feature = "unsafe-http")]
+    /// `TryFrom<&str>` is structural, so it accepts `http://` — deciding
+    /// whether plaintext is *acceptable* moved to [`TransportPolicy`], which
+    /// the builder applies once both the endpoint and the setting are known.
+    /// Parsing a string cannot see configuration, which is exactly why the
+    /// rule used to need a Cargo feature.
     #[test]
-    fn try_from_str_accepts_plaintext_http_when_unsafe_http_enabled() {
-        // With the opt-in `unsafe-http` feature on, `http://` is
-        // accepted; the library emits a `tracing::warn!` (under the
-        // `logging` feature) so the insecure scheme is visible in logs.
+    fn try_from_str_is_structural_and_accepts_plaintext() {
         let tp = TransportProtocol::try_from("http://owner.example.com").unwrap();
         assert_eq!(tp.protocol, Protocol::Https);
-    }
 
-    #[cfg(not(feature = "unsafe-http"))]
-    #[test]
-    fn try_from_str_rejects_plaintext_http_by_default() {
-        // Without the `unsafe-http` feature, `http://` is treated the
-        // same as any other unsupported scheme.
+        // The refusal lives in the policy, not the parse.
+        let proto = derec_proto::TransportProtocol {
+            uri: tp.uri.clone(),
+            protocol: tp.protocol as i32,
+        };
         assert!(matches!(
-            TransportProtocol::try_from("http://owner.example.com"),
-            Err(TransportValidationError::SchemeMismatch {
-                expected: "https://",
-                protocol: Protocol::Https,
-            })
+            TransportPolicy::new(false).check_own(&proto),
+            Err(TransportValidationError::PlaintextRefused { .. })
         ));
     }
 
@@ -512,5 +519,305 @@ mod tests {
             IntoOwnTransport::into_own_transport("ws://owner.example.com"),
             Err(TransportValidationError::SchemeMismatch { .. })
         ));
+    }
+}
+
+/// Decides whether a transport endpoint's **scheme** is acceptable.
+///
+/// [`TransportProtocol::validate`] answers "is this endpoint well-formed";
+/// this answers "may we use it", which depends on how the application is
+/// deployed and so cannot live in a function without configuration. Every
+/// place an endpoint enters
+/// [`DeRecProtocol`](crate::protocol::DeRecProtocol) consults one of these
+/// rather than repeating the rule, so the policy has exactly one definition.
+///
+/// # Scope — this is a guardrail, not an enforcement boundary
+///
+/// The SDK never opens a socket. Transport is the consuming application's
+/// concern ([`DeRecTransport`](crate::protocol::DeRecTransport)), so nothing
+/// here can stop an application sending plaintext. What it *can* do is refuse
+/// to record a plaintext endpoint, refuse to propagate one to peers during
+/// pairing, and refuse to hand one back as a reply address. Treat it as a
+/// consistency check on the endpoints the protocol carries, not as transport
+/// security.
+///
+/// # The rule
+///
+/// | Endpoint | `https` | plaintext loopback | plaintext, any other host |
+/// |---|---|---|---|
+/// | [`check_own`](Self::check_own) — this device's own | always | **always**, with a warning | needs `unsafe_http` |
+/// | [`check_peer`](Self::check_peer) — supplied by a peer | always | needs `unsafe_http` | needs `unsafe_http` |
+///
+/// Loopback is free for an own endpoint because it names a service on this
+/// machine: the bytes never reach a network, so there is nothing for TLS to
+/// protect. It is **not** free for a peer-supplied endpoint, because there
+/// the loopback address is chosen by somebody else and names a service on
+/// *your* machine — a peer should not be able to nominate your localhost as
+/// a reply address without you having opted into plaintext at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct TransportPolicy {
+    /// Mirrors
+    /// [`DeRecProtocolBuilder::with_unsafe_http`](crate::protocol::DeRecProtocolBuilder::with_unsafe_http).
+    allow_plaintext: bool,
+}
+
+impl TransportPolicy {
+    /// Build a policy. `allow_plaintext` is the application's `unsafe_http`
+    /// setting; `false` is the production posture.
+    pub fn new(allow_plaintext: bool) -> Self {
+        Self { allow_plaintext }
+    }
+
+    /// `true` when plaintext has been opted into for every host.
+    pub fn allows_plaintext(&self) -> bool {
+        self.allow_plaintext
+    }
+
+    /// Check an endpoint **this device configured for itself** — the value
+    /// passed to
+    /// [`with_own_transport`](crate::protocol::DeRecProtocolBuilder::with_own_transport),
+    /// and the `reply_to` this device stamps on its own outbound requests.
+    ///
+    /// Plaintext loopback is accepted whatever the setting, so local
+    /// development needs no configuration at all.
+    pub fn check_own(
+        &self,
+        endpoint: &derec_proto::TransportProtocol,
+    ) -> Result<(), TransportValidationError> {
+        self.check(endpoint, true)
+    }
+
+    /// Check an endpoint **a peer supplied** — a contact's
+    /// `transport_protocol`, an `UpdateChannelInfo` announcement, or a
+    /// request's `reply_to`.
+    ///
+    /// Plaintext always requires `unsafe_http`, loopback included.
+    pub fn check_peer(
+        &self,
+        endpoint: &derec_proto::TransportProtocol,
+    ) -> Result<(), TransportValidationError> {
+        self.check(endpoint, false)
+    }
+
+    fn check(
+        &self,
+        endpoint: &derec_proto::TransportProtocol,
+        loopback_is_free: bool,
+    ) -> Result<(), TransportValidationError> {
+        TransportProtocolExt::validate(endpoint)?;
+
+        if !endpoint.uri.starts_with("http://") {
+            return Ok(());
+        }
+        if self.allow_plaintext {
+            #[cfg(feature = "logging")]
+            tracing::warn!(
+                uri = %endpoint.uri,
+                "accepting plaintext http:// transport endpoint — `unsafe_http` is \
+                 enabled, so confidentiality and authenticity are NOT provided by \
+                 the transport layer; never enable this in production",
+            );
+            return Ok(());
+        }
+        if loopback_is_free && is_loopback_uri(&endpoint.uri) {
+            #[cfg(feature = "logging")]
+            tracing::warn!(
+                uri = %endpoint.uri,
+                "accepting plaintext http:// on a loopback endpoint — this is \
+                 development mode; a deployed peer cannot reach it",
+            );
+            return Ok(());
+        }
+        Err(TransportValidationError::PlaintextRefused {
+            uri: endpoint.uri.clone(),
+            reason: if loopback_is_free {
+                "only loopback endpoints may be plaintext by default"
+            } else {
+                "a peer-supplied endpoint may never be plaintext by default"
+            },
+        })
+    }
+}
+
+/// Whether an `http://` URI names this machine.
+///
+/// Deliberately literal: the host must be `localhost`, `127.0.0.1` or `::1`
+/// exactly. No DNS resolution and no wider private-range classification —
+/// both would need real URI parsing, and getting *that* wrong in a security
+/// check is how `http://127.0.0.1@evil.com/` slips through. A closed set of
+/// literals plus an explicit userinfo refusal cannot be spoofed that way, and
+/// the wider case is what `unsafe_http` is for.
+fn is_loopback_uri(uri: &str) -> bool {
+    const LOOPBACK_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
+
+    let Some(rest) = uri.strip_prefix("http://") else {
+        return false;
+    };
+    // Authority is everything before the first `/`, `?` or `#`.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+
+    // Any userinfo means the host is not what a naive reader sees
+    // (`http://127.0.0.1@evil.com/` resolves to `evil.com`). Refuse outright
+    // rather than try to be clever about it.
+    if authority.contains('@') {
+        return false;
+    }
+
+    // IPv6 literals are bracketed, and their colons are not port separators.
+    let host = if let Some(after_bracket) = authority.strip_prefix('[') {
+        match after_bracket.split_once(']') {
+            // Only a port may follow the bracket.
+            Some((inner, tail)) if tail.is_empty() || tail.starts_with(':') => inner,
+            _ => return false,
+        }
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    };
+
+    LOOPBACK_HOSTS.contains(&host)
+}
+
+#[cfg(test)]
+mod transport_policy_tests {
+    use super::*;
+
+    fn ep(uri: &str) -> derec_proto::TransportProtocol {
+        derec_proto::TransportProtocol {
+            uri: uri.to_owned(),
+            protocol: Protocol::Https as i32,
+        }
+    }
+
+    const STRICT: TransportPolicy = TransportPolicy {
+        allow_plaintext: false,
+    };
+    const UNSAFE: TransportPolicy = TransportPolicy {
+        allow_plaintext: true,
+    };
+
+    /// Every spelling of "this machine" that the loopback allowance covers,
+    /// with and without ports and paths.
+    #[test]
+    fn loopback_forms_are_recognised() {
+        for uri in [
+            "http://localhost",
+            "http://localhost/",
+            "http://localhost:8080",
+            "http://localhost:8080/derec",
+            "http://127.0.0.1",
+            "http://127.0.0.1:3000/x?y=1",
+            "http://[::1]",
+            "http://[::1]:8080/path",
+        ] {
+            assert!(is_loopback_uri(uri), "{uri} should be loopback");
+        }
+    }
+
+    /// The spoofs. Each of these *contains* a loopback literal but does not
+    /// resolve to this machine — the userinfo trick is the classic one.
+    #[test]
+    fn loopback_lookalikes_are_rejected() {
+        for uri in [
+            "http://127.0.0.1@evil.com/",
+            "http://localhost@evil.com/",
+            "http://localhost:pw@evil.com/",
+            "http://[::1]@evil.com/",
+            "http://127.0.0.1.evil.com/",
+            "http://notlocalhost/",
+            "http://localhost.evil.com/",
+            "http://127.0.0.2/",
+            "http://10.0.0.1/",
+            "http://192.168.1.42:8080/",
+            // A bracketed authority that is not a well-formed IPv6 literal.
+            "http://[::1/",
+            "http://[::1]x/",
+            "https://localhost",
+        ] {
+            assert!(!is_loopback_uri(uri), "{uri} must not count as loopback");
+        }
+    }
+
+    /// `https` needs no permission from anyone, on either path.
+    #[test]
+    fn https_is_always_accepted() {
+        for policy in [STRICT, UNSAFE] {
+            assert!(policy.check_own(&ep("https://owner.example.com")).is_ok());
+            assert!(policy.check_peer(&ep("https://helper.example.com")).is_ok());
+        }
+    }
+
+    /// The default posture: an own loopback endpoint works with no
+    /// configuration, which is what makes local development frictionless.
+    #[test]
+    fn own_loopback_plaintext_is_free() {
+        assert!(STRICT.check_own(&ep("http://localhost:8080")).is_ok());
+        assert!(STRICT.check_own(&ep("http://127.0.0.1:8080")).is_ok());
+    }
+
+    /// The asymmetry that matters. A peer must not be able to nominate this
+    /// machine's loopback as a reply address while plaintext is switched off.
+    #[test]
+    fn peer_loopback_plaintext_is_refused_by_default() {
+        let err = STRICT
+            .check_peer(&ep("http://127.0.0.1:9999"))
+            .expect_err("a peer-supplied loopback endpoint must be refused");
+        assert!(matches!(
+            err,
+            TransportValidationError::PlaintextRefused { .. }
+        ));
+    }
+
+    /// Own endpoints get loopback for free, but nothing wider.
+    #[test]
+    fn own_non_loopback_plaintext_is_refused_by_default() {
+        for uri in ["http://192.168.1.42:8080", "http://helper.example.com"] {
+            assert!(
+                matches!(
+                    STRICT.check_own(&ep(uri)),
+                    Err(TransportValidationError::PlaintextRefused { .. })
+                ),
+                "{uri} must be refused without unsafe_http"
+            );
+        }
+    }
+
+    /// With the opt-in, both paths accept plaintext anywhere — including the
+    /// LAN case the flag exists for, and including public hosts, which is
+    /// why the setting is named the way it is.
+    #[test]
+    fn unsafe_http_opens_both_paths_everywhere() {
+        for uri in [
+            "http://localhost:8080",
+            "http://192.168.1.42:8080",
+            "http://10.0.0.7:8080",
+            "http://helper.example.com",
+        ] {
+            assert!(UNSAFE.check_own(&ep(uri)).is_ok(), "own {uri}");
+            assert!(UNSAFE.check_peer(&ep(uri)).is_ok(), "peer {uri}");
+        }
+    }
+
+    /// Policy runs *after* structure, so a malformed endpoint reports as
+    /// malformed rather than as a plaintext refusal — the two are fixed
+    /// differently.
+    #[test]
+    fn structural_failures_are_reported_as_such() {
+        assert!(matches!(
+            UNSAFE.check_own(&ep("")),
+            Err(TransportValidationError::EmptyUri)
+        ));
+        assert!(matches!(
+            UNSAFE.check_own(&ep("ftp://host/")),
+            Err(TransportValidationError::SchemeMismatch { .. })
+        ));
+    }
+
+    /// `validate` itself no longer takes a view on plaintext — that moved to
+    /// the policy. Both http-family schemes are structurally sound.
+    #[test]
+    fn validate_is_structural_only() {
+        assert!(TransportProtocolExt::validate(&ep("http://anything.example.com")).is_ok());
+        assert!(TransportProtocolExt::validate(&ep("https://anything.example.com")).is_ok());
     }
 }

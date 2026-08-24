@@ -13,16 +13,21 @@
 //! can write `use derec_library::protocol::Channel;` rather than
 //! `use derec_library::protocol::types::Channel;`.
 
-use crate::types::ChannelId;
+use crate::types::{ChannelId, ReplicaId};
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::ContactMessage;
 #[cfg(any(feature = "serde", target_arch = "wasm32"))]
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use zeroize::Zeroizing;
 
 pub mod secret;
+#[cfg(any(feature = "serde", target_arch = "wasm32"))]
+pub mod state_record;
 
 pub use secret::{HelperInfo, ReplicaInfo, Replicas, Secret, UserSecret};
+#[cfg(any(feature = "serde", target_arch = "wasm32"))]
+pub use state_record::{StateItemRecord, StateKeyRecord, SyncCheckReport};
 
 /// Selects which channels to target for a discovery request.
 #[derive(Debug, Clone)]
@@ -37,83 +42,375 @@ pub enum Target {
 
 /// Status of a channel in the protocol lifecycle.
 ///
-/// Replica channels start as `Pending` after pairing completes and transition
-/// to `Paired` once fingerprint verification succeeds. Helper/Owner channels
-/// are `Paired` immediately after pairing.
+/// A channel starts as `Pending` after pairing completes and transitions to
+/// `Paired` once fingerprint verification succeeds. Two cases take that path:
+///
+/// - **Replica channels**, always. Admitting a second device to the group is
+///   a human decision.
+/// - **[`derec_proto::ContactMode::NoKeys`] channels**, whatever the kind.
+///   That mode inlines neither the keys nor a commitment to them, so nothing
+///   binds what the scanner received over the plaintext `PrePair` leg to the
+///   contact delivered out of band. The fingerprint, derived from the
+///   established shared key, is the only check that detects a substituted
+///   key — it is to `NoKeys` what `contact_binding_hash` is to
+///   [`derec_proto::ContactMode::HashedKeys`].
+///
+/// Helper/Owner channels paired over
+/// [`derec_proto::ContactMode::InlineKeys`] or
+/// [`derec_proto::ContactMode::HashedKeys`] are `Paired` immediately: the
+/// contact carried the keys, or a commitment already verified against them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[cfg_attr(
     any(feature = "serde", target_arch = "wasm32"),
     derive(Serialize, Deserialize)
 )]
 pub enum ChannelStatus {
-    /// Channel is awaiting fingerprint verification (replica only).
+    /// Channel is awaiting out-of-band fingerprint confirmation: every
+    /// replica pairing, and every
+    /// [`derec_proto::ContactMode::NoKeys`] pairing. Not a publish target,
+    /// not a recovery source, and inbound messages on it are ignored.
     Pending,
     /// Channel is fully paired and ready for protocol messages.
     #[default]
     Paired,
+    /// Replica member only: told to leave, awaiting the version that
+    /// completes its removal. Never set on a helper channel.
+    Unpairing,
 }
 
-/// A channel — the post-pairing representation of a peer.
+/// Policy governing automatic removal of expired `Pending` channels.
 ///
-/// Stored by [`crate::protocol::DeRecChannelStore`] and returned by its
-/// `channels()` method.
+/// [`crate::protocol::DeRecProtocol::process`] consults this on every
+/// call. It does not affect
+/// [`crate::protocol::DeRecProtocol::remove_expired_channels`], which
+/// always sweeps at the threshold it is given — that is what makes
+/// [`Self::Disabled`] mean "the application drives cleanup itself"
+/// rather than "cleanup never happens".
 ///
-/// `Serialize` / `Deserialize` are derived for the FFI and WASM bridges,
-/// which ship channels to host languages as JSON over the language
-/// boundary. Library consumers writing a Rust `DeRecChannelStore` see
-/// only the typed value and never observe the serde representation;
-/// the wire format is not part of the public API and may change
-/// independently. `#[serde(default)]` annotations let bridges decode
-/// legacy bytes that predate later-added fields without erroring.
+/// Configured via
+/// [`crate::protocol::types::Timeouts::expired_channels`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    any(feature = "serde", target_arch = "wasm32"),
+    derive(Serialize, Deserialize)
+)]
+pub enum ExpiredChannelCleanup {
+    /// No automatic sweep during `process()`. The application drives
+    /// cleanup itself via
+    /// [`crate::protocol::DeRecProtocol::remove_expired_channels`].
+    Disabled,
+    /// `process()` removes `Pending` channels older than this.
+    Enabled { timeout_in_secs: u64 },
+}
+
+impl Default for ExpiredChannelCleanup {
+    fn default() -> Self {
+        Self::Enabled {
+            timeout_in_secs: 300,
+        }
+    }
+}
+
+/// How long the protocol waits on each thing it can be kept waiting by.
+///
+/// These were one knob until it became clear they answer different questions.
+/// [`inbound_message`](Self::inbound_message) is a **security** boundary — it
+/// bounds how stale a message may be and still be accepted, so it has to
+/// tolerate transport latency and clock skew. The other three are **liveness**
+/// budgets: how long to keep hoping a peer will answer before giving up on it.
+/// A value that suits one is wrong for the others, and collapsing them meant
+/// tightening the replay window every time someone wanted rounds to settle
+/// faster.
+///
+/// Unspecified fields keep their default:
+///
+/// ```
+/// use derec_library::protocol::types::Timeouts;
+/// use std::time::Duration;
+///
+/// let timeouts = Timeouts {
+///     sharing_round: Duration::from_secs(30),
+///     ..Default::default()
+/// };
+/// assert_eq!(timeouts.sharing_round, Duration::from_secs(30));
+/// assert_eq!(timeouts.inbound_message, Duration::from_secs(300));
+/// ```
+///
+/// # Granularity
+///
+/// **One second is the smallest effective unit.** Wire timestamps
+/// (protobuf `Timestamp.seconds`) carry whole seconds only, so ages can be
+/// measured no finer. Sub-second precision is truncated and any value below
+/// one second is clamped to one, so an accidental [`Duration::ZERO`] cannot
+/// silently disable a timeout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Timeouts {
+    /// Staleness boundary for **inbound envelopes**: any message whose
+    /// timestamp is older than this is discarded on receipt, whatever the
+    /// flow. This is the replay-defence window.
+    ///
+    /// Lower is not safer in any simple sense. The protocol is
+    /// transport-agnostic — a store-and-forward transport, a phone that was
+    /// offline, or a peer whose clock is a minute out all produce legitimately
+    /// old messages, and this value is what decides whether they are refused.
+    ///
+    /// Default: **300 seconds**.
+    pub inbound_message: Duration,
+    /// How long a publishing round waits for a peer that has not answered.
+    /// On expiry the silent helpers are failed, the silent members are
+    /// reported behind, and the round closes.
+    ///
+    /// This is what bounds how long
+    /// [`DeRecEvent::SharingComplete`](crate::protocol::events::DeRecEvent::SharingComplete)
+    /// can be delayed by one unreachable peer, so it is the one to shorten if
+    /// a stalled round should surface quickly.
+    ///
+    /// Default: **60 seconds**.
+    pub sharing_round: Duration,
+    /// How long to wait for a peer to acknowledge an unpair before dropping
+    /// the local channel state anyway. Expiry only discards local state; the
+    /// unpair itself was already sent.
+    ///
+    /// Default: **60 seconds**.
+    pub unpair_ack: Duration,
+    /// When to remove a channel still awaiting out-of-band fingerprint
+    /// confirmation — every replica pairing, and every
+    /// [`derec_proto::ContactMode::NoKeys`] pairing.
+    ///
+    /// Unlike the others this can be [`ExpiredChannelCleanup::Disabled`],
+    /// leaving the sweep to the application. The budget is a **human** one:
+    /// someone comparing a fingerprint out of band, possibly over the phone.
+    /// Shortening it below a minute or so will strand real pairings.
+    ///
+    /// Default: `Enabled { timeout_in_secs: 300 }`.
+    pub expired_channels: ExpiredChannelCleanup,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            inbound_message: Duration::from_secs(300),
+            sharing_round: Duration::from_secs(60),
+            unpair_ack: Duration::from_secs(60),
+            expired_channels: ExpiredChannelCleanup::default(),
+        }
+    }
+}
+
+impl ExpiredChannelCleanup {
+    /// Enable automatic cleanup with the given timeout.
+    ///
+    /// Performs no validation. A zero is clamped to one second by
+    /// [`crate::protocol::types::Timeouts::expired_channels`],
+    /// the single normalization point.
+    pub fn from_secs(secs: u64) -> Self {
+        Self::Enabled {
+            timeout_in_secs: secs,
+        }
+    }
+
+    /// Build a policy from the flat `(enabled, timeout_in_secs)` pair the
+    /// FFI and WASM layers carry. When `enabled` is `false` the timeout is
+    /// ignored and the result is [`Self::Disabled`].
+    ///
+    /// This is the marshalling seam for the SDKs: they forward both values
+    /// verbatim and this function decides what they mean, so the rule is
+    /// written and tested once rather than in every binding.
+    pub fn new(enabled: bool, timeout_in_secs: u64) -> Self {
+        if enabled {
+            Self::Enabled { timeout_in_secs }
+        } else {
+            Self::Disabled
+        }
+    }
+}
+
+/// Which side of a replica pairing a member holds for one secret.
+///
+/// Exactly one member of a group is the [`Source`](Self::Source). This is a
+/// property of *membership*, not of a channel: all members share one channel,
+/// so the channel cannot carry it.
+///
+/// The value is **absolute**: every member records the same role for a given
+/// peer, regardless of who is reading. One exception is bounded and
+/// self-correcting — between pairing and the first sync, a joiner holds the
+/// role its admitter presented (a device admitting a new member pairs as
+/// `ReplicaSource` whether or not it is the group's source). The first roster
+/// it hydrates overwrites that provisional value, after which the group again
+/// names exactly one source. Nothing acts on the roles in that window: the
+/// joiner cannot publish before it has a snapshot.
+///
+/// Serialization is unconditional rather than feature-gated: the role rides
+/// inside the recoverable secret (see [`crate::protocol::types::secret`]),
+/// which every build must encode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ReplicaRole {
+    /// Originated the secret. Exactly one member per group.
+    Source,
+    /// Holds a mirrored copy.
+    Destination,
+}
+
+impl ReplicaRole {
+    /// The role the peer holds, given this one.
+    pub fn counterparty(self) -> Self {
+        match self {
+            ReplicaRole::Source => ReplicaRole::Destination,
+            ReplicaRole::Destination => ReplicaRole::Source,
+        }
+    }
+
+    /// Map from the discriminant carried by [`ReplicaInfo::role`], or `None`
+    /// if it names no known role.
+    ///
+    /// [`ReplicaInfo::role`]: crate::protocol::types::ReplicaInfo::role
+    pub fn from_i32(value: i32) -> Option<Self> {
+        match value {
+            v if v == ReplicaRole::Source as i32 => Some(ReplicaRole::Source),
+            v if v == ReplicaRole::Destination as i32 => Some(ReplicaRole::Destination),
+            _ => None,
+        }
+    }
+
+    /// Map from the wire `SenderKind`, or `None` for non-replica kinds.
+    pub fn from_sender_kind(kind: derec_proto::SenderKind) -> Option<Self> {
+        match kind {
+            derec_proto::SenderKind::ReplicaSource => Some(ReplicaRole::Source),
+            derec_proto::SenderKind::ReplicaDestination => Some(ReplicaRole::Destination),
+            _ => None,
+        }
+    }
+
+    /// Map to the wire `SenderKind`.
+    pub fn to_sender_kind(self) -> derec_proto::SenderKind {
+        match self {
+            ReplicaRole::Source => derec_proto::SenderKind::ReplicaSource,
+            ReplicaRole::Destination => derec_proto::SenderKind::ReplicaDestination,
+        }
+    }
+}
+
+/// A channel to a single helper, or to the owner from a helper's side.
+///
+/// Keyed by `(secret_id, channel_id)`. Also the record written while an
+/// owner-helper pairing is still in flight — that flow is unchanged.
 #[derive(Clone, Debug)]
 #[cfg_attr(
     any(feature = "serde", target_arch = "wasm32"),
     derive(Serialize, Deserialize)
 )]
-pub struct Channel {
-    /// Unique identifier for this channel.
-    pub id: ChannelId,
-    /// The peer's transport endpoint.
+pub struct HelperChannel {
+    pub channel_id: ChannelId,
     pub transport: derec_proto::TransportProtocol,
-    /// Application-level identity metadata for the peer on this channel.
-    ///
-    /// Free-form key/value pairs — the protocol treats this as opaque and
-    /// never inspects keys or values. Anything an app wants to remember
-    /// about *who* is on the other end (display name, account id, avatar
-    /// URI, ...) lives here. App-level identity logic (e.g. auto-linking
-    /// by display name) reads from this map; the protocol does not.
-    ///
-    /// On the initiator side, this is whatever the caller supplied when
-    /// starting [`crate::protocol::DeRecFlow::Pairing`]. On the responder
-    /// side, it is the peer's own `communication_info` extracted from the
-    /// wire pair-request — the same map that surfaces in
-    /// [`crate::protocol::DeRecEvent::PairingCompleted::peer_communication_info`].
     #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
     pub communication_info: std::collections::HashMap<String, String>,
-    /// Lifecycle status. Messages on `Pending` channels are ignored.
+    /// The **peer's** role: `Owner` when this node is the helper, `Helper`
+    /// when this node is the owner.
+    pub peer_role: derec_proto::SenderKind,
     #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
     pub status: ChannelStatus,
-    /// Unix timestamp (seconds) when the channel was created.
     #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
     pub created_at: u64,
-    /// This node's role on this channel, fixed at pairing time.
-    ///
-    /// The orchestrator enforces flow directionality against this value: an
-    /// `Owner` may initiate `ProtectSecret` / `VerifyShares` / `Discovery` /
-    /// `RecoverSecret`; a `Helper` may not. Inbound messages are gated the
-    /// other way around — a `StoreShareRequest` is only honored on a channel
-    /// where this node is the `Helper`, and so on.
-    pub role: derec_proto::SenderKind,
-    /// The peer's replica identity, populated only when `role` is
-    /// `ReplicaSource` or `ReplicaDestination`.
-    ///
-    /// Extracted from the peer's `derec.replica_id` entry in
-    /// `CommunicationInfo` during the pair handshake. `None` on
-    /// Helper/Owner channels and as a defensive default on
-    /// freshly-paired Replica channels where the peer did not advertise
-    /// one.
+}
+
+/// One member of a replica group, including this device itself.
+///
+/// Keyed by `(secret_id, replica_id)`. Every member shares one `channel_id`,
+/// so the channel cannot be the key. Storing this device's own row is what
+/// makes the roster reconstructible from stores alone.
+///
+/// An initiating device writes its **own** row when it starts a replica
+/// pairing — it knows its identity and role then, and the peer's role is the
+/// counterpart. The peer's row follows once the response announces its id.
+#[derive(Clone, Debug)]
+#[cfg_attr(
+    any(feature = "serde", target_arch = "wasm32"),
+    derive(Serialize, Deserialize)
+)]
+pub struct ReplicaMember {
+    /// The group channel. Identical for every member.
+    pub channel_id: ChannelId,
+    /// This member's identity — the primary key within the group.
+    pub replica_id: ReplicaId,
+    pub transport: derec_proto::TransportProtocol,
     #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
-    pub replica_id: Option<u64>,
+    pub communication_info: std::collections::HashMap<String, String>,
+    pub role: ReplicaRole,
+    #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
+    pub status: ChannelStatus,
+    #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
+    pub created_at: u64,
+}
+
+/// Addresses a single record in [`crate::protocol::DeRecChannelStore`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChannelQuery {
+    Helper {
+        channel_id: ChannelId,
+    },
+    Replica {
+        channel_id: ChannelId,
+        replica_id: ReplicaId,
+    },
+}
+
+impl ChannelQuery {
+    pub fn channel_id(&self) -> ChannelId {
+        match self {
+            ChannelQuery::Helper { channel_id } => *channel_id,
+            ChannelQuery::Replica { channel_id, .. } => *channel_id,
+        }
+    }
+}
+
+/// A record returned by [`crate::protocol::DeRecChannelStore::load`].
+#[derive(Clone, Debug)]
+#[cfg_attr(
+    any(feature = "serde", target_arch = "wasm32"),
+    derive(Serialize, Deserialize)
+)]
+pub enum ChannelRecord {
+    Helper(HelperChannel),
+    Replica(ReplicaMember),
+}
+
+impl ChannelRecord {
+    pub fn channel_id(&self) -> ChannelId {
+        match self {
+            ChannelRecord::Helper(h) => h.channel_id,
+            ChannelRecord::Replica(r) => r.channel_id,
+        }
+    }
+    pub fn status(&self) -> ChannelStatus {
+        match self {
+            ChannelRecord::Helper(h) => h.status,
+            ChannelRecord::Replica(r) => r.status,
+        }
+    }
+    pub fn transport(&self) -> &derec_proto::TransportProtocol {
+        match self {
+            ChannelRecord::Helper(h) => &h.transport,
+            ChannelRecord::Replica(r) => &r.transport,
+        }
+    }
+    pub fn communication_info(&self) -> &std::collections::HashMap<String, String> {
+        match self {
+            ChannelRecord::Helper(h) => &h.communication_info,
+            ChannelRecord::Replica(r) => &r.communication_info,
+        }
+    }
+    pub fn as_helper(&self) -> Option<&HelperChannel> {
+        match self {
+            ChannelRecord::Helper(h) => Some(h),
+            _ => None,
+        }
+    }
+    pub fn as_replica(&self) -> Option<&ReplicaMember> {
+        match self {
+            ChannelRecord::Replica(r) => Some(r),
+            _ => None,
+        }
+    }
 }
 
 /// Snapshot of the user-facing secret contents persisted by
@@ -386,19 +683,28 @@ pub enum StateKind {
     /// Outstanding [`derec_proto::VerifyShareRequestMessage`], one per
     /// channel. Load-bearing for the replay-defence binding gate.
     PendingVerification,
-    /// Recovery accumulator, one per `(secret_id, version)`. Holds every
+    /// Recovery accumulator, one per `(recovered secret_id, version)`
+    /// within a partition. Holds every
     /// [`derec_proto::GetShareResponseMessage`] received so far for that
-    /// reconstruction target.
+    /// reconstruction target. See [`StateKey::PendingRecovery`] on why
+    /// the recovered id is distinct from the partitioning one.
     PendingRecovery,
     /// Outstanding unpair acknowledgement, one per channel. Carries the
     /// `started_at` unix-seconds timestamp so the orchestrator can time
     /// out unresponsive peers.
     PendingUnpair,
-    /// Active sharing round. At most one entry exists per `secret_id`
-    /// (a new `start(ProtectSecret)` overwrites any prior round). Holds
-    /// the per-channel tallies (`pending` / `confirmed` / `failed`) and
-    /// the `started_at` timestamp used to time out unresponsive helpers.
+    /// Active sharing round, one row per in-flight version. Several can be
+    /// open at once: publishes are started by the pair-completion hook and by
+    /// the promotion inside `verify_fingerprint`, not only by
+    /// `start(ProtectSecret)`. Holds the per-channel tallies (`pending` /
+    /// `confirmed` / `failed`), the per-member tallies, and the `started_at`
+    /// timestamp used to time out unresponsive peers.
     SharingRound,
+    /// Active replica catch-up. At most one entry exists per `secret_id`
+    /// (a new `start(SyncCheck)` overwrites any prior one). Holds the
+    /// versions members have reported so far, so the asker can pick the
+    /// member holding the newest state once every peer has answered.
+    PendingSyncCheck,
 }
 
 /// Secondary-key selector identifying a single row within a given
@@ -410,11 +716,32 @@ pub enum StateKey {
     /// Row is scoped to one channel.
     PendingVerification { channel_id: ChannelId },
     /// Row is scoped to one reconstruction target.
-    PendingRecovery { version: u32 },
+    ///
+    /// `secret_id` is the secret *being recovered*, which is not
+    /// necessarily the `secret_id` naming the partition this row lives
+    /// in: a recovering device runs an ephemeral instance whose own id
+    /// owns the partition, while the target belongs to the wire. Keying
+    /// on it lets one instance recover several secrets concurrently at
+    /// the same version without their accumulators colliding.
+    PendingRecovery { secret_id: u64, version: u32 },
     /// Row is scoped to one channel.
     PendingUnpair { channel_id: ChannelId },
     /// At most one row per `secret_id`. No secondary key.
-    SharingRound,
+    PendingSyncCheck,
+    /// Row is scoped to one publishing round, identified by the version it
+    /// distributes.
+    ///
+    /// Keying on the version is load-bearing rather than cosmetic. Rounds are
+    /// not started only by `start(ProtectSecret)`: the pair-completion hook
+    /// and the promotion inside `verify_fingerprint` both publish, and both
+    /// run while handling an *inbound* message. A single unkeyed row meant a
+    /// round started that way silently replaced one already in flight, after
+    /// which neither completed — responses for the replaced round arrived
+    /// against state that no longer existed, and no `SharingComplete` was
+    /// emitted for either. An application could not prevent this, because it
+    /// cannot see the library's round state. Distinct versions now accumulate
+    /// independently.
+    SharingRound { version: u32 },
 }
 
 impl StateKey {
@@ -425,7 +752,8 @@ impl StateKey {
             StateKey::PendingVerification { .. } => StateKind::PendingVerification,
             StateKey::PendingRecovery { .. } => StateKind::PendingRecovery,
             StateKey::PendingUnpair { .. } => StateKind::PendingUnpair,
-            StateKey::SharingRound => StateKind::SharingRound,
+            StateKey::PendingSyncCheck => StateKind::PendingSyncCheck,
+            StateKey::SharingRound { .. } => StateKind::SharingRound,
         }
     }
 }
@@ -459,7 +787,7 @@ pub enum StateItem {
     ///
     /// The library writes this variant one share at a time as each inbound
     /// [`derec_proto::GetShareResponseMessage`] arrives. The write sequence
-    /// under a single `(secret_id, version)` is:
+    /// under a single `(recovered secret_id, version)` is:
     ///
     /// 1. First response arrives. Library calls `save` with a `shares`
     ///    vector containing exactly one element.
@@ -479,9 +807,14 @@ pub enum StateItem {
     /// concurrency contract. Concurrent inbound shares racing on the same
     /// accumulator will clobber each other via a naive load-modify-save;
     /// the application layer is responsible for serializing concurrent
-    /// `process()` calls that touch the same `(secret_id, version)` if
-    /// this matters.
+    /// `process()` calls that touch the same `(recovered secret_id,
+    /// version)` if this matters. Recoveries of *different* secrets do
+    /// not contend: they occupy separate rows even at the same version.
     PendingRecovery {
+        /// The secret being recovered. See
+        /// [`StateKey::PendingRecovery`] — this is a wire-level id and
+        /// may differ from the `secret_id` partitioning the row.
+        secret_id: u64,
         version: u32,
         shares: Vec<derec_proto::GetShareResponseMessage>,
     },
@@ -495,23 +828,58 @@ pub enum StateItem {
         started_at: u64,
     },
 
-    /// Active sharing round for `secret_id`. Created by
-    /// `start(ProtectSecret)` and cleared by the orchestrator once every
-    /// targeted helper has responded (confirmed, rejected, or timed
-    /// out). At most one entry exists per `secret_id`; a fresh
-    /// `start(ProtectSecret)` overwrites any prior in-flight round.
+    /// Active sharing round, keyed by the version it distributes. Created by
+    /// a publish — `start(ProtectSecret)`, the pair-completion hook, or the
+    /// promotion inside `verify_fingerprint` — and cleared by the orchestrator
+    /// once every targeted peer has responded (confirmed, rejected, or timed
+    /// out). Rounds at different versions are independent and settle
+    /// separately; one never displaces another.
     ///
     /// `pending` / `confirmed` / `failed` partition the round's target
     /// channels; the union is invariant across the round's lifetime.
     /// `started_at` is the unix-seconds timestamp used to time out
     /// unresponsive helpers.
-    SharingRound {
-        version: u32,
-        pending: std::collections::HashSet<ChannelId>,
-        confirmed: std::collections::HashSet<ChannelId>,
-        failed: std::collections::HashSet<ChannelId>,
+    /// An in-flight replica catch-up: the versions members have reported so
+    /// far, plus the asker's own, so the winner can be chosen once every peer
+    /// has answered or timed out.
+    PendingSyncCheck {
+        /// The version the asker held when the check started.
+        local_version: u32,
+        /// Members asked that have not yet answered.
+        pending: std::collections::HashSet<ReplicaId>,
+        /// Versions reported so far, by member.
+        reported: std::collections::HashMap<ReplicaId, u32>,
         started_at: u64,
     },
+    /// An in-flight publishing round. Boxed because it is by far the largest
+    /// variant, and every other `StateItem` would otherwise be padded to its
+    /// size.
+    SharingRound(Box<SharingRoundState>),
+}
+
+/// The accounting for one in-flight publishing round.
+///
+/// The two populations are tracked separately and by different keys — helpers
+/// by [`ChannelId`], members by [`ReplicaId`]. A single set keyed on
+/// `ChannelId` cannot express the replica leg at all: every member shares the
+/// group channel, so they would collapse into one entry and the first answer
+/// would settle the round for the whole group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharingRoundState {
+    pub version: u32,
+    /// Helpers written to that have not yet answered.
+    pub pending: std::collections::HashSet<ChannelId>,
+    /// Helpers that confirmed storage.
+    pub confirmed: std::collections::HashSet<ChannelId>,
+    /// Helpers that rejected or timed out.
+    pub failed: std::collections::HashSet<ChannelId>,
+    /// Members written to that have not yet answered.
+    pub pending_replicas: std::collections::HashSet<ReplicaId>,
+    /// Members that acknowledged.
+    pub synced_replicas: std::collections::HashSet<ReplicaId>,
+    /// Members that refused, timed out, or could not be reached.
+    pub behind_replicas: std::collections::HashSet<ReplicaId>,
+    pub started_at: u64,
 }
 
 impl StateItem {
@@ -521,7 +889,8 @@ impl StateItem {
             StateItem::PendingVerification { .. } => StateKind::PendingVerification,
             StateItem::PendingRecovery { .. } => StateKind::PendingRecovery,
             StateItem::PendingUnpair { .. } => StateKind::PendingUnpair,
-            StateItem::SharingRound { .. } => StateKind::SharingRound,
+            StateItem::PendingSyncCheck { .. } => StateKind::PendingSyncCheck,
+            StateItem::SharingRound(_) => StateKind::SharingRound,
         }
     }
 
@@ -533,13 +902,19 @@ impl StateItem {
             StateItem::PendingVerification { channel_id, .. } => StateKey::PendingVerification {
                 channel_id: *channel_id,
             },
-            StateItem::PendingRecovery { version, .. } => {
-                StateKey::PendingRecovery { version: *version }
-            }
+            StateItem::PendingRecovery {
+                secret_id, version, ..
+            } => StateKey::PendingRecovery {
+                secret_id: *secret_id,
+                version: *version,
+            },
             StateItem::PendingUnpair { channel_id, .. } => StateKey::PendingUnpair {
                 channel_id: *channel_id,
             },
-            StateItem::SharingRound { .. } => StateKey::SharingRound,
+            StateItem::PendingSyncCheck { .. } => StateKey::PendingSyncCheck,
+            StateItem::SharingRound(round) => StateKey::SharingRound {
+                version: round.version,
+            },
         }
     }
 }
@@ -551,17 +926,6 @@ pub struct Share {
     pub secret_id: u64,
     /// Version number of the secret.
     pub version: u32,
-    /// Stable per-device identifier of the replica that produced this
-    /// share, copied from
-    /// [`derec_proto::StoreShareRequestMessage::replica_id`] when the
-    /// helper persisted the write.
-    ///
-    /// `None` when the writer was a non-replica `Owner`. `Some(id)` when
-    /// the writer was `ReplicaSource`. Two distinct replicas may produce
-    /// the same `(secret_id, channel_id, version)` independently
-    /// — see [`crate::protocol::DeRecShareStore::save`] for the
-    /// conceptual storage key and the disambiguation contract.
-    pub replica_id: Option<u64>,
     /// Opaque protobuf bytes — see [`crate::protocol::DeRecShareStore`] for
     /// the per-side format.
     pub bytes: Vec<u8>,
@@ -610,5 +974,60 @@ mod tests {
         let json = serde_json::to_vec(&material).expect("serialize");
         let decoded: PairingKeyMaterial = serde_json::from_slice(&json).expect("deserialize");
         assert_eq!(material.as_bytes(), decoded.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod expired_channel_cleanup_tests {
+    use super::ExpiredChannelCleanup;
+
+    /// Constructors do not validate — normalization is the builder's job,
+    /// so a zero survives construction intact.
+    #[test]
+    fn from_secs_does_not_clamp() {
+        assert_eq!(
+            ExpiredChannelCleanup::from_secs(0),
+            ExpiredChannelCleanup::Enabled { timeout_in_secs: 0 }
+        );
+    }
+
+    #[test]
+    fn from_secs_preserves_value() {
+        assert_eq!(
+            ExpiredChannelCleanup::from_secs(900),
+            ExpiredChannelCleanup::Enabled {
+                timeout_in_secs: 900
+            }
+        );
+    }
+
+    /// The marshalling seam: a disabled policy discards its timeout here,
+    /// in Rust, so no SDK has to make that decision.
+    #[test]
+    fn new_disabled_discards_timeout() {
+        assert_eq!(
+            ExpiredChannelCleanup::new(false, 900),
+            ExpiredChannelCleanup::Disabled
+        );
+    }
+
+    #[test]
+    fn new_enabled_keeps_timeout() {
+        assert_eq!(
+            ExpiredChannelCleanup::new(true, 900),
+            ExpiredChannelCleanup::Enabled {
+                timeout_in_secs: 900
+            }
+        );
+    }
+
+    #[test]
+    fn default_matches_historical_behaviour() {
+        assert_eq!(
+            ExpiredChannelCleanup::default(),
+            ExpiredChannelCleanup::Enabled {
+                timeout_in_secs: 300
+            }
+        );
     }
 }

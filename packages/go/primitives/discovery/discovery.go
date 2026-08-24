@@ -12,12 +12,10 @@ import (
 	"github.com/derecalliance/lib-derec/packages/go/internal/native"
 )
 
-// VersionEntry is one advertised version of a secret. ReplicaID is set only
-// when the version originated from a Replica rather than the Owner.
+// VersionEntry is one advertised version of a secret.
 type VersionEntry struct {
 	Version     uint32
 	Description string
-	ReplicaID   *uint64
 }
 
 // SecretVersionEntry is the set of versions a helper advertises for one
@@ -120,12 +118,6 @@ func encodeSecretList(entries []SecretVersionEntry) []byte {
 			descBytes := []byte(v.Description)
 			out = appendUint32(out, uint32(len(descBytes)))
 			out = append(out, descBytes...)
-			if v.ReplicaID != nil {
-				out = append(out, 1)
-				out = appendUint64(out, *v.ReplicaID)
-			} else {
-				out = append(out, 0)
-			}
 		}
 	}
 	return out
@@ -165,25 +157,9 @@ func decodeSecretList(wire []byte) ([]SecretVersionEntry, error) {
 			description := string(wire[offset : offset+descLen])
 			offset += descLen
 
-			if offset+1 > len(wire) {
-				return nil, fmt.Errorf("discovery: unexpected end of secret list wire bytes reading entry %d version %d replica flag", i, j)
-			}
-			hasReplicaID := wire[offset]
-			offset++
-			var replicaID *uint64
-			if hasReplicaID != 0 {
-				if offset+8 > len(wire) {
-					return nil, fmt.Errorf("discovery: unexpected end of secret list wire bytes reading entry %d version %d replica id", i, j)
-				}
-				id := binary.LittleEndian.Uint64(wire[offset:])
-				offset += 8
-				replicaID = &id
-			}
-
 			versions = append(versions, VersionEntry{
 				Version:     version,
 				Description: description,
-				ReplicaID:   replicaID,
 			})
 		}
 

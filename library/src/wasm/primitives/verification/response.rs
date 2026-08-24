@@ -105,11 +105,7 @@ pub fn extract(envelope_bytes: &[u8], shared_key: &[u8]) -> Result<JsValue, JsVa
 /// `(nonce, secret_id, version)` triple doesn't match — that's the
 /// anti-replay gate.
 #[wasm_bindgen(js_name = "verification_response_process")]
-pub fn process(
-    request: JsValue,
-    response: JsValue,
-    share_content: &[u8],
-) -> Result<bool, JsValue> {
+pub fn process(request: JsValue, response: JsValue, share_content: &[u8]) -> Result<bool, JsValue> {
     let request: VerifyShareRequestMessage = from_js(request)?;
     let request_proto: derec_proto::VerifyShareRequestMessage = request.into();
     let response: VerifyShareResponseMessage = from_js(response)?;

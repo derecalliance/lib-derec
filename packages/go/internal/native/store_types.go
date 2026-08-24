@@ -8,21 +8,115 @@ import (
 	"fmt"
 )
 
-// Channel is the post-pairing representation of a peer, persisted by a
-// ChannelStore implementation. Mirrors the Rust-side
-// derec_library::protocol::types::Channel shape field-for-field; the JSON
-// produced by EncodeChannel is byte-compatible with what the derec-library
-// FFI bridge decodes via serde on the Rust side (see
-// library/src/ffi/protocol/stores.rs), since Channel crosses the C callback
-// boundary as plain serde JSON rather than a wrapped record type.
-type Channel struct {
-	ID                uint64
+// HelperChannel is a channel to a single helper, or to the owner from a
+// helper's side. Mirrors derec_library::protocol::types::HelperChannel
+// field-for-field. Keyed by (secretID, channelID).
+//
+// PeerRole is the *other end's* role, fixed at pairing time: a helper
+// pairing held by an Owner carries SenderKindHelper, and the helper's own
+// row for the same channel carries SenderKindOwner.
+type HelperChannel struct {
+	ChannelID         uint64
 	Transport         TransportEndpoint
 	CommunicationInfo map[string]string
+	PeerRole          SenderKind
 	Status            ChannelStatus
 	CreatedAt         uint64
-	Role              SenderKind
-	ReplicaID         *uint64
+}
+
+// ReplicaMember is one member of a replica group, including this device
+// itself. Mirrors derec_library::protocol::types::ReplicaMember
+// field-for-field. Keyed by (secretID, replicaID): every member shares one
+// ChannelID, so the channel cannot be the key. Storing this device's own
+// row is what makes the roster reconstructible from stores alone.
+type ReplicaMember struct {
+	ChannelID         uint64
+	ReplicaID         uint64
+	Transport         TransportEndpoint
+	CommunicationInfo map[string]string
+	Role              ReplicaRole
+	Status            ChannelStatus
+	CreatedAt         uint64
+}
+
+// ChannelRecord is what a ChannelStore holds at one address: either a
+// helper channel or one replica-group member. Exactly one field is non-nil.
+type ChannelRecord struct {
+	Helper  *HelperChannel
+	Replica *ReplicaMember
+}
+
+// ChannelID reports the channel this record names, whichever variant it is.
+func (r ChannelRecord) ChannelID() uint64 {
+	switch {
+	case r.Helper != nil:
+		return r.Helper.ChannelID
+	case r.Replica != nil:
+		return r.Replica.ChannelID
+	default:
+		return 0
+	}
+}
+
+// ReplicaID reports the replica id this record is keyed by, or 0 for a
+// helper channel — the value the Rust side reserves as "absent".
+func (r ChannelRecord) ReplicaID() uint64 {
+	if r.Replica != nil {
+		return r.Replica.ReplicaID
+	}
+	return 0
+}
+
+// ReplicaRole is a member's role within a replica group, mirroring the
+// Rust-side ReplicaRole enum. Exactly one member of a group is the Source.
+// The value is absolute: every member records the same role for a given
+// peer, regardless of who is reading. It marshals to/from the exact strings
+// Rust's default serde derive produces ("Source"/"Destination").
+type ReplicaRole int
+
+const (
+	// ReplicaRoleSource marks the member the secret replicates from.
+	ReplicaRoleSource ReplicaRole = iota
+	// ReplicaRoleDestination marks a member the secret replicates to.
+	ReplicaRoleDestination
+)
+
+func (r ReplicaRole) String() string {
+	switch r {
+	case ReplicaRoleSource:
+		return "Source"
+	case ReplicaRoleDestination:
+		return "Destination"
+	default:
+		return fmt.Sprintf("ReplicaRole(%d)", int(r))
+	}
+}
+
+// MarshalJSON emits the Rust variant name.
+func (r ReplicaRole) MarshalJSON() ([]byte, error) {
+	switch r {
+	case ReplicaRoleSource, ReplicaRoleDestination:
+		return json.Marshal(r.String())
+	default:
+		return nil, fmt.Errorf("native: invalid ReplicaRole %d", int(r))
+	}
+}
+
+// UnmarshalJSON accepts the Rust variant name.
+func (r *ReplicaRole) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return fmt.Errorf("native: decode ReplicaRole: %w", err)
+	}
+	switch s {
+	case "Source":
+		*r = ReplicaRoleSource
+	case "Destination":
+		*r = ReplicaRoleDestination
+	default:
+		return fmt.Errorf("native: unknown ReplicaRole %q", s)
+	}
+	return nil
 }
 
 // TransportEndpoint is a peer's advertised transport, mirroring
@@ -34,17 +128,26 @@ type TransportEndpoint struct {
 
 // ChannelStatus is a channel's lifecycle status, mirroring the Rust-side
 // ChannelStatus enum. It marshals to/from the exact strings produced by
-// Rust's default serde derive for a unit-variant enum ("Pending"/"Paired"),
-// not the SCREAMING_SNAKE_CASE convention protobuf enums use.
+// Rust's default serde derive for a unit-variant enum
+// ("Pending"/"Paired"/"Unpairing"), not the SCREAMING_SNAKE_CASE convention
+// protobuf enums use.
 type ChannelStatus int
 
 const (
-	// ChannelStatusPending marks a channel awaiting fingerprint
-	// verification (replica pairing only).
+	// ChannelStatusPending marks a channel awaiting out-of-band fingerprint
+	// confirmation: every replica pairing, and every pairing made over
+	// ContactModeNoKeys — that mode commits to nothing, so the fingerprint
+	// is the only check that catches a key substituted on its plaintext
+	// PrePair leg. Such a channel is not a publish target, not a recovery
+	// source, and inbound messages on it are ignored.
 	ChannelStatusPending ChannelStatus = iota
 	// ChannelStatusPaired marks a channel fully paired and ready for
 	// protocol messages.
 	ChannelStatusPaired
+	// ChannelStatusUnpairing marks a replica-group member that has been
+	// told to leave and is awaiting the roster version that completes its
+	// removal. Never set on a helper channel.
+	ChannelStatusUnpairing
 )
 
 func (s ChannelStatus) String() string {
@@ -53,6 +156,8 @@ func (s ChannelStatus) String() string {
 		return "Pending"
 	case ChannelStatusPaired:
 		return "Paired"
+	case ChannelStatusUnpairing:
+		return "Unpairing"
 	default:
 		return fmt.Sprintf("ChannelStatus(%d)", int(s))
 	}
@@ -61,7 +166,7 @@ func (s ChannelStatus) String() string {
 // MarshalJSON implements json.Marshaler.
 func (s ChannelStatus) MarshalJSON() ([]byte, error) {
 	str := s.String()
-	if s != ChannelStatusPending && s != ChannelStatusPaired {
+	if s != ChannelStatusPending && s != ChannelStatusPaired && s != ChannelStatusUnpairing {
 		return nil, fmt.Errorf("native: unknown ChannelStatus: %d", int(s))
 	}
 	return json.Marshal(str)
@@ -78,6 +183,8 @@ func (s *ChannelStatus) UnmarshalJSON(data []byte) error {
 		*s = ChannelStatusPending
 	case "Paired":
 		*s = ChannelStatusPaired
+	case "Unpairing":
+		*s = ChannelStatusUnpairing
 	default:
 		return fmt.Errorf("native: unknown ChannelStatus: %q", str)
 	}
@@ -205,16 +312,25 @@ const (
 	// StateKindSharingRound is the active sharing round, at most one row
 	// per secretID.
 	StateKindSharingRound StateKind = 3
+	// StateKindPendingSyncCheck is an active replica catch-up, at most one
+	// row per secretID. Holds the versions members have reported so far.
+	StateKindPendingSyncCheck StateKind = 4
 )
 
 // StateKey selects one row inside a StateKind under a secretID. Which
 // field is populated is determined by Kind:
 //   - PendingVerification, PendingUnpair: ChannelID.
-//   - PendingRecovery: Version.
-//   - SharingRound: neither (at most one row per secretID).
+//   - PendingRecovery: SecretID, Version.
+//   - SharingRound: none (at most one row per secretID).
+//
+// SecretID names the secret being recovered, which is not necessarily
+// the secretID partitioning the store: a recovering device runs an
+// ephemeral instance whose own id owns the partition while the target
+// belongs to the wire.
 type StateKey struct {
 	Kind      StateKind
 	ChannelID *uint64
+	SecretID  *uint64
 	Version   *uint32
 }
 
@@ -223,14 +339,21 @@ type StateKey struct {
 // variants:
 //   - PendingVerification: ChannelID, Bytes (prost-encoded
 //     VerifyShareRequestMessage).
-//   - PendingRecovery: Version, Shares (each entry a prost-encoded
-//     GetShareResponseMessage).
+//   - PendingRecovery: SecretID (the secret being recovered), Version,
+//     Shares (each entry a prost-encoded GetShareResponseMessage).
 //   - PendingUnpair: ChannelID, StartedAt (unix seconds).
 //   - SharingRound: Version, Pending/Confirmed/Failed (channel-id sets),
+//     PendingReplicas/SyncedReplicas/BehindReplicas (replica-id sets),
 //     StartedAt (unix seconds).
+//
+// The two populations of a sharing round are tracked separately and by
+// different keys: helpers by channelID, group members by replicaID. Every
+// member of a group answers on the one shared channel, so a channel-keyed set
+// would collapse them and the first answer would settle the round for all.
 type StateItem struct {
 	Kind      StateKind
 	ChannelID *uint64
+	SecretID  *uint64
 	Version   *uint32
 	StartedAt *uint64
 	Bytes     []byte
@@ -238,6 +361,12 @@ type StateItem struct {
 	Pending   []uint64
 	Confirmed []uint64
 	Failed    []uint64
+	// PendingReplicas are members written to that have not yet answered.
+	PendingReplicas []uint64
+	// SyncedReplicas are members that acknowledged.
+	SyncedReplicas []uint64
+	// BehindReplicas are members that refused, timed out, or were unreachable.
+	BehindReplicas []uint64
 }
 
 // Key returns the StateKey this item is stored under, mirroring the
@@ -247,7 +376,7 @@ func (i StateItem) Key() StateKey {
 	case StateKindPendingVerification:
 		return StateKey{Kind: StateKindPendingVerification, ChannelID: i.ChannelID}
 	case StateKindPendingRecovery:
-		return StateKey{Kind: StateKindPendingRecovery, Version: i.Version}
+		return StateKey{Kind: StateKindPendingRecovery, SecretID: i.SecretID, Version: i.Version}
 	case StateKindPendingUnpair:
 		return StateKey{Kind: StateKindPendingUnpair, ChannelID: i.ChannelID}
 	default:

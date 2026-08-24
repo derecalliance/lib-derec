@@ -4,7 +4,10 @@
 package protocol
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
+	"strconv"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -34,6 +37,28 @@ const (
 // surfacing it for the application to accept explicitly. Zero value is
 // "every flow off" (today's behavior: every request surfaces for the
 // application to decide).
+//
+// Per-flow caveats, read before enabling in production:
+//
+//   - Pairing covers standard and replica pairing. Replica pairing
+//     remains Pending until both sides verify fingerprints, so
+//     auto-accept is safe there; standard pairing becomes Paired at once.
+//   - PrePair turns the initiator into a request-amplification oracle —
+//     anyone knowing a HashedKeys contact's nonce can elicit a
+//     key-publish. Keep off unless you control both ends of the transport.
+//   - StoreShare is the helper's only admission-control point for inbound
+//     shares. The protocol enforces no size, quota or rate limit of its
+//     own, and maxShareSize is checked for range overlap at pairing time
+//     only, never against an actual share. While false, ActionRequired
+//     carries the decoded request, so the application can inspect the
+//     share and Reject with StatusEnum_SIZE_LIMIT_EXCEEDED. Setting it
+//     true removes that opportunity entirely: every share from every
+//     paired Owner is stored unconditionally, at whatever size it
+//     arrives. Keep off in any deployment with per-user storage limits.
+//   - Unpair is destructive — accepting deletes the local channel record
+//     before any UI confirmation.
+//   - UpdateChannelInfo silently overwrites the channel record with the
+//     peer's announced transport / communication info.
 type AutoAcceptPolicy struct {
 	Pairing           bool
 	PrePair           bool
@@ -73,9 +98,24 @@ type Config struct {
 	// pairing-request and pairing-response CommunicationInfo. Default:
 	// empty.
 	CommunicationInfo map[string]string
-	// Timeout is the protocol-wide staleness boundary, truncated to
-	// seconds and clamped to at least 1 second. Default: 5 minutes.
-	Timeout time.Duration
+	// Timeouts configures how long the protocol waits on each thing that
+	// can keep it waiting. nil, or a zero field inside it, leaves the
+	// library's own default in force. See Timeouts.
+	Timeouts *Timeouts
+	// UnsafeHTTP accepts plaintext http:// transport endpoints. Development
+	// only. Default: false, the production posture.
+	//
+	// With it false, plaintext is accepted only for an endpoint this device
+	// configured for itself that names loopback (localhost, 127.0.0.1, ::1),
+	// so a local dev server needs no configuration. With it true, plaintext
+	// is accepted for any host on any path, including endpoints a peer
+	// supplies — which is what makes the LAN case work (a phone against a
+	// laptop), and why the name is blunt.
+	//
+	// This is a guardrail, not transport security: the SDK opens no sockets,
+	// so nothing here stops an application sending plaintext. It governs
+	// which endpoints the protocol will record, propagate and reply to.
+	UnsafeHTTP bool
 	// AutoRespondOnFailure controls whether the protocol auto-replies on
 	// failed inbound processing. Default: false.
 	AutoRespondOnFailure bool
@@ -91,6 +131,48 @@ type Config struct {
 	// ReplicaID configures this node's local replica_id, required for
 	// any replica-mode pairing. Default: unset.
 	ReplicaID *uint64
+}
+
+// Timeouts configures how long the protocol waits on each thing that can keep
+// it waiting. A zero field means "use the library default"; the defaults live
+// in the Rust library, not here.
+//
+// These were one knob until it became clear they answer different questions.
+// InboundMessage is a security boundary — it bounds how stale a message may be
+// and still be accepted, so it must tolerate transport latency and clock skew.
+// The other three are liveness budgets: how long to keep hoping a peer will
+// answer. Collapsing them meant tightening the replay window every time
+// someone wanted rounds to settle faster.
+type Timeouts struct {
+	// InboundMessage is the staleness boundary for inbound envelopes: any
+	// message older than this is discarded on receipt, whatever the flow.
+	// This is the replay-defence window, and lowering it starts refusing
+	// legitimately old messages from slow transports or skewed clocks.
+	// Default: 300s.
+	InboundMessage time.Duration
+	// SharingRound bounds how long a publishing round waits on a peer that
+	// has not answered. It is what limits how long SharingComplete can be
+	// delayed by one unreachable peer. Default: 60s.
+	SharingRound time.Duration
+	// UnpairAck bounds the wait for an unpair acknowledgement before local
+	// channel state is dropped anyway. Default: 60s.
+	UnpairAck time.Duration
+	// ExpiredChannels governs removal of channels still awaiting out-of-band
+	// fingerprint confirmation — every replica pairing, and every NoKeys
+	// pairing. Unlike the others it can be disabled, leaving the sweep to
+	// the application. The budget is a human one: someone comparing a
+	// fingerprint, possibly over the phone. nil leaves the default
+	// (enabled, 300s) in force.
+	ExpiredChannels *RemoveExpiredChannelsPolicy
+}
+
+// RemoveExpiredChannelsPolicy configures the automatic expired-channel
+// sweep. Both fields are always forwarded to the library, including when
+// Enabled is false — the library decides that a disabled policy ignores
+// its timeout.
+type RemoveExpiredChannelsPolicy struct {
+	Enabled       bool
+	TimeoutInSecs uint64
 }
 
 // DeRecProtocol is the orchestrator instance bound to a set of
@@ -156,13 +238,28 @@ func New(
 	if keepVersionsCount == 0 {
 		keepVersionsCount = 3
 	}
-	timeout := config.Timeout
-	if timeout == 0 {
-		timeout = 5 * time.Minute
-	}
-	timeoutInSecs := uint32(timeout.Truncate(time.Second).Seconds())
-	if timeoutInSecs == 0 {
-		timeoutInSecs = 1
+	// Timeouts are forwarded verbatim; an unset field is omitted so the
+	// library applies its own default rather than this wrapper choosing one.
+	var nativeTimeouts *native.TimeoutsConfig
+	if config.Timeouts != nil {
+		secs := func(d time.Duration) *uint64 {
+			if d == 0 {
+				return nil
+			}
+			v := uint64(d.Truncate(time.Second).Seconds())
+			return &v
+		}
+		nativeTimeouts = &native.TimeoutsConfig{
+			InboundMessageSecs: secs(config.Timeouts.InboundMessage),
+			SharingRoundSecs:   secs(config.Timeouts.SharingRound),
+			UnpairAckSecs:      secs(config.Timeouts.UnpairAck),
+		}
+		if p := config.Timeouts.ExpiredChannels; p != nil {
+			nativeTimeouts.ExpiredChannels = &native.RemoveExpiredChannelsPolicy{
+				Enabled:       p.Enabled,
+				TimeoutInSecs: p.TimeoutInSecs,
+			}
+		}
 	}
 
 	commInfo, err := encodeCommunicationInfo(config.CommunicationInfo)
@@ -177,7 +274,8 @@ func New(
 		Threshold:            threshold,
 		KeepVersionsCount:    keepVersionsCount,
 		CommunicationInfo:    commInfo,
-		TimeoutInSecs:        timeoutInSecs,
+		Timeouts:             nativeTimeouts,
+		UnsafeHTTP:           config.UnsafeHTTP,
 		AutoRespondOnFailure: config.AutoRespondOnFailure,
 		UnpairAck:            int32(config.UnpairAck),
 		AutoReplyTo:          config.AutoReplyTo,
@@ -193,7 +291,6 @@ func New(
 		},
 		ReplicaID: config.ReplicaID,
 	}
-
 	instance, err := native.NewProtocolInstance(
 		channelStore, secretStore, shareStore, userSecretStore, stateStore, transport,
 		nativeCfg,
@@ -246,6 +343,37 @@ func (p *DeRecProtocol) VerifyFingerprint(channelID uint64, fingerprint string) 
 	return p.instance.VerifyFingerprint(channelID, fingerprint)
 }
 
+// RemoveExpiredChannels removes Pending channels older than
+// olderThanSecs, along with their pairing keys, returning the ids
+// removed.
+//
+// Independent of Config.RemoveExpiredChannels — this sweeps at the
+// threshold given even when that policy is disabled. The age comparison
+// is strict, so a channel created within the current second survives
+// even olderThanSecs == 0.
+func (p *DeRecProtocol) RemoveExpiredChannels(olderThanSecs uint64) ([]uint64, error) {
+	if p.closed {
+		return nil, errors.New("protocol: RemoveExpiredChannels: protocol is closed")
+	}
+	raw, err := p.instance.RemoveExpiredChannels(olderThanSecs)
+	if err != nil {
+		return nil, err
+	}
+	var decimal []string
+	if err := json.Unmarshal(raw, &decimal); err != nil {
+		return nil, fmt.Errorf("protocol: RemoveExpiredChannels: decode ids: %w", err)
+	}
+	ids := make([]uint64, 0, len(decimal))
+	for _, s := range decimal {
+		id, err := strconv.ParseUint(s, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("protocol: RemoveExpiredChannels: parse id %q: %w", s, err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
 // SetOwnTransport replaces this node's local transport endpoint. Only
 // mutates local state — propagating the change to paired peers requires a
 // follow-up UpdateChannelInfo flow. See Config.OwnTransportProtocol for
@@ -279,6 +407,29 @@ func (p *DeRecProtocol) Process(message []byte) ([]Event, error) {
 		return nil, errors.New("protocol: Process: protocol is closed")
 	}
 	eventsJSON, err := p.instance.Process(message)
+	if err != nil {
+		return nil, err
+	}
+	return decodeEvents(eventsJSON)
+}
+
+// Tick advances time-driven state without an inbound message, returning the
+// resulting events.
+//
+// Timeouts are otherwise only evaluated by Process, so a publish whose
+// helpers all go quiet has nothing left to close it: the round stays open
+// and no SharingComplete is ever emitted. Call this from a scheduler — a
+// time.Ticker, a cron job, a queue heartbeat — at an interval shorter than
+// the configured timeout.
+//
+// Safe to call at any time; with nothing in flight it returns no events. It
+// mutates the same round state an inbound response does, so it must be
+// serialized against Process for the same secret_id.
+func (p *DeRecProtocol) Tick() ([]Event, error) {
+	if p.closed {
+		return nil, errors.New("protocol: Tick: protocol is closed")
+	}
+	eventsJSON, err := p.instance.Tick()
 	if err != nil {
 		return nil, err
 	}

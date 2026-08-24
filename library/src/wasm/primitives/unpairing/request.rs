@@ -55,7 +55,9 @@ pub fn produce(
 ) -> Result<JsValue, JsValue> {
     let shared_key = parse_shared_key(shared_key)?;
     let reply_to_proto = parse_optional_transport_protocol(reply_to)?;
-    let result = request::produce(channel_id.into(), memo, &shared_key, reply_to_proto)
+    // Helper path. Replica-group removal is orchestrated through the
+    // `RemoveReplica` flow, which names the departing member itself.
+    let result = request::produce(channel_id.into(), memo, &shared_key, reply_to_proto, None)
         .map_err(js_error_from_lib)?;
     to_js(&ProduceResult {
         envelope: result.envelope,

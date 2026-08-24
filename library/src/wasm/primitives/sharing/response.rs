@@ -22,6 +22,11 @@ pub struct StoreShareResponseMessage {
     pub version: u32,
     pub timestamp: Option<Timestamp>,
     pub secret_id: u64,
+    /// The member that produced this acknowledgement. Every member of a
+    /// replica group answers on the same channel, so the responder names
+    /// itself here. Absent on a helper's acknowledgement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_id: Option<u64>,
 }
 
 impl From<derec_proto::StoreShareResponseMessage> for StoreShareResponseMessage {
@@ -31,6 +36,7 @@ impl From<derec_proto::StoreShareResponseMessage> for StoreShareResponseMessage 
             version: value.version,
             timestamp: value.timestamp.map(Into::into),
             secret_id: value.secret_id,
+            replica_id: value.replica_id,
         }
     }
 }
@@ -42,6 +48,7 @@ impl From<StoreShareResponseMessage> for derec_proto::StoreShareResponseMessage 
             version: value.version,
             timestamp: value.timestamp.map(Into::into),
             secret_id: value.secret_id,
+            replica_id: value.replica_id,
         }
     }
 }

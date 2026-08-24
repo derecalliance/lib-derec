@@ -1,22 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-//! Version 1 payload: gzip-compressed JSON. Byte fields are standard-padded
+//! Version 2 payload: gzip-compressed JSON. Byte fields are standard-padded
 //! base64 (RFC 4648 §4), `u64` fields are decimal strings, keys are snake_case,
 //! optional keys are omitted when absent/empty.
 
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
 
-use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::types::secret::SecretError;
-use crate::protocol::types::{HelperInfo, ReplicaInfo, Replicas, Secret, UserSecret};
+use crate::protocol::types::{HelperInfo, ReplicaInfo, ReplicaRole, Replicas, Secret, UserSecret};
 
 fn gzip(data: &[u8]) -> Vec<u8> {
     let mut enc = GzEncoder::new(Vec::new(), Compression::default());
-    enc.write_all(data).expect("gzip write into Vec is infallible");
+    enc.write_all(data)
+        .expect("gzip write into Vec is infallible");
     enc.finish().expect("gzip finish into Vec is infallible")
 }
 
@@ -29,7 +30,7 @@ fn gunzip(data: &[u8]) -> Result<Vec<u8>, SecretError> {
 }
 
 mod base64_bytes {
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use serde::{Deserialize as _, Deserializer, Serializer};
 
     #[allow(clippy::ptr_arg)]
@@ -66,8 +67,6 @@ where
 
 #[derive(Serialize, Deserialize)]
 struct SecretJson {
-    #[serde(with = "u64_string")]
-    owner_replica_id: u64,
     #[serde(default)]
     helpers: Vec<HelperJson>,
     #[serde(default)]
@@ -83,7 +82,11 @@ struct HelperJson {
     transport_uri: String,
     #[serde(with = "base64_bytes")]
     shared_key: Vec<u8>,
-    #[serde(default, deserialize_with = "de_map", skip_serializing_if = "HashMap::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "de_map",
+        skip_serializing_if = "HashMap::is_empty"
+    )]
     communication_info: HashMap<String, String>,
 }
 
@@ -98,27 +101,30 @@ struct UserSecretJson {
 
 #[derive(Serialize, Deserialize)]
 struct ReplicasJson {
+    #[serde(with = "u64_string")]
+    channel_id: u64,
     #[serde(with = "base64_bytes")]
     shared_key: Vec<u8>,
-    replicas: Vec<ReplicaInfoJson>,
+    members: Vec<ReplicaInfoJson>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct ReplicaInfoJson {
     #[serde(with = "u64_string")]
-    channel_id: u64,
-    transport_uri: String,
-    #[serde(with = "u64_string")]
     replica_id: u64,
-    sender_kind: i32,
-    #[serde(default, deserialize_with = "de_map", skip_serializing_if = "HashMap::is_empty")]
+    transport_uri: String,
+    role: ReplicaRole,
+    #[serde(
+        default,
+        deserialize_with = "de_map",
+        skip_serializing_if = "HashMap::is_empty"
+    )]
     communication_info: HashMap<String, String>,
 }
 
 impl From<&Secret> for SecretJson {
     fn from(s: &Secret) -> Self {
         SecretJson {
-            owner_replica_id: s.owner_replica_id,
             helpers: s.helpers.iter().map(HelperJson::from).collect(),
             secrets: s.secrets.iter().map(UserSecretJson::from).collect(),
             replicas: s.replicas.as_ref().map(ReplicasJson::from),
@@ -132,7 +138,6 @@ impl From<SecretJson> for Secret {
             helpers: j.helpers.into_iter().map(HelperInfo::from).collect(),
             secrets: j.secrets.into_iter().map(UserSecret::from).collect(),
             replicas: j.replicas.map(Replicas::from),
-            owner_replica_id: j.owner_replica_id,
         }
     }
 }
@@ -160,28 +165,38 @@ impl From<HelperJson> for HelperInfo {
 
 impl From<&UserSecret> for UserSecretJson {
     fn from(u: &UserSecret) -> Self {
-        UserSecretJson { id: u.id.clone(), name: u.name.clone(), data: u.data.clone() }
+        UserSecretJson {
+            id: u.id.clone(),
+            name: u.name.clone(),
+            data: u.data.clone(),
+        }
     }
 }
 impl From<UserSecretJson> for UserSecret {
     fn from(j: UserSecretJson) -> Self {
-        UserSecret { id: j.id, name: j.name, data: j.data }
+        UserSecret {
+            id: j.id,
+            name: j.name,
+            data: j.data,
+        }
     }
 }
 
 impl From<&Replicas> for ReplicasJson {
     fn from(r: &Replicas) -> Self {
         ReplicasJson {
+            channel_id: r.channel_id,
             shared_key: r.shared_key.clone(),
-            replicas: r.replicas.iter().map(ReplicaInfoJson::from).collect(),
+            members: r.members.iter().map(ReplicaInfoJson::from).collect(),
         }
     }
 }
 impl From<ReplicasJson> for Replicas {
     fn from(j: ReplicasJson) -> Self {
         Replicas {
-            replicas: j.replicas.into_iter().map(ReplicaInfo::from).collect(),
+            members: j.members.into_iter().map(ReplicaInfo::from).collect(),
             shared_key: j.shared_key,
+            channel_id: j.channel_id,
         }
     }
 }
@@ -189,10 +204,11 @@ impl From<ReplicasJson> for Replicas {
 impl From<&ReplicaInfo> for ReplicaInfoJson {
     fn from(r: &ReplicaInfo) -> Self {
         ReplicaInfoJson {
-            channel_id: r.channel_id,
-            transport_uri: r.transport_uri.clone(),
             replica_id: r.replica_id,
-            sender_kind: r.sender_kind,
+            transport_uri: r.transport_uri.clone(),
+            // An out-of-range discriminant cannot reach the wire: the roster
+            // is built from `ReplicaMember` rows, whose role is typed.
+            role: ReplicaRole::from_i32(r.role).unwrap_or(ReplicaRole::Destination),
             communication_info: r.communication_info.clone(),
         }
     }
@@ -200,24 +216,23 @@ impl From<&ReplicaInfo> for ReplicaInfoJson {
 impl From<ReplicaInfoJson> for ReplicaInfo {
     fn from(j: ReplicaInfoJson) -> Self {
         ReplicaInfo {
-            channel_id: j.channel_id,
-            transport_uri: j.transport_uri,
-            communication_info: j.communication_info,
             replica_id: j.replica_id,
-            sender_kind: j.sender_kind,
+            transport_uri: j.transport_uri,
+            role: j.role as i32,
+            communication_info: j.communication_info,
         }
     }
 }
 
-/// Encode the v1 payload (no version prefix): gzip-compressed JSON.
+/// Encode the v2 payload (no version prefix): gzip-compressed JSON.
 pub fn encode(secret: &Secret) -> Vec<u8> {
     let dto = SecretJson::from(secret);
-    let json = serde_json::to_vec(&dto)
-        .expect("Secret JSON serialization is infallible for owned data");
+    let json =
+        serde_json::to_vec(&dto).expect("Secret JSON serialization is infallible for owned data");
     gzip(&json)
 }
 
-/// Decode a v1 payload (no version prefix) back into a [`Secret`].
+/// Decode a v2 payload (no version prefix) back into a [`Secret`].
 pub fn decode(payload: &[u8]) -> Result<Secret, SecretError> {
     let json = gunzip(payload)?;
     let dto: SecretJson = serde_json::from_slice(&json)?;
@@ -242,16 +257,23 @@ mod tests {
                 data: b"correct horse battery staple".to_vec(),
             }],
             replicas: Some(Replicas {
-                replicas: vec![ReplicaInfo {
-                    channel_id: 2_000_000,
-                    transport_uri: "https://replica-0.example.org/derec".to_owned(),
-                    communication_info: HashMap::new(),
-                    replica_id: 900_000,
-                    sender_kind: 0,
-                }],
+                channel_id: 2_000_000,
+                members: vec![
+                    ReplicaInfo {
+                        replica_id: 900_000,
+                        transport_uri: "https://replica-0.example.org/derec".to_owned(),
+                        role: ReplicaRole::Source as i32,
+                        communication_info: HashMap::new(),
+                    },
+                    ReplicaInfo {
+                        replica_id: 900_001,
+                        transport_uri: "https://replica-1.example.org/derec".to_owned(),
+                        role: ReplicaRole::Destination as i32,
+                        communication_info: HashMap::new(),
+                    },
+                ],
                 shared_key: vec![0x55; 32],
             }),
-            owner_replica_id: 0xAAAA_BBBB,
         }
     }
 
@@ -264,11 +286,38 @@ mod tests {
     #[test]
     fn u64_fields_survive_beyond_2_pow_53() {
         let mut secret = full_secret();
-        secret.owner_replica_id = u64::MAX;
         secret.helpers[0].channel_id = (1u64 << 53) + 7;
+        let replicas = secret.replicas.as_mut().expect("fixture has replicas");
+        replicas.channel_id = u64::MAX;
+        replicas.members[0].replica_id = u64::MAX - 1;
         let decoded = decode(&encode(&secret)).expect("large u64 must round-trip");
-        assert_eq!(decoded.owner_replica_id, u64::MAX);
         assert_eq!(decoded.helpers[0].channel_id, (1u64 << 53) + 7);
+        let decoded_replicas = decoded.replicas.expect("replicas survive");
+        assert_eq!(decoded_replicas.channel_id, u64::MAX);
+        assert_eq!(decoded_replicas.members[0].replica_id, u64::MAX - 1);
+    }
+
+    /// The roster names its source by role, so a decoded payload must be able
+    /// to answer "who is the source" without a separate field.
+    #[test]
+    fn role_survives_the_round_trip_and_names_one_source() {
+        let decoded = decode(&encode(&full_secret())).expect("round trip");
+        let members = decoded.replicas.expect("replicas survive").members;
+        let sources: Vec<u64> = members
+            .iter()
+            .filter(|m| m.role == ReplicaRole::Source as i32)
+            .map(|m| m.replica_id)
+            .collect();
+        assert_eq!(sources, vec![900_000], "exactly one member is the source");
+    }
+
+    /// `role` rides the wire as its variant name, not as an integer — the
+    /// shape other SDKs decode against.
+    #[test]
+    fn role_serializes_as_its_variant_name() {
+        let json = String::from_utf8(gunzip(&encode(&full_secret())).unwrap()).unwrap();
+        assert!(json.contains(r#""role":"Source""#), "got: {json}");
+        assert!(json.contains(r#""role":"Destination""#), "got: {json}");
     }
 
     #[test]
@@ -277,9 +326,18 @@ mod tests {
         secret.replicas = None;
         secret.helpers[0].communication_info.clear();
         let json = String::from_utf8(gunzip(&encode(&secret)).unwrap()).unwrap();
-        assert!(!json.contains("replicas"), "absent replicas must be omitted");
-        assert!(!json.contains("communication_info"), "empty communication_info must be omitted");
-        assert!(!json.contains("version"), "v1 JSON must not carry a version field");
+        assert!(
+            !json.contains("replicas"),
+            "absent replicas must be omitted"
+        );
+        assert!(
+            !json.contains("communication_info"),
+            "empty communication_info must be omitted"
+        );
+        assert!(
+            !json.contains("version"),
+            "v2 JSON must not carry a version field"
+        );
     }
 
     #[test]
@@ -290,7 +348,7 @@ mod tests {
 
     #[test]
     fn decoder_tolerates_null_and_missing_optional_fields() {
-        let json = br#"{"owner_replica_id":"5","helpers":[{"channel_id":"2","transport_uri":"u","shared_key":"qqqqqg==","communication_info":null}]}"#;
+        let json = br#"{"helpers":[{"channel_id":"2","transport_uri":"u","shared_key":"qqqqqg==","communication_info":null}]}"#;
         let decoded = decode(&gzip(json)).expect("null/absent optionals must decode");
         assert!(decoded.replicas.is_none());
         assert!(decoded.secrets.is_empty());

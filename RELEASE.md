@@ -44,35 +44,29 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-4. Verify each packages to be uploaded independently:
+4. Verify the packages to be uploaded:
 
 ```bash
-cargo publish --dry-run -p derec-proto
-cargo publish --dry-run -p derec-cryptography
-cargo publish --dry-run -p derec-library
+cargo publish --workspace --dry-run
 ```
 
-This step ensures the packages compile correctly once packaged.
+This step ensures the packages compile correctly once packaged. Because the
+crates depend on each other by `version` + `path`, a whole-workspace dry run
+resolves the not-yet-published versions against a temporary local registry;
+dry-running `derec-library` on its own fails until its dependencies are on
+crates.io.
 
 ---
 
 ## Publishing Rust SDK
 
-Publish the crates required by `derec-library` first:
+Publish all three crates in dependency order:
 
 ```bash
-cargo publish -p derec-proto
-cargo publish -p derec-cryptography
+cargo publish --workspace
 ```
 
-Then publish the SDK crate:
-
-```bash
-cargo publish -p derec-library
-```
-
-If both dependency crates are being released together, they may be published
-in either order.
+`derec-rust-binding-smoke-test` is marked `publish = false` and is skipped.
 
 > [!INFO]
 > Each publish may take a few seconds before the crate becomes available for dependency resolution.
@@ -421,9 +415,10 @@ go get github.com/derecalliance/lib-derec/packages/go@vX.Y.Z
 
 Before publishing a release:
 
-- [ ] Version updated in Cargo.toml
-- [ ] Changelog updated
-- [ ] `make all` succeeds
+- [ ] Version updated in `library/Cargo.toml` (everything else derives from it
+      via `scripts/get-version.sh` — do not edit package manifests individually)
+- [ ] Release notes written, including any **breaking** changes
+- [ ] `make all` succeeds — run it **last**, immediately before publishing
 - [ ] Test installation of all SDKs
 
 ---

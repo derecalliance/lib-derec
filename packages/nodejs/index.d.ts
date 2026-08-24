@@ -28,11 +28,76 @@ export interface SecretStore {
   remove(secretId: string, channelId: string, kind: 0 | 1 | 2): Promise<void>;
 }
 
+/**
+ * Channel-record persistence.
+ *
+ * A record is addressed by `(channelId, replicaId)`. A `replicaId` of `"0"` —
+ * the value the protocol reserves as "absent" — addresses the helper channel
+ * at `channelId`.
+ *
+ * Any other value addresses that member of the replica group, and the member
+ * is keyed by **`replicaId` alone**. The accompanying `channelId` is context,
+ * not part of the key: a member moves between channels during an admission
+ * handover while remaining the same member, and a lookup that required both to
+ * match would miss it exactly when the move needs to be observed. Keep two
+ * maps — helpers by `channelId`, members by `replicaId` — not one keyed by the
+ * pair.
+ *
+ * `load`/`save` bytes are a JSON-encoded `ChannelRecord`: an externally
+ * tagged union carrying exactly one of `Helper` or `Replica`.
+ *
+ * `listHelpers` and `listReplicas` are **not** arrays of that union — they
+ * return a JSON array of the **inner** records with the tag stripped:
+ * `[{ channel_id, transport, ... }, ...]`, `HelperChannel` for the first and
+ * `ReplicaMember` for the second. Wrapping each element back in
+ * `{ "Helper": ... }` will not decode.
+ *
+ * Build that array by **splicing the stored bytes as text** — the payloads are
+ * opaque, so persist and re-emit them verbatim:
+ *
+ * ```js
+ * const inner = rows.map((r) => new TextDecoder().decode(r));
+ * return new TextEncoder().encode(`[${inner.join(",")}]`);
+ * ```
+ *
+ * Do not `JSON.parse` and re-serialise. Every id in these records is a `u64`,
+ * and `JSON.parse` silently rounds anything above 2^53 — the corruption only
+ * appears once a real id happens to be large. `bindings/web` implements this.
+ */
 export interface ChannelStore {
-  load(secretId: string, channelId: string): Promise<Uint8Array | null | undefined>;
-  save(secretId: string, channelId: string, bytes: Uint8Array): Promise<void>;
-  listChannels(secretId: string): Promise<string[]>;
-  remove(secretId: string, channelId: string): Promise<boolean>;
+  load(
+    secretId: string,
+    channelId: string,
+    replicaId: string,
+  ): Promise<Uint8Array | null | undefined>;
+  save(
+    secretId: string,
+    channelId: string,
+    replicaId: string,
+    bytes: Uint8Array,
+  ): Promise<void>;
+  remove(secretId: string, channelId: string, replicaId: string): Promise<boolean>;
+  /** JSON array of the helper channels stored under `secretId`. */
+  listHelpers(secretId: string): Promise<Uint8Array | null | undefined>;
+  /**
+   * JSON array of the replica-group members stored under `secretId`,
+   * including this device's own row.
+   *
+   * The order is significant in exactly one situation. A group has one member
+   * holding the `Source` role; when it is removed, the protocol promotes the
+   * first element of this array that is neither the departing member nor
+   * itself leaving. Ordering this array is therefore how an application
+   * chooses its succession policy. The choice is read once, on the single
+   * device running the removal, and is then published in the roster, so
+   * implementations on different devices need not agree on order. Nothing else
+   * consults it.
+   *
+   * Returning an arbitrary order is correct and simply delegates the choice to
+   * the storage — note that a SQL `SELECT` without `ORDER BY` and `Map`
+   * insertion order after arbitrary edits are both effectively arbitrary.
+   * Order explicitly to make succession predictable.
+   */
+  listReplicas(secretId: string): Promise<Uint8Array | null | undefined>;
   linkChannel(
     secretId: string,
     channelId: string,
@@ -90,7 +155,7 @@ export interface UserSecretStore {
  * returns the exact blob it received, `remove` drops the row, and
  * `loadAll` returns every blob whose `kind` matches the requested
  * category (`0` = PendingVerification, `1` = PendingRecovery,
- * `2` = PendingUnpair, `3` = SharingRound).
+ * `2` = PendingUnpair, `3` = SharingRound, `4` = PendingSyncCheck).
  *
  * Rows are keyed by `(secretId, StateKey)` — the `keyJson` buffer is
  * a JSON object `{ kind, channel_id?, version? }` matching the `kind`
@@ -110,9 +175,27 @@ export interface StateStore {
     keyJson: Uint8Array,
   ): Promise<Uint8Array | null | undefined>;
   remove(secretId: string, keyJson: Uint8Array): Promise<boolean>;
-  loadAll(secretId: string, kind: 0 | 1 | 2 | 3): Promise<Uint8Array[]>;
+  loadAll(secretId: string, kind: 0 | 1 | 2 | 3 | 4): Promise<Uint8Array[]>;
 }
 
+/**
+ * Outbound message delivery.
+ *
+ * This is a mailbox, not a request/response channel: every peer has an
+ * address, and a reply is posted to that address rather than returned from
+ * `process`. Where both sides are reachable services, a one-way push is all
+ * that is needed.
+ *
+ * A peer that cannot be addressed — a phone, a browser, anything behind NAT —
+ * breaks that silently: the reply is handed to `send`, goes nowhere, and
+ * nothing reports an error. Such a service must answer on the connection the
+ * request arrived on, by building the protocol per request with a `Transport`
+ * that collects into a buffer instead of sending, then returning the collected
+ * message whose trace id matches the inbound envelope's
+ * (`envelope_read_trace_id`). One call can emit several messages, so the rest
+ * of the buffer is genuine fan-out and still has to be delivered. See "Serving
+ * DeRec over request/response transports" in the Rust SDK README.
+ */
 export interface Transport {
   send(endpoint: { protocol: string; uri: string }, message: Uint8Array): Promise<void>;
 }
@@ -141,6 +224,14 @@ export enum SenderKind {
  *   already-KYC-authenticated institution). Applications MUST rate-limit
  *   inbound `PrePairRequest`s per channel and expire outstanding NoKeys
  *   contacts on a short timer.
+ *
+ *   Because nothing binds the published keys to the contact, the channel is
+ *   held `Pending` until `verifyFingerprint` succeeds on both sides: it is
+ *   not a publish target, not a recovery source, and inbound messages on it
+ *   are ignored. A man-in-the-middle on the plaintext `PrePair` leg leaves
+ *   the two sides with different shared keys and so different fingerprints,
+ *   which is what the comparison catches — the role `contact_binding_hash`
+ *   plays for `HashedKeys`.
  */
 export enum ContactMode {
   InlineKeys = 0,
@@ -156,6 +247,15 @@ export enum FlowKind {
   RecoverSecret = 4,
   Unpair = 5,
   UpdateChannelInfo = 6,
+  /** Ask the replica group whether this device is behind, and catch up if it
+   *  is. Replica-only, and takes no parameters — the group and this device's
+   *  own version both come from the stores. */
+  SyncCheck = 7,
+  /** Remove a member from the replica group. Replica-only. Naming this device
+   *  is a voluntary departure; naming another is an eviction. Params:
+   *  `{ replica_id: string; memo?: string }` — `replica_id` is a decimal
+   *  string so ids above 2^53 survive JS number handling. */
+  RemoveReplica = 8,
 }
 
 export type UnpairAck = "required" | "not_required";
@@ -223,6 +323,45 @@ export interface UpdateChannelInfoParams {
   transport_protocol?: { uri: string; protocol: number };
 }
 
+/**
+ * How long the protocol waits on each thing that can keep it waiting. Every
+ * field is optional; omit one to keep the library's default for it.
+ */
+export interface Timeouts {
+  /** Staleness boundary for inbound envelopes — the replay-defence window.
+   *  Any message older than this is discarded on receipt, whatever the flow.
+   *  Lowering it starts refusing legitimately old messages from slow
+   *  transports or skewed clocks. Library default: 300. */
+  inbound_message_secs?: number;
+  /** How long a publishing round waits on a peer that has not answered.
+   *  Bounds how long `SharingComplete` can be delayed by one unreachable
+   *  peer. Library default: 60. */
+  sharing_round_secs?: number;
+  /** How long to wait for an unpair acknowledgement before dropping local
+   *  channel state anyway. Library default: 60. */
+  unpair_ack_secs?: number;
+  /** Removal of channels still awaiting out-of-band fingerprint
+   *  confirmation — every replica pairing, and every `NoKeys` pairing.
+   *  Unlike the others this can be disabled, leaving the sweep to the
+   *  application via `removeExpiredChannels`. The budget is a **human** one:
+   *  someone comparing a fingerprint, possibly over the phone. Library
+   *  default: `{ enabled: true, timeout_in_secs: 300 }`. */
+  expired_channels?: { enabled: boolean; timeout_in_secs: number };
+}
+
+/** `SyncCheck` takes no parameters: the group and this device's own version
+ *  are both read from the stores. The argument may be omitted entirely. */
+export type SyncCheckParams = Record<string, never>;
+
+export interface RemoveReplicaParams {
+  /** The member to remove, as a **decimal** `u64` string — the same form
+   *  `ReplicaPaired.peer_replica_id` hands back. A value naming no current
+   *  member is rejected; it is not silently ignored. */
+  replica_id: string;
+
+  memo?: string;
+}
+
 export type DeRecEvent =
   | {
       type: "PairingCompleted";
@@ -252,7 +391,62 @@ export type DeRecEvent =
   | { type: "ShareStored"; channel_id: string; version: number }
   | { type: "ShareConfirmed"; channel_id: string; version: number }
   | { type: "ShareRejected"; channel_id: string; version: number; status: number; memo: string }
+  /** A publishing round finished — every targeted helper confirmed,
+   *  rejected, or timed out.
+   *
+   *  **A mixed round waits for the replica leg.** The counts here describe
+   *  helpers only and are known the instant the helpers answer, but the
+   *  event is withheld until every replica member has also acknowledged,
+   *  refused, or timed out. One unreachable member therefore delays it by
+   *  up to the configured timeout, which is easy to mistake for a hang.
+   *  Nothing is lost — the round always terminates and a silent member is
+   *  reported in `ReplicaSyncComplete.behind` rather than failing it.
+   *
+   *  Drive per-helper progress from `ShareConfirmed` instead: those land as
+   *  each helper answers, with no cross-population wait. A helpers-only
+   *  round is unaffected. */
   | { type: "SharingComplete"; version: number; confirmed_count: number; failed_count: number; threshold_met: boolean }
+  /** A group member refused a secret sync. Keyed by `replica_id`, not
+   *  `channel_id`: every member answers on the one group channel. A
+   *  `VERSION_CONFLICT` status means the round must be resolved and
+   *  republished at a new version. */
+  | {
+      type: "ReplicaSyncRejected";
+      replica_id: string;
+      secret_id: string;
+      version: number;
+      status: number;
+      memo: string;
+    }
+  /** A secret sync could not be delivered to a member at all — distinct from
+   *  `ReplicaSyncRejected`, which is the member answering "no". */
+  | { type: "ReplicaSyncFailed"; replica_id: string; version: number; reason: string }
+  /** A member left the group and its roster row was dropped. Fires on the
+   *  members that remain. */
+  | { type: "ReplicaRemoved"; replica_id: string }
+  /** The group's source role moved to another member because the previous
+   *  source is leaving. Fires on the device that chose the successor — which
+   *  it does by the order its channel store returns members in — and on the
+   *  successor itself when the roster promoting it arrives. */
+  | { type: "ReplicaSourceChanged"; replica_id: string }
+  /** This device left the group and dropped its whole `secret_id` partition —
+   *  group channel, helper channels, shares, secrets and the snapshot. Fires
+   *  only once it was told to leave *and* has since seen a roster excluding
+   *  it; absence alone never destroys a copy of the secret. */
+  | { type: "SelfRemovedFromGroup"; version: number }
+  /** A replica catch-up finished. `fetched_from` is absent when this device
+   *  was already current, in which case no hydration event follows. */
+  | {
+      type: "SyncCheckComplete";
+      local_version: number;
+      group_version: number;
+      fetched_from?: string;
+    }
+  /** The replica leg of a publishing round finished. Reported separately from
+   *  `SharingComplete`: replicas are best-effort, so a member in `behind` does
+   *  not fail the round. `behind` is the application's retry list — the
+   *  library keeps no durable per-member sync state. */
+  | { type: "ReplicaSyncComplete"; version: number; synced: string[]; behind: string[] }
   | { type: "ShareVerified"; channel_id: string; version: number }
   | {
       type: "SecretsDiscovered";
@@ -265,9 +459,8 @@ export type DeRecEvent =
   /** Recovery completed — the typed `Secret` snapshot the owner
    *  originally protected. Mirrors `ReplicaSecretReceived.secret`:
    *  `secrets` is the user-facing `Vec<UserSecret>` the application
-   *  fed to `start(FlowKind.ProtectSecret)`; `helpers`, `replicas`
-   *  and `owner_replica_id` are the roster snapshot captured at
-   *  distribution time. The library handles the two-stage
+   *  fed to `start(FlowKind.ProtectSecret)`; `helpers` and `replicas`
+   *  are the roster snapshot captured at distribution time. The library handles the two-stage
    *  `DeRecSecret` → `Secret` protobuf decode internally. */
   | {
       type: "SecretRecovered";
@@ -284,20 +477,23 @@ export type DeRecEvent =
           data: Uint8Array;
         }>;
         /** Replica composite. Absent when this `secret_id` has no
-         *  replica setup. Carries the destination roster, the
-         *  per-helper share map, and the 32-byte group key. Required
-         *  by `restore` to rebuild replica channels without re-pairing. */
+         *  replica setup. Carries the full member roster, the one channel
+         *  they share, and the 32-byte group key. Required by `restore` to
+         *  rebuild replica state without re-pairing. */
         replicas?: {
-          replicas: Array<{
-            channel_id: string;
-            transport_uri: string;
-            communication_info: Record<string, string>;
+          /** The one channel every member is addressed on. */
+          channel_id: string;
+          /** Every member of the group, including the writer. Exactly one
+           *  carries `role: "Source"` — that member is where the secret
+           *  originated, which is why no separate owner field is needed. */
+          members: Array<{
             replica_id: string;
-            sender_kind: number;
+            transport_uri: string;
+            role: "Source" | "Destination";
+            communication_info: Record<string, string>;
           }>;
           shared_key: Uint8Array;
         };
-        owner_replica_id: string;
       };
     }
 
@@ -311,8 +507,10 @@ export type DeRecEvent =
   | { type: "PrePairRejected"; channel_id: string; status: number; memo: string }
 
   /** Fires alongside `PairingCompleted` on replica-mode pair handshakes.
-   *  `peer_replica_id` is the peer's hex-encoded `u64` (matches the wire
-   *  `derec.replica_id` representation). The local side's role
+   *  `peer_replica_id` is the peer's `u64` as a **decimal** string,
+   *  matching the wire `derec.replica_id` representation and every other
+   *  id across this boundary. Pass it back verbatim — `RemoveReplica`
+   *  expects the same decimal form. The local side's role
    *  (`ReplicaSource` vs `ReplicaDestination`) is on the persisted
    *  channel record — replica pairings are unidirectional, so there is
    *  no separate "role in pair" field. */
@@ -325,7 +523,8 @@ export type DeRecEvent =
    *  `ReplicaDestination` channel. The library decoded the
    *  `ReplicaSecretPayload`; the app installs `secret.secrets` and
    *  optionally uses `shares` for recovery. `from_replica_id` and the
-   *  `replica_id` fields inside `secret` are hex-encoded `u64`. */
+   *  `replica_id` fields inside `secret` are `u64` as **decimal**
+   *  strings. */
   | {
       type: "ReplicaSecretReceived";
       channel_id: string;
@@ -347,16 +546,68 @@ export type DeRecEvent =
         /** Replica composite. Absent when this `secret_id` has no
          *  replica setup. The same shape as `SecretRecovered.secret.replicas`. */
         replicas?: {
-          replicas: Array<{
-            channel_id: string;
-            transport_uri: string;
-            communication_info: Record<string, string>;
+          /** The one channel every member is addressed on. */
+          channel_id: string;
+          /** Every member of the group, including the writer. Exactly one
+           *  carries `role: "Source"` — that member is where the secret
+           *  originated, which is why no separate owner field is needed. */
+          members: Array<{
             replica_id: string;
-            sender_kind: number;
+            transport_uri: string;
+            role: "Source" | "Destination";
+            communication_info: Record<string, string>;
           }>;
           shared_key: Uint8Array;
         };
-        owner_replica_id: string;
+      };
+      shares: Array<{
+        channel_id: string;
+        committed_share: Uint8Array;
+      }>;
+    }
+  /** The first sync for a `secret_id` this device had no snapshot for —
+   *  the secret now exists here. Same payload as `ReplicaSecretReceived`,
+   *  which reports a later version of a secret the device already held.
+   *  Both are written to the stores by the library before the event is
+   *  delivered; the distinct type is what tells an application the set of
+   *  secrets on the device changed.
+   *
+   *  This is not a recovery: recovery reconstructs a secret from helper
+   *  shares and is driven by the application through `restore`. */
+  | {
+      type: "ReplicaSecretInstalled";
+      channel_id: string;
+      from_replica_id: string;
+      secret_id: string;
+      version: number;
+      secret: {
+        helpers: Array<{
+          channel_id: string;
+          transport_uri: string;
+          shared_key: Uint8Array;
+          communication_info: Record<string, string>;
+        }>;
+        secrets: Array<{
+          id: Uint8Array;
+          name: string;
+          data: Uint8Array;
+        }>;
+        /** Replica composite. Absent when this `secret_id` has no
+         *  replica setup. The same shape as `SecretRecovered.secret.replicas`. */
+        replicas?: {
+          /** The one channel every member is addressed on. */
+          channel_id: string;
+          /** Every member of the group, including the writer. Exactly one
+           *  carries `role: "Source"` — that member is where the secret
+           *  originated, which is why no separate owner field is needed. */
+          members: Array<{
+            replica_id: string;
+            transport_uri: string;
+            role: "Source" | "Destination";
+            communication_info: Record<string, string>;
+          }>;
+          shared_key: Uint8Array;
+        };
       };
       shares: Array<{
         channel_id: string;
@@ -441,6 +692,7 @@ export type DeRecEvent =
   /** An unpair request was dispatched to `channel_id`. Followed by an
    *  `Unpaired` event once the peer acknowledges (or in the same event
    *  vec, under `UnpairAck.NotRequired`). */
+  | { type: "UnpairFailed"; channel_id: string; error: string }
   | { type: "UnpairStarted"; channel_id: string }
   /** An update-channel-info request was dispatched to `channel_id`. */
   | { type: "UpdateChannelInfoStarted"; channel_id: string }
@@ -463,6 +715,16 @@ export type DeRecEvent =
  *   oracle. Anyone who knows a HashedKeys contact's nonce can elicit a
  *   key-publish response. Keep off unless you control both ends of
  *   the transport.
+ * - `storeShare` — the helper's only admission-control point for
+ *   inbound shares. The protocol enforces no size, quota or rate limit
+ *   of its own, and `maxShareSize` is checked for range overlap at
+ *   pairing time only, never against an actual share. While this is
+ *   `false`, `ActionRequired` carries the decoded request, so the
+ *   application can inspect the share and call `reject()` with
+ *   `StatusEnum.SizeLimitExceeded`. Setting it `true` removes that
+ *   opportunity entirely: every share from every paired Owner is stored
+ *   unconditionally, at whatever size it arrives. Keep off in any
+ *   deployment with per-user storage limits.
  * - `unpair` — destructive. Accepting deletes the local channel
  *   record before any UI confirmation.
  * - `updateChannelInfo` — silently overwrites the channel record with
@@ -510,8 +772,42 @@ export declare class DeRecProtocolBuilder {
   withThreshold(threshold: number): DeRecProtocolBuilder;
   /** Default: 3. */
   withKeepVersionsCount(count: number): DeRecProtocolBuilder;
-  /** Seconds. Default: 300 (5 minutes). Clamped to at least 1. */
-  withTimeout(timeoutInSecs: number): DeRecProtocolBuilder;
+  /**
+   * Configure how long the protocol waits on each thing that can keep it
+   * waiting. Every field is optional and **absent means "keep the library
+   * default"**; not calling this at all leaves all four at their defaults.
+   *
+   * These were one setting until it became clear they answer different
+   * questions. `inbound_message_secs` is a **security** boundary — how stale
+   * a message may be and still be accepted — so it has to tolerate transport
+   * latency and clock skew. The other three are **liveness** budgets: how
+   * long to keep hoping a peer will answer.
+   *
+   * Values are forwarded verbatim; clamping, and the meaning of a disabled
+   * `expired_channels`, are library decisions rather than this binding's.
+   */
+  withTimeouts(timeouts: Timeouts): DeRecProtocolBuilder;
+
+  /**
+   * Accept plaintext `http://` transport endpoints. **Development only.**
+   * Default: `false`.
+   *
+   * With `false`, plaintext is accepted in exactly one situation: an endpoint
+   * this device configured for **itself** that names loopback (`localhost`,
+   * `127.0.0.1`, `::1`). A local dev server therefore needs no configuration
+   * at all.
+   *
+   * With `true`, plaintext is accepted for **any host on any path**,
+   * including endpoints a peer supplies. That is what makes the LAN case
+   * work — a phone talking to a laptop, where neither side is loopback — and
+   * why the name is blunt.
+   *
+   * This is a guardrail, not transport security. The SDK opens no sockets;
+   * delivery is your `Transport`. Nothing here stops an application sending
+   * plaintext — it governs which endpoints the protocol will record,
+   * propagate to peers, and reply to.
+   */
+  withUnsafeHttp(allow: boolean): DeRecProtocolBuilder;
   /** Default: empty. */
   withCommunicationInfo(info: Record<string, string>): DeRecProtocolBuilder;
   /** Default: false. */
@@ -593,6 +889,16 @@ export declare class DeRecProtocol {
   start(flowKind: FlowKind.RecoverSecret, params: RecoverSecretParams): Promise<DeRecEvent[]>;
   start(flowKind: FlowKind.Unpair, params: UnpairParams): Promise<DeRecEvent[]>;
   start(flowKind: FlowKind.UpdateChannelInfo, params: UpdateChannelInfoParams): Promise<DeRecEvent[]>;
+  start(flowKind: FlowKind.SyncCheck, params?: SyncCheckParams): Promise<DeRecEvent[]>;
+
+  /** Announce a member's removal. This does **not** remove anything on its
+   *  own and emits no `ReplicaRemoved`: it tells every member and flags the
+   *  target locally. The removal completes only once the application
+   *  publishes a roster omitting that member — an ordinary
+   *  `start(FlowKind.ProtectSecret)` — at which point `ReplicaRemoved`
+   *  fires. A group with no secret to publish therefore cannot complete a
+   *  removal. */
+  start(flowKind: FlowKind.RemoveReplica, params: RemoveReplicaParams): Promise<DeRecEvent[]>;
 
   /**
    * Replace this node's local <c>communication_info</c> map. Does not
@@ -610,14 +916,31 @@ export declare class DeRecProtocol {
 
   process(message: Uint8Array): Promise<DeRecEvent[]>;
 
+  /**
+   * Advance time-driven state without an inbound message.
+   *
+   * Timeouts are otherwise only evaluated by `process`, so a publish whose
+   * helpers all go quiet has nothing left to close it: the round stays open
+   * and no `SharingComplete` is ever emitted. Call this from a timer —
+   * `setInterval`, a service-worker alarm, a job runner — at an interval
+   * shorter than the configured timeout.
+   *
+   * Safe to call at any time; with nothing in flight it resolves to an empty
+   * array. It mutates the same round state an inbound response does, so it
+   * must be serialized against `process` for the same `secretId`.
+   */
+  tick(): Promise<DeRecEvent[]>;
+
   accept(actionBytes: Uint8Array): Promise<DeRecEvent[]>;
 
   reject(actionBytes: Uint8Array, status: number, memo: string): Promise<void>;
 
   /**
    * Derive the human-readable fingerprint for a paired channel. Both sides
-   * of a replica pair compute the same fingerprint from the shared key —
-   * users compare them out of band before calling `verifyFingerprint`.
+   * compute the same value from the shared key — users compare them out of
+   * band before calling `verifyFingerprint`. Required for every replica
+   * pairing and every `NoKeys` pairing, which stay unusable until it
+   * succeeds.
    */
   getFingerprint(channelId: bigint | number): Promise<string>;
 
@@ -627,6 +950,16 @@ export declare class DeRecProtocol {
    * `true` on confirmation, `false` on mismatch.
    */
   verifyFingerprint(channelId: bigint | number, fingerprint: string): Promise<boolean>;
+  /**
+   * Remove `Pending` channels older than `olderThanSecs`, along with their
+   * pairing keys. Resolves to the removed channel ids as decimal strings.
+   *
+   * Independent of the configured cleanup policy — this sweeps at the
+   * threshold given even when that policy is disabled. The age comparison
+   * is strict, so a channel created within the current second survives
+   * even `0`.
+   */
+  removeExpiredChannels(olderThanSecs: number): Promise<string[]>;
 
   /**
    * Rebuild this protocol's `secret_id` namespace from a recovered

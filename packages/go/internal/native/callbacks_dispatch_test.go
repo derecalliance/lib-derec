@@ -18,25 +18,29 @@ import (
 // without a real backend.
 
 type mockChannelStore struct {
-	loadFn   func(secretID, channelID uint64) (Channel, bool, error)
-	saveFn   func(secretID uint64, channel Channel) error
-	removeFn func(secretID, channelID uint64) (bool, error)
-	listFn   func(secretID uint64) ([]uint64, error)
-	linkFn   func(secretID, a, b uint64) error
-	linkedFn func(secretID, channelID uint64) ([]uint64, error)
+	loadFn         func(secretID, channelID, replicaID uint64) (ChannelRecord, bool, error)
+	saveFn         func(secretID uint64, record ChannelRecord) error
+	removeFn       func(secretID, channelID, replicaID uint64) (bool, error)
+	listHelpersFn  func(secretID uint64) ([]HelperChannel, error)
+	listReplicasFn func(secretID uint64) ([]ReplicaMember, error)
+	linkFn         func(secretID, a, b uint64) error
+	linkedFn       func(secretID, channelID uint64) ([]uint64, error)
 }
 
-func (m *mockChannelStore) Load(secretID, channelID uint64) (Channel, bool, error) {
-	return m.loadFn(secretID, channelID)
+func (m *mockChannelStore) Load(secretID, channelID, replicaID uint64) (ChannelRecord, bool, error) {
+	return m.loadFn(secretID, channelID, replicaID)
 }
-func (m *mockChannelStore) Save(secretID uint64, channel Channel) error {
-	return m.saveFn(secretID, channel)
+func (m *mockChannelStore) Save(secretID uint64, record ChannelRecord) error {
+	return m.saveFn(secretID, record)
 }
-func (m *mockChannelStore) Remove(secretID, channelID uint64) (bool, error) {
-	return m.removeFn(secretID, channelID)
+func (m *mockChannelStore) Remove(secretID, channelID, replicaID uint64) (bool, error) {
+	return m.removeFn(secretID, channelID, replicaID)
 }
-func (m *mockChannelStore) ListChannels(secretID uint64) ([]uint64, error) {
-	return m.listFn(secretID)
+func (m *mockChannelStore) ListHelpers(secretID uint64) ([]HelperChannel, error) {
+	return m.listHelpersFn(secretID)
+}
+func (m *mockChannelStore) ListReplicas(secretID uint64) ([]ReplicaMember, error) {
+	return m.listReplicasFn(secretID)
 }
 func (m *mockChannelStore) LinkChannel(secretID, a, b uint64) error {
 	return m.linkFn(secretID, a, b)
@@ -148,35 +152,60 @@ var _ transportSender = (*mockTransportSender)(nil)
 // --- ChannelStore dispatch ------------------------------------------------
 
 func TestDispatchChannelLoad_Found(t *testing.T) {
-	want := Channel{ID: 7, Status: ChannelStatusPaired, Role: SenderKindOwner, CommunicationInfo: map[string]string{}}
+	helper := HelperChannel{ChannelID: 7, Status: ChannelStatusPaired, PeerRole: SenderKindOwner, CommunicationInfo: map[string]string{}}
 	s := &storeSet{channel: &mockChannelStore{
-		loadFn: func(secretID, channelID uint64) (Channel, bool, error) {
-			if secretID != 100 || channelID != 7 {
-				t.Fatalf("unexpected args: %d %d", secretID, channelID)
+		loadFn: func(secretID, channelID, replicaID uint64) (ChannelRecord, bool, error) {
+			if secretID != 100 || channelID != 7 || replicaID != 0 {
+				t.Fatalf("unexpected args: %d %d %d", secretID, channelID, replicaID)
 			}
-			return want, true, nil
+			return ChannelRecord{Helper: &helper}, true, nil
 		},
 	}}
-	status, out := dispatchChannelLoad(s, 100, 7)
+	status, out := dispatchChannelLoad(s, 100, 7, 0)
 	if status != ffiStatusOK {
 		t.Fatalf("status = %d, want ffiStatusOK", status)
 	}
-	got, err := DecodeChannel(out)
+	got, err := DecodeChannelRecord(out)
 	if err != nil {
-		t.Fatalf("DecodeChannel: %v", err)
+		t.Fatalf("DecodeChannelRecord: %v", err)
 	}
-	if got.ID != want.ID || got.Role != want.Role {
-		t.Fatalf("decoded = %+v, want %+v", got, want)
+	if got.Helper == nil || got.Helper.ChannelID != helper.ChannelID || got.Helper.PeerRole != helper.PeerRole {
+		t.Fatalf("decoded = %+v, want %+v", got, helper)
+	}
+}
+
+// A member row is addressed by its replica id, and the query must reach the
+// store verbatim — a member and a helper channel can share a channel id.
+func TestDispatchChannelLoad_ReplicaMember(t *testing.T) {
+	member := ReplicaMember{ChannelID: 7, ReplicaID: 42, Role: ReplicaRoleDestination, Status: ChannelStatusPaired, CommunicationInfo: map[string]string{}}
+	s := &storeSet{channel: &mockChannelStore{
+		loadFn: func(secretID, channelID, replicaID uint64) (ChannelRecord, bool, error) {
+			if channelID != 7 || replicaID != 42 {
+				t.Fatalf("query must reach the store verbatim: %d %d", channelID, replicaID)
+			}
+			return ChannelRecord{Replica: &member}, true, nil
+		},
+	}}
+	status, out := dispatchChannelLoad(s, 100, 7, 42)
+	if status != ffiStatusOK {
+		t.Fatalf("status = %d, want ffiStatusOK", status)
+	}
+	got, err := DecodeChannelRecord(out)
+	if err != nil {
+		t.Fatalf("DecodeChannelRecord: %v", err)
+	}
+	if got.Replica == nil || got.Replica.ReplicaID != 42 || got.Replica.Role != ReplicaRoleDestination {
+		t.Fatalf("decoded = %+v, want %+v", got, member)
 	}
 }
 
 func TestDispatchChannelLoad_NotFound(t *testing.T) {
 	s := &storeSet{channel: &mockChannelStore{
-		loadFn: func(secretID, channelID uint64) (Channel, bool, error) {
-			return Channel{}, false, nil
+		loadFn: func(secretID, channelID, replicaID uint64) (ChannelRecord, bool, error) {
+			return ChannelRecord{}, false, nil
 		},
 	}}
-	status, out := dispatchChannelLoad(s, 1, 2)
+	status, out := dispatchChannelLoad(s, 1, 2, 0)
 	if status != ffiStatusNotFound {
 		t.Fatalf("status = %d, want ffiStatusNotFound", status)
 	}
@@ -187,11 +216,11 @@ func TestDispatchChannelLoad_NotFound(t *testing.T) {
 
 func TestDispatchChannelLoad_BackendError(t *testing.T) {
 	s := &storeSet{channel: &mockChannelStore{
-		loadFn: func(secretID, channelID uint64) (Channel, bool, error) {
-			return Channel{}, false, errors.New("boom")
+		loadFn: func(secretID, channelID, replicaID uint64) (ChannelRecord, bool, error) {
+			return ChannelRecord{}, false, errors.New("boom")
 		},
 	}}
-	status, _ := dispatchChannelLoad(s, 1, 2)
+	status, _ := dispatchChannelLoad(s, 1, 2, 0)
 	if status != ffiStatusFailure {
 		t.Fatalf("status = %d, want ffiStatusFailure", status)
 	}
@@ -203,11 +232,11 @@ func TestDispatchChannelLoad_BackendError(t *testing.T) {
 // a crash.
 func TestDispatchChannelLoad_PanicRecovered(t *testing.T) {
 	s := &storeSet{channel: &mockChannelStore{
-		loadFn: func(secretID, channelID uint64) (Channel, bool, error) {
+		loadFn: func(secretID, channelID, replicaID uint64) (ChannelRecord, bool, error) {
 			panic("mock store blew up")
 		},
 	}}
-	status, out := dispatchChannelLoad(s, 1, 2)
+	status, out := dispatchChannelLoad(s, 1, 2, 0)
 	if status != ffiStatusFailure {
 		t.Fatalf("status = %d, want ffiStatusFailure after recovered panic", status)
 	}
@@ -217,37 +246,37 @@ func TestDispatchChannelLoad_PanicRecovered(t *testing.T) {
 }
 
 func TestDispatchChannelSave_RecordsValue(t *testing.T) {
-	var saved Channel
+	var saved ChannelRecord
 	var savedSecretID uint64
 	s := &storeSet{channel: &mockChannelStore{
-		saveFn: func(secretID uint64, channel Channel) error {
+		saveFn: func(secretID uint64, record ChannelRecord) error {
 			savedSecretID = secretID
-			saved = channel
+			saved = record
 			return nil
 		},
 	}}
-	ch := Channel{ID: 9, Status: ChannelStatusPending, Role: SenderKindHelper, CommunicationInfo: map[string]string{}}
-	payload, err := EncodeChannel(ch)
+	ch := HelperChannel{ChannelID: 9, Status: ChannelStatusPending, PeerRole: SenderKindHelper, CommunicationInfo: map[string]string{}}
+	payload, err := EncodeChannelRecord(ChannelRecord{Helper: &ch})
 	if err != nil {
-		t.Fatalf("EncodeChannel: %v", err)
+		t.Fatalf("EncodeChannelRecord: %v", err)
 	}
-	status := dispatchChannelSave(s, 55, 9, payload)
+	status := dispatchChannelSave(s, 55, 9, 0, payload)
 	if status != ffiStatusOK {
 		t.Fatalf("status = %d, want ffiStatusOK", status)
 	}
-	if savedSecretID != 55 || saved.ID != 9 || saved.Role != SenderKindHelper {
-		t.Fatalf("mock did not record expected save: secretID=%d channel=%+v", savedSecretID, saved)
+	if savedSecretID != 55 || saved.Helper == nil || saved.Helper.ChannelID != 9 || saved.Helper.PeerRole != SenderKindHelper {
+		t.Fatalf("mock did not record expected save: secretID=%d record=%+v", savedSecretID, saved)
 	}
 }
 
 func TestDispatchChannelSave_InvalidJSON(t *testing.T) {
 	s := &storeSet{channel: &mockChannelStore{
-		saveFn: func(secretID uint64, channel Channel) error {
+		saveFn: func(secretID uint64, record ChannelRecord) error {
 			t.Fatal("save should not be called for undecodable input")
 			return nil
 		},
 	}}
-	status := dispatchChannelSave(s, 1, 2, []byte("not json"))
+	status := dispatchChannelSave(s, 1, 2, 0, []byte("not json"))
 	if status != ffiStatusFailure {
 		t.Fatalf("status = %d, want ffiStatusFailure", status)
 	}
@@ -256,34 +285,59 @@ func TestDispatchChannelSave_InvalidJSON(t *testing.T) {
 func TestDispatchChannelRemove_ExistedTransitions(t *testing.T) {
 	existed := true
 	s := &storeSet{channel: &mockChannelStore{
-		removeFn: func(secretID, channelID uint64) (bool, error) {
+		removeFn: func(secretID, channelID, replicaID uint64) (bool, error) {
 			return existed, nil
 		},
 	}}
-	status, got := dispatchChannelRemove(s, 1, 2)
+	status, got := dispatchChannelRemove(s, 1, 2, 0)
 	if status != ffiStatusOK || !got {
 		t.Fatalf("first remove: status=%d existed=%v, want ok/true", status, got)
 	}
 	existed = false
-	status, got = dispatchChannelRemove(s, 1, 2)
+	status, got = dispatchChannelRemove(s, 1, 2, 0)
 	if status != ffiStatusOK || got {
 		t.Fatalf("second remove: status=%d existed=%v, want ok/false", status, got)
 	}
 }
 
-func TestDispatchChannelListChannels(t *testing.T) {
+func TestDispatchChannelListHelpers(t *testing.T) {
 	s := &storeSet{channel: &mockChannelStore{
-		listFn: func(secretID uint64) ([]uint64, error) {
-			return []uint64{1, 2, 3}, nil
+		listHelpersFn: func(secretID uint64) ([]HelperChannel, error) {
+			return []HelperChannel{
+				{ChannelID: 1, CommunicationInfo: map[string]string{}},
+				{ChannelID: 2, CommunicationInfo: map[string]string{}},
+			}, nil
 		},
 	}}
-	status, out := dispatchChannelListChannels(s, 1)
+	status, out := dispatchChannelListHelpers(s, 1)
 	if status != ffiStatusOK {
 		t.Fatalf("status = %d, want ffiStatusOK", status)
 	}
-	ids, err := DecodeUint64Array(out)
-	if err != nil || len(ids) != 3 {
-		t.Fatalf("DecodeUint64Array: ids=%v err=%v", ids, err)
+	var decoded []helperChannelWire
+	if err := json.Unmarshal(out, &decoded); err != nil || len(decoded) != 2 {
+		t.Fatalf("decode listHelpers: decoded=%v err=%v", decoded, err)
+	}
+}
+
+func TestDispatchChannelListReplicas(t *testing.T) {
+	s := &storeSet{channel: &mockChannelStore{
+		listReplicasFn: func(secretID uint64) ([]ReplicaMember, error) {
+			return []ReplicaMember{
+				{ChannelID: 5, ReplicaID: 1, Role: ReplicaRoleSource, CommunicationInfo: map[string]string{}},
+				{ChannelID: 5, ReplicaID: 2, Role: ReplicaRoleDestination, CommunicationInfo: map[string]string{}},
+			}, nil
+		},
+	}}
+	status, out := dispatchChannelListReplicas(s, 1)
+	if status != ffiStatusOK {
+		t.Fatalf("status = %d, want ffiStatusOK", status)
+	}
+	var decoded []replicaMemberWire
+	if err := json.Unmarshal(out, &decoded); err != nil || len(decoded) != 2 {
+		t.Fatalf("decode listReplicas: decoded=%v err=%v", decoded, err)
+	}
+	if decoded[0].Role != ReplicaRoleSource || decoded[1].Role != ReplicaRoleDestination {
+		t.Fatalf("roles must survive the round trip: %+v", decoded)
 	}
 }
 

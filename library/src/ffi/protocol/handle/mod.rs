@@ -14,8 +14,8 @@ use std::time::Duration;
 use prost::Message as _;
 
 use crate::ffi::error::{
-    ffi_error, success, DeRecError, DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_INVALID_ENUM,
-    DEREC_CODE_FFI_NULL_PTR,
+    DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_INVALID_ENUM, DEREC_CODE_FFI_NULL_PTR, DeRecError,
+    ffi_error, success,
 };
 use crate::ffi::protocol::stores::{
     ChannelStoreCallbacks, DotnetChannelStore, DotnetSecretStore, DotnetShareStore,
@@ -171,7 +171,8 @@ unsafe fn construct_protocol(
     threshold: u32,
     keep_versions_count: u32,
     communication_info: HashMap<String, String>,
-    timeout_in_secs: u32,
+    timeouts: crate::protocol::types::Timeouts,
+    unsafe_http: bool,
     auto_respond_on_failure: bool,
     unpair_ack: crate::protocol::UnpairAck,
     auto_reply_to: bool,
@@ -228,7 +229,8 @@ unsafe fn construct_protocol(
         .with_threshold(threshold as usize)
         .with_keep_versions_count(keep_versions_count as usize)
         .with_communication_info(communication_info)
-        .with_timeout(Duration::from_secs(u64::from(timeout_in_secs.max(1))))
+        .with_timeouts(timeouts)
+        .with_unsafe_http(unsafe_http)
         .with_auto_respond_on_failure(auto_respond_on_failure)
         .with_unpair_ack(unpair_ack)
         .with_auto_reply_to(auto_reply_to)
@@ -301,6 +303,70 @@ impl From<AutoAcceptConfig> for crate::protocol::AutoAcceptPolicy {
 /// numbers: `u64` values above 2^53 lose precision once round-tripped
 /// through JSON's `f64`-backed number type in common encoders
 /// (including Go's `encoding/json`).
+/// Automatic expired-channel cleanup, as carried in the
+/// [`derec_protocol_new`] config JSON.
+///
+/// Both fields are always transported. Deciding that a disabled policy
+/// ignores its timeout is a protocol decision and happens in
+/// [`crate::protocol::ExpiredChannelCleanup::new`], not here — this shim
+/// only marshals.
+#[derive(serde::Deserialize)]
+struct RemoveExpiredChannelsConfig {
+    enabled: bool,
+    timeout_in_secs: u64,
+}
+
+impl Default for RemoveExpiredChannelsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timeout_in_secs: 300,
+        }
+    }
+}
+
+/// The four waiting periods, as carried in the [`derec_protocol_new`] config
+/// JSON under `"timeouts"`.
+///
+/// Every field is optional and **absent means "use the library default"** —
+/// the defaults live in [`crate::protocol::types::Timeouts`], not here, so a
+/// binding that omits a field gets whatever the protocol currently considers
+/// right rather than a value frozen into the shim.
+#[derive(serde::Deserialize, Default)]
+struct TimeoutsConfig {
+    #[serde(default)]
+    inbound_message_secs: Option<u64>,
+    #[serde(default)]
+    sharing_round_secs: Option<u64>,
+    #[serde(default)]
+    unpair_ack_secs: Option<u64>,
+    #[serde(default)]
+    expired_channels: Option<RemoveExpiredChannelsConfig>,
+}
+
+impl TimeoutsConfig {
+    fn to_timeouts(&self) -> crate::protocol::types::Timeouts {
+        let d = crate::protocol::types::Timeouts::default();
+        crate::protocol::types::Timeouts {
+            inbound_message: self
+                .inbound_message_secs
+                .map_or(d.inbound_message, Duration::from_secs),
+            sharing_round: self
+                .sharing_round_secs
+                .map_or(d.sharing_round, Duration::from_secs),
+            unpair_ack: self
+                .unpair_ack_secs
+                .map_or(d.unpair_ack, Duration::from_secs),
+            expired_channels: self
+                .expired_channels
+                .as_ref()
+                .map_or(d.expired_channels, |e| {
+                    crate::protocol::ExpiredChannelCleanup::new(e.enabled, e.timeout_in_secs)
+                }),
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct ProtocolConfig {
     secret_id: String,
@@ -308,12 +374,17 @@ struct ProtocolConfig {
     own_transport_protocol: i32,
     threshold: u32,
     keep_versions_count: u32,
-    timeout_in_secs: u32,
     auto_respond_on_failure: bool,
     // 0 = Required, 1 = NotRequired.
     unpair_ack: i32,
     auto_reply_to: bool,
     auto_accept: AutoAcceptConfig,
+    #[serde(default)]
+    timeouts: TimeoutsConfig,
+    /// Accept plaintext `http://` endpoints. Absent means `false`, the
+    /// production posture. See `DeRecProtocolBuilder::with_unsafe_http`.
+    #[serde(default)]
+    unsafe_http: bool,
     // Absent or `null` means "no replica id".
     #[serde(default)]
     replica_id: Option<String>,
@@ -353,6 +424,7 @@ struct ProtocolConfig {
 ///     "unpair": false,
 ///     "update_channel_info": false
 ///   },
+///   "remove_expired_channels": { "enabled": true, "timeout_in_secs": 300 },
 ///   "replica_id": null
 /// }
 /// ```
@@ -364,6 +436,10 @@ struct ProtocolConfig {
 /// - `own_transport_protocol`: [`derec_proto::Protocol`] discriminant.
 /// - `unpair_ack`: `0` = Required, `1` = NotRequired.
 /// - `auto_accept`: one boolean per flow.
+/// - `remove_expired_channels`: automatic removal of expired `Pending`
+///   channels. Optional — omitted means `{ "enabled": true,
+///   "timeout_in_secs": 300 }`. Both fields are always sent; when
+///   `enabled` is `false` the timeout is ignored by the library.
 /// - `replica_id`: decimal-string `u64`, or absent/`null` for "no
 ///   replica id".
 ///
@@ -416,8 +492,7 @@ pub unsafe extern "C" fn derec_protocol_new(
         Some(s) => match s.parse() {
             Ok(id) => Some(id),
             Err(_) => {
-                return ffi_error(DEREC_CODE_FFI_BAD_PROTO, "replica_id is not a valid u64")
-                    .into();
+                return ffi_error(DEREC_CODE_FFI_BAD_PROTO, "replica_id is not a valid u64").into();
             }
         },
         None => None,
@@ -465,7 +540,8 @@ pub unsafe extern "C" fn derec_protocol_new(
             config.threshold,
             config.keep_versions_count,
             info,
-            config.timeout_in_secs,
+            config.timeouts.to_timeouts(),
+            config.unsafe_http,
             config.auto_respond_on_failure,
             unpair_ack_value,
             config.auto_reply_to,

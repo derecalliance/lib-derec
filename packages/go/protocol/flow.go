@@ -24,6 +24,13 @@ const (
 	FlowKindRecoverSecret     FlowKind = 4
 	FlowKindUnpair            FlowKind = 5
 	FlowKindUpdateChannelInfo FlowKind = 6
+	// FlowKindSyncCheck asks the replica group whether this device is behind
+	// and catches up if it is. Replica-only, and takes no params.
+	FlowKindSyncCheck FlowKind = 7
+	// FlowKindRemoveReplica removes a member from the replica group.
+	// Replica-only: naming this device is a voluntary departure, naming
+	// another is an eviction.
+	FlowKindRemoveReplica FlowKind = 8
 )
 
 // targetKind discriminates Target's three wire shapes. The zero value
@@ -170,6 +177,19 @@ type TransportProtocolParam struct {
 	Protocol int32
 }
 
+// RemoveReplicaParams are the parameters for FlowKindRemoveReplica.
+// ReplicaID names the member being removed — this device for a voluntary
+// departure, another for an eviction.
+type RemoveReplicaParams struct {
+	ReplicaID uint64
+	Memo      *string
+}
+
+type removeReplicaParamsWire struct {
+	ReplicaID string  `json:"replica_id"`
+	Memo      *string `json:"memo,omitempty"`
+}
+
 // UpdateChannelInfoParams are the parameters for FlowKindUpdateChannelInfo.
 type UpdateChannelInfoParams struct {
 	Target Target
@@ -276,6 +296,19 @@ func marshalFlowParams(flowKind FlowKind, params any) ([]byte, error) {
 			}
 		}
 		return json.Marshal(w)
+	case FlowKindRemoveReplica:
+		rrp, ok := params.(RemoveReplicaParams)
+		if !ok {
+			return nil, fmt.Errorf("protocol: Start: FlowKindRemoveReplica requires RemoveReplicaParams, got %T", params)
+		}
+		return json.Marshal(removeReplicaParamsWire{
+			ReplicaID: strconv.FormatUint(rrp.ReplicaID, 10),
+			Memo:      rrp.Memo,
+		})
+	case FlowKindSyncCheck:
+		// No parameters: the group and this device's own version both come
+		// from the stores.
+		return json.Marshal(struct{}{})
 	default:
 		return nil, fmt.Errorf("protocol: Start: unknown FlowKind %d", flowKind)
 	}

@@ -7,8 +7,10 @@
 use std::collections::HashMap;
 
 use super::DeRecProtocolHandle;
+use crate::ffi::common::{DeRecBuffer, empty_buffer, vec_into_buffer};
 use crate::ffi::error::{
-    ffi_error, success, DeRecError, DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_NULL_PTR,
+    DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_NULL_PTR, DeRecError, ffi_error, from_lib_error,
+    success,
 };
 
 /// Replace this node's local `communication_info` map. Does not contact
@@ -102,5 +104,68 @@ pub unsafe extern "C" fn derec_protocol_set_own_transport(
     match inner.set_own_transport(validated_tp) {
         Ok(()) => success(),
         Err(e) => crate::ffi::error::from_lib_error(e),
+    }
+}
+
+/// Result type for [`derec_protocol_remove_expired_channels`].
+#[repr(C)]
+pub struct DeRecRemovedChannelsResult {
+    pub error: DeRecError,
+    /// On success, a heap-owned UTF-8 JSON array of removed channel ids as
+    /// decimal strings — e.g. `["12","4096"]`. Decimal strings rather than
+    /// JSON numbers because `u64` ids exceed `Number.MAX_SAFE_INTEGER`;
+    /// this matches every other id crossing this boundary. Caller releases
+    /// via [`crate::ffi::common::derec_free_buffer`].
+    pub channels: DeRecBuffer,
+}
+
+impl From<DeRecError> for DeRecRemovedChannelsResult {
+    fn from(error: DeRecError) -> Self {
+        Self {
+            error,
+            channels: empty_buffer(),
+        }
+    }
+}
+
+/// Remove `Pending` channels older than `older_than_secs`. See
+/// [`crate::protocol::DeRecProtocol::remove_expired_channels`] for the
+/// semantics, including the strict `>` age boundary.
+///
+/// # Safety
+///
+/// `handle` must be a valid pointer returned by
+/// [`super::derec_protocol_new`]. Concurrent calls on the same handle
+/// from different threads are safe: the handle's internal mutex
+/// serializes them.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn derec_protocol_remove_expired_channels(
+    handle: *mut DeRecProtocolHandle,
+    older_than_secs: u64,
+) -> DeRecRemovedChannelsResult {
+    if handle.is_null() {
+        return ffi_error(DEREC_CODE_FFI_NULL_PTR, "handle is null").into();
+    }
+    let h = unsafe { &*handle };
+    let mut inner = h.lock_inner();
+    match h
+        .runtime
+        .block_on(inner.remove_expired_channels(older_than_secs))
+    {
+        Ok(ids) => {
+            let decimal: Vec<String> = ids.iter().map(|c| c.0.to_string()).collect();
+            match serde_json::to_vec(&decimal) {
+                Ok(bytes) => DeRecRemovedChannelsResult {
+                    error: success(),
+                    channels: vec_into_buffer(bytes),
+                },
+                Err(e) => ffi_error(
+                    DEREC_CODE_FFI_BAD_PROTO,
+                    format!("failed to encode removed channel ids: {e}"),
+                )
+                .into(),
+            }
+        }
+        Err(e) => from_lib_error(e).into(),
     }
 }

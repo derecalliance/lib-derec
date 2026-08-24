@@ -347,7 +347,7 @@ func TestOrchestrator_PairingAndProtectSecret_EndToEnd(t *testing.T) {
 		{"owner/channelB", owner.channelStore, channelB},
 		{"helper-b/channelB", helperB.channelStore, channelB},
 	} {
-		if _, ok, err := check.store.Load(orchestratorSecretID, check.cid); err != nil || !ok {
+		if _, ok, err := check.store.Load(orchestratorSecretID, check.cid, 0); err != nil || !ok {
 			t.Fatalf("%s channelStore must have the paired channel: ok=%v err=%v", check.label, ok, err)
 		}
 	}

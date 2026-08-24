@@ -160,9 +160,7 @@ pub fn deserialize(bytes: &[u8]) -> Result<PendingAction, String> {
     if rest.len() < 8 {
         return Err("action bytes too short for channel_id".to_owned());
     }
-    let channel_id = ChannelId(u64::from_be_bytes(
-        rest[..8].try_into().unwrap(),
-    ));
+    let channel_id = ChannelId(u64::from_be_bytes(rest[..8].try_into().unwrap()));
     let rest = &rest[8..];
 
     match tag {

@@ -213,7 +213,6 @@ mod tests {
     fn test_shamir_correctness() {
         // test if recovery on shares produces the shared secret
 
-        //let seed: [u8; 32] = [0; 32];
         let mut rng = thread_rng();
 
         let mut seed = [0u8; 32];

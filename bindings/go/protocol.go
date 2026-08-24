@@ -12,6 +12,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"strconv"
 	"sync"
@@ -27,49 +28,87 @@ const protocolSecretID = uint64(0xDE2EC)
 
 // -- In-memory store implementations, one per protocol.*Store interface --
 
+// Two maps, mirroring the two primary keys the interface defines: a helper
+// channel is unique per channelID, while a replica-group member is unique per
+// replicaID and moves between channels during an admission handover.
 type memChannelStore struct {
-	mu    sync.Mutex
-	data  map[[2]uint64]protocol.Channel
-	links map[[2]uint64]map[uint64]struct{}
+	mu      sync.Mutex
+	helpers map[[2]uint64]protocol.HelperChannel
+	members map[[2]uint64]protocol.ReplicaMember
+	links   map[[2]uint64]map[uint64]struct{}
 }
 
 func newMemChannelStore() *memChannelStore {
 	return &memChannelStore{
-		data:  make(map[[2]uint64]protocol.Channel),
-		links: make(map[[2]uint64]map[uint64]struct{}),
+		helpers: make(map[[2]uint64]protocol.HelperChannel),
+		members: make(map[[2]uint64]protocol.ReplicaMember),
+		links:   make(map[[2]uint64]map[uint64]struct{}),
 	}
 }
 
-func (s *memChannelStore) Load(secretID, channelID uint64) (protocol.Channel, bool, error) {
+func (s *memChannelStore) Load(secretID, channelID, replicaID uint64) (protocol.ChannelRecord, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	c, ok := s.data[[2]uint64{secretID, channelID}]
-	return c, ok, nil
+	if replicaID == 0 {
+		h, ok := s.helpers[[2]uint64{secretID, channelID}]
+		if !ok {
+			return protocol.ChannelRecord{}, false, nil
+		}
+		return protocol.ChannelRecord{Helper: &h}, true, nil
+	}
+	m, ok := s.members[[2]uint64{secretID, replicaID}]
+	if !ok {
+		return protocol.ChannelRecord{}, false, nil
+	}
+	return protocol.ChannelRecord{Replica: &m}, true, nil
 }
 
-func (s *memChannelStore) Save(secretID uint64, channel protocol.Channel) error {
+func (s *memChannelStore) Save(secretID uint64, record protocol.ChannelRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data[[2]uint64{secretID, channel.ID}] = channel
+	if record.Helper != nil {
+		s.helpers[[2]uint64{secretID, record.Helper.ChannelID}] = *record.Helper
+	}
+	if record.Replica != nil {
+		s.members[[2]uint64{secretID, record.Replica.ReplicaID}] = *record.Replica
+	}
 	return nil
 }
 
-func (s *memChannelStore) Remove(secretID, channelID uint64) (bool, error) {
+func (s *memChannelStore) Remove(secretID, channelID, replicaID uint64) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	key := [2]uint64{secretID, channelID}
-	_, existed := s.data[key]
-	delete(s.data, key)
+	if replicaID == 0 {
+		key := [2]uint64{secretID, channelID}
+		_, existed := s.helpers[key]
+		delete(s.helpers, key)
+		return existed, nil
+	}
+	key := [2]uint64{secretID, replicaID}
+	_, existed := s.members[key]
+	delete(s.members, key)
 	return existed, nil
 }
 
-func (s *memChannelStore) ListChannels(secretID uint64) ([]uint64, error) {
+func (s *memChannelStore) ListHelpers(secretID uint64) ([]protocol.HelperChannel, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var out []uint64
-	for key := range s.data {
+	var out []protocol.HelperChannel
+	for key, h := range s.helpers {
 		if key[0] == secretID {
-			out = append(out, key[1])
+			out = append(out, h)
+		}
+	}
+	return out, nil
+}
+
+func (s *memChannelStore) ListReplicas(secretID uint64) ([]protocol.ReplicaMember, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []protocol.ReplicaMember
+	for key, m := range s.members {
+		if key[0] == secretID {
+			out = append(out, m)
 		}
 	}
 	return out, nil
@@ -383,6 +422,7 @@ type peer struct {
 	transport    *memTransport
 	shareStore   *memShareStore
 	channelStore *memChannelStore
+	secretStore  *memSecretStore
 }
 
 func newPeer(label, uri string, threshold uint32) *peer {
@@ -410,6 +450,7 @@ func newPeer(label, uri string, threshold uint32) *peer {
 		transport:    transport,
 		shareStore:   shareStore,
 		channelStore: channelStore,
+		secretStore:  secretStore,
 	}
 }
 
@@ -511,7 +552,18 @@ func pumpMany(peers []*peer) []protocol.Event {
 // bindings/rust/src/protocol.rs. Returns the long-term channel_id both
 // peers rotated to.
 func pairPeers(owner, helper *peer, pairingChannelID uint64) uint64 {
-	contact, err := owner.proto.CreateContact(&pairingChannelID, protocol.ContactModeInlineKeys, nil)
+	return pairPeersWithMode(owner, helper, pairingChannelID, protocol.ContactModeInlineKeys)
+}
+
+// pairPeersWithMode is pairPeers over any contact mode.
+//
+// HashedKeys and NoKeys insert a PrePair round-trip before the handshake
+// proper: the scanner asks for the real keys, and the contact creator either
+// republishes the ones it committed to (HashedKeys) or generates them on the
+// spot (NoKeys). pump follows the chain, so the extra legs need no special
+// handling here — only the mode the contact is minted with differs.
+func pairPeersWithMode(owner, helper *peer, pairingChannelID uint64, mode protocol.ContactMode) uint64 {
+	contact, err := owner.proto.CreateContact(&pairingChannelID, mode, nil)
 	must(err, "owner.CreateContact")
 	assertTrue(contact.ChannelID == pairingChannelID, "CreateContact.ChannelID = %d, want %d", contact.ChannelID, pairingChannelID)
 
@@ -569,6 +621,103 @@ func pairPeers(owner, helper *peer, pairingChannelID uint64) uint64 {
 // rejects Threshold < 2, and the sharing handler only VSS-splits shares to
 // Helpers once helpers.len() >= threshold — a single Helper would never
 // observe a real ShareStored event.
+// runEveryContactModePairs proves this SDK can pair over all three contact
+// modes. It only ever exercised InlineKeys, so the two modes with a PrePair
+// leg — the ones where the wire choreography actually differs — were never
+// driven from Go at all.
+func runEveryContactModePairs() {
+	fmt.Println("=== Protocol contact-mode pairing test ===")
+
+	const threshold = 2
+	modes := []struct {
+		name string
+		mode protocol.ContactMode
+	}{
+		{"InlineKeys", protocol.ContactModeInlineKeys},
+		{"HashedKeys", protocol.ContactModeHashedKeys},
+		{"NoKeys", protocol.ContactModeNoKeys},
+	}
+
+	for i, m := range modes {
+		owner := newPeer("owner", fmt.Sprintf("https://owner-%d.example.com", i), threshold)
+		helper := newPeer("helper", fmt.Sprintf("https://helper-%d.example.com", i), threshold)
+
+		channelID := pairPeersWithMode(owner, helper, uint64(900+i), m.mode)
+		assertTrue(channelID != uint64(900+i),
+			"%s: both peers must rotate off the transient pairing id", m.name)
+
+		// The strongest end-to-end check: the handshake converged on one key.
+		ownerKey, ok, err := owner.secretStore.Load(protocolSecretID, channelID, 0)
+		must(err, fmt.Sprintf("%s owner secretStore.Load", m.name))
+		assertTrue(ok, "%s: owner must hold a shared key", m.name)
+		helperKey, ok, err := helper.secretStore.Load(protocolSecretID, channelID, 0)
+		must(err, fmt.Sprintf("%s helper secretStore.Load", m.name))
+		assertTrue(ok, "%s: helper must hold a shared key", m.name)
+		assertTrue(bytes.Equal(ownerKey.Bytes, helperKey.Bytes),
+			"%s: owner and helper shared keys must match", m.name)
+
+		// NoKeys stores the contact on the creator so it can authenticate the
+		// PrePairRequest by nonce. Once the handshake has rekeyed that row is
+		// spent and must not survive — it used to.
+		_, stranded, err := owner.secretStore.Load(protocolSecretID, uint64(900+i), 2)
+		must(err, fmt.Sprintf("%s owner transient contact lookup", m.name))
+		assertTrue(!stranded,
+			"%s: the transient PairingContact must not outlive the handshake", m.name)
+
+		// The gate. NoKeys inlines neither the keys nor a commitment to them,
+		// so nothing binds what arrived over the plaintext PrePair leg to the
+		// contact delivered out of band. Both sides hold the channel Pending
+		// until the fingerprints are compared; the other two modes are usable
+		// straight away.
+		wantStatus := protocol.ChannelStatusPaired
+		if m.mode == protocol.ContactModeNoKeys {
+			wantStatus = protocol.ChannelStatusPending
+		}
+		for _, side := range []struct {
+			label string
+			peer  *peer
+		}{{"owner", owner}, {"helper", helper}} {
+			rec, ok, err := side.peer.channelStore.Load(protocolSecretID, channelID, 0)
+			must(err, fmt.Sprintf("%s %s channelStore.Load", m.name, side.label))
+			assertTrue(ok, "%s: %s must hold the channel", m.name, side.label)
+			assertTrue(rec.Helper.Status == wantStatus,
+				"%s: %s channel status = %v, want %v", m.name, side.label, rec.Helper.Status, wantStatus)
+		}
+
+		if m.mode == protocol.ContactModeNoKeys {
+			ownerFP, err := owner.proto.GetFingerprint(channelID)
+			must(err, "owner GetFingerprint")
+			helperFP, err := helper.proto.GetFingerprint(channelID)
+			must(err, "helper GetFingerprint")
+			assertTrue(ownerFP == helperFP, "both sides must derive one fingerprint")
+
+			matched, err := owner.proto.VerifyFingerprint(channelID, helperFP)
+			must(err, "owner VerifyFingerprint")
+			assertTrue(matched, "owner VerifyFingerprint must match")
+			matched, err = helper.proto.VerifyFingerprint(channelID, ownerFP)
+			must(err, "helper VerifyFingerprint")
+			assertTrue(matched, "helper VerifyFingerprint must match")
+
+			for _, side := range []struct {
+				label string
+				peer  *peer
+			}{{"owner", owner}, {"helper", helper}} {
+				rec, ok, err := side.peer.channelStore.Load(protocolSecretID, channelID, 0)
+				must(err, fmt.Sprintf("%s channelStore.Load after verify", side.label))
+				assertTrue(ok, "%s must still hold the channel", side.label)
+				assertTrue(rec.Helper.Status == protocol.ChannelStatusPaired,
+					"%s: a confirmed NoKeys channel must be Paired, got %v", side.label, rec.Helper.Status)
+			}
+			fmt.Println("  NoKeys held Pending until the fingerprint confirmed it  ✓")
+		}
+
+		fmt.Printf("  %s paired → channel_id=%d, shared_key=%dB, no transient state left  ✓\n",
+			m.name, channelID, len(ownerKey.Bytes))
+	}
+
+	fmt.Println("Protocol contact-mode pairing test passed.")
+}
+
 func runProtocol() {
 	fmt.Println("=== Protocol pairing + protect-secret flow test ===")
 
@@ -577,6 +726,14 @@ func runProtocol() {
 	owner := newPeer("owner", "https://owner.example.com", threshold)
 	helperA := newPeer("helper-a", "https://helper-a.example.com", threshold)
 	helperB := newPeer("helper-b", "https://helper-b.example.com", threshold)
+
+	// Tick before anything is in flight: proves the symbol resolves through
+	// purego (a registration failure only surfaces at call time) and that an
+	// idle protocol is a safe thing for a scheduler to poke.
+	idleEvents, err := owner.proto.Tick()
+	must(err, "owner.Tick on an idle protocol")
+	assertTrue(len(idleEvents) == 0, "idle Tick must produce no events, got %d", len(idleEvents))
+	fmt.Println("  Tick on an idle protocol returns no events  ✓")
 
 	channelA := pairPeers(owner, helperA, 1)
 	channelB := pairPeers(owner, helperB, 2)
@@ -592,7 +749,7 @@ func runProtocol() {
 		{"owner/channelB", owner.channelStore, channelB},
 		{"helper-b/channelB", helperB.channelStore, channelB},
 	} {
-		_, ok, err := check.store.Load(protocolSecretID, check.cid)
+		_, ok, err := check.store.Load(protocolSecretID, check.cid, 0)
 		must(err, fmt.Sprintf("%s channelStore.Load", check.label))
 		assertTrue(ok, "%s channelStore must have the paired channel", check.label)
 	}
@@ -662,4 +819,102 @@ func runProtocol() {
 	helperB.proto.Close()
 
 	fmt.Println("Protocol pairing + protect-secret flow test passed.")
+
+	runExpiredChannelCleanup()
+}
+
+// runExpiredChannelCleanup exercises the expired-channel cleanup surface
+// through the Go SDK.
+//
+// The contradictory pair — Enabled false alongside a non-zero timeout — is
+// the point: the wrapper must forward both values verbatim and let the
+// library decide that a disabled policy ignores its timeout. A wrapper that
+// interpreted the flag locally (dropping the timeout, or substituting its
+// own default) would still pass a happy-path test, so the config is chosen
+// to fail if any interpretation crept into the Go layer.
+func runExpiredChannelCleanup() {
+	fmt.Println("=== Protocol expired-channel cleanup test ===")
+
+	channelStore := newMemChannelStore()
+	shareStore := newMemShareStore()
+	secretStore := newMemSecretStore()
+	userSecretStore := newMemUserSecretStore()
+	stateStore := newMemStateStore()
+	transport := newMemTransport()
+
+	cfg := protocol.Config{
+		SecretID:             protocolSecretID,
+		OwnTransportURI:      "https://cleanup.example.com",
+		OwnTransportProtocol: int32(derecpb.Protocol_HTTPS),
+		Threshold:            2,
+		KeepVersionsCount:    3,
+		Timeouts: &protocol.Timeouts{
+			ExpiredChannels: &protocol.RemoveExpiredChannelsPolicy{
+				Enabled:       false,
+				TimeoutInSecs: 900,
+			},
+		},
+	}
+	p, err := protocol.New(channelStore, shareStore, secretStore, userSecretStore, stateStore, transport, cfg)
+	must(err, "protocol.New(cleanup)")
+	defer p.Close()
+
+	// The caller-driven sweep works regardless of the disabled policy —
+	// that is what Disabled means. No Pending channels exist yet, so the
+	// result is an empty (non-nil error) list.
+	removed, err := p.RemoveExpiredChannels(0)
+	must(err, "RemoveExpiredChannels(0)")
+	assertTrue(len(removed) == 0, "expected no removed channels on a fresh protocol, got %d", len(removed))
+
+	fmt.Println("  cleanup: disabled policy forwarded with its timeout; manual sweep callable ✓")
+	fmt.Println("Protocol expired-channel cleanup test passed.")
+}
+
+// runUnsafeHTTP proves the unsafe_http setting survives the JSON config
+// boundary and actually changes behaviour.
+//
+// Worth its own test because the failure mode is silent: the Rust side reads
+// the field with serde's `default`, so a name mismatch between this SDK and
+// the FFI config would deserialize as `false` and the setting would appear to
+// do nothing — with every other test still passing. Exactly the shape of the
+// bug that made three enum variants `undefined` in the JS shims.
+func runUnsafeHTTP() {
+	fmt.Println("=== Protocol unsafe_http config test ===")
+
+	build := func(uri string, allow bool) error {
+		cfg := protocol.Config{
+			SecretID:             protocolSecretID,
+			OwnTransportURI:      uri,
+			OwnTransportProtocol: int32(derecpb.Protocol_HTTPS),
+			Threshold:            2,
+			KeepVersionsCount:    3,
+			UnsafeHTTP:           allow,
+		}
+		p, err := protocol.New(
+			newMemChannelStore(), newMemShareStore(), newMemSecretStore(),
+			newMemUserSecretStore(), newMemStateStore(), newMemTransport(), cfg,
+		)
+		if err != nil {
+			return err
+		}
+		p.Close()
+		return nil
+	}
+
+	// Loopback is free — a local dev server needs no configuration.
+	must(build("http://127.0.0.1:8080", false), "loopback plaintext with unsafe_http=false")
+	fmt.Println("  loopback http accepted with unsafe_http=false  ✓")
+
+	// A LAN address is not, until asked for. If the field name did not match
+	// the FFI config, this would build and the assertion would fail here.
+	if err := build("http://192.168.1.42:8080", false); err == nil {
+		panic("LAN plaintext must be refused when unsafe_http=false — " +
+			"the setting is not reaching the library")
+	}
+	fmt.Println("  LAN http refused with unsafe_http=false  ✓")
+
+	must(build("http://192.168.1.42:8080", true), "LAN plaintext with unsafe_http=true")
+	fmt.Println("  LAN http accepted with unsafe_http=true  ✓")
+
+	fmt.Println("Protocol unsafe_http config test passed.")
 }

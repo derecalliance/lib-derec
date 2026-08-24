@@ -49,11 +49,7 @@ pub fn count_shares(conn: &SharedConnection, secret_id: u64) -> i64 {
     .expect("count_shares failed")
 }
 
-pub fn count_shares_for_channel(
-    conn: &SharedConnection,
-    secret_id: u64,
-    channel_id: u64,
-) -> i64 {
+pub fn count_shares_for_channel(conn: &SharedConnection, secret_id: u64, channel_id: u64) -> i64 {
     let conn = lock(conn);
     conn.query_row(
         "SELECT COUNT(*) FROM shares WHERE secret_id = ?1 AND channel_id = ?2",
@@ -81,4 +77,17 @@ pub fn count_user_secrets(conn: &SharedConnection, secret_id: u64) -> i64 {
         |row| row.get(0),
     )
     .expect("count_user_secrets failed")
+}
+
+/// Rows in `protocol_state` of kind `0` — `StateKind::PendingVerification`.
+/// Reads the table directly so the assertion is about what is on disk, not
+/// what the protocol reports.
+pub fn count_pending_verifications(connection: &SharedConnection, secret_id: u64) -> i64 {
+    let conn = lock(connection);
+    conn.query_row(
+        "SELECT COUNT(*) FROM protocol_state WHERE secret_id = ?1 AND kind = 0",
+        rusqlite::params![u64_to_sql(secret_id)],
+        |row| row.get(0),
+    )
+    .expect("count pending verifications failed")
 }

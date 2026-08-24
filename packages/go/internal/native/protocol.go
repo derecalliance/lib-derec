@@ -49,6 +49,16 @@ type DeRecProtocolCreateContactResult struct {
 	ContactWireBytes DeRecBuffer
 }
 
+// DeRecRemovedChannelsResult mirrors #[repr(C)] struct
+// DeRecRemovedChannelsResult in
+// library/src/ffi/protocol/handle/config.rs: the standard DeRecError
+// envelope plus a UTF-8 JSON array of removed channel ids as decimal
+// strings, released via bytesFromBuffer.
+type DeRecRemovedChannelsResult struct {
+	Error    DeRecError
+	Channels DeRecBuffer
+}
+
 // AutoAcceptPolicy is the per-flow auto-accept toggle set carried by the
 // JSON config's "auto_accept" object, field for field matching
 // AutoAcceptConfig in library/src/ffi/protocol/handle/mod.rs (booleans,
@@ -62,6 +72,32 @@ type AutoAcceptPolicy struct {
 	GetShare          bool `json:"get_share"`
 	Unpair            bool `json:"unpair"`
 	UpdateChannelInfo bool `json:"update_channel_info"`
+}
+
+// RemoveExpiredChannelsPolicy is the automatic expired-channel cleanup
+// setting carried by the JSON config's "remove_expired_channels" object,
+// field for field matching RemoveExpiredChannelsConfig in
+// library/src/ffi/protocol/handle/mod.rs.
+//
+// Both fields are always marshalled, including when Enabled is false. The
+// library decides that a disabled policy ignores its timeout — see
+// ExpiredChannelCleanup::new.
+type RemoveExpiredChannelsPolicy struct {
+	Enabled       bool   `json:"enabled"`
+	TimeoutInSecs uint64 `json:"timeout_in_secs"`
+}
+
+// TimeoutsConfig is the JSON config's "timeouts" object, field for field
+// matching TimeoutsConfig in library/src/ffi/protocol/handle/mod.rs.
+//
+// Every field is optional and omitted when nil: absent means "use the library
+// default". The defaults live in the Rust Timeouts type, so a value omitted
+// here follows the protocol rather than a constant frozen into this shim.
+type TimeoutsConfig struct {
+	InboundMessageSecs *uint64                      `json:"inbound_message_secs,omitempty"`
+	SharingRoundSecs   *uint64                      `json:"sharing_round_secs,omitempty"`
+	UnpairAckSecs      *uint64                      `json:"unpair_ack_secs,omitempty"`
+	ExpiredChannels    *RemoveExpiredChannelsPolicy `json:"expired_channels,omitempty"`
 }
 
 // ProtocolConfig carries every derec_protocol_new argument beyond
@@ -83,7 +119,13 @@ type ProtocolConfig struct {
 	// config.
 	CommunicationInfo []byte
 
-	TimeoutInSecs        uint32
+	// Timeouts configures the four waiting periods. nil omits the key so
+	// every library default applies; individual fields inside may also be
+	// omitted for the same effect.
+	Timeouts *TimeoutsConfig
+	// UnsafeHTTP accepts plaintext http:// transport endpoints. Development
+	// only; false is the production posture.
+	UnsafeHTTP           bool
 	AutoRespondOnFailure bool
 	// UnpairAck: 0 = Required, 1 = NotRequired.
 	UnpairAck   int32
@@ -109,11 +151,12 @@ type protocolConfigJSON struct {
 	OwnTransportProtocol int32            `json:"own_transport_protocol"`
 	Threshold            uint32           `json:"threshold"`
 	KeepVersionsCount    uint32           `json:"keep_versions_count"`
-	TimeoutInSecs        uint32           `json:"timeout_in_secs"`
 	AutoRespondOnFailure bool             `json:"auto_respond_on_failure"`
 	UnpairAck            int32            `json:"unpair_ack"`
 	AutoReplyTo          bool             `json:"auto_reply_to"`
 	AutoAccept           AutoAcceptPolicy `json:"auto_accept"`
+	Timeouts             *TimeoutsConfig  `json:"timeouts,omitempty"`
+	UnsafeHTTP           bool             `json:"unsafe_http"`
 	ReplicaID            *string          `json:"replica_id,omitempty"`
 }
 
@@ -142,6 +185,11 @@ var (
 		fingerprintPtr *byte, outMatched *uint32,
 	) DeRecError
 
+	protocolRemoveExpiredChannelsOnce sync.Once
+	protocolRemoveExpiredChannelsFn   func(
+		handle uintptr, olderThanSecs uint64,
+	) DeRecRemovedChannelsResult
+
 	protocolSetOwnTransportOnce sync.Once
 	protocolSetOwnTransportFn   func(
 		handle uintptr,
@@ -160,6 +208,9 @@ var (
 		handle uintptr,
 		messagePtr *byte, messageLen uintptr,
 	) DeRecProtocolEventsResult
+
+	protocolTickOnce sync.Once
+	protocolTickFn   func(handle uintptr) DeRecProtocolEventsResult
 
 	protocolStartOnce sync.Once
 	protocolStartFn   func(
@@ -213,11 +264,13 @@ func protocolNew(cfg ProtocolConfig, cb *builtCallbacks) (uintptr, error) {
 		OwnTransportProtocol: cfg.OwnTransportProtocol,
 		Threshold:            cfg.Threshold,
 		KeepVersionsCount:    cfg.KeepVersionsCount,
-		TimeoutInSecs:        cfg.TimeoutInSecs,
 		AutoRespondOnFailure: cfg.AutoRespondOnFailure,
 		UnpairAck:            cfg.UnpairAck,
 		AutoReplyTo:          cfg.AutoReplyTo,
 		AutoAccept:           cfg.AutoAccept,
+
+		Timeouts:   cfg.Timeouts,
+		UnsafeHTTP: cfg.UnsafeHTTP,
 	}
 	if cfg.ReplicaID != nil {
 		id := strconv.FormatUint(*cfg.ReplicaID, 10)
@@ -325,6 +378,26 @@ func (p *ProtocolInstance) GetFingerprint(channelID uint64) (string, error) {
 	return stringFromCString(res.Fingerprint), nil
 }
 
+// RemoveExpiredChannels wraps derec_protocol_remove_expired_channels:
+// removes Pending channels older than olderThanSecs along with their
+// pairing keys, returning the UTF-8 JSON array of removed channel ids as
+// decimal strings.
+//
+// Independent of the configured cleanup policy — it sweeps at the
+// threshold given even when that policy is disabled. The age comparison
+// is strict, so a channel created within the current second survives
+// even olderThanSecs == 0.
+func (p *ProtocolInstance) RemoveExpiredChannels(olderThanSecs uint64) ([]byte, error) {
+	protocolRemoveExpiredChannelsOnce.Do(func() {
+		purego.RegisterFunc(&protocolRemoveExpiredChannelsFn, symbol("derec_protocol_remove_expired_channels"))
+	})
+	res := protocolRemoveExpiredChannelsFn(p.handle, olderThanSecs)
+	if err := errorFrom(res.Error); err != nil {
+		return nil, err
+	}
+	return bytesFromBuffer(res.Channels), nil
+}
+
 // VerifyFingerprint wraps derec_protocol_verify_fingerprint: compares
 // fingerprint against channelID's locally-derived one. On match, the
 // channel transitions from Pending to Paired. The returned bool is only
@@ -391,6 +464,21 @@ func (p *ProtocolInstance) Process(message []byte) ([]byte, error) {
 		purego.RegisterFunc(&protocolProcessFn, symbol("derec_protocol_process"))
 	})
 	res := protocolProcessFn(p.handle, bytePtr(message), uintptr(len(message)))
+	if err := errorFrom(res.Error); err != nil {
+		return nil, err
+	}
+	return bytesFromBuffer(res.EventsJSON), nil
+}
+
+// Tick wraps derec_protocol_tick: advances time-driven state without an
+// inbound message, returning the resulting events as a UTF-8 JSON array in
+// the same shape as Process. Safe to call at any time; with nothing in
+// flight the array is empty.
+func (p *ProtocolInstance) Tick() ([]byte, error) {
+	protocolTickOnce.Do(func() {
+		purego.RegisterFunc(&protocolTickFn, symbol("derec_protocol_tick"))
+	})
+	res := protocolTickFn(p.handle)
 	if err := errorFrom(res.Error); err != nil {
 		return nil, err
 	}

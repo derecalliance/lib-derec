@@ -74,7 +74,7 @@ pub struct ExtractResult {
 /// let channel_id = ChannelId(42);
 /// let shared_key = [7u8; 32];
 ///
-/// let result = request::produce(channel_id, "no longer needed", &shared_key, None)
+/// let result = request::produce(channel_id, "no longer needed", &shared_key, None, None)
 ///     .expect("failed to build unpair request");
 ///
 /// assert!(!result.envelope.is_empty());
@@ -83,11 +83,17 @@ pub struct ExtractResult {
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0, memo_len = memo.len()))
 )]
+/// `replica_id` names the departing member on the replica path and MUST be
+/// absent on the owner ↔ helper path — its presence is what tells the receiver
+/// which operation this is. A helper channel serves one peer, so unpairing it
+/// deletes the channel; a replica group shares one channel, so removal edits a
+/// member row and this says which.
 pub fn produce(
     channel_id: ChannelId,
     memo: &str,
     shared_key: &SharedKey,
     reply_to: Option<derec_proto::TransportProtocol>,
+    replica_id: Option<u64>,
 ) -> Result<ProduceResult, crate::Error> {
     let timestamp = current_timestamp();
 
@@ -95,6 +101,7 @@ pub fn produce(
         memo: memo.to_owned(),
         timestamp: Some(timestamp),
         reply_to,
+        replica_id,
     };
 
     let envelope = DeRecMessageBuilder::channel()
@@ -169,7 +176,7 @@ pub fn produce(
 /// let shared_key = [7u8; 32];
 ///
 /// let request::ProduceResult { envelope } =
-///     request::produce(channel_id, "no longer needed", &shared_key, None)
+///     request::produce(channel_id, "no longer needed", &shared_key, None, None)
 ///         .expect("failed to build unpair request");
 ///
 /// let request::ExtractResult { request } =
@@ -181,6 +188,17 @@ pub fn produce(
     feature = "logging",
     tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
 )]
+///
+/// # Transport scheme is not checked here
+///
+/// The endpoint's structure is validated (length, control characters,
+/// scheme/protocol consistency), but whether a plaintext `http://` endpoint
+/// is *acceptable* is deployment policy and lives on the orchestrator — see
+/// [`TransportPolicy`](crate::transport::TransportPolicy). A caller using
+/// this primitive directly, rather than through
+/// [`DeRecProtocol`](crate::protocol::DeRecProtocol), owns that decision and
+/// should run [`TransportPolicy::check_peer`](crate::transport::TransportPolicy::check_peer)
+/// on any endpoint this returns.
 pub fn extract(
     envelope_bytes: &[u8],
     shared_key: &SharedKey,

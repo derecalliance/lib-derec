@@ -68,9 +68,7 @@
 use std::marker::PhantomData;
 
 use crate::{
-    derec_message::DeRecMessageBuilderError,
-    protocol_version::ProtocolVersion,
-    types::ChannelId,
+    derec_message::DeRecMessageBuilderError, protocol_version::ProtocolVersion, types::ChannelId,
 };
 use derec_proto::{DeRecMessage, MessageBody};
 use prost_types::Timestamp;

@@ -8,11 +8,8 @@ use std::sync::{Arc, Mutex};
 /// migration is two lines: drop a new `.sql` file under `migrations/`
 /// and append an entry to this slice with a higher version number.
 /// `version` must be strictly increasing.
-const MIGRATIONS: &[(i64, &str, &str)] = &[(
-    1,
-    "0001_init",
-    include_str!("../migrations/0001_init.sql"),
-)];
+const MIGRATIONS: &[(i64, &str, &str)] =
+    &[(1, "0001_init", include_str!("../migrations/0001_init.sql"))];
 
 /// Shared handle to the underlying in-memory SQLite connection.
 ///
@@ -57,9 +54,11 @@ fn apply_migrations(connection: &Connection) {
         .expect("failed to create __migrations table");
 
     let mut last_version: i64 = connection
-        .query_row("SELECT COALESCE(MAX(version), 0) FROM __migrations", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM __migrations",
+            [],
+            |row| row.get(0),
+        )
         .expect("failed to query __migrations");
 
     for (version, name, sql) in MIGRATIONS {
@@ -90,7 +89,5 @@ fn apply_migrations(connection: &Connection) {
 /// only mean a prior panic while holding the lock — fatal either way
 /// for these smoke tests).
 pub fn lock(connection: &SharedConnection) -> std::sync::MutexGuard<'_, Connection> {
-    connection
-        .lock()
-        .expect("SQLite connection mutex poisoned")
+    connection.lock().expect("SQLite connection mutex poisoned")
 }

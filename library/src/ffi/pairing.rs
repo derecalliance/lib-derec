@@ -92,7 +92,6 @@ pub struct ProcessPairResponseMessageResult {
     pub channel_id: u64,
 }
 
-
 #[repr(C)]
 pub struct ProducePrePairRequestMessageResult {
     pub error: DeRecError,
@@ -913,12 +912,14 @@ fn decode_optional_parameter_range(
         return Ok(None);
     }
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-    derec_proto::ParameterRange::decode(bytes).map(Some).map_err(|_| {
-        ffi_error(
-            DEREC_CODE_FFI_BAD_PROTO,
-            "parameter_range_bytes is not a valid ParameterRange",
-        )
-    })
+    derec_proto::ParameterRange::decode(bytes)
+        .map(Some)
+        .map_err(|_| {
+            ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                "parameter_range_bytes is not a valid ParameterRange",
+            )
+        })
 }
 
 fn decode_secret_key_material(

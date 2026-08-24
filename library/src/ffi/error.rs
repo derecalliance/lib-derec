@@ -107,6 +107,12 @@ pub const DEREC_CODE_ALREADY_RESTORED: i32 = 14;
 /// `DEREC_CATEGORY_INVALID_INPUT`.
 pub const DEREC_CODE_RESTORE_CONFLICT: i32 = 15;
 
+/// A replica pairing named a `replica_id` already held by another member of
+/// the group, this device included. Assignment is the application's, so this
+/// is a configuration fault: assign a distinct id and pair again.
+/// `DEREC_CATEGORY_INVALID_INPUT`.
+pub const DEREC_CODE_REPLICA_ID_CONFLICT: i32 = 16;
+
 pub const DEREC_CODE_ENCRYPTION: i32 = 20;
 pub const DEREC_CODE_KEYGEN: i32 = 21;
 pub const DEREC_CODE_FINISH_PAIRING_INITIATOR: i32 = 22;
@@ -340,12 +346,17 @@ fn categorize(err: &crate::Error) -> (i32, i32) {
         crate::Error::RoleMismatch { .. } => {
             (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_ROLE_MISMATCH)
         }
-        crate::Error::ReplicaIdNotConfigured => {
-            (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_REPLICA_ID_NOT_CONFIGURED)
+        crate::Error::ReplicaIdNotConfigured => (
+            DEREC_CATEGORY_INVALID_INPUT,
+            DEREC_CODE_REPLICA_ID_NOT_CONFIGURED,
+        ),
+        crate::Error::ReplicaIdConflict { .. } => {
+            (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_REPLICA_ID_CONFLICT)
         }
-        crate::Error::ChannelAlreadyPaired { .. } => {
-            (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_CHANNEL_ALREADY_PAIRED)
-        }
+        crate::Error::ChannelAlreadyPaired { .. } => (
+            DEREC_CATEGORY_INVALID_INPUT,
+            DEREC_CODE_CHANNEL_ALREADY_PAIRED,
+        ),
         crate::Error::Restore(e) => {
             use crate::protocol::RestoreError;
             match e {
@@ -372,9 +383,7 @@ fn pairing_code(e: &PairingError) -> i32 {
         PairingError::PrePairHashMismatch => DEREC_CODE_PREPAIR_HASH_MISMATCH,
         PairingError::MissingReplicaId { .. } => DEREC_CODE_MISSING_REPLICA_ID,
         PairingError::UnexpectedReplicaId { .. } => DEREC_CODE_UNEXPECTED_REPLICA_ID,
-        PairingError::IncompatibleParameterRange { .. } => {
-            DEREC_CODE_INCOMPATIBLE_PARAMETER_RANGE
-        }
+        PairingError::IncompatibleParameterRange { .. } => DEREC_CODE_INCOMPATIBLE_PARAMETER_RANGE,
         PairingError::Invariant(_) => DEREC_CODE_INVARIANT,
         PairingError::ContactMessageKeygen { .. } => DEREC_CODE_KEYGEN,
         PairingError::PairRequestKeygen { .. } => DEREC_CODE_KEYGEN,

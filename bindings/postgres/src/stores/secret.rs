@@ -60,8 +60,7 @@ impl DeRecSecretStore for PostgresSecretStore {
                 return Ok(Vec::new());
             }
 
-            let channel_ids_i64: Vec<i64> =
-                requested.iter().copied().map(u64_to_sql).collect();
+            let channel_ids_i64: Vec<i64> = requested.iter().copied().map(u64_to_sql).collect();
             let params: [&(dyn ToSql + Sync); 3] = [&secret_id_i64, &kind_i32, &channel_ids_i64];
             let rows = client
                 .query(

@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use derec_library::protocol::DeRecFlow;
 use derec_library::protocol::events::DeRecEvent;
 use derec_library::protocol::types::UserSecret;
-use derec_library::protocol::DeRecFlow;
 use derec_library::types::ChannelId;
 use derec_proto::{ContactMode, SenderKind};
 use std::collections::HashMap;
 
 use crate::peer::{Peer, pump_many};
 
-/// Drive a full Owner↔Helper InlineKeys pair handshake. Returns the
+/// Drive a full Owner↔Helper pair handshake over `InlineKeys`. Returns the
 /// `ChannelId` both sides converge on (which may differ from the
 /// initial `channel_id` the contact was minted with).
 pub async fn pair_owner_helper(
@@ -18,9 +18,23 @@ pub async fn pair_owner_helper(
     helper: &mut Peer,
     channel_id: ChannelId,
 ) -> ChannelId {
+    pair_owner_helper_with_mode(owner, helper, channel_id, ContactMode::InlineKeys).await
+}
+
+/// As [`pair_owner_helper`], over any contact mode.
+///
+/// `HashedKeys` and `NoKeys` add a `PrePair` round-trip before the handshake
+/// proper. Pumping to quiescence covers that, so the only difference here is
+/// which mode the contact is minted with.
+pub async fn pair_owner_helper_with_mode(
+    owner: &mut Peer,
+    helper: &mut Peer,
+    channel_id: ChannelId,
+    mode: ContactMode,
+) -> ChannelId {
     let contact = owner
         .protocol
-        .create_contact(Some(channel_id), ContactMode::InlineKeys, None)
+        .create_contact(Some(channel_id), mode, None)
         .await
         .expect("owner.create_contact failed");
 
@@ -29,10 +43,7 @@ pub async fn pair_owner_helper(
         .start(DeRecFlow::Pairing {
             kind: SenderKind::Helper,
             contact,
-            peer_communication_info: HashMap::from([(
-                "name".to_owned(),
-                helper.label.to_owned(),
-            )]),
+            peer_communication_info: HashMap::from([("name".to_owned(), helper.label.to_owned())]),
         })
         .await
         .expect("helper.start(Pairing) failed");

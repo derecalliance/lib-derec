@@ -85,6 +85,9 @@ pub fn produce(
         version,
         timestamp: Some(timestamp),
         reply_to,
+        // Owner ↔ helper exchange: the replica path sets this, this one
+        // never does. Its absence is what marks the message helper-bound.
+        replica_id: None,
     };
 
     let envelope = DeRecMessageBuilder::channel()
@@ -168,6 +171,17 @@ pub fn produce(
     feature = "logging",
     tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
 )]
+///
+/// # Transport scheme is not checked here
+///
+/// The endpoint's structure is validated (length, control characters,
+/// scheme/protocol consistency), but whether a plaintext `http://` endpoint
+/// is *acceptable* is deployment policy and lives on the orchestrator — see
+/// [`TransportPolicy`](crate::transport::TransportPolicy). A caller using
+/// this primitive directly, rather than through
+/// [`DeRecProtocol`](crate::protocol::DeRecProtocol), owns that decision and
+/// should run [`TransportPolicy::check_peer`](crate::transport::TransportPolicy::check_peer)
+/// on any endpoint this returns.
 pub fn extract(
     envelope_bytes: &[u8],
     shared_key: &SharedKey,

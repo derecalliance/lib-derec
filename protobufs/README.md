@@ -25,6 +25,11 @@ which provides a higher-level API and complete protocol flows.
 > The Rust types in this crate are generated from `.proto` schema files.
 > Changes should be made in the schema definitions rather than editing the generated code directly.
 
+> [!IMPORTANT]
+> Code generation runs in this crate's build script, so the Protocol Buffers
+> compiler (`protoc`) must be installed and on your `PATH` (or located via the
+> `PROTOC` environment variable) to build this crate.
+
 ---
 
 ## Example
@@ -112,6 +117,24 @@ All protocol messages are wrapped in the `MessageBody` oneof inside
 | 15 | `UpdateChannelInfoResponseMessage` |
 | 16 | `PrePairRequestMessage` |
 | 17 | `PrePairResponseMessage` |
+
+---
+
+## Cargo features
+
+Off by default — a default build compiles no serde.
+
+| Feature | Enables |
+| --- | --- |
+| `serde` | `serde::Serialize` / `Deserialize` on the hand-written wrapper types the SDKs exchange — `TransportProtocol` and `SenderKind`. The generated prost message types are unaffected; they cross process boundaries as protobuf. Enabled automatically by `derec-library`'s own `serde` feature, so consumers of the library rarely set it directly. |
+
+```toml
+[dependencies]
+derec-proto = { version = "*", features = ["serde"] }
+```
+
+The serde shapes are an implementation detail of the SDK bridges, not a
+stable wire format — protobuf encoding is the contract between peers.
 
 ---
 

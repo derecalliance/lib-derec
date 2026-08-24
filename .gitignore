@@ -27,3 +27,8 @@ runtimes/
 
 # Superpowers SDD scratch
 .superpowers/
+
+# wasm-pack's default output directory. `make nodejs` / `make web` build into
+# library/target/pkg-*, but a bare `wasm-pack build` drops this here and it is
+# never an input to anything.
+/library/pkg/

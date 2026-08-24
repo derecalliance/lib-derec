@@ -337,8 +337,8 @@ fn test_trace_id_round_trips_through_proto_encoding() {
         .expect("build should succeed");
 
     let wire_bytes = original.encode_to_vec();
-    let decoded = derec_proto::DeRecMessage::decode(wire_bytes.as_slice())
-        .expect("envelope should decode");
+    let decoded =
+        derec_proto::DeRecMessage::decode(wire_bytes.as_slice()).expect("envelope should decode");
 
     assert_eq!(decoded.trace_id, 0xFEED_FACE_BAAD_F00D);
 }

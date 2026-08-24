@@ -13,11 +13,17 @@ import (
 // channelStore mirrors protocol.ChannelStore's method set over native's own
 // domain types — see the storeSet doc comment in callbacks.go for why
 // native re-declares this instead of importing protocol.
+//
+// A record is addressed by (channelID, replicaID). A replicaID of 0 — the
+// value the protocol reserves as "absent" — addresses the helper channel at
+// channelID; any other value addresses that member of the replica group,
+// which is keyed by replicaID alone (see protocol.ChannelStore).
 type channelStore interface {
-	Load(secretID, channelID uint64) (Channel, bool, error)
-	Save(secretID uint64, channel Channel) error
-	Remove(secretID, channelID uint64) (bool, error)
-	ListChannels(secretID uint64) ([]uint64, error)
+	Load(secretID, channelID, replicaID uint64) (ChannelRecord, bool, error)
+	Save(secretID uint64, record ChannelRecord) error
+	Remove(secretID, channelID, replicaID uint64) (bool, error)
+	ListHelpers(secretID uint64) ([]HelperChannel, error)
+	ListReplicas(secretID uint64) ([]ReplicaMember, error)
 	LinkChannel(secretID, a, b uint64) error
 	LinkedChannels(secretID, channelID uint64) ([]uint64, error)
 }
@@ -31,7 +37,8 @@ type ChannelStoreCallbacks struct {
 	Load           uintptr
 	Save           uintptr
 	Remove         uintptr
-	ListChannels   uintptr
+	ListHelpers    uintptr
+	ListReplicas   uintptr
 	LinkChannel    uintptr
 	LinkedChannels uintptr
 	FreeBuffer     uintptr
@@ -39,57 +46,69 @@ type ChannelStoreCallbacks struct {
 
 // --- Dispatch (pure, unit-testable against a mock channelStore) -----------
 
-func dispatchChannelLoad(s *storeSet, secretID, channelID uint64) (status int32, out []byte) {
+func dispatchChannelLoad(s *storeSet, secretID, channelID, replicaID uint64) (status int32, out []byte) {
 	defer recoverInto(&status)
-	ch, ok, err := s.channel.Load(secretID, channelID)
+	record, ok, err := s.channel.Load(secretID, channelID, replicaID)
 	if err != nil {
 		return ffiStatusFailure, nil
 	}
 	if !ok {
 		return ffiStatusNotFound, nil
 	}
-	encoded, err := EncodeChannel(ch)
+	encoded, err := EncodeChannelRecord(record)
 	if err != nil {
 		return ffiStatusFailure, nil
 	}
 	return ffiStatusOK, encoded
 }
 
-// dispatchChannelSave takes channelID purely for FFI signature parity with
-// ChannelStoreCallbacks.save (which carries it redundantly alongside the
-// encoded Channel, mirroring remove/linked_channels) — the store call
-// itself is keyed by the decoded channel's own ID, matching
-// protocol.ChannelStore.Save's signature and Rust's DotnetChannelStore::save
-// (which derives channel_id from the Channel object, not a caller-supplied
-// value).
-func dispatchChannelSave(s *storeSet, secretID, channelID uint64, channelJSON []byte) (status int32) {
+// dispatchChannelSave takes channelID and replicaID purely for FFI signature
+// parity with ChannelStoreCallbacks.save (which carries them redundantly
+// alongside the encoded record, mirroring remove) — the store call itself is
+// keyed by the decoded record's own address, matching Rust's
+// DotnetChannelStore::save, which derives the key from the record rather than
+// a caller-supplied value so a record cannot be saved under the wrong key.
+func dispatchChannelSave(s *storeSet, secretID, channelID, replicaID uint64, recordJSON []byte) (status int32) {
 	defer recoverInto(&status)
-	ch, err := DecodeChannel(channelJSON)
+	record, err := DecodeChannelRecord(recordJSON)
 	if err != nil {
 		return ffiStatusFailure
 	}
-	if err := s.channel.Save(secretID, ch); err != nil {
+	if err := s.channel.Save(secretID, record); err != nil {
 		return ffiStatusFailure
 	}
 	return ffiStatusOK
 }
 
-func dispatchChannelRemove(s *storeSet, secretID, channelID uint64) (status int32, existed bool) {
+func dispatchChannelRemove(s *storeSet, secretID, channelID, replicaID uint64) (status int32, existed bool) {
 	defer recoverInto(&status)
-	existed, err := s.channel.Remove(secretID, channelID)
+	existed, err := s.channel.Remove(secretID, channelID, replicaID)
 	if err != nil {
 		return ffiStatusFailure, false
 	}
 	return ffiStatusOK, existed
 }
 
-func dispatchChannelListChannels(s *storeSet, secretID uint64) (status int32, out []byte) {
+func dispatchChannelListHelpers(s *storeSet, secretID uint64) (status int32, out []byte) {
 	defer recoverInto(&status)
-	ids, err := s.channel.ListChannels(secretID)
+	helpers, err := s.channel.ListHelpers(secretID)
 	if err != nil {
 		return ffiStatusFailure, nil
 	}
-	encoded, err := EncodeUint64Array(ids)
+	encoded, err := EncodeHelperChannelList(helpers)
+	if err != nil {
+		return ffiStatusFailure, nil
+	}
+	return ffiStatusOK, encoded
+}
+
+func dispatchChannelListReplicas(s *storeSet, secretID uint64) (status int32, out []byte) {
+	defer recoverInto(&status)
+	members, err := s.channel.ListReplicas(secretID)
+	if err != nil {
+		return ffiStatusFailure, nil
+	}
+	encoded, err := EncodeReplicaMemberList(members)
 	if err != nil {
 		return ffiStatusFailure, nil
 	}
@@ -120,13 +139,13 @@ func dispatchChannelLinkedChannels(s *storeSet, secretID, channelID uint64) (sta
 // --- C-facing callbacks (exact FFI signature; registered with
 // purego.NewCallback in buildChannelStoreCallbacks) -------------------------
 
-func channelLoadCallback(userData uintptr, secretID, channelID uint64, outPtr, outLen *uintptr) (status int32) {
+func channelLoadCallback(userData uintptr, secretID, channelID, replicaID uint64, outPtr, outLen *uintptr) (status int32) {
 	defer recoverInto(&status)
 	s, ok := lookupStores(storeHandle(userData))
 	if !ok {
 		return ffiStatusFailure
 	}
-	st, out := dispatchChannelLoad(s, secretID, channelID)
+	st, out := dispatchChannelLoad(s, secretID, channelID, replicaID)
 	if st != ffiStatusOK {
 		return st
 	}
@@ -134,35 +153,49 @@ func channelLoadCallback(userData uintptr, secretID, channelID uint64, outPtr, o
 	return ffiStatusOK
 }
 
-func channelSaveCallback(userData uintptr, secretID, channelID uint64, bytesPtr *byte, length uintptr) (status int32) {
+func channelSaveCallback(userData uintptr, secretID, channelID, replicaID uint64, bytesPtr *byte, length uintptr) (status int32) {
 	defer recoverInto(&status)
 	s, ok := lookupStores(storeHandle(userData))
 	if !ok {
 		return ffiStatusFailure
 	}
-	return dispatchChannelSave(s, secretID, channelID, unsafe.Slice(bytesPtr, length))
+	return dispatchChannelSave(s, secretID, channelID, replicaID, unsafe.Slice(bytesPtr, length))
 }
 
-func channelRemoveCallback(userData uintptr, secretID, channelID uint64, outExisted *uint32) (status int32) {
+func channelRemoveCallback(userData uintptr, secretID, channelID, replicaID uint64, outExisted *uint32) (status int32) {
 	defer recoverInto(&status)
 	s, ok := lookupStores(storeHandle(userData))
 	if !ok {
 		return ffiStatusFailure
 	}
-	st, existed := dispatchChannelRemove(s, secretID, channelID)
+	st, existed := dispatchChannelRemove(s, secretID, channelID, replicaID)
 	if st == ffiStatusOK {
 		*outExisted = boolToU32(existed)
 	}
 	return st
 }
 
-func channelListChannelsCallback(userData uintptr, secretID uint64, outPtr, outLen *uintptr) (status int32) {
+func channelListHelpersCallback(userData uintptr, secretID uint64, outPtr, outLen *uintptr) (status int32) {
 	defer recoverInto(&status)
 	s, ok := lookupStores(storeHandle(userData))
 	if !ok {
 		return ffiStatusFailure
 	}
-	st, out := dispatchChannelListChannels(s, secretID)
+	st, out := dispatchChannelListHelpers(s, secretID)
+	if st != ffiStatusOK {
+		return st
+	}
+	writeOutBuffer(out, outPtr, outLen)
+	return ffiStatusOK
+}
+
+func channelListReplicasCallback(userData uintptr, secretID uint64, outPtr, outLen *uintptr) (status int32) {
+	defer recoverInto(&status)
+	s, ok := lookupStores(storeHandle(userData))
+	if !ok {
+		return ffiStatusFailure
+	}
+	st, out := dispatchChannelListReplicas(s, secretID)
 	if st != ffiStatusOK {
 		return st
 	}
@@ -204,7 +237,7 @@ func channelLinkedChannelsCallback(userData uintptr, secretID, channelID uint64,
 var (
 	channelCallbacksOnce sync.Once
 	channelCallbackPtrs  struct {
-		load, save, remove, listChannels, linkChannel, linkedChannels uintptr
+		load, save, remove, listHelpers, listReplicas, linkChannel, linkedChannels uintptr
 	}
 )
 
@@ -213,7 +246,8 @@ func registerChannelCallbacks() {
 		channelCallbackPtrs.load = purego.NewCallback(channelLoadCallback)
 		channelCallbackPtrs.save = purego.NewCallback(channelSaveCallback)
 		channelCallbackPtrs.remove = purego.NewCallback(channelRemoveCallback)
-		channelCallbackPtrs.listChannels = purego.NewCallback(channelListChannelsCallback)
+		channelCallbackPtrs.listHelpers = purego.NewCallback(channelListHelpersCallback)
+		channelCallbackPtrs.listReplicas = purego.NewCallback(channelListReplicasCallback)
 		channelCallbackPtrs.linkChannel = purego.NewCallback(channelLinkChannelCallback)
 		channelCallbackPtrs.linkedChannels = purego.NewCallback(channelLinkedChannelsCallback)
 	})
@@ -229,7 +263,8 @@ func buildChannelStoreCallbacks(h storeHandle) ChannelStoreCallbacks {
 		Load:           channelCallbackPtrs.load,
 		Save:           channelCallbackPtrs.save,
 		Remove:         channelCallbackPtrs.remove,
-		ListChannels:   channelCallbackPtrs.listChannels,
+		ListHelpers:    channelCallbackPtrs.listHelpers,
+		ListReplicas:   channelCallbackPtrs.listReplicas,
 		LinkChannel:    channelCallbackPtrs.linkChannel,
 		LinkedChannels: channelCallbackPtrs.linkedChannels,
 		FreeBuffer:     sharedFreeBufferCallback(),

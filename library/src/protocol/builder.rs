@@ -63,7 +63,8 @@ pub struct DeRecProtocolBuilder<
     own_transport: OwnTransport,
     threshold: usize,
     keep_versions_count: usize,
-    timeout_in_secs: u64,
+    timeouts: crate::protocol::types::Timeouts,
+    unsafe_http: bool,
     communication_info: HashMap<String, String>,
     auto_respond_on_failure: bool,
     unpair_ack: UnpairAck,
@@ -101,7 +102,8 @@ impl
             own_transport: BuilderSlotMissingMarker,
             threshold: 3,
             keep_versions_count: 3,
-            timeout_in_secs: 300,
+            timeouts: crate::protocol::types::Timeouts::default(),
+            unsafe_http: false,
             communication_info: HashMap::new(),
             auto_respond_on_failure: false,
             unpair_ack: UnpairAck::Required,
@@ -145,30 +147,86 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
         self
     }
 
-    /// Protocol-wide staleness boundary.
+    /// Configure how long the protocol waits on each thing that can keep it
+    /// waiting.
     ///
-    /// Any inbound envelope whose timestamp is older than this is discarded
-    /// on receipt, regardless of flow.
+    /// One call sets all four; anything left unspecified keeps its default:
     ///
-    /// The same threshold is also used to age out local state that is
-    /// waiting on a peer: incomplete pairings, in-flight sharing rounds,
-    /// and outstanding unpair acknowledgements.
+    /// ```no_run
+    /// # use derec_library::protocol::types::Timeouts;
+    /// # use std::time::Duration;
+    /// # let builder = derec_library::protocol::DeRecProtocolBuilder::new(1);
+    /// builder.with_timeouts(Timeouts {
+    ///     sharing_round: Duration::from_secs(30),
+    ///     ..Default::default()
+    /// })
+    /// # ;
+    /// ```
     ///
-    /// # Granularity
+    /// These used to be a single knob, which forced a bad trade: shortening
+    /// the sharing round to make a stalled publish surface sooner also
+    /// narrowed the replay window every inbound message is judged against.
+    /// [`Timeouts::inbound_message`](crate::protocol::types::Timeouts::inbound_message)
+    /// is a security boundary and the other
+    /// three are liveness budgets; they are configured separately because
+    /// they answer different questions. See
+    /// [`Timeouts`](crate::protocol::types::Timeouts) for what each one
+    /// governs and how to choose it.
     ///
-    /// **One second is the smallest effective unit.** The protocol's wire
-    /// timestamps (protobuf `Timestamp.seconds`) carry only whole-second
-    /// resolution, so message ages can only be measured to the nearest
-    /// second. As a consequence:
+    /// Every value is clamped to at least one second — this is the single
+    /// normalization point, so the clamp applies however the value was
+    /// constructed.
+    pub fn with_timeouts(mut self, timeouts: crate::protocol::types::Timeouts) -> Self {
+        let secs = |d: Duration| d.as_secs().max(1);
+        self.timeouts = crate::protocol::types::Timeouts {
+            inbound_message: Duration::from_secs(secs(timeouts.inbound_message)),
+            sharing_round: Duration::from_secs(secs(timeouts.sharing_round)),
+            unpair_ack: Duration::from_secs(secs(timeouts.unpair_ack)),
+            expired_channels: match timeouts.expired_channels {
+                crate::protocol::ExpiredChannelCleanup::Enabled { timeout_in_secs } => {
+                    crate::protocol::ExpiredChannelCleanup::Enabled {
+                        timeout_in_secs: timeout_in_secs.max(1),
+                    }
+                }
+                crate::protocol::ExpiredChannelCleanup::Disabled => {
+                    crate::protocol::ExpiredChannelCleanup::Disabled
+                }
+            },
+        };
+        self
+    }
+
+    /// Accept plaintext `http://` transport endpoints. **Development only.**
     ///
-    /// - sub-second precision in the supplied [`Duration`] is truncated
-    ///   ([`Duration::from_millis(2500)`](Duration::from_millis) becomes 2 seconds);
-    /// - any value below one second is clamped to one second, so an
-    ///   accidental [`Duration::ZERO`] does not silently disable the timeout.
+    /// Default: `false`, which is the production posture.
     ///
-    /// Default: 5 minutes.
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout_in_secs = timeout.as_secs().max(1);
+    /// # What it changes
+    ///
+    /// With it `false`, plaintext is accepted in exactly one situation: an
+    /// endpoint **this device configured for itself** that names loopback
+    /// (`localhost`, `127.0.0.1`, `::1`). That covers running a dev server on
+    /// your own machine with no configuration at all.
+    ///
+    /// With it `true`, plaintext is accepted for **any host, on any path** —
+    /// this device's own endpoint and any endpoint a peer supplies, including
+    /// public hosts. That is what makes it usable for the case it exists for:
+    /// testing a phone against a laptop across a LAN, where neither side is
+    /// loopback. It is also why the name is blunt.
+    ///
+    /// See [`TransportPolicy`](crate::transport::TransportPolicy) for the
+    /// full table, including why loopback is free for your own endpoint but
+    /// not for one a peer names.
+    ///
+    /// # This is a guardrail, not transport security
+    ///
+    /// The SDK opens no sockets — delivery is the application's
+    /// [`DeRecTransport`](crate::protocol::DeRecTransport). Nothing here can
+    /// stop an application sending plaintext; what it does is refuse to
+    /// record, propagate or reply to a plaintext endpoint. Leaving it `false`
+    /// does not make a deployment secure on its own, and setting it `true`
+    /// does not by itself send anything in the clear.
+    pub fn with_unsafe_http(mut self, allow: bool) -> Self {
+        self.unsafe_http = allow;
         self
     }
 
@@ -199,7 +257,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     /// before dropping local state.
     ///
     /// - [`UnpairAck::Required`]: keep state until the peer responds with `Ok`,
-    ///   or until the timeout configured via [`Self::with_timeout`] elapses.
+    ///   or until the timeout configured via [`Self::with_timeouts`] elapses.
     /// - [`UnpairAck::NotRequired`]: drop state immediately after sending the
     ///   request; any later response is silently ignored.
     ///
@@ -247,10 +305,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     /// every field `false`, behaviour identical to today's
     /// `ActionRequired` flow. See the field-level docs on
     /// [`crate::protocol::AutoAcceptPolicy`] for the per-flow trade-offs.
-    pub fn with_auto_accept(
-        mut self,
-        policy: crate::protocol::AutoAcceptPolicy,
-    ) -> Self {
+    pub fn with_auto_accept(mut self, policy: crate::protocol::AutoAcceptPolicy) -> Self {
         self.auto_accept = policy;
         self
     }
@@ -258,7 +313,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     /// Configure this node's local **replica identity**.
     ///
     /// Required to participate in any replica-mode pairing — when set, the
-    /// orchestrator auto-injects the id (hex-encoded) under the reserved key
+    /// orchestrator auto-injects the id (decimal-encoded) under the reserved key
     /// `derec.replica_id` in outbound `PairRequest` / `PairResponse`
     /// envelopes whose `sender_kind` is `ReplicaSource` or
     /// `ReplicaDestination`, and accepts inbound replica pairings that
@@ -333,7 +388,8 @@ impl<ShareStore, SecretStore, UserSecretStore, StateStore, Transport, OwnTranspo
             own_transport: self.own_transport,
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
-            timeout_in_secs: self.timeout_in_secs,
+            timeouts: self.timeouts,
+            unsafe_http: self.unsafe_http,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -381,7 +437,8 @@ impl<ChannelStore, SecretStore, UserSecretStore, StateStore, Transport, OwnTrans
             own_transport: self.own_transport,
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
-            timeout_in_secs: self.timeout_in_secs,
+            timeouts: self.timeouts,
+            unsafe_http: self.unsafe_http,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -429,7 +486,8 @@ impl<ChannelStore, ShareStore, UserSecretStore, StateStore, Transport, OwnTransp
             own_transport: self.own_transport,
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
-            timeout_in_secs: self.timeout_in_secs,
+            timeouts: self.timeouts,
+            unsafe_http: self.unsafe_http,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -480,7 +538,8 @@ impl<ChannelStore, ShareStore, SecretStore, StateStore, Transport, OwnTransport>
             own_transport: self.own_transport,
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
-            timeout_in_secs: self.timeout_in_secs,
+            timeouts: self.timeouts,
+            unsafe_http: self.unsafe_http,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -528,7 +587,8 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, OwnTran
             own_transport: self.own_transport,
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
-            timeout_in_secs: self.timeout_in_secs,
+            timeouts: self.timeouts,
+            unsafe_http: self.unsafe_http,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -588,7 +648,8 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             own_transport: BuilderSlotSetMarker(own_transport),
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
-            timeout_in_secs: self.timeout_in_secs,
+            timeouts: self.timeouts,
+            unsafe_http: self.unsafe_http,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -641,7 +702,8 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, Transport, OwnTrans
             own_transport: self.own_transport,
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
-            timeout_in_secs: self.timeout_in_secs,
+            timeouts: self.timeouts,
+            unsafe_http: self.unsafe_http,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -691,6 +753,10 @@ impl<
     ///   validation (malformed scheme, empty URI, …).
     pub fn build(self) -> crate::Result<DeRecProtocol<Cs, Sh, Ss, Us, St, Tr>> {
         let own_transport: TransportProtocol = self.own_transport.0?.into();
+        // Deferred to here rather than to `with_own_transport`: the setters
+        // may be called in either order, so this is the first point at which
+        // both the endpoint and the policy are known.
+        crate::transport::TransportPolicy::new(self.unsafe_http).check_own(&own_transport)?;
         let mut protocol = DeRecProtocol::new(
             self.secret_id,
             self.channel_store.0,
@@ -702,7 +768,7 @@ impl<
             own_transport,
             self.threshold,
             self.keep_versions_count,
-            self.timeout_in_secs,
+            self.timeouts,
         )?;
         protocol.communication_info = self.communication_info;
         protocol.auto_respond_on_failure = self.auto_respond_on_failure;
@@ -711,6 +777,7 @@ impl<
         protocol.auto_accept = self.auto_accept;
         protocol.replica_id = self.replica_id;
         protocol.parameter_range = self.parameter_range;
+        protocol.unsafe_http = self.unsafe_http;
         Ok(protocol)
     }
 }
@@ -777,22 +844,32 @@ mod tests {
             DeRecTransport, DeRecUserSecretStore, SecretStoreFuture, ShareStoreFuture,
             TransportFuture,
         };
-        use crate::protocol::types::{Channel, MissingPolicy, SecretKind, SecretValue, Share, UserSecrets};
+        use crate::protocol::types::{
+            ChannelQuery, ChannelRecord, HelperChannel, MissingPolicy, ReplicaMember, SecretKind,
+            SecretValue, Share, UserSecrets,
+        };
         use crate::types::ChannelId;
         use derec_proto::TransportProtocol;
 
         struct NoopChannelStore;
         impl DeRecChannelStore for NoopChannelStore {
-            fn load(&self, _: u64, _: ChannelId) -> ChannelStoreFuture<'_, Option<Channel>> {
+            fn load(
+                &self,
+                _: u64,
+                _: ChannelQuery,
+            ) -> ChannelStoreFuture<'_, Option<ChannelRecord>> {
                 Box::pin(std::future::ready(Ok(None)))
             }
-            fn save(&mut self, _: u64, _: Channel) -> ChannelStoreFuture<'_, ()> {
+            fn save(&mut self, _: u64, _: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
-            fn remove(&mut self, _: u64, _: ChannelId) -> ChannelStoreFuture<'_, bool> {
+            fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(std::future::ready(Ok(false)))
             }
-            fn channels(&self, _: u64) -> ChannelStoreFuture<'_, Vec<Channel>> {
+            fn helpers(&self, _: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+            fn replicas(&self, _: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn link_channel(
@@ -814,12 +891,7 @@ mod tests {
 
         struct NoopShareStore;
         impl DeRecShareStore for NoopShareStore {
-            fn load(
-                &self,
-                _: u64,
-                _: ChannelId,
-                _: &[u32],
-            ) -> ShareStoreFuture<'_, Vec<Share>> {
+            fn load(&self, _: u64, _: ChannelId, _: &[u32]) -> ShareStoreFuture<'_, Vec<Share>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn load_many(
@@ -830,11 +902,7 @@ mod tests {
             ) -> ShareStoreFuture<'_, Vec<Share>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
-            fn load_all(
-                &self,
-                _: u64,
-                _: &[ChannelId],
-            ) -> ShareStoreFuture<'_, Vec<Share>> {
+            fn load_all(&self, _: u64, _: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn latest_version(&self, _: u64) -> ShareStoreFuture<'_, Option<u32>> {
@@ -867,20 +935,10 @@ mod tests {
             ) -> SecretStoreFuture<'_, Vec<(ChannelId, SecretValue)>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
-            fn save(
-                &mut self,
-                _: u64,
-                _: ChannelId,
-                _: SecretValue,
-            ) -> SecretStoreFuture<'_, ()> {
+            fn save(&mut self, _: u64, _: ChannelId, _: SecretValue) -> SecretStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
-            fn remove(
-                &mut self,
-                _: u64,
-                _: ChannelId,
-                _: SecretKind,
-            ) -> SecretStoreFuture<'_, ()> {
+            fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
         }
@@ -918,7 +976,8 @@ mod tests {
                 &self,
                 _: u64,
                 _: crate::protocol::StateKey,
-            ) -> crate::protocol::StateStoreFuture<'_, Option<crate::protocol::StateItem>> {
+            ) -> crate::protocol::StateStoreFuture<'_, Option<crate::protocol::StateItem>>
+            {
                 Box::pin(std::future::ready(Ok(None)))
             }
             fn remove(
@@ -932,7 +991,8 @@ mod tests {
                 &self,
                 _: u64,
                 _: crate::protocol::StateKind,
-            ) -> crate::protocol::StateStoreFuture<'_, Vec<crate::protocol::StateItem>> {
+            ) -> crate::protocol::StateStoreFuture<'_, Vec<crate::protocol::StateItem>>
+            {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
         }
@@ -953,7 +1013,7 @@ mod tests {
             },
             0, // ← invalid threshold
             3,
-            30,
+            crate::protocol::types::Timeouts::default(),
         );
         assert!(matches!(result, Err(crate::Error::InvalidInput(_))));
     }
@@ -969,23 +1029,31 @@ mod tests {
             TransportFuture,
         };
         use crate::protocol::types::{
-            Channel, MissingPolicy, SecretKind, SecretValue, Share, UserSecrets,
+            ChannelQuery, ChannelRecord, HelperChannel, MissingPolicy, ReplicaMember, SecretKind,
+            SecretValue, Share, UserSecrets,
         };
         use crate::types::ChannelId;
         use derec_proto::TransportProtocol;
 
         struct NoopChannelStore;
         impl DeRecChannelStore for NoopChannelStore {
-            fn load(&self, _: u64, _: ChannelId) -> ChannelStoreFuture<'_, Option<Channel>> {
+            fn load(
+                &self,
+                _: u64,
+                _: ChannelQuery,
+            ) -> ChannelStoreFuture<'_, Option<ChannelRecord>> {
                 Box::pin(std::future::ready(Ok(None)))
             }
-            fn save(&mut self, _: u64, _: Channel) -> ChannelStoreFuture<'_, ()> {
+            fn save(&mut self, _: u64, _: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
-            fn remove(&mut self, _: u64, _: ChannelId) -> ChannelStoreFuture<'_, bool> {
+            fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(std::future::ready(Ok(false)))
             }
-            fn channels(&self, _: u64) -> ChannelStoreFuture<'_, Vec<Channel>> {
+            fn helpers(&self, _: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+            fn replicas(&self, _: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn link_channel(
@@ -1006,12 +1074,7 @@ mod tests {
         }
         struct NoopShareStore;
         impl DeRecShareStore for NoopShareStore {
-            fn load(
-                &self,
-                _: u64,
-                _: ChannelId,
-                _: &[u32],
-            ) -> ShareStoreFuture<'_, Vec<Share>> {
+            fn load(&self, _: u64, _: ChannelId, _: &[u32]) -> ShareStoreFuture<'_, Vec<Share>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn load_many(
@@ -1022,11 +1085,7 @@ mod tests {
             ) -> ShareStoreFuture<'_, Vec<Share>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
-            fn load_all(
-                &self,
-                _: u64,
-                _: &[ChannelId],
-            ) -> ShareStoreFuture<'_, Vec<Share>> {
+            fn load_all(&self, _: u64, _: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn latest_version(&self, _: u64) -> ShareStoreFuture<'_, Option<u32>> {
@@ -1058,20 +1117,10 @@ mod tests {
             ) -> SecretStoreFuture<'_, Vec<(ChannelId, SecretValue)>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
-            fn save(
-                &mut self,
-                _: u64,
-                _: ChannelId,
-                _: SecretValue,
-            ) -> SecretStoreFuture<'_, ()> {
+            fn save(&mut self, _: u64, _: ChannelId, _: SecretValue) -> SecretStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
-            fn remove(
-                &mut self,
-                _: u64,
-                _: ChannelId,
-                _: SecretKind,
-            ) -> SecretStoreFuture<'_, ()> {
+            fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
         }
@@ -1107,7 +1156,8 @@ mod tests {
                 &self,
                 _: u64,
                 _: crate::protocol::StateKey,
-            ) -> crate::protocol::StateStoreFuture<'_, Option<crate::protocol::StateItem>> {
+            ) -> crate::protocol::StateStoreFuture<'_, Option<crate::protocol::StateItem>>
+            {
                 Box::pin(std::future::ready(Ok(None)))
             }
             fn remove(
@@ -1121,7 +1171,8 @@ mod tests {
                 &self,
                 _: u64,
                 _: crate::protocol::StateKind,
-            ) -> crate::protocol::StateStoreFuture<'_, Vec<crate::protocol::StateItem>> {
+            ) -> crate::protocol::StateStoreFuture<'_, Vec<crate::protocol::StateItem>>
+            {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
         }
@@ -1150,23 +1201,31 @@ mod tests {
             TransportFuture,
         };
         use crate::protocol::types::{
-            Channel, MissingPolicy, SecretKind, SecretValue, Share, UserSecrets,
+            ChannelQuery, ChannelRecord, HelperChannel, MissingPolicy, ReplicaMember, SecretKind,
+            SecretValue, Share, UserSecrets,
         };
         use crate::types::ChannelId;
         use derec_proto::TransportProtocol;
 
         struct NoopChannelStore;
         impl DeRecChannelStore for NoopChannelStore {
-            fn load(&self, _: u64, _: ChannelId) -> ChannelStoreFuture<'_, Option<Channel>> {
+            fn load(
+                &self,
+                _: u64,
+                _: ChannelQuery,
+            ) -> ChannelStoreFuture<'_, Option<ChannelRecord>> {
                 Box::pin(std::future::ready(Ok(None)))
             }
-            fn save(&mut self, _: u64, _: Channel) -> ChannelStoreFuture<'_, ()> {
+            fn save(&mut self, _: u64, _: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
-            fn remove(&mut self, _: u64, _: ChannelId) -> ChannelStoreFuture<'_, bool> {
+            fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(std::future::ready(Ok(false)))
             }
-            fn channels(&self, _: u64) -> ChannelStoreFuture<'_, Vec<Channel>> {
+            fn helpers(&self, _: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+            fn replicas(&self, _: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn link_channel(
@@ -1187,12 +1246,7 @@ mod tests {
         }
         struct NoopShareStore;
         impl DeRecShareStore for NoopShareStore {
-            fn load(
-                &self,
-                _: u64,
-                _: ChannelId,
-                _: &[u32],
-            ) -> ShareStoreFuture<'_, Vec<Share>> {
+            fn load(&self, _: u64, _: ChannelId, _: &[u32]) -> ShareStoreFuture<'_, Vec<Share>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn load_many(
@@ -1203,11 +1257,7 @@ mod tests {
             ) -> ShareStoreFuture<'_, Vec<Share>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
-            fn load_all(
-                &self,
-                _: u64,
-                _: &[ChannelId],
-            ) -> ShareStoreFuture<'_, Vec<Share>> {
+            fn load_all(&self, _: u64, _: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn latest_version(&self, _: u64) -> ShareStoreFuture<'_, Option<u32>> {
@@ -1239,20 +1289,10 @@ mod tests {
             ) -> SecretStoreFuture<'_, Vec<(ChannelId, SecretValue)>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
-            fn save(
-                &mut self,
-                _: u64,
-                _: ChannelId,
-                _: SecretValue,
-            ) -> SecretStoreFuture<'_, ()> {
+            fn save(&mut self, _: u64, _: ChannelId, _: SecretValue) -> SecretStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
-            fn remove(
-                &mut self,
-                _: u64,
-                _: ChannelId,
-                _: SecretKind,
-            ) -> SecretStoreFuture<'_, ()> {
+            fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
                 Box::pin(std::future::ready(Ok(())))
             }
         }
@@ -1288,7 +1328,8 @@ mod tests {
                 &self,
                 _: u64,
                 _: crate::protocol::StateKey,
-            ) -> crate::protocol::StateStoreFuture<'_, Option<crate::protocol::StateItem>> {
+            ) -> crate::protocol::StateStoreFuture<'_, Option<crate::protocol::StateItem>>
+            {
                 Box::pin(std::future::ready(Ok(None)))
             }
             fn remove(
@@ -1302,7 +1343,8 @@ mod tests {
                 &self,
                 _: u64,
                 _: crate::protocol::StateKind,
-            ) -> crate::protocol::StateStoreFuture<'_, Vec<crate::protocol::StateItem>> {
+            ) -> crate::protocol::StateStoreFuture<'_, Vec<crate::protocol::StateItem>>
+            {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
         }
@@ -1323,5 +1365,112 @@ mod tests {
                 crate::transport::TransportValidationError::SchemeMismatch { .. }
             ))
         ));
+    }
+
+    /// Normalization is the builder's single responsibility here: a zero
+    /// arriving by any construction path is clamped to one second, because a
+    /// zero would expire every `Pending` channel on the next `process()`
+    /// call — including pairings that had only just started.
+    #[test]
+    fn with_timeouts_expired_channels_clamps_zero_from_constructor() {
+        let b = DeRecProtocolBuilder::new(0).with_timeouts(crate::protocol::types::Timeouts {
+            expired_channels: crate::protocol::ExpiredChannelCleanup::from_secs(0),
+            ..Default::default()
+        });
+        assert_eq!(
+            b.timeouts.expired_channels,
+            crate::protocol::ExpiredChannelCleanup::Enabled { timeout_in_secs: 1 }
+        );
+    }
+
+    #[test]
+    fn with_timeouts_expired_channels_clamps_zero_from_new() {
+        let b = DeRecProtocolBuilder::new(0).with_timeouts(crate::protocol::types::Timeouts {
+            expired_channels: crate::protocol::ExpiredChannelCleanup::new(true, 0),
+            ..Default::default()
+        });
+        assert_eq!(
+            b.timeouts.expired_channels,
+            crate::protocol::ExpiredChannelCleanup::Enabled { timeout_in_secs: 1 }
+        );
+    }
+
+    #[test]
+    fn with_timeouts_expired_channels_clamps_zero_from_literal() {
+        let b = DeRecProtocolBuilder::new(0).with_timeouts(crate::protocol::types::Timeouts {
+            expired_channels: crate::protocol::ExpiredChannelCleanup::Enabled {
+                timeout_in_secs: 0,
+            },
+            ..Default::default()
+        });
+        assert_eq!(
+            b.timeouts.expired_channels,
+            crate::protocol::ExpiredChannelCleanup::Enabled { timeout_in_secs: 1 }
+        );
+    }
+
+    /// The three `Duration` budgets clamp to one second, for the same
+    /// reason the sweep does: wire timestamps carry whole seconds, so a
+    /// zero would mean "expire everything on the next pass" rather than
+    /// "no timeout".
+    #[test]
+    fn with_timeouts_clamps_every_duration_to_at_least_one_second() {
+        let b = DeRecProtocolBuilder::new(0).with_timeouts(crate::protocol::types::Timeouts {
+            inbound_message: Duration::ZERO,
+            sharing_round: Duration::ZERO,
+            unpair_ack: Duration::from_millis(400),
+            ..Default::default()
+        });
+        assert_eq!(b.timeouts.inbound_message, Duration::from_secs(1));
+        assert_eq!(b.timeouts.sharing_round, Duration::from_secs(1));
+        assert_eq!(b.timeouts.unpair_ack, Duration::from_secs(1));
+    }
+
+    /// Sub-second precision is truncated, not rounded — 2.5s is 2s.
+    #[test]
+    fn with_timeouts_truncates_sub_second_precision() {
+        let b = DeRecProtocolBuilder::new(0).with_timeouts(crate::protocol::types::Timeouts {
+            sharing_round: Duration::from_millis(2500),
+            ..Default::default()
+        });
+        assert_eq!(b.timeouts.sharing_round, Duration::from_secs(2));
+    }
+
+    /// Setting one field leaves the other three at their defaults — the
+    /// struct-update ergonomics every binding relies on.
+    #[test]
+    fn with_timeouts_leaves_unspecified_fields_at_their_defaults() {
+        let d = crate::protocol::types::Timeouts::default();
+        let b = DeRecProtocolBuilder::new(0).with_timeouts(crate::protocol::types::Timeouts {
+            sharing_round: Duration::from_secs(30),
+            ..Default::default()
+        });
+        assert_eq!(b.timeouts.sharing_round, Duration::from_secs(30));
+        assert_eq!(b.timeouts.inbound_message, d.inbound_message);
+        assert_eq!(b.timeouts.unpair_ack, d.unpair_ack);
+        assert_eq!(b.timeouts.expired_channels, d.expired_channels);
+    }
+
+    #[test]
+    fn with_timeouts_expired_channels_preserves_disabled() {
+        let b = DeRecProtocolBuilder::new(0).with_timeouts(crate::protocol::types::Timeouts {
+            expired_channels: crate::protocol::ExpiredChannelCleanup::Disabled,
+            ..Default::default()
+        });
+        assert_eq!(
+            b.timeouts.expired_channels,
+            crate::protocol::ExpiredChannelCleanup::Disabled
+        );
+    }
+
+    #[test]
+    fn builder_defaults_to_enabled_300() {
+        let b = DeRecProtocolBuilder::new(0);
+        assert_eq!(
+            b.timeouts.expired_channels,
+            crate::protocol::ExpiredChannelCleanup::Enabled {
+                timeout_in_secs: 300
+            }
+        );
     }
 }

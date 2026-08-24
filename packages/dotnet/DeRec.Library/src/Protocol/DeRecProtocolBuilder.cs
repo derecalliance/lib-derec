@@ -23,7 +23,7 @@ namespace DeRec.Library.Orchestrator;
 /// <para>
 /// Optional setters all carry the defaults documented on the Rust
 /// builder: <see cref="WithThreshold"/> (3), <see cref="WithKeepVersionsCount"/> (3),
-/// <see cref="WithTimeout"/> (5 minutes), <see cref="WithCommunicationInfo"/> (empty),
+/// <see cref="WithTimeouts"/> (library defaults), <see cref="WithCommunicationInfo"/> (empty),
 /// <see cref="WithAutoRespondOnFailure"/> (false),
 /// <see cref="WithUnpairAck"/> (<see cref="UnpairAck.Required"/>),
 /// <see cref="WithAutoReplyTo"/> (false), <see cref="WithReplicaId"/> (unset).
@@ -41,13 +41,14 @@ public sealed class DeRecProtocolBuilder
     private TransportProtocol? _ownTransport;
     private int _threshold = 3;
     private int _keepVersionsCount = 3;
-    private TimeSpan _timeout = TimeSpan.FromSeconds(300);
     private Dictionary<string, string> _communicationInfo = new();
     private bool _autoRespondOnFailure = false;
     private UnpairAck _unpairAck = UnpairAck.Required;
     private bool _autoReplyTo = false;
     private AutoAcceptPolicy _autoAccept = new();
     private ulong? _replicaId = null;
+    private Timeouts? _timeouts = null;
+    private bool _unsafeHttp = false;
 
     /// <summary>
     /// Construct a builder bound to a specific secret.
@@ -130,12 +131,51 @@ public sealed class DeRecProtocolBuilder
     }
 
     /// <summary>
-    /// Protocol-wide staleness boundary. Truncated to seconds; clamped
-    /// to at least 1 second. Default: 5 minutes.
+    /// Configure how long the protocol waits on each thing that can keep it
+    /// waiting. Not calling this leaves every library default in force, as
+    /// does leaving any individual field of <see cref="Timeouts"/> null.
     /// </summary>
-    public DeRecProtocolBuilder WithTimeout(TimeSpan timeout)
+    /// <remarks>
+    /// These were one setting until it became clear they answer different
+    /// questions. <see cref="Timeouts.InboundMessage"/> is a security
+    /// boundary — how stale a message may be and still be accepted — so it
+    /// must tolerate transport latency and clock skew. The other three are
+    /// liveness budgets. Values are forwarded verbatim; clamping and
+    /// defaulting are library decisions.
+    /// </remarks>
+    public DeRecProtocolBuilder WithTimeouts(Timeouts timeouts)
     {
-        _timeout = timeout;
+        _timeouts = timeouts;
+        return this;
+    }
+
+    /// <summary>
+    /// Accept plaintext <c>http://</c> transport endpoints.
+    /// <b>Development only.</b> Default: <c>false</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// With <c>false</c>, plaintext is accepted in exactly one situation: an
+    /// endpoint this device configured for <em>itself</em> that names loopback
+    /// (<c>localhost</c>, <c>127.0.0.1</c>, <c>::1</c>). A local dev server
+    /// therefore needs no configuration at all.
+    /// </para>
+    /// <para>
+    /// With <c>true</c>, plaintext is accepted for any host on any path,
+    /// including endpoints a peer supplies. That is what makes the LAN case
+    /// work — a phone talking to a laptop, where neither side is loopback —
+    /// and why the name is blunt.
+    /// </para>
+    /// <para>
+    /// This is a guardrail, not transport security. The SDK opens no sockets;
+    /// delivery is your <c>ITransport</c>. Nothing here stops an application
+    /// sending plaintext — it governs which endpoints the protocol will
+    /// record, propagate to peers, and reply to.
+    /// </para>
+    /// </remarks>
+    public DeRecProtocolBuilder WithUnsafeHttp(bool allow)
+    {
+        _unsafeHttp = allow;
         return this;
     }
 
@@ -205,6 +245,8 @@ public sealed class DeRecProtocolBuilder
     }
 
     /// <summary>
+    /// Configure automatic removal of expired <c>Pending</c> channels
+    /// <summary>
     /// Finalize the configuration. Throws
     /// <see cref="InvalidOperationException"/> if any of the required
     /// setters was not called.
@@ -219,9 +261,6 @@ public sealed class DeRecProtocolBuilder
         if (_transport is null) throw new InvalidOperationException("WithTransport is required");
         if (_ownTransport is null) throw new InvalidOperationException("WithOwnTransport is required");
 
-        long secs = (long)Math.Floor(_timeout.TotalSeconds);
-        int timeoutInSecs = (int)Math.Max(1, Math.Min(secs, int.MaxValue));
-
         return new DeRecProtocol(
             secretId: _secretId,
             channelStore: _channelStore,
@@ -235,11 +274,12 @@ public sealed class DeRecProtocolBuilder
             threshold: _threshold,
             keepVersionsCount: _keepVersionsCount,
             communicationInfo: _communicationInfo,
-            timeoutInSecs: timeoutInSecs,
             autoRespondOnFailure: _autoRespondOnFailure,
             unpairAck: _unpairAck,
             autoReplyTo: _autoReplyTo,
             autoAccept: _autoAccept,
-            replicaId: _replicaId);
+            replicaId: _replicaId,
+            timeouts: _timeouts,
+            unsafeHttp: _unsafeHttp);
     }
 }

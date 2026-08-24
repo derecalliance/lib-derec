@@ -25,9 +25,12 @@ Alliance**.
 - [Quick start (Protocol layer)](#quick-start-protocol-layer)
 - [Builder configuration](#builder-configuration)
 - [Event-driven model](#event-driven-model)
+- [Helper-side admission control](#helper-side-admission-control)
 - [Protocol flows](#protocol-flows)
 - [Replica flows](#replica-flows)
+- [Correlation and routing on the wire](#correlation-and-routing-on-the-wire)
 - [Storage and transport traits](#storage-and-transport-traits)
+- [Choosing backends at run time](#choosing-backends-at-run-time)
 - [Errors](#errors)
 - [Async and executors](#async-and-executors)
 - [WebAssembly support](#webassembly-support)
@@ -65,7 +68,7 @@ Three roles participate:
   Pairing is confirmed out of band with a human-readable fingerprint
   (`DeRecProtocol::get_fingerprint` / `verify_fingerprint`), then
   `ProtectSecret` distributes the full secret (helpers + secrets +
-  replicas + `owner_replica_id`) to every Destination via a
+  replicas) to every Destination via a
   [`ReplicaSecretPayload`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.ReplicaSecretPayload.html).
   Destinations surface the typed
   [`DeRecEvent::ReplicaSecretReceived`](https://docs.rs/derec-library/latest/derec_library/protocol/events/enum.DeRecEvent.html#variant.ReplicaSecretReceived).
@@ -96,10 +99,9 @@ FFI layer, and no logging, so a pure-Rust consumer pays for none of them.
 
 | Feature | Enables |
 | --- | --- |
-| `serde` | `serde::Serialize` / `Deserialize` on the public store and channel types (`SecretValue`, `PairingKeyMaterial`, `Channel`, `ChannelStatus`, `TransportProtocol`), so a store implementation can persist them with any serde format. Without it, use the byte-level accessors (e.g. `PairingKeyMaterial::as_bytes` / `from_bytes`) or your own codec. Also pulls the matching `derec-proto/serde`. The serde wire format is not part of the public API and may change. |
+| `serde` | `serde::Serialize` / `Deserialize` on the public store and channel types (`SecretValue`, `PairingKeyMaterial`, `ChannelRecord`, `HelperChannel`, `ReplicaMember`, `ChannelStatus`, `TransportProtocol`), so a store implementation can persist them with any serde format. Without it, use the byte-level accessors (e.g. `PairingKeyMaterial::as_bytes` / `from_bytes`) or your own codec. Also pulls the matching `derec-proto/serde`. The serde wire format is not part of the public API and may change. |
 | `logging` | `tracing` spans and events across the protocol and primitives layers. Adds no overhead when no subscriber is installed. |
 | `ffi` | The native C-ABI bridge for host languages that link the shared library. Implies `serde` + `serde_json`. Pure-Rust consumers do not need this. |
-| `unsafe-http` | **Development only.** Lets `TransportProtocol::validate` accept plaintext `http://` endpoints. Production builds MUST leave this off — enabling it also lets a peer-supplied `replyTo` downgrade the reply path to plaintext. |
 
 ```toml
 [dependencies]
@@ -147,7 +149,7 @@ use derec_proto::{Protocol, TransportProtocol};
 
 // 1. Implement the four storage/transport traits for your environment.
 //    See the trait docs:
-//    - DeRecChannelStore  — paired channels
+//    - DeRecChannelStore  — helper channels + replica-group members
 //    - DeRecShareStore    — secret shares
 //    - DeRecSecretStore   — per-channel key material (sensitive)
 //    - DeRecTransport     — outbound message delivery
@@ -210,7 +212,7 @@ loop {
                 // Recovery completed — `secret` is the typed `Secret` snapshot
                 // the owner originally protected. The user-facing entries live
                 // in `secret.secrets: Vec<UserSecret>`; `helpers`, `replicas`
-                // and `owner_replica_id` carry the roster captured at
+                // carry the roster captured at
                 // distribution time.
                 for entry in &secret.secrets {
                     println!("recovered {} ({}B)", entry.name, entry.data.len());
@@ -247,8 +249,12 @@ Optional setters have defaults:
 |--------|---------|---------|
 | `with_threshold(n)` | `3` | Minimum shares required to reconstruct the secret. |
 | `with_keep_versions_count(n)` | `3` | Number of recent versions each helper must retain. |
-| `with_timeout(duration)` | `5 minutes` | Staleness boundary for inbound envelopes and pending state. One-second granularity. |
+| `with_timeouts(timeouts)` | see [Timeouts](#timeouts) | All four waiting periods in one call; unspecified fields keep their default. `inbound_message` 300s is the staleness/replay window, `sharing_round` and `unpair_ack` 60s are liveness budgets, `expired_channels` `Enabled { 300 }` sweeps channels awaiting fingerprint confirmation. |
+| `with_unsafe_http(bool)` | `false` | Accept plaintext `http://` endpoints. **Development only.** Loopback is accepted for your own endpoint regardless; see [Transport endpoints and plaintext](#transport-endpoints-and-plaintext). |
 | `with_communication_info(map)` | empty | Key-value identity metadata embedded in pairing messages. |
+| `with_replica_id(id)` | unset | This device's replica identity. Required for any replica-mode pairing; application-assigned and rejected if `0`. |
+| `with_auto_accept(policy)` | every flow off | Per-flow opt-in to auto-accepting inbound requests instead of surfacing `ActionRequired`. Read the per-flow caveats before enabling — several are state-changing. |
+| `with_parameter_range(range)` | unset | Advertised protocol parameter bounds, checked for overlap at pairing time. |
 | `with_auto_respond_on_failure(bool)` | `false` | If `true`, the protocol replies to the peer on inbound processing failures; if `false`, errors only surface as events. |
 | `with_unpair_ack(ack)` | `UnpairAck::Required` | Whether the unpair initiator waits for the peer's `Ok` before dropping local state. |
 | `with_auto_reply_to(bool)` | `false` | If `true`, every outbound request stamps `replyTo = own_transport` so the responder routes the reply back to this node — even if the channel's stored peer endpoint points elsewhere. Useful for replica scenarios. See [Correlation and routing on the wire](#correlation-and-routing-on-the-wire). |
@@ -290,7 +296,13 @@ before any target-level events are emitted.
   list of `UserSecret` the owner protected, alongside the captured
   helper/replica roster) /
   `RecoveryShareError { … }`
-- `Unpaired { channel_id }` / `UnpairRejected { channel_id, status, memo }`
+- `Unpaired { channel_id }` / `UnpairRejected { channel_id, status, memo }` /
+  `UnpairFailed { channel_id, error }` — emitted by `restore` when an
+  ephemeral recovery channel's teardown could not be delivered. The
+  teardown is fire-and-forget, so local state is dropped anyway and an
+  `Unpaired` for the same channel follows; the pair means "gone locally,
+  peer not told"
+
 - `ChannelInfoUpdated { channel_id }` /
   `ChannelInfoUpdateRejected { channel_id, status, memo }`
 - `PrePairRejected { channel_id, status, memo }` — the contact creator
@@ -306,27 +318,128 @@ for the complete enum and per-variant docs.
 
 ### Channel roles
 
-Each paired channel carries the local node's role — `SenderKind::Owner`,
+A channel row describes the participant on the other end, so each paired
+channel carries the **peer's** role — `SenderKind::Owner`,
 `SenderKind::Helper`, `SenderKind::ReplicaSource`, or
 `SenderKind::ReplicaDestination` — fixed at pairing time and stored on
-[`Channel.role`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.Channel.html).
+[`HelperChannel.peer_role`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.HelperChannel.html).
+The two sides of one channel therefore hold opposite values: an Owner's
+row for its helper reads `Helper`, and that helper's row for the Owner
+reads `Owner`. This node's own role is always the inverse
+(`Owner` ↔ `Helper`, `ReplicaSource` ↔ `ReplicaDestination`).
+
 The orchestrator enforces flow directionality against this value:
 
 - Outbound: `ProtectSecret`, `VerifyShares`, `Discovery`, `RecoverSecret`,
-  and `Unpair` require the local role to be `Owner` (or `ReplicaSource`
-  for `ProtectSecret`) on every targeted channel.
+  and `Unpair` require the peer to be a `Helper` (or a
+  `ReplicaDestination` for `ProtectSecret`) on every targeted channel.
 - Inbound: a `StoreShareRequest` / `VerifyShareRequest` /
   `GetSecretIdsVersionsRequest` / `GetShareRequest` / `UnpairRequest` is
-  only honored on a channel where the local role is `Helper`; the
-  corresponding responses require `Owner`. A `StoreShareRequest` on a
-  `ReplicaDestination` channel is decoded as a
+  only honored when it arrives from a peer recorded as `Owner`; the
+  corresponding responses require a `Helper` peer. A `StoreShareRequest`
+  on a `ReplicaSource` channel is decoded as a
   [`ReplicaSecretPayload`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.ReplicaSecretPayload.html)
   and surfaces as
   [`DeRecEvent::ReplicaSecretReceived`](https://docs.rs/derec-library/latest/derec_library/protocol/events/enum.DeRecEvent.html#variant.ReplicaSecretReceived).
 - `UpdateChannelInfo` is symmetric — either side may initiate it, and the
-  role is not consulted.
+  peer role is not consulted.
 
 A mismatch surfaces as `Error::RoleMismatch { channel_id, expected, actual }`.
+
+---
+
+## Helper-side admission control
+
+**The protocol enforces no limits of its own on inbound shares.** It does
+not bound share size, storage consumed per sharer, or how often an owner
+may push updates. A helper that needs those limits enforces them itself,
+and this section is how.
+
+`ParameterRange.maxShareSize` does not do this for you. It is exchanged
+during pairing and checked for *range overlap* between the two peers'
+advertised ranges; the negotiated value is never compared against an
+actual share afterwards. Treat it as a compatibility handshake, not an
+enforced ceiling.
+
+### Where the decision belongs
+
+Not before `process()`. Reading a share's size from raw wire bytes would
+mean decoding the envelope, resolving the channel's shared key,
+decrypting the inner message and parsing the protobuf — reimplementing
+the protocol's receive path outside the protocol.
+
+Instead, `process()` does that work and hands back the decoded request in
+an `ActionRequired` event. `PendingAction::StoreShare` carries the
+already-decrypted `StoreShareRequestMessage`, so the application inspects
+the share without touching wire bytes or key material:
+
+```rust,ignore
+for event in protocol.process(&wire_bytes).await? {
+    let DeRecEvent::ActionRequired { action, channel_id } = event else { continue };
+    match &action {
+        PendingAction::StoreShare { request, .. } => {
+            // `channel_id` maps to a user in the application's own store,
+            // so the limit can be per-user, per-plan, or whatever the
+            // deployment needs.
+            let limit = my_app.share_limit_for(channel_id);
+            if request.share.len() > limit {
+                protocol
+                    .reject(
+                        action,
+                        StatusEnum::SizeLimitExceeded,
+                        &format!("share exceeds the {limit}-byte limit"),
+                    )
+                    .await?;
+            } else {
+                protocol.accept(action).await?;
+            }
+        }
+        _ => { protocol.accept(action).await?; }
+    }
+}
+```
+
+The owner receives a `StoreShareResponse` carrying that status and memo,
+surfacing as `ShareRejected { channel_id, version, status, memo }` on its
+side — so a refusal is attributable rather than a silent timeout.
+
+Status codes for the common cases:
+
+| Status | Use for |
+|--------|---------|
+| `SizeLimitExceeded` | share too large, or storage quota for this sharer exhausted |
+| `TooFrequent` | rate limiting — the owner is updating faster than the helper allows |
+| `Rejected` | a user or operator declined the request |
+| `Fail` | anything else; put the detail in `memo` |
+
+### `auto_accept.store_share` removes this gate
+
+> [!IMPORTANT]
+> Setting `AutoAcceptPolicy::store_share = true` means `process()`
+> accepts and stores every inbound share internally. No `ActionRequired`
+> is emitted, so **there is no opportunity to reject** — every share from
+> every paired Owner is stored unconditionally, at whatever size it
+> arrives.
+
+Keep it `false` in any deployment with per-user storage limits. It is
+`false` by default; only an explicit
+`with_auto_accept(...)` turns it on, including via
+`AutoAcceptPolicy::all()`.
+
+### This is policy, not DoS protection
+
+By the time `ActionRequired` fires, the message has already been
+received, decrypted and parsed. Rejecting here protects your *storage*,
+not the CPU and memory spent getting there.
+
+`process()` deliberately imposes no upper bound on inbound message size —
+legitimate envelopes range from tens of bytes to many megabytes, and any
+cap tight enough to resist abuse risks truncating a legitimate replica
+sync, which can render a secret unrecoverable. Applications must bound
+inbound message size at the **transport** layer (max HTTP body,
+WebSocket frame size) sized to their deployment's secret size, helper
+count and replica fan-out. The two mechanisms are complementary: the
+transport cap protects resources, `reject` enforces policy.
 
 ---
 
@@ -343,6 +456,57 @@ A mismatch surfaces as `Error::RoleMismatch { channel_id, expected, actual }`.
 | Unpairing | Tear down a paired channel and drop local state. |
 | Update channel info | Propagate post-pairing changes to communication info and/or transport endpoint. |
 
+### Transport endpoints and plaintext
+
+Every transport endpoint the protocol handles is checked in two stages.
+
+**Structure** — non-empty, within the length cap, no control characters, and a
+scheme consistent with the declared protocol. Always applied; `ws://` and
+`file://` are refused everywhere.
+
+**Scheme policy** — whether a plaintext `http://` endpoint may actually be
+used. This depends on how you are deployed, so it is configuration rather than
+a fixed rule:
+
+```rust
+builder.with_unsafe_http(true)   // development only; default is false
+```
+
+| Endpoint | `https` | plaintext loopback | plaintext, any other host |
+|---|---|---|---|
+| **Your own** — `with_own_transport`, and the `reply_to` you stamp on outbound requests | always | **always**, with a warning | needs `with_unsafe_http(true)` |
+| **A peer's** — a contact's endpoint, an `UpdateChannelInfo` announcement, a request's `reply_to` | always | needs `with_unsafe_http(true)` | needs `with_unsafe_http(true)` |
+
+So **a local dev server needs no configuration at all** — `http://localhost:8080`
+as your own endpoint just works. Testing across a LAN, a phone against a
+laptop, needs `with_unsafe_http(true)` on both sides, because neither is
+loopback.
+
+Loopback is free for *your own* endpoint because it names a service on your
+machine: the bytes never reach a network. It is not free for one a **peer**
+names, because there the address is chosen by somebody else and points at
+*your* machine — a peer should not be able to nominate your localhost as a
+reply address without you having opted into plaintext at all.
+
+Recognition is deliberately literal: `localhost`, `127.0.0.1`, `::1`, nothing
+else. No DNS resolution, no private-range classification. Both would need full
+URI parsing, and getting that wrong in a security check is how
+`http://127.0.0.1@evil.com/` slips past — so userinfo is refused outright and
+the wider case is what `with_unsafe_http` is for.
+
+> **This is a guardrail, not transport security.** The SDK opens no sockets —
+> delivery is your `DeRecTransport`. Nothing here stops an application sending
+> plaintext; what it does is refuse to record a plaintext endpoint, refuse to
+> propagate one to peers during pairing, and refuse to reply to one. Leaving
+> `with_unsafe_http` at its default does not by itself make a deployment
+> secure, and turning it on does not by itself send anything in the clear.
+
+This was a Cargo feature (`unsafe-http`) until it became clear a compile-time
+switch is unreachable for the four SDKs that install a prebuilt binary from a
+package manager: a .NET or Node developer has no compilation step in which to
+enable it. The setting is available identically in Rust, .NET, Go, Node.js and
+Web.
+
 ### Pairing modes
 
 `DeRecProtocol::create_contact` takes a `ContactMode` argument; the choice
@@ -352,6 +516,22 @@ travels in the `ContactMessage` and tells the scanner which handshake to run.
 |---|---|---|
 | `InlineKeys` | Full ML-KEM encapsulation key + ECIES public key | Out-of-band channel can carry ~1.2 KB (NFC, deep link, direct messaging). |
 | `HashedKeys` | Only a 48-byte SHA-384 commitment to the keys | Out-of-band channel is size-constrained (QR codes). The scanner fetches the real keys over the wire via a plaintext `PrePair` round-trip and verifies them against the commitment. |
+| `NoKeys` | `channel_id`, `nonce` and the transport endpoint — nothing else | Out-of-band channel is a human one: hand-typed, dictated over the phone, or an institutional email. Requires a caller-supplied `nonce`. **The channel stays unusable until the fingerprint is confirmed** — see below. |
+
+> **`NoKeys` is the one mode with no cryptographic binding to the keys.**
+> `InlineKeys` carries them in the contact; `HashedKeys` carries a commitment
+> the scanner checks the fetched keys against. `NoKeys` carries neither, and
+> its `PrePair` leg is plaintext, so an attacker who intercepts that exchange
+> can substitute their own keys — the nonce does not prevent it, because the
+> nonce is in the same plaintext.
+>
+> The library therefore holds a `NoKeys` channel in `ChannelStatus::Pending`
+> until [`verify_fingerprint`](#fingerprint-confirmation) succeeds: it is not
+> a `ProtectSecret` target, not a recovery source, and inbound messages on it
+> are ignored. A man-in-the-middle leaves the two sides with different shared
+> keys and so different fingerprints, which is exactly what the comparison
+> catches. Applications MUST also rate-limit inbound `PrePairRequest`s per
+> `channel_id` and expire outstanding `NoKeys` contacts on a short timer.
 
 The library's primitives section below documents the [`InlineKeys`](#inlinekeys-flow)
 and [`HashedKeys`](#hashedkeys-flow-prepair) message-level handshakes. At
@@ -428,18 +608,28 @@ Attempting any replica-mode flow on a protocol built without
 
 The reserved `derec.*` `CommunicationInfo` namespace — including
 `derec.replica_id` and its wire encoding — is documented in
-[`protocol::reserved_keys`](https://docs.rs/derec-library/latest/derec_library/protocol/reserved_keys/index.html).
+[`protocol::utils::reserved_keys`](https://docs.rs/derec-library/latest/derec_library/protocol/utils/reserved_keys/index.html).
 Apps should not write to this namespace; the orchestrator strips and
 re-injects entries at the protocol boundary.
 
 ### Fingerprint confirmation
 
-Replica channels start in `ChannelStatus::Pending` after the handshake
-and are not eligible as `ProtectSecret` targets until both sides confirm
-the pair out of band. The protocol derives a deterministic
-human-readable fingerprint from the shared key — same on both
-devices — that users compare visually before each side calls
-`verify_fingerprint`:
+Two kinds of channel start in `ChannelStatus::Pending` after the handshake
+and are not eligible as `ProtectSecret` targets until both sides confirm the
+pair out of band:
+
+- **Every replica channel**, whatever the contact mode — admitting another
+  device to the group is a human decision.
+- **Every `NoKeys` channel**, including owner↔helper ones. That mode commits
+  to nothing, so the fingerprint is the only check that catches a key
+  substituted on its plaintext `PrePair` leg.
+
+A `Pending` channel fails closed: nothing is published to it, it is not used
+as a recovery source, and inbound messages on it are ignored.
+
+The protocol derives a deterministic human-readable fingerprint from the
+shared key — same on both devices — that users compare visually before each
+side calls `verify_fingerprint`:
 
 ```rust
 let local = source.get_fingerprint(channel_id).await?;
@@ -452,6 +642,10 @@ destination.verify_fingerprint(channel_id, &local).await?;  // → true
 `verify_fingerprint` returns `true` on match and transitions the channel
 to `Paired`. A mismatch returns `false` and leaves the channel `Pending`
 so the app can retry.
+
+Confirmation is also the moment the peer becomes reachable, so the current
+snapshot is published to it then — a `NoKeys` helper was not an eligible
+target at handshake time, and the pairing-time auto-publish skipped it.
 
 ### Secret distribution
 
@@ -471,6 +665,34 @@ On the destination, the inbound envelope decodes into
 [`DeRecEvent::ReplicaSecretReceived`](https://docs.rs/derec-library/latest/derec_library/protocol/events/enum.DeRecEvent.html#variant.ReplicaSecretReceived)
 with `secret: Secret` and `shares: Vec<ChannelShare>` already
 parsed — the app just installs the secrets.
+
+#### When a mixed round reports
+
+A round that targets both helpers and replica members reports **only once
+both populations have settled**. `SharingComplete` and `ReplicaSyncComplete`
+are emitted together, at that moment.
+
+The counts on `SharingComplete` describe helpers only and are known the
+instant the helpers answer — but the event is held until every member has
+acknowledged, refused, or timed out. So **one unreachable member delays it by
+up to `with_timeout`**, even though the helpers confirmed in milliseconds.
+
+Nothing is lost and the round always terminates: the timeout sweep closes it,
+and a member that never answered is reported in `behind` rather than failing
+the round. The application is simply told late, which is easy to mistake for a
+hang.
+
+Two things follow for application authors:
+
+- **Do not drive a "your secret is protected" indicator from
+  `SharingComplete` alone** if replicas are in play. Watch the per-peer
+  `ShareConfirmed` events instead — those land as each helper answers, with no
+  cross-population wait.
+- **Call `tick()` on a schedule.** Timeouts only advance inside `process` and
+  `tick`, so an idle protocol with a stranded round never closes it at all.
+
+A helpers-only round is unaffected and completes as soon as the helpers
+answer.
 
 ---
 
@@ -541,19 +763,52 @@ the same role.
 ## Storage and transport traits
 
 The library does **not** ship a default backend for storage or transport.
-Consumers implement four traits — the protocol holds them by `&mut self`, so
-implementations need no internal synchronization:
+Consumers implement six traits — five stores plus the transport. All are
+required to build a protocol instance. The protocol holds them by `&mut self`,
+so implementations need no internal synchronization:
 
 | Trait | Stores |
 |-------|--------|
-| [`DeRecChannelStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecChannelStore.html) | Paired channel records and the channel-link graph. |
+| [`DeRecChannelStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecChannelStore.html) | Helper channels (keyed by `channel_id`), replica-group members (keyed by `replica_id`), and the channel-link graph. |
 | [`DeRecShareStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecShareStore.html) | Encoded share entries keyed by `(channel_id, secret_id, version)`. |
 | [`DeRecSecretStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecSecretStore.html) | Per-channel cryptographic material (shared keys, pairing secrets, pairing contacts). |
+| [`DeRecUserSecretStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecUserSecretStore.html) | The latest user-facing secret snapshot per `secret_id` — what a freshly-paired peer is sent. |
+| [`DeRecStateStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecStateStore.html) | In-flight orchestrator state: verification challenges, recovery accumulators, pending unpairs, the active sharing round and catch-up. Must be durable in any deployment that can restart mid-flow. |
 | [`DeRecTransport`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecTransport.html) | Outbound envelope delivery to peers. |
 
 Each trait's rustdoc states its contract, idempotency expectations, and the
 security classification of the data it holds (`DeRecSecretStore` content is
 keychain-grade; the others need durable storage only).
+
+### Choosing backends at run time
+
+`DeRecProtocol` is generic over all six, so by default the concrete backends
+are baked into its type. To pick one at run time — Postgres in production,
+in-memory under test — box the trait objects; the library implements every
+trait for `Box<T>` and `&mut T`, so an erased protocol satisfies the builder's
+bounds without any wrapper of your own:
+
+```rust,ignore
+type AnyProtocol = DeRecProtocol<
+    Box<dyn DeRecChannelStore>,
+    Box<dyn DeRecShareStore>,
+    Box<dyn DeRecSecretStore>,
+    Box<dyn DeRecUserSecretStore>,
+    Box<dyn DeRecStateStore>,
+    Arc<dyn DeRecTransport>,
+>;
+
+let protocol = DeRecProtocolBuilder::new(secret_id)
+    .with_channel_store(Box::new(PostgresChannelStore::new(db)) as Box<dyn DeRecChannelStore>)
+    // ...the rest of the stores, then a transport shared across requests:
+    .with_transport(Arc::clone(&http))
+    .build()?;
+```
+
+`Arc<T>` is implemented for `DeRecTransport` only. Every store has `&mut self`
+methods and `Arc` never yields `&mut T`, so a store behind an `Arc` cannot
+compile. The transport is the one `&self`-only trait — which is also the one
+worth sharing, since it is typically a pooled client.
 
 ---
 
@@ -624,6 +879,79 @@ custom relay, …).
 > The on-the-wire `TransportProtocol.protocol` enum currently defines
 > `Https` as the only supported value. New transports can be added by
 > extending the protobuf enum.
+
+### Serving DeRec over request/response transports
+
+The protocol is a **mailbox**: every participant has an address, and answering
+someone means posting to their address. A reply produced while handling an
+inbound message is not returned to the caller — it is handed to
+`DeRecTransport::send`, addressed to the peer's endpoint, while `process()`
+returns only the `DeRecEvent`s describing what happened.
+
+When both sides are reachable services, that is all you need. The transport is
+a one-way push and an HTTP handler acknowledges rather than answers:
+
+```rust,ignore
+async fn inbound(State(app): State<App>, body: Bytes) -> StatusCode {
+    let mut protocol = app.build_protocol(HttpPush(app.http.clone()));
+    let events = protocol.process(&body).await.expect("process");
+    app.on_events(events).await;
+    StatusCode::ACCEPTED // the reply is already on its way, separately
+}
+```
+
+**A peer with no address breaks this silently.** A phone, a browser tab or
+anything behind NAT advertised an endpoint at pairing time that nothing can
+actually reach, so a push-style `send` drops the reply on the floor. Nothing
+errors — `process` returned events and the handler looks successful — the peer
+just never hears back.
+
+Those deployments must answer on the connection the request arrived on, which
+means capturing what the protocol emits instead of pushing it:
+
+```rust,ignore
+async fn inbound(State(app): State<App>, body: Bytes) -> Result<Bytes, StatusCode> {
+    // 1. Build per request, with a transport that collects rather than sends.
+    let collector = Collector::default();
+    let mut protocol = app.build_protocol(collector.clone());
+
+    let events = protocol
+        .process(&body)
+        .await
+        .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+    app.on_events(events).await;
+
+    // 2. One `process` can emit several messages. Only the one echoing this
+    //    request's trace_id answers the caller; the rest is real fan-out and
+    //    still has to reach its own endpoint.
+    let (reply, elsewhere) = split_reply(&body, collector.take());
+    for (endpoint, bytes) in elsewhere {
+        app.deliver_out_of_band(endpoint, bytes).await;
+    }
+
+    Ok(reply.map(Bytes::from).unwrap_or_default())
+}
+```
+
+Two details carry this, and both are easy to miss:
+
+- **Per-request construction.** The collector's buffer must belong to exactly
+  one exchange, or concurrent requests mix their replies. This is the same
+  per-request pattern a stateless deployment uses anyway.
+- **Correlation by `trace_id`.** Admitting a helper also republishes to every
+  *other* helper, so the buffer routinely holds messages for several peers.
+  Responses echo the inbound envelope's `trace_id`;
+  `derec_message::read_trace_id` tells them apart. Returning the whole buffer —
+  or blindly returning its first entry — is the mistake to avoid.
+
+`Collector` and `split_reply` are about twenty lines each; a complete, compiled
+version of both is in the [`DeRecTransport` rustdoc][transport-doc].
+
+Every SDK exposes the same correlation primitive: `Envelope.ReadTraceId`
+(.NET), `envelope.ReadTraceID` (Go), `envelope_read_trace_id`
+(TypeScript/WASM), `read_trace_id_from_envelope` (C FFI).
+
+[transport-doc]: https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecTransport.html
 
 ### Updating channel info post-pairing
 
@@ -731,15 +1059,16 @@ submodules. The general pattern is:
 ### Pairing
 
 The contact message is exchanged out-of-band (QR codes, existing messaging
-channels, etc.). Two modes select how the initiator's public encryption
+channels, etc.). Three modes select how the initiator's public encryption
 material is delivered:
 
 | `ContactMode` | What's in the contact | When to use |
 |---|---|---|
 | `InlineKeys` (default) | Full ML-KEM encapsulation key + ECIES public key | Out-of-band channel can carry the keys (e.g. NFC, direct messaging). |
 | `HashedKeys` | Only a SHA-384 commitment to the keys (`contact_binding_hash`) | The out-of-band channel is size-constrained (QR codes). The scanner fetches the actual keys over the wire via a `PrePair` round-trip, then verifies them against the hash. |
+| `NoKeys` | `channel_id`, `nonce` and the transport endpoint only | The out-of-band channel is human — hand-typed or dictated. Nothing commits to the keys, so the channel stays `Pending` until the fingerprint is confirmed. See [Pairing modes](#pairing-modes). |
 
-After the handshake completes, **both modes** rekey the channel id. The
+After the handshake completes, **every mode** rekeys the channel id. The
 responder includes
 `channel_id = u64::from_be_bytes( SHA-384(u64_be(originalId) || sharedKey)[..8] )`
 in the encrypted `PairResponseMessage`; both sides switch their local channel

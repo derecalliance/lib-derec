@@ -5,6 +5,8 @@ package protocol
 
 import (
 	"errors"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
@@ -18,49 +20,87 @@ import (
 // from whatever goroutine the caller drives process()/accept()/start()
 // from), one type per store interface in package protocol.
 
+// Two maps, mirroring the two primary keys the interface defines: a helper
+// channel is unique per channelID, while a replica-group member is unique per
+// replicaID and moves between channels during an admission handover.
 type inMemoryChannelStore struct {
-	mu    sync.Mutex
-	data  map[[2]uint64]Channel
-	links map[[2]uint64]map[uint64]struct{}
+	mu      sync.Mutex
+	helpers map[[2]uint64]HelperChannel
+	members map[[2]uint64]ReplicaMember
+	links   map[[2]uint64]map[uint64]struct{}
 }
 
 func newInMemoryChannelStore() *inMemoryChannelStore {
 	return &inMemoryChannelStore{
-		data:  make(map[[2]uint64]Channel),
-		links: make(map[[2]uint64]map[uint64]struct{}),
+		helpers: make(map[[2]uint64]HelperChannel),
+		members: make(map[[2]uint64]ReplicaMember),
+		links:   make(map[[2]uint64]map[uint64]struct{}),
 	}
 }
 
-func (s *inMemoryChannelStore) Load(secretID, channelID uint64) (Channel, bool, error) {
+func (s *inMemoryChannelStore) Load(secretID, channelID, replicaID uint64) (ChannelRecord, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	c, ok := s.data[[2]uint64{secretID, channelID}]
-	return c, ok, nil
+	if replicaID == 0 {
+		h, ok := s.helpers[[2]uint64{secretID, channelID}]
+		if !ok {
+			return ChannelRecord{}, false, nil
+		}
+		return ChannelRecord{Helper: &h}, true, nil
+	}
+	m, ok := s.members[[2]uint64{secretID, replicaID}]
+	if !ok {
+		return ChannelRecord{}, false, nil
+	}
+	return ChannelRecord{Replica: &m}, true, nil
 }
 
-func (s *inMemoryChannelStore) Save(secretID uint64, channel Channel) error {
+func (s *inMemoryChannelStore) Save(secretID uint64, record ChannelRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data[[2]uint64{secretID, channel.ID}] = channel
+	if record.Helper != nil {
+		s.helpers[[2]uint64{secretID, record.Helper.ChannelID}] = *record.Helper
+	}
+	if record.Replica != nil {
+		s.members[[2]uint64{secretID, record.Replica.ReplicaID}] = *record.Replica
+	}
 	return nil
 }
 
-func (s *inMemoryChannelStore) Remove(secretID, channelID uint64) (bool, error) {
+func (s *inMemoryChannelStore) Remove(secretID, channelID, replicaID uint64) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	key := [2]uint64{secretID, channelID}
-	_, existed := s.data[key]
-	delete(s.data, key)
+	if replicaID == 0 {
+		key := [2]uint64{secretID, channelID}
+		_, existed := s.helpers[key]
+		delete(s.helpers, key)
+		return existed, nil
+	}
+	key := [2]uint64{secretID, replicaID}
+	_, existed := s.members[key]
+	delete(s.members, key)
 	return existed, nil
 }
 
-func (s *inMemoryChannelStore) ListChannels(secretID uint64) ([]uint64, error) {
+func (s *inMemoryChannelStore) ListHelpers(secretID uint64) ([]HelperChannel, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var out []uint64
-	for key := range s.data {
+	var out []HelperChannel
+	for key, h := range s.helpers {
 		if key[0] == secretID {
-			out = append(out, key[1])
+			out = append(out, h)
+		}
+	}
+	return out, nil
+}
+
+func (s *inMemoryChannelStore) ListReplicas(secretID uint64) ([]ReplicaMember, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []ReplicaMember
+	for key, m := range s.members {
+		if key[0] == secretID {
+			out = append(out, m)
 		}
 	}
 	return out, nil
@@ -282,35 +322,63 @@ var _ UserSecretStore = (*inMemoryUserSecretStore)(nil)
 
 type inMemoryStateStore struct {
 	mu   sync.Mutex
-	data map[uint64]map[StateKey]StateItem
+	data map[uint64]map[string]StateItem
+}
+
+// stateKeyID renders a StateKey as a comparable value.
+//
+// StateKey cannot be used as a map key directly: its ChannelID/SecretID/
+// Version fields are pointers, and Go compares pointer fields by address.
+// A key rebuilt for Load would never match the one Save derived from
+// item.Key(), so every lookup would miss.
+func stateKeyID(k StateKey) string {
+	optU64 := func(v *uint64) string {
+		if v == nil {
+			return ""
+		}
+		return strconv.FormatUint(*v, 10)
+	}
+	optU32 := func(v *uint32) string {
+		if v == nil {
+			return ""
+		}
+		return strconv.FormatUint(uint64(*v), 10)
+	}
+	return strings.Join([]string{
+		strconv.FormatUint(uint64(k.Kind), 10),
+		optU64(k.ChannelID),
+		optU64(k.SecretID),
+		optU32(k.Version),
+	}, ":")
 }
 
 func newInMemoryStateStore() *inMemoryStateStore {
-	return &inMemoryStateStore{data: make(map[uint64]map[StateKey]StateItem)}
+	return &inMemoryStateStore{data: make(map[uint64]map[string]StateItem)}
 }
 
 func (s *inMemoryStateStore) Save(secretID uint64, item StateItem) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.data[secretID] == nil {
-		s.data[secretID] = make(map[StateKey]StateItem)
+		s.data[secretID] = make(map[string]StateItem)
 	}
-	s.data[secretID][item.Key()] = item
+	s.data[secretID][stateKeyID(item.Key())] = item
 	return nil
 }
 
 func (s *inMemoryStateStore) Load(secretID uint64, key StateKey) (StateItem, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	item, ok := s.data[secretID][key]
+	item, ok := s.data[secretID][stateKeyID(key)]
 	return item, ok, nil
 }
 
 func (s *inMemoryStateStore) Remove(secretID uint64, key StateKey) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, existed := s.data[secretID][key]
-	delete(s.data[secretID], key)
+	id := stateKeyID(key)
+	_, existed := s.data[secretID][id]
+	delete(s.data[secretID], id)
 	return existed, nil
 }
 
@@ -318,12 +386,72 @@ func (s *inMemoryStateStore) LoadAll(secretID uint64, kind StateKind) ([]StateIt
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []StateItem
-	for key, item := range s.data[secretID] {
-		if key.Kind == kind {
+	for _, item := range s.data[secretID] {
+		if item.Kind == kind {
 			out = append(out, item)
 		}
 	}
 	return out, nil
+}
+
+// A key rebuilt from equal values must find the row Save stored, or the
+// store silently loses every row it is given.
+func TestInMemoryStateStore_LoadsRowSavedUnderAnEquivalentKey(t *testing.T) {
+	s := newInMemoryStateStore()
+	sid, ver := uint64(0xA0), uint32(3)
+	if err := s.Save(1, StateItem{
+		Kind:     StateKindPendingRecovery,
+		SecretID: &sid,
+		Version:  &ver,
+		Shares:   [][]byte{{1}},
+	}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	// Same values, freshly allocated — as the library rebuilds them.
+	sid2, ver2 := uint64(0xA0), uint32(3)
+	got, ok, err := s.Load(1, StateKey{
+		Kind:     StateKindPendingRecovery,
+		SecretID: &sid2,
+		Version:  &ver2,
+	})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !ok {
+		t.Fatal("row not found: the map key compared pointers, not values")
+	}
+	if len(got.Shares) != 1 {
+		t.Fatalf("wrong row loaded: %+v", got)
+	}
+}
+
+// Recoveries of two different secrets at the same version must occupy
+// separate rows.
+func TestInMemoryStateStore_SeparatesConcurrentRecoveryTargets(t *testing.T) {
+	s := newInMemoryStateStore()
+	ver := uint32(1)
+	sidA, sidB := uint64(0xA0), uint64(0xB0)
+	for sid, shares := range map[*uint64][][]byte{
+		&sidA: {{1}},
+		&sidB: {{2}, {3}},
+	} {
+		if err := s.Save(1, StateItem{
+			Kind: StateKindPendingRecovery, SecretID: sid, Version: &ver, Shares: shares,
+		}); err != nil {
+			t.Fatalf("Save: %v", err)
+		}
+	}
+
+	got, ok, err := s.Load(1, StateKey{
+		Kind: StateKindPendingRecovery, SecretID: &sidA, Version: &ver,
+	})
+	if err != nil || !ok {
+		t.Fatalf("Load(A): ok=%v err=%v", ok, err)
+	}
+	if len(got.Shares) != 1 {
+		t.Fatalf("vault A row was clobbered by vault B: %+v", got)
+	}
 }
 
 var _ StateStore = (*inMemoryStateStore)(nil)

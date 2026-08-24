@@ -31,7 +31,7 @@
 //! never appears in the protobuf form used for the internal replica-sync message
 //! ([`ReplicaSecretPayload`](crate::protocol::types::ReplicaSecretPayload)).
 //!
-//! # v1 payload
+//! # v2 payload
 //!
 //! `payload = gzip(json(secret))` (RFC 1952). Byte fields are standard-padded
 //! base64 (RFC 4648 §4), `u64` fields are decimal strings, keys are snake_case,
@@ -39,19 +39,38 @@
 //! or empty as "not present"). Schema:
 //!
 //! ```text
-//! Secret      { owner_replica_id:str<u64>, helpers:[Helper], secrets:[UserSecret],
-//!               replicas?:Replicas }
+//! Secret      { helpers:[Helper], secrets:[UserSecret], replicas?:Replicas }
 //! Helper      { channel_id:str<u64>, transport_uri:str, shared_key:base64,
 //!               communication_info?:{str:str} }
 //! UserSecret  { id:base64, name:str, data:base64 }
-//! Replicas    { shared_key:base64, replicas:[ReplicaInfo] }
-//! ReplicaInfo { channel_id:str<u64>, transport_uri:str, replica_id:str<u64>,
-//!               sender_kind:int, communication_info?:{str:str} }
+//! Replicas    { members:[ReplicaInfo], shared_key:base64,
+//!               channel_id:str<u64> }
+//! ReplicaInfo { replica_id:str<u64>, transport_uri:str, role:int,
+//!               communication_info?:{str:str} }
 //! ```
+//!
+//! ## What changed from v1, and why v1 does not decode
+//!
+//! Three shape changes, all in the replica group:
+//!
+//! - **`channel_id` moved from each member to the group.** Every member of a
+//!   group is addressed on one channel, so carrying it per member invited
+//!   disagreement about a value that cannot legitimately differ.
+//! - **`sender_kind` became `role`**, a
+//!   [`ReplicaRole`](crate::protocol::types::ReplicaRole) discriminant rather
+//!   than a wire `SenderKind`. Role is a property of *membership*, and exactly
+//!   one member of a group carries `Source`.
+//! - **`replicas` became `members`**, matching the field it now names.
+//!
+//! **There is no v1 decode path.** A v1 roster cannot express a source member
+//! — it has no `transport_uri` for one — so it cannot be upgraded losslessly,
+//! and a v1 payload is rejected rather than guessed at. No published release
+//! carries a v1 roster: the last published version predates the roster
+//! entirely, so nothing in the wild needs migrating.
 //!
 //! # Conformance
 //!
-//! Golden vectors (a canonical [`Secret`] paired with its exact v1 JSON) live
+//! Golden vectors (a canonical [`Secret`] paired with its exact v2 JSON) live
 //! under `library/tests/golden/`. gzip *decoding* is universal but *encoding*
 //! is not byte-stable, so conformance is defined on the JSON (pre-gzip).
 

@@ -39,7 +39,10 @@ pub async fn run() {
 
     let cid_a = pair_owner_helper(&mut owner, &mut helper_a, ChannelId(1)).await;
     let cid_b = pair_owner_helper(&mut owner, &mut helper_b, ChannelId(2)).await;
-    println!("  paired Owner↔HelperA({}), Owner↔HelperB({})", cid_a.0, cid_b.0);
+    println!(
+        "  paired Owner↔HelperA({}), Owner↔HelperB({})",
+        cid_a.0, cid_b.0
+    );
 
     let events = protect_secret(
         &mut owner,
@@ -55,26 +58,30 @@ pub async fn run() {
 
     let auto_accepted = events
         .iter()
-        .filter(|e| matches!(
-            e,
-            DeRecEvent::AutoAccepted {
-                action_kind: PendingActionKind::StoreShare,
-                ..
-            }
-        ))
+        .filter(|e| {
+            matches!(
+                e,
+                DeRecEvent::AutoAccepted {
+                    action_kind: PendingActionKind::StoreShare,
+                    ..
+                }
+            )
+        })
         .count();
     assert_eq!(
         auto_accepted, 2,
         "expected AutoAccepted{{StoreShare}} from each of the two helpers; got {auto_accepted}"
     );
 
-    let still_required = events.iter().any(|e| matches!(
-        e,
-        DeRecEvent::ActionRequired {
-            action: derec_library::protocol::PendingAction::StoreShare { .. },
-            ..
-        }
-    ));
+    let still_required = events.iter().any(|e| {
+        matches!(
+            e,
+            DeRecEvent::ActionRequired {
+                action: derec_library::protocol::PendingAction::StoreShare { .. },
+                ..
+            }
+        )
+    });
     assert!(
         !still_required,
         "auto-accept should suppress ActionRequired{{StoreShare}} entirely"
@@ -87,7 +94,11 @@ pub async fn run() {
             _ => None,
         })
         .collect();
-    assert_eq!(stored.len(), 2, "both helpers must persist a share; got {stored:?}");
+    assert_eq!(
+        stored.len(),
+        2,
+        "both helpers must persist a share; got {stored:?}"
+    );
 
     let confirmed = events
         .iter()

@@ -21,32 +21,30 @@ type Accessor = (&'static str, fn(&ParameterRange) -> (i64, i64));
 
 const FIELDS: &[Accessor] = &[
     ("shareSize", |r| (r.min_share_size, r.max_share_size)),
-    (
-        "timeBetweenVerifications",
-        |r| (r.min_time_between_verifications, r.max_time_between_verifications),
-    ),
-    (
-        "timeBetweenShareUpdates",
-        |r| (r.min_time_between_share_updates, r.max_time_between_share_updates),
-    ),
-    (
-        "unresponsiveDeletionTimeout",
-        |r| {
-            (
-                r.min_unresponsive_deletion_timeout,
-                r.max_unresponsive_deletion_timeout,
-            )
-        },
-    ),
-    (
-        "unresponsiveDeactivationTimeout",
-        |r| {
-            (
-                r.min_unresponsive_deactivation_timeout,
-                r.max_unresponsive_deactivation_timeout,
-            )
-        },
-    ),
+    ("timeBetweenVerifications", |r| {
+        (
+            r.min_time_between_verifications,
+            r.max_time_between_verifications,
+        )
+    }),
+    ("timeBetweenShareUpdates", |r| {
+        (
+            r.min_time_between_share_updates,
+            r.max_time_between_share_updates,
+        )
+    }),
+    ("unresponsiveDeletionTimeout", |r| {
+        (
+            r.min_unresponsive_deletion_timeout,
+            r.max_unresponsive_deletion_timeout,
+        )
+    }),
+    ("unresponsiveDeactivationTimeout", |r| {
+        (
+            r.min_unresponsive_deactivation_timeout,
+            r.max_unresponsive_deactivation_timeout,
+        )
+    }),
 ];
 
 /// Returns `Ok(())` when `local` and `peer` ranges overlap on every

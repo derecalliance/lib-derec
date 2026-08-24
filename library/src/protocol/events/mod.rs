@@ -64,6 +64,20 @@ pub enum PendingActionKind {
 ///   party that knows the contact's `nonce` + `channel_id` can elicit
 ///   a key-publish response. Prefer to keep this off unless you
 ///   control both ends of the transport (LAN, integration tests).
+/// - [`Self::store_share`] is the helper's only admission-control point
+///   for inbound shares. The protocol enforces no size, quota or rate
+///   limit of its own, and the negotiated `maxShareSize` from
+///   [`derec_proto::ParameterRange`] is checked for range overlap at
+///   pairing time only — never against an actual share. While this flag
+///   is `false`, the [`DeRecEvent::ActionRequired`] carrying
+///   [`PendingAction::StoreShare`] hands the application the decoded
+///   [`derec_proto::StoreShareRequestMessage`], which is where a size or
+///   quota decision belongs — see
+///   [`super::DeRecProtocol::reject`] for a worked example. Setting it
+///   `true` removes that opportunity entirely: every share from every
+///   paired Owner is stored unconditionally, at whatever size it
+///   arrives. Keep it `false` in any deployment with per-user storage
+///   limits.
 /// - [`Self::unpair`] is destructive — accepting deletes the local
 ///   channel record and any shares/secrets associated with it. The
 ///   [`DeRecEvent::Unpaired`] event still fires (after the deletion),
@@ -78,8 +92,10 @@ pub enum PendingActionKind {
 ///   announced.
 ///
 /// All other fields wrap routine request/response flows and have no
-/// security-sensitive caveats beyond "the caller decided not to gate
-/// them."
+/// caveats beyond "the caller decided not to gate them." Note that this
+/// applies to gating alone: auto-accept never relaxes an invariant the
+/// protocol enforces itself, only the application's opportunity to
+/// refuse.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AutoAcceptPolicy {
     pub pairing: bool,
@@ -222,7 +238,7 @@ pub enum PendingAction {
     ///
     /// Calling [`super::DeRecProtocol::accept`] on this action does the
     /// state mutation **for you**: the orchestrator writes the new fields
-    /// onto the stored [`crate::protocol::types::Channel`] and sends back
+    /// onto the stored [`crate::protocol::types::HelperChannel`] and sends back
     /// an `Ok` response. When `transport_protocol` is part of the update,
     /// the response is routed to the **new** endpoint, so subsequent
     /// outbound traffic on this channel already targets the new address.
@@ -286,11 +302,11 @@ impl PendingAction {
 /// # Role gating
 ///
 /// The orchestrator enforces flow directionality against
-/// [`crate::protocol::types::Channel::role`] (set at pairing time):
+/// [`crate::protocol::types::HelperChannel::peer_role`] (set at pairing time):
 ///
 /// - [`Self::Discovery`], [`Self::ProtectSecret`], [`Self::VerifyShares`],
-///   [`Self::RecoverSecret`], and [`Self::Unpair`] require this node to be
-///   the [`SenderKind::Owner`] on every targeted channel; otherwise
+///   [`Self::RecoverSecret`], and [`Self::Unpair`] require the peer to be
+///   a [`SenderKind::Helper`] on every targeted channel; otherwise
 ///   [`crate::Error::RoleMismatch`] is returned.
 /// - [`Self::Pairing`] creates the channel, so no role exists yet.
 /// - [`Self::UpdateChannelInfo`] is symmetric — either party may initiate.
@@ -299,7 +315,7 @@ pub enum DeRecFlow {
         kind: SenderKind,
         contact: ContactMessage,
         /// App-level identity metadata for the peer being paired with.
-        /// Stored verbatim on the resulting [`crate::protocol::types::Channel`]
+        /// Stored verbatim on the resulting [`crate::protocol::types::HelperChannel`]
         /// (`channel.communication_info`). The protocol does not inspect
         /// it — pass an empty map to record nothing.
         peer_communication_info: std::collections::HashMap<String, String>,
@@ -337,6 +353,57 @@ pub enum DeRecFlow {
     RecoverSecret {
         secret_id: u64,
         version: u32,
+    },
+    /// Ask the replica group whether this device is behind, and catch up if
+    /// it is.
+    ///
+    /// **Replica-only.** Requires a configured `replica_id` and at least one
+    /// other group member. Every member is asked which version it holds; the
+    /// one holding the newest state is then asked for it, and the reply is
+    /// hydrated exactly as an inbound sync would be. Ties resolve to the
+    /// group's `Source`.
+    ///
+    /// A member reporting an *older* version than this device is ignored —
+    /// the check never turns into a publish. Nothing here writes to a peer.
+    ///
+    /// Nothing triggers this automatically: the library provides the
+    /// mechanism and the application chooses when to run it (a user action, a
+    /// timer, app start). Concludes with [`DeRecEvent::SyncCheckComplete`],
+    /// plus the usual hydration event when a fetch actually happened.
+    SyncCheck,
+    /// Remove a member from the replica group.
+    ///
+    /// **Replica-only.** `replica_id` names the member being removed — as a
+    /// plain `u64`, matching the decimal form ids take everywhere else.
+    /// Naming this device is a voluntary departure; naming another is an
+    /// eviction. A `replica_id` that names no current member is rejected with
+    /// [`crate::Error::InvalidInput`] rather than silently doing nothing.
+    ///
+    /// # Announcing is all this flow does
+    ///
+    /// `start` tells every member, including the departing one, and flags that
+    /// member locally. **It removes nothing on its own, and emits no
+    /// [`DeRecEvent::ReplicaRemoved`].** The flag keeps the member out of the
+    /// next roster while leaving it on the distribution list, which is how it
+    /// learns it may tear down.
+    ///
+    /// The removal completes only when **the application publishes a roster
+    /// that omits the member** — an ordinary
+    /// [`DeRecFlow::ProtectSecret`]. `ReplicaRemoved` fires when that round
+    /// completes, not before. An application that calls this flow and then
+    /// waits for the event without publishing waits forever.
+    ///
+    /// One consequence is worth stating plainly: **a group with no secret to
+    /// publish cannot complete a removal**, because there is no roster to
+    /// send. The member stays flagged until something is published.
+    ///
+    /// A member tears down only once it has been told to leave *and* has seen
+    /// a newer roster excluding it. Absence alone never destroys a copy of the
+    /// secret — a publisher that silently omitted a member would otherwise
+    /// destroy that member's state instead of merely forgetting it.
+    RemoveReplica {
+        replica_id: u64,
+        memo: Option<String>,
     },
     /// Initiate an unpair flow against a paired channel.
     ///
@@ -407,10 +474,11 @@ pub enum UnpairAck {
 pub enum DeRecEvent {
     /// Pairing completed — the shared key for `channel_id` is now persisted.
     ///
-    /// `kind` is the local party's role in the pairing, also persisted as
-    /// [`crate::protocol::types::Channel::role`] and consulted by the orchestrator on
-    /// every subsequent flow start and inbound message. Applications use it
-    /// to decide what to do next:
+    /// `kind` is the local party's role in the pairing. The channel record
+    /// stores its inverse — the peer's role — on
+    /// [`crate::protocol::types::HelperChannel::peer_role`], which the
+    /// orchestrator consults on every subsequent flow start and inbound
+    /// message. Applications use `kind` to decide what to do next:
     ///
     /// - [`SenderKind::Owner`] — the Owner completed pairing with a Helper.
     ///   Call [`super::DeRecProtocol::start`] with [`DeRecFlow::ProtectSecret`]
@@ -444,9 +512,9 @@ pub enum DeRecEvent {
     /// A replica-mode pair handshake completed. Fires **alongside**
     /// [`Self::PairingCompleted`] on replica channels.
     ///
-    /// Under the unidirectional replica model, the local side's role
-    /// (`ReplicaSource` or `ReplicaDestination`) is already on
-    /// [`crate::protocol::types::Channel::role`] — this event just adds the
+    /// Under the unidirectional replica model, the peer's role
+    /// (`ReplicaDestination` or `ReplicaSource`) is already on
+    /// [`crate::protocol::types::HelperChannel::peer_role`] — this event just adds the
     /// peer's `replica_id`, which the app needs as a `from_replica_id`
     /// when subsequent secret syncs arrive or when targeting the peer via
     /// `ProtectSecret`.
@@ -502,13 +570,43 @@ pub enum DeRecEvent {
         /// `version` echoed from the inbound `StoreShareRequest`.
         version: u32,
         /// Decoded full secret — same shape the sender wrote. The
-        /// `helpers`, `replicas`, `secrets`, and `owner_replica_id`
-        /// fields carry the canonical roster snapshot for this version.
+        /// `helpers`, `replicas` and `secrets` fields carry the canonical
+        /// roster snapshot for this version.
         secret: crate::protocol::types::Secret,
         /// Per-helper VSS share map. Each entry pairs a helper's
         /// `channel_id` with the serialized `CommittedDeRecShare` bytes
         /// the helper received — sufficient material for the receiver
         /// to drive a recovery against those helpers if needed.
+        shares: Vec<crate::protocol::types::ChannelShare>,
+    },
+
+    /// The first sync for a `secret_id` this device had no snapshot for —
+    /// the secret now exists here.
+    ///
+    /// Distinguished from [`Self::ReplicaSecretReceived`], which reports a
+    /// later version of a secret the device already held. Both are hydrated
+    /// by the library before the event fires; the difference is what the
+    /// application should show the user, since only this one changes the set
+    /// of secrets on the device.
+    ///
+    /// This is **not** a recovery. Recovery reconstructs a secret from helper
+    /// shares and is driven by the application through
+    /// [`crate::protocol::DeRecProtocol::restore`]; this arrives unsolicited
+    /// from a group member and is applied on receipt.
+    ReplicaSecretInstalled {
+        /// The channel the request arrived on. During an admission handover
+        /// this is the ephemeral pairing channel, not the group channel —
+        /// the group's own id is `secret.replicas.channel_id`.
+        channel_id: ChannelId,
+        /// The member that wrote this version, from the payload.
+        from_replica_id: u64,
+        /// `secret_id` echoed from the inbound `StoreShareRequest`.
+        secret_id: u64,
+        /// `version` echoed from the inbound `StoreShareRequest`.
+        version: u32,
+        /// Decoded full secret, already written to the stores.
+        secret: crate::protocol::types::Secret,
+        /// Per-helper VSS share map, as on [`Self::ReplicaSecretReceived`].
         shares: Vec<crate::protocol::types::ChannelShare>,
     },
 
@@ -534,6 +632,125 @@ pub enum DeRecEvent {
         memo: String,
     },
 
+    /// A group member **refused** a secret sync we sent.
+    ///
+    /// The member answered and declined — distinct from
+    /// [`Self::ReplicaSyncFailed`], where no usable answer arrived at all
+    /// (transport error, encoding error, or timeout). Either way the member
+    /// lands in `behind` on [`Self::ReplicaSyncComplete`] rather than failing
+    /// the round; replicas are best-effort.
+    ///
+    /// Keyed by `replica_id`, not `channel_id`: every member answers on the
+    /// one group channel, so the channel cannot say who replied.
+    ReplicaSyncRejected {
+        /// The member that refused, from the response payload.
+        replica_id: u64,
+        /// `secret_id` echoed from the response.
+        secret_id: u64,
+        /// `version` echoed from the response.
+        version: u32,
+        /// The `StatusEnum` value from the member's response.
+        /// `VERSION_CONFLICT` means the round must be resolved and
+        /// republished at a new version — see [`Self::ReplicaSyncComplete`].
+        status: i32,
+        /// Human-readable explanation from the member.
+        memo: String,
+    },
+
+    /// A secret sync could not be delivered to a member at all.
+    ///
+    /// Distinct from [`Self::ReplicaSyncRejected`], which is the member
+    /// answering "no": here nothing was sent, so no acknowledgement can ever
+    /// arrive. The member is reported once, at dispatch, and appears in
+    /// [`Self::ReplicaSyncComplete::behind`].
+    ReplicaSyncFailed {
+        /// The member that could not be reached.
+        replica_id: u64,
+        /// The version this round was publishing.
+        version: u32,
+        /// The transport or encoding failure, rendered for display.
+        reason: String,
+    },
+
+    /// A member was removed from the group and its roster row dropped.
+    ///
+    /// Fires on the members that remain. The departing device instead reports
+    /// [`Self::SelfRemovedFromGroup`].
+    ReplicaRemoved {
+        /// The member that left or was evicted.
+        replica_id: u64,
+    },
+
+    /// The group's [`crate::protocol::types::ReplicaRole::Source`] moved to a
+    /// different member, because the previous source is leaving.
+    ///
+    /// Fires on the device that ran the removal, naming the successor it chose,
+    /// and on any member whose own row is promoted by an arriving roster. A
+    /// member that is neither is unaffected: it learns the new source from
+    /// `ReplicaInfo.role` like any other roster field.
+    ReplicaSourceChanged {
+        /// The member that now holds the source role.
+        replica_id: u64,
+    },
+
+    /// This device has left the group and dropped its entire `secret_id`
+    /// partition — group channel, helper channels, shares, secrets and the
+    /// user-secret snapshot.
+    ///
+    /// Fires only after both halves of the safety rule hold: this device was
+    /// told to leave, and has since seen a roster excluding it.
+    SelfRemovedFromGroup {
+        /// The version whose roster completed the removal.
+        version: u32,
+    },
+
+    /// A replica catch-up finished.
+    ///
+    /// `group_version` is the newest version any member reported; it is `0`
+    /// when no member answered. `fetched_from` names the member the state was
+    /// pulled from, and is `None` when this device was already current — in
+    /// which case no hydration event follows.
+    SyncCheckComplete {
+        /// The version this device held when the check started.
+        local_version: u32,
+        /// The newest version any member reported.
+        group_version: u32,
+        /// The member the newest state was pulled from, if a fetch happened.
+        fetched_from: Option<u64>,
+    },
+
+    /// The replica leg of a publishing round finished.
+    ///
+    /// Reported separately from [`Self::SharingComplete`] because the two
+    /// populations have different success rules and different keys. Replicas
+    /// are **best-effort**: a member in `behind` does not fail the round. A
+    /// replica holds a full copy and contributes nothing to the recovery
+    /// quorum, so blocking on one offline device would freeze writes for the
+    /// whole group while buying no safety.
+    ///
+    /// `behind` is the application's retry list. The library keeps no durable
+    /// per-member sync state, so an application that wants convergence across
+    /// restarts must persist this itself or republish to the whole group.
+    ///
+    /// # Best-effort governs the *outcome*, not the timing
+    ///
+    /// A member that never answers does not fail the round — but it does
+    /// delay the report. This event and [`Self::SharingComplete`] are emitted
+    /// together, once both populations have settled, so an unreachable member
+    /// holds *both* back until it times out
+    /// ([`Timeouts::sharing_round`](crate::protocol::types::Timeouts::sharing_round)).
+    /// Per-peer events ([`Self::ShareConfirmed`],
+    /// [`Self::ReplicaSecretAcked`]) are not delayed and can be watched
+    /// instead where promptness matters.
+    ReplicaSyncComplete {
+        /// The version this round was publishing.
+        version: u32,
+        /// Members that acknowledged.
+        synced: Vec<u64>,
+        /// Members that refused, timed out, or could not be reached.
+        behind: Vec<u64>,
+    },
+
     /// A Helper confirmed it stored our share (Owner side).
     ShareConfirmed { channel_id: ChannelId, version: u32 },
 
@@ -553,8 +770,37 @@ pub enum DeRecEvent {
 
     /// A sharing round has completed (all participants responded or timed out).
     ///
-    /// Emitted once per [`DeRecFlow::ProtectSecret`] flow after every targeted
-    /// Helper has either confirmed, rejected, or timed out.
+    /// Emitted once per round after every targeted Helper has either
+    /// confirmed, rejected, or timed out.
+    ///
+    /// # It also waits for the replica leg
+    ///
+    /// A round that targeted replica group members as well as Helpers does
+    /// **not** report until *both* populations have settled. The counts below
+    /// describe Helpers only, and they are known as soon as the Helpers answer
+    /// — but the event is withheld until every member has acknowledged,
+    /// refused, or timed out.
+    ///
+    /// The practical consequence: **one unreachable member delays this event
+    /// by up to the configured timeout**
+    /// ([`Timeouts::sharing_round`](crate::protocol::types::Timeouts::sharing_round)),
+    /// even though the Helpers may have confirmed in milliseconds. An
+    /// application waiting on `SharingComplete` to tell the user their secret
+    /// is protected will appear to hang for that window. Nothing is lost and
+    /// the round does terminate — the timeout sweep closes it — but the
+    /// application is told late.
+    ///
+    /// A Helpers-only round is unaffected and completes as soon as the Helpers
+    /// answer.
+    ///
+    /// If the two legs need to be observed independently, watch the per-peer
+    /// events instead: [`DeRecEvent::ShareConfirmed`] /
+    /// [`DeRecEvent::ShareRejected`] land as each Helper answers, without
+    /// waiting for anyone else.
+    ///
+    /// The replica leg reports separately via
+    /// [`DeRecEvent::ReplicaSyncComplete`], which is emitted at the same
+    /// moment as this event when the round had members.
     SharingComplete {
         version: u32,
         confirmed_count: usize,
@@ -613,7 +859,7 @@ pub enum DeRecEvent {
     /// inner `secret` carries the full typed snapshot
     /// — `secrets: Vec<UserSecret>` (the user-facing entries the
     /// owner originally protected) plus the roster snapshot
-    /// (`helpers`, `replicas`, `owner_replica_id`) captured at
+    /// (`helpers` and `replicas`) captured at
     /// distribution time. Apps that only care about the user-facing
     /// entries read `secret.secrets`; the roster fields are useful
     /// when the recovering owner wants to know who held the shares,
@@ -704,7 +950,7 @@ pub enum DeRecEvent {
         memo: String,
     },
 
-    /// The stored [`crate::protocol::types::Channel`] for `channel_id` has been updated
+    /// The stored [`crate::protocol::types::HelperChannel`] for `channel_id` has been updated
     /// with new communication info and/or transport endpoint.
     ///
     /// Surfaces on **both** sides of the flow:
@@ -716,7 +962,7 @@ pub enum DeRecEvent {
     ///
     /// The new `communication_info` / `transport_protocol` values are
     /// already on the local
-    /// [`crate::protocol::types::Channel`] by the time the event fires;
+    /// [`crate::protocol::types::HelperChannel`] by the time the event fires;
     /// applications that care about the post-update state read it from
     /// the channel store directly.
     ChannelInfoUpdated { channel_id: ChannelId },
@@ -746,8 +992,9 @@ pub enum DeRecEvent {
     PairingStarted {
         channel_id: ChannelId,
         /// The local party's role in the pairing (same value that will
-        /// appear on [`Self::PairingCompleted::kind`] and be persisted
-        /// as [`crate::protocol::types::Channel::role`]).
+        /// appear on [`Self::PairingCompleted::kind`]; the channel record
+        /// persists its inverse as
+        /// [`crate::protocol::types::HelperChannel::peer_role`]).
         kind: SenderKind,
     },
 
@@ -766,11 +1013,16 @@ pub enum DeRecEvent {
     },
 
     /// A share-storage request was dispatched to `channel_id` for
-    /// `version`. Emitted per targeted helper (and per targeted replica
-    /// destination) by [`super::DeRecProtocol::start`]. Followed by
-    /// [`Self::ShareStored`] / [`Self::ShareConfirmed`] /
-    /// [`Self::ShareRejected`] as the peer responds; the whole round
-    /// finishes with [`Self::SharingComplete`].
+    /// `version`. Emitted **per targeted helper** by
+    /// [`super::DeRecProtocol::start`]. Followed by [`Self::ShareStored`] /
+    /// [`Self::ShareConfirmed`] / [`Self::ShareRejected`] as the peer
+    /// responds; the helper leg finishes with [`Self::SharingComplete`].
+    ///
+    /// The replica leg is **not** reported here. This event is keyed by
+    /// channel, and every member of a group shares one — emitting per member
+    /// would yield indistinguishable duplicates. Members report through
+    /// [`Self::ReplicaSyncFailed`] at dispatch and
+    /// [`Self::ReplicaSyncComplete`] at the end, both keyed by `replica_id`.
     ProtectSecretStarted { channel_id: ChannelId, version: u32 },
 
     /// A share-storage request could not be dispatched to `channel_id`
@@ -805,6 +1057,19 @@ pub enum DeRecEvent {
     RecoverSecretFailed {
         channel_id: ChannelId,
         version: u32,
+        error: String,
+    },
+
+    /// An unpair request could not be dispatched to `channel_id`.
+    ///
+    /// Emitted by [`super::DeRecProtocol::restore`] when tearing down the
+    /// ephemeral recovery channels. The teardown is fire-and-forget, so
+    /// the peer's reachability was never load-bearing: local state is
+    /// dropped anyway and a [`Self::Unpaired`] for the same channel
+    /// follows. The pair reports "the channel is gone locally, but the
+    /// peer was not told" — the application may notify it out-of-band.
+    UnpairFailed {
+        channel_id: ChannelId,
         error: String,
     },
 

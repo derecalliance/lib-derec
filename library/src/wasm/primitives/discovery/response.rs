@@ -23,10 +23,6 @@ use wasm_bindgen::prelude::*;
 pub struct VersionListEntry {
     pub version: u32,
     pub version_description: String,
-    /// Optional `replica_id` of the writer. `null` on the JS side
-    /// means a non-replica Owner produced this version.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub replica_id: Option<u64>,
 }
 
 impl From<VersionListEntryProto> for VersionListEntry {
@@ -34,7 +30,6 @@ impl From<VersionListEntryProto> for VersionListEntry {
         Self {
             version: value.version,
             version_description: value.version_description,
-            replica_id: value.replica_id,
         }
     }
 }
@@ -59,6 +54,10 @@ pub struct GetSecretIdsVersionsResponseMessage {
     pub result: Option<DeRecResult>,
     pub secret_list: Vec<VersionList>,
     pub timestamp: Option<Timestamp>,
+    /// Identity of the replica-group member this message concerns, present
+    /// only on the replica catch-up path. `null` on the owner ↔ helper path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_id: Option<u64>,
 }
 
 impl From<derec_proto::GetSecretIdsVersionsResponseMessage>
@@ -69,6 +68,7 @@ impl From<derec_proto::GetSecretIdsVersionsResponseMessage>
             result: value.result.map(Into::into),
             secret_list: value.secret_list.into_iter().map(Into::into).collect(),
             timestamp: value.timestamp.map(Into::into),
+            replica_id: value.replica_id,
         }
     }
 }
@@ -90,12 +90,12 @@ impl From<GetSecretIdsVersionsResponseMessage>
                         .map(|e| VersionListEntryProto {
                             version: e.version,
                             version_description: e.version_description,
-                            replica_id: e.replica_id,
                         })
                         .collect(),
                 })
                 .collect(),
             timestamp: value.timestamp.map(Into::into),
+            replica_id: value.replica_id,
         }
     }
 }
@@ -104,10 +104,6 @@ impl From<GetSecretIdsVersionsResponseMessage>
 pub struct VersionEntry {
     pub version: u32,
     pub description: String,
-    /// Optional `replica_id` of the writer. `null` on the JS side means
-    /// a non-replica Owner produced this version.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub replica_id: Option<u64>,
 }
 
 impl From<DomainVersionEntry> for VersionEntry {
@@ -115,7 +111,6 @@ impl From<DomainVersionEntry> for VersionEntry {
         Self {
             version: value.version,
             description: value.description,
-            replica_id: value.replica_id,
         }
     }
 }
@@ -125,7 +120,6 @@ impl From<VersionEntry> for DomainVersionEntry {
         Self {
             version: value.version,
             description: value.description,
-            replica_id: value.replica_id,
         }
     }
 }

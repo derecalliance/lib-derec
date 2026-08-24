@@ -113,13 +113,11 @@ pub fn decrypt_message(ctxt: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, DerecChan
     let cipher = Aes256Gcm::new(key);
 
     let nonce = Nonce::try_from(&ctxt[0..12]).expect("nonce slice is exactly 12 bytes");
-    let plaintext = cipher
-        .decrypt(&nonce, &ctxt[12..])
-        .map_err(|e| {
-            #[cfg(feature = "logging")]
-            tracing::warn!(error = %e, "AES-GCM decryption failed");
-            DerecChannelError::DecryptionError(e)
-        })?;
+    let plaintext = cipher.decrypt(&nonce, &ctxt[12..]).map_err(|e| {
+        #[cfg(feature = "logging")]
+        tracing::warn!(error = %e, "AES-GCM decryption failed");
+        DerecChannelError::DecryptionError(e)
+    })?;
 
     #[cfg(feature = "logging")]
     tracing::info!(plaintext_len = plaintext.len(), "message decrypted");

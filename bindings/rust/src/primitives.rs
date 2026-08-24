@@ -6,11 +6,11 @@ use derec_library::primitives::discovery::{
     response::{self as disc_response, SecretVersionEntry, VersionEntry},
 };
 use derec_library::primitives::pairing::{request as pair_request, response as pair_response};
-use derec_library::primitives::recovery::{
-    request as rec_request, response as rec_response,
-};
+use derec_library::primitives::recovery::{request as rec_request, response as rec_response};
 use derec_library::primitives::sharing::{request as share_request, response as share_response};
-use derec_library::primitives::verification::{request as verif_request, response as verif_response};
+use derec_library::primitives::verification::{
+    request as verif_request, response as verif_response,
+};
 use derec_library::types::ChannelId;
 use derec_proto::{Protocol, SenderKind, TransportProtocol};
 use prost::Message;
@@ -51,7 +51,9 @@ fn run_pairing_flow_test() {
         TransportProtocol {
             uri: "https://example.com/alice".to_owned(),
             protocol: Protocol::Https.into(),
-        }, None)
+        },
+        None,
+    )
     .expect("pair_request::create_contact failed");
 
     let contact_wire_bytes = contact_result.contact_message.encode_to_vec();
@@ -93,15 +95,22 @@ fn run_pairing_flow_test() {
     assert_eq!(initiator_tp.uri, "https://example.com/alice");
     assert_eq!(initiator_tp.protocol(), Protocol::Https);
 
-    let extracted_request =
-        pair_request::extract(&pair_req.envelope, contact_result.secret_key.as_ref().unwrap().ecies_secret_key())
-            .expect("pair_request::extract failed");
+    let extracted_request = pair_request::extract(
+        &pair_req.envelope,
+        contact_result
+            .secret_key
+            .as_ref()
+            .unwrap()
+            .ecies_secret_key(),
+    )
+    .expect("pair_request::extract failed");
 
     let pair_resp = pair_response::produce(
         channel_id,
         &extracted_request.request,
         contact_result.secret_key.as_ref().unwrap(),
-        None, None,
+        None,
+        None,
     )
     .expect("pair_response::produce failed");
 
@@ -156,7 +165,9 @@ fn run_pairing_flow_hashed_keys_test() {
         TransportProtocol {
             uri: "https://example.com/alice/ephemeral".to_owned(),
             protocol: Protocol::Https.into(),
-        }, None)
+        },
+        None,
+    )
     .expect("pair_request::create_contact (HASHED_KEYS) failed");
 
     let alice_contact = alice_contact_result.contact_message.clone();
@@ -211,11 +222,9 @@ fn run_pairing_flow_hashed_keys_test() {
     let extracted_prepair_resp = pair_response::extract_pre_pair(&alice_prepair_resp.envelope)
         .expect("pair_response::extract_pre_pair failed");
 
-    let processed_prepair = pair_response::process_pre_pair(
-        &alice_contact,
-        &extracted_prepair_resp.response,
-    )
-    .expect("pair_response::process_pre_pair failed");
+    let processed_prepair =
+        pair_response::process_pre_pair(&alice_contact, &extracted_prepair_resp.response)
+            .expect("pair_response::process_pre_pair failed");
 
     assert!(
         !processed_prepair.mlkem_encapsulation_key.is_empty(),
@@ -246,14 +255,18 @@ fn run_pairing_flow_hashed_keys_test() {
     )
     .expect("pair_request::produce failed");
 
-    let extracted_request = pair_request::extract(&pair_req.envelope, alice_secret.as_ref().unwrap().ecies_secret_key())
-        .expect("pair_request::extract failed");
+    let extracted_request = pair_request::extract(
+        &pair_req.envelope,
+        alice_secret.as_ref().unwrap().ecies_secret_key(),
+    )
+    .expect("pair_request::extract failed");
 
     let pair_resp = pair_response::produce(
         channel_id,
         &extracted_request.request,
         alice_secret.as_ref().unwrap(),
-        None, None,
+        None,
+        None,
     )
     .expect("pair_response::produce failed");
 
@@ -324,7 +337,6 @@ fn run_sharing_flow_test() {
             &[],
             "",
             &shared_key,
-            None,
             None,
         )
         .unwrap_or_else(|e| panic!("share_request::produce failed for {channel:?}: {e}"));
@@ -397,7 +409,6 @@ fn run_verification_flow_test() {
         "",
         shared_key_1,
         None,
-        None,
     )
     .expect("share_request::produce failed for channel 1")
     .envelope;
@@ -410,7 +421,6 @@ fn run_verification_flow_test() {
         &[],
         "",
         shared_key_1,
-        None,
         None,
     )
     .expect("share_request::produce failed for channel 2")
@@ -465,12 +475,9 @@ fn run_verification_flow_test() {
             .expect("second verif_response::produce failed");
     let resp_result_2 = verif_response::extract(&resp_produced_2.envelope, shared_key_1)
         .expect("second verif_response::extract failed");
-    let valid_2 = verif_response::process(
-        &req_result.request,
-        &resp_result_2.response,
-        &share_bytes_2,
-    )
-    .expect("verif_response::process failed (invalid case)");
+    let valid_2 =
+        verif_response::process(&req_result.request, &resp_result_2.response, &share_bytes_2)
+            .expect("verif_response::process failed (invalid case)");
     assert!(
         !valid_2,
         "expected an invalid verification response for the wrong share"
@@ -513,7 +520,6 @@ fn run_recovery_flow_test() {
             "",
             shared_key_1,
             None,
-            None,
         )
         .expect("share_request::produce failed for channel 1")
         .envelope,
@@ -532,7 +538,6 @@ fn run_recovery_flow_test() {
             "",
             shared_key_2,
             None,
-            None,
         )
         .expect("share_request::produce failed for channel 2")
         .envelope,
@@ -546,13 +551,9 @@ fn run_recovery_flow_test() {
     let get_request_1 = rec_request::extract(&share_req_1.envelope, shared_key_1)
         .expect("rec_request::extract failed for channel 1")
         .request;
-    let share_resp_1 = rec_response::produce(
-        channel_1,
-        &get_request_1,
-        &stored_request_1,
-        shared_key_1,
-    )
-    .expect("rec_response::produce failed for channel 1");
+    let share_resp_1 =
+        rec_response::produce(channel_1, &get_request_1, &stored_request_1, shared_key_1)
+            .expect("rec_response::produce failed for channel 1");
     let get_response_1 = rec_response::extract(&share_resp_1.envelope, shared_key_1)
         .expect("rec_response::extract failed for channel 1")
         .response;
@@ -562,13 +563,9 @@ fn run_recovery_flow_test() {
     let get_request_2 = rec_request::extract(&share_req_2.envelope, shared_key_2)
         .expect("rec_request::extract failed for channel 2")
         .request;
-    let share_resp_2 = rec_response::produce(
-        channel_2,
-        &get_request_2,
-        &stored_request_2,
-        shared_key_2,
-    )
-    .expect("rec_response::produce failed for channel 2");
+    let share_resp_2 =
+        rec_response::produce(channel_2, &get_request_2, &stored_request_2, shared_key_2)
+            .expect("rec_response::produce failed for channel 2");
     let get_response_2 = rec_response::extract(&share_resp_2.envelope, shared_key_2)
         .expect("rec_response::extract failed for channel 2")
         .response;
@@ -593,8 +590,8 @@ fn run_discovery_flow_test() {
     let channel_id = ChannelId(7);
     let shared_key = [11u8; 32];
 
-    let request = disc_request::produce(channel_id, &shared_key, None)
-        .expect("disc_request::produce failed");
+    let request =
+        disc_request::produce(channel_id, &shared_key, None).expect("disc_request::produce failed");
     assert!(
         !request.envelope.is_empty(),
         "discovery request envelope must not be empty"
@@ -610,12 +607,10 @@ fn run_discovery_flow_test() {
             VersionEntry {
                 version: 1,
                 description: "wallet seed".to_owned(),
-                replica_id: None,
             },
             VersionEntry {
                 version: 2,
                 description: "wallet seed v2".to_owned(),
-                replica_id: None,
             },
         ],
     }];
@@ -626,8 +621,8 @@ fn run_discovery_flow_test() {
     let extracted_resp = disc_response::extract(&response.envelope, &shared_key)
         .expect("disc_response::extract failed");
 
-    let processed = disc_response::process(&extracted_resp.response)
-        .expect("disc_response::process failed");
+    let processed =
+        disc_response::process(&extracted_resp.response).expect("disc_response::process failed");
 
     assert_eq!(
         processed.secret_list, secret_list,
@@ -643,8 +638,8 @@ fn run_envelope_trace_id_test() {
     let channel_id = ChannelId(42);
     let shared_key = [9u8; 32];
 
-    let result = disc_request::produce(channel_id, &shared_key, None)
-        .expect("disc_request::produce failed");
+    let result =
+        disc_request::produce(channel_id, &shared_key, None).expect("disc_request::produce failed");
 
     let trace_before =
         derec_library::derec_message::read_trace_id(&result.envelope).expect("read failed");
@@ -680,8 +675,8 @@ fn run_request_reply_to_test() {
     let result = disc_request::produce(channel_id, &shared_key, Some(reply_to.clone()))
         .expect("disc_request::produce failed");
 
-    let extracted = disc_request::extract(&result.envelope, &shared_key)
-        .expect("disc_request::extract failed");
+    let extracted =
+        disc_request::extract(&result.envelope, &shared_key).expect("disc_request::extract failed");
     assert_eq!(
         extracted.request.reply_to,
         Some(reply_to),
@@ -690,8 +685,8 @@ fn run_request_reply_to_test() {
 
     let plain = disc_request::produce(channel_id, &shared_key, None)
         .expect("disc_request::produce (no reply_to) failed");
-    let plain_extracted = disc_request::extract(&plain.envelope, &shared_key)
-        .expect("disc_request::extract failed");
+    let plain_extracted =
+        disc_request::extract(&plain.envelope, &shared_key).expect("disc_request::extract failed");
     assert!(
         plain_extracted.request.reply_to.is_none(),
         "absent reply_to must decode as None"

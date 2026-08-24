@@ -8,7 +8,7 @@ namespace DeRec.Library.Native;
 
 /// <summary>
 /// P/Invoke surface for the stateful <c>DeRecProtocol</c> orchestrator FFI.
-/// Callbacks for the four store/transport traits are passed in as
+/// Callbacks for the store and transport traits are passed in as
 /// function pointers in the layout structs below — each delegate MUST
 /// have <see cref="UnmanagedFunctionPointerAttribute"/> with
 /// <see cref="CallingConvention.Cdecl"/>.
@@ -25,17 +25,17 @@ internal static class Protocol
 {
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int ChannelStoreLoadDelegate(
-        IntPtr userData, ulong secretId, ulong channelId,
+        IntPtr userData, ulong secretId, ulong channelId, ulong replicaId,
         out IntPtr outPtr, out UIntPtr outLen);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int ChannelStoreSaveDelegate(
-        IntPtr userData, ulong secretId, ulong channelId,
+        IntPtr userData, ulong secretId, ulong channelId, ulong replicaId,
         IntPtr bytes, UIntPtr len);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int ChannelStoreRemoveDelegate(
-        IntPtr userData, ulong secretId, ulong channelId,
+        IntPtr userData, ulong secretId, ulong channelId, ulong replicaId,
         out uint outExisted);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
@@ -63,7 +63,8 @@ internal static class Protocol
         public IntPtr Load;
         public IntPtr Save;
         public IntPtr Remove;
-        public IntPtr ListChannels;
+        public IntPtr ListHelpers;
+        public IntPtr ListReplicas;
         public IntPtr LinkChannel;
         public IntPtr LinkedChannels;
         public IntPtr FreeBuffer;
@@ -254,6 +255,17 @@ internal static class Protocol
         IntPtr handle, ulong channelId, byte[] fingerprintUtf8, out uint outMatched);
 
     [StructLayout(LayoutKind.Sequential)]
+    internal struct DeRecRemovedChannelsResult
+    {
+        public DeRecError Error;
+        public Buffer Channels;
+    }
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern DeRecRemovedChannelsResult derec_protocol_remove_expired_channels(
+        IntPtr handle, ulong olderThanSecs);
+
+    [StructLayout(LayoutKind.Sequential)]
     internal struct DeRecProtocolCreateContactResult
     {
         public DeRecError Error;
@@ -283,6 +295,9 @@ internal static class Protocol
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern DeRecProtocolEventsResult derec_protocol_process(
         IntPtr handle, byte[] message, UIntPtr messageLen);
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern DeRecProtocolEventsResult derec_protocol_tick(IntPtr handle);
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern DeRecProtocolEventsResult derec_protocol_accept(

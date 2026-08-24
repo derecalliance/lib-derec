@@ -78,6 +78,17 @@ message GetShareRequestMessage {
   // route to the stored channel endpoint; Present = route this response
   // here without persisting the endpoint.
   optional TransportProtocol replyTo = 4;
+
+  // Identity of the replica-group member this message concerns.
+  //
+  // Present **only** on the replica path, where a member drives catch-up
+  // against another member. Absent on the owner ↔ helper path, which is
+  // unchanged.
+  //
+  // Every member of a group is addressed on one shared `channel_id`, so the
+  // channel cannot name the peer — this field does. Its presence is also what
+  // tells the receiver which path a message belongs to.
+  optional uint64 replicaId = 5;
 }
 
 // GetShareResponseMessage returns a share previously stored by the Helper.
@@ -158,4 +169,15 @@ message GetShareResponseMessage {
   // Echoed from the corresponding GetShareRequestMessage for the same
   // correlation reasons as `secretId`.
   uint32 version = 6;
+
+  // Identity of the replica-group member this message concerns.
+  //
+  // Present **only** on the replica path, where a member drives catch-up
+  // against another member. Absent on the owner ↔ helper path, which is
+  // unchanged.
+  //
+  // Every member of a group is addressed on one shared `channel_id`, so the
+  // channel cannot name the peer — this field does. Its presence is also what
+  // tells the receiver which path a message belongs to.
+  optional uint64 replicaId = 7;
 }

@@ -9,73 +9,108 @@ import (
 	"testing"
 )
 
-// --- Channel: JSON rides serde directly on the Rust side (see
-// library/src/ffi/protocol/stores.rs doc comment), so EncodeChannel's
-// output must match Channel's derived Serialize shape byte-for-byte:
-// bare-number id (ChannelId is #[serde(transparent)]), nested transport
+// --- Channel records: JSON rides serde directly on the Rust side (see
+// library/src/ffi/protocol/stores.rs doc comment), so EncodeChannelRecord's
+// output must match ChannelRecord's derived Serialize shape byte-for-byte:
+// externally tagged enum ("Helper" / "Replica" wrapper key), bare-number ids
+// (ChannelId and ReplicaId are #[serde(transparent)]), nested transport
 // object with a plain-int protocol field, and PascalCase enum strings for
-// status/role (Rust's default unit-variant serde form, not SCREAMING_CASE).
+// status/peer_role/role (Rust's default unit-variant serde form, not
+// SCREAMING_CASE). Field order matches the Rust struct declaration order.
 
-func TestEncodeChannel_MatchesRustJSONShape(t *testing.T) {
-	replicaID := uint64(42)
-	ch := Channel{
-		ID: 123456789,
+func TestEncodeChannelRecord_Helper_MatchesRustJSONShape(t *testing.T) {
+	h := HelperChannel{
+		ChannelID: 123456789,
 		Transport: TransportEndpoint{
 			URI:      "https://example.com/derec",
 			Protocol: 0,
 		},
 		CommunicationInfo: map[string]string{"name": "helper"},
+		PeerRole:          SenderKindHelper,
 		Status:            ChannelStatusPaired,
 		CreatedAt:         1700000000,
-		Role:              SenderKindReplicaDestination,
-		ReplicaID:         &replicaID,
 	}
 
-	got, err := EncodeChannel(ch)
+	got, err := EncodeChannelRecord(ChannelRecord{Helper: &h})
 	if err != nil {
-		t.Fatalf("EncodeChannel: %v", err)
+		t.Fatalf("EncodeChannelRecord: %v", err)
 	}
 
-	want := `{"id":123456789,"transport":{"uri":"https://example.com/derec","protocol":0},` +
-		`"communication_info":{"name":"helper"},"status":"Paired","created_at":1700000000,` +
-		`"role":"ReplicaDestination","replica_id":42}`
+	want := `{"Helper":{"channel_id":123456789,"transport":{"uri":"https://example.com/derec","protocol":0},` +
+		`"communication_info":{"name":"helper"},"peer_role":"Helper","status":"Paired","created_at":1700000000}}`
 	if string(got) != want {
-		t.Fatalf("EncodeChannel mismatch:\n got: %s\nwant: %s", got, want)
+		t.Fatalf("EncodeChannelRecord mismatch:\n got: %s\nwant: %s", got, want)
 	}
 }
 
-func TestEncodeChannel_EmptyCommunicationInfoIsEmptyObjectNotNull(t *testing.T) {
-	ch := Channel{
-		ID:        1,
+func TestEncodeChannelRecord_Replica_MatchesRustJSONShape(t *testing.T) {
+	m := ReplicaMember{
+		ChannelID:         123456789,
+		ReplicaID:         42,
+		Transport:         TransportEndpoint{URI: "https://replica.example.com", Protocol: 0},
+		CommunicationInfo: map[string]string{"name": "alice-2"},
+		Role:              ReplicaRoleDestination,
+		Status:            ChannelStatusPending,
+		CreatedAt:         1700000000,
+	}
+
+	got, err := EncodeChannelRecord(ChannelRecord{Replica: &m})
+	if err != nil {
+		t.Fatalf("EncodeChannelRecord: %v", err)
+	}
+
+	want := `{"Replica":{"channel_id":123456789,"replica_id":42,"transport":{"uri":"https://replica.example.com","protocol":0},` +
+		`"communication_info":{"name":"alice-2"},"role":"Destination","status":"Pending","created_at":1700000000}}`
+	if string(got) != want {
+		t.Fatalf("EncodeChannelRecord mismatch:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func TestEncodeChannelRecord_EmptyCommunicationInfoIsEmptyObjectNotNull(t *testing.T) {
+	h := HelperChannel{
+		ChannelID: 1,
 		Transport: TransportEndpoint{URI: "https://h.example.com", Protocol: 0},
 		Status:    ChannelStatusPending,
-		Role:      SenderKindOwner,
+		PeerRole:  SenderKindOwner,
 	}
-	got, err := EncodeChannel(ch)
+	got, err := EncodeChannelRecord(ChannelRecord{Helper: &h})
 	if err != nil {
-		t.Fatalf("EncodeChannel: %v", err)
+		t.Fatalf("EncodeChannelRecord: %v", err)
 	}
 	if !strings.Contains(string(got), `"communication_info":{}`) {
 		t.Fatalf("expected empty object for nil CommunicationInfo (Rust HashMap never serializes as null), got: %s", got)
 	}
-	if strings.Contains(string(got), `"replica_id":null`) == false {
-		t.Fatalf("expected replica_id:null for nil ReplicaID (Option<u64> has no skip_serializing_if), got: %s", got)
+}
+
+// A record must carry exactly one variant — neither is as wrong as both,
+// since the Rust side cannot decode either into ChannelRecord.
+func TestEncodeChannelRecord_RejectsAmbiguousRecords(t *testing.T) {
+	if _, err := EncodeChannelRecord(ChannelRecord{}); err == nil {
+		t.Fatal("expected an error for a record carrying neither variant")
+	}
+	h := HelperChannel{ChannelID: 1}
+	m := ReplicaMember{ChannelID: 1, ReplicaID: 2}
+	if _, err := EncodeChannelRecord(ChannelRecord{Helper: &h, Replica: &m}); err == nil {
+		t.Fatal("expected an error for a record carrying both variants")
 	}
 }
 
-// DecodeChannel against a hand-written sample matching the exact shape
-// produced by Rust's serde derive (see library/src/protocol/types.rs).
-func TestDecodeChannel_KnownGoodRustSample(t *testing.T) {
-	sample := `{"id":987654321,"transport":{"uri":"https://owner.example.com","protocol":0},` +
-		`"communication_info":{"name":"owner"},"status":"Pending","created_at":42,` +
-		`"role":"ReplicaSource","replica_id":null}`
+// DecodeChannelRecord against hand-written samples matching the exact shape
+// produced by Rust's serde derive (see library/src/protocol/types/mod.rs).
+func TestDecodeChannelRecord_KnownGoodRustSamples(t *testing.T) {
+	helperSample := `{"Helper":{"channel_id":987654321,"transport":{"uri":"https://owner.example.com","protocol":0},` +
+		`"communication_info":{"name":"owner"},"peer_role":"Owner","status":"Pending","created_at":42}}`
 
-	ch, err := DecodeChannel([]byte(sample))
+	record, err := DecodeChannelRecord([]byte(helperSample))
 	if err != nil {
-		t.Fatalf("DecodeChannel: %v", err)
+		t.Fatalf("DecodeChannelRecord(helper): %v", err)
 	}
-	if ch.ID != 987654321 {
-		t.Errorf("ID = %d, want 987654321", ch.ID)
+	if record.Helper == nil {
+		t.Fatal("expected the Helper variant")
+	}
+	ch := record.Helper
+	if ch.ChannelID != 987654321 {
+		t.Errorf("ChannelID = %d, want 987654321", ch.ChannelID)
 	}
 	if ch.Transport.URI != "https://owner.example.com" || ch.Transport.Protocol != 0 {
 		t.Errorf("Transport = %+v", ch.Transport)
@@ -89,35 +124,64 @@ func TestDecodeChannel_KnownGoodRustSample(t *testing.T) {
 	if ch.CreatedAt != 42 {
 		t.Errorf("CreatedAt = %d, want 42", ch.CreatedAt)
 	}
-	if ch.Role != SenderKindReplicaSource {
-		t.Errorf("Role = %v, want ReplicaSource", ch.Role)
+	if ch.PeerRole != SenderKindOwner {
+		t.Errorf("PeerRole = %v, want Owner", ch.PeerRole)
 	}
-	if ch.ReplicaID != nil {
-		t.Errorf("ReplicaID = %v, want nil", ch.ReplicaID)
+
+	replicaSample := `{"Replica":{"channel_id":987654321,"replica_id":7,"transport":{"uri":"https://alice-2.example.com","protocol":0},` +
+		`"communication_info":{},"role":"Source","status":"Paired","created_at":42}}`
+
+	record, err = DecodeChannelRecord([]byte(replicaSample))
+	if err != nil {
+		t.Fatalf("DecodeChannelRecord(replica): %v", err)
+	}
+	if record.Replica == nil {
+		t.Fatal("expected the Replica variant")
+	}
+	if record.Replica.ReplicaID != 7 {
+		t.Errorf("ReplicaID = %d, want 7", record.Replica.ReplicaID)
+	}
+	if record.Replica.Role != ReplicaRoleSource {
+		t.Errorf("Role = %v, want Source", record.Replica.Role)
 	}
 }
 
-func TestChannelRoundTrip(t *testing.T) {
-	replicaID := uint64(7)
-	orig := Channel{
-		ID:                5,
+func TestDecodeChannelRecord_RejectsAmbiguousJSON(t *testing.T) {
+	if _, err := DecodeChannelRecord([]byte(`{}`)); err == nil {
+		t.Fatal("expected an error for JSON carrying neither variant")
+	}
+	both := `{"Helper":{"channel_id":1,"transport":{"uri":"","protocol":0},"communication_info":{},"peer_role":"Owner","status":"Paired","created_at":0},` +
+		`"Replica":{"channel_id":1,"replica_id":2,"transport":{"uri":"","protocol":0},"communication_info":{},"role":"Source","status":"Paired","created_at":0}}`
+	if _, err := DecodeChannelRecord([]byte(both)); err == nil {
+		t.Fatal("expected an error for JSON carrying both variants")
+	}
+}
+
+func TestChannelRecordRoundTrip(t *testing.T) {
+	orig := ReplicaMember{
+		ChannelID:         5,
+		ReplicaID:         7,
 		Transport:         TransportEndpoint{URI: "https://x.example.com", Protocol: 0},
 		CommunicationInfo: map[string]string{"a": "1", "b": "2"},
+		Role:              ReplicaRoleDestination,
 		Status:            ChannelStatusPaired,
 		CreatedAt:         999,
-		Role:              SenderKindHelper,
-		ReplicaID:         &replicaID,
 	}
-	wire, err := EncodeChannel(orig)
+	wire, err := EncodeChannelRecord(ChannelRecord{Replica: &orig})
 	if err != nil {
-		t.Fatalf("EncodeChannel: %v", err)
+		t.Fatalf("EncodeChannelRecord: %v", err)
 	}
-	got, err := DecodeChannel(wire)
+	record, err := DecodeChannelRecord(wire)
 	if err != nil {
-		t.Fatalf("DecodeChannel: %v", err)
+		t.Fatalf("DecodeChannelRecord: %v", err)
 	}
-	if got.ID != orig.ID || got.Transport != orig.Transport || got.Status != orig.Status ||
-		got.CreatedAt != orig.CreatedAt || got.Role != orig.Role || *got.ReplicaID != *orig.ReplicaID {
+	got := record.Replica
+	if got == nil {
+		t.Fatal("expected the Replica variant")
+	}
+	if got.ChannelID != orig.ChannelID || got.ReplicaID != orig.ReplicaID ||
+		got.Transport != orig.Transport || got.Status != orig.Status ||
+		got.CreatedAt != orig.CreatedAt || got.Role != orig.Role {
 		t.Fatalf("round trip mismatch: got %+v, want %+v", got, orig)
 	}
 	if len(got.CommunicationInfo) != 2 || got.CommunicationInfo["a"] != "1" || got.CommunicationInfo["b"] != "2" {
@@ -252,10 +316,11 @@ func TestDecodeSecretValue_RejectsUnknownKind(t *testing.T) {
 
 func TestStateKeyRoundTrip_AllKinds(t *testing.T) {
 	cid := uint64(10)
+	sid := uint64(0xA0)
 	ver := uint32(3)
 	cases := []StateKey{
 		{Kind: StateKindPendingVerification, ChannelID: &cid},
-		{Kind: StateKindPendingRecovery, Version: &ver},
+		{Kind: StateKindPendingRecovery, SecretID: &sid, Version: &ver},
 		{Kind: StateKindPendingUnpair, ChannelID: &cid},
 		{Kind: StateKindSharingRound},
 	}
@@ -325,8 +390,9 @@ func TestStateItemRoundTrip_PendingVerification(t *testing.T) {
 }
 
 func TestStateItemRoundTrip_PendingRecovery(t *testing.T) {
+	sid := uint64(0xA0)
 	ver := uint32(4)
-	want := StateItem{Kind: StateKindPendingRecovery, Version: &ver, Shares: [][]byte{{1, 2}, {3, 4, 5}}}
+	want := StateItem{Kind: StateKindPendingRecovery, SecretID: &sid, Version: &ver, Shares: [][]byte{{1, 2}, {3, 4, 5}}}
 	wire, err := EncodeStateItem(want)
 	if err != nil {
 		t.Fatalf("EncodeStateItem: %v", err)
@@ -344,8 +410,9 @@ func TestStateItemRoundTrip_PendingRecovery(t *testing.T) {
 // (Rust always wraps Some(...) for this variant, even over an empty vec —
 // it is not the same as the field being entirely absent).
 func TestEncodeStateItem_PendingRecoveryEmptySharesStillPresent(t *testing.T) {
+	sid := uint64(0xA0)
 	ver := uint32(1)
-	got, err := EncodeStateItem(StateItem{Kind: StateKindPendingRecovery, Version: &ver, Shares: [][]byte{}})
+	got, err := EncodeStateItem(StateItem{Kind: StateKindPendingRecovery, SecretID: &sid, Version: &ver, Shares: [][]byte{}})
 	if err != nil {
 		t.Fatalf("EncodeStateItem: %v", err)
 	}
@@ -540,5 +607,85 @@ func TestJsonByteArray_UnmarshalRejectsOutOfRange(t *testing.T) {
 	var b JSONByteArray
 	if err := json.Unmarshal([]byte("[1,2,300]"), &b); err == nil {
 		t.Fatal("expected error for byte value out of range")
+	}
+}
+
+// --- PendingRecovery carries the secret being recovered --------------
+//
+// The recovering device runs an ephemeral instance, so the secret named
+// in a PendingRecovery row is not the secret_id partitioning the store.
+// Both the key and the item must carry it, or the Rust side rejects the
+// row and every recovered share is dropped.
+
+func TestStateKeyRoundTrip_PendingRecoveryCarriesSecretID(t *testing.T) {
+	sid := uint64(0xA0)
+	ver := uint32(3)
+	wire, err := EncodeStateKey(StateKey{Kind: StateKindPendingRecovery, SecretID: &sid, Version: &ver})
+	if err != nil {
+		t.Fatalf("EncodeStateKey: %v", err)
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(wire, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if string(raw["secret_id"]) != `"160"` {
+		t.Fatalf("secret_id must be a stringified u64, got: %s", wire)
+	}
+
+	got, err := DecodeStateKey(wire)
+	if err != nil {
+		t.Fatalf("DecodeStateKey: %v", err)
+	}
+	if got.SecretID == nil || *got.SecretID != sid {
+		t.Fatalf("SecretID mismatch: got %+v want %d", got.SecretID, sid)
+	}
+}
+
+func TestEncodeStateKey_PendingRecoveryRequiresSecretID(t *testing.T) {
+	ver := uint32(3)
+	if _, err := EncodeStateKey(StateKey{Kind: StateKindPendingRecovery, Version: &ver}); err == nil {
+		t.Fatal("expected an error when SecretID is absent")
+	}
+}
+
+func TestStateItemRoundTrip_PendingRecoveryCarriesSecretID(t *testing.T) {
+	sid := uint64(0xA0)
+	ver := uint32(4)
+	want := StateItem{
+		Kind:     StateKindPendingRecovery,
+		SecretID: &sid,
+		Version:  &ver,
+		Shares:   [][]byte{{1, 2}},
+	}
+	wire, err := EncodeStateItem(want)
+	if err != nil {
+		t.Fatalf("EncodeStateItem: %v", err)
+	}
+	got, err := DecodeStateItem(wire)
+	if err != nil {
+		t.Fatalf("DecodeStateItem: %v", err)
+	}
+	if got.SecretID == nil || *got.SecretID != sid {
+		t.Fatalf("SecretID mismatch: got %+v want %d", got.SecretID, sid)
+	}
+}
+
+func TestStateItemKey_PendingRecoveryPropagatesSecretID(t *testing.T) {
+	sid := uint64(0xA0)
+	ver := uint32(4)
+	key := StateItem{Kind: StateKindPendingRecovery, SecretID: &sid, Version: &ver}.Key()
+	if key.SecretID == nil || *key.SecretID != sid {
+		t.Fatalf("Key() dropped SecretID: %+v", key)
+	}
+	if key.Version == nil || *key.Version != ver {
+		t.Fatalf("Key() dropped Version: %+v", key)
+	}
+}
+
+func TestDecodeStateItem_PendingRecoveryRequiresSecretID(t *testing.T) {
+	wire := []byte(`{"kind":1,"version":4,"shares":[]}`)
+	if _, err := DecodeStateItem(wire); err == nil {
+		t.Fatal("expected an error when secret_id is absent")
 	}
 }

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use derec_library::protocol::DeRecFlow;
 use derec_library::protocol::events::DeRecEvent;
 use derec_library::protocol::types::UserSecret;
-use derec_library::protocol::DeRecFlow;
 use derec_library::types::ChannelId;
 
 use crate::db::Database;
@@ -63,7 +63,11 @@ pub async fn run() {
         "helper must hold a share row for the channel about to be unpaired"
     );
 
-    assert!(channel_exists(&owner_db.connection(), DEFAULT_TEST_SECRET_ID, cid.0));
+    assert!(channel_exists(
+        &owner_db.connection(),
+        DEFAULT_TEST_SECRET_ID,
+        cid.0
+    ));
     assert!(channel_exists(
         &helper_db.connection(),
         DEFAULT_TEST_SECRET_ID,

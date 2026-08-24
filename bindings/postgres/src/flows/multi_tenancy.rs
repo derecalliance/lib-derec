@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-use derec_library::protocol::types::UserSecret;
+use derec_library::protocol::types::{ChannelQuery, UserSecret};
 use derec_library::protocol::{
     DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecUserSecretStore, MissingPolicy,
     SecretKind, SecretStoreError,
@@ -9,9 +9,7 @@ use derec_library::protocol::{
 use derec_library::types::ChannelId;
 
 use crate::db::Database;
-use crate::flows::assertions::{
-    count_channels, count_shares, count_user_secrets,
-};
+use crate::flows::assertions::{count_channels, count_shares, count_user_secrets};
 use crate::flows::helpers::{pair_owner_helper, protect_secret};
 use crate::peer::Peer;
 
@@ -75,29 +73,39 @@ pub async fn run() {
     assert_eq!(count_channels(&shared_db.client(), SECRET_B_ID).await, 2);
     println!("  shared `channels` table: 2 rows under each secret_id  ✓");
 
-    let a_chans = owner_a.protocol.channel_store.channels(SECRET_A_ID).await.unwrap();
-    let b_chans = owner_b.protocol.channel_store.channels(SECRET_B_ID).await.unwrap();
+    let a_chans = owner_a
+        .protocol
+        .channel_store
+        .helpers(SECRET_A_ID)
+        .await
+        .unwrap();
+    let b_chans = owner_b
+        .protocol
+        .channel_store
+        .helpers(SECRET_B_ID)
+        .await
+        .unwrap();
     assert_eq!(a_chans.len(), 2);
     assert_eq!(b_chans.len(), 2);
     for c in &a_chans {
         assert!(
-            c.id == a1 || c.id == a2,
+            c.channel_id == a1 || c.channel_id == a2,
             "secret A enumerate returned a non-A channel: {:?}",
-            c.id
+            c.channel_id
         );
     }
     for c in &b_chans {
         assert!(
-            c.id == b1 || c.id == b2,
+            c.channel_id == b1 || c.channel_id == b2,
             "secret B enumerate returned a non-B channel: {:?}",
-            c.id
+            c.channel_id
         );
     }
     assert!(
         owner_a
             .protocol
             .channel_store
-            .load(SECRET_A_ID, b1)
+            .load(SECRET_A_ID, ChannelQuery::Helper { channel_id: b1 })
             .await
             .unwrap()
             .is_none(),
@@ -108,7 +116,7 @@ pub async fn run() {
         owner_b
             .protocol
             .channel_store
-            .load(SECRET_B_ID, a1)
+            .load(SECRET_B_ID, ChannelQuery::Helper { channel_id: a1 })
             .await
             .unwrap()
             .is_none(),
@@ -120,7 +128,12 @@ pub async fn run() {
     match owner_a
         .protocol
         .secret_store
-        .load_many(SECRET_A_ID, &[b1], SecretKind::SharedKey, MissingPolicy::Fail)
+        .load_many(
+            SECRET_A_ID,
+            &[b1],
+            SecretKind::SharedKey,
+            MissingPolicy::Fail,
+        )
         .await
     {
         Ok(v) => panic!(
@@ -131,13 +144,9 @@ pub async fn run() {
             assert_eq!(kind, SecretKind::SharedKey);
             assert_eq!(channel_ids, vec![b1.0]);
         }
-        Err(other) => panic!(
-            "unexpected error variant for cross-secret load_many: {other:?}"
-        ),
+        Err(other) => panic!("unexpected error variant for cross-secret load_many: {other:?}"),
     }
-    println!(
-        "  SecretStore::load_many(MissingPolicy::Fail) reports partitioned miss  ✓"
-    );
+    println!("  SecretStore::load_many(MissingPolicy::Fail) reports partitioned miss  ✓");
 
     protect_secret(
         &mut owner_a,
@@ -161,16 +170,30 @@ pub async fn run() {
         "B publish",
     )
     .await;
-    assert_eq!(count_user_secrets(&shared_db.client(), SECRET_A_ID).await, 1);
-    assert_eq!(count_user_secrets(&shared_db.client(), SECRET_B_ID).await, 1);
+    assert_eq!(
+        count_user_secrets(&shared_db.client(), SECRET_A_ID).await,
+        1
+    );
+    assert_eq!(
+        count_user_secrets(&shared_db.client(), SECRET_B_ID).await,
+        1
+    );
     assert_eq!(count_shares(&shared_db.client(), SECRET_A_ID).await, 2);
     assert_eq!(count_shares(&shared_db.client(), SECRET_B_ID).await, 2);
-    println!(
-        "  publish into both secrets: each has 1 user_secret + 2 owner-side share rows  ✓"
-    );
+    println!("  publish into both secrets: each has 1 user_secret + 2 owner-side share rows  ✓");
 
-    let lv_a = owner_a.protocol.share_store.latest_version(SECRET_A_ID).await.unwrap();
-    let lv_b = owner_b.protocol.share_store.latest_version(SECRET_B_ID).await.unwrap();
+    let lv_a = owner_a
+        .protocol
+        .share_store
+        .latest_version(SECRET_A_ID)
+        .await
+        .unwrap();
+    let lv_b = owner_b
+        .protocol
+        .share_store
+        .latest_version(SECRET_B_ID)
+        .await
+        .unwrap();
     assert_eq!(lv_a, Some(1));
     assert_eq!(lv_b, Some(1));
     let cross = owner_a
@@ -193,32 +216,48 @@ pub async fn run() {
         .remove(SECRET_A_ID)
         .await
         .unwrap();
-    let secret_a_channels = owner_a.protocol.channel_store.channels(SECRET_A_ID).await.unwrap();
+    let secret_a_channels = owner_a
+        .protocol
+        .channel_store
+        .helpers(SECRET_A_ID)
+        .await
+        .unwrap();
     for c in &secret_a_channels {
         owner_a
             .protocol
             .channel_store
-            .remove(SECRET_A_ID, c.id)
+            .remove(
+                SECRET_A_ID,
+                ChannelQuery::Helper {
+                    channel_id: c.channel_id,
+                },
+            )
             .await
             .unwrap();
         owner_a
             .protocol
             .secret_store
-            .remove(SECRET_A_ID, c.id, SecretKind::SharedKey)
+            .remove(SECRET_A_ID, c.channel_id, SecretKind::SharedKey)
             .await
             .unwrap();
         owner_a
             .protocol
             .share_store
-            .remove_channel(SECRET_A_ID, c.id)
+            .remove_channel(SECRET_A_ID, c.channel_id)
             .await
             .unwrap();
     }
     assert_eq!(count_channels(&shared_db.client(), SECRET_A_ID).await, 0);
-    assert_eq!(count_user_secrets(&shared_db.client(), SECRET_A_ID).await, 0);
+    assert_eq!(
+        count_user_secrets(&shared_db.client(), SECRET_A_ID).await,
+        0
+    );
     assert_eq!(count_shares(&shared_db.client(), SECRET_A_ID).await, 0);
     assert_eq!(count_channels(&shared_db.client(), SECRET_B_ID).await, 2);
-    assert_eq!(count_user_secrets(&shared_db.client(), SECRET_B_ID).await, 1);
+    assert_eq!(
+        count_user_secrets(&shared_db.client(), SECRET_B_ID).await,
+        1
+    );
     assert_eq!(count_shares(&shared_db.client(), SECRET_B_ID).await, 2);
     println!("  secret A fully removed; secret B's rows are unaffected  ✓");
 

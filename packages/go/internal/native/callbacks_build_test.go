@@ -49,7 +49,8 @@ func TestBuildCallbacks_PopulatesAllSixStructs(t *testing.T) {
 	checkNonZero("Channel.Load", built.Channel.Load)
 	checkNonZero("Channel.Save", built.Channel.Save)
 	checkNonZero("Channel.Remove", built.Channel.Remove)
-	checkNonZero("Channel.ListChannels", built.Channel.ListChannels)
+	checkNonZero("Channel.ListHelpers", built.Channel.ListHelpers)
+	checkNonZero("Channel.ListReplicas", built.Channel.ListReplicas)
 	checkNonZero("Channel.LinkChannel", built.Channel.LinkChannel)
 	checkNonZero("Channel.LinkedChannels", built.Channel.LinkedChannels)
 	checkNonZero("Channel.FreeBuffer", built.Channel.FreeBuffer)
@@ -119,10 +120,10 @@ func TestBuildCallbacks_NilStoreSet(t *testing.T) {
 // unit-test floor.
 
 func TestChannelStoreCallbacks_LoadCallback_RealRoundTrip(t *testing.T) {
-	want := Channel{ID: 77, Status: ChannelStatusPaired, Role: SenderKindOwner, CommunicationInfo: map[string]string{}}
+	want := HelperChannel{ChannelID: 77, Status: ChannelStatusPaired, PeerRole: SenderKindOwner, CommunicationInfo: map[string]string{}}
 	s := &storeSet{channel: &mockChannelStore{
-		loadFn: func(secretID, channelID uint64) (Channel, bool, error) {
-			return want, true, nil
+		loadFn: func(secretID, channelID, replicaID uint64) (ChannelRecord, bool, error) {
+			return ChannelRecord{Helper: &want}, true, nil
 		},
 	}}
 	built, err := buildCallbacks(s)
@@ -136,12 +137,12 @@ func TestChannelStoreCallbacks_LoadCallback_RealRoundTrip(t *testing.T) {
 	// unsafe.Pointer(uintptr) round trip on the test's side — purego
 	// marshals by raw register bits, so this differs from the callback's
 	// own *uintptr-typed parameter in name only, not in ABI.
-	var load func(userData uintptr, secretID, channelID uint64, outPtr **byte, outLen *uintptr) int32
+	var load func(userData uintptr, secretID, channelID, replicaID uint64, outPtr **byte, outLen *uintptr) int32
 	purego.RegisterFunc(&load, built.Channel.Load)
 
 	var outPtr *byte
 	var outLen uintptr
-	rc := load(built.Channel.UserData, 1, 77, &outPtr, &outLen)
+	rc := load(built.Channel.UserData, 1, 77, 0, &outPtr, &outLen)
 	if rc != ffiStatusOK {
 		t.Fatalf("rc = %d, want ffiStatusOK", rc)
 	}
@@ -150,12 +151,12 @@ func TestChannelStoreCallbacks_LoadCallback_RealRoundTrip(t *testing.T) {
 	}
 
 	got := unsafe.Slice(outPtr, outLen)
-	ch, err := DecodeChannel(got)
+	record, err := DecodeChannelRecord(got)
 	if err != nil {
-		t.Fatalf("DecodeChannel: %v", err)
+		t.Fatalf("DecodeChannelRecord: %v", err)
 	}
-	if ch.ID != want.ID {
-		t.Fatalf("ID = %d, want %d", ch.ID, want.ID)
+	if record.Helper == nil || record.Helper.ChannelID != want.ChannelID {
+		t.Fatalf("record = %+v, want helper %+v", record, want)
 	}
 
 	var freeBuffer func(userData uintptr, ptr *byte, length uintptr)
@@ -165,8 +166,8 @@ func TestChannelStoreCallbacks_LoadCallback_RealRoundTrip(t *testing.T) {
 
 func TestChannelStoreCallbacks_LoadCallback_NotFound_RealRoundTrip(t *testing.T) {
 	s := &storeSet{channel: &mockChannelStore{
-		loadFn: func(secretID, channelID uint64) (Channel, bool, error) {
-			return Channel{}, false, nil
+		loadFn: func(secretID, channelID, replicaID uint64) (ChannelRecord, bool, error) {
+			return ChannelRecord{}, false, nil
 		},
 	}}
 	built, err := buildCallbacks(s)
@@ -175,12 +176,12 @@ func TestChannelStoreCallbacks_LoadCallback_NotFound_RealRoundTrip(t *testing.T)
 	}
 	defer built.release()
 
-	var load func(userData uintptr, secretID, channelID uint64, outPtr **byte, outLen *uintptr) int32
+	var load func(userData uintptr, secretID, channelID, replicaID uint64, outPtr **byte, outLen *uintptr) int32
 	purego.RegisterFunc(&load, built.Channel.Load)
 
 	var outPtr *byte
 	var outLen uintptr
-	rc := load(built.Channel.UserData, 1, 2, &outPtr, &outLen)
+	rc := load(built.Channel.UserData, 1, 2, 0, &outPtr, &outLen)
 	if rc != ffiStatusNotFound {
 		t.Fatalf("rc = %d, want ffiStatusNotFound", rc)
 	}
@@ -194,10 +195,10 @@ func TestChannelStoreCallbacks_LoadCallback_NotFound_RealRoundTrip(t *testing.T)
 // registered callback reading it back out via unsafe.Slice — round trips
 // correctly.
 func TestChannelStoreCallbacks_SaveCallback_RealRoundTrip(t *testing.T) {
-	var saved Channel
+	var saved ChannelRecord
 	s := &storeSet{channel: &mockChannelStore{
-		saveFn: func(secretID uint64, channel Channel) error {
-			saved = channel
+		saveFn: func(secretID uint64, record ChannelRecord) error {
+			saved = record
 			return nil
 		},
 	}}
@@ -207,18 +208,19 @@ func TestChannelStoreCallbacks_SaveCallback_RealRoundTrip(t *testing.T) {
 	}
 	defer built.release()
 
-	var save func(userData uintptr, secretID, channelID uint64, bytesPtr *byte, length uintptr) int32
+	var save func(userData uintptr, secretID, channelID, replicaID uint64, bytesPtr *byte, length uintptr) int32
 	purego.RegisterFunc(&save, built.Channel.Save)
 
-	payload, err := EncodeChannel(Channel{ID: 5, Status: ChannelStatusPending, Role: SenderKindHelper, CommunicationInfo: map[string]string{}})
+	helper := HelperChannel{ChannelID: 5, Status: ChannelStatusPending, PeerRole: SenderKindHelper, CommunicationInfo: map[string]string{}}
+	payload, err := EncodeChannelRecord(ChannelRecord{Helper: &helper})
 	if err != nil {
-		t.Fatalf("EncodeChannel: %v", err)
+		t.Fatalf("EncodeChannelRecord: %v", err)
 	}
-	rc := save(built.Channel.UserData, 9, 5, &payload[0], uintptr(len(payload)))
+	rc := save(built.Channel.UserData, 9, 5, 0, &payload[0], uintptr(len(payload)))
 	if rc != ffiStatusOK {
 		t.Fatalf("rc = %d, want ffiStatusOK", rc)
 	}
-	if saved.ID != 5 || saved.Role != SenderKindHelper {
+	if saved.Helper == nil || saved.Helper.ChannelID != 5 || saved.Helper.PeerRole != SenderKindHelper {
 		t.Fatalf("saved = %+v", saved)
 	}
 }
@@ -230,7 +232,7 @@ func TestChannelStoreCallbacks_SaveCallback_RealRoundTrip(t *testing.T) {
 // purego.NewCallback trampoline, not crash the process.
 func TestChannelStoreCallbacks_LoadCallback_PanicNotCrash_RealRoundTrip(t *testing.T) {
 	s := &storeSet{channel: &mockChannelStore{
-		loadFn: func(secretID, channelID uint64) (Channel, bool, error) {
+		loadFn: func(secretID, channelID, replicaID uint64) (ChannelRecord, bool, error) {
 			panic("mock store blew up across the C boundary")
 		},
 	}}
@@ -240,12 +242,12 @@ func TestChannelStoreCallbacks_LoadCallback_PanicNotCrash_RealRoundTrip(t *testi
 	}
 	defer built.release()
 
-	var load func(userData uintptr, secretID, channelID uint64, outPtr **byte, outLen *uintptr) int32
+	var load func(userData uintptr, secretID, channelID, replicaID uint64, outPtr **byte, outLen *uintptr) int32
 	purego.RegisterFunc(&load, built.Channel.Load)
 
 	var outPtr *byte
 	var outLen uintptr
-	rc := load(built.Channel.UserData, 1, 2, &outPtr, &outLen)
+	rc := load(built.Channel.UserData, 1, 2, 0, &outPtr, &outLen)
 	if rc != ffiStatusFailure {
 		t.Fatalf("rc = %d, want ffiStatusFailure after recovered panic", rc)
 	}
@@ -375,7 +377,8 @@ func TestBuildCallbacks_ManyInstancesDoNotExhaustCallbackTable(t *testing.T) {
 		checkNonZero("Channel.Load", built.Channel.Load)
 		checkNonZero("Channel.Save", built.Channel.Save)
 		checkNonZero("Channel.Remove", built.Channel.Remove)
-		checkNonZero("Channel.ListChannels", built.Channel.ListChannels)
+		checkNonZero("Channel.ListHelpers", built.Channel.ListHelpers)
+		checkNonZero("Channel.ListReplicas", built.Channel.ListReplicas)
 		checkNonZero("Channel.LinkChannel", built.Channel.LinkChannel)
 		checkNonZero("Channel.LinkedChannels", built.Channel.LinkedChannels)
 		checkNonZero("Channel.FreeBuffer", built.Channel.FreeBuffer)

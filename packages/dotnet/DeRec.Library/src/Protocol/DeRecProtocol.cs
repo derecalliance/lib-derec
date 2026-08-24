@@ -33,7 +33,8 @@ public sealed class DeRecProtocol : IDisposable
     private readonly NP.ChannelStoreLoadDelegate _channelLoad;
     private readonly NP.ChannelStoreSaveDelegate _channelSave;
     private readonly NP.ChannelStoreRemoveDelegate _channelRemove;
-    private readonly NP.ChannelStoreListDelegate _channelList;
+    private readonly NP.ChannelStoreListDelegate _channelListHelpers;
+    private readonly NP.ChannelStoreListDelegate _channelListReplicas;
     private readonly NP.ChannelStoreLinkDelegate _channelLink;
     private readonly NP.ChannelStoreLinkedDelegate _channelLinked;
     private readonly NP.FreeBufferDelegate _channelFreeBuffer;
@@ -96,12 +97,13 @@ public sealed class DeRecProtocol : IDisposable
         int threshold = 3,
         int keepVersionsCount = 3,
         Dictionary<string, string>? communicationInfo = null,
-        int timeoutInSecs = 300,
         bool autoRespondOnFailure = false,
         UnpairAck unpairAck = UnpairAck.Required,
         bool autoReplyTo = false,
         AutoAcceptPolicy? autoAccept = null,
-        ulong? replicaId = null)
+        ulong? replicaId = null,
+        Timeouts? timeouts = null,
+        bool unsafeHttp = false)
     {
         SecretId = secretId;
         _channelStore = channelStore;
@@ -114,7 +116,8 @@ public sealed class DeRecProtocol : IDisposable
         _channelLoad = ChannelLoadImpl;
         _channelSave = ChannelSaveImpl;
         _channelRemove = ChannelRemoveImpl;
-        _channelList = ChannelListImpl;
+        _channelListHelpers = ChannelListHelpersImpl;
+        _channelListReplicas = ChannelListReplicasImpl;
         _channelLink = ChannelLinkImpl;
         _channelLinked = ChannelLinkedImpl;
         _channelFreeBuffer = FreeBufferImpl;
@@ -151,7 +154,8 @@ public sealed class DeRecProtocol : IDisposable
             Load = Marshal.GetFunctionPointerForDelegate(_channelLoad),
             Save = Marshal.GetFunctionPointerForDelegate(_channelSave),
             Remove = Marshal.GetFunctionPointerForDelegate(_channelRemove),
-            ListChannels = Marshal.GetFunctionPointerForDelegate(_channelList),
+            ListHelpers = Marshal.GetFunctionPointerForDelegate(_channelListHelpers),
+            ListReplicas = Marshal.GetFunctionPointerForDelegate(_channelListReplicas),
             LinkChannel = Marshal.GetFunctionPointerForDelegate(_channelLink),
             LinkedChannels = Marshal.GetFunctionPointerForDelegate(_channelLinked),
             FreeBuffer = Marshal.GetFunctionPointerForDelegate(_channelFreeBuffer),
@@ -214,7 +218,6 @@ public sealed class DeRecProtocol : IDisposable
             OwnTransportProtocol: ownProtocolNum,
             Threshold: (uint)threshold,
             KeepVersionsCount: (uint)keepVersionsCount,
-            TimeoutInSecs: (uint)timeoutInSecs,
             AutoRespondOnFailure: autoRespondOnFailure,
             UnpairAck: (int)unpairAck,
             AutoReplyTo: autoReplyTo,
@@ -227,6 +230,18 @@ public sealed class DeRecProtocol : IDisposable
                 GetShare: policy.GetShare,
                 Unpair: policy.Unpair,
                 UpdateChannelInfo: policy.UpdateChannelInfo),
+            Timeouts: timeouts is null
+                ? null
+                : new TimeoutsConfigDto(
+                    InboundMessageSecs: ToSecs(timeouts.InboundMessage),
+                    SharingRoundSecs: ToSecs(timeouts.SharingRound),
+                    UnpairAckSecs: ToSecs(timeouts.UnpairAck),
+                    ExpiredChannels: timeouts.ExpiredChannels is null
+                        ? null
+                        : new RemoveExpiredChannelsConfigDto(
+                            Enabled: timeouts.ExpiredChannels.Enabled,
+                            TimeoutInSecs: timeouts.ExpiredChannels.TimeoutInSecs)),
+            UnsafeHttp: unsafeHttp,
             ReplicaId: replicaId?.ToString(System.Globalization.CultureInfo.InvariantCulture));
         byte[] configJsonBytes = JsonSerializer.SerializeToUtf8Bytes(config, JsonOpts);
 
@@ -284,6 +299,38 @@ public sealed class DeRecProtocol : IDisposable
             var err = NP.derec_protocol_verify_fingerprint(_handle, channelId, fpBytes, out uint matched);
             ThrowOnError(err);
             return matched != 0;
+        });
+    }
+
+    /// <summary>
+    /// Remove <c>Pending</c> channels older than <paramref name="olderThanSecs"/>,
+    /// along with their pairing keys, and return the ids removed.
+    /// </summary>
+    /// <remarks>
+    /// Independent of the cleanup policy the protocol was constructed with —
+    /// this sweeps at the threshold given even when that policy is disabled.
+    /// The age comparison is strict, so a channel created within the current
+    /// second survives even <c>0</c>.
+    /// </remarks>
+    public Task<IReadOnlyList<ulong>> RemoveExpiredChannelsAsync(ulong olderThanSecs)
+    {
+        EnsureNotDisposed();
+        return Task.Run<IReadOnlyList<ulong>>(() =>
+        {
+            var result = NP.derec_protocol_remove_expired_channels(_handle, olderThanSecs);
+            try
+            {
+                ThrowOnError(result.Error);
+                byte[] json = DeRec.Library.Utils.CopyBuffer(result.Channels);
+                var ids = JsonSerializer.Deserialize<List<string>>(json, JsonOpts)
+                    ?? new List<string>();
+                return ids.ConvertAll(id =>
+                    ulong.Parse(id, System.Globalization.CultureInfo.InvariantCulture));
+            }
+            finally
+            {
+                DeRec.Library.Utils.FreeBuffer(result.Channels);
+            }
         });
     }
 
@@ -450,6 +497,44 @@ public sealed class DeRecProtocol : IDisposable
     }
 
     /// <summary>
+    /// Advance time-driven state without an inbound message.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Timeouts are otherwise only evaluated by <see cref="ProcessAsync"/>, so
+    /// a publish whose helpers all go quiet has nothing left to close it: the
+    /// round stays open and no <c>SharingComplete</c> is ever raised. Call
+    /// this from a scheduler — a timer, a hosted background service, a cron
+    /// trigger — at an interval shorter than the configured timeout.
+    /// </para>
+    /// <para>
+    /// Safe to call at any time; with nothing in flight it returns an empty
+    /// list. It mutates the same round state an inbound response does, so it
+    /// must be serialized against <see cref="ProcessAsync"/> for the same
+    /// <c>secret_id</c>.
+    /// </para>
+    /// </remarks>
+    public Task<IReadOnlyList<DeRecEvent>> TickAsync()
+    {
+        EnsureNotDisposed();
+        return Task.Run<IReadOnlyList<DeRecEvent>>(() =>
+        {
+            var result = NP.derec_protocol_tick(_handle);
+            try
+            {
+                ThrowOnError(result.Error);
+                byte[] json = DeRec.Library.Utils.CopyBuffer(result.EventsJson);
+                return JsonSerializer.Deserialize<List<DeRecEvent>>(json, JsonOpts)
+                    ?? new List<DeRecEvent>();
+            }
+            finally
+            {
+                DeRec.Library.Utils.FreeBuffer(result.EventsJson);
+            }
+        });
+    }
+
+    /// <summary>
     /// Rebuild this protocol's <c>secret_id</c> namespace from a recovered
     /// <see cref="Secret"/>. Mirrors the Rust <c>DeRecProtocol::restore</c>
     /// — see that method for the full contract. <paramref name="recoveredSecret"/>
@@ -560,25 +645,54 @@ public sealed class DeRecProtocol : IDisposable
             Marshal.FreeCoTaskMem(ptr);
     }
 
-    private int ChannelLoadImpl(IntPtr userData, ulong secretId, ulong channelId, out IntPtr outPtr, out UIntPtr outLen)
+    private static HelperChannelDto ToDto(HelperChannel h) => new(
+        h.ChannelId,
+        new TransportDto(h.Transport.Uri, (int)h.Transport.Protocol),
+        h.CommunicationInfo,
+        h.PeerRole.ToString(),
+        h.Status.ToString(),
+        h.CreatedAt);
+
+    private static ReplicaMemberDto ToDto(ReplicaMember m) => new(
+        m.ChannelId,
+        m.ReplicaId,
+        new TransportDto(m.Transport.Uri, (int)m.Transport.Protocol),
+        m.CommunicationInfo,
+        m.Role.ToString(),
+        m.Status.ToString(),
+        m.CreatedAt);
+
+    private static HelperChannel FromDto(HelperChannelDto d) => new(
+        d.channel_id,
+        new TransportProtocol(d.transport.uri, (Protocol)d.transport.protocol),
+        d.communication_info ?? new(),
+        Enum.Parse<ChannelStatus>(d.status ?? nameof(ChannelStatus.Paired)),
+        d.created_at,
+        Enum.Parse<LibPairing.SenderKind>(d.peer_role));
+
+    private static ReplicaMember FromDto(ReplicaMemberDto d) => new(
+        d.channel_id,
+        d.replica_id,
+        new TransportProtocol(d.transport.uri, (Protocol)d.transport.protocol),
+        d.communication_info ?? new(),
+        Enum.Parse<ReplicaRole>(d.role),
+        Enum.Parse<ChannelStatus>(d.status ?? nameof(ChannelStatus.Paired)),
+        d.created_at);
+
+    private int ChannelLoadImpl(IntPtr userData, ulong secretId, ulong channelId, ulong replicaId, out IntPtr outPtr, out UIntPtr outLen)
     {
         try
         {
-            var ch = _channelStore.Load(secretId, channelId);
-            if (ch is null)
+            var record = _channelStore.Load(secretId, channelId, replicaId);
+            if (record is null)
             {
                 outPtr = IntPtr.Zero;
                 outLen = UIntPtr.Zero;
                 return 1;
             }
-            var dto = new ChannelDto(
-                ch.Id,
-                new TransportDto(ch.Transport.Uri, (int)ch.Transport.Protocol),
-                ch.CommunicationInfo,
-                ch.Status.ToString(),
-                ch.CreatedAt,
-                ch.Role.ToString(),
-                ch.ReplicaId);
+            var dto = new ChannelRecordDto(
+                record.Helper is null ? null : ToDto(record.Helper),
+                record.Replica is null ? null : ToDto(record.Replica));
             byte[] json = JsonSerializer.SerializeToUtf8Bytes(dto, JsonOpts);
             return WriteOut(json, out outPtr, out outLen);
         }
@@ -590,36 +704,32 @@ public sealed class DeRecProtocol : IDisposable
         }
     }
 
-    private int ChannelSaveImpl(IntPtr userData, ulong secretId, ulong channelId, IntPtr bytes, UIntPtr len)
+    private int ChannelSaveImpl(IntPtr userData, ulong secretId, ulong channelId, ulong replicaId, IntPtr bytes, UIntPtr len)
     {
         try
         {
             byte[] buf = new byte[(int)len];
             Marshal.Copy(bytes, buf, 0, buf.Length);
-            var dto = JsonSerializer.Deserialize<ChannelDto>(buf, JsonOpts)
-                ?? throw new InvalidOperationException("null Channel JSON");
-            var transport = new TransportProtocol(
-                dto.transport.uri, (Protocol)dto.transport.protocol);
-            var status = Enum.Parse<ChannelStatus>(dto.status ?? nameof(ChannelStatus.Paired));
-            var role = Enum.Parse<LibPairing.SenderKind>(dto.role);
-            _channelStore.Save(secretId, new Channel(
-                dto.id,
-                transport,
-                dto.communication_info ?? new(),
-                status,
-                dto.created_at,
-                role,
-                dto.replica_id));
+            var dto = JsonSerializer.Deserialize<ChannelRecordDto>(buf, JsonOpts)
+                ?? throw new InvalidOperationException("null ChannelRecord JSON");
+            var record = (dto.Helper, dto.Replica) switch
+            {
+                ({ } h, null) => ChannelRecord.Of(FromDto(h)),
+                (null, { } r) => ChannelRecord.Of(FromDto(r)),
+                _ => throw new InvalidOperationException(
+                    "ChannelRecord JSON must carry exactly one of Helper / Replica"),
+            };
+            _channelStore.Save(secretId, record);
             return 0;
         }
         catch { return -1; }
     }
 
-    private int ChannelRemoveImpl(IntPtr userData, ulong secretId, ulong channelId, out uint outExisted)
+    private int ChannelRemoveImpl(IntPtr userData, ulong secretId, ulong channelId, ulong replicaId, out uint outExisted)
     {
         try
         {
-            outExisted = _channelStore.Remove(secretId, channelId) ? 1u : 0u;
+            outExisted = _channelStore.Remove(secretId, channelId, replicaId) ? 1u : 0u;
             return 0;
         }
         catch
@@ -629,12 +739,32 @@ public sealed class DeRecProtocol : IDisposable
         }
     }
 
-    private int ChannelListImpl(IntPtr userData, ulong secretId, out IntPtr outPtr, out UIntPtr outLen)
+    private int ChannelListHelpersImpl(IntPtr userData, ulong secretId, out IntPtr outPtr, out UIntPtr outLen)
     {
         try
         {
-            var ids = new List<ulong>(_channelStore.ListChannelIds(secretId));
-            byte[] json = JsonSerializer.SerializeToUtf8Bytes(ids, JsonOpts);
+            var dtos = new List<HelperChannelDto>();
+            foreach (var h in _channelStore.ListHelpers(secretId))
+                dtos.Add(ToDto(h));
+            byte[] json = JsonSerializer.SerializeToUtf8Bytes(dtos, JsonOpts);
+            return WriteOut(json, out outPtr, out outLen);
+        }
+        catch
+        {
+            outPtr = IntPtr.Zero;
+            outLen = UIntPtr.Zero;
+            return -1;
+        }
+    }
+
+    private int ChannelListReplicasImpl(IntPtr userData, ulong secretId, out IntPtr outPtr, out UIntPtr outLen)
+    {
+        try
+        {
+            var dtos = new List<ReplicaMemberDto>();
+            foreach (var m in _channelStore.ListReplicas(secretId))
+                dtos.Add(ToDto(m));
+            byte[] json = JsonSerializer.SerializeToUtf8Bytes(dtos, JsonOpts);
             return WriteOut(json, out outPtr, out outLen);
         }
         catch
@@ -869,30 +999,39 @@ public sealed class DeRecProtocol : IDisposable
     private sealed record StateItemDto(
         uint kind,
         string? channel_id,
+        string? secret_id,
         uint? version,
         string? started_at,
         byte[]? bytes,
         byte[][]? shares,
         string[]? pending,
         string[]? confirmed,
-        string[]? failed);
+        string[]? failed,
+        string[]? pending_replicas,
+        string[]? synced_replicas,
+        string[]? behind_replicas);
 
     // Wire shape matches Rust `StateKeyRecord`.
     private sealed record StateKeyDto(
         uint kind,
         string? channel_id,
+        string? secret_id,
         uint? version);
 
     private static StateItemDto ToDto(StateItem item) => new(
         (uint)item.Kind,
         item.ChannelId?.ToString(),
+        item.SecretId?.ToString(),
         item.Version,
         item.StartedAt?.ToString(),
         item.Bytes,
         item.Shares,
         item.Pending?.Select(c => c.ToString()).ToArray(),
         item.Confirmed?.Select(c => c.ToString()).ToArray(),
-        item.Failed?.Select(c => c.ToString()).ToArray());
+        item.Failed?.Select(c => c.ToString()).ToArray(),
+        item.PendingReplicas?.Select(r => r.ToString()).ToArray(),
+        item.SyncedReplicas?.Select(r => r.ToString()).ToArray(),
+        item.BehindReplicas?.Select(r => r.ToString()).ToArray());
 
     private static StateItem FromDto(StateItemDto dto)
     {
@@ -900,6 +1039,9 @@ public sealed class DeRecProtocol : IDisposable
         ulong? channelId = dto.channel_id is null
             ? null
             : ulong.Parse(dto.channel_id, System.Globalization.CultureInfo.InvariantCulture);
+        ulong? secretId = dto.secret_id is null
+            ? null
+            : ulong.Parse(dto.secret_id, System.Globalization.CultureInfo.InvariantCulture);
         ulong? startedAt = dto.started_at is null
             ? null
             : ulong.Parse(dto.started_at, System.Globalization.CultureInfo.InvariantCulture);
@@ -912,9 +1054,18 @@ public sealed class DeRecProtocol : IDisposable
         ulong[]? failed = dto.failed?
             .Select(s => ulong.Parse(s, System.Globalization.CultureInfo.InvariantCulture))
             .ToArray();
+        ulong[]? pendingReplicas = dto.pending_replicas?
+            .Select(s => ulong.Parse(s, System.Globalization.CultureInfo.InvariantCulture))
+            .ToArray();
+        ulong[]? syncedReplicas = dto.synced_replicas?
+            .Select(s => ulong.Parse(s, System.Globalization.CultureInfo.InvariantCulture))
+            .ToArray();
+        ulong[]? behindReplicas = dto.behind_replicas?
+            .Select(s => ulong.Parse(s, System.Globalization.CultureInfo.InvariantCulture))
+            .ToArray();
         return new StateItem(
-            kind, channelId, dto.version, startedAt, dto.bytes, dto.shares,
-            pending, confirmed, failed);
+            kind, channelId, secretId, dto.version, startedAt, dto.bytes, dto.shares,
+            pending, confirmed, failed, pendingReplicas, syncedReplicas, behindReplicas);
     }
 
     private static StateKey ParseKeyBuffer(IntPtr ptr, UIntPtr len)
@@ -931,6 +1082,9 @@ public sealed class DeRecProtocol : IDisposable
                     ?? throw new InvalidOperationException("PendingVerification requires channel_id"),
                     System.Globalization.CultureInfo.InvariantCulture)),
             StateKind.PendingRecovery => StateKey.PendingRecovery(
+                ulong.Parse(dto.secret_id
+                    ?? throw new InvalidOperationException("PendingRecovery requires secret_id"),
+                    System.Globalization.CultureInfo.InvariantCulture),
                 dto.version
                     ?? throw new InvalidOperationException("PendingRecovery requires version")),
             StateKind.PendingUnpair => StateKey.PendingUnpair(
@@ -1046,26 +1200,38 @@ public sealed class DeRecProtocol : IDisposable
         catch { return -1; }
     }
 
-    // Mirror the Rust-side `crate::protocol::types::Channel` /
-    // `TransportProtocol` shapes produced by serde's default derives.
-    // Wire field names are snake_case to match serde; `status` and `role`
-    // are variant-name strings ("Pending" / "Paired", "Owner" /
-    // "Helper" / "ReplicaSource" / "ReplicaDestination"). The public
-    // `Channel` record on the dotnet side uses native types
-    // (`TransportProtocol`, `ChannelStatus`, `Pairing.SenderKind`)
-    // and the bridge translates in `ChannelLoadImpl` /
-    // `ChannelSaveImpl`.
+    // Mirror the Rust-side `crate::protocol::types::ChannelRecord` /
+    // `HelperChannel` / `ReplicaMember` / `TransportProtocol` shapes produced
+    // by serde's default derives. Wire field names are snake_case to match
+    // serde; `status`, `peer_role` and `role` are variant-name strings
+    // ("Pending" / "Paired", "Owner" / "Helper" / "ReplicaSource" /
+    // "ReplicaDestination", "Source" / "Destination"). `ChannelRecord` is an
+    // externally tagged enum, so exactly one of `Helper` / `Replica` is
+    // present. The public records on the dotnet side use native types and the
+    // bridge translates in `ChannelLoadImpl` / `ChannelSaveImpl`.
 
     private sealed record TransportDto(string uri, int protocol);
 
-    private sealed record ChannelDto(
-        ulong id,
+    private sealed record HelperChannelDto(
+        ulong channel_id,
         TransportDto transport,
         Dictionary<string, string>? communication_info,
+        string peer_role,
         string? status,
-        ulong created_at,
+        ulong created_at);
+
+    private sealed record ReplicaMemberDto(
+        ulong channel_id,
+        ulong replica_id,
+        TransportDto transport,
+        Dictionary<string, string>? communication_info,
         string role,
-        ulong? replica_id);
+        string? status,
+        ulong created_at);
+
+    private sealed record ChannelRecordDto(
+        HelperChannelDto? Helper,
+        ReplicaMemberDto? Replica);
 
     private sealed record SecretValueDto(uint kind, byte[] bytes);
 
@@ -1082,12 +1248,36 @@ public sealed class DeRecProtocol : IDisposable
         [property: JsonPropertyName("own_transport_protocol")] int OwnTransportProtocol,
         [property: JsonPropertyName("threshold")] uint Threshold,
         [property: JsonPropertyName("keep_versions_count")] uint KeepVersionsCount,
-        [property: JsonPropertyName("timeout_in_secs")] uint TimeoutInSecs,
         [property: JsonPropertyName("auto_respond_on_failure")] bool AutoRespondOnFailure,
         [property: JsonPropertyName("unpair_ack")] int UnpairAck,
         [property: JsonPropertyName("auto_reply_to")] bool AutoReplyTo,
         [property: JsonPropertyName("auto_accept")] AutoAcceptConfigDto AutoAccept,
+        [property: JsonPropertyName("timeouts")] TimeoutsConfigDto? Timeouts,
+        [property: JsonPropertyName("unsafe_http")] bool UnsafeHttp,
         [property: JsonPropertyName("replica_id")] string? ReplicaId);
+
+    // Field-for-field equivalent of Rust `RemoveExpiredChannelsConfig`.
+    // Both fields are always serialized, including when Enabled is false —
+    // the library decides that a disabled policy ignores its timeout.
+    // The whole object is omitted (not `null`) when the caller did not
+    // configure a policy, so Rust's `#[serde(default)]` supplies the
+    // default rather than this wrapper restating it.
+    private sealed record RemoveExpiredChannelsConfigDto(
+        [property: JsonPropertyName("enabled")] bool Enabled,
+        [property: JsonPropertyName("timeout_in_secs")] ulong TimeoutInSecs);
+
+    // Field-for-field equivalent of Rust `TimeoutsConfig`. Every field is
+    // omitted when null so Rust's `#[serde(default)]` supplies the default —
+    // the values live there, not in this wrapper.
+    private sealed record TimeoutsConfigDto(
+        [property: JsonPropertyName("inbound_message_secs")] ulong? InboundMessageSecs,
+        [property: JsonPropertyName("sharing_round_secs")] ulong? SharingRoundSecs,
+        [property: JsonPropertyName("unpair_ack_secs")] ulong? UnpairAckSecs,
+        [property: JsonPropertyName("expired_channels")] RemoveExpiredChannelsConfigDto? ExpiredChannels);
+
+    /// Whole seconds, or null when the caller left the value unset.
+    private static ulong? ToSecs(TimeSpan? span) =>
+        span is null ? null : (ulong)Math.Max(0, Math.Floor(span.Value.TotalSeconds));
 
     // Field-for-field equivalent of Rust `AutoAcceptConfig`.
     private sealed record AutoAcceptConfigDto(
@@ -1138,6 +1328,17 @@ public enum UnpairAck
 /// request-amplification oracle (anyone with the contact's nonce can
 /// elicit a key-publish). Keep off unless you control both ends of
 /// the transport.</item>
+/// <item><see cref="StoreShare"/> is the helper's only admission-control
+/// point for inbound shares. The protocol enforces no size, quota or
+/// rate limit of its own, and <c>maxShareSize</c> is checked for range
+/// overlap at pairing time only, never against an actual share. While
+/// this is <c>false</c>, the <see cref="ActionRequiredEvent"/> carries
+/// the decoded request, so the application can inspect the share and
+/// call <see cref="DeRecProtocol.RejectAsync"/> with
+/// <c>StatusEnum.SizeLimitExceeded</c>. Setting it <c>true</c> removes
+/// that opportunity entirely: every share from every paired Owner is
+/// stored unconditionally, at whatever size it arrives. Keep off in any
+/// deployment with per-user storage limits.</item>
 /// <item><see cref="Unpair"/> is destructive — accepting deletes the
 /// local channel record before any UI confirmation.</item>
 /// <item><see cref="UpdateChannelInfo"/> silently overwrites the
@@ -1146,6 +1347,71 @@ public enum UnpairAck
 /// </list>
 /// </para>
 /// </summary>
+/// <summary>
+/// Automatic removal of expired <c>Pending</c> channels during
+/// <see cref="DeRecProtocol.ProcessAsync"/>.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Pass <c>null</c> (the default) to leave the library's own default in
+/// force. Both properties are always sent to the library, including when
+/// <see cref="Enabled"/> is <c>false</c> — the library decides that a
+/// disabled policy ignores its timeout.
+/// </para>
+/// <para>
+/// <c>Pending</c> covers both an in-flight pairing handshake and a
+/// replica channel awaiting out-of-band fingerprint verification, and one
+/// timeout governs both. Fingerprint verification is paced by a human, so
+/// deployments that pair replicas should raise
+/// <see cref="TimeoutInSecs"/> or set <see cref="Enabled"/> to
+/// <c>false</c> and call
+/// <see cref="DeRecProtocol.RemoveExpiredChannelsAsync"/> on their own
+/// schedule.
+/// </para>
+/// </remarks>
+public sealed record RemoveExpiredChannelsPolicy(bool Enabled, ulong TimeoutInSecs);
+
+/// <summary>
+/// How long the protocol waits on each thing that can keep it waiting. A
+/// <c>null</c> property means "use the library default"; the defaults live in
+/// the Rust library, not here.
+/// </summary>
+/// <remarks>
+/// <para>
+/// These were one setting until it became clear they answer different
+/// questions. <see cref="InboundMessage"/> is a <b>security</b> boundary — it
+/// bounds how stale a message may be and still be accepted, so it must
+/// tolerate transport latency and clock skew. The other three are
+/// <b>liveness</b> budgets: how long to keep hoping a peer will answer.
+/// </para>
+/// </remarks>
+/// <param name="InboundMessage">
+/// Staleness boundary for inbound envelopes — the replay-defence window. Any
+/// message older than this is discarded on receipt, whatever the flow.
+/// Lowering it starts refusing legitimately old messages from slow transports
+/// or skewed clocks. Library default: 300s.
+/// </param>
+/// <param name="SharingRound">
+/// How long a publishing round waits on a peer that has not answered. This
+/// bounds how long <c>SharingCompleteEvent</c> can be delayed by one
+/// unreachable peer. Library default: 60s.
+/// </param>
+/// <param name="UnpairAck">
+/// How long to wait for an unpair acknowledgement before dropping local
+/// channel state anyway. Library default: 60s.
+/// </param>
+/// <param name="ExpiredChannels">
+/// Removal of channels still awaiting out-of-band fingerprint confirmation.
+/// Unlike the others this can be disabled. The budget is a <b>human</b> one —
+/// someone comparing a fingerprint, possibly over the phone. Library default:
+/// enabled at 300s.
+/// </param>
+public sealed record Timeouts(
+    TimeSpan? InboundMessage = null,
+    TimeSpan? SharingRound = null,
+    TimeSpan? UnpairAck = null,
+    RemoveExpiredChannelsPolicy? ExpiredChannels = null);
+
 public sealed class AutoAcceptPolicy
 {
     public bool Pairing { get; set; } = false;

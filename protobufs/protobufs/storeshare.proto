@@ -156,33 +156,36 @@ message StoreShareRequestMessage {
   //  endpoint and leaves the stored endpoint unchanged.
   optional TransportProtocol replyTo = 8;
 
-  // Stable per-device identifier of the replica that produced this share.
+  // Identity of the replica that authored this update.
   //
-  // # Why this field exists
+  // # Audience
   //
-  // Replica destinations reuse the source's shared keys with helpers (the
-  // keys travel inside the `ReplicaSecretPayload`). Two distinct
-  // replicas writing the same `(secretId, channelId, version)` from the
-  // helper's perspective look cryptographically identical — same envelope
-  // key, same channel id. Without this field the helper's `ShareStore`
-  // would coalesce the writes and silently drop one of the two shares.
+  // This field is for **replicas only**. Helpers know nothing about
+  // replicas and never receive it:
   //
-  // # Semantics
+  // - helper-bound (`SHARE_ALGORITHM_VSS`) — MUST be absent.
+  // - replica-bound (`SHARE_ALGORITHM_REPLICA_SECRET`) — MUST be present.
   //
-  // - Absent (default): the writer is a non-replica `Owner` (no
-  //  `replica_id` configured at the builder).
-  // - Present: the writer is `ReplicaSource` and is announcing its
-  //  identity. The helper treats `replica_id` as part of the storage
-  //  key so distinct replicas writing the same version coexist.
+  // The invariant is `replicaId.is_some() == (shareAlgorithm ==
+  // SHARE_ALGORITHM_REPLICA_SECRET)`, asserted on send and on receive; a
+  // violation is a protocol error, not a tolerated variation.
+  //
+  // # Why the receiver needs it
+  //
+  // Every member of a replica group shares one `channelId`, so the
+  // channel identifies the *group*, not the sender. The channel's
+  // counterparty says who established it, which after admission by a
+  // third member is not who wrote this message. Author attribution
+  // therefore comes from this field and never from the channel record.
+  //
+  // Applications use it to resolve which member published an update, and
+  // to route the response back to that member's endpoint.
   //
   // # Out of scope for the protocol
   //
   // The protocol does not authenticate the claim; anyone holding the
-  // channel's shared key may write any `replica_id`. The field is
-  // metadata the application uses to detect conflicts (e.g. two
-  // replicas independently bumped `version`). Conflict resolution is
-  // the application's responsibility — the protocol just surfaces what
-  // it knows.
+  // group key may write any `replicaId`. It is an identifier, not an
+  // authenticator.
   optional uint64 replicaId = 9;
 }
 
@@ -221,4 +224,20 @@ message StoreShareResponseMessage {
   //
   // Used for observability, replay detection, and timeout handling.
   google.protobuf.Timestamp timestamp = 4;
+
+  // Identity of the replica that produced this response.
+  //
+  // Present only when the corresponding request was replica-bound
+  // (`shareAlgorithm == SHARE_ALGORITHM_REPLICA_SECRET`); absent on
+  // helper responses, which carry no replica identity in either
+  // direction.
+  //
+  // # Why the requester needs it
+  //
+  // Every member of a replica group answers on the same `channelId`, and
+  // `secretId` and `version` are echoed identically by all of them. Two
+  // members responding to one publish are otherwise indistinguishable —
+  // the requester cannot tell whether both acknowledged or one
+  // acknowledged twice, and so cannot track a sharing round per member.
+  optional uint64 replicaId = 5;
 }

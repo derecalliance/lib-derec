@@ -6,10 +6,10 @@
 //! runtime and returns either a typed result or a JSON event array.
 
 use super::DeRecProtocolHandle;
-use crate::ffi::common::{empty_buffer, vec_into_buffer, DeRecBuffer};
+use crate::ffi::common::{DeRecBuffer, empty_buffer, vec_into_buffer};
 use crate::ffi::error::{
-    ffi_error, from_lib_error, success, DeRecError, DEREC_CODE_FFI_BAD_PROTO,
-    DEREC_CODE_FFI_BAD_UTF8, DEREC_CODE_FFI_INVALID_ENUM, DEREC_CODE_FFI_NULL_PTR,
+    DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_BAD_UTF8, DEREC_CODE_FFI_INVALID_ENUM,
+    DEREC_CODE_FFI_NULL_PTR, DeRecError, ffi_error, from_lib_error, success,
 };
 use crate::ffi::protocol::events::encode_events;
 use crate::ffi::protocol::flow as flow_params;
@@ -34,7 +34,11 @@ pub unsafe extern "C" fn derec_protocol_start(
         return ffi_error(DEREC_CODE_FFI_NULL_PTR, "handle is null").into();
     }
     if params_json_len > 0 && params_json_ptr.is_null() {
-        return ffi_error(DEREC_CODE_FFI_NULL_PTR, "params_json_ptr is null but len > 0").into();
+        return ffi_error(
+            DEREC_CODE_FFI_NULL_PTR,
+            "params_json_ptr is null but len > 0",
+        )
+        .into();
     }
     let params_bytes = if params_json_len == 0 {
         b""[..].to_vec()
@@ -120,6 +124,34 @@ pub unsafe extern "C" fn derec_protocol_process(
     }
 }
 
+/// Advance time-driven state without an inbound message. See
+/// [`crate::protocol::DeRecProtocol::tick`].
+///
+/// Intended for a scheduler — a timer, a cron job, a queue heartbeat —
+/// in deployments where nothing else would ever evaluate timeouts. Safe
+/// to call on an idle protocol: it returns an empty event array.
+///
+/// # Safety
+///
+/// `handle` must be a valid pointer returned by
+/// [`super::derec_protocol_new`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn derec_protocol_tick(
+    handle: *mut DeRecProtocolHandle,
+) -> DeRecProtocolEventsResult {
+    if handle.is_null() {
+        return ffi_error(DEREC_CODE_FFI_NULL_PTR, "handle is null").into();
+    }
+
+    let h = unsafe { &*handle };
+    let mut inner = h.lock_inner();
+    let events = h.runtime.block_on(inner.tick());
+    DeRecProtocolEventsResult {
+        error: success(),
+        events_json: vec_into_buffer(encode_events(events)),
+    }
+}
+
 /// Accept a pending action from an `ActionRequired` event. See
 /// [`crate::protocol::DeRecProtocol::accept`]. The `action_bytes` blob
 /// is the exact payload the caller received in the event — the FFI
@@ -197,7 +229,10 @@ pub unsafe extern "C" fn derec_protocol_reject(
     let action = match crate::protocol::utils::pending_action_wire::deserialize(bytes) {
         Ok(a) => a,
         Err(e) => {
-            return ffi_error(DEREC_CODE_FFI_BAD_PROTO, format!("PendingAction decode: {e}"));
+            return ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                format!("PendingAction decode: {e}"),
+            );
         }
     };
     let memo = if memo_len == 0 {
@@ -244,19 +279,25 @@ pub unsafe extern "C" fn derec_protocol_reject(
 ///                   "shared_key": [..32 bytes..],
 ///                   "communication_info": {} }],
 ///     "secrets": [{ "id": [..], "name": "...", "data": [..] }],
-///     "replicas": [{ "channel_id": "21", "transport_uri": "...",
-///                    "replica_id": "0xCAFE", "sender_kind": 3,
-///                    "communication_info": {} }],
-///     "owner_replica_id": "48879",
-///     "replica_group_shared_key": [..32 bytes..]
+///     "replicas": {
+///       "channel_id": "21",
+///       "members": [{ "replica_id": "51966", "transport_uri": "...",
+///                     "role": "Source", "communication_info": {} }],
+///       "shared_key": [..32 bytes..]
+///     }
 ///   }
 /// }
 /// ```
 ///
 /// Field names mirror `SecretWire` in `protocol/events/wire.rs` — the
-/// same shape `SecretRecovered` carries. `channel_id`, `replica_id`,
-/// and `owner_replica_id` are decimal `u64` strings (empty / absent
-/// means zero).
+/// same shape `SecretRecovered` carries. `channel_id` and `replica_id`
+/// are decimal `u64` strings (empty / absent means zero).
+///
+/// `replicas` is an **object**, not an array, and is omitted entirely when
+/// the `secret_id` has no replica group. Every member of the group shares
+/// the one `channel_id` and the one `shared_key` it carries, so neither is
+/// repeated per member; a member is identified by `replica_id` alone, and
+/// the group's source is the member whose `role` is `"Source"`.
 ///
 /// # Safety
 ///
@@ -331,14 +372,14 @@ struct SecretJsonIn {
     secrets: Vec<UserSecretJsonIn>,
     #[serde(default)]
     replicas: Option<ReplicasJsonIn>,
-    #[serde(default)]
-    owner_replica_id: String,
 }
 
 #[derive(serde::Deserialize)]
 struct ReplicasJsonIn {
     #[serde(default)]
-    replicas: Vec<ReplicaJsonIn>,
+    channel_id: String,
+    #[serde(default)]
+    members: Vec<ReplicaJsonIn>,
     #[serde(default)]
     shared_key: Vec<u8>,
 }
@@ -354,12 +395,12 @@ struct HelperJsonIn {
 
 #[derive(serde::Deserialize)]
 struct ReplicaJsonIn {
-    channel_id: String,
+    replica_id: String,
     transport_uri: String,
+    /// `"Source"` or `"Destination"`.
+    role: String,
     #[serde(default)]
     communication_info: std::collections::HashMap<String, String>,
-    replica_id: String,
-    sender_kind: i32,
 }
 
 #[derive(serde::Deserialize)]
@@ -395,21 +436,30 @@ impl SecretJsonIn {
         let replicas = self
             .replicas
             .map(|g| -> Result<_, String> {
-                let replicas = g
-                    .replicas
+                let members = g
+                    .members
                     .into_iter()
                     .map(|r| -> Result<_, String> {
+                        let role = match r.role.as_str() {
+                            "Source" => crate::protocol::types::ReplicaRole::Source,
+                            "Destination" => crate::protocol::types::ReplicaRole::Destination,
+                            other => {
+                                return Err(format!(
+                                    "replica.role must be \"Source\" or \"Destination\", got {other:?}"
+                                ));
+                            }
+                        };
                         Ok(crate::protocol::types::ReplicaInfo {
-                            channel_id: parse_u64(&r.channel_id, "replica.channel_id")?,
-                            transport_uri: r.transport_uri,
-                            communication_info: r.communication_info,
                             replica_id: parse_u64(&r.replica_id, "replica.replica_id")?,
-                            sender_kind: r.sender_kind,
+                            transport_uri: r.transport_uri,
+                            role: role as i32,
+                            communication_info: r.communication_info,
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(crate::protocol::types::Replicas {
-                    replicas,
+                    channel_id: parse_u64(&g.channel_id, "replicas.channel_id")?,
+                    members,
                     shared_key: g.shared_key,
                 })
             })
@@ -429,7 +479,6 @@ impl SecretJsonIn {
             helpers,
             secrets,
             replicas,
-            owner_replica_id: parse_u64(&self.owner_replica_id, "owner_replica_id")?,
         })
     }
 }

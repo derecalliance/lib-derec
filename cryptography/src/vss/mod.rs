@@ -167,8 +167,7 @@ pub fn share(
         MERKLE_TREE_DEPTH,
         &mut rand_chacha::ChaCha8Rng::from_seed(seed2),
     );
-    let merkle_proofs =
-        utils::extract_merkle_proofs(&merkle_tree, MERKLE_TREE_DEPTH, total_shares);
+    let merkle_proofs = utils::extract_merkle_proofs(&merkle_tree, MERKLE_TREE_DEPTH, total_shares);
 
     let mut output = vec![];
     for (i, (x, y)) in shamir_shares.iter().enumerate() {

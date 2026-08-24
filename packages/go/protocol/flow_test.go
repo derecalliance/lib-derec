@@ -278,7 +278,6 @@ func fixtureRestoreSecret(helperChannelID uint64) Secret {
 		Secrets: []UserSecret{
 			{ID: []byte{0x01}, Name: "wallet", Data: []byte("correct horse battery staple")},
 		},
-		OwnerReplicaID: "",
 	}
 }
 

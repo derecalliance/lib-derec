@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-use std::collections::HashMap;
-
 use derec_library::protocol::{DeRecEvent, DeRecProtocol, DeRecProtocolBuilder};
 use derec_proto::TransportProtocol;
 
 use crate::db::SharedConnection;
 use crate::stores::{
-    SqliteChannelStore, SqliteSecretStore, SqliteShareStore, SqliteUserSecretStore,
+    SqliteChannelStore, SqliteSecretStore, SqliteShareStore, SqliteStateStore,
+    SqliteUserSecretStore,
 };
 use crate::transport::InProcessTransport;
 
@@ -19,58 +18,9 @@ pub type SqliteProtocol = DeRecProtocol<
     SqliteShareStore,
     SqliteSecretStore,
     SqliteUserSecretStore,
-    SqliteInMemoryStateStore,
+    SqliteStateStore,
     InProcessTransport,
 >;
-
-/// In-memory state store used by the sqlite smoke test until the
-/// real sqlite-backed implementation ships. Each row is keyed by
-/// `(secret_id, StateKey)` and holds the full `StateItem` payload.
-#[derive(Default, Clone)]
-pub struct SqliteInMemoryStateStore {
-    data: HashMap<(u64, derec_library::protocol::StateKey), derec_library::protocol::StateItem>,
-}
-impl derec_library::protocol::DeRecStateStore for SqliteInMemoryStateStore {
-    fn save(
-        &mut self,
-        secret_id: u64,
-        item: derec_library::protocol::StateItem,
-    ) -> derec_library::protocol::StateStoreFuture<'_, ()> {
-        self.data.insert((secret_id, item.key()), item);
-        Box::pin(std::future::ready(Ok(())))
-    }
-    fn load(
-        &self,
-        secret_id: u64,
-        key: derec_library::protocol::StateKey,
-    ) -> derec_library::protocol::StateStoreFuture<'_, Option<derec_library::protocol::StateItem>>
-    {
-        let result = self.data.get(&(secret_id, key)).cloned();
-        Box::pin(std::future::ready(Ok(result)))
-    }
-    fn remove(
-        &mut self,
-        secret_id: u64,
-        key: derec_library::protocol::StateKey,
-    ) -> derec_library::protocol::StateStoreFuture<'_, bool> {
-        let removed = self.data.remove(&(secret_id, key)).is_some();
-        Box::pin(std::future::ready(Ok(removed)))
-    }
-    fn load_all(
-        &self,
-        secret_id: u64,
-        kind: derec_library::protocol::StateKind,
-    ) -> derec_library::protocol::StateStoreFuture<'_, Vec<derec_library::protocol::StateItem>>
-    {
-        let entries: Vec<derec_library::protocol::StateItem> = self
-            .data
-            .iter()
-            .filter(|((s, k), _)| *s == secret_id && k.kind() == kind)
-            .map(|(_, item)| item.clone())
-            .collect();
-        Box::pin(std::future::ready(Ok(entries)))
-    }
-}
 
 pub struct Peer {
     pub label: &'static str,
@@ -155,7 +105,8 @@ impl Peer {
         let channel_store = SqliteChannelStore::new(connection.clone());
         let share_store = SqliteShareStore::new(connection.clone());
         let secret_store = SqliteSecretStore::new(connection.clone());
-        let user_secret_store = SqliteUserSecretStore::new(connection);
+        let user_secret_store = SqliteUserSecretStore::new(connection.clone());
+        let state_store = SqliteStateStore::new(connection);
 
         let mut builder = DeRecProtocolBuilder::new(options.secret_id)
             .with_channel_store(channel_store)
@@ -163,7 +114,7 @@ impl Peer {
             .with_secret_store(secret_store)
             .with_user_secret_store(user_secret_store)
             .with_transport(transport.clone())
-            .with_state_store(SqliteInMemoryStateStore::default())
+            .with_state_store(state_store)
             .with_own_transport(uri)
             .with_threshold(options.threshold)
             .with_auto_accept(auto_accept);
@@ -239,10 +190,7 @@ pub async fn pump_many(peers: &mut [&mut Peer]) -> Vec<DeRecEvent> {
                             .map(|p| p.uri.as_str())
                             .collect::<Vec<_>>()
                             .join(", ");
-                        panic!(
-                            "no peer for destination uri {} (have {known})",
-                            tp.uri
-                        )
+                        panic!("no peer for destination uri {} (have {known})", tp.uri)
                     });
                 pending.push((dest, bytes));
             }

@@ -11,14 +11,12 @@
 use serde::Serialize;
 use wasm_bindgen::JsValue;
 
-use crate::protocol::{events::wire, DeRecEvent};
+use crate::protocol::{DeRecEvent, events::wire};
 use crate::wasm::ts_bindings_utils::js_error;
 
 pub fn event_to_js(event: DeRecEvent) -> Result<JsValue, JsValue> {
-    let mirror = wire::Event::from_event(event)
-        .map_err(|e| js_error("WASM_SERIALIZE_ERROR", e))?;
-    let serializer =
-        serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    let mirror = wire::Event::from_event(event).map_err(|e| js_error("WASM_SERIALIZE_ERROR", e))?;
+    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
     mirror
         .serialize(&serializer)
         .map_err(|e| js_error("WASM_SERIALIZE_ERROR", e.to_string()))
