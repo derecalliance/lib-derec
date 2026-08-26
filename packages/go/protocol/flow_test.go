@@ -15,7 +15,7 @@ import (
 )
 
 // TestTarget_MarshalJSON covers the three wire shapes parse_target in
-// library/src/ffi/protocol/flow.rs expects, including the edge case where
+// library/src/interop/ffi/protocol/flow.rs expects, including the edge case where
 // TargetMany is called with zero ids — that must stay distinct from
 // TargetAll (null) since Rust resolves an empty array to zero channels,
 // not "every channel".

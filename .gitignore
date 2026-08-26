@@ -32,3 +32,12 @@ runtimes/
 # library/target/pkg-*, but a bare `wasm-pack build` drops this here and it is
 # never an input to anything.
 /library/pkg/
+
+# React Native native artifacts and compiled output, all produced by
+# scripts/prepare-react-native-package.sh.
+/packages/react-native/ios/DeRecFFI.xcframework/
+/packages/react-native/android/src/main/jniLibs/
+/packages/react-native/android/.cxx/
+/packages/react-native/android/build/
+/packages/react-native/lib/
+/packages/react-native/dist/

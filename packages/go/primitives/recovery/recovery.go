@@ -100,7 +100,7 @@ func (responseAPI) Recover(responses []ShareResponse, secretID uint64, version u
 }
 
 // encodeResponsesSet packs decrypted GetShareResponseMessage proto bytes into
-// the responses binary format documented at library/src/ffi/recovery.rs:
+// the responses binary format documented at library/src/interop/ffi/recovery.rs:
 //
 //	[count: u32 LE]
 //	for each entry:

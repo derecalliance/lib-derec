@@ -13,7 +13,7 @@ namespace DeRec.Library.Orchestrator;
 /// <summary>
 /// Numeric flow-kind discriminator passed to
 /// <see cref="DeRecProtocol.StartAsync"/>. Values MUST match the
-/// Rust-side constants in <c>library/src/ffi/protocol/flow.rs</c>.
+/// Rust-side constants in <c>library/src/interop/ffi/protocol/flow.rs</c>.
 /// </summary>
 public enum FlowKind : uint
 {

@@ -577,7 +577,7 @@ func TestDecodeEvents_UpdateChannelInfoFailed(t *testing.T) {
 
 // TestDecodeEvents_Array proves the top-level shape: a JSON array of mixed
 // event objects (as encode_events actually emits — see
-// library/src/ffi/protocol/events.rs) decodes into a slice preserving
+// library/src/interop/ffi/protocol/events.rs) decodes into a slice preserving
 // order, without any per-event cross-talk.
 func TestDecodeEvents_Array(t *testing.T) {
 	raw := `[

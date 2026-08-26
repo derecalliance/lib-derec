@@ -10,7 +10,7 @@ import (
 )
 
 // --- Channel records: JSON rides serde directly on the Rust side (see
-// library/src/ffi/protocol/stores.rs doc comment), so EncodeChannelRecord's
+// library/src/interop/ffi/protocol/stores.rs doc comment), so EncodeChannelRecord's
 // output must match ChannelRecord's derived Serialize shape byte-for-byte:
 // externally tagged enum ("Helper" / "Replica" wrapper key), bare-number ids
 // (ChannelId and ReplicaId are #[serde(transparent)]), nested transport

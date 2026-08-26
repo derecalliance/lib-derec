@@ -1237,7 +1237,7 @@ public sealed class DeRecProtocol : IDisposable
 
     // Wire shape for `derec_protocol_new`'s `config_json` argument.
     // Field names match Rust `ProtocolConfig` exactly (see
-    // library/src/ffi/protocol/handle/mod.rs). `SecretId`/`ReplicaId` are
+    // library/src/interop/ffi/protocol/handle/mod.rs). `SecretId`/`ReplicaId` are
     // decimal strings, not JSON numbers, so u64 values above 2^53 survive
     // the round trip through System.Text.Json without precision loss.
     // `ReplicaId` is omitted entirely (not `null`) when there is no

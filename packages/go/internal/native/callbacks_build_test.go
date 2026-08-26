@@ -15,7 +15,7 @@ import (
 // buildCallbacks wires every field of every *Callbacks struct to a
 // non-zero UserData (the storeHandle) and a non-zero fn-pointer address
 // (the purego.NewCallback result), matching every field
-// library/src/ffi/protocol/stores.rs declares.
+// library/src/interop/ffi/protocol/stores.rs declares.
 func TestBuildCallbacks_PopulatesAllSixStructs(t *testing.T) {
 	s := &storeSet{
 		channel:    &mockChannelStore{},

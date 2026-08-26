@@ -97,7 +97,7 @@ func u32Ptr(s []uint32) *uint32 {
 
 // ProtectSecret splits secretData across channelIDs at the given threshold,
 // returning the committed shares in the wire format documented at
-// library/src/ffi/sharing.rs: a length-prefixed sequence of (channel_id,
+// library/src/interop/ffi/sharing.rs: a length-prefixed sequence of (channel_id,
 // serialized CommittedDeRecShare) entries sorted by channel id.
 func ProtectSecret(secretID uint64, secretData []byte, channelIDs []uint64, threshold uintptr, version uint32) ([]byte, error) {
 	protectSecretOnce.Do(func() {

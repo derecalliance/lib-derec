@@ -19,7 +19,7 @@ type transportSender interface {
 }
 
 // TransportCallbacks mirrors #[repr(C)] struct TransportCallbacks in
-// library/src/ffi/protocol/stores.rs field-for-field. Unlike the five
+// library/src/interop/ffi/protocol/stores.rs field-for-field. Unlike the five
 // store callbacks, there is no FreeBuffer field — send has no out buffer.
 type TransportCallbacks struct {
 	UserData uintptr

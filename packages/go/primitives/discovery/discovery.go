@@ -95,7 +95,7 @@ func (responseAPI) Process(responseProto []byte) ([]SecretVersionEntry, error) {
 }
 
 // encodeSecretList packs entries into the secret-list binary format
-// documented at library/src/ffi/discovery.rs:
+// documented at library/src/interop/ffi/discovery.rs:
 //
 //	[count: u32 LE]
 //	for each entry:
@@ -124,7 +124,7 @@ func encodeSecretList(entries []SecretVersionEntry) []byte {
 }
 
 // decodeSecretList unpacks the secret-list binary format documented at
-// library/src/ffi/discovery.rs; see encodeSecretList for the layout.
+// library/src/interop/ffi/discovery.rs; see encodeSecretList for the layout.
 func decodeSecretList(wire []byte) ([]SecretVersionEntry, error) {
 	if len(wire) < 4 {
 		return nil, fmt.Errorf("discovery: secret list wire bytes too short for count: got %d bytes", len(wire))

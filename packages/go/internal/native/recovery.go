@@ -128,7 +128,7 @@ func ExtractGetShareResponse(response, sharedKey []byte) (uint64, []byte, error)
 // RecoverFromShareResponses reconstructs the secret stored under
 // (secretID, version) from responsesWire, a length-prefixed sequence of
 // decrypted GetShareResponseMessage proto bytes matching the format
-// documented at library/src/ffi/recovery.rs:
+// documented at library/src/interop/ffi/recovery.rs:
 //
 //	[count: u32 LE]
 //	for each entry:

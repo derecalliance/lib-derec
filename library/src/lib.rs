@@ -86,10 +86,6 @@ pub fn generate_replica_id() -> u64 {
     rand::random()
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "ffi"))]
-mod ffi;
-
-#[cfg(target_arch = "wasm32")]
-pub mod wasm;
+pub mod interop;
 
 pub type Result<T> = std::result::Result<T, Error>;

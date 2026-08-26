@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Required for autolinking, not for its contents.
+
+  React Native's Android autolinking treats a dependency as having no Android
+  platform unless this file exists: without it `platforms.android` resolves to
+  null, `packageImportPath` is never computed, and `DeRecPackage` is silently
+  left out of the generated `PackageList` — the module is simply absent at run
+  time, with no build error. The package name comes from `namespace` in
+  build.gradle, so nothing else belongs here.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" />

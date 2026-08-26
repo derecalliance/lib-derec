@@ -411,6 +411,112 @@ go get github.com/derecalliance/lib-derec/packages/go@vX.Y.Z
 
 ---
 
+## Publishing React Native SDK
+
+### Prerequisites
+
+Building the React Native package requires macOS, since the iOS
+`XCFramework` cannot be cross-built from Linux:
+
+| Tool | Purpose |
+|-----|-----|
+| Rust | Build the native library |
+| rustup | Manage Rust targets |
+| Xcode | Build the iOS static libraries and assemble the XCFramework |
+| Android NDK | Cross-compile the Android static libraries |
+| cbindgen | Regenerate the C header consumed by the JSI native module |
+| Node.js | Compile the TypeScript sources and stage `package.json` |
+
+Install the Rust targets used by the build:
+
+```bash
+rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+```
+
+Set `ANDROID_NDK_HOME` to an installed NDK before building:
+
+```bash
+export ANDROID_NDK_HOME=/path/to/Android/sdk/ndk/<version>
+```
+
+### Build the React Native package
+
+```bash
+cd library
+make react-native
+```
+
+`make react-native` runs `scripts/prepare-react-native-package.sh`, which:
+
+1. Regenerates `packages/react-native/cpp/derec_ffi.h` with cbindgen.
+2. Builds the Rust static library for the iOS device and simulator targets,
+   combines the simulator slices with `lipo`, and assembles
+   `packages/react-native/ios/DeRecFFI.xcframework` with `xcodebuild`.
+3. Builds the Rust static library for each Android ABI and stages it into
+   `packages/react-native/android/src/main/jniLibs/<abi>/`.
+4. Compiles the package's TypeScript sources into `lib/`.
+5. Writes `package.json` from `package.override.json` plus the resolved
+   version, and copies in `LICENSE`.
+
+This must run on macOS with Xcode installed and `ANDROID_NDK_HOME` set — the
+XCFramework step has no Linux or cross-compilation equivalent.
+
+> [!IMPORTANT]
+> Step 5 overwrites the tracked `packages/react-native/package.json`. Unlike
+> the other packages, this one keeps a development manifest in git, because
+> its in-tree Jest suite needs `devDependencies` and `scripts` and the
+> lockfile is resolved against them — neither of which belongs in a published
+> tarball. Restore it once publishing is done:
+>
+> ```bash
+> git checkout packages/react-native/package.json
+> ```
+
+### Review the package before publishing
+
+```bash
+cd packages/react-native
+npm pack --dry-run
+```
+
+Verify the file list matches `package.override.json`'s `files` array and
+that the `ios/DeRecFFI.xcframework` and `android/src/main/jniLibs/*` native
+artifacts staged by the build are present.
+
+### Publish the package to npm
+
+```bash
+npm publish --access public
+```
+
+> [!INFO]
+> The --access public flag is required for scoped packages such as
+> @derec-alliance/react-native.
+
+### Verify the release
+
+After publishing, confirm the new version is available:
+* https://www.npmjs.com/package/@derec-alliance/react-native
+
+You can also verify using:
+
+```bash
+npm view @derec-alliance/react-native
+```
+
+Or install it in a test Expo dev-build project:
+
+```bash
+npx expo install @derec-alliance/react-native
+npx expo run:ios   # or: npx expo run:android
+```
+
+`@derec-alliance/react-native` ships custom native code and cannot run in
+Expo Go — a dev build (or a plain React Native build) is required.
+
+---
+
 ## Release Checklist
 
 Before publishing a release:

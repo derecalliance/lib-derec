@@ -230,14 +230,6 @@ func New(
 		return nil, errors.New("protocol: New: transport is required")
 	}
 
-	threshold := config.Threshold
-	if threshold == 0 {
-		threshold = 3
-	}
-	keepVersionsCount := config.KeepVersionsCount
-	if keepVersionsCount == 0 {
-		keepVersionsCount = 3
-	}
 	// Timeouts are forwarded verbatim; an unset field is omitted so the
 	// library applies its own default rather than this wrapper choosing one.
 	var nativeTimeouts *native.TimeoutsConfig
@@ -271,8 +263,8 @@ func New(
 		SecretID:             config.SecretID,
 		OwnTransportURI:      config.OwnTransportURI,
 		OwnTransportProtocol: config.OwnTransportProtocol,
-		Threshold:            threshold,
-		KeepVersionsCount:    keepVersionsCount,
+		Threshold:            config.Threshold,
+		KeepVersionsCount:    config.KeepVersionsCount,
 		CommunicationInfo:    commInfo,
 		Timeouts:             nativeTimeouts,
 		UnsafeHTTP:           config.UnsafeHTTP,

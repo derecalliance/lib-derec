@@ -13,7 +13,7 @@ import (
 )
 
 // DeRecProtocolNewResult mirrors #[repr(C)] struct DeRecProtocolNewResult
-// in library/src/ffi/protocol/handle/mod.rs: the standard DeRecError
+// in library/src/interop/ffi/protocol/handle/mod.rs: the standard DeRecError
 // envelope plus the opaque protocol handle (null on error).
 type DeRecProtocolNewResult struct {
 	Error  DeRecError
@@ -22,7 +22,7 @@ type DeRecProtocolNewResult struct {
 
 // DeRecProtocolFingerprintResult mirrors #[repr(C)] struct
 // DeRecProtocolFingerprintResult in
-// library/src/ffi/protocol/handle/pairing.rs: the standard DeRecError
+// library/src/interop/ffi/protocol/handle/pairing.rs: the standard DeRecError
 // envelope plus an owned C string (null on error), released via
 // stringFromCString.
 type DeRecProtocolFingerprintResult struct {
@@ -31,7 +31,7 @@ type DeRecProtocolFingerprintResult struct {
 }
 
 // DeRecProtocolEventsResult mirrors #[repr(C)] struct
-// DeRecProtocolEventsResult in library/src/ffi/protocol/handle/flow.rs: the
+// DeRecProtocolEventsResult in library/src/interop/ffi/protocol/handle/flow.rs: the
 // standard DeRecError envelope plus a UTF-8 JSON array of events, released
 // via bytesFromBuffer.
 type DeRecProtocolEventsResult struct {
@@ -41,7 +41,7 @@ type DeRecProtocolEventsResult struct {
 
 // DeRecProtocolCreateContactResult mirrors #[repr(C)] struct
 // DeRecProtocolCreateContactResult in
-// library/src/ffi/protocol/handle/pairing.rs: the standard DeRecError
+// library/src/interop/ffi/protocol/handle/pairing.rs: the standard DeRecError
 // envelope plus the prost-encoded ContactMessage bytes, released via
 // bytesFromBuffer.
 type DeRecProtocolCreateContactResult struct {
@@ -51,7 +51,7 @@ type DeRecProtocolCreateContactResult struct {
 
 // DeRecRemovedChannelsResult mirrors #[repr(C)] struct
 // DeRecRemovedChannelsResult in
-// library/src/ffi/protocol/handle/config.rs: the standard DeRecError
+// library/src/interop/ffi/protocol/handle/config.rs: the standard DeRecError
 // envelope plus a UTF-8 JSON array of removed channel ids as decimal
 // strings, released via bytesFromBuffer.
 type DeRecRemovedChannelsResult struct {
@@ -61,7 +61,7 @@ type DeRecRemovedChannelsResult struct {
 
 // AutoAcceptPolicy is the per-flow auto-accept toggle set carried by the
 // JSON config's "auto_accept" object, field for field matching
-// AutoAcceptConfig in library/src/ffi/protocol/handle/mod.rs (booleans,
+// AutoAcceptConfig in library/src/interop/ffi/protocol/handle/mod.rs (booleans,
 // since JSON has a native boolean type).
 type AutoAcceptPolicy struct {
 	Pairing           bool `json:"pairing"`
@@ -77,7 +77,7 @@ type AutoAcceptPolicy struct {
 // RemoveExpiredChannelsPolicy is the automatic expired-channel cleanup
 // setting carried by the JSON config's "remove_expired_channels" object,
 // field for field matching RemoveExpiredChannelsConfig in
-// library/src/ffi/protocol/handle/mod.rs.
+// library/src/interop/ffi/protocol/handle/mod.rs.
 //
 // Both fields are always marshalled, including when Enabled is false. The
 // library decides that a disabled policy ignores its timeout — see
@@ -88,7 +88,7 @@ type RemoveExpiredChannelsPolicy struct {
 }
 
 // TimeoutsConfig is the JSON config's "timeouts" object, field for field
-// matching TimeoutsConfig in library/src/ffi/protocol/handle/mod.rs.
+// matching TimeoutsConfig in library/src/interop/ffi/protocol/handle/mod.rs.
 //
 // Every field is optional and omitted when nil: absent means "use the library
 // default". The defaults live in the Rust Timeouts type, so a value omitted
@@ -135,29 +135,38 @@ type ProtocolConfig struct {
 	// ReplicaID configures this node's local replica_id. nil leaves it
 	// unset (omitted from the JSON config, matching the "absent or null
 	// means no replica id" convention documented on ProtocolConfig in
-	// library/src/ffi/protocol/handle/mod.rs).
+	// library/src/interop/ffi/protocol/handle/mod.rs).
 	ReplicaID *uint64
 }
 
 // protocolConfigJSON is the JSON shape derec_protocol_new expects,
 // field-for-field matching ProtocolConfig in
-// library/src/ffi/protocol/handle/mod.rs. secret_id/replica_id are decimal
+// library/src/interop/ffi/protocol/handle/mod.rs. secret_id/replica_id are decimal
 // strings rather than JSON numbers: u64 values above 2^53 lose precision
 // once round-tripped through JSON's float64-backed number type in common
 // encoders, including Go's encoding/json.
+//
+// Threshold, KeepVersionsCount, AutoRespondOnFailure, UnpairAck,
+// AutoReplyTo and AutoAccept are all omitempty: the Rust struct now
+// carries a `#[serde(default = ...)]` for each of them, reading the same
+// constants DeRecProtocolBuilder::new does, so omitting a zero-valued
+// field here lets the library's default apply instead of this shim
+// inventing one. AutoAccept is a pointer for that reason — a non-pointer
+// struct is never "empty" under encoding/json's omitempty rules, so it
+// would never be omitted otherwise.
 type protocolConfigJSON struct {
-	SecretID             string           `json:"secret_id"`
-	OwnTransportURI      string           `json:"own_transport_uri"`
-	OwnTransportProtocol int32            `json:"own_transport_protocol"`
-	Threshold            uint32           `json:"threshold"`
-	KeepVersionsCount    uint32           `json:"keep_versions_count"`
-	AutoRespondOnFailure bool             `json:"auto_respond_on_failure"`
-	UnpairAck            int32            `json:"unpair_ack"`
-	AutoReplyTo          bool             `json:"auto_reply_to"`
-	AutoAccept           AutoAcceptPolicy `json:"auto_accept"`
-	Timeouts             *TimeoutsConfig  `json:"timeouts,omitempty"`
-	UnsafeHTTP           bool             `json:"unsafe_http"`
-	ReplicaID            *string          `json:"replica_id,omitempty"`
+	SecretID             string            `json:"secret_id"`
+	OwnTransportURI      string            `json:"own_transport_uri"`
+	OwnTransportProtocol int32             `json:"own_transport_protocol"`
+	Threshold            uint32            `json:"threshold,omitempty"`
+	KeepVersionsCount    uint32            `json:"keep_versions_count,omitempty"`
+	AutoRespondOnFailure bool              `json:"auto_respond_on_failure,omitempty"`
+	UnpairAck            int32             `json:"unpair_ack,omitempty"`
+	AutoReplyTo          bool              `json:"auto_reply_to,omitempty"`
+	AutoAccept           *AutoAcceptPolicy `json:"auto_accept,omitempty"`
+	Timeouts             *TimeoutsConfig   `json:"timeouts,omitempty"`
+	UnsafeHTTP           bool              `json:"unsafe_http"`
+	ReplicaID            *string           `json:"replica_id,omitempty"`
 }
 
 var (
@@ -267,10 +276,17 @@ func protocolNew(cfg ProtocolConfig, cb *builtCallbacks) (uintptr, error) {
 		AutoRespondOnFailure: cfg.AutoRespondOnFailure,
 		UnpairAck:            cfg.UnpairAck,
 		AutoReplyTo:          cfg.AutoReplyTo,
-		AutoAccept:           cfg.AutoAccept,
 
 		Timeouts:   cfg.Timeouts,
 		UnsafeHTTP: cfg.UnsafeHTTP,
+	}
+	// The zero value of AutoAcceptPolicy (every flow false) is
+	// indistinguishable from "the caller never set it" — and is also
+	// exactly crate::protocol::AutoAcceptPolicy's own default, so
+	// omitting the key in that case changes nothing observable.
+	if cfg.AutoAccept != (AutoAcceptPolicy{}) {
+		autoAccept := cfg.AutoAccept
+		cfgJSON.AutoAccept = &autoAccept
 	}
 	if cfg.ReplicaID != nil {
 		id := strconv.FormatUint(*cfg.ReplicaID, 10)
@@ -488,7 +504,7 @@ func (p *ProtocolInstance) Tick() ([]byte, error) {
 // Start wraps derec_protocol_start: kicks off a new flow. flowKind matches
 // the FlowKind constants package protocol exposes; paramsJSON is a UTF-8
 // JSON blob shaped to the matching flow's params (see
-// library/src/ffi/protocol/flow.rs for the per-variant decoder). Returns
+// library/src/interop/ffi/protocol/flow.rs for the per-variant decoder). Returns
 // the resulting events as a UTF-8 JSON array, same shape as Process.
 func (p *ProtocolInstance) Start(flowKind uint32, paramsJSON []byte) ([]byte, error) {
 	protocolStartOnce.Do(func() {
@@ -534,7 +550,7 @@ func (p *ProtocolInstance) Reject(action []byte, status int32, memo string) erro
 // Restore wraps derec_protocol_restore: rebuilds this protocol's secret_id
 // namespace from a recovered Secret. paramsJSON is a UTF-8 JSON blob of the
 // {version, recovered_secret} shape documented on
-// derec_protocol_restore in library/src/ffi/protocol/handle/flow.rs.
+// derec_protocol_restore in library/src/interop/ffi/protocol/handle/flow.rs.
 // Returns the resulting events as a UTF-8 JSON array.
 func (p *ProtocolInstance) Restore(paramsJSON []byte) ([]byte, error) {
 	protocolRestoreOnce.Do(func() {

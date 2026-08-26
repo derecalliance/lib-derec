@@ -9,7 +9,7 @@
 //
 // The Category*/Code* constants mirror, one-for-one and with the same
 // integer values, the DEREC_CATEGORY_*/DEREC_CODE_* constants declared in
-// library/src/ffi/error.rs, which remains the source of truth.
+// library/src/interop/ffi/error.rs, which remains the source of truth.
 package derec
 
 import "fmt"
@@ -44,7 +44,7 @@ func (e *Error) Unwrap() error {
 }
 
 // Categories identify the protocol phase or layer that produced an [Error].
-// They mirror the DEREC_CATEGORY_* constants in library/src/ffi/error.rs.
+// They mirror the DEREC_CATEGORY_* constants in library/src/interop/ffi/error.rs.
 const (
 	CategoryOK           int32 = 0
 	CategoryFFI          int32 = 1
@@ -66,7 +66,7 @@ const (
 
 // Codes give the specific reason an [Error] occurred. Codes are global — the
 // same value means the same thing regardless of Category. They mirror the
-// DEREC_CODE_* constants in library/src/ffi/error.rs.
+// DEREC_CODE_* constants in library/src/interop/ffi/error.rs.
 const (
 	CodeOK                     int32 = 0
 	CodeNonOKStatus            int32 = 1

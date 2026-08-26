@@ -90,7 +90,7 @@ func ExtractGetSecretIdsVersionsRequest(request, sharedKey []byte) (uint64, []by
 
 // ProduceGetSecretIdsVersionsResponse builds the wire-encoded DeRecMessage
 // advertising secretList (encoded in the binary format documented at
-// library/src/ffi/discovery.rs) on channelID, encrypted under sharedKey.
+// library/src/interop/ffi/discovery.rs) on channelID, encrypted under sharedKey.
 func ProduceGetSecretIdsVersionsResponse(channelID uint64, secretList, sharedKey []byte) ([]byte, error) {
 	produceDiscoveryRespOnce.Do(func() {
 		purego.RegisterFunc(&produceDiscoveryRespFn, symbol("produce_get_secret_ids_versions_response_message"))
@@ -121,7 +121,7 @@ func ExtractGetSecretIdsVersionsResponse(response, sharedKey []byte) (uint64, []
 // ProcessGetSecretIdsVersionsResponse validates a discovery response (the
 // inner GetSecretIdsVersionsResponseMessage proto bytes returned by
 // ExtractGetSecretIdsVersionsResponse) and returns the advertised secret list
-// in the binary format documented at library/src/ffi/discovery.rs.
+// in the binary format documented at library/src/interop/ffi/discovery.rs.
 func ProcessGetSecretIdsVersionsResponse(responseProto []byte) ([]byte, error) {
 	processDiscoveryRespOnce.Do(func() {
 		purego.RegisterFunc(&processDiscoveryRespFn, symbol("process_get_secret_ids_versions_response_message"))

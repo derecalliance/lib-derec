@@ -5,23 +5,51 @@ package protocol
 
 import (
 	"encoding/json"
+	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
 
-// These golden byte strings were captured from the pre-refactor code (the
-// duplicate secretWire/helperWire/replicaWire/replicasWire/userSecretWire
-// hierarchy and secretToWire converter that used to live in this file)
-// before it was replaced by Secret/Helper/Replica/Replicas/UserSecret's own
-// MarshalJSON methods (see events.go and internal/native/store_types.go).
-// Any byte difference below means the wire format changed — do not update
-// these constants to make a failing assertion pass; fix the marshal code
-// instead.
-const (
-	restoreGoldenJSON = `{"version":7,"recovered_secret":{"helpers":[{"channel_id":"11","transport_uri":"https://helper-a.example.com","shared_key":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31],"communication_info":{"foo":"bar"}},{"channel_id":"22","transport_uri":"https://helper-b.example.com","shared_key":[31,30,29,28,27,26,25,24,23,22,21,20,19,18,17,16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0]}],"secrets":[{"id":[1],"name":"wallet","data":[99,111,114,114,101,99,116,32,104,111,114,115,101,32,98,97,116,116,101,114,121,32,115,116,97,112,108,101]},{"id":[2,3],"name":"seed","data":[222,173,190,239]}],"replicas":{"channel_id":"33","members":[{"replica_id":"44","transport_uri":"https://replica-a.example.com","role":"Source","communication_info":{"baz":"qux"}},{"replica_id":"66","transport_uri":"https://replica-b.example.com","role":"Destination"}],"shared_key":[9,8,7,6,5,4,3,2,1,0]}}}`
+// goldenJSON loads one entry from the shared golden fixture
+// (bindings/test_fixture/wire_golden.json), which every SDK asserts its own
+// params builder against. Any difference from what that fixture pins means
+// the wire format changed — do not update the fixture to make a failing
+// assertion pass; fix the marshal code instead.
+func goldenJSON(t *testing.T, key string) string {
+	t.Helper()
+	raw, err := os.ReadFile("../../../bindings/test_fixture/wire_golden.json")
+	if err != nil {
+		t.Fatalf("read wire_golden.json: %v", err)
+	}
+	var fixture map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatalf("parse wire_golden.json: %v", err)
+	}
+	value, ok := fixture[key]
+	if !ok {
+		t.Fatalf("wire_golden.json has no %q entry", key)
+	}
+	return string(value)
+}
 
-	protectSecretGoldenJSON = `{"secrets":[{"id":[1],"name":"wallet","data":[99,111,114,114,101,99,116,32,104,111,114,115,101,32,98,97,116,116,101,114,121,32,115,116,97,112,108,101]},{"id":[2,3],"name":"seed","data":[222,173,190,239]}],"description":"capture description"}`
-)
+// assertJSONEqual compares two JSON documents by parsed value rather than
+// raw bytes: the fixture is pretty-printed while the marshaled output under
+// test is compact, so a byte comparison would always fail even when the
+// values are identical.
+func assertJSONEqual(t *testing.T, got, want string) {
+	t.Helper()
+	var gotValue, wantValue map[string]any
+	if err := json.Unmarshal([]byte(got), &gotValue); err != nil {
+		t.Fatalf("parse got JSON: %v", err)
+	}
+	if err := json.Unmarshal([]byte(want), &wantValue); err != nil {
+		t.Fatalf("parse want JSON: %v", err)
+	}
+	if !reflect.DeepEqual(gotValue, wantValue) {
+		t.Fatalf("wire format changed:\n got  = %s\n want = %s", got, want)
+	}
+}
 
 // goldenRestoreSecret builds the same fully-populated Secret the golden
 // bytes above were captured from: two helpers (one with
@@ -79,9 +107,8 @@ func goldenRestoreSecret() Secret {
 
 // TestWireGolden_Restore asserts Restore's params marshal (via
 // restoreParamsWire, whose RecoveredSecret field is now a plain Secret —
-// see flow.go) is byte-identical to the pre-refactor output, which built
-// the same JSON through the now-deleted secretToWire/secretWire/
-// helperWire/replicaWire/replicasWire hierarchy.
+// see flow.go) matches the shared golden fixture that every SDK's params
+// builder is checked against.
 func TestWireGolden_Restore(t *testing.T) {
 	got, err := json.Marshal(restoreParamsWire{
 		Version:         7,
@@ -90,16 +117,13 @@ func TestWireGolden_Restore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal restore params: %v", err)
 	}
-	if string(got) != restoreGoldenJSON {
-		t.Fatalf("wire format changed:\n got  = %s\n want = %s", got, restoreGoldenJSON)
-	}
+	assertJSONEqual(t, string(got), goldenJSON(t, "restore"))
 }
 
 // TestWireGolden_ProtectSecret asserts ProtectSecretParams' marshal (via
 // marshalFlowParams, whose protectSecretParamsWire.Secrets field is now
-// []UserSecret directly — see flow.go) is byte-identical to the
-// pre-refactor output, which built the same JSON through the now-deleted
-// encodeUserSecrets/userSecretWire helpers.
+// []UserSecret directly — see flow.go) matches the shared golden fixture
+// that every SDK's params builder is checked against.
 func TestWireGolden_ProtectSecret(t *testing.T) {
 	secret := goldenRestoreSecret()
 	desc := "capture description"
@@ -110,9 +134,7 @@ func TestWireGolden_ProtectSecret(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal protect secret params: %v", err)
 	}
-	if string(got) != protectSecretGoldenJSON {
-		t.Fatalf("wire format changed:\n got  = %s\n want = %s", got, protectSecretGoldenJSON)
-	}
+	assertJSONEqual(t, string(got), goldenJSON(t, "protect_secret"))
 }
 
 // TestWireGolden_Restore_NilReplicasOmitsField pins the other end of the
