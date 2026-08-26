@@ -22,7 +22,7 @@ type shareStore interface {
 }
 
 // ShareStoreCallbacks mirrors #[repr(C)] struct ShareStoreCallbacks in
-// library/src/ffi/protocol/stores.rs field-for-field. channel_ids[]/
+// library/src/interop/ffi/protocol/stores.rs field-for-field. channel_ids[]/
 // versions[] cross the FFI as JSON-array byte buffers, matching stores.rs's
 // doc comment on the struct.
 type ShareStoreCallbacks struct {

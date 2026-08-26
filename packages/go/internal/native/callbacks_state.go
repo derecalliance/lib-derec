@@ -21,7 +21,7 @@ type stateStore interface {
 }
 
 // StateStoreCallbacks mirrors #[repr(C)] struct StateStoreCallbacks in
-// library/src/ffi/protocol/stores.rs field-for-field.
+// library/src/interop/ffi/protocol/stores.rs field-for-field.
 type StateStoreCallbacks struct {
 	UserData   uintptr
 	Save       uintptr

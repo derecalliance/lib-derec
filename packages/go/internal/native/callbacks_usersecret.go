@@ -20,7 +20,7 @@ type userSecretStore interface {
 }
 
 // UserSecretStoreCallbacks mirrors #[repr(C)] struct
-// UserSecretStoreCallbacks in library/src/ffi/protocol/stores.rs
+// UserSecretStoreCallbacks in library/src/interop/ffi/protocol/stores.rs
 // field-for-field.
 type UserSecretStoreCallbacks struct {
 	UserData   uintptr

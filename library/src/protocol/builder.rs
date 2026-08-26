@@ -23,6 +23,17 @@ pub struct BuilderSlotMissingMarker;
 
 pub struct BuilderSlotSetMarker<T>(T);
 
+/// Minimum number of shares required to reconstruct the secret, absent an
+/// explicit [`DeRecProtocolBuilder::with_threshold`] call. This is the sole
+/// definition of the value — [`DeRecProtocolBuilder::new`] and the FFI
+/// config's serde default both read it rather than each hardcoding `3`.
+pub const DEFAULT_THRESHOLD: usize = 3;
+
+/// Number of recent share versions each helper retains, absent an explicit
+/// [`DeRecProtocolBuilder::with_keep_versions_count`] call. Sole definition
+/// of the value; see [`DEFAULT_THRESHOLD`].
+pub const DEFAULT_KEEP_VERSIONS_COUNT: usize = 3;
+
 /// Typestate builder for [`DeRecProtocol`].
 ///
 /// Call each store/transport setter, then [`build`](DeRecProtocolBuilder::build).
@@ -100,8 +111,8 @@ impl
             state_store: BuilderSlotMissingMarker,
             transport: BuilderSlotMissingMarker,
             own_transport: BuilderSlotMissingMarker,
-            threshold: 3,
-            keep_versions_count: 3,
+            threshold: DEFAULT_THRESHOLD,
+            keep_versions_count: DEFAULT_KEEP_VERSIONS_COUNT,
             timeouts: crate::protocol::types::Timeouts::default(),
             unsafe_http: false,
             communication_info: HashMap::new(),
@@ -128,7 +139,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
 {
     /// Minimum number of shares required to reconstruct the secret.
     ///
-    /// Default: `3`. This setter is infallible — invariant checks run
+    /// Default: [`DEFAULT_THRESHOLD`]. This setter is infallible — invariant checks run
     /// at [`build`](Self::build) time and surface a structured
     /// [`crate::Error`] so callers can handle invalid configurations
     /// uniformly across SDKs (FFI / WASM bindings translate that error
@@ -141,7 +152,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
 
     /// Number of recent versions each helper must retain.
     ///
-    /// Default: `3`.
+    /// Default: [`DEFAULT_KEEP_VERSIONS_COUNT`].
     pub fn with_keep_versions_count(mut self, count: usize) -> Self {
         self.keep_versions_count = count;
         self
@@ -785,6 +796,17 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A freshly-constructed builder carries `DEFAULT_THRESHOLD` /
+    /// `DEFAULT_KEEP_VERSIONS_COUNT` until a setter overrides them — the
+    /// same constants the FFI config's serde defaults read, so both paths
+    /// stay in lockstep by construction rather than by convention.
+    #[test]
+    fn new_defaults_to_the_shared_constants() {
+        let b = DeRecProtocolBuilder::new(0);
+        assert_eq!(b.threshold, DEFAULT_THRESHOLD);
+        assert_eq!(b.keep_versions_count, DEFAULT_KEEP_VERSIONS_COUNT);
+    }
 
     /// Boundary value: threshold == 2 is the minimum valid input.
     #[test]

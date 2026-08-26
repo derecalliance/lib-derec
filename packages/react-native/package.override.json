@@ -1,0 +1,40 @@
+{
+  "name": "@derec-alliance/react-native",
+  "description": "React Native bindings for derec-library, the Rust SDK for the DeRec protocol.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/derecalliance/lib-derec"
+  },
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "files": [
+    "lib",
+    "src",
+    "cpp",
+    "ios",
+    "android",
+    "!android/build",
+    "!android/.cxx",
+    "!cpp/tests",
+    "DeRec.podspec",
+    "react-native.config.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "react": ">=18.2.0",
+    "react-native": ">=0.76.0"
+  },
+  "keywords": [
+    "derec",
+    "decentralized",
+    "recovery",
+    "secret-sharing",
+    "sdk",
+    "react-native",
+    "ios",
+    "android",
+    "typescript",
+    "jsi"
+  ]
+}

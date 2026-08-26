@@ -1,0 +1,79 @@
+buildscript {
+  // An autolinked library module is configured by the host app's Gradle build,
+  // so the toolchain versions have to come from the app rather than be pinned
+  // here — a library that hardcoded them would collide with whatever React
+  // Native version the app is on. The literals are fallbacks for a standalone
+  // build only.
+  def kotlinVersion = rootProject.ext.has('kotlinVersion')
+    ? rootProject.ext.get('kotlinVersion')
+    : '2.2.0'
+
+  repositories {
+    google()
+    mavenCentral()
+  }
+
+  dependencies {
+    classpath("com.android.tools.build:gradle:9.2.1")
+    classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlinVersion")
+  }
+}
+
+def derecExtOr(name, defaultValue) {
+  return rootProject.ext.has(name) ? rootProject.ext.get(name) : defaultValue
+}
+
+apply plugin: "com.android.library"
+apply plugin: "org.jetbrains.kotlin.android"
+
+android {
+  namespace "org.derec"
+  compileSdk derecExtOr('compileSdkVersion', 35).toString().toInteger()
+
+  // Must match the NDK `scripts/prepare-react-native-package.sh` built
+  // `libderec_library.a` with. Left unset, AGP picks its own default — a
+  // different NDK than the archive was compiled against, which links the two
+  // C++ runtimes together and fails in ways that surface at run time.
+  // Not named `ndk`: that would shadow the `ndk { }` DSL block in
+  // `defaultConfig` below, and Groovy resolves the local first — turning the
+  // block into a call on a String.
+  def requestedNdkVersion = derecExtOr('ndkVersion', null)
+  if (requestedNdkVersion != null) {
+    ndkVersion requestedNdkVersion.toString()
+  }
+
+  defaultConfig {
+    minSdk derecExtOr('minSdkVersion', 24).toString().toInteger()
+
+    externalNativeBuild {
+      cmake {
+        cppFlags "-frtti -fexceptions -std=c++17"
+        arguments "-DANDROID_STL=c++_shared"
+      }
+    }
+
+    // `i686-linux-android` is deliberately absent: `prepare-react-native-
+    // package.sh` does not build it, so listing it here would fail the link
+    // rather than skip the ABI.
+    ndk {
+      abiFilters "arm64-v8a", "armeabi-v7a", "x86_64"
+    }
+  }
+
+  externalNativeBuild {
+    cmake {
+      path "CMakeLists.txt"
+    }
+  }
+
+  buildFeatures {
+    buildConfig false
+    // Puts React Native's jsi/reactnative and fbjni prefab packages on CMake's
+    // search path; `find_package` in CMakeLists.txt fails without it.
+    prefab true
+  }
+}
+
+dependencies {
+  implementation "com.facebook.react:react-android"
+}

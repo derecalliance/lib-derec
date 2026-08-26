@@ -29,7 +29,7 @@ type channelStore interface {
 }
 
 // ChannelStoreCallbacks mirrors #[repr(C)] struct ChannelStoreCallbacks in
-// library/src/ffi/protocol/stores.rs field-for-field. UserData carries the
+// library/src/interop/ffi/protocol/stores.rs field-for-field. UserData carries the
 // storeHandle (never a Go pointer); every other field holds the uintptr
 // purego.NewCallback returned for that fn-pointer slot.
 type ChannelStoreCallbacks struct {

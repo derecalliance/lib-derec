@@ -112,7 +112,7 @@ func (responseAPI) Process(version uint32, responseProto []byte) error {
 }
 
 // decodeShares unpacks the committed-shares wire format documented at
-// library/src/ffi/sharing.rs into a channel id -> serialized
+// library/src/interop/ffi/sharing.rs into a channel id -> serialized
 // CommittedDeRecShare map:
 //
 //	[count: u32 LE]

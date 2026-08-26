@@ -43,10 +43,10 @@ use crate::{
 };
 use std::collections::HashSet;
 
+#[cfg(target_arch = "wasm32")]
+use crate::interop::wasm::now_secs;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::utils::now_secs;
-#[cfg(target_arch = "wasm32")]
-use crate::wasm::now_secs;
 
 /// Restore-specific failure modes surfaced via [`crate::Error::Restore`].
 /// Every variant is reported **before any store mutation** — a

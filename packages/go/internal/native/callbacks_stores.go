@@ -2,7 +2,7 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 // Wires the six store/transport interfaces held by a storeSet to the C
-// callback ABI library/src/ffi/protocol/stores.rs expects, via
+// callback ABI library/src/interop/ffi/protocol/stores.rs expects, via
 // purego.NewCallback. Each store has its own file (callbacks_channel.go,
 // callbacks_secret.go, callbacks_share.go, callbacks_usersecret.go,
 // callbacks_state.go, callbacks_transport.go) containing three layers:
@@ -152,7 +152,7 @@ type builtCallbacks struct {
 }
 
 // buildCallbacks registers s under a new handle and assembles the six
-// #[repr(C)]-mirroring callback structs library/src/ffi/protocol/stores.rs
+// #[repr(C)]-mirroring callback structs library/src/interop/ffi/protocol/stores.rs
 // expects, ready to hand to derec_protocol_new.
 func buildCallbacks(s *storeSet) (*builtCallbacks, error) {
 	if s == nil {

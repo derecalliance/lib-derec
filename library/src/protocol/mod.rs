@@ -86,7 +86,7 @@ use crate::{
     Error, Result, primitives::pairing::request::create_contact as create_contact_message,
     types::ChannelId,
 };
-pub use builder::DeRecProtocolBuilder;
+pub use builder::{DEFAULT_KEEP_VERSIONS_COUNT, DEFAULT_THRESHOLD, DeRecProtocolBuilder};
 use derec_proto::{ContactMessage, ContactMode, DeRecMessage, StatusEnum, TransportProtocol};
 pub use error::{
     ChannelStoreError, ProcessError, SecretStoreError, ShareStoreError, StateStoreError,
@@ -110,10 +110,10 @@ pub use events::{
 };
 pub use handlers::restore::RestoreError;
 
+#[cfg(target_arch = "wasm32")]
+use crate::interop::wasm::now_secs;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::utils::now_secs;
-#[cfg(target_arch = "wasm32")]
-use crate::wasm::now_secs;
 
 /// Internal state of the single secret container managed by the protocol.
 ///

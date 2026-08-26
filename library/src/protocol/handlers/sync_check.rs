@@ -51,10 +51,10 @@ use derec_proto::{
 use prost::Message as _;
 use std::collections::{HashMap, HashSet};
 
+#[cfg(target_arch = "wasm32")]
+use crate::interop::wasm::now_secs;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::utils::now_secs;
-#[cfg(target_arch = "wasm32")]
-use crate::wasm::now_secs;
 
 /// Ask every other member which version it holds.
 ///

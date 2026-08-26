@@ -2,7 +2,7 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 // Wire record codecs for the store callbacks. Every function here mirrors
-// a serde-JSON shape defined by library/src/ffi/protocol/stores.rs (or, for
+// a serde-JSON shape defined by library/src/interop/ffi/protocol/stores.rs (or, for
 // Channel, Channel's own serde derive in library/src/protocol/types.rs).
 // This file is the Go mirror image of stores.rs's Dotnet* adapters: Rust
 // there decodes what Go here encodes, and encodes what Go here decodes —

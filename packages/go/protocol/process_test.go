@@ -17,7 +17,7 @@ import (
 // TestProcess_EmptyMessage_ReturnsAnErrorNotAPanic drives the genuine FFI
 // round trip: derec_protocol_process accepts message_len == 0 as a valid
 // (zero-length) call rather than a null-pointer error — see
-// library/src/ffi/protocol/handle/flow.rs — but the protocol core still
+// library/src/interop/ffi/protocol/handle/flow.rs — but the protocol core still
 // decodes it into a default DeRecMessage{channel_id: 0} and rejects it
 // because no shared key or pairing secret exists for channel 0 on a fresh
 // instance (library/src/protocol/mod.rs process_inner's final Err arm).

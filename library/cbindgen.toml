@@ -1,0 +1,15 @@
+language = "C"
+header = "// SPDX-License-Identifier: Apache-2.0\n// Copyright (c) 2026 DeRec Alliance. All rights reserved.\n//\n// GENERATED FILE - DO NOT EDIT.\n// Regenerate with: scripts/prepare-react-native-package.sh"
+include_guard = "DEREC_FFI_H"
+cpp_compat = true
+usize_is_size_t = true
+
+[export]
+prefix = ""
+include = []
+
+[parse]
+parse_deps = false
+
+[enum]
+prefix_with_name = true

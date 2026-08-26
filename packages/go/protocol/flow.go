@@ -13,7 +13,7 @@ import (
 )
 
 // FlowKind selects which flow Start dispatches. Values match the numeric
-// constants in library/src/ffi/protocol/flow.rs.
+// constants in library/src/interop/ffi/protocol/flow.rs.
 type FlowKind uint32
 
 const (
@@ -69,7 +69,7 @@ func TargetMany(channelIDs ...uint64) Target {
 }
 
 // MarshalJSON implements json.Marshaler, producing the wire shape
-// parse_target in library/src/ffi/protocol/flow.rs expects: null for
+// parse_target in library/src/interop/ffi/protocol/flow.rs expects: null for
 // TargetAll, a decimal-string for TargetOne, an array of decimal-strings
 // for TargetMany.
 func (t Target) MarshalJSON() ([]byte, error) {
@@ -215,7 +215,7 @@ type transportProtocolParamWire struct {
 }
 
 // marshalFlowParams validates params against flowKind and renders it into
-// the JSON shape the matching decoder in library/src/ffi/protocol/flow.rs
+// the JSON shape the matching decoder in library/src/interop/ffi/protocol/flow.rs
 // expects.
 func marshalFlowParams(flowKind FlowKind, params any) ([]byte, error) {
 	switch flowKind {
