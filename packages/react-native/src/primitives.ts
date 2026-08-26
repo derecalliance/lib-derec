@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-// ---------------------------------------------------------------------------
-// The stateless primitive surface, shaped identically to
-// `@derec-alliance/nodejs`.
-//
-// Primitives are synchronous: they are pure byte transforms with no store or
-// transport callbacks, so they run on the JavaScript thread. `sharing.request.
-// split` does real cryptographic work, which is why an application that needs
-// it off-thread should drive it through `DeRecProtocol` instead.
-//
-// Each function marshals between the typed surface and the C ABI's own shapes
-// — protobuf wire bytes for messages, hand-packed little-endian containers for
-// the three set-valued arguments. See `./messages` and `./binary`. Nothing
-// here interprets a protocol value: no defaulting, no clamping, no branching
-// on what a field contains.
-// ---------------------------------------------------------------------------
+/**
+ * The stateless primitive surface, shaped identically to
+ * `@derec-alliance/nodejs`.
+ *
+ * Primitives are synchronous: they are pure byte transforms with no store or
+ * transport callbacks, so they run on the JavaScript thread. `sharing.request.
+ * split` does real cryptographic work, which is why an application that needs
+ * it off-thread should drive it through `DeRecProtocol` instead.
+ *
+ * Each function marshals between the typed surface and the C ABI's own shapes
+ * — protobuf wire bytes for messages, hand-packed little-endian containers for
+ * the three set-valued arguments. See `./messages` and `./binary`. Nothing
+ * here interprets a protocol value: no defaulting, no clamping, no branching
+ * on what a field contains.
+ */
 
 import {
   decodeCommittedShareEntries,
@@ -111,8 +111,6 @@ function decodeContact(wire: Uint8Array | ArrayBuffer): ContactMessage {
   const json = call('decode_contact_message', wire) as ArrayBuffer;
   return reviveMessage(jsonFromBytes(json)) as ContactMessage;
 }
-
-// ---------------------------------------------------------------------------
 
 const discovery = {
   request: {

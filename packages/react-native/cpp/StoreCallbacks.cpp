@@ -16,12 +16,10 @@ namespace derec {
 
 namespace {
 
-// ---------------------------------------------------------------------------
-// Struct-layout guards (Step 3). Every field is pointer-sized, so a struct's
+// Struct-layout guards. Every field is pointer-sized, so a struct's
 // size is exactly its member count times `sizeof(void*)` on every ABI this
 // binding targets; a mismatch means `derec_ffi.h` grew or shrank a field
 // this file has not been updated to match.
-// ---------------------------------------------------------------------------
 
 static_assert(sizeof(ChannelStoreCallbacks) == 9 * sizeof(void*),
               "ChannelStoreCallbacks layout changed; update the bindings");
@@ -35,10 +33,6 @@ static_assert(sizeof(StateStoreCallbacks) == 6 * sizeof(void*),
               "StateStoreCallbacks layout changed; update the bindings");
 static_assert(sizeof(TransportCallbacks) == 2 * sizeof(void*),
               "TransportCallbacks layout changed; update the bindings");
-
-// ---------------------------------------------------------------------------
-// Byte / value plumbing shared by every callback below.
-// ---------------------------------------------------------------------------
 
 /// Write `bytes` into a store callback's out-parameters. Returns `false`
 /// only when the allocation itself failed; a genuinely empty `bytes` still
@@ -95,7 +89,6 @@ jsi::Value toUint8ArrayVal(jsi::Runtime& rt, const std::vector<uint8_t>& bytes) 
   return toUint8ArrayVal(rt, bytes.data(), bytes.size());
 }
 
-// ---------------------------------------------------------------------------
 // Minimal decoders for the wire's "bare JSON array/object of unsigned
 // integers" convention (`versions_json`, `channel_ids_json`, the `bytes`
 // field of a `ShareRecord` / `SecretValueRecord`). These are produced by
@@ -103,7 +96,6 @@ jsi::Value toUint8ArrayVal(jsi::Runtime& rt, const std::vector<uint8_t>& bytes) 
 // known shape, so a substring scan is sufficient and — critically — never
 // routes a `u64` through a JS `number`, which cannot represent every value
 // in that range exactly.
-// ---------------------------------------------------------------------------
 
 /// Parse a bare `[n, n, ...]` array of unsigned decimal integers.
 std::vector<uint64_t> parseUnsignedJsonArray(const uint8_t* ptr, size_t len) {
@@ -249,12 +241,10 @@ jsi::Array u64VectorToJsStringArray(jsi::Runtime& rt, const std::vector<uint64_t
   return arr;
 }
 
-// ---------------------------------------------------------------------------
 // `ResultConverter`s. Each encodes a settled JS value into the private
 // `CallResult.bytes` payload the calling extern "C" function decodes once
 // `callSync` returns — a channel this file controls end to end, so each
 // converter is free to define its own encoding.
-// ---------------------------------------------------------------------------
 
 /// Load-family convention: `null`/`undefined` is "absent" (code `1`); any
 /// other value is read as bytes and passed through unmodified (code `0`).
@@ -409,13 +399,11 @@ CallResult toStateLoadAllResult(jsi::Runtime& rt, const jsi::Value& value) {
   return CallResult{0, std::vector<uint8_t>(text.begin(), text.end())};
 }
 
-// ---------------------------------------------------------------------------
 // `UserSecrets` JSON <-> JS object conversion. Unlike the flat integer-only
 // records above, `UserSecrets` carries application-controlled `name` /
 // `description` strings, so building or reading its wire JSON goes through
 // the runtime's own `JSON.parse` / `JSON.stringify` rather than a hand-rolled
 // scanner — the only place in this file that needs real string escaping.
-// ---------------------------------------------------------------------------
 
 jsi::Value jsonParseUtf8(jsi::Runtime& rt, const uint8_t* bytes, size_t len) {
   jsi::Object json = rt.global().getPropertyAsObject(rt, "JSON");
@@ -516,10 +504,6 @@ jsi::Value buildUserSecretsFromWire(jsi::Runtime& rt, const uint8_t* ptr, size_t
 /// Shared by every struct's `free_buffer` field — the signature is
 /// identical across all six.
 extern "C" void storeFreeBuffer(void* /*userData*/, uint8_t* ptr, size_t len) { freeBytes(ptr, len); }
-
-// ---------------------------------------------------------------------------
-// ChannelStoreCallbacks
-// ---------------------------------------------------------------------------
 
 /// `ChannelStore.load(secretId, channelId, replicaId) -> Uint8Array | null`
 extern "C" int32_t channelStoreLoad(void* userData, uint64_t secretId, uint64_t channelId,
@@ -691,10 +675,6 @@ extern "C" int32_t channelStoreLinkedChannels(void* userData, uint64_t secretId,
   return result.code;
 }
 
-// ---------------------------------------------------------------------------
-// SecretStoreCallbacks
-// ---------------------------------------------------------------------------
-
 /// `SecretStore.load(secretId, channelId, kind) -> Uint8Array | null`
 extern "C" int32_t secretStoreLoad(void* userData, uint64_t secretId, uint64_t channelId, uint32_t kind,
                                     uint8_t** outPtr, size_t* outLen) {
@@ -764,10 +744,6 @@ extern "C" int32_t secretStoreRemove(void* userData, uint64_t secretId, uint64_t
       });
   return result.code;
 }
-
-// ---------------------------------------------------------------------------
-// ShareStoreCallbacks
-// ---------------------------------------------------------------------------
 
 /// `ShareStore.load(secretId, channelId, versions) -> Share[]`
 extern "C" int32_t shareStoreLoad(void* userData, uint64_t secretId, uint64_t channelId,
@@ -933,10 +909,6 @@ extern "C" int32_t shareStoreRemoveChannel(void* userData, uint64_t secretId, ui
   return result.code;
 }
 
-// ---------------------------------------------------------------------------
-// UserSecretStoreCallbacks
-// ---------------------------------------------------------------------------
-
 /// `UserSecretStore.loadLatest(secretId) -> UserSecrets | null`
 extern "C" int32_t userSecretStoreLoadLatest(void* userData, uint64_t secretId, uint8_t** outPtr,
                                               size_t* outLen) {
@@ -999,10 +971,6 @@ extern "C" int32_t userSecretStoreRemove(void* userData, uint64_t secretId) {
   });
   return result.code;
 }
-
-// ---------------------------------------------------------------------------
-// StateStoreCallbacks
-// ---------------------------------------------------------------------------
 
 /// `StateStore.save(secretId, itemJson) -> void`
 extern "C" int32_t stateStoreSave(void* userData, uint64_t secretId, const uint8_t* itemJsonPtr,
@@ -1098,10 +1066,6 @@ extern "C" int32_t stateStoreLoadAll(void* userData, uint64_t secretId, uint32_t
   }
   return result.code;
 }
-
-// ---------------------------------------------------------------------------
-// TransportCallbacks
-// ---------------------------------------------------------------------------
 
 /// Maps the wire's `derec_proto::Protocol` discriminant to the string
 /// `Transport.send`'s endpoint carries. Only `HTTPS = 0` is defined today;

@@ -50,7 +50,7 @@ Or manually in your `Cargo.toml`
 
 ```toml
 [dependencies]
-derec-library = "0.0.1-alpha.10"
+derec-library = "0.0.1-alpha.11"
 ```
 
 > [!WARNING]

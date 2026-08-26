@@ -1,35 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-// ---------------------------------------------------------------------------
-// Message marshalling.
-//
-// Every `extract_*` entry point in the C ABI hands back protobuf wire bytes,
-// and every `produce_*` / `process_*` that takes a message takes the same.
-// Go and .NET decode those with generated protobuf bindings; this SDK has
-// none, so it goes through `derec_decode_message_json` /
-// `derec_encode_message_json` instead (`library/src/interop/ffi/message_json.rs`),
-// which re-emits each message as the JSON mirror the WASM SDKs already
-// surface. The wire format therefore stays a single Rust-side decision — this
-// file only changes representation.
-//
-// Two representation changes are needed to reach the exact JavaScript shape
-// `@derec-alliance/nodejs` exposes, where `serde-wasm-bindgen` produces it
-// natively:
-//
-//   - Wide numerics cross the JSON seam as decimal strings and are `bigint`
-//     in the typed surface. `serde_json` would otherwise emit them as JSON
-//     numbers, and `JSON.parse` silently rounds anything above 2^53 — the
-//     corruption only appears once a real id happens to be large.
-//   - Byte fields cross as arrays of decimal byte values (`serde_json` draws
-//     no distinction for `serde_bytes`) and are `Uint8Array` in the typed
-//     surface.
-//
-// Both conversions are keyed by field name, matching the lists in
-// `message_json.rs`. A name-keyed walk is deliberate: `keep_list` is a
-// genuine `number[]` and must stay one, so a structural "array of numbers is
-// bytes" rule would corrupt it.
-// ---------------------------------------------------------------------------
+/**
+ * Message marshalling.
+ *
+ * Every `extract_*` entry point in the C ABI hands back protobuf wire bytes,
+ * and every `produce_*` / `process_*` that takes a message takes the same.
+ * Go and .NET decode those with generated protobuf bindings; this SDK has
+ * none, so it goes through `derec_decode_message_json` /
+ * `derec_encode_message_json` instead (`library/src/interop/ffi/message_json.rs`),
+ * which re-emits each message as the JSON mirror the WASM SDKs already
+ * surface. The wire format therefore stays a single Rust-side decision — this
+ * file only changes representation.
+ *
+ * Two representation changes are needed to reach the exact JavaScript shape
+ * `@derec-alliance/nodejs` exposes, where `serde-wasm-bindgen` produces it
+ * natively:
+ *
+ *   - Wide numerics cross the JSON seam as decimal strings and are `bigint`
+ *     in the typed surface. `serde_json` would otherwise emit them as JSON
+ *     numbers, and `JSON.parse` silently rounds anything above 2^53 — the
+ *     corruption only appears once a real id happens to be large.
+ *   - Byte fields cross as arrays of decimal byte values (`serde_json` draws
+ *     no distinction for `serde_bytes`) and are `Uint8Array` in the typed
+ *     surface.
+ *
+ * Both conversions are keyed by field name, matching the lists in
+ * `message_json.rs`. A name-keyed walk is deliberate: `keep_list` is a
+ * genuine `number[]` and must stay one, so a structural "array of numbers is
+ * bytes" rule would corrupt it.
+ */
 
 import { jsonFromBytes, jsonToBytes } from './codec';
 import { getNative } from './native';

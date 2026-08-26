@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-// ---------------------------------------------------------------------------
-// UTF-8 byte <-> string codec, shared by every JSON payload that crosses the
-// JSI boundary (config, flow params, the events array, the `ContactMessage`
-// JSON the pairing codec entry points exchange). Those payloads travel as
-// bytes, not a JS string — the host functions read `ArrayBuffer`/typed-array
-// arguments and hand back `ArrayBuffer` results (see `ProtocolHost.cpp`'s
-// `bytesToArrayBuffer`). `TextDecoder`/`TextEncoder` are not declared as
-// ambient globals under this package's `lib: ["ES2020"]` (no DOM lib) and the
-// installed `@types/node` exposes them only from `node:util`, which does not
-// exist in the Hermes runtime this code actually ships on. A small
-// dependency-free codec avoids both problems.
-// ---------------------------------------------------------------------------
+/**
+ * UTF-8 byte <-> string codec, shared by every JSON payload that crosses the
+ * JSI boundary (config, flow params, the events array, the `ContactMessage`
+ * JSON the pairing codec entry points exchange). Those payloads travel as
+ * bytes, not a JS string — the host functions read `ArrayBuffer`/typed-array
+ * arguments and hand back `ArrayBuffer` results (see `ProtocolHost.cpp`'s
+ * `bytesToArrayBuffer`). `TextDecoder`/`TextEncoder` are not declared as
+ * ambient globals under this package's `lib: ["ES2020"]` (no DOM lib) and the
+ * installed `@types/node` exposes them only from `node:util`, which does not
+ * exist in the Hermes runtime this code actually ships on. A small
+ * dependency-free codec avoids both problems.
+ */
 
 export function utf8Encode(text: string): Uint8Array {
   const bytes: number[] = [];

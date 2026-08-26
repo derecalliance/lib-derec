@@ -1,22 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-// ---------------------------------------------------------------------------
-// The three FFI container formats.
-//
-// Most values cross this boundary as protobuf or JSON. Three do not: the C ABI
-// ferries a set of items as a single hand-packed little-endian buffer, because
-// a C signature cannot carry a variable-length array of variable-length items
-// without one. Each format is specified in the module header of the Rust file
-// that owns it, and the encoders below follow those specs exactly:
-//
-//   - the discovery secret list  (`library/src/interop/ffi/discovery.rs`)
-//   - the recovery response set  (`library/src/interop/ffi/recovery.rs`)
-//   - the committed-share map    (`library/src/interop/ffi/sharing.rs`)
-//
-// Everything here is representation, not protocol: no field is defaulted,
-// reordered or interpreted.
-// ---------------------------------------------------------------------------
+/**
+ * The three FFI container formats.
+ *
+ * Most values cross this boundary as protobuf or JSON. Three do not: the C ABI
+ * ferries a set of items as a single hand-packed little-endian buffer, because
+ * a C signature cannot carry a variable-length array of variable-length items
+ * without one. Each format is specified in the module header of the Rust file
+ * that owns it, and the encoders below follow those specs exactly:
+ *
+ *   - the discovery secret list  (`library/src/interop/ffi/discovery.rs`)
+ *   - the recovery response set  (`library/src/interop/ffi/recovery.rs`)
+ *   - the committed-share map    (`library/src/interop/ffi/sharing.rs`)
+ *
+ * Everything here is representation, not protocol: no field is defaulted,
+ * reordered or interpreted.
+ */
 
 import { utf8Decode, utf8Encode } from './codec';
 import type { SecretVersionEntry, VersionEntry } from './types';

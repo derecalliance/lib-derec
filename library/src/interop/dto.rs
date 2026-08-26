@@ -34,10 +34,6 @@
 
 use serde::{Deserialize, Serialize};
 
-// ---------------------------------------------------------------------------
-// Shared scalars
-// ---------------------------------------------------------------------------
-
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Timestamp {
     pub seconds: i64,
@@ -109,10 +105,6 @@ impl From<DeRecResult> for derec_proto::DeRecResult {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Pairing-adjacent shared messages
-// ---------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CommunicationInfoKeyValue {
@@ -277,10 +269,6 @@ impl From<ContactMessage> for derec_proto::ContactMessage {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Pairing
-// ---------------------------------------------------------------------------
-
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PairRequestMessage {
     pub sender_kind: i32,
@@ -424,10 +412,6 @@ impl From<PrePairResponseMessage> for derec_proto::PrePairResponseMessage {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Discovery
-// ---------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct VersionListEntry {
@@ -607,10 +591,6 @@ impl From<SecretVersionEntry> for crate::primitives::discovery::response::Secret
     }
 }
 
-// ---------------------------------------------------------------------------
-// Sharing
-// ---------------------------------------------------------------------------
-
 #[derive(Serialize, Deserialize, Clone)]
 pub struct SiblingHash {
     pub is_left: bool,
@@ -752,10 +732,6 @@ impl From<StoreShareResponseMessage> for derec_proto::StoreShareResponseMessage 
     }
 }
 
-// ---------------------------------------------------------------------------
-// Recovery
-// ---------------------------------------------------------------------------
-
 #[derive(Serialize, Deserialize, Clone)]
 pub struct GetShareRequestMessage {
     pub secret_id: u64,
@@ -837,10 +813,6 @@ impl From<GetShareResponseMessage> for derec_proto::GetShareResponseMessage {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Unpairing
-// ---------------------------------------------------------------------------
-
 #[derive(Serialize, Deserialize, Clone)]
 pub struct UnpairRequestMessage {
     pub memo: String,
@@ -901,10 +873,6 @@ impl From<UnpairResponseMessage> for derec_proto::UnpairResponseMessage {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Verification
-// ---------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct VerifyShareRequestMessage {

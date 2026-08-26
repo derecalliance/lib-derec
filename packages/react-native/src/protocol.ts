@@ -107,18 +107,14 @@ function encodeTarget(target: Target): unknown {
   return target.toString();
 }
 
-// ---------------------------------------------------------------------------
-// `*ParamsJson` builders — the wire shapes `library/src/interop/ffi/protocol/flow.rs`
-// and `library/src/interop/ffi/protocol/handle/flow.rs` deserialize. `buildProtectSecretParams`
-// and `buildRestoreParams` are exported so they can be golden-tested against
-// `bindings/test_fixture/wire_golden.json` without a native module.
-// ---------------------------------------------------------------------------
-
 /**
  * `ProtectSecretParamsJson` (`library/src/interop/ffi/protocol/flow.rs`): every
  * `UserSecret.id`/`.data` byte array travels as a bare JSON array of decimal
  * byte values, matching `UserSecretJson`'s plain `Vec<u8>` fields — no
  * base64, no wrapping.
+ *
+ * Exported so it can be golden-tested against
+ * `bindings/test_fixture/wire_golden.json` without a native module.
  */
 export function buildProtectSecretParams(params: ProtectSecretParams): Record<string, unknown> {
   const out: Record<string, unknown> = {
@@ -148,6 +144,9 @@ function communicationInfoOrOmit(
  * helper or replica member has none, matching the Go SDK's `omitempty` and
  * the shared golden fixture byte-for-byte; `replicas` is omitted entirely
  * when the recovered secret has no replica group.
+ *
+ * Exported so it can be golden-tested against
+ * `bindings/test_fixture/wire_golden.json` without a native module.
  */
 export function buildRestoreParams(
   recoveredSecret: Extract<DeRecEvent, { type: 'SecretRecovered' }>['secret'],
