@@ -62,7 +62,7 @@ export interface SecretStore {
  *
  * Do not `JSON.parse` and re-serialise. Every id in these records is a `u64`,
  * and `JSON.parse` silently rounds anything above 2^53 — the corruption only
- * appears once a real id happens to be large. `bindings/web` implements this.
+ * appears once a real id happens to be large.
  */
 export interface ChannelStore {
   load(

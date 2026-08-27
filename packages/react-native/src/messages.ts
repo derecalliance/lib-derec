@@ -37,8 +37,8 @@ import { getNative } from './native';
 /**
  * Selects which message the JSON codec operates on.
  *
- * Mirrors `MessageKind` in `bindings/test_fixture/enums.json`, which
- * `library/src/interop/ffi/message_json.rs` asserts against — so a message
+ * Mirrors the crate's `MessageKind`, which the shared enum fixture holds
+ * both sides to — so a message
  * added in Rust cannot reach this SDK as a silently unhandled value.
  */
 export enum MessageKind {

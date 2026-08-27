@@ -33,8 +33,7 @@ func appendVarint(buf []byte, v uint64) []byte {
 	return append(buf, byte(v))
 }
 
-// TestPairingInlineKeysHandshakeRoundTrip mirrors
-// bindings/rust/src/primitives.rs::run_pairing_flow_test: a full INLINE_KEYS
+// TestPairingInlineKeysHandshakeRoundTrip drives a full INLINE_KEYS
 // handshake for channel id 1, asserting both sides derive the same shared
 // key and the same rekeyed channel id, which must differ from the original.
 func TestPairingInlineKeysHandshakeRoundTrip(t *testing.T) {
@@ -157,9 +156,8 @@ func tamperContactBindingHash(t *testing.T, contactWireBytes []byte) []byte {
 	return tampered
 }
 
-// TestPairingHashedKeysPrePairRoundTrip mirrors
-// bindings/rust/src/primitives.rs::run_pairing_flow_hashed_keys_test's PrePair
-// leg: a HASHED_KEYS contact carries only a binding hash, the scanner
+// TestPairingHashedKeysPrePairRoundTrip drives the PrePair leg: a
+// HASHED_KEYS contact carries only a binding hash, the scanner
 // requests the real keys over an ephemeral PrePair exchange, and
 // Response.ProcessPrePair validates the republished keys against that hash
 // before returning them.

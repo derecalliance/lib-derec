@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-// fixtureVariant is one entry of bindings/test_fixture/enums.json. `Wire` is a
+// fixtureVariant is one entry of library/tests/fixtures/enums.json. `Wire` is a
 // serde variant-name string for some enums and a number for others, so it stays
 // untyped until the per-enum check knows which.
 type fixtureVariant struct {
@@ -21,7 +21,7 @@ type fixtureVariant struct {
 func loadEnumFixture(t *testing.T, enumName string) []fixtureVariant {
 	t.Helper()
 	// packages/go/internal/native -> repo root
-	path := filepath.Join("..", "..", "..", "..", "bindings", "test_fixture", "enums.json")
+	path := filepath.Join("..", "..", "..", "..", "library", "tests", "fixtures", "enums.json")
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("reading %s: %v", path, err)

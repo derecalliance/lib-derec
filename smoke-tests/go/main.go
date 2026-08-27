@@ -4,7 +4,7 @@
 // Command go-binding-smoke-test is a runnable consumer of the DeRec Go SDK
 // (github.com/derecalliance/lib-derec/packages/go), imported exactly as an
 // external application would — through the module's public packages only.
-// It mirrors bindings/rust/src/{main,primitives,protocol}.rs: run the
+// It mirrors smoke-tests/rust/src/{main,primitives,protocol}.rs: run the
 // primitive-level produce/extract/process surface, then the stateful
 // DeRecProtocol orchestrator, printing a pass line per flow and exiting
 // non-zero the moment any assertion fails.

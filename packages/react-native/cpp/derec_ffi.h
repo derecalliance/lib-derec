@@ -267,9 +267,8 @@
  * Discriminants selecting which message [`derec_decode_message_json`] and
  * [`derec_encode_message_json`] operate on.
  *
- * Mirrored in `bindings/test_fixture/enums.json`, which every SDK asserts
- * against, so a message added here cannot reach a binding as a silently
- * unhandled value.
+ * Mirrored in the shared enum fixture, which every SDK asserts against, so a
+ * message added here cannot reach a binding as a silently unhandled value.
  */
 #define DEREC_MESSAGE_KIND_PAIR_REQUEST 0
 

@@ -230,8 +230,8 @@ loop {
 }
 ```
 
-A complete working example lives at `bindings/rust/src/protocol.rs` in the
-repository.
+A complete working example lives in the repository's end-to-end tests; see
+[End-to-end test coverage](https://github.com/derecalliance/lib-derec#end-to-end-test-coverage).
 
 ---
 
@@ -568,12 +568,8 @@ an ephemeral endpoint that an observer cannot link to a long-lived
 identity. After pairing completes, propagate a long-term endpoint via
 `DeRecFlow::UpdateChannelInfo`; retire the ephemeral one.
 
-End-to-end smoke tests covering both happy path and tampered-hash:
-- Rust orchestrator level — `bindings/rust/src/protocol.rs::run_hashed_keys_pairing_flow`.
-- nodejs / web orchestrator level — `bindings/nodejs/protocol.ts::runHashedKeysPairingFlow`
-  and `bindings/web/src/protocol.ts::runHashedKeysPairingFlow`.
-- Primitives level — `bindings/{rust,dotnet,nodejs,web}/{primitives.*,Program.cs}` cover
-  the same flow without an orchestrator (the .NET binding is primitives-only).
+This flow is covered end to end — happy path and tampered-hash — for every
+SDK. See [End-to-end test coverage](https://github.com/derecalliance/lib-derec#end-to-end-test-coverage).
 
 ---
 
@@ -1333,8 +1329,8 @@ for entry in &secret_list {
 Recovery is a three-step process: **pairing** (re-establish a channel with
 each helper in recovery mode), **discovery** (ask each helper which secrets it
 holds), and **share collection** (reconstruct the secret). The end-to-end
-flow is orchestrated by the protocol layer; see `bindings/rust/src/protocol.rs`
-in the repository for the full driver loop.
+flow is orchestrated by the protocol layer; the repository's end-to-end tests
+carry a full driver loop — see [End-to-end test coverage](https://github.com/derecalliance/lib-derec#end-to-end-test-coverage).
 
 Helper-side primitive surface:
 

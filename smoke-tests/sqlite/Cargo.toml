@@ -6,7 +6,7 @@ edition = "2024"
 # Self-contained workspace so cargo does not attempt to attach this
 # package to the parent repository workspace (which would require
 # editing the root `Cargo.toml`). The user-visible expectation is that
-# nothing outside `bindings/sqlite/` changes.
+# nothing outside `smoke-tests/sqlite/` changes.
 [workspace]
 
 [dependencies]

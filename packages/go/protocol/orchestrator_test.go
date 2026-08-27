@@ -14,16 +14,13 @@ import (
 // This file is the M3 payoff: two real DeRecProtocol instances (Owner +
 // Helper), each backed by the in-memory store doubles from
 // protocol_test.go plus an in-process transport, driven through a genuine
-// pairing -> protect-secret flow. It mirrors the `InProcessTransport` /
-// `Peer` / `deliver` / `pump` / `pair` pattern in
-// bindings/rust/src/protocol.rs so the Go orchestrator is exercised under
-// the same shape of end-to-end load the Rust reference already validates.
+// pairing -> protect-secret flow, so the Go orchestrator is exercised under
+// a realistic shape of end-to-end load rather than one call at a time.
 
 // orchestratorSecretID is the shared secret identity both peers configure
 // — the protocol-level SecretID that names which secret this pairing
-// manages, agreed out of band before pairing (mirrors
-// bindings/rust/src/protocol.rs's DEFAULT_TEST_SECRET_ID: every peer in a
-// scenario shares the same value, it is not per-node).
+// manages, agreed out of band before pairing. Every peer in a scenario
+// shares the same value; it is not per-node.
 const orchestratorSecretID = 0xDE2EC
 
 // outboxEntry is one buffered outbound message: destination URI plus the
@@ -34,9 +31,8 @@ type outboxEntry struct {
 }
 
 // inProcessTransport buffers outbound (uri, message) pairs instead of
-// performing network I/O, mirroring InProcessTransport in
-// bindings/rust/src/protocol.rs: Send appends to outbox, drain retrieves
-// and clears it. Guarded by a mutex since a protocol instance's transport
+// performing network I/O: Send appends to outbox, drain retrieves and
+// clears it. Guarded by a mutex since a protocol instance's transport
 // callback may fire from whatever goroutine drives Process/Start/Accept.
 type inProcessTransport struct {
 	mu     sync.Mutex
@@ -115,8 +111,7 @@ func newOrchestratorPeer(t *testing.T, label, uri string, threshold uint32) *orc
 }
 
 // deliverToOrchestratorPeer feeds bytes to peer.protocol.Process, then
-// satisfies every emitted ActionRequired via peer.protocol.Accept —
-// mirroring the `deliver` helper in bindings/rust/src/protocol.rs. Returns
+// satisfies every emitted ActionRequired via peer.protocol.Accept. Returns
 // every event produced by process() and the follow-up accept() calls, so
 // the caller can assert on them. Walks the collected slice by index (not
 // range) since an accept() call can itself append further events —
@@ -143,9 +138,8 @@ func deliverToOrchestratorPeer(t *testing.T, peer *orchestratorPeer, bytes []byt
 
 // pumpOrchestratorPeers drains `from`'s outbox and delivers each message
 // to whichever peer's own URI matches the destination, recursively
-// transporting any replies until the network is quiescent — mirroring
-// `pump` in bindings/rust/src/protocol.rs. Returns every event observed
-// across the whole exchange, on both sides.
+// transporting any replies until the network is quiescent. Returns every
+// event observed across the whole exchange, on both sides.
 func pumpOrchestratorPeers(t *testing.T, from, to *orchestratorPeer) []Event {
 	t.Helper()
 	var allEvents []Event
@@ -177,10 +171,9 @@ func pumpOrchestratorPeers(t *testing.T, from, to *orchestratorPeer) []Event {
 // pumpOrchestratorPeersMany is the multi-peer variant of
 // pumpOrchestratorPeers, for flows that fan out to more than one
 // participant in a single round (e.g. an Owner sending StoreShareRequest
-// to several helpers at once) — mirroring `pump_many` in
-// bindings/rust/src/protocol.rs. Drains every peer's outbox, dispatches
-// each message to the peer whose URI matches the destination, and repeats
-// until the whole network is quiescent.
+// to several helpers at once). Drains every peer's outbox, dispatches each
+// message to the peer whose URI matches the destination, and repeats until
+// the whole network is quiescent.
 func pumpOrchestratorPeersMany(t *testing.T, peers []*orchestratorPeer) []Event {
 	t.Helper()
 	var allEvents []Event
@@ -221,9 +214,8 @@ func pumpOrchestratorPeersMany(t *testing.T, peers []*orchestratorPeer) []Event 
 
 // pairOrchestratorPeers drives a full pairing handshake — Owner creates a
 // contact, Helper starts pairing from it, and bytes are pumped both ways
-// until both sides report PairingCompleted — mirroring `pair` in
-// bindings/rust/src/protocol.rs. Returns the long-term channel_id both
-// peers rotated to.
+// until both sides report PairingCompleted. Returns the long-term
+// channel_id both peers rotated to.
 func pairOrchestratorPeers(t *testing.T, owner, helper *orchestratorPeer, pairingChannelID uint64) uint64 {
 	t.Helper()
 

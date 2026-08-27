@@ -5,7 +5,7 @@
 // plus two Helpers), each backed by in-memory implementations of the six
 // store/transport interfaces, driven through a genuine pairing ->
 // protect-secret -> ShareStored flow over an in-process transport. Mirrors
-// bindings/rust/src/protocol.rs and packages/go/protocol/orchestrator_test.go,
+// smoke-tests/rust/src/protocol.rs and packages/go/protocol/orchestrator_test.go,
 // but as an external consumer: only the public
 // github.com/derecalliance/lib-derec/packages/go/protocol package is
 // imported, never packages/go/internal/....
@@ -23,7 +23,7 @@ import (
 
 // protocolSecretID is the shared secret identity both peers configure —
 // agreed out of band before pairing, mirroring
-// bindings/rust/src/protocol.rs's DEFAULT_TEST_SECRET_ID.
+// smoke-tests/rust/src/protocol.rs's DEFAULT_TEST_SECRET_ID.
 const protocolSecretID = uint64(0xDE2EC)
 
 // -- In-memory store implementations, one per protocol.*Store interface --
@@ -460,7 +460,7 @@ func (p *peer) drain() []outboxEntry {
 
 // deliver feeds bytes to peer.proto.Process, then satisfies every emitted
 // ActionRequired via peer.proto.Accept — mirroring the `deliver` helper in
-// bindings/rust/src/protocol.rs. Returns every event produced by Process
+// smoke-tests/rust/src/protocol.rs. Returns every event produced by Process
 // and the follow-up Accept calls.
 func deliver(p *peer, bytes []byte) []protocol.Event {
 	collected, err := p.proto.Process(bytes)
@@ -480,7 +480,7 @@ func deliver(p *peer, bytes []byte) []protocol.Event {
 // pump drains `from`'s outbox and delivers each message to whichever peer's
 // own URI matches the destination, recursively transporting any replies
 // until the network is quiescent — mirroring `pump` in
-// bindings/rust/src/protocol.rs.
+// smoke-tests/rust/src/protocol.rs.
 func pump(from, to *peer) []protocol.Event {
 	var allEvents []protocol.Event
 	pending := from.drain()
@@ -509,7 +509,7 @@ func pump(from, to *peer) []protocol.Event {
 
 // pumpMany is the multi-peer variant of pump, for flows that fan out to
 // more than one participant in a single round (e.g. Owner -> several
-// Helpers) — mirroring `pump_many` in bindings/rust/src/protocol.rs.
+// Helpers) — mirroring `pump_many` in smoke-tests/rust/src/protocol.rs.
 func pumpMany(peers []*peer) []protocol.Event {
 	var allEvents []protocol.Event
 
@@ -549,7 +549,7 @@ func pumpMany(peers []*peer) []protocol.Event {
 // pairPeers drives a full pairing handshake — Owner creates a contact,
 // Helper starts pairing from it, and bytes are pumped both ways until both
 // sides report PairingCompleted — mirroring `pair` in
-// bindings/rust/src/protocol.rs. Returns the long-term channel_id both
+// smoke-tests/rust/src/protocol.rs. Returns the long-term channel_id both
 // peers rotated to.
 func pairPeers(owner, helper *peer, pairingChannelID uint64) uint64 {
 	return pairPeersWithMode(owner, helper, pairingChannelID, protocol.ContactModeInlineKeys)

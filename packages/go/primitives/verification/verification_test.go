@@ -59,9 +59,9 @@ func TestVerificationRequestRejectsShortKey(t *testing.T) {
 	}
 }
 
-// TestVerificationResponseRoundTrip mirrors run_verification_flow_test in
-// bindings/rust/src/primitives.rs: split a real secret into committed shares,
-// challenge channel 1, answer with its share content, and confirm the owner
+// TestVerificationResponseRoundTrip splits a real secret into committed
+// shares, challenges channel 1, answers with its share content, and
+// confirms the owner
 // accepts a response proving possession of the exact share while rejecting
 // one proving possession of a different channel's share.
 func TestVerificationResponseRoundTrip(t *testing.T) {

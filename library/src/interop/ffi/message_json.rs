@@ -34,9 +34,8 @@ use crate::interop::ffi::error::{
 /// Discriminants selecting which message [`derec_decode_message_json`] and
 /// [`derec_encode_message_json`] operate on.
 ///
-/// Mirrored in `bindings/test_fixture/enums.json`, which every SDK asserts
-/// against, so a message added here cannot reach a binding as a silently
-/// unhandled value.
+/// Mirrored in the shared enum fixture, which every SDK asserts against, so a
+/// message added here cannot reach a binding as a silently unhandled value.
 pub const DEREC_MESSAGE_KIND_PAIR_REQUEST: i32 = 0;
 pub const DEREC_MESSAGE_KIND_PAIR_RESPONSE: i32 = 1;
 pub const DEREC_MESSAGE_KIND_PRE_PAIR_REQUEST: i32 = 2;
@@ -383,7 +382,7 @@ mod tests {
     use prost::Message as _;
 
     /// Every kind this FFI accepts, paired with the name
-    /// `bindings/test_fixture/enums.json` records for it. The round-trip test
+    /// `library/tests/fixtures/enums.json` records for it. The round-trip test
     /// walks this list and `fixture_matches_the_dispatch_table` compares it to
     /// the fixture, so a kind added to the dispatch table without being added
     /// here is caught either way.
@@ -434,7 +433,7 @@ mod tests {
     fn fixture_matches_the_dispatch_table() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../bindings/test_fixture/enums.json"
+            "/tests/fixtures/enums.json"
         );
         let doc: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(path).expect("read fixture"))
@@ -459,7 +458,7 @@ mod tests {
 
         assert_eq!(
             recorded, declared,
-            "bindings/test_fixture/enums.json MessageKind is out of step with \
+            "library/tests/fixtures/enums.json MessageKind is out of step with \
              the constants in this module"
         );
     }

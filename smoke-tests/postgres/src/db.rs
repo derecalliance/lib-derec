@@ -40,7 +40,7 @@ impl Database {
             .unwrap_or_else(|e| {
                 panic!(
                     "failed to connect to Postgres at {url}: {e}\n\
-                     Did you run `docker compose up -d` in bindings/postgres?"
+                     Did you run `docker compose up -d` in smoke-tests/postgres?"
                 )
             });
         tokio::spawn(async move {
@@ -127,7 +127,7 @@ pub async fn cleanup_stale_schemas() {
         .unwrap_or_else(|e| {
             panic!(
                 "cleanup: failed to connect to Postgres at {url}: {e}\n\
-                 Did you run `docker compose up -d` in bindings/postgres?"
+                 Did you run `docker compose up -d` in smoke-tests/postgres?"
             )
         });
     let handle = tokio::spawn(async move {

@@ -374,7 +374,7 @@ The same cross-compilation prerequisites as the .NET build apply
 
 ```bash
 cd packages/go && CGO_ENABLED=0 go test ./...
-cd ../bindings/go && CGO_ENABLED=0 go run .
+cd ../smoke-tests/go && CGO_ENABLED=0 go run .
 ```
 
 Both must pass. Confirm each staged lib exports the FFI surface, e.g.

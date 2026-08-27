@@ -184,8 +184,8 @@ awaiting them additionally lets a failure surface instead of vanishing.
 
 **The `DeRecErrorCategory` union differs from nodejs's.** This SDK's union
 omits `"wasm"`, which a C-ABI binding can never emit, and adds `"ok"`,
-`"ffi"` and `"state_store"`, which it can. A test pins the union to
-`bindings/test_fixture/enums.json` so it stays in step with the Rust enum.
+`"ffi"` and `"state_store"`, which it can. A test pins the union to the crate's shared enum fixture so it stays in step
+with the Rust enum.
 
 **Ids are decimal strings in stores, `bigint | number` on `DeRecProtocol`.**
 Store interfaces (`ChannelStore`, `ShareStore`, event fields such as

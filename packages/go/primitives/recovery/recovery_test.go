@@ -19,9 +19,9 @@ func sharedKey(fill byte) []byte {
 	return k
 }
 
-// TestRecoverReconstructsOriginalSecret mirrors run_recovery_flow_test in
-// bindings/rust/src/primitives.rs: split a secret across three channels at
-// threshold 2, store committed shares with two of the helpers, walk the
+// TestRecoverReconstructsOriginalSecret splits a secret across three
+// channels at threshold 2, stores committed shares with two of the
+// helpers, walks the
 // get-share request/response exchange with each, and assert the recovered
 // secret is byte-identical to the original.
 func TestRecoverReconstructsOriginalSecret(t *testing.T) {

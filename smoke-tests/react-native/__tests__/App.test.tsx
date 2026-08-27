@@ -7,7 +7,7 @@
  * a device. Under Jest there is no JSI host object, so the render would either
  * fail on the missing module or, worse, pass while proving nothing.
  *
- * The scenarios are exercised by `bindings/react-native/run_test.sh`; the
+ * The scenarios are exercised by `smoke-tests/react-native/run_test.sh`; the
  * SDK's own logic is covered by the unit tests in
  * `packages/react-native/__tests__/`.
  */

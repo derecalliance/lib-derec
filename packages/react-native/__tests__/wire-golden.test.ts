@@ -8,7 +8,7 @@ import { buildProtectSecretParams, buildRestoreParams } from '../src/protocol';
 import type { DeRecEvent, ProtectSecretParams } from '../src/types';
 
 const golden = JSON.parse(
-  fs.readFileSync(path.join(__dirname, '../../../bindings/test_fixture/wire_golden.json'), 'utf8'),
+  fs.readFileSync(path.join(__dirname, '../../../library/tests/fixtures/wire_golden.json'), 'utf8'),
 ) as Record<string, unknown>;
 
 function asciiBytes(text: string): Uint8Array {

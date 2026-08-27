@@ -4,8 +4,8 @@
 /**
  * Every category name `derec_error_category_name` can return, and no others.
  *
- * This is the authoritative list for this SDK, mirrored by a test against
- * `bindings/test_fixture/enums.json` so it cannot drift from the Rust enum.
+ * This is the authoritative list for this SDK, held to the Rust enum by a
+ * test against the shared enum fixture so the two cannot drift.
  * It deliberately differs from `@derec-alliance/nodejs`'s union, which was
  * the original source of this file: that union lists `"wasm"`, a category no
  * C-ABI binding can ever emit, and omits `"ok"`, `"ffi"` and `"state_store"`,

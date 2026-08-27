@@ -3,7 +3,7 @@
 // Protocol smoke tests: exercises the stateful DeRecProtocol orchestrator
 // (handle FFI + storage/transport callbacks + flow start/process/accept
 // surface) across pair, sharing, discovery, recovery, and replica flows.
-// Mirrors `bindings/nodejs/protocol.ts` and `bindings/web/src/protocol.ts`.
+// Mirrors `smoke-tests/nodejs/protocol.ts` and `smoke-tests/web/src/protocol.ts`.
 
 using System;
 using System.Collections.Generic;
@@ -46,15 +46,15 @@ internal static class Protocol
     /// emit. <c>ChannelStatus</c> once gained <c>Unpairing</c> that never
     /// reached .NET, and nothing here noticed, because the suite only ever
     /// exercised the variants .NET already declared.
-    /// <c>bindings/test_fixture/enums.json</c> is the external source of truth
+    /// <c>library/tests/fixtures/enums.json</c> is the external source of truth
     /// that closes that gap; Rust asserts it stays complete.
     /// </summary>
     private static void RunEnumFixtureTest()
     {
         Console.WriteLine("=== Protocol enum fixture test ===");
 
-        // bindings/dotnet -> repo root
-        string path = Path.Combine("..", "..", "bindings", "test_fixture", "enums.json");
+        // smoke-tests/dotnet -> repo root
+        string path = Path.Combine("..", "..", "library", "tests", "fixtures", "enums.json");
         if (!File.Exists(path))
         {
             throw new Exception($"enum fixture not found at {Path.GetFullPath(path)}");
@@ -1668,7 +1668,7 @@ internal static class Protocol
     /// <summary>
     /// In-memory peer composed of fresh stores + a recording transport
     /// + the <see cref="DeRecProtocol"/> built on top. Mirrors the
-    /// <c>Node</c> wrapper in <c>bindings/nodejs/protocol.ts</c>. Use
+    /// <c>Node</c> wrapper in <c>smoke-tests/nodejs/protocol.ts</c>. Use
     /// <see cref="MakeNode"/> to construct one.
     /// </summary>
     private sealed record Node(

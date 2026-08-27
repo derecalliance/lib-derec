@@ -3,7 +3,7 @@
 // Primitive smoke tests: exercises the low-level produce/extract/process
 // surface for each flow (pairing, sharing, verification, recovery,
 // discovery, unpairing) plus the cross-cutting envelope/replyTo helpers.
-// Mirrors `bindings/nodejs/primitives.ts` and `bindings/web/src/primitives.ts`.
+// Mirrors `smoke-tests/nodejs/primitives.ts` and `smoke-tests/web/src/primitives.ts`.
 
 using System;
 using System.Collections.Generic;

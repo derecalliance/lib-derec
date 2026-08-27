@@ -8,6 +8,10 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LIBRARY_DIR="$ROOT_DIR/library"
 WORKSPACE_TARGET_DIR="$ROOT_DIR/target"
 PKG_DIR="$ROOT_DIR/packages/react-native"
+# Beside pkg-nodejs and pkg-web, so every publishable package stages in one
+# place. `WORKSPACE_TARGET_DIR` is the cargo workspace target at the repository
+# root, which is a different directory.
+STAGE_DIR="$LIBRARY_DIR/target/pkg-react-native"
 
 IOS_DIR="$PKG_DIR/ios"
 ANDROID_JNI_DIR="$PKG_DIR/android/src/main/jniLibs"
@@ -160,6 +164,7 @@ main() {
   require_cmd xcodebuild
   require_cmd cargo-ndk
   require_cmd node
+  require_cmd rsync
 
   if [[ -z "${ANDROID_NDK_HOME:-}" ]]; then
     echo "ANDROID_NDK_HOME must be set (cargo-ndk needs it to locate the NDK toolchain)." >&2
@@ -175,32 +180,53 @@ main() {
   echo "── Compiling TypeScript ────────────────────────────────────"
   (cd "$PKG_DIR" && npx tsc --project tsconfig.build.json)
 
-  # `packages/react-native/package.json` is tracked, because unlike the other
-  # packages this one has its own in-tree test suite: `npm ci` and `jest` need
-  # a manifest carrying `devDependencies` and `scripts`, and the lockfile is
-  # resolved against it. Publishing needs the opposite — neither key belongs in
-  # a published tarball. So the staged manifest is the override plus the
-  # version, and the tracked development manifest is restored afterwards.
-  echo "── Writing package.json ────────────────────────────────────"
-  VERSION="$("$ROOT_DIR/scripts/get-version.sh")"
+  stage_package
+}
+
+# Assembles the publishable package into `library/target/pkg-react-native`,
+# the way every other package is staged.
+#
+# The source directory is never mutated. It previously received the publish
+# manifest in place, which made publishing a three-step dance — run this
+# script, publish, restore the manifest — with two failure modes that both
+# happened: publishing before staging ships the development manifest, and
+# committing after staging strips `devDependencies` from the repository.
+# Staging elsewhere removes both: the source tree keeps its development
+# manifest permanently, and the directory that gets published contains only
+# what ships.
+stage_package() {
+  local version
+  version="$("$ROOT_DIR/scripts/get-version.sh")"
+
+  echo "── Staging publishable package ─────────────────────────────"
+  rm -rf "$STAGE_DIR"
+  mkdir -p "$STAGE_DIR"
+
+  # `cpp/tests` is a host-only harness and `android/build` / `android/.cxx`
+  # are Gradle output that the smoke app refills on every run; excluding them
+  # here is what keeps the tarball at ~50 MB instead of ~720 MB.
+  rsync -a "$PKG_DIR/lib/" "$STAGE_DIR/lib/"
+  rsync -a "$PKG_DIR/src/" "$STAGE_DIR/src/"
+  rsync -a --exclude 'tests/' "$PKG_DIR/cpp/" "$STAGE_DIR/cpp/"
+  rsync -a "$PKG_DIR/ios/" "$STAGE_DIR/ios/"
+  rsync -a --exclude 'build/' --exclude '.cxx/' "$PKG_DIR/android/" "$STAGE_DIR/android/"
+  cp "$PKG_DIR/DeRec.podspec" "$PKG_DIR/react-native.config.js" "$PKG_DIR/README.md" "$STAGE_DIR/"
+  cp "$ROOT_DIR/LICENSE" "$STAGE_DIR/LICENSE"
+
   node -e '
     const fs = require("fs");
-    const path = process.argv[1];
-    const version = process.argv[2];
-    const override = JSON.parse(fs.readFileSync(path + "/package.override.json", "utf8"));
-    fs.writeFileSync(
-      path + "/package.json",
-      JSON.stringify({ ...override, version, license: "Apache-2.0" }, null, 2) + "\n"
+    const [pkgDir, stageDir, version] = process.argv.slice(1);
+    const override = JSON.parse(
+      fs.readFileSync(pkgDir + "/package.override.json", "utf8"),
     );
-  ' "$PKG_DIR" "$VERSION"
+    fs.writeFileSync(
+      stageDir + "/package.json",
+      JSON.stringify({ ...override, version, license: "Apache-2.0" }, null, 2) + "\n",
+    );
+  ' "$PKG_DIR" "$STAGE_DIR" "$version"
 
-  cp "$ROOT_DIR/LICENSE" "$PKG_DIR/LICENSE"
-  echo "Package staged at version $VERSION"
-  echo ""
-  echo "packages/react-native/package.json now holds the publish manifest."
-  echo "After 'npm publish', restore the development manifest with:"
-  echo ""
-  echo "  git checkout packages/react-native/package.json"
+  echo "Package staged at version $version"
+  echo "  publish with: (cd $STAGE_DIR && npm publish --access public)"
 }
 
 # Guards direct execution so this file can also be `source`d (e.g. to run

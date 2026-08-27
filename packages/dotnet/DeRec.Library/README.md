@@ -219,8 +219,8 @@ catch (DeRecException e)
 }
 ```
 
-End-to-end primitive-level coverage (including the tampered-hash assertion)
-lives at `bindings/dotnet/Program.cs::RunPairingFlowHashedKeysTest`. The
+This flow is covered end to end, including the tampered-hash assertion — see
+[End-to-end test coverage](https://github.com/derecalliance/lib-derec#end-to-end-test-coverage). The
 higher-level `DeRecProtocol` orchestrator is also available — see
 [Using `DeRecProtocol` (orchestrator)](#using-derecprotocol-orchestrator).
 
@@ -419,10 +419,7 @@ App-side responsibilities (mirrors the other SDKs):
   (`channelStore.LinkChannel(oldId, newId)`) so recovery can fan out on
   the new pair while still surfacing shares stored under the old one.
 
-End-to-end coverage:
-`bindings/dotnet/Program.cs::RunOrchestratorPairFlowTest`,
-`RunOrchestratorShareAndDiscoverFlowTest`,
-`RunOrchestratorReplicaPairAndSecretSyncTest`.
+End-to-end coverage: see [End-to-end test coverage](https://github.com/derecalliance/lib-derec#end-to-end-test-coverage).
 
 ---
 
@@ -468,8 +465,8 @@ var ev = events.OfType<ReplicaSecretReceivedEvent>().First();
 ```
 
 `ev.Secret` + `ev.Shares` give the Destination everything it needs to act
-in the Source's place during recovery. Smoke parity reference:
-`bindings/dotnet/Program.cs::RunOrchestratorReplicaPairAndSecretSyncTest`.
+in the Source's place during recovery. This is covered end to end — see
+[End-to-end test coverage](https://github.com/derecalliance/lib-derec#end-to-end-test-coverage).
 
 ---
 

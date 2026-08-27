@@ -2,7 +2,7 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 // Primitives smoke tests: exercises every flow using the low-level
 // `primitives.*` API (raw message produce / extract / process functions).
-// Mirrors the Rust primitive smoke test (`bindings/rust/src/primitives.rs`).
+// Mirrors the Rust primitive smoke test (`smoke-tests/rust/src/primitives.rs`).
 // The chain in each flow is request.produce → request.extract → response.produce
 // → response.extract → response.process, matching the current Rust signatures
 // one-for-one.
