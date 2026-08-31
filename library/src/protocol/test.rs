@@ -22,11 +22,15 @@ use derec_proto::TransportProtocol;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-/// Two maps, mirroring the two primary keys the trait defines.
+/// Two maps, mirroring the two primary keys the trait defines, plus the
+/// channel-link graph recovery walks.
 #[derive(Default, Clone)]
 pub(crate) struct InMemChannelStore {
     pub(crate) helper_rows: Arc<Mutex<HashMap<(u64, u64), HelperChannel>>>,
     pub(crate) member_rows: Arc<Mutex<HashMap<(u64, u64), ReplicaMember>>>,
+    /// Undirected edges, stored both ways so a walk can start at either end.
+    #[allow(clippy::type_complexity)]
+    pub(crate) links: Arc<Mutex<HashMap<(u64, u64), Vec<u64>>>>,
 }
 
 impl DeRecChannelStore for InMemChannelStore {
@@ -110,12 +114,38 @@ impl DeRecChannelStore for InMemChannelStore {
         Box::pin(std::future::ready(Ok(v)))
     }
 
-    fn link_channel(&mut self, _: u64, _: ChannelId, _: ChannelId) -> ChannelStoreFuture<'_, ()> {
+    fn link_channel(&mut self, sid: u64, a: ChannelId, b: ChannelId) -> ChannelStoreFuture<'_, ()> {
+        let mut links = self.links.lock().unwrap();
+        for (from, to) in [(a.0, b.0), (b.0, a.0)] {
+            let edges = links.entry((sid, from)).or_default();
+            if !edges.contains(&to) {
+                edges.push(to);
+            }
+        }
+        drop(links);
         Box::pin(std::future::ready(Ok(())))
     }
 
-    fn linked_channels(&self, _: u64, cid: ChannelId) -> ChannelStoreFuture<'_, Vec<ChannelId>> {
-        Box::pin(std::future::ready(Ok(vec![cid])))
+    /// Transitive closure including the start node — the same walk a SQL
+    /// store expresses with a recursive CTE. Returning only `[cid]`, as this
+    /// used to, makes a multi-channel recovery unrepresentable in tests.
+    fn linked_channels(&self, sid: u64, cid: ChannelId) -> ChannelStoreFuture<'_, Vec<ChannelId>> {
+        let links = self.links.lock().unwrap();
+        let mut seen = vec![cid.0];
+        let mut queue = vec![cid.0];
+        while let Some(node) = queue.pop() {
+            for next in links.get(&(sid, node)).into_iter().flatten() {
+                if !seen.contains(next) {
+                    seen.push(*next);
+                    queue.push(*next);
+                }
+            }
+        }
+        drop(links);
+        Box::pin(std::future::ready(Ok(seen
+            .into_iter()
+            .map(ChannelId)
+            .collect())))
     }
 }
 
@@ -188,11 +218,34 @@ impl DeRecShareStore for InMemShareStore {
             .collect();
         Box::pin(std::future::ready(Ok(out)))
     }
-    fn load_many(&self, _: u64, _: &[ChannelId], _: &[u32]) -> ShareStoreFuture<'_, Vec<Share>> {
-        Box::pin(std::future::ready(Ok(Vec::new())))
+    /// Ordered by `(version, channel_id)`. A store backed by a real database
+    /// returns rows in whatever order the plan produces, so a caller that
+    /// depends on which row arrives first is depending on something no store
+    /// guarantees; a deterministic mock is what makes that dependence
+    /// reproducible in a test instead of intermittent in production.
+    fn load_many(
+        &self,
+        sid: u64,
+        cids: &[ChannelId],
+        versions: &[u32],
+    ) -> ShareStoreFuture<'_, Vec<Share>> {
+        let wanted: Vec<u64> = cids.iter().map(|c| c.0).collect();
+        let lock = self.data.lock().unwrap();
+        let mut out: Vec<(u64, Share)> = lock
+            .iter()
+            .filter(|((s, c, v), _)| {
+                *s == sid && wanted.contains(c) && (versions.is_empty() || versions.contains(v))
+            })
+            .map(|((_, c, _), share)| (*c, share.clone()))
+            .collect();
+        out.sort_by_key(|(c, share)| (share.version, *c));
+        Box::pin(std::future::ready(Ok(out
+            .into_iter()
+            .map(|(_, share)| share)
+            .collect())))
     }
-    fn load_all(&self, _: u64, _: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
-        Box::pin(std::future::ready(Ok(Vec::new())))
+    fn load_all(&self, sid: u64, cids: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
+        self.load_many(sid, cids, &[])
     }
     fn latest_version(&self, _: u64) -> ShareStoreFuture<'_, Option<u32>> {
         Box::pin(std::future::ready(Ok(None)))

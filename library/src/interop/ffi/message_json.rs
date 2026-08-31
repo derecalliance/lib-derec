@@ -431,10 +431,7 @@ mod tests {
     /// unhandled value. See `library/tests/enum_fixture.rs`.
     #[test]
     fn fixture_matches_the_dispatch_table() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/enums.json"
-        );
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/enums.json");
         let doc: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(path).expect("read fixture"))
                 .expect("parse fixture");

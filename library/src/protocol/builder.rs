@@ -45,15 +45,19 @@ pub const DEFAULT_KEEP_VERSIONS_COUNT: usize = 3;
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// let protocol = DeRecProtocolBuilder::new()
+/// The store types are yours to supply, so this cannot be a compiled example:
+///
+/// ```text
+/// let protocol = DeRecProtocolBuilder::new(secret_id)
 ///     .with_channel_store(my_channel_store)
 ///     .with_share_store(my_share_store)
 ///     .with_secret_store(my_secret_store)
+///     .with_user_secret_store(my_user_secret_store)
+///     .with_state_store(my_state_store)
 ///     .with_transport(my_transport)
-///     .with_own_transport(TransportProtocol { uri: "https://me.example.com".into(), .. })
+///     .with_own_transport("https://me.example.com")
 ///     // Plus any optional with_* setters to override defaults.
-///     .build();
+///     .build()?;
 /// ```
 pub struct DeRecProtocolBuilder<
     ChannelStore,

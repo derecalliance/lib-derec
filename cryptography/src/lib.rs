@@ -35,7 +35,10 @@
 //! tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 //! ```
 //!
-//! ```rust,ignore
+//! `tracing-subscriber` is the consumer's dependency, not this crate's, so the
+//! snippet below is illustrative rather than a compiled example:
+//!
+//! ```text
 //! // main.rs / lib.rs — set DEREC_LOG=debug before running
 //! tracing_subscriber::fmt()
 //!     .with_env_filter(

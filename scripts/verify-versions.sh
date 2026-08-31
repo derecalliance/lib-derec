@@ -12,6 +12,14 @@
 # it only as a git tag. A bump that misses one of those is invisible until
 # something is published at the wrong version — which is not recoverable on
 # crates.io, and awkward everywhere else.
+#
+# Two things beyond the artifacts themselves:
+#
+#   * The version pins the three crates use to depend on *each other*. These
+#     live in library/Cargo.toml and are easy to bump the packages without.
+#   * The Go module tag. Go has no manifest, so the tag is the version — and
+#     it is pushed after publishing, so during `make all` it is normally
+#     absent. That one is a warning, never a failure.
 
 set -euo pipefail
 
@@ -19,6 +27,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXPECTED="$("$ROOT_DIR/scripts/get-version.sh")"
 
 failures=0
+warnings=0
 
 check() {
   local name="$1" actual="$2"
@@ -44,6 +53,23 @@ echo "expected version: $EXPECTED"
 check "crate: derec-proto"        "$(crate_version protobufs)"
 check "crate: derec-cryptography" "$(crate_version cryptography)"
 check "crate: derec-library"      "$(crate_version library)"
+
+# The three crates are also pinned to each other by version inside
+# library/Cargo.toml. Bumping the package versions and forgetting these
+# publishes a derec-library that depends on the *previous* derec-proto — which
+# resolves, builds, and is wrong, with no way to correct it after the fact
+# because crates.io versions are immutable.
+# `derec-proto` is pinned twice — once for the host build and once under the
+# wasm32 target table — so the line number is what tells the two apart when
+# only one of them is stale.
+while read -r line dep actual; do
+  check "  dep pin: $dep:$line" "$actual"
+done < <(
+  awk -F'"' '/^derec-(proto|cryptography) = \{ version = "/ {
+    split($0, name, " ");
+    print NR, name[1], $2
+  }' "$ROOT_DIR/library/Cargo.toml"
+)
 
 check "npm: nodejs"       "$(json_version "$ROOT_DIR/library/target/pkg-nodejs/package.json")"
 check "npm: web"          "$(json_version "$ROOT_DIR/library/target/pkg-web/package.json")"
@@ -72,6 +98,20 @@ else
   failures=$((failures + 1))
 fi
 
+# Go is the one package with no manifest to read: a module's version *is* its
+# git tag. That makes it the only artifact whose version cannot be confirmed
+# from a built file, and the tag is pushed *after* publishing rather than
+# before — so during `make all` its absence is the normal case and must not
+# fail the build. It is reported instead, because it is also the one release
+# step nothing else in this script can verify for you.
+go_tag="packages/go/v$EXPECTED"
+if git -C "$ROOT_DIR" rev-parse -q --verify "refs/tags/$go_tag" >/dev/null 2>&1; then
+  printf '  %-26s %s\n' "go: module tag" "$go_tag"
+else
+  printf '  %-26s %s\n' "go: module tag" "$go_tag not created yet (warning)"
+  warnings=$((warnings + 1))
+fi
+
 if (( failures > 0 )); then
   echo "" >&2
   echo "$failures artifact(s) disagree with library/Cargo.toml." >&2
@@ -79,3 +119,6 @@ if (( failures > 0 )); then
 fi
 
 echo "all artifacts agree at $EXPECTED"
+if (( warnings > 0 )); then
+  echo "$warnings warning(s): see above. Not a build failure."
+fi

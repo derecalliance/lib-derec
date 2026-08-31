@@ -4,6 +4,26 @@
 //! The `Secret` data model: the roster, user secrets, and replica group that
 //! make up a recoverable secret. These are `prost` messages; their recoverable
 //! JSON encoding lives in the sibling `codec`/`versions` modules.
+//!
+//! # Debug redaction
+//!
+//! Three fields here are the material the protocol exists to protect:
+//! [`UserSecret::data`], [`HelperInfo::shared_key`] and
+//! [`Replicas::shared_key`]. `prost::Message` requires `Debug` as a supertrait
+//! and its derive would print all three verbatim, so one `tracing::debug!(?x)`
+//! or `{:?}` in an error path would put plaintext secrets and symmetric keys
+//! into a log.
+//!
+//! The hand-written key-bearing types elsewhere in this crate avoid that by
+//! deriving no `Debug` at all ([`crate::protocol::types::SecretValue`],
+//! `PairingKeyMaterial`). These cannot — `prost::Message` demands it — so they
+//! use `#[prost(skip_debug)]` and the manual impls at the end of this file,
+//! which report a length in place of the bytes. Structural fields stay
+//! visible, so the output is still worth reading.
+//!
+//! [`Secret`] needs no impl of its own: the derived one delegates to these.
+
+use core::fmt;
 
 /// Per-helper metadata stored inside the secret for recovery.
 ///
@@ -12,6 +32,7 @@
 /// In the recoverable JSON encoding (see [`crate::protocol::types::secret`]), `shared_key` serializes as
 /// base64 and `channel_id` as a decimal string.
 #[derive(Clone, PartialEq, ::prost::Message)]
+#[prost(skip_debug)]
 pub struct HelperInfo {
     /// Unique channel identifier assigned during pairing.
     #[prost(uint64, tag = "1")]
@@ -48,6 +69,7 @@ pub struct HelperInfo {
 /// In the recoverable JSON encoding (see [`crate::protocol::types::secret`]), `id` and `data` serialize as
 /// base64.
 #[derive(Clone, PartialEq, ::prost::Message)]
+#[prost(skip_debug)]
 pub struct UserSecret {
     /// Application-defined identifier.
     #[prost(bytes = "vec", tag = "1")]
@@ -140,6 +162,7 @@ pub struct Secret {
 /// side during sharing round construction and on the consumer side in
 /// [`crate::protocol::DeRecProtocol::restore`].
 #[derive(Clone, PartialEq, ::prost::Message)]
+#[prost(skip_debug)]
 pub struct Replicas {
     /// Every member of the group, including the source and the writer.
     #[prost(message, repeated, tag = "1")]
@@ -150,4 +173,139 @@ pub struct Replicas {
     /// The one channel every member is addressed on.
     #[prost(uint64, tag = "3")]
     pub channel_id: u64,
+}
+
+/// Stands in for a byte field that must not be printed.
+///
+/// The length is kept because it is the part worth debugging — a key that is
+/// not 32 bytes, or a secret that is unexpectedly empty, is exactly the sort
+/// of thing someone reaches for `{:?}` to find.
+struct Redacted<'a>(&'a [u8]);
+
+impl fmt::Debug for Redacted<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<redacted, {} bytes>", self.0.len())
+    }
+}
+
+impl fmt::Debug for UserSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UserSecret")
+            .field("id", &Redacted(&self.id))
+            .field("name", &self.name)
+            .field("data", &Redacted(&self.data))
+            .finish()
+    }
+}
+
+impl fmt::Debug for HelperInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HelperInfo")
+            .field("channel_id", &self.channel_id)
+            .field("transport_uri", &self.transport_uri)
+            .field("shared_key", &Redacted(&self.shared_key))
+            .field("communication_info", &self.communication_info)
+            .finish()
+    }
+}
+
+impl fmt::Debug for Replicas {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Replicas")
+            .field("members", &self.members)
+            .field("shared_key", &Redacted(&self.shared_key))
+            .field("channel_id", &self.channel_id)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    /// Distinctive enough that a substring search cannot miss it, and not a
+    /// value any structural field would print by coincidence.
+    const PLAINTEXT: &[u8] = b"correct-horse-battery-staple";
+    const KEY: [u8; 32] = [0xA7; 32];
+
+    fn user_secret() -> UserSecret {
+        UserSecret {
+            id: vec![0xDE, 0xAD],
+            name: "wallet".to_owned(),
+            data: PLAINTEXT.to_vec(),
+        }
+    }
+
+    /// The formatted bytes, as `tracing::debug!(?x)` would render them.
+    fn rendered(value: &impl fmt::Debug) -> String {
+        format!("{value:?}")
+    }
+
+    /// A byte slice prints through `Debug` as `[222, 173]`, so searching for
+    /// the literal bytes is not enough — the decimal rendering is what would
+    /// actually land in a log line.
+    fn decimal_rendering(bytes: &[u8]) -> String {
+        format!("{bytes:?}")
+    }
+
+    #[test]
+    fn a_user_secret_does_not_print_its_plaintext() {
+        let out = rendered(&user_secret());
+
+        assert!(!out.contains("correct-horse-battery-staple"));
+        assert!(!out.contains(&decimal_rendering(PLAINTEXT)));
+        assert!(out.contains("<redacted, 28 bytes>"), "{out}");
+        // The label is the point of the line — redaction that hides
+        // everything is redaction nobody keeps.
+        assert!(out.contains("wallet"), "{out}");
+    }
+
+    #[test]
+    fn helper_and_replica_group_keys_are_not_printed() {
+        let helper = HelperInfo {
+            channel_id: 7,
+            transport_uri: "https://helper.example".to_owned(),
+            shared_key: KEY.to_vec(),
+            communication_info: Default::default(),
+        };
+        let out = rendered(&helper);
+        assert!(!out.contains(&decimal_rendering(&KEY)), "{out}");
+        assert!(out.contains("<redacted, 32 bytes>"), "{out}");
+        assert!(out.contains("https://helper.example"), "{out}");
+
+        let replicas = Replicas {
+            members: Vec::new(),
+            shared_key: KEY.to_vec(),
+            channel_id: 9,
+        };
+        let out = rendered(&replicas);
+        assert!(!out.contains(&decimal_rendering(&KEY)), "{out}");
+        assert!(out.contains("<redacted, 32 bytes>"), "{out}");
+    }
+
+    /// `Secret` has no impl of its own; this is what proves the derived one
+    /// delegates rather than reaching past the leaves and printing the bytes
+    /// itself. Nesting is where redaction usually leaks back out.
+    #[test]
+    fn a_secret_does_not_leak_through_its_nested_fields() {
+        let secret = Secret {
+            helpers: vec![HelperInfo {
+                channel_id: 7,
+                transport_uri: "https://helper.example".to_owned(),
+                shared_key: KEY.to_vec(),
+                communication_info: Default::default(),
+            }],
+            secrets: vec![user_secret()],
+            replicas: Some(Replicas {
+                members: Vec::new(),
+                shared_key: KEY.to_vec(),
+                channel_id: 9,
+            }),
+        };
+
+        let out = rendered(&secret);
+        assert!(!out.contains("correct-horse-battery-staple"), "{out}");
+        assert!(!out.contains(&decimal_rendering(PLAINTEXT)), "{out}");
+        assert!(!out.contains(&decimal_rendering(&KEY)), "{out}");
+    }
 }

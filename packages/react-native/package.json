@@ -1,6 +1,6 @@
 {
   "name": "@derec-alliance/react-native",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "React Native bindings for derec-library, the Rust SDK for the DeRec protocol.",
   "license": "Apache-2.0",
   "repository": {

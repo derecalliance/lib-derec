@@ -66,11 +66,17 @@
 //!
 //! # Usage
 //!
-//! ```rust, ignore
-//! use derec_cryptography::envelope;
+//! ```rust
+//! use derec_cryptography::pairing::{envelope, pairing_ecies};
+//! use rand::rngs::OsRng;
 //!
-//! let ciphertext = envelope::encrypt(&plaintext, &public_key).unwrap();
+//! // `generate_key` returns the secret key first, then the public key.
+//! let (secret_key, public_key) = pairing_ecies::generate_key(&mut OsRng).unwrap();
+//!
+//! let ciphertext = envelope::encrypt(b"hello derec", &public_key).unwrap();
 //! let plaintext = envelope::decrypt(&ciphertext, &secret_key).unwrap();
+//!
+//! assert_eq!(plaintext, b"hello derec");
 //! ```
 
 use rand::rngs::OsRng;
@@ -127,10 +133,14 @@ pub enum DerecEncryptionError {
 ///
 /// # Example
 ///
-/// ```rust, ignore
-/// use derec_cryptography::envelope;
+/// ```rust
+/// use derec_cryptography::pairing::{envelope, pairing_ecies};
+/// use rand::rngs::OsRng;
+///
+/// let (_secret_key, public_key) = pairing_ecies::generate_key(&mut OsRng).unwrap();
 ///
 /// let ciphertext = envelope::encrypt(b"hello", &public_key).unwrap();
+/// assert!(!ciphertext.is_empty());
 /// ```
 #[cfg_attr(
     feature = "logging",
@@ -203,10 +213,15 @@ pub fn encrypt(bytes: &[u8], public_key: &[u8]) -> Result<Vec<u8>, DerecEncrypti
 ///
 /// # Example
 ///
-/// ```rust, ignore
-/// use derec_cryptography::envelope;
+/// ```rust
+/// use derec_cryptography::pairing::{envelope, pairing_ecies};
+/// use rand::rngs::OsRng;
+///
+/// let (secret_key, public_key) = pairing_ecies::generate_key(&mut OsRng).unwrap();
+/// let ciphertext = envelope::encrypt(b"hello", &public_key).unwrap();
 ///
 /// let plaintext = envelope::decrypt(&ciphertext, &secret_key).unwrap();
+/// assert_eq!(plaintext, b"hello");
 /// ```
 #[cfg_attr(
     feature = "logging",

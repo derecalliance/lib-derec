@@ -505,6 +505,23 @@ pub struct ReplicaSecretPayload {
 /// [`crate::protocol::DeRecSecretStore::remove`]; on
 /// [`crate::protocol::DeRecSecretStore::save`] the kind is inferred from
 /// the [`SecretValue`] variant and need not be passed.
+///
+/// # Discriminant stability
+///
+/// **The numeric values below are stable and safe to persist.** They will
+/// not be renumbered, and new variants are appended rather than inserted.
+///
+/// This is a guarantee, not an implementation detail, because store
+/// implementations legitimately need a compact tag for the secret they are
+/// writing and `kind as u8` is the obvious one to reach for. A deployed
+/// store's rows outlive any single version of this crate, so renumbering
+/// would silently reinterpret data already at rest — and two of the three
+/// variants carry variable-length payloads, so a swapped tag decodes into a
+/// plausible wrong value rather than failing.
+///
+/// Note that [`SecretValue`]'s serde representation carries no such
+/// guarantee (see its docs). Persisting the discriminant plus your own
+/// payload encoding is the supported way to store secret material durably.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretKind {
     /// The post-pairing symmetric channel key (see [`SecretValue::SharedKey`]).
@@ -678,33 +695,44 @@ pub enum SecretValue {
 /// Tag identifying which kind of in-flight orchestrator state an entry in
 /// [`crate::protocol::DeRecStateStore`] holds. Used by
 /// [`crate::protocol::DeRecStateStore::load_all`] to filter by category.
+///
+/// # Discriminant stability
+///
+/// The same guarantee as [`SecretKind`]: these values are stable, safe to
+/// persist, and new variants are appended rather than inserted. A durable
+/// state store needs a column to filter `load_all` by, and this is it.
+///
+/// The values are written out explicitly for that reason. Left implicit they
+/// would still *have* numbers — ones every reader would have to count out by
+/// hand, and that a reordering would change without touching a single digit
+/// in this file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StateKind {
     /// Outstanding [`derec_proto::VerifyShareRequestMessage`], one per
     /// channel. Load-bearing for the replay-defence binding gate.
-    PendingVerification,
+    PendingVerification = 0,
     /// Recovery accumulator, one per `(recovered secret_id, version)`
     /// within a partition. Holds every
     /// [`derec_proto::GetShareResponseMessage`] received so far for that
     /// reconstruction target. See [`StateKey::PendingRecovery`] on why
     /// the recovered id is distinct from the partitioning one.
-    PendingRecovery,
+    PendingRecovery = 1,
     /// Outstanding unpair acknowledgement, one per channel. Carries the
     /// `started_at` unix-seconds timestamp so the orchestrator can time
     /// out unresponsive peers.
-    PendingUnpair,
+    PendingUnpair = 2,
     /// Active sharing round, one row per in-flight version. Several can be
     /// open at once: publishes are started by the pair-completion hook and by
     /// the promotion inside `verify_fingerprint`, not only by
     /// `start(ProtectSecret)`. Holds the per-channel tallies (`pending` /
     /// `confirmed` / `failed`), the per-member tallies, and the `started_at`
     /// timestamp used to time out unresponsive peers.
-    SharingRound,
+    SharingRound = 3,
     /// Active replica catch-up. At most one entry exists per `secret_id`
     /// (a new `start(SyncCheck)` overwrites any prior one). Holds the
     /// versions members have reported so far, so the asker can pick the
     /// member holding the newest state once every peer has answered.
-    PendingSyncCheck,
+    PendingSyncCheck = 4,
 }
 
 /// Secondary-key selector identifying a single row within a given
@@ -974,6 +1002,45 @@ mod tests {
         let json = serde_json::to_vec(&material).expect("serialize");
         let decoded: PairingKeyMaterial = serde_json::from_slice(&json).expect("deserialize");
         assert_eq!(material.as_bytes(), decoded.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod persisted_discriminant_tests {
+    //! Pins the discriminants callers are told they may store.
+    //!
+    //! `library/tests/enum_fixture.rs` also checks these, but it checks them
+    //! against `enums.json` — a file that gets updated as part of responding
+    //! to the failure. Reorder an enum, run the suite, update the fixture the
+    //! message points you at, and it goes green with every deployed database
+    //! now misreading its own rows.
+    //!
+    //! These assertions name the numbers directly, so there is nothing to
+    //! update but the assertion itself. Changing one is then a deliberate act
+    //! with this comment attached to it, which is the whole point: renumbering
+    //! is not forbidden, it is just never something to do by accident.
+    //!
+    //! If you are here because one of these failed: appending a variant is
+    //! fine and needs a new line below. Renumbering an existing one breaks
+    //! data at rest in every deployment that has stored it, and no migration
+    //! runs on our side to fix it.
+
+    use super::{SecretKind, StateKind};
+
+    #[test]
+    fn secret_kind_discriminants_are_unchanged() {
+        assert_eq!(SecretKind::SharedKey as u8, 0);
+        assert_eq!(SecretKind::PairingSecret as u8, 1);
+        assert_eq!(SecretKind::PairingContact as u8, 2);
+    }
+
+    #[test]
+    fn state_kind_discriminants_are_unchanged() {
+        assert_eq!(StateKind::PendingVerification as u8, 0);
+        assert_eq!(StateKind::PendingRecovery as u8, 1);
+        assert_eq!(StateKind::PendingUnpair as u8, 2);
+        assert_eq!(StateKind::SharingRound as u8, 3);
+        assert_eq!(StateKind::PendingSyncCheck as u8, 4);
     }
 }
 

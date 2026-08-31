@@ -58,6 +58,26 @@ crates.io.
 
 ---
 
+## One build, all packages
+
+`make all` is the only build entry point, and it is all-or-nothing:
+
+```bash
+cd library
+make all
+```
+
+It lints, runs every test suite (Rust, Go, C++, TypeScript, and the on-device
+React Native smoke tests), builds and stages all six packages, and finishes by
+asserting every staged artifact reports the version `scripts/get-version.sh`
+resolves. If it exits zero, everything below is ready to publish; if it fails,
+nothing is.
+
+Per-package targets were removed deliberately. Every release problem this
+repository has hit came from a step that was available to skip.
+
+---
+
 ## Publishing Rust SDK
 
 Publish all three crates in dependency order:
@@ -91,10 +111,10 @@ cargo search derec
 
 Build the Node.js WebAssembly package:
 
-```bash
-cd library
-make nodejs
-```
+> [!NOTE]
+> There is no per-package build target. `make all` — see
+> [One build, all packages](#one-build-all-packages) — builds, tests and
+> verifies every package in a single pass, and has already produced this one.
 
 This generates the npm package in:
 
@@ -144,10 +164,10 @@ npm install @derec-alliance/nodejs
 
 Build the Browser WebAssembly package:
 
-```bash
-cd library
-make web
-```
+> [!NOTE]
+> There is no per-package build target. `make all` — see
+> [One build, all packages](#one-build-all-packages) — builds, tests and
+> verifies every package in a single pass, and has already produced this one.
 
 This generates the npm package in:
 
@@ -240,10 +260,10 @@ dotnet --version
 
 Build the multi-runtime NuGet package:
 
-```bash
-cd library
-make dotnet
-```
+> [!NOTE]
+> There is no per-package build target. `make all` — see
+> [One build, all packages](#one-build-all-packages) — builds, tests and
+> verifies every package in a single pass, and has already produced this one.
 
 The build process performs the following steps automatically:
 
@@ -351,10 +371,10 @@ whose native artifacts are built at pack time).
 
 ### Build and stage the native libraries
 
-```bash
-cd library
-make go
-```
+> [!NOTE]
+> There is no per-package build target. `make all` — see
+> [One build, all packages](#one-build-all-packages) — builds, tests and
+> verifies every package in a single pass, and has already produced this one.
 
 `make go` runs `scripts/prepare-go-package.sh`, which cross-compiles the native
 library (with `--features ffi`) for all four supported platforms and stages
@@ -442,10 +462,10 @@ export ANDROID_NDK_HOME=/path/to/Android/sdk/ndk/<version>
 
 ### Build the React Native package
 
-```bash
-cd library
-make react-native
-```
+> [!NOTE]
+> There is no per-package build target. `make all` — see
+> [One build, all packages](#one-build-all-packages) — builds, tests and
+> verifies every package in a single pass, and has already produced this one.
 
 `make react-native` runs `scripts/prepare-react-native-package.sh`, which:
 
@@ -521,8 +541,14 @@ Expo Go — a dev build (or a plain React Native build) is required.
 
 Before publishing a release:
 
-- [ ] Version updated in `library/Cargo.toml` (everything else derives from it
-      via `scripts/get-version.sh` — do not edit package manifests individually)
+- [ ] Version bumped in every manifest that carries a literal:
+      `library/Cargo.toml` (the source `scripts/get-version.sh` reads),
+      `protobufs/Cargo.toml`, `cryptography/Cargo.toml`, the three
+      `derec-proto` / `derec-cryptography` dependency entries inside
+      `library/Cargo.toml`, and `packages/react-native/package.json` plus its
+      lockfile. The .NET, Go, nodejs and web manifests are generated at build
+      time and need no edit. `scripts/verify-versions.sh` (run by `make all`)
+      fails if any of them disagree — it is the check, not the reminder.
 - [ ] Release notes written, including any **breaking** changes
 - [ ] `make all` succeeds — run it **last**, immediately before publishing
 - [ ] Test installation of all SDKs

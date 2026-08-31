@@ -16,8 +16,8 @@
 # Internal targets are prefixed `_` to keep them out of the tab-completion a
 # developer sees; nothing outside this file should depend on them.
 
-.PHONY: all _preflight _lint _test-rust _build _packages _test-native _test-js \
-        _smoke _verify-versions
+.PHONY: all _preflight _lint _docs _test-rust _build _packages _test-native \
+        _test-js _smoke _verify-versions
 
 ROOT := ..
 VERSION := $(shell $(ROOT)/scripts/get-version.sh)
@@ -26,7 +26,7 @@ define section
 	@printf '\n\033[1m── %s\033[0m\n' $(1)
 endef
 
-all: _preflight _lint _test-rust _build _packages _test-native _test-js _smoke _verify-versions
+all: _preflight _lint _docs _test-rust _build _packages _test-native _test-js _smoke _verify-versions
 	$(call section,"Release build complete")
 	@printf 'Every package built and verified at version %s.\n' '$(VERSION)'
 	@printf 'Staged for publication:\n'
@@ -52,6 +52,32 @@ _lint:
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo clippy -p derec-library --target wasm32-unknown-unknown -- -D warnings
+
+# Three crates publish to docs.rs, so a broken intra-doc link is as public as
+# a broken API. `-D warnings` makes rustdoc's lints fail the build the way
+# clippy's already do.
+#
+# Three configurations, because a link can resolve under one and not another
+# and each of these has caught something the others did not:
+#
+#   default          what `cargo doc` gives someone with this crate as a
+#                    dependency. Strictest for links *into* gated items,
+#                    since those items are absent here.
+#   --features serde what docs.rs publishes, per `package.metadata.docs.rs`.
+#                    `interop::dto` and `types::state_record` exist only with
+#                    this feature, so their docs are unchecked without it.
+#   wasm32           the WASM binding's own docs. Nothing else in this file
+#                    reads them, and `cargo doc` never runs for that target
+#                    incidentally.
+#
+# Scoped to `-p derec-library` for wasm32: the workspace also holds a host-only
+# smoke-test binary that does not build for that target.
+_docs:
+	$(call section,"Documentation")
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+	RUSTDOCFLAGS="-D warnings" cargo doc -p derec-library --no-deps --features serde
+	RUSTDOCFLAGS="-D warnings" cargo doc -p derec-library --no-deps \
+	    --target wasm32-unknown-unknown
 
 _test-rust:
 	$(call section,"Rust tests")
@@ -105,7 +131,13 @@ _smoke: _test-native _test-js
 	$(ROOT)/smoke-tests/react-native/run_test.sh
 
 # The last thing standing between a green build and a wrong publish: every
-# staged artifact must report the version `get-version.sh` resolved.
+# staged artifact, and every version the crates pin each other by, must report
+# the version `get-version.sh` resolved. Runs after `_packages` so it reads
+# what was actually built rather than what was meant to be.
+#
+# The Go module tag is the sole exception. Go has no manifest to inspect, and
+# the tag is pushed after publishing, so it is reported as a warning rather
+# than failing a build that is otherwise ready.
 _verify-versions: _packages
 	$(call section,"Version consistency")
 	@$(ROOT)/scripts/verify-versions.sh

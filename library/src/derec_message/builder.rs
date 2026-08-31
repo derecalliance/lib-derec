@@ -128,24 +128,44 @@ pub struct ChannelMode;
 ///
 /// Pairing mode:
 ///
-/// ```rust,ignore
-/// let envelope = DeRecMessageBuilder::new()
+/// ```rust,no_run
+/// use derec_library::derec_message::{DeRecMessageBuilder, current_timestamp};
+/// use derec_library::types::ChannelId;
+/// use derec_proto::{MessageBody, PairRequestMessage};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let channel_id = ChannelId(1);
+/// # let pair_request = PairRequestMessage::default();
+/// # let helper_public_key: Vec<u8> = Vec::new();
+/// let envelope = DeRecMessageBuilder::pairing()
 ///     .channel_id(channel_id)
 ///     .timestamp(current_timestamp())
-///     .message(&pair_request)
+///     .message_body(MessageBody::PairRequest(pair_request))
 ///     .encrypt_pairing(helper_public_key)?
 ///     .build()?;
+/// # Ok(())
+/// # }
 /// ```
 ///
 /// Channel mode:
 ///
-/// ```rust,ignore
+/// ```rust,no_run
+/// use derec_library::derec_message::{DeRecMessageBuilder, current_timestamp};
+/// use derec_library::types::ChannelId;
+/// use derec_proto::{MessageBody, VerifyShareRequestMessage};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let channel_id = ChannelId(1);
+/// # let verify_request = VerifyShareRequestMessage::default();
+/// # let shared_key = [0u8; 32];
 /// let envelope = DeRecMessageBuilder::channel()
 ///     .channel_id(channel_id)
 ///     .timestamp(current_timestamp())
-///     .message_body(MessageBody::VerifyShareRequest(&verify_request))
-///     .encrypt(shared_key)?
+///     .message_body(MessageBody::VerifyShareRequest(verify_request))
+///     .encrypt(&shared_key)?
 ///     .build()?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug)]
 pub struct DeRecMessageBuilder<State, Mode> {
@@ -280,8 +300,10 @@ impl DeRecMessageBuilder<NotEncrypted, PairingMode> {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// let builder = DeRecMessageBuilder::new();
+    /// ```rust
+    /// use derec_library::derec_message::DeRecMessageBuilder;
+    ///
+    /// let builder = DeRecMessageBuilder::pairing();
     /// ```
     pub fn pairing() -> Self {
         Self {
@@ -354,7 +376,9 @@ impl DeRecMessageBuilder<NotEncrypted, ChannelMode> {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// use derec_library::derec_message::DeRecMessageBuilder;
+    ///
     /// let builder = DeRecMessageBuilder::channel();
     /// ```
     pub fn channel() -> Self {

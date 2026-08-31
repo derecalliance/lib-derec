@@ -78,7 +78,7 @@ type WasmProtocol = DeRecProtocol<
 
 /// Higher-level DeRec protocol orchestrator for TypeScript/JavaScript consumers.
 ///
-/// Wraps [`DeRecProtocol`](crate::protocol::DeRecProtocol) with JS-side store
+/// Wraps [`crate::protocol::DeRecProtocol`] with JS-side store
 /// and transport adapters so that a TypeScript application can drive all five
 /// protocol flows without routing raw bytes manually.
 ///

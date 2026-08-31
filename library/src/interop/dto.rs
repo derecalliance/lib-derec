@@ -9,7 +9,8 @@
 //! structs below. They live under [`crate::interop`] rather than in either
 //! binding because the WASM bindings and the C FFI both need them and the two
 //! are compiled under mutually exclusive `cfg`s;
-//! [`crate::interop::wasm::primitives`] re-exports them under their original paths so
+//! `crate::interop::wasm::primitives` (wasm32 only, hence not linked)
+//! re-exports them under their original paths so
 //! the WASM binding code is unaffected.
 //!
 //! Two prost shapes are deliberately not mirrored one-for-one:

@@ -25,10 +25,7 @@ use derec_library::protocol::types::{ChannelStatus, ReplicaRole, SecretKind, Sta
 
 /// Names the fixture records for one enum, in wire encoding.
 fn fixture_names(enum_name: &str) -> BTreeSet<String> {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/enums.json"
-    );
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/enums.json");
     let raw = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
     let doc: serde_json::Value =
         serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parsing {path}: {e}"));
@@ -238,10 +235,7 @@ fn protobuf_enum_fixtures_are_complete() {
 /// names but not the values is just as broken.
 #[test]
 fn numeric_discriminants_match_the_fixture() {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/enums.json"
-    );
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/enums.json");
     let doc: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(path).expect("read fixture"))
             .expect("parse fixture");
