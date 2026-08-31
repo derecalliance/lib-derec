@@ -7,7 +7,7 @@ import { ContactMode, FlowKind, SenderKind } from '../src/types';
 
 const fixture = JSON.parse(
   fs.readFileSync(
-    path.join(__dirname, '../../../bindings/test_fixture/enums.json'),
+    path.join(__dirname, '../../../library/tests/fixtures/enums.json'),
     'utf8',
   ),
 ) as {

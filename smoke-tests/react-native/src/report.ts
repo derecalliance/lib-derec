@@ -9,7 +9,7 @@ const HOST = Platform.OS === 'android' ? '10.0.2.2' : 'localhost';
 const PORT = 8099;
 
 /**
- * Sends a line to the collector `bindings/react-native/run_test.sh` runs.
+ * Sends a line to the collector `smoke-tests/react-native/run_test.sh` runs.
  *
  * React Native routes `console.log` to the debugger rather than to Metro's
  * stdout, so a run can pass or fail with nothing reaching any log the script

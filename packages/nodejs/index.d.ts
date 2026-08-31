@@ -62,7 +62,7 @@ export interface SecretStore {
  *
  * Do not `JSON.parse` and re-serialise. Every id in these records is a `u64`,
  * and `JSON.parse` silently rounds anything above 2^53 — the corruption only
- * appears once a real id happens to be large. `bindings/web` implements this.
+ * appears once a real id happens to be large.
  */
 export interface ChannelStore {
   load(
@@ -1018,6 +1018,8 @@ export interface GetSecretIdsVersionsRequestMessage {
   /** Ephemeral endpoint where the requester wants the response routed.
    *  Absent means "use the channel's stored peer endpoint". */
   reply_to?: TransportProtocol;
+  /** Replica-group member that sent this; see `replicaId` semantics. */
+  replica_id?: bigint;
 }
 
 export interface VersionList {
@@ -1034,6 +1036,8 @@ export interface GetSecretIdsVersionsResponseMessage {
   result?: DeRecResult;
   secret_list: VersionList[];
   timestamp?: Timestamp;
+  /** Replica-group member that sent this; see `replicaId` semantics. */
+  replica_id?: bigint;
 }
 
 export interface VersionEntry {
@@ -1128,6 +1132,8 @@ export interface GetShareRequestMessage {
   timestamp?: Timestamp;
   /** Ephemeral response endpoint; see `replyTo` semantics. */
   reply_to?: TransportProtocol;
+  /** Replica-group member that sent this; see `replicaId` semantics. */
+  replica_id?: bigint;
 }
 
 export interface GetShareResponseMessage {
@@ -1141,6 +1147,8 @@ export interface GetShareResponseMessage {
   secret_id: bigint;
   /** Echoed from the request for the same correlation reasons as `secret_id`. */
   version: number;
+  /** Replica-group member that sent this; see `replicaId` semantics. */
+  replica_id?: bigint;
 }
 
 export interface SiblingHash {
@@ -1166,6 +1174,8 @@ export interface StoreShareRequestMessage {
   secret_id: bigint;
   /** Ephemeral response endpoint; see `replyTo` semantics. */
   reply_to?: TransportProtocol;
+  /** Replica-group member that sent this; see `replicaId` semantics. */
+  replica_id?: bigint;
 }
 
 export interface StoreShareResponseMessage {
@@ -1173,6 +1183,8 @@ export interface StoreShareResponseMessage {
   version: number;
   timestamp?: Timestamp;
   secret_id: bigint;
+  /** Replica-group member that sent this; see `replicaId` semantics. */
+  replica_id?: bigint;
 }
 
 export interface UnpairRequestMessage {
@@ -1180,6 +1192,8 @@ export interface UnpairRequestMessage {
   timestamp?: Timestamp;
   /** Ephemeral response endpoint; see `replyTo` semantics. */
   reply_to?: TransportProtocol;
+  /** Replica-group member that sent this; see `replicaId` semantics. */
+  replica_id?: bigint;
 }
 
 export interface UnpairResponseMessage {

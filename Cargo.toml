@@ -4,5 +4,5 @@ members = [
     "cryptography",
     "library",
     "protobufs",
-    "bindings/rust",
+    "smoke-tests/rust",
 ]

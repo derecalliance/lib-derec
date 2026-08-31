@@ -14,11 +14,10 @@ import (
 	"github.com/derecalliance/lib-derec/packages/go/derecpb"
 )
 
-// The in-memory store doubles below translate the InMemory* fixtures in
-// bindings/rust/src/protocol.rs into idiomatic Go: real map-backed
-// storage behind a mutex (a protocol instance's callbacks may be invoked
-// from whatever goroutine the caller drives process()/accept()/start()
-// from), one type per store interface in package protocol.
+// The in-memory store doubles below are real map-backed storage behind a
+// mutex (a protocol instance's callbacks may be invoked from whatever
+// goroutine the caller drives process()/accept()/start() from), one type
+// per store interface in package protocol.
 
 // Two maps, mirroring the two primary keys the interface defines: a helper
 // channel is unique per channelID, while a replica-group member is unique per

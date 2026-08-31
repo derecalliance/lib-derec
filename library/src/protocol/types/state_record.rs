@@ -22,7 +22,7 @@ use crate::types::ChannelId;
 use prost::Message;
 
 /// JSON-on-the-wire shape of a [`StateKey`]. `kind` matches
-/// [`StateKind`]:
+/// [`crate::protocol::StateKind`]:
 /// - `0` = PendingVerification — `channel_id` present (stringified u64)
 /// - `1` = PendingRecovery — `secret_id` (stringified u64, the secret
 ///   being recovered) and `version` present
@@ -81,7 +81,7 @@ impl From<&StateKey> for StateKeyRecord {
 }
 
 /// JSON-on-the-wire shape of a [`StateItem`]. `kind` matches
-/// [`StateKind`] (identical numbering to [`StateKeyRecord::kind`]):
+/// [`crate::protocol::StateKind`] (identical numbering to [`StateKeyRecord::kind`]):
 /// - `0` = PendingVerification — `channel_id`, `bytes` (prost-encoded
 ///   [`derec_proto::VerifyShareRequestMessage`])
 /// - `1` = PendingRecovery — `secret_id` (stringified u64, the secret

@@ -4,7 +4,7 @@
 // Primitive-level smoke tests: exercises the low-level produce/extract/
 // process surface for pairing, sharing, verification, recovery, and
 // discovery, plus the cross-cutting envelope trace-id helpers. Mirrors
-// bindings/rust/src/primitives.rs. Imports only the public
+// smoke-tests/rust/src/primitives.rs. Imports only the public
 // packages/go/primitives/* packages, packages/go/derec, and
 // packages/go/derecpb — the same surface an external consumer has.
 package main
@@ -55,7 +55,7 @@ func sharedKeyFill(fill byte) []byte {
 	return key
 }
 
-// runPairingFlow mirrors run_pairing_flow_test in bindings/rust/src/primitives.rs:
+// runPairingFlow mirrors run_pairing_flow_test in smoke-tests/rust/src/primitives.rs:
 // a full INLINE_KEYS handshake, asserting both sides derive the same shared
 // key and the same rekeyed channel id, which must differ from the original.
 func runPairingFlow() {
@@ -101,7 +101,7 @@ func runPairingFlow() {
 	fmt.Println("Pairing flow test passed.")
 }
 
-// runSharingFlow mirrors run_sharing_flow_test in bindings/rust/src/primitives.rs:
+// runSharingFlow mirrors run_sharing_flow_test in smoke-tests/rust/src/primitives.rs:
 // split a secret into committed shares across three channels, then walk the
 // full store-share request/response/process round trip for each.
 func runSharingFlow() {
@@ -148,7 +148,7 @@ func runSharingFlow() {
 }
 
 // runVerificationFlow mirrors run_verification_flow_test in
-// bindings/rust/src/primitives.rs: challenge channel 1 for its share of a
+// smoke-tests/rust/src/primitives.rs: challenge channel 1 for its share of a
 // split secret, confirm a response proving possession of the exact share
 // validates, and confirm a response checked against a different channel's
 // share content does not.
@@ -200,7 +200,7 @@ func runVerificationFlow() {
 	fmt.Println("Verification flow test passed.")
 }
 
-// runRecoveryFlow mirrors run_recovery_flow_test in bindings/rust/src/primitives.rs:
+// runRecoveryFlow mirrors run_recovery_flow_test in smoke-tests/rust/src/primitives.rs:
 // store committed shares with two of three channels, walk the get-share
 // request/response exchange with each, and reconstruct the original secret.
 func runRecoveryFlow() {
@@ -258,7 +258,7 @@ func runRecoveryFlow() {
 	fmt.Println("Recovery flow test passed.")
 }
 
-// runDiscoveryFlow mirrors run_discovery_flow_test in bindings/rust/src/primitives.rs:
+// runDiscoveryFlow mirrors run_discovery_flow_test in smoke-tests/rust/src/primitives.rs:
 // a discovery request/response round trip advertising a small secret-id/
 // version list, asserting it decodes unchanged.
 func runDiscoveryFlow() {
@@ -305,7 +305,7 @@ func runDiscoveryFlow() {
 }
 
 // runEnvelopeTraceID mirrors run_envelope_trace_id_test in
-// bindings/rust/src/primitives.rs: the trace_id helpers round-trip a value
+// smoke-tests/rust/src/primitives.rs: the trace_id helpers round-trip a value
 // through an envelope's outer field without disturbing the encrypted inner
 // payload — Extract still succeeds after re-stamping.
 func runEnvelopeTraceID() {

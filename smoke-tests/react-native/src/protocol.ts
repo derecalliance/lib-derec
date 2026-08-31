@@ -3,17 +3,23 @@
 // Protocol smoke tests: exercises pairing, sharing, and discovery+recovery
 // using the low-level `DeRecProtocol` runtime (`start` / `process` / `accept`)
 // backed by in-memory stores.
-// This is a Node.js (CommonJS-backed) port of the verified web smoke test
-// (`bindings/web/src/protocol.ts`). The only difference is the module
-// specifier: `@derec-alliance/nodejs` loads the wasm module synchronously on
-// `require`, so there is no `init` to import or await.
+// This is a React Native port of the verified Node.js smoke test
+// (`smoke-tests/nodejs/protocol.ts`), which is itself a port of the web one. The
+// public surface is identical across all three, so the scenarios are carried
+// over unchanged apart from three runtime differences:
+//   - `TextEncoder`/`TextDecoder` do not exist in Hermes, so `./utf8` stands in.
+//   - `setCommunicationInfo` and `setOwnTransport` return a `Promise` here
+//     (they queue onto the protocol's serial worker rather than running on the
+//     JavaScript thread), so the scenarios await them.
+//   - `StateStore.loadAll` takes a fifth `kind` (`4` = PendingSyncCheck).
 // No UI: every `ActionRequired` event a peer receives is auto-accepted via
 // `processAll`. The store implementations mirror the reference app's
 // `stores.ts` algorithms exactly (channel-link graph + BFS closure, keyed
 // share store, recording transport), but are Map-backed instead of
 // localStorage-backed.
 
-import { ContactMode, DeRecProtocol, DeRecProtocolBuilder, FlowKind, SenderKind, primitives } from "@derec-alliance/nodejs";
+import { ContactMode, DeRecProtocol, DeRecProtocolBuilder, FlowKind, SenderKind, primitives } from "@derec-alliance/react-native";
+import { utf8Decode, utf8Encode } from "./utf8";
 import type {
   ChannelStore,
   ContactMessage,
@@ -25,7 +31,7 @@ import type {
   Transport,
   UserSecretStore,
   UserSecrets,
-} from "@derec-alliance/nodejs";
+} from "@derec-alliance/react-native";
 
 
 const kindName = (k: SenderKind): string => {
@@ -158,11 +164,11 @@ class InMemoryChannelStore implements ChannelStore {
     const inner: string[] = [];
     for (const [k, v] of source) {
       if (!k.startsWith(prefix)) continue;
-      const text = new TextDecoder().decode(v);
+      const text = utf8Decode(v);
       if (!text.startsWith(tag)) continue;
       inner.push(text.slice(tag.length, -1));
     }
-    return new TextEncoder().encode(`[${inner.join(",")}]`);
+    return utf8Encode(`[${inner.join(",")}]`);
   }
 
   async listHelpers(secretId: string): Promise<Uint8Array> {
@@ -343,7 +349,7 @@ class InMemoryStateStore implements StateStore {
   }
 
   private parseBlob(bytes: Uint8Array): StateRecord {
-    return JSON.parse(new TextDecoder().decode(bytes));
+    return JSON.parse(utf8Decode(bytes));
   }
 
   async save(secretId: string, itemJson: Uint8Array): Promise<void> {
@@ -361,7 +367,7 @@ class InMemoryStateStore implements StateStore {
     return this.data.delete(this.compositeKey(secretId, rec));
   }
 
-  async loadAll(secretId: string, kind: 0 | 1 | 2 | 3): Promise<Uint8Array[]> {
+  async loadAll(secretId: string, kind: 0 | 1 | 2 | 3 | 4): Promise<Uint8Array[]> {
     const prefix = `${secretId}:${kind}:`;
     const out: Uint8Array[] = [];
     for (const [k, v] of this.data.entries()) {
@@ -408,12 +414,13 @@ const THRESHOLD = 2;
 const KEEP_VERSIONS_COUNT = 3;
 const DEFAULT_TEST_SECRET_ID = 0xDE_2ECn;
 
+
 function makeNode(
   name: string,
   endpointUri: string,
   options: {
     autoReplyTo?: boolean;
-    autoAccept?: import("@derec-alliance/nodejs").AutoAcceptPolicy;
+    autoAccept?: import("@derec-alliance/react-native").AutoAcceptPolicy;
     replicaId?: bigint;
     secretId?: bigint;
     threshold?: number;
@@ -635,7 +642,7 @@ async function runFingerprintMismatchFlow(): Promise<void> {
     nodeSid,
     String(channelId),
     String(replicaId),
-    new TextEncoder().encode(JSON.stringify(channelJson)),
+    utf8Encode(JSON.stringify(channelJson)),
   );
   await node.secretStore.save(nodeSid, String(channelId), 0, sharedKey);
 
@@ -652,7 +659,7 @@ async function runFingerprintMismatchFlow(): Promise<void> {
     String(replicaId),
   );
   if (!storedBytes) throw new Error("member record missing after verify");
-  const stored = JSON.parse(new TextDecoder().decode(storedBytes)).Replica;
+  const stored = JSON.parse(utf8Decode(storedBytes)).Replica;
   if (stored.status !== "Pending") {
     throw new Error(
       `verifyFingerprint(wrong) must leave the member status as Pending; got ${stored.status}`,
@@ -840,7 +847,7 @@ async function runNoKeysPairingFlow(): Promise<void> {
   const helperStatus = async (node: Node, sid: string): Promise<string> => {
     const bytes = await node.channelStore.load(sid, longTermChannelId, "0");
     if (!bytes) throw new Error("NoKeys pairing: channel record missing");
-    return JSON.parse(new TextDecoder().decode(bytes)).Helper.status;
+    return JSON.parse(utf8Decode(bytes)).Helper.status;
   };
 
   for (const [label, node, sid] of [
@@ -991,7 +998,7 @@ async function runSharingFlow(): Promise<void> {
   await doPair(helperB, owner, channelIdB, "Owner↔HelperB");
   console.log();
 
-  const secretData = new TextEncoder().encode("super-secret-value");
+  const secretData = utf8Encode("super-secret-value");
   await owner.protocol.start(FlowKind.ProtectSecret, {
     secrets: [{ id: new Uint8Array([1]), name: "smoke", data: secretData }],
     description: "smoke-test secret",
@@ -1049,7 +1056,7 @@ async function runSharingFlow(): Promise<void> {
 
 // VSS sharing requires threshold ≥ 2, so this scenario pairs the Owner with
 // TWO helpers and reconstructs the secret from both shares. Mirrors the Rust
-// `bindings/rust/src/protocol.rs::run_discovery_and_recovery_flow`.
+// `smoke-tests/rust/src/protocol.rs::run_discovery_and_recovery_flow`.
 async function runDiscoveryAndRecoveryFlow(): Promise<void> {
   console.log("=== [Protocol] Discovery & Recovery Flow ===\n");
 
@@ -1072,7 +1079,7 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
   const recoveryChannelB = 101n;
 
   const description = "wallet seed phrase";
-  const secretBytes = new TextEncoder().encode("correct horse battery staple");
+  const secretBytes = utf8Encode("correct horse battery staple");
 
 
   console.log("  -- Setup: initial pairing & sharing --\n");
@@ -1438,7 +1445,7 @@ async function runReplyToFlow(): Promise<void> {
 /**
  * Owner↔Destination replica pair, followed by a full ProtectSecret
  * fan-out that includes the Destination as one of the targets. Mirrors
- * `bindings/rust/src/protocol.rs::run_protect_secret_with_replica_targets_flow`
+ * `smoke-tests/rust/src/protocol.rs::run_protect_secret_with_replica_targets_flow`
  * — pair, cross-confirm fingerprints, distribute, and assert the typed
  * `ReplicaSecretReceived` event carries the decoded `Secret`
  * (secret.secrets / .helpers / .replicas / .owner_replica_id) plus the
@@ -1553,7 +1560,7 @@ async function runReplicaPairingAndSecretSyncFlow(): Promise<void> {
   // 4. ProtectSecret across both helpers + the destination. Three
   //    envelopes leave the owner: two VSS shares (one per helper) and
   //    one ReplicaSecretPayload composite (for the destination).
-  const secretData = new TextEncoder().encode("secret-payload-for-replica-and-helper");
+  const secretData = utf8Encode("secret-payload-for-replica-and-helper");
   await owner.protocol.start(FlowKind.ProtectSecret, {
     secrets: [{ id: new Uint8Array([0x01]), name: "shared-secret", data: secretData }],
     description: "replica + helper distribution",
@@ -1648,7 +1655,7 @@ async function runReplicaPairingAndSecretSyncFlow(): Promise<void> {
   //   v=1: verify_fingerprint auto-publish (already drained above)
   //   v=2: first explicit ProtectSecret (the `received` round above)
   //   v=3: this second explicit ProtectSecret
-  const secretDataV2 = new TextEncoder().encode("secret-payload-after-update");
+  const secretDataV2 = utf8Encode("secret-payload-after-update");
   await owner.protocol.start(FlowKind.ProtectSecret, {
     secrets: [{ id: new Uint8Array([0x01]), name: "shared-secret", data: secretDataV2 }],
     description: "v2 replica + helper distribution",
@@ -1779,9 +1786,11 @@ async function runUpdateChannelInfoFlow(): Promise<void> {
   const newUri = "https://owner.NEW.example.com";
   const newInfo = { name: "Owner-renamed", email: "owner.new@example.com" };
 
-  // Mutate local state, then propagate.
-  owner.protocol.setCommunicationInfo(newInfo);
-  owner.protocol.setOwnTransport(newUri, "https");
+  // Mutate local state, then propagate. Both setters queue onto the
+  // protocol's serial worker, so they are awaited before the flow that must
+  // observe them starts.
+  await owner.protocol.setCommunicationInfo(newInfo);
+  await owner.protocol.setOwnTransport(newUri, "https");
 
   await owner.protocol.start(FlowKind.UpdateChannelInfo, {
     target: BigInt(longTermChannelId),
@@ -1818,7 +1827,7 @@ async function runUpdateChannelInfoFlow(): Promise<void> {
   if (!helperStoredBytes) {
     throw new Error("helper channel record must still exist after UpdateChannelInfo");
   }
-  const helperStored = JSON.parse(new TextDecoder().decode(helperStoredBytes)).Helper;
+  const helperStored = JSON.parse(utf8Decode(helperStoredBytes)).Helper;
   if (helperStored.transport.uri !== newUri) {
     throw new Error(
       `helper's stored transport.uri must reflect the announced update; got ${helperStored.transport.uri}`,
@@ -1952,7 +1961,7 @@ async function runAutoAcceptFlow(): Promise<void> {
 
   await owner.protocol.start(FlowKind.ProtectSecret, {
     secrets: [
-      { id: new Uint8Array([0xAA]), name: "auto-accept smoke", data: new TextEncoder().encode("nodejs-auto-accept") },
+      { id: new Uint8Array([0xAA]), name: "auto-accept smoke", data: utf8Encode("nodejs-auto-accept") },
     ],
     description: "nodejs auto-accept smoke",
   });
@@ -2122,7 +2131,7 @@ async function runReplicaSyncVersionProgressionFlow(): Promise<void> {
   console.log("  step 1: pair replica A → v=1, secret(h=0,s=0,r=1,shares=0)  ✓");
 
   // Step 2 — ProtectSecret([s1]) → v=2.
-  const s1 = { id: new Uint8Array([0x01]), name: "secret-one", data: new TextEncoder().encode("first-user-secret") };
+  const s1 = { id: new Uint8Array([0x01]), name: "secret-one", data: utf8Encode("first-user-secret") };
   await owner.protocol.start(FlowKind.ProtectSecret, {
     secrets: [s1],
     description: "v=2 explicit publish",
@@ -2189,7 +2198,7 @@ async function runReplicaSyncVersionProgressionFlow(): Promise<void> {
   console.log("  step 5: pair helper #2 → v=5, secret(h=2,s=1,r=2,shares=0)  ✓");
 
   // Step 6 — ProtectSecret([s1, s2]) → v=6.
-  const s2 = { id: new Uint8Array([0x02]), name: "secret-two", data: new TextEncoder().encode("second-user-secret") };
+  const s2 = { id: new Uint8Array([0x02]), name: "secret-two", data: utf8Encode("second-user-secret") };
   await owner.protocol.start(FlowKind.ProtectSecret, {
     secrets: [s1, s2],
     description: "v=6 explicit publish",
@@ -2393,7 +2402,7 @@ async function assertHydrated(
   }
 
   const storedHelpers = JSON.parse(
-    new TextDecoder().decode(await peer.channelStore.listHelpers(sid)),
+    utf8Decode(await peer.channelStore.listHelpers(sid)),
   );
   if (storedHelpers.length !== helpers) {
     throw new Error(
@@ -2402,7 +2411,7 @@ async function assertHydrated(
   }
 
   const roster = JSON.parse(
-    new TextDecoder().decode(await peer.channelStore.listReplicas(sid)),
+    utf8Decode(await peer.channelStore.listReplicas(sid)),
   );
   if (roster.length !== members) {
     throw new Error(`replica ${label} roster size: expected ${members}, got ${roster.length}`);

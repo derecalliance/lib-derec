@@ -18,7 +18,7 @@ lib-derec/
 ├── protobufs      # Generated protobuf protocol types
 ├── cryptography   # Cryptographic primitives used by the protocol
 ├── library        # Main SDK used by applications
-├── bindings/      # Example bindings and integration samples
+├── smoke-tests/      # Example bindings and integration samples
 ```
 
 Crate responsibilities:

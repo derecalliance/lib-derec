@@ -4,7 +4,7 @@
 // On-device smoke test entry point. Runs every scenario in sequence and logs a
 // single sentinel line — `DEREC_SMOKE_RESULT: PASS` or
 // `DEREC_SMOKE_RESULT: FAIL <reason>` — which
-// `bindings/react-native/run_test.sh` greps out of the device log. The on-screen
+// `smoke-tests/react-native/run_test.sh` greps out of the device log. The on-screen
 // list is for a human watching the simulator; the sentinel is what CI reads.
 
 import React, {useEffect, useState} from 'react';

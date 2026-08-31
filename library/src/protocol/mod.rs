@@ -614,7 +614,10 @@ impl<
     /// application inspects the share without touching wire bytes,
     /// envelopes or key material:
     ///
-    /// ```rust,ignore
+    /// The application context (`my_app`, its per-user limits) is yours, so
+    /// this is illustrative rather than a compiled example:
+    ///
+    /// ```text
     /// for event in protocol.process(&wire_bytes).await? {
     ///     let DeRecEvent::ActionRequired { action, channel_id } = event else { continue };
     ///     match &action {

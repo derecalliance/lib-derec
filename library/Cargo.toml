@@ -1,6 +1,6 @@
 [package]
 name = "derec-library"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -22,8 +22,8 @@ include = [
 crate-type = ["cdylib", "rlib", "staticlib"]
 
 [dependencies]
-derec-cryptography = { version = "0.0.1", path = "../cryptography" }
-derec-proto = { version = "0.0.1", path = "../protobufs" }
+derec-cryptography = { version = "0.0.2", path = "../cryptography" }
+derec-proto = { version = "0.0.2", path = "../protobufs" }
 prost = "0.14.4"
 prost-types = "0.14.4"
 rand = { version = "0.10.2", features = ["sys_rng"] }
@@ -44,7 +44,7 @@ tracing = { version = "0.1.44", default-features = false, features = ["attribute
 tokio = { version = "1.53.1", features = ["rt"], default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-derec-proto = { version = "0.0.1", path = "../protobufs", features = ["serde"] }
+derec-proto = { version = "0.0.2", path = "../protobufs", features = ["serde"] }
 wasm-bindgen = { version = "0.2.126", features = ["serde-serialize"] }
 wasm-bindgen-futures = { version = "0.4.76" }
 serde-wasm-bindgen = { version = "0.6.5" }
@@ -58,6 +58,16 @@ console_error_panic_hook = "0.1.7"
 logging = ["dep:tracing"]
 ffi = ["serde"]
 serde = ["derec-proto/serde"]
+
+# docs.rs builds default features only, which leaves two public modules
+# undocumented: `interop::dto` and `protocol::types::state_record`, both gated
+# on `serde`. They are the serde shapes a store implementor needs, so being
+# absent from the published docs is the opposite of what they are for.
+#
+# `serde` alone is enough. `ffi` adds no public Rust API (the C ABI module is
+# private) and `logging` only attaches tracing spans.
+[package.metadata.docs.rs]
+features = ["serde"]
 
 [dev-dependencies]
 rand08 = { package = "rand", version = "0.8.5" }

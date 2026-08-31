@@ -350,6 +350,19 @@ pub trait DeRecShareStore {
     /// `secret_id`. Recovery uses this with the set returned by
     /// [`DeRecChannelStore::linked_channels`], so it is a single
     /// round-trip regardless of how many channels are linked.
+    ///
+    /// # Ordering
+    ///
+    /// The order of the returned shares is unspecified, and an
+    /// implementation backed by a database is free to return rows in
+    /// whatever order its query plan produces. Callers must select the
+    /// share they want by inspecting [`Share`] rather than by position.
+    ///
+    /// This matters because `secret_id` is a *partition*, not the secret
+    /// being asked for: a Helper stores shares belonging to other people's
+    /// secrets, so one partition can hold several secrets at the same
+    /// version and a single call can legitimately return all of them. Only
+    /// [`Share::secret_id`] distinguishes them.
     fn load_many(
         &self,
         secret_id: u64,

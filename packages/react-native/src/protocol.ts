@@ -82,8 +82,8 @@ function decodeEvents(buffer: ArrayBuffer): DeRecEvent[] {
 
 /**
  * Maps a transport protocol name to the `derec_proto::Protocol` discriminant.
- * `bindings/test_fixture/enums.json` — the shared enum fixture every other
- * numeric mapping in this SDK is read from — does not carry this enum (it
+ * The shared enum fixture every other numeric mapping in this SDK is checked
+ * against does not carry this enum (it
  * only covers the Rust-internal serde enums listed under its `"enums"` key);
  * the transport `Protocol` enum lives in `protobufs/transportprotocol.proto`
  * instead, where only `HTTPS = 0` is currently defined.
@@ -113,8 +113,8 @@ function encodeTarget(target: Target): unknown {
  * byte values, matching `UserSecretJson`'s plain `Vec<u8>` fields — no
  * base64, no wrapping.
  *
- * Exported so it can be golden-tested against
- * `bindings/test_fixture/wire_golden.json` without a native module.
+ * Exported so it can be golden-tested against the shared wire fixture
+ * without a native module.
  */
 export function buildProtectSecretParams(params: ProtectSecretParams): Record<string, unknown> {
   const out: Record<string, unknown> = {
@@ -145,8 +145,8 @@ function communicationInfoOrOmit(
  * the shared golden fixture byte-for-byte; `replicas` is omitted entirely
  * when the recovered secret has no replica group.
  *
- * Exported so it can be golden-tested against
- * `bindings/test_fixture/wire_golden.json` without a native module.
+ * Exported so it can be golden-tested against the shared wire fixture
+ * without a native module.
  */
 export function buildRestoreParams(
   recoveredSecret: Extract<DeRecEvent, { type: 'SecretRecovered' }>['secret'],

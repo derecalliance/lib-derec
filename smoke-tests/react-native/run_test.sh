@@ -50,6 +50,7 @@ mkdir -p "$LOG_DIR"
 
 METRO_PID=""
 COLLECTOR_PID=""
+EMULATOR_PID=""
 
 # Collects the result the app POSTs.
 #
@@ -156,12 +157,87 @@ await_sentinel() {
   return 1
 }
 
+# Boots the simulator and waits for it to finish.
+#
+# `run-ios` boots it too, but returns as soon as the launch is issued rather
+# than when the device is usable, so a cold simulator makes the first run fail
+# and the second pass. `simctl bootstatus -b` blocks until boot completes,
+# which turns that race into a wait.
+ensure_ios_device() {
+  local udid
+  udid="$(xcrun simctl list devices available 2>/dev/null \
+    | sed -n "s/^ *${IOS_SIMULATOR} (\([0-9A-F-]*\)).*/\\1/p" | head -1)"
+  if [[ -z "$udid" ]]; then
+    echo "Simulator not found: $IOS_SIMULATOR" >&2
+    return 1
+  fi
+
+  if xcrun simctl list devices 2>/dev/null | grep -q "$udid.*Booted"; then
+    echo "Simulator already booted: $IOS_SIMULATOR"
+    return 0
+  fi
+
+  echo "Booting simulator: $IOS_SIMULATOR"
+  xcrun simctl boot "$udid" 2>/dev/null || true
+  xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1 || true
+
+  if ! xcrun simctl list devices 2>/dev/null | grep -q "$udid.*Booted"; then
+    echo "Simulator failed to boot: $IOS_SIMULATOR" >&2
+    return 1
+  fi
+  echo "Simulator ready"
+}
+
+# Boots an emulator when none is attached, and waits for Android to finish
+# coming up — `adb wait-for-device` returns while the system is still starting,
+# so `sys.boot_completed` is the real signal.
+ensure_android_device() {
+  if adb get-state >/dev/null 2>&1; then
+    echo "Android device already attached"
+    return 0
+  fi
+
+  local emulator_bin="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}/emulator/emulator"
+  if [[ ! -x "$emulator_bin" ]]; then
+    echo "No emulator binary; set ANDROID_HOME or attach a device." >&2
+    return 1
+  fi
+
+  local avd
+  avd="${DEREC_SMOKE_AVD:-$("$emulator_bin" -list-avds 2>/dev/null | head -1)}"
+  if [[ -z "$avd" ]]; then
+    echo "No AVD defined; create one or attach a device." >&2
+    return 1
+  fi
+
+  echo "Booting emulator: $avd"
+  "$emulator_bin" -avd "$avd" -no-snapshot-save -no-boot-anim \
+    > "$LOG_DIR/rn-smoke-emulator.log" 2>&1 &
+  EMULATOR_PID=$!
+
+  local deadline=$((SECONDS + 300))
+  while (( SECONDS < deadline )); do
+    if [[ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" == "1" ]]; then
+      echo "Emulator ready: $avd"
+      return 0
+    fi
+    if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
+      echo "Emulator exited during boot; see $LOG_DIR/rn-smoke-emulator.log" >&2
+      return 1
+    fi
+    sleep 5
+  done
+  echo "Emulator did not finish booting within 300s" >&2
+  return 1
+}
+
 run_ios() {
   if [[ -z "$IOS_SIMULATOR" ]]; then
     echo "No iOS simulator available; install one via Xcode or set DEREC_SMOKE_IOS_SIMULATOR." >&2
     return 1
   fi
   echo "── iOS simulator (${IOS_SIMULATOR}) ────────────────────────"
+  ensure_ios_device || return 1
   local build_log="$LOG_DIR/rn-smoke-ios.log"
 
   # `--no-packager`: Metro is already running, and a second one on the same
@@ -181,10 +257,7 @@ run_android() {
   echo "── Android emulator ────────────────────────────────────────"
   local build_log="$LOG_DIR/rn-smoke-android.log"
 
-  if ! adb get-state >/dev/null 2>&1; then
-    echo "No Android device or emulator attached; start one and retry." >&2
-    return 1
-  fi
+  ensure_android_device || return 1
 
   if ! ( cd "$APP_DIR" && npx react-native run-android --no-packager ) \
          > "$build_log" 2>&1; then

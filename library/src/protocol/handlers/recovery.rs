@@ -240,11 +240,19 @@ pub(in crate::protocol) async fn accept<
 ) -> Result<Vec<DeRecEvent>> {
     let linked_ids = channel_store.linked_channels(secret_id, channel_id).await?;
 
+    // `secret_id` is the partition this node stores under, not the secret
+    // being asked for: a helper holds shares for other people's secrets, and
+    // `request.secret_id` is the only thing that names which one. Selecting
+    // on the partition alone leaves the choice to whatever order the store
+    // returns rows in, so a partition holding a second secret at the same
+    // version could yield the wrong share — which `response::produce` then
+    // rejects as `SecretIdMismatch`, failing a request whose share is
+    // present and readable.
     let encoded = share_store
         .load_many(secret_id, &linked_ids, &[request.version])
         .await?
         .into_iter()
-        .next()
+        .find(|s| s.secret_id == request.secret_id)
         .map(|s| s.bytes)
         .ok_or(Error::InvalidInput("no stored share for recovery request"))?;
 
@@ -1483,6 +1491,110 @@ mod recovery_ids_tests {
                     other => panic!("expected accumulator, got {other:?}"),
                 };
                 assert!(shares.is_empty(), "the accumulator stays untouched");
+            });
+        }
+    }
+
+    /// Serving a `GetShareRequest` out of a partition holding more than one
+    /// secret.
+    ///
+    /// A helper's `secret_id` is a storage partition for shares belonging to
+    /// other people's secrets, not "the one secret this instance manages" —
+    /// the owner-side reading of the term. `load_many` is keyed on that
+    /// partition, so with two secrets stored at the same version across
+    /// linked channels it legitimately returns both, and which one arrives
+    /// first is a property of the store, not of the request.
+    mod partition_holding_two_secrets {
+        use super::*;
+        use crate::protocol::Share;
+
+        /// A stored `StoreShareRequestMessage`, shaped the way `accept`
+        /// re-decodes it: the requested secret id lives on the innermost
+        /// `DeRecShare`, which is what `response::produce` checks against.
+        fn stored_share(secret_id: u64, version: u32) -> Vec<u8> {
+            let share = derec_proto::DeRecShare {
+                encrypted_secret: vec![0xAB; 4],
+                x: vec![0x01],
+                y: vec![0x02],
+                secret_id,
+                version,
+            };
+            let committed = derec_proto::CommittedDeRecShare {
+                de_rec_share: share.encode_to_vec(),
+                commitment: vec![0xCD; 4],
+                merkle_path: Vec::new(),
+            };
+            derec_proto::StoreShareRequestMessage {
+                share: committed.encode_to_vec(),
+                secret_id,
+                version,
+                ..Default::default()
+            }
+            .encode_to_vec()
+        }
+
+        /// The decoy sorts ahead of the wanted share, so a handler that takes
+        /// whatever `load_many` returns first picks the wrong secret. It then
+        /// fails the request outright — `response::produce` rejects the
+        /// mismatch with `SecretIdMismatch` rather than serving another
+        /// secret's share — so the symptom is a recovery that cannot
+        /// complete even though the right share is stored.
+        #[test]
+        fn the_share_served_is_the_one_the_request_asked_for() {
+            run_async(async {
+                const DECOY_CHANNEL: u64 = 0x10;
+                const WANTED_CHANNEL: u64 = 0x20;
+                const DECOY_SECRET: u64 = 0x88;
+
+                let mut channels = InMemChannelStore::default();
+                let mut secrets = InMemSecretStore::default();
+                let mut shares = crate::protocol::test::InMemShareStore::default();
+                let transport = RecordingTransport::default();
+
+                seed_channel(&mut channels, &mut secrets, LOCAL, DECOY_CHANNEL, 0xB1).await;
+                seed_channel(&mut channels, &mut secrets, LOCAL, WANTED_CHANNEL, 0xB2).await;
+                DeRecChannelStore::link_channel(
+                    &mut channels,
+                    LOCAL,
+                    ChannelId(DECOY_CHANNEL),
+                    ChannelId(WANTED_CHANNEL),
+                )
+                .await
+                .expect("link the two channels");
+
+                for (channel, secret) in [(DECOY_CHANNEL, DECOY_SECRET), (WANTED_CHANNEL, TARGET)] {
+                    DeRecShareStore::save(
+                        &mut shares,
+                        LOCAL,
+                        ChannelId(channel),
+                        Share {
+                            secret_id: secret,
+                            version: VERSION,
+                            bytes: stored_share(secret, VERSION),
+                        },
+                    )
+                    .await
+                    .expect("seed share");
+                }
+
+                let request = GetShareRequestMessage {
+                    secret_id: TARGET,
+                    version: VERSION,
+                    ..Default::default()
+                };
+
+                accept(
+                    &mut channels,
+                    &mut shares,
+                    &transport,
+                    LOCAL,
+                    ChannelId(WANTED_CHANNEL),
+                    &request,
+                    &[0xB2; 32],
+                    0,
+                )
+                .await
+                .expect("the share for TARGET is stored and must be the one served");
             });
         }
     }

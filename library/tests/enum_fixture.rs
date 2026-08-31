@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-//! Guards `bindings/test_fixture/enums.json` against drifting behind the Rust
+//! Guards `library/tests/fixtures/enums.json` against drifting behind the Rust
 //! definitions it mirrors.
 //!
 //! Every enum listed there is hand-mirrored into five SDKs with nothing linking
@@ -25,10 +25,7 @@ use derec_library::protocol::types::{ChannelStatus, ReplicaRole, SecretKind, Sta
 
 /// Names the fixture records for one enum, in wire encoding.
 fn fixture_names(enum_name: &str) -> BTreeSet<String> {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../bindings/test_fixture/enums.json"
-    );
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/enums.json");
     let raw = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
     let doc: serde_json::Value =
         serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parsing {path}: {e}"));
@@ -52,7 +49,7 @@ fn assert_matches_fixture(enum_name: &str, rust: &[&str]) {
     let extra: Vec<_> = fixture.difference(&rust).cloned().collect();
     assert!(
         missing.is_empty() && extra.is_empty(),
-        "{enum_name} has drifted from bindings/test_fixture/enums.json\n  \
+        "{enum_name} has drifted from library/tests/fixtures/enums.json\n  \
          in Rust but not the fixture: {missing:?}\n  \
          in the fixture but not Rust: {extra:?}\n  \
          Update the fixture, then update every SDK until its tests pass again."
@@ -238,10 +235,7 @@ fn protobuf_enum_fixtures_are_complete() {
 /// names but not the values is just as broken.
 #[test]
 fn numeric_discriminants_match_the_fixture() {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../bindings/test_fixture/enums.json"
-    );
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/enums.json");
     let doc: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(path).expect("read fixture"))
             .expect("parse fixture");
@@ -300,7 +294,7 @@ fn numeric_discriminants_match_the_fixture() {
 fn typescript_declarations_cover_the_fixture() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
     let fixture: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(format!("{root}/bindings/test_fixture/enums.json"))
+        &std::fs::read_to_string(format!("{root}/library/tests/fixtures/enums.json"))
             .expect("read fixture"),
     )
     .expect("parse fixture");

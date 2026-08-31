@@ -224,9 +224,8 @@ The orchestrator handles the whole chain automatically:
       keys published by the peer do not match the commitment the scanner
       originally accepted.
 
-End-to-end orchestrator-level coverage is in
-`bindings/nodejs/protocol.ts::runHashedKeysPairingFlow` (happy path +
-tampered-hash assertion).
+This flow is covered end to end — happy path and tampered-hash — for every
+SDK. See [End-to-end test coverage](https://github.com/derecalliance/lib-derec#end-to-end-test-coverage).
 
 ---
 
@@ -430,8 +429,8 @@ typed `ReplicaSecretReceived` event:
 `secret` + `shares` give the Destination everything it needs to act in the
 Source's place during recovery.
 
-End-to-end coverage lives in
-[`runReplicaPairingAndSecretSyncFlow`](../../bindings/nodejs/protocol.ts).
+End-to-end coverage lives in the repository's tests — see
+[End-to-end test coverage](https://github.com/derecalliance/lib-derec#end-to-end-test-coverage).
 
 ---
 

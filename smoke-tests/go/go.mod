@@ -1,4 +1,4 @@
-module github.com/derecalliance/lib-derec/bindings/go
+module github.com/derecalliance/lib-derec/smoke-tests/go
 
 go 1.23
 

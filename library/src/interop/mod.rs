@@ -4,12 +4,18 @@
 //! The language-binding layer: everything that exists so a host language can
 //! reach the protocol, and nothing that is part of the protocol itself.
 //!
-//! [`ffi`] and [`wasm`] are compiled under mutually exclusive `cfg`s — the
+//! `ffi` and `wasm` are compiled under mutually exclusive `cfg`s — the
 //! first requires `not(target_arch = "wasm32")`, the second requires it — so
-//! neither can own something the other also needs. [`dto`] holds what both
+//! neither can own something the other also needs. `dto` holds what both
 //! depend on, as a sibling of the two rather than inside either. That is the
 //! whole reason this module exists as a layer instead of two unrelated
 //! top-level modules.
+//!
+//! Those three are named in plain code spans rather than linked because none
+//! of them resolves in a default documentation build: `ffi` is private and
+//! feature-gated, `wasm` exists only on `wasm32`, and `dto` requires the
+//! `serde` feature. A link would be a warning on every build and a dead end
+//! on docs.rs.
 //!
 //! Everything above this module — [`crate::primitives`], [`crate::protocol`],
 //! [`crate::transport`] — is binding-agnostic and must stay that way. A

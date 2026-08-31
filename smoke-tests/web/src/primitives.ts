@@ -2,15 +2,10 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 // Primitives smoke tests: exercises every flow using the low-level
 // `primitives.*` API (raw message produce / extract / process functions).
-// Mirrors the Rust primitive smoke test (`bindings/rust/src/primitives.rs`).
+// Mirrors the Rust primitive smoke test (`smoke-tests/rust/src/primitives.rs`).
 // The chain in each flow is request.produce → request.extract → response.produce
 // → response.extract → response.process, matching the current Rust signatures
 // one-for-one.
-// Carried over from `bindings/nodejs/primitives.ts` unchanged apart from the
-// module specifier: primitives are synchronous byte transforms in both SDKs,
-// so nothing here needs adapting for React Native. They run on the JavaScript
-// thread — `protect_secret` does real cryptographic work, which is why the
-// protocol scenarios drive it through `DeRecProtocol` instead.
 
 import {
   ContactMode,
@@ -24,7 +19,7 @@ import {
   type PrePairResponseMessage,
   type SecretVersionEntry,
   type StoreShareRequestMessage,
-} from "@derec-alliance/react-native";
+} from "@derec-alliance/web";
 
 function sharedKey(byte: number): Uint8Array {
   return new Uint8Array(32).fill(byte);
@@ -288,29 +283,23 @@ export function runPrimitivesSmoke(): void {
   console.log(`  contact carries 48-byte binding hash, no inline keys  ✓`);
 
 
-  // Bob (the scanner) sends a plaintext PrePair request asking for the keys.
   const prePairRequestEnvelope = primitives.pairing.request.produce_pre_pair(
     { protocol: 0, uri: "https://example.com/helper/ephemeral" },
     hkContact.contact_message,
   );
-
-  // Alice decodes the inbound plaintext request.
   const { request: prePairReq }: { request: PrePairRequestMessage } =
     primitives.pairing.request.extract_pre_pair(prePairRequestEnvelope.envelope);
   if (prePairReq.nonce !== hkContact.contact_message.nonce) {
     throw new Error("PrePair request must echo the contact's nonce");
   }
 
-  // Alice publishes the public keys back to Bob.
   const prePairResponseEnvelope = primitives.pairing.response.produce_pre_pair(
     hashedKeysChannelId, prePairReq, hkContact.secret_key,
   );
-
-  // Bob decodes the inbound plaintext response.
   const { response: prePairResp }: { response: PrePairResponseMessage } =
     primitives.pairing.response.extract_pre_pair(prePairResponseEnvelope.envelope);
 
-  // Bob recomputes the SHA-384 binding hash and validates it against the
+  // Scanner-side: recompute the SHA-384 binding hash and validate against the
   // commitment from the original contact. Any tampering on the plaintext
   // PrePair leg surfaces here.
   const validated = primitives.pairing.response.process_pre_pair(
@@ -365,7 +354,6 @@ export function runPrimitivesSmoke(): void {
     throw new Error("HASHED_KEYS pairing: rekeyed channel id must differ from the pre-rekey id");
   }
   console.log(`  shared keys match (${hkProduced.shared_key.length}B)  ✓`);
-  console.log(`  channel id rekeyed: ${hashedKeysChannelId} → ${hkProduced.channel_id}  ✓`);
 
   console.log("✓ Pairing flow (HASHED_KEYS + PrePair) passed.\n");
 

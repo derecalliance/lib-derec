@@ -12,13 +12,13 @@ import (
 )
 
 // goldenJSON loads one entry from the shared golden fixture
-// (bindings/test_fixture/wire_golden.json), which every SDK asserts its own
+// (library/tests/fixtures/wire_golden.json), which every SDK asserts its own
 // params builder against. Any difference from what that fixture pins means
 // the wire format changed — do not update the fixture to make a failing
 // assertion pass; fix the marshal code instead.
 func goldenJSON(t *testing.T, key string) string {
 	t.Helper()
-	raw, err := os.ReadFile("../../../bindings/test_fixture/wire_golden.json")
+	raw, err := os.ReadFile("../../../library/tests/fixtures/wire_golden.json")
 	if err != nil {
 		t.Fatalf("read wire_golden.json: %v", err)
 	}

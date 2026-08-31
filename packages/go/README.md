@@ -160,7 +160,7 @@ if err != nil {
 // validated.MlkemEncapsulationKey / validated.EciesPublicKey / validated.Nonce
 ```
 
-The transport URI used for the `PrePair` leg **must** be ephemeral — `PrePair` envelopes are plaintext. Swap to a long-term endpoint via an `UpdateChannelInfo` flow once pairing completes. See `bindings/go/primitives.go::runPairingFlow` for a complete, compiling handshake.
+The transport URI used for the `PrePair` leg **must** be ephemeral — `PrePair` envelopes are plaintext. Swap to a long-term endpoint via an `UpdateChannelInfo` flow once pairing completes. The repository's end-to-end tests carry a complete, compiling handshake — see [End-to-end test coverage](https://github.com/derecalliance/lib-derec#end-to-end-test-coverage).
 
 ---
 
@@ -298,7 +298,7 @@ if err != nil {
 defer p.Close()
 ```
 
-`channelStore`/`shareStore`/`secretStore`/`userSecretStore`/`stateStore`/`transport` are your application's implementations of the six interfaces above. See `bindings/go/protocol.go` for complete in-memory implementations (`memChannelStore`, `memShareStore`, `memSecretStore`, `memUserSecretStore`, `memStateStore`, `memTransport`) used by the SDK's own smoke test.
+`channelStore`/`shareStore`/`secretStore`/`userSecretStore`/`stateStore`/`transport` are your application's implementations of the six interfaces above. The repository's end-to-end tests carry complete in-memory implementations of all six — see [End-to-end test coverage](https://github.com/derecalliance/lib-derec#end-to-end-test-coverage).
 
 ### Driving a flow
 
@@ -332,7 +332,7 @@ for _, ev := range events {
 
 When recovering a secret onto a fresh instance, pass the typed `Secret` from a `SecretRecovered` (or `ReplicaSecretReceived`) event to `p.Restore(secret, version)` to commit canonical helper state and wipe the throwaway recovery-mode channels.
 
-Reference: `bindings/go/protocol.go` (`runProtocol`) drives a complete Owner + two Helpers pairing → protect-secret → `ShareStored`/`ShareConfirmed` flow using only the public `protocol` package.
+Reference: the repository's end-to-end tests drive a complete Owner + two Helpers pairing → protect-secret → recovery cycle — see [End-to-end test coverage](https://github.com/derecalliance/lib-derec#end-to-end-test-coverage).
 
 ---
 

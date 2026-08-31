@@ -51,14 +51,18 @@ const TYPE_URL_PREFIX: &str = "type.derec.org/";
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// `DeRecMessageBuilder` lives in `derec-library`, which depends on this
+/// crate, so this cannot be a compiled example here. Note that the variants
+/// hold **owned** messages, not references:
+///
+/// ```text
 /// use derec_proto::{MessageBody, VerifyShareRequestMessage};
 ///
 /// let inner = VerifyShareRequestMessage { /* … */ };
 /// let envelope = DeRecMessageBuilder::channel()
 ///     .channel_id(channel_id)
 ///     .timestamp(ts)
-///     .message_body(MessageBody::VerifyShareRequest(&inner))
+///     .message_body(MessageBody::VerifyShareRequest(inner))
 ///     .encrypt(&shared_key)?
 ///     .build()?;
 /// ```

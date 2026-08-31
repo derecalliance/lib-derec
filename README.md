@@ -24,7 +24,7 @@ lib-derec/
 ├── protobufs      # Generated protobuf message types
 ├── cryptography   # Cryptographic primitives used by the protocol
 ├── library        # Main SDK exposed to application developers
-├── bindings/      # Example bindings and integration samples
+├── smoke-tests/      # End-to-end tests for every SDK
 ├── packages/      # Package wrappers for each SDK supported
 ```
 
@@ -50,7 +50,7 @@ Or manually in your `Cargo.toml`
 
 ```toml
 [dependencies]
-derec-library = "0.0.1"
+derec-library = "0.0.2"
 ```
 
 > [!WARNING]
@@ -116,23 +116,26 @@ including Node-only dependencies.
 
 ---
 
-## Example bindings
+## End-to-end test coverage
 
-End-to-end smoke tests live under `bindings/` and exercise every primitive
+End-to-end smoke tests live under `smoke-tests/` and exercise every primitive
 flow plus the high-level `DeRecProtocol` orchestrator (Owner↔Helper pair,
 ProtectSecret, Discovery, Recovery, replica secret sync) across every SDK:
 
-- `bindings/rust` — Rust primitive + protocol tests. Run with `cargo run -p derec-rust-binding-smoke-test`.
-- `bindings/nodejs` — Node.js WASM tests. `cd bindings/nodejs && npm install && npx tsc && node index.js`.
-- `bindings/web` — Browser WASM tests. `cd bindings/web && npm install && npm run build` and open via `npm run dev`.
-- `bindings/dotnet` — .NET P/Invoke tests against the C ABI, including the orchestrator. `cd bindings/dotnet && dotnet run`.
-- `bindings/go` — Go purego (no cgo) tests against the C ABI, including the orchestrator. `cd bindings/go && go run .`.
+- `smoke-tests/rust` — Rust primitive + protocol tests. Run with `cargo run -p derec-rust-binding-smoke-test`.
+- `smoke-tests/nodejs` — Node.js WASM tests. `cd smoke-tests/nodejs && npm install && npx tsc && node index.js`.
+- `smoke-tests/web` — Browser WASM tests. `cd smoke-tests/web && npm install && npm run build` and open via `npm run dev`.
+- `smoke-tests/dotnet` — .NET P/Invoke tests against the C ABI, including the orchestrator. `cd smoke-tests/dotnet && dotnet run`.
+- `smoke-tests/react-native` — React Native JSI tests against the C ABI on an iOS simulator
+  and an Android emulator, including the orchestrator. Run with
+  `smoke-tests/react-native/run_test.sh` (booted devices are not required; it starts them).
+- `smoke-tests/go` — Go purego (no cgo) tests against the C ABI, including the orchestrator. `cd smoke-tests/go && go run .`.
 
 Two reference storage backends implementing all six store traits over a real
 database also live here and run the full protocol suite:
 
-- `bindings/sqlite` — SQLite-backed stores. `cd bindings/sqlite && cargo run`.
-- `bindings/postgres` — Postgres-backed stores (needs a Postgres reachable at `DATABASE_URL`, default `postgres://postgres:postgres@localhost:15432/derec_test`). `cd bindings/postgres && cargo run`.
+- `smoke-tests/sqlite` — SQLite-backed stores. `cd smoke-tests/sqlite && cargo run`.
+- `smoke-tests/postgres` — Postgres-backed stores (needs a Postgres reachable at `DATABASE_URL`, default `postgres://postgres:postgres@localhost:15432/derec_test`). `cd smoke-tests/postgres && cargo run`.
 
 ## Replica feature
 
