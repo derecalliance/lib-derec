@@ -242,9 +242,16 @@ func (r Replicas) MarshalJSON() ([]byte, error) {
 
 // Helper mirrors the Helper wire DTO in wire.rs — one entry of Secret's
 // helper roster.
+// EndpointJSON is one advertised address in the recovered-secret roster:
+// URI plus the protocol discriminant, so nothing is inferred from a scheme.
+type EndpointJSON struct {
+	URI      string `json:"uri"`
+	Protocol int32  `json:"protocol"`
+}
+
 type Helper struct {
 	ChannelID         string            `json:"channel_id"`
-	TransportURI      string            `json:"transport_uri"`
+	Transports        []EndpointJSON    `json:"transports"`
 	SharedKey         []byte            `json:"shared_key"`
 	CommunicationInfo map[string]string `json:"communication_info"`
 }
@@ -257,12 +264,12 @@ type Helper struct {
 func (h Helper) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		ChannelID         string               `json:"channel_id"`
-		TransportURI      string               `json:"transport_uri"`
+		Transports        []EndpointJSON       `json:"transports"`
 		SharedKey         native.JSONByteArray `json:"shared_key"`
 		CommunicationInfo map[string]string    `json:"communication_info,omitempty"`
 	}{
 		ChannelID:         h.ChannelID,
-		TransportURI:      h.TransportURI,
+		Transports:        h.Transports,
 		SharedKey:         native.JSONByteArray(h.SharedKey),
 		CommunicationInfo: h.CommunicationInfo,
 	})
@@ -273,7 +280,7 @@ func (h Helper) MarshalJSON() ([]byte, error) {
 // group carries "Source".
 type Replica struct {
 	ReplicaID         string            `json:"replica_id"`
-	TransportURI      string            `json:"transport_uri"`
+	Transports        []EndpointJSON    `json:"transports"`
 	Role              string            `json:"role"`
 	CommunicationInfo map[string]string `json:"communication_info"`
 }
@@ -286,12 +293,12 @@ type Replica struct {
 func (r Replica) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		ReplicaID         string            `json:"replica_id"`
-		TransportURI      string            `json:"transport_uri"`
+		Transports        []EndpointJSON    `json:"transports"`
 		Role              string            `json:"role"`
 		CommunicationInfo map[string]string `json:"communication_info,omitempty"`
 	}{
 		ReplicaID:         r.ReplicaID,
-		TransportURI:      r.TransportURI,
+		Transports:        r.Transports,
 		Role:              r.Role,
 		CommunicationInfo: r.CommunicationInfo,
 	})

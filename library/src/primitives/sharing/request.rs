@@ -198,7 +198,7 @@ pub fn split(
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 ///
 /// let ProduceResult { envelope } =
-///     produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, None)
+///     produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, &[])
 ///         .expect("produce failed");
 ///
 /// assert!(!envelope.is_empty());
@@ -216,7 +216,7 @@ pub fn produce(
     keep_list: &[u32],
     description: impl Into<String>,
     shared_key: &SharedKey,
-    reply_to: Option<derec_proto::TransportProtocol>,
+    reply_to: &[derec_proto::TransportProtocol],
 ) -> Result<ProduceResult, crate::Error> {
     let timestamp = current_timestamp();
 
@@ -228,7 +228,7 @@ pub fn produce(
         version_description: description.into(),
         timestamp: Some(timestamp),
         secret_id,
-        reply_to,
+        reply_to: reply_to.to_vec(),
         // Helper-bound: `SHARE_ALGORITHM_VSS` implies no replica identity.
         // Helpers know nothing about replicas — see
         // `StoreShareRequestMessage.replicaId`.
@@ -330,7 +330,7 @@ pub fn produce(
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 ///
 /// let ProduceResult { envelope } =
-///     produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, None)
+///     produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, &[])
 ///         .expect("produce failed");
 ///
 /// let ExtractResult { request } = extract(&envelope, &shared_key).expect("extract failed");
@@ -372,7 +372,7 @@ pub fn extract(
 
     verify_timestamps(envelope.timestamp, request.timestamp)?;
 
-    if let Some(reply_to) = request.reply_to.as_ref() {
+    for reply_to in &request.reply_to {
         reply_to.validate()?;
     }
 

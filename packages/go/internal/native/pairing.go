@@ -29,11 +29,11 @@ type extractPairRequestResult struct {
 }
 
 type producePairResponseMessageResult struct {
-	Error                 DeRecError
-	ResponseWireBytes     DeRecBuffer
-	PeerTransportProtocol DeRecBuffer
-	SharedKey             DeRecBuffer
-	ChannelID             uint64
+	Error             DeRecError
+	ResponseWireBytes DeRecBuffer
+	PeerTransports    DeRecBuffer
+	SharedKey         DeRecBuffer
+	ChannelID         uint64
 }
 
 type extractPairResponseResult struct {
@@ -102,7 +102,8 @@ var (
 		requestProto *byte, requestProtoLen uintptr,
 		secretKeyMaterial *byte, secretKeyMaterialLen uintptr,
 		communicationInfo *byte, communicationInfoLen uintptr,
-		parameterRange *byte, parameterRangeLen uintptr) producePairResponseMessageResult
+		parameterRange *byte, parameterRangeLen uintptr,
+		unsafeConnection uint32) producePairResponseMessageResult
 
 	extractPairRespOnce sync.Once
 	extractPairRespFn   func(response *byte, responseLen uintptr,
@@ -134,8 +135,10 @@ var (
 )
 
 // CreateContact builds an out-of-band ContactMessage bootstrapping pairing on
-// channelID, advertising transportProtocol (serialized TransportProtocol proto
-// bytes). nonce == nil lets the library generate a fresh random nonce. Returns
+// channelID, advertising transportProtocols: a length-delimited sequence of
+// serialized TransportProtocol protos (each entry preceded by its varint byte
+// length), in this application's preference order. The first entry also fills
+// the legacy singular field for peers predating the offer list. nonce == nil lets the library generate a fresh random nonce. Returns
 // the encoded ContactMessage wire bytes and (for INLINE_KEYS / HASHED_KEYS
 // contactMode) the opaque pairing secret key material to feed back into
 // ExtractPairRequest / ProducePairResponse.
@@ -214,7 +217,11 @@ func ExtractPairRequest(request, secretKeyMaterial []byte) (uint64, []byte, erro
 // derives the pairing shared key, and returns the rekeyed channel id the
 // responder commits to. communicationInfo and parameterRange are optional
 // serialized proto bytes (nil for none).
-func ProducePairResponse(channelID uint64, requestProto, secretKeyMaterial, communicationInfo, parameterRange []byte) ([]byte, []byte, []byte, uint64, error) {
+//
+// The returned endpoints are every endpoint the requester advertised, in its
+// own order, filtered to those the library will record. unsafeConnection
+// accepts plaintext peer endpoints (http://, grpc://) and is development-only.
+func ProducePairResponse(channelID uint64, requestProto, secretKeyMaterial, communicationInfo, parameterRange []byte, unsafeConnection bool) ([]byte, []Endpoint, []byte, uint64, error) {
 	producePairResponseOnce.Do(func() {
 		purego.RegisterFunc(&producePairResponseFn, symbol("produce_pair_response_message"))
 	})
@@ -222,15 +229,22 @@ func ProducePairResponse(channelID uint64, requestProto, secretKeyMaterial, comm
 		bytePtr(requestProto), uintptr(len(requestProto)),
 		bytePtr(secretKeyMaterial), uintptr(len(secretKeyMaterial)),
 		bytePtr(communicationInfo), uintptr(len(communicationInfo)),
-		bytePtr(parameterRange), uintptr(len(parameterRange)))
+		bytePtr(parameterRange), uintptr(len(parameterRange)),
+		boolToUint32(unsafeConnection))
 	if err := errorFrom(res.Error); err != nil {
 		return nil, nil, nil, 0, err
 	}
-	return bytesFromBuffer(res.ResponseWireBytes),
-		bytesFromBuffer(res.PeerTransportProtocol),
-		bytesFromBuffer(res.SharedKey),
-		res.ChannelID,
-		nil
+	// Drain every out buffer before the decode can return early; each one is
+	// heap-owned by the library and freed as it is copied.
+	envelope := bytesFromBuffer(res.ResponseWireBytes)
+	framed := bytesFromBuffer(res.PeerTransports)
+	sharedKey := bytesFromBuffer(res.SharedKey)
+
+	peerTransports, err := decodeEndpointList(framed)
+	if err != nil {
+		return nil, nil, nil, 0, err
+	}
+	return envelope, peerTransports, sharedKey, res.ChannelID, nil
 }
 
 // ExtractPairResponse decrypts a pairing response envelope using
@@ -268,15 +282,18 @@ func ProcessPairResponse(contactMessage, responseProto, secretKeyMaterial []byte
 
 // ProducePrePairRequest builds a plaintext PrePair request envelope
 // addressed to the creator of contactMessage (a HASHED_KEYS or NO_KEYS
-// contact), sent by a scanner reachable at transportProtocol. Because the
-// envelope carries no shared key yet, transportProtocol MUST be an
-// ephemeral endpoint.
-func ProducePrePairRequest(transportProtocol, contactMessage []byte) ([]byte, error) {
+// contact), sent by a scanner reachable at transportProtocols: a
+// length-delimited sequence of serialized TransportProtocol protos (each
+// entry preceded by its varint byte length), in the scanner's own
+// preference order. The first entry also fills the deprecated singular
+// field for peers predating the list. Because the envelope carries no
+// shared key yet, these MUST be ephemeral endpoints.
+func ProducePrePairRequest(transportProtocols, contactMessage []byte) ([]byte, error) {
 	producePrePairRequestOnce.Do(func() {
 		purego.RegisterFunc(&producePrePairRequestFn, symbol("produce_pre_pair_request_message"))
 	})
 	res := producePrePairRequestFn(
-		bytePtr(transportProtocol), uintptr(len(transportProtocol)),
+		bytePtr(transportProtocols), uintptr(len(transportProtocols)),
 		bytePtr(contactMessage), uintptr(len(contactMessage)))
 	if err := errorFrom(res.Error); err != nil {
 		return nil, err
@@ -347,4 +364,12 @@ func ProcessPrePairResponse(contactMessage, responseProto []byte) (mlkemEncapsul
 		return nil, nil, 0, e
 	}
 	return bytesFromBuffer(res.MlkemEncapsulationKey), bytesFromBuffer(res.EciesPublicKey), res.Nonce, nil
+}
+
+// boolToUint32 maps a Go bool onto the C ABI's uint32 flag convention.
+func boolToUint32(b bool) uint32 {
+	if b {
+		return 1
+	}
+	return 0
 }

@@ -71,13 +71,13 @@ func goldenRestoreSecret() Secret {
 		Helpers: []Helper{
 			{
 				ChannelID:         "11",
-				TransportURI:      "https://helper-a.example.com",
+				Transports:        []EndpointJSON{{URI: "https://helper-a.example.com", Protocol: 0}},
 				SharedKey:         sharedKey1,
 				CommunicationInfo: map[string]string{"foo": "bar"},
 			},
 			{
 				ChannelID:    "22",
-				TransportURI: "https://helper-b.example.com",
+				Transports:        []EndpointJSON{{URI: "https://helper-b.example.com", Protocol: 0}},
 				SharedKey:    sharedKey2,
 			},
 		},
@@ -90,13 +90,13 @@ func goldenRestoreSecret() Secret {
 			Members: []Replica{
 				{
 					ReplicaID:         "44",
-					TransportURI:      "https://replica-a.example.com",
+					Transports:        []EndpointJSON{{URI: "https://replica-a.example.com", Protocol: 0}},
 					Role:              "Source",
 					CommunicationInfo: map[string]string{"baz": "qux"},
 				},
 				{
 					ReplicaID:    "66",
-					TransportURI: "https://replica-b.example.com",
+					Transports:        []EndpointJSON{{URI: "https://replica-b.example.com", Protocol: 0}},
 					Role:         "Destination",
 				},
 			},
@@ -146,7 +146,7 @@ func TestWireGolden_ProtectSecret(t *testing.T) {
 func TestWireGolden_Restore_NilReplicasOmitsField(t *testing.T) {
 	secret := Secret{
 		Helpers: []Helper{
-			{ChannelID: "1", TransportURI: "https://h.example.com", SharedKey: make([]byte, 32)},
+			{ChannelID: "1", Transports:        []EndpointJSON{{URI: "https://h.example.com", Protocol: 0}}, SharedKey: make([]byte, 32)},
 		},
 		Secrets: []UserSecret{{ID: []byte{0x01}, Name: "n", Data: []byte{0x02}}},
 	}

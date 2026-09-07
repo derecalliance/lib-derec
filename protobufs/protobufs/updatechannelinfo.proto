@@ -56,7 +56,34 @@ message UpdateChannelInfoRequestMessage {
   //
   // Presence updates both the URI and protocol enum. The receiver routes
   // the response to this new endpoint.
-  optional TransportProtocol transportProtocol = 2;
+  //
+  // Deprecated: superseded by `supportedTransports`, which carries every
+  // endpoint rather than one. Kept so implementations predating that field
+  // still learn the sender's new address. **Scheduled for removal in
+  // v0.0.5.** A sender populating `supportedTransports` MUST also set this
+  // to a single best-compatibility choice until then.
+  optional TransportProtocol transportProtocol = 2 [deprecated = true];
+
+  // Every transport endpoint the sender can now be reached on, in its own
+  // preference order, replacing the receiver's stored set for this channel.
+  //
+  // # Semantics
+  //
+  // - Empty, and `transportProtocol` absent: the sender's endpoints are
+  //  left unchanged. An update that changes only `communicationInfo` says
+  //  nothing about transports.
+  // - Non-empty: replaces the stored set outright. Unlike a request's
+  //  `replyTo`, this **is** persisted — it is how a peer announces it has
+  //  moved.
+  //
+  // # Compatibility
+  //
+  // Empty with `transportProtocol` present means "only that one endpoint is
+  // offered", which is how every implementation predating this field
+  // behaves. A sender populating this list MUST also set
+  // `transportProtocol` to a single best-compatibility choice so those
+  // implementations still learn the new address.
+  repeated TransportProtocol supportedTransports = 4;
 
   // Timestamp indicating when this message was created.
   //

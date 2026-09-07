@@ -874,20 +874,37 @@ struct EndpointJs {
 }
 
 impl DeRecTransport for JsTransport {
-    fn send(&self, endpoint: &TransportProtocol, message: Vec<u8>) -> TransportFuture<'_> {
-        let obj = self.0.clone();
-        let protocol = match endpoint.protocol {
-            0 => "https",
-            _ => "unknown",
+    fn send(&self, endpoints: &[TransportProtocol], message: Vec<u8>) -> TransportFuture<'_> {
+        // Every entry point that produces a `TransportProtocol` — builder
+        // config, peer-supplied endpoints decoded off the wire — validates
+        // the `protocol` discriminant before it reaches here, so an unknown
+        // one should be unreachable in practice. Treated as a hard failure
+        // rather than handed to JS as a meaningless `"unknown"` string: the
+        // application cannot act on a protocol name it doesn't recognise.
+        let mut js_endpoints = Vec::with_capacity(endpoints.len());
+        for endpoint in endpoints {
+            let Some(protocol) = super::protocol_discriminant_to_name(endpoint.protocol) else {
+                return Box::pin(async move {
+                    Err(Error::InvalidInput(
+                        "unknown transport protocol discriminant",
+                    ))
+                });
+            };
+            js_endpoints.push(EndpointJs {
+                protocol: protocol.to_owned(),
+                uri: endpoint.uri.to_owned(),
+            });
         }
-        .to_owned();
-        let uri = endpoint.uri.to_owned();
+
+        let obj = self.0.clone();
         Box::pin(async move {
-            let endpoint_js = serde_wasm_bindgen::to_value(&EndpointJs { protocol, uri })
-                .map_err(|_| Error::InvalidInput("failed to serialize endpoint"))?;
+            // The whole set, in the peer's order. Which to dial, and whether
+            // to fall back, is the JS implementation's choice.
+            let endpoints_js = serde_wasm_bindgen::to_value(&js_endpoints)
+                .map_err(|_| Error::InvalidInput("failed to serialize endpoints"))?;
             let js_message = Uint8Array::from(message.as_slice());
             let args = Array::new();
-            args.push(&endpoint_js);
+            args.push(&endpoints_js);
             args.push(&js_message);
             let promise_val = call_method(&obj, "send", &args)
                 .map_err(|_| Error::InvalidInput("transport.send call failed"))?;

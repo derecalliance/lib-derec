@@ -473,7 +473,10 @@ func newInMemoryTransport() *inMemoryTransport {
 	return &inMemoryTransport{}
 }
 
-func (t *inMemoryTransport) Send(uri string, protocol int32, message []byte) error {
+func (t *inMemoryTransport) Send(endpoints []Endpoint, message []byte) error {
+	uri := endpoints[0].URI
+	protocol := endpoints[0].Protocol
+	_ = protocol
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.sent = append(t.sent, sentMessage{uri, protocol, append([]byte(nil), message...)})

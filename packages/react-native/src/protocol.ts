@@ -86,12 +86,14 @@ function decodeEvents(buffer: ArrayBuffer): DeRecEvent[] {
  * against does not carry this enum (it
  * only covers the Rust-internal serde enums listed under its `"enums"` key);
  * the transport `Protocol` enum lives in `protobufs/transportprotocol.proto`
- * instead, where only `HTTPS = 0` is currently defined.
+ * instead, where `HTTPS = 0` and `GRPC = 1` are defined.
  */
 export function protocolDiscriminant(protocol: string): number {
   switch (protocol.toLowerCase()) {
     case 'https':
       return 0;
+    case 'grpc':
+      return 1;
     default:
       throw new Error(`DeRec: unknown transport protocol "${protocol}"`);
   }
@@ -156,7 +158,7 @@ export function buildRestoreParams(
     helpers: recoveredSecret.helpers.map((helper) => {
       const out: Record<string, unknown> = {
         channel_id: helper.channel_id,
-        transport_uri: helper.transport_uri,
+        transports: helper.transports,
         shared_key: Array.from(helper.shared_key),
       };
       const info = communicationInfoOrOmit(helper.communication_info);
@@ -177,7 +179,7 @@ export function buildRestoreParams(
       members: recoveredSecret.replicas.members.map((member) => {
         const out: Record<string, unknown> = {
           replica_id: member.replica_id,
-          transport_uri: member.transport_uri,
+          transports: member.transports,
           role: member.role,
         };
         const info = communicationInfoOrOmit(member.communication_info);
@@ -258,7 +260,12 @@ function buildStartParams(flowKind: FlowKind, params: unknown): Uint8Array {
       if (p.communication_info !== undefined) {
         out.communication_info = p.communication_info;
       }
-      if (p.transport_protocol !== undefined) {
+      if (p.own_transports !== undefined && p.own_transports.length > 0) {
+        out.own_transports = p.own_transports;
+        // The first entry also fills the deprecated singular field so a peer
+        // predating `supported_transports` still learns the new address.
+        out.transport_protocol = p.own_transports[0];
+      } else if (p.transport_protocol !== undefined) {
         out.transport_protocol = p.transport_protocol;
       }
       return jsonToBytes(out);
@@ -347,6 +354,32 @@ export class DeRecProtocolBuilder {
     return this;
   }
 
+  /**
+   * Set every transport endpoint this application serves, in preference
+   * order. Written to the config's `own_transports` array, which takes
+   * precedence over `own_transport_uri` / `own_transport_protocol` on the
+   * Rust side when non-empty — see `ProtocolConfig` in
+   * `library/src/interop/ffi/protocol/handle/mod.rs`.
+   *
+   * The order given is forwarded verbatim: it is not sorted, deduplicated,
+   * or reordered here. It is this application's own preference and
+   * decides which of a peer's offered endpoints is used. Every listed
+   * transport must actually be served, because delivery is push-only —
+   * listing an endpoint this application does not serve makes pairing
+   * succeed and replies vanish.
+   *
+   * Supersedes {@link withOwnTransport} for applications serving more
+   * than one transport; the single-endpoint setter remains fully
+   * supported.
+   */
+  withOwnTransports(transports: { uri: string; protocol: string }[]): this {
+    this.config.own_transports = transports.map((t) => ({
+      uri: t.uri,
+      protocol: protocolDiscriminant(t.protocol),
+    }));
+    return this;
+  }
+
   /** Default: 3. */
   withThreshold(threshold: number): this {
     this.config.threshold = threshold;
@@ -371,9 +404,22 @@ export class DeRecProtocolBuilder {
     return this;
   }
 
-  /** Default: false. */
+  /**
+   * @deprecated Use {@link withUnsafeConnection}, which names both gated
+   * schemes. Removed at 0.1.0. Default: false.
+   */
   withUnsafeHttp(allow: boolean): this {
     this.config.unsafe_http = allow;
+    return this;
+  }
+
+  /**
+   * Accept plaintext `http://` and `grpc://` transport endpoints.
+   * **Development only.** Default: false. Supersedes
+   * {@link withUnsafeHttp}, which names only the HTTP scheme.
+   */
+  withUnsafeConnection(allow: boolean): this {
+    this.config.unsafe_connection = allow;
     return this;
   }
 

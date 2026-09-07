@@ -5,7 +5,15 @@ use std::path::PathBuf;
 
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    // Protocol messages — the DeRec wire vocabulary every implementation
+    // must speak.
     let proto_root = manifest_dir.join("protobufs");
+    // Transport service contracts. Kept apart from the message vocabulary
+    // because they describe how envelopes are *delivered*, not what the
+    // protocol says: an implementation reaching peers over HTTPS needs
+    // nothing from here, and each SDK's message codegen globs `proto_root`
+    // alone so these never reach a binding that does not implement them.
+    let grpc_root = manifest_dir.join("grpc");
 
     let proto_files = [
         proto_root.join("committedderecshare.proto"),
@@ -22,12 +30,14 @@ fn main() {
         proto_root.join("storeshare.proto"),
         proto_root.join("unpair.proto"),
         proto_root.join("verify.proto"),
+        grpc_root.join("derectransport.proto"),
     ];
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
     // Re-run if proto changes
     println!("cargo:rerun-if-changed={}", proto_root.display());
+    println!("cargo:rerun-if-changed={}", grpc_root.display());
     for proto in &proto_files {
         println!("cargo:rerun-if-changed={}", proto.display());
     }
@@ -57,6 +67,6 @@ fn main() {
     config
         .out_dir(&out_dir)
         .file_descriptor_set_path(out_dir.join("derec_descriptor.bin"))
-        .compile_protos(&proto_files, &[proto_root])
+        .compile_protos(&proto_files, &[proto_root, grpc_root])
         .expect("Failed to compile .proto files");
 }

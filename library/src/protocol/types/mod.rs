@@ -301,7 +301,24 @@ impl ReplicaRole {
 )]
 pub struct HelperChannel {
     pub channel_id: ChannelId,
-    pub transport: derec_proto::TransportProtocol,
+    /// Every endpoint this peer advertised, in the order it offered them.
+    ///
+    /// The library never ranks these — it filters them through
+    /// [`TransportPolicy`](crate::transport::TransportPolicy) and hands the
+    /// survivors to [`DeRecTransport::send`](crate::protocol::DeRecTransport),
+    /// which is the application's to choose among and fail over between.
+    ///
+    /// # Upgrading from a pre-0.0.3 channel store
+    ///
+    /// This replaced a single `transport` field, so a stored record written
+    /// by an older build no longer deserializes. That is deliberate: the
+    /// field carries no `serde(default)`, so a stale row fails loudly with
+    /// a missing-field error instead of quietly yielding a channel with no
+    /// endpoints — a peer that looks paired and is unreachable is worse than
+    /// one that refuses to load. Applications own channel-store persistence;
+    /// migrating a stored row means wrapping its `transport` object in an
+    /// array.
+    pub transports: Vec<derec_proto::TransportProtocol>,
     #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
     pub communication_info: std::collections::HashMap<String, String>,
     /// The **peer's** role: `Owner` when this node is the helper, `Helper`
@@ -332,7 +349,10 @@ pub struct ReplicaMember {
     pub channel_id: ChannelId,
     /// This member's identity — the primary key within the group.
     pub replica_id: ReplicaId,
-    pub transport: derec_proto::TransportProtocol,
+    /// Every endpoint this member advertised. See
+    /// [`HelperChannel::transports`] for the ordering and compatibility
+    /// contract.
+    pub transports: Vec<derec_proto::TransportProtocol>,
     #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
     pub communication_info: std::collections::HashMap<String, String>,
     pub role: ReplicaRole,
@@ -387,10 +407,14 @@ impl ChannelRecord {
             ChannelRecord::Replica(r) => r.status,
         }
     }
-    pub fn transport(&self) -> &derec_proto::TransportProtocol {
+    /// Every endpoint the peer advertised, in the order it offered them.
+    ///
+    /// Never empty for a recorded channel: the library refuses to record a
+    /// peer whose endpoints were all filtered away.
+    pub fn transports(&self) -> &[derec_proto::TransportProtocol] {
         match self {
-            ChannelRecord::Helper(h) => &h.transport,
-            ChannelRecord::Replica(r) => &r.transport,
+            ChannelRecord::Helper(h) => &h.transports,
+            ChannelRecord::Replica(r) => &r.transports,
         }
     }
     pub fn communication_info(&self) -> &std::collections::HashMap<String, String> {

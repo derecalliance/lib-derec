@@ -3,7 +3,7 @@
 
 use crate::{
     interop::wasm::{
-        primitives::helpers::{parse_optional_transport_protocol, parse_shared_key, to_js},
+        primitives::helpers::{parse_shared_key, parse_transport_protocol_list, to_js},
         ts_bindings_utils::js_error_from_lib,
     },
     primitives::verification::request,
@@ -36,13 +36,13 @@ pub fn produce(
     reply_to: JsValue,
 ) -> Result<JsValue, JsValue> {
     let shared_key = parse_shared_key(shared_key)?;
-    let reply_to_proto = parse_optional_transport_protocol(reply_to)?;
+    let reply_to_proto = parse_transport_protocol_list(reply_to)?;
     let result = request::produce(
         channel_id.into(),
         secret_id,
         version,
         &shared_key,
-        reply_to_proto,
+        &reply_to_proto,
     )
     .map_err(js_error_from_lib)?;
     to_js(&ProduceResult {

@@ -3,9 +3,7 @@
 
 use crate::{
     interop::wasm::{
-        primitives::helpers::{
-            from_js, parse_optional_transport_protocol, parse_shared_key, to_js,
-        },
+        primitives::helpers::{from_js, parse_shared_key, parse_transport_protocol_list, to_js},
         ts_bindings_utils::js_error_from_lib,
     },
     primitives::sharing::request,
@@ -83,7 +81,7 @@ pub fn produce(
     let committed_share: CommittedDeRecShare = from_js(committed_share)?;
     let committed_share_proto: derec_proto::CommittedDeRecShare = committed_share.into();
     let keep_list_raw: Vec<u32> = from_js(keep_list)?;
-    let reply_to_proto = parse_optional_transport_protocol(reply_to)?;
+    let reply_to_proto = parse_transport_protocol_list(reply_to)?;
     let result = request::produce(
         ChannelId(channel_id),
         version,
@@ -92,7 +90,7 @@ pub fn produce(
         &keep_list_raw,
         description,
         &shared_key,
-        reply_to_proto,
+        &reply_to_proto,
     )
     .map_err(js_error_from_lib)?;
 

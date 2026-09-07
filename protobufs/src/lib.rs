@@ -245,7 +245,7 @@ mod tests {
         UnpairRequestMessage {
             memo: "bye".to_owned(),
             timestamp: None,
-            reply_to: None,
+            reply_to: Vec::new(),
             replica_id: None,
         }
         .encode_to_vec()
@@ -258,7 +258,7 @@ mod tests {
         let body = MessageBody::UnpairRequest(UnpairRequestMessage {
             memo: "bye".to_owned(),
             timestamp: None,
-            reply_to: None,
+            reply_to: Vec::new(),
             replica_id: None,
         });
         let bytes = body.encode_to_vec();
@@ -302,5 +302,95 @@ mod tests {
                 .contains("is missing the required `type.derec.org/` namespace prefix"),
             "unexpected error: {err}"
         );
+    }
+}
+
+/// `replyTo` was a singular field through 0.0.2 and is a list from 0.0.3.
+/// Both directions of that transition are wire-level properties rather than
+/// API ones, so they are pinned here.
+#[cfg(test)]
+mod reply_to_wire_compatibility {
+    use super::*;
+    use prost::Message as _;
+    use prost::encoding::{WireType, encode_key, encode_varint};
+
+    fn endpoint(uri: &str, protocol: Protocol) -> TransportProtocol {
+        TransportProtocol {
+            uri: uri.to_owned(),
+            protocol: protocol as i32,
+        }
+    }
+
+    /// Hand-encodes `entries` at `tag`, the way a writer of either vintage
+    /// puts `TransportProtocol` submessages on the wire.
+    fn encode_at_tag(tag: u32, entries: &[TransportProtocol]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for tp in entries {
+            let bytes = tp.encode_to_vec();
+            encode_key(tag, WireType::LengthDelimited, &mut buf);
+            encode_varint(bytes.len() as u64, &mut buf);
+            buf.extend_from_slice(&bytes);
+        }
+        buf
+    }
+
+    /// A 0.0.2 writer emits exactly one entry on the same tag. Reading it as
+    /// a list must yield that one endpoint, not an error and not an empty
+    /// list — this is what keeps already-released peers working.
+    #[test]
+    fn a_single_entry_from_an_older_writer_decodes_as_a_one_element_list() {
+        // VerifyShareRequestMessage.replyTo is tag 5.
+        let wire = encode_at_tag(5, &[endpoint("https://old.example/derec", Protocol::Https)]);
+
+        let decoded = VerifyShareRequestMessage::decode(wire.as_slice())
+            .expect("a single-entry stream must decode");
+
+        assert_eq!(decoded.reply_to.len(), 1);
+        assert_eq!(decoded.reply_to[0].uri, "https://old.example/derec");
+    }
+
+    /// Absent stays absent: an older writer that set no `replyTo` decodes to
+    /// an empty list, which means "route to the endpoints on file" rather
+    /// than "unreachable".
+    #[test]
+    fn an_absent_reply_to_decodes_as_an_empty_list() {
+        let wire = encode_at_tag(5, &[]);
+
+        let decoded =
+            VerifyShareRequestMessage::decode(wire.as_slice()).expect("an empty stream decodes");
+
+        assert!(decoded.reply_to.is_empty());
+    }
+
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+    #[allow(deprecated)]
+    /// The cost of the change, pinned so it is not rediscovered in the
+    /// field: a 0.0.2 reader merges a multi-entry list and sees only the
+    /// **last** entry. An application still talking to one must order
+    /// accordingly. Modelled here by decoding into `UpdateChannelInfo`'s
+    /// still-singular `transportProtocol`, which has the same shape a
+    /// 0.0.2 `replyTo` had.
+    #[test]
+    fn an_older_reader_merges_a_multi_entry_list_and_sees_the_last() {
+        // UpdateChannelInfoRequestMessage.transportProtocol is tag 2 and is
+        // still singular, so it stands in for a 0.0.2 `replyTo`.
+        let wire = encode_at_tag(
+            2,
+            &[
+                endpoint("https://first.example/derec", Protocol::Https),
+                endpoint("grpcs://second.example:443", Protocol::Grpc),
+            ],
+        );
+
+        let decoded = UpdateChannelInfoRequestMessage::decode(wire.as_slice())
+            .expect("a singular reader must still decode a repeated stream");
+
+        let seen = decoded
+            .transport_protocol
+            .expect("the merged field is present");
+        assert_eq!(seen.uri, "grpcs://second.example:443");
+        assert_eq!(seen.protocol, Protocol::Grpc as i32);
     }
 }

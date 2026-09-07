@@ -1,0 +1,38 @@
+/*
+ * Copyright (c) DeRec Alliance and its Contributors.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+syntax = "proto3";
+
+package org.derecalliance.derec.protobuf;
+
+import "derecmessage.proto";
+import "google/protobuf/empty.proto";
+
+/// Delivery service for DeRec messages over gRPC.
+///
+/// Mirrors the request/response-free delivery model the protocol already
+/// uses: a sender hands one envelope to one endpoint and learns only whether
+/// delivery succeeded.
+///
+/// # Push-only
+///
+/// `Send` returns `google.protobuf.Empty`. There is no inline reply. A
+/// responder answers by opening a new `Send` to the requester's own
+/// endpoint, which means **both parties must run a reachable server**.
+/// Responses are correlated by the envelope's `traceId`, not by the call.
+///
+/// # Security
+///
+/// This service provides no security guarantees of its own. Every
+/// `DeRecMessage` carries its payload signed and encrypted at the
+/// application layer, and remains valid regardless of transport.
+service DeRecTransport {
+  /// Deliver one DeRec envelope to this endpoint.
+  ///
+  /// Returns once the receiver has accepted the envelope for processing.
+  /// Acceptance is not a protocol-level acknowledgement: a protocol
+  /// response, if any, arrives as a separate `Send` call.
+  rpc Send(DeRecMessage) returns (google.protobuf.Empty);
+}

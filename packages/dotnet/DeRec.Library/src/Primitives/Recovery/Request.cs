@@ -21,7 +21,13 @@ public static partial class Recovery
             /// Optional response endpoint advertised by the sender on
             /// the inner request. Mirrors the JS bridge surface.
             /// </summary>
-            public TransportProtocol? ReplyTo { get; init; }
+            /// <summary>
+            /// Every endpoint the requester asked to be answered on, in its
+            /// own preference order. Empty means route to the endpoints
+            /// recorded for the channel.
+            /// </summary>
+            public IReadOnlyList<TransportProtocol> ReplyTo { get; init; } =
+                Array.Empty<TransportProtocol>();
         }
 
         public static DeRecMessage Produce(
@@ -29,10 +35,12 @@ public static partial class Recovery
             ulong secretId,
             uint version,
             byte[] sharedKey,
-            TransportProtocol? replyTo = null
+            IReadOnlyList<TransportProtocol>? replyTo = null
         )
         {
-            byte[]? replyToBytes = replyTo?.ToProtoBytes();
+            byte[]? replyToBytes = replyTo is { Count: > 0 }
+                ? TransportProtocol.ToProtoBytesList(replyTo)
+                : null;
             UIntPtr replyToLen = replyToBytes is null ? UIntPtr.Zero : (UIntPtr)replyToBytes.Length;
 
             Native.Recovery.ProduceGetShareRequestMessageResult nativeResult =
@@ -79,7 +87,7 @@ public static partial class Recovery
                 {
                     ChannelId = nativeResult.ChannelId,
                     RequestProtoBytes = innerBytes,
-                    ReplyTo = TransportProtocol.FromProto(inner.ReplyTo),
+                    ReplyTo = inner.ReplyTo.Select(TransportProtocol.FromProtoValue).ToList(),
                 };
             }
             finally

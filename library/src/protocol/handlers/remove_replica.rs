@@ -120,11 +120,11 @@ pub(in crate::protocol) async fn start<
             peer.channel_id,
             &memo,
             &key,
-            None,
+            &[],
             Some(target.0),
         )?;
         let envelope = super::apply_trace_id(request.envelope, super::fresh_trace_id())?;
-        if transport.send(&peer.transport, envelope).await.is_ok() {
+        if transport.send(&peer.transports, envelope).await.is_ok() {
             notified.push(peer.replica_id);
         }
     }
@@ -372,7 +372,7 @@ mod tests {
                 ChannelRecord::Replica(ReplicaMember {
                     channel_id: GROUP,
                     replica_id: ReplicaId(id),
-                    transport: endpoint("https://peer.example"),
+                    transports: vec![endpoint("https://peer.example")],
                     communication_info: std::collections::HashMap::new(),
                     role,
                     status,
@@ -479,7 +479,7 @@ mod tests {
                     SECRET_ID,
                     ChannelRecord::Helper(HelperChannel {
                         channel_id: ChannelId(9001),
-                        transport: endpoint("https://helper.example"),
+                        transports: vec![endpoint("https://helper.example")],
                         communication_info: std::collections::HashMap::new(),
                         peer_role: derec_proto::SenderKind::Helper,
                         status: ChannelStatus::Paired,
@@ -573,7 +573,7 @@ mod tests {
                     SECRET_ID,
                     ChannelRecord::Helper(HelperChannel {
                         channel_id: ChannelId(9001),
-                        transport: endpoint("https://helper.example"),
+                        transports: vec![endpoint("https://helper.example")],
                         communication_info: std::collections::HashMap::new(),
                         peer_role: derec_proto::SenderKind::Helper,
                         status: ChannelStatus::Paired,

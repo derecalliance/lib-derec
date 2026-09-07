@@ -515,8 +515,11 @@ pub trait DeRecUserSecretStore {
 /// }
 ///
 /// impl DeRecTransport for Collector {
-///     fn send(&self, endpoint: &TransportProtocol, message: Vec<u8>) -> TransportFuture<'_> {
-///         let entry = (endpoint.clone(), message);
+///     fn send(&self, endpoints: &[TransportProtocol], message: Vec<u8>) -> TransportFuture<'_> {
+///         // The library offers every endpoint the peer advertised and takes
+///         // no view on which is used. A real transport would try them in
+///         // its own order and fall back; this one records the first.
+///         let entry = (endpoints[0].clone(), message);
 ///         let out = Arc::clone(&self.0);
 ///         Box::pin(async move {
 ///             out.lock().expect("collector poisoned").push(entry);
@@ -561,8 +564,8 @@ pub trait DeRecUserSecretStore {
 /// let collector = Collector::default();
 /// let rt = tokio::runtime::Builder::new_current_thread().build()?;
 /// rt.block_on(async {
-///     collector.send(&peer, apply_trace_id(&envelope(), 0xA11CE).unwrap()).await.unwrap();
-///     collector.send(&peer, apply_trace_id(&envelope(), 0xB0B).unwrap()).await.unwrap();
+///     collector.send(std::slice::from_ref(&peer), apply_trace_id(&envelope(), 0xA11CE).unwrap()).await.unwrap();
+///     collector.send(std::slice::from_ref(&peer), apply_trace_id(&envelope(), 0xB0B).unwrap()).await.unwrap();
 /// });
 ///
 /// let (reply, elsewhere) = split_reply(&inbound, collector.take());
@@ -585,12 +588,23 @@ pub trait DeRecUserSecretStore {
 ///
 /// Same as [`DeRecSecretStore`]; `send` returns [`TransportFuture`].
 pub trait DeRecTransport {
-    /// Deliver `message` to `endpoint`.
+    /// Deliver `message` to a peer, reachable at any of `endpoints`.
     ///
-    /// `endpoint` is the [`TransportProtocol`] the peer advertised during
-    /// pairing. The library calls this from protocol handlers whenever an
-    /// outbound envelope needs to reach a peer.
-    fn send(&self, endpoint: &TransportProtocol, message: Vec<u8>) -> TransportFuture<'_>;
+    /// `endpoints` are the endpoints that peer advertised, in the order it
+    /// offered them, filtered to those this library will record — plaintext
+    /// and malformed entries are already gone. The library does **not**
+    /// rank them: which endpoint to dial, and whether to fall back to
+    /// another when one is unreachable, is transport mechanism and belongs
+    /// to the implementation. Only this side knows which of its transports
+    /// are healthy, cheap, or currently reachable.
+    ///
+    /// Delivery to **any one** endpoint is success. Return an error only
+    /// when the message reached none of them.
+    ///
+    /// `endpoints` is never empty: the library refuses to record a peer it
+    /// filtered every endpoint away from, so a channel that exists has at
+    /// least one usable address.
+    fn send(&self, endpoints: &[TransportProtocol], message: Vec<u8>) -> TransportFuture<'_>;
 }
 
 /// Durable storage for the orchestrator's in-flight protocol state.
@@ -828,8 +842,8 @@ impl<T: DeRecStateStore + ?Sized> DeRecStateStore for Box<T> {
 }
 
 impl<T: DeRecTransport + ?Sized> DeRecTransport for Box<T> {
-    fn send(&self, endpoint: &TransportProtocol, message: Vec<u8>) -> TransportFuture<'_> {
-        (**self).send(endpoint, message)
+    fn send(&self, endpoints: &[TransportProtocol], message: Vec<u8>) -> TransportFuture<'_> {
+        (**self).send(endpoints, message)
     }
 }
 
@@ -978,8 +992,8 @@ impl<T: DeRecStateStore + ?Sized> DeRecStateStore for &mut T {
 }
 
 impl<T: DeRecTransport + ?Sized> DeRecTransport for &mut T {
-    fn send(&self, endpoint: &TransportProtocol, message: Vec<u8>) -> TransportFuture<'_> {
-        (**self).send(endpoint, message)
+    fn send(&self, endpoints: &[TransportProtocol], message: Vec<u8>) -> TransportFuture<'_> {
+        (**self).send(endpoints, message)
     }
 }
 
@@ -994,8 +1008,8 @@ impl<T: DeRecTransport + ?Sized> DeRecTransport for &mut T {
 /// Use [`Box<T>`](Box) or `&mut T` for the stores; both are implemented for
 /// every trait here.
 impl<T: DeRecTransport + ?Sized> DeRecTransport for std::sync::Arc<T> {
-    fn send(&self, endpoint: &TransportProtocol, message: Vec<u8>) -> TransportFuture<'_> {
-        (**self).send(endpoint, message)
+    fn send(&self, endpoints: &[TransportProtocol], message: Vec<u8>) -> TransportFuture<'_> {
+        (**self).send(endpoints, message)
     }
 }
 

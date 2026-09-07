@@ -161,33 +161,36 @@ type StoreShareRequestMessage struct {
 	//   - Present: the responder routes this exchange's response to this
 	//     endpoint and leaves the stored endpoint unchanged.
 	ReplyTo *TransportProtocol `protobuf:"bytes,8,opt,name=replyTo,proto3,oneof" json:"replyTo,omitempty"`
-	// Stable per-device identifier of the replica that produced this share.
+	// Identity of the replica that authored this update.
 	//
-	// # Why this field exists
+	// # Audience
 	//
-	// Replica destinations reuse the source's shared keys with helpers (the
-	// keys travel inside the `ReplicaSecretPayload`). Two distinct
-	// replicas writing the same `(secretId, channelId, version)` from the
-	// helper's perspective look cryptographically identical — same envelope
-	// key, same channel id. Without this field the helper's `ShareStore`
-	// would coalesce the writes and silently drop one of the two shares.
+	// This field is for **replicas only**. Helpers know nothing about
+	// replicas and never receive it:
 	//
-	// # Semantics
+	// - helper-bound (`SHARE_ALGORITHM_VSS`) — MUST be absent.
+	// - replica-bound (`SHARE_ALGORITHM_REPLICA_SECRET`) — MUST be present.
 	//
-	//   - Absent (default): the writer is a non-replica `Owner` (no
-	//     `replica_id` configured at the builder).
-	//   - Present: the writer is `ReplicaSource` and is announcing its
-	//     identity. The helper treats `replica_id` as part of the storage
-	//     key so distinct replicas writing the same version coexist.
+	// The invariant is `replicaId.is_some() == (shareAlgorithm ==
+	// SHARE_ALGORITHM_REPLICA_SECRET)`, asserted on send and on receive; a
+	// violation is a protocol error, not a tolerated variation.
+	//
+	// # Why the receiver needs it
+	//
+	// Every member of a replica group shares one `channelId`, so the
+	// channel identifies the *group*, not the sender. The channel's
+	// counterparty says who established it, which after admission by a
+	// third member is not who wrote this message. Author attribution
+	// therefore comes from this field and never from the channel record.
+	//
+	// Applications use it to resolve which member published an update, and
+	// to route the response back to that member's endpoint.
 	//
 	// # Out of scope for the protocol
 	//
 	// The protocol does not authenticate the claim; anyone holding the
-	// channel's shared key may write any `replica_id`. The field is
-	// metadata the application uses to detect conflicts (e.g. two
-	// replicas independently bumped `version`). Conflict resolution is
-	// the application's responsibility — the protocol just surfaces what
-	// it knows.
+	// group key may write any `replicaId`. It is an identifier, not an
+	// authenticator.
 	ReplicaId     *uint64 `protobuf:"varint,9,opt,name=replicaId,proto3,oneof" json:"replicaId,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -317,7 +320,22 @@ type StoreShareResponseMessage struct {
 	// Timestamp indicating when this message was created.
 	//
 	// Used for observability, replay detection, and timeout handling.
-	Timestamp     *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	Timestamp *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	// Identity of the replica that produced this response.
+	//
+	// Present only when the corresponding request was replica-bound
+	// (`shareAlgorithm == SHARE_ALGORITHM_REPLICA_SECRET`); absent on
+	// helper responses, which carry no replica identity in either
+	// direction.
+	//
+	// # Why the requester needs it
+	//
+	// Every member of a replica group answers on the same `channelId`, and
+	// `secretId` and `version` are echoed identically by all of them. Two
+	// members responding to one publish are otherwise indistinguishable —
+	// the requester cannot tell whether both acknowledged or one
+	// acknowledged twice, and so cannot track a sharing round per member.
+	ReplicaId     *uint64 `protobuf:"varint,5,opt,name=replicaId,proto3,oneof" json:"replicaId,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -380,6 +398,13 @@ func (x *StoreShareResponseMessage) GetTimestamp() *timestamppb.Timestamp {
 	return nil
 }
 
+func (x *StoreShareResponseMessage) GetReplicaId() uint64 {
+	if x != nil && x.ReplicaId != nil {
+		return *x.ReplicaId
+	}
+	return 0
+}
+
 var File_storeshare_proto protoreflect.FileDescriptor
 
 const file_storeshare_proto_rawDesc = "" +
@@ -398,12 +423,15 @@ const file_storeshare_proto_rawDesc = "" +
 	"\n" +
 	"\b_replyToB\f\n" +
 	"\n" +
-	"_replicaId\"\xd2\x01\n" +
+	"_replicaId\"\x83\x02\n" +
 	"\x19StoreShareResponseMessage\x12E\n" +
 	"\x06result\x18\x01 \x01(\v2-.org.derecalliance.derec.protobuf.DeRecResultR\x06result\x12\x1a\n" +
 	"\bsecretId\x18\x02 \x01(\x04R\bsecretId\x12\x18\n" +
 	"\aversion\x18\x03 \x01(\rR\aversion\x128\n" +
-	"\ttimestamp\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestampb\x06proto3"
+	"\ttimestamp\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12!\n" +
+	"\treplicaId\x18\x05 \x01(\x04H\x00R\treplicaId\x88\x01\x01B\f\n" +
+	"\n" +
+	"_replicaIdb\x06proto3"
 
 var (
 	file_storeshare_proto_rawDescOnce sync.Once
@@ -445,6 +473,7 @@ func file_storeshare_proto_init() {
 	file_result_proto_init()
 	file_transportprotocol_proto_init()
 	file_storeshare_proto_msgTypes[0].OneofWrappers = []any{}
+	file_storeshare_proto_msgTypes[1].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

@@ -21,10 +21,10 @@ import (
 func TestEncodeChannelRecord_Helper_MatchesRustJSONShape(t *testing.T) {
 	h := HelperChannel{
 		ChannelID: 123456789,
-		Transport: TransportEndpoint{
+		Transports:        []TransportEndpoint{{
 			URI:      "https://example.com/derec",
 			Protocol: 0,
-		},
+		}},
 		CommunicationInfo: map[string]string{"name": "helper"},
 		PeerRole:          SenderKindHelper,
 		Status:            ChannelStatusPaired,
@@ -36,7 +36,7 @@ func TestEncodeChannelRecord_Helper_MatchesRustJSONShape(t *testing.T) {
 		t.Fatalf("EncodeChannelRecord: %v", err)
 	}
 
-	want := `{"Helper":{"channel_id":123456789,"transport":{"uri":"https://example.com/derec","protocol":0},` +
+	want := `{"Helper":{"channel_id":123456789,"transports":[{"uri":"https://example.com/derec","protocol":0}],` +
 		`"communication_info":{"name":"helper"},"peer_role":"Helper","status":"Paired","created_at":1700000000}}`
 	if string(got) != want {
 		t.Fatalf("EncodeChannelRecord mismatch:\n got: %s\nwant: %s", got, want)
@@ -47,7 +47,7 @@ func TestEncodeChannelRecord_Replica_MatchesRustJSONShape(t *testing.T) {
 	m := ReplicaMember{
 		ChannelID:         123456789,
 		ReplicaID:         42,
-		Transport:         TransportEndpoint{URI: "https://replica.example.com", Protocol: 0},
+		Transports:        []TransportEndpoint{{URI: "https://replica.example.com", Protocol: 0}},
 		CommunicationInfo: map[string]string{"name": "alice-2"},
 		Role:              ReplicaRoleDestination,
 		Status:            ChannelStatusPending,
@@ -59,7 +59,7 @@ func TestEncodeChannelRecord_Replica_MatchesRustJSONShape(t *testing.T) {
 		t.Fatalf("EncodeChannelRecord: %v", err)
 	}
 
-	want := `{"Replica":{"channel_id":123456789,"replica_id":42,"transport":{"uri":"https://replica.example.com","protocol":0},` +
+	want := `{"Replica":{"channel_id":123456789,"replica_id":42,"transports":[{"uri":"https://replica.example.com","protocol":0}],` +
 		`"communication_info":{"name":"alice-2"},"role":"Destination","status":"Pending","created_at":1700000000}}`
 	if string(got) != want {
 		t.Fatalf("EncodeChannelRecord mismatch:\n got: %s\nwant: %s", got, want)
@@ -69,7 +69,7 @@ func TestEncodeChannelRecord_Replica_MatchesRustJSONShape(t *testing.T) {
 func TestEncodeChannelRecord_EmptyCommunicationInfoIsEmptyObjectNotNull(t *testing.T) {
 	h := HelperChannel{
 		ChannelID: 1,
-		Transport: TransportEndpoint{URI: "https://h.example.com", Protocol: 0},
+		Transports:        []TransportEndpoint{{URI: "https://h.example.com", Protocol: 0}},
 		Status:    ChannelStatusPending,
 		PeerRole:  SenderKindOwner,
 	}
@@ -98,7 +98,7 @@ func TestEncodeChannelRecord_RejectsAmbiguousRecords(t *testing.T) {
 // DecodeChannelRecord against hand-written samples matching the exact shape
 // produced by Rust's serde derive (see library/src/protocol/types/mod.rs).
 func TestDecodeChannelRecord_KnownGoodRustSamples(t *testing.T) {
-	helperSample := `{"Helper":{"channel_id":987654321,"transport":{"uri":"https://owner.example.com","protocol":0},` +
+	helperSample := `{"Helper":{"channel_id":987654321,"transports":[{"uri":"https://owner.example.com","protocol":0}],` +
 		`"communication_info":{"name":"owner"},"peer_role":"Owner","status":"Pending","created_at":42}}`
 
 	record, err := DecodeChannelRecord([]byte(helperSample))
@@ -112,8 +112,8 @@ func TestDecodeChannelRecord_KnownGoodRustSamples(t *testing.T) {
 	if ch.ChannelID != 987654321 {
 		t.Errorf("ChannelID = %d, want 987654321", ch.ChannelID)
 	}
-	if ch.Transport.URI != "https://owner.example.com" || ch.Transport.Protocol != 0 {
-		t.Errorf("Transport = %+v", ch.Transport)
+	if ch.Transports[0].URI != "https://owner.example.com" || ch.Transports[0].Protocol != 0 {
+		t.Errorf("Transport = %+v", ch.Transports[0])
 	}
 	if ch.CommunicationInfo["name"] != "owner" {
 		t.Errorf("CommunicationInfo = %v", ch.CommunicationInfo)
@@ -128,7 +128,7 @@ func TestDecodeChannelRecord_KnownGoodRustSamples(t *testing.T) {
 		t.Errorf("PeerRole = %v, want Owner", ch.PeerRole)
 	}
 
-	replicaSample := `{"Replica":{"channel_id":987654321,"replica_id":7,"transport":{"uri":"https://alice-2.example.com","protocol":0},` +
+	replicaSample := `{"Replica":{"channel_id":987654321,"replica_id":7,"transports":[{"uri":"https://alice-2.example.com","protocol":0}],` +
 		`"communication_info":{},"role":"Source","status":"Paired","created_at":42}}`
 
 	record, err = DecodeChannelRecord([]byte(replicaSample))
@@ -150,8 +150,8 @@ func TestDecodeChannelRecord_RejectsAmbiguousJSON(t *testing.T) {
 	if _, err := DecodeChannelRecord([]byte(`{}`)); err == nil {
 		t.Fatal("expected an error for JSON carrying neither variant")
 	}
-	both := `{"Helper":{"channel_id":1,"transport":{"uri":"","protocol":0},"communication_info":{},"peer_role":"Owner","status":"Paired","created_at":0},` +
-		`"Replica":{"channel_id":1,"replica_id":2,"transport":{"uri":"","protocol":0},"communication_info":{},"role":"Source","status":"Paired","created_at":0}}`
+	both := `{"Helper":{"channel_id":1,"transports":[{"uri":"","protocol":0}],"communication_info":{},"peer_role":"Owner","status":"Paired","created_at":0},` +
+		`"Replica":{"channel_id":1,"replica_id":2,"transports":[{"uri":"","protocol":0}],"communication_info":{},"role":"Source","status":"Paired","created_at":0}}`
 	if _, err := DecodeChannelRecord([]byte(both)); err == nil {
 		t.Fatal("expected an error for JSON carrying both variants")
 	}
@@ -161,7 +161,7 @@ func TestChannelRecordRoundTrip(t *testing.T) {
 	orig := ReplicaMember{
 		ChannelID:         5,
 		ReplicaID:         7,
-		Transport:         TransportEndpoint{URI: "https://x.example.com", Protocol: 0},
+		Transports:        []TransportEndpoint{{URI: "https://x.example.com", Protocol: 0}},
 		CommunicationInfo: map[string]string{"a": "1", "b": "2"},
 		Role:              ReplicaRoleDestination,
 		Status:            ChannelStatusPaired,
@@ -180,7 +180,7 @@ func TestChannelRecordRoundTrip(t *testing.T) {
 		t.Fatal("expected the Replica variant")
 	}
 	if got.ChannelID != orig.ChannelID || got.ReplicaID != orig.ReplicaID ||
-		got.Transport != orig.Transport || got.Status != orig.Status ||
+		got.Transports[0] != orig.Transports[0] || got.Status != orig.Status ||
 		got.CreatedAt != orig.CreatedAt || got.Role != orig.Role {
 		t.Fatalf("round trip mismatch: got %+v, want %+v", got, orig)
 	}

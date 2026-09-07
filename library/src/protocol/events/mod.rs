@@ -442,8 +442,12 @@ pub enum DeRecFlow {
         /// Updated communication info. `None` leaves the peer's stored map
         /// untouched; `Some(_)` replaces it (an empty `HashMap` clears it).
         communication_info: Option<std::collections::HashMap<String, String>>,
-        /// Updated transport endpoint. `None` leaves it untouched.
-        transport_protocol: Option<TransportProtocol>,
+        /// Every endpoint this device can now be reached on, in its own
+        /// preference order. Empty leaves the peer's stored set untouched;
+        /// non-empty replaces it outright. The first entry also fills the
+        /// deprecated singular `transportProtocol` so a peer predating
+        /// `supportedTransports` still learns the new address.
+        own_transports: Vec<TransportProtocol>,
     },
 }
 
@@ -1083,8 +1087,10 @@ pub enum DeRecEvent {
     /// Followed by [`Self::ChannelInfoUpdated`] once the peer responds.
     UpdateChannelInfoStarted { channel_id: ChannelId },
 
-    /// An update-channel-info request could not be dispatched to
-    /// `channel_id`.
+    /// An update-channel-info exchange failed for `channel_id`: either an
+    /// outbound request could not be dispatched, or an inbound request
+    /// announcing an unservable transport switch was refused (see
+    /// [`crate::Error::NoUsableEndpoint`]).
     UpdateChannelInfoFailed {
         channel_id: ChannelId,
         error: String,

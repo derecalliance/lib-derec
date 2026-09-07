@@ -115,7 +115,7 @@ pub(in crate::protocol) async fn start<
     local_secret_id: u64,
     target_secret_id: u64,
     version: u32,
-    reply_to: Option<derec_proto::TransportProtocol>,
+    reply_to: &[derec_proto::TransportProtocol],
 ) -> Result<Vec<DeRecEvent>> {
     state_store
         .save(
@@ -162,11 +162,11 @@ pub(in crate::protocol) async fn start<
         match dispatch_one(
             transport,
             channel.channel_id,
-            &channel.transport,
+            &channel.transports,
             target_secret_id,
             version,
             &shared_key,
-            reply_to.clone(),
+            reply_to,
         )
         .await
         {
@@ -262,13 +262,9 @@ pub(in crate::protocol) async fn accept<
     let resp = response::produce(channel_id, request, &stored, shared_key)?;
 
     let envelope = super::apply_trace_id(resp.envelope, trace_id)?;
-    let endpoint = super::resolve_response_endpoint(
-        channel_store,
-        secret_id,
-        channel_id,
-        request.reply_to.as_ref(),
-    )
-    .await?;
+    let endpoint =
+        super::resolve_response_endpoints(channel_store, secret_id, channel_id, &request.reply_to)
+            .await?;
     transport.send(&endpoint, envelope).await?;
 
     #[cfg(feature = "logging")]
@@ -329,7 +325,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
         MessageBody::GetShareResponse(response),
         shared_key,
         trace_id,
-        request.reply_to.as_ref(),
+        &request.reply_to,
     )
     .await
 }
@@ -525,15 +521,15 @@ fn decode_recovered_secret(outer_bytes: &[u8]) -> Result<crate::protocol::types:
 async fn dispatch_one<T: DeRecTransport>(
     transport: &T,
     channel_id: ChannelId,
-    endpoint: &derec_proto::TransportProtocol,
+    endpoints: &[derec_proto::TransportProtocol],
     secret_id: u64,
     version: u32,
     shared_key: &SharedKey,
-    reply_to: Option<derec_proto::TransportProtocol>,
+    reply_to: &[derec_proto::TransportProtocol],
 ) -> Result<()> {
     let msg = request::produce(channel_id, secret_id, version, shared_key, reply_to)?;
     let envelope = super::apply_trace_id(msg.envelope, super::fresh_trace_id())?;
-    transport.send(endpoint, envelope).await?;
+    transport.send(endpoints, envelope).await?;
     Ok(())
 }
 
@@ -617,7 +613,7 @@ mod recovery_ids_tests {
             Some(role) => ChannelRecord::Replica(ReplicaMember {
                 channel_id: ChannelId(cid),
                 replica_id: crate::types::ReplicaId(cid),
-                transport,
+                transports: vec![transport.clone()],
                 communication_info: Default::default(),
                 role,
                 status,
@@ -625,7 +621,7 @@ mod recovery_ids_tests {
             }),
             None => ChannelRecord::Helper(HelperChannel {
                 channel_id: ChannelId(cid),
-                transport,
+                transports: vec![transport],
                 communication_info: Default::default(),
                 status,
                 created_at: 1,
@@ -713,7 +709,7 @@ mod recovery_ids_tests {
                 LOCAL,
                 TARGET,
                 VERSION,
-                None,
+                &[],
             )
             .await
             .expect("start succeeds");
@@ -756,7 +752,7 @@ mod recovery_ids_tests {
                 LOCAL,
                 TARGET,
                 VERSION,
-                None,
+                &[],
             )
             .await
             .expect("start succeeds");
@@ -794,7 +790,7 @@ mod recovery_ids_tests {
                 LOCAL,
                 TARGET,
                 VERSION,
-                None,
+                &[],
             )
             .await
             .expect("start succeeds");
@@ -825,7 +821,7 @@ mod recovery_ids_tests {
                 LOCAL,
                 TARGET,
                 VERSION,
-                None,
+                &[],
             )
             .await
             .expect("start succeeds");
@@ -882,7 +878,7 @@ mod recovery_ids_tests {
                 LOCAL,
                 TARGET,
                 VERSION,
-                None,
+                &[],
             )
             .await
             .expect("a replica channel must not abort the recovery");
@@ -925,7 +921,7 @@ mod recovery_ids_tests {
                 LOCAL,
                 TARGET,
                 VERSION,
-                None,
+                &[],
             )
             .await
             .expect("start succeeds");
@@ -964,7 +960,7 @@ mod recovery_ids_tests {
                 LOCAL,
                 TARGET,
                 VERSION,
-                None,
+                &[],
             )
             .await
             .expect("start succeeds");
@@ -995,7 +991,7 @@ mod recovery_ids_tests {
                 LOCAL,
                 TARGET,
                 VERSION,
-                None,
+                &[],
             )
             .await
             .expect("start succeeds");
@@ -1626,7 +1622,10 @@ mod tests {
         Secret {
             helpers: vec![HelperInfo {
                 channel_id: 7,
-                transport_uri: "https://helper.example".to_owned(),
+                transports: vec![derec_proto::TransportProtocol {
+                    uri: "https://helper.example".to_owned(),
+                    protocol: derec_proto::Protocol::Https as i32,
+                }],
                 shared_key: vec![0xAA; 32],
                 communication_info: HashMap::from([("name".to_owned(), "Helper".to_owned())]),
             }],
@@ -1647,13 +1646,19 @@ mod tests {
                 members: vec![
                     ReplicaInfo {
                         replica_id: 0xBEEF,
-                        transport_uri: "https://owner.example".to_owned(),
+                        transports: vec![derec_proto::TransportProtocol {
+                            uri: "https://owner.example".to_owned(),
+                            protocol: derec_proto::Protocol::Https as i32,
+                        }],
                         role: crate::protocol::types::ReplicaRole::Source as i32,
                         communication_info: HashMap::new(),
                     },
                     ReplicaInfo {
                         replica_id: 0xCAFE,
-                        transport_uri: "https://replica.example".to_owned(),
+                        transports: vec![derec_proto::TransportProtocol {
+                            uri: "https://replica.example".to_owned(),
+                            protocol: derec_proto::Protocol::Https as i32,
+                        }],
                         role: crate::protocol::types::ReplicaRole::Destination as i32,
                         communication_info: HashMap::new(),
                     },

@@ -185,10 +185,12 @@ pub(in crate::protocol) async fn handle_replica_request<
         .build()?
         .encode_to_vec();
     let envelope = super::apply_trace_id(envelope_bytes, inbound_trace_id)?;
-    let endpoint = request
-        .reply_to
-        .clone()
-        .unwrap_or_else(|| channel.transport.clone());
+    let endpoint = request.reply_to.clone();
+    let endpoint = if endpoint.is_empty() {
+        channel.transports.clone()
+    } else {
+        endpoint
+    };
     transport.send(&endpoint, envelope).await?;
 
     // Admission handover: the sync arrived on the ephemeral channel minted
@@ -365,10 +367,7 @@ async fn hydrate<
                 secret_id,
                 ChannelRecord::Helper(HelperChannel {
                     channel_id,
-                    transport: derec_proto::TransportProtocol {
-                        uri: helper.transport_uri.clone(),
-                        protocol: derec_proto::Protocol::Https as i32,
-                    },
+                    transports: helper.transports.clone(),
                     communication_info: helper.communication_info.clone(),
                     peer_role: SenderKind::Helper,
                     status: ChannelStatus::Paired,
@@ -400,10 +399,7 @@ async fn hydrate<
                 ChannelRecord::Replica(ReplicaMember {
                     channel_id: group_channel,
                     replica_id: crate::types::ReplicaId::try_from(member.replica_id)?,
-                    transport: derec_proto::TransportProtocol {
-                        uri: member.transport_uri.clone(),
-                        protocol: derec_proto::Protocol::Https as i32,
-                    },
+                    transports: member.transports.clone(),
                     communication_info: member.communication_info.clone(),
                     // The roster is authoritative, including for this device's
                     // own row: a joiner's provisional role from pairing is
@@ -571,7 +567,7 @@ pub(in crate::protocol) async fn start<
     keep_versions_count: usize,
     secret_id: u64,
     own_transport: &derec_proto::TransportProtocol,
-    reply_to: Option<derec_proto::TransportProtocol>,
+    reply_to: &[derec_proto::TransportProtocol],
     local_replica_id: Option<u64>,
 ) -> Result<Option<SharingRoundResult>> {
     let (helpers, replicas) =
@@ -611,10 +607,10 @@ pub(in crate::protocol) async fn start<
     // whoever paired — which for a member that joined later is the wrong
     // device entirely. Decided here, where the roster is known, rather than
     // left to the application's `auto_reply_to` setting.
-    let helper_reply_to = if roster.is_empty() {
-        reply_to.clone()
+    let helper_reply_to: Vec<derec_proto::TransportProtocol> = if roster.is_empty() {
+        reply_to.to_vec()
     } else {
-        Some(own_transport.clone())
+        vec![own_transport.clone()]
     };
     let derec_secret_bytes = wrap_for_helper_split(&secret, threshold);
 
@@ -651,7 +647,7 @@ pub(in crate::protocol) async fn start<
             secret_id,
             version,
             &description,
-            helper_reply_to,
+            &helper_reply_to,
         )
         .await;
         outcomes.extend(helper_outcomes);
@@ -815,13 +811,9 @@ pub(in crate::protocol) async fn accept<
 
     let resp = sharing_response::produce(channel_id, request, shared_key)?;
     let envelope = super::apply_trace_id(resp.envelope, trace_id)?;
-    let endpoint = super::resolve_response_endpoint(
-        channel_store,
-        secret_id,
-        channel_id,
-        request.reply_to.as_ref(),
-    )
-    .await?;
+    let endpoint =
+        super::resolve_response_endpoints(channel_store, secret_id, channel_id, &request.reply_to)
+            .await?;
     transport.send(&endpoint, envelope).await?;
 
     #[cfg(feature = "logging")]
@@ -883,7 +875,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
         MessageBody::StoreShareResponse(response),
         shared_key,
         trace_id,
-        request.reply_to.as_ref(),
+        &request.reply_to,
     )
     .await?;
 
@@ -1086,7 +1078,7 @@ fn build_secret(
         .iter()
         .map(|(channel, shared_key)| HelperInfo {
             channel_id: channel.channel_id.0,
-            transport_uri: channel.transport.uri.to_owned(),
+            transports: channel.transports.clone(),
             shared_key: shared_key.to_vec(),
             communication_info: channel.communication_info.clone(),
         })
@@ -1143,7 +1135,7 @@ fn build_replicas(
         .filter(|member| member.status != crate::protocol::types::ChannelStatus::Unpairing)
         .map(|member| crate::protocol::types::ReplicaInfo {
             replica_id: member.replica_id.0,
-            transport_uri: member.transport.uri.to_owned(),
+            transports: member.transports.clone(),
             role: member.role as i32,
             communication_info: member.communication_info.clone(),
         })
@@ -1201,7 +1193,7 @@ async fn distribute_shares<Sh: DeRecShareStore, T: DeRecTransport>(
     secret_id: u64,
     version: u32,
     description: &str,
-    reply_to: Option<derec_proto::TransportProtocol>,
+    reply_to: &[derec_proto::TransportProtocol],
 ) -> Vec<(ChannelId, Result<()>)> {
     let keep_list: Vec<u32> = {
         let start = version
@@ -1226,7 +1218,7 @@ async fn distribute_shares<Sh: DeRecShareStore, T: DeRecTransport>(
             secret_id,
             version,
             description,
-            reply_to.clone(),
+            reply_to,
         )
         .await;
 
@@ -1271,7 +1263,7 @@ async fn dispatch_share_to_helper<Sh: DeRecShareStore, T: DeRecTransport>(
     secret_id: u64,
     version: u32,
     description: &str,
-    reply_to: Option<derec_proto::TransportProtocol>,
+    reply_to: &[derec_proto::TransportProtocol],
 ) -> Result<()> {
     let msg = produce_store_share_request_message(
         channel.channel_id,
@@ -1284,7 +1276,7 @@ async fn dispatch_share_to_helper<Sh: DeRecShareStore, T: DeRecTransport>(
         reply_to,
     )?;
     let envelope = super::apply_trace_id(msg.envelope, super::fresh_trace_id())?;
-    transport.send(&channel.transport, envelope).await?;
+    transport.send(&channel.transports, envelope).await?;
 
     share_store
         .save(
@@ -1311,7 +1303,7 @@ async fn distribute_composite_to_destinations<Ss: DeRecSecretStore, T: DeRecTran
     secret_id: u64,
     version: u32,
     description: &str,
-    reply_to: Option<derec_proto::TransportProtocol>,
+    reply_to: &[derec_proto::TransportProtocol],
     local_replica_id: Option<u64>,
 ) -> Vec<(crate::types::ReplicaId, Result<()>)> {
     let mut results: Vec<(crate::types::ReplicaId, Result<()>)> =
@@ -1327,7 +1319,7 @@ async fn distribute_composite_to_destinations<Ss: DeRecSecretStore, T: DeRecTran
             secret_id,
             version,
             description,
-            reply_to.clone(),
+            reply_to,
             local_replica_id,
         )
         .await;
@@ -1374,7 +1366,7 @@ async fn dispatch_composite_to_destination<Ss: DeRecSecretStore, T: DeRecTranspo
     secret_id: u64,
     version: u32,
     description: &str,
-    reply_to: Option<derec_proto::TransportProtocol>,
+    reply_to: &[derec_proto::TransportProtocol],
     local_replica_id: Option<u64>,
 ) -> Result<()> {
     let needs_handover = match k_group {
@@ -1397,7 +1389,7 @@ async fn dispatch_composite_to_destination<Ss: DeRecSecretStore, T: DeRecTranspo
         version_description: description.to_owned(),
         timestamp: Some(timestamp),
         secret_id,
-        reply_to,
+        reply_to: reply_to.to_vec(),
         replica_id: local_replica_id,
     };
 
@@ -1409,7 +1401,7 @@ async fn dispatch_composite_to_destination<Ss: DeRecSecretStore, T: DeRecTranspo
         .build()?
         .encode_to_vec();
     let envelope = super::apply_trace_id(envelope_bytes, super::fresh_trace_id())?;
-    transport.send(&channel.transport, envelope).await?;
+    transport.send(&channel.transports, envelope).await?;
 
     if needs_handover {
         let new_key = k_group.expect("handover implies k_group set");
@@ -1470,7 +1462,7 @@ mod tests {
                 &[],
                 "",
                 &shared_key,
-                Some(TransportProtocol {
+                std::slice::from_ref(&TransportProtocol {
                     uri: "https://owner.example".to_owned(),
                     protocol: Protocol::Https as i32,
                 }),
@@ -1518,6 +1510,120 @@ mod tests {
         });
     }
 
+    /// A Destination hydrating a roster uses each stored endpoint verbatim.
+    ///
+    /// The roster carries the protocol discriminant alongside the URI, so
+    /// nothing is inferred here. That is the point: a roster that stored only
+    /// a URI forced the discriminant to be reconstructed on every hydration,
+    /// and the historical reconstruction hardcoded `Https` — producing
+    /// `{grpcs://…, Https}` and silently unaddressing every gRPC peer.
+    #[test]
+    fn hydrate_uses_each_stored_endpoint_verbatim() {
+        run_async(async {
+            use crate::protocol::test::InMemUserSecretStore;
+            use crate::protocol::traits::DeRecChannelStore;
+            use crate::protocol::types::{
+                ChannelQuery, ChannelRecord, HelperInfo, ReplicaInfo, ReplicaRole, Replicas, Secret,
+            };
+
+            const SECRET_ID: u64 = 0xD3_57;
+
+            let secret = Secret {
+                helpers: vec![
+                    HelperInfo {
+                        channel_id: 11,
+                        transports: vec![derec_proto::TransportProtocol {
+                            uri: "grpcs://helper.example:443".to_owned(),
+                            protocol: derec_proto::Protocol::Grpc as i32,
+                        }],
+                        shared_key: vec![0xAA; 32],
+                        communication_info: std::collections::HashMap::new(),
+                    },
+                    HelperInfo {
+                        channel_id: 12,
+                        transports: vec![derec_proto::TransportProtocol {
+                            uri: "https://helper-b.example".to_owned(),
+                            protocol: derec_proto::Protocol::Https as i32,
+                        }],
+                        shared_key: vec![0xAB; 32],
+                        communication_info: std::collections::HashMap::new(),
+                    },
+                ],
+                secrets: Vec::new(),
+                replicas: Some(Replicas {
+                    channel_id: 21,
+                    members: vec![ReplicaInfo {
+                        replica_id: 0xCAFE,
+                        transports: vec![derec_proto::TransportProtocol {
+                            uri: "grpcs://replica.example:443".to_owned(),
+                            protocol: derec_proto::Protocol::Grpc as i32,
+                        }],
+                        role: ReplicaRole::Destination as i32,
+                        communication_info: std::collections::HashMap::new(),
+                    }],
+                    shared_key: vec![0xCC; 32],
+                }),
+            };
+
+            let mut channel_store = InMemChannelStore::default();
+            let mut secret_store = InMemSecretStore::default();
+            let mut user_secret_store = InMemUserSecretStore::default();
+
+            super::hydrate(
+                &mut channel_store,
+                &mut secret_store,
+                &mut user_secret_store,
+                SECRET_ID,
+                4,
+                &secret,
+                String::new(),
+            )
+            .await
+            .expect("a grpc roster must hydrate");
+
+            let expected = [(11_u64, Protocol::Grpc), (12, Protocol::Https)];
+            for (channel_id, protocol) in expected {
+                let record = channel_store
+                    .load(
+                        SECRET_ID,
+                        ChannelQuery::Helper {
+                            channel_id: ChannelId(channel_id),
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .expect("helper channel must be persisted");
+                let ChannelRecord::Helper(record) = record else {
+                    panic!("a helper query must never return a replica record");
+                };
+                assert_eq!(
+                    record.transports[0].protocol, protocol as i32,
+                    "helper {channel_id} must carry the protocol its URI scheme names"
+                );
+                for endpoint in &record.transports {
+                    crate::transport::TransportProtocol::try_from(endpoint)
+                        .expect("every rehydrated endpoint must be self-consistent");
+                }
+            }
+
+            let member = channel_store
+                .load(
+                    SECRET_ID,
+                    ChannelQuery::Replica {
+                        channel_id: ChannelId(21),
+                        replica_id: crate::types::ReplicaId(0xCAFE),
+                    },
+                )
+                .await
+                .unwrap()
+                .expect("group member must be persisted");
+            let ChannelRecord::Replica(member) = member else {
+                panic!("a replica query must never return a helper record");
+            };
+            assert_eq!(member.transports[0].protocol, Protocol::Grpc as i32);
+        });
+    }
+
     /// A version has exactly one writer. Re-sending the *identical*
     /// envelope is an idempotent retry — the recipient acknowledges it
     /// and leaves the stored bytes untouched, so a lost ack costs
@@ -1546,7 +1652,7 @@ mod tests {
                 &[],
                 "",
                 &shared_key,
-                None,
+                &[],
             )
             .expect("produce request");
             let request = request::extract(&produced.envelope, &shared_key)
@@ -1613,7 +1719,7 @@ mod tests {
                     &[],
                     "",
                     &shared_key,
-                    None,
+                    &[],
                 )
                 .expect("produce request");
                 request::extract(&produced.envelope, &shared_key)
@@ -1697,10 +1803,10 @@ mod tests {
                 channel_id: ChannelId(5001),
                 // The member row the response arrived against is Alice-2 …
                 replica_id: crate::types::ReplicaId(CHANNEL_PEER),
-                transport: TransportProtocol {
+                transports: vec![TransportProtocol {
                     uri: "https://alice-2.example".to_owned(),
                     protocol: Protocol::Https as i32,
-                },
+                }],
                 communication_info: std::collections::HashMap::new(),
                 status: crate::protocol::types::ChannelStatus::Paired,
                 created_at: 0,
@@ -1760,10 +1866,10 @@ mod tests {
                 crate::protocol::types::ChannelRecord::Helper(
                     crate::protocol::types::HelperChannel {
                         channel_id,
-                        transport: TransportProtocol {
+                        transports: vec![TransportProtocol {
                             uri: "https://owner.example".to_owned(),
                             protocol: Protocol::Https as i32,
-                        },
+                        }],
                         communication_info: std::collections::HashMap::new(),
                         status: crate::protocol::types::ChannelStatus::Paired,
                         created_at: 0,
@@ -1813,7 +1919,7 @@ mod group_conformance_tests {
                 ChannelRecord::Replica(ReplicaMember {
                     channel_id: GROUP_CHANNEL,
                     replica_id: ReplicaId(replica_id),
-                    transport: endpoint(uri),
+                    transports: vec![endpoint(uri)],
                     communication_info: std::collections::HashMap::new(),
                     role,
                     status: ChannelStatus::Paired,
@@ -2050,7 +2156,7 @@ mod group_conformance_tests {
                     ChannelRecord::Replica(ReplicaMember {
                         channel_id: ChannelId(7001),
                         replica_id: ReplicaId(1003),
-                        transport: endpoint("https://alice-3"),
+                        transports: vec![endpoint("https://alice-3")],
                         communication_info: std::collections::HashMap::new(),
                         role: ReplicaRole::Destination,
                         status: ChannelStatus::Paired,

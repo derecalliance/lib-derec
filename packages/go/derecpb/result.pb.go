@@ -100,6 +100,38 @@ const (
 	// the offending field and the two `(min, max)` pairs so the
 	// initiator can surface a useful diagnostic.
 	StatusEnum_INCOMPATIBLE_PARAMETER_RANGE StatusEnum = 11
+	// A share already exists for this (secretId, version) with different
+	// content, so the write was refused.
+	//
+	// Exactly one writer owns a version. A recipient stores the first write
+	// it sees at a version; a later write carrying different bytes is
+	// rejected with this status rather than overwriting or coexisting. A
+	// byte-identical re-send is an idempotent retry and returns `OK`.
+	//
+	// Because a single writer always derives `version` as
+	// `latest_version + 1`, it can never rewrite a version with different
+	// content. Receiving this status therefore means a *second* writer
+	// published concurrently — typically the same user acting on two
+	// devices at once. Resolution is the application's responsibility: the
+	// round has failed and should be republished at a new version.
+	StatusEnum_VERSION_CONFLICT StatusEnum = 13
+	// A replica pairing named a `replicaId` that is already in use by another
+	// member of the group — including the recipient itself.
+	//
+	// Every member of a group must be uniquely identified: the roster is keyed
+	// by `replicaId`, and messages between members are attributed by it. Two
+	// members sharing an id would overwrite each other's roster row and make
+	// every acknowledgement ambiguous.
+	//
+	// `replicaId` is assigned by the application, so a collision is a
+	// configuration fault — most often the same identity reused on two devices,
+	// such as a cloned device image. Resolution is the application's: assign a
+	// distinct id and pair again. The protocol cannot pick one, because it
+	// cannot know which device is meant to keep the original.
+	//
+	// Reported before fingerprint verification: there is no point asking a user
+	// to confirm a pairing that cannot be completed.
+	StatusEnum_REPLICA_ID_CONFLICT StatusEnum = 14
 	// The Helper is requesting that the Owner terminate the relationship.
 	//
 	// The Owner SHOULD respond by sending an UnpairRequestMessage and
@@ -122,6 +154,8 @@ var (
 		9:  "FORMAT_ERROR",
 		10: "REJECTED",
 		11: "INCOMPATIBLE_PARAMETER_RANGE",
+		13: "VERSION_CONFLICT",
+		14: "REPLICA_ID_CONFLICT",
 		99: "REQUEST_TO_CLOSE",
 	}
 	StatusEnum_value = map[string]int32{
@@ -137,6 +171,8 @@ var (
 		"FORMAT_ERROR":                 9,
 		"REJECTED":                     10,
 		"INCOMPATIBLE_PARAMETER_RANGE": 11,
+		"VERSION_CONFLICT":             13,
+		"REPLICA_ID_CONFLICT":          14,
 		"REQUEST_TO_CLOSE":             99,
 	}
 )
@@ -267,7 +303,7 @@ const file_result_proto_rawDesc = "" +
 	"\fresult.proto\x12 org.derecalliance.derec.protobuf\"g\n" +
 	"\vDeRecResult\x12D\n" +
 	"\x06status\x18\x01 \x01(\x0e2,.org.derecalliance.derec.protobuf.StatusEnumR\x06status\x12\x12\n" +
-	"\x04memo\x18\x02 \x01(\tR\x04memo*\x90\x02\n" +
+	"\x04memo\x18\x02 \x01(\tR\x04memo*\xbf\x02\n" +
 	"\n" +
 	"StatusEnum\x12\x06\n" +
 	"\x02OK\x10\x00\x12\v\n" +
@@ -283,6 +319,8 @@ const file_result_proto_rawDesc = "" +
 	"\bREJECTED\x10\n" +
 	"\x12 \n" +
 	"\x1cINCOMPATIBLE_PARAMETER_RANGE\x10\v\x12\x14\n" +
+	"\x10VERSION_CONFLICT\x10\r\x12\x17\n" +
+	"\x13REPLICA_ID_CONFLICT\x10\x0e\x12\x14\n" +
 	"\x10REQUEST_TO_CLOSE\x10cb\x06proto3"
 
 var (

@@ -62,7 +62,7 @@ func (b *JSONByteArray) UnmarshalJSON(data []byte) error {
 // tagged enum, so exactly one of Helper / Replica is present.
 type helperChannelWire struct {
 	ChannelID         uint64            `json:"channel_id"`
-	Transport         transportWire     `json:"transport"`
+	Transports        []transportWire   `json:"transports"`
 	CommunicationInfo map[string]string `json:"communication_info"`
 	PeerRole          SenderKind        `json:"peer_role"`
 	Status            ChannelStatus     `json:"status"`
@@ -72,7 +72,7 @@ type helperChannelWire struct {
 type replicaMemberWire struct {
 	ChannelID         uint64            `json:"channel_id"`
 	ReplicaID         uint64            `json:"replica_id"`
-	Transport         transportWire     `json:"transport"`
+	Transports        []transportWire   `json:"transports"`
 	CommunicationInfo map[string]string `json:"communication_info"`
 	Role              ReplicaRole       `json:"role"`
 	Status            ChannelStatus     `json:"status"`
@@ -102,7 +102,7 @@ func nonNilInfo(info map[string]string) map[string]string {
 func helperToWire(h HelperChannel) helperChannelWire {
 	return helperChannelWire{
 		ChannelID:         h.ChannelID,
-		Transport:         transportWire{URI: h.Transport.URI, Protocol: h.Transport.Protocol},
+		Transports:        endpointsToWire(h.Transports),
 		CommunicationInfo: nonNilInfo(h.CommunicationInfo),
 		PeerRole:          h.PeerRole,
 		Status:            h.Status,
@@ -114,7 +114,7 @@ func memberToWire(m ReplicaMember) replicaMemberWire {
 	return replicaMemberWire{
 		ChannelID:         m.ChannelID,
 		ReplicaID:         m.ReplicaID,
-		Transport:         transportWire{URI: m.Transport.URI, Protocol: m.Transport.Protocol},
+		Transports:        endpointsToWire(m.Transports),
 		CommunicationInfo: nonNilInfo(m.CommunicationInfo),
 		Role:              m.Role,
 		Status:            m.Status,
@@ -125,7 +125,7 @@ func memberToWire(m ReplicaMember) replicaMemberWire {
 func helperFromWire(w helperChannelWire) HelperChannel {
 	return HelperChannel{
 		ChannelID:         w.ChannelID,
-		Transport:         TransportEndpoint{URI: w.Transport.URI, Protocol: w.Transport.Protocol},
+		Transports:        endpointsFromWire(w.Transports),
 		CommunicationInfo: w.CommunicationInfo,
 		PeerRole:          w.PeerRole,
 		Status:            w.Status,
@@ -137,7 +137,7 @@ func memberFromWire(w replicaMemberWire) ReplicaMember {
 	return ReplicaMember{
 		ChannelID:         w.ChannelID,
 		ReplicaID:         w.ReplicaID,
-		Transport:         TransportEndpoint{URI: w.Transport.URI, Protocol: w.Transport.Protocol},
+		Transports:        endpointsFromWire(w.Transports),
 		CommunicationInfo: w.CommunicationInfo,
 		Role:              w.Role,
 		Status:            w.Status,
@@ -717,4 +717,23 @@ func DecodeUint32Array(data []byte) ([]uint32, error) {
 		return nil, fmt.Errorf("native: decode uint32 array: %w", err)
 	}
 	return versions, nil
+}
+
+// endpointsToWire / endpointsFromWire convert between the public endpoint
+// list and its JSON shape. The list carries every endpoint a peer advertised,
+// in the peer's order, which the library preserves verbatim.
+func endpointsToWire(endpoints []TransportEndpoint) []transportWire {
+	out := make([]transportWire, 0, len(endpoints))
+	for _, e := range endpoints {
+		out = append(out, transportWire{URI: e.URI, Protocol: e.Protocol})
+	}
+	return out
+}
+
+func endpointsFromWire(wires []transportWire) []TransportEndpoint {
+	out := make([]TransportEndpoint, 0, len(wires))
+	for _, w := range wires {
+		out = append(out, TransportEndpoint{URI: w.URI, Protocol: w.Protocol})
+	}
+	return out
 }

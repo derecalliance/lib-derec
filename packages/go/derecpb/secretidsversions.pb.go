@@ -90,7 +90,17 @@ type GetSecretIdsVersionsRequestMessage struct {
 	// See `StoreShareRequestMessage.replyTo` for full semantics. Absent =
 	// route to the stored channel endpoint; Present = route this response
 	// here without persisting the endpoint.
-	ReplyTo       *TransportProtocol `protobuf:"bytes,2,opt,name=replyTo,proto3,oneof" json:"replyTo,omitempty"`
+	ReplyTo *TransportProtocol `protobuf:"bytes,2,opt,name=replyTo,proto3,oneof" json:"replyTo,omitempty"`
+	// Identity of the replica-group member this message concerns.
+	//
+	// Present **only** on the replica path, where a member drives catch-up
+	// against another member. Absent on the owner ↔ helper path, which is
+	// unchanged.
+	//
+	// Every member of a group is addressed on one shared `channel_id`, so the
+	// channel cannot name the peer — this field does. Its presence is also what
+	// tells the receiver which path a message belongs to.
+	ReplicaId     *uint64 `protobuf:"varint,3,opt,name=replicaId,proto3,oneof" json:"replicaId,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -137,6 +147,13 @@ func (x *GetSecretIdsVersionsRequestMessage) GetReplyTo() *TransportProtocol {
 		return x.ReplyTo
 	}
 	return nil
+}
+
+func (x *GetSecretIdsVersionsRequestMessage) GetReplicaId() uint64 {
+	if x != nil && x.ReplicaId != nil {
+		return *x.ReplicaId
+	}
+	return 0
 }
 
 // GetSecretIdsVersionsResponseMessage returns the list of all secrets and
@@ -195,7 +212,17 @@ type GetSecretIdsVersionsResponseMessage struct {
 	// - observability and logging
 	// - replay detection (in combination with sequence numbers)
 	// - timeout handling
-	Timestamp     *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	Timestamp *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	// Identity of the replica-group member this message concerns.
+	//
+	// Present **only** on the replica path, where a member drives catch-up
+	// against another member. Absent on the owner ↔ helper path, which is
+	// unchanged.
+	//
+	// Every member of a group is addressed on one shared `channel_id`, so the
+	// channel cannot name the peer — this field does. Its presence is also what
+	// tells the receiver which path a message belongs to.
+	ReplicaId     *uint64 `protobuf:"varint,4,opt,name=replicaId,proto3,oneof" json:"replicaId,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -249,6 +276,13 @@ func (x *GetSecretIdsVersionsResponseMessage) GetTimestamp() *timestamppb.Timest
 		return x.Timestamp
 	}
 	return nil
+}
+
+func (x *GetSecretIdsVersionsResponseMessage) GetReplicaId() uint64 {
+	if x != nil && x.ReplicaId != nil {
+		return *x.ReplicaId
+	}
+	return 0
 }
 
 // VersionList groups the share versions stored for a single secretId.
@@ -330,35 +364,8 @@ type GetSecretIdsVersionsResponseMessage_VersionList_VersionEntry struct {
 	//
 	// May be empty if no description was provided.
 	VersionDescription string `protobuf:"bytes,2,opt,name=versionDescription,proto3" json:"versionDescription,omitempty"`
-	// Stable per-device identifier of the replica that produced this
-	// version, copied from `StoreShareRequestMessage.replicaId` at
-	// share-storage time.
-	//
-	// # Why per-version (and not per-secret)
-	//
-	// Two distinct replicas can independently produce the same numeric
-	// `version` for the same `secretId` (each replica observes the
-	// current latest version and increments it). The helper persists
-	// both side-by-side; this field is what lets the recovering owner
-	// tell them apart.
-	//
-	// # Semantics
-	//
-	//   - Absent: the version was produced by a non-replica `Owner`
-	//     (the writer had no `replica_id` configured at the builder).
-	//   - Present: the version was produced by the named replica.
-	//
-	// # Out of scope for the protocol
-	//
-	// The protocol surfaces this metadata so the application can
-	// detect conflicts (e.g. two replicas both produced version 7 of
-	// the same secret). Resolution is the application's
-	// responsibility — typically: pick one, then re-run
-	// `ProtectSecret` with the chosen value to produce a fresh,
-	// uncontested version before driving recovery.
-	ReplicaId     *uint64 `protobuf:"varint,3,opt,name=replicaId,proto3,oneof" json:"replicaId,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *GetSecretIdsVersionsResponseMessage_VersionList_VersionEntry) Reset() {
@@ -405,36 +412,32 @@ func (x *GetSecretIdsVersionsResponseMessage_VersionList_VersionEntry) GetVersio
 	return ""
 }
 
-func (x *GetSecretIdsVersionsResponseMessage_VersionList_VersionEntry) GetReplicaId() uint64 {
-	if x != nil && x.ReplicaId != nil {
-		return *x.ReplicaId
-	}
-	return 0
-}
-
 var File_secretidsversions_proto protoreflect.FileDescriptor
 
 const file_secretidsversions_proto_rawDesc = "" +
 	"\n" +
-	"\x17secretidsversions.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\xbe\x01\n" +
+	"\x17secretidsversions.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\xef\x01\n" +
 	"\"GetSecretIdsVersionsRequestMessage\x128\n" +
 	"\ttimestamp\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12R\n" +
-	"\areplyTo\x18\x02 \x01(\v23.org.derecalliance.derec.protobuf.TransportProtocolH\x00R\areplyTo\x88\x01\x01B\n" +
+	"\areplyTo\x18\x02 \x01(\v23.org.derecalliance.derec.protobuf.TransportProtocolH\x00R\areplyTo\x88\x01\x01\x12!\n" +
+	"\treplicaId\x18\x03 \x01(\x04H\x01R\treplicaId\x88\x01\x01B\n" +
 	"\n" +
-	"\b_replyTo\"\xcd\x04\n" +
+	"\b_replyToB\f\n" +
+	"\n" +
+	"_replicaId\"\xcc\x04\n" +
 	"#GetSecretIdsVersionsResponseMessage\x12E\n" +
 	"\x06result\x18\x01 \x01(\v2-.org.derecalliance.derec.protobuf.DeRecResultR\x06result\x12q\n" +
 	"\n" +
 	"secretList\x18\x02 \x03(\v2Q.org.derecalliance.derec.protobuf.GetSecretIdsVersionsResponseMessage.VersionListR\n" +
 	"secretList\x128\n" +
-	"\ttimestamp\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x1a\xb1\x02\n" +
+	"\ttimestamp\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12!\n" +
+	"\treplicaId\x18\x04 \x01(\x04H\x00R\treplicaId\x88\x01\x01\x1a\xff\x01\n" +
 	"\vVersionList\x12\x1a\n" +
 	"\bsecretId\x18\x01 \x01(\x04R\bsecretId\x12z\n" +
-	"\bversions\x18\x02 \x03(\v2^.org.derecalliance.derec.protobuf.GetSecretIdsVersionsResponseMessage.VersionList.VersionEntryR\bversions\x1a\x89\x01\n" +
+	"\bversions\x18\x02 \x03(\v2^.org.derecalliance.derec.protobuf.GetSecretIdsVersionsResponseMessage.VersionList.VersionEntryR\bversions\x1aX\n" +
 	"\fVersionEntry\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\rR\aversion\x12.\n" +
-	"\x12versionDescription\x18\x02 \x01(\tR\x12versionDescription\x12!\n" +
-	"\treplicaId\x18\x03 \x01(\x04H\x00R\treplicaId\x88\x01\x01B\f\n" +
+	"\x12versionDescription\x18\x02 \x01(\tR\x12versionDescriptionB\f\n" +
 	"\n" +
 	"_replicaIdb\x06proto3"
 
@@ -482,7 +485,7 @@ func file_secretidsversions_proto_init() {
 	file_result_proto_init()
 	file_transportprotocol_proto_init()
 	file_secretidsversions_proto_msgTypes[0].OneofWrappers = []any{}
-	file_secretidsversions_proto_msgTypes[3].OneofWrappers = []any{}
+	file_secretidsversions_proto_msgTypes[1].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

@@ -65,18 +65,20 @@ public static partial class Pairing
         /// generates them on the fly when the <c>PrePairRequest</c> arrives
         /// (only appropriate when the OOB delivery channel is fully trusted).
         /// </param>
-        /// <param name="transportProtocol">Endpoint the scanner uses to reach this initiator.</param>
+        /// <param name="transportProtocols">Every endpoint this initiator serves, in
+        /// preference order. The whole list is advertised; the first entry also
+        /// fills the legacy singular field for peers predating the offer list.</param>
         /// <param name="nonce"><c>null</c> lets the library generate a fresh
         /// random <c>ulong</c>. Required for <see cref="ContactMode.NoKeys"/>
         /// where callers typically pick a small human-typable value.</param>
         public static CreateContactResult CreateContact(
             ulong channelId,
             ContactMode contactMode,
-            TransportProtocol transportProtocol,
+            IReadOnlyList<TransportProtocol> transportProtocols,
             ulong? nonce = null
         )
         {
-            byte[] transportProtocolBytes = transportProtocol.ToProtoBytes();
+            byte[] transportProtocolBytes = TransportProtocol.ToProtoBytesList(transportProtocols);
             uint hasNonce = nonce.HasValue ? 1u : 0u;
             ulong nonceValue = nonce ?? 0ul;
 
@@ -117,13 +119,13 @@ public static partial class Pairing
         /// </summary>
         public static ProduceResult Produce(
             SenderKind kind,
-            TransportProtocol transportProtocol,
+            IReadOnlyList<TransportProtocol> transportProtocols,
             ContactMessage contactMessage,
             byte[]? communicationInfo = null,
             byte[]? parameterRange = null
         )
         {
-            byte[] transportProtocolBytes = transportProtocol.ToProtoBytes();
+            byte[] transportProtocolBytes = TransportProtocol.ToProtoBytesList(transportProtocols);
             byte[] contactMessageBytes = contactMessage.ToProtoBytes();
 
             Native.Pairing.ProducePairRequestMessageResult nativeResult =
@@ -193,11 +195,11 @@ public static partial class Pairing
         /// <see cref="Produce"/>.
         /// </summary>
         public static ProducePrePairResult ProducePrePair(
-            TransportProtocol transportProtocol,
+            IReadOnlyList<TransportProtocol> transportProtocols,
             ContactMessage contactMessage
         )
         {
-            byte[] transportProtocolBytes = transportProtocol.ToProtoBytes();
+            byte[] transportProtocolBytes = TransportProtocol.ToProtoBytesList(transportProtocols);
             byte[] contactMessageBytes = contactMessage.ToProtoBytes();
 
             Native.Pairing.ProducePrePairRequestMessageResult nativeResult =

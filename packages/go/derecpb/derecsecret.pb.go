@@ -184,7 +184,11 @@ type DeRecSecret struct {
 	// Arbitrary secret payload.
 	//
 	// This may include cryptographic keys, credentials, documents, or any
-	// serialized data the Owner wishes to protect.
+	// serialized data the Owner wishes to protect. When produced by the DeRec
+	// library, these bytes are the recoverable secret: a 1-byte version prefix
+	// followed by a versioned payload (v1 = gzip-compressed (RFC 1952) JSON,
+	// base64 (RFC 4648 §4) byte fields, u64 as decimal strings). Other payloads
+	// MAY use a different encoding; secretData is opaque to the protocol.
 	SecretData []byte `protobuf:"bytes,1,opt,name=secretData,proto3" json:"secretData,omitempty"`
 	// Timestamp indicating when this secret (or this version of it) was created.
 	//

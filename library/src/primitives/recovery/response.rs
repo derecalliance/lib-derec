@@ -105,14 +105,14 @@ pub struct RecoverResult {
 ///         .expect("split failed");
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 /// let sharing::request::ProduceResult { envelope: share_envelope } =
-///     sharing::request::produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, None)
+///     sharing::request::produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, &[])
 ///         .expect("share produce failed");
 /// let sharing::request::ExtractResult { request: stored_share_request } =
 ///     sharing::request::extract(&share_envelope, &shared_key).expect("share extract failed");
 ///
 /// // Recovery flow: Owner asks for the share back, Helper answers.
 /// let recovery::request::ProduceResult { envelope: req_envelope } =
-///     recovery::request::produce(channel_id, 1, 1, &shared_key, None).expect("recovery request failed");
+///     recovery::request::produce(channel_id, 1, 1, &shared_key, &[]).expect("recovery request failed");
 /// let recovery::request::ExtractResult { request: get_share_request } =
 ///     recovery::request::extract(&req_envelope, &shared_key)
 ///         .expect("recovery request extract failed");
@@ -130,9 +130,12 @@ pub struct RecoverResult {
 pub fn produce(
     channel_id: ChannelId,
     request: &GetShareRequestMessage,
+    // TODO: rename to request
     stored_share_request: &StoreShareRequestMessage,
     shared_key: &SharedKey,
 ) -> Result<ProduceResult, crate::Error> {
+    // TODO: I want to hide this share.is_empty into a request.has_share() instead.
+    //       Use the Extension pattern used with pair request
     if stored_share_request.share.is_empty() {
         #[cfg(feature = "logging")]
         tracing::warn!("stored share is empty");
@@ -140,6 +143,8 @@ pub fn produce(
         return Err(RecoveryError::EmptyCommittedDeRecShare.into());
     }
 
+    // TODO: since we first validate the share is not empty and then read it, we could have a
+    // request.read_share()?
     let committed_derec_share = CommittedDeRecShare::decode(stored_share_request.share.as_slice())
         .map_err(|source| RecoveryError::DecodeCommittedDeRecShare { source })?;
 
@@ -263,14 +268,14 @@ pub fn produce(
 ///         .expect("split failed");
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 /// let sharing::request::ProduceResult { envelope: share_envelope } =
-///     sharing::request::produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, None)
+///     sharing::request::produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, &[])
 ///         .expect("share produce failed");
 /// let sharing::request::ExtractResult { request: stored_share_request } =
 ///     sharing::request::extract(&share_envelope, &shared_key).expect("share extract failed");
 ///
 /// // Recovery flow: Owner asks for the share back, Helper answers, Owner extracts.
 /// let recovery::request::ProduceResult { envelope: req_envelope } =
-///     recovery::request::produce(channel_id, 1, 1, &shared_key, None).expect("recovery request failed");
+///     recovery::request::produce(channel_id, 1, 1, &shared_key, &[]).expect("recovery request failed");
 /// let recovery::request::ExtractResult { request: get_share_request } =
 ///     recovery::request::extract(&req_envelope, &shared_key)
 ///         .expect("recovery request extract failed");
@@ -380,7 +385,7 @@ pub fn extract(
 /// for &channel_id in &channels[..2] {
 ///     let committed_share = shares.get(&channel_id).expect("missing share");
 ///     let sharing::request::ProduceResult { envelope } =
-///         sharing::request::produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, None)
+///         sharing::request::produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, &[])
 ///             .expect("share produce failed");
 ///     let sharing::request::ExtractResult { request } =
 ///         sharing::request::extract(&envelope, &shared_key).expect("share extract failed");
@@ -391,7 +396,7 @@ pub fn extract(
 /// let mut responses = Vec::new();
 /// for (channel_id, stored_share_request) in &stored_shares {
 ///     let recovery::request::ProduceResult { envelope: req_env } =
-///         recovery::request::produce(*channel_id, 1, 1, &shared_key, None)
+///         recovery::request::produce(*channel_id, 1, 1, &shared_key, &[])
 ///             .expect("recovery request failed");
 ///     let recovery::request::ExtractResult { request: get_share_req } =
 ///         recovery::request::extract(&req_env, &shared_key)
@@ -451,6 +456,8 @@ fn extract_share_from_response(
         "GetShareResponseMessage is missing result field",
     ))?;
 
+    // TODO: this validation on the DeRecResult is repeated everywhere.
+    //       see if we can implement the Ext pattern and have result.validate()?;
     if result.status != StatusEnum::Ok as i32 {
         #[cfg(feature = "logging")]
         tracing::warn!(status = result.status, memo = %result.memo, "recovery share response status is not Ok");
@@ -461,6 +468,8 @@ fn extract_share_from_response(
         .into());
     }
 
+    // TODO: similar to read_share mentioned above, lets hide this inner request concern into:write
+    //       something such as request.read_committed_share()?
     if response.committed_de_rec_share.is_empty() {
         return Err(RecoveryError::EmptyCommittedDeRecShare.into());
     }
@@ -472,6 +481,7 @@ fn extract_share_from_response(
     let derec_share = DeRecShare::decode(committed_derec_share.de_rec_share.as_slice())
         .map_err(|source| RecoveryError::DecodeDeRecShare { source })?;
 
+    // TODO: using Ext pattern we could have derec_share.validate(secret_id, version)?
     if derec_share.secret_id != secret_id {
         return Err(RecoveryError::SecretIdMismatch.into());
     }

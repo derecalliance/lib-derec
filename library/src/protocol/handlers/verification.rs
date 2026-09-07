@@ -5,7 +5,7 @@ use super::super::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecStateStore,
     DeRecTransport, MissingPolicy, PendingAction, SecretKind, SecretValue, StateItem, StateKey,
 };
-use super::peer_endpoint;
+use super::peer_endpoints;
 use crate::{
     Error, Result,
     derec_message::current_timestamp,
@@ -93,7 +93,7 @@ pub(in crate::protocol) async fn start<
     version: u32,
     target: Target,
     secret_id: u64,
-    reply_to: Option<derec_proto::TransportProtocol>,
+    reply_to: &[derec_proto::TransportProtocol],
 ) -> Result<Vec<DeRecEvent>> {
     let all_channels = channel_store.helpers(secret_id).await?;
     let all_channel_ids: Vec<ChannelId> = all_channels.iter().map(|c| c.channel_id).collect();
@@ -141,7 +141,7 @@ pub(in crate::protocol) async fn start<
             version,
             channel_id,
             &shared_key,
-            reply_to.clone(),
+            reply_to,
         )
         .await
         {
@@ -227,13 +227,9 @@ pub(in crate::protocol) async fn accept<
     let resp = verification_response::produce(channel_id, request, shared_key, &stored.share)?;
 
     let envelope = super::apply_trace_id(resp.envelope, trace_id)?;
-    let endpoint = super::resolve_response_endpoint(
-        channel_store,
-        secret_id,
-        channel_id,
-        request.reply_to.as_ref(),
-    )
-    .await?;
+    let endpoint =
+        super::resolve_response_endpoints(channel_store, secret_id, channel_id, &request.reply_to)
+            .await?;
     transport.send(&endpoint, envelope).await?;
 
     #[cfg(feature = "logging")]
@@ -289,7 +285,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
         MessageBody::VerifyShareResponse(response),
         shared_key,
         trace_id,
-        request.reply_to.as_ref(),
+        &request.reply_to,
     )
     .await
 }
@@ -394,16 +390,11 @@ async fn dispatch_one<Ch: DeRecChannelStore, T: DeRecTransport, St: DeRecStateSt
     version: u32,
     channel_id: ChannelId,
     shared_key: &SharedKey,
-    reply_to: Option<derec_proto::TransportProtocol>,
+    reply_to: &[derec_proto::TransportProtocol],
 ) -> Result<()> {
-    let endpoint = peer_endpoint(channel_store, secret_id, channel_id).await?;
-    let msg = produce_verify_share_request_message(
-        channel_id,
-        secret_id,
-        version,
-        shared_key,
-        reply_to.clone(),
-    )?;
+    let endpoint = peer_endpoints(channel_store, secret_id, channel_id).await?;
+    let msg =
+        produce_verify_share_request_message(channel_id, secret_id, version, shared_key, reply_to)?;
 
     state_store
         .save(
@@ -415,7 +406,7 @@ async fn dispatch_one<Ch: DeRecChannelStore, T: DeRecTransport, St: DeRecStateSt
                     version,
                     nonce: msg.nonce,
                     timestamp: None,
-                    reply_to,
+                    reply_to: reply_to.to_vec(),
                 },
             },
         )

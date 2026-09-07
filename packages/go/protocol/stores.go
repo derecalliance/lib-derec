@@ -258,9 +258,23 @@ type StateStore interface {
 // the buffer is genuine fan-out and still has to be delivered. See "Serving
 // DeRec over request/response transports" in the Rust SDK README for the full
 // pattern.
+// Endpoint is one address a peer advertised, with the protocol discriminant
+// that says how to reach it (see derecpb.Protocol: 0 = HTTPS, 1 = GRPC).
+//
+// Aliased rather than redeclared so a Transport implementation satisfies the
+// internal seam without a conversion at every call site.
+type Endpoint = native.Endpoint
+
 type Transport interface {
-	// Send delivers message to uri over the given transport protocol
-	// (0 = HTTPS, the only value currently defined —see
-	// derecpb.Protocol).
-	Send(uri string, protocol int32, message []byte) error
+	// Send delivers message to a peer reachable at any of endpoints.
+	//
+	// endpoints are the addresses that peer advertised, in the order it
+	// offered them, already filtered to those the library will record. The
+	// library does not rank them: which to dial, and whether to fall back
+	// when one is unreachable, is this implementation's choice — only it
+	// knows which of its transports are healthy or cheap.
+	//
+	// Delivery to any one endpoint is success. Return an error only when
+	// the message reached none of them. endpoints is never empty.
+	Send(endpoints []Endpoint, message []byte) error
 }

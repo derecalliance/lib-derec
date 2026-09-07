@@ -45,13 +45,13 @@ function goldenRestoreInput(): Extract<DeRecEvent, { type: 'SecretRecovered' }>[
     helpers: [
       {
         channel_id: '11',
-        transport_uri: 'https://helper-a.example.com',
+        transports: [{ uri: 'https://helper-a.example.com', protocol: 0 }],
         shared_key: sharedKey1,
         communication_info: { foo: 'bar' },
       },
       {
         channel_id: '22',
-        transport_uri: 'https://helper-b.example.com',
+        transports: [{ uri: 'https://helper-b.example.com', protocol: 0 }],
         shared_key: sharedKey2,
         communication_info: {},
       },
@@ -62,13 +62,13 @@ function goldenRestoreInput(): Extract<DeRecEvent, { type: 'SecretRecovered' }>[
       members: [
         {
           replica_id: '44',
-          transport_uri: 'https://replica-a.example.com',
+          transports: [{ uri: 'https://replica-a.example.com', protocol: 0 }],
           role: 'Source',
           communication_info: { baz: 'qux' },
         },
         {
           replica_id: '66',
-          transport_uri: 'https://replica-b.example.com',
+          transports: [{ uri: 'https://replica-b.example.com', protocol: 0 }],
           role: 'Destination',
           communication_info: {},
         },

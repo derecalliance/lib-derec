@@ -37,7 +37,13 @@ public static partial class Sharing
             /// (the responder routes to the channel's stored peer endpoint).
             /// Mirrors the JS bridge surface.
             /// </summary>
-            public TransportProtocol? ReplyTo { get; init; }
+            /// <summary>
+            /// Every endpoint the requester asked to be answered on, in its
+            /// own preference order. Empty means route to the endpoints
+            /// recorded for the channel.
+            /// </summary>
+            public IReadOnlyList<TransportProtocol> ReplyTo { get; init; } =
+                Array.Empty<TransportProtocol>();
         }
 
         public static SplitResult Split(
@@ -83,7 +89,7 @@ public static partial class Sharing
             uint[] keepList,
             string description,
             byte[] sharedKey,
-            TransportProtocol? replyTo = null,
+            IReadOnlyList<TransportProtocol>? replyTo = null,
             ulong? replicaId = null
         )
         {
@@ -94,7 +100,9 @@ public static partial class Sharing
                 throw new ArgumentException("sharedKey must be exactly 32 bytes.", nameof(sharedKey));
 
             byte[] descriptionBytes = System.Text.Encoding.UTF8.GetBytes(description ?? string.Empty);
-            byte[]? replyToBytes = replyTo?.ToProtoBytes();
+            byte[]? replyToBytes = replyTo is { Count: > 0 }
+                ? TransportProtocol.ToProtoBytesList(replyTo)
+                : null;
             UIntPtr replyToLen = replyToBytes is null ? UIntPtr.Zero : (UIntPtr)replyToBytes.Length;
 
             Native.Sharing.ProduceStoreShareRequestMessageResult nativeResult =
@@ -149,7 +157,7 @@ public static partial class Sharing
                 {
                     ChannelId = nativeResult.ChannelId,
                     RequestProtoBytes = requestBytes,
-                    ReplyTo = TransportProtocol.FromProto(inner.ReplyTo),
+                    ReplyTo = inner.ReplyTo.Select(TransportProtocol.FromProtoValue).ToList(),
                 };
             }
             finally

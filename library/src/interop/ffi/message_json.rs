@@ -52,7 +52,7 @@ pub const DEREC_MESSAGE_KIND_VERIFY_SHARE_REQUEST: i32 = 12;
 pub const DEREC_MESSAGE_KIND_VERIFY_SHARE_RESPONSE: i32 = 13;
 /// Not a standalone message on the wire, but it crosses this FFI on its own
 /// as the `transport_protocol` argument of `create_contact_message` and the
-/// `peer_transport_protocol` result of `produce_pair_response_message`.
+/// `peer_transports` result of `produce_pair_response_message`.
 pub const DEREC_MESSAGE_KIND_TRANSPORT_PROTOCOL: i32 = 14;
 /// Crosses on its own as the `communication_info` argument of the pairing
 /// produce calls. See [`DEREC_MESSAGE_KIND_TRANSPORT_PROTOCOL`].
@@ -511,7 +511,7 @@ mod tests {
             version: 7,
             nonce: 9_007_199_254_740_993,
             timestamp: None,
-            reply_to: None,
+            reply_to: Vec::new(),
         };
         let json = decode(
             DEREC_MESSAGE_KIND_VERIFY_SHARE_REQUEST,
@@ -562,6 +562,10 @@ mod tests {
         assert_eq!(decoded.secret_list[0].secret_id, u64::MAX);
     }
 
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+    #[allow(deprecated)]
     /// `ParameterRange`'s bounds are `i64` and are surfaced as `bigint` by
     /// the WASM SDKs, so they cross this seam as strings too.
     #[test]
@@ -579,6 +583,7 @@ mod tests {
             }),
             transport_protocol: None,
             timestamp: None,
+            supported_transports: Vec::new(),
         };
         let json = decode(DEREC_MESSAGE_KIND_PAIR_REQUEST, &message.encode_to_vec());
 
@@ -605,7 +610,6 @@ mod tests {
             "version": 1,
             "nonce": 34u64,
             "timestamp": null,
-            "reply_to": null,
         });
         let bytes = encode(DEREC_MESSAGE_KIND_VERIFY_SHARE_REQUEST, &json);
         let decoded = derec_proto::VerifyShareRequestMessage::decode(&bytes[..]).unwrap();
@@ -620,7 +624,6 @@ mod tests {
             "version": 1,
             "nonce": "0",
             "timestamp": null,
-            "reply_to": null,
         });
         let bytes = serde_json::to_vec(&json).unwrap();
         let result = derec_encode_message_json(
@@ -652,7 +655,7 @@ mod tests {
         let message = derec_proto::UnpairRequestMessage {
             memo: "leaving".to_owned(),
             timestamp: None,
-            reply_to: None,
+            reply_to: Vec::new(),
             replica_id: Some(u64::MAX),
         };
         let json = decode(DEREC_MESSAGE_KIND_UNPAIR_REQUEST, &message.encode_to_vec());

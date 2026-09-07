@@ -1,0 +1,20 @@
+[package]
+name = "derec-grpc-transport-smoke-test"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+derec-library = { path = "../../library" }
+derec-proto = { path = "../../protobufs" }
+prost = "0.14.4"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+tracing = { version = "0.1.41", optional = true }
+
+[build-dependencies]
+tonic-prost-build = "0.14.6"
+
+[features]
+logging = ["dep:tracing", "derec-library/logging"]

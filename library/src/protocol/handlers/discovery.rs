@@ -5,7 +5,7 @@ use super::super::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport,
     MissingPolicy, PendingAction, SecretKind, SecretValue,
 };
-use super::peer_endpoint;
+use super::peer_endpoints;
 use crate::{
     Error, Result,
     derec_message::current_timestamp,
@@ -63,7 +63,7 @@ pub(in crate::protocol) async fn start<
     transport: &T,
     secret_id: u64,
     target: Target,
-    reply_to: Option<derec_proto::TransportProtocol>,
+    reply_to: &[derec_proto::TransportProtocol],
 ) -> Result<Vec<DeRecEvent>> {
     let known_channel_ids: std::collections::HashSet<ChannelId> = channel_store
         .helpers(secret_id)
@@ -111,7 +111,7 @@ pub(in crate::protocol) async fn start<
             secret_id,
             channel_id,
             &shared_key,
-            reply_to.clone(),
+            reply_to,
         )
         .await
         {
@@ -202,13 +202,9 @@ pub(in crate::protocol) async fn accept<
     let resp = response::produce(channel_id, &secret_list, shared_key)?;
 
     let envelope = super::apply_trace_id(resp.envelope, trace_id)?;
-    let endpoint = super::resolve_response_endpoint(
-        channel_store,
-        secret_id,
-        channel_id,
-        request.reply_to.as_ref(),
-    )
-    .await?;
+    let endpoint =
+        super::resolve_response_endpoints(channel_store, secret_id, channel_id, &request.reply_to)
+            .await?;
     transport.send(&endpoint, envelope).await?;
 
     #[cfg(feature = "logging")]
@@ -254,7 +250,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
         MessageBody::GetSecretIdsVersionsResponse(response),
         shared_key,
         trace_id,
-        request.reply_to.as_ref(),
+        &request.reply_to,
     )
     .await
 }
@@ -308,9 +304,9 @@ async fn dispatch_one<Ch: DeRecChannelStore, T: DeRecTransport>(
     secret_id: u64,
     channel_id: ChannelId,
     shared_key: &SharedKey,
-    reply_to: Option<derec_proto::TransportProtocol>,
+    reply_to: &[derec_proto::TransportProtocol],
 ) -> Result<()> {
-    let endpoint = peer_endpoint(channel_store, secret_id, channel_id).await?;
+    let endpoint = peer_endpoints(channel_store, secret_id, channel_id).await?;
     let msg = request::produce(channel_id, shared_key, reply_to)?;
     let envelope = super::apply_trace_id(msg.envelope, super::fresh_trace_id())?;
     transport.send(&endpoint, envelope).await?;

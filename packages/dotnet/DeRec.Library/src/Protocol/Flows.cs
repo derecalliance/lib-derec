@@ -177,9 +177,26 @@ public sealed record UpdateChannelInfoParams
     [JsonPropertyName("communication_info")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public Dictionary<string, string>? CommunicationInfo { get; init; }
+    /// <summary>
+    /// Replaces the target(s)' view of this node's transport endpoint.
+    /// </summary>
+    /// <remarks>
+    /// Superseded by <see cref="OwnTransports"/>, which carries every
+    /// endpoint rather than one. Scheduled for removal in v0.0.5;
+    /// <see cref="OwnTransports"/> takes precedence when both are set.
+    /// </remarks>
+    [Obsolete("Superseded by OwnTransports. Scheduled for removal in v0.0.5.")]
     [JsonPropertyName("transport_protocol")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public TransportProtocolDto? TransportProtocol { get; init; }
+
+    /// <summary>
+    /// Every endpoint this node now serves, in its own preference order.
+    /// Empty leaves the target(s)' stored set untouched.
+    /// </summary>
+    [JsonPropertyName("own_transports")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public IReadOnlyList<TransportProtocolDto>? OwnTransports { get; init; }
 
     public sealed record TransportProtocolDto
     {
@@ -425,7 +442,7 @@ public sealed record PrePairRejectedEvent : DeRecEvent
 
 public sealed record HelperInfo(
     [property: JsonPropertyName("channel_id")] string ChannelId,
-    [property: JsonPropertyName("transport_uri")] string TransportUri,
+    [property: JsonPropertyName("transports")] IReadOnlyList<TransportProtocol> Transports,
     [property: JsonPropertyName("shared_key")] byte[] SharedKey,
     [property: JsonPropertyName("communication_info")] Dictionary<string, string> CommunicationInfo);
 
@@ -436,7 +453,7 @@ public sealed record HelperInfo(
 /// </summary>
 public sealed record ReplicaInfo(
     [property: JsonPropertyName("replica_id")] string ReplicaId,
-    [property: JsonPropertyName("transport_uri")] string TransportUri,
+    [property: JsonPropertyName("transports")] IReadOnlyList<TransportProtocol> Transports,
     [property: JsonPropertyName("role")] string Role,
     [property: JsonPropertyName("communication_info")] Dictionary<string, string> CommunicationInfo);
 
@@ -973,6 +990,34 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
         return out_;
     }
 
+    /// <summary>
+    /// Reads a member's <c>transports</c> array. Absent on a payload written
+    /// before the list existed, where the single endpoint was recorded under
+    /// <c>transport_uri</c> with no protocol discriminant — read as HTTPS,
+    /// which is the only protocol those payloads could carry.
+    /// </summary>
+    private static IReadOnlyList<TransportProtocol> ReadEndpoints(System.Text.Json.JsonElement member)
+    {
+        if (member.TryGetProperty("transports", out var transports)
+            && transports.ValueKind == System.Text.Json.JsonValueKind.Array)
+        {
+            var endpoints = new List<TransportProtocol>();
+            foreach (var t in transports.EnumerateArray())
+            {
+                endpoints.Add(new TransportProtocol(
+                    t.GetProperty("uri").GetString()!,
+                    (Protocol)(t.TryGetProperty("protocol", out var p) ? p.GetInt32() : 0)));
+            }
+            return endpoints;
+        }
+        if (member.TryGetProperty("transport_uri", out var legacy)
+            && legacy.ValueKind == System.Text.Json.JsonValueKind.String)
+        {
+            return new[] { new TransportProtocol(legacy.GetString()!) };
+        }
+        return Array.Empty<TransportProtocol>();
+    }
+
     private static Dictionary<string, string> ReadStringMap(System.Text.Json.JsonElement el)
     {
         var dict = new Dictionary<string, string>();
@@ -1029,7 +1074,7 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
         {
             helpers.Add(new HelperInfo(
                 h.GetProperty("channel_id").GetString()!,
-                h.GetProperty("transport_uri").GetString()!,
+                ReadEndpoints(h),
                 ReadByteArray(h.GetProperty("shared_key")),
                 h.TryGetProperty("communication_info", out var hci) ? ReadStringMap(hci) : new()));
         }
@@ -1052,7 +1097,7 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             {
                 members.Add(new ReplicaInfo(
                     r.GetProperty("replica_id").GetString()!,
-                    r.GetProperty("transport_uri").GetString()!,
+                    ReadEndpoints(r),
                     r.GetProperty("role").GetString()!,
                     r.TryGetProperty("communication_info", out var rci) ? ReadStringMap(rci) : new()));
             }

@@ -132,6 +132,29 @@ pub enum Error {
     /// device is meant to keep the original.
     #[error("replica id {replica_id} is already in use by another member of the group")]
     ReplicaIdConflict { replica_id: u64 },
+
+    /// A peer advertised no endpoint this library will record.
+    ///
+    /// Every endpoint it offered failed [`TransportPolicy`] — typically all
+    /// of them were plaintext while plaintext is not opted into. Terminal:
+    /// delivery is push-only, so a peer that cannot be reached cannot be
+    /// sent a rejection either. The application tells the user; the protocol
+    /// has nothing further to try.
+    ///
+    /// This is *not* a mismatch between the two sides' transports. The
+    /// library no longer compares them — it records what a peer offers and
+    /// leaves the choice of which to dial to
+    /// [`DeRecTransport`](crate::protocol::DeRecTransport).
+    ///
+    /// [`TransportPolicy`]: crate::transport::TransportPolicy
+    #[error(
+        "peer advertised no usable transport endpoint; all {offered} offer(s) \
+         were refused by transport policy"
+    )]
+    NoUsableEndpoint {
+        /// How many endpoints the peer offered before filtering.
+        offered: usize,
+    },
 }
 
 impl Error {

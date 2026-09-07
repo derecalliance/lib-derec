@@ -116,22 +116,24 @@ fn typescript_surfaces_declare_every_dto_field() {
         }
         ContactMessage {
             channel_id, transport_protocol, nonce, contact_mode, mlkem_encapsulation_key,
-            ecies_public_key, contact_binding_hash, timestamp,
+            ecies_public_key, contact_binding_hash, timestamp, supported_transports,
         }
         PairRequestMessage {
             sender_kind, mlkem_ciphertext, ecies_public_key, nonce, communication_info,
-            parameter_range, transport_protocol, timestamp,
+            parameter_range, transport_protocol, timestamp, supported_transports,
         }
         PairResponseMessage {
             result, nonce, communication_info, parameter_range, timestamp, channel_id,
         }
-        PrePairRequestMessage { nonce, transport_protocol, timestamp }
+        PrePairRequestMessage { nonce, transport_protocol, timestamp, supported_transports }
         PrePairResponseMessage {
             result, mlkem_encapsulation_key, ecies_public_key, nonce, timestamp,
         }
         VersionListEntry { version, version_description }
         VersionList { secret_id, versions }
-        GetSecretIdsVersionsRequestMessage { timestamp, reply_to, replica_id }
+        GetSecretIdsVersionsRequestMessage {
+            timestamp, reply_to, replica_id,
+        }
         GetSecretIdsVersionsResponseMessage { result, secret_list, timestamp, replica_id }
         VersionEntry { version, description }
         SecretVersionEntry { secret_id, versions }
@@ -142,14 +144,18 @@ fn typescript_surfaces_declare_every_dto_field() {
             secret_id, reply_to, replica_id,
         }
         StoreShareResponseMessage { result, version, timestamp, secret_id, replica_id }
-        GetShareRequestMessage { secret_id, version, timestamp, reply_to, replica_id }
+        GetShareRequestMessage {
+            secret_id, version, timestamp, reply_to, replica_id,
+        }
         GetShareResponseMessage {
             share_algorithm, committed_de_rec_share, result, timestamp, secret_id, version,
             replica_id,
         }
         UnpairRequestMessage { memo, timestamp, reply_to, replica_id }
         UnpairResponseMessage { result, timestamp }
-        VerifyShareRequestMessage { secret_id, version, nonce, timestamp, reply_to }
+        VerifyShareRequestMessage {
+            secret_id, version, nonce, timestamp, reply_to,
+        }
         VerifyShareResponseMessage { result, secret_id, version, nonce, hash, timestamp }
     };
 
@@ -191,5 +197,42 @@ fn typescript_surfaces_declare_every_dto_field() {
         "TypeScript declarations have drifted from library/src/interop/dto.rs:\n  {}\n\n\
          Update the surface(s) listed, or the DTO if the core changed.",
         problems.join("\n  ")
+    );
+}
+
+/// `withUnsafeConnection` and the `Grpc` transport discriminant have no
+/// `dto::` struct behind them to destructure exhaustively: `unsafe_http` /
+/// `unsafe_connection` live on the private FFI `ProtocolConfig`
+/// (`library/src/interop/ffi/protocol/handle/mod.rs`), and the transport
+/// `Protocol` enum is declared in `protobufs/transportprotocol.proto` — both
+/// unreachable from this external test crate the way `dto::` is. The check
+/// is therefore textual, the same trick `enum_fixture.rs` uses for the
+/// nodejs/web runtime shims: assert each surface's source actually forwards
+/// the value, so a surface that gained the enum member (A1) or the config
+/// key (A5) on the Rust side without a matching setter here fails loudly
+/// instead of silently rejecting or ignoring it.
+#[test]
+fn typescript_surfaces_forward_unsafe_connection_and_grpc() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+
+    for pkg in ["nodejs", "web"] {
+        let path = format!("{root}/packages/{pkg}/index.d.ts");
+        let dts = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
+        assert!(
+            dts.contains("withUnsafeConnection(allow: boolean): DeRecProtocolBuilder;"),
+            "{path} does not declare withUnsafeConnection"
+        );
+    }
+
+    let rn_path = format!("{root}/packages/react-native/src/protocol.ts");
+    let rn = std::fs::read_to_string(&rn_path).unwrap_or_else(|e| panic!("reading {rn_path}: {e}"));
+    assert!(
+        rn.contains("withUnsafeConnection(allow: boolean): this")
+            && rn.contains("this.config.unsafe_connection = allow;"),
+        "{rn_path} does not forward unsafe_connection to the wire config"
+    );
+    assert!(
+        rn.contains("case 'grpc':"),
+        "{rn_path} protocolDiscriminant does not resolve the Grpc protocol name"
     );
 }

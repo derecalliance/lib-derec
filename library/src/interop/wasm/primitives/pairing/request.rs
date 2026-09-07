@@ -46,7 +46,7 @@ pub struct ExtractResult {
 pub fn create_contact(
     channel_id: u64,
     contact_mode: u32,
-    transport_protocol: JsValue,
+    transport_protocols: JsValue,
     nonce: JsValue,
 ) -> Result<JsValue, JsValue> {
     let contact_mode = derec_proto::ContactMode::try_from(contact_mode as i32).map_err(|_| {
@@ -55,8 +55,9 @@ pub fn create_contact(
             format!("invalid contact_mode value: {contact_mode}"),
         )
     })?;
-    let transport_protocol: TransportProtocol = from_js(transport_protocol)?;
-    let transport_protocol_proto: derec_proto::TransportProtocol = transport_protocol.into();
+    let transport_protocols: Vec<TransportProtocol> = from_js(transport_protocols)?;
+    let transport_protocols_proto: Vec<derec_proto::TransportProtocol> =
+        transport_protocols.into_iter().map(Into::into).collect();
     let nonce = if nonce.is_null() || nonce.is_undefined() {
         None
     } else if nonce.is_bigint() {
@@ -76,7 +77,7 @@ pub fn create_contact(
     let result = request::create_contact(
         channel_id.into(),
         contact_mode,
-        transport_protocol_proto,
+        transport_protocols_proto,
         nonce,
     )
     .map_err(js_error_from_lib)?;
@@ -128,14 +129,15 @@ pub fn decode_contact(bytes: &[u8]) -> Result<JsValue, JsValue> {
 #[wasm_bindgen(js_name = "pairing_request_produce")]
 pub fn produce(
     kind: u32,
-    transport_protocol: JsValue,
+    transport_protocols: JsValue,
     contact_message: JsValue,
     communication_info: JsValue,
     parameter_range: JsValue,
 ) -> Result<JsValue, JsValue> {
     let sender_kind = get_sender_kind(kind)?;
-    let transport_protocol: TransportProtocol = from_js(transport_protocol)?;
-    let transport_protocol_proto: derec_proto::TransportProtocol = transport_protocol.into();
+    let transport_protocols: Vec<TransportProtocol> = from_js(transport_protocols)?;
+    let transport_protocols_proto: Vec<derec_proto::TransportProtocol> =
+        transport_protocols.into_iter().map(Into::into).collect();
     let contact_message: ContactMessage = from_js(contact_message)?;
     let contact_message_proto: derec_proto::ContactMessage = contact_message.into();
     let communication_info: Option<CommunicationInfo> =
@@ -156,7 +158,7 @@ pub fn produce(
 
     let result = request::produce(
         sender_kind,
-        transport_protocol_proto,
+        transport_protocols_proto,
         &contact_message_proto,
         communication_info_proto,
         parameter_range_proto,
@@ -195,17 +197,17 @@ pub struct PrePairExtractResult {
 /// `HASHED_KEYS` contact.
 #[wasm_bindgen(js_name = "pairing_request_produce_pre_pair")]
 pub fn produce_pre_pair_request(
-    transport_protocol: JsValue,
+    own_transports: JsValue,
     contact_message: JsValue,
 ) -> Result<JsValue, JsValue> {
-    let transport_protocol: TransportProtocol = from_js(transport_protocol)?;
-    let transport_protocol_proto: derec_proto::TransportProtocol = transport_protocol.into();
+    let own_transports: Vec<TransportProtocol> = from_js(own_transports)?;
+    let own_transports_proto: Vec<derec_proto::TransportProtocol> =
+        own_transports.into_iter().map(Into::into).collect();
     let contact_message: ContactMessage = from_js(contact_message)?;
     let contact_message_proto: derec_proto::ContactMessage = contact_message.into();
 
-    let result =
-        request::produce_pre_pair_request(transport_protocol_proto, &contact_message_proto)
-            .map_err(js_error_from_lib)?;
+    let result = request::produce_pre_pair_request(own_transports_proto, &contact_message_proto)
+        .map_err(js_error_from_lib)?;
 
     to_js(&ProducePrePairResult {
         envelope: result.envelope,

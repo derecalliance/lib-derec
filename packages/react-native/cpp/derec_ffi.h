@@ -30,7 +30,7 @@
  * Latest encoding major version, used for all new encodes. Bump only on a
  * breaking format change, adding the matching `vN` module and match arm.
  */
-#define LATEST 2
+#define LATEST 3
 
 /**
  * Minimum number of shares required to reconstruct the secret, absent an
@@ -264,6 +264,14 @@
 #define DEREC_CODE_TRANSPORT_INVALID 120
 
 /**
+ * No transport is shared with the peer — its offered endpoints and this
+ * application's served endpoints intersect to nothing. Always a local,
+ * terminal error: push-only delivery means an unreachable peer also
+ * cannot be told. `DEREC_CATEGORY_INVALID_INPUT`.
+ */
+#define DEREC_CODE_NO_USABLE_ENDPOINT 121
+
+/**
  * Discriminants selecting which message [`derec_decode_message_json`] and
  * [`derec_encode_message_json`] operate on.
  *
@@ -301,7 +309,7 @@
 /**
  * Not a standalone message on the wire, but it crosses this FFI on its own
  * as the `transport_protocol` argument of `create_contact_message` and the
- * `peer_transport_protocol` result of `produce_pair_response_message`.
+ * `peer_transports` result of `produce_pair_response_message`.
  */
 #define DEREC_MESSAGE_KIND_TRANSPORT_PROTOCOL 14
 
@@ -552,7 +560,7 @@ typedef struct ExtractPairRequestResult {
 typedef struct ProducePairResponseMessageResult {
   struct DeRecError error;
   struct DeRecBuffer response_wire_bytes;
-  struct DeRecBuffer peer_transport_protocol;
+  struct DeRecBuffer peer_transports;
   struct DeRecBuffer shared_key;
   /**
    * Post-handshake rekey channel id the responder is committing to.
@@ -861,10 +869,24 @@ typedef struct StateStoreCallbacks {
  */
 typedef struct TransportCallbacks {
   void *user_data;
+  /**
+   * Deliver `bytes` to a peer reachable at any of `endpoints`.
+   *
+   * `endpoints` is a length-delimited sequence of encoded
+   * `TransportProtocol` messages — each entry preceded by its protobuf
+   * varint byte length, the same framing protobuf uses for a repeated
+   * embedded message field. They are the endpoints that peer advertised,
+   * in the order it offered them, already filtered to those the library
+   * will record.
+   *
+   * The library does not rank them. Which endpoint to dial, and whether
+   * to fall back to another when one is unreachable, is the
+   * implementation's choice. Return `0` once the message has reached any
+   * one of them; non-zero only when it reached none.
+   */
   int32_t (*send)(void *user_data,
-                  const uint8_t *uri_ptr,
-                  size_t uri_len,
-                  int32_t protocol,
+                  const uint8_t *endpoints_ptr,
+                  size_t endpoints_len,
                   const uint8_t *bytes,
                   size_t len);
 } TransportCallbacks;
@@ -1287,8 +1309,8 @@ struct DeRecMessageJsonResult derec_encode_message_json(int32_t kind,
  */
 struct CreateContactMessageResult create_contact_message(uint64_t channel_id,
                                                          int32_t contact_mode,
-                                                         const uint8_t *transport_protocol_ptr,
-                                                         size_t transport_protocol_len,
+                                                         const uint8_t *transport_protocols_ptr,
+                                                         size_t transport_protocols_len,
                                                          uint32_t has_nonce,
                                                          uint64_t nonce);
 
@@ -1362,8 +1384,8 @@ struct DecodeContactMessageResult decode_contact_message(const uint8_t *contact_
  * Non-null input pointers must point to the corresponding readable byte ranges.
  */
 struct ProducePairRequestMessageResult produce_pair_request_message(int32_t sender_kind,
-                                                                    const uint8_t *transport_protocol_ptr,
-                                                                    size_t transport_protocol_len,
+                                                                    const uint8_t *transport_protocols_ptr,
+                                                                    size_t transport_protocols_len,
                                                                     const uint8_t *contact_message_ptr,
                                                                     size_t contact_message_len,
                                                                     const uint8_t *communication_info_ptr,
@@ -1402,7 +1424,8 @@ struct ProducePairResponseMessageResult produce_pair_response_message(uint64_t c
                                                                       const uint8_t *communication_info_ptr,
                                                                       size_t communication_info_len,
                                                                       const uint8_t *parameter_range_ptr,
-                                                                      size_t parameter_range_len);
+                                                                      size_t parameter_range_len,
+                                                                      uint32_t unsafe_connection);
 
 /**
  * # Safety
@@ -1439,8 +1462,8 @@ struct ProcessPairResponseMessageResult process_pair_response_message(const uint
  *
  * Non-null input pointers must point to the corresponding readable byte ranges.
  */
-struct ProducePrePairRequestMessageResult produce_pre_pair_request_message(const uint8_t *transport_protocol_ptr,
-                                                                           size_t transport_protocol_len,
+struct ProducePrePairRequestMessageResult produce_pre_pair_request_message(const uint8_t *transport_protocols_ptr,
+                                                                           size_t transport_protocols_len,
                                                                            const uint8_t *contact_message_ptr,
                                                                            size_t contact_message_len);
 
@@ -1527,6 +1550,7 @@ struct ProcessPrePairResponseMessageResult process_pre_pair_response_message(con
  *   "secret_id": "12345678901234567890",
  *   "own_transport_uri": "https://example.com/derec",
  *   "own_transport_protocol": 1,
+ *   "own_transports": [{ "uri": "https://example.com/derec", "protocol": 0 }],
  *   "threshold": 3,
  *   "keep_versions_count": 2,
  *   "timeout_in_secs": 30,
@@ -1553,6 +1577,11 @@ struct ProcessPrePairResponseMessageResult process_pre_pair_response_message(con
  *   `derec_protocol_set_own_transport` must be called before pairing
  *   in that case.
  * - `own_transport_protocol`: [`derec_proto::Protocol`] discriminant.
+ * - `own_transports`: every endpoint this application serves, in
+ *   preference order — the order decides which of a peer's offered
+ *   endpoints is used. Optional; when non-empty it takes precedence over
+ *   `own_transport_uri` / `own_transport_protocol`, which stay fully
+ *   supported for callers that serve a single transport.
  * - `threshold` / `keep_versions_count`: optional; omitted means
  *   [`crate::protocol::DEFAULT_THRESHOLD`] /
  *   [`crate::protocol::DEFAULT_KEEP_VERSIONS_COUNT`].

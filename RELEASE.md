@@ -3,6 +3,13 @@
 This repository contains multiple crates. The publish order must respect
 crate dependencies.
 
+## Release Notes
+
+Release notes live in [CHANGELOG.md](CHANGELOG.md). This document is the
+maintainer runbook: publish order, per-SDK build steps and the release
+checklist. A consumer upgrading between versions wants the changelog, not
+this file.
+
 ## Dependency Structure
 
 The dependency structure is:

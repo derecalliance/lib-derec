@@ -254,7 +254,7 @@ internal static class Protocol
         // Pre-seed: a paired channel + its 32-byte SharedKey.
         channelStore.Save(DefaultTestSecretId, ChannelRecord.Of(new HelperChannel(
             ChannelId: channelId,
-            Transport: new TransportProtocol("https://peer.example.com"),
+            Transports: new[] { new TransportProtocol("https://peer.example.com") },
             CommunicationInfo: new Dictionary<string, string>(),
             Status: ChannelStatus.Paired,
             CreatedAt: 1700000000UL,
@@ -312,7 +312,7 @@ internal static class Protocol
         node.ChannelStore.Save(node.Protocol.SecretId, ChannelRecord.Of(new ReplicaMember(
             ChannelId: channelId,
             ReplicaId: 0xcafeUL,
-            Transport: new TransportProtocol("https://peer.example.com"),
+            Transports: new[] { new TransportProtocol("https://peer.example.com") },
             CommunicationInfo: new Dictionary<string, string>(),
             Role: ReplicaRole.Destination,
             Status: ChannelStatus.Pending,
@@ -1086,9 +1086,9 @@ internal static class Protocol
         // URI and communication-info map.
         var helperChannel = helper.ChannelStore.Load(helper.Protocol.SecretId, rekeyedId, 0)?.Helper
             ?? throw new InvalidOperationException("helper channel record must still exist");
-        if (helperChannel.Transport.Uri != newUri)
+        if (helperChannel.Transports[0].Uri != newUri)
             throw new InvalidOperationException(
-                $"helper's stored Transport.Uri must reflect the announced update; got {helperChannel.Transport.Uri}");
+                $"helper's stored Transports[0].Uri must reflect the announced update; got {helperChannel.Transports[0].Uri}");
         foreach (var (k, v) in newInfo)
         {
             if (!helperChannel.CommunicationInfo.TryGetValue(k, out var stored) || stored != v)
@@ -1138,10 +1138,13 @@ internal static class Protocol
         byte[] sharedKey = helper.SecretStore.Load(helper.Protocol.SecretId, rekeyedId, SecretKind.SharedKey)!.Bytes;
         var extracted = Discovery.Request.Extract(
             DeRecMessage.FromProtoBytes(outBytes), sharedKey);
-        if (extracted.ReplyTo is null || extracted.ReplyTo.Uri != ownerUri)
+        // reply_to is a list now: autoReplyTo advertises every endpoint this
+        // device serves, leading with its own transport.
+        if (extracted.ReplyTo.Count == 0 || extracted.ReplyTo[0].Uri != ownerUri)
             throw new InvalidOperationException(
-                $"autoReplyTo envelope must stamp reply_to = ownerUri; got {extracted.ReplyTo?.Uri ?? "<null>"}");
-        Console.WriteLine($"  autoReplyTo envelope.reply_to = {extracted.ReplyTo.Uri}  ✓");
+                "autoReplyTo envelope must stamp reply_to leading with ownerUri; got "
+                    + (extracted.ReplyTo.Count == 0 ? "<empty>" : extracted.ReplyTo[0].Uri));
+        Console.WriteLine($"  autoReplyTo envelope.reply_to = {extracted.ReplyTo[0].Uri}  ✓");
 
         // Sanity: a node WITHOUT autoReplyTo. The same field must be unset.
         using var helper2 = MakeNode("Helper", helperUri);
@@ -1156,9 +1159,9 @@ internal static class Protocol
         byte[] sharedKey2 = helper2.SecretStore.Load(helper2.Protocol.SecretId, rekeyedId2, SecretKind.SharedKey)!.Bytes;
         var extracted2 = Discovery.Request.Extract(
             DeRecMessage.FromProtoBytes(defaultBytes), sharedKey2);
-        if (extracted2.ReplyTo is not null)
+        if (extracted2.ReplyTo.Count != 0)
             throw new InvalidOperationException(
-                $"default envelope must leave reply_to unset; got {extracted2.ReplyTo.Uri}");
+                $"default envelope must leave reply_to empty; got {extracted2.ReplyTo[0].Uri}");
         Console.WriteLine("  default envelope.reply_to is unset  ✓");
 
         Console.WriteLine("Orchestrator replyTo flow test passed.");

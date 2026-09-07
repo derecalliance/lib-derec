@@ -82,6 +82,26 @@ The protocol defines three roles via the `SenderKind` enum:
 | `committedderecshare.proto` | `CommittedDeRecShare` | Share data with Merkle proof commitment |
 | `derecsecret.proto` | `DeRecSecret` | Secret metadata |
 
+### Transport service contracts — `grpc/`
+
+Everything above lives in `protobufs/` and defines the DeRec **message
+vocabulary**: what the protocol says. `grpc/` holds contracts describing how
+those envelopes are **delivered**, which is a separate concern — an
+implementation reaching its peers over HTTPS needs nothing from this
+directory.
+
+| File | Defines | Purpose |
+|---|---|---|
+| `grpc/derectransport.proto` | `DeRecTransport` service (`Send` RPC) | gRPC delivery service contract: `rpc Send(DeRecMessage) returns (google.protobuf.Empty)`. |
+
+The service shares the `org.derecalliance.derec.protobuf` package with the
+message vocabulary, so its full name — and therefore the method path on the
+wire — is unaffected by living in its own directory.
+
+This crate ships the `.proto` definition only and generates **no service
+stubs**. Consumers who want stubs run their own `tonic-prost-build`, as
+`smoke-tests/grpc/build.rs` does.
+
 ### `DeRecSecret.secretData`
 
 `secretData` is `bytes` and opaque to this crate — this schema only describes

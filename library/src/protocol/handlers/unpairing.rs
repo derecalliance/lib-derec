@@ -47,7 +47,7 @@ use super::super::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecStateStore,
     DeRecTransport, PendingAction, SecretKind, SecretValue, StateItem, StateKey, events::UnpairAck,
 };
-use super::peer_endpoint;
+use super::peer_endpoints;
 use crate::derec_message::current_timestamp;
 use crate::{
     Error, Result,
@@ -134,7 +134,7 @@ pub(in crate::protocol) async fn start<
     memo: Option<String>,
     unpair_ack: UnpairAck,
     now: u64,
-    reply_to: Option<derec_proto::TransportProtocol>,
+    reply_to: &[derec_proto::TransportProtocol],
 ) -> Result<Vec<DeRecEvent>> {
     let memo_str = memo.unwrap_or_default();
     let mut events = Vec::new();
@@ -155,7 +155,7 @@ pub(in crate::protocol) async fn start<
     // owner ↔ helper path rather than a replica-group removal.
     let request = produce_unpair_request(channel_id, &memo_str, &shared_key, reply_to, None)?;
     let envelope = super::apply_trace_id(request.envelope, super::fresh_trace_id())?;
-    let endpoint = peer_endpoint(channel_store, secret_id, channel_id).await?;
+    let endpoint = peer_endpoints(channel_store, secret_id, channel_id).await?;
     transport.send(&endpoint, envelope).await?;
 
     match unpair_ack {
@@ -216,13 +216,9 @@ pub(in crate::protocol) async fn accept<
 ) -> Result<Vec<DeRecEvent>> {
     let resp = unpairing_response::produce(channel_id, shared_key)?;
     let envelope = super::apply_trace_id(resp.envelope, trace_id)?;
-    let endpoint = super::resolve_response_endpoint(
-        channel_store,
-        secret_id,
-        channel_id,
-        request.reply_to.as_ref(),
-    )
-    .await?;
+    let endpoint =
+        super::resolve_response_endpoints(channel_store, secret_id, channel_id, &request.reply_to)
+            .await?;
     transport.send(&endpoint, envelope).await?;
 
     drop_channel_state(
@@ -272,7 +268,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
         MessageBody::UnpairResponse(response),
         shared_key,
         trace_id,
-        request.reply_to.as_ref(),
+        &request.reply_to,
     )
     .await
 }

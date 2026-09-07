@@ -199,7 +199,7 @@ internal static class Protocol
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int TransportSendDelegate(
-        IntPtr userData, IntPtr uriPtr, UIntPtr uriLen, int protocol,
+        IntPtr userData, IntPtr endpointsPtr, UIntPtr endpointsLen,
         IntPtr bytes, UIntPtr len);
 
     [StructLayout(LayoutKind.Sequential)]

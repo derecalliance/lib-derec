@@ -11,6 +11,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 
 	"google.golang.org/protobuf/proto"
@@ -33,18 +34,26 @@ func runPrimitives() {
 	runEnvelopeTraceID()
 }
 
-// transportBytes proto-encodes a derecpb.TransportProtocol — the one
-// message every pairing entry point takes as raw bytes, since the SDK makes
-// no assumption about how the application constructs it.
-func transportBytes(uri string) []byte {
-	wire, err := proto.Marshal(&derecpb.TransportProtocol{
-		Uri:      uri,
-		Protocol: derecpb.Protocol_HTTPS,
-	})
-	if err != nil {
-		fail("marshal TransportProtocol: %v", err)
+// transportListBytes frames a preference-ordered endpoint list the way
+// CreateContact and Request.Produce take it: each proto-encoded
+// derecpb.TransportProtocol preceded by its varint byte length, the same
+// framing protobuf uses for a repeated embedded message field. The SDK makes
+// no assumption about how the application constructs these, so they cross as
+// raw bytes.
+func transportListBytes(uris ...string) []byte {
+	var out []byte
+	for _, uri := range uris {
+		entry, err := proto.Marshal(&derecpb.TransportProtocol{
+			Uri:      uri,
+			Protocol: derecpb.Protocol_HTTPS,
+		})
+		if err != nil {
+			fail("marshal TransportProtocol: %v", err)
+		}
+		out = binary.AppendUvarint(out, uint64(len(entry)))
+		out = append(out, entry...)
 	}
-	return wire
+	return out
 }
 
 func sharedKeyFill(fill byte) []byte {
@@ -63,7 +72,7 @@ func runPairingFlow() {
 
 	const channelID = uint64(1)
 
-	aliceTransport := transportBytes("https://example.com/alice")
+	aliceTransport := transportListBytes("https://example.com/alice")
 	created, err := pairing.Request.CreateContact(channelID, pairing.ContactModeInlineKeys, aliceTransport, nil)
 	must(err, "pairing.Request.CreateContact")
 	assertTrue(len(created.ContactWireBytes) != 0, "contact wire bytes must not be empty")
@@ -71,7 +80,7 @@ func runPairingFlow() {
 
 	must(pairing.Request.Validate(created.ContactWireBytes), "pairing.Request.Validate")
 
-	bobTransport := transportBytes("https://example.com/helper")
+	bobTransport := transportListBytes("https://example.com/helper")
 	producedReq, err := pairing.Request.Produce(pairing.SenderKindHelper, bobTransport, created.ContactWireBytes, nil, nil)
 	must(err, "pairing.Request.Produce")
 	assertTrue(len(producedReq.Envelope) != 0, "pair request envelope must not be empty")
@@ -81,9 +90,10 @@ func runPairingFlow() {
 	must(err, "pairing.Request.Extract")
 	assertTrue(len(extractedReq.RequestProto) != 0, "extracted pair request proto must not be empty")
 
-	producedResp, err := pairing.Response.Produce(channelID, extractedReq.RequestProto, created.SecretKeyMaterial, nil, nil)
+	producedResp, err := pairing.Response.Produce(channelID, extractedReq.RequestProto, created.SecretKeyMaterial, nil, nil, false)
 	must(err, "pairing.Response.Produce")
 	assertTrue(len(producedResp.Envelope) != 0, "pair response envelope must not be empty")
+	assertTrue(len(producedResp.PeerTransports) != 0, "peer transports must not be empty")
 	assertTrue(len(producedResp.SharedKey) != 0, "initiator shared key must not be empty")
 
 	extractedResp, err := pairing.Response.Extract(producedResp.Envelope, producedReq.SecretKeyMaterial)

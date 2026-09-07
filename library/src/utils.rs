@@ -125,13 +125,22 @@ pub(crate) trait ContactMessageExt {
     /// Build a [`ContactMode::InlineKeys`] [`ContactMessage`] carrying
     /// the given ML-KEM + ECIES public key material verbatim.
     ///
+    /// `own` is every endpoint the contact creator serves, in its own
+    /// preference order. It fills `supported_transports` wholesale, and
+    /// its first entry also fills the legacy singular
+    /// `transport_protocol` so peers predating the offer list still find
+    /// an endpoint. Deriving the singular field here rather than taking
+    /// it as a second argument is what keeps the two from disagreeing.
+    /// An empty `own` yields an absent singular field; callers reject
+    /// that case before constructing a contact.
+    ///
     /// Timestamp is stamped with the current wall-clock; callers that
     /// need deterministic timestamps must construct the proto struct
     /// directly.
     fn inline_keys(
         channel_id: ChannelId,
         nonce: u64,
-        transport_protocol: TransportProtocol,
+        own: Vec<TransportProtocol>,
         pk: PairingContactMessageMaterial,
     ) -> ContactMessage;
 
@@ -141,11 +150,14 @@ pub(crate) trait ContactMessageExt {
     /// || u64_be(channel_id))` so the scanner can verify keys received
     /// later via `PrePair` against the commitment.
     ///
+    /// `own` is outside the binding hash, exactly like the singular
+    /// field derived from it.
+    ///
     /// Timestamp is stamped with the current wall-clock.
     fn hashed_keys(
         channel_id: ChannelId,
         nonce: u64,
-        transport_protocol: TransportProtocol,
+        own: Vec<TransportProtocol>,
         pk: &PairingContactMessageMaterial,
     ) -> ContactMessage;
 
@@ -162,14 +174,14 @@ pub(crate) trait ContactMessageExt {
     /// contacts on a short timer.
     ///
     /// Timestamp is stamped with the current wall-clock.
-    fn no_keys(
-        channel_id: ChannelId,
-        nonce: u64,
-        transport_protocol: TransportProtocol,
-    ) -> ContactMessage;
+    fn no_keys(channel_id: ChannelId, nonce: u64, own: Vec<TransportProtocol>) -> ContactMessage;
 }
 
 impl ContactMessageExt for ContactMessage {
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+    #[allow(deprecated)]
     fn validate(&self) -> Result<(), crate::Error> {
         let mode = ContactMode::try_from(self.contact_mode).map_err(|_| {
             #[cfg(feature = "logging")]
@@ -256,6 +268,22 @@ impl ContactMessageExt for ContactMessage {
             }
         }
 
+        // A contact naming no endpoint at all gives the scanner nowhere to
+        // send the pair request. Either spelling satisfies this: the list,
+        // or the deprecated singular field a peer predating it fills.
+        let has_offers = !self.supported_transports.is_empty();
+        let has_singular = self
+            .transport_protocol
+            .as_ref()
+            .is_some_and(|tp| !tp.uri.trim().is_empty());
+
+        if !has_offers && !has_singular {
+            #[cfg(feature = "logging")]
+            tracing::warn!("contact advertises no usable transport endpoint");
+
+            return Err(PairingError::EmptyTransportUri.into());
+        }
+
         Ok(())
     }
 
@@ -264,28 +292,37 @@ impl ContactMessageExt for ContactMessage {
             || self.contact_mode == ContactMode::NoKeys as i32
     }
 
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+    #[allow(deprecated)]
     fn inline_keys(
         channel_id: ChannelId,
         nonce: u64,
-        transport_protocol: TransportProtocol,
+        own: Vec<TransportProtocol>,
         pk: PairingContactMessageMaterial,
     ) -> ContactMessage {
         ContactMessage {
             channel_id: channel_id.into(),
-            transport_protocol: Some(transport_protocol),
+            transport_protocol: own.first().cloned(),
             contact_mode: ContactMode::InlineKeys as i32,
             mlkem_encapsulation_key: Some(pk.mlkem_encapsulation_key),
             ecies_public_key: Some(pk.ecies_public_key),
             contact_binding_hash: None,
             nonce,
             timestamp: Some(current_timestamp()),
+            supported_transports: own,
         }
     }
 
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+    #[allow(deprecated)]
     fn hashed_keys(
         channel_id: ChannelId,
         nonce: u64,
-        transport_protocol: TransportProtocol,
+        own: Vec<TransportProtocol>,
         pk: &PairingContactMessageMaterial,
     ) -> ContactMessage {
         let binding_hash = derec_cryptography::pairing::contact_binding_hash(
@@ -297,31 +334,155 @@ impl ContactMessageExt for ContactMessage {
 
         ContactMessage {
             channel_id: channel_id.into(),
-            transport_protocol: Some(transport_protocol),
+            transport_protocol: own.first().cloned(),
             contact_mode: ContactMode::HashedKeys as i32,
             mlkem_encapsulation_key: None,
             ecies_public_key: None,
             contact_binding_hash: Some(binding_hash.to_vec()),
             nonce,
             timestamp: Some(current_timestamp()),
+            supported_transports: own,
         }
     }
 
-    fn no_keys(
-        channel_id: ChannelId,
-        nonce: u64,
-        transport_protocol: TransportProtocol,
-    ) -> ContactMessage {
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+    #[allow(deprecated)]
+    fn no_keys(channel_id: ChannelId, nonce: u64, own: Vec<TransportProtocol>) -> ContactMessage {
         ContactMessage {
             channel_id: channel_id.into(),
-            transport_protocol: Some(transport_protocol),
+            transport_protocol: own.first().cloned(),
             contact_mode: ContactMode::NoKeys as i32,
             mlkem_encapsulation_key: None,
             ecies_public_key: None,
             contact_binding_hash: None,
             nonce,
             timestamp: Some(current_timestamp()),
+            supported_transports: own,
         }
+    }
+}
+
+/// Structural validation for a decoded [`PairRequestMessage`], attached as a
+/// method the same way [`ContactMessageExt`] attaches it to
+/// [`ContactMessage`].
+///
+/// Sidesteps the orphan rule: the message is generated in `derec-proto`, so
+/// the check cannot be an inherent method. Bring the trait into scope
+/// (`use crate::utils::PairRequestMessageExt as _;`) and call
+/// `request.validate()?` before handing a peer-supplied request to protocol
+/// code.
+pub(crate) trait PairRequestMessageExt {
+    /// Structural validator for a decoded [`PairRequestMessage`]. Enforces
+    /// the field-presence invariants the proto schema documents but cannot
+    /// itself express:
+    ///
+    /// - `mlkem_ciphertext` MUST be present and non-empty — without it the
+    ///   responder has no encapsulated secret to decapsulate.
+    /// - `ecies_public_key` MUST be present and non-empty, for the same
+    ///   reason on the ECIES half of the hybrid handshake.
+    /// - The request MUST advertise at least one endpoint, through either
+    ///   `supportedTransports` or a non-blank singular `transportProtocol`.
+    ///
+    /// Says nothing about whether those endpoints are *acceptable* — that is
+    /// [`TransportPolicy`](crate::transport::TransportPolicy)'s decision, made
+    /// later against configuration this validator cannot see.
+    fn validate(&self) -> Result<(), crate::Error>;
+}
+
+impl PairRequestMessageExt for derec_proto::PairRequestMessage {
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+    #[allow(deprecated)]
+    fn validate(&self) -> Result<(), crate::Error> {
+        if self.mlkem_ciphertext.is_empty() {
+            #[cfg(feature = "logging")]
+            tracing::warn!("pair request missing mlkem_ciphertext");
+
+            return Err(
+                PairingError::InvalidPairRequestMessage("mlkem_ciphertext is empty").into(),
+            );
+        }
+
+        if self.ecies_public_key.is_empty() {
+            #[cfg(feature = "logging")]
+            tracing::warn!("pair request missing ecies_public_key");
+
+            return Err(
+                PairingError::InvalidPairRequestMessage("ecies_public_key is empty").into(),
+            );
+        }
+
+        // A request carrying no offer list and no usable singular endpoint
+        // gives selection nothing to work with. Report it as the malformed
+        // request it is rather than as `NoUsableEndpoint`: the two are fixed
+        // differently — one by the sender correcting its request, the other
+        // by one side gaining a transport the other serves.
+        let has_offers = !self.supported_transports.is_empty();
+        let has_singular = self
+            .transport_protocol
+            .as_ref()
+            .is_some_and(|tp| !tp.uri.trim().is_empty());
+
+        if !has_offers && !has_singular {
+            #[cfg(feature = "logging")]
+            tracing::warn!("pair request advertises no usable transport endpoint");
+
+            return Err(PairingError::EmptyTransportUri.into());
+        }
+
+        Ok(())
+    }
+}
+
+/// Structural validation for a decoded [`PrePairRequestMessage`], attached
+/// as a method the same way [`ContactMessageExt`] and
+/// [`PairRequestMessageExt`] attach it to their messages.
+///
+/// Sidesteps the orphan rule: the message is generated in `derec-proto`, so
+/// the check cannot be an inherent method. Bring the trait into scope
+/// (`use crate::utils::PrePairRequestMessageExt as _;`) and call
+/// `request.validate()?` before handing a peer-supplied request to protocol
+/// code.
+pub(crate) trait PrePairRequestMessageExt {
+    /// Structural validator for a decoded [`PrePairRequestMessage`].
+    ///
+    /// The message carries only `nonce`, `transportProtocol` and
+    /// `timestamp`, and just one of those is checkable from the message
+    /// alone:
+    ///
+    /// - `transportProtocol`, when present, MUST be a structurally valid
+    ///   endpoint — within the length cap, free of control characters, and
+    ///   carrying a scheme consistent with its protocol discriminant.
+    ///
+    /// The other two are deliberately not checked here. `nonce` is only
+    /// meaningful against the originating `ContactMessage`, which this
+    /// message does not carry, and `timestamp` is validated as a *binding*
+    /// against the outer envelope by
+    /// [`verify_timestamps`] — a relationship between two messages rather
+    /// than a property of this one.
+    ///
+    /// Says nothing about whether the endpoint is *acceptable*: that is
+    /// [`TransportPolicy`](crate::transport::TransportPolicy)'s decision,
+    /// applied to this message type through the inbound funnel.
+    fn validate(&self) -> Result<(), crate::Error>;
+}
+
+impl PrePairRequestMessageExt for derec_proto::PrePairRequestMessage {
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+    #[allow(deprecated)]
+    fn validate(&self) -> Result<(), crate::Error> {
+        use crate::transport::TransportProtocolExt as _;
+
+        if let Some(tp) = self.transport_protocol.as_ref() {
+            tp.validate()?;
+        }
+
+        Ok(())
     }
 }
 
@@ -393,6 +554,10 @@ mod tests {
         Timestamp { seconds, nanos: 0 }
     }
 
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+    #[allow(deprecated)]
     fn well_formed_inline_keys_contact() -> ContactMessage {
         ContactMessage {
             channel_id: 42,
@@ -406,9 +571,14 @@ mod tests {
             contact_binding_hash: None,
             nonce: 0xCAFE_BABE,
             timestamp: Some(ts(1_700_000_000)),
+            supported_transports: Vec::new(),
         }
     }
 
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+    #[allow(deprecated)]
     fn well_formed_hashed_keys_contact() -> ContactMessage {
         ContactMessage {
             channel_id: 42,
@@ -422,9 +592,14 @@ mod tests {
             contact_binding_hash: Some(vec![0xAB; 48]),
             nonce: 0xDEAD_BEEF,
             timestamp: Some(ts(1_700_000_000)),
+            supported_transports: Vec::new(),
         }
     }
 
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+    #[allow(deprecated)]
     fn well_formed_no_keys_contact() -> ContactMessage {
         ContactMessage {
             channel_id: 1234,
@@ -438,6 +613,7 @@ mod tests {
             contact_binding_hash: None,
             nonce: 4321,
             timestamp: Some(ts(1_700_000_000)),
+            supported_transports: Vec::new(),
         }
     }
 

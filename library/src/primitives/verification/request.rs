@@ -112,7 +112,7 @@ pub struct ExtractResult {
 ///     1,
 ///     7,
 ///     &shared_key,
-///     None,
+///     &[],
 /// )
 /// .expect("failed to build verification request");
 ///
@@ -127,7 +127,7 @@ pub fn produce(
     secret_id: u64,
     version: u32,
     shared_key: &SharedKey,
-    reply_to: Option<derec_proto::TransportProtocol>,
+    reply_to: &[derec_proto::TransportProtocol],
 ) -> Result<ProduceResult, crate::Error> {
     let mut rng = rng();
 
@@ -139,7 +139,7 @@ pub fn produce(
         version,
         nonce,
         timestamp: Some(timestamp),
-        reply_to,
+        reply_to: reply_to.to_vec(),
     };
 
     let envelope = DeRecMessageBuilder::channel()
@@ -208,7 +208,7 @@ pub fn produce(
 /// let channel_id = ChannelId(42);
 /// let shared_key = [7u8; 32];
 ///
-/// let request::ProduceResult { envelope, .. } = request::produce(channel_id, 1, 7, &shared_key, None)
+/// let request::ProduceResult { envelope, .. } = request::produce(channel_id, 1, 7, &shared_key, &[])
 ///     .expect("failed to build verification request");
 ///
 /// let request::ExtractResult { request } = request::extract(&envelope, &shared_key)
@@ -252,7 +252,7 @@ pub fn extract(
 
     verify_timestamps(envelope.timestamp, request.timestamp)?;
 
-    if let Some(reply_to) = request.reply_to.as_ref() {
+    for reply_to in &request.reply_to {
         reply_to.validate()?;
     }
 

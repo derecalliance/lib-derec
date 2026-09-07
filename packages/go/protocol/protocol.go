@@ -84,9 +84,21 @@ type Config struct {
 	// any pairing flow requires it to be set first.
 	OwnTransportURI string
 	// OwnTransportProtocol selects the transport scheme for
-	// OwnTransportURI; 0 = HTTPS (see derecpb.Protocol_HTTPS), currently
-	// the only defined value.
+	// OwnTransportURI: 0 = HTTPS (derecpb.Protocol_HTTPS), 1 = gRPC
+	// (derecpb.Protocol_GRPC).
 	OwnTransportProtocol int32
+	// OwnTransports is every transport endpoint this application serves,
+	// in preference order. Optional; when non-empty it takes precedence
+	// over OwnTransportURI / OwnTransportProtocol entirely, which stay
+	// fully supported for callers serving a single transport.
+	//
+	// The order given is the order forwarded to the library — it is not
+	// sorted, deduplicated, or reordered here. It is this application's
+	// own preference and decides which of a peer's offered endpoints is
+	// used. Every listed transport must actually be served, because
+	// delivery is push-only: listing an endpoint this application does not
+	// serve makes pairing succeed and replies vanish.
+	OwnTransports []TransportProtocolParam
 
 	// Threshold is the minimum number of shares required to reconstruct
 	// the secret. Default: 3.
@@ -103,19 +115,28 @@ type Config struct {
 	// library's own default in force. See Timeouts.
 	Timeouts *Timeouts
 	// UnsafeHTTP accepts plaintext http:// transport endpoints. Development
-	// only. Default: false, the production posture.
+	// only. nil (unset) is the production posture.
 	//
-	// With it false, plaintext is accepted only for an endpoint this device
-	// configured for itself that names loopback (localhost, 127.0.0.1, ::1),
-	// so a local dev server needs no configuration. With it true, plaintext
-	// is accepted for any host on any path, including endpoints a peer
-	// supplies — which is what makes the LAN case work (a phone against a
-	// laptop), and why the name is blunt.
+	// With it unset or false, plaintext is accepted only for an endpoint
+	// this device configured for itself that names loopback (localhost,
+	// 127.0.0.1, ::1), so a local dev server needs no configuration. With it
+	// true, plaintext is accepted for any host on any path, including
+	// endpoints a peer supplies — which is what makes the LAN case work (a
+	// phone against a laptop), and why the name is blunt.
 	//
 	// This is a guardrail, not transport security: the SDK opens no sockets,
 	// so nothing here stops an application sending plaintext. It governs
 	// which endpoints the protocol will record, propagate and reply to.
-	UnsafeHTTP bool
+	//
+	// Deprecated: use UnsafeConnection, which names both gated schemes.
+	// Removed at 0.1.0. nil is indistinguishable from "unset" on the wire —
+	// a caller that wants the old flag off explicitly must still set it to
+	// a pointer to false, not leave it nil.
+	UnsafeHTTP *bool
+	// UnsafeConnection accepts plaintext http:// and grpc:// transport
+	// endpoints. Development only. nil (unset) is the production posture.
+	// See UnsafeHTTP for the conflict rule when both are set.
+	UnsafeConnection *bool
 	// AutoRespondOnFailure controls whether the protocol auto-replies on
 	// failed inbound processing. Default: false.
 	AutoRespondOnFailure bool
@@ -259,15 +280,27 @@ func New(
 		return nil, err
 	}
 
+	// Order preserved verbatim — it is the application's own preference
+	// and decides which of a peer's offered endpoints the library picks.
+	var nativeOwnTransports []native.TransportOffer
+	if len(config.OwnTransports) > 0 {
+		nativeOwnTransports = make([]native.TransportOffer, len(config.OwnTransports))
+		for i, t := range config.OwnTransports {
+			nativeOwnTransports[i] = native.TransportOffer{URI: t.URI, Protocol: t.Protocol}
+		}
+	}
+
 	nativeCfg := native.ProtocolConfig{
 		SecretID:             config.SecretID,
 		OwnTransportURI:      config.OwnTransportURI,
 		OwnTransportProtocol: config.OwnTransportProtocol,
+		OwnTransports:        nativeOwnTransports,
 		Threshold:            config.Threshold,
 		KeepVersionsCount:    config.KeepVersionsCount,
 		CommunicationInfo:    commInfo,
 		Timeouts:             nativeTimeouts,
 		UnsafeHTTP:           config.UnsafeHTTP,
+		UnsafeConnection:     config.UnsafeConnection,
 		AutoRespondOnFailure: config.AutoRespondOnFailure,
 		UnpairAck:            int32(config.UnpairAck),
 		AutoReplyTo:          config.AutoReplyTo,

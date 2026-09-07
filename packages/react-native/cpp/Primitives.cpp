@@ -276,7 +276,7 @@ jsi::Value createContactMessage(jsi::Runtime& rt,
   auto hasNonce = static_cast<uint32_t>(args[3].asNumber());
   uint64_t nonce = asU64(rt, args[4]);
   CreateContactMessageResult result = create_contact_message(
-      channelId, contactMode, transportProtocol.ptr, transportProtocol.len,
+      channelId, contactMode, transportProtocols.ptr, transportProtocols.len,
       hasNonce, nonce);
   if (result.error.code != 0) {
     throwDeRecError(rt, result.error);
@@ -395,7 +395,7 @@ jsi::Value producePairRequestMessage(jsi::Runtime& rt,
   ByteView communicationInfo = asBytes(rt, args[3]);
   ByteView parameterRange = asBytes(rt, args[4]);
   ProducePairRequestMessageResult result = produce_pair_request_message(
-      senderKind, transportProtocol.ptr, transportProtocol.len,
+      senderKind, transportProtocols.ptr, transportProtocols.len,
       contactMessage.ptr, contactMessage.len, communicationInfo.ptr,
       communicationInfo.len, parameterRange.ptr, parameterRange.len);
   if (result.error.code != 0) {
@@ -440,35 +440,41 @@ jsi::Value extractPairRequest(jsi::Runtime& rt,
 
 /// `produce_pair_response_message(channelId: bigint, requestProto:
 ///   ArrayBuffer, secretKeyMaterial: ArrayBuffer, communicationInfo:
-///   ArrayBuffer|null, parameterRange: ArrayBuffer|null) ->
-///   { response_wire_bytes, peer_transport_protocol, shared_key, channel_id }`
+///   ArrayBuffer|null, parameterRange: ArrayBuffer|null,
+///   unsafeConnection: boolean) ->
+///   { response_wire_bytes, peer_transports, shared_key, channel_id }`
+///
+/// `peer_transports` is a length-delimited sequence of encoded
+/// `TransportProtocol` messages — every endpoint the requester advertised,
+/// in its own order, filtered to those the library will record. It crosses
+/// this seam framed; the TypeScript layer decodes it.
 jsi::Value producePairResponseMessage(jsi::Runtime& rt,
                                       const jsi::Value&,
                                       const jsi::Value* args,
                                       size_t count) {
-  requireArgs(rt, "produce_pair_response_message", count, 5);
+  requireArgs(rt, "produce_pair_response_message", count, 6);
   uint64_t channelId = asU64(rt, args[0]);
   ByteView requestProto = asBytes(rt, args[1]);
   ByteView secretKeyMaterial = asBytes(rt, args[2]);
   ByteView communicationInfo = asBytes(rt, args[3]);
   ByteView parameterRange = asBytes(rt, args[4]);
+  uint32_t unsafeConnection = args[5].asBool() ? 1u : 0u;
   ProducePairResponseMessageResult result = produce_pair_response_message(
       channelId, requestProto.ptr, requestProto.len, secretKeyMaterial.ptr,
       secretKeyMaterial.len, communicationInfo.ptr, communicationInfo.len,
-      parameterRange.ptr, parameterRange.len);
+      parameterRange.ptr, parameterRange.len, unsafeConnection);
   if (result.error.code != 0) {
     throwDeRecError(rt, result.error);
   }
   std::vector<uint8_t> responseBytes = takeBuffer(result.response_wire_bytes);
-  std::vector<uint8_t> peerTransportProtocol =
-      takeBuffer(result.peer_transport_protocol);
+  std::vector<uint8_t> peerTransports = takeBuffer(result.peer_transports);
   std::vector<uint8_t> sharedKey = takeBuffer(result.shared_key);
   auto payload = jsi::Object(rt);
   payload.setProperty(rt, "response_wire_bytes",
                       toArrayBuffer(rt, responseBytes.data(), responseBytes.size()));
   payload.setProperty(
-      rt, "peer_transport_protocol",
-      toArrayBuffer(rt, peerTransportProtocol.data(), peerTransportProtocol.size()));
+      rt, "peer_transports",
+      toArrayBuffer(rt, peerTransports.data(), peerTransports.size()));
   payload.setProperty(rt, "shared_key",
                       toArrayBuffer(rt, sharedKey.data(), sharedKey.size()));
   payload.setProperty(rt, "channel_id",
@@ -525,17 +531,20 @@ jsi::Value processPairResponseMessage(jsi::Runtime& rt,
   return jsi::Value(rt, payload);
 }
 
-/// `produce_pre_pair_request_message(transportProtocol: ArrayBuffer,
+/// `produce_pre_pair_request_message(transportProtocols: ArrayBuffer,
 ///   contactMessage: ArrayBuffer) -> ArrayBuffer`
+///
+/// `transportProtocols` is a length-delimited sequence of encoded
+/// `TransportProtocol` messages in the scanner's preference order.
 jsi::Value producePrePairRequestMessage(jsi::Runtime& rt,
                                         const jsi::Value&,
                                         const jsi::Value* args,
                                         size_t count) {
   requireArgs(rt, "produce_pre_pair_request_message", count, 2);
-  ByteView transportProtocol = asBytes(rt, args[0]);
+  ByteView transportProtocols = asBytes(rt, args[0]);
   ByteView contactMessage = asBytes(rt, args[1]);
   ProducePrePairRequestMessageResult result = produce_pre_pair_request_message(
-      transportProtocol.ptr, transportProtocol.len, contactMessage.ptr,
+      transportProtocols.ptr, transportProtocols.len, contactMessage.ptr,
       contactMessage.len);
   if (result.error.code != 0) {
     throwDeRecError(rt, result.error);
@@ -1145,7 +1154,7 @@ void installPrimitives(jsi::Runtime& rt, jsi::Object& host) {
   bind(rt, host, "encode_message_json", 2, encodeMessageJson);
   bind(rt, host, "produce_pair_request_message", 5, producePairRequestMessage);
   bind(rt, host, "extract_pair_request", 2, extractPairRequest);
-  bind(rt, host, "produce_pair_response_message", 5, producePairResponseMessage);
+  bind(rt, host, "produce_pair_response_message", 7, producePairResponseMessage);
   bind(rt, host, "extract_pair_response", 2, extractPairResponse);
   bind(rt, host, "process_pair_response_message", 3, processPairResponseMessage);
   bind(rt, host, "produce_pre_pair_request_message", 2,

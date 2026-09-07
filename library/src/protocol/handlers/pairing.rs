@@ -36,6 +36,7 @@ use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp},
     primitives::pairing::{PairingError, request, response},
     protocol::utils::reserved_keys,
+    transport::AdvertisedEndpoints as _,
     types::ChannelId,
     utils::{ContactMessageExt as _, SenderKindExt as _},
 };
@@ -69,6 +70,7 @@ pub(in crate::protocol) async fn handle<
     inbound_trace_id: u64,
     replica_id: Option<u64>,
     parameter_range: Option<&derec_proto::ParameterRange>,
+    policy: crate::transport::TransportPolicy,
 ) -> Result<Vec<DeRecEvent>> {
     match message {
         MessageBody::PairRequest(request) => {
@@ -86,6 +88,7 @@ pub(in crate::protocol) async fn handle<
                     StatusEnum::IncompatibleParameterRange,
                     &err.to_string(),
                     inbound_trace_id,
+                    policy,
                 )
                 .await?;
                 return Err(err.into());
@@ -110,6 +113,7 @@ pub(in crate::protocol) async fn handle<
                         StatusEnum::ReplicaIdConflict,
                         "replica id already in use by a member of this group",
                         inbound_trace_id,
+                        policy,
                     )
                     .await?;
                     return Err(Error::ReplicaIdConflict {
@@ -129,6 +133,7 @@ pub(in crate::protocol) async fn handle<
                 pairing_secret,
                 replica_id,
                 parameter_range,
+                policy,
             )
             .await
         }
@@ -183,7 +188,7 @@ pub(in crate::protocol) async fn start<
     channel_store: &mut Ch,
     secret_store: &mut Ss,
     transport: &T,
-    own_transport: &TransportProtocol,
+    own_transports: &[TransportProtocol],
     communication_info: &HashMap<String, String>,
     secret_id: u64,
     kind: SenderKind,
@@ -191,30 +196,25 @@ pub(in crate::protocol) async fn start<
     peer_communication_info: HashMap<String, String>,
     replica_id: Option<u64>,
     parameter_range: Option<derec_proto::ParameterRange>,
+    policy: crate::transport::TransportPolicy,
 ) -> Result<u64> {
     let replica_id_to_inject = require_replica_id_for_kind(kind, replica_id)?;
 
     let channel_id = ChannelId(contact.channel_id);
 
-    let endpoint = contact
-        .transport_protocol
-        .clone()
-        .ok_or(Error::InvalidInput(
-            "contact message has no transport endpoint",
-        ))?;
-    let _ = crate::transport::TransportProtocol::try_from(&endpoint)?;
+    let endpoints = policy.admit_peer_endpoints(contact.advertised_endpoints())?;
 
     if contact.requires_pre_pair() {
         start_pre_pair(
             channel_store,
             secret_store,
             transport,
-            own_transport,
+            own_transports,
             secret_id,
             channel_id,
             contact,
             peer_communication_info,
-            endpoint,
+            endpoints,
             kind,
             replica_id,
         )
@@ -224,13 +224,13 @@ pub(in crate::protocol) async fn start<
             channel_store,
             secret_store,
             transport,
-            own_transport,
+            own_transports,
             communication_info,
             secret_id,
             channel_id,
             contact,
             peer_communication_info,
-            endpoint,
+            endpoints,
             kind,
             replica_id_to_inject,
             parameter_range,
@@ -298,7 +298,7 @@ pub(in crate::protocol) async fn accept<
     channel_store: &mut Ch,
     secret_store: &mut Ss,
     transport: &T,
-    own_transport: &TransportProtocol,
+    own_transports: &[TransportProtocol],
     communication_info: &HashMap<String, String>,
     secret_id: u64,
     channel_id: ChannelId,
@@ -307,6 +307,7 @@ pub(in crate::protocol) async fn accept<
     trace_id: u64,
     replica_id: Option<u64>,
     parameter_range: Option<derec_proto::ParameterRange>,
+    policy: crate::transport::TransportPolicy,
 ) -> Result<Vec<DeRecEvent>> {
     let replica_id_to_inject = require_replica_id_for_kind(kind, replica_id)?;
 
@@ -327,6 +328,7 @@ pub(in crate::protocol) async fn accept<
         &pairing_secret,
         comm_info,
         parameter_range,
+        policy,
     )?;
 
     let new_channel_id = resp.channel_id;
@@ -339,7 +341,7 @@ pub(in crate::protocol) async fn accept<
         )
         .await?;
 
-    let peer_transport = resp.peer_transport_protocol.clone();
+    let peer_transport = resp.peer_transports.clone();
 
     // The contact is still stored at this point — the transient material is
     // dropped further down — so the mode this pairing ran under is readable
@@ -372,13 +374,13 @@ pub(in crate::protocol) async fn accept<
     .await?;
 
     // The responder is a group member too, and only it knows its own id and
-    // endpoint. Without this row the roster it publishes would omit itself.
+    // endpoints. Without this row the roster it publishes would omit itself.
     if kind.is_replica() {
         persist_own_member(
             channel_store,
             secret_id,
             new_channel_id,
-            own_transport,
+            primary_own_transport(own_transports),
             kind,
             replica_id,
             status,
@@ -387,9 +389,7 @@ pub(in crate::protocol) async fn accept<
     }
 
     let envelope = super::apply_trace_id(resp.envelope, trace_id)?;
-    transport
-        .send(&resp.peer_transport_protocol, envelope)
-        .await?;
+    transport.send(&resp.peer_transports, envelope).await?;
 
     secret_store
         .remove(secret_id, channel_id, SecretKind::PairingSecret)
@@ -420,6 +420,10 @@ pub(in crate::protocol) async fn accept<
     ))
 }
 
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
 /// `accept` arm for [`PendingAction::PrePair`]. Branches on the stored
 /// contact's mode:
 ///
@@ -438,6 +442,7 @@ pub(in crate::protocol) async fn accept_pre_pair<Ss: DeRecSecretStore, T: DeRecT
     channel_id: ChannelId,
     request: &PrePairRequestMessage,
     trace_id: u64,
+    policy: crate::transport::TransportPolicy,
 ) -> Result<Vec<DeRecEvent>> {
     if let Some(SecretValue::PairingContact(contact)) = secret_store
         .load(secret_id, channel_id, SecretKind::PairingContact)
@@ -468,14 +473,19 @@ pub(in crate::protocol) async fn accept_pre_pair<Ss: DeRecSecretStore, T: DeRecT
             .await?;
 
         let envelope = super::apply_trace_id(result.envelope, trace_id)?;
-        let endpoint = request
-            .transport_protocol
-            .clone()
-            .ok_or(Error::InvalidInput(
-                "PrePair request missing transport endpoint",
-            ))?;
-        let _ = crate::transport::TransportProtocol::try_from(&endpoint)?;
-        transport.send(&endpoint, envelope).await?;
+        // Every endpoint the requester advertised, so a reply that cannot
+        // reach the first can fall back. Never empty: `validate` refuses a
+        // request naming none.
+        let endpoints = policy.admit_peer_endpoints(request.advertised_endpoints())?;
+        let endpoint = endpoints[0].clone();
+        // PrePair is plaintext and takes its own dispatch path, so it never
+        // passes the `peer_supplied_endpoints` funnel the encrypted paths
+        // run. This is the only point the policy can be applied to an
+        // endpoint the peer chose, and it is where the endpoint is dialled.
+        policy.check_peer(&endpoint)?;
+        transport
+            .send(std::slice::from_ref(&endpoint), envelope)
+            .await?;
 
         #[cfg(feature = "logging")]
         tracing::info!(
@@ -499,14 +509,15 @@ pub(in crate::protocol) async fn accept_pre_pair<Ss: DeRecSecretStore, T: DeRecT
     let result = response::produce_pre_pair(channel_id, request, &pairing_secret)?;
     let envelope = super::apply_trace_id(result.envelope, trace_id)?;
 
-    let endpoint = request
-        .transport_protocol
-        .clone()
-        .ok_or(Error::InvalidInput(
-            "PrePair request missing transport endpoint",
-        ))?;
-    let _ = crate::transport::TransportProtocol::try_from(&endpoint)?;
-    transport.send(&endpoint, envelope).await?;
+    // Same as the NoKeys branch: take every advertised endpoint, filtered.
+    let endpoints = policy.admit_peer_endpoints(request.advertised_endpoints())?;
+    let endpoint = endpoints[0].clone();
+    // Same gate as the NoKeys branch above: this plaintext path bypasses the
+    // `peer_supplied_endpoints` funnel, so the policy is applied here.
+    policy.check_peer(&endpoint)?;
+    transport
+        .send(std::slice::from_ref(&endpoint), envelope)
+        .await?;
 
     #[cfg(feature = "logging")]
     tracing::info!(
@@ -532,14 +543,9 @@ pub(in crate::protocol) async fn reject<Ss: DeRecSecretStore, T: DeRecTransport>
     status: StatusEnum,
     memo: &str,
     trace_id: u64,
+    policy: crate::transport::TransportPolicy,
 ) -> Result<()> {
-    let peer_transport_protocol = request
-        .transport_protocol
-        .clone()
-        .ok_or(Error::InvalidInput(
-            "pair request missing transport endpoint",
-        ))?;
-    let _ = crate::transport::TransportProtocol::try_from(&peer_transport_protocol)?;
+    let peer_transports = policy.admit_peer_endpoints(request.advertised_endpoints())?;
 
     let timestamp = current_timestamp();
 
@@ -564,7 +570,7 @@ pub(in crate::protocol) async fn reject<Ss: DeRecSecretStore, T: DeRecTransport>
         .build()?
         .encode_to_vec();
 
-    transport.send(&peer_transport_protocol, envelope).await?;
+    transport.send(&peer_transports, envelope).await?;
 
     secret_store
         .remove(secret_id, channel_id, SecretKind::PairingSecret)
@@ -576,6 +582,10 @@ pub(in crate::protocol) async fn reject<Ss: DeRecSecretStore, T: DeRecTransport>
     Ok(())
 }
 
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
 /// `reject` arm for [`PendingAction::PrePair`]. Builds a non-Ok
 /// `PrePairResponse` (no keys) and sends it to the scanner's `replyTo`.
 /// Does NOT load `PairingSecret` — rejection carries no crypto material.
@@ -587,14 +597,12 @@ pub(in crate::protocol) async fn reject_pre_pair<T: DeRecTransport>(
     status: StatusEnum,
     memo: &str,
     trace_id: u64,
+    policy: crate::transport::TransportPolicy,
 ) -> Result<()> {
-    let endpoint = request
-        .transport_protocol
-        .clone()
-        .ok_or(Error::InvalidInput(
-            "PrePair request missing transport endpoint",
-        ))?;
-    let _ = crate::transport::TransportProtocol::try_from(&endpoint)?;
+    // The rejection is dialled at a peer-chosen endpoint just like the
+    // acceptance, so it passes the same policy gate.
+    let endpoints = policy.admit_peer_endpoints(request.advertised_endpoints())?;
+    let endpoint = endpoints[0].clone();
 
     let timestamp = current_timestamp();
     let response = PrePairResponseMessage {
@@ -622,7 +630,9 @@ pub(in crate::protocol) async fn reject_pre_pair<T: DeRecTransport>(
     }
     .encode_to_vec();
 
-    transport.send(&endpoint, envelope).await?;
+    transport
+        .send(std::slice::from_ref(&endpoint), envelope)
+        .await?;
 
     #[cfg(feature = "logging")]
     tracing::info!(
@@ -663,7 +673,7 @@ pub(in crate::protocol) async fn on_pre_pair_response<
     channel_store: &mut Ch,
     secret_store: &mut Ss,
     transport: &T,
-    own_transport: &TransportProtocol,
+    own_transports: &[TransportProtocol],
     communication_info: &HashMap<String, String>,
     secret_id: u64,
     channel_id: ChannelId,
@@ -671,6 +681,7 @@ pub(in crate::protocol) async fn on_pre_pair_response<
     response: &PrePairResponseMessage,
     replica_id: Option<u64>,
     parameter_range: Option<derec_proto::ParameterRange>,
+    policy: crate::transport::TransportPolicy,
 ) -> Result<Vec<DeRecEvent>> {
     let processed = if original_contact.contact_mode == ContactMode::NoKeys as i32 {
         response::process_pre_pair_no_keys(original_contact, response)
@@ -758,7 +769,7 @@ pub(in crate::protocol) async fn on_pre_pair_response<
     let comm_info = build_communication_info(communication_info, replica_id_to_inject);
     let result = request::produce(
         local_kind,
-        own_transport.clone(),
+        own_transports.to_vec(),
         &filled_in_contact,
         comm_info,
         parameter_range,
@@ -779,14 +790,9 @@ pub(in crate::protocol) async fn on_pre_pair_response<
         )
         .await?;
 
-    let endpoint = original_contact
-        .transport_protocol
-        .clone()
-        .ok_or(Error::Invariant(
-            "stored contact missing transport_protocol on PrePair response",
-        ))?;
+    let endpoints = policy.admit_peer_endpoints(original_contact.advertised_endpoints())?;
     let envelope = super::apply_trace_id(result.envelope, super::fresh_trace_id())?;
-    transport.send(&endpoint, envelope).await?;
+    transport.send(&endpoints, envelope).await?;
 
     #[cfg(feature = "logging")]
     tracing::info!(
@@ -840,6 +846,7 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     pairing_secret: &PairingSecretKeyMaterial,
     replica_id: Option<u64>,
     parameter_range: Option<&derec_proto::ParameterRange>,
+    policy: crate::transport::TransportPolicy,
 ) -> Result<Vec<DeRecEvent>> {
     crate::primitives::pairing::parameter_range::check_compatibility(
         parameter_range,
@@ -929,15 +936,14 @@ async fn on_response<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
         });
     }
 
-    // The peer's endpoint comes from the contact we already loaded, so
-    // dropping the placeholder for replica pairings costs nothing.
-    let peer_transport = helper_placeholder
-        .as_ref()
-        .map(|p| p.transport.clone())
-        .or_else(|| contact.transport_protocol.clone())
-        .ok_or(Error::InvalidInput(
-            "no transport endpoint for the pairing peer",
-        ))?;
+    // The peer's endpoints come from the helper placeholder when one
+    // exists. A replica pairing has none, so it re-filters the contact we
+    // already loaded — dropping the placeholder for replica pairings costs
+    // nothing.
+    let peer_transport = match helper_placeholder.as_ref() {
+        Some(p) => p.transports.clone(),
+        None => policy.admit_peer_endpoints(contact.advertised_endpoints())?,
+    };
 
     let mut merged_info = helper_placeholder
         .as_ref()
@@ -1019,13 +1025,13 @@ async fn start_inlined_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRe
     channel_store: &mut Ch,
     secret_store: &mut Ss,
     transport: &T,
-    own_transport: &TransportProtocol,
+    own_transports: &[TransportProtocol],
     communication_info: &HashMap<String, String>,
     secret_id: u64,
     channel_id: ChannelId,
     contact: ContactMessage,
     peer_communication_info: HashMap<String, String>,
-    endpoint: TransportProtocol,
+    endpoints: Vec<TransportProtocol>,
     kind: SenderKind,
     replica_id_to_inject: Option<u64>,
     parameter_range: Option<derec_proto::ParameterRange>,
@@ -1035,7 +1041,7 @@ async fn start_inlined_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRe
     let comm_info = build_communication_info(communication_info, replica_id_to_inject);
     let result = request::produce(
         kind,
-        own_transport.clone(),
+        own_transports.to_vec(),
         &contact,
         comm_info,
         parameter_range,
@@ -1060,8 +1066,8 @@ async fn start_inlined_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRe
         channel_store,
         secret_id,
         channel_id,
-        endpoint.clone(),
-        own_transport,
+        endpoints.clone(),
+        primary_own_transport(own_transports),
         peer_communication_info,
         kind,
         replica_id_to_inject,
@@ -1072,7 +1078,7 @@ async fn start_inlined_keys<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRe
     tracing::info!("pairing request sent");
 
     let envelope = super::apply_trace_id(result.envelope, super::fresh_trace_id())?;
-    transport.send(&endpoint, envelope).await?;
+    transport.send(&endpoints, envelope).await?;
 
     Ok(channel_id.0)
 }
@@ -1082,18 +1088,18 @@ async fn start_pre_pair<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRecTra
     channel_store: &mut Ch,
     secret_store: &mut Ss,
     transport: &T,
-    own_transport: &TransportProtocol,
+    own_transports: &[TransportProtocol],
     secret_id: u64,
     channel_id: ChannelId,
     contact: ContactMessage,
     peer_communication_info: HashMap<String, String>,
-    endpoint: TransportProtocol,
+    endpoints: Vec<TransportProtocol>,
     kind: SenderKind,
     replica_id: Option<u64>,
 ) -> Result<u64> {
     reject_start_on_paired_channel(channel_store, secret_id, channel_id).await?;
 
-    let result = request::produce_pre_pair_request(own_transport.clone(), &contact)?;
+    let result = request::produce_pre_pair_request(own_transports.to_vec(), &contact)?;
 
     secret_store
         .save(secret_id, channel_id, SecretValue::PairingContact(contact))
@@ -1103,8 +1109,8 @@ async fn start_pre_pair<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRecTra
         channel_store,
         secret_id,
         channel_id,
-        endpoint.clone(),
-        own_transport,
+        endpoints.clone(),
+        primary_own_transport(own_transports),
         peer_communication_info,
         kind,
         replica_id,
@@ -1115,7 +1121,7 @@ async fn start_pre_pair<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRecTra
     tracing::info!("PrePair request sent (scanner side)");
 
     let envelope = super::apply_trace_id(result.envelope, super::fresh_trace_id())?;
-    transport.send(&endpoint, envelope).await?;
+    transport.send(&endpoints, envelope).await?;
 
     Ok(channel_id.0)
 }
@@ -1225,6 +1231,29 @@ fn is_reserved_key(key: &str) -> bool {
     key.starts_with("derec.")
 }
 
+/// This device's most-preferred endpoints — the first entry of
+/// `own_transports` — mirroring
+/// [`DeRecProtocol::first_own_transport`](crate::protocol::DeRecProtocol::first_own_transport)
+/// for the free functions in this module, which have no `self` to call it
+/// on.
+fn primary_own_transport(own_transports: &[TransportProtocol]) -> &TransportProtocol {
+    &own_transports[0]
+}
+
+/// The own endpoints to hand a peer we have chosen to reach at `selected`.
+///
+/// Selection decides which of the peer's endpoints this side sends to; it says
+/// nothing about which of this side's endpoints the peer can send back to.
+/// Delivery is push-only in both directions, so an endpoints advertised over a
+/// transport the peer does not speak is undeliverable — the response simply
+/// never arrives, with no error on either side.
+///
+/// `selected` was chosen because the peer serves that protocol, which makes it
+/// the best available evidence of what the peer can also dial. Advertising the
+/// own entry matching it keeps the return leg on the same transport as the
+/// outbound one. When this application serves no entry of that protocol the
+/// primary endpoints stands, which is the behaviour of a single-transport
+/// deployment.
 fn pair_completion_events(
     channel_id: ChannelId,
     pairing_channel_id: ChannelId,
@@ -1293,7 +1322,7 @@ async fn persist_peer_record<Ch: DeRecChannelStore>(
     channel_store: &mut Ch,
     secret_id: u64,
     channel_id: ChannelId,
-    transport: TransportProtocol,
+    transports: Vec<TransportProtocol>,
     communication_info: HashMap<String, String>,
     peer_kind: SenderKind,
     peer_replica_id: Option<u64>,
@@ -1310,7 +1339,7 @@ async fn persist_peer_record<Ch: DeRecChannelStore>(
             ChannelRecord::Replica(ReplicaMember {
                 channel_id,
                 replica_id,
-                transport,
+                transports,
                 communication_info,
                 role,
                 status,
@@ -1319,7 +1348,7 @@ async fn persist_peer_record<Ch: DeRecChannelStore>(
         }
         None => ChannelRecord::Helper(HelperChannel {
             channel_id,
-            transport,
+            transports,
             communication_info,
             peer_role: peer_kind,
             status,
@@ -1405,7 +1434,7 @@ async fn persist_start_record<Ch: DeRecChannelStore>(
     channel_store: &mut Ch,
     secret_id: u64,
     channel_id: ChannelId,
-    peer_endpoint: TransportProtocol,
+    peer_endpoints: Vec<TransportProtocol>,
     own_transport: &TransportProtocol,
     peer_communication_info: HashMap<String, String>,
     own_kind: SenderKind,
@@ -1429,7 +1458,7 @@ async fn persist_start_record<Ch: DeRecChannelStore>(
             secret_id,
             ChannelRecord::Helper(HelperChannel {
                 channel_id,
-                transport: peer_endpoint,
+                transports: peer_endpoints,
                 communication_info: peer_communication_info,
                 peer_role: own_kind.counterparty(),
                 status: ChannelStatus::Pending,
@@ -1489,7 +1518,7 @@ async fn persist_own_member<Ch: DeRecChannelStore>(
             ChannelRecord::Replica(ReplicaMember {
                 channel_id,
                 replica_id,
-                transport: own_transport.clone(),
+                transports: vec![own_transport.clone()],
                 communication_info: HashMap::new(),
                 role,
                 status,
@@ -1675,6 +1704,44 @@ mod tests {
         );
     }
 
+    /// Selection picks which of the peer's endpoints we send to; this picks
+    /// A PrePair request carries exactly one endpoint on the wire, so this
+    /// side has to name one of its own. It names the first of its configured
+    /// preference order — the application's stated preference — rather than
+    /// matching the peer's, because there is no longer a "the peer's
+    /// protocol" to match: the peer's whole offer set is recorded and the
+    /// choice of which to dial is the application's.
+    #[test]
+    fn prepair_advertises_the_first_configured_own_endpoint() {
+        let own = [
+            TransportProtocol {
+                uri: "grpcs://me.example:443".to_owned(),
+                protocol: derec_proto::Protocol::Grpc as i32,
+            },
+            TransportProtocol {
+                uri: "https://me.example/derec".to_owned(),
+                protocol: derec_proto::Protocol::Https as i32,
+            },
+        ];
+
+        assert_eq!(
+            primary_own_transport(&own).uri,
+            "grpcs://me.example:443",
+            "the caller's order decides which single endpoint PrePair advertises"
+        );
+    }
+
+    /// A single-transport deployment has exactly one answer.
+    #[test]
+    fn prepair_advertises_the_sole_endpoint_when_only_one_is_served() {
+        let own = [TransportProtocol {
+            uri: "https://me.example/derec".to_owned(),
+            protocol: derec_proto::Protocol::Https as i32,
+        }];
+
+        assert_eq!(primary_own_transport(&own).uri, "https://me.example/derec");
+    }
+
     #[test]
     fn require_replica_id_for_kind_passes_through_for_replica() {
         assert_eq!(
@@ -1735,10 +1802,10 @@ mod tests {
     fn fake_channel(status: ChannelStatus, peer_role: SenderKind) -> ChannelRecord {
         ChannelRecord::Helper(HelperChannel {
             channel_id: ChannelId(1),
-            transport: TransportProtocol {
+            transports: vec![TransportProtocol {
                 uri: "https://example.com".to_owned(),
                 protocol: 0,
-            },
+            }],
             communication_info: HashMap::new(),
             status,
             created_at: 1_700_000_000,
@@ -1827,6 +1894,10 @@ mod prepair_record_shape_tests {
         }
     }
 
+    fn endpoints() -> Vec<TransportProtocol> {
+        vec![endpoint()]
+    }
+
     /// `start` records a replica scanner as its own roster row, not as a
     /// helper channel, so the PrePair-response handler has to resolve the
     /// local sender kind from either shape.
@@ -1841,7 +1912,7 @@ mod prepair_record_shape_tests {
                 &mut channels,
                 SECRET_ID,
                 CHANNEL,
-                endpoint(),
+                endpoints(),
                 &endpoint(),
                 std::collections::HashMap::new(),
                 SenderKind::ReplicaDestination,
@@ -1896,7 +1967,7 @@ mod prepair_record_shape_tests {
                 &mut channels,
                 SECRET_ID,
                 CHANNEL,
-                endpoint(),
+                endpoints(),
                 &endpoint(),
                 std::collections::HashMap::new(),
                 SenderKind::Owner,
@@ -1921,7 +1992,7 @@ mod prepair_record_shape_tests {
             let _ = ChannelRecord::Replica(ReplicaMember {
                 channel_id: CHANNEL,
                 replica_id: ReplicaId(OWN_REPLICA),
-                transport: endpoint(),
+                transports: endpoints(),
                 communication_info: std::collections::HashMap::new(),
                 role: crate::protocol::types::ReplicaRole::Destination,
                 status: ChannelStatus::Pending,
@@ -1996,10 +2067,10 @@ mod replica_id_conflict_tests {
                 ChannelRecord::Replica(ReplicaMember {
                     channel_id,
                     replica_id: ReplicaId(id),
-                    transport: derec_proto::TransportProtocol {
+                    transports: vec![derec_proto::TransportProtocol {
                         uri: "https://peer.example".to_owned(),
                         protocol: derec_proto::Protocol::Https as i32,
-                    },
+                    }],
                     communication_info: std::collections::HashMap::new(),
                     role: ReplicaRole::Source,
                     status: ChannelStatus::Paired,
@@ -2115,6 +2186,146 @@ mod replica_id_conflict_tests {
                     .expect("load")
                     .is_none(),
                 "the pairing secret must not survive an abandoned handshake"
+            );
+        });
+    }
+
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+    #[allow(deprecated)]
+    /// `accept()` must select from the requester's `supportedTransports`
+    /// offer list, not trust its legacy singular field outright. The peer
+    /// here advertises HTTPS as its singular field — structurally valid,
+    /// so the old code accepted it without complaint — but also offers
+    /// gRPCS, which is the only protocol this responder actually serves.
+    #[test]
+    fn accept_offers_the_transport_every_advertised_endpoint() {
+        use super::accept;
+        use crate::primitives::pairing::request;
+        use crate::protocol::test::{
+            InMemChannelStore, InMemSecretStore, RecordingTransport, run_async,
+        };
+        use crate::protocol::{DeRecSecretStore, PairingKeyMaterial, SecretValue};
+        use crate::types::ChannelId;
+        use derec_proto::{ContactMode, Protocol, SenderKind, TransportProtocol};
+        use std::collections::HashMap;
+
+        run_async(async {
+            let channel_id = ChannelId(0xACCE_9701);
+            let secret_id = 0x60A7;
+
+            let request::CreateContactResult {
+                contact_message,
+                secret_key,
+            } = request::create_contact(
+                channel_id,
+                ContactMode::InlineKeys,
+                vec![TransportProtocol {
+                    uri: "https://initiator.example/derec".to_owned(),
+                    protocol: Protocol::Https as i32,
+                }],
+                None,
+            )
+            .expect("create_contact");
+            let initiator_secret = secret_key.expect("InlineKeys always returns key material");
+
+            // Built through the real crypto path so the request decrypts
+            // and finalizes normally; only the transport fields are then
+            // overwritten to the scenario under test.
+            let request::ProduceResult {
+                envelope: request_envelope,
+                ..
+            } = request::produce(
+                SenderKind::Helper,
+                vec![TransportProtocol {
+                    uri: "https://peer.example.com/derec".to_owned(),
+                    protocol: Protocol::Https as i32,
+                }],
+                &contact_message,
+                None,
+                None,
+            )
+            .expect("produce");
+
+            let request::ExtractResult {
+                request: mut pair_request,
+            } = request::extract(&request_envelope, initiator_secret.ecies_secret_key())
+                .expect("extract");
+
+            pair_request.transport_protocol = Some(TransportProtocol {
+                uri: "https://peer.example.com/derec".to_owned(),
+                protocol: Protocol::Https as i32,
+            });
+            pair_request.supported_transports = vec![
+                TransportProtocol {
+                    uri: "https://peer.example.com/derec".to_owned(),
+                    protocol: Protocol::Https as i32,
+                },
+                TransportProtocol {
+                    uri: "grpcs://peer.example.com:443".to_owned(),
+                    protocol: Protocol::Grpc as i32,
+                },
+            ];
+
+            let mut channel_store = InMemChannelStore::default();
+            let mut secret_store = InMemSecretStore::default();
+            secret_store
+                .save(
+                    secret_id,
+                    channel_id,
+                    SecretValue::PairingSecret(PairingKeyMaterial::from_secret(&initiator_secret)),
+                )
+                .await
+                .expect("save pairing secret");
+            let transport = RecordingTransport::default();
+
+            // This responder serves only gRPCS.
+            let own_transports = vec![TransportProtocol {
+                uri: "grpcs://me.example.com:443".to_owned(),
+                protocol: Protocol::Grpc as i32,
+            }];
+            let policy = crate::transport::TransportPolicy::new(false);
+
+            accept(
+                &mut channel_store,
+                &mut secret_store,
+                &transport,
+                &own_transports,
+                &HashMap::new(),
+                secret_id,
+                channel_id,
+                &pair_request,
+                SenderKind::Owner,
+                0,
+                None,
+                None,
+                policy,
+            )
+            .await
+            .expect(
+                "accept must select the servable gRPCS offer, not the unservable \
+                 HTTPS singular field",
+            );
+
+            // The library must hand the transport everything the peer
+            // advertised, in the peer's order — not narrow it to the singular
+            // legacy field. Which of these to dial is the application's call,
+            // so this asserts what was *offered*, not what was chosen.
+            assert_eq!(
+                transport.sent_endpoint_sets(),
+                vec![vec![
+                    derec_proto::TransportProtocol {
+                        uri: "https://peer.example.com/derec".to_owned(),
+                        protocol: Protocol::Https as i32,
+                    },
+                    derec_proto::TransportProtocol {
+                        uri: "grpcs://peer.example.com:443".to_owned(),
+                        protocol: Protocol::Grpc as i32,
+                    },
+                ]],
+                "accept() must offer the transport every endpoint the peer \
+                 advertised, not just its singular legacy field"
             );
         });
     }

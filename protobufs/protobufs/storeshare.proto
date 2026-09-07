@@ -136,25 +136,31 @@ message StoreShareRequestMessage {
   // Used for observability, replay detection, and timeout handling.
   google.protobuf.Timestamp timestamp = 7;
 
-  // Ephemeral transport endpoint at which the requester wants to receive
-  // the response to *this exchange*, overriding the channel's stored peer
-  // endpoint for this round-trip only.
+  // Ephemeral transport endpoints at which the requester wants to receive
+  // the response to *this exchange*, in its own preference order,
+  // overriding the channel's stored peer endpoints for this round-trip
+  // only.
   //
   // # When to use
   //
   // Set when the requester's outbound endpoint does not match the endpoint
   // the responder has on file for the channel — for example a replica
   // talking to a helper that was paired with a sibling replica. The
-  // responder routes the response to `replyTo` but does NOT persist this
-  // endpoint; use `UpdateChannelInfoRequestMessage` for permanent changes.
+  // responder routes the response here but does NOT persist these
+  // endpoints; use `UpdateChannelInfoRequestMessage` for permanent changes.
   //
   // # Semantics
   //
-  // - Absent (the default): the responder routes to the endpoint stored on
+  // - Empty (the default): the responder routes to the endpoints stored on
   //  its `Channel` record for this `channelId`.
-  // - Present: the responder routes this exchange's response to this
-  //  endpoint and leaves the stored endpoint unchanged.
-  optional TransportProtocol replyTo = 8;
+  // - Non-empty: the responder routes this exchange's response to any one
+  //  of these, in the order given, and leaves the stored endpoints
+  //  unchanged. Delivery to any one is success.
+  //
+  // Was a singular field through 0.0.2. A 0.0.2 reader decoding a
+  // multi-entry list merges them and sees only the last, so an
+  // application still talking to one should order accordingly.
+  repeated TransportProtocol replyTo = 8;
 
   // Identity of the replica that authored this update.
   //

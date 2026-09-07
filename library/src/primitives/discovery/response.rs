@@ -383,6 +383,7 @@ pub fn process(
         "GetSecretIdsVersionsResponseMessage is missing result field",
     ))?;
 
+    // TODO: result.validate()?
     if result.status != StatusEnum::Ok as i32 {
         #[cfg(feature = "logging")]
         tracing::warn!(status = result.status, memo = %result.memo, "discovery response status is not Ok");

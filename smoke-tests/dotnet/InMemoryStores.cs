@@ -8,6 +8,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
+using DeRec.Library;
 using DeRec.Library.Orchestrator;
 
 namespace DeRec.Bindings.Smoke;
@@ -208,8 +209,18 @@ internal sealed class RecordingTransport : ITransport
 {
     public readonly List<(string Uri, int Protocol, byte[] Bytes)> Outbox = new();
 
-    public void Send(string uri, int protocol, byte[] message) =>
-        Outbox.Add((uri, protocol, message));
+    /// <summary>
+    /// The library hands over every endpoint the peer advertised, filtered
+    /// but unranked, and delivery to any one of them is success. A real
+    /// transport would try them in order and fall back; recording the first
+    /// is enough for an in-memory double.
+    /// </summary>
+    public void Send(IReadOnlyList<TransportProtocol> endpoints, byte[] message)
+    {
+        if (endpoints.Count == 0)
+            throw new InvalidOperationException("transport: Send called with no endpoints");
+        Outbox.Add((endpoints[0].Uri, (int)endpoints[0].Protocol, message));
+    }
 
     public List<(string Uri, int Protocol, byte[] Bytes)> DrainAll()
     {

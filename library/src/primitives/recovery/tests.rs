@@ -135,7 +135,7 @@ fn create_store_share_request_envelope(
         version_description: String::new(),
         timestamp: Some(timestamp),
         secret_id: 1,
-        reply_to: None,
+        reply_to: Vec::new(),
         replica_id: None,
     };
 
@@ -159,7 +159,7 @@ fn test_produce_get_share_response_message_empty_committed_share() {
 
     let ProduceGetShareRequestMessageResult {
         envelope: request_envelope,
-    } = produce_get_share_request_message(channel_id, secret_id, version, &shared_key, None)
+    } = produce_get_share_request_message(channel_id, secret_id, version, &shared_key, &[])
         .expect("request generation should succeed");
 
     let ExtractGetShareRequestResult { request } =
@@ -449,7 +449,7 @@ fn test_produce_get_share_response_message_request_timestamp_mismatch() {
         secret_id,
         version,
         timestamp: Some(message_timestamp),
-        reply_to: None,
+        reply_to: Vec::new(),
         replica_id: None,
     };
 
@@ -482,7 +482,7 @@ fn test_produce_get_share_response_message_stored_share_timestamp_mismatch() {
 
     let ProduceGetShareRequestMessageResult {
         envelope: request_envelope,
-    } = produce_get_share_request_message(channel_id, secret_id, version, &shared_key, None)
+    } = produce_get_share_request_message(channel_id, secret_id, version, &shared_key, &[])
         .expect("request generation should succeed");
 
     let ExtractGetShareRequestResult { request } =
@@ -501,7 +501,7 @@ fn test_produce_get_share_response_message_stored_share_timestamp_mismatch() {
         version_description: String::new(),
         timestamp: Some(message_timestamp),
         secret_id,
-        reply_to: None,
+        reply_to: Vec::new(),
         replica_id: None,
     };
 
@@ -558,7 +558,7 @@ fn test_produce_get_share_response_message_secret_id_mismatch() {
         requested_secret_id,
         version,
         &shared_key,
-        None,
+        &[],
     )
     .expect("request generation should succeed");
 
@@ -604,7 +604,7 @@ fn test_produce_get_share_response_message_version_mismatch() {
         secret_id,
         requested_version,
         &shared_key,
-        None,
+        &[],
     )
     .expect("request generation should succeed");
 
@@ -653,7 +653,7 @@ fn test_recovery_end_to_end() {
     for channel_id in &channel_ids {
         let ProduceGetShareRequestMessageResult {
             envelope: request_envelope,
-        } = produce_get_share_request_message(*channel_id, secret_id, version, &shared_key, None)
+        } = produce_get_share_request_message(*channel_id, secret_id, version, &shared_key, &[])
             .expect("produce_get_share_request_message should succeed");
 
         let ExtractGetShareRequestResult { request } =
@@ -673,7 +673,7 @@ fn test_recovery_end_to_end() {
             version_description: String::new(),
             timestamp: Some(timestamp),
             secret_id,
-            reply_to: None,
+            reply_to: Vec::new(),
             replica_id: None,
         };
         let stored_share_envelope = DeRecMessageBuilder::channel()
@@ -733,9 +733,14 @@ fn test_extract_get_share_request_rejects_scheme_mismatched_reply_to() {
         protocol: derec_proto::Protocol::Https as i32,
     };
 
-    let ProduceGetShareRequestMessageResult { envelope } =
-        produce_get_share_request_message(channel_id, 1, 1, &shared_key, Some(malicious_reply_to))
-            .expect("failed to produce get share request");
+    let ProduceGetShareRequestMessageResult { envelope } = produce_get_share_request_message(
+        channel_id,
+        1,
+        1,
+        &shared_key,
+        std::slice::from_ref(&malicious_reply_to),
+    )
+    .expect("failed to produce get share request");
 
     let result = extract_get_share_request(&envelope, &shared_key);
 

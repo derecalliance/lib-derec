@@ -94,6 +94,7 @@ public sealed class DeRecProtocol : IDisposable
         ITransport transport,
         string ownTransportUri,
         string ownTransportProtocol = "https",
+        IReadOnlyList<TransportProtocol>? ownTransports = null,
         int threshold = 3,
         int keepVersionsCount = 3,
         Dictionary<string, string>? communicationInfo = null,
@@ -103,7 +104,8 @@ public sealed class DeRecProtocol : IDisposable
         AutoAcceptPolicy? autoAccept = null,
         ulong? replicaId = null,
         Timeouts? timeouts = null,
-        bool unsafeHttp = false)
+        bool? unsafeHttp = null,
+        bool? unsafeConnection = null)
     {
         SecretId = secretId;
         _channelStore = channelStore;
@@ -205,17 +207,26 @@ public sealed class DeRecProtocol : IDisposable
         int ownProtocolNum = ownTransportProtocol.ToLowerInvariant() switch
         {
             "https" => 0,
+            "grpc" => 1,
             _ => throw new ArgumentException($"unknown protocol: {ownTransportProtocol}", nameof(ownTransportProtocol)),
         };
 
         byte[]? commInfoBytes = null;
         UIntPtr commInfoLen = UIntPtr.Zero;
 
+        // `own_transports` takes precedence over the scalar
+        // `own_transport_uri` / `own_transport_protocol` fields on the
+        // Rust side when non-empty; order is preserved verbatim.
+        List<TransportOfferDto>? ownTransportsDto = ownTransports is { Count: > 0 }
+            ? ownTransports.Select(t => new TransportOfferDto(t.Uri, (int)t.Protocol)).ToList()
+            : null;
+
         var policy = autoAccept ?? new AutoAcceptPolicy();
         var config = new ProtocolConfigDto(
             SecretId: secretId.ToString(System.Globalization.CultureInfo.InvariantCulture),
             OwnTransportUri: ownTransportUri,
             OwnTransportProtocol: ownProtocolNum,
+            OwnTransports: ownTransportsDto,
             Threshold: (uint)threshold,
             KeepVersionsCount: (uint)keepVersionsCount,
             AutoRespondOnFailure: autoRespondOnFailure,
@@ -242,6 +253,7 @@ public sealed class DeRecProtocol : IDisposable
                             Enabled: timeouts.ExpiredChannels.Enabled,
                             TimeoutInSecs: timeouts.ExpiredChannels.TimeoutInSecs)),
             UnsafeHttp: unsafeHttp,
+            UnsafeConnection: unsafeConnection,
             ReplicaId: replicaId?.ToString(System.Globalization.CultureInfo.InvariantCulture));
         byte[] configJsonBytes = JsonSerializer.SerializeToUtf8Bytes(config, JsonOpts);
 
@@ -598,6 +610,7 @@ public sealed class DeRecProtocol : IDisposable
         int protocolNum = protocol.ToLowerInvariant() switch
         {
             "https" => 0,
+            "grpc" => 1,
             _ => throw new ArgumentException($"unknown protocol: {protocol}", nameof(protocol)),
         };
         byte[] uriBytes = Encoding.UTF8.GetBytes(uri);
@@ -647,7 +660,7 @@ public sealed class DeRecProtocol : IDisposable
 
     private static HelperChannelDto ToDto(HelperChannel h) => new(
         h.ChannelId,
-        new TransportDto(h.Transport.Uri, (int)h.Transport.Protocol),
+        h.Transports.Select(t => new TransportDto(t.Uri, (int)t.Protocol)).ToList(),
         h.CommunicationInfo,
         h.PeerRole.ToString(),
         h.Status.ToString(),
@@ -656,7 +669,7 @@ public sealed class DeRecProtocol : IDisposable
     private static ReplicaMemberDto ToDto(ReplicaMember m) => new(
         m.ChannelId,
         m.ReplicaId,
-        new TransportDto(m.Transport.Uri, (int)m.Transport.Protocol),
+        m.Transports.Select(t => new TransportDto(t.Uri, (int)t.Protocol)).ToList(),
         m.CommunicationInfo,
         m.Role.ToString(),
         m.Status.ToString(),
@@ -664,7 +677,7 @@ public sealed class DeRecProtocol : IDisposable
 
     private static HelperChannel FromDto(HelperChannelDto d) => new(
         d.channel_id,
-        new TransportProtocol(d.transport.uri, (Protocol)d.transport.protocol),
+        d.transports.Select(t => new TransportProtocol(t.uri, (Protocol)t.protocol)).ToList(),
         d.communication_info ?? new(),
         Enum.Parse<ChannelStatus>(d.status ?? nameof(ChannelStatus.Paired)),
         d.created_at,
@@ -673,7 +686,7 @@ public sealed class DeRecProtocol : IDisposable
     private static ReplicaMember FromDto(ReplicaMemberDto d) => new(
         d.channel_id,
         d.replica_id,
-        new TransportProtocol(d.transport.uri, (Protocol)d.transport.protocol),
+        d.transports.Select(t => new TransportProtocol(t.uri, (Protocol)t.protocol)).ToList(),
         d.communication_info ?? new(),
         Enum.Parse<ReplicaRole>(d.role),
         Enum.Parse<ChannelStatus>(d.status ?? nameof(ChannelStatus.Paired)),
@@ -1185,16 +1198,15 @@ public sealed class DeRecProtocol : IDisposable
 
     private sealed record ShareRecordDto(string secret_id, uint version, byte[] bytes);
 
-    private int TransportSendImpl(IntPtr userData, IntPtr uriPtr, UIntPtr uriLen, int protocol, IntPtr bytes, UIntPtr len)
+    private int TransportSendImpl(IntPtr userData, IntPtr endpointsPtr, UIntPtr endpointsLen, IntPtr bytes, UIntPtr len)
     {
         try
         {
-            byte[] uriBuf = new byte[(int)uriLen];
-            Marshal.Copy(uriPtr, uriBuf, 0, uriBuf.Length);
-            string uri = Encoding.UTF8.GetString(uriBuf);
+            byte[] framed = new byte[(int)endpointsLen];
+            Marshal.Copy(endpointsPtr, framed, 0, framed.Length);
             byte[] msg = new byte[(int)len];
             Marshal.Copy(bytes, msg, 0, msg.Length);
-            _transport.Send(uri, protocol, msg);
+            _transport.Send(TransportProtocol.FromProtoBytesList(framed), msg);
             return 0;
         }
         catch { return -1; }
@@ -1214,7 +1226,7 @@ public sealed class DeRecProtocol : IDisposable
 
     private sealed record HelperChannelDto(
         ulong channel_id,
-        TransportDto transport,
+        List<TransportDto> transports,
         Dictionary<string, string>? communication_info,
         string peer_role,
         string? status,
@@ -1223,7 +1235,7 @@ public sealed class DeRecProtocol : IDisposable
     private sealed record ReplicaMemberDto(
         ulong channel_id,
         ulong replica_id,
-        TransportDto transport,
+        List<TransportDto> transports,
         Dictionary<string, string>? communication_info,
         string role,
         string? status,
@@ -1242,10 +1254,14 @@ public sealed class DeRecProtocol : IDisposable
     // the round trip through System.Text.Json without precision loss.
     // `ReplicaId` is omitted entirely (not `null`) when there is no
     // replica id, per `JsonOpts`'s `WhenWritingNull` ignore condition.
+    // `UnsafeHttp`/`UnsafeConnection` rely on the same ignore condition:
+    // absence is meaningful there too, since Rust's conflict rule between
+    // the two flags only applies when a flag is actually present.
     private sealed record ProtocolConfigDto(
         [property: JsonPropertyName("secret_id")] string SecretId,
         [property: JsonPropertyName("own_transport_uri")] string OwnTransportUri,
         [property: JsonPropertyName("own_transport_protocol")] int OwnTransportProtocol,
+        [property: JsonPropertyName("own_transports")] List<TransportOfferDto>? OwnTransports,
         [property: JsonPropertyName("threshold")] uint Threshold,
         [property: JsonPropertyName("keep_versions_count")] uint KeepVersionsCount,
         [property: JsonPropertyName("auto_respond_on_failure")] bool AutoRespondOnFailure,
@@ -1253,8 +1269,16 @@ public sealed class DeRecProtocol : IDisposable
         [property: JsonPropertyName("auto_reply_to")] bool AutoReplyTo,
         [property: JsonPropertyName("auto_accept")] AutoAcceptConfigDto AutoAccept,
         [property: JsonPropertyName("timeouts")] TimeoutsConfigDto? Timeouts,
-        [property: JsonPropertyName("unsafe_http")] bool UnsafeHttp,
+        [property: JsonPropertyName("unsafe_http")] bool? UnsafeHttp,
+        [property: JsonPropertyName("unsafe_connection")] bool? UnsafeConnection,
         [property: JsonPropertyName("replica_id")] string? ReplicaId);
+
+    // One entry of `ProtocolConfigDto.OwnTransports`. Field-for-field
+    // equivalent of Rust `OwnTransportConfig` — `Protocol` is the
+    // `derec_proto::Protocol` `i32` discriminant, not a URI scheme.
+    private sealed record TransportOfferDto(
+        [property: JsonPropertyName("uri")] string Uri,
+        [property: JsonPropertyName("protocol")] int Protocol);
 
     // Field-for-field equivalent of Rust `RemoveExpiredChannelsConfig`.
     // Both fields are always serialized, including when Enabled is false —

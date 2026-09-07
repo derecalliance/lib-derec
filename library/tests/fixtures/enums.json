@@ -373,7 +373,7 @@
     },
     "StatusEnum": {
       "encoding": "number",
-      "note": "protobuf result status; 12 is deliberately unassigned",
+      "note": "protobuf result status",
       "variants": [
         {
           "name": "Ok",
@@ -422,6 +422,10 @@
         {
           "name": "IncompatibleParameterRange",
           "wire": 11
+        },
+        {
+          "name": "UnsupportedTransportProtocol",
+          "wire": 12
         },
         {
           "name": "VersionConflict",

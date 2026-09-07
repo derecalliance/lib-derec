@@ -148,13 +148,26 @@ message PairRequestMessage {
   //
   // After pairing, the responder uses this information to send responses
   // and all subsequent protocol messages to the initiator.
-  TransportProtocol transportProtocol = 8;
+  // Deprecated: superseded by `supportedTransports`, which carries every
+  // endpoint rather than one. Kept so implementations predating that field
+  // still pair. **Scheduled for removal in v0.0.5.** A sender populating
+  // `supportedTransports` MUST also set this to a single
+  // best-compatibility choice until then.
+  TransportProtocol transportProtocol = 8 [deprecated = true];
 
   // Timestamp indicating when this message was created.
   //
   // Used for observability and may assist in replay detection or timeout
   // handling, depending on the implementation.
   google.protobuf.Timestamp timestamp = 9;
+
+  // Every transport endpoint the initiator can be reached on, in the
+  // initiator's own preference order.
+  //
+  // Same semantics as `ContactMessage.supportedTransports`: the responder
+  // selects by its own preference, and absent means "only
+  // `transportProtocol` is offered".
+  repeated TransportProtocol supportedTransports = 10;
 }
 
 // PairResponseMessage is the response to a PairRequestMessage.

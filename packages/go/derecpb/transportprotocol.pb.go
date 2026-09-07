@@ -39,15 +39,29 @@ const (
 	// /
 	// / This is the default and currently required transport.
 	Protocol_HTTPS Protocol = 0
+	// / gRPC-based transport.
+	// /
+	// / Messages are delivered as unary `DeRecTransport.Send` calls carrying a
+	// / `DeRecMessage` directly. Delivery is push-only: the call returns
+	// / `google.protobuf.Empty`, and every response is a fresh `Send` to the
+	// / peer's own endpoint, so both parties must run a reachable server.
+	// /
+	// / URI forms:
+	// /
+	// / - `grpcs://host:port` — gRPC over TLS
+	// / - `grpc://host:port` — plaintext, development only
+	Protocol_GRPC Protocol = 1
 )
 
 // Enum value maps for Protocol.
 var (
 	Protocol_name = map[int32]string{
 		0: "HTTPS",
+		1: "GRPC",
 	}
 	Protocol_value = map[string]int32{
 		"HTTPS": 0,
+		"GRPC":  1,
 	}
 )
 
@@ -195,9 +209,10 @@ const file_transportprotocol_proto_rawDesc = "" +
 	"\x17transportprotocol.proto\x12 org.derecalliance.derec.protobuf\"m\n" +
 	"\x11TransportProtocol\x12\x10\n" +
 	"\x03uri\x18\x01 \x01(\tR\x03uri\x12F\n" +
-	"\bprotocol\x18\x02 \x01(\x0e2*.org.derecalliance.derec.protobuf.ProtocolR\bprotocol*\x15\n" +
+	"\bprotocol\x18\x02 \x01(\x0e2*.org.derecalliance.derec.protobuf.ProtocolR\bprotocol*\x1f\n" +
 	"\bProtocol\x12\t\n" +
-	"\x05HTTPS\x10\x00b\x06proto3"
+	"\x05HTTPS\x10\x00\x12\b\n" +
+	"\x04GRPC\x10\x01b\x06proto3"
 
 var (
 	file_transportprotocol_proto_rawDescOnce sync.Once

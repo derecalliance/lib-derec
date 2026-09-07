@@ -22,6 +22,12 @@
 //!   the canonical helper / replica ids carried by the recovered
 //!   `Secret`.
 //!
+//! A third, [`crate::Error::Transport`], joins them: the roster stores each
+//! peer as a bare `transport_uri`, so its protocol is derived from the URI
+//! scheme on the way back in, and a scheme this library serves no transport
+//! for cannot become a channel record. Checked with the other preconditions,
+//! so it too costs no partial write.
+//!
 //! Store I/O failures mid-restore propagate as their underlying
 //! [`crate::Error`] variant (`ShareStore`, `ChannelStore`,
 //! `SecretStore`). The snapshot write is the commit point — nothing
@@ -95,9 +101,11 @@ pub enum RestoreError {
 ///    committed, [`RestoreError::Invariant`] when
 ///    `secret.replicas.shared_key` is mis-sized, and
 ///    [`RestoreError::Conflict`] when an existing channel sits at a
-///    canonical helper / replica id. All three are reported before any
-///    store mutation. Channels *not* at canonical ids are recovery
-///    channels — wiped in step 5, never flagged as collisions.
+///    canonical helper / replica id, and [`crate::Error::Transport`] when
+///    a roster entry names a URI scheme this library serves no transport
+///    for. All four are reported before any store mutation. Channels *not*
+///    at canonical ids are recovery channels — wiped in step 5, never
+///    flagged as collisions.
 /// 2. **Helper channels.** Persist each helper's canonical channel
 ///    record, its `SharedKey`, and an empty owner-side tracking
 ///    [`Share`] at `recovered_version`.
@@ -223,6 +231,35 @@ async fn check_preconditions<Ch: DeRecChannelStore, Us: DeRecUserSecretStore>(
         .into());
     }
 
+    // Rehydrating an endpoint derives its protocol from the URI scheme, so a
+    // roster naming a scheme this library does not serve cannot be turned into
+    // channel records at all. Checked here, alongside the other preconditions,
+    // so the refusal costs no partial write.
+    // A roster entry with no endpoint cannot be restored into a usable
+    // channel — there would be nothing to send to. Checked here, alongside
+    // the other preconditions, so the refusal costs no partial write.
+    //
+    // The endpoints themselves need no re-derivation: a v3 roster stores each
+    // one with its protocol discriminant, and a v2 roster had its single URI
+    // resolved during decode.
+    let rosters_have_endpoints = secret
+        .helpers
+        .iter()
+        .map(|h| &h.transports)
+        .chain(
+            secret
+                .replicas
+                .iter()
+                .flat_map(|g| g.members.iter().map(|m| &m.transports)),
+        )
+        .all(|endpoints| !endpoints.is_empty());
+
+    if !rosters_have_endpoints {
+        return Err(crate::Error::InvalidInput(
+            "recovered roster has an entry with no transport endpoint",
+        ));
+    }
+
     // Every member shares the group channel, so the roster contributes one id
     // rather than one per member.
     let canonical_ids: HashSet<u64> = secret
@@ -264,10 +301,7 @@ async fn write_helper_channels<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: D
                 secret_id,
                 ChannelRecord::Helper(HelperChannel {
                     channel_id: cid,
-                    transport: derec_proto::TransportProtocol {
-                        uri: h.transport_uri.clone(),
-                        protocol: derec_proto::Protocol::Https as i32,
-                    },
+                    transports: h.transports.clone(),
                     communication_info: h.communication_info.clone(),
                     status: ChannelStatus::Paired,
                     created_at: now_secs(),
@@ -310,10 +344,7 @@ async fn write_replica_channels<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
                 ChannelRecord::Replica(ReplicaMember {
                     channel_id: cid,
                     replica_id: crate::types::ReplicaId::try_from(r.replica_id)?,
-                    transport: derec_proto::TransportProtocol {
-                        uri: r.transport_uri.clone(),
-                        protocol: derec_proto::Protocol::Https as i32,
-                    },
+                    transports: r.transports.clone(),
                     communication_info: r.communication_info.clone(),
                     role: ReplicaRole::from_i32(r.role).ok_or(RestoreError::Invariant(
                         "roster member carries an unknown role",
@@ -390,7 +421,7 @@ async fn unpair_recovery_channels<
             None,
             UnpairAck::NotRequired,
             now,
-            None,
+            &[],
         )
         .await
         {
@@ -487,13 +518,19 @@ mod tests {
             helpers: vec![
                 HelperInfo {
                     channel_id: 11,
-                    transport_uri: "https://helper-a.example".to_owned(),
+                    transports: vec![derec_proto::TransportProtocol {
+                        uri: "https://helper-a.example".to_owned(),
+                        protocol: derec_proto::Protocol::Https as i32,
+                    }],
                     shared_key: vec![0xAA; 32],
                     communication_info: HashMap::from([("name".to_owned(), "HelperA".to_owned())]),
                 },
                 HelperInfo {
                     channel_id: 12,
-                    transport_uri: "https://helper-b.example".to_owned(),
+                    transports: vec![derec_proto::TransportProtocol {
+                        uri: "https://helper-b.example".to_owned(),
+                        protocol: derec_proto::Protocol::Https as i32,
+                    }],
                     shared_key: vec![0xBB; 32],
                     communication_info: HashMap::new(),
                 },
@@ -515,13 +552,19 @@ mod tests {
                 members: vec![
                     ReplicaInfo {
                         replica_id: 0xBEEF,
-                        transport_uri: "https://owner.example".to_owned(),
+                        transports: vec![derec_proto::TransportProtocol {
+                            uri: "https://owner.example".to_owned(),
+                            protocol: derec_proto::Protocol::Https as i32,
+                        }],
                         role: ReplicaRole::Source as i32,
                         communication_info: HashMap::new(),
                     },
                     ReplicaInfo {
                         replica_id: 0xCAFE,
-                        transport_uri: "https://replica.example".to_owned(),
+                        transports: vec![derec_proto::TransportProtocol {
+                            uri: "https://replica.example".to_owned(),
+                            protocol: derec_proto::Protocol::Https as i32,
+                        }],
                         role: ReplicaRole::Destination as i32,
                         communication_info: HashMap::new(),
                     },
@@ -634,6 +677,156 @@ mod tests {
         });
     }
 
+    // ---------------- Endpoint rehydration ----------------
+
+    /// The roster stores a bare `transport_uri` and no protocol discriminant,
+    /// so restore has to derive one. Pairing it with a fixed `Https` made every
+    /// gRPC-paired peer come back as `{grpcs://…, Https}` — a combination
+    /// `TransportProtocol::validate` rejects outright, which breaks the first
+    /// send after every recovery.
+    #[test]
+    fn a_grpc_peer_is_rehydrated_as_grpc() {
+        run_async(async {
+            let secret_id: u64 = 0xDE_2EC;
+            let mut rig = build_rig(secret_id);
+
+            let mut secret = fixture_secret();
+            secret.helpers[0].transports = vec![derec_proto::TransportProtocol {
+                uri: "grpcs://helper-a.example:443".to_owned(),
+                protocol: derec_proto::Protocol::Grpc as i32,
+            }];
+            let members = &mut secret
+                .replicas
+                .as_mut()
+                .expect("fixture has a roster")
+                .members;
+            members[1].transports = vec![derec_proto::TransportProtocol {
+                uri: "grpcs://replica.example:443".to_owned(),
+                protocol: derec_proto::Protocol::Grpc as i32,
+            }];
+
+            rig.protocol
+                .restore(&secret, 7)
+                .await
+                .expect("a grpc roster must restore");
+
+            let helper = rig
+                .channel_store
+                .load(
+                    secret_id,
+                    ChannelQuery::Helper {
+                        channel_id: ChannelId(11),
+                    },
+                )
+                .await
+                .unwrap()
+                .expect("helper channel must be persisted");
+            let ChannelRecord::Helper(helper) = helper else {
+                panic!("a helper query must never return a replica record");
+            };
+            assert_eq!(helper.transports[0].uri, "grpcs://helper-a.example:443");
+            assert_eq!(
+                helper.transports[0].protocol,
+                derec_proto::Protocol::Grpc as i32,
+                "a grpcs:// helper must come back as Grpc, not the historical \
+                 hardcoded Https"
+            );
+            for endpoint in &helper.transports {
+                crate::transport::TransportProtocol::try_from(endpoint)
+                    .expect("every rehydrated endpoint must be self-consistent");
+            }
+
+            let member = rig
+                .channel_store
+                .load(
+                    secret_id,
+                    ChannelQuery::Replica {
+                        channel_id: ChannelId(21),
+                        replica_id: crate::types::ReplicaId(0xCAFE),
+                    },
+                )
+                .await
+                .unwrap()
+                .expect("replica member must be persisted");
+            let ChannelRecord::Replica(member) = member else {
+                panic!("a replica query must never return a helper record");
+            };
+            assert_eq!(member.transports[0].uri, "grpcs://replica.example:443");
+            assert_eq!(
+                member.transports[0].protocol,
+                derec_proto::Protocol::Grpc as i32,
+                "a grpcs:// group member must come back as Grpc"
+            );
+
+            // The https:// entries in the same roster are unaffected — the
+            // discriminant follows each URI, not the roster as a whole.
+            let other = rig
+                .channel_store
+                .load(
+                    secret_id,
+                    ChannelQuery::Helper {
+                        channel_id: ChannelId(12),
+                    },
+                )
+                .await
+                .unwrap()
+                .expect("helper channel must be persisted");
+            let ChannelRecord::Helper(other) = other else {
+                panic!("a helper query must never return a replica record");
+            };
+            assert_eq!(
+                other.transports[0].protocol,
+                derec_proto::Protocol::Https as i32
+            );
+        });
+    }
+
+    /// A roster entry that names no endpoint cannot become a usable channel
+    /// — there would be nothing to send to. Refused with the rest of the
+    /// preconditions, so nothing is written and the call stays retryable.
+    #[test]
+    fn a_roster_entry_without_an_endpoint_is_refused_before_any_write() {
+        run_async(async {
+            let secret_id: u64 = 0xDE_2EC;
+            let mut rig = build_rig(secret_id);
+
+            let mut secret = fixture_secret();
+            secret.helpers[1].transports = Vec::new();
+
+            let err = rig
+                .protocol
+                .restore(&secret, 7)
+                .await
+                .expect_err("a peer with no endpoint must not restore silently");
+            assert!(
+                matches!(err, crate::Error::InvalidInput(_)),
+                "expected the precondition refusal, got {err:?}"
+            );
+
+            assert!(
+                rig.channel_store
+                    .load(
+                        secret_id,
+                        ChannelQuery::Helper {
+                            channel_id: ChannelId(11)
+                        }
+                    )
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a precondition failure must leave the stores untouched"
+            );
+            assert!(
+                rig.user_secret_store
+                    .load_latest(secret_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a precondition failure must not commit a snapshot"
+            );
+        });
+    }
+
     // ---------------- Recovery-channel wipe ----------------
 
     #[test]
@@ -651,10 +844,10 @@ mod tests {
                     (secret_id, rcid),
                     HelperChannel {
                         channel_id: ChannelId(rcid),
-                        transport: TransportProtocol {
+                        transports: vec![TransportProtocol {
                             uri: format!("https://recovery-{rcid}.example"),
                             protocol: 0,
-                        },
+                        }],
                         communication_info: HashMap::new(),
                         status: ChannelStatus::Paired,
                         created_at: 1,
@@ -739,10 +932,10 @@ mod tests {
                 (secret_id, 99),
                 HelperChannel {
                     channel_id: ChannelId(99),
-                    transport: TransportProtocol {
+                    transports: vec![TransportProtocol {
                         uri: "https://gone.example".to_owned(),
                         protocol: 0,
-                    },
+                    }],
                     communication_info: HashMap::new(),
                     status: ChannelStatus::Paired,
                     created_at: 1,
@@ -863,10 +1056,10 @@ mod tests {
                 (secret_id, 11),
                 HelperChannel {
                     channel_id: ChannelId(11),
-                    transport: TransportProtocol {
+                    transports: vec![TransportProtocol {
                         uri: "https://collision.example".to_owned(),
                         protocol: 0,
-                    },
+                    }],
                     communication_info: HashMap::new(),
                     status: ChannelStatus::Paired,
                     created_at: 1,

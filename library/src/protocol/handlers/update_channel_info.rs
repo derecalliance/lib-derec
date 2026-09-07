@@ -5,8 +5,9 @@ use super::super::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecTransport, MissingPolicy, PendingAction,
     SecretKind, SecretValue,
 };
-use super::{peer_endpoint, resolve_target};
+use super::{peer_endpoints, resolve_target};
 use crate::derec_message::{DeRecMessageBuilder, current_timestamp};
+use crate::transport::AdvertisedEndpoints as _;
 use crate::transport::TransportProtocolExt as _;
 use crate::{
     Error, Result,
@@ -33,10 +34,15 @@ pub(in crate::protocol) async fn handle(
     inner: MessageBody,
     shared_key: SharedKey,
     inbound_trace_id: u64,
+    own_transports: &[TransportProtocol],
 ) -> Result<Vec<DeRecEvent>> {
     match inner {
         MessageBody::UpdateChannelInfoRequest(request) => {
-            on_request(channel_id, request, shared_key, inbound_trace_id)
+            let own = own_transports
+                .iter()
+                .map(crate::transport::TransportProtocol::try_from)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            on_request(channel_id, request, shared_key, inbound_trace_id, &own)
         }
         MessageBody::UpdateChannelInfoResponse(response) => on_response(channel_id, &response),
         _ => Err(Error::Invariant(
@@ -58,9 +64,9 @@ pub(in crate::protocol) async fn start<
     secret_id: u64,
     target: Target,
     communication_info: Option<HashMap<String, String>>,
-    transport_protocol: Option<TransportProtocol>,
+    own_transports: Vec<TransportProtocol>,
 ) -> Result<Vec<DeRecEvent>> {
-    if communication_info.is_none() && transport_protocol.is_none() {
+    if communication_info.is_none() && own_transports.is_empty() {
         return Err(EMPTY_UPDATE_ERROR);
     }
 
@@ -99,7 +105,7 @@ pub(in crate::protocol) async fn start<
             channel_id,
             &shared_key,
             comm_info_proto.clone(),
-            transport_protocol.clone(),
+            own_transports.clone(),
         )
         .await
         {
@@ -109,7 +115,7 @@ pub(in crate::protocol) async fn start<
                 tracing::debug!(
                     channel_id = channel_id.0,
                     has_communication_info = comm_info_proto.is_some(),
-                    has_transport_protocol = transport_protocol.is_some(),
+                    advertised_transports = own_transports.len(),
                     "update_channel_info request sent"
                 );
             }
@@ -138,6 +144,11 @@ pub(in crate::protocol) async fn start<
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
 )]
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
+#[allow(clippy::too_many_arguments)]
 pub(in crate::protocol) async fn accept<Ch: DeRecChannelStore, T: DeRecTransport>(
     channel_store: &mut Ch,
     transport: &T,
@@ -146,6 +157,7 @@ pub(in crate::protocol) async fn accept<Ch: DeRecChannelStore, T: DeRecTransport
     request: &UpdateChannelInfoRequestMessage,
     shared_key: &SharedKey,
     trace_id: u64,
+    policy: crate::transport::TransportPolicy,
 ) -> Result<Vec<DeRecEvent>> {
     let channel = channel_store
         .load(
@@ -166,12 +178,13 @@ pub(in crate::protocol) async fn accept<Ch: DeRecChannelStore, T: DeRecTransport
         .communication_info
         .as_ref()
         .map(extract_communication_info);
-    let new_transport = match request.transport_protocol.clone() {
-        Some(tp) => {
-            let _ = crate::transport::TransportProtocol::try_from(&tp)?;
-            Some(tp)
-        }
-        None => None,
+    let advertised = request.advertised_endpoints();
+    let new_transport = if advertised.is_empty() {
+        // An update that changes only `communication_info` says nothing
+        // about transports, so the stored set is left alone.
+        None
+    } else {
+        Some(policy.admit_peer_endpoints(advertised)?)
     };
 
     // Either record kind can carry an endpoint change; the fields live on the
@@ -181,8 +194,8 @@ pub(in crate::protocol) async fn accept<Ch: DeRecChannelStore, T: DeRecTransport
             if let Some(ci) = new_info {
                 h.communication_info = ci;
             }
-            if let Some(tp) = new_transport {
-                h.transport = tp;
+            if let Some(tps) = new_transport.clone() {
+                h.transports = tps;
             }
             crate::protocol::types::ChannelRecord::Helper(h)
         }
@@ -190,8 +203,8 @@ pub(in crate::protocol) async fn accept<Ch: DeRecChannelStore, T: DeRecTransport
             if let Some(ci) = new_info {
                 r.communication_info = ci;
             }
-            if let Some(tp) = new_transport {
-                r.transport = tp;
+            if let Some(tps) = new_transport {
+                r.transports = tps;
             }
             crate::protocol::types::ChannelRecord::Replica(r)
         }
@@ -217,7 +230,7 @@ pub(in crate::protocol) async fn accept<Ch: DeRecChannelStore, T: DeRecTransport
         .build()?
         .encode_to_vec();
 
-    let endpoint = peer_endpoint(channel_store, secret_id, channel_id).await?;
+    let endpoint = peer_endpoints(channel_store, secret_id, channel_id).await?;
     transport.send(&endpoint, envelope).await?;
 
     #[cfg(feature = "logging")]
@@ -264,7 +277,7 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
         .build()?
         .encode_to_vec();
 
-    let endpoint = peer_endpoint(channel_store, secret_id, channel_id).await?;
+    let endpoint = peer_endpoints(channel_store, secret_id, channel_id).await?;
     transport.send(&endpoint, envelope).await?;
 
     #[cfg(feature = "logging")]
@@ -277,21 +290,39 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
 )]
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
 fn on_request(
     channel_id: ChannelId,
     request: UpdateChannelInfoRequestMessage,
     shared_key: SharedKey,
     trace_id: u64,
+    own_transports: &[crate::transport::TransportProtocol],
 ) -> Result<Vec<DeRecEvent>> {
     if request.communication_info.is_none() && request.transport_protocol.is_none() {
         return Err(EMPTY_UPDATE_ERROR);
     }
 
-    // Structure only. Whether the announced endpoint's *scheme* is
-    // acceptable was settled by `TransportPolicy` in `handlers::handle`,
-    // where every peer-supplied endpoint is checked in one place.
+    // Structure, then servability. An endpoint this side cannot serve is
+    // refused rather than recorded: following the switch would leave the
+    // peer unreachable with no way to discover that. Structural validation
+    // (scheme consistency, whose policy acceptability was already settled
+    // by `TransportPolicy` in `handlers::handle`) runs first, so a
+    // malformed endpoint is reported as malformed rather than unservable.
     if let Some(tp) = request.transport_protocol.as_ref() {
         tp.validate()?;
+
+        let protocol = derec_proto::Protocol::try_from(tp.protocol).map_err(|_| {
+            crate::transport::TransportValidationError::UnsupportedProtocol {
+                discriminant: tp.protocol,
+            }
+        })?;
+
+        if !own_transports.iter().any(|t| t.protocol == protocol) {
+            return Err(crate::Error::NoUsableEndpoint { offered: 1 });
+        }
     }
 
     Ok(vec![DeRecEvent::ActionRequired {
@@ -369,6 +400,10 @@ fn extract_communication_info(info: &CommunicationInfo) -> HashMap<String, Strin
         .collect()
 }
 
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_one<Ch: DeRecChannelStore, T: DeRecTransport>(
     channel_store: &mut Ch,
@@ -377,12 +412,16 @@ async fn dispatch_one<Ch: DeRecChannelStore, T: DeRecTransport>(
     channel_id: ChannelId,
     shared_key: &SharedKey,
     comm_info_proto: Option<CommunicationInfo>,
-    transport_protocol: Option<TransportProtocol>,
+    own_transports: Vec<TransportProtocol>,
 ) -> Result<()> {
     let timestamp = current_timestamp();
     let request = UpdateChannelInfoRequestMessage {
         communication_info: comm_info_proto,
-        transport_protocol,
+        // The first entry also fills the deprecated singular field so a
+        // receiver predating `supportedTransports` still learns the new
+        // address. Same rule every other pairing-time message follows.
+        transport_protocol: own_transports.first().cloned(),
+        supported_transports: own_transports,
         timestamp: Some(timestamp),
     };
     let envelope = DeRecMessageBuilder::channel()
@@ -394,7 +433,7 @@ async fn dispatch_one<Ch: DeRecChannelStore, T: DeRecTransport>(
         .build()?
         .encode_to_vec();
 
-    let endpoint = peer_endpoint(channel_store, secret_id, channel_id).await?;
+    let endpoint = peer_endpoints(channel_store, secret_id, channel_id).await?;
     transport.send(&endpoint, envelope).await?;
     Ok(())
 }
@@ -404,6 +443,10 @@ mod tests {
     use super::*;
     use crate::derec_message::current_timestamp;
 
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+    #[allow(deprecated)]
     /// A peer-supplied `UpdateChannelInfoRequest.transport_protocol`
     /// declaring `Protocol::Https` but carrying a URI with an
     /// unsupported scheme is rejected by the handler before any
@@ -423,12 +466,13 @@ mod tests {
         };
 
         let request = UpdateChannelInfoRequestMessage {
+            supported_transports: Vec::new(),
             communication_info: None,
             transport_protocol: Some(malicious_transport),
             timestamp: Some(current_timestamp()),
         };
 
-        let result = on_request(channel_id, request, shared_key, 0);
+        let result = on_request(channel_id, request, shared_key, 0, &[]);
 
         assert!(matches!(
             result,
@@ -436,5 +480,63 @@ mod tests {
                 crate::transport::TransportValidationError::SchemeMismatch { .. }
             ))
         ));
+    }
+
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+    #[allow(deprecated)]
+    /// A peer announcing a switch to a transport this side cannot serve is
+    /// refused rather than followed. Unlike the pairing case, the refusal is
+    /// deliverable: the channel is up, so the peer's previous endpoint still
+    /// works.
+    #[test]
+    fn on_request_refuses_an_unservable_transport_change() {
+        let own = vec![crate::transport::TransportProtocol::new(
+            "https://me.example.com/derec",
+            derec_proto::Protocol::Https,
+        )];
+        let request = UpdateChannelInfoRequestMessage {
+            supported_transports: Vec::new(),
+            communication_info: None,
+            transport_protocol: Some(derec_proto::TransportProtocol {
+                uri: "grpcs://peer.example.com:443".to_owned(),
+                protocol: derec_proto::Protocol::Grpc as i32,
+            }),
+            timestamp: None,
+        };
+
+        let result = on_request(ChannelId(1), request, [0u8; 32], 0, &own);
+        assert!(matches!(result, Err(crate::Error::NoUsableEndpoint { .. })));
+    }
+
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+    #[allow(deprecated)]
+    /// A switch to a transport this side does serve is still accepted.
+    #[test]
+    fn on_request_accepts_a_servable_transport_change() {
+        let own = vec![
+            crate::transport::TransportProtocol::new(
+                "https://me.example.com/derec",
+                derec_proto::Protocol::Https,
+            ),
+            crate::transport::TransportProtocol::new(
+                "grpcs://me.example.com:443",
+                derec_proto::Protocol::Grpc,
+            ),
+        ];
+        let request = UpdateChannelInfoRequestMessage {
+            supported_transports: Vec::new(),
+            communication_info: None,
+            transport_protocol: Some(derec_proto::TransportProtocol {
+                uri: "grpcs://peer.example.com:443".to_owned(),
+                protocol: derec_proto::Protocol::Grpc as i32,
+            }),
+            timestamp: None,
+        };
+
+        assert!(on_request(ChannelId(1), request, [0u8; 32], 0, &own).is_ok());
     }
 }

@@ -72,7 +72,7 @@ pub mod traits;
 pub mod types;
 pub mod utils;
 
-mod builder;
+pub(crate) mod builder;
 mod handlers;
 
 /// In-memory store and transport doubles shared by the unit tests
@@ -182,8 +182,12 @@ pub struct DeRecProtocol<
     pub state_store: StateStore,
     /// Set via [`DeRecProtocolBuilder::with_transport`].
     pub transport: Transport,
-    /// Set via [`DeRecProtocolBuilder::with_own_transport`].
-    pub own_transport: TransportProtocol,
+    /// Set via [`DeRecProtocolBuilder::with_own_transport`] or
+    /// [`DeRecProtocolBuilder::with_own_transports`], in preference order.
+    /// Never empty — the typestate builder cannot reach `build()` without
+    /// this slot filled. The first entry is this device's primary
+    /// endpoint; see `first_own_transport`.
+    pub own_transports: Vec<TransportProtocol>,
     /// Configured via [`DeRecProtocolBuilder::with_unpair_ack`].
     pub(crate) unpair_ack: UnpairAck,
     /// Configured via [`DeRecProtocolBuilder::with_threshold`].
@@ -202,7 +206,7 @@ pub struct DeRecProtocol<
     /// Configured via [`DeRecProtocolBuilder::with_auto_reply_to`].
     ///
     /// When `true`, every outbound request envelope is stamped with
-    /// `request.reply_to = self.own_transport` so the responder knows which
+    /// `request.reply_to = self.first_own_transport()` so the responder knows which
     /// endpoint to route the response to. When `false` (the default),
     /// outbound requests leave `reply_to` unset and the responder falls back
     /// to the channel's stored peer endpoint. See `replyTo` on each request
@@ -255,6 +259,12 @@ impl<
     /// construction path; both entry points run the same runtime
     /// validation and surface the same errors.
     ///
+    /// `own_transports` must be non-empty and in preference order — the
+    /// first entry is treated as this device's primary endpoint. Unlike
+    /// the builder, this constructor does not run [`TransportPolicy`
+    /// ](crate::transport::TransportPolicy) validation on them; callers
+    /// bypassing [`DeRecProtocolBuilder`] own that check themselves.
+    ///
     /// # Errors
     ///
     /// Returns [`crate::Error::InvalidInput`] if `threshold < 2`. A
@@ -271,7 +281,7 @@ impl<
         user_secret_store: Us,
         state_store: St,
         transport: T,
-        own_transport: TransportProtocol,
+        own_transports: Vec<TransportProtocol>,
         threshold: usize,
         keep_versions_count: usize,
         timeouts: crate::protocol::types::Timeouts,
@@ -289,7 +299,7 @@ impl<
             user_secret_store,
             state_store,
             transport,
-            own_transport,
+            own_transports,
             unpair_ack: UnpairAck::Required,
             threshold,
             keep_versions_count,
@@ -344,9 +354,10 @@ impl<
     /// - [`ContactMode::HashedKeys`] embeds only a SHA-384 binding hash over
     ///   the keys. The contact stays small enough for a QR code; the scanner
     ///   obtains the real keys via a `PrePair` round-trip and validates them
-    ///   against the hash. Requires the `own_transport` set on this protocol
-    ///   to be **ephemeral** — the plaintext PrePair traffic must not be
-    ///   linkable to a long-lived endpoint.
+    ///   against the hash. Requires every endpoint in `own_transports` —
+    ///   all of them are advertised in the contact's `supported_transports`
+    ///   — to be **ephemeral**, since the plaintext PrePair traffic must
+    ///   not be linkable to a long-lived endpoint.
     /// - [`ContactMode::NoKeys`] carries no key material and no commitment —
     ///   only `channel_id`, `nonce`, and `transport_protocol`. Small enough
     ///   to be hand-typed. Keys are generated on the fly by the creator when
@@ -381,7 +392,7 @@ impl<
         );
 
         let result =
-            create_contact_message(channel_id, contact_mode, self.own_transport.clone(), nonce)?;
+            create_contact_message(channel_id, contact_mode, self.own_transports.clone(), nonce)?;
 
         // Persist the material the eventual `PrePairRequest` /
         // `PairRequest` handler will need to look up:
@@ -458,7 +469,10 @@ impl<
     ///
     /// Failing to keep both endpoints reachable during this window will
     /// cause messages to be lost.
-    /// Set the local node's transport endpoint.
+    /// Set the local node's primary transport endpoint — the first entry
+    /// of the preference list, replacing whatever was there before. Any
+    /// additional endpoints configured via
+    /// [`DeRecProtocolBuilder::with_own_transports`] are left untouched.
     ///
     /// Accepts anything implementing
     /// [`IntoOwnTransport`](crate::transport::IntoOwnTransport): a
@@ -477,7 +491,7 @@ impl<
         own_transport: impl crate::transport::IntoOwnTransport,
     ) -> crate::Result<()> {
         let tp = own_transport.into_own_transport()?;
-        self.own_transport = tp.into();
+        self.own_transports[0] = tp.into();
         Ok(())
     }
 
@@ -507,7 +521,14 @@ impl<
         // peer endpoint points elsewhere (e.g. a sibling replica).
         // Pairing has its own dedicated `transport_protocol` field so
         // it's intentionally excluded.
-        let reply_to = self.auto_reply_to.then(|| self.own_transport.clone());
+        // Every endpoint this device serves, so a responder that cannot reach
+        // the first can fall back rather than give up. Owned rather than
+        // borrowed because `self` is used mutably further down.
+        let reply_to: Vec<derec_proto::TransportProtocol> = if self.auto_reply_to {
+            self.own_transports.clone()
+        } else {
+            Vec::new()
+        };
 
         match flow {
             DeRecFlow::Pairing {
@@ -518,12 +539,12 @@ impl<
                 self.start_pairing(kind, contact, peer_communication_info)
                     .await
             }
-            DeRecFlow::Discovery { target } => self.start_discovery(target, reply_to).await,
+            DeRecFlow::Discovery { target } => self.start_discovery(target, &reply_to).await,
             DeRecFlow::ProtectSecret {
                 secrets,
                 description,
             } => {
-                self.start_protect_secret(secrets, description, reply_to)
+                self.start_protect_secret(secrets, description, &reply_to)
                     .await
             }
             DeRecFlow::VerifyShares {
@@ -531,11 +552,11 @@ impl<
                 version,
                 target,
             } => {
-                self.start_verify_shares(secret_id, version, target, reply_to)
+                self.start_verify_shares(secret_id, version, target, &reply_to)
                     .await
             }
             DeRecFlow::RecoverSecret { secret_id, version } => {
-                self.start_recover_secret(secret_id, version, reply_to)
+                self.start_recover_secret(secret_id, version, &reply_to)
                     .await
             }
             DeRecFlow::SyncCheck => {
@@ -547,7 +568,7 @@ impl<
                     &self.transport,
                     self.secret_id,
                     self.replica_id,
-                    &self.own_transport,
+                    &self.own_transports[0],
                 )
                 .await
             }
@@ -568,14 +589,14 @@ impl<
                 .await
             }
             DeRecFlow::Unpair { channel_id, memo } => {
-                self.start_unpair(channel_id, memo, reply_to).await
+                self.start_unpair(channel_id, memo, &reply_to).await
             }
             DeRecFlow::UpdateChannelInfo {
                 target,
                 communication_info,
-                transport_protocol,
+                own_transports,
             } => {
-                self.start_update_channel_info(target, communication_info, transport_protocol)
+                self.start_update_channel_info(target, communication_info, own_transports)
                     .await
             }
         }
@@ -670,6 +691,7 @@ impl<
                 trace_id,
                 ..
             } => {
+                let transport_policy = self.transport_policy();
                 handlers::pairing::reject(
                     &mut self.secret_store,
                     &self.transport,
@@ -680,6 +702,7 @@ impl<
                     status,
                     memo,
                     trace_id,
+                    transport_policy,
                 )
                 .await
             }
@@ -804,6 +827,7 @@ impl<
                 request,
                 trace_id,
             } => {
+                let transport_policy = self.transport_policy();
                 handlers::pairing::reject_pre_pair(
                     &self.transport,
                     channel_id,
@@ -811,6 +835,7 @@ impl<
                     status,
                     memo,
                     trace_id,
+                    transport_policy,
                 )
                 .await
             }
@@ -1068,8 +1093,12 @@ impl<
                 None => None,
             };
             if let Some((secrets, description)) = payload {
-                let reply_to = self.auto_reply_to.then(|| self.own_transport.clone());
-                self.publish_secret(secrets, description, reply_to).await?;
+                let reply_to: Vec<derec_proto::TransportProtocol> = if self.auto_reply_to {
+                    self.own_transports.clone()
+                } else {
+                    Vec::new()
+                };
+                self.publish_secret(secrets, description, &reply_to).await?;
             }
         }
 
@@ -1120,6 +1149,12 @@ impl<
     ///   is internally inconsistent (e.g. non-empty `replicas` with
     ///   empty `replicas.shared_key`).
     ///
+    /// [`crate::Error::Transport`] surfaces on the same terms when a roster
+    /// entry's `transport_uri` names a scheme this library serves no
+    /// transport for: the roster carries no protocol discriminant, so each
+    /// peer's is derived from its URI scheme, and an unknown scheme leaves
+    /// nothing to derive.
+    ///
     /// Store I/O failures mid-restore propagate as the underlying
     /// [`crate::Error::ShareStore`], [`crate::Error::ChannelStore`],
     /// or [`crate::Error::SecretStore`] variant.
@@ -1149,11 +1184,12 @@ impl<
         contact: derec_proto::ContactMessage,
         peer_communication_info: HashMap<String, String>,
     ) -> Result<Vec<DeRecEvent>> {
+        let transport_policy = self.transport_policy();
         let channel_id = handlers::pairing::start(
             &mut self.channel_store,
             &mut self.secret_store,
             &self.transport,
-            &self.own_transport,
+            &self.own_transports,
             &self.communication_info,
             self.secret_id,
             kind,
@@ -1161,6 +1197,7 @@ impl<
             peer_communication_info,
             self.replica_id,
             self.parameter_range,
+            transport_policy,
         )
         .await?;
         Ok(vec![DeRecEvent::PairingStarted {
@@ -1172,7 +1209,7 @@ impl<
     async fn start_discovery(
         &mut self,
         target: crate::protocol::types::Target,
-        reply_to: Option<derec_proto::TransportProtocol>,
+        reply_to: &[derec_proto::TransportProtocol],
     ) -> Result<Vec<DeRecEvent>> {
         let resolved =
             handlers::resolve_target(&mut self.channel_store, self.secret_id, target.clone())
@@ -1200,7 +1237,7 @@ impl<
         &mut self,
         secrets: Vec<crate::protocol::types::UserSecret>,
         description: Option<String>,
-        reply_to: Option<derec_proto::TransportProtocol>,
+        reply_to: &[derec_proto::TransportProtocol],
     ) -> Result<Vec<DeRecEvent>> {
         self.publish_secret(secrets, description, reply_to).await
     }
@@ -1213,7 +1250,7 @@ impl<
         &mut self,
         secrets: Vec<crate::protocol::types::UserSecret>,
         description: Option<String>,
-        reply_to: Option<derec_proto::TransportProtocol>,
+        reply_to: &[derec_proto::TransportProtocol],
     ) -> Result<Vec<DeRecEvent>> {
         let Some(round) = handlers::sharing::start(
             &mut self.channel_store,
@@ -1226,7 +1263,7 @@ impl<
             self.threshold,
             self.keep_versions_count,
             self.secret_id,
-            &self.own_transport,
+            &self.own_transports[0],
             reply_to,
             self.replica_id,
         )
@@ -1310,7 +1347,7 @@ impl<
         secret_id: u64,
         version: u32,
         target: crate::protocol::types::Target,
-        reply_to: Option<derec_proto::TransportProtocol>,
+        reply_to: &[derec_proto::TransportProtocol],
     ) -> Result<Vec<DeRecEvent>> {
         let resolved =
             handlers::resolve_target(&mut self.channel_store, self.secret_id, target.clone())
@@ -1340,7 +1377,7 @@ impl<
         &mut self,
         secret_id: u64,
         version: u32,
-        reply_to: Option<derec_proto::TransportProtocol>,
+        reply_to: &[derec_proto::TransportProtocol],
     ) -> Result<Vec<DeRecEvent>> {
         // No blanket role gate here: an instance legitimately holds
         // replica channels alongside its helper pairings, and requiring
@@ -1367,7 +1404,7 @@ impl<
         &mut self,
         channel_id: ChannelId,
         memo: Option<String>,
-        reply_to: Option<derec_proto::TransportProtocol>,
+        reply_to: &[derec_proto::TransportProtocol],
     ) -> Result<Vec<DeRecEvent>> {
         handlers::require_role(
             &self.channel_store,
@@ -1406,7 +1443,7 @@ impl<
         &mut self,
         target: crate::protocol::types::Target,
         communication_info: Option<HashMap<String, String>>,
-        transport_protocol: Option<derec_proto::TransportProtocol>,
+        own_transports: Vec<derec_proto::TransportProtocol>,
     ) -> Result<Vec<DeRecEvent>> {
         handlers::update_channel_info::start(
             &mut self.channel_store,
@@ -1415,7 +1452,7 @@ impl<
             self.secret_id,
             target,
             communication_info,
-            transport_protocol,
+            own_transports,
         )
         .await
     }
@@ -1429,11 +1466,12 @@ impl<
                 trace_id,
                 ..
             } => {
+                let transport_policy = self.transport_policy();
                 handlers::pairing::accept(
                     &mut self.channel_store,
                     &mut self.secret_store,
                     &self.transport,
-                    &self.own_transport,
+                    &self.own_transports,
                     &self.communication_info,
                     self.secret_id,
                     channel_id,
@@ -1442,6 +1480,7 @@ impl<
                     trace_id,
                     self.replica_id,
                     self.parameter_range,
+                    transport_policy,
                 )
                 .await
             }
@@ -1543,6 +1582,7 @@ impl<
                 shared_key,
                 trace_id,
             } => {
+                let transport_policy = self.transport_policy();
                 handlers::update_channel_info::accept(
                     &mut self.channel_store,
                     &self.transport,
@@ -1551,6 +1591,7 @@ impl<
                     &request,
                     &shared_key,
                     trace_id,
+                    transport_policy,
                 )
                 .await
             }
@@ -1559,6 +1600,7 @@ impl<
                 request,
                 trace_id,
             } => {
+                let transport_policy = self.transport_policy();
                 handlers::pairing::accept_pre_pair(
                     &mut self.secret_store,
                     &self.transport,
@@ -1566,6 +1608,7 @@ impl<
                     channel_id,
                     &request,
                     trace_id,
+                    transport_policy,
                 )
                 .await
             }
@@ -1637,8 +1680,15 @@ impl<
                 (Vec::new(), None)
             }
         };
-        let reply_to = self.auto_reply_to.then(|| self.own_transport.clone());
-        self.publish_secret(secrets, description, reply_to).await
+        // Every endpoint this device serves, so a responder that cannot reach
+        // the first can fall back rather than give up. Owned rather than
+        // borrowed because `self` is used mutably further down.
+        let reply_to: Vec<derec_proto::TransportProtocol> = if self.auto_reply_to {
+            self.own_transports.clone()
+        } else {
+            Vec::new()
+        };
+        self.publish_secret(secrets, description, &reply_to).await
     }
 
     /// Returns `true` when at least one channel records a
@@ -1767,13 +1817,15 @@ impl<
             &mut self.user_secret_store,
             &self.transport,
             &mut self.state_store,
-            &self.own_transport,
+            &self.own_transports[0],
+            &self.own_transports,
             message,
             self.secret_id,
             channel_id,
             &shared_key,
             self.replica_id,
             transport_policy,
+            self.auto_respond_on_failure,
         )
         .await?;
 
@@ -1837,11 +1889,12 @@ impl<
                     else {
                         return Ok(None);
                     };
+                    let transport_policy = self.transport_policy();
                     let events = handlers::pairing::on_pre_pair_response(
                         &mut self.channel_store,
                         &mut self.secret_store,
                         &self.transport,
-                        &self.own_transport,
+                        &self.own_transports,
                         &self.communication_info,
                         self.secret_id,
                         channel_id,
@@ -1849,6 +1902,7 @@ impl<
                         &resp,
                         self.replica_id,
                         self.parameter_range,
+                        transport_policy,
                     )
                     .await?;
                     return Ok(Some(events));
@@ -2480,7 +2534,7 @@ mod expired_channel_sweep_tests {
                 SECRET_ID,
                 ChannelRecord::Helper(HelperChannel {
                     channel_id: ChannelId(cid),
-                    transport: endpoint(),
+                    transports: vec![endpoint()],
                     communication_info: std::collections::HashMap::new(),
                     status,
                     created_at: now_secs().saturating_sub(age_secs),
@@ -2555,7 +2609,7 @@ mod expired_channel_sweep_tests {
                 ChannelRecord::Replica(ReplicaMember {
                     channel_id: ChannelId(9000),
                     replica_id: crate::types::ReplicaId(replica_id),
-                    transport: endpoint(),
+                    transports: vec![endpoint()],
                     communication_info: std::collections::HashMap::new(),
                     role: ReplicaRole::Destination,
                     status,
@@ -3082,10 +3136,10 @@ mod sharing_round_outcome_tests {
                         crate::protocol::types::ChannelRecord::Helper(
                             crate::protocol::types::HelperChannel {
                                 channel_id: ChannelId(77),
-                                transport: derec_proto::TransportProtocol {
+                                transports: vec![derec_proto::TransportProtocol {
                                     uri: "https://stale.example".to_owned(),
                                     protocol: derec_proto::Protocol::Https as i32,
-                                },
+                                }],
                                 communication_info: std::collections::HashMap::new(),
                                 peer_role: derec_proto::SenderKind::Helper,
                                 status: crate::protocol::types::ChannelStatus::Pending,
@@ -3173,10 +3227,10 @@ mod sharing_round_outcome_tests {
                             crate::protocol::types::ReplicaMember {
                                 channel_id: ChannelId(5001),
                                 replica_id: ReplicaId(id),
-                                transport: derec_proto::TransportProtocol {
+                                transports: vec![derec_proto::TransportProtocol {
                                     uri: "https://peer.example".to_owned(),
                                     protocol: derec_proto::Protocol::Https as i32,
-                                },
+                                }],
                                 communication_info: std::collections::HashMap::new(),
                                 role: crate::protocol::types::ReplicaRole::Destination,
                                 status,
@@ -3254,10 +3308,10 @@ mod sharing_round_outcome_tests {
                         crate::protocol::types::ReplicaMember {
                             channel_id: ChannelId(5001),
                             replica_id: ReplicaId(1003),
-                            transport: derec_proto::TransportProtocol {
+                            transports: vec![derec_proto::TransportProtocol {
                                 uri: "https://peer.example".to_owned(),
                                 protocol: derec_proto::Protocol::Https as i32,
-                            },
+                            }],
                             communication_info: std::collections::HashMap::new(),
                             role: crate::protocol::types::ReplicaRole::Destination,
                             status: crate::protocol::types::ChannelStatus::Unpairing,
@@ -3557,7 +3611,7 @@ mod helper_fingerprint_gate_tests {
                 SECRET_ID,
                 ChannelRecord::Helper(HelperChannel {
                     channel_id: CHANNEL,
-                    transport: endpoint(),
+                    transports: vec![endpoint()],
                     communication_info: std::collections::HashMap::new(),
                     status,
                     created_at: now_secs(),
@@ -3887,6 +3941,9 @@ mod transport_gate_tests {
 
     const SECRET_ID: u64 = 0x60A7;
 
+    // Exercises the deprecated `with_unsafe_http` deliberately — this is
+    // the regression net proving the old flag still works unchanged.
+    #[allow(deprecated)]
     fn builder_with(
         own: &str,
         unsafe_http: bool,
@@ -3951,6 +4008,7 @@ mod transport_gate_tests {
     /// Order of the two setters must not matter — the policy is applied at
     /// `build`, not when either one is called.
     #[test]
+    #[allow(deprecated)]
     fn setter_order_does_not_matter() {
         run_async(async {
             let built = DeRecProtocolBuilder::new(SECRET_ID)
@@ -3977,52 +4035,44 @@ mod transport_gate_tests {
         });
     }
 
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+    #[allow(deprecated)]
     /// The accessor the funnel depends on must actually see every field a
     /// peer controls. If a new message type gains a `reply_to` or a
     /// transport, this is what should fail first.
     #[test]
     fn every_peer_supplied_endpoint_is_reachable_from_the_funnel() {
         use derec_proto::{MessageBody, TransportProtocol};
-        let ep = || {
-            Some(TransportProtocol {
-                uri: "http://127.0.0.1:9999".to_owned(),
-                protocol: derec_proto::Protocol::Https as i32,
-            })
+        let one = || TransportProtocol {
+            uri: "http://127.0.0.1:9999".to_owned(),
+            protocol: derec_proto::Protocol::Https as i32,
         };
+        // Only `reply_to` reaches the funnel now, and it is a list.
+        let eps = || vec![one()];
 
         let bodies = [
             MessageBody::StoreShareRequest(derec_proto::StoreShareRequestMessage {
-                reply_to: ep(),
+                reply_to: eps(),
                 ..Default::default()
             }),
             MessageBody::VerifyShareRequest(derec_proto::VerifyShareRequestMessage {
-                reply_to: ep(),
+                reply_to: eps(),
                 ..Default::default()
             }),
             MessageBody::GetSecretIdsVersionsRequest(
                 derec_proto::GetSecretIdsVersionsRequestMessage {
-                    reply_to: ep(),
+                    reply_to: eps(),
                     ..Default::default()
                 },
             ),
             MessageBody::GetShareRequest(derec_proto::GetShareRequestMessage {
-                reply_to: ep(),
+                reply_to: eps(),
                 ..Default::default()
             }),
             MessageBody::UnpairRequest(derec_proto::UnpairRequestMessage {
-                reply_to: ep(),
-                ..Default::default()
-            }),
-            MessageBody::UpdateChannelInfoRequest(derec_proto::UpdateChannelInfoRequestMessage {
-                transport_protocol: ep(),
-                ..Default::default()
-            }),
-            MessageBody::PairRequest(derec_proto::PairRequestMessage {
-                transport_protocol: ep(),
-                ..Default::default()
-            }),
-            MessageBody::PrePairRequest(derec_proto::PrePairRequestMessage {
-                transport_protocol: ep(),
+                reply_to: eps(),
                 ..Default::default()
             }),
         ];
@@ -4041,5 +4091,466 @@ mod transport_gate_tests {
                     .is_err()
             );
         }
+    }
+
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+    #[allow(deprecated)]
+    /// `PairRequest` is the deliberate exception to the funnel: it carries
+    /// an offer list, and gating on its legacy singular field ahead of
+    /// `admit_peer_endpoints` would fail-fast on an endpoint that a later
+    /// one in the list would have survived. Locks in the exclusion so it isn't
+    /// re-added by habit alongside the other message types above.
+    #[test]
+    fn pair_request_is_not_gated_by_the_funnel() {
+        use derec_proto::MessageBody;
+        let body = MessageBody::PairRequest(derec_proto::PairRequestMessage {
+            transport_protocol: Some(derec_proto::TransportProtocol {
+                uri: "http://127.0.0.1:9999".to_owned(),
+                protocol: derec_proto::Protocol::Https as i32,
+            }),
+            ..Default::default()
+        });
+        assert_eq!(handlers::peer_supplied_endpoints(&body).count(), 0);
+    }
+
+    /// `UpdateChannelInfo` is excluded for the same reason, with an extra
+    /// one: fail-fasting here would reject the whole announcement and leave
+    /// the peer's *stale* endpoints in place. Its handler filters instead.
+    #[test]
+    fn update_channel_info_is_not_gated_by_the_funnel() {
+        use derec_proto::MessageBody;
+        let body =
+            MessageBody::UpdateChannelInfoRequest(derec_proto::UpdateChannelInfoRequestMessage {
+                supported_transports: vec![derec_proto::TransportProtocol {
+                    uri: "http://127.0.0.1:9999".to_owned(),
+                    protocol: derec_proto::Protocol::Https as i32,
+                }],
+                ..Default::default()
+            });
+        assert_eq!(handlers::peer_supplied_endpoints(&body).count(), 0);
+    }
+
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+    #[allow(deprecated)]
+    /// `PrePairRequest` is excluded for the same reason, and additionally
+    /// could not be gated here at all: it is plaintext and takes its own
+    /// dispatch path, which never reaches this function. Its endpoints are
+    /// filtered in `accept_pre_pair` / `reject_pre_pair` instead.
+    #[test]
+    fn pre_pair_request_is_not_gated_by_the_funnel() {
+        use derec_proto::MessageBody;
+        let body = MessageBody::PrePairRequest(derec_proto::PrePairRequestMessage {
+            transport_protocol: Some(derec_proto::TransportProtocol {
+                uri: "http://127.0.0.1:9999".to_owned(),
+                protocol: derec_proto::Protocol::Https as i32,
+            }),
+            supported_transports: vec![derec_proto::TransportProtocol {
+                uri: "http://127.0.0.1:9999".to_owned(),
+                protocol: derec_proto::Protocol::Https as i32,
+            }],
+            ..Default::default()
+        });
+        assert_eq!(handlers::peer_supplied_endpoints(&body).count(), 0);
+    }
+}
+
+/// The plaintext PrePair leg takes its own dispatch path, so it never passes
+/// the `peer_supplied_endpoints` funnel the encrypted paths run. These lock in
+/// that [`TransportPolicy`](crate::transport::TransportPolicy) is nonetheless
+/// applied to the endpoint the peer asks to be answered on — the endpoint this
+/// device dials.
+#[cfg(test)]
+mod pre_pair_transport_policy_tests {
+    use super::*;
+    use crate::protocol::test::{
+        InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
+        InMemUserSecretStore, NoopTransport, run_async,
+    };
+    use crate::protocol::types::SecretValue;
+
+    const SECRET_ID: u64 = 0xF2;
+    const CHANNEL: ChannelId = ChannelId(4242);
+    const NONCE: u64 = 0xABCD;
+
+    /// A NoKeys contact is the cheapest way into `accept_pre_pair`: it needs
+    /// only a stored `PairingContact` whose nonce the request echoes.
+    async fn seed_no_keys_contact(secrets: &mut InMemSecretStore) {
+        secrets
+            .save(
+                SECRET_ID,
+                CHANNEL,
+                SecretValue::PairingContact(derec_proto::ContactMessage {
+                    channel_id: CHANNEL.0,
+                    contact_mode: derec_proto::ContactMode::NoKeys as i32,
+                    nonce: NONCE,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("seed NoKeys pairing contact");
+    }
+
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+    #[allow(deprecated)]
+    fn request_answering_on(uri: &str, protocol: derec_proto::Protocol) -> PendingAction {
+        PendingAction::PrePair {
+            channel_id: CHANNEL,
+            request: derec_proto::PrePairRequestMessage {
+                nonce: NONCE,
+                // Exercises the deprecated singular spelling deliberately:
+                // a peer predating `supportedTransports` sends only this.
+                transport_protocol: Some(derec_proto::TransportProtocol {
+                    uri: uri.to_owned(),
+                    protocol: protocol as i32,
+                }),
+                supported_transports: Vec::new(),
+                timestamp: None,
+            },
+            trace_id: 0,
+        }
+    }
+
+    fn build(
+        secrets: InMemSecretStore,
+        unsafe_connection: bool,
+    ) -> DeRecProtocol<
+        InMemChannelStore,
+        InMemShareStore,
+        InMemSecretStore,
+        InMemUserSecretStore,
+        InMemStateStore,
+        NoopTransport,
+    > {
+        DeRecProtocolBuilder::new(SECRET_ID)
+            .with_channel_store(InMemChannelStore::default())
+            .with_share_store(InMemShareStore::default())
+            .with_secret_store(secrets)
+            .with_user_secret_store(InMemUserSecretStore::default())
+            .with_transport(NoopTransport)
+            .with_state_store(InMemStateStore)
+            .with_own_transport("https://owner.example.com")
+            .with_threshold(2)
+            .with_unsafe_connection(unsafe_connection)
+            .build()
+            .expect("test protocol builds")
+    }
+
+    /// The gap this guards: a peer asking to be answered over LAN plaintext
+    /// was dialled regardless of `unsafe_connection`, because this path
+    /// validated the endpoint's *structure* and never applied the policy.
+    #[test]
+    fn lan_plaintext_reply_endpoint_is_refused() {
+        run_async(async {
+            let secrets = InMemSecretStore::default();
+            let mut seeded = secrets.clone();
+            seed_no_keys_contact(&mut seeded).await;
+
+            let mut protocol = build(secrets, false);
+            let err = protocol
+                .accept(request_answering_on(
+                    "http://192.168.1.42:8080",
+                    derec_proto::Protocol::Https,
+                ))
+                .await
+                .expect_err("LAN plaintext must not be dialled without the flag");
+
+            // Endpoints are filtered rather than fail-fasted, so a request
+            // whose *every* endpoint is refused reports that none was usable.
+            // The guarantee is unchanged: plaintext is not dialled.
+            assert!(
+                matches!(err, crate::Error::NoUsableEndpoint { offered: 1 }),
+                "expected a no-usable-endpoint refusal, got {err:?}"
+            );
+        });
+    }
+
+    /// Same request succeeds once plaintext is opted into, proving the
+    /// refusal above comes from the policy rather than from the fixture.
+    #[test]
+    fn lan_plaintext_reply_endpoint_is_accepted_with_the_flag() {
+        run_async(async {
+            let secrets = InMemSecretStore::default();
+            let mut seeded = secrets.clone();
+            seed_no_keys_contact(&mut seeded).await;
+
+            let mut protocol = build(secrets, true);
+            protocol
+                .accept(request_answering_on(
+                    "http://192.168.1.42:8080",
+                    derec_proto::Protocol::Https,
+                ))
+                .await
+                .expect("plaintext is dialled once unsafe_connection is set");
+        });
+    }
+
+    // Constructs the deprecated singular field explicitly: this test covers
+    // the list spelling, so it states the singular one is absent.
+    #[allow(deprecated)]
+    /// A requester offering both is answered over the secure one rather than
+    /// refused outright — one bad endpoint does not sink the request. This is
+    /// what filtering buys over the fail-fast the singular field forced.
+    #[test]
+    fn a_plaintext_entry_is_skipped_when_a_secure_one_is_offered() {
+        run_async(async {
+            let secrets = InMemSecretStore::default();
+            let mut seeded = secrets.clone();
+            seed_no_keys_contact(&mut seeded).await;
+
+            let mut protocol = build(secrets, false);
+            protocol
+                .accept(PendingAction::PrePair {
+                    channel_id: CHANNEL,
+                    request: derec_proto::PrePairRequestMessage {
+                        nonce: NONCE,
+                        transport_protocol: None,
+                        supported_transports: vec![
+                            derec_proto::TransportProtocol {
+                                uri: "http://192.168.1.42:8080".to_owned(),
+                                protocol: derec_proto::Protocol::Https as i32,
+                            },
+                            derec_proto::TransportProtocol {
+                                uri: "https://helper.example.com".to_owned(),
+                                protocol: derec_proto::Protocol::Https as i32,
+                            },
+                        ],
+                        timestamp: None,
+                    },
+                    trace_id: 0,
+                })
+                .await
+                .expect("the secure entry survives the plaintext one");
+        });
+    }
+
+    /// The ordinary case stays working: a secure endpoint needs no flag.
+    #[test]
+    fn secure_reply_endpoint_needs_no_flag() {
+        run_async(async {
+            let secrets = InMemSecretStore::default();
+            let mut seeded = secrets.clone();
+            seed_no_keys_contact(&mut seeded).await;
+
+            let mut protocol = build(secrets, false);
+            protocol
+                .accept(request_answering_on(
+                    "https://helper.example.com",
+                    derec_proto::Protocol::Https,
+                ))
+                .await
+                .expect("a secure reply endpoint is dialled by default");
+        });
+    }
+}
+
+/// `with_auto_respond_on_failure` decides whether a peer learns that its
+/// request failed, or only this side does.
+///
+/// Both settings return the same `Err` to the caller — the flag governs a
+/// side effect on the wire, not the local contract.
+#[cfg(test)]
+mod auto_respond_on_failure_tests {
+    use super::*;
+    use crate::protocol::test::{
+        InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
+        InMemUserSecretStore, RecordingTransport, run_async,
+    };
+    use crate::protocol::types::{ChannelRecord, ChannelStatus, HelperChannel, SecretValue};
+
+    const SECRET_ID: u64 = 0xAF;
+    const CHANNEL: ChannelId = ChannelId(808);
+    const SHARED_KEY: crate::types::SharedKey = [9u8; 32];
+
+    fn endpoint() -> derec_proto::TransportProtocol {
+        derec_proto::TransportProtocol {
+            uri: "https://peer.example.com/derec".to_owned(),
+            protocol: derec_proto::Protocol::Https as i32,
+        }
+    }
+
+    /// A paired channel with the peer in the **Helper** role, so an inbound
+    /// request that requires an `Owner` peer fails the role gate. That is a
+    /// post-decrypt failure: authenticated, and therefore answerable.
+    async fn seed(channels: &mut InMemChannelStore, secrets: &mut InMemSecretStore) {
+        channels
+            .save(
+                SECRET_ID,
+                ChannelRecord::Helper(HelperChannel {
+                    channel_id: CHANNEL,
+                    transports: vec![endpoint()],
+                    communication_info: std::collections::HashMap::new(),
+                    status: ChannelStatus::Paired,
+                    created_at: now_secs(),
+                    peer_role: derec_proto::SenderKind::Helper,
+                }),
+            )
+            .await
+            .expect("seed channel");
+        secrets
+            .save(SECRET_ID, CHANNEL, SecretValue::SharedKey(SHARED_KEY))
+            .await
+            .expect("seed shared key");
+    }
+
+    fn build(
+        channels: InMemChannelStore,
+        secrets: InMemSecretStore,
+        transport: RecordingTransport,
+        auto_respond: bool,
+    ) -> DeRecProtocol<
+        InMemChannelStore,
+        InMemShareStore,
+        InMemSecretStore,
+        InMemUserSecretStore,
+        InMemStateStore,
+        RecordingTransport,
+    > {
+        DeRecProtocolBuilder::new(SECRET_ID)
+            .with_channel_store(channels)
+            .with_share_store(InMemShareStore::default())
+            .with_secret_store(secrets)
+            .with_user_secret_store(InMemUserSecretStore::default())
+            .with_transport(transport)
+            .with_state_store(InMemStateStore)
+            .with_own_transport("https://owner.example.com")
+            .with_threshold(2)
+            .with_auto_respond_on_failure(auto_respond)
+            .build()
+            .expect("test protocol builds")
+    }
+
+    /// An inbound `VerifyShareResponse` from a peer recorded as a Helper
+    /// fails the role gate — a response is only legal from a Helper, so the
+    /// request direction is what this channel refuses.
+    fn failing_request() -> Vec<u8> {
+        let timestamp = crate::derec_message::current_timestamp();
+        crate::derec_message::DeRecMessageBuilder::channel()
+            .channel_id(CHANNEL)
+            .timestamp(timestamp)
+            .message_body(derec_proto::MessageBody::VerifyShareRequest(
+                derec_proto::VerifyShareRequestMessage {
+                    secret_id: SECRET_ID,
+                    version: 1,
+                    nonce: 7,
+                    timestamp: Some(timestamp),
+                    reply_to: Vec::new(),
+                },
+            ))
+            .encrypt(&SHARED_KEY)
+            .expect("encrypt")
+            .build()
+            .expect("build")
+            .encode_to_vec()
+    }
+
+    /// Disabled is the default and stays silent: the failure is the caller's
+    /// to act on, and the peer is told nothing.
+    #[test]
+    fn disabled_sends_nothing_and_still_errors() {
+        run_async(async {
+            let channels = InMemChannelStore::default();
+            let secrets = InMemSecretStore::default();
+            let transport = RecordingTransport::default();
+            let (mut c, mut s) = (channels.clone(), secrets.clone());
+            seed(&mut c, &mut s).await;
+
+            let mut protocol = build(channels, secrets, transport.clone(), false);
+            let result = protocol.process(&failing_request()).await;
+
+            assert!(result.is_err(), "the failure must reach the caller");
+            assert!(
+                transport.sent_envelopes().is_empty(),
+                "nothing may go on the wire when the setting is off"
+            );
+        });
+    }
+
+    /// Enabled tells the peer as well — and still returns the same error, so
+    /// the caller's handling does not change with the setting.
+    #[test]
+    fn enabled_sends_a_failure_response_and_still_errors() {
+        run_async(async {
+            let channels = InMemChannelStore::default();
+            let secrets = InMemSecretStore::default();
+            let transport = RecordingTransport::default();
+            let (mut c, mut s) = (channels.clone(), secrets.clone());
+            seed(&mut c, &mut s).await;
+
+            let mut protocol = build(channels, secrets, transport.clone(), true);
+            let result = protocol.process(&failing_request()).await;
+
+            assert!(
+                result.is_err(),
+                "the caller still gets the error that mattered"
+            );
+
+            let sent = transport.sent_envelopes();
+            assert_eq!(sent.len(), 1, "exactly one failure response");
+
+            // It is a real, decryptable VerifyShareResponse carrying a
+            // non-Ok status — not merely "some bytes were sent".
+            let envelope = derec_proto::DeRecMessage::decode(sent[0].as_slice())
+                .expect("the response is a DeRec envelope");
+            let inner = crate::derec_message::extract_inner_message(&envelope.message, &SHARED_KEY)
+                .expect("the peer can decrypt it under the channel key");
+            let derec_proto::MessageBody::VerifyShareResponse(response) = inner else {
+                panic!("expected a VerifyShareResponse, got {inner:?}");
+            };
+            let status = response.result.expect("a result is present").status;
+            assert_ne!(
+                status,
+                derec_proto::StatusEnum::Ok as i32,
+                "the response must report failure"
+            );
+        });
+    }
+
+    /// A message that fails to decrypt is not authenticated, so nothing is
+    /// sent back even with the setting on — otherwise anyone able to reach
+    /// this device could use it as an oracle.
+    #[test]
+    fn an_undecryptable_message_is_never_answered() {
+        run_async(async {
+            let channels = InMemChannelStore::default();
+            let secrets = InMemSecretStore::default();
+            let transport = RecordingTransport::default();
+            let (mut c, mut s) = (channels.clone(), secrets.clone());
+            seed(&mut c, &mut s).await;
+
+            // Right channel, wrong key: decryption fails before dispatch.
+            let timestamp = crate::derec_message::current_timestamp();
+            let envelope = crate::derec_message::DeRecMessageBuilder::channel()
+                .channel_id(CHANNEL)
+                .timestamp(timestamp)
+                .message_body(derec_proto::MessageBody::VerifyShareRequest(
+                    derec_proto::VerifyShareRequestMessage {
+                        secret_id: SECRET_ID,
+                        version: 1,
+                        nonce: 7,
+                        timestamp: Some(timestamp),
+                        reply_to: Vec::new(),
+                    },
+                ))
+                .encrypt(&[1u8; 32])
+                .expect("encrypt")
+                .build()
+                .expect("build")
+                .encode_to_vec();
+
+            let mut protocol = build(channels, secrets, transport.clone(), true);
+            let result = protocol.process(&envelope).await;
+
+            assert!(result.is_err(), "an undecryptable message still errors");
+            assert!(
+                transport.sent_envelopes().is_empty(),
+                "an unauthenticated message must never be answered"
+            );
+        });
     }
 }

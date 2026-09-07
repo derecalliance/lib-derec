@@ -88,7 +88,20 @@ type UnpairRequestMessage struct {
 	// See `StoreShareRequestMessage.replyTo` for full semantics. Absent =
 	// route to the stored channel endpoint; Present = route this response
 	// here without persisting the endpoint.
-	ReplyTo       *TransportProtocol `protobuf:"bytes,3,opt,name=replyTo,proto3,oneof" json:"replyTo,omitempty"`
+	ReplyTo *TransportProtocol `protobuf:"bytes,3,opt,name=replyTo,proto3,oneof" json:"replyTo,omitempty"`
+	// Identity of the replica-group member that initiated this unpair.
+	//
+	// A replica-originated unpair MUST carry it; an owner-originated one MUST
+	// NOT. Its presence is what tells the receiver which path the message
+	// belongs to, exactly as on `StoreShareRequestMessage`. Asserted on send
+	// and on receive; a violation is a protocol error.
+	//
+	// Removing a replica is not the same operation as unpairing a helper. A
+	// helper channel serves exactly one peer, so unpairing deletes it. Every
+	// member of a replica group shares one channel, so deleting it would sever
+	// the whole group — replica removal edits a member row instead, and this
+	// field says which row.
+	ReplicaId     *uint64 `protobuf:"varint,4,opt,name=replicaId,proto3,oneof" json:"replicaId,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -142,6 +155,13 @@ func (x *UnpairRequestMessage) GetReplyTo() *TransportProtocol {
 		return x.ReplyTo
 	}
 	return nil
+}
+
+func (x *UnpairRequestMessage) GetReplicaId() uint64 {
+	if x != nil && x.ReplicaId != nil {
+		return *x.ReplicaId
+	}
+	return 0
 }
 
 // UnpairResponseMessage is the response to an UnpairRequestMessage.
@@ -230,13 +250,16 @@ var File_unpair_proto protoreflect.FileDescriptor
 
 const file_unpair_proto_rawDesc = "" +
 	"\n" +
-	"\funpair.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\xc4\x01\n" +
+	"\funpair.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\xf5\x01\n" +
 	"\x14UnpairRequestMessage\x12\x12\n" +
 	"\x04memo\x18\x01 \x01(\tR\x04memo\x128\n" +
 	"\ttimestamp\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12R\n" +
-	"\areplyTo\x18\x03 \x01(\v23.org.derecalliance.derec.protobuf.TransportProtocolH\x00R\areplyTo\x88\x01\x01B\n" +
+	"\areplyTo\x18\x03 \x01(\v23.org.derecalliance.derec.protobuf.TransportProtocolH\x00R\areplyTo\x88\x01\x01\x12!\n" +
+	"\treplicaId\x18\x04 \x01(\x04H\x01R\treplicaId\x88\x01\x01B\n" +
 	"\n" +
-	"\b_replyTo\"\x98\x01\n" +
+	"\b_replyToB\f\n" +
+	"\n" +
+	"_replicaId\"\x98\x01\n" +
 	"\x15UnpairResponseMessage\x12E\n" +
 	"\x06result\x18\x01 \x01(\v2-.org.derecalliance.derec.protobuf.DeRecResultR\x06result\x128\n" +
 	"\ttimestamp\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestampb\x06proto3"

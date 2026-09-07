@@ -86,7 +86,7 @@ func TestDecodeEvents_ReplicaSecretReceived(t *testing.T) {
 		"version": 3,
 		"secret": {
 			"helpers": [
-				{"channel_id": "1", "transport_uri": "https://h1", "shared_key": [1,2,3], "communication_info": {"k": "v"}}
+				{"channel_id": "1", "transports": [{"uri": "https://h1", "protocol": 0}], "shared_key": [1,2,3], "communication_info": {"k": "v"}}
 			],
 			"secrets": [
 				{"id": [9,9], "name": "n1", "data": [10,11]}
@@ -94,8 +94,8 @@ func TestDecodeEvents_ReplicaSecretReceived(t *testing.T) {
 			"replicas": {
 				"channel_id": "21",
 				"members": [
-					{"replica_id": "48879", "transport_uri": "https://src", "role": "Source", "communication_info": {}},
-					{"replica_id": "0xCAFE", "transport_uri": "https://r1", "role": "Destination", "communication_info": {}}
+					{"replica_id": "48879", "transports": [{"uri": "https://src", "protocol": 0}], "role": "Source", "communication_info": {}},
+					{"replica_id": "0xCAFE", "transports": [{"uri": "https://r1", "protocol": 0}], "role": "Destination", "communication_info": {}}
 				],
 				"shared_key": [1,2,3,4]
 			}
@@ -117,7 +117,7 @@ func TestDecodeEvents_ReplicaSecretReceived(t *testing.T) {
 		t.Fatal("expected non-nil Secret")
 	}
 	if len(ev.Secret.Helpers) != 1 || ev.Secret.Helpers[0].ChannelID != "1" ||
-		ev.Secret.Helpers[0].TransportURI != "https://h1" ||
+		ev.Secret.Helpers[0].Transports[0].URI != "https://h1" ||
 		string(ev.Secret.Helpers[0].SharedKey) != string([]byte{1, 2, 3}) ||
 		ev.Secret.Helpers[0].CommunicationInfo["k"] != "v" {
 		t.Fatalf("Helpers: got %+v", ev.Secret.Helpers)

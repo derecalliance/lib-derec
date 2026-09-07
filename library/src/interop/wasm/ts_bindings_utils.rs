@@ -85,6 +85,7 @@ fn categorize(err: &crate::Error) -> (&'static str, &'static str) {
         crate::Error::ShareStore(_) => ("share_store", "STORE_ERROR"),
         crate::Error::StateStore(_) => ("state_store", "STORE_ERROR"),
         crate::Error::Transport(_) => ("input", "TRANSPORT_INVALID"),
+        crate::Error::NoUsableEndpoint { .. } => ("input", "NO_COMMON_TRANSPORT"),
         crate::Error::InvalidInput(_) => ("input", "INVALID_INPUT"),
         crate::Error::ProtobufDecode(_) => ("protobuf", "DECODE_ERROR"),
         crate::Error::ProtobufEncode(_) => ("protobuf", "ENCODE_ERROR"),

@@ -386,10 +386,18 @@ interface OutboundMessage {
 class RecordingTransport implements Transport {
   private outbox: OutboundMessage[] = [];
 
+  // The library hands over every endpoint the peer advertised, filtered but
+  // unranked, and delivery to any one of them is success. A real transport
+  // would try them in order and fall back; recording the first keeps the
+  // outbox assertions below addressed by a single uri.
   async send(
-    endpoint: { protocol: string; uri: string },
+    endpoints: ReadonlyArray<{ protocol: string; uri: string }>,
     message: Uint8Array,
   ): Promise<void> {
+    const endpoint = endpoints[0];
+    if (!endpoint) {
+      throw new Error("transport: send called with no endpoints");
+    }
     this.outbox.push({ endpoint, message });
   }
 
@@ -630,7 +638,7 @@ async function runFingerprintMismatchFlow(): Promise<void> {
     Replica: {
       channel_id: Number(channelId),
       replica_id: replicaId,
-      transport: { uri: "https://peer.example.com", protocol: 0 },
+      transports: [{ uri: "https://peer.example.com", protocol: 0 }],
       communication_info: {},
       role: "Destination",
       status: "Pending",
@@ -1407,9 +1415,11 @@ async function runReplyToFlow(): Promise<void> {
     outboundMsg.message,
     sharedKey,
   );
-  if (!decoded.reply_to || decoded.reply_to.uri !== ownerUri) {
+  // reply_to is a list now: auto_reply_to advertises every endpoint this
+  // device serves, leading with its own transport.
+  if (!decoded.reply_to?.length || decoded.reply_to[0]!.uri !== ownerUri) {
     throw new Error(
-      `auto_reply_to must stamp replyTo = ownerUri (${ownerUri}) on the inner request body, got ${JSON.stringify(decoded.reply_to)}`,
+      `auto_reply_to must stamp replyTo leading with ownerUri (${ownerUri}) on the inner request body, got ${JSON.stringify(decoded.reply_to)}`,
     );
   }
 
@@ -1431,9 +1441,9 @@ async function runReplyToFlow(): Promise<void> {
     defaultMsg.message,
     defaultSharedKey,
   );
-  if (defaultDecoded.reply_to) {
+  if (defaultDecoded.reply_to?.length) {
     throw new Error(
-      `without auto_reply_to, request.reply_to must be unset; got ${JSON.stringify(defaultDecoded.reply_to)}`,
+      `without auto_reply_to, request.reply_to must be empty; got ${JSON.stringify(defaultDecoded.reply_to)}`,
     );
   }
 
@@ -1828,9 +1838,9 @@ async function runUpdateChannelInfoFlow(): Promise<void> {
     throw new Error("helper channel record must still exist after UpdateChannelInfo");
   }
   const helperStored = JSON.parse(utf8Decode(helperStoredBytes)).Helper;
-  if (helperStored.transport.uri !== newUri) {
+  if (helperStored.transports[0].uri !== newUri) {
     throw new Error(
-      `helper's stored transport.uri must reflect the announced update; got ${helperStored.transport.uri}`,
+      `helper's stored transports[0].uri must reflect the announced update; got ${helperStored.transports[0].uri}`,
     );
   }
   for (const [k, v] of Object.entries(newInfo)) {

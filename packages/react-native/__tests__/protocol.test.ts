@@ -284,7 +284,7 @@ describe('event byte fields', () => {
       {
         type: 'SecretRecovered',
         secret: {
-          helpers: [{channel_id: '1', transport_uri: 'x', shared_key: [9], communication_info: {}}],
+          helpers: [{channel_id: '1', transports: [{ uri: 'x', protocol: 0 }], shared_key: [9], communication_info: {}}],
           secrets: [{id: [1], name: 'n', data: [2, 3]}],
         },
       },

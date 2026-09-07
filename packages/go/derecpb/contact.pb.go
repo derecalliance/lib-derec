@@ -41,7 +41,9 @@ const (
 	// `channelId`, `nonce`, and `transportProtocol`; the contact creator
 	// generates key material on the fly when the corresponding
 	// `PrePairRequest` arrives. Only appropriate when the out-of-band
-	// delivery channel is fully trusted.
+	// delivery channel is fully trusted, and the channel stays unusable
+	// until both sides confirm the fingerprint out of band — nothing else
+	// binds the published keys to the contact.
 	ContactMode_NO_KEYS ContactMode = 2
 )
 

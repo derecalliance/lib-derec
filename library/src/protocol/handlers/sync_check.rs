@@ -109,7 +109,7 @@ pub(in crate::protocol) async fn start<
             // The asker names itself so the answer can be routed back to a
             // member rather than treated as an owner ↔ helper exchange.
             replica_id: Some(own),
-            reply_to: Some(own_transport.clone()),
+            reply_to: vec![own_transport.clone()],
         };
         let envelope = DeRecMessageBuilder::channel()
             .channel_id(peer.channel_id)
@@ -121,7 +121,7 @@ pub(in crate::protocol) async fn start<
 
         // A peer we cannot reach is simply not waited on: it can never
         // answer, and counting it would stall the check until the timeout.
-        if transport.send(&peer.transport, envelope).await.is_ok() {
+        if transport.send(&peer.transports, envelope).await.is_ok() {
             asked.insert(peer.replica_id);
         }
     }
@@ -199,10 +199,12 @@ pub(in crate::protocol) async fn answer_versions<Us: DeRecUserSecretStore, T: De
         .build()?
         .encode_to_vec();
     let envelope = super::apply_trace_id(envelope, inbound_trace_id)?;
-    let endpoint = request
-        .reply_to
-        .clone()
-        .unwrap_or_else(|| member.transport.clone());
+    // A reply-to overrides the recorded endpoints for this exchange only.
+    let endpoint = if request.reply_to.is_empty() {
+        member.transports.clone()
+    } else {
+        request.reply_to.clone()
+    };
     transport.send(&endpoint, envelope).await?;
 
     Ok(vec![DeRecEvent::NoOp])
@@ -338,7 +340,7 @@ async fn finish<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRecTransport>(
         secret_id,
         version: group_version,
         timestamp: Some(timestamp),
-        reply_to: Some(own_transport.clone()),
+        reply_to: vec![own_transport.clone()],
         replica_id: local_replica_id,
     };
     let envelope = DeRecMessageBuilder::channel()
@@ -348,7 +350,7 @@ async fn finish<Ch: DeRecChannelStore, Ss: DeRecSecretStore, T: DeRecTransport>(
         .encrypt(&key)?
         .build()?
         .encode_to_vec();
-    transport.send(&member.transport, envelope).await?;
+    transport.send(&member.transports, envelope).await?;
 
     #[cfg(feature = "logging")]
     tracing::info!(
@@ -430,10 +432,12 @@ pub(in crate::protocol) async fn answer_share<
         .build()?
         .encode_to_vec();
     let envelope = super::apply_trace_id(envelope, inbound_trace_id)?;
-    let endpoint = request
-        .reply_to
-        .clone()
-        .unwrap_or_else(|| member.transport.clone());
+    // A reply-to overrides the recorded endpoints for this exchange only.
+    let endpoint = if request.reply_to.is_empty() {
+        member.transports.clone()
+    } else {
+        request.reply_to.clone()
+    };
     transport.send(&endpoint, envelope).await?;
 
     Ok(vec![DeRecEvent::NoOp])
@@ -516,7 +520,7 @@ mod tests {
                 ChannelRecord::Replica(ReplicaMember {
                     channel_id: GROUP,
                     replica_id: ReplicaId(id),
-                    transport: endpoint(uri),
+                    transports: vec![endpoint(uri)],
                     communication_info: std::collections::HashMap::new(),
                     role,
                     status: ChannelStatus::Paired,

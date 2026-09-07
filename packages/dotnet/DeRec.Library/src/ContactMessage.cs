@@ -55,6 +55,10 @@ public sealed record ContactMessage(
     /// <see cref="DeRecException"/> instead of producing a wire blob that
     /// downstream consumers would reject anyway.
     /// </remarks>
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+#pragma warning disable CS0612
     internal byte[] ToProtoBytes()
     {
         var proto = new Org.Derecalliance.Derec.Protobuf.ContactMessage
@@ -92,6 +96,10 @@ public sealed record ContactMessage(
     /// if the contact is malformed (unknown <see cref="ContactMode"/>,
     /// mode/field mismatch, wrong binding-hash length).
     /// </summary>
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+#pragma warning disable CS0612
     internal static ContactMessage FromProtoBytes(byte[] bytes)
     {
         Validate(bytes);
@@ -133,3 +141,4 @@ public sealed record ContactMessage(
         Utils.ThrowIfError(error);
     }
 }
+#pragma warning restore CS0612

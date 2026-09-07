@@ -238,9 +238,19 @@ pub struct ContactMessage {
     #[serde(with = "serde_bytes", default, skip_serializing_if = "Option::is_none")]
     pub contact_binding_hash: Option<Vec<u8>>,
     pub timestamp: Option<Timestamp>,
+    /// Every transport endpoint the creator of this contact can be
+    /// reached on, in its own preference order. Empty means "only
+    /// `transport_protocol` is offered", which is how every
+    /// implementation predating this field behaves.
+    #[serde(default)]
+    pub supported_transports: Vec<TransportProtocol>,
 }
 
 impl From<derec_proto::ContactMessage> for ContactMessage {
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+    #[allow(deprecated)]
     fn from(value: derec_proto::ContactMessage) -> Self {
         Self {
             channel_id: value.channel_id,
@@ -251,11 +261,20 @@ impl From<derec_proto::ContactMessage> for ContactMessage {
             ecies_public_key: value.ecies_public_key,
             contact_binding_hash: value.contact_binding_hash,
             timestamp: value.timestamp.map(Into::into),
+            supported_transports: value
+                .supported_transports
+                .into_iter()
+                .map(Into::into)
+                .collect(),
         }
     }
 }
 
 impl From<ContactMessage> for derec_proto::ContactMessage {
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+    #[allow(deprecated)]
     fn from(value: ContactMessage) -> Self {
         Self {
             channel_id: value.channel_id,
@@ -266,6 +285,11 @@ impl From<ContactMessage> for derec_proto::ContactMessage {
             ecies_public_key: value.ecies_public_key,
             contact_binding_hash: value.contact_binding_hash,
             timestamp: value.timestamp.map(Into::into),
+            supported_transports: value
+                .supported_transports
+                .into_iter()
+                .map(Into::into)
+                .collect(),
         }
     }
 }
@@ -282,9 +306,18 @@ pub struct PairRequestMessage {
     pub parameter_range: Option<ParameterRange>,
     pub transport_protocol: Option<TransportProtocol>,
     pub timestamp: Option<Timestamp>,
+    /// Every transport endpoint the initiator can be reached on, in its
+    /// own preference order. Empty means "only `transport_protocol` is
+    /// offered".
+    #[serde(default)]
+    pub supported_transports: Vec<TransportProtocol>,
 }
 
 impl From<derec_proto::PairRequestMessage> for PairRequestMessage {
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+    #[allow(deprecated)]
     fn from(value: derec_proto::PairRequestMessage) -> Self {
         Self {
             sender_kind: value.sender_kind,
@@ -295,11 +328,20 @@ impl From<derec_proto::PairRequestMessage> for PairRequestMessage {
             parameter_range: value.parameter_range.map(Into::into),
             transport_protocol: value.transport_protocol.map(Into::into),
             timestamp: value.timestamp.map(Into::into),
+            supported_transports: value
+                .supported_transports
+                .into_iter()
+                .map(Into::into)
+                .collect(),
         }
     }
 }
 
 impl From<PairRequestMessage> for derec_proto::PairRequestMessage {
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+    #[allow(deprecated)]
     fn from(value: PairRequestMessage) -> Self {
         Self {
             sender_kind: value.sender_kind,
@@ -310,6 +352,11 @@ impl From<PairRequestMessage> for derec_proto::PairRequestMessage {
             parameter_range: value.parameter_range.map(Into::into),
             transport_protocol: value.transport_protocol.map(Into::into),
             timestamp: value.timestamp.map(Into::into),
+            supported_transports: value
+                .supported_transports
+                .into_iter()
+                .map(Into::into)
+                .collect(),
         }
     }
 }
@@ -355,26 +402,50 @@ impl From<PairResponseMessage> for derec_proto::PairResponseMessage {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PrePairRequestMessage {
     pub nonce: u64,
+    /// Deprecated: superseded by `supported_transports`. Scheduled for
+    /// removal in v0.0.5.
     pub transport_protocol: Option<TransportProtocol>,
     pub timestamp: Option<Timestamp>,
+    /// Every endpoint the sender can be reached on for the PrePair reply,
+    /// in its own preference order.
+    #[serde(default)]
+    pub supported_transports: Vec<TransportProtocol>,
 }
 
 impl From<derec_proto::PrePairRequestMessage> for PrePairRequestMessage {
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+    #[allow(deprecated)]
     fn from(value: derec_proto::PrePairRequestMessage) -> Self {
         Self {
             nonce: value.nonce,
             transport_protocol: value.transport_protocol.map(Into::into),
             timestamp: value.timestamp.map(Into::into),
+            supported_transports: value
+                .supported_transports
+                .into_iter()
+                .map(Into::into)
+                .collect(),
         }
     }
 }
 
 impl From<PrePairRequestMessage> for derec_proto::PrePairRequestMessage {
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+    #[allow(deprecated)]
     fn from(value: PrePairRequestMessage) -> Self {
         Self {
             nonce: value.nonce,
             transport_protocol: value.transport_protocol.map(Into::into),
             timestamp: value.timestamp.map(Into::into),
+            supported_transports: value
+                .supported_transports
+                .into_iter()
+                .map(Into::into)
+                .collect(),
         }
     }
 }
@@ -471,9 +542,11 @@ impl From<VersionList> for derec_proto::get_secret_ids_versions_response_message
 #[derive(Serialize, Deserialize, Clone)]
 pub struct GetSecretIdsVersionsRequestMessage {
     pub timestamp: Option<Timestamp>,
-    /// Optional ephemeral response endpoint. See `replyTo` on the request
-    /// proto for the routing semantics.
-    pub reply_to: Option<TransportProtocol>,
+    /// Every endpoint the requester can be answered on for this exchange,
+    /// in its own preference order. Empty means "route to the endpoints
+    /// recorded for this channel". See `replyTo` on the request proto.
+    #[serde(default)]
+    pub reply_to: Vec<TransportProtocol>,
     /// Identity of the replica-group member this message concerns, present
     /// only on the replica catch-up path. `null` on the owner ↔ helper path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -484,7 +557,7 @@ impl From<derec_proto::GetSecretIdsVersionsRequestMessage> for GetSecretIdsVersi
     fn from(value: derec_proto::GetSecretIdsVersionsRequestMessage) -> Self {
         Self {
             timestamp: value.timestamp.map(Into::into),
-            reply_to: value.reply_to.map(Into::into),
+            reply_to: value.reply_to.into_iter().map(Into::into).collect(),
             replica_id: value.replica_id,
         }
     }
@@ -494,7 +567,7 @@ impl From<GetSecretIdsVersionsRequestMessage> for derec_proto::GetSecretIdsVersi
     fn from(value: GetSecretIdsVersionsRequestMessage) -> Self {
         Self {
             timestamp: value.timestamp.map(Into::into),
-            reply_to: value.reply_to.map(Into::into),
+            reply_to: value.reply_to.into_iter().map(Into::into).collect(),
             replica_id: value.replica_id,
         }
     }
@@ -656,9 +729,11 @@ pub struct StoreShareRequestMessage {
     pub version_description: String,
     pub timestamp: Option<Timestamp>,
     pub secret_id: u64,
-    /// Optional ephemeral response endpoint. See `replyTo` on the request
-    /// proto for the routing semantics.
-    pub reply_to: Option<TransportProtocol>,
+    /// Every endpoint the requester can be answered on for this exchange,
+    /// in its own preference order. Empty means "route to the endpoints
+    /// recorded for this channel". See `replyTo` on the request proto.
+    #[serde(default)]
+    pub reply_to: Vec<TransportProtocol>,
     /// Optional `replica_id` of the writer. See the proto's `replicaId`
     /// field for the disambiguation contract.
     pub replica_id: Option<u64>,
@@ -674,7 +749,7 @@ impl From<derec_proto::StoreShareRequestMessage> for StoreShareRequestMessage {
             version_description: value.version_description,
             timestamp: value.timestamp.map(Into::into),
             secret_id: value.secret_id,
-            reply_to: value.reply_to.map(Into::into),
+            reply_to: value.reply_to.into_iter().map(Into::into).collect(),
             replica_id: value.replica_id,
         }
     }
@@ -690,7 +765,7 @@ impl From<StoreShareRequestMessage> for derec_proto::StoreShareRequestMessage {
             version_description: value.version_description,
             timestamp: value.timestamp.map(Into::into),
             secret_id: value.secret_id,
-            reply_to: value.reply_to.map(Into::into),
+            reply_to: value.reply_to.into_iter().map(Into::into).collect(),
             replica_id: value.replica_id,
         }
     }
@@ -738,9 +813,11 @@ pub struct GetShareRequestMessage {
     pub secret_id: u64,
     pub version: u32,
     pub timestamp: Option<Timestamp>,
-    /// Optional ephemeral response endpoint. See `replyTo` on the request
-    /// proto for the routing semantics.
-    pub reply_to: Option<TransportProtocol>,
+    /// Every endpoint the requester can be answered on for this exchange,
+    /// in its own preference order. Empty means "route to the endpoints
+    /// recorded for this channel". See `replyTo` on the request proto.
+    #[serde(default)]
+    pub reply_to: Vec<TransportProtocol>,
     /// Identity of the replica-group member this message concerns, present
     /// only on the replica catch-up path. `null` on the owner ↔ helper path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -753,7 +830,7 @@ impl From<derec_proto::GetShareRequestMessage> for GetShareRequestMessage {
             secret_id: value.secret_id,
             version: value.version,
             timestamp: value.timestamp.map(Into::into),
-            reply_to: value.reply_to.map(Into::into),
+            reply_to: value.reply_to.into_iter().map(Into::into).collect(),
             replica_id: value.replica_id,
         }
     }
@@ -765,7 +842,7 @@ impl From<GetShareRequestMessage> for derec_proto::GetShareRequestMessage {
             secret_id: value.secret_id,
             version: value.version,
             timestamp: value.timestamp.map(Into::into),
-            reply_to: value.reply_to.map(Into::into),
+            reply_to: value.reply_to.into_iter().map(Into::into).collect(),
             replica_id: value.replica_id,
         }
     }
@@ -818,9 +895,11 @@ impl From<GetShareResponseMessage> for derec_proto::GetShareResponseMessage {
 pub struct UnpairRequestMessage {
     pub memo: String,
     pub timestamp: Option<Timestamp>,
-    /// Optional ephemeral response endpoint. See `replyTo` on the request
-    /// proto for the routing semantics.
-    pub reply_to: Option<TransportProtocol>,
+    /// Every endpoint the requester can be answered on for this exchange,
+    /// in its own preference order. Empty means "route to the endpoints
+    /// recorded for this channel". See `replyTo` on the request proto.
+    #[serde(default)]
+    pub reply_to: Vec<TransportProtocol>,
     /// The replica-group member that initiated this unpair. Present exactly
     /// when the unpair is replica-originated — its presence is what tells the
     /// receiver which path the message belongs to, so it must survive a
@@ -834,7 +913,7 @@ impl From<derec_proto::UnpairRequestMessage> for UnpairRequestMessage {
         Self {
             memo: value.memo,
             timestamp: value.timestamp.map(Into::into),
-            reply_to: value.reply_to.map(Into::into),
+            reply_to: value.reply_to.into_iter().map(Into::into).collect(),
             replica_id: value.replica_id,
         }
     }
@@ -845,7 +924,7 @@ impl From<UnpairRequestMessage> for derec_proto::UnpairRequestMessage {
         Self {
             memo: value.memo,
             timestamp: value.timestamp.map(Into::into),
-            reply_to: value.reply_to.map(Into::into),
+            reply_to: value.reply_to.into_iter().map(Into::into).collect(),
             replica_id: value.replica_id,
         }
     }
@@ -881,9 +960,11 @@ pub struct VerifyShareRequestMessage {
     pub version: u32,
     pub nonce: u64,
     pub timestamp: Option<Timestamp>,
-    /// Optional ephemeral response endpoint. See `replyTo` on the request
-    /// proto for the routing semantics.
-    pub reply_to: Option<TransportProtocol>,
+    /// Every endpoint the requester can be answered on for this exchange,
+    /// in its own preference order. Empty means "route to the endpoints
+    /// recorded for this channel". See `replyTo` on the request proto.
+    #[serde(default)]
+    pub reply_to: Vec<TransportProtocol>,
 }
 
 impl From<derec_proto::VerifyShareRequestMessage> for VerifyShareRequestMessage {
@@ -893,7 +974,7 @@ impl From<derec_proto::VerifyShareRequestMessage> for VerifyShareRequestMessage 
             version: value.version,
             nonce: value.nonce,
             timestamp: value.timestamp.map(Into::into),
-            reply_to: value.reply_to.map(Into::into),
+            reply_to: value.reply_to.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -905,7 +986,7 @@ impl From<VerifyShareRequestMessage> for derec_proto::VerifyShareRequestMessage 
             version: value.version,
             nonce: value.nonce,
             timestamp: value.timestamp.map(Into::into),
-            reply_to: value.reply_to.map(Into::into),
+            reply_to: value.reply_to.into_iter().map(Into::into).collect(),
         }
     }
 }

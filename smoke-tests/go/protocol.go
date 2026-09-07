@@ -13,6 +13,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"strconv"
 	"sync"
@@ -385,6 +386,10 @@ type outboxEntry struct {
 
 // memTransport buffers outbound (uri, message) pairs instead of performing
 // network I/O: Send appends to the outbox, drain retrieves and clears it.
+//
+// The library hands over every endpoint the peer advertised, filtered but
+// unranked, and delivery to any one of them is success. A real transport
+// would try them in order and fall back; buffering the first is enough here.
 type memTransport struct {
 	mu     sync.Mutex
 	outbox []outboxEntry
@@ -394,10 +399,13 @@ func newMemTransport() *memTransport {
 	return &memTransport{}
 }
 
-func (t *memTransport) Send(uri string, _ int32, message []byte) error {
+func (t *memTransport) Send(endpoints []protocol.Endpoint, message []byte) error {
+	if len(endpoints) == 0 {
+		return errors.New("transport: send called with no endpoints")
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.outbox = append(t.outbox, outboxEntry{uri: uri, message: append([]byte(nil), message...)})
+	t.outbox = append(t.outbox, outboxEntry{uri: endpoints[0].URI, message: append([]byte(nil), message...)})
 	return nil
 }
 
@@ -888,7 +896,7 @@ func runUnsafeHTTP() {
 			OwnTransportProtocol: int32(derecpb.Protocol_HTTPS),
 			Threshold:            2,
 			KeepVersionsCount:    3,
-			UnsafeHTTP:           allow,
+			UnsafeHTTP:           &allow,
 		}
 		p, err := protocol.New(
 			newMemChannelStore(), newMemShareStore(), newMemSecretStore(),

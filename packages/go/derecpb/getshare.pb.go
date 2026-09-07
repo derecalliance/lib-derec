@@ -89,7 +89,17 @@ type GetShareRequestMessage struct {
 	// See `StoreShareRequestMessage.replyTo` for full semantics. Absent =
 	// route to the stored channel endpoint; Present = route this response
 	// here without persisting the endpoint.
-	ReplyTo       *TransportProtocol `protobuf:"bytes,4,opt,name=replyTo,proto3,oneof" json:"replyTo,omitempty"`
+	ReplyTo *TransportProtocol `protobuf:"bytes,4,opt,name=replyTo,proto3,oneof" json:"replyTo,omitempty"`
+	// Identity of the replica-group member this message concerns.
+	//
+	// Present **only** on the replica path, where a member drives catch-up
+	// against another member. Absent on the owner ↔ helper path, which is
+	// unchanged.
+	//
+	// Every member of a group is addressed on one shared `channel_id`, so the
+	// channel cannot name the peer — this field does. Its presence is also what
+	// tells the receiver which path a message belongs to.
+	ReplicaId     *uint64 `protobuf:"varint,5,opt,name=replicaId,proto3,oneof" json:"replicaId,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -150,6 +160,13 @@ func (x *GetShareRequestMessage) GetReplyTo() *TransportProtocol {
 		return x.ReplyTo
 	}
 	return nil
+}
+
+func (x *GetShareRequestMessage) GetReplicaId() uint64 {
+	if x != nil && x.ReplicaId != nil {
+		return *x.ReplicaId
+	}
+	return 0
 }
 
 // GetShareResponseMessage returns a share previously stored by the Helper.
@@ -224,7 +241,17 @@ type GetShareResponseMessage struct {
 	//
 	// Echoed from the corresponding GetShareRequestMessage for the same
 	// correlation reasons as `secretId`.
-	Version       uint32 `protobuf:"varint,6,opt,name=version,proto3" json:"version,omitempty"`
+	Version uint32 `protobuf:"varint,6,opt,name=version,proto3" json:"version,omitempty"`
+	// Identity of the replica-group member this message concerns.
+	//
+	// Present **only** on the replica path, where a member drives catch-up
+	// against another member. Absent on the owner ↔ helper path, which is
+	// unchanged.
+	//
+	// Every member of a group is addressed on one shared `channel_id`, so the
+	// channel cannot name the peer — this field does. Its presence is also what
+	// tells the receiver which path a message belongs to.
+	ReplicaId     *uint64 `protobuf:"varint,7,opt,name=replicaId,proto3,oneof" json:"replicaId,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -301,25 +328,38 @@ func (x *GetShareResponseMessage) GetVersion() uint32 {
 	return 0
 }
 
+func (x *GetShareResponseMessage) GetReplicaId() uint64 {
+	if x != nil && x.ReplicaId != nil {
+		return *x.ReplicaId
+	}
+	return 0
+}
+
 var File_getshare_proto protoreflect.FileDescriptor
 
 const file_getshare_proto_rawDesc = "" +
 	"\n" +
-	"\x0egetshare.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\xe8\x01\n" +
+	"\x0egetshare.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\x99\x02\n" +
 	"\x16GetShareRequestMessage\x12\x1a\n" +
 	"\bsecretId\x18\x01 \x01(\x04R\bsecretId\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\rR\aversion\x128\n" +
 	"\ttimestamp\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12R\n" +
-	"\areplyTo\x18\x04 \x01(\v23.org.derecalliance.derec.protobuf.TransportProtocolH\x00R\areplyTo\x88\x01\x01B\n" +
+	"\areplyTo\x18\x04 \x01(\v23.org.derecalliance.derec.protobuf.TransportProtocolH\x00R\areplyTo\x88\x01\x01\x12!\n" +
+	"\treplicaId\x18\x05 \x01(\x04H\x01R\treplicaId\x88\x01\x01B\n" +
 	"\n" +
-	"\b_replyTo\"\xaa\x02\n" +
+	"\b_replyToB\f\n" +
+	"\n" +
+	"_replicaId\"\xdb\x02\n" +
 	"\x17GetShareResponseMessage\x12E\n" +
 	"\x06result\x18\x01 \x01(\v2-.org.derecalliance.derec.protobuf.DeRecResultR\x06result\x120\n" +
 	"\x13committedDeRecShare\x18\x02 \x01(\fR\x13committedDeRecShare\x12&\n" +
 	"\x0eshareAlgorithm\x18\x03 \x01(\x05R\x0eshareAlgorithm\x128\n" +
 	"\ttimestamp\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12\x1a\n" +
 	"\bsecretId\x18\x05 \x01(\x04R\bsecretId\x12\x18\n" +
-	"\aversion\x18\x06 \x01(\rR\aversionb\x06proto3"
+	"\aversion\x18\x06 \x01(\rR\aversion\x12!\n" +
+	"\treplicaId\x18\a \x01(\x04H\x00R\treplicaId\x88\x01\x01B\f\n" +
+	"\n" +
+	"_replicaIdb\x06proto3"
 
 var (
 	file_getshare_proto_rawDescOnce sync.Once
@@ -361,6 +401,7 @@ func file_getshare_proto_init() {
 	file_result_proto_init()
 	file_transportprotocol_proto_init()
 	file_getshare_proto_msgTypes[0].OneofWrappers = []any{}
+	file_getshare_proto_msgTypes[1].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

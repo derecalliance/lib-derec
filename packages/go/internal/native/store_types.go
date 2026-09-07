@@ -17,7 +17,10 @@ import (
 // row for the same channel carries SenderKindOwner.
 type HelperChannel struct {
 	ChannelID         uint64
-	Transport         TransportEndpoint
+	// Transports are every endpoint the peer advertised, in the order it
+	// offered them. The library does not rank them; a Transport
+	// implementation chooses which to dial and may fall back.
+	Transports        []TransportEndpoint
 	CommunicationInfo map[string]string
 	PeerRole          SenderKind
 	Status            ChannelStatus
@@ -32,7 +35,10 @@ type HelperChannel struct {
 type ReplicaMember struct {
 	ChannelID         uint64
 	ReplicaID         uint64
-	Transport         TransportEndpoint
+	// Transports are every endpoint the peer advertised, in the order it
+	// offered them. The library does not rank them; a Transport
+	// implementation chooses which to dial and may fall back.
+	Transports        []TransportEndpoint
 	CommunicationInfo map[string]string
 	Role              ReplicaRole
 	Status            ChannelStatus

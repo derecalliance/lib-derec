@@ -25,7 +25,7 @@
 //! ```
 
 use crate::interop::ffi::common::{
-    DeRecBuffer, empty_buffer, parse_optional_transport_protocol, read_exact, read_u32_le,
+    DeRecBuffer, empty_buffer, parse_transport_protocol_list, read_exact, read_u32_le,
     vec_into_buffer, write_u32_le, write_u64_le,
 };
 use crate::interop::ffi::error::{
@@ -97,12 +97,13 @@ pub extern "C" fn produce_get_secret_ids_versions_request_message(
         Err(e) => return with_err(e),
     };
 
-    let reply_to = match parse_optional_transport_protocol(reply_to_ptr, reply_to_len) {
+    let reply_to = match parse_transport_protocol_list(reply_to_ptr, reply_to_len, "reply_to_ptr") {
         Ok(rt) => rt,
         Err(e) => return with_err(e),
     };
 
-    match crate::primitives::discovery::request::produce(channel_id.into(), &shared_key, reply_to) {
+    match crate::primitives::discovery::request::produce(channel_id.into(), &shared_key, &reply_to)
+    {
         Ok(r) => ProduceGetSecretIdsVersionsRequestMessageResult {
             error: success(),
             envelope_wire_bytes: vec_into_buffer(r.envelope),

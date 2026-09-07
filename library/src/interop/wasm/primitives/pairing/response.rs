@@ -20,7 +20,9 @@ use wasm_bindgen::prelude::*;
 pub struct ProduceResult {
     #[serde(with = "serde_bytes")]
     pub envelope: Vec<u8>,
-    pub peer_transport_protocol: TransportProtocol,
+    /// Every endpoint the requester advertised, in the order it offered
+    /// them. The application chooses which to dial.
+    pub peer_transports: Vec<TransportProtocol>,
     #[serde(with = "serde_bytes")]
     pub shared_key: Vec<u8>,
     /// Post-handshake rekey channel id the responder is committing to.
@@ -53,6 +55,7 @@ pub fn produce(
     secret_key: &[u8],
     communication_info: JsValue,
     parameter_range: JsValue,
+    unsafe_connection: bool,
 ) -> Result<JsValue, JsValue> {
     let pairing_sk = deserialize_pairing_secret_key_material(secret_key)?;
     let request: PairRequestMessage = from_js(request)?;
@@ -79,12 +82,13 @@ pub fn produce(
         &pairing_sk,
         communication_info_proto,
         parameter_range_proto,
+        crate::transport::TransportPolicy::new(unsafe_connection),
     )
     .map_err(js_error_from_lib)?;
 
     to_js(&ProduceResult {
         envelope: result.envelope,
-        peer_transport_protocol: result.peer_transport_protocol.into(),
+        peer_transports: result.peer_transports.into_iter().map(Into::into).collect(),
         shared_key: result.shared_key.to_vec(),
         channel_id: result.channel_id.into(),
     })

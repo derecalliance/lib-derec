@@ -305,10 +305,27 @@ pub struct ReplicasWire {
     pub shared_key: Vec<u8>,
 }
 
+/// One advertised endpoint, carrying its protocol discriminant so an SDK
+/// never infers a protocol from a URI scheme.
+#[derive(Serialize)]
+pub struct Endpoint {
+    pub uri: String,
+    pub protocol: i32,
+}
+
+impl From<derec_proto::TransportProtocol> for Endpoint {
+    fn from(t: derec_proto::TransportProtocol) -> Self {
+        Endpoint {
+            uri: t.uri,
+            protocol: t.protocol,
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub struct Helper {
     pub channel_id: String,
-    pub transport_uri: String,
+    pub transports: Vec<Endpoint>,
     pub shared_key: Vec<u8>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub communication_info: HashMap<String, String>,
@@ -317,7 +334,7 @@ pub struct Helper {
 #[derive(Serialize)]
 pub struct Replica {
     pub replica_id: String,
-    pub transport_uri: String,
+    pub transports: Vec<Endpoint>,
     /// `"Source"` or `"Destination"` — the member's role in the group.
     pub role: String,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
@@ -345,7 +362,7 @@ impl From<Secret> for SecretWire {
                 .into_iter()
                 .map(|h| Helper {
                     channel_id: h.channel_id.to_string(),
-                    transport_uri: h.transport_uri,
+                    transports: h.transports.into_iter().map(Into::into).collect(),
                     shared_key: h.shared_key,
                     communication_info: h.communication_info,
                 })
@@ -366,7 +383,7 @@ impl From<Secret> for SecretWire {
                     .into_iter()
                     .map(|r| Replica {
                         replica_id: encode_replica_id(r.replica_id),
-                        transport_uri: r.transport_uri,
+                        transports: r.transports.into_iter().map(Into::into).collect(),
                         role: crate::protocol::types::ReplicaRole::from_i32(r.role)
                             .map(|role| format!("{role:?}"))
                             .unwrap_or_default(),

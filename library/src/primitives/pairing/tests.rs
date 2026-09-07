@@ -20,8 +20,13 @@ use crate::primitives::pairing::{
         ProduceResult as ProducePairingResponseMessageResult, extract as extract_pairing_response,
         extract_pre_pair as extract_pre_pair_response, process as process_pairing_response_message,
         process_pre_pair, produce as produce_pairing_response_message, produce_pre_pair,
+        produce_pre_pair_no_keys,
     },
 };
+
+fn test_policy() -> crate::transport::TransportPolicy {
+    crate::transport::TransportPolicy::new(true)
+}
 use crate::types::ChannelId;
 use derec_proto::{
     ContactMessage, ContactMode, DeRecMessage, DeRecResult, MessageBody, PairRequestMessage,
@@ -49,10 +54,10 @@ fn test_create_contact_message_empty_transport_uri() {
     let result = create_contact_message(
         ChannelId(42),
         derec_proto::ContactMode::InlineKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: String::new(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     );
 
@@ -62,6 +67,10 @@ fn test_create_contact_message_empty_transport_uri() {
     ));
 }
 
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
 #[test]
 fn test_create_contact_message() {
     let channel_id = ChannelId(42);
@@ -73,10 +82,10 @@ fn test_create_contact_message() {
     } = create_contact_message(
         channel_id,
         derec_proto::ContactMode::InlineKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: transport_uri.to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("failed to create contact message");
@@ -104,6 +113,10 @@ fn test_create_contact_message() {
     );
 }
 
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
 #[test]
 fn test_produce_pairing_request_message_empty_mlkem_encapsulation_key() {
     let invalid_contact_msg = ContactMessage {
@@ -118,14 +131,15 @@ fn test_produce_pairing_request_message_empty_mlkem_encapsulation_key() {
         contact_binding_hash: None,
         nonce: 1234,
         timestamp: Some(current_timestamp()),
+        supported_transports: Vec::new(),
     };
 
     let result = produce_pairing_request_message(
         SenderKind::Helper,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/bob".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &invalid_contact_msg,
         None,
         None,
@@ -138,6 +152,10 @@ fn test_produce_pairing_request_message_empty_mlkem_encapsulation_key() {
     ));
 }
 
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
 #[test]
 fn test_produce_pairing_request_message_empty_ecies_public_key() {
     let invalid_contact_msg = ContactMessage {
@@ -152,14 +170,15 @@ fn test_produce_pairing_request_message_empty_ecies_public_key() {
         contact_binding_hash: None,
         nonce: 1234,
         timestamp: Some(current_timestamp()),
+        supported_transports: Vec::new(),
     };
 
     let result = produce_pairing_request_message(
         SenderKind::Helper,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/bob".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &invalid_contact_msg,
         None,
         None,
@@ -172,6 +191,10 @@ fn test_produce_pairing_request_message_empty_ecies_public_key() {
     ));
 }
 
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
 #[test]
 fn test_produce_pairing_request_message_empty_transport_uri() {
     let invalid_contact_msg = ContactMessage {
@@ -186,14 +209,15 @@ fn test_produce_pairing_request_message_empty_transport_uri() {
         ecies_public_key: Some(vec![1; 33]),
         nonce: 1234,
         timestamp: Some(current_timestamp()),
+        supported_transports: Vec::new(),
     };
 
     let result = produce_pairing_request_message(
         SenderKind::Helper,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: String::new(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &invalid_contact_msg,
         None,
         None,
@@ -205,6 +229,10 @@ fn test_produce_pairing_request_message_empty_transport_uri() {
     ));
 }
 
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
 #[test]
 fn test_produce_pairing_request_message() {
     let channel_id = ChannelId(42);
@@ -217,20 +245,20 @@ fn test_produce_pairing_request_message() {
     } = create_contact_message(
         channel_id,
         derec_proto::ContactMode::InlineKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: alice_transport_uri.to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("failed to create contact message");
 
     let ProducePairingRequestMessageResult { envelope, .. } = produce_pairing_request_message(
         SenderKind::Helper,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: bob_transport_uri.to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &contact_message,
         None,
         None,
@@ -258,6 +286,10 @@ fn test_produce_pairing_request_message() {
     assert_eq!(transport.protocol, Protocol::Https as i32);
 }
 
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
 #[test]
 fn test_produce_pairing_request_message_initiator_contact_message() {
     let alice_transport_uri = "https://relay.example/alice";
@@ -267,10 +299,10 @@ fn test_produce_pairing_request_message_initiator_contact_message() {
     } = create_contact_message(
         ChannelId(42),
         derec_proto::ContactMode::InlineKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: alice_transport_uri.to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("failed to create contact message");
@@ -280,10 +312,10 @@ fn test_produce_pairing_request_message_initiator_contact_message() {
         ..
     } = produce_pairing_request_message(
         SenderKind::Helper,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/bob".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &contact_message,
         None,
         None,
@@ -297,6 +329,10 @@ fn test_produce_pairing_request_message_initiator_contact_message() {
     assert_eq!(tp.protocol, Protocol::Https as i32);
 }
 
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
 #[test]
 fn test_produce_pairing_response_message_empty_mlkem_ciphertext() {
     let alice_channel_id = ChannelId(42);
@@ -307,10 +343,10 @@ fn test_produce_pairing_response_message_empty_mlkem_ciphertext() {
     } = create_contact_message(
         alice_channel_id,
         derec_proto::ContactMode::InlineKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("failed to create contact message");
@@ -327,6 +363,7 @@ fn test_produce_pairing_response_message_empty_mlkem_ciphertext() {
             protocol: Protocol::Https.into(),
         }),
         timestamp: Some(current_timestamp()),
+        supported_transports: Vec::new(),
     };
 
     let result = produce_pairing_response_message(
@@ -335,6 +372,7 @@ fn test_produce_pairing_response_message_empty_mlkem_ciphertext() {
         alice_sk_state.as_ref().unwrap(),
         None,
         None,
+        test_policy(),
     );
 
     assert!(matches!(
@@ -344,6 +382,10 @@ fn test_produce_pairing_response_message_empty_mlkem_ciphertext() {
     ));
 }
 
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
 #[test]
 fn test_produce_pairing_response_message_empty_ecies_public_key() {
     let alice_channel_id = ChannelId(42);
@@ -354,10 +396,10 @@ fn test_produce_pairing_response_message_empty_ecies_public_key() {
     } = create_contact_message(
         alice_channel_id,
         derec_proto::ContactMode::InlineKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("failed to create contact message");
@@ -374,6 +416,7 @@ fn test_produce_pairing_response_message_empty_ecies_public_key() {
             protocol: Protocol::Https.into(),
         }),
         timestamp: Some(current_timestamp()),
+        supported_transports: Vec::new(),
     };
 
     let result = produce_pairing_response_message(
@@ -382,6 +425,7 @@ fn test_produce_pairing_response_message_empty_ecies_public_key() {
         alice_sk_state.as_ref().unwrap(),
         None,
         None,
+        test_policy(),
     );
 
     assert!(matches!(
@@ -391,6 +435,10 @@ fn test_produce_pairing_response_message_empty_ecies_public_key() {
     ));
 }
 
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
 #[test]
 fn test_produce_pairing_response_message_missing_transport_protocol() {
     let alice_channel_id = ChannelId(42);
@@ -401,10 +449,10 @@ fn test_produce_pairing_response_message_missing_transport_protocol() {
     } = create_contact_message(
         alice_channel_id,
         derec_proto::ContactMode::InlineKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("failed to create contact message");
@@ -418,6 +466,7 @@ fn test_produce_pairing_response_message_missing_transport_protocol() {
         parameter_range: None,
         transport_protocol: None,
         timestamp: Some(current_timestamp()),
+        supported_transports: Vec::new(),
     };
 
     let result = produce_pairing_response_message(
@@ -426,6 +475,7 @@ fn test_produce_pairing_response_message_missing_transport_protocol() {
         alice_sk_state.as_ref().unwrap(),
         None,
         None,
+        test_policy(),
     );
 
     assert!(matches!(
@@ -434,6 +484,10 @@ fn test_produce_pairing_response_message_missing_transport_protocol() {
     ));
 }
 
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
 #[test]
 fn test_produce_pairing_response_message_empty_transport_uri() {
     let alice_channel_id = ChannelId(42);
@@ -444,10 +498,10 @@ fn test_produce_pairing_response_message_empty_transport_uri() {
     } = create_contact_message(
         alice_channel_id,
         derec_proto::ContactMode::InlineKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("failed to create contact message");
@@ -464,6 +518,7 @@ fn test_produce_pairing_response_message_empty_transport_uri() {
             protocol: Protocol::Https.into(),
         }),
         timestamp: Some(current_timestamp()),
+        supported_transports: Vec::new(),
     };
 
     let result = produce_pairing_response_message(
@@ -472,6 +527,7 @@ fn test_produce_pairing_response_message_empty_transport_uri() {
         alice_sk_state.as_ref().unwrap(),
         None,
         None,
+        test_policy(),
     );
 
     assert!(matches!(
@@ -490,20 +546,20 @@ fn test_extract_pairing_request_rejects_envelope_timestamp_mismatch() {
     } = create_contact_message(
         alice_channel_id,
         derec_proto::ContactMode::InlineKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("failed to create contact message");
 
     let ProducePairingRequestMessageResult { envelope, .. } = produce_pairing_request_message(
         SenderKind::Helper,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/bob".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &alice_contact,
         None,
         None,
@@ -530,10 +586,10 @@ fn test_process_pairing_response_message_missing_result() {
     } = create_contact_message(
         alice_channel_id,
         derec_proto::ContactMode::InlineKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("failed to create contact message");
@@ -544,10 +600,10 @@ fn test_process_pairing_response_message_missing_result() {
         secret_key: bob_sk_state,
     } = produce_pairing_request_message(
         SenderKind::Helper,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/bob".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &alice_contact,
         None,
         None,
@@ -594,10 +650,10 @@ fn test_process_pairing_response_message_result_non_ok() {
     } = create_contact_message(
         alice_channel_id,
         derec_proto::ContactMode::InlineKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("failed to create contact message");
@@ -608,10 +664,10 @@ fn test_process_pairing_response_message_result_non_ok() {
         secret_key: bob_sk_state,
     } = produce_pairing_request_message(
         SenderKind::Helper,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/bob".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &alice_contact,
         None,
         None,
@@ -661,10 +717,10 @@ fn test_process_pairing_response_message_invalid_status() {
     } = create_contact_message(
         alice_channel_id,
         derec_proto::ContactMode::InlineKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("failed to create contact message");
@@ -675,10 +731,10 @@ fn test_process_pairing_response_message_invalid_status() {
         secret_key: bob_sk_state,
     } = produce_pairing_request_message(
         SenderKind::Helper,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/bob".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &alice_contact,
         None,
         None,
@@ -728,10 +784,10 @@ fn test_process_pairing_response_message_nonce_mismatch() {
     } = create_contact_message(
         alice_channel_id,
         derec_proto::ContactMode::InlineKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("failed to create contact message");
@@ -742,10 +798,10 @@ fn test_process_pairing_response_message_nonce_mismatch() {
         secret_key: bob_sk_state,
     } = produce_pairing_request_message(
         SenderKind::Helper,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/bob".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &alice_contact,
         None,
         None,
@@ -795,10 +851,10 @@ fn test_process_pairing_response_message_empty_mlkem_encapsulation_key() {
     } = create_contact_message(
         alice_channel_id,
         derec_proto::ContactMode::InlineKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("failed to create contact message");
@@ -809,10 +865,10 @@ fn test_process_pairing_response_message_empty_mlkem_encapsulation_key() {
         secret_key: bob_sk_state,
     } = produce_pairing_request_message(
         SenderKind::Helper,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/bob".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &alice_contact,
         None,
         None,
@@ -862,10 +918,10 @@ fn test_process_pairing_response_message_empty_ecies_public_key() {
     } = create_contact_message(
         alice_channel_id,
         derec_proto::ContactMode::InlineKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("failed to create contact message");
@@ -876,10 +932,10 @@ fn test_process_pairing_response_message_empty_ecies_public_key() {
         secret_key: bob_sk_state,
     } = produce_pairing_request_message(
         SenderKind::Helper,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/bob".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &alice_contact,
         None,
         None,
@@ -929,10 +985,10 @@ fn test_extract_pairing_response_rejects_envelope_timestamp_mismatch() {
     } = create_contact_message(
         alice_channel_id,
         derec_proto::ContactMode::InlineKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("failed to create contact message");
@@ -943,10 +999,10 @@ fn test_extract_pairing_response_rejects_envelope_timestamp_mismatch() {
         ..
     } = produce_pairing_request_message(
         SenderKind::Helper,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/bob".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &alice_contact,
         None,
         None,
@@ -968,6 +1024,7 @@ fn test_extract_pairing_response_rejects_envelope_timestamp_mismatch() {
         initiator_secret_key.as_ref().unwrap(),
         None,
         None,
+        test_policy(),
     )
     .expect("failed to produce pairing response");
 
@@ -990,10 +1047,10 @@ fn test_alice_bob_pairing_flow() {
     } = create_contact_message(
         alice_channel_id,
         derec_proto::ContactMode::InlineKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: alice_transport_uri.to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("failed to create contact message");
@@ -1004,10 +1061,10 @@ fn test_alice_bob_pairing_flow() {
         secret_key: bob_sk_state,
     } = produce_pairing_request_message(
         SenderKind::Helper,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: bob_transport_uri.to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &alice_contact,
         None,
         None,
@@ -1027,7 +1084,7 @@ fn test_alice_bob_pairing_flow() {
     let ProducePairingResponseMessageResult {
         envelope: alice_pair_resp_envelope,
         shared_key: alice_shared_key,
-        peer_transport_protocol: bob_transport_protocol,
+        peer_transports: bob_transport_protocol,
         channel_id: alice_new_channel_id,
     } = produce_pairing_response_message(
         alice_channel_id,
@@ -1035,6 +1092,7 @@ fn test_alice_bob_pairing_flow() {
         alice_sk_state.as_ref().unwrap(),
         None,
         None,
+        test_policy(),
     )
     .expect("failed to produce pairing response");
 
@@ -1064,8 +1122,8 @@ fn test_alice_bob_pairing_flow() {
     assert_eq!(contact_nonce, bob_pair_req_msg.nonce);
     assert_eq!(alice_pair_resp_msg.nonce, bob_pair_req_msg.nonce);
     assert_eq!(alice_shared_key, bob_shared_key);
-    assert_eq!(bob_transport_protocol.uri, bob_transport_uri);
-    assert_eq!(bob_transport_protocol.protocol, Protocol::Https as i32);
+    assert_eq!(bob_transport_protocol[0].uri, bob_transport_uri);
+    assert_eq!(bob_transport_protocol[0].protocol, Protocol::Https as i32);
     assert_eq!(alice_new_channel_id, bob_new_channel_id);
     assert_ne!(alice_new_channel_id, alice_channel_id);
     assert_eq!(
@@ -1085,10 +1143,10 @@ fn test_produce_pairing_response_returns_envelope_and_peer_transport() {
     } = create_contact_message(
         alice_channel_id,
         derec_proto::ContactMode::InlineKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("failed to create contact message");
@@ -1099,10 +1157,10 @@ fn test_produce_pairing_response_returns_envelope_and_peer_transport() {
         ..
     } = produce_pairing_request_message(
         SenderKind::Helper,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: bob_transport_uri.to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &alice_contact,
         None,
         None,
@@ -1120,7 +1178,7 @@ fn test_produce_pairing_response_returns_envelope_and_peer_transport() {
     let ProducePairingResponseMessageResult {
         envelope,
         shared_key,
-        peer_transport_protocol,
+        peer_transports,
         channel_id: _,
     } = produce_pairing_response_message(
         alice_channel_id,
@@ -1128,12 +1186,13 @@ fn test_produce_pairing_response_returns_envelope_and_peer_transport() {
         alice_sk_state.as_ref().unwrap(),
         None,
         None,
+        test_policy(),
     )
     .expect("accept should succeed");
 
     assert!(!envelope.is_empty());
-    assert_eq!(peer_transport_protocol.uri, bob_transport_uri);
-    assert_eq!(peer_transport_protocol.protocol, Protocol::Https as i32);
+    assert_eq!(peer_transports[0].uri, bob_transport_uri);
+    assert_eq!(peer_transports[0].protocol, Protocol::Https as i32);
 
     let ExtractPairingResponseResult { response } =
         extract_pairing_response(&envelope, bob_sk_state.ecies_secret_key())
@@ -1150,10 +1209,10 @@ fn make_hashed_keys_contact(channel_id: ChannelId) -> ContactMessage {
     create_contact_message(
         channel_id,
         ContactMode::HashedKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("failed to create HASHED_KEYS contact message")
@@ -1183,10 +1242,10 @@ fn test_create_contact_message_hashed_keys_empty_transport_uri() {
     let result = create_contact_message(
         ChannelId(42),
         ContactMode::HashedKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: String::new(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     );
 
@@ -1203,6 +1262,10 @@ fn test_create_contact_message_hashed_keys_fresh_randomness_yields_distinct_hash
     assert_ne!(a.contact_binding_hash, b.contact_binding_hash);
 }
 
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
 #[test]
 fn test_produce_pre_pair_request_emits_envelope_routed_to_contact_channel() {
     let channel_id = ChannelId(42);
@@ -1214,7 +1277,7 @@ fn test_produce_pre_pair_request_emits_envelope_routed_to_contact_channel() {
     };
 
     let ProducePrePairResult { envelope } =
-        produce_pre_pair_request(bob_transport.clone(), &alice_contact)
+        produce_pre_pair_request(vec![bob_transport.clone()], &alice_contact)
             .expect("produce_pre_pair_request should succeed");
 
     let outer = decode_outer_envelope(&envelope);
@@ -1242,20 +1305,20 @@ fn test_produce_pre_pair_request_rejects_inline_keys_contact() {
     let alice_contact = create_contact_message(
         ChannelId(42),
         ContactMode::InlineKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("failed to create contact message")
     .contact_message;
 
     let result = produce_pre_pair_request(
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/bob".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &alice_contact,
     );
 
@@ -1270,10 +1333,10 @@ fn test_produce_pre_pair_request_rejects_empty_transport_uri() {
     let alice_contact = make_hashed_keys_contact(ChannelId(42));
 
     let result = produce_pre_pair_request(
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "   ".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &alice_contact,
     );
 
@@ -1283,6 +1346,10 @@ fn test_produce_pre_pair_request_rejects_empty_transport_uri() {
     ));
 }
 
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
 #[test]
 fn test_extract_pre_pair_roundtrip() {
     let alice_contact = make_hashed_keys_contact(ChannelId(42));
@@ -1293,7 +1360,7 @@ fn test_extract_pre_pair_roundtrip() {
     };
 
     let ProducePrePairResult { envelope } =
-        produce_pre_pair_request(bob_transport.clone(), &alice_contact)
+        produce_pre_pair_request(vec![bob_transport.clone()], &alice_contact)
             .expect("produce_pre_pair_request should succeed");
 
     let PrePairExtractResult { request } =
@@ -1314,10 +1381,10 @@ fn test_extract_pre_pair_rejects_envelope_timestamp_mismatch() {
     let alice_contact = make_hashed_keys_contact(ChannelId(42));
 
     let ProducePrePairResult { envelope } = produce_pre_pair_request(
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/bob".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &alice_contact,
     )
     .expect("produce_pre_pair_request should succeed");
@@ -1363,10 +1430,10 @@ fn test_produce_pre_pair_emits_envelope_carrying_initiator_public_keys() {
     } = create_contact_message(
         channel_id,
         ContactMode::HashedKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("failed to create HASHED_KEYS contact");
@@ -1374,10 +1441,10 @@ fn test_produce_pre_pair_emits_envelope_carrying_initiator_public_keys() {
     let ProducePrePairResult {
         envelope: request_envelope,
     } = produce_pre_pair_request(
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/bob".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &alice_contact,
     )
     .expect("produce_pre_pair_request should succeed");
@@ -1423,6 +1490,10 @@ fn test_produce_pre_pair_emits_envelope_carrying_initiator_public_keys() {
     );
 }
 
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
 #[test]
 fn test_produce_pre_pair_rejects_responder_secret_key_material() {
     let channel_id = ChannelId(42);
@@ -1430,10 +1501,10 @@ fn test_produce_pre_pair_rejects_responder_secret_key_material() {
     let alice_contact = create_contact_message(
         channel_id,
         ContactMode::InlineKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("failed to create contact")
@@ -1444,10 +1515,10 @@ fn test_produce_pre_pair_rejects_responder_secret_key_material() {
         ..
     } = produce_pairing_request_message(
         SenderKind::Helper,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/bob".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &alice_contact,
         None,
         None,
@@ -1455,6 +1526,7 @@ fn test_produce_pre_pair_rejects_responder_secret_key_material() {
     .expect("produce_pairing_request_message should succeed");
 
     let dummy_request = derec_proto::PrePairRequestMessage {
+        supported_transports: Vec::new(),
         nonce: 1234,
         transport_protocol: None,
         timestamp: Some(current_timestamp()),
@@ -1468,6 +1540,10 @@ fn test_produce_pre_pair_rejects_responder_secret_key_material() {
     ));
 }
 
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
 #[test]
 fn test_produce_pre_pair_response_keys_match_initiator_contact_keys_in_inline_mode() {
     let channel_id = ChannelId(42);
@@ -1477,15 +1553,16 @@ fn test_produce_pre_pair_response_keys_match_initiator_contact_keys_in_inline_mo
     } = create_contact_message(
         channel_id,
         ContactMode::InlineKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("failed to create contact");
 
     let dummy_request = derec_proto::PrePairRequestMessage {
+        supported_transports: Vec::new(),
         nonce: 7,
         transport_protocol: None,
         timestamp: Some(current_timestamp()),
@@ -1525,10 +1602,10 @@ fn build_pre_pair_response_envelope(
     } = create_contact_message(
         channel_id,
         ContactMode::HashedKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("create_contact (HASHED_KEYS) failed");
@@ -1536,10 +1613,10 @@ fn build_pre_pair_response_envelope(
     let ProducePrePairResult {
         envelope: request_envelope,
     } = produce_pre_pair_request(
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/bob".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &alice_contact,
     )
     .expect("produce_pre_pair_request failed");
@@ -1636,10 +1713,10 @@ fn run_pre_pair_leg(channel_id: ChannelId) -> (ContactMessage, PrePairResponseMe
     } = create_contact_message(
         channel_id,
         ContactMode::HashedKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("create_contact (HASHED_KEYS) failed");
@@ -1647,10 +1724,10 @@ fn run_pre_pair_leg(channel_id: ChannelId) -> (ContactMessage, PrePairResponseMe
     let ProducePrePairResult {
         envelope: request_envelope,
     } = produce_pre_pair_request(
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/bob".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &alice_contact,
     )
     .expect("produce_pre_pair_request failed");
@@ -1802,10 +1879,10 @@ fn test_process_pairing_response_rejects_tampered_channel_id_rekey() {
     } = create_contact_message(
         alice_channel_id,
         derec_proto::ContactMode::InlineKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: alice_transport_uri.to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("create_contact failed");
@@ -1816,10 +1893,10 @@ fn test_process_pairing_response_rejects_tampered_channel_id_rekey() {
         ..
     } = produce_pairing_request_message(
         SenderKind::Helper,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: bob_transport_uri.to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &initiator_contact_message,
         None,
         None,
@@ -1843,6 +1920,7 @@ fn test_process_pairing_response_rejects_tampered_channel_id_rekey() {
         alice_sk_state.as_ref().unwrap(),
         None,
         None,
+        test_policy(),
     )
     .expect("produce_pairing_response failed");
 
@@ -1876,10 +1954,10 @@ fn test_pairing_rekey_also_fires_in_hashed_keys_mode() {
     } = create_contact_message(
         alice_channel_id,
         ContactMode::HashedKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/alice/ephemeral".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("create_contact (HASHED_KEYS) failed");
@@ -1887,10 +1965,10 @@ fn test_pairing_rekey_also_fires_in_hashed_keys_mode() {
     let ProducePrePairResult {
         envelope: pre_pair_req_envelope,
     } = produce_pre_pair_request(
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/bob/ephemeral".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &alice_contact,
     )
     .expect("produce_pre_pair_request failed");
@@ -1926,10 +2004,10 @@ fn test_pairing_rekey_also_fires_in_hashed_keys_mode() {
         secret_key: bob_sk_state,
     } = produce_pairing_request_message(
         SenderKind::Helper,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/bob".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &filled_in_contact,
         None,
         None,
@@ -1954,6 +2032,7 @@ fn test_pairing_rekey_also_fires_in_hashed_keys_mode() {
         alice_sk_state.as_ref().unwrap(),
         None,
         None,
+        test_policy(),
     )
     .expect("produce_pairing_response_message failed");
 
@@ -1980,6 +2059,10 @@ fn test_pairing_rekey_also_fires_in_hashed_keys_mode() {
     );
 }
 
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
 /// Reference contact builders for the `validate_contact_for_mode` tests.
 fn well_formed_inline_keys_contact() -> ContactMessage {
     ContactMessage {
@@ -1994,9 +2077,14 @@ fn well_formed_inline_keys_contact() -> ContactMessage {
         contact_binding_hash: None,
         nonce: 0xCAFE_BABE,
         timestamp: Some(current_timestamp()),
+        supported_transports: Vec::new(),
     }
 }
 
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
 fn well_formed_hashed_keys_contact() -> ContactMessage {
     ContactMessage {
         channel_id: 42,
@@ -2010,6 +2098,7 @@ fn well_formed_hashed_keys_contact() -> ContactMessage {
         contact_binding_hash: Some(vec![0xAB; 48]),
         nonce: 0xDEAD_BEEF,
         timestamp: Some(current_timestamp()),
+        supported_transports: Vec::new(),
     }
 }
 
@@ -2154,6 +2243,10 @@ fn test_validate_contact_for_mode_rejects_hashed_wrong_hash_length() {
     ));
 }
 
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
 /// A peer-supplied `PairRequestMessage.transport_protocol` declaring
 /// `Protocol::Https` but carrying a URI with an unsupported scheme is
 /// rejected on the initiator side at extract — the producer-side
@@ -2173,10 +2266,10 @@ fn test_extract_pairing_request_rejects_scheme_mismatched_transport_protocol() {
     } = create_contact_message(
         alice_channel_id,
         ContactMode::InlineKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://relay.example/alice".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("failed to create contact message");
@@ -2195,6 +2288,7 @@ fn test_extract_pairing_request_rejects_scheme_mismatched_transport_protocol() {
         parameter_range: None,
         transport_protocol: Some(malicious_transport),
         timestamp: Some(timestamp),
+        supported_transports: Vec::new(),
     };
 
     let envelope = DeRecMessageBuilder::pairing()
@@ -2225,6 +2319,10 @@ fn test_extract_pairing_request_rejects_scheme_mismatched_transport_protocol() {
     ));
 }
 
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
 /// Same gate at the plaintext PrePair leg: a `PrePairRequestMessage`
 /// advertising `Protocol::Https` with a URI carrying an unsupported
 /// scheme is rejected at extract. (`http://` is intentionally accepted
@@ -2243,6 +2341,7 @@ fn test_extract_pre_pair_rejects_scheme_mismatched_transport_protocol() {
     };
     let timestamp = current_timestamp();
     let request = PrePairRequestMessage {
+        supported_transports: Vec::new(),
         nonce: 0xDEAD_BEEF,
         transport_protocol: Some(malicious_transport),
         timestamp: Some(timestamp),
@@ -2268,4 +2367,505 @@ fn test_extract_pre_pair_rejects_scheme_mismatched_transport_protocol() {
             crate::transport::TransportValidationError::SchemeMismatch { .. }
         ))
     ));
+}
+
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
+/// Old peers read only the singular field, so a multi-transport contact
+/// must still fill it. The first entry is what goes there: the order is
+/// the application's stated preference and is never reinterpreted here.
+#[test]
+fn legacy_field_takes_the_first_entry() {
+    let own = vec![
+        TransportProtocol {
+            uri: "grpcs://me.example.com:443".to_owned(),
+            protocol: Protocol::Grpc as i32,
+        },
+        TransportProtocol {
+            uri: "https://me.example.com/derec".to_owned(),
+            protocol: Protocol::Https as i32,
+        },
+    ];
+    let result = create_contact_message(ChannelId(1), ContactMode::InlineKeys, own, Some(42))
+        .expect("creates");
+
+    assert_eq!(
+        result
+            .contact_message
+            .transport_protocol
+            .as_ref()
+            .expect("legacy field is always filled")
+            .protocol,
+        Protocol::Grpc as i32,
+        "the legacy singular field must mirror the caller's first entry, \
+         not a protocol the library picked on its own"
+    );
+}
+
+/// An empty list has no entry to advertise, so contact creation fails
+/// rather than panicking on an index.
+#[test]
+fn create_contact_rejects_an_empty_transport_list() {
+    assert!(matches!(
+        create_contact_message(ChannelId(1), ContactMode::InlineKeys, Vec::new(), Some(42)),
+        Err(Error::Pairing(PairingError::EmptyTransportUri))
+    ));
+}
+
+#[test]
+fn contact_carries_every_served_transport() {
+    let own = vec![
+        TransportProtocol {
+            uri: "grpcs://me.example.com:443".to_owned(),
+            protocol: Protocol::Grpc as i32,
+        },
+        TransportProtocol {
+            uri: "https://me.example.com/derec".to_owned(),
+            protocol: Protocol::Https as i32,
+        },
+    ];
+    let result = create_contact_message(ChannelId(1), ContactMode::InlineKeys, own, Some(42))
+        .expect("creates");
+
+    assert_eq!(result.contact_message.supported_transports.len(), 2);
+    assert_eq!(
+        result.contact_message.supported_transports[0].protocol,
+        Protocol::Grpc as i32,
+        "the offer list must preserve the caller's order verbatim"
+    );
+}
+
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
+/// A responder builds its PrePair reply from a request a peer sent, so the
+/// endpoint in that request is untrusted input. Validating it here rather
+/// than only at `extract_pre_pair` matters because the FFI decodes straight
+/// into this call, bypassing `extract` entirely.
+#[test]
+fn test_produce_pre_pair_rejects_scheme_mismatched_transport_protocol() {
+    let channel_id = ChannelId(4301);
+    let CreateContactMessageResult {
+        secret_key: alice_secret,
+        ..
+    } = create_contact_message(
+        channel_id,
+        ContactMode::InlineKeys,
+        vec![TransportProtocol {
+            uri: "https://relay.example/alice".to_owned(),
+            protocol: Protocol::Https.into(),
+        }],
+        None,
+    )
+    .expect("failed to create contact");
+
+    let request = derec_proto::PrePairRequestMessage {
+        supported_transports: Vec::new(),
+        nonce: 7,
+        transport_protocol: Some(TransportProtocol {
+            uri: "ws://attacker.example/inbox".to_owned(),
+            protocol: Protocol::Https.into(),
+        }),
+        timestamp: Some(current_timestamp()),
+    };
+
+    let result = produce_pre_pair(channel_id, &request, alice_secret.as_ref().unwrap());
+
+    assert!(
+        matches!(
+            result,
+            Err(Error::Transport(
+                crate::transport::TransportValidationError::SchemeMismatch { .. }
+            ))
+        ),
+        "a scheme-mismatched reply endpoint must be refused"
+    );
+}
+
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
+/// Same guard on the NoKeys leg, which generates key material before
+/// replying and so must refuse before doing that work.
+#[test]
+fn test_produce_pre_pair_no_keys_rejects_scheme_mismatched_transport_protocol() {
+    let request = derec_proto::PrePairRequestMessage {
+        supported_transports: Vec::new(),
+        nonce: 11,
+        transport_protocol: Some(TransportProtocol {
+            uri: "ws://attacker.example/inbox".to_owned(),
+            protocol: Protocol::Https.into(),
+        }),
+        timestamp: Some(current_timestamp()),
+    };
+
+    let result = produce_pre_pair_no_keys(ChannelId(4302), &request);
+
+    assert!(
+        matches!(
+            result,
+            Err(Error::Transport(
+                crate::transport::TransportValidationError::SchemeMismatch { .. }
+            ))
+        ),
+        "a scheme-mismatched reply endpoint must be refused"
+    );
+}
+
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
+/// An absent endpoint stays acceptable: the responder then routes to what
+/// it already has on file. Locks in that adding validation did not turn
+/// absence into an error.
+#[test]
+fn test_produce_pre_pair_no_keys_accepts_an_absent_transport_protocol() {
+    let request = derec_proto::PrePairRequestMessage {
+        supported_transports: Vec::new(),
+        nonce: 13,
+        transport_protocol: None,
+        timestamp: Some(current_timestamp()),
+    };
+
+    produce_pre_pair_no_keys(ChannelId(4303), &request)
+        .expect("an absent reply endpoint is not an error");
+}
+
+/// Builds a pairing envelope carrying `request`, encrypted to `contact`'s
+/// ECIES public key. Lets a test hand a deliberately malformed body to
+/// `extract` the way a hostile peer would.
+fn pairing_envelope_carrying(
+    channel_id: ChannelId,
+    contact: &ContactMessage,
+    request: PairRequestMessage,
+    timestamp: prost_types::Timestamp,
+) -> Vec<u8> {
+    use crate::derec_message::DeRecMessageBuilder;
+
+    DeRecMessageBuilder::pairing()
+        .channel_id(channel_id)
+        .timestamp(timestamp)
+        .message_body(MessageBody::PairRequest(request))
+        .encrypt_pairing(
+            contact
+                .ecies_public_key
+                .as_ref()
+                .expect("inline-keys contact carries ecies_public_key"),
+        )
+        .expect("encrypt pairing")
+        .build()
+        .expect("build envelope")
+        .encode_to_vec()
+}
+
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
+/// A malformed request is refused at the parse boundary rather than
+/// travelling until something happens to read the missing field. The FFI
+/// decodes through this call, so every SDK inherits the check.
+#[test]
+fn test_extract_pairing_request_rejects_missing_mlkem_ciphertext() {
+    let channel_id = ChannelId(4401);
+    let CreateContactMessageResult {
+        contact_message: alice_contact,
+        secret_key: alice_sk,
+    } = create_contact_message(
+        channel_id,
+        ContactMode::InlineKeys,
+        vec![TransportProtocol {
+            uri: "https://relay.example/alice".to_owned(),
+            protocol: Protocol::Https.into(),
+        }],
+        None,
+    )
+    .expect("failed to create contact message");
+
+    let timestamp = current_timestamp();
+    let envelope = pairing_envelope_carrying(
+        channel_id,
+        &alice_contact,
+        PairRequestMessage {
+            sender_kind: SenderKind::Helper.into(),
+            mlkem_ciphertext: Vec::new(),
+            ecies_public_key: vec![0u8; 33],
+            nonce: alice_contact.nonce,
+            communication_info: None,
+            parameter_range: None,
+            transport_protocol: Some(TransportProtocol {
+                uri: "https://relay.example/bob".to_owned(),
+                protocol: Protocol::Https.into(),
+            }),
+            timestamp: Some(timestamp),
+            supported_transports: Vec::new(),
+        },
+        timestamp,
+    );
+
+    let result = extract_pairing_request(&envelope, alice_sk.as_ref().unwrap().ecies_secret_key());
+
+    assert!(
+        matches!(
+            result,
+            Err(Error::Pairing(PairingError::InvalidPairRequestMessage(_)))
+        ),
+        "a request missing mlkem_ciphertext must be refused at extract"
+    );
+}
+
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
+/// A request advertising no endpoint at all is refused here too: there
+/// would be nowhere to send the response.
+#[test]
+fn test_extract_pairing_request_rejects_a_request_advertising_no_endpoint() {
+    let channel_id = ChannelId(4402);
+    let CreateContactMessageResult {
+        contact_message: alice_contact,
+        secret_key: alice_sk,
+    } = create_contact_message(
+        channel_id,
+        ContactMode::InlineKeys,
+        vec![TransportProtocol {
+            uri: "https://relay.example/alice".to_owned(),
+            protocol: Protocol::Https.into(),
+        }],
+        None,
+    )
+    .expect("failed to create contact message");
+
+    let timestamp = current_timestamp();
+    let envelope = pairing_envelope_carrying(
+        channel_id,
+        &alice_contact,
+        PairRequestMessage {
+            sender_kind: SenderKind::Helper.into(),
+            mlkem_ciphertext: vec![0u8; 32],
+            ecies_public_key: vec![0u8; 33],
+            nonce: alice_contact.nonce,
+            communication_info: None,
+            parameter_range: None,
+            transport_protocol: None,
+            timestamp: Some(timestamp),
+            supported_transports: Vec::new(),
+        },
+        timestamp,
+    );
+
+    let result = extract_pairing_request(&envelope, alice_sk.as_ref().unwrap().ecies_secret_key());
+
+    assert!(
+        matches!(result, Err(Error::Pairing(PairingError::EmptyTransportUri))),
+        "a request advertising no endpoint must be refused at extract"
+    );
+}
+
+/// A well-formed request still extracts: the boundary check rejects only
+/// what it is meant to.
+#[test]
+fn test_extract_pairing_request_accepts_a_well_formed_request() {
+    let channel_id = ChannelId(4403);
+    let CreateContactMessageResult {
+        contact_message: alice_contact,
+        secret_key: alice_sk,
+    } = create_contact_message(
+        channel_id,
+        ContactMode::InlineKeys,
+        vec![TransportProtocol {
+            uri: "https://relay.example/alice".to_owned(),
+            protocol: Protocol::Https.into(),
+        }],
+        None,
+    )
+    .expect("failed to create contact message");
+
+    let ProducePairingRequestMessageResult { envelope, .. } = produce_pairing_request_message(
+        SenderKind::Helper,
+        vec![TransportProtocol {
+            uri: "https://relay.example/bob".to_owned(),
+            protocol: Protocol::Https.into(),
+        }],
+        &alice_contact,
+        None,
+        None,
+    )
+    .expect("failed to produce valid pairing request");
+
+    extract_pairing_request(&envelope, alice_sk.as_ref().unwrap().ecies_secret_key())
+        .expect("a well-formed request extracts");
+}
+
+/// A contact that names no endpoint at all leaves the scanner nowhere to
+/// send its pair request, so it is refused at validation rather than
+/// failing later with a less obvious error.
+#[test]
+fn test_validate_rejects_a_contact_advertising_no_endpoint() {
+    use crate::utils::ContactMessageExt as _;
+
+    let contact = ContactMessage {
+        channel_id: 5001,
+        contact_mode: ContactMode::NoKeys as i32,
+        nonce: 42,
+        timestamp: Some(current_timestamp()),
+        ..Default::default()
+    };
+
+    assert!(
+        matches!(
+            contact.validate(),
+            Err(Error::Pairing(PairingError::EmptyTransportUri))
+        ),
+        "a contact naming no endpoint must be refused"
+    );
+}
+
+/// The list alone satisfies the rule: a peer that has moved past the
+/// deprecated singular field must not be refused for omitting it.
+#[test]
+fn test_validate_accepts_a_contact_carrying_only_the_list() {
+    use crate::utils::ContactMessageExt as _;
+
+    let contact = ContactMessage {
+        channel_id: 5002,
+        contact_mode: ContactMode::NoKeys as i32,
+        nonce: 42,
+        timestamp: Some(current_timestamp()),
+        supported_transports: vec![TransportProtocol {
+            uri: "https://relay.example/alice".to_owned(),
+            protocol: Protocol::Https.into(),
+        }],
+        ..Default::default()
+    };
+
+    contact
+        .validate()
+        .expect("a contact carrying only the list is valid");
+}
+
+/// And the whole pairing entry point accepts it, not just `validate`.
+/// `validate_inputs` used to demand the singular field, which refused a
+/// peer doing the modern thing.
+#[test]
+fn test_produce_accepts_a_contact_carrying_only_the_list() {
+    let CreateContactMessageResult {
+        contact_message: mut alice_contact,
+        ..
+    } = create_contact_message(
+        ChannelId(5003),
+        ContactMode::InlineKeys,
+        vec![TransportProtocol {
+            uri: "https://relay.example/alice".to_owned(),
+            protocol: Protocol::Https.into(),
+        }],
+        None,
+    )
+    .expect("failed to create contact message");
+
+    // Drop the deprecated singular field, leaving only the list.
+    #[allow(deprecated)]
+    {
+        alice_contact.transport_protocol = None;
+    }
+
+    produce_pairing_request_message(
+        SenderKind::Helper,
+        vec![TransportProtocol {
+            uri: "https://relay.example/bob".to_owned(),
+            protocol: Protocol::Https.into(),
+        }],
+        &alice_contact,
+        None,
+        None,
+    )
+    .expect("a list-only contact must be accepted");
+}
+
+/// A PrePair request advertises the scanner's whole list, filling the
+/// deprecated singular field from the first entry so peers predating the
+/// list still know where to reply.
+#[test]
+fn test_produce_pre_pair_request_advertises_the_whole_list() {
+    let channel_id = ChannelId(5004);
+    let CreateContactMessageResult {
+        contact_message: alice_contact,
+        ..
+    } = create_contact_message(
+        channel_id,
+        ContactMode::HashedKeys,
+        vec![TransportProtocol {
+            uri: "https://relay.example/alice/ephemeral".to_owned(),
+            protocol: Protocol::Https.into(),
+        }],
+        None,
+    )
+    .expect("failed to create contact message");
+
+    let own = vec![
+        TransportProtocol {
+            uri: "grpcs://bob.example:443".to_owned(),
+            protocol: Protocol::Grpc.into(),
+        },
+        TransportProtocol {
+            uri: "https://bob.example/derec".to_owned(),
+            protocol: Protocol::Https.into(),
+        },
+    ];
+
+    let ProducePrePairResult { envelope } =
+        produce_pre_pair_request(own.clone(), &alice_contact).expect("produce_pre_pair_request");
+
+    let outer = decode_outer_envelope(&envelope);
+    let request = match MessageBody::decode_from_vec(outer.message.as_slice())
+        .expect("inner MessageBody should decode")
+    {
+        MessageBody::PrePairRequest(r) => r,
+        other => panic!("expected PrePairRequest, got {other:?}"),
+    };
+
+    assert_eq!(
+        request.supported_transports, own,
+        "the whole list must travel in the sender's own order"
+    );
+    #[allow(deprecated)]
+    {
+        assert_eq!(
+            request.transport_protocol.as_ref(),
+            own.first(),
+            "the first entry must fill the deprecated singular field"
+        );
+    }
+}
+
+/// An empty list is refused: the request would name nowhere to reply.
+#[test]
+fn test_produce_pre_pair_request_rejects_an_empty_transport_list() {
+    let CreateContactMessageResult {
+        contact_message: alice_contact,
+        ..
+    } = create_contact_message(
+        ChannelId(5005),
+        ContactMode::HashedKeys,
+        vec![TransportProtocol {
+            uri: "https://relay.example/alice/ephemeral".to_owned(),
+            protocol: Protocol::Https.into(),
+        }],
+        None,
+    )
+    .expect("failed to create contact message");
+
+    assert!(
+        matches!(
+            produce_pre_pair_request(Vec::new(), &alice_contact),
+            Err(Error::Pairing(PairingError::EmptyTransportUri))
+        ),
+        "a PrePair request naming no endpoint must be refused"
+    );
 }

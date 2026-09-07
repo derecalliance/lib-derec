@@ -531,11 +531,23 @@ pub struct StateStoreCallbacks {
 #[repr(C)]
 pub struct TransportCallbacks {
     pub user_data: *mut c_void,
+    /// Deliver `bytes` to a peer reachable at any of `endpoints`.
+    ///
+    /// `endpoints` is a length-delimited sequence of encoded
+    /// `TransportProtocol` messages — each entry preceded by its protobuf
+    /// varint byte length, the same framing protobuf uses for a repeated
+    /// embedded message field. They are the endpoints that peer advertised,
+    /// in the order it offered them, already filtered to those the library
+    /// will record.
+    ///
+    /// The library does not rank them. Which endpoint to dial, and whether
+    /// to fall back to another when one is unreachable, is the
+    /// implementation's choice. Return `0` once the message has reached any
+    /// one of them; non-zero only when it reached none.
     pub send: extern "C" fn(
         user_data: *mut c_void,
-        uri_ptr: *const u8,
-        uri_len: usize,
-        protocol: i32,
+        endpoints_ptr: *const u8,
+        endpoints_len: usize,
         bytes: *const u8,
         len: usize,
     ) -> i32,
@@ -1111,15 +1123,24 @@ unsafe impl Send for DotnetTransport {}
 unsafe impl Sync for DotnetTransport {}
 
 impl DeRecTransport for DotnetTransport {
-    fn send(&self, endpoint: &TransportProtocol, message: Vec<u8>) -> TransportFuture<'_> {
+    fn send(&self, endpoints: &[TransportProtocol], message: Vec<u8>) -> TransportFuture<'_> {
+        use prost::Message as _;
+
         let cb = &self.cb;
-        let uri = endpoint.uri.clone();
-        let protocol = endpoint.protocol;
+        // Length-delimited framing: one varint length per entry, then its
+        // encoded bytes. Keeps the C ABI a single (ptr, len) pair however
+        // many endpoints a peer advertised.
+        let mut framed = Vec::new();
+        for endpoint in endpoints {
+            let entry = endpoint.encode_to_vec();
+            prost::encoding::encode_varint(entry.len() as u64, &mut framed);
+            framed.extend_from_slice(&entry);
+        }
+
         let rc = (cb.send)(
             cb.user_data,
-            uri.as_ptr(),
-            uri.len(),
-            protocol,
+            framed.as_ptr(),
+            framed.len(),
             message.as_ptr(),
             message.len(),
         );

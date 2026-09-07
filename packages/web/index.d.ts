@@ -199,7 +199,21 @@ export interface StateStore {
  * DeRec over request/response transports" in the Rust SDK README.
  */
 export interface Transport {
-  send(endpoint: { protocol: string; uri: string }, message: Uint8Array): Promise<void>;
+  /**
+   * Delivers `message` to a peer reachable at any of `endpoints`.
+   *
+   * `endpoints` are the addresses that peer advertised, in the order it
+   * offered them, already filtered to those the library will record. The
+   * library does not rank them: which to dial, and whether to fall back when
+   * one is unreachable, is this implementation's choice. Never empty.
+   *
+   * Delivery to any one endpoint is success. Reject only when the message
+   * reached none of them.
+   */
+  send(
+    endpoints: ReadonlyArray<{ protocol: string; uri: string }>,
+    message: Uint8Array,
+  ): Promise<void>;
 }
 
 export enum SenderKind {
@@ -275,6 +289,10 @@ export interface ContactMessage {
   /** Present only when `contact_mode === ContactMode.HashedKeys`. SHA-384 digest (48 bytes). */
   contact_binding_hash?: Uint8Array;
   timestamp?: Timestamp;
+  /** Every transport endpoint the creator of this contact can be reached
+   *  on, in its own preference order. Empty means "only
+   *  `transport_protocol` is offered". */
+  supported_transports: TransportProtocol[];
 }
 
 export interface UserSecret {
@@ -323,6 +341,12 @@ export interface UpdateChannelInfoParams {
 
   /** New transport endpoint. Absent leaves it untouched. */
   transport_protocol?: { uri: string; protocol: number };
+  /**
+   * Every endpoint this node now serves, in its own preference order.
+   * Omitted leaves the target(s)' stored set untouched. Takes precedence
+   * over `transport_protocol`, whose first entry it also fills.
+   */
+  own_transports?: TransportProtocol[];
 }
 
 /**
@@ -469,7 +493,8 @@ export type DeRecEvent =
       secret: {
         helpers: Array<{
           channel_id: string;
-          transport_uri: string;
+          /** Every endpoint this peer advertised, in the order it offered them. */
+          transports: Array<{ uri: string; protocol: number }>;
           shared_key: Uint8Array;
           communication_info: Record<string, string>;
         }>;
@@ -490,7 +515,8 @@ export type DeRecEvent =
            *  originated, which is why no separate owner field is needed. */
           members: Array<{
             replica_id: string;
-            transport_uri: string;
+            /** Every endpoint this peer advertised, in the order it offered them. */
+            transports: Array<{ uri: string; protocol: number }>;
             role: "Source" | "Destination";
             communication_info: Record<string, string>;
           }>;
@@ -536,7 +562,8 @@ export type DeRecEvent =
       secret: {
         helpers: Array<{
           channel_id: string;
-          transport_uri: string;
+          /** Every endpoint this peer advertised, in the order it offered them. */
+          transports: Array<{ uri: string; protocol: number }>;
           shared_key: Uint8Array;
           communication_info: Record<string, string>;
         }>;
@@ -555,7 +582,8 @@ export type DeRecEvent =
            *  originated, which is why no separate owner field is needed. */
           members: Array<{
             replica_id: string;
-            transport_uri: string;
+            /** Every endpoint this peer advertised, in the order it offered them. */
+            transports: Array<{ uri: string; protocol: number }>;
             role: "Source" | "Destination";
             communication_info: Record<string, string>;
           }>;
@@ -585,7 +613,8 @@ export type DeRecEvent =
       secret: {
         helpers: Array<{
           channel_id: string;
-          transport_uri: string;
+          /** Every endpoint this peer advertised, in the order it offered them. */
+          transports: Array<{ uri: string; protocol: number }>;
           shared_key: Uint8Array;
           communication_info: Record<string, string>;
         }>;
@@ -604,7 +633,8 @@ export type DeRecEvent =
            *  originated, which is why no separate owner field is needed. */
           members: Array<{
             replica_id: string;
-            transport_uri: string;
+            /** Every endpoint this peer advertised, in the order it offered them. */
+            transports: Array<{ uri: string; protocol: number }>;
             role: "Source" | "Destination";
             communication_info: Record<string, string>;
           }>;
@@ -750,8 +780,8 @@ export interface AutoAcceptPolicy {
  * between them without reaching for reference docs.
  *
  * Required setters: `withChannelStore`, `withShareStore`,
- * `withSecretStore`, `withTransport`, `withOwnTransport`. Calling
- * `build()` without all five throws.
+ * `withSecretStore`, `withTransport`, and either `withOwnTransport` or
+ * `withOwnTransports`. Calling `build()` without all five throws.
  */
 export declare class DeRecProtocolBuilder {
   /**
@@ -769,6 +799,22 @@ export declare class DeRecProtocolBuilder {
   withStateStore(store: StateStore): DeRecProtocolBuilder;
   withTransport(transport: Transport): DeRecProtocolBuilder;
   withOwnTransport(endpoint: { uri: string; protocol: string }): DeRecProtocolBuilder;
+  /**
+   * Set every transport endpoint this application serves, in preference
+   * order. `protocol` is `"https"` or `"grpc"` (case-insensitive) per
+   * entry, same as {@link withOwnTransport}.
+   *
+   * The order is this application's own preference and decides which of
+   * a peer's offered endpoints is used; it is not sorted, deduplicated,
+   * or reordered. Every listed transport must actually be served,
+   * because delivery is push-only — listing an endpoint this application
+   * does not serve makes pairing succeed and replies vanish.
+   *
+   * Supersedes {@link withOwnTransport} for applications serving more
+   * than one transport; the single-endpoint setter remains fully
+   * supported.
+   */
+  withOwnTransports(transports: { uri: string; protocol: string }[]): DeRecProtocolBuilder;
 
   /** Default: 3. */
   withThreshold(threshold: number): DeRecProtocolBuilder;
@@ -808,8 +854,17 @@ export declare class DeRecProtocolBuilder {
    * delivery is your `Transport`. Nothing here stops an application sending
    * plaintext — it governs which endpoints the protocol will record,
    * propagate to peers, and reply to.
+   *
+   * @deprecated Use {@link withUnsafeConnection}, which names both gated
+   * schemes. Removed at 0.1.0.
    */
   withUnsafeHttp(allow: boolean): DeRecProtocolBuilder;
+  /**
+   * Accept plaintext `http://` and `grpc://` transport endpoints.
+   * **Development only.** Default: `false`. Supersedes
+   * {@link withUnsafeHttp}, which names only the HTTP scheme.
+   */
+  withUnsafeConnection(allow: boolean): DeRecProtocolBuilder;
   /** Default: empty. */
   withCommunicationInfo(info: Record<string, string>): DeRecProtocolBuilder;
   /** Default: false. */
@@ -1019,7 +1074,12 @@ export interface GetSecretIdsVersionsRequestMessage {
   timestamp?: Timestamp;
   /** Ephemeral endpoint where the requester wants the response routed.
    *  Absent means "use the channel's stored peer endpoint". */
-  reply_to?: TransportProtocol;
+  /**
+   * Every endpoint the requester can be answered on for this exchange, in
+   * its own preference order. Omitted means route to the endpoints already
+   * recorded for the channel.
+   */
+  reply_to?: TransportProtocol[];
   /** Replica-group member that sent this; see `replicaId` semantics. */
   replica_id?: bigint;
 }
@@ -1094,6 +1154,9 @@ export interface PairRequestMessage {
   parameter_range?: ParameterRange;
   transport_protocol?: TransportProtocol;
   timestamp?: Timestamp;
+  /** Every transport endpoint the initiator can be reached on, in its own
+   *  preference order. Empty means "only `transport_protocol` is offered". */
+  supported_transports: TransportProtocol[];
 }
 
 export interface PairResponseMessage {
@@ -1114,8 +1177,18 @@ export interface PairResponseMessage {
 
 export interface PrePairRequestMessage {
   nonce: bigint;
+  /**
+   * @deprecated Superseded by `supported_transports`, which carries every
+   * endpoint rather than one. Scheduled for removal in v0.0.5.
+   */
   transport_protocol?: TransportProtocol;
   timestamp?: Timestamp;
+  /**
+   * Every endpoint the sender can be reached on for the PrePair reply, in
+   * its own preference order. At least one of this and `transport_protocol`
+   * must be present.
+   */
+  supported_transports?: TransportProtocol[];
 }
 
 export interface PrePairResponseMessage {
@@ -1133,7 +1206,12 @@ export interface GetShareRequestMessage {
   version: number;
   timestamp?: Timestamp;
   /** Ephemeral response endpoint; see `replyTo` semantics. */
-  reply_to?: TransportProtocol;
+  /**
+   * Every endpoint the requester can be answered on for this exchange, in
+   * its own preference order. Omitted means route to the endpoints already
+   * recorded for the channel.
+   */
+  reply_to?: TransportProtocol[];
   /** Replica-group member that sent this; see `replicaId` semantics. */
   replica_id?: bigint;
 }
@@ -1175,7 +1253,12 @@ export interface StoreShareRequestMessage {
   timestamp?: Timestamp;
   secret_id: bigint;
   /** Ephemeral response endpoint; see `replyTo` semantics. */
-  reply_to?: TransportProtocol;
+  /**
+   * Every endpoint the requester can be answered on for this exchange, in
+   * its own preference order. Omitted means route to the endpoints already
+   * recorded for the channel.
+   */
+  reply_to?: TransportProtocol[];
   /** Replica-group member that sent this; see `replicaId` semantics. */
   replica_id?: bigint;
 }
@@ -1193,7 +1276,12 @@ export interface UnpairRequestMessage {
   memo: string;
   timestamp?: Timestamp;
   /** Ephemeral response endpoint; see `replyTo` semantics. */
-  reply_to?: TransportProtocol;
+  /**
+   * Every endpoint the requester can be answered on for this exchange, in
+   * its own preference order. Omitted means route to the endpoints already
+   * recorded for the channel.
+   */
+  reply_to?: TransportProtocol[];
   /** Replica-group member that sent this; see `replicaId` semantics. */
   replica_id?: bigint;
 }
@@ -1209,7 +1297,12 @@ export interface VerifyShareRequestMessage {
   nonce: bigint;
   timestamp?: Timestamp;
   /** Ephemeral response endpoint; see `replyTo` semantics. */
-  reply_to?: TransportProtocol;
+  /**
+   * Every endpoint the requester can be answered on for this exchange, in
+   * its own preference order. Omitted means route to the endpoints already
+   * recorded for the channel.
+   */
+  reply_to?: TransportProtocol[];
 }
 
 export interface VerifyShareResponseMessage {
@@ -1245,7 +1338,12 @@ export interface PairingRequestProduceResult extends ProduceResult {
 }
 
 export interface PairingResponseProduceResult extends ProduceResult {
-  peer_transport_protocol: TransportProtocol;
+  /**
+   * Every endpoint the requester advertised, in the order it offered them,
+   * filtered to those the library will record. Never empty. Choosing which
+   * to dial, and failing over when one is unreachable, is the application's.
+   */
+  peer_transports: TransportProtocol[];
 
   shared_key: Uint8Array;
 
@@ -1354,7 +1452,7 @@ export declare const primitives: {
       produce(
         channel_id: bigint,
         shared_key: Uint8Array,
-        reply_to?: TransportProtocol | null,
+        reply_to?: TransportProtocol[],
       ): ProduceResult;
       extract(envelope_bytes: Uint8Array, shared_key: Uint8Array): { request: GetSecretIdsVersionsRequestMessage };
     };
@@ -1374,19 +1472,21 @@ export declare const primitives: {
        *                      `ContactMode.HashedKeys` embeds only a SHA-384
        *                      commitment and the scanner must complete a
        *                      `PrePair` round-trip first.
-       * @param transport_protocol  Endpoint the scanner uses to talk back. For
-       *                            `HashedKeys` mode it MUST be ephemeral.
+       * @param transport_protocols  Every endpoint this initiator serves, in
+       *                             preference order. The first also fills the
+       *                             legacy singular field. For `HashedKeys`
+       *                             mode they MUST be ephemeral.
        */
       create_contact(
         channel_id: bigint,
         contact_mode: ContactMode | number,
-        transport_protocol: TransportProtocol,
+        transport_protocols: TransportProtocol[],
       ): CreateContactResult;
       encode_contact(contact_message: ContactMessage): Uint8Array;
       decode_contact(bytes: Uint8Array): ContactMessage;
       produce(
         kind: SenderKind,
-        transport_protocol: TransportProtocol,
+        transport_protocols: TransportProtocol[],
         contact_message: ContactMessage,
         communication_info: CommunicationInfo | null,
         parameter_range: ParameterRange | null,
@@ -1401,8 +1501,14 @@ export declare const primitives: {
        * binding hash with `pairing.response.process_pre_pair` before
        * proceeding to a normal `produce`.
        */
+      /**
+       * @param own_transports  Every endpoint this scanner serves for the
+       *                        PrePair reply, in its own preference order.
+       *                        The first entry also fills the deprecated
+       *                        singular field for peers predating the list.
+       */
       produce_pre_pair(
-        transport_protocol: TransportProtocol,
+        own_transports: TransportProtocol[],
         contact_message: ContactMessage,
       ): ProducePrePairResult;
 
@@ -1413,12 +1519,17 @@ export declare const primitives: {
       extract_pre_pair(envelope_bytes: Uint8Array): PrePairRequestExtractResult;
     };
     response: {
+      /**
+       * @param unsafe_connection  Accept plaintext peer endpoints
+       *                           (`http://`, `grpc://`). Development only.
+       */
       produce(
         channel_id: bigint,
         request: PairRequestMessage,
         secret_key: Uint8Array,
         communication_info: CommunicationInfo | null,
         parameter_range: ParameterRange | null,
+        unsafe_connection?: boolean,
       ): PairingResponseProduceResult;
 
       extract(envelope_bytes: Uint8Array, secret_key: Uint8Array): { response: PairResponseMessage };
@@ -1463,7 +1574,7 @@ export declare const primitives: {
         version: number,
         shared_key: Uint8Array,
         /** See `discovery.request.produce.reply_to`. */
-        reply_to?: TransportProtocol | null,
+        reply_to?: TransportProtocol[],
       ): ProduceResult;
       extract(envelope_bytes: Uint8Array, shared_key: Uint8Array): { request: GetShareRequestMessage };
     };
@@ -1496,7 +1607,7 @@ export declare const primitives: {
         description: string,
         shared_key: Uint8Array,
         /** See `discovery.request.produce.reply_to`. */
-        reply_to?: TransportProtocol | null,
+        reply_to?: TransportProtocol[],
       ): ProduceResult;
       extract(envelope_bytes: Uint8Array, shared_key: Uint8Array): { request: StoreShareRequestMessage };
     };
@@ -1517,7 +1628,7 @@ export declare const primitives: {
         memo: string,
         shared_key: Uint8Array,
         /** See `discovery.request.produce.reply_to`. */
-        reply_to?: TransportProtocol | null,
+        reply_to?: TransportProtocol[],
       ): ProduceResult;
       extract(envelope_bytes: Uint8Array, shared_key: Uint8Array): { request: UnpairRequestMessage };
     };
@@ -1535,7 +1646,7 @@ export declare const primitives: {
         version: number,
         shared_key: Uint8Array,
         /** See `discovery.request.produce.reply_to`. */
-        reply_to?: TransportProtocol | null,
+        reply_to?: TransportProtocol[],
       ): ProduceResult;
       extract(envelope_bytes: Uint8Array, shared_key: Uint8Array): { request: VerifyShareRequestMessage };
     };

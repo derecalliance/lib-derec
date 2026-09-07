@@ -81,7 +81,7 @@ pub struct ExtractResult {
 ///
 /// // Owner: issue a verification challenge.
 /// let request::ProduceResult { envelope: req_envelope, .. } =
-///     request::produce(channel_id, 1, 1, &shared_key, None).expect("produce request failed");
+///     request::produce(channel_id, 1, 1, &shared_key, &[]).expect("produce request failed");
 ///
 /// // Helper: extract the challenge and answer it with the share bytes.
 /// let request::ExtractResult { request: challenge } =
@@ -192,7 +192,7 @@ pub fn produce(
 ///
 /// // Owner: issue a verification challenge.
 /// let request::ProduceResult { envelope: req_envelope, .. } =
-///     request::produce(channel_id, 1, 1, &shared_key, None).expect("produce request failed");
+///     request::produce(channel_id, 1, 1, &shared_key, &[]).expect("produce request failed");
 ///
 /// // Helper: extract the challenge and answer it.
 /// let request::ExtractResult { request: challenge } =
@@ -314,7 +314,7 @@ pub fn extract(
 /// // Owner: issue a verification challenge and remember the request body
 /// // so we can bind the eventual response back to this specific challenge.
 /// let request::ProduceResult { envelope: req_envelope, nonce: _expected_nonce } =
-///     request::produce(channel_id, 1, 1, &shared_key, None).expect("produce request failed");
+///     request::produce(channel_id, 1, 1, &shared_key, &[]).expect("produce request failed");
 ///
 /// // Helper: answer the challenge with the share bytes.
 /// let request::ExtractResult { request: challenge } =
@@ -342,6 +342,7 @@ pub fn process(
     // Anti-replay / cross-binding gate — runs BEFORE the status and
     // hash checks so a stale/replayed response is rejected even on a
     // structurally-OK envelope.
+    // TODO: add response.validate(nonce, secret_id, version)?
     if response.nonce != request.nonce {
         return Err(VerificationError::ResponseBindingMismatch {
             field: "nonce",
@@ -371,6 +372,7 @@ pub fn process(
         "VerifyShareResponseMessage is missing result field",
     ))?;
 
+    // TODO: result.validate()?
     if result.status != StatusEnum::Ok as i32 {
         #[cfg(feature = "logging")]
         tracing::warn!(

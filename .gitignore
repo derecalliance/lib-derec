@@ -41,3 +41,7 @@ runtimes/
 /packages/react-native/android/build/
 /packages/react-native/lib/
 /packages/react-native/dist/
+
+# Compiled smoke-test binaries. `go build ./...` in smoke-tests/go drops an
+# executable named after the directory; it is a build output, never an input.
+/smoke-tests/go/go

@@ -86,11 +86,11 @@ function bytes(value: unknown): Uint8Array {
   return new Uint8Array(value as ArrayBuffer);
 }
 
-/** `null` and `undefined` both mean "no override" for every optional
- *  `TransportProtocol` argument; the C ABI reads a zero-length buffer as
- *  absent. */
-function replyTo(value: TransportProtocol | null | undefined): Uint8Array {
-  return encodeOptionalMessage(MessageKind.TransportProtocol, value);
+/** An omitted or empty list means "no override" for every reply-to argument;
+ *  the C ABI reads a zero-length buffer as absent, and the responder then
+ *  routes to the endpoints already recorded for the channel. */
+function replyTo(value: TransportProtocol[] | undefined): Uint8Array {
+  return value && value.length > 0 ? encodeTransportList(value) : new Uint8Array(0);
 }
 
 /**
@@ -117,7 +117,7 @@ const discovery = {
     produce(
       channel_id: bigint,
       shared_key: Uint8Array,
-      reply_to?: TransportProtocol | null,
+      reply_to?: TransportProtocol[],
     ): ProduceResult {
       const envelope = call(
         'produce_get_secret_ids_versions_request_message',
@@ -188,12 +188,69 @@ const discovery = {
   },
 };
 
+/**
+ * Frames a preference-ordered endpoint list for the native seam: each entry
+ * preceded by its protobuf varint byte length. Order is preserved exactly.
+ */
+function encodeTransportList(transports: TransportProtocol[]): Uint8Array {
+  const entries = transports.map((t) =>
+    new Uint8Array(encodeMessage(MessageKind.TransportProtocol, t)),
+  );
+  const out: number[] = [];
+  for (const entry of entries) {
+    let len = entry.length;
+    do {
+      let b = len & 0x7f;
+      len >>>= 7;
+      if (len !== 0) b |= 0x80;
+      out.push(b);
+    } while (len !== 0);
+    out.push(...entry);
+  }
+  return new Uint8Array(out);
+}
+
+/**
+ * Reads the framing `encodeTransportList` writes. Order is the peer's and is
+ * preserved exactly — the library filters a peer's endpoints but never ranks
+ * them, so this order is the peer's own preference, not a recommendation.
+ */
+function decodeTransportList(framed: Uint8Array | ArrayBuffer): TransportProtocol[] {
+  const buf = framed instanceof Uint8Array ? framed : new Uint8Array(framed);
+  const out: TransportProtocol[] = [];
+  let i = 0;
+  while (i < buf.length) {
+    let len = 0;
+    let shift = 0;
+    for (;;) {
+      if (i >= buf.length) {
+        throw new Error('truncated transport list: length prefix runs past the end');
+      }
+      const b = buf[i++]!;
+      len |= (b & 0x7f) << shift;
+      if ((b & 0x80) === 0) break;
+      shift += 7;
+    }
+    if (i + len > buf.length) {
+      throw new Error('truncated transport list: entry runs past the end');
+    }
+    out.push(
+      decodeMessage<TransportProtocol>(
+        MessageKind.TransportProtocol,
+        buf.subarray(i, i + len),
+      ),
+    );
+    i += len;
+  }
+  return out;
+}
+
 const pairing = {
   request: {
     create_contact(
       channel_id: bigint,
       contact_mode: ContactMode | number,
-      transport_protocol: TransportProtocol,
+      transport_protocols: TransportProtocol[],
     ): CreateContactResult {
       // The C entry point also accepts a caller-supplied nonce behind a
       // presence flag. `@derec-alliance/nodejs` has no such parameter, so the
@@ -203,7 +260,7 @@ const pairing = {
         'create_contact_message',
         channel_id,
         contact_mode,
-        encodeMessage(MessageKind.TransportProtocol, transport_protocol),
+        encodeTransportList(transport_protocols),
         0,
         0n,
       ) as { contact_wire_bytes: ArrayBuffer; secret_key_material: ArrayBuffer };
@@ -223,7 +280,7 @@ const pairing = {
 
     produce(
       kind: SenderKind,
-      transport_protocol: TransportProtocol,
+      transport_protocols: TransportProtocol[],
       contact_message: ContactMessage,
       communication_info: CommunicationInfo | null,
       parameter_range: ParameterRange | null,
@@ -231,7 +288,7 @@ const pairing = {
       const result = call(
         'produce_pair_request_message',
         kind,
-        encodeMessage(MessageKind.TransportProtocol, transport_protocol),
+        encodeTransportList(transport_protocols),
         encodeContact(contact_message),
         encodeOptionalMessage(MessageKind.CommunicationInfo, communication_info),
         encodeOptionalMessage(MessageKind.ParameterRange, parameter_range),
@@ -262,12 +319,12 @@ const pairing = {
     },
 
     produce_pre_pair(
-      transport_protocol: TransportProtocol,
+      own_transports: TransportProtocol[],
       contact_message: ContactMessage,
     ): ProducePrePairResult {
       const envelope = call(
         'produce_pre_pair_request_message',
-        encodeMessage(MessageKind.TransportProtocol, transport_protocol),
+        encodeTransportList(own_transports),
         encodeContact(contact_message),
       );
       return { envelope: bytes(envelope) };
@@ -293,6 +350,7 @@ const pairing = {
       secret_key: Uint8Array,
       communication_info: CommunicationInfo | null,
       parameter_range: ParameterRange | null,
+      unsafe_connection = false,
     ): PairingResponseProduceResult {
       const result = call(
         'produce_pair_response_message',
@@ -301,18 +359,16 @@ const pairing = {
         secret_key,
         encodeOptionalMessage(MessageKind.CommunicationInfo, communication_info),
         encodeOptionalMessage(MessageKind.ParameterRange, parameter_range),
+        unsafe_connection,
       ) as {
         response_wire_bytes: ArrayBuffer;
-        peer_transport_protocol: ArrayBuffer;
+        peer_transports: ArrayBuffer;
         shared_key: ArrayBuffer;
         channel_id: bigint;
       };
       return {
         envelope: bytes(result.response_wire_bytes),
-        peer_transport_protocol: decodeMessage<TransportProtocol>(
-          MessageKind.TransportProtocol,
-          result.peer_transport_protocol,
-        ),
+        peer_transports: decodeTransportList(result.peer_transports),
         shared_key: bytes(result.shared_key),
         channel_id: result.channel_id,
       };
@@ -402,7 +458,7 @@ const recovery = {
       secret_id: bigint,
       version: number,
       shared_key: Uint8Array,
-      reply_to?: TransportProtocol | null,
+      reply_to?: TransportProtocol[],
     ): ProduceResult {
       const envelope = call(
         'produce_get_share_request_message',
@@ -505,7 +561,7 @@ const sharing = {
       keep_list: number[],
       description: string,
       shared_key: Uint8Array,
-      reply_to?: TransportProtocol | null,
+      reply_to?: TransportProtocol[],
     ): ProduceResult {
       const envelope = call(
         'produce_store_share_request_message',
@@ -596,7 +652,7 @@ const unpairing = {
       channel_id: bigint,
       memo: string,
       shared_key: Uint8Array,
-      reply_to?: TransportProtocol | null,
+      reply_to?: TransportProtocol[],
     ): ProduceResult {
       const envelope = call(
         'produce_unpair_request_message',
@@ -668,7 +724,7 @@ const verification = {
       secret_id: bigint,
       version: number,
       shared_key: Uint8Array,
-      reply_to?: TransportProtocol | null,
+      reply_to?: TransportProtocol[],
     ): ProduceResult {
       const envelope = call(
         'produce_verify_share_request_message',

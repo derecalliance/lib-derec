@@ -43,7 +43,10 @@ func newInProcessTransport() *inProcessTransport {
 	return &inProcessTransport{}
 }
 
-func (t *inProcessTransport) Send(uri string, _ int32, message []byte) error {
+func (t *inProcessTransport) Send(endpoints []Endpoint, message []byte) error {
+	uri := endpoints[0].URI
+	protocol := endpoints[0].Protocol
+	_ = protocol
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.outbox = append(t.outbox, outboxEntry{uri: uri, message: append([]byte(nil), message...)})

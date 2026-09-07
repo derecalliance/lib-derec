@@ -202,7 +202,13 @@ message ContactMessage {
   // request. Subsequent protocol exchanges may continue using the same
   // transport information or updated transport details, depending on the
   // protocol and application behavior.
-  TransportProtocol transportProtocol = 7;
+  //
+  // Deprecated: superseded by `supportedTransports`, which carries every
+  // endpoint rather than one. Kept so implementations predating that field
+  // still pair. **Scheduled for removal in v0.0.5.** A sender populating
+  // `supportedTransports` MUST also set this to a single
+  // best-compatibility choice until then.
+  TransportProtocol transportProtocol = 7 [deprecated = true];
 
   // Timestamp indicating when the sender created this message.
   //
@@ -212,4 +218,35 @@ message ContactMessage {
   // - timeout handling
   // - logging and observability
   google.protobuf.Timestamp timestamp = 8;
+
+  // Every transport endpoint the creator of this contact can be reached on.
+  //
+  // Each entry is a complete endpoint: a URI plus the protocol that says
+  // how to interpret it. The list is written in the creator's own
+  // preference order.
+  //
+  // # Selection is the recipient's
+  //
+  // A recipient picks whichever entry suits it, ordered by its **own**
+  // preference rather than the sender's. The order here expresses
+  // availability, not a ranking the recipient must honor.
+  //
+  // # Compatibility
+  //
+  // Absent means "only `transportProtocol` is offered", which is how every
+  // implementation predating this field behaves. A sender populating this
+  // list MUST also set `transportProtocol` to a single best-compatibility
+  // choice so those implementations still pair.
+  //
+  // # Security
+  //
+  // `contactBindingHash` does not cover this field, exactly as it does not
+  // cover `transportProtocol`. An attacker able to rewrite an
+  // out-of-band contact can therefore remove entries. Removing the secure
+  // ones leaves only plaintext, which the recipient's transport policy
+  // refuses unless plaintext has been explicitly opted into. DeRec messages
+  // are signed and encrypted at the application layer on every transport,
+  // so substituting one secure transport for another is not a loss of
+  // confidentiality or authenticity.
+  repeated TransportProtocol supportedTransports = 9;
 }

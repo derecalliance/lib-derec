@@ -25,6 +25,18 @@ func encodeTransportProtocol(uri string) []byte {
 	return buf
 }
 
+// encodeTransportList frames endpoints the way the FFI seam expects: each
+// entry preceded by its varint byte length.
+func encodeTransportList(uris ...string) []byte {
+	var out []byte
+	for _, uri := range uris {
+		entry := encodeTransportProtocol(uri)
+		out = appendVarint(out, uint64(len(entry)))
+		out = append(out, entry...)
+	}
+	return out
+}
+
 func appendVarint(buf []byte, v uint64) []byte {
 	for v >= 0x80 {
 		buf = append(buf, byte(v)|0x80)
@@ -39,7 +51,7 @@ func appendVarint(buf []byte, v uint64) []byte {
 func TestPairingInlineKeysHandshakeRoundTrip(t *testing.T) {
 	const channelID = uint64(1)
 
-	aliceTransport := encodeTransportProtocol("https://example.com/alice")
+	aliceTransport := encodeTransportList("https://example.com/alice")
 	created, err := pairing.Request.CreateContact(channelID, pairing.ContactModeInlineKeys, aliceTransport, nil)
 	if err != nil {
 		t.Fatalf("CreateContact: %v", err)
@@ -55,7 +67,7 @@ func TestPairingInlineKeysHandshakeRoundTrip(t *testing.T) {
 		t.Fatalf("Validate: %v", err)
 	}
 
-	bobTransport := encodeTransportProtocol("https://example.com/helper")
+	bobTransport := encodeTransportList("https://example.com/helper")
 	producedReq, err := pairing.Request.Produce(pairing.SenderKindHelper, bobTransport, created.ContactWireBytes, nil, nil)
 	if err != nil {
 		t.Fatalf("Request.Produce: %v", err)
@@ -75,12 +87,21 @@ func TestPairingInlineKeysHandshakeRoundTrip(t *testing.T) {
 		t.Fatal("Request.Extract returned empty request proto")
 	}
 
-	producedResp, err := pairing.Response.Produce(channelID, extractedReq.RequestProto, created.SecretKeyMaterial, nil, nil)
+	producedResp, err := pairing.Response.Produce(channelID, extractedReq.RequestProto, created.SecretKeyMaterial, nil, nil, false)
 	if err != nil {
 		t.Fatalf("Response.Produce: %v", err)
 	}
 	if len(producedResp.Envelope) == 0 {
 		t.Fatal("Response.Produce returned empty envelope")
+	}
+	// The endpoints the requester advertised come back decoded, in its order.
+	// Reading them as a single encoded TransportProtocol is the bug this
+	// guards: the buffer carries a length-delimited list, not one message.
+	if len(producedResp.PeerTransports) != 1 {
+		t.Fatalf("Response.Produce: want 1 peer transport, got %d", len(producedResp.PeerTransports))
+	}
+	if producedResp.PeerTransports[0].URI != "https://example.com/helper" {
+		t.Fatalf("Response.Produce: unexpected peer transport %q", producedResp.PeerTransports[0].URI)
 	}
 	if len(producedResp.SharedKey) == 0 {
 		t.Fatal("Response.Produce returned empty shared key (initiator side)")
@@ -125,7 +146,7 @@ func TestValidateContactMessageRejectsGarbageBytes(t *testing.T) {
 }
 
 func TestCreateContactRejectsInvalidContactMode(t *testing.T) {
-	_, err := pairing.Request.CreateContact(1, pairing.ContactMode(99), encodeTransportProtocol("https://example.com"), nil)
+	_, err := pairing.Request.CreateContact(1, pairing.ContactMode(99), encodeTransportList("https://example.com"), nil)
 	if err == nil {
 		t.Fatal("expected an error for an invalid ContactMode value")
 	}
@@ -165,7 +186,7 @@ func TestPairingHashedKeysPrePairRoundTrip(t *testing.T) {
 	const channelID = uint64(2)
 	const expectedNonce = uint64(0x1234_5678)
 
-	aliceTransport := encodeTransportProtocol("https://example.com/alice/ephemeral")
+	aliceTransport := encodeTransportList("https://example.com/alice/ephemeral")
 	nonce := expectedNonce
 	aliceContact, err := pairing.Request.CreateContact(channelID, pairing.ContactModeHashedKeys, aliceTransport, &nonce)
 	if err != nil {
@@ -182,7 +203,9 @@ func TestPairingHashedKeysPrePairRoundTrip(t *testing.T) {
 		t.Fatalf("Validate (HASHED_KEYS contact): %v", err)
 	}
 
-	bobTransport := encodeTransportProtocol("https://example.com/helper/ephemeral")
+	// PrePair now advertises the scanner's whole list, framed like every
+	// other endpoint list crossing the seam.
+	bobTransport := encodeTransportList("https://example.com/helper/ephemeral")
 	prepairReq, err := pairing.Request.ProducePrePair(bobTransport, aliceContact.ContactWireBytes)
 	if err != nil {
 		t.Fatalf("Request.ProducePrePair: %v", err)
@@ -240,13 +263,15 @@ func TestProcessPrePairRejectsBindingHashMismatch(t *testing.T) {
 	const channelID = uint64(3)
 	nonce := uint64(0xABCD)
 
-	aliceTransport := encodeTransportProtocol("https://example.com/alice/ephemeral")
+	aliceTransport := encodeTransportList("https://example.com/alice/ephemeral")
 	aliceContact, err := pairing.Request.CreateContact(channelID, pairing.ContactModeHashedKeys, aliceTransport, &nonce)
 	if err != nil {
 		t.Fatalf("CreateContact (HASHED_KEYS): %v", err)
 	}
 
-	bobTransport := encodeTransportProtocol("https://example.com/helper/ephemeral")
+	// PrePair now advertises the scanner's whole list, framed like every
+	// other endpoint list crossing the seam.
+	bobTransport := encodeTransportList("https://example.com/helper/ephemeral")
 	prepairReq, err := pairing.Request.ProducePrePair(bobTransport, aliceContact.ContactWireBytes)
 	if err != nil {
 		t.Fatalf("Request.ProducePrePair: %v", err)
@@ -276,5 +301,49 @@ func TestProcessPrePairRejectsBindingHashMismatch(t *testing.T) {
 	var derr *derec.Error
 	if !errors.As(err, &derr) || derr.Code != derec.CodePrepairHashMismatch {
 		t.Fatalf("want *derec.Error CodePrepairHashMismatch, got %#v", err)
+	}
+}
+
+// TestPairingResponseRejectsPlaintextPeerEndpoint asserts the plaintext
+// guardrail actually reaches the library across the FFI seam: a requester
+// advertising only http:// must be refused unless unsafeConnection is set.
+//
+// This guards the argument list as much as the policy. unsafeConnection is
+// the last scalar the C function reads, so an SDK passing an extra argument
+// ahead of it hands the library a stray value in that slot and silently
+// enables plaintext — which is not observable from a handshake that only
+// ever uses https://.
+func TestPairingResponseRejectsPlaintextPeerEndpoint(t *testing.T) {
+	const channelID = uint64(7)
+
+	aliceTransport := encodeTransportList("https://example.com/alice")
+	created, err := pairing.Request.CreateContact(channelID, pairing.ContactModeInlineKeys, aliceTransport, nil)
+	if err != nil {
+		t.Fatalf("CreateContact: %v", err)
+	}
+
+	bobTransport := encodeTransportList("http://example.com/helper")
+	producedReq, err := pairing.Request.Produce(pairing.SenderKindHelper, bobTransport, created.ContactWireBytes, nil, nil)
+	if err != nil {
+		t.Fatalf("Request.Produce: %v", err)
+	}
+
+	extractedReq, err := pairing.Request.Extract(producedReq.Envelope, created.SecretKeyMaterial)
+	if err != nil {
+		t.Fatalf("Request.Extract: %v", err)
+	}
+
+	if _, err := pairing.Response.Produce(channelID, extractedReq.RequestProto, created.SecretKeyMaterial, nil, nil, false); err == nil {
+		t.Fatal("Response.Produce accepted a plaintext-only peer with unsafeConnection=false")
+	}
+
+	// The same request succeeds once plaintext is opted into, proving the
+	// rejection above came from the policy and not from a malformed request.
+	produced, err := pairing.Response.Produce(channelID, extractedReq.RequestProto, created.SecretKeyMaterial, nil, nil, true)
+	if err != nil {
+		t.Fatalf("Response.Produce with unsafeConnection=true: %v", err)
+	}
+	if len(produced.PeerTransports) != 1 || produced.PeerTransports[0].URI != "http://example.com/helper" {
+		t.Fatalf("Response.Produce: unexpected peer transports %+v", produced.PeerTransports)
 	}
 }

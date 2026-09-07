@@ -72,7 +72,7 @@ pub struct ExtractResult {
 /// let channel_id = ChannelId(42);
 /// let shared_key = [7u8; 32];
 ///
-/// let result = request::produce(channel_id, &shared_key, None)
+/// let result = request::produce(channel_id, &shared_key, &[])
 ///     .expect("failed to build discovery request");
 ///
 /// assert!(!result.envelope.is_empty());
@@ -84,15 +84,13 @@ pub struct ExtractResult {
 pub fn produce(
     channel_id: ChannelId,
     shared_key: &SharedKey,
-    reply_to: Option<derec_proto::TransportProtocol>,
+    reply_to: &[derec_proto::TransportProtocol],
 ) -> Result<ProduceResult, crate::Error> {
     let timestamp = current_timestamp();
 
     let message = GetSecretIdsVersionsRequestMessage {
         timestamp: Some(timestamp),
-        reply_to,
-        // Owner ↔ helper exchange: the replica path sets this, this one
-        // never does. Its absence is what marks the message helper-bound.
+        reply_to: reply_to.to_vec(),
         replica_id: None,
     };
 
@@ -167,7 +165,7 @@ pub fn produce(
 /// let channel_id = ChannelId(42);
 /// let shared_key = [7u8; 32];
 ///
-/// let request::ProduceResult { envelope } = request::produce(channel_id, &shared_key, None)
+/// let request::ProduceResult { envelope } = request::produce(channel_id, &shared_key, &[])
 ///     .expect("failed to build discovery request");
 ///
 /// let request::ExtractResult { request } = request::extract(&envelope, &shared_key)
@@ -210,7 +208,7 @@ pub fn extract(
 
     verify_timestamps(envelope.timestamp, request.timestamp)?;
 
-    if let Some(reply_to) = request.reply_to.as_ref() {
+    for reply_to in &request.reply_to {
         reply_to.validate()?;
     }
 

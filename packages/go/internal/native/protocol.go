@@ -100,6 +100,15 @@ type TimeoutsConfig struct {
 	ExpiredChannels    *RemoveExpiredChannelsPolicy `json:"expired_channels,omitempty"`
 }
 
+// TransportOffer is one entry of the JSON config's "own_transports" array,
+// field for field matching OwnTransportConfig in
+// library/src/interop/ffi/protocol/handle/mod.rs — Protocol is the
+// derec_proto.Protocol i32 discriminant, not a URI scheme.
+type TransportOffer struct {
+	URI      string `json:"uri"`
+	Protocol int32  `json:"protocol"`
+}
+
 // ProtocolConfig carries every derec_protocol_new argument beyond
 // the six callback structs and the communication_info proto buffer, in
 // idiomatic Go form. protocolNew renders it into the JSON config buffer
@@ -110,6 +119,12 @@ type ProtocolConfig struct {
 
 	OwnTransportURI      string
 	OwnTransportProtocol int32
+	// OwnTransports mirrors the "own_transports" JSON array documented on
+	// ProtocolConfig in library/src/interop/ffi/protocol/handle/mod.rs.
+	// Empty omits the key, in which case OwnTransportURI /
+	// OwnTransportProtocol apply; non-empty takes precedence over them
+	// entirely.
+	OwnTransports []TransportOffer
 
 	Threshold         uint32
 	KeepVersionsCount uint32
@@ -124,8 +139,14 @@ type ProtocolConfig struct {
 	// omitted for the same effect.
 	Timeouts *TimeoutsConfig
 	// UnsafeHTTP accepts plaintext http:// transport endpoints. Development
-	// only; false is the production posture.
-	UnsafeHTTP           bool
+	// only; nil (unset) is the production posture.
+	//
+	// Deprecated: use UnsafeConnection, which names both gated schemes.
+	// Removed at 0.1.0.
+	UnsafeHTTP *bool
+	// UnsafeConnection accepts plaintext http:// and grpc:// transport
+	// endpoints. Development only; nil (unset) is the production posture.
+	UnsafeConnection     *bool
 	AutoRespondOnFailure bool
 	// UnpairAck: 0 = Required, 1 = NotRequired.
 	UnpairAck   int32
@@ -158,6 +179,7 @@ type protocolConfigJSON struct {
 	SecretID             string            `json:"secret_id"`
 	OwnTransportURI      string            `json:"own_transport_uri"`
 	OwnTransportProtocol int32             `json:"own_transport_protocol"`
+	OwnTransports        []TransportOffer  `json:"own_transports,omitempty"`
 	Threshold            uint32            `json:"threshold,omitempty"`
 	KeepVersionsCount    uint32            `json:"keep_versions_count,omitempty"`
 	AutoRespondOnFailure bool              `json:"auto_respond_on_failure,omitempty"`
@@ -165,8 +187,12 @@ type protocolConfigJSON struct {
 	AutoReplyTo          bool              `json:"auto_reply_to,omitempty"`
 	AutoAccept           *AutoAcceptPolicy `json:"auto_accept,omitempty"`
 	Timeouts             *TimeoutsConfig   `json:"timeouts,omitempty"`
-	UnsafeHTTP           bool              `json:"unsafe_http"`
-	ReplicaID            *string           `json:"replica_id,omitempty"`
+	// UnsafeHTTP and UnsafeConnection are both omitempty: absence is
+	// meaningful and distinct from false, since the deprecated UnsafeHTTP
+	// only wins its conflict with UnsafeConnection when actually present.
+	UnsafeHTTP       *bool   `json:"unsafe_http,omitempty"`
+	UnsafeConnection *bool   `json:"unsafe_connection,omitempty"`
+	ReplicaID        *string `json:"replica_id,omitempty"`
 }
 
 var (
@@ -271,14 +297,16 @@ func protocolNew(cfg ProtocolConfig, cb *builtCallbacks) (uintptr, error) {
 		SecretID:             strconv.FormatUint(cfg.SecretID, 10),
 		OwnTransportURI:      cfg.OwnTransportURI,
 		OwnTransportProtocol: cfg.OwnTransportProtocol,
+		OwnTransports:        cfg.OwnTransports,
 		Threshold:            cfg.Threshold,
 		KeepVersionsCount:    cfg.KeepVersionsCount,
 		AutoRespondOnFailure: cfg.AutoRespondOnFailure,
 		UnpairAck:            cfg.UnpairAck,
 		AutoReplyTo:          cfg.AutoReplyTo,
 
-		Timeouts:   cfg.Timeouts,
-		UnsafeHTTP: cfg.UnsafeHTTP,
+		Timeouts:         cfg.Timeouts,
+		UnsafeHTTP:       cfg.UnsafeHTTP,
+		UnsafeConnection: cfg.UnsafeConnection,
 	}
 	// The zero value of AutoAcceptPolicy (every flow false) is
 	// indistinguishable from "the caller never set it" — and is also

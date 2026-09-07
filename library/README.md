@@ -250,7 +250,8 @@ Optional setters have defaults:
 | `with_threshold(n)` | `3` | Minimum shares required to reconstruct the secret. |
 | `with_keep_versions_count(n)` | `3` | Number of recent versions each helper must retain. |
 | `with_timeouts(timeouts)` | see [Timeouts](#timeouts) | All four waiting periods in one call; unspecified fields keep their default. `inbound_message` 300s is the staleness/replay window, `sharing_round` and `unpair_ack` 60s are liveness budgets, `expired_channels` `Enabled { 300 }` sweeps channels awaiting fingerprint confirmation. |
-| `with_unsafe_http(bool)` | `false` | Accept plaintext `http://` endpoints. **Development only.** Loopback is accepted for your own endpoint regardless; see [Transport endpoints and plaintext](#transport-endpoints-and-plaintext). |
+| `with_unsafe_connection(bool)` | `false` | Accept plaintext `http://` and `grpc://` endpoints. **Development only.** Loopback is accepted for your own endpoint regardless; see [Transport endpoints and plaintext](#transport-endpoints-and-plaintext). |
+| `with_unsafe_http(bool)` | `false` | Deprecated since 0.0.3 — the `http://`-only predecessor of `with_unsafe_connection`. Still honored; wins on conflict if both are set. See [Transport endpoints and plaintext](#transport-endpoints-and-plaintext). |
 | `with_communication_info(map)` | empty | Key-value identity metadata embedded in pairing messages. |
 | `with_replica_id(id)` | unset | This device's replica identity. Required for any replica-mode pairing; application-assigned and rejected if `0`. |
 | `with_auto_accept(policy)` | every flow off | Per-flow opt-in to auto-accepting inbound requests instead of surfacing `ActionRequired`. Read the per-flow caveats before enabling — several are state-changing. |
@@ -464,23 +465,23 @@ Every transport endpoint the protocol handles is checked in two stages.
 scheme consistent with the declared protocol. Always applied; `ws://` and
 `file://` are refused everywhere.
 
-**Scheme policy** — whether a plaintext `http://` endpoint may actually be
-used. This depends on how you are deployed, so it is configuration rather than
-a fixed rule:
+**Scheme policy** — whether a plaintext `http://` or `grpc://` endpoint may
+actually be used. This depends on how you are deployed, so it is
+configuration rather than a fixed rule:
 
 ```rust
-builder.with_unsafe_http(true)   // development only; default is false
+builder.with_unsafe_connection(true)   // development only; default is false
 ```
 
-| Endpoint | `https` | plaintext loopback | plaintext, any other host |
+| Endpoint | `https` / `grpcs` | plaintext loopback | plaintext, any other host |
 |---|---|---|---|
-| **Your own** — `with_own_transport`, and the `reply_to` you stamp on outbound requests | always | **always**, with a warning | needs `with_unsafe_http(true)` |
-| **A peer's** — a contact's endpoint, an `UpdateChannelInfo` announcement, a request's `reply_to` | always | needs `with_unsafe_http(true)` | needs `with_unsafe_http(true)` |
+| **Your own** — `with_own_transport`, and the `reply_to` you stamp on outbound requests | always | **always**, with a warning | needs `with_unsafe_connection(true)` |
+| **A peer's** — a contact's endpoint, an `UpdateChannelInfo` announcement, a request's `reply_to` | always | needs `with_unsafe_connection(true)` | needs `with_unsafe_connection(true)` |
 
 So **a local dev server needs no configuration at all** — `http://localhost:8080`
-as your own endpoint just works. Testing across a LAN, a phone against a
-laptop, needs `with_unsafe_http(true)` on both sides, because neither is
-loopback.
+or `grpc://localhost:50051` as your own endpoint just works. Testing across a
+LAN, a phone against a laptop, needs `with_unsafe_connection(true)` on both
+sides, because neither is loopback.
 
 Loopback is free for *your own* endpoint because it names a service on your
 machine: the bytes never reach a network. It is not free for one a **peer**
@@ -492,14 +493,21 @@ Recognition is deliberately literal: `localhost`, `127.0.0.1`, `::1`, nothing
 else. No DNS resolution, no private-range classification. Both would need full
 URI parsing, and getting that wrong in a security check is how
 `http://127.0.0.1@evil.com/` slips past — so userinfo is refused outright and
-the wider case is what `with_unsafe_http` is for.
+the wider case is what `with_unsafe_connection` is for.
 
 > **This is a guardrail, not transport security.** The SDK opens no sockets —
 > delivery is your `DeRecTransport`. Nothing here stops an application sending
 > plaintext; what it does is refuse to record a plaintext endpoint, refuse to
 > propagate one to peers during pairing, and refuse to reply to one. Leaving
-> `with_unsafe_http` at its default does not by itself make a deployment
+> `with_unsafe_connection` at its default does not by itself make a deployment
 > secure, and turning it on does not by itself send anything in the clear.
+
+`with_unsafe_http(bool)` is the original, `http://`-only form of this
+setting, kept for compatibility and `#[deprecated]` since 0.0.3. Both flags
+are honored; when both are set and disagree, the deprecated
+`with_unsafe_http` wins, so a deployment that only knows the old flag keeps
+its current behavior after upgrading. New code should use
+`with_unsafe_connection`.
 
 This was a Cargo feature (`unsafe-http`) until it became clear a compile-time
 switch is unreachable for the four SDKs that install a prebuilt binary from a
@@ -868,13 +876,47 @@ for full TypeScript examples.
 The protocol is transport-agnostic. The `TransportProtocol` value carried in
 contact and pairing messages identifies the peer endpoint; the application's
 [`DeRecTransport`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecTransport.html)
-implementation decides how to deliver bytes (HTTPS, WebSocket, message queue,
-custom relay, …).
+implementation decides how to deliver bytes (HTTPS, gRPC, WebSocket, message
+queue, custom relay, …).
 
 > [!NOTE]
-> The on-the-wire `TransportProtocol.protocol` enum currently defines
-> `Https` as the only supported value. New transports can be added by
-> extending the protobuf enum.
+> The on-the-wire `TransportProtocol.protocol` enum defines two values,
+> `Https` and `Grpc`. The library validates and propagates `grpcs://` /
+> `grpc://` endpoints exactly as it does HTTPS ones, but never implements the
+> gRPC side itself: `derec-proto` ships the `DeRecTransport` service contract
+> (`rpc Send(DeRecMessage) returns (google.protobuf.Empty)`) as a `.proto`
+> file with no generated service stubs. Consumers who want stubs run their
+> own `tonic-prost-build`, as `smoke-tests/grpc` does — see that crate for a
+> complete worked reference. New transports can be added by extending the
+> protobuf enum.
+
+An application serving more than one transport declares them all, in
+preference order:
+
+```rust
+builder.with_own_transports([
+    "grpcs://me.example.com:443",
+    "https://me.example.com/derec",
+])
+```
+
+The list is advertised to peers as `supportedTransports` on contacts and pair
+requests, and it is what decides which of a peer's endpoints gets used: each
+side independently picks, from what the other offered, the first entry
+matching its **own** order. Nothing is negotiated on the wire, so there is no
+extra round trip. An endpoint offered by a peer that fails structural
+validation or scheme policy is skipped rather than fatal; no overlap at all is
+`Error::NoCommonTransport`, and at pairing time it is terminal — delivery is
+push-only, so a peer whose transport you cannot speak cannot be sent a
+rejection either.
+
+Order is meaningful and the first entry is also your primary endpoint, the one
+advertised to implementations predating the offer list. Because delivery is
+push-only, every entry must be a transport you actually **serve**: listing one
+you do not makes pairing succeed and replies vanish. `with_own_transport`
+remains fully supported and is exactly a one-element list. The equivalents are
+`WithOwnTransports` (.NET), `withOwnTransports` (Node.js / Web) and
+`Config.OwnTransports` (Go).
 
 ### Serving DeRec over request/response transports
 
@@ -966,6 +1008,13 @@ The flow is symmetric — either Owner or Helper may initiate it — and
 auto-applies on the receiver via the standard `ActionRequired` → `accept`
 path. Outcome surfaces as `DeRecEvent::ChannelInfoUpdated` (or
 `ChannelInfoUpdateRejected` if the peer refused).
+
+A switch to a transport the receiving side serves no endpoint for is
+**refused, not recorded**: the receiver answers
+`StatusEnum::UNSUPPORTED_TRANSPORT_PROTOCOL` over the previous — still
+working — endpoint, and the initiator sees `ChannelInfoUpdateRejected`.
+Recording it would have pointed every later message at an address the
+receiver cannot deliver to, with nothing to indicate it.
 
 > [!WARNING]
 > **Endpoint changeover discipline.** When `transport_protocol` is updated,

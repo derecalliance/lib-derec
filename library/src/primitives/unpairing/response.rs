@@ -115,7 +115,7 @@ pub fn produce(
 ///
 /// // Initiator: send an unpair request.
 /// let request::ProduceResult { envelope: req_envelope } =
-///     request::produce(channel_id, "no longer needed", &shared_key, None, None)
+///     request::produce(channel_id, "no longer needed", &shared_key, &[], None)
 ///         .expect("produce request failed");
 ///
 /// // Responder: extract and ack with a successful response.
@@ -182,7 +182,7 @@ pub fn extract(
 ///
 /// // Initiator → Responder → Initiator roundtrip.
 /// let request::ProduceResult { envelope: req_envelope } =
-///     request::produce(channel_id, "no longer needed", &shared_key, None, None)
+///     request::produce(channel_id, "no longer needed", &shared_key, &[], None)
 ///         .expect("produce request failed");
 /// let _ = request::extract(&req_envelope, &shared_key).expect("extract request failed");
 /// let response::ProduceResult { envelope: resp_envelope } =
@@ -201,6 +201,7 @@ pub fn process(response: &UnpairResponseMessage) -> Result<ProcessResult, crate:
         "UnpairResponseMessage is missing result field",
     ))?;
 
+    // TODO: result.validate()?
     if result.status != StatusEnum::Ok as i32 {
         #[cfg(feature = "logging")]
         tracing::warn!(

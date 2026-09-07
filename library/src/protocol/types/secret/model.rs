@@ -37,9 +37,17 @@ pub struct HelperInfo {
     /// Unique channel identifier assigned during pairing.
     #[prost(uint64, tag = "1")]
     pub channel_id: u64,
-    /// The Helper's message endpoint URI.
-    #[prost(string, tag = "2")]
-    pub transport_uri: ::prost::alloc::string::String,
+    /// Every endpoint the Helper can be reached on, in the order it
+    /// advertised them.
+    ///
+    /// Carries the protocol discriminant per entry rather than a bare URI:
+    /// a roster that stored only a string forced recovery to *reconstruct*
+    /// the discriminant from the scheme, which silently rewrote every
+    /// non-HTTPS peer. A fresh tag rather than reusing 2, so the v2 field
+    /// number stays retired — v2 payloads are lifted into this shape on
+    /// decode.
+    #[prost(message, repeated, tag = "6")]
+    pub transports: ::prost::alloc::vec::Vec<derec_proto::TransportProtocol>,
     /// Symmetric key negotiated during pairing (32 bytes).
     #[prost(bytes = "vec", tag = "4")]
     pub shared_key: ::prost::alloc::vec::Vec<u8>,
@@ -100,9 +108,11 @@ pub struct ReplicaInfo {
     /// is stored under.
     #[prost(uint64, tag = "1")]
     pub replica_id: u64,
-    /// The member's message endpoint URI.
-    #[prost(string, tag = "2")]
-    pub transport_uri: ::prost::alloc::string::String,
+    /// Every endpoint the member can be reached on, in the order it
+    /// advertised them. See [`HelperInfo::transports`] for why the
+    /// discriminant travels per entry.
+    #[prost(message, repeated, tag = "6")]
+    pub transports: ::prost::alloc::vec::Vec<derec_proto::TransportProtocol>,
     /// The member's [`crate::protocol::types::ReplicaRole`] discriminant.
     /// Exactly one member of a group carries `Source`.
     #[prost(int32, tag = "3")]
@@ -202,7 +212,7 @@ impl fmt::Debug for HelperInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HelperInfo")
             .field("channel_id", &self.channel_id)
-            .field("transport_uri", &self.transport_uri)
+            .field("transports", &self.transports)
             .field("shared_key", &Redacted(&self.shared_key))
             .field("communication_info", &self.communication_info)
             .finish()
@@ -264,7 +274,10 @@ mod redaction_tests {
     fn helper_and_replica_group_keys_are_not_printed() {
         let helper = HelperInfo {
             channel_id: 7,
-            transport_uri: "https://helper.example".to_owned(),
+            transports: vec![derec_proto::TransportProtocol {
+                uri: "https://helper.example".to_owned(),
+                protocol: derec_proto::Protocol::Https as i32,
+            }],
             shared_key: KEY.to_vec(),
             communication_info: Default::default(),
         };
@@ -291,7 +304,10 @@ mod redaction_tests {
         let secret = Secret {
             helpers: vec![HelperInfo {
                 channel_id: 7,
-                transport_uri: "https://helper.example".to_owned(),
+                transports: vec![derec_proto::TransportProtocol {
+                    uri: "https://helper.example".to_owned(),
+                    protocol: derec_proto::Protocol::Https as i32,
+                }],
                 shared_key: KEY.to_vec(),
                 communication_info: Default::default(),
             }],

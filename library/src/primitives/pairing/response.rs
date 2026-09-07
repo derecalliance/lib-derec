@@ -4,7 +4,10 @@
 use crate::derec_message::{DeRecMessageBuilder, current_timestamp};
 use crate::primitives::pairing::PairingError;
 use crate::protocol_version::ProtocolVersion;
+use crate::transport::AdvertisedEndpoints as _;
 use crate::types::ChannelId;
+use crate::utils::PairRequestMessageExt as _;
+use crate::utils::PrePairRequestMessageExt as _;
 use crate::utils::verify_timestamps;
 use derec_cryptography::pairing::{
     self as cryptography_pairing, PairingSecretKeyMaterial, PairingSharedKey,
@@ -22,7 +25,10 @@ pub struct ProduceResult {
     /// Serialized outer [`derec_proto::DeRecMessage`] wire bytes carrying an encrypted inner
     /// [`derec_proto::PairResponseMessage`]. Ready to send over transport.
     pub envelope: Vec<u8>,
-    pub peer_transport_protocol: TransportProtocol,
+    /// Every endpoint the requester advertised that survived transport
+    /// policy, in the order it offered them. Record all of them: which to
+    /// dial, and whether to fall back, is the application's choice.
+    pub peer_transports: Vec<TransportProtocol>,
     pub shared_key: PairingSharedKey,
     /// Channel identifier the responder is committing to for all future
     /// traffic on this channel — derived from the pre-rekey id and the
@@ -115,7 +121,7 @@ pub struct ProcessPrePairResult {
 /// - `envelope`: serialized outer [`derec_proto::DeRecMessage`] envelope bytes carrying
 ///   the encrypted inner [`derec_proto::PairResponseMessage`]
 /// - `shared_key`: the initiator-side derived pairing shared key
-/// - `peer_transport_protocol`: peer transport information extracted from the
+/// - `peer_transports`: peer transport information extracted from the
 ///   validated [`derec_proto::PairRequestMessage`]
 ///
 /// # Errors
@@ -131,7 +137,7 @@ pub struct ProcessPrePairResult {
 /// # Security Notes
 ///
 /// - The derived shared key should be treated as sensitive material.
-/// - The returned `peer_transport_protocol` is peer-provided data; apply any
+/// - The returned `peer_transports` is peer-provided data; apply any
 ///   caller-side validation required by the selected transport layer before using it.
 ///
 /// # Channel id rekey
@@ -163,20 +169,20 @@ pub struct ProcessPrePairResult {
 /// } = request::create_contact(
 ///     ChannelId(42),
 ///     ContactMode::InlineKeys,
-///     TransportProtocol {
+///     vec![TransportProtocol {
 ///         uri: "https://relay.example/initiator".to_owned(),
 ///         protocol: Protocol::Https.into(),
-///     },
+///     }],
 ///     None,
 /// ).expect("create_contact failed");
 ///
 /// // Responder side: build and send the pairing request envelope.
 /// let request::ProduceResult { envelope: request_envelope, .. } = request::produce(
 ///     SenderKind::Helper,
-///     TransportProtocol {
+///     vec![TransportProtocol {
 ///         uri: "https://relay.example/responder".to_owned(),
 ///         protocol: Protocol::Https.into(),
-///     },
+///     }],
 ///     &contact_message,
 ///     None,
 ///     None,
@@ -194,6 +200,7 @@ pub struct ProcessPrePairResult {
 ///     initiator_key.as_ref().unwrap(),
 ///     None,
 ///     None,
+///     derec_library::transport::TransportPolicy::new(false),
 /// ).expect("produce failed");
 ///
 /// assert!(!envelope.is_empty());
@@ -203,16 +210,29 @@ pub struct ProcessPrePairResult {
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = channel_id.0))
 )]
+/// # Selecting the reply endpoint
+///
+/// Every endpoint the requester advertised — read via
+/// [`AdvertisedEndpoints`](crate::transport::AdvertisedEndpoints), so its
+/// singular `transportProtocol` field is the fallback when it offers no
+/// list, which is how peers predating the offer list behave — is recorded
+/// in the order it offered them, filtered by `policy` via
+/// [`TransportPolicy::admit_peer_endpoints`](crate::transport::TransportPolicy::admit_peer_endpoints).
+///
+/// This does not choose between the survivors. Which endpoint to dial, and
+/// whether to fall back when one is unreachable, belongs to the
+/// application's [`crate::protocol::DeRecTransport`].
 pub fn produce(
     channel_id: ChannelId,
     request: &PairRequestMessage,
     pairing_secret_key_material: &PairingSecretKeyMaterial,
     communication_info: Option<CommunicationInfo>,
     parameter_range: Option<derec_proto::ParameterRange>,
+    policy: crate::transport::TransportPolicy,
 ) -> Result<ProduceResult, crate::Error> {
-    validate_produce_inputs(request)?;
+    request.validate()?;
 
-    let peer_transport_protocol = extract_peer_transport_protocol(request)?;
+    let peer_transports = policy.admit_peer_endpoints(request.advertised_endpoints())?;
 
     let pairing_request = cryptography_pairing::PairingRequestMessageMaterial {
         mlkem_ciphertext: request.mlkem_ciphertext.clone(),
@@ -262,7 +282,7 @@ pub fn produce(
     Ok(ProduceResult {
         envelope,
         shared_key,
-        peer_transport_protocol,
+        peer_transports,
         channel_id: rekeyed_channel_id,
     })
 }
@@ -321,6 +341,8 @@ pub fn produce_pre_pair(
     request: &PrePairRequestMessage,
     pairing_secret_key_material: &PairingSecretKeyMaterial,
 ) -> Result<ProducePrePairResult, crate::Error> {
+    request.validate()?;
+
     let initiator_material = match pairing_secret_key_material {
         PairingSecretKeyMaterial::Initiator(m) => m,
         _ => {
@@ -420,6 +442,8 @@ pub fn produce_pre_pair_no_keys(
     channel_id: ChannelId,
     request: &PrePairRequestMessage,
 ) -> Result<ProducePrePairNoKeysResult, crate::Error> {
+    request.validate()?;
+
     let seed = crate::utils::generate_seed::<32>();
     let (pk, secret_key) = cryptography_pairing::contact_message(*seed)
         .map_err(|e| PairingError::ContactMessageKeygen { source: e })?;
@@ -523,10 +547,10 @@ pub fn produce_pre_pair_no_keys(
 /// } = request::create_contact(
 ///     ChannelId(42),
 ///     ContactMode::InlineKeys,
-///     TransportProtocol {
+///     vec![TransportProtocol {
 ///         uri: "https://relay.example/initiator".to_owned(),
 ///         protocol: Protocol::Https.into(),
-///     },
+///     }],
 ///     None,
 /// ).expect("create_contact failed");
 ///
@@ -537,10 +561,10 @@ pub fn produce_pre_pair_no_keys(
 ///     ..
 /// } = request::produce(
 ///     SenderKind::Helper,
-///     TransportProtocol {
+///     vec![TransportProtocol {
 ///         uri: "https://relay.example/responder".to_owned(),
 ///         protocol: Protocol::Https.into(),
-///     },
+///     }],
 ///     &contact_message,
 ///     None,
 ///     None,
@@ -552,8 +576,15 @@ pub fn produce_pre_pair_no_keys(
 ///     initiator_key.as_ref().unwrap().ecies_secret_key(),
 /// ).expect("extract request failed");
 /// let response::ProduceResult { envelope: response_envelope, .. } =
-///     response::produce(ChannelId(42), &pair_request, initiator_key.as_ref().unwrap(), None, None)
-///         .expect("produce failed");
+///     response::produce(
+///         ChannelId(42),
+///         &pair_request,
+///         initiator_key.as_ref().unwrap(),
+///         None,
+///         None,
+///         derec_library::transport::TransportPolicy::new(false),
+///     )
+///     .expect("produce failed");
 ///
 /// // Responder: decrypt the pairing response.
 /// let response::ExtractResult { response } =
@@ -740,10 +771,10 @@ pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, c
 /// } = request::create_contact(
 ///     ChannelId(42),
 ///     ContactMode::InlineKeys,
-///     TransportProtocol {
+///     vec![TransportProtocol {
 ///         uri: "https://relay.example/initiator".to_owned(),
 ///         protocol: Protocol::Https.into(),
-///     },
+///     }],
 ///     None,
 /// ).expect("create_contact failed");
 ///
@@ -754,10 +785,10 @@ pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, c
 ///     secret_key: responder_key,
 /// } = request::produce(
 ///     SenderKind::Helper,
-///     TransportProtocol {
+///     vec![TransportProtocol {
 ///         uri: "https://relay.example/responder".to_owned(),
 ///         protocol: Protocol::Https.into(),
-///     },
+///     }],
 ///     &contact_message,
 ///     None,
 ///     None,
@@ -770,8 +801,15 @@ pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, c
 /// ).expect("extract request failed");
 ///
 /// let response::ProduceResult { envelope: response_envelope, shared_key: initiator_shared_key, .. } =
-///     response::produce(ChannelId(42), &pair_request, initiator_key.as_ref().unwrap(), None, None)
-///         .expect("produce failed");
+///     response::produce(
+///         ChannelId(42),
+///         &pair_request,
+///         initiator_key.as_ref().unwrap(),
+///         None,
+///         None,
+///         derec_library::transport::TransportPolicy::new(false),
+///     )
+///     .expect("produce failed");
 ///
 /// // Responder side: extract the pairing response and derive the shared key.
 /// let response::ExtractResult { response: pair_response } = response::extract(
@@ -947,44 +985,6 @@ pub fn process_pre_pair_no_keys(
         ecies_public_key,
         nonce: response.nonce,
     })
-}
-
-fn validate_produce_inputs(request: &PairRequestMessage) -> Result<(), crate::Error> {
-    if request.mlkem_ciphertext.is_empty() {
-        #[cfg(feature = "logging")]
-        tracing::warn!("pair request missing mlkem_ciphertext");
-
-        return Err(PairingError::InvalidPairRequestMessage("mlkem_ciphertext is empty").into());
-    }
-
-    if request.ecies_public_key.is_empty() {
-        #[cfg(feature = "logging")]
-        tracing::warn!("pair request missing ecies_public_key");
-
-        return Err(PairingError::InvalidPairRequestMessage("ecies_public_key is empty").into());
-    }
-
-    Ok(())
-}
-
-fn extract_peer_transport_protocol(
-    request: &PairRequestMessage,
-) -> Result<TransportProtocol, crate::Error> {
-    let peer_transport_protocol = request
-        .transport_protocol
-        .clone()
-        .ok_or(PairingError::EmptyTransportUri)?;
-
-    if peer_transport_protocol.uri.trim().is_empty() {
-        #[cfg(feature = "logging")]
-        tracing::warn!("peer transport URI is empty");
-
-        return Err(PairingError::EmptyTransportUri.into());
-    }
-
-    let _ = crate::transport::TransportProtocol::try_from(&peer_transport_protocol)?;
-
-    Ok(peer_transport_protocol)
 }
 
 fn validate_process_inputs<'a>(

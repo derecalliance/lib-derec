@@ -59,7 +59,11 @@ public enum ReplicaRole
 /// 1:1. Keyed by <c>(secretId, channelId)</c>.
 /// </remarks>
 /// <param name="ChannelId">Channel identifier; opaque on this side.</param>
-/// <param name="Transport">The peer's transport endpoint.</param>
+/// <param name="Transports">
+/// Every endpoint the peer advertised, in the order it offered them. The
+/// library does not rank them; a transport chooses which to dial and may
+/// fall back between them.
+/// </param>
 /// <param name="CommunicationInfo">App-level identity metadata for the peer.</param>
 /// <param name="Status">Lifecycle state (<see cref="ChannelStatus"/>).</param>
 /// <param name="CreatedAt">Unix timestamp (seconds) when the channel was created.</param>
@@ -71,7 +75,7 @@ public enum ReplicaRole
 /// </param>
 public sealed record HelperChannel(
     ulong ChannelId,
-    TransportProtocol Transport,
+    IReadOnlyList<TransportProtocol> Transports,
     Dictionary<string, string> CommunicationInfo,
     ChannelStatus Status,
     ulong CreatedAt,
@@ -88,7 +92,9 @@ public sealed record HelperChannel(
 /// </remarks>
 /// <param name="ChannelId">The group channel. Identical for every member.</param>
 /// <param name="ReplicaId">This member's identity — the primary key within the group.</param>
-/// <param name="Transport">This member's transport endpoint.</param>
+/// <param name="Transports">
+/// Every endpoint this member advertised, in the order it offered them.
+/// </param>
 /// <param name="CommunicationInfo">App-level identity metadata for the member.</param>
 /// <param name="Role">This member's role (<see cref="ReplicaRole"/>).</param>
 /// <param name="Status">Lifecycle state (<see cref="ChannelStatus"/>).</param>
@@ -96,7 +102,7 @@ public sealed record HelperChannel(
 public sealed record ReplicaMember(
     ulong ChannelId,
     ulong ReplicaId,
-    TransportProtocol Transport,
+    IReadOnlyList<TransportProtocol> Transports,
     Dictionary<string, string> CommunicationInfo,
     ReplicaRole Role,
     ChannelStatus Status,
@@ -314,7 +320,21 @@ public interface IUserSecretStore
 /// </remarks>
 public interface ITransport
 {
-    void Send(string uri, int protocol, byte[] message);
+    /// <summary>
+    /// Delivers <paramref name="message"/> to a peer reachable at any of
+    /// <paramref name="endpoints"/>.
+    /// </summary>
+    /// <param name="endpoints">
+    /// Every address that peer advertised, in the order it offered them,
+    /// already filtered to those the library will record. The library does
+    /// not rank them: which to dial, and whether to fall back when one is
+    /// unreachable, is this implementation's choice. Never empty.
+    /// </param>
+    /// <remarks>
+    /// Delivery to any one endpoint is success. Throw only when the message
+    /// reached none of them.
+    /// </remarks>
+    void Send(IReadOnlyList<TransportProtocol> endpoints, byte[] message);
 }
 
 /// <summary>

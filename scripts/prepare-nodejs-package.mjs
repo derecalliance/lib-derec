@@ -50,7 +50,22 @@ function mergeDeep(base, override) {
   return result;
 }
 
+// The wasm-pack output this script assembles is a build artifact under
+// library/target/, so a stale or absent one would otherwise be packaged
+// silently. Build it here, the way the Go and .NET packaging scripts build
+// their native libraries, so `prepare` always reflects current source.
+function buildWasm(target, outDir) {
+  console.log(`Building wasm with wasm-pack --target ${target}`);
+  execFileSync(
+    "wasm-pack",
+    ["build", "--release", "--out-dir", path.join("target", outDir), "--target", target],
+    { cwd: libraryRoot, stdio: "inherit" }
+  );
+}
+
 async function main() {
+  buildWasm("nodejs", "pkg-nodejs");
+
   const [generatedPackageJsonRaw, overridePackageJsonRaw] = await Promise.all([
     readFile(generatedPackageJsonPath, "utf8"),
     readFile(overridePackageJsonPath, "utf8"),

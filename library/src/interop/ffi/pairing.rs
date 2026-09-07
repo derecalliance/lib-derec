@@ -76,7 +76,7 @@ pub struct ExtractPairRequestResult {
 pub struct ProducePairResponseMessageResult {
     pub error: DeRecError,
     pub response_wire_bytes: DeRecBuffer,
-    pub peer_transport_protocol: DeRecBuffer,
+    pub peer_transports: DeRecBuffer,
     pub shared_key: DeRecBuffer,
     /// Post-handshake rekey channel id the responder is committing to.
     /// Callers MUST atomically rename their local channel record from the
@@ -176,8 +176,8 @@ pub struct ProcessPrePairResponseMessageResult {
 pub extern "C" fn create_contact_message(
     channel_id: u64,
     contact_mode: i32,
-    transport_protocol_ptr: *const u8,
-    transport_protocol_len: usize,
+    transport_protocols_ptr: *const u8,
+    transport_protocols_len: usize,
     has_nonce: u32,
     nonce: u64,
 ) -> CreateContactMessageResult {
@@ -197,18 +197,18 @@ pub extern "C" fn create_contact_message(
         }
     };
 
-    let transport_protocol =
-        match decode_transport_protocol(transport_protocol_ptr, transport_protocol_len) {
-            Ok(t) => t,
-            Err(e) => return with_err(e),
-        };
+    let own = match decode_transport_protocol_list(transport_protocols_ptr, transport_protocols_len)
+    {
+        Ok(t) => t,
+        Err(e) => return with_err(e),
+    };
 
     let nonce = if has_nonce != 0 { Some(nonce) } else { None };
 
     match crate::primitives::pairing::request::create_contact(
         channel_id.into(),
         contact_mode,
-        transport_protocol,
+        own,
         nonce,
     ) {
         Ok(r) => CreateContactMessageResult {
@@ -436,8 +436,8 @@ fn u64_id_fields_to_numbers(value: &mut serde_json::Value) -> Result<(), String>
 #[unsafe(no_mangle)]
 pub extern "C" fn produce_pair_request_message(
     sender_kind: i32,
-    transport_protocol_ptr: *const u8,
-    transport_protocol_len: usize,
+    transport_protocols_ptr: *const u8,
+    transport_protocols_len: usize,
     contact_message_ptr: *const u8,
     contact_message_len: usize,
     communication_info_ptr: *const u8,
@@ -461,11 +461,11 @@ pub extern "C" fn produce_pair_request_message(
             ));
         }
     };
-    let transport_protocol =
-        match decode_transport_protocol(transport_protocol_ptr, transport_protocol_len) {
-            Ok(t) => t,
-            Err(e) => return with_err(e),
-        };
+    let own = match decode_transport_protocol_list(transport_protocols_ptr, transport_protocols_len)
+    {
+        Ok(t) => t,
+        Err(e) => return with_err(e),
+    };
     let contact_message_bytes = match parse_buffer(
         contact_message_ptr,
         contact_message_len,
@@ -496,7 +496,7 @@ pub extern "C" fn produce_pair_request_message(
 
     match crate::primitives::pairing::request::produce(
         sender_kind,
-        transport_protocol,
+        own,
         &contact_message,
         communication_info,
         parameter_range,
@@ -587,11 +587,12 @@ pub extern "C" fn produce_pair_response_message(
     communication_info_len: usize,
     parameter_range_ptr: *const u8,
     parameter_range_len: usize,
+    unsafe_connection: u32,
 ) -> ProducePairResponseMessageResult {
     let with_err = |error| ProducePairResponseMessageResult {
         error,
         response_wire_bytes: empty_buffer(),
-        peer_transport_protocol: empty_buffer(),
+        peer_transports: empty_buffer(),
         shared_key: empty_buffer(),
         channel_id: 0,
     };
@@ -632,11 +633,12 @@ pub extern "C" fn produce_pair_response_message(
         &pairing_secret_key_material,
         communication_info,
         parameter_range,
+        crate::transport::TransportPolicy::new(unsafe_connection != 0),
     ) {
         Ok(r) => ProducePairResponseMessageResult {
             error: success(),
             response_wire_bytes: vec_into_buffer(r.envelope),
-            peer_transport_protocol: vec_into_buffer(r.peer_transport_protocol.encode_to_vec()),
+            peer_transports: vec_into_buffer(encode_transport_list(&r.peer_transports)),
             shared_key: vec_into_buffer(r.shared_key.to_vec()),
             channel_id: r.channel_id.into(),
         },
@@ -775,8 +777,8 @@ pub extern "C" fn process_pair_response_message(
 /// Non-null input pointers must point to the corresponding readable byte ranges.
 #[unsafe(no_mangle)]
 pub extern "C" fn produce_pre_pair_request_message(
-    transport_protocol_ptr: *const u8,
-    transport_protocol_len: usize,
+    transport_protocols_ptr: *const u8,
+    transport_protocols_len: usize,
     contact_message_ptr: *const u8,
     contact_message_len: usize,
 ) -> ProducePrePairRequestMessageResult {
@@ -785,8 +787,8 @@ pub extern "C" fn produce_pre_pair_request_message(
         envelope_wire_bytes: empty_buffer(),
     };
 
-    let transport_protocol =
-        match decode_transport_protocol(transport_protocol_ptr, transport_protocol_len) {
+    let transport_protocols =
+        match decode_transport_protocol_list(transport_protocols_ptr, transport_protocols_len) {
             Ok(t) => t,
             Err(e) => return with_err(e),
         };
@@ -809,7 +811,7 @@ pub extern "C" fn produce_pre_pair_request_message(
     };
 
     match crate::primitives::pairing::request::produce_pre_pair_request(
-        transport_protocol,
+        transport_protocols,
         &contact_message,
     ) {
         Ok(r) => ProducePrePairRequestMessageResult {
@@ -1041,21 +1043,72 @@ fn parse_buffer<'a>(ptr: *const u8, len: usize, name: &str) -> Result<&'a [u8], 
     }
 }
 
-fn decode_transport_protocol(ptr: *const u8, len: usize) -> Result<TransportProtocol, DeRecError> {
-    let bytes = parse_buffer(ptr, len, "transport_protocol_ptr")?;
-    let tp = TransportProtocol::decode(bytes).map_err(|_| {
-        ffi_error(
+/// Decode a length-delimited sequence of `TransportProtocol` messages.
+///
+/// Each entry is a protobuf varint byte length followed by that many bytes
+/// of an encoded `TransportProtocol` — the same framing protobuf itself
+/// uses for a repeated embedded message field, so every binding can build
+/// it with the varint writer its protobuf runtime already exposes.
+///
+/// The list is the caller's served endpoints in its own preference order,
+/// and that order is preserved exactly. Every entry is validated at this
+/// seam, as the single-endpoint decoder does.
+/// Frame a list of endpoints the way `decode_transport_protocol_list` reads
+/// one: each entry preceded by its varint byte length.
+fn encode_transport_list(endpoints: &[TransportProtocol]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for endpoint in endpoints {
+        let entry = endpoint.encode_to_vec();
+        prost::encoding::encode_varint(entry.len() as u64, &mut out);
+        out.extend_from_slice(&entry);
+    }
+    out
+}
+
+fn decode_transport_protocol_list(
+    ptr: *const u8,
+    len: usize,
+) -> Result<Vec<TransportProtocol>, DeRecError> {
+    let mut bytes = parse_buffer(ptr, len, "transport_protocols_ptr")?;
+    let mut out = Vec::new();
+
+    while !bytes.is_empty() {
+        let entry_len = prost::encoding::decode_varint(&mut bytes).map_err(|_| {
+            ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                "transport_protocols_bytes has a malformed length prefix",
+            )
+        })? as usize;
+
+        if entry_len > bytes.len() {
+            return Err(ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                "transport_protocols_bytes length prefix overruns the buffer",
+            ));
+        }
+
+        let (entry, rest) = bytes.split_at(entry_len);
+        bytes = rest;
+
+        let tp = TransportProtocol::decode(entry).map_err(|_| {
+            ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                "transport_protocols_bytes contains an invalid TransportProtocol",
+            )
+        })?;
+        tp.validate()
+            .map_err(|e| from_lib_error(crate::Error::Transport(e)))?;
+        out.push(tp);
+    }
+
+    if out.is_empty() {
+        return Err(ffi_error(
             DEREC_CODE_FFI_BAD_PROTO,
-            "transport_protocol_bytes is not a valid TransportProtocol",
-        )
-    })?;
-    // Reject mismatched-scheme / malformed transport at the FFI seam.
-    // Same gate runs at every primitive `extract`; running it here
-    // means application-supplied transport bytes are validated even
-    // before the primitive sees them.
-    tp.validate()
-        .map_err(|e| from_lib_error(crate::Error::Transport(e)))?;
-    Ok(tp)
+            "transport_protocols_bytes must carry at least one TransportProtocol",
+        ));
+    }
+
+    Ok(out)
 }
 
 fn decode_optional_communication_info(
@@ -1192,6 +1245,10 @@ mod contact_message_json_tests {
         assert_eq!(take_buffer(re_encoded.wire_bytes), wire);
     }
 
+    // Touches the deprecated singular `transportProtocol`: this is the
+    // compatibility path that keeps peers predating `supportedTransports`
+    // working, so the warning is expected here rather than a defect.
+    #[allow(deprecated)]
     /// An `INLINE_KEYS` contact that also carries a binding hash violates
     /// the mode/field invariant. Both directions must reject it — encode so
     /// a locally-built contact is never published, decode so application
@@ -1230,6 +1287,7 @@ mod contact_message_json_tests {
             ecies_public_key: Some(vec![4, 5, 6]),
             contact_binding_hash: Some(vec![7, 7, 7]),
             timestamp: None,
+            supported_transports: Vec::new(),
         }
         .encode_to_vec();
 
@@ -1243,13 +1301,24 @@ mod contact_message_json_tests {
 
     /// A contact produced by the library itself decodes without any
     /// hand-written JSON in the loop.
+    /// Frame a list of endpoints the way `decode_transport_protocol_list`
+    /// expects: each entry preceded by its varint byte length.
+    fn encode_transport_list(entries: &[TransportProtocol]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for tp in entries {
+            let bytes = tp.encode_to_vec();
+            prost::encoding::encode_varint(bytes.len() as u64, &mut out);
+            out.extend_from_slice(&bytes);
+        }
+        out
+    }
+
     #[test]
     fn library_produced_contact_decodes() {
-        let transport = TransportProtocol {
+        let transport = encode_transport_list(&[TransportProtocol {
             uri: "https://owner.example.com".to_owned(),
             protocol: 0,
-        }
-        .encode_to_vec();
+        }]);
         let created = create_contact_message(
             42,
             ContactMode::InlineKeys as i32,
@@ -1269,5 +1338,187 @@ mod contact_message_json_tests {
         assert_eq!(value["channel_id"], "42");
         assert_eq!(value["nonce"], "99");
         assert_eq!(value["contact_mode"], 0);
+    }
+}
+
+/// The pairing entry points as a foreign caller sees them: raw pointers,
+/// length-delimited endpoint lists, and error codes rather than `Result`.
+///
+/// These matter because validation deliberately lives in the primitives
+/// rather than being repeated per SDK — every binding inherits whatever this
+/// seam enforces, so what it enforces is worth pinning.
+#[cfg(test)]
+mod pairing_entry_point_tests {
+    use super::*;
+    use crate::interop::ffi::common::derec_free_buffer;
+    use crate::interop::ffi::error::{DEREC_CATEGORY_OK, derec_free_error};
+
+    fn take(buffer: DeRecBuffer) -> Vec<u8> {
+        if buffer.ptr.is_null() {
+            return Vec::new();
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.len) }.to_vec();
+        derec_free_buffer(buffer.ptr, buffer.len);
+        bytes
+    }
+
+    fn release(mut error: DeRecError) -> i32 {
+        let code = error.code;
+        unsafe { derec_free_error(&mut error) };
+        code
+    }
+
+    fn endpoint(uri: &str, protocol: derec_proto::Protocol) -> TransportProtocol {
+        TransportProtocol {
+            uri: uri.to_owned(),
+            protocol: protocol as i32,
+        }
+    }
+
+    /// The framing every endpoint list crosses this seam in.
+    fn framed(entries: &[TransportProtocol]) -> Vec<u8> {
+        encode_transport_list(entries)
+    }
+
+    fn create_contact(
+        mode: derec_proto::ContactMode,
+        framed_list: &[u8],
+    ) -> CreateContactMessageResult {
+        create_contact_message(
+            42,
+            mode as i32,
+            framed_list.as_ptr(),
+            framed_list.len(),
+            0,
+            0,
+        )
+    }
+
+    /// The happy path, and the shape the other tests deviate from.
+    #[test]
+    fn create_contact_accepts_a_framed_endpoint_list() {
+        let list = framed(&[
+            endpoint("grpcs://a.example:443", derec_proto::Protocol::Grpc),
+            endpoint("https://a.example/derec", derec_proto::Protocol::Https),
+        ]);
+        let result = create_contact(derec_proto::ContactMode::InlineKeys, &list);
+
+        assert_eq!(result.error.category, DEREC_CATEGORY_OK, "unexpected error");
+        let contact =
+            derec_proto::ContactMessage::decode(take(result.contact_wire_bytes).as_slice())
+                .expect("the produced contact decodes");
+        let _ = take(result.secret_key_material);
+
+        assert_eq!(contact.supported_transports.len(), 2);
+        // The first entry also fills the deprecated singular field.
+        #[allow(deprecated)]
+        {
+            assert_eq!(
+                contact.transport_protocol.as_ref().map(|t| t.uri.as_str()),
+                Some("grpcs://a.example:443"),
+            );
+        }
+    }
+
+    /// An empty list names no endpoint, so the contact would be unusable.
+    /// Rejected at the seam rather than producing a contact nobody can answer.
+    #[test]
+    fn create_contact_rejects_an_empty_endpoint_list() {
+        let result = create_contact(derec_proto::ContactMode::InlineKeys, &[]);
+
+        assert_ne!(
+            release(result.error),
+            0,
+            "an empty endpoint list must be refused"
+        );
+        let _ = take(result.contact_wire_bytes);
+        let _ = take(result.secret_key_material);
+    }
+
+    /// Malformed framing is caught here rather than decoding into garbage: a
+    /// length prefix claiming more bytes than the buffer holds.
+    #[test]
+    fn a_length_prefix_overrunning_the_buffer_is_refused() {
+        // Varint 0x7F promises 127 bytes; only two follow.
+        let malformed = [0x7Fu8, 0x00, 0x00];
+        let result = create_contact(derec_proto::ContactMode::InlineKeys, &malformed);
+
+        assert_ne!(
+            release(result.error),
+            0,
+            "a length prefix past the end must be refused"
+        );
+        let _ = take(result.contact_wire_bytes);
+        let _ = take(result.secret_key_material);
+    }
+
+    /// A structurally invalid endpoint inside the list is refused, so an SDK
+    /// cannot smuggle a mismatched scheme past the seam.
+    #[test]
+    fn a_scheme_mismatched_endpoint_in_the_list_is_refused() {
+        let list = framed(&[endpoint("ws://a.example", derec_proto::Protocol::Https)]);
+        let result = create_contact(derec_proto::ContactMode::InlineKeys, &list);
+
+        assert_ne!(
+            release(result.error),
+            0,
+            "a scheme-mismatched endpoint must be refused"
+        );
+        let _ = take(result.contact_wire_bytes);
+        let _ = take(result.secret_key_material);
+    }
+
+    /// The PrePair entry point takes the same framing, and refuses an empty
+    /// list for the same reason: the reply would have nowhere to go.
+    #[test]
+    fn produce_pre_pair_request_requires_at_least_one_endpoint() {
+        let list = framed(&[endpoint(
+            "https://a.example/derec",
+            derec_proto::Protocol::Https,
+        )]);
+        let contact = create_contact(derec_proto::ContactMode::HashedKeys, &list);
+        assert_eq!(contact.error.category, DEREC_CATEGORY_OK);
+        let contact_bytes = take(contact.contact_wire_bytes);
+        let _ = take(contact.secret_key_material);
+
+        let empty = produce_pre_pair_request_message(
+            std::ptr::null(),
+            0,
+            contact_bytes.as_ptr(),
+            contact_bytes.len(),
+        );
+        assert_ne!(
+            release(empty.error),
+            0,
+            "a PrePair request naming no endpoint must be refused"
+        );
+        let _ = take(empty.envelope_wire_bytes);
+
+        let ok = produce_pre_pair_request_message(
+            list.as_ptr(),
+            list.len(),
+            contact_bytes.as_ptr(),
+            contact_bytes.len(),
+        );
+        assert_eq!(
+            ok.error.category, DEREC_CATEGORY_OK,
+            "a framed list must be accepted"
+        );
+        let _ = take(ok.envelope_wire_bytes);
+    }
+
+    /// A null pointer with a non-zero length is a caller bug, not a decode
+    /// failure — it must be reported rather than dereferenced.
+    #[test]
+    fn a_null_pointer_with_a_non_zero_length_is_refused() {
+        let result = create_contact_message(42, 0, std::ptr::null(), 8, 0, 0);
+
+        assert_ne!(
+            release(result.error),
+            0,
+            "a null pointer with a non-zero length must be refused"
+        );
+        let _ = take(result.contact_wire_bytes);
+        let _ = take(result.secret_key_material);
     }
 }

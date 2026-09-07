@@ -62,7 +62,7 @@ pub struct ExtractResult {
 /// let channel_id = ChannelId(42);
 /// let shared_key = [7u8; 32];
 ///
-/// let result = request::produce(channel_id, 1, 1, &shared_key, None)
+/// let result = request::produce(channel_id, 1, 1, &shared_key, &[])
 ///     .expect("failed to build recovery request");
 ///
 /// assert!(!result.envelope.is_empty());
@@ -76,7 +76,7 @@ pub fn produce(
     secret_id: u64,
     version: u32,
     shared_key: &SharedKey,
-    reply_to: Option<derec_proto::TransportProtocol>,
+    reply_to: &[derec_proto::TransportProtocol],
 ) -> Result<ProduceResult, crate::Error> {
     let timestamp = current_timestamp();
 
@@ -84,7 +84,7 @@ pub fn produce(
         secret_id,
         version,
         timestamp: Some(timestamp),
-        reply_to,
+        reply_to: reply_to.to_vec(),
         // Owner ↔ helper exchange: the replica path sets this, this one
         // never does. Its absence is what marks the message helper-bound.
         replica_id: None,
@@ -158,7 +158,7 @@ pub fn produce(
 /// let channel_id = ChannelId(42);
 /// let shared_key = [7u8; 32];
 ///
-/// let request::ProduceResult { envelope } = request::produce(channel_id, 1, 1, &shared_key, None)
+/// let request::ProduceResult { envelope } = request::produce(channel_id, 1, 1, &shared_key, &[])
 ///     .expect("failed to build recovery request");
 ///
 /// let request::ExtractResult { request } = request::extract(&envelope, &shared_key)
@@ -202,7 +202,7 @@ pub fn extract(
 
     verify_timestamps(envelope.timestamp, request.timestamp)?;
 
-    if let Some(reply_to) = request.reply_to.as_ref() {
+    for reply_to in &request.reply_to {
         reply_to.validate()?;
     }
 

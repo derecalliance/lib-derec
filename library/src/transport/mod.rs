@@ -20,13 +20,14 @@
 //! 2. **No control characters** — bytes `< 0x20` or `= 0x7F` are
 //!    rejected (NUL, embedded newlines, terminal escape codes).
 //! 3. **Scheme matches the protocol** — `Protocol::Https` ⇒ the URI
-//!    must start with `https://` or `http://`. Other schemes
+//!    must start with `https://` or `http://`; `Protocol::Grpc` ⇒ the
+//!    URI must start with `grpcs://` or `grpc://`. Other schemes
 //!    (`ws://`, `file://`, …) are always rejected.
 //!
-//! Whether plaintext `http://` is *acceptable* is a separate question,
-//! answered by [`TransportPolicy`] rather than here: it depends on how
-//! the application is deployed, which a validator with no configuration
-//! cannot know.
+//! Whether plaintext `http://` or `grpc://` is *acceptable* is a separate
+//! question, answered by [`TransportPolicy`] rather than here: it depends
+//! on how the application is deployed, which a validator with no
+//! configuration cannot know.
 //! 4. **Non-empty URI** — `EmptyUri` is the explicit error.
 //!
 //! Unknown `protocol` discriminants are caught at the *conversion*
@@ -38,12 +39,24 @@ use derec_proto::Protocol;
 #[cfg(any(feature = "serde", target_arch = "wasm32"))]
 use serde::{Deserialize, Serialize};
 
+mod selection;
+pub use selection::AdvertisedEndpoints;
+
 /// Maximum accepted transport URI length, in bytes.
 ///
 /// Matches the de-facto 2048-byte limit most HTTP stacks enforce
 /// for request URIs. Pairing payloads embed the URI verbatim, so
 /// capping it also bounds the propagated blob size.
 pub const MAX_TRANSPORT_URI_LEN: usize = 2048;
+
+/// URI scheme prefixes that carry DeRec messages without transport-layer
+/// confidentiality. Each has a TLS counterpart sharing its [`Protocol`]
+/// discriminant (`https://` for `http://`, `grpcs://` for `grpc://`).
+///
+/// [`TransportPolicy`] gates every entry here identically, so adding a
+/// transport means adding its plaintext spelling to this list and nothing
+/// else.
+const PLAINTEXT_SCHEMES: [&str; 2] = ["http://", "grpc://"];
 
 /// Library-level transport endpoint.
 ///
@@ -61,7 +74,7 @@ pub const MAX_TRANSPORT_URI_LEN: usize = 2048;
 /// because both are structurally consistent with [`Protocol::Https`].
 /// Whether plaintext may actually be *used* is decided by
 /// [`TransportPolicy`], configured through
-/// [`with_unsafe_http`](crate::protocol::DeRecProtocolBuilder::with_unsafe_http).
+/// [`with_unsafe_connection`](crate::protocol::DeRecProtocolBuilder::with_unsafe_connection).
 ///
 /// This was a Cargo feature until it became clear that a compile-time
 /// switch is unreachable for the four SDKs that install a prebuilt
@@ -151,8 +164,32 @@ impl TransportProtocol {
                     });
                 }
             }
+            Protocol::Grpc => {
+                // Both gRPC schemes are structurally consistent with this
+                // discriminant, exactly as the http family is for Https.
+                // Choosing between them is `TransportPolicy`'s job.
+                if !self.uri.starts_with("grpcs://") && !self.uri.starts_with("grpc://") {
+                    return Err(TransportValidationError::SchemeMismatch {
+                        expected: "grpcs://",
+                        protocol: self.protocol,
+                    });
+                }
+            }
         }
         Ok(())
+    }
+}
+
+/// Derive the transport protocol a URI scheme implies.
+///
+/// The plaintext and TLS spellings of one transport share a discriminant:
+/// whether plaintext is *acceptable* is [`TransportPolicy`]'s decision, not
+/// the parser's.
+fn protocol_for_scheme(uri: &str) -> Option<Protocol> {
+    match uri.split_once("://") {
+        Some(("https" | "http", _)) => Some(Protocol::Https),
+        Some(("grpcs" | "grpc", _)) => Some(Protocol::Grpc),
+        _ => None,
     }
 }
 
@@ -162,23 +199,18 @@ impl TryFrom<&str> for TransportProtocol {
     /// Build a validated [`TransportProtocol`] from a URI literal,
     /// deriving the [`Protocol`] discriminant from the URI scheme:
     ///
-    /// - `https://…` → [`Protocol::Https`]
-    /// - `http://…`  → [`Protocol::Https`] (development-only; emits
-    ///   a `tracing::warn!` under the `logging` feature — see the
-    ///   struct-level docs)
-    /// - any other scheme → [`TransportValidationError::SchemeMismatch`]
+    /// - `https://…` / `http://…`   → [`Protocol::Https`] (`http://` is
+    ///   development-only; emits a `tracing::warn!` under the `logging`
+    ///   feature — see the struct-level docs)
+    /// - `grpcs://…` / `grpc://…`   → [`Protocol::Grpc`]
+    /// - any other scheme → [`TransportValidationError::UnknownScheme`]
     ///
     /// Also runs the full [`validate`](Self::validate) chain (length
     /// cap, control-character check, non-empty URI), so a successful
     /// result is a fully-checked endpoint ready to embed in a
     /// pairing payload.
     fn try_from(uri: &str) -> Result<Self, Self::Error> {
-        let tp = Self {
-            uri: uri.to_owned(),
-            protocol: Protocol::Https,
-        };
-        tp.validate()?;
-        Ok(tp)
+        Self::try_from(uri.to_owned())
     }
 }
 
@@ -188,10 +220,10 @@ impl TryFrom<String> for TransportProtocol {
     /// Same as [`TryFrom<&str>`](Self#impl-TryFrom<%26str>-for-TransportProtocol),
     /// but takes ownership of the URI string instead of cloning it.
     fn try_from(uri: String) -> Result<Self, Self::Error> {
-        let tp = Self {
-            uri,
-            protocol: Protocol::Https,
+        let Some(protocol) = protocol_for_scheme(&uri) else {
+            return Err(TransportValidationError::UnknownScheme { uri });
         };
+        let tp = Self { uri, protocol };
         tp.validate()?;
         Ok(tp)
     }
@@ -231,8 +263,11 @@ impl TryFrom<derec_proto::TransportProtocol> for TransportProtocol {
     /// the value is well-formed without a follow-up
     /// `.validate()` call.
     fn try_from(p: derec_proto::TransportProtocol) -> Result<Self, Self::Error> {
-        let protocol = Protocol::try_from(p.protocol)
-            .map_err(|_| TransportValidationError::UnknownProtocol(p.protocol))?;
+        let protocol = Protocol::try_from(p.protocol).map_err(|_| {
+            TransportValidationError::UnsupportedProtocol {
+                discriminant: p.protocol,
+            }
+        })?;
         let tp = Self {
             uri: p.uri,
             protocol,
@@ -250,8 +285,11 @@ impl TryFrom<&derec_proto::TransportProtocol> for TransportProtocol {
     /// Same validation chain, but clones the URI string instead of
     /// taking ownership.
     fn try_from(p: &derec_proto::TransportProtocol) -> Result<Self, Self::Error> {
-        let protocol = Protocol::try_from(p.protocol)
-            .map_err(|_| TransportValidationError::UnknownProtocol(p.protocol))?;
+        let protocol = Protocol::try_from(p.protocol).map_err(|_| {
+            TransportValidationError::UnsupportedProtocol {
+                discriminant: p.protocol,
+            }
+        })?;
         let tp = Self {
             uri: p.uri.clone(),
             protocol,
@@ -341,8 +379,34 @@ pub enum TransportValidationError {
     #[error("transport uri contains control characters (bytes < 0x20 or = 0x7F are not allowed)")]
     ControlCharacters,
 
+    #[deprecated(
+        since = "0.0.3",
+        note = "use `UnsupportedProtocol { discriminant }`; removed at 0.1.0"
+    )]
     #[error("unknown TransportProtocol.protocol discriminant: {0}")]
     UnknownProtocol(i32),
+
+    /// The URI scheme matches no supported transport protocol.
+    ///
+    /// Distinct from [`Self::SchemeMismatch`], which reports a URI whose
+    /// scheme is known but inconsistent with the *declared* protocol. This
+    /// variant is for a scheme no protocol claims at all.
+    #[error(
+        "transport uri scheme in `{uri}` matches no supported transport protocol \
+         (expected one of: https://, http://, grpcs://, grpc://)"
+    )]
+    UnknownScheme { uri: String },
+
+    /// A protocol discriminant this build does not define — typically a
+    /// value introduced by a newer revision of the DeRec protocol.
+    ///
+    /// Reported instead of a bare decode failure so an application can tell
+    /// the user something actionable rather than surfacing a parse error.
+    #[error(
+        "transport protocol discriminant {discriminant} is not defined in this \
+         version of the DeRec protocol"
+    )]
+    UnsupportedProtocol { discriminant: i32 },
 
     #[error(
         "transport uri must start with `{expected}` for protocol {protocol:?} \
@@ -359,8 +423,8 @@ pub enum TransportValidationError {
     /// have not opted in" — the second is fixed by configuration, the first
     /// is not.
     #[error(
-        "plaintext http:// transport endpoint refused ({uri}) — {reason}. \
-         Enable `unsafe_http` on the protocol builder to accept plaintext \
+        "plaintext transport endpoint refused ({uri}) — {reason}. \
+         Enable `unsafe_connection` on the protocol builder to accept plaintext \
          during development; never enable it in production"
     )]
     PlaintextRefused { uri: String, reason: &'static str },
@@ -406,17 +470,6 @@ mod tests {
     }
 
     #[test]
-    fn try_from_str_rejects_unsupported_scheme() {
-        assert!(matches!(
-            TransportProtocol::try_from("ws://owner.example.com"),
-            Err(TransportValidationError::SchemeMismatch {
-                expected: "https://",
-                protocol: Protocol::Https,
-            })
-        ));
-    }
-
-    #[test]
     fn validate_rejects_unsupported_scheme() {
         let tp = TransportProtocol::new("ws://owner.example.com", Protocol::Https);
         assert!(matches!(
@@ -443,19 +496,6 @@ mod tests {
         assert!(matches!(
             TransportProtocol::try_from(oversize),
             Err(TransportValidationError::UriTooLong { .. })
-        ));
-    }
-
-    #[test]
-    fn try_from_proto_rejects_unknown_enum() {
-        let proto = derec_proto::TransportProtocol {
-            uri: "https://x".to_owned(),
-            protocol: 9999,
-        };
-        let res: Result<TransportProtocol, _> = (&proto).try_into();
-        assert!(matches!(
-            res,
-            Err(TransportValidationError::UnknownProtocol(9999))
         ));
     }
 
@@ -517,7 +557,102 @@ mod tests {
     fn into_own_transport_rejects_unsupported_str_scheme() {
         assert!(matches!(
             IntoOwnTransport::into_own_transport("ws://owner.example.com"),
-            Err(TransportValidationError::SchemeMismatch { .. })
+            Err(TransportValidationError::UnknownScheme { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_accepts_both_grpc_schemes() {
+        for uri in ["grpcs://helper.example.com:443", "grpc://localhost:50051"] {
+            let tp = TransportProtocol::new(uri, Protocol::Grpc);
+            assert!(tp.validate().is_ok(), "{uri} should validate under Grpc");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_cross_scheme_pairings() {
+        let https_under_grpc = TransportProtocol::new("https://x.example.com", Protocol::Grpc);
+        assert!(matches!(
+            https_under_grpc.validate(),
+            Err(TransportValidationError::SchemeMismatch {
+                expected: "grpcs://",
+                protocol: Protocol::Grpc,
+            })
+        ));
+
+        let grpc_under_https = TransportProtocol::new("grpc://x.example.com", Protocol::Https);
+        assert!(matches!(
+            grpc_under_https.validate(),
+            Err(TransportValidationError::SchemeMismatch {
+                expected: "https://",
+                protocol: Protocol::Https,
+            })
+        ));
+    }
+
+    #[test]
+    fn try_from_str_dispatches_on_scheme() {
+        for (uri, expected) in [
+            ("https://x.example.com", Protocol::Https),
+            ("http://x.example.com", Protocol::Https),
+            ("grpcs://x.example.com:443", Protocol::Grpc),
+            ("grpc://localhost:50051", Protocol::Grpc),
+        ] {
+            let tp = TransportProtocol::try_from(uri).expect("should parse");
+            assert_eq!(tp.protocol, expected, "{uri}");
+            assert_eq!(tp.uri, uri);
+        }
+    }
+
+    #[test]
+    fn try_from_str_reports_unknown_scheme() {
+        assert!(matches!(
+            TransportProtocol::try_from("ws://x.example.com"),
+            Err(TransportValidationError::UnknownScheme { .. })
+        ));
+    }
+
+    /// The scheme is the whole component before `://`, never a prefix of it.
+    /// A URI whose scheme merely *starts with* a known one names a different
+    /// protocol and must not be classified as that one — this feeds
+    /// [`TransportPolicy`], so a misread here would apply the wrong plaintext
+    /// rule.
+    #[test]
+    fn scheme_matching_is_exact_not_prefixed() {
+        for uri in [
+            "httpsx://x.example.com",
+            "grpcx://x.example.com",
+            "xhttps://x.example.com",
+            "https:/x.example.com",
+            "https",
+            "://x.example.com",
+            "",
+        ] {
+            assert_eq!(
+                protocol_for_scheme(uri),
+                None,
+                "{uri} must not resolve to a protocol"
+            );
+        }
+
+        // A second `://` later in the URI belongs to the path, not the scheme.
+        assert_eq!(
+            protocol_for_scheme("https://a://b"),
+            Some(Protocol::Https),
+            "only the first `://` delimits the scheme"
+        );
+    }
+
+    #[test]
+    fn try_from_proto_reports_unsupported_discriminant() {
+        let proto = derec_proto::TransportProtocol {
+            uri: "grpcs://x.example.com".to_owned(),
+            protocol: 9999,
+        };
+        let res: Result<TransportProtocol, _> = (&proto).try_into();
+        assert!(matches!(
+            res,
+            Err(TransportValidationError::UnsupportedProtocol { discriminant: 9999 })
         ));
     }
 }
@@ -545,8 +680,8 @@ mod tests {
 ///
 /// | Endpoint | `https` | plaintext loopback | plaintext, any other host |
 /// |---|---|---|---|
-/// | [`check_own`](Self::check_own) — this device's own | always | **always**, with a warning | needs `unsafe_http` |
-/// | [`check_peer`](Self::check_peer) — supplied by a peer | always | needs `unsafe_http` | needs `unsafe_http` |
+/// | [`check_own`](Self::check_own) — this device's own | always | **always**, with a warning | needs `unsafe_connection` |
+/// | [`check_peer`](Self::check_peer) — supplied by a peer | always | needs `unsafe_connection` | needs `unsafe_connection` |
 ///
 /// Loopback is free for an own endpoint because it names a service on this
 /// machine: the bytes never reach a network, so there is nothing for TLS to
@@ -556,15 +691,19 @@ mod tests {
 /// a reply address without you having opted into plaintext at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct TransportPolicy {
-    /// Mirrors
-    /// [`DeRecProtocolBuilder::with_unsafe_http`](crate::protocol::DeRecProtocolBuilder::with_unsafe_http).
+    /// Mirrors the resolved value of
+    /// [`DeRecProtocolBuilder::with_unsafe_connection`](crate::protocol::DeRecProtocolBuilder::with_unsafe_connection)
+    /// (and the deprecated
+    /// [`with_unsafe_http`](crate::protocol::DeRecProtocolBuilder::with_unsafe_http),
+    /// which still wins on conflict).
     allow_plaintext: bool,
 }
 
 impl TransportPolicy {
-    /// Build a policy. `allow_plaintext` is the application's `unsafe_http`
-    /// setting; `false` is the production posture.
-    pub fn new(allow_plaintext: bool) -> Self {
+    /// Build a policy. `allow_plaintext` is the application's resolved
+    /// `unsafe_connection` (or deprecated `unsafe_http`) setting; `false` is
+    /// the production posture.
+    pub const fn new(allow_plaintext: bool) -> Self {
         Self { allow_plaintext }
     }
 
@@ -591,7 +730,7 @@ impl TransportPolicy {
     /// `transport_protocol`, an `UpdateChannelInfo` announcement, or a
     /// request's `reply_to`.
     ///
-    /// Plaintext always requires `unsafe_http`, loopback included.
+    /// Plaintext always requires `unsafe_connection`, loopback included.
     pub fn check_peer(
         &self,
         endpoint: &derec_proto::TransportProtocol,
@@ -606,24 +745,27 @@ impl TransportPolicy {
     ) -> Result<(), TransportValidationError> {
         TransportProtocolExt::validate(endpoint)?;
 
-        if !endpoint.uri.starts_with("http://") {
+        let Some(scheme) = PLAINTEXT_SCHEMES
+            .iter()
+            .find(|scheme| endpoint.uri.starts_with(*scheme))
+        else {
             return Ok(());
-        }
+        };
         if self.allow_plaintext {
             #[cfg(feature = "logging")]
             tracing::warn!(
                 uri = %endpoint.uri,
-                "accepting plaintext http:// transport endpoint — `unsafe_http` is \
+                "accepting plaintext transport endpoint — `unsafe_connection` is \
                  enabled, so confidentiality and authenticity are NOT provided by \
                  the transport layer; never enable this in production",
             );
             return Ok(());
         }
-        if loopback_is_free && is_loopback_uri(&endpoint.uri) {
+        if loopback_is_free && is_loopback_uri_with_scheme(&endpoint.uri, scheme) {
             #[cfg(feature = "logging")]
             tracing::warn!(
                 uri = %endpoint.uri,
-                "accepting plaintext http:// on a loopback endpoint — this is \
+                "accepting plaintext transport endpoint on loopback — this is \
                  development mode; a deployed peer cannot reach it",
             );
             return Ok(());
@@ -639,18 +781,19 @@ impl TransportPolicy {
     }
 }
 
-/// Whether an `http://` URI names this machine.
+/// Whether a plaintext URI with the given `scheme` prefix names this
+/// machine.
 ///
 /// Deliberately literal: the host must be `localhost`, `127.0.0.1` or `::1`
 /// exactly. No DNS resolution and no wider private-range classification —
 /// both would need real URI parsing, and getting *that* wrong in a security
 /// check is how `http://127.0.0.1@evil.com/` slips through. A closed set of
 /// literals plus an explicit userinfo refusal cannot be spoofed that way, and
-/// the wider case is what `unsafe_http` is for.
-fn is_loopback_uri(uri: &str) -> bool {
+/// the wider case is what `unsafe_connection` is for.
+fn is_loopback_uri_with_scheme(uri: &str, scheme: &str) -> bool {
     const LOOPBACK_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
 
-    let Some(rest) = uri.strip_prefix("http://") else {
+    let Some(rest) = uri.strip_prefix(scheme) else {
         return false;
     };
     // Authority is everything before the first `/`, `?` or `#`.
@@ -710,7 +853,10 @@ mod transport_policy_tests {
             "http://[::1]",
             "http://[::1]:8080/path",
         ] {
-            assert!(is_loopback_uri(uri), "{uri} should be loopback");
+            assert!(
+                is_loopback_uri_with_scheme(uri, "http://"),
+                "{uri} should be loopback"
+            );
         }
     }
 
@@ -734,7 +880,10 @@ mod transport_policy_tests {
             "http://[::1]x/",
             "https://localhost",
         ] {
-            assert!(!is_loopback_uri(uri), "{uri} must not count as loopback");
+            assert!(
+                !is_loopback_uri_with_scheme(uri, "http://"),
+                "{uri} must not count as loopback"
+            );
         }
     }
 
@@ -819,5 +968,84 @@ mod transport_policy_tests {
     fn validate_is_structural_only() {
         assert!(TransportProtocolExt::validate(&ep("http://anything.example.com")).is_ok());
         assert!(TransportProtocolExt::validate(&ep("https://anything.example.com")).is_ok());
+    }
+
+    fn grpc_ep(uri: &str) -> derec_proto::TransportProtocol {
+        derec_proto::TransportProtocol {
+            uri: uri.to_owned(),
+            protocol: Protocol::Grpc as i32,
+        }
+    }
+
+    #[test]
+    fn grpcs_is_always_accepted() {
+        for policy in [STRICT, UNSAFE] {
+            assert!(
+                policy
+                    .check_own(&grpc_ep("grpcs://owner.example.com"))
+                    .is_ok()
+            );
+            assert!(
+                policy
+                    .check_peer(&grpc_ep("grpcs://helper.example.com"))
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn own_grpc_loopback_plaintext_is_free() {
+        assert!(STRICT.check_own(&grpc_ep("grpc://localhost:50051")).is_ok());
+        assert!(STRICT.check_own(&grpc_ep("grpc://127.0.0.1:50051")).is_ok());
+        assert!(STRICT.check_own(&grpc_ep("grpc://[::1]:50051")).is_ok());
+    }
+
+    #[test]
+    fn peer_grpc_loopback_plaintext_is_refused_by_default() {
+        assert!(matches!(
+            STRICT.check_peer(&grpc_ep("grpc://127.0.0.1:50052")),
+            Err(TransportValidationError::PlaintextRefused { .. })
+        ));
+    }
+
+    #[test]
+    fn own_non_loopback_grpc_plaintext_is_refused_by_default() {
+        for uri in ["grpc://192.168.1.42:50051", "grpc://helper.example.com"] {
+            assert!(
+                matches!(
+                    STRICT.check_own(&grpc_ep(uri)),
+                    Err(TransportValidationError::PlaintextRefused { .. })
+                ),
+                "{uri} must be refused without the plaintext opt-in"
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_opens_grpc_plaintext_everywhere() {
+        for uri in ["grpc://localhost:50051", "grpc://192.168.1.42:50051"] {
+            assert!(UNSAFE.check_own(&grpc_ep(uri)).is_ok(), "own {uri}");
+            assert!(UNSAFE.check_peer(&grpc_ep(uri)).is_ok(), "peer {uri}");
+        }
+    }
+
+    /// The spoof set is scheme-independent: every lookalike that fails for
+    /// `http://` must fail identically for `grpc://`.
+    #[test]
+    fn grpc_loopback_lookalikes_are_rejected() {
+        for uri in [
+            "grpc://127.0.0.1@evil.com/",
+            "grpc://localhost@evil.com/",
+            "grpc://[::1]@evil.com/",
+            "grpc://127.0.0.1.evil.com/",
+            "grpc://localhost.evil.com/",
+            "grpc://[::1/",
+            "grpc://[::1]x/",
+        ] {
+            assert!(
+                !is_loopback_uri_with_scheme(uri, "grpc://"),
+                "{uri} must not count as loopback"
+            );
+        }
     }
 }

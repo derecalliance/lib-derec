@@ -3,7 +3,7 @@
 
 use crate::{
     interop::wasm::{
-        primitives::helpers::{parse_optional_transport_protocol, parse_shared_key, to_js},
+        primitives::helpers::{parse_shared_key, parse_transport_protocol_list, to_js},
         ts_bindings_utils::js_error_from_lib,
     },
     primitives::unpairing::request,
@@ -35,10 +35,10 @@ pub fn produce(
     reply_to: JsValue,
 ) -> Result<JsValue, JsValue> {
     let shared_key = parse_shared_key(shared_key)?;
-    let reply_to_proto = parse_optional_transport_protocol(reply_to)?;
+    let reply_to_proto = parse_transport_protocol_list(reply_to)?;
     // Helper path. Replica-group removal is orchestrated through the
     // `RemoveReplica` flow, which names the departing member itself.
-    let result = request::produce(channel_id.into(), memo, &shared_key, reply_to_proto, None)
+    let result = request::produce(channel_id.into(), memo, &shared_key, &reply_to_proto, None)
         .map_err(js_error_from_lib)?;
     to_js(&ProduceResult {
         envelope: result.envelope,

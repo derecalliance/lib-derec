@@ -47,7 +47,7 @@ internal static class Primitives
         var contact = Pairing.Request.CreateContact(
             channelId,
             ContactMode.InlineKeys,
-            new TransportProtocol("https://example.com/alice")
+            new[] { new TransportProtocol("https://example.com/alice") }
         );
 
         if (contact.SecretKeyMaterial.Length == 0)
@@ -55,7 +55,7 @@ internal static class Primitives
 
         var pairRequest = Pairing.Request.Produce(
             Pairing.SenderKind.Helper,
-            new TransportProtocol("https://example.com/helper"),
+            new[] { new TransportProtocol("https://example.com/helper") },
             contact.ContactMessage
         );
 
@@ -109,7 +109,7 @@ internal static class Primitives
         var aliceContact = Pairing.Request.CreateContact(
             channelId,
             ContactMode.HashedKeys,
-            new TransportProtocol("https://example.com/alice/ephemeral")
+            new[] { new TransportProtocol("https://example.com/alice/ephemeral") }
         );
 
         if (aliceContact.ContactMessage.ContactMode != ContactMode.HashedKeys)
@@ -125,7 +125,7 @@ internal static class Primitives
 
         // Bob (the scanner) sends a plaintext PrePair request asking for the keys.
         var prePairRequestEnvelope = Pairing.Request.ProducePrePair(
-            new TransportProtocol("https://example.com/helper/ephemeral"),
+            new[] { new TransportProtocol("https://example.com/helper/ephemeral") },
             aliceContact.ContactMessage
         );
 
@@ -177,7 +177,7 @@ internal static class Primitives
 
         var pairRequest = Pairing.Request.Produce(
             Pairing.SenderKind.Helper,
-            new TransportProtocol("https://example.com/helper"),
+            new[] { new TransportProtocol("https://example.com/helper") },
             filledInContact
         );
 
@@ -222,7 +222,7 @@ internal static class Primitives
         var tamperedAlice = Pairing.Request.CreateContact(
             tamperedChannelId,
             ContactMode.HashedKeys,
-            new TransportProtocol("https://example.com/alice/ephemeral")
+            new[] { new TransportProtocol("https://example.com/alice/ephemeral") }
         );
 
         if (tamperedAlice.ContactMessage.ContactBindingHash is not { Length: 48 } originalHash)
@@ -238,7 +238,7 @@ internal static class Primitives
         // happens on Bob's stored contact, so the error surfaces on Bob's
         // side when validating the real keys against the tampered commitment.
         var tamperedPrePairRequest = Pairing.Request.ProducePrePair(
-            new TransportProtocol("https://example.com/helper/ephemeral"),
+            new[] { new TransportProtocol("https://example.com/helper/ephemeral") },
             tamperedContact
         );
         var tamperedExtractedReq = Pairing.Request.ExtractPrePair(tamperedPrePairRequest.Envelope);
@@ -561,7 +561,9 @@ internal static class Primitives
 
         ulong channelId = 99;
         byte[] sharedKey = Make32(0x99);
-        var replyTo = new TransportProtocol("https://replica.example.com");
+        // The reply-to is a list now: a requester names every endpoint it can
+        // be answered on for the exchange, in its own order.
+        var replyTo = new[] { new TransportProtocol("https://replica.example.com") };
 
         // Primitive produce defaults to trace_id = 0 and reply_to = null.
         DeRecMessage envWithout = Discovery.Request.Produce(channelId, sharedKey);

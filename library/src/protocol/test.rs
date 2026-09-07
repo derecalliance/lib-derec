@@ -336,7 +336,7 @@ impl DeRecStateStore for InMemPersistedStateStore {
 #[derive(Default, Clone)]
 pub(crate) struct NoopTransport;
 impl DeRecTransport for NoopTransport {
-    fn send(&self, _: &TransportProtocol, _: Vec<u8>) -> TransportFuture<'_> {
+    fn send(&self, _: &[TransportProtocol], _: Vec<u8>) -> TransportFuture<'_> {
         Box::pin(std::future::ready(Ok(())))
     }
 }
@@ -347,7 +347,7 @@ impl DeRecTransport for NoopTransport {
 #[derive(Default, Clone)]
 pub(crate) struct FailingTransport;
 impl DeRecTransport for FailingTransport {
-    fn send(&self, _: &TransportProtocol, _: Vec<u8>) -> TransportFuture<'_> {
+    fn send(&self, _: &[TransportProtocol], _: Vec<u8>) -> TransportFuture<'_> {
         Box::pin(std::future::ready(Err(crate::Error::InvalidInput(
             "transport unreachable",
         ))))
@@ -359,8 +359,12 @@ impl DeRecTransport for FailingTransport {
 /// and *what* it carried.
 #[derive(Default, Clone)]
 pub(crate) struct RecordingTransport {
+    /// Every send, as the library handed it over: the peer's full endpoint
+    /// set, in the peer's order, plus the envelope. Recording the whole set
+    /// rather than one endpoint is what lets a test tell "the library offered
+    /// both" from "the library narrowed to one".
     #[allow(clippy::type_complexity)]
-    pub(crate) sent: Arc<Mutex<Vec<(TransportProtocol, Vec<u8>)>>>,
+    pub(crate) sent: Arc<Mutex<Vec<(Vec<TransportProtocol>, Vec<u8>)>>>,
 }
 impl RecordingTransport {
     /// Endpoint URIs of everything sent so far, in send order.
@@ -369,9 +373,19 @@ impl RecordingTransport {
             .lock()
             .unwrap()
             .iter()
-            .map(|(t, _)| t.uri.clone())
+            .map(|(endpoints, _)| endpoints[0].uri.clone())
             .collect()
     }
+    /// Every endpoint offered on each send, in the peer's order.
+    pub(crate) fn sent_endpoint_sets(&self) -> Vec<Vec<TransportProtocol>> {
+        self.sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(endpoints, _)| endpoints.clone())
+            .collect()
+    }
+
     /// Raw envelopes sent so far, in send order.
     pub(crate) fn sent_envelopes(&self) -> Vec<Vec<u8>> {
         self.sent
@@ -383,8 +397,12 @@ impl RecordingTransport {
     }
 }
 impl DeRecTransport for RecordingTransport {
-    fn send(&self, endpoint: &TransportProtocol, bytes: Vec<u8>) -> TransportFuture<'_> {
-        self.sent.lock().unwrap().push((endpoint.clone(), bytes));
+    fn send(&self, endpoints: &[TransportProtocol], bytes: Vec<u8>) -> TransportFuture<'_> {
+        assert!(
+            !endpoints.is_empty(),
+            "the library must never send to a peer with no endpoints"
+        );
+        self.sent.lock().unwrap().push((endpoints.to_vec(), bytes));
         Box::pin(std::future::ready(Ok(())))
     }
 }

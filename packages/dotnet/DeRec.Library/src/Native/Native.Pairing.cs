@@ -43,7 +43,7 @@ internal static class Pairing
     {
         public DeRecError Error;
         public Buffer ResponseWireBytes;
-        public Buffer PeerTransportProtocol;
+        public Buffer PeerTransports;
         public Buffer SharedKey;
         public ulong ChannelId;
     }
@@ -108,8 +108,8 @@ internal static class Pairing
     internal static extern CreateContactMessageResult create_contact_message(
         ulong channelId,
         int contactMode,
-        byte[] transportProtocolBytes,
-        UIntPtr transportProtocolBytesLen,
+        byte[] transportProtocolsBytes,
+        UIntPtr transportProtocolsBytesLen,
         uint hasNonce,
         ulong nonce
     );
@@ -123,8 +123,8 @@ internal static class Pairing
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern ProducePairRequestMessageResult produce_pair_request_message(
         int senderKind,
-        byte[] transportProtocolBytes,
-        UIntPtr transportProtocolBytesLen,
+        byte[] transportProtocolsBytes,
+        UIntPtr transportProtocolsBytesLen,
         byte[] contactMessageBytes,
         UIntPtr contactMessageBytesLen,
         byte[]? communicationInfoBytes,
@@ -151,7 +151,8 @@ internal static class Pairing
         byte[]? communicationInfoBytes,
         UIntPtr communicationInfoBytesLen,
         byte[]? parameterRangeBytes,
-        UIntPtr parameterRangeBytesLen
+        UIntPtr parameterRangeBytesLen,
+        uint unsafeConnection
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]

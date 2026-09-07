@@ -414,8 +414,8 @@ impl InProcessTransport {
 }
 
 impl DeRecTransport for InProcessTransport {
-    fn send(&self, endpoint: &TransportProtocol, message: Vec<u8>) -> TransportFuture<'_> {
-        let entry = (endpoint.clone(), message);
+    fn send(&self, endpoints: &[TransportProtocol], message: Vec<u8>) -> TransportFuture<'_> {
+        let entry = (endpoints[0].clone(), message);
         let outbox = self.outbox.clone();
         let failing = self.failing_uris.clone();
         Box::pin(async move {
@@ -1974,8 +1974,8 @@ async fn run_protect_secret_with_replica_targets_flow() {
         "ReplicaInfo.role must be Destination"
     );
     assert_eq!(
-        destination.transport_uri, replica.uri,
-        "ReplicaInfo.transport_uri must echo the Destination's URI"
+        destination.transports[0].uri, replica.uri,
+        "ReplicaInfo.transports[0].uri must echo the Destination's URI"
     );
 
     println!(
@@ -2606,10 +2606,10 @@ async fn run_update_channel_info_flow() {
         .start(DeRecFlow::UpdateChannelInfo {
             target: Target::Single(channel_id),
             communication_info: Some(new_info.clone()),
-            transport_protocol: Some(TransportProtocol {
+            own_transports: vec![TransportProtocol {
                 uri: new_uri.clone(),
                 protocol: Protocol::Https.into(),
-            }),
+            }],
         })
         .await
         .expect("owner start(UpdateChannelInfo) failed");
@@ -2645,7 +2645,7 @@ async fn run_update_channel_info_flow() {
         .expect("helper channel_store.load failed")
         .expect("helper channel must still exist after UpdateChannelInfo");
     assert_eq!(
-        helper_channel.transport().uri,
+        helper_channel.transports()[0].uri,
         new_uri,
         "helper's stored transport URI must reflect the announced update"
     );
@@ -2660,7 +2660,7 @@ async fn run_update_channel_info_flow() {
         .start(DeRecFlow::UpdateChannelInfo {
             target: Target::Single(channel_id),
             communication_info: None,
-            transport_protocol: None,
+            own_transports: Vec::new(),
         })
         .await;
     assert!(
@@ -2740,20 +2740,25 @@ async fn run_reply_to_flow() {
     let MessageBody::GetSecretIdsVersionsRequest(req) = inner else {
         panic!("expected GetSecretIdsVersionsRequest, got {inner:?}");
     };
-    let reply_to = req.reply_to.expect("auto_reply_to must populate replyTo");
+    // auto_reply_to now advertises every endpoint this device serves, so a
+    // responder that cannot reach the first can fall back.
+    assert!(
+        !req.reply_to.is_empty(),
+        "auto_reply_to must populate replyTo"
+    );
     assert_eq!(
-        reply_to.uri, "https://owner-reply.example.com",
-        "replyTo.uri must equal the owner's own_transport"
+        req.reply_to[0].uri, "https://owner-reply.example.com",
+        "replyTo must lead with the owner's own_transport"
     );
 
     let phantom_uri = "https://phantom-replica.example.com";
     let timestamp = current_timestamp();
     let crafted = GetSecretIdsVersionsRequestMessage {
         timestamp: Some(timestamp),
-        reply_to: Some(TransportProtocol {
+        reply_to: vec![TransportProtocol {
             uri: phantom_uri.to_owned(),
             protocol: Protocol::Https.into(),
-        }),
+        }],
         // Owner ↔ helper exchange, so no member names itself.
         replica_id: None,
     };

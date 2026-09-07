@@ -57,7 +57,7 @@ fn make_request_with_mutated_share(
         version_description: String::new(),
         timestamp: Some(timestamp),
         secret_id,
-        reply_to: None,
+        reply_to: Vec::new(),
         replica_id: None,
     }
 }
@@ -215,7 +215,7 @@ fn test_produce_store_share_request_message_valid() {
         &[],
         "",
         &shared_key,
-        None,
+        &[],
     )
     .expect("produce_store_share_request_message should succeed");
 
@@ -250,7 +250,7 @@ fn test_produce_store_share_request_message_with_keep_list_and_description() {
         &[1, 2],
         "initial share distribution",
         &shared_key,
-        None,
+        &[],
     )
     .expect("produce_store_share_request_message should succeed");
 
@@ -287,7 +287,7 @@ fn test_produce_store_share_response_message_valid() {
         &[],
         "",
         &shared_key,
-        None,
+        &[],
     )
     .expect("produce_store_share_request_message should succeed");
 
@@ -360,7 +360,7 @@ fn test_extract_store_share_request_wrong_key() {
         &[],
         "",
         &shared_key,
-        None,
+        &[],
     )
     .expect("produce_store_share_request_message should succeed");
 
@@ -433,7 +433,7 @@ fn test_process_store_share_response_message_valid() {
         &[],
         "",
         &shared_key,
-        None,
+        &[],
     )
     .expect("produce_store_share_request_message should succeed");
 
@@ -482,7 +482,7 @@ fn test_process_store_share_response_message_wrong_version() {
         &[],
         "",
         &shared_key,
-        None,
+        &[],
     )
     .expect("produce_store_share_request_message should succeed");
 
@@ -533,7 +533,7 @@ fn test_extract_store_share_response_wrong_key() {
         &[],
         "",
         &shared_key,
-        None,
+        &[],
     )
     .expect("produce_store_share_request_message should succeed");
 
@@ -631,7 +631,7 @@ fn test_extract_store_share_request_rejects_scheme_mismatched_reply_to() {
         &[],
         String::new(),
         &shared_key,
-        Some(malicious_reply_to),
+        std::slice::from_ref(&malicious_reply_to),
     )
     .expect("failed to produce store share request");
 
@@ -669,7 +669,7 @@ fn helper_bound_request_never_carries_a_replica_id() {
         &[],
         String::new(),
         &shared_key,
-        None,
+        &[],
     )
     .expect("helper-bound produce")
     .envelope;
