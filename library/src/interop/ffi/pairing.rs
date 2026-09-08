@@ -16,14 +16,14 @@
 
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 
+use crate::extensions::contact_message::ContactMessageExt as _;
+use crate::extensions::transport_protocol::TransportProtocolExt as _;
 use crate::interop::dto::ContactMessage as ContactMessageDto;
 use crate::interop::ffi::common::{DeRecBuffer, empty_buffer, vec_into_buffer};
 use crate::interop::ffi::error::{
     DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_BAD_SHARED_KEY, DEREC_CODE_FFI_INVALID_ENUM,
     DEREC_CODE_FFI_NULL_PTR, DeRecError, ffi_error, from_lib_error, success,
 };
-use crate::transport::TransportProtocolExt as _;
-use crate::utils::ContactMessageExt as _;
 use derec_cryptography::pairing::PairingSecretKeyMaterial;
 use derec_proto::{
     CommunicationInfo, ContactMessage, ContactMode, DeRecMessage, PairRequestMessage,
@@ -393,36 +393,6 @@ pub extern "C" fn decode_contact_message(
 
 /// The `ContactMessage` fields that cross this seam as decimal strings.
 const CONTACT_U64_ID_FIELDS: [&str; 2] = ["channel_id", "nonce"];
-
-/// Rewrites [`CONTACT_U64_ID_FIELDS`] from JSON numbers to decimal strings.
-fn u64_id_fields_to_strings(value: &mut serde_json::Value) {
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-    for field in CONTACT_U64_ID_FIELDS {
-        if let Some(n) = object.get(field).and_then(serde_json::Value::as_u64) {
-            object.insert(field.to_owned(), serde_json::Value::String(n.to_string()));
-        }
-    }
-}
-
-/// Reverse of [`u64_id_fields_to_strings`]. A field already holding a JSON
-/// number is left untouched.
-fn u64_id_fields_to_numbers(value: &mut serde_json::Value) -> Result<(), String> {
-    let Some(object) = value.as_object_mut() else {
-        return Ok(());
-    };
-    for field in CONTACT_U64_ID_FIELDS {
-        let Some(serde_json::Value::String(raw)) = object.get(field) else {
-            continue;
-        };
-        let parsed: u64 = raw
-            .parse()
-            .map_err(|e| format!("{field} must be a decimal u64 string, got {raw:?}: {e}"))?;
-        object.insert(field.to_owned(), serde_json::Value::Number(parsed.into()));
-    }
-    Ok(())
-}
 
 /// `communication_info_ptr` may be null / zero-length to indicate no
 /// communication info; otherwise it must be serialized [`CommunicationInfo`]
@@ -1029,6 +999,36 @@ pub extern "C" fn process_pre_pair_response_message(
     }
 }
 
+/// Rewrites [`CONTACT_U64_ID_FIELDS`] from JSON numbers to decimal strings.
+fn u64_id_fields_to_strings(value: &mut serde_json::Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    for field in CONTACT_U64_ID_FIELDS {
+        if let Some(n) = object.get(field).and_then(serde_json::Value::as_u64) {
+            object.insert(field.to_owned(), serde_json::Value::String(n.to_string()));
+        }
+    }
+}
+
+/// Reverse of [`u64_id_fields_to_strings`]. A field already holding a JSON
+/// number is left untouched.
+fn u64_id_fields_to_numbers(value: &mut serde_json::Value) -> Result<(), String> {
+    let Some(object) = value.as_object_mut() else {
+        return Ok(());
+    };
+    for field in CONTACT_U64_ID_FIELDS {
+        let Some(serde_json::Value::String(raw)) = object.get(field) else {
+            continue;
+        };
+        let parsed: u64 = raw
+            .parse()
+            .map_err(|e| format!("{field} must be a decimal u64 string, got {raw:?}: {e}"))?;
+        object.insert(field.to_owned(), serde_json::Value::Number(parsed.into()));
+    }
+    Ok(())
+}
+
 fn parse_buffer<'a>(ptr: *const u8, len: usize, name: &str) -> Result<&'a [u8], DeRecError> {
     if ptr.is_null() && len > 0 {
         return Err(ffi_error(
@@ -1245,14 +1245,12 @@ mod contact_message_json_tests {
         assert_eq!(take_buffer(re_encoded.wire_bytes), wire);
     }
 
-    // Touches the deprecated singular `transportProtocol`: this is the
-    // compatibility path that keeps peers predating `supportedTransports`
-    // working, so the warning is expected here rather than a defect.
-    #[allow(deprecated)]
     /// An `INLINE_KEYS` contact that also carries a binding hash violates
     /// the mode/field invariant. Both directions must reject it — encode so
     /// a locally-built contact is never published, decode so application
     /// code can trust what it is handed.
+    // Compatibility, not oversight — see the `transport` module docs.
+    #[allow(deprecated)]
     #[test]
     fn invalid_contact_is_rejected_in_both_directions() {
         let invalid_json = r#"{

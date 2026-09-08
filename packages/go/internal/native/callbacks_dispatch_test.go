@@ -36,10 +36,10 @@ func (m *mockChannelStore) Save(secretID uint64, record ChannelRecord) error {
 func (m *mockChannelStore) Remove(secretID, channelID, replicaID uint64) (bool, error) {
 	return m.removeFn(secretID, channelID, replicaID)
 }
-func (m *mockChannelStore) ListHelpers(secretID uint64) ([]HelperChannel, error) {
+func (m *mockChannelStore) ListHelpers(secretID uint64, _ HelperFilter) ([]HelperChannel, error) {
 	return m.listHelpersFn(secretID)
 }
-func (m *mockChannelStore) ListReplicas(secretID uint64) ([]ReplicaMember, error) {
+func (m *mockChannelStore) ListReplicas(secretID uint64, _ ReplicaFilter) ([]ReplicaMember, error) {
 	return m.listReplicasFn(secretID)
 }
 func (m *mockChannelStore) LinkChannel(secretID, a, b uint64) error {
@@ -309,7 +309,7 @@ func TestDispatchChannelListHelpers(t *testing.T) {
 			}, nil
 		},
 	}}
-	status, out := dispatchChannelListHelpers(s, 1)
+	status, out := dispatchChannelListHelpers(s, 1, nil)
 	if status != ffiStatusOK {
 		t.Fatalf("status = %d, want ffiStatusOK", status)
 	}
@@ -328,7 +328,7 @@ func TestDispatchChannelListReplicas(t *testing.T) {
 			}, nil
 		},
 	}}
-	status, out := dispatchChannelListReplicas(s, 1)
+	status, out := dispatchChannelListReplicas(s, 1, nil)
 	if status != ffiStatusOK {
 		t.Fatalf("status = %d, want ffiStatusOK", status)
 	}

@@ -13,12 +13,17 @@
 // share store, recording transport), but are Map-backed instead of
 // localStorage-backed.
 
-import { ContactMode, DeRecProtocol, DeRecProtocolBuilder, FlowKind, SenderKind, primitives } from "@derec-alliance/nodejs";
+import { channelFilterMatches, ContactMode, DeRecProtocol, DeRecProtocolBuilder, FlowKind, SenderKind, primitives } from "@derec-alliance/nodejs";
 import type {
+  ChannelStatusName,
   ChannelStore,
   ContactMessage,
   DeRecEvent,
+  HelperFilter,
+  ReplicaFilter,
+  ReplicaRoleName,
   SecretStore,
+  SenderKindName,
   Share,
   ShareStore,
   StateStore,
@@ -26,6 +31,13 @@ import type {
   UserSecretStore,
   UserSecrets,
 } from "@derec-alliance/nodejs";
+
+/**
+ * The unrestricted filters, for assertions that want the whole listing.
+ * Every field empty is exactly what the core means by "no restriction".
+ */
+const ANY_HELPERS: HelperFilter = { ids: [], status: [], role: null, exclude: [] };
+const ANY_REPLICAS: ReplicaFilter = { ids: [], status: [], role: null, exclude: [] };
 
 
 const kindName = (k: SenderKind): string => {
@@ -151,7 +163,16 @@ class InMemoryChannelStore implements ChannelStore {
   // 2**53 to the nearest double. A record is always the externally
   // tagged `{"<variant>":{...}}` serde emits, so stripping the wrapper
   // is a prefix/suffix slice.
-  private list(secretId: string, variant: "Helper" | "Replica"): Uint8Array {
+  //
+  // The filter is applied against a *parsed copy* — reading `status` and
+  // `role` is safe, and the id comes from the map key, which is already the
+  // exact decimal string. The bytes pushed to the output are always the
+  // original slice, so the precision guarantee above still holds.
+  private list(
+    secretId: string,
+    variant: "Helper" | "Replica",
+    filter: HelperFilter | ReplicaFilter,
+  ): Uint8Array {
     const source = variant === "Helper" ? this.helpers : this.members;
     const prefix = `${secretId}:`;
     const tag = `{"${variant}":`;
@@ -160,17 +181,20 @@ class InMemoryChannelStore implements ChannelStore {
       if (!k.startsWith(prefix)) continue;
       const text = new TextDecoder().decode(v);
       if (!text.startsWith(tag)) continue;
-      inner.push(text.slice(tag.length, -1));
+      const body = text.slice(tag.length, -1);
+      const id = k.slice(prefix.length);
+      if (!matchesFilter(filter, id, body, variant)) continue;
+      inner.push(body);
     }
     return new TextEncoder().encode(`[${inner.join(",")}]`);
   }
 
-  async listHelpers(secretId: string): Promise<Uint8Array> {
-    return this.list(secretId, "Helper");
+  async listHelpers(secretId: string, filter: HelperFilter): Promise<Uint8Array> {
+    return this.list(secretId, "Helper", filter);
   }
 
-  async listReplicas(secretId: string): Promise<Uint8Array> {
-    return this.list(secretId, "Replica");
+  async listReplicas(secretId: string, filter: ReplicaFilter): Promise<Uint8Array> {
+    return this.list(secretId, "Replica", filter);
   }
 
   private linkKey(secretId: string, channelId: string): string {
@@ -426,9 +450,10 @@ function makeNode(
     secretId?: bigint;
     threshold?: number;
     unsafeHttp?: boolean;
+    channelStore?: InMemoryChannelStore;
   } = {},
 ): Node {
-  const channelStore = new InMemoryChannelStore();
+  const channelStore = options.channelStore ?? new InMemoryChannelStore();
   const shareStore = new InMemoryShareStore();
   const secretStore = new InMemorySecretStore();
   const userSecretStore = new InMemoryUserSecretStore();
@@ -1919,6 +1944,7 @@ export async function runProtocolSmoke(): Promise<void> {
   await runHashedKeysPairingFlow();
   await runNoKeysPairingFlow();
   runUnsafeHttpConfigFlow();
+  runConfigSurfaceFlow();
   await runSharingFlow();
   await runDiscoveryAndRecoveryFlow();
   await runUnpairingFlow();
@@ -1929,6 +1955,7 @@ export async function runProtocolSmoke(): Promise<void> {
   await runReplicaSyncVersionProgressionFlow();
   await runAutoAcceptFlow();
   await runExpiredChannelCleanupFlow();
+  await runDefiantChannelStoreFlow();
 
   console.log("━━━ [Protocol] All passed. ━━━\n");
 }
@@ -2403,7 +2430,7 @@ async function assertHydrated(
   }
 
   const storedHelpers = JSON.parse(
-    new TextDecoder().decode(await peer.channelStore.listHelpers(sid)),
+    new TextDecoder().decode(await peer.channelStore.listHelpers(sid, ANY_HELPERS)),
   );
   if (storedHelpers.length !== helpers) {
     throw new Error(
@@ -2412,7 +2439,7 @@ async function assertHydrated(
   }
 
   const roster = JSON.parse(
-    new TextDecoder().decode(await peer.channelStore.listReplicas(sid)),
+    new TextDecoder().decode(await peer.channelStore.listReplicas(sid, ANY_REPLICAS)),
   );
   if (roster.length !== members) {
     throw new Error(`replica ${label} roster size: expected ${members}, got ${roster.length}`);
@@ -2452,6 +2479,101 @@ function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
     if (a[i] !== b[i]) return false;
   }
   return true;
+}
+
+
+// A channel store that takes the filter and throws it away — the shape a store
+// written before `ChannelFilter` existed still compiles into, because
+// TypeScript accepts a function of fewer parameters where more are declared.
+//
+// This is the case the library's re-check was written for, so it is worth
+// pinning through the real WASM bridge rather than only in Rust: the bridge is
+// what hands the filter to JS and what reads the answer back.
+class DefiantChannelStore extends InMemoryChannelStore {
+  override async listHelpers(secretId: string): Promise<Uint8Array> {
+    return super.listHelpers(secretId, { ids: [], status: [], role: null, exclude: [] });
+  }
+
+  override async listReplicas(secretId: string): Promise<Uint8Array> {
+    return super.listReplicas(secretId, { ids: [], status: [], role: null, exclude: [] });
+  }
+
+  /// Move a channel's `created_at` back to the epoch so an age predicate can
+  /// no longer be what spares it.
+  ///
+  /// Edited as text: re-encoding the record through `JSON.parse` would round
+  /// its u64 `channel_id`, and this store exists to hold those bytes verbatim.
+  async backdate(secretId: string, channelId: string): Promise<void> {
+    const bytes = await this.load(secretId, channelId, "0");
+    if (bytes === null) throw new Error(`backdate: no channel ${channelId}`);
+    const text = new TextDecoder().decode(bytes);
+    const edited = text.replace(/"created_at":\d+/, '"created_at":0');
+    if (edited === text) throw new Error("backdate: no created_at field found");
+    await this.save(secretId, channelId, "0", new TextEncoder().encode(edited));
+  }
+}
+
+// A store that ignores the filter must not be able to make the library act on
+// rows the filter excluded.
+//
+// `removeExpiredChannels` is the sharpest case: it narrows to
+// `status: ["Pending"]` and deletes whatever comes back. Against a defiant
+// store with no backstop it would delete *paired* channels and their pairing
+// secrets — silently, and by default, since the same sweep runs inside
+// `process()`.
+async function runDefiantChannelStoreFlow(): Promise<void> {
+  console.log("[Protocol] a store that ignores the filter cannot cause damage");
+
+  const defiant = new DefiantChannelStore();
+  const owner = makeNode("DefiantOwner", "https://defiant-owner.example.com", {
+    channelStore: defiant,
+  });
+  const helper = makeNode("DefiantHelper", "https://defiant-helper.example.com");
+
+  // A completed pairing leaves a Paired channel on both sides.
+  const { longTermChannelId } = await doPair(helper, owner, 4242n, "Defiant↔Helper");
+
+  const before = JSON.parse(
+    new TextDecoder().decode(
+      await defiant.listHelpers(DEFAULT_TEST_SECRET_ID.toString()),
+    ),
+  );
+  if (before.length !== 1 || before[0].status !== "Paired") {
+    throw new Error(
+      `expected one paired channel before the sweep, got ${JSON.stringify(before)}`,
+    );
+  }
+
+  // Age must not be what saves it. The sweep removes channels *older than*
+  // the threshold, so a channel created this second survives `0` regardless of
+  // its status — and the test would pass without the filter being applied at
+  // all. Backdated, the status filter is the only thing left standing between
+  // this paired channel and deletion.
+  await defiant.backdate(DEFAULT_TEST_SECRET_ID.toString(), longTermChannelId);
+
+  const removed = await owner.protocol.removeExpiredChannels(0);
+  if (removed.length !== 0) {
+    throw new Error(
+      `a paired channel was swept: the status filter was not enforced (removed ${JSON.stringify(removed)})`,
+    );
+  }
+
+  const after = JSON.parse(
+    new TextDecoder().decode(
+      await defiant.listHelpers(DEFAULT_TEST_SECRET_ID.toString()),
+    ),
+  );
+  // Compared by count and status, not by id: `channel_id` rides the listing as
+  // a JSON number, so a u64 above 2**53 does not survive `JSON.parse` intact —
+  // see the note on `InMemoryChannelStore.list`.
+  if (after.length !== 1 || after[0].status !== "Paired") {
+    throw new Error(
+      `the paired channel must survive a sweep for pending ones, got ${JSON.stringify(after)}`,
+    );
+  }
+  console.log("  a defiant store cannot make the pending-sweep delete a paired channel  ✓");
+
+  console.log("\n✓ Defiant-channel-store flow passed.\n");
 }
 
 
@@ -2496,20 +2618,20 @@ async function runExpiredChannelCleanupFlow(): Promise<void> {
  * Compile-time proof that both new flows are reachable from TypeScript without
  * widening `start`.
  *
- * `SyncCheck` (7) and `RemoveReplica` (8) were in the `FlowKind` enum and
+ * `ReplicaDiscovery` (7) and `UnpairReplica` (8) were in the `FlowKind` enum and
  * accepted at runtime, but `start` declared overloads only up to kind 6, so
  * dispatching them meant casting to a looser signature. This function is never
  * called — it exists so `tsc` fails if those overloads are dropped again.
  */
 export function _startOverloadsCoverEveryFlowKind(protocol: DeRecProtocol): void {
-  void (() => protocol.start(FlowKind.SyncCheck));
-  void (() => protocol.start(FlowKind.SyncCheck, {}));
+  void (() => protocol.start(FlowKind.ReplicaDiscovery));
+  void (() => protocol.start(FlowKind.ReplicaDiscovery, {}));
   void (() =>
-    protocol.start(FlowKind.RemoveReplica, {
+    protocol.start(FlowKind.UnpairReplica, {
       replica_id: "51966",
       memo: "retired device",
     }));
-  void (() => protocol.start(FlowKind.RemoveReplica, { replica_id: "51966" }));
+  void (() => protocol.start(FlowKind.UnpairReplica, { replica_id: "51966" }));
 }
 
 /**
@@ -2550,4 +2672,125 @@ export function runUnsafeHttpConfigFlow(): void {
   console.log("  LAN http accepted with unsafeHttp=true  ✓");
 
   console.log("\n✓ unsafe_http config passed.\n");
+}
+
+/**
+ * The config knobs and validation rules an application reaches through this
+ * SDK. Each crosses into the wasm build, where a name mismatch would silently
+ * drop the setting rather than fail — so each assertion here is checking the
+ * value actually arrived.
+ */
+export function runConfigSurfaceFlow(): void {
+  console.log("=== [Protocol] config surface ===\n");
+
+  const base = () =>
+    new DeRecProtocolBuilder(DEFAULT_TEST_SECRET_ID)
+      .withChannelStore(new InMemoryChannelStore())
+      .withShareStore(new InMemoryShareStore())
+      .withSecretStore(new InMemorySecretStore())
+      .withUserSecretStore(new InMemoryUserSecretStore())
+      .withStateStore(new InMemoryStateStore())
+      .withTransport(new RecordingTransport())
+      .withThreshold(THRESHOLD);
+
+  // ParameterRange reaches the library. Bounds that cannot intersect any peer
+  // range would still build — this proves only that the field is carried,
+  // which is what no SDK could do before it was declared.
+  base()
+    .withOwnTransports([{ uri: "https://owner.example.com", protocol: "https" }])
+    .withParameterRange({
+      min_share_size: 1n,
+      max_share_size: 1n << 20n,
+      min_time_between_verifications: 1n,
+      max_time_between_verifications: 3600n,
+    })
+    .build();
+  console.log("  withParameterRange accepted  ✓");
+
+  // A device serves at most one endpoint per protocol: two HTTPS entries
+  // contradict rather than extend, so the set is refused even though each
+  // entry is individually well-formed.
+  let refused = false;
+  try {
+    base()
+      .withOwnTransports([
+        { uri: "https://a.example", protocol: "https" },
+        { uri: "https://b.example", protocol: "https" },
+      ])
+      .build();
+  } catch {
+    refused = true;
+  }
+  if (!refused) {
+    throw new Error(
+      "two endpoints of one protocol must be refused — the one-per-protocol rule is not reaching the library",
+    );
+  }
+  console.log("  two endpoints of one protocol refused  ✓");
+
+  // Distinct protocols are what the list is for.
+  const protocol = base()
+    .withOwnTransports([
+      { uri: "https://a.example", protocol: "https" },
+      { uri: "grpcs://a.example:443", protocol: "grpc" },
+    ])
+    .build();
+  console.log("  distinct protocols accepted  ✓");
+
+  // setOwnTransport re-points one protocol; setOwnTransports replaces the set
+  // and is held to the same rule as the builder.
+  protocol.setOwnTransport("https://moved.example", "https");
+  console.log("  setOwnTransport re-points a single protocol  ✓");
+
+  protocol.setOwnTransports([{ uri: "https://only.example", protocol: "https" }]);
+  console.log("  setOwnTransports replaces the whole set  ✓");
+
+  refused = false;
+  try {
+    protocol.setOwnTransports([
+      { uri: "https://a.example", protocol: "https" },
+      { uri: "https://b.example", protocol: "https" },
+    ]);
+  } catch {
+    refused = true;
+  }
+  if (!refused) {
+    throw new Error(
+      "setOwnTransports must apply the same one-per-protocol rule as the builder",
+    );
+  }
+  console.log("  setOwnTransports refuses a duplicate protocol  ✓");
+
+  console.log("\n✓ config surface passed.\n");
+}
+
+/**
+ * Apply a listing filter to one stored record.
+ *
+ * Empty means "do not restrict", `exclude` is applied last, and the
+ * restrictions combine with AND — the contract the core documents on
+ * `ChannelFilter`. A store that ignores this still compiles; it would just
+ * ship rows the core asked it not to.
+ */
+function matchesFilter(
+  filter: HelperFilter | ReplicaFilter,
+  id: string,
+  body: string,
+  variant: "Helper" | "Replica",
+): boolean {
+  // Parsed only to read the two enum fields; the caller emits `body` itself.
+  const record = JSON.parse(body) as {
+    status?: string;
+    role?: string;
+    peer_role?: string;
+  };
+  const role = (variant === "Helper" ? record.peer_role : record.role) ?? "";
+  // The SDK ships this predicate so every store need not re-derive the
+  // empty-means-unrestricted / exclude-after-ids rules.
+  return channelFilterMatches(
+    filter,
+    id,
+    (record.status ?? "Paired") as ChannelStatusName,
+    role as SenderKindName | ReplicaRoleName,
+  );
 }

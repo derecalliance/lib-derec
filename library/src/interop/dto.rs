@@ -247,9 +247,7 @@ pub struct ContactMessage {
 }
 
 impl From<derec_proto::ContactMessage> for ContactMessage {
-    // Touches the deprecated singular `transportProtocol`: this is the
-    // compatibility path that keeps peers predating `supportedTransports`
-    // working, so the warning is expected here rather than a defect.
+    // Compatibility, not oversight — see the `transport` module docs.
     #[allow(deprecated)]
     fn from(value: derec_proto::ContactMessage) -> Self {
         Self {
@@ -271,9 +269,7 @@ impl From<derec_proto::ContactMessage> for ContactMessage {
 }
 
 impl From<ContactMessage> for derec_proto::ContactMessage {
-    // Touches the deprecated singular `transportProtocol`: this is the
-    // compatibility path that keeps peers predating `supportedTransports`
-    // working, so the warning is expected here rather than a defect.
+    // Compatibility, not oversight — see the `transport` module docs.
     #[allow(deprecated)]
     fn from(value: ContactMessage) -> Self {
         Self {
@@ -314,9 +310,7 @@ pub struct PairRequestMessage {
 }
 
 impl From<derec_proto::PairRequestMessage> for PairRequestMessage {
-    // Touches the deprecated singular `transportProtocol`: this is the
-    // compatibility path that keeps peers predating `supportedTransports`
-    // working, so the warning is expected here rather than a defect.
+    // Compatibility, not oversight — see the `transport` module docs.
     #[allow(deprecated)]
     fn from(value: derec_proto::PairRequestMessage) -> Self {
         Self {
@@ -338,9 +332,7 @@ impl From<derec_proto::PairRequestMessage> for PairRequestMessage {
 }
 
 impl From<PairRequestMessage> for derec_proto::PairRequestMessage {
-    // Touches the deprecated singular `transportProtocol`: this is the
-    // compatibility path that keeps peers predating `supportedTransports`
-    // working, so the warning is expected here rather than a defect.
+    // Compatibility, not oversight — see the `transport` module docs.
     #[allow(deprecated)]
     fn from(value: PairRequestMessage) -> Self {
         Self {
@@ -413,9 +405,7 @@ pub struct PrePairRequestMessage {
 }
 
 impl From<derec_proto::PrePairRequestMessage> for PrePairRequestMessage {
-    // Touches the deprecated singular `transportProtocol`: this is the
-    // compatibility path that keeps peers predating `supportedTransports`
-    // working, so the warning is expected here rather than a defect.
+    // Compatibility, not oversight — see the `transport` module docs.
     #[allow(deprecated)]
     fn from(value: derec_proto::PrePairRequestMessage) -> Self {
         Self {
@@ -432,9 +422,7 @@ impl From<derec_proto::PrePairRequestMessage> for PrePairRequestMessage {
 }
 
 impl From<PrePairRequestMessage> for derec_proto::PrePairRequestMessage {
-    // Touches the deprecated singular `transportProtocol`: this is the
-    // compatibility path that keeps peers predating `supportedTransports`
-    // working, so the warning is expected here rather than a defect.
+    // Compatibility, not oversight — see the `transport` module docs.
     #[allow(deprecated)]
     fn from(value: PrePairRequestMessage) -> Self {
         Self {

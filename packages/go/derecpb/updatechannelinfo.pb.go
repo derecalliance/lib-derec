@@ -69,7 +69,35 @@ type UpdateChannelInfoRequestMessage struct {
 	//
 	// Presence updates both the URI and protocol enum. The receiver routes
 	// the response to this new endpoint.
+	//
+	// Deprecated: superseded by `supportedTransports`, which carries every
+	// endpoint rather than one. Kept so implementations predating that field
+	// still learn the sender's new address. **Scheduled for removal in
+	// v0.0.5.** A sender populating `supportedTransports` MUST also set this
+	// to a single best-compatibility choice until then.
+	//
+	// Deprecated: Marked as deprecated in updatechannelinfo.proto.
 	TransportProtocol *TransportProtocol `protobuf:"bytes,2,opt,name=transportProtocol,proto3,oneof" json:"transportProtocol,omitempty"`
+	// Every transport endpoint the sender can now be reached on, in its own
+	// preference order, replacing the receiver's stored set for this channel.
+	//
+	// # Semantics
+	//
+	//   - Empty, and `transportProtocol` absent: the sender's endpoints are
+	//     left unchanged. An update that changes only `communicationInfo` says
+	//     nothing about transports.
+	//   - Non-empty: replaces the stored set outright. Unlike a request's
+	//     `replyTo`, this **is** persisted — it is how a peer announces it has
+	//     moved.
+	//
+	// # Compatibility
+	//
+	// Empty with `transportProtocol` present means "only that one endpoint is
+	// offered", which is how every implementation predating this field
+	// behaves. A sender populating this list MUST also set
+	// `transportProtocol` to a single best-compatibility choice so those
+	// implementations still learn the new address.
+	SupportedTransports []*TransportProtocol `protobuf:"bytes,4,rep,name=supportedTransports,proto3" json:"supportedTransports,omitempty"`
 	// Timestamp indicating when this message was created.
 	//
 	// This value is expressed in UTC and is used for envelope-vs-body
@@ -116,9 +144,17 @@ func (x *UpdateChannelInfoRequestMessage) GetCommunicationInfo() *CommunicationI
 	return nil
 }
 
+// Deprecated: Marked as deprecated in updatechannelinfo.proto.
 func (x *UpdateChannelInfoRequestMessage) GetTransportProtocol() *TransportProtocol {
 	if x != nil {
 		return x.TransportProtocol
+	}
+	return nil
+}
+
+func (x *UpdateChannelInfoRequestMessage) GetSupportedTransports() []*TransportProtocol {
+	if x != nil {
+		return x.SupportedTransports
 	}
 	return nil
 }
@@ -203,10 +239,11 @@ var File_updatechannelinfo_proto protoreflect.FileDescriptor
 
 const file_updatechannelinfo_proto_rawDesc = "" +
 	"\n" +
-	"\x17updatechannelinfo.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x17communicationinfo.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\xd7\x02\n" +
+	"\x17updatechannelinfo.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x17communicationinfo.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\xc2\x03\n" +
 	"\x1fUpdateChannelInfoRequestMessage\x12f\n" +
-	"\x11communicationInfo\x18\x01 \x01(\v23.org.derecalliance.derec.protobuf.CommunicationInfoH\x00R\x11communicationInfo\x88\x01\x01\x12f\n" +
-	"\x11transportProtocol\x18\x02 \x01(\v23.org.derecalliance.derec.protobuf.TransportProtocolH\x01R\x11transportProtocol\x88\x01\x01\x128\n" +
+	"\x11communicationInfo\x18\x01 \x01(\v23.org.derecalliance.derec.protobuf.CommunicationInfoH\x00R\x11communicationInfo\x88\x01\x01\x12j\n" +
+	"\x11transportProtocol\x18\x02 \x01(\v23.org.derecalliance.derec.protobuf.TransportProtocolB\x02\x18\x01H\x01R\x11transportProtocol\x88\x01\x01\x12e\n" +
+	"\x13supportedTransports\x18\x04 \x03(\v23.org.derecalliance.derec.protobuf.TransportProtocolR\x13supportedTransports\x128\n" +
 	"\ttimestamp\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestampB\x14\n" +
 	"\x12_communicationInfoB\x14\n" +
 	"\x12_transportProtocol\"\xa3\x01\n" +
@@ -238,14 +275,15 @@ var file_updatechannelinfo_proto_goTypes = []any{
 var file_updatechannelinfo_proto_depIdxs = []int32{
 	2, // 0: org.derecalliance.derec.protobuf.UpdateChannelInfoRequestMessage.communicationInfo:type_name -> org.derecalliance.derec.protobuf.CommunicationInfo
 	3, // 1: org.derecalliance.derec.protobuf.UpdateChannelInfoRequestMessage.transportProtocol:type_name -> org.derecalliance.derec.protobuf.TransportProtocol
-	4, // 2: org.derecalliance.derec.protobuf.UpdateChannelInfoRequestMessage.timestamp:type_name -> google.protobuf.Timestamp
-	5, // 3: org.derecalliance.derec.protobuf.UpdateChannelInfoResponseMessage.result:type_name -> org.derecalliance.derec.protobuf.DeRecResult
-	4, // 4: org.derecalliance.derec.protobuf.UpdateChannelInfoResponseMessage.timestamp:type_name -> google.protobuf.Timestamp
-	5, // [5:5] is the sub-list for method output_type
-	5, // [5:5] is the sub-list for method input_type
-	5, // [5:5] is the sub-list for extension type_name
-	5, // [5:5] is the sub-list for extension extendee
-	0, // [0:5] is the sub-list for field type_name
+	3, // 2: org.derecalliance.derec.protobuf.UpdateChannelInfoRequestMessage.supportedTransports:type_name -> org.derecalliance.derec.protobuf.TransportProtocol
+	4, // 3: org.derecalliance.derec.protobuf.UpdateChannelInfoRequestMessage.timestamp:type_name -> google.protobuf.Timestamp
+	5, // 4: org.derecalliance.derec.protobuf.UpdateChannelInfoResponseMessage.result:type_name -> org.derecalliance.derec.protobuf.DeRecResult
+	4, // 5: org.derecalliance.derec.protobuf.UpdateChannelInfoResponseMessage.timestamp:type_name -> google.protobuf.Timestamp
+	6, // [6:6] is the sub-list for method output_type
+	6, // [6:6] is the sub-list for method input_type
+	6, // [6:6] is the sub-list for extension type_name
+	6, // [6:6] is the sub-list for extension extendee
+	0, // [0:6] is the sub-list for field type_name
 }
 
 func init() { file_updatechannelinfo_proto_init() }

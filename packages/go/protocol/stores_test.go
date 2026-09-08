@@ -48,7 +48,7 @@ func (m *mockChannelStore) Remove(secretID, channelID, replicaID uint64) (bool, 
 	return ok, nil
 }
 
-func (m *mockChannelStore) ListHelpers(secretID uint64) ([]HelperChannel, error) {
+func (m *mockChannelStore) ListHelpers(secretID uint64, _ HelperFilter) ([]HelperChannel, error) {
 	out := make([]HelperChannel, 0, len(m.data[secretID]))
 	for _, r := range m.data[secretID] {
 		if r.Helper != nil {
@@ -58,7 +58,7 @@ func (m *mockChannelStore) ListHelpers(secretID uint64) ([]HelperChannel, error)
 	return out, nil
 }
 
-func (m *mockChannelStore) ListReplicas(secretID uint64) ([]ReplicaMember, error) {
+func (m *mockChannelStore) ListReplicas(secretID uint64, _ ReplicaFilter) ([]ReplicaMember, error) {
 	out := make([]ReplicaMember, 0, len(m.data[secretID]))
 	for _, r := range m.data[secretID] {
 		if r.Replica != nil {
@@ -231,11 +231,11 @@ func TestChannelStore_SaveLoadRemoveThroughInterface(t *testing.T) {
 		t.Fatal("saving a member at the same channel id must not evict the helper channel")
 	}
 
-	helpers, err := store.ListHelpers(100)
+	helpers, err := store.ListHelpers(100, HelperFilter{})
 	if err != nil || len(helpers) != 1 {
 		t.Fatalf("ListHelpers: got %d entries, err=%v", len(helpers), err)
 	}
-	members, err := store.ListReplicas(100)
+	members, err := store.ListReplicas(100, ReplicaFilter{})
 	if err != nil || len(members) != 1 {
 		t.Fatalf("ListReplicas: got %d entries, err=%v", len(members), err)
 	}

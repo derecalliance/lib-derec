@@ -84,6 +84,11 @@ const (
 	CodeChannelAlreadyPaired   int32 = 13
 	CodeAlreadyRestored        int32 = 14
 	CodeRestoreConflict        int32 = 15
+	// CodeReplicaIDConflict: a replica pairing named a replica_id already
+	// held by another member of the group, this device included. Assignment
+	// is the application's, so this is a configuration fault: assign a
+	// distinct id and pair again.
+	CodeReplicaIDConflict int32 = 16
 
 	CodeEncryption             int32 = 20
 	CodeKeygen                 int32 = 21
@@ -122,4 +127,9 @@ const (
 	CodeFFINulInString  int32 = 106
 
 	CodeTransportInvalid int32 = 120
+	// CodeNoUsableEndpoint: no transport is shared with the peer — its
+	// offered endpoints and this application's served endpoints intersect to
+	// nothing. Always a local, terminal error: push-only delivery means an
+	// unreachable peer also cannot be told.
+	CodeNoUsableEndpoint int32 = 121
 )

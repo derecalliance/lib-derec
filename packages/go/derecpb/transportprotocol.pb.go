@@ -37,7 +37,7 @@ const (
 	// / request/response pattern where the Owner acts as client and the
 	// / Helper acts as server.
 	// /
-	// / This is the default and currently required transport.
+	// / This is the default transport.
 	Protocol_HTTPS Protocol = 0
 	// / gRPC-based transport.
 	// /
@@ -140,7 +140,8 @@ type TransportProtocol struct {
 	// / The format of this field depends on the selected `protocol`.
 	// / Examples:
 	// /
-	// / - HTTPS: "https://example.com/derec"
+	// / - HTTPS: "https://example.com/derec" or "http://example.com/derec"
+	// / - gRPC: "grpcs://example.com:443" or "grpc://example.com:50051"
 	// / - Future protocols MAY define other URI schemes.
 	// /
 	// / The URI MUST be sufficient to route messages to the intended recipient.

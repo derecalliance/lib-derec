@@ -57,6 +57,7 @@
 //! applications.
 
 pub mod derec_message;
+pub mod extensions;
 pub mod primitives;
 pub mod protocol;
 pub mod protocol_version;

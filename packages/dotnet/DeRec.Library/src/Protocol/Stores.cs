@@ -3,6 +3,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 
 using DeRec.Library.Primitives;
 
@@ -151,6 +152,84 @@ public enum SecretKind : uint
 public sealed record SecretValue(SecretKind Kind, byte[] Bytes);
 
 /// <summary>
+/// Narrows a listing from <see cref="IChannelStore"/>.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Every property is a restriction, and every property's empty value means
+/// "do not restrict on this" — an all-empty filter selects everything.
+/// Restrictions combine with AND, and <c>Exclude</c> is applied last,
+/// overriding <c>Ids</c>.
+/// </para>
+/// <para>
+/// Apply it in your query — a <c>WHERE</c> clause, a key-condition
+/// expression — instead of transferring rows the caller will discard. That
+/// transfer costs bandwidth everywhere, and on a metered backing that bills by
+/// bytes read it costs money. The library re-applies the filter to whatever
+/// you return before acting on it, so ignoring it is slow rather than wrong.
+/// That is one-way: returning <em>fewer</em> rows than the filter selects is
+/// still wrong, and is not something the library can detect.
+/// </para>
+/// </remarks>
+/// <param name="Ids">Restrict to these ids. Empty selects every record.</param>
+/// <param name="Status">Restrict to these statuses. Empty selects any status.</param>
+/// <param name="Role">Restrict to this role. <c>null</c> selects any role.</param>
+/// <param name="Exclude">Omit these ids, applied after <c>Ids</c>. Empty omits nothing.</param>
+public abstract record ChannelFilter<TRole>(
+    IReadOnlyList<ulong> Ids,
+    IReadOnlyList<ChannelStatus> Status,
+    TRole? Role,
+    IReadOnlyList<ulong> Exclude)
+    where TRole : struct
+{
+    /// <summary>
+    /// Whether a record with these attributes survives the filter. A store
+    /// whose backing cannot express the restrictions as a query can list and
+    /// call this, which is correct but transfers the rows the filter was meant
+    /// to leave behind.
+    /// </summary>
+    public bool Matches(ulong id, ChannelStatus status, TRole role)
+        => (Ids.Count == 0 || Ids.Contains(id))
+           && (Status.Count == 0 || Status.Contains(status))
+           && (Role is null || EqualityComparer<TRole>.Default.Equals(Role.Value, role))
+           && !Exclude.Contains(id);
+}
+
+/// <summary>
+/// Narrows <see cref="IChannelStore.ListHelpers"/>. Ids are
+/// <see cref="HelperChannel.ChannelId"/> and the role is the <em>peer's</em>
+/// <see cref="HelperChannel.PeerRole"/>.
+/// </summary>
+public sealed record HelperFilter(
+    IReadOnlyList<ulong> Ids,
+    IReadOnlyList<ChannelStatus> Status,
+    Pairing.SenderKind? Role,
+    IReadOnlyList<ulong> Exclude)
+    : ChannelFilter<Pairing.SenderKind>(Ids, Status, Role, Exclude)
+{
+    /// <summary>An empty filter: selects every channel.</summary>
+    public static HelperFilter Any =>
+        new(Array.Empty<ulong>(), Array.Empty<ChannelStatus>(), null, Array.Empty<ulong>());
+}
+
+/// <summary>
+/// Narrows <see cref="IChannelStore.ListReplicas"/>. Ids are
+/// <see cref="ReplicaMember.ReplicaId"/> and the role is
+/// <see cref="ReplicaMember.Role"/>.
+/// </summary>
+public sealed record ReplicaFilter(
+    IReadOnlyList<ulong> Ids,
+    IReadOnlyList<ChannelStatus> Status,
+    ReplicaRole? Role,
+    IReadOnlyList<ulong> Exclude)
+    : ChannelFilter<ReplicaRole>(Ids, Status, Role, Exclude)
+{
+    /// <summary>An empty filter: selects every member.</summary>
+    public static ReplicaFilter Any =>
+        new(Array.Empty<ulong>(), Array.Empty<ChannelStatus>(), null, Array.Empty<ulong>());
+}
+
+/// <summary>
 /// Channel-record persistence for the protocol. Implementations MUST
 /// be safe to read/write across multiple calls, but never see
 /// overlapping calls (the protocol holds the store by <c>&amp;mut self</c>
@@ -175,7 +254,18 @@ public interface IChannelStore
     ChannelRecord? Load(ulong secretId, ulong channelId, ulong replicaId);
     void Save(ulong secretId, ChannelRecord record);
     bool Remove(ulong secretId, ulong channelId, ulong replicaId);
-    IEnumerable<HelperChannel> ListHelpers(ulong secretId);
+
+    /// <summary>
+    /// The helper channels stored under <paramref name="secretId"/> that
+    /// <paramref name="filter"/> selects.
+    /// </summary>
+    /// <remarks>
+    /// The filter addresses records by <see cref="HelperChannel.ChannelId"/>,
+    /// and its <c>Role</c> is the <em>peer's</em>
+    /// <see cref="HelperChannel.PeerRole"/>. Apply it in your query; see
+    /// <see cref="ChannelFilter{TRole}"/>.
+    /// </remarks>
+    IEnumerable<HelperChannel> ListHelpers(ulong secretId, HelperFilter filter);
 
     /// <summary>
     /// Every replica-group member stored under <paramref name="secretId"/>,
@@ -185,8 +275,8 @@ public interface IChannelStore
     /// <para>
     /// The order is significant in exactly one situation. A group has one
     /// member holding the <c>Source</c> role; when it is removed, the protocol
-    /// promotes the first element of this sequence that is neither the
-    /// departing member nor itself leaving. Ordering this sequence is
+    /// promotes the first element returned for a filter that already excludes
+    /// the departing member. Ordering this sequence is
     /// therefore how an application chooses its succession policy. The choice
     /// is read once, on the single device running the removal, and is then
     /// published in the roster, so implementations on different devices need
@@ -199,7 +289,12 @@ public interface IChannelStore
     /// to make succession predictable.
     /// </para>
     /// </remarks>
-    IEnumerable<ReplicaMember> ListReplicas(ulong secretId);
+    /// <para>
+    /// The filter addresses records by <see cref="ReplicaMember.ReplicaId"/>,
+    /// and its <c>Role</c> is <see cref="ReplicaMember.Role"/>. Apply it in
+    /// your query; see <see cref="ChannelFilter{TRole}"/>.
+    /// </para>
+    IEnumerable<ReplicaMember> ListReplicas(ulong secretId, ReplicaFilter filter);
     void LinkChannel(ulong secretId, ulong a, ulong b);
     IEnumerable<ulong> LinkedChannels(ulong secretId, ulong channelId);
 }
@@ -356,7 +451,7 @@ public enum StateKind : uint
     /// Active replica catch-up, at most one row per <c>secretId</c>. Holds
     /// the versions members have reported so far.
     /// </summary>
-    PendingSyncCheck = 4,
+    PendingReplicaDiscovery = 4,
 }
 
 /// <summary>

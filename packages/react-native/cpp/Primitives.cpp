@@ -263,7 +263,7 @@ jsi::Value readTraceId(jsi::Runtime& rt,
 }
 
 /// `create_contact_message(channelId: bigint, contactMode: number,
-///   transportProtocol: ArrayBuffer, hasNonce: number, nonce: bigint)
+///   transportProtocols: ArrayBuffer, hasNonce: number, nonce: bigint)
 ///   -> { contact_wire_bytes, secret_key_material }`
 jsi::Value createContactMessage(jsi::Runtime& rt,
                                 const jsi::Value&,
@@ -272,7 +272,7 @@ jsi::Value createContactMessage(jsi::Runtime& rt,
   requireArgs(rt, "create_contact_message", count, 5);
   uint64_t channelId = asU64(rt, args[0]);
   auto contactMode = static_cast<int32_t>(args[1].asNumber());
-  ByteView transportProtocol = asBytes(rt, args[2]);
+  ByteView transportProtocols = asBytes(rt, args[2]);
   auto hasNonce = static_cast<uint32_t>(args[3].asNumber());
   uint64_t nonce = asU64(rt, args[4]);
   CreateContactMessageResult result = create_contact_message(
@@ -379,7 +379,7 @@ jsi::Value encodeMessageJson(jsi::Runtime& rt,
   return toArrayBuffer(rt, bytes.data(), bytes.size());
 }
 
-/// `produce_pair_request_message(senderKind: number, transportProtocol:
+/// `produce_pair_request_message(senderKind: number, transportProtocols:
 ///   ArrayBuffer, contactMessage: ArrayBuffer, communicationInfo:
 ///   ArrayBuffer|null, parameterRange: ArrayBuffer|null) ->
 ///   { request_wire_bytes, initiator_contact_message_wire_bytes,
@@ -390,7 +390,7 @@ jsi::Value producePairRequestMessage(jsi::Runtime& rt,
                                      size_t count) {
   requireArgs(rt, "produce_pair_request_message", count, 5);
   auto senderKind = static_cast<int32_t>(args[0].asNumber());
-  ByteView transportProtocol = asBytes(rt, args[1]);
+  ByteView transportProtocols = asBytes(rt, args[1]);
   ByteView contactMessage = asBytes(rt, args[2]);
   ByteView communicationInfo = asBytes(rt, args[3]);
   ByteView parameterRange = asBytes(rt, args[4]);

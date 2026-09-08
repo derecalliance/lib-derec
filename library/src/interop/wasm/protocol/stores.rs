@@ -75,9 +75,9 @@ use crate::{
             ShareStoreFuture, StateStoreFuture, TransportFuture,
         },
         types::{
-            ChannelQuery, ChannelRecord, HelperChannel, MissingPolicy, PairingKeyMaterial,
-            ReplicaMember, SecretKind, SecretValue, Share, StateItem, StateKey, StateKind,
-            UserSecret, UserSecrets,
+            ChannelQuery, ChannelRecord, HelperChannel, HelperFilter, MissingPolicy,
+            PairingKeyMaterial, ReplicaFilter, ReplicaMember, SecretKind, SecretValue, Share,
+            StateItem, StateKey, StateKind, UserSecret, UserSecrets,
         },
     },
     types::ChannelId,
@@ -344,13 +344,62 @@ fn record_key(record: &ChannelRecord) -> (String, String) {
 
 /// Call a listing method and decode its JSON array. A `null`/`undefined` or
 /// empty buffer is an empty list, not an error.
+/// A listing filter, as the plain JS object the store method receives:
+/// `{ ids, status, role, exclude }`.
+///
+/// Ids cross as **decimal strings**, matching every other `u64` on this
+/// bridge — a JS number cannot hold one exactly. Statuses and the role cross
+/// as their Rust variant names, matching the records the same store returns.
+fn encode_filter<Role: serde::Serialize>(
+    ids: &[u64],
+    status: &[crate::protocol::types::ChannelStatus],
+    role: Option<&Role>,
+    exclude: &[u64],
+) -> Result<JsValue, ChannelStoreError> {
+    let obj = js_sys::Object::new();
+    let set = |key: &str, value: &JsValue| -> Result<(), ChannelStoreError> {
+        js_sys::Reflect::set(&obj, &JsValue::from_str(key), value)
+            .map(|_| ())
+            .map_err(|e| ChannelStoreError::Backend(box_err(format!("{e:?}"))))
+    };
+
+    let id_array = |values: &[u64]| {
+        let arr = Array::new();
+        for v in values {
+            arr.push(&JsValue::from_str(&v.to_string()));
+        }
+        arr
+    };
+    set("ids", &id_array(ids))?;
+    set("exclude", &id_array(exclude))?;
+
+    let status_array = Array::new();
+    for s in status {
+        let encoded = serde_wasm_bindgen::to_value(s)
+            .map_err(|e| ChannelStoreError::Backend(box_err(e.to_string())))?;
+        status_array.push(&encoded);
+    }
+    set("status", &status_array)?;
+
+    let role = match role {
+        Some(r) => serde_wasm_bindgen::to_value(r)
+            .map_err(|e| ChannelStoreError::Backend(box_err(e.to_string())))?,
+        None => JsValue::NULL,
+    };
+    set("role", &role)?;
+
+    Ok(obj.into())
+}
+
 async fn list_records<T: serde::de::DeserializeOwned>(
     obj: &JsValue,
     method: &str,
     secret_str: &str,
+    filter: JsValue,
 ) -> Result<Vec<T>, ChannelStoreError> {
     let args = Array::new();
     args.push(&JsValue::from_str(secret_str));
+    args.push(&filter);
     let promise_val =
         call_method(obj, method, &args).map_err(|e| ChannelStoreError::Backend(box_err(e)))?;
     let value = resolve_promise(promise_val)
@@ -438,16 +487,34 @@ impl DeRecChannelStore for JsChannelStore {
         })
     }
 
-    fn helpers(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+    fn helpers(
+        &self,
+        secret_id: u64,
+        filter: HelperFilter,
+    ) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
         let obj = self.0.clone();
         let secret_str = secret_id.to_string();
-        Box::pin(async move { list_records(&obj, "listHelpers", &secret_str).await })
+        Box::pin(async move {
+            let ids: Vec<u64> = filter.ids.iter().map(|c| c.0).collect();
+            let exclude: Vec<u64> = filter.exclude.iter().map(|c| c.0).collect();
+            let filter = encode_filter(&ids, &filter.status, filter.role.as_ref(), &exclude)?;
+            list_records(&obj, "listHelpers", &secret_str, filter).await
+        })
     }
 
-    fn replicas(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
+    fn replicas(
+        &self,
+        secret_id: u64,
+        filter: ReplicaFilter,
+    ) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
         let obj = self.0.clone();
         let secret_str = secret_id.to_string();
-        Box::pin(async move { list_records(&obj, "listReplicas", &secret_str).await })
+        Box::pin(async move {
+            let ids: Vec<u64> = filter.ids.iter().map(|r| r.0).collect();
+            let exclude: Vec<u64> = filter.exclude.iter().map(|r| r.0).collect();
+            let filter = encode_filter(&ids, &filter.status, filter.role.as_ref(), &exclude)?;
+            list_records(&obj, "listReplicas", &secret_str, filter).await
+        })
     }
 
     fn link_channel(
@@ -927,7 +994,7 @@ fn state_kind_to_u32(kind: StateKind) -> u32 {
         StateKind::PendingRecovery => 1,
         StateKind::PendingUnpair => 2,
         StateKind::SharingRound => 3,
-        StateKind::PendingSyncCheck => 4,
+        StateKind::PendingReplicaDiscovery => 4,
     }
 }
 

@@ -41,6 +41,7 @@ internal static class Protocol
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int ChannelStoreListDelegate(
         IntPtr userData, ulong secretId,
+        IntPtr filter, UIntPtr filterLen,
         out IntPtr outPtr, out UIntPtr outLen);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
@@ -315,6 +316,10 @@ internal static class Protocol
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern DeRecError derec_protocol_set_own_transport(
         IntPtr handle, byte[] uri, UIntPtr uriLen, int protocol);
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern DeRecError derec_protocol_set_own_transports(
+        IntPtr handle, byte[] transportsJson, UIntPtr transportsJsonLen);
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern DeRecProtocolEventsResult derec_protocol_restore(

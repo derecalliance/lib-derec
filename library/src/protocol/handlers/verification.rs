@@ -2,10 +2,12 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use super::super::{
-    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecStateStore,
-    DeRecTransport, MissingPolicy, PendingAction, SecretKind, SecretValue, StateItem, StateKey,
+    DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecStateStore, DeRecTransport, MissingPolicy,
+    PendingAction, SecretKind, SecretValue, StateItem, StateKey,
 };
-use super::peer_endpoints;
+use crate::extensions::channel_store::ChannelStoreExt as _;
+use crate::protocol::context::{Exchange, Local, Round};
+use crate::protocol::stores::{StoreSet, Stores};
 use crate::{
     Error, Result,
     derec_message::current_timestamp,
@@ -39,23 +41,18 @@ use prost::Message;
 /// caller rather than swallowed.
 #[cfg_attr(
     feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+    tracing::instrument(skip_all, fields(trace_id = exchange.trace_id, channel_id = exchange.channel_id.0))
 )]
-pub(in crate::protocol) async fn handle<Sh: DeRecShareStore, St: DeRecStateStore>(
-    share_store: &mut Sh,
-    state_store: &mut St,
-    secret_id: u64,
-    channel_id: ChannelId,
+pub(in crate::protocol) async fn handle<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    exchange: &Exchange<'_>,
     inner: MessageBody,
-    shared_key: SharedKey,
-    inbound_trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
     match inner {
-        MessageBody::VerifyShareRequest(request) => {
-            on_request(channel_id, request, shared_key, inbound_trace_id)
-        }
+        MessageBody::VerifyShareRequest(request) => on_request(exchange, request),
         MessageBody::VerifyShareResponse(response) => {
-            on_response(share_store, state_store, secret_id, channel_id, &response).await
+            on_response(stores, local.secret_id, exchange.channel_id, &response).await
         }
         _ => Err(Error::Invariant(
             "unexpected MessageBody variant in verification handler",
@@ -77,43 +74,34 @@ pub(in crate::protocol) async fn handle<Sh: DeRecShareStore, St: DeRecStateStore
 /// `VerifySharesFailed` rather than short-circuiting the fan-out.
 #[cfg_attr(
     feature = "logging",
-    tracing::instrument(skip_all, fields(secret_id = secret_id, version = version))
+    tracing::instrument(skip_all, fields(trace_id = round.trace_id, secret_id = local.secret_id, version = version))
 )]
-#[allow(clippy::too_many_arguments)]
-pub(in crate::protocol) async fn start<
-    Ch: DeRecChannelStore,
-    Ss: DeRecSecretStore,
-    T: DeRecTransport,
-    St: DeRecStateStore,
->(
-    channel_store: &mut Ch,
-    secret_store: &mut Ss,
-    transport: &T,
-    state_store: &mut St,
+pub(in crate::protocol) async fn start<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
     version: u32,
     target: Target,
-    secret_id: u64,
-    reply_to: &[derec_proto::TransportProtocol],
+    round: &Round<'_>,
 ) -> Result<Vec<DeRecEvent>> {
-    let all_channels = channel_store.helpers(secret_id).await?;
-    let all_channel_ids: Vec<ChannelId> = all_channels.iter().map(|c| c.channel_id).collect();
+    let secret_id = local.secret_id;
+    let known: Vec<ChannelId> = stores
+        .channels
+        .helpers_matching(
+            secret_id,
+            crate::protocol::types::HelperFilter {
+                ids: target.ids(),
+                ..Default::default()
+            },
+        )
+        .await?
+        .iter()
+        .map(|c| c.channel_id)
+        .collect();
 
-    let channel_ids = match target {
-        Target::All => all_channel_ids,
-        Target::Single(id) => {
-            if all_channel_ids.contains(&id) {
-                vec![id]
-            } else {
-                vec![]
-            }
-        }
-        Target::Many(ids) => ids
-            .into_iter()
-            .filter(|id| all_channel_ids.contains(id))
-            .collect(),
-    };
+    let channel_ids = target.filter(&known);
 
-    let keys = secret_store
+    let keys = stores
+        .secrets
         .load_many(
             secret_id,
             &channel_ids,
@@ -122,59 +110,7 @@ pub(in crate::protocol) async fn start<
         )
         .await?;
 
-    let mut events = Vec::with_capacity(keys.len());
-    for (channel_id, value) in keys {
-        let SecretValue::SharedKey(shared_key) = value else {
-            events.push(DeRecEvent::VerifySharesFailed {
-                channel_id,
-                version,
-                error: "channel has no shared key".to_owned(),
-            });
-            continue;
-        };
-
-        match dispatch_one(
-            channel_store,
-            transport,
-            state_store,
-            secret_id,
-            version,
-            channel_id,
-            &shared_key,
-            reply_to,
-        )
-        .await
-        {
-            Ok(()) => {
-                events.push(DeRecEvent::VerifySharesStarted {
-                    channel_id,
-                    version,
-                });
-                #[cfg(feature = "logging")]
-                tracing::debug!(
-                    channel_id = channel_id.0,
-                    secret_id = secret_id,
-                    version = version,
-                    "verification challenge sent"
-                );
-            }
-            Err(e) => {
-                events.push(DeRecEvent::VerifySharesFailed {
-                    channel_id,
-                    version,
-                    error: e.to_string(),
-                });
-                #[cfg(feature = "logging")]
-                tracing::warn!(
-                    channel_id = channel_id.0,
-                    secret_id = secret_id,
-                    version = version,
-                    error = %e,
-                    "verification challenge dispatch failed"
-                );
-            }
-        }
-    }
+    let events = dispatch_all(stores, secret_id, version, keys, round).await;
 
     #[cfg(feature = "logging")]
     tracing::info!(
@@ -190,29 +126,23 @@ pub(in crate::protocol) async fn start<
     feature = "logging",
     tracing::instrument(
         skip_all,
-        fields(
-            channel_id = channel_id.0,
+        fields(trace_id = exchange.trace_id,
+            channel_id = exchange.channel_id.0,
             secret_id = request.secret_id,
             version = request.version
         )
     )
 )]
-#[allow(clippy::too_many_arguments)]
-pub(in crate::protocol) async fn accept<
-    Ch: DeRecChannelStore,
-    Sh: DeRecShareStore,
-    T: DeRecTransport,
->(
-    channel_store: &mut Ch,
-    share_store: &mut Sh,
-    transport: &T,
-    secret_id: u64,
-    channel_id: ChannelId,
+pub(in crate::protocol) async fn accept<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    exchange: &Exchange<'_>,
     request: &VerifyShareRequestMessage,
-    shared_key: &SharedKey,
-    trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
-    let stored_bytes = share_store
+    let (secret_id, channel_id) = (local.secret_id, exchange.channel_id);
+
+    let stored_bytes = stores
+        .shares
         .load(secret_id, channel_id, &[request.version])
         .await?
         .into_iter()
@@ -221,16 +151,19 @@ pub(in crate::protocol) async fn accept<
         .ok_or(Error::InvalidInput(
             "no stored share for verification request",
         ))?;
+
     let stored =
         StoreShareRequestMessage::decode(stored_bytes.as_slice()).map_err(Error::ProtobufDecode)?;
 
-    let resp = verification_response::produce(channel_id, request, shared_key, &stored.share)?;
+    let resp =
+        verification_response::produce(channel_id, request, exchange.shared_key, &stored.share)?;
 
-    let envelope = super::apply_trace_id(resp.envelope, trace_id)?;
-    let endpoint =
-        super::resolve_response_endpoints(channel_store, secret_id, channel_id, &request.reply_to)
-            .await?;
-    transport.send(&endpoint, envelope).await?;
+    let envelope = crate::derec_message::apply_trace_id(&resp.envelope, exchange.trace_id)?;
+    let endpoint = stores
+        .channels
+        .resolve_response_endpoints(secret_id, channel_id, &request.reply_to)
+        .await?;
+    stores.transport.send(&endpoint, envelope).await?;
 
     #[cfg(feature = "logging")]
     tracing::info!(
@@ -247,25 +180,22 @@ pub(in crate::protocol) async fn accept<
     feature = "logging",
     tracing::instrument(
         skip_all,
-        fields(
-            channel_id = channel_id.0,
+        fields(trace_id = exchange.trace_id,
+            channel_id = exchange.channel_id.0,
             secret_id = request.secret_id,
             version = request.version
         )
     )
 )]
-#[allow(clippy::too_many_arguments)]
-pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport>(
-    channel_store: &mut Ch,
-    transport: &T,
-    secret_id: u64,
-    channel_id: ChannelId,
+pub(in crate::protocol) async fn reject<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    exchange: &Exchange<'_>,
     request: &VerifyShareRequestMessage,
-    shared_key: &SharedKey,
     status: StatusEnum,
     memo: &str,
-    trace_id: u64,
 ) -> Result<()> {
+    let (secret_id, channel_id) = (local.secret_id, exchange.channel_id);
     let response = VerifyShareResponseMessage {
         result: Some(DeRecResult {
             status: status as i32,
@@ -277,14 +207,14 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
         hash: Vec::new(),
         timestamp: Some(current_timestamp()),
     };
-    super::send_channel_message(
-        channel_store,
-        transport,
+    crate::extensions::channel_store::send_channel_message(
+        stores.channels,
+        stores.transport,
         secret_id,
         channel_id,
         MessageBody::VerifyShareResponse(response),
-        shared_key,
-        trace_id,
+        exchange.shared_key,
+        exchange.trace_id,
         &request.reply_to,
     )
     .await
@@ -294,26 +224,24 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
     feature = "logging",
     tracing::instrument(
         skip_all,
-        fields(
-            channel_id = channel_id.0,
+        fields(trace_id = exchange.trace_id,
+            channel_id = exchange.channel_id.0,
             secret_id = request.secret_id,
             version = request.version
         )
     )
 )]
 fn on_request(
-    channel_id: ChannelId,
+    exchange: &Exchange<'_>,
     request: VerifyShareRequestMessage,
-    shared_key: SharedKey,
-    trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
     Ok(vec![DeRecEvent::ActionRequired {
-        channel_id,
+        channel_id: exchange.channel_id,
         action: PendingAction::VerifyShare {
-            channel_id,
+            channel_id: exchange.channel_id,
             request,
-            shared_key,
-            trace_id,
+            shared_key: *exchange.shared_key,
+            trace_id: exchange.trace_id,
         },
     }])
 }
@@ -329,16 +257,15 @@ fn on_request(
         )
     )
 )]
-async fn on_response<Sh: DeRecShareStore, St: DeRecStateStore>(
-    share_store: &mut Sh,
-    state_store: &mut St,
+async fn on_response<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
     secret_id: u64,
     channel_id: ChannelId,
     response: &VerifyShareResponseMessage,
 ) -> Result<Vec<DeRecEvent>> {
     let key = StateKey::PendingVerification { channel_id };
     let Some(StateItem::PendingVerification { request, .. }) =
-        state_store.load(secret_id, key.clone()).await?
+        stores.state.load(secret_id, key.clone()).await?
     else {
         #[cfg(feature = "logging")]
         tracing::warn!(
@@ -347,11 +274,12 @@ async fn on_response<Sh: DeRecShareStore, St: DeRecStateStore>(
         );
         return Ok(vec![DeRecEvent::NoOp]);
     };
-    let _ = state_store.remove(secret_id, key).await?;
+    let _ = stores.state.remove(secret_id, key).await?;
 
     let version = response.version;
 
-    let committed_share_bytes = share_store
+    let committed_share_bytes = stores
+        .shares
         .load(secret_id, channel_id, &[version])
         .await?
         .into_iter()
@@ -381,22 +309,86 @@ async fn on_response<Sh: DeRecShareStore, St: DeRecStateStore>(
     }])
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn dispatch_one<Ch: DeRecChannelStore, T: DeRecTransport, St: DeRecStateStore>(
-    channel_store: &mut Ch,
-    transport: &T,
-    state_store: &mut St,
+/// Send a challenge to every resolved channel, reporting each outcome.
+///
+/// One event per target, in the order the targets were resolved. A failure is
+/// isolated to its own target: it becomes a `VerifySharesFailed` and the
+/// fan-out continues.
+async fn dispatch_all<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    secret_id: u64,
+    version: u32,
+    keys: Vec<(ChannelId, SecretValue)>,
+    round: &Round<'_>,
+) -> Vec<DeRecEvent> {
+    let mut events = Vec::with_capacity(keys.len());
+    for (channel_id, value) in keys {
+        let SecretValue::SharedKey(shared_key) = value else {
+            events.push(DeRecEvent::VerifySharesFailed {
+                channel_id,
+                version,
+                error: "channel has no shared key".to_owned(),
+            });
+            continue;
+        };
+
+        match dispatch_one(stores, secret_id, version, channel_id, &shared_key, round).await {
+            Ok(()) => {
+                events.push(DeRecEvent::VerifySharesStarted {
+                    channel_id,
+                    version,
+                    trace_id: round.trace_id,
+                });
+                #[cfg(feature = "logging")]
+                tracing::debug!(
+                    channel_id = channel_id.0,
+                    secret_id = secret_id,
+                    version = version,
+                    "verification challenge sent"
+                );
+            }
+            Err(e) => {
+                events.push(DeRecEvent::VerifySharesFailed {
+                    channel_id,
+                    version,
+                    error: e.to_string(),
+                });
+                #[cfg(feature = "logging")]
+                tracing::warn!(
+                    channel_id = channel_id.0,
+                    secret_id = secret_id,
+                    version = version,
+                    error = %e,
+                    "verification challenge dispatch failed"
+                );
+            }
+        }
+    }
+    events
+}
+
+async fn dispatch_one<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
     secret_id: u64,
     version: u32,
     channel_id: ChannelId,
     shared_key: &SharedKey,
-    reply_to: &[derec_proto::TransportProtocol],
+    round: &Round<'_>,
 ) -> Result<()> {
-    let endpoint = peer_endpoints(channel_store, secret_id, channel_id).await?;
-    let msg =
-        produce_verify_share_request_message(channel_id, secret_id, version, shared_key, reply_to)?;
+    let endpoint = stores
+        .channels
+        .peer_endpoints(secret_id, channel_id)
+        .await?;
+    let msg = produce_verify_share_request_message(
+        channel_id,
+        secret_id,
+        version,
+        shared_key,
+        round.reply_to,
+    )?;
 
-    state_store
+    stores
+        .state
         .save(
             secret_id,
             StateItem::PendingVerification {
@@ -406,13 +398,13 @@ async fn dispatch_one<Ch: DeRecChannelStore, T: DeRecTransport, St: DeRecStateSt
                     version,
                     nonce: msg.nonce,
                     timestamp: None,
-                    reply_to: reply_to.to_vec(),
+                    reply_to: round.reply_to.to_vec(),
                 },
             },
         )
         .await?;
 
-    let envelope = super::apply_trace_id(msg.envelope, super::fresh_trace_id())?;
-    transport.send(&endpoint, envelope).await?;
+    let envelope = crate::derec_message::apply_trace_id(&msg.envelope, round.trace_id)?;
+    stores.transport.send(&endpoint, envelope).await?;
     Ok(())
 }

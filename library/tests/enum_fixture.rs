@@ -113,7 +113,7 @@ fn state_kind_fixture_is_complete() {
         StateKind::PendingRecovery,
         StateKind::PendingUnpair,
         StateKind::SharingRound,
-        StateKind::PendingSyncCheck,
+        StateKind::PendingReplicaDiscovery,
     ];
     let names: Vec<&str> = all
         .iter()
@@ -122,7 +122,7 @@ fn state_kind_fixture_is_complete() {
             StateKind::PendingRecovery => "PendingRecovery",
             StateKind::PendingUnpair => "PendingUnpair",
             StateKind::SharingRound => "SharingRound",
-            StateKind::PendingSyncCheck => "PendingSyncCheck",
+            StateKind::PendingReplicaDiscovery => "PendingReplicaDiscovery",
         })
         .collect();
     assert_matches_fixture("StateKind", &names);
@@ -262,7 +262,7 @@ fn numeric_discriminants_match_the_fixture() {
     }
 
     // Declaration order is the wire order here, so a plain cast is correct.
-    // It was not always: `SharingRound` and `PendingSyncCheck` were declared
+    // It was not always: `SharingRound` and `PendingReplicaDiscovery` were declared
     // in the opposite order to the numbering every shim uses, so `kind as u32`
     // would have filed a row under the wrong kind.
     for (name, kind) in [
@@ -270,7 +270,10 @@ fn numeric_discriminants_match_the_fixture() {
         ("PendingRecovery", StateKind::PendingRecovery),
         ("PendingUnpair", StateKind::PendingUnpair),
         ("SharingRound", StateKind::SharingRound),
-        ("PendingSyncCheck", StateKind::PendingSyncCheck),
+        (
+            "PendingReplicaDiscovery",
+            StateKind::PendingReplicaDiscovery,
+        ),
     ] {
         assert_eq!(wire("StateKind", name), kind as i64, "StateKind::{name}");
     }

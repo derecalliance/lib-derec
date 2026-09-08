@@ -2,12 +2,12 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use crate::derec_message::{DeRecMessageBuilder, current_timestamp};
+use crate::extensions::advertised_endpoints::AdvertisedEndpoints as _;
+use crate::extensions::pair_request::PairRequestMessageExt as _;
+use crate::extensions::pre_pair_request::PrePairRequestMessageExt as _;
 use crate::primitives::pairing::PairingError;
 use crate::protocol_version::ProtocolVersion;
-use crate::transport::AdvertisedEndpoints as _;
 use crate::types::ChannelId;
-use crate::utils::PairRequestMessageExt as _;
-use crate::utils::PrePairRequestMessageExt as _;
 use crate::utils::verify_timestamps;
 use derec_cryptography::pairing::{
     self as cryptography_pairing, PairingSecretKeyMaterial, PairingSharedKey,
@@ -213,7 +213,7 @@ pub struct ProcessPrePairResult {
 /// # Selecting the reply endpoint
 ///
 /// Every endpoint the requester advertised — read via
-/// [`AdvertisedEndpoints`](crate::transport::AdvertisedEndpoints), so its
+/// [`AdvertisedEndpoints`](crate::extensions::advertised_endpoints::AdvertisedEndpoints), so its
 /// singular `transportProtocol` field is the fallback when it offers no
 /// list, which is how peers predating the offer list behave — is recorded
 /// in the order it offered them, filtered by `policy` via

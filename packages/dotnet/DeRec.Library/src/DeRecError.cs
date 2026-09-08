@@ -25,6 +25,7 @@ public static class DeRecCategory
     public const int InvalidInput = 12;
     public const int Protobuf = 13;
     public const int Invariant = 14;
+    public const int StateStore = 15;
 }
 
 /// <summary>
@@ -53,6 +54,14 @@ public static class DeRecCode
     /// <see cref="DeRecCategory.SecretStore"/>.
     /// </summary>
     public const int MissingSharedKey = 10;
+
+    /// <summary>
+    /// A message arrived on a channel whose peer holds a different role than
+    /// the message requires — an owner-only request from a helper, or the
+    /// reverse. <see cref="DeRecException.Category"/> is
+    /// <see cref="DeRecCategory.InvalidInput"/>.
+    /// </summary>
+    public const int RoleMismatch = 11;
 
     /// <summary>
     /// The protocol was built without a local replica id but a replica-mode
@@ -90,6 +99,15 @@ public static class DeRecCode
     /// <see cref="DeRecCategory.InvalidInput"/>.
     /// </summary>
     public const int RestoreConflict = 15;
+
+    /// <summary>
+    /// A replica pairing named a <c>replicaId</c> already held by another
+    /// member of the group, this device included. Assignment is the
+    /// application's, so this is a configuration fault: assign a distinct id
+    /// and pair again. <see cref="DeRecException.Category"/> is
+    /// <see cref="DeRecCategory.InvalidInput"/>.
+    /// </summary>
+    public const int ReplicaIdConflict = 16;
 
     public const int Encryption = 20;
     public const int Keygen = 21;
@@ -157,6 +175,14 @@ public static class DeRecCode
     public const int SecretIdMismatch = 84;
     public const int ReconstructionFailed = 85;
 
+    /// <summary>
+    /// The secret reconstructed from the collected shares did not decode —
+    /// the shares combined, but into something that is not a valid secret.
+    /// <see cref="DeRecException.Category"/> is
+    /// <see cref="DeRecCategory.Recovery"/>.
+    /// </summary>
+    public const int MalformedRecoveredSecret = 86;
+
     public const int FfiNullPtr = 100;
     public const int FfiBadLength = 101;
     public const int FfiBadUtf8 = 102;
@@ -164,4 +190,21 @@ public static class DeRecCode
     public const int FfiInvalidEnum = 104;
     public const int FfiBadSharedKey = 105;
     public const int FfiNulInString = 106;
+
+    /// <summary>
+    /// A transport endpoint failed validation — malformed URI, unknown
+    /// scheme, a scheme inconsistent with the declared protocol, or plaintext
+    /// where policy does not allow it. <see cref="DeRecException.Category"/>
+    /// is <see cref="DeRecCategory.InvalidInput"/>.
+    /// </summary>
+    public const int TransportInvalid = 120;
+
+    /// <summary>
+    /// No transport is shared with the peer — its offered endpoints and this
+    /// application's served endpoints intersect to nothing. Always a local,
+    /// terminal error: push-only delivery means an unreachable peer also
+    /// cannot be told. <see cref="DeRecException.Category"/> is
+    /// <see cref="DeRecCategory.InvalidInput"/>.
+    /// </summary>
+    public const int NoUsableEndpoint = 121;
 }

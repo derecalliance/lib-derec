@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use crate::extensions::advertised_endpoints::AdvertisedEndpoints as _;
+use crate::extensions::contact_message::ContactMessageExt as _;
+use crate::extensions::pair_request::PairRequestMessageExt as _;
+use crate::extensions::pre_pair_request::PrePairRequestMessageExt as _;
+use crate::extensions::transport_protocol::TransportProtocolExt as _;
 use crate::primitives::pairing::PairingError;
-use crate::transport::{AdvertisedEndpoints as _, TransportProtocolExt as _};
-use crate::utils::{
-    ContactMessageExt as _, PairRequestMessageExt as _, PrePairRequestMessageExt as _,
-    verify_timestamps,
-};
+use crate::utils::verify_timestamps;
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp},
     protocol_version::ProtocolVersion,
@@ -300,9 +301,7 @@ pub fn create_contact(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = contact_message.channel_id, kind = kind as i32))
 )]
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
+// Compatibility, not oversight — see the `transport` module docs.
 #[allow(deprecated)]
 pub fn produce(
     kind: SenderKind,
@@ -420,9 +419,7 @@ pub fn produce(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = contact_message.channel_id))
 )]
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
+// Compatibility, not oversight — see the `transport` module docs.
 #[allow(deprecated)]
 pub fn produce_pre_pair_request(
     own: Vec<TransportProtocol>,
@@ -561,9 +558,7 @@ pub fn produce_pre_pair_request(
     feature = "logging",
     tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
 )]
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
+// Compatibility, not oversight — see the `transport` module docs.
 #[allow(deprecated)]
 pub fn extract(
     envelope_bytes: &[u8],
@@ -682,9 +677,7 @@ pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, c
     Ok(PrePairExtractResult { request })
 }
 
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
+// Compatibility, not oversight — see the `transport` module docs.
 #[allow(deprecated)]
 fn validate_inputs(
     transport_protocol: &TransportProtocol,

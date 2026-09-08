@@ -95,11 +95,11 @@ func TestNumericEnumsMatchTheFixture(t *testing.T) {
 
 	state := byName("StateKind")
 	for name, want := range map[string]StateKind{
-		"PendingVerification": StateKindPendingVerification,
-		"PendingRecovery":     StateKindPendingRecovery,
-		"PendingUnpair":       StateKindPendingUnpair,
-		"SharingRound":        StateKindSharingRound,
-		"PendingSyncCheck":    StateKindPendingSyncCheck,
+		"PendingVerification":     StateKindPendingVerification,
+		"PendingRecovery":         StateKindPendingRecovery,
+		"PendingUnpair":           StateKindPendingUnpair,
+		"SharingRound":            StateKindSharingRound,
+		"PendingReplicaDiscovery": StateKindPendingReplicaDiscovery,
 	} {
 		got, ok := state[name]
 		if !ok {

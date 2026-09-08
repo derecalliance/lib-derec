@@ -26,21 +26,6 @@ use serde::{Deserialize, Serialize};
 use crate::protocol::types::secret::SecretError;
 use crate::protocol::types::{HelperInfo, ReplicaInfo, ReplicaRole, Replicas, Secret, UserSecret};
 
-fn gzip(data: &[u8]) -> Vec<u8> {
-    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
-    enc.write_all(data)
-        .expect("gzip write into Vec is infallible");
-    enc.finish().expect("gzip finish into Vec is infallible")
-}
-
-fn gunzip(data: &[u8]) -> Result<Vec<u8>, SecretError> {
-    let mut out = Vec::new();
-    GzDecoder::new(data)
-        .read_to_end(&mut out)
-        .map_err(|_| SecretError::Decompression)?;
-    Ok(out)
-}
-
 mod base64_bytes {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use serde::{Deserialize as _, Deserializer, Serializer};
@@ -67,14 +52,6 @@ mod u64_string {
         let s = String::deserialize(d)?;
         s.parse::<u64>().map_err(serde::de::Error::custom)
     }
-}
-
-fn de_map<'de, D>(d: D) -> Result<HashMap<String, String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::Deserialize as _;
-    Ok(Option::<HashMap<String, String>>::deserialize(d)?.unwrap_or_default())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -281,4 +258,27 @@ pub fn decode(payload: &[u8]) -> Result<Secret, SecretError> {
     let json = gunzip(payload)?;
     let dto: SecretJson = serde_json::from_slice(&json)?;
     Ok(Secret::from(dto))
+}
+
+fn gzip(data: &[u8]) -> Vec<u8> {
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(data)
+        .expect("gzip write into Vec is infallible");
+    enc.finish().expect("gzip finish into Vec is infallible")
+}
+
+fn gunzip(data: &[u8]) -> Result<Vec<u8>, SecretError> {
+    let mut out = Vec::new();
+    GzDecoder::new(data)
+        .read_to_end(&mut out)
+        .map_err(|_| SecretError::Decompression)?;
+    Ok(out)
+}
+
+fn de_map<'de, D>(d: D) -> Result<HashMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    Ok(Option::<HashMap<String, String>>::deserialize(d)?.unwrap_or_default())
 }

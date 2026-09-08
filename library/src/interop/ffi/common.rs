@@ -122,7 +122,7 @@ pub(crate) fn read_len_prefixed_vec(input: &mut &[u8]) -> Result<Vec<u8>, String
 /// corresponding primitive.
 ///
 /// Every entry is validated with
-/// [`crate::transport::TransportProtocolExt::validate`], so callers that
+/// [`crate::extensions::transport_protocol::TransportProtocolExt::validate`], so callers that
 /// reach the library through FFI cannot smuggle a mismatched-scheme or
 /// otherwise malformed endpoint past the seam. Mirrors the validation
 /// applied at every primitive `extract` site, keeping the rejection
@@ -132,10 +132,10 @@ pub(crate) fn parse_transport_protocol_list(
     len: usize,
     field: &str,
 ) -> Result<Vec<derec_proto::TransportProtocol>, crate::interop::ffi::error::DeRecError> {
+    use crate::extensions::transport_protocol::TransportProtocolExt as _;
     use crate::interop::ffi::error::{
         DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_NULL_PTR, ffi_error, from_lib_error,
     };
-    use crate::transport::TransportProtocolExt as _;
     use prost::Message as _;
 
     if len == 0 {

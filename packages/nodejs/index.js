@@ -10,7 +10,7 @@ const SenderKind = Object.freeze({ Owner: 0, Helper: 1, ReplicaSource: 3, Replic
 
 const ContactMode = Object.freeze({ InlineKeys: 0, HashedKeys: 1, NoKeys: 2 });
 
-const FlowKind = Object.freeze({ Pairing: 0, Discovery: 1, ProtectSecret: 2, VerifyShares: 3, RecoverSecret: 4, Unpair: 5, UpdateChannelInfo: 6, SyncCheck: 7, RemoveReplica: 8 });
+const FlowKind = Object.freeze({ Pairing: 0, Discovery: 1, ProtectSecret: 2, VerifyShares: 3, RecoverSecret: 4, Unpair: 5, UpdateChannelInfo: 6, ReplicaDiscovery: 7, UnpairReplica: 8 });
 
 const primitives = {
   discovery: {
@@ -95,8 +95,33 @@ const envelope = {
   read_trace_id: wasm.envelope_read_trace_id,
 };
 
+/**
+ * Whether a channel or member with these attributes survives `filter`.
+ *
+ * Every empty field means "do not restrict", `exclude` is applied after `ids`,
+ * and the restrictions combine with AND — the same contract the core states on
+ * `ChannelFilter`. A store whose backing cannot express the filter as a query
+ * can list and call this; that is correct but transfers the rows the filter
+ * exists to leave behind.
+ *
+ * `id` is a decimal string, as ids are everywhere on this bridge. `role` is the
+ * peer's `SenderKind` name for `listHelpers` and the member's `ReplicaRole`
+ * name for `listReplicas`.
+ */
+function channelFilterMatches(filter, id, status, role) {
+  if (!filter) return true;
+  const ids = filter.ids ?? [];
+  const statuses = filter.status ?? [];
+  const exclude = filter.exclude ?? [];
+  if (ids.length > 0 && !ids.includes(id)) return false;
+  if (statuses.length > 0 && !statuses.includes(status)) return false;
+  if (filter.role != null && filter.role !== role) return false;
+  return !exclude.includes(id);
+}
+
 module.exports = {
   primitives,
+  channelFilterMatches,
   envelope,
   DeRecProtocol,
   DeRecProtocolBuilder,

@@ -67,9 +67,7 @@ fn test_create_contact_message_empty_transport_uri() {
     ));
 }
 
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
+// Compatibility, not oversight — see the `transport` module docs.
 #[allow(deprecated)]
 #[test]
 fn test_create_contact_message() {
@@ -113,9 +111,7 @@ fn test_create_contact_message() {
     );
 }
 
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
+// Compatibility, not oversight — see the `transport` module docs.
 #[allow(deprecated)]
 #[test]
 fn test_produce_pairing_request_message_empty_mlkem_encapsulation_key() {
@@ -152,9 +148,7 @@ fn test_produce_pairing_request_message_empty_mlkem_encapsulation_key() {
     ));
 }
 
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
+// Compatibility, not oversight — see the `transport` module docs.
 #[allow(deprecated)]
 #[test]
 fn test_produce_pairing_request_message_empty_ecies_public_key() {
@@ -191,9 +185,7 @@ fn test_produce_pairing_request_message_empty_ecies_public_key() {
     ));
 }
 
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
+// Compatibility, not oversight — see the `transport` module docs.
 #[allow(deprecated)]
 #[test]
 fn test_produce_pairing_request_message_empty_transport_uri() {
@@ -229,9 +221,7 @@ fn test_produce_pairing_request_message_empty_transport_uri() {
     ));
 }
 
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
+// Compatibility, not oversight — see the `transport` module docs.
 #[allow(deprecated)]
 #[test]
 fn test_produce_pairing_request_message() {
@@ -286,9 +276,7 @@ fn test_produce_pairing_request_message() {
     assert_eq!(transport.protocol, Protocol::Https as i32);
 }
 
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
+// Compatibility, not oversight — see the `transport` module docs.
 #[allow(deprecated)]
 #[test]
 fn test_produce_pairing_request_message_initiator_contact_message() {
@@ -329,9 +317,7 @@ fn test_produce_pairing_request_message_initiator_contact_message() {
     assert_eq!(tp.protocol, Protocol::Https as i32);
 }
 
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
+// Compatibility, not oversight — see the `transport` module docs.
 #[allow(deprecated)]
 #[test]
 fn test_produce_pairing_response_message_empty_mlkem_ciphertext() {
@@ -382,9 +368,7 @@ fn test_produce_pairing_response_message_empty_mlkem_ciphertext() {
     ));
 }
 
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
+// Compatibility, not oversight — see the `transport` module docs.
 #[allow(deprecated)]
 #[test]
 fn test_produce_pairing_response_message_empty_ecies_public_key() {
@@ -435,9 +419,7 @@ fn test_produce_pairing_response_message_empty_ecies_public_key() {
     ));
 }
 
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
+// Compatibility, not oversight — see the `transport` module docs.
 #[allow(deprecated)]
 #[test]
 fn test_produce_pairing_response_message_missing_transport_protocol() {
@@ -484,9 +466,7 @@ fn test_produce_pairing_response_message_missing_transport_protocol() {
     ));
 }
 
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
+// Compatibility, not oversight — see the `transport` module docs.
 #[allow(deprecated)]
 #[test]
 fn test_produce_pairing_response_message_empty_transport_uri() {
@@ -1262,9 +1242,7 @@ fn test_create_contact_message_hashed_keys_fresh_randomness_yields_distinct_hash
     assert_ne!(a.contact_binding_hash, b.contact_binding_hash);
 }
 
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
+// Compatibility, not oversight — see the `transport` module docs.
 #[allow(deprecated)]
 #[test]
 fn test_produce_pre_pair_request_emits_envelope_routed_to_contact_channel() {
@@ -1346,9 +1324,7 @@ fn test_produce_pre_pair_request_rejects_empty_transport_uri() {
     ));
 }
 
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
+// Compatibility, not oversight — see the `transport` module docs.
 #[allow(deprecated)]
 #[test]
 fn test_extract_pre_pair_roundtrip() {
@@ -1490,9 +1466,7 @@ fn test_produce_pre_pair_emits_envelope_carrying_initiator_public_keys() {
     );
 }
 
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
+// Compatibility, not oversight — see the `transport` module docs.
 #[allow(deprecated)]
 #[test]
 fn test_produce_pre_pair_rejects_responder_secret_key_material() {
@@ -1540,9 +1514,7 @@ fn test_produce_pre_pair_rejects_responder_secret_key_material() {
     ));
 }
 
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
+// Compatibility, not oversight — see the `transport` module docs.
 #[allow(deprecated)]
 #[test]
 fn test_produce_pre_pair_response_keys_match_initiator_contact_keys_in_inline_mode() {
@@ -2059,11 +2031,9 @@ fn test_pairing_rekey_also_fires_in_hashed_keys_mode() {
     );
 }
 
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
-#[allow(deprecated)]
 /// Reference contact builders for the `validate_contact_for_mode` tests.
+// Compatibility, not oversight — see the `transport` module docs.
+#[allow(deprecated)]
 fn well_formed_inline_keys_contact() -> ContactMessage {
     ContactMessage {
         channel_id: 42,
@@ -2081,9 +2051,7 @@ fn well_formed_inline_keys_contact() -> ContactMessage {
     }
 }
 
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
+// Compatibility, not oversight — see the `transport` module docs.
 #[allow(deprecated)]
 fn well_formed_hashed_keys_contact() -> ContactMessage {
     ContactMessage {
@@ -2243,10 +2211,6 @@ fn test_validate_contact_for_mode_rejects_hashed_wrong_hash_length() {
     ));
 }
 
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
-#[allow(deprecated)]
 /// A peer-supplied `PairRequestMessage.transport_protocol` declaring
 /// `Protocol::Https` but carrying a URI with an unsupported scheme is
 /// rejected on the initiator side at extract — the producer-side
@@ -2254,6 +2218,8 @@ fn test_validate_contact_for_mode_rejects_hashed_wrong_hash_length() {
 /// catches a malicious responder that bypasses it. (`http://` is
 /// intentionally accepted as a dev-mode affordance and is flagged via
 /// `tracing::warn!`; see `crate::transport`.)
+// Compatibility, not oversight — see the `transport` module docs.
+#[allow(deprecated)]
 #[test]
 fn test_extract_pairing_request_rejects_scheme_mismatched_transport_protocol() {
     use crate::derec_message::DeRecMessageBuilder;
@@ -2319,15 +2285,13 @@ fn test_extract_pairing_request_rejects_scheme_mismatched_transport_protocol() {
     ));
 }
 
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
-#[allow(deprecated)]
 /// Same gate at the plaintext PrePair leg: a `PrePairRequestMessage`
 /// advertising `Protocol::Https` with a URI carrying an unsupported
 /// scheme is rejected at extract. (`http://` is intentionally accepted
 /// as a dev-mode affordance and is flagged via `tracing::warn!`; see
 /// `crate::transport`.)
+// Compatibility, not oversight — see the `transport` module docs.
+#[allow(deprecated)]
 #[test]
 fn test_extract_pre_pair_rejects_scheme_mismatched_transport_protocol() {
     use crate::protocol_version::ProtocolVersion;
@@ -2369,13 +2333,11 @@ fn test_extract_pre_pair_rejects_scheme_mismatched_transport_protocol() {
     ));
 }
 
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
-#[allow(deprecated)]
 /// Old peers read only the singular field, so a multi-transport contact
 /// must still fill it. The first entry is what goes there: the order is
 /// the application's stated preference and is never reinterpreted here.
+// Compatibility, not oversight — see the `transport` module docs.
+#[allow(deprecated)]
 #[test]
 fn legacy_field_takes_the_first_entry() {
     let own = vec![
@@ -2437,14 +2399,12 @@ fn contact_carries_every_served_transport() {
     );
 }
 
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
-#[allow(deprecated)]
 /// A responder builds its PrePair reply from a request a peer sent, so the
 /// endpoint in that request is untrusted input. Validating it here rather
 /// than only at `extract_pre_pair` matters because the FFI decodes straight
 /// into this call, bypassing `extract` entirely.
+// Compatibility, not oversight — see the `transport` module docs.
+#[allow(deprecated)]
 #[test]
 fn test_produce_pre_pair_rejects_scheme_mismatched_transport_protocol() {
     let channel_id = ChannelId(4301);
@@ -2485,12 +2445,10 @@ fn test_produce_pre_pair_rejects_scheme_mismatched_transport_protocol() {
     );
 }
 
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
-#[allow(deprecated)]
 /// Same guard on the NoKeys leg, which generates key material before
 /// replying and so must refuse before doing that work.
+// Compatibility, not oversight — see the `transport` module docs.
+#[allow(deprecated)]
 #[test]
 fn test_produce_pre_pair_no_keys_rejects_scheme_mismatched_transport_protocol() {
     let request = derec_proto::PrePairRequestMessage {
@@ -2516,13 +2474,11 @@ fn test_produce_pre_pair_no_keys_rejects_scheme_mismatched_transport_protocol() 
     );
 }
 
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
-#[allow(deprecated)]
 /// An absent endpoint stays acceptable: the responder then routes to what
 /// it already has on file. Locks in that adding validation did not turn
 /// absence into an error.
+// Compatibility, not oversight — see the `transport` module docs.
+#[allow(deprecated)]
 #[test]
 fn test_produce_pre_pair_no_keys_accepts_an_absent_transport_protocol() {
     let request = derec_proto::PrePairRequestMessage {
@@ -2563,13 +2519,11 @@ fn pairing_envelope_carrying(
         .encode_to_vec()
 }
 
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
-#[allow(deprecated)]
 /// A malformed request is refused at the parse boundary rather than
 /// travelling until something happens to read the missing field. The FFI
 /// decodes through this call, so every SDK inherits the check.
+// Compatibility, not oversight — see the `transport` module docs.
+#[allow(deprecated)]
 #[test]
 fn test_extract_pairing_request_rejects_missing_mlkem_ciphertext() {
     let channel_id = ChannelId(4401);
@@ -2619,12 +2573,10 @@ fn test_extract_pairing_request_rejects_missing_mlkem_ciphertext() {
     );
 }
 
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
-#[allow(deprecated)]
 /// A request advertising no endpoint at all is refused here too: there
 /// would be nowhere to send the response.
+// Compatibility, not oversight — see the `transport` module docs.
+#[allow(deprecated)]
 #[test]
 fn test_extract_pairing_request_rejects_a_request_advertising_no_endpoint() {
     let channel_id = ChannelId(4402);
@@ -2708,7 +2660,7 @@ fn test_extract_pairing_request_accepts_a_well_formed_request() {
 /// failing later with a less obvious error.
 #[test]
 fn test_validate_rejects_a_contact_advertising_no_endpoint() {
-    use crate::utils::ContactMessageExt as _;
+    use crate::extensions::contact_message::ContactMessageExt as _;
 
     let contact = ContactMessage {
         channel_id: 5001,
@@ -2731,7 +2683,7 @@ fn test_validate_rejects_a_contact_advertising_no_endpoint() {
 /// deprecated singular field must not be refused for omitting it.
 #[test]
 fn test_validate_accepts_a_contact_carrying_only_the_list() {
-    use crate::utils::ContactMessageExt as _;
+    use crate::extensions::contact_message::ContactMessageExt as _;
 
     let contact = ContactMessage {
         channel_id: 5002,

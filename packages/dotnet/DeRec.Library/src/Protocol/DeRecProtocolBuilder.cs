@@ -49,6 +49,7 @@ public sealed class DeRecProtocolBuilder
     private bool _autoReplyTo = false;
     private AutoAcceptPolicy _autoAccept = new();
     private ulong? _replicaId = null;
+    private ParameterRange? _parameterRange = null;
     private Timeouts? _timeouts = null;
     private bool? _unsafeHttp = null;
     private bool? _unsafeConnection = null;
@@ -303,6 +304,22 @@ public sealed class DeRecProtocolBuilder
     }
 
     /// <summary>
+    /// Declare the bounds this node advertises during pair negotiation.
+    /// </summary>
+    /// <remarks>
+    /// Embedded in outbound <c>PairRequest</c>/<c>PairResponse</c> envelopes
+    /// and checked against the peer's range on inbound ones: a range that
+    /// fails to intersect rejects the pairing with
+    /// <see cref="DeRecCode.IncompatibleParameterRange"/>. Default: unset —
+    /// no constraints advertised, every peer range accepted.
+    /// </remarks>
+    public DeRecProtocolBuilder WithParameterRange(ParameterRange range)
+    {
+        _parameterRange = range;
+        return this;
+    }
+
+    /// <summary>
     /// Configure automatic removal of expired <c>Pending</c> channels
     /// <summary>
     /// Finalize the configuration. Throws
@@ -339,6 +356,7 @@ public sealed class DeRecProtocolBuilder
             autoReplyTo: _autoReplyTo,
             autoAccept: _autoAccept,
             replicaId: _replicaId,
+            parameterRange: _parameterRange,
             timeouts: _timeouts,
             unsafeHttp: _unsafeHttp,
             unsafeConnection: _unsafeConnection);

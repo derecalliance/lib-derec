@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use crate::extensions::derec_result::DeRecResultExt as _;
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     primitives::discovery::DiscoveryError,
@@ -383,17 +384,7 @@ pub fn process(
         "GetSecretIdsVersionsResponseMessage is missing result field",
     ))?;
 
-    // TODO: result.validate()?
-    if result.status != StatusEnum::Ok as i32 {
-        #[cfg(feature = "logging")]
-        tracing::warn!(status = result.status, memo = %result.memo, "discovery response status is not Ok");
-
-        return Err(DiscoveryError::NonOkStatus {
-            status: result.status,
-            memo: result.memo.to_owned(),
-        }
-        .into());
-    }
+    result.validate(|status, memo| DiscoveryError::NonOkStatus { status, memo })?;
 
     let secret_list: Vec<SecretVersionEntry> = response
         .secret_list

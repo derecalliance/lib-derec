@@ -24,7 +24,7 @@
 //!
 //! A third, [`crate::Error::Transport`], joins them: the roster stores each
 //! peer as a bare `transport_uri`, so its protocol is derived from the URI
-//! scheme on the way back in, and a scheme this library serves no transport
+//! scheme on the way back in, and a scheme this library serves no stores.transport
 //! for cannot become a channel record. Checked with the other preconditions,
 //! so it too costs no partial write.
 //!
@@ -36,19 +36,22 @@
 //! preconditions above.
 
 use super::super::{
-    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecStateStore,
-    DeRecTransport, DeRecUserSecretStore, SecretValue, UnpairAck,
+    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecUserSecretStore,
+    SecretValue, UnpairAck,
     types::{
         ChannelRecord, ChannelStatus, HelperChannel, HelperInfo, ReplicaMember, ReplicaRole,
         Replicas, Secret, Share, UserSecrets,
     },
 };
+use crate::protocol::context::Local;
+use crate::protocol::stores::{StoreSet, Stores};
 use crate::{
     Result,
     types::{ChannelId, SharedKey},
 };
 use std::collections::HashSet;
 
+use crate::extensions::channel_store::ChannelStoreExt as _;
 #[cfg(target_arch = "wasm32")]
 use crate::interop::wasm::now_secs;
 #[cfg(not(target_arch = "wasm32"))]
@@ -102,7 +105,7 @@ pub enum RestoreError {
 ///    `secret.replicas.shared_key` is mis-sized, and
 ///    [`RestoreError::Conflict`] when an existing channel sits at a
 ///    canonical helper / replica id, and [`crate::Error::Transport`] when
-///    a roster entry names a URI scheme this library serves no transport
+///    a roster entry names a URI scheme this library serves no stores.transport
 ///    for. All four are reported before any store mutation. Channels *not*
 ///    at canonical ids are recovery channels — wiped in step 5, never
 ///    flagged as collisions.
@@ -149,59 +152,27 @@ pub enum RestoreError {
 ///    every wiped channel still yields exactly one
 ///    [`DeRecEvent::Unpaired`].
 #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
-#[allow(clippy::too_many_arguments)]
-pub(in crate::protocol) async fn restore<
-    Ch: DeRecChannelStore,
-    Sh: DeRecShareStore,
-    Ss: DeRecSecretStore,
-    Us: DeRecUserSecretStore,
-    T: DeRecTransport,
-    St: DeRecStateStore,
->(
-    channel_store: &mut Ch,
-    share_store: &mut Sh,
-    secret_store: &mut Ss,
-    user_secret_store: &mut Us,
-    transport: &T,
-    state_store: &mut St,
-    secret_id: u64,
+pub(in crate::protocol) async fn restore<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
     secret: &Secret,
     recovered_version: u32,
 ) -> Result<Vec<DeRecEvent>> {
-    let (canonical_ids, existing_channels) =
-        check_preconditions(user_secret_store, channel_store, secret_id, secret).await?;
+    let (canonical_ids, existing_channels) = check_preconditions(stores, local, secret).await?;
 
-    write_helper_channels(
-        channel_store,
-        share_store,
-        secret_store,
-        secret_id,
-        &secret.helpers,
-        recovered_version,
-    )
-    .await?;
+    write_helper_channels(stores, local, &secret.helpers, recovered_version).await?;
 
     if let Some(group) = secret.replicas.as_ref().filter(|g| !g.members.is_empty()) {
-        write_replica_channels(channel_store, secret_store, secret_id, group).await?;
+        write_replica_channels(stores, local, group).await?;
     }
 
-    commit_snapshot(user_secret_store, secret_id, secret, recovered_version).await?;
+    commit_snapshot(stores, local, secret, recovered_version).await?;
 
-    let events = unpair_recovery_channels(
-        channel_store,
-        share_store,
-        secret_store,
-        transport,
-        state_store,
-        secret_id,
-        &existing_channels,
-        &canonical_ids,
-    )
-    .await;
+    let events = unpair_recovery_channels(stores, local, &existing_channels, &canonical_ids).await;
 
     #[cfg(feature = "logging")]
     tracing::info!(
-        secret_id,
+        local.secret_id,
         helpers_restored = secret.helpers.len(),
         replicas_restored = secret.replicas.as_ref().map_or(0, |g| g.members.len()),
         user_secrets_restored = secret.secrets.len(),
@@ -211,13 +182,17 @@ pub(in crate::protocol) async fn restore<
     Ok(events)
 }
 
-async fn check_preconditions<Ch: DeRecChannelStore, Us: DeRecUserSecretStore>(
-    user_secret_store: &Us,
-    channel_store: &Ch,
-    secret_id: u64,
+async fn check_preconditions<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
     secret: &Secret,
 ) -> Result<(HashSet<u64>, Vec<HelperChannel>)> {
-    if user_secret_store.load_latest(secret_id).await?.is_some() {
+    if stores
+        .user_secrets
+        .load_latest(local.secret_id)
+        .await?
+        .is_some()
+    {
         return Err(RestoreError::AlreadyRestored.into());
     }
 
@@ -268,7 +243,16 @@ async fn check_preconditions<Ch: DeRecChannelStore, Us: DeRecUserSecretStore>(
         .map(|h| h.channel_id)
         .chain(secret.replicas.as_ref().map(|g| g.channel_id))
         .collect();
-    let existing_channels = channel_store.helpers(secret_id).await?;
+    // Unfiltered deliberately: the caller partitions this listing, unpairing
+    // every channel `canonical_ids` does *not* name while this function
+    // rejects the ones it does. Narrowing either way loses the other half.
+    let existing_channels = stores
+        .channels
+        .helpers_matching(
+            local.secret_id,
+            crate::protocol::types::HelperFilter::default(),
+        )
+        .await?;
     let collisions: Vec<ChannelId> = existing_channels
         .iter()
         .filter(|c| canonical_ids.contains(&c.channel_id.0))
@@ -281,14 +265,13 @@ async fn check_preconditions<Ch: DeRecChannelStore, Us: DeRecUserSecretStore>(
     Ok((canonical_ids, existing_channels))
 }
 
-async fn write_helper_channels<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: DeRecSecretStore>(
-    channel_store: &mut Ch,
-    share_store: &mut Sh,
-    secret_store: &mut Ss,
-    secret_id: u64,
+async fn write_helper_channels<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
     helpers: &[HelperInfo],
     recovered_version: u32,
 ) -> Result<()> {
+    let secret_id = local.secret_id;
     for h in helpers {
         let cid = ChannelId(h.channel_id);
         let shared_key: SharedKey = h
@@ -296,7 +279,8 @@ async fn write_helper_channels<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: D
             .as_slice()
             .try_into()
             .map_err(|_| RestoreError::Invariant("helper.shared_key must be 32 bytes"))?;
-        channel_store
+        stores
+            .channels
             .save(
                 secret_id,
                 ChannelRecord::Helper(HelperChannel {
@@ -309,10 +293,12 @@ async fn write_helper_channels<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: D
                 }),
             )
             .await?;
-        secret_store
+        stores
+            .secrets
             .save(secret_id, cid, SecretValue::SharedKey(shared_key))
             .await?;
-        share_store
+        stores
+            .shares
             .save(
                 secret_id,
                 cid,
@@ -327,10 +313,9 @@ async fn write_helper_channels<Ch: DeRecChannelStore, Sh: DeRecShareStore, Ss: D
     Ok(())
 }
 
-async fn write_replica_channels<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
-    channel_store: &mut Ch,
-    secret_store: &mut Ss,
-    secret_id: u64,
+async fn write_replica_channels<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
     group: &Replicas,
 ) -> Result<()> {
     let group_key: SharedKey = group.shared_key.as_slice().try_into().map_err(|_| {
@@ -338,9 +323,10 @@ async fn write_replica_channels<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
     })?;
     let cid = ChannelId(group.channel_id);
     for r in &group.members {
-        channel_store
+        stores
+            .channels
             .save(
-                secret_id,
+                local.secret_id,
                 ChannelRecord::Replica(ReplicaMember {
                     channel_id: cid,
                     replica_id: crate::types::ReplicaId::try_from(r.replica_id)?,
@@ -356,21 +342,23 @@ async fn write_replica_channels<Ch: DeRecChannelStore, Ss: DeRecSecretStore>(
             .await?;
     }
     // One key at the one channel every member is addressed on.
-    secret_store
-        .save(secret_id, cid, SecretValue::SharedKey(group_key))
+    stores
+        .secrets
+        .save(local.secret_id, cid, SecretValue::SharedKey(group_key))
         .await?;
     Ok(())
 }
 
-async fn commit_snapshot<Us: DeRecUserSecretStore>(
-    user_secret_store: &mut Us,
-    secret_id: u64,
+async fn commit_snapshot<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
     secret: &Secret,
     recovered_version: u32,
 ) -> Result<()> {
-    user_secret_store
+    stores
+        .user_secrets
         .save_latest(
-            secret_id,
+            local.secret_id,
             UserSecrets {
                 version: recovered_version,
                 secrets: secret.secrets.clone(),
@@ -381,21 +369,9 @@ async fn commit_snapshot<Us: DeRecUserSecretStore>(
         .await?;
     Ok(())
 }
-
-#[allow(clippy::too_many_arguments)]
-async fn unpair_recovery_channels<
-    Ch: DeRecChannelStore,
-    Sh: DeRecShareStore,
-    Ss: DeRecSecretStore,
-    T: DeRecTransport,
-    St: DeRecStateStore,
->(
-    channel_store: &mut Ch,
-    share_store: &mut Sh,
-    secret_store: &mut Ss,
-    transport: &T,
-    state_store: &mut St,
-    secret_id: u64,
+async fn unpair_recovery_channels<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
     existing_channels: &[HelperChannel],
     canonical_ids: &HashSet<u64>,
 ) -> Vec<DeRecEvent> {
@@ -408,20 +384,20 @@ async fn unpair_recovery_channels<
         return Vec::new();
     }
     let now = now_secs();
+    let round = &crate::protocol::context::Round {
+        reply_to: &[],
+        trace_id: crate::derec_message::fresh_trace_id(),
+    };
     let mut events = Vec::new();
     for channel_id in recovery_ids {
         match super::unpairing::start(
-            channel_store,
-            share_store,
-            secret_store,
-            transport,
-            state_store,
-            secret_id,
+            stores,
+            local,
             channel_id,
             None,
             UnpairAck::NotRequired,
             now,
-            &[],
+            round,
         )
         .await
         {
@@ -431,15 +407,9 @@ async fn unpair_recovery_channels<
                     channel_id,
                     error: e.to_string(),
                 });
-                if super::unpairing::drop_channel_state(
-                    channel_store,
-                    share_store,
-                    secret_store,
-                    secret_id,
-                    channel_id,
-                )
-                .await
-                .is_ok()
+                if super::unpairing::drop_channel_state(stores, local, channel_id)
+                    .await
+                    .is_ok()
                 {
                     events.push(DeRecEvent::Unpaired { channel_id });
                 }
@@ -465,7 +435,7 @@ mod tests {
 
     use crate::protocol::test::{
         InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
-        InMemUserSecretStore, NoopTransport, run_async,
+        InMemUserSecretStore, NoopTransport, StoreRig, run_async,
     };
 
     type TestProto = crate::protocol::DeRecProtocol<
@@ -489,27 +459,24 @@ mod tests {
     }
 
     fn build_rig(secret_id: u64) -> TestRig {
-        let channel_store = InMemChannelStore::default();
-        let secret_store = InMemSecretStore::default();
-        let share_store = InMemShareStore::default();
-        let user_secret_store = InMemUserSecretStore::default();
+        let rig = StoreRig::new();
         let protocol = DeRecProtocolBuilder::new(secret_id)
-            .with_channel_store(channel_store.clone())
-            .with_share_store(share_store.clone())
-            .with_secret_store(secret_store.clone())
-            .with_user_secret_store(user_secret_store.clone())
+            .with_channel_store(rig.channels.clone())
+            .with_share_store(rig.shares.clone())
+            .with_secret_store(rig.secrets.clone())
+            .with_user_secret_store(rig.user_secrets.clone())
             .with_transport(NoopTransport)
             .with_state_store(InMemStateStore)
-            .with_own_transport("https://owner.example.com")
+            .with_own_transports(["https://owner.example.com"])
             .with_threshold(2)
             .build()
             .expect("test rig builds");
         TestRig {
             protocol,
-            channel_store,
-            secret_store,
-            share_store,
-            user_secret_store,
+            channel_store: rig.channels,
+            secret_store: rig.secrets,
+            share_store: rig.shares,
+            user_secret_store: rig.user_secrets,
         }
     }
 
@@ -912,23 +879,20 @@ mod tests {
     fn restore_succeeds_when_recovery_channel_unpair_cannot_be_delivered() {
         run_async(async {
             let secret_id: u64 = 0xDE_2EC;
-            let channel_store = InMemChannelStore::default();
-            let secret_store = InMemSecretStore::default();
-            let share_store = InMemShareStore::default();
-            let user_secret_store = InMemUserSecretStore::default();
+            let rig = StoreRig::new();
             let mut protocol = DeRecProtocolBuilder::new(secret_id)
-                .with_channel_store(channel_store.clone())
-                .with_share_store(share_store.clone())
-                .with_secret_store(secret_store.clone())
-                .with_user_secret_store(user_secret_store.clone())
+                .with_channel_store(rig.channels.clone())
+                .with_share_store(rig.shares.clone())
+                .with_secret_store(rig.secrets.clone())
+                .with_user_secret_store(rig.user_secrets.clone())
                 .with_transport(crate::protocol::test::FailingTransport)
                 .with_state_store(InMemStateStore)
-                .with_own_transport("https://owner.example.com")
+                .with_own_transports(["https://owner.example.com"])
                 .with_threshold(2)
                 .build()
                 .expect("test rig builds");
 
-            channel_store.helper_rows.lock().unwrap().insert(
+            rig.channels.helper_rows.lock().unwrap().insert(
                 (secret_id, 99),
                 HelperChannel {
                     channel_id: ChannelId(99),
@@ -942,7 +906,7 @@ mod tests {
                     peer_role: SenderKind::Helper,
                 },
             );
-            secret_store.data.lock().unwrap().insert(
+            rig.secrets.data.lock().unwrap().insert(
                 (secret_id, 99, SecretKind::SharedKey as u8),
                 SecretValue::SharedKey([0x77; 32]),
             );
@@ -967,7 +931,7 @@ mod tests {
             );
 
             assert!(
-                channel_store
+                rig.channels
                     .load(
                         secret_id,
                         ChannelQuery::Helper {
@@ -980,7 +944,7 @@ mod tests {
                 "the ephemeral channel must not survive a failed send"
             );
             assert!(
-                user_secret_store
+                rig.user_secrets
                     .load_latest(secret_id)
                     .await
                     .unwrap()
@@ -988,7 +952,7 @@ mod tests {
                 "the recovered snapshot stays committed"
             );
             assert!(
-                channel_store
+                rig.channels
                     .load(
                         secret_id,
                         ChannelQuery::Helper {
@@ -1135,7 +1099,7 @@ mod tests {
                 .with_user_secret_store(InMemUserSecretStore::default())
                 .with_transport(NoopTransport)
                 .with_state_store(InMemStateStore)
-                .with_own_transport("https://owner.example.com")
+                .with_own_transports(["https://owner.example.com"])
                 .with_threshold(2)
                 .with_replica_id(0x1234)
                 .build()

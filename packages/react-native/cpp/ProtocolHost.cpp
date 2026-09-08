@@ -320,9 +320,45 @@ jsi::Value ProtocolHost::get(jsi::Runtime& rt, const jsi::PropNameID& name) {
           DeRecProtocolHandle* handle = handle_;
 
           auto body = [handle, uri, protocol]() -> std::vector<uint8_t> {
+// This binding *is* the deprecated single-endpoint path, so it calls the
+// deprecated export on purpose — the same reason the Rust side carries
+// `#[allow(deprecated)]` on its compatibility paths. Both go at 0.0.5.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
             DeRecError error = derec_protocol_set_own_transport(
                 handle, reinterpret_cast<const uint8_t*>(uri.data()), uri.size(),
                 protocol);
+#pragma GCC diagnostic pop
+            if (error.code != DEREC_CODE_OK) {
+              throw FfiFailure(error);
+            }
+            return {};
+          };
+          auto convert = [](jsi::Runtime&, std::vector<uint8_t>&) {
+            return jsi::Value::undefined();
+          };
+          return runAsync(rt2, std::move(body), std::move(convert));
+        });
+  }
+
+  // Takes the endpoint list already JSON-encoded, the same way
+  // `setCommunicationInfo` takes its map: the FFI parses JSON on the other
+  // side, so encoding in JavaScript keeps this bridge free of a shape it
+  // would otherwise have to marshal field by field.
+  if (prop == "setOwnTransports") {
+    return jsi::Function::createFromHostFunction(
+        rt, name, 1,
+        [this](jsi::Runtime& rt2, const jsi::Value&, const jsi::Value* args,
+               size_t count) -> jsi::Value {
+          requireArgs(rt2, "setOwnTransports", count, 1);
+          ByteView view = asBytes(rt2, args[0]);
+          std::vector<uint8_t> transports(view.ptr, view.ptr + view.len);
+          DeRecProtocolHandle* handle = handle_;
+
+          auto body = [handle,
+                       transports = std::move(transports)]() -> std::vector<uint8_t> {
+            DeRecError error = derec_protocol_set_own_transports(
+                handle, transports.data(), transports.size());
             if (error.code != DEREC_CODE_OK) {
               throw FfiFailure(error);
             }
@@ -597,6 +633,7 @@ jsi::Value ProtocolHost::get(jsi::Runtime& rt, const jsi::PropNameID& name) {
 std::vector<jsi::PropNameID> ProtocolHost::getPropertyNames(jsi::Runtime& rt) {
   const char* names[] = {
       "secretId",       "setCommunicationInfo",  "setOwnTransport",
+      "setOwnTransports",
       "createContact",  "start",                 "process",
       "tick",           "accept",                "reject",
       "getFingerprint", "verifyFingerprint",     "removeExpiredChannels",

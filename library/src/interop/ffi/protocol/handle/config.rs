@@ -56,10 +56,17 @@ pub unsafe extern "C" fn derec_protocol_set_communication_info(
     success()
 }
 
-/// Replace this node's local transport endpoint. See
-/// [`crate::protocol::DeRecProtocol::set_own_transport`] for the
-/// changeover discipline (keep the old endpoint up during the
-/// transition).
+/// Replace this node's endpoint **for one protocol**, leaving the others
+/// alone. A node serves at most one endpoint per protocol, so the `(uri,
+/// protocol)` pair identifies the entry it replaces; an entry for a protocol
+/// not yet served is appended, and a replaced one keeps its position in the
+/// preference order. See
+/// [`crate::protocol::DeRecProtocol::set_own_transport`] for the changeover
+/// discipline (keep the old endpoint up during the transition).
+///
+/// Superseded by [`derec_protocol_set_own_transports`], which takes the
+/// whole preference list and is the only way to change *which* protocols
+/// this node serves, or their order.
 ///
 /// # Safety
 ///
@@ -72,6 +79,11 @@ pub unsafe extern "C" fn derec_protocol_set_communication_info(
 /// from different threads are safe: the handle's internal mutex
 /// serializes them.
 #[unsafe(no_mangle)]
+#[deprecated(
+    since = "0.0.3",
+    note = "use derec_protocol_set_own_transports, which takes the whole \
+            preference list; removed at 0.0.5"
+)]
 pub unsafe extern "C" fn derec_protocol_set_own_transport(
     handle: *mut DeRecProtocolHandle,
     uri_ptr: *const u8,
@@ -101,10 +113,75 @@ pub unsafe extern "C" fn derec_protocol_set_own_transport(
     };
     let h = unsafe { &*handle };
     let mut inner = h.lock_inner();
-    match inner.set_own_transport(validated_tp) {
+    match inner.set_own_transports([validated_tp]) {
         Ok(()) => success(),
         Err(e) => crate::interop::ffi::error::from_lib_error(e),
     }
+}
+
+/// Replace every endpoint this node advertises, in preference order.
+///
+/// The runtime counterpart to the `own_transports` array accepted by
+/// [`super::derec_protocol_new`], and the way to change the whole set:
+/// `derec_protocol_set_own_transport` replaces only the entry for the
+/// protocol its URI names. A device serves at most one endpoint per
+/// protocol, so this list is a preference order over distinct protocols and
+/// two entries of the same protocol are rejected. Body is the same JSON
+/// shape that config array uses — `[{"uri": "...", "protocol": 0}, ...]`.
+///
+/// Every entry is validated before any is stored, so a malformed URI
+/// leaves the previous set intact rather than half-applied.
+///
+/// # Safety
+///
+/// `handle` must be a valid pointer returned by
+/// [`super::derec_protocol_new`]. `json_ptr`/`json_len` must describe a
+/// readable byte range. Concurrent calls on the same handle from
+/// different threads are safe: the handle's internal mutex serializes
+/// them.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn derec_protocol_set_own_transports(
+    handle: *mut DeRecProtocolHandle,
+    json_ptr: *const u8,
+    json_len: usize,
+) -> DeRecError {
+    if handle.is_null() {
+        return ffi_error(DEREC_CODE_FFI_NULL_PTR, "handle is null");
+    }
+    if json_len == 0 || json_ptr.is_null() {
+        return ffi_error(DEREC_CODE_FFI_NULL_PTR, "json_ptr null or len == 0");
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(json_ptr, json_len) };
+    let entries: Vec<OwnTransportEntry> = match serde_json::from_slice(bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            return ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                format!("invalid own_transports JSON: {e}"),
+            );
+        }
+    };
+    let mut validated = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match super::validate_transport(&entry.uri, entry.protocol) {
+            Ok(tp) => validated.push(tp),
+            Err(e) => return e,
+        }
+    }
+    let h = unsafe { &*handle };
+    let mut inner = h.lock_inner();
+    match inner.set_own_transports(validated) {
+        Ok(()) => success(),
+        Err(e) => from_lib_error(e),
+    }
+}
+
+/// One entry of the array [`derec_protocol_set_own_transports`] accepts.
+/// Same `{uri, protocol}` shape as the `own_transports` config array.
+#[derive(serde::Deserialize)]
+struct OwnTransportEntry {
+    uri: String,
+    protocol: i32,
 }
 
 /// Result type for [`derec_protocol_remove_expired_channels`].

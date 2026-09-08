@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use crate::extensions::transport_protocol::TransportProtocolExt as _;
 use crate::primitives::sharing::SharingError;
-use crate::transport::TransportProtocolExt as _;
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     types::{ChannelId, SharedKey},

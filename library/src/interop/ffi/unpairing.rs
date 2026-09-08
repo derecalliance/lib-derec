@@ -106,7 +106,7 @@ pub extern "C" fn produce_unpair_request_message(
         &shared_key,
         &reply_to,
         // Helper path. Replica-group removal is orchestrated through the
-        // `RemoveReplica` flow, which names the departing member itself.
+        // `UnpairReplica` flow, which names the departing member itself.
         None,
     ) {
         Ok(r) => ProduceUnpairRequestMessageResult {

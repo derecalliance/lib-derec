@@ -2,10 +2,11 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 use derec_library::protocol::types::{
-    ChannelRecord, HelperChannel, PairingKeyMaterial, ReplicaMember, UserSecret, UserSecrets,
+    ChannelRecord, ChannelStatus, HelperChannel, PairingKeyMaterial, ReplicaMember, ReplicaRole,
+    UserSecret, UserSecrets,
 };
 use derec_library::protocol::{SecretKind, SecretValue};
-use derec_proto::ContactMessage;
+use derec_proto::{ContactMessage, SenderKind};
 use prost::Message;
 
 pub fn encode_channel(record: &ChannelRecord) -> Vec<u8> {
@@ -109,4 +110,29 @@ pub fn assemble_user_secrets(
         secrets: decode_user_secrets_payload(&payload),
         replicas: None,
     }
+}
+
+/// Integer tags for the two enums projected into indexed columns.
+///
+/// The mapping is this store's own, not the library's — nothing on the wire
+/// depends on it. It only has to stay stable against the rows already written,
+/// which is why the values are spelled out rather than derived from the
+/// variant order.
+pub fn channel_status_tag(status: ChannelStatus) -> i64 {
+    match status {
+        ChannelStatus::Pending => 0,
+        ChannelStatus::Paired => 1,
+        ChannelStatus::Unpairing => 2,
+    }
+}
+
+pub fn replica_role_tag(role: ReplicaRole) -> i64 {
+    match role {
+        ReplicaRole::Source => 0,
+        ReplicaRole::Destination => 1,
+    }
+}
+
+pub fn sender_kind_tag(kind: SenderKind) -> i64 {
+    kind as i64
 }

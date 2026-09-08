@@ -3,11 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-
-// TODO: changes made:
-//   1. moved secretId right above version for Consistency
-//   2. accomodated field indexes acccording to point 1
-
 syntax = "proto3";
 
 import "google/protobuf/timestamp.proto";

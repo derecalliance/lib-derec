@@ -105,7 +105,8 @@ public sealed class DeRecProtocol : IDisposable
         ulong? replicaId = null,
         Timeouts? timeouts = null,
         bool? unsafeHttp = null,
-        bool? unsafeConnection = null)
+        bool? unsafeConnection = null,
+        ParameterRange? parameterRange = null)
     {
         SecretId = secretId;
         _channelStore = channelStore;
@@ -254,7 +255,20 @@ public sealed class DeRecProtocol : IDisposable
                             TimeoutInSecs: timeouts.ExpiredChannels.TimeoutInSecs)),
             UnsafeHttp: unsafeHttp,
             UnsafeConnection: unsafeConnection,
-            ReplicaId: replicaId?.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            ReplicaId: replicaId?.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            ParameterRange: parameterRange is null
+                ? null
+                : new ParameterRangeDto(
+                    MinShareSize: parameterRange.MinShareSize,
+                    MaxShareSize: parameterRange.MaxShareSize,
+                    MinTimeBetweenVerifications: parameterRange.MinTimeBetweenVerifications,
+                    MaxTimeBetweenVerifications: parameterRange.MaxTimeBetweenVerifications,
+                    MinTimeBetweenShareUpdates: parameterRange.MinTimeBetweenShareUpdates,
+                    MaxTimeBetweenShareUpdates: parameterRange.MaxTimeBetweenShareUpdates,
+                    MinUnresponsiveDeletionTimeout: parameterRange.MinUnresponsiveDeletionTimeout,
+                    MaxUnresponsiveDeletionTimeout: parameterRange.MaxUnresponsiveDeletionTimeout,
+                    MinUnresponsiveDeactivationTimeout: parameterRange.MinUnresponsiveDeactivationTimeout,
+                    MaxUnresponsiveDeactivationTimeout: parameterRange.MaxUnresponsiveDeactivationTimeout));
         byte[] configJsonBytes = JsonSerializer.SerializeToUtf8Bytes(config, JsonOpts);
 
         var result = NP.derec_protocol_new(
@@ -464,27 +478,6 @@ public sealed class DeRecProtocol : IDisposable
     }
 
     /// <summary>
-    /// Drive <see cref="ProcessAsync"/> and auto-<see cref="AcceptAsync"/>
-    /// every <see cref="ActionRequiredEvent"/> the protocol emits, then
-    /// return the flat list of events. Mirrors the JS smoke's
-    /// <c>processAll</c> helper.
-    /// </summary>
-    public async Task<IReadOnlyList<DeRecEvent>> ProcessAndAcceptAllAsync(byte[] message)
-    {
-        var initial = await ProcessAsync(message);
-        var combined = new List<DeRecEvent>(initial);
-        foreach (var ev in initial)
-        {
-            if (ev is ActionRequiredEvent ar)
-            {
-                var follow = await AcceptAsync(ar.Action);
-                combined.AddRange(follow);
-            }
-        }
-        return combined;
-    }
-
-    /// <summary>
     /// Process an inbound envelope. Returns every <see cref="DeRecEvent"/>
     /// the orchestrator emits while handling it.
     /// </summary>
@@ -600,10 +593,50 @@ public sealed class DeRecProtocol : IDisposable
     }
 
     /// <summary>
-    /// Replace this node's local transport endpoint. IMPORTANT: keep
-    /// the old endpoint operational during the changeover (see the Rust
-    /// docs on the matching setter for the discipline).
+    /// Replace every endpoint this node advertises, in preference order —
+    /// the runtime counterpart to the <c>ownTransports</c> constructor
+    /// argument, and the way to change the whole set
+    /// (<see cref="SetOwnTransport"/> replaces only the entry for the
+    /// protocol its URI names).
+    ///
+    /// A node serves at most one endpoint per protocol, so this list is a
+    /// preference order over distinct protocols. Two entries of the same
+    /// protocol are rejected.
     /// </summary>
+    /// <remarks>
+    /// Every entry is validated before any is stored, so a malformed URI
+    /// leaves the previous set intact. An empty list is rejected. IMPORTANT:
+    /// keep the old endpoints operational during the changeover (see the
+    /// Rust docs on the matching setter for the discipline).
+    /// </remarks>
+    public void SetOwnTransports(IReadOnlyList<TransportProtocol> transports)
+    {
+        EnsureNotDisposed();
+        ArgumentNullException.ThrowIfNull(transports);
+        if (transports.Count == 0)
+        {
+            throw new ArgumentException("own transports must not be empty", nameof(transports));
+        }
+        var dto = transports.Select(t => new TransportOfferDto(t.Uri, (int)t.Protocol)).ToList();
+        byte[] json = JsonSerializer.SerializeToUtf8Bytes(dto, JsonOpts);
+        var err = NP.derec_protocol_set_own_transports(_handle, json, (UIntPtr)json.Length);
+        ThrowOnError(err);
+    }
+
+    /// <summary>
+    /// Replace this node's endpoint for one protocol, leaving the others
+    /// alone. A node serves at most one endpoint per protocol, so the
+    /// <c>(uri, protocol)</c> pair identifies the entry it replaces; an
+    /// entry for a protocol not yet served is appended, and a replaced one
+    /// keeps its position in the preference order. Use
+    /// <see cref="SetOwnTransports"/> to change which protocols this node
+    /// serves, or their order. IMPORTANT: keep the old endpoint operational
+    /// during the changeover (see the Rust docs on the matching setter for
+    /// the discipline).
+    /// </summary>
+    [Obsolete("Use SetOwnTransports, which takes the whole preference list. " +
+              "SetOwnTransports(new[] { new TransportProtocol(uri, protocol) }) is the " +
+              "direct replacement. Removed at 0.0.5.")]
     public void SetOwnTransport(string uri, string protocol = "https")
     {
         EnsureNotDisposed();
@@ -752,12 +785,16 @@ public sealed class DeRecProtocol : IDisposable
         }
     }
 
-    private int ChannelListHelpersImpl(IntPtr userData, ulong secretId, out IntPtr outPtr, out UIntPtr outLen)
+    private int ChannelListHelpersImpl(
+        IntPtr userData, ulong secretId, IntPtr filter, UIntPtr filterLen,
+        out IntPtr outPtr, out UIntPtr outLen)
     {
         try
         {
+            var f = ReadFilter<Primitives.Pairing.SenderKind>(filter, filterLen);
             var dtos = new List<HelperChannelDto>();
-            foreach (var h in _channelStore.ListHelpers(secretId))
+            foreach (var h in _channelStore.ListHelpers(
+                         secretId, new HelperFilter(f.Ids, f.Status, f.Role, f.Exclude)))
                 dtos.Add(ToDto(h));
             byte[] json = JsonSerializer.SerializeToUtf8Bytes(dtos, JsonOpts);
             return WriteOut(json, out outPtr, out outLen);
@@ -770,12 +807,16 @@ public sealed class DeRecProtocol : IDisposable
         }
     }
 
-    private int ChannelListReplicasImpl(IntPtr userData, ulong secretId, out IntPtr outPtr, out UIntPtr outLen)
+    private int ChannelListReplicasImpl(
+        IntPtr userData, ulong secretId, IntPtr filter, UIntPtr filterLen,
+        out IntPtr outPtr, out UIntPtr outLen)
     {
         try
         {
+            var f = ReadFilter<ReplicaRole>(filter, filterLen);
             var dtos = new List<ReplicaMemberDto>();
-            foreach (var m in _channelStore.ListReplicas(secretId))
+            foreach (var m in _channelStore.ListReplicas(
+                         secretId, new ReplicaFilter(f.Ids, f.Status, f.Role, f.Exclude)))
                 dtos.Add(ToDto(m));
             byte[] json = JsonSerializer.SerializeToUtf8Bytes(dtos, JsonOpts);
             return WriteOut(json, out outPtr, out outLen);
@@ -786,6 +827,47 @@ public sealed class DeRecProtocol : IDisposable
             outLen = UIntPtr.Zero;
             return -1;
         }
+    }
+
+    /// <summary>
+    /// Decode the listing filter the native side passed as JSON. An absent or
+    /// empty buffer is an unrestricted filter, not an error.
+    /// </summary>
+    /// <remarks>
+    /// Statuses and the role cross as Rust variant names, matching how the
+    /// same two enums travel on <see cref="HelperChannel"/> and
+    /// <see cref="ReplicaMember"/>.
+    /// </remarks>
+    private static (IReadOnlyList<ulong> Ids, IReadOnlyList<ChannelStatus> Status, TRole? Role,
+                    IReadOnlyList<ulong> Exclude)
+        ReadFilter<TRole>(IntPtr filter, UIntPtr filterLen)
+        where TRole : struct, Enum
+    {
+        var empty = (
+            (IReadOnlyList<ulong>)Array.Empty<ulong>(),
+            (IReadOnlyList<ChannelStatus>)Array.Empty<ChannelStatus>(),
+            (TRole?)null,
+            (IReadOnlyList<ulong>)Array.Empty<ulong>());
+        if (filter == IntPtr.Zero || (ulong)filterLen == 0)
+            return empty;
+
+        var bytes = new byte[(int)filterLen];
+        Marshal.Copy(filter, bytes, 0, bytes.Length);
+        var dto = JsonSerializer.Deserialize<ChannelFilterDto>(bytes, JsonOpts);
+        if (dto is null)
+            return empty;
+
+        var status = (dto.status ?? new List<string>())
+            .Select(Enum.Parse<ChannelStatus>)
+            .ToList();
+        TRole? role = dto.role is null ? null : Enum.Parse<TRole>(dto.role);
+
+        static IReadOnlyList<ulong> ids(List<string>? raw) =>
+            (raw ?? new List<string>())
+                .Select(v => ulong.Parse(v, System.Globalization.CultureInfo.InvariantCulture))
+                .ToList();
+
+        return (ids(dto.ids), status, role, ids(dto.exclude));
     }
 
     private int ChannelLinkImpl(IntPtr userData, ulong secretId, ulong a, ulong b)
@@ -1241,6 +1323,20 @@ public sealed class DeRecProtocol : IDisposable
         string? status,
         ulong created_at);
 
+    /// <summary>
+    /// Wire shape of a listing filter. Field names and the null/empty
+    /// conventions match the Rust <c>ChannelFilter</c> exactly.
+    /// </summary>
+    /// <remarks>
+    /// Ids are decimal strings, not numbers: the same JSON reaches the React
+    /// Native bridge, where `JSON.parse` cannot hold a u64.
+    /// </remarks>
+    private sealed record ChannelFilterDto(
+        List<string>? ids,
+        List<string>? status,
+        string? role,
+        List<string>? exclude);
+
     private sealed record ChannelRecordDto(
         HelperChannelDto? Helper,
         ReplicaMemberDto? Replica);
@@ -1271,7 +1367,23 @@ public sealed class DeRecProtocol : IDisposable
         [property: JsonPropertyName("timeouts")] TimeoutsConfigDto? Timeouts,
         [property: JsonPropertyName("unsafe_http")] bool? UnsafeHttp,
         [property: JsonPropertyName("unsafe_connection")] bool? UnsafeConnection,
-        [property: JsonPropertyName("replica_id")] string? ReplicaId);
+        [property: JsonPropertyName("replica_id")] string? ReplicaId,
+        [property: JsonPropertyName("parameter_range")] ParameterRangeDto? ParameterRange);
+
+    // Field-for-field equivalent of Rust `ParameterRangeConfig`. Every bound
+    // is optional and defaults to 0, which the proto reads as "no constraint
+    // on this dimension".
+    private sealed record ParameterRangeDto(
+        [property: JsonPropertyName("min_share_size")] long MinShareSize,
+        [property: JsonPropertyName("max_share_size")] long MaxShareSize,
+        [property: JsonPropertyName("min_time_between_verifications")] long MinTimeBetweenVerifications,
+        [property: JsonPropertyName("max_time_between_verifications")] long MaxTimeBetweenVerifications,
+        [property: JsonPropertyName("min_time_between_share_updates")] long MinTimeBetweenShareUpdates,
+        [property: JsonPropertyName("max_time_between_share_updates")] long MaxTimeBetweenShareUpdates,
+        [property: JsonPropertyName("min_unresponsive_deletion_timeout")] long MinUnresponsiveDeletionTimeout,
+        [property: JsonPropertyName("max_unresponsive_deletion_timeout")] long MaxUnresponsiveDeletionTimeout,
+        [property: JsonPropertyName("min_unresponsive_deactivation_timeout")] long MinUnresponsiveDeactivationTimeout,
+        [property: JsonPropertyName("max_unresponsive_deactivation_timeout")] long MaxUnresponsiveDeactivationTimeout);
 
     // One entry of `ProtocolConfigDto.OwnTransports`. Field-for-field
     // equivalent of Rust `OwnTransportConfig` — `Protocol` is the

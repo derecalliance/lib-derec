@@ -8,6 +8,12 @@ usize_is_size_t = true
 prefix = ""
 include = []
 
+# Carry Rust `#[deprecated]` through to the C header, so a C/ObjC/C++ consumer
+# gets a compiler warning rather than only a comment they may not read.
+[fn]
+deprecated = "__attribute__((deprecated))"
+deprecated_with_note = "__attribute__((deprecated({})))"
+
 [parse]
 parse_deps = false
 

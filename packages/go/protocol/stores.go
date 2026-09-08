@@ -58,6 +58,13 @@ type (
 	TransportEndpoint = native.TransportEndpoint
 	// ChannelStatus is a channel's lifecycle status.
 	ChannelStatus = native.ChannelStatus
+	// ChannelFilter carries the id and status restrictions shared by the
+	// two listing filters.
+	ChannelFilter = native.ChannelFilter
+	// HelperFilter narrows ChannelStore.ListHelpers.
+	HelperFilter = native.HelperFilter
+	// ReplicaFilter narrows ChannelStore.ListReplicas.
+	ReplicaFilter = native.ReplicaFilter
 	// SenderKind identifies the role a node holds on a Channel.
 	SenderKind = native.SenderKind
 	// SecretKind selects which kind of secret material a SecretValue
@@ -99,11 +106,11 @@ const (
 	SecretKindPairingSecret  = native.SecretKindPairingSecret
 	SecretKindPairingContact = native.SecretKindPairingContact
 
-	StateKindPendingVerification = native.StateKindPendingVerification
-	StateKindPendingRecovery     = native.StateKindPendingRecovery
-	StateKindPendingUnpair       = native.StateKindPendingUnpair
-	StateKindSharingRound        = native.StateKindSharingRound
-	StateKindPendingSyncCheck    = native.StateKindPendingSyncCheck
+	StateKindPendingVerification     = native.StateKindPendingVerification
+	StateKindPendingRecovery         = native.StateKindPendingRecovery
+	StateKindPendingUnpair           = native.StateKindPendingUnpair
+	StateKindSharingRound            = native.StateKindSharingRound
+	StateKindPendingReplicaDiscovery = native.StateKindPendingReplicaDiscovery
 )
 
 // ChannelStore persists channel records plus the channel-link graph used to
@@ -136,10 +143,21 @@ type ChannelStore interface {
 	// Returns whether an entry actually existed; removing a missing
 	// entry is not an error.
 	Remove(secretID, channelID, replicaID uint64) (existed bool, err error)
-	// ListHelpers returns every helper channel stored under secretID.
-	ListHelpers(secretID uint64) ([]HelperChannel, error)
-	// ListReplicas returns every replica-group member stored under
-	// secretID, including this device's own row.
+	// ListHelpers returns the helper channels stored under secretID that
+	// filter selects.
+	//
+	// The filter addresses records by HelperChannel.ChannelID, and its Role
+	// is the peer's HelperChannel.PeerRole. A zero HelperFilter selects
+	// every channel. Apply it in your query; the library re-applies it to
+	// whatever you return, so ignoring it is slow, not wrong.
+	ListHelpers(secretID uint64, filter HelperFilter) ([]HelperChannel, error)
+	// ListReplicas returns the replica-group members stored under secretID
+	// that filter selects, including this device's own row unless the
+	// filter excludes it.
+	//
+	// The filter addresses records by ReplicaMember.ReplicaID, and its Role
+	// is ReplicaMember.Role. A zero ReplicaFilter selects every member. Apply
+	// it in your query; the library re-applies it to whatever you return.
 	//
 	// The order is significant in exactly one situation. A group has one
 	// member holding the Source role; when it is removed, the protocol
@@ -154,7 +172,7 @@ type ChannelStore interface {
 	// to the storage — note that a SQL SELECT without ORDER BY and Go map
 	// iteration are both arbitrary. Order explicitly to make succession
 	// predictable.
-	ListReplicas(secretID uint64) ([]ReplicaMember, error)
+	ListReplicas(secretID uint64, filter ReplicaFilter) ([]ReplicaMember, error)
 	// LinkChannel records a as belonging to the same Owner identity as
 	// b (and vice versa) — a symmetric relation.
 	LinkChannel(secretID, a, b uint64) error

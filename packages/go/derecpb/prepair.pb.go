@@ -86,14 +86,52 @@ type PrePairRequestMessage struct {
 	Nonce uint64 `protobuf:"varint,1,opt,name=nonce,proto3" json:"nonce,omitempty"`
 	// Transport endpoint at which the sender expects to receive the
 	// `PrePairResponseMessage`.
+	//
+	// Deprecated: superseded by `supportedTransports`, which carries every
+	// endpoint rather than one. Kept so implementations predating that field
+	// still receive a reply. **Scheduled for removal in v0.0.5.** A sender
+	// populating `supportedTransports` MUST also set this to a single
+	// best-compatibility choice until then.
+	//
+	// Deprecated: Marked as deprecated in prepair.proto.
 	TransportProtocol *TransportProtocol `protobuf:"bytes,2,opt,name=transportProtocol,proto3" json:"transportProtocol,omitempty"`
 	// Timestamp indicating when this message was created.
 	//
 	// This value is expressed in UTC and is used for envelope-vs-body
 	// timestamp validation, replay detection, and observability.
-	Timestamp     *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Timestamp *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	// Every transport endpoint the sender of this PrePair request can be
+	// reached on for the `PrePairResponseMessage`.
+	//
+	// Each entry is a complete endpoint: a URI plus the protocol that says
+	// how to interpret it. The list is written in the sender's own
+	// preference order.
+	//
+	// # Selection is the recipient's
+	//
+	// A recipient picks whichever entry suits it, ordered by its **own**
+	// preference rather than the sender's. The order here expresses
+	// availability, not a ranking the recipient must honor.
+	//
+	// # Compatibility
+	//
+	// Absent means "only `transportProtocol` is offered", which is how every
+	// implementation predating this field behaves. A sender populating this
+	// list MUST also set `transportProtocol` to a single best-compatibility
+	// choice so those implementations still reply.
+	//
+	// At least one of the two MUST be present: a request naming no endpoint
+	// gives the recipient nowhere to send the response.
+	//
+	// # Security
+	//
+	// PrePair traffic is plaintext — no shared key exists yet — so these
+	// endpoints are visible to a passive observer, exactly as
+	// `transportProtocol` already was. The recipient's transport policy still
+	// refuses plaintext entries unless plaintext has been opted into.
+	SupportedTransports []*TransportProtocol `protobuf:"bytes,4,rep,name=supportedTransports,proto3" json:"supportedTransports,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *PrePairRequestMessage) Reset() {
@@ -133,6 +171,7 @@ func (x *PrePairRequestMessage) GetNonce() uint64 {
 	return 0
 }
 
+// Deprecated: Marked as deprecated in prepair.proto.
 func (x *PrePairRequestMessage) GetTransportProtocol() *TransportProtocol {
 	if x != nil {
 		return x.TransportProtocol
@@ -143,6 +182,13 @@ func (x *PrePairRequestMessage) GetTransportProtocol() *TransportProtocol {
 func (x *PrePairRequestMessage) GetTimestamp() *timestamppb.Timestamp {
 	if x != nil {
 		return x.Timestamp
+	}
+	return nil
+}
+
+func (x *PrePairRequestMessage) GetSupportedTransports() []*TransportProtocol {
+	if x != nil {
+		return x.SupportedTransports
 	}
 	return nil
 }
@@ -261,11 +307,12 @@ var File_prepair_proto protoreflect.FileDescriptor
 
 const file_prepair_proto_rawDesc = "" +
 	"\n" +
-	"\rprepair.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\xca\x01\n" +
+	"\rprepair.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\xb5\x02\n" +
 	"\x15PrePairRequestMessage\x12\x14\n" +
-	"\x05nonce\x18\x01 \x01(\x04R\x05nonce\x12a\n" +
-	"\x11transportProtocol\x18\x02 \x01(\v23.org.derecalliance.derec.protobuf.TransportProtocolR\x11transportProtocol\x128\n" +
-	"\ttimestamp\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\"\xc4\x02\n" +
+	"\x05nonce\x18\x01 \x01(\x04R\x05nonce\x12e\n" +
+	"\x11transportProtocol\x18\x02 \x01(\v23.org.derecalliance.derec.protobuf.TransportProtocolB\x02\x18\x01R\x11transportProtocol\x128\n" +
+	"\ttimestamp\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12e\n" +
+	"\x13supportedTransports\x18\x04 \x03(\v23.org.derecalliance.derec.protobuf.TransportProtocolR\x13supportedTransports\"\xc4\x02\n" +
 	"\x16PrePairResponseMessage\x12E\n" +
 	"\x06result\x18\x01 \x01(\v2-.org.derecalliance.derec.protobuf.DeRecResultR\x06result\x129\n" +
 	"\x15mlkemEncapsulationKey\x18\x02 \x01(\fH\x00R\x15mlkemEncapsulationKey\x88\x01\x01\x12+\n" +
@@ -298,13 +345,14 @@ var file_prepair_proto_goTypes = []any{
 var file_prepair_proto_depIdxs = []int32{
 	2, // 0: org.derecalliance.derec.protobuf.PrePairRequestMessage.transportProtocol:type_name -> org.derecalliance.derec.protobuf.TransportProtocol
 	3, // 1: org.derecalliance.derec.protobuf.PrePairRequestMessage.timestamp:type_name -> google.protobuf.Timestamp
-	4, // 2: org.derecalliance.derec.protobuf.PrePairResponseMessage.result:type_name -> org.derecalliance.derec.protobuf.DeRecResult
-	3, // 3: org.derecalliance.derec.protobuf.PrePairResponseMessage.timestamp:type_name -> google.protobuf.Timestamp
-	4, // [4:4] is the sub-list for method output_type
-	4, // [4:4] is the sub-list for method input_type
-	4, // [4:4] is the sub-list for extension type_name
-	4, // [4:4] is the sub-list for extension extendee
-	0, // [0:4] is the sub-list for field type_name
+	2, // 2: org.derecalliance.derec.protobuf.PrePairRequestMessage.supportedTransports:type_name -> org.derecalliance.derec.protobuf.TransportProtocol
+	4, // 3: org.derecalliance.derec.protobuf.PrePairResponseMessage.result:type_name -> org.derecalliance.derec.protobuf.DeRecResult
+	3, // 4: org.derecalliance.derec.protobuf.PrePairResponseMessage.timestamp:type_name -> google.protobuf.Timestamp
+	5, // [5:5] is the sub-list for method output_type
+	5, // [5:5] is the sub-list for method input_type
+	5, // [5:5] is the sub-list for extension type_name
+	5, // [5:5] is the sub-list for extension extendee
+	0, // [0:5] is the sub-list for field type_name
 }
 
 func init() { file_prepair_proto_init() }

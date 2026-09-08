@@ -86,10 +86,10 @@ type GetShareRequestMessage struct {
 	// the response to *this exchange*, overriding the channel's stored peer
 	// endpoint for this round-trip only.
 	//
-	// See `StoreShareRequestMessage.replyTo` for full semantics. Absent =
+	// See `StoreShareRequestMessage.replyTo` for full semantics. Empty =
 	// route to the stored channel endpoint; Present = route this response
 	// here without persisting the endpoint.
-	ReplyTo *TransportProtocol `protobuf:"bytes,4,opt,name=replyTo,proto3,oneof" json:"replyTo,omitempty"`
+	ReplyTo []*TransportProtocol `protobuf:"bytes,4,rep,name=replyTo,proto3" json:"replyTo,omitempty"`
 	// Identity of the replica-group member this message concerns.
 	//
 	// Present **only** on the replica path, where a member drives catch-up
@@ -155,7 +155,7 @@ func (x *GetShareRequestMessage) GetTimestamp() *timestamppb.Timestamp {
 	return nil
 }
 
-func (x *GetShareRequestMessage) GetReplyTo() *TransportProtocol {
+func (x *GetShareRequestMessage) GetReplyTo() []*TransportProtocol {
 	if x != nil {
 		return x.ReplyTo
 	}
@@ -339,15 +339,13 @@ var File_getshare_proto protoreflect.FileDescriptor
 
 const file_getshare_proto_rawDesc = "" +
 	"\n" +
-	"\x0egetshare.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\x99\x02\n" +
+	"\x0egetshare.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\x88\x02\n" +
 	"\x16GetShareRequestMessage\x12\x1a\n" +
 	"\bsecretId\x18\x01 \x01(\x04R\bsecretId\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\rR\aversion\x128\n" +
-	"\ttimestamp\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12R\n" +
-	"\areplyTo\x18\x04 \x01(\v23.org.derecalliance.derec.protobuf.TransportProtocolH\x00R\areplyTo\x88\x01\x01\x12!\n" +
-	"\treplicaId\x18\x05 \x01(\x04H\x01R\treplicaId\x88\x01\x01B\n" +
-	"\n" +
-	"\b_replyToB\f\n" +
+	"\ttimestamp\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12M\n" +
+	"\areplyTo\x18\x04 \x03(\v23.org.derecalliance.derec.protobuf.TransportProtocolR\areplyTo\x12!\n" +
+	"\treplicaId\x18\x05 \x01(\x04H\x00R\treplicaId\x88\x01\x01B\f\n" +
 	"\n" +
 	"_replicaId\"\xdb\x02\n" +
 	"\x17GetShareResponseMessage\x12E\n" +

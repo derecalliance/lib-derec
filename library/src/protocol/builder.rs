@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-//! Typestate builder for [`DeRecProtocol`]. See [`DeRecProtocolBuilder`].
+//! Typestate builder for [`DeRecProtocol`]. See [`DeRecProtocolBuilder`](crate::protocol::DeRecProtocolBuilder).
 //!
 //! Each store/transport slot is tracked by its own type parameter, starting
 //! at [`BuilderSlotMissingMarker`] and transitioning to
 //! [`BuilderSlotSetMarker<T>`] when its `with_*` setter runs. Setters only
 //! touch their own slot, which is what makes call order irrelevant.
-//! [`DeRecProtocolBuilder::build`] is reachable only when every slot has
+//! [`DeRecProtocolBuilder::build`](crate::protocol::DeRecProtocolBuilder::build) is reachable only when every slot has
 //! reached [`BuilderSlotSetMarker<_>`].
 
 use std::collections::HashMap;
@@ -24,13 +24,13 @@ pub struct BuilderSlotMissingMarker;
 pub struct BuilderSlotSetMarker<T>(T);
 
 /// Minimum number of shares required to reconstruct the secret, absent an
-/// explicit [`DeRecProtocolBuilder::with_threshold`] call. This is the sole
-/// definition of the value — [`DeRecProtocolBuilder::new`] and the FFI
+/// explicit [`DeRecProtocolBuilder::with_threshold`](crate::protocol::DeRecProtocolBuilder::with_threshold) call. This is the sole
+/// definition of the value — [`DeRecProtocolBuilder::new`](crate::protocol::DeRecProtocolBuilder::new) and the FFI
 /// config's serde default both read it rather than each hardcoding `3`.
 pub const DEFAULT_THRESHOLD: usize = 3;
 
 /// Number of recent share versions each helper retains, absent an explicit
-/// [`DeRecProtocolBuilder::with_keep_versions_count`] call. Sole definition
+/// [`DeRecProtocolBuilder::with_keep_versions_count`](crate::protocol::DeRecProtocolBuilder::with_keep_versions_count) call. Sole definition
 /// of the value; see [`DEFAULT_THRESHOLD`].
 pub const DEFAULT_KEEP_VERSIONS_COUNT: usize = 3;
 
@@ -89,7 +89,7 @@ pub(crate) fn resolve_plaintext_opt_in(
 ///     .with_user_secret_store(my_user_secret_store)
 ///     .with_state_store(my_state_store)
 ///     .with_transport(my_transport)
-///     .with_own_transport("https://me.example.com")
+///     .with_own_transports(["https://me.example.com"])
 ///     // Plus any optional with_* setters to override defaults.
 ///     .build()?;
 /// ```
@@ -359,9 +359,10 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     ///   single-device case.
     ///
     /// Only affects outbound requests originated through
-    /// [`DeRecProtocol::start`]. Responders always honour an inbound
-    /// `replyTo` regardless of this flag (it is purely a per-request hint
-    /// on the wire).
+    /// [`DeRecProtocol::start`], and only on channel-mode flows: pairing
+    /// carries its endpoints in its own `transportProtocol` field and is
+    /// unaffected. Responders always honour an inbound `replyTo` regardless
+    /// of this flag (it is purely a per-request hint on the wire).
     ///
     /// Default: `false`.
     pub fn with_auto_reply_to(mut self, enabled: bool) -> Self {
@@ -707,7 +708,31 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     /// Stores a one-element preference list, so this and
     /// [`with_own_transports`](Self::with_own_transports) fill the same
     /// slot — whichever is called last wins, same as any other setter.
+    ///
+    /// # Migrating
+    ///
+    /// [`with_own_transports`](Self::with_own_transports) takes the whole
+    /// preference list and is what this becomes internally, so a
+    /// single-endpoint deployment migrates by wrapping its argument:
+    ///
+    /// ```ignore
+    /// // before
+    /// .with_own_transport("https://me.example/derec")
+    /// // after
+    /// .with_own_transports(["https://me.example/derec"])
+    /// ```
+    ///
+    /// The singular spelling is going away because it can name only one
+    /// protocol, and a device serving several advertises all of them in
+    /// preference order. See the [`transport`](crate::transport) module docs
+    /// for how the list is used during pairing, and for the one-endpoint-per-
+    /// protocol rule the set is held to.
     #[allow(clippy::type_complexity)]
+    #[deprecated(
+        since = "0.0.3",
+        note = "use `with_own_transports`, which takes the whole preference \
+                list; removed at 0.0.5"
+    )]
     pub fn with_own_transport(
         self,
         own_transport: impl crate::transport::IntoOwnTransport,
@@ -925,6 +950,12 @@ impl<
     ///   [`with_own_transports`](Self::with_own_transports) failed
     ///   validation (malformed scheme, empty URI, …) — the first
     ///   invalid entry stops the build.
+    /// - [`crate::Error::Transport`] carrying
+    ///   [`DuplicateProtocol`](crate::transport::TransportValidationError::DuplicateProtocol)
+    ///   if the list names one protocol twice. A device serves at most one
+    ///   address per protocol, so the list is a preference order over
+    ///   distinct protocols — see the [`transport`](crate::transport) module
+    ///   docs.
     pub fn build(self) -> crate::Result<DeRecProtocol<Cs, Sh, Ss, Us, St, Tr>> {
         let own_transports: Vec<TransportProtocol> =
             self.own_transport.0?.into_iter().map(Into::into).collect();
@@ -953,6 +984,10 @@ impl<
         for own_transport in &own_transports {
             policy.check_own(own_transport)?;
         }
+        // Each endpoint may be individually fine and the set still wrong: a
+        // device serves one address per protocol, so two of the same protocol
+        // leave peers with no rule for choosing between them.
+        policy.check_own_set(&own_transports)?;
         let mut protocol = DeRecProtocol::new(
             self.secret_id,
             self.channel_store.0,
@@ -1087,8 +1122,8 @@ mod tests {
             TransportFuture,
         };
         use crate::protocol::types::{
-            ChannelQuery, ChannelRecord, HelperChannel, MissingPolicy, ReplicaMember, SecretKind,
-            SecretValue, Share, UserSecrets,
+            ChannelQuery, ChannelRecord, HelperChannel, HelperFilter, MissingPolicy, ReplicaFilter,
+            ReplicaMember, SecretKind, SecretValue, Share, UserSecrets,
         };
         use crate::types::ChannelId;
         use derec_proto::TransportProtocol;
@@ -1108,10 +1143,18 @@ mod tests {
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(std::future::ready(Ok(false)))
             }
-            fn helpers(&self, _: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+            fn helpers(
+                &self,
+                _: u64,
+                _: HelperFilter,
+            ) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
-            fn replicas(&self, _: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
+            fn replicas(
+                &self,
+                _: u64,
+                _: ReplicaFilter,
+            ) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn link_channel(
@@ -1271,8 +1314,8 @@ mod tests {
             TransportFuture,
         };
         use crate::protocol::types::{
-            ChannelQuery, ChannelRecord, HelperChannel, MissingPolicy, ReplicaMember, SecretKind,
-            SecretValue, Share, UserSecrets,
+            ChannelQuery, ChannelRecord, HelperChannel, HelperFilter, MissingPolicy, ReplicaFilter,
+            ReplicaMember, SecretKind, SecretValue, Share, UserSecrets,
         };
         use crate::types::ChannelId;
         use derec_proto::TransportProtocol;
@@ -1292,10 +1335,18 @@ mod tests {
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(std::future::ready(Ok(false)))
             }
-            fn helpers(&self, _: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+            fn helpers(
+                &self,
+                _: u64,
+                _: HelperFilter,
+            ) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
-            fn replicas(&self, _: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
+            fn replicas(
+                &self,
+                _: u64,
+                _: ReplicaFilter,
+            ) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn link_channel(
@@ -1426,7 +1477,7 @@ mod tests {
             .with_user_secret_store(NoopUserSecretStore)
             .with_transport(NoopTransport)
             .with_state_store(NoopStateStore)
-            .with_own_transport("https://owner.example/derec")
+            .with_own_transports(["https://owner.example/derec"])
             .with_threshold(1)
             .build();
         assert!(matches!(result, Err(crate::Error::InvalidInput(_))));
@@ -1443,8 +1494,8 @@ mod tests {
             TransportFuture,
         };
         use crate::protocol::types::{
-            ChannelQuery, ChannelRecord, HelperChannel, MissingPolicy, ReplicaMember, SecretKind,
-            SecretValue, Share, UserSecrets,
+            ChannelQuery, ChannelRecord, HelperChannel, HelperFilter, MissingPolicy, ReplicaFilter,
+            ReplicaMember, SecretKind, SecretValue, Share, UserSecrets,
         };
         use crate::types::ChannelId;
         use derec_proto::TransportProtocol;
@@ -1464,10 +1515,18 @@ mod tests {
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(std::future::ready(Ok(false)))
             }
-            fn helpers(&self, _: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+            fn helpers(
+                &self,
+                _: u64,
+                _: HelperFilter,
+            ) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
-            fn replicas(&self, _: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
+            fn replicas(
+                &self,
+                _: u64,
+                _: ReplicaFilter,
+            ) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn link_channel(
@@ -1598,7 +1657,7 @@ mod tests {
             .with_user_secret_store(NoopUserSecretStore)
             .with_transport(NoopTransport)
             .with_state_store(NoopStateStore)
-            .with_own_transport("ws://owner.example/derec")
+            .with_own_transports(["ws://owner.example/derec"])
             .with_threshold(2)
             .build();
         assert!(matches!(
@@ -1619,8 +1678,8 @@ mod tests {
             TransportFuture,
         };
         use crate::protocol::types::{
-            ChannelQuery, ChannelRecord, HelperChannel, MissingPolicy, ReplicaMember, SecretKind,
-            SecretValue, Share, UserSecrets,
+            ChannelQuery, ChannelRecord, HelperChannel, HelperFilter, MissingPolicy, ReplicaFilter,
+            ReplicaMember, SecretKind, SecretValue, Share, UserSecrets,
         };
         use crate::types::ChannelId;
         use derec_proto::{Protocol, TransportProtocol};
@@ -1640,10 +1699,18 @@ mod tests {
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(std::future::ready(Ok(false)))
             }
-            fn helpers(&self, _: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+            fn helpers(
+                &self,
+                _: u64,
+                _: HelperFilter,
+            ) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
-            fn replicas(&self, _: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
+            fn replicas(
+                &self,
+                _: u64,
+                _: ReplicaFilter,
+            ) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn link_channel(
@@ -1773,10 +1840,10 @@ mod tests {
             .with_user_secret_store(NoopUserSecretStore)
             .with_transport(NoopTransport)
             .with_state_store(NoopStateStore)
-            .with_own_transport(crate::transport::TransportProtocol::new(
+            .with_own_transports([crate::transport::TransportProtocol::new(
                 "https://me.example.com/derec",
                 Protocol::Https,
-            ))
+            )])
             .with_threshold(2)
             .build()
             .expect("valid single-endpoint builder should build");
@@ -1794,8 +1861,8 @@ mod tests {
             TransportFuture,
         };
         use crate::protocol::types::{
-            ChannelQuery, ChannelRecord, HelperChannel, MissingPolicy, ReplicaMember, SecretKind,
-            SecretValue, Share, UserSecrets,
+            ChannelQuery, ChannelRecord, HelperChannel, HelperFilter, MissingPolicy, ReplicaFilter,
+            ReplicaMember, SecretKind, SecretValue, Share, UserSecrets,
         };
         use crate::types::ChannelId;
         use derec_proto::{Protocol, TransportProtocol};
@@ -1815,10 +1882,18 @@ mod tests {
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(std::future::ready(Ok(false)))
             }
-            fn helpers(&self, _: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+            fn helpers(
+                &self,
+                _: u64,
+                _: HelperFilter,
+            ) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
-            fn replicas(&self, _: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
+            fn replicas(
+                &self,
+                _: u64,
+                _: ReplicaFilter,
+            ) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn link_channel(

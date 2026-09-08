@@ -89,10 +89,10 @@ type VerifyShareRequestMessage struct {
 	// the response to *this exchange*, overriding the channel's stored peer
 	// endpoint for this round-trip only.
 	//
-	// See `StoreShareRequestMessage.replyTo` for full semantics. Absent =
+	// See `StoreShareRequestMessage.replyTo` for full semantics. Empty =
 	// route to the stored channel endpoint; Present = route this response
 	// here without persisting the endpoint.
-	ReplyTo       *TransportProtocol `protobuf:"bytes,5,opt,name=replyTo,proto3,oneof" json:"replyTo,omitempty"`
+	ReplyTo       []*TransportProtocol `protobuf:"bytes,5,rep,name=replyTo,proto3" json:"replyTo,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -155,7 +155,7 @@ func (x *VerifyShareRequestMessage) GetTimestamp() *timestamppb.Timestamp {
 	return nil
 }
 
-func (x *VerifyShareRequestMessage) GetReplyTo() *TransportProtocol {
+func (x *VerifyShareRequestMessage) GetReplyTo() []*TransportProtocol {
 	if x != nil {
 		return x.ReplyTo
 	}
@@ -310,15 +310,13 @@ var File_verify_proto protoreflect.FileDescriptor
 
 const file_verify_proto_rawDesc = "" +
 	"\n" +
-	"\fverify.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\x81\x02\n" +
+	"\fverify.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\xf0\x01\n" +
 	"\x19VerifyShareRequestMessage\x12\x1a\n" +
 	"\bsecretId\x18\x01 \x01(\x04R\bsecretId\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\rR\aversion\x12\x14\n" +
 	"\x05nonce\x18\x03 \x01(\x04R\x05nonce\x128\n" +
-	"\ttimestamp\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12R\n" +
-	"\areplyTo\x18\x05 \x01(\v23.org.derecalliance.derec.protobuf.TransportProtocolH\x00R\areplyTo\x88\x01\x01B\n" +
-	"\n" +
-	"\b_replyTo\"\xfd\x01\n" +
+	"\ttimestamp\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12M\n" +
+	"\areplyTo\x18\x05 \x03(\v23.org.derecalliance.derec.protobuf.TransportProtocolR\areplyTo\"\xfd\x01\n" +
 	"\x1aVerifyShareResponseMessage\x12E\n" +
 	"\x06result\x18\x01 \x01(\v2-.org.derecalliance.derec.protobuf.DeRecResultR\x06result\x12\x1a\n" +
 	"\bsecretId\x18\x02 \x01(\x04R\bsecretId\x12\x18\n" +
@@ -366,7 +364,6 @@ func file_verify_proto_init() {
 	}
 	file_result_proto_init()
 	file_transportprotocol_proto_init()
-	file_verify_proto_msgTypes[0].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

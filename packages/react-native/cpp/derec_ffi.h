@@ -34,15 +34,15 @@
 
 /**
  * Minimum number of shares required to reconstruct the secret, absent an
- * explicit [`DeRecProtocolBuilder::with_threshold`] call. This is the sole
- * definition of the value — [`DeRecProtocolBuilder::new`] and the FFI
+ * explicit [`DeRecProtocolBuilder::with_threshold`](crate::protocol::DeRecProtocolBuilder::with_threshold) call. This is the sole
+ * definition of the value — [`DeRecProtocolBuilder::new`](crate::protocol::DeRecProtocolBuilder::new) and the FFI
  * config's serde default both read it rather than each hardcoding `3`.
  */
 #define DEFAULT_THRESHOLD 3
 
 /**
  * Number of recent share versions each helper retains, absent an explicit
- * [`DeRecProtocolBuilder::with_keep_versions_count`] call. Sole definition
+ * [`DeRecProtocolBuilder::with_keep_versions_count`](crate::protocol::DeRecProtocolBuilder::with_keep_versions_count) call. Sole definition
  * of the value; see [`DEFAULT_THRESHOLD`].
  */
 #define DEFAULT_KEEP_VERSIONS_COUNT 3
@@ -353,13 +353,13 @@
  * Replica catch-up. Takes no parameters: the group and this device's own
  * version are both read from the stores.
  */
-#define FLOW_KIND_SYNC_CHECK 7
+#define FLOW_KIND_REPLICA_DISCOVERY 7
 
 /**
  * Remove a member from the replica group. Params:
  * `{ "replica_id": "<decimal>", "memo": "<optional>" }`.
  */
-#define FLOW_KIND_REMOVE_REPLICA 8
+#define FLOW_KIND_UNPAIR_REPLICA 8
 
 /**
  * Opaque handle returned by [`derec_protocol_new`] and consumed by
@@ -702,6 +702,17 @@ typedef struct DeRecProtocolNewResult {
  * [`crate::protocol::types::HelperChannel`] and
  * [`crate::protocol::types::ReplicaMember`] respectively.
  *
+ * Both listing callbacks receive a `filter` buffer holding a JSON-encoded
+ * [`crate::protocol::types::HelperFilter`] or
+ * [`crate::protocol::types::ReplicaFilter`] — an object with `ids`, `status`,
+ * `role` and `exclude`, where an empty array or a null `role` restricts
+ * nothing. A backend should apply it in its query rather than by listing
+ * everything and discarding rows; see
+ * [`crate::protocol::types::ChannelFilter`]. The library re-applies it to
+ * whatever comes back, so ignoring it is slow rather than wrong — but
+ * returning fewer rows than it selects is wrong, and undetectable. The buffer is owned
+ * by the caller and valid only for the duration of the call.
+ *
  * The order `list_replicas` returns is significant in exactly one situation —
  * it selects the successor when the group's source is removed. See
  * [`crate::protocol::DeRecChannelStore::replicas`] for the full contract.
@@ -725,8 +736,18 @@ typedef struct ChannelStoreCallbacks {
                     uint64_t channel_id,
                     uint64_t replica_id,
                     uint32_t *out_existed);
-  int32_t (*list_helpers)(void *user_data, uint64_t secret_id, uint8_t **out_ptr, size_t *out_len);
-  int32_t (*list_replicas)(void *user_data, uint64_t secret_id, uint8_t **out_ptr, size_t *out_len);
+  int32_t (*list_helpers)(void *user_data,
+                          uint64_t secret_id,
+                          const uint8_t *filter,
+                          size_t filter_len,
+                          uint8_t **out_ptr,
+                          size_t *out_len);
+  int32_t (*list_replicas)(void *user_data,
+                           uint64_t secret_id,
+                           const uint8_t *filter,
+                           size_t filter_len,
+                           uint8_t **out_ptr,
+                           size_t *out_len);
   int32_t (*link_channel)(void *user_data, uint64_t secret_id, uint64_t a, uint64_t b);
   int32_t (*linked_channels)(void *user_data,
                              uint64_t secret_id,
@@ -1663,10 +1684,17 @@ struct DeRecError derec_protocol_set_communication_info(struct DeRecProtocolHand
                                                         size_t info_json_len);
 
 /**
- * Replace this node's local transport endpoint. See
- * [`crate::protocol::DeRecProtocol::set_own_transport`] for the
- * changeover discipline (keep the old endpoint up during the
- * transition).
+ * Replace this node's endpoint **for one protocol**, leaving the others
+ * alone. A node serves at most one endpoint per protocol, so the `(uri,
+ * protocol)` pair identifies the entry it replaces; an entry for a protocol
+ * not yet served is appended, and a replaced one keeps its position in the
+ * preference order. See
+ * [`crate::protocol::DeRecProtocol::set_own_transport`] for the changeover
+ * discipline (keep the old endpoint up during the transition).
+ *
+ * Superseded by [`derec_protocol_set_own_transports`], which takes the
+ * whole preference list and is the only way to change *which* protocols
+ * this node serves, or their order.
  *
  * # Safety
  *
@@ -1679,10 +1707,37 @@ struct DeRecError derec_protocol_set_communication_info(struct DeRecProtocolHand
  * from different threads are safe: the handle's internal mutex
  * serializes them.
  */
+__attribute__((deprecated("use derec_protocol_set_own_transports, which takes the whole preference list; removed at 0.0.5")))
 struct DeRecError derec_protocol_set_own_transport(struct DeRecProtocolHandle *handle,
                                                    const uint8_t *uri_ptr,
                                                    size_t uri_len,
                                                    int32_t protocol);
+
+/**
+ * Replace every endpoint this node advertises, in preference order.
+ *
+ * The runtime counterpart to the `own_transports` array accepted by
+ * [`super::derec_protocol_new`], and the way to change the whole set:
+ * `derec_protocol_set_own_transport` replaces only the entry for the
+ * protocol its URI names. A device serves at most one endpoint per
+ * protocol, so this list is a preference order over distinct protocols and
+ * two entries of the same protocol are rejected. Body is the same JSON
+ * shape that config array uses — `[{"uri": "...", "protocol": 0}, ...]`.
+ *
+ * Every entry is validated before any is stored, so a malformed URI
+ * leaves the previous set intact rather than half-applied.
+ *
+ * # Safety
+ *
+ * `handle` must be a valid pointer returned by
+ * [`super::derec_protocol_new`]. `json_ptr`/`json_len` must describe a
+ * readable byte range. Concurrent calls on the same handle from
+ * different threads are safe: the handle's internal mutex serializes
+ * them.
+ */
+struct DeRecError derec_protocol_set_own_transports(struct DeRecProtocolHandle *handle,
+                                                    const uint8_t *json_ptr,
+                                                    size_t json_len);
 
 /**
  * Remove `Pending` channels older than `older_than_secs`. See

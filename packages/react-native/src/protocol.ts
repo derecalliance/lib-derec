@@ -13,13 +13,14 @@ import type {
   DeRecEvent,
   DiscoveryParams,
   PairingParams,
+  ParameterRange,
   ProtectSecretParams,
   RecoverSecretParams,
-  RemoveReplicaParams,
+  UnpairReplicaParams,
   SecretStore,
   ShareStore,
   StateStore,
-  SyncCheckParams,
+  ReplicaDiscoveryParams,
   Target,
   Timeouts,
   Transport,
@@ -270,12 +271,12 @@ function buildStartParams(flowKind: FlowKind, params: unknown): Uint8Array {
       }
       return jsonToBytes(out);
     }
-    case FlowKind.SyncCheck:
+    case FlowKind.ReplicaDiscovery:
       // No parameters: the group and this device's own version both come
       // from the stores.
       return jsonToBytes({});
-    case FlowKind.RemoveReplica: {
-      const p = params as RemoveReplicaParams;
+    case FlowKind.UnpairReplica: {
+      const p = params as UnpairReplicaParams;
       const out: Record<string, unknown> = { replica_id: p.replica_id };
       if (p.memo !== undefined) {
         out.memo = p.memo;
@@ -348,6 +349,11 @@ export class DeRecProtocolBuilder {
     return this;
   }
 
+  /**
+   * @deprecated Use {@link withOwnTransports}, which takes the whole
+   * preference list — `withOwnTransports([endpoint])` is the direct
+   * replacement. Removed at 0.0.5.
+   */
   withOwnTransport(endpoint: { uri: string; protocol: string }): this {
     this.config.own_transport_uri = endpoint.uri;
     this.config.own_transport_protocol = protocolDiscriminant(endpoint.protocol);
@@ -490,6 +496,41 @@ export class DeRecProtocolBuilder {
     return this;
   }
 
+  /**
+   * Declare the bounds this node advertises during pair negotiation.
+   *
+   * Embedded in outbound `PairRequest`/`PairResponse` envelopes and checked
+   * against the peer's range on inbound ones: a range that fails to
+   * intersect rejects the pairing. Every bound is optional and defaults to
+   * `0`, which the protocol reads as "no constraint on this dimension".
+   *
+   * Default: unset — no constraints advertised, every peer range accepted.
+   */
+  withParameterRange(range: Partial<ParameterRange>): this {
+    const n = (v: bigint | undefined) => Number(v ?? 0n);
+    this.config.parameter_range = {
+      min_share_size: n(range.min_share_size),
+      max_share_size: n(range.max_share_size),
+      min_time_between_verifications: n(range.min_time_between_verifications),
+      max_time_between_verifications: n(range.max_time_between_verifications),
+      min_time_between_share_updates: n(range.min_time_between_share_updates),
+      max_time_between_share_updates: n(range.max_time_between_share_updates),
+      min_unresponsive_deletion_timeout: n(
+        range.min_unresponsive_deletion_timeout,
+      ),
+      max_unresponsive_deletion_timeout: n(
+        range.max_unresponsive_deletion_timeout,
+      ),
+      min_unresponsive_deactivation_timeout: n(
+        range.min_unresponsive_deactivation_timeout,
+      ),
+      max_unresponsive_deactivation_timeout: n(
+        range.max_unresponsive_deactivation_timeout,
+      ),
+    };
+    return this;
+  }
+
   build(): DeRecProtocol {
     const config = {
       secret_id: this.secretIdValue.toString(),
@@ -572,12 +613,45 @@ export class DeRecProtocol {
     return this.host.setCommunicationInfo(jsonToBytes(info)) as Promise<void>;
   }
 
-  /** Returns a `Promise` for the same reason {@link setCommunicationInfo} does. */
+  /**
+   * Replace this node's endpoint for one protocol, leaving the others
+   * alone. A node serves at most one endpoint per protocol, so the
+   * `(uri, protocol)` pair identifies the entry it replaces; an entry for a
+   * protocol not yet served is appended, and a replaced one keeps its
+   * position in the preference order.
+   *
+   * Returns a `Promise` for the same reason {@link setCommunicationInfo} does.
+   *
+   * @deprecated Use {@link setOwnTransports}, which takes the whole
+   * preference list and is the only way to change which protocols this node
+   * serves, or their order. Removed at 0.0.5.
+   */
   setOwnTransport(uri: string, protocol: string): Promise<void> {
     return this.host.setOwnTransport(
       uri,
       protocolDiscriminant(protocol),
     ) as Promise<void>;
+  }
+
+  /**
+   * Replaces every endpoint this node advertises, in preference order —
+   * the runtime counterpart to `withOwnTransports`, and the only way to
+   * change a multi-endpoint node's set ({@link setOwnTransport} collapses
+   * it to the one endpoint it is given).
+   *
+   * Every entry is validated before any is stored, so a malformed URI
+   * leaves the previous set intact. An empty array is rejected.
+   *
+   * Returns a `Promise` for the same reason {@link setCommunicationInfo} does.
+   */
+  setOwnTransports(
+    transports: { uri: string; protocol: string }[],
+  ): Promise<void> {
+    const wire = transports.map(({ uri, protocol }) => ({
+      uri,
+      protocol: protocolDiscriminant(protocol),
+    }));
+    return this.host.setOwnTransports(jsonToBytes(wire)) as Promise<void>;
   }
 
   /**
@@ -611,8 +685,8 @@ export class DeRecProtocol {
   start(flowKind: FlowKind.RecoverSecret, params: RecoverSecretParams): Promise<DeRecEvent[]>;
   start(flowKind: FlowKind.Unpair, params: UnpairParams): Promise<DeRecEvent[]>;
   start(flowKind: FlowKind.UpdateChannelInfo, params: UpdateChannelInfoParams): Promise<DeRecEvent[]>;
-  start(flowKind: FlowKind.SyncCheck, params?: SyncCheckParams): Promise<DeRecEvent[]>;
-  start(flowKind: FlowKind.RemoveReplica, params: RemoveReplicaParams): Promise<DeRecEvent[]>;
+  start(flowKind: FlowKind.ReplicaDiscovery, params?: ReplicaDiscoveryParams): Promise<DeRecEvent[]>;
+  start(flowKind: FlowKind.UnpairReplica, params: UnpairReplicaParams): Promise<DeRecEvent[]>;
   async start(flowKind: FlowKind, params?: unknown): Promise<DeRecEvent[]> {
     const paramsBytes = buildStartParams(flowKind, params);
     const buffer = (await this.host.start(flowKind, paramsBytes)) as ArrayBuffer;

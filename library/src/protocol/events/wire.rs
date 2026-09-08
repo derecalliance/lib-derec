@@ -8,7 +8,7 @@
 //!
 //! Field-name conventions:
 //! - All `u64` identifiers (`channel_id`, `secret_id`, `replica_id`,
-//!   `from_replica_id`) cross the boundary as
+//!   `from_replica_id`, `trace_id`) cross the boundary as
 //!   **decimal strings** to dodge JS `Number.MAX_SAFE_INTEGER` without
 //!   forcing callers to track which id uses which encoding.
 //! - `peer_communication_info` / `communication_info` are
@@ -101,7 +101,7 @@ pub(crate) enum Event {
     },
     /// A replica catch-up finished. `fetched_from` is absent when this device
     /// was already current, in which case no hydration event follows.
-    SyncCheckComplete {
+    ReplicaDiscoveryComplete {
         local_version: u32,
         group_version: u32,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -220,9 +220,11 @@ pub(crate) enum Event {
     PairingStarted {
         channel_id: String,
         kind: i32,
+        trace_id: String,
     },
     DiscoveryStarted {
         channel_id: String,
+        trace_id: String,
     },
     DiscoveryFailed {
         channel_id: String,
@@ -231,6 +233,7 @@ pub(crate) enum Event {
     ProtectSecretStarted {
         channel_id: String,
         version: u32,
+        trace_id: String,
     },
     ProtectSecretFailed {
         channel_id: String,
@@ -240,6 +243,7 @@ pub(crate) enum Event {
     VerifySharesStarted {
         channel_id: String,
         version: u32,
+        trace_id: String,
     },
     VerifySharesFailed {
         channel_id: String,
@@ -249,6 +253,7 @@ pub(crate) enum Event {
     RecoverSecretStarted {
         channel_id: String,
         version: u32,
+        trace_id: String,
     },
     RecoverSecretFailed {
         channel_id: String,
@@ -261,9 +266,11 @@ pub(crate) enum Event {
     },
     UnpairStarted {
         channel_id: String,
+        trace_id: String,
     },
     UpdateChannelInfoStarted {
         channel_id: String,
+        trace_id: String,
     },
     UpdateChannelInfoFailed {
         channel_id: String,
@@ -488,11 +495,11 @@ impl Event {
                 replica_id: encode_replica_id(replica_id),
             },
             DeRecEvent::SelfRemovedFromGroup { version } => Self::SelfRemovedFromGroup { version },
-            DeRecEvent::SyncCheckComplete {
+            DeRecEvent::ReplicaDiscoveryComplete {
                 local_version,
                 group_version,
                 fetched_from,
-            } => Self::SyncCheckComplete {
+            } => Self::ReplicaDiscoveryComplete {
                 local_version,
                 group_version,
                 fetched_from: fetched_from.map(encode_replica_id),
@@ -663,12 +670,21 @@ impl Event {
                 }
             }
             DeRecEvent::NoOp => Self::NoOp,
-            DeRecEvent::PairingStarted { channel_id, kind } => Self::PairingStarted {
+            DeRecEvent::PairingStarted {
+                channel_id,
+                kind,
+                trace_id,
+            } => Self::PairingStarted {
                 channel_id: channel_id.0.to_string(),
                 kind: kind as i32,
+                trace_id: trace_id.to_string(),
             },
-            DeRecEvent::DiscoveryStarted { channel_id } => Self::DiscoveryStarted {
+            DeRecEvent::DiscoveryStarted {
+                channel_id,
+                trace_id,
+            } => Self::DiscoveryStarted {
                 channel_id: channel_id.0.to_string(),
+                trace_id: trace_id.to_string(),
             },
             DeRecEvent::DiscoveryFailed { channel_id, error } => Self::DiscoveryFailed {
                 channel_id: channel_id.0.to_string(),
@@ -677,9 +693,11 @@ impl Event {
             DeRecEvent::ProtectSecretStarted {
                 channel_id,
                 version,
+                trace_id,
             } => Self::ProtectSecretStarted {
                 channel_id: channel_id.0.to_string(),
                 version,
+                trace_id: trace_id.to_string(),
             },
             DeRecEvent::ProtectSecretFailed {
                 channel_id,
@@ -693,9 +711,11 @@ impl Event {
             DeRecEvent::VerifySharesStarted {
                 channel_id,
                 version,
+                trace_id,
             } => Self::VerifySharesStarted {
                 channel_id: channel_id.0.to_string(),
                 version,
+                trace_id: trace_id.to_string(),
             },
             DeRecEvent::VerifySharesFailed {
                 channel_id,
@@ -709,9 +729,11 @@ impl Event {
             DeRecEvent::RecoverSecretStarted {
                 channel_id,
                 version,
+                trace_id,
             } => Self::RecoverSecretStarted {
                 channel_id: channel_id.0.to_string(),
                 version,
+                trace_id: trace_id.to_string(),
             },
             DeRecEvent::RecoverSecretFailed {
                 channel_id,
@@ -722,15 +744,23 @@ impl Event {
                 version,
                 error,
             },
-            DeRecEvent::UnpairStarted { channel_id } => Self::UnpairStarted {
+            DeRecEvent::UnpairStarted {
+                channel_id,
+                trace_id,
+            } => Self::UnpairStarted {
                 channel_id: channel_id.0.to_string(),
+                trace_id: trace_id.to_string(),
             },
             DeRecEvent::UnpairFailed { channel_id, error } => Self::UnpairFailed {
                 channel_id: channel_id.0.to_string(),
                 error,
             },
-            DeRecEvent::UpdateChannelInfoStarted { channel_id } => Self::UpdateChannelInfoStarted {
+            DeRecEvent::UpdateChannelInfoStarted {
+                channel_id,
+                trace_id,
+            } => Self::UpdateChannelInfoStarted {
                 channel_id: channel_id.0.to_string(),
+                trace_id: trace_id.to_string(),
             },
             DeRecEvent::UpdateChannelInfoFailed { channel_id, error } => {
                 Self::UpdateChannelInfoFailed {
@@ -744,10 +774,6 @@ impl Event {
             _ => Self::NoOp,
         })
     }
-}
-
-fn action_kind_label(action: &PendingAction) -> &'static str {
-    pending_action_kind_label(action.kind())
 }
 
 pub(crate) fn pending_action_kind_label(
@@ -764,6 +790,10 @@ pub(crate) fn pending_action_kind_label(
         K::Unpair => "Unpair",
         K::UpdateChannelInfo => "UpdateChannelInfo",
     }
+}
+
+fn action_kind_label(action: &PendingAction) -> &'static str {
+    pending_action_kind_label(action.kind())
 }
 
 fn extract_peer_communication_info(action: &PendingAction) -> HashMap<String, String> {

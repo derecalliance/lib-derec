@@ -37,7 +37,7 @@ pub fn produce(
     let shared_key = parse_shared_key(shared_key)?;
     let reply_to_proto = parse_transport_protocol_list(reply_to)?;
     // Helper path. Replica-group removal is orchestrated through the
-    // `RemoveReplica` flow, which names the departing member itself.
+    // `UnpairReplica` flow, which names the departing member itself.
     let result = request::produce(channel_id.into(), memo, &shared_key, &reply_to_proto, None)
         .map_err(js_error_from_lib)?;
     to_js(&ProduceResult {

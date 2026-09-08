@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use crate::extensions::derec_result::DeRecResultExt as _;
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     primitives::unpairing::UnpairingError,
@@ -201,20 +202,7 @@ pub fn process(response: &UnpairResponseMessage) -> Result<ProcessResult, crate:
         "UnpairResponseMessage is missing result field",
     ))?;
 
-    // TODO: result.validate()?
-    if result.status != StatusEnum::Ok as i32 {
-        #[cfg(feature = "logging")]
-        tracing::warn!(
-            status = result.status,
-            memo = %result.memo,
-            "unpair response status is not Ok"
-        );
-        return Err(UnpairingError::NonOkStatus {
-            status: result.status,
-            memo: result.memo.to_owned(),
-        }
-        .into());
-    }
+    result.validate(|status, memo| UnpairingError::NonOkStatus { status, memo })?;
 
     #[cfg(feature = "logging")]
     tracing::info!("unpair response acknowledged");

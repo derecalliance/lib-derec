@@ -6,13 +6,13 @@ use super::{
     TransportProtocol, deserialize_pairing_secret_key_material, get_sender_kind,
     serialize_pairing_secret_key_material,
 };
+use crate::extensions::contact_message::ContactMessageExt as _;
 use crate::{
     interop::wasm::{
         primitives::helpers::{from_js, to_js},
         ts_bindings_utils::{js_error, js_error_from_lib},
     },
     primitives::pairing::request,
-    utils::ContactMessageExt as _,
 };
 use prost::Message as _;
 use serde::{Deserialize, Serialize};

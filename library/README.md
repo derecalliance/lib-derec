@@ -784,6 +784,32 @@ Each trait's rustdoc states its contract, idempotency expectations, and the
 security classification of the data it holds (`DeRecSecretStore` content is
 keychain-grade; the others need durable storage only).
 
+#### Filtered listings
+
+`DeRecChannelStore::helpers` and `DeRecChannelStore::replicas` take a
+[`ChannelFilter`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.ChannelFilter.html)
+— `ids`, `status`, `role` and `exclude`, where every empty value means "do not
+restrict on this", so a `Default` filter selects everything.
+
+**Apply it in your query.** That is the point: a `WHERE` clause or a
+key-condition expression instead of transferring rows the caller will discard.
+That transfer costs bandwidth everywhere, and on a metered backing such as
+DynamoDB, which bills by bytes read, it costs money.
+
+**A store that ignores it is slow, not wrong.** The library re-applies the
+filter to every listing before acting on it and drops anything the filter
+excluded.
+
+**That is a one-way guarantee, not a validation of your store.** Dropping rows
+enforces an upper bound; it cannot recover a row you omitted. A store that
+returns *fewer* rows than the filter selects is still wrong, in a way nothing
+in the library can detect — the protocol simply fails to act. Applying the
+filter faithfully is still your job.
+
+The same filter crosses every binding: as a JSON object over the C ABI
+(`list_helpers` / `list_replicas` gain a `filter` buffer), and as a plain
+object on the WASM bridges.
+
 ### Choosing backends at run time
 
 `DeRecProtocol` is generic over all six, so by default the concrete backends
@@ -918,6 +944,17 @@ remains fully supported and is exactly a one-element list. The equivalents are
 `WithOwnTransports` (.NET), `withOwnTransports` (Node.js / Web) and
 `Config.OwnTransports` (Go).
 
+`with_own_transport` / `set_own_transport` are **deprecated and removed at
+0.0.5**; a one-element list is the direct replacement.
+
+To change the set after construction, use `set_own_transports` — the runtime
+counterpart, and the only way a multi-endpoint node can change what it
+advertises. `set_own_transport` replaces the list with the single endpoint it
+is given, matching `with_own_transport`. Both validate every entry before
+storing any, so a malformed URI leaves the previous set intact. The
+equivalents are `setOwnTransports` (Node.js / Web / React Native) and
+`SetOwnTransports` (Go).
+
 ### Serving DeRec over request/response transports
 
 The protocol is a **mailbox**: every participant has an address, and answering
@@ -1025,7 +1062,8 @@ receiver cannot deliver to, with nothing to indicate it.
 > `ChannelInfoUpdated` / `ChannelInfoUpdateRejected` (plus a grace window
 > for in-flight messages from peers not yet aware of the update). Failing
 > to keep both endpoints reachable during this window will cause messages
-> to be lost. See the rustdoc on `set_own_transport` for details.
+> to be lost. See the rustdoc on `set_own_transport` / `set_own_transports`
+> for details.
 
 ---
 

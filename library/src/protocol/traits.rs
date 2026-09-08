@@ -4,8 +4,8 @@
 use super::error::{ChannelStoreError, SecretStoreError, ShareStoreError, StateStoreError};
 use crate::Result;
 use crate::protocol::types::{
-    ChannelQuery, ChannelRecord, HelperChannel, MissingPolicy, ReplicaMember, SecretKind,
-    SecretValue, Share, StateItem, StateKey, StateKind, UserSecrets,
+    ChannelQuery, ChannelRecord, HelperChannel, HelperFilter, MissingPolicy, ReplicaFilter,
+    ReplicaMember, SecretKind, SecretValue, Share, StateItem, StateKey, StateKind, UserSecrets,
 };
 use crate::types::ChannelId;
 use derec_proto::TransportProtocol;
@@ -220,11 +220,38 @@ pub trait DeRecChannelStore {
     /// the group channel and every other member survive.
     fn remove(&mut self, secret_id: u64, query: ChannelQuery) -> ChannelStoreFuture<'_, bool>;
 
-    /// Every helper channel stored under `secret_id`.
-    fn helpers(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>>;
+    /// The helper channels stored under `secret_id` that `filter` selects.
+    ///
+    /// [`HelperFilter`] addresses records by [`HelperChannel::channel_id`],
+    /// and its `role` field is the **peer's**
+    /// [`HelperChannel::peer_role`]. A [`Default`] filter selects every
+    /// channel.
+    ///
+    /// Apply the filter in your query rather than listing everything and
+    /// discarding rows; see
+    /// [`ChannelFilter`](crate::protocol::types::ChannelFilter). The library
+    /// re-applies it to whatever you return, so ignoring it is slow rather
+    /// than wrong — but returning *fewer* rows than it selects is wrong, and
+    /// is not something the library can detect.
+    fn helpers(
+        &self,
+        secret_id: u64,
+        filter: HelperFilter,
+    ) -> ChannelStoreFuture<'_, Vec<HelperChannel>>;
 
-    /// Every replica-group member, **including this device's own row**.
-    /// Callers fanning out exclude themselves by [`crate::types::ReplicaId`].
+    /// The replica-group members under `secret_id` that `filter` selects,
+    /// **including this device's own row** unless the filter excludes it.
+    ///
+    /// [`ReplicaFilter`] addresses records by [`ReplicaMember::replica_id`],
+    /// and its `role` field is [`ReplicaMember::role`]. A [`Default`] filter
+    /// selects every member.
+    ///
+    /// Apply the filter in your query rather than listing everything and
+    /// discarding rows; see
+    /// [`ChannelFilter`](crate::protocol::types::ChannelFilter). The library
+    /// re-applies it to whatever you return, so ignoring it is slow rather
+    /// than wrong — but returning *fewer* rows than it selects is wrong, and
+    /// is not something the library can detect.
     ///
     /// # Order selects the successor when the source leaves
     ///
@@ -234,8 +261,9 @@ pub trait DeRecChannelStore {
     /// A replica group has exactly one member holding
     /// [`crate::protocol::types::ReplicaRole::Source`]. When that member is
     /// removed, a successor must be chosen, and the protocol takes **the first
-    /// element of this list that is neither the departing member nor itself
-    /// leaving**. Implementing `replicas` is therefore how an application
+    /// element returned** for a filter that already excludes the departing
+    /// member and admits only members not themselves leaving. Implementing
+    /// `replicas` is therefore how an application
     /// chooses its own succession policy — order by an `added_at` column, by a
     /// user-chosen preference, by whatever a backend says — without the
     /// protocol having to model one.
@@ -256,7 +284,11 @@ pub trait DeRecChannelStore {
     ///
     /// A source that is the group's only member leaves no successor, and the
     /// group dissolves with it.
-    fn replicas(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>>;
+    fn replicas(
+        &self,
+        secret_id: u64,
+        filter: ReplicaFilter,
+    ) -> ChannelStoreFuture<'_, Vec<ReplicaMember>>;
 
     /// Link two channels as belonging to the same Owner identity.
     ///
@@ -747,11 +779,19 @@ impl<T: DeRecChannelStore + ?Sized> DeRecChannelStore for Box<T> {
     fn remove(&mut self, secret_id: u64, query: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
         (**self).remove(secret_id, query)
     }
-    fn helpers(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
-        (**self).helpers(secret_id)
+    fn helpers(
+        &self,
+        secret_id: u64,
+        filter: HelperFilter,
+    ) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+        (**self).helpers(secret_id, filter)
     }
-    fn replicas(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
-        (**self).replicas(secret_id)
+    fn replicas(
+        &self,
+        secret_id: u64,
+        filter: ReplicaFilter,
+    ) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
+        (**self).replicas(secret_id, filter)
     }
     fn link_channel(
         &mut self,
@@ -897,11 +937,19 @@ impl<T: DeRecChannelStore + ?Sized> DeRecChannelStore for &mut T {
     fn remove(&mut self, secret_id: u64, query: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
         (**self).remove(secret_id, query)
     }
-    fn helpers(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
-        (**self).helpers(secret_id)
+    fn helpers(
+        &self,
+        secret_id: u64,
+        filter: HelperFilter,
+    ) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+        (**self).helpers(secret_id, filter)
     }
-    fn replicas(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
-        (**self).replicas(secret_id)
+    fn replicas(
+        &self,
+        secret_id: u64,
+        filter: ReplicaFilter,
+    ) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
+        (**self).replicas(secret_id, filter)
     }
     fn link_channel(
         &mut self,
@@ -1049,7 +1097,7 @@ mod pointer_forwarding_tests {
                 Box::new(InMemPersistedStateStore::default()) as Box<dyn DeRecStateStore>
             )
             .with_transport(std::sync::Arc::new(NoopTransport))
-            .with_own_transport("https://erased.example.com")
+            .with_own_transports(["https://erased.example.com"])
             .with_threshold(2)
             .build()
             .expect("a fully type-erased protocol must build")

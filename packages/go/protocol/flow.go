@@ -24,13 +24,13 @@ const (
 	FlowKindRecoverSecret     FlowKind = 4
 	FlowKindUnpair            FlowKind = 5
 	FlowKindUpdateChannelInfo FlowKind = 6
-	// FlowKindSyncCheck asks the replica group whether this device is behind
+	// FlowKindReplicaDiscovery asks the replica group whether this device is behind
 	// and catches up if it is. Replica-only, and takes no params.
-	FlowKindSyncCheck FlowKind = 7
-	// FlowKindRemoveReplica removes a member from the replica group.
+	FlowKindReplicaDiscovery FlowKind = 7
+	// FlowKindUnpairReplica removes a member from the replica group.
 	// Replica-only: naming this device is a voluntary departure, naming
 	// another is an eviction.
-	FlowKindRemoveReplica FlowKind = 8
+	FlowKindUnpairReplica FlowKind = 8
 )
 
 // targetKind discriminates Target's three wire shapes. The zero value
@@ -177,15 +177,23 @@ type TransportProtocolParam struct {
 	Protocol int32
 }
 
-// RemoveReplicaParams are the parameters for FlowKindRemoveReplica.
+// ReplicaDiscoveryParams carries nothing: the group and this device's own
+// version are both read from the stores.
+//
+// Declared so every FlowKind has a params type, matching dotnet's
+// ReplicaDiscoveryParams and the TypeScript `Record<string, never>`. Start
+// also accepts nil for this flow.
+type ReplicaDiscoveryParams struct{}
+
+// UnpairReplicaParams are the parameters for FlowKindUnpairReplica.
 // ReplicaID names the member being removed — this device for a voluntary
 // departure, another for an eviction.
-type RemoveReplicaParams struct {
+type UnpairReplicaParams struct {
 	ReplicaID uint64
 	Memo      *string
 }
 
-type removeReplicaParamsWire struct {
+type unpairReplicaParamsWire struct {
 	ReplicaID string  `json:"replica_id"`
 	Memo      *string `json:"memo,omitempty"`
 }
@@ -313,18 +321,24 @@ func marshalFlowParams(flowKind FlowKind, params any) ([]byte, error) {
 			}
 		}
 		return json.Marshal(w)
-	case FlowKindRemoveReplica:
-		rrp, ok := params.(RemoveReplicaParams)
+	case FlowKindUnpairReplica:
+		rrp, ok := params.(UnpairReplicaParams)
 		if !ok {
-			return nil, fmt.Errorf("protocol: Start: FlowKindRemoveReplica requires RemoveReplicaParams, got %T", params)
+			return nil, fmt.Errorf("protocol: Start: FlowKindUnpairReplica requires UnpairReplicaParams, got %T", params)
 		}
-		return json.Marshal(removeReplicaParamsWire{
+		return json.Marshal(unpairReplicaParamsWire{
 			ReplicaID: strconv.FormatUint(rrp.ReplicaID, 10),
 			Memo:      rrp.Memo,
 		})
-	case FlowKindSyncCheck:
+	case FlowKindReplicaDiscovery:
 		// No parameters: the group and this device's own version both come
-		// from the stores.
+		// from the stores. nil is accepted for the same reason the other
+		// SDKs make theirs optional.
+		if params != nil {
+			if _, ok := params.(ReplicaDiscoveryParams); !ok {
+				return nil, fmt.Errorf("protocol: Start: FlowKindReplicaDiscovery requires ReplicaDiscoveryParams or nil, got %T", params)
+			}
+		}
 		return json.Marshal(struct{}{})
 	default:
 		return nil, fmt.Errorf("protocol: Start: unknown FlowKind %d", flowKind)
@@ -333,7 +347,8 @@ func marshalFlowParams(flowKind FlowKind, params any) ([]byte, error) {
 
 // Start kicks off flowKind with the matching params struct — PairingParams,
 // DiscoveryParams, ProtectSecretParams, VerifySharesParams,
-// RecoverSecretParams, UnpairParams, or UpdateChannelInfoParams. Passing a
+// RecoverSecretParams, UnpairParams, UpdateChannelInfoParams,
+// ReplicaDiscoveryParams or UnpairReplicaParams. Passing a
 // params value that doesn't match flowKind is a returned error, not a
 // panic. Returns the per-target *Started / *Failed events describing what
 // was dispatched.

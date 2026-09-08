@@ -30,6 +30,96 @@ export interface SecretStore {
   remove(secretId: string, channelId: string, kind: 0 | 1 | 2): Promise<void>;
 }
 
+
+/**
+ * A channel's lifecycle status, as the Rust variant name the core emits.
+ */
+export type ChannelStatusName = "Pending" | "Paired" | "Unpairing";
+
+/**
+ * A peer's role on a helper channel, as the Rust variant name.
+ */
+export type SenderKindName =
+  | "Owner"
+  | "Helper"
+  | "ReplicaSource"
+  | "ReplicaDestination";
+
+/**
+ * A member's role within a replica group, as the Rust variant name.
+ */
+export type ReplicaRoleName = "Source" | "Destination";
+
+/**
+ * Narrows a listing from {@link ChannelStore}.
+ *
+ * Every field is a restriction, and every field's empty value means "do not
+ * restrict on this" — a filter of all-empties selects everything.
+ * Restrictions combine with AND, and `exclude` is applied last, overriding
+ * `ids`.
+ *
+ * Apply it in your query — a `WHERE` clause, a key-condition expression —
+ * instead of transferring rows the caller will discard. That transfer costs
+ * bandwidth everywhere, and on a metered backing that bills by bytes read it
+ * costs money.
+ *
+ * The library re-applies the filter to whatever this returns before acting on
+ * it, so ignoring it is slow, not wrong. That backstop is load-bearing here:
+ * TypeScript accepts a function of fewer parameters where more are declared,
+ * so a store written before this parameter existed still satisfies the
+ * interface and compiles without a diagnostic.
+ *
+ * It is a one-way guarantee, not a validation of your store: dropping rows can
+ * enforce an upper bound, but it cannot recover a row you omitted. Returning
+ * *fewer* rows than the filter selects is still wrong, and undetectable — the
+ * protocol simply fails to act.
+ *
+ * Ids are decimal strings, like every other `u64` on this bridge.
+ */
+export interface ChannelFilter<Role> {
+  /** Restrict to these ids. Empty selects every record. */
+  ids: string[];
+  /** Restrict to these statuses. Empty selects any status. */
+  status: ChannelStatusName[];
+  /** Restrict to this role. `null` selects any role. */
+  role: Role | null;
+  /** Omit these ids, applied after `ids`. Empty omits nothing. */
+  exclude: string[];
+}
+
+/**
+ * Narrows `listHelpers`. Ids are the channel's `channel_id` and the role is
+ * the **peer's** `peer_role`.
+ */
+export type HelperFilter = ChannelFilter<SenderKindName>;
+
+/**
+ * Narrows `listReplicas`. Ids are the member's `replica_id` and the role is
+ * the member's `role`.
+ */
+export type ReplicaFilter = ChannelFilter<ReplicaRoleName>;
+
+/**
+ * Whether a channel or member with these attributes survives `filter`.
+ *
+ * Every empty field means "do not restrict", `exclude` is applied after `ids`,
+ * and the restrictions combine with AND — the same contract the core states on
+ * {@link ChannelFilter}. A store whose backing cannot express the filter as a
+ * query can list and call this; that is correct but transfers the rows the
+ * filter exists to leave behind.
+ *
+ * `id` is a decimal string, as ids are everywhere on this bridge. `role` is the
+ * peer's `SenderKind` name for `listHelpers` and the member's `ReplicaRole`
+ * name for `listReplicas`.
+ */
+export declare function channelFilterMatches(
+  filter: HelperFilter | ReplicaFilter | null | undefined,
+  id: string,
+  status: ChannelStatusName,
+  role: SenderKindName | ReplicaRoleName,
+): boolean;
+
+
 /**
  * Channel-record persistence.
  *
@@ -79,8 +169,19 @@ export interface ChannelStore {
     bytes: Uint8Array,
   ): Promise<void>;
   remove(secretId: string, channelId: string, replicaId: string): Promise<boolean>;
-  /** JSON array of the helper channels stored under `secretId`. */
-  listHelpers(secretId: string): Promise<Uint8Array | null | undefined>;
+  /**
+   * JSON array of the helper channels stored under `secretId` that `filter`
+   * selects.
+   *
+   * Apply the filter in your query rather than listing everything and
+   * discarding rows; see {@link ChannelFilter}. The library re-applies it to
+   * whatever you return, so ignoring it is slow rather than wrong — but
+   * returning fewer rows than it selects is wrong, and undetectable.
+   */
+  listHelpers(
+    secretId: string,
+    filter: HelperFilter,
+  ): Promise<Uint8Array | null | undefined>;
   /**
    * JSON array of the replica-group members stored under `secretId`,
    * including this device's own row.
@@ -99,7 +200,10 @@ export interface ChannelStore {
    * `Map` insertion order after arbitrary edits are both effectively
    * arbitrary. Order explicitly to make succession predictable.
    */
-  listReplicas(secretId: string): Promise<Uint8Array | null | undefined>;
+  listReplicas(
+    secretId: string,
+    filter: ReplicaFilter,
+  ): Promise<Uint8Array | null | undefined>;
   linkChannel(
     secretId: string,
     channelId: string,
@@ -157,7 +261,7 @@ export interface UserSecretStore {
  * returns the exact blob it received, `remove` drops the row, and
  * `loadAll` returns every blob whose `kind` matches the requested
  * category (`0` = PendingVerification, `1` = PendingRecovery,
- * `2` = PendingUnpair, `3` = SharingRound, `4` = PendingSyncCheck).
+ * `2` = PendingUnpair, `3` = SharingRound, `4` = PendingReplicaDiscovery).
  *
  * Rows are keyed by `(secretId, StateKey)` — the `keyJson` buffer is
  * a JSON object `{ kind, channel_id?, version? }` matching the `kind`
@@ -266,12 +370,12 @@ export enum FlowKind {
   /** Ask the replica group whether this device is behind, and catch up if it
    *  is. Replica-only, and takes no parameters — the group and this device's
    *  own version both come from the stores. */
-  SyncCheck = 7,
+  ReplicaDiscovery = 7,
   /** Remove a member from the replica group. Replica-only. Naming this device
    *  is a voluntary departure; naming another is an eviction. Params:
    *  `{ replica_id: string; memo?: string }` — `replica_id` is a decimal
    *  string so ids above 2^53 survive JS number handling. */
-  RemoveReplica = 8,
+  UnpairReplica = 8,
 }
 
 export type UnpairAck = "required" | "not_required";
@@ -375,11 +479,11 @@ export interface Timeouts {
   expired_channels?: { enabled: boolean; timeout_in_secs: number };
 }
 
-/** `SyncCheck` takes no parameters: the group and this device's own version
+/** `ReplicaDiscovery` takes no parameters: the group and this device's own version
  *  are both read from the stores. The argument may be omitted entirely. */
-export type SyncCheckParams = Record<string, never>;
+export type ReplicaDiscoveryParams = Record<string, never>;
 
-export interface RemoveReplicaParams {
+export interface UnpairReplicaParams {
   /** The member to remove, as a **decimal** `u64` string — the same form
    *  `ReplicaPaired.peer_replica_id` hands back. A value naming no current
    *  member is rejected; it is not silently ignored. */
@@ -404,7 +508,7 @@ export type DeRecEvent =
 
       action: Uint8Array;
 
-      action_kind: string;
+      action_kind: PendingActionKind;
       peer_communication_info?: Record<string, string>;
 
       sender_kind?: SenderKind;
@@ -463,7 +567,7 @@ export type DeRecEvent =
   /** A replica catch-up finished. `fetched_from` is absent when this device
    *  was already current, in which case no hydration event follows. */
   | {
-      type: "SyncCheckComplete";
+      type: "ReplicaDiscoveryComplete";
       local_version: number;
       group_version: number;
       fetched_from?: string;
@@ -537,7 +641,7 @@ export type DeRecEvent =
   /** Fires alongside `PairingCompleted` on replica-mode pair handshakes.
    *  `peer_replica_id` is the peer's `u64` as a **decimal** string,
    *  matching the wire `derec.replica_id` representation and every other
-   *  id across this boundary. Pass it back verbatim — `RemoveReplica`
+   *  id across this boundary. Pass it back verbatim — `UnpairReplica`
    *  expects the same decimal form. The local side's role
    *  (`ReplicaSource` vs `ReplicaDestination`) is on the persisted
    *  channel record — replica pairings are unidirectional, so there is
@@ -681,21 +785,21 @@ export type DeRecEvent =
    *  for observability — no further action is required. `action_kind`
    *  is the same label vocabulary as `ActionRequired.action_kind`
    *  (`"Pairing"`, `"StoreShare"`, …). */
-  | { type: "AutoAccepted"; channel_id: string; action_kind: string }
+  | { type: "AutoAccepted"; channel_id: string; action_kind: PendingActionKind }
   | { type: "NoOp" }
   /** A pairing handshake was dispatched successfully. `kind` is the
    *  local party's role — same value the subsequent `PairingCompleted`
    *  will carry. Emitted by `start(Pairing)`. */
-  | { type: "PairingStarted"; channel_id: string; kind: SenderKind }
+  | { type: "PairingStarted"; channel_id: string; kind: SenderKind; trace_id: string }
   /** A discovery request was dispatched to `channel_id`. Emitted per
    *  targeted helper by `start(Discovery)`. */
-  | { type: "DiscoveryStarted"; channel_id: string }
+  | { type: "DiscoveryStarted"; channel_id: string; trace_id: string }
   /** A discovery request could not be dispatched to `channel_id`. Other
    *  targeted channels are unaffected. */
   | { type: "DiscoveryFailed"; channel_id: string; error: string }
   /** A share-storage request was dispatched to `channel_id`. Emitted per
    *  targeted peer by `start(ProtectSecret)`. */
-  | { type: "ProtectSecretStarted"; channel_id: string; version: number }
+  | { type: "ProtectSecretStarted"; channel_id: string; version: number; trace_id: string }
   /** A share-storage request could not be dispatched to `channel_id`. */
   | {
       type: "ProtectSecretFailed";
@@ -704,7 +808,7 @@ export type DeRecEvent =
       error: string;
     }
   /** A verify-share challenge was dispatched to `channel_id`. */
-  | { type: "VerifySharesStarted"; channel_id: string; version: number }
+  | { type: "VerifySharesStarted"; channel_id: string; version: number; trace_id: string }
   /** A verify-share challenge could not be dispatched to `channel_id`. */
   | {
       type: "VerifySharesFailed";
@@ -713,7 +817,7 @@ export type DeRecEvent =
       error: string;
     }
   /** A recovery share request was dispatched to `channel_id`. */
-  | { type: "RecoverSecretStarted"; channel_id: string; version: number }
+  | { type: "RecoverSecretStarted"; channel_id: string; version: number; trace_id: string }
   /** A recovery share request could not be dispatched to `channel_id`. */
   | {
       type: "RecoverSecretFailed";
@@ -725,9 +829,9 @@ export type DeRecEvent =
    *  `Unpaired` event once the peer acknowledges (or in the same event
    *  vec, under `UnpairAck.NotRequired`). */
   | { type: "UnpairFailed"; channel_id: string; error: string }
-  | { type: "UnpairStarted"; channel_id: string }
+  | { type: "UnpairStarted"; channel_id: string; trace_id: string }
   /** An update-channel-info request was dispatched to `channel_id`. */
-  | { type: "UpdateChannelInfoStarted"; channel_id: string }
+  | { type: "UpdateChannelInfoStarted"; channel_id: string; trace_id: string }
   /** An update-channel-info request could not be dispatched to
    *  `channel_id`. */
   | { type: "UpdateChannelInfoFailed"; channel_id: string; error: string };
@@ -893,6 +997,18 @@ export declare class DeRecProtocolBuilder {
    * stable across restarts. Default: unset.
    */
   withReplicaId(id: bigint | number): DeRecProtocolBuilder;
+  /**
+   * Declare the bounds this node advertises during pair negotiation.
+   *
+   * Embedded in outbound `PairRequest` / `PairResponse` envelopes and
+   * checked against the peer's range on inbound ones: a range that fails to
+   * intersect rejects the pairing. Keys match the {@link ParameterRange}
+   * interface; every field is optional and defaults to `0`, which the
+   * protocol reads as no constraint on that dimension.
+   *
+   * Default: unset — no constraints advertised, every peer range accepted.
+   */
+  withParameterRange(range: Partial<ParameterRange>): DeRecProtocolBuilder;
 
   /**
    * Finalize the configuration. Throws if any of the required setters
@@ -946,7 +1062,7 @@ export declare class DeRecProtocol {
   start(flowKind: FlowKind.RecoverSecret, params: RecoverSecretParams): Promise<DeRecEvent[]>;
   start(flowKind: FlowKind.Unpair, params: UnpairParams): Promise<DeRecEvent[]>;
   start(flowKind: FlowKind.UpdateChannelInfo, params: UpdateChannelInfoParams): Promise<DeRecEvent[]>;
-  start(flowKind: FlowKind.SyncCheck, params?: SyncCheckParams): Promise<DeRecEvent[]>;
+  start(flowKind: FlowKind.ReplicaDiscovery, params?: ReplicaDiscoveryParams): Promise<DeRecEvent[]>;
 
   /** Announce a member's removal. This does **not** remove anything on its
    *  own and emits no `ReplicaRemoved`: it tells every member and flags the
@@ -955,7 +1071,7 @@ export declare class DeRecProtocol {
    *  `start(FlowKind.ProtectSecret)` — at which point `ReplicaRemoved`
    *  fires. A group with no secret to publish therefore cannot complete a
    *  removal. */
-  start(flowKind: FlowKind.RemoveReplica, params: RemoveReplicaParams): Promise<DeRecEvent[]>;
+  start(flowKind: FlowKind.UnpairReplica, params: UnpairReplicaParams): Promise<DeRecEvent[]>;
 
   /**
    * Replace this node's local <c>communication_info</c> map. Does not
@@ -965,11 +1081,31 @@ export declare class DeRecProtocol {
   setCommunicationInfo(info: Record<string, string>): void;
 
   /**
-   * Replace this node's local transport endpoint. IMPORTANT: keep the
-   * old endpoint operational during the changeover (see the Rust docs
-   * on the matching setter for the discipline).
+   * Replace this node's endpoint for one protocol, leaving the others
+   * alone. A node serves at most one endpoint per protocol, so the
+   * `(uri, protocol)` pair identifies the entry it replaces; an entry for
+   * a protocol not yet served is appended, and a replaced one keeps its
+   * position in the preference order.
+   *
+   * IMPORTANT: keep the old endpoint operational during the changeover
+   * (see the Rust docs on the matching setter for the discipline).
    */
   setOwnTransport(uri: string, protocol: string): void;
+
+  /**
+   * Replace every endpoint this node advertises, in preference order —
+   * the runtime counterpart to `withOwnTransports`, and the way to change
+   * the whole set (`setOwnTransport` replaces only the entry for the
+   * protocol its URI names).
+   *
+   * A node serves at most one endpoint per protocol, so this list is a
+   * preference order over distinct protocols. Two entries of the same
+   * protocol are rejected.
+   *
+   * Every entry is validated before any is stored, so a malformed URI
+   * leaves the previous set intact. An empty array is rejected.
+   */
+  setOwnTransports(transports: { uri: string; protocol: string }[]): void;
 
   process(message: Uint8Array): Promise<DeRecEvent[]>;
 
@@ -1131,6 +1267,22 @@ export interface CommunicationInfo {
 // `ContactMessage` is defined once above (line ~75) and covers both
 // `INLINE_KEYS` and `HASHED_KEYS` modes.
 
+
+/**
+ * The label vocabulary for `ActionRequired.action_kind` and
+ * `AutoAccepted.action_kind` — one value per pending-action kind the
+ * protocol can raise. Matches the Rust `PendingActionKind` discriminants
+ * one-for-one.
+ */
+export type PendingActionKind =
+  | "Pairing"
+  | "PrePair"
+  | "StoreShare"
+  | "VerifyShare"
+  | "Discovery"
+  | "GetShare"
+  | "Unpair"
+  | "UpdateChannelInfo";
 
 export interface ParameterRange {
   min_share_size: bigint;

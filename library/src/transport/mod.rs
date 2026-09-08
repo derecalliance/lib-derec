@@ -28,19 +28,54 @@
 //! question, answered by [`TransportPolicy`] rather than here: it depends
 //! on how the application is deployed, which a validator with no
 //! configuration cannot know.
+//!
+//! # One endpoint per protocol
+//!
+//! The rules above judge endpoints one at a time. A *set* of them carries one
+//! more: a device serves at most one address per protocol. The endpoint is
+//! the address peers reach that protocol on, so a second entry for the same
+//! protocol names no additional reachability — it contradicts the first, and
+//! nothing says two peers would resolve the contradiction alike.
+//!
+//! A list of endpoints is therefore a preference order over *distinct*
+//! protocols, not a pool of interchangeable addresses. The rule is enforced
+//! at two different strengths:
+//!
+//! - **This device's own endpoints** — refused. See
+//!   [`TransportPolicy::check_own_set`]. A duplicate here is a configuration
+//!   mistake the application can fix, and silently dropping one would
+//!   advertise something it never asked for.
+//! - **A peer's advertised endpoints** — filtered, first entry wins. See
+//!   [`TransportPolicy::admit_peer_endpoints`]. The advertisement is
+//!   untrusted input, and failing a whole pairing over a contradiction that
+//!   can be resolved would discard an otherwise usable endpoint.
 //! 4. **Non-empty URI** — `EmptyUri` is the explicit error.
 //!
 //! Unknown `protocol` discriminants are caught at the *conversion*
 //! boundary by [`TryFrom<derec_proto::TransportProtocol>`] (or by
 //! [`TryFrom<&derec_proto::TransportProtocol>`]), so they never reach
 //! the typed [`TransportProtocol`] in the first place.
+//!
+//! ## The deprecated singular `transportProtocol`
+//!
+//! Contacts and pair requests carry both a singular `transportProtocol`
+//! and a `supportedTransports` list. The singular field predates the list
+//! and is deprecated on the wire, but it is still written and still read:
+//! a peer running an implementation that predates `supportedTransports`
+//! finds an endpoint only there, and dropping it would make this library
+//! unpairable with them.
+//!
+//! Every site that touches it therefore carries `#[allow(deprecated)]`.
+//! Those are compatibility, not oversight — this is the explanation they
+//! point at rather than each restating it. The singular field is always
+//! derived from the first entry of the list, never set independently,
+//! which is what keeps the two from disagreeing.
 
 use derec_proto::Protocol;
 #[cfg(any(feature = "serde", target_arch = "wasm32"))]
 use serde::{Deserialize, Serialize};
 
 mod selection;
-pub use selection::AdvertisedEndpoints;
 
 /// Maximum accepted transport URI length, in bytes.
 ///
@@ -299,34 +334,6 @@ impl TryFrom<&derec_proto::TransportProtocol> for TransportProtocol {
     }
 }
 
-/// Extension trait that gives the prost wire type
-/// [`derec_proto::TransportProtocol`] the same `validate()` shape as the
-/// library wrapper [`TransportProtocol`]. Defined here because the wire
-/// type lives in another crate — the orphan rule blocks adding an
-/// inherent method.
-///
-/// Brought into scope at every boundary where a remotely-controlled or
-/// application-supplied [`derec_proto::TransportProtocol`] surfaces:
-/// peer-extracted `reply_to` / `transport_protocol` fields inside
-/// `extract` primitives, the orchestrator's `on_request` handlers, and
-/// the FFI seam helpers. Centralising the gate in one impl keeps the
-/// rejection semantics uniform across SDKs through
-/// [`crate::Error::Transport`].
-pub trait TransportProtocolExt {
-    /// Validate the endpoint's structural soundness + scheme/protocol
-    /// consistency. Same rules as [`TransportProtocol::validate`]:
-    /// non-empty URI ≤ [`MAX_TRANSPORT_URI_LEN`] bytes, no control
-    /// characters, known `protocol` discriminant, and the URI scheme
-    /// matches the declared protocol.
-    fn validate(&self) -> Result<(), TransportValidationError>;
-}
-
-impl TransportProtocolExt for derec_proto::TransportProtocol {
-    fn validate(&self) -> Result<(), TransportValidationError> {
-        TransportProtocol::try_from(self).map(|_| ())
-    }
-}
-
 /// Conversion trait for the `with_own_transport` builder setter.
 ///
 /// Lets callers pass either an already-typed [`TransportProtocol`] or
@@ -407,6 +414,29 @@ pub enum TransportValidationError {
          version of the DeRec protocol"
     )]
     UnsupportedProtocol { discriminant: i32 },
+
+    /// The same protocol appears twice in one advertisement.
+    ///
+    /// A device serves at most one endpoint per protocol: the endpoint *is*
+    /// the address peers reach that protocol on, so a second one for the same
+    /// protocol names no additional reachability, it contradicts the first.
+    /// Peers would have no rule for choosing between them, and different
+    /// peers could choose differently.
+    ///
+    /// Reported for endpoints this device advertises about *itself*, where a
+    /// duplicate is a configuration mistake the application can fix. A
+    /// duplicate arriving from a peer is filtered instead — see
+    /// [`TransportPolicy::admit_peer_endpoints`].
+    #[error(
+        "transport protocol {protocol:?} is advertised more than once \
+         (`{first}` and `{second}`) — a device serves at most one endpoint \
+         per protocol"
+    )]
+    DuplicateProtocol {
+        protocol: Protocol,
+        first: String,
+        second: String,
+    },
 
     #[error(
         "transport uri must start with `{expected}` for protocol {protocol:?} \
@@ -712,6 +742,40 @@ impl TransportPolicy {
         self.allow_plaintext
     }
 
+    /// Check that a set of endpoints this device advertises names each
+    /// protocol at most once.
+    ///
+    /// A device serves one address per protocol, so the list peers receive in
+    /// `supportedTransports` is a preference *order* over distinct protocols,
+    /// not a pool of interchangeable addresses. Two HTTPS entries would leave
+    /// a peer with no rule for choosing, and nothing says two peers would
+    /// choose alike.
+    ///
+    /// Strict here — a duplicate is refused rather than filtered — because
+    /// these are the application's own endpoints, where a duplicate is a
+    /// configuration mistake it can fix and silently dropping one would
+    /// advertise something it did not ask for. Peer-advertised duplicates are
+    /// filtered instead; see [`Self::admit_peer_endpoints`].
+    pub fn check_own_set(
+        &self,
+        own: &[derec_proto::TransportProtocol],
+    ) -> Result<(), TransportValidationError> {
+        for (i, endpoint) in own.iter().enumerate() {
+            if let Some(first) = own[..i].iter().find(|e| e.protocol == endpoint.protocol) {
+                return Err(TransportValidationError::DuplicateProtocol {
+                    protocol: Protocol::try_from(endpoint.protocol).map_err(|_| {
+                        TransportValidationError::UnsupportedProtocol {
+                            discriminant: endpoint.protocol,
+                        }
+                    })?,
+                    first: first.uri.clone(),
+                    second: endpoint.uri.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Check an endpoint **this device configured for itself** — the value
     /// passed to
     /// [`with_own_transport`](crate::protocol::DeRecProtocolBuilder::with_own_transport),
@@ -743,7 +807,7 @@ impl TransportPolicy {
         endpoint: &derec_proto::TransportProtocol,
         loopback_is_free: bool,
     ) -> Result<(), TransportValidationError> {
-        TransportProtocolExt::validate(endpoint)?;
+        crate::extensions::transport_protocol::TransportProtocolExt::validate(endpoint)?;
 
         let Some(scheme) = PLAINTEXT_SCHEMES
             .iter()
@@ -824,6 +888,82 @@ fn is_loopback_uri_with_scheme(uri: &str, scheme: &str) -> bool {
 #[cfg(test)]
 mod transport_policy_tests {
     use super::*;
+
+    fn grpc(uri: &str) -> derec_proto::TransportProtocol {
+        derec_proto::TransportProtocol {
+            uri: uri.to_owned(),
+            protocol: Protocol::Grpc as i32,
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // One endpoint per protocol
+    // ---------------------------------------------------------------
+
+    /// This device's own advertisement is held strictly: a duplicate is a
+    /// configuration mistake the application can fix, and dropping one
+    /// silently would advertise something it did not ask for.
+    #[test]
+    fn own_set_refuses_a_repeated_protocol() {
+        let err = STRICT
+            .check_own_set(&[ep("https://a.example"), ep("https://b.example")])
+            .expect_err("one protocol may name only one endpoint");
+        assert!(
+            matches!(err, TransportValidationError::DuplicateProtocol { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// Distinct protocols are exactly what the list is for.
+    #[test]
+    fn own_set_accepts_one_endpoint_per_protocol() {
+        STRICT
+            .check_own_set(&[ep("https://a.example"), grpc("grpcs://a.example:443")])
+            .expect("distinct protocols are a valid advertisement");
+    }
+
+    /// A peer's duplicate is filtered, not refused. Its advertisement is
+    /// untrusted input, and failing the whole exchange over a contradiction
+    /// we can resolve would abort a pairing that has a usable endpoint in it.
+    #[test]
+    fn a_peers_repeated_protocol_is_filtered_to_the_first() {
+        let first = ep("https://first.example");
+        let second = ep("https://second.example");
+        let kept = STRICT
+            .admit_peer_endpoints(vec![&first, &second])
+            .expect("the first entry is usable");
+        assert_eq!(
+            kept,
+            vec![first],
+            "the earlier entry wins — the list is the peer's own preference order"
+        );
+    }
+
+    /// Filtering a duplicate must not cost the peer its other protocols.
+    #[test]
+    fn filtering_a_duplicate_keeps_the_other_protocols() {
+        let https = ep("https://a.example");
+        let dup = ep("https://b.example");
+        let grpc = grpc("grpcs://a.example:443");
+        let kept = STRICT
+            .admit_peer_endpoints(vec![&https, &dup, &grpc])
+            .expect("two usable protocols");
+        assert_eq!(kept, vec![https, grpc]);
+    }
+
+    /// The scheme filter runs first, so a duplicate of a *dropped* entry is
+    /// admitted rather than being suppressed by an endpoint that never
+    /// survived. Refusing it would leave the peer unreachable over a
+    /// protocol it does serve.
+    #[test]
+    fn a_duplicate_of_a_refused_endpoint_is_still_admitted() {
+        let plaintext = ep("http://a.example");
+        let secure = ep("https://b.example");
+        let kept = STRICT
+            .admit_peer_endpoints(vec![&plaintext, &secure])
+            .expect("the secure entry survives");
+        assert_eq!(kept, vec![secure]);
+    }
 
     fn ep(uri: &str) -> derec_proto::TransportProtocol {
         derec_proto::TransportProtocol {
@@ -966,8 +1106,18 @@ mod transport_policy_tests {
     /// the policy. Both http-family schemes are structurally sound.
     #[test]
     fn validate_is_structural_only() {
-        assert!(TransportProtocolExt::validate(&ep("http://anything.example.com")).is_ok());
-        assert!(TransportProtocolExt::validate(&ep("https://anything.example.com")).is_ok());
+        assert!(
+            crate::extensions::transport_protocol::TransportProtocolExt::validate(&ep(
+                "http://anything.example.com"
+            ))
+            .is_ok()
+        );
+        assert!(
+            crate::extensions::transport_protocol::TransportProtocolExt::validate(&ep(
+                "https://anything.example.com"
+            ))
+            .is_ok()
+        );
     }
 
     fn grpc_ep(uri: &str) -> derec_proto::TransportProtocol {

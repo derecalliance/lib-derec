@@ -81,24 +81,24 @@ func (s *inMemoryChannelStore) Remove(secretID, channelID, replicaID uint64) (bo
 	return existed, nil
 }
 
-func (s *inMemoryChannelStore) ListHelpers(secretID uint64) ([]HelperChannel, error) {
+func (s *inMemoryChannelStore) ListHelpers(secretID uint64, filter HelperFilter) ([]HelperChannel, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []HelperChannel
 	for key, h := range s.helpers {
-		if key[0] == secretID {
+		if key[0] == secretID && filter.Matches(h.ChannelID, h.Status, h.PeerRole) {
 			out = append(out, h)
 		}
 	}
 	return out, nil
 }
 
-func (s *inMemoryChannelStore) ListReplicas(secretID uint64) ([]ReplicaMember, error) {
+func (s *inMemoryChannelStore) ListReplicas(secretID uint64, filter ReplicaFilter) ([]ReplicaMember, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []ReplicaMember
 	for key, m := range s.members {
-		if key[0] == secretID {
+		if key[0] == secretID && filter.Matches(m.ReplicaID, m.Status, m.Role) {
 			out = append(out, m)
 		}
 	}

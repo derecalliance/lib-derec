@@ -47,11 +47,17 @@ internal sealed class InMemoryChannelStore : IChannelStore
             ? _helpers.Remove((secretId, channelId))
             : _members.Remove((secretId, replicaId));
 
-    public IEnumerable<HelperChannel> ListHelpers(ulong secretId) =>
-        _helpers.Where(kv => kv.Key.Item1 == secretId).Select(kv => kv.Value);
+    public IEnumerable<HelperChannel> ListHelpers(ulong secretId, HelperFilter filter) =>
+        _helpers
+            .Where(kv => kv.Key.Item1 == secretId)
+            .Select(kv => kv.Value)
+            .Where(c => filter.Matches(c.ChannelId, c.Status, c.PeerRole));
 
-    public IEnumerable<ReplicaMember> ListReplicas(ulong secretId) =>
-        _members.Where(kv => kv.Key.Item1 == secretId).Select(kv => kv.Value);
+    public IEnumerable<ReplicaMember> ListReplicas(ulong secretId, ReplicaFilter filter) =>
+        _members
+            .Where(kv => kv.Key.Item1 == secretId)
+            .Select(kv => kv.Value)
+            .Where(m => filter.Matches(m.ReplicaId, m.Status, m.Role));
 
     public void LinkChannel(ulong secretId, ulong a, ulong b)
     {

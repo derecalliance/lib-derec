@@ -152,6 +152,49 @@ type Config struct {
 	// ReplicaID configures this node's local replica_id, required for
 	// any replica-mode pairing. Default: unset.
 	ReplicaID *uint64
+
+	// ParameterRange declares the bounds this node advertises during pair
+	// negotiation. Embedded in outbound PairRequest/PairResponse envelopes
+	// and checked against the peer's range on inbound ones: a range that
+	// fails to intersect rejects the pairing with
+	// derec.CodeIncompatibleParameterRange. Default: unset — no constraints
+	// advertised, every peer range accepted.
+	ParameterRange *ParameterRange
+}
+
+// ParameterRange declares the bounds this node advertises during pair
+// negotiation, mirroring the ParameterRange proto field for field. Each bound
+// is optional and defaults to 0, which the proto reads as "no constraint on
+// this dimension".
+type ParameterRange struct {
+	MinShareSize                       int64
+	MaxShareSize                       int64
+	MinTimeBetweenVerifications        int64
+	MaxTimeBetweenVerifications        int64
+	MinTimeBetweenShareUpdates         int64
+	MaxTimeBetweenShareUpdates         int64
+	MinUnresponsiveDeletionTimeout     int64
+	MaxUnresponsiveDeletionTimeout     int64
+	MinUnresponsiveDeactivationTimeout int64
+	MaxUnresponsiveDeactivationTimeout int64
+}
+
+func nativeParameterRange(r *ParameterRange) *native.ParameterRangeConfig {
+	if r == nil {
+		return nil
+	}
+	return &native.ParameterRangeConfig{
+		MinShareSize:                       r.MinShareSize,
+		MaxShareSize:                       r.MaxShareSize,
+		MinTimeBetweenVerifications:        r.MinTimeBetweenVerifications,
+		MaxTimeBetweenVerifications:        r.MaxTimeBetweenVerifications,
+		MinTimeBetweenShareUpdates:         r.MinTimeBetweenShareUpdates,
+		MaxTimeBetweenShareUpdates:         r.MaxTimeBetweenShareUpdates,
+		MinUnresponsiveDeletionTimeout:     r.MinUnresponsiveDeletionTimeout,
+		MaxUnresponsiveDeletionTimeout:     r.MaxUnresponsiveDeletionTimeout,
+		MinUnresponsiveDeactivationTimeout: r.MinUnresponsiveDeactivationTimeout,
+		MaxUnresponsiveDeactivationTimeout: r.MaxUnresponsiveDeactivationTimeout,
+	}
 }
 
 // Timeouts configures how long the protocol waits on each thing that can keep
@@ -202,6 +245,12 @@ type RemoveExpiredChannelsPolicy struct {
 // from more than one goroutine at a time, matching every other DeRec SDK.
 type DeRecProtocol struct {
 	instance *native.ProtocolInstance
+
+	// secretID is kept so the constructed protocol can answer which secret
+	// it manages, matching the other SDKs (dotnet `SecretId`, TypeScript
+	// `secretId`). Without it a caller has to hold on to the Config value
+	// it passed in.
+	secretID uint64
 
 	// Strong references keeping the store/transport implementations
 	// reachable for as long as Rust may still invoke a callback into
@@ -314,7 +363,8 @@ func New(
 			Unpair:            config.AutoAccept.Unpair,
 			UpdateChannelInfo: config.AutoAccept.UpdateChannelInfo,
 		},
-		ReplicaID: config.ReplicaID,
+		ReplicaID:      config.ReplicaID,
+		ParameterRange: nativeParameterRange(config.ParameterRange),
 	}
 	instance, err := native.NewProtocolInstance(
 		channelStore, secretStore, shareStore, userSecretStore, stateStore, transport,
@@ -326,6 +376,7 @@ func New(
 
 	return &DeRecProtocol{
 		instance:        instance,
+		secretID:        config.SecretID,
 		channelStore:    channelStore,
 		secretStore:     secretStore,
 		shareStore:      shareStore,
@@ -337,6 +388,15 @@ func New(
 
 // Close frees the underlying protocol handle and releases the store
 // registration. Idempotent — safe to call more than once.
+// SecretID is the single secret this protocol instance manages, as supplied
+// in Config.SecretID.
+//
+// Mirrors dotnet's SecretId property and the TypeScript `secretId` accessor,
+// so a caller need not retain the Config it built with.
+func (p *DeRecProtocol) SecretID() uint64 {
+	return p.secretID
+}
+
 func (p *DeRecProtocol) Close() error {
 	if p.closed {
 		return nil
@@ -399,15 +459,41 @@ func (p *DeRecProtocol) RemoveExpiredChannels(olderThanSecs uint64) ([]uint64, e
 	return ids, nil
 }
 
-// SetOwnTransport replaces this node's local transport endpoint. Only
-// mutates local state — propagating the change to paired peers requires a
-// follow-up UpdateChannelInfo flow. See Config.OwnTransportProtocol for
-// the protocol argument's meaning.
+// SetOwnTransport replaces this node's endpoint for one protocol, leaving
+// the others alone. A node serves at most one endpoint per protocol, so the
+// (uri, protocol) pair identifies the entry it replaces; an entry for a
+// protocol not yet served is appended, and a replaced one keeps its position
+// in the preference order. Only mutates local state — propagating the change
+// to paired peers requires a follow-up UpdateChannelInfo flow. See
+// Config.OwnTransportProtocol for the protocol argument's meaning.
+//
+// Deprecated: use SetOwnTransports, which takes the whole preference list
+// and is the only way to change which protocols this node serves, or their
+// order. Removed at 0.0.5.
 func (p *DeRecProtocol) SetOwnTransport(uri string, protocol int32) error {
 	if p.closed {
 		return errors.New("protocol: SetOwnTransport: protocol is closed")
 	}
 	return p.instance.SetOwnTransport(uri, protocol)
+}
+
+// SetOwnTransports replaces every endpoint this node advertises, in
+// preference order. SetOwnTransport replaces only the entry for the
+// protocol its URI names. A node serves at most one endpoint per protocol,
+// so this list is a preference order over distinct protocols and two
+// entries of the same protocol are rejected.
+// Only mutates local state; propagating the change to paired peers
+// requires a follow-up UpdateChannelInfo flow. See
+// Config.OwnTransportProtocol for each entry's Protocol meaning.
+func (p *DeRecProtocol) SetOwnTransports(transports []TransportProtocolParam) error {
+	if p.closed {
+		return errors.New("protocol: SetOwnTransports: protocol is closed")
+	}
+	nativeTransports := make([]native.OwnTransport, 0, len(transports))
+	for _, t := range transports {
+		nativeTransports = append(nativeTransports, native.OwnTransport{URI: t.URI, Protocol: t.Protocol})
+	}
+	return p.instance.SetOwnTransports(nativeTransports)
 }
 
 // SetCommunicationInfo replaces this node's local communication_info map.

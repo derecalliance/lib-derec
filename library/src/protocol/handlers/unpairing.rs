@@ -41,24 +41,28 @@
 //! already unpaired" — the same end state the legitimate flow
 //! produces. No cross-request satisfaction is possible because the
 //! pending-unpair state store row is keyed by `channel_id` and the
-//! response envelope is routed by channel id at the transport layer.
+//! response envelope is routed by channel id at the stores.transport layer.
 
 use super::super::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecStateStore,
     DeRecTransport, PendingAction, SecretKind, SecretValue, StateItem, StateKey, events::UnpairAck,
 };
-use super::peer_endpoints;
+use super::replicas::unpairing as replica;
 use crate::derec_message::current_timestamp;
+use crate::extensions::channel_store::ChannelStoreExt as _;
+use crate::extensions::message_body::{MessageBodyExt as _, Route};
+use crate::protocol::context::{Exchange, Local, Round};
+use crate::protocol::stores::{StoreSet, Stores};
 use crate::{
     Error, Result,
     primitives::unpairing::{
         request::produce as produce_unpair_request,
         response::{self as unpairing_response, process as process_unpair_response},
     },
-    types::{ChannelId, SharedKey},
+    types::ChannelId,
 };
 use derec_proto::{
-    DeRecResult, MessageBody, StatusEnum, UnpairRequestMessage, UnpairResponseMessage,
+    DeRecResult, MessageBody, SenderKind, StatusEnum, UnpairRequestMessage, UnpairResponseMessage,
 };
 
 /// Route an inbound unpair message.
@@ -74,40 +78,25 @@ use derec_proto::{
 /// mutating any state.
 #[cfg_attr(
     feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+    tracing::instrument(skip_all, fields(trace_id = exchange.trace_id, channel_id = exchange.channel_id.0))
 )]
-#[allow(clippy::too_many_arguments)]
-pub(in crate::protocol) async fn handle<
-    Ch: DeRecChannelStore,
-    Sh: DeRecShareStore,
-    Ss: DeRecSecretStore,
-    St: DeRecStateStore,
->(
-    channel_store: &mut Ch,
-    share_store: &mut Sh,
-    secret_store: &mut Ss,
-    state_store: &mut St,
-    secret_id: u64,
-    channel_id: ChannelId,
+pub(in crate::protocol) async fn handle<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    exchange: &Exchange<'_>,
     inner: MessageBody,
-    shared_key: SharedKey,
-    inbound_trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
-    match inner {
-        MessageBody::UnpairRequest(request) => {
-            on_request(channel_id, request, shared_key, inbound_trace_id)
+    match (inner.route(), inner) {
+        (Route::Replica(target), inner) => replica::handle(stores, local, target, inner).await,
+        (_, MessageBody::UnpairRequest(request)) => {
+            stores
+                .channels
+                .require_role(local.secret_id, &[exchange.channel_id], SenderKind::Owner)
+                .await?;
+            on_request(exchange, request)
         }
-        MessageBody::UnpairResponse(response) => {
-            on_response(
-                channel_store,
-                share_store,
-                secret_store,
-                state_store,
-                secret_id,
-                channel_id,
-                &response,
-            )
-            .await
+        (_, MessageBody::UnpairResponse(response)) => {
+            on_response(stores, local, exchange, &response).await
         }
         _ => Err(Error::Invariant(
             "unexpected MessageBody variant in unpairing handler",
@@ -115,31 +104,22 @@ pub(in crate::protocol) async fn handle<
     }
 }
 
-#[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
-#[allow(clippy::too_many_arguments)]
-pub(in crate::protocol) async fn start<
-    Ch: DeRecChannelStore,
-    Sh: DeRecShareStore,
-    Ss: DeRecSecretStore,
-    T: DeRecTransport,
-    St: DeRecStateStore,
->(
-    channel_store: &mut Ch,
-    share_store: &mut Sh,
-    secret_store: &mut Ss,
-    transport: &T,
-    state_store: &mut St,
-    secret_id: u64,
+#[cfg_attr(feature = "logging", tracing::instrument(skip_all, fields(trace_id = round.trace_id)))]
+pub(in crate::protocol) async fn start<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
     channel_id: ChannelId,
     memo: Option<String>,
     unpair_ack: UnpairAck,
     now: u64,
-    reply_to: &[derec_proto::TransportProtocol],
+    round: &Round<'_>,
 ) -> Result<Vec<DeRecEvent>> {
+    let secret_id = local.secret_id;
     let memo_str = memo.unwrap_or_default();
     let mut events = Vec::new();
 
-    let shared_key = match secret_store
+    let shared_key = match stores
+        .secrets
         .load(secret_id, channel_id, SecretKind::SharedKey)
         .await?
     {
@@ -153,25 +133,22 @@ pub(in crate::protocol) async fn start<
 
     // Helper unpair: no member is named, which is what marks this the
     // owner ↔ helper path rather than a replica-group removal.
-    let request = produce_unpair_request(channel_id, &memo_str, &shared_key, reply_to, None)?;
-    let envelope = super::apply_trace_id(request.envelope, super::fresh_trace_id())?;
-    let endpoint = peer_endpoints(channel_store, secret_id, channel_id).await?;
-    transport.send(&endpoint, envelope).await?;
+    let request = produce_unpair_request(channel_id, &memo_str, &shared_key, round.reply_to, None)?;
+    let envelope = crate::derec_message::apply_trace_id(&request.envelope, round.trace_id)?;
+    let endpoint = stores
+        .channels
+        .peer_endpoints(secret_id, channel_id)
+        .await?;
+    stores.transport.send(&endpoint, envelope).await?;
 
     match unpair_ack {
         UnpairAck::NotRequired => {
-            drop_channel_state(
-                channel_store,
-                share_store,
-                secret_store,
-                secret_id,
-                channel_id,
-            )
-            .await?;
+            drop_channel_state(stores, local, channel_id).await?;
             events.push(DeRecEvent::Unpaired { channel_id });
         }
         UnpairAck::Required => {
-            state_store
+            stores
+                .state
                 .save(
                     secret_id,
                     StateItem::PendingUnpair {
@@ -195,40 +172,24 @@ pub(in crate::protocol) async fn start<
 
 #[cfg_attr(
     feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+    tracing::instrument(skip_all, fields(trace_id = exchange.trace_id, channel_id = exchange.channel_id.0))
 )]
-#[allow(clippy::too_many_arguments)]
-pub(in crate::protocol) async fn accept<
-    Ch: DeRecChannelStore,
-    Sh: DeRecShareStore,
-    Ss: DeRecSecretStore,
-    T: DeRecTransport,
->(
-    channel_store: &mut Ch,
-    share_store: &mut Sh,
-    secret_store: &mut Ss,
-    transport: &T,
-    secret_id: u64,
-    channel_id: ChannelId,
+pub(in crate::protocol) async fn accept<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    exchange: &Exchange<'_>,
     request: &UnpairRequestMessage,
-    shared_key: &SharedKey,
-    trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
-    let resp = unpairing_response::produce(channel_id, shared_key)?;
-    let envelope = super::apply_trace_id(resp.envelope, trace_id)?;
-    let endpoint =
-        super::resolve_response_endpoints(channel_store, secret_id, channel_id, &request.reply_to)
-            .await?;
-    transport.send(&endpoint, envelope).await?;
+    let channel_id = exchange.channel_id;
+    let resp = unpairing_response::produce(channel_id, exchange.shared_key)?;
+    let envelope = crate::derec_message::apply_trace_id(&resp.envelope, exchange.trace_id)?;
+    let endpoint = stores
+        .channels
+        .resolve_response_endpoints(local.secret_id, channel_id, &request.reply_to)
+        .await?;
+    stores.transport.send(&endpoint, envelope).await?;
 
-    drop_channel_state(
-        channel_store,
-        share_store,
-        secret_store,
-        secret_id,
-        channel_id,
-    )
-    .await?;
+    drop_channel_state(stores, local, channel_id).await?;
 
     #[cfg(feature = "logging")]
     tracing::info!("unpair accepted; local state dropped");
@@ -238,19 +199,15 @@ pub(in crate::protocol) async fn accept<
 
 #[cfg_attr(
     feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0, status = status as i32))
+    tracing::instrument(skip_all, fields(trace_id = exchange.trace_id, channel_id = exchange.channel_id.0, status = status as i32))
 )]
-#[allow(clippy::too_many_arguments)]
-pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport>(
-    channel_store: &mut Ch,
-    transport: &T,
-    secret_id: u64,
-    channel_id: ChannelId,
+pub(in crate::protocol) async fn reject<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    exchange: &Exchange<'_>,
     request: &UnpairRequestMessage,
-    shared_key: &SharedKey,
     status: StatusEnum,
     memo: &str,
-    trace_id: u64,
 ) -> Result<()> {
     let response = UnpairResponseMessage {
         result: Some(DeRecResult {
@@ -260,43 +217,42 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
         timestamp: Some(current_timestamp()),
     };
 
-    super::send_channel_message(
-        channel_store,
-        transport,
-        secret_id,
-        channel_id,
+    crate::extensions::channel_store::send_channel_message(
+        stores.channels,
+        stores.transport,
+        local.secret_id,
+        exchange.channel_id,
         MessageBody::UnpairResponse(response),
-        shared_key,
-        trace_id,
+        exchange.shared_key,
+        exchange.trace_id,
         &request.reply_to,
     )
     .await
 }
 
-pub(in crate::protocol) async fn drop_channel_state<
-    Ch: DeRecChannelStore,
-    Sh: DeRecShareStore,
-    Ss: DeRecSecretStore,
->(
-    channel_store: &mut Ch,
-    share_store: &mut Sh,
-    secret_store: &mut Ss,
-    secret_id: u64,
+pub(in crate::protocol) async fn drop_channel_state<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
     channel_id: ChannelId,
 ) -> Result<()> {
-    share_store.remove_channel(secret_id, channel_id).await?;
+    let secret_id = local.secret_id;
+    stores.shares.remove_channel(secret_id, channel_id).await?;
 
-    let _ = secret_store
+    let _ = stores
+        .secrets
         .remove(secret_id, channel_id, SecretKind::SharedKey)
         .await;
-    let _ = secret_store
+    let _ = stores
+        .secrets
         .remove(secret_id, channel_id, SecretKind::PairingSecret)
         .await;
-    let _ = secret_store
+    let _ = stores
+        .secrets
         .remove(secret_id, channel_id, SecretKind::PairingContact)
         .await;
 
-    let _ = channel_store
+    let _ = stores
+        .channels
         .remove(
             secret_id,
             crate::protocol::types::ChannelQuery::Helper { channel_id },
@@ -307,45 +263,38 @@ pub(in crate::protocol) async fn drop_channel_state<
 
 #[cfg_attr(
     feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+    tracing::instrument(skip_all, fields(trace_id = exchange.trace_id, channel_id = exchange.channel_id.0))
 )]
-fn on_request(
-    channel_id: ChannelId,
-    request: UnpairRequestMessage,
-    shared_key: SharedKey,
-    trace_id: u64,
-) -> Result<Vec<DeRecEvent>> {
+fn on_request(exchange: &Exchange<'_>, request: UnpairRequestMessage) -> Result<Vec<DeRecEvent>> {
     Ok(vec![DeRecEvent::ActionRequired {
-        channel_id,
+        channel_id: exchange.channel_id,
         action: PendingAction::Unpair {
-            channel_id,
+            channel_id: exchange.channel_id,
             request,
-            shared_key,
-            trace_id,
+            shared_key: *exchange.shared_key,
+            trace_id: exchange.trace_id,
         },
     }])
 }
 
 #[cfg_attr(
     feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+    tracing::instrument(skip_all, fields(trace_id = exchange.trace_id, channel_id = exchange.channel_id.0))
 )]
-async fn on_response<
-    Ch: DeRecChannelStore,
-    Sh: DeRecShareStore,
-    Ss: DeRecSecretStore,
-    St: DeRecStateStore,
->(
-    channel_store: &mut Ch,
-    share_store: &mut Sh,
-    secret_store: &mut Ss,
-    state_store: &mut St,
-    secret_id: u64,
-    channel_id: ChannelId,
+async fn on_response<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    exchange: &Exchange<'_>,
     response: &UnpairResponseMessage,
 ) -> Result<Vec<DeRecEvent>> {
-    if !state_store
-        .remove(secret_id, StateKey::PendingUnpair { channel_id })
+    if !stores
+        .state
+        .remove(
+            local.secret_id,
+            StateKey::PendingUnpair {
+                channel_id: exchange.channel_id,
+            },
+        )
         .await?
     {
         return Ok(vec![DeRecEvent::NoOp]);
@@ -353,21 +302,16 @@ async fn on_response<
 
     match process_unpair_response(response) {
         Ok(_) => {
-            drop_channel_state(
-                channel_store,
-                share_store,
-                secret_store,
-                secret_id,
-                channel_id,
-            )
-            .await?;
-            Ok(vec![DeRecEvent::Unpaired { channel_id }])
+            drop_channel_state(stores, local, exchange.channel_id).await?;
+            Ok(vec![DeRecEvent::Unpaired {
+                channel_id: exchange.channel_id,
+            }])
         }
         Err(Error::Unpairing(crate::primitives::unpairing::UnpairingError::NonOkStatus {
             status,
             memo,
         })) => Ok(vec![DeRecEvent::UnpairRejected {
-            channel_id,
+            channel_id: exchange.channel_id,
             status,
             memo,
         }]),

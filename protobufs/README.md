@@ -176,6 +176,42 @@ Full protocol documentation:
 
 https://derec-alliance.gitbook.io/docs/protocol-specification/messages
 
+### Store-share schema revision
+
+The two store-share messages were revised after this schema was first
+derived, so an implementation built against an earlier revision will not
+interoperate with them. Field numbers and scalar types are both wire-
+significant, and all three kinds of change below affect the encoding.
+
+`StoreShareRequestMessage`:
+
+| field | before | now |
+| --- | --- | --- |
+| `secretId` | *(absent — read from the enclosing `DeRecMessage`)* | `uint64` = 3 |
+| `version` | `int32` = 3 | `uint32` = 4 |
+| `keepList` | `repeated int32` = 4 | `repeated uint32` = 5 |
+| `versionDescription` | = 5 | = 6 |
+| `timestamp` | = 6 | = 7 |
+
+`StoreShareResponseMessage`:
+
+| field | before | now |
+| --- | --- | --- |
+| `secretId` | *(absent)* | `uint64` = 2 |
+| `version` | `int32` = 2 | `uint32` = 3 |
+| `timestamp` | = 3 | = 4 |
+
+`secretId` was added so the store-share messages identify their own secret
+rather than depending on the envelope, which every other message family
+already did — `GetShare`, `VerifyShare` and `DeRecShare` all carry
+`secretId` immediately before `version`. The remaining fields were
+renumbered to make room, and the two counters became unsigned because
+neither a version nor a retained-version list is ever negative.
+
+`replyTo` (8) and `replicaId` (9) on the request, and `replicaId` (5) on the
+response, were added afterwards in free slots and are backward compatible:
+both are `optional`, and a reader that does not know them ignores them.
+
 ---
 
 ## License

@@ -300,6 +300,10 @@ impl DeRecProtocolBuilderWasm {
 
     /// `endpoint` shape: `{ uri: string, protocol: string }`.
     /// `protocol` is `"https"` or `"grpc"` (case-insensitive).
+    ///
+    /// @deprecated Use `withOwnTransports`, which takes the whole preference
+    /// list — `withOwnTransports([endpoint])` is the direct replacement.
+    /// Removed at 0.0.5.
     #[wasm_bindgen(js_name = withOwnTransport)]
     pub fn with_own_transport(
         mut self,
@@ -538,18 +542,20 @@ impl DeRecProtocolBuilderWasm {
     }
 
     /// Declare the local node's acceptable parameter range for pair
-    /// negotiation. `range` is a JS object whose keys mirror the
-    /// `ParameterRange` proto (`minShareSize`, `maxShareSize`,
-    /// `minTimeBetweenVerifications`, ...). Each field is `i64` —
-    /// accept either a number or a `BigInt` on the JS side. Default:
-    /// unset (no constraints advertised, every peer range accepted).
+    /// negotiation. `range` is a JS object whose keys match the
+    /// `ParameterRange` interface every binding already declares —
+    /// `min_share_size`, `max_share_size`, `min_time_between_verifications`,
+    /// … — so one shape serves the wasm and FFI paths alike. Each field is
+    /// `i64`: accept either a number or a `BigInt` on the JS side. Every
+    /// field is optional and defaults to `0`, which the proto reads as no
+    /// constraint on that dimension. Default: unset (no constraints
+    /// advertised, every peer range accepted).
     #[wasm_bindgen(js_name = withParameterRange)]
     pub fn with_parameter_range(
         mut self,
         range: JsValue,
     ) -> Result<DeRecProtocolBuilderWasm, JsValue> {
         #[derive(serde::Deserialize)]
-        #[serde(rename_all = "camelCase")]
         struct In {
             #[serde(default)]
             min_share_size: i64,
@@ -761,8 +767,65 @@ impl DeRecProtocolWasm {
         Ok(())
     }
 
-    /// Replace this node's local transport endpoint. See
-    /// `setCommunicationInfo` for the matching update-propagation flow.
+    /// Replace every endpoint this node advertises, in preference order.
+    ///
+    /// `transports` is an array of `{ uri: string, protocol: string }`
+    /// objects, same shape as `withOwnTransports`. The runtime counterpart
+    /// to that builder setter, and the way to change the whole set:
+    /// `setOwnTransport` replaces only the entry for the protocol its URI
+    /// names. A node serves at most one endpoint per protocol, so this list
+    /// is a preference order over distinct protocols and two entries of the
+    /// same protocol are rejected.
+    ///
+    /// Every entry is validated before any is stored, so a malformed URI
+    /// leaves the previous set intact. IMPORTANT: keep the old endpoints
+    /// operational during the changeover — see the Rust docs on
+    /// `set_own_transports` for the discipline.
+    #[wasm_bindgen(js_name = "setOwnTransports")]
+    pub fn set_own_transports(&mut self, transports: Vec<JsValue>) -> Result<(), JsValue> {
+        #[derive(serde::Deserialize)]
+        struct EndpointShape {
+            uri: String,
+            protocol: String,
+        }
+        let mut validated = Vec::with_capacity(transports.len());
+        for endpoint in transports {
+            let parsed: EndpointShape = serde_wasm_bindgen::from_value(endpoint)
+                .map_err(|e| js_error("INVALID_OWN_TRANSPORT", e.to_string()))?;
+            let protocol_num =
+                protocol_name_to_discriminant(&parsed.protocol).ok_or_else(|| {
+                    js_error(
+                        "INVALID_PROTOCOL",
+                        format!("unknown protocol: {}", parsed.protocol.to_lowercase()),
+                    )
+                })?;
+            let proto_tp = TransportProtocol {
+                uri: parsed.uri,
+                protocol: protocol_num,
+            };
+            validated.push(
+                crate::transport::TransportProtocol::try_from(&proto_tp)
+                    .map_err(|e| js_error("INVALID_OWN_TRANSPORT", e.to_string()))?,
+            );
+        }
+        self.inner
+            .set_own_transports(validated)
+            .map_err(|e| js_error("INVALID_OWN_TRANSPORT", e.to_string()))?;
+        Ok(())
+    }
+
+    /// Replace this node's endpoint for one protocol, leaving the others
+    /// alone. A node serves at most one endpoint per protocol, so the
+    /// `(uri, protocol)` pair identifies the entry it replaces; an entry for
+    /// a protocol not yet served is appended, and a replaced one keeps its
+    /// position in the preference order.
+    ///
+    /// @deprecated Use `setOwnTransports`, which takes the whole preference
+    /// list and is the only way to change which protocols this node serves,
+    /// or their order. Removed at 0.0.5.
+    ///
+    /// See `setCommunicationInfo` for the matching update-propagation
+    /// flow, and `setOwnTransports` to keep more than one endpoint.
     /// IMPORTANT: keep the old endpoint operational during the changeover —
     /// see the Rust docs on `set_own_transport` for the discipline.
     #[wasm_bindgen(js_name = "setOwnTransport")]
@@ -782,7 +845,7 @@ impl DeRecProtocolWasm {
         let lib_tp = crate::transport::TransportProtocol::try_from(&proto_tp)
             .map_err(|e| js_error("INVALID_OWN_TRANSPORT", e.to_string()))?;
         self.inner
-            .set_own_transport(lib_tp)
+            .set_own_transports([lib_tp])
             .map_err(|e| js_error("INVALID_OWN_TRANSPORT", e.to_string()))?;
         Ok(())
     }
@@ -1484,7 +1547,7 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
             })
         }
         8 => {
-            // RemoveReplica: `{ replica_id, memo? }`. `replica_id` is a
+            // UnpairReplica: `{ replica_id, memo? }`. `replica_id` is a
             // decimal string so large values survive JS number handling.
             let replica_id_val = js_sys::Reflect::get(&params, &JsValue::from_str("replica_id"))
                 .unwrap_or(JsValue::UNDEFINED);
@@ -1511,12 +1574,12 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
             } else {
                 memo_val.as_string()
             };
-            Ok(DeRecFlow::RemoveReplica { replica_id, memo })
+            Ok(DeRecFlow::UnpairReplica { replica_id, memo })
         }
         7 => {
-            // SyncCheck takes no parameters: the group and this device's own
+            // ReplicaDiscovery takes no parameters: the group and this device's own
             // version are both read from the stores.
-            Ok(DeRecFlow::SyncCheck)
+            Ok(DeRecFlow::ReplicaDiscovery)
         }
         _ => Err(js_error(
             "INVALID_FLOW_KIND",

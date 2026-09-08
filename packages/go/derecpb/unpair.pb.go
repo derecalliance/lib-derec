@@ -85,10 +85,10 @@ type UnpairRequestMessage struct {
 	// the response to *this exchange*, overriding the channel's stored peer
 	// endpoint for this round-trip only.
 	//
-	// See `StoreShareRequestMessage.replyTo` for full semantics. Absent =
+	// See `StoreShareRequestMessage.replyTo` for full semantics. Empty =
 	// route to the stored channel endpoint; Present = route this response
 	// here without persisting the endpoint.
-	ReplyTo *TransportProtocol `protobuf:"bytes,3,opt,name=replyTo,proto3,oneof" json:"replyTo,omitempty"`
+	ReplyTo []*TransportProtocol `protobuf:"bytes,3,rep,name=replyTo,proto3" json:"replyTo,omitempty"`
 	// Identity of the replica-group member that initiated this unpair.
 	//
 	// A replica-originated unpair MUST carry it; an owner-originated one MUST
@@ -150,7 +150,7 @@ func (x *UnpairRequestMessage) GetTimestamp() *timestamppb.Timestamp {
 	return nil
 }
 
-func (x *UnpairRequestMessage) GetReplyTo() *TransportProtocol {
+func (x *UnpairRequestMessage) GetReplyTo() []*TransportProtocol {
 	if x != nil {
 		return x.ReplyTo
 	}
@@ -250,14 +250,12 @@ var File_unpair_proto protoreflect.FileDescriptor
 
 const file_unpair_proto_rawDesc = "" +
 	"\n" +
-	"\funpair.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\xf5\x01\n" +
+	"\funpair.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\xe4\x01\n" +
 	"\x14UnpairRequestMessage\x12\x12\n" +
 	"\x04memo\x18\x01 \x01(\tR\x04memo\x128\n" +
-	"\ttimestamp\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12R\n" +
-	"\areplyTo\x18\x03 \x01(\v23.org.derecalliance.derec.protobuf.TransportProtocolH\x00R\areplyTo\x88\x01\x01\x12!\n" +
-	"\treplicaId\x18\x04 \x01(\x04H\x01R\treplicaId\x88\x01\x01B\n" +
-	"\n" +
-	"\b_replyToB\f\n" +
+	"\ttimestamp\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12M\n" +
+	"\areplyTo\x18\x03 \x03(\v23.org.derecalliance.derec.protobuf.TransportProtocolR\areplyTo\x12!\n" +
+	"\treplicaId\x18\x04 \x01(\x04H\x00R\treplicaId\x88\x01\x01B\f\n" +
 	"\n" +
 	"_replicaId\"\x98\x01\n" +
 	"\x15UnpairResponseMessage\x12E\n" +

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use crate::extensions::committed_derec_share::CommittedDeRecShareExt as _;
+use crate::extensions::derec_result::DeRecResultExt as _;
 use crate::primitives::sharing::SharingError;
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
@@ -336,16 +338,7 @@ pub fn process(version: u32, response: &StoreShareResponseMessage) -> Result<(),
         "StoreShareResponseMessage is missing result field",
     ))?;
 
-    // TODO result.validate()?
-    if result.status != StatusEnum::Ok as i32 {
-        #[cfg(feature = "logging")]
-        tracing::warn!(status = result.status, memo = %result.memo, "share response status is not Ok");
-        return Err(SharingError::NonOkStatus {
-            status: result.status,
-            memo: result.memo.to_owned(),
-        }
-        .into());
-    }
+    result.validate(|status, memo| SharingError::NonOkStatus { status, memo })?;
 
     if response.version != version {
         #[cfg(feature = "logging")]
@@ -370,7 +363,6 @@ pub fn process(version: u32, response: &StoreShareResponseMessage) -> Result<(),
 fn validate_produce_inputs(
     request: &StoreShareRequestMessage,
 ) -> Result<(CommittedDeRecShare, u64), crate::Error> {
-    // TODO: can we reuse request.read_share()? from previous TODO?
     if request.share.is_empty() {
         #[cfg(feature = "logging")]
         tracing::warn!("share field is empty in StoreShareRequestMessage");
@@ -382,30 +374,7 @@ fn validate_produce_inputs(
     let committed_share = CommittedDeRecShare::decode(request.share.as_slice())
         .map_err(crate::Error::ProtobufDecode)?;
 
-    // TODO: can we have committed_share.validate()?
-    if committed_share.de_rec_share.is_empty() {
-        #[cfg(feature = "logging")]
-        tracing::warn!("CommittedDeRecShare.de_rec_share is empty");
-        return Err(crate::Error::Invariant(
-            "CommittedDeRecShare.de_rec_share is empty",
-        ));
-    }
-
-    if committed_share.commitment.is_empty() {
-        #[cfg(feature = "logging")]
-        tracing::warn!("CommittedDeRecShare.commitment is empty");
-        return Err(crate::Error::Invariant(
-            "CommittedDeRecShare.commitment is empty",
-        ));
-    }
-
-    if committed_share.merkle_path.is_empty() {
-        #[cfg(feature = "logging")]
-        tracing::warn!("CommittedDeRecShare.merkle_path is empty");
-        return Err(crate::Error::Invariant(
-            "CommittedDeRecShare.merkle_path is empty",
-        ));
-    }
+    committed_share.validate()?;
 
     let inner_share = DeRecShare::decode(committed_share.de_rec_share.as_slice())
         .map_err(crate::Error::ProtobufDecode)?;

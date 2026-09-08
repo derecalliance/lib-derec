@@ -15,6 +15,7 @@
     "README.md",
     "LICENSE"
   ],
+  "main": "index.js",
   "module": "index.js",
   "types": "index.d.ts",
   "keywords": [
@@ -23,7 +24,7 @@
     "recovery",
     "secret-sharing",
     "sdk",
-    "nodejs",
+    "browser",
     "typescript",
     "wasm",
     "webassembly"

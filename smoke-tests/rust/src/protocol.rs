@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use derec_library::protocol::types::{
-    ChannelQuery, ChannelRecord, HelperChannel, ReplicaMember, ReplicaRole, Target, UserSecret,
-    UserSecrets,
+    ChannelQuery, ChannelRecord, HelperChannel, HelperFilter, ReplicaFilter, ReplicaMember,
+    ReplicaRole, Target, UserSecret, UserSecrets,
 };
 use derec_library::protocol::{
     ChannelStoreFuture, DeRecChannelStore, DeRecEvent, DeRecFlow, DeRecProtocol,
@@ -41,6 +41,7 @@ pub async fn run_all() {
     run_start_pairing_rejects_already_paired_channel().await;
     run_pairing_rejects_incompatible_parameter_range().await;
     run_expired_channel_cleanup_flow().await;
+    run_own_transport_set_rules().await;
 }
 
 /// Stores channel records plus the channel-link graph (channels belonging to
@@ -105,22 +106,32 @@ impl DeRecChannelStore for InMemoryChannelStore {
         Box::pin(std::future::ready(Ok(removed)))
     }
 
-    fn helpers(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+    fn helpers(
+        &self,
+        secret_id: u64,
+        filter: HelperFilter,
+    ) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
         let entries: Vec<HelperChannel> = self
             .helper_rows
             .iter()
             .filter(|((s, _), _)| *s == secret_id)
             .map(|(_, c)| c.clone())
+            .filter(|c| filter.matches(&c.channel_id, c.status, &c.peer_role))
             .collect();
         Box::pin(std::future::ready(Ok(entries)))
     }
 
-    fn replicas(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
+    fn replicas(
+        &self,
+        secret_id: u64,
+        filter: ReplicaFilter,
+    ) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
         let entries: Vec<ReplicaMember> = self
             .member_rows
             .iter()
             .filter(|((s, _), _)| *s == secret_id)
             .map(|(_, m)| m.clone())
+            .filter(|m| filter.matches(&m.replica_id, m.status, &m.role))
             .collect();
         Box::pin(std::future::ready(Ok(entries)))
     }
@@ -585,7 +596,7 @@ impl Peer {
             .with_user_secret_store(InMemoryUserSecretStore::default())
             .with_transport(transport.clone())
             .with_state_store(InMemoryStateStore::default())
-            .with_own_transport(uri)
+            .with_own_transports([uri])
             .with_threshold(2)
             .with_replica_id(replica_id)
             .with_timeouts(derec_library::protocol::types::Timeouts {
@@ -637,7 +648,7 @@ impl Peer {
             .with_user_secret_store(InMemoryUserSecretStore::default())
             .with_transport(transport.clone())
             .with_state_store(InMemoryStateStore::default())
-            .with_own_transport(uri)
+            .with_own_transports([uri])
             .with_threshold(2)
             .with_parameter_range(range)
             .build()
@@ -667,7 +678,7 @@ impl Peer {
             .with_user_secret_store(InMemoryUserSecretStore::default())
             .with_transport(transport.clone())
             .with_state_store(InMemoryStateStore::default())
-            .with_own_transport(uri)
+            .with_own_transports([uri])
             .with_threshold(threshold)
             .with_auto_reply_to(auto_reply_to)
             .with_auto_accept(auto_accept);
@@ -825,7 +836,9 @@ async fn pair(owner: &mut Peer, helper: &mut Peer, channel_id: ChannelId) -> Cha
     let pairing_started = start_events
         .iter()
         .find_map(|e| match e {
-            DeRecEvent::PairingStarted { channel_id, kind } => Some((*channel_id, *kind)),
+            DeRecEvent::PairingStarted {
+                channel_id, kind, ..
+            } => Some((*channel_id, *kind)),
             _ => None,
         })
         .expect("start(Pairing) must emit PairingStarted");
@@ -976,7 +989,7 @@ async fn run_pairing_flow() {
 
 /// Drive a full HashedKeys pairing handshake: Owner creates a HashedKeys
 /// contact (binding hash only, no inline public keys), Helper kicks off the
-/// PrePair leg, Owner publishes its real keys via `accept_pre_pair`, Helper
+/// PrePair leg, Owner publishes its real keys via `pre_pair::accept`, Helper
 /// validates the hash and auto-proceeds to a regular `PairRequest`, then
 /// both sides reach `PairingCompleted`. The whole multi-leg chain drains
 /// through a single `pump` call.
@@ -1498,13 +1511,13 @@ async fn run_replica_id_wiring_flow() {
     let owner_roster = owner
         .protocol
         .channel_store
-        .replicas(owner_sid)
+        .replicas(owner_sid, ReplicaFilter::default())
         .await
         .expect("owner roster load");
     let helper_roster = helper
         .protocol
         .channel_store
-        .replicas(helper_sid)
+        .replicas(helper_sid, ReplicaFilter::default())
         .await
         .expect("helper roster load");
 
@@ -1742,6 +1755,7 @@ async fn run_protect_secret_with_replica_targets_flow() {
             DeRecEvent::ProtectSecretStarted {
                 channel_id,
                 version,
+                ..
             } => Some((*channel_id, *version)),
             _ => None,
         })
@@ -2597,7 +2611,7 @@ async fn run_update_channel_info_flow() {
     owner.protocol.set_communication_info(new_info.clone());
     owner
         .protocol
-        .set_own_transport(new_uri.clone())
+        .set_own_transports([new_uri.clone()])
         .expect("test fixture: valid URI should pass set_own_transport validation");
     owner.uri = new_uri.clone();
 
@@ -3247,7 +3261,7 @@ async fn run_replica_sync_version_progression_flow() {
         let roster = peer
             .protocol
             .channel_store
-            .replicas(peer.protocol.secret_id())
+            .replicas(peer.protocol.secret_id(), ReplicaFilter::default())
             .await
             .expect("replicas");
         let ids: std::collections::BTreeSet<u64> = roster.iter().map(|m| m.channel_id.0).collect();
@@ -3385,7 +3399,7 @@ async fn run_replica_group_key_handover_flow() {
         let roster = peer
             .protocol
             .channel_store
-            .replicas(sid)
+            .replicas(sid, ReplicaFilter::default())
             .await
             .expect("replicas");
         assert_eq!(roster.len(), 3, "{label} roster holds all three members");
@@ -3617,7 +3631,7 @@ async fn assert_hydrated(
     let stored_helpers = peer
         .protocol
         .channel_store
-        .helpers(sid)
+        .helpers(sid, HelperFilter::default())
         .await
         .expect("helpers");
     assert_eq!(
@@ -3629,7 +3643,7 @@ async fn assert_hydrated(
     let roster = peer
         .protocol
         .channel_store
-        .replicas(sid)
+        .replicas(sid, ReplicaFilter::default())
         .await
         .expect("replicas");
     assert_eq!(
@@ -3786,7 +3800,7 @@ async fn run_auto_accept_flow() {
 /// `Error::InvalidInput` rather than silently overwriting the
 /// completed-pair state. Guards the defensive
 /// `reject_start_on_paired_channel` check in
-/// `handlers::pairing::start_inlined_keys` / `start_hashed_keys`.
+/// `handlers::pairing::pair::start` / `pre_pair::start`.
 async fn run_start_pairing_rejects_already_paired_channel() {
     use derec_library::protocol::AutoAcceptPolicy;
     use derec_library::protocol::types::ChannelStatus;
@@ -4069,4 +4083,89 @@ async fn run_expired_channel_cleanup_flow() {
     );
 
     println!("  ✓ expired channel cleanup: policy and manual sweep are independent");
+}
+
+/// The rules governing what a device may advertise about itself.
+///
+/// A device serves at most one endpoint per protocol, so a list of endpoints
+/// is a preference order over *distinct* protocols rather than a pool of
+/// interchangeable addresses. The builder and the runtime setters are held to
+/// the same rule — a set can never reach a state the builder would refuse.
+async fn run_own_transport_set_rules() {
+    println!("=== Own-transport set rules ===");
+
+    let build = |endpoints: &[&str]| {
+        DeRecProtocolBuilder::new(DEFAULT_TEST_SECRET_ID)
+            .with_channel_store(InMemoryChannelStore::default())
+            .with_share_store(InMemoryShareStore::default())
+            .with_secret_store(InMemorySecretStore::default())
+            .with_user_secret_store(InMemoryUserSecretStore::default())
+            .with_transport(InProcessTransport::new())
+            .with_state_store(InMemoryStateStore::default())
+            .with_own_transports(endpoints.to_vec())
+            .with_threshold(2)
+            .build()
+    };
+
+    // Each entry is individually well-formed; the *set* is not.
+    let Err(err) = build(&["https://a.example", "https://b.example"]) else {
+        panic!("two endpoints of one protocol must be refused");
+    };
+    assert!(
+        matches!(
+            err,
+            derec_library::Error::Transport(
+                derec_library::transport::TransportValidationError::DuplicateProtocol { .. }
+            )
+        ),
+        "expected DuplicateProtocol, got {err:?}"
+    );
+    println!("  two endpoints of one protocol refused  ✓");
+
+    let mut protocol = build(&["https://a.example", "grpcs://a.example:443"])
+        .expect("distinct protocols are a valid advertisement");
+    println!("  distinct protocols accepted  ✓");
+
+    // Re-pointing HTTPS leaves gRPC where it was, and keeps HTTPS in its
+    // position: changing an address is not a change of preference.
+    #[allow(deprecated)]
+    protocol
+        .set_own_transport("https://moved.example")
+        .expect("re-pointing one protocol is valid");
+    let uris: Vec<String> = protocol
+        .own_transports
+        .iter()
+        .map(|t| t.uri.clone())
+        .collect();
+    assert_eq!(
+        uris,
+        vec![
+            "https://moved.example".to_owned(),
+            "grpcs://a.example:443".to_owned()
+        ],
+        "set_own_transport must re-point only its own protocol, in place"
+    );
+    println!("  set_own_transport re-points one protocol, in place  ✓");
+
+    // The runtime setter applies the same rule as the builder.
+    let err = protocol
+        .set_own_transports(["https://a.example", "https://b.example"])
+        .expect_err("a duplicate protocol must be refused at runtime too");
+    assert!(
+        matches!(
+            err,
+            derec_library::Error::Transport(
+                derec_library::transport::TransportValidationError::DuplicateProtocol { .. }
+            )
+        ),
+        "expected DuplicateProtocol, got {err:?}"
+    );
+    assert_eq!(
+        protocol.own_transports.len(),
+        2,
+        "a refused set must leave the previous endpoints intact"
+    );
+    println!("  set_own_transports refuses a duplicate protocol  ✓");
+
+    println!("Own-transport set rules passed.\n");
 }

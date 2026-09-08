@@ -27,9 +27,9 @@ pub mod state_record;
 
 pub use secret::{HelperInfo, ReplicaInfo, Replicas, Secret, UserSecret};
 #[cfg(any(feature = "serde", target_arch = "wasm32"))]
-pub use state_record::{StateItemRecord, StateKeyRecord, SyncCheckReport};
+pub use state_record::{ReplicaDiscoveryReport, StateItemRecord, StateKeyRecord};
 
-/// Selects which channels to target for a discovery request.
+/// Selects which channels a flow targets.
 #[derive(Debug, Clone)]
 pub enum Target {
     /// Send to all paired channels (most common case).
@@ -38,6 +38,45 @@ pub enum Target {
     Single(ChannelId),
     /// Send to a specific set of channels.
     Many(Vec<ChannelId>),
+}
+
+impl Target {
+    /// Narrow this target to the channels in `known`.
+    ///
+    /// A caller may name a channel this device never paired on, or one that
+    /// has since been unpaired. Those ids are **dropped, not refused**: a
+    /// target asks to reach whoever is reachable, and one stale id should
+    /// not fail a fan-out to everyone else. A caller that needs to know an
+    /// id went nowhere compares the returned length against what it asked
+    /// for.
+    ///
+    /// Ordering differs by variant, deliberately:
+    ///
+    /// - [`Target::All`] and [`Target::Single`] follow `known`, which is the
+    ///   order the channel store returned.
+    /// - [`Target::Many`] follows the order the **caller** listed, so an
+    ///   application that ranks its helpers keeps that ranking.
+    pub fn filter(self, known: &[ChannelId]) -> Vec<ChannelId> {
+        match self {
+            Target::All => known.to_vec(),
+            Target::Single(id) => known.iter().copied().filter(|k| *k == id).collect(),
+            Target::Many(ids) => ids.into_iter().filter(|id| known.contains(id)).collect(),
+        }
+    }
+
+    /// The ids this target names, for [`ChannelFilter::ids`]. Empty for
+    /// [`Target::All`], which names none and so restricts nothing.
+    ///
+    /// Narrowing the listing by these does not replace [`Self::filter`]: the
+    /// store decides which of them exist, `filter` decides the order they come
+    /// back in.
+    pub fn ids(&self) -> Vec<ChannelId> {
+        match self {
+            Target::All => Vec::new(),
+            Target::Single(id) => vec![*id],
+            Target::Many(ids) => ids.clone(),
+        }
+    }
 }
 
 /// Status of a channel in the protocol lifecycle.
@@ -382,6 +421,97 @@ impl ChannelQuery {
         }
     }
 }
+
+/// Narrows a listing from [`crate::protocol::DeRecChannelStore`].
+///
+/// Every field is a *restriction*, and every field's empty value means "do not
+/// restrict on this" — so [`Default`] selects everything and is equivalent to
+/// an unfiltered listing. Restrictions combine with AND, and `exclude` is
+/// applied last, overriding `ids`.
+///
+/// # Apply it in the query, but the library re-checks
+///
+/// Applying the filter is the store's job precisely because the store is where
+/// it can be pushed into a query — a `WHERE` clause, a key-condition
+/// expression — instead of transferring rows the caller will discard. That
+/// transfer is what the filter exists to avoid: it costs bandwidth everywhere,
+/// and on a metered backing such as DynamoDB, which bills by bytes read, it
+/// costs money.
+///
+/// **A store that ignores it is slow, not wrong.** The protocol acts on the
+/// rows a listing returns — deleting some, flagging the member a by-id filter
+/// named — so it re-applies the filter to every listing before using it, and
+/// drops anything the filter excluded. That backstop matters most where the
+/// signature cannot enforce itself: TypeScript accepts a function of fewer
+/// parameters where more are declared, so a store written before this
+/// parameter existed satisfies the current interface and compiles without a
+/// diagnostic.
+///
+/// **It is a one-way guarantee, and not a validation of your store.** Dropping
+/// rows can enforce an upper bound — nothing excluded gets through — but it
+/// cannot recover a row you omitted. A store that returns *fewer* rows than
+/// the filter selects is still wrong, and wrong in a way nothing here can
+/// detect: the protocol simply fails to act. Applying the filter faithfully
+/// remains the store's job; the library only declines to trust the result.
+///
+/// The listing methods state which record field each of `status`, `role` and
+/// the id fields refers to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    any(feature = "serde", target_arch = "wasm32"),
+    derive(Serialize, Deserialize),
+    serde(
+        default,
+        bound = "Role: Serialize + serde::de::DeserializeOwned, Id: Serialize + serde::de::DeserializeOwned"
+    )
+)]
+pub struct ChannelFilter<Role, Id> {
+    /// Restrict to these ids. Empty selects every record.
+    pub ids: Vec<Id>,
+    /// Restrict to these statuses. Empty selects any status.
+    pub status: Vec<ChannelStatus>,
+    /// Restrict to this role. `None` selects any role.
+    pub role: Option<Role>,
+    /// Omit these ids, applied after `ids`. Empty omits nothing.
+    pub exclude: Vec<Id>,
+}
+
+impl<Role, Id> Default for ChannelFilter<Role, Id> {
+    fn default() -> Self {
+        Self {
+            ids: Vec::new(),
+            status: Vec::new(),
+            role: None,
+            exclude: Vec::new(),
+        }
+    }
+}
+
+impl<Role: PartialEq, Id: PartialEq> ChannelFilter<Role, Id> {
+    /// Whether a record with these attributes survives the filter.
+    ///
+    /// A store whose backing cannot express the restrictions as a query can
+    /// list and call this, which is correct but transfers the rows the filter
+    /// was meant to leave behind.
+    pub fn matches(&self, id: &Id, status: ChannelStatus, role: &Role) -> bool {
+        (self.ids.is_empty() || self.ids.contains(id))
+            && (self.status.is_empty() || self.status.contains(&status))
+            && self.role.as_ref().is_none_or(|wanted| wanted == role)
+            && !self.exclude.contains(id)
+    }
+}
+
+/// Narrows [`crate::protocol::DeRecChannelStore::replicas`].
+///
+/// Ids are [`ReplicaMember::replica_id`] and the role is
+/// [`ReplicaMember::role`].
+pub type ReplicaFilter = ChannelFilter<ReplicaRole, ReplicaId>;
+
+/// Narrows [`crate::protocol::DeRecChannelStore::helpers`].
+///
+/// Ids are [`HelperChannel::channel_id`] and the role is the **peer's**
+/// [`HelperChannel::peer_role`].
+pub type HelperFilter = ChannelFilter<derec_proto::SenderKind, ChannelId>;
 
 /// A record returned by [`crate::protocol::DeRecChannelStore::load`].
 #[derive(Clone, Debug)]
@@ -753,10 +883,10 @@ pub enum StateKind {
     /// timestamp used to time out unresponsive peers.
     SharingRound = 3,
     /// Active replica catch-up. At most one entry exists per `secret_id`
-    /// (a new `start(SyncCheck)` overwrites any prior one). Holds the
+    /// (a new `start(ReplicaDiscovery)` overwrites any prior one). Holds the
     /// versions members have reported so far, so the asker can pick the
     /// member holding the newest state once every peer has answered.
-    PendingSyncCheck = 4,
+    PendingReplicaDiscovery = 4,
 }
 
 /// Secondary-key selector identifying a single row within a given
@@ -779,7 +909,7 @@ pub enum StateKey {
     /// Row is scoped to one channel.
     PendingUnpair { channel_id: ChannelId },
     /// At most one row per `secret_id`. No secondary key.
-    PendingSyncCheck,
+    PendingReplicaDiscovery,
     /// Row is scoped to one publishing round, identified by the version it
     /// distributes.
     ///
@@ -804,7 +934,7 @@ impl StateKey {
             StateKey::PendingVerification { .. } => StateKind::PendingVerification,
             StateKey::PendingRecovery { .. } => StateKind::PendingRecovery,
             StateKey::PendingUnpair { .. } => StateKind::PendingUnpair,
-            StateKey::PendingSyncCheck => StateKind::PendingSyncCheck,
+            StateKey::PendingReplicaDiscovery => StateKind::PendingReplicaDiscovery,
             StateKey::SharingRound { .. } => StateKind::SharingRound,
         }
     }
@@ -894,7 +1024,7 @@ pub enum StateItem {
     /// An in-flight replica catch-up: the versions members have reported so
     /// far, plus the asker's own, so the winner can be chosen once every peer
     /// has answered or timed out.
-    PendingSyncCheck {
+    PendingReplicaDiscovery {
         /// The version the asker held when the check started.
         local_version: u32,
         /// Members asked that have not yet answered.
@@ -941,7 +1071,7 @@ impl StateItem {
             StateItem::PendingVerification { .. } => StateKind::PendingVerification,
             StateItem::PendingRecovery { .. } => StateKind::PendingRecovery,
             StateItem::PendingUnpair { .. } => StateKind::PendingUnpair,
-            StateItem::PendingSyncCheck { .. } => StateKind::PendingSyncCheck,
+            StateItem::PendingReplicaDiscovery { .. } => StateKind::PendingReplicaDiscovery,
             StateItem::SharingRound(_) => StateKind::SharingRound,
         }
     }
@@ -963,7 +1093,7 @@ impl StateItem {
             StateItem::PendingUnpair { channel_id, .. } => StateKey::PendingUnpair {
                 channel_id: *channel_id,
             },
-            StateItem::PendingSyncCheck { .. } => StateKey::PendingSyncCheck,
+            StateItem::PendingReplicaDiscovery { .. } => StateKey::PendingReplicaDiscovery,
             StateItem::SharingRound(round) => StateKey::SharingRound {
                 version: round.version,
             },
@@ -1064,7 +1194,7 @@ mod persisted_discriminant_tests {
         assert_eq!(StateKind::PendingRecovery as u8, 1);
         assert_eq!(StateKind::PendingUnpair as u8, 2);
         assert_eq!(StateKind::SharingRound as u8, 3);
-        assert_eq!(StateKind::PendingSyncCheck as u8, 4);
+        assert_eq!(StateKind::PendingReplicaDiscovery as u8, 4);
     }
 }
 
@@ -1120,5 +1250,225 @@ mod expired_channel_cleanup_tests {
                 timeout_in_secs: 300
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod target_filter_tests {
+    use super::*;
+
+    fn ids(raw: &[u64]) -> Vec<ChannelId> {
+        raw.iter().copied().map(ChannelId).collect()
+    }
+
+    /// `All` is every paired channel, in the order the store returned them.
+    ///
+    /// Order is asserted rather than membership: it decides the order a
+    /// fan-out dispatches in, and therefore the order of the events an
+    /// application sees back.
+    #[test]
+    fn all_keeps_every_known_channel_in_store_order() {
+        let known = ids(&[30, 10, 20]);
+        assert_eq!(Target::All.filter(&known), known);
+    }
+
+    #[test]
+    fn single_yields_the_channel_when_it_is_known() {
+        let known = ids(&[30, 10, 20]);
+        assert_eq!(Target::Single(ChannelId(10)).filter(&known), ids(&[10]));
+    }
+
+    /// A caller may name a channel this device never paired on, or one that
+    /// has since been unpaired. It is dropped rather than refused.
+    #[test]
+    fn single_yields_nothing_when_the_channel_is_unknown() {
+        let known = ids(&[30, 10, 20]);
+        assert!(Target::Single(ChannelId(99)).filter(&known).is_empty());
+    }
+
+    /// `Many` follows the **caller's** order, not the store's, so an
+    /// application that ranks its helpers keeps that ranking.
+    #[test]
+    fn many_keeps_the_callers_order() {
+        let known = ids(&[30, 10, 20]);
+        assert_eq!(
+            Target::Many(ids(&[20, 30])).filter(&known),
+            ids(&[20, 30]),
+            "the requested order must survive, not be re-sorted into store order"
+        );
+    }
+
+    /// One stale id must not fail the fan-out to everyone else.
+    #[test]
+    fn many_drops_unknown_ids_and_keeps_the_rest() {
+        let known = ids(&[30, 10, 20]);
+        assert_eq!(
+            Target::Many(ids(&[10, 99, 20])).filter(&known),
+            ids(&[10, 20])
+        );
+    }
+
+    #[test]
+    fn a_target_naming_only_unknown_channels_yields_nothing() {
+        let known = ids(&[30, 10, 20]);
+        assert!(Target::Many(ids(&[98, 99])).filter(&known).is_empty());
+    }
+
+    /// A device with no paired channels reaches nobody, whatever it asked for.
+    #[test]
+    fn nothing_is_reachable_when_no_channel_is_known() {
+        assert!(Target::All.filter(&[]).is_empty());
+        assert!(Target::Single(ChannelId(10)).filter(&[]).is_empty());
+        assert!(Target::Many(ids(&[10, 20])).filter(&[]).is_empty());
+    }
+
+    /// A duplicate in the request is not de-duplicated: the caller asked for
+    /// it twice and the fan-out honours that literally.
+    #[test]
+    fn many_does_not_deduplicate_the_request() {
+        let known = ids(&[10, 20]);
+        assert_eq!(Target::Many(ids(&[10, 10])).filter(&known), ids(&[10, 10]));
+    }
+}
+
+#[cfg(test)]
+mod channel_filter_tests {
+    use super::*;
+    use crate::types::ReplicaId;
+
+    fn member(
+        id: u64,
+        status: ChannelStatus,
+        role: ReplicaRole,
+    ) -> (ReplicaId, ChannelStatus, ReplicaRole) {
+        (ReplicaId(id), status, role)
+    }
+
+    /// The contract every field rests on: empty means "do not restrict".
+    /// A store that reads `ids: []` as "no rows" instead of "all rows"
+    /// silently returns nothing, and the flow above it does nothing at all.
+    #[test]
+    fn a_default_filter_admits_everything() {
+        let filter = ReplicaFilter::default();
+        let (id, status, role) = member(1, ChannelStatus::Pending, ReplicaRole::Destination);
+        assert!(filter.matches(&id, status, &role));
+    }
+
+    #[test]
+    fn ids_restrict_to_the_listed_members() {
+        let filter = ReplicaFilter {
+            ids: vec![ReplicaId(1), ReplicaId(2)],
+            ..Default::default()
+        };
+        for id in [1, 2] {
+            let (id, status, role) = member(id, ChannelStatus::Paired, ReplicaRole::Source);
+            assert!(filter.matches(&id, status, &role));
+        }
+        let (id, status, role) = member(3, ChannelStatus::Paired, ReplicaRole::Source);
+        assert!(!filter.matches(&id, status, &role));
+    }
+
+    /// The status list is an allow-list, not a single value: the sharing
+    /// flow needs `Paired` *and* `Unpairing` on one listing, because a
+    /// departing member learns its removal completed by receiving the
+    /// version that omits it.
+    #[test]
+    fn status_is_an_allow_list() {
+        let filter = ReplicaFilter {
+            status: vec![ChannelStatus::Paired, ChannelStatus::Unpairing],
+            ..Default::default()
+        };
+        for status in [ChannelStatus::Paired, ChannelStatus::Unpairing] {
+            let (id, status, role) = member(1, status, ReplicaRole::Destination);
+            assert!(filter.matches(&id, status, &role));
+        }
+        let (id, status, role) = member(1, ChannelStatus::Pending, ReplicaRole::Destination);
+        assert!(!filter.matches(&id, status, &role));
+    }
+
+    #[test]
+    fn role_restricts_when_set_and_admits_when_none() {
+        let filter = ReplicaFilter {
+            role: Some(ReplicaRole::Destination),
+            ..Default::default()
+        };
+        let (id, status, role) = member(1, ChannelStatus::Paired, ReplicaRole::Destination);
+        assert!(filter.matches(&id, status, &role));
+        let (id, status, role) = member(1, ChannelStatus::Paired, ReplicaRole::Source);
+        assert!(!filter.matches(&id, status, &role));
+
+        let any = ReplicaFilter::default();
+        assert!(any.matches(&id, status, &role));
+    }
+
+    /// Six flows exclude this device's own row, which `replicas()` returns
+    /// deliberately so the group stays reconstructible from the stores.
+    #[test]
+    fn exclude_omits_the_named_members() {
+        let filter = ReplicaFilter {
+            exclude: vec![ReplicaId(7)],
+            ..Default::default()
+        };
+        let (id, status, role) = member(7, ChannelStatus::Paired, ReplicaRole::Source);
+        assert!(!filter.matches(&id, status, &role));
+        let (id, status, role) = member(8, ChannelStatus::Paired, ReplicaRole::Source);
+        assert!(filter.matches(&id, status, &role));
+    }
+
+    /// `exclude` is applied after `ids`, so naming the same member in both
+    /// omits it rather than admitting it. Stated because the successor pick
+    /// and the fan-out filters compose these two fields on one call.
+    #[test]
+    fn exclude_overrides_ids() {
+        let filter = ReplicaFilter {
+            ids: vec![ReplicaId(1), ReplicaId(2)],
+            exclude: vec![ReplicaId(2)],
+            ..Default::default()
+        };
+        let (id, status, role) = member(1, ChannelStatus::Paired, ReplicaRole::Source);
+        assert!(filter.matches(&id, status, &role));
+        let (id, status, role) = member(2, ChannelStatus::Paired, ReplicaRole::Source);
+        assert!(!filter.matches(&id, status, &role));
+    }
+
+    #[test]
+    fn restrictions_combine_with_and() {
+        let filter = ReplicaFilter {
+            status: vec![ChannelStatus::Paired],
+            role: Some(ReplicaRole::Destination),
+            exclude: vec![ReplicaId(9)],
+            ..Default::default()
+        };
+        let (id, status, role) = member(1, ChannelStatus::Paired, ReplicaRole::Destination);
+        assert!(filter.matches(&id, status, &role));
+
+        // Each of the three, violated on its own.
+        let (id, status, role) = member(1, ChannelStatus::Pending, ReplicaRole::Destination);
+        assert!(!filter.matches(&id, status, &role));
+        let (id, status, role) = member(1, ChannelStatus::Paired, ReplicaRole::Source);
+        assert!(!filter.matches(&id, status, &role));
+        let (id, status, role) = member(9, ChannelStatus::Paired, ReplicaRole::Destination);
+        assert!(!filter.matches(&id, status, &role));
+    }
+
+    /// The helper alias carries the peer's `SenderKind`, not a `ReplicaRole`
+    /// — the two listings differ in that one type, which is why the filter
+    /// is generic over it.
+    #[test]
+    fn the_helper_alias_filters_on_sender_kind() {
+        let filter = HelperFilter {
+            role: Some(derec_proto::SenderKind::Helper),
+            ..Default::default()
+        };
+        assert!(filter.matches(
+            &ChannelId(1),
+            ChannelStatus::Paired,
+            &derec_proto::SenderKind::Helper
+        ));
+        assert!(!filter.matches(
+            &ChannelId(1),
+            ChannelStatus::Paired,
+            &derec_proto::SenderKind::Owner
+        ));
     }
 }

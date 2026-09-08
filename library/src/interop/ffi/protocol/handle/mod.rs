@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use prost::Message as _;
 
+use crate::extensions::communication_info::CommunicationInfoExt as _;
 use crate::interop::ffi::error::{
     DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_INVALID_ENUM, DEREC_CODE_FFI_NULL_PTR, DeRecError,
     ffi_error, success,
@@ -89,51 +90,6 @@ pub(super) fn validate_transport(
         .map_err(|e| crate::interop::ffi::error::from_lib_error(crate::Error::Transport(e)))
 }
 
-/// Decode a serialized [`derec_proto::CommunicationInfo`] proto buffer
-/// into the `<String, String>` map the core protocol accepts. Used by
-/// [`derec_protocol_new`], which takes `communication_info` as
-/// a proto buffer separate from the rest of its JSON configuration.
-///
-/// # Safety
-///
-/// `ptr` must be valid for reads of `len` bytes when `len != 0`.
-unsafe fn decode_communication_info(
-    ptr: *const u8,
-    len: usize,
-) -> Result<HashMap<String, String>, DeRecError> {
-    if len == 0 {
-        return Ok(HashMap::new());
-    }
-    if ptr.is_null() {
-        return Err(ffi_error(
-            DEREC_CODE_FFI_NULL_PTR,
-            "communication_info_ptr is null but length is non-zero",
-        ));
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-    match derec_proto::CommunicationInfo::decode(bytes) {
-        Ok(c) => Ok(c
-            .communication_info_entries
-            .into_iter()
-            .filter_map(|e| {
-                let s = match e.value? {
-                    derec_proto::communication_info_key_value::Value::StringValue(s) => s,
-                    // Binary entries have nowhere to land in the core
-                    // protocol's `<String, String>` map; skip them.
-                    derec_proto::communication_info_key_value::Value::BytesValue(_) => {
-                        return None;
-                    }
-                };
-                Some((e.key, s))
-            })
-            .collect()),
-        Err(_) => Err(ffi_error(
-            DEREC_CODE_FFI_BAD_PROTO,
-            "communication_info is not a valid CommunicationInfo proto",
-        )),
-    }
-}
-
 /// Result type for [`derec_protocol_new`].
 #[repr(C)]
 pub struct DeRecProtocolNewResult {
@@ -148,121 +104,6 @@ impl From<DeRecError> for DeRecProtocolNewResult {
             error,
             handle: std::ptr::null_mut(),
         }
-    }
-}
-
-/// Construction logic for [`derec_protocol_new`]: takes the
-/// already-parsed/validated scalar configuration plus the 6
-/// store/transport callback pointers,
-/// reads each callback struct, builds the [`DeRecProtocolBuilder`],
-/// and wraps the result in a handle bound to a fresh single-thread
-/// tokio runtime.
-///
-/// # Safety
-///
-/// - All 6 callback pointers must be valid for reads of their pointee
-///   struct.
-/// - `channel_store_cb`/`secret_store_cb`/`share_store_cb`/`user_secret_store_cb`/
-///   `state_store_cb`/`transport_cb` must outlive the returned handle.
-#[allow(clippy::too_many_arguments)]
-unsafe fn construct_protocol(
-    secret_id: u64,
-    own_transports: Vec<crate::transport::TransportProtocol>,
-    threshold: u32,
-    keep_versions_count: u32,
-    communication_info: HashMap<String, String>,
-    timeouts: crate::protocol::types::Timeouts,
-    unsafe_connection: bool,
-    auto_respond_on_failure: bool,
-    unpair_ack: crate::protocol::UnpairAck,
-    auto_reply_to: bool,
-    auto_accept: crate::protocol::AutoAcceptPolicy,
-    replica_id: Option<u64>,
-    channel_store_cb: *const ChannelStoreCallbacks,
-    secret_store_cb: *const SecretStoreCallbacks,
-    share_store_cb: *const ShareStoreCallbacks,
-    user_secret_store_cb: *const UserSecretStoreCallbacks,
-    state_store_cb: *const StateStoreCallbacks,
-    transport_cb: *const TransportCallbacks,
-) -> DeRecProtocolNewResult {
-    if channel_store_cb.is_null()
-        || secret_store_cb.is_null()
-        || share_store_cb.is_null()
-        || user_secret_store_cb.is_null()
-        || state_store_cb.is_null()
-        || transport_cb.is_null()
-    {
-        return ffi_error(
-            DEREC_CODE_FFI_NULL_PTR,
-            "store/transport callback pointer is null",
-        )
-        .into();
-    }
-
-    let channel_store = DotnetChannelStore {
-        cb: unsafe { std::ptr::read(channel_store_cb) },
-    };
-    let secret_store = DotnetSecretStore {
-        cb: unsafe { std::ptr::read(secret_store_cb) },
-    };
-    let share_store = DotnetShareStore {
-        cb: unsafe { std::ptr::read(share_store_cb) },
-    };
-    let user_secret_store = DotnetUserSecretStore {
-        cb: unsafe { std::ptr::read(user_secret_store_cb) },
-    };
-    let state_store = DotnetStateStore {
-        cb: unsafe { std::ptr::read(state_store_cb) },
-    };
-    let transport = DotnetTransport {
-        cb: unsafe { std::ptr::read(transport_cb) },
-    };
-
-    let mut builder = DeRecProtocolBuilder::new(secret_id)
-        .with_channel_store(channel_store)
-        .with_share_store(share_store)
-        .with_secret_store(secret_store)
-        .with_user_secret_store(user_secret_store)
-        .with_state_store(state_store)
-        .with_transport(transport)
-        .with_own_transports(own_transports)
-        .with_threshold(threshold as usize)
-        .with_keep_versions_count(keep_versions_count as usize)
-        .with_communication_info(communication_info)
-        .with_timeouts(timeouts)
-        .with_unsafe_connection(unsafe_connection)
-        .with_auto_respond_on_failure(auto_respond_on_failure)
-        .with_unpair_ack(unpair_ack)
-        .with_auto_reply_to(auto_reply_to)
-        .with_auto_accept(auto_accept);
-
-    if let Some(replica_id) = replica_id {
-        builder = builder.with_replica_id(replica_id);
-    }
-
-    let inner = match builder.build() {
-        Ok(p) => p,
-        Err(e) => return crate::interop::ffi::error::from_lib_error(e).into(),
-    };
-
-    let runtime = match tokio::runtime::Builder::new_current_thread().build() {
-        Ok(rt) => rt,
-        Err(e) => {
-            return ffi_error(
-                DEREC_CODE_FFI_BAD_PROTO,
-                format!("failed to build tokio runtime: {e}"),
-            )
-            .into();
-        }
-    };
-
-    let handle = Box::new(DeRecProtocolHandle {
-        runtime,
-        inner: std::sync::Mutex::new(inner),
-    });
-    DeRecProtocolNewResult {
-        error: success(),
-        handle: Box::into_raw(handle),
     }
 }
 
@@ -387,26 +228,52 @@ impl TimeoutsConfig {
     }
 }
 
-/// [`crate::protocol::DEFAULT_THRESHOLD`], narrowed to the FFI config's
-/// wire type. Read by serde's `#[serde(default = "...")]` on
-/// [`ProtocolConfig::threshold`] so an absent key resolves to the same
-/// constant [`crate::protocol::DeRecProtocolBuilder::new`] uses.
-fn default_threshold() -> u32 {
-    crate::protocol::DEFAULT_THRESHOLD as u32
+/// The `parameter_range` object in [`ProtocolConfig`]. Mirrors
+/// [`derec_proto::ParameterRange`] field for field.
+///
+/// Every field is optional and defaults to `0`, which is what the proto's
+/// own default is: an unset bound advertises no constraint on that
+/// dimension. Omitting the whole object advertises no constraints at all and
+/// accepts any peer range, matching the builder's default.
+#[derive(serde::Deserialize)]
+struct ParameterRangeConfig {
+    #[serde(default)]
+    min_share_size: i64,
+    #[serde(default)]
+    max_share_size: i64,
+    #[serde(default)]
+    min_time_between_verifications: i64,
+    #[serde(default)]
+    max_time_between_verifications: i64,
+    #[serde(default)]
+    min_time_between_share_updates: i64,
+    #[serde(default)]
+    max_time_between_share_updates: i64,
+    #[serde(default)]
+    min_unresponsive_deletion_timeout: i64,
+    #[serde(default)]
+    max_unresponsive_deletion_timeout: i64,
+    #[serde(default)]
+    min_unresponsive_deactivation_timeout: i64,
+    #[serde(default)]
+    max_unresponsive_deactivation_timeout: i64,
 }
 
-/// See [`default_threshold`]; the [`crate::protocol::DEFAULT_KEEP_VERSIONS_COUNT`]
-/// counterpart for [`ProtocolConfig::keep_versions_count`].
-fn default_keep_versions_count() -> u32 {
-    crate::protocol::DEFAULT_KEEP_VERSIONS_COUNT as u32
-}
-
-/// [`crate::protocol::UnpairAck::default()`] (`Required`), encoded as the
-/// wire discriminant. Read by serde's `#[serde(default = "...")]` on
-/// [`ProtocolConfig::unpair_ack`] so an absent key resolves to the same
-/// default [`crate::protocol::DeRecProtocolBuilder::new`] uses.
-fn default_unpair_ack() -> i32 {
-    crate::protocol::UnpairAck::default() as i32
+impl From<&ParameterRangeConfig> for derec_proto::ParameterRange {
+    fn from(c: &ParameterRangeConfig) -> Self {
+        Self {
+            min_share_size: c.min_share_size,
+            max_share_size: c.max_share_size,
+            min_time_between_verifications: c.min_time_between_verifications,
+            max_time_between_verifications: c.max_time_between_verifications,
+            min_time_between_share_updates: c.min_time_between_share_updates,
+            max_time_between_share_updates: c.max_time_between_share_updates,
+            min_unresponsive_deletion_timeout: c.min_unresponsive_deletion_timeout,
+            max_unresponsive_deletion_timeout: c.max_unresponsive_deletion_timeout,
+            min_unresponsive_deactivation_timeout: c.min_unresponsive_deactivation_timeout,
+            max_unresponsive_deactivation_timeout: c.max_unresponsive_deactivation_timeout,
+        }
+    }
 }
 
 /// One entry of the `own_transports` array in [`ProtocolConfig`]. Mirrors
@@ -462,6 +329,8 @@ struct ProtocolConfig {
     // Absent or `null` means "no replica id".
     #[serde(default)]
     replica_id: Option<String>,
+    #[serde(default)]
+    parameter_range: Option<ParameterRangeConfig>,
 }
 
 /// Constructs a [`crate::protocol::DeRecProtocol`] with scalar config
@@ -659,6 +528,7 @@ pub unsafe extern "C" fn derec_protocol_new(
             config.auto_reply_to,
             config.auto_accept.into(),
             replica_id,
+            config.parameter_range.as_ref().map(Into::into),
             channel_store_cb,
             secret_store_cb,
             share_store_cb,
@@ -697,6 +567,178 @@ pub unsafe extern "C" fn derec_protocol_free(handle: *mut DeRecProtocolHandle) {
     unsafe {
         drop(Box::from_raw(handle));
     }
+}
+
+/// Decode a serialized [`derec_proto::CommunicationInfo`] proto buffer
+/// into the `<String, String>` map the core protocol accepts. Used by
+/// [`derec_protocol_new`], which takes `communication_info` as
+/// a proto buffer separate from the rest of its JSON configuration.
+///
+/// # Safety
+///
+/// `ptr` must be valid for reads of `len` bytes when `len != 0`.
+unsafe fn decode_communication_info(
+    ptr: *const u8,
+    len: usize,
+) -> Result<HashMap<String, String>, DeRecError> {
+    if len == 0 {
+        return Ok(HashMap::new());
+    }
+    if ptr.is_null() {
+        return Err(ffi_error(
+            DEREC_CODE_FFI_NULL_PTR,
+            "communication_info_ptr is null but length is non-zero",
+        ));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    match derec_proto::CommunicationInfo::decode(bytes) {
+        Ok(c) => Ok(c.to_map()),
+        Err(_) => Err(ffi_error(
+            DEREC_CODE_FFI_BAD_PROTO,
+            "communication_info is not a valid CommunicationInfo proto",
+        )),
+    }
+}
+
+/// Construction logic for [`derec_protocol_new`]: takes the
+/// already-parsed/validated scalar configuration plus the 6
+/// store/transport callback pointers,
+/// reads each callback struct, builds the [`DeRecProtocolBuilder`],
+/// and wraps the result in a handle bound to a fresh single-thread
+/// tokio runtime.
+///
+/// # Safety
+///
+/// - All 6 callback pointers must be valid for reads of their pointee
+///   struct.
+/// - `channel_store_cb`/`secret_store_cb`/`share_store_cb`/`user_secret_store_cb`/
+///   `state_store_cb`/`transport_cb` must outlive the returned handle.
+#[allow(clippy::too_many_arguments)]
+unsafe fn construct_protocol(
+    secret_id: u64,
+    own_transports: Vec<crate::transport::TransportProtocol>,
+    threshold: u32,
+    keep_versions_count: u32,
+    communication_info: HashMap<String, String>,
+    timeouts: crate::protocol::types::Timeouts,
+    unsafe_connection: bool,
+    auto_respond_on_failure: bool,
+    unpair_ack: crate::protocol::UnpairAck,
+    auto_reply_to: bool,
+    auto_accept: crate::protocol::AutoAcceptPolicy,
+    replica_id: Option<u64>,
+    parameter_range: Option<derec_proto::ParameterRange>,
+    channel_store_cb: *const ChannelStoreCallbacks,
+    secret_store_cb: *const SecretStoreCallbacks,
+    share_store_cb: *const ShareStoreCallbacks,
+    user_secret_store_cb: *const UserSecretStoreCallbacks,
+    state_store_cb: *const StateStoreCallbacks,
+    transport_cb: *const TransportCallbacks,
+) -> DeRecProtocolNewResult {
+    if channel_store_cb.is_null()
+        || secret_store_cb.is_null()
+        || share_store_cb.is_null()
+        || user_secret_store_cb.is_null()
+        || state_store_cb.is_null()
+        || transport_cb.is_null()
+    {
+        return ffi_error(
+            DEREC_CODE_FFI_NULL_PTR,
+            "store/transport callback pointer is null",
+        )
+        .into();
+    }
+
+    let channel_store = DotnetChannelStore {
+        cb: unsafe { std::ptr::read(channel_store_cb) },
+    };
+    let secret_store = DotnetSecretStore {
+        cb: unsafe { std::ptr::read(secret_store_cb) },
+    };
+    let share_store = DotnetShareStore {
+        cb: unsafe { std::ptr::read(share_store_cb) },
+    };
+    let user_secret_store = DotnetUserSecretStore {
+        cb: unsafe { std::ptr::read(user_secret_store_cb) },
+    };
+    let state_store = DotnetStateStore {
+        cb: unsafe { std::ptr::read(state_store_cb) },
+    };
+    let transport = DotnetTransport {
+        cb: unsafe { std::ptr::read(transport_cb) },
+    };
+
+    let mut builder = DeRecProtocolBuilder::new(secret_id)
+        .with_channel_store(channel_store)
+        .with_share_store(share_store)
+        .with_secret_store(secret_store)
+        .with_user_secret_store(user_secret_store)
+        .with_state_store(state_store)
+        .with_transport(transport)
+        .with_own_transports(own_transports)
+        .with_threshold(threshold as usize)
+        .with_keep_versions_count(keep_versions_count as usize)
+        .with_communication_info(communication_info)
+        .with_timeouts(timeouts)
+        .with_unsafe_connection(unsafe_connection)
+        .with_auto_respond_on_failure(auto_respond_on_failure)
+        .with_unpair_ack(unpair_ack)
+        .with_auto_reply_to(auto_reply_to)
+        .with_auto_accept(auto_accept);
+
+    if let Some(replica_id) = replica_id {
+        builder = builder.with_replica_id(replica_id);
+    }
+    if let Some(parameter_range) = parameter_range {
+        builder = builder.with_parameter_range(parameter_range);
+    }
+
+    let inner = match builder.build() {
+        Ok(p) => p,
+        Err(e) => return crate::interop::ffi::error::from_lib_error(e).into(),
+    };
+
+    let runtime = match tokio::runtime::Builder::new_current_thread().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            return ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                format!("failed to build tokio runtime: {e}"),
+            )
+            .into();
+        }
+    };
+
+    let handle = Box::new(DeRecProtocolHandle {
+        runtime,
+        inner: std::sync::Mutex::new(inner),
+    });
+    DeRecProtocolNewResult {
+        error: success(),
+        handle: Box::into_raw(handle),
+    }
+}
+
+/// [`crate::protocol::DEFAULT_THRESHOLD`], narrowed to the FFI config's
+/// wire type. Read by serde's `#[serde(default = "...")]` on
+/// [`ProtocolConfig::threshold`] so an absent key resolves to the same
+/// constant [`crate::protocol::DeRecProtocolBuilder::new`] uses.
+fn default_threshold() -> u32 {
+    crate::protocol::DEFAULT_THRESHOLD as u32
+}
+
+/// See [`default_threshold`]; the [`crate::protocol::DEFAULT_KEEP_VERSIONS_COUNT`]
+/// counterpart for [`ProtocolConfig::keep_versions_count`].
+fn default_keep_versions_count() -> u32 {
+    crate::protocol::DEFAULT_KEEP_VERSIONS_COUNT as u32
+}
+
+/// [`crate::protocol::UnpairAck::default()`] (`Required`), encoded as the
+/// wire discriminant. Read by serde's `#[serde(default = "...")]` on
+/// [`ProtocolConfig::unpair_ack`] so an absent key resolves to the same
+/// default [`crate::protocol::DeRecProtocolBuilder::new`] uses.
+fn default_unpair_ack() -> i32 {
+    crate::protocol::UnpairAck::default() as i32
 }
 
 #[cfg(test)]

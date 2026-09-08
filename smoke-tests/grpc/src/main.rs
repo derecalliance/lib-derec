@@ -21,7 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use derec_library::protocol::types::{
-    ChannelQuery, ChannelRecord, HelperChannel, ReplicaMember, Target, UserSecret, UserSecrets,
+    ChannelQuery, ChannelRecord, HelperChannel, HelperFilter, ReplicaFilter, ReplicaMember, Target,
+    UserSecret, UserSecrets,
 };
 use derec_library::protocol::{
     ChannelStoreFuture, DeRecChannelStore, DeRecEvent, DeRecFlow, DeRecProtocol,
@@ -136,22 +137,32 @@ impl DeRecChannelStore for InMemoryChannelStore {
         Box::pin(std::future::ready(Ok(removed)))
     }
 
-    fn helpers(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+    fn helpers(
+        &self,
+        secret_id: u64,
+        filter: HelperFilter,
+    ) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
         let entries: Vec<HelperChannel> = self
             .helper_rows
             .iter()
             .filter(|((s, _), _)| *s == secret_id)
             .map(|(_, c)| c.clone())
+            .filter(|c| filter.matches(&c.channel_id, c.status, &c.peer_role))
             .collect();
         Box::pin(std::future::ready(Ok(entries)))
     }
 
-    fn replicas(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
+    fn replicas(
+        &self,
+        secret_id: u64,
+        filter: ReplicaFilter,
+    ) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
         let entries: Vec<ReplicaMember> = self
             .member_rows
             .iter()
             .filter(|((s, _), _)| *s == secret_id)
             .map(|(_, m)| m.clone())
+            .filter(|m| filter.matches(&m.replica_id, m.status, &m.role))
             .collect();
         Box::pin(std::future::ready(Ok(entries)))
     }
@@ -512,7 +523,7 @@ impl Node {
                 TransportProtocol::new(https_uri.to_owned(), derec_proto::Protocol::Https),
                 served,
             ]),
-            None => builder.with_own_transport(served),
+            None => builder.with_own_transports([served]),
         };
 
         let protocol = builder

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-use derec_library::protocol::types::{ChannelQuery, UserSecret};
+use derec_library::protocol::types::{ChannelQuery, HelperFilter, UserSecret};
 use derec_library::protocol::{
     DeRecChannelStore, DeRecSecretStore, DeRecShareStore, DeRecUserSecretStore, MissingPolicy,
     SecretKind, SecretStoreError,
@@ -76,13 +76,13 @@ pub async fn run() {
     let a_chans = owner_a
         .protocol
         .channel_store
-        .helpers(SECRET_A_ID)
+        .helpers(SECRET_A_ID, HelperFilter::default())
         .await
         .unwrap();
     let b_chans = owner_b
         .protocol
         .channel_store
-        .helpers(SECRET_B_ID)
+        .helpers(SECRET_B_ID, HelperFilter::default())
         .await
         .unwrap();
     assert_eq!(a_chans.len(), 2);
@@ -219,7 +219,7 @@ pub async fn run() {
     let secret_a_channels = owner_a
         .protocol
         .channel_store
-        .helpers(SECRET_A_ID)
+        .helpers(SECRET_A_ID, HelperFilter::default())
         .await
         .unwrap();
     for c in &secret_a_channels {

@@ -17,6 +17,8 @@
 //! disagrees is rejected rather than combined, so a single corrupted or
 //! malicious share cannot steer the result.
 
+use crate::extensions::derec_result::DeRecResultExt as _;
+use crate::extensions::derec_share::DeRecShareExt as _;
 use crate::primitives::recovery::RecoveryError;
 use crate::utils::verify_timestamps;
 use crate::{
@@ -52,7 +54,7 @@ pub struct RecoverResult {
 ///
 /// The Helper:
 ///
-/// 1. Validates that `stored_share_request` contains non-empty committed share bytes
+/// 1. Validates that `stored_request` contains non-empty committed share bytes
 /// 2. Decodes the embedded [`derec_proto::CommittedDeRecShare`] and inner [`derec_proto::DeRecShare`]
 /// 3. Validates that the stored share matches the requested `secret_id` and `version`
 /// 4. Builds and encrypts a [`derec_proto::GetShareResponseMessage`] carrying the committed share
@@ -62,7 +64,7 @@ pub struct RecoverResult {
 /// * `channel_id` - Identifier of the previously paired Helper channel.
 /// * `request` - The decoded [`derec_proto::GetShareRequestMessage`] previously extracted
 ///   from the recovery request envelope.
-/// * `stored_share_request` - The decoded [`derec_proto::StoreShareRequestMessage`] previously
+/// * `stored_request` - The decoded [`derec_proto::StoreShareRequestMessage`] previously
 ///   stored by this Helper during the sharing flow.
 /// * `shared_key` - Previously established 32-byte symmetric channel key used to encrypt
 ///   the response.
@@ -130,53 +132,17 @@ pub struct RecoverResult {
 pub fn produce(
     channel_id: ChannelId,
     request: &GetShareRequestMessage,
-    // TODO: rename to request
-    stored_share_request: &StoreShareRequestMessage,
+    stored_request: &StoreShareRequestMessage,
     shared_key: &SharedKey,
 ) -> Result<ProduceResult, crate::Error> {
-    // TODO: I want to hide this share.is_empty into a request.has_share() instead.
-    //       Use the Extension pattern used with pair request
-    if stored_share_request.share.is_empty() {
-        #[cfg(feature = "logging")]
-        tracing::warn!("stored share is empty");
-
-        return Err(RecoveryError::EmptyCommittedDeRecShare.into());
-    }
-
-    // TODO: since we first validate the share is not empty and then read it, we could have a
-    // request.read_share()?
-    let committed_derec_share = CommittedDeRecShare::decode(stored_share_request.share.as_slice())
-        .map_err(|source| RecoveryError::DecodeCommittedDeRecShare { source })?;
-
-    let derec_share = DeRecShare::decode(committed_derec_share.de_rec_share.as_slice())
-        .map_err(|source| RecoveryError::DecodeDeRecShare { source })?;
-
-    if derec_share.secret_id != request.secret_id {
-        #[cfg(feature = "logging")]
-        tracing::warn!("secret_id mismatch between request and stored share");
-        return Err(RecoveryError::SecretIdMismatch.into());
-    }
-
-    if derec_share.version != request.version {
-        #[cfg(feature = "logging")]
-        tracing::warn!(
-            expected = request.version,
-            got = derec_share.version,
-            "version mismatch between request and stored share"
-        );
-
-        return Err(RecoveryError::VersionMismatch {
-            expected: request.version,
-            got: derec_share.version,
-        }
-        .into());
-    }
+    let (_, derec_share) = read_committed_share(&stored_request.share)?;
+    derec_share.validate(request.secret_id, request.version)?;
 
     let timestamp = current_timestamp();
 
     let message = GetShareResponseMessage {
         share_algorithm: SHARE_ALGORITHM_VSS,
-        committed_de_rec_share: stored_share_request.share.clone(),
+        committed_de_rec_share: stored_request.share.clone(),
         result: Some(DeRecResult {
             status: StatusEnum::Ok as i32,
             memo: String::new(),
@@ -447,6 +413,25 @@ pub fn recover(
     Ok(RecoverResult { secret_data })
 }
 
+/// Decode a stored `CommittedDeRecShare` and the `DeRecShare` it wraps.
+///
+/// Both sides of recovery read a share the same way — the helper answering
+/// a request and the owner consuming the answer — so the empty-check and the
+/// two decodes live here rather than once per side. Says nothing about
+/// *which* share this is; that is [`DeRecShareExt::validate`].
+fn read_committed_share(bytes: &[u8]) -> Result<(CommittedDeRecShare, DeRecShare), crate::Error> {
+    if bytes.is_empty() {
+        #[cfg(feature = "logging")]
+        tracing::warn!("stored share is empty");
+        return Err(RecoveryError::EmptyCommittedDeRecShare.into());
+    }
+    let committed = CommittedDeRecShare::decode(bytes)
+        .map_err(|source| RecoveryError::DecodeCommittedDeRecShare { source })?;
+    let share = DeRecShare::decode(committed.de_rec_share.as_slice())
+        .map_err(|source| RecoveryError::DecodeDeRecShare { source })?;
+    Ok((committed, share))
+}
+
 fn extract_share_from_response(
     response: &GetShareResponseMessage,
     secret_id: u64,
@@ -456,43 +441,11 @@ fn extract_share_from_response(
         "GetShareResponseMessage is missing result field",
     ))?;
 
-    // TODO: this validation on the DeRecResult is repeated everywhere.
-    //       see if we can implement the Ext pattern and have result.validate()?;
-    if result.status != StatusEnum::Ok as i32 {
-        #[cfg(feature = "logging")]
-        tracing::warn!(status = result.status, memo = %result.memo, "recovery share response status is not Ok");
-        return Err(RecoveryError::NonOkStatus {
-            status: result.status,
-            memo: result.memo.to_owned(),
-        }
-        .into());
-    }
+    result.validate(|status, memo| RecoveryError::NonOkStatus { status, memo })?;
 
-    // TODO: similar to read_share mentioned above, lets hide this inner request concern into:write
-    //       something such as request.read_committed_share()?
-    if response.committed_de_rec_share.is_empty() {
-        return Err(RecoveryError::EmptyCommittedDeRecShare.into());
-    }
-
-    let committed_derec_share =
-        CommittedDeRecShare::decode(response.committed_de_rec_share.as_slice())
-            .map_err(|source| RecoveryError::DecodeCommittedDeRecShare { source })?;
-
-    let derec_share = DeRecShare::decode(committed_derec_share.de_rec_share.as_slice())
-        .map_err(|source| RecoveryError::DecodeDeRecShare { source })?;
-
-    // TODO: using Ext pattern we could have derec_share.validate(secret_id, version)?
-    if derec_share.secret_id != secret_id {
-        return Err(RecoveryError::SecretIdMismatch.into());
-    }
-
-    if derec_share.version != version {
-        return Err(RecoveryError::VersionMismatch {
-            expected: version,
-            got: derec_share.version,
-        }
-        .into());
-    }
+    let (committed_derec_share, derec_share) =
+        read_committed_share(&response.committed_de_rec_share)?;
+    derec_share.validate(secret_id, version)?;
 
     Ok(vss::VSSShare {
         x: derec_share.x,

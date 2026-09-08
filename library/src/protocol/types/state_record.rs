@@ -64,7 +64,7 @@ impl From<&StateKey> for StateKeyRecord {
                 secret_id: None,
                 version: None,
             },
-            StateKey::PendingSyncCheck => Self {
+            StateKey::PendingReplicaDiscovery => Self {
                 kind: 4,
                 channel_id: None,
                 secret_id: None,
@@ -125,12 +125,12 @@ pub struct StateItemRecord {
     /// Catch-up accounting: members still to answer, and what those that
     /// have answered reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reported: Option<Vec<SyncCheckReport>>,
+    pub reported: Option<Vec<ReplicaDiscoveryReport>>,
 }
 /// One member's answer in an in-flight catch-up. A nested record rather than
 /// a packed string so the pair stays self-describing for every binding.
 #[derive(serde::Serialize, serde::Deserialize)]
-pub struct SyncCheckReport {
+pub struct ReplicaDiscoveryReport {
     pub replica_id: String,
     pub version: u32,
 }
@@ -196,7 +196,7 @@ impl From<&StateItem> for StateItemRecord {
                 behind_replicas: None,
                 reported: None,
             },
-            StateItem::PendingSyncCheck {
+            StateItem::PendingReplicaDiscovery {
                 local_version,
                 pending,
                 reported,
@@ -218,7 +218,7 @@ impl From<&StateItem> for StateItemRecord {
                 reported: Some(
                     reported
                         .iter()
-                        .map(|(id, version)| SyncCheckReport {
+                        .map(|(id, version)| ReplicaDiscoveryReport {
                             replica_id: id.0.to_string(),
                             version: *version,
                         })
@@ -396,10 +396,10 @@ impl StateItemRecord {
             4 => {
                 let local_version = self
                     .version
-                    .ok_or_else(|| "PendingSyncCheck requires version".to_string())?;
+                    .ok_or_else(|| "PendingReplicaDiscovery requires version".to_string())?;
                 let started_at = self
                     .started_at
-                    .ok_or_else(|| "PendingSyncCheck requires started_at".to_string())?
+                    .ok_or_else(|| "PendingReplicaDiscovery requires started_at".to_string())?
                     .parse::<u64>()
                     .map_err(|e| format!("started_at not a decimal u64: {e}"))?;
                 let pending = parse_replica_id_set(self.pending_replicas, "pending_replicas")?;
@@ -415,7 +415,7 @@ impl StateItemRecord {
                         })?;
                     reported.insert(id, entry.version);
                 }
-                Ok(StateItem::PendingSyncCheck {
+                Ok(StateItem::PendingReplicaDiscovery {
                     local_version,
                     pending,
                     reported,

@@ -578,19 +578,31 @@ extern "C" int32_t channelStoreRemove(void* userData, uint64_t secretId, uint64_
   return result.code;
 }
 
-/// `ChannelStore.listHelpers(secretId) -> Uint8Array | null`
-extern "C" int32_t channelStoreListHelpers(void* userData, uint64_t secretId, uint8_t** outPtr,
-                                            size_t* outLen) {
+/// `ChannelStore.listHelpers(secretId, filter) -> Uint8Array | null`
+///
+/// `filter` arrives as JSON and is handed to JavaScript as a plain object —
+/// see `ChannelFilter` in the SDK's types. The buffer is owned by the core and
+/// valid only for this call, so it is parsed before the promise is awaited.
+extern "C" int32_t channelStoreListHelpers(void* userData, uint64_t secretId, const uint8_t* filter,
+                                            size_t filterLen, uint8_t** outPtr, size_t* outLen) {
   auto* self = static_cast<StoreBindings*>(userData);
   // Kept alive past this call so the lambda handed to `callSync` — which the
   // JavaScript CallInvoker's queue may still be holding after this object's
   // owner has released its own reference — has somewhere safe to run.
   auto keepAlive = self->shared_from_this();
-  CallResult result = keepAlive->bridge().callSync([keepAlive, secretId](std::function<void(CallResult)> settle) {
+  std::vector<uint8_t> filterJson(filter, filter + filterLen);
+  CallResult result = keepAlive->bridge().callSync([keepAlive, secretId, filterJson](std::function<void(CallResult)> settle) {
     jsi::Runtime& rt = keepAlive->runtime();
     auto store = keepAlive->channelStore();
     auto method = store->getPropertyAsFunction(rt, "listHelpers");
-    jsi::Value promise = method.callWithThis(rt, *store, idVal(rt, secretId));
+    // Ids arrive as decimal strings — the core encodes them that way because
+    // `JSON.parse` cannot hold a u64; see `encode_filter` in
+    // `interop/ffi/protocol/stores.rs`.
+    jsi::Value filterVal = filterJson.empty()
+                               ? jsi::Value(jsi::Object(rt))
+                               : jsonParseUtf8(rt, filterJson.data(), filterJson.size());
+    jsi::Value promise =
+        method.callWithThis(rt, *store, idVal(rt, secretId), std::move(filterVal));
     keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), toCallResult);
   });
   if (result.code == 0) {
@@ -604,19 +616,31 @@ extern "C" int32_t channelStoreListHelpers(void* userData, uint64_t secretId, ui
   return result.code;
 }
 
-/// `ChannelStore.listReplicas(secretId) -> Uint8Array | null`
-extern "C" int32_t channelStoreListReplicas(void* userData, uint64_t secretId, uint8_t** outPtr,
-                                             size_t* outLen) {
+/// `ChannelStore.listReplicas(secretId, filter) -> Uint8Array | null`
+///
+/// `filter` arrives as JSON and is handed to JavaScript as a plain object —
+/// see `ChannelFilter` in the SDK's types. The buffer is owned by the core and
+/// valid only for this call, so it is parsed before the promise is awaited.
+extern "C" int32_t channelStoreListReplicas(void* userData, uint64_t secretId, const uint8_t* filter,
+                                            size_t filterLen, uint8_t** outPtr, size_t* outLen) {
   auto* self = static_cast<StoreBindings*>(userData);
   // Kept alive past this call so the lambda handed to `callSync` — which the
   // JavaScript CallInvoker's queue may still be holding after this object's
   // owner has released its own reference — has somewhere safe to run.
   auto keepAlive = self->shared_from_this();
-  CallResult result = keepAlive->bridge().callSync([keepAlive, secretId](std::function<void(CallResult)> settle) {
+  std::vector<uint8_t> filterJson(filter, filter + filterLen);
+  CallResult result = keepAlive->bridge().callSync([keepAlive, secretId, filterJson](std::function<void(CallResult)> settle) {
     jsi::Runtime& rt = keepAlive->runtime();
     auto store = keepAlive->channelStore();
     auto method = store->getPropertyAsFunction(rt, "listReplicas");
-    jsi::Value promise = method.callWithThis(rt, *store, idVal(rt, secretId));
+    // Ids arrive as decimal strings — the core encodes them that way because
+    // `JSON.parse` cannot hold a u64; see `encode_filter` in
+    // `interop/ffi/protocol/stores.rs`.
+    jsi::Value filterVal = filterJson.empty()
+                               ? jsi::Value(jsi::Object(rt))
+                               : jsonParseUtf8(rt, filterJson.data(), filterJson.size());
+    jsi::Value promise =
+        method.callWithThis(rt, *store, idVal(rt, secretId), std::move(filterVal));
     keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), toCallResult);
   });
   if (result.code == 0) {

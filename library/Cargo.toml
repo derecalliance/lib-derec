@@ -71,4 +71,10 @@ features = ["serde"]
 
 [dev-dependencies]
 rand08 = { package = "rand", version = "0.8.5" }
+# Captures span/event output so a test can assert a log actually carries the
+# fields its span records; the library itself depends only on the facade.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+# The library builds tracing without `std`; installing a subscriber in-process
+# needs it, so the test build (and only that) turns it on.
+tracing = { version = "0.1.44", features = ["std", "attributes"] }
 

@@ -458,6 +458,35 @@ response back to me," without rewriting channel state.
 
 ---
 
+## Store filtered listings
+
+`ChannelStore.listHelpers` and `ChannelStore.listReplicas` receive a filter
+object — `ids`, `status`, `role` and `exclude`, where every empty value means
+"do not restrict on this", so an all-empty filter selects everything.
+`exclude` is applied last, overriding `ids`. Ids are decimal strings, like
+every other `u64` on this bridge.
+
+**Apply it in your query.** That is the point: a `WHERE` clause or a
+key-condition expression instead of transferring rows the caller will discard.
+That transfer costs bandwidth everywhere, and on a metered backing such as
+DynamoDB, which bills by bytes read, it costs money.
+
+**A store that ignores it is slow, not wrong.** The library re-applies the
+filter to every listing before acting on it and drops anything the filter
+excluded.
+
+**That is a one-way guarantee, not a validation of your store.** Dropping rows
+enforces an upper bound; it cannot recover a row you omitted. A store that
+returns *fewer* rows than the filter selects is still wrong, in a way nothing
+in the library can detect — the protocol simply fails to act. Applying the
+filter faithfully is still your job.
+
+The backstop matters here in particular: TypeScript accepts a function of fewer
+parameters where more are declared, so a store written before the filter
+existed still satisfies this interface and compiles without a diagnostic.
+
+---
+
 ## Package Contents
 
 ```text
@@ -507,7 +536,8 @@ that you can retire as soon as the PrePair leg completes.
 
 The recommended pattern is: pair on the ephemeral URI, then — as soon
 as the pairing completes on the contact creator side — call
-`setOwnTransport` with the permanent endpoint and start an
+`setOwnTransports` with the permanent endpoint (`setOwnTransport` is
+deprecated and removed at 0.0.5) and start an
 `UpdateChannelInfo` flow against the peer to announce the swap. Once
 the peer acknowledges, retire the ephemeral URI. This keeps the
 plaintext PrePair window tight while letting subsequent traffic ride

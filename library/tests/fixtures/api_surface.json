@@ -1,0 +1,423 @@
+{
+  "$schema_note": "The API surface every SDK must expose, with each SDK's spelling. `api_surface_parity.rs` holds this file to the Rust core and holds every SDK to this file. Adding a method to the core fails that test until this file names it; naming it here fails until every SDK declares it. Lifecycle entry points (`derec_protocol_new`, `_free`, `_version`) are excluded: each SDK expresses them idiomatically as a constructor and a disposer. `secret_id` is absent from `builder_options`: every SDK takes it as the builder's constructor argument rather than as a setter, and the constructed protocol exposes it through the `secret_id` protocol method. `sdk_helpers` covers conveniences every SDK must offer that have no counterpart in the core, so nothing else would notice one going missing.",
+  "protocol_methods": [
+    {
+      "rust": "accept",
+      "dotnet": "AcceptAsync",
+      "go": "Accept",
+      "ts": "accept"
+    },
+    {
+      "rust": "create_contact",
+      "dotnet": "CreateContactAsync",
+      "go": "CreateContact",
+      "ts": "createContact"
+    },
+    {
+      "rust": "get_fingerprint",
+      "dotnet": "GetFingerprintAsync",
+      "go": "GetFingerprint",
+      "ts": "getFingerprint"
+    },
+    {
+      "rust": "process",
+      "dotnet": "ProcessAsync",
+      "go": "Process",
+      "ts": "process"
+    },
+    {
+      "rust": "reject",
+      "dotnet": "RejectAsync",
+      "go": "Reject",
+      "ts": "reject"
+    },
+    {
+      "rust": "remove_expired_channels",
+      "dotnet": "RemoveExpiredChannelsAsync",
+      "go": "RemoveExpiredChannels",
+      "ts": "removeExpiredChannels"
+    },
+    {
+      "rust": "restore",
+      "dotnet": "RestoreAsync",
+      "go": "Restore",
+      "ts": "restore"
+    },
+    {
+      "rust": "set_communication_info",
+      "dotnet": "SetCommunicationInfo",
+      "go": "SetCommunicationInfo",
+      "ts": "setCommunicationInfo"
+    },
+    {
+      "rust": "set_own_transport",
+      "dotnet": "SetOwnTransport",
+      "go": "SetOwnTransport",
+      "ts": "setOwnTransport"
+    },
+    {
+      "rust": "set_own_transports",
+      "dotnet": "SetOwnTransports",
+      "go": "SetOwnTransports",
+      "ts": "setOwnTransports"
+    },
+    {
+      "rust": "start",
+      "dotnet": "StartAsync",
+      "go": "Start",
+      "ts": "start"
+    },
+    {
+      "rust": "tick",
+      "dotnet": "TickAsync",
+      "go": "Tick",
+      "ts": "tick"
+    },
+    {
+      "rust": "verify_fingerprint",
+      "dotnet": "VerifyFingerprintAsync",
+      "go": "VerifyFingerprint",
+      "ts": "verifyFingerprint"
+    },
+    {
+      "rust": "secret_id",
+      "dotnet": "SecretId",
+      "go": "SecretID",
+      "ts": "secretId"
+    }
+  ],
+  "builder_options": [
+    {
+      "rust": "own_transport_uri",
+      "dotnet": "WithOwnTransport",
+      "go": "OwnTransportURI",
+      "ts": "withOwnTransport"
+    },
+    {
+      "rust": "own_transport_protocol",
+      "dotnet": "WithOwnTransport",
+      "go": "OwnTransportProtocol",
+      "ts": "withOwnTransport"
+    },
+    {
+      "rust": "own_transports",
+      "dotnet": "WithOwnTransports",
+      "go": "OwnTransports",
+      "ts": "withOwnTransports"
+    },
+    {
+      "rust": "threshold",
+      "dotnet": "WithThreshold",
+      "go": "Threshold",
+      "ts": "withThreshold"
+    },
+    {
+      "rust": "keep_versions_count",
+      "dotnet": "WithKeepVersionsCount",
+      "go": "KeepVersionsCount",
+      "ts": "withKeepVersionsCount"
+    },
+    {
+      "rust": "auto_respond_on_failure",
+      "dotnet": "WithAutoRespondOnFailure",
+      "go": "AutoRespondOnFailure",
+      "ts": "withAutoRespondOnFailure"
+    },
+    {
+      "rust": "unpair_ack",
+      "dotnet": "WithUnpairAck",
+      "go": "UnpairAck",
+      "ts": "withUnpairAck"
+    },
+    {
+      "rust": "auto_reply_to",
+      "dotnet": "WithAutoReplyTo",
+      "go": "AutoReplyTo",
+      "ts": "withAutoReplyTo"
+    },
+    {
+      "rust": "auto_accept",
+      "dotnet": "WithAutoAccept",
+      "go": "AutoAccept",
+      "ts": "withAutoAccept"
+    },
+    {
+      "rust": "timeouts",
+      "dotnet": "WithTimeouts",
+      "go": "Timeouts",
+      "ts": "withTimeouts"
+    },
+    {
+      "rust": "unsafe_http",
+      "dotnet": "WithUnsafeHttp",
+      "go": "UnsafeHTTP",
+      "ts": "withUnsafeHttp"
+    },
+    {
+      "rust": "unsafe_connection",
+      "dotnet": "WithUnsafeConnection",
+      "go": "UnsafeConnection",
+      "ts": "withUnsafeConnection"
+    },
+    {
+      "rust": "replica_id",
+      "dotnet": "WithReplicaId",
+      "go": "ReplicaID",
+      "ts": "withReplicaId"
+    },
+    {
+      "rust": "parameter_range",
+      "dotnet": "WithParameterRange",
+      "go": "ParameterRange",
+      "ts": "withParameterRange"
+    },
+    {
+      "rust": "communication_info",
+      "dotnet": "WithCommunicationInfo",
+      "go": "CommunicationInfo",
+      "ts": "withCommunicationInfo"
+    }
+  ],
+  "flow_params": [
+    {
+      "flow": "Pairing",
+      "dotnet": "PairingParams",
+      "go": "PairingParams",
+      "ts": "PairingParams"
+    },
+    {
+      "flow": "Discovery",
+      "dotnet": "DiscoveryParams",
+      "go": "DiscoveryParams",
+      "ts": "DiscoveryParams"
+    },
+    {
+      "flow": "ProtectSecret",
+      "dotnet": "ProtectSecretParams",
+      "go": "ProtectSecretParams",
+      "ts": "ProtectSecretParams"
+    },
+    {
+      "flow": "VerifyShares",
+      "dotnet": "VerifySharesParams",
+      "go": "VerifySharesParams",
+      "ts": "VerifySharesParams"
+    },
+    {
+      "flow": "RecoverSecret",
+      "dotnet": "RecoverSecretParams",
+      "go": "RecoverSecretParams",
+      "ts": "RecoverSecretParams"
+    },
+    {
+      "flow": "ReplicaDiscovery",
+      "dotnet": "ReplicaDiscoveryParams",
+      "go": "ReplicaDiscoveryParams",
+      "ts": "ReplicaDiscoveryParams"
+    },
+    {
+      "flow": "UnpairReplica",
+      "dotnet": "UnpairReplicaParams",
+      "go": "UnpairReplicaParams",
+      "ts": "UnpairReplicaParams"
+    },
+    {
+      "flow": "Unpair",
+      "dotnet": "UnpairParams",
+      "go": "UnpairParams",
+      "ts": "UnpairParams"
+    },
+    {
+      "flow": "UpdateChannelInfo",
+      "dotnet": "UpdateChannelInfoParams",
+      "go": "UpdateChannelInfoParams",
+      "ts": "UpdateChannelInfoParams"
+    }
+  ],
+  "store_methods": [
+    {
+      "trait": "DeRecChannelStore",
+      "rust": "load",
+      "dotnet": "Load",
+      "go": "Load",
+      "ts": "load"
+    },
+    {
+      "trait": "DeRecChannelStore",
+      "rust": "save",
+      "dotnet": "Save",
+      "go": "Save",
+      "ts": "save"
+    },
+    {
+      "trait": "DeRecChannelStore",
+      "rust": "remove",
+      "dotnet": "Remove",
+      "go": "Remove",
+      "ts": "remove"
+    },
+    {
+      "trait": "DeRecChannelStore",
+      "rust": "helpers",
+      "dotnet": "ListHelpers",
+      "go": "ListHelpers",
+      "ts": "listHelpers"
+    },
+    {
+      "trait": "DeRecChannelStore",
+      "rust": "replicas",
+      "dotnet": "ListReplicas",
+      "go": "ListReplicas",
+      "ts": "listReplicas"
+    },
+    {
+      "trait": "DeRecChannelStore",
+      "rust": "link_channel",
+      "dotnet": "LinkChannel",
+      "go": "LinkChannel",
+      "ts": "linkChannel"
+    },
+    {
+      "trait": "DeRecChannelStore",
+      "rust": "linked_channels",
+      "dotnet": "LinkedChannels",
+      "go": "LinkedChannels",
+      "ts": "linkedChannels"
+    },
+    {
+      "trait": "DeRecSecretStore",
+      "rust": "load",
+      "dotnet": "Load",
+      "go": "Load",
+      "ts": "load"
+    },
+    {
+      "trait": "DeRecSecretStore",
+      "rust": "load_many",
+      "dotnet": "LoadMany",
+      "go": "LoadMany",
+      "ts": "loadMany"
+    },
+    {
+      "trait": "DeRecSecretStore",
+      "rust": "save",
+      "dotnet": "Save",
+      "go": "Save",
+      "ts": "save"
+    },
+    {
+      "trait": "DeRecSecretStore",
+      "rust": "remove",
+      "dotnet": "Remove",
+      "go": "Remove",
+      "ts": "remove"
+    },
+    {
+      "trait": "DeRecShareStore",
+      "rust": "load",
+      "dotnet": "Load",
+      "go": "Load",
+      "ts": "load"
+    },
+    {
+      "trait": "DeRecShareStore",
+      "rust": "load_many",
+      "dotnet": "LoadMany",
+      "go": "LoadMany",
+      "ts": "loadMany"
+    },
+    {
+      "trait": "DeRecShareStore",
+      "rust": "load_all",
+      "dotnet": "LoadAll",
+      "go": "LoadAll",
+      "ts": "loadAll"
+    },
+    {
+      "trait": "DeRecShareStore",
+      "rust": "latest_version",
+      "dotnet": "LatestVersion",
+      "go": "LatestVersion",
+      "ts": "latestVersion"
+    },
+    {
+      "trait": "DeRecShareStore",
+      "rust": "save",
+      "dotnet": "Save",
+      "go": "Save",
+      "ts": "save"
+    },
+    {
+      "trait": "DeRecShareStore",
+      "rust": "remove_channel",
+      "dotnet": "RemoveChannel",
+      "go": "RemoveChannel",
+      "ts": "removeChannel"
+    },
+    {
+      "trait": "DeRecUserSecretStore",
+      "rust": "load_latest",
+      "dotnet": "LoadLatest",
+      "go": "LoadLatest",
+      "ts": "loadLatest"
+    },
+    {
+      "trait": "DeRecUserSecretStore",
+      "rust": "save_latest",
+      "dotnet": "SaveLatest",
+      "go": "SaveLatest",
+      "ts": "saveLatest"
+    },
+    {
+      "trait": "DeRecUserSecretStore",
+      "rust": "remove",
+      "dotnet": "Remove",
+      "go": "Remove",
+      "ts": "remove"
+    },
+    {
+      "trait": "DeRecStateStore",
+      "rust": "save",
+      "dotnet": "Save",
+      "go": "Save",
+      "ts": "save"
+    },
+    {
+      "trait": "DeRecStateStore",
+      "rust": "load",
+      "dotnet": "Load",
+      "go": "Load",
+      "ts": "load"
+    },
+    {
+      "trait": "DeRecStateStore",
+      "rust": "remove",
+      "dotnet": "Remove",
+      "go": "Remove",
+      "ts": "remove"
+    },
+    {
+      "trait": "DeRecStateStore",
+      "rust": "load_all",
+      "dotnet": "LoadAll",
+      "go": "LoadAll",
+      "ts": "loadAll"
+    },
+    {
+      "trait": "DeRecTransport",
+      "rust": "send",
+      "dotnet": "Send",
+      "go": "Send",
+      "ts": "send"
+    }
+  ],
+  "sdk_helpers": [
+    {
+      "what": "filter predicate",
+      "why": "a store whose backing cannot express ChannelFilter as a query needs to apply it in memory without re-deriving the empty-means-unrestricted and exclude-after-ids rules",
+      "dotnet": "Matches",
+      "go": "Matches",
+      "ts": "channelFilterMatches"
+    }
+  ]
+}

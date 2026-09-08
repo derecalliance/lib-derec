@@ -28,12 +28,12 @@ public enum FlowKind : uint
     /// Ask the replica group whether this device is behind, and catch up if
     /// it is. Replica-only; takes no parameters.
     /// </summary>
-    SyncCheck = 7,
+    ReplicaDiscovery = 7,
     /// <summary>
     /// Remove a member from the replica group. Replica-only. Naming this
     /// device is a voluntary departure; naming another is an eviction.
     /// </summary>
-    RemoveReplica = 8,
+    UnpairReplica = 8,
 }
 
 /// <summary>
@@ -206,17 +206,17 @@ public sealed record UpdateChannelInfoParams
 }
 
 /// <summary>
-/// Params for <see cref="FlowKind.SyncCheck"/>.
+/// Params for <see cref="FlowKind.ReplicaDiscovery"/>.
 /// </summary>
 /// <remarks>
 /// The flow takes none: the group and this device's own version are both read
 /// from the stores. Present so every flow kind has a params type and
 /// <see cref="DeRecProtocol.StartAsync"/> reads uniformly at the call site.
 /// </remarks>
-public sealed record SyncCheckParams;
+public sealed record ReplicaDiscoveryParams;
 
 /// <summary>
-/// Params for <see cref="FlowKind.RemoveReplica"/>.
+/// Params for <see cref="FlowKind.UnpairReplica"/>.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -237,7 +237,7 @@ public sealed record SyncCheckParams;
 /// therefore cannot complete a removal.
 /// </para>
 /// </remarks>
-public sealed record RemoveReplicaParams
+public sealed record UnpairReplicaParams
 {
     [JsonPropertyName("replica_id")] public required string ReplicaId { get; init; }
 
@@ -529,9 +529,9 @@ public sealed record SelfRemovedFromGroupEvent : DeRecEvent
 /// A replica catch-up finished. <c>FetchedFrom</c> is null when this device
 /// was already current, in which case no hydration event follows.
 /// </summary>
-public sealed record SyncCheckCompleteEvent : DeRecEvent
+public sealed record ReplicaDiscoveryCompleteEvent : DeRecEvent
 {
-    public override string EventType => "SyncCheckComplete";
+    public override string EventType => "ReplicaDiscoveryComplete";
     public required uint LocalVersion { get; init; }
     public required uint GroupVersion { get; init; }
     public string? FetchedFrom { get; init; }
@@ -639,12 +639,22 @@ public sealed record PairingStartedEvent : DeRecEvent
     public override string EventType => "PairingStarted";
     public required string ChannelId { get; init; }
     public required Pairing.SenderKind Kind { get; init; }
+
+    /// <summary>The token identifying the round this request belongs to.
+    /// One is drawn per <c>Start</c> call, so a fan-out shares it across all
+    /// of its targets, and the peer echoes it on the response.</summary>
+    public required string TraceId { get; init; }
 }
 
 public sealed record DiscoveryStartedEvent : DeRecEvent
 {
     public override string EventType => "DiscoveryStarted";
     public required string ChannelId { get; init; }
+
+    /// <summary>The token identifying the round this request belongs to.
+    /// One is drawn per <c>Start</c> call, so a fan-out shares it across all
+    /// of its targets, and the peer echoes it on the response.</summary>
+    public required string TraceId { get; init; }
 }
 
 public sealed record DiscoveryFailedEvent : DeRecEvent
@@ -659,6 +669,11 @@ public sealed record ProtectSecretStartedEvent : DeRecEvent
     public override string EventType => "ProtectSecretStarted";
     public required string ChannelId { get; init; }
     public required uint Version { get; init; }
+
+    /// <summary>The token identifying the round this request belongs to.
+    /// One is drawn per <c>Start</c> call, so a fan-out shares it across all
+    /// of its targets, and the peer echoes it on the response.</summary>
+    public required string TraceId { get; init; }
 }
 
 public sealed record ProtectSecretFailedEvent : DeRecEvent
@@ -674,6 +689,11 @@ public sealed record VerifySharesStartedEvent : DeRecEvent
     public override string EventType => "VerifySharesStarted";
     public required string ChannelId { get; init; }
     public required uint Version { get; init; }
+
+    /// <summary>The token identifying the round this request belongs to.
+    /// One is drawn per <c>Start</c> call, so a fan-out shares it across all
+    /// of its targets, and the peer echoes it on the response.</summary>
+    public required string TraceId { get; init; }
 }
 
 public sealed record VerifySharesFailedEvent : DeRecEvent
@@ -689,6 +709,11 @@ public sealed record RecoverSecretStartedEvent : DeRecEvent
     public override string EventType => "RecoverSecretStarted";
     public required string ChannelId { get; init; }
     public required uint Version { get; init; }
+
+    /// <summary>The token identifying the round this request belongs to.
+    /// One is drawn per <c>Start</c> call, so a fan-out shares it across all
+    /// of its targets, and the peer echoes it on the response.</summary>
+    public required string TraceId { get; init; }
 }
 
 public sealed record RecoverSecretFailedEvent : DeRecEvent
@@ -710,12 +735,22 @@ public sealed record UnpairStartedEvent : DeRecEvent
 {
     public override string EventType => "UnpairStarted";
     public required string ChannelId { get; init; }
+
+    /// <summary>The token identifying the round this request belongs to.
+    /// One is drawn per <c>Start</c> call, so a fan-out shares it across all
+    /// of its targets, and the peer echoes it on the response.</summary>
+    public required string TraceId { get; init; }
 }
 
 public sealed record UpdateChannelInfoStartedEvent : DeRecEvent
 {
     public override string EventType => "UpdateChannelInfoStarted";
     public required string ChannelId { get; init; }
+
+    /// <summary>The token identifying the round this request belongs to.
+    /// One is drawn per <c>Start</c> call, so a fan-out shares it across all
+    /// of its targets, and the peer echoes it on the response.</summary>
+    public required string TraceId { get; init; }
 }
 
 public sealed record UpdateChannelInfoFailedEvent : DeRecEvent
@@ -864,7 +899,7 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             {
                 Version = root.GetProperty("version").GetUInt32(),
             },
-            "SyncCheckComplete" => new SyncCheckCompleteEvent
+            "ReplicaDiscoveryComplete" => new ReplicaDiscoveryCompleteEvent
             {
                 LocalVersion = root.GetProperty("local_version").GetUInt32(),
                 GroupVersion = root.GetProperty("group_version").GetUInt32(),
@@ -907,10 +942,12 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             {
                 ChannelId = root.GetProperty("channel_id").GetString()!,
                 Kind = (Pairing.SenderKind)root.GetProperty("kind").GetInt32(),
+                TraceId = root.GetProperty("trace_id").GetString()!,
             },
             "DiscoveryStarted" => new DiscoveryStartedEvent
             {
                 ChannelId = root.GetProperty("channel_id").GetString()!,
+                TraceId = root.GetProperty("trace_id").GetString()!,
             },
             "DiscoveryFailed" => new DiscoveryFailedEvent
             {
@@ -921,6 +958,7 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             {
                 ChannelId = root.GetProperty("channel_id").GetString()!,
                 Version = root.GetProperty("version").GetUInt32(),
+                TraceId = root.GetProperty("trace_id").GetString()!,
             },
             "ProtectSecretFailed" => new ProtectSecretFailedEvent
             {
@@ -932,6 +970,7 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             {
                 ChannelId = root.GetProperty("channel_id").GetString()!,
                 Version = root.GetProperty("version").GetUInt32(),
+                TraceId = root.GetProperty("trace_id").GetString()!,
             },
             "VerifySharesFailed" => new VerifySharesFailedEvent
             {
@@ -943,6 +982,7 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             {
                 ChannelId = root.GetProperty("channel_id").GetString()!,
                 Version = root.GetProperty("version").GetUInt32(),
+                TraceId = root.GetProperty("trace_id").GetString()!,
             },
             "RecoverSecretFailed" => new RecoverSecretFailedEvent
             {
@@ -958,10 +998,12 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             "UnpairStarted" => new UnpairStartedEvent
             {
                 ChannelId = root.GetProperty("channel_id").GetString()!,
+                TraceId = root.GetProperty("trace_id").GetString()!,
             },
             "UpdateChannelInfoStarted" => new UpdateChannelInfoStartedEvent
             {
                 ChannelId = root.GetProperty("channel_id").GetString()!,
+                TraceId = root.GetProperty("trace_id").GetString()!,
             },
             "UpdateChannelInfoFailed" => new UpdateChannelInfoFailedEvent
             {

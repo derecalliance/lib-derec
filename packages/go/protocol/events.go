@@ -20,7 +20,7 @@ const (
 	EventTypeReplicaSyncRejected       = "ReplicaSyncRejected"
 	EventTypeReplicaSyncFailed         = "ReplicaSyncFailed"
 	EventTypeReplicaSyncComplete       = "ReplicaSyncComplete"
-	EventTypeSyncCheckComplete         = "SyncCheckComplete"
+	EventTypeReplicaDiscoveryComplete  = "ReplicaDiscoveryComplete"
 	EventTypeReplicaRemoved            = "ReplicaRemoved"
 	EventTypeReplicaSourceChanged      = "ReplicaSourceChanged"
 	EventTypeSelfRemovedFromGroup      = "SelfRemovedFromGroup"
@@ -86,6 +86,11 @@ type Event struct {
 	// the EventType* constants above.
 	Type string `json:"type"`
 
+	// Every *Started event: the token identifying the round this request
+	// belongs to. One token is drawn per Start call, so a fan-out shares it
+	// across all of its targets, and the peer echoes it on the response.
+	TraceID string `json:"trace_id"`
+
 	// PairingCompleted, PairingStarted.
 	ChannelID             string            `json:"channel_id"`
 	PairingChannelID      string            `json:"pairing_channel_id"`
@@ -121,7 +126,7 @@ type Event struct {
 	Synced []string `json:"synced"`
 	Behind []string `json:"behind"`
 
-	// SyncCheckComplete. LocalVersion is what this device held when the
+	// ReplicaDiscoveryComplete. LocalVersion is what this device held when the
 	// catch-up ran, GroupVersion the newest any member reported, and
 	// FetchedFrom names the member the state was pulled from — nil when this
 	// device was already current, in which case no hydration event follows.
@@ -161,6 +166,21 @@ type Event struct {
 	ShareDescription *string `json:"share_description"`
 	ShareSecretID    *string `json:"share_secret_id"`
 }
+
+// The label vocabulary for Event.ActionKind, one value per pending-action
+// kind the protocol can raise. Compare against these rather than writing the
+// string literal — they match the Rust PendingActionKind discriminants
+// one-for-one.
+const (
+	ActionKindPairing           = "Pairing"
+	ActionKindPrePair           = "PrePair"
+	ActionKindStoreShare        = "StoreShare"
+	ActionKindVerifyShare       = "VerifyShare"
+	ActionKindDiscovery         = "Discovery"
+	ActionKindGetShare          = "GetShare"
+	ActionKindUnpair            = "Unpair"
+	ActionKindUpdateChannelInfo = "UpdateChannelInfo"
+)
 
 // Secret mirrors SecretWire in wire.rs — the typed secret snapshot carried
 // by ReplicaSecretReceived and SecretRecovered.
