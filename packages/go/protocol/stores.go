@@ -36,7 +36,11 @@
 // package.
 package protocol
 
-import "github.com/derecalliance/lib-derec/packages/go/internal/native"
+import (
+	"errors"
+
+	"github.com/derecalliance/lib-derec/packages/go/internal/native"
+)
 
 // Domain types exchanged by the store/transport interfaces below. See
 // internal/native/store_types.go for the authoritative definitions and
@@ -294,5 +298,94 @@ type Transport interface {
 	//
 	// Delivery to any one endpoint is success. Return an error only when
 	// the message reached none of them. endpoints is never empty.
+	//
+	// Deliver once. Every entry addresses the same peer, so sending to all
+	// of them delivers one authenticated message several times. Stop at the
+	// first success. The protocol's handlers are idempotent, so a duplicate
+	// does not corrupt state, but it is still a duplicate to anything
+	// counting messages, and a peer entitled to treat re-delivery as a
+	// replay will.
+	//
+	// Prefer an adapter to writing this by hand. Choosing which endpoint to
+	// dial is yours and stays here; the bookkeeping around it is the same
+	// everywhere and is already written and tested. Implement SendOne and
+	// wrap it in SequentialFailover. Taking endpoints[0] compiles, passes
+	// every test, and silently gives up the failover the list exists to
+	// provide — if that is genuinely wanted, say so with
+	// SingleEndpointTransport rather than by indexing.
 	Send(endpoints []Endpoint, message []byte) error
+}
+
+// SendOne delivers one message to one endpoint.
+//
+// The narrow half of a transport: everything genuinely about dialing, and
+// nothing about which endpoint to dial. Implement this, then wrap it in
+// SequentialFailover or SingleEndpointTransport to get a Transport.
+type SendOne interface {
+	// SendOne delivers message to endpoint, or reports that it did not
+	// arrive.
+	//
+	// The error need not distinguish "unreachable" from "rejected":
+	// SequentialFailover treats both as a reason to try the next endpoint,
+	// which is the safe reading. Trying an endpoint that would have refused
+	// costs a round trip; skipping one that would have worked costs the
+	// delivery.
+	SendOne(endpoint Endpoint, message []byte) error
+}
+
+// SequentialFailover tries each endpoint in the order the peer offered it and
+// stops at the first success.
+//
+// Implements the Transport contract over a SendOne: endpoints are attempted in
+// order, delivery stops at the first success, and an error is returned only
+// when every endpoint failed. The message is delivered at most once.
+//
+// This is the right default. A peer advertising several endpoints is saying it
+// can be reached at any of them, and the reason 0.0.3 records the whole list is
+// so one being down does not end the conversation.
+type SequentialFailover struct {
+	// Dialer delivers to a single endpoint. Required.
+	Dialer SendOne
+}
+
+// Send implements Transport.
+func (s SequentialFailover) Send(endpoints []Endpoint, message []byte) error {
+	var last error
+	for _, endpoint := range endpoints {
+		if err := s.Dialer.SendOne(endpoint, message); err != nil {
+			last = err
+			continue
+		}
+		return nil
+	}
+	if last == nil {
+		// endpoints is never empty through the protocol, which refuses to
+		// record a peer whose endpoints were all filtered away.
+		return errors.New("protocol: Send called with no endpoints")
+	}
+	return last
+}
+
+// SingleEndpointTransport uses the first endpoint only.
+//
+// Reproduces the pre-0.0.3 behaviour exactly, for an application that genuinely
+// serves one endpoint or has a reason not to fail over.
+//
+// It exists so that choosing it is visible. endpoints[0] written inline looks
+// like an implementation detail and reads as finished; naming this type records
+// that failover was considered and declined, which is a claim a reviewer can
+// disagree with. If the peers this application talks to advertise more than one
+// endpoint, prefer SequentialFailover — every endpoint after the first is
+// reachability being thrown away.
+type SingleEndpointTransport struct {
+	// Dialer delivers to a single endpoint. Required.
+	Dialer SendOne
+}
+
+// Send implements Transport.
+func (s SingleEndpointTransport) Send(endpoints []Endpoint, message []byte) error {
+	if len(endpoints) == 0 {
+		return errors.New("protocol: Send called with no endpoints")
+	}
+	return s.Dialer.SendOne(endpoints[0], message)
 }

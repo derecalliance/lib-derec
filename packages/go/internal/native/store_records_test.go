@@ -36,7 +36,7 @@ func TestEncodeChannelRecord_Helper_MatchesRustJSONShape(t *testing.T) {
 		t.Fatalf("EncodeChannelRecord: %v", err)
 	}
 
-	want := `{"Helper":{"channel_id":123456789,"transports":[{"uri":"https://example.com/derec","protocol":0}],` +
+	want := `{"Helper":{"schema_version":3,"channel_id":123456789,"transports":[{"uri":"https://example.com/derec","protocol":0}],` +
 		`"communication_info":{"name":"helper"},"peer_role":"Helper","status":"Paired","created_at":1700000000}}`
 	if string(got) != want {
 		t.Fatalf("EncodeChannelRecord mismatch:\n got: %s\nwant: %s", got, want)
@@ -59,7 +59,7 @@ func TestEncodeChannelRecord_Replica_MatchesRustJSONShape(t *testing.T) {
 		t.Fatalf("EncodeChannelRecord: %v", err)
 	}
 
-	want := `{"Replica":{"channel_id":123456789,"replica_id":42,"transports":[{"uri":"https://replica.example.com","protocol":0}],` +
+	want := `{"Replica":{"schema_version":3,"channel_id":123456789,"replica_id":42,"transports":[{"uri":"https://replica.example.com","protocol":0}],` +
 		`"communication_info":{"name":"alice-2"},"role":"Destination","status":"Pending","created_at":1700000000}}`
 	if string(got) != want {
 		t.Fatalf("EncodeChannelRecord mismatch:\n got: %s\nwant: %s", got, want)
@@ -143,6 +143,46 @@ func TestDecodeChannelRecord_KnownGoodRustSamples(t *testing.T) {
 	}
 	if record.Replica.Role != ReplicaRoleSource {
 		t.Errorf("Role = %v, want Source", record.Replica.Role)
+	}
+}
+
+// The core stamps schema_version on every record it writes, and a record
+// written before the marker existed carries none. Decoding has to accept
+// both: the samples above are the unversioned shape, this is the current one.
+func TestDecodeChannelRecord_AcceptsTheSchemaVersionMarker(t *testing.T) {
+	versioned := `{"Helper":{"schema_version":3,"channel_id":987654321,` +
+		`"transports":[{"uri":"https://owner.example.com","protocol":0}],` +
+		`"communication_info":{},"peer_role":"Owner","status":"Pending","created_at":42}}`
+
+	record, err := DecodeChannelRecord([]byte(versioned))
+	if err != nil {
+		t.Fatalf("DecodeChannelRecord(versioned): %v", err)
+	}
+	if record.Helper == nil {
+		t.Fatal("expected the Helper variant")
+	}
+	if record.Helper.ChannelID != 987654321 {
+		t.Errorf("ChannelID = %d, want 987654321", record.Helper.ChannelID)
+	}
+}
+
+// Re-encoding must stamp the marker even when the record came in without one,
+// so a record that round-trips through this package does not keep looking
+// older than the shape it is actually written in.
+func TestChannelRecordRoundTrip_StampsTheMarkerOnUnversionedInput(t *testing.T) {
+	unversioned := `{"Helper":{"channel_id":1,"transports":[{"uri":"https://a.example","protocol":0}],` +
+		`"communication_info":{},"peer_role":"Owner","status":"Paired","created_at":0}}`
+
+	record, err := DecodeChannelRecord([]byte(unversioned))
+	if err != nil {
+		t.Fatalf("DecodeChannelRecord: %v", err)
+	}
+	got, err := EncodeChannelRecord(record)
+	if err != nil {
+		t.Fatalf("EncodeChannelRecord: %v", err)
+	}
+	if !strings.Contains(string(got), `"schema_version":3`) {
+		t.Fatalf("re-encoded record is missing the marker: %s", got)
 	}
 }
 

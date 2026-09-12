@@ -9,7 +9,11 @@
     // See also https://aka.ms/tsconfig/module
     "module": "nodenext",
     "target": "esnext",
-    "types": [],
+    // `channelFilterConformance.ts` reads the shared fixture through
+    // `node:fs`. Importing the JSON instead would make it a compile input,
+    // and tsc would widen `rootDir` to the repository root and scatter the
+    // emit accordingly.
+    "types": ["node"],
     // For nodejs:
     // "lib": ["esnext"],
     // "types": ["node"],

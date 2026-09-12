@@ -427,7 +427,9 @@ mod tests {
                     version: 1,
                     nonce: 7,
                     timestamp: Some(timestamp),
-                    reply_to: Vec::new(),
+                    #[allow(deprecated)]
+                    reply_to: None,
+                    reply_to_transports: Vec::new(),
                 },
             ))
             .encrypt(&SHARED_KEY)
@@ -522,7 +524,9 @@ mod tests {
                         version: 1,
                         nonce: 7,
                         timestamp: Some(timestamp),
-                        reply_to: Vec::new(),
+                        #[allow(deprecated)]
+                        reply_to: None,
+                        reply_to_transports: Vec::new(),
                     },
                 ))
                 .encrypt(&[1u8; 32])

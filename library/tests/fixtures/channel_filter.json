@@ -1,0 +1,128 @@
+{
+  "$schema_note": "Conformance vectors for ChannelFilter. A store may translate the filter into a query instead of returning every row, which is an optimization and is the store's to verify: the library's re-check drops rows the filter excludes but cannot recover a row that was never returned, so an under-selecting pushdown is undetectable at runtime. Each case lists records, a filter, and the ids that must survive, in that order. `role` names are the Rust variant names the wire uses: SenderKind for helpers, ReplicaRole for replicas. Ids are decimal strings because the same table is driven from TypeScript, where `JSON.parse` cannot hold a u64. `library/tests/channel_filter_conformance.rs` drives this against `ChannelFilter::matches`, which is the same predicate the library re-checks with; every SDK's suite drives it against its own helper.",
+
+  "helpers": {
+    "records": [
+      { "id": "1", "status": "Paired", "role": "Helper" },
+      { "id": "2", "status": "Pending", "role": "Helper" },
+      { "id": "3", "status": "Paired", "role": "Owner" },
+      { "id": "4", "status": "Unpairing", "role": "Helper" },
+      { "id": "18446744073709551615", "status": "Paired", "role": "Owner" }
+    ],
+    "cases": [
+      {
+        "name": "a default filter selects everything",
+        "why": "Every field's empty value means 'do not restrict'. A pushdown that treats an empty `ids` as `IN ()` returns nothing and silently stops the protocol acting on any channel.",
+        "filter": { "ids": [], "status": [], "role": null, "exclude": [] },
+        "expected": ["1", "2", "3", "4", "18446744073709551615"]
+      },
+      {
+        "name": "empty ids does not restrict",
+        "why": "The commonest pushdown bug: `WHERE id IN ()` is not the same as no clause.",
+        "filter": { "ids": [], "status": ["Paired"], "role": null, "exclude": [] },
+        "expected": ["1", "3", "18446744073709551615"]
+      },
+      {
+        "name": "empty status does not restrict",
+        "filter": { "ids": ["1", "2"], "status": [], "role": null, "exclude": [] },
+        "expected": ["1", "2"]
+      },
+      {
+        "name": "a null role does not restrict",
+        "why": "`role` is an optional, not a list. Absent means any role, which is distinct from an empty list meaning the same thing for the other fields.",
+        "filter": { "ids": [], "status": [], "role": null, "exclude": [] },
+        "expected": ["1", "2", "3", "4", "18446744073709551615"]
+      },
+      {
+        "name": "role restricts to exactly that role",
+        "filter": { "ids": [], "status": [], "role": "Owner", "exclude": [] },
+        "expected": ["3", "18446744073709551615"]
+      },
+      {
+        "name": "status accepts several values",
+        "filter": { "ids": [], "status": ["Pending", "Unpairing"], "role": null, "exclude": [] },
+        "expected": ["2", "4"]
+      },
+      {
+        "name": "restrictions combine with AND",
+        "filter": { "ids": ["1", "2", "3"], "status": ["Paired"], "role": "Helper", "exclude": [] },
+        "expected": ["1"]
+      },
+      {
+        "name": "exclude is applied after ids and overrides it",
+        "why": "An id named by both `ids` and `exclude` is excluded. A pushdown that ORs the two, or applies exclude first, returns it.",
+        "filter": { "ids": ["1", "2"], "status": [], "role": null, "exclude": ["2"] },
+        "expected": ["1"]
+      },
+      {
+        "name": "exclude applies with no ids restriction",
+        "filter": { "ids": [], "status": [], "role": null, "exclude": ["1", "4"] },
+        "expected": ["2", "3", "18446744073709551615"]
+      },
+      {
+        "name": "exclude overrides a full ids list",
+        "filter": { "ids": ["3"], "status": [], "role": null, "exclude": ["3"] },
+        "expected": []
+      },
+      {
+        "name": "an id not present selects nothing rather than erroring",
+        "filter": { "ids": ["999"], "status": [], "role": null, "exclude": [] },
+        "expected": []
+      },
+      {
+        "name": "ids above 2^53 are matched exactly",
+        "why": "Ids cross the SDK bridges as decimal strings because `JSON.parse` rounds anything larger. A binding that parses them as numbers matches the wrong channel.",
+        "filter": {
+          "ids": ["18446744073709551615"],
+          "status": [],
+          "role": null,
+          "exclude": []
+        },
+        "expected": ["18446744073709551615"]
+      },
+      {
+        "name": "excluding a large id does not exclude its rounded neighbour",
+        "why": "18446744073709551615 and 18446744073709551614 collapse to the same f64. Excluding one must not drop the other.",
+        "filter": {
+          "ids": [],
+          "status": ["Paired"],
+          "role": "Owner",
+          "exclude": ["18446744073709551614"]
+        },
+        "expected": ["3", "18446744073709551615"]
+      }
+    ]
+  },
+
+  "replicas": {
+    "records": [
+      { "id": "10", "status": "Paired", "role": "Source" },
+      { "id": "11", "status": "Paired", "role": "Destination" },
+      { "id": "12", "status": "Pending", "role": "Destination" }
+    ],
+    "cases": [
+      {
+        "name": "a default filter selects every member",
+        "filter": { "ids": [], "status": [], "role": null, "exclude": [] },
+        "expected": ["10", "11", "12"]
+      },
+      {
+        "name": "role narrows to the source",
+        "why": "How the protocol finds the single member holding Source before a succession.",
+        "filter": { "ids": [], "status": [], "role": "Source", "exclude": [] },
+        "expected": ["10"]
+      },
+      {
+        "name": "exclude-self with a role restriction",
+        "why": "The shape the removal path uses: every member that is not this device and not leaving. Order of the survivors decides the successor, so returning too few changes who inherits.",
+        "filter": { "ids": [], "status": ["Paired"], "role": "Destination", "exclude": ["10"] },
+        "expected": ["11"]
+      },
+      {
+        "name": "excluding the only match selects nothing",
+        "filter": { "ids": [], "status": [], "role": "Source", "exclude": ["10"] },
+        "expected": []
+      }
+    ]
+  }
+}

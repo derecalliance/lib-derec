@@ -112,12 +112,21 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     let mut asked: HashSet<ReplicaId> = HashSet::new();
     for peer in &peers {
         let timestamp = current_timestamp();
+        let (legacy_reply_to, reply_to_transports) =
+            crate::extensions::advertised_endpoints::split_reply_to(std::slice::from_ref(
+                local.primary(),
+            ));
+        // Populating the deprecated singular field is the compatibility
+        // path that keeps peers predating `replyToTransports`
+        // answerable, so the warning is expected here.
+        #[allow(deprecated)]
         let request = GetSecretIdsVersionsRequestMessage {
             timestamp: Some(timestamp),
             // The asker names itself so the answer can be routed back to a
             // member rather than treated as an owner ↔ helper exchange.
             replica_id: Some(own),
-            reply_to: vec![local.primary().clone()],
+            reply_to: legacy_reply_to,
+            reply_to_transports,
         };
         let envelope = DeRecMessageBuilder::channel()
             .channel_id(peer.channel_id)
@@ -213,10 +222,11 @@ async fn on_request<S: StoreSet>(
         .encode_to_vec();
     let envelope = crate::derec_message::apply_trace_id(&envelope, inbound_trace_id)?;
     // A reply-to overrides the recorded endpoints for this exchange only.
-    let endpoint = if request.reply_to.is_empty() {
+    let reply_to = crate::extensions::advertised_endpoints::reply_to_owned(request);
+    let endpoint = if reply_to.is_empty() {
         member.transports.clone()
     } else {
-        request.reply_to.clone()
+        reply_to
     };
     stores.transport.send(&endpoint, envelope).await?;
 
@@ -345,11 +355,20 @@ async fn finish<S: StoreSet>(
 
     let key = load_channel_key(stores, local, member.channel_id).await?;
     let timestamp = current_timestamp();
+    let (legacy_reply_to, reply_to_transports) =
+        crate::extensions::advertised_endpoints::split_reply_to(std::slice::from_ref(
+            local.primary(),
+        ));
+    // Populating the deprecated singular field is the compatibility
+    // path that keeps peers predating `replyToTransports`
+    // answerable, so the warning is expected here.
+    #[allow(deprecated)]
     let request = GetShareRequestMessage {
         secret_id,
         version: group_version,
         timestamp: Some(timestamp),
-        reply_to: vec![local.primary().clone()],
+        reply_to: legacy_reply_to,
+        reply_to_transports,
         replica_id: local.replica_id,
     };
     let envelope = DeRecMessageBuilder::channel()

@@ -18,6 +18,15 @@ namespace DeRec.Library;
 /// </param>
 /// <param name="TransportProtocol">
 /// Transport endpoint and protocol to use when sending protocol messages to the initiator.
+///
+/// <para>
+/// <b>Reading this directly is incorrect.</b> Its meaning narrowed from "the
+/// endpoint" to "one entry of a list, and possibly absent": a creator that has
+/// moved past this field populates only <see cref="SupportedTransports"/>, and
+/// this property is then an empty-URI placeholder. Call
+/// <see cref="AdvertisedEndpoints"/>, which resolves both spellings. Removed at
+/// 0.0.5.
+/// </para>
 /// </param>
 /// <param name="Nonce">
 /// Random nonce that binds the pairing request to this contact exchange.
@@ -46,6 +55,37 @@ public sealed record ContactMessage(
 )
 {
     /// <summary>
+    /// Every transport endpoint the creator of this contact can be reached on,
+    /// in its own preference order.
+    /// </summary>
+    /// <remarks>
+    /// Empty means "only <see cref="TransportProtocol"/> is offered", which is
+    /// how every implementation predating this field advertises. Preserved
+    /// across a decode/encode round trip, so a contact this SDK parses and
+    /// hands back to <c>Pairing.Request.Produce</c> still advertises every
+    /// endpoint the creator offered.
+    /// </remarks>
+    public IReadOnlyList<TransportProtocol> SupportedTransports { get; init; } =
+        Array.Empty<TransportProtocol>();
+
+    /// <summary>
+    /// The endpoints this contact advertises, in the creator's own order.
+    /// </summary>
+    /// <remarks>
+    /// Yields <see cref="SupportedTransports"/> when it is non-empty, and
+    /// otherwise the singular <see cref="TransportProtocol"/> — which is how
+    /// every implementation predating the offer list advertises, and the reason
+    /// this is a method rather than a property read. Reports what was
+    /// advertised, not what is acceptable; nothing here is validated.
+    /// </remarks>
+    public IReadOnlyList<TransportProtocol> AdvertisedEndpoints() =>
+        SupportedTransports.Count > 0
+            ? SupportedTransports
+            : string.IsNullOrEmpty(TransportProtocol.Uri)
+                ? Array.Empty<TransportProtocol>()
+                : new[] { TransportProtocol };
+
+    /// <summary>
     /// Serializes this <see cref="ContactMessage"/> to protobuf wire bytes.
     /// </summary>
     /// <remarks>
@@ -72,6 +112,14 @@ public sealed record ContactMessage(
             },
             Nonce = Nonce,
         };
+        foreach (TransportProtocol offer in SupportedTransports)
+        {
+            proto.SupportedTransports.Add(new Org.Derecalliance.Derec.Protobuf.TransportProtocol
+            {
+                Uri = offer.Uri,
+                Protocol = (Org.Derecalliance.Derec.Protobuf.Protocol)(int)offer.Protocol,
+            });
+        }
         if (MlkemEncapsulationKey is { Length: > 0 } mlkem)
         {
             proto.MlkemEncapsulationKey = Google.Protobuf.ByteString.CopyFrom(mlkem);
@@ -131,7 +179,12 @@ public sealed record ContactMessage(
             MlkemEncapsulationKey: mlkem,
             EciesPublicKey: ecies,
             ContactBindingHash: hash
-        );
+        )
+        {
+            SupportedTransports = proto.SupportedTransports
+                .Select(t => new TransportProtocol(t.Uri, (Protocol)(int)t.Protocol))
+                .ToList(),
+        };
     }
 
     private static void Validate(byte[] bytes)

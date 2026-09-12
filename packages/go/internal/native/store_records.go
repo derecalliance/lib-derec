@@ -60,7 +60,23 @@ func (b *JSONByteArray) UnmarshalJSON(data []byte) error {
 // library/src/protocol/types/mod.rs): field names, presence, and nesting are
 // load-bearing. channelRecordWire mirrors ChannelRecord, an externally
 // tagged enum, so exactly one of Helper / Replica is present.
+// ChannelRecordSchemaVersion mirrors CHANNEL_RECORD_SCHEMA_VERSION in
+// library/src/protocol/types/mod.rs. It is stamped on every record this
+// package encodes.
+//
+// Stamping rather than echoing what was decoded is correct because this
+// package ships in lockstep with the core it mirrors — verify-versions.sh
+// refuses a release where they disagree — so a build of this package knows
+// exactly the field set of the core it will call. The marker therefore
+// describes the shape being written, which is the shape of these structs.
+const ChannelRecordSchemaVersion uint8 = 3
+
+// Field order matters: these are compared byte-for-byte against the Rust
+// serializer's output, and encoding/json emits struct fields in declaration
+// order while serde emits them in declaration order too. Keep both in the
+// same order as the Rust struct.
 type helperChannelWire struct {
+	SchemaVersion     uint8             `json:"schema_version"`
 	ChannelID         uint64            `json:"channel_id"`
 	Transports        []transportWire   `json:"transports"`
 	CommunicationInfo map[string]string `json:"communication_info"`
@@ -70,6 +86,7 @@ type helperChannelWire struct {
 }
 
 type replicaMemberWire struct {
+	SchemaVersion     uint8             `json:"schema_version"`
 	ChannelID         uint64            `json:"channel_id"`
 	ReplicaID         uint64            `json:"replica_id"`
 	Transports        []transportWire   `json:"transports"`
@@ -101,6 +118,7 @@ func nonNilInfo(info map[string]string) map[string]string {
 
 func helperToWire(h HelperChannel) helperChannelWire {
 	return helperChannelWire{
+		SchemaVersion:     ChannelRecordSchemaVersion,
 		ChannelID:         h.ChannelID,
 		Transports:        endpointsToWire(h.Transports),
 		CommunicationInfo: nonNilInfo(h.CommunicationInfo),
@@ -112,6 +130,7 @@ func helperToWire(h HelperChannel) helperChannelWire {
 
 func memberToWire(m ReplicaMember) replicaMemberWire {
 	return replicaMemberWire{
+		SchemaVersion:     ChannelRecordSchemaVersion,
 		ChannelID:         m.ChannelID,
 		ReplicaID:         m.ReplicaID,
 		Transports:        endpointsToWire(m.Transports),

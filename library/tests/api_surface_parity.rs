@@ -101,9 +101,19 @@ const SDK_BUILDER: &[(&str, &[&str])] = &[
 const SDK_HELPERS: &[(&str, &[&str])] = &[
     (
         "dotnet",
-        &["packages/dotnet/DeRec.Library/src/Protocol/Stores.cs"],
+        &[
+            "packages/dotnet/DeRec.Library/src/Protocol/Stores.cs",
+            "packages/dotnet/DeRec.Library/src/ContactMessage.cs",
+        ],
     ),
-    ("go", &["packages/go/internal/native/store_types.go"]),
+    (
+        "go",
+        &[
+            "packages/go/internal/native/store_types.go",
+            "packages/go/derecpb/endpoints.go",
+            "packages/go/protocol/stores.go",
+        ],
+    ),
     (
         "nodejs",
         &["packages/nodejs/index.d.ts", "packages/nodejs/index.js"],
@@ -142,8 +152,17 @@ const SDK_TYPES: &[(&str, &[&str])] = &[
 /// literals — so a token search reports a method that does not exist.
 #[derive(Clone, Copy)]
 enum Shape {
-    /// Go receiver method: `func (p *DeRecProtocol) SecretID() uint64`.
+    /// Go callable: a receiver method,
+    /// `func (p *DeRecProtocol) SecretID() uint64`, or a package-level
+    /// function, `func AdvertisedEndpoints(m EndpointAdvertiser)`.
     GoMethod,
+    /// Anything Go can export under a name: a callable, or a declared type.
+    ///
+    /// Used for `sdk_helpers`, where a binding is free to express a shared
+    /// convenience as whichever of the two reads best — a filter predicate is
+    /// naturally a method, a transport adapter naturally a type — and the
+    /// fixture's claim is only that the name is exported.
+    GoExport,
     /// Go struct field: `Threshold uint32`.
     GoField,
     /// C# member: a `public` method, property or field.
@@ -160,7 +179,12 @@ fn declared_in(text: &str, needle: &str, shape: Shape) -> bool {
         Shape::TypeName => text
             .split(|c: char| !c.is_alphanumeric() && c != '_')
             .any(|tok| tok == needle),
-        Shape::GoMethod => text.contains(&format!(") {needle}(")),
+        Shape::GoMethod => {
+            text.contains(&format!(") {needle}(")) || text.contains(&format!("func {needle}("))
+        }
+        Shape::GoExport => {
+            declared_in(text, needle, Shape::GoMethod) || text.contains(&format!("type {needle} "))
+        }
         Shape::GoField => text.lines().any(|l| {
             let t = l.trim_start();
             t.strip_prefix(needle)
@@ -206,6 +230,10 @@ fn declared_in(text: &str, needle: &str, shape: Shape) -> bool {
 /// *runtime* file, and a name must be in both: present in `index.d.ts` and
 /// absent from `index.js` is the worst shape of all, because it type-checks
 /// and hands the caller `undefined`.
+///
+/// That distinction is a property of the *SDK*, not of the section, so only
+/// the TypeScript packages ever require all of their paths — see
+/// [`requires_every_path`].
 fn declared(paths: &[&str], needle: &str, shape: Shape, require_all: bool) -> bool {
     let mut hits = paths.iter().map(|p| declared_in(&read(p), needle, shape));
     if require_all {
@@ -215,11 +243,22 @@ fn declared(paths: &[&str], needle: &str, shape: Shape, require_all: bool) -> bo
     }
 }
 
+/// Whether every path listed for `sdk` must declare the name, or just one.
+///
+/// Only the TypeScript packages split a surface into a declaration file and a
+/// runtime file that must agree. Go and .NET list several files because a
+/// surface is spread across them, so any one of them declaring the name is
+/// enough — `Matches` lives beside the store types and `AdvertisedEndpoints`
+/// beside the generated messages, and neither file has reason to hold both.
+fn requires_every_path(sdk: &str) -> bool {
+    matches!(sdk, "nodejs" | "web" | "react-native")
+}
+
 /// The declaration shape to require, per SDK, for a given section.
 fn shape_for(sdk: &str, section: &str) -> Shape {
     match (sdk, section) {
         (_, "flow_params") => Shape::TypeName,
-        ("go", "sdk_helpers") => Shape::GoMethod,
+        ("go", "sdk_helpers") => Shape::GoExport,
         ("go", "protocol_methods") => Shape::GoMethod,
         ("go", "builder_options") => Shape::GoField,
         ("go", _) => Shape::LineMember,
@@ -240,7 +279,8 @@ fn assert_declared(section: &str, surfaces: &[(&str, &[&str])], require_all: boo
                 sdk
             };
             let name = field(&entry, key);
-            if !declared(paths, &name, shape_for(sdk, section), require_all) {
+            let all_paths = require_all && requires_every_path(sdk);
+            if !declared(paths, &name, shape_for(sdk, section), all_paths) {
                 missing.push(format!("  {sdk}: `{name}` (from {section} entry {entry})"));
             }
         }
@@ -455,4 +495,390 @@ fn every_sdk_declares_every_store_method() {
 #[test]
 fn every_sdk_declares_every_shared_helper() {
     assert_declared("sdk_helpers", SDK_HELPERS, true);
+}
+
+// ── prose vs core ──────────────────────────────────────────────────────────
+//
+// The checks above hold the SDKs to the core. These hold the *documentation*
+// to it, because the two defects below shipped in 0.0.3 and were found by
+// reading rather than by running anything:
+//
+// - The changelog described `Error::NoCommonTransport` as current behaviour in
+//   two entries after the variant had been renamed to `NoUsableEndpoint`. The
+//   trap is sharper than a typo: `NO_COMMON_TRANSPORT` is still the live
+//   cross-binding error *code* for that error, so a consumer grepping the
+//   TypeScript bindings finds the string and concludes the Rust is what is
+//   wrong.
+// - The deprecation wave named two removal versions, 0.0.5 and 0.1.0, purely
+//   because the notes were written at different times.
+//
+// Both are mechanically detectable, and a changelog that is wrong once is a
+// changelog a reader stops trusting in full.
+
+/// Every error enum in the crate, mapped to its variant names.
+///
+/// Read from the sources rather than matched in Rust: these are fifteen enums
+/// across nine modules, most of them not re-exported anywhere this test could
+/// name them, and an exhaustive match on each would be more code than the
+/// check it serves.
+fn error_variants() -> std::collections::BTreeMap<String, BTreeSet<String>> {
+    const SOURCES: &[&str] = &[
+        "library/src/error.rs",
+        "library/src/derec_message/error.rs",
+        "library/src/transport/mod.rs",
+        "library/src/protocol/error.rs",
+        "library/src/protocol/types/secret/codec.rs",
+        "library/src/protocol/handlers/restore.rs",
+        "library/src/primitives/pairing/error.rs",
+        "library/src/primitives/recovery/error.rs",
+        "library/src/primitives/sharing/error.rs",
+        "library/src/primitives/verification/error.rs",
+        "library/src/primitives/discovery/error.rs",
+        "library/src/primitives/unpairing/error.rs",
+    ];
+
+    let mut found: std::collections::BTreeMap<String, BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+
+    for rel in SOURCES {
+        let src = read(rel);
+        let mut current: Option<String> = None;
+        for line in src.lines() {
+            if let Some(rest) = line.strip_prefix("pub enum ") {
+                let name = rest.split([' ', '{', '<']).next().unwrap_or("").to_owned();
+                current = (name == "Error" || name.ends_with("Error")).then_some(name);
+                continue;
+            }
+            // An enum is a top-level item, so its body ends at the first
+            // column-zero `}`. A struct variant's own closing brace is
+            // indented, so it does not end the walk early.
+            if line == "}" {
+                current = None;
+                continue;
+            }
+            // Variants are indented by four and capitalised. The leading
+            // character test is what keeps a struct variant's fields — which
+            // are indented by eight and lowercase — from being read as
+            // variants of their own.
+            if let Some(enum_name) = current.as_ref()
+                && let Some(rest) = line.strip_prefix("    ")
+                && rest.starts_with(|c: char| c.is_ascii_uppercase())
+            {
+                let variant = rest
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .next()
+                    .unwrap_or("");
+                if !variant.is_empty() {
+                    found
+                        .entry(enum_name.clone())
+                        .or_default()
+                        .insert(variant.to_owned());
+                }
+            }
+        }
+    }
+
+    assert!(
+        found.contains_key("Error"),
+        "no `pub enum Error` was found — the variant walk is reading nothing, \
+         which would make every check below pass vacuously"
+    );
+    found
+}
+
+/// Every `SomeError::Variant` the changelog names is a variant that exists.
+///
+/// The whole file is in scope: the crate has never been past 0.0.x, so every
+/// entry in it describes the current surface.
+///
+/// A retired spelling is allowed only where it explains its own rename, which
+/// is why the allowlist carries a `replaced_by` that has to appear in the same
+/// paragraph. Without that clause this check would pass the defect it exists
+/// for: the two entries that described `NoCommonTransport` as current
+/// behaviour were wrong precisely because they named it *alone*.
+#[test]
+fn changelog_error_variants_resolve() {
+    let known = error_variants();
+    let retired: std::collections::BTreeMap<(String, String), String> = fixture()["documented_api"]
+        ["retired_error_variants"]
+        .as_array()
+        .expect("documented_api.retired_error_variants is an array")
+        .iter()
+        .map(|e| {
+            (
+                (field(e, "enum"), field(e, "variant")),
+                field(e, "replaced_by"),
+            )
+        })
+        .collect();
+
+    let changelog = read("CHANGELOG.md");
+    let mut unresolved: BTreeSet<String> = BTreeSet::new();
+
+    // Paragraph-scoped rather than line-scoped: the changelog is wrapped
+    // prose, so a rename and the name it replaced routinely land on
+    // neighbouring lines.
+    for paragraph in paragraphs(&changelog) {
+        for line in &paragraph.lines {
+            for (owner, variant) in qualified_paths(line) {
+                // `crate::Error::Foo` yields `crate::Error` too; only the
+                // error enums are ours to check, and anything else on the line
+                // is a module path this test has no opinion about.
+                let Some(variants) = known.get(&owner) else {
+                    continue;
+                };
+                if variants.contains(&variant) {
+                    continue;
+                }
+                match retired.get(&(owner.clone(), variant.clone())) {
+                    Some(replacement) if paragraph.names(replacement) => continue,
+                    Some(replacement) => unresolved.insert(format!(
+                        "CHANGELOG.md:{}: `{owner}::{variant}` is retired and this \
+                         entry does not name `{replacement}`, so it reads as current",
+                        paragraph.first_line
+                    )),
+                    None => unresolved.insert(format!(
+                        "CHANGELOG.md:{}: `{owner}::{variant}` is not a variant of `{owner}`",
+                        paragraph.first_line
+                    )),
+                };
+            }
+        }
+    }
+
+    assert!(
+        unresolved.is_empty(),
+        "the changelog names error variants that do not exist:\n  {}\n\n\
+         Correct the entry, or — if it names a retired spelling deliberately, \
+         to explain a rename — add it to `documented_api.retired_error_variants` \
+         in api_surface.json with the reason and the replacement.",
+        unresolved.into_iter().collect::<Vec<_>>().join("\n  ")
+    );
+}
+
+/// A blank-line-delimited block, with the 1-based line number it starts at.
+struct Paragraph<'a> {
+    first_line: usize,
+    lines: Vec<&'a str>,
+}
+
+impl Paragraph<'_> {
+    /// Whether any line names `needle`. Equivalent to searching the joined
+    /// text, since every name this test looks for is a single identifier and
+    /// so cannot straddle a line break.
+    fn names(&self, needle: &str) -> bool {
+        self.lines.iter().any(|l| l.contains(needle))
+    }
+}
+
+fn paragraphs(doc: &str) -> Vec<Paragraph<'_>> {
+    let mut out: Vec<Paragraph<'_>> = Vec::new();
+    let mut start = 0usize;
+    let mut lines: Vec<&str> = Vec::new();
+
+    for (i, line) in doc.lines().enumerate() {
+        if line.trim().is_empty() {
+            if !lines.is_empty() {
+                out.push(Paragraph {
+                    first_line: start + 1,
+                    lines: std::mem::take(&mut lines),
+                });
+            }
+            continue;
+        }
+        if lines.is_empty() {
+            start = i;
+        }
+        lines.push(line);
+    }
+    if !lines.is_empty() {
+        out.push(Paragraph {
+            first_line: start + 1,
+            lines,
+        });
+    }
+    out
+}
+
+/// `Owner::Member` pairs on one line, with the owner's own path prefix stripped.
+fn qualified_paths(line: &str) -> Vec<(String, String)> {
+    fn ident_before(s: &str) -> &str {
+        let end = s.len();
+        let start = s
+            .rfind(|c: char| !c.is_alphanumeric() && c != '_')
+            .map_or(0, |i| i + 1);
+        &s[start..end]
+    }
+    fn ident_after(s: &str) -> &str {
+        let end = s
+            .find(|c: char| !c.is_alphanumeric() && c != '_')
+            .unwrap_or(s.len());
+        &s[..end]
+    }
+
+    let mut out = Vec::new();
+    let mut rest = line;
+    let mut consumed = 0usize;
+    while let Some(at) = rest.find("::") {
+        let owner = ident_before(&line[..consumed + at]);
+        let member = ident_after(&rest[at + 2..]);
+        if !owner.is_empty() && !member.is_empty() {
+            out.push((owner.to_owned(), member.to_owned()));
+        }
+        consumed += at + 2;
+        rest = &line[consumed..];
+    }
+    out
+}
+
+/// Every deprecation in the crate names the wave's single removal version.
+///
+/// Split horizons are what this catches. They are never a decision — they are
+/// what happens when two notes are written weeks apart — and a consumer
+/// planning one migration reads them as two.
+#[test]
+fn every_deprecation_shares_the_release_horizon() {
+    let horizon = &fixture()["documented_api"]["deprecation_horizon"];
+    let since = horizon["since"].as_str().expect("horizon names a `since`");
+    let removed_at = horizon["removed_at"]
+        .as_str()
+        .expect("horizon names a `removed_at`");
+    let exceptions: BTreeSet<String> = horizon["exceptions"]
+        .as_array()
+        .expect("horizon.exceptions is an array")
+        .iter()
+        .map(|e| field(e, "symbol"))
+        .collect();
+
+    let mut wrong: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+
+    for (rel, symbol, attr) in deprecations() {
+        checked += 1;
+        if exceptions.contains(&symbol) {
+            continue;
+        }
+        if !attr.contains(&format!("since = \"{since}\"")) {
+            wrong.push(format!("{rel}: `{symbol}` is not `since = \"{since}\"`"));
+        }
+        // Matched on the note's text because `deprecated` has no field for a
+        // removal version; the note is the only place it can be stated, and
+        // it is the only place a consumer will read it.
+        if !attr.contains(&format!("removed at {removed_at}")) {
+            wrong.push(format!(
+                "{rel}: `{symbol}` does not say `removed at {removed_at}`"
+            ));
+        }
+    }
+
+    assert!(
+        checked > 0,
+        "no `#[deprecated]` attributes were found — the walk is reading nothing"
+    );
+    assert!(
+        wrong.is_empty(),
+        "these deprecations disagree with the wave's horizon \
+         (since {since}, removed at {removed_at}):\n  {}\n\n\
+         Align the note, or add the symbol to \
+         `documented_api.deprecation_horizon.exceptions` with the reason it \
+         needs longer.",
+        wrong.join("\n  ")
+    );
+}
+
+/// Every deprecated symbol is named in the changelog.
+///
+/// A deprecation the release notes do not mention reaches a consumer as a
+/// build warning with no context and no migration.
+#[test]
+fn changelog_names_every_deprecated_symbol() {
+    let changelog = read("CHANGELOG.md");
+    let unmentioned: Vec<String> = deprecations()
+        .into_iter()
+        .filter(|(_, symbol, _)| !changelog.contains(symbol.as_str()))
+        .map(|(rel, symbol, _)| format!("{rel}: `{symbol}`"))
+        .collect();
+
+    assert!(
+        unmentioned.is_empty(),
+        "these symbols are deprecated in the source and absent from the changelog:\n  {}",
+        unmentioned.join("\n  ")
+    );
+}
+
+/// Every `#[deprecated]` in the library, as (file, deprecated symbol, attribute
+/// text).
+fn deprecations() -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for rel in rust_sources("library/src") {
+        let src = read(&rel);
+        let mut lines = src.lines().peekable();
+        while let Some(line) = lines.next() {
+            if !line.trim_start().starts_with("#[deprecated") {
+                continue;
+            }
+            // The attribute spans several lines and ends at the first `)]`.
+            let mut attr = line.to_owned();
+            while !attr.contains(")]") {
+                match lines.next() {
+                    Some(l) => {
+                        attr.push(' ');
+                        attr.push_str(l.trim());
+                    }
+                    None => break,
+                }
+            }
+            // The item follows, after any remaining attributes and docs.
+            let mut symbol = String::new();
+            for l in lines.by_ref() {
+                let t = l.trim_start();
+                if t.is_empty() || t.starts_with("#[") || t.starts_with("//") {
+                    continue;
+                }
+                symbol = item_name(t);
+                break;
+            }
+            if !symbol.is_empty() {
+                out.push((rel.clone(), symbol, attr));
+            }
+        }
+    }
+    out
+}
+
+/// The name a declaration introduces: the token after `fn`, or the leading
+/// identifier for an enum variant.
+fn item_name(decl: &str) -> String {
+    let head = match decl.split_once("fn ") {
+        Some((_, rest)) => rest,
+        None => decl,
+    };
+    head.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .next()
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// Every `.rs` file under `rel`, repository-relative.
+fn rust_sources(rel: &str) -> Vec<String> {
+    let root = repo_root();
+    let mut out = Vec::new();
+    let mut stack = vec![root.join(rel)];
+    while let Some(dir) = stack.pop() {
+        let entries =
+            std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry.expect("a readable directory entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let relative = path
+                    .strip_prefix(&root)
+                    .expect("walked from the repository root");
+                out.push(relative.to_string_lossy().into_owned());
+            }
+        }
+    }
+    out.sort();
+    out
 }

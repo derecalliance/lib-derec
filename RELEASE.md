@@ -63,6 +63,25 @@ resolves the not-yet-published versions against a temporary local registry;
 dry-running `derec-library` on its own fails until its dependencies are on
 crates.io.
 
+> [!WARNING]
+> Run it against a clean `target/package/`, or build somewhere disposable:
+>
+> ```bash
+> CARGO_TARGET_DIR=$(mktemp -d) cargo publish --workspace --dry-run
+> ```
+>
+> The verification step reuses whatever it finds cached under
+> `target/package/`. A tree left over from an earlier release still carries
+> that release's generated protobuf code, so the dry run compiles the new
+> `derec-library` against the *old* `derec-proto` and reports a wall of
+> errors about fields that exist perfectly well in the source. The failure
+> looks exactly like a genuine packaging defect and is not one.
+
+`cargo publish` refuses to package a dirty working tree, so commit first.
+Do **not** reach for `--allow-dirty` to get past it: it publishes your
+uncommitted working tree, and what lands on crates.io is then something no
+commit describes.
+
 ---
 
 ## One build, all packages
@@ -490,30 +509,36 @@ This must run on macOS with Xcode installed and `ANDROID_NDK_HOME` set — the
 XCFramework step has no Linux or cross-compilation equivalent.
 
 > [!IMPORTANT]
-> Step 5 overwrites the tracked `packages/react-native/package.json`. Unlike
-> the other packages, this one keeps a development manifest in git, because
-> its in-tree Jest suite needs `devDependencies` and `scripts` and the
-> lockfile is resolved against them — neither of which belongs in a published
-> tarball. Restore it once publishing is done:
+> **Publish from `library/target/pkg-react-native`, not from
+> `packages/react-native`.** Unlike the other packages, this one keeps a
+> *development* manifest in git, because its in-tree Jest suite needs
+> `devDependencies` and `scripts` and the lockfile is resolved against them —
+> neither of which belongs in a published tarball. Step 5 writes the publish
+> manifest into the stage directory and leaves the tracked one alone, so the
+> two are never the same file and there is nothing to restore afterwards.
 >
-> ```bash
-> git checkout packages/react-native/package.json
-> ```
+> Publishing the source directory is what put `devDependencies` into the
+> registry metadata for 0.0.1. `scripts/verify-versions.sh` guards the staged
+> manifest against carrying them, but it cannot tell which directory you
+> publish from.
 
 ### Review the package before publishing
 
 ```bash
-cd packages/react-native
+cd library/target/pkg-react-native
 npm pack --dry-run
 ```
 
 Verify the file list matches `package.override.json`'s `files` array and
 that the `ios/DeRecFFI.xcframework` and `android/src/main/jniLibs/*` native
-artifacts staged by the build are present.
+artifacts staged by the build are present. Confirm the manifest carries no
+`devDependencies` and no `scripts` — if it does, you are in the source
+directory rather than the stage directory.
 
 ### Publish the package to npm
 
 ```bash
+cd library/target/pkg-react-native
 npm publish --access public
 ```
 

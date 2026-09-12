@@ -69,6 +69,7 @@
 pub mod error;
 pub mod events;
 pub mod traits;
+pub mod transport_adapters;
 pub mod types;
 pub mod utils;
 
@@ -101,6 +102,7 @@ pub use traits::{
     DeRecTransport, DeRecUserSecretStore, SecretStoreFuture, ShareStoreFuture, StateStoreFuture,
     TransportFuture,
 };
+pub use transport_adapters::{SendOne, SequentialFailover, SingleEndpointTransport};
 pub use types::{
     ChannelQuery, ChannelRecord, ChannelShare, ChannelStatus, ExpiredChannelCleanup, HelperChannel,
     HelperInfo, MissingPolicy, PairingKeyMaterial, ReplicaInfo, ReplicaMember, ReplicaRole,
@@ -188,8 +190,10 @@ pub struct DeRecProtocol<
     /// Set via [`DeRecProtocolBuilder::with_own_transport`](crate::protocol::DeRecProtocolBuilder::with_own_transport) or
     /// [`DeRecProtocolBuilder::with_own_transports`](crate::protocol::DeRecProtocolBuilder::with_own_transports), in preference order.
     /// Never empty — the typestate builder cannot reach `build()` without
-    /// this slot filled. The first entry is this device's primary
-    /// endpoint; see `first_own_transport`.
+    /// this slot filled. The order is the application's and is never
+    /// reinterpreted; the first entry is this device's primary endpoint, and
+    /// is what fills the legacy singular `transportProtocol` field for peers
+    /// predating the offer list.
     pub own_transports: Vec<TransportProtocol>,
     /// Configured via [`DeRecProtocolBuilder::with_unpair_ack`](crate::protocol::DeRecProtocolBuilder::with_unpair_ack).
     pub(crate) unpair_ack: UnpairAck,
@@ -208,12 +212,14 @@ pub struct DeRecProtocol<
     pub(crate) auto_respond_on_failure: bool,
     /// Configured via [`DeRecProtocolBuilder::with_auto_reply_to`](crate::protocol::DeRecProtocolBuilder::with_auto_reply_to).
     ///
-    /// When `true`, every outbound request envelope is stamped with
-    /// `request.reply_to = self.first_own_transport()` so the responder knows which
-    /// endpoint to route the response to. When `false` (the default),
-    /// outbound requests leave `reply_to` unset and the responder falls back
-    /// to the channel's stored peer endpoint. See `replyTo` on each request
-    /// proto for the wire-level semantics.
+    /// When `true`, every outbound request envelope carries
+    /// [`own_transports`](Self::own_transports) in full, so the responder can
+    /// fail over rather than being given one address to try. When `false`
+    /// (the default), outbound requests leave it unset and the responder
+    /// falls back to the channel's stored peer endpoint. See
+    /// `replyToTransports` on each request proto for the wire-level
+    /// semantics, and `replyTo` beside it for the singular field kept for
+    /// peers predating the list.
     pub(crate) auto_reply_to: bool,
     /// Configured via [`DeRecProtocolBuilder::with_auto_accept`](crate::protocol::DeRecProtocolBuilder::with_auto_accept).
     ///

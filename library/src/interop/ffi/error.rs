@@ -186,6 +186,16 @@ pub const DEREC_CODE_TRANSPORT_INVALID: i32 = 120;
 /// cannot be told. `DEREC_CATEGORY_INVALID_INPUT`.
 pub const DEREC_CODE_NO_USABLE_ENDPOINT: i32 = 121;
 
+/// Both plaintext opt-in flags were set explicitly and disagree: the
+/// deprecated `unsafe_http` says one thing and `unsafe_connection` the
+/// other. Raised at protocol construction rather than resolved by
+/// precedence, because the flag precedence would favour is the one being
+/// removed, and a configuration layer that emits every field
+/// unconditionally would otherwise let a defaulted value silently beat a
+/// deliberate one. Set only `unsafe_connection`.
+/// `DEREC_CATEGORY_INVALID_INPUT`.
+pub const DEREC_CODE_CONFLICTING_PLAINTEXT_OPT_IN: i32 = 122;
+
 pub(crate) fn success() -> DeRecError {
     DeRecError {
         category: DEREC_CATEGORY_OK,
@@ -348,6 +358,10 @@ fn categorize(err: &crate::Error) -> (i32, i32) {
         crate::Error::NoUsableEndpoint { .. } => {
             (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_NO_USABLE_ENDPOINT)
         }
+        crate::Error::ConflictingPlaintextOptIn { .. } => (
+            DEREC_CATEGORY_INVALID_INPUT,
+            DEREC_CODE_CONFLICTING_PLAINTEXT_OPT_IN,
+        ),
         crate::Error::InvalidInput(_) => (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_INVALID_INPUT),
         crate::Error::ProtobufDecode(_) => (DEREC_CATEGORY_PROTOBUF, DEREC_CODE_PROTOBUF_DECODE),
         crate::Error::ProtobufEncode(_) => (DEREC_CATEGORY_PROTOBUF, DEREC_CODE_PROTOBUF_ENCODE),

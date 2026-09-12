@@ -317,7 +317,7 @@ async fn on_request<S: StoreSet>(
         .build()?
         .encode_to_vec();
     let envelope = crate::derec_message::apply_trace_id(&envelope_bytes, inbound_trace_id)?;
-    let endpoint = request.reply_to.clone();
+    let endpoint = crate::extensions::advertised_endpoints::reply_to_owned(&request);
     let endpoint = if endpoint.is_empty() {
         channel.transports.clone()
     } else {
@@ -838,7 +838,9 @@ mod tests {
                     share_algorithm: 0,
                     keep_list: Vec::new(),
                     replica_id: Some(OWNER),
-                    reply_to: Vec::new(),
+                    #[allow(deprecated)]
+                    reply_to: None,
+                    reply_to_transports: Vec::new(),
                     timestamp: None,
                 }
             };

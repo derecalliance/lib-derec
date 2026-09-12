@@ -155,6 +155,31 @@ pub enum Error {
         /// How many endpoints the peer offered before filtering.
         offered: usize,
     },
+
+    /// Both plaintext opt-in flags were set explicitly, and they disagree.
+    ///
+    /// Precedence would resolve this silently — the deprecated flag wins, so
+    /// that a deployment which only knows the old one keeps its behavior after
+    /// upgrading. That rule is right when a human wrote both values and wrong
+    /// when a machine wrote one of them: a configuration layer that emits every
+    /// field unconditionally sets `unsafe_http: false` as a safe default, and
+    /// a deliberate `unsafe_connection: true` would then lose to it. Nothing
+    /// would error; plaintext endpoints would simply be refused, and the
+    /// operator would be left debugging a flag that appears to do nothing.
+    ///
+    /// Setting only the deprecated flag is still honored and does not raise
+    /// this — that is the compatibility case the precedence rule exists for.
+    #[error(
+        "conflicting plaintext opt-in: deprecated `unsafe_http` is {unsafe_http} but \
+         `unsafe_connection` is {unsafe_connection} — set only `unsafe_connection`, \
+         which supersedes it and gates both plaintext schemes (`http://` and `grpc://`)"
+    )]
+    ConflictingPlaintextOptIn {
+        /// The value given for the deprecated flag.
+        unsafe_http: bool,
+        /// The value given for the flag that supersedes it.
+        unsafe_connection: bool,
+    },
 }
 
 impl Error {

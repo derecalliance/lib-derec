@@ -87,7 +87,7 @@ public static partial class Verification
                 {
                     ChannelId = nativeResult.ChannelId,
                     RequestProtoBytes = innerBytes,
-                    ReplyTo = inner.ReplyTo.Select(TransportProtocol.FromProtoValue).ToList(),
+                    ReplyTo = TransportProtocol.ResolveReplyTo(inner.ReplyTo, inner.ReplyToTransports),
                 };
             }
             finally

@@ -403,7 +403,7 @@ impl DeRecProtocolBuilderWasm {
     /// work (a phone against a laptop), and why the name is blunt.
     ///
     /// Superseded by `withUnsafeConnection`; still honored, and wins on
-    /// conflict. Removed at 0.1.0.
+    /// conflict. Removed at 0.0.5.
     #[wasm_bindgen(js_name = withUnsafeHttp)]
     pub fn with_unsafe_http(mut self, allow: bool) -> DeRecProtocolBuilderWasm {
         self.unsafe_http = Some(allow);
@@ -644,6 +644,12 @@ impl DeRecProtocolBuilderWasm {
                 ]
             };
 
+        let unsafe_connection = crate::protocol::builder::resolve_plaintext_opt_in(
+            self.unsafe_http,
+            self.unsafe_connection,
+        )
+        .map_err(js_error_from_lib)?;
+
         let mut builder = DeRecProtocolBuilder::new(self.secret_id)
             .with_channel_store(JsChannelStore(channel_store))
             .with_share_store(JsShareStore(share_store))
@@ -659,10 +665,7 @@ impl DeRecProtocolBuilderWasm {
             .with_unpair_ack(self.unpair_ack)
             .with_auto_reply_to(self.auto_reply_to)
             .with_auto_accept(self.auto_accept)
-            .with_unsafe_connection(crate::protocol::builder::resolve_plaintext_opt_in(
-                self.unsafe_http,
-                self.unsafe_connection,
-            ));
+            .with_unsafe_connection(unsafe_connection);
         if let Some(t) = self.timeouts {
             builder = builder.with_timeouts(t.to_timeouts());
         }

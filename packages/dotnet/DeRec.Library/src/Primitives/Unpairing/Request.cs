@@ -82,7 +82,7 @@ public static partial class Unpairing
                 {
                     ChannelId = nativeResult.ChannelId,
                     Memo = memo,
-                    ReplyTo = inner.ReplyTo.Select(TransportProtocol.FromProtoValue).ToList(),
+                    ReplyTo = TransportProtocol.ResolveReplyTo(inner.ReplyTo, inner.ReplyToTransports),
                 };
             }
             finally

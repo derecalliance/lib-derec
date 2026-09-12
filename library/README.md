@@ -251,7 +251,7 @@ Optional setters have defaults:
 | `with_keep_versions_count(n)` | `3` | Number of recent versions each helper must retain. |
 | `with_timeouts(timeouts)` | see [Timeouts](#timeouts) | All four waiting periods in one call; unspecified fields keep their default. `inbound_message` 300s is the staleness/replay window, `sharing_round` and `unpair_ack` 60s are liveness budgets, `expired_channels` `Enabled { 300 }` sweeps channels awaiting fingerprint confirmation. |
 | `with_unsafe_connection(bool)` | `false` | Accept plaintext `http://` and `grpc://` endpoints. **Development only.** Loopback is accepted for your own endpoint regardless; see [Transport endpoints and plaintext](#transport-endpoints-and-plaintext). |
-| `with_unsafe_http(bool)` | `false` | Deprecated since 0.0.3 — the `http://`-only predecessor of `with_unsafe_connection`. Still honored; wins on conflict if both are set. See [Transport endpoints and plaintext](#transport-endpoints-and-plaintext). |
+| `with_unsafe_http(bool)` | `false` | Deprecated since 0.0.3 — the `http://`-only predecessor of `with_unsafe_connection`. Still honored on its own; setting both to disagreeing values fails `build()`. See [Transport endpoints and plaintext](#transport-endpoints-and-plaintext). |
 | `with_communication_info(map)` | empty | Key-value identity metadata embedded in pairing messages. |
 | `with_replica_id(id)` | unset | This device's replica identity. Required for any replica-mode pairing; application-assigned and rejected if `0`. |
 | `with_auto_accept(policy)` | every flow off | Per-flow opt-in to auto-accepting inbound requests instead of surfacing `ActionRequired`. Read the per-flow caveats before enabling — several are state-changing. |
@@ -503,10 +503,14 @@ the wider case is what `with_unsafe_connection` is for.
 > secure, and turning it on does not by itself send anything in the clear.
 
 `with_unsafe_http(bool)` is the original, `http://`-only form of this
-setting, kept for compatibility and `#[deprecated]` since 0.0.3. Both flags
-are honored; when both are set and disagree, the deprecated
-`with_unsafe_http` wins, so a deployment that only knows the old flag keeps
-its current behavior after upgrading. New code should use
+setting, kept for compatibility and `#[deprecated]` since 0.0.3. Either flag
+alone is honored, so a deployment that only knows the old one keeps its
+current behavior after upgrading. Setting **both** to disagreeing values is
+refused at `build()` with `Error::ConflictingPlaintextOptIn`, which names
+both flags and the values given: precedence would hand the decision to the
+flag being removed, and a configuration layer that emits every field
+unconditionally would then let a defaulted `unsafe_http: false` silently beat
+a deliberate `unsafe_connection: true`. New code should use
 `with_unsafe_connection`.
 
 This was a Cargo feature (`unsafe-http`) until it became clear a compile-time
@@ -784,6 +788,31 @@ Each trait's rustdoc states its contract, idempotency expectations, and the
 security classification of the data it holds (`DeRecSecretStore` content is
 keychain-grade; the others need durable storage only).
 
+### Transport: implement `SendOne`, not `send`
+
+`DeRecTransport::send` receives *every* endpoint a peer advertised and leaves
+the choice among them to you, because only your application knows which of its
+transports are healthy, cheap, or currently reachable. That decision stays
+yours. The bookkeeping around it does not: try in order, stop at the first
+success, fail only when none worked, never deliver twice.
+
+Implement [`SendOne`](https://docs.rs/derec-library/latest/derec_library/protocol/trait.SendOne.html)
+— deliver to one endpoint — and wrap it:
+
+```rust,ignore
+let transport = SequentialFailover::new(MyDialer);
+```
+
+`SequentialFailover` is the right default. `SingleEndpointTransport` uses only
+the first endpoint, which is what `endpoints[0]` written inline does — the
+difference is that choosing the type is visible to a reviewer, where the index
+reads as finished code. Every binding ships both: `SequentialFailover` /
+`SingleEndpointTransport` (.NET, Go), `sequentialFailover(dialer)` /
+`singleEndpointTransport(dialer)` (Node, web, React Native).
+
+Do not deliver to every endpoint. They all address the same peer, so a fan-out
+sends one authenticated message several times.
+
 #### Filtered listings
 
 `DeRecChannelStore::helpers` and `DeRecChannelStore::replicas` take a
@@ -791,20 +820,29 @@ keychain-grade; the others need durable storage only).
 — `ids`, `status`, `role` and `exclude`, where every empty value means "do not
 restrict on this", so a `Default` filter selects everything.
 
-**Apply it in your query.** That is the point: a `WHERE` clause or a
-key-condition expression instead of transferring rows the caller will discard.
-That transfer costs bandwidth everywhere, and on a metered backing such as
-DynamoDB, which bills by bytes read, it costs money.
+**Returning everything is correct.** Ignore the filter and return every record
+under the `secret_id` unless you have a measured reason not to. The library
+re-applies the filter to every listing before acting on it and drops anything
+the filter excluded, so a superset is trimmed to exactly the right set.
 
-**A store that ignores it is slow, not wrong.** The library re-applies the
-filter to every listing before acting on it and drops anything the filter
-excluded.
+**Pushing it into your query is an optimization you opt into.** A `WHERE`
+clause or a key-condition expression avoids transferring rows the caller will
+discard, which costs bandwidth everywhere and real money on a metered backing
+such as DynamoDB that bills by bytes read.
 
-**That is a one-way guarantee, not a validation of your store.** Dropping rows
-enforces an upper bound; it cannot recover a row you omitted. A store that
-returns *fewer* rows than the filter selects is still wrong, in a way nothing
-in the library can detect — the protocol simply fails to act. Applying the
-filter faithfully is still your job.
+**The two directions are not symmetric, which is why that is opt-in.** Dropping
+rows enforces an upper bound, so returning too *many* costs only the transfer.
+It cannot recover a row that was never returned: a pushdown selecting too
+*few* is wrong in a way nothing can detect at runtime — no exception, no event,
+just a share that was never published.
+
+So verify a pushdown. `library/tests/fixtures/channel_filter.json` is a table
+of `(records, filter, expected)` cases covering the clauses that are easy to
+get subtly wrong — empty-means-unrestricted per field, `role` as an optional,
+`exclude` applied after and overriding `ids`, and ids above 2^53. Every binding
+drives it; a store that pushes down should too. `ChannelFilter::matches` is the
+same predicate the library re-checks with, exported for stores that would
+rather filter in memory than translate.
 
 The same filter crosses every binding: as a JSON object over the C ABI
 (`list_helpers` / `list_replicas` gain a `filter` buffer), and as a plain
@@ -851,9 +889,10 @@ Public errors are structured and typed:
 - [`ChannelStoreError`](https://docs.rs/derec-library/latest/derec_library/protocol/error/enum.ChannelStoreError.html), [`ShareStoreError`](https://docs.rs/derec-library/latest/derec_library/protocol/error/enum.ShareStoreError.html), [`SecretStoreError`](https://docs.rs/derec-library/latest/derec_library/protocol/error/enum.SecretStoreError.html) — surfaced by storage trait implementations.
 
 The protocol never panics on malformed input. Inbound parsing or decryption
-failures surface as events (or as a typed `Error::ProtobufDecode` /
-`Error::DecryptionFailed` etc.); see `with_auto_respond_on_failure` for
-controlling whether such failures are replied to.
+failures surface as events, or as a typed `Error::ProtobufDecode` /
+`Error::Pairing(PairingError::PairingEncryption(..))`; see
+`with_auto_respond_on_failure` for controlling whether such failures are
+replied to.
 
 ---
 
@@ -932,7 +971,7 @@ side independently picks, from what the other offered, the first entry
 matching its **own** order. Nothing is negotiated on the wire, so there is no
 extra round trip. An endpoint offered by a peer that fails structural
 validation or scheme policy is skipped rather than fatal; no overlap at all is
-`Error::NoCommonTransport`, and at pairing time it is terminal — delivery is
+`Error::NoUsableEndpoint`, and at pairing time it is terminal — delivery is
 push-only, so a peer whose transport you cannot speak cannot be sent a
 rejection either.
 

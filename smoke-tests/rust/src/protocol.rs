@@ -2757,22 +2757,35 @@ async fn run_reply_to_flow() {
     // auto_reply_to now advertises every endpoint this device serves, so a
     // responder that cannot reach the first can fall back.
     assert!(
-        !req.reply_to.is_empty(),
-        "auto_reply_to must populate replyTo"
+        !req.reply_to_transports.is_empty(),
+        "auto_reply_to must populate replyToTransports"
     );
     assert_eq!(
-        req.reply_to[0].uri, "https://owner-reply.example.com",
-        "replyTo must lead with the owner's own_transport"
+        req.reply_to_transports[0].uri, "https://owner-reply.example.com",
+        "replyToTransports must lead with the owner's own_transport"
     );
+    // The deprecated singular field carries the first entry so a peer
+    // predating replyToTransports still has somewhere to answer.
+    #[allow(deprecated)]
+    {
+        assert_eq!(
+            req.reply_to.as_ref().map(|t| t.uri.as_str()),
+            Some("https://owner-reply.example.com"),
+            "the legacy replyTo must be the list's first entry, not its last"
+        );
+    }
 
     let phantom_uri = "https://phantom-replica.example.com";
     let timestamp = current_timestamp();
+    let phantom = TransportProtocol {
+        uri: phantom_uri.to_owned(),
+        protocol: Protocol::Https.into(),
+    };
+    #[allow(deprecated)]
     let crafted = GetSecretIdsVersionsRequestMessage {
         timestamp: Some(timestamp),
-        reply_to: vec![TransportProtocol {
-            uri: phantom_uri.to_owned(),
-            protocol: Protocol::Https.into(),
-        }],
+        reply_to: Some(phantom.clone()),
+        reply_to_transports: vec![phantom],
         // Owner ↔ helper exchange, so no member names itself.
         replica_id: None,
     };

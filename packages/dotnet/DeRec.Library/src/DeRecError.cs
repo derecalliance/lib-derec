@@ -207,4 +207,17 @@ public static class DeRecCode
     /// <see cref="DeRecCategory.InvalidInput"/>.
     /// </summary>
     public const int NoUsableEndpoint = 121;
+
+    /// <summary>
+    /// Both plaintext opt-in flags were set explicitly and disagree: the
+    /// deprecated <c>WithUnsafeHttp</c> says one thing and
+    /// <c>WithUnsafeConnection</c> the other. Raised at protocol construction
+    /// rather than resolved by precedence, because the flag precedence would
+    /// favour is the one being removed, and a configuration layer that emits
+    /// every field unconditionally would otherwise let a defaulted value
+    /// silently beat a deliberate one. Set only <c>WithUnsafeConnection</c>.
+    /// <see cref="DeRecException.Category"/> is
+    /// <see cref="DeRecCategory.InvalidInput"/>.
+    /// </summary>
+    public const int ConflictingPlaintextOptIn = 122;
 }

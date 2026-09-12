@@ -157,7 +157,7 @@ public static partial class Sharing
                 {
                     ChannelId = nativeResult.ChannelId,
                     RequestProtoBytes = requestBytes,
-                    ReplyTo = inner.ReplyTo.Select(TransportProtocol.FromProtoValue).ToList(),
+                    ReplyTo = TransportProtocol.ResolveReplyTo(inner.ReplyTo, inner.ReplyToTransports),
                 };
             }
             finally

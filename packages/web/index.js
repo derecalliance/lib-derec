@@ -34,6 +34,44 @@ export function channelFilterMatches(filter, id, status, role) {
   return !exclude.includes(id);
 }
 
+export function advertisedEndpoints(message) {
+  if (!message) return [];
+  const offers = message.supported_transports ?? [];
+  if (offers.length > 0) return offers;
+  return message.transport_protocol ? [message.transport_protocol] : [];
+}
+
+export function sequentialFailover(dialer) {
+  return {
+    async send(endpoints, message) {
+      let last;
+      for (const endpoint of endpoints) {
+        try {
+          await dialer(endpoint, message);
+          return;
+        } catch (e) {
+          last = e;
+        }
+      }
+      // `endpoints` is never empty — the library refuses to record a peer
+      // whose endpoints were all filtered away — so reaching here means at
+      // least one attempt was made and `last` is populated.
+      throw last ?? new Error("send was called with no endpoints");
+    },
+  };
+}
+
+export function singleEndpointTransport(dialer) {
+  return {
+    async send(endpoints, message) {
+      if (endpoints.length === 0) {
+        throw new Error("send was called with no endpoints");
+      }
+      await dialer(endpoints[0], message);
+    },
+  };
+}
+
 export const envelope = {
   apply_trace_id: envelope_apply_trace_id,
   read_trace_id: envelope_read_trace_id,

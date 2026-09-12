@@ -58,10 +58,22 @@ message UpdateChannelInfoRequestMessage {
   // the response to this new endpoint.
   //
   // Deprecated: superseded by `supportedTransports`, which carries every
-  // endpoint rather than one. Kept so implementations predating that field
-  // still learn the sender's new address. **Scheduled for removal in
-  // v0.0.5.** A sender populating `supportedTransports` MUST also set this
-  // to a single best-compatibility choice until then.
+  // endpoint rather than one.
+  //
+  // **Reading this field directly is now incorrect.** Its meaning narrowed
+  // from "the endpoint" to "one entry of a list, and possibly absent": a
+  // sender that has moved past this field announces only
+  // `supportedTransports`. A reader that was correct before this release is
+  // a bug now — it records the wrong address, or none, for a peer that
+  // announced a perfectly good one. Resolve both spellings instead of
+  // reading either: `advertised_endpoints()` (Rust and TypeScript),
+  // `AdvertisedEndpoints()` (Go), `AdvertisedEndpoints()` (.NET).
+  //
+  // Senders still populate it: a sender that sets `supportedTransports`
+  // MUST also set this to a single best-compatibility choice, so
+  // implementations predating the list still learn the new address.
+  //
+  // **Scheduled for removal in v0.0.5.**
   optional TransportProtocol transportProtocol = 2 [deprecated = true];
 
   // Every transport endpoint the sender can now be reached on, in its own

@@ -20,6 +20,7 @@ internal static class Primitives
     {
         RunProtocolVersionTest();
         RunPairingFlowTest();
+        RunContactOfferListRoundTripTest();
         RunPairingFlowHashedKeysTest();
         RunSharingFlowTest();
         RunVerificationFlowTest();
@@ -35,6 +36,73 @@ internal static class Primitives
         var version = ProtocolVersion.Current();
         Console.WriteLine($"protocol version = {version}");
         Console.WriteLine("Protocol version test passed.");
+    }
+
+    /// <summary>
+    /// A contact carrying several endpoints must still carry all of them after
+    /// this SDK has decoded it and re-encoded it.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="ContactMessage"/> is the only place in any binding where a
+    /// contact is decoded into a hand-written type and later serialized back:
+    /// Go and the TypeScript SDKs pass the wire bytes through untouched. When
+    /// the record had no <c>SupportedTransports</c> member, every contact an
+    /// application round-tripped through <c>Request.Produce</c> silently lost
+    /// its offer list and advertised a single endpoint. Nothing detected it,
+    /// because every other test builds contacts with one endpoint, for which
+    /// the lossy and correct paths agree.
+    /// </remarks>
+    private static void RunContactOfferListRoundTripTest()
+    {
+        Console.WriteLine("=== Contact offer-list round trip ===");
+
+        var offered = new[]
+        {
+            new TransportProtocol("https://alice.example.com/derec"),
+            new TransportProtocol("grpcs://alice.example.com:443", DeRec.Library.Protocol.Grpc),
+        };
+
+        var contact = Pairing.Request.CreateContact(channelId: 7, ContactMode.InlineKeys, offered);
+
+        // Decode side: the library advertised both, so the record must hold both.
+        if (contact.ContactMessage.SupportedTransports.Count != offered.Length)
+            throw new InvalidOperationException(
+                $"Contact offer-list test failed: decoded {contact.ContactMessage.SupportedTransports.Count} "
+                + $"supported transports, expected {offered.Length}.");
+
+        if (contact.ContactMessage.AdvertisedEndpoints().Count != offered.Length)
+            throw new InvalidOperationException(
+                "Contact offer-list test failed: AdvertisedEndpoints() did not return the offer list.");
+
+        // The deprecated singular field carries the first entry, for peers
+        // predating the list.
+        if (contact.ContactMessage.TransportProtocol.Uri != offered[0].Uri)
+            throw new InvalidOperationException(
+                "Contact offer-list test failed: singular transportProtocol is not the first offer.");
+
+        // Encode side: Produce serializes the record back to wire bytes and the
+        // library echoes the contact it was handed. Both entries must survive.
+        var pairRequest = Pairing.Request.Produce(
+            Pairing.SenderKind.Helper,
+            new[] { new TransportProtocol("https://bob.example.com/derec") },
+            contact.ContactMessage
+        );
+
+        var echoed = pairRequest.InitiatorContactMessage.SupportedTransports;
+        if (echoed.Count != offered.Length)
+            throw new InvalidOperationException(
+                $"Contact offer-list test failed: offer list lost on re-encode — {echoed.Count} "
+                + $"survived of {offered.Length}.");
+
+        for (int i = 0; i < offered.Length; i++)
+        {
+            if (echoed[i].Uri != offered[i].Uri || echoed[i].Protocol != offered[i].Protocol)
+                throw new InvalidOperationException(
+                    $"Contact offer-list test failed: entry {i} changed across the round trip "
+                    + $"({offered[i].Uri} -> {echoed[i].Uri}).");
+        }
+
+        Console.WriteLine("Contact offer-list round trip passed.");
     }
 
     private static void RunPairingFlowTest()

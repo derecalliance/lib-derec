@@ -692,6 +692,7 @@ public sealed class DeRecProtocol : IDisposable
     }
 
     private static HelperChannelDto ToDto(HelperChannel h) => new(
+        ChannelRecordSchemaVersion,
         h.ChannelId,
         h.Transports.Select(t => new TransportDto(t.Uri, (int)t.Protocol)).ToList(),
         h.CommunicationInfo,
@@ -700,6 +701,7 @@ public sealed class DeRecProtocol : IDisposable
         h.CreatedAt);
 
     private static ReplicaMemberDto ToDto(ReplicaMember m) => new(
+        ChannelRecordSchemaVersion,
         m.ChannelId,
         m.ReplicaId,
         m.Transports.Select(t => new TransportDto(t.Uri, (int)t.Protocol)).ToList(),
@@ -1306,7 +1308,24 @@ public sealed class DeRecProtocol : IDisposable
 
     private sealed record TransportDto(string uri, int protocol);
 
+    /// <summary>
+    /// Mirrors <c>CHANNEL_RECORD_SCHEMA_VERSION</c> in
+    /// <c>library/src/protocol/types/mod.rs</c>. Stamped on every record this
+    /// bridge encodes.
+    /// </summary>
+    /// <remarks>
+    /// Stamping rather than echoing what was decoded is correct because this
+    /// package ships in lockstep with the core it mirrors — verify-versions.sh
+    /// refuses a release where they disagree — so this build knows exactly the
+    /// field set of the core it calls. The marker describes the shape being
+    /// written, which is the shape of these DTOs.
+    /// </remarks>
+    internal const byte ChannelRecordSchemaVersion = 3;
+
+    // `schema_version` leads both records because the Rust struct declares it
+    // first and serde emits fields in declaration order.
     private sealed record HelperChannelDto(
+        byte schema_version,
         ulong channel_id,
         List<TransportDto> transports,
         Dictionary<string, string>? communication_info,
@@ -1315,6 +1334,7 @@ public sealed class DeRecProtocol : IDisposable
         ulong created_at);
 
     private sealed record ReplicaMemberDto(
+        byte schema_version,
         ulong channel_id,
         ulong replica_id,
         List<TransportDto> transports,
@@ -1351,8 +1371,10 @@ public sealed class DeRecProtocol : IDisposable
     // `ReplicaId` is omitted entirely (not `null`) when there is no
     // replica id, per `JsonOpts`'s `WhenWritingNull` ignore condition.
     // `UnsafeHttp`/`UnsafeConnection` rely on the same ignore condition:
-    // absence is meaningful there too, since Rust's conflict rule between
-    // the two flags only applies when a flag is actually present.
+    // absence is meaningful there too. Only one present is honored; both
+    // present and disagreeing is DeRecCode.ConflictingPlaintextOptIn, so a
+    // null serialized as `false` would turn a deliberate setting into a
+    // construction failure.
     private sealed record ProtocolConfigDto(
         [property: JsonPropertyName("secret_id")] string SecretId,
         [property: JsonPropertyName("own_transport_uri")] string OwnTransportUri,

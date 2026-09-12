@@ -688,19 +688,35 @@ fn run_request_reply_to_test() {
     let extracted =
         disc_request::extract(&result.envelope, &shared_key).expect("disc_request::extract failed");
     assert_eq!(
-        extracted.request.reply_to,
-        vec![reply_to],
-        "reply_to must round-trip on the inner request"
+        extracted.request.reply_to_transports,
+        vec![reply_to.clone()],
+        "replyToTransports must round-trip on the inner request"
     );
+    #[allow(deprecated)]
+    {
+        assert_eq!(
+            extracted.request.reply_to,
+            Some(reply_to),
+            "the deprecated singular replyTo carries the list's first entry"
+        );
+    }
 
     let plain = disc_request::produce(channel_id, &shared_key, &[])
         .expect("disc_request::produce (no reply_to) failed");
     let plain_extracted =
         disc_request::extract(&plain.envelope, &shared_key).expect("disc_request::extract failed");
     assert!(
-        plain_extracted.request.reply_to.is_empty(),
+        plain_extracted.request.reply_to_transports.is_empty(),
         "an unset reply_to must decode as an empty list"
     );
+    #[allow(deprecated)]
+    {
+        assert!(
+            plain_extracted.request.reply_to.is_none(),
+            "an unset reply_to must leave the deprecated singular field absent, \
+             not present-and-empty — absent is what means 'route to the stored endpoints'"
+        );
+    }
 
     println!("Request reply_to round-trip test passed.");
 }

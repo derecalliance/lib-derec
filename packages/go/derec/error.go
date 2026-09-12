@@ -132,4 +132,12 @@ const (
 	// nothing. Always a local, terminal error: push-only delivery means an
 	// unreachable peer also cannot be told.
 	CodeNoUsableEndpoint int32 = 121
+	// CodeConflictingPlaintextOptIn: both plaintext opt-in flags were set
+	// explicitly and disagree — Config.UnsafeHTTP says one thing and
+	// Config.UnsafeConnection the other. Raised at protocol construction
+	// rather than resolved by precedence, because the flag precedence would
+	// favour is the one being removed, and a configuration layer that emits
+	// every field unconditionally would otherwise let a defaulted value
+	// silently beat a deliberate one. Set only UnsafeConnection.
+	CodeConflictingPlaintextOptIn int32 = 122
 )

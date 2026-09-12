@@ -57,7 +57,9 @@ fn make_request_with_mutated_share(
         version_description: String::new(),
         timestamp: Some(timestamp),
         secret_id,
-        reply_to: Vec::new(),
+        #[allow(deprecated)]
+        reply_to: None,
+        reply_to_transports: Vec::new(),
         replica_id: None,
     }
 }

@@ -388,7 +388,7 @@ pub enum TransportValidationError {
 
     #[deprecated(
         since = "0.0.3",
-        note = "use `UnsupportedProtocol { discriminant }`; removed at 0.1.0"
+        note = "use `UnsupportedProtocol { discriminant }`; removed at 0.0.5"
     )]
     #[error("unknown TransportProtocol.protocol discriminant: {0}")]
     UnknownProtocol(i32),
@@ -723,9 +723,9 @@ mod tests {
 pub struct TransportPolicy {
     /// Mirrors the resolved value of
     /// [`DeRecProtocolBuilder::with_unsafe_connection`](crate::protocol::DeRecProtocolBuilder::with_unsafe_connection)
-    /// (and the deprecated
+    /// (or the deprecated
     /// [`with_unsafe_http`](crate::protocol::DeRecProtocolBuilder::with_unsafe_http),
-    /// which still wins on conflict).
+    /// whichever was set — both set and disagreeing fails `build()`).
     allow_plaintext: bool,
 }
 

@@ -142,7 +142,7 @@ type ProtocolConfig struct {
 	// only; nil (unset) is the production posture.
 	//
 	// Deprecated: use UnsafeConnection, which names both gated schemes.
-	// Removed at 0.1.0.
+	// Removed at 0.0.5.
 	UnsafeHTTP *bool
 	// UnsafeConnection accepts plaintext http:// and grpc:// transport
 	// endpoints. Development only; nil (unset) is the production posture.
@@ -212,8 +212,10 @@ type protocolConfigJSON struct {
 	AutoAccept           *AutoAcceptPolicy `json:"auto_accept,omitempty"`
 	Timeouts             *TimeoutsConfig   `json:"timeouts,omitempty"`
 	// UnsafeHTTP and UnsafeConnection are both omitempty: absence is
-	// meaningful and distinct from false, since the deprecated UnsafeHTTP
-	// only wins its conflict with UnsafeConnection when actually present.
+	// meaningful and distinct from false. Only one present is honored;
+	// both present and disagreeing is CodeConflictingPlaintextOptIn from
+	// derec_protocol_new, so a nil that serialized as false would turn a
+	// deliberate setting into a construction failure.
 	UnsafeHTTP       *bool                 `json:"unsafe_http,omitempty"`
 	UnsafeConnection *bool                 `json:"unsafe_connection,omitempty"`
 	ReplicaID        *string               `json:"replica_id,omitempty"`

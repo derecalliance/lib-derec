@@ -82,10 +82,17 @@ type Config struct {
 	// OwnTransportURI is this node's advertised transport endpoint. An
 	// empty URI defers configuration to a later SetOwnTransport call;
 	// any pairing flow requires it to be set first.
+	//
+	// Deprecated: use OwnTransports, which takes the whole preference list.
+	// A single-element OwnTransports is the direct replacement. Removed at
+	// 0.0.5.
 	OwnTransportURI string
 	// OwnTransportProtocol selects the transport scheme for
 	// OwnTransportURI: 0 = HTTPS (derecpb.Protocol_HTTPS), 1 = gRPC
 	// (derecpb.Protocol_GRPC).
+	//
+	// Deprecated: use OwnTransports, whose entries carry their own protocol.
+	// Removed at 0.0.5.
 	OwnTransportProtocol int32
 	// OwnTransports is every transport endpoint this application serves,
 	// in preference order. Optional; when non-empty it takes precedence
@@ -129,13 +136,17 @@ type Config struct {
 	// which endpoints the protocol will record, propagate and reply to.
 	//
 	// Deprecated: use UnsafeConnection, which names both gated schemes.
-	// Removed at 0.1.0. nil is indistinguishable from "unset" on the wire —
+	// Removed at 0.0.5. nil is indistinguishable from "unset" on the wire —
 	// a caller that wants the old flag off explicitly must still set it to
 	// a pointer to false, not leave it nil.
 	UnsafeHTTP *bool
 	// UnsafeConnection accepts plaintext http:// and grpc:// transport
 	// endpoints. Development only. nil (unset) is the production posture.
-	// See UnsafeHTTP for the conflict rule when both are set.
+	//
+	// Either flag alone is honored. Both non-nil and disagreeing fails
+	// New with derec.CodeConflictingPlaintextOptIn rather than resolving
+	// silently, because precedence would hand the decision to UnsafeHTTP,
+	// the flag being removed.
 	UnsafeConnection *bool
 	// AutoRespondOnFailure controls whether the protocol auto-replies on
 	// failed inbound processing. Default: false.

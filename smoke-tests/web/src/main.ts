@@ -6,6 +6,7 @@
 // protocol tests (higher-level DeRecProtocol orchestrator).
 
 import { init } from "@derec-alliance/web";
+import { runChannelFilterConformance } from "./channelFilterConformance";
 import { runPrimitivesSmoke } from "./primitives";
 import { runProtocolSmoke } from "./protocol";
 
@@ -15,6 +16,8 @@ async function main(): Promise<void> {
   console.log("╔══════════════════════════════════════════╗");
   console.log("║  DeRec Web Smoke Tests                   ║");
   console.log("╚══════════════════════════════════════════╝\n");
+
+  runChannelFilterConformance();
 
   await runPrimitivesSmoke();
 

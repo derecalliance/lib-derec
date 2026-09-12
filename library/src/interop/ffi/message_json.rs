@@ -511,7 +511,9 @@ mod tests {
             version: 7,
             nonce: 9_007_199_254_740_993,
             timestamp: None,
-            reply_to: Vec::new(),
+            #[allow(deprecated)]
+            reply_to: None,
+            reply_to_transports: Vec::new(),
         };
         let json = decode(
             DEREC_MESSAGE_KIND_VERIFY_SHARE_REQUEST,
@@ -653,7 +655,9 @@ mod tests {
         let message = derec_proto::UnpairRequestMessage {
             memo: "leaving".to_owned(),
             timestamp: None,
-            reply_to: Vec::new(),
+            #[allow(deprecated)]
+            reply_to: None,
+            reply_to_transports: Vec::new(),
             replica_id: Some(u64::MAX),
         };
         let json = decode(DEREC_MESSAGE_KIND_UNPAIR_REQUEST, &message.encode_to_vec());

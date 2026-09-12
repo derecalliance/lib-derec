@@ -244,9 +244,7 @@ mod tests {
     fn unpair_request_bytes() -> Vec<u8> {
         UnpairRequestMessage {
             memo: "bye".to_owned(),
-            timestamp: None,
-            reply_to: Vec::new(),
-            replica_id: None,
+            ..Default::default()
         }
         .encode_to_vec()
     }
@@ -257,9 +255,7 @@ mod tests {
     fn decode_accepts_canonical_prefixed_type_url() {
         let body = MessageBody::UnpairRequest(UnpairRequestMessage {
             memo: "bye".to_owned(),
-            timestamp: None,
-            reply_to: Vec::new(),
-            replica_id: None,
+            ..Default::default()
         });
         let bytes = body.encode_to_vec();
         let round_tripped =
@@ -305,9 +301,12 @@ mod tests {
     }
 }
 
-/// `replyTo` was a singular field through 0.0.2 and is a list from 0.0.3.
-/// Both directions of that transition are wire-level properties rather than
-/// API ones, so they are pinned here.
+/// `replyTo` is singular and `replyToTransports` is the list beside it.
+///
+/// The pairing is a wire-level property rather than an API one, so it is
+/// pinned here: the singular field keeps the tag and the meaning it had
+/// through 0.0.2, and the list arrives on a tag no released build has ever
+/// written.
 #[cfg(test)]
 mod reply_to_wire_compatibility {
     use super::*;
@@ -334,63 +333,121 @@ mod reply_to_wire_compatibility {
         buf
     }
 
-    /// A 0.0.2 writer emits exactly one entry on the same tag. Reading it as
-    /// a list must yield that one endpoint, not an error and not an empty
-    /// list — this is what keeps already-released peers working.
+    // Touches the deprecated singular `replyTo`: reading what a 0.0.2 peer
+    // wrote is the entire point of these tests.
+    #[allow(deprecated)]
+    /// A 0.0.2 writer emits one entry on tag 5 and nothing on tag 6. That has
+    /// to keep meaning "answer me here", which is what keeps already-released
+    /// peers working.
     #[test]
-    fn a_single_entry_from_an_older_writer_decodes_as_a_one_element_list() {
+    fn a_request_from_an_older_writer_still_names_its_endpoint() {
         // VerifyShareRequestMessage.replyTo is tag 5.
         let wire = encode_at_tag(5, &[endpoint("https://old.example/derec", Protocol::Https)]);
 
         let decoded = VerifyShareRequestMessage::decode(wire.as_slice())
-            .expect("a single-entry stream must decode");
+            .expect("a 0.0.2 request must decode");
 
-        assert_eq!(decoded.reply_to.len(), 1);
-        assert_eq!(decoded.reply_to[0].uri, "https://old.example/derec");
+        assert_eq!(
+            decoded.reply_to.expect("the singular field is present").uri,
+            "https://old.example/derec"
+        );
+        assert!(
+            decoded.reply_to_transports.is_empty(),
+            "a 0.0.2 writer knows nothing of the list tag"
+        );
     }
 
-    /// Absent stays absent: an older writer that set no `replyTo` decodes to
-    /// an empty list, which means "route to the endpoints on file" rather
-    /// than "unreachable".
+    // Reads the deprecated singular field to prove it stays absent.
+    #[allow(deprecated)]
+    /// Absent stays absent. A request naming no reply-to must not decode into
+    /// one, because absent means "route to the endpoints on file" while a
+    /// present-but-empty endpoint would mean "answer me nowhere".
     #[test]
-    fn an_absent_reply_to_decodes_as_an_empty_list() {
+    fn an_absent_reply_to_stays_absent() {
         let wire = encode_at_tag(5, &[]);
 
         let decoded =
             VerifyShareRequestMessage::decode(wire.as_slice()).expect("an empty stream decodes");
 
-        assert!(decoded.reply_to.is_empty());
+        assert!(decoded.reply_to.is_none());
+        assert!(decoded.reply_to_transports.is_empty());
     }
 
-    // Touches the deprecated singular `transportProtocol`: this is the
-    // compatibility path that keeps peers predating `supportedTransports`
-    // working, so the warning is expected here rather than a defect.
+    // Writes the deprecated singular field, which is what a 0.0.3 sender does
+    // for compatibility.
     #[allow(deprecated)]
-    /// The cost of the change, pinned so it is not rediscovered in the
-    /// field: a 0.0.2 reader merges a multi-entry list and sees only the
-    /// **last** entry. An application still talking to one must order
-    /// accordingly. Modelled here by decoding into `UpdateChannelInfo`'s
-    /// still-singular `transportProtocol`, which has the same shape a
-    /// 0.0.2 `replyTo` had.
+    /// The property the new tag buys, and the reason `replyTo` was not simply
+    /// re-tagged `repeated`.
+    ///
+    /// Protobuf merges a repeated submessage into a singular reader
+    /// field-by-field, so a 0.0.2 peer decoding a multi-entry list on tag 5
+    /// would have seen the **last** entry. Every other compatibility rule in
+    /// 0.0.3 designates the **first** entry as the legacy-readable one — the
+    /// singular `transportProtocol` beside `supportedTransports` is filled
+    /// that way — so one list on one tag could not satisfy both, and no
+    /// ordering the application chose would have been right for both.
+    ///
+    /// With the list on its own tag the question does not arise: a 0.0.2
+    /// reader skips tag 6 as unknown and reads tag 5, which carries the first
+    /// entry.
     #[test]
-    fn an_older_reader_merges_a_multi_entry_list_and_sees_the_last() {
-        // UpdateChannelInfoRequestMessage.transportProtocol is tag 2 and is
-        // still singular, so it stands in for a 0.0.2 `replyTo`.
-        let wire = encode_at_tag(
+    fn an_older_reader_sees_the_first_entry_not_the_last() {
+        let first = endpoint("https://first.example/derec", Protocol::Https);
+        let second = endpoint("grpcs://second.example:443", Protocol::Grpc);
+
+        // What a 0.0.3 sender puts on the wire: the whole list on tag 6, its
+        // first entry mirrored onto tag 5.
+        let mut wire = encode_at_tag(5, std::slice::from_ref(&first));
+        wire.extend(encode_at_tag(6, &[first.clone(), second]));
+
+        // A 0.0.2 reader has no tag 6, so model it with a message that has
+        // only the singular field: prost skips the unknown tag.
+        let decoded = VerifyShareRequestMessage::decode(wire.as_slice())
+            .expect("a 0.0.3 request must decode");
+
+        assert_eq!(
+            decoded
+                .reply_to
+                .as_ref()
+                .expect("the singular field is present")
+                .uri,
+            "https://first.example/derec",
+            "an older reader must see the first entry, which is the one every \
+             other compatibility rule in this release designates as legacy-readable"
+        );
+        assert_eq!(
+            decoded.reply_to_transports.len(),
             2,
+            "a current reader sees the whole list"
+        );
+        assert_eq!(
+            decoded.reply_to_transports[0].uri,
+            "https://first.example/derec"
+        );
+    }
+
+    /// A list on the new tag does not leak into the old one. Nothing merges,
+    /// because they are different fields.
+    #[test]
+    fn the_list_tag_never_populates_the_singular_field() {
+        let wire = encode_at_tag(
+            6,
             &[
                 endpoint("https://first.example/derec", Protocol::Https),
                 endpoint("grpcs://second.example:443", Protocol::Grpc),
             ],
         );
 
-        let decoded = UpdateChannelInfoRequestMessage::decode(wire.as_slice())
-            .expect("a singular reader must still decode a repeated stream");
+        let decoded = VerifyShareRequestMessage::decode(wire.as_slice())
+            .expect("a list-only request decodes");
 
-        let seen = decoded
-            .transport_protocol
-            .expect("the merged field is present");
-        assert_eq!(seen.uri, "grpcs://second.example:443");
-        assert_eq!(seen.protocol, Protocol::Grpc as i32);
+        #[allow(deprecated)]
+        {
+            assert!(
+                decoded.reply_to.is_none(),
+                "tag 6 must not merge into tag 5"
+            );
+        }
+        assert_eq!(decoded.reply_to_transports.len(), 2);
     }
 }

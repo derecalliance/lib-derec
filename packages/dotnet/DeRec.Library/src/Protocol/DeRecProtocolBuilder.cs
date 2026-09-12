@@ -108,7 +108,13 @@ public sealed class DeRecProtocolBuilder
         return this;
     }
 
-    /// <summary>Set this node's transport endpoint. Required.</summary>
+    /// <summary>
+    /// Set this node's transport endpoint. Required in place of
+    /// <see cref="WithOwnTransports"/>.
+    /// </summary>
+    [Obsolete("Use WithOwnTransports, which takes the whole preference list. " +
+              "WithOwnTransports(new[] { endpoint }) is the direct replacement. " +
+              "Removed at 0.0.5.")]
     public DeRecProtocolBuilder WithOwnTransport(TransportProtocol endpoint)
     {
         _ownTransport = endpoint ?? throw new ArgumentNullException(nameof(endpoint));
@@ -200,7 +206,7 @@ public sealed class DeRecProtocolBuilder
     /// record, propagate to peers, and reply to.
     /// </para>
     /// </remarks>
-    [Obsolete("Use WithUnsafeConnection, which names both gated schemes. Removed at 0.1.0.")]
+    [Obsolete("Use WithUnsafeConnection, which names both gated schemes. Removed at 0.0.5.")]
     public DeRecProtocolBuilder WithUnsafeHttp(bool allow)
     {
         _unsafeHttp = allow;

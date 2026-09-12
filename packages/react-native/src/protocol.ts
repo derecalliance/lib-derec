@@ -412,7 +412,7 @@ export class DeRecProtocolBuilder {
 
   /**
    * @deprecated Use {@link withUnsafeConnection}, which names both gated
-   * schemes. Removed at 0.1.0. Default: false.
+   * schemes. Removed at 0.0.5. Default: false.
    */
   withUnsafeHttp(allow: boolean): this {
     this.config.unsafe_http = allow;
@@ -423,6 +423,11 @@ export class DeRecProtocolBuilder {
    * Accept plaintext `http://` and `grpc://` transport endpoints.
    * **Development only.** Default: false. Supersedes
    * {@link withUnsafeHttp}, which names only the HTTP scheme.
+   *
+   * Either flag alone is honored. Setting both to disagreeing values fails
+   * construction with the error code `CONFLICTING_PLAINTEXT_OPT_IN` rather
+   * than resolving silently, because precedence would hand the decision to
+   * the flag being removed.
    */
   withUnsafeConnection(allow: boolean): this {
     this.config.unsafe_connection = allow;

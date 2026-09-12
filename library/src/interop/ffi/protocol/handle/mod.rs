@@ -319,7 +319,7 @@ struct ProtocolConfig {
     /// override `unsafe_connection`.
     ///
     /// Superseded by `unsafe_connection`; still honored, and wins on
-    /// conflict. Removed at 0.1.0.
+    /// conflict. Removed at 0.0.5.
     #[serde(default)]
     unsafe_http: Option<bool>,
     /// Accept plaintext transport endpoints — `http://` and `grpc://`.
@@ -511,6 +511,14 @@ pub unsafe extern "C" fn derec_protocol_new(
         }
     };
 
+    let unsafe_connection = match crate::protocol::builder::resolve_plaintext_opt_in(
+        config.unsafe_http,
+        config.unsafe_connection,
+    ) {
+        Ok(v) => v,
+        Err(e) => return crate::interop::ffi::error::from_lib_error(e).into(),
+    };
+
     unsafe {
         construct_protocol(
             secret_id,
@@ -519,10 +527,7 @@ pub unsafe extern "C" fn derec_protocol_new(
             config.keep_versions_count,
             info,
             config.timeouts.to_timeouts(),
-            crate::protocol::builder::resolve_plaintext_opt_in(
-                config.unsafe_http,
-                config.unsafe_connection,
-            ),
+            unsafe_connection,
             config.auto_respond_on_failure,
             unpair_ack_value,
             config.auto_reply_to,

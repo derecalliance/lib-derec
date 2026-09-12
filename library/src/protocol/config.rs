@@ -709,30 +709,31 @@ mod transport_gate_tests {
             uri: "http://127.0.0.1:9999".to_owned(),
             protocol: derec_proto::Protocol::Https as i32,
         };
-        // Only `reply_to` reaches the funnel now, and it is a list.
+        // Only the reply-to pair reaches the funnel, and the list is what
+        // a current sender populates.
         let eps = || vec![one()];
 
         let bodies = [
             MessageBody::StoreShareRequest(derec_proto::StoreShareRequestMessage {
-                reply_to: eps(),
+                reply_to_transports: eps(),
                 ..Default::default()
             }),
             MessageBody::VerifyShareRequest(derec_proto::VerifyShareRequestMessage {
-                reply_to: eps(),
+                reply_to_transports: eps(),
                 ..Default::default()
             }),
             MessageBody::GetSecretIdsVersionsRequest(
                 derec_proto::GetSecretIdsVersionsRequestMessage {
-                    reply_to: eps(),
+                    reply_to_transports: eps(),
                     ..Default::default()
                 },
             ),
             MessageBody::GetShareRequest(derec_proto::GetShareRequestMessage {
-                reply_to: eps(),
+                reply_to_transports: eps(),
                 ..Default::default()
             }),
             MessageBody::UnpairRequest(derec_proto::UnpairRequestMessage {
-                reply_to: eps(),
+                reply_to_transports: eps(),
                 ..Default::default()
             }),
         ];

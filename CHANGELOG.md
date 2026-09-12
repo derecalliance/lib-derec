@@ -9,6 +9,14 @@ all of them unless it names a specific binding.
 
 ### 0.0.3
 
+> **Every symbol this release deprecates is removed in 0.0.5.** One horizon for
+> the whole wave, in every binding: the singular `transportProtocol` proto field
+> in all four messages, `with_own_transport` / `set_own_transport` and their SDK
+> counterparts, `with_unsafe_http`, and
+> `TransportValidationError::UnknownProtocol`. Individual deprecation notes
+> repeat the version so a compiler warning carries it, but there is only one
+> date to plan against — nothing deprecated here survives past 0.0.5.
+
 - **Published binaries no longer embed the release machine's paths, and the
   React Native package is a quarter smaller.** *(no API change)*
 
@@ -74,6 +82,27 @@ all of them unless it names a specific binding.
   exist. For the TypeScript packages a helper must appear in *both* the
   declaration file and the runtime file — present in `index.d.ts` and absent
   from `index.js` type-checks and hands the caller `undefined`.
+
+  **The same file now holds this document to the source.** Three further
+  checks: every `SomeError::Variant` named in this changelog must resolve,
+  every `#[deprecated]` must name the wave's single removal version, and every
+  deprecated symbol must appear here at all. A retired spelling is allowed only
+  where it explains its own rename, which the fixture records as a
+  `replaced_by` that has to appear in the same paragraph — allowlisting the
+  bare name would pass the defect this exists for, since describing
+  `NoCommonTransport` as current behaviour was wrong precisely because it was
+  named *alone*.
+
+  Both defects it was written for shipped and were found by reading: a renamed
+  error variant described as current, and a deprecation wave that named two
+  removal versions because the notes were written weeks apart. On its first run
+  it found a third — the deprecated C export
+  `derec_protocol_set_own_transport` was absent from this document entirely, so
+  a consumer hitting the compiler warning had nothing to search for.
+
+  It reads this file and the deprecation notes; it does **not** read rustdoc.
+  `cargo doc` catches broken intra-doc links but not names written in plain
+  backticks, which is how the stale references fixed below were written.
 
 - **SDK parity pass.** Four divergences closed after auditing every SDK's
   surface against the core.
@@ -146,15 +175,44 @@ all of them unless it names a specific binding.
   bridge in the Node smoke suite, since the TypeScript hole is the case the
   backstop exists for and the Rust unit tests cannot reach it.
 
-  **Nothing to change in your store.** Keep applying the filter in your query:
-  that is where the bandwidth and the metered-read cost are saved, and it is
-  still your job to apply it faithfully. What changed is only that the library
-  no longer trusts a listing it did not produce.
+  **Nothing to change in your store**, and the guidance on what to write has
+  been turned the right way up. The docs previously opened with "apply the
+  filter in your query rather than listing everything and discarding rows",
+  which points every implementer at the one direction that can fail silently.
+  They now say what the backstop actually makes true: **returning every record
+  under the `secret_id` is correct**, and pushing the filter into a query is an
+  optimization to opt into when the transfer cost is worth re-expressing these
+  semantics in a query language by hand.
+
+  That asymmetry is the whole point. Returning too *many* rows costs only the
+  transfer; returning too *few* is undetectable at runtime. Recommending the
+  risky direction by default was backwards.
+
+  **Conformance vectors ship for the direction that can go wrong.**
+  `library/tests/fixtures/channel_filter.json` is a table of
+  `(records, filter, expected)` cases covering the clauses a hand-written
+  pushdown gets subtly wrong: empty-means-unrestricted per field, `role` as an
+  optional rather than a list, `exclude` applied *after* and overriding `ids`,
+  and ids above 2^53 where a binding that parses them as numbers matches the
+  wrong record. Rust, Go, .NET and the TypeScript SDKs each drive the same
+  table against their own predicate, so a binding that drifts fails against the
+  fixture rather than against another binding. A store that pushes the filter
+  down should be driven through it too — that is what makes the optimization
+  checkable by the party who has to get it right.
 
 - **Fixed: two deprecation notices showed no migration.** The `set_own_transport`
   and `with_own_transport` doc examples had an identical "before" and "after",
   from a search-and-replace that caught the wrong line too. Both now show the
   singular call being replaced by the plural one.
+
+- **Fixed: two doc comments described an API that does not exist.** *(docs only)*
+
+  `DeRecProtocol`'s `own_transports` and `auto_reply_to` fields both referred
+  to a `first_own_transport()` accessor. It was planned during the
+  transport-negotiation work and never landed, but the documentation written
+  against it did. The `auto_reply_to` comment was stale twice over: it
+  described the outbound `reply_to` as a single endpoint on the one field this
+  release changed to a list, so it stated the opposite of what shipped.
 
 - **Fixed: a replica destination reported every roster as a first install.**
   *(bug fix; no API change)*
@@ -219,12 +277,16 @@ all of them unless it names a specific binding.
   old unfiltered behaviour** — that is the whole migration for a caller that
   wants everything.
 
-  **Implementations must apply the filter.** It is not a hint. The point is
-  that a store can express it as a query — a `WHERE` clause, a key-condition
-  expression — instead of moving rows the caller will drop. That transfer costs
-  bandwidth everywhere, and on a metered backing such as DynamoDB, which bills
-  by bytes read, it costs money. A backend that cannot push it down can list
-  and call `ChannelFilter::matches`, which is correct but gives up the saving.
+  **Returning everything and ignoring the filter is correct** — see the
+  enforcement entry above, which is what makes that true. A store *may* express
+  the filter as a query instead — a `WHERE` clause, a key-condition expression
+  — to avoid moving rows the caller will drop, which costs bandwidth everywhere
+  and real money on a metered backing such as DynamoDB that bills by bytes
+  read. That is an optimization, and one to verify against the shipped
+  conformance vectors: the library can drop rows you should not have returned
+  but cannot recover one you never did. A backend that would rather not think
+  about it can list and call `ChannelFilter::matches`, which is the same
+  predicate the library re-checks with.
 
   Migrating an implementation:
 
@@ -357,6 +419,14 @@ all of them unless it names a specific binding.
   0.0.5, and `set_own_transports` remains the way to change the whole set.
   It is now correct rather than a trap for whatever remains of its life.
 
+  The deprecation reaches every binding in that binding's own mechanism, so
+  the warning a consumer sees names a different symbol depending on where
+  they stand: `derec_protocol_set_own_transport` in the C header, which
+  carries a real `__attribute__((deprecated))` rather than a comment,
+  `SetOwnTransport` in .NET and Go, and `setOwnTransport` in Node, web and
+  React Native. All of them point at the plural form and all are removed at
+  0.0.5.
+
 
 - **Every `*Started` event now carries the `trace_id` of the round that
   produced it.** *(breaking for exhaustive `match` on `DeRecEvent`)*
@@ -405,6 +475,40 @@ all of them unless it names a specific binding.
   Sending the response is best effort — if it fails, the original error still
   reaches the caller rather than being replaced by the delivery failure.
 
+- **Fixed: three SDKs deprecated nothing where the others deprecated a
+  symbol.** The single-endpoint setters were marked in some bindings and
+  silently fine in others, so whether an application learned its call site
+  disappears at 0.0.5 depended on which SDK it used. Now marked everywhere:
+  `withOwnTransport` / `setOwnTransport` in the web package (`@deprecated`),
+  `WithOwnTransport` in .NET (`[Obsolete]`), and `Config.OwnTransportURI` /
+  `Config.OwnTransportProtocol` in Go (`Deprecated:`).
+
+- **Fixed: `NoUsableEndpoint` reached the SDKs under two different names.**
+  The WASM bridge reported it as the error code `NO_COMMON_TRANSPORT` while
+  the C FFI — and therefore .NET and Go — reported
+  `DEREC_CODE_NO_USABLE_ENDPOINT = 121`, so the same condition was
+  unmatchable across bindings. The TypeScript code is now `NO_USABLE_ENDPOINT`
+  to match the Rust variant and the FFI constant. Neither spelling shipped in
+  0.0.2, so nothing depended on the old one.
+
+- **Fixed (.NET): a contact lost its offer list when the SDK re-encoded it.**
+
+  `DeRec.Library.ContactMessage` is the only place in any binding where a
+  contact is decoded into a hand-written type and later serialized back — Go
+  and the TypeScript SDKs pass the wire bytes through untouched. The record
+  had no `SupportedTransports` member, so the round trip
+  `CreateContact` → `ContactMessage` → `Request.Produce` silently dropped
+  every endpoint but the deprecated singular one, and a .NET responder never
+  learned more than one of the initiator's endpoints. `CreateContact` accepts
+  a list, so the caller had every reason to believe it had advertised
+  several.
+
+  The record now carries `SupportedTransports`, populates it on decode and
+  emits it on encode. Nothing detected this before because every test built
+  contacts with a single endpoint, for which the lossy and correct paths
+  agree; the .NET smoke suite now round-trips a two-endpoint contact and
+  asserts both entries survive.
+
 - **The legacy singular `transportProtocol` is deprecated everywhere, and
   `PrePairRequestMessage` gains `supportedTransports`.**
 
@@ -424,6 +528,32 @@ all of them unless it names a specific binding.
   entry, which the library does for you. The deprecation surfaces as a real
   compiler warning in Rust (prost emits `#[deprecated]`) and in .NET
   (`CS0612`), and as `@deprecated` in the TypeScript declarations.
+
+  **Reading the singular field is now a bug, and deprecation does not say
+  so.** A deprecation notice communicates *this is going away*; it does not
+  communicate *the meaning of reading this has changed*. This field's meaning
+  narrowed from "the endpoint" to "one entry of a list, and possibly absent",
+  so a reader that was correct in 0.0.2 now rejects — or fails to reach — a
+  peer that advertises only `supportedTransports`. The name, type and runtime
+  behaviour are all unchanged, so nothing in any type system points at the
+  read sites.
+
+  Every binding therefore ships the resolver the core already used
+  internally, so there is a named thing to reach for instead of a field read:
+
+  - **Rust** — `AdvertisedEndpoints::advertised_endpoints()`, implemented for
+    all four message types.
+  - **.NET** — `ContactMessage.AdvertisedEndpoints()`.
+  - **Go** — `derecpb.AdvertisedEndpoints(msg)`, over any message satisfying
+    `derecpb.EndpointAdvertiser`.
+  - **Node / web / React Native** — `advertisedEndpoints(message)`.
+
+  Each yields `supportedTransports` when non-empty and the singular field
+  otherwise, reporting what was advertised rather than what is acceptable —
+  the transport policy still decides what may be recorded. The per-field
+  deprecation notes now state the reader obligation rather than only the
+  removal date, and `api_surface_parity` holds every binding to declaring the
+  resolver.
 
   **At least one of the two must be present.** A message naming no endpoint
   leaves the peer nowhere to reply, so it is refused at validation rather
@@ -462,9 +592,12 @@ all of them unless it names a specific binding.
   routes to every endpoint recorded for the channel, with it to exactly one.
   Turning on a convenience should not cost failover.
 
-  `replyTo` changes from a singular field to a repeated one **on the same
-  tag**, on all five request types — `StoreShare`, `VerifyShare`,
-  `GetSecretIdsVersions`, `GetShare`, `Unpair`. No new field is introduced.
+  Each of the five request types — `StoreShare`, `VerifyShare`,
+  `GetSecretIdsVersions`, `GetShare`, `Unpair` — gains a
+  `repeated TransportProtocol replyToTransports` on a **new tag** (10, 6, 6, 4
+  and 5 respectively). The singular `replyTo` keeps its original tag, its
+  original meaning, and is still populated with the list's **first** entry; it
+  is `[deprecated = true]` and removed in v0.0.5.
 
   - **Rust** — `reply_to` on the message is `Vec<TransportProtocol>`; the
     `reply_to` parameter of every `request::produce` is
@@ -477,15 +610,34 @@ all of them unless it names a specific binding.
   - **C FFI** — `reply_to_ptr` / `reply_to_len` carry a length-delimited
     sequence rather than one encoded message. A zero length still means "no
     override".
-  - **Go** — unaffected: it does not expose `reply_to`.
+  - **Go** — the primitives pass `reply_to` through as opaque bytes and are
+    unaffected. `derecpb.ReplyToEndpoints` is available for an application
+    that parses a request itself.
 
-  **Wire compatibility.** Singular and repeated message fields share an
-  encoding, so a 0.0.2 peer sending one endpoint decodes here as a
-  one-element list, and an unset field decodes as empty. In the other
-  direction a 0.0.2 reader *merges* a multi-entry list and sees only the
-  **last** entry — so an application still talking to 0.0.2 peers should
-  order its list with the endpoint those peers understand last. All three
-  behaviours are pinned by tests in `derec-proto`.
+  Every binding's own surface still takes and returns **one list**. The wire
+  pair is resolved on the way in and split on the way out inside the DTO
+  layer, so no binding has to know the rule and none can get it wrong.
+
+  **Wire compatibility.** A 0.0.2 peer reads tag 5 and skips the list tag it
+  has never heard of, so it sees the first entry. A 0.0.2 peer *writing* one
+  endpoint on tag 5 is read here as a one-element list, and an absent field
+  stays absent — which means "route to the endpoints on file", not "answer me
+  nowhere". All four behaviours are pinned by tests in `derec-proto`.
+
+  **Why a new tag rather than re-tagging `replyTo` as repeated.** An earlier
+  draft of this release did the latter, and it is wire-compatible in the read
+  direction only. Protobuf merges a repeated submessage into a singular reader
+  field-by-field, so a 0.0.2 peer decoding a multi-entry list sees the
+  **last** entry — while the singular `transportProtocol` beside
+  `supportedTransports`, and every other compatibility rule in this release,
+  designates the **first** entry as the legacy-readable one. The same
+  `own_transports` list feeds both paths when `with_auto_reply_to` is on, so
+  no ordering an application chose could satisfy both: leading with HTTPS
+  paired correctly and replied to an address a 0.0.2 peer could not dial;
+  leading with gRPC did the reverse. Shipping that as an ordering convention
+  for applications to follow was not a trade-off worth making when a new tag
+  costs one field number. This is the shape `supportedTransports` (tag 9)
+  already uses beside `transportProtocol` (tag 7).
 
   A reply-to still stands alone rather than joining the recorded endpoints.
   Those may belong to a different peer entirely — a replica talking to a
@@ -533,7 +685,29 @@ all of them unless it names a specific binding.
   is transport mechanism and belongs to the application: only it knows which
   of its transports are healthy, cheap, or currently reachable. Delivery to
   any one endpoint is success; return an error only when the message reached
-  none. `endpoints` is never empty.
+  none. `endpoints` is never empty, and every entry addresses the **same**
+  peer — delivering to all of them sends one authenticated message several
+  times, so stop at the first success.
+
+  **Both adapters ship, so nobody writes that contract by hand.** The decision
+  above stays with the application; the bookkeeping around it is identical
+  everywhere and is now written and tested once per binding. Implement a
+  one-endpoint dialer and wrap it:
+
+  - `SequentialFailover` — tries each endpoint in the peer's order, stops at
+    the first success, errors only when every endpoint failed. The default.
+  - `SingleEndpointTransport` — uses the first and ignores the rest.
+
+  Spelled `SendOne` + `SequentialFailover` / `SingleEndpointTransport` in Rust,
+  .NET and Go, and `SendOne` + `sequentialFailover(dialer)` /
+  `singleEndpointTransport(dialer)` in Node, web and React Native.
+
+  The second adapter exists because `endpoints[0]` compiles, passes every
+  test, and silently forfeits the failover the list was added to provide —
+  and the migration note for this release said it "reproduces the old
+  behaviour exactly", which reads as a green light. It still does reproduce
+  it; the difference is that naming a type records the choice where an index
+  reads as finished code, so a reviewer gets something to disagree with.
 
   An earlier draft of this release had the library pick one endpoint, ranking
   a peer's offers by the order the application had configured its *own*
@@ -579,12 +753,44 @@ all of them unless it names a specific binding.
   `vec![endpoint]`, and a read that needed one takes the first.
 
   *SDK applications* store a JSON-encoded `ChannelRecord` produced by the
-  library, so there is no compile error to catch this. A record written by
-  an older build **fails to load** with a missing-field error for
-  `transports`. That is deliberate — the field carries no `serde(default)`,
-  precisely so a stale row cannot deserialize into a channel that looks
-  paired and has no endpoints. Migrating a stored row means wrapping its
-  `transport` object in an array; the rest of the record is unchanged.
+  library, so there is no compile error to catch this. **They do not have to
+  migrate anything:** the deserializer accepts either spelling and lifts a
+  lone `transport` object into a one-element list, so a record written by an
+  older build loads unchanged.
+
+  An earlier draft of this release left the old spelling unreadable, on the
+  reasoning that a stale row must not deserialize into a channel that looks
+  paired and has no endpoints. That reasoning is sound and is kept — it argues
+  against defaulting the field to *empty*, which is a different thing from
+  upcasting it. Lifting `transport` into `[transport]` yields a channel with
+  the right endpoint; there was never a reason for the two to share an answer.
+  A record naming no endpoint at all — absent under both spellings, or present
+  and empty — is still a loud deserialization error, and now says which of the
+  two it was. The same treatment the recoverable secret payload already got
+  one type over, applied to the format that did not get it.
+
+- **Channel records carry a schema version.**
+
+  Every `HelperChannel` and `ReplicaMember` the library writes now leads with
+  `"schema_version": 3`, and a record claiming a version this build does not
+  understand is refused rather than read with the unknown fields dropped and
+  written back truncated.
+
+  Applications persist these records as opaque blobs whose shape the *library*
+  owns, which is what made the `transport` → `transports` change a migration no
+  application could write without knowing a schema it does not define. The
+  marker is what lets the library keep doing that migration itself: a reader
+  can tell a record apart by the shape it was written in rather than by
+  guessing from which fields happen to be present. It has to exist *before*
+  the next shape change, not after, which is why it lands now while it is free.
+
+  A record written before the marker existed reads as version 0 and is
+  upgraded on load, so nothing has to be rewritten ahead of time. The Go and
+  .NET bridges rebuild this JSON from their own structs rather than passing
+  the bytes through, so both stamp the marker too; the Rust test now asserts
+  the exact serialized text, which is what makes a field added or reordered
+  here fail on the core side instead of only in a hand-written SDK expectation
+  that nothing cross-checked.
 
 - **Recoverable secret payload format v3, with v2 still readable.**
 
@@ -631,9 +837,12 @@ all of them unless it names a specific binding.
   supported and mean a one-element list. Offers failing structure or scheme
   policy are skipped rather than fatal, so a peer advertising both a plaintext
   and a secure endpoint still pairs over the secure one; only an empty
-  survivor set fails, as `Error::NoCommonTransport { offered, supported }`,
-  which names what the peer actually sent rather than what survived
-  filtering. At pairing that error is terminal — delivery is push-only, so a
+  survivor set fails, as `Error::NoUsableEndpoint { offered }`, which names how
+  many endpoints the peer actually sent rather than what survived filtering.
+  SDKs surface that variant under one name in every binding: the error code
+  `NO_USABLE_ENDPOINT` (Node / web / React Native) and
+  `DEREC_CODE_NO_USABLE_ENDPOINT = 121` (C FFI, and therefore .NET and Go). At
+  pairing the error is terminal — delivery is push-only, so a
   peer whose transport this application cannot speak also cannot be sent a
   rejection.
 - **Behavior change: `UpdateChannelInfo` refuses an unservable transport
@@ -641,21 +850,40 @@ all of them unless it names a specific binding.
   serves no endpoint for previously had that endpoint recorded verbatim,
   which silently pointed every later message at an address the application
   could not deliver to. It is now refused before the `ActionRequired` event:
-  the handler returns `Error::NoCommonTransport` and the new
+  the handler returns `Error::NoUsableEndpoint` and the new
   `StatusEnum::UNSUPPORTED_TRANSPORT_PROTOCOL = 12` is sent back over the
   peer's still-working previous endpoint. Unlike the pairing case this is
   deliverable — the channel is already up — so the announcement fails loudly
   instead of silently. Applications relying on `UpdateChannelInfo` to record
   any endpoint a peer names must now serve the transport being switched to.
-- **`unsafe_connection` supersedes `unsafe_http`.**
+- **`unsafe_connection` supersedes `unsafe_http`, and setting both to
+  disagreeing values is now an error.**
   `DeRecProtocolBuilder::with_unsafe_connection` is the new plaintext opt-in
   covering both gated schemes (`http://` and `grpc://`); the previous
-  `with_unsafe_http` is deprecated but still functional. Both flags are
-  honored, and when both are set and disagree, **the deprecated
-  `unsafe_http` wins** — an existing deployment that only knows the old flag
-  keeps its current behavior after upgrading. The distinction is
-  *presence*, not value: an SDK that never sets `unsafe_http` sends nothing,
-  which must not override a deliberate `unsafe_connection` setting.
+  `with_unsafe_http` is deprecated but still functional. **Either flag alone
+  is honored**, so an existing deployment that only knows the old one keeps
+  its behavior after upgrading — that is the compatibility case, and it is
+  undisturbed. The distinction is *presence*, not value: an SDK that never
+  sets `unsafe_http` sends nothing, which must not override a deliberate
+  `unsafe_connection`.
+
+  Both present and disagreeing is refused at construction with
+  `Error::ConflictingPlaintextOptIn { unsafe_http, unsafe_connection }`,
+  naming both flags and the values given. An earlier draft resolved it by
+  precedence — the deprecated flag won, with a `tracing` warning. That is
+  right when a human wrote both values and wrong when a machine wrote one of
+  them: generated config, defaults-merging and IaC layers routinely emit
+  every field, so a defaulted `unsafe_http: false` would beat a deliberate
+  `unsafe_connection: true`. Nothing would fail; plaintext endpoints would
+  simply be refused, and the operator would be left debugging a flag that
+  appeared to do nothing, with the only signal a log line a library consumer
+  has probably not wired up. A five-second failure at startup is the better
+  trade, and it disappears at 0.0.5 when `unsafe_http` is removed.
+
+  Surfaced as `DEREC_CODE_CONFLICTING_PLAINTEXT_OPT_IN = 122` in the C FFI
+  (and therefore `DeRecCode.ConflictingPlaintextOptIn` in .NET and
+  `derec.CodeConflictingPlaintextOptIn` in Go), and as the error code
+  `CONFLICTING_PLAINTEXT_OPT_IN` in Node, web and React Native.
 - **Breaking (all bindings): the pairing primitives take a transport *list*,
   and there are no `_multi` siblings.** `request::create_contact`,
   `request::produce` and `response::produce` each take every endpoint the
@@ -668,28 +896,38 @@ all of them unless it names a specific binding.
   protocol discriminant.
 
   A transitional `create_contact_multi` / `produce_multi` split was
-  considered and rejected: it left the FFI primitives layer bound to the
-  single-endpoint entry points, so SDK applications built on primitives
-  silently kept pre-negotiation behaviour — no offer list advertised and no
-  selection performed. One function per operation makes that impossible.
+  considered and rejected. The singular-to-list change is not confined to
+  these two functions: it touches the channel store trait, the transport
+  trait, `HelperChannel` and `ReplicaMember`, the builder, and five proto
+  messages. A deprecation train means carrying two spellings of all of that
+  through 0.0.4 — to give a migration window to consumers of a version that
+  has not shipped. The one consumer that exists migrated in 12 files against
+  this working tree, and the `SequentialFailover` /
+  `SingleEndpointTransport` adapters give an unmodified single-endpoint
+  transport a working path without a parallel API surface. Had 0.0.3 been
+  tagged, this would be a different answer.
 
-  `response::produce` additionally takes `own_transports` and a
-  `TransportPolicy`, because it now selects the reply endpoint from the
-  requester's offers instead of trusting the requester's singular field.
+  `response::produce` is the exception and moves the other way: it drops the
+  responder's own transports entirely and takes a `TransportPolicy` instead,
+  because it filters the requester's offers rather than ranking them against
+  anything local. See the `pairing.response.produce` entry above for its full
+  signature and per-binding result change.
 
-  Migration (Rust): wrap the existing argument, `transport` becomes
-  `vec![transport]`. For `response::produce`, pass the endpoints you serve
-  and a policy — `TransportPolicy::new(false)` is the production posture.
+  Migration (Rust): for `request::create_contact` and `request::produce`, wrap
+  the existing argument — `transport` becomes `vec![transport]`. For
+  `response::produce`, drop the endpoint argument and pass a policy;
+  `TransportPolicy::new(false)` is the production posture.
 
   Migration (FFI / SDKs): the `create_contact_message` and
   `produce_pair_request_message` C entry points keep their shape but now
   read a **length-delimited** sequence of encoded `TransportProtocol`
   messages — each entry preceded by its protobuf varint byte length, the
   same framing protobuf uses for a repeated embedded message field.
-  `produce_pair_response_message` gains `transport_protocols_ptr`,
-  `transport_protocols_len` and a `unsafe_connection` flag. The .NET, Go,
-  Node, React Native and web surfaces were updated accordingly; each takes
-  a list where it previously took one endpoint.
+  `produce_pair_response_message` moves the other way: it drops
+  `transport_protocols_ptr` and `transport_protocols_len` and gains a
+  `unsafe_connection` flag. The .NET, Go, Node, React Native and web surfaces
+  were updated accordingly; each takes a list where it previously took one
+  endpoint, except the pair-response entry point, which now takes none.
 
 - **Breaking (Go SDK): `Config.UnsafeHTTP` changed from `bool` to `*bool`.**
   The `unsafe_connection` / `unsafe_http` conflict rule is presence-based —

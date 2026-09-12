@@ -418,6 +418,44 @@
       "dotnet": "Matches",
       "go": "Matches",
       "ts": "channelFilterMatches"
+    },
+    {
+      "what": "advertised endpoints reader",
+      "why": "the singular transportProtocol narrowed to 'one entry of a list, and possibly absent' in 0.0.3, so every reader must resolve it against supportedTransports rather than read either field directly",
+      "dotnet": "AdvertisedEndpoints",
+      "go": "AdvertisedEndpoints",
+      "ts": "advertisedEndpoints"
+    },
+    {
+      "what": "sequential failover transport",
+      "why": "the send contract has four rules and none is about dialing; written by hand per binding it is untested code reaching identical behaviour, and the shortest thing that compiles is endpoints[0], which forfeits failover silently",
+      "dotnet": "SequentialFailover",
+      "go": "SequentialFailover",
+      "ts": "sequentialFailover"
+    },
+    {
+      "what": "single endpoint transport",
+      "why": "taking endpoints[0] inline reads as finished; naming the type records that failover was considered and declined, which is a claim a reviewer can disagree with",
+      "dotnet": "SingleEndpointTransport",
+      "go": "SingleEndpointTransport",
+      "ts": "singleEndpointTransport"
     }
-  ]
+  ],
+  "documented_api": {
+    "$note": "Holds the prose to the source. A consumer reads CHANGELOG.md and deprecation notes while their build is broken, so a name that does not resolve costs them a search through five bindings to conclude the document was wrong. Both defects this guards were shipped and found by hand: the changelog described `Error::NoCommonTransport` as current behaviour after it had been renamed, and the deprecation wave named two removal versions because the notes were written weeks apart.",
+    "retired_error_variants": [
+      {
+        "enum": "Error",
+        "variant": "NoCommonTransport",
+        "replaced_by": "NoUsableEndpoint",
+        "why": "Renamed to `NoUsableEndpoint { offered }` in 0.0.3. Explaining the rename is the one legitimate reason to write a variant that no longer exists, so `replaced_by` must appear in the same paragraph — an entry that names the old spelling and not the new one is describing it as current, which is the defect this guards."
+      }
+    ],
+    "deprecation_horizon": {
+      "since": "0.0.3",
+      "removed_at": "0.0.5",
+      "$note": "One horizon for the whole wave, stated once in the changelog rather than repeated per symbol. A symbol that genuinely needs longer goes in `exceptions` with the reason.",
+      "exceptions": []
+    }
+  }
 }

@@ -138,4 +138,30 @@ public sealed record TransportProtocol(
     /// </summary>
     internal static TransportProtocol FromProtoValue(Org.Derecalliance.Derec.Protobuf.TransportProtocol proto) =>
         new(proto.Uri, (Protocol)(int)proto.Protocol);
+
+    /// <summary>
+    /// Resolve a request's <c>replyTo</c> / <c>replyToTransports</c> pair into
+    /// the endpoints the requester asked to be answered on, in its own order.
+    /// </summary>
+    /// <remarks>
+    /// Yields <paramref name="list"/> when it is non-empty, and otherwise the
+    /// singular <paramref name="legacy"/> — which is how every implementation
+    /// predating the list asks, and the reason this is a method rather than a
+    /// property read. An empty result means the requester named no endpoint at
+    /// all, which tells the responder to answer on the endpoints recorded for
+    /// the channel.
+    /// </remarks>
+    internal static IReadOnlyList<TransportProtocol> ResolveReplyTo(
+        Org.Derecalliance.Derec.Protobuf.TransportProtocol? legacy,
+        IEnumerable<Org.Derecalliance.Derec.Protobuf.TransportProtocol> list)
+    {
+        var resolved = list.Select(FromProtoValue).ToList();
+        if (resolved.Count > 0)
+        {
+            return resolved;
+        }
+        return legacy is null
+            ? Array.Empty<TransportProtocol>()
+            : new[] { FromProtoValue(legacy) };
+    }
 }

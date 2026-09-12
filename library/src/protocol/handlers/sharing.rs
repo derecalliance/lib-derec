@@ -342,7 +342,11 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     let envelope = crate::derec_message::apply_trace_id(&resp.envelope, exchange.trace_id)?;
     let endpoint = stores
         .channels
-        .resolve_response_endpoints(secret_id, channel_id, &request.reply_to)
+        .resolve_response_endpoints(
+            secret_id,
+            channel_id,
+            &crate::extensions::advertised_endpoints::reply_to_owned(request),
+        )
         .await?;
     stores.transport.send(&endpoint, envelope).await?;
 
@@ -402,7 +406,7 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
         MessageBody::StoreShareResponse(response),
         exchange.shared_key,
         exchange.trace_id,
-        &request.reply_to,
+        &crate::extensions::advertised_endpoints::reply_to_owned(request),
     )
     .await?;
 
@@ -905,6 +909,12 @@ async fn dispatch_composite_to_destination<S: StoreSet>(
     let composite_bytes = per_channel.encode_to_vec();
 
     let timestamp = current_timestamp();
+    let (legacy_reply_to, reply_to_transports) =
+        crate::extensions::advertised_endpoints::split_reply_to(round.reply_to);
+    // Populating the deprecated singular field is the compatibility
+    // path that keeps peers predating `replyToTransports`
+    // answerable, so the warning is expected here.
+    #[allow(deprecated)]
     let msg = StoreShareRequestMessage {
         share: composite_bytes,
         share_algorithm: SHARE_ALGORITHM_REPLICA_SECRET,
@@ -913,7 +923,8 @@ async fn dispatch_composite_to_destination<S: StoreSet>(
         version_description: description.to_owned(),
         timestamp: Some(timestamp),
         secret_id: local.secret_id,
-        reply_to: round.reply_to.to_vec(),
+        reply_to: legacy_reply_to,
+        reply_to_transports,
         replica_id: local.replica_id,
     };
 

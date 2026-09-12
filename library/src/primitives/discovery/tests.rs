@@ -155,7 +155,9 @@ fn test_extract_discovery_request_mismatched_timestamp_fails() {
 
     let message = GetSecretIdsVersionsRequestMessage {
         timestamp: Some(message_timestamp),
-        reply_to: Vec::new(),
+        #[allow(deprecated)]
+        reply_to: None,
+        reply_to_transports: Vec::new(),
         replica_id: None,
     };
 
@@ -186,7 +188,9 @@ fn test_extract_discovery_request_wrong_message_type_fails() {
         secret_id: 1,
         version: 1,
         timestamp: Some(timestamp),
-        reply_to: Vec::new(),
+        #[allow(deprecated)]
+        reply_to: None,
+        reply_to_transports: Vec::new(),
         replica_id: None,
     };
 

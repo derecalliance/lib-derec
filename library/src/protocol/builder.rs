@@ -36,35 +36,31 @@ pub const DEFAULT_KEEP_VERSIONS_COUNT: usize = 3;
 
 /// Resolve the two plaintext opt-in flags to a single policy value.
 ///
-/// `unsafe_http` is superseded by `unsafe_connection` but still honored,
-/// and **wins on conflict** so an existing deployment that only knows the
-/// old flag keeps its current behavior after upgrading.
+/// `unsafe_http` is superseded by `unsafe_connection` but still honored, so a
+/// deployment that only knows the old flag keeps its behavior after upgrading.
 ///
 /// The distinction is *presence*, not value: an SDK that never sets the old
 /// flag sends nothing, which must not override a deliberate new-flag
 /// setting. Callers that cannot express absence must pass `None`.
-#[cfg_attr(not(feature = "logging"), allow(unused_variables))]
+///
+/// Two values that are both present and disagree are a
+/// [`Error::ConflictingPlaintextOptIn`](crate::Error::ConflictingPlaintextOptIn)
+/// rather than a silent win for either, because at that point there is no
+/// reading of the configuration that is obviously intended, and the one this
+/// would otherwise pick is the one being removed.
 pub(crate) fn resolve_plaintext_opt_in(
     unsafe_http: Option<bool>,
     unsafe_connection: Option<bool>,
-) -> bool {
+) -> crate::Result<bool> {
     match (unsafe_http, unsafe_connection) {
-        (Some(old), Some(new)) => {
-            #[cfg(feature = "logging")]
-            if old != new {
-                tracing::warn!(
-                    unsafe_http = old,
-                    unsafe_connection = new,
-                    "both plaintext opt-in flags set and disagreeing — honoring the \
-                     deprecated `unsafe_http`; migrate to `unsafe_connection`, which \
-                     becomes the only flag at 0.1.0",
-                );
-            }
-            old
-        }
-        (Some(old), None) => old,
-        (None, Some(new)) => new,
-        (None, None) => false,
+        (Some(old), Some(new)) if old != new => Err(crate::Error::ConflictingPlaintextOptIn {
+            unsafe_http: old,
+            unsafe_connection: new,
+        }),
+        (Some(agreed), Some(_)) => Ok(agreed),
+        (Some(old), None) => Ok(old),
+        (None, Some(new)) => Ok(new),
+        (None, None) => Ok(false),
     }
 }
 
@@ -279,7 +275,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     #[deprecated(
         since = "0.0.3",
         note = "use `with_unsafe_connection`, which names both gated schemes; \
-                removed at 0.1.0"
+                removed at 0.0.5"
     )]
     pub fn with_unsafe_http(mut self, allow: bool) -> Self {
         self.unsafe_http = Some(allow);
@@ -289,8 +285,10 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     /// Accept plaintext transport endpoints — `http://` and `grpc://`.
     ///
     /// Supersedes [`with_unsafe_http`](Self::with_unsafe_http), which named
-    /// only one of the two schemes it gates. Both are honored; if both are
-    /// set and disagree, the deprecated one wins and a warning is emitted.
+    /// only one of the two schemes it gates. Either alone is honored; both
+    /// set and disagreeing is
+    /// [`Error::ConflictingPlaintextOptIn`](crate::Error::ConflictingPlaintextOptIn)
+    /// from [`build`](Self::build) rather than a silent win for either.
     ///
     /// See [`TransportPolicy`](crate::transport::TransportPolicy) for the
     /// full table, including why loopback is free for your own endpoint but
@@ -973,7 +971,7 @@ impl<
         // One resolution feeds both the build-time `check_own` below and the
         // runtime policy stored on the protocol, so the two never disagree
         // about which flag decided the posture.
-        let unsafe_connection = resolve_plaintext_opt_in(self.unsafe_http, self.unsafe_connection);
+        let unsafe_connection = resolve_plaintext_opt_in(self.unsafe_http, self.unsafe_connection)?;
         // Deferred to here rather than to `with_own_transport` /
         // `with_own_transports`: the setters may be called in either order,
         // so this is the first point at which both the endpoint(s) and the
@@ -1019,37 +1017,69 @@ mod tests {
 
     #[test]
     fn unsafe_connection_alone_is_honored() {
-        assert!(resolve_plaintext_opt_in(None, Some(true)));
-        assert!(!resolve_plaintext_opt_in(None, Some(false)));
+        assert!(resolve_plaintext_opt_in(None, Some(true)).unwrap());
+        assert!(!resolve_plaintext_opt_in(None, Some(false)).unwrap());
     }
 
-    /// The deprecated flag wins on conflict, so an existing deployment that
-    /// only knows `unsafe_http` keeps behaving exactly as it did.
+    /// Two explicit values that disagree are refused rather than resolved.
+    ///
+    /// Precedence would hand the decision to the flag being removed, and the
+    /// case that makes that dangerous is a configuration layer emitting both
+    /// fields unconditionally: a defaulted `unsafe_http: false` would beat a
+    /// deliberate `unsafe_connection: true`, refusing plaintext endpoints with
+    /// no diagnostic beyond a log line the application may not have wired up.
     #[test]
-    fn deprecated_flag_wins_on_conflict() {
-        assert!(resolve_plaintext_opt_in(Some(true), Some(false)));
-        assert!(!resolve_plaintext_opt_in(Some(false), Some(true)));
+    fn disagreeing_explicit_flags_are_refused() {
+        for (old, new) in [(true, false), (false, true)] {
+            let err = resolve_plaintext_opt_in(Some(old), Some(new))
+                .expect_err("two explicit, disagreeing values must not resolve silently");
+            assert!(
+                matches!(
+                    err,
+                    crate::Error::ConflictingPlaintextOptIn {
+                        unsafe_http,
+                        unsafe_connection,
+                    } if unsafe_http == old && unsafe_connection == new
+                ),
+                "the error must name both flags and the values given: {err:?}"
+            );
+            // The operator has to be able to find the flag they set, so both
+            // names appear in the rendered message.
+            let rendered = err.to_string();
+            assert!(rendered.contains("unsafe_http"), "{rendered}");
+            assert!(rendered.contains("unsafe_connection"), "{rendered}");
+        }
+    }
+
+    /// Agreement is not a conflict, however redundantly it was expressed — a
+    /// config layer that emits both fields with the same value is describing
+    /// one posture, not two.
+    #[test]
+    fn agreeing_explicit_flags_resolve() {
+        assert!(resolve_plaintext_opt_in(Some(true), Some(true)).unwrap());
+        assert!(!resolve_plaintext_opt_in(Some(false), Some(false)).unwrap());
     }
 
     /// Presence, not value. An SDK that never sets `unsafe_http` must not
     /// override a deliberate `unsafe_connection`.
     #[test]
     fn absent_deprecated_flag_does_not_override() {
-        assert!(resolve_plaintext_opt_in(None, Some(true)));
+        assert!(resolve_plaintext_opt_in(None, Some(true)).unwrap());
     }
 
     #[test]
     fn neither_flag_is_the_production_posture() {
-        assert!(!resolve_plaintext_opt_in(None, None));
+        assert!(!resolve_plaintext_opt_in(None, None).unwrap());
     }
 
     /// The old flag alone still decides, so an application that upgrades
     /// without touching its configuration keeps exactly its previous
-    /// posture.
+    /// posture. This is the compatibility case the precedence rule existed
+    /// for, and refusing a conflict does not disturb it.
     #[test]
     fn deprecated_flag_alone_is_honored() {
-        assert!(resolve_plaintext_opt_in(Some(true), None));
-        assert!(!resolve_plaintext_opt_in(Some(false), None));
+        assert!(resolve_plaintext_opt_in(Some(true), None).unwrap());
+        assert!(!resolve_plaintext_opt_in(Some(false), None).unwrap());
     }
 
     /// A freshly-constructed builder carries `DEFAULT_THRESHOLD` /

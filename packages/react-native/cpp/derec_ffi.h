@@ -27,6 +27,31 @@
 #define SHARE_ALGORITHM_REPLICA_SECRET 1
 
 /**
+ * Schema version stamped onto every channel record this build writes.
+ *
+ * Applications persist [`HelperChannel`] and [`ReplicaMember`] as opaque
+ * blobs whose shape the *library* owns, so a field change here is a
+ * migration the application cannot write without knowing a schema it does
+ * not define. The marker is what lets the library do that migration itself:
+ * a reader can tell a record apart by the shape it was written in rather
+ * than by guessing from which fields happen to be present.
+ *
+ * A record written before the marker existed deserializes as version 0 and
+ * is upgraded on read. A record claiming a version *newer* than this build
+ * understands is refused, because the alternative is silently dropping
+ * fields this build cannot see and writing the truncated result back.
+ *
+ * The value tracks the release that last changed the shape, not the release
+ * that is current: it moved to 3 when `transport` became `transports`, and
+ * stays there until the next shape change.
+ *
+ * Declared unconditionally, unlike the serde impls that stamp it: the SDK
+ * bridges mirror this number in their own encoders, and a constant they must
+ * agree with should not appear and disappear with a feature flag.
+ */
+#define CHANNEL_RECORD_SCHEMA_VERSION 3
+
+/**
  * Latest encoding major version, used for all new encodes. Bump only on a
  * breaking format change, adding the matching `vN` module and match arm.
  */
@@ -270,6 +295,18 @@
  * cannot be told. `DEREC_CATEGORY_INVALID_INPUT`.
  */
 #define DEREC_CODE_NO_USABLE_ENDPOINT 121
+
+/**
+ * Both plaintext opt-in flags were set explicitly and disagree: the
+ * deprecated `unsafe_http` says one thing and `unsafe_connection` the
+ * other. Raised at protocol construction rather than resolved by
+ * precedence, because the flag precedence would favour is the one being
+ * removed, and a configuration layer that emits every field
+ * unconditionally would otherwise let a defaulted value silently beat a
+ * deliberate one. Set only `unsafe_connection`.
+ * `DEREC_CATEGORY_INVALID_INPUT`.
+ */
+#define DEREC_CODE_CONFLICTING_PLAINTEXT_OPT_IN 122
 
 /**
  * Discriminants selecting which message [`derec_decode_message_json`] and

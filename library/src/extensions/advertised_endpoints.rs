@@ -68,6 +68,81 @@ impl AdvertisedEndpoints for derec_proto::UpdateChannelInfoRequestMessage {
     }
 }
 
+/// A request that names where its response should be delivered.
+///
+/// The same offer-list-else-legacy-field rule as [`AdvertisedEndpoints`],
+/// applied to the `replyTo` / `replyToTransports` pair on the five request
+/// types that carry one.
+///
+/// The two are separate traits rather than one because the fields mean
+/// different things. What [`AdvertisedEndpoints`] reports is where a peer can
+/// be reached in general, and it is recorded on the channel; what this reports
+/// overrides that for a single exchange and is deliberately *not* persisted.
+/// A message can carry both, and conflating them would let a one-round-trip
+/// override leak into the stored set.
+pub trait ReplyToEndpoints {
+    /// The endpoints this request asked to be answered on, in its own order.
+    ///
+    /// Empty means the requester named none, which is distinct from naming an
+    /// unreachable one: the responder then falls back to the endpoints stored
+    /// on the channel rather than failing to answer.
+    fn reply_to_endpoints(&self) -> Vec<&derec_proto::TransportProtocol>;
+}
+
+/// Implement [`ReplyToEndpoints`] for a request carrying the field pair.
+///
+/// A macro rather than five hand-written impls: the bodies are identical, and
+/// a sixth request type gaining a `replyTo` should not be able to acquire a
+/// subtly different resolution rule by being written out by hand.
+macro_rules! impl_reply_to_endpoints {
+    ($($message:ty),+ $(,)?) => {
+        $(
+            impl ReplyToEndpoints for $message {
+                // Compatibility, not oversight — see the `transport` module docs.
+                #[allow(deprecated)]
+                fn reply_to_endpoints(&self) -> Vec<&derec_proto::TransportProtocol> {
+                    advertised(&self.reply_to_transports, self.reply_to.as_ref())
+                }
+            }
+        )+
+    };
+}
+
+impl_reply_to_endpoints!(
+    derec_proto::StoreShareRequestMessage,
+    derec_proto::VerifyShareRequestMessage,
+    derec_proto::GetSecretIdsVersionsRequestMessage,
+    derec_proto::GetShareRequestMessage,
+    derec_proto::UnpairRequestMessage,
+);
+
+/// [`ReplyToEndpoints::reply_to_endpoints`] as owned values.
+///
+/// The borrowing form suits the policy-filtering path, which discards most of
+/// what it inspects. A response path instead keeps everything it resolves and
+/// hands it to a transport that outlives the request, so it would clone
+/// immediately anyway.
+pub(crate) fn reply_to_owned(
+    request: &impl ReplyToEndpoints,
+) -> Vec<derec_proto::TransportProtocol> {
+    request.reply_to_endpoints().into_iter().cloned().collect()
+}
+
+/// Split a preference-ordered list into the pair a request puts on the wire.
+///
+/// The first entry fills the deprecated singular `replyTo`, which is what an
+/// implementation predating `replyToTransports` reads, and the whole list
+/// fills `replyToTransports`. Every writer goes through this so the two can
+/// never disagree about which entry is the legacy-readable one.
+pub(crate) fn split_reply_to(
+    reply_to: &[derec_proto::TransportProtocol],
+) -> (
+    Option<derec_proto::TransportProtocol>,
+    Vec<derec_proto::TransportProtocol>,
+) {
+    (reply_to.first().cloned(), reply_to.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

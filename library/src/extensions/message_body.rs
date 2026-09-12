@@ -122,12 +122,14 @@ impl MessageBodyExt for MessageBody {
     }
 
     fn peer_supplied_endpoints(&self) -> impl Iterator<Item = &TransportProtocol> {
+        use crate::extensions::advertised_endpoints::ReplyToEndpoints as _;
+
         let listed: Vec<&TransportProtocol> = match self {
-            MessageBody::StoreShareRequest(r) => r.reply_to.iter().collect::<Vec<_>>(),
-            MessageBody::VerifyShareRequest(r) => r.reply_to.iter().collect::<Vec<_>>(),
-            MessageBody::GetSecretIdsVersionsRequest(r) => r.reply_to.iter().collect::<Vec<_>>(),
-            MessageBody::GetShareRequest(r) => r.reply_to.iter().collect::<Vec<_>>(),
-            MessageBody::UnpairRequest(r) => r.reply_to.iter().collect::<Vec<_>>(),
+            MessageBody::StoreShareRequest(r) => r.reply_to_endpoints(),
+            MessageBody::VerifyShareRequest(r) => r.reply_to_endpoints(),
+            MessageBody::GetSecretIdsVersionsRequest(r) => r.reply_to_endpoints(),
+            MessageBody::GetShareRequest(r) => r.reply_to_endpoints(),
+            MessageBody::UnpairRequest(r) => r.reply_to_endpoints(),
             _ => Vec::new(),
         };
 
@@ -236,7 +238,7 @@ mod tests {
             protocol: derec_proto::Protocol::Https as i32,
         };
         let body = MessageBody::GetShareRequest(derec_proto::GetShareRequestMessage {
-            reply_to: vec![endpoint.clone()],
+            reply_to_transports: vec![endpoint.clone()],
             ..Default::default()
         });
         let found: Vec<_> = body.peer_supplied_endpoints().collect();

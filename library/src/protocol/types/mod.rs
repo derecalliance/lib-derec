@@ -336,7 +336,11 @@ impl ReplicaRole {
 #[derive(Clone, Debug)]
 #[cfg_attr(
     any(feature = "serde", target_arch = "wasm32"),
-    derive(Serialize, Deserialize)
+    derive(Serialize, Deserialize),
+    serde(
+        into = "channel_wire::HelperChannelWire",
+        try_from = "channel_wire::HelperChannelWire"
+    )
 )]
 pub struct HelperChannel {
     pub channel_id: ChannelId,
@@ -347,16 +351,19 @@ pub struct HelperChannel {
     /// survivors to [`DeRecTransport::send`](crate::protocol::DeRecTransport),
     /// which is the application's to choose among and fail over between.
     ///
-    /// # Upgrading from a pre-0.0.3 channel store
+    /// # Reading a pre-0.0.3 stored record
     ///
-    /// This replaced a single `transport` field, so a stored record written
-    /// by an older build no longer deserializes. That is deliberate: the
-    /// field carries no `serde(default)`, so a stale row fails loudly with
-    /// a missing-field error instead of quietly yielding a channel with no
-    /// endpoints — a peer that looks paired and is unreachable is worse than
-    /// one that refuses to load. Applications own channel-store persistence;
-    /// migrating a stored row means wrapping its `transport` object in an
-    /// array.
+    /// This replaced a single `transport` field. A record written by an older
+    /// build still loads: the deserializer accepts either spelling and lifts
+    /// a lone `transport` object into a one-element list, so no application
+    /// has to migrate a schema the library defines. See
+    /// [`CHANNEL_RECORD_SCHEMA_VERSION`].
+    ///
+    /// What is *not* accepted is a record naming no endpoint at all — absent
+    /// under both spellings, or present and empty. Defaulting those to an
+    /// empty list would yield a channel that looks paired and is unreachable,
+    /// which is worse than one that refuses to load, so they stay a loud
+    /// deserialization error.
     pub transports: Vec<derec_proto::TransportProtocol>,
     #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
     pub communication_info: std::collections::HashMap<String, String>,
@@ -381,7 +388,11 @@ pub struct HelperChannel {
 #[derive(Clone, Debug)]
 #[cfg_attr(
     any(feature = "serde", target_arch = "wasm32"),
-    derive(Serialize, Deserialize)
+    derive(Serialize, Deserialize),
+    serde(
+        into = "channel_wire::ReplicaMemberWire",
+        try_from = "channel_wire::ReplicaMemberWire"
+    )
 )]
 pub struct ReplicaMember {
     /// The group channel. Identical for every member.
@@ -399,6 +410,200 @@ pub struct ReplicaMember {
     pub status: ChannelStatus,
     #[cfg_attr(any(feature = "serde", target_arch = "wasm32"), serde(default))]
     pub created_at: u64,
+}
+
+/// Schema version stamped onto every channel record this build writes.
+///
+/// Applications persist [`HelperChannel`] and [`ReplicaMember`] as opaque
+/// blobs whose shape the *library* owns, so a field change here is a
+/// migration the application cannot write without knowing a schema it does
+/// not define. The marker is what lets the library do that migration itself:
+/// a reader can tell a record apart by the shape it was written in rather
+/// than by guessing from which fields happen to be present.
+///
+/// A record written before the marker existed deserializes as version 0 and
+/// is upgraded on read. A record claiming a version *newer* than this build
+/// understands is refused, because the alternative is silently dropping
+/// fields this build cannot see and writing the truncated result back.
+///
+/// The value tracks the release that last changed the shape, not the release
+/// that is current: it moved to 3 when `transport` became `transports`, and
+/// stays there until the next shape change.
+///
+/// Declared unconditionally, unlike the serde impls that stamp it: the SDK
+/// bridges mirror this number in their own encoders, and a constant they must
+/// agree with should not appear and disappear with a feature flag.
+pub const CHANNEL_RECORD_SCHEMA_VERSION: u8 = 3;
+
+/// Stored-format compatibility for the two channel records.
+///
+/// [`HelperChannel`] and [`ReplicaMember`] route both serde directions
+/// through the shadow structs here, which is what lets one stored shape be
+/// read and a different one written. Two properties make it worth the
+/// indirection:
+///
+/// - The conversion is a plain `TryFrom`, so an error message can say what is
+///   wrong with a record rather than surfacing serde's field-level default.
+/// - The two spellings are distinct *fields* rather than one field with an
+///   `untagged` shape, so nothing here needs `deserialize_any`. Applications
+///   own this persistence and the library does not dictate their format; an
+///   `untagged` enum would have silently ruled out every non-self-describing
+///   one.
+#[cfg(any(feature = "serde", target_arch = "wasm32"))]
+mod channel_wire {
+    use super::{
+        CHANNEL_RECORD_SCHEMA_VERSION, ChannelId, ChannelStatus, HelperChannel, ReplicaId,
+        ReplicaMember, ReplicaRole,
+    };
+    use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
+
+    /// Resolve the two endpoint spellings into the one this build uses.
+    ///
+    /// `transports` wins when both are present. A migration script that adds
+    /// the list without deleting the superseded object is doing the sane
+    /// thing, and refusing it would punish the more careful migration.
+    fn endpoints(
+        transport: Option<derec_proto::TransportProtocol>,
+        transports: Option<Vec<derec_proto::TransportProtocol>>,
+        record: &'static str,
+    ) -> Result<Vec<derec_proto::TransportProtocol>, String> {
+        let resolved = match (transports, transport) {
+            (Some(list), _) => list,
+            (None, Some(one)) => vec![one],
+            (None, None) => {
+                return Err(format!(
+                    "{record} names no transport endpoint: neither `transports` nor the \
+                     pre-0.0.3 `transport` is present. A channel record with no endpoint \
+                     describes a peer that looks paired and cannot be reached"
+                ));
+            }
+        };
+        if resolved.is_empty() {
+            return Err(format!(
+                "{record} has an empty `transports` list. A recorded channel always has at \
+                 least one endpoint — the library refuses to record a peer whose endpoints \
+                 were all filtered away"
+            ));
+        }
+        Ok(resolved)
+    }
+
+    /// Refuse a record written by a build that knew a shape this one does not.
+    fn check_version(schema_version: u8, record: &'static str) -> Result<(), String> {
+        if schema_version > CHANNEL_RECORD_SCHEMA_VERSION {
+            return Err(format!(
+                "{record} was written with schema version {schema_version}, but this build \
+                 understands at most {CHANNEL_RECORD_SCHEMA_VERSION}. Reading it would drop \
+                 the fields this build cannot see, and writing the record back would make \
+                 that loss permanent"
+            ));
+        }
+        Ok(())
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub struct HelperChannelWire {
+        #[serde(default)]
+        schema_version: u8,
+        channel_id: ChannelId,
+        /// Pre-0.0.3 spelling. Read, never written.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transport: Option<derec_proto::TransportProtocol>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transports: Option<Vec<derec_proto::TransportProtocol>>,
+        #[serde(default)]
+        communication_info: HashMap<String, String>,
+        peer_role: derec_proto::SenderKind,
+        #[serde(default)]
+        status: ChannelStatus,
+        #[serde(default)]
+        created_at: u64,
+    }
+
+    impl From<HelperChannel> for HelperChannelWire {
+        fn from(value: HelperChannel) -> Self {
+            Self {
+                schema_version: CHANNEL_RECORD_SCHEMA_VERSION,
+                channel_id: value.channel_id,
+                transport: None,
+                transports: Some(value.transports),
+                communication_info: value.communication_info,
+                peer_role: value.peer_role,
+                status: value.status,
+                created_at: value.created_at,
+            }
+        }
+    }
+
+    impl TryFrom<HelperChannelWire> for HelperChannel {
+        type Error = String;
+
+        fn try_from(wire: HelperChannelWire) -> Result<Self, Self::Error> {
+            check_version(wire.schema_version, "HelperChannel")?;
+            Ok(Self {
+                channel_id: wire.channel_id,
+                transports: endpoints(wire.transport, wire.transports, "HelperChannel")?,
+                communication_info: wire.communication_info,
+                peer_role: wire.peer_role,
+                status: wire.status,
+                created_at: wire.created_at,
+            })
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub struct ReplicaMemberWire {
+        #[serde(default)]
+        schema_version: u8,
+        channel_id: ChannelId,
+        replica_id: ReplicaId,
+        /// Pre-0.0.3 spelling. Read, never written.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transport: Option<derec_proto::TransportProtocol>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transports: Option<Vec<derec_proto::TransportProtocol>>,
+        #[serde(default)]
+        communication_info: HashMap<String, String>,
+        role: ReplicaRole,
+        #[serde(default)]
+        status: ChannelStatus,
+        #[serde(default)]
+        created_at: u64,
+    }
+
+    impl From<ReplicaMember> for ReplicaMemberWire {
+        fn from(value: ReplicaMember) -> Self {
+            Self {
+                schema_version: CHANNEL_RECORD_SCHEMA_VERSION,
+                channel_id: value.channel_id,
+                replica_id: value.replica_id,
+                transport: None,
+                transports: Some(value.transports),
+                communication_info: value.communication_info,
+                role: value.role,
+                status: value.status,
+                created_at: value.created_at,
+            }
+        }
+    }
+
+    impl TryFrom<ReplicaMemberWire> for ReplicaMember {
+        type Error = String;
+
+        fn try_from(wire: ReplicaMemberWire) -> Result<Self, Self::Error> {
+            check_version(wire.schema_version, "ReplicaMember")?;
+            Ok(Self {
+                channel_id: wire.channel_id,
+                replica_id: wire.replica_id,
+                transports: endpoints(wire.transport, wire.transports, "ReplicaMember")?,
+                communication_info: wire.communication_info,
+                role: wire.role,
+                status: wire.status,
+                created_at: wire.created_at,
+            })
+        }
+    }
 }
 
 /// Addresses a single record in [`crate::protocol::DeRecChannelStore`].
@@ -429,30 +634,39 @@ impl ChannelQuery {
 /// an unfiltered listing. Restrictions combine with AND, and `exclude` is
 /// applied last, overriding `ids`.
 ///
-/// # Apply it in the query, but the library re-checks
+/// # Returning everything is correct
 ///
-/// Applying the filter is the store's job precisely because the store is where
-/// it can be pushed into a query — a `WHERE` clause, a key-condition
-/// expression — instead of transferring rows the caller will discard. That
-/// transfer is what the filter exists to avoid: it costs bandwidth everywhere,
-/// and on a metered backing such as DynamoDB, which bills by bytes read, it
-/// costs money.
+/// **Ignoring the filter entirely and returning every record under the
+/// `secret_id` is a correct implementation**, and the one to write unless
+/// there is a measured reason not to. The protocol re-applies the filter to
+/// whatever a listing returns and drops anything it excludes, so a superset is
+/// trimmed to exactly the right set before anything acts on it.
 ///
-/// **A store that ignores it is slow, not wrong.** The protocol acts on the
-/// rows a listing returns — deleting some, flagging the member a by-id filter
-/// named — so it re-applies the filter to every listing before using it, and
-/// drops anything the filter excluded. That backstop matters most where the
-/// signature cannot enforce itself: TypeScript accepts a function of fewer
-/// parameters where more are declared, so a store written before this
-/// parameter existed satisfies the current interface and compiles without a
-/// diagnostic.
+/// # Pushing it into the query is an optimization you opt into
 ///
-/// **It is a one-way guarantee, and not a validation of your store.** Dropping
-/// rows can enforce an upper bound — nothing excluded gets through — but it
-/// cannot recover a row you omitted. A store that returns *fewer* rows than
-/// the filter selects is still wrong, and wrong in a way nothing here can
-/// detect: the protocol simply fails to act. Applying the filter faithfully
-/// remains the store's job; the library only declines to trust the result.
+/// A store *may* translate the filter into a `WHERE` clause or a key-condition
+/// expression and return only the matching rows. That saves transferring rows
+/// the caller would discard, which costs bandwidth everywhere and real money
+/// on a metered backing such as DynamoDB, which bills by bytes read.
+///
+/// It also moves this type's semantics into a query language by hand, and the
+/// error that matters is asymmetric. The library's re-check is a **one-way**
+/// guarantee: dropping rows can enforce an upper bound, so returning too
+/// *many* costs only the transfer. It cannot recover a row that was never
+/// returned. A pushdown that selects too *few* is wrong in a way nothing here
+/// can detect — no exception, no event, no log line. The protocol simply fails
+/// to act, and what that looks like is a share that was never published.
+///
+/// So treat pushdown as a performance claim about your own query, and verify
+/// it: `fixtures/channel_filter.json` is a table of
+/// `(records, filter, expected)` cases covering the clauses that are easy to
+/// get subtly wrong — empty-means-unrestricted per field, `role` as an
+/// optional, and `exclude` applied *after* `ids`. Every binding's test suite
+/// drives it, and a store that pushes down should be driven through it too.
+///
+/// [`ChannelFilter::matches`] is the same predicate the library re-checks
+/// with, exported so a store that cannot express the filter as a query can
+/// apply it in memory without re-deriving the rules.
 ///
 /// The listing methods state which record field each of `status`, `role` and
 /// the id fields refers to.
@@ -1111,6 +1325,208 @@ pub struct Share {
     /// Opaque protobuf bytes — see [`crate::protocol::DeRecShareStore`] for
     /// the per-side format.
     pub bytes: Vec<u8>,
+}
+
+/// The stored shape of a channel record, which applications persist and the
+/// library owns.
+///
+/// These assert against **JSON text**, not against a round trip. A round trip
+/// only proves this build agrees with itself; it says nothing about the record
+/// an older build wrote, which is the compatibility that actually matters here
+/// and the one that had no coverage when `transport` became `transports`.
+#[cfg(all(test, feature = "serde"))]
+mod channel_record_format_tests {
+    use super::*;
+
+    fn endpoint(uri: &str) -> derec_proto::TransportProtocol {
+        derec_proto::TransportProtocol {
+            uri: uri.to_owned(),
+            protocol: derec_proto::Protocol::Https as i32,
+        }
+    }
+
+    /// Exactly what a pre-0.0.3 build wrote: a singular `transport` object and
+    /// no schema marker.
+    const LEGACY_HELPER: &str = r#"{
+        "channel_id": 42,
+        "transport": { "uri": "https://helper.example/derec", "protocol": 0 },
+        "peer_role": "Helper",
+        "status": "Paired",
+        "created_at": 1700000000
+    }"#;
+
+    #[test]
+    fn a_pre_0_0_3_helper_record_still_loads() {
+        let decoded: HelperChannel =
+            serde_json::from_str(LEGACY_HELPER).expect("a record written before the list shape");
+
+        assert_eq!(
+            decoded.transports.len(),
+            1,
+            "the singular `transport` is lifted into a one-element list"
+        );
+        assert_eq!(decoded.transports[0].uri, "https://helper.example/derec");
+        assert_eq!(decoded.channel_id, ChannelId(42));
+        assert_eq!(decoded.status, ChannelStatus::Paired);
+    }
+
+    #[test]
+    fn a_pre_0_0_3_replica_record_still_loads() {
+        let legacy = r#"{
+            "channel_id": 9,
+            "replica_id": 3,
+            "transport": { "uri": "https://member.example/derec", "protocol": 0 },
+            "role": "Source"
+        }"#;
+
+        let decoded: ReplicaMember = serde_json::from_str(legacy).expect("legacy replica row");
+
+        assert_eq!(decoded.transports.len(), 1);
+        assert_eq!(decoded.transports[0].uri, "https://member.example/derec");
+        assert_eq!(decoded.replica_id, ReplicaId(3));
+    }
+
+    /// The loud-failure property the `transport` -> `transports` change was
+    /// made to keep. Defaulting these to an empty list would produce a channel
+    /// that looks paired and can never be reached.
+    #[test]
+    fn a_record_naming_no_endpoint_is_refused() {
+        let no_endpoint = r#"{ "channel_id": 42, "peer_role": "Helper" }"#;
+        let err = serde_json::from_str::<HelperChannel>(no_endpoint)
+            .expect_err("a record with neither spelling must not default to no endpoints");
+        assert!(
+            err.to_string().contains("names no transport endpoint"),
+            "the error has to say what is wrong with the record: {err}"
+        );
+
+        let empty_list = r#"{ "channel_id": 42, "transports": [], "peer_role": "Helper" }"#;
+        let err = serde_json::from_str::<HelperChannel>(empty_list)
+            .expect_err("an explicitly empty list is as unreachable as an absent one");
+        assert!(
+            err.to_string().contains("empty `transports`"),
+            "the error has to distinguish empty from absent: {err}"
+        );
+    }
+
+    /// A record from a build that knew a shape this one does not must not be
+    /// read and written back with the unknown fields silently dropped.
+    #[test]
+    fn a_newer_schema_version_is_refused() {
+        let from_the_future = format!(
+            r#"{{
+                "schema_version": {},
+                "channel_id": 42,
+                "transports": [{{ "uri": "https://helper.example/derec", "protocol": 0 }}],
+                "peer_role": "Helper"
+            }}"#,
+            CHANNEL_RECORD_SCHEMA_VERSION + 1
+        );
+
+        let err = serde_json::from_str::<HelperChannel>(&from_the_future)
+            .expect_err("a future schema version must be refused, not truncated");
+        assert!(
+            err.to_string().contains("understands at most"),
+            "the error has to name the version gap: {err}"
+        );
+    }
+
+    /// Both spellings present is what a careful migration leaves behind — it
+    /// added the list without deleting what it replaced.
+    #[test]
+    fn the_list_wins_when_both_spellings_are_present() {
+        let both = r#"{
+            "channel_id": 42,
+            "transport": { "uri": "https://stale.example/derec", "protocol": 0 },
+            "transports": [
+                { "uri": "https://current.example/derec", "protocol": 0 },
+                { "uri": "grpcs://current.example:443", "protocol": 1 }
+            ],
+            "peer_role": "Helper"
+        }"#;
+
+        let decoded: HelperChannel = serde_json::from_str(both).expect("both spellings present");
+
+        assert_eq!(decoded.transports.len(), 2, "the list is authoritative");
+        assert_eq!(decoded.transports[0].uri, "https://current.example/derec");
+    }
+
+    /// What this build writes, asserted against the serialized text: the
+    /// marker is stamped, the list is the only endpoint spelling emitted, and
+    /// the superseded one is never written back.
+    #[test]
+    fn a_written_record_carries_the_marker_and_only_the_list() {
+        let record = HelperChannel {
+            channel_id: ChannelId(42),
+            transports: vec![endpoint("https://helper.example/derec")],
+            communication_info: std::collections::HashMap::new(),
+            peer_role: derec_proto::SenderKind::Helper,
+            status: ChannelStatus::Paired,
+            created_at: 1_700_000_000,
+        };
+
+        let json: serde_json::Value =
+            serde_json::to_value(&record).expect("a channel record serializes");
+
+        assert_eq!(
+            json["schema_version"],
+            serde_json::json!(CHANNEL_RECORD_SCHEMA_VERSION),
+            "every record this build writes is stamped"
+        );
+        assert!(json["transports"].is_array());
+        assert!(
+            json.get("transport").is_none(),
+            "the pre-0.0.3 spelling is read, never written: {json}"
+        );
+
+        // The exact text, not just the fields: the Go and .NET bridges
+        // rebuild this JSON from their own structs rather than passing the
+        // bytes through, and their encoders are ordered hand-written mirrors
+        // of this one. Asserting the string is what makes a field added here
+        // — or reordered — fail on the Rust side too, instead of only in a
+        // hand-written SDK expectation that nothing cross-checks.
+        assert_eq!(
+            serde_json::to_string(&record).expect("serializes"),
+            r#"{"schema_version":3,"channel_id":42,"transports":[{"uri":"https://helper.example/derec","protocol":0}],"communication_info":{},"peer_role":"Helper","status":"Paired","created_at":1700000000}"#
+        );
+    }
+
+    /// A record written by this build reads back identically, and a record
+    /// upgraded from the legacy shape is indistinguishable from one written
+    /// natively once it has been through a save.
+    #[test]
+    fn an_upgraded_record_is_stable_once_rewritten() {
+        let upgraded: HelperChannel =
+            serde_json::from_str(LEGACY_HELPER).expect("legacy record loads");
+
+        let rewritten = serde_json::to_string(&upgraded).expect("serializes");
+        let reloaded: HelperChannel =
+            serde_json::from_str(&rewritten).expect("its own output reloads");
+
+        assert_eq!(reloaded.transports.len(), upgraded.transports.len());
+        assert_eq!(reloaded.transports[0].uri, upgraded.transports[0].uri);
+        assert_eq!(reloaded.channel_id, upgraded.channel_id);
+        assert_eq!(reloaded.created_at, upgraded.created_at);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&rewritten).unwrap()["schema_version"]
+                == serde_json::json!(CHANNEL_RECORD_SCHEMA_VERSION),
+            "the upgrade is persisted, so the next read needs no lifting"
+        );
+    }
+
+    /// The records travel inside `ChannelRecord`, so the compatibility has to
+    /// survive the enum's tagging rather than only working on the inner type.
+    #[test]
+    fn the_compatibility_survives_the_channel_record_wrapper() {
+        let legacy = format!(r#"{{ "Helper": {LEGACY_HELPER} }}"#);
+
+        let decoded: ChannelRecord =
+            serde_json::from_str(&legacy).expect("a legacy record inside its wrapper");
+
+        match decoded {
+            ChannelRecord::Helper(h) => assert_eq!(h.transports.len(), 1),
+            other => panic!("expected a helper record, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(all(test, feature = "serde"))]

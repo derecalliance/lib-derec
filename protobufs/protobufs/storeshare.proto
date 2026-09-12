@@ -146,16 +146,46 @@ message StoreShareRequestMessage {
   //
   // # Semantics
   //
-  // - Empty (the default): the responder routes to the endpoints stored on
+  // - Absent (the default): the responder routes to the endpoints stored on
   //  its `Channel` record for this `channelId`.
-  // - Non-empty: the responder routes this exchange's response to any one
-  //  of these, in the order given, and leaves the stored endpoints
-  //  unchanged. Delivery to any one is success.
+  // - Present: the responder routes this exchange's response here, and
+  //  leaves the stored endpoints unchanged.
   //
-  // Was a singular field through 0.0.2. A 0.0.2 reader decoding a
-  // multi-entry list merges them and sees only the last, so an
-  // application still talking to one should order accordingly.
-  repeated TransportProtocol replyTo = 8;
+  // Superseded by `replyToTransports`, which carries every endpoint rather
+  // than one. Kept, and still populated with the list's first entry, so
+  // implementations predating that field still receive a reply.
+  // **Scheduled for removal in v0.0.5.**
+  //
+  // **Reading this field directly is now incorrect** for the same reason it
+  // is on `transportProtocol`: it is one entry of a list and may be absent.
+  // Resolve it against `replyToTransports` instead.
+  optional TransportProtocol replyTo = 8 [deprecated = true];
+
+  // Every ephemeral endpoint the requester wants this exchange's response
+  // delivered to, in its own preference order.
+  //
+  // # Semantics
+  //
+  // - Empty, and `replyTo` absent: the responder routes to the endpoints
+  //  stored on its `Channel` record for this `channelId`.
+  // - Empty, `replyTo` present: that one endpoint, which is how every
+  //  implementation predating this field asks.
+  // - Non-empty: the responder routes the response to any one of these, in
+  //  the order given, and leaves the stored endpoints unchanged. Delivery
+  //  to any one is success.
+  //
+  // # Why this is a new field rather than a wider `replyTo`
+  //
+  // `replyTo` was singular through 0.0.2. Re-tagging it `repeated` would
+  // have been wire-compatible in the read direction only: protobuf merges a
+  // repeated submessage into a singular reader field-by-field, so a 0.0.2
+  // peer decoding a multi-entry list sees the **last** entry, while the
+  // first entry is what every other compatibility rule in this release
+  // designates as the legacy-readable one. One list cannot be ordered to
+  // satisfy both. A new tag lets the singular field keep meaning exactly
+  // what it did — the same shape `supportedTransports` (contact.proto tag 9)
+  // uses beside `transportProtocol` (tag 7).
+  repeated TransportProtocol replyToTransports = 10;
 
   // Identity of the replica that authored this update.
   //

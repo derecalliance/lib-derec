@@ -162,13 +162,22 @@ public sealed record SecretValue(SecretKind Kind, byte[] Bytes);
 /// overriding <c>Ids</c>.
 /// </para>
 /// <para>
-/// Apply it in your query — a <c>WHERE</c> clause, a key-condition
-/// expression — instead of transferring rows the caller will discard. That
-/// transfer costs bandwidth everywhere, and on a metered backing that bills by
-/// bytes read it costs money. The library re-applies the filter to whatever
-/// you return before acting on it, so ignoring it is slow rather than wrong.
-/// That is one-way: returning <em>fewer</em> rows than the filter selects is
-/// still wrong, and is not something the library can detect.
+/// <b>Returning everything under the <c>secretId</c> and ignoring the filter is
+/// correct</b>, and the implementation to write unless there is a measured
+/// reason not to. The library re-applies the filter to whatever you return and
+/// drops what it excludes, so a superset is trimmed to the right set before
+/// anything acts on it.
+/// </para>
+/// <para>
+/// Pushing the filter into your query — a <c>WHERE</c> clause, a key-condition
+/// expression — is an optimization you opt into. It saves transferring rows the
+/// caller discards, which costs bandwidth everywhere and real money on a
+/// metered backing that bills by bytes read. It also moves these semantics into
+/// a query language by hand, and the error that matters is asymmetric: the
+/// library's re-check can drop rows but cannot recover one that was never
+/// returned, so a pushdown selecting too <em>few</em> is undetectable at
+/// runtime — no exception, no event, just a share that was never published.
+/// Verify one against <c>library/tests/fixtures/channel_filter.json</c>.
 /// </para>
 /// </remarks>
 /// <param name="Ids">Restrict to these ids. Empty selects every record.</param>
@@ -426,10 +435,134 @@ public interface ITransport
     /// unreachable, is this implementation's choice. Never empty.
     /// </param>
     /// <remarks>
+    /// <para>
     /// Delivery to any one endpoint is success. Throw only when the message
     /// reached none of them.
+    /// </para>
+    /// <para>
+    /// <b>Deliver once.</b> Every entry addresses the same peer, so sending to
+    /// all of them delivers one authenticated message several times. Stop at
+    /// the first success. The protocol's handlers are idempotent, so a
+    /// duplicate does not corrupt state, but it is still a duplicate to
+    /// anything counting messages, and a peer entitled to treat re-delivery as
+    /// a replay will.
+    /// </para>
+    /// <para>
+    /// <b>Prefer an adapter to writing this by hand.</b> Choosing which
+    /// endpoint to dial is yours and stays here; the bookkeeping around it is
+    /// the same everywhere and is already written and tested. Implement
+    /// <see cref="ISendOne"/> and wrap it in <see cref="SequentialFailover"/>.
+    /// Taking <c>endpoints[0]</c> compiles, passes every test, and silently
+    /// gives up the failover the list exists to provide — if that is genuinely
+    /// wanted, say so with <see cref="SingleEndpointTransport"/> rather than by
+    /// indexing.
+    /// </para>
     /// </remarks>
     void Send(IReadOnlyList<TransportProtocol> endpoints, byte[] message);
+}
+
+/// <summary>
+/// Delivers one message to one endpoint.
+/// </summary>
+/// <remarks>
+/// The narrow half of a transport: everything genuinely about dialing, and
+/// nothing about which endpoint to dial. Implement this, then wrap it in
+/// <see cref="SequentialFailover"/> or <see cref="SingleEndpointTransport"/> to
+/// get an <see cref="ITransport"/>.
+/// </remarks>
+public interface ISendOne
+{
+    /// <summary>
+    /// Delivers <paramref name="message"/> to <paramref name="endpoint"/>, or
+    /// throws to report that it did not arrive.
+    /// </summary>
+    /// <remarks>
+    /// The exception type does not matter and need not distinguish
+    /// "unreachable" from "rejected": <see cref="SequentialFailover"/> treats
+    /// both as a reason to try the next endpoint, which is the safe reading.
+    /// Trying an endpoint that would have refused costs a round trip; skipping
+    /// one that would have worked costs the delivery.
+    /// </remarks>
+    void SendOne(TransportProtocol endpoint, byte[] message);
+}
+
+/// <summary>
+/// Tries each endpoint in the order the peer offered; the first success wins.
+/// </summary>
+/// <remarks>
+/// Implements the <see cref="ITransport"/> contract over an
+/// <see cref="ISendOne"/>: endpoints are attempted in order, delivery stops at
+/// the first success, and an exception is thrown only when every endpoint
+/// failed. The message is delivered at most once.
+///
+/// This is the right default. A peer advertising several endpoints is saying
+/// it can be reached at any of them, and the reason 0.0.3 records the whole
+/// list is so one being down does not end the conversation.
+/// </remarks>
+public sealed class SequentialFailover : ITransport
+{
+    private readonly ISendOne _dialer;
+
+    /// <summary>Wraps a one-endpoint dialer.</summary>
+    public SequentialFailover(ISendOne dialer) =>
+        _dialer = dialer ?? throw new ArgumentNullException(nameof(dialer));
+
+    /// <inheritdoc/>
+    public void Send(IReadOnlyList<TransportProtocol> endpoints, byte[] message)
+    {
+        Exception? last = null;
+        foreach (TransportProtocol endpoint in endpoints)
+        {
+            try
+            {
+                _dialer.SendOne(endpoint, message);
+                return;
+            }
+            catch (Exception e)
+            {
+                last = e;
+            }
+        }
+        // `endpoints` is never empty — the library refuses to record a peer
+        // whose endpoints were all filtered away — so reaching here means at
+        // least one attempt was made and `last` is populated.
+        throw last ?? new InvalidOperationException(
+            "Send was called with no endpoints, which the protocol never does");
+    }
+}
+
+/// <summary>
+/// Uses the first endpoint only.
+/// </summary>
+/// <remarks>
+/// Reproduces the pre-0.0.3 behaviour exactly, for an application that
+/// genuinely serves one endpoint or has a reason not to fail over.
+///
+/// It exists so that choosing it is visible. <c>endpoints[0]</c> written inline
+/// looks like an implementation detail and reads as finished; naming this type
+/// records that failover was considered and declined, which is a claim a
+/// reviewer can disagree with. If the peers this application talks to advertise
+/// more than one endpoint, prefer <see cref="SequentialFailover"/> — every
+/// endpoint after the first is reachability being thrown away.
+/// </remarks>
+public sealed class SingleEndpointTransport : ITransport
+{
+    private readonly ISendOne _dialer;
+
+    /// <summary>Wraps a one-endpoint dialer.</summary>
+    public SingleEndpointTransport(ISendOne dialer) =>
+        _dialer = dialer ?? throw new ArgumentNullException(nameof(dialer));
+
+    /// <inheritdoc/>
+    public void Send(IReadOnlyList<TransportProtocol> endpoints, byte[] message)
+    {
+        if (endpoints.Count == 0)
+        {
+            throw new InvalidOperationException(
+                "Send was called with no endpoints, which the protocol never does");
+        }
+        _dialer.SendOne(endpoints[0], message);
+    }
 }
 
 /// <summary>

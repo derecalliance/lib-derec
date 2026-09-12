@@ -225,7 +225,11 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     let envelope = crate::derec_message::apply_trace_id(&resp.envelope, exchange.trace_id)?;
     let endpoints = stores
         .channels
-        .resolve_response_endpoints(local.secret_id, exchange.channel_id, &request.reply_to)
+        .resolve_response_endpoints(
+            local.secret_id,
+            exchange.channel_id,
+            &crate::extensions::advertised_endpoints::reply_to_owned(request),
+        )
         .await?;
     stores.transport.send(&endpoints, envelope).await?;
 
@@ -282,7 +286,7 @@ pub(in crate::protocol) async fn reject<S: StoreSet>(
         MessageBody::GetShareResponse(response),
         exchange.shared_key,
         exchange.trace_id,
-        &request.reply_to,
+        &crate::extensions::advertised_endpoints::reply_to_owned(request),
     )
     .await
 }

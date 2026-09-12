@@ -58,21 +58,24 @@ export type ReplicaRoleName = "Source" | "Destination";
  * Restrictions combine with AND, and `exclude` is applied last, overriding
  * `ids`.
  *
- * Apply it in your query — a `WHERE` clause, a key-condition expression —
- * instead of transferring rows the caller will discard. That transfer costs
- * bandwidth everywhere, and on a metered backing that bills by bytes read it
- * costs money.
+ * **Returning everything under the `secretId` and ignoring the filter is
+ * correct**, and the implementation to write unless there is a measured reason
+ * not to. The library re-applies the filter to whatever you return and drops
+ * what it excludes, so a superset is trimmed before anything acts on it.
  *
- * The library re-applies the filter to whatever this returns before acting on
- * it, so ignoring it is slow, not wrong. That backstop is load-bearing here:
- * TypeScript accepts a function of fewer parameters where more are declared,
- * so a store written before this parameter existed still satisfies the
- * interface and compiles without a diagnostic.
+ * Pushing the filter into your query — a `WHERE` clause, a key-condition
+ * expression — is an optimization you opt into. It saves transferring rows the
+ * caller discards, which costs bandwidth everywhere and real money on a metered
+ * backing that bills by bytes read. Verify one against
+ * `library/tests/fixtures/channel_filter.json`.
  *
- * It is a one-way guarantee, not a validation of your store: dropping rows can
- * enforce an upper bound, but it cannot recover a row you omitted. Returning
- * *fewer* rows than the filter selects is still wrong, and undetectable — the
- * protocol simply fails to act.
+ * The asymmetry is what makes pushdown worth verifying: the re-check can drop
+ * rows but cannot recover one that was never returned, so selecting too *few*
+ * is undetectable at runtime — no exception, no event, just a share that was
+ * never published. That matters most here, because TypeScript accepts a
+ * function of fewer parameters where more are declared: a store written before
+ * this parameter existed still satisfies the interface and compiles clean under
+ * `--strict`, so the type system cannot see the gap either.
  *
  * Ids are decimal strings, like every other `u64` on this bridge.
  */
@@ -119,6 +122,29 @@ export declare function channelFilterMatches(
   role: SenderKindName | ReplicaRoleName,
 ): boolean;
 
+/**
+ * The endpoints a peer-supplied message advertises, in the peer's own order.
+ *
+ * Yields `supported_transports` when it is non-empty, and otherwise the
+ * singular `transport_protocol` — which is how every implementation predating
+ * the offer list advertises, and the reason this is a function rather than a
+ * field read. Reading `transport_protocol` directly is a bug: its meaning
+ * narrowed to "one entry of a list, and possibly absent", so a peer that has
+ * moved past it looks unreachable to a reader that was correct before 0.0.3.
+ *
+ * Reports what was advertised, not what is acceptable — nothing here is
+ * validated, and the protocol still applies its own transport policy to
+ * whatever it records.
+ */
+export declare function advertisedEndpoints(
+  message:
+    | Pick<ContactMessage, "transport_protocol" | "supported_transports">
+    | Pick<PairRequestMessage, "transport_protocol" | "supported_transports">
+    | Pick<PrePairRequestMessage, "transport_protocol" | "supported_transports">
+    | null
+    | undefined,
+): TransportProtocol[];
+
 
 /**
  * Channel-record persistence.
@@ -140,7 +166,7 @@ export declare function channelFilterMatches(
  *
  * `listHelpers` and `listReplicas` are **not** arrays of that union — they
  * return a JSON array of the **inner** records with the tag stripped:
- * `[{ channel_id, transport, ... }, ...]`, `HelperChannel` for the first and
+ * `[{ schema_version, channel_id, transports, ... }, ...]`, `HelperChannel` for the first and
  * `ReplicaMember` for the second. Wrapping each element back in
  * `{ "Helper": ... }` will not decode.
  *
@@ -313,12 +339,73 @@ export interface Transport {
    *
    * Delivery to any one endpoint is success. Reject only when the message
    * reached none of them.
+   *
+   * **Deliver once.** Every entry addresses the same peer, so sending to all
+   * of them delivers one authenticated message several times. Stop at the
+   * first success. The protocol's handlers are idempotent, so a duplicate
+   * does not corrupt state, but it is still a duplicate to anything counting
+   * messages, and a peer entitled to treat re-delivery as a replay will.
+   *
+   * **Prefer an adapter to writing this by hand.** Choosing which endpoint to
+   * dial is yours and stays here; the bookkeeping around it is the same
+   * everywhere and is already written and tested. Write a
+   * {@link SendOne} and wrap it in {@link sequentialFailover}. Taking
+   * `endpoints[0]` type-checks, passes every test, and silently gives up the
+   * failover the list exists to provide — if that is genuinely wanted, say so
+   * with {@link singleEndpointTransport} rather than by indexing.
    */
   send(
     endpoints: ReadonlyArray<{ protocol: string; uri: string }>,
     message: Uint8Array,
   ): Promise<void>;
 }
+
+/**
+ * Delivers one message to one endpoint.
+ *
+ * The narrow half of a transport: everything genuinely about dialing, and
+ * nothing about which endpoint to dial. Pass one of these to
+ * {@link sequentialFailover} or {@link singleEndpointTransport} to get a
+ * {@link Transport}.
+ *
+ * Rejecting means the endpoint did not receive the message. The rejection
+ * reason need not distinguish "unreachable" from "rejected":
+ * {@link sequentialFailover} treats both as a reason to try the next endpoint,
+ * which is the safe reading. Trying an endpoint that would have refused costs
+ * a round trip; skipping one that would have worked costs the delivery.
+ */
+export type SendOne = (
+  endpoint: { protocol: string; uri: string },
+  message: Uint8Array,
+) => Promise<void>;
+
+/**
+ * Builds a {@link Transport} that tries each endpoint in the order the peer
+ * offered it and stops at the first success.
+ *
+ * An error is thrown only when every endpoint failed. The message is delivered
+ * at most once.
+ *
+ * This is the right default. A peer advertising several endpoints is saying it
+ * can be reached at any of them, and the reason 0.0.3 records the whole list is
+ * so one being down does not end the conversation.
+ */
+export declare function sequentialFailover(dialer: SendOne): Transport;
+
+/**
+ * Builds a {@link Transport} that uses the first endpoint only.
+ *
+ * Reproduces the pre-0.0.3 behaviour exactly, for an application that genuinely
+ * serves one endpoint or has a reason not to fail over.
+ *
+ * It exists so that choosing it is visible. `endpoints[0]` written inline looks
+ * like an implementation detail and reads as finished; naming this records that
+ * failover was considered and declined, which is a claim a reviewer can
+ * disagree with. If the peers this application talks to advertise more than one
+ * endpoint, prefer {@link sequentialFailover} — every endpoint after the first
+ * is reachability being thrown away.
+ */
+export declare function singleEndpointTransport(dialer: SendOne): Transport;
 
 export enum SenderKind {
   Owner = 0,
@@ -384,6 +471,13 @@ export interface ContactMessage {
   channel_id: bigint;
   /** `ContactMode` numeric value (0 = INLINE_KEYS, 1 = HASHED_KEYS, 2 = NO_KEYS). */
   contact_mode: number;
+  /**
+   * @deprecated Reading this field directly is incorrect: its meaning narrowed
+   * to "one entry of a list, and possibly absent", so a peer advertising only
+   * `supported_transports` looks unreachable to a reader that was correct
+   * before 0.0.3. Call {@link advertisedEndpoints}, which resolves both
+   * spellings. Removed at 0.0.5.
+   */
   transport_protocol?: TransportProtocol;
   nonce: bigint;
   /** Present only when `contact_mode === ContactMode.InlineKeys`. */
@@ -443,7 +537,13 @@ export interface UpdateChannelInfoParams {
    *  map untouched; pass an empty object to clear it. */
   communication_info?: Record<string, string>;
 
-  /** New transport endpoint. Absent leaves it untouched. */
+  /**
+   * New transport endpoint. Absent leaves it untouched.
+   *
+   * @deprecated Use `own_transports`, which carries every endpoint this node
+   * now serves; its first entry also fills this field for peers predating the
+   * list. Removed at 0.0.5.
+   */
   transport_protocol?: { uri: string; protocol: number };
   /**
    * Every endpoint this node now serves, in its own preference order.
@@ -902,6 +1002,11 @@ export declare class DeRecProtocolBuilder {
   withUserSecretStore(store: UserSecretStore): DeRecProtocolBuilder;
   withStateStore(store: StateStore): DeRecProtocolBuilder;
   withTransport(transport: Transport): DeRecProtocolBuilder;
+  /**
+   * @deprecated Use {@link withOwnTransports}, which takes the whole
+   * preference list — `withOwnTransports([endpoint])` is the direct
+   * replacement. Removed at 0.0.5.
+   */
   withOwnTransport(endpoint: { uri: string; protocol: string }): DeRecProtocolBuilder;
   /**
    * Set every transport endpoint this application serves, in preference
@@ -960,13 +1065,18 @@ export declare class DeRecProtocolBuilder {
    * propagate to peers, and reply to.
    *
    * @deprecated Use {@link withUnsafeConnection}, which names both gated
-   * schemes. Removed at 0.1.0.
+   * schemes. Removed at 0.0.5.
    */
   withUnsafeHttp(allow: boolean): DeRecProtocolBuilder;
   /**
    * Accept plaintext `http://` and `grpc://` transport endpoints.
    * **Development only.** Default: `false`. Supersedes
    * {@link withUnsafeHttp}, which names only the HTTP scheme.
+   *
+   * Either flag alone is honored. Setting both to disagreeing values fails
+   * construction with the error code `CONFLICTING_PLAINTEXT_OPT_IN` rather
+   * than resolving silently, because precedence would hand the decision to
+   * the flag being removed.
    */
   withUnsafeConnection(allow: boolean): DeRecProtocolBuilder;
   /** Default: empty. */
@@ -1089,6 +1199,10 @@ export declare class DeRecProtocol {
    *
    * IMPORTANT: keep the old endpoint operational during the changeover
    * (see the Rust docs on the matching setter for the discipline).
+   *
+   * @deprecated Use {@link setOwnTransports}, which takes the whole
+   * preference list and is the only way to change which protocols this
+   * node serves, or their order. Removed at 0.0.5.
    */
   setOwnTransport(uri: string, protocol: string): void;
 
@@ -1304,6 +1418,13 @@ export interface PairRequestMessage {
   nonce: bigint;
   communication_info?: CommunicationInfo;
   parameter_range?: ParameterRange;
+  /**
+   * @deprecated Reading this field directly is incorrect: its meaning narrowed
+   * to "one entry of a list, and possibly absent", so a peer advertising only
+   * `supported_transports` looks unreachable to a reader that was correct
+   * before 0.0.3. Call {@link advertisedEndpoints}, which resolves both
+   * spellings. Removed at 0.0.5.
+   */
   transport_protocol?: TransportProtocol;
   timestamp?: Timestamp;
   /** Every transport endpoint the initiator can be reached on, in its own
@@ -1330,8 +1451,11 @@ export interface PairResponseMessage {
 export interface PrePairRequestMessage {
   nonce: bigint;
   /**
-   * @deprecated Superseded by `supported_transports`, which carries every
-   * endpoint rather than one. Scheduled for removal in v0.0.5.
+   * @deprecated Reading this field directly is incorrect: its meaning narrowed
+   * to "one entry of a list, and possibly absent", so a peer advertising only
+   * `supported_transports` looks unreachable to a reader that was correct
+   * before 0.0.3. Call {@link advertisedEndpoints}, which resolves both
+   * spellings. Removed at 0.0.5.
    */
   transport_protocol?: TransportProtocol;
   timestamp?: Timestamp;
