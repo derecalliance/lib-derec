@@ -18,13 +18,21 @@ public static partial class Unpairing
             /// Optional response endpoint advertised by the sender on
             /// the inner request. Mirrors the JS bridge surface.
             /// </summary>
-            public TransportProtocol? ReplyTo { get; init; }
+            /// <summary>
+            /// Every endpoint the requester asked to be answered on, in its
+            /// own preference order. Empty means route to the endpoints
+            /// recorded for the channel.
+            /// </summary>
+            public IReadOnlyList<TransportProtocol> ReplyTo { get; init; } =
+                Array.Empty<TransportProtocol>();
         }
 
-        public static DeRecMessage Produce(ulong channelId, string memo, byte[] sharedKey, TransportProtocol? replyTo = null)
+        public static DeRecMessage Produce(ulong channelId, string memo, byte[] sharedKey, IReadOnlyList<TransportProtocol>? replyTo = null)
         {
             byte[] memoBytes = System.Text.Encoding.UTF8.GetBytes(memo ?? string.Empty);
-            byte[]? replyToBytes = replyTo?.ToProtoBytes();
+            byte[]? replyToBytes = replyTo is { Count: > 0 }
+                ? TransportProtocol.ToProtoBytesList(replyTo)
+                : null;
             UIntPtr replyToLen = replyToBytes is null ? UIntPtr.Zero : (UIntPtr)replyToBytes.Length;
 
             Native.Unpairing.ProduceUnpairRequestMessageResult nativeResult =
@@ -74,7 +82,7 @@ public static partial class Unpairing
                 {
                     ChannelId = nativeResult.ChannelId,
                     Memo = memo,
-                    ReplyTo = TransportProtocol.FromProto(inner.ReplyTo),
+                    ReplyTo = TransportProtocol.ResolveReplyTo(inner.ReplyTo, inner.ReplyToTransports),
                 };
             }
             finally

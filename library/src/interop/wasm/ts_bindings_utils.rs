@@ -65,6 +65,11 @@ pub(crate) fn js_error_from_lib(err: crate::Error) -> JsValue {
         .unwrap_or_else(|_| JsValue::from_str("failed to serialize error"))
 }
 
+#[wasm_bindgen(start)]
+pub fn wasm_start() {
+    console_error_panic_hook::set_once();
+}
+
 fn categorize(err: &crate::Error) -> (&'static str, &'static str) {
     match err {
         crate::Error::Pairing(e) => ("pairing", pairing_code(e)),
@@ -85,6 +90,8 @@ fn categorize(err: &crate::Error) -> (&'static str, &'static str) {
         crate::Error::ShareStore(_) => ("share_store", "STORE_ERROR"),
         crate::Error::StateStore(_) => ("state_store", "STORE_ERROR"),
         crate::Error::Transport(_) => ("input", "TRANSPORT_INVALID"),
+        crate::Error::NoUsableEndpoint { .. } => ("input", "NO_USABLE_ENDPOINT"),
+        crate::Error::ConflictingPlaintextOptIn { .. } => ("input", "CONFLICTING_PLAINTEXT_OPT_IN"),
         crate::Error::InvalidInput(_) => ("input", "INVALID_INPUT"),
         crate::Error::ProtobufDecode(_) => ("protobuf", "DECODE_ERROR"),
         crate::Error::ProtobufEncode(_) => ("protobuf", "ENCODE_ERROR"),
@@ -168,9 +175,4 @@ fn unpairing_code(e: &UnpairingError) -> &'static str {
     match e {
         UnpairingError::NonOkStatus { .. } => "NON_OK_STATUS",
     }
-}
-
-#[wasm_bindgen(start)]
-pub fn wasm_start() {
-    console_error_panic_hook::set_once();
 }

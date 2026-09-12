@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use crate::extensions::advertised_endpoints::AdvertisedEndpoints as _;
+use crate::extensions::contact_message::ContactMessageExt as _;
+use crate::extensions::pair_request::PairRequestMessageExt as _;
+use crate::extensions::pre_pair_request::PrePairRequestMessageExt as _;
+use crate::extensions::transport_protocol::TransportProtocolExt as _;
 use crate::primitives::pairing::PairingError;
-use crate::transport::TransportProtocolExt as _;
-use crate::utils::{ContactMessageExt as _, verify_timestamps};
+use crate::utils::verify_timestamps;
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp},
     protocol_version::ProtocolVersion,
@@ -99,9 +103,23 @@ pub struct PrePairExtractResult {
 /// - `secret_key`: `Some(...)` for `InlineKeys` and `HashedKeys` (must be persisted);
 ///   `None` for `NoKeys` (no key material at contact-creation time).
 ///
+/// # Transport ordering
+///
+/// `own` carries every endpoint this application serves, in its own
+/// preference order. The whole list travels in `supported_transports`;
+/// the first entry is additionally copied into the legacy singular
+/// `transport_protocol` field so peers predating the offer list still
+/// find an endpoint to reach.
+///
+/// The order is the application's to choose and is never reinterpreted
+/// here. An application that needs to pair with peers predating gRPC
+/// support puts an HTTPS endpoint first, because those peers understand
+/// no other protocol discriminant.
+///
 /// # Errors
 ///
-/// - [`PairingError::EmptyTransportUri`] if `transport_protocol.uri` is empty.
+/// - [`PairingError::EmptyTransportUri`] if `own` is empty or its first
+///   entry has an empty `uri`.
 /// - [`PairingError::ContactMessageKeygen`] if pairing key generation fails
 ///   (`InlineKeys` / `HashedKeys` only — `NoKeys` skips keygen).
 ///
@@ -118,10 +136,10 @@ pub struct PrePairExtractResult {
 /// } = request::create_contact(
 ///     ChannelId(42),
 ///     ContactMode::InlineKeys,
-///     TransportProtocol {
+///     vec![TransportProtocol {
 ///         uri: "https://relay.example/derec".to_owned(),
 ///         protocol: Protocol::Https.into(),
-///     },
+///     }],
 ///     None,
 /// ).expect("Failed to create contact message");
 ///
@@ -135,10 +153,17 @@ pub struct PrePairExtractResult {
 pub fn create_contact(
     channel_id: ChannelId,
     contact_mode: ContactMode,
-    transport_protocol: TransportProtocol,
+    own: Vec<TransportProtocol>,
     nonce: Option<u64>,
 ) -> Result<CreateContactResult, crate::Error> {
-    if transport_protocol.uri.trim().is_empty() {
+    let primary = own.first().ok_or_else(|| {
+        #[cfg(feature = "logging")]
+        tracing::warn!("no transport protocols supplied");
+
+        crate::Error::from(PairingError::EmptyTransportUri)
+    })?;
+
+    if primary.uri.trim().is_empty() {
         #[cfg(feature = "logging")]
         tracing::warn!("transport URI is empty");
 
@@ -150,16 +175,16 @@ pub fn create_contact(
     let (contact_message, secret_key) = match contact_mode {
         ContactMode::InlineKeys => {
             let (pk, sk) = generate_pairing_keys()?;
-            let msg = ContactMessage::inline_keys(channel_id, nonce, transport_protocol, pk);
+            let msg = ContactMessage::inline_keys(channel_id, nonce, own, pk);
             (msg, Some(PairingSecretKeyMaterial::Initiator(sk)))
         }
         ContactMode::HashedKeys => {
             let (pk, sk) = generate_pairing_keys()?;
-            let msg = ContactMessage::hashed_keys(channel_id, nonce, transport_protocol, &pk);
+            let msg = ContactMessage::hashed_keys(channel_id, nonce, own, &pk);
             (msg, Some(PairingSecretKeyMaterial::Initiator(sk)))
         }
         ContactMode::NoKeys => {
-            let msg = ContactMessage::no_keys(channel_id, nonce, transport_protocol);
+            let msg = ContactMessage::no_keys(channel_id, nonce, own);
             (msg, None)
         }
     };
@@ -243,20 +268,20 @@ pub fn create_contact(
 /// let request::CreateContactResult { contact_message, .. } = request::create_contact(
 ///     ChannelId(42),
 ///     ContactMode::InlineKeys,
-///     TransportProtocol {
+///     vec![TransportProtocol {
 ///         uri: "https://relay.example/initiator".to_owned(),
 ///         protocol: Protocol::Https.into(),
-///     },
+///     }],
 ///     None,
 /// ).expect("create_contact failed");
 ///
 /// // Responder side: build the pairing request envelope from the received contact.
 /// let request::ProduceResult { envelope, .. } = request::produce(
 ///     SenderKind::Helper,
-///     TransportProtocol {
+///     vec![TransportProtocol {
 ///         uri: "https://relay.example/responder".to_owned(),
 ///         protocol: Protocol::Https.into(),
-///     },
+///     }],
 ///     &contact_message,
 ///     None,
 ///     None,
@@ -264,17 +289,33 @@ pub fn create_contact(
 ///
 /// assert!(!envelope.is_empty());
 /// ```
+///
+/// # Transport ordering
+///
+/// `own` carries every endpoint this application serves, in its own
+/// preference order. The whole list travels in `supported_transports`;
+/// the first entry is additionally copied into the legacy singular
+/// `transport_protocol` field so peers predating the offer list still
+/// find an endpoint to reach. The order is never reinterpreted here.
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = contact_message.channel_id, kind = kind as i32))
 )]
+// Compatibility, not oversight — see the `transport` module docs.
+#[allow(deprecated)]
 pub fn produce(
     kind: SenderKind,
-    transport_protocol: TransportProtocol,
+    own: Vec<TransportProtocol>,
     contact_message: &ContactMessage,
     communication_info: Option<CommunicationInfo>,
     parameter_range: Option<derec_proto::ParameterRange>,
 ) -> Result<ProduceResult, crate::Error> {
+    let transport_protocol = own.first().cloned().ok_or_else(|| {
+        #[cfg(feature = "logging")]
+        tracing::warn!("no transport protocols supplied");
+
+        crate::Error::from(PairingError::EmptyTransportUri)
+    })?;
     validate_inputs(
         &transport_protocol,
         contact_message,
@@ -295,6 +336,7 @@ pub fn produce(
         parameter_range,
         transport_protocol: Some(transport_protocol),
         timestamp: Some(timestamp),
+        supported_transports: own,
     };
 
     // Encrypt with the INITIATOR's ECIES public key (from the contact) —
@@ -377,16 +419,28 @@ pub fn produce(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = contact_message.channel_id))
 )]
+// Compatibility, not oversight — see the `transport` module docs.
+#[allow(deprecated)]
 pub fn produce_pre_pair_request(
-    transport_protocol: TransportProtocol,
+    own: Vec<TransportProtocol>,
     contact_message: &ContactMessage,
 ) -> Result<ProducePrePairResult, crate::Error> {
-    validate_pre_pair_inputs(&transport_protocol, contact_message)?;
+    let primary = own.first().ok_or_else(|| {
+        #[cfg(feature = "logging")]
+        tracing::warn!("no transport protocols supplied");
+
+        crate::Error::from(PairingError::EmptyTransportUri)
+    })?;
+    validate_pre_pair_inputs(primary, contact_message)?;
 
     let timestamp = current_timestamp();
     let request = PrePairRequestMessage {
         nonce: contact_message.nonce,
-        transport_protocol: Some(transport_protocol),
+        // The first entry also fills the deprecated singular field so a
+        // responder predating `supportedTransports` still knows where to
+        // reply. Same rule `create_contact` follows.
+        transport_protocol: own.first().cloned(),
+        supported_transports: own,
         timestamp: Some(timestamp),
     };
 
@@ -474,20 +528,20 @@ pub fn produce_pre_pair_request(
 /// } = request::create_contact(
 ///     ChannelId(42),
 ///     ContactMode::InlineKeys,
-///     TransportProtocol {
+///     vec![TransportProtocol {
 ///         uri: "https://relay.example/initiator".to_owned(),
 ///         protocol: Protocol::Https.into(),
-///     },
+///     }],
 ///     None,
 /// ).expect("create_contact failed");
 ///
 /// // Responder: build the pairing request envelope.
 /// let request::ProduceResult { envelope, .. } = request::produce(
 ///     SenderKind::Helper,
-///     TransportProtocol {
+///     vec![TransportProtocol {
 ///         uri: "https://relay.example/responder".to_owned(),
 ///         protocol: Protocol::Https.into(),
-///     },
+///     }],
 ///     &contact_message,
 ///     None,
 ///     None,
@@ -504,6 +558,8 @@ pub fn produce_pre_pair_request(
     feature = "logging",
     tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
 )]
+// Compatibility, not oversight — see the `transport` module docs.
+#[allow(deprecated)]
 pub fn extract(
     envelope_bytes: &[u8],
     ecies_secret_key: &[u8],
@@ -529,6 +585,17 @@ pub fn extract(
     };
 
     verify_timestamps(envelope.timestamp, request.timestamp)?;
+
+    // Structural validation at the parse boundary, so a malformed request is
+    // refused where it enters rather than wherever it is first read. This is
+    // the same check `response::produce` runs; applying it here means the FFI
+    // and every SDK above it inherit it without repeating the logic.
+    //
+    // Endpoint *quality* is deliberately not decided here: a peer may
+    // advertise several, and `TransportPolicy::admit_peer_endpoints` skips a
+    // bad one rather than refusing the whole request. Only the singular
+    // legacy field is structurally checked, exactly as before.
+    request.validate()?;
 
     if let Some(tp) = request.transport_protocol.as_ref() {
         tp.validate()?;
@@ -602,9 +669,7 @@ pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, c
 
     verify_timestamps(envelope.timestamp, request.timestamp)?;
 
-    if let Some(tp) = request.transport_protocol.as_ref() {
-        tp.validate()?;
-    }
+    request.validate()?;
 
     #[cfg(feature = "logging")]
     tracing::info!("PrePair request envelope decoded and validated");
@@ -612,6 +677,8 @@ pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, c
     Ok(PrePairExtractResult { request })
 }
 
+// Compatibility, not oversight — see the `transport` module docs.
+#[allow(deprecated)]
 fn validate_inputs(
     transport_protocol: &TransportProtocol,
     contact_message: &ContactMessage,
@@ -625,23 +692,25 @@ fn validate_inputs(
     }
     transport_protocol.validate()?;
 
+    // `validate` already refused a contact naming no endpoint at all, in
+    // either spelling. What remains is checking that what it does name is
+    // structurally sound.
     super::validate_contact_for_mode(contact_message, expected_mode)?;
 
-    let initiator_tp =
-        contact_message
-            .transport_protocol
-            .as_ref()
-            .ok_or(PairingError::InvalidContactMessage(
-                "transport_protocol is missing",
-            ))?;
+    // Read whichever spelling the contact used. A contact carrying only
+    // `supportedTransports` is valid: requiring the deprecated singular
+    // field would refuse a peer that has already moved past it.
+    for endpoint in contact_message.advertised_endpoints() {
+        if endpoint.uri.trim().is_empty() {
+            #[cfg(feature = "logging")]
+            tracing::warn!("contact message advertises an empty transport uri");
 
-    if initiator_tp.uri.trim().is_empty() {
-        #[cfg(feature = "logging")]
-        tracing::warn!("contact message transport_protocol.uri is empty");
-
-        return Err(PairingError::InvalidContactMessage("transport_protocol.uri is empty").into());
+            return Err(
+                PairingError::InvalidContactMessage("transport_protocol.uri is empty").into(),
+            );
+        }
+        endpoint.validate()?;
     }
-    initiator_tp.validate()?;
 
     Ok(())
 }

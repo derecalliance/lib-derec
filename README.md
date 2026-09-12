@@ -130,6 +130,7 @@ ProtectSecret, Discovery, Recovery, replica secret sync) across every SDK:
   and an Android emulator, including the orchestrator. Run with
   `smoke-tests/react-native/run_test.sh` (booted devices are not required; it starts them).
 - `smoke-tests/go` — Go purego (no cgo) tests against the C ABI, including the orchestrator. `cd smoke-tests/go && go run .`.
+- `smoke-tests/grpc` — Reference gRPC transport. The library defines the `DeRecTransport` gRPC service contract but never implements it or opens a socket; this crate is a worked, no-binding implementation of that seam. Run with `cargo run -p derec-grpc-transport-smoke-test`.
 
 Two reference storage backends implementing all six store traits over a real
 database also live here and run the full protocol suite:

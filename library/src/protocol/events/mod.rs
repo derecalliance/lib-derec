@@ -295,6 +295,27 @@ impl PendingAction {
             PendingAction::UpdateChannelInfo { .. } => PendingActionKind::UpdateChannelInfo,
         }
     }
+
+    /// The token of the exchange that raised this action.
+    ///
+    /// Every variant carries one: an action only exists because a request
+    /// arrived, and the response the application's decision produces echoes
+    /// the same token. Reading it uniformly is what lets
+    /// [`accept`](super::DeRecProtocol::accept) and
+    /// [`reject`](super::DeRecProtocol::reject) attribute their work to that
+    /// exchange without matching on the variant.
+    pub fn trace_id(&self) -> u64 {
+        match self {
+            PendingAction::Pairing { trace_id, .. }
+            | PendingAction::PrePair { trace_id, .. }
+            | PendingAction::StoreShare { trace_id, .. }
+            | PendingAction::VerifyShare { trace_id, .. }
+            | PendingAction::Discovery { trace_id, .. }
+            | PendingAction::GetShare { trace_id, .. }
+            | PendingAction::Unpair { trace_id, .. }
+            | PendingAction::UpdateChannelInfo { trace_id, .. } => *trace_id,
+        }
+    }
 }
 
 /// Describes an outbound protocol flow to initiate via [`super::DeRecProtocol::start`].
@@ -346,6 +367,16 @@ pub enum DeRecFlow {
         description: Option<String>,
     },
     VerifyShares {
+        /// Must equal this instance's own `secret_id`.
+        ///
+        /// Verification challenges the helpers holding *this* device's
+        /// shares, so there is no other secret it could address. Passing a
+        /// different id is refused with [`crate::Error::InvalidInput`] rather
+        /// than ignored — a caller that believed it was verifying another
+        /// secret would otherwise be told the wrong thing succeeded.
+        ///
+        /// Contrast [`Self::RecoverSecret`], whose `secret_id` genuinely
+        /// names another instance's secret.
         secret_id: u64,
         version: u32,
         target: Target,
@@ -368,9 +399,9 @@ pub enum DeRecFlow {
     ///
     /// Nothing triggers this automatically: the library provides the
     /// mechanism and the application chooses when to run it (a user action, a
-    /// timer, app start). Concludes with [`DeRecEvent::SyncCheckComplete`],
+    /// timer, app start). Concludes with [`DeRecEvent::ReplicaDiscoveryComplete`],
     /// plus the usual hydration event when a fetch actually happened.
-    SyncCheck,
+    ReplicaDiscovery,
     /// Remove a member from the replica group.
     ///
     /// **Replica-only.** `replica_id` names the member being removed — as a
@@ -401,7 +432,7 @@ pub enum DeRecFlow {
     /// a newer roster excluding it. Absence alone never destroys a copy of the
     /// secret — a publisher that silently omitted a member would otherwise
     /// destroy that member's state instead of merely forgetting it.
-    RemoveReplica {
+    UnpairReplica {
         replica_id: u64,
         memo: Option<String>,
     },
@@ -442,8 +473,12 @@ pub enum DeRecFlow {
         /// Updated communication info. `None` leaves the peer's stored map
         /// untouched; `Some(_)` replaces it (an empty `HashMap` clears it).
         communication_info: Option<std::collections::HashMap<String, String>>,
-        /// Updated transport endpoint. `None` leaves it untouched.
-        transport_protocol: Option<TransportProtocol>,
+        /// Every endpoint this device can now be reached on, in its own
+        /// preference order. Empty leaves the peer's stored set untouched;
+        /// non-empty replaces it outright. The first entry also fills the
+        /// deprecated singular `transportProtocol` so a peer predating
+        /// `supportedTransports` still learns the new address.
+        own_transports: Vec<TransportProtocol>,
     },
 }
 
@@ -710,7 +745,7 @@ pub enum DeRecEvent {
     /// when no member answered. `fetched_from` names the member the state was
     /// pulled from, and is `None` when this device was already current — in
     /// which case no hydration event follows.
-    SyncCheckComplete {
+    ReplicaDiscoveryComplete {
         /// The version this device held when the check started.
         local_version: u32,
         /// The newest version any member reported.
@@ -991,6 +1026,12 @@ pub enum DeRecEvent {
     /// — no `PairingStarted` is emitted.
     PairingStarted {
         channel_id: ChannelId,
+        /// Correlates this request with the response it will draw, and with
+        /// every other request this same [`DeRecProtocol::start`](super::DeRecProtocol::start)
+        /// call dispatched. One token is drawn per round, so a fan-out shares
+        /// it across all of its targets.
+        trace_id: u64,
+
         /// The local party's role in the pairing (same value that will
         /// appear on [`Self::PairingCompleted::kind`]; the channel record
         /// persists its inverse as
@@ -1001,7 +1042,14 @@ pub enum DeRecEvent {
     /// A discovery request was dispatched to `channel_id`. Emitted per
     /// targeted channel by [`super::DeRecProtocol::start`]. Followed by
     /// [`Self::SecretsDiscovered`] once the helper responds.
-    DiscoveryStarted { channel_id: ChannelId },
+    DiscoveryStarted {
+        channel_id: ChannelId,
+        /// Correlates this request with the response it will draw, and with
+        /// every other request this same [`DeRecProtocol::start`](super::DeRecProtocol::start)
+        /// call dispatched. One token is drawn per round, so a fan-out shares
+        /// it across all of its targets.
+        trace_id: u64,
+    },
 
     /// A discovery request could not be dispatched to `channel_id`.
     /// Emitted per targeted channel by [`super::DeRecProtocol::start`]
@@ -1023,7 +1071,15 @@ pub enum DeRecEvent {
     /// would yield indistinguishable duplicates. Members report through
     /// [`Self::ReplicaSyncFailed`] at dispatch and
     /// [`Self::ReplicaSyncComplete`] at the end, both keyed by `replica_id`.
-    ProtectSecretStarted { channel_id: ChannelId, version: u32 },
+    ProtectSecretStarted {
+        channel_id: ChannelId,
+        version: u32,
+        /// Correlates this request with the response it will draw, and with
+        /// every other request this same [`DeRecProtocol::start`](super::DeRecProtocol::start)
+        /// call dispatched. One token is drawn per round, so a fan-out shares
+        /// it across all of its targets.
+        trace_id: u64,
+    },
 
     /// A share-storage request could not be dispatched to `channel_id`
     /// for `version`. Remaining fan-out targets are unaffected.
@@ -1036,7 +1092,15 @@ pub enum DeRecEvent {
     /// A verify-share challenge was dispatched to `channel_id` for
     /// `version`. Followed by [`Self::ShareVerified`] once the helper
     /// responds.
-    VerifySharesStarted { channel_id: ChannelId, version: u32 },
+    VerifySharesStarted {
+        channel_id: ChannelId,
+        version: u32,
+        /// Correlates this request with the response it will draw, and with
+        /// every other request this same [`DeRecProtocol::start`](super::DeRecProtocol::start)
+        /// call dispatched. One token is drawn per round, so a fan-out shares
+        /// it across all of its targets.
+        trace_id: u64,
+    },
 
     /// A verify-share challenge could not be dispatched to `channel_id`
     /// for `version`.
@@ -1050,7 +1114,15 @@ pub enum DeRecEvent {
     /// `version`. Followed by [`Self::RecoveryShareReceived`] /
     /// [`Self::RecoveryShareError`] / [`Self::SecretRecovered`] as
     /// helper responses arrive.
-    RecoverSecretStarted { channel_id: ChannelId, version: u32 },
+    RecoverSecretStarted {
+        channel_id: ChannelId,
+        version: u32,
+        /// Correlates this request with the response it will draw, and with
+        /// every other request this same [`DeRecProtocol::start`](super::DeRecProtocol::start)
+        /// call dispatched. One token is drawn per round, so a fan-out shares
+        /// it across all of its targets.
+        trace_id: u64,
+    },
 
     /// A recovery share request could not be dispatched to `channel_id`
     /// for `version`.
@@ -1077,14 +1149,30 @@ pub enum DeRecEvent {
     /// [`Self::Unpaired`] once the peer acknowledges (or, under
     /// [`UnpairAck::NotRequired`], emitted in the same event vec
     /// immediately after `UnpairStarted`).
-    UnpairStarted { channel_id: ChannelId },
+    UnpairStarted {
+        channel_id: ChannelId,
+        /// Correlates this request with the response it will draw, and with
+        /// every other request this same [`DeRecProtocol::start`](super::DeRecProtocol::start)
+        /// call dispatched. One token is drawn per round, so a fan-out shares
+        /// it across all of its targets.
+        trace_id: u64,
+    },
 
     /// An update-channel-info request was dispatched to `channel_id`.
     /// Followed by [`Self::ChannelInfoUpdated`] once the peer responds.
-    UpdateChannelInfoStarted { channel_id: ChannelId },
+    UpdateChannelInfoStarted {
+        channel_id: ChannelId,
+        /// Correlates this request with the response it will draw, and with
+        /// every other request this same [`DeRecProtocol::start`](super::DeRecProtocol::start)
+        /// call dispatched. One token is drawn per round, so a fan-out shares
+        /// it across all of its targets.
+        trace_id: u64,
+    },
 
-    /// An update-channel-info request could not be dispatched to
-    /// `channel_id`.
+    /// An update-channel-info exchange failed for `channel_id`: either an
+    /// outbound request could not be dispatched, or an inbound request
+    /// announcing an unservable transport switch was refused (see
+    /// [`crate::Error::NoUsableEndpoint`]).
     UpdateChannelInfoFailed {
         channel_id: ChannelId,
         error: String,

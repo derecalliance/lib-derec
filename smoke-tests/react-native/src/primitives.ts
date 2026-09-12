@@ -210,13 +210,13 @@ export function runPrimitivesSmoke(): void {
   const contact = primitives.pairing.request.create_contact(
     pairingChannelId,
     ContactMode.InlineKeys,
-    { protocol: 0, uri: "https://example.com/alice" },
+    [{ protocol: 0, uri: "https://example.com/alice" }],
   );
 
   // Responder (Helper) produces a pairing request from the contact.
   const pairingRequest = primitives.pairing.request.produce(
     SenderKind.Helper,
-    { protocol: 0, uri: "https://example.com/helper" },
+    [{ protocol: 0, uri: "https://example.com/helper" }],
     contact.contact_message,
     null,
     null,
@@ -269,7 +269,7 @@ export function runPrimitivesSmoke(): void {
   const hkContact = primitives.pairing.request.create_contact(
     hashedKeysChannelId,
     ContactMode.HashedKeys,
-    { protocol: 0, uri: "https://example.com/alice/ephemeral" },
+    [{ protocol: 0, uri: "https://example.com/alice/ephemeral" }],
   );
 
   if (hkContact.contact_message.contact_mode !== ContactMode.HashedKeys) {
@@ -290,7 +290,7 @@ export function runPrimitivesSmoke(): void {
 
   // Bob (the scanner) sends a plaintext PrePair request asking for the keys.
   const prePairRequestEnvelope = primitives.pairing.request.produce_pre_pair(
-    { protocol: 0, uri: "https://example.com/helper/ephemeral" },
+    [{ protocol: 0, uri: "https://example.com/helper/ephemeral" }],
     hkContact.contact_message,
   );
 
@@ -335,7 +335,7 @@ export function runPrimitivesSmoke(): void {
 
   const hkPairingRequest = primitives.pairing.request.produce(
     SenderKind.Helper,
-    { protocol: 0, uri: "https://example.com/helper" },
+    [{ protocol: 0, uri: "https://example.com/helper" }],
     filledInContact,
     null,
     null,

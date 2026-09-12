@@ -13,10 +13,12 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"strconv"
 	"sync"
 
+	"github.com/derecalliance/lib-derec/packages/go/derec"
 	"github.com/derecalliance/lib-derec/packages/go/derecpb"
 	"github.com/derecalliance/lib-derec/packages/go/protocol"
 )
@@ -90,24 +92,24 @@ func (s *memChannelStore) Remove(secretID, channelID, replicaID uint64) (bool, e
 	return existed, nil
 }
 
-func (s *memChannelStore) ListHelpers(secretID uint64) ([]protocol.HelperChannel, error) {
+func (s *memChannelStore) ListHelpers(secretID uint64, filter protocol.HelperFilter) ([]protocol.HelperChannel, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []protocol.HelperChannel
 	for key, h := range s.helpers {
-		if key[0] == secretID {
+		if key[0] == secretID && filter.Matches(h.ChannelID, h.Status, h.PeerRole) {
 			out = append(out, h)
 		}
 	}
 	return out, nil
 }
 
-func (s *memChannelStore) ListReplicas(secretID uint64) ([]protocol.ReplicaMember, error) {
+func (s *memChannelStore) ListReplicas(secretID uint64, filter protocol.ReplicaFilter) ([]protocol.ReplicaMember, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []protocol.ReplicaMember
 	for key, m := range s.members {
-		if key[0] == secretID {
+		if key[0] == secretID && filter.Matches(m.ReplicaID, m.Status, m.Role) {
 			out = append(out, m)
 		}
 	}
@@ -385,6 +387,10 @@ type outboxEntry struct {
 
 // memTransport buffers outbound (uri, message) pairs instead of performing
 // network I/O: Send appends to the outbox, drain retrieves and clears it.
+//
+// The library hands over every endpoint the peer advertised, filtered but
+// unranked, and delivery to any one of them is success. A real transport
+// would try them in order and fall back; buffering the first is enough here.
 type memTransport struct {
 	mu     sync.Mutex
 	outbox []outboxEntry
@@ -394,10 +400,13 @@ func newMemTransport() *memTransport {
 	return &memTransport{}
 }
 
-func (t *memTransport) Send(uri string, _ int32, message []byte) error {
+func (t *memTransport) Send(endpoints []protocol.Endpoint, message []byte) error {
+	if len(endpoints) == 0 {
+		return errors.New("transport: send called with no endpoints")
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.outbox = append(t.outbox, outboxEntry{uri: uri, message: append([]byte(nil), message...)})
+	t.outbox = append(t.outbox, outboxEntry{uri: endpoints[0].URI, message: append([]byte(nil), message...)})
 	return nil
 }
 
@@ -888,7 +897,7 @@ func runUnsafeHTTP() {
 			OwnTransportProtocol: int32(derecpb.Protocol_HTTPS),
 			Threshold:            2,
 			KeepVersionsCount:    3,
-			UnsafeHTTP:           allow,
+			UnsafeHTTP:           &allow,
 		}
 		p, err := protocol.New(
 			newMemChannelStore(), newMemShareStore(), newMemSecretStore(),
@@ -917,4 +926,102 @@ func runUnsafeHTTP() {
 	fmt.Println("  LAN http accepted with unsafe_http=true  ✓")
 
 	fmt.Println("Protocol unsafe_http config test passed.")
+}
+
+// runConfigSurface exercises the config knobs and validation rules an
+// application reaches through the Go SDK, each of which crosses the FFI as a
+// JSON field. A mismatch between this shim's field names and the Rust
+// ProtocolConfig would silently drop the setting rather than fail, so each
+// assertion here is checking that the value actually arrived.
+func runConfigSurface() {
+	fmt.Println("=== Protocol config surface test ===")
+
+	base := func() protocol.Config {
+		return protocol.Config{
+			SecretID:             protocolSecretID,
+			OwnTransportURI:      "https://owner.example.com",
+			OwnTransportProtocol: int32(derecpb.Protocol_HTTPS),
+			Threshold:            2,
+			KeepVersionsCount:    3,
+		}
+	}
+	build := func(cfg protocol.Config) (*protocol.DeRecProtocol, error) {
+		return protocol.New(
+			newMemChannelStore(), newMemShareStore(), newMemSecretStore(),
+			newMemUserSecretStore(), newMemStateStore(), newMemTransport(), cfg,
+		)
+	}
+
+	// ParameterRange reaches the library. Bounds that cannot intersect any
+	// peer range would still build — this only proves the field is carried,
+	// which is what was missing before it existed in the FFI config.
+	cfg := base()
+	cfg.ParameterRange = &protocol.ParameterRange{
+		MinShareSize:                1,
+		MaxShareSize:                1 << 20,
+		MinTimeBetweenVerifications: 1,
+		MaxTimeBetweenVerifications: 3600,
+	}
+	p, err := build(cfg)
+	must(err, "build with ParameterRange")
+	p.Close()
+	fmt.Println("  ParameterRange accepted by the FFI config  ✓")
+
+	// A device serves at most one endpoint per protocol: two HTTPS entries
+	// contradict rather than extend, so the set is refused even though each
+	// entry is individually well-formed.
+	cfg = base()
+	cfg.OwnTransports = []protocol.TransportProtocolParam{
+		{URI: "https://a.example", Protocol: int32(derecpb.Protocol_HTTPS)},
+		{URI: "https://b.example", Protocol: int32(derecpb.Protocol_HTTPS)},
+	}
+	if _, err := build(cfg); err == nil {
+		panic("two endpoints of one protocol must be refused — " +
+			"the one-per-protocol rule is not reaching the library")
+	}
+	fmt.Println("  two endpoints of one protocol refused  ✓")
+
+	// Distinct protocols are what the list is for.
+	cfg = base()
+	cfg.OwnTransports = []protocol.TransportProtocolParam{
+		{URI: "https://a.example", Protocol: int32(derecpb.Protocol_HTTPS)},
+		{URI: "grpcs://a.example:443", Protocol: int32(derecpb.Protocol_GRPC)},
+	}
+	p, err = build(cfg)
+	must(err, "build with one endpoint per protocol")
+	fmt.Println("  distinct protocols accepted  ✓")
+
+	// SetOwnTransport re-points one protocol and leaves the other alone;
+	// SetOwnTransports replaces the whole set. Both are refused the same way
+	// the builder is when they would produce a duplicate.
+	must(p.SetOwnTransport("https://moved.example", int32(derecpb.Protocol_HTTPS)),
+		"SetOwnTransport re-points HTTPS")
+	fmt.Println("  SetOwnTransport re-points a single protocol  ✓")
+
+	must(p.SetOwnTransports([]protocol.TransportProtocolParam{
+		{URI: "https://only.example", Protocol: int32(derecpb.Protocol_HTTPS)},
+	}), "SetOwnTransports replaces the set")
+	fmt.Println("  SetOwnTransports replaces the whole set  ✓")
+
+	if err := p.SetOwnTransports([]protocol.TransportProtocolParam{
+		{URI: "https://a.example", Protocol: int32(derecpb.Protocol_HTTPS)},
+		{URI: "https://b.example", Protocol: int32(derecpb.Protocol_HTTPS)},
+	}); err == nil {
+		panic("SetOwnTransports must apply the same one-per-protocol rule as the builder")
+	}
+	fmt.Println("  SetOwnTransports refuses a duplicate protocol  ✓")
+	p.Close()
+
+	// The error constants are a mirror of the Rust DEREC_CODE_* values.
+	// Drift here means an application branching on a code would take the
+	// wrong branch, which no other test would catch.
+	assertTrue(derec.CodeReplicaIDConflict == 16,
+		"CodeReplicaIDConflict must be 16, got %d", derec.CodeReplicaIDConflict)
+	assertTrue(derec.CodeNoUsableEndpoint == 121,
+		"CodeNoUsableEndpoint must be 121, got %d", derec.CodeNoUsableEndpoint)
+	assertTrue(derec.CategoryStateStore == 15,
+		"CategoryStateStore must be 15, got %d", derec.CategoryStateStore)
+	fmt.Println("  error code/category values match the FFI  ✓")
+
+	fmt.Println("Protocol config surface test passed.")
 }

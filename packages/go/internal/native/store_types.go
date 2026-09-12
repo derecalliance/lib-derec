@@ -6,6 +6,7 @@ package native
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 )
 
 // HelperChannel is a channel to a single helper, or to the owner from a
@@ -17,7 +18,10 @@ import (
 // row for the same channel carries SenderKindOwner.
 type HelperChannel struct {
 	ChannelID         uint64
-	Transport         TransportEndpoint
+	// Transports are every endpoint the peer advertised, in the order it
+	// offered them. The library does not rank them; a Transport
+	// implementation chooses which to dial and may fall back.
+	Transports        []TransportEndpoint
 	CommunicationInfo map[string]string
 	PeerRole          SenderKind
 	Status            ChannelStatus
@@ -32,7 +36,10 @@ type HelperChannel struct {
 type ReplicaMember struct {
 	ChannelID         uint64
 	ReplicaID         uint64
-	Transport         TransportEndpoint
+	// Transports are every endpoint the peer advertised, in the order it
+	// offered them. The library does not rank them; a Transport
+	// implementation chooses which to dial and may fall back.
+	Transports        []TransportEndpoint
 	CommunicationInfo map[string]string
 	Role              ReplicaRole
 	Status            ChannelStatus
@@ -312,9 +319,9 @@ const (
 	// StateKindSharingRound is the active sharing round, at most one row
 	// per secretID.
 	StateKindSharingRound StateKind = 3
-	// StateKindPendingSyncCheck is an active replica catch-up, at most one
+	// StateKindPendingReplicaDiscovery is an active replica catch-up, at most one
 	// row per secretID. Holds the versions members have reported so far.
-	StateKindPendingSyncCheck StateKind = 4
+	StateKindPendingReplicaDiscovery StateKind = 4
 )
 
 // StateKey selects one row inside a StateKind under a secretID. Which
@@ -411,4 +418,187 @@ type UserSecrets struct {
 	Version     uint32
 	Secrets     []UserSecret
 	Description *string
+}
+
+// ChannelFilter narrows a listing from ChannelStore.
+//
+// Every field is a restriction, and every field's zero value means "do not
+// restrict on this" — a zero ChannelFilter selects everything. Restrictions
+// combine with AND, and Exclude is applied last, overriding IDs.
+//
+// Apply it in your query — a WHERE clause, a key-condition expression —
+// instead of transferring rows the caller will discard. That transfer costs
+// bandwidth everywhere, and on a metered backing that bills by bytes read it
+// costs money. The library re-applies the filter to whatever you return before
+// acting on it, so ignoring it is slow rather than wrong. That is one-way:
+// returning fewer rows than the filter selects is still wrong, and is not
+// something the library can detect.
+//
+// Role is a pointer so that "any role" (nil) is distinguishable from the
+// zero-valued role, which is a real variant.
+type ChannelFilter struct {
+	// IDs restricts to these ids. Empty selects every record.
+	//
+	// Decoded from decimal strings on the wire — see the UnmarshalJSON
+	// methods below — though callers see ordinary uint64s.
+	IDs []uint64 `json:"ids"`
+	// Status restricts to these statuses. Empty selects any status.
+	Status []ChannelStatus `json:"status"`
+	// Exclude omits these ids, applied after IDs. Empty omits nothing.
+	Exclude []uint64 `json:"exclude"`
+}
+
+// HelperFilter narrows ChannelStore.ListHelpers. IDs are HelperChannel.ChannelID
+// and Role is the peer's HelperChannel.PeerRole.
+type HelperFilter struct {
+	ChannelFilter
+	// Role restricts to this peer role. nil selects any role.
+	Role *SenderKind `json:"role"`
+}
+
+// ReplicaFilter narrows ChannelStore.ListReplicas. IDs are
+// ReplicaMember.ReplicaID and Role is ReplicaMember.Role.
+type ReplicaFilter struct {
+	ChannelFilter
+	// Role restricts to this role. nil selects any role.
+	Role *ReplicaRole `json:"role"`
+}
+
+// matches reports whether the id and status survive the id, status and
+// exclude restrictions. Role is checked by the caller, which knows its type.
+func (f ChannelFilter) matches(id uint64, status ChannelStatus) bool {
+	if len(f.IDs) > 0 && !containsUint64(f.IDs, id) {
+		return false
+	}
+	if len(f.Status) > 0 && !containsStatus(f.Status, status) {
+		return false
+	}
+	return !containsUint64(f.Exclude, id)
+}
+
+// Matches reports whether a channel with these attributes survives the filter.
+//
+// A store whose backing cannot express the restrictions as a query can list
+// and call this, which is correct but transfers the rows the filter was meant
+// to leave behind.
+func (f HelperFilter) Matches(channelID uint64, status ChannelStatus, role SenderKind) bool {
+	if f.Role != nil && *f.Role != role {
+		return false
+	}
+	return f.ChannelFilter.matches(channelID, status)
+}
+
+// Matches reports whether a member with these attributes survives the filter.
+// See HelperFilter.Matches.
+func (f ReplicaFilter) Matches(replicaID uint64, status ChannelStatus, role ReplicaRole) bool {
+	if f.Role != nil && *f.Role != role {
+		return false
+	}
+	return f.ChannelFilter.matches(replicaID, status)
+}
+
+func containsUint64(haystack []uint64, needle uint64) bool {
+	for _, v := range haystack {
+		if v == needle {
+			return true
+		}
+	}
+	return false
+}
+
+func containsStatus(haystack []ChannelStatus, needle ChannelStatus) bool {
+	for _, v := range haystack {
+		if v == needle {
+			return true
+		}
+	}
+	return false
+}
+
+// filterWire is the shape the core actually sends.
+//
+// Ids cross as decimal strings rather than JSON numbers because the same
+// payload reaches the React Native bridge, where JavaScript's JSON.parse
+// cannot hold a u64: an id above 2^53 is silently rounded, and a by-id filter
+// then matches nothing. See `encode_filter` in
+// `library/src/interop/ffi/protocol/stores.rs`.
+type filterWire struct {
+	IDs     []string        `json:"ids"`
+	Status  []ChannelStatus `json:"status"`
+	Role    json.RawMessage `json:"role"`
+	Exclude []string        `json:"exclude"`
+}
+
+func parseFilterIDs(raw []string) ([]uint64, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	out := make([]uint64, 0, len(raw))
+	for _, s := range raw {
+		v, err := strconv.ParseUint(s, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("channel filter id %q is not a decimal u64: %w", s, err)
+		}
+		out = append(out, v)
+	}
+	return out, nil
+}
+
+func (w filterWire) into(f *ChannelFilter) error {
+	ids, err := parseFilterIDs(w.IDs)
+	if err != nil {
+		return err
+	}
+	exclude, err := parseFilterIDs(w.Exclude)
+	if err != nil {
+		return err
+	}
+	f.IDs = ids
+	f.Status = w.Status
+	f.Exclude = exclude
+	return nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+//
+// Declared on HelperFilter rather than on the embedded ChannelFilter: an
+// embedded implementation is promoted to the outer type, so it would be used
+// for the whole struct and Role would never decode.
+func (f *HelperFilter) UnmarshalJSON(data []byte) error {
+	var w filterWire
+	if err := json.Unmarshal(data, &w); err != nil {
+		return err
+	}
+	if err := w.into(&f.ChannelFilter); err != nil {
+		return err
+	}
+	f.Role = nil
+	if len(w.Role) > 0 && string(w.Role) != "null" {
+		var role SenderKind
+		if err := json.Unmarshal(w.Role, &role); err != nil {
+			return err
+		}
+		f.Role = &role
+	}
+	return nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler. See HelperFilter.UnmarshalJSON.
+func (f *ReplicaFilter) UnmarshalJSON(data []byte) error {
+	var w filterWire
+	if err := json.Unmarshal(data, &w); err != nil {
+		return err
+	}
+	if err := w.into(&f.ChannelFilter); err != nil {
+		return err
+	}
+	f.Role = nil
+	if len(w.Role) > 0 && string(w.Role) != "null" {
+		var role ReplicaRole
+		if err := json.Unmarshal(w.Role, &role); err != nil {
+			return err
+		}
+		f.Role = &role
+	}
+	return nil
 }

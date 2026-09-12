@@ -13,13 +13,14 @@ import type {
   DeRecEvent,
   DiscoveryParams,
   PairingParams,
+  ParameterRange,
   ProtectSecretParams,
   RecoverSecretParams,
-  RemoveReplicaParams,
+  UnpairReplicaParams,
   SecretStore,
   ShareStore,
   StateStore,
-  SyncCheckParams,
+  ReplicaDiscoveryParams,
   Target,
   Timeouts,
   Transport,
@@ -86,12 +87,14 @@ function decodeEvents(buffer: ArrayBuffer): DeRecEvent[] {
  * against does not carry this enum (it
  * only covers the Rust-internal serde enums listed under its `"enums"` key);
  * the transport `Protocol` enum lives in `protobufs/transportprotocol.proto`
- * instead, where only `HTTPS = 0` is currently defined.
+ * instead, where `HTTPS = 0` and `GRPC = 1` are defined.
  */
 export function protocolDiscriminant(protocol: string): number {
   switch (protocol.toLowerCase()) {
     case 'https':
       return 0;
+    case 'grpc':
+      return 1;
     default:
       throw new Error(`DeRec: unknown transport protocol "${protocol}"`);
   }
@@ -156,7 +159,7 @@ export function buildRestoreParams(
     helpers: recoveredSecret.helpers.map((helper) => {
       const out: Record<string, unknown> = {
         channel_id: helper.channel_id,
-        transport_uri: helper.transport_uri,
+        transports: helper.transports,
         shared_key: Array.from(helper.shared_key),
       };
       const info = communicationInfoOrOmit(helper.communication_info);
@@ -177,7 +180,7 @@ export function buildRestoreParams(
       members: recoveredSecret.replicas.members.map((member) => {
         const out: Record<string, unknown> = {
           replica_id: member.replica_id,
-          transport_uri: member.transport_uri,
+          transports: member.transports,
           role: member.role,
         };
         const info = communicationInfoOrOmit(member.communication_info);
@@ -258,17 +261,22 @@ function buildStartParams(flowKind: FlowKind, params: unknown): Uint8Array {
       if (p.communication_info !== undefined) {
         out.communication_info = p.communication_info;
       }
-      if (p.transport_protocol !== undefined) {
+      if (p.own_transports !== undefined && p.own_transports.length > 0) {
+        out.own_transports = p.own_transports;
+        // The first entry also fills the deprecated singular field so a peer
+        // predating `supported_transports` still learns the new address.
+        out.transport_protocol = p.own_transports[0];
+      } else if (p.transport_protocol !== undefined) {
         out.transport_protocol = p.transport_protocol;
       }
       return jsonToBytes(out);
     }
-    case FlowKind.SyncCheck:
+    case FlowKind.ReplicaDiscovery:
       // No parameters: the group and this device's own version both come
       // from the stores.
       return jsonToBytes({});
-    case FlowKind.RemoveReplica: {
-      const p = params as RemoveReplicaParams;
+    case FlowKind.UnpairReplica: {
+      const p = params as UnpairReplicaParams;
       const out: Record<string, unknown> = { replica_id: p.replica_id };
       if (p.memo !== undefined) {
         out.memo = p.memo;
@@ -341,9 +349,40 @@ export class DeRecProtocolBuilder {
     return this;
   }
 
+  /**
+   * @deprecated Use {@link withOwnTransports}, which takes the whole
+   * preference list — `withOwnTransports([endpoint])` is the direct
+   * replacement. Removed at 0.0.5.
+   */
   withOwnTransport(endpoint: { uri: string; protocol: string }): this {
     this.config.own_transport_uri = endpoint.uri;
     this.config.own_transport_protocol = protocolDiscriminant(endpoint.protocol);
+    return this;
+  }
+
+  /**
+   * Set every transport endpoint this application serves, in preference
+   * order. Written to the config's `own_transports` array, which takes
+   * precedence over `own_transport_uri` / `own_transport_protocol` on the
+   * Rust side when non-empty — see `ProtocolConfig` in
+   * `library/src/interop/ffi/protocol/handle/mod.rs`.
+   *
+   * The order given is forwarded verbatim: it is not sorted, deduplicated,
+   * or reordered here. It is this application's own preference and
+   * decides which of a peer's offered endpoints is used. Every listed
+   * transport must actually be served, because delivery is push-only —
+   * listing an endpoint this application does not serve makes pairing
+   * succeed and replies vanish.
+   *
+   * Supersedes {@link withOwnTransport} for applications serving more
+   * than one transport; the single-endpoint setter remains fully
+   * supported.
+   */
+  withOwnTransports(transports: { uri: string; protocol: string }[]): this {
+    this.config.own_transports = transports.map((t) => ({
+      uri: t.uri,
+      protocol: protocolDiscriminant(t.protocol),
+    }));
     return this;
   }
 
@@ -371,9 +410,27 @@ export class DeRecProtocolBuilder {
     return this;
   }
 
-  /** Default: false. */
+  /**
+   * @deprecated Use {@link withUnsafeConnection}, which names both gated
+   * schemes. Removed at 0.0.5. Default: false.
+   */
   withUnsafeHttp(allow: boolean): this {
     this.config.unsafe_http = allow;
+    return this;
+  }
+
+  /**
+   * Accept plaintext `http://` and `grpc://` transport endpoints.
+   * **Development only.** Default: false. Supersedes
+   * {@link withUnsafeHttp}, which names only the HTTP scheme.
+   *
+   * Either flag alone is honored. Setting both to disagreeing values fails
+   * construction with the error code `CONFLICTING_PLAINTEXT_OPT_IN` rather
+   * than resolving silently, because precedence would hand the decision to
+   * the flag being removed.
+   */
+  withUnsafeConnection(allow: boolean): this {
+    this.config.unsafe_connection = allow;
     return this;
   }
 
@@ -441,6 +498,41 @@ export class DeRecProtocolBuilder {
   /** Default: unset. */
   withReplicaId(replicaId: bigint | number): this {
     this.config.replica_id = BigInt(replicaId).toString();
+    return this;
+  }
+
+  /**
+   * Declare the bounds this node advertises during pair negotiation.
+   *
+   * Embedded in outbound `PairRequest`/`PairResponse` envelopes and checked
+   * against the peer's range on inbound ones: a range that fails to
+   * intersect rejects the pairing. Every bound is optional and defaults to
+   * `0`, which the protocol reads as "no constraint on this dimension".
+   *
+   * Default: unset — no constraints advertised, every peer range accepted.
+   */
+  withParameterRange(range: Partial<ParameterRange>): this {
+    const n = (v: bigint | undefined) => Number(v ?? 0n);
+    this.config.parameter_range = {
+      min_share_size: n(range.min_share_size),
+      max_share_size: n(range.max_share_size),
+      min_time_between_verifications: n(range.min_time_between_verifications),
+      max_time_between_verifications: n(range.max_time_between_verifications),
+      min_time_between_share_updates: n(range.min_time_between_share_updates),
+      max_time_between_share_updates: n(range.max_time_between_share_updates),
+      min_unresponsive_deletion_timeout: n(
+        range.min_unresponsive_deletion_timeout,
+      ),
+      max_unresponsive_deletion_timeout: n(
+        range.max_unresponsive_deletion_timeout,
+      ),
+      min_unresponsive_deactivation_timeout: n(
+        range.min_unresponsive_deactivation_timeout,
+      ),
+      max_unresponsive_deactivation_timeout: n(
+        range.max_unresponsive_deactivation_timeout,
+      ),
+    };
     return this;
   }
 
@@ -526,12 +618,45 @@ export class DeRecProtocol {
     return this.host.setCommunicationInfo(jsonToBytes(info)) as Promise<void>;
   }
 
-  /** Returns a `Promise` for the same reason {@link setCommunicationInfo} does. */
+  /**
+   * Replace this node's endpoint for one protocol, leaving the others
+   * alone. A node serves at most one endpoint per protocol, so the
+   * `(uri, protocol)` pair identifies the entry it replaces; an entry for a
+   * protocol not yet served is appended, and a replaced one keeps its
+   * position in the preference order.
+   *
+   * Returns a `Promise` for the same reason {@link setCommunicationInfo} does.
+   *
+   * @deprecated Use {@link setOwnTransports}, which takes the whole
+   * preference list and is the only way to change which protocols this node
+   * serves, or their order. Removed at 0.0.5.
+   */
   setOwnTransport(uri: string, protocol: string): Promise<void> {
     return this.host.setOwnTransport(
       uri,
       protocolDiscriminant(protocol),
     ) as Promise<void>;
+  }
+
+  /**
+   * Replaces every endpoint this node advertises, in preference order —
+   * the runtime counterpart to `withOwnTransports`, and the only way to
+   * change a multi-endpoint node's set ({@link setOwnTransport} collapses
+   * it to the one endpoint it is given).
+   *
+   * Every entry is validated before any is stored, so a malformed URI
+   * leaves the previous set intact. An empty array is rejected.
+   *
+   * Returns a `Promise` for the same reason {@link setCommunicationInfo} does.
+   */
+  setOwnTransports(
+    transports: { uri: string; protocol: string }[],
+  ): Promise<void> {
+    const wire = transports.map(({ uri, protocol }) => ({
+      uri,
+      protocol: protocolDiscriminant(protocol),
+    }));
+    return this.host.setOwnTransports(jsonToBytes(wire)) as Promise<void>;
   }
 
   /**
@@ -565,8 +690,8 @@ export class DeRecProtocol {
   start(flowKind: FlowKind.RecoverSecret, params: RecoverSecretParams): Promise<DeRecEvent[]>;
   start(flowKind: FlowKind.Unpair, params: UnpairParams): Promise<DeRecEvent[]>;
   start(flowKind: FlowKind.UpdateChannelInfo, params: UpdateChannelInfoParams): Promise<DeRecEvent[]>;
-  start(flowKind: FlowKind.SyncCheck, params?: SyncCheckParams): Promise<DeRecEvent[]>;
-  start(flowKind: FlowKind.RemoveReplica, params: RemoveReplicaParams): Promise<DeRecEvent[]>;
+  start(flowKind: FlowKind.ReplicaDiscovery, params?: ReplicaDiscoveryParams): Promise<DeRecEvent[]>;
+  start(flowKind: FlowKind.UnpairReplica, params: UnpairReplicaParams): Promise<DeRecEvent[]>;
   async start(flowKind: FlowKind, params?: unknown): Promise<DeRecEvent[]> {
     const paramsBytes = buildStartParams(flowKind, params);
     const buffer = (await this.host.start(flowKind, paramsBytes)) as ArrayBuffer;

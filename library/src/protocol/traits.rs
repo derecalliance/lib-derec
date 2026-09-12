@@ -4,8 +4,8 @@
 use super::error::{ChannelStoreError, SecretStoreError, ShareStoreError, StateStoreError};
 use crate::Result;
 use crate::protocol::types::{
-    ChannelQuery, ChannelRecord, HelperChannel, MissingPolicy, ReplicaMember, SecretKind,
-    SecretValue, Share, StateItem, StateKey, StateKind, UserSecrets,
+    ChannelQuery, ChannelRecord, HelperChannel, HelperFilter, MissingPolicy, ReplicaFilter,
+    ReplicaMember, SecretKind, SecretValue, Share, StateItem, StateKey, StateKind, UserSecrets,
 };
 use crate::types::ChannelId;
 use derec_proto::TransportProtocol;
@@ -220,11 +220,50 @@ pub trait DeRecChannelStore {
     /// the group channel and every other member survive.
     fn remove(&mut self, secret_id: u64, query: ChannelQuery) -> ChannelStoreFuture<'_, bool>;
 
-    /// Every helper channel stored under `secret_id`.
-    fn helpers(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>>;
+    /// The helper channels stored under `secret_id` that `filter` selects.
+    ///
+    /// [`HelperFilter`] addresses records by [`HelperChannel::channel_id`],
+    /// and its `role` field is the **peer's**
+    /// [`HelperChannel::peer_role`]. A [`Default`] filter selects every
+    /// channel.
+    ///
+    /// **Returning everything under `secret_id` and ignoring the filter is
+    /// correct.** The library re-applies it to whatever you return and drops
+    /// what it excludes, so a superset is trimmed before anything acts on it.
+    ///
+    /// Pushing the filter into your query is an optimization: it saves
+    /// transferring rows the caller discards, and costs you re-expressing
+    /// these semantics in a query language. Get that wrong in the
+    /// *under*-returning direction and nothing detects it — the protocol
+    /// simply fails to act. Verify a pushdown against
+    /// `library/tests/fixtures/channel_filter.json`, and see
+    /// [`ChannelFilter`](crate::protocol::types::ChannelFilter) for why the
+    /// two directions are not symmetric.
+    fn helpers(
+        &self,
+        secret_id: u64,
+        filter: HelperFilter,
+    ) -> ChannelStoreFuture<'_, Vec<HelperChannel>>;
 
-    /// Every replica-group member, **including this device's own row**.
-    /// Callers fanning out exclude themselves by [`crate::types::ReplicaId`].
+    /// The replica-group members under `secret_id` that `filter` selects,
+    /// **including this device's own row** unless the filter excludes it.
+    ///
+    /// [`ReplicaFilter`] addresses records by [`ReplicaMember::replica_id`],
+    /// and its `role` field is [`ReplicaMember::role`]. A [`Default`] filter
+    /// selects every member.
+    ///
+    /// **Returning everything under `secret_id` and ignoring the filter is
+    /// correct.** The library re-applies it to whatever you return and drops
+    /// what it excludes, so a superset is trimmed before anything acts on it.
+    ///
+    /// Pushing the filter into your query is an optimization: it saves
+    /// transferring rows the caller discards, and costs you re-expressing
+    /// these semantics in a query language. Get that wrong in the
+    /// *under*-returning direction and nothing detects it — the protocol
+    /// simply fails to act. Verify a pushdown against
+    /// `library/tests/fixtures/channel_filter.json`, and see
+    /// [`ChannelFilter`](crate::protocol::types::ChannelFilter) for why the
+    /// two directions are not symmetric.
     ///
     /// # Order selects the successor when the source leaves
     ///
@@ -234,8 +273,9 @@ pub trait DeRecChannelStore {
     /// A replica group has exactly one member holding
     /// [`crate::protocol::types::ReplicaRole::Source`]. When that member is
     /// removed, a successor must be chosen, and the protocol takes **the first
-    /// element of this list that is neither the departing member nor itself
-    /// leaving**. Implementing `replicas` is therefore how an application
+    /// element returned** for a filter that already excludes the departing
+    /// member and admits only members not themselves leaving. Implementing
+    /// `replicas` is therefore how an application
     /// chooses its own succession policy — order by an `added_at` column, by a
     /// user-chosen preference, by whatever a backend says — without the
     /// protocol having to model one.
@@ -256,7 +296,11 @@ pub trait DeRecChannelStore {
     ///
     /// A source that is the group's only member leaves no successor, and the
     /// group dissolves with it.
-    fn replicas(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>>;
+    fn replicas(
+        &self,
+        secret_id: u64,
+        filter: ReplicaFilter,
+    ) -> ChannelStoreFuture<'_, Vec<ReplicaMember>>;
 
     /// Link two channels as belonging to the same Owner identity.
     ///
@@ -515,8 +559,11 @@ pub trait DeRecUserSecretStore {
 /// }
 ///
 /// impl DeRecTransport for Collector {
-///     fn send(&self, endpoint: &TransportProtocol, message: Vec<u8>) -> TransportFuture<'_> {
-///         let entry = (endpoint.clone(), message);
+///     fn send(&self, endpoints: &[TransportProtocol], message: Vec<u8>) -> TransportFuture<'_> {
+///         // The library offers every endpoint the peer advertised and takes
+///         // no view on which is used. A real transport would try them in
+///         // its own order and fall back; this one records the first.
+///         let entry = (endpoints[0].clone(), message);
 ///         let out = Arc::clone(&self.0);
 ///         Box::pin(async move {
 ///             out.lock().expect("collector poisoned").push(entry);
@@ -561,8 +608,8 @@ pub trait DeRecUserSecretStore {
 /// let collector = Collector::default();
 /// let rt = tokio::runtime::Builder::new_current_thread().build()?;
 /// rt.block_on(async {
-///     collector.send(&peer, apply_trace_id(&envelope(), 0xA11CE).unwrap()).await.unwrap();
-///     collector.send(&peer, apply_trace_id(&envelope(), 0xB0B).unwrap()).await.unwrap();
+///     collector.send(std::slice::from_ref(&peer), apply_trace_id(&envelope(), 0xA11CE).unwrap()).await.unwrap();
+///     collector.send(std::slice::from_ref(&peer), apply_trace_id(&envelope(), 0xB0B).unwrap()).await.unwrap();
 /// });
 ///
 /// let (reply, elsewhere) = split_reply(&inbound, collector.take());
@@ -585,12 +632,47 @@ pub trait DeRecUserSecretStore {
 ///
 /// Same as [`DeRecSecretStore`]; `send` returns [`TransportFuture`].
 pub trait DeRecTransport {
-    /// Deliver `message` to `endpoint`.
+    /// Deliver `message` to a peer, reachable at any of `endpoints`.
     ///
-    /// `endpoint` is the [`TransportProtocol`] the peer advertised during
-    /// pairing. The library calls this from protocol handlers whenever an
-    /// outbound envelope needs to reach a peer.
-    fn send(&self, endpoint: &TransportProtocol, message: Vec<u8>) -> TransportFuture<'_>;
+    /// `endpoints` are the endpoints that peer advertised, in the order it
+    /// offered them, filtered to those this library will record — plaintext
+    /// and malformed entries are already gone. The library does **not**
+    /// rank them: which endpoint to dial, and whether to fall back to
+    /// another when one is unreachable, is transport mechanism and belongs
+    /// to the implementation. Only this side knows which of its transports
+    /// are healthy, cheap, or currently reachable.
+    ///
+    /// Delivery to **any one** endpoint is success. Return an error only
+    /// when the message reached none of them.
+    ///
+    /// `endpoints` is never empty: the library refuses to record a peer it
+    /// filtered every endpoint away from, so a channel that exists has at
+    /// least one usable address.
+    ///
+    /// # Deliver once
+    ///
+    /// Every entry addresses the **same peer**, so delivering to all of them
+    /// sends one authenticated message several times. Stop at the first
+    /// success. The protocol's handlers are idempotent, so a duplicate does
+    /// not corrupt state, but it is still a duplicate to anything counting
+    /// messages, and a peer entitled to treat re-delivery as a replay will.
+    ///
+    /// # Prefer an adapter to writing this by hand
+    ///
+    /// Choosing *which* endpoint to dial is the application's, and stays
+    /// here. The bookkeeping around it — try in order, stop at the first
+    /// success, fail only when none worked — is the same everywhere and is
+    /// already written and tested:
+    /// [`SequentialFailover`](crate::protocol::SequentialFailover) implements
+    /// it over a [`SendOne`](crate::protocol::SendOne) that dials one
+    /// endpoint.
+    ///
+    /// Taking `endpoints[0]` and ignoring the rest compiles, passes every
+    /// test, and silently gives up failover — which is the feature the list
+    /// exists to provide. If that is genuinely wanted, say so with
+    /// [`SingleEndpointTransport`](crate::protocol::SingleEndpointTransport)
+    /// rather than by indexing, so the choice is visible to a reader.
+    fn send(&self, endpoints: &[TransportProtocol], message: Vec<u8>) -> TransportFuture<'_>;
 }
 
 /// Durable storage for the orchestrator's in-flight protocol state.
@@ -733,11 +815,19 @@ impl<T: DeRecChannelStore + ?Sized> DeRecChannelStore for Box<T> {
     fn remove(&mut self, secret_id: u64, query: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
         (**self).remove(secret_id, query)
     }
-    fn helpers(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
-        (**self).helpers(secret_id)
+    fn helpers(
+        &self,
+        secret_id: u64,
+        filter: HelperFilter,
+    ) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+        (**self).helpers(secret_id, filter)
     }
-    fn replicas(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
-        (**self).replicas(secret_id)
+    fn replicas(
+        &self,
+        secret_id: u64,
+        filter: ReplicaFilter,
+    ) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
+        (**self).replicas(secret_id, filter)
     }
     fn link_channel(
         &mut self,
@@ -828,8 +918,8 @@ impl<T: DeRecStateStore + ?Sized> DeRecStateStore for Box<T> {
 }
 
 impl<T: DeRecTransport + ?Sized> DeRecTransport for Box<T> {
-    fn send(&self, endpoint: &TransportProtocol, message: Vec<u8>) -> TransportFuture<'_> {
-        (**self).send(endpoint, message)
+    fn send(&self, endpoints: &[TransportProtocol], message: Vec<u8>) -> TransportFuture<'_> {
+        (**self).send(endpoints, message)
     }
 }
 
@@ -883,11 +973,19 @@ impl<T: DeRecChannelStore + ?Sized> DeRecChannelStore for &mut T {
     fn remove(&mut self, secret_id: u64, query: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
         (**self).remove(secret_id, query)
     }
-    fn helpers(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
-        (**self).helpers(secret_id)
+    fn helpers(
+        &self,
+        secret_id: u64,
+        filter: HelperFilter,
+    ) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+        (**self).helpers(secret_id, filter)
     }
-    fn replicas(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
-        (**self).replicas(secret_id)
+    fn replicas(
+        &self,
+        secret_id: u64,
+        filter: ReplicaFilter,
+    ) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
+        (**self).replicas(secret_id, filter)
     }
     fn link_channel(
         &mut self,
@@ -978,8 +1076,8 @@ impl<T: DeRecStateStore + ?Sized> DeRecStateStore for &mut T {
 }
 
 impl<T: DeRecTransport + ?Sized> DeRecTransport for &mut T {
-    fn send(&self, endpoint: &TransportProtocol, message: Vec<u8>) -> TransportFuture<'_> {
-        (**self).send(endpoint, message)
+    fn send(&self, endpoints: &[TransportProtocol], message: Vec<u8>) -> TransportFuture<'_> {
+        (**self).send(endpoints, message)
     }
 }
 
@@ -994,8 +1092,8 @@ impl<T: DeRecTransport + ?Sized> DeRecTransport for &mut T {
 /// Use [`Box<T>`](Box) or `&mut T` for the stores; both are implemented for
 /// every trait here.
 impl<T: DeRecTransport + ?Sized> DeRecTransport for std::sync::Arc<T> {
-    fn send(&self, endpoint: &TransportProtocol, message: Vec<u8>) -> TransportFuture<'_> {
-        (**self).send(endpoint, message)
+    fn send(&self, endpoints: &[TransportProtocol], message: Vec<u8>) -> TransportFuture<'_> {
+        (**self).send(endpoints, message)
     }
 }
 
@@ -1035,7 +1133,7 @@ mod pointer_forwarding_tests {
                 Box::new(InMemPersistedStateStore::default()) as Box<dyn DeRecStateStore>
             )
             .with_transport(std::sync::Arc::new(NoopTransport))
-            .with_own_transport("https://erased.example.com")
+            .with_own_transports(["https://erased.example.com"])
             .with_threshold(2)
             .build()
             .expect("a fully type-erased protocol must build")

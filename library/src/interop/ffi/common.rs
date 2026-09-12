@@ -110,46 +110,71 @@ pub(crate) fn read_len_prefixed_vec(input: &mut &[u8]) -> Result<Vec<u8>, String
     Ok(bytes.to_vec())
 }
 
-/// Decode an optional `TransportProtocol` (proto-encoded) from raw FFI bytes.
+/// Decode a length-delimited `TransportProtocol` sequence from raw FFI bytes:
+/// each entry preceded by its protobuf varint byte length, the same framing
+/// protobuf uses for a repeated embedded message field.
 ///
-/// `len == 0` (or a null pointer with zero length) signals "absent", which
-/// is how request bodies express `reply_to: None`. A non-zero length plus
-/// null pointer is treated as an error. Used by the FFI `produce_*_request`
-/// surfaces to thread `reply_to` into the corresponding primitive.
+/// `len == 0` (or a null pointer with zero length) yields an empty list. That
+/// is how request bodies express "no reply-to override", which is legitimate
+/// rather than an error: absence means "route to the endpoints already on
+/// file for this channel". A non-zero length plus null pointer is an error.
+/// Used by the FFI `produce_*_request` surfaces to thread `reply_to` into the
+/// corresponding primitive.
 ///
-/// When bytes decode successfully, runs
-/// [`crate::transport::TransportProtocolExt::validate`] against the value
-/// so callers that reach the library through FFI cannot smuggle a
-/// mismatched-scheme or otherwise malformed `reply_to` past the seam.
-/// Mirrors the validation applied at every primitive `extract` site,
-/// keeping the rejection semantics uniform across SDKs.
-pub(crate) fn parse_optional_transport_protocol(
+/// Every entry is validated with
+/// [`crate::extensions::transport_protocol::TransportProtocolExt::validate`], so callers that
+/// reach the library through FFI cannot smuggle a mismatched-scheme or
+/// otherwise malformed endpoint past the seam. Mirrors the validation
+/// applied at every primitive `extract` site, keeping the rejection
+/// semantics uniform across SDKs.
+pub(crate) fn parse_transport_protocol_list(
     ptr: *const u8,
     len: usize,
-) -> Result<Option<derec_proto::TransportProtocol>, crate::interop::ffi::error::DeRecError> {
+    field: &str,
+) -> Result<Vec<derec_proto::TransportProtocol>, crate::interop::ffi::error::DeRecError> {
+    use crate::extensions::transport_protocol::TransportProtocolExt as _;
     use crate::interop::ffi::error::{
         DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_NULL_PTR, ffi_error, from_lib_error,
     };
-    use crate::transport::TransportProtocolExt as _;
     use prost::Message as _;
 
     if len == 0 {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     if ptr.is_null() {
         return Err(ffi_error(
             DEREC_CODE_FFI_NULL_PTR,
-            "reply_to_ptr is null but reply_to_len is non-zero",
+            format!("{field} is null but its length is non-zero"),
         ));
     }
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-    let tp = derec_proto::TransportProtocol::decode(bytes).map_err(|e| {
-        ffi_error(
-            DEREC_CODE_FFI_BAD_PROTO,
-            format!("failed to decode reply_to TransportProtocol: {e}"),
-        )
-    })?;
-    tp.validate()
-        .map_err(|e| from_lib_error(crate::Error::Transport(e)))?;
-    Ok(Some(tp))
+
+    let mut bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let mut out = Vec::new();
+    while !bytes.is_empty() {
+        let entry_len = prost::encoding::decode_varint(&mut bytes).map_err(|_| {
+            ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                format!("{field} has a malformed length prefix"),
+            )
+        })? as usize;
+        if entry_len > bytes.len() {
+            return Err(ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                format!("{field} length prefix overruns the buffer"),
+            ));
+        }
+        let (entry, rest) = bytes.split_at(entry_len);
+        bytes = rest;
+
+        let tp = derec_proto::TransportProtocol::decode(entry).map_err(|_| {
+            ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                format!("{field} contains an invalid TransportProtocol"),
+            )
+        })?;
+        tp.validate()
+            .map_err(|e| from_lib_error(crate::Error::Transport(e)))?;
+        out.push(tp);
+    }
+    Ok(out)
 }

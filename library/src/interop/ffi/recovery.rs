@@ -22,8 +22,8 @@
 //! calls to [`extract_get_share_response`].
 
 use crate::interop::ffi::common::{
-    DeRecBuffer, empty_buffer, parse_optional_transport_protocol, read_len_prefixed_vec,
-    read_u32_le, vec_into_buffer,
+    DeRecBuffer, empty_buffer, parse_transport_protocol_list, read_len_prefixed_vec, read_u32_le,
+    vec_into_buffer,
 };
 use crate::interop::ffi::error::{
     DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_BAD_SHARED_KEY, DEREC_CODE_FFI_NULL_PTR, DeRecError,
@@ -95,7 +95,7 @@ pub extern "C" fn produce_get_share_request_message(
         Err(e) => return with_err(e),
     };
 
-    let reply_to = match parse_optional_transport_protocol(reply_to_ptr, reply_to_len) {
+    let reply_to = match parse_transport_protocol_list(reply_to_ptr, reply_to_len, "reply_to_ptr") {
         Ok(rt) => rt,
         Err(e) => return with_err(e),
     };
@@ -105,7 +105,7 @@ pub extern "C" fn produce_get_share_request_message(
         secret_id,
         version,
         &shared_key,
-        reply_to,
+        &reply_to,
     ) {
         Ok(r) => ProduceGetShareRequestMessageResult {
             error: success(),

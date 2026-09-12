@@ -5,12 +5,15 @@
 // Runs the primitives tests first (low-level message functions), then the
 // protocol tests (higher-level DeRecProtocol orchestrator).
 
+import { runChannelFilterConformance } from "./channelFilterConformance.js";
 import { runPrimitivesSmoke } from "./primitives.js";
 import { runProtocolSmoke } from "./protocol.js";
 
 console.log("╔══════════════════════════════════════════╗");
 console.log("║  DeRec Node.js Smoke Tests               ║");
 console.log("╚══════════════════════════════════════════╝\n");
+
+runChannelFilterConformance();
 
 runPrimitivesSmoke();
 

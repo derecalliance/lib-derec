@@ -48,15 +48,16 @@ pub(crate) fn from_js<T: serde::de::DeserializeOwned>(value: JsValue) -> Result<
         .map_err(|e| js_error("WASM_DESERIALIZE_ERROR", e.to_string()))
 }
 
-/// Parse an optional `TransportProtocol` from a JS value. `null` and
-/// `undefined` both deserialize to `None` — the convention used by every
-/// `produce_*_request` wrapper for `reply_to`.
-pub(crate) fn parse_optional_transport_protocol(
+/// Parse a `TransportProtocol` array from a JS value. `null` and `undefined`
+/// both yield an empty list — the convention every `produce_*_request`
+/// wrapper uses for `reply_to`, where "none supplied" means "route to the
+/// endpoints already on file for the channel".
+pub(crate) fn parse_transport_protocol_list(
     value: JsValue,
-) -> Result<Option<derec_proto::TransportProtocol>, JsValue> {
+) -> Result<Vec<derec_proto::TransportProtocol>, JsValue> {
     if value.is_null() || value.is_undefined() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
-    let rt: crate::interop::wasm::primitives::pairing::TransportProtocol = from_js(value)?;
-    Ok(Some(rt.into()))
+    let list: Vec<crate::interop::wasm::primitives::pairing::TransportProtocol> = from_js(value)?;
+    Ok(list.into_iter().map(Into::into).collect())
 }

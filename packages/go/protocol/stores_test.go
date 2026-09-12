@@ -48,7 +48,7 @@ func (m *mockChannelStore) Remove(secretID, channelID, replicaID uint64) (bool, 
 	return ok, nil
 }
 
-func (m *mockChannelStore) ListHelpers(secretID uint64) ([]HelperChannel, error) {
+func (m *mockChannelStore) ListHelpers(secretID uint64, _ HelperFilter) ([]HelperChannel, error) {
 	out := make([]HelperChannel, 0, len(m.data[secretID]))
 	for _, r := range m.data[secretID] {
 		if r.Helper != nil {
@@ -58,7 +58,7 @@ func (m *mockChannelStore) ListHelpers(secretID uint64) ([]HelperChannel, error)
 	return out, nil
 }
 
-func (m *mockChannelStore) ListReplicas(secretID uint64) ([]ReplicaMember, error) {
+func (m *mockChannelStore) ListReplicas(secretID uint64, _ ReplicaFilter) ([]ReplicaMember, error) {
 	out := make([]ReplicaMember, 0, len(m.data[secretID]))
 	for _, r := range m.data[secretID] {
 		if r.Replica != nil {
@@ -160,7 +160,10 @@ type mockTransport struct {
 	fail bool
 }
 
-func (m *mockTransport) Send(uri string, protocol int32, message []byte) error {
+func (m *mockTransport) Send(endpoints []Endpoint, message []byte) error {
+	uri := endpoints[0].URI
+	protocol := endpoints[0].Protocol
+	_ = protocol
 	if m.fail {
 		return errors.New("simulated transport failure")
 	}
@@ -183,7 +186,7 @@ func TestChannelStore_SaveLoadRemoveThroughInterface(t *testing.T) {
 
 	ch := HelperChannel{
 		ChannelID: 1,
-		Transport: TransportEndpoint{URI: "https://h.example.com", Protocol: 0},
+		Transports:        []TransportEndpoint{{URI: "https://h.example.com", Protocol: 0}},
 		Status:    ChannelStatusPaired,
 		PeerRole:  SenderKindOwner,
 	}
@@ -210,7 +213,7 @@ func TestChannelStore_SaveLoadRemoveThroughInterface(t *testing.T) {
 	member := ReplicaMember{
 		ChannelID: 1,
 		ReplicaID: 42,
-		Transport: TransportEndpoint{URI: "https://r.example.com", Protocol: 0},
+		Transports:        []TransportEndpoint{{URI: "https://r.example.com", Protocol: 0}},
 		Role:      ReplicaRoleDestination,
 		Status:    ChannelStatusPaired,
 	}
@@ -228,11 +231,11 @@ func TestChannelStore_SaveLoadRemoveThroughInterface(t *testing.T) {
 		t.Fatal("saving a member at the same channel id must not evict the helper channel")
 	}
 
-	helpers, err := store.ListHelpers(100)
+	helpers, err := store.ListHelpers(100, HelperFilter{})
 	if err != nil || len(helpers) != 1 {
 		t.Fatalf("ListHelpers: got %d entries, err=%v", len(helpers), err)
 	}
-	members, err := store.ListReplicas(100)
+	members, err := store.ListReplicas(100, ReplicaFilter{})
 	if err != nil || len(members) != 1 {
 		t.Fatalf("ListReplicas: got %d entries, err=%v", len(members), err)
 	}
@@ -249,13 +252,13 @@ func TestChannelStore_SaveLoadRemoveThroughInterface(t *testing.T) {
 
 func TestTransport_SendThroughInterface(t *testing.T) {
 	var transport Transport = &mockTransport{}
-	if err := transport.Send("https://example.com", 0, []byte("hello")); err != nil {
+	if err := transport.Send([]Endpoint{{URI: "https://example.com", Protocol: 0}}, []byte("hello")); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
 	failing := &mockTransport{fail: true}
 	transport = failing
-	if err := transport.Send("https://example.com", 0, nil); err == nil {
+	if err := transport.Send([]Endpoint{{URI: "https://example.com", Protocol: 0}}, nil); err == nil {
 		t.Fatal("expected error from failing transport")
 	}
 }

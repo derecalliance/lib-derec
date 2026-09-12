@@ -121,7 +121,7 @@ declared in `src/types.ts`:
 - **`UserSecretStore`** — the most recent user-facing secret snapshot per
   `secretId`, used to auto-publish to newly paired peers.
 - **`StateStore`** — in-flight orchestrator bookkeeping (pending
-  verifications, recoveries, unpairs, sharing rounds, sync checks) so a
+  verifications, recoveries, unpairs, sharing rounds, replica discoveries) so a
   multi-round flow survives an app restart.
 - **`Transport`** — outbound delivery. `send(endpoint, message)` posts a
   wire-format envelope to a peer; it is a mailbox, not a request/response
@@ -130,6 +130,32 @@ declared in `src/types.ts`:
 Every method is `async` and keyed by decimal-string ids — see the next
 section for why that differs from `DeRecProtocol`'s own methods. Full field-
 level contracts are documented as TSDoc on each interface in `src/types.ts`.
+
+### Filtered listings
+
+`listHelpers` and `listReplicas` receive a filter object — `ids`, `status`,
+`role` and `exclude`, where every empty value means "do not restrict on this",
+so an all-empty filter selects everything. `exclude` is applied last,
+overriding `ids`. Ids are decimal strings, like every other `u64` here.
+
+**Apply it in your query.** That is the point: a `WHERE` clause or a
+key-condition expression instead of transferring rows the caller will discard.
+That transfer costs bandwidth everywhere, and on a metered backing such as
+DynamoDB, which bills by bytes read, it costs money.
+
+**A store that ignores it is slow, not wrong.** The library re-applies the
+filter to every listing before acting on it and drops anything the filter
+excluded.
+
+**That is a one-way guarantee, not a validation of your store.** Dropping rows
+enforces an upper bound; it cannot recover a row you omitted. A store that
+returns *fewer* rows than the filter selects is still wrong, in a way nothing
+in the library can detect — the protocol simply fails to act. Applying the
+filter faithfully is still your job.
+
+The backstop matters here in particular: TypeScript accepts a function of fewer
+parameters where more are declared, so a store written before the filter
+existed still satisfies this interface and compiles without a diagnostic.
 
 ---
 
@@ -171,7 +197,7 @@ after whatever is in flight.
 
 ## Known differences from `@derec-alliance/nodejs`
 
-**`setCommunicationInfo()` and `setOwnTransport()` return a `Promise`.**
+**`setCommunicationInfo()`, `setOwnTransport()` and `setOwnTransports()` return a `Promise`.**
 `@derec-alliance/nodejs` declares both `void`. Here they must not run on the
 JavaScript thread: the underlying FFI setter takes the same handle lock a
 running flow holds across its store callbacks, and those callbacks block the

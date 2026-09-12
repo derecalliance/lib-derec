@@ -4,11 +4,14 @@
 package native
 
 import (
+	"encoding/binary"
 	"errors"
 	"testing"
 	"unsafe"
 
+	"github.com/derecalliance/lib-derec/packages/go/derecpb"
 	"github.com/ebitengine/purego"
+	"google.golang.org/protobuf/proto"
 )
 
 // TestBuildCallbacks_PopulatesAllSixStructs is a smoke test that
@@ -256,12 +259,33 @@ func TestChannelStoreCallbacks_LoadCallback_PanicNotCrash_RealRoundTrip(t *testi
 	}
 }
 
+// frameEndpoints builds the length-delimited TransportProtocol sequence the
+// C seam passes: each entry preceded by its protobuf varint byte length.
+func frameEndpoints(t *testing.T, endpoints ...Endpoint) []byte {
+	t.Helper()
+	var out []byte
+	for _, e := range endpoints {
+		entry, err := proto.Marshal(&derecpb.TransportProtocol{
+			Uri:      e.URI,
+			Protocol: derecpb.Protocol(e.Protocol),
+		})
+		if err != nil {
+			t.Fatalf("marshal endpoint: %v", err)
+		}
+		var prefix [binary.MaxVarintLen64]byte
+		n := binary.PutUvarint(prefix[:], uint64(len(entry)))
+		out = append(out, prefix[:n]...)
+		out = append(out, entry...)
+	}
+	return out
+}
+
 func TestTransportCallbacks_SendCallback_RealRoundTrip(t *testing.T) {
 	var gotURI string
 	var gotMessage []byte
 	s := &storeSet{transport: &mockTransportSender{
-		sendFn: func(uri string, protocol int32, message []byte) error {
-			gotURI = uri
+		sendFn: func(endpoints []Endpoint, message []byte) error {
+			gotURI = endpoints[0].URI
 			gotMessage = append([]byte(nil), message...)
 			return nil
 		},
@@ -272,12 +296,12 @@ func TestTransportCallbacks_SendCallback_RealRoundTrip(t *testing.T) {
 	}
 	defer built.release()
 
-	var send func(userData uintptr, uriPtr *byte, uriLen uintptr, protocol int32, bytesPtr *byte, length uintptr) int32
+	var send func(userData uintptr, endpointsPtr *byte, endpointsLen uintptr, bytesPtr *byte, length uintptr) int32
 	purego.RegisterFunc(&send, built.Transport.Send)
 
-	uri := []byte("https://example.com/derec")
+	framed := frameEndpoints(t, Endpoint{URI: "https://example.com/derec", Protocol: 0})
 	msg := []byte("hello derec")
-	rc := send(built.Transport.UserData, &uri[0], uintptr(len(uri)), 0, &msg[0], uintptr(len(msg)))
+	rc := send(built.Transport.UserData, &framed[0], uintptr(len(framed)), &msg[0], uintptr(len(msg)))
 	if rc != ffiStatusOK {
 		t.Fatalf("rc = %d, want ffiStatusOK", rc)
 	}
@@ -288,7 +312,7 @@ func TestTransportCallbacks_SendCallback_RealRoundTrip(t *testing.T) {
 
 func TestTransportCallbacks_SendCallback_ErrorPropagates_RealRoundTrip(t *testing.T) {
 	s := &storeSet{transport: &mockTransportSender{
-		sendFn: func(uri string, protocol int32, message []byte) error {
+		sendFn: func(endpoints []Endpoint, message []byte) error {
 			return errors.New("simulated failure")
 		},
 	}}

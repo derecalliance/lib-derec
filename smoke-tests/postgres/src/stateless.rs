@@ -130,7 +130,7 @@ impl StatelessPeer {
             .with_user_secret_store(PostgresUserSecretStore::new(self.client.clone()))
             .with_state_store(PostgresStateStore::new(self.client.clone()))
             .with_transport(self.transport.clone())
-            .with_own_transport(self.uri.as_str())
+            .with_own_transports([self.uri.as_str()])
             .with_threshold(self.options.threshold)
             .with_auto_accept(self.auto_accept);
         if let Some(secs) = self.timeout_in_secs {

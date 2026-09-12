@@ -76,6 +76,18 @@ pub fn apply_trace_id(envelope_bytes: &[u8], trace_id: u64) -> Result<Vec<u8>, c
     Ok(envelope.encode_to_vec())
 }
 
+/// Draw a fresh correlation token for an outbound request envelope.
+///
+/// Mirrors [`DeRecMessageBuilder::auto_trace_id`] but for the case where the
+/// envelope was built by a primitive and is then re-stamped via
+/// [`apply_trace_id`]. A `0` return is indistinguishable from "unset", so
+/// there is a 2^-64 chance of drawing a token downstream code might read as
+/// "no correlation requested" — not worth coding around.
+pub(crate) fn fresh_trace_id() -> u64 {
+    use rand::Rng as _;
+    rand::rng().next_u64()
+}
+
 /// Read the `trace_id` field off an inbound DeRecMessage envelope without
 /// touching the encrypted inner payload.
 ///

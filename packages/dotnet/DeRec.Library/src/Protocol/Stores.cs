@@ -3,6 +3,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 
 using DeRec.Library.Primitives;
 
@@ -59,7 +60,11 @@ public enum ReplicaRole
 /// 1:1. Keyed by <c>(secretId, channelId)</c>.
 /// </remarks>
 /// <param name="ChannelId">Channel identifier; opaque on this side.</param>
-/// <param name="Transport">The peer's transport endpoint.</param>
+/// <param name="Transports">
+/// Every endpoint the peer advertised, in the order it offered them. The
+/// library does not rank them; a transport chooses which to dial and may
+/// fall back between them.
+/// </param>
 /// <param name="CommunicationInfo">App-level identity metadata for the peer.</param>
 /// <param name="Status">Lifecycle state (<see cref="ChannelStatus"/>).</param>
 /// <param name="CreatedAt">Unix timestamp (seconds) when the channel was created.</param>
@@ -71,7 +76,7 @@ public enum ReplicaRole
 /// </param>
 public sealed record HelperChannel(
     ulong ChannelId,
-    TransportProtocol Transport,
+    IReadOnlyList<TransportProtocol> Transports,
     Dictionary<string, string> CommunicationInfo,
     ChannelStatus Status,
     ulong CreatedAt,
@@ -88,7 +93,9 @@ public sealed record HelperChannel(
 /// </remarks>
 /// <param name="ChannelId">The group channel. Identical for every member.</param>
 /// <param name="ReplicaId">This member's identity — the primary key within the group.</param>
-/// <param name="Transport">This member's transport endpoint.</param>
+/// <param name="Transports">
+/// Every endpoint this member advertised, in the order it offered them.
+/// </param>
 /// <param name="CommunicationInfo">App-level identity metadata for the member.</param>
 /// <param name="Role">This member's role (<see cref="ReplicaRole"/>).</param>
 /// <param name="Status">Lifecycle state (<see cref="ChannelStatus"/>).</param>
@@ -96,7 +103,7 @@ public sealed record HelperChannel(
 public sealed record ReplicaMember(
     ulong ChannelId,
     ulong ReplicaId,
-    TransportProtocol Transport,
+    IReadOnlyList<TransportProtocol> Transports,
     Dictionary<string, string> CommunicationInfo,
     ReplicaRole Role,
     ChannelStatus Status,
@@ -145,6 +152,93 @@ public enum SecretKind : uint
 public sealed record SecretValue(SecretKind Kind, byte[] Bytes);
 
 /// <summary>
+/// Narrows a listing from <see cref="IChannelStore"/>.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Every property is a restriction, and every property's empty value means
+/// "do not restrict on this" — an all-empty filter selects everything.
+/// Restrictions combine with AND, and <c>Exclude</c> is applied last,
+/// overriding <c>Ids</c>.
+/// </para>
+/// <para>
+/// <b>Returning everything under the <c>secretId</c> and ignoring the filter is
+/// correct</b>, and the implementation to write unless there is a measured
+/// reason not to. The library re-applies the filter to whatever you return and
+/// drops what it excludes, so a superset is trimmed to the right set before
+/// anything acts on it.
+/// </para>
+/// <para>
+/// Pushing the filter into your query — a <c>WHERE</c> clause, a key-condition
+/// expression — is an optimization you opt into. It saves transferring rows the
+/// caller discards, which costs bandwidth everywhere and real money on a
+/// metered backing that bills by bytes read. It also moves these semantics into
+/// a query language by hand, and the error that matters is asymmetric: the
+/// library's re-check can drop rows but cannot recover one that was never
+/// returned, so a pushdown selecting too <em>few</em> is undetectable at
+/// runtime — no exception, no event, just a share that was never published.
+/// Verify one against <c>library/tests/fixtures/channel_filter.json</c>.
+/// </para>
+/// </remarks>
+/// <param name="Ids">Restrict to these ids. Empty selects every record.</param>
+/// <param name="Status">Restrict to these statuses. Empty selects any status.</param>
+/// <param name="Role">Restrict to this role. <c>null</c> selects any role.</param>
+/// <param name="Exclude">Omit these ids, applied after <c>Ids</c>. Empty omits nothing.</param>
+public abstract record ChannelFilter<TRole>(
+    IReadOnlyList<ulong> Ids,
+    IReadOnlyList<ChannelStatus> Status,
+    TRole? Role,
+    IReadOnlyList<ulong> Exclude)
+    where TRole : struct
+{
+    /// <summary>
+    /// Whether a record with these attributes survives the filter. A store
+    /// whose backing cannot express the restrictions as a query can list and
+    /// call this, which is correct but transfers the rows the filter was meant
+    /// to leave behind.
+    /// </summary>
+    public bool Matches(ulong id, ChannelStatus status, TRole role)
+        => (Ids.Count == 0 || Ids.Contains(id))
+           && (Status.Count == 0 || Status.Contains(status))
+           && (Role is null || EqualityComparer<TRole>.Default.Equals(Role.Value, role))
+           && !Exclude.Contains(id);
+}
+
+/// <summary>
+/// Narrows <see cref="IChannelStore.ListHelpers"/>. Ids are
+/// <see cref="HelperChannel.ChannelId"/> and the role is the <em>peer's</em>
+/// <see cref="HelperChannel.PeerRole"/>.
+/// </summary>
+public sealed record HelperFilter(
+    IReadOnlyList<ulong> Ids,
+    IReadOnlyList<ChannelStatus> Status,
+    Pairing.SenderKind? Role,
+    IReadOnlyList<ulong> Exclude)
+    : ChannelFilter<Pairing.SenderKind>(Ids, Status, Role, Exclude)
+{
+    /// <summary>An empty filter: selects every channel.</summary>
+    public static HelperFilter Any =>
+        new(Array.Empty<ulong>(), Array.Empty<ChannelStatus>(), null, Array.Empty<ulong>());
+}
+
+/// <summary>
+/// Narrows <see cref="IChannelStore.ListReplicas"/>. Ids are
+/// <see cref="ReplicaMember.ReplicaId"/> and the role is
+/// <see cref="ReplicaMember.Role"/>.
+/// </summary>
+public sealed record ReplicaFilter(
+    IReadOnlyList<ulong> Ids,
+    IReadOnlyList<ChannelStatus> Status,
+    ReplicaRole? Role,
+    IReadOnlyList<ulong> Exclude)
+    : ChannelFilter<ReplicaRole>(Ids, Status, Role, Exclude)
+{
+    /// <summary>An empty filter: selects every member.</summary>
+    public static ReplicaFilter Any =>
+        new(Array.Empty<ulong>(), Array.Empty<ChannelStatus>(), null, Array.Empty<ulong>());
+}
+
+/// <summary>
 /// Channel-record persistence for the protocol. Implementations MUST
 /// be safe to read/write across multiple calls, but never see
 /// overlapping calls (the protocol holds the store by <c>&amp;mut self</c>
@@ -169,7 +263,18 @@ public interface IChannelStore
     ChannelRecord? Load(ulong secretId, ulong channelId, ulong replicaId);
     void Save(ulong secretId, ChannelRecord record);
     bool Remove(ulong secretId, ulong channelId, ulong replicaId);
-    IEnumerable<HelperChannel> ListHelpers(ulong secretId);
+
+    /// <summary>
+    /// The helper channels stored under <paramref name="secretId"/> that
+    /// <paramref name="filter"/> selects.
+    /// </summary>
+    /// <remarks>
+    /// The filter addresses records by <see cref="HelperChannel.ChannelId"/>,
+    /// and its <c>Role</c> is the <em>peer's</em>
+    /// <see cref="HelperChannel.PeerRole"/>. Apply it in your query; see
+    /// <see cref="ChannelFilter{TRole}"/>.
+    /// </remarks>
+    IEnumerable<HelperChannel> ListHelpers(ulong secretId, HelperFilter filter);
 
     /// <summary>
     /// Every replica-group member stored under <paramref name="secretId"/>,
@@ -179,8 +284,8 @@ public interface IChannelStore
     /// <para>
     /// The order is significant in exactly one situation. A group has one
     /// member holding the <c>Source</c> role; when it is removed, the protocol
-    /// promotes the first element of this sequence that is neither the
-    /// departing member nor itself leaving. Ordering this sequence is
+    /// promotes the first element returned for a filter that already excludes
+    /// the departing member. Ordering this sequence is
     /// therefore how an application chooses its succession policy. The choice
     /// is read once, on the single device running the removal, and is then
     /// published in the roster, so implementations on different devices need
@@ -193,7 +298,12 @@ public interface IChannelStore
     /// to make succession predictable.
     /// </para>
     /// </remarks>
-    IEnumerable<ReplicaMember> ListReplicas(ulong secretId);
+    /// <para>
+    /// The filter addresses records by <see cref="ReplicaMember.ReplicaId"/>,
+    /// and its <c>Role</c> is <see cref="ReplicaMember.Role"/>. Apply it in
+    /// your query; see <see cref="ChannelFilter{TRole}"/>.
+    /// </para>
+    IEnumerable<ReplicaMember> ListReplicas(ulong secretId, ReplicaFilter filter);
     void LinkChannel(ulong secretId, ulong a, ulong b);
     IEnumerable<ulong> LinkedChannels(ulong secretId, ulong channelId);
 }
@@ -314,7 +424,145 @@ public interface IUserSecretStore
 /// </remarks>
 public interface ITransport
 {
-    void Send(string uri, int protocol, byte[] message);
+    /// <summary>
+    /// Delivers <paramref name="message"/> to a peer reachable at any of
+    /// <paramref name="endpoints"/>.
+    /// </summary>
+    /// <param name="endpoints">
+    /// Every address that peer advertised, in the order it offered them,
+    /// already filtered to those the library will record. The library does
+    /// not rank them: which to dial, and whether to fall back when one is
+    /// unreachable, is this implementation's choice. Never empty.
+    /// </param>
+    /// <remarks>
+    /// <para>
+    /// Delivery to any one endpoint is success. Throw only when the message
+    /// reached none of them.
+    /// </para>
+    /// <para>
+    /// <b>Deliver once.</b> Every entry addresses the same peer, so sending to
+    /// all of them delivers one authenticated message several times. Stop at
+    /// the first success. The protocol's handlers are idempotent, so a
+    /// duplicate does not corrupt state, but it is still a duplicate to
+    /// anything counting messages, and a peer entitled to treat re-delivery as
+    /// a replay will.
+    /// </para>
+    /// <para>
+    /// <b>Prefer an adapter to writing this by hand.</b> Choosing which
+    /// endpoint to dial is yours and stays here; the bookkeeping around it is
+    /// the same everywhere and is already written and tested. Implement
+    /// <see cref="ISendOne"/> and wrap it in <see cref="SequentialFailover"/>.
+    /// Taking <c>endpoints[0]</c> compiles, passes every test, and silently
+    /// gives up the failover the list exists to provide — if that is genuinely
+    /// wanted, say so with <see cref="SingleEndpointTransport"/> rather than by
+    /// indexing.
+    /// </para>
+    /// </remarks>
+    void Send(IReadOnlyList<TransportProtocol> endpoints, byte[] message);
+}
+
+/// <summary>
+/// Delivers one message to one endpoint.
+/// </summary>
+/// <remarks>
+/// The narrow half of a transport: everything genuinely about dialing, and
+/// nothing about which endpoint to dial. Implement this, then wrap it in
+/// <see cref="SequentialFailover"/> or <see cref="SingleEndpointTransport"/> to
+/// get an <see cref="ITransport"/>.
+/// </remarks>
+public interface ISendOne
+{
+    /// <summary>
+    /// Delivers <paramref name="message"/> to <paramref name="endpoint"/>, or
+    /// throws to report that it did not arrive.
+    /// </summary>
+    /// <remarks>
+    /// The exception type does not matter and need not distinguish
+    /// "unreachable" from "rejected": <see cref="SequentialFailover"/> treats
+    /// both as a reason to try the next endpoint, which is the safe reading.
+    /// Trying an endpoint that would have refused costs a round trip; skipping
+    /// one that would have worked costs the delivery.
+    /// </remarks>
+    void SendOne(TransportProtocol endpoint, byte[] message);
+}
+
+/// <summary>
+/// Tries each endpoint in the order the peer offered; the first success wins.
+/// </summary>
+/// <remarks>
+/// Implements the <see cref="ITransport"/> contract over an
+/// <see cref="ISendOne"/>: endpoints are attempted in order, delivery stops at
+/// the first success, and an exception is thrown only when every endpoint
+/// failed. The message is delivered at most once.
+///
+/// This is the right default. A peer advertising several endpoints is saying
+/// it can be reached at any of them, and the reason 0.0.3 records the whole
+/// list is so one being down does not end the conversation.
+/// </remarks>
+public sealed class SequentialFailover : ITransport
+{
+    private readonly ISendOne _dialer;
+
+    /// <summary>Wraps a one-endpoint dialer.</summary>
+    public SequentialFailover(ISendOne dialer) =>
+        _dialer = dialer ?? throw new ArgumentNullException(nameof(dialer));
+
+    /// <inheritdoc/>
+    public void Send(IReadOnlyList<TransportProtocol> endpoints, byte[] message)
+    {
+        Exception? last = null;
+        foreach (TransportProtocol endpoint in endpoints)
+        {
+            try
+            {
+                _dialer.SendOne(endpoint, message);
+                return;
+            }
+            catch (Exception e)
+            {
+                last = e;
+            }
+        }
+        // `endpoints` is never empty — the library refuses to record a peer
+        // whose endpoints were all filtered away — so reaching here means at
+        // least one attempt was made and `last` is populated.
+        throw last ?? new InvalidOperationException(
+            "Send was called with no endpoints, which the protocol never does");
+    }
+}
+
+/// <summary>
+/// Uses the first endpoint only.
+/// </summary>
+/// <remarks>
+/// Reproduces the pre-0.0.3 behaviour exactly, for an application that
+/// genuinely serves one endpoint or has a reason not to fail over.
+///
+/// It exists so that choosing it is visible. <c>endpoints[0]</c> written inline
+/// looks like an implementation detail and reads as finished; naming this type
+/// records that failover was considered and declined, which is a claim a
+/// reviewer can disagree with. If the peers this application talks to advertise
+/// more than one endpoint, prefer <see cref="SequentialFailover"/> — every
+/// endpoint after the first is reachability being thrown away.
+/// </remarks>
+public sealed class SingleEndpointTransport : ITransport
+{
+    private readonly ISendOne _dialer;
+
+    /// <summary>Wraps a one-endpoint dialer.</summary>
+    public SingleEndpointTransport(ISendOne dialer) =>
+        _dialer = dialer ?? throw new ArgumentNullException(nameof(dialer));
+
+    /// <inheritdoc/>
+    public void Send(IReadOnlyList<TransportProtocol> endpoints, byte[] message)
+    {
+        if (endpoints.Count == 0)
+        {
+            throw new InvalidOperationException(
+                "Send was called with no endpoints, which the protocol never does");
+        }
+        _dialer.SendOne(endpoints[0], message);
+    }
 }
 
 /// <summary>
@@ -336,7 +584,7 @@ public enum StateKind : uint
     /// Active replica catch-up, at most one row per <c>secretId</c>. Holds
     /// the versions members have reported so far.
     /// </summary>
-    PendingSyncCheck = 4,
+    PendingReplicaDiscovery = 4,
 }
 
 /// <summary>

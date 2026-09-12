@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use crate::extensions::transport_protocol::TransportProtocolExt as _;
 use crate::primitives::sharing::SharingError;
-use crate::transport::TransportProtocolExt as _;
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     types::{ChannelId, SharedKey},
@@ -198,7 +198,7 @@ pub fn split(
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 ///
 /// let ProduceResult { envelope } =
-///     produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, None)
+///     produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, &[])
 ///         .expect("produce failed");
 ///
 /// assert!(!envelope.is_empty());
@@ -216,10 +216,16 @@ pub fn produce(
     keep_list: &[u32],
     description: impl Into<String>,
     shared_key: &SharedKey,
-    reply_to: Option<derec_proto::TransportProtocol>,
+    reply_to: &[derec_proto::TransportProtocol],
 ) -> Result<ProduceResult, crate::Error> {
     let timestamp = current_timestamp();
 
+    let (legacy_reply_to, reply_to_transports) =
+        crate::extensions::advertised_endpoints::split_reply_to(reply_to);
+    // Populating the deprecated singular field is the compatibility path
+    // that keeps peers predating `replyToTransports` answerable, so the
+    // warning is expected here rather than a defect.
+    #[allow(deprecated)]
     let msg = StoreShareRequestMessage {
         share: committed_share.encode_to_vec(),
         share_algorithm: SHARE_ALGORITHM_VSS,
@@ -228,7 +234,8 @@ pub fn produce(
         version_description: description.into(),
         timestamp: Some(timestamp),
         secret_id,
-        reply_to,
+        reply_to: legacy_reply_to,
+        reply_to_transports,
         // Helper-bound: `SHARE_ALGORITHM_VSS` implies no replica identity.
         // Helpers know nothing about replicas — see
         // `StoreShareRequestMessage.replicaId`.
@@ -330,7 +337,7 @@ pub fn produce(
 /// let committed_share = shares.get(&channel_id).expect("missing share");
 ///
 /// let ProduceResult { envelope } =
-///     produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, None)
+///     produce(channel_id, 1, 1, committed_share, &[], "", &shared_key, &[])
 ///         .expect("produce failed");
 ///
 /// let ExtractResult { request } = extract(&envelope, &shared_key).expect("extract failed");
@@ -372,7 +379,16 @@ pub fn extract(
 
     verify_timestamps(envelope.timestamp, request.timestamp)?;
 
-    if let Some(reply_to) = request.reply_to.as_ref() {
+    // Both spellings are validated, not just the one this build reads: a
+    // structurally invalid endpoint in the deprecated singular field is what
+    // a peer predating `replyToTransports` would dial, so letting it through
+    // unchecked would admit exactly the address the check exists to refuse.
+    #[allow(deprecated)]
+    for reply_to in request
+        .reply_to_transports
+        .iter()
+        .chain(request.reply_to.iter())
+    {
         reply_to.validate()?;
     }
 

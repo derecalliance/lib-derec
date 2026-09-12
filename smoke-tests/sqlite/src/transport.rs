@@ -25,8 +25,18 @@ impl InProcessTransport {
 }
 
 impl DeRecTransport for InProcessTransport {
-    fn send(&self, endpoint: &TransportProtocol, message: Vec<u8>) -> TransportFuture<'_> {
-        let entry = (endpoint.clone(), message);
+    /// The library hands over every endpoint the peer advertised, filtered
+    /// but unranked, and delivery to any one of them is success. A real
+    /// transport would try them in order and fall back; recording the first
+    /// is enough for an in-process double.
+    fn send(&self, endpoints: &[TransportProtocol], message: Vec<u8>) -> TransportFuture<'_> {
+        let entry = (
+            endpoints
+                .first()
+                .expect("the library never calls send with an empty endpoint list")
+                .clone(),
+            message,
+        );
         let outbox = self.outbox.clone();
         Box::pin(async move {
             outbox

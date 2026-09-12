@@ -4,6 +4,7 @@
 package native
 
 import (
+	"encoding/json"
 	"sync"
 	"unsafe"
 
@@ -22,8 +23,8 @@ type channelStore interface {
 	Load(secretID, channelID, replicaID uint64) (ChannelRecord, bool, error)
 	Save(secretID uint64, record ChannelRecord) error
 	Remove(secretID, channelID, replicaID uint64) (bool, error)
-	ListHelpers(secretID uint64) ([]HelperChannel, error)
-	ListReplicas(secretID uint64) ([]ReplicaMember, error)
+	ListHelpers(secretID uint64, filter HelperFilter) ([]HelperChannel, error)
+	ListReplicas(secretID uint64, filter ReplicaFilter) ([]ReplicaMember, error)
 	LinkChannel(secretID, a, b uint64) error
 	LinkedChannels(secretID, channelID uint64) ([]uint64, error)
 }
@@ -89,9 +90,13 @@ func dispatchChannelRemove(s *storeSet, secretID, channelID, replicaID uint64) (
 	return ffiStatusOK, existed
 }
 
-func dispatchChannelListHelpers(s *storeSet, secretID uint64) (status int32, out []byte) {
+func dispatchChannelListHelpers(s *storeSet, secretID uint64, filterJSON []byte) (status int32, out []byte) {
 	defer recoverInto(&status)
-	helpers, err := s.channel.ListHelpers(secretID)
+	var filter HelperFilter
+	if err := decodeFilter(filterJSON, &filter); err != nil {
+		return ffiStatusFailure, nil
+	}
+	helpers, err := s.channel.ListHelpers(secretID, filter)
 	if err != nil {
 		return ffiStatusFailure, nil
 	}
@@ -102,9 +107,13 @@ func dispatchChannelListHelpers(s *storeSet, secretID uint64) (status int32, out
 	return ffiStatusOK, encoded
 }
 
-func dispatchChannelListReplicas(s *storeSet, secretID uint64) (status int32, out []byte) {
+func dispatchChannelListReplicas(s *storeSet, secretID uint64, filterJSON []byte) (status int32, out []byte) {
 	defer recoverInto(&status)
-	members, err := s.channel.ListReplicas(secretID)
+	var filter ReplicaFilter
+	if err := decodeFilter(filterJSON, &filter); err != nil {
+		return ffiStatusFailure, nil
+	}
+	members, err := s.channel.ListReplicas(secretID, filter)
 	if err != nil {
 		return ffiStatusFailure, nil
 	}
@@ -175,13 +184,13 @@ func channelRemoveCallback(userData uintptr, secretID, channelID, replicaID uint
 	return st
 }
 
-func channelListHelpersCallback(userData uintptr, secretID uint64, outPtr, outLen *uintptr) (status int32) {
+func channelListHelpersCallback(userData uintptr, secretID uint64, filterPtr *byte, filterLen uintptr, outPtr, outLen *uintptr) (status int32) {
 	defer recoverInto(&status)
 	s, ok := lookupStores(storeHandle(userData))
 	if !ok {
 		return ffiStatusFailure
 	}
-	st, out := dispatchChannelListHelpers(s, secretID)
+	st, out := dispatchChannelListHelpers(s, secretID, readFilterBytes(filterPtr, filterLen))
 	if st != ffiStatusOK {
 		return st
 	}
@@ -189,13 +198,13 @@ func channelListHelpersCallback(userData uintptr, secretID uint64, outPtr, outLe
 	return ffiStatusOK
 }
 
-func channelListReplicasCallback(userData uintptr, secretID uint64, outPtr, outLen *uintptr) (status int32) {
+func channelListReplicasCallback(userData uintptr, secretID uint64, filterPtr *byte, filterLen uintptr, outPtr, outLen *uintptr) (status int32) {
 	defer recoverInto(&status)
 	s, ok := lookupStores(storeHandle(userData))
 	if !ok {
 		return ffiStatusFailure
 	}
-	st, out := dispatchChannelListReplicas(s, secretID)
+	st, out := dispatchChannelListReplicas(s, secretID, readFilterBytes(filterPtr, filterLen))
 	if st != ffiStatusOK {
 		return st
 	}
@@ -269,4 +278,23 @@ func buildChannelStoreCallbacks(h storeHandle) ChannelStoreCallbacks {
 		LinkedChannels: channelCallbackPtrs.linkedChannels,
 		FreeBuffer:     sharedFreeBufferCallback(),
 	}
+}
+
+// readFilterBytes borrows the filter buffer the core owns. It is valid only
+// for the duration of the call, which is why decodeFilter copies out of it
+// rather than retaining it.
+func readFilterBytes(ptr *byte, length uintptr) []byte {
+	if ptr == nil || length == 0 {
+		return nil
+	}
+	return unsafe.Slice(ptr, length)
+}
+
+// decodeFilter fills dst from the core's JSON. An absent or empty buffer
+// leaves dst zero-valued, which is an unrestricted filter — not an error.
+func decodeFilter(data []byte, dst any) error {
+	if len(data) == 0 {
+		return nil
+	}
+	return json.Unmarshal(data, dst)
 }

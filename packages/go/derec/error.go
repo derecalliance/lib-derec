@@ -84,6 +84,11 @@ const (
 	CodeChannelAlreadyPaired   int32 = 13
 	CodeAlreadyRestored        int32 = 14
 	CodeRestoreConflict        int32 = 15
+	// CodeReplicaIDConflict: a replica pairing named a replica_id already
+	// held by another member of the group, this device included. Assignment
+	// is the application's, so this is a configuration fault: assign a
+	// distinct id and pair again.
+	CodeReplicaIDConflict int32 = 16
 
 	CodeEncryption             int32 = 20
 	CodeKeygen                 int32 = 21
@@ -122,4 +127,17 @@ const (
 	CodeFFINulInString  int32 = 106
 
 	CodeTransportInvalid int32 = 120
+	// CodeNoUsableEndpoint: no transport is shared with the peer — its
+	// offered endpoints and this application's served endpoints intersect to
+	// nothing. Always a local, terminal error: push-only delivery means an
+	// unreachable peer also cannot be told.
+	CodeNoUsableEndpoint int32 = 121
+	// CodeConflictingPlaintextOptIn: both plaintext opt-in flags were set
+	// explicitly and disagree — Config.UnsafeHTTP says one thing and
+	// Config.UnsafeConnection the other. Raised at protocol construction
+	// rather than resolved by precedence, because the flag precedence would
+	// favour is the one being removed, and a configuration layer that emits
+	// every field unconditionally would otherwise let a defaulted value
+	// silently beat a deliberate one. Set only UnsafeConnection.
+	CodeConflictingPlaintextOptIn int32 = 122
 )

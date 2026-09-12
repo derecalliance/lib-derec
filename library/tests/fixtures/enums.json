@@ -208,8 +208,8 @@
           "wire": "SharingComplete"
         },
         {
-          "name": "SyncCheckComplete",
-          "wire": "SyncCheckComplete"
+          "name": "ReplicaDiscoveryComplete",
+          "wire": "ReplicaDiscoveryComplete"
         },
         {
           "name": "Unpaired",
@@ -284,7 +284,7 @@
           "wire": 3
         },
         {
-          "name": "PendingSyncCheck",
+          "name": "PendingReplicaDiscovery",
           "wire": 4
         }
       ]
@@ -322,11 +322,11 @@
           "wire": 6
         },
         {
-          "name": "SyncCheck",
+          "name": "ReplicaDiscovery",
           "wire": 7
         },
         {
-          "name": "RemoveReplica",
+          "name": "UnpairReplica",
           "wire": 8
         }
       ]
@@ -373,7 +373,7 @@
     },
     "StatusEnum": {
       "encoding": "number",
-      "note": "protobuf result status; 12 is deliberately unassigned",
+      "note": "protobuf result status",
       "variants": [
         {
           "name": "Ok",
@@ -422,6 +422,10 @@
         {
           "name": "IncompatibleParameterRange",
           "wire": 11
+        },
+        {
+          "name": "UnsupportedTransportProtocol",
+          "wire": 12
         },
         {
           "name": "VersionConflict",

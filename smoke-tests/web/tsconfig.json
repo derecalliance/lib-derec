@@ -3,6 +3,11 @@
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "Bundler",
+    // `channelFilterConformance.ts` imports the shared fixture. Safe as a
+    // compile input here because this project is `noEmit` — vite inlines the
+    // JSON, and `vite.config.ts` already allows serving from the repository
+    // root.
+    "resolveJsonModule": true,
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true

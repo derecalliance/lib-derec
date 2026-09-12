@@ -52,7 +52,7 @@ pub const DEREC_MESSAGE_KIND_VERIFY_SHARE_REQUEST: i32 = 12;
 pub const DEREC_MESSAGE_KIND_VERIFY_SHARE_RESPONSE: i32 = 13;
 /// Not a standalone message on the wire, but it crosses this FFI on its own
 /// as the `transport_protocol` argument of `create_contact_message` and the
-/// `peer_transport_protocol` result of `produce_pair_response_message`.
+/// `peer_transports` result of `produce_pair_response_message`.
 pub const DEREC_MESSAGE_KIND_TRANSPORT_PROTOCOL: i32 = 14;
 /// Crosses on its own as the `communication_info` argument of the pairing
 /// produce calls. See [`DEREC_MESSAGE_KIND_TRANSPORT_PROTOCOL`].
@@ -157,78 +157,6 @@ pub(crate) fn wide_numbers_to_numbers(value: &mut serde_json::Value) -> Result<(
         _ => {}
     }
     Ok(())
-}
-
-fn parse_buffer<'a>(ptr: *const u8, len: usize, name: &str) -> Result<&'a [u8], DeRecError> {
-    if ptr.is_null() && len > 0 {
-        return Err(ffi_error(
-            DEREC_CODE_FFI_NULL_PTR,
-            format!("{name} is null"),
-        ));
-    }
-    if len == 0 {
-        Ok(&[])
-    } else {
-        Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
-    }
-}
-
-fn bad_proto(message: impl Into<String>) -> DeRecMessageJsonResult {
-    DeRecMessageJsonResult {
-        error: ffi_error(DEREC_CODE_FFI_BAD_PROTO, message.into()),
-        bytes: empty_buffer(),
-    }
-}
-
-/// Decodes `proto` as the message named by `Proto`, converts it through
-/// `Dto`, and serializes it as JSON with the wide numeric fields widened to
-/// strings.
-fn decode_as<Proto, Dto>(proto: &[u8], name: &str) -> DeRecMessageJsonResult
-where
-    Proto: prost::Message + Default,
-    Dto: serde::Serialize + From<Proto>,
-{
-    let message = match Proto::decode(proto) {
-        Ok(m) => m,
-        Err(e) => return bad_proto(format!("bytes are not a valid {name}: {e}")),
-    };
-    let dto: Dto = message.into();
-    let mut json = match serde_json::to_value(&dto) {
-        Ok(v) => v,
-        Err(e) => return bad_proto(format!("failed to encode {name} as JSON: {e}")),
-    };
-    wide_numbers_to_strings(&mut json);
-    match serde_json::to_vec(&json) {
-        Ok(bytes) => DeRecMessageJsonResult {
-            error: success(),
-            bytes: vec_into_buffer(bytes),
-        },
-        Err(e) => bad_proto(format!("failed to serialize {name} JSON: {e}")),
-    }
-}
-
-/// Inverse of [`decode_as`].
-fn encode_as<Proto, Dto>(json: &[u8], name: &str) -> DeRecMessageJsonResult
-where
-    Proto: prost::Message + From<Dto>,
-    Dto: serde::de::DeserializeOwned,
-{
-    let mut value: serde_json::Value = match serde_json::from_slice(json) {
-        Ok(v) => v,
-        Err(e) => return bad_proto(format!("{name} JSON is not valid JSON: {e}")),
-    };
-    if let Err(e) = wide_numbers_to_numbers(&mut value) {
-        return bad_proto(format!("{name} JSON has an invalid numeric field: {e}"));
-    }
-    let dto: Dto = match serde_json::from_value(value) {
-        Ok(d) => d,
-        Err(e) => return bad_proto(format!("{name} JSON does not match the message shape: {e}")),
-    };
-    let message: Proto = dto.into();
-    DeRecMessageJsonResult {
-        error: success(),
-        bytes: vec_into_buffer(message.encode_to_vec()),
-    }
 }
 
 /// Dispatches `$body` over every message kind. Keeping the table in one macro
@@ -375,6 +303,78 @@ pub extern "C" fn derec_encode_message_json(
     dispatch_message_kind!(kind, json, encode_as)
 }
 
+fn parse_buffer<'a>(ptr: *const u8, len: usize, name: &str) -> Result<&'a [u8], DeRecError> {
+    if ptr.is_null() && len > 0 {
+        return Err(ffi_error(
+            DEREC_CODE_FFI_NULL_PTR,
+            format!("{name} is null"),
+        ));
+    }
+    if len == 0 {
+        Ok(&[])
+    } else {
+        Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+}
+
+fn bad_proto(message: impl Into<String>) -> DeRecMessageJsonResult {
+    DeRecMessageJsonResult {
+        error: ffi_error(DEREC_CODE_FFI_BAD_PROTO, message.into()),
+        bytes: empty_buffer(),
+    }
+}
+
+/// Decodes `proto` as the message named by `Proto`, converts it through
+/// `Dto`, and serializes it as JSON with the wide numeric fields widened to
+/// strings.
+fn decode_as<Proto, Dto>(proto: &[u8], name: &str) -> DeRecMessageJsonResult
+where
+    Proto: prost::Message + Default,
+    Dto: serde::Serialize + From<Proto>,
+{
+    let message = match Proto::decode(proto) {
+        Ok(m) => m,
+        Err(e) => return bad_proto(format!("bytes are not a valid {name}: {e}")),
+    };
+    let dto: Dto = message.into();
+    let mut json = match serde_json::to_value(&dto) {
+        Ok(v) => v,
+        Err(e) => return bad_proto(format!("failed to encode {name} as JSON: {e}")),
+    };
+    wide_numbers_to_strings(&mut json);
+    match serde_json::to_vec(&json) {
+        Ok(bytes) => DeRecMessageJsonResult {
+            error: success(),
+            bytes: vec_into_buffer(bytes),
+        },
+        Err(e) => bad_proto(format!("failed to serialize {name} JSON: {e}")),
+    }
+}
+
+/// Inverse of [`decode_as`].
+fn encode_as<Proto, Dto>(json: &[u8], name: &str) -> DeRecMessageJsonResult
+where
+    Proto: prost::Message + From<Dto>,
+    Dto: serde::de::DeserializeOwned,
+{
+    let mut value: serde_json::Value = match serde_json::from_slice(json) {
+        Ok(v) => v,
+        Err(e) => return bad_proto(format!("{name} JSON is not valid JSON: {e}")),
+    };
+    if let Err(e) = wide_numbers_to_numbers(&mut value) {
+        return bad_proto(format!("{name} JSON has an invalid numeric field: {e}"));
+    }
+    let dto: Dto = match serde_json::from_value(value) {
+        Ok(d) => d,
+        Err(e) => return bad_proto(format!("{name} JSON does not match the message shape: {e}")),
+    };
+    let message: Proto = dto.into();
+    DeRecMessageJsonResult {
+        error: success(),
+        bytes: vec_into_buffer(message.encode_to_vec()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,7 +511,9 @@ mod tests {
             version: 7,
             nonce: 9_007_199_254_740_993,
             timestamp: None,
+            #[allow(deprecated)]
             reply_to: None,
+            reply_to_transports: Vec::new(),
         };
         let json = decode(
             DEREC_MESSAGE_KIND_VERIFY_SHARE_REQUEST,
@@ -564,6 +566,8 @@ mod tests {
 
     /// `ParameterRange`'s bounds are `i64` and are surfaced as `bigint` by
     /// the WASM SDKs, so they cross this seam as strings too.
+    // Compatibility, not oversight — see the `transport` module docs.
+    #[allow(deprecated)]
     #[test]
     fn parameter_range_bounds_are_widened() {
         let message = derec_proto::PairRequestMessage {
@@ -579,6 +583,7 @@ mod tests {
             }),
             transport_protocol: None,
             timestamp: None,
+            supported_transports: Vec::new(),
         };
         let json = decode(DEREC_MESSAGE_KIND_PAIR_REQUEST, &message.encode_to_vec());
 
@@ -605,7 +610,6 @@ mod tests {
             "version": 1,
             "nonce": 34u64,
             "timestamp": null,
-            "reply_to": null,
         });
         let bytes = encode(DEREC_MESSAGE_KIND_VERIFY_SHARE_REQUEST, &json);
         let decoded = derec_proto::VerifyShareRequestMessage::decode(&bytes[..]).unwrap();
@@ -620,7 +624,6 @@ mod tests {
             "version": 1,
             "nonce": "0",
             "timestamp": null,
-            "reply_to": null,
         });
         let bytes = serde_json::to_vec(&json).unwrap();
         let result = derec_encode_message_json(
@@ -652,7 +655,9 @@ mod tests {
         let message = derec_proto::UnpairRequestMessage {
             memo: "leaving".to_owned(),
             timestamp: None,
+            #[allow(deprecated)]
             reply_to: None,
+            reply_to_transports: Vec::new(),
             replica_id: Some(u64::MAX),
         };
         let json = decode(DEREC_MESSAGE_KIND_UNPAIR_REQUEST, &message.encode_to_vec());

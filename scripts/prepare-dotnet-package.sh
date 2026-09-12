@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Path remapping for every shipped binary; see the file for why.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/build-env.sh"
+
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LIBRARY_DIR="$ROOT_DIR/library"
 WORKSPACE_TARGET_DIR="$ROOT_DIR/target"

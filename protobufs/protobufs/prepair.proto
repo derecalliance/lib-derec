@@ -72,13 +72,62 @@ message PrePairRequestMessage {
 
   // Transport endpoint at which the sender expects to receive the
   // `PrePairResponseMessage`.
-  TransportProtocol transportProtocol = 2;
+  //
+  // Deprecated: superseded by `supportedTransports`, which carries every
+  // endpoint rather than one.
+  //
+  // **Reading this field directly is now incorrect.** Its meaning narrowed
+  // from "the endpoint" to "one entry of a list, and possibly absent": a
+  // sender that has moved past this field advertises only
+  // `supportedTransports`. A reader that was correct before this release is
+  // a bug now — it rejects, or fails to reply to, a peer that is offering it
+  // a perfectly good endpoint. Resolve both spellings instead of reading
+  // either: `advertised_endpoints()` (Rust and TypeScript),
+  // `AdvertisedEndpoints()` (Go), `AdvertisedEndpoints()` (.NET).
+  //
+  // Senders still populate it: a sender that sets `supportedTransports`
+  // MUST also set this to a single best-compatibility choice, so
+  // implementations predating the list still receive a reply.
+  //
+  // **Scheduled for removal in v0.0.5.**
+  TransportProtocol transportProtocol = 2 [deprecated = true];
 
   // Timestamp indicating when this message was created.
   //
   // This value is expressed in UTC and is used for envelope-vs-body
   // timestamp validation, replay detection, and observability.
   google.protobuf.Timestamp timestamp = 3;
+
+  // Every transport endpoint the sender of this PrePair request can be
+  // reached on for the `PrePairResponseMessage`.
+  //
+  // Each entry is a complete endpoint: a URI plus the protocol that says
+  // how to interpret it. The list is written in the sender's own
+  // preference order.
+  //
+  // # Selection is the recipient's
+  //
+  // A recipient picks whichever entry suits it, ordered by its **own**
+  // preference rather than the sender's. The order here expresses
+  // availability, not a ranking the recipient must honor.
+  //
+  // # Compatibility
+  //
+  // Absent means "only `transportProtocol` is offered", which is how every
+  // implementation predating this field behaves. A sender populating this
+  // list MUST also set `transportProtocol` to a single best-compatibility
+  // choice so those implementations still reply.
+  //
+  // At least one of the two MUST be present: a request naming no endpoint
+  // gives the recipient nowhere to send the response.
+  //
+  // # Security
+  //
+  // PrePair traffic is plaintext — no shared key exists yet — so these
+  // endpoints are visible to a passive observer, exactly as
+  // `transportProtocol` already was. The recipient's transport policy still
+  // refuses plaintext entries unless plaintext has been opted into.
+  repeated TransportProtocol supportedTransports = 4;
 }
 
 // PrePairResponseMessage is the contact creator's reply to a

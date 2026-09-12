@@ -384,10 +384,27 @@ struct ReplicasJsonIn {
     shared_key: Vec<u8>,
 }
 
+/// One advertised endpoint, matching the roster's JSON shape: a URI plus the
+/// `Protocol` discriminant, so no protocol is inferred from the scheme.
+#[derive(serde::Deserialize)]
+struct EndpointJsonIn {
+    uri: String,
+    protocol: i32,
+}
+
+impl From<EndpointJsonIn> for derec_proto::TransportProtocol {
+    fn from(j: EndpointJsonIn) -> Self {
+        derec_proto::TransportProtocol {
+            uri: j.uri,
+            protocol: j.protocol,
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct HelperJsonIn {
     channel_id: String,
-    transport_uri: String,
+    transports: Vec<EndpointJsonIn>,
     shared_key: Vec<u8>,
     #[serde(default)]
     communication_info: std::collections::HashMap<String, String>,
@@ -396,7 +413,7 @@ struct HelperJsonIn {
 #[derive(serde::Deserialize)]
 struct ReplicaJsonIn {
     replica_id: String,
-    transport_uri: String,
+    transports: Vec<EndpointJsonIn>,
     /// `"Source"` or `"Destination"`.
     role: String,
     #[serde(default)]
@@ -426,7 +443,7 @@ impl SecretJsonIn {
             .map(|h| -> Result<_, String> {
                 Ok(crate::protocol::types::HelperInfo {
                     channel_id: parse_u64(&h.channel_id, "helper.channel_id")?,
-                    transport_uri: h.transport_uri,
+                    transports: h.transports.into_iter().map(Into::into).collect(),
                     shared_key: h.shared_key,
                     communication_info: h.communication_info,
                 })
@@ -451,7 +468,7 @@ impl SecretJsonIn {
                         };
                         Ok(crate::protocol::types::ReplicaInfo {
                             replica_id: parse_u64(&r.replica_id, "replica.replica_id")?,
-                            transport_uri: r.transport_uri,
+                            transports: r.transports.into_iter().map(Into::into).collect(),
                             role: role as i32,
                             communication_info: r.communication_info,
                         })

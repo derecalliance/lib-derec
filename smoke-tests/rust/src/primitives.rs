@@ -40,6 +40,10 @@ fn run_protocol_version_test() {
     println!("Protocol version test passed.");
 }
 
+// Touches the deprecated singular `transportProtocol`: this is the
+// compatibility path that keeps peers predating `supportedTransports`
+// working, so the warning is expected here rather than a defect.
+#[allow(deprecated)]
 fn run_pairing_flow_test() {
     println!("=== Pairing flow test ===");
 
@@ -48,10 +52,10 @@ fn run_pairing_flow_test() {
     let contact_result = pair_request::create_contact(
         channel_id,
         derec_proto::ContactMode::InlineKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://example.com/alice".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("pair_request::create_contact failed");
@@ -72,10 +76,10 @@ fn run_pairing_flow_test() {
 
     let pair_req = pair_request::produce(
         SenderKind::Helper,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://example.com/helper".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &decoded_contact,
         None,
         None,
@@ -111,6 +115,7 @@ fn run_pairing_flow_test() {
         contact_result.secret_key.as_ref().unwrap(),
         None,
         None,
+        derec_library::transport::TransportPolicy::new(false),
     )
     .expect("pair_response::produce failed");
 
@@ -162,10 +167,10 @@ fn run_pairing_flow_hashed_keys_test() {
     let alice_contact_result = pair_request::create_contact(
         channel_id,
         derec_proto::ContactMode::HashedKeys,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://example.com/alice/ephemeral".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         None,
     )
     .expect("pair_request::create_contact (HASHED_KEYS) failed");
@@ -197,10 +202,10 @@ fn run_pairing_flow_hashed_keys_test() {
     );
 
     let bob_prepair_req = pair_request::produce_pre_pair_request(
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://example.com/helper/ephemeral".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &alice_contact,
     )
     .expect("pair_request::produce_pre_pair_request failed");
@@ -245,10 +250,10 @@ fn run_pairing_flow_hashed_keys_test() {
 
     let pair_req = pair_request::produce(
         SenderKind::Helper,
-        TransportProtocol {
+        vec![TransportProtocol {
             uri: "https://example.com/helper".to_owned(),
             protocol: Protocol::Https.into(),
-        },
+        }],
         &filled_in_contact,
         None,
         None,
@@ -267,6 +272,7 @@ fn run_pairing_flow_hashed_keys_test() {
         alice_secret.as_ref().unwrap(),
         None,
         None,
+        derec_library::transport::TransportPolicy::new(false),
     )
     .expect("pair_response::produce failed");
 
@@ -337,7 +343,7 @@ fn run_sharing_flow_test() {
             &[],
             "",
             &shared_key,
-            None,
+            &[],
         )
         .unwrap_or_else(|e| panic!("share_request::produce failed for {channel:?}: {e}"));
 
@@ -408,7 +414,7 @@ fn run_verification_flow_test() {
         &[],
         "",
         shared_key_1,
-        None,
+        &[],
     )
     .expect("share_request::produce failed for channel 1")
     .envelope;
@@ -421,7 +427,7 @@ fn run_verification_flow_test() {
         &[],
         "",
         shared_key_1,
-        None,
+        &[],
     )
     .expect("share_request::produce failed for channel 2")
     .envelope;
@@ -436,7 +442,7 @@ fn run_verification_flow_test() {
         .request
         .share;
 
-    let produced = verif_request::produce(channel_1, secret_id, version, shared_key_1, None)
+    let produced = verif_request::produce(channel_1, secret_id, version, shared_key_1, &[])
         .expect("verif_request::produce failed");
 
     let request_envelope = derec_proto::DeRecMessage::decode(produced.envelope.as_slice())
@@ -519,7 +525,7 @@ fn run_recovery_flow_test() {
             &[],
             "",
             shared_key_1,
-            None,
+            &[],
         )
         .expect("share_request::produce failed for channel 1")
         .envelope,
@@ -537,7 +543,7 @@ fn run_recovery_flow_test() {
             &[],
             "",
             shared_key_2,
-            None,
+            &[],
         )
         .expect("share_request::produce failed for channel 2")
         .envelope,
@@ -546,7 +552,7 @@ fn run_recovery_flow_test() {
     .expect("share_request::extract failed for channel 2")
     .request;
 
-    let share_req_1 = rec_request::produce(channel_1, secret_id, version, shared_key_1, None)
+    let share_req_1 = rec_request::produce(channel_1, secret_id, version, shared_key_1, &[])
         .expect("rec_request::produce failed for channel 1");
     let get_request_1 = rec_request::extract(&share_req_1.envelope, shared_key_1)
         .expect("rec_request::extract failed for channel 1")
@@ -558,7 +564,7 @@ fn run_recovery_flow_test() {
         .expect("rec_response::extract failed for channel 1")
         .response;
 
-    let share_req_2 = rec_request::produce(channel_2, secret_id, version, shared_key_2, None)
+    let share_req_2 = rec_request::produce(channel_2, secret_id, version, shared_key_2, &[])
         .expect("rec_request::produce failed for channel 2");
     let get_request_2 = rec_request::extract(&share_req_2.envelope, shared_key_2)
         .expect("rec_request::extract failed for channel 2")
@@ -591,7 +597,7 @@ fn run_discovery_flow_test() {
     let shared_key = [11u8; 32];
 
     let request =
-        disc_request::produce(channel_id, &shared_key, None).expect("disc_request::produce failed");
+        disc_request::produce(channel_id, &shared_key, &[]).expect("disc_request::produce failed");
     assert!(
         !request.envelope.is_empty(),
         "discovery request envelope must not be empty"
@@ -639,7 +645,7 @@ fn run_envelope_trace_id_test() {
     let shared_key = [9u8; 32];
 
     let result =
-        disc_request::produce(channel_id, &shared_key, None).expect("disc_request::produce failed");
+        disc_request::produce(channel_id, &shared_key, &[]).expect("disc_request::produce failed");
 
     let trace_before =
         derec_library::derec_message::read_trace_id(&result.envelope).expect("read failed");
@@ -672,25 +678,45 @@ fn run_request_reply_to_test() {
         protocol: Protocol::Https as i32,
     };
 
-    let result = disc_request::produce(channel_id, &shared_key, Some(reply_to.clone()))
-        .expect("disc_request::produce failed");
+    let result = disc_request::produce(
+        channel_id,
+        &shared_key,
+        std::slice::from_ref(&reply_to.clone()),
+    )
+    .expect("disc_request::produce failed");
 
     let extracted =
         disc_request::extract(&result.envelope, &shared_key).expect("disc_request::extract failed");
     assert_eq!(
-        extracted.request.reply_to,
-        Some(reply_to),
-        "reply_to must round-trip on the inner request"
+        extracted.request.reply_to_transports,
+        vec![reply_to.clone()],
+        "replyToTransports must round-trip on the inner request"
     );
+    #[allow(deprecated)]
+    {
+        assert_eq!(
+            extracted.request.reply_to,
+            Some(reply_to),
+            "the deprecated singular replyTo carries the list's first entry"
+        );
+    }
 
-    let plain = disc_request::produce(channel_id, &shared_key, None)
+    let plain = disc_request::produce(channel_id, &shared_key, &[])
         .expect("disc_request::produce (no reply_to) failed");
     let plain_extracted =
         disc_request::extract(&plain.envelope, &shared_key).expect("disc_request::extract failed");
     assert!(
-        plain_extracted.request.reply_to.is_none(),
-        "absent reply_to must decode as None"
+        plain_extracted.request.reply_to_transports.is_empty(),
+        "an unset reply_to must decode as an empty list"
     );
+    #[allow(deprecated)]
+    {
+        assert!(
+            plain_extracted.request.reply_to.is_none(),
+            "an unset reply_to must leave the deprecated singular field absent, \
+             not present-and-empty — absent is what means 'route to the stored endpoints'"
+        );
+    }
 
     println!("Request reply_to round-trip test passed.");
 }

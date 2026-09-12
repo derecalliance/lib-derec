@@ -20,7 +20,7 @@ const (
 	EventTypeReplicaSyncRejected       = "ReplicaSyncRejected"
 	EventTypeReplicaSyncFailed         = "ReplicaSyncFailed"
 	EventTypeReplicaSyncComplete       = "ReplicaSyncComplete"
-	EventTypeSyncCheckComplete         = "SyncCheckComplete"
+	EventTypeReplicaDiscoveryComplete  = "ReplicaDiscoveryComplete"
 	EventTypeReplicaRemoved            = "ReplicaRemoved"
 	EventTypeReplicaSourceChanged      = "ReplicaSourceChanged"
 	EventTypeSelfRemovedFromGroup      = "SelfRemovedFromGroup"
@@ -86,6 +86,11 @@ type Event struct {
 	// the EventType* constants above.
 	Type string `json:"type"`
 
+	// Every *Started event: the token identifying the round this request
+	// belongs to. One token is drawn per Start call, so a fan-out shares it
+	// across all of its targets, and the peer echoes it on the response.
+	TraceID string `json:"trace_id"`
+
 	// PairingCompleted, PairingStarted.
 	ChannelID             string            `json:"channel_id"`
 	PairingChannelID      string            `json:"pairing_channel_id"`
@@ -121,7 +126,7 @@ type Event struct {
 	Synced []string `json:"synced"`
 	Behind []string `json:"behind"`
 
-	// SyncCheckComplete. LocalVersion is what this device held when the
+	// ReplicaDiscoveryComplete. LocalVersion is what this device held when the
 	// catch-up ran, GroupVersion the newest any member reported, and
 	// FetchedFrom names the member the state was pulled from — nil when this
 	// device was already current, in which case no hydration event follows.
@@ -161,6 +166,21 @@ type Event struct {
 	ShareDescription *string `json:"share_description"`
 	ShareSecretID    *string `json:"share_secret_id"`
 }
+
+// The label vocabulary for Event.ActionKind, one value per pending-action
+// kind the protocol can raise. Compare against these rather than writing the
+// string literal — they match the Rust PendingActionKind discriminants
+// one-for-one.
+const (
+	ActionKindPairing           = "Pairing"
+	ActionKindPrePair           = "PrePair"
+	ActionKindStoreShare        = "StoreShare"
+	ActionKindVerifyShare       = "VerifyShare"
+	ActionKindDiscovery         = "Discovery"
+	ActionKindGetShare          = "GetShare"
+	ActionKindUnpair            = "Unpair"
+	ActionKindUpdateChannelInfo = "UpdateChannelInfo"
+)
 
 // Secret mirrors SecretWire in wire.rs — the typed secret snapshot carried
 // by ReplicaSecretReceived and SecretRecovered.
@@ -242,9 +262,16 @@ func (r Replicas) MarshalJSON() ([]byte, error) {
 
 // Helper mirrors the Helper wire DTO in wire.rs — one entry of Secret's
 // helper roster.
+// EndpointJSON is one advertised address in the recovered-secret roster:
+// URI plus the protocol discriminant, so nothing is inferred from a scheme.
+type EndpointJSON struct {
+	URI      string `json:"uri"`
+	Protocol int32  `json:"protocol"`
+}
+
 type Helper struct {
 	ChannelID         string            `json:"channel_id"`
-	TransportURI      string            `json:"transport_uri"`
+	Transports        []EndpointJSON    `json:"transports"`
 	SharedKey         []byte            `json:"shared_key"`
 	CommunicationInfo map[string]string `json:"communication_info"`
 }
@@ -257,12 +284,12 @@ type Helper struct {
 func (h Helper) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		ChannelID         string               `json:"channel_id"`
-		TransportURI      string               `json:"transport_uri"`
+		Transports        []EndpointJSON       `json:"transports"`
 		SharedKey         native.JSONByteArray `json:"shared_key"`
 		CommunicationInfo map[string]string    `json:"communication_info,omitempty"`
 	}{
 		ChannelID:         h.ChannelID,
-		TransportURI:      h.TransportURI,
+		Transports:        h.Transports,
 		SharedKey:         native.JSONByteArray(h.SharedKey),
 		CommunicationInfo: h.CommunicationInfo,
 	})
@@ -273,7 +300,7 @@ func (h Helper) MarshalJSON() ([]byte, error) {
 // group carries "Source".
 type Replica struct {
 	ReplicaID         string            `json:"replica_id"`
-	TransportURI      string            `json:"transport_uri"`
+	Transports        []EndpointJSON    `json:"transports"`
 	Role              string            `json:"role"`
 	CommunicationInfo map[string]string `json:"communication_info"`
 }
@@ -286,12 +313,12 @@ type Replica struct {
 func (r Replica) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		ReplicaID         string            `json:"replica_id"`
-		TransportURI      string            `json:"transport_uri"`
+		Transports        []EndpointJSON    `json:"transports"`
 		Role              string            `json:"role"`
 		CommunicationInfo map[string]string `json:"communication_info,omitempty"`
 	}{
 		ReplicaID:         r.ReplicaID,
-		TransportURI:      r.TransportURI,
+		Transports:        r.Transports,
 		Role:              r.Role,
 		CommunicationInfo: r.CommunicationInfo,
 	})

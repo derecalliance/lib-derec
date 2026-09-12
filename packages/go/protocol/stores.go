@@ -36,7 +36,11 @@
 // package.
 package protocol
 
-import "github.com/derecalliance/lib-derec/packages/go/internal/native"
+import (
+	"errors"
+
+	"github.com/derecalliance/lib-derec/packages/go/internal/native"
+)
 
 // Domain types exchanged by the store/transport interfaces below. See
 // internal/native/store_types.go for the authoritative definitions and
@@ -58,6 +62,13 @@ type (
 	TransportEndpoint = native.TransportEndpoint
 	// ChannelStatus is a channel's lifecycle status.
 	ChannelStatus = native.ChannelStatus
+	// ChannelFilter carries the id and status restrictions shared by the
+	// two listing filters.
+	ChannelFilter = native.ChannelFilter
+	// HelperFilter narrows ChannelStore.ListHelpers.
+	HelperFilter = native.HelperFilter
+	// ReplicaFilter narrows ChannelStore.ListReplicas.
+	ReplicaFilter = native.ReplicaFilter
 	// SenderKind identifies the role a node holds on a Channel.
 	SenderKind = native.SenderKind
 	// SecretKind selects which kind of secret material a SecretValue
@@ -99,11 +110,11 @@ const (
 	SecretKindPairingSecret  = native.SecretKindPairingSecret
 	SecretKindPairingContact = native.SecretKindPairingContact
 
-	StateKindPendingVerification = native.StateKindPendingVerification
-	StateKindPendingRecovery     = native.StateKindPendingRecovery
-	StateKindPendingUnpair       = native.StateKindPendingUnpair
-	StateKindSharingRound        = native.StateKindSharingRound
-	StateKindPendingSyncCheck    = native.StateKindPendingSyncCheck
+	StateKindPendingVerification     = native.StateKindPendingVerification
+	StateKindPendingRecovery         = native.StateKindPendingRecovery
+	StateKindPendingUnpair           = native.StateKindPendingUnpair
+	StateKindSharingRound            = native.StateKindSharingRound
+	StateKindPendingReplicaDiscovery = native.StateKindPendingReplicaDiscovery
 )
 
 // ChannelStore persists channel records plus the channel-link graph used to
@@ -136,10 +147,21 @@ type ChannelStore interface {
 	// Returns whether an entry actually existed; removing a missing
 	// entry is not an error.
 	Remove(secretID, channelID, replicaID uint64) (existed bool, err error)
-	// ListHelpers returns every helper channel stored under secretID.
-	ListHelpers(secretID uint64) ([]HelperChannel, error)
-	// ListReplicas returns every replica-group member stored under
-	// secretID, including this device's own row.
+	// ListHelpers returns the helper channels stored under secretID that
+	// filter selects.
+	//
+	// The filter addresses records by HelperChannel.ChannelID, and its Role
+	// is the peer's HelperChannel.PeerRole. A zero HelperFilter selects
+	// every channel. Apply it in your query; the library re-applies it to
+	// whatever you return, so ignoring it is slow, not wrong.
+	ListHelpers(secretID uint64, filter HelperFilter) ([]HelperChannel, error)
+	// ListReplicas returns the replica-group members stored under secretID
+	// that filter selects, including this device's own row unless the
+	// filter excludes it.
+	//
+	// The filter addresses records by ReplicaMember.ReplicaID, and its Role
+	// is ReplicaMember.Role. A zero ReplicaFilter selects every member. Apply
+	// it in your query; the library re-applies it to whatever you return.
 	//
 	// The order is significant in exactly one situation. A group has one
 	// member holding the Source role; when it is removed, the protocol
@@ -154,7 +176,7 @@ type ChannelStore interface {
 	// to the storage — note that a SQL SELECT without ORDER BY and Go map
 	// iteration are both arbitrary. Order explicitly to make succession
 	// predictable.
-	ListReplicas(secretID uint64) ([]ReplicaMember, error)
+	ListReplicas(secretID uint64, filter ReplicaFilter) ([]ReplicaMember, error)
 	// LinkChannel records a as belonging to the same Owner identity as
 	// b (and vice versa) — a symmetric relation.
 	LinkChannel(secretID, a, b uint64) error
@@ -258,9 +280,112 @@ type StateStore interface {
 // the buffer is genuine fan-out and still has to be delivered. See "Serving
 // DeRec over request/response transports" in the Rust SDK README for the full
 // pattern.
+// Endpoint is one address a peer advertised, with the protocol discriminant
+// that says how to reach it (see derecpb.Protocol: 0 = HTTPS, 1 = GRPC).
+//
+// Aliased rather than redeclared so a Transport implementation satisfies the
+// internal seam without a conversion at every call site.
+type Endpoint = native.Endpoint
+
 type Transport interface {
-	// Send delivers message to uri over the given transport protocol
-	// (0 = HTTPS, the only value currently defined —see
-	// derecpb.Protocol).
-	Send(uri string, protocol int32, message []byte) error
+	// Send delivers message to a peer reachable at any of endpoints.
+	//
+	// endpoints are the addresses that peer advertised, in the order it
+	// offered them, already filtered to those the library will record. The
+	// library does not rank them: which to dial, and whether to fall back
+	// when one is unreachable, is this implementation's choice — only it
+	// knows which of its transports are healthy or cheap.
+	//
+	// Delivery to any one endpoint is success. Return an error only when
+	// the message reached none of them. endpoints is never empty.
+	//
+	// Deliver once. Every entry addresses the same peer, so sending to all
+	// of them delivers one authenticated message several times. Stop at the
+	// first success. The protocol's handlers are idempotent, so a duplicate
+	// does not corrupt state, but it is still a duplicate to anything
+	// counting messages, and a peer entitled to treat re-delivery as a
+	// replay will.
+	//
+	// Prefer an adapter to writing this by hand. Choosing which endpoint to
+	// dial is yours and stays here; the bookkeeping around it is the same
+	// everywhere and is already written and tested. Implement SendOne and
+	// wrap it in SequentialFailover. Taking endpoints[0] compiles, passes
+	// every test, and silently gives up the failover the list exists to
+	// provide — if that is genuinely wanted, say so with
+	// SingleEndpointTransport rather than by indexing.
+	Send(endpoints []Endpoint, message []byte) error
+}
+
+// SendOne delivers one message to one endpoint.
+//
+// The narrow half of a transport: everything genuinely about dialing, and
+// nothing about which endpoint to dial. Implement this, then wrap it in
+// SequentialFailover or SingleEndpointTransport to get a Transport.
+type SendOne interface {
+	// SendOne delivers message to endpoint, or reports that it did not
+	// arrive.
+	//
+	// The error need not distinguish "unreachable" from "rejected":
+	// SequentialFailover treats both as a reason to try the next endpoint,
+	// which is the safe reading. Trying an endpoint that would have refused
+	// costs a round trip; skipping one that would have worked costs the
+	// delivery.
+	SendOne(endpoint Endpoint, message []byte) error
+}
+
+// SequentialFailover tries each endpoint in the order the peer offered it and
+// stops at the first success.
+//
+// Implements the Transport contract over a SendOne: endpoints are attempted in
+// order, delivery stops at the first success, and an error is returned only
+// when every endpoint failed. The message is delivered at most once.
+//
+// This is the right default. A peer advertising several endpoints is saying it
+// can be reached at any of them, and the reason 0.0.3 records the whole list is
+// so one being down does not end the conversation.
+type SequentialFailover struct {
+	// Dialer delivers to a single endpoint. Required.
+	Dialer SendOne
+}
+
+// Send implements Transport.
+func (s SequentialFailover) Send(endpoints []Endpoint, message []byte) error {
+	var last error
+	for _, endpoint := range endpoints {
+		if err := s.Dialer.SendOne(endpoint, message); err != nil {
+			last = err
+			continue
+		}
+		return nil
+	}
+	if last == nil {
+		// endpoints is never empty through the protocol, which refuses to
+		// record a peer whose endpoints were all filtered away.
+		return errors.New("protocol: Send called with no endpoints")
+	}
+	return last
+}
+
+// SingleEndpointTransport uses the first endpoint only.
+//
+// Reproduces the pre-0.0.3 behaviour exactly, for an application that genuinely
+// serves one endpoint or has a reason not to fail over.
+//
+// It exists so that choosing it is visible. endpoints[0] written inline looks
+// like an implementation detail and reads as finished; naming this type records
+// that failover was considered and declined, which is a claim a reviewer can
+// disagree with. If the peers this application talks to advertise more than one
+// endpoint, prefer SequentialFailover — every endpoint after the first is
+// reachability being thrown away.
+type SingleEndpointTransport struct {
+	// Dialer delivers to a single endpoint. Required.
+	Dialer SendOne
+}
+
+// Send implements Transport.
+func (s SingleEndpointTransport) Send(endpoints []Endpoint, message []byte) error {
+	if len(endpoints) == 0 {
+		return errors.New("protocol: Send called with no endpoints")
+	}
+	return s.Dialer.SendOne(endpoints[0], message)
 }

@@ -24,6 +24,7 @@ func main() {
 	runProtocol()
 	runEveryContactModePairs()
 	runUnsafeHTTP()
+	runConfigSurface()
 
 	fmt.Println()
 	fmt.Println("All smoke tests passed.")

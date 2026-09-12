@@ -21,7 +21,7 @@
 
 use crate::{
     interop::ffi::common::{
-        DeRecBuffer, empty_buffer, parse_optional_transport_protocol, vec_into_buffer,
+        DeRecBuffer, empty_buffer, parse_transport_protocol_list, vec_into_buffer,
         write_len_prefixed, write_u32_le, write_u64_le,
     },
     interop::ffi::error::{
@@ -206,7 +206,7 @@ pub extern "C" fn produce_store_share_request_message(
         }
     };
 
-    let reply_to = match parse_optional_transport_protocol(reply_to_ptr, reply_to_len) {
+    let reply_to = match parse_transport_protocol_list(reply_to_ptr, reply_to_len, "reply_to_ptr") {
         Ok(rt) => rt,
         Err(e) => return with_err(e),
     };
@@ -219,7 +219,7 @@ pub extern "C" fn produce_store_share_request_message(
         keep_list,
         description,
         &shared_key,
-        reply_to,
+        &reply_to,
     ) {
         Ok(r) => ProduceStoreShareRequestMessageResult {
             error: success(),

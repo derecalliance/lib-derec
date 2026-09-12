@@ -17,8 +17,21 @@ enum Protocol {
   /// request/response pattern where the Owner acts as client and the
   /// Helper acts as server.
   ///
-  /// This is the default and currently required transport.
+  /// This is the default transport.
   HTTPS = 0;
+
+  /// gRPC-based transport.
+  ///
+  /// Messages are delivered as unary `DeRecTransport.Send` calls carrying a
+  /// `DeRecMessage` directly. Delivery is push-only: the call returns
+  /// `google.protobuf.Empty`, and every response is a fresh `Send` to the
+  /// peer's own endpoint, so both parties must run a reachable server.
+  ///
+  /// URI forms:
+  ///
+  /// - `grpcs://host:port` — gRPC over TLS
+  /// - `grpc://host:port` — plaintext, development only
+  GRPC = 1;
 }
 
 /// TransportProtocol defines how a DeRec participant (Owner or Helper)
@@ -68,7 +81,8 @@ message TransportProtocol {
   /// The format of this field depends on the selected `protocol`.
   /// Examples:
   ///
-  /// - HTTPS: "https://example.com/derec"
+  /// - HTTPS: "https://example.com/derec" or "http://example.com/derec"
+  /// - gRPC: "grpcs://example.com:443" or "grpc://example.com:50051"
   /// - Future protocols MAY define other URI schemes.
   ///
   /// The URI MUST be sufficient to route messages to the intended recipient.

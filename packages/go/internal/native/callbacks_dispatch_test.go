@@ -36,10 +36,10 @@ func (m *mockChannelStore) Save(secretID uint64, record ChannelRecord) error {
 func (m *mockChannelStore) Remove(secretID, channelID, replicaID uint64) (bool, error) {
 	return m.removeFn(secretID, channelID, replicaID)
 }
-func (m *mockChannelStore) ListHelpers(secretID uint64) ([]HelperChannel, error) {
+func (m *mockChannelStore) ListHelpers(secretID uint64, _ HelperFilter) ([]HelperChannel, error) {
 	return m.listHelpersFn(secretID)
 }
-func (m *mockChannelStore) ListReplicas(secretID uint64) ([]ReplicaMember, error) {
+func (m *mockChannelStore) ListReplicas(secretID uint64, _ ReplicaFilter) ([]ReplicaMember, error) {
 	return m.listReplicasFn(secretID)
 }
 func (m *mockChannelStore) LinkChannel(secretID, a, b uint64) error {
@@ -140,11 +140,11 @@ func (m *mockStateStore) LoadAll(secretID uint64, kind StateKind) ([]StateItem, 
 var _ stateStore = (*mockStateStore)(nil)
 
 type mockTransportSender struct {
-	sendFn func(uri string, protocol int32, message []byte) error
+	sendFn func(endpoints []Endpoint, message []byte) error
 }
 
-func (m *mockTransportSender) Send(uri string, protocol int32, message []byte) error {
-	return m.sendFn(uri, protocol, message)
+func (m *mockTransportSender) Send(endpoints []Endpoint, message []byte) error {
+	return m.sendFn(endpoints, message)
 }
 
 var _ transportSender = (*mockTransportSender)(nil)
@@ -309,7 +309,7 @@ func TestDispatchChannelListHelpers(t *testing.T) {
 			}, nil
 		},
 	}}
-	status, out := dispatchChannelListHelpers(s, 1)
+	status, out := dispatchChannelListHelpers(s, 1, nil)
 	if status != ffiStatusOK {
 		t.Fatalf("status = %d, want ffiStatusOK", status)
 	}
@@ -328,7 +328,7 @@ func TestDispatchChannelListReplicas(t *testing.T) {
 			}, nil
 		},
 	}}
-	status, out := dispatchChannelListReplicas(s, 1)
+	status, out := dispatchChannelListReplicas(s, 1, nil)
 	if status != ffiStatusOK {
 		t.Fatalf("status = %d, want ffiStatusOK", status)
 	}
@@ -720,12 +720,14 @@ func TestDispatchTransportSend(t *testing.T) {
 	var gotProtocol int32
 	var gotMessage []byte
 	s := &storeSet{transport: &mockTransportSender{
-		sendFn: func(uri string, protocol int32, message []byte) error {
-			gotURI, gotProtocol, gotMessage = uri, protocol, message
+		sendFn: func(endpoints []Endpoint, message []byte) error {
+			gotURI = endpoints[0].URI
+			gotProtocol = endpoints[0].Protocol
+			gotMessage = message
 			return nil
 		},
 	}}
-	status := dispatchTransportSend(s, "https://example.com", 0, []byte("hello"))
+	status := dispatchTransportSend(s, []Endpoint{{URI: "https://example.com", Protocol: 0}}, []byte("hello"))
 	if status != ffiStatusOK || gotURI != "https://example.com" || gotProtocol != 0 || string(gotMessage) != "hello" {
 		t.Fatalf("status=%d uri=%q protocol=%d message=%q", status, gotURI, gotProtocol, gotMessage)
 	}
@@ -733,11 +735,11 @@ func TestDispatchTransportSend(t *testing.T) {
 
 func TestDispatchTransportSend_PanicRecovered(t *testing.T) {
 	s := &storeSet{transport: &mockTransportSender{
-		sendFn: func(uri string, protocol int32, message []byte) error {
+		sendFn: func(endpoints []Endpoint, message []byte) error {
 			panic("transport blew up")
 		},
 	}}
-	status := dispatchTransportSend(s, "https://example.com", 0, nil)
+	status := dispatchTransportSend(s, []Endpoint{{URI: "https://example.com", Protocol: 0}}, nil)
 	if status != ffiStatusFailure {
 		t.Fatalf("status = %d, want ffiStatusFailure after recovered panic", status)
 	}
@@ -745,11 +747,11 @@ func TestDispatchTransportSend_PanicRecovered(t *testing.T) {
 
 func TestDispatchTransportSend_Error(t *testing.T) {
 	s := &storeSet{transport: &mockTransportSender{
-		sendFn: func(uri string, protocol int32, message []byte) error {
+		sendFn: func(endpoints []Endpoint, message []byte) error {
 			return errors.New("simulated transport failure")
 		},
 	}}
-	status := dispatchTransportSend(s, "https://example.com", 0, nil)
+	status := dispatchTransportSend(s, []Endpoint{{URI: "https://example.com", Protocol: 0}}, nil)
 	if status != ffiStatusFailure {
 		t.Fatalf("status = %d, want ffiStatusFailure", status)
 	}

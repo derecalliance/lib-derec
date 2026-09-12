@@ -4,6 +4,7 @@
 #include "StoreCallbacks.h"
 
 #include <cstring>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -577,19 +578,31 @@ extern "C" int32_t channelStoreRemove(void* userData, uint64_t secretId, uint64_
   return result.code;
 }
 
-/// `ChannelStore.listHelpers(secretId) -> Uint8Array | null`
-extern "C" int32_t channelStoreListHelpers(void* userData, uint64_t secretId, uint8_t** outPtr,
-                                            size_t* outLen) {
+/// `ChannelStore.listHelpers(secretId, filter) -> Uint8Array | null`
+///
+/// `filter` arrives as JSON and is handed to JavaScript as a plain object —
+/// see `ChannelFilter` in the SDK's types. The buffer is owned by the core and
+/// valid only for this call, so it is parsed before the promise is awaited.
+extern "C" int32_t channelStoreListHelpers(void* userData, uint64_t secretId, const uint8_t* filter,
+                                            size_t filterLen, uint8_t** outPtr, size_t* outLen) {
   auto* self = static_cast<StoreBindings*>(userData);
   // Kept alive past this call so the lambda handed to `callSync` — which the
   // JavaScript CallInvoker's queue may still be holding after this object's
   // owner has released its own reference — has somewhere safe to run.
   auto keepAlive = self->shared_from_this();
-  CallResult result = keepAlive->bridge().callSync([keepAlive, secretId](std::function<void(CallResult)> settle) {
+  std::vector<uint8_t> filterJson(filter, filter + filterLen);
+  CallResult result = keepAlive->bridge().callSync([keepAlive, secretId, filterJson](std::function<void(CallResult)> settle) {
     jsi::Runtime& rt = keepAlive->runtime();
     auto store = keepAlive->channelStore();
     auto method = store->getPropertyAsFunction(rt, "listHelpers");
-    jsi::Value promise = method.callWithThis(rt, *store, idVal(rt, secretId));
+    // Ids arrive as decimal strings — the core encodes them that way because
+    // `JSON.parse` cannot hold a u64; see `encode_filter` in
+    // `interop/ffi/protocol/stores.rs`.
+    jsi::Value filterVal = filterJson.empty()
+                               ? jsi::Value(jsi::Object(rt))
+                               : jsonParseUtf8(rt, filterJson.data(), filterJson.size());
+    jsi::Value promise =
+        method.callWithThis(rt, *store, idVal(rt, secretId), std::move(filterVal));
     keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), toCallResult);
   });
   if (result.code == 0) {
@@ -603,19 +616,31 @@ extern "C" int32_t channelStoreListHelpers(void* userData, uint64_t secretId, ui
   return result.code;
 }
 
-/// `ChannelStore.listReplicas(secretId) -> Uint8Array | null`
-extern "C" int32_t channelStoreListReplicas(void* userData, uint64_t secretId, uint8_t** outPtr,
-                                             size_t* outLen) {
+/// `ChannelStore.listReplicas(secretId, filter) -> Uint8Array | null`
+///
+/// `filter` arrives as JSON and is handed to JavaScript as a plain object —
+/// see `ChannelFilter` in the SDK's types. The buffer is owned by the core and
+/// valid only for this call, so it is parsed before the promise is awaited.
+extern "C" int32_t channelStoreListReplicas(void* userData, uint64_t secretId, const uint8_t* filter,
+                                            size_t filterLen, uint8_t** outPtr, size_t* outLen) {
   auto* self = static_cast<StoreBindings*>(userData);
   // Kept alive past this call so the lambda handed to `callSync` — which the
   // JavaScript CallInvoker's queue may still be holding after this object's
   // owner has released its own reference — has somewhere safe to run.
   auto keepAlive = self->shared_from_this();
-  CallResult result = keepAlive->bridge().callSync([keepAlive, secretId](std::function<void(CallResult)> settle) {
+  std::vector<uint8_t> filterJson(filter, filter + filterLen);
+  CallResult result = keepAlive->bridge().callSync([keepAlive, secretId, filterJson](std::function<void(CallResult)> settle) {
     jsi::Runtime& rt = keepAlive->runtime();
     auto store = keepAlive->channelStore();
     auto method = store->getPropertyAsFunction(rt, "listReplicas");
-    jsi::Value promise = method.callWithThis(rt, *store, idVal(rt, secretId));
+    // Ids arrive as decimal strings — the core encodes them that way because
+    // `JSON.parse` cannot hold a u64; see `encode_filter` in
+    // `interop/ffi/protocol/stores.rs`.
+    jsi::Value filterVal = filterJson.empty()
+                               ? jsi::Value(jsi::Object(rt))
+                               : jsonParseUtf8(rt, filterJson.data(), filterJson.size());
+    jsi::Value promise =
+        method.callWithThis(rt, *store, idVal(rt, secretId), std::move(filterVal));
     keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), toCallResult);
   });
   if (result.code == 0) {
@@ -1073,27 +1098,110 @@ extern "C" int32_t stateStoreLoadAll(void* userData, uint64_t secretId, uint32_t
 /// is reported rather than guessed at.
 std::string protocolToString(int32_t protocol) { return protocol == 0 ? "https" : "unknown"; }
 
-/// `Transport.send(endpoint, message) -> void`
-extern "C" int32_t transportSend(void* userData, const uint8_t* uriPtr, size_t uriLen, int32_t protocol,
+/// Minimal reader for an encoded `TransportProtocol`: field 1 is the URI
+/// (length-delimited string), field 2 the protocol discriminant (varint).
+/// Hand-rolled rather than linking a protobuf runtime into the JSI layer for
+/// two fields; unknown fields are skipped so a newer library stays readable.
+static std::optional<std::pair<std::string, int32_t>> decodeTransportProtocol(
+    const uint8_t* data, size_t len) {
+  std::string uri;
+  int32_t protocol = 0;
+  size_t i = 0;
+
+  auto readVarint = [&](uint64_t& out) -> bool {
+    out = 0;
+    int shift = 0;
+    while (i < len) {
+      uint8_t b = data[i++];
+      out |= static_cast<uint64_t>(b & 0x7F) << shift;
+      if ((b & 0x80) == 0) return true;
+      shift += 7;
+      if (shift > 63) return false;
+    }
+    return false;
+  };
+
+  while (i < len) {
+    uint64_t tag = 0;
+    if (!readVarint(tag)) return std::nullopt;
+    uint32_t field = static_cast<uint32_t>(tag >> 3);
+    uint32_t wire = static_cast<uint32_t>(tag & 0x7);
+
+    if (field == 1 && wire == 2) {
+      uint64_t size = 0;
+      if (!readVarint(size) || i + size > len) return std::nullopt;
+      uri.assign(reinterpret_cast<const char*>(data + i), size);
+      i += size;
+    } else if (field == 2 && wire == 0) {
+      uint64_t value = 0;
+      if (!readVarint(value)) return std::nullopt;
+      protocol = static_cast<int32_t>(value);
+    } else if (wire == 0) {
+      uint64_t skip = 0;
+      if (!readVarint(skip)) return std::nullopt;
+    } else if (wire == 2) {
+      uint64_t size = 0;
+      if (!readVarint(size) || i + size > len) return std::nullopt;
+      i += size;
+    } else {
+      return std::nullopt;
+    }
+  }
+  return std::make_pair(uri, protocol);
+}
+
+/// `Transport.send(endpoints, message) -> void`
+///
+/// `endpoints` is every address the peer advertised, in the peer's order,
+/// already filtered to those the library will record. The library does not
+/// rank them: which to dial, and whether to fall back, is the JavaScript
+/// implementation's choice. Delivery to any one of them is success.
+extern "C" int32_t transportSend(void* userData, const uint8_t* endpointsPtr, size_t endpointsLen,
                                   const uint8_t* bytes, size_t len) {
   auto* self = static_cast<StoreBindings*>(userData);
   // Kept alive past this call so the lambda handed to `callSync` — which the
   // JavaScript CallInvoker's queue may still be holding after this object's
   // owner has released its own reference — has somewhere safe to run.
   auto keepAlive = self->shared_from_this();
-  std::string uri(reinterpret_cast<const char*>(uriPtr), uriLen);
+
+  // Length-delimited TransportProtocol sequence: each entry preceded by its
+  // protobuf varint byte length.
+  std::vector<std::pair<std::string, int32_t>> endpoints;
+  size_t offset = 0;
+  while (offset < endpointsLen) {
+    uint64_t size = 0;
+    int shift = 0;
+    while (offset < endpointsLen) {
+      uint8_t b = endpointsPtr[offset++];
+      size |= static_cast<uint64_t>(b & 0x7F) << shift;
+      if ((b & 0x80) == 0) break;
+      shift += 7;
+    }
+    if (offset + size > endpointsLen) return -1;
+    auto parsed = decodeTransportProtocol(endpointsPtr + offset, size);
+    if (!parsed) return -1;
+    endpoints.push_back(*parsed);
+    offset += size;
+  }
+
   std::vector<uint8_t> message(bytes, bytes + len);
-  CallResult result = keepAlive->bridge().callSync([keepAlive, uri, protocol,
+  CallResult result = keepAlive->bridge().callSync([keepAlive, endpoints,
                                                 message](std::function<void(CallResult)> settle) {
     jsi::Runtime& rt = keepAlive->runtime();
     auto store = keepAlive->transportStore();
     auto method = store->getPropertyAsFunction(rt, "send");
-    jsi::Object endpoint(rt);
-    endpoint.setProperty(rt, "protocol",
-                          jsi::Value(rt, jsi::String::createFromUtf8(rt, protocolToString(protocol))));
-    endpoint.setProperty(rt, "uri", jsi::Value(rt, jsi::String::createFromUtf8(rt, uri)));
+    jsi::Array endpointsJs(rt, endpoints.size());
+    for (size_t i = 0; i < endpoints.size(); ++i) {
+      jsi::Object endpoint(rt);
+      endpoint.setProperty(rt, "protocol",
+                            jsi::Value(rt, jsi::String::createFromUtf8(
+                                               rt, protocolToString(endpoints[i].second))));
+      endpoint.setProperty(rt, "uri",
+                            jsi::Value(rt, jsi::String::createFromUtf8(rt, endpoints[i].first)));
+      endpointsJs.setValueAtIndex(rt, i, endpoint);
+    }
     jsi::Value promise =
-        method.callWithThis(rt, *store, jsi::Value(rt, endpoint), toUint8ArrayVal(rt, message));
+        method.callWithThis(rt, *store, jsi::Value(rt, endpointsJs), toUint8ArrayVal(rt, message));
     keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), toVoidResult);
   });
   return result.code;

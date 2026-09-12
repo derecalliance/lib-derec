@@ -27,22 +27,47 @@
 #define SHARE_ALGORITHM_REPLICA_SECRET 1
 
 /**
+ * Schema version stamped onto every channel record this build writes.
+ *
+ * Applications persist [`HelperChannel`] and [`ReplicaMember`] as opaque
+ * blobs whose shape the *library* owns, so a field change here is a
+ * migration the application cannot write without knowing a schema it does
+ * not define. The marker is what lets the library do that migration itself:
+ * a reader can tell a record apart by the shape it was written in rather
+ * than by guessing from which fields happen to be present.
+ *
+ * A record written before the marker existed deserializes as version 0 and
+ * is upgraded on read. A record claiming a version *newer* than this build
+ * understands is refused, because the alternative is silently dropping
+ * fields this build cannot see and writing the truncated result back.
+ *
+ * The value tracks the release that last changed the shape, not the release
+ * that is current: it moved to 3 when `transport` became `transports`, and
+ * stays there until the next shape change.
+ *
+ * Declared unconditionally, unlike the serde impls that stamp it: the SDK
+ * bridges mirror this number in their own encoders, and a constant they must
+ * agree with should not appear and disappear with a feature flag.
+ */
+#define CHANNEL_RECORD_SCHEMA_VERSION 3
+
+/**
  * Latest encoding major version, used for all new encodes. Bump only on a
  * breaking format change, adding the matching `vN` module and match arm.
  */
-#define LATEST 2
+#define LATEST 3
 
 /**
  * Minimum number of shares required to reconstruct the secret, absent an
- * explicit [`DeRecProtocolBuilder::with_threshold`] call. This is the sole
- * definition of the value — [`DeRecProtocolBuilder::new`] and the FFI
+ * explicit [`DeRecProtocolBuilder::with_threshold`](crate::protocol::DeRecProtocolBuilder::with_threshold) call. This is the sole
+ * definition of the value — [`DeRecProtocolBuilder::new`](crate::protocol::DeRecProtocolBuilder::new) and the FFI
  * config's serde default both read it rather than each hardcoding `3`.
  */
 #define DEFAULT_THRESHOLD 3
 
 /**
  * Number of recent share versions each helper retains, absent an explicit
- * [`DeRecProtocolBuilder::with_keep_versions_count`] call. Sole definition
+ * [`DeRecProtocolBuilder::with_keep_versions_count`](crate::protocol::DeRecProtocolBuilder::with_keep_versions_count) call. Sole definition
  * of the value; see [`DEFAULT_THRESHOLD`].
  */
 #define DEFAULT_KEEP_VERSIONS_COUNT 3
@@ -264,6 +289,26 @@
 #define DEREC_CODE_TRANSPORT_INVALID 120
 
 /**
+ * No transport is shared with the peer — its offered endpoints and this
+ * application's served endpoints intersect to nothing. Always a local,
+ * terminal error: push-only delivery means an unreachable peer also
+ * cannot be told. `DEREC_CATEGORY_INVALID_INPUT`.
+ */
+#define DEREC_CODE_NO_USABLE_ENDPOINT 121
+
+/**
+ * Both plaintext opt-in flags were set explicitly and disagree: the
+ * deprecated `unsafe_http` says one thing and `unsafe_connection` the
+ * other. Raised at protocol construction rather than resolved by
+ * precedence, because the flag precedence would favour is the one being
+ * removed, and a configuration layer that emits every field
+ * unconditionally would otherwise let a defaulted value silently beat a
+ * deliberate one. Set only `unsafe_connection`.
+ * `DEREC_CATEGORY_INVALID_INPUT`.
+ */
+#define DEREC_CODE_CONFLICTING_PLAINTEXT_OPT_IN 122
+
+/**
  * Discriminants selecting which message [`derec_decode_message_json`] and
  * [`derec_encode_message_json`] operate on.
  *
@@ -301,7 +346,7 @@
 /**
  * Not a standalone message on the wire, but it crosses this FFI on its own
  * as the `transport_protocol` argument of `create_contact_message` and the
- * `peer_transport_protocol` result of `produce_pair_response_message`.
+ * `peer_transports` result of `produce_pair_response_message`.
  */
 #define DEREC_MESSAGE_KIND_TRANSPORT_PROTOCOL 14
 
@@ -345,13 +390,13 @@
  * Replica catch-up. Takes no parameters: the group and this device's own
  * version are both read from the stores.
  */
-#define FLOW_KIND_SYNC_CHECK 7
+#define FLOW_KIND_REPLICA_DISCOVERY 7
 
 /**
  * Remove a member from the replica group. Params:
  * `{ "replica_id": "<decimal>", "memo": "<optional>" }`.
  */
-#define FLOW_KIND_REMOVE_REPLICA 8
+#define FLOW_KIND_UNPAIR_REPLICA 8
 
 /**
  * Opaque handle returned by [`derec_protocol_new`] and consumed by
@@ -552,7 +597,7 @@ typedef struct ExtractPairRequestResult {
 typedef struct ProducePairResponseMessageResult {
   struct DeRecError error;
   struct DeRecBuffer response_wire_bytes;
-  struct DeRecBuffer peer_transport_protocol;
+  struct DeRecBuffer peer_transports;
   struct DeRecBuffer shared_key;
   /**
    * Post-handshake rekey channel id the responder is committing to.
@@ -694,6 +739,17 @@ typedef struct DeRecProtocolNewResult {
  * [`crate::protocol::types::HelperChannel`] and
  * [`crate::protocol::types::ReplicaMember`] respectively.
  *
+ * Both listing callbacks receive a `filter` buffer holding a JSON-encoded
+ * [`crate::protocol::types::HelperFilter`] or
+ * [`crate::protocol::types::ReplicaFilter`] — an object with `ids`, `status`,
+ * `role` and `exclude`, where an empty array or a null `role` restricts
+ * nothing. A backend should apply it in its query rather than by listing
+ * everything and discarding rows; see
+ * [`crate::protocol::types::ChannelFilter`]. The library re-applies it to
+ * whatever comes back, so ignoring it is slow rather than wrong — but
+ * returning fewer rows than it selects is wrong, and undetectable. The buffer is owned
+ * by the caller and valid only for the duration of the call.
+ *
  * The order `list_replicas` returns is significant in exactly one situation —
  * it selects the successor when the group's source is removed. See
  * [`crate::protocol::DeRecChannelStore::replicas`] for the full contract.
@@ -717,8 +773,18 @@ typedef struct ChannelStoreCallbacks {
                     uint64_t channel_id,
                     uint64_t replica_id,
                     uint32_t *out_existed);
-  int32_t (*list_helpers)(void *user_data, uint64_t secret_id, uint8_t **out_ptr, size_t *out_len);
-  int32_t (*list_replicas)(void *user_data, uint64_t secret_id, uint8_t **out_ptr, size_t *out_len);
+  int32_t (*list_helpers)(void *user_data,
+                          uint64_t secret_id,
+                          const uint8_t *filter,
+                          size_t filter_len,
+                          uint8_t **out_ptr,
+                          size_t *out_len);
+  int32_t (*list_replicas)(void *user_data,
+                           uint64_t secret_id,
+                           const uint8_t *filter,
+                           size_t filter_len,
+                           uint8_t **out_ptr,
+                           size_t *out_len);
   int32_t (*link_channel)(void *user_data, uint64_t secret_id, uint64_t a, uint64_t b);
   int32_t (*linked_channels)(void *user_data,
                              uint64_t secret_id,
@@ -861,10 +927,24 @@ typedef struct StateStoreCallbacks {
  */
 typedef struct TransportCallbacks {
   void *user_data;
+  /**
+   * Deliver `bytes` to a peer reachable at any of `endpoints`.
+   *
+   * `endpoints` is a length-delimited sequence of encoded
+   * `TransportProtocol` messages — each entry preceded by its protobuf
+   * varint byte length, the same framing protobuf uses for a repeated
+   * embedded message field. They are the endpoints that peer advertised,
+   * in the order it offered them, already filtered to those the library
+   * will record.
+   *
+   * The library does not rank them. Which endpoint to dial, and whether
+   * to fall back to another when one is unreachable, is the
+   * implementation's choice. Return `0` once the message has reached any
+   * one of them; non-zero only when it reached none.
+   */
   int32_t (*send)(void *user_data,
-                  const uint8_t *uri_ptr,
-                  size_t uri_len,
-                  int32_t protocol,
+                  const uint8_t *endpoints_ptr,
+                  size_t endpoints_len,
                   const uint8_t *bytes,
                   size_t len);
 } TransportCallbacks;
@@ -1287,8 +1367,8 @@ struct DeRecMessageJsonResult derec_encode_message_json(int32_t kind,
  */
 struct CreateContactMessageResult create_contact_message(uint64_t channel_id,
                                                          int32_t contact_mode,
-                                                         const uint8_t *transport_protocol_ptr,
-                                                         size_t transport_protocol_len,
+                                                         const uint8_t *transport_protocols_ptr,
+                                                         size_t transport_protocols_len,
                                                          uint32_t has_nonce,
                                                          uint64_t nonce);
 
@@ -1362,8 +1442,8 @@ struct DecodeContactMessageResult decode_contact_message(const uint8_t *contact_
  * Non-null input pointers must point to the corresponding readable byte ranges.
  */
 struct ProducePairRequestMessageResult produce_pair_request_message(int32_t sender_kind,
-                                                                    const uint8_t *transport_protocol_ptr,
-                                                                    size_t transport_protocol_len,
+                                                                    const uint8_t *transport_protocols_ptr,
+                                                                    size_t transport_protocols_len,
                                                                     const uint8_t *contact_message_ptr,
                                                                     size_t contact_message_len,
                                                                     const uint8_t *communication_info_ptr,
@@ -1402,7 +1482,8 @@ struct ProducePairResponseMessageResult produce_pair_response_message(uint64_t c
                                                                       const uint8_t *communication_info_ptr,
                                                                       size_t communication_info_len,
                                                                       const uint8_t *parameter_range_ptr,
-                                                                      size_t parameter_range_len);
+                                                                      size_t parameter_range_len,
+                                                                      uint32_t unsafe_connection);
 
 /**
  * # Safety
@@ -1439,8 +1520,8 @@ struct ProcessPairResponseMessageResult process_pair_response_message(const uint
  *
  * Non-null input pointers must point to the corresponding readable byte ranges.
  */
-struct ProducePrePairRequestMessageResult produce_pre_pair_request_message(const uint8_t *transport_protocol_ptr,
-                                                                           size_t transport_protocol_len,
+struct ProducePrePairRequestMessageResult produce_pre_pair_request_message(const uint8_t *transport_protocols_ptr,
+                                                                           size_t transport_protocols_len,
                                                                            const uint8_t *contact_message_ptr,
                                                                            size_t contact_message_len);
 
@@ -1527,6 +1608,7 @@ struct ProcessPrePairResponseMessageResult process_pre_pair_response_message(con
  *   "secret_id": "12345678901234567890",
  *   "own_transport_uri": "https://example.com/derec",
  *   "own_transport_protocol": 1,
+ *   "own_transports": [{ "uri": "https://example.com/derec", "protocol": 0 }],
  *   "threshold": 3,
  *   "keep_versions_count": 2,
  *   "timeout_in_secs": 30,
@@ -1553,6 +1635,11 @@ struct ProcessPrePairResponseMessageResult process_pre_pair_response_message(con
  *   `derec_protocol_set_own_transport` must be called before pairing
  *   in that case.
  * - `own_transport_protocol`: [`derec_proto::Protocol`] discriminant.
+ * - `own_transports`: every endpoint this application serves, in
+ *   preference order — the order decides which of a peer's offered
+ *   endpoints is used. Optional; when non-empty it takes precedence over
+ *   `own_transport_uri` / `own_transport_protocol`, which stay fully
+ *   supported for callers that serve a single transport.
  * - `threshold` / `keep_versions_count`: optional; omitted means
  *   [`crate::protocol::DEFAULT_THRESHOLD`] /
  *   [`crate::protocol::DEFAULT_KEEP_VERSIONS_COUNT`].
@@ -1634,10 +1721,17 @@ struct DeRecError derec_protocol_set_communication_info(struct DeRecProtocolHand
                                                         size_t info_json_len);
 
 /**
- * Replace this node's local transport endpoint. See
- * [`crate::protocol::DeRecProtocol::set_own_transport`] for the
- * changeover discipline (keep the old endpoint up during the
- * transition).
+ * Replace this node's endpoint **for one protocol**, leaving the others
+ * alone. A node serves at most one endpoint per protocol, so the `(uri,
+ * protocol)` pair identifies the entry it replaces; an entry for a protocol
+ * not yet served is appended, and a replaced one keeps its position in the
+ * preference order. See
+ * [`crate::protocol::DeRecProtocol::set_own_transport`] for the changeover
+ * discipline (keep the old endpoint up during the transition).
+ *
+ * Superseded by [`derec_protocol_set_own_transports`], which takes the
+ * whole preference list and is the only way to change *which* protocols
+ * this node serves, or their order.
  *
  * # Safety
  *
@@ -1650,10 +1744,37 @@ struct DeRecError derec_protocol_set_communication_info(struct DeRecProtocolHand
  * from different threads are safe: the handle's internal mutex
  * serializes them.
  */
+__attribute__((deprecated("use derec_protocol_set_own_transports, which takes the whole preference list; removed at 0.0.5")))
 struct DeRecError derec_protocol_set_own_transport(struct DeRecProtocolHandle *handle,
                                                    const uint8_t *uri_ptr,
                                                    size_t uri_len,
                                                    int32_t protocol);
+
+/**
+ * Replace every endpoint this node advertises, in preference order.
+ *
+ * The runtime counterpart to the `own_transports` array accepted by
+ * [`super::derec_protocol_new`], and the way to change the whole set:
+ * `derec_protocol_set_own_transport` replaces only the entry for the
+ * protocol its URI names. A device serves at most one endpoint per
+ * protocol, so this list is a preference order over distinct protocols and
+ * two entries of the same protocol are rejected. Body is the same JSON
+ * shape that config array uses — `[{"uri": "...", "protocol": 0}, ...]`.
+ *
+ * Every entry is validated before any is stored, so a malformed URI
+ * leaves the previous set intact rather than half-applied.
+ *
+ * # Safety
+ *
+ * `handle` must be a valid pointer returned by
+ * [`super::derec_protocol_new`]. `json_ptr`/`json_len` must describe a
+ * readable byte range. Concurrent calls on the same handle from
+ * different threads are safe: the handle's internal mutex serializes
+ * them.
+ */
+struct DeRecError derec_protocol_set_own_transports(struct DeRecProtocolHandle *handle,
+                                                    const uint8_t *json_ptr,
+                                                    size_t json_len);
 
 /**
  * Remove `Pending` channels older than `older_than_secs`. See

@@ -202,7 +202,25 @@ message ContactMessage {
   // request. Subsequent protocol exchanges may continue using the same
   // transport information or updated transport details, depending on the
   // protocol and application behavior.
-  TransportProtocol transportProtocol = 7;
+  //
+  // Deprecated: superseded by `supportedTransports`, which carries every
+  // endpoint rather than one.
+  //
+  // **Reading this field directly is now incorrect.** Its meaning narrowed
+  // from "the endpoint" to "one entry of a list, and possibly absent": a
+  // creator that has moved past this field advertises only
+  // `supportedTransports`. A reader that was correct before this release is
+  // a bug now — it rejects, or fails to reach, a peer that is offering it a
+  // perfectly good endpoint. Resolve both spellings instead of reading
+  // either: `advertised_endpoints()` (Rust and TypeScript),
+  // `AdvertisedEndpoints()` (Go), `AdvertisedEndpoints()` (.NET).
+  //
+  // Senders still populate it: a sender that sets `supportedTransports`
+  // MUST also set this to a single best-compatibility choice, so
+  // implementations predating the list still pair.
+  //
+  // **Scheduled for removal in v0.0.5.**
+  TransportProtocol transportProtocol = 7 [deprecated = true];
 
   // Timestamp indicating when the sender created this message.
   //
@@ -212,4 +230,35 @@ message ContactMessage {
   // - timeout handling
   // - logging and observability
   google.protobuf.Timestamp timestamp = 8;
+
+  // Every transport endpoint the creator of this contact can be reached on.
+  //
+  // Each entry is a complete endpoint: a URI plus the protocol that says
+  // how to interpret it. The list is written in the creator's own
+  // preference order.
+  //
+  // # Selection is the recipient's
+  //
+  // A recipient picks whichever entry suits it, ordered by its **own**
+  // preference rather than the sender's. The order here expresses
+  // availability, not a ranking the recipient must honor.
+  //
+  // # Compatibility
+  //
+  // Absent means "only `transportProtocol` is offered", which is how every
+  // implementation predating this field behaves. A sender populating this
+  // list MUST also set `transportProtocol` to a single best-compatibility
+  // choice so those implementations still pair.
+  //
+  // # Security
+  //
+  // `contactBindingHash` does not cover this field, exactly as it does not
+  // cover `transportProtocol`. An attacker able to rewrite an
+  // out-of-band contact can therefore remove entries. Removing the secure
+  // ones leaves only plaintext, which the recipient's transport policy
+  // refuses unless plaintext has been explicitly opted into. DeRec messages
+  // are signed and encrypted at the application layer on every transport,
+  // so substituting one secure transport for another is not a loss of
+  // confidentiality or authenticity.
+  repeated TransportProtocol supportedTransports = 9;
 }

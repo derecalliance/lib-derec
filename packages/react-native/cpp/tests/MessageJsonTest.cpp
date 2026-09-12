@@ -56,9 +56,17 @@ static void everyKindDecodesAnEmptyMessage() {
 
 /// The reason the wide fields cross as strings rather than JSON numbers.
 static void wideIdsCrossAsDecimalStrings() {
+  // `reply_to` is omitted rather than sent as `null`. The DTO declares it
+  // `Vec<TransportProtocol>` with `#[serde(default)]`, and `default` covers a
+  // *missing* key, not an explicit null — so `null` fails to deserialize.
+  //
+  // That is the encoder's real contract, not a quirk this test works around:
+  // `src/messages.ts` drops undefined fields for exactly this reason, with the
+  // same explanation. `timestamp` stays `null` because it *is* an `Option`,
+  // which does accept one — the asymmetry is the point worth pinning here.
   const std::string json =
       R"({"secret_id":"18446744073709551615","version":1,)"
-      R"("nonce":"9007199254740993","timestamp":null,"reply_to":null})";
+      R"("nonce":"9007199254740993","timestamp":null})";
 
   DeRecMessageJsonResult encoded = derec_encode_message_json(
       DEREC_MESSAGE_KIND_VERIFY_SHARE_REQUEST,

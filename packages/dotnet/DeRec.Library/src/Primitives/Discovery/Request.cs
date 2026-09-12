@@ -17,12 +17,20 @@ public static partial class Discovery
             /// the inner request. <c>null</c> when the sender did not set
             /// one. Mirrors the JS bridge surface.
             /// </summary>
-            public TransportProtocol? ReplyTo { get; init; }
+            /// <summary>
+            /// Every endpoint the requester asked to be answered on, in its
+            /// own preference order. Empty means route to the endpoints
+            /// recorded for the channel.
+            /// </summary>
+            public IReadOnlyList<TransportProtocol> ReplyTo { get; init; } =
+                Array.Empty<TransportProtocol>();
         }
 
-        public static DeRecMessage Produce(ulong channelId, byte[] sharedKey, TransportProtocol? replyTo = null)
+        public static DeRecMessage Produce(ulong channelId, byte[] sharedKey, IReadOnlyList<TransportProtocol>? replyTo = null)
         {
-            byte[]? replyToBytes = replyTo?.ToProtoBytes();
+            byte[]? replyToBytes = replyTo is { Count: > 0 }
+                ? TransportProtocol.ToProtoBytesList(replyTo)
+                : null;
             UIntPtr replyToLen = replyToBytes is null ? UIntPtr.Zero : (UIntPtr)replyToBytes.Length;
 
             Native.Discovery.ProduceGetSecretIdsVersionsRequestMessageResult nativeResult =
@@ -66,7 +74,7 @@ public static partial class Discovery
                 return new ExtractResult
                 {
                     ChannelId = nativeResult.ChannelId,
-                    ReplyTo = TransportProtocol.FromProto(inner.ReplyTo),
+                    ReplyTo = TransportProtocol.ResolveReplyTo(inner.ReplyTo, inner.ReplyToTransports),
                 };
             }
             finally

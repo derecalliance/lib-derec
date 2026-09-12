@@ -82,6 +82,26 @@ The protocol defines three roles via the `SenderKind` enum:
 | `committedderecshare.proto` | `CommittedDeRecShare` | Share data with Merkle proof commitment |
 | `derecsecret.proto` | `DeRecSecret` | Secret metadata |
 
+### Transport service contracts — `grpc/`
+
+Everything above lives in `protobufs/` and defines the DeRec **message
+vocabulary**: what the protocol says. `grpc/` holds contracts describing how
+those envelopes are **delivered**, which is a separate concern — an
+implementation reaching its peers over HTTPS needs nothing from this
+directory.
+
+| File | Defines | Purpose |
+|---|---|---|
+| `grpc/derectransport.proto` | `DeRecTransport` service (`Send` RPC) | gRPC delivery service contract: `rpc Send(DeRecMessage) returns (google.protobuf.Empty)`. |
+
+The service shares the `org.derecalliance.derec.protobuf` package with the
+message vocabulary, so its full name — and therefore the method path on the
+wire — is unaffected by living in its own directory.
+
+This crate ships the `.proto` definition only and generates **no service
+stubs**. Consumers who want stubs run their own `tonic-prost-build`, as
+`smoke-tests/grpc/build.rs` does.
+
 ### `DeRecSecret.secretData`
 
 `secretData` is `bytes` and opaque to this crate — this schema only describes
@@ -155,6 +175,42 @@ Most developers should only interact with `derec-library`.
 Full protocol documentation:
 
 https://derec-alliance.gitbook.io/docs/protocol-specification/messages
+
+### Store-share schema revision
+
+The two store-share messages were revised after this schema was first
+derived, so an implementation built against an earlier revision will not
+interoperate with them. Field numbers and scalar types are both wire-
+significant, and all three kinds of change below affect the encoding.
+
+`StoreShareRequestMessage`:
+
+| field | before | now |
+| --- | --- | --- |
+| `secretId` | *(absent — read from the enclosing `DeRecMessage`)* | `uint64` = 3 |
+| `version` | `int32` = 3 | `uint32` = 4 |
+| `keepList` | `repeated int32` = 4 | `repeated uint32` = 5 |
+| `versionDescription` | = 5 | = 6 |
+| `timestamp` | = 6 | = 7 |
+
+`StoreShareResponseMessage`:
+
+| field | before | now |
+| --- | --- | --- |
+| `secretId` | *(absent)* | `uint64` = 2 |
+| `version` | `int32` = 2 | `uint32` = 3 |
+| `timestamp` | = 3 | = 4 |
+
+`secretId` was added so the store-share messages identify their own secret
+rather than depending on the envelope, which every other message family
+already did — `GetShare`, `VerifyShare` and `DeRecShare` all carry
+`secretId` immediately before `version`. The remaining fields were
+renumbered to make room, and the two counters became unsigned because
+neither a version nor a retained-version list is ever negative.
+
+`replyTo` (8) and `replicaId` (9) on the request, and `replicaId` (5) on the
+response, were added afterwards in free slots and are backward compatible:
+both are `optional`, and a reader that does not know them ignores them.
 
 ---
 

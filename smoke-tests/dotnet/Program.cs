@@ -14,6 +14,8 @@ internal static class Program
     private static void Main()
     {
         Primitives.RunAll();
+        TransportAdapters.RunAll();
+        ChannelFilterConformance.RunAll();
         Protocol.RunAll();
 
         Console.WriteLine("All smoke tests passed.");

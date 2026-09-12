@@ -11,7 +11,7 @@ pub mod response;
 #[cfg(test)]
 mod tests;
 
-use crate::utils::ContactMessageExt as _;
+use crate::extensions::contact_message::ContactMessageExt as _;
 use derec_proto::{ContactMessage, ContactMode};
 
 /// Asserts the contact is structurally valid AND its declared

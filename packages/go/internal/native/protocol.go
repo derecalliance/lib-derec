@@ -100,6 +100,15 @@ type TimeoutsConfig struct {
 	ExpiredChannels    *RemoveExpiredChannelsPolicy `json:"expired_channels,omitempty"`
 }
 
+// TransportOffer is one entry of the JSON config's "own_transports" array,
+// field for field matching OwnTransportConfig in
+// library/src/interop/ffi/protocol/handle/mod.rs — Protocol is the
+// derec_proto.Protocol i32 discriminant, not a URI scheme.
+type TransportOffer struct {
+	URI      string `json:"uri"`
+	Protocol int32  `json:"protocol"`
+}
+
 // ProtocolConfig carries every derec_protocol_new argument beyond
 // the six callback structs and the communication_info proto buffer, in
 // idiomatic Go form. protocolNew renders it into the JSON config buffer
@@ -110,6 +119,12 @@ type ProtocolConfig struct {
 
 	OwnTransportURI      string
 	OwnTransportProtocol int32
+	// OwnTransports mirrors the "own_transports" JSON array documented on
+	// ProtocolConfig in library/src/interop/ffi/protocol/handle/mod.rs.
+	// Empty omits the key, in which case OwnTransportURI /
+	// OwnTransportProtocol apply; non-empty takes precedence over them
+	// entirely.
+	OwnTransports []TransportOffer
 
 	Threshold         uint32
 	KeepVersionsCount uint32
@@ -124,8 +139,14 @@ type ProtocolConfig struct {
 	// omitted for the same effect.
 	Timeouts *TimeoutsConfig
 	// UnsafeHTTP accepts plaintext http:// transport endpoints. Development
-	// only; false is the production posture.
-	UnsafeHTTP           bool
+	// only; nil (unset) is the production posture.
+	//
+	// Deprecated: use UnsafeConnection, which names both gated schemes.
+	// Removed at 0.0.5.
+	UnsafeHTTP *bool
+	// UnsafeConnection accepts plaintext http:// and grpc:// transport
+	// endpoints. Development only; nil (unset) is the production posture.
+	UnsafeConnection     *bool
 	AutoRespondOnFailure bool
 	// UnpairAck: 0 = Required, 1 = NotRequired.
 	UnpairAck   int32
@@ -137,6 +158,30 @@ type ProtocolConfig struct {
 	// means no replica id" convention documented on ProtocolConfig in
 	// library/src/interop/ffi/protocol/handle/mod.rs).
 	ReplicaID *uint64
+
+	// ParameterRange declares the bounds this node advertises during pair
+	// negotiation. An inbound pairing whose range fails to intersect is
+	// rejected with CodeIncompatibleParameterRange. nil advertises no
+	// constraints and accepts any peer range.
+	ParameterRange *ParameterRangeConfig
+}
+
+// ParameterRangeConfig declares the bounds this node advertises during pair
+// negotiation, mirroring the ParameterRange proto field for field. Each bound
+// is optional and defaults to 0, which the proto reads as "no constraint on
+// this dimension". Omitting the whole struct advertises no constraints and
+// accepts any peer range.
+type ParameterRangeConfig struct {
+	MinShareSize                       int64 `json:"min_share_size,omitempty"`
+	MaxShareSize                       int64 `json:"max_share_size,omitempty"`
+	MinTimeBetweenVerifications        int64 `json:"min_time_between_verifications,omitempty"`
+	MaxTimeBetweenVerifications        int64 `json:"max_time_between_verifications,omitempty"`
+	MinTimeBetweenShareUpdates         int64 `json:"min_time_between_share_updates,omitempty"`
+	MaxTimeBetweenShareUpdates         int64 `json:"max_time_between_share_updates,omitempty"`
+	MinUnresponsiveDeletionTimeout     int64 `json:"min_unresponsive_deletion_timeout,omitempty"`
+	MaxUnresponsiveDeletionTimeout     int64 `json:"max_unresponsive_deletion_timeout,omitempty"`
+	MinUnresponsiveDeactivationTimeout int64 `json:"min_unresponsive_deactivation_timeout,omitempty"`
+	MaxUnresponsiveDeactivationTimeout int64 `json:"max_unresponsive_deactivation_timeout,omitempty"`
 }
 
 // protocolConfigJSON is the JSON shape derec_protocol_new expects,
@@ -158,6 +203,7 @@ type protocolConfigJSON struct {
 	SecretID             string            `json:"secret_id"`
 	OwnTransportURI      string            `json:"own_transport_uri"`
 	OwnTransportProtocol int32             `json:"own_transport_protocol"`
+	OwnTransports        []TransportOffer  `json:"own_transports,omitempty"`
 	Threshold            uint32            `json:"threshold,omitempty"`
 	KeepVersionsCount    uint32            `json:"keep_versions_count,omitempty"`
 	AutoRespondOnFailure bool              `json:"auto_respond_on_failure,omitempty"`
@@ -165,8 +211,15 @@ type protocolConfigJSON struct {
 	AutoReplyTo          bool              `json:"auto_reply_to,omitempty"`
 	AutoAccept           *AutoAcceptPolicy `json:"auto_accept,omitempty"`
 	Timeouts             *TimeoutsConfig   `json:"timeouts,omitempty"`
-	UnsafeHTTP           bool              `json:"unsafe_http"`
-	ReplicaID            *string           `json:"replica_id,omitempty"`
+	// UnsafeHTTP and UnsafeConnection are both omitempty: absence is
+	// meaningful and distinct from false. Only one present is honored;
+	// both present and disagreeing is CodeConflictingPlaintextOptIn from
+	// derec_protocol_new, so a nil that serialized as false would turn a
+	// deliberate setting into a construction failure.
+	UnsafeHTTP       *bool                 `json:"unsafe_http,omitempty"`
+	UnsafeConnection *bool                 `json:"unsafe_connection,omitempty"`
+	ReplicaID        *string               `json:"replica_id,omitempty"`
+	ParameterRange   *ParameterRangeConfig `json:"parameter_range,omitempty"`
 }
 
 var (
@@ -204,6 +257,12 @@ var (
 		handle uintptr,
 		uriPtr *byte, uriLen uintptr,
 		protocolNum int32,
+	) DeRecError
+
+	protocolSetOwnTransportsOnce sync.Once
+	protocolSetOwnTransportsFn   func(
+		handle uintptr,
+		jsonPtr *byte, jsonLen uintptr,
 	) DeRecError
 
 	protocolSetCommunicationInfoOnce sync.Once
@@ -271,14 +330,16 @@ func protocolNew(cfg ProtocolConfig, cb *builtCallbacks) (uintptr, error) {
 		SecretID:             strconv.FormatUint(cfg.SecretID, 10),
 		OwnTransportURI:      cfg.OwnTransportURI,
 		OwnTransportProtocol: cfg.OwnTransportProtocol,
+		OwnTransports:        cfg.OwnTransports,
 		Threshold:            cfg.Threshold,
 		KeepVersionsCount:    cfg.KeepVersionsCount,
 		AutoRespondOnFailure: cfg.AutoRespondOnFailure,
 		UnpairAck:            cfg.UnpairAck,
 		AutoReplyTo:          cfg.AutoReplyTo,
 
-		Timeouts:   cfg.Timeouts,
-		UnsafeHTTP: cfg.UnsafeHTTP,
+		Timeouts:         cfg.Timeouts,
+		UnsafeHTTP:       cfg.UnsafeHTTP,
+		UnsafeConnection: cfg.UnsafeConnection,
 	}
 	// The zero value of AutoAcceptPolicy (every flow false) is
 	// indistinguishable from "the caller never set it" — and is also
@@ -292,6 +353,7 @@ func protocolNew(cfg ProtocolConfig, cb *builtCallbacks) (uintptr, error) {
 		id := strconv.FormatUint(*cfg.ReplicaID, 10)
 		cfgJSON.ReplicaID = &id
 	}
+	cfgJSON.ParameterRange = cfg.ParameterRange
 
 	configJSON, err := json.Marshal(cfgJSON)
 	if err != nil {
@@ -435,14 +497,47 @@ func (p *ProtocolInstance) VerifyFingerprint(channelID uint64, fingerprint strin
 }
 
 // SetOwnTransport wraps derec_protocol_set_own_transport: replaces this
-// node's local transport endpoint. Only mutates local state — propagating
-// the change to paired peers requires a follow-up UpdateChannelInfo flow.
+// node's endpoint for one protocol, leaving the others alone. A node serves
+// at most one endpoint per protocol, so the (uri, protocolNum) pair
+// identifies the entry it replaces; an entry for a protocol not yet served
+// is appended, and a replaced one keeps its position in the preference
+// order. Only mutates local state — propagating the change to paired peers
+// requires a follow-up UpdateChannelInfo flow.
 func (p *ProtocolInstance) SetOwnTransport(uri string, protocolNum int32) error {
 	protocolSetOwnTransportOnce.Do(func() {
 		purego.RegisterFunc(&protocolSetOwnTransportFn, symbol("derec_protocol_set_own_transport"))
 	})
 	uriBytes := []byte(uri)
 	return errorFrom(protocolSetOwnTransportFn(p.handle, bytePtr(uriBytes), uintptr(len(uriBytes)), protocolNum))
+}
+
+// OwnTransport is one entry of the endpoint list SetOwnTransports takes.
+// Mirrors the {uri, protocol} JSON shape the FFI uses for the
+// own_transports config array.
+type OwnTransport struct {
+	URI      string `json:"uri"`
+	Protocol int32  `json:"protocol"`
+}
+
+// SetOwnTransports wraps derec_protocol_set_own_transports: replaces every
+// endpoint this node advertises, in preference order. SetOwnTransport
+// replaces only the entry for the protocol its URI names. A node serves at
+// most one endpoint per protocol, so this list is a preference order over
+// distinct protocols and two entries of the same protocol are rejected.
+// Only mutates local state; propagating the change to paired peers requires
+// a follow-up UpdateChannelInfo flow.
+func (p *ProtocolInstance) SetOwnTransports(transports []OwnTransport) error {
+	protocolSetOwnTransportsOnce.Do(func() {
+		purego.RegisterFunc(&protocolSetOwnTransportsFn, symbol("derec_protocol_set_own_transports"))
+	})
+	if len(transports) == 0 {
+		return fmt.Errorf("native: own transports must not be empty")
+	}
+	transportsJSON, err := json.Marshal(transports)
+	if err != nil {
+		return fmt.Errorf("native: marshal own_transports: %w", err)
+	}
+	return errorFrom(protocolSetOwnTransportsFn(p.handle, bytePtr(transportsJSON), uintptr(len(transportsJSON))))
 }
 
 // SetCommunicationInfo wraps derec_protocol_set_communication_info:

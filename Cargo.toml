@@ -5,4 +5,5 @@ members = [
     "library",
     "protobufs",
     "smoke-tests/rust",
+    "smoke-tests/grpc",
 ]

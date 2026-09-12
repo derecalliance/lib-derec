@@ -5,6 +5,11 @@ use super::super::{
     DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecStateStore,
     DeRecTransport, MissingPolicy, PendingAction, SecretKind, SecretValue,
 };
+use super::replicas::recovery as replica;
+use crate::extensions::channel_store::ChannelStoreExt as _;
+use crate::extensions::message_body::{MessageBodyExt as _, Route};
+use crate::protocol::context::{Exchange, Local, Round};
+use crate::protocol::stores::{StoreSet, Stores};
 use crate::{
     Error, Result,
     derec_message::current_timestamp,
@@ -14,7 +19,7 @@ use crate::{
 };
 use derec_proto::{
     DeRecResult, DeRecSecret, GetShareRequestMessage, GetShareResponseMessage, MessageBody,
-    StatusEnum, StoreShareRequestMessage,
+    SenderKind, StatusEnum, StoreShareRequestMessage,
 };
 use prost::Message;
 
@@ -42,26 +47,37 @@ use prost::Message;
 /// *something*, but not a wire shape the protocol recognises.
 #[cfg_attr(
     feature = "logging",
-    tracing::instrument(skip_all, fields(channel_id = channel_id.0))
+    tracing::instrument(skip_all, fields(trace_id = exchange.trace_id, channel_id = exchange.channel_id.0))
 )]
-pub(in crate::protocol) async fn handle<St: DeRecStateStore>(
-    state_store: &mut St,
-    channel_id: ChannelId,
+pub(in crate::protocol) async fn handle<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    exchange: &Exchange<'_>,
     inner: MessageBody,
-    shared_key: SharedKey,
-    inbound_trace_id: u64,
-    secret_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
-    match inner {
-        MessageBody::GetShareRequest(request) => {
-            on_request(channel_id, request, shared_key, inbound_trace_id)
+    match (inner.route(), inner) {
+        (Route::Replica(author), inner) => {
+            replica::handle(stores, local, exchange, author, inner).await
         }
-        MessageBody::GetShareResponse(response) => {
-            on_response(state_store, secret_id, channel_id, &response).await
+        (_, inner) => {
+            let expected = match &inner {
+                MessageBody::GetShareRequest(_) => SenderKind::Owner,
+                _ => SenderKind::Helper,
+            };
+            stores
+                .channels
+                .require_role(local.secret_id, &[exchange.channel_id], expected)
+                .await?;
+            match inner {
+                MessageBody::GetShareRequest(request) => on_request(exchange, request),
+                MessageBody::GetShareResponse(response) => {
+                    on_response(stores, local, exchange.channel_id, &response).await
+                }
+                _ => Err(Error::Invariant(
+                    "unexpected MessageBody variant in recovery handler",
+                )),
+            }
         }
-        _ => Err(Error::Invariant(
-            "unexpected MessageBody variant in recovery handler",
-        )),
     }
 }
 
@@ -95,31 +111,23 @@ pub(in crate::protocol) async fn handle<St: DeRecStateStore>(
     tracing::instrument(
         skip_all,
         fields(
-            local_secret_id = local_secret_id,
+            local.secret_id = local.secret_id,
             target_secret_id = target_secret_id,
             version = version
         )
     )
 )]
-#[allow(clippy::too_many_arguments)]
-pub(in crate::protocol) async fn start<
-    Ch: DeRecChannelStore,
-    Ss: DeRecSecretStore,
-    St: DeRecStateStore,
-    T: DeRecTransport,
->(
-    channel_store: &mut Ch,
-    secret_store: &mut Ss,
-    state_store: &mut St,
-    transport: &T,
-    local_secret_id: u64,
+pub(in crate::protocol) async fn start<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
     target_secret_id: u64,
     version: u32,
-    reply_to: Option<derec_proto::TransportProtocol>,
+    round: &Round<'_>,
 ) -> Result<Vec<DeRecEvent>> {
-    state_store
+    stores
+        .state
         .save(
-            local_secret_id,
+            local.secret_id,
             StateItem::PendingRecovery {
                 secret_id: target_secret_id,
                 version,
@@ -128,19 +136,23 @@ pub(in crate::protocol) async fn start<
         )
         .await?;
 
-    let all_channels: Vec<crate::protocol::types::HelperChannel> = channel_store
-        .helpers(local_secret_id)
-        .await?
-        .into_iter()
-        .filter(|c| {
-            c.peer_role == derec_proto::SenderKind::Helper
-                && c.status == crate::protocol::types::ChannelStatus::Paired
-        })
-        .collect();
+    let all_channels: Vec<crate::protocol::types::HelperChannel> = stores
+        .channels
+        .helpers_matching(
+            local.secret_id,
+            crate::protocol::types::HelperFilter {
+                status: vec![crate::protocol::types::ChannelStatus::Paired],
+                role: Some(derec_proto::SenderKind::Helper),
+                ..Default::default()
+            },
+        )
+        .await?;
+
     let channel_ids: Vec<ChannelId> = all_channels.iter().map(|c| c.channel_id).collect();
-    let mut keys: std::collections::HashMap<ChannelId, SharedKey> = secret_store
+    let keys: std::collections::HashMap<ChannelId, SharedKey> = stores
+        .secrets
         .load_many(
-            local_secret_id,
+            local.secret_id,
             &channel_ids,
             SecretKind::SharedKey,
             MissingPolicy::Fail,
@@ -153,57 +165,11 @@ pub(in crate::protocol) async fn start<
         })
         .collect();
 
-    let mut events = Vec::with_capacity(all_channels.len());
-    for channel in all_channels {
-        let shared_key = keys
-            .remove(&channel.channel_id)
-            .expect("load_many(MissingPolicy::Fail) guarantees an entry per id");
-
-        match dispatch_one(
-            transport,
-            channel.channel_id,
-            &channel.transport,
-            target_secret_id,
-            version,
-            &shared_key,
-            reply_to.clone(),
-        )
-        .await
-        {
-            Ok(()) => {
-                events.push(DeRecEvent::RecoverSecretStarted {
-                    channel_id: channel.channel_id,
-                    version,
-                });
-                #[cfg(feature = "logging")]
-                tracing::debug!(
-                    channel_id = channel.channel_id.0,
-                    target_secret_id,
-                    version,
-                    "share request sent"
-                );
-            }
-            Err(e) => {
-                events.push(DeRecEvent::RecoverSecretFailed {
-                    channel_id: channel.channel_id,
-                    version,
-                    error: e.to_string(),
-                });
-                #[cfg(feature = "logging")]
-                tracing::warn!(
-                    channel_id = channel.channel_id.0,
-                    target_secret_id,
-                    version,
-                    error = %e,
-                    "share request dispatch failed"
-                );
-            }
-        }
-    }
+    let events = dispatch_all(stores, all_channels, keys, target_secret_id, version, round).await;
 
     #[cfg(feature = "logging")]
     tracing::info!(
-        local_secret_id,
+        local_secret_id = local.secret_id,
         target_secret_id,
         version,
         "share requests dispatched to all helpers"
@@ -216,29 +182,23 @@ pub(in crate::protocol) async fn start<
     feature = "logging",
     tracing::instrument(
         skip_all,
-        fields(
-            channel_id = channel_id.0,
+        fields(trace_id = exchange.trace_id,
+            channel_id = exchange.channel_id.0,
             secret_id = request.secret_id,
             version = request.version
         )
     )
 )]
-#[allow(clippy::too_many_arguments)]
-pub(in crate::protocol) async fn accept<
-    Ch: DeRecChannelStore,
-    Sh: DeRecShareStore,
-    T: DeRecTransport,
->(
-    channel_store: &mut Ch,
-    share_store: &mut Sh,
-    transport: &T,
-    secret_id: u64,
-    channel_id: ChannelId,
+pub(in crate::protocol) async fn accept<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    exchange: &Exchange<'_>,
     request: &GetShareRequestMessage,
-    shared_key: &SharedKey,
-    trace_id: u64,
 ) -> Result<Vec<DeRecEvent>> {
-    let linked_ids = channel_store.linked_channels(secret_id, channel_id).await?;
+    let linked_ids = stores
+        .channels
+        .linked_channels(local.secret_id, exchange.channel_id)
+        .await?;
 
     // `secret_id` is the partition this node stores under, not the secret
     // being asked for: a helper holds shares for other people's secrets, and
@@ -248,8 +208,9 @@ pub(in crate::protocol) async fn accept<
     // version could yield the wrong share — which `response::produce` then
     // rejects as `SecretIdMismatch`, failing a request whose share is
     // present and readable.
-    let encoded = share_store
-        .load_many(secret_id, &linked_ids, &[request.version])
+    let encoded = stores
+        .shares
+        .load_many(local.secret_id, &linked_ids, &[request.version])
         .await?
         .into_iter()
         .find(|s| s.secret_id == request.secret_id)
@@ -259,21 +220,22 @@ pub(in crate::protocol) async fn accept<
     let stored =
         StoreShareRequestMessage::decode(encoded.as_slice()).map_err(Error::ProtobufDecode)?;
 
-    let resp = response::produce(channel_id, request, &stored, shared_key)?;
+    let resp = response::produce(exchange.channel_id, request, &stored, exchange.shared_key)?;
 
-    let envelope = super::apply_trace_id(resp.envelope, trace_id)?;
-    let endpoint = super::resolve_response_endpoint(
-        channel_store,
-        secret_id,
-        channel_id,
-        request.reply_to.as_ref(),
-    )
-    .await?;
-    transport.send(&endpoint, envelope).await?;
+    let envelope = crate::derec_message::apply_trace_id(&resp.envelope, exchange.trace_id)?;
+    let endpoints = stores
+        .channels
+        .resolve_response_endpoints(
+            local.secret_id,
+            exchange.channel_id,
+            &crate::extensions::advertised_endpoints::reply_to_owned(request),
+        )
+        .await?;
+    stores.transport.send(&endpoints, envelope).await?;
 
     #[cfg(feature = "logging")]
     tracing::info!(
-        channel_id = channel_id.0,
+        channel_id = exchange.channel_id.0,
         secret_id = request.secret_id,
         version = request.version,
         "recovery share response sent"
@@ -286,25 +248,20 @@ pub(in crate::protocol) async fn accept<
     feature = "logging",
     tracing::instrument(
         skip_all,
-        fields(
-            channel_id = channel_id.0,
+        fields(trace_id = exchange.trace_id,
+            channel_id = exchange.channel_id.0,
             secret_id = request.secret_id,
             version = request.version
         )
     )
 )]
-#[allow(clippy::too_many_arguments)]
-pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport>(
-    channel_store: &mut Ch,
-    transport: &T,
-    secret_id: u64,
-    channel_id: ChannelId,
+pub(in crate::protocol) async fn reject<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    exchange: &Exchange<'_>,
     request: &GetShareRequestMessage,
-    shared_key: &SharedKey,
     status: StatusEnum,
     memo: &str,
-    trace_id: u64,
-    local_replica_id: Option<u64>,
 ) -> Result<()> {
     let response = GetShareResponseMessage {
         result: Some(DeRecResult {
@@ -318,18 +275,18 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
         version: request.version,
         // Answer on the path the request arrived on: a member asking gets a
         // member's answer, a helper exchange stays helper-bound.
-        replica_id: local_replica_id.filter(|_| request.replica_id.is_some()),
+        replica_id: local.replica_id.filter(|_| request.replica_id.is_some()),
     };
 
-    super::send_channel_message(
-        channel_store,
-        transport,
-        secret_id,
-        channel_id,
+    crate::extensions::channel_store::send_channel_message(
+        stores.channels,
+        stores.transport,
+        local.secret_id,
+        exchange.channel_id,
         MessageBody::GetShareResponse(response),
-        shared_key,
-        trace_id,
-        request.reply_to.as_ref(),
+        exchange.shared_key,
+        exchange.trace_id,
+        &crate::extensions::advertised_endpoints::reply_to_owned(request),
     )
     .await
 }
@@ -338,26 +295,21 @@ pub(in crate::protocol) async fn reject<Ch: DeRecChannelStore, T: DeRecTransport
     feature = "logging",
     tracing::instrument(
         skip_all,
-        fields(
-            channel_id = channel_id.0,
+        fields(trace_id = exchange.trace_id,
+            channel_id = exchange.channel_id.0,
             secret_id = request.secret_id,
             version = request.version
         )
     )
 )]
-fn on_request(
-    channel_id: ChannelId,
-    request: GetShareRequestMessage,
-    shared_key: SharedKey,
-    trace_id: u64,
-) -> Result<Vec<DeRecEvent>> {
+fn on_request(exchange: &Exchange<'_>, request: GetShareRequestMessage) -> Result<Vec<DeRecEvent>> {
     Ok(vec![DeRecEvent::ActionRequired {
-        channel_id,
+        channel_id: exchange.channel_id,
         action: PendingAction::GetShare {
-            channel_id,
+            channel_id: exchange.channel_id,
             request,
-            shared_key,
-            trace_id,
+            shared_key: *exchange.shared_key,
+            trace_id: exchange.trace_id,
         },
     }])
 }
@@ -373,17 +325,22 @@ fn on_request(
         )
     )
 )]
-async fn on_response<St: DeRecStateStore>(
-    state_store: &mut St,
-    local_secret_id: u64,
+async fn on_response<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
     channel_id: ChannelId,
     response: &GetShareResponseMessage,
 ) -> Result<Vec<DeRecEvent>> {
-    let secret_id = response.secret_id;
-    let version = response.version;
-    let state_key = StateKey::PendingRecovery { secret_id, version };
+    let state_key = StateKey::PendingRecovery {
+        secret_id: response.secret_id,
+        version: response.version,
+    };
 
-    let mut shares = match state_store.load(local_secret_id, state_key.clone()).await? {
+    let mut shares = match stores
+        .state
+        .load(local.secret_id, state_key.clone())
+        .await?
+    {
         Some(StateItem::PendingRecovery { shares, .. }) => shares,
         Some(_) => {
             return Err(Error::Invariant(
@@ -394,8 +351,8 @@ async fn on_response<St: DeRecStateStore>(
             #[cfg(feature = "logging")]
             tracing::debug!(
                 channel_id = channel_id.0,
-                secret_id,
-                version,
+                secret_id = response.secret_id,
+                version = response.version,
                 "recovery response has no matching pending recovery; dropping"
             );
             return Ok(vec![DeRecEvent::NoOp]);
@@ -406,7 +363,7 @@ async fn on_response<St: DeRecStateStore>(
     let shares_received = shares.len();
     let inputs: Vec<&GetShareResponseMessage> = shares.iter().collect();
 
-    let event = match response::recover(secret_id, version, &inputs) {
+    let event = match response::recover(response.secret_id, response.version, &inputs) {
         Ok(result) => {
             let typed_secret = match decode_recovered_secret(&result.secret_data) {
                 Ok(s) => s,
@@ -414,8 +371,8 @@ async fn on_response<St: DeRecStateStore>(
                     #[cfg(feature = "logging")]
                     tracing::warn!(
                         channel_id = channel_id.0,
-                        secret_id,
-                        version,
+                        secret_id = response.secret_id,
+                        version = response.version,
                         shares_received,
                         error = %e,
                         "recovered bytes did not decode as canonical Secret protobuf"
@@ -429,13 +386,13 @@ async fn on_response<St: DeRecStateStore>(
                 }
             };
 
-            state_store.remove(local_secret_id, state_key).await?;
+            stores.state.remove(local.secret_id, state_key).await?;
 
             #[cfg(feature = "logging")]
             tracing::info!(
                 channel_id = channel_id.0,
-                secret_id,
-                version,
+                secret_id = response.secret_id,
+                version = response.version,
                 shares_received,
                 "secret reconstructed from shares"
             );
@@ -450,12 +407,13 @@ async fn on_response<St: DeRecStateStore>(
                 derec_cryptography::vss::DerecVSSError::InsufficientShares
             ) =>
         {
-            state_store
+            stores
+                .state
                 .save(
-                    local_secret_id,
+                    local.secret_id,
                     StateItem::PendingRecovery {
-                        secret_id,
-                        version,
+                        secret_id: response.secret_id,
+                        version: response.version,
                         shares,
                     },
                 )
@@ -464,8 +422,8 @@ async fn on_response<St: DeRecStateStore>(
             #[cfg(feature = "logging")]
             tracing::debug!(
                 channel_id = channel_id.0,
-                secret_id,
-                version,
+                secret_id = response.secret_id,
+                version = response.version,
                 shares_received,
                 "reconstruction not yet possible — insufficient shares"
             );
@@ -476,12 +434,13 @@ async fn on_response<St: DeRecStateStore>(
             }
         }
         Err(e) => {
-            state_store
+            stores
+                .state
                 .save(
-                    local_secret_id,
+                    local.secret_id,
                     StateItem::PendingRecovery {
-                        secret_id,
-                        version,
+                        secret_id: response.secret_id,
+                        version: response.version,
                         shares,
                     },
                 )
@@ -490,8 +449,8 @@ async fn on_response<St: DeRecStateStore>(
             #[cfg(feature = "logging")]
             tracing::warn!(
                 channel_id = channel_id.0,
-                secret_id,
-                version,
+                secret_id = response.secret_id,
+                version = response.version,
                 shares_received,
                 error = %e,
                 "recovery share response received but reconstruction failed"
@@ -522,18 +481,82 @@ fn decode_recovered_secret(outer_bytes: &[u8]) -> Result<crate::protocol::types:
     Ok(secret)
 }
 
-async fn dispatch_one<T: DeRecTransport>(
-    transport: &T,
+/// Send a share request to every resolved channel, reporting each outcome.
+///
+/// One event per target, in the order the targets were resolved. A failure is
+/// isolated to its own target: it becomes a `RecoverSecretFailed` and the
+/// fan-out continues, so one unreachable helper cannot suppress the rest.
+async fn dispatch_all<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    all_channels: Vec<crate::protocol::types::HelperChannel>,
+    mut keys: std::collections::HashMap<ChannelId, SharedKey>,
+    target_secret_id: u64,
+    version: u32,
+    round: &Round<'_>,
+) -> Vec<DeRecEvent> {
+    let mut events = Vec::with_capacity(all_channels.len());
+    for channel in all_channels {
+        let shared_key = keys
+            .remove(&channel.channel_id)
+            .expect("load_many(MissingPolicy::Fail) guarantees an entry per id");
+
+        match dispatch_one(
+            stores,
+            channel.channel_id,
+            &channel.transports,
+            target_secret_id,
+            version,
+            &shared_key,
+            round,
+        )
+        .await
+        {
+            Ok(()) => {
+                events.push(DeRecEvent::RecoverSecretStarted {
+                    channel_id: channel.channel_id,
+                    version,
+                    trace_id: round.trace_id,
+                });
+                #[cfg(feature = "logging")]
+                tracing::debug!(
+                    channel_id = channel.channel_id.0,
+                    target_secret_id,
+                    version,
+                    "share request sent"
+                );
+            }
+            Err(e) => {
+                events.push(DeRecEvent::RecoverSecretFailed {
+                    channel_id: channel.channel_id,
+                    version,
+                    error: e.to_string(),
+                });
+                #[cfg(feature = "logging")]
+                tracing::warn!(
+                    channel_id = channel.channel_id.0,
+                    target_secret_id,
+                    version,
+                    error = %e,
+                    "share request dispatch failed"
+                );
+            }
+        }
+    }
+    events
+}
+
+async fn dispatch_one<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
     channel_id: ChannelId,
-    endpoint: &derec_proto::TransportProtocol,
+    endpoints: &[derec_proto::TransportProtocol],
     secret_id: u64,
     version: u32,
     shared_key: &SharedKey,
-    reply_to: Option<derec_proto::TransportProtocol>,
+    round: &Round<'_>,
 ) -> Result<()> {
-    let msg = request::produce(channel_id, secret_id, version, shared_key, reply_to)?;
-    let envelope = super::apply_trace_id(msg.envelope, super::fresh_trace_id())?;
-    transport.send(endpoint, envelope).await?;
+    let msg = request::produce(channel_id, secret_id, version, shared_key, round.reply_to)?;
+    let envelope = crate::derec_message::apply_trace_id(&msg.envelope, round.trace_id)?;
+    stores.transport.send(endpoints, envelope).await?;
     Ok(())
 }
 
@@ -549,9 +572,11 @@ mod recovery_ids_tests {
     //! `LOCAL != TARGET`.
 
     use super::*;
+    use crate::protocol::context::Exchange;
+    use crate::protocol::test::LocalFixture;
     use crate::protocol::test::{
         InMemChannelStore, InMemPersistedStateStore, InMemSecretStore, RecordingTransport,
-        run_async,
+        StoreRig, run_async,
     };
     use crate::protocol::types::{
         ChannelRecord, ChannelStatus, HelperChannel, ReplicaMember, ReplicaRole, SecretValue,
@@ -602,7 +627,6 @@ mod recovery_ids_tests {
     /// Owner holds is `SenderKind::Helper`. A replica `peer_role` seeds a
     /// group member instead, keyed on `replica_id = cid` so tests can name
     /// the member with the same literal they use for the channel.
-    #[allow(clippy::too_many_arguments)]
     async fn seed_channel_as(
         channels: &mut InMemChannelStore,
         secrets: &mut InMemSecretStore,
@@ -617,7 +641,7 @@ mod recovery_ids_tests {
             Some(role) => ChannelRecord::Replica(ReplicaMember {
                 channel_id: ChannelId(cid),
                 replica_id: crate::types::ReplicaId(cid),
-                transport,
+                transports: vec![transport.clone()],
                 communication_info: Default::default(),
                 role,
                 status,
@@ -625,7 +649,7 @@ mod recovery_ids_tests {
             }),
             None => ChannelRecord::Helper(HelperChannel {
                 channel_id: ChannelId(cid),
-                transport,
+                transports: vec![transport],
                 communication_info: Default::default(),
                 status,
                 created_at: 1,
@@ -694,31 +718,26 @@ mod recovery_ids_tests {
     // helpers and carry the TARGET secret id.
     // ---------------------------------------------------------------
 
+    /// A fixed round, so a test can assert what reaches the wire.
+    const ROUND: crate::protocol::context::Round<'static> = crate::protocol::context::Round {
+        reply_to: &[],
+        trace_id: 0x7ACE,
+    };
+
     #[test]
     fn start_dispatches_to_every_channel_of_the_local_instance() {
         run_async(async {
-            let mut channels = InMemChannelStore::default();
-            let mut secrets = InMemSecretStore::default();
-            let mut state = InMemPersistedStateStore::default();
-            let transport = RecordingTransport::default();
+            let lf = LocalFixture::new(LOCAL);
+            let mut rig = StoreRig::new();
 
-            seed_channel(&mut channels, &mut secrets, LOCAL, 11, 0xA1).await;
-            seed_channel(&mut channels, &mut secrets, LOCAL, 12, 0xA2).await;
+            seed_channel(&mut rig.channels, &mut rig.secrets, LOCAL, 11, 0xA1).await;
+            seed_channel(&mut rig.channels, &mut rig.secrets, LOCAL, 12, 0xA2).await;
 
-            let events = start(
-                &mut channels,
-                &mut secrets,
-                &mut state,
-                &transport,
-                LOCAL,
-                TARGET,
-                VERSION,
-                None,
-            )
-            .await
-            .expect("start succeeds");
+            let events = start(&mut rig.stores(), &lf.local(), TARGET, VERSION, &ROUND)
+                .await
+                .expect("start succeeds");
 
-            let mut uris = transport.sent_uris();
+            let mut uris = rig.transport.sent_uris();
             uris.sort();
             assert_eq!(
                 uris,
@@ -741,27 +760,16 @@ mod recovery_ids_tests {
     #[test]
     fn start_sends_request_carrying_the_target_secret_id() {
         run_async(async {
-            let mut channels = InMemChannelStore::default();
-            let mut secrets = InMemSecretStore::default();
-            let mut state = InMemPersistedStateStore::default();
-            let transport = RecordingTransport::default();
+            let lf = LocalFixture::new(LOCAL);
+            let mut rig = StoreRig::new();
 
-            seed_channel(&mut channels, &mut secrets, LOCAL, 11, 0xA1).await;
+            seed_channel(&mut rig.channels, &mut rig.secrets, LOCAL, 11, 0xA1).await;
 
-            start(
-                &mut channels,
-                &mut secrets,
-                &mut state,
-                &transport,
-                LOCAL,
-                TARGET,
-                VERSION,
-                None,
-            )
-            .await
-            .expect("start succeeds");
+            start(&mut rig.stores(), &lf.local(), TARGET, VERSION, &ROUND)
+                .await
+                .expect("start succeeds");
 
-            let envelopes = transport.sent_envelopes();
+            let envelopes = rig.transport.sent_envelopes();
             assert_eq!(envelopes.len(), 1);
             let request = decode_request(&envelopes[0], 0xA1);
             assert_eq!(
@@ -775,32 +783,21 @@ mod recovery_ids_tests {
     #[test]
     fn start_ignores_channels_belonging_to_other_instances() {
         run_async(async {
-            let mut channels = InMemChannelStore::default();
-            let mut secrets = InMemSecretStore::default();
-            let mut state = InMemPersistedStateStore::default();
-            let transport = RecordingTransport::default();
+            let lf = LocalFixture::new(LOCAL);
+            let mut rig = StoreRig::new();
 
             // One physical store, three instances. Only LOCAL's helpers
             // are ours to talk to.
-            seed_channel(&mut channels, &mut secrets, LOCAL, 11, 0xA1).await;
-            seed_channel(&mut channels, &mut secrets, TARGET, 21, 0xB1).await;
-            seed_channel(&mut channels, &mut secrets, OTHER, 31, 0xC1).await;
+            seed_channel(&mut rig.channels, &mut rig.secrets, LOCAL, 11, 0xA1).await;
+            seed_channel(&mut rig.channels, &mut rig.secrets, TARGET, 21, 0xB1).await;
+            seed_channel(&mut rig.channels, &mut rig.secrets, OTHER, 31, 0xC1).await;
 
-            start(
-                &mut channels,
-                &mut secrets,
-                &mut state,
-                &transport,
-                LOCAL,
-                TARGET,
-                VERSION,
-                None,
-            )
-            .await
-            .expect("start succeeds");
+            start(&mut rig.stores(), &lf.local(), TARGET, VERSION, &ROUND)
+                .await
+                .expect("start succeeds");
 
             assert_eq!(
-                transport.sent_uris(),
+                rig.transport.sent_uris(),
                 vec!["https://helper-11.example".to_owned()],
                 "recovery is scoped to the running instance's channels"
             );
@@ -810,37 +807,26 @@ mod recovery_ids_tests {
     #[test]
     fn start_records_pending_recovery_under_the_local_partition() {
         run_async(async {
-            let mut channels = InMemChannelStore::default();
-            let mut secrets = InMemSecretStore::default();
-            let mut state = InMemPersistedStateStore::default();
-            let transport = RecordingTransport::default();
+            let lf = LocalFixture::new(LOCAL);
+            let mut rig = StoreRig::new();
 
-            seed_channel(&mut channels, &mut secrets, LOCAL, 11, 0xA1).await;
+            seed_channel(&mut rig.channels, &mut rig.secrets, LOCAL, 11, 0xA1).await;
 
-            start(
-                &mut channels,
-                &mut secrets,
-                &mut state,
-                &transport,
-                LOCAL,
-                TARGET,
-                VERSION,
-                None,
-            )
-            .await
-            .expect("start succeeds");
+            start(&mut rig.stores(), &lf.local(), TARGET, VERSION, &ROUND)
+                .await
+                .expect("start succeeds");
 
             let key = pending_key(TARGET, VERSION);
             assert!(
                 matches!(
-                    state.load(LOCAL, key.clone()).await.expect("load"),
+                    rig.state.load(LOCAL, key.clone()).await.expect("load"),
                     Some(StateItem::PendingRecovery { secret_id, version, .. })
                         if secret_id == TARGET && version == VERSION
                 ),
                 "state lives in the local partition, keyed by the target"
             );
             assert!(
-                state.load(TARGET, key).await.expect("load").is_none(),
+                rig.state.load(TARGET, key).await.expect("load").is_none(),
                 "nothing may be written to the target's partition"
             );
         });
@@ -852,19 +838,17 @@ mod recovery_ids_tests {
     #[test]
     fn start_excludes_replica_channels() {
         run_async(async {
-            let mut channels = InMemChannelStore::default();
-            let mut secrets = InMemSecretStore::default();
-            let mut state = InMemPersistedStateStore::default();
-            let transport = RecordingTransport::default();
+            let lf = LocalFixture::new(LOCAL);
+            let mut rig = StoreRig::new();
 
-            seed_channel(&mut channels, &mut secrets, LOCAL, 11, 0xA1).await;
+            seed_channel(&mut rig.channels, &mut rig.secrets, LOCAL, 11, 0xA1).await;
             for (cid, peer_role) in [
                 (41, SenderKind::ReplicaDestination),
                 (42, SenderKind::ReplicaSource),
             ] {
                 seed_channel_as(
-                    &mut channels,
-                    &mut secrets,
+                    &mut rig.channels,
+                    &mut rig.secrets,
                     LOCAL,
                     cid,
                     0xD1,
@@ -874,21 +858,12 @@ mod recovery_ids_tests {
                 .await;
             }
 
-            let events = start(
-                &mut channels,
-                &mut secrets,
-                &mut state,
-                &transport,
-                LOCAL,
-                TARGET,
-                VERSION,
-                None,
-            )
-            .await
-            .expect("a replica channel must not abort the recovery");
+            let events = start(&mut rig.stores(), &lf.local(), TARGET, VERSION, &ROUND)
+                .await
+                .expect("a replica channel must not abort the recovery");
 
             assert_eq!(
-                transport.sent_uris(),
+                rig.transport.sent_uris(),
                 vec!["https://helper-11.example".to_owned()],
                 "only share-holding helpers may be asked for shares"
             );
@@ -901,14 +876,12 @@ mod recovery_ids_tests {
     #[test]
     fn start_excludes_channels_whose_peer_is_an_owner() {
         run_async(async {
-            let mut channels = InMemChannelStore::default();
-            let mut secrets = InMemSecretStore::default();
-            let mut state = InMemPersistedStateStore::default();
-            let transport = RecordingTransport::default();
+            let lf = LocalFixture::new(LOCAL);
+            let mut rig = StoreRig::new();
 
             seed_channel_as(
-                &mut channels,
-                &mut secrets,
+                &mut rig.channels,
+                &mut rig.secrets,
                 LOCAL,
                 51,
                 0xE1,
@@ -917,20 +890,11 @@ mod recovery_ids_tests {
             )
             .await;
 
-            start(
-                &mut channels,
-                &mut secrets,
-                &mut state,
-                &transport,
-                LOCAL,
-                TARGET,
-                VERSION,
-                None,
-            )
-            .await
-            .expect("start succeeds");
+            start(&mut rig.stores(), &lf.local(), TARGET, VERSION, &ROUND)
+                .await
+                .expect("start succeeds");
 
-            assert!(transport.sent_uris().is_empty());
+            assert!(rig.transport.sent_uris().is_empty());
         });
     }
 
@@ -939,15 +903,13 @@ mod recovery_ids_tests {
     #[test]
     fn start_excludes_channels_pending_fingerprint_verification() {
         run_async(async {
-            let mut channels = InMemChannelStore::default();
-            let mut secrets = InMemSecretStore::default();
-            let mut state = InMemPersistedStateStore::default();
-            let transport = RecordingTransport::default();
+            let lf = LocalFixture::new(LOCAL);
+            let mut rig = StoreRig::new();
 
-            seed_channel(&mut channels, &mut secrets, LOCAL, 11, 0xA1).await;
+            seed_channel(&mut rig.channels, &mut rig.secrets, LOCAL, 11, 0xA1).await;
             seed_channel_as(
-                &mut channels,
-                &mut secrets,
+                &mut rig.channels,
+                &mut rig.secrets,
                 LOCAL,
                 61,
                 0xF1,
@@ -956,21 +918,12 @@ mod recovery_ids_tests {
             )
             .await;
 
-            start(
-                &mut channels,
-                &mut secrets,
-                &mut state,
-                &transport,
-                LOCAL,
-                TARGET,
-                VERSION,
-                None,
-            )
-            .await
-            .expect("start succeeds");
+            start(&mut rig.stores(), &lf.local(), TARGET, VERSION, &ROUND)
+                .await
+                .expect("start succeeds");
 
             assert_eq!(
-                transport.sent_uris(),
+                rig.transport.sent_uris(),
                 vec!["https://helper-11.example".to_owned()]
             );
         });
@@ -979,28 +932,17 @@ mod recovery_ids_tests {
     #[test]
     fn start_dispatches_nothing_when_the_local_instance_has_no_channels() {
         run_async(async {
-            let mut channels = InMemChannelStore::default();
-            let mut secrets = InMemSecretStore::default();
-            let mut state = InMemPersistedStateStore::default();
-            let transport = RecordingTransport::default();
+            let lf = LocalFixture::new(LOCAL);
+            let mut rig = StoreRig::new();
 
             // Channels exist, but under the target — not under us.
-            seed_channel(&mut channels, &mut secrets, TARGET, 21, 0xB1).await;
+            seed_channel(&mut rig.channels, &mut rig.secrets, TARGET, 21, 0xB1).await;
 
-            let events = start(
-                &mut channels,
-                &mut secrets,
-                &mut state,
-                &transport,
-                LOCAL,
-                TARGET,
-                VERSION,
-                None,
-            )
-            .await
-            .expect("start succeeds");
+            let events = start(&mut rig.stores(), &lf.local(), TARGET, VERSION, &ROUND)
+                .await
+                .expect("start succeeds");
 
-            assert!(transport.sent_uris().is_empty());
+            assert!(rig.transport.sent_uris().is_empty());
             assert!(events.is_empty());
         });
     }
@@ -1013,8 +955,9 @@ mod recovery_ids_tests {
     #[test]
     fn on_response_accepts_share_whose_secret_id_differs_from_the_local_instance() {
         run_async(async {
-            let mut state = InMemPersistedStateStore::default();
-            state
+            let lf = LocalFixture::new(LOCAL);
+            let mut rig = StoreRig::new();
+            rig.state
                 .save(
                     LOCAL,
                     StateItem::PendingRecovery {
@@ -1028,7 +971,7 @@ mod recovery_ids_tests {
 
             let responses = helper_responses(TARGET, VERSION, &[11, 12, 13], 2, b"payload");
 
-            let events = on_response(&mut state, LOCAL, ChannelId(11), &responses[0])
+            let events = on_response(&mut rig.stores(), &lf.local(), ChannelId(11), &responses[0])
                 .await
                 .expect("a response for the requested secret must not be rejected");
 
@@ -1045,8 +988,9 @@ mod recovery_ids_tests {
     #[test]
     fn on_response_accumulates_shares_until_threshold() {
         run_async(async {
-            let mut state = InMemPersistedStateStore::default();
-            state
+            let lf = LocalFixture::new(LOCAL);
+            let mut rig = StoreRig::new();
+            rig.state
                 .save(
                     LOCAL,
                     StateItem::PendingRecovery {
@@ -1060,10 +1004,10 @@ mod recovery_ids_tests {
 
             let responses = helper_responses(TARGET, VERSION, &[11, 12, 13], 3, b"payload");
 
-            on_response(&mut state, LOCAL, ChannelId(11), &responses[0])
+            on_response(&mut rig.stores(), &lf.local(), ChannelId(11), &responses[0])
                 .await
                 .expect("first share accepted");
-            let events = on_response(&mut state, LOCAL, ChannelId(12), &responses[1])
+            let events = on_response(&mut rig.stores(), &lf.local(), ChannelId(12), &responses[1])
                 .await
                 .expect("second share accepted");
 
@@ -1080,8 +1024,9 @@ mod recovery_ids_tests {
     #[test]
     fn on_response_reconstructs_secret_once_threshold_is_met() {
         run_async(async {
-            let mut state = InMemPersistedStateStore::default();
-            state
+            let lf = LocalFixture::new(LOCAL);
+            let mut rig = StoreRig::new();
+            rig.state
                 .save(
                     LOCAL,
                     StateItem::PendingRecovery {
@@ -1096,10 +1041,10 @@ mod recovery_ids_tests {
             let payload = super::tests::encode_protect_wrapping(&super::tests::fixture_secret());
             let responses = helper_responses(TARGET, VERSION, &[11, 12], 2, &payload);
 
-            on_response(&mut state, LOCAL, ChannelId(11), &responses[0])
+            on_response(&mut rig.stores(), &lf.local(), ChannelId(11), &responses[0])
                 .await
                 .expect("first share accepted");
-            let events = on_response(&mut state, LOCAL, ChannelId(12), &responses[1])
+            let events = on_response(&mut rig.stores(), &lf.local(), ChannelId(12), &responses[1])
                 .await
                 .expect("second share accepted");
 
@@ -1114,8 +1059,9 @@ mod recovery_ids_tests {
     #[test]
     fn on_response_clears_pending_state_after_reconstruction() {
         run_async(async {
-            let mut state = InMemPersistedStateStore::default();
-            state
+            let lf = LocalFixture::new(LOCAL);
+            let mut rig = StoreRig::new();
+            rig.state
                 .save(
                     LOCAL,
                     StateItem::PendingRecovery {
@@ -1130,15 +1076,15 @@ mod recovery_ids_tests {
             let payload = super::tests::encode_protect_wrapping(&super::tests::fixture_secret());
             let responses = helper_responses(TARGET, VERSION, &[11, 12], 2, &payload);
 
-            on_response(&mut state, LOCAL, ChannelId(11), &responses[0])
+            on_response(&mut rig.stores(), &lf.local(), ChannelId(11), &responses[0])
                 .await
                 .expect("first share accepted");
-            on_response(&mut state, LOCAL, ChannelId(12), &responses[1])
+            on_response(&mut rig.stores(), &lf.local(), ChannelId(12), &responses[1])
                 .await
                 .expect("second share accepted");
 
             assert!(
-                state
+                rig.state
                     .load(LOCAL, pending_key(TARGET, VERSION))
                     .await
                     .expect("load")
@@ -1151,10 +1097,11 @@ mod recovery_ids_tests {
     #[test]
     fn on_response_drops_response_with_no_matching_pending_recovery() {
         run_async(async {
-            let mut state = InMemPersistedStateStore::default();
+            let lf = LocalFixture::new(LOCAL);
+            let mut rig = StoreRig::new();
             let responses = helper_responses(TARGET, VERSION, &[11, 12], 2, b"payload");
 
-            let events = on_response(&mut state, LOCAL, ChannelId(11), &responses[0])
+            let events = on_response(&mut rig.stores(), &lf.local(), ChannelId(11), &responses[0])
                 .await
                 .expect("an unsolicited response is dropped, not an error");
 
@@ -1165,12 +1112,13 @@ mod recovery_ids_tests {
     #[test]
     fn on_response_keeps_concurrent_recoveries_of_different_targets_separate() {
         run_async(async {
+            let lf = LocalFixture::new(LOCAL);
             const TARGET_A: u64 = 0xA1;
             const TARGET_B: u64 = 0xB2;
 
-            let mut state = InMemPersistedStateStore::default();
+            let mut rig = StoreRig::new();
             for target in [TARGET_A, TARGET_B] {
-                state
+                rig.state
                     .save(
                         LOCAL,
                         StateItem::PendingRecovery {
@@ -1188,13 +1136,13 @@ mod recovery_ids_tests {
             let a = helper_responses(TARGET_A, VERSION, &[11, 12, 13], 3, b"vault-a");
             let b = helper_responses(TARGET_B, VERSION, &[21, 22, 23], 3, b"vault-b");
 
-            on_response(&mut state, LOCAL, ChannelId(11), &a[0])
+            on_response(&mut rig.stores(), &lf.local(), ChannelId(11), &a[0])
                 .await
                 .expect("vault A share accepted");
-            on_response(&mut state, LOCAL, ChannelId(21), &b[0])
+            on_response(&mut rig.stores(), &lf.local(), ChannelId(21), &b[0])
                 .await
                 .expect("vault B share accepted");
-            let events = on_response(&mut state, LOCAL, ChannelId(12), &a[1])
+            let events = on_response(&mut rig.stores(), &lf.local(), ChannelId(12), &a[1])
                 .await
                 .expect("second vault A share accepted");
 
@@ -1209,7 +1157,8 @@ mod recovery_ids_tests {
                 "vault A must have exactly its own two shares, got {events:?}"
             );
 
-            let b_shares = match state
+            let b_shares = match rig
+                .state
                 .load(LOCAL, pending_key(TARGET_B, VERSION))
                 .await
                 .expect("load")
@@ -1251,27 +1200,24 @@ mod recovery_ids_tests {
         /// A protocol instance running under `LOCAL` — the ephemeral
         /// instance a recovering device would spin up.
         fn build_rig() -> Rig {
-            let channel_store = InMemChannelStore::default();
-            let secret_store = InMemSecretStore::default();
-            let state_store = InMemPersistedStateStore::default();
-            let transport = RecordingTransport::default();
+            let rig = StoreRig::new();
             let protocol = DeRecProtocolBuilder::new(LOCAL)
-                .with_channel_store(channel_store.clone())
+                .with_channel_store(rig.channels.clone())
                 .with_share_store(InMemShareStore::default())
-                .with_secret_store(secret_store.clone())
+                .with_secret_store(rig.secrets.clone())
                 .with_user_secret_store(InMemUserSecretStore::default())
-                .with_state_store(state_store.clone())
-                .with_transport(transport.clone())
-                .with_own_transport("https://recovering-device.example")
+                .with_state_store(rig.state.clone())
+                .with_transport(rig.transport.clone())
+                .with_own_transports(["https://recovering-device.example"])
                 .with_threshold(2)
                 .build()
                 .expect("test rig builds");
             Rig {
                 protocol,
-                channel_store,
-                secret_store,
-                state_store,
-                transport,
+                channel_store: rig.channels,
+                secret_store: rig.secrets,
+                state_store: rig.state,
+                transport: rig.transport,
             }
         }
 
@@ -1542,19 +1488,31 @@ mod recovery_ids_tests {
         #[test]
         fn the_share_served_is_the_one_the_request_asked_for() {
             run_async(async {
+                let lf = LocalFixture::new(LOCAL);
                 const DECOY_CHANNEL: u64 = 0x10;
                 const WANTED_CHANNEL: u64 = 0x20;
                 const DECOY_SECRET: u64 = 0x88;
 
-                let mut channels = InMemChannelStore::default();
-                let mut secrets = InMemSecretStore::default();
-                let mut shares = crate::protocol::test::InMemShareStore::default();
-                let transport = RecordingTransport::default();
+                let mut rig = StoreRig::new();
 
-                seed_channel(&mut channels, &mut secrets, LOCAL, DECOY_CHANNEL, 0xB1).await;
-                seed_channel(&mut channels, &mut secrets, LOCAL, WANTED_CHANNEL, 0xB2).await;
+                seed_channel(
+                    &mut rig.channels,
+                    &mut rig.secrets,
+                    LOCAL,
+                    DECOY_CHANNEL,
+                    0xB1,
+                )
+                .await;
+                seed_channel(
+                    &mut rig.channels,
+                    &mut rig.secrets,
+                    LOCAL,
+                    WANTED_CHANNEL,
+                    0xB2,
+                )
+                .await;
                 DeRecChannelStore::link_channel(
-                    &mut channels,
+                    &mut rig.channels,
                     LOCAL,
                     ChannelId(DECOY_CHANNEL),
                     ChannelId(WANTED_CHANNEL),
@@ -1564,7 +1522,7 @@ mod recovery_ids_tests {
 
                 for (channel, secret) in [(DECOY_CHANNEL, DECOY_SECRET), (WANTED_CHANNEL, TARGET)] {
                     DeRecShareStore::save(
-                        &mut shares,
+                        &mut rig.shares,
                         LOCAL,
                         ChannelId(channel),
                         Share {
@@ -1584,14 +1542,14 @@ mod recovery_ids_tests {
                 };
 
                 accept(
-                    &mut channels,
-                    &mut shares,
-                    &transport,
-                    LOCAL,
-                    ChannelId(WANTED_CHANNEL),
+                    &mut rig.stores(),
+                    &lf.local(),
+                    &Exchange {
+                        channel_id: ChannelId(WANTED_CHANNEL),
+                        shared_key: &[0xB2; 32],
+                        trace_id: 0,
+                    },
                     &request,
-                    &[0xB2; 32],
-                    0,
                 )
                 .await
                 .expect("the share for TARGET is stored and must be the one served");
@@ -1626,7 +1584,10 @@ mod tests {
         Secret {
             helpers: vec![HelperInfo {
                 channel_id: 7,
-                transport_uri: "https://helper.example".to_owned(),
+                transports: vec![derec_proto::TransportProtocol {
+                    uri: "https://helper.example".to_owned(),
+                    protocol: derec_proto::Protocol::Https as i32,
+                }],
                 shared_key: vec![0xAA; 32],
                 communication_info: HashMap::from([("name".to_owned(), "Helper".to_owned())]),
             }],
@@ -1647,13 +1608,19 @@ mod tests {
                 members: vec![
                     ReplicaInfo {
                         replica_id: 0xBEEF,
-                        transport_uri: "https://owner.example".to_owned(),
+                        transports: vec![derec_proto::TransportProtocol {
+                            uri: "https://owner.example".to_owned(),
+                            protocol: derec_proto::Protocol::Https as i32,
+                        }],
                         role: crate::protocol::types::ReplicaRole::Source as i32,
                         communication_info: HashMap::new(),
                     },
                     ReplicaInfo {
                         replica_id: 0xCAFE,
-                        transport_uri: "https://replica.example".to_owned(),
+                        transports: vec![derec_proto::TransportProtocol {
+                            uri: "https://replica.example".to_owned(),
+                            protocol: derec_proto::Protocol::Https as i32,
+                        }],
                         role: crate::protocol::types::ReplicaRole::Destination as i32,
                         communication_info: HashMap::new(),
                     },

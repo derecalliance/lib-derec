@@ -132,6 +132,54 @@ pub enum Error {
     /// device is meant to keep the original.
     #[error("replica id {replica_id} is already in use by another member of the group")]
     ReplicaIdConflict { replica_id: u64 },
+
+    /// A peer advertised no endpoint this library will record.
+    ///
+    /// Every endpoint it offered failed [`TransportPolicy`] — typically all
+    /// of them were plaintext while plaintext is not opted into. Terminal:
+    /// delivery is push-only, so a peer that cannot be reached cannot be
+    /// sent a rejection either. The application tells the user; the protocol
+    /// has nothing further to try.
+    ///
+    /// This is *not* a mismatch between the two sides' transports. The
+    /// library no longer compares them — it records what a peer offers and
+    /// leaves the choice of which to dial to
+    /// [`DeRecTransport`](crate::protocol::DeRecTransport).
+    ///
+    /// [`TransportPolicy`]: crate::transport::TransportPolicy
+    #[error(
+        "peer advertised no usable transport endpoint; all {offered} offer(s) \
+         were refused by transport policy"
+    )]
+    NoUsableEndpoint {
+        /// How many endpoints the peer offered before filtering.
+        offered: usize,
+    },
+
+    /// Both plaintext opt-in flags were set explicitly, and they disagree.
+    ///
+    /// Precedence would resolve this silently — the deprecated flag wins, so
+    /// that a deployment which only knows the old one keeps its behavior after
+    /// upgrading. That rule is right when a human wrote both values and wrong
+    /// when a machine wrote one of them: a configuration layer that emits every
+    /// field unconditionally sets `unsafe_http: false` as a safe default, and
+    /// a deliberate `unsafe_connection: true` would then lose to it. Nothing
+    /// would error; plaintext endpoints would simply be refused, and the
+    /// operator would be left debugging a flag that appears to do nothing.
+    ///
+    /// Setting only the deprecated flag is still honored and does not raise
+    /// this — that is the compatibility case the precedence rule exists for.
+    #[error(
+        "conflicting plaintext opt-in: deprecated `unsafe_http` is {unsafe_http} but \
+         `unsafe_connection` is {unsafe_connection} — set only `unsafe_connection`, \
+         which supersedes it and gates both plaintext schemes (`http://` and `grpc://`)"
+    )]
+    ConflictingPlaintextOptIn {
+        /// The value given for the deprecated flag.
+        unsafe_http: bool,
+        /// The value given for the flag that supersedes it.
+        unsafe_connection: bool,
+    },
 }
 
 impl Error {

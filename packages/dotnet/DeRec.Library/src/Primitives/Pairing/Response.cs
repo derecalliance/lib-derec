@@ -12,7 +12,13 @@ public static partial class Pairing
         public sealed class ProduceResult
         {
             public required DeRecMessage Envelope { get; init; }
-            public required TransportProtocol PeerTransportProtocol { get; init; }
+            /// <summary>
+            /// Every endpoint the requester advertised, in the order it
+            /// offered them, filtered to those the library will record. Never
+            /// empty. Choosing which to dial, and failing over when one is
+            /// unreachable, belongs to the caller.
+            /// </summary>
+            public required IReadOnlyList<TransportProtocol> PeerTransports { get; init; }
             public required byte[] SharedKey { get; init; }
             /// <summary>
             /// Post-handshake rekey channel id the responder is committing to.
@@ -94,12 +100,15 @@ public static partial class Pairing
         /// bytes (<c>CommunicationInfo</c> and <c>ParameterRange</c>
         /// respectively).
         /// </summary>
+        /// <param name="unsafeConnection">Accept plaintext peer endpoints
+        /// (<c>http://</c>, <c>grpc://</c>). Development only.</param>
         public static ProduceResult Produce(
             ulong channelId,
             byte[] requestProtoBytes,
             byte[] secretKeyMaterial,
             byte[]? communicationInfo = null,
-            byte[]? parameterRange = null
+            byte[]? parameterRange = null,
+            bool unsafeConnection = false
         )
         {
             Native.Pairing.ProducePairResponseMessageResult nativeResult =
@@ -112,7 +121,8 @@ public static partial class Pairing
                     communicationInfo,
                     (UIntPtr)(communicationInfo?.Length ?? 0),
                     parameterRange,
-                    (UIntPtr)(parameterRange?.Length ?? 0)
+                    (UIntPtr)(parameterRange?.Length ?? 0),
+                    unsafeConnection ? 1u : 0u
                 );
 
             try
@@ -121,7 +131,7 @@ public static partial class Pairing
                 return new ProduceResult
                 {
                     Envelope = DeRecMessage.FromProtoBytes(Utils.CopyBuffer(nativeResult.ResponseWireBytes)),
-                    PeerTransportProtocol = TransportProtocol.FromProtoBytes(Utils.CopyBuffer(nativeResult.PeerTransportProtocol)),
+                    PeerTransports = TransportProtocol.FromProtoBytesList(Utils.CopyBuffer(nativeResult.PeerTransports)),
                     SharedKey = Utils.CopyBuffer(nativeResult.SharedKey),
                     ChannelId = nativeResult.ChannelId,
                 };
@@ -129,7 +139,7 @@ public static partial class Pairing
             finally
             {
                 Utils.FreeBuffer(nativeResult.ResponseWireBytes);
-                Utils.FreeBuffer(nativeResult.PeerTransportProtocol);
+                Utils.FreeBuffer(nativeResult.PeerTransports);
                 Utils.FreeBuffer(nativeResult.SharedKey);
             }
         }

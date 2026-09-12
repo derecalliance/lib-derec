@@ -139,6 +139,19 @@ enum StatusEnum {
   // initiator can surface a useful diagnostic.
   INCOMPATIBLE_PARAMETER_RANGE = 11;
 
+  // The announced transport protocol is one the recipient cannot serve.
+  //
+  // Returned only for a transport change on an **already-established**
+  // channel — an `UpdateChannelInfo` announcing a switch the recipient
+  // cannot follow. The recipient still holds the peer's previous working
+  // endpoint, which is what makes this refusal deliverable at all.
+  //
+  // It is deliberately **not** used during pairing. Delivery is push-only,
+  // so a party that cannot reach a peer also cannot deliver a rejection to
+  // it; pairing incompatibility surfaces locally to the application
+  // instead.
+  UNSUPPORTED_TRANSPORT_PROTOCOL = 12;
+
   // A share already exists for this (secretId, version) with different
   // content, so the write was refused.
   //

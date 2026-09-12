@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-//! Typestate builder for [`DeRecProtocol`]. See [`DeRecProtocolBuilder`].
+//! Typestate builder for [`DeRecProtocol`]. See [`DeRecProtocolBuilder`](crate::protocol::DeRecProtocolBuilder).
 //!
 //! Each store/transport slot is tracked by its own type parameter, starting
 //! at [`BuilderSlotMissingMarker`] and transitioning to
 //! [`BuilderSlotSetMarker<T>`] when its `with_*` setter runs. Setters only
 //! touch their own slot, which is what makes call order irrelevant.
-//! [`DeRecProtocolBuilder::build`] is reachable only when every slot has
+//! [`DeRecProtocolBuilder::build`](crate::protocol::DeRecProtocolBuilder::build) is reachable only when every slot has
 //! reached [`BuilderSlotSetMarker<_>`].
 
 use std::collections::HashMap;
@@ -24,15 +24,45 @@ pub struct BuilderSlotMissingMarker;
 pub struct BuilderSlotSetMarker<T>(T);
 
 /// Minimum number of shares required to reconstruct the secret, absent an
-/// explicit [`DeRecProtocolBuilder::with_threshold`] call. This is the sole
-/// definition of the value — [`DeRecProtocolBuilder::new`] and the FFI
+/// explicit [`DeRecProtocolBuilder::with_threshold`](crate::protocol::DeRecProtocolBuilder::with_threshold) call. This is the sole
+/// definition of the value — [`DeRecProtocolBuilder::new`](crate::protocol::DeRecProtocolBuilder::new) and the FFI
 /// config's serde default both read it rather than each hardcoding `3`.
 pub const DEFAULT_THRESHOLD: usize = 3;
 
 /// Number of recent share versions each helper retains, absent an explicit
-/// [`DeRecProtocolBuilder::with_keep_versions_count`] call. Sole definition
+/// [`DeRecProtocolBuilder::with_keep_versions_count`](crate::protocol::DeRecProtocolBuilder::with_keep_versions_count) call. Sole definition
 /// of the value; see [`DEFAULT_THRESHOLD`].
 pub const DEFAULT_KEEP_VERSIONS_COUNT: usize = 3;
+
+/// Resolve the two plaintext opt-in flags to a single policy value.
+///
+/// `unsafe_http` is superseded by `unsafe_connection` but still honored, so a
+/// deployment that only knows the old flag keeps its behavior after upgrading.
+///
+/// The distinction is *presence*, not value: an SDK that never sets the old
+/// flag sends nothing, which must not override a deliberate new-flag
+/// setting. Callers that cannot express absence must pass `None`.
+///
+/// Two values that are both present and disagree are a
+/// [`Error::ConflictingPlaintextOptIn`](crate::Error::ConflictingPlaintextOptIn)
+/// rather than a silent win for either, because at that point there is no
+/// reading of the configuration that is obviously intended, and the one this
+/// would otherwise pick is the one being removed.
+pub(crate) fn resolve_plaintext_opt_in(
+    unsafe_http: Option<bool>,
+    unsafe_connection: Option<bool>,
+) -> crate::Result<bool> {
+    match (unsafe_http, unsafe_connection) {
+        (Some(old), Some(new)) if old != new => Err(crate::Error::ConflictingPlaintextOptIn {
+            unsafe_http: old,
+            unsafe_connection: new,
+        }),
+        (Some(agreed), Some(_)) => Ok(agreed),
+        (Some(old), None) => Ok(old),
+        (None, Some(new)) => Ok(new),
+        (None, None) => Ok(false),
+    }
+}
 
 /// Typestate builder for [`DeRecProtocol`].
 ///
@@ -55,7 +85,7 @@ pub const DEFAULT_KEEP_VERSIONS_COUNT: usize = 3;
 ///     .with_user_secret_store(my_user_secret_store)
 ///     .with_state_store(my_state_store)
 ///     .with_transport(my_transport)
-///     .with_own_transport("https://me.example.com")
+///     .with_own_transports(["https://me.example.com"])
 ///     // Plus any optional with_* setters to override defaults.
 ///     .build()?;
 /// ```
@@ -79,7 +109,8 @@ pub struct DeRecProtocolBuilder<
     threshold: usize,
     keep_versions_count: usize,
     timeouts: crate::protocol::types::Timeouts,
-    unsafe_http: bool,
+    unsafe_http: Option<bool>,
+    unsafe_connection: Option<bool>,
     communication_info: HashMap<String, String>,
     auto_respond_on_failure: bool,
     unpair_ack: UnpairAck,
@@ -118,7 +149,8 @@ impl
             threshold: DEFAULT_THRESHOLD,
             keep_versions_count: DEFAULT_KEEP_VERSIONS_COUNT,
             timeouts: crate::protocol::types::Timeouts::default(),
-            unsafe_http: false,
+            unsafe_http: None,
+            unsafe_connection: None,
             communication_info: HashMap::new(),
             auto_respond_on_failure: false,
             unpair_ack: UnpairAck::Required,
@@ -240,8 +272,36 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     /// record, propagate or reply to a plaintext endpoint. Leaving it `false`
     /// does not make a deployment secure on its own, and setting it `true`
     /// does not by itself send anything in the clear.
+    #[deprecated(
+        since = "0.0.3",
+        note = "use `with_unsafe_connection`, which names both gated schemes; \
+                removed at 0.0.5"
+    )]
     pub fn with_unsafe_http(mut self, allow: bool) -> Self {
-        self.unsafe_http = allow;
+        self.unsafe_http = Some(allow);
+        self
+    }
+
+    /// Accept plaintext transport endpoints — `http://` and `grpc://`.
+    ///
+    /// Supersedes [`with_unsafe_http`](Self::with_unsafe_http), which named
+    /// only one of the two schemes it gates. Either alone is honored; both
+    /// set and disagreeing is
+    /// [`Error::ConflictingPlaintextOptIn`](crate::Error::ConflictingPlaintextOptIn)
+    /// from [`build`](Self::build) rather than a silent win for either.
+    ///
+    /// See [`TransportPolicy`](crate::transport::TransportPolicy) for the
+    /// full table, including why loopback is free for your own endpoint but
+    /// not for one a peer names.
+    ///
+    /// # This is a guardrail, not transport security
+    ///
+    /// The SDK opens no sockets — delivery is the application's
+    /// [`DeRecTransport`](crate::protocol::DeRecTransport). Nothing here can
+    /// stop an application sending plaintext; what it does is refuse to
+    /// record, propagate or reply to a plaintext endpoint.
+    pub fn with_unsafe_connection(mut self, allow: bool) -> Self {
+        self.unsafe_connection = Some(allow);
         self
     }
 
@@ -297,9 +357,10 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     ///   single-device case.
     ///
     /// Only affects outbound requests originated through
-    /// [`DeRecProtocol::start`]. Responders always honour an inbound
-    /// `replyTo` regardless of this flag (it is purely a per-request hint
-    /// on the wire).
+    /// [`DeRecProtocol::start`], and only on channel-mode flows: pairing
+    /// carries its endpoints in its own `transportProtocol` field and is
+    /// unaffected. Responders always honour an inbound `replyTo` regardless
+    /// of this flag (it is purely a per-request hint on the wire).
     ///
     /// Default: `false`.
     pub fn with_auto_reply_to(mut self, enabled: bool) -> Self {
@@ -405,6 +466,7 @@ impl<ShareStore, SecretStore, UserSecretStore, StateStore, Transport, OwnTranspo
             keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
             unsafe_http: self.unsafe_http,
+            unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -454,6 +516,7 @@ impl<ChannelStore, SecretStore, UserSecretStore, StateStore, Transport, OwnTrans
             keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
             unsafe_http: self.unsafe_http,
+            unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -503,6 +566,7 @@ impl<ChannelStore, ShareStore, UserSecretStore, StateStore, Transport, OwnTransp
             keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
             unsafe_http: self.unsafe_http,
+            unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -555,6 +619,7 @@ impl<ChannelStore, ShareStore, SecretStore, StateStore, Transport, OwnTransport>
             keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
             unsafe_http: self.unsafe_http,
+            unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -604,6 +669,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, OwnTran
             keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
             unsafe_http: self.unsafe_http,
+            unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -636,7 +702,35 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     /// [`build`](DeRecProtocolBuilder::build) so the setter chain stays
     /// infallible — a malformed URI surfaces as
     /// [`crate::Error::Transport`] when `build()` runs.
+    ///
+    /// Stores a one-element preference list, so this and
+    /// [`with_own_transports`](Self::with_own_transports) fill the same
+    /// slot — whichever is called last wins, same as any other setter.
+    ///
+    /// # Migrating
+    ///
+    /// [`with_own_transports`](Self::with_own_transports) takes the whole
+    /// preference list and is what this becomes internally, so a
+    /// single-endpoint deployment migrates by wrapping its argument:
+    ///
+    /// ```ignore
+    /// // before
+    /// .with_own_transport("https://me.example/derec")
+    /// // after
+    /// .with_own_transports(["https://me.example/derec"])
+    /// ```
+    ///
+    /// The singular spelling is going away because it can name only one
+    /// protocol, and a device serving several advertises all of them in
+    /// preference order. See the [`transport`](crate::transport) module docs
+    /// for how the list is used during pairing, and for the one-endpoint-per-
+    /// protocol rule the set is held to.
     #[allow(clippy::type_complexity)]
+    #[deprecated(
+        since = "0.0.3",
+        note = "use `with_own_transports`, which takes the whole preference \
+                list; removed at 0.0.5"
+    )]
     pub fn with_own_transport(
         self,
         own_transport: impl crate::transport::IntoOwnTransport,
@@ -648,10 +742,13 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
         StateStore,
         Transport,
         BuilderSlotSetMarker<
-            Result<crate::transport::TransportProtocol, crate::transport::TransportValidationError>,
+            Result<
+                Vec<crate::transport::TransportProtocol>,
+                crate::transport::TransportValidationError,
+            >,
         >,
     > {
-        let own_transport = own_transport.into_own_transport();
+        let own_transport = own_transport.into_own_transport().map(|t| vec![t]);
         DeRecProtocolBuilder {
             secret_id: self.secret_id,
             channel_store: self.channel_store,
@@ -665,6 +762,80 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
             unsafe_http: self.unsafe_http,
+            unsafe_connection: self.unsafe_connection,
+            communication_info: self.communication_info,
+            auto_respond_on_failure: self.auto_respond_on_failure,
+            unpair_ack: self.unpair_ack,
+            auto_reply_to: self.auto_reply_to,
+            auto_accept: self.auto_accept,
+            replica_id: self.replica_id,
+            parameter_range: self.parameter_range,
+        }
+    }
+
+    /// Set every transport endpoint this application serves, in preference
+    /// order.
+    ///
+    /// The order is meaningful: it is what decides which of a peer's offered
+    /// endpoints gets used. The first entry is also this device's primary
+    /// endpoint, the one advertised to implementations predating the offer
+    /// list.
+    ///
+    /// Because delivery is push-only, an endpoint listed here is one this
+    /// application must actually **serve** — a peer can only reply to an
+    /// address it can reach. Listing a transport that is not served makes
+    /// pairing succeed and replies vanish.
+    ///
+    /// Supersedes [`with_own_transport`](Self::with_own_transport) for
+    /// applications serving more than one transport; the single-endpoint
+    /// setter remains fully supported and is equivalent to passing a
+    /// one-element list.
+    ///
+    /// The list must be non-empty — [`build`](Self::build) rejects an empty
+    /// one with [`crate::Error::InvalidInput`].
+    #[allow(clippy::type_complexity)]
+    pub fn with_own_transports<I, T>(
+        self,
+        transports: I,
+    ) -> DeRecProtocolBuilder<
+        ChannelStore,
+        ShareStore,
+        SecretStore,
+        UserSecretStore,
+        StateStore,
+        Transport,
+        BuilderSlotSetMarker<
+            Result<
+                Vec<crate::transport::TransportProtocol>,
+                crate::transport::TransportValidationError,
+            >,
+        >,
+    >
+    where
+        I: IntoIterator<Item = T>,
+        T: crate::transport::IntoOwnTransport,
+    {
+        // Same error-deferral shape as `with_own_transport`: stash the
+        // fallible conversion, surface failures from `.build()`, keep the
+        // setter chain infallible.
+        let own_transports: Result<Vec<_>, _> = transports
+            .into_iter()
+            .map(crate::transport::IntoOwnTransport::into_own_transport)
+            .collect();
+        DeRecProtocolBuilder {
+            secret_id: self.secret_id,
+            channel_store: self.channel_store,
+            share_store: self.share_store,
+            secret_store: self.secret_store,
+            user_secret_store: self.user_secret_store,
+            state_store: self.state_store,
+            transport: self.transport,
+            own_transport: BuilderSlotSetMarker(own_transports),
+            threshold: self.threshold,
+            keep_versions_count: self.keep_versions_count,
+            timeouts: self.timeouts,
+            unsafe_http: self.unsafe_http,
+            unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -719,6 +890,7 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, Transport, OwnTrans
             keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
             unsafe_http: self.unsafe_http,
+            unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
             unpair_ack: self.unpair_ack,
@@ -746,7 +918,10 @@ impl<
         BuilderSlotSetMarker<St>,
         BuilderSlotSetMarker<Tr>,
         BuilderSlotSetMarker<
-            Result<crate::transport::TransportProtocol, crate::transport::TransportValidationError>,
+            Result<
+                Vec<crate::transport::TransportProtocol>,
+                crate::transport::TransportValidationError,
+            >,
         >,
     >
 {
@@ -755,23 +930,62 @@ impl<
     /// The "all required slots set" constraint is enforced by this impl
     /// block's type bounds — the call is only reachable once every slot
     /// has been filled. Runtime invariant checks (currently:
-    /// `threshold >= 2` and own-transport URI validity) are deferred to
-    /// this point and surface as [`crate::Error`].
+    /// `threshold >= 2` and own-transport URI validity, checked for
+    /// every entry) are deferred to this point and surface as
+    /// [`crate::Error`].
     ///
     /// # Errors
     ///
     /// - [`crate::Error::InvalidInput`] if `threshold < 2`. A threshold
     ///   of `0` or `1` collapses threshold secret sharing and lets a
     ///   single helper reconstruct the secret unilaterally.
-    /// - [`crate::Error::Transport`] if the URI passed to
-    ///   [`with_own_transport`](Self::with_own_transport) failed
-    ///   validation (malformed scheme, empty URI, …).
+    /// - [`crate::Error::InvalidInput`] if
+    ///   [`with_own_transports`](Self::with_own_transports) was given an
+    ///   empty list. Delivery is push-only, so an application serving no
+    ///   endpoint can never be replied to.
+    /// - [`crate::Error::Transport`] if any endpoint passed to
+    ///   [`with_own_transport`](Self::with_own_transport) or
+    ///   [`with_own_transports`](Self::with_own_transports) failed
+    ///   validation (malformed scheme, empty URI, …) — the first
+    ///   invalid entry stops the build.
+    /// - [`crate::Error::Transport`] carrying
+    ///   [`DuplicateProtocol`](crate::transport::TransportValidationError::DuplicateProtocol)
+    ///   if the list names one protocol twice. A device serves at most one
+    ///   address per protocol, so the list is a preference order over
+    ///   distinct protocols — see the [`transport`](crate::transport) module
+    ///   docs.
     pub fn build(self) -> crate::Result<DeRecProtocol<Cs, Sh, Ss, Us, St, Tr>> {
-        let own_transport: TransportProtocol = self.own_transport.0?.into();
-        // Deferred to here rather than to `with_own_transport`: the setters
-        // may be called in either order, so this is the first point at which
-        // both the endpoint and the policy are known.
-        crate::transport::TransportPolicy::new(self.unsafe_http).check_own(&own_transport)?;
+        let own_transports: Vec<TransportProtocol> =
+            self.own_transport.0?.into_iter().map(Into::into).collect();
+        // The typestate proves the slot was *filled*, not that it was filled
+        // with anything. `with_own_transports` accepts any iterator, so an
+        // empty one reaches here having satisfied every type bound, and the
+        // protocol treats `own_transports[0]` as this device's primary
+        // endpoint — an application with no endpoint cannot be reached at all.
+        if own_transports.is_empty() {
+            return Err(crate::Error::InvalidInput(
+                "own transports must not be empty: this application needs at \
+                 least one endpoint peers can reach it on",
+            ));
+        }
+        // One resolution feeds both the build-time `check_own` below and the
+        // runtime policy stored on the protocol, so the two never disagree
+        // about which flag decided the posture.
+        let unsafe_connection = resolve_plaintext_opt_in(self.unsafe_http, self.unsafe_connection)?;
+        // Deferred to here rather than to `with_own_transport` /
+        // `with_own_transports`: the setters may be called in either order,
+        // so this is the first point at which both the endpoint(s) and the
+        // policy are known. Every entry is checked — an unvalidated
+        // secondary endpoint would otherwise be advertised to peers in
+        // `supportedTransports` without ever passing policy.
+        let policy = crate::transport::TransportPolicy::new(unsafe_connection);
+        for own_transport in &own_transports {
+            policy.check_own(own_transport)?;
+        }
+        // Each endpoint may be individually fine and the set still wrong: a
+        // device serves one address per protocol, so two of the same protocol
+        // leave peers with no rule for choosing between them.
+        policy.check_own_set(&own_transports)?;
         let mut protocol = DeRecProtocol::new(
             self.secret_id,
             self.channel_store.0,
@@ -780,7 +994,7 @@ impl<
             self.user_secret_store.0,
             self.state_store.0,
             self.transport.0,
-            own_transport,
+            own_transports,
             self.threshold,
             self.keep_versions_count,
             self.timeouts,
@@ -792,7 +1006,7 @@ impl<
         protocol.auto_accept = self.auto_accept;
         protocol.replica_id = self.replica_id;
         protocol.parameter_range = self.parameter_range;
-        protocol.unsafe_http = self.unsafe_http;
+        protocol.unsafe_http = unsafe_connection;
         Ok(protocol)
     }
 }
@@ -800,6 +1014,73 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsafe_connection_alone_is_honored() {
+        assert!(resolve_plaintext_opt_in(None, Some(true)).unwrap());
+        assert!(!resolve_plaintext_opt_in(None, Some(false)).unwrap());
+    }
+
+    /// Two explicit values that disagree are refused rather than resolved.
+    ///
+    /// Precedence would hand the decision to the flag being removed, and the
+    /// case that makes that dangerous is a configuration layer emitting both
+    /// fields unconditionally: a defaulted `unsafe_http: false` would beat a
+    /// deliberate `unsafe_connection: true`, refusing plaintext endpoints with
+    /// no diagnostic beyond a log line the application may not have wired up.
+    #[test]
+    fn disagreeing_explicit_flags_are_refused() {
+        for (old, new) in [(true, false), (false, true)] {
+            let err = resolve_plaintext_opt_in(Some(old), Some(new))
+                .expect_err("two explicit, disagreeing values must not resolve silently");
+            assert!(
+                matches!(
+                    err,
+                    crate::Error::ConflictingPlaintextOptIn {
+                        unsafe_http,
+                        unsafe_connection,
+                    } if unsafe_http == old && unsafe_connection == new
+                ),
+                "the error must name both flags and the values given: {err:?}"
+            );
+            // The operator has to be able to find the flag they set, so both
+            // names appear in the rendered message.
+            let rendered = err.to_string();
+            assert!(rendered.contains("unsafe_http"), "{rendered}");
+            assert!(rendered.contains("unsafe_connection"), "{rendered}");
+        }
+    }
+
+    /// Agreement is not a conflict, however redundantly it was expressed — a
+    /// config layer that emits both fields with the same value is describing
+    /// one posture, not two.
+    #[test]
+    fn agreeing_explicit_flags_resolve() {
+        assert!(resolve_plaintext_opt_in(Some(true), Some(true)).unwrap());
+        assert!(!resolve_plaintext_opt_in(Some(false), Some(false)).unwrap());
+    }
+
+    /// Presence, not value. An SDK that never sets `unsafe_http` must not
+    /// override a deliberate `unsafe_connection`.
+    #[test]
+    fn absent_deprecated_flag_does_not_override() {
+        assert!(resolve_plaintext_opt_in(None, Some(true)).unwrap());
+    }
+
+    #[test]
+    fn neither_flag_is_the_production_posture() {
+        assert!(!resolve_plaintext_opt_in(None, None).unwrap());
+    }
+
+    /// The old flag alone still decides, so an application that upgrades
+    /// without touching its configuration keeps exactly its previous
+    /// posture. This is the compatibility case the precedence rule existed
+    /// for, and refusing a conflict does not disturb it.
+    #[test]
+    fn deprecated_flag_alone_is_honored() {
+        assert!(resolve_plaintext_opt_in(Some(true), None).unwrap());
+        assert!(!resolve_plaintext_opt_in(Some(false), None).unwrap());
+    }
 
     /// A freshly-constructed builder carries `DEFAULT_THRESHOLD` /
     /// `DEFAULT_KEEP_VERSIONS_COUNT` until a setter overrides them — the
@@ -871,8 +1152,8 @@ mod tests {
             TransportFuture,
         };
         use crate::protocol::types::{
-            ChannelQuery, ChannelRecord, HelperChannel, MissingPolicy, ReplicaMember, SecretKind,
-            SecretValue, Share, UserSecrets,
+            ChannelQuery, ChannelRecord, HelperChannel, HelperFilter, MissingPolicy, ReplicaFilter,
+            ReplicaMember, SecretKind, SecretValue, Share, UserSecrets,
         };
         use crate::types::ChannelId;
         use derec_proto::TransportProtocol;
@@ -892,10 +1173,18 @@ mod tests {
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(std::future::ready(Ok(false)))
             }
-            fn helpers(&self, _: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+            fn helpers(
+                &self,
+                _: u64,
+                _: HelperFilter,
+            ) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
-            fn replicas(&self, _: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
+            fn replicas(
+                &self,
+                _: u64,
+                _: ReplicaFilter,
+            ) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn link_channel(
@@ -984,7 +1273,7 @@ mod tests {
 
         struct NoopTransport;
         impl DeRecTransport for NoopTransport {
-            fn send(&self, _: &TransportProtocol, _: Vec<u8>) -> TransportFuture<'_> {
+            fn send(&self, _: &[TransportProtocol], _: Vec<u8>) -> TransportFuture<'_> {
                 Box::pin(std::future::ready(Ok(())))
             }
         }
@@ -1033,10 +1322,10 @@ mod tests {
             NoopUserSecretStore,
             NoopStateStore,
             NoopTransport,
-            TransportProtocol {
+            vec![TransportProtocol {
                 uri: String::new(),
                 protocol: 0,
-            },
+            }],
             0, // ← invalid threshold
             3,
             crate::protocol::types::Timeouts::default(),
@@ -1055,8 +1344,8 @@ mod tests {
             TransportFuture,
         };
         use crate::protocol::types::{
-            ChannelQuery, ChannelRecord, HelperChannel, MissingPolicy, ReplicaMember, SecretKind,
-            SecretValue, Share, UserSecrets,
+            ChannelQuery, ChannelRecord, HelperChannel, HelperFilter, MissingPolicy, ReplicaFilter,
+            ReplicaMember, SecretKind, SecretValue, Share, UserSecrets,
         };
         use crate::types::ChannelId;
         use derec_proto::TransportProtocol;
@@ -1076,10 +1365,18 @@ mod tests {
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(std::future::ready(Ok(false)))
             }
-            fn helpers(&self, _: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+            fn helpers(
+                &self,
+                _: u64,
+                _: HelperFilter,
+            ) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
-            fn replicas(&self, _: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
+            fn replicas(
+                &self,
+                _: u64,
+                _: ReplicaFilter,
+            ) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn link_channel(
@@ -1164,7 +1461,7 @@ mod tests {
         }
         struct NoopTransport;
         impl DeRecTransport for NoopTransport {
-            fn send(&self, _: &TransportProtocol, _: Vec<u8>) -> TransportFuture<'_> {
+            fn send(&self, _: &[TransportProtocol], _: Vec<u8>) -> TransportFuture<'_> {
                 Box::pin(std::future::ready(Ok(())))
             }
         }
@@ -1210,7 +1507,7 @@ mod tests {
             .with_user_secret_store(NoopUserSecretStore)
             .with_transport(NoopTransport)
             .with_state_store(NoopStateStore)
-            .with_own_transport("https://owner.example/derec")
+            .with_own_transports(["https://owner.example/derec"])
             .with_threshold(1)
             .build();
         assert!(matches!(result, Err(crate::Error::InvalidInput(_))));
@@ -1227,8 +1524,8 @@ mod tests {
             TransportFuture,
         };
         use crate::protocol::types::{
-            ChannelQuery, ChannelRecord, HelperChannel, MissingPolicy, ReplicaMember, SecretKind,
-            SecretValue, Share, UserSecrets,
+            ChannelQuery, ChannelRecord, HelperChannel, HelperFilter, MissingPolicy, ReplicaFilter,
+            ReplicaMember, SecretKind, SecretValue, Share, UserSecrets,
         };
         use crate::types::ChannelId;
         use derec_proto::TransportProtocol;
@@ -1248,10 +1545,18 @@ mod tests {
             fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
                 Box::pin(std::future::ready(Ok(false)))
             }
-            fn helpers(&self, _: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+            fn helpers(
+                &self,
+                _: u64,
+                _: HelperFilter,
+            ) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
-            fn replicas(&self, _: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
+            fn replicas(
+                &self,
+                _: u64,
+                _: ReplicaFilter,
+            ) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
                 Box::pin(std::future::ready(Ok(Vec::new())))
             }
             fn link_channel(
@@ -1336,7 +1641,7 @@ mod tests {
         }
         struct NoopTransport;
         impl DeRecTransport for NoopTransport {
-            fn send(&self, _: &TransportProtocol, _: Vec<u8>) -> TransportFuture<'_> {
+            fn send(&self, _: &[TransportProtocol], _: Vec<u8>) -> TransportFuture<'_> {
                 Box::pin(std::future::ready(Ok(())))
             }
         }
@@ -1382,15 +1687,416 @@ mod tests {
             .with_user_secret_store(NoopUserSecretStore)
             .with_transport(NoopTransport)
             .with_state_store(NoopStateStore)
-            .with_own_transport("ws://owner.example/derec")
+            .with_own_transports(["ws://owner.example/derec"])
             .with_threshold(2)
             .build();
         assert!(matches!(
             result,
             Err(crate::Error::Transport(
-                crate::transport::TransportValidationError::SchemeMismatch { .. }
+                crate::transport::TransportValidationError::UnknownScheme { .. }
             ))
         ));
+    }
+
+    /// `with_own_transport` fills the same slot as `with_own_transports`,
+    /// as a one-element list.
+    #[test]
+    fn single_own_transport_becomes_a_one_element_list() {
+        use crate::protocol::traits::{
+            ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecShareStore,
+            DeRecTransport, DeRecUserSecretStore, SecretStoreFuture, ShareStoreFuture,
+            TransportFuture,
+        };
+        use crate::protocol::types::{
+            ChannelQuery, ChannelRecord, HelperChannel, HelperFilter, MissingPolicy, ReplicaFilter,
+            ReplicaMember, SecretKind, SecretValue, Share, UserSecrets,
+        };
+        use crate::types::ChannelId;
+        use derec_proto::{Protocol, TransportProtocol};
+
+        struct NoopChannelStore;
+        impl DeRecChannelStore for NoopChannelStore {
+            fn load(
+                &self,
+                _: u64,
+                _: ChannelQuery,
+            ) -> ChannelStoreFuture<'_, Option<ChannelRecord>> {
+                Box::pin(std::future::ready(Ok(None)))
+            }
+            fn save(&mut self, _: u64, _: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
+                Box::pin(std::future::ready(Ok(false)))
+            }
+            fn helpers(
+                &self,
+                _: u64,
+                _: HelperFilter,
+            ) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+            fn replicas(
+                &self,
+                _: u64,
+                _: ReplicaFilter,
+            ) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+            fn link_channel(
+                &mut self,
+                _: u64,
+                _: ChannelId,
+                _: ChannelId,
+            ) -> ChannelStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn linked_channels(
+                &self,
+                _: u64,
+                cid: ChannelId,
+            ) -> ChannelStoreFuture<'_, Vec<ChannelId>> {
+                Box::pin(std::future::ready(Ok(vec![cid])))
+            }
+        }
+        struct NoopShareStore;
+        impl DeRecShareStore for NoopShareStore {
+            fn load(&self, _: u64, _: ChannelId, _: &[u32]) -> ShareStoreFuture<'_, Vec<Share>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+            fn load_many(
+                &self,
+                _: u64,
+                _: &[ChannelId],
+                _: &[u32],
+            ) -> ShareStoreFuture<'_, Vec<Share>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+            fn load_all(&self, _: u64, _: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+            fn latest_version(&self, _: u64) -> ShareStoreFuture<'_, Option<u32>> {
+                Box::pin(std::future::ready(Ok(None)))
+            }
+            fn save(&mut self, _: u64, _: ChannelId, _: Share) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn remove_channel(&mut self, _: u64, _: ChannelId) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+        }
+        struct NoopSecretStore;
+        impl DeRecSecretStore for NoopSecretStore {
+            fn load(
+                &self,
+                _: u64,
+                _: ChannelId,
+                _: SecretKind,
+            ) -> SecretStoreFuture<'_, Option<SecretValue>> {
+                Box::pin(std::future::ready(Ok(None)))
+            }
+            fn load_many(
+                &self,
+                _: u64,
+                _: &[ChannelId],
+                _: SecretKind,
+                _: MissingPolicy,
+            ) -> SecretStoreFuture<'_, Vec<(ChannelId, SecretValue)>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+            fn save(&mut self, _: u64, _: ChannelId, _: SecretValue) -> SecretStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+        }
+        struct NoopUserSecretStore;
+        impl DeRecUserSecretStore for NoopUserSecretStore {
+            fn load_latest(&self, _: u64) -> ShareStoreFuture<'_, Option<UserSecrets>> {
+                Box::pin(std::future::ready(Ok(None)))
+            }
+            fn save_latest(&mut self, _: u64, _: UserSecrets) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn remove(&mut self, _: u64) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+        }
+        struct NoopTransport;
+        impl DeRecTransport for NoopTransport {
+            fn send(&self, _: &[TransportProtocol], _: Vec<u8>) -> TransportFuture<'_> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+        }
+        struct NoopStateStore;
+        impl crate::protocol::DeRecStateStore for NoopStateStore {
+            fn save(
+                &mut self,
+                _: u64,
+                _: crate::protocol::StateItem,
+            ) -> crate::protocol::StateStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn load(
+                &self,
+                _: u64,
+                _: crate::protocol::StateKey,
+            ) -> crate::protocol::StateStoreFuture<'_, Option<crate::protocol::StateItem>>
+            {
+                Box::pin(std::future::ready(Ok(None)))
+            }
+            fn remove(
+                &mut self,
+                _: u64,
+                _: crate::protocol::StateKey,
+            ) -> crate::protocol::StateStoreFuture<'_, bool> {
+                Box::pin(std::future::ready(Ok(false)))
+            }
+            fn load_all(
+                &self,
+                _: u64,
+                _: crate::protocol::StateKind,
+            ) -> crate::protocol::StateStoreFuture<'_, Vec<crate::protocol::StateItem>>
+            {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+        }
+
+        let protocol = DeRecProtocolBuilder::new(0)
+            .with_channel_store(NoopChannelStore)
+            .with_share_store(NoopShareStore)
+            .with_secret_store(NoopSecretStore)
+            .with_user_secret_store(NoopUserSecretStore)
+            .with_transport(NoopTransport)
+            .with_state_store(NoopStateStore)
+            .with_own_transports([crate::transport::TransportProtocol::new(
+                "https://me.example.com/derec",
+                Protocol::Https,
+            )])
+            .with_threshold(2)
+            .build()
+            .expect("valid single-endpoint builder should build");
+        assert_eq!(protocol.own_transports.len(), 1);
+        assert_eq!(protocol.own_transports[0].protocol, Protocol::Https as i32);
+    }
+
+    /// The order the application passes is its preference order and must
+    /// survive verbatim — it is the order the peer is advertised in.
+    #[test]
+    fn own_transports_preserve_caller_order() {
+        use crate::protocol::traits::{
+            ChannelStoreFuture, DeRecChannelStore, DeRecSecretStore, DeRecShareStore,
+            DeRecTransport, DeRecUserSecretStore, SecretStoreFuture, ShareStoreFuture,
+            TransportFuture,
+        };
+        use crate::protocol::types::{
+            ChannelQuery, ChannelRecord, HelperChannel, HelperFilter, MissingPolicy, ReplicaFilter,
+            ReplicaMember, SecretKind, SecretValue, Share, UserSecrets,
+        };
+        use crate::types::ChannelId;
+        use derec_proto::{Protocol, TransportProtocol};
+
+        struct NoopChannelStore;
+        impl DeRecChannelStore for NoopChannelStore {
+            fn load(
+                &self,
+                _: u64,
+                _: ChannelQuery,
+            ) -> ChannelStoreFuture<'_, Option<ChannelRecord>> {
+                Box::pin(std::future::ready(Ok(None)))
+            }
+            fn save(&mut self, _: u64, _: ChannelRecord) -> ChannelStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn remove(&mut self, _: u64, _: ChannelQuery) -> ChannelStoreFuture<'_, bool> {
+                Box::pin(std::future::ready(Ok(false)))
+            }
+            fn helpers(
+                &self,
+                _: u64,
+                _: HelperFilter,
+            ) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+            fn replicas(
+                &self,
+                _: u64,
+                _: ReplicaFilter,
+            ) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+            fn link_channel(
+                &mut self,
+                _: u64,
+                _: ChannelId,
+                _: ChannelId,
+            ) -> ChannelStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn linked_channels(
+                &self,
+                _: u64,
+                cid: ChannelId,
+            ) -> ChannelStoreFuture<'_, Vec<ChannelId>> {
+                Box::pin(std::future::ready(Ok(vec![cid])))
+            }
+        }
+        struct NoopShareStore;
+        impl DeRecShareStore for NoopShareStore {
+            fn load(&self, _: u64, _: ChannelId, _: &[u32]) -> ShareStoreFuture<'_, Vec<Share>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+            fn load_many(
+                &self,
+                _: u64,
+                _: &[ChannelId],
+                _: &[u32],
+            ) -> ShareStoreFuture<'_, Vec<Share>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+            fn load_all(&self, _: u64, _: &[ChannelId]) -> ShareStoreFuture<'_, Vec<Share>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+            fn latest_version(&self, _: u64) -> ShareStoreFuture<'_, Option<u32>> {
+                Box::pin(std::future::ready(Ok(None)))
+            }
+            fn save(&mut self, _: u64, _: ChannelId, _: Share) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn remove_channel(&mut self, _: u64, _: ChannelId) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+        }
+        struct NoopSecretStore;
+        impl DeRecSecretStore for NoopSecretStore {
+            fn load(
+                &self,
+                _: u64,
+                _: ChannelId,
+                _: SecretKind,
+            ) -> SecretStoreFuture<'_, Option<SecretValue>> {
+                Box::pin(std::future::ready(Ok(None)))
+            }
+            fn load_many(
+                &self,
+                _: u64,
+                _: &[ChannelId],
+                _: SecretKind,
+                _: MissingPolicy,
+            ) -> SecretStoreFuture<'_, Vec<(ChannelId, SecretValue)>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+            fn save(&mut self, _: u64, _: ChannelId, _: SecretValue) -> SecretStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn remove(&mut self, _: u64, _: ChannelId, _: SecretKind) -> SecretStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+        }
+        struct NoopUserSecretStore;
+        impl DeRecUserSecretStore for NoopUserSecretStore {
+            fn load_latest(&self, _: u64) -> ShareStoreFuture<'_, Option<UserSecrets>> {
+                Box::pin(std::future::ready(Ok(None)))
+            }
+            fn save_latest(&mut self, _: u64, _: UserSecrets) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn remove(&mut self, _: u64) -> ShareStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+        }
+        struct NoopTransport;
+        impl DeRecTransport for NoopTransport {
+            fn send(&self, _: &[TransportProtocol], _: Vec<u8>) -> TransportFuture<'_> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+        }
+        struct NoopStateStore;
+        impl crate::protocol::DeRecStateStore for NoopStateStore {
+            fn save(
+                &mut self,
+                _: u64,
+                _: crate::protocol::StateItem,
+            ) -> crate::protocol::StateStoreFuture<'_, ()> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn load(
+                &self,
+                _: u64,
+                _: crate::protocol::StateKey,
+            ) -> crate::protocol::StateStoreFuture<'_, Option<crate::protocol::StateItem>>
+            {
+                Box::pin(std::future::ready(Ok(None)))
+            }
+            fn remove(
+                &mut self,
+                _: u64,
+                _: crate::protocol::StateKey,
+            ) -> crate::protocol::StateStoreFuture<'_, bool> {
+                Box::pin(std::future::ready(Ok(false)))
+            }
+            fn load_all(
+                &self,
+                _: u64,
+                _: crate::protocol::StateKind,
+            ) -> crate::protocol::StateStoreFuture<'_, Vec<crate::protocol::StateItem>>
+            {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+        }
+
+        let protocol = DeRecProtocolBuilder::new(0)
+            .with_channel_store(NoopChannelStore)
+            .with_share_store(NoopShareStore)
+            .with_secret_store(NoopSecretStore)
+            .with_user_secret_store(NoopUserSecretStore)
+            .with_transport(NoopTransport)
+            .with_state_store(NoopStateStore)
+            .with_own_transports(vec![
+                crate::transport::TransportProtocol::new(
+                    "grpcs://me.example.com:443",
+                    Protocol::Grpc,
+                ),
+                crate::transport::TransportProtocol::new(
+                    "https://me.example.com/derec",
+                    Protocol::Https,
+                ),
+            ])
+            .with_threshold(2)
+            .build()
+            .expect("valid multi-endpoint builder should build");
+        assert_eq!(protocol.own_transports[0].protocol, Protocol::Grpc as i32);
+        assert_eq!(protocol.own_transports[1].protocol, Protocol::Https as i32);
+    }
+
+    /// The typestate proves the own-transport slot was filled, not that it was
+    /// filled with an endpoint. `with_own_transports` takes any iterator, so an
+    /// empty one satisfies every type bound and would leave `own_transports[0]`
+    /// — the primary endpoint the protocol indexes unconditionally — with
+    /// nothing to return.
+    #[test]
+    fn build_rejects_an_empty_own_transport_list() {
+        use crate::protocol::test::{
+            InMemChannelStore, InMemSecretStore, InMemShareStore, InMemStateStore,
+            InMemUserSecretStore, NoopTransport,
+        };
+
+        let built = DeRecProtocolBuilder::new(0)
+            .with_channel_store(InMemChannelStore::default())
+            .with_share_store(InMemShareStore::default())
+            .with_secret_store(InMemSecretStore::default())
+            .with_user_secret_store(InMemUserSecretStore::default())
+            .with_transport(NoopTransport)
+            .with_state_store(InMemStateStore)
+            .with_own_transports(Vec::<crate::transport::TransportProtocol>::new())
+            .with_threshold(2)
+            .build();
+        match built {
+            Err(crate::Error::InvalidInput(_)) => {}
+            Err(other) => panic!("expected InvalidInput, got {other:?}"),
+            Ok(_) => panic!("an application serving no endpoint must not build"),
+        }
     }
 
     /// Normalization is the builder's single responsibility here: a zero

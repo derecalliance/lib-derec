@@ -21,7 +21,7 @@
 //!   secretStore,    // implements { load, save, remove }
 //!   transport,      // implements { send }
 //!   "https://my-node.example.com/derec",
-//!   "https",
+//!   "https",         // or "grpc" for a grpc://... / grpcs://... endpoint
 //! );
 //!
 //! // Owner: generate a contact message, read channel_id, serialize for QR.
@@ -42,6 +42,36 @@
 //! interface contracts.
 
 mod events;
+
+/// Maps a transport protocol *name* to its wire discriminant.
+///
+/// Case-insensitive; accepts exactly `"https"` and `"grpc"` — the two
+/// protocol-family names, not the four URI schemes each admits. `https://`
+/// and `http://` both name `Protocol::Https`; `grpcs://` and `grpc://` both
+/// name `Protocol::Grpc`.
+///
+/// Lives here rather than beside
+/// [`crate::transport::protocol_for_scheme`](crate::transport) because names
+/// only cross this seam: every other layer derives the protocol from a URI
+/// instead of taking a bare string. Both directions go through this single
+/// pair so the name/discriminant pairing cannot drift between call sites.
+pub(super) fn protocol_name_to_discriminant(name: &str) -> Option<i32> {
+    match name.to_lowercase().as_str() {
+        "https" => Some(derec_proto::Protocol::Https.into()),
+        "grpc" => Some(derec_proto::Protocol::Grpc.into()),
+        _ => None,
+    }
+}
+
+/// Inverse of [`protocol_name_to_discriminant`]: maps a wire discriminant
+/// back to its lowercase protocol name. `None` for any discriminant outside
+/// the defined `Protocol` variants.
+pub(super) fn protocol_discriminant_to_name(discriminant: i32) -> Option<&'static str> {
+    match derec_proto::Protocol::try_from(discriminant).ok()? {
+        derec_proto::Protocol::Https => Some("https"),
+        derec_proto::Protocol::Grpc => Some("grpc"),
+    }
+}
 // `pending_action_wire` lives in `crate::protocol::utils` so both WASM
 // and FFI bridges can share the same on-the-wire encoding for the opaque
 // PendingAction blob.
@@ -160,8 +190,8 @@ impl TimeoutsJs {
 /// docs.
 ///
 /// Required setters: `withChannelStore`, `withShareStore`,
-/// `withSecretStore`, `withTransport`, `withOwnTransport`. Calling
-/// `build()` without all five throws.
+/// `withSecretStore`, `withTransport`, and either `withOwnTransport` or
+/// `withOwnTransports`. Calling `build()` without all five throws.
 ///
 /// All optional setters carry the defaults documented on the Rust
 /// builder.
@@ -176,6 +206,10 @@ pub struct DeRecProtocolBuilderWasm {
     transport: Option<JsValue>,
     own_transport_uri: Option<String>,
     own_transport_protocol_num: Option<i32>,
+    /// Set by `withOwnTransports`, in preference order. Takes precedence
+    /// over `own_transport_uri` / `own_transport_protocol_num` in `build()`
+    /// when non-empty.
+    own_transports: Vec<crate::transport::TransportProtocol>,
     threshold: u32,
     keep_versions_count: u32,
     communication_info: HashMap<String, String>,
@@ -183,7 +217,8 @@ pub struct DeRecProtocolBuilderWasm {
     /// leaves the library's own defaults in force rather than restating them
     /// here.
     timeouts: Option<TimeoutsJs>,
-    unsafe_http: bool,
+    unsafe_http: Option<bool>,
+    unsafe_connection: Option<bool>,
     auto_respond_on_failure: bool,
     unpair_ack: UnpairAck,
     auto_reply_to: bool,
@@ -211,11 +246,13 @@ impl DeRecProtocolBuilderWasm {
             transport: None,
             own_transport_uri: None,
             own_transport_protocol_num: None,
+            own_transports: Vec::new(),
             threshold: 3,
             keep_versions_count: 3,
             communication_info: HashMap::new(),
             timeouts: None,
-            unsafe_http: false,
+            unsafe_http: None,
+            unsafe_connection: None,
             auto_respond_on_failure: false,
             unpair_ack: UnpairAck::Required,
             auto_reply_to: false,
@@ -262,7 +299,11 @@ impl DeRecProtocolBuilderWasm {
     }
 
     /// `endpoint` shape: `{ uri: string, protocol: string }`.
-    /// `protocol` must be `"https"` (the only protocol supported today).
+    /// `protocol` is `"https"` or `"grpc"` (case-insensitive).
+    ///
+    /// @deprecated Use `withOwnTransports`, which takes the whole preference
+    /// list — `withOwnTransports([endpoint])` is the direct replacement.
+    /// Removed at 0.0.5.
     #[wasm_bindgen(js_name = withOwnTransport)]
     pub fn with_own_transport(
         mut self,
@@ -275,17 +316,64 @@ impl DeRecProtocolBuilderWasm {
         }
         let parsed: EndpointShape = serde_wasm_bindgen::from_value(endpoint)
             .map_err(|e| js_error("INVALID_OWN_TRANSPORT", e.to_string()))?;
-        let protocol_num = match parsed.protocol.to_lowercase().as_str() {
-            "https" => 0i32,
-            other => {
-                return Err(js_error(
-                    "INVALID_PROTOCOL",
-                    format!("unknown protocol: {other}"),
-                ));
-            }
-        };
+        let protocol_num = protocol_name_to_discriminant(&parsed.protocol).ok_or_else(|| {
+            js_error(
+                "INVALID_PROTOCOL",
+                format!("unknown protocol: {}", parsed.protocol.to_lowercase()),
+            )
+        })?;
         self.own_transport_uri = Some(parsed.uri);
         self.own_transport_protocol_num = Some(protocol_num);
+        Ok(self)
+    }
+
+    /// Every transport endpoint this application serves, in preference
+    /// order. `transports` is an array of `{ uri: string, protocol: string
+    /// }` objects, `protocol` being `"https"` or `"grpc"`
+    /// (case-insensitive), same shape as [`Self::with_own_transport`].
+    ///
+    /// The order is the application's own preference and decides which of
+    /// a peer's offered endpoints is used. Every listed transport must
+    /// actually be served, because delivery is push-only — listing an
+    /// endpoint this application does not serve makes pairing succeed and
+    /// replies vanish.
+    ///
+    /// Supersedes [`Self::with_own_transport`] for applications serving
+    /// more than one transport; the single-endpoint setter remains fully
+    /// supported.
+    #[wasm_bindgen(js_name = withOwnTransports)]
+    pub fn with_own_transports(
+        mut self,
+        transports: Vec<JsValue>,
+    ) -> Result<DeRecProtocolBuilderWasm, JsValue> {
+        #[derive(serde::Deserialize)]
+        struct EndpointShape {
+            uri: String,
+            protocol: String,
+        }
+        let mut parsed_transports = Vec::with_capacity(transports.len());
+        for endpoint in transports {
+            let parsed: EndpointShape = serde_wasm_bindgen::from_value(endpoint)
+                .map_err(|e| js_error("INVALID_OWN_TRANSPORT", e.to_string()))?;
+            let protocol_num =
+                protocol_name_to_discriminant(&parsed.protocol).ok_or_else(|| {
+                    js_error(
+                        "INVALID_PROTOCOL",
+                        format!("unknown protocol: {}", parsed.protocol.to_lowercase()),
+                    )
+                })?;
+            let proto_tp = TransportProtocol {
+                uri: parsed.uri,
+                protocol: protocol_num,
+            };
+            // Same structural + scheme/protocol validation as
+            // `withOwnTransport`, run per entry, order preserved verbatim
+            // — it is the application's preference.
+            let tp = crate::transport::TransportProtocol::try_from(&proto_tp)
+                .map_err(|e| js_error("INVALID_OWN_TRANSPORT", e.to_string()))?;
+            parsed_transports.push(tp);
+        }
+        self.own_transports = parsed_transports;
         Ok(self)
     }
 
@@ -313,9 +401,21 @@ impl DeRecProtocolBuilderWasm {
     /// With it `true`, plaintext is accepted for any host on any path,
     /// including endpoints a peer supplies. That is what makes the LAN case
     /// work (a phone against a laptop), and why the name is blunt.
+    ///
+    /// Superseded by `withUnsafeConnection`; still honored, and wins on
+    /// conflict. Removed at 0.0.5.
     #[wasm_bindgen(js_name = withUnsafeHttp)]
     pub fn with_unsafe_http(mut self, allow: bool) -> DeRecProtocolBuilderWasm {
-        self.unsafe_http = allow;
+        self.unsafe_http = Some(allow);
+        self
+    }
+
+    /// Accept plaintext transport endpoints — `http://` and `grpc://`.
+    /// **Development only.** Default `false`. See `withUnsafeHttp` for the
+    /// conflict rule when both are set.
+    #[wasm_bindgen(js_name = withUnsafeConnection)]
+    pub fn with_unsafe_connection(mut self, allow: bool) -> DeRecProtocolBuilderWasm {
+        self.unsafe_connection = Some(allow);
         self
     }
 
@@ -442,18 +542,20 @@ impl DeRecProtocolBuilderWasm {
     }
 
     /// Declare the local node's acceptable parameter range for pair
-    /// negotiation. `range` is a JS object whose keys mirror the
-    /// `ParameterRange` proto (`minShareSize`, `maxShareSize`,
-    /// `minTimeBetweenVerifications`, ...). Each field is `i64` —
-    /// accept either a number or a `BigInt` on the JS side. Default:
-    /// unset (no constraints advertised, every peer range accepted).
+    /// negotiation. `range` is a JS object whose keys match the
+    /// `ParameterRange` interface every binding already declares —
+    /// `min_share_size`, `max_share_size`, `min_time_between_verifications`,
+    /// … — so one shape serves the wasm and FFI paths alike. Each field is
+    /// `i64`: accept either a number or a `BigInt` on the JS side. Every
+    /// field is optional and defaults to `0`, which the proto reads as no
+    /// constraint on that dimension. Default: unset (no constraints
+    /// advertised, every peer range accepted).
     #[wasm_bindgen(js_name = withParameterRange)]
     pub fn with_parameter_range(
         mut self,
         range: JsValue,
     ) -> Result<DeRecProtocolBuilderWasm, JsValue> {
         #[derive(serde::Deserialize)]
-        #[serde(rename_all = "camelCase")]
         struct In {
             #[serde(default)]
             min_share_size: i64,
@@ -514,24 +616,39 @@ impl DeRecProtocolBuilderWasm {
         let transport = self
             .transport
             .ok_or_else(|| js_error("BUILDER_MISSING", "withTransport is required"))?;
-        let own_transport_uri = self
-            .own_transport_uri
-            .ok_or_else(|| js_error("BUILDER_MISSING", "withOwnTransport is required"))?;
-        let own_transport_protocol = self
-            .own_transport_protocol_num
-            .ok_or_else(|| js_error("BUILDER_MISSING", "withOwnTransport is required"))?;
+        // `withOwnTransports` takes precedence over `withOwnTransport`
+        // when non-empty; both remain fully supported.
+        let own_transports: Vec<crate::transport::TransportProtocol> =
+            if !self.own_transports.is_empty() {
+                self.own_transports
+            } else {
+                let own_transport_uri = self
+                    .own_transport_uri
+                    .ok_or_else(|| js_error("BUILDER_MISSING", "withOwnTransport is required"))?;
+                let own_transport_protocol = self
+                    .own_transport_protocol_num
+                    .ok_or_else(|| js_error("BUILDER_MISSING", "withOwnTransport is required"))?;
 
-        let proto_tp = TransportProtocol {
-            uri: own_transport_uri,
-            protocol: own_transport_protocol,
-        };
-        // Library-level structural + scheme/protocol validation —
-        // `TryFrom` runs both the enum-discriminant check and the
-        // URI rules in a single step. Catches plaintext downgrades
-        // and unknown enums before the value can be propagated to
-        // peers via pairing or UpdateChannelInfo.
-        let own_transport = crate::transport::TransportProtocol::try_from(&proto_tp)
-            .map_err(|e| js_error("INVALID_OWN_TRANSPORT", e.to_string()))?;
+                let proto_tp = TransportProtocol {
+                    uri: own_transport_uri,
+                    protocol: own_transport_protocol,
+                };
+                // Library-level structural + scheme/protocol validation —
+                // `TryFrom` runs both the enum-discriminant check and the
+                // URI rules in a single step. Catches plaintext downgrades
+                // and unknown enums before the value can be propagated to
+                // peers via pairing or UpdateChannelInfo.
+                vec![
+                    crate::transport::TransportProtocol::try_from(&proto_tp)
+                        .map_err(|e| js_error("INVALID_OWN_TRANSPORT", e.to_string()))?,
+                ]
+            };
+
+        let unsafe_connection = crate::protocol::builder::resolve_plaintext_opt_in(
+            self.unsafe_http,
+            self.unsafe_connection,
+        )
+        .map_err(js_error_from_lib)?;
 
         let mut builder = DeRecProtocolBuilder::new(self.secret_id)
             .with_channel_store(JsChannelStore(channel_store))
@@ -540,7 +657,7 @@ impl DeRecProtocolBuilderWasm {
             .with_user_secret_store(JsUserSecretStore(user_secret_store))
             .with_state_store(JsStateStore(state_store))
             .with_transport(JsTransport(transport))
-            .with_own_transport(own_transport)
+            .with_own_transports(own_transports)
             .with_threshold(self.threshold as usize)
             .with_keep_versions_count(self.keep_versions_count as usize)
             .with_communication_info(self.communication_info)
@@ -548,7 +665,7 @@ impl DeRecProtocolBuilderWasm {
             .with_unpair_ack(self.unpair_ack)
             .with_auto_reply_to(self.auto_reply_to)
             .with_auto_accept(self.auto_accept)
-            .with_unsafe_http(self.unsafe_http);
+            .with_unsafe_connection(unsafe_connection);
         if let Some(t) = self.timeouts {
             builder = builder.with_timeouts(t.to_timeouts());
         }
@@ -653,21 +770,75 @@ impl DeRecProtocolWasm {
         Ok(())
     }
 
-    /// Replace this node's local transport endpoint. See
-    /// `setCommunicationInfo` for the matching update-propagation flow.
+    /// Replace every endpoint this node advertises, in preference order.
+    ///
+    /// `transports` is an array of `{ uri: string, protocol: string }`
+    /// objects, same shape as `withOwnTransports`. The runtime counterpart
+    /// to that builder setter, and the way to change the whole set:
+    /// `setOwnTransport` replaces only the entry for the protocol its URI
+    /// names. A node serves at most one endpoint per protocol, so this list
+    /// is a preference order over distinct protocols and two entries of the
+    /// same protocol are rejected.
+    ///
+    /// Every entry is validated before any is stored, so a malformed URI
+    /// leaves the previous set intact. IMPORTANT: keep the old endpoints
+    /// operational during the changeover — see the Rust docs on
+    /// `set_own_transports` for the discipline.
+    #[wasm_bindgen(js_name = "setOwnTransports")]
+    pub fn set_own_transports(&mut self, transports: Vec<JsValue>) -> Result<(), JsValue> {
+        #[derive(serde::Deserialize)]
+        struct EndpointShape {
+            uri: String,
+            protocol: String,
+        }
+        let mut validated = Vec::with_capacity(transports.len());
+        for endpoint in transports {
+            let parsed: EndpointShape = serde_wasm_bindgen::from_value(endpoint)
+                .map_err(|e| js_error("INVALID_OWN_TRANSPORT", e.to_string()))?;
+            let protocol_num =
+                protocol_name_to_discriminant(&parsed.protocol).ok_or_else(|| {
+                    js_error(
+                        "INVALID_PROTOCOL",
+                        format!("unknown protocol: {}", parsed.protocol.to_lowercase()),
+                    )
+                })?;
+            let proto_tp = TransportProtocol {
+                uri: parsed.uri,
+                protocol: protocol_num,
+            };
+            validated.push(
+                crate::transport::TransportProtocol::try_from(&proto_tp)
+                    .map_err(|e| js_error("INVALID_OWN_TRANSPORT", e.to_string()))?,
+            );
+        }
+        self.inner
+            .set_own_transports(validated)
+            .map_err(|e| js_error("INVALID_OWN_TRANSPORT", e.to_string()))?;
+        Ok(())
+    }
+
+    /// Replace this node's endpoint for one protocol, leaving the others
+    /// alone. A node serves at most one endpoint per protocol, so the
+    /// `(uri, protocol)` pair identifies the entry it replaces; an entry for
+    /// a protocol not yet served is appended, and a replaced one keeps its
+    /// position in the preference order.
+    ///
+    /// @deprecated Use `setOwnTransports`, which takes the whole preference
+    /// list and is the only way to change which protocols this node serves,
+    /// or their order. Removed at 0.0.5.
+    ///
+    /// See `setCommunicationInfo` for the matching update-propagation
+    /// flow, and `setOwnTransports` to keep more than one endpoint.
     /// IMPORTANT: keep the old endpoint operational during the changeover —
     /// see the Rust docs on `set_own_transport` for the discipline.
     #[wasm_bindgen(js_name = "setOwnTransport")]
     pub fn set_own_transport(&mut self, uri: String, protocol: String) -> Result<(), JsValue> {
-        let protocol_num = match protocol.to_lowercase().as_str() {
-            "https" => 0i32,
-            other => {
-                return Err(js_error(
-                    "INVALID_PROTOCOL",
-                    format!("unknown protocol: {other}"),
-                ));
-            }
-        };
+        let protocol_num = protocol_name_to_discriminant(&protocol).ok_or_else(|| {
+            js_error(
+                "INVALID_PROTOCOL",
+                format!("unknown protocol: {}", protocol.to_lowercase()),
+            )
+        })?;
         let proto_tp = TransportProtocol {
             uri,
             protocol: protocol_num,
@@ -677,7 +848,7 @@ impl DeRecProtocolWasm {
         let lib_tp = crate::transport::TransportProtocol::try_from(&proto_tp)
             .map_err(|e| js_error("INVALID_OWN_TRANSPORT", e.to_string()))?;
         self.inner
-            .set_own_transport(lib_tp)
+            .set_own_transports([lib_tp])
             .map_err(|e| js_error("INVALID_OWN_TRANSPORT", e.to_string()))?;
         Ok(())
     }
@@ -904,10 +1075,27 @@ impl DeRecProtocolWasm {
 }
 
 fn parse_recovered_secret(value: JsValue) -> Result<crate::protocol::types::Secret, JsValue> {
+    /// One advertised endpoint: URI plus the `Protocol` discriminant, so
+    /// no protocol is inferred from a scheme.
+    #[derive(serde::Deserialize)]
+    struct EndpointIn {
+        uri: String,
+        protocol: i32,
+    }
+
+    impl From<EndpointIn> for derec_proto::TransportProtocol {
+        fn from(j: EndpointIn) -> Self {
+            derec_proto::TransportProtocol {
+                uri: j.uri,
+                protocol: j.protocol,
+            }
+        }
+    }
+
     #[derive(serde::Deserialize)]
     struct HelperIn {
         channel_id: String,
-        transport_uri: String,
+        transports: Vec<EndpointIn>,
         shared_key: Vec<u8>,
         #[serde(default)]
         communication_info: HashMap<String, String>,
@@ -915,7 +1103,7 @@ fn parse_recovered_secret(value: JsValue) -> Result<crate::protocol::types::Secr
     #[derive(serde::Deserialize)]
     struct ReplicaIn {
         replica_id: String,
-        transport_uri: String,
+        transports: Vec<EndpointIn>,
         /// `"Source"` or `"Destination"`.
         role: String,
         #[serde(default)]
@@ -967,7 +1155,7 @@ fn parse_recovered_secret(value: JsValue) -> Result<crate::protocol::types::Secr
         .map(|h| -> Result<_, JsValue> {
             Ok(crate::protocol::types::HelperInfo {
                 channel_id: parse_u64(&h.channel_id, "helper.channel_id")?,
-                transport_uri: h.transport_uri,
+                transports: h.transports.into_iter().map(Into::into).collect(),
                 shared_key: h.shared_key,
                 communication_info: h.communication_info,
             })
@@ -995,7 +1183,7 @@ fn parse_recovered_secret(value: JsValue) -> Result<crate::protocol::types::Secr
                     };
                     Ok(crate::protocol::types::ReplicaInfo {
                         replica_id: parse_u64(&r.replica_id, "replica.replica_id")?,
-                        transport_uri: r.transport_uri,
+                        transports: r.transports.into_iter().map(Into::into).collect(),
                         role: role as i32,
                         communication_info: r.communication_info,
                     })
@@ -1318,34 +1506,51 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
                             .map_err(|e| js_error("INVALID_COMMUNICATION_INFO", e.to_string()))?,
                     )
                 };
-            let transport_protocol_val =
-                js_sys::Reflect::get(&params, &JsValue::from_str("transport_protocol"))
-                    .unwrap_or(JsValue::UNDEFINED);
-            let transport_protocol = if transport_protocol_val.is_null()
-                || transport_protocol_val.is_undefined()
-            {
-                None
-            } else {
-                #[derive(serde::Deserialize)]
-                struct TransportShape {
-                    uri: String,
-                    protocol: i32,
-                }
-                let parsed: TransportShape = serde_wasm_bindgen::from_value(transport_protocol_val)
+            #[derive(serde::Deserialize)]
+            struct TransportShape {
+                uri: String,
+                protocol: i32,
+            }
+            let read_one = |v: JsValue| -> Result<TransportProtocol, JsValue> {
+                let parsed: TransportShape = serde_wasm_bindgen::from_value(v)
                     .map_err(|e| js_error("INVALID_TRANSPORT_PROTOCOL", e.to_string()))?;
-                Some(TransportProtocol {
+                Ok(TransportProtocol {
                     uri: parsed.uri,
                     protocol: parsed.protocol,
                 })
             };
+
+            // The list wins when present; the singular field is the
+            // deprecated spelling a host predating it still sends.
+            let own_transports_val =
+                js_sys::Reflect::get(&params, &JsValue::from_str("own_transports"))
+                    .unwrap_or(JsValue::UNDEFINED);
+            let own_transports =
+                if own_transports_val.is_null() || own_transports_val.is_undefined() {
+                    let singular =
+                        js_sys::Reflect::get(&params, &JsValue::from_str("transport_protocol"))
+                            .unwrap_or(JsValue::UNDEFINED);
+                    if singular.is_null() || singular.is_undefined() {
+                        Vec::new()
+                    } else {
+                        vec![read_one(singular)?]
+                    }
+                } else {
+                    let array = js_sys::Array::from(&own_transports_val);
+                    let mut out = Vec::with_capacity(array.length() as usize);
+                    for entry in array.iter() {
+                        out.push(read_one(entry)?);
+                    }
+                    out
+                };
             Ok(DeRecFlow::UpdateChannelInfo {
                 target,
                 communication_info,
-                transport_protocol,
+                own_transports,
             })
         }
         8 => {
-            // RemoveReplica: `{ replica_id, memo? }`. `replica_id` is a
+            // UnpairReplica: `{ replica_id, memo? }`. `replica_id` is a
             // decimal string so large values survive JS number handling.
             let replica_id_val = js_sys::Reflect::get(&params, &JsValue::from_str("replica_id"))
                 .unwrap_or(JsValue::UNDEFINED);
@@ -1372,12 +1577,12 @@ fn parse_flow(flow_kind: u32, params: JsValue) -> Result<DeRecFlow, JsValue> {
             } else {
                 memo_val.as_string()
             };
-            Ok(DeRecFlow::RemoveReplica { replica_id, memo })
+            Ok(DeRecFlow::UnpairReplica { replica_id, memo })
         }
         7 => {
-            // SyncCheck takes no parameters: the group and this device's own
+            // ReplicaDiscovery takes no parameters: the group and this device's own
             // version are both read from the stores.
-            Ok(DeRecFlow::SyncCheck)
+            Ok(DeRecFlow::ReplicaDiscovery)
         }
         _ => Err(js_error(
             "INVALID_FLOW_KIND",

@@ -82,7 +82,9 @@ fn fetch_callback_bytes(
         Err(format!("{label} callback failed (rc={rc})"))
     }
 }
-use crate::protocol::types::{ChannelQuery, ChannelRecord, HelperChannel, ReplicaMember};
+use crate::protocol::types::{
+    ChannelQuery, ChannelRecord, HelperChannel, HelperFilter, ReplicaFilter, ReplicaMember,
+};
 use crate::types::ChannelId;
 
 /// Flatten a query into the `(channel_id, replica_id)` pair the vtable takes.
@@ -123,11 +125,50 @@ fn decode_list<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&bytes)
         .map_err(|e| ChannelStoreError::Backend(format!("{label} JSON: {e}").into()))
 }
+
+/// The wire shape of a listing filter.
+///
+/// Ids are **decimal strings**, not JSON numbers. `ChannelId` and `ReplicaId`
+/// are transparent `u64`s, so serialising the filter directly emits numbers —
+/// which is lossless for the .NET and Go bindings but not for React Native,
+/// whose bridge parses this JSON with JavaScript's `JSON.parse`. Every id
+/// above 2^53 is silently rounded there: a channel id of
+/// `12528301489426105160` reaches the store as `12528301489426104320`, so a
+/// by-id filter matches nothing and the flow fans out to no one.
+///
+/// Stringifying downstream cannot repair it — by then the value is already a
+/// rounded double — so the ids have to be strings before `JSON.parse` sees
+/// them. Same reasoning, and same shape, as `encode_filter` on the WASM
+/// bridge.
+#[derive(serde::Serialize)]
+struct ChannelFilterWire<'a, Role: serde::Serialize> {
+    ids: Vec<String>,
+    status: &'a [crate::protocol::types::ChannelStatus],
+    role: Option<&'a Role>,
+    exclude: Vec<String>,
+}
+
+/// Encode a listing filter for the callback that will apply it.
+fn encode_filter<Role: serde::Serialize>(
+    ids: &[u64],
+    status: &[crate::protocol::types::ChannelStatus],
+    role: Option<&Role>,
+    exclude: &[u64],
+    label: &str,
+) -> Result<Vec<u8>, ChannelStoreError> {
+    let wire = ChannelFilterWire {
+        ids: ids.iter().map(u64::to_string).collect(),
+        status,
+        role,
+        exclude: exclude.iter().map(u64::to_string).collect(),
+    };
+    serde_json::to_vec(&wire)
+        .map_err(|e| ChannelStoreError::Backend(format!("{label} filter JSON: {e}").into()))
+}
 use derec_proto::TransportProtocol;
 
 /// JSON-on-the-wire shape of a [`Share`] consumed by
 /// [`DotnetShareStore`].
-#[allow(dead_code)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct ShareRecord {
     pub secret_id: String,
@@ -146,7 +187,6 @@ impl From<&Share> for ShareRecord {
 }
 
 impl ShareRecord {
-    #[allow(dead_code)]
     pub(crate) fn into_share(self) -> Result<Share, String> {
         let secret_id = self
             .secret_id
@@ -231,7 +271,7 @@ fn state_kind_to_u32(kind: StateKind) -> u32 {
         StateKind::PendingRecovery => 1,
         StateKind::PendingUnpair => 2,
         StateKind::SharingRound => 3,
-        StateKind::PendingSyncCheck => 4,
+        StateKind::PendingReplicaDiscovery => 4,
     }
 }
 
@@ -269,6 +309,17 @@ fn state_kind_to_u32(kind: StateKind) -> u32 {
 /// [`crate::protocol::types::HelperChannel`] and
 /// [`crate::protocol::types::ReplicaMember`] respectively.
 ///
+/// Both listing callbacks receive a `filter` buffer holding a JSON-encoded
+/// [`crate::protocol::types::HelperFilter`] or
+/// [`crate::protocol::types::ReplicaFilter`] — an object with `ids`, `status`,
+/// `role` and `exclude`, where an empty array or a null `role` restricts
+/// nothing. A backend should apply it in its query rather than by listing
+/// everything and discarding rows; see
+/// [`crate::protocol::types::ChannelFilter`]. The library re-applies it to
+/// whatever comes back, so ignoring it is slow rather than wrong — but
+/// returning fewer rows than it selects is wrong, and undetectable. The buffer is owned
+/// by the caller and valid only for the duration of the call.
+///
 /// The order `list_replicas` returns is significant in exactly one situation —
 /// it selects the successor when the group's source is removed. See
 /// [`crate::protocol::DeRecChannelStore::replicas`] for the full contract.
@@ -301,12 +352,16 @@ pub struct ChannelStoreCallbacks {
     pub list_helpers: extern "C" fn(
         user_data: *mut c_void,
         secret_id: u64,
+        filter: *const u8,
+        filter_len: usize,
         out_ptr: *mut *mut u8,
         out_len: *mut usize,
     ) -> i32,
     pub list_replicas: extern "C" fn(
         user_data: *mut c_void,
         secret_id: u64,
+        filter: *const u8,
+        filter_len: usize,
         out_ptr: *mut *mut u8,
         out_len: *mut usize,
     ) -> i32,
@@ -531,11 +586,23 @@ pub struct StateStoreCallbacks {
 #[repr(C)]
 pub struct TransportCallbacks {
     pub user_data: *mut c_void,
+    /// Deliver `bytes` to a peer reachable at any of `endpoints`.
+    ///
+    /// `endpoints` is a length-delimited sequence of encoded
+    /// `TransportProtocol` messages — each entry preceded by its protobuf
+    /// varint byte length, the same framing protobuf uses for a repeated
+    /// embedded message field. They are the endpoints that peer advertised,
+    /// in the order it offered them, already filtered to those the library
+    /// will record.
+    ///
+    /// The library does not rank them. Which endpoint to dial, and whether
+    /// to fall back to another when one is unreachable, is the
+    /// implementation's choice. Return `0` once the message has reached any
+    /// one of them; non-zero only when it reached none.
     pub send: extern "C" fn(
         user_data: *mut c_void,
-        uri_ptr: *const u8,
-        uri_len: usize,
-        protocol: i32,
+        endpoints_ptr: *const u8,
+        endpoints_len: usize,
         bytes: *const u8,
         len: usize,
     ) -> i32,
@@ -633,15 +700,63 @@ impl DeRecChannelStore for DotnetChannelStore {
         Box::pin(async move { res })
     }
 
-    fn helpers(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
-        let bytes_res =
-            self.fetch_bytes(|p, l| (self.cb.list_helpers)(self.cb.user_data, secret_id, p, l));
+    fn helpers(
+        &self,
+        secret_id: u64,
+        filter: HelperFilter,
+    ) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+        let ids: Vec<u64> = filter.ids.iter().map(|c| c.0).collect();
+        let exclude: Vec<u64> = filter.exclude.iter().map(|c| c.0).collect();
+        let encoded = match encode_filter(
+            &ids,
+            &filter.status,
+            filter.role.as_ref(),
+            &exclude,
+            "list_helpers",
+        ) {
+            Ok(bytes) => bytes,
+            Err(e) => return Box::pin(async move { Err(e) }),
+        };
+        let bytes_res = self.fetch_bytes(|p, l| {
+            (self.cb.list_helpers)(
+                self.cb.user_data,
+                secret_id,
+                encoded.as_ptr(),
+                encoded.len(),
+                p,
+                l,
+            )
+        });
         Box::pin(async move { decode_list(bytes_res, "list_helpers") })
     }
 
-    fn replicas(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
-        let bytes_res =
-            self.fetch_bytes(|p, l| (self.cb.list_replicas)(self.cb.user_data, secret_id, p, l));
+    fn replicas(
+        &self,
+        secret_id: u64,
+        filter: ReplicaFilter,
+    ) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
+        let ids: Vec<u64> = filter.ids.iter().map(|r| r.0).collect();
+        let exclude: Vec<u64> = filter.exclude.iter().map(|r| r.0).collect();
+        let encoded = match encode_filter(
+            &ids,
+            &filter.status,
+            filter.role.as_ref(),
+            &exclude,
+            "list_replicas",
+        ) {
+            Ok(bytes) => bytes,
+            Err(e) => return Box::pin(async move { Err(e) }),
+        };
+        let bytes_res = self.fetch_bytes(|p, l| {
+            (self.cb.list_replicas)(
+                self.cb.user_data,
+                secret_id,
+                encoded.as_ptr(),
+                encoded.len(),
+                p,
+                l,
+            )
+        });
         Box::pin(async move { decode_list(bytes_res, "list_replicas") })
     }
 
@@ -1111,15 +1226,24 @@ unsafe impl Send for DotnetTransport {}
 unsafe impl Sync for DotnetTransport {}
 
 impl DeRecTransport for DotnetTransport {
-    fn send(&self, endpoint: &TransportProtocol, message: Vec<u8>) -> TransportFuture<'_> {
+    fn send(&self, endpoints: &[TransportProtocol], message: Vec<u8>) -> TransportFuture<'_> {
+        use prost::Message as _;
+
         let cb = &self.cb;
-        let uri = endpoint.uri.clone();
-        let protocol = endpoint.protocol;
+        // Length-delimited framing: one varint length per entry, then its
+        // encoded bytes. Keeps the C ABI a single (ptr, len) pair however
+        // many endpoints a peer advertised.
+        let mut framed = Vec::new();
+        for endpoint in endpoints {
+            let entry = endpoint.encode_to_vec();
+            prost::encoding::encode_varint(entry.len() as u64, &mut framed);
+            framed.extend_from_slice(&entry);
+        }
+
         let rc = (cb.send)(
             cb.user_data,
-            uri.as_ptr(),
-            uri.len(),
-            protocol,
+            framed.as_ptr(),
+            framed.len(),
             message.as_ptr(),
             message.len(),
         );
@@ -1248,5 +1372,53 @@ impl DeRecStateStore for DotnetStateStore {
             Ok(out)
         })();
         Box::pin(async move { res })
+    }
+}
+
+#[cfg(test)]
+mod filter_wire_tests {
+    use super::*;
+    use crate::protocol::types::{ChannelStatus, HelperFilter};
+    use crate::types::ChannelId;
+
+    /// Ids cross as decimal strings, so a u64 beyond `Number.MAX_SAFE_INTEGER`
+    /// survives the React Native bridge's `JSON.parse`.
+    ///
+    /// As a number this id comes back as `12528301489426104320` — 840 short —
+    /// and a by-id filter then matches nothing, which is how a discovery
+    /// fan-out reached zero peers with every other suite green. Nothing
+    /// downstream can repair it: by then the value is a rounded double.
+    #[test]
+    fn ids_are_encoded_as_decimal_strings() {
+        const WIDE: u64 = 12_528_301_489_426_105_160;
+        assert!(
+            WIDE as f64 as u64 != WIDE,
+            "this id must be one a double cannot hold, or the test proves nothing"
+        );
+
+        let filter = HelperFilter {
+            ids: vec![ChannelId(WIDE)],
+            status: vec![ChannelStatus::Paired],
+            role: None,
+            exclude: vec![ChannelId(u64::MAX)],
+        };
+        let ids: Vec<u64> = filter.ids.iter().map(|c| c.0).collect();
+        let exclude: Vec<u64> = filter.exclude.iter().map(|c| c.0).collect();
+        let json = encode_filter(&ids, &filter.status, filter.role.as_ref(), &exclude, "test")
+            .expect("filter encodes");
+        let text = String::from_utf8(json).expect("utf8");
+
+        assert!(
+            text.contains(&format!("\"{WIDE}\"")),
+            "id must be quoted, got {text}"
+        );
+        assert!(
+            text.contains(&format!("\"{}\"", u64::MAX)),
+            "exclude must be quoted, got {text}"
+        );
+        assert!(
+            !text.contains(&format!(":[{WIDE}")) && !text.contains(&format!(",{WIDE}")),
+            "no bare numeric id may appear, got {text}"
+        );
     }
 }

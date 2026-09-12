@@ -17,7 +17,10 @@ fn recovered_secret_decodes_without_the_protocol() {
     let secret = Secret {
         helpers: vec![HelperInfo {
             channel_id: 1_000_000,
-            transport_uri: "https://helper-0.example.org/derec".to_owned(),
+            transports: vec![derec_proto::TransportProtocol {
+                uri: "https://helper-0.example.org/derec".to_owned(),
+                protocol: derec_proto::Protocol::Https as i32,
+            }],
             shared_key: vec![0xAB; 32],
             communication_info: HashMap::from([("name".to_owned(), "Helper 0".to_owned())]),
         }],
@@ -32,13 +35,19 @@ fn recovered_secret_decodes_without_the_protocol() {
             members: vec![
                 ReplicaInfo {
                     replica_id: 1001,
-                    transport_uri: "https://alice.example.org/derec".to_owned(),
+                    transports: vec![derec_proto::TransportProtocol {
+                        uri: "https://alice.example.org/derec".to_owned(),
+                        protocol: derec_proto::Protocol::Https as i32,
+                    }],
                     role: ReplicaRole::Source as i32,
                     communication_info: HashMap::new(),
                 },
                 ReplicaInfo {
                     replica_id: 1002,
-                    transport_uri: "https://alice-2.example.org/derec".to_owned(),
+                    transports: vec![derec_proto::TransportProtocol {
+                        uri: "https://alice-2.example.org/derec".to_owned(),
+                        protocol: derec_proto::Protocol::Https as i32,
+                    }],
                     role: ReplicaRole::Destination as i32,
                     communication_info: HashMap::new(),
                 },
@@ -51,7 +60,7 @@ fn recovered_secret_decodes_without_the_protocol() {
 
     // --- independent decoder: version byte → gzip → JSON → base64, no DeRec code ---
     let (&major, payload) = encoded.split_first().expect("non-empty encoding");
-    assert_eq!(major, 2, "version prefix");
+    assert_eq!(major, 3, "version prefix");
 
     let mut json = Vec::new();
     GzDecoder::new(payload)
@@ -79,10 +88,15 @@ fn recovered_secret_decodes_without_the_protocol() {
     let sources: Vec<&Value> = members.iter().filter(|m| m["role"] == "Source").collect();
     assert_eq!(sources.len(), 1, "exactly one source in the roster");
     assert_eq!(sources[0]["replica_id"], "1001");
-    assert_eq!(
-        sources[0]["transport_uri"],
-        "https://alice.example.org/derec"
-    );
+    // A roster entry carries every endpoint the member advertised, each with
+    // its protocol discriminant — an independent decoder never has to infer a
+    // protocol from a URI scheme.
+    let endpoints = sources[0]["transports"]
+        .as_array()
+        .expect("transports is an array");
+    assert_eq!(endpoints.len(), 1);
+    assert_eq!(endpoints[0]["uri"], "https://alice.example.org/derec");
+    assert_eq!(endpoints[0]["protocol"], 0, "0 is the HTTPS discriminant");
     let group_key = STANDARD
         .decode(group["shared_key"].as_str().unwrap())
         .unwrap();

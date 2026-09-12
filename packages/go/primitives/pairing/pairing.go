@@ -19,6 +19,13 @@ package pairing
 
 import "github.com/derecalliance/lib-derec/packages/go/internal/native"
 
+// Endpoint is a transport endpoint: a URI and the protocol discriminant that
+// says how to reach it (see derecpb.Protocol: 0 = HTTPS, 1 = GRPC).
+//
+// Aliased rather than redeclared so it is the same type the protocol package
+// exposes to a Transport implementation, without a conversion between layers.
+type Endpoint = native.Endpoint
+
 // ContactMode selects how the public encryption material is delivered in a
 // ContactMessage. Mirrors org.derecalliance.derec.protobuf.ContactMode.
 type ContactMode int32
@@ -92,9 +99,11 @@ type ProducedResponse struct {
 	// Envelope is the wire-encoded pairing response, ready to send over
 	// transport.
 	Envelope []byte
-	// PeerTransportProtocol is the requester's TransportProtocol proto bytes,
-	// as carried in the request.
-	PeerTransportProtocol []byte
+	// PeerTransports is every endpoint the requester advertised, in the order
+	// it offered them, filtered to those the library will record. Never empty.
+	// Choosing which to dial, and failing over when one is unreachable,
+	// belongs to the caller.
+	PeerTransports []Endpoint
 	// SharedKey is the pairing shared key derived by the responder.
 	SharedKey []byte
 	// ChannelID is the post-handshake rekey channel id the responder is
@@ -222,10 +231,14 @@ func (requestAPI) Extract(request, secretKeyMaterial []byte) (ExtractedRequest, 
 // ProducePrePair builds a plaintext PrePair request envelope addressed to
 // the creator of contactMessage (a ContactModeHashedKeys or
 // ContactModeNoKeys contact), sent by a scanner reachable at
-// transportProtocol. Because no shared key exists yet, the envelope is
-// plaintext, so transportProtocol MUST be an ephemeral endpoint.
-func (requestAPI) ProducePrePair(transportProtocol, contactMessage []byte) (ProducedPrePairRequest, error) {
-	envelope, err := native.ProducePrePairRequest(transportProtocol, contactMessage)
+// transportProtocols: a length-delimited sequence of serialized
+// TransportProtocol protos (each entry preceded by its varint byte length),
+// in the scanner's own preference order. The first entry also fills the
+// deprecated singular field for peers predating the list. Because no shared
+// key exists yet, the envelope is plaintext, so these MUST be ephemeral
+// endpoints.
+func (requestAPI) ProducePrePair(transportProtocols, contactMessage []byte) (ProducedPrePairRequest, error) {
+	envelope, err := native.ProducePrePairRequest(transportProtocols, contactMessage)
 	if err != nil {
 		return ProducedPrePairRequest{}, err
 	}
@@ -255,17 +268,20 @@ var Response responseAPI
 // and returns the rekeyed channel id the responder commits to.
 // communicationInfo and parameterRange are optional serialized proto bytes
 // (nil for none).
-func (responseAPI) Produce(channelID uint64, requestProto, secretKeyMaterial, communicationInfo, parameterRange []byte) (ProducedResponse, error) {
-	envelope, peerTransportProtocol, sharedKey, rekeyedChannelID, err := native.ProducePairResponse(
-		channelID, requestProto, secretKeyMaterial, communicationInfo, parameterRange)
+//
+// unsafeConnection accepts plaintext peer endpoints (http://, grpc://) and is
+// development-only.
+func (responseAPI) Produce(channelID uint64, requestProto, secretKeyMaterial, communicationInfo, parameterRange []byte, unsafeConnection bool) (ProducedResponse, error) {
+	envelope, peerTransports, sharedKey, rekeyedChannelID, err := native.ProducePairResponse(
+		channelID, requestProto, secretKeyMaterial, communicationInfo, parameterRange, unsafeConnection)
 	if err != nil {
 		return ProducedResponse{}, err
 	}
 	return ProducedResponse{
-		Envelope:              envelope,
-		PeerTransportProtocol: peerTransportProtocol,
-		SharedKey:             sharedKey,
-		ChannelID:             rekeyedChannelID,
+		Envelope:       envelope,
+		PeerTransports: peerTransports,
+		SharedKey:      sharedKey,
+		ChannelID:      rekeyedChannelID,
 	}, nil
 }
 

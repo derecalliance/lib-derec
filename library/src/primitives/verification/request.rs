@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-use crate::transport::TransportProtocolExt as _;
+use crate::extensions::transport_protocol::TransportProtocolExt as _;
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     types::{ChannelId, SharedKey},
@@ -112,7 +112,7 @@ pub struct ExtractResult {
 ///     1,
 ///     7,
 ///     &shared_key,
-///     None,
+///     &[],
 /// )
 /// .expect("failed to build verification request");
 ///
@@ -127,19 +127,26 @@ pub fn produce(
     secret_id: u64,
     version: u32,
     shared_key: &SharedKey,
-    reply_to: Option<derec_proto::TransportProtocol>,
+    reply_to: &[derec_proto::TransportProtocol],
 ) -> Result<ProduceResult, crate::Error> {
     let mut rng = rng();
 
     let timestamp = current_timestamp();
     let nonce = rng.next_u64();
 
+    let (legacy_reply_to, reply_to_transports) =
+        crate::extensions::advertised_endpoints::split_reply_to(reply_to);
+    // Populating the deprecated singular field is the compatibility path
+    // that keeps peers predating `replyToTransports` answerable, so the
+    // warning is expected here rather than a defect.
+    #[allow(deprecated)]
     let message = VerifyShareRequestMessage {
         secret_id,
         version,
         nonce,
         timestamp: Some(timestamp),
-        reply_to,
+        reply_to: legacy_reply_to,
+        reply_to_transports,
     };
 
     let envelope = DeRecMessageBuilder::channel()
@@ -208,7 +215,7 @@ pub fn produce(
 /// let channel_id = ChannelId(42);
 /// let shared_key = [7u8; 32];
 ///
-/// let request::ProduceResult { envelope, .. } = request::produce(channel_id, 1, 7, &shared_key, None)
+/// let request::ProduceResult { envelope, .. } = request::produce(channel_id, 1, 7, &shared_key, &[])
 ///     .expect("failed to build verification request");
 ///
 /// let request::ExtractResult { request } = request::extract(&envelope, &shared_key)
@@ -252,7 +259,16 @@ pub fn extract(
 
     verify_timestamps(envelope.timestamp, request.timestamp)?;
 
-    if let Some(reply_to) = request.reply_to.as_ref() {
+    // Both spellings are validated, not just the one this build reads: a
+    // structurally invalid endpoint in the deprecated singular field is what
+    // a peer predating `replyToTransports` would dial, so letting it through
+    // unchecked would admit exactly the address the check exists to refuse.
+    #[allow(deprecated)]
+    for reply_to in request
+        .reply_to_transports
+        .iter()
+        .chain(request.reply_to.iter())
+    {
         reply_to.validate()?;
     }
 

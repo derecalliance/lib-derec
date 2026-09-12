@@ -639,12 +639,12 @@ async fn step_9_remove_a_replica(
 
     owner
         .session()
-        .start(DeRecFlow::RemoveReplica {
+        .start(DeRecFlow::UnpairReplica {
             replica_id: evicted.replica_id,
             memo: Some("retiring an old tablet".to_owned()),
         })
         .await
-        .expect("owner.start(RemoveReplica) failed");
+        .expect("owner.start(UnpairReplica) failed");
 
     // The publish that completes the removal has to reach the evictee too —
     // its absence from that roster is what tells it it may leave.

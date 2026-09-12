@@ -250,7 +250,8 @@ Optional setters have defaults:
 | `with_threshold(n)` | `3` | Minimum shares required to reconstruct the secret. |
 | `with_keep_versions_count(n)` | `3` | Number of recent versions each helper must retain. |
 | `with_timeouts(timeouts)` | see [Timeouts](#timeouts) | All four waiting periods in one call; unspecified fields keep their default. `inbound_message` 300s is the staleness/replay window, `sharing_round` and `unpair_ack` 60s are liveness budgets, `expired_channels` `Enabled { 300 }` sweeps channels awaiting fingerprint confirmation. |
-| `with_unsafe_http(bool)` | `false` | Accept plaintext `http://` endpoints. **Development only.** Loopback is accepted for your own endpoint regardless; see [Transport endpoints and plaintext](#transport-endpoints-and-plaintext). |
+| `with_unsafe_connection(bool)` | `false` | Accept plaintext `http://` and `grpc://` endpoints. **Development only.** Loopback is accepted for your own endpoint regardless; see [Transport endpoints and plaintext](#transport-endpoints-and-plaintext). |
+| `with_unsafe_http(bool)` | `false` | Deprecated since 0.0.3 — the `http://`-only predecessor of `with_unsafe_connection`. Still honored on its own; setting both to disagreeing values fails `build()`. See [Transport endpoints and plaintext](#transport-endpoints-and-plaintext). |
 | `with_communication_info(map)` | empty | Key-value identity metadata embedded in pairing messages. |
 | `with_replica_id(id)` | unset | This device's replica identity. Required for any replica-mode pairing; application-assigned and rejected if `0`. |
 | `with_auto_accept(policy)` | every flow off | Per-flow opt-in to auto-accepting inbound requests instead of surfacing `ActionRequired`. Read the per-flow caveats before enabling — several are state-changing. |
@@ -464,23 +465,23 @@ Every transport endpoint the protocol handles is checked in two stages.
 scheme consistent with the declared protocol. Always applied; `ws://` and
 `file://` are refused everywhere.
 
-**Scheme policy** — whether a plaintext `http://` endpoint may actually be
-used. This depends on how you are deployed, so it is configuration rather than
-a fixed rule:
+**Scheme policy** — whether a plaintext `http://` or `grpc://` endpoint may
+actually be used. This depends on how you are deployed, so it is
+configuration rather than a fixed rule:
 
 ```rust
-builder.with_unsafe_http(true)   // development only; default is false
+builder.with_unsafe_connection(true)   // development only; default is false
 ```
 
-| Endpoint | `https` | plaintext loopback | plaintext, any other host |
+| Endpoint | `https` / `grpcs` | plaintext loopback | plaintext, any other host |
 |---|---|---|---|
-| **Your own** — `with_own_transport`, and the `reply_to` you stamp on outbound requests | always | **always**, with a warning | needs `with_unsafe_http(true)` |
-| **A peer's** — a contact's endpoint, an `UpdateChannelInfo` announcement, a request's `reply_to` | always | needs `with_unsafe_http(true)` | needs `with_unsafe_http(true)` |
+| **Your own** — `with_own_transport`, and the `reply_to` you stamp on outbound requests | always | **always**, with a warning | needs `with_unsafe_connection(true)` |
+| **A peer's** — a contact's endpoint, an `UpdateChannelInfo` announcement, a request's `reply_to` | always | needs `with_unsafe_connection(true)` | needs `with_unsafe_connection(true)` |
 
 So **a local dev server needs no configuration at all** — `http://localhost:8080`
-as your own endpoint just works. Testing across a LAN, a phone against a
-laptop, needs `with_unsafe_http(true)` on both sides, because neither is
-loopback.
+or `grpc://localhost:50051` as your own endpoint just works. Testing across a
+LAN, a phone against a laptop, needs `with_unsafe_connection(true)` on both
+sides, because neither is loopback.
 
 Loopback is free for *your own* endpoint because it names a service on your
 machine: the bytes never reach a network. It is not free for one a **peer**
@@ -492,14 +493,25 @@ Recognition is deliberately literal: `localhost`, `127.0.0.1`, `::1`, nothing
 else. No DNS resolution, no private-range classification. Both would need full
 URI parsing, and getting that wrong in a security check is how
 `http://127.0.0.1@evil.com/` slips past — so userinfo is refused outright and
-the wider case is what `with_unsafe_http` is for.
+the wider case is what `with_unsafe_connection` is for.
 
 > **This is a guardrail, not transport security.** The SDK opens no sockets —
 > delivery is your `DeRecTransport`. Nothing here stops an application sending
 > plaintext; what it does is refuse to record a plaintext endpoint, refuse to
 > propagate one to peers during pairing, and refuse to reply to one. Leaving
-> `with_unsafe_http` at its default does not by itself make a deployment
+> `with_unsafe_connection` at its default does not by itself make a deployment
 > secure, and turning it on does not by itself send anything in the clear.
+
+`with_unsafe_http(bool)` is the original, `http://`-only form of this
+setting, kept for compatibility and `#[deprecated]` since 0.0.3. Either flag
+alone is honored, so a deployment that only knows the old one keeps its
+current behavior after upgrading. Setting **both** to disagreeing values is
+refused at `build()` with `Error::ConflictingPlaintextOptIn`, which names
+both flags and the values given: precedence would hand the decision to the
+flag being removed, and a configuration layer that emits every field
+unconditionally would then let a defaulted `unsafe_http: false` silently beat
+a deliberate `unsafe_connection: true`. New code should use
+`with_unsafe_connection`.
 
 This was a Cargo feature (`unsafe-http`) until it became clear a compile-time
 switch is unreachable for the four SDKs that install a prebuilt binary from a
@@ -776,6 +788,66 @@ Each trait's rustdoc states its contract, idempotency expectations, and the
 security classification of the data it holds (`DeRecSecretStore` content is
 keychain-grade; the others need durable storage only).
 
+### Transport: implement `SendOne`, not `send`
+
+`DeRecTransport::send` receives *every* endpoint a peer advertised and leaves
+the choice among them to you, because only your application knows which of its
+transports are healthy, cheap, or currently reachable. That decision stays
+yours. The bookkeeping around it does not: try in order, stop at the first
+success, fail only when none worked, never deliver twice.
+
+Implement [`SendOne`](https://docs.rs/derec-library/latest/derec_library/protocol/trait.SendOne.html)
+— deliver to one endpoint — and wrap it:
+
+```rust,ignore
+let transport = SequentialFailover::new(MyDialer);
+```
+
+`SequentialFailover` is the right default. `SingleEndpointTransport` uses only
+the first endpoint, which is what `endpoints[0]` written inline does — the
+difference is that choosing the type is visible to a reviewer, where the index
+reads as finished code. Every binding ships both: `SequentialFailover` /
+`SingleEndpointTransport` (.NET, Go), `sequentialFailover(dialer)` /
+`singleEndpointTransport(dialer)` (Node, web, React Native).
+
+Do not deliver to every endpoint. They all address the same peer, so a fan-out
+sends one authenticated message several times.
+
+#### Filtered listings
+
+`DeRecChannelStore::helpers` and `DeRecChannelStore::replicas` take a
+[`ChannelFilter`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.ChannelFilter.html)
+— `ids`, `status`, `role` and `exclude`, where every empty value means "do not
+restrict on this", so a `Default` filter selects everything.
+
+**Returning everything is correct.** Ignore the filter and return every record
+under the `secret_id` unless you have a measured reason not to. The library
+re-applies the filter to every listing before acting on it and drops anything
+the filter excluded, so a superset is trimmed to exactly the right set.
+
+**Pushing it into your query is an optimization you opt into.** A `WHERE`
+clause or a key-condition expression avoids transferring rows the caller will
+discard, which costs bandwidth everywhere and real money on a metered backing
+such as DynamoDB that bills by bytes read.
+
+**The two directions are not symmetric, which is why that is opt-in.** Dropping
+rows enforces an upper bound, so returning too *many* costs only the transfer.
+It cannot recover a row that was never returned: a pushdown selecting too
+*few* is wrong in a way nothing can detect at runtime — no exception, no event,
+just a share that was never published.
+
+So verify a pushdown. `library/tests/fixtures/channel_filter.json` is a table
+of `(records, filter, expected)` cases covering the clauses that are easy to
+get subtly wrong — empty-means-unrestricted per field, `role` as an optional,
+`exclude` applied after and overriding `ids`, and ids above 2^53. Every binding
+drives it; a store that pushes down should too. `ChannelFilter::matches` is the
+same predicate the library re-checks with, exported for stores that would
+rather filter in memory than translate.
+
+The same filter crosses every binding: as a JSON object over the C ABI
+(`list_helpers` / `list_replicas` gain a `filter` buffer), and as a plain
+object on the WASM bridges.
+
 ### Choosing backends at run time
 
 `DeRecProtocol` is generic over all six, so by default the concrete backends
@@ -817,9 +889,10 @@ Public errors are structured and typed:
 - [`ChannelStoreError`](https://docs.rs/derec-library/latest/derec_library/protocol/error/enum.ChannelStoreError.html), [`ShareStoreError`](https://docs.rs/derec-library/latest/derec_library/protocol/error/enum.ShareStoreError.html), [`SecretStoreError`](https://docs.rs/derec-library/latest/derec_library/protocol/error/enum.SecretStoreError.html) — surfaced by storage trait implementations.
 
 The protocol never panics on malformed input. Inbound parsing or decryption
-failures surface as events (or as a typed `Error::ProtobufDecode` /
-`Error::DecryptionFailed` etc.); see `with_auto_respond_on_failure` for
-controlling whether such failures are replied to.
+failures surface as events, or as a typed `Error::ProtobufDecode` /
+`Error::Pairing(PairingError::PairingEncryption(..))`; see
+`with_auto_respond_on_failure` for controlling whether such failures are
+replied to.
 
 ---
 
@@ -868,13 +941,58 @@ for full TypeScript examples.
 The protocol is transport-agnostic. The `TransportProtocol` value carried in
 contact and pairing messages identifies the peer endpoint; the application's
 [`DeRecTransport`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecTransport.html)
-implementation decides how to deliver bytes (HTTPS, WebSocket, message queue,
-custom relay, …).
+implementation decides how to deliver bytes (HTTPS, gRPC, WebSocket, message
+queue, custom relay, …).
 
 > [!NOTE]
-> The on-the-wire `TransportProtocol.protocol` enum currently defines
-> `Https` as the only supported value. New transports can be added by
-> extending the protobuf enum.
+> The on-the-wire `TransportProtocol.protocol` enum defines two values,
+> `Https` and `Grpc`. The library validates and propagates `grpcs://` /
+> `grpc://` endpoints exactly as it does HTTPS ones, but never implements the
+> gRPC side itself: `derec-proto` ships the `DeRecTransport` service contract
+> (`rpc Send(DeRecMessage) returns (google.protobuf.Empty)`) as a `.proto`
+> file with no generated service stubs. Consumers who want stubs run their
+> own `tonic-prost-build`, as `smoke-tests/grpc` does — see that crate for a
+> complete worked reference. New transports can be added by extending the
+> protobuf enum.
+
+An application serving more than one transport declares them all, in
+preference order:
+
+```rust
+builder.with_own_transports([
+    "grpcs://me.example.com:443",
+    "https://me.example.com/derec",
+])
+```
+
+The list is advertised to peers as `supportedTransports` on contacts and pair
+requests, and it is what decides which of a peer's endpoints gets used: each
+side independently picks, from what the other offered, the first entry
+matching its **own** order. Nothing is negotiated on the wire, so there is no
+extra round trip. An endpoint offered by a peer that fails structural
+validation or scheme policy is skipped rather than fatal; no overlap at all is
+`Error::NoUsableEndpoint`, and at pairing time it is terminal — delivery is
+push-only, so a peer whose transport you cannot speak cannot be sent a
+rejection either.
+
+Order is meaningful and the first entry is also your primary endpoint, the one
+advertised to implementations predating the offer list. Because delivery is
+push-only, every entry must be a transport you actually **serve**: listing one
+you do not makes pairing succeed and replies vanish. `with_own_transport`
+remains fully supported and is exactly a one-element list. The equivalents are
+`WithOwnTransports` (.NET), `withOwnTransports` (Node.js / Web) and
+`Config.OwnTransports` (Go).
+
+`with_own_transport` / `set_own_transport` are **deprecated and removed at
+0.0.5**; a one-element list is the direct replacement.
+
+To change the set after construction, use `set_own_transports` — the runtime
+counterpart, and the only way a multi-endpoint node can change what it
+advertises. `set_own_transport` replaces the list with the single endpoint it
+is given, matching `with_own_transport`. Both validate every entry before
+storing any, so a malformed URI leaves the previous set intact. The
+equivalents are `setOwnTransports` (Node.js / Web / React Native) and
+`SetOwnTransports` (Go).
 
 ### Serving DeRec over request/response transports
 
@@ -967,6 +1085,13 @@ auto-applies on the receiver via the standard `ActionRequired` → `accept`
 path. Outcome surfaces as `DeRecEvent::ChannelInfoUpdated` (or
 `ChannelInfoUpdateRejected` if the peer refused).
 
+A switch to a transport the receiving side serves no endpoint for is
+**refused, not recorded**: the receiver answers
+`StatusEnum::UNSUPPORTED_TRANSPORT_PROTOCOL` over the previous — still
+working — endpoint, and the initiator sees `ChannelInfoUpdateRejected`.
+Recording it would have pointed every later message at an address the
+receiver cannot deliver to, with nothing to indicate it.
+
 > [!WARNING]
 > **Endpoint changeover discipline.** When `transport_protocol` is updated,
 > the receiving peer sends its response to the **new** endpoint. The
@@ -976,7 +1101,8 @@ path. Outcome surfaces as `DeRecEvent::ChannelInfoUpdated` (or
 > `ChannelInfoUpdated` / `ChannelInfoUpdateRejected` (plus a grace window
 > for in-flight messages from peers not yet aware of the update). Failing
 > to keep both endpoints reachable during this window will cause messages
-> to be lost. See the rustdoc on `set_own_transport` for details.
+> to be lost. See the rustdoc on `set_own_transport` / `set_own_transports`
+> for details.
 
 ---
 

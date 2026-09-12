@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use crate::extensions::derec_result::DeRecResultExt as _;
+use crate::extensions::verify_share_response::VerifyShareResponseExt as _;
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     primitives::verification::VerificationError,
@@ -81,7 +83,7 @@ pub struct ExtractResult {
 ///
 /// // Owner: issue a verification challenge.
 /// let request::ProduceResult { envelope: req_envelope, .. } =
-///     request::produce(channel_id, 1, 1, &shared_key, None).expect("produce request failed");
+///     request::produce(channel_id, 1, 1, &shared_key, &[]).expect("produce request failed");
 ///
 /// // Helper: extract the challenge and answer it with the share bytes.
 /// let request::ExtractResult { request: challenge } =
@@ -192,7 +194,7 @@ pub fn produce(
 ///
 /// // Owner: issue a verification challenge.
 /// let request::ProduceResult { envelope: req_envelope, .. } =
-///     request::produce(channel_id, 1, 1, &shared_key, None).expect("produce request failed");
+///     request::produce(channel_id, 1, 1, &shared_key, &[]).expect("produce request failed");
 ///
 /// // Helper: extract the challenge and answer it.
 /// let request::ExtractResult { request: challenge } =
@@ -314,7 +316,7 @@ pub fn extract(
 /// // Owner: issue a verification challenge and remember the request body
 /// // so we can bind the eventual response back to this specific challenge.
 /// let request::ProduceResult { envelope: req_envelope, nonce: _expected_nonce } =
-///     request::produce(channel_id, 1, 1, &shared_key, None).expect("produce request failed");
+///     request::produce(channel_id, 1, 1, &shared_key, &[]).expect("produce request failed");
 ///
 /// // Helper: answer the challenge with the share bytes.
 /// let request::ExtractResult { request: challenge } =
@@ -342,48 +344,13 @@ pub fn process(
     // Anti-replay / cross-binding gate — runs BEFORE the status and
     // hash checks so a stale/replayed response is rejected even on a
     // structurally-OK envelope.
-    if response.nonce != request.nonce {
-        return Err(VerificationError::ResponseBindingMismatch {
-            field: "nonce",
-            expected: request.nonce,
-            got: response.nonce,
-        }
-        .into());
-    }
-    if response.secret_id != request.secret_id {
-        return Err(VerificationError::ResponseBindingMismatch {
-            field: "secret_id",
-            expected: request.secret_id,
-            got: response.secret_id,
-        }
-        .into());
-    }
-    if response.version != request.version {
-        return Err(VerificationError::ResponseBindingMismatch {
-            field: "version",
-            expected: u64::from(request.version),
-            got: u64::from(response.version),
-        }
-        .into());
-    }
+    response.validate_binding(request)?;
 
     let result = response.result.as_ref().ok_or(crate::Error::Invariant(
         "VerifyShareResponseMessage is missing result field",
     ))?;
 
-    if result.status != StatusEnum::Ok as i32 {
-        #[cfg(feature = "logging")]
-        tracing::warn!(
-            status = result.status,
-            memo = %result.memo,
-            "verification response status is not Ok"
-        );
-        return Err(VerificationError::NonOkStatus {
-            status: result.status,
-            memo: result.memo.to_owned(),
-        }
-        .into());
-    }
+    result.validate(|status, memo| VerificationError::NonOkStatus { status, memo })?;
 
     // Hash against the OWNER'S nonce (from `request`), not the helper-
     // controlled `response.nonce`. The binding gate above guarantees

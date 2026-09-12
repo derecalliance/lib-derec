@@ -10,7 +10,7 @@ const SenderKind = Object.freeze({ Owner: 0, Helper: 1, ReplicaSource: 3, Replic
 
 const ContactMode = Object.freeze({ InlineKeys: 0, HashedKeys: 1, NoKeys: 2 });
 
-const FlowKind = Object.freeze({ Pairing: 0, Discovery: 1, ProtectSecret: 2, VerifyShares: 3, RecoverSecret: 4, Unpair: 5, UpdateChannelInfo: 6, SyncCheck: 7, RemoveReplica: 8 });
+const FlowKind = Object.freeze({ Pairing: 0, Discovery: 1, ProtectSecret: 2, VerifyShares: 3, RecoverSecret: 4, Unpair: 5, UpdateChannelInfo: 6, ReplicaDiscovery: 7, UnpairReplica: 8 });
 
 const primitives = {
   discovery: {
@@ -95,8 +95,74 @@ const envelope = {
   read_trace_id: wasm.envelope_read_trace_id,
 };
 
+/**
+ * Whether a channel or member with these attributes survives `filter`.
+ *
+ * Every empty field means "do not restrict", `exclude` is applied after `ids`,
+ * and the restrictions combine with AND — the same contract the core states on
+ * `ChannelFilter`. A store whose backing cannot express the filter as a query
+ * can list and call this; that is correct but transfers the rows the filter
+ * exists to leave behind.
+ *
+ * `id` is a decimal string, as ids are everywhere on this bridge. `role` is the
+ * peer's `SenderKind` name for `listHelpers` and the member's `ReplicaRole`
+ * name for `listReplicas`.
+ */
+function channelFilterMatches(filter, id, status, role) {
+  if (!filter) return true;
+  const ids = filter.ids ?? [];
+  const statuses = filter.status ?? [];
+  const exclude = filter.exclude ?? [];
+  if (ids.length > 0 && !ids.includes(id)) return false;
+  if (statuses.length > 0 && !statuses.includes(status)) return false;
+  if (filter.role != null && filter.role !== role) return false;
+  return !exclude.includes(id);
+}
+
+function advertisedEndpoints(message) {
+  if (!message) return [];
+  const offers = message.supported_transports ?? [];
+  if (offers.length > 0) return offers;
+  return message.transport_protocol ? [message.transport_protocol] : [];
+}
+
+function sequentialFailover(dialer) {
+  return {
+    async send(endpoints, message) {
+      let last;
+      for (const endpoint of endpoints) {
+        try {
+          await dialer(endpoint, message);
+          return;
+        } catch (e) {
+          last = e;
+        }
+      }
+      // `endpoints` is never empty — the library refuses to record a peer
+      // whose endpoints were all filtered away — so reaching here means at
+      // least one attempt was made and `last` is populated.
+      throw last ?? new Error("send was called with no endpoints");
+    },
+  };
+}
+
+function singleEndpointTransport(dialer) {
+  return {
+    async send(endpoints, message) {
+      if (endpoints.length === 0) {
+        throw new Error("send was called with no endpoints");
+      }
+      await dialer(endpoints[0], message);
+    },
+  };
+}
+
 module.exports = {
   primitives,
+  channelFilterMatches,
+  advertisedEndpoints,
+  sequentialFailover,
+  singleEndpointTransport,
   envelope,
   DeRecProtocol,
   DeRecProtocolBuilder,

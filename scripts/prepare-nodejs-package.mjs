@@ -2,6 +2,7 @@ import { readFile, writeFile, copyFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
+import os from "node:os";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -50,7 +51,40 @@ function mergeDeep(base, override) {
   return result;
 }
 
+// The wasm-pack output this script assembles is a build artifact under
+// library/target/, so a stale or absent one would otherwise be packaged
+// silently. Build it here, the way the Go and .NET packaging scripts build
+// their native libraries, so `prepare` always reflects current source.
+/// Path remapping for the shipped `.wasm`, matching what
+/// `scripts/lib/build-env.sh` gives the native packaging scripts.
+///
+/// `panic!` and friends compile their source location into the binary as
+/// read-only data, so without this every published bundle carries absolute
+/// paths from the release machine's `~/.cargo` and `~/.rustup`. Stripping
+/// cannot remove them — they are not debug info — so they have to be rewritten
+/// at compile time.
+function buildRustFlags() {
+  const home = os.homedir();
+  const parts = [`--remap-path-prefix=${home}=/derec-build`];
+  // Listed last so it wins for a checkout that lives outside the home
+  // directory: when several prefixes match, rustc applies the last one.
+  parts.push(`--remap-path-prefix=${repoRoot}=/derec`);
+  const existing = process.env.RUSTFLAGS;
+  return existing ? `${existing} ${parts.join(" ")}` : parts.join(" ");
+}
+
+function buildWasm(target, outDir) {
+  console.log(`Building wasm with wasm-pack --target ${target}`);
+  execFileSync(
+    "wasm-pack",
+    ["build", "--release", "--out-dir", path.join("target", outDir), "--target", target],
+    { cwd: libraryRoot, stdio: "inherit", env: { ...process.env, RUSTFLAGS: buildRustFlags() } }
+  );
+}
+
 async function main() {
+  buildWasm("nodejs", "pkg-nodejs");
+
   const [generatedPackageJsonRaw, overridePackageJsonRaw] = await Promise.all([
     readFile(generatedPackageJsonPath, "utf8"),
     readFile(overridePackageJsonPath, "utf8"),

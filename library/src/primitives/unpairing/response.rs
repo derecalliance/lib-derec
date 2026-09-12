@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use crate::extensions::derec_result::DeRecResultExt as _;
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     primitives::unpairing::UnpairingError,
@@ -115,7 +116,7 @@ pub fn produce(
 ///
 /// // Initiator: send an unpair request.
 /// let request::ProduceResult { envelope: req_envelope } =
-///     request::produce(channel_id, "no longer needed", &shared_key, None, None)
+///     request::produce(channel_id, "no longer needed", &shared_key, &[], None)
 ///         .expect("produce request failed");
 ///
 /// // Responder: extract and ack with a successful response.
@@ -182,7 +183,7 @@ pub fn extract(
 ///
 /// // Initiator → Responder → Initiator roundtrip.
 /// let request::ProduceResult { envelope: req_envelope } =
-///     request::produce(channel_id, "no longer needed", &shared_key, None, None)
+///     request::produce(channel_id, "no longer needed", &shared_key, &[], None)
 ///         .expect("produce request failed");
 /// let _ = request::extract(&req_envelope, &shared_key).expect("extract request failed");
 /// let response::ProduceResult { envelope: resp_envelope } =
@@ -201,19 +202,7 @@ pub fn process(response: &UnpairResponseMessage) -> Result<ProcessResult, crate:
         "UnpairResponseMessage is missing result field",
     ))?;
 
-    if result.status != StatusEnum::Ok as i32 {
-        #[cfg(feature = "logging")]
-        tracing::warn!(
-            status = result.status,
-            memo = %result.memo,
-            "unpair response status is not Ok"
-        );
-        return Err(UnpairingError::NonOkStatus {
-            status: result.status,
-            memo: result.memo.to_owned(),
-        }
-        .into());
-    }
+    result.validate(|status, memo| UnpairingError::NonOkStatus { status, memo })?;
 
     #[cfg(feature = "logging")]
     tracing::info!("unpair response acknowledged");

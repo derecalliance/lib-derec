@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-use derec_library::protocol::types::{ChannelQuery, ChannelRecord, HelperChannel, ReplicaMember};
+use derec_library::protocol::types::{
+    ChannelQuery, ChannelRecord, HelperChannel, HelperFilter, ReplicaFilter, ReplicaMember,
+};
 use derec_library::protocol::{ChannelStoreFuture, DeRecChannelStore};
 use derec_library::types::ChannelId;
 use std::collections::{HashSet, VecDeque};
 
-use crate::codec::{decode_helper, decode_member, encode_channel, sql_to_u64, u64_to_sql};
+use crate::codec::{
+    channel_status_tag, decode_helper, decode_member, encode_channel, replica_role_tag,
+    sender_kind_tag, sql_to_u64, u64_to_sql,
+};
 use crate::db::{SharedConnection, lock};
 
 pub struct SqliteChannelStore {
@@ -56,23 +61,38 @@ impl DeRecChannelStore for SqliteChannelStore {
         match &record {
             ChannelRecord::Helper(h) => {
                 conn.execute(
-                    "INSERT INTO channels (secret_id, channel_id, data) VALUES (?1, ?2, ?3)
-                     ON CONFLICT(secret_id, channel_id) DO UPDATE SET data = excluded.data",
-                    rusqlite::params![u64_to_sql(secret_id), u64_to_sql(h.channel_id.0), bytes],
+                    "INSERT INTO channels (secret_id, channel_id, status, peer_role, data)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(secret_id, channel_id) DO UPDATE SET
+                         status = excluded.status,
+                         peer_role = excluded.peer_role,
+                         data = excluded.data",
+                    rusqlite::params![
+                        u64_to_sql(secret_id),
+                        u64_to_sql(h.channel_id.0),
+                        channel_status_tag(h.status),
+                        sender_kind_tag(h.peer_role),
+                        bytes
+                    ],
                 )
                 .expect("helper channel save failed");
             }
             ChannelRecord::Replica(m) => {
                 conn.execute(
-                    "INSERT INTO replica_members (secret_id, replica_id, channel_id, data)
-                     VALUES (?1, ?2, ?3, ?4)
+                    "INSERT INTO replica_members
+                         (secret_id, replica_id, channel_id, status, role, data)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                      ON CONFLICT(secret_id, replica_id) DO UPDATE SET
                          channel_id = excluded.channel_id,
+                         status = excluded.status,
+                         role = excluded.role,
                          data = excluded.data",
                     rusqlite::params![
                         u64_to_sql(secret_id),
                         u64_to_sql(m.replica_id.0),
                         u64_to_sql(m.channel_id.0),
+                        channel_status_tag(m.status),
+                        replica_role_tag(m.role),
                         bytes
                     ],
                 )
@@ -109,15 +129,44 @@ impl DeRecChannelStore for SqliteChannelStore {
         Box::pin(std::future::ready(Ok(affected > 0)))
     }
 
-    fn helpers(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
+    fn helpers(
+        &self,
+        secret_id: u64,
+        filter: HelperFilter,
+    ) -> ChannelStoreFuture<'_, Vec<HelperChannel>> {
         let conn = lock(&self.connection);
-        let mut stmt = conn
-            .prepare("SELECT data FROM channels WHERE secret_id = ?1")
-            .expect("helpers prepare failed");
+        let mut sql = String::from("SELECT data FROM channels WHERE secret_id = ?1");
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(u64_to_sql(secret_id))];
+
+        push_id_clause(
+            &mut sql,
+            &mut params,
+            "channel_id",
+            filter.ids.iter().map(|c| c.0),
+            false,
+        );
+        push_tag_clause(
+            &mut sql,
+            &mut params,
+            "status",
+            filter.status.iter().copied().map(channel_status_tag),
+        );
+        if let Some(role) = filter.role {
+            params.push(Box::new(sender_kind_tag(role)));
+            sql.push_str(&format!(" AND peer_role = ?{}", params.len()));
+        }
+        push_id_clause(
+            &mut sql,
+            &mut params,
+            "channel_id",
+            filter.exclude.iter().map(|c| c.0),
+            true,
+        );
+
+        let mut stmt = conn.prepare(&sql).expect("helpers prepare failed");
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
         let rows = stmt
-            .query_map(rusqlite::params![u64_to_sql(secret_id)], |row| {
-                row.get::<_, Vec<u8>>(0)
-            })
+            .query_map(refs.as_slice(), |row| row.get::<_, Vec<u8>>(0))
             .expect("helpers query failed");
 
         let mut out = Vec::new();
@@ -127,18 +176,49 @@ impl DeRecChannelStore for SqliteChannelStore {
         Box::pin(std::future::ready(Ok(out)))
     }
 
-    fn replicas(&self, secret_id: u64) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
+    fn replicas(
+        &self,
+        secret_id: u64,
+        filter: ReplicaFilter,
+    ) -> ChannelStoreFuture<'_, Vec<ReplicaMember>> {
         let conn = lock(&self.connection);
-        let mut stmt = conn
-            // Ordered deliberately: this order picks the successor when the
-            // group's source is removed, and an unordered SELECT would leave
-            // that to the planner. See `DeRecChannelStore::replicas`.
-            .prepare("SELECT data FROM replica_members WHERE secret_id = ?1 ORDER BY replica_id")
-            .expect("replicas prepare failed");
+        let mut sql = String::from("SELECT data FROM replica_members WHERE secret_id = ?1");
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(u64_to_sql(secret_id))];
+
+        push_id_clause(
+            &mut sql,
+            &mut params,
+            "replica_id",
+            filter.ids.iter().map(|r| r.0),
+            false,
+        );
+        push_tag_clause(
+            &mut sql,
+            &mut params,
+            "status",
+            filter.status.iter().copied().map(channel_status_tag),
+        );
+        if let Some(role) = filter.role {
+            params.push(Box::new(replica_role_tag(role)));
+            sql.push_str(&format!(" AND role = ?{}", params.len()));
+        }
+        push_id_clause(
+            &mut sql,
+            &mut params,
+            "replica_id",
+            filter.exclude.iter().map(|r| r.0),
+            true,
+        );
+
+        // Ordered deliberately: this order picks the successor when the
+        // group's source is removed, and an unordered SELECT would leave
+        // that to the planner. See `DeRecChannelStore::replicas`.
+        sql.push_str(" ORDER BY replica_id");
+
+        let mut stmt = conn.prepare(&sql).expect("replicas prepare failed");
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
         let rows = stmt
-            .query_map(rusqlite::params![u64_to_sql(secret_id)], |row| {
-                row.get::<_, Vec<u8>>(0)
-            })
+            .query_map(refs.as_slice(), |row| row.get::<_, Vec<u8>>(0))
             .expect("replicas query failed");
 
         let mut out = Vec::new();
@@ -205,4 +285,52 @@ impl DeRecChannelStore for SqliteChannelStore {
         let result: Vec<ChannelId> = visited.into_iter().map(ChannelId).collect();
         Box::pin(std::future::ready(Ok(result)))
     }
+}
+
+/// Append `AND col IN (…)` — or `NOT IN` when `negate` — for a non-empty id
+/// list, binding each id as its own parameter.
+///
+/// An empty list appends nothing, which is what an empty
+/// [`ChannelFilter`](derec_library::protocol::types::ChannelFilter) field
+/// means: no restriction on this column.
+fn push_id_clause(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn rusqlite::ToSql>>,
+    column: &str,
+    ids: impl Iterator<Item = u64>,
+    negate: bool,
+) {
+    let placeholders = bind_all(params, ids.map(|id| u64_to_sql(id) as i64));
+    if placeholders.is_empty() {
+        return;
+    }
+    let op = if negate { "NOT IN" } else { "IN" };
+    sql.push_str(&format!(" AND {column} {op} ({})", placeholders.join(", ")));
+}
+
+/// Append `AND col IN (…)` for a non-empty list of enum tags.
+fn push_tag_clause(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn rusqlite::ToSql>>,
+    column: &str,
+    tags: impl Iterator<Item = i64>,
+) {
+    let placeholders = bind_all(params, tags);
+    if placeholders.is_empty() {
+        return;
+    }
+    sql.push_str(&format!(" AND {column} IN ({})", placeholders.join(", ")));
+}
+
+/// Bind each value and return its `?N` placeholder, in order.
+fn bind_all(
+    params: &mut Vec<Box<dyn rusqlite::ToSql>>,
+    values: impl Iterator<Item = i64>,
+) -> Vec<String> {
+    values
+        .map(|v| {
+            params.push(Box::new(v));
+            format!("?{}", params.len())
+        })
+        .collect()
 }

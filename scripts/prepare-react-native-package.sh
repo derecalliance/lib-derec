@@ -4,6 +4,9 @@
 
 set -euo pipefail
 
+# Path remapping for every shipped binary; see the file for why.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/build-env.sh"
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LIBRARY_DIR="$ROOT_DIR/library"
 WORKSPACE_TARGET_DIR="$ROOT_DIR/target"
@@ -102,6 +105,45 @@ check_ffi_header_is_current() {
   log "cpp/derec_ffi.h matches the current FFI surface"
 }
 
+# Remove debug sections from a static archive, keeping the symbol table.
+#
+# A `.a` is an archive of object files, never linked, so Cargo's
+# `profile.strip` — a link-time flag — does not reach it. The archives ship
+# with full DWARF: the five this package carries account for 171 MB of its
+# 172 MB unpacked size, and removing it takes roughly a fifth off each one.
+#
+# Debug sections only. Stripping the symbol table would leave an archive the
+# consuming app cannot link against.
+strip_static_archive() {
+  local lib="$1" kind="$2"
+  local before after
+  before="$(wc -c <"$lib" | tr -d ' ')"
+  case "$kind" in
+    apple) xcrun strip -S "$lib" ;;
+    android)
+      # Globbed rather than `find`ed: the NDK's toolchain directories are
+      # symlinks under a Homebrew install, and `find -type f` does not follow
+      # them, so it reports the tool as absent while `ls` shows it.
+      local ndk_root="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}"
+      local ndk_strip=""
+      local candidate
+      for candidate in "$ndk_root"/toolchains/llvm/prebuilt/*/bin/llvm-strip; do
+        if [[ -x "$candidate" ]]; then
+          ndk_strip="$candidate"
+          break
+        fi
+      done
+      if [[ -z "$ndk_strip" ]]; then
+        log "llvm-strip not found in the NDK; leaving $lib unstripped"
+        return 0
+      fi
+      "$ndk_strip" --strip-debug "$lib"
+      ;;
+  esac
+  after="$(wc -c <"$lib" | tr -d ' ')"
+  log "Stripped $(basename "$(dirname "$lib")")/$(basename "$lib"): $((before / 1048576))M -> $((after / 1048576))M"
+}
+
 build_ios_xcframework() {
   log "Building iOS targets: $IOS_DEVICE_TARGET ${IOS_SIM_TARGETS[*]}"
   build_rust_target "$IOS_DEVICE_TARGET"
@@ -132,6 +174,9 @@ build_ios_xcframework() {
   mkdir -p "$headers_dir"
   cp "$PKG_DIR/cpp/derec_ffi.h" "$headers_dir/"
 
+  strip_static_archive "$device_lib" apple
+  strip_static_archive "$sim_fat_lib" apple
+
   log "Creating $XCFRAMEWORK_NAME"
   rm -rf "$IOS_DIR/$XCFRAMEWORK_NAME"
   mkdir -p "$IOS_DIR"
@@ -152,6 +197,7 @@ build_android_libs() {
     local dest_dir="$ANDROID_JNI_DIR/$abi"
     mkdir -p "$dest_dir"
     cp "$(staticlib_path "$rust_target")" "$dest_dir/"
+    strip_static_archive "$dest_dir/$STATICLIB_NAME" android
     echo "Staged $STATICLIB_NAME -> android/src/main/jniLibs/$abi/"
   done
 }

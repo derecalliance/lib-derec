@@ -9,12 +9,17 @@
 // share store, recording transport), but are Map-backed instead of
 // localStorage-backed.
 
-import { ContactMode, DeRecProtocol, DeRecProtocolBuilder, FlowKind, SenderKind, primitives } from "@derec-alliance/web";
+import { channelFilterMatches, ContactMode, DeRecProtocol, DeRecProtocolBuilder, FlowKind, SenderKind, primitives } from "@derec-alliance/web";
 import type {
+  ChannelStatusName,
   ChannelStore,
   ContactMessage,
   DeRecEvent,
+  HelperFilter,
+  ReplicaFilter,
+  ReplicaRoleName,
   SecretStore,
+  SenderKindName,
   Share,
   ShareStore,
   StateStore,
@@ -22,6 +27,13 @@ import type {
   UserSecretStore,
   UserSecrets,
 } from "@derec-alliance/web";
+
+/**
+ * The unrestricted filters, for assertions that want the whole listing.
+ * Every field empty is exactly what the core means by "no restriction".
+ */
+const ANY_HELPERS: HelperFilter = { ids: [], status: [], role: null, exclude: [] };
+const ANY_REPLICAS: ReplicaFilter = { ids: [], status: [], role: null, exclude: [] };
 
 
 const kindName = (k: SenderKind): string => {
@@ -146,7 +158,16 @@ class InMemoryChannelStore implements ChannelStore {
   // 2**53 to the nearest double. A record is always the externally
   // tagged `{"<variant>":{...}}` serde emits, so stripping the wrapper
   // is a prefix/suffix slice.
-  private list(secretId: string, variant: "Helper" | "Replica"): Uint8Array {
+  //
+  // The filter is applied against a *parsed copy* — reading `status` and
+  // `role` is safe, and the id comes from the map key, which is already the
+  // exact decimal string. The bytes pushed to the output are always the
+  // original slice, so the precision guarantee above still holds.
+  private list(
+    secretId: string,
+    variant: "Helper" | "Replica",
+    filter: HelperFilter | ReplicaFilter,
+  ): Uint8Array {
     const source = variant === "Helper" ? this.helpers : this.members;
     const prefix = `${secretId}:`;
     const tag = `{"${variant}":`;
@@ -155,17 +176,20 @@ class InMemoryChannelStore implements ChannelStore {
       if (!k.startsWith(prefix)) continue;
       const text = new TextDecoder().decode(v);
       if (!text.startsWith(tag)) continue;
-      inner.push(text.slice(tag.length, -1));
+      const body = text.slice(tag.length, -1);
+      const id = k.slice(prefix.length);
+      if (!matchesFilter(filter, id, body, variant)) continue;
+      inner.push(body);
     }
     return new TextEncoder().encode(`[${inner.join(",")}]`);
   }
 
-  async listHelpers(secretId: string): Promise<Uint8Array> {
-    return this.list(secretId, "Helper");
+  async listHelpers(secretId: string, filter: HelperFilter): Promise<Uint8Array> {
+    return this.list(secretId, "Helper", filter);
   }
 
-  async listReplicas(secretId: string): Promise<Uint8Array> {
-    return this.list(secretId, "Replica");
+  async listReplicas(secretId: string, filter: ReplicaFilter): Promise<Uint8Array> {
+    return this.list(secretId, "Replica", filter);
   }
 
   private linkKey(secretId: string, channelId: string): string {
@@ -368,10 +392,18 @@ interface OutboundMessage {
 class RecordingTransport implements Transport {
   private outbox: OutboundMessage[] = [];
 
+  // The library hands over every endpoint the peer advertised, filtered but
+  // unranked, and delivery to any one of them is success. A real transport
+  // would try them in order and fall back; recording the first keeps the
+  // outbox assertions below addressed by a single uri.
   async send(
-    endpoint: { protocol: string; uri: string },
+    endpoints: ReadonlyArray<{ protocol: string; uri: string }>,
     message: Uint8Array,
   ): Promise<void> {
+    const endpoint = endpoints[0];
+    if (!endpoint) {
+      throw new Error("transport: send called with no endpoints");
+    }
     this.outbox.push({ endpoint, message });
   }
 
@@ -1311,9 +1343,11 @@ async function runReplyToFlow(): Promise<void> {
     outboundMsg.message,
     sharedKey,
   );
-  if (!decoded.reply_to || decoded.reply_to.uri !== ownerUri) {
+  // reply_to is a list now: auto_reply_to advertises every endpoint this
+  // device serves, leading with its own transport.
+  if (!decoded.reply_to?.length || decoded.reply_to[0]!.uri !== ownerUri) {
     throw new Error(
-      `auto_reply_to must stamp replyTo = ownerUri (${ownerUri}) on the inner request body, got ${JSON.stringify(decoded.reply_to)}`,
+      `auto_reply_to must stamp replyTo leading with ownerUri (${ownerUri}) on the inner request body, got ${JSON.stringify(decoded.reply_to)}`,
     );
   }
 
@@ -1341,9 +1375,9 @@ async function runReplyToFlow(): Promise<void> {
     defaultMsg.message,
     defaultSharedKey,
   );
-  if (defaultDecoded.reply_to) {
+  if (defaultDecoded.reply_to?.length) {
     throw new Error(
-      `without auto_reply_to, request.reply_to must be unset; got ${JSON.stringify(defaultDecoded.reply_to)}`,
+      `without auto_reply_to, request.reply_to must be empty; got ${JSON.stringify(defaultDecoded.reply_to)}`,
     );
   }
 
@@ -1672,6 +1706,7 @@ export async function runProtocolSmoke(): Promise<void> {
   await runHashedKeysPairingFlow();
   await runNoKeysPairingFlow();
   runUnsafeHttpConfigFlow();
+  runConfigSurfaceFlow();
   await runSharingFlow();
   await runDiscoveryAndRecoveryFlow();
   await runUnpairingFlow();
@@ -2155,7 +2190,7 @@ async function assertHydrated(
   }
 
   const storedHelpers = JSON.parse(
-    new TextDecoder().decode(await peer.channelStore.listHelpers(sid)),
+    new TextDecoder().decode(await peer.channelStore.listHelpers(sid, ANY_HELPERS)),
   );
   if (storedHelpers.length !== helpers) {
     throw new Error(
@@ -2164,7 +2199,7 @@ async function assertHydrated(
   }
 
   const roster = JSON.parse(
-    new TextDecoder().decode(await peer.channelStore.listReplicas(sid)),
+    new TextDecoder().decode(await peer.channelStore.listReplicas(sid, ANY_REPLICAS)),
   );
   if (roster.length !== members) {
     throw new Error(`replica ${label} roster size: expected ${members}, got ${roster.length}`);
@@ -2248,20 +2283,20 @@ async function runExpiredChannelCleanupFlow(): Promise<void> {
  * Compile-time proof that both new flows are reachable from TypeScript without
  * widening `start`.
  *
- * `SyncCheck` (7) and `RemoveReplica` (8) were in the `FlowKind` enum and
+ * `ReplicaDiscovery` (7) and `UnpairReplica` (8) were in the `FlowKind` enum and
  * accepted at runtime, but `start` declared overloads only up to kind 6, so
  * dispatching them meant casting to a looser signature. This function is never
  * called — it exists so `tsc` fails if those overloads are dropped again.
  */
 export function _startOverloadsCoverEveryFlowKind(protocol: DeRecProtocol): void {
-  void (() => protocol.start(FlowKind.SyncCheck));
-  void (() => protocol.start(FlowKind.SyncCheck, {}));
+  void (() => protocol.start(FlowKind.ReplicaDiscovery));
+  void (() => protocol.start(FlowKind.ReplicaDiscovery, {}));
   void (() =>
-    protocol.start(FlowKind.RemoveReplica, {
+    protocol.start(FlowKind.UnpairReplica, {
       replica_id: "51966",
       memo: "retired device",
     }));
-  void (() => protocol.start(FlowKind.RemoveReplica, { replica_id: "51966" }));
+  void (() => protocol.start(FlowKind.UnpairReplica, { replica_id: "51966" }));
 }
 
 /**
@@ -2302,4 +2337,101 @@ export function runUnsafeHttpConfigFlow(): void {
   console.log("  LAN http accepted with unsafeHttp=true  ✓");
 
   console.log("\n✓ unsafe_http config passed.\n");
+}
+
+/**
+ * The config knobs and validation rules an application reaches through this
+ * SDK. Each crosses into the native core, where a name mismatch would silently
+ * drop the setting rather than fail — so each assertion here is checking the
+ * value actually arrived.
+ */
+export function runConfigSurfaceFlow(): void {
+  console.log("=== [Protocol] config surface ===\n");
+
+  const base = () =>
+    new DeRecProtocolBuilder(DEFAULT_TEST_SECRET_ID)
+      .withChannelStore(new InMemoryChannelStore())
+      .withShareStore(new InMemoryShareStore())
+      .withSecretStore(new InMemorySecretStore())
+      .withUserSecretStore(new InMemoryUserSecretStore())
+      .withStateStore(new InMemoryStateStore())
+      .withTransport(new RecordingTransport())
+      .withThreshold(THRESHOLD);
+
+  // ParameterRange reaches the library. Bounds that cannot intersect any peer
+  // range would still build — this proves only that the field is carried,
+  // which is what no SDK could do before it was declared.
+  base()
+    .withOwnTransports([{ uri: "https://owner.example.com", protocol: "https" }])
+    .withParameterRange({
+      min_share_size: 1n,
+      max_share_size: 1n << 20n,
+      min_time_between_verifications: 1n,
+      max_time_between_verifications: 3600n,
+    })
+    .build();
+  console.log("  withParameterRange accepted  ✓");
+
+  // A device serves at most one endpoint per protocol: two HTTPS entries
+  // contradict rather than extend, so the set is refused even though each
+  // entry is individually well-formed.
+  let refused = false;
+  try {
+    base()
+      .withOwnTransports([
+        { uri: "https://a.example", protocol: "https" },
+        { uri: "https://b.example", protocol: "https" },
+      ])
+      .build();
+  } catch {
+    refused = true;
+  }
+  if (!refused) {
+    throw new Error(
+      "two endpoints of one protocol must be refused — the one-per-protocol rule is not reaching the library",
+    );
+  }
+  console.log("  two endpoints of one protocol refused  ✓");
+
+  // Distinct protocols are what the list is for.
+  const protocol = base()
+    .withOwnTransports([
+      { uri: "https://a.example", protocol: "https" },
+      { uri: "grpcs://a.example:443", protocol: "grpc" },
+    ])
+    .build();
+  console.log("  distinct protocols accepted  ✓");
+
+  console.log("\n✓ config surface passed.\n");
+}
+
+/**
+ * Apply a listing filter to one stored record.
+ *
+ * Empty means "do not restrict", `exclude` is applied last, and the
+ * restrictions combine with AND — the contract the core documents on
+ * `ChannelFilter`. A store that ignores this still compiles; it would just
+ * ship rows the core asked it not to.
+ */
+function matchesFilter(
+  filter: HelperFilter | ReplicaFilter,
+  id: string,
+  body: string,
+  variant: "Helper" | "Replica",
+): boolean {
+  // Parsed only to read the two enum fields; the caller emits `body` itself.
+  const record = JSON.parse(body) as {
+    status?: string;
+    role?: string;
+    peer_role?: string;
+  };
+  const role = (variant === "Helper" ? record.peer_role : record.role) ?? "";
+  // The SDK ships this predicate so every store need not re-derive the
+  // empty-means-unrestricted / exclude-after-ids rules.
+  return channelFilterMatches(
+    filter,
+    id,
+    (record.status ?? "Paired") as ChannelStatusName,
+    role as SenderKindName | ReplicaRoleName,
+  );
 }

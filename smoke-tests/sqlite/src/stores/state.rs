@@ -38,7 +38,7 @@ fn kind_to_sql(kind: StateKind) -> i64 {
         StateKind::PendingRecovery => 1,
         StateKind::PendingUnpair => 2,
         StateKind::SharingRound => 3,
-        StateKind::PendingSyncCheck => 4,
+        StateKind::PendingReplicaDiscovery => 4,
     }
 }
 
@@ -58,7 +58,7 @@ fn key_columns(key: &StateKey) -> (i64, i64, i64) {
         // open at once, so a single row per kind would let one overwrite
         // another.
         StateKey::SharingRound { version } => (kind, i64::from(*version), 0),
-        StateKey::PendingSyncCheck => (kind, 0, 0),
+        StateKey::PendingReplicaDiscovery => (kind, 0, 0),
     }
 }
 

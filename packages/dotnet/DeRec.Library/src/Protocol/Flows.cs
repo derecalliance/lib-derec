@@ -28,12 +28,12 @@ public enum FlowKind : uint
     /// Ask the replica group whether this device is behind, and catch up if
     /// it is. Replica-only; takes no parameters.
     /// </summary>
-    SyncCheck = 7,
+    ReplicaDiscovery = 7,
     /// <summary>
     /// Remove a member from the replica group. Replica-only. Naming this
     /// device is a voluntary departure; naming another is an eviction.
     /// </summary>
-    RemoveReplica = 8,
+    UnpairReplica = 8,
 }
 
 /// <summary>
@@ -177,9 +177,26 @@ public sealed record UpdateChannelInfoParams
     [JsonPropertyName("communication_info")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public Dictionary<string, string>? CommunicationInfo { get; init; }
+    /// <summary>
+    /// Replaces the target(s)' view of this node's transport endpoint.
+    /// </summary>
+    /// <remarks>
+    /// Superseded by <see cref="OwnTransports"/>, which carries every
+    /// endpoint rather than one. Scheduled for removal in v0.0.5;
+    /// <see cref="OwnTransports"/> takes precedence when both are set.
+    /// </remarks>
+    [Obsolete("Superseded by OwnTransports. Scheduled for removal in v0.0.5.")]
     [JsonPropertyName("transport_protocol")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public TransportProtocolDto? TransportProtocol { get; init; }
+
+    /// <summary>
+    /// Every endpoint this node now serves, in its own preference order.
+    /// Empty leaves the target(s)' stored set untouched.
+    /// </summary>
+    [JsonPropertyName("own_transports")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public IReadOnlyList<TransportProtocolDto>? OwnTransports { get; init; }
 
     public sealed record TransportProtocolDto
     {
@@ -189,17 +206,17 @@ public sealed record UpdateChannelInfoParams
 }
 
 /// <summary>
-/// Params for <see cref="FlowKind.SyncCheck"/>.
+/// Params for <see cref="FlowKind.ReplicaDiscovery"/>.
 /// </summary>
 /// <remarks>
 /// The flow takes none: the group and this device's own version are both read
 /// from the stores. Present so every flow kind has a params type and
 /// <see cref="DeRecProtocol.StartAsync"/> reads uniformly at the call site.
 /// </remarks>
-public sealed record SyncCheckParams;
+public sealed record ReplicaDiscoveryParams;
 
 /// <summary>
-/// Params for <see cref="FlowKind.RemoveReplica"/>.
+/// Params for <see cref="FlowKind.UnpairReplica"/>.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -220,7 +237,7 @@ public sealed record SyncCheckParams;
 /// therefore cannot complete a removal.
 /// </para>
 /// </remarks>
-public sealed record RemoveReplicaParams
+public sealed record UnpairReplicaParams
 {
     [JsonPropertyName("replica_id")] public required string ReplicaId { get; init; }
 
@@ -425,7 +442,7 @@ public sealed record PrePairRejectedEvent : DeRecEvent
 
 public sealed record HelperInfo(
     [property: JsonPropertyName("channel_id")] string ChannelId,
-    [property: JsonPropertyName("transport_uri")] string TransportUri,
+    [property: JsonPropertyName("transports")] IReadOnlyList<TransportProtocol> Transports,
     [property: JsonPropertyName("shared_key")] byte[] SharedKey,
     [property: JsonPropertyName("communication_info")] Dictionary<string, string> CommunicationInfo);
 
@@ -436,7 +453,7 @@ public sealed record HelperInfo(
 /// </summary>
 public sealed record ReplicaInfo(
     [property: JsonPropertyName("replica_id")] string ReplicaId,
-    [property: JsonPropertyName("transport_uri")] string TransportUri,
+    [property: JsonPropertyName("transports")] IReadOnlyList<TransportProtocol> Transports,
     [property: JsonPropertyName("role")] string Role,
     [property: JsonPropertyName("communication_info")] Dictionary<string, string> CommunicationInfo);
 
@@ -512,9 +529,9 @@ public sealed record SelfRemovedFromGroupEvent : DeRecEvent
 /// A replica catch-up finished. <c>FetchedFrom</c> is null when this device
 /// was already current, in which case no hydration event follows.
 /// </summary>
-public sealed record SyncCheckCompleteEvent : DeRecEvent
+public sealed record ReplicaDiscoveryCompleteEvent : DeRecEvent
 {
-    public override string EventType => "SyncCheckComplete";
+    public override string EventType => "ReplicaDiscoveryComplete";
     public required uint LocalVersion { get; init; }
     public required uint GroupVersion { get; init; }
     public string? FetchedFrom { get; init; }
@@ -622,12 +639,22 @@ public sealed record PairingStartedEvent : DeRecEvent
     public override string EventType => "PairingStarted";
     public required string ChannelId { get; init; }
     public required Pairing.SenderKind Kind { get; init; }
+
+    /// <summary>The token identifying the round this request belongs to.
+    /// One is drawn per <c>Start</c> call, so a fan-out shares it across all
+    /// of its targets, and the peer echoes it on the response.</summary>
+    public required string TraceId { get; init; }
 }
 
 public sealed record DiscoveryStartedEvent : DeRecEvent
 {
     public override string EventType => "DiscoveryStarted";
     public required string ChannelId { get; init; }
+
+    /// <summary>The token identifying the round this request belongs to.
+    /// One is drawn per <c>Start</c> call, so a fan-out shares it across all
+    /// of its targets, and the peer echoes it on the response.</summary>
+    public required string TraceId { get; init; }
 }
 
 public sealed record DiscoveryFailedEvent : DeRecEvent
@@ -642,6 +669,11 @@ public sealed record ProtectSecretStartedEvent : DeRecEvent
     public override string EventType => "ProtectSecretStarted";
     public required string ChannelId { get; init; }
     public required uint Version { get; init; }
+
+    /// <summary>The token identifying the round this request belongs to.
+    /// One is drawn per <c>Start</c> call, so a fan-out shares it across all
+    /// of its targets, and the peer echoes it on the response.</summary>
+    public required string TraceId { get; init; }
 }
 
 public sealed record ProtectSecretFailedEvent : DeRecEvent
@@ -657,6 +689,11 @@ public sealed record VerifySharesStartedEvent : DeRecEvent
     public override string EventType => "VerifySharesStarted";
     public required string ChannelId { get; init; }
     public required uint Version { get; init; }
+
+    /// <summary>The token identifying the round this request belongs to.
+    /// One is drawn per <c>Start</c> call, so a fan-out shares it across all
+    /// of its targets, and the peer echoes it on the response.</summary>
+    public required string TraceId { get; init; }
 }
 
 public sealed record VerifySharesFailedEvent : DeRecEvent
@@ -672,6 +709,11 @@ public sealed record RecoverSecretStartedEvent : DeRecEvent
     public override string EventType => "RecoverSecretStarted";
     public required string ChannelId { get; init; }
     public required uint Version { get; init; }
+
+    /// <summary>The token identifying the round this request belongs to.
+    /// One is drawn per <c>Start</c> call, so a fan-out shares it across all
+    /// of its targets, and the peer echoes it on the response.</summary>
+    public required string TraceId { get; init; }
 }
 
 public sealed record RecoverSecretFailedEvent : DeRecEvent
@@ -693,12 +735,22 @@ public sealed record UnpairStartedEvent : DeRecEvent
 {
     public override string EventType => "UnpairStarted";
     public required string ChannelId { get; init; }
+
+    /// <summary>The token identifying the round this request belongs to.
+    /// One is drawn per <c>Start</c> call, so a fan-out shares it across all
+    /// of its targets, and the peer echoes it on the response.</summary>
+    public required string TraceId { get; init; }
 }
 
 public sealed record UpdateChannelInfoStartedEvent : DeRecEvent
 {
     public override string EventType => "UpdateChannelInfoStarted";
     public required string ChannelId { get; init; }
+
+    /// <summary>The token identifying the round this request belongs to.
+    /// One is drawn per <c>Start</c> call, so a fan-out shares it across all
+    /// of its targets, and the peer echoes it on the response.</summary>
+    public required string TraceId { get; init; }
 }
 
 public sealed record UpdateChannelInfoFailedEvent : DeRecEvent
@@ -847,7 +899,7 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             {
                 Version = root.GetProperty("version").GetUInt32(),
             },
-            "SyncCheckComplete" => new SyncCheckCompleteEvent
+            "ReplicaDiscoveryComplete" => new ReplicaDiscoveryCompleteEvent
             {
                 LocalVersion = root.GetProperty("local_version").GetUInt32(),
                 GroupVersion = root.GetProperty("group_version").GetUInt32(),
@@ -890,10 +942,12 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             {
                 ChannelId = root.GetProperty("channel_id").GetString()!,
                 Kind = (Pairing.SenderKind)root.GetProperty("kind").GetInt32(),
+                TraceId = root.GetProperty("trace_id").GetString()!,
             },
             "DiscoveryStarted" => new DiscoveryStartedEvent
             {
                 ChannelId = root.GetProperty("channel_id").GetString()!,
+                TraceId = root.GetProperty("trace_id").GetString()!,
             },
             "DiscoveryFailed" => new DiscoveryFailedEvent
             {
@@ -904,6 +958,7 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             {
                 ChannelId = root.GetProperty("channel_id").GetString()!,
                 Version = root.GetProperty("version").GetUInt32(),
+                TraceId = root.GetProperty("trace_id").GetString()!,
             },
             "ProtectSecretFailed" => new ProtectSecretFailedEvent
             {
@@ -915,6 +970,7 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             {
                 ChannelId = root.GetProperty("channel_id").GetString()!,
                 Version = root.GetProperty("version").GetUInt32(),
+                TraceId = root.GetProperty("trace_id").GetString()!,
             },
             "VerifySharesFailed" => new VerifySharesFailedEvent
             {
@@ -926,6 +982,7 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             {
                 ChannelId = root.GetProperty("channel_id").GetString()!,
                 Version = root.GetProperty("version").GetUInt32(),
+                TraceId = root.GetProperty("trace_id").GetString()!,
             },
             "RecoverSecretFailed" => new RecoverSecretFailedEvent
             {
@@ -941,10 +998,12 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             "UnpairStarted" => new UnpairStartedEvent
             {
                 ChannelId = root.GetProperty("channel_id").GetString()!,
+                TraceId = root.GetProperty("trace_id").GetString()!,
             },
             "UpdateChannelInfoStarted" => new UpdateChannelInfoStartedEvent
             {
                 ChannelId = root.GetProperty("channel_id").GetString()!,
+                TraceId = root.GetProperty("trace_id").GetString()!,
             },
             "UpdateChannelInfoFailed" => new UpdateChannelInfoFailedEvent
             {
@@ -971,6 +1030,34 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
         var out_ = new List<string>(el.GetArrayLength());
         foreach (var item in el.EnumerateArray()) out_.Add(item.GetString()!);
         return out_;
+    }
+
+    /// <summary>
+    /// Reads a member's <c>transports</c> array. Absent on a payload written
+    /// before the list existed, where the single endpoint was recorded under
+    /// <c>transport_uri</c> with no protocol discriminant — read as HTTPS,
+    /// which is the only protocol those payloads could carry.
+    /// </summary>
+    private static IReadOnlyList<TransportProtocol> ReadEndpoints(System.Text.Json.JsonElement member)
+    {
+        if (member.TryGetProperty("transports", out var transports)
+            && transports.ValueKind == System.Text.Json.JsonValueKind.Array)
+        {
+            var endpoints = new List<TransportProtocol>();
+            foreach (var t in transports.EnumerateArray())
+            {
+                endpoints.Add(new TransportProtocol(
+                    t.GetProperty("uri").GetString()!,
+                    (Protocol)(t.TryGetProperty("protocol", out var p) ? p.GetInt32() : 0)));
+            }
+            return endpoints;
+        }
+        if (member.TryGetProperty("transport_uri", out var legacy)
+            && legacy.ValueKind == System.Text.Json.JsonValueKind.String)
+        {
+            return new[] { new TransportProtocol(legacy.GetString()!) };
+        }
+        return Array.Empty<TransportProtocol>();
     }
 
     private static Dictionary<string, string> ReadStringMap(System.Text.Json.JsonElement el)
@@ -1029,7 +1116,7 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
         {
             helpers.Add(new HelperInfo(
                 h.GetProperty("channel_id").GetString()!,
-                h.GetProperty("transport_uri").GetString()!,
+                ReadEndpoints(h),
                 ReadByteArray(h.GetProperty("shared_key")),
                 h.TryGetProperty("communication_info", out var hci) ? ReadStringMap(hci) : new()));
         }
@@ -1052,7 +1139,7 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             {
                 members.Add(new ReplicaInfo(
                     r.GetProperty("replica_id").GetString()!,
-                    r.GetProperty("transport_uri").GetString()!,
+                    ReadEndpoints(r),
                     r.GetProperty("role").GetString()!,
                     r.TryGetProperty("communication_info", out var rci) ? ReadStringMap(rci) : new()));
             }

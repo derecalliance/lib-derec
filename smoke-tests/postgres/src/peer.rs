@@ -115,7 +115,7 @@ impl Peer {
             .with_user_secret_store(user_secret_store)
             .with_transport(transport.clone())
             .with_state_store(state_store)
-            .with_own_transport(uri)
+            .with_own_transports([uri])
             .with_threshold(options.threshold)
             .with_auto_accept(auto_accept);
         if let Some(rid) = options.replica_id {

@@ -6,14 +6,21 @@
 //! optional keys are omitted when absent/empty.
 
 use std::collections::HashMap;
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
+#[cfg(test)]
+use std::io::Write as _;
 
-use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+use flate2::read::GzDecoder;
+#[cfg(test)]
+use flate2::{Compression, write::GzEncoder};
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::types::secret::SecretError;
 use crate::protocol::types::{HelperInfo, ReplicaInfo, ReplicaRole, Replicas, Secret, UserSecret};
 
+/// Only the tests build v2 payloads now — decoding is v2's whole remaining
+/// job, so nothing in production compresses one.
+#[cfg(test)]
 fn gzip(data: &[u8]) -> Vec<u8> {
     let mut enc = GzEncoder::new(Vec::new(), Compression::default());
     enc.write_all(data)
@@ -122,16 +129,6 @@ struct ReplicaInfoJson {
     communication_info: HashMap<String, String>,
 }
 
-impl From<&Secret> for SecretJson {
-    fn from(s: &Secret) -> Self {
-        SecretJson {
-            helpers: s.helpers.iter().map(HelperJson::from).collect(),
-            secrets: s.secrets.iter().map(UserSecretJson::from).collect(),
-            replicas: s.replicas.as_ref().map(ReplicasJson::from),
-        }
-    }
-}
-
 impl From<SecretJson> for Secret {
     fn from(j: SecretJson) -> Self {
         Secret {
@@ -142,36 +139,17 @@ impl From<SecretJson> for Secret {
     }
 }
 
-impl From<&HelperInfo> for HelperJson {
-    fn from(h: &HelperInfo) -> Self {
-        HelperJson {
-            channel_id: h.channel_id,
-            transport_uri: h.transport_uri.clone(),
-            shared_key: h.shared_key.clone(),
-            communication_info: h.communication_info.clone(),
-        }
-    }
-}
 impl From<HelperJson> for HelperInfo {
     fn from(j: HelperJson) -> Self {
         HelperInfo {
             channel_id: j.channel_id,
-            transport_uri: j.transport_uri,
+            transports: lift_endpoint(&j.transport_uri),
             shared_key: j.shared_key,
             communication_info: j.communication_info,
         }
     }
 }
 
-impl From<&UserSecret> for UserSecretJson {
-    fn from(u: &UserSecret) -> Self {
-        UserSecretJson {
-            id: u.id.clone(),
-            name: u.name.clone(),
-            data: u.data.clone(),
-        }
-    }
-}
 impl From<UserSecretJson> for UserSecret {
     fn from(j: UserSecretJson) -> Self {
         UserSecret {
@@ -182,15 +160,6 @@ impl From<UserSecretJson> for UserSecret {
     }
 }
 
-impl From<&Replicas> for ReplicasJson {
-    fn from(r: &Replicas) -> Self {
-        ReplicasJson {
-            channel_id: r.channel_id,
-            shared_key: r.shared_key.clone(),
-            members: r.members.iter().map(ReplicaInfoJson::from).collect(),
-        }
-    }
-}
 impl From<ReplicasJson> for Replicas {
     fn from(j: ReplicasJson) -> Self {
         Replicas {
@@ -201,35 +170,15 @@ impl From<ReplicasJson> for Replicas {
     }
 }
 
-impl From<&ReplicaInfo> for ReplicaInfoJson {
-    fn from(r: &ReplicaInfo) -> Self {
-        ReplicaInfoJson {
-            replica_id: r.replica_id,
-            transport_uri: r.transport_uri.clone(),
-            // An out-of-range discriminant cannot reach the wire: the roster
-            // is built from `ReplicaMember` rows, whose role is typed.
-            role: ReplicaRole::from_i32(r.role).unwrap_or(ReplicaRole::Destination),
-            communication_info: r.communication_info.clone(),
-        }
-    }
-}
 impl From<ReplicaInfoJson> for ReplicaInfo {
     fn from(j: ReplicaInfoJson) -> Self {
         ReplicaInfo {
             replica_id: j.replica_id,
-            transport_uri: j.transport_uri,
+            transports: lift_endpoint(&j.transport_uri),
             role: j.role as i32,
             communication_info: j.communication_info,
         }
     }
-}
-
-/// Encode the v2 payload (no version prefix): gzip-compressed JSON.
-pub fn encode(secret: &Secret) -> Vec<u8> {
-    let dto = SecretJson::from(secret);
-    let json =
-        serde_json::to_vec(&dto).expect("Secret JSON serialization is infallible for owned data");
-    gzip(&json)
 }
 
 /// Decode a v2 payload (no version prefix) back into a [`Secret`].
@@ -239,119 +188,143 @@ pub fn decode(payload: &[u8]) -> Result<Secret, SecretError> {
     Ok(Secret::from(dto))
 }
 
+/// Lift a v2 single-URI endpoint into the current list-of-endpoints shape.
+///
+/// v2 stored a bare `transport_uri`, so the protocol discriminant has to be
+/// recovered from the scheme. That reconstruction is exactly what this
+/// format's successor exists to retire — v3 stores the discriminant — but it
+/// is sound here because a v2 roster could only ever have been written when
+/// HTTPS was the only transport, or by a writer whose scheme still names its
+/// protocol unambiguously.
+///
+/// An unparseable URI yields an empty list rather than a guessed endpoint:
+/// a peer with no reachable endpoint is recoverable information, a peer with
+/// a *wrong* one is not.
+fn lift_endpoint(uri: &str) -> Vec<derec_proto::TransportProtocol> {
+    match crate::transport::TransportProtocol::try_from(uri) {
+        Ok(tp) => vec![tp.into()],
+        Err(_error) => {
+            #[cfg(feature = "logging")]
+            tracing::warn!(
+                uri = %uri,
+                error = %_error,
+                "v2 roster entry has an unusable transport uri; recovering the \
+                 peer without an endpoint rather than guessing one",
+            );
+            Vec::new()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use derec_proto::Protocol;
 
-    fn full_secret() -> Secret {
-        Secret {
-            helpers: vec![HelperInfo {
-                channel_id: 1_000_000,
-                transport_uri: "https://helper-0.example.org/derec".to_owned(),
-                shared_key: vec![0xAA; 32],
-                communication_info: HashMap::from([("name".to_owned(), "Helper 0".to_owned())]),
+    /// Build a v2 payload the way a pre-0.0.3 writer would have: gzipped
+    /// JSON with a single `transport_uri` string per roster entry.
+    ///
+    /// Written by hand rather than by a v2 encoder, because v2 can no longer
+    /// encode — a multi-endpoint roster has no faithful v2 representation,
+    /// and an encoder that silently dropped endpoints would be worse than
+    /// none.
+    fn v2_payload(helper_uri: &str, member_uri: &str) -> Vec<u8> {
+        let json = format!(
+            r#"{{
+                "helpers": [{{
+                    "channel_id": "7",
+                    "transport_uri": "{helper_uri}",
+                    "shared_key": "AAAA",
+                    "communication_info": {{"name": "helper-a"}}
+                }}],
+                "secrets": [],
+                "replicas": {{
+                    "channel_id": "9",
+                    "shared_key": "AAAA",
+                    "members": [{{
+                        "replica_id": "3",
+                        "transport_uri": "{member_uri}",
+                        "role": "Source",
+                        "communication_info": {{}}
+                    }}]
+                }}
+            }}"#
+        );
+        gzip(json.as_bytes())
+    }
+
+    /// The compatibility guarantee: a secret protected before multi-endpoint
+    /// support still decodes, and each single URI becomes a one-element list.
+    #[test]
+    fn v2_payload_lifts_into_the_current_shape() {
+        let secret = decode(&v2_payload(
+            "https://helper-a.example/derec",
+            "https://replica.example/derec",
+        ))
+        .expect("a v2 payload must still decode");
+
+        assert_eq!(secret.helpers.len(), 1);
+        assert_eq!(secret.helpers[0].channel_id, 7);
+        assert_eq!(
+            secret.helpers[0].transports,
+            vec![derec_proto::TransportProtocol {
+                uri: "https://helper-a.example/derec".to_owned(),
+                protocol: Protocol::Https as i32,
             }],
-            secrets: vec![UserSecret {
-                id: vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
-                name: "Gmail".to_owned(),
-                data: b"correct horse battery staple".to_vec(),
-            }],
-            replicas: Some(Replicas {
-                channel_id: 2_000_000,
-                members: vec![
-                    ReplicaInfo {
-                        replica_id: 900_000,
-                        transport_uri: "https://replica-0.example.org/derec".to_owned(),
-                        role: ReplicaRole::Source as i32,
-                        communication_info: HashMap::new(),
-                    },
-                    ReplicaInfo {
-                        replica_id: 900_001,
-                        transport_uri: "https://replica-1.example.org/derec".to_owned(),
-                        role: ReplicaRole::Destination as i32,
-                        communication_info: HashMap::new(),
-                    },
-                ],
-                shared_key: vec![0x55; 32],
-            }),
-        }
-    }
-
-    #[test]
-    fn payload_round_trips() {
-        let secret = full_secret();
-        assert_eq!(decode(&encode(&secret)).unwrap(), secret);
-    }
-
-    #[test]
-    fn u64_fields_survive_beyond_2_pow_53() {
-        let mut secret = full_secret();
-        secret.helpers[0].channel_id = (1u64 << 53) + 7;
-        let replicas = secret.replicas.as_mut().expect("fixture has replicas");
-        replicas.channel_id = u64::MAX;
-        replicas.members[0].replica_id = u64::MAX - 1;
-        let decoded = decode(&encode(&secret)).expect("large u64 must round-trip");
-        assert_eq!(decoded.helpers[0].channel_id, (1u64 << 53) + 7);
-        let decoded_replicas = decoded.replicas.expect("replicas survive");
-        assert_eq!(decoded_replicas.channel_id, u64::MAX);
-        assert_eq!(decoded_replicas.members[0].replica_id, u64::MAX - 1);
-    }
-
-    /// The roster names its source by role, so a decoded payload must be able
-    /// to answer "who is the source" without a separate field.
-    #[test]
-    fn role_survives_the_round_trip_and_names_one_source() {
-        let decoded = decode(&encode(&full_secret())).expect("round trip");
-        let members = decoded.replicas.expect("replicas survive").members;
-        let sources: Vec<u64> = members
-            .iter()
-            .filter(|m| m.role == ReplicaRole::Source as i32)
-            .map(|m| m.replica_id)
-            .collect();
-        assert_eq!(sources, vec![900_000], "exactly one member is the source");
-    }
-
-    /// `role` rides the wire as its variant name, not as an integer — the
-    /// shape other SDKs decode against.
-    #[test]
-    fn role_serializes_as_its_variant_name() {
-        let json = String::from_utf8(gunzip(&encode(&full_secret())).unwrap()).unwrap();
-        assert!(json.contains(r#""role":"Source""#), "got: {json}");
-        assert!(json.contains(r#""role":"Destination""#), "got: {json}");
-    }
-
-    #[test]
-    fn omits_absent_and_empty_fields() {
-        let mut secret = full_secret();
-        secret.replicas = None;
-        secret.helpers[0].communication_info.clear();
-        let json = String::from_utf8(gunzip(&encode(&secret)).unwrap()).unwrap();
-        assert!(
-            !json.contains("replicas"),
-            "absent replicas must be omitted"
         );
-        assert!(
-            !json.contains("communication_info"),
-            "empty communication_info must be omitted"
+
+        let members = &secret.replicas.as_ref().expect("replicas present").members;
+        assert_eq!(members.len(), 1);
+        assert_eq!(
+            members[0].transports[0].uri,
+            "https://replica.example/derec"
         );
-        assert!(
-            !json.contains("version"),
-            "v2 JSON must not carry a version field"
+    }
+
+    /// The discriminant comes from the scheme, so a v2 roster written by a
+    /// gRPC-capable peer lifts to `Grpc` rather than being flattened to
+    /// HTTPS — the failure that made v3 store the discriminant outright.
+    #[test]
+    fn v2_lift_derives_the_discriminant_from_the_scheme() {
+        let secret = decode(&v2_payload(
+            "grpcs://helper-a.example:443",
+            "grpcs://replica.example:443",
+        ))
+        .expect("decodes");
+
+        assert_eq!(
+            secret.helpers[0].transports[0].protocol,
+            Protocol::Grpc as i32
+        );
+        assert_eq!(
+            secret.replicas.as_ref().unwrap().members[0].transports[0].protocol,
+            Protocol::Grpc as i32,
+        );
+    }
+
+    /// A URI whose scheme names no known transport cannot be lifted into a
+    /// truthful endpoint. Recover the peer without one rather than inventing
+    /// a protocol for it.
+    #[test]
+    fn v2_lift_drops_an_unusable_uri_rather_than_guessing() {
+        let secret = decode(&v2_payload(
+            "ws://helper-a.example",
+            "https://replica.example",
+        ))
+        .expect("decodes");
+
+        assert!(secret.helpers[0].transports.is_empty());
+        assert_eq!(
+            secret.replicas.as_ref().unwrap().members[0]
+                .transports
+                .len(),
+            1,
+            "one bad entry must not affect the others"
         );
     }
 
     #[test]
-    fn payload_rejects_non_gzip() {
-        let err = decode(&[0x01, 0x02, 0x03]).expect_err("non-gzip must fail");
-        assert!(matches!(err, SecretError::Decompression));
-    }
-
-    #[test]
-    fn decoder_tolerates_null_and_missing_optional_fields() {
-        let json = br#"{"helpers":[{"channel_id":"2","transport_uri":"u","shared_key":"qqqqqg==","communication_info":null}]}"#;
-        let decoded = decode(&gzip(json)).expect("null/absent optionals must decode");
-        assert!(decoded.replicas.is_none());
-        assert!(decoded.secrets.is_empty());
-        assert!(decoded.helpers[0].communication_info.is_empty());
+    fn a_truncated_payload_is_an_error_not_a_panic() {
+        assert!(decode(b"not gzip").is_err());
     }
 }

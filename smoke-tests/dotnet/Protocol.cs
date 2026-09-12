@@ -17,6 +17,49 @@ using DeRec.Library.Primitives;
 
 namespace DeRec.Bindings.Smoke;
 
+/// <summary>
+/// Drives <see cref="DeRecProtocol.ProcessAsync"/> and accepts every
+/// <see cref="ActionRequiredEvent"/> it emits, returning the flat list.
+/// </summary>
+/// <remarks>
+/// <para>
+/// A test helper, and deliberately not part of the shipped SDK — its four
+/// peers are private helpers in their own suites (`processAll` in the Node,
+/// web and React Native smokes). It lived on <c>DeRecProtocol</c> until an SDK
+/// parity audit found it was the one method .NET exposed that no other binding
+/// did, with no caller outside this file.
+/// </para>
+/// <para>
+/// It is the wrong shape for production code twice over. Accepting every
+/// action whatever its kind defeats the point of
+/// <see cref="ActionRequiredEvent"/>, which is where an application applies
+/// its own admission control — share-size caps, rate limits, a user declining;
+/// <see cref="AutoAcceptPolicy"/> is how you opt into automatic acceptance,
+/// and it is selective per flow kind. And it does not iterate to a fixpoint:
+/// events produced by <c>AcceptAsync</c> are never re-scanned for further
+/// actions, which suits a test that knows its own message flow and would need
+/// defining for anything else.
+/// </para>
+/// </remarks>
+internal static class ProtocolTestExtensions
+{
+    internal static async Task<IReadOnlyList<DeRecEvent>> ProcessAndAcceptAllAsync(
+        this DeRecProtocol protocol,
+        byte[] message)
+    {
+        var initial = await protocol.ProcessAsync(message);
+        var combined = new List<DeRecEvent>(initial);
+        foreach (var ev in initial)
+        {
+            if (ev is ActionRequiredEvent ar)
+            {
+                combined.AddRange(await protocol.AcceptAsync(ar.Action));
+            }
+        }
+        return combined;
+    }
+}
+
 internal static class Protocol
 {
     public static void RunAll()
@@ -39,6 +82,7 @@ internal static class Protocol
         RunOrchestratorExpiredChannelCleanupTest();
         RunOrchestratorTickTest();
         RunEnumFixtureTest();
+        RunConfigSurfaceTest();
     }
 
     /// <summary>
@@ -254,7 +298,7 @@ internal static class Protocol
         // Pre-seed: a paired channel + its 32-byte SharedKey.
         channelStore.Save(DefaultTestSecretId, ChannelRecord.Of(new HelperChannel(
             ChannelId: channelId,
-            Transport: new TransportProtocol("https://peer.example.com"),
+            Transports: new[] { new TransportProtocol("https://peer.example.com") },
             CommunicationInfo: new Dictionary<string, string>(),
             Status: ChannelStatus.Paired,
             CreatedAt: 1700000000UL,
@@ -312,7 +356,7 @@ internal static class Protocol
         node.ChannelStore.Save(node.Protocol.SecretId, ChannelRecord.Of(new ReplicaMember(
             ChannelId: channelId,
             ReplicaId: 0xcafeUL,
-            Transport: new TransportProtocol("https://peer.example.com"),
+            Transports: new[] { new TransportProtocol("https://peer.example.com") },
             CommunicationInfo: new Dictionary<string, string>(),
             Role: ReplicaRole.Destination,
             Status: ChannelStatus.Pending,
@@ -1086,9 +1130,9 @@ internal static class Protocol
         // URI and communication-info map.
         var helperChannel = helper.ChannelStore.Load(helper.Protocol.SecretId, rekeyedId, 0)?.Helper
             ?? throw new InvalidOperationException("helper channel record must still exist");
-        if (helperChannel.Transport.Uri != newUri)
+        if (helperChannel.Transports[0].Uri != newUri)
             throw new InvalidOperationException(
-                $"helper's stored Transport.Uri must reflect the announced update; got {helperChannel.Transport.Uri}");
+                $"helper's stored Transports[0].Uri must reflect the announced update; got {helperChannel.Transports[0].Uri}");
         foreach (var (k, v) in newInfo)
         {
             if (!helperChannel.CommunicationInfo.TryGetValue(k, out var stored) || stored != v)
@@ -1138,10 +1182,13 @@ internal static class Protocol
         byte[] sharedKey = helper.SecretStore.Load(helper.Protocol.SecretId, rekeyedId, SecretKind.SharedKey)!.Bytes;
         var extracted = Discovery.Request.Extract(
             DeRecMessage.FromProtoBytes(outBytes), sharedKey);
-        if (extracted.ReplyTo is null || extracted.ReplyTo.Uri != ownerUri)
+        // reply_to is a list now: autoReplyTo advertises every endpoint this
+        // device serves, leading with its own transport.
+        if (extracted.ReplyTo.Count == 0 || extracted.ReplyTo[0].Uri != ownerUri)
             throw new InvalidOperationException(
-                $"autoReplyTo envelope must stamp reply_to = ownerUri; got {extracted.ReplyTo?.Uri ?? "<null>"}");
-        Console.WriteLine($"  autoReplyTo envelope.reply_to = {extracted.ReplyTo.Uri}  ✓");
+                "autoReplyTo envelope must stamp reply_to leading with ownerUri; got "
+                    + (extracted.ReplyTo.Count == 0 ? "<empty>" : extracted.ReplyTo[0].Uri));
+        Console.WriteLine($"  autoReplyTo envelope.reply_to = {extracted.ReplyTo[0].Uri}  ✓");
 
         // Sanity: a node WITHOUT autoReplyTo. The same field must be unset.
         using var helper2 = MakeNode("Helper", helperUri);
@@ -1156,9 +1203,9 @@ internal static class Protocol
         byte[] sharedKey2 = helper2.SecretStore.Load(helper2.Protocol.SecretId, rekeyedId2, SecretKind.SharedKey)!.Bytes;
         var extracted2 = Discovery.Request.Extract(
             DeRecMessage.FromProtoBytes(defaultBytes), sharedKey2);
-        if (extracted2.ReplyTo is not null)
+        if (extracted2.ReplyTo.Count != 0)
             throw new InvalidOperationException(
-                $"default envelope must leave reply_to unset; got {extracted2.ReplyTo.Uri}");
+                $"default envelope must leave reply_to empty; got {extracted2.ReplyTo[0].Uri}");
         Console.WriteLine("  default envelope.reply_to is unset  ✓");
 
         Console.WriteLine("Orchestrator replyTo flow test passed.");
@@ -1479,12 +1526,12 @@ internal static class Protocol
             throw new InvalidOperationException(
                 $"replica {label} secret count: expected {secrets}, got {snapshot.Secrets.Length}");
 
-        var storedHelpers = peer.ChannelStore.ListHelpers(secretId).Count();
+        var storedHelpers = peer.ChannelStore.ListHelpers(secretId, HelperFilter.Any).Count();
         if (storedHelpers != helpers)
             throw new InvalidOperationException(
                 $"replica {label} must have materialised {helpers} helper channel(s), got {storedHelpers}");
 
-        var roster = peer.ChannelStore.ListReplicas(secretId).ToList();
+        var roster = peer.ChannelStore.ListReplicas(secretId, ReplicaFilter.Any).ToList();
         if (roster.Count != members)
             throw new InvalidOperationException(
                 $"replica {label} roster size: expected {members}, got {roster.Count}");
@@ -1771,26 +1818,26 @@ internal static class Protocol
     /// </remarks>
     private static void RunNewFlowParamsTest()
     {
-        Console.WriteLine("=== Orchestrator SyncCheck/RemoveReplica params test ===");
+        Console.WriteLine("=== Orchestrator ReplicaDiscovery/UnpairReplica params test ===");
 
-        string syncJson = JsonSerializer.Serialize(new SyncCheckParams());
+        string syncJson = JsonSerializer.Serialize(new ReplicaDiscoveryParams());
         if (syncJson != "{}")
             throw new InvalidOperationException(
-                $"SyncCheckParams must serialize to an empty object, got {syncJson}");
-        Console.WriteLine("  SyncCheckParams serializes to {}  ✓");
+                $"ReplicaDiscoveryParams must serialize to an empty object, got {syncJson}");
+        Console.WriteLine("  ReplicaDiscoveryParams serializes to {}  ✓");
 
         string removeJson = JsonSerializer.Serialize(
-            new RemoveReplicaParams { ReplicaId = "51966", Memo = "retired device" });
+            new UnpairReplicaParams { ReplicaId = "51966", Memo = "retired device" });
         if (!removeJson.Contains("\"replica_id\":\"51966\""))
             throw new InvalidOperationException(
                 $"replica_id must be a decimal string under that exact key, got {removeJson}");
         if (!removeJson.Contains("\"memo\":\"retired device\""))
             throw new InvalidOperationException($"memo missing from {removeJson}");
-        Console.WriteLine("  RemoveReplicaParams carries a decimal replica_id + memo  ✓");
+        Console.WriteLine("  UnpairReplicaParams carries a decimal replica_id + memo  ✓");
 
         // memo is optional and must be omitted rather than sent as null —
         // Rust reads it with `#[serde(default)]` on an Option.
-        string noMemo = JsonSerializer.Serialize(new RemoveReplicaParams { ReplicaId = "7" });
+        string noMemo = JsonSerializer.Serialize(new UnpairReplicaParams { ReplicaId = "7" });
         if (noMemo.Contains("memo"))
             throw new InvalidOperationException($"absent memo must be omitted, got {noMemo}");
         Console.WriteLine("  an absent memo is omitted, not sent as null  ✓");
@@ -1801,8 +1848,8 @@ internal static class Protocol
             new NodeOptions(ReplicaId: 0xA11CE01UL));
         try
         {
-            node.Protocol.StartAsync(FlowKind.RemoveReplica,
-                new RemoveReplicaParams { ReplicaId = "999999" })
+            node.Protocol.StartAsync(FlowKind.UnpairReplica,
+                new UnpairReplicaParams { ReplicaId = "999999" })
                 .GetAwaiter().GetResult();
             throw new InvalidOperationException(
                 "removing a member that does not exist must fail");
@@ -1815,9 +1862,9 @@ internal static class Protocol
         {
             // Expected: the library parsed the params and refused the target.
         }
-        Console.WriteLine("  RemoveReplica reaches the library and rejects an unknown member  ✓");
+        Console.WriteLine("  UnpairReplica reaches the library and rejects an unknown member  ✓");
 
-        Console.WriteLine("Orchestrator SyncCheck/RemoveReplica params test passed.");
+        Console.WriteLine("Orchestrator ReplicaDiscovery/UnpairReplica params test passed.");
     }
 
     private static Node MakeNode(
@@ -1894,4 +1941,127 @@ internal static class Protocol
         Console.WriteLine("  cleanup: disabled policy forwarded with its timeout; manual sweep callable \u2713");
         Console.WriteLine("Protocol expired-channel cleanup test passed.");
     }
+    /// <summary>
+    /// The config knobs and validation rules an application reaches through
+    /// this SDK, each of which crosses the FFI as a JSON field. A mismatch
+    /// between the DTO's field names and the Rust <c>ProtocolConfig</c> would
+    /// silently drop the setting rather than fail, so each assertion here is
+    /// checking that the value actually arrived.
+    /// </summary>
+    private static void RunConfigSurfaceTest()
+    {
+        Console.WriteLine("=== Protocol config surface test ===");
+
+        DeRecProtocolBuilder Base() =>
+            new DeRecProtocolBuilder(DefaultTestSecretId)
+                .WithChannelStore(new InMemoryChannelStore())
+                .WithShareStore(new InMemoryShareStore())
+                .WithSecretStore(new InMemorySecretStore())
+                .WithUserSecretStore(new InMemoryUserSecretStore())
+                .WithStateStore(new InMemoryStateStore())
+                .WithTransport(new RecordingTransport())
+                .WithThreshold(DefaultThreshold);
+
+        // ParameterRange reaches the library. Bounds that cannot intersect any
+        // peer range would still build — this only proves the field is
+        // carried, which is what was missing before it existed in the FFI
+        // config.
+        using (Base()
+            .WithOwnTransport(new TransportProtocol("https://owner.example.com"))
+            .WithParameterRange(new ParameterRange
+            {
+                MinShareSize = 1,
+                MaxShareSize = 1 << 20,
+                MinTimeBetweenVerifications = 1,
+                MaxTimeBetweenVerifications = 3600,
+            })
+            .Build())
+        {
+            Console.WriteLine("  ParameterRange accepted by the FFI config  ✓");
+        }
+
+        // A device serves at most one endpoint per protocol: two HTTPS entries
+        // contradict rather than extend, so the set is refused even though
+        // each entry is individually well-formed.
+        var duplicate = false;
+        try
+        {
+            using var _ = Base()
+                .WithOwnTransports(new[]
+                {
+                    new TransportProtocol("https://a.example"),
+                    new TransportProtocol("https://b.example"),
+                })
+                .Build();
+        }
+        catch (DeRecException)
+        {
+            duplicate = true;
+        }
+        if (!duplicate)
+        {
+            throw new Exception(
+                "two endpoints of one protocol must be refused — the "
+                + "one-per-protocol rule is not reaching the library");
+        }
+        Console.WriteLine("  two endpoints of one protocol refused  ✓");
+
+        // Distinct protocols are what the list is for.
+        using (var p = Base()
+            .WithOwnTransports(new[]
+            {
+                new TransportProtocol("https://a.example"),
+                new TransportProtocol("grpcs://a.example:443", DeRec.Library.Protocol.Grpc),
+            })
+            .Build())
+        {
+            Console.WriteLine("  distinct protocols accepted  ✓");
+
+            // SetOwnTransport re-points one protocol and leaves the other
+            // alone; SetOwnTransports replaces the whole set.
+            p.SetOwnTransport("https://moved.example");
+            Console.WriteLine("  SetOwnTransport re-points a single protocol  ✓");
+
+            p.SetOwnTransports(new[] { new TransportProtocol("https://only.example") });
+            Console.WriteLine("  SetOwnTransports replaces the whole set  ✓");
+
+            var refused = false;
+            try
+            {
+                p.SetOwnTransports(new[]
+                {
+                    new TransportProtocol("https://a.example"),
+                    new TransportProtocol("https://b.example"),
+                });
+            }
+            catch (DeRecException)
+            {
+                refused = true;
+            }
+            if (!refused)
+            {
+                throw new Exception(
+                    "SetOwnTransports must apply the same one-per-protocol "
+                    + "rule as the builder");
+            }
+            Console.WriteLine("  SetOwnTransports refuses a duplicate protocol  ✓");
+        }
+
+        // The error constants mirror the Rust DEREC_CODE_* values. Drift here
+        // means an application branching on a code takes the wrong branch,
+        // which no other test would catch.
+        if (DeRecCode.ReplicaIdConflict != 16
+            || DeRecCode.NoUsableEndpoint != 121
+            || DeRecCode.RoleMismatch != 11
+            || DeRecCode.MalformedRecoveredSecret != 86
+            || DeRecCode.TransportInvalid != 120
+            || DeRecCategory.StateStore != 15)
+        {
+            throw new Exception("error code/category values drifted from the FFI");
+        }
+        Console.WriteLine("  error code/category values match the FFI  ✓");
+
+        Console.WriteLine("Protocol config surface test passed.\n");
+    }
+
 }

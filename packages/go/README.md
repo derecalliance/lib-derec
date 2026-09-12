@@ -275,6 +275,28 @@ For applications that don't want to drive the primitive produce/extract/process 
 - `protocol.StateStore` — in-flight orchestrator state (pending verification/recovery/unpair/sharing rounds)
 - `protocol.Transport` — outbound delivery (`Send(uri string, protocol int32, message []byte) error`)
 
+#### Filtered listings
+
+`ListHelpers` and `ListReplicas` take a filter — `ids`, `status`, `role` and
+`exclude`, where every empty value means "do not restrict on this", so an
+all-empty filter selects everything. `exclude` is applied last, overriding
+`ids`.
+
+**Apply it in your query.** That is the point: a `WHERE` clause or a
+key-condition expression instead of transferring rows the caller will discard.
+That transfer costs bandwidth everywhere, and on a metered backing such as
+DynamoDB, which bills by bytes read, it costs money.
+
+**A store that ignores it is slow, not wrong.** The library re-applies the
+filter to every listing before acting on it and drops anything the filter
+excluded.
+
+**That is a one-way guarantee, not a validation of your store.** Dropping rows
+enforces an upper bound; it cannot recover a row you omitted. A store that
+returns *fewer* rows than the filter selects is still wrong, in a way nothing
+in the library can detect — the protocol simply fails to act. Applying the
+filter faithfully is still your job.
+
 ### Constructing an instance
 
 ```go
@@ -359,7 +381,7 @@ All replicas of one `secretID` also share a single **group channel key**: every 
 
 `HashedKeys` ships only a SHA-384 binding hash in the contact and serves the actual public keys through a plaintext `PrePair` round-trip on the contact creator's own transport. Any party that can reach that URI before the legitimate scanner gets the keys. Use `HashedKeys` only with a transport endpoint that is freshly minted for the pairing and retired as soon as the `PrePair` leg completes. `ContactModeInlineKeys` has no such constraint.
 
-The recommended pattern: pair on the ephemeral URI, then — as soon as pairing completes on the contact-creator side — call `SetOwnTransport` with the permanent endpoint and start an `UpdateChannelInfo` flow to announce the swap. This keeps the plaintext `PrePair` window tight while subsequent traffic rides on the long-lived endpoint.
+The recommended pattern: pair on the ephemeral URI, then — as soon as pairing completes on the contact-creator side — call `SetOwnTransports` with the permanent endpoint (`SetOwnTransport` is deprecated and removed at 0.0.5) and start an `UpdateChannelInfo` flow to announce the swap. This keeps the plaintext `PrePair` window tight while subsequent traffic rides on the long-lived endpoint.
 
 ### Replica fingerprint verification is mandatory
 

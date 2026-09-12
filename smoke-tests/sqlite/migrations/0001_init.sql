@@ -4,25 +4,42 @@
 -- without leakage between them.
 
 -- Helper channels: unique per channel_id, one row per pairing.
+--
+-- `status` and `peer_role` are projected out of `data` into real columns so
+-- `DeRecChannelStore::helpers` can answer a filtered listing with a WHERE
+-- clause instead of decoding every blob and discarding most of them. They are
+-- a denormalization of the record and are rewritten on every save.
 CREATE TABLE channels (
     secret_id  INTEGER NOT NULL,
     channel_id INTEGER NOT NULL,
+    status     INTEGER NOT NULL,
+    peer_role  INTEGER NOT NULL,
     data       BLOB    NOT NULL,
     PRIMARY KEY (secret_id, channel_id)
 );
+
+CREATE INDEX channels_by_status_role
+    ON channels (secret_id, status, peer_role);
 
 -- Replica-group members. Keyed by `replica_id`, NOT by `channel_id`: every
 -- member of a group shares one channel, so a channel-keyed table would
 -- collide at the second member. `channel_id` is stored as an ordinary column
 -- because a member moves between channels during an admission handover while
 -- remaining the same member.
+-- `status` and `role` are projected out of `data` for the same reason as on
+-- `channels` above.
 CREATE TABLE replica_members (
     secret_id  INTEGER NOT NULL,
     replica_id INTEGER NOT NULL,
     channel_id INTEGER NOT NULL,
+    status     INTEGER NOT NULL,
+    role       INTEGER NOT NULL,
     data       BLOB    NOT NULL,
     PRIMARY KEY (secret_id, replica_id)
 );
+
+CREATE INDEX replica_members_by_status_role
+    ON replica_members (secret_id, status, role);
 
 -- Undirected adjacency list for the channel-link graph. Each link is
 -- materialized as two rows so a single index covers lookups from
@@ -73,7 +90,7 @@ CREATE TABLE user_secrets (
 --   PendingRecovery                     -> sub_a = recovered secret_id,
 --                                          sub_b = version
 --   SharingRound                        -> sub_a = version
---   PendingSyncCheck                    -> no secondary key, both 0
+--   PendingReplicaDiscovery                    -> no secondary key, both 0
 -- `kind` is part of the key, so the two channel-keyed kinds cannot collide.
 --
 -- SharingRound's version is load-bearing, not decoration. Several rounds can

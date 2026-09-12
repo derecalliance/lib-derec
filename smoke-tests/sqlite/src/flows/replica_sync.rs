@@ -3,7 +3,7 @@
 
 use derec_library::protocol::DeRecChannelStore;
 use derec_library::protocol::events::DeRecEvent;
-use derec_library::protocol::types::{Secret, UserSecret};
+use derec_library::protocol::types::{HelperFilter, ReplicaFilter, Secret, UserSecret};
 use derec_library::protocol::{ChannelShare, DeRecFlow, DeRecUserSecretStore};
 use derec_library::types::ChannelId;
 use derec_proto::SenderKind;
@@ -410,7 +410,7 @@ async fn assert_hydrated(
     let stored_helpers = peer
         .protocol
         .channel_store
-        .helpers(PROTECTED_SECRET_ID)
+        .helpers(PROTECTED_SECRET_ID, HelperFilter::default())
         .await
         .unwrap();
     assert_eq!(
@@ -422,7 +422,7 @@ async fn assert_hydrated(
     let roster = peer
         .protocol
         .channel_store
-        .replicas(PROTECTED_SECRET_ID)
+        .replicas(PROTECTED_SECRET_ID, ReplicaFilter::default())
         .await
         .unwrap();
     assert_eq!(

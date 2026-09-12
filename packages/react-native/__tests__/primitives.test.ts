@@ -137,12 +137,16 @@ describe('message marshalling', () => {
     expect(calls.some((c) => c.name === 'encode_message_json')).toBe(false);
   });
 
-  it('encodes a present reply_to as a TransportProtocol', () => {
-    primitives.discovery.request.produce(1n, new Uint8Array(32), {
-      uri: 'https://x.example',
-      protocol: 0,
-    });
-    expect(find('encode_message_json').args[0]).toBe(MessageKind.TransportProtocol);
+  it('encodes a present reply_to as a framed TransportProtocol list', () => {
+    primitives.discovery.request.produce(1n, new Uint8Array(32), [
+      { uri: 'https://x.example', protocol: 0 },
+      { uri: 'grpcs://x.example:443', protocol: 1 },
+    ]);
+    const encoded = calls.filter((c) => c.name === 'encode_message_json');
+    // One encode per entry: the list is framed, not a single message.
+    expect(encoded).toHaveLength(2);
+    expect(encoded[0]!.args[0]).toBe(MessageKind.TransportProtocol);
+    expect(encoded[1]!.args[0]).toBe(MessageKind.TransportProtocol);
   });
 });
 
