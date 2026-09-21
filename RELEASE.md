@@ -131,6 +131,20 @@ You can also verify using:
 cargo search derec
 ```
 
+### Post-publish: schema distribution
+
+`derec-proto` bundles the `.proto` schema inside the published crate so a
+`tonic` client or server built against `DeRecTransport` never needs a
+`lib-derec` checkout. That guarantee rests on `cargo`'s package-extraction
+and build-script conventions rather than on anything a path-dependency test
+in this repository can exercise, so confirm it once, against a scratch crate
+that depends on `derec-proto = "<version>"` from crates.io, contains no
+`.proto` files, and sits outside any `lib-derec` checkout:
+
+- [ ] `cargo build --offline` succeeds against a warm cache
+- [ ] `cargo vendor` with source replacement configured succeeds
+- [ ] `CARGO_HOME` pointed at a non-default path succeeds
+
 ---
 
 ## Publishing Node.js SDK

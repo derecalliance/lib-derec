@@ -1,0 +1,79 @@
+/*
+ * Copyright (c) DeRec Alliance and its Contributors.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+syntax = "proto3";
+
+package org.derecalliance.derec.protobuf;
+
+// CommittedDeRecShare represents a DeRec share that has been committed and
+// is ready to be given to a helper for storage.
+//
+// During recovery, this protobuf message is returned.
+//
+// The commitment uses a Merkle tree. The hash of the share given to each
+// helper forms a leaf in the tree. Each leaf and internal node hash is a
+// SHA-384 hash.
+//
+// The Merkle path from a leaf to the root (i.e., the sibling nodes along
+// that route) is called merklePath. The root hash is referred to as the
+// "commitment".
+message CommittedDeRecShare {
+
+  // Protobuf serialization of DeRecShare.
+  bytes deRecShare = 1;
+
+  // The Merkle root.
+  bytes commitment = 2;
+
+  // Represents a leaf or interior node in the Merkle path.
+  // isLeft is true if the sibling is a left child.
+  message SiblingHash {
+    bool isLeft = 1;
+    bytes hash = 2;
+  }
+
+  // The bottom-up Merkle path from the leaf to the root.
+  repeated SiblingHash merklePath = 3;
+}
+
+
+// DeRecShare contains the information that a sharer provides to a helper.
+//
+// The sharer first generates a random AES-256 key k and uses it to
+// AES-GCM encrypt the secret. A random polynomial f is generated such
+// that f(0) = k. The polynomial is then evaluated at a random x value
+// for the intended helper, and the share contains the value y where
+// f(x) = y.
+//
+// The computation should be done in GF(p), where p is the smallest
+// 256-bit prime. The degree of the polynomial determines the threshold
+// number of helpers required to reconstruct the secret.
+//
+// The message also includes the secretId and the share version number,
+// because they must be serialized together with the share so that they
+// are covered by the same signature.
+message DeRecShare {
+
+  // The result of serializing the secret to be shared and encrypting it
+  // with a randomly generated AES-256 key.
+  bytes encryptedSecret = 1;
+
+  // Random 256-bit integer encoded as two's complement, big-endian.
+  bytes x = 2;
+
+  // The value y = f(x).
+  bytes y = 3;
+
+  // Numeric identifier of the secret associated with the share.
+  //
+  // Must be unique for each secret created by a sharer.
+  uint64 secretId = 4;
+
+  // Version number of the share.
+  //
+  // A helper is entitled to ignore any StoreShareRequestMessage whose
+  // version is less than or equal to the last seen version.
+  uint32 version = 5;
+}

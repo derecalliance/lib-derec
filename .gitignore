@@ -45,3 +45,5 @@ runtimes/
 # Compiled smoke-test binaries. `go build ./...` in smoke-tests/go drops an
 # executable named after the directory; it is a build output, never an input.
 /smoke-tests/go/go
+
+/packages/dotnet/DeRec.Library/schema/

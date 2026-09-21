@@ -1,0 +1,60 @@
+/*
+ * Copyright (c) DeRec Alliance and its Contributors.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+syntax = "proto3";
+
+import "result.proto";
+
+package org.derecalliance.derec.protobuf;
+
+// ErrorResponseMessage is a generic error response sent when a protocol
+// message cannot be processed successfully.
+//
+// # Context
+//
+// This message may be returned in response to any DeRecMessage when the
+// receiver encounters an error during processing.
+//
+// Typical scenarios include:
+//
+// - malformed or invalid message payloads
+// - unsupported or unknown message types
+// - protocol violations (e.g., invalid sequence, nonce mismatch)
+// - authorization or validation failures
+//
+// # Semantics
+//
+// This message indicates that:
+//
+// - the original request was not successfully processed
+// - no state change should be assumed by the sender
+//
+// The sender SHOULD:
+//
+// - inspect the `result` field to determine the cause of the failure
+// - decide whether to retry, abort, or escalate based on the error
+//
+// # Usage Guidelines
+//
+// - This message is intended as a fallback when no more specific response
+//  type is applicable
+// - Protocol-specific errors SHOULD use their corresponding response
+//  messages when available
+//
+// # Security Considerations
+//
+// - Error responses SHOULD avoid leaking sensitive internal details
+// - Only high-level error information should be exposed via `result`
+//
+// # Idempotency
+//
+// Error responses are idempotent and may be returned multiple times
+// for repeated invalid requests.
+message ErrorResponseMessage {
+  // Result describing the error encountered while processing the request.
+  //
+  // This field encodes the error type and any associated status information.
+  DeRecResult result = 1;
+}

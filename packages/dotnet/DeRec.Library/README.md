@@ -51,6 +51,24 @@ running it is only validated on a Windows environment (e.g. a Windows CI runner)
 
 ---
 
+## Protocol schema
+
+The package ships the DeRec `.proto` schema under `schema/` so you can
+generate code for any language without a `lib-derec` checkout:
+
+- `schema/proto/` — the 18 schema files, flat. Every import is a bare
+  filename, so a single include root resolves the whole closure:
+  `protoc --proto_path=<nuget-package-root>/schema/proto <nuget-package-root>/schema/proto/*.proto`
+- `schema/derec_descriptor.bin` — the same closure precompiled, well-known
+  types included. Needs no include path at all. Compiled with
+  `--include_source_info`, so code generated from it keeps the protocol's doc
+  comments instead of emitting bare type declarations.
+
+The schema is versioned with the package: `vX.Y.Z` carries exactly the schema
+`vX.Y.Z` was built from.
+
+---
+
 ## Design Overview
 
 The .NET SDK is a **thin interop layer** over the Rust implementation.

@@ -1,0 +1,194 @@
+/*
+ * Copyright (c) DeRec Alliance and its Contributors.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+syntax = "proto3";
+
+package org.derecalliance.derec.protobuf;
+
+// Result represents the outcome of processing a DeRec protocol request.
+//
+// # Purpose
+//
+// This message is included in response messages to communicate:
+//
+// - whether a request was successfully processed
+// - the type of failure (if any)
+// - optional human-readable context for debugging or user display
+//
+// # Semantics
+//
+// A Result consists of:
+//
+// - a machine-readable `status` code
+// - an optional `memo` providing additional context
+//
+// The `status` field MUST be used by implementations to determine
+// protocol behavior. The `memo` field is informational only.
+//
+// # Usage
+//
+// - Every response message that can fail SHOULD include a Result
+// - Senders MUST inspect the `status` field to determine next steps
+// - The `memo` field MAY be displayed to users or logged for diagnostics
+//
+// # Security Considerations
+//
+// - The `memo` field SHOULD NOT include sensitive internal details
+// - Only high-level or user-safe information should be exposed
+//
+// # Idempotency
+//
+// The Result reflects the outcome of a specific request. Repeated identical
+// requests SHOULD produce consistent Result values unless system state changes.
+message DeRecResult {
+  // Status code indicating the outcome of the request.
+  StatusEnum status = 1;
+
+  // Optional human-readable description providing additional details.
+  //
+  // This field is intended for debugging, logging, or user display.
+  // It MUST NOT be relied upon for programmatic decision-making.
+  string memo = 2;
+}
+
+// StatusEnum defines the set of possible outcomes for processing
+// DeRec protocol requests.
+//
+// # Semantics
+//
+// These values are used across all response messages to provide a consistent
+// interpretation of success and failure conditions.
+//
+// Implementations MUST handle all known values and SHOULD safely ignore
+// unknown values for forward compatibility.
+enum StatusEnum {
+
+  // The request was successfully handled.
+  //
+  // No further action is required by the sender.
+  OK = 0;
+
+  // The request was partially fulfilled.
+  //
+  // The `memo` field SHOULD provide additional context explaining which
+  // parts succeeded and which did not.
+  PARTIAL = 1;
+
+  // The request failed for a generic or unspecified reason.
+  //
+  // The `memo` field MAY provide additional details.
+  FAIL = 2;
+
+  // The request failed because it would exceed the allowed storage limit
+  // for this sharer and secret ID.
+  //
+  // This typically applies to share storage operations.
+  SIZE_LIMIT_EXCEEDED = 3;
+
+  // The request was ignored because it exceeded the allowed frequency.
+  //
+  // This may be used for rate limiting to prevent abuse or excessive load.
+  TOO_FREQUENT = 4;
+
+  // The specified secret ID is not recognized by the Helper.
+  //
+  // This may occur during recovery or share retrieval.
+  UNKNOWN_SECRET_ID = 5;
+
+  // The specified share version does not exist for the given secret ID.
+  //
+  // This may occur if the version was never stored or has been deleted.
+  UNKNOWN_SHARE_VERSION = 6;
+
+  // The message could not be decrypted successfully.
+  //
+  // This indicates a failure in the cryptographic layer, such as:
+  //
+  // - incorrect key material
+  // - corrupted ciphertext
+  DECRYPTION_FAILED = 7;
+
+  // The message signature or authentication could not be verified.
+  //
+  // This indicates that the message integrity or authenticity check failed.
+  VERIFICATION_FAILED = 8;
+
+  // The message format is invalid.
+  //
+  // This includes errors such as:
+  //
+  // - protobuf parsing failures
+  // - missing required fields
+  // - structurally invalid messages
+  FORMAT_ERROR = 9;
+
+  // The request was rejected by the counter-party
+  //
+  // This might be used to indicate the user or system that received the
+  // requested rejected it.
+  REJECTED = 10;
+
+  // The pair handshake failed because the two parties' advertised
+  // `ParameterRange` values do not overlap on at least one field
+  // (e.g. local `minShareSize` exceeds peer `maxShareSize`).
+  //
+  // Sent on a `PairResponseMessage`; the `memo` field SHOULD describe
+  // the offending field and the two `(min, max)` pairs so the
+  // initiator can surface a useful diagnostic.
+  INCOMPATIBLE_PARAMETER_RANGE = 11;
+
+  // The announced transport protocol is one the recipient cannot serve.
+  //
+  // Returned only for a transport change on an **already-established**
+  // channel — an `UpdateChannelInfo` announcing a switch the recipient
+  // cannot follow. The recipient still holds the peer's previous working
+  // endpoint, which is what makes this refusal deliverable at all.
+  //
+  // It is deliberately **not** used during pairing. Delivery is push-only,
+  // so a party that cannot reach a peer also cannot deliver a rejection to
+  // it; pairing incompatibility surfaces locally to the application
+  // instead.
+  UNSUPPORTED_TRANSPORT_PROTOCOL = 12;
+
+  // A share already exists for this (secretId, version) with different
+  // content, so the write was refused.
+  //
+  // Exactly one writer owns a version. A recipient stores the first write
+  // it sees at a version; a later write carrying different bytes is
+  // rejected with this status rather than overwriting or coexisting. A
+  // byte-identical re-send is an idempotent retry and returns `OK`.
+  //
+  // Because a single writer always derives `version` as
+  // `latest_version + 1`, it can never rewrite a version with different
+  // content. Receiving this status therefore means a *second* writer
+  // published concurrently — typically the same user acting on two
+  // devices at once. Resolution is the application's responsibility: the
+  // round has failed and should be republished at a new version.
+  VERSION_CONFLICT = 13;
+
+  // A replica pairing named a `replicaId` that is already in use by another
+  // member of the group — including the recipient itself.
+  //
+  // Every member of a group must be uniquely identified: the roster is keyed
+  // by `replicaId`, and messages between members are attributed by it. Two
+  // members sharing an id would overwrite each other's roster row and make
+  // every acknowledgement ambiguous.
+  //
+  // `replicaId` is assigned by the application, so a collision is a
+  // configuration fault — most often the same identity reused on two devices,
+  // such as a cloned device image. Resolution is the application's: assign a
+  // distinct id and pair again. The protocol cannot pick one, because it
+  // cannot know which device is meant to keep the original.
+  //
+  // Reported before fingerprint verification: there is no point asking a user
+  // to confirm a pairing that cannot be completed.
+  REPLICA_ID_CONFLICT = 14;
+
+  // The Helper is requesting that the Owner terminate the relationship.
+  //
+  // The Owner SHOULD respond by sending an UnpairRequestMessage and
+  // ceasing further communication on the channel.
+  REQUEST_TO_CLOSE = 99;
+}

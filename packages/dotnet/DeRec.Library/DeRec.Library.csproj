@@ -21,6 +21,17 @@
   <ItemGroup>
     <None Include="README.md" Pack="true" PackagePath="\" />
     <None Include="LICENSE" Pack="true" PackagePath="\" />
+
+    <!-- The DeRec schema, so consumers can generate code from the protocol
+         definitions without a lib-derec checkout. Staged by
+         scripts/prepare-dotnet-package.sh. -->
+    <None Include="schema/derec_descriptor.bin"
+        Pack="true"
+        PackagePath="schema/"
+        Condition="Exists('schema/derec_descriptor.bin')" />
+    <None Include="schema/proto/**/*.proto"
+        Pack="true"
+        PackagePath="schema/proto/" />
   </ItemGroup>
 
   <ItemGroup>
