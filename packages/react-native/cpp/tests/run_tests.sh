@@ -6,6 +6,17 @@ ROOT="$(cd "$HERE/../../../.." && pwd)"
 OUT="$ROOT/target/rn-cpp-tests"
 mkdir -p "$OUT"
 
+# `c++` picks its SDK on its own, and on a machine that carries both Xcode and
+# a standalone Command Line Tools install it can pick the CLT one — whose
+# clang is then older than its own `.tbd` system stubs and rejects them with
+# "unknown architecture". That surfaces as a link failure against libSystem,
+# which looks like a defect in this tree and is not one. Pin the SDK belonging
+# to the toolchain `xcode-select` points at.
+if [[ "$(uname -s)" == "Darwin" && -z "${SDKROOT:-}" ]] && command -v xcrun >/dev/null 2>&1; then
+  SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+  export SDKROOT
+fi
+
 # Host build of the Rust staticlib so the C++ tests can link the real ABI.
 (cd "$ROOT" && cargo build --release --features ffi)
 

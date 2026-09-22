@@ -1,0 +1,264 @@
+/*
+ * Copyright (c) DeRec Alliance and its Contributors.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
+import "transportprotocol.proto";
+
+package org.derecalliance.derec.protobuf;
+
+// ContactMessage is the only DeRec protocol message that is not wrapped
+// inside a DeRecMessage.
+//
+// This message is exchanged out-of-band before pairing begins. It provides
+// the minimum information required for another party to initiate contact and
+// send the first protocol message for a new pairing session.
+//
+// Unlike normal DeRec protocol messages, a ContactMessage:
+//
+// - is not wrapped in a DeRecMessage
+// - is not signed
+// - is not encrypted
+// - is not delivered through an already-established DeRec channel
+//
+// Because it is exchanged before any secure channel exists, this message
+// should only contain bootstrap information needed to establish that channel.
+// It is typically transferred through a trusted or user-mediated mechanism.
+//
+// Typical exchange mechanisms include:
+//
+// - QR codes displayed by either the Owner or Helper and scanned by the other
+//  party
+// - distribution inside an application controlled by one of the parties
+// - transmission over an already-existing communication channel when the
+//  parties have a prior relationship
+//
+// The recipient of this message uses its contents to construct and send the
+// initial pairing request. In particular, the ContactMessage conveys:
+//
+// - the public encryption key material needed to protect the first inbound
+//  pairing message
+// - a channel identifier that the recipient must echo in subsequent protocol
+//  messages sent to this contact
+// - a nonce that binds the pairing attempt to the out-of-band contact exchange
+// - the transport information required to deliver the pairing request
+//
+// The nonce may be transmitted together with the rest of the message or
+// delivered separately by the application, depending on the authentication
+// and pairing UX.
+//
+// # Modes
+//
+// `ContactMessage` supports three delivery modes for the public encryption
+// material, selected by `contactMode`:
+//
+// - `INLINE_KEYS` (default): both `mlkemEncapsulationKey` and
+//  `eciesPublicKey` are present in the contact. The recipient may proceed
+//  directly to `PairRequestMessage`. This is the original, wire-equivalent
+//  behavior — existing contacts (which have no `contactMode` set) are
+//  parsed as `INLINE_KEYS` by virtue of the proto3 default.
+//
+// - `HASHED_KEYS`: `contactBindingHash` is present and both
+//  key fields are absent. The contact is small enough to fit in a QR code
+//  or short URL. The recipient must first exchange a `PrePairRequest` /
+//  `PrePairResponse` pair to obtain the actual keys, then verify them
+//  against the hash before sending `PairRequestMessage`. The hash binding
+//  gives the OOB-shared contact the same MITM resistance as inline-keys
+//  mode despite the keys traveling over the (unauthenticated) transport.
+//  Because the `PrePair*` messages are plaintext, the `transportProtocol`
+//  carried in this mode MUST be ephemeral — see the security note on
+//  `PrePairRequestMessage` for the required ephemeral-then-swap discipline.
+//
+// - `NO_KEYS`: all of `mlkemEncapsulationKey`, `eciesPublicKey`, and
+//  `contactBindingHash` are absent. The contact carries only
+//  `channelId`, `nonce`, and `transportProtocol` — small enough to be
+//  hand-typed or dictated over the phone. There is no cryptographic
+//  binding: the recipient's `PrePairRequest` triggers on-the-fly key
+//  generation on the contact creator, and the returned keys are used
+//  without hash verification. The security model rests **entirely** on
+//  the out-of-band delivery channel being fully trusted (e.g. a
+//  verified email from an already-KYC-authenticated institution). The
+//  `nonce` correlates the incoming request to the intended user; because
+//  the nonce is intentionally small for human typability, applications
+//  MUST rate-limit incoming `PrePairRequest`s per `channelId` and expire
+//  outstanding NoKeys contacts on a short timer. Not appropriate for
+//  peer-to-peer pairing over untrusted channels — use `HASHED_KEYS` or
+//  `INLINE_KEYS` there.
+//
+//  Because nothing binds the published keys to the contact, a `NO_KEYS`
+//  channel MUST NOT be used until the pair is confirmed out of band. An
+//  implementation MUST hold it unusable — no secrets sent, inbound
+//  messages ignored — until both sides compare the human-readable
+//  fingerprint derived from the established shared key and it matches. A
+//  man-in-the-middle on the `PrePair` leg yields two different shared
+//  keys and therefore two different fingerprints, so this comparison is
+//  what `HASHED_KEYS` gets from its `contactBindingHash` and `NO_KEYS`
+//  can get no other way. This is a requirement of the mode, not a
+//  deployment choice.
+//
+// The mode selector and the per-mode field-presence invariants are enforced
+// by the implementation; mixing fields across modes is a protocol error.
+
+// Selects the delivery mode for the public encryption material in
+// `ContactMessage`. See `ContactMessage` for details.
+enum ContactMode {
+  // Default. `mlkemEncapsulationKey` and `eciesPublicKey` are inlined
+  // in the contact.
+  INLINE_KEYS = 0;
+  // `contactBindingHash` is inlined in the contact; keys are obtained via
+  // `PrePairRequest` / `PrePairResponse` and verified against the hash.
+  HASHED_KEYS = 1;
+  // No key material and no hash are inlined. The contact carries only
+  // `channelId`, `nonce`, and `transportProtocol`; the contact creator
+  // generates key material on the fly when the corresponding
+  // `PrePairRequest` arrives. Only appropriate when the out-of-band
+  // delivery channel is fully trusted, and the channel stays unusable
+  // until both sides confirm the fingerprint out of band — nothing else
+  // binds the published keys to the contact.
+  NO_KEYS = 2;
+}
+
+message ContactMessage {
+
+  // Selects how the public encryption material is delivered. Defaults to
+  // `INLINE_KEYS` (current behavior) when unset.
+  ContactMode contactMode = 1;
+
+  // Serialized ML-KEM-768 encapsulation key.
+  //
+  // Present only when `contactMode == INLINE_KEYS`. Used by
+  // the recipient to construct the initial pairing message.
+  optional bytes mlkemEncapsulationKey = 2;
+
+  // Serialized ECIES public key.
+  //
+  // Present only when `contactMode == INLINE_KEYS`. Used by
+  // the recipient to construct the initial pairing message.
+  optional bytes eciesPublicKey = 3;
+
+  // SHA-384 commitment to the public encryption material.
+  //
+  // Present only when `contactMode == HASHED_KEYS`. Computed
+  // as:
+  //
+  // ```text
+  // SHA-384(
+  //     mlkemEncapsulationKey
+  //     || eciesPublicKey
+  //     || u64_be(nonce)
+  //     || u64_be(channelId)
+  // )
+  // ```
+  //
+  // The recipient obtains the actual keys via `PrePairRequest` and
+  // recomputes this hash to confirm integrity before proceeding to
+  // `PairRequestMessage`.
+  optional bytes contactBindingHash = 4;
+
+  // Channel identifier associated with this contact.
+  //
+  // This value identifies the communication channel that the creator of this
+  // ContactMessage expects to use for the new pairing. After receiving this
+  // contact, the initiating party includes this channelId in subsequent
+  // protocol messages sent to the contact creator.
+  //
+  // The recipient uses this identifier to determine which local key material
+  // and pairing state should be used when processing the message.
+  //
+  // If an implementation generates multiple pending contact records or
+  // multiple encryption key pairs for different pairing attempts, it should
+  // retain the mapping from channelId to the corresponding local state so it
+  // can process inbound messages without trial decryption across all keys.
+  //
+  // This value MUST be unique within the scope required by the implementation
+  // to disambiguate concurrent or stored pairing sessions.
+  uint64 channelId = 5;
+
+  // Random nonce used to bind the pairing request to this contact exchange.
+  //
+  // The initiator includes this value in the pairing request so the creator
+  // of the ContactMessage can confirm that the request corresponds to the
+  // same out-of-band contact information that was just shared.
+  //
+  // This helps the application detect mismatched, stale, or spoofed pairing
+  // attempts during the bootstrap phase.
+  //
+  // Applications may choose to reveal this nonce only after sufficient
+  // out-of-band authentication has taken place.
+  uint64 nonce = 6;
+
+  // Transport information used to reach the creator of this contact.
+  //
+  // This specifies both:
+  //
+  // - the endpoint to which the first protocol message should be sent
+  // - the transport protocol that determines how that endpoint is interpreted
+  //  and used
+  //
+  // The initiating party uses this field to deliver the initial pairing
+  // request. Subsequent protocol exchanges may continue using the same
+  // transport information or updated transport details, depending on the
+  // protocol and application behavior.
+  //
+  // Deprecated: superseded by `supportedTransports`, which carries every
+  // endpoint rather than one.
+  //
+  // **Reading this field directly is now incorrect.** Its meaning narrowed
+  // from "the endpoint" to "one entry of a list, and possibly absent": a
+  // creator that has moved past this field advertises only
+  // `supportedTransports`. A reader that was correct before this release is
+  // a bug now — it rejects, or fails to reach, a peer that is offering it a
+  // perfectly good endpoint. Resolve both spellings instead of reading
+  // either: `advertised_endpoints()` (Rust and TypeScript),
+  // `AdvertisedEndpoints()` (Go), `AdvertisedEndpoints()` (.NET).
+  //
+  // Senders still populate it: a sender that sets `supportedTransports`
+  // MUST also set this to a single best-compatibility choice, so
+  // implementations predating the list still pair.
+  //
+  // **Scheduled for removal in v0.0.5.**
+  TransportProtocol transportProtocol = 7 [deprecated = true];
+
+  // Timestamp indicating when the sender created this message.
+  //
+  // This value is expressed in UTC and can be used for:
+  //
+  // - replay detection
+  // - timeout handling
+  // - logging and observability
+  google.protobuf.Timestamp timestamp = 8;
+
+  // Every transport endpoint the creator of this contact can be reached on.
+  //
+  // Each entry is a complete endpoint: a URI plus the protocol that says
+  // how to interpret it. The list is written in the creator's own
+  // preference order.
+  //
+  // # Selection is the recipient's
+  //
+  // A recipient picks whichever entry suits it, ordered by its **own**
+  // preference rather than the sender's. The order here expresses
+  // availability, not a ranking the recipient must honor.
+  //
+  // # Compatibility
+  //
+  // Absent means "only `transportProtocol` is offered", which is how every
+  // implementation predating this field behaves. A sender populating this
+  // list MUST also set `transportProtocol` to a single best-compatibility
+  // choice so those implementations still pair.
+  //
+  // # Security
+  //
+  // `contactBindingHash` does not cover this field, exactly as it does not
+  // cover `transportProtocol`. An attacker able to rewrite an
+  // out-of-band contact can therefore remove entries. Removing the secure
+  // ones leaves only plaintext, which the recipient's transport policy
+  // refuses unless plaintext has been explicitly opted into. DeRec messages
+  // are signed and encrypted at the application layer on every transport,
+  // so substituting one secure transport for another is not a loss of
+  // confidentiality or authenticity.
+  repeated TransportProtocol supportedTransports = 9;
+}

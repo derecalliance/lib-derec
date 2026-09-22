@@ -259,6 +259,10 @@ stage_package() {
   cp "$PKG_DIR/DeRec.podspec" "$PKG_DIR/react-native.config.js" "$PKG_DIR/README.md" "$STAGE_DIR/"
   cp "$ROOT_DIR/LICENSE" "$STAGE_DIR/LICENSE"
 
+  # The schema ships with the package so consumers can generate their own code
+  # from it without a lib-derec checkout.
+  "$ROOT_DIR/scripts/sync-schema.sh" "$STAGE_DIR/schema"
+
   node -e '
     const fs = require("fs");
     const [pkgDir, stageDir, version] = process.argv.slice(1);

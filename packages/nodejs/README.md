@@ -29,6 +29,24 @@ No native dependencies are required.
 
 ---
 
+## Protocol schema
+
+The package ships the DeRec `.proto` schema at its root so you can generate
+code for any language without a `lib-derec` checkout:
+
+- `proto/` — the 18 schema files, flat. Every import is a bare filename, so a
+  single include root resolves the whole closure:
+  `protoc --proto_path=node_modules/@derec-alliance/nodejs/proto node_modules/@derec-alliance/nodejs/proto/*.proto`
+- `derec_descriptor.bin` — the same closure precompiled, well-known types
+  included. Needs no include path at all. Compiled with
+  `--include_source_info`, so code generated from it keeps the protocol's doc
+  comments instead of emitting bare type declarations.
+
+The schema is versioned with the package: `vX.Y.Z` carries exactly the schema
+`vX.Y.Z` was built from.
+
+---
+
 ## Design Overview
 
 The NodeJS SDK is a **thin binding layer** over the Rust implementation.

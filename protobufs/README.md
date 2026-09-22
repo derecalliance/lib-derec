@@ -98,9 +98,53 @@ The service shares the `org.derecalliance.derec.protobuf` package with the
 message vocabulary, so its full name — and therefore the method path on the
 wire — is unaffected by living in its own directory.
 
-This crate ships the `.proto` definition only and generates **no service
-stubs**. Consumers who want stubs run their own `tonic-prost-build`, as
-`smoke-tests/grpc/build.rs` does.
+This crate ships the `.proto` definition only. See "Generating transport
+stubs" below for how consumers produce a client or server from it.
+
+### Generating transport stubs — the `descriptor` feature
+
+This crate generates **no service stubs**: `prost` emits messages and ignores
+services. Consumers who want a `DeRecTransport` client or server generate it
+themselves from the schema this crate carries.
+
+The schema is exposed as a file descriptor set, not as file paths, so it works
+under `cargo vendor`, a relocated `CARGO_HOME`, registry mirrors, and
+`--offline`.
+
+```toml
+[dependencies]
+derec-proto = "0.0.4"
+
+[build-dependencies]
+derec-proto = { version = "0.0.4", features = ["descriptor"] }
+tonic-prost-build = "0.14"
+```
+
+```rust
+// build.rs
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tonic_prost_build::configure()
+        .build_server(true)
+        .build_client(true)
+        .extern_path(".org.derecalliance.derec.protobuf", "::derec_proto")
+        .compile_fds(derec_proto::descriptor::transport_descriptor())?;
+    Ok(())
+}
+```
+
+`transport_descriptor()` narrows the closure to `derectransport.proto`. The
+`extern_path` is what makes the generated service use this crate's
+`DeRecMessage` rather than emitting a second, incompatible copy of it — pass
+`FILE_DESCRIPTOR_SET` instead only if you want a standalone type set.
+
+The descriptor is compiled with source info, so code generated from it keeps
+the protocol's doc comments instead of emitting bare type declarations.
+
+The feature is default-off. The descriptor is ~122 KB, and `derec-library`
+compiles to WebAssembly for the Node.js and web SDKs, so it is not carried by
+builds that do not ask for it. Enable it on the build-dependency only, as
+above: with resolver v2 or later, build-dependency features are not unified
+with normal-dependency features, so the bytes stay in your build script.
 
 ### `DeRecSecret.secretData`
 
@@ -147,6 +191,7 @@ Off by default — a default build compiles no serde.
 | Feature | Enables |
 | --- | --- |
 | `serde` | `serde::Serialize` / `Deserialize` on the hand-written wrapper types the SDKs exchange — `TransportProtocol` and `SenderKind`. The generated prost message types are unaffected; they cross process boundaries as protobuf. Enabled automatically by `derec-library`'s own `serde` feature, so consumers of the library rarely set it directly. |
+| `descriptor` | `derec_proto::descriptor`, a file descriptor set for consumers generating their own code from the schema. See "Generating transport stubs — the `descriptor` feature" above. |
 
 ```toml
 [dependencies]

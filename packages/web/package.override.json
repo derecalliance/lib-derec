@@ -12,6 +12,8 @@
     "derec_library.d.ts",
     "index.js",
     "index.d.ts",
+    "proto",
+    "derec_descriptor.bin",
     "README.md",
     "LICENSE"
   ],

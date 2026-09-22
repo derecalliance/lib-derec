@@ -1,0 +1,284 @@
+/*
+ * Copyright (c) DeRec Alliance and its Contributors.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
+import "communicationinfo.proto";
+import "parameterrange.proto";
+import "result.proto";
+import "transportprotocol.proto";
+
+package org.derecalliance.derec.protobuf;
+
+// SenderKind identifies the logical role of the sender in the pairing flow.
+//
+// The role determines how the receiver interprets the message and what
+// role each party takes in the resulting channel. Pairs are formed by
+// matching complementary kinds: Owner↔Helper, ReplicaSource↔ReplicaDestination.
+enum SenderKind {
+  // Sender is an Owner.
+  //
+  // Used for all Owner-initiated pairings, whether establishing a new
+  // relationship or re-pairing during recovery. There is no protocol-level
+  // distinction between the two cases.
+  OWNER = 0;
+
+  // Sender is acting as a Helper.
+  //
+  // Helpers may initiate pairing in some application flows, though the
+  // Owner typically acts as the initiator.
+  HELPER = 1;
+
+  // Sender is the Source side of a replica pair — the device that owns
+  // the secrets and pushes them to a destination for backup. The matching
+  // peer kind is REPLICA_DESTINATION.
+  //
+  // Replica pairing follows the same cryptographic handshake as Helper
+  // pairing but adds a mandatory fingerprint-verify step before the
+  // channel transitions out of `Pending`. After verification, the Source
+  // calls ProtectSecret targeting the Destination channel; the library
+  // sends a `ReplicaSecretPayload` (full secret + share map) to the
+  // Destination via a normal channel-mode `StoreShareRequest`.
+  REPLICA_SOURCE = 3;
+
+  // Sender is the Destination side of a replica pair — the device that
+  // receives and stores full secret copies from a Source for backup or
+  // recovery purposes. The matching peer kind is REPLICA_SOURCE.
+  //
+  // The Destination never initiates ProtectSecret on this channel; it
+  // only receives `ReplicaSecretPayload` messages and surfaces them to
+  // the application via the `ReplicaSecretReceived` event.
+  REPLICA_DESTINATION = 4;
+}
+
+// PairRequestMessage is the first message in the pairing protocol,
+// sent from the initiator to the responder after receiving a ContactMessage.
+//
+// # Preconditions
+//
+// Before sending this message:
+//
+// - The initiator MUST have received a valid ContactMessage from the responder
+// - The initiator MUST use the responder's public encryption material from
+//  the ContactMessage to construct this request
+//
+// # Purpose
+//
+// This message establishes:
+//
+// - the initiator's identity and role (Owner/Helper, recovery mode or not)
+// - fresh cryptographic material for the responder to use in subsequent messages
+// - agreement negotiation inputs (parameter ranges)
+// - binding between the out-of-band contact exchange and this pairing attempt
+// - transport information for future communication
+//
+// # Security Properties
+//
+// - The nonce binds this request to the ContactMessage exchange
+// - The ciphertext and public keys bootstrap a secure communication channel
+// - The message is encrypted and authenticated at the DeRecMessage layer
+//
+// # Outcome
+//
+// Upon successful processing, the responder replies with PairResponseMessage.
+// After this exchange:
+//
+// - both parties know each other's public keys
+// - a secure communication channel is established for subsequent protocol flows
+message PairRequestMessage {
+
+  // The role of the sender of this message.
+  //
+  // This informs the responder whether the initiator is:
+  //
+  // - an Owner (normal or recovery mode), or
+  // - a Helper
+  //
+  // Recovery mode has special semantics for how Helpers associate this
+  // pairing with existing stored secrets.
+  SenderKind senderKind = 1;
+
+  // ML-KEM-768 ciphertext.
+  //
+  // This ciphertext is generated using the responder's ML-KEM public key
+  // obtained from the ContactMessage. It is used to establish shared
+  // cryptographic material for securing subsequent communication.
+  bytes mlkemCiphertext = 2;
+
+  // Serialized ECIES public key of the sender.
+  //
+  // This key is provided to the responder so that future messages can be
+  // encrypted toward the initiator.
+  bytes eciesPublicKey = 3;
+
+  // Sender's application-level identifying information.
+  //
+  // This field is intended for user-facing identification and may include
+  // data such as name, phone number, or account identifiers.
+  //
+  // It is not used directly by the protocol for security decisions.
+  CommunicationInfo communicationInfo = 5;
+
+  // Nonce binding this request to the ContactMessage exchange.
+  //
+  // This value MUST match the nonce provided in the ContactMessage.
+  // It allows the responder to verify that the pairing request corresponds
+  // to the same out-of-band interaction, preventing mismatched or spoofed
+  // pairing attempts.
+  uint64 nonce = 6;
+
+  // Parameter range supported by the sender.
+  //
+  // This defines the acceptable configuration space (e.g., thresholds,
+  // limits) that the sender is willing to operate under.
+  //
+  // The responder combines this with its own parameter range to determine
+  // whether pairing is possible and which parameters to use.
+  ParameterRange parameterRange = 7;
+
+  // Transport information for reaching the initiator.
+  //
+  // This specifies:
+  //
+  // - the endpoint where the initiator can receive messages
+  // - the protocol required to deliver those messages
+  //
+  // After pairing, the responder uses this information to send responses
+  // and all subsequent protocol messages to the initiator.
+  // Deprecated: superseded by `supportedTransports`, which carries every
+  // endpoint rather than one.
+  //
+  // **Reading this field directly is now incorrect.** Its meaning narrowed
+  // from "the endpoint" to "one entry of a list, and possibly absent": an
+  // initiator that has moved past this field advertises only
+  // `supportedTransports`. A reader that was correct before this release is
+  // a bug now — it rejects, or fails to reach, a peer that is offering it a
+  // perfectly good endpoint. Resolve both spellings instead of reading
+  // either: `advertised_endpoints()` (Rust and TypeScript),
+  // `AdvertisedEndpoints()` (Go), `AdvertisedEndpoints()` (.NET).
+  //
+  // Senders still populate it: a sender that sets `supportedTransports`
+  // MUST also set this to a single best-compatibility choice, so
+  // implementations predating the list still pair.
+  //
+  // **Scheduled for removal in v0.0.5.**
+  TransportProtocol transportProtocol = 8 [deprecated = true];
+
+  // Timestamp indicating when this message was created.
+  //
+  // Used for observability and may assist in replay detection or timeout
+  // handling, depending on the implementation.
+  google.protobuf.Timestamp timestamp = 9;
+
+  // Every transport endpoint the initiator can be reached on, in the
+  // initiator's own preference order.
+  //
+  // Same semantics as `ContactMessage.supportedTransports`: the responder
+  // selects by its own preference, and absent means "only
+  // `transportProtocol` is offered".
+  repeated TransportProtocol supportedTransports = 10;
+}
+
+// PairResponseMessage is the response to a PairRequestMessage.
+//
+// # Purpose
+//
+// This message completes the pairing handshake. It informs the initiator:
+//
+// - whether the pairing was accepted or rejected
+// - the responder's role and identity information
+// - the responder's supported parameter range
+//
+// # Differences from PairRequestMessage
+//
+// - Does not include encryption public keys, as those were already exchanged
+//  via ContactMessage and PairRequestMessage
+// - Includes a Result field indicating success or failure
+//
+// # Semantics
+//
+// - If `result` indicates success, a secure channel is considered established
+// - If `result` indicates failure, the pairing MUST be treated as unsuccessful
+//  and no further protocol messages should be exchanged on this channel
+//
+// The nonce MUST match the value provided in the request, ensuring that the
+// response corresponds to the same pairing session.
+message PairResponseMessage {
+
+  // Result of processing the pairing request.
+  //
+  // Indicates whether the pairing was successful or failed.
+  // Failure may occur due to:
+  //
+  // - incompatible parameter ranges
+  // - failed authentication at the application layer
+  // - invalid or malformed request data
+  DeRecResult result = 1;
+
+  // Application-level identifying information of the responder.
+  //
+  // Intended for user-facing identification and display purposes.
+  CommunicationInfo communicationInfo = 4;
+
+  // Nonce identifying the pairing session.
+  //
+  // This value MUST exactly match the nonce received in the
+  // PairRequestMessage. A mismatch indicates an invalid or unrelated
+  // pairing attempt and SHOULD result in rejection.
+  uint64 nonce = 5;
+
+  // Parameter range supported by the responder.
+  //
+  // The initiator combines this with its own parameter range to determine
+  // the final agreed configuration for the channel.
+  ParameterRange parameterRange = 6;
+
+  // Timestamp indicating when this message was created.
+  //
+  // Used for observability and may assist in replay detection or timeout
+  // handling, depending on the implementation.
+  google.protobuf.Timestamp timestamp = 7;
+
+  // Derived channel identifier the two parties switch to immediately after
+  // the pairing handshake completes. This message is the only place this
+  // value travels on the wire, and it travels encrypted (inside the pairing
+  // envelope), so a passive observer who only sees the pre-rekey traffic
+  // cannot link the now-paired session to its long-running successor.
+  //
+  // # Derivation
+  //
+  // The responder computes:
+  //
+  // ```text
+  // channelId = u64::from_be_bytes(
+  //     SHA-384(
+  //         u64_be(originalChannelId) || sharedKeyBytes
+  //     )[0..8]
+  // )
+  // ```
+  //
+  // where `originalChannelId` is the channelId from the contact / pairing
+  // envelopes and `sharedKeyBytes` is the freshly-derived pairing shared
+  // key.
+  //
+  // # Validation
+  //
+  // The requester MUST recompute the same hash with its own derivation of
+  // the shared key and reject the response (closing the would-be channel)
+  // if the value here does not match. A non-matching value indicates either
+  // a key-derivation mismatch (the channel would be unusable anyway) or
+  // tampering by a peer that somehow forged a valid envelope but cannot
+  // produce the SHA-384 preimage.
+  //
+  // # Effect
+  //
+  // Both parties atomically rekey their local channel record from
+  // `originalChannelId` to this value once the handshake is accepted. All
+  // subsequent envelopes on this channel — including the
+  // UpdateChannelInfo handover for the long-term transport — route on the
+  // new id.
+  uint64 channelId = 8;
+}

@@ -22,6 +22,33 @@ go get github.com/derecalliance/lib-derec/packages/go
 
 ---
 
+## Protocol schema
+
+The module ships the DeRec `.proto` schema under `derecpb/schema/` so you can
+generate code for any language without a `lib-derec` checkout:
+
+- `derecpb/schema/proto/` — the 18 schema files, flat. Every import is a bare
+  filename, so a single include root resolves the whole closure:
+  `protoc --proto_path=derecpb/schema/proto derecpb/schema/proto/*.proto`
+- `derecpb/schema/derec_descriptor.bin` — the same closure precompiled,
+  well-known types included. Needs no include path at all. Compiled with
+  `--include_source_info`, so code generated from it keeps the protocol's doc
+  comments instead of emitting bare type declarations.
+
+Both are also reachable in-process, without touching the filesystem:
+
+```go
+import "github.com/derecalliance/lib-derec/packages/go/derecpb/schema"
+
+_ = schema.FileDescriptorSet // []byte
+_ = schema.Proto             // embed.FS rooted at "proto"
+```
+
+The schema is versioned with the module: `vX.Y.Z` carries exactly the schema
+`vX.Y.Z` was built from.
+
+---
+
 ## Design Overview
 
 The Go SDK is a **thin binding layer** over the Rust implementation. All core logic is executed in Rust:

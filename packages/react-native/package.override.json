@@ -18,6 +18,7 @@
     "!cpp/tests",
     "DeRec.podspec",
     "react-native.config.js",
+    "schema",
     "README.md",
     "LICENSE"
   ],
