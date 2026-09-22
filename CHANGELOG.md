@@ -7,6 +7,75 @@ Breaking changes are called out explicitly, with the migration alongside
 them. The three crates and the SDKs share a version, so an entry applies to
 all of them unless it names a specific binding.
 
+### 0.0.4
+
+- **The protocol schema now ships inside every published artifact.**
+  *(new capability; no breaking change)*
+
+  Nothing published before this release carried a usable copy of the `.proto`
+  definitions. `derec-proto` did include them in its `.crate`, but nothing
+  told a dependent where cargo had put them; the .NET, Go, Node, React Native
+  and web packages shipped none at all. Anyone writing a gRPC transport, or
+  generating types for a language with no DeRec SDK, had to copy the files
+  out of a `lib-derec` checkout and keep them in step by hand — which is what
+  the reference application ended up doing with fifteen of them.
+
+  **Rust.** A default-off `descriptor` feature on `derec-proto` exposes the
+  schema as a compiled file descriptor set: `descriptor::FILE_DESCRIPTOR_SET`
+  is the full import closure, including the well-known types it imports, and
+  `descriptor::transport_descriptor()` narrows that closure to
+  `derectransport.proto`. Generating a `DeRecTransport` client and server no
+  longer involves a `.proto` file at all:
+
+  ```toml
+  [dependencies]
+  derec-proto = "0.0.4"
+
+  [build-dependencies]
+  derec-proto = { version = "0.0.4", features = ["descriptor"] }
+  tonic-prost-build = "0.14"
+  ```
+
+  ```rust
+  // build.rs
+  tonic_prost_build::configure()
+      .build_server(true)
+      .build_client(true)
+      .extern_path(".org.derecalliance.derec.protobuf", "::derec_proto")
+      .compile_fds(derec_proto::descriptor::transport_descriptor())?;
+  ```
+
+  The `extern_path` is what binds the generated service to this crate's own
+  `DeRecMessage`; without it you get a second, structurally identical message
+  set that will not unify with the first. Because the feature carries bytes
+  rather than file paths, it resolves the same way under `cargo vendor`, a
+  relocated `CARGO_HOME`, registry mirrors and `--offline`.
+
+  Enable it on the **build-dependency only**, as above. The descriptor is
+  ~122 KB and `derec-library` compiles to WebAssembly for the Node.js and web
+  SDKs; with resolver v2 or later, build-dependency features are not unified
+  with normal-dependency ones, so the bytes stay in your build script and out
+  of your binary. That is also why the feature is off by default.
+
+  **Every other SDK.** Each package now carries the same schema as a flat
+  directory of 18 `.proto` files plus the descriptor:
+
+  | SDK | Where |
+  |-----|-------|
+  | Go | package `derecpb/schema` — `FileDescriptorSet []byte` and `Proto embed.FS` |
+  | Node.js, web, React Native | `proto/` and `derec_descriptor.bin` at the package root |
+  | .NET | `schema/proto/` and `schema/derec_descriptor.bin` in the `.nupkg` |
+
+  Every import in the schema is a bare filename, so the flat directory
+  resolves the whole closure with a single include root — `protoc -I proto`,
+  with no second path to supply. The descriptor is compiled with source info,
+  so code generated from it keeps the protocol's doc comments.
+
+  The schema has no version of its own, deliberately: each bundle is
+  generated from the sources of the artifact shipping it, so `0.0.4` of any
+  package carries `0.0.4` of the schema and there is no second version line
+  to reconcile.
+
 ### 0.0.3
 
 > **Every symbol this release deprecates is removed in 0.0.5.** One horizon for

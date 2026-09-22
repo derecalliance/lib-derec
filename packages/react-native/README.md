@@ -58,6 +58,24 @@ release build already includes whatever native modules are linked in.
 
 ---
 
+## Protocol schema
+
+The package ships the DeRec `.proto` schema under `schema/` so you can
+generate code for any language without a `lib-derec` checkout:
+
+- `schema/proto/` — the 18 schema files, flat. Every import is a bare
+  filename, so a single include root resolves the whole closure:
+  `protoc --proto_path=node_modules/@derec-alliance/react-native/schema/proto node_modules/@derec-alliance/react-native/schema/proto/*.proto`
+- `schema/derec_descriptor.bin` — the same closure precompiled, well-known
+  types included. Needs no include path at all. Compiled with
+  `--include_source_info`, so code generated from it keeps the protocol's doc
+  comments instead of emitting bare type declarations.
+
+The schema is versioned with the package: `vX.Y.Z` carries exactly the schema
+`vX.Y.Z` was built from.
+
+---
+
 ## Quickstart: pairing two devices
 
 `DeRecProtocol` is the orchestrator: it owns protocol state, drives flows to

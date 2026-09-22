@@ -1,4 +1,4 @@
-import { readFile, writeFile, copyFile } from "node:fs/promises";
+import { readFile, writeFile, copyFile, cp, rm } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
@@ -29,6 +29,7 @@ const targetReadmePath = path.join(pkgDir, "README.md");
 
 const nodejsDir = path.join(repoRoot, "packages", "nodejs");
 const indexFiles = ["index.js", "index.d.ts"];
+const schemaBundleDir = path.join(pkgDir, "__schema");
 
 function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -119,6 +120,27 @@ async function main() {
       copyFile(path.join(nodejsDir, f), path.join(pkgDir, f)),
     ),
   );
+
+  // The schema ships with the package so consumers can generate their own
+  // code from it without a lib-derec checkout.
+  execFileSync(
+    "bash",
+    [path.join(repoRoot, "scripts", "sync-schema.sh"), schemaBundleDir],
+    { stdio: "inherit" }
+  );
+  // Replace rather than merge. `fs.cp` with `recursive` overwrites files that
+  // exist in both trees but never removes destination files absent from the
+  // source, and `pkgDir` survives between runs — so without this, a `.proto`
+  // renamed or deleted upstream would keep shipping from a stale copy.
+  await rm(path.join(pkgDir, "proto"), { recursive: true, force: true });
+  await cp(path.join(schemaBundleDir, "proto"), path.join(pkgDir, "proto"), {
+    recursive: true,
+  });
+  await copyFile(
+    path.join(schemaBundleDir, "derec_descriptor.bin"),
+    path.join(pkgDir, "derec_descriptor.bin"),
+  );
+  await rm(schemaBundleDir, { recursive: true, force: true });
 
   console.log(`Prepared Node.js package at ${pkgDir}`);
 }

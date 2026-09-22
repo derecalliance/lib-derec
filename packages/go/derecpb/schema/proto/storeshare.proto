@@ -1,0 +1,274 @@
+/*
+ * Copyright (c) DeRec Alliance and its Contributors.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
+import "result.proto";
+import "transportprotocol.proto";
+
+package org.derecalliance.derec.protobuf;
+
+// StoreShareRequestMessage instructs a Helper to store a share for a given
+// secret and manage the set of retained share versions.
+//
+// # Context
+//
+// This message is used in the sharing flow when:
+//
+// - a new secret is created
+// - an existing secret is updated
+// - the helper set or recovery threshold changes
+//
+// The Owner sends this message to each Helper to:
+//
+// - store (or replace) a specific share version
+// - update the set of versions that must be retained (keepList)
+//
+// # Semantics
+//
+// This message may carry two independent instructions:
+//
+// 1. Share storage/update:
+//    - If `share` is present, the Helper MUST store this share under the
+//      specified `version`
+//    - If the version already exists, the Helper MUST replace it
+//
+// 2. Retention policy update:
+//    - If `keepList` is present, it defines the complete set of versions
+//      that MUST be retained
+//    - Any stored version not in `keepList` SHOULD be deleted
+//
+// If `keepList` is absent:
+//
+// - The Helper MUST preserve the existing keepList
+// - The Helper MUST add the new `version` to the retained set
+//
+// # Consistency Requirements
+//
+// The Owner MUST ensure that for a given (secretId, version):
+//
+// - all Helpers receive identical share contents
+//
+// It is an error for different shares to be associated with the same
+// version and secretId.
+//
+// # Replay Protection
+//
+// To prevent replay attacks:
+//
+// - If `version` is less than the latest stored version,
+//  the Helper MUST ignore the `keepList` field
+//
+// This ensures that stale messages cannot cause deletion of newer shares.
+//
+// # Share Opacity
+//
+// The Helper MUST treat the `share` field as opaque data. It is not required
+// to understand or validate the share contents.
+//
+// # Idempotency
+//
+// This message is idempotent:
+//
+// - Re-sending the same (version, share) pair SHOULD result in the same state
+// - Re-applying the same keepList SHOULD not change state after the first time
+message StoreShareRequestMessage {
+
+  // Share bytes to be stored by the Helper.
+  //
+  // This is an opaque byte array produced by the share distribution
+  // algorithm. The Helper MUST store it without interpretation.
+  bytes share = 1;
+
+  // Identifier of the algorithm used to produce the share.
+  //
+  // This allows the Owner and Helper to coordinate on how the share
+  // should be interpreted during recovery.
+  //
+  // Algorithm 0 defines the share as a serialized `CommittedDeRecShare`
+  // protobuf message (see DeRec cryptography repository).
+  //
+  // Implementations SHOULD support algorithm 0 for interoperability.
+  int32 shareAlgorithm = 2;
+
+
+  // Identifier of the secret to which this share belongs.
+  //
+  // Used by the Helper to associate the share with the correct secret in the
+  // share store under the composite key (channel_id, secret_id, version).
+  uint64 secretId = 3;
+
+  // Version number of the share.
+  //
+  // Each resharing event increments this value.
+  uint32 version = 4;
+
+  // List of share versions that MUST be retained by the Helper.
+  //
+  // Any stored version not included in this list SHOULD be deleted.
+  //
+  // If absent, the Helper MUST:
+  //
+  // - retain the existing keepList
+  // - add the current `version` to the retained set
+  //
+  // This field MUST be ignored if `version` is older than the latest
+  // version already stored, to prevent replay attacks.
+  repeated uint32 keepList = 5;
+
+  // Optional human-readable description of this share version.
+  //
+  // This field is visible to the Helper and is not intended to carry
+  // sensitive information. It may be used for debugging, labeling, or
+  // user-facing display.
+  string versionDescription = 6;
+
+  // Timestamp indicating when this message was created.
+  //
+  // Used for observability, replay detection, and timeout handling.
+  google.protobuf.Timestamp timestamp = 7;
+
+  // Ephemeral transport endpoints at which the requester wants to receive
+  // the response to *this exchange*, in its own preference order,
+  // overriding the channel's stored peer endpoints for this round-trip
+  // only.
+  //
+  // # When to use
+  //
+  // Set when the requester's outbound endpoint does not match the endpoint
+  // the responder has on file for the channel — for example a replica
+  // talking to a helper that was paired with a sibling replica. The
+  // responder routes the response here but does NOT persist these
+  // endpoints; use `UpdateChannelInfoRequestMessage` for permanent changes.
+  //
+  // # Semantics
+  //
+  // - Absent (the default): the responder routes to the endpoints stored on
+  //  its `Channel` record for this `channelId`.
+  // - Present: the responder routes this exchange's response here, and
+  //  leaves the stored endpoints unchanged.
+  //
+  // Superseded by `replyToTransports`, which carries every endpoint rather
+  // than one. Kept, and still populated with the list's first entry, so
+  // implementations predating that field still receive a reply.
+  // **Scheduled for removal in v0.0.5.**
+  //
+  // **Reading this field directly is now incorrect** for the same reason it
+  // is on `transportProtocol`: it is one entry of a list and may be absent.
+  // Resolve it against `replyToTransports` instead.
+  optional TransportProtocol replyTo = 8 [deprecated = true];
+
+  // Every ephemeral endpoint the requester wants this exchange's response
+  // delivered to, in its own preference order.
+  //
+  // # Semantics
+  //
+  // - Empty, and `replyTo` absent: the responder routes to the endpoints
+  //  stored on its `Channel` record for this `channelId`.
+  // - Empty, `replyTo` present: that one endpoint, which is how every
+  //  implementation predating this field asks.
+  // - Non-empty: the responder routes the response to any one of these, in
+  //  the order given, and leaves the stored endpoints unchanged. Delivery
+  //  to any one is success.
+  //
+  // # Why this is a new field rather than a wider `replyTo`
+  //
+  // `replyTo` was singular through 0.0.2. Re-tagging it `repeated` would
+  // have been wire-compatible in the read direction only: protobuf merges a
+  // repeated submessage into a singular reader field-by-field, so a 0.0.2
+  // peer decoding a multi-entry list sees the **last** entry, while the
+  // first entry is what every other compatibility rule in this release
+  // designates as the legacy-readable one. One list cannot be ordered to
+  // satisfy both. A new tag lets the singular field keep meaning exactly
+  // what it did — the same shape `supportedTransports` (contact.proto tag 9)
+  // uses beside `transportProtocol` (tag 7).
+  repeated TransportProtocol replyToTransports = 10;
+
+  // Identity of the replica that authored this update.
+  //
+  // # Audience
+  //
+  // This field is for **replicas only**. Helpers know nothing about
+  // replicas and never receive it:
+  //
+  // - helper-bound (`SHARE_ALGORITHM_VSS`) — MUST be absent.
+  // - replica-bound (`SHARE_ALGORITHM_REPLICA_SECRET`) — MUST be present.
+  //
+  // The invariant is `replicaId.is_some() == (shareAlgorithm ==
+  // SHARE_ALGORITHM_REPLICA_SECRET)`, asserted on send and on receive; a
+  // violation is a protocol error, not a tolerated variation.
+  //
+  // # Why the receiver needs it
+  //
+  // Every member of a replica group shares one `channelId`, so the
+  // channel identifies the *group*, not the sender. The channel's
+  // counterparty says who established it, which after admission by a
+  // third member is not who wrote this message. Author attribution
+  // therefore comes from this field and never from the channel record.
+  //
+  // Applications use it to resolve which member published an update, and
+  // to route the response back to that member's endpoint.
+  //
+  // # Out of scope for the protocol
+  //
+  // The protocol does not authenticate the claim; anyone holding the
+  // group key may write any `replicaId`. It is an identifier, not an
+  // authenticator.
+  optional uint64 replicaId = 9;
+}
+
+// StoreShareResponseMessage is the response to a StoreShareRequestMessage.
+//
+// # Semantics
+//
+// This message indicates whether the Helper successfully:
+//
+// - stored or updated the requested share version
+// - applied the retention policy (keepList)
+//
+// # Idempotency
+//
+// Multiple identical requests SHOULD produce identical responses.
+message StoreShareResponseMessage {
+
+  // Result of processing the request.
+  //
+  // Indicates success or failure of the storage/update operation.
+  DeRecResult result = 1;
+
+  // Identifier of the secret to which this response refers.
+  //
+  // Echoed from the corresponding StoreShareRequestMessage so the Owner can
+  // correlate responses with the correct secret without inspecting the share
+  // bytes.
+  uint64 secretId = 2;
+
+  // Version number from the corresponding request.
+  //
+  // This allows the sender to correlate responses with requests.
+  uint32 version = 3;
+
+  // Timestamp indicating when this message was created.
+  //
+  // Used for observability, replay detection, and timeout handling.
+  google.protobuf.Timestamp timestamp = 4;
+
+  // Identity of the replica that produced this response.
+  //
+  // Present only when the corresponding request was replica-bound
+  // (`shareAlgorithm == SHARE_ALGORITHM_REPLICA_SECRET`); absent on
+  // helper responses, which carry no replica identity in either
+  // direction.
+  //
+  // # Why the requester needs it
+  //
+  // Every member of a replica group answers on the same `channelId`, and
+  // `secretId` and `version` are echoed identically by all of them. Two
+  // members responding to one publish are otherwise indistinguishable —
+  // the requester cannot tell whether both acknowledged or one
+  // acknowledged twice, and so cannot track a sharing round per member.
+  optional uint64 replicaId = 5;
+}

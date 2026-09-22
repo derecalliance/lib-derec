@@ -16,8 +16,8 @@
 # Internal targets are prefixed `_` to keep them out of the tab-completion a
 # developer sees; nothing outside this file should depend on them.
 
-.PHONY: all _preflight _lint _docs _test-rust _build _packages _test-native \
-        _test-js _smoke _verify-versions
+.PHONY: all check-descriptor _preflight _lint _docs _test-rust _build _packages \
+        _test-packaging _test-native _test-js _smoke _verify-versions
 
 ROOT := ..
 VERSION := $(shell $(ROOT)/scripts/get-version.sh)
@@ -26,7 +26,7 @@ define section
 	@printf '\n\033[1m── %s\033[0m\n' $(1)
 endef
 
-all: _preflight _lint _docs _test-rust _build _packages _test-native _test-js _smoke _verify-versions
+all: _preflight _lint _docs _test-rust _build _packages _test-packaging _test-native _test-js _smoke check-descriptor _verify-versions
 	$(call section,"Release build complete")
 	@printf 'Every package built and verified at version %s.\n' '$(VERSION)'
 	@printf 'Staged for publication:\n'
@@ -34,6 +34,9 @@ all: _preflight _lint _docs _test-rust _build _packages _test-native _test-js _s
 	@printf '  npm         library/target/pkg-{nodejs,web,react-native}\n'
 	@printf '  nuget       packages/dotnet/DeRec.Library/bin/Release/DeRec.Library.%s.nupkg\n' '$(VERSION)'
 	@printf '  go          tag packages/go/v%s\n' '$(VERSION)'
+
+check-descriptor:
+	../scripts/check-descriptor-optional.sh
 
 # Fail early and by name rather than partway through with a cryptic error from
 # whichever tool happens to be missing.
@@ -83,6 +86,11 @@ _test-rust:
 	$(call section,"Rust tests")
 	cargo test --workspace
 	cargo test -p derec-library --features ffi
+# `derec-proto`'s descriptor tests are gated behind a default-off feature, and
+# the only crate that enables it does so as a build-dependency. The feature
+# resolver keeps build-dependency features separate from normal ones, so
+# `--workspace` compiles that test file to zero tests. It needs its own run.
+	cargo test -p derec-proto --features descriptor
 
 _build:
 	$(call section,"Native build")
@@ -101,6 +109,19 @@ _packages: _build
 	$(ROOT)/scripts/prepare-go-package.sh
 	$(call section,"Packaging: react-native")
 	$(ROOT)/scripts/prepare-react-native-package.sh
+
+# Each packaging script embeds the schema bundle by hand; nothing forces a
+# script that forgets to copy it to fail loudly on its own (the .NET csproj's
+# wildcard `Include`, for one, silently expands to zero items). Runs after
+# `_packages` so it inspects what was actually staged and packed, not what
+# was meant to be.
+_test-packaging: _packages
+	$(call section,"Packaging: schema bundle assertions")
+	$(ROOT)/scripts/test-schema-bundle.sh
+	$(ROOT)/scripts/test-go-schema-freshness.sh
+	$(ROOT)/scripts/test-npm-schema-packaging.sh
+	$(ROOT)/scripts/test-dotnet-schema-packaging.sh
+	$(ROOT)/scripts/test-react-native-schema-packaging.sh
 
 # Tests that need the built artifacts: Go loads the freshly staged shared
 # library, and the C++ harness links the release staticlib.

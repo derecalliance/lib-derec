@@ -1,0 +1,140 @@
+/*
+ * Copyright (c) DeRec Alliance and its Contributors.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
+import "result.proto";
+import "transportprotocol.proto";
+
+package org.derecalliance.derec.protobuf;
+
+// UnpairRequestMessage requests termination of the DeRec relationship
+// between two parties (Owner and Helper).
+//
+// # Context
+//
+// This message is used when:
+//
+// - the Owner no longer wants a Helper to store shares
+// - the Helper chooses to stop acting as a Helper
+// - the relationship must be terminated due to policy, failure, or user action
+//
+// # Semantics
+//
+// Upon receiving this message, the recipient MUST:
+//
+// - stop acting as a Helper for the corresponding channel
+// - cease all protocol interactions for that channel
+//
+// The recipient SHOULD:
+//
+// - delete all stored shares and related state for the Owner
+//
+// However, deletion MAY be subject to:
+//
+// - regulatory requirements
+// - contractual obligations
+// - service-specific retention policies
+//
+// # Effects on Protocol State
+//
+// After a successful unpair:
+//
+// - the channel is considered permanently closed
+// - the Owner MUST NOT rely on this Helper for recovery
+// - the Owner SHOULD reshare secrets with remaining Helpers if necessary
+//
+// # Idempotency
+//
+// This message is idempotent. Repeated unpair requests SHOULD result in
+// the same final state.
+message UnpairRequestMessage {
+
+  // Optional human-readable explanation for the unpairing.
+  //
+  // This field is intended for logging, debugging, or user display.
+  // It MUST NOT be relied upon for protocol behavior.
+  string memo = 1;
+
+  // Timestamp indicating when this message was created.
+  //
+  // This value is expressed in UTC and can be used for:
+  //
+  // - observability and logging
+  // - replay detection (in combination with sequence numbers)
+  // - timeout handling
+  google.protobuf.Timestamp timestamp = 2;
+
+  // Ephemeral transport endpoint at which the requester wants to receive
+  // the response to *this exchange*, overriding the channel's stored peer
+  // endpoint for this round-trip only.
+  //
+  // See `StoreShareRequestMessage.replyTo` for full semantics.
+  //
+  // Superseded by `replyToTransports`, which carries every endpoint rather
+  // than one. Kept, and still populated with the list's first entry, so
+  // implementations predating that field still receive a reply.
+  // **Scheduled for removal in v0.0.5.** Reading this field directly is now
+  // incorrect — resolve it against `replyToTransports`.
+  optional TransportProtocol replyTo = 3 [deprecated = true];
+
+  // Every ephemeral endpoint the requester wants this exchange's response
+  // delivered to, in its own preference order.
+  //
+  // See `StoreShareRequestMessage.replyToTransports` for full semantics,
+  // including why this is a new tag rather than a widened `replyTo`.
+  repeated TransportProtocol replyToTransports = 5;
+
+  // Identity of the replica-group member that initiated this unpair.
+  //
+  // A replica-originated unpair MUST carry it; an owner-originated one MUST
+  // NOT. Its presence is what tells the receiver which path the message
+  // belongs to, exactly as on `StoreShareRequestMessage`. Asserted on send
+  // and on receive; a violation is a protocol error.
+  //
+  // Removing a replica is not the same operation as unpairing a helper. A
+  // helper channel serves exactly one peer, so unpairing deletes it. Every
+  // member of a replica group shares one channel, so deleting it would sever
+  // the whole group — replica removal edits a member row instead, and this
+  // field says which row.
+  optional uint64 replicaId = 4;
+}
+
+// UnpairResponseMessage is the response to an UnpairRequestMessage.
+//
+// # Semantics
+//
+// This message indicates whether the recipient successfully processed
+// the unpair request.
+//
+// On success:
+//
+// - the relationship is considered terminated
+// - the recipient has ceased participation in the protocol for this channel
+//
+// On failure:
+//
+// - the relationship state is undefined and SHOULD be handled by the
+//  application (e.g., retry or escalate)
+//
+// # Idempotency
+//
+// Multiple identical unpair requests SHOULD produce consistent responses.
+message UnpairResponseMessage {
+  // Result of processing the unpair request.
+  //
+  // Indicates whether the unpair operation was successfully completed.
+  DeRecResult result = 1;
+
+  // Timestamp indicating when this message was created.
+  //
+  // This value is expressed in UTC and can be used for:
+  //
+  // - observability and logging
+  // - replay detection (in combination with sequence numbers)
+  // - timeout handling
+  google.protobuf.Timestamp timestamp = 2;
+}

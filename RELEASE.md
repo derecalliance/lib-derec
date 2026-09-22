@@ -131,6 +131,32 @@ You can also verify using:
 cargo search derec
 ```
 
+### Post-publish: schema distribution
+
+`derec-proto` bundles the `.proto` schema inside the published crate so a
+`tonic` client or server built against `DeRecTransport` never needs a
+`lib-derec` checkout. That guarantee rests on `cargo`'s package-extraction
+and build-script conventions rather than on anything a path-dependency test
+in this repository can exercise — in the working tree `derec-proto` resolves
+through its crate directory, which is the one resolution a consumer never
+gets. So confirm it against the registry, once `derec-proto` is up:
+
+```bash
+./scripts/test-published-schema.sh          # defaults to the current version
+```
+
+It builds a `DeRecTransport` client and server from a scratch crate that
+depends on `derec-proto = "=<version>"` from crates.io, holds no `.proto`
+files of its own, and sits outside any `lib-derec` checkout — three ways:
+
+- `cargo build --offline` against a warm cache
+- `cargo vendor` with source replacement configured
+- a `CARGO_HOME` pointed at a non-default path
+
+Run it after step 1 of the publish sequence; it needs only `derec-proto`, not
+the whole release. If `derec-proto` is published without the `descriptor`
+feature the script fails at dependency resolution, before building anything.
+
 ---
 
 ## Publishing Node.js SDK
@@ -584,6 +610,13 @@ Before publishing a release:
 - [ ] Release notes written, including any **breaking** changes
 - [ ] `make all` succeeds — run it **last**, immediately before publishing
 - [ ] Test installation of all SDKs
+
+After publishing:
+
+- [ ] `./scripts/test-published-schema.sh` passes — see
+      [Post-publish: schema distribution](#post-publish-schema-distribution).
+      It is the only check in this repository that exercises the published
+      crate rather than the working tree.
 
 ---
 

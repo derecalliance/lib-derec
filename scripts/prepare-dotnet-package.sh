@@ -11,6 +11,7 @@ VERSION="$("$ROOT_DIR/scripts/get-version.sh")"
 
 DOTNET_PKG_DIR="$ROOT_DIR/packages/dotnet/DeRec.Library"
 RUNTIMES_DIR="$DOTNET_PKG_DIR/runtimes"
+SCHEMA_DIR="$DOTNET_PKG_DIR/schema"
 
 # Rust target -> NuGet RID -> expected library filename
 #
@@ -89,6 +90,10 @@ main() {
          "$RUNTIMES_DIR/osx-x64" \
          "$RUNTIMES_DIR/linux-x64" \
          "$RUNTIMES_DIR/linux-arm64"
+
+  # The schema ships inside the package so consumers can generate their own
+  # code from it without a lib-derec checkout.
+  "$ROOT_DIR/scripts/sync-schema.sh" "$SCHEMA_DIR"
 
   log "Cleaning previous nuget packages"
   rm -f "$DOTNET_PKG_DIR"/bin/Release/*.nupkg

@@ -52,7 +52,7 @@ rather than two.
 
 ## The service
 
-`protobufs/protobufs/derectransport.proto` defines the whole contract:
+`protobufs/grpc/derectransport.proto` defines the whole contract:
 
 ```protobuf
 service DeRecTransport {

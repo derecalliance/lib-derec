@@ -1,6 +1,6 @@
 [package]
 name = "derec-proto"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -31,4 +31,9 @@ prost-build = "0.14.4"
 
 [features]
 serde = ["dep:serde"]
+descriptor = []
+
+[dev-dependencies]
+prost = "0.14.4"
+prost-types = "0.14.4"
 

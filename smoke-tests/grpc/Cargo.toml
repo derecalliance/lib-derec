@@ -15,6 +15,7 @@ tracing = { version = "0.1.41", optional = true }
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"
+derec-proto = { path = "../../protobufs", features = ["descriptor"] }
 
 [features]
 logging = ["dep:tracing", "derec-library/logging"]
