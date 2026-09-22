@@ -29,7 +29,26 @@ fi
 rm -rf "$OUT_DIR/proto" "$OUT_DIR/derec_descriptor.bin"
 mkdir -p "$OUT_DIR/proto"
 
+# Flattening two roots into one directory means a shared basename would have
+# one file silently overwrite the other, leaving the bundle the right size and
+# the wrong contents. Fail here rather than let a downstream count assertion
+# read the expected total and pass.
+collisions="$(basename -a "$SRC_MESSAGES"/*.proto "$SRC_TRANSPORT"/*.proto | sort | uniq -d)"
+if [[ -n "$collisions" ]]; then
+  echo "the two schema roots share these file names:" >&2
+  echo "$collisions" >&2
+  echo "flattening them into one directory would discard one of each" >&2
+  exit 1
+fi
+
 cp "$SRC_MESSAGES"/*.proto "$SRC_TRANSPORT"/*.proto "$OUT_DIR/proto/"
+
+expected="$(ls "$SRC_MESSAGES"/*.proto "$SRC_TRANSPORT"/*.proto | wc -l | tr -d ' ')"
+actual="$(find "$OUT_DIR/proto" -name '*.proto' | wc -l | tr -d ' ')"
+if [[ "$expected" != "$actual" ]]; then
+  echo "copied $actual of $expected schema files into the bundle" >&2
+  exit 1
+fi
 
 # --include_source_info embeds comment locations in the descriptor, so code
 # generated from this bundle (Go, C#, TypeScript, ...) carries the protobuf

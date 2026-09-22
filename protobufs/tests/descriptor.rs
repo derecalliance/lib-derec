@@ -3,7 +3,7 @@
 
 #![cfg(feature = "descriptor")]
 
-use derec_proto::descriptor::{transport_descriptor, FILE_DESCRIPTOR_SET};
+use derec_proto::descriptor::{FILE_DESCRIPTOR_SET, transport_descriptor};
 use prost::Message as _;
 use prost_types::FileDescriptorSet;
 

@@ -949,10 +949,14 @@ queue, custom relay, …).
 > `Https` and `Grpc`. The library validates and propagates `grpcs://` /
 > `grpc://` endpoints exactly as it does HTTPS ones, but never implements the
 > gRPC side itself: `derec-proto` ships the `DeRecTransport` service contract
-> (`rpc Send(DeRecMessage) returns (google.protobuf.Empty)`) as a `.proto`
-> file with no generated service stubs. Consumers who want stubs run their
-> own `tonic-prost-build`, as `smoke-tests/grpc` does — see that crate for a
-> complete worked reference. New transports can be added by extending the
+> (`rpc Send(DeRecMessage) returns (google.protobuf.Empty)`) with no generated
+> service stubs. Consumers who want stubs run their own `tonic-prost-build`
+> against the schema `derec-proto` carries — enable its `descriptor` feature
+> on a build-dependency and pass `descriptor::transport_descriptor()` to
+> `compile_fds`; the [`derec-proto`
+> README](https://docs.rs/crate/derec-proto/latest) has the full recipe and
+> `smoke-tests/grpc` is a complete worked reference. No `.proto` file or
+> include path is involved. New transports can be added by extending the
 > protobuf enum.
 
 An application serving more than one transport declares them all, in

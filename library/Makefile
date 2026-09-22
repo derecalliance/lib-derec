@@ -86,6 +86,11 @@ _test-rust:
 	$(call section,"Rust tests")
 	cargo test --workspace
 	cargo test -p derec-library --features ffi
+# `derec-proto`'s descriptor tests are gated behind a default-off feature, and
+# the only crate that enables it does so as a build-dependency. The feature
+# resolver keeps build-dependency features separate from normal ones, so
+# `--workspace` compiles that test file to zero tests. It needs its own run.
+	cargo test -p derec-proto --features descriptor
 
 _build:
 	$(call section,"Native build")
@@ -112,6 +117,8 @@ _packages: _build
 # was meant to be.
 _test-packaging: _packages
 	$(call section,"Packaging: schema bundle assertions")
+	$(ROOT)/scripts/test-schema-bundle.sh
+	$(ROOT)/scripts/test-go-schema-freshness.sh
 	$(ROOT)/scripts/test-npm-schema-packaging.sh
 	$(ROOT)/scripts/test-dotnet-schema-packaging.sh
 	$(ROOT)/scripts/test-react-native-schema-packaging.sh

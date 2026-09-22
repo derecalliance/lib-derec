@@ -113,10 +113,10 @@ under `cargo vendor`, a relocated `CARGO_HOME`, registry mirrors, and
 
 ```toml
 [dependencies]
-derec-proto = "0.0.3"
+derec-proto = "0.0.4"
 
 [build-dependencies]
-derec-proto = { version = "0.0.3", features = ["descriptor"] }
+derec-proto = { version = "0.0.4", features = ["descriptor"] }
 tonic-prost-build = "0.14"
 ```
 
