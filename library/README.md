@@ -233,6 +233,37 @@ loop {
 A complete working example lives in the repository's end-to-end tests; see
 [End-to-end test coverage](https://github.com/derecalliance/lib-derec#end-to-end-test-coverage).
 
+### After a restore
+
+`restore` writes no owner-side tracking shares, so `VerifyShares` at the
+recovered version fails with `Error::InvalidInput` — this device holds no
+reference bytes for it. It cannot: a `VerifyShare` proof is
+`SHA-384(share ‖ nonce)` over the exact bytes a helper holds, and recovery
+cannot attribute a collected share to a canonical helper channel (the VSS
+x-coordinate is a random field element and `GetShareResponseMessage`
+carries no channel id).
+
+Publish once to get verification back. `start(ProtectSecret)` derives
+`recovered_version + 1` from the snapshot `restore` committed, writes real
+tracking shares as it distributes, and verification at that version behaves
+as it does for an owner that never recovered:
+
+```rust,ignore
+protocol.restore(&secret, recovered_version).await?;
+// Re-publish so this device holds tracking shares of its own.
+protocol.start(DeRecFlow::ProtectSecret {
+    secrets: secret.secrets.clone(),
+    description: None,
+}).await?;
+// Now verifiable, at recovered_version + 1.
+```
+
+If the recovered roster carries a replica group, that publish additionally
+needs a `replica_id` the roster names — `restore` does not adopt one,
+since claiming the lost device's identity is a takeover with its own
+convergence rules. Without it the publish fails with
+`Error::ReplicaIdNotConfigured` and no share reaches any helper.
+
 ---
 
 ## Builder configuration
@@ -453,7 +484,7 @@ transport cap protects resources, `reject` enforces policy.
 | Verification | Challenge helpers to prove they still hold their shares. |
 | Discovery | Ask helpers which secrets and versions they store. |
 | Recovery | Re-pair, collect shares, reconstruct the secret. |
-| Restore | Commit a recovered [`Secret`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.Secret.html) into an empty protocol — reseats canonical helper / replica channels at the recovered version and wipes the throwaway recovery-mode channels. Called once, after `Recovery`, via [`DeRecProtocol::restore`](https://docs.rs/derec-library/latest/derec_library/protocol/struct.DeRecProtocol.html#method.restore). |
+| Restore | Commit a recovered [`Secret`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.Secret.html) into an empty protocol — reseats canonical helper / replica channels at the recovered version and wipes the throwaway recovery-mode channels. Called once, after `Recovery`, via [`DeRecProtocol::restore`](https://docs.rs/derec-library/latest/derec_library/protocol/struct.DeRecProtocol.html#method.restore). Verification needs one publish first — see [After a restore](#after-a-restore). |
 | Unpairing | Tear down a paired channel and drop local state. |
 | Update channel info | Propagate post-pairing changes to communication info and/or transport endpoint. |
 
@@ -664,7 +695,7 @@ two payload shapes from the same `start` call:
 - Helpers receive the usual VSS share via `StoreShareRequest`.
 - Destinations receive a typed
   [`ReplicaSecretPayload`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.ReplicaSecretPayload.html)
-  `{ secret: Secret, shares: Vec<ChannelShare> }` — the full
+  `{ secret: Secret, shares: Vec<ChannelShare>, version }` — the full
   secret plus every helper's share keyed by `channel_id`. This is what
   lets a destination act in the source's place during recovery without
   re-running the share collection.
@@ -673,6 +704,18 @@ On the destination, the inbound envelope decodes into
 [`DeRecEvent::ReplicaSecretReceived`](https://docs.rs/derec-library/latest/derec_library/protocol/events/enum.DeRecEvent.html#variant.ReplicaSecretReceived)
 with `secret: Secret` and `shares: Vec<ChannelShare>` already
 parsed — the app just installs the secrets.
+
+The library also writes that share map to the share store as this
+device's own owner-side tracking shares, at the same
+`(channel_id, version)` keys the source used. That is what makes
+**verification** work on a destination: a `VerifyShare` proof is
+`SHA-384(share ‖ nonce)` over the exact bytes the helper holds, so
+without the map a destination could challenge its helpers and receive
+their answers but have nothing to check them against. A destination that
+takes over a mirrored vault can therefore verify it exactly as the source
+could. The same map travels on a replica catch-up, so a member that
+became current by pulling is no less able to verify than one that
+received a push.
 
 #### When a mixed round reports
 
@@ -778,7 +821,7 @@ so implementations need no internal synchronization:
 | Trait | Stores |
 |-------|--------|
 | [`DeRecChannelStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecChannelStore.html) | Helper channels (keyed by `channel_id`), replica-group members (keyed by `replica_id`), and the channel-link graph. |
-| [`DeRecShareStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecShareStore.html) | Encoded share entries keyed by `(channel_id, secret_id, version)`. |
+| [`DeRecShareStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecShareStore.html) | Encoded share entries keyed by `(secret_id, channel_id, version)` — the `secret_id` *argument*, which is the partition every load filters by. `Share::secret_id` is a different value and routinely differs from it; see below. |
 | [`DeRecSecretStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecSecretStore.html) | Per-channel cryptographic material (shared keys, pairing secrets, pairing contacts). |
 | [`DeRecUserSecretStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecUserSecretStore.html) | The latest user-facing secret snapshot per `secret_id` — what a freshly-paired peer is sent. |
 | [`DeRecStateStore`](https://docs.rs/derec-library/latest/derec_library/protocol/traits/trait.DeRecStateStore.html) | In-flight orchestrator state: verification challenges, recovery accumulators, pending unpairs, the active sharing round and catch-up. Must be durable in any deployment that can restart mid-flow. |
@@ -787,6 +830,25 @@ so implementations need no internal synchronization:
 Each trait's rustdoc states its contract, idempotency expectations, and the
 security classification of the data it holds (`DeRecSecretStore` content is
 keychain-grade; the others need durable storage only).
+
+### Share store: `secret_id` is the partition, not `Share::secret_id`
+
+Every `DeRecShareStore` method takes a `secret_id`. That is **this device's
+own partition** — the namespace it stores under, and the value every `load`
+filters by. [`Share::secret_id`](https://docs.rs/derec-library/latest/derec_library/protocol/types/struct.Share.html)
+names the secret the bytes belong to, which on a helper is the *owner's* id.
+A helper holds shares belonging to other people's secrets, so one partition
+can legitimately hold several secrets at the same version, and
+`Share::secret_id` is the only thing that tells them apart.
+
+So `save` must key on the argument and carry `share.secret_id` alongside as
+data. Two ways to get this wrong, both of which have shipped:
+
+- **Keying on `share.secret_id`** puts rows where no `load` looks, because
+  the reads filter on the partition. The store silently discards everything
+  it is given, and every helper-side verification and recovery answer fails.
+- **Asserting the two are equal** fires on the ordinary case of a helper
+  holding someone else's share.
 
 ### Transport: implement `SendOne`, not `send`
 

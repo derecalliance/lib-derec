@@ -200,10 +200,18 @@ type SecretStore interface {
 	Remove(secretID, channelID uint64, kind SecretKind) error
 }
 
-// ShareStore persists shares, keyed by (channelID, secretID, version).
+// ShareStore persists shares, keyed by (secretID, channelID, version)
+// where secretID is the partition passed to every method.
 // Mirrors derec_library::protocol::DeRecShareStore. The orchestrator
 // funnels every share access through this interface —
 // discovery/recovery/verification all hit one of the Load* methods.
+//
+// Share.SecretID is not the partition. It names the secret the bytes
+// belong to, which on a helper is the owner's id and routinely differs
+// from the partition this device stores under. Key on the secretID
+// argument and carry Share.SecretID alongside as data: keying on
+// Share.SecretID makes writes invisible to every Load, which filter on
+// the partition.
 type ShareStore interface {
 	// Load returns the shares for a single channel within secretID. An
 	// empty versions selects every version.
@@ -217,8 +225,9 @@ type ShareStore interface {
 	// LatestVersion returns the highest version stored for secretID, or
 	// ok=false if no shares exist yet for this secret.
 	LatestVersion(secretID uint64) (version uint32, ok bool, err error)
-	// Save inserts or replaces the share at (channelID, share.SecretID,
-	// share.Version).
+	// Save inserts or replaces the share at (secretID, channelID,
+	// share.Version) — the secretID argument, not share.SecretID. See
+	// the interface docs.
 	Save(secretID, channelID uint64, share Share) error
 	// RemoveChannel deletes every share stored for channelID within
 	// secretID.

@@ -242,6 +242,17 @@ export interface Share {
   bytes: Uint8Array;
 }
 
+/**
+ * Share-record persistence.
+ *
+ * Rows are keyed by `(secretId, channelId, version)` where `secretId` is
+ * the partition passed to every method. `Share.secretId` is a different
+ * value: it names the secret the bytes belong to, which on a helper is
+ * the owner's id and routinely differs from the partition this device
+ * stores under. Key on the argument and carry `share.secretId` alongside
+ * as data — keying on it instead puts rows where no `load` looks, since
+ * every read filters on the partition.
+ */
 export interface ShareStore {
   load(secretId: string, channelId: string, versions: number[]): Promise<Share[]>;
   loadMany(

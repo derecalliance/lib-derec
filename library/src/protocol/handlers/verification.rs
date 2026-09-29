@@ -72,6 +72,17 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
 ///
 /// Dispatch failure is isolated per channel and surfaced as
 /// `VerifySharesFailed` rather than short-circuiting the fan-out.
+///
+/// # Answering a member of a replica group
+///
+/// A Helper holds exactly one endpoint per channel: the device that paired
+/// with it. Every other member of the group is invisible to it, so a
+/// challenge from a group carries this device's own endpoint or the answer is
+/// routed to whoever paired — which for a Destination verifying a mirrored
+/// vault is the Source, leaving the challenger waiting on a reply another
+/// device silently drops. Decided here rather than left to the application's
+/// `auto_reply_to` setting, on the same terms as the helper leg of
+/// [`sharing::start`](super::sharing::start).
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(trace_id = round.trace_id, secret_id = local.secret_id, version = version))
@@ -110,7 +121,17 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
         )
         .await?;
 
-    let events = dispatch_all(stores, secret_id, version, keys, round).await;
+    let roster = stores
+        .channels
+        .replicas_matching(secret_id, crate::protocol::types::ReplicaFilter::default())
+        .await?;
+    let reply_to: Vec<derec_proto::TransportProtocol> = if roster.is_empty() {
+        round.reply_to.to_vec()
+    } else {
+        vec![local.primary().clone()]
+    };
+
+    let events = dispatch_all(stores, secret_id, version, keys, &reply_to, round).await;
 
     #[cfg(feature = "logging")]
     tracing::info!(
@@ -323,6 +344,7 @@ async fn dispatch_all<S: StoreSet>(
     secret_id: u64,
     version: u32,
     keys: Vec<(ChannelId, SecretValue)>,
+    reply_to: &[derec_proto::TransportProtocol],
     round: &Round<'_>,
 ) -> Vec<DeRecEvent> {
     let mut events = Vec::with_capacity(keys.len());
@@ -336,7 +358,17 @@ async fn dispatch_all<S: StoreSet>(
             continue;
         };
 
-        match dispatch_one(stores, secret_id, version, channel_id, &shared_key, round).await {
+        match dispatch_one(
+            stores,
+            secret_id,
+            version,
+            channel_id,
+            &shared_key,
+            reply_to,
+            round,
+        )
+        .await
+        {
             Ok(()) => {
                 events.push(DeRecEvent::VerifySharesStarted {
                     channel_id,
@@ -377,22 +409,18 @@ async fn dispatch_one<S: StoreSet>(
     version: u32,
     channel_id: ChannelId,
     shared_key: &SharedKey,
+    reply_to: &[derec_proto::TransportProtocol],
     round: &Round<'_>,
 ) -> Result<()> {
     let endpoint = stores
         .channels
         .peer_endpoints(secret_id, channel_id)
         .await?;
-    let msg = produce_verify_share_request_message(
-        channel_id,
-        secret_id,
-        version,
-        shared_key,
-        round.reply_to,
-    )?;
+    let msg =
+        produce_verify_share_request_message(channel_id, secret_id, version, shared_key, reply_to)?;
 
     let (legacy_reply_to, reply_to_transports) =
-        crate::extensions::advertised_endpoints::split_reply_to(round.reply_to);
+        crate::extensions::advertised_endpoints::split_reply_to(reply_to);
 
     stores
         .state

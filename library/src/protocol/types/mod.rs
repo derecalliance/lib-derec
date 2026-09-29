@@ -864,6 +864,22 @@ pub struct ReplicaSecretPayload {
     /// key). See type-level docs for the swap protocol.
     #[prost(bytes = "vec", tag = "3")]
     pub shared_key: ::prost::alloc::vec::Vec<u8>,
+    /// The version `secret` and `shares` belong to.
+    ///
+    /// The payload is self-describing because its two carriers disagree
+    /// about what the enclosing `version` field means. On a push it is
+    /// the round being published and matches
+    /// `StoreShareRequestMessage.version`. On a catch-up the enclosing
+    /// `GetShareResponseMessage.version` echoes the version the *asker*
+    /// requested, while the payload is whatever snapshot the *answerer*
+    /// happens to hold — so filing the share map under the enclosing
+    /// value would key it to a version these bytes were never part of.
+    ///
+    /// `0` means the writer predates this field. A receiver falls back
+    /// to the enclosing message's version, which is what that writer
+    /// intended.
+    #[prost(uint32, tag = "4")]
+    pub version: u32,
 }
 
 /// Kind of secret material stored by [`crate::protocol::DeRecSecretStore`].

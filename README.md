@@ -120,7 +120,8 @@ including Node-only dependencies.
 
 End-to-end smoke tests live under `smoke-tests/` and exercise every primitive
 flow plus the high-level `DeRecProtocol` orchestrator (Owner↔Helper pair,
-ProtectSecret, Discovery, Recovery, replica secret sync) across every SDK:
+ProtectSecret, Verification, Discovery, Recovery, replica secret sync) across
+every SDK:
 
 - `smoke-tests/rust` — Rust primitive + protocol tests. Run with `cargo run -p derec-rust-binding-smoke-test`.
 - `smoke-tests/nodejs` — Node.js WASM tests. `cd smoke-tests/nodejs && npm install && npx tsc && node index.js`.

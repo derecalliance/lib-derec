@@ -446,8 +446,23 @@ pub trait DeRecShareStore {
     /// writer to disambiguate. See
     /// `StoreShareRequestMessage.replicaId`.
     ///
-    /// `share.secret_id` is denormalized metadata and must match the
-    /// partition key `secret_id` — implementations may assert this.
+    /// # `secret_id` is not `share.secret_id`
+    ///
+    /// The `secret_id` argument is the **partition** — this device's own
+    /// namespace, and the value every `load` on this trait filters by.
+    /// [`Share::secret_id`] names the secret the bytes belong to, which
+    /// on a Helper is the *Owner's* id and routinely differs. Key on the
+    /// argument; carry `share.secret_id` alongside as data.
+    ///
+    /// Keying on `share.secret_id` instead makes writes invisible to
+    /// every read, since the reads filter on the partition — a store
+    /// that silently discards everything it is given. Asserting the two
+    /// are equal is just as wrong: it fires on the ordinary case of a
+    /// Helper holding someone else's share.
+    ///
+    /// See [`Self::load_many`] for why one partition legitimately holds
+    /// several secrets, and why `share.secret_id` is the only thing that
+    /// tells them apart.
     fn save(
         &mut self,
         secret_id: u64,

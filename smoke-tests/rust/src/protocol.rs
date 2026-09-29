@@ -30,6 +30,9 @@ pub async fn run_all() {
     run_protect_secret_with_replica_targets_flow().await;
     run_protect_secret_per_target_failure_flow().await;
     run_sharing_flow().await;
+    run_verification_flow().await;
+    run_replica_mirror_then_verify_flow().await;
+    run_replica_verifies_only_synced_versions_flow().await;
     run_discovery_and_recovery_flow().await;
     run_unpairing_flow().await;
     run_update_channel_info_flow().await;
@@ -346,8 +349,11 @@ impl DeRecShareStore for InMemoryShareStore {
         channel_id: ChannelId,
         share: Share,
     ) -> ShareStoreFuture<'_, ()> {
-        let _ = secret_id;
-        let key = (channel_id.0, share.secret_id, share.version);
+        // Keyed by the partition, which is what every read here filters by.
+        // `share.secret_id` names the Owner's secret and differs from the
+        // partition whenever this peer is a Helper, so keying on it would put
+        // rows where no read looks.
+        let key = (channel_id.0, secret_id, share.version);
         self.data.insert(key, share);
         Box::pin(std::future::ready(Ok(())))
     }
@@ -2211,6 +2217,593 @@ async fn run_sharing_flow() {
     );
 
     println!("Protocol sharing flow test passed.");
+}
+
+/// An Owner challenges its Helpers to prove they still hold the shares it
+/// distributed, and both answers check out.
+///
+/// The fourth of the four flows an owner is expected to be able to drive, and
+/// the one that had no end-to-end coverage. Everything about it is a
+/// round-trip between two devices — the Owner hashes the bytes it recorded
+/// when it distributed, the Helper hashes the bytes it stored — so a
+/// single-process unit test cannot see a disagreement between the two sides.
+async fn run_verification_flow() {
+    println!("=== Protocol verification flow test ===");
+
+    let mut owner = Peer::with_secret_id("owner", "https://owner.example.com", 42);
+    let mut helper_a = Peer::new("helper-a", "https://helper-a.example.com");
+    let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
+
+    let channel_a = pair(&mut owner, &mut helper_a, ChannelId(1)).await;
+    let channel_b = pair(&mut owner, &mut helper_b, ChannelId(2)).await;
+
+    // Pairing can auto-publish, so the version to verify is the one this
+    // round reports rather than whichever share happens to land first.
+    let protect_events = owner
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![UserSecret {
+                id: vec![1],
+                name: "verifiable secret".to_owned(),
+                data: b"bytes-to-be-proven".to_vec(),
+            }],
+            description: None,
+        })
+        .await
+        .expect("owner start(ProtectSecret) failed");
+    let version = protect_events
+        .iter()
+        .find_map(|e| match e {
+            DeRecEvent::ProtectSecretStarted { version, .. } => Some(*version),
+            _ => None,
+        })
+        .expect("the round must report the version it published");
+    pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b]).await;
+
+    let owner_sid = owner.protocol.secret_id();
+    owner
+        .protocol
+        .start(DeRecFlow::VerifyShares {
+            secret_id: owner_sid,
+            version,
+            target: Target::All,
+        })
+        .await
+        .expect("owner start(VerifyShares) failed");
+
+    let events = pump_many(&mut [&mut owner, &mut helper_a, &mut helper_b]).await;
+
+    let verified: HashSet<ChannelId> = events
+        .iter()
+        .filter_map(|e| match e {
+            DeRecEvent::ShareVerified { channel_id, .. } => Some(*channel_id),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        verified.contains(&channel_a) && verified.contains(&channel_b),
+        "both helpers must prove possession; verified {verified:?}"
+    );
+
+    println!("Protocol verification flow test passed.");
+}
+
+/// A Replica Destination that received a mirrored vault can verify the Helpers
+/// holding that vault's shares.
+///
+/// The Destination never spoke to those Helpers and never split the secret
+/// itself: the roster gives it each Helper's channel and key, and the
+/// accompanying share map gives it the committed bytes to hash a proof
+/// against. Both halves are required, which is what this asserts — the map
+/// used to be surfaced to the application and dropped from the stores, so a
+/// Destination could challenge every Helper, receive every answer, and reject
+/// all of them for having nothing to compare against.
+///
+/// Two independent processes are what made the original report credible, and
+/// two independent `Peer`s with separate stores are what reproduce it here:
+/// the Destination reads back only what its own hydration wrote.
+async fn run_replica_mirror_then_verify_flow() {
+    println!("=== Protocol replica mirror-then-verify flow test ===");
+
+    let source_id = 0xAAAA_AAAA_AAAA_AAAAu64;
+    let destination_id = 0xBBBB_BBBB_BBBB_BBBBu64;
+
+    let mut source = Peer::with_secret_id_and_replica_id(
+        "source",
+        "https://source.example.com",
+        0xC0FFEE,
+        source_id,
+    );
+    let mut helper_a = Peer::new("helper-a", "https://helper-a.example.com");
+    let mut helper_b = Peer::new("helper-b", "https://helper-b.example.com");
+    let mut destination = Peer::with_replica_id(
+        "destination",
+        "https://destination.example.com",
+        destination_id,
+    );
+
+    let channel_a = pair(&mut source, &mut helper_a, ChannelId(1)).await;
+    let channel_b = pair(&mut source, &mut helper_b, ChannelId(2)).await;
+
+    // Replica pairing: the Destination joins the group the Source owns.
+    let contact = source
+        .protocol
+        .create_contact(
+            Some(ChannelId(3)),
+            derec_proto::ContactMode::InlineKeys,
+            None,
+        )
+        .await
+        .expect("source.create_contact failed");
+    destination
+        .protocol
+        .start(DeRecFlow::Pairing {
+            kind: SenderKind::ReplicaDestination,
+            contact,
+            peer_communication_info: HashMap::new(),
+        })
+        .await
+        .expect("destination start(Pairing, kind=ReplicaDestination) failed");
+    let round_1 = pump(&mut destination, &mut source).await;
+    let round_2 = pump(&mut source, &mut destination).await;
+    let replica_channel =
+        extract_paired_channel_id(round_1.iter().chain(round_2.iter()), ChannelId(3))
+            .expect("PairingCompleted for the replica handshake must fire");
+
+    // A replica channel counts as paired only once both sides confirm the
+    // fingerprint derived from K_replica, so this is what puts the Destination
+    // on the publish roster at all.
+    let source_fp = source
+        .protocol
+        .get_fingerprint(replica_channel)
+        .await
+        .expect("source fingerprint");
+    let destination_fp = destination
+        .protocol
+        .get_fingerprint(replica_channel)
+        .await
+        .expect("destination fingerprint");
+    assert!(
+        source
+            .protocol
+            .verify_fingerprint(replica_channel, &destination_fp)
+            .await
+            .expect("source verify_fingerprint")
+            && destination
+                .protocol
+                .verify_fingerprint(replica_channel, &source_fp)
+                .await
+                .expect("destination verify_fingerprint"),
+        "both sides must accept the matching fingerprint"
+    );
+
+    // The pair-completion auto-publish is not the round under test.
+    let _ = pump_many(&mut [&mut source, &mut helper_a, &mut helper_b, &mut destination]).await;
+
+    source
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![UserSecret {
+                id: vec![1],
+                name: "mirrored secret".to_owned(),
+                data: b"vault-contents".to_vec(),
+            }],
+            description: Some("mirror round".to_owned()),
+        })
+        .await
+        .expect("source start(ProtectSecret) failed");
+
+    let mirror_events =
+        pump_many(&mut [&mut source, &mut helper_a, &mut helper_b, &mut destination]).await;
+
+    let (mirrored_version, mirrored_share_count) = mirror_events
+        .iter()
+        .find_map(|e| match e {
+            DeRecEvent::ReplicaSecretReceived {
+                version, shares, ..
+            }
+            | DeRecEvent::ReplicaSecretInstalled {
+                version, shares, ..
+            } => Some((*version, shares.len())),
+            _ => None,
+        })
+        .expect("the destination must report the mirrored vault");
+    assert_eq!(
+        mirrored_share_count, 2,
+        "the mirrored payload must carry one share per helper, got {mirrored_share_count}"
+    );
+
+    // The Destination now acts as the owner of the vault it received, over its
+    // own partition — it was never configured with the Source's `secret_id`.
+    let destination_sid = destination.protocol.secret_id();
+    // The share map landed under this device's own partition, tagged with the
+    // Source's `secret_id` as the secret it belongs to.
+    for ch in [channel_a, channel_b] {
+        let tracked = destination
+            .protocol
+            .share_store
+            .load(destination_sid, ch, &[mirrored_version])
+            .await
+            .expect("destination share load");
+        assert_eq!(
+            tracked.len(),
+            1,
+            "the destination must hold a tracking share for helper channel {} \
+             at the mirrored version",
+            ch.0
+        );
+        assert!(
+            !tracked[0].bytes.is_empty(),
+            "the tracking share must carry the committed bytes the helper holds"
+        );
+    }
+
+    destination
+        .protocol
+        .start(DeRecFlow::VerifyShares {
+            secret_id: destination_sid,
+            version: mirrored_version,
+            target: Target::All,
+        })
+        .await
+        .expect("destination start(VerifyShares) failed");
+
+    let events =
+        pump_many(&mut [&mut source, &mut helper_a, &mut helper_b, &mut destination]).await;
+
+    let verified: HashSet<ChannelId> = events
+        .iter()
+        .filter_map(|e| match e {
+            DeRecEvent::ShareVerified { channel_id, .. } => Some(*channel_id),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        verified.contains(&channel_a) && verified.contains(&channel_b),
+        "a destination holding a mirrored vault must verify the helpers that \
+         hold its shares; verified {verified:?}"
+    );
+
+    // ---- and again, for a version the Destination pulled rather than received.
+    //
+    // A member that falls behind catches up by asking a peer, and the answer
+    // carries the same share map a push would have. Without it, how a member
+    // became current would decide whether it can verify — the pulled path
+    // used to serve the secret alone and leave the puller unable to check any
+    // Helper.
+    let missed = source
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![UserSecret {
+                id: vec![1],
+                name: "mirrored secret".to_owned(),
+                data: b"vault-contents-v2".to_vec(),
+            }],
+            description: Some("round the destination misses".to_owned()),
+        })
+        .await
+        .expect("source start(ProtectSecret) failed");
+    let missed_version = missed
+        .iter()
+        .find_map(|e| match e {
+            DeRecEvent::ProtectSecretStarted { version, .. } => Some(*version),
+            _ => None,
+        })
+        .expect("the round must report its version");
+    assert!(missed_version > mirrored_version);
+
+    // Deliver this round to the Helpers only: the Destination's copy is
+    // dropped on the floor, which is what leaves it behind.
+    for (tp, bytes) in source.drain() {
+        if tp.uri == helper_a.uri {
+            deliver(&mut helper_a, &bytes).await;
+        } else if tp.uri == helper_b.uri {
+            deliver(&mut helper_b, &bytes).await;
+        }
+    }
+    let _ = pump_many(&mut [&mut source, &mut helper_a, &mut helper_b]).await;
+
+    destination
+        .protocol
+        .start(DeRecFlow::ReplicaDiscovery)
+        .await
+        .expect("destination start(ReplicaDiscovery) failed");
+    let caught_up =
+        pump_many(&mut [&mut source, &mut helper_a, &mut helper_b, &mut destination]).await;
+    assert!(
+        caught_up.iter().any(|e| matches!(
+            e,
+            DeRecEvent::ReplicaSecretReceived { version, .. } if *version == missed_version
+        )),
+        "the catch-up must hydrate the version the destination missed; got {caught_up:?}"
+    );
+
+    destination
+        .protocol
+        .start(DeRecFlow::VerifyShares {
+            secret_id: destination_sid,
+            version: missed_version,
+            target: Target::All,
+        })
+        .await
+        .expect("destination start(VerifyShares) after catch-up failed");
+    let events =
+        pump_many(&mut [&mut source, &mut helper_a, &mut helper_b, &mut destination]).await;
+    let verified: HashSet<ChannelId> = events
+        .iter()
+        .filter_map(|e| match e {
+            DeRecEvent::ShareVerified { channel_id, .. } => Some(*channel_id),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        verified.contains(&channel_a) && verified.contains(&channel_b),
+        "a version obtained by catch-up must be as verifiable as one received \
+         by push; verified {verified:?}"
+    );
+
+    println!("Protocol replica mirror-then-verify flow test passed.");
+}
+
+/// A Destination can verify the versions it was synced, and only those.
+///
+/// The sequence a consumer reported: Alice protects a secret across three
+/// helpers (v1), *then* pairs Bob as a Destination, which re-publishes as v2
+/// and syncs it. Bob was never told anything about v1, so the two devices end
+/// up with deliberately different reach:
+///
+/// - both hold tracking shares for v2 and both can verify it
+/// - only Alice holds v1, so only Alice can verify it
+///
+/// Bob asking about v1 is refused because Bob has no reference bytes to hash,
+/// not because anything is wrong with the helpers — they answer that challenge
+/// perfectly well. Asserted here because "the destination cannot verify" and
+/// "the destination cannot verify *this* version" look identical from an
+/// application's logs, and only the second one is correct.
+async fn run_replica_verifies_only_synced_versions_flow() {
+    println!("=== Protocol replica verifies only synced versions flow ===");
+
+    let alice_replica_id = 0xA11CEu64;
+    let bob_replica_id = 0xB0Bu64;
+
+    let mut alice = Peer::with_secret_id_and_replica_id(
+        "alice",
+        "https://alice.example.com",
+        0xC0FFEE,
+        alice_replica_id,
+    );
+    let mut h1 = Peer::new("helper-1", "https://helper-1.example.com");
+    let mut h2 = Peer::new("helper-2", "https://helper-2.example.com");
+    let mut h3 = Peer::new("helper-3", "https://helper-3.example.com");
+    let mut bob = Peer::with_replica_id("bob", "https://bob.example.com", bob_replica_id);
+
+    let c1 = pair(&mut alice, &mut h1, ChannelId(1)).await;
+    let c2 = pair(&mut alice, &mut h2, ChannelId(2)).await;
+    let c3 = pair(&mut alice, &mut h3, ChannelId(3)).await;
+    let helper_channels = [c1, c2, c3];
+
+    // v1 — three helpers, no Bob yet.
+    let v1 = alice
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![UserSecret {
+                id: vec![1],
+                name: "wallet".to_owned(),
+                data: b"alice-secret-v1".to_vec(),
+            }],
+            description: None,
+        })
+        .await
+        .expect("alice start(ProtectSecret) v1 failed")
+        .iter()
+        .find_map(|e| match e {
+            DeRecEvent::ProtectSecretStarted { version, .. } => Some(*version),
+            _ => None,
+        })
+        .expect("v1 must report a version");
+    pump_many(&mut [&mut alice, &mut h1, &mut h2, &mut h3]).await;
+
+    // Bob joins. Confirming the fingerprint is what puts him on the roster,
+    // and the pair-completion auto-publish is what carries v2 to him.
+    let contact = alice
+        .protocol
+        .create_contact(
+            Some(ChannelId(4)),
+            derec_proto::ContactMode::InlineKeys,
+            None,
+        )
+        .await
+        .expect("alice.create_contact failed");
+    bob.protocol
+        .start(DeRecFlow::Pairing {
+            kind: SenderKind::ReplicaDestination,
+            contact,
+            peer_communication_info: HashMap::new(),
+        })
+        .await
+        .expect("bob start(Pairing, kind=ReplicaDestination) failed");
+    let r1 = pump(&mut bob, &mut alice).await;
+    let r2 = pump(&mut alice, &mut bob).await;
+    let replica_channel = extract_paired_channel_id(r1.iter().chain(r2.iter()), ChannelId(4))
+        .expect("PairingCompleted for the replica handshake must fire");
+
+    let alice_fp = alice
+        .protocol
+        .get_fingerprint(replica_channel)
+        .await
+        .expect("alice fingerprint");
+    let bob_fp = bob
+        .protocol
+        .get_fingerprint(replica_channel)
+        .await
+        .expect("bob fingerprint");
+    assert!(
+        alice
+            .protocol
+            .verify_fingerprint(replica_channel, &bob_fp)
+            .await
+            .expect("alice verify_fingerprint")
+            && bob
+                .protocol
+                .verify_fingerprint(replica_channel, &alice_fp)
+                .await
+                .expect("bob verify_fingerprint"),
+        "both sides must accept the matching fingerprint"
+    );
+
+    let joined = pump_many(&mut [&mut alice, &mut h1, &mut h2, &mut h3, &mut bob]).await;
+    let (v2, synced_secret) = joined
+        .iter()
+        .find_map(|e| match e {
+            DeRecEvent::ReplicaSecretReceived { version, secret, .. }
+            | DeRecEvent::ReplicaSecretInstalled { version, secret, .. } => {
+                Some((*version, secret.clone()))
+            }
+            _ => None,
+        })
+        .expect("bob must be synced when he joins the roster");
+
+    // A synced Destination must not be put through `restore`. The sync already
+    // installed everything restore would write — helper channels and keys, the
+    // group, the snapshot — plus the tracking shares restore deliberately does
+    // not write. So restore here is a strict downgrade, and the library says so
+    // rather than letting it happen.
+    //
+    // Worth asserting because the refusal is easy to read as an obstacle and
+    // clear away: an application that wipes the namespace to get past it
+    // destroys the share map the sync just wrote, and restore does not put it
+    // back. The destination then cannot verify a version it could verify a
+    // moment earlier.
+    let restored = bob.protocol.restore(&synced_secret, v2).await;
+    assert!(
+        matches!(
+            restored,
+            Err(derec_library::Error::Restore(
+                derec_library::protocol::RestoreError::AlreadyRestored
+            ))
+        ),
+        "a synced destination is already provisioned; restore must refuse it, got {restored:?}"
+    );
+    assert!(v2 > v1, "joining must publish a newer version (v1={v1}, v2={v2})");
+
+    // The stores are what decide verifiability, so assert them directly.
+    let alice_sid = alice.protocol.secret_id();
+    let bob_sid = bob.protocol.secret_id();
+    for ch in helper_channels {
+        for (label, sid, store, version, expected) in [
+            ("alice", alice_sid, &alice.protocol.share_store, v1, 1),
+            ("alice", alice_sid, &alice.protocol.share_store, v2, 1),
+            ("bob", bob_sid, &bob.protocol.share_store, v1, 0),
+            ("bob", bob_sid, &bob.protocol.share_store, v2, 1),
+        ] {
+            let rows = store
+                .load(sid, ch, &[version])
+                .await
+                .expect("share load")
+                .len();
+            assert_eq!(
+                rows, expected,
+                "{label} must hold {expected} tracking share(s) for helper {} at v{version}",
+                ch.0
+            );
+        }
+    }
+
+    // Both verify v2 against all three helpers.
+    for (who, sid) in [("alice", alice_sid), ("bob", bob_sid)] {
+        let peer = if who == "alice" { &mut alice } else { &mut bob };
+        peer.protocol
+            .start(DeRecFlow::VerifyShares {
+                secret_id: sid,
+                version: v2,
+                target: Target::All,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("{who} start(VerifyShares v{v2}) failed: {e}"));
+        let events = pump_many(&mut [&mut alice, &mut h1, &mut h2, &mut h3, &mut bob]).await;
+        let verified: HashSet<ChannelId> = events
+            .iter()
+            .filter_map(|e| match e {
+                DeRecEvent::ShareVerified { channel_id, .. } => Some(*channel_id),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            helper_channels.iter().all(|c| verified.contains(c)),
+            "{who} must verify v{v2} against all three helpers; verified {verified:?}"
+        );
+    }
+
+    // Alice verifies v1; Bob cannot, and the refusal names the missing bytes
+    // rather than blaming the helper.
+    alice
+        .protocol
+        .start(DeRecFlow::VerifyShares {
+            secret_id: alice_sid,
+            version: v1,
+            target: Target::All,
+        })
+        .await
+        .expect("alice start(VerifyShares v1) failed");
+    let events = pump_many(&mut [&mut alice, &mut h1, &mut h2, &mut h3, &mut bob]).await;
+    let verified: HashSet<ChannelId> = events
+        .iter()
+        .filter_map(|e| match e {
+            DeRecEvent::ShareVerified { channel_id, .. } => Some(*channel_id),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        helper_channels.iter().all(|c| verified.contains(c)),
+        "alice must verify v1 against all three helpers; verified {verified:?}"
+    );
+
+    // Driven by hand: `pump_many` panics on a process() error, and the error
+    // is the assertion here.
+    bob.protocol
+        .start(DeRecFlow::VerifyShares {
+            secret_id: bob_sid,
+            version: v1,
+            target: Target::All,
+        })
+        .await
+        .expect("the challenge itself dispatches — bob holds the channels and keys");
+    let mut refusals = 0;
+    for (tp, bytes) in bob.drain() {
+        let helper: &mut Peer = if tp.uri == h1.uri {
+            &mut h1
+        } else if tp.uri == h2.uri {
+            &mut h2
+        } else if tp.uri == h3.uri {
+            &mut h3
+        } else {
+            panic!("bob addressed an unknown endpoint {}", tp.uri)
+        };
+        deliver(helper, &bytes).await;
+        for (_, reply) in helper.drain() {
+            let err = bob
+                .protocol
+                .process(&reply)
+                .await
+                .expect_err("bob holds no v1 bytes, so the proof cannot be checked");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("no committed share stored"),
+                "the refusal must name the missing local bytes, not the helper's \
+                 share; got {msg}"
+            );
+            refusals += 1;
+        }
+    }
+    assert_eq!(
+        refusals, 3,
+        "all three helpers answered bob's v1 challenge; each answer is refused locally"
+    );
+
+    println!(
+        "  alice: v{v1} ✓ v{v2} ✓   bob: v{v1} refused (never synced) v{v2} ✓  ✓"
+    );
+    println!("Protocol replica verifies only synced versions flow test passed.");
 }
 
 async fn run_discovery_and_recovery_flow() {

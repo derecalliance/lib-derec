@@ -320,10 +320,14 @@ public interface ISecretStore
 }
 
 /// <summary>
-/// Stored share — opaque protobuf bytes keyed by
-/// <c>(channel_id, secret_id, version)</c>. The byte format depends on
+/// Stored share — opaque protobuf bytes. The byte format depends on
 /// which side stored it (helper: <c>StoreShareRequestMessage</c>; owner:
 /// <c>CommittedDeRecShare</c>); the store treats them as opaque.
+/// <para>
+/// <see cref="SecretId"/> names the secret the bytes belong to, which on
+/// a helper is the owner's id — it is <b>not</b> the partition the row is
+/// keyed under. See <see cref="IShareStore.Save"/>.
+/// </para>
 /// </summary>
 public sealed record Share(ulong SecretId, uint Version, byte[] Bytes);
 
@@ -354,6 +358,20 @@ public interface IShareStore
     /// <c>null</c> if no shares exist yet for this secret.
     /// </summary>
     uint? LatestVersion(ulong secretId);
+    /// <summary>
+    /// Insert or replace the share at
+    /// <c>(secretId, channelId, share.Version)</c> — the
+    /// <paramref name="secretId"/> argument, which is the partition every
+    /// <c>Load*</c> filters by.
+    /// <para>
+    /// <see cref="Share.SecretId"/> routinely differs from it: a helper
+    /// holds shares belonging to other people's secrets, and that field is
+    /// the only thing distinguishing them. Carry it alongside as data.
+    /// Keying on it instead makes writes invisible to every read, and
+    /// asserting the two are equal fires on the ordinary case of a helper
+    /// holding someone else's share.
+    /// </para>
+    /// </summary>
     void Save(ulong secretId, ulong channelId, Share share);
     void RemoveChannel(ulong secretId, ulong channelId);
 }
