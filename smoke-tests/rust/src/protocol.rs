@@ -2655,10 +2655,12 @@ async fn run_replica_verifies_only_synced_versions_flow() {
     let (v2, synced_secret) = joined
         .iter()
         .find_map(|e| match e {
-            DeRecEvent::ReplicaSecretReceived { version, secret, .. }
-            | DeRecEvent::ReplicaSecretInstalled { version, secret, .. } => {
-                Some((*version, secret.clone()))
+            DeRecEvent::ReplicaSecretReceived {
+                version, secret, ..
             }
+            | DeRecEvent::ReplicaSecretInstalled {
+                version, secret, ..
+            } => Some((*version, secret.clone())),
             _ => None,
         })
         .expect("bob must be synced when he joins the roster");
@@ -2684,7 +2686,10 @@ async fn run_replica_verifies_only_synced_versions_flow() {
         ),
         "a synced destination is already provisioned; restore must refuse it, got {restored:?}"
     );
-    assert!(v2 > v1, "joining must publish a newer version (v1={v1}, v2={v2})");
+    assert!(
+        v2 > v1,
+        "joining must publish a newer version (v1={v1}, v2={v2})"
+    );
 
     // The stores are what decide verifiability, so assert them directly.
     let alice_sid = alice.protocol.secret_id();
@@ -2800,9 +2805,7 @@ async fn run_replica_verifies_only_synced_versions_flow() {
         "all three helpers answered bob's v1 challenge; each answer is refused locally"
     );
 
-    println!(
-        "  alice: v{v1} ✓ v{v2} ✓   bob: v{v1} refused (never synced) v{v2} ✓  ✓"
-    );
+    println!("  alice: v{v1} ✓ v{v2} ✓   bob: v{v1} refused (never synced) v{v2} ✓  ✓");
     println!("Protocol replica verifies only synced versions flow test passed.");
 }
 
