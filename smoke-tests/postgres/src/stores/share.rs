@@ -141,11 +141,9 @@ impl DeRecShareStore for PostgresShareStore {
         channel_id: ChannelId,
         share: Share,
     ) -> ShareStoreFuture<'_, ()> {
-        debug_assert_eq!(
-            share.secret_id, secret_id,
-            "DeRecShareStore::save invariant: share.secret_id ({}) must match partition secret_id ({})",
-            share.secret_id, secret_id,
-        );
+        // `share.secret_id` is the Owner's id and differs from the partition
+        // whenever this peer holds someone else's share, so it goes in its own
+        // column rather than into the key. See `DeRecShareStore::save`.
         let client = self.client.clone();
         let secret_id_i64 = u64_to_sql(secret_id);
         let channel_id_i64 = u64_to_sql(channel_id.0);

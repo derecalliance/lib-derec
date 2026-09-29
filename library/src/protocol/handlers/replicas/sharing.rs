@@ -16,7 +16,8 @@ use crate::protocol::DeRecUserSecretStore;
 use crate::protocol::context::{Exchange, Local};
 use crate::protocol::stores::{StoreSet, Stores};
 use crate::protocol::{
-    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecTransport, SecretKind, SecretValue,
+    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecTransport, SecretKind,
+    SecretValue,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::utils::now_secs;
@@ -73,13 +74,31 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
 /// Write an inbound roster into this device's stores.
 ///
 /// The payload is self-contained by construction, so hydration is a straight
-/// decomposition: helper channels and their keys, every group member against
-/// the one group channel, the group key, and the user-secret snapshot. After
-/// it, a destination holds the same state as the source and can publish.
+/// decomposition: helper channels and their keys, the per-helper share map,
+/// every group member against the one group channel, the group key, and the
+/// user-secret snapshot. After it, a destination holds the same state as the
+/// source and can publish.
 ///
 /// Materialising the helper channels grants no capability the payload had not
 /// already granted — it ships each helper's `shared_key`, which is what
 /// authenticating as the source toward that helper requires.
+///
+/// # Why the share map is stored
+///
+/// `shares` becomes this device's owner-side tracking shares, at the same
+/// `(channel_id, version)` keys the source wrote them under. That is what
+/// makes verification possible here: a `VerifyShare` proof is
+/// `SHA-384(share ‖ nonce)` over the exact bytes the Helper holds, and
+/// [`verification`](super::super::verification) reads those bytes back from
+/// the share store when a response arrives. A destination that hydrated the
+/// roster but not the map can challenge its Helpers and receive their
+/// answers, yet has nothing to check them against — it holds a secret it can
+/// read and recover from but cannot verify.
+///
+/// An empty map is not a defect. A round below `threshold` runs no split, so
+/// the source distributed no share and tracked none either; a catch-up served
+/// by a member that never held the map carries none. In both cases the
+/// versions simply stay unverifiable on both sides, consistently.
 ///
 /// Returns the group channel and its key when the payload carried a roster,
 /// so the caller can acknowledge there.
@@ -88,6 +107,7 @@ pub(in crate::protocol) async fn hydrate<S: StoreSet>(
     local: &Local<'_>,
     version: u32,
     secret: &Secret,
+    shares: &[crate::protocol::types::ChannelShare],
     description: String,
 ) -> Result<Option<(ChannelId, SharedKey)>> {
     let secret_id = local.secret_id;
@@ -118,6 +138,39 @@ pub(in crate::protocol) async fn hydrate<S: StoreSet>(
         stores
             .secrets
             .save(secret_id, channel_id, SecretValue::SharedKey(key))
+            .await?;
+    }
+
+    // Owner-side tracking shares, keyed exactly as the source keyed them so
+    // the two devices agree on what each Helper was given. `secret_id` is the
+    // local partition, not the sender's: the wire id names the secret, the
+    // partition names the store this device reads back from.
+    for share in shares {
+        let channel_id = ChannelId(share.channel_id);
+        // A share naming a channel the roster does not list would be filed
+        // against a Helper this device has no record of, unreachable and
+        // unverifiable. The roster is authoritative, so the disagreement is
+        // the payload's.
+        if !secret
+            .helpers
+            .iter()
+            .any(|h| h.channel_id == share.channel_id)
+        {
+            return Err(crate::Error::InvalidInput(
+                "share map names a channel absent from the roster's helpers",
+            ));
+        }
+        stores
+            .shares
+            .save(
+                secret_id,
+                channel_id,
+                crate::protocol::types::Share {
+                    secret_id,
+                    version,
+                    bytes: share.committed_share.clone(),
+                },
+            )
             .await?;
     }
 
@@ -235,6 +288,17 @@ async fn on_request<S: StoreSet>(
     ))?;
     let shares = composite.shares;
 
+    // On a push the two carriers of the version are the same round and the
+    // sender writes both. Disagreement means the payload and the envelope
+    // describe different versions, and there is no way to tell which one the
+    // share map belongs to — so it is refused rather than guessed. (A sender
+    // predating the payload field sends 0, which is not a disagreement.)
+    if composite.version != 0 && composite.version != version {
+        return Err(crate::Error::InvalidInput(
+            "replica payload's version disagrees with the request's version",
+        ));
+    }
+
     // Whether this is the first time this device has held the secret is
     // decided before hydration writes the snapshot that would erase the
     // distinction.
@@ -276,6 +340,7 @@ async fn on_request<S: StoreSet>(
         local,
         version,
         &secret,
+        &shares,
         request.version_description.clone(),
     )
     .await?;
@@ -634,9 +699,16 @@ mod tests {
 
             let mut rig = StoreRig::new();
 
-            super::hydrate(&mut rig.stores(), &lf.local(), 4, &secret, String::new())
-                .await
-                .expect("a grpc roster must hydrate");
+            super::hydrate(
+                &mut rig.stores(),
+                &lf.local(),
+                4,
+                &secret,
+                &[],
+                String::new(),
+            )
+            .await
+            .expect("a grpc roster must hydrate");
 
             let expected = [(11_u64, Protocol::Grpc), (12, Protocol::Https)];
             for (channel_id, protocol) in expected {
@@ -829,6 +901,7 @@ mod tests {
                     secret: Some(roster()),
                     shares: Vec::new(),
                     shared_key: Vec::new(),
+                    version,
                 };
                 derec_proto::StoreShareRequestMessage {
                     secret_id: WIRE_SECRET_ID,
@@ -893,6 +966,324 @@ mod tests {
                 echoed,
                 Some(WIRE_SECRET_ID),
                 "the event echoes the inbound secret_id, not the local partition"
+            );
+        });
+    }
+
+    /// A Destination that receives the per-helper share map must keep it as
+    /// owner-side tracking shares, or it can never verify what those helpers
+    /// hold: `on_response` in the verification handler reads the committed
+    /// share for `(channel_id, version)` and has nothing to hash against.
+    #[test]
+    fn a_received_share_map_is_stored_for_verification() {
+        run_async(async {
+            use crate::protocol::DeRecShareStore as _;
+            use crate::protocol::types::{
+                ChannelShare, HelperInfo, ReplicaInfo, ReplicaSecretPayload, Replicas, Secret,
+            };
+
+            const OWNER: u64 = 1001;
+            const SELF_ID: u64 = 1002;
+            const HELPER_CHANNEL: u64 = 77;
+            const VERSION: u32 = 3;
+
+            let committed = prost::Message::encode_to_vec(&derec_proto::CommittedDeRecShare {
+                de_rec_share: vec![0x01, 0x02, 0x03],
+                commitment: Vec::new(),
+                merkle_path: Vec::new(),
+            });
+
+            let lf = LocalFixture::with_replica(SECRET_ID, SELF_ID);
+            let mut rig = StoreRig::new();
+            seed_member(
+                &mut rig.channels,
+                OWNER,
+                ReplicaRole::Source,
+                "https://owner",
+            )
+            .await;
+            seed_member(
+                &mut rig.channels,
+                SELF_ID,
+                ReplicaRole::Destination,
+                "https://self",
+            )
+            .await;
+
+            let channel = rig
+                .channels
+                .load(
+                    SECRET_ID,
+                    crate::protocol::types::ChannelQuery::Replica {
+                        channel_id: GROUP_CHANNEL,
+                        replica_id: ReplicaId(OWNER),
+                    },
+                )
+                .await
+                .expect("load")
+                .and_then(|r| r.as_replica().cloned())
+                .expect("seeded member");
+
+            let payload = ReplicaSecretPayload {
+                secret: Some(Secret {
+                    helpers: vec![HelperInfo {
+                        channel_id: HELPER_CHANNEL,
+                        transports: vec![endpoint("https://helper")],
+                        shared_key: vec![0xAA; 32],
+                        communication_info: std::collections::HashMap::new(),
+                    }],
+                    secrets: Vec::new(),
+                    replicas: Some(Replicas {
+                        channel_id: GROUP_CHANNEL.0,
+                        members: vec![
+                            ReplicaInfo {
+                                replica_id: OWNER,
+                                transports: vec![endpoint("https://owner")],
+                                role: ReplicaRole::Source as i32,
+                                communication_info: std::collections::HashMap::new(),
+                            },
+                            ReplicaInfo {
+                                replica_id: SELF_ID,
+                                transports: vec![endpoint("https://self")],
+                                role: ReplicaRole::Destination as i32,
+                                communication_info: std::collections::HashMap::new(),
+                            },
+                        ],
+                        shared_key: vec![0x42; 32],
+                    }),
+                }),
+                shares: vec![ChannelShare {
+                    channel_id: HELPER_CHANNEL,
+                    committed_share: committed.clone(),
+                }],
+                shared_key: Vec::new(),
+                version: VERSION,
+            };
+
+            let request = derec_proto::StoreShareRequestMessage {
+                secret_id: SECRET_ID,
+                share: prost::Message::encode_to_vec(&payload),
+                version: VERSION,
+                version_description: String::new(),
+                share_algorithm: 0,
+                keep_list: Vec::new(),
+                replica_id: Some(OWNER),
+                #[allow(deprecated)]
+                reply_to: None,
+                reply_to_transports: Vec::new(),
+                timestamp: None,
+            };
+
+            super::on_request(
+                &mut rig.stores(),
+                &lf.local(),
+                &channel,
+                request,
+                [0x11; 32],
+                7,
+            )
+            .await
+            .expect("the sync must be accepted");
+
+            let stored = rig
+                .shares
+                .load(SECRET_ID, ChannelId(HELPER_CHANNEL), &[VERSION])
+                .await
+                .expect("share store must answer");
+
+            assert_eq!(
+                stored.len(),
+                1,
+                "the mirrored share map must land in the share store, or verification \
+                 of this helper has nothing to check against"
+            );
+            assert_eq!(
+                stored[0].bytes, committed,
+                "the tracked bytes must be the same CommittedDeRecShare the helper \
+                 received, since that is what the helper hashes"
+            );
+        });
+    }
+
+    /// A share naming a channel the roster does not list is refused.
+    ///
+    /// Storing it would file a tracking share against a Helper this device has
+    /// no channel or key for — unreachable, unverifiable, and indistinguishable
+    /// afterwards from a Helper that simply went quiet. The roster is
+    /// authoritative, so the disagreement belongs to the payload.
+    #[test]
+    fn a_share_map_naming_an_unknown_channel_is_refused() {
+        run_async(async {
+            use crate::protocol::types::{
+                ChannelShare, HelperInfo, ReplicaInfo, ReplicaSecretPayload, Replicas, Secret,
+            };
+
+            const OWNER: u64 = 1001;
+            const SELF_ID: u64 = 1002;
+
+            let lf = LocalFixture::with_replica(SECRET_ID, SELF_ID);
+            let mut rig = StoreRig::new();
+            seed_member(
+                &mut rig.channels,
+                OWNER,
+                ReplicaRole::Source,
+                "https://owner",
+            )
+            .await;
+            let channel = rig
+                .channels
+                .load(
+                    SECRET_ID,
+                    crate::protocol::types::ChannelQuery::Replica {
+                        channel_id: GROUP_CHANNEL,
+                        replica_id: ReplicaId(OWNER),
+                    },
+                )
+                .await
+                .expect("load")
+                .and_then(|r| r.as_replica().cloned())
+                .expect("seeded member");
+
+            let payload = ReplicaSecretPayload {
+                secret: Some(Secret {
+                    helpers: vec![HelperInfo {
+                        channel_id: 77,
+                        transports: vec![endpoint("https://helper")],
+                        shared_key: vec![0xAA; 32],
+                        communication_info: std::collections::HashMap::new(),
+                    }],
+                    secrets: Vec::new(),
+                    replicas: Some(Replicas {
+                        channel_id: GROUP_CHANNEL.0,
+                        members: vec![ReplicaInfo {
+                            replica_id: OWNER,
+                            transports: vec![endpoint("https://owner")],
+                            role: ReplicaRole::Source as i32,
+                            communication_info: std::collections::HashMap::new(),
+                        }],
+                        shared_key: vec![0x42; 32],
+                    }),
+                }),
+                // 78 is in nobody's roster.
+                shares: vec![ChannelShare {
+                    channel_id: 78,
+                    committed_share: vec![0x01],
+                }],
+                shared_key: Vec::new(),
+                version: 1,
+            };
+
+            let err = super::on_request(
+                &mut rig.stores(),
+                &lf.local(),
+                &channel,
+                derec_proto::StoreShareRequestMessage {
+                    secret_id: SECRET_ID,
+                    share: prost::Message::encode_to_vec(&payload),
+                    version: 1,
+                    version_description: String::new(),
+                    share_algorithm: 0,
+                    keep_list: Vec::new(),
+                    replica_id: Some(OWNER),
+                    #[allow(deprecated)]
+                    reply_to: None,
+                    reply_to_transports: Vec::new(),
+                    timestamp: None,
+                },
+                [0x11; 32],
+                7,
+            )
+            .await
+            .expect_err("a share for an unlisted channel must be refused");
+            assert!(
+                matches!(err, crate::Error::InvalidInput(m) if m.contains("absent from the roster")),
+                "got {err:?}"
+            );
+        });
+    }
+
+    /// A payload whose own version contradicts the request's is refused.
+    ///
+    /// On a push the sender writes both, so a disagreement leaves no way to
+    /// say which version the share map belongs to. Filing it under either
+    /// guess would key a Helper's share to a version it may never have held.
+    #[test]
+    fn a_payload_version_disagreeing_with_the_request_is_refused() {
+        run_async(async {
+            use crate::protocol::types::{ReplicaInfo, ReplicaSecretPayload, Replicas, Secret};
+
+            const OWNER: u64 = 1001;
+            const SELF_ID: u64 = 1002;
+
+            let lf = LocalFixture::with_replica(SECRET_ID, SELF_ID);
+            let mut rig = StoreRig::new();
+            seed_member(
+                &mut rig.channels,
+                OWNER,
+                ReplicaRole::Source,
+                "https://owner",
+            )
+            .await;
+            let channel = rig
+                .channels
+                .load(
+                    SECRET_ID,
+                    crate::protocol::types::ChannelQuery::Replica {
+                        channel_id: GROUP_CHANNEL,
+                        replica_id: ReplicaId(OWNER),
+                    },
+                )
+                .await
+                .expect("load")
+                .and_then(|r| r.as_replica().cloned())
+                .expect("seeded member");
+
+            let payload = ReplicaSecretPayload {
+                secret: Some(Secret {
+                    helpers: Vec::new(),
+                    secrets: Vec::new(),
+                    replicas: Some(Replicas {
+                        channel_id: GROUP_CHANNEL.0,
+                        members: vec![ReplicaInfo {
+                            replica_id: OWNER,
+                            transports: vec![endpoint("https://owner")],
+                            role: ReplicaRole::Source as i32,
+                            communication_info: std::collections::HashMap::new(),
+                        }],
+                        shared_key: vec![0x42; 32],
+                    }),
+                }),
+                shares: Vec::new(),
+                shared_key: Vec::new(),
+                // The envelope says 5.
+                version: 4,
+            };
+
+            let err = super::on_request(
+                &mut rig.stores(),
+                &lf.local(),
+                &channel,
+                derec_proto::StoreShareRequestMessage {
+                    secret_id: SECRET_ID,
+                    share: prost::Message::encode_to_vec(&payload),
+                    version: 5,
+                    version_description: String::new(),
+                    share_algorithm: 0,
+                    keep_list: Vec::new(),
+                    replica_id: Some(OWNER),
+                    #[allow(deprecated)]
+                    reply_to: None,
+                    reply_to_transports: Vec::new(),
+                    timestamp: None,
+                },
+                [0x11; 32],
+                7,
+            )
+            .await
+            .expect_err("contradicting versions must be refused");
+            assert!(
+                matches!(err, crate::Error::InvalidInput(m) if m.contains("version disagrees")),
+                "got {err:?}"
             );
         });
     }

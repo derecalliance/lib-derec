@@ -29,18 +29,24 @@
 //! so it too costs no partial write.
 //!
 //! Store I/O failures mid-restore propagate as their underlying
-//! [`crate::Error`] variant (`ShareStore`, `ChannelStore`,
-//! `SecretStore`). The snapshot write is the commit point — nothing
+//! [`crate::Error`] variant (`ChannelStore`, `SecretStore`, and
+//! `ShareStore` — which the user-secret store reuses for the snapshot
+//! write, restore having no share writes of its own). The snapshot
+//! write is the commit point — nothing
 //! is removed before it succeeds, so any mid-flight failure leaves
 //! state the next `restore` call can detect as one of the
 //! preconditions above.
+//!
+//! Restore writes no owner-side tracking shares, so the recovered
+//! version is not verifiable on this device; publishing once restores
+//! that. See [`restore`] for why, and for the replica-identity
+//! precondition on that publish.
 
 use super::super::{
-    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecShareStore, DeRecUserSecretStore,
-    SecretValue, UnpairAck,
+    DeRecChannelStore, DeRecEvent, DeRecSecretStore, DeRecUserSecretStore, SecretValue, UnpairAck,
     types::{
         ChannelRecord, ChannelStatus, HelperChannel, HelperInfo, ReplicaMember, ReplicaRole,
-        Replicas, Secret, Share, UserSecrets,
+        Replicas, Secret, UserSecrets,
     },
 };
 use crate::protocol::context::Local;
@@ -86,14 +92,35 @@ pub enum RestoreError {
 }
 
 /// Run the restore flow. On success: canonical helper channels are
-/// persisted with `SharedKey` + owner-side tracking shares at
-/// `recovered_version`; canonical replica channels are persisted with
-/// the group key from `secret.replicas.shared_key`; the user-secret
-/// snapshot is committed at `recovered_version`; every
+/// persisted with their `SharedKey`; canonical replica channels are
+/// persisted with the group key from `secret.replicas.shared_key`; the
+/// user-secret snapshot is committed at `recovered_version`; every
 /// recovery-mode channel under `secret_id` is unpaired
 /// (`UnpairAck::NotRequired`). The returned events come from the
 /// recovery-channel wipe and should be drained into the protocol's
 /// `pending_start_events`.
+///
+/// # Verification after a restore
+///
+/// No owner-side tracking [`crate::protocol::types::Share`] is written,
+/// so `start(VerifyShares)` at `recovered_version` reports
+/// [`crate::Error::InvalidInput`] — this device holds no reference bytes
+/// for that version and cannot check a proof against it. That is a
+/// property of recovery, not a defect: a `VerifyShare` proof is
+/// `SHA-384(share ‖ nonce)` over the *exact* bytes a Helper holds, and
+/// recovery cannot attribute a collected share to a canonical Helper
+/// channel — the VSS x-coordinate is a random field element and
+/// `GetShareResponseMessage` carries no channel id.
+///
+/// The way back to a verifiable state is to publish:
+/// `start(ProtectSecret)` derives `recovered_version + 1` from the
+/// snapshot committed here, writes real tracking shares as it
+/// distributes, and `start(VerifyShares)` at that version behaves
+/// exactly as it does for an owner that never recovered.
+///
+/// A restored device whose roster carries a replica group cannot
+/// publish until the application configures a `replica_id` that the
+/// roster names — see step 3 on why restore does not adopt one itself.
 ///
 /// # Sequence
 ///
@@ -110,8 +137,8 @@ pub enum RestoreError {
 ///    at canonical ids are recovery channels — wiped in step 5, never
 ///    flagged as collisions.
 /// 2. **Helper channels.** Persist each helper's canonical channel
-///    record, its `SharedKey`, and an empty owner-side tracking
-///    [`Share`] at `recovered_version`.
+///    record and its `SharedKey`. No tracking share — see
+///    *Verification after a restore* above.
 /// 3. **Replica members.** Persist every member of the roster against the
 ///    one group channel, with the group key as that channel's `SharedKey`.
 ///    Each member's `role` is taken verbatim from the roster: it is a
@@ -160,7 +187,7 @@ pub(in crate::protocol) async fn restore<S: StoreSet>(
 ) -> Result<Vec<DeRecEvent>> {
     let (canonical_ids, existing_channels) = check_preconditions(stores, local, secret).await?;
 
-    write_helper_channels(stores, local, &secret.helpers, recovered_version).await?;
+    write_helper_channels(stores, local, &secret.helpers).await?;
 
     if let Some(group) = secret.replicas.as_ref().filter(|g| !g.members.is_empty()) {
         write_replica_channels(stores, local, group).await?;
@@ -269,7 +296,6 @@ async fn write_helper_channels<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
     helpers: &[HelperInfo],
-    recovered_version: u32,
 ) -> Result<()> {
     let secret_id = local.secret_id;
     for h in helpers {
@@ -296,18 +322,6 @@ async fn write_helper_channels<S: StoreSet>(
         stores
             .secrets
             .save(secret_id, cid, SecretValue::SharedKey(shared_key))
-            .await?;
-        stores
-            .shares
-            .save(
-                secret_id,
-                cid,
-                Share {
-                    secret_id,
-                    version: recovered_version,
-                    bytes: Vec::new(),
-                },
-            )
             .await?;
     }
     Ok(())
@@ -579,13 +593,19 @@ mod tests {
                     .unwrap()
                     .expect("helper SharedKey must be persisted");
                 assert!(matches!(sk, SecretValue::SharedKey(_)));
+                // No tracking share. A fabricated one would hash to
+                // something no Helper can produce, so verification would
+                // report the Helper's data as corrupt rather than reporting
+                // that this device has nothing to check against.
                 let shares = rig
                     .share_store
                     .load(secret_id, ChannelId(hid), &[])
                     .await
                     .unwrap();
-                assert_eq!(shares.len(), 1);
-                assert_eq!(shares[0].version, 7);
+                assert!(
+                    shares.is_empty(),
+                    "restore must not invent tracking shares; got {shares:?}"
+                );
             }
 
             // Replica member: the roster records each member's own role
@@ -968,6 +988,70 @@ mod tests {
     }
 
     // ---------------- Preconditions ----------------
+
+    /// Restore leaves the recovered version unverifiable, and one publish is
+    /// what buys verification back.
+    ///
+    /// This is the sequence the restore docs point applications at, so it is
+    /// asserted rather than described: the snapshot committed at
+    /// `recovered_version` is what the next round derives `+ 1` from, and that
+    /// round writes tracking shares carrying the bytes it actually sent.
+    /// Without this, removing the fabricated share would look like a lost
+    /// capability instead of a relocated one.
+    #[test]
+    fn a_publish_after_restore_writes_real_tracking_shares() {
+        run_async(async {
+            let secret_id: u64 = 0xDE_2EC;
+            let mut rig = build_rig(secret_id);
+            // Helpers only. A roster carrying a replica group cannot publish
+            // until the application configures a `replica_id` the roster
+            // names, which is a separate decision restore declines to make.
+            let secret = Secret {
+                replicas: None,
+                ..fixture_secret()
+            };
+
+            rig.protocol
+                .restore(&secret, 4)
+                .await
+                .expect("restore must succeed");
+
+            let events = rig
+                .protocol
+                .start(crate::protocol::DeRecFlow::ProtectSecret {
+                    secrets: secret.secrets.clone(),
+                    description: None,
+                })
+                .await
+                .expect("a restored owner must be able to publish again");
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, DeRecEvent::ProtectSecretStarted { version: 5, .. })),
+                "the round after a restore at 4 must be 5; got {events:?}"
+            );
+
+            for hid in [11_u64, 12] {
+                let rows = rig
+                    .share_store
+                    .load(secret_id, ChannelId(hid), &[])
+                    .await
+                    .unwrap();
+                let versions: Vec<u32> = rows.iter().map(|r| r.version).collect();
+                assert_eq!(
+                    versions,
+                    vec![5],
+                    "helper {hid} must hold exactly the published version, \
+                     with nothing left over from the restore"
+                );
+                assert!(
+                    !rows[0].bytes.is_empty(),
+                    "helper {hid}'s tracking share must carry the committed \
+                     bytes that were sent, or verification has nothing to hash"
+                );
+            }
+        });
+    }
 
     #[test]
     fn restore_returns_already_restored_when_snapshot_exists() {

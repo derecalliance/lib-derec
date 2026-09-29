@@ -166,11 +166,9 @@ impl DeRecShareStore for SqliteShareStore {
         channel_id: ChannelId,
         share: Share,
     ) -> ShareStoreFuture<'_, ()> {
-        debug_assert_eq!(
-            share.secret_id, secret_id,
-            "DeRecShareStore::save invariant: share.secret_id ({}) must match partition secret_id ({})",
-            share.secret_id, secret_id,
-        );
+        // `share.secret_id` is the Owner's id and differs from the partition
+        // whenever this peer holds someone else's share, so it goes in its own
+        // column rather than into the key. See `DeRecShareStore::save`.
         let conn = lock(&self.connection);
         conn.execute(
             "INSERT INTO shares (secret_id, channel_id, version, share_secret_id, bytes) \

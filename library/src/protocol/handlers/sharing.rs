@@ -194,7 +194,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     }
 
     if !replicas.is_empty() {
-        let composite = build_replica_composite(&secret, split_result.as_ref());
+        let composite = build_replica_composite(&secret, split_result.as_ref(), version);
         let k_group = group_key;
         let replica_results = distribute_composite_to_destinations(
             stores,
@@ -688,6 +688,7 @@ fn build_replicas(
 fn build_replica_composite(
     secret: &Secret,
     split_result: Option<&crate::primitives::sharing::request::SplitResult>,
+    version: u32,
 ) -> crate::protocol::types::ReplicaSecretPayload {
     let shares: Vec<crate::protocol::types::ChannelShare> = split_result
         .map(|r| {
@@ -705,6 +706,7 @@ fn build_replica_composite(
         secret: Some(secret.clone()),
         shares,
         shared_key: Vec::new(),
+        version,
     }
 }
 
@@ -1489,14 +1491,275 @@ mod group_conformance_tests {
             );
         });
     }
+
+    const HELPER_CHANNEL: ChannelId = ChannelId(7001);
+
+    /// Seed one paired helper channel plus a snapshot, so a catch-up has
+    /// something to serve.
+    async fn seed_helper_and_snapshot(
+        rig: &mut StoreRig,
+        version: u32,
+        tracked_bytes: Option<Vec<u8>>,
+    ) {
+        use crate::protocol::types::{HelperChannel, Share, UserSecrets};
+        use crate::protocol::{DeRecSecretStore, DeRecShareStore, DeRecUserSecretStore};
+
+        rig.channels
+            .save(
+                SECRET_ID,
+                ChannelRecord::Helper(HelperChannel {
+                    channel_id: HELPER_CHANNEL,
+                    transports: vec![endpoint("https://helper")],
+                    communication_info: std::collections::HashMap::new(),
+                    status: ChannelStatus::Paired,
+                    created_at: 0,
+                    peer_role: derec_proto::SenderKind::Helper,
+                }),
+            )
+            .await
+            .expect("seed helper");
+        rig.secrets
+            .save(
+                SECRET_ID,
+                HELPER_CHANNEL,
+                SecretValue::SharedKey([0xAA; 32]),
+            )
+            .await
+            .expect("seed helper key");
+        if let Some(bytes) = tracked_bytes {
+            rig.shares
+                .save(
+                    SECRET_ID,
+                    HELPER_CHANNEL,
+                    Share {
+                        secret_id: SECRET_ID,
+                        version,
+                        bytes,
+                    },
+                )
+                .await
+                .expect("seed tracking share");
+        }
+        rig.user_secrets
+            .save_latest(
+                SECRET_ID,
+                UserSecrets {
+                    version,
+                    secrets: Vec::new(),
+                    description: None,
+                    replicas: None,
+                },
+            )
+            .await
+            .expect("seed snapshot");
+    }
+
+    /// The roster a catch-up payload carries. A payload always comes from a
+    /// group member, so one is always present — and `hydrate` commits the
+    /// snapshot only for a payload that names a group.
+    fn payload_roster() -> crate::protocol::types::Replicas {
+        crate::protocol::types::Replicas {
+            channel_id: GROUP_CHANNEL.0,
+            members: vec![crate::protocol::types::ReplicaInfo {
+                replica_id: 1002,
+                transports: vec![endpoint("https://self")],
+                role: ReplicaRole::Destination as i32,
+                communication_info: std::collections::HashMap::new(),
+            }],
+            shared_key: vec![0x42; 32],
+        }
+    }
+
+    /// A catch-up answer carries the share map, so the asker ends up as able
+    /// to verify as the answerer is.
+    ///
+    /// The map used to be withheld on the pulled path on the grounds that
+    /// shares are derived per publishing round — which left a member that
+    /// became current by pulling permanently unable to check its helpers,
+    /// while one that received a push could.
+    #[test]
+    fn a_catch_up_answer_carries_the_tracked_share_map() {
+        run_async(async {
+            let lf = LocalFixture::with_replica(SECRET_ID, 1002);
+            let mut rig = StoreRig::new();
+            seed_member(&mut rig.channels, 1002, ReplicaRole::Source, "https://self").await;
+            seed_group_key(&mut rig.secrets).await;
+            seed_helper_and_snapshot(&mut rig, 4, Some(vec![0xDE, 0xAD, 0xBE, 0xEF])).await;
+
+            let payload = super::build_catch_up_payload(&mut rig.stores(), &lf.local())
+                .await
+                .expect("catch-up payload")
+                .expect("a device holding a snapshot must serve one");
+
+            assert_eq!(
+                payload.version, 4,
+                "the payload must name the version it actually carries"
+            );
+            assert_eq!(payload.shares.len(), 1, "got {:?}", payload.shares);
+            assert_eq!(payload.shares[0].channel_id, HELPER_CHANNEL.0);
+            assert_eq!(
+                payload.shares[0].committed_share,
+                vec![0xDE, 0xAD, 0xBE, 0xEF]
+            );
+        });
+    }
+
+    /// A member with no tracking rows serves a map-less answer rather than
+    /// failing. Below-threshold rounds and recovered devices both land here.
+    #[test]
+    fn a_catch_up_answer_without_tracked_shares_is_still_served() {
+        run_async(async {
+            let lf = LocalFixture::with_replica(SECRET_ID, 1002);
+            let mut rig = StoreRig::new();
+            seed_member(&mut rig.channels, 1002, ReplicaRole::Source, "https://self").await;
+            seed_group_key(&mut rig.secrets).await;
+            seed_helper_and_snapshot(&mut rig, 4, None).await;
+
+            let payload = super::build_catch_up_payload(&mut rig.stores(), &lf.local())
+                .await
+                .expect("catch-up payload")
+                .expect("a snapshot is still servable without a share map");
+
+            assert!(payload.shares.is_empty());
+            assert_eq!(payload.version, 4);
+        });
+    }
+
+    /// The asker commits the payload's version, not the one it asked for.
+    ///
+    /// A catch-up asks for a version and is answered with whatever the peer
+    /// holds, so the two routinely differ. Filing the share map under the
+    /// requested version would key a helper's share to a version it never
+    /// held, and verification would then hash the wrong bytes and report a
+    /// healthy helper as corrupt.
+    #[test]
+    fn a_catch_up_commits_the_payload_version_not_the_requested_one() {
+        run_async(async {
+            use crate::protocol::DeRecShareStore;
+
+            let lf = LocalFixture::with_replica(SECRET_ID, 1002);
+            let mut rig = StoreRig::new();
+
+            let payload = crate::protocol::types::ReplicaSecretPayload {
+                secret: Some(crate::protocol::types::Secret {
+                    helpers: vec![crate::protocol::types::HelperInfo {
+                        channel_id: HELPER_CHANNEL.0,
+                        transports: vec![endpoint("https://helper")],
+                        shared_key: vec![0xAA; 32],
+                        communication_info: std::collections::HashMap::new(),
+                    }],
+                    secrets: Vec::new(),
+                    replicas: Some(payload_roster()),
+                }),
+                shares: vec![crate::protocol::types::ChannelShare {
+                    channel_id: HELPER_CHANNEL.0,
+                    committed_share: vec![0x01, 0x02],
+                }],
+                shared_key: Vec::new(),
+                version: 4,
+            };
+
+            // The asker requested 9; the answerer served 4.
+            super::hydrate_catch_up(
+                &mut rig.stores(),
+                &lf.local(),
+                1001,
+                9,
+                &prost::Message::encode_to_vec(&payload),
+            )
+            .await
+            .expect("catch-up must hydrate");
+
+            let at_served = rig
+                .shares
+                .load(SECRET_ID, HELPER_CHANNEL, &[4])
+                .await
+                .expect("load");
+            let at_requested = rig
+                .shares
+                .load(SECRET_ID, HELPER_CHANNEL, &[9])
+                .await
+                .expect("load");
+            assert_eq!(
+                at_served.len(),
+                1,
+                "the map belongs to the version the payload names"
+            );
+            assert!(
+                at_requested.is_empty(),
+                "nothing may be filed under the version the asker happened to request"
+            );
+        });
+    }
+
+    /// An answerer predating the payload version falls back to the enclosing
+    /// message's version, which is what that writer meant.
+    #[test]
+    fn a_catch_up_from_an_older_writer_falls_back_to_the_response_version() {
+        run_async(async {
+            use crate::protocol::DeRecUserSecretStore;
+
+            let lf = LocalFixture::with_replica(SECRET_ID, 1002);
+            let mut rig = StoreRig::new();
+
+            let payload = crate::protocol::types::ReplicaSecretPayload {
+                secret: Some(crate::protocol::types::Secret {
+                    helpers: Vec::new(),
+                    secrets: Vec::new(),
+                    replicas: Some(payload_roster()),
+                }),
+                shares: Vec::new(),
+                shared_key: Vec::new(),
+                version: 0,
+            };
+
+            super::hydrate_catch_up(
+                &mut rig.stores(),
+                &lf.local(),
+                1001,
+                9,
+                &prost::Message::encode_to_vec(&payload),
+            )
+            .await
+            .expect("catch-up must hydrate");
+
+            let snapshot = rig
+                .user_secrets
+                .load_latest(SECRET_ID)
+                .await
+                .expect("load")
+                .expect("a snapshot must be committed");
+            assert_eq!(
+                snapshot.version, 9,
+                "an absent payload version means the enclosing one governs"
+            );
+        });
+    }
 }
 
 /// Build the payload a catch-up request is answered with.
 ///
-/// The same composite a publish sends — whole secret, whole roster — so the
-/// asker's hydration path is identical whether the state arrived unsolicited
-/// or was pulled. `None` when this device holds no snapshot and therefore has
-/// nothing to serve.
+/// The same composite a publish sends — whole secret, whole roster, and the
+/// per-helper share map — so the asker's hydration path is identical whether
+/// the state arrived unsolicited or was pulled. `None` when this device holds
+/// no snapshot and therefore has nothing to serve.
+///
+/// # The share map
+///
+/// Served from this device's own owner-side tracking shares at the snapshot's
+/// version, one read per helper: [`crate::protocol::types::Share`] carries no
+/// channel id, so a batched `load_many` could not say which helper each row
+/// belongs to, and the whole point of the map is that pairing.
+///
+/// Whatever this device can verify, the asker can verify after hydrating —
+/// which is the property that makes a pulled catch-up equivalent to a pushed
+/// round. A member that holds no tracking rows (it recovered, or it predates
+/// the map being stored) serves none and the asker is no worse off than the
+/// answerer.
+///
+/// This is no wider a disclosure than a publish: the push path has always
+/// carried the same share material to the same audience, and every member
+/// already holds each helper's `shared_key` through the roster.
 pub(in crate::protocol) async fn build_catch_up_payload<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
@@ -1532,22 +1795,52 @@ pub(in crate::protocol) async fn build_catch_up_payload<S: StoreSet>(
         group_key,
     )?;
 
-    // No share map: shares are derived per publishing round from the helper
-    // set, and a member does not persist them. A catch-up carries the secret,
-    // which is what the asker needs to become current.
+    let mut shares: Vec<crate::protocol::types::ChannelShare> = Vec::new();
+    for (helper, _) in &helpers {
+        if let Some(tracked) = stores
+            .shares
+            .load(secret_id, helper.channel_id, &[snapshot.version])
+            .await?
+            .into_iter()
+            .next()
+        {
+            shares.push(crate::protocol::types::ChannelShare {
+                channel_id: helper.channel_id.0,
+                committed_share: tracked.bytes,
+            });
+        }
+    }
+
     Ok(Some(crate::protocol::types::ReplicaSecretPayload {
         secret: Some(secret),
-        shares: Vec::new(),
+        shares,
         shared_key: Vec::new(),
+        // The asker files the map under this, not under the version it
+        // requested — see the field's docs.
+        version: snapshot.version,
     }))
 }
 
 /// Hydrate a payload pulled by a catch-up, reporting install or update.
+///
+/// # Which version this commits
+///
+/// `response_version` is what the enclosing `GetShareResponseMessage`
+/// carried, which on this leg is the version the *asker* requested rather
+/// than the one the answerer served. The payload's own
+/// [`version`](crate::protocol::types::ReplicaSecretPayload::version) is
+/// authoritative when present, so the snapshot and the share map are both
+/// committed at the version the bytes actually belong to. `response_version`
+/// is the fallback for an answerer that predates the field.
+///
+/// Filing the map under the requested version instead would key a helper's
+/// share to a version it never held, and verification would then hash the
+/// wrong bytes and report a healthy helper as corrupt.
 pub(in crate::protocol) async fn hydrate_catch_up<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
     from_replica_id: u64,
-    version: u32,
+    response_version: u32,
     payload: &[u8],
 ) -> Result<Vec<DeRecEvent>> {
     let secret_id = local.secret_id;
@@ -1556,10 +1849,23 @@ pub(in crate::protocol) async fn hydrate_catch_up<S: StoreSet>(
     let secret = composite.secret.ok_or(crate::Error::InvalidInput(
         "catch-up payload missing `secret` field",
     ))?;
+    let version = if composite.version == 0 {
+        response_version
+    } else {
+        composite.version
+    };
 
     let is_install = stores.user_secrets.load_latest(secret_id).await?.is_none();
 
-    replica::hydrate(stores, local, version, &secret, String::new()).await?;
+    replica::hydrate(
+        stores,
+        local,
+        version,
+        &secret,
+        &composite.shares,
+        String::new(),
+    )
+    .await?;
 
     let event = if is_install {
         DeRecEvent::ReplicaSecretInstalled {

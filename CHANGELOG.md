@@ -7,6 +7,122 @@ Breaking changes are called out explicitly, with the migration alongside
 them. The three crates and the SDKs share a version, so an entry applies to
 all of them unless it names a specific binding.
 
+### 0.0.5
+
+Verification was reachable but not usable outside the simplest case: a replica
+could not check the helpers holding the vault it mirrored, a member that caught
+up by pulling could never check anything, and a restored owner accused healthy
+helpers of holding corrupt data. Nothing here changes an API.
+
+- **Fixed: a replica destination could not verify the helpers holding the vault
+  it mirrored.** *(bug fix; no API change)*
+
+  Verification is a round trip over exact bytes: a helper answers a challenge
+  with `SHA-384(share ‖ nonce)` over the share it stores, and the owner
+  recomputes that hash from the copy it recorded when it distributed. A
+  destination records nothing when it distributes, because it never
+  distributed — so the mirrored payload carries the per-helper share map for
+  exactly this purpose.
+
+  That map was decoded, surfaced on `ReplicaSecretReceived` /
+  `ReplicaSecretInstalled`, and then dropped. Nothing wrote it to the share
+  store. A destination that took over a mirrored vault could therefore
+  challenge every helper and receive every answer, and reject all of them with
+  `no committed share stored for this channel/version — cannot verify proof`.
+  It held a secret it could read and recover from but not check — one of the
+  four things an owner is expected to be able to do.
+
+  `hydrate` now persists the map as owner-side tracking shares, under the
+  local partition at the same `(channel_id, version)` keys the source used. A
+  share naming a channel the roster does not list is refused rather than filed
+  against a helper this device has no channel or key for.
+
+  A second defect sat behind it. A helper holds exactly one endpoint per
+  channel — the device that paired with it — so a challenge from a group member
+  has to advertise its own endpoint or the answer is routed to whoever paired.
+  For a destination verifying a mirrored vault that is the *source*, which
+  drops the response as unsolicited while the challenger waits. `VerifyShares`
+  now carries this device's endpoint whenever a replica group exists, matching
+  what the helper leg of `ProtectSecret` has always done.
+
+  An empty map stays legitimate: a round below `threshold` runs no split, so
+  the source tracked nothing either and the version is equally unverifiable on
+  both devices.
+
+- **Fixed: a member that caught up by pulling could never verify its helpers.**
+  *(bug fix; wire-compatible new field on the replica payload)*
+
+  A member that falls behind pulls the current state from a peer instead of
+  waiting for a push. That answer deliberately carried no share map, on the
+  grounds that shares are derived per publishing round and a member does not
+  persist them — which is no longer true, and made *how* a member became
+  current decide whether it could verify anything.
+
+  A catch-up answer now carries the share map, served from the answerer's own
+  tracking rows. Whatever the answerer can verify, the asker can verify after
+  hydrating.
+
+  Fixing it exposed a version-keying hazard. A catch-up asks for one version
+  and is answered with whatever the peer holds, so the two routinely differ,
+  and `GetShareResponseMessage.version` echoes the *request*. Committing the
+  answer under that value already mis-dated the snapshot; doing it to a share
+  map would key a helper's share to a version it never held, and verification
+  would then hash the wrong bytes and report a healthy helper as corrupt.
+  `ReplicaSecretPayload` therefore gained a `version` field (tag 4) naming the
+  version its `secret` and `shares` belong to, and the receiver commits that.
+  A writer predating the field sends `0`, and the receiver falls back to the
+  enclosing message's version — which is what that writer meant. On a push,
+  where the sender writes both, a disagreement between the two is refused
+  rather than guessed.
+
+- **Fixed: `restore` wrote a fabricated tracking share, so verification accused
+  healthy helpers of holding corrupt data.** *(bug fix; no API change)*
+
+  Restore persisted an empty owner-side `Share` at the recovered version.
+  Verification found that row, hashed zero bytes against the nonce, compared it
+  with the helper's hash of the real share, and reported `verification proof is
+  invalid` — blaming the helper for a mismatch the owner had manufactured. An
+  application sweeping its helpers would mark every one of them corrupt and
+  prompt the user to re-provision over nothing.
+
+  The row is gone. Verification at the recovered version now reports honestly
+  that this device holds no reference bytes. It cannot hold them: a proof is
+  over the exact bytes a helper stores, and recovery cannot attribute a
+  collected share to a canonical helper channel — the VSS x-coordinate is a
+  random field element and `GetShareResponseMessage` carries no channel id.
+
+  The way back to a verifiable state is to publish. `start(ProtectSecret)`
+  derives `recovered_version + 1` from the snapshot restore commits, writes real
+  tracking shares as it distributes, and verification at that version behaves
+  as it does for an owner that never recovered. Note that a restored device
+  whose roster carries a replica group cannot publish until the application
+  configures a `replica_id` the roster names — restore does not adopt one,
+  since claiming the lost device's identity is a takeover with its own
+  convergence rules.
+
+- **Fixed: `DeRecShareStore::save` documented an invariant that contradicted the
+  rest of the trait, and three store implementations encoded it.**
+  *(bug fix; no API change — but read this if you wrote a share store)*
+
+  `save` said `share.secret_id` "must match the partition key `secret_id` —
+  implementations may assert this". `load_many`, four methods above it, says the
+  opposite and is the one that is right: `secret_id` is a **partition**, a
+  helper holds shares belonging to other people's secrets, and
+  `Share::secret_id` is the only thing that distinguishes them. The two are
+  equal only when a device happens to hold its own secret.
+
+  Both readings shipped. The SQLite and PostgreSQL reference stores added a
+  `debug_assert_eq!` that fires on the ordinary case of a helper holding
+  someone else's share. The Rust binding's in-memory store keyed rows on
+  `share.secret_id` while every read filtered on the partition, so writes
+  landed where no read looked — a store that silently discarded everything it
+  was given, and with it every helper-side verification and recovery answer.
+
+  The doc now states the rule the trait actually relies on, and all three
+  implementations follow it. **If you wrote a share store, check that `save`
+  keys on the `secret_id` argument and carries `share.secret_id` alongside as
+  data.** An assertion that the two are equal should be removed.
+
 ### 0.0.4
 
 - **The protocol schema now ships inside every published artifact.**

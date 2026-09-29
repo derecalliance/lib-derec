@@ -142,9 +142,8 @@ impl<
     ///   → DeRecProtocol::restore(&secret, version)
     /// ```
     ///
-    /// On success: canonical helper channels are persisted with
-    /// `SharedKey` + owner-side tracking shares at
-    /// `recovered_version`; canonical replica channels are persisted
+    /// On success: canonical helper channels are persisted with their
+    /// `SharedKey`; canonical replica channels are persisted
     /// with the group key from `secret.replicas.shared_key`;
     /// the user-secret snapshot is committed at `recovered_version`;
     /// every other
@@ -158,6 +157,25 @@ impl<
     /// before it succeeds. Any mid-flight failure leaves state the
     /// next `restore` call will detect as one of the precondition
     /// errors below.
+    ///
+    /// # Verification needs one publish first
+    ///
+    /// No owner-side tracking share is written, so
+    /// `start(`[`DeRecFlow::VerifyShares`]`)` at `recovered_version`
+    /// fails with [`crate::Error::InvalidInput`]: a `VerifyShare` proof
+    /// is `SHA-384(share ‖ nonce)` over the exact bytes a Helper holds,
+    /// and recovery cannot attribute a collected share to a canonical
+    /// Helper channel, so this device has no reference bytes for that
+    /// version. Run `start(`[`DeRecFlow::ProtectSecret`]`)` once —
+    /// it publishes `recovered_version + 1` and writes the tracking
+    /// shares that make verification work from then on.
+    ///
+    /// When `secret.replicas` carries a group, that publish additionally
+    /// requires a configured `replica_id` the roster names: restore
+    /// deliberately does not adopt the roster's identity, since claiming
+    /// it is a takeover with its own convergence rules. Without one the
+    /// publish fails with [`crate::Error::ReplicaIdNotConfigured`] and
+    /// no share reaches any Helper.
     ///
     /// # Errors
     ///
@@ -179,8 +197,10 @@ impl<
     /// nothing to derive.
     ///
     /// Store I/O failures mid-restore propagate as the underlying
-    /// [`crate::Error::ShareStore`], [`crate::Error::ChannelStore`],
-    /// or [`crate::Error::SecretStore`] variant.
+    /// [`crate::Error::ChannelStore`] or [`crate::Error::SecretStore`]
+    /// variant, or as [`crate::Error::ShareStore`] — which the
+    /// user-secret store reuses for the snapshot write, restore having
+    /// no share writes of its own.
     #[cfg_attr(feature = "logging", tracing::instrument(skip_all))]
     pub async fn restore(
         &mut self,
