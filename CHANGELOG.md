@@ -9,15 +9,16 @@ all of them unless it names a specific binding.
 
 ### 0.0.6
 
-Two security fixes and five defects. Every message on a channel was encrypted
+Two security fixes and six defects. Every message on a channel was encrypted
 under the same AES-GCM nonce, which exposes its contents and lets an attacker
 forge messages. A replica destination acted on its source's roster before
 confirming the fingerprint, so the check that stops a man-in-the-middle ran
 after the fact. Replica catch-up did not work from any SDK but Rust, and a
 pulled copy reported the wrong secret id. The Node.js and web SDKs could hang when two calls overlapped on one
 `DeRecProtocol` instance, and the React Native SDK on iOS could silently produce
-malformed messages. Dropped messages now surface as a `MessageIgnored` event
-that says why.
+malformed messages. A published replica roster did not name, or list every
+endpoint of, the device that published it. Dropped messages now surface as a
+`MessageIgnored` event that says why.
 
 - **Fixed (security): every message on a channel was encrypted with the same
   AES-GCM nonce.** *(bug fix; every SDK — wire-compatible)*
@@ -167,6 +168,21 @@ that says why.
   (`-all_load`) per slice, so this failure mode stops the build instead of
   shipping. **React Native iOS apps on 0.0.5 or earlier should upgrade**;
   messages those builds sent may have been rejected by their peers.
+
+- **Fixed: a replica roster described every member except the one that
+  published it.** *(bug fix; every SDK — wire-compatible, no API change)*
+
+  A device recorded each peer in its group with every endpoint and the
+  `communication_info` that peer advertised at pairing, but recorded itself
+  with only its primary endpoint and an empty `communication_info`. Each
+  version's `Secret.replicas.members` is built from those records, so the
+  member that wrote it had no name and a single address. Anything rebuilding
+  the group from a `Secret` — a destination adopting a copy, a device
+  restoring — could neither name that member nor reach it on its other
+  endpoints. A device's own record now carries its full endpoint list and its
+  `communication_info`, filtered as a peer would store it, and every publish
+  fills both in from the instance's current configuration. Groups paired on
+  an earlier version are corrected by their next publish.
 
 ### 0.0.5
 

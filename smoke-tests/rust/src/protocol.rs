@@ -32,6 +32,7 @@ pub async fn run_all() {
     run_sharing_flow().await;
     run_verification_flow().await;
     run_replica_mirror_then_verify_flow().await;
+    run_replica_roster_describes_every_member_flow().await;
     run_unconfirmed_destination_ignores_the_copy_flow().await;
     run_replica_verifies_only_synced_versions_flow().await;
     run_discovery_and_recovery_flow().await;
@@ -2646,6 +2647,138 @@ async fn run_replica_mirror_then_verify_flow() {
 /// perfectly well. Asserted here because "the destination cannot verify" and
 /// "the destination cannot verify *this* version" look identical from an
 /// application's logs, and only the second one is correct.
+/// A published roster describes every member the same way — the device that
+/// published it included.
+///
+/// Each device advertises two endpoints and a name. A peer's row is recorded
+/// from what that peer advertised at pairing; the publisher's own row must
+/// carry the same: every endpoint, in preference order, and its
+/// `communication_info`. Anything rebuilding the group from a `Secret` —
+/// a destination adopting the copy, a device restoring — can otherwise
+/// neither name nor reach the member that wrote it.
+async fn run_replica_roster_describes_every_member_flow() {
+    println!("=== Protocol replica roster describes every member flow test ===");
+
+    let source_id = 0xCCCC_CCCC_CCCC_CCCCu64;
+    let destination_id = 0xDDDD_DDDD_DDDD_DDDDu64;
+
+    let identity = |label: &'static str, name: &str, replica_id: u64| {
+        let uri = format!("https://{label}.example.com");
+        let endpoints = vec![uri.clone(), format!("grpcs://{label}.example.com:443")];
+        let transport = InProcessTransport::new();
+        let protocol = DeRecProtocolBuilder::new(DEFAULT_TEST_SECRET_ID)
+            .with_channel_store(InMemoryChannelStore::default())
+            .with_share_store(InMemoryShareStore::default())
+            .with_secret_store(InMemorySecretStore::default())
+            .with_user_secret_store(InMemoryUserSecretStore::default())
+            .with_transport(transport.clone())
+            .with_state_store(InMemoryStateStore::default())
+            .with_own_transports(endpoints.iter().map(String::as_str).collect::<Vec<_>>())
+            .with_threshold(2)
+            .with_replica_id(replica_id)
+            .with_communication_info(HashMap::from([("name".to_owned(), name.to_owned())]))
+            .build()
+            .expect("test fixture: builder.build() should succeed");
+        let peer = Peer {
+            label,
+            uri,
+            protocol,
+            transport,
+        };
+        (peer, endpoints)
+    };
+    let (mut source, source_endpoints) = identity("roster-source", "Alice-1", source_id);
+    let (mut destination, destination_endpoints) =
+        identity("roster-destination", "Alice-2", destination_id);
+
+    let pairing_channel = ChannelId(0x0570);
+    let group_channel =
+        pair_replica_handshake(&mut source, &mut destination, pairing_channel).await;
+    cross_confirm_fingerprint(&mut source, &mut destination, group_channel).await;
+    let _ = pump_many(&mut [&mut source, &mut destination]).await;
+
+    source
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![UserSecret {
+                id: vec![1],
+                name: "roster secret".to_owned(),
+                data: b"roster-contents".to_vec(),
+            }],
+            description: None,
+        })
+        .await
+        .expect("source start(ProtectSecret) failed");
+    let events = pump_many(&mut [&mut source, &mut destination]).await;
+
+    let secret = events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            DeRecEvent::ReplicaSecretReceived { secret, .. }
+            | DeRecEvent::ReplicaSecretInstalled { secret, .. } => Some(secret.clone()),
+            _ => None,
+        })
+        .expect("the destination must receive the published secret");
+
+    let describe = |transports: &[TransportProtocol], info: &HashMap<String, String>| {
+        (
+            transports.iter().map(|t| t.uri.clone()).collect::<Vec<_>>(),
+            info.get("name").cloned(),
+        )
+    };
+    let expected = |endpoints: &[String], name: &str| (endpoints.to_vec(), Some(name.to_owned()));
+
+    let members = secret.replicas.expect("roster is present").members;
+    assert_eq!(
+        members.len(),
+        2,
+        "both members are published, got {members:?}"
+    );
+    for (replica_id, endpoints, name) in [
+        (source_id, &source_endpoints, "Alice-1"),
+        (destination_id, &destination_endpoints, "Alice-2"),
+    ] {
+        let member = members
+            .iter()
+            .find(|m| m.replica_id == replica_id)
+            .unwrap_or_else(|| panic!("member {replica_id:#x} missing from {members:?}"));
+        assert_eq!(
+            describe(&member.transports, &member.communication_info),
+            expected(endpoints, name),
+            "published row for {name}"
+        );
+    }
+    println!("  published roster names and reaches the writer as well as its peer  ✓");
+
+    // The destination now holds the group as the roster described it. Its
+    // record of the source must be as complete as its record of itself.
+    let destination_sid = destination.protocol.secret_id();
+    let stored = destination
+        .protocol
+        .channel_store
+        .replicas(destination_sid, ReplicaFilter::default())
+        .await
+        .expect("destination roster");
+    for (replica_id, endpoints, name) in [
+        (source_id, &source_endpoints, "Alice-1"),
+        (destination_id, &destination_endpoints, "Alice-2"),
+    ] {
+        let member = stored
+            .iter()
+            .find(|m| m.replica_id == ReplicaId(replica_id))
+            .unwrap_or_else(|| panic!("destination holds no row for {replica_id:#x}"));
+        assert_eq!(
+            describe(&member.transports, &member.communication_info),
+            expected(endpoints, name),
+            "destination's stored row for {name}"
+        );
+    }
+    println!("  destination stores every member, itself included, the same way  ✓");
+
+    println!("Protocol replica roster describes every member flow test passed.\n");
+}
+
 async fn run_replica_verifies_only_synced_versions_flow() {
     println!("=== Protocol replica verifies only synced versions flow ===");
 

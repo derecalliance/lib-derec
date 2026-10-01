@@ -116,10 +116,11 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     // The roster names every member, including this device — a group whose
     // members cannot name themselves is not reconstructible from the payload.
     // The dispatch list above is the same set minus self.
-    let roster = stores
+    let mut roster = stores
         .channels
         .replicas_matching(secret_id, crate::protocol::types::ReplicaFilter::default())
         .await?;
+    stamp_own_row(local, &mut roster);
     let group_channel = group_channel_of(local, &roster)?;
     let group_key = match group_channel {
         Some(channel_id) => match stores
@@ -652,6 +653,22 @@ fn group_channel_of(
         .ok_or(Error::Invariant(
             "replica group has members but this device holds no row of its own",
         ))
+}
+
+/// Publish this device's own row under what it advertises now.
+///
+/// A peer's row carries every endpoint and the `communication_info` that peer
+/// advertised, but the stored own row only records what was current when it
+/// was written. Stamping it here is what lets a roster name, and reach, the
+/// device that published it.
+fn stamp_own_row(local: &Local<'_>, roster: &mut [crate::protocol::types::ReplicaMember]) {
+    let Some(own) = local.replica_id else {
+        return;
+    };
+    if let Some(member) = roster.iter_mut().find(|m| m.replica_id.0 == own) {
+        member.transports = local.own_transports.to_vec();
+        member.communication_info = super::pairing::own_communication_info(local);
+    }
 }
 
 /// Project the group onto the wire roster.
@@ -1604,6 +1621,92 @@ mod group_conformance_tests {
         });
     }
 
+    /// A published roster names, and can reach, every member — the writer
+    /// included.
+    ///
+    /// The writer's stored row is seeded with one endpoint and no
+    /// `communication_info`, as rows written before the own row carried them
+    /// are: publishing stamps it from the instance, so such a group heals on
+    /// its next round.
+    #[test]
+    fn a_published_roster_describes_every_member_including_the_writer() {
+        run_async(async {
+            let lf = crate::protocol::test::LocalFixture {
+                own_transports: vec![
+                    endpoint("https://self"),
+                    TransportProtocol {
+                        uri: "grpcs://self:443".to_owned(),
+                        protocol: Protocol::Grpc as i32,
+                    },
+                ],
+                communication_info: std::collections::HashMap::from([(
+                    "name".to_owned(),
+                    "Alice-2".to_owned(),
+                )]),
+                ..LocalFixture::with_replica(SECRET_ID, 1002)
+            };
+            let mut rig = StoreRig::new();
+            seed_member(&mut rig.channels, 1002, ReplicaRole::Source, "https://self").await;
+            rig.channels
+                .save(
+                    SECRET_ID,
+                    ChannelRecord::Replica(ReplicaMember {
+                        channel_id: GROUP_CHANNEL,
+                        replica_id: ReplicaId(1003),
+                        transports: vec![endpoint("https://alice-3")],
+                        communication_info: std::collections::HashMap::from([(
+                            "name".to_owned(),
+                            "Alice-3".to_owned(),
+                        )]),
+                        role: ReplicaRole::Destination,
+                        status: ChannelStatus::Paired,
+                        created_at: 0,
+                    }),
+                )
+                .await
+                .expect("seed peer");
+            seed_group_key(&mut rig.secrets).await;
+            seed_helper_and_snapshot(&mut rig, 4, None).await;
+
+            let payload = super::build_catch_up_payload(&mut rig.stores(), &lf.local())
+                .await
+                .expect("catch-up payload")
+                .expect("a device holding a snapshot must serve one");
+
+            let members = payload
+                .secret
+                .and_then(|s| s.replicas)
+                .expect("roster is present")
+                .members;
+            let mut described: Vec<(u64, Option<String>, Vec<String>)> = members
+                .iter()
+                .map(|m| {
+                    (
+                        m.replica_id,
+                        m.communication_info.get("name").cloned(),
+                        m.transports.iter().map(|t| t.uri.clone()).collect(),
+                    )
+                })
+                .collect();
+            described.sort();
+            assert_eq!(
+                described,
+                vec![
+                    (
+                        1002,
+                        Some("Alice-2".to_owned()),
+                        vec!["https://self".to_owned(), "grpcs://self:443".to_owned()],
+                    ),
+                    (
+                        1003,
+                        Some("Alice-3".to_owned()),
+                        vec!["https://alice-3".to_owned()],
+                    ),
+                ],
+            );
+        });
+    }
+
     /// A member with no tracking rows serves a map-less answer rather than
     /// failing. Below-threshold rounds and recovered devices both land here.
     #[test]
@@ -1820,10 +1923,11 @@ pub(in crate::protocol) async fn build_catch_up_payload<S: StoreSet>(
     };
 
     let (helpers, _) = load_all_paired_targets(stores, local).await?;
-    let roster = stores
+    let mut roster = stores
         .channels
         .replicas_matching(secret_id, crate::protocol::types::ReplicaFilter::default())
         .await?;
+    stamp_own_row(local, &mut roster);
     let group_channel = group_channel_of(local, &roster)?;
     let group_key = match group_channel {
         Some(channel_id) => match stores

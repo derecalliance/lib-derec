@@ -371,8 +371,7 @@ pub(in crate::protocol) async fn on_response<S: StoreSet>(
     };
 
     let replica_id_to_inject = super::require_replica_id_for_kind(local_kind, replica_id)?;
-    let comm_info =
-        super::build_communication_info(pairing.communication_info, replica_id_to_inject);
+    let comm_info = super::build_communication_info(local.communication_info, replica_id_to_inject);
     let result = request::produce(
         local_kind,
         local.own_transports.to_vec(),
