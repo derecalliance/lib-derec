@@ -1,6 +1,6 @@
 [package]
 name = "derec-library"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -22,8 +22,8 @@ include = [
 crate-type = ["cdylib", "rlib", "staticlib"]
 
 [dependencies]
-derec-cryptography = { version = "0.0.5", path = "../cryptography" }
-derec-proto = { version = "0.0.5", path = "../protobufs" }
+derec-cryptography = { version = "0.0.6", path = "../cryptography" }
+derec-proto = { version = "0.0.6", path = "../protobufs" }
 prost = "0.14.4"
 prost-types = "0.14.4"
 rand = { version = "0.10.2", features = ["sys_rng"] }
@@ -44,7 +44,7 @@ tracing = { version = "0.1.44", default-features = false, features = ["attribute
 tokio = { version = "1.53.1", features = ["rt"], default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-derec-proto = { version = "0.0.5", path = "../protobufs", features = ["serde"] }
+derec-proto = { version = "0.0.6", path = "../protobufs", features = ["serde"] }
 wasm-bindgen = { version = "0.2.126", features = ["serde-serialize"] }
 wasm-bindgen-futures = { version = "0.4.76" }
 serde-wasm-bindgen = { version = "0.6.5" }
@@ -53,6 +53,7 @@ web-sys = { version = "0.3.103", features = ["console"] }
 getrandom_02 = { package = "getrandom", version = "0.2.17", features = ["js"] }
 getrandom_04 = { package = "getrandom", version = "0.4.3", features = ["wasm_js"] }
 console_error_panic_hook = "0.1.7"
+tokio = { version = "1.53.1", features = ["sync"], default-features = false }
 
 [features]
 logging = ["dep:tracing"]

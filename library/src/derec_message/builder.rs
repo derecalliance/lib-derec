@@ -431,7 +431,7 @@ impl DeRecMessageBuilder<NotEncrypted, ChannelMode> {
             .ok_or(DeRecMessageBuilderError::MissingChannelId)?;
 
         let mut nonce = [0u8; 32];
-        nonce[24..].copy_from_slice(&u64::from(channel_id).to_be_bytes());
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut nonce[..12]);
 
         let encoded = self.message.unwrap().encode_to_vec();
         let encrypted = derec_cryptography::channel::encrypt_message(&encoded, shared_key, &nonce)?;

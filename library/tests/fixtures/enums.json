@@ -71,6 +71,20 @@
         }
       ]
     },
+    "IgnoreReason": {
+      "encoding": "name",
+      "note": "MessageIgnored.reason",
+      "variants": [
+        {
+          "name": "PendingVerification",
+          "wire": "PendingVerification"
+        },
+        {
+          "name": "Expired",
+          "wire": "Expired"
+        }
+      ]
+    },
     "DeRecEvent": {
       "encoding": "name",
       "note": "the serde `type` discriminator on every emitted event",
@@ -98,6 +112,10 @@
         {
           "name": "DiscoveryStarted",
           "wire": "DiscoveryStarted"
+        },
+        {
+          "name": "MessageIgnored",
+          "wire": "MessageIgnored"
         },
         {
           "name": "NoOp",

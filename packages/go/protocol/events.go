@@ -42,6 +42,7 @@ const (
 	EventTypeActionRequired            = "ActionRequired"
 	EventTypeAutoAccepted              = "AutoAccepted"
 	EventTypeNoOp                      = "NoOp"
+	EventTypeMessageIgnored            = "MessageIgnored"
 	EventTypePairingStarted            = "PairingStarted"
 	EventTypeDiscoveryStarted          = "DiscoveryStarted"
 	EventTypeDiscoveryFailed           = "DiscoveryFailed"
@@ -118,6 +119,14 @@ type Event struct {
 
 	// ReplicaSyncFailed — the transport or encoding failure, rendered for
 	// display. Distinct from Error, which the flow-level *Failed events use.
+	//
+	// MessageIgnored — why the message was dropped, one of the IgnoreReason*
+	// constants. The message changed no store and drew no reply.
+	// IgnoreReasonPendingVerification means the peer sent it before this
+	// device confirmed the channel's fingerprint; confirming does not replay
+	// it, so a replica destination calls Start(FlowKindReplicaDiscovery)
+	// after VerifyFingerprint succeeds to pull the copy itself. TraceID and
+	// ChannelID are set too.
 	Reason string `json:"reason"`
 
 	// ReplicaSyncComplete. Synced acknowledged; Behind refused, timed out, or
@@ -180,6 +189,13 @@ const (
 	ActionKindGetShare          = "GetShare"
 	ActionKindUnpair            = "Unpair"
 	ActionKindUpdateChannelInfo = "UpdateChannelInfo"
+)
+
+// The label vocabulary for Event.Reason on a MessageIgnored event. Matches
+// the Rust IgnoreReason discriminants one-for-one.
+const (
+	IgnoreReasonPendingVerification = "PendingVerification"
+	IgnoreReasonExpired             = "Expired"
 )
 
 // Secret mirrors SecretWire in wire.rs — the typed secret snapshot carried

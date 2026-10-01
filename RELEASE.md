@@ -527,9 +527,22 @@ export ANDROID_NDK_HOME=/path/to/Android/sdk/ndk/<version>
    `packages/react-native/ios/DeRecFFI.xcframework` with `xcodebuild`.
 3. Builds the Rust static library for each Android ABI and stages it into
    `packages/react-native/android/src/main/jniLibs/<abi>/`.
-4. Compiles the package's TypeScript sources into `lib/`.
-5. Writes `package.json` from `package.override.json` plus the resolved
+4. Strips debug sections from every archive with the NDK's `llvm-strip`, then
+   links each iOS slice into a stub executable with `-all_load`, which fails
+   the build if two archive members define the same symbol.
+5. Compiles the package's TypeScript sources into `lib/`.
+6. Writes `package.json` from `package.override.json` plus the resolved
    version, and copies in `LICENSE`.
+
+> [!WARNING]
+> Never strip these archives with Apple's `strip`. Rust gives each codegen
+> unit's copy of a cross-unit internal symbol a distinct `.llvm.<hash>`
+> suffix, and `strip -S` drops those suffixes. Distinct function bodies then
+> share one name, and the app's linker binds some calls to the wrong one. The
+> app still links and runs but computes garbage; up to 0.0.5 this showed up as
+> truncated protobuf varints on iOS only. The `-all_load` link in step 4 is
+> the check that catches it, because a standalone link reports the duplicate
+> symbols that an app link resolves silently.
 
 This must run on macOS with Xcode installed and `ANDROID_NDK_HOME` set — the
 XCFramework step has no Linux or cross-compilation equivalent.
@@ -539,7 +552,7 @@ XCFramework step has no Linux or cross-compilation equivalent.
 > `packages/react-native`.** Unlike the other packages, this one keeps a
 > *development* manifest in git, because its in-tree Jest suite needs
 > `devDependencies` and `scripts` and the lockfile is resolved against them —
-> neither of which belongs in a published tarball. Step 5 writes the publish
+> neither of which belongs in a published tarball. Step 6 writes the publish
 > manifest into the stage directory and leaves the tracked one alone, so the
 > two are never the same file and there is nothing to restore afterwards.
 >

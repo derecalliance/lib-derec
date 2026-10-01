@@ -414,6 +414,8 @@ The recommended pattern: pair on the ephemeral URI, then — as soon as pairing 
 
 Replica channels are created `Pending` and remain there until both sides call `VerifyFingerprint` with the value the peer derived from the shared key — confirmed out of band. The orchestrator enforces this: `Start(FlowKindProtectSecret, ...)` rejects a target that is still `Pending`. Treat verification as a required step in the pairing UX — a scanner that auto-pairs without it accepts a MITM-vulnerable replica.
 
+Until a device confirms, it ignores everything the peer sends on that channel: `Process` changes no store, sends nothing back, and returns an event with `Type == EventTypeMessageIgnored` and `Reason == IgnoreReasonPendingVerification`, plus `ChannelID` and `TraceID`. This matters most for a replica destination. The source's own confirmation publishes the vault immediately, so that copy usually arrives before the destination's user has confirmed. Confirming does not replay it: once the destination's `VerifyFingerprint` returns `true`, call `Start(FlowKindReplicaDiscovery, nil)` to pull the copy from the source.
+
 ### The `derec.*` `communicationInfo` namespace is library-owned
 
 `CommunicationInfo` is otherwise an opaque application-defined map, but every key under the `derec.` prefix is reserved for the protocol. Application code must not write any `derec.*` entry — the orchestrator silently overwrites or strips library-owned keys at the protocol boundary, and app-set values are lost without warning.

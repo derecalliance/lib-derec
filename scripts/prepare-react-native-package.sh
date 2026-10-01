@@ -114,34 +114,51 @@ check_ffi_header_is_current() {
 #
 # Debug sections only. Stripping the symbol table would leave an archive the
 # consuming app cannot link against.
+find_llvm_strip() {
+  # Globbed rather than `find`ed: the NDK's toolchain directories are
+  # symlinks under a Homebrew install, and `find -type f` does not follow
+  # them, so it reports the tool as absent while `ls` shows it.
+  local ndk_root="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}"
+  local candidate
+  for candidate in "$ndk_root"/toolchains/llvm/prebuilt/*/bin/llvm-strip; do
+    if [[ -x "$candidate" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+}
+
 strip_static_archive() {
-  local lib="$1" kind="$2"
-  local before after
+  local lib="$1"
+  local before after llvm_strip
+  llvm_strip="$(find_llvm_strip)"
+  if [[ -z "$llvm_strip" ]]; then
+    log "llvm-strip not found in the NDK; leaving $lib unstripped"
+    return 0
+  fi
   before="$(wc -c <"$lib" | tr -d ' ')"
-  case "$kind" in
-    apple) xcrun strip -S "$lib" ;;
-    android)
-      # Globbed rather than `find`ed: the NDK's toolchain directories are
-      # symlinks under a Homebrew install, and `find -type f` does not follow
-      # them, so it reports the tool as absent while `ls` shows it.
-      local ndk_root="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}"
-      local ndk_strip=""
-      local candidate
-      for candidate in "$ndk_root"/toolchains/llvm/prebuilt/*/bin/llvm-strip; do
-        if [[ -x "$candidate" ]]; then
-          ndk_strip="$candidate"
-          break
-        fi
-      done
-      if [[ -z "$ndk_strip" ]]; then
-        log "llvm-strip not found in the NDK; leaving $lib unstripped"
-        return 0
-      fi
-      "$ndk_strip" --strip-debug "$lib"
-      ;;
-  esac
+  "$llvm_strip" --strip-debug "$lib"
   after="$(wc -c <"$lib" | tr -d ' ')"
   log "Stripped $(basename "$(dirname "$lib")")/$(basename "$lib"): $((before / 1048576))M -> $((after / 1048576))M"
+}
+
+assert_archive_links() {
+  local lib="$1" sdk="$2" target_suffix="$3"
+  local stub_dir="$WORKSPACE_TARGET_DIR/rn-archive-link-check"
+  mkdir -p "$stub_dir"
+  printf 'int main(void) { return 0; }\n' >"$stub_dir/stub.c"
+  local arch
+  for arch in $(lipo -archs "$lib"); do
+    if ! xcrun -sdk "$sdk" clang -target "$arch-apple-ios15.0$target_suffix" \
+         "$stub_dir/stub.c" -Wl,-all_load "$lib" \
+         -framework Security -framework CoreFoundation -liconv -lresolv \
+         -o "$stub_dir/stub" >"$stub_dir/link.log" 2>&1; then
+      echo "$(basename "$lib") ($arch, $sdk) does not link on its own:" >&2
+      grep -E "duplicate symbol|error" "$stub_dir/link.log" | head -10 >&2 || true
+      exit 1
+    fi
+    log "$sdk/$arch archive links cleanly"
+  done
 }
 
 build_ios_xcframework() {
@@ -174,8 +191,10 @@ build_ios_xcframework() {
   mkdir -p "$headers_dir"
   cp "$PKG_DIR/cpp/derec_ffi.h" "$headers_dir/"
 
-  strip_static_archive "$device_lib" apple
-  strip_static_archive "$sim_fat_lib" apple
+  strip_static_archive "$device_lib"
+  strip_static_archive "$sim_fat_lib"
+  assert_archive_links "$device_lib" iphoneos ""
+  assert_archive_links "$sim_fat_lib" iphonesimulator "-simulator"
 
   log "Creating $XCFRAMEWORK_NAME"
   rm -rf "$IOS_DIR/$XCFRAMEWORK_NAME"
@@ -197,7 +216,7 @@ build_android_libs() {
     local dest_dir="$ANDROID_JNI_DIR/$abi"
     mkdir -p "$dest_dir"
     cp "$(staticlib_path "$rust_target")" "$dest_dir/"
-    strip_static_archive "$dest_dir/$STATICLIB_NAME" android
+    strip_static_archive "$dest_dir/$STATICLIB_NAME"
     echo "Staged $STATICLIB_NAME -> android/src/main/jniLibs/$abi/"
   done
 }

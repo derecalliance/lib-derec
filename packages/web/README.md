@@ -505,6 +505,12 @@ index.d.ts
 - No protobuf types are exposed
 - No cryptographic operations occur in JavaScript
 - Rust is the single source of truth
+- Every `DeRecProtocol` method that touches protocol state returns a
+  `Promise`, including the `set*` setters. Overlapping calls on one
+  instance — a `tick()` timer firing while `process()` handles a message —
+  queue and run in the order they were made; they never collide. A store
+  or transport callback must not await a call on the instance that
+  invoked it, since that call waits behind the callback's own caller.
 
 ---
 
@@ -650,6 +656,15 @@ enforces this: `start(FlowKind.ProtectSecret, ...)` throws when a
 target is still `Pending`. Treat verification as a required step in
 the pairing UX — a scanner that auto-pairs without it accepts a
 MITM-vulnerable replica.
+
+Until a device confirms, it ignores everything the peer sends on that
+channel: `process` changes no store, sends nothing back, and returns
+`{ type: "MessageIgnored", channel_id, reason: "PendingVerification",
+trace_id }`. This matters most for a replica destination. The source's own
+confirmation publishes the vault immediately, so that copy usually arrives
+before the destination's user has confirmed. Confirming does not replay it:
+once the destination's `verifyFingerprint` resolves `true`, call
+`start(FlowKind.ReplicaDiscovery)` to pull the copy from the source.
 
 ### The `derec.*` namespace in `communicationInfo` is library-owned
 

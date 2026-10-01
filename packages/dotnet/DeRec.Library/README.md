@@ -600,6 +600,16 @@ target is still `Pending`. Treat verification as a required step in the
 pairing UX — a scanner that auto-pairs without it accepts a
 MITM-vulnerable replica.
 
+Until a device confirms, it ignores everything the peer sends on that
+channel: `ProcessAsync` changes no store, sends nothing back, and returns a
+`MessageIgnoredEvent` whose `Reason` is `IgnoreReason.PendingVerification`,
+with `ChannelId` and `TraceId`. This matters most for a replica destination.
+The source's own confirmation publishes the vault immediately, so that copy
+usually arrives before the destination's user has confirmed. Confirming does
+not replay it: once the destination's `VerifyFingerprintAsync` returns `true`,
+call `StartAsync(FlowKind.ReplicaDiscovery, new ReplicaDiscoveryParams())` to
+pull the copy from the source.
+
 ### The `derec.*` namespace in `CommunicationInfo` is library-owned
 
 `CommunicationInfo` is otherwise an opaque app-defined map, but every

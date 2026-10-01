@@ -267,7 +267,7 @@ async fn step_4_rotate_helpers(
         Tables {
             channels: 3,
             secrets: 3,
-            shares: 3,
+            shares: 0,
             user_secrets: 1,
             ..Default::default()
         },
@@ -299,7 +299,7 @@ async fn step_4_rotate_helpers(
     // nothing. Each pairing is therefore a version:
     //   v3 goes to the 3 survivors + spare #6   → 4 rows
     //   v4 goes to those 4 + spare #7           → 5 rows
-    // on top of the 3 rows the owner still held at v2.
+    // The recovered v2 left the owner no rows of its own.
     assert_tables(
         &owner.client(),
         SECRET_ID,
@@ -308,7 +308,7 @@ async fn step_4_rotate_helpers(
         Tables {
             channels: 5,
             secrets: 5,
-            shares: 3 + 4 + 5,
+            shares: 4 + 5,
             user_secrets: 1,
             ..Default::default()
         },
@@ -316,8 +316,8 @@ async fn step_4_rotate_helpers(
     .await;
     assert_eq!(
         share_versions(&owner.client(), SECRET_ID).await,
-        vec![2, 3, 4],
-        "one version per admission, on top of the recovered v2"
+        vec![3, 4],
+        "one version per admission; the recovered v2 has none"
     );
 
     // Each helper holds exactly the versions published since it joined: the
@@ -411,13 +411,13 @@ async fn step_5_admit_first_replica(
             channels: 5,
             replica_members: 2,
             secrets: 6,
-            shares: 12 + 5,
+            shares: 9 + 5,
             user_secrets: 1,
             ..Default::default()
         },
     )
     .await;
-    assert_replica(replica, "step 5", 2).await;
+    assert_replica(replica, "step 5", 2, 5).await;
     assert_helpers(helpers, "step 5", 1).await;
     println!("  step 5: replica admitted — roster of 2 on both devices, replica synced  ✓");
 }
@@ -460,9 +460,8 @@ async fn step_6_recover_with_a_replica_in_the_roster(
         Some(version),
         "the recovered version becomes the owner's snapshot"
     );
-    // Recovery resets the owner's share rows to one per helper at the
-    // recovered version, exactly as in step 3 — but the roster came back with
-    // it, so this is still a two-member group.
+    // Recovery leaves the owner with no share rows, exactly as in step 3 — but
+    // the roster came back with it, so this is still a two-member group.
     assert_tables(
         &owner.client(),
         SECRET_ID,
@@ -472,7 +471,7 @@ async fn step_6_recover_with_a_replica_in_the_roster(
             channels: 5,
             replica_members: 2,
             secrets: 6,
-            shares: 5,
+            shares: 0,
             user_secrets: 1,
             ..Default::default()
         },
@@ -480,7 +479,7 @@ async fn step_6_recover_with_a_replica_in_the_roster(
     .await;
     assert_helpers(helpers, "step 6", 1).await;
     for replica in replicas.iter() {
-        assert_replica(replica, "step 6", 2).await;
+        assert_replica(replica, "step 6", 2, 5).await;
     }
     println!(
         "  step 6: owner recovered v{version} again — replica roster restored from the secret  ✓"
@@ -536,14 +535,14 @@ async fn step_7_admit_remaining_replicas(
             channels: 5,
             replica_members: 4,
             secrets: 6,
-            shares: 5 + 5 + 5,
+            shares: 5 + 5,
             user_secrets: 1,
             ..Default::default()
         },
     )
     .await;
-    for replica in replicas.iter() {
-        assert_replica(replica, "step 7", 4).await;
+    for (replica, shares) in replicas.iter().zip([15, 10, 5]) {
+        assert_replica(replica, "step 7", 4, shares).await;
     }
     assert_helpers(helpers, "step 7", 3).await;
     println!("  step 7: two more replicas admitted — all 4 devices share one roster  ✓");
@@ -606,14 +605,14 @@ async fn step_8_protect_more_secrets(
             channels: 5,
             replica_members: 4,
             secrets: 6,
-            shares: 15 + 5,
+            shares: 10 + 5,
             user_secrets: 1,
             ..Default::default()
         },
     )
     .await;
-    for replica in replicas.iter() {
-        assert_replica(replica, "step 8", 4).await;
+    for (replica, shares) in replicas.iter().zip([20, 15, 10]) {
+        assert_replica(replica, "step 8", 4, shares).await;
     }
     assert_helpers(helpers, "step 8", 4).await;
     println!(
@@ -691,14 +690,14 @@ async fn step_9_remove_a_replica(
             channels: 5,
             replica_members: 3,
             secrets: 6,
-            shares: 20 + 5,
+            shares: 15 + 5,
             user_secrets: 1,
             ..Default::default()
         },
     )
     .await;
-    for replica in replicas.iter() {
-        assert_replica(replica, "step 9", 3).await;
+    for (replica, shares) in replicas.iter().zip([25, 20]) {
+        assert_replica(replica, "step 9", 3, shares).await;
     }
     assert_helpers(helpers, "step 9", 5).await;
     println!(
@@ -988,8 +987,10 @@ async fn step_3_recover_after_device_loss(
     );
 
     // Post-recovery the owner is whole again: five re-paired channels, their
-    // keys, the shares restore() re-derived, and the snapshot. The old
-    // channels are gone with the old device.
+    // keys and the snapshot. Restore writes no tracking shares — recovery
+    // cannot attribute a collected share to a helper channel — so the owner
+    // holds none until it next publishes. The old channels are gone with the
+    // old device.
     assert_tables(
         &owner.client(),
         SECRET_ID,
@@ -998,7 +999,7 @@ async fn step_3_recover_after_device_loss(
         Tables {
             channels: 5,
             secrets: 5,
-            shares: 5,
+            shares: 0,
             user_secrets: 1,
             ..Default::default()
         },
@@ -1028,10 +1029,9 @@ async fn step_3_recover_after_device_loss(
         )
         .await;
     }
-    assert_eq!(
-        share_versions(&owner.client(), SECRET_ID).await,
-        vec![2],
-        "the restored owner holds shares for the recovered version only"
+    assert!(
+        share_versions(&owner.client(), SECRET_ID).await.is_empty(),
+        "restore writes no tracking shares"
     );
     println!(
         "  step 3: owner recovered v{recovered_version} from 5 helpers after a total device loss — \
@@ -1420,10 +1420,10 @@ async fn assert_helpers(helpers: &[HelperDevice], step: &str, publishes_since_st
 ///
 /// A member hydrates the **whole** roster, helper channels included — it must
 /// be able to publish on its own, which means holding every helper's channel
-/// and key, plus the group channel: six `secrets` rows in all. It keeps no
-/// share rows, because unlike the owner it holds the secret itself rather than
-/// tracking copies of what it handed out.
-async fn assert_replica(replica: &ReplicaDevice, step: &str, members: i64) {
+/// and key, plus the group channel: six `secrets` rows in all. It also stores
+/// the mirrored share map for every version it synced since joining, one row
+/// per helper per version, so it can verify those helpers itself.
+async fn assert_replica(replica: &ReplicaDevice, step: &str, members: i64, shares: i64) {
     assert_tables(
         &replica.peer.client(),
         SECRET_ID,
@@ -1433,6 +1433,7 @@ async fn assert_replica(replica: &ReplicaDevice, step: &str, members: i64) {
             channels: 5,
             replica_members: members,
             secrets: 6,
+            shares,
             user_secrets: 1,
             ..Default::default()
         },

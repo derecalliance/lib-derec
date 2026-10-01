@@ -629,6 +629,38 @@ public sealed record NoOpEvent : DeRecEvent
 }
 
 /// <summary>
+/// An inbound message was dropped untouched: no store was written and nothing
+/// was sent back. <see cref="Reason"/> is one of the <see cref="IgnoreReason"/>
+/// constants.
+/// </summary>
+/// <remarks>
+/// <see cref="IgnoreReason.PendingVerification"/> means the peer sent it before
+/// this device confirmed the channel's fingerprint — typically a replica source
+/// pushing its first copy while this destination still shows the code.
+/// Confirming does not replay it: after <c>VerifyFingerprintAsync</c> succeeds,
+/// a replica destination starts <see cref="FlowKind.ReplicaDiscovery"/> to pull
+/// the copy itself. <see cref="TraceId"/> matches the peer's <c>*Started</c>
+/// event for the same round (<c>"0"</c> when the sender set none).
+/// </remarks>
+public sealed record MessageIgnoredEvent : DeRecEvent
+{
+    public override string EventType => "MessageIgnored";
+    public required string ChannelId { get; init; }
+    public required string Reason { get; init; }
+    public required string TraceId { get; init; }
+}
+
+/// <summary>
+/// The label vocabulary for <see cref="MessageIgnoredEvent.Reason"/>. Matches
+/// the Rust <c>IgnoreReason</c> discriminants one-for-one.
+/// </summary>
+public static class IgnoreReason
+{
+    public const string PendingVerification = "PendingVerification";
+    public const string Expired = "Expired";
+}
+
+/// <summary>
 /// Fired by <see cref="DeRecProtocol.StartAsync"/> when a pairing
 /// handshake was dispatched successfully. <see cref="Kind"/> is the
 /// local party's role in the flow (same value that will land on the
@@ -938,6 +970,12 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                 ActionKind = root.GetProperty("action_kind").GetString() ?? string.Empty,
             },
             "NoOp" => new NoOpEvent(),
+            "MessageIgnored" => new MessageIgnoredEvent
+            {
+                ChannelId = root.GetProperty("channel_id").GetString()!,
+                Reason = root.GetProperty("reason").GetString() ?? string.Empty,
+                TraceId = root.GetProperty("trace_id").GetString()!,
+            },
             "PairingStarted" => new PairingStartedEvent
             {
                 ChannelId = root.GetProperty("channel_id").GetString()!,

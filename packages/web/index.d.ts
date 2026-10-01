@@ -898,6 +898,23 @@ export type DeRecEvent =
    *  (`"Pairing"`, `"StoreShare"`, …). */
   | { type: "AutoAccepted"; channel_id: string; action_kind: PendingActionKind }
   | { type: "NoOp" }
+  /** An inbound message was dropped untouched: no store was written and
+   *  nothing was sent back. `reason` says why.
+   *
+   *  `"PendingVerification"` means the peer sent something before this
+   *  device confirmed the channel's fingerprint — typically a replica source
+   *  pushing its first copy while this destination still shows the code.
+   *  Confirming does not replay it: after `verifyFingerprint` succeeds, a
+   *  replica destination calls `start(FlowKind.ReplicaDiscovery)` to pull
+   *  the copy itself. `"Expired"` means the message was older than the
+   *  inbound timeout. `trace_id` matches the peer's `*Started` event for
+   *  the same round (`"0"` when the sender set none). */
+  | {
+      type: "MessageIgnored";
+      channel_id: string;
+      reason: IgnoreReason;
+      trace_id: string;
+    }
   /** A pairing handshake was dispatched successfully. `kind` is the
    *  local party's role — same value the subsequent `PairingCompleted`
    *  will carry. Emitted by `start(Pairing)`. */
@@ -1138,6 +1155,18 @@ export declare class DeRecProtocolBuilder {
   build(): DeRecProtocol;
 }
 
+/**
+ * Every method that touches protocol state returns a `Promise` and runs under
+ * one lock per instance, so overlapping calls on the same instance — a `tick`
+ * timer firing while `process` handles an inbound message — queue and run one
+ * at a time, in the order they were made. Distinct instances do not share the
+ * lock: two instances bound to the same `secretId` and the same stores must
+ * still be serialized by the caller.
+ *
+ * A store or transport callback must not await a call on the instance that
+ * invoked it: that call queues behind the one waiting on the callback, and
+ * neither settles. Calling `free()` while a call is in flight throws.
+ */
 export declare class DeRecProtocol {
   /** Use {@link DeRecProtocolBuilder} to construct instances. */
   private constructor();
@@ -1199,7 +1228,7 @@ export declare class DeRecProtocol {
    * contact peers — follow up with
    * <c>start(FlowKind.UpdateChannelInfo, ...)</c> to propagate.
    */
-  setCommunicationInfo(info: Record<string, string>): void;
+  setCommunicationInfo(info: Record<string, string>): Promise<void>;
 
   /**
    * Replace this node's endpoint for one protocol, leaving the others
@@ -1215,7 +1244,7 @@ export declare class DeRecProtocol {
    * preference list and is the only way to change which protocols this
    * node serves, or their order. Removed at 0.0.5.
    */
-  setOwnTransport(uri: string, protocol: string): void;
+  setOwnTransport(uri: string, protocol: string): Promise<void>;
 
   /**
    * Replace every endpoint this node advertises, in preference order —
@@ -1230,7 +1259,7 @@ export declare class DeRecProtocol {
    * Every entry is validated before any is stored, so a malformed URI
    * leaves the previous set intact. An empty array is rejected.
    */
-  setOwnTransports(transports: { uri: string; protocol: string }[]): void;
+  setOwnTransports(transports: { uri: string; protocol: string }[]): Promise<void>;
 
   process(message: Uint8Array): Promise<DeRecEvent[]>;
 
@@ -1244,8 +1273,8 @@ export declare class DeRecProtocol {
    * shorter than the configured timeout.
    *
    * Safe to call at any time; with nothing in flight it resolves to an empty
-   * array. It mutates the same round state an inbound response does, so it
-   * must be serialized against `process` for the same `secretId`.
+   * array. Overlapping calls with `process` on the same instance queue
+   * rather than collide.
    */
   tick(): Promise<DeRecEvent[]>;
 
@@ -1399,6 +1428,10 @@ export interface CommunicationInfo {
  * protocol can raise. Matches the Rust `PendingActionKind` discriminants
  * one-for-one.
  */
+/** Why a `MessageIgnored` event dropped a message. Matches the Rust
+ *  `IgnoreReason` discriminants one-for-one. */
+export type IgnoreReason = "PendingVerification" | "Expired";
+
 export type PendingActionKind =
   | "Pairing"
   | "PrePair"

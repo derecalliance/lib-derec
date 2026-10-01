@@ -11,8 +11,8 @@ use derec_library::protocol::types::{
 use derec_library::protocol::{
     ChannelStoreFuture, DeRecChannelStore, DeRecEvent, DeRecFlow, DeRecProtocol,
     DeRecProtocolBuilder, DeRecSecretStore, DeRecShareStore, DeRecTransport, DeRecUserSecretStore,
-    ExpiredChannelCleanup, MissingPolicy, SecretKind, SecretStoreError, SecretStoreFuture,
-    SecretValue, Share, ShareStoreFuture, TransportFuture,
+    ExpiredChannelCleanup, IgnoreReason, MissingPolicy, SecretKind, SecretStoreError,
+    SecretStoreFuture, SecretValue, Share, ShareStoreFuture, TransportFuture,
 };
 use derec_library::types::{ChannelId, ReplicaId};
 use derec_proto::{Protocol, SenderKind, TransportProtocol};
@@ -32,6 +32,7 @@ pub async fn run_all() {
     run_sharing_flow().await;
     run_verification_flow().await;
     run_replica_mirror_then_verify_flow().await;
+    run_unconfirmed_destination_ignores_the_copy_flow().await;
     run_replica_verifies_only_synced_versions_flow().await;
     run_discovery_and_recovery_flow().await;
     run_unpairing_flow().await;
@@ -2302,6 +2303,91 @@ async fn run_verification_flow() {
 /// Two independent processes are what made the original report credible, and
 /// two independent `Peer`s with separate stores are what reproduce it here:
 /// the Destination reads back only what its own hydration wrote.
+async fn run_unconfirmed_destination_ignores_the_copy_flow() {
+    println!("=== Protocol unconfirmed replica destination flow test ===");
+
+    let mut source = Peer::with_secret_id_and_replica_id(
+        "source",
+        "https://source.example.com",
+        0xC0FFEE,
+        0x5050_5050_5050_5050,
+    );
+    let mut destination = Peer::with_replica_id(
+        "destination",
+        "https://destination.example.com",
+        0xDE57_DE57_DE57_DE57,
+    );
+
+    let replica_channel =
+        pair_replica_handshake(&mut source, &mut destination, ChannelId(31)).await;
+    let destination_fp = destination
+        .protocol
+        .get_fingerprint(replica_channel)
+        .await
+        .expect("destination fingerprint");
+    assert!(
+        source
+            .protocol
+            .verify_fingerprint(replica_channel, &destination_fp)
+            .await
+            .expect("source verify_fingerprint"),
+        "the source must accept the matching fingerprint"
+    );
+
+    let early = pump(&mut source, &mut destination).await;
+    assert!(
+        early.iter().any(|e| matches!(
+            e,
+            DeRecEvent::MessageIgnored {
+                channel_id,
+                reason: IgnoreReason::PendingVerification,
+                ..
+            } if *channel_id == replica_channel
+        )),
+        "a copy that arrives before the destination confirms must be ignored, got {early:?}"
+    );
+    assert!(
+        !early.iter().any(|e| matches!(
+            e,
+            DeRecEvent::ReplicaSecretInstalled { .. }
+                | DeRecEvent::ReplicaSecretReceived { .. }
+                | DeRecEvent::ReplicaSecretAcked { .. }
+        )),
+        "nothing may be installed or acknowledged before the destination confirms: {early:?}"
+    );
+    println!("  copy sent before the destination confirmed was ignored  ✓");
+
+    let source_fp = source
+        .protocol
+        .get_fingerprint(replica_channel)
+        .await
+        .expect("source fingerprint");
+    assert!(
+        destination
+            .protocol
+            .verify_fingerprint(replica_channel, &source_fp)
+            .await
+            .expect("destination verify_fingerprint"),
+        "the destination must accept the matching fingerprint"
+    );
+    destination
+        .protocol
+        .start(DeRecFlow::ReplicaDiscovery)
+        .await
+        .expect("destination start(ReplicaDiscovery) failed");
+    let catch_up = pump(&mut destination, &mut source).await;
+    assert!(
+        catch_up.iter().any(|e| matches!(
+            e,
+            DeRecEvent::ReplicaSecretInstalled { secret_id, .. } if *secret_id == 0xC0FFEE
+        )),
+        "after confirming, ReplicaDiscovery must install the copy under the source's secret id, got {catch_up:?}"
+    );
+    println!("  destination pulled the copy with ReplicaDiscovery after confirming  ✓");
+
+    println!("Protocol unconfirmed replica destination flow test passed.\n");
+}
+
 async fn run_replica_mirror_then_verify_flow() {
     println!("=== Protocol replica mirror-then-verify flow test ===");
 

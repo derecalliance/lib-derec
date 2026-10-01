@@ -16,6 +16,7 @@ package native
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 )
 
@@ -363,7 +364,7 @@ func EncodeStateKey(k StateKey) ([]byte, error) {
 		w.SecretID = &sid
 		v := *k.Version
 		w.Version = &v
-	case StateKindSharingRound:
+	case StateKindSharingRound, StateKindPendingReplicaDiscovery:
 		// No secondary key.
 	default:
 		return nil, fmt.Errorf("native: unknown StateKind: %d", k.Kind)
@@ -403,8 +404,8 @@ func DecodeStateKey(data []byte) (StateKey, error) {
 		}
 		v := *w.Version
 		return StateKey{Kind: StateKindPendingRecovery, SecretID: &sid, Version: &v}, nil
-	case StateKindSharingRound:
-		return StateKey{Kind: StateKindSharingRound}, nil
+	case StateKindSharingRound, StateKindPendingReplicaDiscovery:
+		return StateKey{Kind: StateKind(w.Kind)}, nil
 	default:
 		return StateKey{}, fmt.Errorf("native: unknown StateKind: %d", w.Kind)
 	}
@@ -430,9 +431,16 @@ type stateItemWire struct {
 	Failed    *[]string        `json:"failed,omitempty"`
 	// Replica-leg accounting, keyed by replica_id. Absent on rows written
 	// before the leg existed, which decode as empty rather than failing.
-	PendingReplicas *[]string `json:"pending_replicas,omitempty"`
-	SyncedReplicas  *[]string `json:"synced_replicas,omitempty"`
-	BehindReplicas  *[]string `json:"behind_replicas,omitempty"`
+	PendingReplicas *[]string               `json:"pending_replicas,omitempty"`
+	SyncedReplicas  *[]string               `json:"synced_replicas,omitempty"`
+	BehindReplicas  *[]string               `json:"behind_replicas,omitempty"`
+	LocalVersion    *uint32                 `json:"local_version,omitempty"`
+	Reported        *[]replicaDiscoveryWire `json:"reported,omitempty"`
+}
+
+type replicaDiscoveryWire struct {
+	ReplicaID string `json:"replica_id"`
+	Version   uint32 `json:"version"`
 }
 
 // parseOptionalUint64Strings decodes an id set whose absence is legitimate,
@@ -530,6 +538,29 @@ func EncodeStateItem(item StateItem) ([]byte, error) {
 		w.PendingReplicas = &pendingReplicas
 		w.SyncedReplicas = &syncedReplicas
 		w.BehindReplicas = &behindReplicas
+	case StateKindPendingReplicaDiscovery:
+		if item.LocalVersion == nil {
+			return nil, fmt.Errorf("native: PendingReplicaDiscovery StateItem requires LocalVersion")
+		}
+		if item.StartedAt == nil {
+			return nil, fmt.Errorf("native: PendingReplicaDiscovery StateItem requires StartedAt")
+		}
+		lv := *item.LocalVersion
+		w.LocalVersion = &lv
+		sa := strconv.FormatUint(*item.StartedAt, 10)
+		w.StartedAt = &sa
+		pendingReplicas := stringifyUint64s(item.PendingReplicas)
+		w.PendingReplicas = &pendingReplicas
+		ids := make([]uint64, 0, len(item.Reported))
+		for id := range item.Reported {
+			ids = append(ids, id)
+		}
+		sort.Slice(ids, func(a, b int) bool { return ids[a] < ids[b] })
+		reported := make([]replicaDiscoveryWire, len(ids))
+		for i, id := range ids {
+			reported[i] = replicaDiscoveryWire{ReplicaID: strconv.FormatUint(id, 10), Version: item.Reported[id]}
+		}
+		w.Reported = &reported
 	default:
 		return nil, fmt.Errorf("native: unknown StateKind: %d", item.Kind)
 	}
@@ -641,6 +672,43 @@ func DecodeStateItem(data []byte) (StateItem, error) {
 			PendingReplicas: pendingReplicas,
 			SyncedReplicas:  syncedReplicas,
 			BehindReplicas:  behindReplicas,
+		}, nil
+	case StateKindPendingReplicaDiscovery:
+		lv := w.LocalVersion
+		if lv == nil {
+			lv = w.Version
+		}
+		if lv == nil {
+			return StateItem{}, fmt.Errorf("native: PendingReplicaDiscovery requires local_version")
+		}
+		if w.StartedAt == nil {
+			return StateItem{}, fmt.Errorf("native: PendingReplicaDiscovery requires started_at")
+		}
+		sa, err := strconv.ParseUint(*w.StartedAt, 10, 64)
+		if err != nil {
+			return StateItem{}, fmt.Errorf("native: started_at not a decimal u64: %w", err)
+		}
+		pending, err := parseOptionalUint64Strings(w.PendingReplicas, "pending_replicas")
+		if err != nil {
+			return StateItem{}, err
+		}
+		reported := map[uint64]uint32{}
+		if w.Reported != nil {
+			for _, r := range *w.Reported {
+				id, err := strconv.ParseUint(r.ReplicaID, 10, 64)
+				if err != nil {
+					return StateItem{}, fmt.Errorf("native: reported.replica_id not a decimal u64: %w", err)
+				}
+				reported[id] = r.Version
+			}
+		}
+		v := *lv
+		return StateItem{
+			Kind:            StateKindPendingReplicaDiscovery,
+			LocalVersion:    &v,
+			StartedAt:       &sa,
+			PendingReplicas: pending,
+			Reported:        reported,
 		}, nil
 	default:
 		return StateItem{}, fmt.Errorf("native: unknown StateKind: %d", w.Kind)

@@ -937,6 +937,23 @@ export type DeRecEvent =
    *  (`"Pairing"`, `"StoreShare"`, …). */
   | { type: "AutoAccepted"; channel_id: string; action_kind: PendingActionKind }
   | { type: "NoOp" }
+  /** An inbound message was dropped untouched: no store was written and
+   *  nothing was sent back. `reason` says why.
+   *
+   *  `"PendingVerification"` means the peer sent something before this
+   *  device confirmed the channel's fingerprint — typically a replica source
+   *  pushing its first copy while this destination still shows the code.
+   *  Confirming does not replay it: after `verifyFingerprint` succeeds, a
+   *  replica destination calls `start(FlowKind.ReplicaDiscovery)` to pull
+   *  the copy itself. `"Expired"` means the message was older than the
+   *  inbound timeout. `trace_id` matches the peer's `*Started` event for
+   *  the same round (`"0"` when the sender set none). */
+  | {
+      type: "MessageIgnored";
+      channel_id: string;
+      reason: IgnoreReason;
+      trace_id: string;
+    }
   /** A pairing handshake was dispatched successfully. `kind` is the
    *  local party's role — same value the subsequent `PairingCompleted`
    *  will carry. Emitted by `start(Pairing)`. */
@@ -1098,6 +1115,10 @@ export interface CommunicationInfo {
 
 // `ContactMessage` is defined once above and covers both `INLINE_KEYS` and
 // `HASHED_KEYS` modes.
+
+/** Why a `MessageIgnored` event dropped a message. Matches the Rust
+ *  `IgnoreReason` discriminants one-for-one. */
+export type IgnoreReason = "PendingVerification" | "Expired";
 
 /**
  * The label vocabulary for `ActionRequired.action_kind` and

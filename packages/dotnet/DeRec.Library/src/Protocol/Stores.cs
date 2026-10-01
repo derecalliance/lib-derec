@@ -630,6 +630,8 @@ public sealed record StateKey(StateKind Kind, ulong? ChannelId, ulong? SecretId,
         new(StateKind.PendingUnpair, channelId, null, null);
     public static StateKey SharingRound() =>
         new(StateKind.SharingRound, null, null, null);
+    public static StateKey PendingReplicaDiscovery() =>
+        new(StateKind.PendingReplicaDiscovery, null, null, null);
 }
 
 /// <summary>
@@ -675,7 +677,9 @@ public sealed record StateItem(
     ulong[]? Failed = null,
     ulong[]? PendingReplicas = null,
     ulong[]? SyncedReplicas = null,
-    ulong[]? BehindReplicas = null)
+    ulong[]? BehindReplicas = null,
+    uint? LocalVersion = null,
+    IReadOnlyDictionary<ulong, uint>? Reported = null)
 {
     public StateKey Key() => Kind switch
     {
@@ -687,6 +691,7 @@ public sealed record StateItem(
         StateKind.PendingUnpair => StateKey.PendingUnpair(
             ChannelId ?? throw new InvalidOperationException("PendingUnpair requires ChannelId")),
         StateKind.SharingRound => StateKey.SharingRound(),
+        StateKind.PendingReplicaDiscovery => StateKey.PendingReplicaDiscovery(),
         _ => throw new InvalidOperationException($"unknown StateKind: {Kind}"),
     };
 
@@ -709,6 +714,13 @@ public sealed record StateItem(
             pendingReplicas ?? Array.Empty<ulong>(),
             syncedReplicas ?? Array.Empty<ulong>(),
             behindReplicas ?? Array.Empty<ulong>());
+    public static StateItem PendingReplicaDiscovery(
+        uint localVersion,
+        ulong[] pendingReplicas,
+        IReadOnlyDictionary<ulong, uint> reported,
+        ulong startedAt) =>
+        new(StateKind.PendingReplicaDiscovery, null, null, null, startedAt, null, null,
+            PendingReplicas: pendingReplicas, LocalVersion: localVersion, Reported: reported);
 }
 
 /// <summary>

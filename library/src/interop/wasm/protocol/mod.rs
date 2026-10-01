@@ -118,6 +118,25 @@ type WasmProtocol = DeRecProtocol<
 /// parameter.  All store methods must return `Promise`s — synchronous
 /// implementations can wrap their result with `Promise.resolve(...)`.
 ///
+/// # Concurrency
+///
+/// Every method that touches protocol state is `async` and runs under one
+/// lock per instance, so overlapping calls on the same instance — a
+/// `tick` timer firing while `process` handles an inbound message — queue
+/// and run one at a time, in the order they were made. Distinct instances
+/// do not share the lock: two instances bound to the same `secret_id` and
+/// the same stores must still be serialized by the caller.
+///
+/// A store or transport callback must not await a call on the instance
+/// that invoked it: that call queues behind the one waiting on the
+/// callback, and neither settles. Calling `free()` while a call is in
+/// flight throws.
+///
+/// Methods take `&self` for this reason: wasm-bindgen holds the borrow of
+/// the instance for an async call's whole lifetime, so under `&mut self` an
+/// overlapping call fails that borrow outside its promise and never
+/// settles.
+///
 /// # Events
 ///
 /// [`process`](DeRecProtocolWasm::process) returns an `Array` of plain JS
@@ -132,11 +151,13 @@ type WasmProtocol = DeRecProtocol<
 /// | `SecretsDiscovered`| `channel_id: string`, `secrets: SecretVersionEntry[]`  |
 /// | `SecretRecovered`  | `secret: { helpers, secrets, replicas }` (same nested shape as `ReplicaSecretReceived.secret`) |
 /// | `NoOp`             | _(none)_                                               |
+/// | `MessageIgnored`   | `channel_id: string`, `reason: "PendingVerification" \| "Expired"`, `trace_id: string` |
 ///
 /// `SecretVersionEntry = { secret_id: bigint, versions: { version: number, description: string }[] }`
 #[wasm_bindgen]
 pub struct DeRecProtocolWasm {
-    inner: WasmProtocol,
+    inner: tokio::sync::Mutex<WasmProtocol>,
+    secret_id: u64,
 }
 
 /// JS-side shape of [`crate::protocol::types::Timeouts`]. Every field is
@@ -676,34 +697,19 @@ impl DeRecProtocolBuilderWasm {
             builder = builder.with_parameter_range(range);
         }
         let inner = builder.build().map_err(js_error_from_lib)?;
-        Ok(DeRecProtocolWasm { inner })
+        Ok(DeRecProtocolWasm {
+            secret_id: inner.secret_id(),
+            inner: tokio::sync::Mutex::new(inner),
+        })
     }
 }
 
 #[wasm_bindgen]
 impl DeRecProtocolWasm {
-    /// Generate an out-of-band contact message (QR code payload, deep link, …).
-    ///
-    /// Returns a plain JS `ContactMessage` object. The `channel_id` field identifies
-    /// the pairing session and will match the `channel_id` in the eventual
-    /// `PairingCompleted` event — read it directly from the returned object.
-    ///
-    /// The caller is responsible for serializing the contact for out-of-band
-    /// delivery (QR code, deep link, etc.). The peer passes the deserialized object
-    /// to [`start`](Self::start) with `FlowKind::Pairing`.
-    ///
-    /// # Arguments
-    ///
-    /// * `channel_id` — Optional `BigInt` channel identifier. Pass `null` or
-    ///   `undefined` to have the library generate a random one.
-    /// * `contact_mode` — `0` for `InlineKeys` (keys embedded directly), `1`
-    ///   for `HashedKeys` (contact carries only a SHA-384 binding hash; the
-    ///   scanner fetches keys via a `PrePair` round-trip). `HashedKeys`
-    ///   requires the protocol's `own_transport` to be ephemeral.
     /// The secret identifier this protocol instance is bound to.
     #[wasm_bindgen(js_name = "secretId")]
     pub fn secret_id(&self) -> u64 {
-        self.inner.secret_id()
+        self.secret_id
     }
 
     /// Single entry point for all three contact modes (`InlineKeys`,
@@ -718,7 +724,7 @@ impl DeRecProtocolWasm {
     ///   human-typable value.
     #[wasm_bindgen(js_name = "createContact")]
     pub async fn create_contact(
-        &mut self,
+        &self,
         channel_id: JsValue,
         contact_mode: u32,
         nonce: JsValue,
@@ -744,6 +750,8 @@ impl DeRecProtocolWasm {
         };
         let contact = self
             .inner
+            .lock()
+            .await
             .create_contact(id, mode, nonce)
             .await
             .map_err(|e| js_error("DEREC_ERROR", e.to_string()))?;
@@ -759,14 +767,14 @@ impl DeRecProtocolWasm {
     /// Replace this node's local communication info. Does not contact peers —
     /// follow up with a `start(UpdateChannelInfo, ...)` to propagate.
     #[wasm_bindgen(js_name = "setCommunicationInfo")]
-    pub fn set_communication_info(&mut self, info: JsValue) -> Result<(), JsValue> {
+    pub async fn set_communication_info(&self, info: JsValue) -> Result<(), JsValue> {
         let map: HashMap<String, String> = if info.is_null() || info.is_undefined() {
             HashMap::new()
         } else {
             serde_wasm_bindgen::from_value(info)
                 .map_err(|e| js_error("INVALID_COMMUNICATION_INFO", e.to_string()))?
         };
-        self.inner.set_communication_info(map);
+        self.inner.lock().await.set_communication_info(map);
         Ok(())
     }
 
@@ -785,7 +793,7 @@ impl DeRecProtocolWasm {
     /// operational during the changeover — see the Rust docs on
     /// `set_own_transports` for the discipline.
     #[wasm_bindgen(js_name = "setOwnTransports")]
-    pub fn set_own_transports(&mut self, transports: Vec<JsValue>) -> Result<(), JsValue> {
+    pub async fn set_own_transports(&self, transports: Vec<JsValue>) -> Result<(), JsValue> {
         #[derive(serde::Deserialize)]
         struct EndpointShape {
             uri: String,
@@ -812,6 +820,8 @@ impl DeRecProtocolWasm {
             );
         }
         self.inner
+            .lock()
+            .await
             .set_own_transports(validated)
             .map_err(|e| js_error("INVALID_OWN_TRANSPORT", e.to_string()))?;
         Ok(())
@@ -832,7 +842,7 @@ impl DeRecProtocolWasm {
     /// IMPORTANT: keep the old endpoint operational during the changeover —
     /// see the Rust docs on `set_own_transport` for the discipline.
     #[wasm_bindgen(js_name = "setOwnTransport")]
-    pub fn set_own_transport(&mut self, uri: String, protocol: String) -> Result<(), JsValue> {
+    pub async fn set_own_transport(&self, uri: String, protocol: String) -> Result<(), JsValue> {
         let protocol_num = protocol_name_to_discriminant(&protocol).ok_or_else(|| {
             js_error(
                 "INVALID_PROTOCOL",
@@ -848,6 +858,8 @@ impl DeRecProtocolWasm {
         let lib_tp = crate::transport::TransportProtocol::try_from(&proto_tp)
             .map_err(|e| js_error("INVALID_OWN_TRANSPORT", e.to_string()))?;
         self.inner
+            .lock()
+            .await
             .set_own_transports([lib_tp])
             .map_err(|e| js_error("INVALID_OWN_TRANSPORT", e.to_string()))?;
         Ok(())
@@ -869,10 +881,12 @@ impl DeRecProtocolWasm {
     /// An `Array` of `*Started` / `*Failed` events describing the
     /// dispatched requests. Same shape as `process()`.
     #[wasm_bindgen(js_name = "start")]
-    pub async fn start(&mut self, flow_kind: u32, params: JsValue) -> Result<JsValue, JsValue> {
+    pub async fn start(&self, flow_kind: u32, params: JsValue) -> Result<JsValue, JsValue> {
         let flow = parse_flow(flow_kind, params)?;
         let rust_events = self
             .inner
+            .lock()
+            .await
             .start(flow)
             .await
             .map_err(|e| js_error("DEREC_ERROR", e.to_string()))?;
@@ -888,9 +902,11 @@ impl DeRecProtocolWasm {
     /// shared key, enabling out-of-band confirmation before the channel
     /// transitions from `Pending` to `Paired`.
     #[wasm_bindgen(js_name = "getFingerprint")]
-    pub async fn get_fingerprint(&mut self, channel_id: JsValue) -> Result<String, JsValue> {
+    pub async fn get_fingerprint(&self, channel_id: JsValue) -> Result<String, JsValue> {
         let id = js_value_to_u64(channel_id)?;
         self.inner
+            .lock()
+            .await
             .get_fingerprint(ChannelId(id))
             .await
             .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
@@ -902,12 +918,14 @@ impl DeRecProtocolWasm {
     /// `false` otherwise.
     #[wasm_bindgen(js_name = "verifyFingerprint")]
     pub async fn verify_fingerprint(
-        &mut self,
+        &self,
         channel_id: JsValue,
         fingerprint: String,
     ) -> Result<bool, JsValue> {
         let id = js_value_to_u64(channel_id)?;
         self.inner
+            .lock()
+            .await
             .verify_fingerprint(ChannelId(id), &fingerprint)
             .await
             .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
@@ -925,12 +943,11 @@ impl DeRecProtocolWasm {
     ///
     /// An `Array` of removed channel ids as decimal strings.
     #[wasm_bindgen(js_name = removeExpiredChannels)]
-    pub async fn remove_expired_channels(
-        &mut self,
-        older_than_secs: u32,
-    ) -> Result<JsValue, JsValue> {
+    pub async fn remove_expired_channels(&self, older_than_secs: u32) -> Result<JsValue, JsValue> {
         let ids = self
             .inner
+            .lock()
+            .await
             .remove_expired_channels(u64::from(older_than_secs))
             .await
             .map_err(|e| js_error("DEREC_ERROR", e.to_string()))?;
@@ -948,11 +965,13 @@ impl DeRecProtocolWasm {
     /// # Returns
     ///
     /// An `Array` of event objects (same format as `process()`).
-    pub async fn accept(&mut self, action_bytes: &[u8]) -> Result<JsValue, JsValue> {
+    pub async fn accept(&self, action_bytes: &[u8]) -> Result<JsValue, JsValue> {
         let action = pending_action_wire::deserialize(action_bytes)
             .map_err(|e| js_error("DECODE_ERROR", e))?;
         let rust_events = self
             .inner
+            .lock()
+            .await
             .accept(action)
             .await
             .map_err(|e| js_error("DEREC_ERROR", e.to_string()))?;
@@ -971,7 +990,7 @@ impl DeRecProtocolWasm {
     /// * `status` — Numeric status code from `StatusEnum` (e.g. 2 for FAIL, 10 for REJECTED).
     /// * `memo` — Human-readable rejection reason.
     pub async fn reject(
-        &mut self,
+        &self,
         action_bytes: &[u8],
         status: i32,
         memo: &str,
@@ -985,6 +1004,8 @@ impl DeRecProtocolWasm {
             )
         })?;
         self.inner
+            .lock()
+            .await
             .reject(action, status_enum, memo)
             .await
             .map_err(|e| js_error("DEREC_ERROR", e.to_string()))
@@ -999,8 +1020,8 @@ impl DeRecProtocolWasm {
     ///
     /// Returns an `Array` of plain JS event objects, empty when nothing was
     /// in flight. Safe to call at any time.
-    pub async fn tick(&mut self) -> Result<JsValue, JsValue> {
-        let rust_events = self.inner.tick().await;
+    pub async fn tick(&self) -> Result<JsValue, JsValue> {
+        let rust_events = self.inner.lock().await.tick().await;
         let js_events = Array::new();
         for event in rust_events {
             js_events.push(&events::event_to_js(event)?);
@@ -1018,16 +1039,22 @@ impl DeRecProtocolWasm {
     /// # Arguments
     ///
     /// * `message` — Raw wire bytes of an incoming `DeRecMessage`.
-    pub async fn process(&mut self, message: &[u8]) -> Result<JsValue, JsValue> {
-        let rust_events = self.inner.process(message).await.map_err(|e| {
-            web_sys::console::error_1(&format!("[wasm-process] error: {e}").into());
-            let channel_id_str = e.channel_id.map(|c| c.0.to_string());
-            if let Some((status, memo)) = e.as_non_ok_status() {
-                non_ok_status_error(status, memo, channel_id_str.as_deref())
-            } else {
-                process_error(e.to_string(), channel_id_str.as_deref())
-            }
-        })?;
+    pub async fn process(&self, message: &[u8]) -> Result<JsValue, JsValue> {
+        let rust_events = self
+            .inner
+            .lock()
+            .await
+            .process(message)
+            .await
+            .map_err(|e| {
+                web_sys::console::error_1(&format!("[wasm-process] error: {e}").into());
+                let channel_id_str = e.channel_id.map(|c| c.0.to_string());
+                if let Some((status, memo)) = e.as_non_ok_status() {
+                    non_ok_status_error(status, memo, channel_id_str.as_deref())
+                } else {
+                    process_error(e.to_string(), channel_id_str.as_deref())
+                }
+            })?;
         let js_events = Array::new();
         for event in rust_events {
             js_events.push(&events::event_to_js(event)?);
@@ -1053,13 +1080,15 @@ impl DeRecProtocolWasm {
     /// | `STORAGE`          | A store I/O call failed mid-restore.                             |
     #[wasm_bindgen(js_name = "restore")]
     pub async fn restore(
-        &mut self,
+        &self,
         recovered_secret: JsValue,
         version: u32,
     ) -> Result<JsValue, JsValue> {
         let secret = parse_recovered_secret(recovered_secret)?;
         let rust_events = self
             .inner
+            .lock()
+            .await
             .restore(&secret, version)
             .await
             .map_err(|e| match e {

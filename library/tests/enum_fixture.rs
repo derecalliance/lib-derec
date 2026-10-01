@@ -20,7 +20,7 @@
 
 use std::collections::BTreeSet;
 
-use derec_library::protocol::events::PendingActionKind;
+use derec_library::protocol::events::{IgnoreReason, PendingActionKind};
 use derec_library::protocol::types::{ChannelStatus, ReplicaRole, SecretKind, StateKind};
 
 /// Names the fixture records for one enum, in wire encoding.
@@ -158,6 +158,19 @@ fn pending_action_kind_fixture_is_complete() {
 
 /// The protobuf-derived enums are re-declared by hand in each SDK rather than
 /// re-exported from generated code, so they drift like any other mirror.
+#[test]
+fn ignore_reason_fixture_is_complete() {
+    let all = [IgnoreReason::PendingVerification, IgnoreReason::Expired];
+    let names: Vec<&str> = all
+        .iter()
+        .map(|r| match r {
+            IgnoreReason::PendingVerification => "PendingVerification",
+            IgnoreReason::Expired => "Expired",
+        })
+        .collect();
+    assert_matches_fixture("IgnoreReason", &names);
+}
+
 #[test]
 fn protobuf_enum_fixtures_are_complete() {
     use derec_proto::{ContactMode, SenderKind, StatusEnum};

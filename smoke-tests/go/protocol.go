@@ -435,6 +435,10 @@ type peer struct {
 }
 
 func newPeer(label, uri string, threshold uint32) *peer {
+	return newPeerWithReplicaID(label, uri, threshold, nil)
+}
+
+func newPeerWithReplicaID(label, uri string, threshold uint32, replicaID *uint64) *peer {
 	channelStore := newMemChannelStore()
 	shareStore := newMemShareStore()
 	secretStore := newMemSecretStore()
@@ -448,6 +452,7 @@ func newPeer(label, uri string, threshold uint32) *peer {
 		OwnTransportProtocol: int32(derecpb.Protocol_HTTPS),
 		Threshold:            threshold,
 		KeepVersionsCount:    3,
+		ReplicaID:            replicaID,
 	}
 	p, err := protocol.New(channelStore, shareStore, secretStore, userSecretStore, stateStore, transport, cfg)
 	must(err, fmt.Sprintf("protocol.New(%s)", label))
@@ -1024,4 +1029,69 @@ func runConfigSurface() {
 	fmt.Println("  error code/category values match the FFI  ✓")
 
 	fmt.Println("Protocol config surface test passed.")
+}
+
+func runUnconfirmedDestination() {
+	fmt.Println("=== Protocol unconfirmed replica destination test ===")
+
+	sourceID, destinationID := uint64(0x50505050), uint64(0xDE57DE57)
+	source := newPeerWithReplicaID("source", "https://source.example.com", 2, &sourceID)
+	destination := newPeerWithReplicaID("destination", "https://destination.example.com", 2, &destinationID)
+
+	pairingChannelID := uint64(31)
+	contact, err := source.proto.CreateContact(&pairingChannelID, protocol.ContactModeInlineKeys, nil)
+	must(err, "source.CreateContact")
+	_, err = destination.proto.Start(protocol.FlowKindPairing, protocol.PairingParams{
+		Kind:    int32(protocol.SenderKindReplicaDestination),
+		Contact: contact.ContactBytes,
+	})
+	must(err, "destination.Start(Pairing)")
+	handshake := append(pump(destination, source), pump(source, destination)...)
+	var replicaChannel uint64
+	for _, ev := range handshake {
+		if ev.Type == protocol.EventTypePairingCompleted {
+			replicaChannel, err = strconv.ParseUint(ev.ChannelID, 10, 64)
+			must(err, "parse PairingCompleted.ChannelID")
+		}
+	}
+	assertTrue(replicaChannel != 0, "the replica handshake must complete")
+
+	destinationFp, err := destination.proto.GetFingerprint(replicaChannel)
+	must(err, "destination.GetFingerprint")
+	ok, err := source.proto.VerifyFingerprint(replicaChannel, destinationFp)
+	must(err, "source.VerifyFingerprint")
+	assertTrue(ok, "the source must accept the matching fingerprint")
+
+	var ignored bool
+	for _, ev := range pump(source, destination) {
+		switch ev.Type {
+		case protocol.EventTypeMessageIgnored:
+			ignored = ignored || (ev.Reason == protocol.IgnoreReasonPendingVerification &&
+				ev.ChannelID == strconv.FormatUint(replicaChannel, 10))
+		case protocol.EventTypeReplicaSecretInstalled, protocol.EventTypeReplicaSecretReceived, protocol.EventTypeReplicaSecretAcked:
+			fail("nothing may be installed or acknowledged before the destination confirms, got %s", ev.Type)
+		}
+	}
+	assertTrue(ignored, "a copy sent before the destination confirms must surface as MessageIgnored(PendingVerification)")
+	fmt.Println("  copy sent before the destination confirmed was ignored  ✓")
+
+	sourceFp, err := source.proto.GetFingerprint(replicaChannel)
+	must(err, "source.GetFingerprint")
+	ok, err = destination.proto.VerifyFingerprint(replicaChannel, sourceFp)
+	must(err, "destination.VerifyFingerprint")
+	assertTrue(ok, "the destination must accept the matching fingerprint")
+	_, err = destination.proto.Start(protocol.FlowKindReplicaDiscovery, nil)
+	must(err, "destination.Start(ReplicaDiscovery)")
+
+	var installed bool
+	var seen []string
+	for _, ev := range pump(destination, source) {
+		seen = append(seen, ev.Type)
+		installed = installed || ev.Type == protocol.EventTypeReplicaSecretInstalled
+	}
+	assertTrue(installed, "after confirming, ReplicaDiscovery must install the copy, got %v", seen)
+	fmt.Println("  destination pulled the copy with ReplicaDiscovery after confirming  ✓")
+
+	fmt.Println("Protocol unconfirmed replica destination test passed.")
+	fmt.Println()
 }

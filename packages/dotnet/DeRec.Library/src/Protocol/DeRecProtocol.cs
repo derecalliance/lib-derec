@@ -1106,7 +1106,11 @@ public sealed class DeRecProtocol : IDisposable
         string[]? failed,
         string[]? pending_replicas,
         string[]? synced_replicas,
-        string[]? behind_replicas);
+        string[]? behind_replicas,
+        uint? local_version,
+        ReplicaDiscoveryReportDto[]? reported);
+
+    private sealed record ReplicaDiscoveryReportDto(string replica_id, uint version);
 
     // Wire shape matches Rust `StateKeyRecord`.
     private sealed record StateKeyDto(
@@ -1128,7 +1132,12 @@ public sealed class DeRecProtocol : IDisposable
         item.Failed?.Select(c => c.ToString()).ToArray(),
         item.PendingReplicas?.Select(r => r.ToString()).ToArray(),
         item.SyncedReplicas?.Select(r => r.ToString()).ToArray(),
-        item.BehindReplicas?.Select(r => r.ToString()).ToArray());
+        item.BehindReplicas?.Select(r => r.ToString()).ToArray(),
+        item.LocalVersion,
+        item.Reported?
+            .OrderBy(r => r.Key)
+            .Select(r => new ReplicaDiscoveryReportDto(r.Key.ToString(), r.Value))
+            .ToArray());
 
     private static StateItem FromDto(StateItemDto dto)
     {
@@ -1160,6 +1169,18 @@ public sealed class DeRecProtocol : IDisposable
         ulong[]? behindReplicas = dto.behind_replicas?
             .Select(s => ulong.Parse(s, System.Globalization.CultureInfo.InvariantCulture))
             .ToArray();
+        var reported = dto.reported?.ToDictionary(
+            r => ulong.Parse(r.replica_id, System.Globalization.CultureInfo.InvariantCulture),
+            r => r.version);
+        if (kind == StateKind.PendingReplicaDiscovery)
+        {
+            return StateItem.PendingReplicaDiscovery(
+                dto.local_version ?? dto.version
+                    ?? throw new InvalidOperationException("PendingReplicaDiscovery requires local_version"),
+                pendingReplicas ?? Array.Empty<ulong>(),
+                reported ?? new Dictionary<ulong, uint>(),
+                startedAt ?? throw new InvalidOperationException("PendingReplicaDiscovery requires started_at"));
+        }
         return new StateItem(
             kind, channelId, secretId, dto.version, startedAt, dto.bytes, dto.shares,
             pending, confirmed, failed, pendingReplicas, syncedReplicas, behindReplicas);
@@ -1189,6 +1210,7 @@ public sealed class DeRecProtocol : IDisposable
                     ?? throw new InvalidOperationException("PendingUnpair requires channel_id"),
                     System.Globalization.CultureInfo.InvariantCulture)),
             StateKind.SharingRound => StateKey.SharingRound(),
+            StateKind.PendingReplicaDiscovery => StateKey.PendingReplicaDiscovery(),
             _ => throw new InvalidOperationException($"unknown StateKind: {dto.kind}"),
         };
     }

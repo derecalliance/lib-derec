@@ -342,6 +342,12 @@ before any target-level events are emitted.
   `HashedKeys` flow). Distinct from a cryptographic binding-hash mismatch,
   which surfaces as `Error::Pairing(PairingError::PrePairHashMismatch)`
   from `process()` rather than as an event. See [Pairing modes](#pairing-modes).
+- `MessageIgnored { channel_id, reason, trace_id }` — an inbound message was
+  dropped without touching any store or sending anything back. `reason` is
+  `IgnoreReason::PendingVerification` (the channel's fingerprint is not
+  confirmed on this device yet; see
+  [Replica fingerprint verification is mandatory](#replica-fingerprint-verification-is-mandatory))
+  or `IgnoreReason::Expired` (older than the inbound timeout).
 - `NoOp` — emitted when an inbound message was processed but had no
   application-visible consequence.
 
@@ -1720,6 +1726,16 @@ helper pairings are. The orchestrator enforces this:
 when a target is still `Pending`. Treat verification as a required step
 in the pairing UX, not an optional confirmation — a scanner that
 auto-pairs without it accepts a MITM-vulnerable replica.
+
+Until a device confirms, it ignores everything the peer sends on that
+channel: `process` changes no store, sends nothing back, and returns
+`DeRecEvent::MessageIgnored { channel_id, reason:
+IgnoreReason::PendingVerification, trace_id }`. This matters most for a
+replica destination. The source's own confirmation publishes the vault
+immediately, so that copy usually arrives before the destination's user has
+confirmed. Confirming does not replay it: once the destination's
+`verify_fingerprint` succeeds, call `start(DeRecFlow::ReplicaDiscovery)` to
+pull the copy from the source.
 
 ### The `derec.*` namespace in `CommunicationInfo` is library-owned
 

@@ -1664,6 +1664,7 @@ mod group_conformance_tests {
                 &mut rig.stores(),
                 &lf.local(),
                 1001,
+                SECRET_ID,
                 9,
                 &prost::Message::encode_to_vec(&payload),
             )
@@ -1717,6 +1718,7 @@ mod group_conformance_tests {
                 &mut rig.stores(),
                 &lf.local(),
                 1001,
+                SECRET_ID,
                 9,
                 &prost::Message::encode_to_vec(&payload),
             )
@@ -1732,6 +1734,54 @@ mod group_conformance_tests {
             assert_eq!(
                 snapshot.version, 9,
                 "an absent payload version means the enclosing one governs"
+            );
+        });
+    }
+
+    #[test]
+    fn a_pulled_copy_reports_the_senders_secret_id() {
+        run_async(async {
+            use crate::protocol::DeRecUserSecretStore;
+
+            const SENDER_SECRET_ID: u64 = 0x5E_4DE4;
+            let lf = LocalFixture::with_replica(SECRET_ID, 1002);
+            let mut rig = StoreRig::new();
+            let payload = crate::protocol::types::ReplicaSecretPayload {
+                secret: Some(crate::protocol::types::Secret {
+                    helpers: Vec::new(),
+                    secrets: Vec::new(),
+                    replicas: Some(payload_roster()),
+                }),
+                shares: Vec::new(),
+                shared_key: Vec::new(),
+                version: 3,
+            };
+
+            let events = super::hydrate_catch_up(
+                &mut rig.stores(),
+                &lf.local(),
+                1001,
+                SENDER_SECRET_ID,
+                3,
+                &prost::Message::encode_to_vec(&payload),
+            )
+            .await
+            .expect("catch-up must hydrate");
+
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [crate::protocol::DeRecEvent::ReplicaSecretInstalled { secret_id, .. }] if *secret_id == SENDER_SECRET_ID
+                ),
+                "a pull must report the sender's secret id, as a push does: {events:?}"
+            );
+            assert!(
+                rig.user_secrets
+                    .load_latest(SECRET_ID)
+                    .await
+                    .expect("load")
+                    .is_some(),
+                "the copy is still stored under this device's own partition"
             );
         });
     }
@@ -1840,10 +1890,11 @@ pub(in crate::protocol) async fn hydrate_catch_up<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
     from_replica_id: u64,
+    secret_id: u64,
     response_version: u32,
     payload: &[u8],
 ) -> Result<Vec<DeRecEvent>> {
-    let secret_id = local.secret_id;
+    let partition = local.secret_id;
     let composite = crate::protocol::types::ReplicaSecretPayload::decode(payload)
         .map_err(crate::Error::ProtobufDecode)?;
     let secret = composite.secret.ok_or(crate::Error::InvalidInput(
@@ -1855,7 +1906,7 @@ pub(in crate::protocol) async fn hydrate_catch_up<S: StoreSet>(
         composite.version
     };
 
-    let is_install = stores.user_secrets.load_latest(secret_id).await?.is_none();
+    let is_install = stores.user_secrets.load_latest(partition).await?.is_none();
 
     replica::hydrate(
         stores,

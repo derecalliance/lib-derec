@@ -1815,8 +1815,8 @@ async function runUpdateChannelInfoFlow(): Promise<void> {
   const newInfo = { name: "Owner-renamed", email: "owner.new@example.com" };
 
   // Mutate local state, then propagate.
-  owner.protocol.setCommunicationInfo(newInfo);
-  owner.protocol.setOwnTransport(newUri, "https");
+  await owner.protocol.setCommunicationInfo(newInfo);
+  await owner.protocol.setOwnTransport(newUri, "https");
 
   await owner.protocol.start(FlowKind.UpdateChannelInfo, {
     target: BigInt(longTermChannelId),
@@ -1944,7 +1944,8 @@ export async function runProtocolSmoke(): Promise<void> {
   await runHashedKeysPairingFlow();
   await runNoKeysPairingFlow();
   runUnsafeHttpConfigFlow();
-  runConfigSurfaceFlow();
+  await runConfigSurfaceFlow();
+  await runOverlappingCallsFlow();
   await runSharingFlow();
   await runDiscoveryAndRecoveryFlow();
   await runUnpairingFlow();
@@ -1952,6 +1953,7 @@ export async function runProtocolSmoke(): Promise<void> {
   await runReplyToFlow();
   await runReplicaIdWiringSadPathsFlow();
   await runReplicaPairingAndSecretSyncFlow();
+  await runUnconfirmedDestinationIgnoresTheCopyFlow();
   await runReplicaSyncVersionProgressionFlow();
   await runAutoAcceptFlow();
   await runExpiredChannelCleanupFlow();
@@ -2300,6 +2302,64 @@ async function assertLatestVersion(owner: Node, secretId: bigint, expected: numb
   }
 }
 
+async function runUnconfirmedDestinationIgnoresTheCopyFlow(): Promise<void> {
+  console.log("\n=== [Protocol] Unconfirmed replica destination ===\n");
+
+  const source = {
+    node: makeNode("Source", "https://source.example.com", { replicaId: 0x5050_5050n }),
+    uri: "https://source.example.com",
+  };
+  const destination = {
+    node: makeNode("Destination", "https://destination.example.com", { replicaId: 0xde57_de57n }),
+    uri: "https://destination.example.com",
+  };
+
+  const { rekeyed } = await pairReplicaHandshake(source, destination, 31n);
+  const destinationFp = await destination.node.protocol.getFingerprint(rekeyed);
+  if (!(await source.node.protocol.verifyFingerprint(rekeyed, destinationFp))) {
+    throw new Error("source.verifyFingerprint must return true");
+  }
+
+  const early = await pumpAll([source, destination]);
+  const ignored = early.find(
+    (e) =>
+      e.type === "MessageIgnored" &&
+      e.reason === "PendingVerification" &&
+      BigInt(e.channel_id) === rekeyed,
+  );
+  if (!ignored) {
+    throw new Error(
+      `a copy sent before the destination confirms must be ignored, got [${early.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  if (
+    early.some(
+      (e) =>
+        e.type === "ReplicaSecretInstalled" ||
+        e.type === "ReplicaSecretReceived" ||
+        e.type === "ReplicaSecretAcked",
+    )
+  ) {
+    throw new Error("nothing may be installed or acknowledged before the destination confirms");
+  }
+  console.log("  copy sent before the destination confirmed was ignored  ✓");
+
+  const sourceFp = await source.node.protocol.getFingerprint(rekeyed);
+  if (!(await destination.node.protocol.verifyFingerprint(rekeyed, sourceFp))) {
+    throw new Error("destination.verifyFingerprint must return true");
+  }
+  await destination.node.protocol.start(FlowKind.ReplicaDiscovery);
+  const catchUp = await pumpAll([destination, source]);
+  if (!catchUp.some((e) => e.type === "ReplicaSecretInstalled")) {
+    throw new Error(
+      `after confirming, ReplicaDiscovery must install the copy, got [${catchUp.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  console.log("  destination pulled the copy with ReplicaDiscovery after confirming  ✓");
+
+  console.log("\n✓ Unconfirmed replica destination flow passed.\n");
+}
+
 async function pairReplicaHandshake(
   owner: AddressedNode,
   replica: AddressedNode,
@@ -2585,6 +2645,75 @@ async function runDefiantChannelStoreFlow(): Promise<void> {
 // interpreted the flag locally (dropping the timeout, or substituting its
 // own default) would still pass a happy-path test, so the config is chosen
 // to fail if any interpretation crept into the JS layer.
+async function runOverlappingCallsFlow(): Promise<void> {
+  console.log("=== [Protocol] overlapping calls on one instance ===\n");
+
+  class SlowSecretStore extends InMemorySecretStore {
+    override async save(
+      secretId: string,
+      channelId: string,
+      kind: 0 | 1 | 2,
+      value: Uint8Array,
+    ): Promise<void> {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      return super.save(secretId, channelId, kind, value);
+    }
+  }
+
+  const protocol = new DeRecProtocolBuilder(DEFAULT_TEST_SECRET_ID)
+    .withChannelStore(new InMemoryChannelStore())
+    .withShareStore(new InMemoryShareStore())
+    .withSecretStore(new SlowSecretStore())
+    .withUserSecretStore(new InMemoryUserSecretStore())
+    .withStateStore(new InMemoryStateStore())
+    .withTransport(new RecordingTransport())
+    .withOwnTransport({ uri: "https://overlap.example.com", protocol: "https" })
+    .withThreshold(THRESHOLD)
+    .build();
+
+  const settled: string[] = [];
+  const track = <T>(label: string, call: Promise<T>): Promise<T> =>
+    call.then((value) => {
+      settled.push(label);
+      return value;
+    });
+  const calls = Promise.all([
+    track("createContact#1", protocol.createContact(1n, ContactMode.InlineKeys)),
+    track("tick", protocol.tick()),
+    track("setCommunicationInfo", protocol.setCommunicationInfo({ name: "Overlap" })),
+    track("createContact#2", protocol.createContact(2n, ContactMode.InlineKeys)),
+  ]);
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const hung = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () =>
+        reject(
+          new Error(
+            `overlapping calls did not settle within 5s (settled: [${settled.join(", ")}]) — calls on one instance collide instead of queueing`,
+          ),
+        ),
+      5000,
+    );
+  });
+  try {
+    await Promise.race([calls, hung]);
+  } finally {
+    clearTimeout(timer);
+  }
+  console.log("  four overlapping calls on one instance all settled  ✓");
+
+  const expected = ["createContact#1", "tick", "setCommunicationInfo", "createContact#2"];
+  if (settled.join() !== expected.join()) {
+    throw new Error(
+      `overlapping calls must run in call order: expected [${expected.join(", ")}], got [${settled.join(", ")}]`,
+    );
+  }
+  console.log("  overlapping calls ran in the order they were made  ✓");
+
+  console.log("\n✓ overlapping calls passed.\n");
+}
+
 async function runExpiredChannelCleanupFlow(): Promise<void> {
   console.log("[Protocol] expired-channel cleanup");
 
@@ -2680,7 +2809,7 @@ export function runUnsafeHttpConfigFlow(): void {
  * drop the setting rather than fail — so each assertion here is checking the
  * value actually arrived.
  */
-export function runConfigSurfaceFlow(): void {
+export async function runConfigSurfaceFlow(): Promise<void> {
   console.log("=== [Protocol] config surface ===\n");
 
   const base = () =>
@@ -2739,15 +2868,15 @@ export function runConfigSurfaceFlow(): void {
 
   // setOwnTransport re-points one protocol; setOwnTransports replaces the set
   // and is held to the same rule as the builder.
-  protocol.setOwnTransport("https://moved.example", "https");
+  await protocol.setOwnTransport("https://moved.example", "https");
   console.log("  setOwnTransport re-points a single protocol  ✓");
 
-  protocol.setOwnTransports([{ uri: "https://only.example", protocol: "https" }]);
+  await protocol.setOwnTransports([{ uri: "https://only.example", protocol: "https" }]);
   console.log("  setOwnTransports replaces the whole set  ✓");
 
   refused = false;
   try {
-    protocol.setOwnTransports([
+    await protocol.setOwnTransports([
       { uri: "https://a.example", protocol: "https" },
       { uri: "https://b.example", protocol: "https" },
     ]);

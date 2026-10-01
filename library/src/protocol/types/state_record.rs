@@ -92,6 +92,12 @@ impl From<&StateKey> for StateKeyRecord {
 /// - `3` = SharingRound — `version`, `pending`, `confirmed`, `failed`
 ///   (each channel-id set is stringified u64s), `started_at`
 ///   (stringified u64 unix-seconds)
+/// - `4` = PendingReplicaDiscovery — `local_version`, `started_at`,
+///   `pending_replicas`, `reported`
+///
+/// The fields a [`StateKeyRecord`] carries (`channel_id`, `secret_id`,
+/// `version`) are present on an item exactly when its key has them, with the
+/// same values, so a store can derive the row key from either.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct StateItemRecord {
     pub kind: u32,
@@ -103,6 +109,12 @@ pub struct StateItemRecord {
     pub version: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
+    /// PendingReplicaDiscovery only: the version this device held when the
+    /// catch-up started. Kept out of `version`, which is a key field, because
+    /// the catch-up's key has none. Rows written before 0.0.6 carry it in
+    /// `version`, which is still read when this field is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_version: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -147,6 +159,7 @@ impl From<&StateItem> for StateItemRecord {
                 secret_id: None,
                 version: None,
                 started_at: None,
+                local_version: None,
                 bytes: Some(request.encode_to_vec()),
                 shares: None,
                 pending: None,
@@ -167,6 +180,7 @@ impl From<&StateItem> for StateItemRecord {
                 secret_id: Some(secret_id.to_string()),
                 version: Some(*version),
                 started_at: None,
+                local_version: None,
                 bytes: None,
                 shares: Some(shares.iter().map(|s| s.encode_to_vec()).collect()),
                 pending: None,
@@ -186,6 +200,7 @@ impl From<&StateItem> for StateItemRecord {
                 secret_id: None,
                 version: None,
                 started_at: Some(started_at.to_string()),
+                local_version: None,
                 bytes: None,
                 shares: None,
                 pending: None,
@@ -205,8 +220,9 @@ impl From<&StateItem> for StateItemRecord {
                 kind: 4,
                 channel_id: None,
                 secret_id: None,
-                version: Some(*local_version),
+                version: None,
                 started_at: Some(started_at.to_string()),
+                local_version: Some(*local_version),
                 bytes: None,
                 shares: None,
                 pending: None,
@@ -231,6 +247,7 @@ impl From<&StateItem> for StateItemRecord {
                 secret_id: None,
                 version: Some(round.version),
                 started_at: Some(round.started_at.to_string()),
+                local_version: None,
                 bytes: None,
                 shares: None,
                 pending: Some(round.pending.iter().map(|c| c.0.to_string()).collect()),
@@ -395,8 +412,9 @@ impl StateItemRecord {
             }
             4 => {
                 let local_version = self
-                    .version
-                    .ok_or_else(|| "PendingReplicaDiscovery requires version".to_string())?;
+                    .local_version
+                    .or(self.version)
+                    .ok_or_else(|| "PendingReplicaDiscovery requires local_version".to_string())?;
                 let started_at = self
                     .started_at
                     .ok_or_else(|| "PendingReplicaDiscovery requires started_at".to_string())?
@@ -424,5 +442,92 @@ impl StateItemRecord {
             }
             other => Err(format!("unknown StateKind: {other}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ChannelId, ReplicaId};
+
+    fn every_kind() -> Vec<StateItem> {
+        vec![
+            StateItem::PendingVerification {
+                channel_id: ChannelId(7),
+                request: derec_proto::VerifyShareRequestMessage::default(),
+            },
+            StateItem::PendingRecovery {
+                secret_id: 11,
+                version: 3,
+                shares: Vec::new(),
+            },
+            StateItem::PendingUnpair {
+                channel_id: ChannelId(9),
+                started_at: 100,
+            },
+            StateItem::PendingReplicaDiscovery {
+                local_version: 5,
+                pending: [ReplicaId(21)].into_iter().collect(),
+                reported: [(ReplicaId(22), 6)].into_iter().collect(),
+                started_at: 100,
+            },
+            StateItem::SharingRound(Box::new(crate::protocol::types::SharingRoundState {
+                version: 4,
+                pending: Default::default(),
+                confirmed: Default::default(),
+                failed: Default::default(),
+                pending_replicas: Default::default(),
+                synced_replicas: Default::default(),
+                behind_replicas: Default::default(),
+                started_at: 100,
+            })),
+        ]
+    }
+
+    #[test]
+    fn an_item_carries_exactly_its_keys_fields() {
+        for item in every_kind() {
+            let record = StateItemRecord::from(&item);
+            let key = StateKeyRecord::from(&item.key());
+            assert_eq!(record.kind, key.kind, "{item:?}");
+            assert_eq!(record.channel_id, key.channel_id, "channel_id of {item:?}");
+            assert_eq!(record.secret_id, key.secret_id, "secret_id of {item:?}");
+            assert_eq!(record.version, key.version, "version of {item:?}");
+        }
+    }
+
+    #[test]
+    fn a_catch_up_row_round_trips() {
+        let item = &every_kind()[3];
+        let json = serde_json::to_string(&StateItemRecord::from(item)).expect("encodes");
+        let back: StateItemRecord = serde_json::from_str(&json).expect("decodes");
+        match back.into_item().expect("valid row") {
+            StateItem::PendingReplicaDiscovery {
+                local_version,
+                pending,
+                reported,
+                started_at,
+            } => {
+                assert_eq!(local_version, 5);
+                assert!(pending.contains(&ReplicaId(21)));
+                assert_eq!(reported.get(&ReplicaId(22)), Some(&6));
+                assert_eq!(started_at, 100);
+            }
+            other => panic!("decoded as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_catch_up_row_from_before_0_0_6_still_decodes() {
+        let json =
+            r#"{"kind":4,"version":5,"started_at":"100","pending_replicas":["21"],"reported":[]}"#;
+        let row: StateItemRecord = serde_json::from_str(json).expect("decodes");
+        assert!(matches!(
+            row.into_item(),
+            Ok(StateItem::PendingReplicaDiscovery {
+                local_version: 5,
+                ..
+            })
+        ));
     }
 }

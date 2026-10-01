@@ -139,6 +139,7 @@ async fn on_response<S: StoreSet>(
         stores,
         local,
         from.0,
+        response.secret_id,
         response.version,
         &response.committed_de_rec_share,
     )

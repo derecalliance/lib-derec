@@ -21,7 +21,7 @@ import (
 func TestEncodeChannelRecord_Helper_MatchesRustJSONShape(t *testing.T) {
 	h := HelperChannel{
 		ChannelID: 123456789,
-		Transports:        []TransportEndpoint{{
+		Transports: []TransportEndpoint{{
 			URI:      "https://example.com/derec",
 			Protocol: 0,
 		}},
@@ -68,10 +68,10 @@ func TestEncodeChannelRecord_Replica_MatchesRustJSONShape(t *testing.T) {
 
 func TestEncodeChannelRecord_EmptyCommunicationInfoIsEmptyObjectNotNull(t *testing.T) {
 	h := HelperChannel{
-		ChannelID: 1,
-		Transports:        []TransportEndpoint{{URI: "https://h.example.com", Protocol: 0}},
-		Status:    ChannelStatusPending,
-		PeerRole:  SenderKindOwner,
+		ChannelID:  1,
+		Transports: []TransportEndpoint{{URI: "https://h.example.com", Protocol: 0}},
+		Status:     ChannelStatusPending,
+		PeerRole:   SenderKindOwner,
 	}
 	got, err := EncodeChannelRecord(ChannelRecord{Helper: &h})
 	if err != nil {
@@ -539,6 +539,67 @@ func TestDecodeStateItem_SharingRoundRequiresAllThreeSets(t *testing.T) {
 	sample := `{"kind":3,"version":1,"started_at":"1"}`
 	if _, err := DecodeStateItem([]byte(sample)); err == nil {
 		t.Fatal("expected error when pending/confirmed/failed are absent")
+	}
+}
+
+func TestStateItemRoundTrip_PendingReplicaDiscovery(t *testing.T) {
+	lv, sa := uint32(5), uint64(100)
+	item := StateItem{
+		Kind:            StateKindPendingReplicaDiscovery,
+		LocalVersion:    &lv,
+		StartedAt:       &sa,
+		PendingReplicas: []uint64{21},
+		Reported:        map[uint64]uint32{22: 6},
+	}
+	raw, err := EncodeStateItem(item)
+	if err != nil {
+		t.Fatalf("EncodeStateItem: %v", err)
+	}
+	back, err := DecodeStateItem(raw)
+	if err != nil {
+		t.Fatalf("DecodeStateItem: %v", err)
+	}
+	if back.Kind != StateKindPendingReplicaDiscovery || back.LocalVersion == nil || *back.LocalVersion != 5 ||
+		back.StartedAt == nil || *back.StartedAt != 100 ||
+		len(back.PendingReplicas) != 1 || back.PendingReplicas[0] != 21 || back.Reported[22] != 6 {
+		t.Fatalf("round-trip lost data: %+v", back)
+	}
+}
+
+func TestPendingReplicaDiscoveryItemCarriesNoVersion(t *testing.T) {
+	lv, sa := uint32(5), uint64(100)
+	raw, err := EncodeStateItem(StateItem{Kind: StateKindPendingReplicaDiscovery, LocalVersion: &lv, StartedAt: &sa})
+	if err != nil {
+		t.Fatalf("EncodeStateItem: %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := fields["version"]; ok {
+		t.Fatalf("catch-up item must not carry the key field `version`: %s", raw)
+	}
+	key := StateItem{Kind: StateKindPendingReplicaDiscovery}.Key()
+	if key.Kind != StateKindPendingReplicaDiscovery {
+		t.Fatalf("Key() = %+v, want PendingReplicaDiscovery", key)
+	}
+	if _, err := EncodeStateKey(key); err != nil {
+		t.Fatalf("EncodeStateKey: %v", err)
+	}
+}
+
+func TestDecodeStateItem_KnownGoodRustSample_PendingReplicaDiscovery(t *testing.T) {
+	sample := `{"kind":4,"started_at":"100","local_version":5,"pending_replicas":["21"],"reported":[{"replica_id":"22","version":6}]}`
+	item, err := DecodeStateItem([]byte(sample))
+	if err != nil {
+		t.Fatalf("DecodeStateItem: %v", err)
+	}
+	if *item.LocalVersion != 5 || item.Reported[22] != 6 {
+		t.Fatalf("got %+v", item)
+	}
+	legacy := `{"kind":4,"version":5,"started_at":"100","pending_replicas":[],"reported":[]}`
+	if item, err := DecodeStateItem([]byte(legacy)); err != nil || *item.LocalVersion != 5 {
+		t.Fatalf("a row written before 0.0.6 must still decode: %+v, %v", item, err)
 	}
 }
 

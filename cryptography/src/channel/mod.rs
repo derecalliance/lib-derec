@@ -28,6 +28,11 @@ pub enum DerecChannelError {
 /// * `key` - A 32-byte array representing the AES-256 encryption key.
 /// * `nonce` - A 32-byte array used as the nonce; only the first 12 bytes are used for AES-GCM.
 ///
+/// Those 12 bytes must never repeat under the same `key`. AES-GCM with a
+/// reused nonce leaks the XOR of the two plaintexts and lets an attacker forge
+/// authentication tags, so a key used for more than one message needs a fresh
+/// random nonce for each.
+///
 /// # Returns
 ///
 /// Returns a `Result` containing the ciphertext as a `Vec<u8>` on success. The ciphertext

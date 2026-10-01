@@ -111,7 +111,8 @@ pub use types::{
 };
 
 pub use events::{
-    AutoAcceptPolicy, DeRecEvent, DeRecFlow, PendingAction, PendingActionKind, UnpairAck,
+    AutoAcceptPolicy, DeRecEvent, DeRecFlow, IgnoreReason, PendingAction, PendingActionKind,
+    UnpairAck,
 };
 pub use handlers::restore::RestoreError;
 

@@ -1960,6 +1960,7 @@ export async function runProtocolSmoke(): Promise<void> {
   await runReplyToFlow();
   await runReplicaIdWiringSadPathsFlow();
   await runReplicaPairingAndSecretSyncFlow();
+  await runUnconfirmedDestinationIgnoresTheCopyFlow();
   await runReplicaSyncVersionProgressionFlow();
   await runAutoAcceptFlow();
   await runExpiredChannelCleanupFlow();
@@ -2305,6 +2306,64 @@ async function assertLatestVersion(owner: Node, secretId: bigint, expected: numb
       `expected user_secret_store version=${expected}, got ${snapshot?.version}`,
     );
   }
+}
+
+async function runUnconfirmedDestinationIgnoresTheCopyFlow(): Promise<void> {
+  console.log("\n=== [Protocol] Unconfirmed replica destination ===\n");
+
+  const source = {
+    node: makeNode("Source", "https://source.example.com", { replicaId: 0x5050_5050n }),
+    uri: "https://source.example.com",
+  };
+  const destination = {
+    node: makeNode("Destination", "https://destination.example.com", { replicaId: 0xde57_de57n }),
+    uri: "https://destination.example.com",
+  };
+
+  const { rekeyed } = await pairReplicaHandshake(source, destination, 31n);
+  const destinationFp = await destination.node.protocol.getFingerprint(rekeyed);
+  if (!(await source.node.protocol.verifyFingerprint(rekeyed, destinationFp))) {
+    throw new Error("source.verifyFingerprint must return true");
+  }
+
+  const early = await pumpAll([source, destination]);
+  const ignored = early.find(
+    (e) =>
+      e.type === "MessageIgnored" &&
+      e.reason === "PendingVerification" &&
+      BigInt(e.channel_id) === rekeyed,
+  );
+  if (!ignored) {
+    throw new Error(
+      `a copy sent before the destination confirms must be ignored, got [${early.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  if (
+    early.some(
+      (e) =>
+        e.type === "ReplicaSecretInstalled" ||
+        e.type === "ReplicaSecretReceived" ||
+        e.type === "ReplicaSecretAcked",
+    )
+  ) {
+    throw new Error("nothing may be installed or acknowledged before the destination confirms");
+  }
+  console.log("  copy sent before the destination confirmed was ignored  ✓");
+
+  const sourceFp = await source.node.protocol.getFingerprint(rekeyed);
+  if (!(await destination.node.protocol.verifyFingerprint(rekeyed, sourceFp))) {
+    throw new Error("destination.verifyFingerprint must return true");
+  }
+  await destination.node.protocol.start(FlowKind.ReplicaDiscovery);
+  const catchUp = await pumpAll([destination, source]);
+  if (!catchUp.some((e) => e.type === "ReplicaSecretInstalled")) {
+    throw new Error(
+      `after confirming, ReplicaDiscovery must install the copy, got [${catchUp.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  console.log("  destination pulled the copy with ReplicaDiscovery after confirming  ✓");
+
+  console.log("\n✓ Unconfirmed replica destination flow passed.\n");
 }
 
 async function pairReplicaHandshake(

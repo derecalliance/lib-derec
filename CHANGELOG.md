@@ -7,6 +7,167 @@ Breaking changes are called out explicitly, with the migration alongside
 them. The three crates and the SDKs share a version, so an entry applies to
 all of them unless it names a specific binding.
 
+### 0.0.6
+
+Two security fixes and five defects. Every message on a channel was encrypted
+under the same AES-GCM nonce, which exposes its contents and lets an attacker
+forge messages. A replica destination acted on its source's roster before
+confirming the fingerprint, so the check that stops a man-in-the-middle ran
+after the fact. Replica catch-up did not work from any SDK but Rust, and a
+pulled copy reported the wrong secret id. The Node.js and web SDKs could hang when two calls overlapped on one
+`DeRecProtocol` instance, and the React Native SDK on iOS could silently produce
+malformed messages. Dropped messages now surface as a `MessageIgnored` event
+that says why.
+
+- **Fixed (security): every message on a channel was encrypted with the same
+  AES-GCM nonce.** *(bug fix; every SDK — wire-compatible)*
+
+  Channel messages are encrypted under the pair's long-lived shared key, and
+  the nonce was built from the channel id in bytes that the cipher never
+  reads. So all messages on a channel used the same all-zero 96-bit nonce under
+  the same key. With AES-GCM that is catastrophic: an eavesdropper learns the
+  XOR of any two plaintexts, and can recover the authentication key and forge
+  messages that pass the tag check. Each message now draws a fresh random
+  nonce. Receivers already read the nonce from the ciphertext's first 12
+  bytes, so old and new peers interoperate in both directions. Messages
+  already exchanged under the reused nonce stay exposed; re-pairing rotates
+  the key for any channel whose past traffic must be treated as compromised.
+
+- **Fixed (security): a replica destination acted on its source before
+  confirming the fingerprint.** *(bug fix; every SDK — wire-compatible)*
+
+  The fingerprint comparison is the only defence against a man-in-the-middle on
+  a replica channel. `process` ignored messages on a `Pending` channel, but it
+  found the status only on a helper record. Replica members record theirs
+  separately, so a replica channel was never gated. A destination that had not
+  confirmed still took the source's first copy: it wrote the roster, helper
+  keys and share map to its stores, marked every group member `Paired`, and
+  acknowledged `Ok`. The source then reported the destination in sync. And
+  because the roster marked the destination `Paired`, it became a full group
+  member whether or not its user ever confirmed. This was easy to hit, because
+  the source's own confirmation publishes the vault at once and that copy
+  usually arrives first.
+
+  A message on a channel with a `Pending` replica member is now ignored like
+  one on a `Pending` helper channel: no store is written and nothing is sent
+  back. Confirming does not replay the dropped copy. The destination pulls it
+  after confirming, with `start(ReplicaDiscovery)`. Traffic on an established
+  group channel is unaffected, because a pairing in progress leaves `Pending`
+  rows only on its own pairing channel.
+
+- **Added: `MessageIgnored { channel_id, reason, trace_id }`.** *(new event;
+  every SDK — see the behavior change below)*
+
+  A dropped message used to come back as a bare `NoOp`, which carries nothing
+  and looks exactly like an acknowledgement. An application had no way to tell
+  its user a copy was waiting on their confirmation. `reason` is
+  `PendingVerification` or `Expired` (older than the inbound timeout).
+  `trace_id` matches the peer's `*Started` event for the same round. The Rust
+  type is `IgnoreReason`; the other SDKs get string labels, like
+  `ActionRequired.action_kind` (Go `IgnoreReason*` constants, .NET
+  `IgnoreReason` constants, a TypeScript `IgnoreReason` union).
+
+  **Behavior change.** Messages dropped for either reason, including on a
+  pending *helper* channel, now produce `MessageIgnored` instead of `NoOp`. Code
+  that counted `NoOp`s to detect a drop should match `MessageIgnored` instead.
+  `NoOp` remains for messages that genuinely have no effect, such as
+  acknowledgements.
+
+- **Fixed: a pulled replica copy reported the wrong `secret_id`.** *(bug fix;
+  every SDK — wire-compatible)*
+
+  `ReplicaSecretInstalled` and `ReplicaSecretReceived` carry the secret id of
+  the vault being mirrored. A pushed copy reported the sender's id, but a copy
+  pulled by `ReplicaDiscovery` reported the destination's own. An application
+  that compares that id with its own to choose between "an update to my vault"
+  and "an offer to take over another vault" therefore applied a pulled first
+  copy silently, without the adoption prompt. With the fingerprint fix above, a
+  pull is how a destination normally receives its first copy. Both paths now
+  report the sender's id, which the serving member already put on the wire.
+
+- **Fixed: replica catch-up (`ReplicaDiscovery`) never completed outside Rust.**
+  *(bug fix; .NET, Go, Node.js, web and React Native — rows written by 0.0.5
+  still decode)*
+
+  An in-flight catch-up is stored as a state row. Its JSON put the device's
+  local version in `version`, a field that is part of the row's key for other
+  kinds but absent from this one's key. Every SDK store derives a row's key
+  from those fields, as the store contract says, so the round was saved under
+  one key and looked up under another. The answers then arrived as `NoOp` and
+  the catch-up never finished. The Go and .NET SDKs had no support for this row
+  kind at all: Go filed it under the sharing round's key and failed to encode
+  it, and .NET threw on it.
+
+  The local version now travels in its own `local_version` field, so an item's
+  key fields always equal its key's. A test in the core pins that invariant for
+  every state kind. Go and .NET decode and encode the row and key it correctly.
+  Rust callers were unaffected, since Rust stores receive typed values.
+
+- **Fixed: overlapping calls on one `DeRecProtocol` instance hung instead of
+  queueing.** *(bug fix; Node.js and web only — **breaking** for the three
+  `set*` setters, see below)*
+
+  Every state-touching method took the instance mutably, and wasm-bindgen holds
+  that borrow for the whole life of an async call. A second call issued while
+  the first was awaiting a store or the transport — a `tick()` timer firing
+  while `process()` handled an inbound message, which is the pattern `tick()`'s
+  own documentation recommends — failed that borrow outside any promise. The
+  page got an uncaught `recursive use of an object detected which would lead to
+  unsafe aliasing in rust`, and the calls involved never settled, neither
+  resolving nor rejecting, so a flow simply stalled until the application's own
+  timeout. The FFI-based SDKs never had this: their handle has always
+  serialized calls behind a mutex.
+
+  Each instance now holds its state behind an async lock taken inside every
+  call. Overlapping calls on one instance queue and run one at a time, in the
+  order they were made. Applications that already serialized calls per instance
+  keep working unchanged; that lock is now redundant. Distinct instances do not
+  share the lock, so two instances bound to the same `secretId` and the same
+  stores must still be serialized by the caller.
+
+  Two consequences to be aware of:
+
+  - A store or transport callback must not await a call on the instance that
+    invoked it. That call queues behind the one waiting on the callback, and
+    neither settles.
+  - Calling `free()` while a call is in flight throws.
+
+  **Breaking — migration.** `setCommunicationInfo`, `setOwnTransport` and
+  `setOwnTransports` now return `Promise<void>`, because they queue behind
+  in-flight calls like everything else. `await` them. A validation failure
+  (`INVALID_OWN_TRANSPORT`, `INVALID_PROTOCOL`, `INVALID_COMMUNICATION_INFO`)
+  now rejects the promise instead of throwing synchronously; a call site that
+  does not await it turns that error into an unhandled rejection.
+
+  ```ts
+  // before
+  protocol.setOwnTransports([{ uri, protocol: "https" }]);
+  // after
+  await protocol.setOwnTransports([{ uri, protocol: "https" }]);
+  ```
+
+  `secretId()` stays synchronous and never waits behind an in-flight call.
+
+- **Fixed: the React Native SDK on iOS could emit malformed protocol
+  messages.** *(bug fix; React Native iOS only — no API change)*
+
+  The iOS static libraries were stripped of debug info with Apple's `strip -S`.
+  Rust gives each copy of a symbol shared between codegen units a distinct
+  `.llvm.<hash>` suffix; that tool drops the suffixes, so different function
+  bodies ended up under one name and the app's linker bound some calls to the
+  wrong one. The app still linked and ran, but some encodes came out wrong —
+  most visibly a random `u64` written as a truncated protobuf varint — which
+  the receiving side rejected with `protobuf_decode`. Which call failed varied
+  from run to run with the random values involved, so the failure looked
+  intermittent. Android was never affected: its libraries were already stripped
+  with `llvm-strip`.
+
+  The iOS libraries are now stripped with the same `llvm-strip --strip-debug`
+  as Android, and packaging links every archive member into a stub executable
+  (`-all_load`) per slice, so this failure mode stops the build instead of
+  shipping. **React Native iOS apps on 0.0.5 or earlier should upgrade**;
+  messages those builds sent may have been rejected by their peers.
+
 ### 0.0.5
 
 Verification was reachable but not usable outside the simplest case: a replica

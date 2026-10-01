@@ -78,6 +78,7 @@ internal static class Protocol
         RunOrchestratorReplicaIdWiringSadPathsTest();
         RunOrchestratorReplicaPairAndSecretSyncTest();
         RunOrchestratorReplicaSyncVersionProgressionTest();
+        RunOrchestratorUnconfirmedDestinationTest();
         RunOrchestratorAutoAcceptFlowTest();
         RunOrchestratorExpiredChannelCleanupTest();
         RunOrchestratorTickTest();
@@ -110,6 +111,7 @@ internal static class Protocol
         AssertNamedEnum<ReplicaRole>(enums, "ReplicaRole");
         AssertNumericEnum<StateKind>(enums, "StateKind");
         AssertNumericEnum<SecretKind>(enums, "SecretKind");
+        AssertLabelConstants(typeof(IgnoreReason), enums, "IgnoreReason");
 
         Console.WriteLine("  every fixture variant is known to this SDK  ✓");
         Console.WriteLine("Protocol enum fixture test passed.\n");
@@ -136,6 +138,24 @@ internal static class Protocol
         if (seen != declared)
         {
             throw new Exception($"{enumName}: fixture lists {seen} variants, .NET declares {declared}");
+        }
+    }
+
+    private static void AssertLabelConstants(Type holder, JsonElement enums, string enumName)
+    {
+        var declared = holder
+            .GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)
+            .Where(f => f.IsLiteral && f.FieldType == typeof(string))
+            .Select(f => (string)f.GetRawConstantValue()!)
+            .ToHashSet();
+        var fixture = enums.GetProperty(enumName).GetProperty("variants").EnumerateArray()
+            .Select(v => v.GetProperty("wire").GetString()!)
+            .ToHashSet();
+        if (!declared.SetEquals(fixture))
+        {
+            throw new Exception(
+                $"{enumName}: fixture has [{string.Join(", ", fixture)}], "
+                + $".NET declares [{string.Join(", ", declared)}]");
         }
     }
 
@@ -1547,6 +1567,50 @@ internal static class Protocol
         if (snapshot is null || snapshot.Version != expected)
             throw new InvalidOperationException(
                 $"expected user_secret_store version={expected}, got {snapshot?.Version}");
+    }
+
+    private static void RunOrchestratorUnconfirmedDestinationTest()
+    {
+        Console.WriteLine("=== Orchestrator unconfirmed replica destination test ===");
+
+        const string sourceUri = "https://source.example.com";
+        const string destinationUri = "https://destination.example.com";
+        using var source = MakeNode("Source", sourceUri, new NodeOptions(ReplicaId: 0x5050_5050UL));
+        using var destination = MakeNode("Destination", destinationUri, new NodeOptions(ReplicaId: 0xDE57_DE57UL));
+        var scope = new[] { (source, sourceUri), (destination, destinationUri) };
+
+        ulong channel = PairReplicaHandshake(source, destination, 31);
+        string destinationFp = destination.Protocol.GetFingerprintAsync(channel).GetAwaiter().GetResult();
+        if (!source.Protocol.VerifyFingerprintAsync(channel, destinationFp).GetAwaiter().GetResult())
+            throw new InvalidOperationException("source.VerifyFingerprint must return true");
+
+        var early = PumpAll(scope);
+        if (!early.OfType<MessageIgnoredEvent>().Any(e =>
+                e.Reason == IgnoreReason.PendingVerification && ulong.Parse(e.ChannelId) == channel))
+        {
+            throw new InvalidOperationException(
+                "a copy sent before the destination confirms must surface as MessageIgnored(PendingVerification), got ["
+                + string.Join(", ", early.Select(e => e.EventType)) + "]");
+        }
+        if (early.Any(e => e is ReplicaSecretInstalledEvent or ReplicaSecretReceivedEvent or ReplicaSecretAckedEvent))
+            throw new InvalidOperationException("nothing may be installed or acknowledged before the destination confirms");
+        Console.WriteLine("  copy sent before the destination confirmed was ignored  ✓");
+
+        string sourceFp = source.Protocol.GetFingerprintAsync(channel).GetAwaiter().GetResult();
+        if (!destination.Protocol.VerifyFingerprintAsync(channel, sourceFp).GetAwaiter().GetResult())
+            throw new InvalidOperationException("destination.VerifyFingerprint must return true");
+        destination.Protocol.StartAsync(FlowKind.ReplicaDiscovery, new ReplicaDiscoveryParams())
+            .GetAwaiter().GetResult();
+        var catchUp = PumpAll(scope);
+        if (!catchUp.OfType<ReplicaSecretInstalledEvent>().Any())
+        {
+            throw new InvalidOperationException(
+                "after confirming, ReplicaDiscovery must install the copy, got ["
+                + string.Join(", ", catchUp.Select(e => e.EventType)) + "]");
+        }
+        Console.WriteLine("  destination pulled the copy with ReplicaDiscovery after confirming  ✓");
+
+        Console.WriteLine("Orchestrator unconfirmed replica destination test passed.\n");
     }
 
     private static ulong PairReplicaHandshake(Node owner, Node replica, ulong channelId)

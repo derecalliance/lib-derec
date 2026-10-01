@@ -17,6 +17,28 @@ use derec_proto::{
     UnpairRequestMessage, UpdateChannelInfoRequestMessage, VerifyShareRequestMessage,
 };
 
+/// Why [`DeRecEvent::MessageIgnored`] dropped an inbound message.
+///
+/// Both cases leave every store untouched and send nothing back, so the
+/// sender learns nothing from the drop and a retry is always safe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum IgnoreReason {
+    /// The channel's fingerprint has not been confirmed on this device yet:
+    /// a `Pending` helper channel, or a `Pending` replica member on the
+    /// channel the message arrived on. The comparison is the only defence
+    /// against a man-in-the-middle, so nothing a peer sends is acted on
+    /// before it. Once [`super::DeRecProtocol::verify_fingerprint`] succeeds
+    /// the channel accepts traffic, but a dropped message is not replayed.
+    ///
+    /// Admitting a replica leaves `Pending` members only on that pairing's
+    /// own channel, so traffic on an established group channel is never
+    /// held back by a pairing in progress.
+    PendingVerification,
+    /// The message is older than the configured inbound timeout
+    /// ([`crate::protocol::types::Timeouts::inbound_message`]).
+    Expired,
+}
+
 /// Lightweight discriminant of [`PendingAction`].
 ///
 /// Carries no payload — useful for the
@@ -1015,6 +1037,28 @@ pub enum DeRecEvent {
 
     /// Well-formed message with no actionable effect (e.g. an ACK).
     NoOp,
+
+    /// An inbound message was dropped without being acted on: no store was
+    /// written and nothing was sent back. `reason` says why and whether it
+    /// can succeed later.
+    ///
+    /// `PendingVerification` is the case an application should surface. It
+    /// means the peer sent something before this device confirmed the
+    /// channel's fingerprint, and it is typically a replica source pushing
+    /// its first copy while the destination is still showing the code.
+    /// Confirming does not replay the message. Once
+    /// [`super::DeRecProtocol::verify_fingerprint`] succeeds, a replica
+    /// destination starts [`DeRecFlow::ReplicaDiscovery`] to pull the copy
+    /// from the source itself.
+    MessageIgnored {
+        /// The channel the message arrived on.
+        channel_id: ChannelId,
+        reason: IgnoreReason,
+        /// The envelope's trace id, so the drop can be matched to the
+        /// peer's `*Started` event for the same round. `0` when the sender
+        /// set none.
+        trace_id: u64,
+    },
 
     /// A pairing flow was initiated for `channel_id` with the local
     /// role `kind`. Emitted synchronously from

@@ -33,6 +33,21 @@ function nativeDiagnostics(): string {
   ].join(' ');
 }
 
+function describeError(error: unknown): string {
+  if (error instanceof Error) {
+    return String(error);
+  }
+  if (typeof error === 'object' && error !== null) {
+    try {
+      return JSON.stringify(error, (_key, value: unknown) =>
+        typeof value === 'bigint' ? value.toString() : value,
+      );
+    } catch {
+    }
+  }
+  return String(error);
+}
+
 const SCENARIOS: Array<[string, () => void | Promise<void>]> = [
   ['primitives', runPrimitives],
   ['protocol', runProtocol],
@@ -47,8 +62,10 @@ export default function App(): React.JSX.Element {
     (async () => {
       forwardConsole();
       const lines: string[] = [];
+      let current = '';
       try {
         for (const [name, run] of SCENARIOS) {
+          current = name;
           await run();
           lines.push(`ok  ${name}`);
           setLog([...lines]);
@@ -60,10 +77,11 @@ export default function App(): React.JSX.Element {
         await report(pass);
       } catch (error) {
         setStatus('FAIL');
-        lines.push(String(error));
+        const reason = `${current}: ${describeError(error)}`;
+        lines.push(reason);
         setLog([...lines]);
         const stack = error instanceof Error && error.stack ? error.stack : '';
-        const fail = `DEREC_SMOKE_RESULT: FAIL [${Platform.OS}] ${String(error)}`;
+        const fail = `DEREC_SMOKE_RESULT: FAIL [${Platform.OS}] ${reason}`;
         console.log(fail);
         await drain();
         await report(`${fail}\n${stack}\n${nativeDiagnostics()}`);

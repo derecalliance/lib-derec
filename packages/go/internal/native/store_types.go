@@ -17,7 +17,7 @@ import (
 // pairing held by an Owner carries SenderKindHelper, and the helper's own
 // row for the same channel carries SenderKindOwner.
 type HelperChannel struct {
-	ChannelID         uint64
+	ChannelID uint64
 	// Transports are every endpoint the peer advertised, in the order it
 	// offered them. The library does not rank them; a Transport
 	// implementation chooses which to dial and may fall back.
@@ -34,8 +34,8 @@ type HelperChannel struct {
 // ChannelID, so the channel cannot be the key. Storing this device's own
 // row is what makes the roster reconstructible from stores alone.
 type ReplicaMember struct {
-	ChannelID         uint64
-	ReplicaID         uint64
+	ChannelID uint64
+	ReplicaID uint64
 	// Transports are every endpoint the peer advertised, in the order it
 	// offered them. The library does not rank them; a Transport
 	// implementation chooses which to dial and may fall back.
@@ -328,7 +328,8 @@ const (
 // field is populated is determined by Kind:
 //   - PendingVerification, PendingUnpair: ChannelID.
 //   - PendingRecovery: SecretID, Version.
-//   - SharingRound: none (at most one row per secretID).
+//   - SharingRound, PendingReplicaDiscovery: none (at most one row per
+//     secretID).
 //
 // SecretID names the secret being recovered, which is not necessarily
 // the secretID partitioning the store: a recovering device runs an
@@ -352,6 +353,9 @@ type StateKey struct {
 //   - SharingRound: Version, Pending/Confirmed/Failed (channel-id sets),
 //     PendingReplicas/SyncedReplicas/BehindReplicas (replica-id sets),
 //     StartedAt (unix seconds).
+//   - PendingReplicaDiscovery: LocalVersion, PendingReplicas (members still
+//     to answer), Reported (replicaID → version each member reported),
+//     StartedAt (unix seconds).
 //
 // The two populations of a sharing round are tracked separately and by
 // different keys: helpers by channelID, group members by replicaID. Every
@@ -374,6 +378,11 @@ type StateItem struct {
 	SyncedReplicas []uint64
 	// BehindReplicas are members that refused, timed out, or were unreachable.
 	BehindReplicas []uint64
+	// LocalVersion is the version this device held when a catch-up started.
+	LocalVersion *uint32
+	// Reported maps each member that has answered a catch-up to the version
+	// it reported.
+	Reported map[uint64]uint32
 }
 
 // Key returns the StateKey this item is stored under, mirroring the
@@ -386,6 +395,8 @@ func (i StateItem) Key() StateKey {
 		return StateKey{Kind: StateKindPendingRecovery, SecretID: i.SecretID, Version: i.Version}
 	case StateKindPendingUnpair:
 		return StateKey{Kind: StateKindPendingUnpair, ChannelID: i.ChannelID}
+	case StateKindPendingReplicaDiscovery:
+		return StateKey{Kind: StateKindPendingReplicaDiscovery}
 	default:
 		return StateKey{Kind: StateKindSharingRound}
 	}

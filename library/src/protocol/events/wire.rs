@@ -217,6 +217,12 @@ pub(crate) enum Event {
         action_kind: String,
     },
     NoOp,
+    MessageIgnored {
+        channel_id: String,
+        /// [`ignore_reason_label`] — `"PendingVerification"` or `"Expired"`.
+        reason: String,
+        trace_id: String,
+    },
     PairingStarted {
         channel_id: String,
         kind: i32,
@@ -670,6 +676,15 @@ impl Event {
                 }
             }
             DeRecEvent::NoOp => Self::NoOp,
+            DeRecEvent::MessageIgnored {
+                channel_id,
+                reason,
+                trace_id,
+            } => Self::MessageIgnored {
+                channel_id: channel_id.0.to_string(),
+                reason: ignore_reason_label(reason).to_owned(),
+                trace_id: trace_id.to_string(),
+            },
             DeRecEvent::PairingStarted {
                 channel_id,
                 kind,
@@ -776,6 +791,16 @@ impl Event {
     }
 }
 
+/// Wire label for an [`IgnoreReason`](crate::protocol::IgnoreReason): the
+/// variant name, matching `library/tests/fixtures/enums.json`.
+pub(crate) fn ignore_reason_label(reason: crate::protocol::IgnoreReason) -> &'static str {
+    use crate::protocol::IgnoreReason;
+    match reason {
+        IgnoreReason::PendingVerification => "PendingVerification",
+        IgnoreReason::Expired => "Expired",
+    }
+}
+
 pub(crate) fn pending_action_kind_label(
     kind: crate::protocol::events::PendingActionKind,
 ) -> &'static str {
@@ -857,5 +882,21 @@ mod tests {
         assert_eq!(json["type"], "UnpairFailed");
         assert_eq!(json["channel_id"], "99");
         assert_eq!(json["error"], "transport unreachable");
+    }
+
+    #[test]
+    fn message_ignored_maps_with_channel_reason_and_trace() {
+        let mapped = Event::from_event(DeRecEvent::MessageIgnored {
+            channel_id: ChannelId(u64::MAX),
+            reason: crate::protocol::IgnoreReason::PendingVerification,
+            trace_id: 42,
+        })
+        .expect("MessageIgnored must map");
+
+        let json = serde_json::to_value(&mapped).expect("serializes");
+        assert_eq!(json["type"], "MessageIgnored");
+        assert_eq!(json["channel_id"], u64::MAX.to_string());
+        assert_eq!(json["reason"], "PendingVerification");
+        assert_eq!(json["trace_id"], "42");
     }
 }

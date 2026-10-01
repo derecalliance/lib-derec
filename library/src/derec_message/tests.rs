@@ -364,3 +364,34 @@ fn test_extract_inner_plaintext_message_rejects_garbage() {
 
     assert!(matches!(err, crate::Error::ProtobufDecode(_)));
 }
+
+#[test]
+fn test_channel_encrypt_never_reuses_a_nonce_under_one_key() {
+    let seal = || {
+        let bytes = DeRecMessageBuilder::channel()
+            .channel_id(CHANNEL_ID)
+            .timestamp(current_timestamp())
+            .message_body(MessageBody::PairRequest(sample_message()))
+            .encrypt(&SHARED_KEY)
+            .unwrap()
+            .build()
+            .unwrap()
+            .encode_to_vec();
+        DeRecMessage::decode(bytes.as_slice()).unwrap().message
+    };
+
+    let first = seal();
+    let second = seal();
+
+    assert_ne!(
+        first[..12],
+        second[..12],
+        "two messages on one channel key must not share an AES-GCM nonce"
+    );
+    for ciphertext in [&first, &second] {
+        assert!(matches!(
+            extract_inner_message(ciphertext, &SHARED_KEY),
+            Ok(MessageBody::PairRequest(_))
+        ));
+    }
+}
