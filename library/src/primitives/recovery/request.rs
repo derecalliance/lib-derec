@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-use crate::extensions::transport_protocol::TransportProtocolExt as _;
+use crate::extensions::request_message::RequestMessageExt as _;
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     types::{ChannelId, SharedKey},
@@ -86,8 +86,6 @@ pub fn produce(
         version,
         timestamp: Some(timestamp),
         reply_to_transports,
-        // Owner ↔ helper exchange: the replica path sets this, this one
-        // never does. Its absence is what marks the message helper-bound.
         replica_id: None,
     };
 
@@ -203,9 +201,7 @@ pub fn extract(
 
     verify_timestamps(envelope.timestamp, request.timestamp)?;
 
-    for reply_to in &request.reply_to_transports {
-        reply_to.validate()?;
-    }
+    request.validate()?;
 
     #[cfg(feature = "logging")]
     tracing::info!("recovery request extracted and validated");

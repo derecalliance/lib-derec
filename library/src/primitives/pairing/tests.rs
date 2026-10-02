@@ -3,6 +3,7 @@
 
 use crate::Error;
 use crate::derec_message::current_timestamp;
+use crate::extensions::derec_result::DeRecResultExt as _;
 use crate::primitives::pairing::PairingError;
 use crate::primitives::pairing::{
     request::{
@@ -782,10 +783,7 @@ fn test_process_pairing_response_message_nonce_mismatch() {
     .expect("failed to extract pairing request");
 
     let pair_response_msg = PairResponseMessage {
-        result: Some(DeRecResult {
-            status: StatusEnum::Ok as i32,
-            memo: String::new(),
-        }),
+        result: Some(DeRecResult::ok()),
         nonce: bob_pair_request_msg.nonce + 1,
         communication_info: None,
         parameter_range: None,
@@ -851,10 +849,7 @@ fn test_process_pairing_response_message_empty_mlkem_encapsulation_key() {
     .expect("failed to extract pairing request");
 
     let pair_response_msg = PairResponseMessage {
-        result: Some(DeRecResult {
-            status: StatusEnum::Ok as i32,
-            memo: String::new(),
-        }),
+        result: Some(DeRecResult::ok()),
         nonce: bob_pair_request_msg.nonce,
         communication_info: None,
         parameter_range: None,
@@ -919,10 +914,7 @@ fn test_process_pairing_response_message_empty_ecies_public_key() {
     .expect("failed to extract pairing request");
 
     let pair_response_msg = PairResponseMessage {
-        result: Some(DeRecResult {
-            status: StatusEnum::Ok as i32,
-            memo: String::new(),
-        }),
+        result: Some(DeRecResult::ok()),
         nonce: bob_pair_request_msg.nonce,
         communication_info: None,
         parameter_range: None,
@@ -2017,7 +2009,7 @@ fn test_pairing_rekey_also_fires_in_hashed_keys_mode() {
     );
 }
 
-/// Reference contact builders for the `validate_contact_for_mode` tests.
+/// Reference contact builders for the `validate_for_mode` tests.
 fn well_formed_inline_keys_contact() -> ContactMessage {
     ContactMessage {
         channel_id: 42,
@@ -2052,25 +2044,27 @@ fn well_formed_hashed_keys_contact() -> ContactMessage {
 
 #[test]
 fn test_validate_contact_for_mode_accepts_well_formed_inline_keys() {
-    use crate::primitives::pairing::validate_contact_for_mode;
+    use crate::extensions::contact_message::ContactMessageExt as _;
     let c = well_formed_inline_keys_contact();
-    validate_contact_for_mode(&c, ContactMode::InlineKeys)
+    c.validate_for_mode(ContactMode::InlineKeys)
         .expect("well-formed inline_keys must pass");
 }
 
 #[test]
 fn test_validate_contact_for_mode_accepts_well_formed_hashed_keys() {
-    use crate::primitives::pairing::validate_contact_for_mode;
+    use crate::extensions::contact_message::ContactMessageExt as _;
     let c = well_formed_hashed_keys_contact();
-    validate_contact_for_mode(&c, ContactMode::HashedKeys)
+    c.validate_for_mode(ContactMode::HashedKeys)
         .expect("well-formed hashed_keys must pass");
 }
 
 #[test]
 fn test_validate_contact_for_mode_rejects_mode_mismatch() {
-    use crate::primitives::pairing::validate_contact_for_mode;
+    use crate::extensions::contact_message::ContactMessageExt as _;
     let inline = well_formed_inline_keys_contact();
-    let err = validate_contact_for_mode(&inline, ContactMode::HashedKeys).unwrap_err();
+    let err = inline
+        .validate_for_mode(ContactMode::HashedKeys)
+        .unwrap_err();
     assert!(matches!(
         err,
         Error::Pairing(PairingError::InvalidContactMessage(m))
@@ -2078,7 +2072,9 @@ fn test_validate_contact_for_mode_rejects_mode_mismatch() {
     ));
 
     let hashed = well_formed_hashed_keys_contact();
-    let err = validate_contact_for_mode(&hashed, ContactMode::InlineKeys).unwrap_err();
+    let err = hashed
+        .validate_for_mode(ContactMode::InlineKeys)
+        .unwrap_err();
     assert!(matches!(
         err,
         Error::Pairing(PairingError::InvalidContactMessage(m))
@@ -2088,10 +2084,10 @@ fn test_validate_contact_for_mode_rejects_mode_mismatch() {
 
 #[test]
 fn test_validate_contact_for_mode_rejects_inline_missing_mlkem_key() {
-    use crate::primitives::pairing::validate_contact_for_mode;
+    use crate::extensions::contact_message::ContactMessageExt as _;
     let mut c = well_formed_inline_keys_contact();
     c.mlkem_encapsulation_key = Some(Vec::new());
-    let err = validate_contact_for_mode(&c, ContactMode::InlineKeys).unwrap_err();
+    let err = c.validate_for_mode(ContactMode::InlineKeys).unwrap_err();
     assert!(matches!(
         err,
         Error::Pairing(PairingError::InvalidContactMessage(m))
@@ -2100,7 +2096,7 @@ fn test_validate_contact_for_mode_rejects_inline_missing_mlkem_key() {
 
     let mut c = well_formed_inline_keys_contact();
     c.mlkem_encapsulation_key = None;
-    let err = validate_contact_for_mode(&c, ContactMode::InlineKeys).unwrap_err();
+    let err = c.validate_for_mode(ContactMode::InlineKeys).unwrap_err();
     assert!(matches!(
         err,
         Error::Pairing(PairingError::InvalidContactMessage(m))
@@ -2110,10 +2106,10 @@ fn test_validate_contact_for_mode_rejects_inline_missing_mlkem_key() {
 
 #[test]
 fn test_validate_contact_for_mode_rejects_inline_missing_ecies_key() {
-    use crate::primitives::pairing::validate_contact_for_mode;
+    use crate::extensions::contact_message::ContactMessageExt as _;
     let mut c = well_formed_inline_keys_contact();
     c.ecies_public_key = None;
-    let err = validate_contact_for_mode(&c, ContactMode::InlineKeys).unwrap_err();
+    let err = c.validate_for_mode(ContactMode::InlineKeys).unwrap_err();
     assert!(matches!(
         err,
         Error::Pairing(PairingError::InvalidContactMessage(m))
@@ -2123,10 +2119,10 @@ fn test_validate_contact_for_mode_rejects_inline_missing_ecies_key() {
 
 #[test]
 fn test_validate_contact_for_mode_rejects_inline_with_binding_hash() {
-    use crate::primitives::pairing::validate_contact_for_mode;
+    use crate::extensions::contact_message::ContactMessageExt as _;
     let mut c = well_formed_inline_keys_contact();
     c.contact_binding_hash = Some(vec![0xCD; 48]);
-    let err = validate_contact_for_mode(&c, ContactMode::InlineKeys).unwrap_err();
+    let err = c.validate_for_mode(ContactMode::InlineKeys).unwrap_err();
     assert!(matches!(
         err,
         Error::Pairing(PairingError::InvalidContactMessage(m))
@@ -2136,10 +2132,10 @@ fn test_validate_contact_for_mode_rejects_inline_with_binding_hash() {
 
 #[test]
 fn test_validate_contact_for_mode_rejects_hashed_with_inline_keys() {
-    use crate::primitives::pairing::validate_contact_for_mode;
+    use crate::extensions::contact_message::ContactMessageExt as _;
     let mut c = well_formed_hashed_keys_contact();
     c.mlkem_encapsulation_key = Some(vec![1; 1184]);
-    let err = validate_contact_for_mode(&c, ContactMode::HashedKeys).unwrap_err();
+    let err = c.validate_for_mode(ContactMode::HashedKeys).unwrap_err();
     assert!(matches!(
         err,
         Error::Pairing(PairingError::InvalidContactMessage(m))
@@ -2148,7 +2144,7 @@ fn test_validate_contact_for_mode_rejects_hashed_with_inline_keys() {
 
     let mut c = well_formed_hashed_keys_contact();
     c.ecies_public_key = Some(vec![2; 33]);
-    let err = validate_contact_for_mode(&c, ContactMode::HashedKeys).unwrap_err();
+    let err = c.validate_for_mode(ContactMode::HashedKeys).unwrap_err();
     assert!(matches!(
         err,
         Error::Pairing(PairingError::InvalidContactMessage(m))
@@ -2158,10 +2154,10 @@ fn test_validate_contact_for_mode_rejects_hashed_with_inline_keys() {
 
 #[test]
 fn test_validate_contact_for_mode_rejects_hashed_missing_binding_hash() {
-    use crate::primitives::pairing::validate_contact_for_mode;
+    use crate::extensions::contact_message::ContactMessageExt as _;
     let mut c = well_formed_hashed_keys_contact();
     c.contact_binding_hash = None;
-    let err = validate_contact_for_mode(&c, ContactMode::HashedKeys).unwrap_err();
+    let err = c.validate_for_mode(ContactMode::HashedKeys).unwrap_err();
     assert!(matches!(
         err,
         Error::Pairing(PairingError::InvalidContactMessage(m))
@@ -2170,7 +2166,7 @@ fn test_validate_contact_for_mode_rejects_hashed_missing_binding_hash() {
 
     let mut c = well_formed_hashed_keys_contact();
     c.contact_binding_hash = Some(Vec::new());
-    let err = validate_contact_for_mode(&c, ContactMode::HashedKeys).unwrap_err();
+    let err = c.validate_for_mode(ContactMode::HashedKeys).unwrap_err();
     assert!(matches!(
         err,
         Error::Pairing(PairingError::InvalidContactMessage(m))
@@ -2180,10 +2176,10 @@ fn test_validate_contact_for_mode_rejects_hashed_missing_binding_hash() {
 
 #[test]
 fn test_validate_contact_for_mode_rejects_hashed_wrong_hash_length() {
-    use crate::primitives::pairing::validate_contact_for_mode;
+    use crate::extensions::contact_message::ContactMessageExt as _;
     let mut c = well_formed_hashed_keys_contact();
     c.contact_binding_hash = Some(vec![0xAB; 32]);
-    let err = validate_contact_for_mode(&c, ContactMode::HashedKeys).unwrap_err();
+    let err = c.validate_for_mode(ContactMode::HashedKeys).unwrap_err();
     assert!(matches!(
         err,
         Error::Pairing(PairingError::InvalidContactMessage(m))

@@ -115,8 +115,6 @@ impl MessageBodyExt for MessageBody {
             MessageBody::VerifyShareResponse(_) | MessageBody::UnpairResponse(_) => {
                 Some(SenderKind::Helper)
             }
-            // Multi-valued, or role-blind: gated by the owning flow, or not
-            // at all. See the trait method's docs.
             _ => None,
         }
     }

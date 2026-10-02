@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use crate::extensions::derec_result::DeRecResultExt as _;
 use crate::{
     Error,
     derec_message::{DeRecMessageBuilder, current_timestamp},
@@ -99,10 +100,7 @@ fn create_response_envelope_with_mismatched_timestamp(
     let message = GetShareResponseMessage {
         share_algorithm: 0,
         committed_de_rec_share: committed_bytes,
-        result: Some(DeRecResult {
-            status: StatusEnum::Ok as i32,
-            memo: String::new(),
-        }),
+        result: Some(DeRecResult::ok()),
         timestamp: Some(message_timestamp),
         secret_id: 0,
         version: 0,

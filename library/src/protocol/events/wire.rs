@@ -17,15 +17,13 @@
 //! - Enum variants use serde's default tag (`#[serde(tag = "type")]`)
 //!   with the Rust variant name as the discriminator value.
 
-use std::collections::HashMap;
-
-use serde::Serialize;
-
 use crate::protocol::utils::{pending_action_wire, reserved_keys::encode_replica_id};
 use crate::protocol::{
     DeRecEvent, PendingAction,
     types::{ChannelShare, Secret},
 };
+use serde::Serialize;
+use std::collections::HashMap;
 
 /// Canonical wire-shape of [`super::DeRecEvent`]. Consumed by the FFI
 /// and WASM bridges only. See module docs for the field conventions.

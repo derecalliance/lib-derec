@@ -300,7 +300,7 @@ fn push_id_clause(
     ids: impl Iterator<Item = u64>,
     negate: bool,
 ) {
-    let placeholders = bind_all(params, ids.map(|id| u64_to_sql(id) as i64));
+    let placeholders = bind_all(params, ids.map(u64_to_sql));
     if placeholders.is_empty() {
         return;
     }

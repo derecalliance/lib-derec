@@ -12,6 +12,7 @@
 use super::load_channel_key;
 use crate::derec_message::{DeRecMessageBuilder, current_timestamp};
 use crate::extensions::channel_store::ChannelStoreExt as _;
+use crate::extensions::derec_result::DeRecResultExt as _;
 #[cfg(target_arch = "wasm32")]
 use crate::interop::wasm::now_secs;
 use crate::protocol::context::{Exchange, Local};
@@ -26,8 +27,7 @@ use crate::utils::now_secs;
 use crate::{Error, Result};
 use derec_proto::{
     DeRecResult, GetSecretIdsVersionsRequestMessage, GetSecretIdsVersionsResponseMessage,
-    GetShareRequestMessage, MessageBody, StatusEnum,
-    get_secret_ids_versions_response_message::VersionList,
+    GetShareRequestMessage, MessageBody, get_secret_ids_versions_response_message::VersionList,
     get_secret_ids_versions_response_message::version_list::VersionEntry,
 };
 use prost::Message as _;
@@ -185,10 +185,7 @@ async fn on_request<S: StoreSet>(
 
     let timestamp = current_timestamp();
     let response = GetSecretIdsVersionsResponseMessage {
-        result: Some(DeRecResult {
-            status: StatusEnum::Ok as i32,
-            memo: String::new(),
-        }),
+        result: Some(DeRecResult::ok()),
         // A device holding no snapshot reports nothing rather than version 0,
         // which would be indistinguishable from "I hold the empty version".
         secret_list: version
@@ -448,10 +445,7 @@ mod tests {
 
     fn versions_response(version: Option<u32>) -> GetSecretIdsVersionsResponseMessage {
         GetSecretIdsVersionsResponseMessage {
-            result: Some(DeRecResult {
-                status: StatusEnum::Ok as i32,
-                memo: String::new(),
-            }),
+            result: Some(DeRecResult::ok()),
             secret_list: version
                 .map(|version| VersionList {
                     secret_id: SECRET_ID,

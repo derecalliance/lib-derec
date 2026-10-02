@@ -46,6 +46,22 @@ pub(crate) trait ContactMessageExt {
     /// a mode the OOB channel wasn't trusted for.
     fn validate(&self) -> Result<(), crate::Error>;
 
+    /// [`Self::validate`], plus the declared `contact_mode` must be the one
+    /// the calling flow expects. A pairing step that accepts only one mode
+    /// checks it here, so a contact whose `contact_mode` was altered between
+    /// the out-of-band exchange and this point is refused rather than
+    /// handled as another mode:
+    ///
+    /// - producing a pair request requires [`ContactMode::InlineKeys`]: the
+    ///   responder needs the keys inline;
+    /// - producing a PrePair request, and processing a PrePair response for a
+    ///   hashed contact, require [`ContactMode::HashedKeys`]: the keys are
+    ///   fetched and checked against the binding hash;
+    /// - processing a PrePair response for a no-keys contact requires
+    ///   [`ContactMode::NoKeys`]: no key material and no commitment, trust
+    ///   rests on the out-of-band channel alone.
+    fn validate_for_mode(&self, expected: ContactMode) -> Result<(), crate::Error>;
+
     /// Returns `true` when this contact's mode requires a `PrePairRequest`
     /// round-trip before the responder can produce a `PairRequestMessage`.
     ///
@@ -133,69 +149,18 @@ impl ContactMessageExt for ContactMessage {
 
         match mode {
             ContactMode::InlineKeys => {
-                if !mlkem_present {
-                    return Err(PairingError::InvalidContactMessage(
-                        "inline_keys contact missing mlkem_encapsulation_key",
-                    )
-                    .into());
-                }
-                if !ecies_present {
-                    return Err(PairingError::InvalidContactMessage(
-                        "inline_keys contact missing ecies_public_key",
-                    )
-                    .into());
-                }
-                if hash_present {
-                    return Err(PairingError::InvalidContactMessage(
-                        "inline_keys contact must not carry contact_binding_hash",
-                    )
-                    .into());
-                }
+                check_inline_keys_fields(mlkem_present, ecies_present, hash_present)?
             }
-            ContactMode::HashedKeys => {
-                if mlkem_present || ecies_present {
-                    return Err(PairingError::InvalidContactMessage(
-                        "hashed_keys contact must not carry inline keys",
-                    )
-                    .into());
-                }
-                const BINDING_HASH_LEN: usize = 48;
-                let hash = self.contact_binding_hash.as_ref().ok_or(
-                    PairingError::InvalidContactMessage(
-                        "hashed_keys contact missing contact_binding_hash",
-                    ),
-                )?;
-                if hash.is_empty() {
-                    return Err(PairingError::InvalidContactMessage(
-                        "hashed_keys contact missing contact_binding_hash",
-                    )
-                    .into());
-                }
-                if hash.len() != BINDING_HASH_LEN {
-                    return Err(PairingError::InvalidContactMessage(
-                        "hashed_keys contact_binding_hash is not a SHA-384 digest",
-                    )
-                    .into());
-                }
-            }
+            ContactMode::HashedKeys => check_hashed_keys_fields(
+                mlkem_present,
+                ecies_present,
+                self.contact_binding_hash.as_deref(),
+            )?,
             ContactMode::NoKeys => {
-                if mlkem_present || ecies_present {
-                    return Err(PairingError::InvalidContactMessage(
-                        "no_keys contact must not carry inline keys",
-                    )
-                    .into());
-                }
-                if hash_present {
-                    return Err(PairingError::InvalidContactMessage(
-                        "no_keys contact must not carry contact_binding_hash",
-                    )
-                    .into());
-                }
+                check_no_keys_fields(mlkem_present, ecies_present, hash_present)?
             }
         }
 
-        // A contact naming no endpoint at all gives the scanner nowhere to
-        // send the pair request.
         if self.supported_transports.is_empty() {
             #[cfg(feature = "logging")]
             tracing::warn!("contact advertises no usable transport endpoint");
@@ -204,6 +169,26 @@ impl ContactMessageExt for ContactMessage {
         }
 
         Ok(())
+    }
+
+    fn validate_for_mode(&self, expected: ContactMode) -> Result<(), crate::Error> {
+        if self.contact_mode != expected as i32 {
+            #[cfg(feature = "logging")]
+            tracing::warn!(
+                contact_mode = self.contact_mode,
+                expected = expected as i32,
+                "contact_mode mismatch"
+            );
+
+            return Err(PairingError::InvalidContactMessage(match expected {
+                ContactMode::InlineKeys => "expected INLINE_KEYS contact mode",
+                ContactMode::HashedKeys => "expected HASHED_KEYS contact mode",
+                ContactMode::NoKeys => "expected NO_KEYS contact mode",
+            })
+            .into());
+        }
+
+        self.validate()
     }
 
     fn requires_pre_pair(&self) -> bool {
@@ -266,6 +251,79 @@ impl ContactMessageExt for ContactMessage {
             supported_transports: own,
         }
     }
+}
+
+/// [`ContactMode::InlineKeys`]: both keys inline, no binding hash.
+fn check_inline_keys_fields(
+    mlkem_present: bool,
+    ecies_present: bool,
+    hash_present: bool,
+) -> Result<(), crate::Error> {
+    if !mlkem_present {
+        return Err(PairingError::InvalidContactMessage(
+            "inline_keys contact missing mlkem_encapsulation_key",
+        )
+        .into());
+    }
+    if !ecies_present {
+        return Err(PairingError::InvalidContactMessage(
+            "inline_keys contact missing ecies_public_key",
+        )
+        .into());
+    }
+    if hash_present {
+        return Err(PairingError::InvalidContactMessage(
+            "inline_keys contact must not carry contact_binding_hash",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// [`ContactMode::HashedKeys`]: no inline keys, and a SHA-384 binding hash.
+fn check_hashed_keys_fields(
+    mlkem_present: bool,
+    ecies_present: bool,
+    contact_binding_hash: Option<&[u8]>,
+) -> Result<(), crate::Error> {
+    const BINDING_HASH_LEN: usize = 48;
+    if mlkem_present || ecies_present {
+        return Err(PairingError::InvalidContactMessage(
+            "hashed_keys contact must not carry inline keys",
+        )
+        .into());
+    }
+    let hash = contact_binding_hash.filter(|h| !h.is_empty()).ok_or(
+        PairingError::InvalidContactMessage("hashed_keys contact missing contact_binding_hash"),
+    )?;
+    if hash.len() != BINDING_HASH_LEN {
+        return Err(PairingError::InvalidContactMessage(
+            "hashed_keys contact_binding_hash is not a SHA-384 digest",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// [`ContactMode::NoKeys`]: no key material and no binding hash.
+fn check_no_keys_fields(
+    mlkem_present: bool,
+    ecies_present: bool,
+    hash_present: bool,
+) -> Result<(), crate::Error> {
+    if mlkem_present || ecies_present {
+        return Err(PairingError::InvalidContactMessage(
+            "no_keys contact must not carry inline keys",
+        )
+        .into());
+    }
+    if hash_present {
+        return Err(PairingError::InvalidContactMessage(
+            "no_keys contact must not carry contact_binding_hash",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

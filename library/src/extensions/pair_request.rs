@@ -50,11 +50,6 @@ impl PairRequestMessageExt for derec_proto::PairRequestMessage {
             );
         }
 
-        // A request carrying no offer list gives selection nothing to work
-        // with. Report it as the malformed
-        // request it is rather than as `NoUsableEndpoint`: the two are fixed
-        // differently — one by the sender correcting its request, the other
-        // by one side gaining a transport the other serves.
         if self.supported_transports.is_empty() {
             #[cfg(feature = "logging")]
             tracing::warn!("pair request advertises no usable transport endpoint");

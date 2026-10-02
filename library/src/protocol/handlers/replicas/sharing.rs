@@ -735,6 +735,7 @@ fn promotion_event(local: &Local<'_>, was_source: bool, secret: &Secret) -> Opti
 
 #[cfg(test)]
 mod tests {
+    use crate::extensions::derec_result::DeRecResultExt as _;
     use crate::protocol::DeRecChannelStore;
     use crate::protocol::test::{InMemChannelStore, LocalFixture, StoreRig, run_async};
     use crate::protocol::types::{ChannelRecord, ChannelStatus, ReplicaMember, ReplicaRole};
@@ -916,10 +917,7 @@ mod tests {
             };
 
             let response = derec_proto::StoreShareResponseMessage {
-                result: Some(derec_proto::DeRecResult {
-                    status: derec_proto::StatusEnum::Ok as i32,
-                    memo: String::new(),
-                }),
+                result: Some(derec_proto::DeRecResult::ok()),
                 secret_id: SECRET_ID,
                 version: 3,
                 timestamp: None,

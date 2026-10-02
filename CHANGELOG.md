@@ -521,6 +521,11 @@ removed, in every binding. See the first entry below for the migration.
   TypeScript `ChannelStore.linkChannel` now names its edge ends `a`, `b`, as
   the Rust trait does; only the parameter names change.
 
+  `make all` now also lints with every feature enabled, which reaches the C
+  ABI layer and the logging call sites that the default-feature run skipped,
+  and checks formatting and lints in the SQLite and Postgres smoke crates,
+  which sit outside the workspace.
+
 - **Changed: `restore` skips a peer it cannot reach instead of refusing the
   whole secret.** *(breaking; every SDK)*
 

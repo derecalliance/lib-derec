@@ -7,8 +7,7 @@ use tokio_postgres::{Client, NoTls};
 /// Migrations bundled into the binary at compile time. Adding a
 /// migration is two lines: drop a new `.sql` file under `migrations/`
 /// and append an entry here with a strictly increasing `version`.
-const MIGRATIONS: &[(i64, &str, &str)] =
-    &[
+const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "0001_init", include_str!("../migrations/0001_init.sql")),
     (
         2,

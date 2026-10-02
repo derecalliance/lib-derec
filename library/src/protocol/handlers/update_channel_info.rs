@@ -9,6 +9,7 @@ use crate::derec_message::{DeRecMessageBuilder, current_timestamp};
 use crate::extensions::advertised_endpoints::AdvertisedEndpoints as _;
 use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::extensions::communication_info::CommunicationInfoExt as _;
+use crate::extensions::derec_result::DeRecResultExt as _;
 use crate::extensions::transport_protocol::TransportProtocolExt as _;
 use crate::protocol::context::{Exchange, Local};
 use crate::protocol::stores::{StoreSet, Stores};
@@ -182,10 +183,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
 
     let timestamp = current_timestamp();
     let response = UpdateChannelInfoResponseMessage {
-        result: Some(DeRecResult {
-            status: StatusEnum::Ok as i32,
-            memo: String::new(),
-        }),
+        result: Some(DeRecResult::ok()),
         timestamp: Some(timestamp),
     };
 

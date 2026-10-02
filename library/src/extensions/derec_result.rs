@@ -27,9 +27,22 @@ pub(crate) trait DeRecResultExt {
     /// `process` span already does, and the handler span above it carries the
     /// `trace_id` that attributes it to an exchange.
     fn validate<E>(&self, non_ok: impl FnOnce(i32, String) -> E) -> Result<(), E>;
+
+    /// The result of a request the responder handled: [`StatusEnum::Ok`] and
+    /// an empty memo.
+    fn ok() -> Self
+    where
+        Self: Sized;
 }
 
 impl DeRecResultExt for derec_proto::DeRecResult {
+    fn ok() -> Self {
+        Self {
+            status: derec_proto::StatusEnum::Ok as i32,
+            memo: String::new(),
+        }
+    }
+
     fn validate<E>(&self, non_ok: impl FnOnce(i32, String) -> E) -> Result<(), E> {
         if self.status == derec_proto::StatusEnum::Ok as i32 {
             return Ok(());
@@ -41,6 +54,20 @@ impl DeRecResultExt for derec_proto::DeRecResult {
             "peer answered with a non-Ok status"
         );
         Err(non_ok(self.status, self.memo.clone()))
+    }
+}
+
+#[cfg(test)]
+mod ok_tests {
+    use super::*;
+
+    /// `ok()` is the answer `validate` accepts: Ok status, no memo.
+    #[test]
+    fn ok_is_an_ok_status_with_no_memo() {
+        let result = derec_proto::DeRecResult::ok();
+        assert_eq!(result.status, derec_proto::StatusEnum::Ok as i32);
+        assert!(result.memo.is_empty());
+        assert!(result.validate(|_, _| ()).is_ok());
     }
 }
 

@@ -8,8 +8,7 @@ use std::sync::{Arc, Mutex};
 /// migration is two lines: drop a new `.sql` file under `migrations/`
 /// and append an entry to this slice with a higher version number.
 /// `version` must be strictly increasing.
-const MIGRATIONS: &[(i64, &str, &str)] =
-    &[
+const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "0001_init", include_str!("../migrations/0001_init.sql")),
     (
         2,

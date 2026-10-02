@@ -36,6 +36,7 @@ pub(crate) mod derec_result;
 pub(crate) mod derec_share;
 pub(crate) mod message_body;
 pub(crate) mod pair_request;
+pub(crate) mod request_message;
 pub(crate) mod sender_kind;
 pub mod transport_protocol;
 pub(crate) mod verify_share_response;

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-use crate::extensions::transport_protocol::TransportProtocolExt as _;
+use crate::extensions::request_message::RequestMessageExt as _;
 use crate::primitives::sharing::SharingError;
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
@@ -230,9 +230,6 @@ pub fn produce(
         timestamp: Some(timestamp),
         secret_id,
         reply_to_transports,
-        // Helper-bound: `SHARE_ALGORITHM_VSS` implies no replica identity.
-        // Helpers know nothing about replicas — see
-        // `StoreShareRequestMessage.replicaId`.
         replica_id: None,
     };
 
@@ -373,9 +370,7 @@ pub fn extract(
 
     verify_timestamps(envelope.timestamp, request.timestamp)?;
 
-    for reply_to in &request.reply_to_transports {
-        reply_to.validate()?;
-    }
+    request.validate()?;
 
     #[cfg(feature = "logging")]
     tracing::info!("share request extracted and validated");

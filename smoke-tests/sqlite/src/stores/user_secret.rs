@@ -36,8 +36,7 @@ impl DeRecUserSecretStore for SqliteUserSecretStore {
                 },
             )
             .ok();
-        let value = row
-            .map(|(v, d, p, a)| assemble_user_secrets(v, d, p, a.map(sql_to_u64)));
+        let value = row.map(|(v, d, p, a)| assemble_user_secrets(v, d, p, a.map(sql_to_u64)));
         Box::pin(std::future::ready(Ok(value)))
     }
 

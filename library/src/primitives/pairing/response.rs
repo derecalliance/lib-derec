@@ -3,6 +3,8 @@
 
 use crate::derec_message::{DeRecMessageBuilder, current_timestamp};
 use crate::extensions::advertised_endpoints::AdvertisedEndpoints as _;
+use crate::extensions::contact_message::ContactMessageExt as _;
+use crate::extensions::derec_result::DeRecResultExt as _;
 use crate::extensions::pair_request::PairRequestMessageExt as _;
 use crate::primitives::pairing::PairingError;
 use crate::protocol_version::ProtocolVersion;
@@ -262,10 +264,7 @@ pub fn produce(
 
     let timestamp = current_timestamp();
     let response = PairResponseMessage {
-        result: Some(DeRecResult {
-            status: StatusEnum::Ok as i32,
-            memo: String::new(),
-        }),
+        result: Some(DeRecResult::ok()),
         nonce: request.nonce,
         communication_info,
         parameter_range,
@@ -361,10 +360,7 @@ pub fn produce_pre_pair(
 
     let timestamp = current_timestamp();
     let response = PrePairResponseMessage {
-        result: Some(DeRecResult {
-            status: StatusEnum::Ok as i32,
-            memo: String::new(),
-        }),
+        result: Some(DeRecResult::ok()),
         mlkem_encapsulation_key: Some(initiator_material.mlkem_encapsulation_key.clone()),
         ecies_public_key: Some(initiator_material.ecies_public_key.clone()),
         nonce: request.nonce,
@@ -451,10 +447,7 @@ pub fn produce_pre_pair_no_keys(
 
     let timestamp = current_timestamp();
     let response = PrePairResponseMessage {
-        result: Some(DeRecResult {
-            status: StatusEnum::Ok as i32,
-            memo: String::new(),
-        }),
+        result: Some(DeRecResult::ok()),
         mlkem_encapsulation_key: Some(pk.mlkem_encapsulation_key.clone()),
         ecies_public_key: Some(pk.ecies_public_key.clone()),
         nonce: request.nonce,
@@ -1125,11 +1118,7 @@ fn validate_process_pre_pair_inputs(
         .into());
     }
 
-    // Shape + mode invariants for the contact. Catches an attacker who
-    // tampered with `contact_mode` between the out-of-band exchange and
-    // this validation point, and rejects malformed contacts that carry
-    // both inline keys and a binding hash.
-    super::validate_contact_for_mode(contact_message, expected_mode)?;
+    contact_message.validate_for_mode(expected_mode)?;
 
     let mlkem_present = response
         .mlkem_encapsulation_key

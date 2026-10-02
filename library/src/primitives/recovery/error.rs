@@ -37,11 +37,6 @@ pub enum RecoveryError {
         source: derec_cryptography::vss::DerecVSSError,
     },
 
-    /// VSS reconstruction succeeded but the resulting bytes were not the
-    /// canonical `DeRecSecret` envelope, or its `secret_data` was not a
-    /// valid encoded secret. The shares almost certainly came from a
-    /// corrupted source — the math reconstructed *something*, just not a
-    /// shape the protocol can interpret.
     #[error(
         "recovered bytes were not a valid DeRecSecret envelope / encoded secret \
          — share corruption likely"

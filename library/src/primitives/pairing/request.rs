@@ -313,6 +313,11 @@ pub fn decode_contact(bytes: &[u8]) -> Result<ContactMessage, crate::Error> {
 ///
 /// - The `contact_message` is peer-provided data; validate all required fields before use.
 /// - The returned secret key material must be securely retained by the responder.
+/// - The envelope is encrypted to the contact creator's ECIES public key, taken
+///   from the contact, so only the holder of the matching secret key can read
+///   it. The responder's own freshly generated public key travels inside the
+///   request, in `ecies_public_key`, for the creator to complete the key
+///   agreement; it is not the key the envelope is encrypted to.
 ///
 /// # Example
 ///
@@ -391,11 +396,6 @@ pub fn produce(
         supported_transports: own,
     };
 
-    // Encrypt with the INITIATOR's ECIES public key (from the contact) —
-    // only the initiator's matching secret key can decrypt. The
-    // responder's own freshly-generated pubkey travels in
-    // `request.ecies_public_key` (above) for the initiator to ECDH against
-    // when finishing the pairing; it is NOT the encryption key here.
     let envelope = DeRecMessageBuilder::pairing()
         .channel_id(contact_message.channel_id.into())
         .timestamp(timestamp)
@@ -481,6 +481,7 @@ pub fn produce_pre_pair_request(
 
         crate::Error::from(PairingError::EmptyTransportUri)
     })?;
+
     validate_pre_pair_inputs(primary, contact_message)?;
 
     let timestamp = current_timestamp();
@@ -642,14 +643,6 @@ pub fn extract(
 
     verify_timestamps(envelope.timestamp, request.timestamp)?;
 
-    // Structural validation at the parse boundary, so a malformed request is
-    // refused where it enters rather than wherever it is first read. This is
-    // the same check `response::produce` runs; applying it here means the FFI
-    // and every SDK above it inherit it without repeating the logic.
-    //
-    // Endpoint *quality* is deliberately not decided here: a peer may
-    // advertise several, and `TransportPolicy::admit_peer_endpoints` skips a
-    // bad one rather than refusing the whole request.
     request.validate()?;
 
     check_parameter_range(&request, parameter_range)?;
@@ -753,9 +746,10 @@ fn validate_inputs(
     }
     transport_protocol.validate()?;
 
-    // `validate` already refused a contact naming no endpoint at all. What
-    // remains is checking that what it does name is structurally sound.
-    super::validate_contact_for_mode(contact_message, expected_mode)?;
+    // `validate_for_mode` already refused a contact naming no endpoint at
+    // all. What remains is checking that what it does name is structurally
+    // sound.
+    contact_message.validate_for_mode(expected_mode)?;
 
     for endpoint in contact_message.advertised_endpoints() {
         if endpoint.uri.trim().is_empty() {

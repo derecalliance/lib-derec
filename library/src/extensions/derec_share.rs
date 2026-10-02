@@ -23,6 +23,7 @@ impl DeRecShareExt for derec_proto::DeRecShare {
             tracing::warn!("secret_id mismatch between request and stored share");
             return Err(RecoveryError::SecretIdMismatch.into());
         }
+
         if self.version != version {
             #[cfg(feature = "logging")]
             tracing::warn!(
@@ -36,6 +37,7 @@ impl DeRecShareExt for derec_proto::DeRecShare {
             }
             .into());
         }
+
         Ok(())
     }
 }
