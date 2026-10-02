@@ -432,6 +432,7 @@ type peer struct {
 	shareStore   *memShareStore
 	channelStore *memChannelStore
 	secretStore  *memSecretStore
+	userSecrets  *memUserSecretStore
 }
 
 func newPeer(label, uri string, threshold uint32) *peer {
@@ -447,12 +448,11 @@ func newPeerWithReplicaID(label, uri string, threshold uint32, replicaID *uint64
 	transport := newMemTransport()
 
 	cfg := protocol.Config{
-		SecretID:             protocolSecretID,
-		OwnTransportURI:      uri,
-		OwnTransportProtocol: int32(derecpb.Protocol_HTTPS),
-		Threshold:            threshold,
-		KeepVersionsCount:    3,
-		ReplicaID:            replicaID,
+		SecretID:          protocolSecretID,
+		OwnTransports:     []protocol.TransportProtocolParam{{URI: uri, Protocol: int32(derecpb.Protocol_HTTPS)}},
+		Threshold:         threshold,
+		KeepVersionsCount: 3,
+		ReplicaID:         replicaID,
 	}
 	p, err := protocol.New(channelStore, shareStore, secretStore, userSecretStore, stateStore, transport, cfg)
 	must(err, fmt.Sprintf("protocol.New(%s)", label))
@@ -465,6 +465,7 @@ func newPeerWithReplicaID(label, uri string, threshold uint32, replicaID *uint64
 		shareStore:   shareStore,
 		channelStore: channelStore,
 		secretStore:  secretStore,
+		userSecrets:  userSecretStore,
 	}
 }
 
@@ -797,7 +798,13 @@ func runProtocol() {
 
 	storedFor := map[string]bool{}
 	confirmedCount := 0
+	storeShareActions := 0
 	for _, ev := range shareEvents {
+		if ev.Type == protocol.EventTypeActionRequired && ev.ActionKind == protocol.ActionKindStoreShare {
+			storeShareActions++
+			assertTrue(ev.ShareSize != nil && *ev.ShareSize > 0, "StoreShare ActionRequired must carry a positive ShareSize, got %+v", ev)
+			assertTrue(ev.TraceID != "", "StoreShare ActionRequired must carry a TraceID, got %+v", ev)
+		}
 		switch ev.Type {
 		case protocol.EventTypeShareStored:
 			storedFor[ev.ChannelID] = true
@@ -807,6 +814,7 @@ func runProtocol() {
 	}
 	assertTrue(storedFor[strconv.FormatUint(channelA, 10)], "expected a ShareStored event for channel-a (%d)", channelA)
 	assertTrue(storedFor[strconv.FormatUint(channelB, 10)], "expected a ShareStored event for channel-b (%d)", channelB)
+	assertTrue(storeShareActions == 2, "expected 2 StoreShare ActionRequired events (one per helper), got %d", storeShareActions)
 	assertTrue(confirmedCount == 2, "expected 2 ShareConfirmed events (one per helper), got %d", confirmedCount)
 
 	for _, check := range []struct {
@@ -857,11 +865,10 @@ func runExpiredChannelCleanup() {
 	transport := newMemTransport()
 
 	cfg := protocol.Config{
-		SecretID:             protocolSecretID,
-		OwnTransportURI:      "https://cleanup.example.com",
-		OwnTransportProtocol: int32(derecpb.Protocol_HTTPS),
-		Threshold:            2,
-		KeepVersionsCount:    3,
+		SecretID:          protocolSecretID,
+		OwnTransports:     []protocol.TransportProtocolParam{{URI: "https://cleanup.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+		Threshold:         2,
+		KeepVersionsCount: 3,
 		Timeouts: &protocol.Timeouts{
 			ExpiredChannels: &protocol.RemoveExpiredChannelsPolicy{
 				Enabled:       false,
@@ -884,25 +891,24 @@ func runExpiredChannelCleanup() {
 	fmt.Println("Protocol expired-channel cleanup test passed.")
 }
 
-// runUnsafeHTTP proves the unsafe_http setting survives the JSON config
-// boundary and actually changes behaviour.
+// runUnsafeConnection proves the unsafe_connection setting survives the JSON
+// config boundary and actually changes behaviour.
 //
 // Worth its own test because the failure mode is silent: the Rust side reads
 // the field with serde's `default`, so a name mismatch between this SDK and
 // the FFI config would deserialize as `false` and the setting would appear to
 // do nothing — with every other test still passing. Exactly the shape of the
 // bug that made three enum variants `undefined` in the JS shims.
-func runUnsafeHTTP() {
-	fmt.Println("=== Protocol unsafe_http config test ===")
+func runUnsafeConnection() {
+	fmt.Println("=== Protocol unsafe_connection config test ===")
 
 	build := func(uri string, allow bool) error {
 		cfg := protocol.Config{
-			SecretID:             protocolSecretID,
-			OwnTransportURI:      uri,
-			OwnTransportProtocol: int32(derecpb.Protocol_HTTPS),
-			Threshold:            2,
-			KeepVersionsCount:    3,
-			UnsafeHTTP:           &allow,
+			SecretID:          protocolSecretID,
+			OwnTransports:     []protocol.TransportProtocolParam{{URI: uri, Protocol: int32(derecpb.Protocol_HTTPS)}},
+			Threshold:         2,
+			KeepVersionsCount: 3,
+			UnsafeConnection:  &allow,
 		}
 		p, err := protocol.New(
 			newMemChannelStore(), newMemShareStore(), newMemSecretStore(),
@@ -916,21 +922,21 @@ func runUnsafeHTTP() {
 	}
 
 	// Loopback is free — a local dev server needs no configuration.
-	must(build("http://127.0.0.1:8080", false), "loopback plaintext with unsafe_http=false")
-	fmt.Println("  loopback http accepted with unsafe_http=false  ✓")
+	must(build("http://127.0.0.1:8080", false), "loopback plaintext with unsafe_connection=false")
+	fmt.Println("  loopback http accepted with unsafe_connection=false  ✓")
 
 	// A LAN address is not, until asked for. If the field name did not match
 	// the FFI config, this would build and the assertion would fail here.
 	if err := build("http://192.168.1.42:8080", false); err == nil {
-		panic("LAN plaintext must be refused when unsafe_http=false — " +
+		panic("LAN plaintext must be refused when unsafe_connection=false — " +
 			"the setting is not reaching the library")
 	}
-	fmt.Println("  LAN http refused with unsafe_http=false  ✓")
+	fmt.Println("  LAN http refused with unsafe_connection=false  ✓")
 
-	must(build("http://192.168.1.42:8080", true), "LAN plaintext with unsafe_http=true")
-	fmt.Println("  LAN http accepted with unsafe_http=true  ✓")
+	must(build("http://192.168.1.42:8080", true), "LAN plaintext with unsafe_connection=true")
+	fmt.Println("  LAN http accepted with unsafe_connection=true  ✓")
 
-	fmt.Println("Protocol unsafe_http config test passed.")
+	fmt.Println("Protocol unsafe_connection config test passed.")
 }
 
 // runConfigSurface exercises the config knobs and validation rules an
@@ -943,11 +949,10 @@ func runConfigSurface() {
 
 	base := func() protocol.Config {
 		return protocol.Config{
-			SecretID:             protocolSecretID,
-			OwnTransportURI:      "https://owner.example.com",
-			OwnTransportProtocol: int32(derecpb.Protocol_HTTPS),
-			Threshold:            2,
-			KeepVersionsCount:    3,
+			SecretID:          protocolSecretID,
+			OwnTransports:     []protocol.TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+			Threshold:         2,
+			KeepVersionsCount: 3,
 		}
 	}
 	build := func(cfg protocol.Config) (*protocol.DeRecProtocol, error) {
@@ -996,13 +1001,8 @@ func runConfigSurface() {
 	must(err, "build with one endpoint per protocol")
 	fmt.Println("  distinct protocols accepted  ✓")
 
-	// SetOwnTransport re-points one protocol and leaves the other alone;
-	// SetOwnTransports replaces the whole set. Both are refused the same way
-	// the builder is when they would produce a duplicate.
-	must(p.SetOwnTransport("https://moved.example", int32(derecpb.Protocol_HTTPS)),
-		"SetOwnTransport re-points HTTPS")
-	fmt.Println("  SetOwnTransport re-points a single protocol  ✓")
-
+	// SetOwnTransports replaces the whole set, and is refused the same way
+	// the builder is when it would produce a duplicate.
 	must(p.SetOwnTransports([]protocol.TransportProtocolParam{
 		{URI: "https://only.example", Protocol: int32(derecpb.Protocol_HTTPS)},
 	}), "SetOwnTransports replaces the set")
@@ -1015,6 +1015,14 @@ func runConfigSurface() {
 		panic("SetOwnTransports must apply the same one-per-protocol rule as the builder")
 	}
 	fmt.Println("  SetOwnTransports refuses a duplicate protocol  ✓")
+
+	// An empty list is refused by the core, which the SDK forwards as is.
+	var emptyErr *derec.Error
+	if err := p.SetOwnTransports([]protocol.TransportProtocolParam{}); !errors.As(err, &emptyErr) ||
+		emptyErr.Code != derec.CodeInvalidInput {
+		panic(fmt.Sprintf("SetOwnTransports with no endpoints must fail with CodeInvalidInput, got %v", err))
+	}
+	fmt.Println("  SetOwnTransports refuses an empty list  ✓")
 	p.Close()
 
 	// The error constants are a mirror of the Rust DEREC_CODE_* values.
@@ -1083,14 +1091,26 @@ func runUnconfirmedDestination() {
 	_, err = destination.proto.Start(protocol.FlowKindReplicaDiscovery, nil)
 	must(err, "destination.Start(ReplicaDiscovery)")
 
-	var installed bool
+	var installed *protocol.Event
 	var seen []string
 	for _, ev := range pump(destination, source) {
 		seen = append(seen, ev.Type)
-		installed = installed || ev.Type == protocol.EventTypeReplicaSecretInstalled
+		if ev.Type == protocol.EventTypeReplicaSecretInstalled {
+			installed = &ev
+		}
 	}
-	assertTrue(installed, "after confirming, ReplicaDiscovery must install the copy, got %v", seen)
+	assertTrue(installed != nil, "after confirming, ReplicaDiscovery must install the copy, got %v", seen)
 	fmt.Println("  destination pulled the copy with ReplicaDiscovery after confirming  ✓")
+
+	sourceIDText := strconv.FormatUint(sourceID, 10)
+	assertTrue(installed.AuthorReplicaID != nil && *installed.AuthorReplicaID == sourceIDText,
+		"ReplicaSecretInstalled.AuthorReplicaID must name the publisher %s, got %v", sourceIDText, installed.AuthorReplicaID)
+	held, ok, err := destination.userSecrets.LoadLatest(protocolSecretID)
+	must(err, "destination.userSecrets.LoadLatest")
+	assertTrue(ok, "the destination must persist the installed user secrets")
+	assertTrue(held.AuthorReplicaID != nil && *held.AuthorReplicaID == sourceID,
+		"the destination's user-secret store must record author %d, got %v", sourceID, held.AuthorReplicaID)
+	fmt.Println("  installed copy names the publisher as author, in the event and in the store  ✓")
 
 	fmt.Println("Protocol unconfirmed replica destination test passed.")
 	fmt.Println()

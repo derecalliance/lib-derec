@@ -206,24 +206,14 @@ type UpdateChannelInfoParams struct {
 	// (including an empty one) sets it, matching the destructive-replace
 	// semantics of SetCommunicationInfo.
 	CommunicationInfo map[string]string
-	// TransportProtocol replaces the target(s)' view of this node's
-	// transport endpoint. nil leaves it untouched.
-	//
-	// Deprecated: superseded by OwnTransports, which carries every endpoint
-	// rather than one. Scheduled for removal in v0.0.5. OwnTransports takes
-	// precedence when both are set.
-	TransportProtocol *TransportProtocolParam
 	// OwnTransports replaces the target(s)' view of every endpoint this node
-	// serves, in its own preference order. Empty leaves them untouched. The
-	// first entry also fills the deprecated singular field so a peer
-	// predating the list still learns the new address.
+	// serves, in its own preference order. Empty leaves them untouched.
 	OwnTransports []TransportProtocolParam
 }
 
 type updateChannelInfoParamsWire struct {
 	Target            Target                       `json:"target"`
 	CommunicationInfo *map[string]string           `json:"communication_info,omitempty"`
-	TransportProtocol *transportProtocolParamWire  `json:"transport_protocol,omitempty"`
 	OwnTransports     []transportProtocolParamWire `json:"own_transports,omitempty"`
 }
 
@@ -312,13 +302,6 @@ func marshalFlowParams(flowKind FlowKind, params any) ([]byte, error) {
 			for i, t := range ucip.OwnTransports {
 				w.OwnTransports[i] = transportProtocolParamWire{URI: t.URI, Protocol: t.Protocol}
 			}
-			// The first entry also fills the deprecated singular field.
-			w.TransportProtocol = &w.OwnTransports[0]
-		} else if ucip.TransportProtocol != nil {
-			w.TransportProtocol = &transportProtocolParamWire{
-				URI:      ucip.TransportProtocol.URI,
-				Protocol: ucip.TransportProtocol.Protocol,
-			}
 		}
 		return json.Marshal(w)
 	case FlowKindUnpairReplica:
@@ -395,6 +378,11 @@ func (p *DeRecProtocol) Reject(action []byte, status int32, memo string) error {
 // Secret — the same typed snapshot carried by SecretRecoveredEvent.Secret
 // (and ReplicaSecretReceivedEvent.Secret); pass it verbatim along with the
 // version it was recovered at.
+//
+// When channels already exist at ids the recovered Secret uses, Restore
+// fails with a *derec.Error whose Code is derec.CodeRestoreConflict and
+// whose ConflictingChannelIDs lists exactly those ids, so the application
+// can clear them and retry.
 func (p *DeRecProtocol) Restore(secret Secret, version uint32) ([]Event, error) {
 	if p.closed {
 		return nil, errors.New("protocol: Restore: protocol is closed")

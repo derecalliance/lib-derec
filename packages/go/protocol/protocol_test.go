@@ -506,11 +506,10 @@ func TestNew_ConstructsRealProtocolHandleAndCloses(t *testing.T) {
 	channel, share, secret, userSecret, state, transport := newTestStores()
 
 	cfg := Config{
-		SecretID:             1,
-		OwnTransportURI:      "https://owner.example.com",
-		OwnTransportProtocol: int32(derecpb.Protocol_HTTPS),
-		Threshold:            2,
-		KeepVersionsCount:    3,
+		SecretID:          1,
+		OwnTransports:     []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+		Threshold:         2,
+		KeepVersionsCount: 3,
 	}
 
 	p, err := New(channel, share, secret, userSecret, state, transport, cfg)
@@ -540,18 +539,16 @@ func TestNew_TwoInstancesBothConstructAndClose(t *testing.T) {
 	channel2, share2, secret2, userSecret2, state2, transport2 := newTestStores()
 
 	cfg1 := Config{
-		SecretID:             1,
-		OwnTransportURI:      "https://owner-a.example.com",
-		OwnTransportProtocol: int32(derecpb.Protocol_HTTPS),
-		Threshold:            2,
-		KeepVersionsCount:    3,
+		SecretID:          1,
+		OwnTransports:     []TransportProtocolParam{{URI: "https://owner-a.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+		Threshold:         2,
+		KeepVersionsCount: 3,
 	}
 	cfg2 := Config{
-		SecretID:             2,
-		OwnTransportURI:      "https://owner-b.example.com",
-		OwnTransportProtocol: int32(derecpb.Protocol_HTTPS),
-		Threshold:            2,
-		KeepVersionsCount:    3,
+		SecretID:          2,
+		OwnTransports:     []TransportProtocolParam{{URI: "https://owner-b.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+		Threshold:         2,
+		KeepVersionsCount: 3,
 	}
 
 	p1, err := New(channel1, share1, secret1, userSecret1, state1, transport1, cfg1)
@@ -576,7 +573,7 @@ func TestNew_TwoInstancesBothConstructAndClose(t *testing.T) {
 
 func TestNew_RequiresEveryStoreAndTransport(t *testing.T) {
 	channel, share, secret, userSecret, state, transport := newTestStores()
-	cfg := Config{SecretID: 1, OwnTransportURI: "https://owner.example.com"}
+	cfg := Config{SecretID: 1, OwnTransports: []TransportProtocolParam{{URI: "https://owner.example.com"}}}
 
 	cases := []struct {
 		name string
@@ -612,17 +609,16 @@ func TestNew_RequiresEveryStoreAndTransport(t *testing.T) {
 
 // newTestProtocol builds a real protocol instance backed by in-memory store
 // doubles, for exercising the M3 Task 6 handle-method bindings
-// (GetFingerprint, VerifyFingerprint, SetOwnTransport,
+// (GetFingerprint, VerifyFingerprint, SetOwnTransports,
 // SetCommunicationInfo).
 func newTestProtocol(t *testing.T) *DeRecProtocol {
 	t.Helper()
 	channel, share, secret, userSecret, state, transport := newTestStores()
 	cfg := Config{
-		SecretID:             1,
-		OwnTransportURI:      "https://owner.example.com",
-		OwnTransportProtocol: int32(derecpb.Protocol_HTTPS),
-		Threshold:            2,
-		KeepVersionsCount:    3,
+		SecretID:          1,
+		OwnTransports:     []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+		Threshold:         2,
+		KeepVersionsCount: 3,
 	}
 	p, err := New(channel, share, secret, userSecret, state, transport, cfg)
 	if err != nil {
@@ -632,23 +628,25 @@ func newTestProtocol(t *testing.T) *DeRecProtocol {
 	return p
 }
 
-// TestSetOwnTransport_ValidHTTPSURI covers the happy path: a well-formed
+// TestSetOwnTransports_ValidHTTPSURI covers the happy path: a well-formed
 // https URI is accepted and stored without contacting any peer.
-func TestSetOwnTransport_ValidHTTPSURI(t *testing.T) {
+func TestSetOwnTransports_ValidHTTPSURI(t *testing.T) {
 	p := newTestProtocol(t)
-	if err := p.SetOwnTransport("https://owner-new.example.com", int32(derecpb.Protocol_HTTPS)); err != nil {
-		t.Fatalf("SetOwnTransport: %v", err)
+	transports := []TransportProtocolParam{{URI: "https://owner-new.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}}
+	if err := p.SetOwnTransports(transports); err != nil {
+		t.Fatalf("SetOwnTransports: %v", err)
 	}
 }
 
-// TestSetOwnTransport_ClosedProtocol asserts the closed-instance guard
+// TestSetOwnTransports_ClosedProtocol asserts the closed-instance guard
 // rejects the call instead of touching a freed handle.
-func TestSetOwnTransport_ClosedProtocol(t *testing.T) {
+func TestSetOwnTransports_ClosedProtocol(t *testing.T) {
 	p := newTestProtocol(t)
 	if err := p.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if err := p.SetOwnTransport("https://owner-new.example.com", int32(derecpb.Protocol_HTTPS)); err == nil {
+	transports := []TransportProtocolParam{{URI: "https://owner-new.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}}
+	if err := p.SetOwnTransports(transports); err == nil {
 		t.Fatal("expected an error on a closed protocol")
 	}
 }
@@ -741,5 +739,25 @@ func TestSetCommunicationInfo_ClosedProtocol(t *testing.T) {
 	}
 	if err := p.SetCommunicationInfo(map[string]string{"name": "Owner"}); err == nil {
 		t.Fatal("expected an error on a closed protocol")
+	}
+}
+
+// TestNew_WithGeneratedReplicaID asserts a protocol builds with a replica id
+// minted by derec.GenerateReplicaID.
+func TestNew_WithGeneratedReplicaID(t *testing.T) {
+	channel, share, secret, userSecret, state, transport := newTestStores()
+	replicaID := derec.GenerateReplicaID()
+	p, err := New(channel, share, secret, userSecret, state, transport, Config{
+		SecretID:          1,
+		OwnTransports:     []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+		Threshold:         2,
+		KeepVersionsCount: 3,
+		ReplicaID:         &replicaID,
+	})
+	if err != nil {
+		t.Fatalf("New with generated ReplicaID %d: %v", replicaID, err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 }

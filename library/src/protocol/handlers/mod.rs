@@ -186,8 +186,6 @@ pub(in crate::protocol) async fn handle_pairing<S: StoreSet>(
 ///
 /// Only request bodies appear: nothing is owed to a peer that was itself
 /// answering us, and the pairing flows carry their own accept/reject surface.
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 enum FailureResponder {
     StoreShare(Box<derec_proto::StoreShareRequestMessage>),
     VerifyShare(Box<derec_proto::VerifyShareRequestMessage>),

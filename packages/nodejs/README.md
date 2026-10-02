@@ -227,7 +227,7 @@ The orchestrator handles the whole chain automatically:
   `ActionRequired` event with `action_kind: "PrePair"`. Call
   `protocol.accept(action)` to publish the keys (the library builds the
   response and routes it), or `protocol.reject(action, status, memo)` to
-  refuse.
+  refuse — `status` is a `StatusEnum` value such as `StatusEnum.Rejected`.
 - **Scanner** — `protocol.start(FlowKind.Pairing, { kind, contact })` kicks
   off the plaintext PrePair leg. `start()` returns a `DeRecEvent[]`
   containing one `PairingStarted { channel_id, kind }` event that
@@ -467,13 +467,13 @@ Two cross-cutting metadata fields appear on every channel-mode exchange:
   end-to-end (random token on every outbound request, echo on every
   response). Primitive-only callers can manipulate it directly via
   `envelope.apply_trace_id(bytes, traceId)` and `envelope.read_trace_id(bytes)`.
-- **`replyTo`** — optional `TransportProtocol` on request bodies, telling
-  the responder to route this exchange's response to an alternate endpoint.
+- **`replyTo`** — optional `TransportProtocol` list on request bodies, telling
+  the responder to route this exchange's response to alternate endpoints.
   Set it per call (every `primitives.*.request.produce` takes a trailing
   `reply_to` arg) or protocol-wide with the `autoReplyTo` constructor flag
-  on `DeRecProtocol` (stamps `replyTo = ownTransport` on every outbound
-  request). Excludes pairing and `UpdateChannelInfo`, which already carry
-  their own `transportProtocol` field.
+  on `DeRecProtocol` (stamps this node's own transports into `replyTo` on
+  every outbound request). Excludes pairing and `UpdateChannelInfo`, which
+  already carry their own `supportedTransports` field.
 
 The motivating case for `replyTo` is replicas: when Replica A sends a
 request on a channel the helper paired with sibling Replica B, the
@@ -560,8 +560,7 @@ that you can retire as soon as the PrePair leg completes.
 
 The recommended pattern is: pair on the ephemeral URI, then — as soon
 as the pairing completes on the contact creator side — call
-`setOwnTransports` with the permanent endpoint (`setOwnTransport` is
-deprecated and removed at 0.0.5) and start an
+`setOwnTransports` with the permanent endpoint and start an
 `UpdateChannelInfo` flow against the peer to announce the swap. Once
 the peer acknowledges, retire the ephemeral URI. This keeps the
 plaintext PrePair window tight while letting subsequent traffic ride

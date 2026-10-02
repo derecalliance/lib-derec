@@ -24,7 +24,7 @@ func main() {
 	runProtocol()
 	runEveryContactModePairs()
 	runUnconfirmedDestination()
-	runUnsafeHTTP()
+	runUnsafeConnection()
 	runConfigSurface()
 
 	fmt.Println()

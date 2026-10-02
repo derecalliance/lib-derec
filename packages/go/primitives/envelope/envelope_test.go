@@ -23,7 +23,7 @@ func TestTraceIDRoundTrip(t *testing.T) {
 	const traceID = uint64(0xDEADBEEF12345678)
 	key := sharedKey()
 
-	original, err := verification.Request.Produce(channelID, secretID, version, key)
+	original, err := verification.Request.Produce(channelID, secretID, version, key, nil)
 	if err != nil {
 		t.Fatalf("produce: %v", err)
 	}

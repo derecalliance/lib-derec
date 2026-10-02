@@ -22,11 +22,13 @@ internal static class Primitives
         RunPairingFlowTest();
         RunContactOfferListRoundTripTest();
         RunPairingFlowHashedKeysTest();
+        RunPairingFlowNoKeysTest();
         RunSharingFlowTest();
         RunVerificationFlowTest();
         RunRecoveryFlowTest();
         RunDiscoveryFlowTest();
         RunUnpairingFlowTest();
+        RunUnpairingNonAsciiMemoTest();
         RunEnvelopeAndReplyToTest();
     }
 
@@ -73,12 +75,6 @@ internal static class Primitives
         if (contact.ContactMessage.AdvertisedEndpoints().Count != offered.Length)
             throw new InvalidOperationException(
                 "Contact offer-list test failed: AdvertisedEndpoints() did not return the offer list.");
-
-        // The deprecated singular field carries the first entry, for peers
-        // predating the list.
-        if (contact.ContactMessage.TransportProtocol.Uri != offered[0].Uri)
-            throw new InvalidOperationException(
-                "Contact offer-list test failed: singular transportProtocol is not the first offer.");
 
         // Encode side: Produce serializes the record back to wire bytes and the
         // library echoes the contact it was handed. Both entries must survive.
@@ -342,6 +338,137 @@ internal static class Primitives
         Console.WriteLine("Pairing flow test (HASHED_KEYS + PrePair) passed.");
     }
 
+    private static void RunPairingFlowNoKeysTest()
+    {
+        Console.WriteLine("=== Pairing flow test (NO_KEYS + PrePair + fingerprint) ===");
+
+        ulong channelId = 4;
+        ulong nonce = 424242;
+
+        // Alice creates a NO_KEYS contact: no keys, no commitment, only the
+        // nonce authenticates the PrePair request that follows.
+        var aliceContact = Pairing.Request.CreateContact(
+            channelId,
+            ContactMode.NoKeys,
+            new[] { new TransportProtocol("https://example.com/alice/ephemeral") },
+            nonce
+        );
+
+        if (aliceContact.ContactMessage.ContactMode != ContactMode.NoKeys)
+            throw new InvalidOperationException("NO_KEYS contact must advertise contact_mode = NoKeys.");
+        if (aliceContact.ContactMessage.Nonce != nonce)
+            throw new InvalidOperationException("NO_KEYS contact must carry the explicit nonce.");
+        if (aliceContact.ContactMessage.MlkemEncapsulationKey is not null
+            || aliceContact.ContactMessage.EciesPublicKey is not null
+            || aliceContact.ContactMessage.ContactBindingHash is not null)
+            throw new InvalidOperationException("NO_KEYS contact must carry neither keys nor a binding hash.");
+        if (aliceContact.SecretKeyMaterial.Length != 0)
+            throw new InvalidOperationException("NO_KEYS contact must not produce secret key material.");
+
+        // Bob (the scanner) asks for keys.
+        var prePairRequestEnvelope = Pairing.Request.ProducePrePair(
+            new[] { new TransportProtocol("https://example.com/helper/ephemeral") },
+            aliceContact.ContactMessage
+        );
+
+        // Alice decodes the request and matches its nonce against the contact
+        // she issued before generating any keys.
+        var extractedPrePairReq = Pairing.Request.ExtractPrePair(prePairRequestEnvelope.Envelope);
+        if (extractedPrePairReq.ChannelId != channelId)
+            throw new InvalidOperationException("NO_KEYS PrePair request envelope must route to the contact's channel.");
+        var requestNonce = Proto.PrePairRequestMessage.Parser
+            .ParseFrom(extractedPrePairReq.RequestProtoBytes).Nonce;
+        if (requestNonce != nonce)
+            throw new InvalidOperationException($"NO_KEYS PrePair request nonce mismatch (got {requestNonce}, issued {nonce}).");
+
+        var prePairResponse = Pairing.Response.ProducePrePairNoKeys(
+            channelId,
+            extractedPrePairReq.RequestProtoBytes
+        );
+        if (prePairResponse.SecretKeyMaterial.Length == 0)
+            throw new InvalidOperationException("ProducePrePairNoKeys must return secret key material.");
+        var aliceSecretKeyMaterial = prePairResponse.SecretKeyMaterial;
+
+        // Bob decodes and accepts the freshly generated keys.
+        var extractedPrePairResp = Pairing.Response.ExtractPrePair(prePairResponse.Envelope);
+        if (extractedPrePairResp.ChannelId != channelId)
+            throw new InvalidOperationException("NO_KEYS PrePair response envelope must route to the contact's channel.");
+
+        var accepted = Pairing.Response.ProcessPrePairNoKeys(
+            aliceContact.ContactMessage,
+            extractedPrePairResp.ResponseProtoBytes
+        );
+        if (accepted.MlkemEncapsulationKey.Length == 0 || accepted.EciesPublicKey.Length == 0)
+            throw new InvalidOperationException("ProcessPrePairNoKeys must return Alice's public keys.");
+        if (accepted.Nonce != nonce)
+            throw new InvalidOperationException("ProcessPrePairNoKeys must echo the contact's nonce.");
+        Console.WriteLine($"  PrePair accepted (mlkem={accepted.MlkemEncapsulationKey.Length}B, ecies={accepted.EciesPublicKey.Length}B, nonce echoed)");
+
+        // From here the flow continues exactly as HASHED_KEYS does after
+        // ProcessPrePair.
+        var filledInContact = aliceContact.ContactMessage with
+        {
+            ContactMode = ContactMode.InlineKeys,
+            MlkemEncapsulationKey = accepted.MlkemEncapsulationKey,
+            EciesPublicKey = accepted.EciesPublicKey,
+            ContactBindingHash = null,
+        };
+
+        var pairRequest = Pairing.Request.Produce(
+            Pairing.SenderKind.Helper,
+            new[] { new TransportProtocol("https://example.com/helper") },
+            filledInContact
+        );
+
+        var extractedRequest = Pairing.Request.Extract(pairRequest.Envelope, aliceSecretKeyMaterial);
+        if (extractedRequest.ChannelId != channelId)
+            throw new InvalidOperationException("NO_KEYS pairing: channel_id mismatch on extract.");
+
+        var produced = Pairing.Response.Produce(
+            channelId,
+            extractedRequest.RequestProtoBytes,
+            aliceSecretKeyMaterial
+        );
+
+        var extractedResponse = Pairing.Response.Extract(produced.Envelope, pairRequest.SecretKeyMaterial);
+        var processed = Pairing.Response.Process(
+            pairRequest.InitiatorContactMessage,
+            extractedResponse.ResponseProtoBytes,
+            pairRequest.SecretKeyMaterial
+        );
+
+        if (produced.SharedKey.Length == 0 || !produced.SharedKey.SequenceEqual(processed.SharedKey))
+            throw new InvalidOperationException("NO_KEYS pairing: shared keys do not match.");
+        if (produced.ChannelId != processed.ChannelId)
+            throw new InvalidOperationException($"NO_KEYS pairing: rekeyed channel id mismatch (produce={produced.ChannelId} process={processed.ChannelId}).");
+        Console.WriteLine($"  shared keys match ({produced.SharedKey.Length}B)");
+
+        // Out-of-band confirmation: both sides derive the same fingerprint.
+        var aliceFingerprint = Pairing.Fingerprint(produced.SharedKey);
+        var bobFingerprint = Pairing.Fingerprint(processed.SharedKey);
+        if (string.IsNullOrEmpty(aliceFingerprint))
+            throw new InvalidOperationException("NO_KEYS pairing: empty fingerprint.");
+        if (aliceFingerprint != bobFingerprint)
+            throw new InvalidOperationException($"NO_KEYS pairing: fingerprints differ ({aliceFingerprint} vs {bobFingerprint}).");
+        Console.WriteLine($"  fingerprints match: {aliceFingerprint}");
+
+        // Negative: a 31-byte key is not a shared key.
+        DeRecException? caught = null;
+        try
+        {
+            Pairing.Fingerprint(new byte[31]);
+        }
+        catch (DeRecException e)
+        {
+            caught = e;
+        }
+        if (caught is null)
+            throw new InvalidOperationException("Fingerprint must refuse a 31-byte key.");
+        Console.WriteLine($"  Fingerprint(31B) threw category={caught.Category} code={caught.Code} ✓");
+
+        Console.WriteLine("Pairing flow test (NO_KEYS + PrePair + fingerprint) passed.");
+    }
+
     private static void RunSharingFlowTest()
     {
         Console.WriteLine("=== Sharing flow test ===");
@@ -576,6 +703,24 @@ internal static class Primitives
             throw new InvalidOperationException("Discovery test failed: second entry mismatch.");
 
         Console.WriteLine("Discovery flow test passed.");
+    }
+
+    /// <summary>
+    /// The memo crosses the FFI as UTF-8 in both directions, so non-ASCII text
+    /// survives produce → extract unchanged.
+    /// </summary>
+    private static void RunUnpairingNonAsciiMemoTest()
+    {
+        Console.WriteLine("=== Unpairing non-ASCII memo test ===");
+
+        byte[] sharedKey = Make32(0x23);
+        const string Memo = "adiós — ✓";
+
+        var extracted = Unpairing.Request.Extract(Unpairing.Request.Produce(7, Memo, sharedKey), sharedKey);
+        if (extracted.Memo != Memo)
+            throw new InvalidOperationException($"non-ASCII memo must round-trip unchanged; got '{extracted.Memo}'");
+
+        Console.WriteLine("Unpairing non-ASCII memo test passed.");
     }
 
     private static void RunUnpairingFlowTest()

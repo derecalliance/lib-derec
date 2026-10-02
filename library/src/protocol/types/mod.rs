@@ -806,6 +806,17 @@ pub struct UserSecrets {
     /// `None` when this `secret_id` has no replica setup (or before
     /// the first sharing round commits).
     pub replicas: Option<Replicas>,
+    /// The replica-group member that published this version.
+    ///
+    /// Set on every publish, whatever changed — the secrets or only the
+    /// roster — and carried to every other member with the version, so each
+    /// one knows who wrote what it holds. A replica compares it with the
+    /// author of an incoming copy at the same version: the same author is a
+    /// re-send, a different one is a conflict.
+    ///
+    /// `None` when the version was not published by a group member: an owner
+    /// with no replica identity, or a snapshot rebuilt by recovery.
+    pub author_replica_id: Option<u64>,
 }
 
 /// A single helper's share of the current secret — wire-pairs a
@@ -880,6 +891,15 @@ pub struct ReplicaSecretPayload {
     /// intended.
     #[prost(uint32, tag = "4")]
     pub version: u32,
+    /// The member that published `version`.
+    ///
+    /// Like `version`, carried in the payload because the enclosing message
+    /// cannot say it: a push's `replicaId` is the publisher, but a catch-up
+    /// answer's `replicaId` is whichever member answered, which need not be
+    /// the one that wrote the version it serves. Absent when the serving
+    /// member's snapshot records no author.
+    #[prost(uint64, optional, tag = "5")]
+    pub author_replica_id: ::core::option::Option<u64>,
 }
 
 /// Kind of secret material stored by [`crate::protocol::DeRecSecretStore`].

@@ -81,25 +81,10 @@ type UnpairRequestMessage struct {
 	// - replay detection (in combination with sequence numbers)
 	// - timeout handling
 	Timestamp *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
-	// Ephemeral transport endpoint at which the requester wants to receive
-	// the response to *this exchange*, overriding the channel's stored peer
-	// endpoint for this round-trip only.
-	//
-	// See `StoreShareRequestMessage.replyTo` for full semantics.
-	//
-	// Superseded by `replyToTransports`, which carries every endpoint rather
-	// than one. Kept, and still populated with the list's first entry, so
-	// implementations predating that field still receive a reply.
-	// **Scheduled for removal in v0.0.5.** Reading this field directly is now
-	// incorrect — resolve it against `replyToTransports`.
-	//
-	// Deprecated: Marked as deprecated in unpair.proto.
-	ReplyTo *TransportProtocol `protobuf:"bytes,3,opt,name=replyTo,proto3,oneof" json:"replyTo,omitempty"`
 	// Every ephemeral endpoint the requester wants this exchange's response
 	// delivered to, in its own preference order.
 	//
-	// See `StoreShareRequestMessage.replyToTransports` for full semantics,
-	// including why this is a new tag rather than a widened `replyTo`.
+	// See `StoreShareRequestMessage.replyToTransports` for full semantics.
 	ReplyToTransports []*TransportProtocol `protobuf:"bytes,5,rep,name=replyToTransports,proto3" json:"replyToTransports,omitempty"`
 	// Identity of the replica-group member that initiated this unpair.
 	//
@@ -158,14 +143,6 @@ func (x *UnpairRequestMessage) GetMemo() string {
 func (x *UnpairRequestMessage) GetTimestamp() *timestamppb.Timestamp {
 	if x != nil {
 		return x.Timestamp
-	}
-	return nil
-}
-
-// Deprecated: Marked as deprecated in unpair.proto.
-func (x *UnpairRequestMessage) GetReplyTo() *TransportProtocol {
-	if x != nil {
-		return x.ReplyTo
 	}
 	return nil
 }
@@ -270,17 +247,14 @@ var File_unpair_proto protoreflect.FileDescriptor
 
 const file_unpair_proto_rawDesc = "" +
 	"\n" +
-	"\funpair.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\xdc\x02\n" +
+	"\funpair.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\x87\x02\n" +
 	"\x14UnpairRequestMessage\x12\x12\n" +
 	"\x04memo\x18\x01 \x01(\tR\x04memo\x128\n" +
-	"\ttimestamp\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12V\n" +
-	"\areplyTo\x18\x03 \x01(\v23.org.derecalliance.derec.protobuf.TransportProtocolB\x02\x18\x01H\x00R\areplyTo\x88\x01\x01\x12a\n" +
+	"\ttimestamp\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12a\n" +
 	"\x11replyToTransports\x18\x05 \x03(\v23.org.derecalliance.derec.protobuf.TransportProtocolR\x11replyToTransports\x12!\n" +
-	"\treplicaId\x18\x04 \x01(\x04H\x01R\treplicaId\x88\x01\x01B\n" +
+	"\treplicaId\x18\x04 \x01(\x04H\x00R\treplicaId\x88\x01\x01B\f\n" +
 	"\n" +
-	"\b_replyToB\f\n" +
-	"\n" +
-	"_replicaId\"\x98\x01\n" +
+	"_replicaIdJ\x04\b\x03\x10\x04R\areplyTo\"\x98\x01\n" +
 	"\x15UnpairResponseMessage\x12E\n" +
 	"\x06result\x18\x01 \x01(\v2-.org.derecalliance.derec.protobuf.DeRecResultR\x06result\x128\n" +
 	"\ttimestamp\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestampb\x06proto3"
@@ -307,15 +281,14 @@ var file_unpair_proto_goTypes = []any{
 }
 var file_unpair_proto_depIdxs = []int32{
 	2, // 0: org.derecalliance.derec.protobuf.UnpairRequestMessage.timestamp:type_name -> google.protobuf.Timestamp
-	3, // 1: org.derecalliance.derec.protobuf.UnpairRequestMessage.replyTo:type_name -> org.derecalliance.derec.protobuf.TransportProtocol
-	3, // 2: org.derecalliance.derec.protobuf.UnpairRequestMessage.replyToTransports:type_name -> org.derecalliance.derec.protobuf.TransportProtocol
-	4, // 3: org.derecalliance.derec.protobuf.UnpairResponseMessage.result:type_name -> org.derecalliance.derec.protobuf.DeRecResult
-	2, // 4: org.derecalliance.derec.protobuf.UnpairResponseMessage.timestamp:type_name -> google.protobuf.Timestamp
-	5, // [5:5] is the sub-list for method output_type
-	5, // [5:5] is the sub-list for method input_type
-	5, // [5:5] is the sub-list for extension type_name
-	5, // [5:5] is the sub-list for extension extendee
-	0, // [0:5] is the sub-list for field type_name
+	3, // 1: org.derecalliance.derec.protobuf.UnpairRequestMessage.replyToTransports:type_name -> org.derecalliance.derec.protobuf.TransportProtocol
+	4, // 2: org.derecalliance.derec.protobuf.UnpairResponseMessage.result:type_name -> org.derecalliance.derec.protobuf.DeRecResult
+	2, // 3: org.derecalliance.derec.protobuf.UnpairResponseMessage.timestamp:type_name -> google.protobuf.Timestamp
+	4, // [4:4] is the sub-list for method output_type
+	4, // [4:4] is the sub-list for method input_type
+	4, // [4:4] is the sub-list for extension type_name
+	4, // [4:4] is the sub-list for extension extendee
+	0, // [0:4] is the sub-list for field type_name
 }
 
 func init() { file_unpair_proto_init() }

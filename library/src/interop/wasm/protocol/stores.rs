@@ -837,6 +837,14 @@ fn user_secrets_to_js(value: &UserSecrets) -> JsValue {
         js_sys::Reflect::set(&obj, &"description".into(), &JsValue::from_str(d))
             .unwrap_or_default();
     }
+    if let Some(author) = value.author_replica_id {
+        js_sys::Reflect::set(
+            &obj,
+            &"author_replica_id".into(),
+            &JsValue::from_str(&author.to_string()),
+        )
+        .unwrap_or_default();
+    }
     obj.into()
 }
 
@@ -867,6 +875,17 @@ fn user_secrets_from_js(value: &JsValue) -> Result<UserSecrets, ShareStoreError>
     let description = js_sys::Reflect::get(value, &"description".into())
         .ok()
         .and_then(|v| v.as_string());
+    let author_replica_id = js_sys::Reflect::get(value, &"author_replica_id".into())
+        .ok()
+        .and_then(|v| v.as_string())
+        .map(|id| {
+            id.parse::<u64>().map_err(|_| {
+                ShareStoreError::Backend(box_err(format!(
+                    "userSecrets.author_replica_id is not a decimal u64: {id}"
+                )))
+            })
+        })
+        .transpose()?;
     // The JS-side store carries only the user-facing snapshot; the
     // `replicas` cache is rebuilt on the next ProtectSecret round from
     // live channel state.
@@ -875,6 +894,7 @@ fn user_secrets_from_js(value: &JsValue) -> Result<UserSecrets, ShareStoreError>
         secrets,
         description,
         replicas: None,
+        author_replica_id,
     })
 }
 

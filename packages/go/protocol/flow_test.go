@@ -5,6 +5,7 @@ package protocol
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -333,5 +334,97 @@ func TestRestore_ClosedProtocol(t *testing.T) {
 	}
 	if _, err := p.Restore(fixtureRestoreSecret(11), 7); err == nil {
 		t.Fatal("expected an error on a closed protocol")
+	}
+}
+
+// TestRestore_Conflict_ReportsConflictingChannelIDs pre-seeds helper
+// channels at two of the recovered Secret's ids (plus one unrelated id) and
+// asserts Restore fails with CodeRestoreConflict carrying exactly the
+// colliding ids, decoded from derec_protocol_restore's
+// conflicting_channel_ids_json buffer.
+func TestRestore_Conflict_ReportsConflictingChannelIDs(t *testing.T) {
+	channel, share, secretStore, userSecret, state, transport := newTestStores()
+	const secretID = 1
+	for _, id := range []uint64{11, 13, 99} {
+		rec := ChannelRecord{Helper: &HelperChannel{
+			ChannelID:         id,
+			Transports:        []TransportEndpoint{{URI: "https://collision.example.com", Protocol: 0}},
+			CommunicationInfo: map[string]string{},
+			PeerRole:          SenderKindHelper,
+			Status:            ChannelStatusPaired,
+			CreatedAt:         1,
+		}}
+		if err := channel.Save(secretID, rec); err != nil {
+			t.Fatalf("seed channel %d: %v", id, err)
+		}
+	}
+	p, err := New(channel, share, secretStore, userSecret, state, transport, Config{
+		SecretID:          secretID,
+		OwnTransports:     []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+		Threshold:         2,
+		KeepVersionsCount: 3,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { p.Close() })
+
+	secret := fixtureRestoreSecret(11)
+	base := secret.Helpers[0]
+	secret.Helpers = nil
+	for _, id := range []string{"11", "12", "13"} {
+		h := base
+		h.ChannelID = id
+		secret.Helpers = append(secret.Helpers, h)
+	}
+
+	_, err = p.Restore(secret, 7)
+	if err == nil {
+		t.Fatal("expected a restore conflict")
+	}
+	var derecErr *derec.Error
+	if !errors.As(err, &derecErr) {
+		t.Fatalf("expected a *derec.Error, got %T: %v", err, err)
+	}
+	if derecErr.Code != derec.CodeRestoreConflict {
+		t.Fatalf("Code = %d (%s), want CodeRestoreConflict", derecErr.Code, derecErr.CodeName())
+	}
+	got := append([]uint64(nil), derecErr.ConflictingChannelIDs...)
+	slices.Sort(got)
+	if !slices.Equal(got, []uint64{11, 13}) {
+		t.Fatalf("ConflictingChannelIDs = %v, want [11 13]", derecErr.ConflictingChannelIDs)
+	}
+
+	// Clearing exactly the reported ids lets the retry succeed; the
+	// unrelated channel 99 is torn down, which surfaces as events.
+	for _, id := range derecErr.ConflictingChannelIDs {
+		if _, err := channel.Remove(secretID, id, 0); err != nil {
+			t.Fatalf("remove channel %d: %v", id, err)
+		}
+	}
+	events, err := p.Restore(secret, 7)
+	if err != nil {
+		t.Fatalf("Restore after clearing conflicts: %v", err)
+	}
+	if len(events) == 0 {
+		t.Fatal("expected Restore to report the teardown of channel 99")
+	}
+}
+
+// TestRestore_NonConflictError_HasNoConflictingChannelIDs asserts the ids
+// field stays empty for any other restore failure.
+func TestRestore_NonConflictError_HasNoConflictingChannelIDs(t *testing.T) {
+	p := newTestProtocol(t)
+	secret := fixtureRestoreSecret(11)
+	if _, err := p.Restore(secret, 7); err != nil {
+		t.Fatalf("first Restore: %v", err)
+	}
+	_, err := p.Restore(secret, 7)
+	var derecErr *derec.Error
+	if !errors.As(err, &derecErr) {
+		t.Fatalf("expected a *derec.Error, got %T: %v", err, err)
+	}
+	if derecErr.Code == derec.CodeRestoreConflict || len(derecErr.ConflictingChannelIDs) != 0 {
+		t.Fatalf("unexpected conflict payload: code=%d ids=%v", derecErr.Code, derecErr.ConflictingChannelIDs)
 	}
 }

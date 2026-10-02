@@ -64,13 +64,17 @@ var (
 // ProduceGetShareRequest builds the wire-encoded DeRecMessage requesting the
 // helper's stored share for (secretID, version) on channelID, encrypted under
 // sharedKey.
-func ProduceGetShareRequest(channelID, secretID uint64, version uint32, sharedKey []byte) ([]byte, error) {
+func ProduceGetShareRequest(channelID, secretID uint64, version uint32, sharedKey []byte, replyTo []Endpoint) ([]byte, error) {
 	produceGetShareReqOnce.Do(func() {
 		purego.RegisterFunc(&produceGetShareReqFn, symbol("produce_get_share_request_message"))
 	})
+	replyToBytes, err := encodeEndpointList(replyTo)
+	if err != nil {
+		return nil, err
+	}
 	res := produceGetShareReqFn(channelID, secretID, version,
 		bytePtr(sharedKey), uintptr(len(sharedKey)),
-		nil, 0)
+		bytePtr(replyToBytes), uintptr(len(replyToBytes)))
 	if err := errorFrom(res.Error); err != nil {
 		return nil, err
 	}

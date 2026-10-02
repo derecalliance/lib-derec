@@ -87,6 +87,25 @@ func decodeEndpointList(buf []byte) ([]Endpoint, error) {
 	return out, nil
 }
 
+// encodeEndpointList is the inverse of decodeEndpointList: each endpoint
+// serialized as a TransportProtocol proto and preceded by its protobuf varint
+// byte length. An empty list yields nil.
+func encodeEndpointList(endpoints []Endpoint) ([]byte, error) {
+	var out []byte
+	for _, e := range endpoints {
+		entry, err := proto.Marshal(&derecpb.TransportProtocol{
+			Uri:      e.URI,
+			Protocol: derecpb.Protocol(e.Protocol),
+		})
+		if err != nil {
+			return nil, err
+		}
+		out = binary.AppendUvarint(out, uint64(len(entry)))
+		out = append(out, entry...)
+	}
+	return out, nil
+}
+
 // transportSendCallbackPtr holds the purego.NewCallback address for
 // transportSendCallback, a stateless package-level func that needs exactly
 // one registration total — see registerChannelCallbacks in

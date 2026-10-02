@@ -16,18 +16,6 @@ namespace DeRec.Library;
 /// Selects how the public encryption material is delivered. See
 /// <see cref="ContactMode"/>.
 /// </param>
-/// <param name="TransportProtocol">
-/// Transport endpoint and protocol to use when sending protocol messages to the initiator.
-///
-/// <para>
-/// <b>Reading this directly is incorrect.</b> Its meaning narrowed from "the
-/// endpoint" to "one entry of a list, and possibly absent": a creator that has
-/// moved past this field populates only <see cref="SupportedTransports"/>, and
-/// this property is then an empty-URI placeholder. Call
-/// <see cref="AdvertisedEndpoints"/>, which resolves both spellings. Removed at
-/// 0.0.5.
-/// </para>
-/// </param>
 /// <param name="Nonce">
 /// Random nonce that binds the pairing request to this contact exchange.
 /// </param>
@@ -47,7 +35,6 @@ namespace DeRec.Library;
 public sealed record ContactMessage(
     ulong ChannelId,
     ContactMode ContactMode,
-    TransportProtocol TransportProtocol,
     ulong Nonce,
     byte[]? MlkemEncapsulationKey,
     byte[]? EciesPublicKey,
@@ -59,11 +46,9 @@ public sealed record ContactMessage(
     /// in its own preference order.
     /// </summary>
     /// <remarks>
-    /// Empty means "only <see cref="TransportProtocol"/> is offered", which is
-    /// how every implementation predating this field advertises. Preserved
-    /// across a decode/encode round trip, so a contact this SDK parses and
-    /// hands back to <c>Pairing.Request.Produce</c> still advertises every
-    /// endpoint the creator offered.
+    /// Preserved across a decode/encode round trip, so a contact this SDK
+    /// parses and hands back to <c>Pairing.Request.Produce</c> still
+    /// advertises every endpoint the creator offered.
     /// </remarks>
     public IReadOnlyList<TransportProtocol> SupportedTransports { get; init; } =
         Array.Empty<TransportProtocol>();
@@ -72,44 +57,28 @@ public sealed record ContactMessage(
     /// The endpoints this contact advertises, in the creator's own order.
     /// </summary>
     /// <remarks>
-    /// Yields <see cref="SupportedTransports"/> when it is non-empty, and
-    /// otherwise the singular <see cref="TransportProtocol"/> — which is how
-    /// every implementation predating the offer list advertises, and the reason
-    /// this is a method rather than a property read. Reports what was
-    /// advertised, not what is acceptable; nothing here is validated.
+    /// Reports what was advertised, not what is acceptable; nothing here is
+    /// validated.
     /// </remarks>
-    public IReadOnlyList<TransportProtocol> AdvertisedEndpoints() =>
-        SupportedTransports.Count > 0
-            ? SupportedTransports
-            : string.IsNullOrEmpty(TransportProtocol.Uri)
-                ? Array.Empty<TransportProtocol>()
-                : new[] { TransportProtocol };
+    public IReadOnlyList<TransportProtocol> AdvertisedEndpoints() => SupportedTransports;
+
+    /// <summary>
+    /// When the creator produced this contact, or <c>null</c> if unset.
+    /// </summary>
+    public Timestamp? Timestamp { get; init; }
 
     /// <summary>
     /// Serializes this <see cref="ContactMessage"/> to protobuf wire bytes.
     /// </summary>
-    /// <remarks>
-    /// Structurally validates the contact's <c>(ContactMode, inline keys,
-    /// binding hash)</c> tuple before emitting bytes — a locally constructed
-    /// instance that violates the per-mode invariant raises
-    /// <see cref="DeRecException"/> instead of producing a wire blob that
-    /// downstream consumers would reject anyway.
-    /// </remarks>
-    // Touches the deprecated singular `transportProtocol`: this is the
-    // compatibility path that keeps peers predating `supportedTransports`
-    // working, so the warning is expected here rather than a defect.
-#pragma warning disable CS0612
-    internal byte[] ToProtoBytes()
+    /// <exception cref="DeRecException">
+    /// The contact violates its <see cref="ContactMode"/> invariant.
+    /// </exception>
+    public byte[] ToProtoBytes()
     {
         var proto = new Org.Derecalliance.Derec.Protobuf.ContactMessage
         {
             ChannelId = ChannelId,
             ContactMode = (Org.Derecalliance.Derec.Protobuf.ContactMode)(int)ContactMode,
-            TransportProtocol = new Org.Derecalliance.Derec.Protobuf.TransportProtocol
-            {
-                Uri = TransportProtocol.Uri,
-                Protocol = (Org.Derecalliance.Derec.Protobuf.Protocol)(int)TransportProtocol.Protocol,
-            },
             Nonce = Nonce,
         };
         foreach (TransportProtocol offer in SupportedTransports)
@@ -132,31 +101,33 @@ public sealed record ContactMessage(
         {
             proto.ContactBindingHash = Google.Protobuf.ByteString.CopyFrom(hash);
         }
+        if (Timestamp is { } ts)
+        {
+            proto.Timestamp = new Google.Protobuf.WellKnownTypes.Timestamp
+            {
+                Seconds = ts.Seconds,
+                Nanos = ts.Nanos,
+            };
+        }
         byte[] bytes = proto.ToByteArray();
         Validate(bytes);
         return bytes;
     }
 
     /// <summary>
-    /// Deserializes a <see cref="ContactMessage"/> from protobuf wire bytes
-    /// and structurally validates the result against the per-mode invariant
-    /// documented on the wire format. Throws <see cref="DeRecException"/>
-    /// if the contact is malformed (unknown <see cref="ContactMode"/>,
-    /// mode/field mismatch, wrong binding-hash length).
+    /// Decodes a <see cref="ContactMessage"/> from protobuf wire bytes, such
+    /// as those received out of band from a QR code.
     /// </summary>
-    // Touches the deprecated singular `transportProtocol`: this is the
-    // compatibility path that keeps peers predating `supportedTransports`
-    // working, so the warning is expected here rather than a defect.
-#pragma warning disable CS0612
-    internal static ContactMessage FromProtoBytes(byte[] bytes)
+    /// <exception cref="DeRecException">
+    /// The bytes are not a valid contact: undecodable, unknown
+    /// <see cref="ContactMode"/>, fields inconsistent with the mode, or a
+    /// binding hash of the wrong length.
+    /// </exception>
+    public static ContactMessage FromProtoBytes(byte[] bytes)
     {
         Validate(bytes);
 
         var proto = Org.Derecalliance.Derec.Protobuf.ContactMessage.Parser.ParseFrom(bytes);
-
-        var tp = proto.TransportProtocol is { } protoTp
-            ? new TransportProtocol(protoTp.Uri, (Protocol)(int)protoTp.Protocol)
-            : new TransportProtocol(string.Empty);
 
         // proto3 `optional bytes` fields are reported via `HasFoo` once set;
         // if the field was never set the property still returns `ByteString.Empty`,
@@ -174,7 +145,6 @@ public sealed record ContactMessage(
         return new ContactMessage(
             ChannelId: proto.ChannelId,
             ContactMode: (ContactMode)(int)proto.ContactMode,
-            TransportProtocol: tp,
             Nonce: proto.Nonce,
             MlkemEncapsulationKey: mlkem,
             EciesPublicKey: ecies,
@@ -184,6 +154,7 @@ public sealed record ContactMessage(
             SupportedTransports = proto.SupportedTransports
                 .Select(t => new TransportProtocol(t.Uri, (Protocol)(int)t.Protocol))
                 .ToList(),
+            Timestamp = proto.Timestamp is { } ts ? new Timestamp(ts.Seconds, ts.Nanos) : null,
         };
     }
 
@@ -194,4 +165,3 @@ public sealed record ContactMessage(
         Utils.ThrowIfError(error);
     }
 }
-#pragma warning restore CS0612

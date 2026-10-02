@@ -14,6 +14,12 @@ using namespace facebook;
 namespace derec {
 
 void throwDeRecError(jsi::Runtime& rt, const DeRecError& error) {
+  throwDeRecError(rt, error, {});
+}
+
+void throwDeRecError(jsi::Runtime& rt,
+                     const DeRecError& error,
+                     const std::vector<uint8_t>& conflictingChannelIdsJson) {
   auto names = errorName(error.category, error.code);
   // `message` and `peer_memo` are Rust-owned strings; copy before releasing.
   std::string message =
@@ -41,6 +47,11 @@ void throwDeRecError(jsi::Runtime& rt, const DeRecError& error) {
   if (expected != 0 || got != 0) {
     payload.setProperty(rt, "expected", jsi::Value(static_cast<int>(expected)));
     payload.setProperty(rt, "got", jsi::Value(static_cast<int>(got)));
+  }
+  if (!conflictingChannelIdsJson.empty()) {
+    payload.setProperty(rt, "channel_ids",
+                        jsi::Value::createFromJsonUtf8(rt, conflictingChannelIdsJson.data(),
+                                                       conflictingChannelIdsJson.size()));
   }
   throw jsi::JSError(rt, jsi::Value(rt, payload));
 }
@@ -72,6 +83,22 @@ jsi::Value toArrayBuffer(jsi::Runtime& rt, const uint8_t* bytes, size_t len) {
     std::memcpy(result.data(rt), bytes, len);
   }
   return jsi::Value(rt, result);
+}
+
+/// Build a genuine `Uint8Array` (not a bare `ArrayBuffer`) — every store
+/// interface types its byte payloads as `Uint8Array`, and application code
+/// is entitled to index or slice it directly.
+jsi::Value toUint8ArrayVal(jsi::Runtime& rt, const uint8_t* bytes, size_t len) {
+  jsi::Uint8Array arr(rt, len);
+  if (len > 0 && bytes != nullptr) {
+    jsi::ArrayBuffer buffer = arr.buffer(rt);
+    std::memcpy(buffer.data(rt), bytes, len);
+  }
+  return jsi::Value(rt, std::move(arr));
+}
+
+jsi::Value toUint8ArrayVal(jsi::Runtime& rt, const std::vector<uint8_t>& bytes) {
+  return toUint8ArrayVal(rt, bytes.data(), bytes.size());
 }
 
 uint64_t asU64(jsi::Runtime& rt, const jsi::Value& value) {
@@ -262,6 +289,28 @@ jsi::Value readTraceId(jsi::Runtime& rt,
   return jsi::Value(rt, jsi::BigInt::fromUint64(rt, result.trace_id));
 }
 
+/// `version() -> { major: number, minor: number }` — the protocol version the
+/// core writes into every envelope it produces.
+jsi::Value protocolVersion(jsi::Runtime& rt,
+                           const jsi::Value&,
+                           const jsi::Value*,
+                           size_t) {
+  DeRecProtocolVersion version = derec_protocol_version();
+  auto payload = jsi::Object(rt);
+  payload.setProperty(rt, "major", jsi::Value(static_cast<double>(version.major)));
+  payload.setProperty(rt, "minor", jsi::Value(static_cast<double>(version.minor)));
+  return jsi::Value(rt, payload);
+}
+
+/// `generate_replica_id() -> bigint` — a fresh replica identity from the
+/// core, never `0`. The application persists it once per device.
+jsi::Value generateReplicaId(jsi::Runtime& rt,
+                             const jsi::Value&,
+                             const jsi::Value*,
+                             size_t) {
+  return jsi::Value(rt, jsi::BigInt::fromUint64(rt, derec_generate_replica_id()));
+}
+
 /// `create_contact_message(channelId: bigint, contactMode: number,
 ///   transportProtocols: ArrayBuffer, hasNonce: number, nonce: bigint)
 ///   -> { contact_wire_bytes, secret_key_material }`
@@ -336,6 +385,20 @@ jsi::Value decodeContactMessage(jsi::Runtime& rt,
   }
   std::vector<uint8_t> bytes = takeBuffer(result.contact_json);
   return toArrayBuffer(rt, bytes.data(), bytes.size());
+}
+
+/// `transport_protocol_discriminant(name: string) -> number`
+///
+/// The `derec_proto::Protocol` discriminant the crate assigns to `name`, or
+/// `-1` when it names none; forwarded unchanged for Rust to validate.
+jsi::Value transportProtocolDiscriminant(jsi::Runtime& rt,
+                                         const jsi::Value&,
+                                         const jsi::Value* args,
+                                         size_t count) {
+  requireArgs(rt, "transport_protocol_discriminant", count, 1);
+  std::string name = args[0].asString(rt).utf8(rt);
+  return jsi::Value(static_cast<int>(derec_transport_protocol_discriminant(
+      reinterpret_cast<const uint8_t*>(name.data()), name.size())));
 }
 
 /// `decode_message_json(kind: number, protoBytes: ArrayBuffer) -> ArrayBuffer`
@@ -643,6 +706,79 @@ jsi::Value processPrePairResponseMessage(jsi::Runtime& rt,
   payload.setProperty(rt, "nonce",
                       jsi::Value(rt, jsi::BigInt::fromUint64(rt, result.nonce)));
   return jsi::Value(rt, payload);
+}
+
+/// `produce_pre_pair_no_keys_response_message(channelId: bigint,
+///   requestProto: ArrayBuffer) -> { envelope_wire_bytes,
+///   secret_key_material }`
+jsi::Value producePrePairNoKeysResponseMessage(jsi::Runtime& rt,
+                                               const jsi::Value&,
+                                               const jsi::Value* args,
+                                               size_t count) {
+  requireArgs(rt, "produce_pre_pair_no_keys_response_message", count, 2);
+  uint64_t channelId = asU64(rt, args[0]);
+  ByteView requestProto = asBytes(rt, args[1]);
+  ProducePrePairNoKeysResponseMessageResult result =
+      produce_pre_pair_no_keys_response_message(channelId, requestProto.ptr,
+                                                requestProto.len);
+  if (result.error.code != 0) {
+    throwDeRecError(rt, result.error);
+  }
+  std::vector<uint8_t> envelope = takeBuffer(result.envelope_wire_bytes);
+  std::vector<uint8_t> secretKeyMaterial = takeBuffer(result.secret_key_material);
+  auto payload = jsi::Object(rt);
+  payload.setProperty(rt, "envelope_wire_bytes",
+                      toArrayBuffer(rt, envelope.data(), envelope.size()));
+  payload.setProperty(
+      rt, "secret_key_material",
+      toArrayBuffer(rt, secretKeyMaterial.data(), secretKeyMaterial.size()));
+  return jsi::Value(rt, payload);
+}
+
+/// `process_pre_pair_no_keys_response_message(contactMessage: ArrayBuffer,
+///   responseProto: ArrayBuffer) -> { mlkem_encapsulation_key,
+///   ecies_public_key, nonce }`
+jsi::Value processPrePairNoKeysResponseMessage(jsi::Runtime& rt,
+                                               const jsi::Value&,
+                                               const jsi::Value* args,
+                                               size_t count) {
+  requireArgs(rt, "process_pre_pair_no_keys_response_message", count, 2);
+  ByteView contactMessage = asBytes(rt, args[0]);
+  ByteView responseProto = asBytes(rt, args[1]);
+  ProcessPrePairResponseMessageResult result =
+      process_pre_pair_no_keys_response_message(contactMessage.ptr,
+                                                contactMessage.len,
+                                                responseProto.ptr,
+                                                responseProto.len);
+  if (result.error.code != 0) {
+    throwDeRecError(rt, result.error);
+  }
+  std::vector<uint8_t> mlkemKey = takeBuffer(result.mlkem_encapsulation_key);
+  std::vector<uint8_t> eciesKey = takeBuffer(result.ecies_public_key);
+  auto payload = jsi::Object(rt);
+  payload.setProperty(rt, "mlkem_encapsulation_key",
+                      toArrayBuffer(rt, mlkemKey.data(), mlkemKey.size()));
+  payload.setProperty(rt, "ecies_public_key",
+                      toArrayBuffer(rt, eciesKey.data(), eciesKey.size()));
+  payload.setProperty(rt, "nonce",
+                      jsi::Value(rt, jsi::BigInt::fromUint64(rt, result.nonce)));
+  return jsi::Value(rt, payload);
+}
+
+/// `pairing_fingerprint(sharedKey: ArrayBuffer) -> string`
+jsi::Value pairingFingerprint(jsi::Runtime& rt,
+                              const jsi::Value&,
+                              const jsi::Value* args,
+                              size_t count) {
+  requireArgs(rt, "pairing_fingerprint", count, 1);
+  ByteView sharedKey = asBytes(rt, args[0]);
+  PairingFingerprintResult result =
+      pairing_fingerprint(sharedKey.ptr, sharedKey.len);
+  if (result.error.code != 0) {
+    throwDeRecError(rt, result.error);
+  }
+  std::string fingerprint = takeString(result.fingerprint);
+  return jsi::String::createFromUtf8(rt, fingerprint);
 }
 
 /// `produce_get_share_request_message(channelId: bigint, secretId: bigint,
@@ -1134,6 +1270,8 @@ void bind(jsi::Runtime& rt,
 }  // namespace
 
 void installPrimitives(jsi::Runtime& rt, jsi::Object& host) {
+  bind(rt, host, "version", 0, protocolVersion);
+  bind(rt, host, "generate_replica_id", 0, generateReplicaId);
   bind(rt, host, "produce_get_secret_ids_versions_request_message", 3,
        produceGetSecretIdsVersionsRequestMessage);
   bind(rt, host, "extract_get_secret_ids_versions_request", 2,
@@ -1150,6 +1288,8 @@ void installPrimitives(jsi::Runtime& rt, jsi::Object& host) {
   bind(rt, host, "validate_contact_message", 1, validateContactMessage);
   bind(rt, host, "encode_contact_message", 1, encodeContactMessage);
   bind(rt, host, "decode_contact_message", 1, decodeContactMessage);
+  bind(rt, host, "transport_protocol_discriminant", 1,
+       transportProtocolDiscriminant);
   bind(rt, host, "decode_message_json", 2, decodeMessageJson);
   bind(rt, host, "encode_message_json", 2, encodeMessageJson);
   bind(rt, host, "produce_pair_request_message", 5, producePairRequestMessage);
@@ -1165,6 +1305,11 @@ void installPrimitives(jsi::Runtime& rt, jsi::Object& host) {
   bind(rt, host, "extract_pre_pair_response", 1, extractPrePairResponse);
   bind(rt, host, "process_pre_pair_response_message", 2,
        processPrePairResponseMessage);
+  bind(rt, host, "produce_pre_pair_no_keys_response_message", 2,
+       producePrePairNoKeysResponseMessage);
+  bind(rt, host, "process_pre_pair_no_keys_response_message", 2,
+       processPrePairNoKeysResponseMessage);
+  bind(rt, host, "pairing_fingerprint", 1, pairingFingerprint);
   bind(rt, host, "produce_get_share_request_message", 5,
        produceGetShareRequestMessage);
   bind(rt, host, "extract_get_share_request", 2, extractGetShareRequest);

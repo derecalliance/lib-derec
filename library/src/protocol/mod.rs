@@ -41,12 +41,12 @@
 //!   [`DeRecFlow`] variant — called once, directly on the protocol,
 //!   after a `SecretRecovered` event surfaces.
 //! - **UpdateChannelInfo** — broadcast updated `communication_info`
-//!   and/or `transport_protocol` to one or more paired peers. Either
+//!   and/or `supported_transports` to one or more paired peers. Either
 //!   side may initiate. The accompanying setters
 //!   [`DeRecProtocol::set_communication_info`] and
-//!   [`DeRecProtocol::set_own_transport`] update local state first; the
+//!   [`DeRecProtocol::set_own_transports`] update local state first; the
 //!   flow then announces the change. The endpoint-changeover discipline
-//!   on `set_own_transport` is required reading before broadcasting a
+//!   on `set_own_transports` is required reading before broadcasting a
 //!   transport update — both endpoints must remain reachable through
 //!   the changeover or in-flight traffic will be lost.
 //! - **Unpair** — Owner-initiated channel teardown. Ack semantics are
@@ -188,13 +188,10 @@ pub struct DeRecProtocol<
     pub state_store: StateStore,
     /// Set via [`DeRecProtocolBuilder::with_transport`](crate::protocol::DeRecProtocolBuilder::with_transport).
     pub transport: Transport,
-    /// Set via [`DeRecProtocolBuilder::with_own_transport`](crate::protocol::DeRecProtocolBuilder::with_own_transport) or
-    /// [`DeRecProtocolBuilder::with_own_transports`](crate::protocol::DeRecProtocolBuilder::with_own_transports), in preference order.
+    /// Set via [`DeRecProtocolBuilder::with_own_transports`](crate::protocol::DeRecProtocolBuilder::with_own_transports), in preference order.
     /// Never empty — the typestate builder cannot reach `build()` without
     /// this slot filled. The order is the application's and is never
-    /// reinterpreted; the first entry is this device's primary endpoint, and
-    /// is what fills the legacy singular `transportProtocol` field for peers
-    /// predating the offer list.
+    /// reinterpreted; the first entry is this device's primary endpoint.
     pub own_transports: Vec<TransportProtocol>,
     /// Configured via [`DeRecProtocolBuilder::with_unpair_ack`](crate::protocol::DeRecProtocolBuilder::with_unpair_ack).
     pub(crate) unpair_ack: UnpairAck,
@@ -205,8 +202,8 @@ pub struct DeRecProtocol<
     /// Configured via [`Timeouts`](crate::protocol::types::Timeouts).
     /// Configured via [`DeRecProtocolBuilder::with_timeouts`](crate::protocol::DeRecProtocolBuilder::with_timeouts).
     pub(crate) timeouts: crate::protocol::types::Timeouts,
-    /// Configured via [`DeRecProtocolBuilder::with_unsafe_http`](crate::protocol::DeRecProtocolBuilder::with_unsafe_http).
-    pub(crate) unsafe_http: bool,
+    /// Configured via [`DeRecProtocolBuilder::with_unsafe_connection`](crate::protocol::DeRecProtocolBuilder::with_unsafe_connection).
+    pub(crate) unsafe_connection: bool,
     /// Configured via [`DeRecProtocolBuilder::with_communication_info`](crate::protocol::DeRecProtocolBuilder::with_communication_info).
     pub(crate) communication_info: HashMap<String, String>,
     /// Configured via [`DeRecProtocolBuilder::with_auto_respond_on_failure`](crate::protocol::DeRecProtocolBuilder::with_auto_respond_on_failure).
@@ -219,8 +216,7 @@ pub struct DeRecProtocol<
     /// (the default), outbound requests leave it unset and the responder
     /// falls back to the channel's stored peer endpoint. See
     /// `replyToTransports` on each request proto for the wire-level
-    /// semantics, and `replyTo` beside it for the singular field kept for
-    /// peers predating the list.
+    /// semantics.
     pub(crate) auto_reply_to: bool,
     /// Configured via [`DeRecProtocolBuilder::with_auto_accept`](crate::protocol::DeRecProtocolBuilder::with_auto_accept).
     ///

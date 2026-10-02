@@ -4,7 +4,6 @@
 use crate::derec_message::{DeRecMessageBuilder, current_timestamp};
 use crate::extensions::advertised_endpoints::AdvertisedEndpoints as _;
 use crate::extensions::pair_request::PairRequestMessageExt as _;
-use crate::extensions::pre_pair_request::PrePairRequestMessageExt as _;
 use crate::primitives::pairing::PairingError;
 use crate::protocol_version::ProtocolVersion;
 use crate::types::ChannelId;
@@ -213,10 +212,8 @@ pub struct ProcessPrePairResult {
 /// # Selecting the reply endpoint
 ///
 /// Every endpoint the requester advertised — read via
-/// [`AdvertisedEndpoints`](crate::extensions::advertised_endpoints::AdvertisedEndpoints), so its
-/// singular `transportProtocol` field is the fallback when it offers no
-/// list, which is how peers predating the offer list behave — is recorded
-/// in the order it offered them, filtered by `policy` via
+/// [`AdvertisedEndpoints`](crate::extensions::advertised_endpoints::AdvertisedEndpoints) —
+/// is recorded in the order it offered them, filtered by `policy` via
 /// [`TransportPolicy::admit_peer_endpoints`](crate::transport::TransportPolicy::admit_peer_endpoints).
 ///
 /// This does not choose between the survivors. Which endpoint to dial, and
@@ -341,8 +338,6 @@ pub fn produce_pre_pair(
     request: &PrePairRequestMessage,
     pairing_secret_key_material: &PairingSecretKeyMaterial,
 ) -> Result<ProducePrePairResult, crate::Error> {
-    request.validate()?;
-
     let initiator_material = match pairing_secret_key_material {
         PairingSecretKeyMaterial::Initiator(m) => m,
         _ => {
@@ -442,8 +437,6 @@ pub fn produce_pre_pair_no_keys(
     channel_id: ChannelId,
     request: &PrePairRequestMessage,
 ) -> Result<ProducePrePairNoKeysResult, crate::Error> {
-    request.validate()?;
-
     let seed = crate::utils::generate_seed::<32>();
     let (pk, secret_key) = cryptography_pairing::contact_message(*seed)
         .map_err(|e| PairingError::ContactMessageKeygen { source: e })?;

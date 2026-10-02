@@ -190,14 +190,23 @@ internal sealed class InMemoryStateStore : IStateStore
 {
     private readonly Dictionary<(ulong, StateKey), StateItem> _data = new();
 
+    /// <summary>Every key the library passed to <see cref="Load"/> or <see cref="Remove"/>.</summary>
+    public readonly List<StateKey> RequestedKeys = new();
+
     public void Save(ulong secretId, StateItem item) =>
         _data[(secretId, item.Key())] = item;
 
-    public StateItem? Load(ulong secretId, StateKey key) =>
-        _data.TryGetValue((secretId, key), out var v) ? v : null;
+    public StateItem? Load(ulong secretId, StateKey key)
+    {
+        RequestedKeys.Add(key);
+        return _data.TryGetValue((secretId, key), out var v) ? v : null;
+    }
 
-    public bool Remove(ulong secretId, StateKey key) =>
-        _data.Remove((secretId, key));
+    public bool Remove(ulong secretId, StateKey key)
+    {
+        RequestedKeys.Add(key);
+        return _data.Remove((secretId, key));
+    }
 
     public IEnumerable<StateItem> LoadAll(ulong secretId, StateKind kind) =>
         _data

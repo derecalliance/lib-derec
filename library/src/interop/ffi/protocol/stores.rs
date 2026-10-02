@@ -488,6 +488,10 @@ pub(crate) struct UserSecretsRecord {
     pub secrets: Vec<UserSecretRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Decimal-encoded publisher of `version`, like every other `u64` id in
+    /// these records. Absent when the snapshot records no author.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_replica_id: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -511,13 +515,23 @@ impl From<&UserSecrets> for UserSecretsRecord {
                 })
                 .collect(),
             description: v.description.clone(),
+            author_replica_id: v.author_replica_id.map(|id| id.to_string()),
         }
     }
 }
 
-impl From<UserSecretsRecord> for UserSecrets {
-    fn from(r: UserSecretsRecord) -> Self {
-        Self {
+impl TryFrom<UserSecretsRecord> for UserSecrets {
+    type Error = String;
+
+    fn try_from(r: UserSecretsRecord) -> Result<Self, String> {
+        let author_replica_id = r
+            .author_replica_id
+            .map(|id| {
+                id.parse::<u64>()
+                    .map_err(|_| format!("author_replica_id is not a decimal u64: {id}"))
+            })
+            .transpose()?;
+        Ok(Self {
             version: r.version,
             secrets: r
                 .secrets
@@ -533,7 +547,8 @@ impl From<UserSecretsRecord> for UserSecrets {
             // now; the `replicas` cache is rebuilt on the next
             // ProtectSecret round from live channel state.
             replicas: None,
-        }
+            author_replica_id,
+        })
     }
 }
 
@@ -1177,8 +1192,10 @@ impl DeRecUserSecretStore for DotnetUserSecretStore {
             Ok(None) => Ok(None),
             Ok(Some(bytes)) if bytes.is_empty() => Ok(None),
             Ok(Some(bytes)) => serde_json::from_slice::<UserSecretsRecord>(&bytes)
-                .map(|r| Some(r.into()))
-                .map_err(|e| ShareStoreError::Backend(boxed_err(format!("UserSecrets JSON: {e}")))),
+                .map_err(|e| format!("UserSecrets JSON: {e}"))
+                .and_then(UserSecrets::try_from)
+                .map(Some)
+                .map_err(|e| ShareStoreError::Backend(boxed_err(e))),
         };
         Box::pin(async move { res })
     }
@@ -1420,5 +1437,56 @@ mod filter_wire_tests {
             !text.contains(&format!(":[{WIDE}")) && !text.contains(&format!(",{WIDE}")),
             "no bare numeric id may appear, got {text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod user_secrets_record_tests {
+    use super::*;
+
+    fn snapshot(author_replica_id: Option<u64>) -> UserSecrets {
+        UserSecrets {
+            version: 3,
+            secrets: Vec::new(),
+            description: None,
+            replicas: None,
+            author_replica_id,
+        }
+    }
+
+    /// The author is a `u64`, so it crosses as a decimal string like every
+    /// other id: a host whose numbers are doubles must read it exactly.
+    #[test]
+    fn the_author_round_trips_as_a_decimal_string() {
+        let json = serde_json::to_value(UserSecretsRecord::from(&snapshot(Some(u64::MAX))))
+            .expect("serializes");
+        assert_eq!(json["author_replica_id"], u64::MAX.to_string());
+
+        let back: UserSecretsRecord = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(
+            UserSecrets::try_from(back).expect("converts"),
+            snapshot(Some(u64::MAX))
+        );
+    }
+
+    #[test]
+    fn an_absent_author_stays_absent() {
+        let json =
+            serde_json::to_value(UserSecretsRecord::from(&snapshot(None))).expect("serializes");
+        assert!(json.get("author_replica_id").is_none());
+        let back: UserSecretsRecord = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(
+            UserSecrets::try_from(back).expect("converts"),
+            snapshot(None)
+        );
+    }
+
+    #[test]
+    fn a_malformed_author_is_refused() {
+        let back: UserSecretsRecord = serde_json::from_str(
+            r#"{"version":3,"secrets":[],"author_replica_id":"not-a-number"}"#,
+        )
+        .expect("deserializes");
+        assert!(UserSecrets::try_from(back).is_err());
     }
 }

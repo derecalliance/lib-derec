@@ -118,7 +118,7 @@ pub(crate) struct PairingConfig<'a> {
 
 /// Borrow a [`DeRecProtocol`]'s identity into a [`Local`].
 ///
-/// Reads `unsafe_http` directly rather than calling `transport_policy()`:
+/// Reads `unsafe_connection` directly rather than calling `transport_policy()`:
 /// that method borrows the whole protocol, which would collide with the
 /// store borrows [`borrow_stores!`](crate::protocol::stores::borrow_stores)
 /// takes in the same call. Copying one `bool` field keeps the two disjoint.
@@ -130,7 +130,7 @@ macro_rules! local {
             secret_id: $protocol.secret_id,
             replica_id: $protocol.replica_id,
             own_transports: &$protocol.own_transports,
-            policy: $crate::transport::TransportPolicy::new($protocol.unsafe_http),
+            policy: $crate::transport::TransportPolicy::new($protocol.unsafe_connection),
             communication_info: &$protocol.communication_info,
         }
     };

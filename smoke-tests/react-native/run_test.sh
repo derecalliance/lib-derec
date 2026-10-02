@@ -231,6 +231,25 @@ ensure_android_device() {
   return 1
 }
 
+# CocoaPods fixes a pod's source list when `pod install` runs, so a native
+# file the package gained since then is left out of the build and the link
+# fails. Reinstall the pods whenever a package source is missing from them —
+# the step an application runs after upgrading the package.
+sync_pods() {
+  local project="$APP_DIR/ios/Pods/Pods.xcodeproj/project.pbxproj"
+  local source
+  for source in "$APP_DIR"/node_modules/@derec-alliance/react-native/cpp/*.cpp; do
+    if [[ ! -f "$project" ]] || ! grep -qF "$(basename "$source")" "$project"; then
+      echo "Package sources changed since the last pod install; reinstalling pods"
+      ( cd "$APP_DIR/ios" && bundle exec pod install ) > "$LOG_DIR/rn-smoke-pods.log" 2>&1 || {
+        echo "pod install failed; see $LOG_DIR/rn-smoke-pods.log" >&2
+        return 1
+      }
+      return 0
+    fi
+  done
+}
+
 run_ios() {
   if [[ -z "$IOS_SIMULATOR" ]]; then
     echo "No iOS simulator available; install one via Xcode or set DEREC_SMOKE_IOS_SIMULATOR." >&2
@@ -238,6 +257,7 @@ run_ios() {
   fi
   echo "── iOS simulator (${IOS_SIMULATOR}) ────────────────────────"
   ensure_ios_device || return 1
+  sync_pods || return 1
   local build_log="$LOG_DIR/rn-smoke-ios.log"
 
   # `--no-packager`: Metro is already running, and a second one on the same

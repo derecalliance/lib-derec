@@ -752,13 +752,9 @@ mod replica_id_conflict_tests {
         });
     }
 
-    /// `accept()` must select from the requester's `supportedTransports`
-    /// offer list, not trust its legacy singular field outright. The peer
-    /// here advertises HTTPS as its singular field — structurally valid,
-    /// so the old code accepted it without complaint — but also offers
-    /// gRPCS, which is the only protocol this responder actually serves.
-    // Compatibility, not oversight — see the `transport` module docs.
-    #[allow(deprecated)]
+    /// `accept()` must record the requester's whole `supportedTransports`
+    /// offer list. The peer here offers HTTPS first and gRPCS second, and
+    /// gRPCS is the only protocol this responder actually serves.
     #[test]
     fn accept_offers_the_transport_every_advertised_endpoint() {
         use super::super::pair::accept;
@@ -810,10 +806,6 @@ mod replica_id_conflict_tests {
             } = request::extract(&request_envelope, initiator_secret.ecies_secret_key())
                 .expect("extract");
 
-            pair_request.transport_protocol = Some(TransportProtocol {
-                uri: "https://peer.example.com/derec".to_owned(),
-                protocol: Protocol::Https as i32,
-            });
             pair_request.supported_transports = vec![
                 TransportProtocol {
                     uri: "https://peer.example.com/derec".to_owned(),
@@ -857,14 +849,11 @@ mod replica_id_conflict_tests {
                 0,
             )
             .await
-            .expect(
-                "accept must select the servable gRPCS offer, not the unservable \
-                 HTTPS singular field",
-            );
+            .expect("accept must succeed when one offered endpoint is servable");
 
             // The library must hand the transport everything the peer
-            // advertised, in the peer's order — not narrow it to the singular
-            // legacy field. Which of these to dial is the application's call,
+            // advertised, in the peer's order. Which of these to dial is the
+            // application's call,
             // so this asserts what was *offered*, not what was chosen.
             assert_eq!(
                 rig.transport.sent_endpoint_sets(),
@@ -879,7 +868,7 @@ mod replica_id_conflict_tests {
                     },
                 ]],
                 "accept() must offer the transport every endpoint the peer \
-                 advertised, not just its singular legacy field"
+                 advertised"
             );
         });
     }

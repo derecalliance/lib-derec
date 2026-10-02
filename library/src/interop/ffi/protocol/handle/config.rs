@@ -56,75 +56,10 @@ pub unsafe extern "C" fn derec_protocol_set_communication_info(
     success()
 }
 
-/// Replace this node's endpoint **for one protocol**, leaving the others
-/// alone. A node serves at most one endpoint per protocol, so the `(uri,
-/// protocol)` pair identifies the entry it replaces; an entry for a protocol
-/// not yet served is appended, and a replaced one keeps its position in the
-/// preference order. See
-/// [`crate::protocol::DeRecProtocol::set_own_transport`] for the changeover
-/// discipline (keep the old endpoint up during the transition).
-///
-/// Superseded by [`derec_protocol_set_own_transports`], which takes the
-/// whole preference list and is the only way to change *which* protocols
-/// this node serves, or their order.
-///
-/// # Safety
-///
-/// `handle` must be a valid pointer returned by
-/// [`super::derec_protocol_new`]. `uri_ptr`/`uri_len` must describe a
-/// readable byte range. The `(uri, protocol)` pair is validated via
-/// [`super::validate_transport`] before it is stored — see that
-/// function's docs for the structural rules (length cap, scheme
-/// match, enum discriminant). Concurrent calls on the same handle
-/// from different threads are safe: the handle's internal mutex
-/// serializes them.
-#[unsafe(no_mangle)]
-#[deprecated(
-    since = "0.0.3",
-    note = "use derec_protocol_set_own_transports, which takes the whole \
-            preference list; removed at 0.0.5"
-)]
-pub unsafe extern "C" fn derec_protocol_set_own_transport(
-    handle: *mut DeRecProtocolHandle,
-    uri_ptr: *const u8,
-    uri_len: usize,
-    protocol: i32,
-) -> DeRecError {
-    if handle.is_null() {
-        return ffi_error(DEREC_CODE_FFI_NULL_PTR, "handle is null");
-    }
-    if uri_len == 0 || uri_ptr.is_null() {
-        return ffi_error(DEREC_CODE_FFI_NULL_PTR, "uri_ptr null or len == 0");
-    }
-    let uri = {
-        let bytes = unsafe { std::slice::from_raw_parts(uri_ptr, uri_len) };
-        match std::str::from_utf8(bytes) {
-            Ok(s) => s.to_owned(),
-            Err(_) => return ffi_error(DEREC_CODE_FFI_BAD_PROTO, "uri is not valid UTF-8"),
-        }
-    };
-    // Validate before storing — `validate_transport` runs both the
-    // protocol-enum check and the URI rules, so a downgraded scheme
-    // (e.g. `http://` carried with `Protocol::Https`) is rejected
-    // here rather than silently propagated to peers.
-    let validated_tp = match super::validate_transport(&uri, protocol) {
-        Ok(tp) => tp,
-        Err(e) => return e,
-    };
-    let h = unsafe { &*handle };
-    let mut inner = h.lock_inner();
-    match inner.set_own_transports([validated_tp]) {
-        Ok(()) => success(),
-        Err(e) => crate::interop::ffi::error::from_lib_error(e),
-    }
-}
-
 /// Replace every endpoint this node advertises, in preference order.
 ///
 /// The runtime counterpart to the `own_transports` array accepted by
-/// [`super::derec_protocol_new`], and the way to change the whole set:
-/// `derec_protocol_set_own_transport` replaces only the entry for the
-/// protocol its URI names. A device serves at most one endpoint per
+/// [`super::derec_protocol_new`]. A device serves at most one endpoint per
 /// protocol, so this list is a preference order over distinct protocols and
 /// two entries of the same protocol are rejected. Body is the same JSON
 /// shape that config array uses — `[{"uri": "...", "protocol": 0}, ...]`.

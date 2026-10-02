@@ -316,8 +316,8 @@ const (
 	// StateKindPendingUnpair is an outstanding unpair acknowledgement,
 	// one row per channel.
 	StateKindPendingUnpair StateKind = 2
-	// StateKindSharingRound is the active sharing round, at most one row
-	// per secretID.
+	// StateKindSharingRound is an active sharing round, one row per
+	// in-flight version. Several rounds can be open at once.
 	StateKindSharingRound StateKind = 3
 	// StateKindPendingReplicaDiscovery is an active replica catch-up, at most one
 	// row per secretID. Holds the versions members have reported so far.
@@ -328,8 +328,8 @@ const (
 // field is populated is determined by Kind:
 //   - PendingVerification, PendingUnpair: ChannelID.
 //   - PendingRecovery: SecretID, Version.
-//   - SharingRound, PendingReplicaDiscovery: none (at most one row per
-//     secretID).
+//   - SharingRound: Version (the version the round distributes).
+//   - PendingReplicaDiscovery: none (at most one row per secretID).
 //
 // SecretID names the secret being recovered, which is not necessarily
 // the secretID partitioning the store: a recovering device runs an
@@ -398,7 +398,7 @@ func (i StateItem) Key() StateKey {
 	case StateKindPendingReplicaDiscovery:
 		return StateKey{Kind: StateKindPendingReplicaDiscovery}
 	default:
-		return StateKey{Kind: StateKindSharingRound}
+		return StateKey{Kind: StateKindSharingRound, Version: i.Version}
 	}
 }
 
@@ -429,6 +429,9 @@ type UserSecrets struct {
 	Version     uint32
 	Secrets     []UserSecret
 	Description *string
+	// AuthorReplicaID is the replica member that published Version, or nil
+	// when the snapshot records no author. Store it as given.
+	AuthorReplicaID *uint64
 }
 
 // ChannelFilter narrows a listing from ChannelStore.

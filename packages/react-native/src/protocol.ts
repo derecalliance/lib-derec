@@ -20,6 +20,7 @@ import type {
   SecretStore,
   ShareStore,
   StateStore,
+  StatusEnum,
   ReplicaDiscoveryParams,
   Target,
   Timeouts,
@@ -82,22 +83,14 @@ function decodeEvents(buffer: ArrayBuffer): DeRecEvent[] {
 }
 
 /**
- * Maps a transport protocol name to the `derec_proto::Protocol` discriminant.
- * The shared enum fixture every other numeric mapping in this SDK is checked
- * against does not carry this enum (it
- * only covers the Rust-internal serde enums listed under its `"enums"` key);
- * the transport `Protocol` enum lives in `protobufs/transportprotocol.proto`
- * instead, where `HTTPS = 0` and `GRPC = 1` are defined.
+ * The `derec_proto::Protocol` discriminant Rust assigns to a transport
+ * protocol name. Forwarded unchanged: a name Rust does not recognise comes
+ * back as `-1`, which Rust's own transport validation then rejects.
  */
-export function protocolDiscriminant(protocol: string): number {
-  switch (protocol.toLowerCase()) {
-    case 'https':
-      return 0;
-    case 'grpc':
-      return 1;
-    default:
-      throw new Error(`DeRec: unknown transport protocol "${protocol}"`);
-  }
+function protocolDiscriminant(protocol: string): number {
+  return (getNative() as unknown as NativeHost).transport_protocol_discriminant(
+    protocol,
+  ) as number;
 }
 
 function encodeTarget(target: Target): unknown {
@@ -261,13 +254,8 @@ function buildStartParams(flowKind: FlowKind, params: unknown): Uint8Array {
       if (p.communication_info !== undefined) {
         out.communication_info = p.communication_info;
       }
-      if (p.own_transports !== undefined && p.own_transports.length > 0) {
+      if (p.own_transports !== undefined) {
         out.own_transports = p.own_transports;
-        // The first entry also fills the deprecated singular field so a peer
-        // predating `supported_transports` still learns the new address.
-        out.transport_protocol = p.own_transports[0];
-      } else if (p.transport_protocol !== undefined) {
-        out.transport_protocol = p.transport_protocol;
       }
       return jsonToBytes(out);
     }
@@ -350,22 +338,9 @@ export class DeRecProtocolBuilder {
   }
 
   /**
-   * @deprecated Use {@link withOwnTransports}, which takes the whole
-   * preference list — `withOwnTransports([endpoint])` is the direct
-   * replacement. Removed at 0.0.5.
-   */
-  withOwnTransport(endpoint: { uri: string; protocol: string }): this {
-    this.config.own_transport_uri = endpoint.uri;
-    this.config.own_transport_protocol = protocolDiscriminant(endpoint.protocol);
-    return this;
-  }
-
-  /**
    * Set every transport endpoint this application serves, in preference
-   * order. Written to the config's `own_transports` array, which takes
-   * precedence over `own_transport_uri` / `own_transport_protocol` on the
-   * Rust side when non-empty — see `ProtocolConfig` in
-   * `library/src/interop/ffi/protocol/handle/mod.rs`.
+   * order. Written to the config's `own_transports` array — see
+   * `ProtocolConfig` in `library/src/interop/ffi/protocol/handle/mod.rs`.
    *
    * The order given is forwarded verbatim: it is not sorted, deduplicated,
    * or reordered here. It is this application's own preference and
@@ -374,9 +349,8 @@ export class DeRecProtocolBuilder {
    * listing an endpoint this application does not serve makes pairing
    * succeed and replies vanish.
    *
-   * Supersedes {@link withOwnTransport} for applications serving more
-   * than one transport; the single-endpoint setter remains fully
-   * supported.
+   * Not calling this leaves `own_transports` empty, the deferred-config
+   * path: call {@link DeRecProtocol.setOwnTransports} before pairing.
    */
   withOwnTransports(transports: { uri: string; protocol: string }[]): this {
     this.config.own_transports = transports.map((t) => ({
@@ -411,23 +385,8 @@ export class DeRecProtocolBuilder {
   }
 
   /**
-   * @deprecated Use {@link withUnsafeConnection}, which names both gated
-   * schemes. Removed at 0.0.5. Default: false.
-   */
-  withUnsafeHttp(allow: boolean): this {
-    this.config.unsafe_http = allow;
-    return this;
-  }
-
-  /**
    * Accept plaintext `http://` and `grpc://` transport endpoints.
-   * **Development only.** Default: false. Supersedes
-   * {@link withUnsafeHttp}, which names only the HTTP scheme.
-   *
-   * Either flag alone is honored. Setting both to disagreeing values fails
-   * construction with the error code `CONFLICTING_PLAINTEXT_OPT_IN` rather
-   * than resolving silently, because precedence would hand the decision to
-   * the flag being removed.
+   * **Development only.** Default: false.
    */
   withUnsafeConnection(allow: boolean): this {
     this.config.unsafe_connection = allow;
@@ -540,8 +499,6 @@ export class DeRecProtocolBuilder {
     const config = {
       secret_id: this.secretIdValue.toString(),
       replica_id: null,
-      own_transport_uri: '',
-      own_transport_protocol: 0,
       ...this.config,
     };
     const host = (getNative() as unknown as NativeHost).protocol_new(
@@ -569,9 +526,8 @@ export class DeRecProtocolBuilder {
 /**
  * Thin wrapper around the `ProtocolHost` JSI host object, mirroring
  * `@derec-alliance/nodejs`'s `DeRecProtocol` — same methods, and the same
- * sync/async split except for `setCommunicationInfo` and `setOwnTransport`,
- * which return a `Promise` here (see their own doc comments for why);
- * `secretId` is synchronous and everything else returns a `Promise`. Every method encodes its
+ * sync/async split: `secretId` is synchronous and everything else returns a
+ * `Promise`. Every method encodes its
  * arguments into the wire shape the host function expects and decodes its
  * result back into the typed value declared here; no protocol decision is
  * made in this class.
@@ -601,53 +557,29 @@ export class DeRecProtocol {
   }
 
   /**
-   * Returns a `Promise`, where `@derec-alliance/nodejs` declares this
-   * `void`. The native setter takes the same handle mutex a running flow
-   * holds across its store callbacks, so calling it on the JavaScript thread
-   * would block that thread until the flow released the mutex — which it
-   * cannot do while it is waiting on the JavaScript thread. The binding
-   * therefore queues the setter onto the same serial worker every flow runs
-   * on, which orders it after any call already in flight. The nodejs SDK is
-   * WASM and single-threaded, so it has no such hazard.
+   * Replaces this node's local communication info.
    *
-   * Callers that ignore the result behave exactly as before, so this stays
-   * source-compatible with nodejs-shaped code; awaiting it additionally
-   * surfaces a failure that would otherwise be swallowed.
+   * The native setter takes the same handle mutex a running flow holds
+   * across its store callbacks, so calling it on the JavaScript thread would
+   * block that thread until the flow released the mutex — which it cannot do
+   * while it is waiting on the JavaScript thread. The binding therefore
+   * queues the setter onto the same serial worker every flow runs on, which
+   * orders it after any call already in flight. Awaiting the returned
+   * `Promise` surfaces a failure that would otherwise be swallowed.
    */
   setCommunicationInfo(info: Record<string, string>): Promise<void> {
     return this.host.setCommunicationInfo(jsonToBytes(info)) as Promise<void>;
   }
 
   /**
-   * Replace this node's endpoint for one protocol, leaving the others
-   * alone. A node serves at most one endpoint per protocol, so the
-   * `(uri, protocol)` pair identifies the entry it replaces; an entry for a
-   * protocol not yet served is appended, and a replaced one keeps its
-   * position in the preference order.
-   *
-   * Returns a `Promise` for the same reason {@link setCommunicationInfo} does.
-   *
-   * @deprecated Use {@link setOwnTransports}, which takes the whole
-   * preference list and is the only way to change which protocols this node
-   * serves, or their order. Removed at 0.0.5.
-   */
-  setOwnTransport(uri: string, protocol: string): Promise<void> {
-    return this.host.setOwnTransport(
-      uri,
-      protocolDiscriminant(protocol),
-    ) as Promise<void>;
-  }
-
-  /**
    * Replaces every endpoint this node advertises, in preference order —
-   * the runtime counterpart to `withOwnTransports`, and the only way to
-   * change a multi-endpoint node's set ({@link setOwnTransport} collapses
-   * it to the one endpoint it is given).
+   * the runtime counterpart to `withOwnTransports`.
    *
    * Every entry is validated before any is stored, so a malformed URI
    * leaves the previous set intact. An empty array is rejected.
    *
-   * Returns a `Promise` for the same reason {@link setCommunicationInfo} does.
+   * Queued onto the serial worker for the same reason as
+   * {@link setCommunicationInfo}.
    */
   setOwnTransports(
     transports: { uri: string; protocol: string }[],
@@ -662,7 +594,7 @@ export class DeRecProtocol {
   /**
    * Decodes the `contact_wire_bytes` `derec_protocol_create_contact`
    * produces into a typed `ContactMessage`, so an application can read the
-   * contact's `nonce`, `transport_protocol` and mode without a protobuf
+   * contact's `nonce`, `supported_transports` and mode without a protobuf
    * codec of its own. Feed the returned object straight back into
    * `start(FlowKind.Pairing, { contact })`, which re-encodes it.
    */
@@ -713,7 +645,7 @@ export class DeRecProtocol {
     return decodeEvents(buffer);
   }
 
-  async reject(actionBytes: Uint8Array, status: number, memo: string): Promise<void> {
+  async reject(actionBytes: Uint8Array, status: StatusEnum, memo: string): Promise<void> {
     await this.host.reject(actionBytes, status, memo);
   }
 
@@ -730,6 +662,18 @@ export class DeRecProtocol {
     return jsonFromBytes(buffer) as string[];
   }
 
+  /**
+   * Rebuild this protocol's `secret_id` namespace from a recovered `Secret`.
+   * Pass the `secret` carried by the `SecretRecovered` event verbatim.
+   *
+   * Rejects with a `DeRecError`; among its codes:
+   *
+   * | code               | meaning                                                     |
+   * |--------------------|-------------------------------------------------------------|
+   * | `already_restored` | A user-secret snapshot already exists for this `secret_id`. |
+   * | `restore_conflict` | Channels live at canonical helper / replica ids. The error  |
+   * |                    | carries `channel_ids: string[]` listing the collisions.     |
+   */
   async restore(
     recoveredSecret: Extract<DeRecEvent, { type: 'SecretRecovered' }>['secret'],
     version: number,

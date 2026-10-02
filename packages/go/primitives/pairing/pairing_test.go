@@ -9,15 +9,17 @@ import (
 	"testing"
 
 	"github.com/derecalliance/lib-derec/packages/go/derec"
+	"github.com/derecalliance/lib-derec/packages/go/derecpb"
 	"github.com/derecalliance/lib-derec/packages/go/primitives/pairing"
+	"google.golang.org/protobuf/proto"
 )
 
 // encodeTransportProtocol hand-encodes a org.derecalliance.derec.protobuf
 // TransportProtocol message (protobufs/protobufs/transportprotocol.proto):
-// field 1 "uri" (string), field 2 "protocol" (enum, HTTPS = 0). The Go SDK
-// has no generated proto bindings, and the wrapper API accepts/returns raw
-// proto bytes like every other primitive; this test builds the one message
-// application code is responsible for supplying from scratch.
+// field 1 "uri" (string), field 2 "protocol" (enum, HTTPS = 0). The wrapper
+// API accepts/returns raw proto bytes like every other primitive; this test
+// builds the one message application code is responsible for supplying from
+// scratch.
 func encodeTransportProtocol(uri string) []byte {
 	buf := []byte{0x0A} // field 1, wire type 2 (length-delimited)
 	buf = appendVarint(buf, uint64(len(uri)))
@@ -346,4 +348,130 @@ func TestPairingResponseRejectsPlaintextPeerEndpoint(t *testing.T) {
 	if len(produced.PeerTransports) != 1 || produced.PeerTransports[0].URI != "http://example.com/helper" {
 		t.Fatalf("Response.Produce: unexpected peer transports %+v", produced.PeerTransports)
 	}
+}
+
+// TestPairingNoKeysPrePairRoundTrip drives a complete NO_KEYS pairing
+// through primitives only: the contact carries no keys, the creator
+// authenticates the PrePair request by nonce and generates keys on the spot,
+// the scanner accepts them unbound and finishes the handshake against an
+// INLINE_KEYS-shaped contact, and both ends confirm by fingerprint.
+func TestPairingNoKeysPrePairRoundTrip(t *testing.T) {
+	const channelID = uint64(4)
+	nonce := uint64(424242)
+
+	aliceTransport := encodeTransportList("https://example.com/alice/ephemeral")
+	aliceContact, err := pairing.Request.CreateContact(channelID, pairing.ContactModeNoKeys, aliceTransport, &nonce)
+	if err != nil {
+		t.Fatalf("CreateContact (NO_KEYS): %v", err)
+	}
+	if err := pairing.Request.Validate(aliceContact.ContactWireBytes); err != nil {
+		t.Fatalf("Validate (NO_KEYS contact): %v", err)
+	}
+
+	bobTransport := encodeTransportList("https://example.com/helper/ephemeral")
+	prepairReq, err := pairing.Request.ProducePrePair(bobTransport, aliceContact.ContactWireBytes)
+	if err != nil {
+		t.Fatalf("Request.ProducePrePair: %v", err)
+	}
+
+	extractedReq, err := pairing.Request.ExtractPrePair(prepairReq.Envelope)
+	if err != nil {
+		t.Fatalf("Request.ExtractPrePair: %v", err)
+	}
+	var reqMsg derecpb.PrePairRequestMessage
+	if err := proto.Unmarshal(extractedReq.RequestProto, &reqMsg); err != nil {
+		t.Fatalf("decode PrePairRequestMessage: %v", err)
+	}
+	if reqMsg.GetNonce() != nonce {
+		t.Fatalf("PrePair request nonce = %d, want the issued contact nonce %d", reqMsg.GetNonce(), nonce)
+	}
+
+	prepairResp, err := pairing.Response.ProducePrePairNoKeys(channelID, extractedReq.RequestProto)
+	if err != nil {
+		t.Fatalf("Response.ProducePrePairNoKeys: %v", err)
+	}
+	if len(prepairResp.Envelope) == 0 || len(prepairResp.SecretKeyMaterial) == 0 {
+		t.Fatal("Response.ProducePrePairNoKeys returned an empty envelope or secret key material")
+	}
+
+	extractedResp, err := pairing.Response.ExtractPrePair(prepairResp.Envelope)
+	if err != nil {
+		t.Fatalf("Response.ExtractPrePair: %v", err)
+	}
+
+	processed, err := pairing.Response.ProcessPrePairNoKeys(aliceContact.ContactWireBytes, extractedResp.ResponseProto)
+	if err != nil {
+		t.Fatalf("Response.ProcessPrePairNoKeys: %v", err)
+	}
+	if len(processed.MlkemEncapsulationKey) == 0 || len(processed.EciesPublicKey) == 0 {
+		t.Fatal("Response.ProcessPrePairNoKeys returned empty keys")
+	}
+	if processed.Nonce != nonce {
+		t.Fatalf("Response.ProcessPrePairNoKeys nonce = %d, want %d", processed.Nonce, nonce)
+	}
+
+	filledIn := inlineContactWithKeys(t, aliceContact.ContactWireBytes, processed)
+
+	pairReq, err := pairing.Request.Produce(pairing.SenderKindHelper, encodeTransportList("https://example.com/helper"), filledIn, nil, nil)
+	if err != nil {
+		t.Fatalf("Request.Produce: %v", err)
+	}
+	extractedPairReq, err := pairing.Request.Extract(pairReq.Envelope, prepairResp.SecretKeyMaterial)
+	if err != nil {
+		t.Fatalf("Request.Extract: %v", err)
+	}
+	produced, err := pairing.Response.Produce(channelID, extractedPairReq.RequestProto, prepairResp.SecretKeyMaterial, nil, nil, false)
+	if err != nil {
+		t.Fatalf("Response.Produce: %v", err)
+	}
+	extractedPairResp, err := pairing.Response.Extract(produced.Envelope, pairReq.SecretKeyMaterial)
+	if err != nil {
+		t.Fatalf("Response.Extract: %v", err)
+	}
+	processedPair, err := pairing.Response.Process(pairReq.InitiatorContactMessage, extractedPairResp.ResponseProto, pairReq.SecretKeyMaterial)
+	if err != nil {
+		t.Fatalf("Response.Process: %v", err)
+	}
+
+	if !bytes.Equal(produced.SharedKey, processedPair.SharedKey) {
+		t.Fatal("shared keys derived by both sides must match (NO_KEYS path)")
+	}
+	if produced.ChannelID != processedPair.ChannelID {
+		t.Fatalf("rekeyed channel id mismatch: creator=%d scanner=%d", produced.ChannelID, processedPair.ChannelID)
+	}
+
+	aliceFP, err := pairing.Fingerprint(produced.SharedKey)
+	if err != nil {
+		t.Fatalf("Fingerprint (creator): %v", err)
+	}
+	bobFP, err := pairing.Fingerprint(processedPair.SharedKey)
+	if err != nil {
+		t.Fatalf("Fingerprint (scanner): %v", err)
+	}
+	if aliceFP == "" || aliceFP != bobFP {
+		t.Fatalf("fingerprints must be equal and non-empty: creator=%q scanner=%q", aliceFP, bobFP)
+	}
+
+	if _, err := pairing.Fingerprint(make([]byte, 31)); err == nil {
+		t.Fatal("Fingerprint must refuse a 31-byte shared key")
+	}
+}
+
+// inlineContactWithKeys rewrites a NO_KEYS contact into the INLINE_KEYS
+// shape Request.Produce requires, carrying the keys PrePair returned.
+func inlineContactWithKeys(t *testing.T, contactWireBytes []byte, keys pairing.ProcessedPrePair) []byte {
+	t.Helper()
+	var contact derecpb.ContactMessage
+	if err := proto.Unmarshal(contactWireBytes, &contact); err != nil {
+		t.Fatalf("decode ContactMessage: %v", err)
+	}
+	contact.ContactMode = derecpb.ContactMode_INLINE_KEYS
+	contact.MlkemEncapsulationKey = keys.MlkemEncapsulationKey
+	contact.EciesPublicKey = keys.EciesPublicKey
+	contact.ContactBindingHash = nil
+	out, err := proto.Marshal(&contact)
+	if err != nil {
+		t.Fatalf("encode ContactMessage: %v", err)
+	}
+	return out
 }

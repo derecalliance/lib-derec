@@ -126,12 +126,12 @@ ulong channelId = 1;
 var contact = Pairing.Request.CreateContact(
     channelId,
     ContactMode.InlineKeys,
-    new TransportProtocol("https://example.com/alice"));
+    new[] { new TransportProtocol("https://example.com/alice") });
 
 // Step 2: Contact responder produces the pairing request envelope.
 var pairRequest = Pairing.Request.Produce(
     Pairing.SenderKind.Helper,
-    new TransportProtocol("https://example.com/helper"),
+    new[] { new TransportProtocol("https://example.com/helper") },
     contact.ContactMessage);
 
 // Step 3: Initiator extracts the request, then produces the response and derives the shared key.
@@ -182,11 +182,11 @@ ulong channelId = 7;
 var contact = Pairing.Request.CreateContact(
     channelId,
     ContactMode.HashedKeys,
-    new TransportProtocol("https://relay.example.com/ephemeral"));
+    new[] { new TransportProtocol("https://relay.example.com/ephemeral") });
 
 // Scanner: fetch keys via PrePair.
 var prePairReqEnv = Pairing.Request.ProducePrePair(
-    new TransportProtocol("https://scanner.example.com/ephemeral"),
+    new[] { new TransportProtocol("https://scanner.example.com/ephemeral") },
     contact.ContactMessage);
 var prePairReq = Pairing.Request.ExtractPrePair(prePairReqEnv.Envelope);
 var prePairRespEnv = Pairing.Response.ProducePrePair(
@@ -350,6 +350,24 @@ to `protocol.RestoreAsync(secret, version)` on a fresh `DeRecProtocol` to
 commit canonical helper / replica state and wipe the throwaway recovery-mode
 channels. Errors throw `DeRecException` with `Code` in
 {`AlreadyRestored`, `RestoreConflict`, `Invariant`, store-category code}.
+On `RestoreConflict`, `DeRecException.ConflictingChannelIds`
+(`IReadOnlyList<ulong>`, empty for every other code) lists the existing
+channels that collide with ids in the recovered `Secret` — clear exactly
+those and retry:
+
+```csharp
+try
+{
+    await protocol.RestoreAsync(recovered.Secret, version);
+}
+catch (DeRecException e) when (e.Code == DeRecCode.RestoreConflict)
+{
+    foreach (ulong channelId in e.ConflictingChannelIds)
+    {
+        // remove the stale channel at `channelId` from your stores, then retry
+    }
+}
+```
 
 > **Secret format:** the `recovered` bytes above (and the recoverable secret
 > data underlying `Secret`) are `[version byte] · payload` — v1's payload is
@@ -392,9 +410,15 @@ var shareStore   = new InMemoryShareStore();
 var secretStore  = new InMemorySecretStore();
 var transport    = new RecordingTransport();
 
-using var owner = new DeRecProtocol(
-    channelStore, shareStore, secretStore, transport,
-    ownTransportUri: "https://owner.example.com");
+using var owner = new DeRecProtocolBuilder(secretId)
+    .WithChannelStore(channelStore)
+    .WithShareStore(shareStore)
+    .WithSecretStore(secretStore)
+    .WithUserSecretStore(new InMemoryUserSecretStore())
+    .WithStateStore(new InMemoryStateStore())
+    .WithTransport(transport)
+    .WithOwnTransports(new[] { new TransportProtocol("https://owner.example.com") })
+    .Build();
 
 // Pair (mirror this on the peer side).
 byte[] contact = await helper.CreateContactAsync(channelId, ContactMode.InlineKeys);
@@ -474,10 +498,16 @@ as `SenderKind.ReplicaDestination` (receives it). Both `DeRecProtocol`
 instances must be constructed with a stable `replicaId`:
 
 ```csharp
-using var owner = new DeRecProtocol(
-    channelStore, shareStore, secretStore, transport,
-    ownTransportUri: "https://owner.example.com",
-    replicaId: 0xAAAA_AAAA_AAAA_AAAAUL);
+using var owner = new DeRecProtocolBuilder(secretId)
+    .WithChannelStore(channelStore)
+    .WithShareStore(shareStore)
+    .WithSecretStore(secretStore)
+    .WithUserSecretStore(new InMemoryUserSecretStore())
+    .WithStateStore(new InMemoryStateStore())
+    .WithTransport(transport)
+    .WithOwnTransports(new[] { new TransportProtocol("https://owner.example.com") })
+    .WithReplicaId(0xAAAA_AAAA_AAAA_AAAAUL)
+    .Build();
 ```
 
 After the handshake, channels start in `Pending` and are not eligible as
@@ -582,8 +612,7 @@ you can retire as soon as the PrePair leg completes.
 
 The recommended pattern is: pair on the ephemeral URI, then — as soon
 as the pairing completes on the contact creator side — call
-`SetOwnTransports` with the permanent endpoint (`SetOwnTransport` is
-deprecated and removed at 0.0.5) and start an
+`SetOwnTransports` with the permanent endpoint and start an
 `UpdateChannelInfo` flow against the peer to announce the swap. Once
 the peer acknowledges, retire the ephemeral URI. This keeps the
 plaintext PrePair window tight while letting subsequent traffic ride

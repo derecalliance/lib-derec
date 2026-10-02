@@ -10,6 +10,7 @@
 
 #include "Convert.h"
 #include "Primitives.h"
+#include "UserSecretsJson.h"
 
 using namespace facebook;
 
@@ -72,118 +73,6 @@ bool writeOut(const std::vector<uint8_t>& bytes, uint8_t** outPtr, size_t* outLe
 /// handling intact).
 jsi::Value idVal(jsi::Runtime& rt, uint64_t id) {
   return jsi::Value(rt, jsi::String::createFromUtf8(rt, std::to_string(id)));
-}
-
-/// Build a genuine `Uint8Array` (not a bare `ArrayBuffer`) — every store
-/// interface types its byte payloads as `Uint8Array`, and application code
-/// is entitled to index or slice it directly.
-jsi::Value toUint8ArrayVal(jsi::Runtime& rt, const uint8_t* bytes, size_t len) {
-  jsi::Uint8Array arr(rt, len);
-  if (len > 0 && bytes != nullptr) {
-    jsi::ArrayBuffer buffer = arr.buffer(rt);
-    std::memcpy(buffer.data(rt), bytes, len);
-  }
-  return jsi::Value(rt, std::move(arr));
-}
-
-jsi::Value toUint8ArrayVal(jsi::Runtime& rt, const std::vector<uint8_t>& bytes) {
-  return toUint8ArrayVal(rt, bytes.data(), bytes.size());
-}
-
-// Minimal decoders for the wire's "bare JSON array/object of unsigned
-// integers" convention (`versions_json`, `channel_ids_json`, the `bytes`
-// field of a `ShareRecord` / `SecretValueRecord`). These are produced by
-// `serde_json`'s default compact, whitespace-free output over a fixed,
-// known shape, so a substring scan is sufficient and — critically — never
-// routes a `u64` through a JS `number`, which cannot represent every value
-// in that range exactly.
-
-/// Parse a bare `[n, n, ...]` array of unsigned decimal integers.
-std::vector<uint64_t> parseUnsignedJsonArray(const uint8_t* ptr, size_t len) {
-  std::vector<uint64_t> out;
-  size_t i = 0;
-  while (i < len && ptr[i] != '[') ++i;
-  if (i >= len) return out;
-  ++i;
-  while (i < len && ptr[i] != ']') {
-    if (ptr[i] < '0' || ptr[i] > '9') {
-      ++i;
-      continue;
-    }
-    uint64_t value = 0;
-    while (i < len && ptr[i] >= '0' && ptr[i] <= '9') {
-      value = value * 10 + static_cast<uint64_t>(ptr[i] - '0');
-      ++i;
-    }
-    out.push_back(value);
-  }
-  return out;
-}
-
-/// Offset just past `"key":` in a flat, compact JSON object, or
-/// `std::string::npos` if `key` is absent.
-size_t fieldValueOffset(const std::string& json, const char* key) {
-  std::string needle = std::string("\"") + key + "\":";
-  size_t pos = json.find(needle);
-  return pos == std::string::npos ? std::string::npos : pos + needle.size();
-}
-
-uint64_t parseUnsignedAt(const std::string& json, size_t pos) {
-  uint64_t value = 0;
-  while (pos < json.size() && json[pos] >= '0' && json[pos] <= '9') {
-    value = value * 10 + static_cast<uint64_t>(json[pos] - '0');
-    ++pos;
-  }
-  return value;
-}
-
-std::vector<uint8_t> parseByteArrayAt(const std::string& json, size_t pos) {
-  std::vector<uint8_t> out;
-  while (pos < json.size() && json[pos] != '[') ++pos;
-  if (pos >= json.size()) return out;
-  ++pos;
-  while (pos < json.size() && json[pos] != ']') {
-    if (json[pos] < '0' || json[pos] > '9') {
-      ++pos;
-      continue;
-    }
-    uint64_t value = 0;
-    while (pos < json.size() && json[pos] >= '0' && json[pos] <= '9') {
-      value = value * 10 + static_cast<uint64_t>(json[pos] - '0');
-      ++pos;
-    }
-    out.push_back(static_cast<uint8_t>(value));
-  }
-  return out;
-}
-
-/// `{"kind":<n>,"bytes":[<n>,...]}` — the wire shape `SecretStore.save`
-/// receives; `kind` is already carried as a separate FFI argument so only
-/// `bytes` needs to be read back out.
-std::vector<uint8_t> decodeSecretValueBytes(const uint8_t* ptr, size_t len) {
-  std::string json(reinterpret_cast<const char*>(ptr), len);
-  size_t pos = fieldValueOffset(json, "bytes");
-  if (pos == std::string::npos) return {};
-  return parseByteArrayAt(json, pos);
-}
-
-/// `{"secret_id":"...","version":<n>,"bytes":[<n>,...]}` — the wire shape
-/// `ShareStore.save` receives. `secret_id` duplicates the FFI's own
-/// `secret_id` argument, so only `version` and `bytes` are decoded.
-struct DecodedShare {
-  uint32_t version;
-  std::vector<uint8_t> bytes;
-};
-
-DecodedShare decodeShareRecord(const uint8_t* ptr, size_t len) {
-  std::string json(reinterpret_cast<const char*>(ptr), len);
-  size_t versionPos = fieldValueOffset(json, "version");
-  size_t bytesPos = fieldValueOffset(json, "bytes");
-  DecodedShare out{};
-  out.version =
-      versionPos == std::string::npos ? 0 : static_cast<uint32_t>(parseUnsignedAt(json, versionPos));
-  out.bytes = bytesPos == std::string::npos ? std::vector<uint8_t>{} : parseByteArrayAt(json, bytesPos);
-  return out;
 }
 
 /// True only for a non-empty run of ASCII decimal digits.
@@ -400,105 +289,12 @@ CallResult toStateLoadAllResult(jsi::Runtime& rt, const jsi::Value& value) {
   return CallResult{0, std::vector<uint8_t>(text.begin(), text.end())};
 }
 
-// `UserSecrets` JSON <-> JS object conversion. Unlike the flat integer-only
-// records above, `UserSecrets` carries application-controlled `name` /
-// `description` strings, so building or reading its wire JSON goes through
-// the runtime's own `JSON.parse` / `JSON.stringify` rather than a hand-rolled
-// scanner — the only place in this file that needs real string escaping.
-
-jsi::Value jsonParseUtf8(jsi::Runtime& rt, const uint8_t* bytes, size_t len) {
-  jsi::Object json = rt.global().getPropertyAsObject(rt, "JSON");
-  jsi::Function parse = json.getPropertyAsFunction(rt, "parse");
-  std::string text(reinterpret_cast<const char*>(bytes), len);
-  return parse.call(rt, jsi::Value(rt, jsi::String::createFromUtf8(rt, text)));
-}
-
-std::vector<uint8_t> jsonStringifyToUtf8(jsi::Runtime& rt, const jsi::Value& value) {
-  jsi::Object json = rt.global().getPropertyAsObject(rt, "JSON");
-  jsi::Function stringify = json.getPropertyAsFunction(rt, "stringify");
-  jsi::Value result = stringify.call(rt, value);
-  std::string text = result.asString(rt).utf8(rt);
-  return std::vector<uint8_t>(text.begin(), text.end());
-}
-
-jsi::Array bytesToNumberArray(jsi::Runtime& rt, ByteView view) {
-  jsi::Array arr(rt, view.len);
-  for (size_t i = 0; i < view.len; ++i) {
-    arr.setValueAtIndex(rt, i, jsi::Value(static_cast<int>(view.ptr[i])));
-  }
-  return arr;
-}
-
-std::vector<uint8_t> numberArrayToBytes(jsi::Runtime& rt, jsi::Array arr) {
-  size_t n = arr.size(rt);
-  std::vector<uint8_t> out;
-  out.reserve(n);
-  for (size_t i = 0; i < n; ++i) {
-    out.push_back(static_cast<uint8_t>(arr.getValueAtIndex(rt, i).asNumber()));
-  }
-  return out;
-}
-
 /// `UserSecretStore.loadLatest(): Promise<UserSecrets | null | undefined>`.
 CallResult toUserSecretsResult(jsi::Runtime& rt, const jsi::Value& value) {
   if (value.isNull() || value.isUndefined()) {
     return CallResult{1, {}};
   }
-  jsi::Object src = value.asObject(rt);
-  jsi::Object wire(rt);
-  wire.setProperty(rt, "version", jsi::Value(rt, src.getProperty(rt, "version")));
-  jsi::Array srcSecrets = src.getProperty(rt, "secrets").asObject(rt).asArray(rt);
-  size_t n = srcSecrets.size(rt);
-  jsi::Array wireSecrets(rt, n);
-  for (size_t i = 0; i < n; ++i) {
-    jsi::Object entry = srcSecrets.getValueAtIndex(rt, i).asObject(rt);
-    jsi::Object wireEntry(rt);
-    wireEntry.setProperty(rt, "id", jsi::Value(rt, bytesToNumberArray(rt, asBytes(rt, entry.getProperty(rt, "id")))));
-    wireEntry.setProperty(rt, "name", jsi::Value(rt, entry.getProperty(rt, "name")));
-    wireEntry.setProperty(
-        rt, "data", jsi::Value(rt, bytesToNumberArray(rt, asBytes(rt, entry.getProperty(rt, "data")))));
-    wireSecrets.setValueAtIndex(rt, i, jsi::Value(rt, wireEntry));
-  }
-  wire.setProperty(rt, "secrets", jsi::Value(rt, wireSecrets));
-  if (src.hasProperty(rt, "description")) {
-    jsi::Value description = src.getProperty(rt, "description");
-    if (!description.isUndefined()) {
-      wire.setProperty(rt, "description", description);
-    }
-  }
-  return CallResult{0, jsonStringifyToUtf8(rt, jsi::Value(rt, wire))};
-}
-
-/// Decode `UserSecretStore.saveLatest`'s incoming wire JSON into the JS
-/// `UserSecrets` shape `src/types.ts` declares.
-jsi::Value buildUserSecretsFromWire(jsi::Runtime& rt, const uint8_t* ptr, size_t len) {
-  jsi::Value parsed = jsonParseUtf8(rt, ptr, len);
-  jsi::Object src = parsed.asObject(rt);
-  jsi::Object out(rt);
-  out.setProperty(rt, "version", jsi::Value(rt, src.getProperty(rt, "version")));
-  jsi::Array srcSecrets = src.getProperty(rt, "secrets").asObject(rt).asArray(rt);
-  size_t n = srcSecrets.size(rt);
-  jsi::Array outSecrets(rt, n);
-  for (size_t i = 0; i < n; ++i) {
-    jsi::Object entry = srcSecrets.getValueAtIndex(rt, i).asObject(rt);
-    jsi::Object outEntry(rt);
-    std::vector<uint8_t> idBytes =
-        numberArrayToBytes(rt, entry.getProperty(rt, "id").asObject(rt).asArray(rt));
-    std::vector<uint8_t> dataBytes =
-        numberArrayToBytes(rt, entry.getProperty(rt, "data").asObject(rt).asArray(rt));
-    outEntry.setProperty(rt, "id", toUint8ArrayVal(rt, idBytes));
-    outEntry.setProperty(rt, "name", jsi::Value(rt, entry.getProperty(rt, "name")));
-    outEntry.setProperty(rt, "data", toUint8ArrayVal(rt, dataBytes));
-    outSecrets.setValueAtIndex(rt, i, jsi::Value(rt, outEntry));
-  }
-  out.setProperty(rt, "secrets", jsi::Value(rt, outSecrets));
-  if (src.hasProperty(rt, "description")) {
-    jsi::Value description = src.getProperty(rt, "description");
-    if (!description.isUndefined()) {
-      out.setProperty(rt, "description", description);
-    }
-  }
-  return jsi::Value(rt, out);
+  return CallResult{0, userSecretsToWire(rt, value.asObject(rt))};
 }
 
 /// Releases a buffer this binding handed to Rust through an out-parameter.
@@ -899,14 +695,22 @@ extern "C" int32_t shareStoreSave(void* userData, uint64_t secretId, uint64_t ch
   // JavaScript CallInvoker's queue may still be holding after this object's
   // owner has released its own reference — has somewhere safe to run.
   auto keepAlive = self->shared_from_this();
-  DecodedShare decoded = decodeShareRecord(shareJsonPtr, shareJsonLen);
+  std::optional<DecodedShare> parsed = decodeShareRecord(shareJsonPtr, shareJsonLen);
+  if (!parsed) {
+    return kBackendFailure;
+  }
+  // `share.secretId` is the record's own `secret_id`, not the partition
+  // `secretId`: on a helper the share carries the owner's secret id, which is
+  // what tells apart several secrets held in one partition.
+  DecodedShare decoded = std::move(*parsed);
   CallResult result = keepAlive->bridge().callSync([keepAlive, secretId, channelId,
                                                 decoded](std::function<void(CallResult)> settle) {
     jsi::Runtime& rt = keepAlive->runtime();
     auto store = keepAlive->shareStore();
     auto method = store->getPropertyAsFunction(rt, "save");
     jsi::Object shareObj(rt);
-    shareObj.setProperty(rt, "secretId", idVal(rt, secretId));
+    shareObj.setProperty(rt, "secretId",
+                         jsi::Value(rt, jsi::String::createFromUtf8(rt, decoded.secretId)));
     shareObj.setProperty(rt, "version", jsi::Value(static_cast<int>(decoded.version)));
     shareObj.setProperty(rt, "bytes", toUint8ArrayVal(rt, decoded.bytes));
     jsi::Value promise = method.callWithThis(rt, *store, idVal(rt, secretId), idVal(rt, channelId),
@@ -973,7 +777,7 @@ extern "C" int32_t userSecretStoreSaveLatest(void* userData, uint64_t secretId,
     jsi::Runtime& rt = keepAlive->runtime();
     auto store = keepAlive->userSecretStore();
     auto method = store->getPropertyAsFunction(rt, "saveLatest");
-    jsi::Value userSecrets = buildUserSecretsFromWire(rt, payload.data(), payload.size());
+    jsi::Value userSecrets = userSecretsFromWire(rt, payload.data(), payload.size());
     jsi::Value promise = method.callWithThis(rt, *store, idVal(rt, secretId), std::move(userSecrets));
     keepAlive->settleFromPromise(rt, std::move(promise), std::move(settle), toVoidResult);
   });
@@ -1092,64 +896,6 @@ extern "C" int32_t stateStoreLoadAll(void* userData, uint64_t secretId, uint32_t
   return result.code;
 }
 
-/// Maps the wire's `derec_proto::Protocol` discriminant to the string
-/// `Transport.send`'s endpoint carries. Only `HTTPS = 0` is defined today;
-/// the protocol is explicitly extensible, so an unrecognised discriminant
-/// is reported rather than guessed at.
-std::string protocolToString(int32_t protocol) { return protocol == 0 ? "https" : "unknown"; }
-
-/// Minimal reader for an encoded `TransportProtocol`: field 1 is the URI
-/// (length-delimited string), field 2 the protocol discriminant (varint).
-/// Hand-rolled rather than linking a protobuf runtime into the JSI layer for
-/// two fields; unknown fields are skipped so a newer library stays readable.
-static std::optional<std::pair<std::string, int32_t>> decodeTransportProtocol(
-    const uint8_t* data, size_t len) {
-  std::string uri;
-  int32_t protocol = 0;
-  size_t i = 0;
-
-  auto readVarint = [&](uint64_t& out) -> bool {
-    out = 0;
-    int shift = 0;
-    while (i < len) {
-      uint8_t b = data[i++];
-      out |= static_cast<uint64_t>(b & 0x7F) << shift;
-      if ((b & 0x80) == 0) return true;
-      shift += 7;
-      if (shift > 63) return false;
-    }
-    return false;
-  };
-
-  while (i < len) {
-    uint64_t tag = 0;
-    if (!readVarint(tag)) return std::nullopt;
-    uint32_t field = static_cast<uint32_t>(tag >> 3);
-    uint32_t wire = static_cast<uint32_t>(tag & 0x7);
-
-    if (field == 1 && wire == 2) {
-      uint64_t size = 0;
-      if (!readVarint(size) || i + size > len) return std::nullopt;
-      uri.assign(reinterpret_cast<const char*>(data + i), size);
-      i += size;
-    } else if (field == 2 && wire == 0) {
-      uint64_t value = 0;
-      if (!readVarint(value)) return std::nullopt;
-      protocol = static_cast<int32_t>(value);
-    } else if (wire == 0) {
-      uint64_t skip = 0;
-      if (!readVarint(skip)) return std::nullopt;
-    } else if (wire == 2) {
-      uint64_t size = 0;
-      if (!readVarint(size) || i + size > len) return std::nullopt;
-      i += size;
-    } else {
-      return std::nullopt;
-    }
-  }
-  return std::make_pair(uri, protocol);
-}
-
 /// `Transport.send(endpoints, message) -> void`
 ///
 /// `endpoints` is every address the peer advertised, in the peer's order,
@@ -1164,25 +910,12 @@ extern "C" int32_t transportSend(void* userData, const uint8_t* endpointsPtr, si
   // owner has released its own reference — has somewhere safe to run.
   auto keepAlive = self->shared_from_this();
 
-  // Length-delimited TransportProtocol sequence: each entry preceded by its
-  // protobuf varint byte length.
-  std::vector<std::pair<std::string, int32_t>> endpoints;
-  size_t offset = 0;
-  while (offset < endpointsLen) {
-    uint64_t size = 0;
-    int shift = 0;
-    while (offset < endpointsLen) {
-      uint8_t b = endpointsPtr[offset++];
-      size |= static_cast<uint64_t>(b & 0x7F) << shift;
-      if ((b & 0x80) == 0) break;
-      shift += 7;
-    }
-    if (offset + size > endpointsLen) return -1;
-    auto parsed = decodeTransportProtocol(endpointsPtr + offset, size);
-    if (!parsed) return -1;
-    endpoints.push_back(*parsed);
-    offset += size;
-  }
+  // A discriminant the crate cannot name fails the send: the application
+  // cannot act on a protocol it does not recognise.
+  std::optional<std::vector<NamedEndpoint>> decoded =
+      decodeTransportEndpoints(endpointsPtr, endpointsLen);
+  if (!decoded) return -1;
+  std::vector<NamedEndpoint> endpoints = std::move(*decoded);
 
   std::vector<uint8_t> message(bytes, bytes + len);
   CallResult result = keepAlive->bridge().callSync([keepAlive, endpoints,
@@ -1194,10 +927,9 @@ extern "C" int32_t transportSend(void* userData, const uint8_t* endpointsPtr, si
     for (size_t i = 0; i < endpoints.size(); ++i) {
       jsi::Object endpoint(rt);
       endpoint.setProperty(rt, "protocol",
-                            jsi::Value(rt, jsi::String::createFromUtf8(
-                                               rt, protocolToString(endpoints[i].second))));
+                            jsi::Value(rt, jsi::String::createFromUtf8(rt, endpoints[i].protocol)));
       endpoint.setProperty(rt, "uri",
-                            jsi::Value(rt, jsi::String::createFromUtf8(rt, endpoints[i].first)));
+                            jsi::Value(rt, jsi::String::createFromUtf8(rt, endpoints[i].uri)));
       endpointsJs.setValueAtIndex(rt, i, endpoint);
     }
     jsi::Value promise =

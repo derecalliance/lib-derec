@@ -97,6 +97,7 @@ pub extern "C" fn derec_error_code_name(code: i32) -> *const c_char {
         DEREC_CODE_FFI_BAD_SHARED_KEY => "ffi_bad_shared_key\0",
         DEREC_CODE_FFI_NUL_IN_STRING => "ffi_nul_in_string\0",
         DEREC_CODE_TRANSPORT_INVALID => "transport_invalid\0",
+        DEREC_CODE_NO_USABLE_ENDPOINT => "no_usable_endpoint\0",
         _ => "unknown\0",
     };
     name.as_ptr() as *const c_char
@@ -162,14 +163,26 @@ mod tests {
         assert_eq!(code(-1), "unknown");
     }
 
+    /// Every `DEREC_CODE_*` constant declared in `error.rs`, read from the
+    /// source so a new code cannot be left out of this check.
+    fn declared_codes() -> Vec<(String, i32)> {
+        include_str!("error.rs")
+            .lines()
+            .filter_map(|line| {
+                let rest = line.trim().strip_prefix("pub const DEREC_CODE_")?;
+                let (name, value) = rest.split_once(": i32 = ")?;
+                let value = value.trim_end_matches(';').parse().ok()?;
+                Some((format!("DEREC_CODE_{name}"), value))
+            })
+            .collect()
+    }
+
     #[test]
     fn every_declared_code_has_a_name() {
-        // Guards against a new DEREC_CODE_* constant landing without a name.
-        // Iterates DECLARED_CODES directly rather than a numeric range, so
-        // codes outside any particular range (e.g. the FFI_* and
-        // TRANSPORT_* families) are still covered.
-        for &value in DECLARED_CODES {
-            assert_ne!(code(value), "unknown", "declared code {value} has no name");
+        let declared = declared_codes();
+        assert!(!declared.is_empty(), "no DEREC_CODE_* constants were read");
+        for (name, value) in declared {
+            assert_ne!(code(value), "unknown", "{name} ({value}) has no name");
         }
     }
 
@@ -177,62 +190,10 @@ mod tests {
     fn undeclared_codes_are_unknown() {
         for value in [7777, 8888, -5] {
             assert!(
-                !DECLARED_CODES.contains(&value),
+                !declared_codes().iter().any(|(_, v)| *v == value),
                 "test value {value} collides with a declared code"
             );
             assert_eq!(code(value), "unknown");
         }
     }
-
-    const DECLARED_CODES: &[i32] = &[
-        crate::interop::ffi::error::DEREC_CODE_OK,
-        crate::interop::ffi::error::DEREC_CODE_NON_OK_STATUS,
-        crate::interop::ffi::error::DEREC_CODE_VERSION_MISMATCH,
-        crate::interop::ffi::error::DEREC_CODE_INVARIANT,
-        crate::interop::ffi::error::DEREC_CODE_INVALID_INPUT,
-        crate::interop::ffi::error::DEREC_CODE_PROTOBUF_DECODE,
-        crate::interop::ffi::error::DEREC_CODE_PROTOBUF_ENCODE,
-        crate::interop::ffi::error::DEREC_CODE_PROTOCOL_VIOLATION,
-        crate::interop::ffi::error::DEREC_CODE_STORE_ERROR,
-        crate::interop::ffi::error::DEREC_CODE_BUILDER_ERROR,
-        crate::interop::ffi::error::DEREC_CODE_MISSING_SHARED_KEY,
-        crate::interop::ffi::error::DEREC_CODE_ROLE_MISMATCH,
-        crate::interop::ffi::error::DEREC_CODE_REPLICA_ID_NOT_CONFIGURED,
-        crate::interop::ffi::error::DEREC_CODE_CHANNEL_ALREADY_PAIRED,
-        crate::interop::ffi::error::DEREC_CODE_ALREADY_RESTORED,
-        crate::interop::ffi::error::DEREC_CODE_RESTORE_CONFLICT,
-        crate::interop::ffi::error::DEREC_CODE_REPLICA_ID_CONFLICT,
-        crate::interop::ffi::error::DEREC_CODE_ENCRYPTION,
-        crate::interop::ffi::error::DEREC_CODE_KEYGEN,
-        crate::interop::ffi::error::DEREC_CODE_FINISH_PAIRING_INITIATOR,
-        crate::interop::ffi::error::DEREC_CODE_FINISH_PAIRING_RESPONDER,
-        crate::interop::ffi::error::DEREC_CODE_EMPTY_TRANSPORT_URI,
-        crate::interop::ffi::error::DEREC_CODE_INVALID_CONTACT_MESSAGE,
-        crate::interop::ffi::error::DEREC_CODE_INVALID_PAIR_REQUEST_MESSAGE,
-        crate::interop::ffi::error::DEREC_CODE_INVALID_PAIR_RESPONSE_MESSAGE,
-        crate::interop::ffi::error::DEREC_CODE_PREPAIR_HASH_MISMATCH,
-        crate::interop::ffi::error::DEREC_CODE_MISSING_REPLICA_ID,
-        crate::interop::ffi::error::DEREC_CODE_UNEXPECTED_REPLICA_ID,
-        crate::interop::ffi::error::DEREC_CODE_INCOMPATIBLE_PARAMETER_RANGE,
-        crate::interop::ffi::error::DEREC_CODE_EMPTY_CHANNELS,
-        crate::interop::ffi::error::DEREC_CODE_DUPLICATE_CHANNEL_ID,
-        crate::interop::ffi::error::DEREC_CODE_INVALID_THRESHOLD,
-        crate::interop::ffi::error::DEREC_CODE_EMPTY_SECRET_DATA,
-        crate::interop::ffi::error::DEREC_CODE_VSS_SHARE_FAILED,
-        crate::interop::ffi::error::DEREC_CODE_EMPTY_RESPONSES,
-        crate::interop::ffi::error::DEREC_CODE_EMPTY_COMMITTED_DEREC_SHARE,
-        crate::interop::ffi::error::DEREC_CODE_DECODE_COMMITTED_DEREC_SHARE,
-        crate::interop::ffi::error::DEREC_CODE_DECODE_DEREC_SHARE,
-        crate::interop::ffi::error::DEREC_CODE_SECRET_ID_MISMATCH,
-        crate::interop::ffi::error::DEREC_CODE_RECONSTRUCTION_FAILED,
-        crate::interop::ffi::error::DEREC_CODE_MALFORMED_RECOVERED_SECRET,
-        crate::interop::ffi::error::DEREC_CODE_FFI_NULL_PTR,
-        crate::interop::ffi::error::DEREC_CODE_FFI_BAD_LENGTH,
-        crate::interop::ffi::error::DEREC_CODE_FFI_BAD_UTF8,
-        crate::interop::ffi::error::DEREC_CODE_FFI_BAD_PROTO,
-        crate::interop::ffi::error::DEREC_CODE_FFI_INVALID_ENUM,
-        crate::interop::ffi::error::DEREC_CODE_FFI_BAD_SHARED_KEY,
-        crate::interop::ffi::error::DEREC_CODE_FFI_NUL_IN_STRING,
-        crate::interop::ffi::error::DEREC_CODE_TRANSPORT_INVALID,
-    ];
 }

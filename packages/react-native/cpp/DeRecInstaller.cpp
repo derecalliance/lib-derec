@@ -157,18 +157,6 @@ void install(jsi::Runtime& rt, std::shared_ptr<Invoker> invoker) {
 
   auto host = jsi::Object(rt);
 
-  host.setProperty(
-      rt, "version",
-      jsi::Function::createFromHostFunction(
-          rt, jsi::PropNameID::forAscii(rt, "version"), 0,
-          [](jsi::Runtime& rt, const jsi::Value&, const jsi::Value*, size_t)
-              -> jsi::Value {
-            DeRecProtocolVersion version = derec_protocol_version();
-            std::string text = std::to_string(version.major) + "." +
-                               std::to_string(version.minor);
-            return jsi::String::createFromUtf8(rt, text);
-          }));
-
   installPrimitives(rt, host);
 
   host.setProperty(

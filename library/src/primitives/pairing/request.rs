@@ -4,7 +4,6 @@
 use crate::extensions::advertised_endpoints::AdvertisedEndpoints as _;
 use crate::extensions::contact_message::ContactMessageExt as _;
 use crate::extensions::pair_request::PairRequestMessageExt as _;
-use crate::extensions::pre_pair_request::PrePairRequestMessageExt as _;
 use crate::extensions::transport_protocol::TransportProtocolExt as _;
 use crate::primitives::pairing::PairingError;
 use crate::utils::verify_timestamps;
@@ -106,15 +105,10 @@ pub struct PrePairExtractResult {
 /// # Transport ordering
 ///
 /// `own` carries every endpoint this application serves, in its own
-/// preference order. The whole list travels in `supported_transports`;
-/// the first entry is additionally copied into the legacy singular
-/// `transport_protocol` field so peers predating the offer list still
-/// find an endpoint to reach.
+/// preference order. The whole list travels in `supported_transports`.
 ///
 /// The order is the application's to choose and is never reinterpreted
-/// here. An application that needs to pair with peers predating gRPC
-/// support puts an HTTPS endpoint first, because those peers understand
-/// no other protocol discriminant.
+/// here.
 ///
 /// # Errors
 ///
@@ -293,16 +287,12 @@ pub fn create_contact(
 /// # Transport ordering
 ///
 /// `own` carries every endpoint this application serves, in its own
-/// preference order. The whole list travels in `supported_transports`;
-/// the first entry is additionally copied into the legacy singular
-/// `transport_protocol` field so peers predating the offer list still
-/// find an endpoint to reach. The order is never reinterpreted here.
+/// preference order. The whole list travels in `supported_transports`.
+/// The order is never reinterpreted here.
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = contact_message.channel_id, kind = kind as i32))
 )]
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 pub fn produce(
     kind: SenderKind,
     own: Vec<TransportProtocol>,
@@ -334,7 +324,6 @@ pub fn produce(
         nonce: contact_message.nonce,
         communication_info,
         parameter_range,
-        transport_protocol: Some(transport_protocol),
         timestamp: Some(timestamp),
         supported_transports: own,
     };
@@ -419,8 +408,6 @@ pub fn produce(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = contact_message.channel_id))
 )]
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 pub fn produce_pre_pair_request(
     own: Vec<TransportProtocol>,
     contact_message: &ContactMessage,
@@ -436,10 +423,6 @@ pub fn produce_pre_pair_request(
     let timestamp = current_timestamp();
     let request = PrePairRequestMessage {
         nonce: contact_message.nonce,
-        // The first entry also fills the deprecated singular field so a
-        // responder predating `supportedTransports` still knows where to
-        // reply. Same rule `create_contact` follows.
-        transport_protocol: own.first().cloned(),
         supported_transports: own,
         timestamp: Some(timestamp),
     };
@@ -558,8 +541,6 @@ pub fn produce_pre_pair_request(
     feature = "logging",
     tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
 )]
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 pub fn extract(
     envelope_bytes: &[u8],
     ecies_secret_key: &[u8],
@@ -593,13 +574,8 @@ pub fn extract(
     //
     // Endpoint *quality* is deliberately not decided here: a peer may
     // advertise several, and `TransportPolicy::admit_peer_endpoints` skips a
-    // bad one rather than refusing the whole request. Only the singular
-    // legacy field is structurally checked, exactly as before.
+    // bad one rather than refusing the whole request.
     request.validate()?;
-
-    if let Some(tp) = request.transport_protocol.as_ref() {
-        tp.validate()?;
-    }
 
     #[cfg(feature = "logging")]
     tracing::info!("pairing request extracted and validated");
@@ -669,16 +645,12 @@ pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, c
 
     verify_timestamps(envelope.timestamp, request.timestamp)?;
 
-    request.validate()?;
-
     #[cfg(feature = "logging")]
     tracing::info!("PrePair request envelope decoded and validated");
 
     Ok(PrePairExtractResult { request })
 }
 
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 fn validate_inputs(
     transport_protocol: &TransportProtocol,
     contact_message: &ContactMessage,
@@ -692,14 +664,10 @@ fn validate_inputs(
     }
     transport_protocol.validate()?;
 
-    // `validate` already refused a contact naming no endpoint at all, in
-    // either spelling. What remains is checking that what it does name is
-    // structurally sound.
+    // `validate` already refused a contact naming no endpoint at all. What
+    // remains is checking that what it does name is structurally sound.
     super::validate_contact_for_mode(contact_message, expected_mode)?;
 
-    // Read whichever spelling the contact used. A contact carrying only
-    // `supportedTransports` is valid: requiring the deprecated singular
-    // field would refuse a peer that has already moved past it.
     for endpoint in contact_message.advertised_endpoints() {
         if endpoint.uri.trim().is_empty() {
             #[cfg(feature = "logging")]

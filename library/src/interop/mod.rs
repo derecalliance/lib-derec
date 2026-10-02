@@ -31,5 +31,8 @@ pub mod dto;
 #[cfg(all(not(target_arch = "wasm32"), feature = "ffi"))]
 mod ffi;
 
+#[cfg(any(target_arch = "wasm32", feature = "ffi"))]
+mod protocol_names;
+
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;

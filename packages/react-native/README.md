@@ -98,7 +98,7 @@ const protocol = new DeRecProtocolBuilder(secretId) // bigint | number
   .withUserSecretStore(myUserSecretStore)
   .withStateStore(myStateStore)
   .withTransport(myTransport)
-  .withOwnTransport({ uri: 'https://owner.example.com', protocol: 'https' })
+  .withOwnTransports([{ uri: 'https://owner.example.com', protocol: 'https' }])
   .withThreshold(2)
   .build();
 
@@ -214,17 +214,6 @@ after whatever is in flight.
 ---
 
 ## Known differences from `@derec-alliance/nodejs`
-
-**`setCommunicationInfo()`, `setOwnTransport()` and `setOwnTransports()` return a `Promise`.**
-`@derec-alliance/nodejs` declares both `void`. Here they must not run on the
-JavaScript thread: the underlying FFI setter takes the same handle lock a
-running flow holds across its store callbacks, and those callbacks block the
-worker until JavaScript settles them — so a synchronous setter would block
-the JavaScript thread on a lock only the JavaScript thread can release. The
-binding queues them onto the same serial worker every flow runs on instead.
-The nodejs SDK is WASM and single-threaded, so it cannot hit this. Code that
-ignores the return value — the way nodejs code calls these — is unaffected;
-awaiting them additionally lets a failure surface instead of vanishing.
 
 **The `DeRecErrorCategory` union differs from nodejs's.** This SDK's union
 omits `"wasm"`, which a C-ABI binding can never emit, and adds `"ok"`,

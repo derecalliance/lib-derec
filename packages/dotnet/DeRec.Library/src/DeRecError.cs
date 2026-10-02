@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+using System.Runtime.InteropServices;
+
 namespace DeRec.Library;
 
 /// <summary>
@@ -26,6 +28,13 @@ public static class DeRecCategory
     public const int Protobuf = 13;
     public const int Invariant = 14;
     public const int StateStore = 15;
+
+    /// <summary>
+    /// Stable name of a category value, e.g. <c>"pairing"</c>, or
+    /// <c>"unknown"</c> for a value the library does not define.
+    /// </summary>
+    public static string Name(int category) =>
+        Marshal.PtrToStringUTF8(Native.Utils.derec_error_category_name(category)) ?? "unknown";
 }
 
 /// <summary>
@@ -208,16 +217,12 @@ public static class DeRecCode
     /// </summary>
     public const int NoUsableEndpoint = 121;
 
+    // 122 is retired (formerly the conflicting plaintext opt-in); never reassign it.
+
     /// <summary>
-    /// Both plaintext opt-in flags were set explicitly and disagree: the
-    /// deprecated <c>WithUnsafeHttp</c> says one thing and
-    /// <c>WithUnsafeConnection</c> the other. Raised at protocol construction
-    /// rather than resolved by precedence, because the flag precedence would
-    /// favour is the one being removed, and a configuration layer that emits
-    /// every field unconditionally would otherwise let a defaulted value
-    /// silently beat a deliberate one. Set only <c>WithUnsafeConnection</c>.
-    /// <see cref="DeRecException.Category"/> is
-    /// <see cref="DeRecCategory.InvalidInput"/>.
+    /// Stable name of a code value, e.g. <c>"no_usable_endpoint"</c>, or
+    /// <c>"unknown"</c> for a value the library does not define.
     /// </summary>
-    public const int ConflictingPlaintextOptIn = 122;
+    public static string Name(int code) =>
+        Marshal.PtrToStringUTF8(Native.Utils.derec_error_code_name(code)) ?? "unknown";
 }

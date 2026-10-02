@@ -357,5 +357,139 @@ export function runPrimitivesSmoke(): void {
 
   console.log("✓ Pairing flow (HASHED_KEYS + PrePair) passed.\n");
 
+  // NO_KEYS contacts carry neither keys nor a commitment; the nonce is the
+  // only correlator, so the application supplies it (typically a short,
+  // human-typable value) instead of letting the library draw a random one.
+
+  console.log("=== [Primitives] Contact creation (NO_KEYS + explicit nonce) ===");
+
+  const noKeysChannelId = 3n;
+  const noKeysNonce = 424242n;
+  const nkContact = primitives.pairing.request.create_contact(
+    noKeysChannelId,
+    ContactMode.NoKeys,
+    [{ protocol: 0, uri: "https://example.com/alice/ephemeral" }],
+    noKeysNonce,
+  );
+  if (nkContact.contact_message.contact_mode !== ContactMode.NoKeys) {
+    throw new Error("NO_KEYS contact must advertise contact_mode = NoKeys");
+  }
+  if (BigInt(nkContact.contact_message.nonce) !== noKeysNonce) {
+    throw new Error(
+      `NO_KEYS contact must carry the caller's nonce (expected ${noKeysNonce}, got ${nkContact.contact_message.nonce})`,
+    );
+  }
+  console.log(`  contact carries the caller-supplied nonce ${noKeysNonce}  ✓`);
+
+  console.log("✓ Contact creation (NO_KEYS + explicit nonce) passed.\n");
+
+  // NO_KEYS pairing: the contact creator generates key material only when the
+  // PrePair request arrives, and the scanner accepts the published keys with
+  // no commitment to check them against. The nonce is the only thing that
+  // authenticates the request, and the pairing is confirmed by comparing the
+  // shared key's fingerprint out of band.
+
+  console.log("=== [Primitives] Pairing Flow (NO_KEYS + PrePair + fingerprint) ===");
+
+  // Bob (the scanner) asks for keys the contact does not carry.
+  const nkPrePairRequestEnvelope = primitives.pairing.request.produce_pre_pair(
+    [{ protocol: 0, uri: "https://example.com/helper/ephemeral" }],
+    nkContact.contact_message,
+  );
+
+  // Alice decodes the request and MUST match its nonce against the contact
+  // she issued before answering.
+  const { request: nkPrePairReq }: { request: PrePairRequestMessage } =
+    primitives.pairing.request.extract_pre_pair(nkPrePairRequestEnvelope.envelope);
+  if (BigInt(nkPrePairReq.nonce) !== BigInt(nkContact.contact_message.nonce)) {
+    throw new Error("NO_KEYS PrePair request must echo the contact's nonce");
+  }
+
+  // Alice generates this pairing's key material now; she MUST persist it,
+  // because the pair request that follows is encrypted to it.
+  const nkPrePairResponseEnvelope = primitives.pairing.response.produce_pre_pair_no_keys(
+    noKeysChannelId, nkPrePairReq,
+  );
+  if (nkPrePairResponseEnvelope.secret_key_material.length === 0) {
+    throw new Error("NO_KEYS PrePair response must return secret key material");
+  }
+
+  // Bob decodes the response and accepts the published keys.
+  const { response: nkPrePairResp }: { response: PrePairResponseMessage } =
+    primitives.pairing.response.extract_pre_pair(nkPrePairResponseEnvelope.envelope);
+  const nkAccepted = primitives.pairing.response.process_pre_pair_no_keys(
+    nkContact.contact_message, nkPrePairResp,
+  );
+  if (BigInt(nkAccepted.nonce) !== noKeysNonce) {
+    throw new Error("NO_KEYS PrePair response must echo the contact's nonce");
+  }
+  console.log(`  PrePair accepted (mlkem=${nkAccepted.mlkem_encapsulation_key.length}B, ecies=${nkAccepted.ecies_public_key.length}B, nonce echoed)  ✓`);
+
+  // Same filled-in contact rewrite as HASHED_KEYS: copy the accepted keys
+  // into the contact and flip it to InlineKeys.
+  const { contact_binding_hash: _nkOmitBindingHash, ...nkContactBase } =
+    nkContact.contact_message;
+  const nkFilledInContact: ContactMessage = {
+    ...nkContactBase,
+    contact_mode: ContactMode.InlineKeys,
+    mlkem_encapsulation_key: nkAccepted.mlkem_encapsulation_key,
+    ecies_public_key: nkAccepted.ecies_public_key,
+  };
+
+  const nkPairingRequest = primitives.pairing.request.produce(
+    SenderKind.Helper,
+    [{ protocol: 0, uri: "https://example.com/helper" }],
+    nkFilledInContact,
+    null,
+    null,
+  );
+  const { request: nkPairRequest }: { request: PairRequestMessage } =
+    primitives.pairing.request.extract(
+      nkPairingRequest.envelope, nkPrePairResponseEnvelope.secret_key_material,
+    );
+  const nkProduced = primitives.pairing.response.produce(
+    noKeysChannelId, nkPairRequest, nkPrePairResponseEnvelope.secret_key_material, null, null,
+  );
+  const { response: nkPairResponse }: { response: PairResponseMessage } =
+    primitives.pairing.response.extract(nkProduced.envelope, nkPairingRequest.secret_key);
+  const nkProcessed = primitives.pairing.response.process(
+    nkPairingRequest.initiator_contact_message as ContactMessage,
+    nkPairResponse,
+    nkPairingRequest.secret_key,
+  );
+  if (nkProduced.shared_key.length !== nkProcessed.shared_key.length ||
+      !nkProduced.shared_key.every((b, i) => b === nkProcessed.shared_key[i])) {
+    throw new Error("NO_KEYS pairing: shared keys do not match");
+  }
+  if (nkProduced.channel_id !== nkProcessed.channel_id) {
+    throw new Error(
+      `NO_KEYS pairing: rekeyed channel id mismatch (produce=${nkProduced.channel_id} process=${nkProcessed.channel_id})`,
+    );
+  }
+  console.log(`  shared keys match (${nkProduced.shared_key.length}B)  ✓`);
+
+  // Both sides MUST compare this out of band before using the channel.
+  const creatorFingerprint = primitives.pairing.fingerprint(nkProduced.shared_key);
+  const scannerFingerprint = primitives.pairing.fingerprint(nkProcessed.shared_key);
+  if (creatorFingerprint.length === 0 || creatorFingerprint !== scannerFingerprint) {
+    throw new Error(
+      `NO_KEYS pairing: fingerprints must be equal and non-empty (creator=${creatorFingerprint} scanner=${scannerFingerprint})`,
+    );
+  }
+  console.log(`  fingerprints match (${creatorFingerprint})  ✓`);
+
+  let shortKeyRefused = false;
+  try {
+    primitives.pairing.fingerprint(new Uint8Array(31));
+  } catch {
+    shortKeyRefused = true;
+  }
+  if (!shortKeyRefused) {
+    throw new Error("fingerprint must refuse a 31-byte key");
+  }
+  console.log(`  31-byte key refused  ✓`);
+
+  console.log("✓ Pairing flow (NO_KEYS + PrePair + fingerprint) passed.\n");
+
   console.log("━━━ [Primitives] All passed. ━━━\n");
 }

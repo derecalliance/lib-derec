@@ -50,7 +50,7 @@ impl<
             }
         };
 
-        Ok(derec_cryptography::replica::fingerprint(&shared_key))
+        Ok(crate::primitives::pairing::fingerprint(&shared_key))
     }
 
     /// Verify that a fingerprint matches the one derived from a channel's shared key.
@@ -173,10 +173,10 @@ impl<
 
     /// The scheme policy this protocol applies to every transport endpoint
     /// that reaches it. Built from
-    /// [`DeRecProtocolBuilder::with_unsafe_http`](crate::protocol::DeRecProtocolBuilder::with_unsafe_http); see
+    /// [`DeRecProtocolBuilder::with_unsafe_connection`](crate::protocol::DeRecProtocolBuilder::with_unsafe_connection); see
     /// [`TransportPolicy`](crate::transport::TransportPolicy).
     pub(crate) fn transport_policy(&self) -> crate::transport::TransportPolicy {
-        crate::transport::TransportPolicy::new(self.unsafe_http)
+        crate::transport::TransportPolicy::new(self.unsafe_connection)
     }
 }
 

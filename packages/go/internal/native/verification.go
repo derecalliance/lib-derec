@@ -72,13 +72,17 @@ func bytePtr(s []byte) *byte {
 	return &s[0]
 }
 
-func ProduceVerifyShareRequest(channelID, secretID uint64, version uint32, sharedKey []byte) ([]byte, error) {
+func ProduceVerifyShareRequest(channelID, secretID uint64, version uint32, sharedKey []byte, replyTo []Endpoint) ([]byte, error) {
 	produceVerifyReqOnce.Do(func() {
 		purego.RegisterFunc(&produceVerifyReqFn, symbol("produce_verify_share_request_message"))
 	})
+	replyToBytes, err := encodeEndpointList(replyTo)
+	if err != nil {
+		return nil, err
+	}
 	res := produceVerifyReqFn(channelID, secretID, version,
 		bytePtr(sharedKey), uintptr(len(sharedKey)),
-		nil, 0)
+		bytePtr(replyToBytes), uintptr(len(replyToBytes)))
 	if err := errorFrom(res.Error); err != nil {
 		return nil, err
 	}

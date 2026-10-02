@@ -378,6 +378,7 @@ async fn commit_snapshot<S: StoreSet>(
                 secrets: secret.secrets.clone(),
                 description: None,
                 replicas: secret.replicas.clone(),
+                author_replica_id: None,
             },
         )
         .await?;
@@ -657,8 +658,7 @@ mod tests {
             // separate decision with its own convergence rules — so a device
             // built without a replica_id still has none after restore.
             assert_eq!(
-                rig.protocol.replica_id(),
-                None,
+                rig.protocol.replica_id, None,
                 "restore must not adopt the roster source's replica_id"
             );
         });
@@ -1065,6 +1065,7 @@ mod tests {
                     secrets: Vec::new(),
                     description: None,
                     replicas: None,
+                    author_replica_id: None,
                 },
             );
 
@@ -1190,7 +1191,7 @@ mod tests {
                 .expect("build");
 
             protocol.restore(&fixture_secret(), 7).await.unwrap();
-            assert_eq!(protocol.replica_id(), Some(0x1234));
+            assert_eq!(protocol.replica_id, Some(0x1234));
         });
     }
 }

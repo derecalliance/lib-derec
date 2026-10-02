@@ -314,14 +314,21 @@ internal static class Protocol
         IntPtr handle, byte[] infoJson, UIntPtr infoJsonLen);
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
-    internal static extern DeRecError derec_protocol_set_own_transport(
-        IntPtr handle, byte[] uri, UIntPtr uriLen, int protocol);
-
-    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern DeRecError derec_protocol_set_own_transports(
         IntPtr handle, byte[] transportsJson, UIntPtr transportsJsonLen);
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
-    internal static extern DeRecProtocolEventsResult derec_protocol_restore(
+    internal static extern ulong derec_generate_replica_id();
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct DeRecProtocolRestoreResult
+    {
+        public DeRecError Error;
+        public Buffer EventsJson;
+        public Buffer ConflictingChannelIdsJson;
+    }
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern DeRecProtocolRestoreResult derec_protocol_restore(
         IntPtr handle, byte[] paramsJson, UIntPtr paramsJsonLen);
 }

@@ -22,7 +22,7 @@ func TestDiscoveryRequestRoundTrip(t *testing.T) {
 	const channelID = uint64(7)
 	key := sharedKey()
 
-	requestWire, err := discovery.Request.Produce(channelID, key)
+	requestWire, err := discovery.Request.Produce(channelID, key, nil)
 	if err != nil {
 		t.Fatalf("request produce: %v", err)
 	}

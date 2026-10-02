@@ -389,8 +389,14 @@ public sealed record UserSecretEntry(byte[] Id, string Name, byte[] Data);
 /// application calls <c>start(FlowKind.ProtectSecret)</c>. The
 /// pair-completion auto-publish hook reads it back so freshly-paired
 /// peers receive the current secret without an explicit re-publish.
+/// <para>
+/// <see cref="AuthorReplicaId"/> is the replica member that published
+/// <see cref="Version"/>, or <c>null</c> when the snapshot records no author.
+/// Persist it with the snapshot and return it unchanged: a replica compares
+/// it against incoming copies of the same version to detect conflicts.
+/// </para>
 /// </summary>
-public sealed record UserSecrets(uint Version, UserSecretEntry[] Secrets, string? Description);
+public sealed record UserSecrets(uint Version, UserSecretEntry[] Secrets, string? Description, ulong? AuthorReplicaId = null);
 
 /// <summary>
 /// Persistence for the user-facing secret contents, keyed by
@@ -596,7 +602,12 @@ public enum StateKind : uint
     PendingRecovery = 1,
     /// <summary>Outstanding unpair acknowledgements, one per channel.</summary>
     PendingUnpair = 2,
-    /// <summary>Active sharing round, at most one per secretId.</summary>
+    /// <summary>
+    /// Active sharing round, one row per in-flight version. Several can be
+    /// open at once: publishes are started by the pair-completion hook and by
+    /// the promotion inside <c>verify_fingerprint</c>, not only by
+    /// <c>start(ProtectSecret)</c>.
+    /// </summary>
     SharingRound = 3,
     /// <summary>
     /// Active replica catch-up, at most one row per <c>secretId</c>. Holds
@@ -611,7 +622,6 @@ public enum StateKind : uint
 /// <see cref="Kind"/>.
 /// </summary>
 /// <param name="Kind">Row category.</param>
-/// <param name="Kind">Row category.</param>
 /// <param name="ChannelId">Set for <see cref="StateKind.PendingVerification"/> and <see cref="StateKind.PendingUnpair"/>.</param>
 /// <param name="SecretId">
 /// The secret being recovered, set for <see cref="StateKind.PendingRecovery"/>.
@@ -619,7 +629,12 @@ public enum StateKind : uint
 /// device runs an ephemeral instance whose own id owns the partition while
 /// the target belongs to the wire.
 /// </param>
-/// <param name="Version">Set for <see cref="StateKind.PendingRecovery"/>.</param>
+/// <param name="Version">
+/// Set for <see cref="StateKind.PendingRecovery"/> and
+/// <see cref="StateKind.SharingRound"/>. A sharing round is scoped to the
+/// version it distributes, so rounds for distinct versions accumulate
+/// independently.
+/// </param>
 public sealed record StateKey(StateKind Kind, ulong? ChannelId, ulong? SecretId, uint? Version)
 {
     public static StateKey PendingVerification(ulong channelId) =>
@@ -628,8 +643,8 @@ public sealed record StateKey(StateKind Kind, ulong? ChannelId, ulong? SecretId,
         new(StateKind.PendingRecovery, null, secretId, version);
     public static StateKey PendingUnpair(ulong channelId) =>
         new(StateKind.PendingUnpair, channelId, null, null);
-    public static StateKey SharingRound() =>
-        new(StateKind.SharingRound, null, null, null);
+    public static StateKey SharingRound(uint version) =>
+        new(StateKind.SharingRound, null, null, version);
     public static StateKey PendingReplicaDiscovery() =>
         new(StateKind.PendingReplicaDiscovery, null, null, null);
 }
@@ -690,7 +705,8 @@ public sealed record StateItem(
             Version ?? throw new InvalidOperationException("PendingRecovery requires Version")),
         StateKind.PendingUnpair => StateKey.PendingUnpair(
             ChannelId ?? throw new InvalidOperationException("PendingUnpair requires ChannelId")),
-        StateKind.SharingRound => StateKey.SharingRound(),
+        StateKind.SharingRound => StateKey.SharingRound(
+            Version ?? throw new InvalidOperationException("SharingRound requires Version")),
         StateKind.PendingReplicaDiscovery => StateKey.PendingReplicaDiscovery(),
         _ => throw new InvalidOperationException($"unknown StateKind: {Kind}"),
     };

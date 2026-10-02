@@ -136,8 +136,7 @@ as **peer** endpoints during pairing, so `check_peer` is what decides — and
 it refuses. "It's all localhost" is not a reason to expect this to work.
 
 `with_unsafe_connection` covers both plaintext schemes (`http://` and
-`grpc://`). It supersedes the deprecated `with_unsafe_http`. It is a
-development switch: in production, advertise `grpcs://` and leave it off.
+`grpc://`). It is a development switch: in production, advertise `grpcs://` and leave it off.
 
 ## What to copy
 

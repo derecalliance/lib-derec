@@ -74,24 +74,14 @@ message VerifyShareRequestMessage {
   // - timeout handling
   google.protobuf.Timestamp timestamp = 4;
 
-  // Ephemeral transport endpoint at which the requester wants to receive
-  // the response to *this exchange*, overriding the channel's stored peer
-  // endpoint for this round-trip only.
-  //
-  // See `StoreShareRequestMessage.replyTo` for full semantics.
-  //
-  // Superseded by `replyToTransports`, which carries every endpoint rather
-  // than one. Kept, and still populated with the list's first entry, so
-  // implementations predating that field still receive a reply.
-  // **Scheduled for removal in v0.0.5.** Reading this field directly is now
-  // incorrect — resolve it against `replyToTransports`.
-  optional TransportProtocol replyTo = 5 [deprecated = true];
+  // Formerly the singular `replyTo`, superseded by `replyToTransports`.
+  reserved 5;
+  reserved "replyTo";
 
   // Every ephemeral endpoint the requester wants this exchange's response
   // delivered to, in its own preference order.
   //
-  // See `StoreShareRequestMessage.replyToTransports` for full semantics,
-  // including why this is a new tag rather than a widened `replyTo`.
+  // See `StoreShareRequestMessage.replyToTransports` for full semantics.
   repeated TransportProtocol replyToTransports = 6;
 }
 

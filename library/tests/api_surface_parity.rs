@@ -104,6 +104,8 @@ const SDK_HELPERS: &[(&str, &[&str])] = &[
         &[
             "packages/dotnet/DeRec.Library/src/Protocol/Stores.cs",
             "packages/dotnet/DeRec.Library/src/ContactMessage.cs",
+            "packages/dotnet/DeRec.Library/src/ProtocolVersion.cs",
+            "packages/dotnet/DeRec.Library/src/Protocol/DeRecProtocolBuilder.cs",
         ],
     ),
     (
@@ -112,6 +114,8 @@ const SDK_HELPERS: &[(&str, &[&str])] = &[
             "packages/go/internal/native/store_types.go",
             "packages/go/derecpb/endpoints.go",
             "packages/go/protocol/stores.go",
+            "packages/go/derec/version.go",
+            "packages/go/derec/replica_id.go",
         ],
     ),
     (
@@ -736,9 +740,30 @@ fn qualified_paths(line: &str) -> Vec<(String, String)> {
 /// Split horizons are what this catches. They are never a decision — they are
 /// what happens when two notes are written weeks apart — and a consumer
 /// planning one migration reads them as two.
+///
+/// A `null` horizon means no wave is open, and then nothing may be deprecated:
+/// a deprecation without a declared removal version is the same defect with
+/// no version at all.
 #[test]
 fn every_deprecation_shares_the_release_horizon() {
     let horizon = &fixture()["documented_api"]["deprecation_horizon"];
+    let found = deprecations();
+
+    if horizon.is_null() {
+        assert!(
+            found.is_empty(),
+            "these symbols are deprecated but no deprecation wave is open:\n  {}\n\n\
+             Declare `documented_api.deprecation_horizon` in api_surface.json \
+             with the version they are removed at.",
+            found
+                .iter()
+                .map(|(rel, symbol, _)| format!("{rel}: `{symbol}`"))
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        );
+        return;
+    }
+
     let since = horizon["since"].as_str().expect("horizon names a `since`");
     let removed_at = horizon["removed_at"]
         .as_str()
@@ -751,11 +776,9 @@ fn every_deprecation_shares_the_release_horizon() {
         .collect();
 
     let mut wrong: Vec<String> = Vec::new();
-    let mut checked = 0usize;
 
-    for (rel, symbol, attr) in deprecations() {
-        checked += 1;
-        if exceptions.contains(&symbol) {
+    for (rel, symbol, attr) in &found {
+        if exceptions.contains(symbol) {
             continue;
         }
         if !attr.contains(&format!("since = \"{since}\"")) {
@@ -772,8 +795,9 @@ fn every_deprecation_shares_the_release_horizon() {
     }
 
     assert!(
-        checked > 0,
-        "no `#[deprecated]` attributes were found — the walk is reading nothing"
+        !found.is_empty(),
+        "a deprecation wave is open but no `#[deprecated]` attributes were found; \
+         set `documented_api.deprecation_horizon` to null once the wave is removed"
     );
     assert!(
         wrong.is_empty(),
@@ -810,7 +834,12 @@ fn changelog_names_every_deprecated_symbol() {
 /// text).
 fn deprecations() -> Vec<(String, String, String)> {
     let mut out = Vec::new();
-    for rel in rust_sources("library/src") {
+    let sources = rust_sources("library/src");
+    assert!(
+        !sources.is_empty(),
+        "no library sources were found — the walk is reading nothing"
+    );
+    for rel in sources {
         let src = read(&rel);
         let mut lines = src.lines().peekable();
         while let Some(line) = lines.next() {

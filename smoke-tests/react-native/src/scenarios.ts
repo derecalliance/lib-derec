@@ -143,7 +143,7 @@ function buildSlowProtocol(storeDelayMs: number) {
     .withUserSecretStore(new EmptyUserSecretStore())
     .withStateStore(new EmptyStateStore())
     .withTransport(new DiscardingTransport())
-    .withOwnTransport({ uri: "https://teardown.example", protocol: "https" })
+    .withOwnTransports([{ uri: "https://teardown.example", protocol: "https" }])
     .build();
 }
 

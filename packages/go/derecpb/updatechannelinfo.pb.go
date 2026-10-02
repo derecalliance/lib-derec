@@ -31,7 +31,7 @@ const (
 //
 // # Context
 //
-// Both `communication_info` and `transport_protocol` are exchanged at pairing
+// Both `communication_info` and the transport endpoints are exchanged at pairing
 // time only. This message lets either party (Owner or Helper) propagate
 // post-pairing changes without re-pairing.
 //
@@ -45,16 +45,16 @@ const (
 //     stored map with the supplied one." Updates, additions, and deletions
 //     are all expressed by the difference between the receiver's current map
 //     and the supplied one.
-//   - `transport_protocol` absent means "do not modify the transport endpoint
-//     stored for the sender." Presence means "the sender's transport endpoint
-//     is now this value." The receiver MUST route subsequent messages on this
-//     channel to the new endpoint, including the
+//   - `supported_transports` empty means "do not modify the transport
+//     endpoints stored for the sender." Non-empty means "the sender's transport
+//     endpoints are now these." The receiver MUST route subsequent messages on
+//     this channel to the new endpoints, including the
 //     UpdateChannelInfoResponseMessage for this request.
 //
 // # Endpoint changeover
 //
-// When `transport_protocol` is updated, the receiver sends its response to
-// the new endpoint. The sender's application is therefore responsible for
+// When `supported_transports` is updated, the receiver sends its response to
+// the new endpoints. The sender's application is therefore responsible for
 // ensuring the new endpoint is reachable BEFORE this request is issued, and
 // for keeping the old endpoint operational long enough for in-flight
 // messages from other peers (and any concurrent operations) to drain.
@@ -65,50 +65,16 @@ type UpdateChannelInfoRequestMessage struct {
 	// Presence (even with an empty entries list) replaces the receiver's
 	// stored map for this channel. Absence leaves it untouched.
 	CommunicationInfo *CommunicationInfo `protobuf:"bytes,1,opt,name=communicationInfo,proto3,oneof" json:"communicationInfo,omitempty"`
-	// Updated transport endpoint for the sender, or absent to leave unchanged.
-	//
-	// Presence updates both the URI and protocol enum. The receiver routes
-	// the response to this new endpoint.
-	//
-	// Deprecated: superseded by `supportedTransports`, which carries every
-	// endpoint rather than one.
-	//
-	// **Reading this field directly is now incorrect.** Its meaning narrowed
-	// from "the endpoint" to "one entry of a list, and possibly absent": a
-	// sender that has moved past this field announces only
-	// `supportedTransports`. A reader that was correct before this release is
-	// a bug now — it records the wrong address, or none, for a peer that
-	// announced a perfectly good one. Resolve both spellings instead of
-	// reading either: `advertised_endpoints()` (Rust and TypeScript),
-	// `AdvertisedEndpoints()` (Go), `AdvertisedEndpoints()` (.NET).
-	//
-	// Senders still populate it: a sender that sets `supportedTransports`
-	// MUST also set this to a single best-compatibility choice, so
-	// implementations predating the list still learn the new address.
-	//
-	// **Scheduled for removal in v0.0.5.**
-	//
-	// Deprecated: Marked as deprecated in updatechannelinfo.proto.
-	TransportProtocol *TransportProtocol `protobuf:"bytes,2,opt,name=transportProtocol,proto3,oneof" json:"transportProtocol,omitempty"`
 	// Every transport endpoint the sender can now be reached on, in its own
 	// preference order, replacing the receiver's stored set for this channel.
 	//
 	// # Semantics
 	//
-	//   - Empty, and `transportProtocol` absent: the sender's endpoints are
-	//     left unchanged. An update that changes only `communicationInfo` says
-	//     nothing about transports.
+	//   - Empty: the sender's endpoints are left unchanged. An update that
+	//     changes only `communicationInfo` says nothing about transports.
 	//   - Non-empty: replaces the stored set outright. Unlike a request's
-	//     `replyTo`, this **is** persisted — it is how a peer announces it has
-	//     moved.
-	//
-	// # Compatibility
-	//
-	// Empty with `transportProtocol` present means "only that one endpoint is
-	// offered", which is how every implementation predating this field
-	// behaves. A sender populating this list MUST also set
-	// `transportProtocol` to a single best-compatibility choice so those
-	// implementations still learn the new address.
+	//     `replyToTransports`, this **is** persisted — it is how a peer
+	//     announces it has moved.
 	SupportedTransports []*TransportProtocol `protobuf:"bytes,4,rep,name=supportedTransports,proto3" json:"supportedTransports,omitempty"`
 	// Timestamp indicating when this message was created.
 	//
@@ -156,14 +122,6 @@ func (x *UpdateChannelInfoRequestMessage) GetCommunicationInfo() *CommunicationI
 	return nil
 }
 
-// Deprecated: Marked as deprecated in updatechannelinfo.proto.
-func (x *UpdateChannelInfoRequestMessage) GetTransportProtocol() *TransportProtocol {
-	if x != nil {
-		return x.TransportProtocol
-	}
-	return nil
-}
-
 func (x *UpdateChannelInfoRequestMessage) GetSupportedTransports() []*TransportProtocol {
 	if x != nil {
 		return x.SupportedTransports
@@ -186,8 +144,8 @@ func (x *UpdateChannelInfoRequestMessage) GetTimestamp() *timestamppb.Timestamp 
 // On success (`result.status == OK`):
 //
 //   - the receiver has persisted the supplied updates
-//   - subsequent messages from the receiver MUST use the new endpoint, if
-//     `transport_protocol` was updated
+//   - subsequent messages from the receiver MUST use the new endpoints, if
+//     `supported_transports` was updated
 //
 // On failure:
 //
@@ -251,14 +209,12 @@ var File_updatechannelinfo_proto protoreflect.FileDescriptor
 
 const file_updatechannelinfo_proto_rawDesc = "" +
 	"\n" +
-	"\x17updatechannelinfo.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x17communicationinfo.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\xc2\x03\n" +
+	"\x17updatechannelinfo.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x17communicationinfo.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\xd9\x02\n" +
 	"\x1fUpdateChannelInfoRequestMessage\x12f\n" +
-	"\x11communicationInfo\x18\x01 \x01(\v23.org.derecalliance.derec.protobuf.CommunicationInfoH\x00R\x11communicationInfo\x88\x01\x01\x12j\n" +
-	"\x11transportProtocol\x18\x02 \x01(\v23.org.derecalliance.derec.protobuf.TransportProtocolB\x02\x18\x01H\x01R\x11transportProtocol\x88\x01\x01\x12e\n" +
+	"\x11communicationInfo\x18\x01 \x01(\v23.org.derecalliance.derec.protobuf.CommunicationInfoH\x00R\x11communicationInfo\x88\x01\x01\x12e\n" +
 	"\x13supportedTransports\x18\x04 \x03(\v23.org.derecalliance.derec.protobuf.TransportProtocolR\x13supportedTransports\x128\n" +
 	"\ttimestamp\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestampB\x14\n" +
-	"\x12_communicationInfoB\x14\n" +
-	"\x12_transportProtocol\"\xa3\x01\n" +
+	"\x12_communicationInfoJ\x04\b\x02\x10\x03R\x11transportProtocol\"\xa3\x01\n" +
 	" UpdateChannelInfoResponseMessage\x12E\n" +
 	"\x06result\x18\x01 \x01(\v2-.org.derecalliance.derec.protobuf.DeRecResultR\x06result\x128\n" +
 	"\ttimestamp\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestampb\x06proto3"
@@ -286,16 +242,15 @@ var file_updatechannelinfo_proto_goTypes = []any{
 }
 var file_updatechannelinfo_proto_depIdxs = []int32{
 	2, // 0: org.derecalliance.derec.protobuf.UpdateChannelInfoRequestMessage.communicationInfo:type_name -> org.derecalliance.derec.protobuf.CommunicationInfo
-	3, // 1: org.derecalliance.derec.protobuf.UpdateChannelInfoRequestMessage.transportProtocol:type_name -> org.derecalliance.derec.protobuf.TransportProtocol
-	3, // 2: org.derecalliance.derec.protobuf.UpdateChannelInfoRequestMessage.supportedTransports:type_name -> org.derecalliance.derec.protobuf.TransportProtocol
-	4, // 3: org.derecalliance.derec.protobuf.UpdateChannelInfoRequestMessage.timestamp:type_name -> google.protobuf.Timestamp
-	5, // 4: org.derecalliance.derec.protobuf.UpdateChannelInfoResponseMessage.result:type_name -> org.derecalliance.derec.protobuf.DeRecResult
-	4, // 5: org.derecalliance.derec.protobuf.UpdateChannelInfoResponseMessage.timestamp:type_name -> google.protobuf.Timestamp
-	6, // [6:6] is the sub-list for method output_type
-	6, // [6:6] is the sub-list for method input_type
-	6, // [6:6] is the sub-list for extension type_name
-	6, // [6:6] is the sub-list for extension extendee
-	0, // [0:6] is the sub-list for field type_name
+	3, // 1: org.derecalliance.derec.protobuf.UpdateChannelInfoRequestMessage.supportedTransports:type_name -> org.derecalliance.derec.protobuf.TransportProtocol
+	4, // 2: org.derecalliance.derec.protobuf.UpdateChannelInfoRequestMessage.timestamp:type_name -> google.protobuf.Timestamp
+	5, // 3: org.derecalliance.derec.protobuf.UpdateChannelInfoResponseMessage.result:type_name -> org.derecalliance.derec.protobuf.DeRecResult
+	4, // 4: org.derecalliance.derec.protobuf.UpdateChannelInfoResponseMessage.timestamp:type_name -> google.protobuf.Timestamp
+	5, // [5:5] is the sub-list for method output_type
+	5, // [5:5] is the sub-list for method input_type
+	5, // [5:5] is the sub-list for extension type_name
+	5, // [5:5] is the sub-list for extension extendee
+	0, // [0:5] is the sub-list for field type_name
 }
 
 func init() { file_updatechannelinfo_proto_init() }

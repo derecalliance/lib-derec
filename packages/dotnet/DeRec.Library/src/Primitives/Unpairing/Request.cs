@@ -73,7 +73,7 @@ public static partial class Unpairing
             {
                 Utils.ThrowIfError(nativeResult.Error);
                 string memo = nativeResult.Memo != IntPtr.Zero
-                    ? Marshal.PtrToStringAnsi(nativeResult.Memo) ?? string.Empty
+                    ? Marshal.PtrToStringUTF8(nativeResult.Memo) ?? string.Empty
                     : string.Empty;
                 byte[] innerBytes = Utils.CopyBuffer(nativeResult.RequestProtoBytes);
                 var inner = Org.Derecalliance.Derec.Protobuf.UnpairRequestMessage.Parser
@@ -82,7 +82,7 @@ public static partial class Unpairing
                 {
                     ChannelId = nativeResult.ChannelId,
                     Memo = memo,
-                    ReplyTo = TransportProtocol.ResolveReplyTo(inner.ReplyTo, inner.ReplyToTransports),
+                    ReplyTo = TransportProtocol.ResolveReplyTo(inner.ReplyToTransports),
                 };
             }
             finally

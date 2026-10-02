@@ -13,8 +13,11 @@
 // / Request.ExtractPrePair / Response.ProducePrePair /
 // Response.ExtractPrePair / Response.ProcessPrePair), after which the
 // caller republishes the validated keys into an INLINE_KEYS-shaped contact
-// and proceeds with the normal handshake. ContactModeNoKeys is a separate
-// flow, not covered here.
+// and proceeds with the normal handshake. ContactModeNoKeys runs the same
+// PrePair exchange with Response.ProducePrePairNoKeys and
+// Response.ProcessPrePairNoKeys; nothing binds those keys to the contact, so
+// the resulting pairing MUST be confirmed by comparing Fingerprint out of
+// band before use.
 package pairing
 
 import "github.com/derecalliance/lib-derec/packages/go/internal/native"
@@ -39,8 +42,8 @@ const (
 	// obtained via a separate PrePair exchange (not covered by this package).
 	ContactModeHashedKeys ContactMode = 1
 	// ContactModeNoKeys carries no key material or hash; the contact creator
-	// generates keys on the fly when a PrePairRequest arrives (not covered by
-	// this package).
+	// generates keys on the fly when a PrePairRequest arrives
+	// (Response.ProducePrePairNoKeys).
 	ContactModeNoKeys ContactMode = 2
 )
 
@@ -154,6 +157,19 @@ type ProducedPrePairResponse struct {
 	Envelope []byte
 }
 
+// ProducedPrePairNoKeysResponse is a produced NO_KEYS PrePair response.
+type ProducedPrePairNoKeysResponse struct {
+	// Envelope is the wire-encoded plaintext PrePair response envelope
+	// carrying the freshly generated public keys, ready to send over
+	// transport.
+	Envelope []byte
+	// SecretKeyMaterial is the key material generated for this pairing. The
+	// caller MUST persist it: the pair request that follows is encrypted to
+	// it, and it is the secretKeyMaterial for Request.Extract and
+	// Response.Produce.
+	SecretKeyMaterial []byte
+}
+
 // ExtractedPrePairResponse is a decoded PrePair response: the channel it
 // arrived on and the inner PrePairResponseMessage proto bytes, which chain
 // into Response.ProcessPrePair.
@@ -162,8 +178,9 @@ type ExtractedPrePairResponse struct {
 	ResponseProto []byte
 }
 
-// ProcessedPrePair is the result of validating a PrePair response against
-// the originating ContactMessage's binding hash.
+// ProcessedPrePair is the result of processing a PrePair response: validated
+// against the originating ContactMessage's binding hash (HASHED_KEYS), or
+// accepted unbound (NO_KEYS).
 type ProcessedPrePair struct {
 	// MlkemEncapsulationKey is the contact creator's validated ML-KEM
 	// encapsulation key.
@@ -233,10 +250,8 @@ func (requestAPI) Extract(request, secretKeyMaterial []byte) (ExtractedRequest, 
 // ContactModeNoKeys contact), sent by a scanner reachable at
 // transportProtocols: a length-delimited sequence of serialized
 // TransportProtocol protos (each entry preceded by its varint byte length),
-// in the scanner's own preference order. The first entry also fills the
-// deprecated singular field for peers predating the list. Because no shared
-// key exists yet, the envelope is plaintext, so these MUST be ephemeral
-// endpoints.
+// in the scanner's own preference order. Because no shared key exists yet,
+// the envelope is plaintext, so these MUST be ephemeral endpoints.
 func (requestAPI) ProducePrePair(transportProtocols, contactMessage []byte) (ProducedPrePairRequest, error) {
 	envelope, err := native.ProducePrePairRequest(transportProtocols, contactMessage)
 	if err != nil {
@@ -350,4 +365,45 @@ func (responseAPI) ProcessPrePair(contactMessage, responseProto []byte) (Process
 		EciesPublicKey:        eciesPublicKey,
 		Nonce:                 nonce,
 	}, nil
+}
+
+// ProducePrePairNoKeys is the contact-creator side of a ContactModeNoKeys
+// pairing: it generates fresh key material and builds a plaintext PrePair
+// response envelope publishing its public keys, acknowledging requestProto
+// (the RequestProto returned by Request.ExtractPrePair). The caller MUST
+// first match the request's nonce against the contact it issued — the only
+// thing that authenticates a NO_KEYS request — and MUST persist the returned
+// SecretKeyMaterial.
+func (responseAPI) ProducePrePairNoKeys(channelID uint64, requestProto []byte) (ProducedPrePairNoKeysResponse, error) {
+	envelope, secretKeyMaterial, err := native.ProducePrePairNoKeysResponse(channelID, requestProto)
+	if err != nil {
+		return ProducedPrePairNoKeysResponse{}, err
+	}
+	return ProducedPrePairNoKeysResponse{Envelope: envelope, SecretKeyMaterial: secretKeyMaterial}, nil
+}
+
+// ProcessPrePairNoKeys is the scanner side of a ContactModeNoKeys pairing:
+// it accepts the contact creator's public keys from responseProto (the
+// ResponseProto returned by ExtractPrePair) for contactMessage (the
+// ContactModeNoKeys contact), returning them with the echoed nonce. Nothing
+// binds these keys to the contact, so the resulting pairing MUST be
+// confirmed by comparing Fingerprint out of band before use.
+func (responseAPI) ProcessPrePairNoKeys(contactMessage, responseProto []byte) (ProcessedPrePair, error) {
+	mlkemEncapsulationKey, eciesPublicKey, nonce, err := native.ProcessPrePairNoKeysResponse(contactMessage, responseProto)
+	if err != nil {
+		return ProcessedPrePair{}, err
+	}
+	return ProcessedPrePair{
+		MlkemEncapsulationKey: mlkemEncapsulationKey,
+		EciesPublicKey:        eciesPublicKey,
+		Nonce:                 nonce,
+	}, nil
+}
+
+// Fingerprint returns the human-readable fingerprint of a pairing's
+// sharedKey, the same value the protocol's GetFingerprint derives. Both ends
+// derive the same value from the same key; a ContactModeNoKeys pairing MUST
+// be confirmed by comparing it out of band before use.
+func Fingerprint(sharedKey []byte) (string, error) {
+	return native.PairingFingerprint(sharedKey)
 }

@@ -66,8 +66,7 @@ public static partial class Pairing
         /// (only appropriate when the OOB delivery channel is fully trusted).
         /// </param>
         /// <param name="transportProtocols">Every endpoint this initiator serves, in
-        /// preference order. The whole list is advertised; the first entry also
-        /// fills the legacy singular field for peers predating the offer list.</param>
+        /// preference order. The whole list is advertised.</param>
         /// <param name="nonce"><c>null</c> lets the library generate a fresh
         /// random <c>ulong</c>. Required for <see cref="ContactMode.NoKeys"/>
         /// where callers typically pick a small human-typable value.</param>
@@ -188,11 +187,11 @@ public static partial class Pairing
 
         /// <summary>
         /// Scanner-side: builds a plaintext <c>PrePairRequest</c> envelope when
-        /// the contact was sent with <see cref="ContactMode.HashedKeys"/>. The
-        /// keys obtained via the matching <c>PrePairResponse</c> MUST be checked
-        /// against the contact's binding hash with
-        /// <see cref="Response.ProcessPrePair"/> before proceeding to a normal
-        /// <see cref="Produce"/>.
+        /// the contact was sent with <see cref="ContactMode.HashedKeys"/> or
+        /// <see cref="ContactMode.NoKeys"/>. The matching <c>PrePairResponse</c>
+        /// MUST go through <see cref="Response.ProcessPrePair"/> (HashedKeys) or
+        /// <see cref="Response.ProcessPrePairNoKeys"/> (NoKeys) before proceeding
+        /// to a normal <see cref="Produce"/>.
         /// </summary>
         public static ProducePrePairResult ProducePrePair(
             IReadOnlyList<TransportProtocol> transportProtocols,

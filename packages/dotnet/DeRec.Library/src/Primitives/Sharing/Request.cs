@@ -89,8 +89,7 @@ public static partial class Sharing
             uint[] keepList,
             string description,
             byte[] sharedKey,
-            IReadOnlyList<TransportProtocol>? replyTo = null,
-            ulong? replicaId = null
+            IReadOnlyList<TransportProtocol>? replyTo = null
         )
         {
             ArgumentNullException.ThrowIfNull(committedShare);
@@ -119,9 +118,7 @@ public static partial class Sharing
                     sharedKey,
                     (UIntPtr)sharedKey.Length,
                     replyToBytes,
-                    replyToLen,
-                    replicaId.HasValue ? 1u : 0u,
-                    replicaId ?? 0
+                    replyToLen
                 );
 
             try
@@ -157,7 +154,7 @@ public static partial class Sharing
                 {
                     ChannelId = nativeResult.ChannelId,
                     RequestProtoBytes = requestBytes,
-                    ReplyTo = TransportProtocol.ResolveReplyTo(inner.ReplyTo, inner.ReplyToTransports),
+                    ReplyTo = TransportProtocol.ResolveReplyTo(inner.ReplyToTransports),
                 };
             }
             finally

@@ -205,33 +205,82 @@ func TestDecodeEvents_ReplicaSecretAcked(t *testing.T) {
 	}
 }
 
-func TestDecodeEvents_ShareStored_WithReplicaID(t *testing.T) {
-	ev := decodeOne(t, `{
-		"type": "ShareStored",
-		"channel_id": "11",
-		"version": 1,
-		"replica_id": "48879"
-	}`)
-	if ev.Type != EventTypeShareStored {
-		t.Fatalf("Type: got %q", ev.Type)
+// TestDecodeEvents_ShareStored covers the wire shape: channel_id and version
+// only. Helpers never learn replica identity, so no replica_id is carried.
+func TestDecodeEvents_ShareStored(t *testing.T) {
+	ev := decodeOne(t, `{"type": "ShareStored", "channel_id": "11", "version": 1}`)
+	if ev.Type != EventTypeShareStored || ev.ChannelID != "11" || ev.Version == nil || *ev.Version != 1 {
+		t.Fatalf("got %+v", ev)
 	}
-	if ev.ReplicaID == nil || *ev.ReplicaID != "48879" {
-		t.Fatalf("ReplicaID: got %v", ev.ReplicaID)
+	if ev.ReplicaID != nil {
+		t.Fatalf("expected nil ReplicaID, got %v", *ev.ReplicaID)
 	}
 }
 
-// TestDecodeEvents_ShareStored_NullReplicaID covers the non-replica Owner
-// writer case: the Rust field is Option<u64> encoded as JSON null (not
-// omitted — ShareStored has no skip_serializing_if on replica_id).
-func TestDecodeEvents_ShareStored_NullReplicaID(t *testing.T) {
+func TestDecodeEvents_ReplicaSecretReceived_AuthorReplicaID(t *testing.T) {
 	ev := decodeOne(t, `{
-		"type": "ShareStored",
+		"type": "ReplicaSecretReceived",
 		"channel_id": "11",
-		"version": 1,
-		"replica_id": null
+		"from_replica_id": "7",
+		"author_replica_id": "18446744073709551615",
+		"secret_id": "42",
+		"version": 4,
+		"secret": {"helpers": [], "secrets": []},
+		"shares": []
 	}`)
-	if ev.ReplicaID != nil {
-		t.Fatalf("expected nil ReplicaID, got %v", *ev.ReplicaID)
+	if ev.FromReplicaID != "7" {
+		t.Fatalf("FromReplicaID: got %q", ev.FromReplicaID)
+	}
+	if ev.AuthorReplicaID == nil || *ev.AuthorReplicaID != "18446744073709551615" {
+		t.Fatalf("AuthorReplicaID: got %v", ev.AuthorReplicaID)
+	}
+}
+
+func TestDecodeEvents_ReplicaSecretInstalled_NullAuthorReplicaID(t *testing.T) {
+	ev := decodeOne(t, `{
+		"type": "ReplicaSecretInstalled",
+		"channel_id": "11",
+		"from_replica_id": "7",
+		"author_replica_id": null,
+		"secret_id": "42",
+		"version": 1,
+		"secret": {"helpers": [], "secrets": []},
+		"shares": []
+	}`)
+	if ev.Type != EventTypeReplicaSecretInstalled || ev.AuthorReplicaID != nil {
+		t.Fatalf("got Type=%q AuthorReplicaID=%v", ev.Type, ev.AuthorReplicaID)
+	}
+}
+
+func TestDecodeEvents_ReplicaVersionConflict(t *testing.T) {
+	ev := decodeOne(t, `{
+		"type": "ReplicaVersionConflict",
+		"channel_id": "11",
+		"from_replica_id": "7",
+		"secret_id": "42",
+		"version": 5,
+		"held_author_replica_id": null,
+		"incoming_author_replica_id": "9",
+		"secret": {
+			"helpers": [],
+			"secrets": [{"id": [1], "name": "n", "data": [2]}]
+		}
+	}`)
+	if ev.Type != EventTypeReplicaVersionConflict {
+		t.Fatalf("Type: got %q", ev.Type)
+	}
+	if ev.ChannelID != "11" || ev.FromReplicaID != "7" || ev.SecretID != "42" ||
+		ev.Version == nil || *ev.Version != 5 {
+		t.Fatalf("ids/version: got %+v", ev)
+	}
+	if ev.HeldAuthorReplicaID != nil {
+		t.Fatalf("HeldAuthorReplicaID: got %v, want nil", *ev.HeldAuthorReplicaID)
+	}
+	if ev.IncomingAuthorReplicaID == nil || *ev.IncomingAuthorReplicaID != "9" {
+		t.Fatalf("IncomingAuthorReplicaID: got %v", ev.IncomingAuthorReplicaID)
+	}
+	if ev.Secret == nil || len(ev.Secret.Secrets) != 1 || ev.Secret.Secrets[0].Name != "n" {
+		t.Fatalf("Secret: got %+v", ev.Secret)
 	}
 }
 
@@ -462,6 +511,129 @@ func TestDecodeEvents_ActionRequired_Discovery(t *testing.T) {
 	if ev.SenderKind != nil || ev.Version != nil || ev.ShareDescription != nil || ev.ShareSecretID != nil {
 		t.Fatalf("expected every optional field nil, got %+v", ev)
 	}
+}
+
+// TestDecodeEvents_ActionRequired_StoreShareSizeAndTrace covers share_size
+// and trace_id on a StoreShare ActionRequired.
+func TestDecodeEvents_ActionRequired_StoreShareSizeAndTrace(t *testing.T) {
+	ev := decodeOne(t, `{
+		"type": "ActionRequired",
+		"channel_id": "11",
+		"action": [9],
+		"action_kind": "StoreShare",
+		"version": 4,
+		"share_secret_id": "42",
+		"trace_id": "18446744073709551615",
+		"share_size": 1234
+	}`)
+	if ev.TraceID != "18446744073709551615" {
+		t.Fatalf("TraceID: got %q", ev.TraceID)
+	}
+	if ev.ShareSize == nil || *ev.ShareSize != 1234 {
+		t.Fatalf("ShareSize: got %v", ev.ShareSize)
+	}
+	if ev.UnpairMemo != nil || ev.UpdatedCommunicationInfo != nil || ev.UpdatedTransports != nil {
+		t.Fatalf("expected Unpair/UpdateChannelInfo fields absent, got %+v", ev)
+	}
+}
+
+// TestDecodeEvents_ActionRequired_GetShare covers version + share_secret_id
+// naming the share a GetShare asks for.
+func TestDecodeEvents_ActionRequired_GetShare(t *testing.T) {
+	ev := decodeOne(t, `{
+		"type": "ActionRequired",
+		"channel_id": "11",
+		"action": [1],
+		"action_kind": "GetShare",
+		"version": 7,
+		"share_secret_id": "99",
+		"trace_id": "5"
+	}`)
+	if ev.ActionKind != ActionKindGetShare {
+		t.Fatalf("ActionKind: got %q", ev.ActionKind)
+	}
+	if ev.Version == nil || *ev.Version != 7 {
+		t.Fatalf("Version: got %v", ev.Version)
+	}
+	if ev.ShareSecretID == nil || *ev.ShareSecretID != "99" {
+		t.Fatalf("ShareSecretID: got %v", ev.ShareSecretID)
+	}
+	if ev.TraceID != "5" {
+		t.Fatalf("TraceID: got %q", ev.TraceID)
+	}
+	if ev.ShareSize != nil {
+		t.Fatalf("expected nil ShareSize, got %v", *ev.ShareSize)
+	}
+}
+
+func TestDecodeEvents_ActionRequired_Unpair(t *testing.T) {
+	ev := decodeOne(t, `{
+		"type": "ActionRequired",
+		"channel_id": "11",
+		"action": [1],
+		"action_kind": "Unpair",
+		"trace_id": "6",
+		"unpair_memo": "moving on"
+	}`)
+	if ev.ActionKind != ActionKindUnpair {
+		t.Fatalf("ActionKind: got %q", ev.ActionKind)
+	}
+	if ev.UnpairMemo == nil || *ev.UnpairMemo != "moving on" {
+		t.Fatalf("UnpairMemo: got %v", ev.UnpairMemo)
+	}
+}
+
+func TestDecodeEvents_ActionRequired_UpdateChannelInfo(t *testing.T) {
+	t.Run("both fields", func(t *testing.T) {
+		ev := decodeOne(t, `{
+			"type": "ActionRequired",
+			"channel_id": "11",
+			"action": [1],
+			"action_kind": "UpdateChannelInfo",
+			"trace_id": "7",
+			"updated_communication_info": {"name": "Bob"},
+			"updated_transports": [{"uri": "https://new.example", "protocol": 1}]
+		}`)
+		if ev.UpdatedCommunicationInfo == nil || ev.UpdatedCommunicationInfo["name"] != "Bob" {
+			t.Fatalf("UpdatedCommunicationInfo: got %+v", ev.UpdatedCommunicationInfo)
+		}
+		want := []EndpointJSON{{URI: "https://new.example", Protocol: 1}}
+		if len(ev.UpdatedTransports) != 1 || ev.UpdatedTransports[0] != want[0] {
+			t.Fatalf("UpdatedTransports: got %+v", ev.UpdatedTransports)
+		}
+	})
+	t.Run("transports only leaves communication info nil", func(t *testing.T) {
+		ev := decodeOne(t, `{
+			"type": "ActionRequired",
+			"channel_id": "11",
+			"action": [1],
+			"action_kind": "UpdateChannelInfo",
+			"trace_id": "8",
+			"updated_transports": [{"uri": "https://new.example", "protocol": 1}]
+		}`)
+		if ev.UpdatedCommunicationInfo != nil {
+			t.Fatalf("expected nil UpdatedCommunicationInfo (unchanged), got %+v", ev.UpdatedCommunicationInfo)
+		}
+		if len(ev.UpdatedTransports) != 1 || ev.UpdatedTransports[0].URI != "https://new.example" {
+			t.Fatalf("UpdatedTransports: got %+v", ev.UpdatedTransports)
+		}
+	})
+	t.Run("empty map means clear", func(t *testing.T) {
+		ev := decodeOne(t, `{
+			"type": "ActionRequired",
+			"channel_id": "11",
+			"action": [1],
+			"action_kind": "UpdateChannelInfo",
+			"trace_id": "9",
+			"updated_communication_info": {}
+		}`)
+		if ev.UpdatedCommunicationInfo == nil || len(ev.UpdatedCommunicationInfo) != 0 {
+			t.Fatalf("expected non-nil empty UpdatedCommunicationInfo (clear), got %#v", ev.UpdatedCommunicationInfo)
+		}
+		if ev.UpdatedTransports != nil {
+			t.Fatalf("expected nil UpdatedTransports (unchanged), got %+v", ev.UpdatedTransports)
+		}
+	})
 }
 
 func TestDecodeEvents_AutoAccepted(t *testing.T) {

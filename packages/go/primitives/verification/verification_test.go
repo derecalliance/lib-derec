@@ -25,7 +25,7 @@ func TestVerificationRequestRoundTrip(t *testing.T) {
 	const channelID, secretID, version = uint64(7), uint64(42), uint32(1)
 	key := sharedKey()
 
-	envelope, err := verification.Request.Produce(channelID, secretID, version, key)
+	envelope, err := verification.Request.Produce(channelID, secretID, version, key, nil)
 	if err != nil {
 		t.Fatalf("produce: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestVerificationRequestRoundTrip(t *testing.T) {
 }
 
 func TestVerificationRequestRejectsShortKey(t *testing.T) {
-	_, err := verification.Request.Produce(1, 1, 1, make([]byte, 16))
+	_, err := verification.Request.Produce(1, 1, 1, make([]byte, 16), nil)
 	if err == nil {
 		t.Fatal("expected an error for a 16-byte shared key")
 	}
@@ -80,7 +80,7 @@ func TestVerificationResponseRoundTrip(t *testing.T) {
 	shareContent1 := shares[channel1]
 	shareContent2 := shares[channel2]
 
-	challengeEnvelope, err := verification.Request.Produce(channel1, secretID, version, key)
+	challengeEnvelope, err := verification.Request.Produce(channel1, secretID, version, key, nil)
 	if err != nil {
 		t.Fatalf("request produce: %v", err)
 	}

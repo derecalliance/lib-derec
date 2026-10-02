@@ -282,7 +282,6 @@ Optional setters have defaults:
 | `with_keep_versions_count(n)` | `3` | Number of recent versions each helper must retain. |
 | `with_timeouts(timeouts)` | see [Timeouts](#timeouts) | All four waiting periods in one call; unspecified fields keep their default. `inbound_message` 300s is the staleness/replay window, `sharing_round` and `unpair_ack` 60s are liveness budgets, `expired_channels` `Enabled { 300 }` sweeps channels awaiting fingerprint confirmation. |
 | `with_unsafe_connection(bool)` | `false` | Accept plaintext `http://` and `grpc://` endpoints. **Development only.** Loopback is accepted for your own endpoint regardless; see [Transport endpoints and plaintext](#transport-endpoints-and-plaintext). |
-| `with_unsafe_http(bool)` | `false` | Deprecated since 0.0.3 — the `http://`-only predecessor of `with_unsafe_connection`. Still honored on its own; setting both to disagreeing values fails `build()`. See [Transport endpoints and plaintext](#transport-endpoints-and-plaintext). |
 | `with_communication_info(map)` | empty | Key-value identity metadata embedded in pairing messages. |
 | `with_replica_id(id)` | unset | This device's replica identity. Required for any replica-mode pairing; application-assigned and rejected if `0`. |
 | `with_auto_accept(policy)` | every flow off | Per-flow opt-in to auto-accepting inbound requests instead of surfacing `ActionRequired`. Read the per-flow caveats before enabling — several are state-changing. |
@@ -539,17 +538,6 @@ the wider case is what `with_unsafe_connection` is for.
 > `with_unsafe_connection` at its default does not by itself make a deployment
 > secure, and turning it on does not by itself send anything in the clear.
 
-`with_unsafe_http(bool)` is the original, `http://`-only form of this
-setting, kept for compatibility and `#[deprecated]` since 0.0.3. Either flag
-alone is honored, so a deployment that only knows the old one keeps its
-current behavior after upgrading. Setting **both** to disagreeing values is
-refused at `build()` with `Error::ConflictingPlaintextOptIn`, which names
-both flags and the values given: precedence would hand the decision to the
-flag being removed, and a configuration layer that emits every field
-unconditionally would then let a defaulted `unsafe_http: false` silently beat
-a deliberate `unsafe_connection: true`. New code should use
-`with_unsafe_connection`.
-
 This was a Cargo feature (`unsafe-http`) until it became clear a compile-time
 switch is unreachable for the four SDKs that install a prebuilt binary from a
 package manager: a .NET or Node developer has no compilation step in which to
@@ -798,21 +786,21 @@ exchange's response to an alternate endpoint — without persisting it (use
 
 The motivating case is replicas: when Replica A sends a request on a
 channel the helper paired with sibling Replica B, the helper's stored peer
-endpoint points at B. `replyTo` lets A say "send the response back to me,"
-without rewriting channel state.
+endpoint points at B. `replyToTransports` lets A say "send the response back
+to me," without rewriting channel state.
 
 Two ways to set it:
 
 - **Per call (primitives):** every `*::request::produce` takes a trailing
-  `reply_to: Option<TransportProtocol>` parameter.
+  `reply_to: &[TransportProtocol]` parameter, in preference order.
 - **Protocol-wide:** `DeRecProtocolBuilder::with_auto_reply_to(true)` makes
-  the orchestrator stamp `replyTo = own_transport` on every outbound
-  request automatically.
+  the orchestrator stamp `replyToTransports = own_transports` on every
+  outbound request automatically.
 
-The responder honours an inbound `replyTo` regardless of how it was set —
-the flag only governs **outbound** population. `PairRequest`,
+The responder honours an inbound `replyToTransports` regardless of how it was
+set — the flag only governs **outbound** population. `PairRequest`,
 `PrePairRequest`, and `UpdateChannelInfoRequest` are intentionally
-excluded: each already carries its own `transportProtocol` field serving
+excluded: each already carries its own `supportedTransports` field serving
 the same role.
 
 ---
@@ -1047,22 +1035,15 @@ validation or scheme policy is skipped rather than fatal; no overlap at all is
 push-only, so a peer whose transport you cannot speak cannot be sent a
 rejection either.
 
-Order is meaningful and the first entry is also your primary endpoint, the one
-advertised to implementations predating the offer list. Because delivery is
-push-only, every entry must be a transport you actually **serve**: listing one
-you do not makes pairing succeed and replies vanish. `with_own_transport`
-remains fully supported and is exactly a one-element list. The equivalents are
-`WithOwnTransports` (.NET), `withOwnTransports` (Node.js / Web) and
-`Config.OwnTransports` (Go).
-
-`with_own_transport` / `set_own_transport` are **deprecated and removed at
-0.0.5**; a one-element list is the direct replacement.
+Order is meaningful and the first entry is also your primary endpoint. Because
+delivery is push-only, every entry must be a transport you actually **serve**:
+listing one you do not makes pairing succeed and replies vanish. The
+equivalents are `WithOwnTransports` (.NET), `withOwnTransports` (Node.js / Web)
+and `Config.OwnTransports` (Go).
 
 To change the set after construction, use `set_own_transports` — the runtime
-counterpart, and the only way a multi-endpoint node can change what it
-advertises. `set_own_transport` replaces the list with the single endpoint it
-is given, matching `with_own_transport`. Both validate every entry before
-storing any, so a malformed URI leaves the previous set intact. The
+counterpart. It validates every entry before storing any, so a malformed URI
+leaves the previous set intact. The
 equivalents are `setOwnTransports` (Node.js / Web / React Native) and
 `SetOwnTransports` (Go).
 

@@ -15,6 +15,7 @@
 //! contact-responder side).
 
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use std::ffi::c_char;
 
 use crate::extensions::contact_message::ContactMessageExt as _;
 use crate::extensions::transport_protocol::TransportProtocolExt as _;
@@ -141,6 +142,25 @@ pub struct ExtractPrePairResponseResult {
     /// Inner `PrePairResponseMessage` proto bytes for chaining into
     /// [`process_pre_pair_response_message`].
     pub response_proto_bytes: DeRecBuffer,
+}
+
+#[repr(C)]
+pub struct ProducePrePairNoKeysResponseMessageResult {
+    pub error: DeRecError,
+    /// Serialized outer plaintext `DeRecMessage` envelope carrying a
+    /// `PrePairResponseMessage` with freshly generated public keys.
+    pub envelope_wire_bytes: DeRecBuffer,
+    /// The secret key material generated for this pairing. The caller MUST
+    /// persist it: the `PairRequestMessage` that follows is encrypted to it.
+    pub secret_key_material: DeRecBuffer,
+}
+
+#[repr(C)]
+pub struct PairingFingerprintResult {
+    pub error: DeRecError,
+    /// NUL-terminated UTF-8 fingerprint. Free with
+    /// [`crate::interop::ffi::common::derec_free_string`]. Null on failure.
+    pub fingerprint: *mut c_char,
 }
 
 /// On success the two key buffers hold the validated public keys republished
@@ -930,6 +950,164 @@ pub extern "C" fn extract_pre_pair_response(
     }
 }
 
+/// Contact-creator side of a `NO_KEYS` pairing: generates key material and
+/// answers the `PrePairRequestMessage` with its public half.
+///
+/// The caller MUST first match the request's `nonce` against the contact it
+/// issued — the only thing that authenticates a `NO_KEYS` request — and MUST
+/// keep the resulting channel unusable until both sides confirm
+/// [`pairing_fingerprint`] out of band.
+///
+/// `request_proto_ptr` / `request_proto_len` must be the `request_proto_bytes`
+/// returned by [`extract_pre_pair_request`].
+///
+/// # Safety
+///
+/// Non-null input pointers must point to the corresponding readable byte ranges.
+#[unsafe(no_mangle)]
+pub extern "C" fn produce_pre_pair_no_keys_response_message(
+    channel_id: u64,
+    request_proto_ptr: *const u8,
+    request_proto_len: usize,
+) -> ProducePrePairNoKeysResponseMessageResult {
+    let with_err = |error| ProducePrePairNoKeysResponseMessageResult {
+        error,
+        envelope_wire_bytes: empty_buffer(),
+        secret_key_material: empty_buffer(),
+    };
+
+    let request_bytes =
+        match parse_buffer(request_proto_ptr, request_proto_len, "request_proto_ptr") {
+            Ok(b) => b,
+            Err(e) => return with_err(e),
+        };
+    let request = match PrePairRequestMessage::decode(request_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                format!("failed to decode PrePairRequestMessage: {e}"),
+            ));
+        }
+    };
+
+    match crate::primitives::pairing::response::produce_pre_pair_no_keys(
+        crate::types::ChannelId(channel_id),
+        &request,
+    ) {
+        Ok(r) => ProducePrePairNoKeysResponseMessageResult {
+            error: success(),
+            envelope_wire_bytes: vec_into_buffer(r.envelope),
+            secret_key_material: vec_into_buffer(serialize_pairing_secret_key_material(
+                &r.pairing_secret_key_material,
+            )),
+        },
+        Err(e) => with_err(from_lib_error(e)),
+    }
+}
+
+/// Scanner side of a `NO_KEYS` pairing: accepts the contact creator's public
+/// keys. There is no binding hash to check them against, so the channel this
+/// leads to MUST stay unusable until both sides confirm
+/// [`pairing_fingerprint`] out of band.
+///
+/// `response_proto_ptr` / `response_proto_len` must be the
+/// `response_proto_bytes` returned by [`extract_pre_pair_response`].
+///
+/// # Safety
+///
+/// Non-null input pointers must point to the corresponding readable byte ranges.
+#[unsafe(no_mangle)]
+pub extern "C" fn process_pre_pair_no_keys_response_message(
+    contact_message_ptr: *const u8,
+    contact_message_len: usize,
+    response_proto_ptr: *const u8,
+    response_proto_len: usize,
+) -> ProcessPrePairResponseMessageResult {
+    let with_err = |error| ProcessPrePairResponseMessageResult {
+        error,
+        mlkem_encapsulation_key: empty_buffer(),
+        ecies_public_key: empty_buffer(),
+        nonce: 0,
+    };
+
+    let contact_message_bytes = match parse_buffer(
+        contact_message_ptr,
+        contact_message_len,
+        "contact_message_ptr",
+    ) {
+        Ok(b) => b,
+        Err(e) => return with_err(e),
+    };
+    let contact_message = match ContactMessage::decode(contact_message_bytes) {
+        Ok(c) => c,
+        Err(_) => {
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                "contact_message_bytes is not a valid ContactMessage",
+            ));
+        }
+    };
+    let response_bytes =
+        match parse_buffer(response_proto_ptr, response_proto_len, "response_proto_ptr") {
+            Ok(b) => b,
+            Err(e) => return with_err(e),
+        };
+    let response = match PrePairResponseMessage::decode(response_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return with_err(ffi_error(
+                DEREC_CODE_FFI_BAD_PROTO,
+                format!("failed to decode PrePairResponseMessage: {e}"),
+            ));
+        }
+    };
+
+    match crate::primitives::pairing::response::process_pre_pair_no_keys(
+        &contact_message,
+        &response,
+    ) {
+        Ok(r) => ProcessPrePairResponseMessageResult {
+            error: success(),
+            mlkem_encapsulation_key: vec_into_buffer(r.mlkem_encapsulation_key),
+            ecies_public_key: vec_into_buffer(r.ecies_public_key),
+            nonce: r.nonce,
+        },
+        Err(e) => with_err(from_lib_error(e)),
+    }
+}
+
+/// The human-readable fingerprint of a pairing's shared key. See
+/// [`crate::primitives::pairing::fingerprint`].
+///
+/// # Safety
+///
+/// `shared_key_ptr` must point to `shared_key_len` readable bytes.
+#[unsafe(no_mangle)]
+pub extern "C" fn pairing_fingerprint(
+    shared_key_ptr: *const u8,
+    shared_key_len: usize,
+) -> PairingFingerprintResult {
+    let with_err = |error| PairingFingerprintResult {
+        error,
+        fingerprint: std::ptr::null_mut(),
+    };
+    let shared_key = match parse_shared_key(shared_key_ptr, shared_key_len) {
+        Ok(k) => k,
+        Err(e) => return with_err(e),
+    };
+    match std::ffi::CString::new(crate::primitives::pairing::fingerprint(&shared_key)) {
+        Ok(c) => PairingFingerprintResult {
+            error: success(),
+            fingerprint: c.into_raw(),
+        },
+        Err(_) => with_err(ffi_error(
+            DEREC_CODE_FFI_BAD_PROTO,
+            "fingerprint contains NUL byte",
+        )),
+    }
+}
+
 /// Scanner-side: validates a decoded `PrePairResponseMessage` against the
 /// original `ContactMessage`'s SHA-384 binding hash. On success returns the
 /// validated public keys and echoed nonce. On any failure (non-Ok status,
@@ -1145,6 +1323,16 @@ fn decode_optional_parameter_range(
         })
 }
 
+fn parse_shared_key(ptr: *const u8, len: usize) -> Result<[u8; 32], DeRecError> {
+    let bytes = parse_buffer(ptr, len, "shared_key_ptr")?;
+    bytes.try_into().map_err(|_| {
+        ffi_error(
+            DEREC_CODE_FFI_BAD_SHARED_KEY,
+            "shared_key must be exactly 32 bytes",
+        )
+    })
+}
+
 fn decode_secret_key_material(
     ptr: *const u8,
     len: usize,
@@ -1201,7 +1389,7 @@ mod contact_message_json_tests {
     /// they cross as decimal strings.
     const VALID_INLINE_KEYS_JSON: &str = r#"{
         "channel_id": "18446744073709551615",
-        "transport_protocol": { "uri": "https://owner.example.com", "protocol": 0 },
+        "supported_transports": [{ "uri": "https://owner.example.com", "protocol": 0 }],
         "nonce": "9007199254740993",
         "contact_mode": 0,
         "mlkem_encapsulation_key": [1, 2, 3],
@@ -1225,10 +1413,10 @@ mod contact_message_json_tests {
         assert_eq!(value["nonce"], "9007199254740993");
         assert_eq!(value["contact_mode"], 0);
         assert_eq!(
-            value["transport_protocol"]["uri"],
+            value["supported_transports"][0]["uri"],
             "https://owner.example.com"
         );
-        assert_eq!(value["transport_protocol"]["protocol"], 0);
+        assert_eq!(value["supported_transports"][0]["protocol"], 0);
         assert_eq!(
             value["mlkem_encapsulation_key"],
             serde_json::json!([1, 2, 3])
@@ -1249,13 +1437,11 @@ mod contact_message_json_tests {
     /// the mode/field invariant. Both directions must reject it — encode so
     /// a locally-built contact is never published, decode so application
     /// code can trust what it is handed.
-    // Compatibility, not oversight — see the `transport` module docs.
-    #[allow(deprecated)]
     #[test]
     fn invalid_contact_is_rejected_in_both_directions() {
         let invalid_json = r#"{
             "channel_id": "7",
-            "transport_protocol": { "uri": "https://owner.example.com", "protocol": 0 },
+            "supported_transports": [{ "uri": "https://owner.example.com", "protocol": 0 }],
             "nonce": "9",
             "contact_mode": 0,
             "mlkem_encapsulation_key": [1, 2, 3],
@@ -1275,17 +1461,16 @@ mod contact_message_json_tests {
         // the encoder, so the decoder's own gate is what is under test.
         let invalid_wire = ContactMessage {
             channel_id: 7,
-            transport_protocol: Some(TransportProtocol {
-                uri: "https://owner.example.com".to_owned(),
-                protocol: 0,
-            }),
             nonce: 9,
             contact_mode: ContactMode::InlineKeys as i32,
             mlkem_encapsulation_key: Some(vec![1, 2, 3]),
             ecies_public_key: Some(vec![4, 5, 6]),
             contact_binding_hash: Some(vec![7, 7, 7]),
             timestamp: None,
-            supported_transports: Vec::new(),
+            supported_transports: vec![TransportProtocol {
+                uri: "https://owner.example.com".to_owned(),
+                protocol: 0,
+            }],
         }
         .encode_to_vec();
 
@@ -1408,14 +1593,7 @@ mod pairing_entry_point_tests {
         let _ = take(result.secret_key_material);
 
         assert_eq!(contact.supported_transports.len(), 2);
-        // The first entry also fills the deprecated singular field.
-        #[allow(deprecated)]
-        {
-            assert_eq!(
-                contact.transport_protocol.as_ref().map(|t| t.uri.as_str()),
-                Some("grpcs://a.example:443"),
-            );
-        }
+        assert_eq!(contact.supported_transports[0].uri, "grpcs://a.example:443");
     }
 
     /// An empty list names no endpoint, so the contact would be unusable.
@@ -1503,6 +1681,91 @@ mod pairing_entry_point_tests {
             "a framed list must be accepted"
         );
         let _ = take(ok.envelope_wire_bytes);
+    }
+
+    /// A `NO_KEYS` pre-pair completes through the C ABI alone: the contact
+    /// creator generates and returns its key material, and the scanner
+    /// accepts the published keys under the nonce it was given.
+    #[test]
+    fn a_no_keys_pre_pair_completes_through_the_c_abi() {
+        const NONCE: u64 = 4242;
+        let list = framed(&[endpoint(
+            "https://a.example/derec",
+            derec_proto::Protocol::Https,
+        )]);
+        let contact = create_contact_message(
+            42,
+            derec_proto::ContactMode::NoKeys as i32,
+            list.as_ptr(),
+            list.len(),
+            1,
+            NONCE,
+        );
+        assert_eq!(contact.error.category, DEREC_CATEGORY_OK);
+        let contact_bytes = take(contact.contact_wire_bytes);
+        let _ = take(contact.secret_key_material);
+
+        let request = produce_pre_pair_request_message(
+            list.as_ptr(),
+            list.len(),
+            contact_bytes.as_ptr(),
+            contact_bytes.len(),
+        );
+        assert_eq!(request.error.category, DEREC_CATEGORY_OK);
+        let request_envelope = take(request.envelope_wire_bytes);
+
+        let extracted = extract_pre_pair_request(request_envelope.as_ptr(), request_envelope.len());
+        assert_eq!(extracted.error.category, DEREC_CATEGORY_OK);
+        let request_proto = take(extracted.request_proto_bytes);
+
+        let produced = produce_pre_pair_no_keys_response_message(
+            42,
+            request_proto.as_ptr(),
+            request_proto.len(),
+        );
+        assert_eq!(produced.error.category, DEREC_CATEGORY_OK);
+        let response_envelope = take(produced.envelope_wire_bytes);
+        let secret_key_material = take(produced.secret_key_material);
+        assert!(
+            decode_secret_key_material(secret_key_material.as_ptr(), secret_key_material.len())
+                .is_ok(),
+            "the generated key material must round-trip"
+        );
+
+        let response =
+            extract_pre_pair_response(response_envelope.as_ptr(), response_envelope.len());
+        assert_eq!(response.error.category, DEREC_CATEGORY_OK);
+        let response_proto = take(response.response_proto_bytes);
+
+        let processed = process_pre_pair_no_keys_response_message(
+            contact_bytes.as_ptr(),
+            contact_bytes.len(),
+            response_proto.as_ptr(),
+            response_proto.len(),
+        );
+        assert_eq!(processed.error.category, DEREC_CATEGORY_OK);
+        assert!(!take(processed.mlkem_encapsulation_key).is_empty());
+        assert!(!take(processed.ecies_public_key).is_empty());
+        assert_eq!(processed.nonce, NONCE);
+    }
+
+    /// The fingerprint is the same derivation the protocol uses, so both
+    /// layers show the user the same value.
+    #[test]
+    fn the_fingerprint_matches_the_protocol_derivation() {
+        let key = [0x5A; 32];
+        let result = pairing_fingerprint(key.as_ptr(), key.len());
+        assert_eq!(result.error.category, DEREC_CATEGORY_OK);
+        let text = unsafe { std::ffi::CStr::from_ptr(result.fingerprint) }
+            .to_string_lossy()
+            .into_owned();
+        crate::interop::ffi::common::derec_free_string(result.fingerprint);
+        assert_eq!(text, crate::primitives::pairing::fingerprint(&key));
+
+        let short = [0x5A; 31];
+        let refused = pairing_fingerprint(short.as_ptr(), short.len());
+        assert!(refused.fingerprint.is_null());
+        assert_ne!(release(refused.error), 0, "a 31-byte key must be refused");
     }
 
     /// A null pointer with a non-zero length is a caller bug, not a decode

@@ -56,8 +56,7 @@ var (
 		keepList *uint32, keepListLen uintptr,
 		description *byte, descriptionLen uintptr,
 		sharedKey *byte, sharedKeyLen uintptr,
-		replyTo *byte, replyToLen uintptr,
-		hasReplicaID uint32, replicaID uint64) produceStoreShareRequestMessageResult
+		replyTo *byte, replyToLen uintptr) produceStoreShareRequestMessageResult
 
 	extractStoreShareReqOnce sync.Once
 	extractStoreShareReqFn   func(request *byte, requestLen uintptr,
@@ -115,18 +114,21 @@ func ProtectSecret(secretID uint64, secretData []byte, channelIDs []uint64, thre
 
 // ProduceStoreShareRequest builds the wire-encoded DeRecMessage carrying
 // committedShare for storage at channelID, encrypted under sharedKey.
-func ProduceStoreShareRequest(channelID uint64, version uint32, secretID uint64, committedShare []byte, keepList []uint32, description string, sharedKey []byte) ([]byte, error) {
+func ProduceStoreShareRequest(channelID uint64, version uint32, secretID uint64, committedShare []byte, keepList []uint32, description string, sharedKey []byte, replyTo []Endpoint) ([]byte, error) {
 	produceStoreShareReqOnce.Do(func() {
 		purego.RegisterFunc(&produceStoreShareReqFn, symbol("produce_store_share_request_message"))
 	})
+	replyToBytes, err := encodeEndpointList(replyTo)
+	if err != nil {
+		return nil, err
+	}
 	descriptionBytes := []byte(description)
 	res := produceStoreShareReqFn(channelID, version, secretID,
 		bytePtr(committedShare), uintptr(len(committedShare)),
 		u32Ptr(keepList), uintptr(len(keepList)),
 		bytePtr(descriptionBytes), uintptr(len(descriptionBytes)),
 		bytePtr(sharedKey), uintptr(len(sharedKey)),
-		nil, 0,
-		0, 0)
+		bytePtr(replyToBytes), uintptr(len(replyToBytes)))
 	if err := errorFrom(res.Error); err != nil {
 		return nil, err
 	}

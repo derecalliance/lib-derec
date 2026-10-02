@@ -112,20 +112,12 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     let mut asked: HashSet<ReplicaId> = HashSet::new();
     for peer in &peers {
         let timestamp = current_timestamp();
-        let (legacy_reply_to, reply_to_transports) =
-            crate::extensions::advertised_endpoints::split_reply_to(std::slice::from_ref(
-                local.primary(),
-            ));
-        // Populating the deprecated singular field is the compatibility
-        // path that keeps peers predating `replyToTransports`
-        // answerable, so the warning is expected here.
-        #[allow(deprecated)]
+        let reply_to_transports = std::slice::from_ref(local.primary()).to_vec();
         let request = GetSecretIdsVersionsRequestMessage {
             timestamp: Some(timestamp),
             // The asker names itself so the answer can be routed back to a
             // member rather than treated as an owner ↔ helper exchange.
             replica_id: Some(own),
-            reply_to: legacy_reply_to,
             reply_to_transports,
         };
         let envelope = DeRecMessageBuilder::channel()
@@ -355,19 +347,11 @@ async fn finish<S: StoreSet>(
 
     let key = load_channel_key(stores, local, member.channel_id).await?;
     let timestamp = current_timestamp();
-    let (legacy_reply_to, reply_to_transports) =
-        crate::extensions::advertised_endpoints::split_reply_to(std::slice::from_ref(
-            local.primary(),
-        ));
-    // Populating the deprecated singular field is the compatibility
-    // path that keeps peers predating `replyToTransports`
-    // answerable, so the warning is expected here.
-    #[allow(deprecated)]
+    let reply_to_transports = std::slice::from_ref(local.primary()).to_vec();
     let request = GetShareRequestMessage {
         secret_id,
         version: group_version,
         timestamp: Some(timestamp),
-        reply_to: legacy_reply_to,
         reply_to_transports,
         replica_id: local.replica_id,
     };
@@ -456,6 +440,7 @@ mod tests {
                     secrets: Vec::new(),
                     description: None,
                     replicas: None,
+                    author_replica_id: None,
                 },
             )
             .await

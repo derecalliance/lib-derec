@@ -17,6 +17,7 @@ const (
 	EventTypeReplicaPaired             = "ReplicaPaired"
 	EventTypeReplicaSecretReceived     = "ReplicaSecretReceived"
 	EventTypeReplicaSecretInstalled    = "ReplicaSecretInstalled"
+	EventTypeReplicaVersionConflict    = "ReplicaVersionConflict"
 	EventTypeReplicaSyncRejected       = "ReplicaSyncRejected"
 	EventTypeReplicaSyncFailed         = "ReplicaSyncFailed"
 	EventTypeReplicaSyncComplete       = "ReplicaSyncComplete"
@@ -77,7 +78,8 @@ const (
 //
 // Fields that are `Option<T>` on the Rust side (and therefore genuinely
 // absent — not just zero — on some variants) are Go pointers: Version,
-// ReplicaID, SenderKind, ShareDescription, ShareSecretID. Every other
+// ReplicaID, AuthorReplicaID, HeldAuthorReplicaID, IncomingAuthorReplicaID,
+// SenderKind, ShareDescription, ShareSecretID, ShareSize, UnpairMemo. Every other
 // field is a plain value; a variant that does not carry it simply leaves
 // it at the zero value, which callers should not read without first
 // checking Type.
@@ -90,16 +92,22 @@ type Event struct {
 	// Every *Started event: the token identifying the round this request
 	// belongs to. One token is drawn per Start call, so a fan-out shares it
 	// across all of its targets, and the peer echoes it on the response.
+	//
+	// ActionRequired, MessageIgnored: the correlation token of the inbound
+	// request, decimal-encoded. Always present on ActionRequired.
 	TraceID string `json:"trace_id"`
 
-	// PairingCompleted, PairingStarted.
+	// PairingCompleted, PairingStarted, ShareStored (with Version), and
+	// most other channel-scoped events.
 	ChannelID             string            `json:"channel_id"`
 	PairingChannelID      string            `json:"pairing_channel_id"`
 	Kind                  int32             `json:"kind"`
 	PeerCommunicationInfo map[string]string `json:"peer_communication_info"`
 
 	// ReplicaPaired, ReplicaSecretReceived, ReplicaSecretInstalled,
-	// ReplicaSecretAcked.
+	// ReplicaVersionConflict, ReplicaSecretAcked. FromReplicaID is the member
+	// the copy came from: the publisher on a push, the responder on a
+	// catch-up.
 	PeerReplicaID string         `json:"peer_replica_id"`
 	FromReplicaID string         `json:"from_replica_id"`
 	SecretID      string         `json:"secret_id"`
@@ -107,14 +115,27 @@ type Event struct {
 	Secret        *Secret        `json:"secret"`
 	Shares        []ChannelShare `json:"shares"`
 
+	// ReplicaSecretReceived, ReplicaSecretInstalled — the member that
+	// published Version; nil when the serving member's snapshot records no
+	// author.
+	AuthorReplicaID *string `json:"author_replica_id"`
+
+	// ReplicaVersionConflict — a member offered a different copy of the
+	// version this device holds. HeldAuthorReplicaID is the publisher of the
+	// local copy, IncomingAuthorReplicaID the publisher of the offered one
+	// (carried in Secret); either is nil when its copy records no author.
+	HeldAuthorReplicaID     *string `json:"held_author_replica_id"`
+	IncomingAuthorReplicaID *string `json:"incoming_author_replica_id"`
+
 	// ReplicaSecretAcked, ShareRejected, UnpairRejected, PrePairRejected,
 	// ChannelInfoUpdateRejected.
 	Status int32  `json:"status"`
 	Memo   string `json:"memo"`
 
-	// ShareStored, ReplicaSyncRejected, ReplicaSyncFailed. On the two
-	// replica events this names the member: they are keyed by replicaID, not
-	// channelID, because every member answers on the one group channel.
+	// ReplicaSyncRejected, ReplicaSyncFailed, ReplicaRemoved,
+	// ReplicaSourceChanged — the member the event is about. The sync events
+	// are keyed by replicaID, not channelID, because every member answers on
+	// the one group channel.
 	ReplicaID *string `json:"replica_id"`
 
 	// ReplicaSyncFailed — the transport or encoding failure, rendered for
@@ -168,12 +189,32 @@ type Event struct {
 	// UpdateChannelInfoFailed.
 	Error string `json:"error"`
 
-	// ActionRequired, AutoAccepted.
-	Action           []byte  `json:"action"`
-	ActionKind       string  `json:"action_kind"`
-	SenderKind       *int32  `json:"sender_kind"`
-	ShareDescription *string `json:"share_description"`
-	ShareSecretID    *string `json:"share_secret_id"`
+	// ActionRequired, AutoAccepted. Action is the opaque pending action to
+	// pass back to Accept/Reject verbatim; ActionKind is one of the
+	// ActionKind* constants. The remaining fields are ActionRequired only and
+	// set per ActionKind:
+	//
+	//   - SenderKind: Pairing.
+	//   - Version, ShareSecretID: StoreShare, VerifyShare, GetShare (on
+	//     GetShare they name the share being asked for).
+	//   - ShareDescription, ShareSize: StoreShare. ShareSize is the length in
+	//     bytes of the share the helper would store — what a size or quota
+	//     decision is made on.
+	//   - UnpairMemo: Unpair — the peer's memo.
+	//   - UpdatedCommunicationInfo: UpdateChannelInfo — the map the peer is
+	//     replacing its stored communication info with. nil means the update
+	//     leaves it unchanged; a non-nil empty map means it clears it.
+	//   - UpdatedTransports: UpdateChannelInfo — the endpoints the peer is
+	//     moving to; nil when the update leaves its endpoints unchanged.
+	Action                   []byte            `json:"action"`
+	ActionKind               string            `json:"action_kind"`
+	SenderKind               *int32            `json:"sender_kind"`
+	ShareDescription         *string           `json:"share_description"`
+	ShareSecretID            *string           `json:"share_secret_id"`
+	ShareSize                *uint64           `json:"share_size"`
+	UnpairMemo               *string           `json:"unpair_memo"`
+	UpdatedCommunicationInfo map[string]string `json:"updated_communication_info"`
+	UpdatedTransports        []EndpointJSON    `json:"updated_transports"`
 }
 
 // The label vocabulary for Event.ActionKind, one value per pending-action
@@ -278,8 +319,9 @@ func (r Replicas) MarshalJSON() ([]byte, error) {
 
 // Helper mirrors the Helper wire DTO in wire.rs — one entry of Secret's
 // helper roster.
-// EndpointJSON is one advertised address in the recovered-secret roster:
-// URI plus the protocol discriminant, so nothing is inferred from a scheme.
+// EndpointJSON is one advertised address — in the recovered-secret roster
+// and in ActionRequired.UpdatedTransports: URI plus the protocol
+// discriminant, so nothing is inferred from a scheme.
 type EndpointJSON struct {
 	URI      string `json:"uri"`
 	Protocol int32  `json:"protocol"`

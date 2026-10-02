@@ -364,7 +364,13 @@ func EncodeStateKey(k StateKey) ([]byte, error) {
 		w.SecretID = &sid
 		v := *k.Version
 		w.Version = &v
-	case StateKindSharingRound, StateKindPendingReplicaDiscovery:
+	case StateKindSharingRound:
+		if k.Version == nil {
+			return nil, fmt.Errorf("native: StateKey SharingRound requires Version")
+		}
+		v := *k.Version
+		w.Version = &v
+	case StateKindPendingReplicaDiscovery:
 		// No secondary key.
 	default:
 		return nil, fmt.Errorf("native: unknown StateKind: %d", k.Kind)
@@ -404,8 +410,14 @@ func DecodeStateKey(data []byte) (StateKey, error) {
 		}
 		v := *w.Version
 		return StateKey{Kind: StateKindPendingRecovery, SecretID: &sid, Version: &v}, nil
-	case StateKindSharingRound, StateKindPendingReplicaDiscovery:
-		return StateKey{Kind: StateKind(w.Kind)}, nil
+	case StateKindSharingRound:
+		if w.Version == nil {
+			return StateKey{}, fmt.Errorf("native: StateKey SharingRound requires version")
+		}
+		v := *w.Version
+		return StateKey{Kind: StateKindSharingRound, Version: &v}, nil
+	case StateKindPendingReplicaDiscovery:
+		return StateKey{Kind: StateKindPendingReplicaDiscovery}, nil
 	default:
 		return StateKey{}, fmt.Errorf("native: unknown StateKind: %d", w.Kind)
 	}
@@ -729,6 +741,8 @@ type userSecretsWire struct {
 	Version     uint32           `json:"version"`
 	Secrets     []userSecretWire `json:"secrets"`
 	Description *string          `json:"description,omitempty"`
+	// Decimal-encoded u64, omitted when absent.
+	AuthorReplicaID *string `json:"author_replica_id,omitempty"`
 }
 
 // EncodeUserSecrets produces the JSON a
@@ -739,6 +753,10 @@ func EncodeUserSecrets(v UserSecrets) ([]byte, error) {
 		secrets[i] = userSecretWire{ID: JSONByteArray(s.ID), Name: s.Name, Data: JSONByteArray(s.Data)}
 	}
 	w := userSecretsWire{Version: v.Version, Secrets: secrets, Description: v.Description}
+	if v.AuthorReplicaID != nil {
+		author := strconv.FormatUint(*v.AuthorReplicaID, 10)
+		w.AuthorReplicaID = &author
+	}
 	return json.Marshal(w)
 }
 
@@ -753,7 +771,15 @@ func DecodeUserSecrets(data []byte) (UserSecrets, error) {
 	for i, s := range w.Secrets {
 		secrets[i] = UserSecret{ID: []byte(s.ID), Name: s.Name, Data: []byte(s.Data)}
 	}
-	return UserSecrets{Version: w.Version, Secrets: secrets, Description: w.Description}, nil
+	out := UserSecrets{Version: w.Version, Secrets: secrets, Description: w.Description}
+	if w.AuthorReplicaID != nil {
+		author, err := strconv.ParseUint(*w.AuthorReplicaID, 10, 64)
+		if err != nil {
+			return UserSecrets{}, fmt.Errorf("native: author_replica_id not a decimal u64: %w", err)
+		}
+		out.AuthorReplicaID = &author
+	}
+	return out, nil
 }
 
 // --- Plain number-array helpers -------------------------------------------

@@ -1,7 +1,7 @@
 PODS:
   - boost (1.84.0):
     - ReactNativeDependencies
-  - DeRec (0.0.1-alpha.10):
+  - DeRec (0.0.6):
     - hermes-engine
     - RCTRequired
     - RCTTypeSafety
@@ -1969,7 +1969,7 @@ EXTERNAL SOURCES:
 
 SPEC CHECKSUMS:
   boost: 2a9d6e1d9873337543f08d9dbc007b288f4e113b
-  DeRec: b0874e257b334c93e5b31e012e05be2544d076d2
+  DeRec: e0d3d5b438c00e00c034c8d9f18c3f27cdd05827
   DoubleConversion: e85e4faac763226bfd1cc4c6a98d8355149b27a5
   fast_float: 908e5ee35999f3d91af4b962ac951acac591866c
   FBLazyVector: ef7f5a8a8d3c7b3fb0b7c6f2bb810938c5fda9ea

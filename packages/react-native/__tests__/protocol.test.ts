@@ -3,6 +3,7 @@
 
 import { DeRecProtocolBuilder } from '../src/protocol';
 import { FlowKind } from '../src/types';
+import type { DeRecEvent } from '../src/types';
 
 let lastConfig: Record<string, unknown> | undefined;
 
@@ -10,6 +11,7 @@ beforeEach(() => {
   lastConfig = undefined;
   // @ts-expect-error test-only global
   globalThis.__DeRec = {
+    transport_protocol_discriminant: () => 0,
     protocol_new: (configJson: string) => {
       lastConfig = JSON.parse(configJson);
       return { secretId: () => 7n };
@@ -39,7 +41,7 @@ function baseBuilder() {
     .withUserSecretStore(stores.userSecretStore as never)
     .withStateStore(stores.stateStore as never)
     .withTransport(stores.transport as never)
-    .withOwnTransport({ uri: 'https://example.com/derec', protocol: 'https' });
+    .withOwnTransports([{ uri: 'https://example.com/derec', protocol: 'https' }]);
 }
 
 describe('DeRecProtocolBuilder', () => {
@@ -124,6 +126,92 @@ describe('DeRecProtocolBuilder', () => {
   });
 });
 
+// The name → `derec_proto::Protocol` mapping is Rust's
+// (`derec_transport_protocol_discriminant`). This SDK forwards the name as
+// given and the result as returned, so an unknown name reaches Rust as `-1`
+// and is rejected by Rust's transport validation, not by a table here.
+describe('own transports protocol names', () => {
+  let names: string[];
+  let setOwnTransportsWire: unknown;
+
+  const RUST_DISCRIMINANTS: Record<string, number> = { grpc: 1, GRPC: 1, bogus: -1 };
+
+  beforeEach(() => {
+    names = [];
+    lastConfig = undefined;
+    setOwnTransportsWire = undefined;
+    // @ts-expect-error test-only global
+    globalThis.__DeRec = {
+      transport_protocol_discriminant: (name: string) => {
+        names.push(name);
+        return RUST_DISCRIMINANTS[name];
+      },
+      protocol_new: (configJson: string) => {
+        lastConfig = JSON.parse(configJson);
+        const protocol = (lastConfig!.own_transports as { protocol: number }[])[0].protocol;
+        if (protocol === -1) {
+          throw new Error('transport_invalid: unsupported protocol discriminant -1');
+        }
+        return {
+          setOwnTransports: async (bytes: Uint8Array) => {
+            setOwnTransportsWire = JSON.parse(String.fromCharCode(...Array.from(bytes)));
+            const entries = setOwnTransportsWire as { protocol: number }[];
+            if (entries.some((e) => e.protocol === -1)) {
+              throw new Error('transport_invalid: unsupported protocol discriminant -1');
+            }
+          },
+        };
+      },
+    };
+  });
+
+  function builderWith(protocol: string) {
+    return new DeRecProtocolBuilder(7n)
+      .withChannelStore(stores.channelStore as never)
+      .withShareStore(stores.shareStore as never)
+      .withSecretStore(stores.secretStore as never)
+      .withUserSecretStore(stores.userSecretStore as never)
+      .withStateStore(stores.stateStore as never)
+      .withTransport(stores.transport as never)
+      .withOwnTransports([{ uri: 'grpcs://example.com:443', protocol }]);
+  }
+
+  it.each(['grpc', 'GRPC'])('withOwnTransports asks Rust for "%s"', (name) => {
+    builderWith(name).build();
+    expect(names).toEqual([name]);
+    expect(lastConfig!.own_transports).toEqual([
+      { uri: 'grpcs://example.com:443', protocol: 1 },
+    ]);
+  });
+
+  it('withOwnTransports forwards an unknown name to Rust, which rejects it', () => {
+    const builder = builderWith('bogus');
+    expect(() => builder.build()).toThrow(/transport_invalid/);
+    expect(names).toEqual(['bogus']);
+    expect(lastConfig!.own_transports).toEqual([
+      { uri: 'grpcs://example.com:443', protocol: -1 },
+    ]);
+  });
+
+  it.each(['grpc', 'GRPC'])('setOwnTransports asks Rust for "%s"', async (name) => {
+    const protocol = builderWith('grpc').build();
+    names = [];
+    await protocol.setOwnTransports([{ uri: 'grpcs://example.com:443', protocol: name }]);
+    expect(names).toEqual([name]);
+    expect(setOwnTransportsWire).toEqual([{ uri: 'grpcs://example.com:443', protocol: 1 }]);
+  });
+
+  it('setOwnTransports forwards an unknown name to Rust, which rejects it', async () => {
+    const protocol = builderWith('grpc').build();
+    names = [];
+    await expect(
+      protocol.setOwnTransports([{ uri: 'grpcs://example.com:443', protocol: 'bogus' }]),
+    ).rejects.toThrow(/transport_invalid/);
+    expect(names).toEqual(['bogus']);
+    expect(setOwnTransportsWire).toEqual([{ uri: 'grpcs://example.com:443', protocol: -1 }]);
+  });
+});
+
 // F1: `PairingParams.contact` is typed `ContactMessage`, and `createContact()`
 // resolves to one, so the natural call below type-checks without a cast. It
 // could not before `encode_contact_message` / `decode_contact_message` existed
@@ -139,11 +227,11 @@ describe('start(FlowKind.Pairing, ...) with createContact() output', () => {
   const CONTACT_JSON = {
     channel_id: '18446744073709551615',
     contact_mode: 0,
-    transport_protocol: { uri: 'https://example.com/derec', protocol: 0 },
     nonce: '9007199254740993',
     mlkem_encapsulation_key: [1, 2, 3],
     ecies_public_key: [4, 5, 6],
     timestamp: { seconds: 1700000000, nanos: 42 },
+    supported_transports: [{ uri: 'https://example.com/derec', protocol: 0 }],
   };
 
   function asciiToBuffer(text: string): ArrayBuffer {
@@ -161,6 +249,7 @@ describe('start(FlowKind.Pairing, ...) with createContact() output', () => {
     encodedContactJson = undefined;
     // @ts-expect-error test-only global
     globalThis.__DeRec = {
+      transport_protocol_discriminant: () => 0,
       decode_contact_message: (bytes: Uint8Array) => {
         expect(Array.from(bytes)).toEqual(CONTACT_WIRE);
         return asciiToBuffer(JSON.stringify(CONTACT_JSON));
@@ -199,10 +288,9 @@ describe('start(FlowKind.Pairing, ...) with createContact() output', () => {
     expect(contact.channel_id).toBe(18446744073709551615n);
     expect(contact.nonce).toBe(9007199254740993n);
     expect(contact.contact_mode).toBe(0);
-    expect(contact.transport_protocol).toEqual({
-      uri: 'https://example.com/derec',
-      protocol: 0,
-    });
+    expect(contact.supported_transports).toEqual([
+      { uri: 'https://example.com/derec', protocol: 0 },
+    ]);
     expect(contact.mlkem_encapsulation_key).toBeInstanceOf(Uint8Array);
     expect(Array.from(contact.mlkem_encapsulation_key!)).toEqual([1, 2, 3]);
     expect(contact.ecies_public_key).toBeInstanceOf(Uint8Array);
@@ -277,6 +365,54 @@ describe('event byte fields', () => {
     // Ids stay strings: widening them the way the message codec does would
     // break every consumer that compares them.
     expect(action.channel_id).toBe('18446744073709551615');
+  });
+
+  it('passes the ActionRequired request fields through unchanged', async () => {
+    const events = [
+      {
+        type: 'ActionRequired',
+        channel_id: '7',
+        action: [1],
+        action_kind: 'StoreShare',
+        trace_id: '18446744073709551615',
+        version: 3,
+        share_secret_id: '42',
+        share_size: 751,
+      },
+      {
+        type: 'ActionRequired',
+        channel_id: '7',
+        action: [2],
+        action_kind: 'Unpair',
+        trace_id: '1',
+        unpair_memo: 'decommissioning',
+      },
+      {
+        type: 'ActionRequired',
+        channel_id: '7',
+        action: [3],
+        action_kind: 'UpdateChannelInfo',
+        trace_id: '2',
+        updated_communication_info: {id: 'x', data: 'y'},
+        updated_transports: [{uri: 'https://new.example.com', protocol: 0}],
+      },
+    ];
+    host.tick = () => Promise.resolve(utf8(JSON.stringify(events)).buffer);
+
+    const { DeRecProtocol } = await import('../src/protocol');
+    const protocol = DeRecProtocol.fromHost(nativeHost() as never);
+    const decoded = (await protocol.tick()) as Array<
+      Extract<DeRecEvent, {type: 'ActionRequired'}>
+    >;
+
+    expect(decoded[0].trace_id).toBe('18446744073709551615');
+    expect(decoded[0].share_size).toBe(751);
+    expect(decoded[0].share_secret_id).toBe('42');
+    expect(decoded[1].unpair_memo).toBe('decommissioning');
+    expect(decoded[2].updated_communication_info).toEqual({id: 'x', data: 'y'});
+    expect(decoded[2].updated_transports).toEqual([
+      {uri: 'https://new.example.com', protocol: 0},
+    ]);
   });
 
   it('revives nested secret bytes in a recovery event', async () => {

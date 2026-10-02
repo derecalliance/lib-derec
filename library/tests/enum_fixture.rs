@@ -345,7 +345,11 @@ fn typescript_declarations_cover_the_fixture() {
         let js_path = format!("{root}/packages/{pkg}/index.js");
         let js =
             std::fs::read_to_string(&js_path).unwrap_or_else(|e| panic!("reading {js_path}: {e}"));
-        for (enum_name, js_object) in [("ContactMode", "ContactMode"), ("FlowKind", "FlowKind")] {
+        for (enum_name, js_object) in [
+            ("ContactMode", "ContactMode"),
+            ("FlowKind", "FlowKind"),
+            ("StatusEnum", "StatusEnum"),
+        ] {
             let mut absent = Vec::new();
             for v in fixture["enums"][enum_name]["variants"]
                 .as_array()

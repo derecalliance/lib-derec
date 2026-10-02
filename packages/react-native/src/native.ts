@@ -6,7 +6,8 @@
  * surface passes `ArrayBuffer`s that TurboModule specs cannot express.
  */
 export interface DeRecNative {
-  version(): string;
+  version(): { major: number; minor: number };
+  generate_replica_id(): bigint;
 }
 
 /**

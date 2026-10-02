@@ -454,8 +454,6 @@ mod tests {
                     version: 1,
                     nonce: 7,
                     timestamp: Some(timestamp),
-                    #[allow(deprecated)]
-                    reply_to: None,
                     reply_to_transports: Vec::new(),
                 },
             ))
@@ -551,8 +549,6 @@ mod tests {
                         version: 1,
                         nonce: 7,
                         timestamp: Some(timestamp),
-                        #[allow(deprecated)]
-                        reply_to: None,
                         reply_to_transports: Vec::new(),
                     },
                 ))

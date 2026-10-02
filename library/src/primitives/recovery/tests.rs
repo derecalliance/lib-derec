@@ -135,8 +135,6 @@ fn create_store_share_request_envelope(
         version_description: String::new(),
         timestamp: Some(timestamp),
         secret_id: 1,
-        #[allow(deprecated)]
-        reply_to: None,
         reply_to_transports: Vec::new(),
         replica_id: None,
     };
@@ -451,8 +449,6 @@ fn test_produce_get_share_response_message_request_timestamp_mismatch() {
         secret_id,
         version,
         timestamp: Some(message_timestamp),
-        #[allow(deprecated)]
-        reply_to: None,
         reply_to_transports: Vec::new(),
         replica_id: None,
     };
@@ -505,8 +501,6 @@ fn test_produce_get_share_response_message_stored_share_timestamp_mismatch() {
         version_description: String::new(),
         timestamp: Some(message_timestamp),
         secret_id,
-        #[allow(deprecated)]
-        reply_to: None,
         reply_to_transports: Vec::new(),
         replica_id: None,
     };
@@ -679,8 +673,6 @@ fn test_recovery_end_to_end() {
             version_description: String::new(),
             timestamp: Some(timestamp),
             secret_id,
-            #[allow(deprecated)]
-            reply_to: None,
             reply_to_transports: Vec::new(),
             replica_id: None,
         };

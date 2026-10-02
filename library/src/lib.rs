@@ -83,8 +83,15 @@ pub use error::Error;
 /// fail re-pairing / secret sync.
 ///
 /// Apps that do not use replica flows do not need to call this.
+///
+/// Never returns `0`, which no replica id may be.
 pub fn generate_replica_id() -> u64 {
-    rand::random()
+    loop {
+        let id: u64 = rand::random();
+        if id != 0 {
+            return id;
+        }
+    }
 }
 
 pub mod interop;

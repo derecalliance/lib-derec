@@ -53,6 +53,13 @@ internal static class Utils
     // surfaces the nulled-out pointers back to the caller on return.
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern void derec_free_error(ref DeRecError error);
+
+    // Both return a static NUL-terminated UTF-8 string; never free it.
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern IntPtr derec_error_category_name(int category);
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern IntPtr derec_error_code_name(int code);
 }
 
 /// <summary>

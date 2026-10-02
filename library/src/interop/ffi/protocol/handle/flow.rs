@@ -75,6 +75,32 @@ pub struct DeRecProtocolEventsResult {
     pub events_json: DeRecBuffer,
 }
 
+/// Result of [`derec_protocol_restore`].
+///
+/// A restore refused because channels already exist at the recovered ids
+/// reports which ones in `conflicting_channel_ids_json`, so the application
+/// can clear exactly those and retry.
+#[repr(C)]
+pub struct DeRecProtocolRestoreResult {
+    pub error: DeRecError,
+    /// UTF-8 JSON array of events, as on [`DeRecProtocolEventsResult`].
+    pub events_json: DeRecBuffer,
+    /// UTF-8 JSON array of decimal-string channel ids. Non-empty only when
+    /// `error.code` is `DEREC_CODE_RESTORE_CONFLICT`. Caller releases via
+    /// [`crate::interop::ffi::derec_free_buffer`].
+    pub conflicting_channel_ids_json: DeRecBuffer,
+}
+
+impl From<DeRecError> for DeRecProtocolRestoreResult {
+    fn from(error: DeRecError) -> Self {
+        Self {
+            error,
+            events_json: empty_buffer(),
+            conflicting_channel_ids_json: empty_buffer(),
+        }
+    }
+}
+
 impl From<DeRecError> for DeRecProtocolEventsResult {
     fn from(error: DeRecError) -> Self {
         Self {
@@ -309,7 +335,7 @@ pub unsafe extern "C" fn derec_protocol_restore(
     handle: *mut DeRecProtocolHandle,
     params_json_ptr: *const u8,
     params_json_len: usize,
-) -> DeRecProtocolEventsResult {
+) -> DeRecProtocolRestoreResult {
     if handle.is_null() {
         return ffi_error(DEREC_CODE_FFI_NULL_PTR, "handle is null").into();
     }
@@ -349,12 +375,26 @@ pub unsafe extern "C" fn derec_protocol_restore(
     match h.runtime.block_on(inner.restore(&secret, params.version)) {
         Ok(events) => {
             let json = encode_events(events);
-            DeRecProtocolEventsResult {
+            DeRecProtocolRestoreResult {
                 error: success(),
                 events_json: vec_into_buffer(json),
+                conflicting_channel_ids_json: empty_buffer(),
             }
         }
-        Err(e) => from_lib_error(e).into(),
+        Err(e) => {
+            let conflicting = match &e {
+                crate::Error::Restore(crate::protocol::RestoreError::Conflict(ids)) => {
+                    let ids: Vec<String> = ids.iter().map(|c| c.0.to_string()).collect();
+                    vec_into_buffer(serde_json::to_vec(&ids).expect("a list of strings serializes"))
+                }
+                _ => empty_buffer(),
+            };
+            DeRecProtocolRestoreResult {
+                error: from_lib_error(e),
+                events_json: empty_buffer(),
+                conflicting_channel_ids_json: conflicting,
+            }
+        }
     }
 }
 

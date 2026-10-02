@@ -195,7 +195,8 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     }
 
     if !replicas.is_empty() {
-        let composite = build_replica_composite(&secret, split_result.as_ref(), version);
+        let composite =
+            build_replica_composite(&secret, split_result.as_ref(), version, local.replica_id);
         let k_group = group_key;
         let replica_results = distribute_composite_to_destinations(
             stores,
@@ -220,6 +221,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
                 secrets: snapshot_secrets,
                 description: snapshot_description,
                 replicas: secret.replicas.clone(),
+                author_replica_id: local.replica_id,
             },
         )
         .await?;
@@ -269,7 +271,6 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     let channel_id = exchange.channel_id;
     let secret_id = local.secret_id;
     let version = request.version;
-    let replica_id = request.replica_id;
     let encoded_request = request.encode_to_vec();
 
     // A version has exactly one writer, so an existing entry at this
@@ -362,7 +363,6 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     Ok(vec![DeRecEvent::ShareStored {
         channel_id,
         version,
-        replica_id,
     }])
 }
 
@@ -706,6 +706,7 @@ fn build_replica_composite(
     secret: &Secret,
     split_result: Option<&crate::primitives::sharing::request::SplitResult>,
     version: u32,
+    author_replica_id: Option<u64>,
 ) -> crate::protocol::types::ReplicaSecretPayload {
     let shares: Vec<crate::protocol::types::ChannelShare> = split_result
         .map(|r| {
@@ -724,6 +725,7 @@ fn build_replica_composite(
         shares,
         shared_key: Vec::new(),
         version,
+        author_replica_id,
     }
 }
 
@@ -928,12 +930,7 @@ async fn dispatch_composite_to_destination<S: StoreSet>(
     let composite_bytes = per_channel.encode_to_vec();
 
     let timestamp = current_timestamp();
-    let (legacy_reply_to, reply_to_transports) =
-        crate::extensions::advertised_endpoints::split_reply_to(round.reply_to);
-    // Populating the deprecated singular field is the compatibility
-    // path that keeps peers predating `replyToTransports`
-    // answerable, so the warning is expected here.
-    #[allow(deprecated)]
+    let reply_to_transports = round.reply_to.to_vec();
     let msg = StoreShareRequestMessage {
         share: composite_bytes,
         share_algorithm: SHARE_ALGORITHM_REPLICA_SECRET,
@@ -942,7 +939,6 @@ async fn dispatch_composite_to_destination<S: StoreSet>(
         version_description: description.to_owned(),
         timestamp: Some(timestamp),
         secret_id: local.secret_id,
-        reply_to: legacy_reply_to,
         reply_to_transports,
         replica_id: local.replica_id,
     };
@@ -1565,6 +1561,7 @@ mod group_conformance_tests {
                     secrets: Vec::new(),
                     description: None,
                     replicas: None,
+                    author_replica_id: None,
                 },
             )
             .await
@@ -1760,6 +1757,7 @@ mod group_conformance_tests {
                 }],
                 shared_key: Vec::new(),
                 version: 4,
+                author_replica_id: None,
             };
 
             // The asker requested 9; the answerer served 4.
@@ -1815,6 +1813,7 @@ mod group_conformance_tests {
                 shares: Vec::new(),
                 shared_key: Vec::new(),
                 version: 0,
+                author_replica_id: None,
             };
 
             super::hydrate_catch_up(
@@ -1858,6 +1857,7 @@ mod group_conformance_tests {
                 shares: Vec::new(),
                 shared_key: Vec::new(),
                 version: 3,
+                author_replica_id: None,
             };
 
             let events = super::hydrate_catch_up(
@@ -1972,6 +1972,7 @@ pub(in crate::protocol) async fn build_catch_up_payload<S: StoreSet>(
         // The asker files the map under this, not under the version it
         // requested — see the field's docs.
         version: snapshot.version,
+        author_replica_id: snapshot.author_replica_id,
     }))
 }
 
@@ -1998,7 +1999,6 @@ pub(in crate::protocol) async fn hydrate_catch_up<S: StoreSet>(
     response_version: u32,
     payload: &[u8],
 ) -> Result<Vec<DeRecEvent>> {
-    let partition = local.secret_id;
     let composite = crate::protocol::types::ReplicaSecretPayload::decode(payload)
         .map_err(crate::Error::ProtobufDecode)?;
     let secret = composite.secret.ok_or(crate::Error::InvalidInput(
@@ -2010,7 +2010,30 @@ pub(in crate::protocol) async fn hydrate_catch_up<S: StoreSet>(
         composite.version
     };
 
-    let is_install = stores.user_secrets.load_latest(partition).await?.is_none();
+    // A catch-up answer comes from whichever member answered, so only the
+    // payload can name the author.
+    let author_replica_id = composite.author_replica_id;
+    let channel_id = ChannelId(secret.replicas.as_ref().map_or(0, |g| g.channel_id));
+
+    let is_install = match replica::arrival(stores, local, version, author_replica_id).await? {
+        replica::Arrival::Apply { is_install } => is_install,
+        replica::Arrival::Resend | replica::Arrival::Stale => {
+            return Ok(vec![DeRecEvent::NoOp]);
+        }
+        replica::Arrival::Conflict {
+            held_author_replica_id,
+        } => {
+            return Ok(vec![DeRecEvent::ReplicaVersionConflict {
+                channel_id,
+                from_replica_id,
+                secret_id,
+                version,
+                held_author_replica_id,
+                incoming_author_replica_id: author_replica_id,
+                secret,
+            }]);
+        }
+    };
 
     replica::hydrate(
         stores,
@@ -2019,13 +2042,15 @@ pub(in crate::protocol) async fn hydrate_catch_up<S: StoreSet>(
         &secret,
         &composite.shares,
         String::new(),
+        author_replica_id,
     )
     .await?;
 
     let event = if is_install {
         DeRecEvent::ReplicaSecretInstalled {
-            channel_id: ChannelId(secret.replicas.as_ref().map_or(0, |g| g.channel_id)),
+            channel_id,
             from_replica_id,
+            author_replica_id,
             secret_id,
             version,
             secret,
@@ -2033,8 +2058,9 @@ pub(in crate::protocol) async fn hydrate_catch_up<S: StoreSet>(
         }
     } else {
         DeRecEvent::ReplicaSecretReceived {
-            channel_id: ChannelId(secret.replicas.as_ref().map_or(0, |g| g.channel_id)),
+            channel_id,
             from_replica_id,
+            author_replica_id,
             secret_id,
             version,
             secret,

@@ -1892,20 +1892,30 @@ async fn run_protect_secret_with_replica_targets_flow() {
             DeRecEvent::ReplicaSecretInstalled {
                 channel_id: c,
                 from_replica_id,
+                author_replica_id,
                 secret_id,
                 version: _,
                 secret,
                 shares,
-            } if *c == replica_channel => {
-                Some((*from_replica_id, *secret_id, secret.clone(), shares.clone()))
-            }
+            } if *c == replica_channel => Some((
+                *from_replica_id,
+                *author_replica_id,
+                *secret_id,
+                secret.clone(),
+                shares.clone(),
+            )),
             _ => None,
         })
         .expect("replica.process should emit ReplicaSecretInstalled on the first sync");
-    let (received_from, received_secret_id, received_secret, shares) = received;
+    let (received_from, received_author, received_secret_id, received_secret, shares) = received;
     assert_eq!(
         received_from, owner_id,
         "from_replica_id must be owner's id"
+    );
+    assert_eq!(
+        received_author,
+        Some(owner_id),
+        "the publisher is recorded as the version's author"
     );
     assert_eq!(received_secret_id, 0xC0FFEE, "secret_id mismatch");
     assert_eq!(
@@ -3579,16 +3589,6 @@ async fn run_reply_to_flow() {
         req.reply_to_transports[0].uri, "https://owner-reply.example.com",
         "replyToTransports must lead with the owner's own_transport"
     );
-    // The deprecated singular field carries the first entry so a peer
-    // predating replyToTransports still has somewhere to answer.
-    #[allow(deprecated)]
-    {
-        assert_eq!(
-            req.reply_to.as_ref().map(|t| t.uri.as_str()),
-            Some("https://owner-reply.example.com"),
-            "the legacy replyTo must be the list's first entry, not its last"
-        );
-    }
 
     let phantom_uri = "https://phantom-replica.example.com";
     let timestamp = current_timestamp();
@@ -3596,10 +3596,8 @@ async fn run_reply_to_flow() {
         uri: phantom_uri.to_owned(),
         protocol: Protocol::Https.into(),
     };
-    #[allow(deprecated)]
     let crafted = GetSecretIdsVersionsRequestMessage {
         timestamp: Some(timestamp),
-        reply_to: Some(phantom.clone()),
         reply_to_transports: vec![phantom],
         // Owner ↔ helper exchange, so no member names itself.
         replica_id: None,
@@ -4953,27 +4951,6 @@ async fn run_own_transport_set_rules() {
     let mut protocol = build(&["https://a.example", "grpcs://a.example:443"])
         .expect("distinct protocols are a valid advertisement");
     println!("  distinct protocols accepted  ✓");
-
-    // Re-pointing HTTPS leaves gRPC where it was, and keeps HTTPS in its
-    // position: changing an address is not a change of preference.
-    #[allow(deprecated)]
-    protocol
-        .set_own_transport("https://moved.example")
-        .expect("re-pointing one protocol is valid");
-    let uris: Vec<String> = protocol
-        .own_transports
-        .iter()
-        .map(|t| t.uri.clone())
-        .collect();
-    assert_eq!(
-        uris,
-        vec![
-            "https://moved.example".to_owned(),
-            "grpcs://a.example:443".to_owned()
-        ],
-        "set_own_transport must re-point only its own protocol, in place"
-    );
-    println!("  set_own_transport re-points one protocol, in place  ✓");
 
     // The runtime setter applies the same rule as the builder.
     let err = protocol

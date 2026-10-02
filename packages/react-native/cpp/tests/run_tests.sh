@@ -25,6 +25,7 @@ LIB="$ROOT/target/release/libderec_library.a"
 status=0
 for src in "$HERE"/*Test.cpp; do
   name="$(basename "$src" .cpp)"
+  [[ "$name" == *JsiTest ]] && continue
   echo "── $name ─────────────────────────────────────"
   c++ -std=c++17 -I"$HERE/.." "$src" "$HERE/../Convert.cpp" \
       "$HERE/../JsCallbackBridge.cpp" "$HERE/../WorkerThread.cpp" \
@@ -33,6 +34,24 @@ for src in "$HERE"/*Test.cpp; do
     || c++ -std=c++17 -I"$HERE/.." "$src" "$HERE/../Convert.cpp" \
            "$HERE/../JsCallbackBridge.cpp" "$HERE/../WorkerThread.cpp" \
            "$LIB" -lpthread -ldl -lm -o "$OUT/$name"
+  "$OUT/$name" || status=1
+done
+# `*JsiTest.cpp` exercise JSI marshalling against a host Hermes build
+# (`HERMES_DIR`, defaulting to the smoke app's CocoaPods `hermes-engine`).
+HERMES_DIR="${HERMES_DIR:-$ROOT/smoke-tests/react-native/ios/Pods/hermes-engine/destroot}"
+HERMES_FW="$HERMES_DIR/Library/Frameworks/macosx"
+for src in "$HERE"/*JsiTest.cpp; do
+  [[ -e "$src" ]] || continue
+  name="$(basename "$src" .cpp)"
+  echo "── $name ─────────────────────────────────────"
+  if [[ ! -d "$HERMES_FW/hermesvm.framework" || ! -d "$HERMES_DIR/include/jsi" ]]; then
+    echo "SKIPPED: no host Hermes at $HERMES_DIR (set HERMES_DIR)"
+    continue
+  fi
+  c++ -std=c++20 -I"$HERE/.." -I"$HERMES_DIR/include" "$src" "$HERE/../UserSecretsJson.cpp" \
+      "$HERE/../Primitives.cpp" "$HERE/../Convert.cpp" "$LIB" \
+      -F"$HERMES_FW" -framework hermesvm -Wl,-rpath,"$HERMES_FW" \
+      -framework CoreFoundation -framework Security -o "$OUT/$name"
   "$OUT/$name" || status=1
 done
 exit $status

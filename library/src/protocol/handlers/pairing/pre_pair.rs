@@ -94,8 +94,6 @@ pub(super) async fn start<S: StoreSet>(
 ///   persists it as `PairingSecret`, and publishes the keys. First
 ///   authenticates the request by matching `request.nonce` against the
 ///   stored contact's `nonce`.
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 pub(in crate::protocol) async fn accept<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
@@ -197,8 +195,6 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
 /// `reject` arm for [`PendingAction::PrePair`]. Builds a non-Ok
 /// `PrePairResponse` (no keys) and sends it to the scanner's `replyTo`.
 /// Does NOT load `PairingSecret` — rejection carries no crypto material.
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 pub(in crate::protocol) async fn reject<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,

@@ -289,14 +289,10 @@ struct OwnTransportConfig {
 #[derive(serde::Deserialize)]
 struct ProtocolConfig {
     secret_id: String,
-    own_transport_uri: String,
-    own_transport_protocol: i32,
     /// Every endpoint this application serves, in preference order.
     ///
-    /// Absent or empty falls back to the `own_transport_uri` /
-    /// `own_transport_protocol` scalars above, which remain fully
-    /// supported. When non-empty, this array takes precedence over the
-    /// scalars entirely.
+    /// Absent or empty is the deferred-config path: the caller sets its
+    /// endpoints with `derec_protocol_set_own_transports` before pairing.
     #[serde(default)]
     own_transports: Vec<OwnTransportConfig>,
     #[serde(default = "default_threshold")]
@@ -314,18 +310,10 @@ struct ProtocolConfig {
     auto_accept: AutoAcceptConfig,
     #[serde(default)]
     timeouts: TimeoutsConfig,
-    /// Accept plaintext transport endpoints. Absent means "not set", which
-    /// is distinct from `false`: an SDK that never writes this key must not
-    /// override `unsafe_connection`.
-    ///
-    /// Superseded by `unsafe_connection`; still honored, and wins on
-    /// conflict. Removed at 0.0.5.
-    #[serde(default)]
-    unsafe_http: Option<bool>,
     /// Accept plaintext transport endpoints — `http://` and `grpc://`.
-    /// Absent means "not set". See `unsafe_http` for the conflict rule.
+    /// Absent means `false`.
     #[serde(default)]
-    unsafe_connection: Option<bool>,
+    unsafe_connection: bool,
     // Absent or `null` means "no replica id".
     #[serde(default)]
     replica_id: Option<String>,
@@ -344,9 +332,8 @@ struct ProtocolConfig {
 /// pointer-sized arguments natively.
 ///
 /// `config_json` must deserialize to the following shape — all field
-/// names `snake_case`. `secret_id`, `own_transport_uri` and
-/// `own_transport_protocol` are the only genuinely required fields;
-/// `threshold`, `keep_versions_count`, `auto_respond_on_failure`,
+/// names `snake_case`. `secret_id` is the only required field;
+/// `own_transports`, `threshold`, `keep_versions_count`, `auto_respond_on_failure`,
 /// `unpair_ack`, `auto_reply_to` and `auto_accept` may each be omitted, in
 /// which case the value matches
 /// [`crate::protocol::DeRecProtocolBuilder::new`]'s own default for that
@@ -356,8 +343,6 @@ struct ProtocolConfig {
 /// ```json
 /// {
 ///   "secret_id": "12345678901234567890",
-///   "own_transport_uri": "https://example.com/derec",
-///   "own_transport_protocol": 1,
 ///   "own_transports": [{ "uri": "https://example.com/derec", "protocol": 0 }],
 ///   "threshold": 3,
 ///   "keep_versions_count": 2,
@@ -381,15 +366,11 @@ struct ProtocolConfig {
 /// ```
 ///
 /// - `secret_id`: decimal-string `u64`.
-/// - `own_transport_uri`: may be `""` for the deferred-config path;
-///   `derec_protocol_set_own_transport` must be called before pairing
-///   in that case.
-/// - `own_transport_protocol`: [`derec_proto::Protocol`] discriminant.
 /// - `own_transports`: every endpoint this application serves, in
 ///   preference order — the order decides which of a peer's offered
-///   endpoints is used. Optional; when non-empty it takes precedence over
-///   `own_transport_uri` / `own_transport_protocol`, which stay fully
-///   supported for callers that serve a single transport.
+///   endpoints is used. May be empty for the deferred-config path;
+///   `derec_protocol_set_own_transports` must be called before pairing in
+///   that case.
 /// - `threshold` / `keep_versions_count`: optional; omitted means
 ///   [`crate::protocol::DEFAULT_THRESHOLD`] /
 ///   [`crate::protocol::DEFAULT_KEEP_VERSIONS_COUNT`].
@@ -461,15 +442,12 @@ pub unsafe extern "C" fn derec_protocol_new(
         None => None,
     };
 
-    // The `own_transports` array takes precedence over the scalar
-    // `own_transport_uri` / `own_transport_protocol` fields when
-    // non-empty. Empty scalar URI (and an empty array) is the
-    // deferred-config path: the caller will call
-    // `derec_protocol_set_own_transport` later, at which point
-    // validation runs unconditionally. Every other combination is
-    // validated here so the protocol can't be constructed with a
-    // malformed or downgraded endpoint that would then be propagated
-    // to peers via pairing.
+    // An empty array is the deferred-config path: the caller will call
+    // `derec_protocol_set_own_transports` later, at which point
+    // validation runs unconditionally. Every entry given here is
+    // validated so the protocol can't be constructed with a malformed or
+    // downgraded endpoint that would then be propagated to peers via
+    // pairing.
     let own_transports: Vec<crate::transport::TransportProtocol> =
         if !config.own_transports.is_empty() {
             let mut validated = Vec::with_capacity(config.own_transports.len());
@@ -480,16 +458,11 @@ pub unsafe extern "C" fn derec_protocol_new(
                 }
             }
             validated
-        } else if config.own_transport_uri.is_empty() {
+        } else {
             vec![crate::transport::TransportProtocol::new(
                 String::new(),
                 derec_proto::Protocol::Https,
             )]
-        } else {
-            match validate_transport(&config.own_transport_uri, config.own_transport_protocol) {
-                Ok(tp) => vec![tp],
-                Err(e) => return e.into(),
-            }
         };
 
     let info = match unsafe {
@@ -511,13 +484,7 @@ pub unsafe extern "C" fn derec_protocol_new(
         }
     };
 
-    let unsafe_connection = match crate::protocol::builder::resolve_plaintext_opt_in(
-        config.unsafe_http,
-        config.unsafe_connection,
-    ) {
-        Ok(v) => v,
-        Err(e) => return crate::interop::ffi::error::from_lib_error(e).into(),
-    };
+    let unsafe_connection = config.unsafe_connection;
 
     unsafe {
         construct_protocol(
@@ -750,17 +717,14 @@ fn default_unpair_ack() -> i32 {
 mod protocol_config_defaults_tests {
     use super::*;
 
-    /// A config JSON carrying only the genuinely-required fields
-    /// (`secret_id`, `own_transport_uri`, `own_transport_protocol`)
+    /// A config JSON carrying only the required `secret_id`
     /// deserializes, and every omitted field resolves to exactly the value
     /// [`crate::protocol::DeRecProtocolBuilder::new`] would have used —
     /// proving the FFI shim invents no defaults of its own.
     #[test]
     fn minimal_config_json_matches_builder_defaults() {
         let minimal = r#"{
-            "secret_id": "1",
-            "own_transport_uri": "",
-            "own_transport_protocol": 1
+            "secret_id": "1"
         }"#;
         let config: ProtocolConfig =
             serde_json::from_str(minimal).expect("minimal config must deserialize");
@@ -787,45 +751,24 @@ mod protocol_config_defaults_tests {
 mod tests {
     use super::*;
 
-    /// `ProtocolConfig` accepts either plaintext opt-in key independently,
-    /// and leaves both `None` when neither is present — the FFI shim must
-    /// preserve presence so `resolve_plaintext_opt_in` sees the same
-    /// distinction the builder does.
+    /// `unsafe_connection` is read when present and defaults to `false`.
     #[test]
-    fn config_json_accepts_either_plaintext_flag() {
-        let old: ProtocolConfig = serde_json::from_str(
+    fn config_json_reads_the_plaintext_flag() {
+        let set: ProtocolConfig = serde_json::from_str(
             r#"{
                 "secret_id": "1",
-                "own_transport_uri": "",
-                "own_transport_protocol": 1,
-                "unsafe_http": true
-            }"#,
-        )
-        .expect("parses");
-        assert_eq!(old.unsafe_http, Some(true));
-        assert_eq!(old.unsafe_connection, None);
-
-        let new: ProtocolConfig = serde_json::from_str(
-            r#"{
-                "secret_id": "1",
-                "own_transport_uri": "",
-                "own_transport_protocol": 1,
                 "unsafe_connection": true
             }"#,
         )
         .expect("parses");
-        assert_eq!(new.unsafe_http, None);
-        assert_eq!(new.unsafe_connection, Some(true));
+        assert!(set.unsafe_connection);
 
-        let neither: ProtocolConfig = serde_json::from_str(
+        let absent: ProtocolConfig = serde_json::from_str(
             r#"{
-                "secret_id": "1",
-                "own_transport_uri": "",
-                "own_transport_protocol": 1
+                "secret_id": "1"
             }"#,
         )
         .expect("parses");
-        assert_eq!(neither.unsafe_http, None);
-        assert_eq!(neither.unsafe_connection, None);
+        assert!(!absent.unsafe_connection);
     }
 }

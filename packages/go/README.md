@@ -81,7 +81,7 @@ func main() {
 		sharedKey        = make([]byte, 32) // established during pairing
 	)
 
-	envelope, err := verification.Request.Produce(channelID, secretID, version, sharedKey)
+	envelope, err := verification.Request.Produce(channelID, secretID, version, sharedKey, nil)
 	if err != nil {
 		panic(err)
 	}
@@ -206,10 +206,12 @@ shares, err := sharing.Request.Split(secretID, secretData, channelIDs, threshold
 // shares: map[uint64][]byte — channel id -> one CommittedDeRecShare per helper.
 
 for channelID, committedShare := range shares {
-	envelope, err := sharing.Request.Produce(channelID, version, secretID, committedShare, nil, "", sharedKeys[channelID])
+	envelope, err := sharing.Request.Produce(channelID, version, secretID, committedShare, nil, "", sharedKeys[channelID], nil)
 	// send envelope over your transport
 }
 ```
+
+The last argument of every request `Produce` (sharing, verification, recovery, discovery, unpairing) is `replyTo []Endpoint`: the endpoints, in preference order, the peer should answer on. `nil` means answer on the endpoints recorded for the channel.
 
 The helper side extracts with `sharing.Request.Extract`, persists the request, and answers with `sharing.Response.Produce` (returning the `CommittedShare`, `SecretID`, and `Version` it stored). The owner confirms with `sharing.Response.Extract` + `sharing.Response.Process`.
 
@@ -221,7 +223,7 @@ The helper side extracts with `sharing.Request.Extract`, persists the request, a
 import "github.com/derecalliance/lib-derec/packages/go/primitives/verification"
 
 // Owner side: produce the challenge.
-requestEnvelope, err := verification.Request.Produce(channelID, secretID, version, sharedKey)
+requestEnvelope, err := verification.Request.Produce(channelID, secretID, version, sharedKey, nil)
 
 // Helper side: decrypt and answer with proof of possession.
 req, err := verification.Request.Extract(requestEnvelope, sharedKey)
@@ -240,7 +242,7 @@ valid, err := verification.Response.Process(req.RequestProto, resp.ResponseProto
 import "github.com/derecalliance/lib-derec/packages/go/primitives/recovery"
 
 // Owner side: request the stored share from each paired helper.
-requestEnvelope, err := recovery.Request.Produce(channelID, secretID, version, sharedKey)
+requestEnvelope, err := recovery.Request.Produce(channelID, secretID, version, sharedKey, nil)
 
 // Helper side: answer using the StoreShareRequest proto it persisted at sharing time.
 req, err := recovery.Request.Extract(requestEnvelope, sharedKey)
@@ -270,7 +272,7 @@ recovered, err := recovery.Response.Recover([]recovery.ShareResponse{
 import "github.com/derecalliance/lib-derec/packages/go/primitives/discovery"
 
 // Owner side: ask a helper which secret ids/versions it holds.
-requestEnvelope, err := discovery.Request.Produce(channelID, sharedKey)
+requestEnvelope, err := discovery.Request.Produce(channelID, sharedKey, nil)
 
 // Helper side: decrypt and advertise its stored versions.
 _, err = discovery.Request.Extract(requestEnvelope, sharedKey)
@@ -333,11 +335,12 @@ import (
 )
 
 cfg := protocol.Config{
-	SecretID:             secretID,
-	OwnTransportURI:      "https://owner.example.com",
-	OwnTransportProtocol: int32(derecpb.Protocol_HTTPS),
-	Threshold:            2, // default 3
-	KeepVersionsCount:    3, // default 3
+	SecretID: secretID,
+	OwnTransports: []protocol.TransportProtocolParam{
+		{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)},
+	},
+	Threshold:         2, // default 3
+	KeepVersionsCount: 3, // default 3
 }
 
 p, err := protocol.New(channelStore, shareStore, secretStore, userSecretStore, stateStore, transport, cfg)
@@ -379,7 +382,7 @@ for _, ev := range events {
 
 `Process` returns `[]protocol.Event`, decoded from the same JSON event stream the Rust core emits — compare `Event.Type` against the `protocol.EventType*` constants (`EventTypePairingCompleted`, `EventTypeShareStored`, `EventTypeShareConfirmed`, `EventTypeSecretRecovered`, `EventTypeActionRequired`, …) rather than hand-typing the string.
 
-When recovering a secret onto a fresh instance, pass the typed `Secret` from a `SecretRecovered` (or `ReplicaSecretReceived`) event to `p.Restore(secret, version)` to commit canonical helper state and wipe the throwaway recovery-mode channels.
+When recovering a secret onto a fresh instance, pass the typed `Secret` from a `SecretRecovered` (or `ReplicaSecretReceived`) event to `p.Restore(secret, version)` to commit canonical helper state and wipe the throwaway recovery-mode channels. If channels already exist at ids the recovered `Secret` uses, `Restore` fails with a `*derec.Error` whose `Code` is `derec.CodeRestoreConflict` and whose `ConflictingChannelIDs` (`[]uint64`) lists exactly those ids — clear them and retry.
 
 Reference: the repository's end-to-end tests drive a complete Owner + two Helpers pairing → protect-secret → recovery cycle — see [End-to-end test coverage](https://github.com/derecalliance/lib-derec#end-to-end-test-coverage).
 
@@ -387,7 +390,7 @@ Reference: the repository's end-to-end tests drive a complete Owner + two Helper
 
 ## Package Layout
 
-- [`derec`](derec/) — the shared error vocabulary: `derec.Error` (`Category`, `Code`, `Message`, `PeerStatus`, `PeerMemo`, `Expected`, `Got`) and the `Category*`/`Code*` constants every fallible call can return.
+- [`derec`](derec/) — the shared error vocabulary: `derec.Error` (`Category`, `Code`, `Message`, `PeerStatus`, `PeerMemo`, `Expected`, `Got`, plus `CategoryName()`/`CodeName()` returning the library's stable names) and the `Category*`/`Code*` constants every fallible call can return; and `derec.CurrentProtocolVersion()`, the core's protocol version for audit logs.
 - [`derecpb`](derecpb/) — generated protobuf Go types for the DeRec wire messages (`TransportProtocol`, `CommunicationInfo`, `ContactMessage`, …).
 - [`primitives`](primitives/) — one package per flow (`pairing`, `sharing`, `verification`, `recovery`, `discovery`, `unpairing`, `envelope`), each exposing stateless `Request`/`Response` produce/extract/process functions operating on raw bytes.
 - [`protocol`](protocol/) — the stateful `DeRecProtocol` orchestrator, its six store interfaces, `Config`, `FlowKind`/`ContactMode` constants, and the `Event` type.
@@ -408,7 +411,7 @@ All replicas of one `secretID` also share a single **group channel key**: every 
 
 `HashedKeys` ships only a SHA-384 binding hash in the contact and serves the actual public keys through a plaintext `PrePair` round-trip on the contact creator's own transport. Any party that can reach that URI before the legitimate scanner gets the keys. Use `HashedKeys` only with a transport endpoint that is freshly minted for the pairing and retired as soon as the `PrePair` leg completes. `ContactModeInlineKeys` has no such constraint.
 
-The recommended pattern: pair on the ephemeral URI, then — as soon as pairing completes on the contact-creator side — call `SetOwnTransports` with the permanent endpoint (`SetOwnTransport` is deprecated and removed at 0.0.5) and start an `UpdateChannelInfo` flow to announce the swap. This keeps the plaintext `PrePair` window tight while subsequent traffic rides on the long-lived endpoint.
+The recommended pattern: pair on the ephemeral URI, then — as soon as pairing completes on the contact-creator side — call `SetOwnTransports` with the permanent endpoint and start an `UpdateChannelInfo` flow to announce the swap. This keeps the plaintext `PrePair` window tight while subsequent traffic rides on the long-lived endpoint.
 
 ### Replica fingerprint verification is mandatory
 

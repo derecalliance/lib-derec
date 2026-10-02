@@ -115,17 +115,17 @@ fn typescript_surfaces_declare_every_dto_field() {
             max_unresponsive_deactivation_timeout,
         }
         ContactMessage {
-            channel_id, transport_protocol, nonce, contact_mode, mlkem_encapsulation_key,
+            channel_id, nonce, contact_mode, mlkem_encapsulation_key,
             ecies_public_key, contact_binding_hash, timestamp, supported_transports,
         }
         PairRequestMessage {
             sender_kind, mlkem_ciphertext, ecies_public_key, nonce, communication_info,
-            parameter_range, transport_protocol, timestamp, supported_transports,
+            parameter_range, timestamp, supported_transports,
         }
         PairResponseMessage {
             result, nonce, communication_info, parameter_range, timestamp, channel_id,
         }
-        PrePairRequestMessage { nonce, transport_protocol, timestamp, supported_transports }
+        PrePairRequestMessage { nonce, timestamp, supported_transports }
         PrePairResponseMessage {
             result, mlkem_encapsulation_key, ecies_public_key, nonce, timestamp,
         }
@@ -201,8 +201,8 @@ fn typescript_surfaces_declare_every_dto_field() {
 }
 
 /// `withUnsafeConnection` and the `Grpc` transport discriminant have no
-/// `dto::` struct behind them to destructure exhaustively: `unsafe_http` /
-/// `unsafe_connection` live on the private FFI `ProtocolConfig`
+/// `dto::` struct behind them to destructure exhaustively: `unsafe_connection`
+/// lives on the private FFI `ProtocolConfig`
 /// (`library/src/interop/ffi/protocol/handle/mod.rs`), and the transport
 /// `Protocol` enum is declared in `protobufs/transportprotocol.proto` — both
 /// unreachable from this external test crate the way `dto::` is. The check
@@ -231,8 +231,12 @@ fn typescript_surfaces_forward_unsafe_connection_and_grpc() {
             && rn.contains("this.config.unsafe_connection = allow;"),
         "{rn_path} does not forward unsafe_connection to the wire config"
     );
+    // Protocol names resolve in the core, never in a table of the binding's
+    // own: a table is how a defined protocol came to reach the transport as
+    // "unknown".
     assert!(
-        rn.contains("case 'grpc':"),
-        "{rn_path} protocolDiscriminant does not resolve the Grpc protocol name"
+        rn.contains("transport_protocol_discriminant(") && !rn.contains("case 'grpc':"),
+        "{rn_path} must resolve protocol names through the core's \
+         transport_protocol_discriminant, not a local table"
     );
 }

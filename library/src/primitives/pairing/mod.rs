@@ -14,6 +14,16 @@ mod tests;
 use crate::extensions::contact_message::ContactMessageExt as _;
 use derec_proto::{ContactMessage, ContactMode};
 
+/// The human-readable fingerprint of the shared key a pairing established.
+///
+/// Both ends derive the same value from the same key, so comparing it out of
+/// band confirms nobody sat between them during the exchange. A
+/// [`ContactMode::NoKeys`] pairing MUST be confirmed this way before the
+/// channel is used: nothing else binds the keys it exchanged to the contact.
+pub fn fingerprint(shared_key: &crate::types::SharedKey) -> String {
+    derec_cryptography::replica::fingerprint(shared_key)
+}
+
 /// Asserts the contact is structurally valid AND its declared
 /// `contact_mode` matches the mode the calling flow expects. Used at every
 /// orchestrator entry point that ingests a contact:

@@ -91,11 +91,10 @@ func newOrchestratorPeer(t *testing.T, label, uri string, threshold uint32) *orc
 	transport := newInProcessTransport()
 
 	cfg := Config{
-		SecretID:             orchestratorSecretID,
-		OwnTransportURI:      uri,
-		OwnTransportProtocol: int32(derecpb.Protocol_HTTPS),
-		Threshold:            threshold,
-		KeepVersionsCount:    3,
+		SecretID:          orchestratorSecretID,
+		OwnTransports:     []TransportProtocolParam{{URI: uri, Protocol: int32(derecpb.Protocol_HTTPS)}},
+		Threshold:         threshold,
+		KeepVersionsCount: 3,
 	}
 	p, err := New(channelStore, shareStore, secretStore, userSecretStore, stateStore, transport, cfg)
 	if err != nil {
@@ -389,7 +388,17 @@ func TestOrchestrator_PairingAndProtectSecret_EndToEnd(t *testing.T) {
 
 	storedFor := map[string]bool{}
 	confirmedCount := 0
+	storeShareActions := 0
 	for _, ev := range shareEvents {
+		if ev.Type == EventTypeActionRequired && ev.ActionKind == ActionKindStoreShare {
+			storeShareActions++
+			if ev.ShareSize == nil || *ev.ShareSize == 0 {
+				t.Fatalf("StoreShare ActionRequired must carry a positive ShareSize, got %+v", ev)
+			}
+			if ev.TraceID == "" {
+				t.Fatalf("StoreShare ActionRequired must carry a TraceID, got %+v", ev)
+			}
+		}
 		switch ev.Type {
 		case EventTypeShareStored:
 			storedFor[ev.ChannelID] = true
@@ -402,6 +411,9 @@ func TestOrchestrator_PairingAndProtectSecret_EndToEnd(t *testing.T) {
 	}
 	if !storedFor[strconv.FormatUint(channelB, 10)] {
 		t.Fatalf("expected a ShareStored event for channel-b (%d), got %+v", channelB, shareEvents)
+	}
+	if storeShareActions != 2 {
+		t.Fatalf("expected 2 StoreShare ActionRequired events (one per helper), got %d", storeShareActions)
 	}
 	if confirmedCount != 2 {
 		t.Fatalf("expected 2 ShareConfirmed events (one per helper), got %d: %+v", confirmedCount, shareEvents)

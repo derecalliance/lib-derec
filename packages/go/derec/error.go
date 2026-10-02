@@ -1,18 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-// Package derec holds the public DeRec SDK error vocabulary: the typed
-// [Error] returned by every fallible primitive, and the Category*/Code*
-// constants it carries. This package is a leaf — it imports nothing else
-// from this module — so that internal/native and every primitives/* package
-// can depend on it without creating an import cycle.
+// Package derec holds the public DeRec SDK vocabulary: the typed [Error]
+// returned by every fallible primitive, the Category*/Code* constants it
+// carries, and the core's [ProtocolVersion].
 //
 // The Category*/Code* constants mirror, one-for-one and with the same
 // integer values, the DEREC_CATEGORY_*/DEREC_CODE_* constants declared in
 // library/src/interop/ffi/error.rs, which remains the source of truth.
 package derec
 
-import "fmt"
+import "github.com/derecalliance/lib-derec/packages/go/internal/native"
 
 // Error is the typed error returned by every fallible DeRec primitive. It
 // carries the FFI category/code plus the structured fields that are only
@@ -20,28 +18,18 @@ import "fmt"
 //
 //   - PeerStatus / PeerMemo are valid when Code == CodeNonOKStatus.
 //   - Expected / Got are valid when Code == CodeVersionMismatch.
+//   - ConflictingChannelIDs is set by protocol Restore when
+//     Code == CodeRestoreConflict: the existing channel ids that collide
+//     with the recovered Secret. Empty otherwise.
 //
 // Message is human-readable only — branch on Code, never parse Message.
-type Error struct {
-	Category   int32
-	Code       int32
-	Message    string
-	PeerStatus int32
-	PeerMemo   string
-	Expected   uint32
-	Got        uint32
-}
-
-// Error implements the error interface.
-func (e *Error) Error() string {
-	return fmt.Sprintf("derec: %s (category=%d code=%d)", e.Message, e.Category, e.Code)
-}
-
-// Unwrap always returns nil: Error is a terminal, self-contained error value
-// with no wrapped cause to unwrap.
-func (e *Error) Unwrap() error {
-	return nil
-}
+// CategoryName and CodeName return the library's stable names for Category
+// and Code ("unknown" for values it does not define), and Error() includes
+// both names alongside the numbers.
+//
+// Declared in the internal binding, which constructs it, so this package can
+// import the binding without an import cycle.
+type Error = native.Error
 
 // Categories identify the protocol phase or layer that produced an [Error].
 // They mirror the DEREC_CATEGORY_* constants in library/src/interop/ffi/error.rs.
@@ -132,12 +120,5 @@ const (
 	// nothing. Always a local, terminal error: push-only delivery means an
 	// unreachable peer also cannot be told.
 	CodeNoUsableEndpoint int32 = 121
-	// CodeConflictingPlaintextOptIn: both plaintext opt-in flags were set
-	// explicitly and disagree — Config.UnsafeHTTP says one thing and
-	// Config.UnsafeConnection the other. Raised at protocol construction
-	// rather than resolved by precedence, because the flag precedence would
-	// favour is the one being removed, and a configuration layer that emits
-	// every field unconditionally would otherwise let a defaulted value
-	// silently beat a deliberate one. Set only UnsafeConnection.
-	CodeConflictingPlaintextOptIn int32 = 122
+	// 122 is retired; never reassign it.
 )

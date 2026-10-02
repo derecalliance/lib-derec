@@ -3,7 +3,7 @@ import * as path from 'node:path';
 
 import { DEREC_ERROR_CATEGORIES } from '../src/errors';
 import { MessageKind } from '../src/messages';
-import { ContactMode, FlowKind, SenderKind } from '../src/types';
+import { ContactMode, FlowKind, SenderKind, StatusEnum } from '../src/types';
 
 const fixture = JSON.parse(
   fs.readFileSync(
@@ -31,6 +31,7 @@ describe('enum parity with the shared fixture', () => {
   it('SenderKind matches', () => expectMatches('SenderKind', SenderKind as never));
   it('ContactMode matches', () => expectMatches('ContactMode', ContactMode as never));
   it('FlowKind matches', () => expectMatches('FlowKind', FlowKind as never));
+  it('StatusEnum matches', () => expectMatches('StatusEnum', StatusEnum as never));
 
   // `MessageKind` selects which message the JSON codec decodes. A shim value
   // that drifted from the Rust discriminant would decode a message as the

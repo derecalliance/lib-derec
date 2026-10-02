@@ -62,13 +62,8 @@ pub(crate) trait ContactMessageExt {
     /// the given ML-KEM + ECIES public key material verbatim.
     ///
     /// `own` is every endpoint the contact creator serves, in its own
-    /// preference order. It fills `supported_transports` wholesale, and
-    /// its first entry also fills the legacy singular
-    /// `transport_protocol` so peers predating the offer list still find
-    /// an endpoint. Deriving the singular field here rather than taking
-    /// it as a second argument is what keeps the two from disagreeing.
-    /// An empty `own` yields an absent singular field; callers reject
-    /// that case before constructing a contact.
+    /// preference order. It fills `supported_transports` wholesale; callers
+    /// reject an empty `own` before constructing a contact.
     ///
     /// Timestamp is stamped with the current wall-clock; callers that
     /// need deterministic timestamps must construct the proto struct
@@ -86,8 +81,7 @@ pub(crate) trait ContactMessageExt {
     /// || u64_be(channel_id))` so the scanner can verify keys received
     /// later via `PrePair` against the commitment.
     ///
-    /// `own` is outside the binding hash, exactly like the singular
-    /// field derived from it.
+    /// `own` is outside the binding hash.
     ///
     /// Timestamp is stamped with the current wall-clock.
     fn hashed_keys(
@@ -114,8 +108,6 @@ pub(crate) trait ContactMessageExt {
 }
 
 impl ContactMessageExt for ContactMessage {
-    // Compatibility, not oversight — see the `transport` module docs.
-    #[allow(deprecated)]
     fn validate(&self) -> Result<(), crate::Error> {
         let mode = ContactMode::try_from(self.contact_mode).map_err(|_| {
             #[cfg(feature = "logging")]
@@ -203,15 +195,8 @@ impl ContactMessageExt for ContactMessage {
         }
 
         // A contact naming no endpoint at all gives the scanner nowhere to
-        // send the pair request. Either spelling satisfies this: the list,
-        // or the deprecated singular field a peer predating it fills.
-        let has_offers = !self.supported_transports.is_empty();
-        let has_singular = self
-            .transport_protocol
-            .as_ref()
-            .is_some_and(|tp| !tp.uri.trim().is_empty());
-
-        if !has_offers && !has_singular {
+        // send the pair request.
+        if self.supported_transports.is_empty() {
             #[cfg(feature = "logging")]
             tracing::warn!("contact advertises no usable transport endpoint");
 
@@ -226,8 +211,6 @@ impl ContactMessageExt for ContactMessage {
             || self.contact_mode == ContactMode::NoKeys as i32
     }
 
-    // Compatibility, not oversight — see the `transport` module docs.
-    #[allow(deprecated)]
     fn inline_keys(
         channel_id: ChannelId,
         nonce: u64,
@@ -236,7 +219,6 @@ impl ContactMessageExt for ContactMessage {
     ) -> ContactMessage {
         ContactMessage {
             channel_id: channel_id.into(),
-            transport_protocol: own.first().cloned(),
             contact_mode: ContactMode::InlineKeys as i32,
             mlkem_encapsulation_key: Some(pk.mlkem_encapsulation_key),
             ecies_public_key: Some(pk.ecies_public_key),
@@ -247,8 +229,6 @@ impl ContactMessageExt for ContactMessage {
         }
     }
 
-    // Compatibility, not oversight — see the `transport` module docs.
-    #[allow(deprecated)]
     fn hashed_keys(
         channel_id: ChannelId,
         nonce: u64,
@@ -264,7 +244,6 @@ impl ContactMessageExt for ContactMessage {
 
         ContactMessage {
             channel_id: channel_id.into(),
-            transport_protocol: own.first().cloned(),
             contact_mode: ContactMode::HashedKeys as i32,
             mlkem_encapsulation_key: None,
             ecies_public_key: None,
@@ -275,12 +254,9 @@ impl ContactMessageExt for ContactMessage {
         }
     }
 
-    // Compatibility, not oversight — see the `transport` module docs.
-    #[allow(deprecated)]
     fn no_keys(channel_id: ChannelId, nonce: u64, own: Vec<TransportProtocol>) -> ContactMessage {
         ContactMessage {
             channel_id: channel_id.into(),
-            transport_protocol: own.first().cloned(),
             contact_mode: ContactMode::NoKeys as i32,
             mlkem_encapsulation_key: None,
             ecies_public_key: None,
@@ -303,60 +279,51 @@ mod tests {
         Timestamp { seconds, nanos: 0 }
     }
 
-    // Compatibility, not oversight — see the `transport` module docs.
-    #[allow(deprecated)]
     fn well_formed_inline_keys_contact() -> ContactMessage {
         ContactMessage {
             channel_id: 42,
-            transport_protocol: Some(TransportProtocol {
-                uri: "https://relay.example/alice".to_owned(),
-                protocol: Protocol::Https.into(),
-            }),
             contact_mode: ContactMode::InlineKeys as i32,
             mlkem_encapsulation_key: Some(vec![1; 1184]),
             ecies_public_key: Some(vec![2; 33]),
             contact_binding_hash: None,
             nonce: 0xCAFE_BABE,
             timestamp: Some(ts(1_700_000_000)),
-            supported_transports: Vec::new(),
+            supported_transports: vec![TransportProtocol {
+                uri: "https://relay.example/alice".to_owned(),
+                protocol: Protocol::Https.into(),
+            }],
         }
     }
 
-    // Compatibility, not oversight — see the `transport` module docs.
-    #[allow(deprecated)]
     fn well_formed_hashed_keys_contact() -> ContactMessage {
         ContactMessage {
             channel_id: 42,
-            transport_protocol: Some(TransportProtocol {
-                uri: "https://relay.example/alice/ephemeral".to_owned(),
-                protocol: Protocol::Https.into(),
-            }),
             contact_mode: ContactMode::HashedKeys as i32,
             mlkem_encapsulation_key: None,
             ecies_public_key: None,
             contact_binding_hash: Some(vec![0xAB; 48]),
             nonce: 0xDEAD_BEEF,
             timestamp: Some(ts(1_700_000_000)),
-            supported_transports: Vec::new(),
+            supported_transports: vec![TransportProtocol {
+                uri: "https://relay.example/alice/ephemeral".to_owned(),
+                protocol: Protocol::Https.into(),
+            }],
         }
     }
 
-    // Compatibility, not oversight — see the `transport` module docs.
-    #[allow(deprecated)]
     fn well_formed_no_keys_contact() -> ContactMessage {
         ContactMessage {
             channel_id: 1234,
-            transport_protocol: Some(TransportProtocol {
-                uri: "https://institution.example/pair".to_owned(),
-                protocol: Protocol::Https.into(),
-            }),
             contact_mode: ContactMode::NoKeys as i32,
             mlkem_encapsulation_key: None,
             ecies_public_key: None,
             contact_binding_hash: None,
             nonce: 4321,
             timestamp: Some(ts(1_700_000_000)),
-            supported_transports: Vec::new(),
+            supported_transports: vec![TransportProtocol {
+                uri: "https://institution.example/pair".to_owned(),
+                protocol: Protocol::Https.into(),
+            }],
         }
     }
 

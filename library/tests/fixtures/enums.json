@@ -194,6 +194,10 @@
           "wire": "ReplicaSyncRejected"
         },
         {
+          "name": "ReplicaVersionConflict",
+          "wire": "ReplicaVersionConflict"
+        },
+        {
           "name": "SecretRecovered",
           "wire": "SecretRecovered"
         },
@@ -533,7 +537,8 @@
         { "name": "FfiInvalidEnum", "wire": 104, "text": "ffi_invalid_enum" },
         { "name": "FfiBadSharedKey", "wire": 105, "text": "ffi_bad_shared_key" },
         { "name": "FfiNulInString", "wire": 106, "text": "ffi_nul_in_string" },
-        { "name": "TransportInvalid", "wire": 120, "text": "transport_invalid" }
+        { "name": "TransportInvalid", "wire": 120, "text": "transport_invalid" },
+        { "name": "NoUsableEndpoint", "wire": 121, "text": "no_usable_endpoint" }
       ]
     },
     "MessageKind": {

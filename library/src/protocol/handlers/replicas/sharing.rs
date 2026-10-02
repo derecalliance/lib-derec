@@ -33,6 +33,49 @@ use derec_proto::{
 };
 use prost::Message;
 
+/// How an incoming copy of the secret relates to the one this device holds.
+pub(in crate::protocol) enum Arrival {
+    /// Newer than what is held, or nothing is held: hydrate it.
+    Apply { is_install: bool },
+    /// The held version, from the same author: a re-send. Nothing to write.
+    Resend,
+    /// The held version from a different author, or from an unknown one: two
+    /// members published the same version.
+    Conflict { held_author_replica_id: Option<u64> },
+    /// Older than what is held.
+    Stale,
+}
+
+/// Classify an incoming copy against this device's snapshot.
+///
+/// A version is identified by who published it, not by its bytes: the same
+/// author re-sending a version may carry a roster that has since changed.
+/// When either author is unknown the two copies cannot be told apart, and
+/// they are reported as a conflict rather than silently merged.
+pub(in crate::protocol) async fn arrival<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    version: u32,
+    incoming_author_replica_id: Option<u64>,
+) -> Result<Arrival> {
+    let Some(held) = stores.user_secrets.load_latest(local.secret_id).await? else {
+        return Ok(Arrival::Apply { is_install: true });
+    };
+    Ok(match version.cmp(&held.version) {
+        std::cmp::Ordering::Greater => Arrival::Apply { is_install: false },
+        std::cmp::Ordering::Less => Arrival::Stale,
+        std::cmp::Ordering::Equal
+            if held.author_replica_id.is_some()
+                && held.author_replica_id == incoming_author_replica_id =>
+        {
+            Arrival::Resend
+        }
+        std::cmp::Ordering::Equal => Arrival::Conflict {
+            held_author_replica_id: held.author_replica_id,
+        },
+    })
+}
+
 /// Handle a store-share message a group member authored.
 ///
 /// Every member of the group answers on the one group channel, so the author
@@ -109,6 +152,7 @@ pub(in crate::protocol) async fn hydrate<S: StoreSet>(
     secret: &Secret,
     shares: &[crate::protocol::types::ChannelShare],
     description: String,
+    author_replica_id: Option<u64>,
 ) -> Result<Option<(ChannelId, SharedKey)>> {
     let secret_id = local.secret_id;
     use crate::protocol::types::{
@@ -226,6 +270,7 @@ pub(in crate::protocol) async fn hydrate<S: StoreSet>(
                 secrets: secret.secrets.clone(),
                 description: Some(description).filter(|d| !d.is_empty()),
                 replicas: secret.replicas.clone(),
+                author_replica_id,
             },
         )
         .await?;
@@ -299,10 +344,67 @@ async fn on_request<S: StoreSet>(
         ));
     }
 
-    // Whether this is the first time this device has held the secret is
-    // decided before hydration writes the snapshot that would erase the
-    // distinction.
-    let is_install = stores.user_secrets.load_latest(partition).await?.is_none();
+    // On a push the sender is the publisher, so it stands in for a writer
+    // that does not name the author in the payload.
+    let author_replica_id = composite.author_replica_id.or(Some(from_replica_id));
+
+    // Decided before hydration writes the snapshot that would erase the
+    // distinction between install, update and conflict.
+    let is_install = match arrival(stores, local, version, author_replica_id).await? {
+        Arrival::Apply { is_install } => is_install,
+        Arrival::Resend => {
+            answer(
+                stores,
+                local,
+                channel,
+                &request,
+                (channel.channel_id, shared_key),
+                StatusEnum::Ok,
+                "",
+                inbound_trace_id,
+            )
+            .await?;
+            return Ok(vec![DeRecEvent::NoOp]);
+        }
+        Arrival::Conflict {
+            held_author_replica_id,
+        } => {
+            answer(
+                stores,
+                local,
+                channel,
+                &request,
+                (channel.channel_id, shared_key),
+                StatusEnum::VersionConflict,
+                "a different copy of this version is already held",
+                inbound_trace_id,
+            )
+            .await?;
+            return Ok(vec![DeRecEvent::ReplicaVersionConflict {
+                channel_id: channel.channel_id,
+                from_replica_id,
+                secret_id,
+                version,
+                held_author_replica_id,
+                incoming_author_replica_id: author_replica_id,
+                secret,
+            }]);
+        }
+        Arrival::Stale => {
+            answer(
+                stores,
+                local,
+                channel,
+                &request,
+                (channel.channel_id, shared_key),
+                StatusEnum::VersionConflict,
+                "a newer version is already held",
+                inbound_trace_id,
+            )
+            .await?;
+            return Ok(vec![DeRecEvent::NoOp]);
+        }
+    };
 
     // The roster is the single source of truth for the group key. The
     // payload's own `shared_key` predates that and is now only a
@@ -342,6 +444,7 @@ async fn on_request<S: StoreSet>(
         &secret,
         &shares,
         request.version_description.clone(),
+        author_replica_id,
     )
     .await?;
 
@@ -360,35 +463,17 @@ async fn on_request<S: StoreSet>(
     // the first sync a joiner has neither, so it answers where the request
     // arrived.
     let (ack_channel, ack_key) = hydrated.unwrap_or((channel.channel_id, shared_key));
-
-    let timestamp = current_timestamp();
-    let response = StoreShareResponseMessage {
-        result: Some(DeRecResult {
-            status: StatusEnum::Ok as i32,
-            memo: String::new(),
-        }),
-        version,
-        timestamp: Some(timestamp),
-        secret_id,
-        // Replica-bound acknowledgement: announce which member answered,
-        // since every member replies on the same group channel.
-        replica_id: local.replica_id,
-    };
-    let envelope_bytes = DeRecMessageBuilder::channel()
-        .channel_id(ack_channel)
-        .timestamp(timestamp)
-        .message_body(MessageBody::StoreShareResponse(response))
-        .encrypt(&ack_key)?
-        .build()?
-        .encode_to_vec();
-    let envelope = crate::derec_message::apply_trace_id(&envelope_bytes, inbound_trace_id)?;
-    let endpoint = crate::extensions::advertised_endpoints::reply_to_owned(&request);
-    let endpoint = if endpoint.is_empty() {
-        channel.transports.clone()
-    } else {
-        endpoint
-    };
-    stores.transport.send(&endpoint, envelope).await?;
+    answer(
+        stores,
+        local,
+        channel,
+        &request,
+        (ack_channel, ack_key),
+        StatusEnum::Ok,
+        "",
+        inbound_trace_id,
+    )
+    .await?;
 
     // Admission handover: the sync arrived on the ephemeral channel minted
     // by the pairing with the admitter. Hydration has already moved every
@@ -450,6 +535,7 @@ async fn on_request<S: StoreSet>(
                 DeRecEvent::ReplicaSecretInstalled {
                     channel_id: channel.channel_id,
                     from_replica_id,
+                    author_replica_id,
                     secret_id,
                     version,
                     secret,
@@ -459,6 +545,7 @@ async fn on_request<S: StoreSet>(
                 DeRecEvent::ReplicaSecretReceived {
                     channel_id: channel.channel_id,
                     from_replica_id,
+                    author_replica_id,
                     secret_id,
                     version,
                     secret,
@@ -474,6 +561,7 @@ async fn on_request<S: StoreSet>(
         DeRecEvent::ReplicaSecretInstalled {
             channel_id: channel.channel_id,
             from_replica_id,
+            author_replica_id,
             secret_id,
             version,
             secret,
@@ -483,6 +571,7 @@ async fn on_request<S: StoreSet>(
         DeRecEvent::ReplicaSecretReceived {
             channel_id: channel.channel_id,
             from_replica_id,
+            author_replica_id,
             secret_id,
             version,
             secret,
@@ -492,6 +581,50 @@ async fn on_request<S: StoreSet>(
     let mut events: Vec<DeRecEvent> = promotion.into_iter().collect();
     events.push(event);
     Ok(events)
+}
+
+/// Answer a member's sync on `(channel, key)` with `status`.
+///
+/// Every member answers on the same group channel, so the response names
+/// which member answered.
+#[allow(clippy::too_many_arguments)]
+async fn answer<S: StoreSet>(
+    stores: &mut Stores<'_, S>,
+    local: &Local<'_>,
+    channel: &crate::protocol::types::ReplicaMember,
+    request: &StoreShareRequestMessage,
+    (ack_channel, ack_key): (ChannelId, SharedKey),
+    status: StatusEnum,
+    memo: &str,
+    inbound_trace_id: u64,
+) -> Result<()> {
+    let timestamp = current_timestamp();
+    let response = StoreShareResponseMessage {
+        result: Some(DeRecResult {
+            status: status as i32,
+            memo: memo.to_owned(),
+        }),
+        version: request.version,
+        timestamp: Some(timestamp),
+        secret_id: request.secret_id,
+        replica_id: local.replica_id,
+    };
+    let envelope_bytes = DeRecMessageBuilder::channel()
+        .channel_id(ack_channel)
+        .timestamp(timestamp)
+        .message_body(MessageBody::StoreShareResponse(response))
+        .encrypt(&ack_key)?
+        .build()?
+        .encode_to_vec();
+    let envelope = crate::derec_message::apply_trace_id(&envelope_bytes, inbound_trace_id)?;
+    let endpoint = crate::extensions::advertised_endpoints::reply_to_owned(request);
+    let endpoint = if endpoint.is_empty() {
+        channel.transports.clone()
+    } else {
+        endpoint
+    };
+    stores.transport.send(&endpoint, envelope).await?;
+    Ok(())
 }
 
 /// Inbound `StoreShareResponse` on a **replica** channel — the source's
@@ -706,6 +839,7 @@ mod tests {
                 &secret,
                 &[],
                 String::new(),
+                None,
             )
             .await
             .expect("a grpc roster must hydrate");
@@ -902,6 +1036,7 @@ mod tests {
                     shares: Vec::new(),
                     shared_key: Vec::new(),
                     version,
+                    author_replica_id: None,
                 };
                 derec_proto::StoreShareRequestMessage {
                     secret_id: WIRE_SECRET_ID,
@@ -911,8 +1046,6 @@ mod tests {
                     share_algorithm: 0,
                     keep_list: Vec::new(),
                     replica_id: Some(OWNER),
-                    #[allow(deprecated)]
-                    reply_to: None,
                     reply_to_transports: Vec::new(),
                     timestamp: None,
                 }
@@ -968,6 +1101,342 @@ mod tests {
                 "the event echoes the inbound secret_id, not the local partition"
             );
         });
+    }
+
+    /// Replica A holds a version written by B; C writes the same version.
+    mod author_tests {
+        use super::*;
+        use crate::extensions::channel_store::ChannelStoreExt as _;
+        use crate::protocol::types::{
+            ReplicaInfo, ReplicaSecretPayload, Replicas, Secret, UserSecret,
+        };
+        use crate::protocol::{DeRecEvent, DeRecUserSecretStore};
+        use derec_proto::{DeRecMessage, MessageBody, StatusEnum, StoreShareRequestMessage};
+        use prost::Message as _;
+
+        const B: u64 = 1001;
+        const A: u64 = 1002;
+        const C: u64 = 1003;
+        const GROUP_KEY: [u8; 32] = [0x42; 32];
+
+        fn state(label: &str) -> Secret {
+            let member = |replica_id, role: ReplicaRole| ReplicaInfo {
+                replica_id,
+                transports: vec![endpoint(&format!("https://m{replica_id}"))],
+                role: role as i32,
+                communication_info: std::collections::HashMap::new(),
+            };
+            Secret {
+                helpers: Vec::new(),
+                secrets: vec![UserSecret {
+                    id: vec![1],
+                    name: label.to_owned(),
+                    data: label.as_bytes().to_vec(),
+                }],
+                replicas: Some(Replicas {
+                    channel_id: GROUP_CHANNEL.0,
+                    members: vec![
+                        member(B, ReplicaRole::Source),
+                        member(A, ReplicaRole::Destination),
+                        member(C, ReplicaRole::Destination),
+                    ],
+                    shared_key: GROUP_KEY.to_vec(),
+                }),
+            }
+        }
+
+        fn payload(version: u32, author: Option<u64>, label: &str) -> ReplicaSecretPayload {
+            ReplicaSecretPayload {
+                secret: Some(state(label)),
+                shares: Vec::new(),
+                shared_key: Vec::new(),
+                version,
+                author_replica_id: author,
+            }
+        }
+
+        fn push(sender: u64, payload: &ReplicaSecretPayload) -> StoreShareRequestMessage {
+            StoreShareRequestMessage {
+                secret_id: SECRET_ID,
+                share: payload.encode_to_vec(),
+                version: payload.version,
+                version_description: String::new(),
+                share_algorithm: 0,
+                keep_list: Vec::new(),
+                replica_id: Some(sender),
+                reply_to_transports: Vec::new(),
+                timestamp: None,
+            }
+        }
+
+        async fn rig_holding_b_v2() -> (LocalFixture, StoreRig) {
+            let lf = LocalFixture::with_replica(SECRET_ID, A);
+            let mut rig = StoreRig::new();
+            for (id, role) in [
+                (B, ReplicaRole::Source),
+                (A, ReplicaRole::Destination),
+                (C, ReplicaRole::Destination),
+            ] {
+                seed_member(&mut rig.channels, id, role, &format!("https://m{id}")).await;
+            }
+            let events = deliver(&mut rig, &lf, B, push(B, &payload(2, Some(B), "b"))).await;
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [DeRecEvent::ReplicaSecretInstalled { .. }]
+                ),
+                "{events:?}"
+            );
+            (lf, rig)
+        }
+
+        async fn deliver(
+            rig: &mut StoreRig,
+            lf: &LocalFixture,
+            sender: u64,
+            request: StoreShareRequestMessage,
+        ) -> Vec<DeRecEvent> {
+            let channel = rig
+                .channels
+                .load_replica_member(SECRET_ID, GROUP_CHANNEL, sender)
+                .await
+                .expect("seeded member");
+            super::super::on_request(
+                &mut rig.stores(),
+                &lf.local(),
+                &channel,
+                request,
+                GROUP_KEY,
+                0,
+            )
+            .await
+            .expect("a sync is handled")
+        }
+
+        fn last_answer(rig: &StoreRig) -> (i32, u32) {
+            let envelope = rig
+                .transport
+                .sent_envelopes()
+                .pop()
+                .expect("an answer was sent");
+            let msg = DeRecMessage::decode(envelope.as_slice()).expect("envelope decodes");
+            match crate::derec_message::extract_inner_message(&msg.message, &GROUP_KEY)
+                .expect("answer decrypts")
+            {
+                MessageBody::StoreShareResponse(r) => (r.result.expect("result").status, r.version),
+                other => panic!("expected a StoreShareResponse, got {other:?}"),
+            }
+        }
+
+        async fn held(rig: &StoreRig) -> (u32, Option<u64>, String) {
+            let snapshot = rig
+                .user_secrets
+                .load_latest(SECRET_ID)
+                .await
+                .expect("load")
+                .expect("a snapshot is held");
+            (
+                snapshot.version,
+                snapshot.author_replica_id,
+                snapshot.secrets[0].name.clone(),
+            )
+        }
+
+        #[test]
+        fn a_rival_copy_of_the_held_version_is_a_conflict_and_writes_nothing() {
+            run_async(async {
+                let (lf, mut rig) = rig_holding_b_v2().await;
+
+                let events = deliver(&mut rig, &lf, C, push(C, &payload(2, Some(C), "c"))).await;
+
+                match events.as_slice() {
+                    [
+                        DeRecEvent::ReplicaVersionConflict {
+                            from_replica_id,
+                            version,
+                            held_author_replica_id,
+                            incoming_author_replica_id,
+                            secret,
+                            ..
+                        },
+                    ] => {
+                        assert_eq!(*from_replica_id, C);
+                        assert_eq!(*version, 2);
+                        assert_eq!(*held_author_replica_id, Some(B));
+                        assert_eq!(*incoming_author_replica_id, Some(C));
+                        assert_eq!(secret.secrets[0].name, "c", "the incoming state");
+                    }
+                    other => panic!("expected one ReplicaVersionConflict, got {other:?}"),
+                }
+                assert_eq!(
+                    last_answer(&rig),
+                    (StatusEnum::VersionConflict as i32, 2),
+                    "the publisher is told its copy was refused"
+                );
+                assert_eq!(held(&rig).await, (2, Some(B), "b".to_owned()));
+            });
+        }
+
+        #[test]
+        fn the_same_author_resending_its_version_is_acknowledged_without_rewriting() {
+            run_async(async {
+                let (lf, mut rig) = rig_holding_b_v2().await;
+
+                let events =
+                    deliver(&mut rig, &lf, B, push(B, &payload(2, Some(B), "b-again"))).await;
+
+                assert!(
+                    matches!(events.as_slice(), [DeRecEvent::NoOp]),
+                    "{events:?}"
+                );
+                assert_eq!(last_answer(&rig), (StatusEnum::Ok as i32, 2));
+                assert_eq!(held(&rig).await, (2, Some(B), "b".to_owned()));
+            });
+        }
+
+        #[test]
+        fn an_older_version_is_refused_and_writes_nothing() {
+            run_async(async {
+                let (lf, mut rig) = rig_holding_b_v2().await;
+
+                let events = deliver(&mut rig, &lf, C, push(C, &payload(1, Some(C), "old"))).await;
+
+                assert!(
+                    matches!(events.as_slice(), [DeRecEvent::NoOp]),
+                    "{events:?}"
+                );
+                assert_eq!(last_answer(&rig), (StatusEnum::VersionConflict as i32, 1));
+                assert_eq!(held(&rig).await, (2, Some(B), "b".to_owned()));
+            });
+        }
+
+        #[test]
+        fn a_newer_version_is_applied_and_its_author_stored() {
+            run_async(async {
+                let (lf, mut rig) = rig_holding_b_v2().await;
+
+                let events = deliver(&mut rig, &lf, C, push(C, &payload(3, Some(C), "c3"))).await;
+
+                assert!(
+                    matches!(
+                        events.as_slice(),
+                        [DeRecEvent::ReplicaSecretReceived {
+                            from_replica_id: C,
+                            author_replica_id: Some(C),
+                            version: 3,
+                            ..
+                        }]
+                    ),
+                    "{events:?}"
+                );
+                assert_eq!(held(&rig).await, (3, Some(C), "c3".to_owned()));
+            });
+        }
+
+        #[test]
+        fn a_push_that_does_not_name_its_author_is_attributed_to_its_sender() {
+            run_async(async {
+                let (lf, mut rig) = rig_holding_b_v2().await;
+
+                let events = deliver(&mut rig, &lf, C, push(C, &payload(3, None, "c3"))).await;
+
+                assert!(
+                    matches!(
+                        events.as_slice(),
+                        [DeRecEvent::ReplicaSecretReceived {
+                            author_replica_id: Some(C),
+                            ..
+                        }]
+                    ),
+                    "{events:?}"
+                );
+                assert_eq!(held(&rig).await.1, Some(C));
+            });
+        }
+
+        /// A catch-up is answered by whichever member is asked, so the
+        /// responder is not the author. The payload is what names it.
+        #[test]
+        fn a_pulled_copy_keeps_its_original_author() {
+            run_async(async {
+                let (lf, mut rig) = rig_holding_b_v2().await;
+
+                let events = crate::protocol::handlers::sharing::hydrate_catch_up(
+                    &mut rig.stores(),
+                    &lf.local(),
+                    C,
+                    SECRET_ID,
+                    3,
+                    &payload(3, Some(B), "b3").encode_to_vec(),
+                )
+                .await
+                .expect("catch-up hydrates");
+
+                assert!(
+                    matches!(
+                        events.as_slice(),
+                        [DeRecEvent::ReplicaSecretReceived {
+                            from_replica_id: C,
+                            author_replica_id: Some(B),
+                            ..
+                        }]
+                    ),
+                    "{events:?}"
+                );
+                assert_eq!(held(&rig).await, (3, Some(B), "b3".to_owned()));
+            });
+        }
+
+        #[test]
+        fn a_pulled_rival_copy_is_a_conflict_and_writes_nothing() {
+            run_async(async {
+                let (lf, mut rig) = rig_holding_b_v2().await;
+
+                let events = crate::protocol::handlers::sharing::hydrate_catch_up(
+                    &mut rig.stores(),
+                    &lf.local(),
+                    B,
+                    SECRET_ID,
+                    2,
+                    &payload(2, Some(C), "c").encode_to_vec(),
+                )
+                .await
+                .expect("catch-up is handled");
+
+                assert!(
+                    matches!(
+                        events.as_slice(),
+                        [DeRecEvent::ReplicaVersionConflict {
+                            held_author_replica_id: Some(B),
+                            incoming_author_replica_id: Some(C),
+                            ..
+                        }]
+                    ),
+                    "{events:?}"
+                );
+                assert_eq!(held(&rig).await, (2, Some(B), "b".to_owned()));
+            });
+        }
+
+        /// A member serving a catch-up names the author it stored, not
+        /// itself, so the asker records who actually wrote the version.
+        #[test]
+        fn a_catch_up_answer_names_the_stored_author() {
+            run_async(async {
+                let (lf, mut rig) = rig_holding_b_v2().await;
+
+                let payload = crate::protocol::handlers::sharing::build_catch_up_payload(
+                    &mut rig.stores(),
+                    &lf.local(),
+                )
+                .await
+                .expect("payload builds")
+                .expect("a snapshot is held");
+
+                assert_eq!(payload.version, 2);
+                assert_eq!(payload.author_replica_id, Some(B));
+            });
+        }
     }
 
     /// A Destination that receives the per-helper share map must keep it as
@@ -1058,6 +1527,7 @@ mod tests {
                 }],
                 shared_key: Vec::new(),
                 version: VERSION,
+                author_replica_id: None,
             };
 
             let request = derec_proto::StoreShareRequestMessage {
@@ -1068,8 +1538,6 @@ mod tests {
                 share_algorithm: 0,
                 keep_list: Vec::new(),
                 replica_id: Some(OWNER),
-                #[allow(deprecated)]
-                reply_to: None,
                 reply_to_transports: Vec::new(),
                 timestamp: None,
             };
@@ -1171,6 +1639,7 @@ mod tests {
                 }],
                 shared_key: Vec::new(),
                 version: 1,
+                author_replica_id: None,
             };
 
             let err = super::on_request(
@@ -1185,8 +1654,6 @@ mod tests {
                     share_algorithm: 0,
                     keep_list: Vec::new(),
                     replica_id: Some(OWNER),
-                    #[allow(deprecated)]
-                    reply_to: None,
                     reply_to_transports: Vec::new(),
                     timestamp: None,
                 },
@@ -1257,6 +1724,7 @@ mod tests {
                 shared_key: Vec::new(),
                 // The envelope says 5.
                 version: 4,
+                author_replica_id: None,
             };
 
             let err = super::on_request(
@@ -1271,8 +1739,6 @@ mod tests {
                     share_algorithm: 0,
                     keep_list: Vec::new(),
                     replica_id: Some(OWNER),
-                    #[allow(deprecated)]
-                    reply_to: None,
                     reply_to_transports: Vec::new(),
                     timestamp: None,
                 },

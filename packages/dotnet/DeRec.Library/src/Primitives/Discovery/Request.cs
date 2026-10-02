@@ -74,7 +74,7 @@ public static partial class Discovery
                 return new ExtractResult
                 {
                     ChannelId = nativeResult.ChannelId,
-                    ReplyTo = TransportProtocol.ResolveReplyTo(inner.ReplyTo, inner.ReplyToTransports),
+                    ReplyTo = TransportProtocol.ResolveReplyTo(inner.ReplyToTransports),
                 };
             }
             finally

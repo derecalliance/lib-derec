@@ -55,6 +55,7 @@ import type {
   PrePairResponseExtractResult,
   PrePairResponseMessage,
   ProcessPrePairResult,
+  ProducePrePairNoKeysResult,
   ProducePrePairResult,
   ProduceResult,
   RecoverResult,
@@ -247,22 +248,24 @@ function decodeTransportList(framed: Uint8Array | ArrayBuffer): TransportProtoco
 
 const pairing = {
   request: {
+    /** Creates an out-of-band `ContactMessage`. `nonce` omitted or `null`
+     *  lets the library draw a random one; `ContactMode.NoKeys` requires the
+     *  caller to supply it. */
     create_contact(
       channel_id: bigint,
       contact_mode: ContactMode | number,
       transport_protocols: TransportProtocol[],
+      nonce?: bigint | number | null,
     ): CreateContactResult {
-      // The C entry point also accepts a caller-supplied nonce behind a
-      // presence flag. `@derec-alliance/nodejs` has no such parameter, so the
-      // flag is 0 and the library generates one — the same behaviour, not a
-      // default invented here.
+      // The C entry point carries `Option<u64>` as a presence flag plus a
+      // value; an absent nonce clears the flag and the library draws one.
       const result = call(
         'create_contact_message',
         channel_id,
         contact_mode,
         encodeTransportList(transport_protocols),
-        0,
-        0n,
+        nonce == null ? 0 : 1,
+        nonce ?? 0n,
       ) as { contact_wire_bytes: ArrayBuffer; secret_key_material: ArrayBuffer };
       return {
         contact_message: decodeContact(result.contact_wire_bytes),
@@ -448,6 +451,45 @@ const pairing = {
         nonce: result.nonce,
       };
     },
+
+    produce_pre_pair_no_keys(
+      channel_id: bigint,
+      request: PrePairRequestMessage,
+    ): ProducePrePairNoKeysResult {
+      const result = call(
+        'produce_pre_pair_no_keys_response_message',
+        channel_id,
+        encodeMessage(MessageKind.PrePairRequest, request),
+      ) as { envelope_wire_bytes: ArrayBuffer; secret_key_material: ArrayBuffer };
+      return {
+        envelope: bytes(result.envelope_wire_bytes),
+        secret_key_material: bytes(result.secret_key_material),
+      };
+    },
+
+    process_pre_pair_no_keys(
+      contact_message: ContactMessage,
+      response: PrePairResponseMessage,
+    ): ProcessPrePairResult {
+      const result = call(
+        'process_pre_pair_no_keys_response_message',
+        encodeContact(contact_message),
+        encodeMessage(MessageKind.PrePairResponse, response),
+      ) as {
+        mlkem_encapsulation_key: ArrayBuffer;
+        ecies_public_key: ArrayBuffer;
+        nonce: bigint;
+      };
+      return {
+        mlkem_encapsulation_key: bytes(result.mlkem_encapsulation_key),
+        ecies_public_key: bytes(result.ecies_public_key),
+        nonce: result.nonce,
+      };
+    },
+  },
+
+  fingerprint(shared_key: Uint8Array): string {
+    return call('pairing_fingerprint', shared_key) as string;
   },
 };
 

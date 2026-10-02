@@ -104,6 +104,22 @@ internal static class Pairing
         public ulong Nonce;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct ProducePrePairNoKeysResponseMessageResult
+    {
+        public DeRecError Error;
+        public Buffer EnvelopeWireBytes;
+        public Buffer SecretKeyMaterial;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct PairingFingerprintResult
+    {
+        public DeRecError Error;
+        /// <summary>Owned C string. Release with derec_free_string.</summary>
+        public IntPtr Fingerprint;
+    }
+
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern CreateContactMessageResult create_contact_message(
         ulong channelId,
@@ -209,5 +225,26 @@ internal static class Pairing
         UIntPtr contactMessageBytesLen,
         byte[] responseProtoBytes,
         UIntPtr responseProtoBytesLen
+    );
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern ProducePrePairNoKeysResponseMessageResult produce_pre_pair_no_keys_response_message(
+        ulong channelId,
+        byte[] requestProtoBytes,
+        UIntPtr requestProtoBytesLen
+    );
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern ProcessPrePairResponseMessageResult process_pre_pair_no_keys_response_message(
+        byte[] contactMessageBytes,
+        UIntPtr contactMessageBytesLen,
+        byte[] responseProtoBytes,
+        UIntPtr responseProtoBytesLen
+    );
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern PairingFingerprintResult pairing_fingerprint(
+        byte[] sharedKey,
+        UIntPtr sharedKeyLen
     );
 }

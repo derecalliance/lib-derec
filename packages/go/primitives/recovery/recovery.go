@@ -35,6 +35,11 @@ type ShareResponse struct {
 	SharedKey []byte
 }
 
+// Endpoint is a transport endpoint: a URI and the protocol discriminant that
+// says how to reach it (see derecpb.Protocol: 0 = HTTPS, 1 = GRPC). It is the
+// same type as pairing.Endpoint.
+type Endpoint = native.Endpoint
+
 type requestAPI struct{}
 
 // Request groups the owner-side get-share operations, mirroring the Rust
@@ -43,8 +48,11 @@ var Request requestAPI
 
 // Produce builds the wire-encoded DeRecMessage requesting the helper's stored
 // share for (secretID, version) on channelID, encrypted under sharedKey.
-func (requestAPI) Produce(channelID, secretID uint64, version uint32, sharedKey []byte) ([]byte, error) {
-	return native.ProduceGetShareRequest(channelID, secretID, version, sharedKey)
+//
+// replyTo lists the endpoints, in preference order, the peer should answer
+// on; nil or empty means answer on the endpoints recorded for the channel.
+func (requestAPI) Produce(channelID, secretID uint64, version uint32, sharedKey []byte, replyTo []Endpoint) ([]byte, error) {
+	return native.ProduceGetShareRequest(channelID, secretID, version, sharedKey, replyTo)
 }
 
 // Extract decrypts a get-share request envelope and returns its channel id

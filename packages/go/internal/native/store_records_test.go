@@ -362,7 +362,8 @@ func TestStateKeyRoundTrip_AllKinds(t *testing.T) {
 		{Kind: StateKindPendingVerification, ChannelID: &cid},
 		{Kind: StateKindPendingRecovery, SecretID: &sid, Version: &ver},
 		{Kind: StateKindPendingUnpair, ChannelID: &cid},
-		{Kind: StateKindSharingRound},
+		{Kind: StateKindSharingRound, Version: &ver},
+		{Kind: StateKindPendingReplicaDiscovery},
 	}
 	for _, want := range cases {
 		wire, err := EncodeStateKey(want)
@@ -389,11 +390,11 @@ func TestStateKeyRoundTrip_AllKinds(t *testing.T) {
 }
 
 func TestEncodeStateKey_OmitsAbsentFields(t *testing.T) {
-	got, err := EncodeStateKey(StateKey{Kind: StateKindSharingRound})
+	got, err := EncodeStateKey(StateKey{Kind: StateKindPendingReplicaDiscovery})
 	if err != nil {
 		t.Fatalf("EncodeStateKey: %v", err)
 	}
-	want := `{"kind":3}`
+	want := `{"kind":4}`
 	if string(got) != want {
 		t.Fatalf("mismatch:\n got: %s\nwant: %s", got, want)
 	}
@@ -652,6 +653,52 @@ func TestEncodeUserSecrets_NoDescriptionOmitsField(t *testing.T) {
 	}
 }
 
+func TestUserSecrets_AuthorReplicaIDRoundTrip(t *testing.T) {
+	author := uint64(18446744073709551615)
+	wire, err := EncodeUserSecrets(UserSecrets{Version: 3, AuthorReplicaID: &author})
+	if err != nil {
+		t.Fatalf("EncodeUserSecrets: %v", err)
+	}
+	want := `{"version":3,"secrets":[],"author_replica_id":"18446744073709551615"}`
+	if string(wire) != want {
+		t.Fatalf("mismatch:\n got: %s\nwant: %s", wire, want)
+	}
+	got, err := DecodeUserSecrets([]byte(want))
+	if err != nil {
+		t.Fatalf("DecodeUserSecrets: %v", err)
+	}
+	if got.AuthorReplicaID == nil || *got.AuthorReplicaID != author {
+		t.Fatalf("AuthorReplicaID: got %v", got.AuthorReplicaID)
+	}
+	again, err := EncodeUserSecrets(got)
+	if err != nil || string(again) != want {
+		t.Fatalf("re-encode: got %s err=%v", again, err)
+	}
+}
+
+func TestUserSecrets_NoAuthorReplicaIDRoundTrip(t *testing.T) {
+	got, err := DecodeUserSecrets([]byte(`{"version":3,"secrets":[]}`))
+	if err != nil {
+		t.Fatalf("DecodeUserSecrets: %v", err)
+	}
+	if got.AuthorReplicaID != nil {
+		t.Fatalf("AuthorReplicaID: got %v, want nil", *got.AuthorReplicaID)
+	}
+	wire, err := EncodeUserSecrets(got)
+	if err != nil {
+		t.Fatalf("EncodeUserSecrets: %v", err)
+	}
+	if string(wire) != `{"version":3,"secrets":[]}` {
+		t.Fatalf("author key must be omitted: %s", wire)
+	}
+}
+
+func TestDecodeUserSecrets_RejectsNonDecimalAuthor(t *testing.T) {
+	if _, err := DecodeUserSecrets([]byte(`{"version":1,"secrets":[],"author_replica_id":"x"}`)); err == nil {
+		t.Fatal("expected an error for a non-decimal author_replica_id")
+	}
+}
+
 // --- uint array helpers used for channel-id / version lists that cross
 // the FFI as plain JSON number arrays (Vec<u64>/Vec<u32>, never
 // stringified).
@@ -740,6 +787,58 @@ func TestStateKeyRoundTrip_PendingRecoveryCarriesSecretID(t *testing.T) {
 	}
 	if got.SecretID == nil || *got.SecretID != sid {
 		t.Fatalf("SecretID mismatch: got %+v want %d", got.SecretID, sid)
+	}
+}
+
+// --- SharingRound keys carry the round's version: several rounds can be in
+// flight for one secret, and an unversioned key would let one round's row
+// replace another's.
+
+func TestStateItemKey_SharingRoundCarriesVersion(t *testing.T) {
+	v1, v2 := uint32(1), uint32(2)
+	k1 := StateItem{Kind: StateKindSharingRound, Version: &v1}.Key()
+	k2 := StateItem{Kind: StateKindSharingRound, Version: &v2}.Key()
+	if k1.Kind != StateKindSharingRound || k1.Version == nil || *k1.Version != v1 {
+		t.Fatalf("key for version %d: got %+v", v1, k1)
+	}
+	if k2.Version == nil || *k2.Version == *k1.Version {
+		t.Fatalf("keys for versions %d and %d must differ: %+v vs %+v", v1, v2, k1, k2)
+	}
+}
+
+func TestStateKeyRoundTrip_SharingRoundCarriesVersion(t *testing.T) {
+	ver := uint32(7)
+	wire, err := EncodeStateKey(StateKey{Kind: StateKindSharingRound, Version: &ver})
+	if err != nil {
+		t.Fatalf("EncodeStateKey: %v", err)
+	}
+	if want := `{"kind":3,"version":7}`; string(wire) != want {
+		t.Fatalf("mismatch:\n got: %s\nwant: %s", wire, want)
+	}
+	got, err := DecodeStateKey(wire)
+	if err != nil {
+		t.Fatalf("DecodeStateKey: %v", err)
+	}
+	if got.Kind != StateKindSharingRound || got.Version == nil || *got.Version != ver {
+		t.Fatalf("got %+v, want SharingRound version %d", got, ver)
+	}
+}
+
+// The exact shape Rust's StateKeyRecord serializes for
+// StateKey::SharingRound { version: 9 }.
+func TestDecodeStateKey_SharingRoundRustSample(t *testing.T) {
+	k, err := DecodeStateKey([]byte(`{"kind":3,"version":9}`))
+	if err != nil {
+		t.Fatalf("DecodeStateKey: %v", err)
+	}
+	if k.Kind != StateKindSharingRound || k.Version == nil || *k.Version != 9 {
+		t.Fatalf("got %+v, want SharingRound version 9", k)
+	}
+}
+
+func TestEncodeStateKey_SharingRoundRequiresVersion(t *testing.T) {
+	if _, err := EncodeStateKey(StateKey{Kind: StateKindSharingRound}); err == nil {
+		t.Fatal("expected an error when Version is absent")
 	}
 }
 

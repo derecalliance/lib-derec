@@ -70,6 +70,17 @@ type extractPrePairResponseResult struct {
 	ResponseProtoBytes DeRecBuffer
 }
 
+type producePrePairNoKeysResponseMessageResult struct {
+	Error             DeRecError
+	EnvelopeWireBytes DeRecBuffer
+	SecretKeyMaterial DeRecBuffer
+}
+
+type pairingFingerprintResult struct {
+	Error       DeRecError
+	Fingerprint *byte
+}
+
 type processPrePairResponseMessageResult struct {
 	Error                 DeRecError
 	MlkemEncapsulationKey DeRecBuffer
@@ -132,16 +143,27 @@ var (
 	processPrePairRespOnce sync.Once
 	processPrePairRespFn   func(contactMessage *byte, contactMessageLen uintptr,
 		responseProto *byte, responseProtoLen uintptr) processPrePairResponseMessageResult
+
+	producePrePairNoKeysResponseOnce sync.Once
+	producePrePairNoKeysResponseFn   func(channelID uint64,
+		requestProto *byte, requestProtoLen uintptr) producePrePairNoKeysResponseMessageResult
+
+	processPrePairNoKeysRespOnce sync.Once
+	processPrePairNoKeysRespFn   func(contactMessage *byte, contactMessageLen uintptr,
+		responseProto *byte, responseProtoLen uintptr) processPrePairResponseMessageResult
+
+	pairingFingerprintOnce sync.Once
+	pairingFingerprintFn   func(sharedKey *byte, sharedKeyLen uintptr) pairingFingerprintResult
 )
 
 // CreateContact builds an out-of-band ContactMessage bootstrapping pairing on
 // channelID, advertising transportProtocols: a length-delimited sequence of
 // serialized TransportProtocol protos (each entry preceded by its varint byte
-// length), in this application's preference order. The first entry also fills
-// the legacy singular field for peers predating the offer list. nonce == nil lets the library generate a fresh random nonce. Returns
-// the encoded ContactMessage wire bytes and (for INLINE_KEYS / HASHED_KEYS
-// contactMode) the opaque pairing secret key material to feed back into
-// ExtractPairRequest / ProducePairResponse.
+// length), in this application's preference order. nonce == nil lets the
+// library generate a fresh random nonce. Returns the encoded ContactMessage
+// wire bytes and (for INLINE_KEYS / HASHED_KEYS contactMode) the opaque
+// pairing secret key material to feed back into ExtractPairRequest /
+// ProducePairResponse.
 func CreateContact(channelID uint64, contactMode int32, transportProtocol []byte, nonce *uint64) ([]byte, []byte, error) {
 	createContactOnce.Do(func() {
 		purego.RegisterFunc(&createContactFn, symbol("create_contact_message"))
@@ -285,9 +307,8 @@ func ProcessPairResponse(contactMessage, responseProto, secretKeyMaterial []byte
 // contact), sent by a scanner reachable at transportProtocols: a
 // length-delimited sequence of serialized TransportProtocol protos (each
 // entry preceded by its varint byte length), in the scanner's own
-// preference order. The first entry also fills the deprecated singular
-// field for peers predating the list. Because the envelope carries no
-// shared key yet, these MUST be ephemeral endpoints.
+// preference order. Because the envelope carries no shared key yet, these
+// MUST be ephemeral endpoints.
 func ProducePrePairRequest(transportProtocols, contactMessage []byte) ([]byte, error) {
 	producePrePairRequestOnce.Do(func() {
 		purego.RegisterFunc(&producePrePairRequestFn, symbol("produce_pre_pair_request_message"))
@@ -364,6 +385,56 @@ func ProcessPrePairResponse(contactMessage, responseProto []byte) (mlkemEncapsul
 		return nil, nil, 0, e
 	}
 	return bytesFromBuffer(res.MlkemEncapsulationKey), bytesFromBuffer(res.EciesPublicKey), res.Nonce, nil
+}
+
+// ProducePrePairNoKeysResponse is the contact-creator side of a NO_KEYS
+// pairing: it generates fresh key material and builds a plaintext PrePair
+// response envelope publishing its public keys, acknowledging requestProto
+// (the RequestProtoBytes returned by ExtractPrePairRequest). The caller MUST
+// first match the request's nonce against the contact it issued, and MUST
+// persist the returned secret key material: the pair request that follows
+// is encrypted to it.
+func ProducePrePairNoKeysResponse(channelID uint64, requestProto []byte) (envelope, secretKeyMaterial []byte, err error) {
+	producePrePairNoKeysResponseOnce.Do(func() {
+		purego.RegisterFunc(&producePrePairNoKeysResponseFn, symbol("produce_pre_pair_no_keys_response_message"))
+	})
+	res := producePrePairNoKeysResponseFn(channelID,
+		bytePtr(requestProto), uintptr(len(requestProto)))
+	if e := errorFrom(res.Error); e != nil {
+		return nil, nil, e
+	}
+	return bytesFromBuffer(res.EnvelopeWireBytes), bytesFromBuffer(res.SecretKeyMaterial), nil
+}
+
+// ProcessPrePairNoKeysResponse is the scanner side of a NO_KEYS pairing: it
+// accepts the public keys in responseProto (the ResponseProtoBytes returned
+// by ExtractPrePairResponse) for contactMessage, returning them with the
+// echoed nonce. Nothing binds these keys to the contact, so the resulting
+// pairing MUST be confirmed by comparing PairingFingerprint out of band.
+func ProcessPrePairNoKeysResponse(contactMessage, responseProto []byte) (mlkemEncapsulationKey, eciesPublicKey []byte, nonce uint64, err error) {
+	processPrePairNoKeysRespOnce.Do(func() {
+		purego.RegisterFunc(&processPrePairNoKeysRespFn, symbol("process_pre_pair_no_keys_response_message"))
+	})
+	res := processPrePairNoKeysRespFn(
+		bytePtr(contactMessage), uintptr(len(contactMessage)),
+		bytePtr(responseProto), uintptr(len(responseProto)))
+	if e := errorFrom(res.Error); e != nil {
+		return nil, nil, 0, e
+	}
+	return bytesFromBuffer(res.MlkemEncapsulationKey), bytesFromBuffer(res.EciesPublicKey), res.Nonce, nil
+}
+
+// PairingFingerprint returns the human-readable fingerprint of a pairing's
+// sharedKey, the same value the protocol's GetFingerprint derives.
+func PairingFingerprint(sharedKey []byte) (string, error) {
+	pairingFingerprintOnce.Do(func() {
+		purego.RegisterFunc(&pairingFingerprintFn, symbol("pairing_fingerprint"))
+	})
+	res := pairingFingerprintFn(bytePtr(sharedKey), uintptr(len(sharedKey)))
+	if err := errorFrom(res.Error); err != nil {
+		return "", err
+	}
+	return stringFromCString(res.Fingerprint), nil
 }
 
 // boolToUint32 maps a Go bool onto the C ABI's uint32 flag convention.

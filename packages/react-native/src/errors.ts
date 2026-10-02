@@ -42,4 +42,11 @@ export interface DeRecError {
   memo?: string;
   expected?: number;
   got?: number;
+  /**
+   * Present only when `code` is `"restore_conflict"`: the channels already
+   * living at the recovered canonical ids, as decimal strings — the same
+   * field `@derec-alliance/nodejs` carries on its restore conflict error.
+   * Clear exactly these and retry `restore`.
+   */
+  channel_ids?: string[];
 }
