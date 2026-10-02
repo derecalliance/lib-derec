@@ -4,7 +4,7 @@
 use super::{
     CommunicationInfo, ContactMessage, PairRequestMessage, PairResponseMessage,
     PrePairRequestMessage, PrePairResponseMessage, TransportProtocol,
-    deserialize_pairing_secret_key_material,
+    deserialize_pairing_secret_key_material, serialize_pairing_secret_key_material,
 };
 use crate::{
     interop::wasm::{
@@ -68,13 +68,7 @@ pub fn produce(
         };
     let communication_info_proto: Option<derec_proto::CommunicationInfo> =
         communication_info.map(Into::into);
-    let parameter_range_proto: Option<derec_proto::ParameterRange> =
-        if parameter_range.is_null() || parameter_range.is_undefined() {
-            None
-        } else {
-            let pr: super::ParameterRange = from_js(parameter_range)?;
-            Some(pr.into())
-        };
+    let parameter_range_proto = super::optional_parameter_range(parameter_range)?;
 
     let result = response::produce(
         crate::types::ChannelId(channel_id),
@@ -109,15 +103,22 @@ pub fn process(
     contact_message: JsValue,
     response: JsValue,
     secret_key: &[u8],
+    parameter_range: JsValue,
 ) -> Result<JsValue, JsValue> {
     let pairing_sk = deserialize_pairing_secret_key_material(secret_key)?;
     let contact_message: ContactMessage = from_js(contact_message)?;
     let contact_message_proto: derec_proto::ContactMessage = contact_message.into();
     let response: PairResponseMessage = from_js(response)?;
     let response_proto: derec_proto::PairResponseMessage = response.into();
+    let parameter_range = super::optional_parameter_range(parameter_range)?;
 
-    let result = response::process(&contact_message_proto, &response_proto, &pairing_sk)
-        .map_err(js_error_from_lib)?;
+    let result = response::process(
+        &contact_message_proto,
+        &response_proto,
+        &pairing_sk,
+        parameter_range.as_ref(),
+    )
+    .map_err(js_error_from_lib)?;
 
     to_js(&ProcessResult {
         shared_key: result.shared_key.to_vec(),
@@ -129,6 +130,16 @@ pub fn process(
 pub struct ProducePrePairResult {
     #[serde(with = "serde_bytes")]
     pub envelope: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ProducePrePairNoKeysResult {
+    #[serde(with = "serde_bytes")]
+    pub envelope: Vec<u8>,
+    /// The secret key material generated for this pairing. The caller MUST
+    /// persist it: the `PairRequestMessage` that follows is encrypted to it.
+    #[serde(with = "serde_bytes")]
+    pub secret_key_material: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -168,6 +179,29 @@ pub fn produce_pre_pair(
     })
 }
 
+/// Contact-creator side of a `NO_KEYS` pairing: generate key material and
+/// answer the `PrePairRequest` with its public half.
+///
+/// The caller MUST first match the request's `nonce` against the contact it
+/// issued, and MUST keep the resulting channel unusable until both sides
+/// confirm `pairing_fingerprint` out of band.
+#[wasm_bindgen(js_name = "pairing_response_produce_pre_pair_no_keys")]
+pub fn produce_pre_pair_no_keys(channel_id: u64, request: JsValue) -> Result<JsValue, JsValue> {
+    let request: PrePairRequestMessage = from_js(request)?;
+    let request_proto: derec_proto::PrePairRequestMessage = request.into();
+
+    let result =
+        response::produce_pre_pair_no_keys(crate::types::ChannelId(channel_id), &request_proto)
+            .map_err(js_error_from_lib)?;
+
+    to_js(&ProducePrePairNoKeysResult {
+        envelope: result.envelope,
+        secret_key_material: serialize_pairing_secret_key_material(
+            &result.pairing_secret_key_material,
+        )?,
+    })
+}
+
 /// Scanner-side: decode the inbound plaintext `PrePairResponse` envelope.
 #[wasm_bindgen(js_name = "pairing_response_extract_pre_pair")]
 pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<JsValue, JsValue> {
@@ -194,4 +228,36 @@ pub fn process_pre_pair(contact_message: JsValue, response: JsValue) -> Result<J
         ecies_public_key: result.ecies_public_key,
         nonce: result.nonce,
     })
+}
+
+/// Scanner side of a `NO_KEYS` pairing: accept the contact creator's public
+/// keys. There is no binding hash to check them against, so the channel this
+/// leads to MUST stay unusable until both sides confirm `pairing_fingerprint`
+/// out of band.
+#[wasm_bindgen(js_name = "pairing_response_process_pre_pair_no_keys")]
+pub fn process_pre_pair_no_keys(
+    contact_message: JsValue,
+    response: JsValue,
+) -> Result<JsValue, JsValue> {
+    let contact_message: ContactMessage = from_js(contact_message)?;
+    let contact_message_proto: derec_proto::ContactMessage = contact_message.into();
+    let response: PrePairResponseMessage = from_js(response)?;
+    let response_proto: derec_proto::PrePairResponseMessage = response.into();
+
+    let result = response::process_pre_pair_no_keys(&contact_message_proto, &response_proto)
+        .map_err(js_error_from_lib)?;
+
+    to_js(&ProcessPrePairResult {
+        mlkem_encapsulation_key: result.mlkem_encapsulation_key,
+        ecies_public_key: result.ecies_public_key,
+        nonce: result.nonce,
+    })
+}
+
+/// The human-readable fingerprint of a pairing's shared key. Both ends derive
+/// the same value; comparing it out of band confirms the pairing.
+#[wasm_bindgen(js_name = "pairing_fingerprint")]
+pub fn fingerprint(shared_key: &[u8]) -> Result<String, JsValue> {
+    let shared_key = crate::interop::wasm::primitives::helpers::parse_shared_key(shared_key)?;
+    Ok(crate::primitives::pairing::fingerprint(&shared_key))
 }

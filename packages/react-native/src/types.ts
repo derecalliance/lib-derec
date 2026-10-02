@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+import { getNative } from './native';
+
 export interface SecretStore {
   load(
     secretId: string,
@@ -9,15 +11,15 @@ export interface SecretStore {
   ): Promise<Uint8Array | null | undefined>;
   /**
    * Load secrets of the same `kind` for several channels in one call,
-   * scoped to `secretId`. Must return an array with one entry per input
-   * id, in the same order, using `null` (or `undefined`) for channels
-   * with no stored secret of `kind`.
+   * scoped to `secretId`. Must return an array with exactly one entry per
+   * input id, in the same order, using `null` (or `undefined`) for channels
+   * with no stored secret of `kind`. Whether a missing entry is an error is
+   * decided by the library.
    */
   loadMany(
     secretId: string,
     channelIds: string[],
     kind: 0 | 1 | 2,
-    missingPolicy: "skip" | "fail",
   ): Promise<Array<Uint8Array | null | undefined>>;
   save(
     secretId: string,
@@ -120,30 +122,15 @@ export function channelFilterMatches(
 /**
  * The endpoints a peer-supplied message advertises, in the peer's own order.
  *
- * Yields `supported_transports` when it is non-empty, and otherwise the
- * singular `transport_protocol` — which is how every implementation predating
- * the offer list advertises, and the reason this is a function rather than a
- * field read. Reading `transport_protocol` directly is a bug: its meaning
- * narrowed to "one entry of a list, and possibly absent", so a peer that has
- * moved past it looks unreachable to a reader that was correct before 0.0.3.
- *
  * Reports what was advertised, not what is acceptable — nothing here is
  * validated, and the protocol still applies its own transport policy to
  * whatever it records.
  */
 export function advertisedEndpoints(
-  message:
-    | {
-        transport_protocol?: TransportProtocol;
-        supported_transports?: TransportProtocol[];
-      }
-    | null
-    | undefined,
+  message: { supported_transports?: TransportProtocol[] } | null | undefined,
 ): TransportProtocol[] {
   if (!message) return [];
-  const offers = message.supported_transports ?? [];
-  if (offers.length > 0) return offers;
-  return message.transport_protocol ? [message.transport_protocol] : [];
+  return message.supported_transports ?? [];
 }
 
 /**
@@ -242,11 +229,7 @@ export interface ChannelStore {
     secretId: string,
     filter: ReplicaFilter,
   ): Promise<Uint8Array | null | undefined>;
-  linkChannel(
-    secretId: string,
-    channelId: string,
-    linkedChannelId: string,
-  ): Promise<void>;
+  linkChannel(secretId: string, a: string, b: string): Promise<void>;
   linkedChannels(secretId: string, channelId: string): Promise<string[]>;
 }
 
@@ -290,6 +273,10 @@ export interface UserSecrets {
   version: number;
   secrets: UserSecretEntry[];
   description?: string;
+  /** Decimal `replica_id` of the member that published `version`. Absent
+   *  when none is recorded. Store and return it unchanged: replica members
+   *  compare it to detect a conflicting copy of the same version. */
+  author_replica_id?: string;
 }
 
 /**
@@ -331,6 +318,18 @@ export interface StateStore {
   ): Promise<Uint8Array | null | undefined>;
   remove(secretId: string, keyJson: Uint8Array): Promise<boolean>;
   loadAll(secretId: string, kind: 0 | 1 | 2 | 3 | 4): Promise<Uint8Array[]>;
+}
+
+/** A transport protocol, by name. */
+export type TransportProtocolName = "https" | "grpc";
+
+/**
+ * One endpoint a node serves or a peer advertised, as every app-facing call
+ * and event carries it.
+ */
+export interface Endpoint {
+  uri: string;
+  protocol: TransportProtocolName;
 }
 
 /**
@@ -378,7 +377,7 @@ export interface Transport {
    * {@link singleEndpointTransport} rather than by indexing.
    */
   send(
-    endpoints: ReadonlyArray<{ protocol: string; uri: string }>,
+    endpoints: ReadonlyArray<Endpoint>,
     message: Uint8Array,
   ): Promise<void>;
 }
@@ -398,9 +397,27 @@ export interface Transport {
  * a round trip; skipping one that would have worked costs the delivery.
  */
 export type SendOne = (
-  endpoint: { protocol: string; uri: string },
+  endpoint: Endpoint,
   message: Uint8Array,
 ) => Promise<void>;
+
+/**
+ * The DeRec protocol version this build speaks — the `protocolVersionMajor` /
+ * `protocolVersionMinor` it writes into every envelope it produces. Not the
+ * package version.
+ */
+export function protocol_version(): { major: number; minor: number } {
+  return getNative().version();
+}
+
+/**
+ * A fresh, random replica id — never `0`. Generate it once per device,
+ * persist it, and pass the same value to
+ * `DeRecProtocolBuilder.withReplicaId` on every init.
+ */
+export function generate_replica_id(): bigint {
+  return getNative().generate_replica_id();
+}
 
 /**
  * Builds a {@link Transport} that tries each endpoint in the order the peer
@@ -473,7 +490,7 @@ export enum SenderKind {
  *   the scanner must fetch the actual keys over the wire via the `PrePair`
  *   round-trip and verify them against the commitment before pairing.
  * - `NoKeys`: no key material and no commitment. The contact carries only
- *   `channel_id`, `nonce`, and `transport_protocol` — small enough to be
+ *   `channel_id`, `nonce`, and `supported_transports` — small enough to be
  *   hand-typed or dictated. Keys are generated on the fly by the contact
  *   creator when the `PrePairRequest` arrives; the scanner accepts them
  *   without cryptographic verification. Trust rests entirely on the OOB
@@ -515,20 +532,33 @@ export enum FlowKind {
   UnpairReplica = 8,
 }
 
+/** Result status carried in every protocol response (`result.proto`). Passed
+ *  to `reject()` to say why an inbound request was refused. */
+export enum StatusEnum {
+  Ok = 0,
+  Partial = 1,
+  Fail = 2,
+  SizeLimitExceeded = 3,
+  TooFrequent = 4,
+  UnknownSecretId = 5,
+  UnknownShareVersion = 6,
+  DecryptionFailed = 7,
+  VerificationFailed = 8,
+  FormatError = 9,
+  Rejected = 10,
+  IncompatibleParameterRange = 11,
+  UnsupportedTransportProtocol = 12,
+  VersionConflict = 13,
+  ReplicaIdConflict = 14,
+  RequestToClose = 99,
+}
+
 export type UnpairAck = "required" | "not_required";
 
 export interface ContactMessage {
   channel_id: bigint;
   /** `ContactMode` numeric value (0 = INLINE_KEYS, 1 = HASHED_KEYS, 2 = NO_KEYS). */
   contact_mode: number;
-  /**
-   * @deprecated Reading this field directly is incorrect: its meaning narrowed
-   * to "one entry of a list, and possibly absent", so a peer advertising only
-   * `supported_transports` looks unreachable to a reader that was correct
-   * before 0.0.3. Call {@link advertisedEndpoints}, which resolves both
-   * spellings. Removed at 0.0.5.
-   */
-  transport_protocol?: TransportProtocol;
   nonce: bigint;
   /** Present only when `contact_mode === ContactMode.InlineKeys`. */
   mlkem_encapsulation_key?: Uint8Array;
@@ -538,8 +568,7 @@ export interface ContactMessage {
   contact_binding_hash?: Uint8Array;
   timestamp?: Timestamp;
   /** Every transport endpoint the creator of this contact can be reached
-   *  on, in its own preference order. Empty means "only
-   *  `transport_protocol` is offered". */
+   *  on, in its own preference order. */
   supported_transports: TransportProtocol[];
 }
 
@@ -588,19 +617,10 @@ export interface UpdateChannelInfoParams {
   communication_info?: Record<string, string>;
 
   /**
-   * New transport endpoint. Absent leaves it untouched.
-   *
-   * @deprecated Use `own_transports`, which carries every endpoint this node
-   * now serves; its first entry also fills this field for peers predating the
-   * list. Removed at 0.0.5.
-   */
-  transport_protocol?: { uri: string; protocol: number };
-  /**
    * Every endpoint this node now serves, in its own preference order.
-   * Omitted leaves the target(s)' stored set untouched. Takes precedence
-   * over `transport_protocol`, whose first entry it also fills.
+   * Omitted leaves the target(s)' stored set untouched.
    */
-  own_transports?: TransportProtocol[];
+  own_transports?: Endpoint[];
 }
 
 /**
@@ -659,18 +679,34 @@ export type DeRecEvent =
       action: Uint8Array;
 
       action_kind: PendingActionKind;
+      /** Correlation token of the inbound request, decimal-encoded. */
+      trace_id: string;
+      /** Pairing only. */
       peer_communication_info?: Record<string, string>;
-
+      /** `sender_kind` of the inbound pair request (Pairing only). */
       sender_kind?: SenderKind;
-
+      /** Share version (StoreShare / VerifyShare / GetShare). */
       version?: number;
+      /** Description of the secret version (StoreShare only). */
       share_description?: string;
-
+      /** Secret identifier, decimal-encoded (StoreShare / VerifyShare /
+       *  GetShare). On GetShare, with `version`, names the requested share. */
       share_secret_id?: string;
+      /** Length in bytes of the share the helper would store (StoreShare
+       *  only) — what a size or quota decision is made on. */
+      share_size?: number;
+      /** The peer's memo (Unpair only). */
+      unpair_memo?: string;
+      /** Communication info the peer replaces its stored map with
+       *  (UpdateChannelInfo only). Absent: unchanged. Empty: cleared. */
+      updated_communication_info?: Record<string, string>;
+      /** Endpoints the peer is moving to (UpdateChannelInfo only). Absent:
+       *  unchanged. */
+      updated_transports?: Endpoint[];
     }
   | { type: "ShareStored"; channel_id: string; version: number }
   | { type: "ShareConfirmed"; channel_id: string; version: number }
-  | { type: "ShareRejected"; channel_id: string; version: number; status: number; memo: string }
+  | { type: "ShareRejected"; channel_id: string; version: number; status: StatusEnum; memo: string }
   /** A publishing round finished — every targeted helper confirmed,
    *  rejected, or timed out.
    *
@@ -695,7 +731,7 @@ export type DeRecEvent =
       replica_id: string;
       secret_id: string;
       version: number;
-      status: number;
+      status: StatusEnum;
       memo: string;
     }
   /** A secret sync could not be delivered to a member at all — distinct from
@@ -748,9 +784,9 @@ export type DeRecEvent =
         helpers: Array<{
           channel_id: string;
           /** Every endpoint this peer advertised, in the order it offered them. */
-          transports: Array<{ uri: string; protocol: number }>;
+          transports: Endpoint[];
           shared_key: Uint8Array;
-          communication_info: Record<string, string>;
+          communication_info?: Record<string, string>;
         }>;
         secrets: Array<{
           id: Uint8Array;
@@ -770,9 +806,9 @@ export type DeRecEvent =
           members: Array<{
             replica_id: string;
             /** Every endpoint this peer advertised, in the order it offered them. */
-            transports: Array<{ uri: string; protocol: number }>;
+            transports: Endpoint[];
             role: "Source" | "Destination";
-            communication_info: Record<string, string>;
+            communication_info?: Record<string, string>;
           }>;
           shared_key: Uint8Array;
         };
@@ -781,12 +817,12 @@ export type DeRecEvent =
 
   | { type: "Unpaired"; channel_id: string }
 
-  | { type: "UnpairRejected"; channel_id: string; status: number; memo: string }
+  | { type: "UnpairRejected"; channel_id: string; status: StatusEnum; memo: string }
 
   /** Contact creator answered the scanner's `PrePairRequest` with a
    *  non-Ok status (HashedKeys flow). Distinct from a cryptographic
    *  hash mismatch, which surfaces as a thrown error from `process()`. */
-  | { type: "PrePairRejected"; channel_id: string; status: number; memo: string }
+  | { type: "PrePairRejected"; channel_id: string; status: StatusEnum; memo: string }
 
   /** Fires alongside `PairingCompleted` on replica-mode pair handshakes.
    *  `peer_replica_id` is the peer's `u64` as a **decimal** string,
@@ -804,22 +840,28 @@ export type DeRecEvent =
   /** A `ReplicaSource` peer pushed a secret sync on a
    *  `ReplicaDestination` channel. The library decoded the
    *  `ReplicaSecretPayload`; the app installs `secret.secrets` and
-   *  optionally uses `shares` for recovery. `from_replica_id` and the
-   *  `replica_id` fields inside `secret` are `u64` as **decimal**
-   *  strings. */
+   *  optionally uses `shares` for recovery. `from_replica_id`,
+   *  `author_replica_id` and the `replica_id` fields inside `secret` are
+   *  `u64` as **decimal** strings.
+   *
+   *  `from_replica_id` is the member this copy came from: the publisher on
+   *  a push, the serving member on a catch-up. `author_replica_id` is the
+   *  member that published `version`, or `null` when the serving member's
+   *  snapshot records none. */
   | {
       type: "ReplicaSecretReceived";
       channel_id: string;
       from_replica_id: string;
+      author_replica_id: string | null;
       secret_id: string;
       version: number;
       secret: {
         helpers: Array<{
           channel_id: string;
           /** Every endpoint this peer advertised, in the order it offered them. */
-          transports: Array<{ uri: string; protocol: number }>;
+          transports: Endpoint[];
           shared_key: Uint8Array;
-          communication_info: Record<string, string>;
+          communication_info?: Record<string, string>;
         }>;
         secrets: Array<{
           id: Uint8Array;
@@ -837,9 +879,9 @@ export type DeRecEvent =
           members: Array<{
             replica_id: string;
             /** Every endpoint this peer advertised, in the order it offered them. */
-            transports: Array<{ uri: string; protocol: number }>;
+            transports: Endpoint[];
             role: "Source" | "Destination";
-            communication_info: Record<string, string>;
+            communication_info?: Record<string, string>;
           }>;
           shared_key: Uint8Array;
         };
@@ -862,15 +904,16 @@ export type DeRecEvent =
       type: "ReplicaSecretInstalled";
       channel_id: string;
       from_replica_id: string;
+      author_replica_id: string | null;
       secret_id: string;
       version: number;
       secret: {
         helpers: Array<{
           channel_id: string;
           /** Every endpoint this peer advertised, in the order it offered them. */
-          transports: Array<{ uri: string; protocol: number }>;
+          transports: Endpoint[];
           shared_key: Uint8Array;
-          communication_info: Record<string, string>;
+          communication_info?: Record<string, string>;
         }>;
         secrets: Array<{
           id: Uint8Array;
@@ -888,9 +931,9 @@ export type DeRecEvent =
           members: Array<{
             replica_id: string;
             /** Every endpoint this peer advertised, in the order it offered them. */
-            transports: Array<{ uri: string; protocol: number }>;
+            transports: Endpoint[];
             role: "Source" | "Destination";
-            communication_info: Record<string, string>;
+            communication_info?: Record<string, string>;
           }>;
           shared_key: Uint8Array;
         };
@@ -900,6 +943,56 @@ export type DeRecEvent =
         committed_share: Uint8Array;
       }>;
     }
+  /** A member offered a different copy of the version this device holds.
+   *  Nothing was written: this device keeps its own copy and refuses the
+   *  incoming one with `VERSION_CONFLICT`, so the publisher sees
+   *  `ReplicaSyncRejected`. Both copies are complete states — the held one
+   *  is in the local stores, the incoming one is `secret`. Resolve by
+   *  publishing the chosen state with `start(FlowKind.ProtectSecret)`; the
+   *  next version supersedes both on every member and helper.
+   *
+   *  `held_author_replica_id` / `incoming_author_replica_id` are the
+   *  decimal `replica_id` of each copy's publisher, or `null` when that
+   *  copy records none. */
+  | {
+      type: "ReplicaVersionConflict";
+      channel_id: string;
+      from_replica_id: string;
+      secret_id: string;
+      version: number;
+      held_author_replica_id: string | null;
+      incoming_author_replica_id: string | null;
+      secret: {
+        helpers: Array<{
+          channel_id: string;
+          /** Every endpoint this peer advertised, in the order it offered them. */
+          transports: Endpoint[];
+          shared_key: Uint8Array;
+          communication_info?: Record<string, string>;
+        }>;
+        secrets: Array<{
+          id: Uint8Array;
+          name: string;
+          data: Uint8Array;
+        }>;
+        /** The same shape as `SecretRecovered.secret.replicas`. */
+        replicas?: {
+          /** The one channel every member is addressed on. */
+          channel_id: string;
+          /** Every member of the group, including the writer. Exactly one
+           *  carries `role: "Source"` — that member is where the secret
+           *  originated, which is why no separate owner field is needed. */
+          members: Array<{
+            replica_id: string;
+            /** Every endpoint this peer advertised, in the order it offered them. */
+            transports: Endpoint[];
+            role: "Source" | "Destination";
+            communication_info?: Record<string, string>;
+          }>;
+          shared_key: Uint8Array;
+        };
+      };
+    }
   /** Peer's ack of a secret sync we sent. `status` is the `StatusEnum`
    *  integer (0 = Ok), `memo` is the peer's explanation. */
   | {
@@ -908,7 +1001,7 @@ export type DeRecEvent =
       from_replica_id: string;
       secret_id: string;
       version: number;
-      status: number;
+      status: StatusEnum;
       memo: string;
     }
   /** A peer announced an updated `communication_info` map and/or
@@ -925,7 +1018,7 @@ export type DeRecEvent =
   | {
       type: "ChannelInfoUpdateRejected";
       channel_id: string;
-      status: number;
+      status: StatusEnum;
       memo: string;
     }
   /** Emitted by `process()` in place of `ActionRequired` when the
@@ -937,6 +1030,38 @@ export type DeRecEvent =
    *  (`"Pairing"`, `"StoreShare"`, …). */
   | { type: "AutoAccepted"; channel_id: string; action_kind: PendingActionKind }
   | { type: "NoOp" }
+  /** An inbound message was dropped untouched: no store was written and
+   *  nothing was sent back. `reason` says why.
+   *
+   *  `"PendingVerification"` means the peer sent something before this
+   *  device confirmed the channel's fingerprint — typically a replica source
+   *  pushing its first copy while this destination still shows the code.
+   *  Confirming does not replay it: after `verifyFingerprint` succeeds, a
+   *  replica destination calls `start(FlowKind.ReplicaDiscovery)` to pull
+   *  the copy itself. `"Expired"` means the message was older than the
+   *  inbound timeout. `trace_id` matches the peer's `*Started` event for
+   *  the same round (`"0"` when the sender set none). */
+  | {
+      type: "MessageIgnored";
+      channel_id: string;
+      reason: IgnoreReason;
+      trace_id: string;
+    }
+  /** Returned by `restore`: a roster entry got no channel, so this device
+   *  cannot reach that peer. Every other entry and the user-secret snapshot
+   *  were restored; `reason` says why this one was not. `"NoTransports"`
+   *  means the recovered roster names no endpoint for it.
+   *
+   *  For a helper, `channel_id` is its channel and `replica_id` is absent.
+   *  For a replica group member, `channel_id` is the group's channel and
+   *  `replica_id` names the member. The peer itself is untouched — a helper
+   *  still holds its share — and pairing with it again makes it reachable. */
+  | {
+      type: "PeerNotRestored";
+      channel_id: string;
+      replica_id?: string;
+      reason: NotRestoredReason;
+    }
   /** A pairing handshake was dispatched successfully. `kind` is the
    *  local party's role — same value the subsequent `PairingCompleted`
    *  will carry. Emitted by `start(Pairing)`. */
@@ -1005,8 +1130,8 @@ export type DeRecEvent =
  *   inbound shares. The protocol enforces no size, quota or rate limit
  *   of its own, and `maxShareSize` is checked for range overlap at
  *   pairing time only, never against an actual share. While this is
- *   `false`, `ActionRequired` carries the decoded request, so the
- *   application can inspect the share and call `reject()` with
+ *   `false`, `ActionRequired` carries `share_size`, so the application
+ *   can compare it to its quota and call `reject()` with
  *   `StatusEnum.SizeLimitExceeded`. Setting it `true` removes that
  *   opportunity entirely: every share from every paired Owner is stored
  *   unconditionally, at whatever size it arrives. Keep off in any
@@ -1099,6 +1224,14 @@ export interface CommunicationInfo {
 // `ContactMessage` is defined once above and covers both `INLINE_KEYS` and
 // `HASHED_KEYS` modes.
 
+/** Why a `MessageIgnored` event dropped a message. Matches the Rust
+ *  `IgnoreReason` discriminants one-for-one. */
+export type IgnoreReason = "PendingVerification" | "Expired";
+
+/** Why a `PeerNotRestored` event left a roster entry without a channel.
+ *  Matches the Rust `NotRestoredReason` discriminants one-for-one. */
+export type NotRestoredReason = "NoTransports";
+
 /**
  * The label vocabulary for `ActionRequired.action_kind` and
  * `AutoAccepted.action_kind` — one value per pending-action kind the
@@ -1135,17 +1268,9 @@ export interface PairRequestMessage {
   nonce: bigint;
   communication_info?: CommunicationInfo;
   parameter_range?: ParameterRange;
-  /**
-   * @deprecated Reading this field directly is incorrect: its meaning narrowed
-   * to "one entry of a list, and possibly absent", so a peer advertising only
-   * `supported_transports` looks unreachable to a reader that was correct
-   * before 0.0.3. Call {@link advertisedEndpoints}, which resolves both
-   * spellings. Removed at 0.0.5.
-   */
-  transport_protocol?: TransportProtocol;
   timestamp?: Timestamp;
   /** Every transport endpoint the initiator can be reached on, in its own
-   *  preference order. Empty means "only `transport_protocol` is offered". */
+   *  preference order. */
   supported_transports: TransportProtocol[];
 }
 
@@ -1167,21 +1292,12 @@ export interface PairResponseMessage {
 
 export interface PrePairRequestMessage {
   nonce: bigint;
-  /**
-   * @deprecated Reading this field directly is incorrect: its meaning narrowed
-   * to "one entry of a list, and possibly absent", so a peer advertising only
-   * `supported_transports` looks unreachable to a reader that was correct
-   * before 0.0.3. Call {@link advertisedEndpoints}, which resolves both
-   * spellings. Removed at 0.0.5.
-   */
-  transport_protocol?: TransportProtocol;
   timestamp?: Timestamp;
   /**
    * Every endpoint the sender can be reached on for the PrePair reply, in
-   * its own preference order. At least one of this and `transport_protocol`
-   * must be present.
+   * its own preference order.
    */
-  supported_transports?: TransportProtocol[];
+  supported_transports: TransportProtocol[];
 }
 
 export interface PrePairResponseMessage {
@@ -1365,6 +1481,15 @@ export interface PairingProcessResult {
 export interface ProducePrePairResult {
 
   envelope: Uint8Array;
+}
+
+export interface ProducePrePairNoKeysResult {
+
+  envelope: Uint8Array;
+
+  /** Secret key material generated for this pairing. The caller MUST persist
+   * it: the `PairRequest` that follows is encrypted to it. */
+  secret_key_material: Uint8Array;
 }
 
 export interface PrePairRequestExtractResult {

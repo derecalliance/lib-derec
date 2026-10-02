@@ -149,10 +149,11 @@ pub extern "C" fn produce_store_share_request_message(
     shared_key_ptr: *const u8,
     shared_key_len: usize,
     // `reply_to` is optional: pass `reply_to_len == 0` for "no override"
-    // (the responder will route to the channel's stored peer endpoint).
-    // When set, the bytes must be a protobuf-encoded `TransportProtocol`;
-    // the responder echoes this exchange's response there without
-    // persisting the endpoint.
+    // (the responder routes to the transports recorded for the channel).
+    // When set, the bytes are a length-delimited sequence of
+    // protobuf-encoded `TransportProtocol` entries, each preceded by its
+    // varint byte length, in preference order; the responder answers this
+    // exchange there without persisting the endpoints.
     reply_to_ptr: *const u8,
     reply_to_len: usize,
 ) -> ProduceStoreShareRequestMessageResult {

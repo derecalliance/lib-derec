@@ -34,36 +34,6 @@ pub const DEFAULT_THRESHOLD: usize = 3;
 /// of the value; see [`DEFAULT_THRESHOLD`].
 pub const DEFAULT_KEEP_VERSIONS_COUNT: usize = 3;
 
-/// Resolve the two plaintext opt-in flags to a single policy value.
-///
-/// `unsafe_http` is superseded by `unsafe_connection` but still honored, so a
-/// deployment that only knows the old flag keeps its behavior after upgrading.
-///
-/// The distinction is *presence*, not value: an SDK that never sets the old
-/// flag sends nothing, which must not override a deliberate new-flag
-/// setting. Callers that cannot express absence must pass `None`.
-///
-/// Two values that are both present and disagree are a
-/// [`Error::ConflictingPlaintextOptIn`](crate::Error::ConflictingPlaintextOptIn)
-/// rather than a silent win for either, because at that point there is no
-/// reading of the configuration that is obviously intended, and the one this
-/// would otherwise pick is the one being removed.
-pub(crate) fn resolve_plaintext_opt_in(
-    unsafe_http: Option<bool>,
-    unsafe_connection: Option<bool>,
-) -> crate::Result<bool> {
-    match (unsafe_http, unsafe_connection) {
-        (Some(old), Some(new)) if old != new => Err(crate::Error::ConflictingPlaintextOptIn {
-            unsafe_http: old,
-            unsafe_connection: new,
-        }),
-        (Some(agreed), Some(_)) => Ok(agreed),
-        (Some(old), None) => Ok(old),
-        (None, Some(new)) => Ok(new),
-        (None, None) => Ok(false),
-    }
-}
-
 /// Typestate builder for [`DeRecProtocol`].
 ///
 /// Call each store/transport setter, then [`build`](DeRecProtocolBuilder::build).
@@ -109,7 +79,6 @@ pub struct DeRecProtocolBuilder<
     threshold: usize,
     keep_versions_count: usize,
     timeouts: crate::protocol::types::Timeouts,
-    unsafe_http: Option<bool>,
     unsafe_connection: Option<bool>,
     communication_info: HashMap<String, String>,
     auto_respond_on_failure: bool,
@@ -149,7 +118,6 @@ impl
             threshold: DEFAULT_THRESHOLD,
             keep_versions_count: DEFAULT_KEEP_VERSIONS_COUNT,
             timeouts: crate::protocol::types::Timeouts::default(),
-            unsafe_http: None,
             unsafe_connection: None,
             communication_info: HashMap::new(),
             auto_respond_on_failure: false,
@@ -243,7 +211,8 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
         self
     }
 
-    /// Accept plaintext `http://` transport endpoints. **Development only.**
+    /// Accept plaintext transport endpoints — `http://` and `grpc://`.
+    /// **Development only.**
     ///
     /// Default: `false`, which is the production posture.
     ///
@@ -272,34 +241,6 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
     /// record, propagate or reply to a plaintext endpoint. Leaving it `false`
     /// does not make a deployment secure on its own, and setting it `true`
     /// does not by itself send anything in the clear.
-    #[deprecated(
-        since = "0.0.3",
-        note = "use `with_unsafe_connection`, which names both gated schemes; \
-                removed at 0.0.5"
-    )]
-    pub fn with_unsafe_http(mut self, allow: bool) -> Self {
-        self.unsafe_http = Some(allow);
-        self
-    }
-
-    /// Accept plaintext transport endpoints — `http://` and `grpc://`.
-    ///
-    /// Supersedes [`with_unsafe_http`](Self::with_unsafe_http), which named
-    /// only one of the two schemes it gates. Either alone is honored; both
-    /// set and disagreeing is
-    /// [`Error::ConflictingPlaintextOptIn`](crate::Error::ConflictingPlaintextOptIn)
-    /// from [`build`](Self::build) rather than a silent win for either.
-    ///
-    /// See [`TransportPolicy`](crate::transport::TransportPolicy) for the
-    /// full table, including why loopback is free for your own endpoint but
-    /// not for one a peer names.
-    ///
-    /// # This is a guardrail, not transport security
-    ///
-    /// The SDK opens no sockets — delivery is the application's
-    /// [`DeRecTransport`](crate::protocol::DeRecTransport). Nothing here can
-    /// stop an application sending plaintext; what it does is refuse to
-    /// record, propagate or reply to a plaintext endpoint.
     pub fn with_unsafe_connection(mut self, allow: bool) -> Self {
         self.unsafe_connection = Some(allow);
         self
@@ -465,7 +406,6 @@ impl<ShareStore, SecretStore, UserSecretStore, StateStore, Transport, OwnTranspo
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
-            unsafe_http: self.unsafe_http,
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
@@ -515,7 +455,6 @@ impl<ChannelStore, SecretStore, UserSecretStore, StateStore, Transport, OwnTrans
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
-            unsafe_http: self.unsafe_http,
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
@@ -565,7 +504,6 @@ impl<ChannelStore, ShareStore, UserSecretStore, StateStore, Transport, OwnTransp
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
-            unsafe_http: self.unsafe_http,
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
@@ -618,7 +556,6 @@ impl<ChannelStore, ShareStore, SecretStore, StateStore, Transport, OwnTransport>
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
-            unsafe_http: self.unsafe_http,
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
@@ -668,7 +605,6 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, OwnTran
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
-            unsafe_http: self.unsafe_http,
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
@@ -692,104 +628,17 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
         BuilderSlotMissingMarker,
     >
 {
-    /// The local node's transport endpoint that peers will use to reach it.
-    ///
-    /// Embedded into outgoing contact and pairing messages so peers know
-    /// where to send their replies. Accepts anything implementing
-    /// [`IntoOwnTransport`](crate::transport::IntoOwnTransport): a typed
-    /// [`TransportProtocol`](crate::transport::TransportProtocol), a
-    /// `&str`, or a `String`. URI validation is deferred to
-    /// [`build`](DeRecProtocolBuilder::build) so the setter chain stays
-    /// infallible — a malformed URI surfaces as
-    /// [`crate::Error::Transport`] when `build()` runs.
-    ///
-    /// Stores a one-element preference list, so this and
-    /// [`with_own_transports`](Self::with_own_transports) fill the same
-    /// slot — whichever is called last wins, same as any other setter.
-    ///
-    /// # Migrating
-    ///
-    /// [`with_own_transports`](Self::with_own_transports) takes the whole
-    /// preference list and is what this becomes internally, so a
-    /// single-endpoint deployment migrates by wrapping its argument:
-    ///
-    /// ```ignore
-    /// // before
-    /// .with_own_transport("https://me.example/derec")
-    /// // after
-    /// .with_own_transports(["https://me.example/derec"])
-    /// ```
-    ///
-    /// The singular spelling is going away because it can name only one
-    /// protocol, and a device serving several advertises all of them in
-    /// preference order. See the [`transport`](crate::transport) module docs
-    /// for how the list is used during pairing, and for the one-endpoint-per-
-    /// protocol rule the set is held to.
-    #[allow(clippy::type_complexity)]
-    #[deprecated(
-        since = "0.0.3",
-        note = "use `with_own_transports`, which takes the whole preference \
-                list; removed at 0.0.5"
-    )]
-    pub fn with_own_transport(
-        self,
-        own_transport: impl crate::transport::IntoOwnTransport,
-    ) -> DeRecProtocolBuilder<
-        ChannelStore,
-        ShareStore,
-        SecretStore,
-        UserSecretStore,
-        StateStore,
-        Transport,
-        BuilderSlotSetMarker<
-            Result<
-                Vec<crate::transport::TransportProtocol>,
-                crate::transport::TransportValidationError,
-            >,
-        >,
-    > {
-        let own_transport = own_transport.into_own_transport().map(|t| vec![t]);
-        DeRecProtocolBuilder {
-            secret_id: self.secret_id,
-            channel_store: self.channel_store,
-            share_store: self.share_store,
-            secret_store: self.secret_store,
-            user_secret_store: self.user_secret_store,
-            state_store: self.state_store,
-            transport: self.transport,
-            own_transport: BuilderSlotSetMarker(own_transport),
-            threshold: self.threshold,
-            keep_versions_count: self.keep_versions_count,
-            timeouts: self.timeouts,
-            unsafe_http: self.unsafe_http,
-            unsafe_connection: self.unsafe_connection,
-            communication_info: self.communication_info,
-            auto_respond_on_failure: self.auto_respond_on_failure,
-            unpair_ack: self.unpair_ack,
-            auto_reply_to: self.auto_reply_to,
-            auto_accept: self.auto_accept,
-            replica_id: self.replica_id,
-            parameter_range: self.parameter_range,
-        }
-    }
-
     /// Set every transport endpoint this application serves, in preference
     /// order.
     ///
     /// The order is meaningful: it is what decides which of a peer's offered
     /// endpoints gets used. The first entry is also this device's primary
-    /// endpoint, the one advertised to implementations predating the offer
-    /// list.
+    /// endpoint.
     ///
     /// Because delivery is push-only, an endpoint listed here is one this
     /// application must actually **serve** — a peer can only reply to an
     /// address it can reach. Listing a transport that is not served makes
     /// pairing succeed and replies vanish.
-    ///
-    /// Supersedes [`with_own_transport`](Self::with_own_transport) for
-    /// applications serving more than one transport; the single-endpoint
-    /// setter remains fully supported and is equivalent to passing a
-    /// one-element list.
     ///
     /// The list must be non-empty — [`build`](Self::build) rejects an empty
     /// one with [`crate::Error::InvalidInput`].
@@ -834,7 +683,6 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, StateStore, Transpo
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
-            unsafe_http: self.unsafe_http,
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
@@ -889,7 +737,6 @@ impl<ChannelStore, ShareStore, SecretStore, UserSecretStore, Transport, OwnTrans
             threshold: self.threshold,
             keep_versions_count: self.keep_versions_count,
             timeouts: self.timeouts,
-            unsafe_http: self.unsafe_http,
             unsafe_connection: self.unsafe_connection,
             communication_info: self.communication_info,
             auto_respond_on_failure: self.auto_respond_on_failure,
@@ -944,7 +791,6 @@ impl<
     ///   empty list. Delivery is push-only, so an application serving no
     ///   endpoint can never be replied to.
     /// - [`crate::Error::Transport`] if any endpoint passed to
-    ///   [`with_own_transport`](Self::with_own_transport) or
     ///   [`with_own_transports`](Self::with_own_transports) failed
     ///   validation (malformed scheme, empty URI, …) — the first
     ///   invalid entry stops the build.
@@ -971,7 +817,7 @@ impl<
         // One resolution feeds both the build-time `check_own` below and the
         // runtime policy stored on the protocol, so the two never disagree
         // about which flag decided the posture.
-        let unsafe_connection = resolve_plaintext_opt_in(self.unsafe_http, self.unsafe_connection)?;
+        let unsafe_connection = self.unsafe_connection.unwrap_or(false);
         // Deferred to here rather than to `with_own_transport` /
         // `with_own_transports`: the setters may be called in either order,
         // so this is the first point at which both the endpoint(s) and the
@@ -1006,7 +852,7 @@ impl<
         protocol.auto_accept = self.auto_accept;
         protocol.replica_id = self.replica_id;
         protocol.parameter_range = self.parameter_range;
-        protocol.unsafe_http = unsafe_connection;
+        protocol.unsafe_connection = unsafe_connection;
         Ok(protocol)
     }
 }
@@ -1014,73 +860,6 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn unsafe_connection_alone_is_honored() {
-        assert!(resolve_plaintext_opt_in(None, Some(true)).unwrap());
-        assert!(!resolve_plaintext_opt_in(None, Some(false)).unwrap());
-    }
-
-    /// Two explicit values that disagree are refused rather than resolved.
-    ///
-    /// Precedence would hand the decision to the flag being removed, and the
-    /// case that makes that dangerous is a configuration layer emitting both
-    /// fields unconditionally: a defaulted `unsafe_http: false` would beat a
-    /// deliberate `unsafe_connection: true`, refusing plaintext endpoints with
-    /// no diagnostic beyond a log line the application may not have wired up.
-    #[test]
-    fn disagreeing_explicit_flags_are_refused() {
-        for (old, new) in [(true, false), (false, true)] {
-            let err = resolve_plaintext_opt_in(Some(old), Some(new))
-                .expect_err("two explicit, disagreeing values must not resolve silently");
-            assert!(
-                matches!(
-                    err,
-                    crate::Error::ConflictingPlaintextOptIn {
-                        unsafe_http,
-                        unsafe_connection,
-                    } if unsafe_http == old && unsafe_connection == new
-                ),
-                "the error must name both flags and the values given: {err:?}"
-            );
-            // The operator has to be able to find the flag they set, so both
-            // names appear in the rendered message.
-            let rendered = err.to_string();
-            assert!(rendered.contains("unsafe_http"), "{rendered}");
-            assert!(rendered.contains("unsafe_connection"), "{rendered}");
-        }
-    }
-
-    /// Agreement is not a conflict, however redundantly it was expressed — a
-    /// config layer that emits both fields with the same value is describing
-    /// one posture, not two.
-    #[test]
-    fn agreeing_explicit_flags_resolve() {
-        assert!(resolve_plaintext_opt_in(Some(true), Some(true)).unwrap());
-        assert!(!resolve_plaintext_opt_in(Some(false), Some(false)).unwrap());
-    }
-
-    /// Presence, not value. An SDK that never sets `unsafe_http` must not
-    /// override a deliberate `unsafe_connection`.
-    #[test]
-    fn absent_deprecated_flag_does_not_override() {
-        assert!(resolve_plaintext_opt_in(None, Some(true)).unwrap());
-    }
-
-    #[test]
-    fn neither_flag_is_the_production_posture() {
-        assert!(!resolve_plaintext_opt_in(None, None).unwrap());
-    }
-
-    /// The old flag alone still decides, so an application that upgrades
-    /// without touching its configuration keeps exactly its previous
-    /// posture. This is the compatibility case the precedence rule existed
-    /// for, and refusing a conflict does not disturb it.
-    #[test]
-    fn deprecated_flag_alone_is_honored() {
-        assert!(resolve_plaintext_opt_in(Some(true), None).unwrap());
-        assert!(!resolve_plaintext_opt_in(Some(false), None).unwrap());
-    }
 
     /// A freshly-constructed builder carries `DEFAULT_THRESHOLD` /
     /// `DEFAULT_KEEP_VERSIONS_COUNT` until a setter overrides them — the

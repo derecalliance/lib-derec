@@ -27,7 +27,7 @@ const (
 	// verifies them against the hash.
 	ContactModeHashedKeys ContactMode = 1
 	// ContactModeNoKeys carries no key material and no hash — only
-	// channel_id, nonce, and transport_protocol. The contact creator
+	// channel_id, nonce, and supported_transports. The contact creator
 	// generates key material on the fly when the corresponding
 	// PrePairRequest arrives; trust rests entirely on the out-of-band
 	// delivery channel being fully trusted.

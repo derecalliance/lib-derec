@@ -1,5 +1,5 @@
 {
-  "$schema_note": "The API surface every SDK must expose, with each SDK's spelling. `api_surface_parity.rs` holds this file to the Rust core and holds every SDK to this file. Adding a method to the core fails that test until this file names it; naming it here fails until every SDK declares it. Lifecycle entry points (`derec_protocol_new`, `_free`, `_version`) are excluded: each SDK expresses them idiomatically as a constructor and a disposer. `secret_id` is absent from `builder_options`: every SDK takes it as the builder's constructor argument rather than as a setter, and the constructed protocol exposes it through the `secret_id` protocol method. `sdk_helpers` covers conveniences every SDK must offer that have no counterpart in the core, so nothing else would notice one going missing.",
+  "$schema_note": "The API surface every SDK must expose, with each SDK's spelling. `api_surface_parity.rs` derives the expected surface from the Rust source and holds this file to it, then holds every SDK to this file, reading each SDK declaration as a block and comparing its members as a set. `protocol_methods` are the public methods of `DeRecProtocol`; `builder_options` and `builder_wiring` the public methods of `DeRecProtocolBuilder` (options are `with_<rust>`). `stores` lists each store trait with its methods: `rust_params` must equal the trait's parameters, `params` the parameters every SDK declares, modulo casing. `primitives` maps each public primitive to the FFI and WASM exports that carry it and to each SDK's path. `records` pairs a Rust struct with the type each SDK mirrors it as; fields are compared, not listed. Lifecycle entry points are not rows: each SDK expresses them idiomatically (Rust Drop, .NET Dispose, Go Close, JS free and Symbol.dispose) and the test spells them per language. `secret_id` is absent from `builder_options`: every SDK takes it as the builder's constructor argument. `sdk_helpers` covers conveniences every SDK must offer that have no counterpart in the core; .NET and Go entries name `Owner.Member` where the helper is a member.",
   "protocol_methods": [
     {
       "rust": "accept",
@@ -50,12 +50,6 @@
       "ts": "setCommunicationInfo"
     },
     {
-      "rust": "set_own_transport",
-      "dotnet": "SetOwnTransport",
-      "go": "SetOwnTransport",
-      "ts": "setOwnTransport"
-    },
-    {
       "rust": "set_own_transports",
       "dotnet": "SetOwnTransports",
       "go": "SetOwnTransports",
@@ -87,18 +81,6 @@
     }
   ],
   "builder_options": [
-    {
-      "rust": "own_transport_uri",
-      "dotnet": "WithOwnTransport",
-      "go": "OwnTransportURI",
-      "ts": "withOwnTransport"
-    },
-    {
-      "rust": "own_transport_protocol",
-      "dotnet": "WithOwnTransport",
-      "go": "OwnTransportProtocol",
-      "ts": "withOwnTransport"
-    },
     {
       "rust": "own_transports",
       "dotnet": "WithOwnTransports",
@@ -148,12 +130,6 @@
       "ts": "withTimeouts"
     },
     {
-      "rust": "unsafe_http",
-      "dotnet": "WithUnsafeHttp",
-      "go": "UnsafeHTTP",
-      "ts": "withUnsafeHttp"
-    },
-    {
       "rust": "unsafe_connection",
       "dotnet": "WithUnsafeConnection",
       "go": "UnsafeConnection",
@@ -176,6 +152,44 @@
       "dotnet": "WithCommunicationInfo",
       "go": "CommunicationInfo",
       "ts": "withCommunicationInfo"
+    }
+  ],
+  "builder_wiring": [
+    {
+      "rust": "with_channel_store",
+      "dotnet": "WithChannelStore",
+      "go": "channelStore",
+      "ts": "withChannelStore"
+    },
+    {
+      "rust": "with_share_store",
+      "dotnet": "WithShareStore",
+      "go": "shareStore",
+      "ts": "withShareStore"
+    },
+    {
+      "rust": "with_secret_store",
+      "dotnet": "WithSecretStore",
+      "go": "secretStore",
+      "ts": "withSecretStore"
+    },
+    {
+      "rust": "with_user_secret_store",
+      "dotnet": "WithUserSecretStore",
+      "go": "userSecretStore",
+      "ts": "withUserSecretStore"
+    },
+    {
+      "rust": "with_state_store",
+      "dotnet": "WithStateStore",
+      "go": "stateStore",
+      "ts": "withStateStore"
+    },
+    {
+      "rust": "with_transport",
+      "dotnet": "WithTransport",
+      "go": "transport",
+      "ts": "withTransport"
     }
   ],
   "flow_params": [
@@ -234,195 +248,431 @@
       "ts": "UpdateChannelInfoParams"
     }
   ],
-  "store_methods": [
+  "stores": [
     {
       "trait": "DeRecChannelStore",
-      "rust": "load",
-      "dotnet": "Load",
-      "go": "Load",
-      "ts": "load"
-    },
-    {
-      "trait": "DeRecChannelStore",
-      "rust": "save",
-      "dotnet": "Save",
-      "go": "Save",
-      "ts": "save"
-    },
-    {
-      "trait": "DeRecChannelStore",
-      "rust": "remove",
-      "dotnet": "Remove",
-      "go": "Remove",
-      "ts": "remove"
-    },
-    {
-      "trait": "DeRecChannelStore",
-      "rust": "helpers",
-      "dotnet": "ListHelpers",
-      "go": "ListHelpers",
-      "ts": "listHelpers"
-    },
-    {
-      "trait": "DeRecChannelStore",
-      "rust": "replicas",
-      "dotnet": "ListReplicas",
-      "go": "ListReplicas",
-      "ts": "listReplicas"
-    },
-    {
-      "trait": "DeRecChannelStore",
-      "rust": "link_channel",
-      "dotnet": "LinkChannel",
-      "go": "LinkChannel",
-      "ts": "linkChannel"
-    },
-    {
-      "trait": "DeRecChannelStore",
-      "rust": "linked_channels",
-      "dotnet": "LinkedChannels",
-      "go": "LinkedChannels",
-      "ts": "linkedChannels"
+      "dotnet": "IChannelStore",
+      "go": "ChannelStore",
+      "ts": "ChannelStore",
+      "methods": [
+        {
+          "rust": "load",
+          "dotnet": "Load",
+          "go": "Load",
+          "ts": "load",
+          "rust_params": [
+            "secret_id",
+            "query"
+          ],
+          "params": [
+            "secret_id",
+            "channel_id",
+            "replica_id"
+          ]
+        },
+        {
+          "rust": "save",
+          "dotnet": "Save",
+          "go": "Save",
+          "ts": "save",
+          "rust_params": [
+            "secret_id",
+            "record"
+          ],
+          "params": [
+            "secret_id",
+            "record"
+          ]
+        },
+        {
+          "rust": "remove",
+          "dotnet": "Remove",
+          "go": "Remove",
+          "ts": "remove",
+          "rust_params": [
+            "secret_id",
+            "query"
+          ],
+          "params": [
+            "secret_id",
+            "channel_id",
+            "replica_id"
+          ]
+        },
+        {
+          "rust": "helpers",
+          "dotnet": "ListHelpers",
+          "go": "ListHelpers",
+          "ts": "listHelpers",
+          "rust_params": [
+            "secret_id",
+            "filter"
+          ],
+          "params": [
+            "secret_id",
+            "filter"
+          ]
+        },
+        {
+          "rust": "replicas",
+          "dotnet": "ListReplicas",
+          "go": "ListReplicas",
+          "ts": "listReplicas",
+          "rust_params": [
+            "secret_id",
+            "filter"
+          ],
+          "params": [
+            "secret_id",
+            "filter"
+          ]
+        },
+        {
+          "rust": "link_channel",
+          "dotnet": "LinkChannel",
+          "go": "LinkChannel",
+          "ts": "linkChannel",
+          "rust_params": [
+            "secret_id",
+            "a",
+            "b"
+          ],
+          "params": [
+            "secret_id",
+            "a",
+            "b"
+          ]
+        },
+        {
+          "rust": "linked_channels",
+          "dotnet": "LinkedChannels",
+          "go": "LinkedChannels",
+          "ts": "linkedChannels",
+          "rust_params": [
+            "secret_id",
+            "channel_id"
+          ],
+          "params": [
+            "secret_id",
+            "channel_id"
+          ]
+        }
+      ]
     },
     {
       "trait": "DeRecSecretStore",
-      "rust": "load",
-      "dotnet": "Load",
-      "go": "Load",
-      "ts": "load"
-    },
-    {
-      "trait": "DeRecSecretStore",
-      "rust": "load_many",
-      "dotnet": "LoadMany",
-      "go": "LoadMany",
-      "ts": "loadMany"
-    },
-    {
-      "trait": "DeRecSecretStore",
-      "rust": "save",
-      "dotnet": "Save",
-      "go": "Save",
-      "ts": "save"
-    },
-    {
-      "trait": "DeRecSecretStore",
-      "rust": "remove",
-      "dotnet": "Remove",
-      "go": "Remove",
-      "ts": "remove"
+      "dotnet": "ISecretStore",
+      "go": "SecretStore",
+      "ts": "SecretStore",
+      "methods": [
+        {
+          "rust": "load",
+          "dotnet": "Load",
+          "go": "Load",
+          "ts": "load",
+          "rust_params": [
+            "secret_id",
+            "channel_id",
+            "kind"
+          ],
+          "params": [
+            "secret_id",
+            "channel_id",
+            "kind"
+          ]
+        },
+        {
+          "rust": "load_many",
+          "dotnet": "LoadMany",
+          "go": "LoadMany",
+          "ts": "loadMany",
+          "rust_params": [
+            "secret_id",
+            "channel_ids",
+            "kind",
+            "missing_policy"
+          ],
+          "params": [
+            "secret_id",
+            "channel_ids",
+            "kind"
+          ]
+        },
+        {
+          "rust": "save",
+          "dotnet": "Save",
+          "go": "Save",
+          "ts": "save",
+          "rust_params": [
+            "secret_id",
+            "channel_id",
+            "value"
+          ],
+          "params": [
+            "secret_id",
+            "channel_id",
+            "value"
+          ]
+        },
+        {
+          "rust": "remove",
+          "dotnet": "Remove",
+          "go": "Remove",
+          "ts": "remove",
+          "rust_params": [
+            "secret_id",
+            "channel_id",
+            "kind"
+          ],
+          "params": [
+            "secret_id",
+            "channel_id",
+            "kind"
+          ]
+        }
+      ]
     },
     {
       "trait": "DeRecShareStore",
-      "rust": "load",
-      "dotnet": "Load",
-      "go": "Load",
-      "ts": "load"
-    },
-    {
-      "trait": "DeRecShareStore",
-      "rust": "load_many",
-      "dotnet": "LoadMany",
-      "go": "LoadMany",
-      "ts": "loadMany"
-    },
-    {
-      "trait": "DeRecShareStore",
-      "rust": "load_all",
-      "dotnet": "LoadAll",
-      "go": "LoadAll",
-      "ts": "loadAll"
-    },
-    {
-      "trait": "DeRecShareStore",
-      "rust": "latest_version",
-      "dotnet": "LatestVersion",
-      "go": "LatestVersion",
-      "ts": "latestVersion"
-    },
-    {
-      "trait": "DeRecShareStore",
-      "rust": "save",
-      "dotnet": "Save",
-      "go": "Save",
-      "ts": "save"
-    },
-    {
-      "trait": "DeRecShareStore",
-      "rust": "remove_channel",
-      "dotnet": "RemoveChannel",
-      "go": "RemoveChannel",
-      "ts": "removeChannel"
+      "dotnet": "IShareStore",
+      "go": "ShareStore",
+      "ts": "ShareStore",
+      "methods": [
+        {
+          "rust": "load",
+          "dotnet": "Load",
+          "go": "Load",
+          "ts": "load",
+          "rust_params": [
+            "secret_id",
+            "channel_id",
+            "versions"
+          ],
+          "params": [
+            "secret_id",
+            "channel_id",
+            "versions"
+          ]
+        },
+        {
+          "rust": "load_many",
+          "dotnet": "LoadMany",
+          "go": "LoadMany",
+          "ts": "loadMany",
+          "rust_params": [
+            "secret_id",
+            "channel_ids",
+            "versions"
+          ],
+          "params": [
+            "secret_id",
+            "channel_ids",
+            "versions"
+          ]
+        },
+        {
+          "rust": "load_all",
+          "dotnet": "LoadAll",
+          "go": "LoadAll",
+          "ts": "loadAll",
+          "rust_params": [
+            "secret_id",
+            "channel_ids"
+          ],
+          "params": [
+            "secret_id",
+            "channel_ids"
+          ]
+        },
+        {
+          "rust": "latest_version",
+          "dotnet": "LatestVersion",
+          "go": "LatestVersion",
+          "ts": "latestVersion",
+          "rust_params": [
+            "secret_id"
+          ],
+          "params": [
+            "secret_id"
+          ]
+        },
+        {
+          "rust": "save",
+          "dotnet": "Save",
+          "go": "Save",
+          "ts": "save",
+          "rust_params": [
+            "secret_id",
+            "channel_id",
+            "share"
+          ],
+          "params": [
+            "secret_id",
+            "channel_id",
+            "share"
+          ]
+        },
+        {
+          "rust": "remove_channel",
+          "dotnet": "RemoveChannel",
+          "go": "RemoveChannel",
+          "ts": "removeChannel",
+          "rust_params": [
+            "secret_id",
+            "channel_id"
+          ],
+          "params": [
+            "secret_id",
+            "channel_id"
+          ]
+        }
+      ]
     },
     {
       "trait": "DeRecUserSecretStore",
-      "rust": "load_latest",
-      "dotnet": "LoadLatest",
-      "go": "LoadLatest",
-      "ts": "loadLatest"
-    },
-    {
-      "trait": "DeRecUserSecretStore",
-      "rust": "save_latest",
-      "dotnet": "SaveLatest",
-      "go": "SaveLatest",
-      "ts": "saveLatest"
-    },
-    {
-      "trait": "DeRecUserSecretStore",
-      "rust": "remove",
-      "dotnet": "Remove",
-      "go": "Remove",
-      "ts": "remove"
+      "dotnet": "IUserSecretStore",
+      "go": "UserSecretStore",
+      "ts": "UserSecretStore",
+      "methods": [
+        {
+          "rust": "load_latest",
+          "dotnet": "LoadLatest",
+          "go": "LoadLatest",
+          "ts": "loadLatest",
+          "rust_params": [
+            "secret_id"
+          ],
+          "params": [
+            "secret_id"
+          ]
+        },
+        {
+          "rust": "save_latest",
+          "dotnet": "SaveLatest",
+          "go": "SaveLatest",
+          "ts": "saveLatest",
+          "rust_params": [
+            "secret_id",
+            "value"
+          ],
+          "params": [
+            "secret_id",
+            "value"
+          ]
+        },
+        {
+          "rust": "remove",
+          "dotnet": "Remove",
+          "go": "Remove",
+          "ts": "remove",
+          "rust_params": [
+            "secret_id"
+          ],
+          "params": [
+            "secret_id"
+          ]
+        }
+      ]
     },
     {
       "trait": "DeRecStateStore",
-      "rust": "save",
-      "dotnet": "Save",
-      "go": "Save",
-      "ts": "save"
-    },
-    {
-      "trait": "DeRecStateStore",
-      "rust": "load",
-      "dotnet": "Load",
-      "go": "Load",
-      "ts": "load"
-    },
-    {
-      "trait": "DeRecStateStore",
-      "rust": "remove",
-      "dotnet": "Remove",
-      "go": "Remove",
-      "ts": "remove"
-    },
-    {
-      "trait": "DeRecStateStore",
-      "rust": "load_all",
-      "dotnet": "LoadAll",
-      "go": "LoadAll",
-      "ts": "loadAll"
+      "dotnet": "IStateStore",
+      "go": "StateStore",
+      "ts": "StateStore",
+      "methods": [
+        {
+          "rust": "save",
+          "dotnet": "Save",
+          "go": "Save",
+          "ts": "save",
+          "rust_params": [
+            "secret_id",
+            "item"
+          ],
+          "params": [
+            "secret_id",
+            "item"
+          ]
+        },
+        {
+          "rust": "load",
+          "dotnet": "Load",
+          "go": "Load",
+          "ts": "load",
+          "rust_params": [
+            "secret_id",
+            "key"
+          ],
+          "params": [
+            "secret_id",
+            "key"
+          ]
+        },
+        {
+          "rust": "remove",
+          "dotnet": "Remove",
+          "go": "Remove",
+          "ts": "remove",
+          "rust_params": [
+            "secret_id",
+            "key"
+          ],
+          "params": [
+            "secret_id",
+            "key"
+          ]
+        },
+        {
+          "rust": "load_all",
+          "dotnet": "LoadAll",
+          "go": "LoadAll",
+          "ts": "loadAll",
+          "rust_params": [
+            "secret_id",
+            "kind"
+          ],
+          "params": [
+            "secret_id",
+            "kind"
+          ]
+        }
+      ]
     },
     {
       "trait": "DeRecTransport",
-      "rust": "send",
-      "dotnet": "Send",
-      "go": "Send",
-      "ts": "send"
+      "dotnet": "ITransport",
+      "go": "Transport",
+      "ts": "Transport",
+      "methods": [
+        {
+          "rust": "send",
+          "dotnet": "Send",
+          "go": "Send",
+          "ts": "send",
+          "rust_params": [
+            "endpoints",
+            "message"
+          ],
+          "params": [
+            "endpoints",
+            "message"
+          ]
+        }
+      ]
     }
   ],
   "sdk_helpers": [
     {
       "what": "filter predicate",
       "why": "a store whose backing cannot express ChannelFilter as a query needs to apply it in memory without re-deriving the empty-means-unrestricted and exclude-after-ids rules",
-      "dotnet": "Matches",
-      "go": "Matches",
+      "dotnet": "ChannelFilter.Matches",
+      "go": "HelperFilter.Matches",
       "ts": "channelFilterMatches"
     },
     {
       "what": "advertised endpoints reader",
-      "why": "the singular transportProtocol narrowed to 'one entry of a list, and possibly absent' in 0.0.3, so every reader must resolve it against supportedTransports rather than read either field directly",
-      "dotnet": "AdvertisedEndpoints",
+      "why": "every message that advertises where its sender can be reached carries the same supportedTransports list, and reading it through one helper keeps that rule in one place per binding",
+      "dotnet": "ContactMessage.AdvertisedEndpoints",
       "go": "AdvertisedEndpoints",
       "ts": "advertisedEndpoints"
     },
@@ -434,11 +684,537 @@
       "ts": "sequentialFailover"
     },
     {
+      "what": "replica id generator",
+      "why": "a replica id must be random and never 0; minting it in the core means no binding can produce one the core refuses",
+      "dotnet": "DeRecProtocolBuilder.GenerateReplicaId",
+      "go": "GenerateReplicaID",
+      "ts": "generate_replica_id",
+      "ffi": "derec_generate_replica_id",
+      "wasm": "generate_replica_id"
+    },
+    {
+      "what": "protocol version",
+      "why": "audit trails and logs record which protocol version a build speaks; it comes from the core so no binding can report one it does not write",
+      "dotnet": "ProtocolVersion.Current",
+      "go": "CurrentProtocolVersion",
+      "ts": "protocol_version",
+      "ffi": "derec_protocol_version",
+      "wasm": "protocol_version"
+    },
+    {
       "what": "single endpoint transport",
       "why": "taking endpoints[0] inline reads as finished; naming the type records that failover was considered and declined, which is a claim a reviewer can disagree with",
       "dotnet": "SingleEndpointTransport",
       "go": "SingleEndpointTransport",
       "ts": "singleEndpointTransport"
+    }
+  ],
+  "primitives": [
+    {
+      "rust": "primitives::discovery::request::produce",
+      "ffi": "produce_get_secret_ids_versions_request_message",
+      "wasm": "discovery_request_produce",
+      "dotnet": "Discovery.Request.Produce",
+      "go": "discovery.Request.Produce",
+      "ts": "primitives.discovery.request.produce"
+    },
+    {
+      "rust": "primitives::discovery::request::extract",
+      "ffi": "extract_get_secret_ids_versions_request",
+      "wasm": "discovery_request_extract",
+      "dotnet": "Discovery.Request.Extract",
+      "go": "discovery.Request.Extract",
+      "ts": "primitives.discovery.request.extract"
+    },
+    {
+      "rust": "primitives::discovery::response::produce",
+      "ffi": "produce_get_secret_ids_versions_response_message",
+      "wasm": "discovery_response_produce",
+      "dotnet": "Discovery.Response.Produce",
+      "go": "discovery.Response.Produce",
+      "ts": "primitives.discovery.response.produce"
+    },
+    {
+      "rust": "primitives::discovery::response::extract",
+      "ffi": "extract_get_secret_ids_versions_response",
+      "wasm": "discovery_response_extract",
+      "dotnet": "Discovery.Response.Extract",
+      "go": "discovery.Response.Extract",
+      "ts": "primitives.discovery.response.extract"
+    },
+    {
+      "rust": "primitives::discovery::response::process",
+      "ffi": "process_get_secret_ids_versions_response_message",
+      "wasm": "discovery_response_process",
+      "dotnet": "Discovery.Response.Process",
+      "go": "discovery.Response.Process",
+      "ts": "primitives.discovery.response.process"
+    },
+    {
+      "rust": "primitives::pairing::fingerprint",
+      "ffi": "pairing_fingerprint",
+      "wasm": "pairing_fingerprint",
+      "dotnet": "Pairing.Fingerprint",
+      "go": "pairing.Fingerprint",
+      "ts": "primitives.pairing.fingerprint"
+    },
+    {
+      "rust": "primitives::pairing::request::create_contact",
+      "ffi": "create_contact_message",
+      "wasm": "pairing_request_create_contact",
+      "dotnet": "Pairing.Request.CreateContact",
+      "go": "pairing.Request.CreateContact",
+      "ts": "primitives.pairing.request.create_contact"
+    },
+    {
+      "rust": "primitives::pairing::request::encode_contact",
+      "ffi": "encode_contact_message",
+      "wasm": "pairing_request_encode_contact",
+      "dotnet": "Pairing.Request.EncodeContact",
+      "go": "pairing.Request.EncodeContact",
+      "ts": "primitives.pairing.request.encode_contact"
+    },
+    {
+      "rust": "primitives::pairing::request::decode_contact",
+      "ffi": "decode_contact_message",
+      "wasm": "pairing_request_decode_contact",
+      "dotnet": "Pairing.Request.DecodeContact",
+      "go": "pairing.Request.DecodeContact",
+      "ts": "primitives.pairing.request.decode_contact"
+    },
+    {
+      "rust": "primitives::pairing::request::produce",
+      "ffi": "produce_pair_request_message",
+      "wasm": "pairing_request_produce",
+      "dotnet": "Pairing.Request.Produce",
+      "go": "pairing.Request.Produce",
+      "ts": "primitives.pairing.request.produce"
+    },
+    {
+      "rust": "primitives::pairing::request::extract",
+      "ffi": "extract_pair_request",
+      "wasm": "pairing_request_extract",
+      "dotnet": "Pairing.Request.Extract",
+      "go": "pairing.Request.Extract",
+      "ts": "primitives.pairing.request.extract"
+    },
+    {
+      "rust": "primitives::pairing::request::produce_pre_pair_request",
+      "ffi": "produce_pre_pair_request_message",
+      "wasm": "pairing_request_produce_pre_pair",
+      "dotnet": "Pairing.Request.ProducePrePair",
+      "go": "pairing.Request.ProducePrePair",
+      "ts": "primitives.pairing.request.produce_pre_pair"
+    },
+    {
+      "rust": "primitives::pairing::request::extract_pre_pair",
+      "ffi": "extract_pre_pair_request",
+      "wasm": "pairing_request_extract_pre_pair",
+      "dotnet": "Pairing.Request.ExtractPrePair",
+      "go": "pairing.Request.ExtractPrePair",
+      "ts": "primitives.pairing.request.extract_pre_pair"
+    },
+    {
+      "rust": "primitives::pairing::response::produce",
+      "ffi": "produce_pair_response_message",
+      "wasm": "pairing_response_produce",
+      "dotnet": "Pairing.Response.Produce",
+      "go": "pairing.Response.Produce",
+      "ts": "primitives.pairing.response.produce"
+    },
+    {
+      "rust": "primitives::pairing::response::extract",
+      "ffi": "extract_pair_response",
+      "wasm": "pairing_response_extract",
+      "dotnet": "Pairing.Response.Extract",
+      "go": "pairing.Response.Extract",
+      "ts": "primitives.pairing.response.extract"
+    },
+    {
+      "rust": "primitives::pairing::response::process",
+      "ffi": "process_pair_response_message",
+      "wasm": "pairing_response_process",
+      "dotnet": "Pairing.Response.Process",
+      "go": "pairing.Response.Process",
+      "ts": "primitives.pairing.response.process"
+    },
+    {
+      "rust": "primitives::pairing::response::produce_pre_pair",
+      "ffi": "produce_pre_pair_response_message",
+      "wasm": "pairing_response_produce_pre_pair",
+      "dotnet": "Pairing.Response.ProducePrePair",
+      "go": "pairing.Response.ProducePrePair",
+      "ts": "primitives.pairing.response.produce_pre_pair"
+    },
+    {
+      "rust": "primitives::pairing::response::extract_pre_pair",
+      "ffi": "extract_pre_pair_response",
+      "wasm": "pairing_response_extract_pre_pair",
+      "dotnet": "Pairing.Response.ExtractPrePair",
+      "go": "pairing.Response.ExtractPrePair",
+      "ts": "primitives.pairing.response.extract_pre_pair"
+    },
+    {
+      "rust": "primitives::pairing::response::process_pre_pair",
+      "ffi": "process_pre_pair_response_message",
+      "wasm": "pairing_response_process_pre_pair",
+      "dotnet": "Pairing.Response.ProcessPrePair",
+      "go": "pairing.Response.ProcessPrePair",
+      "ts": "primitives.pairing.response.process_pre_pair"
+    },
+    {
+      "rust": "primitives::pairing::response::produce_pre_pair_no_keys",
+      "ffi": "produce_pre_pair_no_keys_response_message",
+      "wasm": "pairing_response_produce_pre_pair_no_keys",
+      "dotnet": "Pairing.Response.ProducePrePairNoKeys",
+      "go": "pairing.Response.ProducePrePairNoKeys",
+      "ts": "primitives.pairing.response.produce_pre_pair_no_keys"
+    },
+    {
+      "rust": "primitives::pairing::response::process_pre_pair_no_keys",
+      "ffi": "process_pre_pair_no_keys_response_message",
+      "wasm": "pairing_response_process_pre_pair_no_keys",
+      "dotnet": "Pairing.Response.ProcessPrePairNoKeys",
+      "go": "pairing.Response.ProcessPrePairNoKeys",
+      "ts": "primitives.pairing.response.process_pre_pair_no_keys"
+    },
+    {
+      "rust": "primitives::recovery::request::produce",
+      "ffi": "produce_get_share_request_message",
+      "wasm": "recovery_request_produce",
+      "dotnet": "Recovery.Request.Produce",
+      "go": "recovery.Request.Produce",
+      "ts": "primitives.recovery.request.produce"
+    },
+    {
+      "rust": "primitives::recovery::request::extract",
+      "ffi": "extract_get_share_request",
+      "wasm": "recovery_request_extract",
+      "dotnet": "Recovery.Request.Extract",
+      "go": "recovery.Request.Extract",
+      "ts": "primitives.recovery.request.extract"
+    },
+    {
+      "rust": "primitives::recovery::response::produce",
+      "ffi": "produce_get_share_response_message",
+      "wasm": "recovery_response_produce",
+      "dotnet": "Recovery.Response.Produce",
+      "go": "recovery.Response.Produce",
+      "ts": "primitives.recovery.response.produce"
+    },
+    {
+      "rust": "primitives::recovery::response::extract",
+      "ffi": "extract_get_share_response",
+      "wasm": "recovery_response_extract",
+      "dotnet": "Recovery.Response.Extract",
+      "go": "recovery.Response.Extract",
+      "ts": "primitives.recovery.response.extract"
+    },
+    {
+      "rust": "primitives::recovery::response::recover",
+      "ffi": "recover_from_share_responses",
+      "wasm": "recovery_response_recover",
+      "dotnet": "Recovery.Response.Recover",
+      "go": "recovery.Response.Recover",
+      "ts": "primitives.recovery.response.recover"
+    },
+    {
+      "rust": "primitives::sharing::request::split",
+      "ffi": "protect_secret",
+      "wasm": "sharing_request_split",
+      "dotnet": "Sharing.Request.Split",
+      "go": "sharing.Request.Split",
+      "ts": "primitives.sharing.request.split"
+    },
+    {
+      "rust": "primitives::sharing::request::produce",
+      "ffi": "produce_store_share_request_message",
+      "wasm": "sharing_request_produce",
+      "dotnet": "Sharing.Request.Produce",
+      "go": "sharing.Request.Produce",
+      "ts": "primitives.sharing.request.produce"
+    },
+    {
+      "rust": "primitives::sharing::request::extract",
+      "ffi": "extract_store_share_request",
+      "wasm": "sharing_request_extract",
+      "dotnet": "Sharing.Request.Extract",
+      "go": "sharing.Request.Extract",
+      "ts": "primitives.sharing.request.extract"
+    },
+    {
+      "rust": "primitives::sharing::response::produce",
+      "ffi": "produce_store_share_response_message",
+      "wasm": "sharing_response_produce",
+      "dotnet": "Sharing.Response.Produce",
+      "go": "sharing.Response.Produce",
+      "ts": "primitives.sharing.response.produce"
+    },
+    {
+      "rust": "primitives::sharing::response::extract",
+      "ffi": "extract_store_share_response",
+      "wasm": "sharing_response_extract",
+      "dotnet": "Sharing.Response.Extract",
+      "go": "sharing.Response.Extract",
+      "ts": "primitives.sharing.response.extract"
+    },
+    {
+      "rust": "primitives::sharing::response::process",
+      "ffi": "process_store_share_response_message",
+      "wasm": "sharing_response_process",
+      "dotnet": "Sharing.Response.Process",
+      "go": "sharing.Response.Process",
+      "ts": "primitives.sharing.response.process"
+    },
+    {
+      "rust": "primitives::unpairing::request::produce",
+      "ffi": "produce_unpair_request_message",
+      "wasm": "unpairing_request_produce",
+      "dotnet": "Unpairing.Request.Produce",
+      "go": "unpairing.Request.Produce",
+      "ts": "primitives.unpairing.request.produce"
+    },
+    {
+      "rust": "primitives::unpairing::request::extract",
+      "ffi": "extract_unpair_request",
+      "wasm": "unpairing_request_extract",
+      "dotnet": "Unpairing.Request.Extract",
+      "go": "unpairing.Request.Extract",
+      "ts": "primitives.unpairing.request.extract"
+    },
+    {
+      "rust": "primitives::unpairing::response::produce",
+      "ffi": "produce_unpair_response_message",
+      "wasm": "unpairing_response_produce",
+      "dotnet": "Unpairing.Response.Produce",
+      "go": "unpairing.Response.Produce",
+      "ts": "primitives.unpairing.response.produce"
+    },
+    {
+      "rust": "primitives::unpairing::response::extract",
+      "ffi": "extract_unpair_response",
+      "wasm": "unpairing_response_extract",
+      "dotnet": "Unpairing.Response.Extract",
+      "go": "unpairing.Response.Extract",
+      "ts": "primitives.unpairing.response.extract"
+    },
+    {
+      "rust": "primitives::unpairing::response::process",
+      "ffi": "process_unpair_response_message",
+      "wasm": "unpairing_response_process",
+      "dotnet": "Unpairing.Response.Process",
+      "go": "unpairing.Response.Process",
+      "ts": "primitives.unpairing.response.process"
+    },
+    {
+      "rust": "primitives::verification::request::produce",
+      "ffi": "produce_verify_share_request_message",
+      "wasm": "verification_request_produce",
+      "dotnet": "Verification.Request.Produce",
+      "go": "verification.Request.Produce",
+      "ts": "primitives.verification.request.produce"
+    },
+    {
+      "rust": "primitives::verification::request::extract",
+      "ffi": "extract_verify_share_request",
+      "wasm": "verification_request_extract",
+      "dotnet": "Verification.Request.Extract",
+      "go": "verification.Request.Extract",
+      "ts": "primitives.verification.request.extract"
+    },
+    {
+      "rust": "primitives::verification::response::produce",
+      "ffi": "produce_verify_share_response_message",
+      "wasm": "verification_response_produce",
+      "dotnet": "Verification.Response.Produce",
+      "go": "verification.Response.Produce",
+      "ts": "primitives.verification.response.produce"
+    },
+    {
+      "rust": "primitives::verification::response::extract",
+      "ffi": "extract_verify_share_response",
+      "wasm": "verification_response_extract",
+      "dotnet": "Verification.Response.Extract",
+      "go": "verification.Response.Extract",
+      "ts": "primitives.verification.response.extract"
+    },
+    {
+      "rust": "primitives::verification::response::process",
+      "ffi": "process_verify_share_response_message",
+      "wasm": "verification_response_process",
+      "dotnet": "Verification.Response.Process",
+      "go": "verification.Response.Process",
+      "ts": "primitives.verification.response.process"
+    },
+    {
+      "rust": "derec_message::apply_trace_id",
+      "ffi": "apply_trace_id_to_envelope",
+      "wasm": "envelope_apply_trace_id",
+      "dotnet": "Envelope.ApplyTraceId",
+      "go": "envelope.ApplyTraceID",
+      "ts": "envelope.apply_trace_id"
+    },
+    {
+      "rust": "derec_message::read_trace_id",
+      "ffi": "read_trace_id_from_envelope",
+      "wasm": "envelope_read_trace_id",
+      "dotnet": "Envelope.ReadTraceId",
+      "go": "envelope.ReadTraceID",
+      "ts": "envelope.read_trace_id"
+    }
+  ],
+  "records": [
+    {
+      "what": "Share",
+      "rust_file": "library/src/protocol/types/mod.rs",
+      "rust": "Share",
+      "dotnet": "Share",
+      "go": "Share",
+      "ts": "Share"
+    },
+    {
+      "what": "UserSecrets",
+      "rust_file": "library/src/protocol/types/mod.rs",
+      "rust": "UserSecrets",
+      "dotnet": "UserSecrets",
+      "go": "UserSecrets",
+      "ts": "UserSecrets"
+    },
+    {
+      "what": "UserSecretEntry",
+      "rust_file": "library/src/protocol/types/secret/model.rs",
+      "rust": "UserSecret",
+      "dotnet": "UserSecretEntry",
+      "go": "UserSecret",
+      "ts": "UserSecretEntry"
+    },
+    {
+      "what": "ChannelFilter",
+      "rust_file": "library/src/protocol/types/mod.rs",
+      "rust": "ChannelFilter",
+      "dotnet": "ChannelFilter",
+      "go": "HelperFilter",
+      "ts": "ChannelFilter"
+    },
+    {
+      "what": "PairingParams",
+      "rust_file": "library/src/interop/ffi/protocol/flow.rs",
+      "rust": "PairingParamsJson",
+      "dotnet": "PairingParams",
+      "go": "PairingParams",
+      "ts": "PairingParams"
+    },
+    {
+      "what": "DiscoveryParams",
+      "rust_file": "library/src/interop/ffi/protocol/flow.rs",
+      "rust": "DiscoveryParamsJson",
+      "dotnet": "DiscoveryParams",
+      "go": "DiscoveryParams",
+      "ts": "DiscoveryParams"
+    },
+    {
+      "what": "ProtectSecretParams",
+      "rust_file": "library/src/interop/ffi/protocol/flow.rs",
+      "rust": "ProtectSecretParamsJson",
+      "dotnet": "ProtectSecretParams",
+      "go": "ProtectSecretParams",
+      "ts": "ProtectSecretParams"
+    },
+    {
+      "what": "UserSecret",
+      "rust_file": "library/src/interop/ffi/protocol/flow.rs",
+      "rust": "UserSecretJson",
+      "dotnet": "UserSecret",
+      "go": "UserSecret",
+      "ts": "UserSecret"
+    },
+    {
+      "what": "VerifySharesParams",
+      "rust_file": "library/src/interop/ffi/protocol/flow.rs",
+      "rust": "VerifySharesParamsJson",
+      "dotnet": "VerifySharesParams",
+      "go": "VerifySharesParams",
+      "ts": "VerifySharesParams"
+    },
+    {
+      "what": "RecoverSecretParams",
+      "rust_file": "library/src/interop/ffi/protocol/flow.rs",
+      "rust": "RecoverSecretParamsJson",
+      "dotnet": "RecoverSecretParams",
+      "go": "RecoverSecretParams",
+      "ts": "RecoverSecretParams"
+    },
+    {
+      "what": "UnpairParams",
+      "rust_file": "library/src/interop/ffi/protocol/flow.rs",
+      "rust": "UnpairParamsJson",
+      "dotnet": "UnpairParams",
+      "go": "UnpairParams",
+      "ts": "UnpairParams"
+    },
+    {
+      "what": "UpdateChannelInfoParams",
+      "rust_file": "library/src/interop/ffi/protocol/flow.rs",
+      "rust": "UpdateChannelInfoParamsJson",
+      "dotnet": "UpdateChannelInfoParams",
+      "go": "UpdateChannelInfoParams",
+      "ts": "UpdateChannelInfoParams"
+    },
+    {
+      "what": "TransportProtocolParam",
+      "rust_file": "library/src/interop/ffi/protocol/flow.rs",
+      "rust": "TransportProtocolJson",
+      "dotnet": "TransportProtocolDto",
+      "go": "TransportProtocolParam",
+      "ts": "Endpoint"
+    },
+    {
+      "what": "ReplicaDiscoveryParams",
+      "rust_file": null,
+      "rust": null,
+      "dotnet": "ReplicaDiscoveryParams",
+      "go": "ReplicaDiscoveryParams",
+      "ts": "ReplicaDiscoveryParams"
+    },
+    {
+      "what": "UnpairReplicaParams",
+      "rust_file": "library/src/interop/ffi/protocol/flow.rs",
+      "rust": "Params",
+      "dotnet": "UnpairReplicaParams",
+      "go": "UnpairReplicaParams",
+      "ts": "UnpairReplicaParams"
+    },
+    {
+      "what": "AutoAcceptPolicy",
+      "rust_file": "library/src/interop/ffi/protocol/handle/mod.rs",
+      "rust": "AutoAcceptConfig",
+      "dotnet": "AutoAcceptPolicy",
+      "go": "AutoAcceptPolicy",
+      "ts": "AutoAcceptPolicy"
+    },
+    {
+      "what": "Timeouts",
+      "rust_file": "library/src/interop/ffi/protocol/handle/mod.rs",
+      "rust": "TimeoutsConfig",
+      "dotnet": "Timeouts",
+      "go": "Timeouts",
+      "ts": "Timeouts"
+    },
+    {
+      "what": "RemoveExpiredChannelsPolicy",
+      "rust_file": "library/src/interop/ffi/protocol/handle/mod.rs",
+      "rust": "RemoveExpiredChannelsConfig",
+      "dotnet": "RemoveExpiredChannelsPolicy",
+      "go": "RemoveExpiredChannelsPolicy",
+      "ts": null
+    },
+    {
+      "what": "ParameterRange",
+      "rust_file": "library/src/interop/ffi/protocol/handle/mod.rs",
+      "rust": "ParameterRangeConfig",
+      "dotnet": "ParameterRange",
+      "go": "ParameterRange",
+      "ts": "ParameterRange"
     }
   ],
   "documented_api": {
@@ -449,13 +1225,21 @@
         "variant": "NoCommonTransport",
         "replaced_by": "NoUsableEndpoint",
         "why": "Renamed to `NoUsableEndpoint { offered }` in 0.0.3. Explaining the rename is the one legitimate reason to write a variant that no longer exists, so `replaced_by` must appear in the same paragraph — an entry that names the old spelling and not the new one is describing it as current, which is the defect this guards."
+      },
+      {
+        "enum": "TransportValidationError",
+        "variant": "UnknownProtocol",
+        "replaced_by": "UnsupportedProtocol",
+        "why": "Deprecated in 0.0.3 and removed in 0.0.6. The 0.0.3 entry that deprecated it names the replacement alongside it."
+      },
+      {
+        "enum": "Error",
+        "variant": "ConflictingPlaintextOptIn",
+        "replaced_by": "unsafe_connection",
+        "why": "Existed only to reconcile `unsafe_http` with `unsafe_connection`; removed in 0.0.6 with `unsafe_http`. The entry that introduced it names the flag that remains."
       }
     ],
-    "deprecation_horizon": {
-      "since": "0.0.3",
-      "removed_at": "0.0.5",
-      "$note": "One horizon for the whole wave, stated once in the changelog rather than repeated per symbol. A symbol that genuinely needs longer goes in `exceptions` with the reason.",
-      "exceptions": []
-    }
+    "$deprecation_horizon_note": "The open deprecation wave: `since`, `removed_at` and any `exceptions`. `null` means no wave is open, and then no `#[deprecated]` may exist in the library — a deprecation is only ever introduced together with the horizon it is removed at.",
+    "deprecation_horizon": null
   }
 }

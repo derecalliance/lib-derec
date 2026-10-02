@@ -4,7 +4,6 @@
 use crate::extensions::advertised_endpoints::AdvertisedEndpoints as _;
 use crate::extensions::contact_message::ContactMessageExt as _;
 use crate::extensions::pair_request::PairRequestMessageExt as _;
-use crate::extensions::pre_pair_request::PrePairRequestMessageExt as _;
 use crate::extensions::transport_protocol::TransportProtocolExt as _;
 use crate::primitives::pairing::PairingError;
 use crate::utils::verify_timestamps;
@@ -66,7 +65,8 @@ pub struct PrePairExtractResult {
 /// In DeRec, pairing begins with an **out-of-band contact transfer** (typically QR or
 /// another side channel). Unlike normal DeRec protocol traffic, the contact message is
 /// **not wrapped in a `DeRecMessage` envelope** and is **not encrypted**. It is sent as
-/// plain protobuf bytes (serialize the returned `contact_message` with `.encode_to_vec()`).
+/// plain protobuf bytes: serialize the returned `contact_message` with [`encode_contact`],
+/// and the recipient turns the bytes back into a contact with [`decode_contact`].
 ///
 /// Single entry point for all three `contact_mode` variants. Mode-specific
 /// assembly happens in private helpers (`create_contact_inlined_keys`,
@@ -98,7 +98,7 @@ pub struct PrePairExtractResult {
 ///
 /// [`CreateContactResult`] with:
 ///
-/// - `contact_message`: decoded [`ContactMessage`] — serialize with `.encode_to_vec()`
+/// - `contact_message`: decoded [`ContactMessage`] — serialize with [`encode_contact`]
 ///   before sending out-of-band.
 /// - `secret_key`: `Some(...)` for `InlineKeys` and `HashedKeys` (must be persisted);
 ///   `None` for `NoKeys` (no key material at contact-creation time).
@@ -106,15 +106,10 @@ pub struct PrePairExtractResult {
 /// # Transport ordering
 ///
 /// `own` carries every endpoint this application serves, in its own
-/// preference order. The whole list travels in `supported_transports`;
-/// the first entry is additionally copied into the legacy singular
-/// `transport_protocol` field so peers predating the offer list still
-/// find an endpoint to reach.
+/// preference order. The whole list travels in `supported_transports`.
 ///
 /// The order is the application's to choose and is never reinterpreted
-/// here. An application that needs to pair with peers predating gRPC
-/// support puts an HTTPS endpoint first, because those peers understand
-/// no other protocol discriminant.
+/// here.
 ///
 /// # Errors
 ///
@@ -198,6 +193,68 @@ pub fn create_contact(
     })
 }
 
+/// Serializes a [`ContactMessage`] to the protobuf bytes delivered out of band
+/// (typically as a QR code).
+///
+/// The contact is checked against the invariants of its declared
+/// [`ContactMode`] before it is encoded, so a contact this side could not have
+/// produced with [`create_contact`] never leaves the device:
+///
+/// - [`ContactMode::InlineKeys`]: both public keys present and non-empty, no
+///   binding hash.
+/// - [`ContactMode::HashedKeys`]: a SHA-384 binding hash, no inline keys.
+/// - [`ContactMode::NoKeys`]: neither keys nor a binding hash.
+///
+/// The contact must also advertise at least one transport endpoint.
+///
+/// # Errors
+///
+/// - [`PairingError::InvalidContactMessage`] if the contact violates any of the
+///   invariants above, including an unknown `contact_mode`.
+///
+/// # Example
+///
+/// ```
+/// use derec_library::primitives::pairing::request;
+/// use derec_library::types::ChannelId;
+/// use derec_proto::{ContactMode, Protocol, TransportProtocol};
+///
+/// let request::CreateContactResult { contact_message, .. } = request::create_contact(
+///     ChannelId(42),
+///     ContactMode::InlineKeys,
+///     vec![TransportProtocol {
+///         uri: "https://relay.example/derec".to_owned(),
+///         protocol: Protocol::Https.into(),
+///     }],
+///     None,
+/// ).expect("create_contact failed");
+///
+/// let bytes = request::encode_contact(&contact_message).expect("encode_contact failed");
+/// assert_eq!(request::decode_contact(&bytes).expect("decode_contact failed"), contact_message);
+/// ```
+pub fn encode_contact(contact_message: &ContactMessage) -> Result<Vec<u8>, crate::Error> {
+    contact_message.validate()?;
+    Ok(contact_message.encode_to_vec())
+}
+
+/// Parses the out-of-band bytes produced by [`encode_contact`] back into the
+/// [`ContactMessage`] the scanner pairs against.
+///
+/// The decoded contact is held to the same per-[`ContactMode`] invariants
+/// [`encode_contact`] enforces, so a contact this returns is safe to hand to
+/// [`produce`] or [`produce_pre_pair_request`].
+///
+/// # Errors
+///
+/// - [`crate::Error::ProtobufDecode`] if the bytes are not a `ContactMessage`.
+/// - [`PairingError::InvalidContactMessage`] if the decoded contact violates the
+///   invariants of its declared mode.
+pub fn decode_contact(bytes: &[u8]) -> Result<ContactMessage, crate::Error> {
+    let contact_message = ContactMessage::decode(bytes).map_err(crate::Error::ProtobufDecode)?;
+    contact_message.validate()?;
+    Ok(contact_message)
+}
+
 /// Produces a pairing request [`derec_proto::DeRecMessage`] envelope, continuing the DeRec
 /// pairing flow.
 ///
@@ -256,6 +313,11 @@ pub fn create_contact(
 ///
 /// - The `contact_message` is peer-provided data; validate all required fields before use.
 /// - The returned secret key material must be securely retained by the responder.
+/// - The envelope is encrypted to the contact creator's ECIES public key, taken
+///   from the contact, so only the holder of the matching secret key can read
+///   it. The responder's own freshly generated public key travels inside the
+///   request, in `ecies_public_key`, for the creator to complete the key
+///   agreement; it is not the key the envelope is encrypted to.
 ///
 /// # Example
 ///
@@ -293,16 +355,12 @@ pub fn create_contact(
 /// # Transport ordering
 ///
 /// `own` carries every endpoint this application serves, in its own
-/// preference order. The whole list travels in `supported_transports`;
-/// the first entry is additionally copied into the legacy singular
-/// `transport_protocol` field so peers predating the offer list still
-/// find an endpoint to reach. The order is never reinterpreted here.
+/// preference order. The whole list travels in `supported_transports`.
+/// The order is never reinterpreted here.
 #[cfg_attr(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = contact_message.channel_id, kind = kind as i32))
 )]
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 pub fn produce(
     kind: SenderKind,
     own: Vec<TransportProtocol>,
@@ -334,16 +392,10 @@ pub fn produce(
         nonce: contact_message.nonce,
         communication_info,
         parameter_range,
-        transport_protocol: Some(transport_protocol),
         timestamp: Some(timestamp),
         supported_transports: own,
     };
 
-    // Encrypt with the INITIATOR's ECIES public key (from the contact) —
-    // only the initiator's matching secret key can decrypt. The
-    // responder's own freshly-generated pubkey travels in
-    // `request.ecies_public_key` (above) for the initiator to ECDH against
-    // when finishing the pairing; it is NOT the encryption key here.
     let envelope = DeRecMessageBuilder::pairing()
         .channel_id(contact_message.channel_id.into())
         .timestamp(timestamp)
@@ -419,8 +471,6 @@ pub fn produce(
     feature = "logging",
     tracing::instrument(skip_all, fields(channel_id = contact_message.channel_id))
 )]
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 pub fn produce_pre_pair_request(
     own: Vec<TransportProtocol>,
     contact_message: &ContactMessage,
@@ -431,15 +481,12 @@ pub fn produce_pre_pair_request(
 
         crate::Error::from(PairingError::EmptyTransportUri)
     })?;
+
     validate_pre_pair_inputs(primary, contact_message)?;
 
     let timestamp = current_timestamp();
     let request = PrePairRequestMessage {
         nonce: contact_message.nonce,
-        // The first entry also fills the deprecated singular field so a
-        // responder predating `supportedTransports` still knows where to
-        // reply. Same rule `create_contact` follows.
-        transport_protocol: own.first().cloned(),
         supported_transports: own,
         timestamp: Some(timestamp),
     };
@@ -483,12 +530,21 @@ pub fn produce_pre_pair_request(
 /// * `ecies_secret_key` - The initiator's ECIES secret key. Must correspond to the
 ///   `ecies_public_key` the initiator published in their [`derec_proto::ContactMessage`],
 ///   which is the key used by [`produce`] to encrypt the inner request.
+/// * `parameter_range` - The [`derec_proto::ParameterRange`] this side accepts, the same
+///   value it will pass to [`super::response::produce`]. `None` declares no constraints.
 ///
 /// # Returns
 ///
 /// On success returns [`ExtractResult`] containing:
 ///
 /// - `request`: the decrypted inner [`derec_proto::PairRequestMessage`]
+///
+/// # Parameter-range compatibility
+///
+/// The requester's advertised range is checked against `parameter_range` here, before
+/// the request is handed to the application, so a pairing the two sides could never
+/// agree on is refused before anyone is asked to confirm it. The protocol answers such
+/// a request with a `PairResponse` carrying status `INCOMPATIBLE_PARAMETER_RANGE`.
 ///
 /// # Errors
 ///
@@ -499,6 +555,8 @@ pub fn produce_pre_pair_request(
 /// - the decrypted bytes cannot be decoded as a [`derec_proto::PairRequestMessage`]
 /// - `envelope.timestamp != request.timestamp`
 /// - the inner message is not a [`derec_proto::PairRequestMessage`]
+/// - [`PairingError::IncompatibleParameterRange`] if the requester's advertised range
+///   and `parameter_range` do not overlap on some field
 ///
 /// # Security: no freshness or replay protection
 ///
@@ -549,7 +607,7 @@ pub fn produce_pre_pair_request(
 ///
 /// // Initiator: decrypt the pairing request with the ECIES secret key.
 /// let request::ExtractResult { request: pair_request } =
-///     request::extract(&envelope, initiator_key.as_ref().unwrap().ecies_secret_key())
+///     request::extract(&envelope, initiator_key.as_ref().unwrap().ecies_secret_key(), None)
 ///         .expect("extract failed");
 ///
 /// assert_eq!(pair_request.nonce, contact_message.nonce);
@@ -558,11 +616,10 @@ pub fn produce_pre_pair_request(
     feature = "logging",
     tracing::instrument(skip_all, fields(envelope_len = envelope_bytes.len()))
 )]
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 pub fn extract(
     envelope_bytes: &[u8],
     ecies_secret_key: &[u8],
+    parameter_range: Option<&derec_proto::ParameterRange>,
 ) -> Result<ExtractResult, crate::Error> {
     let envelope = DeRecMessage::decode(envelope_bytes).map_err(crate::Error::ProtobufDecode)?;
 
@@ -586,20 +643,9 @@ pub fn extract(
 
     verify_timestamps(envelope.timestamp, request.timestamp)?;
 
-    // Structural validation at the parse boundary, so a malformed request is
-    // refused where it enters rather than wherever it is first read. This is
-    // the same check `response::produce` runs; applying it here means the FFI
-    // and every SDK above it inherit it without repeating the logic.
-    //
-    // Endpoint *quality* is deliberately not decided here: a peer may
-    // advertise several, and `TransportPolicy::admit_peer_endpoints` skips a
-    // bad one rather than refusing the whole request. Only the singular
-    // legacy field is structurally checked, exactly as before.
     request.validate()?;
 
-    if let Some(tp) = request.transport_protocol.as_ref() {
-        tp.validate()?;
-    }
+    check_parameter_range(&request, parameter_range)?;
 
     #[cfg(feature = "logging")]
     tracing::info!("pairing request extracted and validated");
@@ -669,16 +715,24 @@ pub fn extract_pre_pair(envelope_bytes: &[u8]) -> Result<PrePairExtractResult, c
 
     verify_timestamps(envelope.timestamp, request.timestamp)?;
 
-    request.validate()?;
-
     #[cfg(feature = "logging")]
     tracing::info!("PrePair request envelope decoded and validated");
 
     Ok(PrePairExtractResult { request })
 }
 
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
+/// Refuses a `PairRequest` whose advertised range does not overlap `local`.
+///
+/// Shared by [`extract`] and the protocol's own `PairRequest` handling, which
+/// decrypts through a generic path and so never calls [`extract`]; both refuse
+/// at the same point, before the request reaches the application.
+pub(crate) fn check_parameter_range(
+    request: &PairRequestMessage,
+    local: Option<&derec_proto::ParameterRange>,
+) -> Result<(), PairingError> {
+    super::parameter_range::check_compatibility(local, request.parameter_range.as_ref())
+}
+
 fn validate_inputs(
     transport_protocol: &TransportProtocol,
     contact_message: &ContactMessage,
@@ -692,14 +746,11 @@ fn validate_inputs(
     }
     transport_protocol.validate()?;
 
-    // `validate` already refused a contact naming no endpoint at all, in
-    // either spelling. What remains is checking that what it does name is
-    // structurally sound.
-    super::validate_contact_for_mode(contact_message, expected_mode)?;
+    // `validate_for_mode` already refused a contact naming no endpoint at
+    // all. What remains is checking that what it does name is structurally
+    // sound.
+    contact_message.validate_for_mode(expected_mode)?;
 
-    // Read whichever spelling the contact used. A contact carrying only
-    // `supportedTransports` is valid: requiring the deprecated singular
-    // field would refuse a peer that has already moved past it.
     for endpoint in contact_message.advertised_endpoints() {
         if endpoint.uri.trim().is_empty() {
             #[cfg(feature = "logging")]

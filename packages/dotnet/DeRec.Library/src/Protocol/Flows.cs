@@ -149,7 +149,7 @@ public sealed record ProtectSecretParams
 /// <summary>Params for <see cref="FlowKind.VerifyShares"/>.</summary>
 public sealed record VerifySharesParams
 {
-    [JsonPropertyName("secret_id")] public required string SecretId { get; init; }
+    [JsonPropertyName("secret_id"), JsonNumberHandling(JsonNumberHandling.AllowReadingFromString | JsonNumberHandling.WriteAsString)] public required ulong SecretId { get; init; }
     [JsonPropertyName("version")] public required uint Version { get; init; }
     [JsonPropertyName("target")] public Target? Target { get; init; }
 }
@@ -157,14 +157,14 @@ public sealed record VerifySharesParams
 /// <summary>Params for <see cref="FlowKind.RecoverSecret"/>.</summary>
 public sealed record RecoverSecretParams
 {
-    [JsonPropertyName("secret_id")] public required string SecretId { get; init; }
+    [JsonPropertyName("secret_id"), JsonNumberHandling(JsonNumberHandling.AllowReadingFromString | JsonNumberHandling.WriteAsString)] public required ulong SecretId { get; init; }
     [JsonPropertyName("version")] public required uint Version { get; init; }
 }
 
 /// <summary>Params for <see cref="FlowKind.Unpair"/>.</summary>
 public sealed record UnpairParams
 {
-    [JsonPropertyName("channel_id")] public required string ChannelId { get; init; }
+    [JsonPropertyName("channel_id"), JsonNumberHandling(JsonNumberHandling.AllowReadingFromString | JsonNumberHandling.WriteAsString)] public required ulong ChannelId { get; init; }
     [JsonPropertyName("memo")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Memo { get; init; }
@@ -177,19 +177,6 @@ public sealed record UpdateChannelInfoParams
     [JsonPropertyName("communication_info")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public Dictionary<string, string>? CommunicationInfo { get; init; }
-    /// <summary>
-    /// Replaces the target(s)' view of this node's transport endpoint.
-    /// </summary>
-    /// <remarks>
-    /// Superseded by <see cref="OwnTransports"/>, which carries every
-    /// endpoint rather than one. Scheduled for removal in v0.0.5;
-    /// <see cref="OwnTransports"/> takes precedence when both are set.
-    /// </remarks>
-    [Obsolete("Superseded by OwnTransports. Scheduled for removal in v0.0.5.")]
-    [JsonPropertyName("transport_protocol")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public TransportProtocolDto? TransportProtocol { get; init; }
-
     /// <summary>
     /// Every endpoint this node now serves, in its own preference order.
     /// Empty leaves the target(s)' stored set untouched.
@@ -220,12 +207,9 @@ public sealed record ReplicaDiscoveryParams;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <see cref="ReplicaId"/> is a <b>decimal</b> string — the same form
-/// <c>ReplicaPairedEvent.PeerReplicaId</c> hands back, and the form every
-/// other id takes across this boundary. A string rather than a
-/// <see cref="ulong"/> so values above 2^53 survive the JSON round trip
-/// through hosts whose numbers are doubles. Naming no current member is
-/// rejected, not silently ignored.
+/// <see cref="ReplicaId"/> is the member's <c>replica_id</c>, as
+/// <c>ReplicaPairedEvent.PeerReplicaId</c> hands it back. Naming no current
+/// member is rejected, not silently ignored.
 /// </para>
 /// <para>
 /// <b>Starting this flow removes nothing on its own</b> and emits no
@@ -239,7 +223,7 @@ public sealed record ReplicaDiscoveryParams;
 /// </remarks>
 public sealed record UnpairReplicaParams
 {
-    [JsonPropertyName("replica_id")] public required string ReplicaId { get; init; }
+    [JsonPropertyName("replica_id"), JsonNumberHandling(JsonNumberHandling.AllowReadingFromString | JsonNumberHandling.WriteAsString)] public required ulong ReplicaId { get; init; }
 
     [JsonPropertyName("memo")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -273,7 +257,7 @@ public sealed record PairingCompletedEvent : DeRecEvent
     /// of the handshake. All post-pairing traffic and library state keys on
     /// this value.
     /// </summary>
-    public required string ChannelId { get; init; }
+    public required ulong ChannelId { get; init; }
 
     /// <summary>
     /// Transient <c>channel_id</c> that traveled on the <c>ContactMessage</c>
@@ -281,22 +265,21 @@ public sealed record PairingCompletedEvent : DeRecEvent
     /// this event fires — provided so applications that persisted it can
     /// rekey their own records.
     /// </summary>
-    public required string PairingChannelId { get; init; }
+    public required ulong PairingChannelId { get; init; }
     public required Pairing.SenderKind Kind { get; init; }
     public Dictionary<string, string> PeerCommunicationInfo { get; init; } = new();
 }
 
 /// <summary>
 /// Fired alongside <see cref="PairingCompletedEvent"/> on replica-mode
-/// pairings. Carries the peer's <c>replica_id</c> as a decimal-encoded
-/// string.
+/// pairings. Carries the peer's <c>replica_id</c>.
 /// </summary>
 public sealed record ReplicaPairedEvent : DeRecEvent
 {
     public override string EventType => "ReplicaPaired";
 
-    public required string ChannelId { get; init; }
-    public required string PeerReplicaId { get; init; }
+    public required ulong ChannelId { get; init; }
+    public required ulong PeerReplicaId { get; init; }
 }
 
 /// <summary>
@@ -310,32 +293,90 @@ public sealed record ActionRequiredEvent : DeRecEvent
 {
     public override string EventType => "ActionRequired";
 
-    public required string ChannelId { get; init; }
+    public required ulong ChannelId { get; init; }
 
     /// <summary>Opaque PendingAction bytes — round-trip verbatim.</summary>
     public required byte[] Action { get; init; }
+
+    /// <summary>Which request is awaiting consent; one of the
+    /// <see cref="PendingActionKind"/> constants.</summary>
+    public required string ActionKind { get; init; }
+
+    /// <summary>Correlation token of the inbound request.
+    /// Matches the peer's <c>*Started</c> event for the same round.</summary>
+    public required ulong TraceId { get; init; }
+
+    /// <summary>The peer's communication info (Pairing only; empty otherwise).</summary>
+    public Dictionary<string, string> PeerCommunicationInfo { get; init; } = new();
+
+    /// <summary>The peer's role from its pair request (Pairing only).</summary>
+    public Pairing.SenderKind? SenderKind { get; init; }
+
+    /// <summary>Share version (StoreShare, VerifyShare, GetShare).</summary>
+    public uint? Version { get; init; }
+
+    /// <summary>Description of the secret version (StoreShare only).</summary>
+    public string? ShareDescription { get; init; }
+
+    /// <summary>Secret identifier (StoreShare, VerifyShare,
+    /// GetShare). On GetShare, with <see cref="Version"/>, it names the share
+    /// being asked for.</summary>
+    public ulong? ShareSecretId { get; init; }
+
+    /// <summary>Length in bytes of the share the helper would store
+    /// (StoreShare only) — what a size or quota decision is made on.</summary>
+    public ulong? ShareSize { get; init; }
+
+    /// <summary>The peer's memo (Unpair only).</summary>
+    public string? UnpairMemo { get; init; }
+
+    /// <summary>The communication info accepting would replace the stored map
+    /// with (UpdateChannelInfo only). <c>null</c> leaves it unchanged; an
+    /// empty map clears it.</summary>
+    public Dictionary<string, string>? UpdatedCommunicationInfo { get; init; }
+
+    /// <summary>The endpoints accepting would move the peer to
+    /// (UpdateChannelInfo only). <c>null</c> leaves them unchanged.</summary>
+    public IReadOnlyList<TransportProtocol>? UpdatedTransports { get; init; }
+}
+
+/// <summary>
+/// The label vocabulary for <see cref="ActionRequiredEvent.ActionKind"/> and
+/// <see cref="AutoAcceptedEvent.ActionKind"/>. Matches the Rust
+/// <c>PendingActionKind</c> discriminants one-for-one.
+/// </summary>
+public static class PendingActionKind
+{
+    public const string Pairing = "Pairing";
+    public const string PrePair = "PrePair";
+    public const string StoreShare = "StoreShare";
+    public const string VerifyShare = "VerifyShare";
+    public const string Discovery = "Discovery";
+    public const string GetShare = "GetShare";
+    public const string Unpair = "Unpair";
+    public const string UpdateChannelInfo = "UpdateChannelInfo";
 }
 
 public sealed record ShareStoredEvent : DeRecEvent
 {
     public override string EventType => "ShareStored";
-    public required string ChannelId { get; init; }
+    public required ulong ChannelId { get; init; }
     public required uint Version { get; init; }
 }
 
 public sealed record ShareConfirmedEvent : DeRecEvent
 {
     public override string EventType => "ShareConfirmed";
-    public required string ChannelId { get; init; }
+    public required ulong ChannelId { get; init; }
     public required uint Version { get; init; }
 }
 
 public sealed record ShareRejectedEvent : DeRecEvent
 {
     public override string EventType => "ShareRejected";
-    public required string ChannelId { get; init; }
+    public required ulong ChannelId { get; init; }
     public required uint Version { get; init; }
-    public required int Status { get; init; }
+    public required Org.Derecalliance.Derec.Protobuf.StatusEnum Status { get; init; }
     public required string Memo { get; init; }
 }
 
@@ -371,32 +412,32 @@ public sealed record SharingCompleteEvent : DeRecEvent
 public sealed record ShareVerifiedEvent : DeRecEvent
 {
     public override string EventType => "ShareVerified";
-    public required string ChannelId { get; init; }
+    public required ulong ChannelId { get; init; }
     public required uint Version { get; init; }
 }
 
 public sealed record DiscoveredSecretVersion(uint Version, string Description);
 
-public sealed record DiscoveredSecret(string SecretId, IReadOnlyList<DiscoveredSecretVersion> Versions);
+public sealed record DiscoveredSecret(ulong SecretId, IReadOnlyList<DiscoveredSecretVersion> Versions);
 
 public sealed record SecretsDiscoveredEvent : DeRecEvent
 {
     public override string EventType => "SecretsDiscovered";
-    public required string ChannelId { get; init; }
+    public required ulong ChannelId { get; init; }
     public required IReadOnlyList<DiscoveredSecret> Secrets { get; init; }
 }
 
 public sealed record RecoveryShareReceivedEvent : DeRecEvent
 {
     public override string EventType => "RecoveryShareReceived";
-    public required string ChannelId { get; init; }
+    public required ulong ChannelId { get; init; }
     public required uint SharesReceived { get; init; }
 }
 
 public sealed record RecoveryShareErrorEvent : DeRecEvent
 {
     public override string EventType => "RecoveryShareError";
-    public required string ChannelId { get; init; }
+    public required ulong ChannelId { get; init; }
     public required uint SharesReceived { get; init; }
     public required string Error { get; init; }
 }
@@ -421,41 +462,41 @@ public sealed record SecretRecoveredEvent : DeRecEvent
 public sealed record UnpairedEvent : DeRecEvent
 {
     public override string EventType => "Unpaired";
-    public required string ChannelId { get; init; }
+    public required ulong ChannelId { get; init; }
 }
 
 public sealed record UnpairRejectedEvent : DeRecEvent
 {
     public override string EventType => "UnpairRejected";
-    public required string ChannelId { get; init; }
-    public required int Status { get; init; }
+    public required ulong ChannelId { get; init; }
+    public required Org.Derecalliance.Derec.Protobuf.StatusEnum Status { get; init; }
     public required string Memo { get; init; }
 }
 
 public sealed record PrePairRejectedEvent : DeRecEvent
 {
     public override string EventType => "PrePairRejected";
-    public required string ChannelId { get; init; }
-    public required int Status { get; init; }
+    public required ulong ChannelId { get; init; }
+    public required Org.Derecalliance.Derec.Protobuf.StatusEnum Status { get; init; }
     public required string Memo { get; init; }
 }
 
 public sealed record HelperInfo(
-    [property: JsonPropertyName("channel_id")] string ChannelId,
-    [property: JsonPropertyName("transports")] IReadOnlyList<TransportProtocol> Transports,
+    [property: JsonPropertyName("channel_id"), JsonNumberHandling(JsonNumberHandling.AllowReadingFromString | JsonNumberHandling.WriteAsString)] ulong ChannelId,
+    [property: JsonPropertyName("transports"), JsonConverter(typeof(TransportEndpointListJsonConverter))] IReadOnlyList<TransportProtocol> Transports,
     [property: JsonPropertyName("shared_key")] byte[] SharedKey,
-    [property: JsonPropertyName("communication_info")] Dictionary<string, string> CommunicationInfo);
+    [property: JsonPropertyName("communication_info"), OmitWhenEmpty] Dictionary<string, string> CommunicationInfo);
 
 /// <summary>
-/// One member of the replica group. <c>Role</c> is <c>"Source"</c> or
-/// <c>"Destination"</c>; exactly one member of a group carries
-/// <c>"Source"</c>, and that member is the one the secret originated from.
+/// One member of the replica group. Exactly one member of a group has
+/// <c>Role</c> <see cref="ReplicaRole.Source"/>, and that member is the one
+/// the secret originated from.
 /// </summary>
 public sealed record ReplicaInfo(
-    [property: JsonPropertyName("replica_id")] string ReplicaId,
-    [property: JsonPropertyName("transports")] IReadOnlyList<TransportProtocol> Transports,
-    [property: JsonPropertyName("role")] string Role,
-    [property: JsonPropertyName("communication_info")] Dictionary<string, string> CommunicationInfo);
+    [property: JsonPropertyName("replica_id"), JsonNumberHandling(JsonNumberHandling.AllowReadingFromString | JsonNumberHandling.WriteAsString)] ulong ReplicaId,
+    [property: JsonPropertyName("transports"), JsonConverter(typeof(TransportEndpointListJsonConverter))] IReadOnlyList<TransportProtocol> Transports,
+    [property: JsonPropertyName("role")] ReplicaRole Role,
+    [property: JsonPropertyName("communication_info"), OmitWhenEmpty] Dictionary<string, string> CommunicationInfo);
 
 public sealed record Secret(
     [property: JsonPropertyName("helpers")] IReadOnlyList<HelperInfo> Helpers,
@@ -473,20 +514,31 @@ public sealed record Secret(
 }
 
 public sealed record Replicas(
-    [property: JsonPropertyName("channel_id")] string ChannelId,
+    [property: JsonPropertyName("channel_id"), JsonNumberHandling(JsonNumberHandling.AllowReadingFromString | JsonNumberHandling.WriteAsString)] ulong ChannelId,
     [property: JsonPropertyName("members")] IReadOnlyList<ReplicaInfo> Members,
     [property: JsonPropertyName("shared_key")] byte[] SharedKey);
 
 public sealed record ChannelShare(
-    [property: JsonPropertyName("channel_id")] string ChannelId,
+    [property: JsonPropertyName("channel_id"), JsonNumberHandling(JsonNumberHandling.AllowReadingFromString | JsonNumberHandling.WriteAsString)] ulong ChannelId,
     [property: JsonPropertyName("committed_share")] byte[] CommittedShare);
 
 public sealed record ReplicaSecretReceivedEvent : DeRecEvent
 {
     public override string EventType => "ReplicaSecretReceived";
-    public required string ChannelId { get; init; }
-    public required string FromReplicaId { get; init; }
-    public required string SecretId { get; init; }
+    public required ulong ChannelId { get; init; }
+    /// <summary>
+    /// The member this copy came from: the publisher on a push, the member
+    /// that answered on a catch-up.
+    /// </summary>
+    public required ulong FromReplicaId { get; init; }
+    /// <summary>
+    /// The member that published <see cref="Version"/>, now stored with it.
+    /// Equal to <see cref="FromReplicaId"/> on a push; on a catch-up it names
+    /// the original publisher, or <c>null</c> when the serving
+    /// member's snapshot records no author.
+    /// </summary>
+    public ulong? AuthorReplicaId { get; init; }
+    public required ulong SecretId { get; init; }
     public required uint Version { get; init; }
     public required Secret Secret { get; init; }
     public required IReadOnlyList<ChannelShare> Shares { get; init; }
@@ -499,7 +551,7 @@ public sealed record ReplicaSecretReceivedEvent : DeRecEvent
 public sealed record ReplicaRemovedEvent : DeRecEvent
 {
     public override string EventType => "ReplicaRemoved";
-    public required string ReplicaId { get; init; }
+    public required ulong ReplicaId { get; init; }
 }
 
 /// <summary>
@@ -511,7 +563,7 @@ public sealed record ReplicaRemovedEvent : DeRecEvent
 public sealed record ReplicaSourceChangedEvent : DeRecEvent
 {
     public override string EventType => "ReplicaSourceChanged";
-    public required string ReplicaId { get; init; }
+    public required ulong ReplicaId { get; init; }
 }
 
 /// <summary>
@@ -534,7 +586,7 @@ public sealed record ReplicaDiscoveryCompleteEvent : DeRecEvent
     public override string EventType => "ReplicaDiscoveryComplete";
     public required uint LocalVersion { get; init; }
     public required uint GroupVersion { get; init; }
-    public string? FetchedFrom { get; init; }
+    public ulong? FetchedFrom { get; init; }
 }
 
 /// <summary>
@@ -547,12 +599,62 @@ public sealed record ReplicaDiscoveryCompleteEvent : DeRecEvent
 public sealed record ReplicaSecretInstalledEvent : DeRecEvent
 {
     public override string EventType => "ReplicaSecretInstalled";
-    public required string ChannelId { get; init; }
-    public required string FromReplicaId { get; init; }
-    public required string SecretId { get; init; }
+    public required ulong ChannelId { get; init; }
+    /// <summary>
+    /// The member this copy came from, as on
+    /// <see cref="ReplicaSecretReceivedEvent.FromReplicaId"/>.
+    /// </summary>
+    public required ulong FromReplicaId { get; init; }
+    /// <summary>
+    /// The member that published <see cref="Version"/>, as on
+    /// <see cref="ReplicaSecretReceivedEvent.AuthorReplicaId"/>.
+    /// </summary>
+    public ulong? AuthorReplicaId { get; init; }
+    public required ulong SecretId { get; init; }
     public required uint Version { get; init; }
     public required Secret Secret { get; init; }
     public required IReadOnlyList<ChannelShare> Shares { get; init; }
+}
+
+/// <summary>
+/// A member offered a different copy of the version this device holds.
+/// <para>
+/// Two members published the same version independently — each derives the
+/// next version from what it held, so concurrent changes collide. Nothing was
+/// written; this device keeps its own copy and refused the incoming one with
+/// <c>VERSION_CONFLICT</c>, so the publisher sees
+/// <see cref="ReplicaSyncRejectedEvent"/>.
+/// </para>
+/// <para>
+/// The application resolves the conflict. The held copy is in the local
+/// stores; the incoming one is <see cref="Secret"/>. Publishing the resolved
+/// state with <c>FlowKind.ProtectSecret</c> writes the next version, which
+/// supersedes both on every member and helper.
+/// </para>
+/// </summary>
+public sealed record ReplicaVersionConflictEvent : DeRecEvent
+{
+    public override string EventType => "ReplicaVersionConflict";
+    /// <summary>The channel the copy arrived on.</summary>
+    public required ulong ChannelId { get; init; }
+    /// <summary>The member this copy came from.</summary>
+    public required ulong FromReplicaId { get; init; }
+    /// <summary><c>secret_id</c> of the incoming copy.</summary>
+    public required ulong SecretId { get; init; }
+    /// <summary>The contested version.</summary>
+    public required uint Version { get; init; }
+    /// <summary>
+    /// Who published the copy this device holds, or <c>null</c> when its
+    /// snapshot records no author.
+    /// </summary>
+    public ulong? HeldAuthorReplicaId { get; init; }
+    /// <summary>
+    /// Who published the incoming copy, or <c>null</c> when
+    /// the serving member's snapshot records no author.
+    /// </summary>
+    public ulong? IncomingAuthorReplicaId { get; init; }
+    /// <summary>The incoming copy's full state: secrets, helpers and replicas.</summary>
+    public required Secret Secret { get; init; }
 }
 
 /// <summary>
@@ -564,10 +666,10 @@ public sealed record ReplicaSecretInstalledEvent : DeRecEvent
 public sealed record ReplicaSyncRejectedEvent : DeRecEvent
 {
     public override string EventType => "ReplicaSyncRejected";
-    public required string ReplicaId { get; init; }
-    public required string SecretId { get; init; }
+    public required ulong ReplicaId { get; init; }
+    public required ulong SecretId { get; init; }
     public required uint Version { get; init; }
-    public required int Status { get; init; }
+    public required Org.Derecalliance.Derec.Protobuf.StatusEnum Status { get; init; }
     public required string Memo { get; init; }
 }
 
@@ -578,7 +680,7 @@ public sealed record ReplicaSyncRejectedEvent : DeRecEvent
 public sealed record ReplicaSyncFailedEvent : DeRecEvent
 {
     public override string EventType => "ReplicaSyncFailed";
-    public required string ReplicaId { get; init; }
+    public required ulong ReplicaId { get; init; }
     public required uint Version { get; init; }
     public required string Reason { get; init; }
 }
@@ -594,38 +696,101 @@ public sealed record ReplicaSyncCompleteEvent : DeRecEvent
 {
     public override string EventType => "ReplicaSyncComplete";
     public required uint Version { get; init; }
-    public required IReadOnlyList<string> Synced { get; init; }
-    public required IReadOnlyList<string> Behind { get; init; }
+    public required IReadOnlyList<ulong> Synced { get; init; }
+    public required IReadOnlyList<ulong> Behind { get; init; }
 }
 
 public sealed record ReplicaSecretAckedEvent : DeRecEvent
 {
     public override string EventType => "ReplicaSecretAcked";
-    public required string ChannelId { get; init; }
-    public required string FromReplicaId { get; init; }
-    public required string SecretId { get; init; }
+    public required ulong ChannelId { get; init; }
+    public required ulong FromReplicaId { get; init; }
+    public required ulong SecretId { get; init; }
     public required uint Version { get; init; }
-    public required int Status { get; init; }
+    public required Org.Derecalliance.Derec.Protobuf.StatusEnum Status { get; init; }
     public required string Memo { get; init; }
 }
 
 public sealed record ChannelInfoUpdatedEvent : DeRecEvent
 {
     public override string EventType => "ChannelInfoUpdated";
-    public required string ChannelId { get; init; }
+    public required ulong ChannelId { get; init; }
 }
 
 public sealed record ChannelInfoUpdateRejectedEvent : DeRecEvent
 {
     public override string EventType => "ChannelInfoUpdateRejected";
-    public required string ChannelId { get; init; }
-    public required int Status { get; init; }
+    public required ulong ChannelId { get; init; }
+    public required Org.Derecalliance.Derec.Protobuf.StatusEnum Status { get; init; }
     public required string Memo { get; init; }
 }
 
 public sealed record NoOpEvent : DeRecEvent
 {
     public override string EventType => "NoOp";
+}
+
+/// <summary>
+/// An inbound message was dropped untouched: no store was written and nothing
+/// was sent back. <see cref="Reason"/> is one of the <see cref="IgnoreReason"/>
+/// constants.
+/// </summary>
+/// <remarks>
+/// <see cref="IgnoreReason.PendingVerification"/> means the peer sent it before
+/// this device confirmed the channel's fingerprint — typically a replica source
+/// pushing its first copy while this destination still shows the code.
+/// Confirming does not replay it: after <c>VerifyFingerprintAsync</c> succeeds,
+/// a replica destination starts <see cref="FlowKind.ReplicaDiscovery"/> to pull
+/// the copy itself. <see cref="TraceId"/> matches the peer's <c>*Started</c>
+/// event for the same round (<c>0</c> when the sender set none).
+/// </remarks>
+public sealed record MessageIgnoredEvent : DeRecEvent
+{
+    public override string EventType => "MessageIgnored";
+    public required ulong ChannelId { get; init; }
+    public required string Reason { get; init; }
+    public required ulong TraceId { get; init; }
+}
+
+/// <summary>
+/// The label vocabulary for <see cref="MessageIgnoredEvent.Reason"/>. Matches
+/// the Rust <c>IgnoreReason</c> discriminants one-for-one.
+/// </summary>
+public static class IgnoreReason
+{
+    public const string PendingVerification = "PendingVerification";
+    public const string Expired = "Expired";
+}
+
+/// <summary>
+/// Returned by <c>RestoreAsync</c>: a roster entry got no channel, so this
+/// device cannot reach that peer. Every other entry and the user-secret
+/// snapshot were restored; <see cref="Reason"/> is one of the
+/// <see cref="NotRestoredReason"/> constants.
+/// </summary>
+/// <remarks>
+/// For a helper, <see cref="ChannelId"/> is its channel and
+/// <see cref="ReplicaId"/> is null. For a replica group member,
+/// <see cref="ChannelId"/> is the group's channel and <see cref="ReplicaId"/>
+/// names the member. The peer itself is untouched — a helper still holds its
+/// share — and pairing with it again makes it reachable.
+/// </remarks>
+public sealed record PeerNotRestoredEvent : DeRecEvent
+{
+    public override string EventType => "PeerNotRestored";
+    public required ulong ChannelId { get; init; }
+    public ulong? ReplicaId { get; init; }
+    public required string Reason { get; init; }
+}
+
+/// <summary>
+/// The label vocabulary for <see cref="PeerNotRestoredEvent.Reason"/>.
+/// Matches the Rust <c>NotRestoredReason</c> discriminants one-for-one.
+/// </summary>
+public static class NotRestoredReason
+{
+    /// <summary>The recovered roster names no endpoint for the peer.</summary>
+    public const string NoTransports = "NoTransports";
 }
 
 /// <summary>
@@ -637,49 +802,49 @@ public sealed record NoOpEvent : DeRecEvent
 public sealed record PairingStartedEvent : DeRecEvent
 {
     public override string EventType => "PairingStarted";
-    public required string ChannelId { get; init; }
+    public required ulong ChannelId { get; init; }
     public required Pairing.SenderKind Kind { get; init; }
 
     /// <summary>The token identifying the round this request belongs to.
     /// One is drawn per <c>Start</c> call, so a fan-out shares it across all
     /// of its targets, and the peer echoes it on the response.</summary>
-    public required string TraceId { get; init; }
+    public required ulong TraceId { get; init; }
 }
 
 public sealed record DiscoveryStartedEvent : DeRecEvent
 {
     public override string EventType => "DiscoveryStarted";
-    public required string ChannelId { get; init; }
+    public required ulong ChannelId { get; init; }
 
     /// <summary>The token identifying the round this request belongs to.
     /// One is drawn per <c>Start</c> call, so a fan-out shares it across all
     /// of its targets, and the peer echoes it on the response.</summary>
-    public required string TraceId { get; init; }
+    public required ulong TraceId { get; init; }
 }
 
 public sealed record DiscoveryFailedEvent : DeRecEvent
 {
     public override string EventType => "DiscoveryFailed";
-    public required string ChannelId { get; init; }
+    public required ulong ChannelId { get; init; }
     public required string Error { get; init; }
 }
 
 public sealed record ProtectSecretStartedEvent : DeRecEvent
 {
     public override string EventType => "ProtectSecretStarted";
-    public required string ChannelId { get; init; }
+    public required ulong ChannelId { get; init; }
     public required uint Version { get; init; }
 
     /// <summary>The token identifying the round this request belongs to.
     /// One is drawn per <c>Start</c> call, so a fan-out shares it across all
     /// of its targets, and the peer echoes it on the response.</summary>
-    public required string TraceId { get; init; }
+    public required ulong TraceId { get; init; }
 }
 
 public sealed record ProtectSecretFailedEvent : DeRecEvent
 {
     public override string EventType => "ProtectSecretFailed";
-    public required string ChannelId { get; init; }
+    public required ulong ChannelId { get; init; }
     public required uint Version { get; init; }
     public required string Error { get; init; }
 }
@@ -687,19 +852,19 @@ public sealed record ProtectSecretFailedEvent : DeRecEvent
 public sealed record VerifySharesStartedEvent : DeRecEvent
 {
     public override string EventType => "VerifySharesStarted";
-    public required string ChannelId { get; init; }
+    public required ulong ChannelId { get; init; }
     public required uint Version { get; init; }
 
     /// <summary>The token identifying the round this request belongs to.
     /// One is drawn per <c>Start</c> call, so a fan-out shares it across all
     /// of its targets, and the peer echoes it on the response.</summary>
-    public required string TraceId { get; init; }
+    public required ulong TraceId { get; init; }
 }
 
 public sealed record VerifySharesFailedEvent : DeRecEvent
 {
     public override string EventType => "VerifySharesFailed";
-    public required string ChannelId { get; init; }
+    public required ulong ChannelId { get; init; }
     public required uint Version { get; init; }
     public required string Error { get; init; }
 }
@@ -707,19 +872,19 @@ public sealed record VerifySharesFailedEvent : DeRecEvent
 public sealed record RecoverSecretStartedEvent : DeRecEvent
 {
     public override string EventType => "RecoverSecretStarted";
-    public required string ChannelId { get; init; }
+    public required ulong ChannelId { get; init; }
     public required uint Version { get; init; }
 
     /// <summary>The token identifying the round this request belongs to.
     /// One is drawn per <c>Start</c> call, so a fan-out shares it across all
     /// of its targets, and the peer echoes it on the response.</summary>
-    public required string TraceId { get; init; }
+    public required ulong TraceId { get; init; }
 }
 
 public sealed record RecoverSecretFailedEvent : DeRecEvent
 {
     public override string EventType => "RecoverSecretFailed";
-    public required string ChannelId { get; init; }
+    public required ulong ChannelId { get; init; }
     public required uint Version { get; init; }
     public required string Error { get; init; }
 }
@@ -727,36 +892,36 @@ public sealed record RecoverSecretFailedEvent : DeRecEvent
 public sealed record UnpairFailedEvent : DeRecEvent
 {
     public override string EventType => "UnpairFailed";
-    public required string ChannelId { get; init; }
+    public required ulong ChannelId { get; init; }
     public required string Error { get; init; }
 }
 
 public sealed record UnpairStartedEvent : DeRecEvent
 {
     public override string EventType => "UnpairStarted";
-    public required string ChannelId { get; init; }
+    public required ulong ChannelId { get; init; }
 
     /// <summary>The token identifying the round this request belongs to.
     /// One is drawn per <c>Start</c> call, so a fan-out shares it across all
     /// of its targets, and the peer echoes it on the response.</summary>
-    public required string TraceId { get; init; }
+    public required ulong TraceId { get; init; }
 }
 
 public sealed record UpdateChannelInfoStartedEvent : DeRecEvent
 {
     public override string EventType => "UpdateChannelInfoStarted";
-    public required string ChannelId { get; init; }
+    public required ulong ChannelId { get; init; }
 
     /// <summary>The token identifying the round this request belongs to.
     /// One is drawn per <c>Start</c> call, so a fan-out shares it across all
     /// of its targets, and the peer echoes it on the response.</summary>
-    public required string TraceId { get; init; }
+    public required ulong TraceId { get; init; }
 }
 
 public sealed record UpdateChannelInfoFailedEvent : DeRecEvent
 {
     public override string EventType => "UpdateChannelInfoFailed";
-    public required string ChannelId { get; init; }
+    public required ulong ChannelId { get; init; }
     public required string Error { get; init; }
 }
 
@@ -771,7 +936,7 @@ public sealed record UpdateChannelInfoFailedEvent : DeRecEvent
 public sealed record AutoAcceptedEvent : DeRecEvent
 {
     public override string EventType => "AutoAccepted";
-    public required string ChannelId { get; init; }
+    public required ulong ChannelId { get; init; }
     /// <summary>
     /// Same label vocabulary as
     /// <see cref="ActionRequiredEvent"/>'s underlying action kind
@@ -812,19 +977,19 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             "ActionRequired" => ParseActionRequired(root),
             "ShareStored" => new ShareStoredEvent
             {
-                ChannelId = root.GetProperty("channel_id").GetString()!,
+                ChannelId = ReadId(root.GetProperty("channel_id")),
                 Version = root.GetProperty("version").GetUInt32(),
             },
             "ShareConfirmed" => new ShareConfirmedEvent
             {
-                ChannelId = root.GetProperty("channel_id").GetString()!,
+                ChannelId = ReadId(root.GetProperty("channel_id")),
                 Version = root.GetProperty("version").GetUInt32(),
             },
             "ShareRejected" => new ShareRejectedEvent
             {
-                ChannelId = root.GetProperty("channel_id").GetString()!,
+                ChannelId = ReadId(root.GetProperty("channel_id")),
                 Version = root.GetProperty("version").GetUInt32(),
-                Status = root.GetProperty("status").GetInt32(),
+                Status = (Org.Derecalliance.Derec.Protobuf.StatusEnum)root.GetProperty("status").GetInt32(),
                 Memo = root.GetProperty("memo").GetString() ?? string.Empty,
             },
             "SharingComplete" => new SharingCompleteEvent
@@ -836,18 +1001,18 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             },
             "ShareVerified" => new ShareVerifiedEvent
             {
-                ChannelId = root.GetProperty("channel_id").GetString()!,
+                ChannelId = ReadId(root.GetProperty("channel_id")),
                 Version = root.GetProperty("version").GetUInt32(),
             },
             "SecretsDiscovered" => ParseSecretsDiscovered(root),
             "RecoveryShareReceived" => new RecoveryShareReceivedEvent
             {
-                ChannelId = root.GetProperty("channel_id").GetString()!,
+                ChannelId = ReadId(root.GetProperty("channel_id")),
                 SharesReceived = root.GetProperty("shares_received").GetUInt32(),
             },
             "RecoveryShareError" => new RecoveryShareErrorEvent
             {
-                ChannelId = root.GetProperty("channel_id").GetString()!,
+                ChannelId = ReadId(root.GetProperty("channel_id")),
                 SharesReceived = root.GetProperty("shares_received").GetUInt32(),
                 Error = root.GetProperty("error").GetString() ?? string.Empty,
             },
@@ -857,43 +1022,53 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             },
             "Unpaired" => new UnpairedEvent
             {
-                ChannelId = root.GetProperty("channel_id").GetString()!,
+                ChannelId = ReadId(root.GetProperty("channel_id")),
             },
             "UnpairRejected" => new UnpairRejectedEvent
             {
-                ChannelId = root.GetProperty("channel_id").GetString()!,
-                Status = root.GetProperty("status").GetInt32(),
+                ChannelId = ReadId(root.GetProperty("channel_id")),
+                Status = (Org.Derecalliance.Derec.Protobuf.StatusEnum)root.GetProperty("status").GetInt32(),
                 Memo = root.GetProperty("memo").GetString() ?? string.Empty,
             },
             "PrePairRejected" => new PrePairRejectedEvent
             {
-                ChannelId = root.GetProperty("channel_id").GetString()!,
-                Status = root.GetProperty("status").GetInt32(),
+                ChannelId = ReadId(root.GetProperty("channel_id")),
+                Status = (Org.Derecalliance.Derec.Protobuf.StatusEnum)root.GetProperty("status").GetInt32(),
                 Memo = root.GetProperty("memo").GetString() ?? string.Empty,
             },
             "ReplicaSecretReceived" => ParseReplicaSecretReceived(root),
             "ReplicaSecretInstalled" => ParseReplicaSecretInstalled(root),
+            "ReplicaVersionConflict" => new ReplicaVersionConflictEvent
+            {
+                ChannelId = ReadId(root.GetProperty("channel_id")),
+                FromReplicaId = ReadId(root.GetProperty("from_replica_id")),
+                SecretId = ReadId(root.GetProperty("secret_id")),
+                Version = root.GetProperty("version").GetUInt32(),
+                HeldAuthorReplicaId = ReadOptionalId(root.GetProperty("held_author_replica_id")),
+                IncomingAuthorReplicaId = ReadOptionalId(root.GetProperty("incoming_author_replica_id")),
+                Secret = ParseSecretObject(root.GetProperty("secret")),
+            },
             "ReplicaSyncRejected" => new ReplicaSyncRejectedEvent
             {
-                ReplicaId = root.GetProperty("replica_id").GetString()!,
-                SecretId = root.GetProperty("secret_id").GetString()!,
+                ReplicaId = ReadId(root.GetProperty("replica_id")),
+                SecretId = ReadId(root.GetProperty("secret_id")),
                 Version = root.GetProperty("version").GetUInt32(),
-                Status = root.GetProperty("status").GetInt32(),
+                Status = (Org.Derecalliance.Derec.Protobuf.StatusEnum)root.GetProperty("status").GetInt32(),
                 Memo = root.GetProperty("memo").GetString()!,
             },
             "ReplicaSyncFailed" => new ReplicaSyncFailedEvent
             {
-                ReplicaId = root.GetProperty("replica_id").GetString()!,
+                ReplicaId = ReadId(root.GetProperty("replica_id")),
                 Version = root.GetProperty("version").GetUInt32(),
                 Reason = root.GetProperty("reason").GetString()!,
             },
             "ReplicaRemoved" => new ReplicaRemovedEvent
             {
-                ReplicaId = root.GetProperty("replica_id").GetString()!,
+                ReplicaId = ReadId(root.GetProperty("replica_id")),
             },
             "ReplicaSourceChanged" => new ReplicaSourceChangedEvent
             {
-                ReplicaId = root.GetProperty("replica_id").GetString()!,
+                ReplicaId = ReadId(root.GetProperty("replica_id")),
             },
             "SelfRemovedFromGroup" => new SelfRemovedFromGroupEvent
             {
@@ -904,110 +1079,124 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                 LocalVersion = root.GetProperty("local_version").GetUInt32(),
                 GroupVersion = root.GetProperty("group_version").GetUInt32(),
                 FetchedFrom = root.TryGetProperty("fetched_from", out var ff)
-                    ? ff.GetString()
+                    ? ReadId(ff)
                     : null,
             },
             "ReplicaSyncComplete" => new ReplicaSyncCompleteEvent
             {
                 Version = root.GetProperty("version").GetUInt32(),
-                Synced = ReadStringList(root.GetProperty("synced")),
-                Behind = ReadStringList(root.GetProperty("behind")),
+                Synced = ReadIdList(root.GetProperty("synced")),
+                Behind = ReadIdList(root.GetProperty("behind")),
             },
             "ReplicaSecretAcked" => new ReplicaSecretAckedEvent
             {
-                ChannelId = root.GetProperty("channel_id").GetString()!,
-                FromReplicaId = root.GetProperty("from_replica_id").GetString()!,
-                SecretId = root.GetProperty("secret_id").GetString()!,
+                ChannelId = ReadId(root.GetProperty("channel_id")),
+                FromReplicaId = ReadId(root.GetProperty("from_replica_id")),
+                SecretId = ReadId(root.GetProperty("secret_id")),
                 Version = root.GetProperty("version").GetUInt32(),
-                Status = root.GetProperty("status").GetInt32(),
+                Status = (Org.Derecalliance.Derec.Protobuf.StatusEnum)root.GetProperty("status").GetInt32(),
                 Memo = root.GetProperty("memo").GetString() ?? string.Empty,
             },
             "ChannelInfoUpdated" => new ChannelInfoUpdatedEvent
             {
-                ChannelId = root.GetProperty("channel_id").GetString()!,
+                ChannelId = ReadId(root.GetProperty("channel_id")),
             },
             "ChannelInfoUpdateRejected" => new ChannelInfoUpdateRejectedEvent
             {
-                ChannelId = root.GetProperty("channel_id").GetString()!,
-                Status = root.GetProperty("status").GetInt32(),
+                ChannelId = ReadId(root.GetProperty("channel_id")),
+                Status = (Org.Derecalliance.Derec.Protobuf.StatusEnum)root.GetProperty("status").GetInt32(),
                 Memo = root.GetProperty("memo").GetString() ?? string.Empty,
             },
             "AutoAccepted" => new AutoAcceptedEvent
             {
-                ChannelId = root.GetProperty("channel_id").GetString()!,
+                ChannelId = ReadId(root.GetProperty("channel_id")),
                 ActionKind = root.GetProperty("action_kind").GetString() ?? string.Empty,
             },
             "NoOp" => new NoOpEvent(),
+            "MessageIgnored" => new MessageIgnoredEvent
+            {
+                ChannelId = ReadId(root.GetProperty("channel_id")),
+                Reason = root.GetProperty("reason").GetString() ?? string.Empty,
+                TraceId = ReadId(root.GetProperty("trace_id")),
+            },
+            "PeerNotRestored" => new PeerNotRestoredEvent
+            {
+                ChannelId = ReadId(root.GetProperty("channel_id")),
+                ReplicaId = root.TryGetProperty("replica_id", out var rid)
+                    ? ReadId(rid)
+                    : null,
+                Reason = root.GetProperty("reason").GetString() ?? string.Empty,
+            },
             "PairingStarted" => new PairingStartedEvent
             {
-                ChannelId = root.GetProperty("channel_id").GetString()!,
+                ChannelId = ReadId(root.GetProperty("channel_id")),
                 Kind = (Pairing.SenderKind)root.GetProperty("kind").GetInt32(),
-                TraceId = root.GetProperty("trace_id").GetString()!,
+                TraceId = ReadId(root.GetProperty("trace_id")),
             },
             "DiscoveryStarted" => new DiscoveryStartedEvent
             {
-                ChannelId = root.GetProperty("channel_id").GetString()!,
-                TraceId = root.GetProperty("trace_id").GetString()!,
+                ChannelId = ReadId(root.GetProperty("channel_id")),
+                TraceId = ReadId(root.GetProperty("trace_id")),
             },
             "DiscoveryFailed" => new DiscoveryFailedEvent
             {
-                ChannelId = root.GetProperty("channel_id").GetString()!,
+                ChannelId = ReadId(root.GetProperty("channel_id")),
                 Error = root.GetProperty("error").GetString() ?? string.Empty,
             },
             "ProtectSecretStarted" => new ProtectSecretStartedEvent
             {
-                ChannelId = root.GetProperty("channel_id").GetString()!,
+                ChannelId = ReadId(root.GetProperty("channel_id")),
                 Version = root.GetProperty("version").GetUInt32(),
-                TraceId = root.GetProperty("trace_id").GetString()!,
+                TraceId = ReadId(root.GetProperty("trace_id")),
             },
             "ProtectSecretFailed" => new ProtectSecretFailedEvent
             {
-                ChannelId = root.GetProperty("channel_id").GetString()!,
+                ChannelId = ReadId(root.GetProperty("channel_id")),
                 Version = root.GetProperty("version").GetUInt32(),
                 Error = root.GetProperty("error").GetString() ?? string.Empty,
             },
             "VerifySharesStarted" => new VerifySharesStartedEvent
             {
-                ChannelId = root.GetProperty("channel_id").GetString()!,
+                ChannelId = ReadId(root.GetProperty("channel_id")),
                 Version = root.GetProperty("version").GetUInt32(),
-                TraceId = root.GetProperty("trace_id").GetString()!,
+                TraceId = ReadId(root.GetProperty("trace_id")),
             },
             "VerifySharesFailed" => new VerifySharesFailedEvent
             {
-                ChannelId = root.GetProperty("channel_id").GetString()!,
+                ChannelId = ReadId(root.GetProperty("channel_id")),
                 Version = root.GetProperty("version").GetUInt32(),
                 Error = root.GetProperty("error").GetString() ?? string.Empty,
             },
             "RecoverSecretStarted" => new RecoverSecretStartedEvent
             {
-                ChannelId = root.GetProperty("channel_id").GetString()!,
+                ChannelId = ReadId(root.GetProperty("channel_id")),
                 Version = root.GetProperty("version").GetUInt32(),
-                TraceId = root.GetProperty("trace_id").GetString()!,
+                TraceId = ReadId(root.GetProperty("trace_id")),
             },
             "RecoverSecretFailed" => new RecoverSecretFailedEvent
             {
-                ChannelId = root.GetProperty("channel_id").GetString()!,
+                ChannelId = ReadId(root.GetProperty("channel_id")),
                 Version = root.GetProperty("version").GetUInt32(),
                 Error = root.GetProperty("error").GetString() ?? string.Empty,
             },
             "UnpairFailed" => new UnpairFailedEvent
             {
-                ChannelId = root.GetProperty("channel_id").GetString()!,
+                ChannelId = ReadId(root.GetProperty("channel_id")),
                 Error = root.GetProperty("error").GetString() ?? string.Empty,
             },
             "UnpairStarted" => new UnpairStartedEvent
             {
-                ChannelId = root.GetProperty("channel_id").GetString()!,
-                TraceId = root.GetProperty("trace_id").GetString()!,
+                ChannelId = ReadId(root.GetProperty("channel_id")),
+                TraceId = ReadId(root.GetProperty("trace_id")),
             },
             "UpdateChannelInfoStarted" => new UpdateChannelInfoStartedEvent
             {
-                ChannelId = root.GetProperty("channel_id").GetString()!,
-                TraceId = root.GetProperty("trace_id").GetString()!,
+                ChannelId = ReadId(root.GetProperty("channel_id")),
+                TraceId = ReadId(root.GetProperty("trace_id")),
             },
             "UpdateChannelInfoFailed" => new UpdateChannelInfoFailedEvent
             {
-                ChannelId = root.GetProperty("channel_id").GetString()!,
+                ChannelId = ReadId(root.GetProperty("channel_id")),
                 Error = root.GetProperty("error").GetString() ?? string.Empty,
             },
             "Unmapped" => new UnmappedEvent
@@ -1025,39 +1214,28 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
         return bytes.ToArray();
     }
 
-    private static List<string> ReadStringList(System.Text.Json.JsonElement el)
+    private static ulong ReadId(System.Text.Json.JsonElement el) =>
+        ulong.TryParse(el.GetString(), System.Globalization.NumberStyles.None,
+            System.Globalization.CultureInfo.InvariantCulture, out ulong id)
+            ? id
+            : throw new System.Text.Json.JsonException($"expected a decimal u64 id, got {el.GetRawText()}");
+
+    private static ulong? ReadOptionalId(System.Text.Json.JsonElement el) =>
+        el.ValueKind == System.Text.Json.JsonValueKind.Null ? null : ReadId(el);
+
+    private static List<ulong> ReadIdList(System.Text.Json.JsonElement el)
     {
-        var out_ = new List<string>(el.GetArrayLength());
-        foreach (var item in el.EnumerateArray()) out_.Add(item.GetString()!);
+        var out_ = new List<ulong>(el.GetArrayLength());
+        foreach (var item in el.EnumerateArray()) out_.Add(ReadId(item));
         return out_;
     }
 
-    /// <summary>
-    /// Reads a member's <c>transports</c> array. Absent on a payload written
-    /// before the list existed, where the single endpoint was recorded under
-    /// <c>transport_uri</c> with no protocol discriminant — read as HTTPS,
-    /// which is the only protocol those payloads could carry.
-    /// </summary>
     private static IReadOnlyList<TransportProtocol> ReadEndpoints(System.Text.Json.JsonElement member)
     {
-        if (member.TryGetProperty("transports", out var transports)
-            && transports.ValueKind == System.Text.Json.JsonValueKind.Array)
-        {
-            var endpoints = new List<TransportProtocol>();
-            foreach (var t in transports.EnumerateArray())
-            {
-                endpoints.Add(new TransportProtocol(
-                    t.GetProperty("uri").GetString()!,
-                    (Protocol)(t.TryGetProperty("protocol", out var p) ? p.GetInt32() : 0)));
-            }
-            return endpoints;
-        }
-        if (member.TryGetProperty("transport_uri", out var legacy)
-            && legacy.ValueKind == System.Text.Json.JsonValueKind.String)
-        {
-            return new[] { new TransportProtocol(legacy.GetString()!) };
-        }
-        return Array.Empty<TransportProtocol>();
+        var endpoints = new List<TransportProtocol>();
+        foreach (var t in member.GetProperty("transports").EnumerateArray())
+            endpoints.Add(TransportProtocol.FromWireEndpoint(t));
+        return endpoints;
     }
 
     private static Dictionary<string, string> ReadStringMap(System.Text.Json.JsonElement el)
@@ -1090,21 +1268,23 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
                     }
                 }
                 secrets.Add(new DiscoveredSecret(
-                    s.GetProperty("secret_id").GetString()!,
+                    ReadId(s.GetProperty("secret_id")),
                     versions));
             }
         }
         return new SecretsDiscoveredEvent
         {
-            ChannelId = root.GetProperty("channel_id").GetString()!,
+            ChannelId = ReadId(root.GetProperty("channel_id")),
             Secrets = secrets,
         };
     }
 
     /// <summary>
     /// Parse the nested <c>secret</c> JSON object common to
-    /// <see cref="ReplicaSecretReceivedEvent"/> and
-    /// <see cref="SecretRecoveredEvent"/>. Both events expose the
+    /// <see cref="ReplicaSecretReceivedEvent"/>,
+    /// <see cref="ReplicaSecretInstalledEvent"/>,
+    /// <see cref="ReplicaVersionConflictEvent"/> and
+    /// <see cref="SecretRecoveredEvent"/>. All expose the
     /// identical wire shape — the typed
     /// <see cref="DeRec.Library.Orchestrator.Secret"/> the owner
     /// originally protected.
@@ -1115,7 +1295,7 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
         foreach (var h in secretEl.GetProperty("helpers").EnumerateArray())
         {
             helpers.Add(new HelperInfo(
-                h.GetProperty("channel_id").GetString()!,
+                ReadId(h.GetProperty("channel_id")),
                 ReadEndpoints(h),
                 ReadByteArray(h.GetProperty("shared_key")),
                 h.TryGetProperty("communication_info", out var hci) ? ReadStringMap(hci) : new()));
@@ -1138,16 +1318,14 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
             foreach (var r in replicasEl.GetProperty("members").EnumerateArray())
             {
                 members.Add(new ReplicaInfo(
-                    r.GetProperty("replica_id").GetString()!,
+                    ReadId(r.GetProperty("replica_id")),
                     ReadEndpoints(r),
-                    r.GetProperty("role").GetString()!,
+                    ReplicaRoleJsonConverter.Parse(r.GetProperty("role").GetString()),
                     r.TryGetProperty("communication_info", out var rci) ? ReadStringMap(rci) : new()));
             }
-            var sharedKey = replicasEl.TryGetProperty("shared_key", out var sk)
-                ? ReadByteArray(sk)
-                : Array.Empty<byte>();
+            var sharedKey = ReadByteArray(replicasEl.GetProperty("shared_key"));
             replicas = new Replicas(
-                replicasEl.GetProperty("channel_id").GetString()!,
+                ReadId(replicasEl.GetProperty("channel_id")),
                 members,
                 sharedKey);
         }
@@ -1165,15 +1343,16 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
         foreach (var s in root.GetProperty("shares").EnumerateArray())
         {
             shares.Add(new ChannelShare(
-                s.GetProperty("channel_id").GetString()!,
+                ReadId(s.GetProperty("channel_id")),
                 ReadByteArray(s.GetProperty("committed_share"))));
         }
 
         return new ReplicaSecretReceivedEvent
         {
-            ChannelId = root.GetProperty("channel_id").GetString()!,
-            FromReplicaId = root.GetProperty("from_replica_id").GetString()!,
-            SecretId = root.GetProperty("secret_id").GetString()!,
+            ChannelId = ReadId(root.GetProperty("channel_id")),
+            FromReplicaId = ReadId(root.GetProperty("from_replica_id")),
+            AuthorReplicaId = ReadOptionalId(root.GetProperty("author_replica_id")),
+            SecretId = ReadId(root.GetProperty("secret_id")),
             Version = root.GetProperty("version").GetUInt32(),
             Secret = container,
             Shares = shares,
@@ -1188,15 +1367,16 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
         foreach (var s in root.GetProperty("shares").EnumerateArray())
         {
             shares.Add(new ChannelShare(
-                s.GetProperty("channel_id").GetString()!,
+                ReadId(s.GetProperty("channel_id")),
                 ReadByteArray(s.GetProperty("committed_share"))));
         }
 
         return new ReplicaSecretInstalledEvent
         {
-            ChannelId = root.GetProperty("channel_id").GetString()!,
-            FromReplicaId = root.GetProperty("from_replica_id").GetString()!,
-            SecretId = root.GetProperty("secret_id").GetString()!,
+            ChannelId = ReadId(root.GetProperty("channel_id")),
+            FromReplicaId = ReadId(root.GetProperty("from_replica_id")),
+            AuthorReplicaId = ReadOptionalId(root.GetProperty("author_replica_id")),
+            SecretId = ReadId(root.GetProperty("secret_id")),
             Version = root.GetProperty("version").GetUInt32(),
             Secret = container,
             Shares = shares,
@@ -1208,10 +1388,36 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
         var actionEl = root.GetProperty("action");
         var bytes = new List<byte>(actionEl.GetArrayLength());
         foreach (var b in actionEl.EnumerateArray()) bytes.Add(b.GetByte());
+
+        List<TransportProtocol>? updatedTransports = null;
+        if (root.TryGetProperty("updated_transports", out var ut))
+        {
+            updatedTransports = new List<TransportProtocol>(ut.GetArrayLength());
+            foreach (var t in ut.EnumerateArray())
+                updatedTransports.Add(TransportProtocol.FromWireEndpoint(t));
+        }
+
         return new ActionRequiredEvent
         {
-            ChannelId = root.GetProperty("channel_id").GetString()!,
+            ChannelId = ReadId(root.GetProperty("channel_id")),
             Action = bytes.ToArray(),
+            ActionKind = root.GetProperty("action_kind").GetString()!,
+            TraceId = ReadId(root.GetProperty("trace_id")),
+            PeerCommunicationInfo = root.TryGetProperty("peer_communication_info", out var pci)
+                ? ReadStringMap(pci)
+                : new(),
+            SenderKind = root.TryGetProperty("sender_kind", out var sk)
+                ? (Pairing.SenderKind)sk.GetInt32()
+                : null,
+            Version = root.TryGetProperty("version", out var v) ? v.GetUInt32() : null,
+            ShareDescription = root.TryGetProperty("share_description", out var sd) ? sd.GetString() : null,
+            ShareSecretId = root.TryGetProperty("share_secret_id", out var ssi) ? ReadId(ssi) : null,
+            ShareSize = root.TryGetProperty("share_size", out var ss) ? ss.GetUInt64() : null,
+            UnpairMemo = root.TryGetProperty("unpair_memo", out var um) ? um.GetString() : null,
+            UpdatedCommunicationInfo = root.TryGetProperty("updated_communication_info", out var uci)
+                ? ReadStringMap(uci)
+                : null,
+            UpdatedTransports = updatedTransports,
         };
     }
 
@@ -1224,8 +1430,8 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
     {
         var ev = new PairingCompletedEvent
         {
-            ChannelId = root.GetProperty("channel_id").GetString()!,
-            PairingChannelId = root.GetProperty("pairing_channel_id").GetString()!,
+            ChannelId = ReadId(root.GetProperty("channel_id")),
+            PairingChannelId = ReadId(root.GetProperty("pairing_channel_id")),
             Kind = (Pairing.SenderKind)root.GetProperty("kind").GetInt32(),
         };
         if (root.TryGetProperty("peer_communication_info", out var pci) &&
@@ -1239,7 +1445,7 @@ public sealed class DeRecEventConverter : JsonConverter<DeRecEvent>
 
     private static ReplicaPairedEvent ParseReplicaPaired(System.Text.Json.JsonElement root) => new()
     {
-        ChannelId = root.GetProperty("channel_id").GetString()!,
-        PeerReplicaId = root.GetProperty("peer_replica_id").GetString()!,
+        ChannelId = ReadId(root.GetProperty("channel_id")),
+        PeerReplicaId = ReadId(root.GetProperty("peer_replica_id")),
     };
 }

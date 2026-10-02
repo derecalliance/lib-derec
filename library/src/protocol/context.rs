@@ -18,7 +18,7 @@ use std::collections::HashMap;
 /// Identity and configuration constant for the lifetime of a protocol
 /// instance.
 ///
-/// Every handler takes this whether or not it reads all four fields, for the
+/// Every handler takes this whether or not it reads all five fields, for the
 /// same reason it takes every store: the shape of a signature should not
 /// encode which values a flow happens to need today.
 pub(crate) struct Local<'a> {
@@ -40,6 +40,10 @@ pub(crate) struct Local<'a> {
     pub(crate) own_transports: &'a [TransportProtocol],
     /// Which peer-supplied endpoint schemes this device will accept.
     pub(crate) policy: TransportPolicy,
+    /// The free-form contact details this device advertises: told to a peer
+    /// at pairing, and published as this device's own row in the replica
+    /// roster.
+    pub(crate) communication_info: &'a HashMap<String, String>,
 }
 
 impl Local<'_> {
@@ -104,22 +108,17 @@ pub(crate) struct Round<'a> {
     pub(crate) trace_id: u64,
 }
 
-/// What a peer is told at pairing time, and validated against on the way in.
+/// What a peer is validated against at pairing time.
 ///
 /// Separate from [`Local`] because it is read by the pairing entry points
-/// alone; the other flows would carry two fields they can never use.
-///
-/// Deliberately not used by `update_channel_info::start`, whose
-/// `communication_info` and `own_transports` are the *new* values a caller
-/// asked to broadcast rather than the instance's current ones.
+/// alone; the other flows would carry a field they can never use.
 pub(crate) struct PairingConfig<'a> {
-    pub(crate) communication_info: &'a HashMap<String, String>,
     pub(crate) parameter_range: Option<&'a derec_proto::ParameterRange>,
 }
 
 /// Borrow a [`DeRecProtocol`]'s identity into a [`Local`].
 ///
-/// Reads `unsafe_http` directly rather than calling `transport_policy()`:
+/// Reads `unsafe_connection` directly rather than calling `transport_policy()`:
 /// that method borrows the whole protocol, which would collide with the
 /// store borrows [`borrow_stores!`](crate::protocol::stores::borrow_stores)
 /// takes in the same call. Copying one `bool` field keeps the two disjoint.
@@ -131,7 +130,8 @@ macro_rules! local {
             secret_id: $protocol.secret_id,
             replica_id: $protocol.replica_id,
             own_transports: &$protocol.own_transports,
-            policy: $crate::transport::TransportPolicy::new($protocol.unsafe_http),
+            policy: $crate::transport::TransportPolicy::new($protocol.unsafe_connection),
+            communication_info: &$protocol.communication_info,
         }
     };
 }
@@ -142,7 +142,6 @@ macro_rules! local {
 macro_rules! pairing_config {
     ($protocol:expr) => {
         $crate::protocol::context::PairingConfig {
-            communication_info: &$protocol.communication_info,
             parameter_range: $protocol.parameter_range.as_ref(),
         }
     };

@@ -631,7 +631,7 @@ mod tests {
                         version: 4,
                         secrets: Vec::new(),
                         description: None,
-                        replicas: None,
+                        author_replica_id: None,
                     },
                 )
                 .await

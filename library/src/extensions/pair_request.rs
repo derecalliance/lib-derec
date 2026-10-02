@@ -21,8 +21,8 @@ pub(crate) trait PairRequestMessageExt {
     ///   responder has no encapsulated secret to decapsulate.
     /// - `ecies_public_key` MUST be present and non-empty, for the same
     ///   reason on the ECIES half of the hybrid handshake.
-    /// - The request MUST advertise at least one endpoint, through either
-    ///   `supportedTransports` or a non-blank singular `transportProtocol`.
+    /// - The request MUST advertise at least one endpoint in
+    ///   `supportedTransports`.
     ///
     /// Says nothing about whether those endpoints are *acceptable* — that is
     /// [`TransportPolicy`](crate::transport::TransportPolicy)'s decision, made
@@ -31,8 +31,6 @@ pub(crate) trait PairRequestMessageExt {
 }
 
 impl PairRequestMessageExt for derec_proto::PairRequestMessage {
-    // Compatibility, not oversight — see the `transport` module docs.
-    #[allow(deprecated)]
     fn validate(&self) -> Result<(), crate::Error> {
         if self.mlkem_ciphertext.is_empty() {
             #[cfg(feature = "logging")]
@@ -52,18 +50,7 @@ impl PairRequestMessageExt for derec_proto::PairRequestMessage {
             );
         }
 
-        // A request carrying no offer list and no usable singular endpoint
-        // gives selection nothing to work with. Report it as the malformed
-        // request it is rather than as `NoUsableEndpoint`: the two are fixed
-        // differently — one by the sender correcting its request, the other
-        // by one side gaining a transport the other serves.
-        let has_offers = !self.supported_transports.is_empty();
-        let has_singular = self
-            .transport_protocol
-            .as_ref()
-            .is_some_and(|tp| !tp.uri.trim().is_empty());
-
-        if !has_offers && !has_singular {
+        if self.supported_transports.is_empty() {
             #[cfg(feature = "logging")]
             tracing::warn!("pair request advertises no usable transport endpoint");
 

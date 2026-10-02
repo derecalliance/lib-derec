@@ -139,33 +139,9 @@ message PairRequestMessage {
   // whether pairing is possible and which parameters to use.
   ParameterRange parameterRange = 7;
 
-  // Transport information for reaching the initiator.
-  //
-  // This specifies:
-  //
-  // - the endpoint where the initiator can receive messages
-  // - the protocol required to deliver those messages
-  //
-  // After pairing, the responder uses this information to send responses
-  // and all subsequent protocol messages to the initiator.
-  // Deprecated: superseded by `supportedTransports`, which carries every
-  // endpoint rather than one.
-  //
-  // **Reading this field directly is now incorrect.** Its meaning narrowed
-  // from "the endpoint" to "one entry of a list, and possibly absent": an
-  // initiator that has moved past this field advertises only
-  // `supportedTransports`. A reader that was correct before this release is
-  // a bug now — it rejects, or fails to reach, a peer that is offering it a
-  // perfectly good endpoint. Resolve both spellings instead of reading
-  // either: `advertised_endpoints()` (Rust and TypeScript),
-  // `AdvertisedEndpoints()` (Go), `AdvertisedEndpoints()` (.NET).
-  //
-  // Senders still populate it: a sender that sets `supportedTransports`
-  // MUST also set this to a single best-compatibility choice, so
-  // implementations predating the list still pair.
-  //
-  // **Scheduled for removal in v0.0.5.**
-  TransportProtocol transportProtocol = 8 [deprecated = true];
+  // Formerly the singular `transportProtocol`, superseded by `supportedTransports`.
+  reserved 8;
+  reserved "transportProtocol";
 
   // Timestamp indicating when this message was created.
   //
@@ -177,8 +153,8 @@ message PairRequestMessage {
   // initiator's own preference order.
   //
   // Same semantics as `ContactMessage.supportedTransports`: the responder
-  // selects by its own preference, and absent means "only
-  // `transportProtocol` is offered".
+  // selects by its own preference, and the list MUST carry at least one
+  // entry.
   repeated TransportProtocol supportedTransports = 10;
 }
 

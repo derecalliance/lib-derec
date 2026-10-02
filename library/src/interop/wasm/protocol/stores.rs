@@ -26,7 +26,7 @@
 //!   save(channelId: string, contactBytes: Uint8Array): Promise<void>;
 //!   listChannels(): Promise<string[]>;
 //!   // Channel linking (same Owner identity); undirected, idempotent, transitive.
-//!   linkChannel(channelId: string, linkedChannelId: string): Promise<void>;
+//!   linkChannel(secretId: string, a: string, b: string): Promise<void>;
 //!   // Transitive closure INCLUDING channelId itself.
 //!   linkedChannels(channelId: string): Promise<string[]>;
 //! }
@@ -55,7 +55,7 @@
 //! ### `Transport`
 //! ```ts
 //! interface Transport {
-//!   send(endpoint: { protocol: string; uri: string }, message: Uint8Array): Promise<void>;
+//!   send(endpoints: { protocol: "https" | "grpc"; uri: string }[], message: Uint8Array): Promise<void>;
 //! }
 //! ```
 
@@ -179,12 +179,8 @@ impl DeRecSecretStore for JsSecretStore {
         let obj = self.0.clone();
         let secret_str = secret_id.to_string();
         let ids_vec: Vec<String> = channel_ids.iter().map(|c| c.0.to_string()).collect();
-        let raw_ids: Vec<u64> = channel_ids.iter().map(|c| c.0).collect();
+        let requested = channel_ids.to_vec();
         let kind_num = kind as u32;
-        let policy_str = match missing_policy {
-            MissingPolicy::Skip => "skip",
-            MissingPolicy::Fail => "fail",
-        };
         Box::pin(async move {
             let js_ids = Array::new();
             for id in &ids_vec {
@@ -194,37 +190,24 @@ impl DeRecSecretStore for JsSecretStore {
             args.push(&JsValue::from_str(&secret_str));
             args.push(&js_ids);
             args.push(&JsValue::from_f64(kind_num as f64));
-            args.push(&JsValue::from_str(policy_str));
             let promise_val = call_method(&obj, "loadMany", &args)
                 .map_err(|e| SecretStoreError::Backend(box_err(e)))?;
             let value = resolve_promise(promise_val)
                 .await
                 .map_err(|e| SecretStoreError::Backend(box_err(e)))?;
-            let arr = Array::from(&value);
-            let mut result = Vec::with_capacity(arr.length() as usize);
-            let mut missing: Vec<u64> = Vec::new();
-            for i in 0..arr.length() {
-                let cid = *raw_ids.get(i as usize).ok_or_else(|| {
-                    SecretStoreError::Backend(box_err(
-                        "loadMany returned more entries than requested".to_string(),
-                    ))
-                })?;
-                let raw = arr.get(i);
-                if raw.is_null() || raw.is_undefined() {
-                    missing.push(cid);
-                    continue;
-                }
-                let bytes = Uint8Array::new(&raw).to_vec();
-                let value = decode_secret_value(kind, &bytes)?;
-                result.push((ChannelId(cid), value));
-            }
-            if missing_policy == MissingPolicy::Fail && !missing.is_empty() {
-                return Err(SecretStoreError::MissingEntries {
-                    kind,
-                    channel_ids: missing,
-                });
-            }
-            Ok(result)
+            let entries: Vec<Option<Vec<u8>>> = Array::from(&value)
+                .iter()
+                .map(|raw| {
+                    (!raw.is_null() && !raw.is_undefined()).then(|| Uint8Array::new(&raw).to_vec())
+                })
+                .collect();
+            crate::interop::secret_batch::collect(
+                &requested,
+                entries,
+                kind,
+                missing_policy,
+                |bytes| decode_secret_value(kind, &bytes),
+            )
         })
     }
 
@@ -294,7 +277,7 @@ impl DeRecSecretStore for JsSecretStore {
 ///   remove(secretId: string, channelId: string, replicaId: string): Promise<boolean>;
 ///   listHelpers(secretId: string): Promise<Uint8Array | null>;
 ///   listReplicas(secretId: string): Promise<Uint8Array | null>;
-///   linkChannel(secretId: string, channelId: string, linkedChannelId: string): Promise<void>;
+///   linkChannel(secretId: string, a: string, b: string): Promise<void>;
 ///   linkedChannels(secretId: string, channelId: string): Promise<string[]>;
 /// }
 /// ```
@@ -837,6 +820,14 @@ fn user_secrets_to_js(value: &UserSecrets) -> JsValue {
         js_sys::Reflect::set(&obj, &"description".into(), &JsValue::from_str(d))
             .unwrap_or_default();
     }
+    if let Some(author) = value.author_replica_id {
+        js_sys::Reflect::set(
+            &obj,
+            &"author_replica_id".into(),
+            &JsValue::from_str(&author.to_string()),
+        )
+        .unwrap_or_default();
+    }
     obj.into()
 }
 
@@ -867,14 +858,22 @@ fn user_secrets_from_js(value: &JsValue) -> Result<UserSecrets, ShareStoreError>
     let description = js_sys::Reflect::get(value, &"description".into())
         .ok()
         .and_then(|v| v.as_string());
-    // The JS-side store carries only the user-facing snapshot; the
-    // `replicas` cache is rebuilt on the next ProtectSecret round from
-    // live channel state.
+    let author_replica_id = js_sys::Reflect::get(value, &"author_replica_id".into())
+        .ok()
+        .and_then(|v| v.as_string())
+        .map(|id| {
+            id.parse::<u64>().map_err(|_| {
+                ShareStoreError::Backend(box_err(format!(
+                    "userSecrets.author_replica_id is not a decimal u64: {id}"
+                )))
+            })
+        })
+        .transpose()?;
     Ok(UserSecrets {
         version,
         secrets,
         description,
-        replicas: None,
+        author_replica_id,
     })
 }
 

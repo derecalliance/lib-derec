@@ -446,6 +446,65 @@ mod prepair_record_shape_tests {
         });
     }
 
+    /// The own roster row carries every endpoint this device advertises and
+    /// its `communication_info`, filtered the way a peer would store it — the
+    /// same shape a peer's row has, so a published roster names and reaches its
+    /// writer as well as everyone else.
+    #[test]
+    fn the_own_roster_row_carries_what_this_device_advertises() {
+        run_async(async {
+            let lf = LocalFixture {
+                own_transports: vec![
+                    endpoint(),
+                    TransportProtocol {
+                        uri: "grpcs://peer.example:443".to_owned(),
+                        protocol: derec_proto::Protocol::Grpc as i32,
+                    },
+                ],
+                communication_info: std::collections::HashMap::from([
+                    ("name".to_owned(), "Alice-1".to_owned()),
+                    ("blank".to_owned(), "  ".to_owned()),
+                    ("derec.replica_id".to_owned(), "spoofed".to_owned()),
+                ]),
+                ..LocalFixture::new(SECRET_ID)
+            };
+            let mut rig = StoreRig::new();
+            persist_start_record(
+                &mut rig.stores(),
+                &lf.local(),
+                CHANNEL,
+                endpoints(),
+                std::collections::HashMap::new(),
+                SenderKind::ReplicaSource,
+                Some(OWN_REPLICA),
+            )
+            .await
+            .expect("persist start record");
+
+            let member = rig
+                .channels
+                .load(
+                    SECRET_ID,
+                    crate::protocol::types::ChannelQuery::Replica {
+                        channel_id: CHANNEL,
+                        replica_id: ReplicaId(OWN_REPLICA),
+                    },
+                )
+                .await
+                .expect("load")
+                .and_then(|r| r.as_replica().cloned())
+                .expect("own roster row present");
+            assert_eq!(
+                member.transports, lf.own_transports,
+                "every advertised endpoint, in preference order"
+            );
+            assert_eq!(
+                member.communication_info,
+                std::collections::HashMap::from([("name".to_owned(), "Alice-1".to_owned())]),
+            );
+        });
+    }
+
     /// The helper path is unchanged: it still records the peer's role and the
     /// local kind is its counterparty.
     #[test]
@@ -693,13 +752,9 @@ mod replica_id_conflict_tests {
         });
     }
 
-    /// `accept()` must select from the requester's `supportedTransports`
-    /// offer list, not trust its legacy singular field outright. The peer
-    /// here advertises HTTPS as its singular field — structurally valid,
-    /// so the old code accepted it without complaint — but also offers
-    /// gRPCS, which is the only protocol this responder actually serves.
-    // Compatibility, not oversight — see the `transport` module docs.
-    #[allow(deprecated)]
+    /// `accept()` must record the requester's whole `supportedTransports`
+    /// offer list. The peer here offers HTTPS first and gRPCS second, and
+    /// gRPCS is the only protocol this responder actually serves.
     #[test]
     fn accept_offers_the_transport_every_advertised_endpoint() {
         use super::super::pair::accept;
@@ -708,7 +763,6 @@ mod replica_id_conflict_tests {
         use crate::protocol::{DeRecSecretStore, PairingKeyMaterial, SecretValue};
         use crate::types::ChannelId;
         use derec_proto::{ContactMode, Protocol, SenderKind, TransportProtocol};
-        use std::collections::HashMap;
 
         run_async(async {
             let channel_id = ChannelId(0xACCE_9701);
@@ -749,13 +803,9 @@ mod replica_id_conflict_tests {
 
             let request::ExtractResult {
                 request: mut pair_request,
-            } = request::extract(&request_envelope, initiator_secret.ecies_secret_key())
+            } = request::extract(&request_envelope, initiator_secret.ecies_secret_key(), None)
                 .expect("extract");
 
-            pair_request.transport_protocol = Some(TransportProtocol {
-                uri: "https://peer.example.com/derec".to_owned(),
-                protocol: Protocol::Https as i32,
-            });
             pair_request.supported_transports = vec![
                 TransportProtocol {
                     uri: "https://peer.example.com/derec".to_owned(),
@@ -785,9 +835,7 @@ mod replica_id_conflict_tests {
                 }],
                 ..LocalFixture::new(secret_id)
             };
-            let comm_info = HashMap::new();
             let pairing_cfg = PairingConfig {
-                communication_info: &comm_info,
                 parameter_range: None,
             };
 
@@ -801,14 +849,11 @@ mod replica_id_conflict_tests {
                 0,
             )
             .await
-            .expect(
-                "accept must select the servable gRPCS offer, not the unservable \
-                 HTTPS singular field",
-            );
+            .expect("accept must succeed when one offered endpoint is servable");
 
             // The library must hand the transport everything the peer
-            // advertised, in the peer's order — not narrow it to the singular
-            // legacy field. Which of these to dial is the application's call,
+            // advertised, in the peer's order. Which of these to dial is the
+            // application's call,
             // so this asserts what was *offered*, not what was chosen.
             assert_eq!(
                 rig.transport.sent_endpoint_sets(),
@@ -823,7 +868,7 @@ mod replica_id_conflict_tests {
                     },
                 ]],
                 "accept() must offer the transport every endpoint the peer \
-                 advertised, not just its singular legacy field"
+                 advertised"
             );
         });
     }

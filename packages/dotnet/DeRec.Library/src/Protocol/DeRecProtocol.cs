@@ -39,6 +39,7 @@ public sealed class DeRecProtocol : IDisposable
     private readonly NP.ChannelStoreLinkedDelegate _channelLinked;
     private readonly NP.FreeBufferDelegate _channelFreeBuffer;
     private readonly NP.SecretStoreLoadDelegate _secretLoad;
+    private readonly NP.SecretStoreLoadManyDelegate _secretLoadMany;
     private readonly NP.SecretStoreSaveDelegate _secretSave;
     private readonly NP.SecretStoreRemoveDelegate _secretRemove;
     private readonly NP.FreeBufferDelegate _secretFreeBuffer;
@@ -92,19 +93,16 @@ public sealed class DeRecProtocol : IDisposable
         IUserSecretStore userSecretStore,
         IStateStore stateStore,
         ITransport transport,
-        string ownTransportUri,
-        string ownTransportProtocol = "https",
-        IReadOnlyList<TransportProtocol>? ownTransports = null,
-        int threshold = 3,
-        int keepVersionsCount = 3,
+        IReadOnlyList<TransportProtocol> ownTransports,
+        int? threshold = null,
+        int? keepVersionsCount = null,
         Dictionary<string, string>? communicationInfo = null,
-        bool autoRespondOnFailure = false,
-        UnpairAck unpairAck = UnpairAck.Required,
-        bool autoReplyTo = false,
+        bool? autoRespondOnFailure = null,
+        UnpairAck? unpairAck = null,
+        bool? autoReplyTo = null,
         AutoAcceptPolicy? autoAccept = null,
         ulong? replicaId = null,
         Timeouts? timeouts = null,
-        bool? unsafeHttp = null,
         bool? unsafeConnection = null,
         ParameterRange? parameterRange = null)
     {
@@ -126,6 +124,7 @@ public sealed class DeRecProtocol : IDisposable
         _channelFreeBuffer = FreeBufferImpl;
 
         _secretLoad = SecretLoadImpl;
+        _secretLoadMany = SecretLoadManyImpl;
         _secretSave = SecretSaveImpl;
         _secretRemove = SecretRemoveImpl;
         _secretFreeBuffer = FreeBufferImpl;
@@ -167,6 +166,7 @@ public sealed class DeRecProtocol : IDisposable
         {
             UserData = IntPtr.Zero,
             Load = Marshal.GetFunctionPointerForDelegate(_secretLoad),
+            LoadMany = Marshal.GetFunctionPointerForDelegate(_secretLoadMany),
             Save = Marshal.GetFunctionPointerForDelegate(_secretSave),
             Remove = Marshal.GetFunctionPointerForDelegate(_secretRemove),
             FreeBuffer = Marshal.GetFunctionPointerForDelegate(_secretFreeBuffer),
@@ -205,43 +205,29 @@ public sealed class DeRecProtocol : IDisposable
             Send = Marshal.GetFunctionPointerForDelegate(_transportSend),
         };
 
-        int ownProtocolNum = ownTransportProtocol.ToLowerInvariant() switch
-        {
-            "https" => 0,
-            "grpc" => 1,
-            _ => throw new ArgumentException($"unknown protocol: {ownTransportProtocol}", nameof(ownTransportProtocol)),
-        };
+        // Order is preserved verbatim: it is this node's preference order.
+        List<TransportOfferDto> ownTransportsDto =
+            ownTransports.Select(t => new TransportOfferDto(t.Uri, (int)t.Protocol)).ToList();
 
-        byte[]? commInfoBytes = null;
-        UIntPtr commInfoLen = UIntPtr.Zero;
-
-        // `own_transports` takes precedence over the scalar
-        // `own_transport_uri` / `own_transport_protocol` fields on the
-        // Rust side when non-empty; order is preserved verbatim.
-        List<TransportOfferDto>? ownTransportsDto = ownTransports is { Count: > 0 }
-            ? ownTransports.Select(t => new TransportOfferDto(t.Uri, (int)t.Protocol)).ToList()
-            : null;
-
-        var policy = autoAccept ?? new AutoAcceptPolicy();
         var config = new ProtocolConfigDto(
             SecretId: secretId.ToString(System.Globalization.CultureInfo.InvariantCulture),
-            OwnTransportUri: ownTransportUri,
-            OwnTransportProtocol: ownProtocolNum,
             OwnTransports: ownTransportsDto,
-            Threshold: (uint)threshold,
-            KeepVersionsCount: (uint)keepVersionsCount,
+            Threshold: (uint?)threshold,
+            KeepVersionsCount: (uint?)keepVersionsCount,
             AutoRespondOnFailure: autoRespondOnFailure,
-            UnpairAck: (int)unpairAck,
+            UnpairAck: (int?)unpairAck,
             AutoReplyTo: autoReplyTo,
-            AutoAccept: new AutoAcceptConfigDto(
-                Pairing: policy.Pairing,
-                PrePair: policy.PrePair,
-                StoreShare: policy.StoreShare,
-                VerifyShare: policy.VerifyShare,
-                Discovery: policy.Discovery,
-                GetShare: policy.GetShare,
-                Unpair: policy.Unpair,
-                UpdateChannelInfo: policy.UpdateChannelInfo),
+            AutoAccept: autoAccept is null
+                ? null
+                : new AutoAcceptConfigDto(
+                    Pairing: autoAccept.Pairing,
+                    PrePair: autoAccept.PrePair,
+                    StoreShare: autoAccept.StoreShare,
+                    VerifyShare: autoAccept.VerifyShare,
+                    Discovery: autoAccept.Discovery,
+                    GetShare: autoAccept.GetShare,
+                    Unpair: autoAccept.Unpair,
+                    UpdateChannelInfo: autoAccept.UpdateChannelInfo),
             Timeouts: timeouts is null
                 ? null
                 : new TimeoutsConfigDto(
@@ -253,7 +239,6 @@ public sealed class DeRecProtocol : IDisposable
                         : new RemoveExpiredChannelsConfigDto(
                             Enabled: timeouts.ExpiredChannels.Enabled,
                             TimeoutInSecs: timeouts.ExpiredChannels.TimeoutInSecs)),
-            UnsafeHttp: unsafeHttp,
             UnsafeConnection: unsafeConnection,
             ReplicaId: replicaId?.ToString(System.Globalization.CultureInfo.InvariantCulture),
             ParameterRange: parameterRange is null
@@ -268,12 +253,14 @@ public sealed class DeRecProtocol : IDisposable
                     MinUnresponsiveDeletionTimeout: parameterRange.MinUnresponsiveDeletionTimeout,
                     MaxUnresponsiveDeletionTimeout: parameterRange.MaxUnresponsiveDeletionTimeout,
                     MinUnresponsiveDeactivationTimeout: parameterRange.MinUnresponsiveDeactivationTimeout,
-                    MaxUnresponsiveDeactivationTimeout: parameterRange.MaxUnresponsiveDeactivationTimeout));
+                    MaxUnresponsiveDeactivationTimeout: parameterRange.MaxUnresponsiveDeactivationTimeout),
+            CommunicationInfo: communicationInfo);
         byte[] configJsonBytes = JsonSerializer.SerializeToUtf8Bytes(config, JsonOpts);
 
         var result = NP.derec_protocol_new(
             configJsonBytes, (UIntPtr)configJsonBytes.Length,
-            commInfoBytes, commInfoLen,
+            // communication_info travels in configJsonBytes; the proto buffer stays empty.
+            null, UIntPtr.Zero,
             ref channelCb, ref secretCb, ref shareCb, ref userSecretCb, ref stateCb, ref transportCb);
 
         ThrowOnError(result.Error);
@@ -461,9 +448,9 @@ public sealed class DeRecProtocol : IDisposable
 
     /// <summary>
     /// Reject a pending action with a status + memo. <paramref name="status"/>
-    /// matches the wire <c>StatusEnum</c>.
+    /// is the <c>StatusEnum</c> the peer receives in the response.
     /// </summary>
-    public Task RejectAsync(byte[] actionBytes, int status, string memo)
+    public Task RejectAsync(byte[] actionBytes, Org.Derecalliance.Derec.Protobuf.StatusEnum status, string memo)
     {
         EnsureNotDisposed();
         byte[]? memoBytes = string.IsNullOrEmpty(memo) ? null : Encoding.UTF8.GetBytes(memo);
@@ -472,7 +459,7 @@ public sealed class DeRecProtocol : IDisposable
         {
             var err = NP.derec_protocol_reject(
                 _handle, actionBytes, (UIntPtr)actionBytes.Length,
-                status, memoBytes, memoLen);
+                (int)status, memoBytes, memoLen);
             ThrowOnError(err);
         });
     }
@@ -544,12 +531,18 @@ public sealed class DeRecProtocol : IDisposable
     /// <see cref="Secret"/>. Mirrors the Rust <c>DeRecProtocol::restore</c>
     /// — see that method for the full contract. <paramref name="recoveredSecret"/>
     /// is the <see cref="Secret"/> carried by <see cref="SecretRecoveredEvent.Secret"/>;
-    /// pass it verbatim.
+    /// pass it verbatim. A helper or member whose transports list is empty
+    /// gets no channel: it is reported as a <see cref="PeerNotRestoredEvent"/>
+    /// in the returned list and the rest of the roster is restored.
     /// </summary>
     /// <exception cref="DeRecException">
     /// Thrown with <see cref="DeRecCode.AlreadyRestored"/>,
     /// <see cref="DeRecCode.RestoreConflict"/>, <see cref="DeRecCode.Invariant"/>,
-    /// or a store-category code on failure.
+    /// or a store-category code on failure. On
+    /// <see cref="DeRecCode.RestoreConflict"/>,
+    /// <see cref="DeRecException.ConflictingChannelIds"/> lists the existing
+    /// channels at ids restore is about to write; clear exactly those and
+    /// retry.
     /// </exception>
     public Task<IReadOnlyList<DeRecEvent>> RestoreAsync(Secret recoveredSecret, uint version)
     {
@@ -561,7 +554,9 @@ public sealed class DeRecProtocol : IDisposable
             var result = NP.derec_protocol_restore(_handle, json, (UIntPtr)json.Length);
             try
             {
-                ThrowOnError(result.Error);
+                DeRec.Library.Utils.ThrowIfError(
+                    result.Error,
+                    DeRec.Library.Utils.ParseChannelIdList(result.ConflictingChannelIdsJson));
                 byte[] eventsJson = DeRec.Library.Utils.CopyBuffer(result.EventsJson);
                 return JsonSerializer.Deserialize<List<DeRecEvent>>(eventsJson, JsonOpts)
                     ?? new List<DeRecEvent>();
@@ -569,6 +564,7 @@ public sealed class DeRecProtocol : IDisposable
             finally
             {
                 DeRec.Library.Utils.FreeBuffer(result.EventsJson);
+                DeRec.Library.Utils.FreeBuffer(result.ConflictingChannelIdsJson);
             }
         });
     }
@@ -595,9 +591,7 @@ public sealed class DeRecProtocol : IDisposable
     /// <summary>
     /// Replace every endpoint this node advertises, in preference order —
     /// the runtime counterpart to the <c>ownTransports</c> constructor
-    /// argument, and the way to change the whole set
-    /// (<see cref="SetOwnTransport"/> replaces only the entry for the
-    /// protocol its URI names).
+    /// argument.
     ///
     /// A node serves at most one endpoint per protocol, so this list is a
     /// preference order over distinct protocols. Two entries of the same
@@ -613,41 +607,9 @@ public sealed class DeRecProtocol : IDisposable
     {
         EnsureNotDisposed();
         ArgumentNullException.ThrowIfNull(transports);
-        if (transports.Count == 0)
-        {
-            throw new ArgumentException("own transports must not be empty", nameof(transports));
-        }
         var dto = transports.Select(t => new TransportOfferDto(t.Uri, (int)t.Protocol)).ToList();
         byte[] json = JsonSerializer.SerializeToUtf8Bytes(dto, JsonOpts);
         var err = NP.derec_protocol_set_own_transports(_handle, json, (UIntPtr)json.Length);
-        ThrowOnError(err);
-    }
-
-    /// <summary>
-    /// Replace this node's endpoint for one protocol, leaving the others
-    /// alone. A node serves at most one endpoint per protocol, so the
-    /// <c>(uri, protocol)</c> pair identifies the entry it replaces; an
-    /// entry for a protocol not yet served is appended, and a replaced one
-    /// keeps its position in the preference order. Use
-    /// <see cref="SetOwnTransports"/> to change which protocols this node
-    /// serves, or their order. IMPORTANT: keep the old endpoint operational
-    /// during the changeover (see the Rust docs on the matching setter for
-    /// the discipline).
-    /// </summary>
-    [Obsolete("Use SetOwnTransports, which takes the whole preference list. " +
-              "SetOwnTransports(new[] { new TransportProtocol(uri, protocol) }) is the " +
-              "direct replacement. Removed at 0.0.5.")]
-    public void SetOwnTransport(string uri, string protocol = "https")
-    {
-        EnsureNotDisposed();
-        int protocolNum = protocol.ToLowerInvariant() switch
-        {
-            "https" => 0,
-            "grpc" => 1,
-            _ => throw new ArgumentException($"unknown protocol: {protocol}", nameof(protocol)),
-        };
-        byte[] uriBytes = Encoding.UTF8.GetBytes(uri);
-        var err = NP.derec_protocol_set_own_transport(_handle, uriBytes, (UIntPtr)uriBytes.Length, protocolNum);
         ThrowOnError(err);
     }
 
@@ -917,6 +879,28 @@ public sealed class DeRecProtocol : IDisposable
         }
     }
 
+    private int SecretLoadManyImpl(
+        IntPtr userData, ulong secretId,
+        IntPtr channelIdsJsonPtr, UIntPtr channelIdsJsonLen, uint kind,
+        out IntPtr outPtr, out UIntPtr outLen)
+    {
+        try
+        {
+            ulong[] channelIds = DeserializeJsonArray<ulong>(channelIdsJsonPtr, channelIdsJsonLen) ?? Array.Empty<ulong>();
+            var records = _secretStore.LoadMany(secretId, channelIds, (SecretKind)kind)
+                .Select(sv => sv is null ? null : new SecretValueDto((uint)sv.Kind, sv.Bytes))
+                .ToList();
+            byte[] json = JsonSerializer.SerializeToUtf8Bytes(records, JsonOpts);
+            return WriteOut(json, out outPtr, out outLen);
+        }
+        catch
+        {
+            outPtr = IntPtr.Zero;
+            outLen = UIntPtr.Zero;
+            return -1;
+        }
+    }
+
     private int SecretSaveImpl(IntPtr userData, ulong secretId, ulong channelId, uint kind, IntPtr bytes, UIntPtr len)
     {
         try
@@ -1052,7 +1036,8 @@ public sealed class DeRecProtocol : IDisposable
             var dto = new UserSecretsDto(
                 value.Version,
                 value.Secrets.Select(s => new UserSecretDto(s.Id, s.Name, s.Data)).ToArray(),
-                value.Description);
+                value.Description,
+                value.AuthorReplicaId?.ToString(System.Globalization.CultureInfo.InvariantCulture));
             byte[] json = JsonSerializer.SerializeToUtf8Bytes(dto, JsonOpts);
             return WriteOut(json, out outPtr, out outLen);
         }
@@ -1076,7 +1061,13 @@ public sealed class DeRecProtocol : IDisposable
             var entries = (dto.secrets ?? Array.Empty<UserSecretDto>())
                 .Select(s => new UserSecretEntry(s.id ?? Array.Empty<byte>(), s.name ?? string.Empty, s.data ?? Array.Empty<byte>()))
                 .ToArray();
-            _userSecretStore.SaveLatest(secretId, new UserSecrets(dto.version, entries, dto.description));
+            _userSecretStore.SaveLatest(secretId, new UserSecrets(
+                dto.version,
+                entries,
+                dto.description,
+                dto.author_replica_id is null
+                    ? null
+                    : ulong.Parse(dto.author_replica_id, System.Globalization.CultureInfo.InvariantCulture)));
             return 0;
         }
         catch { return -1; }
@@ -1088,7 +1079,9 @@ public sealed class DeRecProtocol : IDisposable
         catch { return -1; }
     }
 
-    private sealed record UserSecretsDto(uint version, UserSecretDto[] secrets, string? description);
+    // Wire shape matches Rust `UserSecretsRecord`; `author_replica_id` is a
+    // decimal string, omitted when null.
+    private sealed record UserSecretsDto(uint version, UserSecretDto[] secrets, string? description, string? author_replica_id);
     private sealed record UserSecretDto(byte[] id, string name, byte[] data);
 
     // Wire shape matches Rust `StateItemRecord` — snake_case field names, byte[]
@@ -1106,7 +1099,11 @@ public sealed class DeRecProtocol : IDisposable
         string[]? failed,
         string[]? pending_replicas,
         string[]? synced_replicas,
-        string[]? behind_replicas);
+        string[]? behind_replicas,
+        uint? local_version,
+        ReplicaDiscoveryReportDto[]? reported);
+
+    private sealed record ReplicaDiscoveryReportDto(string replica_id, uint version);
 
     // Wire shape matches Rust `StateKeyRecord`.
     private sealed record StateKeyDto(
@@ -1128,7 +1125,12 @@ public sealed class DeRecProtocol : IDisposable
         item.Failed?.Select(c => c.ToString()).ToArray(),
         item.PendingReplicas?.Select(r => r.ToString()).ToArray(),
         item.SyncedReplicas?.Select(r => r.ToString()).ToArray(),
-        item.BehindReplicas?.Select(r => r.ToString()).ToArray());
+        item.BehindReplicas?.Select(r => r.ToString()).ToArray(),
+        item.LocalVersion,
+        item.Reported?
+            .OrderBy(r => r.Key)
+            .Select(r => new ReplicaDiscoveryReportDto(r.Key.ToString(), r.Value))
+            .ToArray());
 
     private static StateItem FromDto(StateItemDto dto)
     {
@@ -1160,9 +1162,13 @@ public sealed class DeRecProtocol : IDisposable
         ulong[]? behindReplicas = dto.behind_replicas?
             .Select(s => ulong.Parse(s, System.Globalization.CultureInfo.InvariantCulture))
             .ToArray();
+        var reported = dto.reported?.ToDictionary(
+            r => ulong.Parse(r.replica_id, System.Globalization.CultureInfo.InvariantCulture),
+            r => r.version);
         return new StateItem(
             kind, channelId, secretId, dto.version, startedAt, dto.bytes, dto.shares,
-            pending, confirmed, failed, pendingReplicas, syncedReplicas, behindReplicas);
+            pending, confirmed, failed, pendingReplicas, syncedReplicas, behindReplicas,
+            dto.local_version, reported);
     }
 
     private static StateKey ParseKeyBuffer(IntPtr ptr, UIntPtr len)
@@ -1188,7 +1194,10 @@ public sealed class DeRecProtocol : IDisposable
                 ulong.Parse(dto.channel_id
                     ?? throw new InvalidOperationException("PendingUnpair requires channel_id"),
                     System.Globalization.CultureInfo.InvariantCulture)),
-            StateKind.SharingRound => StateKey.SharingRound(),
+            StateKind.SharingRound => StateKey.SharingRound(
+                dto.version
+                    ?? throw new InvalidOperationException("SharingRound requires version")),
+            StateKind.PendingReplicaDiscovery => StateKey.PendingReplicaDiscovery(),
             _ => throw new InvalidOperationException($"unknown StateKind: {dto.kind}"),
         };
     }
@@ -1368,29 +1377,23 @@ public sealed class DeRecProtocol : IDisposable
     // library/src/interop/ffi/protocol/handle/mod.rs). `SecretId`/`ReplicaId` are
     // decimal strings, not JSON numbers, so u64 values above 2^53 survive
     // the round trip through System.Text.Json without precision loss.
-    // `ReplicaId` is omitted entirely (not `null`) when there is no
-    // replica id, per `JsonOpts`'s `WhenWritingNull` ignore condition.
-    // `UnsafeHttp`/`UnsafeConnection` rely on the same ignore condition:
-    // absence is meaningful there too. Only one present is honored; both
-    // present and disagreeing is DeRecCode.ConflictingPlaintextOptIn, so a
-    // null serialized as `false` would turn a deliberate setting into a
-    // construction failure.
+    // Every nullable field is omitted entirely (not `null`) when unset, per
+    // `JsonOpts`'s `WhenWritingNull` ignore condition, so Rust applies its
+    // own default for each.
     private sealed record ProtocolConfigDto(
         [property: JsonPropertyName("secret_id")] string SecretId,
-        [property: JsonPropertyName("own_transport_uri")] string OwnTransportUri,
-        [property: JsonPropertyName("own_transport_protocol")] int OwnTransportProtocol,
-        [property: JsonPropertyName("own_transports")] List<TransportOfferDto>? OwnTransports,
-        [property: JsonPropertyName("threshold")] uint Threshold,
-        [property: JsonPropertyName("keep_versions_count")] uint KeepVersionsCount,
-        [property: JsonPropertyName("auto_respond_on_failure")] bool AutoRespondOnFailure,
-        [property: JsonPropertyName("unpair_ack")] int UnpairAck,
-        [property: JsonPropertyName("auto_reply_to")] bool AutoReplyTo,
-        [property: JsonPropertyName("auto_accept")] AutoAcceptConfigDto AutoAccept,
+        [property: JsonPropertyName("own_transports")] List<TransportOfferDto> OwnTransports,
+        [property: JsonPropertyName("threshold")] uint? Threshold,
+        [property: JsonPropertyName("keep_versions_count")] uint? KeepVersionsCount,
+        [property: JsonPropertyName("auto_respond_on_failure")] bool? AutoRespondOnFailure,
+        [property: JsonPropertyName("unpair_ack")] int? UnpairAck,
+        [property: JsonPropertyName("auto_reply_to")] bool? AutoReplyTo,
+        [property: JsonPropertyName("auto_accept")] AutoAcceptConfigDto? AutoAccept,
         [property: JsonPropertyName("timeouts")] TimeoutsConfigDto? Timeouts,
-        [property: JsonPropertyName("unsafe_http")] bool? UnsafeHttp,
         [property: JsonPropertyName("unsafe_connection")] bool? UnsafeConnection,
         [property: JsonPropertyName("replica_id")] string? ReplicaId,
-        [property: JsonPropertyName("parameter_range")] ParameterRangeDto? ParameterRange);
+        [property: JsonPropertyName("parameter_range")] ParameterRangeDto? ParameterRange,
+        [property: JsonPropertyName("communication_info"), OmitWhenEmpty] Dictionary<string, string>? CommunicationInfo);
 
     // Field-for-field equivalent of Rust `ParameterRangeConfig`. Every bound
     // is optional and defaults to 0, which the proto reads as "no constraint
@@ -1426,16 +1429,16 @@ public sealed class DeRecProtocol : IDisposable
 
     // Field-for-field equivalent of Rust `TimeoutsConfig`. Every field is
     // omitted when null so Rust's `#[serde(default)]` supplies the default —
-    // the values live there, not in this wrapper.
+    // the values live there, not in this wrapper. The seconds are forwarded
+    // as the caller gave them; the library accepts only a whole,
+    // non-negative number of seconds and refuses anything else.
     private sealed record TimeoutsConfigDto(
-        [property: JsonPropertyName("inbound_message_secs")] ulong? InboundMessageSecs,
-        [property: JsonPropertyName("sharing_round_secs")] ulong? SharingRoundSecs,
-        [property: JsonPropertyName("unpair_ack_secs")] ulong? UnpairAckSecs,
+        [property: JsonPropertyName("inbound_message_secs")] double? InboundMessageSecs,
+        [property: JsonPropertyName("sharing_round_secs")] double? SharingRoundSecs,
+        [property: JsonPropertyName("unpair_ack_secs")] double? UnpairAckSecs,
         [property: JsonPropertyName("expired_channels")] RemoveExpiredChannelsConfigDto? ExpiredChannels);
 
-    /// Whole seconds, or null when the caller left the value unset.
-    private static ulong? ToSecs(TimeSpan? span) =>
-        span is null ? null : (ulong)Math.Max(0, Math.Floor(span.Value.TotalSeconds));
+    private static double? ToSecs(TimeSpan? span) => span?.TotalSeconds;
 
     // Field-for-field equivalent of Rust `AutoAcceptConfig`.
     private sealed record AutoAcceptConfigDto(
@@ -1532,7 +1535,8 @@ public sealed record RemoveExpiredChannelsPolicy(bool Enabled, ulong TimeoutInSe
 /// <summary>
 /// How long the protocol waits on each thing that can keep it waiting. A
 /// <c>null</c> property means "use the library default"; the defaults live in
-/// the Rust library, not here.
+/// the Rust library, not here. A set value must be a whole, non-negative
+/// number of seconds; the library refuses any other value at construction.
 /// </summary>
 /// <remarks>
 /// <para>

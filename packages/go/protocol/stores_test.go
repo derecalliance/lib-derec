@@ -87,6 +87,16 @@ func (m *mockSecretStore) Load(secretID, channelID uint64, kind SecretKind) (Sec
 	return v, ok, nil
 }
 
+func (m *mockSecretStore) LoadMany(secretID uint64, channelIDs []uint64, kind SecretKind) ([]*SecretValue, error) {
+	out := make([]*SecretValue, len(channelIDs))
+	for i, c := range channelIDs {
+		if v, ok := m.data[secretID][c][kind]; ok {
+			out[i] = &v
+		}
+	}
+	return out, nil
+}
+
 func (m *mockSecretStore) Save(secretID, channelID uint64, value SecretValue) error {
 	return nil
 }
@@ -185,10 +195,10 @@ func TestChannelStore_SaveLoadRemoveThroughInterface(t *testing.T) {
 	var store ChannelStore = newMockChannelStore()
 
 	ch := HelperChannel{
-		ChannelID: 1,
-		Transports:        []TransportEndpoint{{URI: "https://h.example.com", Protocol: 0}},
-		Status:    ChannelStatusPaired,
-		PeerRole:  SenderKindOwner,
+		ChannelID:  1,
+		Transports: []TransportEndpoint{{URI: "https://h.example.com", Protocol: 0}},
+		Status:     ChannelStatusPaired,
+		PeerRole:   SenderKindOwner,
 	}
 	if err := store.Save(100, ChannelRecord{Helper: &ch}); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -211,11 +221,11 @@ func TestChannelStore_SaveLoadRemoveThroughInterface(t *testing.T) {
 	// with every other member — so it must not collide with the helper
 	// channel at the same id.
 	member := ReplicaMember{
-		ChannelID: 1,
-		ReplicaID: 42,
-		Transports:        []TransportEndpoint{{URI: "https://r.example.com", Protocol: 0}},
-		Role:      ReplicaRoleDestination,
-		Status:    ChannelStatusPaired,
+		ChannelID:  1,
+		ReplicaID:  42,
+		Transports: []TransportEndpoint{{URI: "https://r.example.com", Protocol: 0}},
+		Role:       ReplicaRoleDestination,
+		Status:     ChannelStatusPaired,
 	}
 	if err := store.Save(100, ChannelRecord{Replica: &member}); err != nil {
 		t.Fatalf("Save(member): %v", err)

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-use crate::extensions::transport_protocol::TransportProtocolExt as _;
+use crate::extensions::request_message::RequestMessageExt as _;
 use crate::{
     derec_message::{DeRecMessageBuilder, current_timestamp, extract_inner_message},
     types::{ChannelId, SharedKey},
@@ -88,15 +88,9 @@ pub fn produce(
 ) -> Result<ProduceResult, crate::Error> {
     let timestamp = current_timestamp();
 
-    let (legacy_reply_to, reply_to_transports) =
-        crate::extensions::advertised_endpoints::split_reply_to(reply_to);
-    // Populating the deprecated singular field is the compatibility path
-    // that keeps peers predating `replyToTransports` answerable, so the
-    // warning is expected here rather than a defect.
-    #[allow(deprecated)]
+    let reply_to_transports = reply_to.to_vec();
     let message = GetSecretIdsVersionsRequestMessage {
         timestamp: Some(timestamp),
-        reply_to: legacy_reply_to,
         reply_to_transports,
         replica_id: None,
     };
@@ -215,18 +209,7 @@ pub fn extract(
 
     verify_timestamps(envelope.timestamp, request.timestamp)?;
 
-    // Both spellings are validated, not just the one this build reads: a
-    // structurally invalid endpoint in the deprecated singular field is what
-    // a peer predating `replyToTransports` would dial, so letting it through
-    // unchecked would admit exactly the address the check exists to refuse.
-    #[allow(deprecated)]
-    for reply_to in request
-        .reply_to_transports
-        .iter()
-        .chain(request.reply_to.iter())
-    {
-        reply_to.validate()?;
-    }
+    request.validate()?;
 
     #[cfg(feature = "logging")]
     tracing::info!("discovery request extracted and validated");

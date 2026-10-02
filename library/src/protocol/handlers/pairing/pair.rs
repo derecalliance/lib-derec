@@ -60,8 +60,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     };
     let pairing_secret = pairing_secret.to_secret()?;
 
-    let comm_info =
-        super::build_communication_info(pairing.communication_info, replica_id_to_inject);
+    let comm_info = super::build_communication_info(local.communication_info, replica_id_to_inject);
     let resp = response::produce(
         channel_id,
         request,
@@ -272,10 +271,6 @@ pub(super) async fn on_response<S: StoreSet>(
 ) -> Result<Vec<DeRecEvent>> {
     let replica_id = local.replica_id;
     let secret_id = local.secret_id;
-    crate::primitives::pairing::parameter_range::check_compatibility(
-        pairing.parameter_range,
-        response.parameter_range.as_ref(),
-    )?;
 
     let contact = match stores
         .secrets
@@ -290,7 +285,7 @@ pub(super) async fn on_response<S: StoreSet>(
         }
     };
 
-    let result = response::process(&contact, response, pairing_secret)?;
+    let result = response::process(&contact, response, pairing_secret, pairing.parameter_range)?;
 
     let new_channel_id = result.channel_id;
 
@@ -464,8 +459,7 @@ pub(super) async fn start<S: StoreSet>(
 ) -> Result<u64> {
     super::reject_start_on_paired_channel(stores, local, channel_id).await?;
 
-    let comm_info =
-        super::build_communication_info(pairing.communication_info, replica_id_to_inject);
+    let comm_info = super::build_communication_info(local.communication_info, replica_id_to_inject);
     let result = request::produce(
         kind,
         local.own_transports.to_vec(),

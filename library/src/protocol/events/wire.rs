@@ -17,15 +17,13 @@
 //! - Enum variants use serde's default tag (`#[serde(tag = "type")]`)
 //!   with the Rust variant name as the discriminator value.
 
-use std::collections::HashMap;
-
-use serde::Serialize;
-
 use crate::protocol::utils::{pending_action_wire, reserved_keys::encode_replica_id};
 use crate::protocol::{
     DeRecEvent, PendingAction,
     types::{ChannelShare, Secret},
 };
+use serde::Serialize;
+use std::collections::HashMap;
 
 /// Canonical wire-shape of [`super::DeRecEvent`]. Consumed by the FFI
 /// and WASM bridges only. See module docs for the field conventions.
@@ -46,6 +44,9 @@ pub(crate) enum Event {
     ReplicaSecretReceived {
         channel_id: String,
         from_replica_id: String,
+        /// Decimal-encoded publisher of `version`, or `None` when the serving
+        /// member's snapshot records no author.
+        author_replica_id: Option<String>,
         secret_id: String,
         version: u32,
         secret: SecretWire,
@@ -57,10 +58,21 @@ pub(crate) enum Event {
     ReplicaSecretInstalled {
         channel_id: String,
         from_replica_id: String,
+        author_replica_id: Option<String>,
         secret_id: String,
         version: u32,
         secret: SecretWire,
         shares: Vec<Share>,
+    },
+    /// A member offered a different copy of the version this device holds.
+    ReplicaVersionConflict {
+        channel_id: String,
+        from_replica_id: String,
+        secret_id: String,
+        version: u32,
+        held_author_replica_id: Option<String>,
+        incoming_author_replica_id: Option<String>,
+        secret: SecretWire,
     },
     ReplicaSecretAcked {
         channel_id: String,
@@ -118,10 +130,6 @@ pub(crate) enum Event {
     ShareStored {
         channel_id: String,
         version: u32,
-        /// Decimal-encoded `replica_id` of the writer, or `None` for a
-        /// non-replica `Owner`. Matches the proto's optional shape so
-        /// JS/.NET callers receive `null` for the absent case.
-        replica_id: Option<String>,
     },
     ShareConfirmed {
         channel_id: String,
@@ -198,16 +206,35 @@ pub(crate) enum Event {
         /// only).
         #[serde(skip_serializing_if = "Option::is_none")]
         sender_kind: Option<i32>,
-        /// Share version (StoreShare / VerifyShare only).
+        /// Share version (StoreShare / VerifyShare / GetShare only).
         #[serde(skip_serializing_if = "Option::is_none")]
         version: Option<u32>,
         /// Description of the secret version (StoreShare only).
         #[serde(skip_serializing_if = "Option::is_none")]
         share_description: Option<String>,
-        /// Secret identifier as decimal string (StoreShare / VerifyShare
-        /// only).
+        /// Secret identifier as decimal string (StoreShare / VerifyShare /
+        /// GetShare only). On GetShare, with `version`, it names the share
+        /// being asked for.
         #[serde(skip_serializing_if = "Option::is_none")]
         share_secret_id: Option<String>,
+        /// Correlation token of the inbound request, decimal-encoded.
+        trace_id: String,
+        /// Length in bytes of the share the helper would store (StoreShare
+        /// only) — what a size or quota decision is made on.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        share_size: Option<u64>,
+        /// The peer's memo (Unpair only).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        unpair_memo: Option<String>,
+        /// The communication info the peer is replacing its stored map with
+        /// (UpdateChannelInfo only, and only when the update carries one —
+        /// an empty map clears it).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        updated_communication_info: Option<HashMap<String, String>>,
+        /// The endpoints the peer is moving to (UpdateChannelInfo only;
+        /// empty when the update leaves its endpoints unchanged).
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        updated_transports: Vec<Endpoint>,
     },
     AutoAccepted {
         channel_id: String,
@@ -217,6 +244,22 @@ pub(crate) enum Event {
         action_kind: String,
     },
     NoOp,
+    MessageIgnored {
+        channel_id: String,
+        /// [`ignore_reason_label`] — `"PendingVerification"` or `"Expired"`.
+        reason: String,
+        trace_id: String,
+    },
+    /// `restore` wrote no channel for this roster entry.
+    PeerNotRestored {
+        channel_id: String,
+        /// Decimal `replica_id` of a replica group member; absent for a
+        /// helper.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        replica_id: Option<String>,
+        /// [`not_restored_reason_label`] — `"NoTransports"`.
+        reason: String,
+    },
     PairingStarted {
         channel_id: String,
         kind: i32,
@@ -312,19 +355,22 @@ pub struct ReplicasWire {
     pub shared_key: Vec<u8>,
 }
 
-/// One advertised endpoint, carrying its protocol discriminant so an SDK
-/// never infers a protocol from a URI scheme.
+/// One advertised endpoint, carrying its protocol by name (`"https"`,
+/// `"grpc"`) so an SDK never infers a protocol from a URI scheme. Every
+/// endpoint reaching an event was validated on entry, so an undefined
+/// discriminant does not occur; it would read as `"unknown"`.
 #[derive(Serialize)]
 pub struct Endpoint {
     pub uri: String,
-    pub protocol: i32,
+    pub protocol: &'static str,
 }
 
 impl From<derec_proto::TransportProtocol> for Endpoint {
     fn from(t: derec_proto::TransportProtocol) -> Self {
         Endpoint {
             uri: t.uri,
-            protocol: t.protocol,
+            protocol: crate::interop::protocol_names::protocol_discriminant_to_name(t.protocol)
+                .unwrap_or("unknown"),
         }
     }
 }
@@ -439,6 +485,7 @@ impl Event {
             DeRecEvent::ReplicaSecretReceived {
                 channel_id,
                 from_replica_id,
+                author_replica_id,
                 secret_id,
                 version,
                 secret,
@@ -446,6 +493,7 @@ impl Event {
             } => Self::ReplicaSecretReceived {
                 channel_id: channel_id.0.to_string(),
                 from_replica_id: encode_replica_id(from_replica_id),
+                author_replica_id: author_replica_id.map(encode_replica_id),
                 secret_id: secret_id.to_string(),
                 version,
                 secret: secret.into(),
@@ -454,6 +502,7 @@ impl Event {
             DeRecEvent::ReplicaSecretInstalled {
                 channel_id,
                 from_replica_id,
+                author_replica_id,
                 secret_id,
                 version,
                 secret,
@@ -461,10 +510,28 @@ impl Event {
             } => Self::ReplicaSecretInstalled {
                 channel_id: channel_id.0.to_string(),
                 from_replica_id: encode_replica_id(from_replica_id),
+                author_replica_id: author_replica_id.map(encode_replica_id),
                 secret_id: secret_id.to_string(),
                 version,
                 secret: secret.into(),
                 shares: shares.into_iter().map(Into::into).collect(),
+            },
+            DeRecEvent::ReplicaVersionConflict {
+                channel_id,
+                from_replica_id,
+                secret_id,
+                version,
+                held_author_replica_id,
+                incoming_author_replica_id,
+                secret,
+            } => Self::ReplicaVersionConflict {
+                channel_id: channel_id.0.to_string(),
+                from_replica_id: encode_replica_id(from_replica_id),
+                secret_id: secret_id.to_string(),
+                version,
+                held_author_replica_id: held_author_replica_id.map(encode_replica_id),
+                incoming_author_replica_id: incoming_author_replica_id.map(encode_replica_id),
+                secret: secret.into(),
             },
             DeRecEvent::ReplicaSyncRejected {
                 replica_id,
@@ -531,11 +598,9 @@ impl Event {
             DeRecEvent::ShareStored {
                 channel_id,
                 version,
-                replica_id,
             } => Self::ShareStored {
                 channel_id: channel_id.0.to_string(),
                 version,
-                replica_id: replica_id.map(encode_replica_id),
             },
             DeRecEvent::ShareConfirmed {
                 channel_id,
@@ -657,6 +722,30 @@ impl Event {
                 let peer_communication_info = extract_peer_communication_info(&action);
                 let sender_kind = extract_pairing_sender_kind(&action);
                 let (version, share_description, share_secret_id) = extract_share_metadata(&action);
+                let trace_id = action.trace_id().to_string();
+                let share_size = match &action {
+                    PendingAction::StoreShare { request, .. } => Some(request.share.len() as u64),
+                    _ => None,
+                };
+                let unpair_memo = match &action {
+                    PendingAction::Unpair { request, .. } => Some(request.memo.clone()),
+                    _ => None,
+                };
+                let (updated_communication_info, updated_transports) = match &action {
+                    PendingAction::UpdateChannelInfo { request, .. } => (
+                        request.communication_info.as_ref().map(|info| {
+                            use crate::extensions::communication_info::CommunicationInfoExt as _;
+                            info.to_map()
+                        }),
+                        request
+                            .supported_transports
+                            .iter()
+                            .cloned()
+                            .map(Into::into)
+                            .collect(),
+                    ),
+                    _ => (None, Vec::new()),
+                };
                 let action_bytes = pending_action_wire::serialize(action)?;
                 Self::ActionRequired {
                     channel_id: channel_id.0.to_string(),
@@ -667,9 +756,32 @@ impl Event {
                     version,
                     share_description,
                     share_secret_id,
+                    trace_id,
+                    share_size,
+                    unpair_memo,
+                    updated_communication_info,
+                    updated_transports,
                 }
             }
             DeRecEvent::NoOp => Self::NoOp,
+            DeRecEvent::MessageIgnored {
+                channel_id,
+                reason,
+                trace_id,
+            } => Self::MessageIgnored {
+                channel_id: channel_id.0.to_string(),
+                reason: ignore_reason_label(reason).to_owned(),
+                trace_id: trace_id.to_string(),
+            },
+            DeRecEvent::PeerNotRestored {
+                channel_id,
+                replica_id,
+                reason,
+            } => Self::PeerNotRestored {
+                channel_id: channel_id.0.to_string(),
+                replica_id: replica_id.map(encode_replica_id),
+                reason: not_restored_reason_label(reason).to_owned(),
+            },
             DeRecEvent::PairingStarted {
                 channel_id,
                 kind,
@@ -776,6 +888,27 @@ impl Event {
     }
 }
 
+/// Wire label for an [`IgnoreReason`](crate::protocol::IgnoreReason): the
+/// variant name, matching `library/tests/fixtures/enums.json`.
+pub(crate) fn ignore_reason_label(reason: crate::protocol::IgnoreReason) -> &'static str {
+    use crate::protocol::IgnoreReason;
+    match reason {
+        IgnoreReason::PendingVerification => "PendingVerification",
+        IgnoreReason::Expired => "Expired",
+    }
+}
+
+/// Wire label for a [`NotRestoredReason`](crate::protocol::NotRestoredReason):
+/// the variant name, matching `library/tests/fixtures/enums.json`.
+pub(crate) fn not_restored_reason_label(
+    reason: crate::protocol::NotRestoredReason,
+) -> &'static str {
+    use crate::protocol::NotRestoredReason;
+    match reason {
+        NotRestoredReason::NoTransports => "NoTransports",
+    }
+}
+
 pub(crate) fn pending_action_kind_label(
     kind: crate::protocol::events::PendingActionKind,
 ) -> &'static str {
@@ -832,6 +965,11 @@ fn extract_share_metadata(action: &PendingAction) -> (Option<u32>, Option<String
             None,
             Some(request.secret_id.to_string()),
         ),
+        PendingAction::GetShare { request, .. } => (
+            Some(request.version),
+            None,
+            Some(request.secret_id.to_string()),
+        ),
         _ => (None, None, None),
     }
 }
@@ -840,6 +978,111 @@ fn extract_share_metadata(action: &PendingAction) -> (Option<u32>, Option<String
 mod tests {
     use super::*;
     use crate::types::ChannelId;
+
+    fn action_required(action: PendingAction) -> serde_json::Value {
+        let mapped = Event::from_event(DeRecEvent::ActionRequired {
+            channel_id: ChannelId(7),
+            action,
+        })
+        .expect("ActionRequired maps");
+        serde_json::to_value(&mapped).expect("serializes")
+    }
+
+    /// A helper decides whether to store a share by its size: the event
+    /// carries it, and the request's trace id for logs.
+    #[test]
+    fn a_store_share_action_reports_its_size_and_trace_id() {
+        let json = action_required(PendingAction::StoreShare {
+            channel_id: ChannelId(7),
+            request: derec_proto::StoreShareRequestMessage {
+                share: vec![0xAB; 1234],
+                version: 3,
+                secret_id: 42,
+                ..Default::default()
+            },
+            shared_key: [0; 32],
+            trace_id: u64::MAX,
+        });
+        assert_eq!(json["share_size"], 1234);
+        assert_eq!(json["version"], 3);
+        assert_eq!(json["share_secret_id"], "42");
+        assert_eq!(json["trace_id"], u64::MAX.to_string());
+    }
+
+    #[test]
+    fn a_get_share_action_names_the_share_asked_for() {
+        let json = action_required(PendingAction::GetShare {
+            channel_id: ChannelId(7),
+            request: derec_proto::GetShareRequestMessage {
+                secret_id: 42,
+                version: 5,
+                ..Default::default()
+            },
+            shared_key: [0; 32],
+            trace_id: 9,
+        });
+        assert_eq!(json["share_secret_id"], "42");
+        assert_eq!(json["version"], 5);
+        assert!(json.get("share_size").is_none());
+    }
+
+    #[test]
+    fn an_unpair_action_carries_the_peer_memo() {
+        let json = action_required(PendingAction::Unpair {
+            channel_id: ChannelId(7),
+            request: derec_proto::UnpairRequestMessage {
+                memo: "moving devices".to_owned(),
+                ..Default::default()
+            },
+            shared_key: [0; 32],
+            trace_id: 9,
+        });
+        assert_eq!(json["unpair_memo"], "moving devices");
+    }
+
+    /// The application sees where the peer is moving before it agrees: the
+    /// update re-routes all later traffic on the channel.
+    #[test]
+    fn an_update_channel_info_action_shows_what_would_change() {
+        use crate::extensions::communication_info::CommunicationInfoExt as _;
+        let json = action_required(PendingAction::UpdateChannelInfo {
+            channel_id: ChannelId(7),
+            request: derec_proto::UpdateChannelInfoRequestMessage {
+                communication_info: Some(derec_proto::CommunicationInfo::from_map(&HashMap::from(
+                    [("name".to_owned(), "Alice".to_owned())],
+                ))),
+                supported_transports: vec![derec_proto::TransportProtocol {
+                    uri: "grpcs://alice.example:443".to_owned(),
+                    protocol: derec_proto::Protocol::Grpc as i32,
+                }],
+                ..Default::default()
+            },
+            shared_key: [0; 32],
+            trace_id: 9,
+        });
+        assert_eq!(json["updated_communication_info"]["name"], "Alice");
+        assert_eq!(
+            json["updated_transports"][0]["uri"],
+            "grpcs://alice.example:443"
+        );
+        assert_eq!(json["updated_transports"][0]["protocol"], "grpc");
+
+        // An update carrying only endpoints leaves the stored map alone, which
+        // is distinct from clearing it.
+        let json = action_required(PendingAction::UpdateChannelInfo {
+            channel_id: ChannelId(7),
+            request: derec_proto::UpdateChannelInfoRequestMessage {
+                supported_transports: vec![derec_proto::TransportProtocol {
+                    uri: "https://alice.example".to_owned(),
+                    protocol: derec_proto::Protocol::Https as i32,
+                }],
+                ..Default::default()
+            },
+            shared_key: [0; 32],
+            trace_id: 9,
+        });
+        assert!(json.get("updated_communication_info").is_none());
+    }
 
     /// Both the FFI and WASM bridges serialize through
     /// [`Event::from_event`], so mapping a variant here is what makes it
@@ -857,5 +1100,54 @@ mod tests {
         assert_eq!(json["type"], "UnpairFailed");
         assert_eq!(json["channel_id"], "99");
         assert_eq!(json["error"], "transport unreachable");
+    }
+
+    #[test]
+    fn message_ignored_maps_with_channel_reason_and_trace() {
+        let mapped = Event::from_event(DeRecEvent::MessageIgnored {
+            channel_id: ChannelId(u64::MAX),
+            reason: crate::protocol::IgnoreReason::PendingVerification,
+            trace_id: 42,
+        })
+        .expect("MessageIgnored must map");
+
+        let json = serde_json::to_value(&mapped).expect("serializes");
+        assert_eq!(json["type"], "MessageIgnored");
+        assert_eq!(json["channel_id"], u64::MAX.to_string());
+        assert_eq!(json["reason"], "PendingVerification");
+        assert_eq!(json["trace_id"], "42");
+    }
+
+    /// A helper carries no `replica_id` — the key is absent, as
+    /// `fetched_from` is, so the FFI JSON and the WASM object agree; a group
+    /// member is named by it, on the group's channel.
+    #[test]
+    fn peer_not_restored_maps_helper_and_member_entries() {
+        let helper = serde_json::to_value(
+            Event::from_event(DeRecEvent::PeerNotRestored {
+                channel_id: ChannelId(u64::MAX),
+                replica_id: None,
+                reason: crate::protocol::NotRestoredReason::NoTransports,
+            })
+            .expect("PeerNotRestored must map"),
+        )
+        .expect("serializes");
+        assert_eq!(helper["type"], "PeerNotRestored");
+        assert_eq!(helper["channel_id"], u64::MAX.to_string());
+        assert!(!helper.as_object().unwrap().contains_key("replica_id"));
+        assert_eq!(helper["reason"], "NoTransports");
+
+        let member = serde_json::to_value(
+            Event::from_event(DeRecEvent::PeerNotRestored {
+                channel_id: ChannelId(21),
+                replica_id: Some(u64::MAX),
+                reason: crate::protocol::NotRestoredReason::NoTransports,
+            })
+            .expect("PeerNotRestored must map"),
+        )
+        .expect("serializes");
+        assert_eq!(member["channel_id"], "21");
+        assert_eq!(member["replica_id"], u64::MAX.to_string());
+        assert_eq!(member["reason"], "NoTransports");
     }
 }

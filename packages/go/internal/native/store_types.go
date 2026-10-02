@@ -17,7 +17,7 @@ import (
 // pairing held by an Owner carries SenderKindHelper, and the helper's own
 // row for the same channel carries SenderKindOwner.
 type HelperChannel struct {
-	ChannelID         uint64
+	ChannelID uint64
 	// Transports are every endpoint the peer advertised, in the order it
 	// offered them. The library does not rank them; a Transport
 	// implementation chooses which to dial and may fall back.
@@ -34,8 +34,8 @@ type HelperChannel struct {
 // ChannelID, so the channel cannot be the key. Storing this device's own
 // row is what makes the roster reconstructible from stores alone.
 type ReplicaMember struct {
-	ChannelID         uint64
-	ReplicaID         uint64
+	ChannelID uint64
+	ReplicaID uint64
 	// Transports are every endpoint the peer advertised, in the order it
 	// offered them. The library does not rank them; a Transport
 	// implementation chooses which to dial and may fall back.
@@ -288,17 +288,10 @@ type SecretValue struct {
 
 // Share is a single stored share entry, keyed by (channelID, secretID,
 // version) at the store layer. Mirrors the Rust-side Share struct.
-//
-// ReplicaID does NOT round-trip through EncodeShare/DecodeShare: the wire
-// record used by the FFI bridge (ShareRecord in stores.rs) never carries
-// it — Save drops it on encode and Load always sets it to nil on decode,
-// matching Rust's ShareRecord::into_share() exactly. Callers must not rely
-// on ReplicaID surviving a store round trip through this codec.
 type Share struct {
-	SecretID  uint64
-	Version   uint32
-	ReplicaID *uint64
-	Bytes     []byte
+	SecretID uint64
+	Version  uint32
+	Bytes    []byte
 }
 
 // StateKind tags which category of in-flight orchestrator state a
@@ -316,8 +309,8 @@ const (
 	// StateKindPendingUnpair is an outstanding unpair acknowledgement,
 	// one row per channel.
 	StateKindPendingUnpair StateKind = 2
-	// StateKindSharingRound is the active sharing round, at most one row
-	// per secretID.
+	// StateKindSharingRound is an active sharing round, one row per
+	// in-flight version. Several rounds can be open at once.
 	StateKindSharingRound StateKind = 3
 	// StateKindPendingReplicaDiscovery is an active replica catch-up, at most one
 	// row per secretID. Holds the versions members have reported so far.
@@ -328,7 +321,8 @@ const (
 // field is populated is determined by Kind:
 //   - PendingVerification, PendingUnpair: ChannelID.
 //   - PendingRecovery: SecretID, Version.
-//   - SharingRound: none (at most one row per secretID).
+//   - SharingRound: Version (the version the round distributes).
+//   - PendingReplicaDiscovery: none (at most one row per secretID).
 //
 // SecretID names the secret being recovered, which is not necessarily
 // the secretID partitioning the store: a recovering device runs an
@@ -352,6 +346,9 @@ type StateKey struct {
 //   - SharingRound: Version, Pending/Confirmed/Failed (channel-id sets),
 //     PendingReplicas/SyncedReplicas/BehindReplicas (replica-id sets),
 //     StartedAt (unix seconds).
+//   - PendingReplicaDiscovery: LocalVersion, PendingReplicas (members still
+//     to answer), Reported (replicaID → version each member reported),
+//     StartedAt (unix seconds).
 //
 // The two populations of a sharing round are tracked separately and by
 // different keys: helpers by channelID, group members by replicaID. Every
@@ -374,6 +371,11 @@ type StateItem struct {
 	SyncedReplicas []uint64
 	// BehindReplicas are members that refused, timed out, or were unreachable.
 	BehindReplicas []uint64
+	// LocalVersion is the version this device held when a catch-up started.
+	LocalVersion *uint32
+	// Reported maps each member that has answered a catch-up to the version
+	// it reported.
+	Reported map[uint64]uint32
 }
 
 // Key returns the StateKey this item is stored under, mirroring the
@@ -386,8 +388,10 @@ func (i StateItem) Key() StateKey {
 		return StateKey{Kind: StateKindPendingRecovery, SecretID: i.SecretID, Version: i.Version}
 	case StateKindPendingUnpair:
 		return StateKey{Kind: StateKindPendingUnpair, ChannelID: i.ChannelID}
+	case StateKindPendingReplicaDiscovery:
+		return StateKey{Kind: StateKindPendingReplicaDiscovery}
 	default:
-		return StateKey{Kind: StateKindSharingRound}
+		return StateKey{Kind: StateKindSharingRound, Version: i.Version}
 	}
 }
 
@@ -418,6 +422,9 @@ type UserSecrets struct {
 	Version     uint32
 	Secrets     []UserSecret
 	Description *string
+	// AuthorReplicaID is the replica member that published Version, or nil
+	// when the snapshot records no author. Store it as given.
+	AuthorReplicaID *uint64
 }
 
 // ChannelFilter narrows a listing from ChannelStore.

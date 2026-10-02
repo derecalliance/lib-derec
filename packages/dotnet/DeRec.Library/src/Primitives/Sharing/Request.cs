@@ -89,15 +89,12 @@ public static partial class Sharing
             uint[] keepList,
             string description,
             byte[] sharedKey,
-            IReadOnlyList<TransportProtocol>? replyTo = null,
-            ulong? replicaId = null
+            IReadOnlyList<TransportProtocol>? replyTo = null
         )
         {
             ArgumentNullException.ThrowIfNull(committedShare);
             ArgumentNullException.ThrowIfNull(keepList);
             ArgumentNullException.ThrowIfNull(sharedKey);
-            if (sharedKey.Length != 32)
-                throw new ArgumentException("sharedKey must be exactly 32 bytes.", nameof(sharedKey));
 
             byte[] descriptionBytes = System.Text.Encoding.UTF8.GetBytes(description ?? string.Empty);
             byte[]? replyToBytes = replyTo is { Count: > 0 }
@@ -119,9 +116,7 @@ public static partial class Sharing
                     sharedKey,
                     (UIntPtr)sharedKey.Length,
                     replyToBytes,
-                    replyToLen,
-                    replicaId.HasValue ? 1u : 0u,
-                    replicaId ?? 0
+                    replyToLen
                 );
 
             try
@@ -157,7 +152,7 @@ public static partial class Sharing
                 {
                     ChannelId = nativeResult.ChannelId,
                     RequestProtoBytes = requestBytes,
-                    ReplyTo = TransportProtocol.ResolveReplyTo(inner.ReplyTo, inner.ReplyToTransports),
+                    ReplyTo = TransportProtocol.ResolveReplyTo(inner.ReplyToTransports),
                 };
             }
             finally

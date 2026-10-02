@@ -125,7 +125,7 @@ every SDK:
 
 - `smoke-tests/rust` — Rust primitive + protocol tests. Run with `cargo run -p derec-rust-binding-smoke-test`.
 - `smoke-tests/nodejs` — Node.js WASM tests. `cd smoke-tests/nodejs && npm install && npx tsc && node index.js`.
-- `smoke-tests/web` — Browser WASM tests. `cd smoke-tests/web && npm install && npm run build` and open via `npm run dev`.
+- `smoke-tests/web` — Browser WASM tests in headless Chromium (Playwright). Run with `smoke-tests/web/run_test.sh`; the first run downloads the browser. `npm run dev` in `smoke-tests/web` still opens the suite in a browser for debugging.
 - `smoke-tests/dotnet` — .NET P/Invoke tests against the C ABI, including the orchestrator. `cd smoke-tests/dotnet && dotnet run`.
 - `smoke-tests/react-native` — React Native JSI tests against the C ABI on an iOS simulator
   and an Android emulator, including the orchestrator. Run with

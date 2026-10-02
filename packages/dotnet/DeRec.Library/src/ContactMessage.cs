@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
-using Google.Protobuf;
+using System.Globalization;
+using System.Text.Json;
 
 namespace DeRec.Library;
 
@@ -15,18 +16,6 @@ namespace DeRec.Library;
 /// <param name="ContactMode">
 /// Selects how the public encryption material is delivered. See
 /// <see cref="ContactMode"/>.
-/// </param>
-/// <param name="TransportProtocol">
-/// Transport endpoint and protocol to use when sending protocol messages to the initiator.
-///
-/// <para>
-/// <b>Reading this directly is incorrect.</b> Its meaning narrowed from "the
-/// endpoint" to "one entry of a list, and possibly absent": a creator that has
-/// moved past this field populates only <see cref="SupportedTransports"/>, and
-/// this property is then an empty-URI placeholder. Call
-/// <see cref="AdvertisedEndpoints"/>, which resolves both spellings. Removed at
-/// 0.0.5.
-/// </para>
 /// </param>
 /// <param name="Nonce">
 /// Random nonce that binds the pairing request to this contact exchange.
@@ -47,7 +36,6 @@ namespace DeRec.Library;
 public sealed record ContactMessage(
     ulong ChannelId,
     ContactMode ContactMode,
-    TransportProtocol TransportProtocol,
     ulong Nonce,
     byte[]? MlkemEncapsulationKey,
     byte[]? EciesPublicKey,
@@ -59,11 +47,9 @@ public sealed record ContactMessage(
     /// in its own preference order.
     /// </summary>
     /// <remarks>
-    /// Empty means "only <see cref="TransportProtocol"/> is offered", which is
-    /// how every implementation predating this field advertises. Preserved
-    /// across a decode/encode round trip, so a contact this SDK parses and
-    /// hands back to <c>Pairing.Request.Produce</c> still advertises every
-    /// endpoint the creator offered.
+    /// Preserved across a decode/encode round trip, so a contact this SDK
+    /// parses and hands back to <c>Pairing.Request.Produce</c> still
+    /// advertises every endpoint the creator offered.
     /// </remarks>
     public IReadOnlyList<TransportProtocol> SupportedTransports { get; init; } =
         Array.Empty<TransportProtocol>();
@@ -72,126 +58,98 @@ public sealed record ContactMessage(
     /// The endpoints this contact advertises, in the creator's own order.
     /// </summary>
     /// <remarks>
-    /// Yields <see cref="SupportedTransports"/> when it is non-empty, and
-    /// otherwise the singular <see cref="TransportProtocol"/> — which is how
-    /// every implementation predating the offer list advertises, and the reason
-    /// this is a method rather than a property read. Reports what was
-    /// advertised, not what is acceptable; nothing here is validated.
+    /// Reports what was advertised, not what is acceptable; nothing here is
+    /// validated.
     /// </remarks>
-    public IReadOnlyList<TransportProtocol> AdvertisedEndpoints() =>
-        SupportedTransports.Count > 0
-            ? SupportedTransports
-            : string.IsNullOrEmpty(TransportProtocol.Uri)
-                ? Array.Empty<TransportProtocol>()
-                : new[] { TransportProtocol };
+    public IReadOnlyList<TransportProtocol> AdvertisedEndpoints() => SupportedTransports;
 
     /// <summary>
-    /// Serializes this <see cref="ContactMessage"/> to protobuf wire bytes.
+    /// When the creator produced this contact, or <c>null</c> if unset.
     /// </summary>
-    /// <remarks>
-    /// Structurally validates the contact's <c>(ContactMode, inline keys,
-    /// binding hash)</c> tuple before emitting bytes — a locally constructed
-    /// instance that violates the per-mode invariant raises
-    /// <see cref="DeRecException"/> instead of producing a wire blob that
-    /// downstream consumers would reject anyway.
-    /// </remarks>
-    // Touches the deprecated singular `transportProtocol`: this is the
-    // compatibility path that keeps peers predating `supportedTransports`
-    // working, so the warning is expected here rather than a defect.
-#pragma warning disable CS0612
-    internal byte[] ToProtoBytes()
+    public Timestamp? Timestamp { get; init; }
+
+    /// <summary>
+    /// The JSON shape <c>encode_contact_message</c> reads and
+    /// <c>decode_contact_message</c> writes. Encoding and decoding the wire
+    /// bytes, and enforcing the contact's mode invariants, happen in the
+    /// core: see <see cref="Primitives.Pairing.Request.EncodeContact"/> and
+    /// <see cref="Primitives.Pairing.Request.DecodeContact"/>.
+    /// </summary>
+    internal byte[] ToWireJson()
     {
-        var proto = new Org.Derecalliance.Derec.Protobuf.ContactMessage
+        using var buffer = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(buffer))
         {
-            ChannelId = ChannelId,
-            ContactMode = (Org.Derecalliance.Derec.Protobuf.ContactMode)(int)ContactMode,
-            TransportProtocol = new Org.Derecalliance.Derec.Protobuf.TransportProtocol
+            writer.WriteStartObject();
+            writer.WriteString("channel_id", ChannelId.ToString(CultureInfo.InvariantCulture));
+            writer.WriteString("nonce", Nonce.ToString(CultureInfo.InvariantCulture));
+            writer.WriteNumber("contact_mode", (int)ContactMode);
+            WriteBytes(writer, "mlkem_encapsulation_key", MlkemEncapsulationKey);
+            WriteBytes(writer, "ecies_public_key", EciesPublicKey);
+            WriteBytes(writer, "contact_binding_hash", ContactBindingHash);
+            if (Timestamp is { } ts)
             {
-                Uri = TransportProtocol.Uri,
-                Protocol = (Org.Derecalliance.Derec.Protobuf.Protocol)(int)TransportProtocol.Protocol,
-            },
-            Nonce = Nonce,
-        };
-        foreach (TransportProtocol offer in SupportedTransports)
-        {
-            proto.SupportedTransports.Add(new Org.Derecalliance.Derec.Protobuf.TransportProtocol
+                writer.WriteStartObject("timestamp");
+                writer.WriteNumber("seconds", ts.Seconds);
+                writer.WriteNumber("nanos", ts.Nanos);
+                writer.WriteEndObject();
+            }
+            writer.WriteStartArray("supported_transports");
+            foreach (TransportProtocol endpoint in SupportedTransports)
             {
-                Uri = offer.Uri,
-                Protocol = (Org.Derecalliance.Derec.Protobuf.Protocol)(int)offer.Protocol,
-            });
+                writer.WriteStartObject();
+                writer.WriteString("uri", endpoint.Uri);
+                writer.WriteNumber("protocol", (int)endpoint.Protocol);
+                writer.WriteEndObject();
+            }
+            writer.WriteEndArray();
+            writer.WriteEndObject();
         }
-        if (MlkemEncapsulationKey is { Length: > 0 } mlkem)
-        {
-            proto.MlkemEncapsulationKey = Google.Protobuf.ByteString.CopyFrom(mlkem);
-        }
-        if (EciesPublicKey is { Length: > 0 } ecies)
-        {
-            proto.EciesPublicKey = Google.Protobuf.ByteString.CopyFrom(ecies);
-        }
-        if (ContactBindingHash is { Length: > 0 } hash)
-        {
-            proto.ContactBindingHash = Google.Protobuf.ByteString.CopyFrom(hash);
-        }
-        byte[] bytes = proto.ToByteArray();
-        Validate(bytes);
-        return bytes;
+        return buffer.ToArray();
     }
 
-    /// <summary>
-    /// Deserializes a <see cref="ContactMessage"/> from protobuf wire bytes
-    /// and structurally validates the result against the per-mode invariant
-    /// documented on the wire format. Throws <see cref="DeRecException"/>
-    /// if the contact is malformed (unknown <see cref="ContactMode"/>,
-    /// mode/field mismatch, wrong binding-hash length).
-    /// </summary>
-    // Touches the deprecated singular `transportProtocol`: this is the
-    // compatibility path that keeps peers predating `supportedTransports`
-    // working, so the warning is expected here rather than a defect.
-#pragma warning disable CS0612
-    internal static ContactMessage FromProtoBytes(byte[] bytes)
+    /// <summary>Reads the JSON <see cref="ToWireJson"/> writes.</summary>
+    internal static ContactMessage FromWireJson(byte[] json)
     {
-        Validate(bytes);
-
-        var proto = Org.Derecalliance.Derec.Protobuf.ContactMessage.Parser.ParseFrom(bytes);
-
-        var tp = proto.TransportProtocol is { } protoTp
-            ? new TransportProtocol(protoTp.Uri, (Protocol)(int)protoTp.Protocol)
-            : new TransportProtocol(string.Empty);
-
-        // proto3 `optional bytes` fields are reported via `HasFoo` once set;
-        // if the field was never set the property still returns `ByteString.Empty`,
-        // so we map that case to `null` to match the wire semantics.
-        byte[]? mlkem = proto.HasMlkemEncapsulationKey
-            ? proto.MlkemEncapsulationKey.ToByteArray()
-            : null;
-        byte[]? ecies = proto.HasEciesPublicKey
-            ? proto.EciesPublicKey.ToByteArray()
-            : null;
-        byte[]? hash = proto.HasContactBindingHash
-            ? proto.ContactBindingHash.ToByteArray()
-            : null;
-
+        using JsonDocument doc = JsonDocument.Parse(json);
+        JsonElement root = doc.RootElement;
         return new ContactMessage(
-            ChannelId: proto.ChannelId,
-            ContactMode: (ContactMode)(int)proto.ContactMode,
-            TransportProtocol: tp,
-            Nonce: proto.Nonce,
-            MlkemEncapsulationKey: mlkem,
-            EciesPublicKey: ecies,
-            ContactBindingHash: hash
+            ChannelId: ulong.Parse(root.GetProperty("channel_id").GetString()!, CultureInfo.InvariantCulture),
+            ContactMode: (ContactMode)root.GetProperty("contact_mode").GetInt32(),
+            Nonce: ulong.Parse(root.GetProperty("nonce").GetString()!, CultureInfo.InvariantCulture),
+            MlkemEncapsulationKey: ReadBytes(root, "mlkem_encapsulation_key"),
+            EciesPublicKey: ReadBytes(root, "ecies_public_key"),
+            ContactBindingHash: ReadBytes(root, "contact_binding_hash")
         )
         {
-            SupportedTransports = proto.SupportedTransports
-                .Select(t => new TransportProtocol(t.Uri, (Protocol)(int)t.Protocol))
+            SupportedTransports = root.GetProperty("supported_transports")
+                .EnumerateArray()
+                .Select(t => new TransportProtocol(
+                    t.GetProperty("uri").GetString()!,
+                    (Protocol)t.GetProperty("protocol").GetInt32()))
                 .ToList(),
+            Timestamp = root.TryGetProperty("timestamp", out JsonElement ts) && ts.ValueKind == JsonValueKind.Object
+                ? new Timestamp(ts.GetProperty("seconds").GetInt64(), ts.GetProperty("nanos").GetInt32())
+                : null,
         };
     }
 
-    private static void Validate(byte[] bytes)
+    private static void WriteBytes(Utf8JsonWriter writer, string name, byte[]? value)
     {
-        Native.DeRecError error =
-            Native.Pairing.validate_contact_message(bytes, (UIntPtr)bytes.Length);
-        Utils.ThrowIfError(error);
+        if (value is null)
+        {
+            return;
+        }
+        writer.WriteStartArray(name);
+        foreach (byte b in value)
+        {
+            writer.WriteNumberValue(b);
+        }
+        writer.WriteEndArray();
     }
+
+    private static byte[]? ReadBytes(JsonElement root, string name) =>
+        root.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.Array
+            ? value.EnumerateArray().Select(b => b.GetByte()).ToArray()
+            : null;
 }
-#pragma warning restore CS0612

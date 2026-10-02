@@ -52,13 +52,17 @@ func (m *mockChannelStore) LinkedChannels(secretID, channelID uint64) ([]uint64,
 var _ channelStore = (*mockChannelStore)(nil)
 
 type mockSecretStore struct {
-	loadFn   func(secretID, channelID uint64, kind SecretKind) (SecretValue, bool, error)
-	saveFn   func(secretID, channelID uint64, value SecretValue) error
-	removeFn func(secretID, channelID uint64, kind SecretKind) error
+	loadFn     func(secretID, channelID uint64, kind SecretKind) (SecretValue, bool, error)
+	loadManyFn func(secretID uint64, channelIDs []uint64, kind SecretKind) ([]*SecretValue, error)
+	saveFn     func(secretID, channelID uint64, value SecretValue) error
+	removeFn   func(secretID, channelID uint64, kind SecretKind) error
 }
 
 func (m *mockSecretStore) Load(secretID, channelID uint64, kind SecretKind) (SecretValue, bool, error) {
 	return m.loadFn(secretID, channelID, kind)
+}
+func (m *mockSecretStore) LoadMany(secretID uint64, channelIDs []uint64, kind SecretKind) ([]*SecretValue, error) {
+	return m.loadManyFn(secretID, channelIDs, kind)
 }
 func (m *mockSecretStore) Save(secretID, channelID uint64, value SecretValue) error {
 	return m.saveFn(secretID, channelID, value)
@@ -397,6 +401,48 @@ func TestDispatchSecretLoad_FoundAndNotFound(t *testing.T) {
 	}
 }
 
+func TestDispatchSecretLoadMany_OneEntryPerIDInOrder(t *testing.T) {
+	var gotIDs []uint64
+	var gotKind SecretKind
+	s := &storeSet{secret: &mockSecretStore{
+		loadManyFn: func(secretID uint64, channelIDs []uint64, kind SecretKind) ([]*SecretValue, error) {
+			gotIDs, gotKind = channelIDs, kind
+			return []*SecretValue{{Kind: SecretKindSharedKey, Bytes: []byte{9}}, nil}, nil
+		},
+	}}
+	idsJSON, _ := EncodeUint64Array([]uint64{7, 9})
+	status, out := dispatchSecretLoadMany(s, 1, idsJSON, uint32(SecretKindSharedKey))
+	if status != ffiStatusOK {
+		t.Fatalf("status = %d, want ffiStatusOK", status)
+	}
+	if len(gotIDs) != 2 || gotIDs[0] != 7 || gotIDs[1] != 9 || gotKind != SecretKindSharedKey {
+		t.Fatalf("LoadMany got ids=%v kind=%d", gotIDs, gotKind)
+	}
+	var entries []json.RawMessage
+	if err := json.Unmarshal(out, &entries); err != nil || len(entries) != 2 {
+		t.Fatalf("entries=%s err=%v", out, err)
+	}
+	if v, err := DecodeSecretValue(entries[0]); err != nil || v.Kind != SecretKindSharedKey || len(v.Bytes) != 1 || v.Bytes[0] != 9 {
+		t.Fatalf("entry[0] = %s err=%v", entries[0], err)
+	}
+	if string(entries[1]) != "null" {
+		t.Fatalf("entry[1] = %s, want null", entries[1])
+	}
+}
+
+func TestDispatchSecretLoadMany_ErrorIsFailure(t *testing.T) {
+	s := &storeSet{secret: &mockSecretStore{
+		loadManyFn: func(secretID uint64, channelIDs []uint64, kind SecretKind) ([]*SecretValue, error) {
+			return nil, errors.New("backend down")
+		},
+	}}
+	idsJSON, _ := EncodeUint64Array([]uint64{7})
+	status, out := dispatchSecretLoadMany(s, 1, idsJSON, uint32(SecretKindSharedKey))
+	if status != ffiStatusFailure || out != nil {
+		t.Fatalf("status=%d out=%v, want failure/nil", status, out)
+	}
+}
+
 func TestDispatchSecretSave_PanicRecovered(t *testing.T) {
 	s := &storeSet{secret: &mockSecretStore{
 		saveFn: func(secretID, channelID uint64, value SecretValue) error {
@@ -597,6 +643,32 @@ func TestDispatchUserSecretSaveLatest_PanicRecovered(t *testing.T) {
 	}
 }
 
+func TestDispatchUserSecret_SaveThenLoadPreservesAuthor(t *testing.T) {
+	stored := map[uint64]UserSecrets{}
+	s := &storeSet{userSecret: &mockUserSecretStore{
+		saveLatestFn: func(secretID uint64, value UserSecrets) error {
+			stored[secretID] = value
+			return nil
+		},
+		loadLatestFn: func(secretID uint64) (UserSecrets, bool, error) {
+			v, ok := stored[secretID]
+			return v, ok, nil
+		},
+	}}
+	for _, payload := range []string{
+		`{"version":3,"secrets":[],"author_replica_id":"18446744073709551615"}`,
+		`{"version":4,"secrets":[]}`,
+	} {
+		if status := dispatchUserSecretSaveLatest(s, 7, []byte(payload)); status != ffiStatusOK {
+			t.Fatalf("save status = %d", status)
+		}
+		status, out := dispatchUserSecretLoadLatest(s, 7)
+		if status != ffiStatusOK || string(out) != payload {
+			t.Fatalf("load: status=%d\n got: %s\nwant: %s", status, out, payload)
+		}
+	}
+}
+
 func TestDispatchUserSecretRemove(t *testing.T) {
 	called := false
 	s := &storeSet{userSecret: &mockUserSecretStore{
@@ -657,7 +729,7 @@ func TestDispatchStateLoad_NotFound(t *testing.T) {
 			return StateItem{}, false, nil
 		},
 	}}
-	keyJSON, _ := EncodeStateKey(StateKey{Kind: StateKindSharingRound})
+	keyJSON := []byte(`{"kind":3,"version":1}`)
 	status, out := dispatchStateLoad(s, 1, keyJSON)
 	if status != ffiStatusNotFound || out != nil {
 		t.Fatalf("status=%d out=%v, want not-found/nil", status, out)
@@ -670,7 +742,7 @@ func TestDispatchStateLoad_PanicRecovered(t *testing.T) {
 			panic("state store blew up")
 		},
 	}}
-	keyJSON, _ := EncodeStateKey(StateKey{Kind: StateKindSharingRound})
+	keyJSON := []byte(`{"kind":3,"version":1}`)
 	status, out := dispatchStateLoad(s, 1, keyJSON)
 	if status != ffiStatusFailure || out != nil {
 		t.Fatalf("status=%d out=%v, want failure/nil after recovered panic", status, out)
@@ -683,7 +755,7 @@ func TestDispatchStateRemove(t *testing.T) {
 			return true, nil
 		},
 	}}
-	keyJSON, _ := EncodeStateKey(StateKey{Kind: StateKindSharingRound})
+	keyJSON := []byte(`{"kind":3,"version":1}`)
 	status, removed := dispatchStateRemove(s, 1, keyJSON)
 	if status != ffiStatusOK || !removed {
 		t.Fatalf("status=%d removed=%v", status, removed)

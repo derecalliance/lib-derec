@@ -188,35 +188,6 @@ type PairRequestMessage struct {
 	// The responder combines this with its own parameter range to determine
 	// whether pairing is possible and which parameters to use.
 	ParameterRange *ParameterRange `protobuf:"bytes,7,opt,name=parameterRange,proto3" json:"parameterRange,omitempty"`
-	// Transport information for reaching the initiator.
-	//
-	// This specifies:
-	//
-	// - the endpoint where the initiator can receive messages
-	// - the protocol required to deliver those messages
-	//
-	// After pairing, the responder uses this information to send responses
-	// and all subsequent protocol messages to the initiator.
-	// Deprecated: superseded by `supportedTransports`, which carries every
-	// endpoint rather than one.
-	//
-	// **Reading this field directly is now incorrect.** Its meaning narrowed
-	// from "the endpoint" to "one entry of a list, and possibly absent": an
-	// initiator that has moved past this field advertises only
-	// `supportedTransports`. A reader that was correct before this release is
-	// a bug now — it rejects, or fails to reach, a peer that is offering it a
-	// perfectly good endpoint. Resolve both spellings instead of reading
-	// either: `advertised_endpoints()` (Rust and TypeScript),
-	// `AdvertisedEndpoints()` (Go), `AdvertisedEndpoints()` (.NET).
-	//
-	// Senders still populate it: a sender that sets `supportedTransports`
-	// MUST also set this to a single best-compatibility choice, so
-	// implementations predating the list still pair.
-	//
-	// **Scheduled for removal in v0.0.5.**
-	//
-	// Deprecated: Marked as deprecated in pair.proto.
-	TransportProtocol *TransportProtocol `protobuf:"bytes,8,opt,name=transportProtocol,proto3" json:"transportProtocol,omitempty"`
 	// Timestamp indicating when this message was created.
 	//
 	// Used for observability and may assist in replay detection or timeout
@@ -226,8 +197,8 @@ type PairRequestMessage struct {
 	// initiator's own preference order.
 	//
 	// Same semantics as `ContactMessage.supportedTransports`: the responder
-	// selects by its own preference, and absent means "only
-	// `transportProtocol` is offered".
+	// selects by its own preference, and the list MUST carry at least one
+	// entry.
 	SupportedTransports []*TransportProtocol `protobuf:"bytes,10,rep,name=supportedTransports,proto3" json:"supportedTransports,omitempty"`
 	unknownFields       protoimpl.UnknownFields
 	sizeCache           protoimpl.SizeCache
@@ -301,14 +272,6 @@ func (x *PairRequestMessage) GetNonce() uint64 {
 func (x *PairRequestMessage) GetParameterRange() *ParameterRange {
 	if x != nil {
 		return x.ParameterRange
-	}
-	return nil
-}
-
-// Deprecated: Marked as deprecated in pair.proto.
-func (x *PairRequestMessage) GetTransportProtocol() *TransportProtocol {
-	if x != nil {
-		return x.TransportProtocol
 	}
 	return nil
 }
@@ -504,7 +467,7 @@ var File_pair_proto protoreflect.FileDescriptor
 const file_pair_proto_rawDesc = "" +
 	"\n" +
 	"\n" +
-	"pair.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x17communicationinfo.proto\x1a\x14parameterrange.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\x8f\x05\n" +
+	"pair.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x17communicationinfo.proto\x1a\x14parameterrange.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\xc1\x04\n" +
 	"\x12PairRequestMessage\x12L\n" +
 	"\n" +
 	"senderKind\x18\x01 \x01(\x0e2,.org.derecalliance.derec.protobuf.SenderKindR\n" +
@@ -513,11 +476,10 @@ const file_pair_proto_rawDesc = "" +
 	"\x0eeciesPublicKey\x18\x03 \x01(\fR\x0eeciesPublicKey\x12a\n" +
 	"\x11communicationInfo\x18\x05 \x01(\v23.org.derecalliance.derec.protobuf.CommunicationInfoR\x11communicationInfo\x12\x14\n" +
 	"\x05nonce\x18\x06 \x01(\x04R\x05nonce\x12X\n" +
-	"\x0eparameterRange\x18\a \x01(\v20.org.derecalliance.derec.protobuf.ParameterRangeR\x0eparameterRange\x12e\n" +
-	"\x11transportProtocol\x18\b \x01(\v23.org.derecalliance.derec.protobuf.TransportProtocolB\x02\x18\x01R\x11transportProtocol\x128\n" +
+	"\x0eparameterRange\x18\a \x01(\v20.org.derecalliance.derec.protobuf.ParameterRangeR\x0eparameterRange\x128\n" +
 	"\ttimestamp\x18\t \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12e\n" +
 	"\x13supportedTransports\x18\n" +
-	" \x03(\v23.org.derecalliance.derec.protobuf.TransportProtocolR\x13supportedTransports\"\x87\x03\n" +
+	" \x03(\v23.org.derecalliance.derec.protobuf.TransportProtocolR\x13supportedTransportsJ\x04\b\b\x10\tR\x11transportProtocol\"\x87\x03\n" +
 	"\x13PairResponseMessage\x12E\n" +
 	"\x06result\x18\x01 \x01(\v2-.org.derecalliance.derec.protobuf.DeRecResultR\x06result\x12a\n" +
 	"\x11communicationInfo\x18\x04 \x01(\v23.org.derecalliance.derec.protobuf.CommunicationInfoR\x11communicationInfo\x12\x14\n" +
@@ -553,26 +515,25 @@ var file_pair_proto_goTypes = []any{
 	(*PairResponseMessage)(nil),   // 2: org.derecalliance.derec.protobuf.PairResponseMessage
 	(*CommunicationInfo)(nil),     // 3: org.derecalliance.derec.protobuf.CommunicationInfo
 	(*ParameterRange)(nil),        // 4: org.derecalliance.derec.protobuf.ParameterRange
-	(*TransportProtocol)(nil),     // 5: org.derecalliance.derec.protobuf.TransportProtocol
-	(*timestamppb.Timestamp)(nil), // 6: google.protobuf.Timestamp
+	(*timestamppb.Timestamp)(nil), // 5: google.protobuf.Timestamp
+	(*TransportProtocol)(nil),     // 6: org.derecalliance.derec.protobuf.TransportProtocol
 	(*DeRecResult)(nil),           // 7: org.derecalliance.derec.protobuf.DeRecResult
 }
 var file_pair_proto_depIdxs = []int32{
-	0,  // 0: org.derecalliance.derec.protobuf.PairRequestMessage.senderKind:type_name -> org.derecalliance.derec.protobuf.SenderKind
-	3,  // 1: org.derecalliance.derec.protobuf.PairRequestMessage.communicationInfo:type_name -> org.derecalliance.derec.protobuf.CommunicationInfo
-	4,  // 2: org.derecalliance.derec.protobuf.PairRequestMessage.parameterRange:type_name -> org.derecalliance.derec.protobuf.ParameterRange
-	5,  // 3: org.derecalliance.derec.protobuf.PairRequestMessage.transportProtocol:type_name -> org.derecalliance.derec.protobuf.TransportProtocol
-	6,  // 4: org.derecalliance.derec.protobuf.PairRequestMessage.timestamp:type_name -> google.protobuf.Timestamp
-	5,  // 5: org.derecalliance.derec.protobuf.PairRequestMessage.supportedTransports:type_name -> org.derecalliance.derec.protobuf.TransportProtocol
-	7,  // 6: org.derecalliance.derec.protobuf.PairResponseMessage.result:type_name -> org.derecalliance.derec.protobuf.DeRecResult
-	3,  // 7: org.derecalliance.derec.protobuf.PairResponseMessage.communicationInfo:type_name -> org.derecalliance.derec.protobuf.CommunicationInfo
-	4,  // 8: org.derecalliance.derec.protobuf.PairResponseMessage.parameterRange:type_name -> org.derecalliance.derec.protobuf.ParameterRange
-	6,  // 9: org.derecalliance.derec.protobuf.PairResponseMessage.timestamp:type_name -> google.protobuf.Timestamp
-	10, // [10:10] is the sub-list for method output_type
-	10, // [10:10] is the sub-list for method input_type
-	10, // [10:10] is the sub-list for extension type_name
-	10, // [10:10] is the sub-list for extension extendee
-	0,  // [0:10] is the sub-list for field type_name
+	0, // 0: org.derecalliance.derec.protobuf.PairRequestMessage.senderKind:type_name -> org.derecalliance.derec.protobuf.SenderKind
+	3, // 1: org.derecalliance.derec.protobuf.PairRequestMessage.communicationInfo:type_name -> org.derecalliance.derec.protobuf.CommunicationInfo
+	4, // 2: org.derecalliance.derec.protobuf.PairRequestMessage.parameterRange:type_name -> org.derecalliance.derec.protobuf.ParameterRange
+	5, // 3: org.derecalliance.derec.protobuf.PairRequestMessage.timestamp:type_name -> google.protobuf.Timestamp
+	6, // 4: org.derecalliance.derec.protobuf.PairRequestMessage.supportedTransports:type_name -> org.derecalliance.derec.protobuf.TransportProtocol
+	7, // 5: org.derecalliance.derec.protobuf.PairResponseMessage.result:type_name -> org.derecalliance.derec.protobuf.DeRecResult
+	3, // 6: org.derecalliance.derec.protobuf.PairResponseMessage.communicationInfo:type_name -> org.derecalliance.derec.protobuf.CommunicationInfo
+	4, // 7: org.derecalliance.derec.protobuf.PairResponseMessage.parameterRange:type_name -> org.derecalliance.derec.protobuf.ParameterRange
+	5, // 8: org.derecalliance.derec.protobuf.PairResponseMessage.timestamp:type_name -> google.protobuf.Timestamp
+	9, // [9:9] is the sub-list for method output_type
+	9, // [9:9] is the sub-list for method input_type
+	9, // [9:9] is the sub-list for extension type_name
+	9, // [9:9] is the sub-list for extension extendee
+	0, // [0:9] is the sub-list for field type_name
 }
 
 func init() { file_pair_proto_init() }

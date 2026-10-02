@@ -585,20 +585,15 @@ mod tests {
             .expect("seed NoKeys pairing contact");
     }
 
-    // Compatibility, not oversight — see the `transport` module docs.
-    #[allow(deprecated)]
     fn request_answering_on(uri: &str, protocol: derec_proto::Protocol) -> PendingAction {
         PendingAction::PrePair {
             channel_id: CHANNEL,
             request: derec_proto::PrePairRequestMessage {
                 nonce: NONCE,
-                // Exercises the deprecated singular spelling deliberately:
-                // a peer predating `supportedTransports` sends only this.
-                transport_protocol: Some(derec_proto::TransportProtocol {
+                supported_transports: vec![derec_proto::TransportProtocol {
                     uri: uri.to_owned(),
                     protocol: protocol as i32,
-                }),
-                supported_transports: Vec::new(),
+                }],
                 timestamp: None,
             },
             trace_id: 0,
@@ -679,12 +674,8 @@ mod tests {
         });
     }
 
-    // Constructs the deprecated singular field explicitly: this test covers
-    // the list spelling, so it states the singular one is absent.
-    #[allow(deprecated)]
     /// A requester offering both is answered over the secure one rather than
-    /// refused outright — one bad endpoint does not sink the request. This is
-    /// what filtering buys over the fail-fast the singular field forced.
+    /// refused outright — one bad endpoint does not sink the request.
     #[test]
     fn a_plaintext_entry_is_skipped_when_a_secure_one_is_offered() {
         run_async(async {
@@ -698,7 +689,6 @@ mod tests {
                     channel_id: CHANNEL,
                     request: derec_proto::PrePairRequestMessage {
                         nonce: NONCE,
-                        transport_protocol: None,
                         supported_transports: vec![
                             derec_proto::TransportProtocol {
                                 uri: "http://192.168.1.42:8080".to_owned(),

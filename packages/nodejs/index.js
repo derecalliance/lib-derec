@@ -6,11 +6,29 @@ const wasm = require("./derec_library.js");
 const DeRecProtocol = wasm.DeRecProtocolWasm;
 const DeRecProtocolBuilder = wasm.DeRecProtocolBuilder;
 
+// A second `free()`, or one after `build()` consumed the builder, finds the
+// handle already released; it returns instead of passing a null handle to the
+// library, the same as .NET `Dispose` and Go `Close`.
+function releaseOnce(Class) {
+  const release = Class.prototype.free;
+  Class.prototype.free = function free() {
+    if (this.__wbg_ptr !== 0) release.call(this);
+  };
+  Class.prototype[Symbol.dispose] = function dispose() {
+    this.free();
+  };
+}
+
+releaseOnce(DeRecProtocol);
+releaseOnce(DeRecProtocolBuilder);
+
 const SenderKind = Object.freeze({ Owner: 0, Helper: 1, ReplicaSource: 3, ReplicaDestination: 4 });
 
 const ContactMode = Object.freeze({ InlineKeys: 0, HashedKeys: 1, NoKeys: 2 });
 
 const FlowKind = Object.freeze({ Pairing: 0, Discovery: 1, ProtectSecret: 2, VerifyShares: 3, RecoverSecret: 4, Unpair: 5, UpdateChannelInfo: 6, ReplicaDiscovery: 7, UnpairReplica: 8 });
+
+const StatusEnum = Object.freeze({ Ok: 0, Partial: 1, Fail: 2, SizeLimitExceeded: 3, TooFrequent: 4, UnknownSecretId: 5, UnknownShareVersion: 6, DecryptionFailed: 7, VerificationFailed: 8, FormatError: 9, Rejected: 10, IncompatibleParameterRange: 11, UnsupportedTransportProtocol: 12, VersionConflict: 13, ReplicaIdConflict: 14, RequestToClose: 99 });
 
 const primitives = {
   discovery: {
@@ -41,7 +59,10 @@ const primitives = {
       produce_pre_pair: wasm.pairing_response_produce_pre_pair,
       extract_pre_pair: wasm.pairing_response_extract_pre_pair,
       process_pre_pair: wasm.pairing_response_process_pre_pair,
+      produce_pre_pair_no_keys: wasm.pairing_response_produce_pre_pair_no_keys,
+      process_pre_pair_no_keys: wasm.pairing_response_process_pre_pair_no_keys,
     },
+    fingerprint: wasm.pairing_fingerprint,
   },
   recovery: {
     request: {
@@ -121,9 +142,15 @@ function channelFilterMatches(filter, id, status, role) {
 
 function advertisedEndpoints(message) {
   if (!message) return [];
-  const offers = message.supported_transports ?? [];
-  if (offers.length > 0) return offers;
-  return message.transport_protocol ? [message.transport_protocol] : [];
+  return message.supported_transports ?? [];
+}
+
+function protocol_version() {
+  return wasm.protocol_version();
+}
+
+function generate_replica_id() {
+  return wasm.generate_replica_id();
 }
 
 function sequentialFailover(dialer) {
@@ -161,6 +188,8 @@ module.exports = {
   primitives,
   channelFilterMatches,
   advertisedEndpoints,
+  protocol_version,
+  generate_replica_id,
   sequentialFailover,
   singleEndpointTransport,
   envelope,
@@ -169,4 +198,5 @@ module.exports = {
   SenderKind,
   ContactMode,
   FlowKind,
+  StatusEnum,
 };

@@ -83,25 +83,10 @@ type GetSecretIdsVersionsRequestMessage struct {
 	// - replay detection (in combination with sequence numbers)
 	// - timeout handling
 	Timestamp *timestamppb.Timestamp `protobuf:"bytes,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
-	// Ephemeral transport endpoint at which the requester wants to receive
-	// the response to *this exchange*, overriding the channel's stored peer
-	// endpoint for this round-trip only.
-	//
-	// See `StoreShareRequestMessage.replyTo` for full semantics.
-	//
-	// Superseded by `replyToTransports`, which carries every endpoint rather
-	// than one. Kept, and still populated with the list's first entry, so
-	// implementations predating that field still receive a reply.
-	// **Scheduled for removal in v0.0.5.** Reading this field directly is now
-	// incorrect — resolve it against `replyToTransports`.
-	//
-	// Deprecated: Marked as deprecated in secretidsversions.proto.
-	ReplyTo *TransportProtocol `protobuf:"bytes,2,opt,name=replyTo,proto3,oneof" json:"replyTo,omitempty"`
 	// Every ephemeral endpoint the requester wants this exchange's response
 	// delivered to, in its own preference order.
 	//
-	// See `StoreShareRequestMessage.replyToTransports` for full semantics,
-	// including why this is a new tag rather than a widened `replyTo`.
+	// See `StoreShareRequestMessage.replyToTransports` for full semantics.
 	ReplyToTransports []*TransportProtocol `protobuf:"bytes,4,rep,name=replyToTransports,proto3" json:"replyToTransports,omitempty"`
 	// Identity of the replica-group member this message concerns.
 	//
@@ -150,14 +135,6 @@ func (*GetSecretIdsVersionsRequestMessage) Descriptor() ([]byte, []int) {
 func (x *GetSecretIdsVersionsRequestMessage) GetTimestamp() *timestamppb.Timestamp {
 	if x != nil {
 		return x.Timestamp
-	}
-	return nil
-}
-
-// Deprecated: Marked as deprecated in secretidsversions.proto.
-func (x *GetSecretIdsVersionsRequestMessage) GetReplyTo() *TransportProtocol {
-	if x != nil {
-		return x.ReplyTo
 	}
 	return nil
 }
@@ -436,16 +413,13 @@ var File_secretidsversions_proto protoreflect.FileDescriptor
 
 const file_secretidsversions_proto_rawDesc = "" +
 	"\n" +
-	"\x17secretidsversions.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\xd6\x02\n" +
+	"\x17secretidsversions.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\fresult.proto\x1a\x17transportprotocol.proto\"\x81\x02\n" +
 	"\"GetSecretIdsVersionsRequestMessage\x128\n" +
-	"\ttimestamp\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12V\n" +
-	"\areplyTo\x18\x02 \x01(\v23.org.derecalliance.derec.protobuf.TransportProtocolB\x02\x18\x01H\x00R\areplyTo\x88\x01\x01\x12a\n" +
+	"\ttimestamp\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12a\n" +
 	"\x11replyToTransports\x18\x04 \x03(\v23.org.derecalliance.derec.protobuf.TransportProtocolR\x11replyToTransports\x12!\n" +
-	"\treplicaId\x18\x03 \x01(\x04H\x01R\treplicaId\x88\x01\x01B\n" +
+	"\treplicaId\x18\x03 \x01(\x04H\x00R\treplicaId\x88\x01\x01B\f\n" +
 	"\n" +
-	"\b_replyToB\f\n" +
-	"\n" +
-	"_replicaId\"\xcc\x04\n" +
+	"_replicaIdJ\x04\b\x02\x10\x03R\areplyTo\"\xcc\x04\n" +
 	"#GetSecretIdsVersionsResponseMessage\x12E\n" +
 	"\x06result\x18\x01 \x01(\v2-.org.derecalliance.derec.protobuf.DeRecResultR\x06result\x12q\n" +
 	"\n" +
@@ -486,17 +460,16 @@ var file_secretidsversions_proto_goTypes = []any{
 }
 var file_secretidsversions_proto_depIdxs = []int32{
 	4, // 0: org.derecalliance.derec.protobuf.GetSecretIdsVersionsRequestMessage.timestamp:type_name -> google.protobuf.Timestamp
-	5, // 1: org.derecalliance.derec.protobuf.GetSecretIdsVersionsRequestMessage.replyTo:type_name -> org.derecalliance.derec.protobuf.TransportProtocol
-	5, // 2: org.derecalliance.derec.protobuf.GetSecretIdsVersionsRequestMessage.replyToTransports:type_name -> org.derecalliance.derec.protobuf.TransportProtocol
-	6, // 3: org.derecalliance.derec.protobuf.GetSecretIdsVersionsResponseMessage.result:type_name -> org.derecalliance.derec.protobuf.DeRecResult
-	2, // 4: org.derecalliance.derec.protobuf.GetSecretIdsVersionsResponseMessage.secretList:type_name -> org.derecalliance.derec.protobuf.GetSecretIdsVersionsResponseMessage.VersionList
-	4, // 5: org.derecalliance.derec.protobuf.GetSecretIdsVersionsResponseMessage.timestamp:type_name -> google.protobuf.Timestamp
-	3, // 6: org.derecalliance.derec.protobuf.GetSecretIdsVersionsResponseMessage.VersionList.versions:type_name -> org.derecalliance.derec.protobuf.GetSecretIdsVersionsResponseMessage.VersionList.VersionEntry
-	7, // [7:7] is the sub-list for method output_type
-	7, // [7:7] is the sub-list for method input_type
-	7, // [7:7] is the sub-list for extension type_name
-	7, // [7:7] is the sub-list for extension extendee
-	0, // [0:7] is the sub-list for field type_name
+	5, // 1: org.derecalliance.derec.protobuf.GetSecretIdsVersionsRequestMessage.replyToTransports:type_name -> org.derecalliance.derec.protobuf.TransportProtocol
+	6, // 2: org.derecalliance.derec.protobuf.GetSecretIdsVersionsResponseMessage.result:type_name -> org.derecalliance.derec.protobuf.DeRecResult
+	2, // 3: org.derecalliance.derec.protobuf.GetSecretIdsVersionsResponseMessage.secretList:type_name -> org.derecalliance.derec.protobuf.GetSecretIdsVersionsResponseMessage.VersionList
+	4, // 4: org.derecalliance.derec.protobuf.GetSecretIdsVersionsResponseMessage.timestamp:type_name -> google.protobuf.Timestamp
+	3, // 5: org.derecalliance.derec.protobuf.GetSecretIdsVersionsResponseMessage.VersionList.versions:type_name -> org.derecalliance.derec.protobuf.GetSecretIdsVersionsResponseMessage.VersionList.VersionEntry
+	6, // [6:6] is the sub-list for method output_type
+	6, // [6:6] is the sub-list for method input_type
+	6, // [6:6] is the sub-list for extension type_name
+	6, // [6:6] is the sub-list for extension extendee
+	0, // [0:6] is the sub-list for field type_name
 }
 
 func init() { file_secretidsversions_proto_init() }

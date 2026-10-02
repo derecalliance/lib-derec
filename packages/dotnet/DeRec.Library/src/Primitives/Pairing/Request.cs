@@ -66,8 +66,7 @@ public static partial class Pairing
         /// (only appropriate when the OOB delivery channel is fully trusted).
         /// </param>
         /// <param name="transportProtocols">Every endpoint this initiator serves, in
-        /// preference order. The whole list is advertised; the first entry also
-        /// fills the legacy singular field for peers predating the offer list.</param>
+        /// preference order. The whole list is advertised.</param>
         /// <param name="nonce"><c>null</c> lets the library generate a fresh
         /// random <c>ulong</c>. Required for <see cref="ContactMode.NoKeys"/>
         /// where callers typically pick a small human-typable value.</param>
@@ -97,7 +96,7 @@ public static partial class Pairing
                 Utils.ThrowIfError(nativeResult.Error);
                 return new CreateContactResult
                 {
-                    ContactMessage = ContactMessage.FromProtoBytes(Utils.CopyBuffer(nativeResult.ContactWireBytes)),
+                    ContactMessage = DecodeContact(Utils.CopyBuffer(nativeResult.ContactWireBytes)),
                     // Empty for NoKeys (no key material at contact-creation
                     // time); populated for InlineKeys / HashedKeys.
                     SecretKeyMaterial = Utils.CopyBuffer(nativeResult.SecretKeyMaterial),
@@ -107,6 +106,56 @@ public static partial class Pairing
             {
                 Utils.FreeBuffer(nativeResult.ContactWireBytes);
                 Utils.FreeBuffer(nativeResult.SecretKeyMaterial);
+            }
+        }
+
+        /// <summary>
+        /// Serializes a <see cref="ContactMessage"/> to the protobuf bytes
+        /// delivered out of band (typically as a QR code).
+        /// </summary>
+        /// <exception cref="DeRecException">
+        /// The contact violates the invariants of its <see cref="ContactMode"/>,
+        /// or advertises no endpoint.
+        /// </exception>
+        public static byte[] EncodeContact(ContactMessage contactMessage)
+        {
+            byte[] json = contactMessage.ToWireJson();
+
+            Native.Pairing.EncodeContactMessageResult nativeResult =
+                Native.Pairing.encode_contact_message(json, (UIntPtr)json.Length);
+
+            try
+            {
+                Utils.ThrowIfError(nativeResult.Error);
+                return Utils.CopyBuffer(nativeResult.WireBytes);
+            }
+            finally
+            {
+                Utils.FreeBuffer(nativeResult.WireBytes);
+            }
+        }
+
+        /// <summary>
+        /// Parses out-of-band contact bytes back into the
+        /// <see cref="ContactMessage"/> a scanner pairs against.
+        /// </summary>
+        /// <exception cref="DeRecException">
+        /// The bytes are not a contact, or the contact violates the invariants
+        /// of its <see cref="ContactMode"/>.
+        /// </exception>
+        public static ContactMessage DecodeContact(byte[] bytes)
+        {
+            Native.Pairing.DecodeContactMessageResult nativeResult =
+                Native.Pairing.decode_contact_message(bytes, (UIntPtr)bytes.Length);
+
+            try
+            {
+                Utils.ThrowIfError(nativeResult.Error);
+                return ContactMessage.FromWireJson(Utils.CopyBuffer(nativeResult.ContactJson));
+            }
+            finally
+            {
+                Utils.FreeBuffer(nativeResult.ContactJson);
             }
         }
 
@@ -126,7 +175,7 @@ public static partial class Pairing
         )
         {
             byte[] transportProtocolBytes = TransportProtocol.ToProtoBytesList(transportProtocols);
-            byte[] contactMessageBytes = contactMessage.ToProtoBytes();
+            byte[] contactMessageBytes = EncodeContact(contactMessage);
 
             Native.Pairing.ProducePairRequestMessageResult nativeResult =
                 Native.Pairing.produce_pair_request_message(
@@ -147,7 +196,7 @@ public static partial class Pairing
                 return new ProduceResult
                 {
                     Envelope = DeRecMessage.FromProtoBytes(Utils.CopyBuffer(nativeResult.RequestWireBytes)),
-                    InitiatorContactMessage = ContactMessage.FromProtoBytes(Utils.CopyBuffer(nativeResult.InitiatorContactMessageWireBytes)),
+                    InitiatorContactMessage = DecodeContact(Utils.CopyBuffer(nativeResult.InitiatorContactMessageWireBytes)),
                     SecretKeyMaterial = Utils.CopyBuffer(nativeResult.SecretKeyMaterial),
                 };
             }
@@ -159,7 +208,17 @@ public static partial class Pairing
             }
         }
 
-        public static ExtractResult Extract(DeRecMessage request, byte[] secretKeyMaterial)
+        /// <summary>
+        /// Decrypts a pairing request. <paramref name="parameterRange"/> is the
+        /// serialized <c>ParameterRange</c> this side accepts, or null for none;
+        /// a request advertising a range that does not overlap it is refused
+        /// with <see cref="DeRecCode.IncompatibleParameterRange"/>.
+        /// </summary>
+        public static ExtractResult Extract(
+            DeRecMessage request,
+            byte[] secretKeyMaterial,
+            byte[]? parameterRange = null
+        )
         {
             byte[] requestBytes = request.ToProtoBytes();
 
@@ -168,7 +227,9 @@ public static partial class Pairing
                     requestBytes,
                     (UIntPtr)requestBytes.Length,
                     secretKeyMaterial,
-                    (UIntPtr)secretKeyMaterial.Length
+                    (UIntPtr)secretKeyMaterial.Length,
+                    parameterRange,
+                    (UIntPtr)(parameterRange?.Length ?? 0)
                 );
 
             try
@@ -188,11 +249,11 @@ public static partial class Pairing
 
         /// <summary>
         /// Scanner-side: builds a plaintext <c>PrePairRequest</c> envelope when
-        /// the contact was sent with <see cref="ContactMode.HashedKeys"/>. The
-        /// keys obtained via the matching <c>PrePairResponse</c> MUST be checked
-        /// against the contact's binding hash with
-        /// <see cref="Response.ProcessPrePair"/> before proceeding to a normal
-        /// <see cref="Produce"/>.
+        /// the contact was sent with <see cref="ContactMode.HashedKeys"/> or
+        /// <see cref="ContactMode.NoKeys"/>. The matching <c>PrePairResponse</c>
+        /// MUST go through <see cref="Response.ProcessPrePair"/> (HashedKeys) or
+        /// <see cref="Response.ProcessPrePairNoKeys"/> (NoKeys) before proceeding
+        /// to a normal <see cref="Produce"/>.
         /// </summary>
         public static ProducePrePairResult ProducePrePair(
             IReadOnlyList<TransportProtocol> transportProtocols,
@@ -200,7 +261,7 @@ public static partial class Pairing
         )
         {
             byte[] transportProtocolBytes = TransportProtocol.ToProtoBytesList(transportProtocols);
-            byte[] contactMessageBytes = contactMessage.ToProtoBytes();
+            byte[] contactMessageBytes = EncodeContact(contactMessage);
 
             Native.Pairing.ProducePrePairRequestMessageResult nativeResult =
                 Native.Pairing.produce_pre_pair_request_message(

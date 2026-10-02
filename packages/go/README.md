@@ -81,7 +81,7 @@ func main() {
 		sharedKey        = make([]byte, 32) // established during pairing
 	)
 
-	envelope, err := verification.Request.Produce(channelID, secretID, version, sharedKey)
+	envelope, err := verification.Request.Produce(channelID, secretID, version, sharedKey, nil)
 	if err != nil {
 		panic(err)
 	}
@@ -105,6 +105,9 @@ The `ContactMessage` is exchanged out-of-band (QR codes, existing messaging chan
 |---|---|---|
 | `ContactModeInlineKeys` (default) | Full ML-KEM encapsulation key + ECIES public key | Out-of-band channel can carry the keys (NFC, messaging). |
 | `ContactModeHashedKeys` | Only a SHA-384 commitment to the keys | Channel is size-constrained (QR codes). Scanner fetches the actual keys via a plaintext `PrePair` round-trip and verifies them against the hash. |
+| `ContactModeNoKeys` | No key material and no hash | The contact must be small enough for a person to read out or type. The creator generates keys when a `PrePair` request arrives (`Response.ProducePrePairNoKeys` / `Response.ProcessPrePairNoKeys`). Nothing binds those keys to the contact, so the pairing must be confirmed by comparing fingerprints out of band before use — the orchestrator keeps the channel `Pending` until `VerifyFingerprint` succeeds. |
+
+`pairing.Request.EncodeContact` turns a typed `pairing.ContactMessage` into the bytes that travel out of band, and `pairing.Request.DecodeContact` turns them back. Both refuse a contact whose fields do not match its mode.
 
 After the handshake completes, **both modes** rekey the channel id: the responder derives a new id from the shared key, includes it in the encrypted pairing response, and both sides switch their local state to it. The new id never appears in plaintext on the wire.
 
@@ -141,17 +144,22 @@ func main() {
 	must(err)
 
 	// Step 3: Initiator extracts the request and produces the response.
-	extractedReq, err := pairing.Request.Extract(producedReq.Envelope, created.SecretKeyMaterial)
+	extractedReq, err := pairing.Request.Extract(producedReq.Envelope, created.SecretKeyMaterial, nil)
 	must(err)
-	producedResp, err := pairing.Response.Produce(channelID, extractedReq.RequestProto, created.SecretKeyMaterial, nil, nil)
+	producedResp, err := pairing.Response.Produce(channelID, extractedReq.RequestProto, created.SecretKeyMaterial, nil, nil, false)
 	must(err)
 
 	// Step 4: Responder extracts and processes the response.
 	extractedResp, err := pairing.Response.Extract(producedResp.Envelope, producedReq.SecretKeyMaterial)
 	must(err)
-	processed, err := pairing.Response.Process(producedReq.InitiatorContactMessage, extractedResp.ResponseProto, producedReq.SecretKeyMaterial)
+	processed, err := pairing.Response.Process(producedReq.InitiatorContactMessage, extractedResp.ResponseProto, producedReq.SecretKeyMaterial, nil)
 	must(err)
 
+	// The nil arguments to Request.Extract, Response.Produce and
+	// Response.Process are the serialized ParameterRange this side accepts.
+	// Each of them refuses a peer range that does not overlap it with
+	// derec.CodeIncompatibleParameterRange.
+	//
 	// Both sides hold the same shared key and rekeyed channel id.
 	// producedResp.SharedKey   == processed.SharedKey
 	// producedResp.ChannelID   == processed.ChannelID  !=  channelID
@@ -206,10 +214,12 @@ shares, err := sharing.Request.Split(secretID, secretData, channelIDs, threshold
 // shares: map[uint64][]byte — channel id -> one CommittedDeRecShare per helper.
 
 for channelID, committedShare := range shares {
-	envelope, err := sharing.Request.Produce(channelID, version, secretID, committedShare, nil, "", sharedKeys[channelID])
+	envelope, err := sharing.Request.Produce(channelID, version, secretID, committedShare, nil, "", sharedKeys[channelID], nil)
 	// send envelope over your transport
 }
 ```
+
+The last argument of every request `Produce` (sharing, verification, recovery, discovery, unpairing) is `replyTo []Endpoint`: the endpoints, in preference order, the peer should answer on. `nil` means answer on the endpoints recorded for the channel.
 
 The helper side extracts with `sharing.Request.Extract`, persists the request, and answers with `sharing.Response.Produce` (returning the `CommittedShare`, `SecretID`, and `Version` it stored). The owner confirms with `sharing.Response.Extract` + `sharing.Response.Process`.
 
@@ -221,7 +231,7 @@ The helper side extracts with `sharing.Request.Extract`, persists the request, a
 import "github.com/derecalliance/lib-derec/packages/go/primitives/verification"
 
 // Owner side: produce the challenge.
-requestEnvelope, err := verification.Request.Produce(channelID, secretID, version, sharedKey)
+requestEnvelope, err := verification.Request.Produce(channelID, secretID, version, sharedKey, nil)
 
 // Helper side: decrypt and answer with proof of possession.
 req, err := verification.Request.Extract(requestEnvelope, sharedKey)
@@ -240,7 +250,7 @@ valid, err := verification.Response.Process(req.RequestProto, resp.ResponseProto
 import "github.com/derecalliance/lib-derec/packages/go/primitives/recovery"
 
 // Owner side: request the stored share from each paired helper.
-requestEnvelope, err := recovery.Request.Produce(channelID, secretID, version, sharedKey)
+requestEnvelope, err := recovery.Request.Produce(channelID, secretID, version, sharedKey, nil)
 
 // Helper side: answer using the StoreShareRequest proto it persisted at sharing time.
 req, err := recovery.Request.Extract(requestEnvelope, sharedKey)
@@ -270,7 +280,7 @@ recovered, err := recovery.Response.Recover([]recovery.ShareResponse{
 import "github.com/derecalliance/lib-derec/packages/go/primitives/discovery"
 
 // Owner side: ask a helper which secret ids/versions it holds.
-requestEnvelope, err := discovery.Request.Produce(channelID, sharedKey)
+requestEnvelope, err := discovery.Request.Produce(channelID, sharedKey, nil)
 
 // Helper side: decrypt and advertise its stored versions.
 _, err = discovery.Request.Extract(requestEnvelope, sharedKey)
@@ -300,7 +310,7 @@ For applications that don't want to drive the primitive produce/extract/process 
 - `protocol.ShareStore` — stored shares
 - `protocol.UserSecretStore` — the latest user-facing secret snapshot per `secretID`
 - `protocol.StateStore` — in-flight orchestrator state (pending verification/recovery/unpair/sharing rounds)
-- `protocol.Transport` — outbound delivery (`Send(uri string, protocol int32, message []byte) error`)
+- `protocol.Transport` — outbound delivery (`Send(endpoints []protocol.Endpoint, message []byte) error`). Implement `protocol.SendOne` for a single endpoint and wrap it in `protocol.SequentialFailover` (or `protocol.SingleEndpointTransport`); when every endpoint fails, the adapter returns the last dialer error unchanged, so `errors.Is` / `errors.As` against your own dialer errors keep working
 
 #### Filtered listings
 
@@ -330,14 +340,19 @@ filter faithfully is still your job.
 import (
 	"github.com/derecalliance/lib-derec/packages/go/derecpb"
 	"github.com/derecalliance/lib-derec/packages/go/protocol"
+	"google.golang.org/protobuf/proto"
 )
 
 cfg := protocol.Config{
-	SecretID:             secretID,
-	OwnTransportURI:      "https://owner.example.com",
-	OwnTransportProtocol: int32(derecpb.Protocol_HTTPS),
-	Threshold:            2, // default 3
-	KeepVersionsCount:    3, // default 3
+	SecretID: secretID,
+	OwnTransports: []protocol.TransportProtocolParam{
+		{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)},
+	},
+	Threshold:         proto.Uint32(2), // nil: library default (3)
+	KeepVersionsCount: proto.Uint32(3), // nil: library default (3)
+	Timeouts: &protocol.Timeouts{
+		SharingRoundSecs: proto.Uint64(30), // whole seconds; nil: library default
+	},
 }
 
 p, err := protocol.New(channelStore, shareStore, secretStore, userSecretStore, stateStore, transport, cfg)
@@ -346,6 +361,8 @@ if err != nil {
 }
 defer p.Close()
 ```
+
+Numeric settings are pointers so that "unset" and `0` stay distinct: `nil` takes the library default, and any value you set — `0` included — is passed to the library unchanged, which accepts or rejects it (a `Threshold` below 2 fails `protocol.New` with `derec.CodeInvalidInput`). `proto.Uint32` / `proto.Uint64` build the pointer inline. `Timeouts` fields are whole seconds, the unit the library takes.
 
 `channelStore`/`shareStore`/`secretStore`/`userSecretStore`/`stateStore`/`transport` are your application's implementations of the six interfaces above. The repository's end-to-end tests carry complete in-memory implementations of all six — see [End-to-end test coverage](https://github.com/derecalliance/lib-derec#end-to-end-test-coverage).
 
@@ -357,7 +374,7 @@ contact, err := p.CreateContact(nil, protocol.ContactModeInlineKeys, nil)
 
 // Peer starts the handshake from it.
 events, err := peer.Start(protocol.FlowKindPairing, protocol.PairingParams{
-	Kind:    int32(protocol.SenderKindHelper),
+	Kind:    protocol.SenderKindHelper,
 	Contact: contact.ContactBytes,
 })
 
@@ -367,19 +384,23 @@ events, err = p.Process(inboundBytes)
 for _, ev := range events {
 	switch ev.Type {
 	case protocol.EventTypePairingCompleted:
-		// ev.ChannelID now holds the rekeyed channel id.
+		// ev.ChannelID (uint64) now holds the rekeyed channel id.
 	case protocol.EventTypeActionRequired:
-		// Application decides: p.Accept(ev.Action) or p.Reject(ev.Action, status, memo).
+		// Application decides: p.Accept(ev.Action), or
+		// p.Reject(ev.Action, derecpb.StatusEnum_REJECTED, "not now").
 		_, err = p.Accept(ev.Action)
+	case protocol.EventTypeShareRejected:
+		// ev.Status is the derecpb.StatusEnum the helper answered with,
+		// e.g. derecpb.StatusEnum_SIZE_LIMIT_EXCEEDED; ev.Memo explains it.
 	}
 }
 ```
 
 `Start` accepts a `FlowKind` plus the matching params struct: `protocol.PairingParams`, `protocol.DiscoveryParams`, `protocol.ProtectSecretParams`, `protocol.VerifySharesParams`, `protocol.RecoverSecretParams`, `protocol.UnpairParams`, or `protocol.UpdateChannelInfoParams`. Fan-out flows (`FlowKindDiscovery`, `FlowKindVerifyShares`, `FlowKindUpdateChannelInfo`) take a `protocol.Target`, built with `protocol.TargetAll()`, `protocol.TargetOne(channelID)`, or `protocol.TargetMany(channelIDs...)`.
 
-`Process` returns `[]protocol.Event`, decoded from the same JSON event stream the Rust core emits — compare `Event.Type` against the `protocol.EventType*` constants (`EventTypePairingCompleted`, `EventTypeShareStored`, `EventTypeShareConfirmed`, `EventTypeSecretRecovered`, `EventTypeActionRequired`, …) rather than hand-typing the string.
+`Process` returns `[]protocol.Event`, decoded from the same JSON event stream the Rust core emits — compare `Event.Type` against the `protocol.EventType*` constants (`EventTypePairingCompleted`, `EventTypeShareStored`, `EventTypeShareConfirmed`, `EventTypeSecretRecovered`, `EventTypeActionRequired`, …) rather than hand-typing the string. Every u64 identifier on an event (`ChannelID`, `PairingChannelID`, `SecretID`, `TraceID`, the replica ids, `Synced` / `Behind`) and inside the recovered `Secret` (`Helper.ChannelID`, `Replicas.ChannelID`, `Replica.ReplicaID`) is a `uint64`, `Replica.Role` is a `protocol.ReplicaRole` (`ReplicaRoleSource` / `ReplicaRoleDestination`), and `Event.Kind` / `Event.SenderKind` are a `protocol.SenderKind` (`SenderKindOwner` / `SenderKindHelper` / `SenderKindReplicaSource` / `SenderKindReplicaDestination`) — the same type as `pairing.SenderKind` and `PairingParams.Kind`.
 
-When recovering a secret onto a fresh instance, pass the typed `Secret` from a `SecretRecovered` (or `ReplicaSecretReceived`) event to `p.Restore(secret, version)` to commit canonical helper state and wipe the throwaway recovery-mode channels.
+When recovering a secret onto a fresh instance, pass the typed `Secret` from a `SecretRecovered` (or `ReplicaSecretReceived`) event to `p.Restore(secret, version)` to commit canonical helper state and wipe the throwaway recovery-mode channels. A helper or member with no endpoint in the recovered roster gets no channel; `Restore` returns an event with `Type == EventTypePeerNotRestored` and `Reason == NotRestoredReasonNoTransports` for it (`ReplicaID` is set for a replica member) and restores the rest. If channels already exist at ids `Restore` is about to write, `Restore` fails with a `*derec.Error` whose `Code` is `derec.CodeRestoreConflict` and whose `ConflictingChannelIDs` (`[]uint64`) lists exactly those ids — clear them and retry.
 
 Reference: the repository's end-to-end tests drive a complete Owner + two Helpers pairing → protect-secret → recovery cycle — see [End-to-end test coverage](https://github.com/derecalliance/lib-derec#end-to-end-test-coverage).
 
@@ -387,7 +408,7 @@ Reference: the repository's end-to-end tests drive a complete Owner + two Helper
 
 ## Package Layout
 
-- [`derec`](derec/) — the shared error vocabulary: `derec.Error` (`Category`, `Code`, `Message`, `PeerStatus`, `PeerMemo`, `Expected`, `Got`) and the `Category*`/`Code*` constants every fallible call can return.
+- [`derec`](derec/) — the shared error vocabulary: `derec.Error` (`Category`, `Code`, `Message`, `PeerStatus`, `PeerMemo`, `Expected`, `Got`, plus `CategoryName()`/`CodeName()` returning the library's stable names) and the `Category*`/`Code*` constants every fallible call can return; and `derec.CurrentProtocolVersion()`, the core's protocol version for audit logs.
 - [`derecpb`](derecpb/) — generated protobuf Go types for the DeRec wire messages (`TransportProtocol`, `CommunicationInfo`, `ContactMessage`, …).
 - [`primitives`](primitives/) — one package per flow (`pairing`, `sharing`, `verification`, `recovery`, `discovery`, `unpairing`, `envelope`), each exposing stateless `Request`/`Response` produce/extract/process functions operating on raw bytes.
 - [`protocol`](protocol/) — the stateful `DeRecProtocol` orchestrator, its six store interfaces, `Config`, `FlowKind`/`ContactMode` constants, and the `Event` type.
@@ -408,11 +429,13 @@ All replicas of one `secretID` also share a single **group channel key**: every 
 
 `HashedKeys` ships only a SHA-384 binding hash in the contact and serves the actual public keys through a plaintext `PrePair` round-trip on the contact creator's own transport. Any party that can reach that URI before the legitimate scanner gets the keys. Use `HashedKeys` only with a transport endpoint that is freshly minted for the pairing and retired as soon as the `PrePair` leg completes. `ContactModeInlineKeys` has no such constraint.
 
-The recommended pattern: pair on the ephemeral URI, then — as soon as pairing completes on the contact-creator side — call `SetOwnTransports` with the permanent endpoint (`SetOwnTransport` is deprecated and removed at 0.0.5) and start an `UpdateChannelInfo` flow to announce the swap. This keeps the plaintext `PrePair` window tight while subsequent traffic rides on the long-lived endpoint.
+The recommended pattern: pair on the ephemeral URI, then — as soon as pairing completes on the contact-creator side — call `SetOwnTransports` with the permanent endpoint and start an `UpdateChannelInfo` flow to announce the swap. This keeps the plaintext `PrePair` window tight while subsequent traffic rides on the long-lived endpoint.
 
 ### Replica fingerprint verification is mandatory
 
 Replica channels are created `Pending` and remain there until both sides call `VerifyFingerprint` with the value the peer derived from the shared key — confirmed out of band. The orchestrator enforces this: `Start(FlowKindProtectSecret, ...)` rejects a target that is still `Pending`. Treat verification as a required step in the pairing UX — a scanner that auto-pairs without it accepts a MITM-vulnerable replica.
+
+Until a device confirms, it ignores everything the peer sends on that channel: `Process` changes no store, sends nothing back, and returns an event with `Type == EventTypeMessageIgnored` and `Reason == IgnoreReasonPendingVerification`, plus `ChannelID` and `TraceID`. This matters most for a replica destination. The source's own confirmation publishes the vault immediately, so that copy usually arrives before the destination's user has confirmed. Confirming does not replay it: once the destination's `VerifyFingerprint` returns `true`, call `Start(FlowKindReplicaDiscovery, nil)` to pull the copy from the source.
 
 ### The `derec.*` `communicationInfo` namespace is library-owned
 

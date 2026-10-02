@@ -17,6 +17,37 @@ use derec_proto::{
     UnpairRequestMessage, UpdateChannelInfoRequestMessage, VerifyShareRequestMessage,
 };
 
+/// Why [`DeRecEvent::MessageIgnored`] dropped an inbound message.
+///
+/// Both cases leave every store untouched and send nothing back, so the
+/// sender learns nothing from the drop and a retry is always safe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum IgnoreReason {
+    /// The channel's fingerprint has not been confirmed on this device yet:
+    /// a `Pending` helper channel, or a `Pending` replica member on the
+    /// channel the message arrived on. The comparison is the only defence
+    /// against a man-in-the-middle, so nothing a peer sends is acted on
+    /// before it. Once [`super::DeRecProtocol::verify_fingerprint`] succeeds
+    /// the channel accepts traffic, but a dropped message is not replayed.
+    ///
+    /// Admitting a replica leaves `Pending` members only on that pairing's
+    /// own channel, so traffic on an established group channel is never
+    /// held back by a pairing in progress.
+    PendingVerification,
+    /// The message is older than the configured inbound timeout
+    /// ([`crate::protocol::types::Timeouts::inbound_message`]).
+    Expired,
+}
+
+/// Why [`DeRecEvent::PeerNotRestored`] left a roster entry without a channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NotRestoredReason {
+    /// The recovered roster names no endpoint for the peer, so a channel to
+    /// it would have nothing to send to. A legacy roster whose single URI had
+    /// a scheme this library does not serve decodes this way.
+    NoTransports,
+}
+
 /// Lightweight discriminant of [`PendingAction`].
 ///
 /// Carries no payload — useful for the
@@ -246,7 +277,7 @@ pub enum PendingAction {
     /// receiving side — receiving-side endpoint changeover is handled
     /// inside `accept`. The local-node endpoint setters
     /// [`crate::protocol::DeRecProtocol::set_communication_info`] and
-    /// [`crate::protocol::DeRecProtocol::set_own_transport`] exist for
+    /// [`crate::protocol::DeRecProtocol::set_own_transports`] exist for
     /// the **initiating** side only, where the announcement comes from.
     ///
     /// Calling [`super::DeRecProtocol::reject`] sends a non-`Ok`
@@ -465,7 +496,7 @@ pub enum DeRecFlow {
     ///
     /// The application is responsible for calling
     /// [`crate::protocol::DeRecProtocol::set_communication_info`] and/or
-    /// [`crate::protocol::DeRecProtocol::set_own_transport`] **before**
+    /// [`crate::protocol::DeRecProtocol::set_own_transports`] **before**
     /// initiating this flow so the local state matches what is announced.
     /// See the setter docs for the endpoint-changeover discipline.
     UpdateChannelInfo {
@@ -475,9 +506,7 @@ pub enum DeRecFlow {
         communication_info: Option<std::collections::HashMap<String, String>>,
         /// Every endpoint this device can now be reached on, in its own
         /// preference order. Empty leaves the peer's stored set untouched;
-        /// non-empty replaces it outright. The first entry also fills the
-        /// deprecated singular `transportProtocol` so a peer predating
-        /// `supportedTransports` still learns the new address.
+        /// non-empty replaces it outright.
         own_transports: Vec<TransportProtocol>,
     },
 }
@@ -563,18 +592,11 @@ pub enum DeRecEvent {
 
     /// A share was accepted and stored locally (Helper side).
     ///
-    /// `replica_id` is the stable per-device identifier of the writer,
-    /// copied from the inbound `StoreShareRequestMessage.replica_id`.
-    /// `None` indicates the writer was a non-replica `Owner`. The field
-    /// is metadata for the application; see
-    /// [`crate::protocol::DeRecShareStore::save`] for the storage
-    /// disambiguation contract that makes concurrent writes from
-    /// distinct replicas coexist.
-    ShareStored {
-        channel_id: ChannelId,
-        version: u32,
-        replica_id: Option<u64>,
-    },
+    /// A helper never learns which replica wrote a share: helper-bound
+    /// requests carry no replica identity, so every member of a group
+    /// publishes to a helper as the owner. A replica learns the author of a
+    /// version from [`Self::ReplicaSecretReceived`] instead.
+    ShareStored { channel_id: ChannelId, version: u32 },
 
     /// A `ReplicaSource` peer pushed a secret sync on a `ReplicaDestination`
     /// channel. The library has already auto-acked the inbound
@@ -597,9 +619,14 @@ pub enum DeRecEvent {
     ReplicaSecretReceived {
         /// The channel the request arrived on.
         channel_id: ChannelId,
-        /// The peer's replica identity (from `Channel.replica_id`,
-        /// populated at pair time).
+        /// The member this copy came from: the publisher on a push, the
+        /// member that answered on a catch-up.
         from_replica_id: u64,
+        /// The member that published `version`, now stored with it. Equal
+        /// to `from_replica_id` on a push; on a catch-up it names the
+        /// original publisher. `None` when the serving member's snapshot
+        /// records no author.
+        author_replica_id: Option<u64>,
         /// `secret_id` echoed from the inbound `StoreShareRequest`.
         secret_id: u64,
         /// `version` echoed from the inbound `StoreShareRequest`.
@@ -633,8 +660,12 @@ pub enum DeRecEvent {
         /// this is the ephemeral pairing channel, not the group channel —
         /// the group's own id is `secret.replicas.channel_id`.
         channel_id: ChannelId,
-        /// The member that wrote this version, from the payload.
+        /// The member this copy came from, as on
+        /// [`Self::ReplicaSecretReceived`].
         from_replica_id: u64,
+        /// The member that published `version`, as on
+        /// [`Self::ReplicaSecretReceived`].
+        author_replica_id: Option<u64>,
         /// `secret_id` echoed from the inbound `StoreShareRequest`.
         secret_id: u64,
         /// `version` echoed from the inbound `StoreShareRequest`.
@@ -643,6 +674,40 @@ pub enum DeRecEvent {
         secret: crate::protocol::types::Secret,
         /// Per-helper VSS share map, as on [`Self::ReplicaSecretReceived`].
         shares: Vec<crate::protocol::types::ChannelShare>,
+    },
+
+    /// A member offered a different copy of the version this device holds.
+    ///
+    /// Two members published the same version independently — each derives
+    /// the next version from what it held, so concurrent changes collide.
+    /// Either change may be legitimate: one member may have paired a helper
+    /// while another edited the secrets. Nothing was written; this device
+    /// keeps its own copy and refused the incoming one with
+    /// `VERSION_CONFLICT`, so the publisher sees
+    /// [`Self::ReplicaSyncRejected`].
+    ///
+    /// The conflict is the application's to resolve. Both copies are
+    /// complete states: the held one is in the local stores, the incoming
+    /// one is `secret`. Publishing the resolved state with
+    /// [`crate::protocol::DeRecFlow::ProtectSecret`] writes the next
+    /// version, which supersedes both on every member and helper.
+    ReplicaVersionConflict {
+        /// The channel the copy arrived on.
+        channel_id: ChannelId,
+        /// The member this copy came from.
+        from_replica_id: u64,
+        /// `secret_id` of the incoming copy.
+        secret_id: u64,
+        /// The contested version.
+        version: u32,
+        /// Who published the copy this device holds. `None` when its
+        /// snapshot records no author.
+        held_author_replica_id: Option<u64>,
+        /// Who published the incoming copy. `None` when the serving
+        /// member's snapshot records no author.
+        incoming_author_replica_id: Option<u64>,
+        /// The incoming copy's full state: secrets, helpers and replicas.
+        secret: crate::protocol::types::Secret,
     },
 
     /// A replica peer's `StoreShareResponse` to a secret sync we sent
@@ -1015,6 +1080,45 @@ pub enum DeRecEvent {
 
     /// Well-formed message with no actionable effect (e.g. an ACK).
     NoOp,
+
+    /// An inbound message was dropped without being acted on: no store was
+    /// written and nothing was sent back. `reason` says why and whether it
+    /// can succeed later.
+    ///
+    /// `PendingVerification` is the case an application should surface. It
+    /// means the peer sent something before this device confirmed the
+    /// channel's fingerprint, and it is typically a replica source pushing
+    /// its first copy while the destination is still showing the code.
+    /// Confirming does not replay the message. Once
+    /// [`super::DeRecProtocol::verify_fingerprint`] succeeds, a replica
+    /// destination starts [`DeRecFlow::ReplicaDiscovery`] to pull the copy
+    /// from the source itself.
+    MessageIgnored {
+        /// The channel the message arrived on.
+        channel_id: ChannelId,
+        reason: IgnoreReason,
+        /// The envelope's trace id, so the drop can be matched to the
+        /// peer's `*Started` event for the same round. `0` when the sender
+        /// set none.
+        trace_id: u64,
+    },
+
+    /// [`super::DeRecProtocol::restore`] wrote no channel for one entry of
+    /// the recovered roster. Every other entry and the user-secret snapshot
+    /// were restored as usual; `reason` says why this one was not.
+    ///
+    /// Nothing is stored for the peer, so this device cannot reach it. The
+    /// peer itself is untouched: a helper still holds its share, and pairing
+    /// with it again is what makes it reachable from this device.
+    PeerNotRestored {
+        /// The helper's channel, or the replica group's channel when the
+        /// entry is a group member.
+        channel_id: ChannelId,
+        /// The member's `replica_id` when the entry is a replica group
+        /// member; `None` for a helper.
+        replica_id: Option<u64>,
+        reason: NotRestoredReason,
+    },
 
     /// A pairing flow was initiated for `channel_id` with the local
     /// role `kind`. Emitted synchronously from

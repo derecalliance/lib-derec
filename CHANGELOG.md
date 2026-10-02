@@ -7,6 +7,637 @@ Breaking changes are called out explicitly, with the migration alongside
 them. The three crates and the SDKs share a version, so an entry applies to
 all of them unless it names a specific binding.
 
+### 0.0.6
+
+Two security fixes and fifteen defects. Every message on a channel was encrypted
+under the same AES-GCM nonce, which exposes its contents and lets an attacker
+forge messages. A replica destination acted on its source's roster before
+confirming the fingerprint, so the check that stops a man-in-the-middle ran
+after the fact. Replica catch-up did not work from any SDK but Rust, and a
+pulled copy reported the wrong secret id. The Node.js and web SDKs could hang when two calls overlapped on one
+`DeRecProtocol` instance, and the React Native SDK on iOS could silently produce
+malformed messages. A published replica roster did not name, or list every
+endpoint of, the device that published it. Dropped messages now surface as a
+`MessageIgnored` event that says why. Replicas now detect two members
+publishing the same version, instead of silently applying whichever copy
+arrived last. A parity audit of every SDK against the core found eight more
+defects: four that lose data or reachability (React Native helpers stored
+shares under the wrong secret id and could not reach gRPC peers; .NET never
+sent its `communication_info`; .NET and Go keyed every sharing round alike),
+and four in error reporting and FFI signatures.
+
+**Breaking:** the deprecation wave announced in 0.0.3 for removal at 0.0.5 is
+removed, in every binding. See the first entry below for the migration.
+
+- **Removed: the single-endpoint and `unsafe_http` spellings deprecated in
+  0.0.3.** *(breaking; every SDK and the wire schema)*
+
+  0.0.3 deprecated these for removal at 0.0.5, and 0.0.5 shipped them anyway.
+  They are gone now, with nothing deprecated left behind.
+
+  | Removed | Use instead |
+  |---|---|
+  | Rust `with_own_transport` · .NET `WithOwnTransport` · Go `Config.OwnTransportURI` / `OwnTransportProtocol` · Node.js / web / React Native `withOwnTransport` | `with_own_transports` · `WithOwnTransports` · `Config.OwnTransports` · `withOwnTransports`, with a one-element list |
+  | Rust `set_own_transport` · .NET `SetOwnTransport` · Go `SetOwnTransport` · TS `setOwnTransport` · C `derec_protocol_set_own_transport` | `set_own_transports` and its counterparts, with the whole list |
+  | Rust `with_unsafe_http` · .NET `WithUnsafeHttp` · Go `Config.UnsafeHTTP` · TS `withUnsafeHttp` | `with_unsafe_connection` and its counterparts, which gate both `http://` and `grpc://` |
+  | `TransportValidationError::UnknownProtocol` | `TransportValidationError::UnsupportedProtocol` |
+  | `transport_protocol` on the `UpdateChannelInfo` flow parameters | `own_transports` |
+
+  `Error::ConflictingPlaintextOptIn` (FFI code `122`, `CONFLICTING_PLAINTEXT_OPT_IN`
+  in TypeScript) existed only to reconcile `unsafe_http` with
+  `unsafe_connection` and is removed with it; code `122` is retired and will
+  not be reassigned. The FFI `derec_protocol_new` config no longer accepts
+  `own_transport_uri`, `own_transport_protocol` or `unsafe_http`: pass
+  `own_transports` and `unsafe_connection`.
+
+  **On the wire,** the singular `transportProtocol` is gone from
+  `ContactMessage`, `PairRequestMessage`, `PrePairRequestMessage` and
+  `UpdateChannelInfoRequestMessage`, and the singular `replyTo` from the five
+  request messages that carry `replyToTransports`. Their field numbers and
+  names are `reserved`. The message DTOs drop their `transport_protocol` key
+  accordingly. Peers on 0.0.3 through 0.0.5 already read the lists first, so
+  they keep pairing and replying with 0.0.6; a peer older than 0.0.3, which
+  reads only the singular fields, cannot. One exchange does not survive the
+  mix: a 0.0.5-or-earlier peer refuses an `UpdateChannelInfo` that announces
+  new endpoints without also carrying `communicationInfo`, because it decides
+  whether the update is empty from the singular field. Upgrade both sides
+  before moving endpoints, or send the update with `communication_info` set.
+
+  The `advertisedEndpoints` and reply-to helpers stay in every SDK and now
+  read the list alone.
+
+- **Fixed (security): every message on a channel was encrypted with the same
+  AES-GCM nonce.** *(bug fix; every SDK — wire-compatible)*
+
+  Channel messages are encrypted under the pair's long-lived shared key, and
+  the nonce was built from the channel id in bytes that the cipher never
+  reads. So all messages on a channel used the same all-zero 96-bit nonce under
+  the same key. With AES-GCM that is catastrophic: an eavesdropper learns the
+  XOR of any two plaintexts, and can recover the authentication key and forge
+  messages that pass the tag check. Each message now draws a fresh random
+  nonce. Receivers already read the nonce from the ciphertext's first 12
+  bytes, so old and new peers interoperate in both directions. Messages
+  already exchanged under the reused nonce stay exposed; re-pairing rotates
+  the key for any channel whose past traffic must be treated as compromised.
+
+- **Fixed (security): a replica destination acted on its source before
+  confirming the fingerprint.** *(bug fix; every SDK — wire-compatible)*
+
+  The fingerprint comparison is the only defence against a man-in-the-middle on
+  a replica channel. `process` ignored messages on a `Pending` channel, but it
+  found the status only on a helper record. Replica members record theirs
+  separately, so a replica channel was never gated. A destination that had not
+  confirmed still took the source's first copy: it wrote the roster, helper
+  keys and share map to its stores, marked every group member `Paired`, and
+  acknowledged `Ok`. The source then reported the destination in sync. And
+  because the roster marked the destination `Paired`, it became a full group
+  member whether or not its user ever confirmed. This was easy to hit, because
+  the source's own confirmation publishes the vault at once and that copy
+  usually arrives first.
+
+  A message on a channel with a `Pending` replica member is now ignored like
+  one on a `Pending` helper channel: no store is written and nothing is sent
+  back. Confirming does not replay the dropped copy. The destination pulls it
+  after confirming, with `start(ReplicaDiscovery)`. Traffic on an established
+  group channel is unaffected, because a pairing in progress leaves `Pending`
+  rows only on its own pairing channel.
+
+- **Added: `MessageIgnored { channel_id, reason, trace_id }`.** *(new event;
+  every SDK — see the behavior change below)*
+
+  A dropped message used to come back as a bare `NoOp`, which carries nothing
+  and looks exactly like an acknowledgement. An application had no way to tell
+  its user a copy was waiting on their confirmation. `reason` is
+  `PendingVerification` or `Expired` (older than the inbound timeout).
+  `trace_id` matches the peer's `*Started` event for the same round. The Rust
+  type is `IgnoreReason`; the other SDKs get string labels, like
+  `ActionRequired.action_kind` (Go `IgnoreReason*` constants, .NET
+  `IgnoreReason` constants, a TypeScript `IgnoreReason` union).
+
+  **Behavior change.** Messages dropped for either reason, including on a
+  pending *helper* channel, now produce `MessageIgnored` instead of `NoOp`. Code
+  that counted `NoOp`s to detect a drop should match `MessageIgnored` instead.
+  `NoOp` remains for messages that genuinely have no effect, such as
+  acknowledgements.
+
+- **Fixed: a pulled replica copy reported the wrong `secret_id`.** *(bug fix;
+  every SDK — wire-compatible)*
+
+  `ReplicaSecretInstalled` and `ReplicaSecretReceived` carry the secret id of
+  the vault being mirrored. A pushed copy reported the sender's id, but a copy
+  pulled by `ReplicaDiscovery` reported the destination's own. An application
+  that compares that id with its own to choose between "an update to my vault"
+  and "an offer to take over another vault" therefore applied a pulled first
+  copy silently, without the adoption prompt. With the fingerprint fix above, a
+  pull is how a destination normally receives its first copy. Both paths now
+  report the sender's id, which the serving member already put on the wire.
+
+- **Fixed: replica catch-up (`ReplicaDiscovery`) never completed outside Rust.**
+  *(bug fix; .NET, Go, Node.js, web and React Native — rows written by 0.0.5
+  still decode)*
+
+  An in-flight catch-up is stored as a state row. Its JSON put the device's
+  local version in `version`, a field that is part of the row's key for other
+  kinds but absent from this one's key. Every SDK store derives a row's key
+  from those fields, as the store contract says, so the round was saved under
+  one key and looked up under another. The answers then arrived as `NoOp` and
+  the catch-up never finished. The Go and .NET SDKs had no support for this row
+  kind at all: Go filed it under the sharing round's key and failed to encode
+  it, and .NET threw on it.
+
+  The local version now travels in its own `local_version` field, so an item's
+  key fields always equal its key's. A test in the core pins that invariant for
+  every state kind. Go and .NET decode and encode the row and key it correctly.
+  Rust callers were unaffected, since Rust stores receive typed values.
+
+- **Fixed: overlapping calls on one `DeRecProtocol` instance hung instead of
+  queueing.** *(bug fix; Node.js and web only — **breaking** for the three
+  `set*` setters, see below)*
+
+  Every state-touching method took the instance mutably, and wasm-bindgen holds
+  that borrow for the whole life of an async call. A second call issued while
+  the first was awaiting a store or the transport — a `tick()` timer firing
+  while `process()` handled an inbound message, which is the pattern `tick()`'s
+  own documentation recommends — failed that borrow outside any promise. The
+  page got an uncaught `recursive use of an object detected which would lead to
+  unsafe aliasing in rust`, and the calls involved never settled, neither
+  resolving nor rejecting, so a flow simply stalled until the application's own
+  timeout. The FFI-based SDKs never had this: their handle has always
+  serialized calls behind a mutex.
+
+  Each instance now holds its state behind an async lock taken inside every
+  call. Overlapping calls on one instance queue and run one at a time, in the
+  order they were made. Applications that already serialized calls per instance
+  keep working unchanged; that lock is now redundant. Distinct instances do not
+  share the lock, so two instances bound to the same `secretId` and the same
+  stores must still be serialized by the caller.
+
+  Two consequences to be aware of:
+
+  - A store or transport callback must not await a call on the instance that
+    invoked it. That call queues behind the one waiting on the callback, and
+    neither settles.
+  - Calling `free()` while a call is in flight throws.
+
+  **Breaking — migration.** `setCommunicationInfo`, `setOwnTransport` and
+  `setOwnTransports` now return `Promise<void>`, because they queue behind
+  in-flight calls like everything else. `await` them. A validation failure
+  (`invalid_own_transport`, `invalid_protocol`, `invalid_communication_info`)
+  now rejects the promise instead of throwing synchronously; a call site that
+  does not await it turns that error into an unhandled rejection.
+
+  ```ts
+  // before
+  protocol.setOwnTransports([{ uri, protocol: "https" }]);
+  // after
+  await protocol.setOwnTransports([{ uri, protocol: "https" }]);
+  ```
+
+  `secretId()` stays synchronous and never waits behind an in-flight call.
+
+- **Fixed: the React Native SDK on iOS could emit malformed protocol
+  messages.** *(bug fix; React Native iOS only — no API change)*
+
+  The iOS static libraries were stripped of debug info with Apple's `strip -S`.
+  Rust gives each copy of a symbol shared between codegen units a distinct
+  `.llvm.<hash>` suffix; that tool drops the suffixes, so different function
+  bodies ended up under one name and the app's linker bound some calls to the
+  wrong one. The app still linked and ran, but some encodes came out wrong —
+  most visibly a random `u64` written as a truncated protobuf varint — which
+  the receiving side rejected with `protobuf_decode`. Which call failed varied
+  from run to run with the random values involved, so the failure looked
+  intermittent. Android was never affected: its libraries were already stripped
+  with `llvm-strip`.
+
+  The iOS libraries are now stripped with the same `llvm-strip --strip-debug`
+  as Android, and packaging links every archive member into a stub executable
+  (`-all_load`) per slice, so this failure mode stops the build instead of
+  shipping. **React Native iOS apps on 0.0.5 or earlier should upgrade**;
+  messages those builds sent may have been rejected by their peers.
+
+- **Fixed: a replica roster described every member except the one that
+  published it.** *(bug fix; every SDK — wire-compatible, no API change)*
+
+  A device recorded each peer in its group with every endpoint and the
+  `communication_info` that peer advertised at pairing, but recorded itself
+  with only its primary endpoint and an empty `communication_info`. Each
+  version's `Secret.replicas.members` is built from those records, so the
+  member that wrote it had no name and a single address. Anything rebuilding
+  the group from a `Secret` — a destination adopting a copy, a device
+  restoring — could neither name that member nor reach it on its other
+  endpoints. A device's own record now carries its full endpoint list and its
+  `communication_info`, filtered as a peer would store it, and every publish
+  fills both in from the instance's current configuration. Groups paired on
+  an earlier version are corrected by their next publish.
+
+- **Fixed: a replica silently replaced the version it held with a rival copy
+  of it.** *(bug fix; every SDK — the replica wire payload gains a field, and
+  `ShareStored` loses one)*
+
+  Every member derives the next version from what it holds, so two members
+  that change the group at the same time — one pairing a helper, another
+  editing the secrets — both publish the same version. A replica applied
+  whichever copy arrived last, and applied an older version over a newer one,
+  without telling anyone. Helpers keep the first copy they receive, so the
+  replica could end up tracking shares its helpers never held, and
+  verification then reported healthy helpers as corrupt.
+
+  Each version now records the member that published it. The replica payload
+  carries `author_replica_id`, every publish sets it — whether the secrets or
+  only the roster changed — and every member stores it with the version in its
+  `UserSecrets` snapshot. A copy arriving by push or by catch-up is then
+  compared with the one held:
+
+  | Arriving copy | Result |
+  |---|---|
+  | Newer, or nothing held | Applied, as before |
+  | Same version, same author | A re-send: acknowledged, nothing rewritten |
+  | Same version, another or unknown author | Refused with `VERSION_CONFLICT`; the new `ReplicaVersionConflict` event reports both authors and the incoming state |
+  | Older | Refused with `VERSION_CONFLICT`; nothing changes |
+
+  Nothing is written on a conflict. The application resolves it by publishing
+  the reconciled state with `ProtectSecret`, which writes the next version on
+  every member and helper. The publisher whose copy was refused sees
+  `ReplicaSyncRejected`.
+
+  `ReplicaSecretReceived` and `ReplicaSecretInstalled` gain
+  `author_replica_id`. `from_replica_id` keeps naming the member a copy came
+  from, which on a catch-up is whoever answered rather than the author.
+
+  **Store implementations must persist `author_replica_id`** on the
+  `UserSecrets` snapshot (FFI and JavaScript stores: an optional decimal
+  string). A store that drops it makes every copy of the held version look
+  like a conflict. The SQLite and Postgres reference stores add it in a
+  migration.
+
+  `ShareStored` loses `replica_id`. A helper never learns which replica wrote
+  a share — helper-bound requests carry no replica identity by design — so the
+  field could only ever be empty.
+
+- **SDK parity: what the core already offered is now reachable from every
+  binding.** *(feature; breaking where noted)*
+
+  | Change | SDKs |
+  |---|---|
+  | `StatusEnum`, and `reject(action, status: StatusEnum, memo)` — previously a bare number the docs could not name | Node.js, web, React Native |
+  | `protocol_version()` / `CurrentProtocolVersion()` for audit and logs, read from the core | Go, Node.js, web, React Native (.NET already had `ProtocolVersion.Current()`) |
+  | Readable error names from the core: `DeRecException.CategoryName` / `CodeName` (.NET), `Error.CategoryName()` / `CodeName()` (Go) | .NET, Go |
+  | `reply_to` on the five request primitives — **breaking**: `Request.Produce` gains a trailing `replyTo` argument | Go |
+  | `ContactMessage.FromProtoBytes` / `ToProtoBytes` are public, so an app can inspect a contact it received out of band; `ContactMessage` gains `Timestamp`, which encode/decode used to drop | .NET |
+  | `nonce` on `primitives.pairing.request.create_contact` — typed in Node.js and web, and **fixed** in React Native, which ignored it, so a NoKeys contact could not be created there | Node.js, web, React Native |
+  | `ActionRequired` carries what accepting would do: `trace_id` always; `share_size` on StoreShare (the size or quota decision `AutoAcceptPolicy.storeShare` defers to the application); the requested `share_secret_id` / `version` on GetShare; `unpair_memo` on Unpair; `updated_communication_info` / `updated_transports` on UpdateChannelInfo. .NET also gains the fields it dropped (`action_kind`, `peer_communication_info`, `sender_kind`, `version`, `share_description`, `share_secret_id`) and a `PendingActionKind` vocabulary | every SDK |
+  | `generate_replica_id()`, minted by the core — which also stops it ever returning `0`, an invalid replica id. New C export: `derec_generate_replica_id` | every SDK |
+  | A restore refused because channels already exist reports which ones as a list, not only in the message text: `derec_protocol_restore` returns `DeRecProtocolRestoreResult`, whose `conflicting_channel_ids_json` the SDKs surface on the restore error — **breaking** for direct C ABI callers | .NET, Go, React Native (Node.js and web already had `channel_ids`) |
+  | NoKeys pre-pair primitives (`produce_pre_pair_no_keys`, `process_pre_pair_no_keys`) and a pairing `fingerprint(shared_key)` primitive, so a NoKeys pairing can be completed — and confirmed out of band, as the mode requires — without the protocol layer. New C exports: `produce_pre_pair_no_keys_response_message`, `process_pre_pair_no_keys_response_message`, `pairing_fingerprint` | every SDK |
+
+  `derec.Error` in Go is now an alias of the same type, defined where the
+  native layer can build it; fields, constants and `errors.As` are unchanged.
+
+  `DeRecProtocol::replica_id()` is removed from the Rust API *(breaking:
+  Rust)*. It returned the id the application itself passed to
+  `with_replica_id`, which nothing in the protocol ever changes.
+
+- **Fixed: a React Native helper stored every share under its own secret id.**
+  *(bug fix; React Native)*
+
+  A helper keeps the shares of other people's secrets in one partition and
+  tells them apart by `Share.secretId`, the owner's id. The share store's
+  `save` callback replaced it with the partition id, so discovery and recovery
+  on a React Native helper could return the wrong secret, or none. The record's
+  own `secret_id` now reaches the store unchanged.
+
+- **Fixed: React Native could not reach gRPC peers.** *(bug fix; React Native)*
+
+  Endpoints reached `Transport.send` with `protocol: "unknown"` for anything
+  but HTTPS, because the binding kept its own name table. Protocol names now
+  come from the core in both directions, through the new C exports
+  `derec_transport_protocol_name` and `derec_transport_protocol_discriminant`;
+  an endpoint whose protocol the core does not define fails the send instead of
+  reaching the application with a name it cannot act on.
+
+- **Fixed: .NET never told peers its `communication_info`.** *(bug fix; .NET)*
+
+  `WithCommunicationInfo` was stored by the builder and never handed to the
+  core, so pairing sent no name or contact details for a .NET device. It is now
+  encoded and passed at construction, as the Go SDK already did.
+
+- **Fixed: .NET and Go keyed every sharing round alike.** *(bug fix; .NET, Go —
+  breaking for .NET: `StateKey.SharingRound()` now takes the round's version)*
+
+  The core keys an in-flight sharing round by its version, so concurrent rounds
+  keep separate rows. Both SDKs dropped the version from the key, so a store
+  keyed on it let one round overwrite another and neither completed. The key
+  now carries the version in both directions.
+
+- **Fixed: .NET garbled non-ASCII text from the core on Windows.**
+  *(bug fix; .NET)*
+
+  Error messages and memos were decoded as ANSI rather than UTF-8.
+
+- **Fixed: most Node.js and web methods reported every failure as
+  `DEREC_ERROR`.** *(bug fix; Node.js, web)*
+
+  `createContact`, `start`, `accept`, `reject`, `getFingerprint`,
+  `verifyFingerprint`, `removeExpiredChannels` and `process` now raise the same
+  structured `{ category, code }` error as `build` and `restore`. `process`
+  errors keep their `channel_id`. `DeRecErrorCategory` gains `"state_store"`,
+  which the core already emitted.
+
+- **Fixed: error code 121 had no name.** *(bug fix; every FFI SDK)*
+
+  `derec_error_code_name(121)` returned `"unknown"`; it now returns
+  `"no_usable_endpoint"`. The test that guards this reads every code from the
+  source instead of a hand-kept list, which is how 121 was missed.
+
+- **Fixed: the .NET and Go store-share request passed two arguments the C
+  function no longer takes.** *(bug fix; .NET, Go — breaking for .NET:
+  `Sharing.Request.Produce` loses its unused `replicaId` argument)*
+
+  It worked only because the calling convention ignores extra trailing
+  arguments. Every other binding signature in both SDKs was checked against the
+  generated header and matches.
+
+- **Changed: the SDKs no longer decide anything the core decides.**
+  *(behaviour change; every SDK — breaking for Go, see below)*
+
+  Every default, range check and validation rule now lives only in the core,
+  so a value the application passes reaches the library unchanged and every SDK
+  rejects the same inputs with the same error.
+
+  - **Defaults.** An optional builder setter that is not called leaves the
+    library default in force. The .NET and web/Node.js builders no longer
+    restate threshold and keep-versions (3), unpair-ack, the boolean flags or
+    the auto-accept policy; React Native no longer fills in auto-accept or
+    parameter-range fields.
+  - **Go, breaking.** `Config.Threshold` and `Config.KeepVersionsCount` are
+    `*uint32`: `nil` takes the default, and an explicit `0` reaches the
+    library, which rejects it (it used to be dropped, and the default of 3 used
+    instead). `Timeouts` takes whole seconds as `InboundMessageSecs`,
+    `SharingRoundSecs` and `UnpairAckSecs` (`*uint64`) instead of
+    `time.Duration`, which truncated sub-second values to 0.
+  - **.NET timeouts.** `Timeouts` values cross unchanged; a negative or
+    fractional number of seconds is refused at `Build()` (`FfiBadProto`)
+    instead of being clamped to 0 or rounded down.
+  - **Checks moved out of the wrappers.** .NET `SetOwnTransports([])` and a
+    shared key that is not 32 bytes in the .NET sharing primitives now raise
+    `DeRecException` (`InvalidInput`, `FfiBadSharedKey`) from the library
+    instead of `ArgumentException`. Go store codecs no longer re-check
+    records: shared-key length, per-kind required state fields, unknown kinds
+    and channel-record variants are enforced only by the library, which now has
+    tests for each.
+  - **Legacy shapes.** .NET no longer reads `transport_uri`, a missing
+    `protocol`, or `version` as a catch-up's `local_version`, and passes
+    `StateItem` fields through as written (a null replica set stays null). The
+    library never emits those shapes; reading rows written by older versions
+    stays in the core.
+  - **`unpairAck` names.** Web/Node.js `withUnpairAck` accepts exactly
+    `"required"` or `"not_required"`; the aliases and case-insensitive matching
+    are gone. React Native forwards the name and the library validates it.
+  - **No logging from the library.** Web/Node.js `process()` no longer writes
+    to `console.error`; failures arrive only through the rejected promise.
+
+- **Changed: an application must give at least one own transport.**
+  *(breaking for Go and React Native; every SDK now behaves alike)*
+
+  A node with no endpoint cannot be reached by any peer: every pairing message
+  advertises it, and every later reply is sent to it. The Rust builder, the
+  Node.js/web SDKs and .NET already refused an empty list, but the FFI
+  constructor used by Go and React Native accepted one and advertised a
+  placeholder empty URI until `setOwnTransports` was called. `build()` / `New`
+  now refuses an absent or empty list in every SDK with the library's
+  `InvalidInput` error (.NET used to throw `InvalidOperationException`, and
+  Node.js/web `BUILDER_MISSING`). `setOwnTransports` still replaces the list
+  later, and still refuses an empty one.
+
+- **Changed: every SDK reports the same error codes.** *(breaking; Node.js,
+  web)*
+
+  A library error is classified once, in the core, into a category and a
+  code. The C ABI carries the numbers and the Node.js/web SDKs carry the names,
+  both from that one table, so the same failure reads the same everywhere.
+  Codes are lowercase snake_case, as React Native, .NET and Go already
+  reported them. Node.js/web codes change:
+
+  | Before | Now |
+  |---|---|
+  | Every code in `UPPER_SNAKE` | The same name in `lower_snake` (`INVALID_INPUT` → `invalid_input`) |
+  | `CONFLICT` | `restore_conflict` |
+  | `INVARIANT_VIOLATED` | `invariant` |
+  | `DECODE_ERROR` / `ENCODE_ERROR` from the library (category `protobuf`) | `protobuf_decode` / `protobuf_encode` |
+  | `PAIRING_ENCRYPTION` | `encryption` |
+  | `CONTACT_MESSAGE_KEYGEN` / `PAIR_REQUEST_KEYGEN` | `keygen` |
+
+  Errors a binding raises before a value reaches the library keep their own
+  category: `wasm` in Node.js/web (for example `decode_error`,
+  `invalid_unpair_ack`) and `ffi` in React Native, .NET and Go (the `ffi_*`
+  codes).
+
+- **Changed: a transport endpoint names its protocol everywhere an
+  application sees one.** *(breaking; every SDK)*
+
+  Node.js/web and React Native took `"https"` / `"grpc"` when building and in
+  `setOwnTransports`, but `0` / `1` in `UpdateChannelInfo` params, in every
+  event's `transports` / `updated_transports`, and in the `restore` input, so
+  an endpoint read from an event could not be passed back as it was. Every
+  app-facing endpoint is now `{ uri, protocol: "https" | "grpc" }`: the event
+  JSON every SDK decodes carries the name, `restore` takes the name, and the
+  TypeScript packages share one `Endpoint` type. .NET and Go decode the name
+  into their typed protocol, through the core's
+  `derec_transport_protocol_name` / `_discriminant`. FFI inputs
+  (`own_transports`, `set_own_transports`, `UpdateChannelInfo` params) accept
+  the name or the discriminant. Stored channel records and the primitives'
+  message types keep the discriminant.
+
+- **Changed: .NET and Go hand out typed ids, roles, statuses and sender
+  kinds.** *(breaking;
+  .NET, Go)*
+
+  - Every `u64` id on an event, on the recovered `Secret` and on flow params
+    is `ulong` / `uint64` instead of a decimal string, so an id from an event
+    goes straight into a method that takes one. The JSON exchanged with the
+    core is unchanged, and ids up to `u64::MAX` round-trip exactly.
+  - A replica member's `Role` is the typed `ReplicaRole` instead of a
+    string; any role other than `"Source"` / `"Destination"` fails to decode.
+    .NET `ReplicaRole` serializes by name.
+  - `RejectAsync` / `Reject` take the protobuf `StatusEnum` instead of a raw
+    integer, as Rust and TypeScript do.
+  - Go `PairingParams.Kind`, `Event.Kind` and `Event.SenderKind` are the typed
+    `protocol.SenderKind` instead of `int32`, and `pairing.SenderKind` is the
+    same type, as .NET and TypeScript have one `SenderKind`. The wire value is
+    unchanged.
+  - Go `Share` loses `ReplicaID`, which no other SDK has and the library
+    never filled.
+  - The `status` of `ShareRejected`, `UnpairRejected`, `PrePairRejected`,
+    `ChannelInfoUpdateRejected`, `ReplicaSyncRejected` and `ReplicaSecretAcked`
+    is the typed `StatusEnum` in every SDK (it was a raw integer in .NET, Go
+    and the TypeScript typings), the same type `reject` takes.
+  - .NET omits `communication_info` for a helper or member with no entries
+    when it sends a recovered `Secret` to `RestoreAsync`, as the core does,
+    instead of writing `{}`.
+  - .NET and Go pass `CommunicationInfo` to the core as the config's
+    `communication_info` JSON object instead of encoding the protobuf
+    themselves, so only the core knows its wire format.
+
+- **Changed: every secret store answers a broadcast in one call.**
+  *(breaking; .NET, Go, React Native, FFI)*
+
+  The core reads every channel's secret for a broadcast (protect-secret,
+  discovery, verification, update-channel-info) through the store's batch
+  read. Node.js/web already called the application's `loadMany`, but the C
+  ABI had no slot for it: the FFI SDKs read one channel at a time, .NET and Go
+  had no batch method, and React Native required a `loadMany` it never called.
+  `SecretStoreCallbacks` now has a `load_many` slot right after `load`, and
+  .NET `ISecretStore.LoadMany`, Go `SecretStore.LoadMany` and React Native
+  `SecretStore.loadMany` are called once per broadcast. The store returns one
+  entry per requested channel, in request order, with null where nothing is
+  stored; the library pairs the entries with channels, refuses an answer of
+  the wrong length, and decides whether a missing entry is an error.
+  `loadMany` no longer takes a `missingPolicy` argument in TypeScript.
+
+- **Fixed: Node.js/web could not release a protocol through the typings.**
+  *(bug fix; Node.js, web, React Native)*
+
+  `DeRecProtocol` and `DeRecProtocolBuilder` live in the library's memory,
+  which the JavaScript garbage collector does not reclaim in time to rely on.
+  The runtime had `free()`, but the TypeScript declarations omitted it, and a
+  second call threw. Both classes now declare `free()` and
+  `[Symbol.dispose]()` (so `using` works), releasing twice is a no-op as with
+  .NET `Dispose` and Go `Close`, and React Native's `DeRecProtocol` gains
+  `[Symbol.dispose]()` too.
+
+- **Tests: the parity guards compare declarations, not names.** *(tests)*
+
+  A guard passed when a name appeared anywhere in an SDK's file, which is how
+  a secret-store `LoadMany` required by React Native but never called got
+  through. The guards now read each declaration (interface, class, record,
+  struct) and compare its members both ways against the Rust source: store
+  interfaces and their parameter names, protocol and builder methods, and
+  record fields. A store member an SDK declares but its bridge never calls
+  fails. The expected surface is derived from the Rust `pub fn`s of the
+  protocol, the builder and the primitives, so a public Rust item with no FFI
+  or WASM export fails unless it is listed with a reason. The .NET smoke now
+  checks every section of `wire_golden.json`, and every SDK fails when the
+  fixture gains a section it does not check.
+  TypeScript `ChannelStore.linkChannel` now names its edge ends `a`, `b`, as
+  the Rust trait does; only the parameter names change.
+
+  `make all` now also lints with every feature enabled, which reaches the C
+  ABI layer and the logging call sites that the default-feature run skipped,
+  and checks formatting and lints in the SQLite and Postgres smoke crates,
+  which sit outside the workspace.
+
+- **Changed: `restore` skips a peer it cannot reach instead of refusing the
+  whole secret.** *(breaking; every SDK)*
+
+  A channel with no transport endpoint is useless, and a recovered roster can
+  legitimately carry one — a legacy v2 helper whose URI scheme this library
+  does not serve. `restore` refused the whole secret for it. It now writes no
+  channel for that helper or replica member, restores everything else, and
+  reports each skipped peer as a new `PeerNotRestored { channel_id,
+  replica_id?, reason: "NoTransports" }` event (.NET `PeerNotRestoredEvent`,
+  Go `EventTypePeerNotRestored`). A channel already at a skipped peer's id is
+  neither a conflict nor torn down. Skipped peers are still validated, and
+  every key, replica id and role is now checked before any store write; a bad
+  helper key used to be found after earlier helpers were saved. The restore
+  input accepts an absent or `null` `transports` as an empty list.
+
+- **Changed: the pairing primitives enforce parameter-range compatibility
+  themselves.** *(breaking; every SDK)*
+
+  Only the protocol handlers checked that two peers' parameter ranges
+  overlap, so an application pairing through the primitives skipped a rule of
+  the protocol. `request::extract` and `response::process` now take the local
+  `ParameterRange` (C ABI: `extract_pair_request` /
+  `process_pair_response_message` gain `parameter_range_ptr/len`; .NET, Go and
+  TypeScript `Extract` / `Process` gain a parameter-range argument), and
+  `response::produce` refuses a request whose range does not overlap. All
+  refuse with `incompatible_parameter_range`. `check_compatibility` is no
+  longer public, so no binding can skip it.
+
+- **Changed: one contact codec, in the core, for every SDK.** *(breaking;
+  every SDK)*
+
+  The contact message leaves the device as bytes (a QR code) and comes back
+  as the scanner's pairing input. The encoding lived in the bindings and
+  differed by SDK: .NET encoded it with its own protobuf library, Go had only
+  a validator and no typed contact. New `primitives::pairing::request::
+  encode_contact` / `decode_contact` are the single codec, both refusing a
+  contact that breaks its mode's invariants, exposed as
+  `Pairing.Request.EncodeContact` / `DecodeContact` (.NET),
+  `pairing.Request.EncodeContact` / `DecodeContact` with a typed
+  `pairing.ContactMessage` (Go), and `primitives.pairing.request.
+  encode_contact` / `decode_contact` (Node.js, web, React Native). Removed:
+  `validate_contact_message` (C ABI), `pairing_contact_message_validate`
+  (WASM), Go `pairing.Request.Validate`, and .NET `ContactMessage.
+  ToProtoBytes` / `FromProtoBytes`. Bytes that are not a contact now fail with
+  `protobuf_decode` everywhere.
+
+- **Tests: the web smoke runs unattended in `make all`.** *(tests)*
+
+  It ran only when someone opened it in a browser, so `make all` never
+  exercised the web package. `smoke-tests/web/run_test.sh` now builds and
+  type-checks the suite, serves it, and runs it in headless Chromium through
+  Playwright — the page fetches the `.wasm` over HTTP as an application does —
+  and fails unless the page reports `DEREC_SMOKE_RESULT: PASS`, the same
+  convention as the React Native on-device run.
+
+- **Removed: `UserSecrets.replicas`.** *(breaking; Rust)*
+
+  The field was written on every publish, receive and restore but never read:
+  the replica group a version carries is rebuilt from the channel store each
+  round, and every binding already dropped it when loading a snapshot. It also
+  carried the group's shared key, so a store persisting the whole snapshot
+  kept a second copy of that key for nothing. No wire or storage format
+  changes.
+
+- **Fixed: Node.js/web `restore` errors had no or the wrong `category`.**
+  *(bug fix; Node.js, web)*
+
+  `restore_conflict` carried no `category`, and `already_restored` and
+  `invariant` reported `wasm`. They now carry `input` / `invariant` like every
+  other library error, and `DeRecError` declares the conflict's `channel_ids`.
+
+- **Fixed: TypeScript declared `communication_info` as always present.**
+  *(bug fix; Node.js, web, React Native)*
+
+  The library omits an empty map, so the helper and replica-member
+  `communication_info` fields of `SecretRecovered` and the replica events are
+  now optional (`communication_info?:`). `restore` accepts the field absent.
+
+- **Fixed: numeric ids were truncated or defaulted instead of rejected.**
+  *(bug fix; Node.js, web, every FFI SDK)*
+
+  `restore` read an empty `channel_id` or `replica_id` as 0; it now rejects an
+  empty, absent or non-decimal id (`invalid_recovered_secret`), and WASM and
+  FFI share one decoder. Node.js/web ids, flow kinds and versions given as a
+  fractional, negative, non-finite or unsafe number now throw `decode_error`.
+  `removeExpiredChannels` takes a `u64` (`bigint`, safe-integer `number` or
+  decimal string) instead of a `u32`.
+
+- **Fixed: React Native lost precision and set `communication_info` late.**
+  *(bug fix; React Native)*
+
+  `withParameterRange` bounds above 2^53 were rounded; they now cross as
+  decimal strings. `withCommunicationInfo` applies at construction instead of
+  through a setter queued after `build()`. The C++ layer no longer decodes
+  `TransportProtocol` protobuf; endpoints arrive from the library as JSON.
+
+- **Added: FFI config and transport helpers.** *(additive; FFI)*
+
+  The `derec_protocol_new` config accepts a `communication_info` JSON object
+  (rejected together with a non-empty proto buffer); `auto_accept` flows and
+  `parameter_range` bounds are individually optional, and bounds may be decimal
+  strings; `unpair_ack` accepts `"required"` / `"not_required"` as well as
+  `0` / `1`. New `derec_transport_endpoints_json` decodes a transport `send`
+  endpoint buffer into `[{ protocol, uri }]`.
+
+- **Docs.** Corrected the FFI `derec_protocol_new` and `derec_protocol_restore`
+  docs; the WASM API docs (example, flow kinds 0–8, event table, seven
+  required setters); the restore error codes (`store_error`, not `STORAGE`);
+  the web README's `init` import (a named export); the .NET README
+  (`ContactMode.NoKeys`, replica example); the Go docs and README; and the
+  React Native `Transport.send` signature.
+
 ### 0.0.5
 
 Verification was reachable but not usable outside the simplest case: a replica
@@ -198,9 +829,13 @@ helpers of holding corrupt data. Nothing here changes an API.
 > the whole wave, in every binding: the singular `transportProtocol` proto field
 > in all four messages, `with_own_transport` / `set_own_transport` and their SDK
 > counterparts, `with_unsafe_http`, and
-> `TransportValidationError::UnknownProtocol`. Individual deprecation notes
-> repeat the version so a compiler warning carries it, but there is only one
-> date to plan against — nothing deprecated here survives past 0.0.5.
+> `TransportValidationError::UnknownProtocol` (replaced by `UnsupportedProtocol`).
+> Individual deprecation notes repeat the version so a compiler warning carries
+> it, but there is only one date to plan against — nothing deprecated here
+> survives past 0.0.5.
+>
+> *Correction:* 0.0.5 shipped with the wave still in place. It was removed in
+> 0.0.6 — see that release.
 
 - **Published binaries no longer embed the release machine's paths, and the
   React Native package is a quarter smaller.** *(no API change)*

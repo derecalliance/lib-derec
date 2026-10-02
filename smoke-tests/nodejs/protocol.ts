@@ -13,11 +13,12 @@
 // share store, recording transport), but are Map-backed instead of
 // localStorage-backed.
 
-import { channelFilterMatches, ContactMode, DeRecProtocol, DeRecProtocolBuilder, FlowKind, SenderKind, primitives } from "@derec-alliance/nodejs";
+import { channelFilterMatches, ContactMode, DeRecProtocol, DeRecProtocolBuilder, FlowKind, SenderKind, generate_replica_id, primitives } from "@derec-alliance/nodejs";
 import type {
   ChannelStatusName,
   ChannelStore,
   ContactMessage,
+  DeRecError,
   DeRecEvent,
   HelperFilter,
   ReplicaFilter,
@@ -77,7 +78,6 @@ class InMemorySecretStore implements SecretStore {
     secretId: string,
     channelIds: string[],
     kind: 0 | 1 | 2,
-    _missingPolicy: "skip" | "fail",
   ): Promise<Array<Uint8Array | null>> {
     return channelIds.map(
       (id) => this.data.get(this.key(secretId, id, kind)) ?? null,
@@ -449,7 +449,9 @@ function makeNode(
     replicaId?: bigint;
     secretId?: bigint;
     threshold?: number;
-    unsafeHttp?: boolean;
+    /** Leave `withThreshold` uncalled so the library default applies. */
+    omitThreshold?: boolean;
+    unsafeConnection?: boolean;
     channelStore?: InMemoryChannelStore;
   } = {},
 ): Node {
@@ -466,10 +468,12 @@ function makeNode(
     .withUserSecretStore(userSecretStore)
     .withStateStore(stateStore)
     .withTransport(transport)
-    .withOwnTransport({ uri: endpointUri, protocol: "https" })
-    .withThreshold(options.threshold ?? THRESHOLD)
+    .withOwnTransports([{ uri: endpointUri, protocol: "https" }])
     .withKeepVersionsCount(KEEP_VERSIONS_COUNT)
     .withCommunicationInfo({ name });
+  if (!options.omitThreshold) {
+    builder = builder.withThreshold(options.threshold ?? THRESHOLD);
+  }
   if (options.autoReplyTo !== undefined) {
     builder = builder.withAutoReplyTo(options.autoReplyTo);
   }
@@ -479,8 +483,8 @@ function makeNode(
   if (options.replicaId !== undefined) {
     builder = builder.withReplicaId(options.replicaId);
   }
-  if (options.unsafeHttp !== undefined) {
-    builder = builder.withUnsafeHttp(options.unsafeHttp);
+  if (options.unsafeConnection !== undefined) {
+    builder = builder.withUnsafeConnection(options.unsafeConnection);
   }
   const protocol = builder.build();
   return { protocol, transport, channelStore, shareStore, secretStore, userSecretStore, stateStore };
@@ -518,6 +522,40 @@ async function processAll(node: Node, bytes: Uint8Array): Promise<DeRecEvent[]> 
     }
   }
   return out;
+}
+
+/**
+ * Asserts a StoreShare `ActionRequired` carries the request's `trace_id` and
+ * a `share_size` equal to the length of the share the owner sent, read back
+ * by decrypting `request` with the owner's key for the channel.
+ */
+async function assertStoreShareAction(
+  owner: Node,
+  action: Extract<DeRecEvent, { type: "ActionRequired" }>,
+  request: Uint8Array,
+  label: string,
+): Promise<void> {
+  if (action.action_kind !== "StoreShare") {
+    throw new Error(`${label}: expected StoreShare action, got ${action.action_kind}`);
+  }
+  if (typeof action.trace_id !== "string" || action.trace_id.length === 0) {
+    throw new Error(`${label}: ActionRequired.trace_id must be a non-empty string`);
+  }
+  const sharedKey = await owner.secretStore.load(
+    String(owner.protocol.secretId()),
+    action.channel_id,
+    0,
+  );
+  if (!sharedKey) throw new Error(`${label}: owner shared_key missing`);
+  const { request: sent } = primitives.sharing.request.extract(request, sharedKey);
+  if (action.share_size !== sent.share.length) {
+    throw new Error(
+      `${label}: ActionRequired.share_size ${action.share_size} ≠ sent share length ${sent.share.length}`,
+    );
+  }
+  console.log(
+    `  [${label}] ActionRequired(StoreShare) trace_id=${action.trace_id} share_size=${action.share_size}  ✓`,
+  );
 }
 
 /** `true` if two `Uint8Array`s are byte-for-byte identical. */
@@ -957,7 +995,7 @@ async function runHashedKeysPairingFlow(): Promise<void> {
   console.log(`  shared keys match (${ownerSharedKey.length}B)  ✓\n`);
 
   // Negative: tampering the binding hash before the scanner starts must
-  // surface `PREPAIR_HASH_MISMATCH` once the real keys arrive. This is
+  // surface `prepair_hash_mismatch` once the real keys arrive. This is
   // the security-relevant guarantee of HashedKeys — the scanner refuses
   // keys that don't match the commitment they originally accepted.
   console.log("  -- Negative: tampered binding hash --");
@@ -993,13 +1031,9 @@ async function runHashedKeysPairingFlow(): Promise<void> {
   if (!caught) {
     throw new Error("tampered binding hash must cause process(PrePairResponse) to throw");
   }
-  // `process()`'s wasm wrapper flattens every underlying error to
-  // `code: "DEREC_ERROR"` and surfaces the specific failure mode via the
-  // message text — match on that. The message comes from the
-  // `PairingError::PrePairHashMismatch` `#[error("...")]` annotation.
-  if (!caught.message || !caught.message.includes("contact binding hash mismatch")) {
+  if (caught.category !== "pairing" || caught.code !== "prepair_hash_mismatch") {
     throw new Error(
-      `tampered binding hash must surface PrePairHashMismatch, got code=${caught.code} message=${caught.message}`,
+      `tampered binding hash must surface pairing/PREPAIR_HASH_MISMATCH, got ${caught.category}/${caught.code}: ${caught.message}`,
     );
   }
   console.log(`  process(PrePairResponse) threw "${caught.message}" ✓\n`);
@@ -1048,6 +1082,8 @@ async function runSharingFlow(): Promise<void> {
     const [helper, hLabel] = helpers[i]!;
 
     const helperEvents = await processAll(helper, request);
+    const action = requireEvent(helperEvents, "ActionRequired", hLabel);
+    await assertStoreShareAction(owner, action, request, hLabel);
     const stored = requireEvent(helperEvents, "ShareStored", hLabel);
     console.log(
       `  [${hLabel}] processAll(StoreShareRequest) → ShareStored(channel_id=${stored.channel_id}, version=${stored.version})`,
@@ -1330,6 +1366,87 @@ async function runDiscoveryAndRecoveryFlow(): Promise<void> {
     `  [Restored] restore(recovered, 1) → snapshot v1 (${restoredSnapshot.secrets.length} secret) + ${recovered.helpers.length} helper channel(s) ✓`,
   );
 
+  // Restore errors carry the same `category` as every other library error,
+  // and a conflict names the channels that block it.
+  const restoreError = async (label: string): Promise<DeRecError> => {
+    try {
+      await restored.protocol.restore(recovered, 1);
+    } catch (e) {
+      return e as DeRecError;
+    }
+    throw new Error(`${label}: restore must be refused`);
+  };
+  const already = await restoreError("second restore");
+  if (already.code !== "already_restored" || already.category !== "input") {
+    throw new Error(
+      `second restore: expected input/already_restored, got ${already.category}/${already.code}`,
+    );
+  }
+  await restored.userSecretStore.remove(ownerSecretId.toString());
+  const conflict = await restoreError("restore over existing channels");
+  const expectedIds = recovered.helpers.map((h) => h.channel_id).sort();
+  if (
+    conflict.code !== "restore_conflict" ||
+    conflict.category !== "input" ||
+    JSON.stringify([...(conflict.channel_ids ?? [])].sort()) !== JSON.stringify(expectedIds)
+  ) {
+    throw new Error(
+      `restore over existing channels: expected input/restore_conflict naming ${expectedIds.join(",")}, got ${JSON.stringify(conflict)}`,
+    );
+  }
+  console.log("  [Restored] already_restored and restore_conflict carry category \"input\"; restore_conflict names the channels ✓");
+
+  // A helper with no endpoint gets no channel; restore reports it and
+  // restores the rest.
+  const lastHelper = recovered.helpers[recovered.helpers.length - 1];
+  if (!lastHelper) {
+    throw new Error("the recovered roster must name a helper");
+  }
+  const unreachableId = lastHelper.channel_id;
+  const partial = makeNode("PartiallyRestored", "https://partial.example.com", {
+    secretId: ownerSecretId,
+  });
+  const partialEvents = await partial.protocol.restore(
+    {
+      ...recovered,
+      helpers: recovered.helpers.map((h) =>
+        h.channel_id === unreachableId ? { ...h, transports: [] } : h,
+      ),
+    },
+    1,
+  );
+  const notRestored = partialEvents.filter(
+    (e): e is Extract<DeRecEvent, { type: "PeerNotRestored" }> =>
+      e.type === "PeerNotRestored",
+  );
+  const [skipped] = notRestored;
+  if (
+    notRestored.length !== 1 ||
+    !skipped ||
+    skipped.channel_id !== unreachableId ||
+    skipped.replica_id !== undefined ||
+    skipped.reason !== "NoTransports"
+  ) {
+    throw new Error(
+      `expected one PeerNotRestored for ${unreachableId}, got ${JSON.stringify(partialEvents)}`,
+    );
+  }
+  for (const helper of recovered.helpers) {
+    const channel = await partial.channelStore.load(
+      ownerSecretId.toString(),
+      helper.channel_id,
+      "0",
+    );
+    if ((channel === undefined || channel === null) !== (helper.channel_id === unreachableId)) {
+      throw new Error(
+        `helper ${helper.channel_id}: only the helper with no endpoint may be left without a channel`,
+      );
+    }
+  }
+  console.log(
+    `  [Restored] a helper with no endpoint is skipped and reported as PeerNotRestored(${unreachableId}, NoTransports) ✓`,
+  );
+
   console.log("\n✓ Discovery & Recovery flow passed.\n");
 }
 
@@ -1359,6 +1476,12 @@ async function runUnpairingFlow(): Promise<void> {
   );
 
   const helperEvents = await processAll(helper, unpairRequest);
+  const unpairAction = requireEvent(helperEvents, "ActionRequired", "Helper");
+  if (unpairAction.unpair_memo !== "decommissioning") {
+    throw new Error(
+      `ActionRequired(Unpair).unpair_memo must carry the announced memo; got ${unpairAction.unpair_memo}`,
+    );
+  }
   const helperUnpaired = requireEvent(helperEvents, "Unpaired", "Helper");
   if (helperUnpaired.channel_id !== longTermChannelId) {
     throw new Error(
@@ -1385,8 +1508,8 @@ async function runUnpairingFlow(): Promise<void> {
 
 /**
  * Asserts the `autoReplyTo` constructor flag: with it `true`, every outbound
- * channel-mode request must carry `request.replyTo = ownTransport` on the
- * inner request body. Covers half (1) of the replyTo contract; half (2)
+ * channel-mode request must carry this node's own transports in
+ * `request.reply_to` on the inner request body. Covers half (1) of the replyTo contract; half (2)
  * (responder honours an inbound `replyTo`) is exercised by the Rust binding
  * smoke test against the orchestrator handler logic.
  */
@@ -1419,7 +1542,7 @@ async function runReplyToFlow(): Promise<void> {
   }
 
   // Decrypt the request body via the primitive `extract` and verify
-  // `request.reply_to.uri === ownerUri`. The shared key is sitting in the
+  // `request.reply_to[0].uri === ownerUri`. The shared key is sitting in the
   // owner's secret store under kind=0 (SharedKey).
   const sharedKey = await owner.secretStore.load(
     String(owner.protocol.secretId()),
@@ -1626,6 +1749,25 @@ async function runReplicaPairingAndSecretSyncFlow(): Promise<void> {
   if (BigInt(received.secret_id) !== secretId) {
     throw new Error(`secret_id mismatch: expected ${secretId}, got ${received.secret_id}`);
   }
+  // On a push the sender is also the publisher of the version.
+  if (received.author_replica_id === null || BigInt(received.author_replica_id) !== ownerReplicaId) {
+    throw new Error(
+      `author_replica_id must name the publisher (${ownerReplicaId}), got ${received.author_replica_id}`,
+    );
+  }
+  // The destination's snapshot records that publisher; replica conflict
+  // detection reads it back from the application's UserSecretStore.
+  const destSnapshot = await destination.userSecretStore.loadLatest(
+    String(destination.protocol.secretId()),
+  );
+  if (
+    destSnapshot?.author_replica_id === undefined ||
+    BigInt(destSnapshot.author_replica_id) !== ownerReplicaId
+  ) {
+    throw new Error(
+      `destination UserSecretStore must hold author_replica_id=${ownerReplicaId}, got ${destSnapshot?.author_replica_id}`,
+    );
+  }
   if (received.secret.secrets.length !== 1) {
     throw new Error(
       `secret.secrets.length expected 1, got ${received.secret.secrets.length}`,
@@ -1708,6 +1850,11 @@ async function runReplicaPairingAndSecretSyncFlow(): Promise<void> {
   }
   if (received2.version !== 3) {
     throw new Error(`v2: expected version=3, got ${received2.version}`);
+  }
+  if (received2.author_replica_id === null || BigInt(received2.author_replica_id) !== ownerReplicaId) {
+    throw new Error(
+      `v2: author_replica_id must name the publisher (${ownerReplicaId}), got ${received2.author_replica_id}`,
+    );
   }
   const v2Data = received2.secret.secrets[0]?.data;
   if (
@@ -1815,18 +1962,34 @@ async function runUpdateChannelInfoFlow(): Promise<void> {
   const newInfo = { name: "Owner-renamed", email: "owner.new@example.com" };
 
   // Mutate local state, then propagate.
-  owner.protocol.setCommunicationInfo(newInfo);
-  owner.protocol.setOwnTransport(newUri, "https");
+  await owner.protocol.setCommunicationInfo(newInfo);
+  await owner.protocol.setOwnTransports([{ uri: newUri, protocol: "https" }]);
 
   await owner.protocol.start(FlowKind.UpdateChannelInfo, {
     target: BigInt(longTermChannelId),
     communication_info: newInfo,
-    transport_protocol: { uri: newUri, protocol: 0 },
+    own_transports: [{ uri: newUri, protocol: "https" }],
   });
   const updateRequest = drainOne(owner, "Owner");
   console.log(`  [Owner] start(UpdateChannelInfo) → request ${updateRequest.length}B`);
 
   const helperEvents = await processAll(helper, updateRequest);
+  const updateAction = requireEvent(helperEvents, "ActionRequired", "Helper");
+  if (JSON.stringify(updateAction.updated_transports) !== JSON.stringify([{ uri: newUri, protocol: "https" }])) {
+    throw new Error(
+      `ActionRequired(UpdateChannelInfo).updated_transports must match the announced endpoints; got ${JSON.stringify(updateAction.updated_transports)}`,
+    );
+  }
+  const announcedInfo = updateAction.updated_communication_info ?? {};
+  if (
+    Object.keys(announcedInfo).length !== Object.keys(newInfo).length ||
+    Object.entries(newInfo).some(([k, v]) => announcedInfo[k] !== v)
+  ) {
+    throw new Error(
+      `ActionRequired(UpdateChannelInfo).updated_communication_info must match the announced map; got ${JSON.stringify(updateAction.updated_communication_info)}`,
+    );
+  }
+  console.log("  [Helper] ActionRequired(UpdateChannelInfo) carries the announced transports + communication_info  ✓");
   const helperUpdated = helperEvents.find((e) => e.type === "ChannelInfoUpdated");
   if (!helperUpdated) {
     throw new Error(
@@ -1943,8 +2106,10 @@ export async function runProtocolSmoke(): Promise<void> {
   await runFingerprintMismatchFlow();
   await runHashedKeysPairingFlow();
   await runNoKeysPairingFlow();
-  runUnsafeHttpConfigFlow();
-  runConfigSurfaceFlow();
+  runUnsafeConnectionConfigFlow();
+  runGenerateReplicaIdFlow();
+  await runConfigSurfaceFlow();
+  await runOverlappingCallsFlow();
   await runSharingFlow();
   await runDiscoveryAndRecoveryFlow();
   await runUnpairingFlow();
@@ -1952,9 +2117,11 @@ export async function runProtocolSmoke(): Promise<void> {
   await runReplyToFlow();
   await runReplicaIdWiringSadPathsFlow();
   await runReplicaPairingAndSecretSyncFlow();
+  await runUnconfirmedDestinationIgnoresTheCopyFlow();
   await runReplicaSyncVersionProgressionFlow();
   await runAutoAcceptFlow();
   await runExpiredChannelCleanupFlow();
+  await runBindingInputContractFlow();
   await runDefiantChannelStoreFlow();
 
   console.log("━━━ [Protocol] All passed. ━━━\n");
@@ -2300,6 +2467,64 @@ async function assertLatestVersion(owner: Node, secretId: bigint, expected: numb
   }
 }
 
+async function runUnconfirmedDestinationIgnoresTheCopyFlow(): Promise<void> {
+  console.log("\n=== [Protocol] Unconfirmed replica destination ===\n");
+
+  const source = {
+    node: makeNode("Source", "https://source.example.com", { replicaId: 0x5050_5050n }),
+    uri: "https://source.example.com",
+  };
+  const destination = {
+    node: makeNode("Destination", "https://destination.example.com", { replicaId: 0xde57_de57n }),
+    uri: "https://destination.example.com",
+  };
+
+  const { rekeyed } = await pairReplicaHandshake(source, destination, 31n);
+  const destinationFp = await destination.node.protocol.getFingerprint(rekeyed);
+  if (!(await source.node.protocol.verifyFingerprint(rekeyed, destinationFp))) {
+    throw new Error("source.verifyFingerprint must return true");
+  }
+
+  const early = await pumpAll([source, destination]);
+  const ignored = early.find(
+    (e) =>
+      e.type === "MessageIgnored" &&
+      e.reason === "PendingVerification" &&
+      BigInt(e.channel_id) === rekeyed,
+  );
+  if (!ignored) {
+    throw new Error(
+      `a copy sent before the destination confirms must be ignored, got [${early.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  if (
+    early.some(
+      (e) =>
+        e.type === "ReplicaSecretInstalled" ||
+        e.type === "ReplicaSecretReceived" ||
+        e.type === "ReplicaSecretAcked",
+    )
+  ) {
+    throw new Error("nothing may be installed or acknowledged before the destination confirms");
+  }
+  console.log("  copy sent before the destination confirmed was ignored  ✓");
+
+  const sourceFp = await source.node.protocol.getFingerprint(rekeyed);
+  if (!(await destination.node.protocol.verifyFingerprint(rekeyed, sourceFp))) {
+    throw new Error("destination.verifyFingerprint must return true");
+  }
+  await destination.node.protocol.start(FlowKind.ReplicaDiscovery);
+  const catchUp = await pumpAll([destination, source]);
+  if (!catchUp.some((e) => e.type === "ReplicaSecretInstalled")) {
+    throw new Error(
+      `after confirming, ReplicaDiscovery must install the copy, got [${catchUp.map((e) => e.type).join(", ")}]`,
+    );
+  }
+  console.log("  destination pulled the copy with ReplicaDiscovery after confirming  ✓");
+
+  console.log("\n✓ Unconfirmed replica destination flow passed.\n");
+}
+
 async function pairReplicaHandshake(
   owner: AddressedNode,
   replica: AddressedNode,
@@ -2585,6 +2810,75 @@ async function runDefiantChannelStoreFlow(): Promise<void> {
 // interpreted the flag locally (dropping the timeout, or substituting its
 // own default) would still pass a happy-path test, so the config is chosen
 // to fail if any interpretation crept into the JS layer.
+async function runOverlappingCallsFlow(): Promise<void> {
+  console.log("=== [Protocol] overlapping calls on one instance ===\n");
+
+  class SlowSecretStore extends InMemorySecretStore {
+    override async save(
+      secretId: string,
+      channelId: string,
+      kind: 0 | 1 | 2,
+      value: Uint8Array,
+    ): Promise<void> {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      return super.save(secretId, channelId, kind, value);
+    }
+  }
+
+  const protocol = new DeRecProtocolBuilder(DEFAULT_TEST_SECRET_ID)
+    .withChannelStore(new InMemoryChannelStore())
+    .withShareStore(new InMemoryShareStore())
+    .withSecretStore(new SlowSecretStore())
+    .withUserSecretStore(new InMemoryUserSecretStore())
+    .withStateStore(new InMemoryStateStore())
+    .withTransport(new RecordingTransport())
+    .withOwnTransports([{ uri: "https://overlap.example.com", protocol: "https" }])
+    .withThreshold(THRESHOLD)
+    .build();
+
+  const settled: string[] = [];
+  const track = <T>(label: string, call: Promise<T>): Promise<T> =>
+    call.then((value) => {
+      settled.push(label);
+      return value;
+    });
+  const calls = Promise.all([
+    track("createContact#1", protocol.createContact(1n, ContactMode.InlineKeys)),
+    track("tick", protocol.tick()),
+    track("setCommunicationInfo", protocol.setCommunicationInfo({ name: "Overlap" })),
+    track("createContact#2", protocol.createContact(2n, ContactMode.InlineKeys)),
+  ]);
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const hung = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () =>
+        reject(
+          new Error(
+            `overlapping calls did not settle within 5s (settled: [${settled.join(", ")}]) — calls on one instance collide instead of queueing`,
+          ),
+        ),
+      5000,
+    );
+  });
+  try {
+    await Promise.race([calls, hung]);
+  } finally {
+    clearTimeout(timer);
+  }
+  console.log("  four overlapping calls on one instance all settled  ✓");
+
+  const expected = ["createContact#1", "tick", "setCommunicationInfo", "createContact#2"];
+  if (settled.join() !== expected.join()) {
+    throw new Error(
+      `overlapping calls must run in call order: expected [${expected.join(", ")}], got [${settled.join(", ")}]`,
+    );
+  }
+  console.log("  overlapping calls ran in the order they were made  ✓");
+
+  console.log("\n✓ overlapping calls passed.\n");
+}
+
 async function runExpiredChannelCleanupFlow(): Promise<void> {
   console.log("[Protocol] expired-channel cleanup");
 
@@ -2595,7 +2889,7 @@ async function runExpiredChannelCleanupFlow(): Promise<void> {
     .withUserSecretStore(new InMemoryUserSecretStore())
     .withStateStore(new InMemoryStateStore())
     .withTransport(new RecordingTransport())
-    .withOwnTransport({ uri: "https://cleanup.example.com", protocol: "https" })
+    .withOwnTransports([{ uri: "https://cleanup.example.com", protocol: "https" }])
     .withThreshold(THRESHOLD)
     .withTimeouts({ expired_channels: { enabled: false, timeout_in_secs: 900 } });
   const protocol = builder.build();
@@ -2635,19 +2929,35 @@ export function _startOverloadsCoverEveryFlowKind(protocol: DeRecProtocol): void
 }
 
 /**
- * `unsafeHttp` must survive the WASM boundary and actually change behaviour.
+ * `unsafeConnection` must survive the WASM boundary and actually change behaviour.
  *
  * Its own test because the failure is silent: an unset field on the Rust side
  * defaults to `false`, so a name mismatch would make the setting a no-op with
  * every other test still green — the same shape as the enum variants that
  * were declared in `index.d.ts` but `undefined` at run time.
  */
-export function runUnsafeHttpConfigFlow(): void {
-  console.log("=== [Protocol] unsafe_http config ===\n");
+// The core mints replica ids so every SDK obeys the same rule: random, and
+// never 0, which no replica id may be.
+export function runGenerateReplicaIdFlow(): void {
+  console.log("=== [Protocol] generate_replica_id ===\n");
+  for (let i = 0; i < 64; i++) {
+    const id = generate_replica_id();
+    if (typeof id !== "bigint" || id === 0n) {
+      throw new Error(`generate_replica_id() must return a non-zero bigint, got ${String(id)}`);
+    }
+  }
+  makeNode("Generated", "https://generated.example.com", {
+    replicaId: generate_replica_id(),
+  });
+  console.log("  64 ids non-zero; a protocol builds with a generated id  ✓\n");
+}
 
-  const builds = (uri: string, unsafeHttp: boolean): boolean => {
+export function runUnsafeConnectionConfigFlow(): void {
+  console.log("=== [Protocol] unsafe_connection config ===\n");
+
+  const builds = (uri: string, unsafeConnection: boolean): boolean => {
     try {
-      makeNode("Dev", uri, { unsafeHttp });
+      makeNode("Dev", uri, { unsafeConnection });
       return true;
     } catch {
       return false;
@@ -2655,23 +2965,23 @@ export function runUnsafeHttpConfigFlow(): void {
   };
 
   if (!builds("http://127.0.0.1:8080", false)) {
-    throw new Error("loopback plaintext must build with unsafeHttp=false");
+    throw new Error("loopback plaintext must build with unsafeConnection=false");
   }
-  console.log("  loopback http accepted with unsafeHttp=false  ✓");
+  console.log("  loopback http accepted with unsafeConnection=false  ✓");
 
   if (builds("http://192.168.1.42:8080", false)) {
-    throw new Error("LAN plaintext must be refused with unsafeHttp=false");
+    throw new Error("LAN plaintext must be refused with unsafeConnection=false");
   }
-  console.log("  LAN http refused with unsafeHttp=false  ✓");
+  console.log("  LAN http refused with unsafeConnection=false  ✓");
 
   if (!builds("http://192.168.1.42:8080", true)) {
     throw new Error(
-      "LAN plaintext must build with unsafeHttp=true — the setting is not reaching the library",
+      "LAN plaintext must build with unsafeConnection=true — the setting is not reaching the library",
     );
   }
-  console.log("  LAN http accepted with unsafeHttp=true  ✓");
+  console.log("  LAN http accepted with unsafeConnection=true  ✓");
 
-  console.log("\n✓ unsafe_http config passed.\n");
+  console.log("\n✓ unsafe_connection config passed.\n");
 }
 
 /**
@@ -2680,7 +2990,7 @@ export function runUnsafeHttpConfigFlow(): void {
  * drop the setting rather than fail — so each assertion here is checking the
  * value actually arrived.
  */
-export function runConfigSurfaceFlow(): void {
+export async function runConfigSurfaceFlow(): Promise<void> {
   console.log("=== [Protocol] config surface ===\n");
 
   const base = () =>
@@ -2737,17 +3047,14 @@ export function runConfigSurfaceFlow(): void {
     .build();
   console.log("  distinct protocols accepted  ✓");
 
-  // setOwnTransport re-points one protocol; setOwnTransports replaces the set
-  // and is held to the same rule as the builder.
-  protocol.setOwnTransport("https://moved.example", "https");
-  console.log("  setOwnTransport re-points a single protocol  ✓");
-
-  protocol.setOwnTransports([{ uri: "https://only.example", protocol: "https" }]);
+  // setOwnTransports replaces the set and is held to the same rule as the
+  // builder.
+  await protocol.setOwnTransports([{ uri: "https://only.example", protocol: "https" }]);
   console.log("  setOwnTransports replaces the whole set  ✓");
 
   refused = false;
   try {
-    protocol.setOwnTransports([
+    await protocol.setOwnTransports([
       { uri: "https://a.example", protocol: "https" },
       { uri: "https://b.example", protocol: "https" },
     ]);
@@ -2793,4 +3100,186 @@ function matchesFilter(
     (record.status ?? "Paired") as ChannelStatusName,
     role as SenderKindName | ReplicaRoleName,
   );
+}
+
+/** The `code` of a structured binding error, or `undefined` for anything else. */
+function errorCode(e: unknown): string | undefined {
+  return typeof e === "object" && e !== null && "code" in e
+    ? String((e as { code: unknown }).code)
+    : undefined;
+}
+
+async function expectCode(
+  label: string,
+  expected: string,
+  call: () => unknown,
+): Promise<void> {
+  let code: string | undefined;
+  try {
+    await call();
+  } catch (e) {
+    code = errorCode(e);
+    if (code === undefined) throw e;
+  }
+  if (code !== expected) {
+    throw new Error(`${label}: expected error code ${expected}, got ${code ?? "no error"}`);
+  }
+}
+
+/**
+ * What crosses the binding is forwarded or rejected, never reinterpreted.
+ *
+ * Each case is one the bridge used to settle on its own: a restated default,
+ * an accepted alias, a number silently truncated to an id, an empty id read
+ * as `0`, a console write in place of the error path.
+ */
+async function runBindingInputContractFlow(): Promise<void> {
+  console.log("=== [Protocol] binding input contract ===\n");
+
+  // No `withThreshold`: the library's default (3) must be what applies. Two
+  // helpers are below it, so the round splits nothing and sends them nothing,
+  // where a 2-of-2 threshold would send each a share.
+  const owner = makeNode("DefaultOwner", "https://default-owner.example.com", {
+    omitThreshold: true,
+  });
+  const helperA = makeNode("DefaultHelperA", "https://default-helper-a.example.com");
+  const helperB = makeNode("DefaultHelperB", "https://default-helper-b.example.com");
+  await doPair(helperA, owner, 9101n, "DefaultOwner↔HelperA");
+  await doPair(helperB, owner, 9102n, "DefaultOwner↔HelperB");
+  owner.transport.drain();
+  await owner.protocol.start(FlowKind.ProtectSecret, {
+    secrets: [{ id: new Uint8Array([1]), name: "s", data: new Uint8Array([1]) }],
+  });
+  const sent = owner.transport.drain();
+  if (sent.length !== 0) {
+    throw new Error(
+      `without withThreshold the library default (3) must apply: 2 helpers get no share, but ${sent.length} request(s) were sent`,
+    );
+  }
+  console.log("  no withThreshold → the library default (3) applies: 2 helpers get no share  ✓");
+
+  const base = () =>
+    new DeRecProtocolBuilder(DEFAULT_TEST_SECRET_ID)
+      .withChannelStore(new InMemoryChannelStore())
+      .withShareStore(new InMemoryShareStore())
+      .withSecretStore(new InMemorySecretStore())
+      .withUserSecretStore(new InMemoryUserSecretStore())
+      .withStateStore(new InMemoryStateStore())
+      .withTransport(new RecordingTransport())
+      .withOwnTransports([{ uri: "https://contract.example.com", protocol: "https" }]);
+
+  // `withUnpairAck` takes the two names `UnpairAck` declares, exactly.
+  base().withUnpairAck("required").withUnpairAck("not_required").build();
+  for (const alias of ["fire_and_forget", "notrequired", "NOT_REQUIRED", "Required"]) {
+    await expectCode(`withUnpairAck(${alias})`, "invalid_unpair_ack", () =>
+      base().withUnpairAck(alias as never),
+    );
+  }
+  console.log("  withUnpairAck accepts only \"required\" / \"not_required\"  ✓");
+
+  // A node with no endpoint cannot be reached by any peer. An absent or empty
+  // own-transport list reaches the library unchanged and is refused there.
+  const unreachable = () =>
+    new DeRecProtocolBuilder(DEFAULT_TEST_SECRET_ID)
+      .withChannelStore(new InMemoryChannelStore())
+      .withShareStore(new InMemoryShareStore())
+      .withSecretStore(new InMemorySecretStore())
+      .withUserSecretStore(new InMemoryUserSecretStore())
+      .withStateStore(new InMemoryStateStore())
+      .withTransport(new RecordingTransport());
+  await expectCode("build() without withOwnTransports", "invalid_input", () =>
+    unreachable().build(),
+  );
+  await expectCode("build() with withOwnTransports([])", "invalid_input", () =>
+    unreachable().withOwnTransports([]).build(),
+  );
+  console.log("  absent or empty own transports refused by the library  ✓");
+
+  // The library's memory is released explicitly. Releasing twice is a no-op,
+  // as with .NET Dispose and Go Close; any call afterwards is refused.
+  const released = base().build();
+  released.free();
+  released.free();
+  let usedAfterFree = false;
+  try {
+    released.secretId();
+    usedAfterFree = true;
+  } catch {
+    // expected
+  }
+  if (usedAfterFree) {
+    throw new Error("a call after free() must throw");
+  }
+  const unbuilt = base();
+  unbuilt.free();
+  unbuilt[Symbol.dispose]();
+  const built = base();
+  const fromBuilt = built.build();
+  built.free();
+  fromBuilt[Symbol.dispose]();
+  console.log("  free() / [Symbol.dispose]() release once and are safe to repeat  ✓");
+
+  const protocol = base().build();
+
+  // `removeExpiredChannels` takes a u64 in every encoding ids use.
+  for (const secs of [0, 5n, "7", 2n ** 64n - 1n]) {
+    const removed = await protocol.removeExpiredChannels(secs);
+    if (!Array.isArray(removed)) {
+      throw new Error(`removeExpiredChannels(${String(secs)}) must resolve to an array`);
+    }
+  }
+  console.log("  removeExpiredChannels accepts number, bigint up to u64::MAX, decimal string  ✓");
+
+  // A number that is not exactly a u64 is refused, not truncated.
+  for (const bad of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 53]) {
+    await expectCode(`removeExpiredChannels(${bad})`, "decode_error", () =>
+      protocol.removeExpiredChannels(bad),
+    );
+    await expectCode(`getFingerprint(${bad})`, "decode_error", () =>
+      protocol.getFingerprint(bad),
+    );
+  }
+  for (const bad of ["", "-1", "+1", "1.0", "18446744073709551616"]) {
+    await expectCode(`removeExpiredChannels("${bad}")`, "decode_error", () =>
+      protocol.removeExpiredChannels(bad),
+    );
+  }
+  await expectCode("removeExpiredChannels(2^64)", "decode_error", () =>
+    protocol.removeExpiredChannels(2n ** 64n),
+  );
+  console.log("  fractional, negative, unsafe and out-of-range ids are refused  ✓");
+
+  // A recovered secret with an empty id is malformed, not channel 0.
+  const helper = (channel_id: string) => ({
+    helpers: [{ channel_id, transports: [], shared_key: new Uint8Array(32) }],
+    secrets: [],
+  });
+  for (const bad of ["", "-1", "abc"]) {
+    await expectCode(`restore(channel_id="${bad}")`, "invalid_recovered_secret", () =>
+      protocol.restore(helper(bad) as never, 1),
+    );
+  }
+  console.log("  restore refuses an empty or non-decimal channel_id  ✓");
+
+  // A failed `process` surfaces through the rejected promise only.
+  const original = console.error;
+  const logged: unknown[] = [];
+  console.error = (...args: unknown[]) => {
+    logged.push(args);
+  };
+  let rejected = false;
+  try {
+    await protocol.process(new Uint8Array([0xff, 0x00, 0x01]));
+  } catch {
+    rejected = true;
+  } finally {
+    console.error = original;
+  }
+  if (!rejected) throw new Error("process(garbage) must reject");
+  if (logged.length !== 0) {
+    throw new Error(`process must not write to the console, got ${JSON.stringify(logged)}`);
+  }
+  console.log("  a failed process() rejects without writing to the console  ✓");
+
+  console.log("\n✓ binding input contract passed.\n");
 }

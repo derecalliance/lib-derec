@@ -84,12 +84,7 @@ internal static class Sharing
         byte[] sharedKey,
         UIntPtr sharedKeyLen,
         byte[]? replyTo,
-        UIntPtr replyToLen,
-        // Writer's `replica_id`. `hasReplicaId == 0` writes None on the
-        // wire; otherwise `replicaId` is stamped on
-        // `StoreShareRequestMessage.replicaId`.
-        uint hasReplicaId,
-        ulong replicaId
+        UIntPtr replyToLen
     );
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]

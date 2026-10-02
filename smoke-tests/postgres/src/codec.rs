@@ -103,12 +103,13 @@ pub fn assemble_user_secrets(
     version: u32,
     description: Option<String>,
     payload: Vec<u8>,
+    author_replica_id: Option<u64>,
 ) -> UserSecrets {
     UserSecrets {
         version,
         description,
         secrets: decode_user_secrets_payload(&payload),
-        replicas: None,
+        author_replica_id,
     }
 }
 

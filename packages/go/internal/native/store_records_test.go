@@ -4,6 +4,7 @@
 package native
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -21,7 +22,7 @@ import (
 func TestEncodeChannelRecord_Helper_MatchesRustJSONShape(t *testing.T) {
 	h := HelperChannel{
 		ChannelID: 123456789,
-		Transports:        []TransportEndpoint{{
+		Transports: []TransportEndpoint{{
 			URI:      "https://example.com/derec",
 			Protocol: 0,
 		}},
@@ -68,10 +69,10 @@ func TestEncodeChannelRecord_Replica_MatchesRustJSONShape(t *testing.T) {
 
 func TestEncodeChannelRecord_EmptyCommunicationInfoIsEmptyObjectNotNull(t *testing.T) {
 	h := HelperChannel{
-		ChannelID: 1,
-		Transports:        []TransportEndpoint{{URI: "https://h.example.com", Protocol: 0}},
-		Status:    ChannelStatusPending,
-		PeerRole:  SenderKindOwner,
+		ChannelID:  1,
+		Transports: []TransportEndpoint{{URI: "https://h.example.com", Protocol: 0}},
+		Status:     ChannelStatusPending,
+		PeerRole:   SenderKindOwner,
 	}
 	got, err := EncodeChannelRecord(ChannelRecord{Helper: &h})
 	if err != nil {
@@ -82,16 +83,32 @@ func TestEncodeChannelRecord_EmptyCommunicationInfoIsEmptyObjectNotNull(t *testi
 	}
 }
 
-// A record must carry exactly one variant — neither is as wrong as both,
-// since the Rust side cannot decode either into ChannelRecord.
-func TestEncodeChannelRecord_RejectsAmbiguousRecords(t *testing.T) {
-	if _, err := EncodeChannelRecord(ChannelRecord{}); err == nil {
-		t.Fatal("expected an error for a record carrying neither variant")
+// Whether a record carries exactly one variant is the library's decision:
+// whatever is set is marshalled as given, and Rust's externally tagged
+// ChannelRecord refuses `{}` and a two-key object alike.
+func TestEncodeChannelRecord_MarshalsVariantsAsGiven(t *testing.T) {
+	raw, err := EncodeChannelRecord(ChannelRecord{})
+	if err != nil {
+		t.Fatalf("EncodeChannelRecord(neither): %v", err)
+	}
+	if string(raw) != `{}` {
+		t.Fatalf("neither variant: got %s, want {}", raw)
 	}
 	h := HelperChannel{ChannelID: 1}
 	m := ReplicaMember{ChannelID: 1, ReplicaID: 2}
-	if _, err := EncodeChannelRecord(ChannelRecord{Helper: &h, Replica: &m}); err == nil {
-		t.Fatal("expected an error for a record carrying both variants")
+	raw, err = EncodeChannelRecord(ChannelRecord{Helper: &h, Replica: &m})
+	if err != nil {
+		t.Fatalf("EncodeChannelRecord(both): %v", err)
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &keys); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := keys["Helper"]; !ok {
+		t.Fatalf("both variants: Helper missing from %s", raw)
+	}
+	if _, ok := keys["Replica"]; !ok {
+		t.Fatalf("both variants: Replica missing from %s", raw)
 	}
 }
 
@@ -186,14 +203,13 @@ func TestChannelRecordRoundTrip_StampsTheMarkerOnUnversionedInput(t *testing.T) 
 	}
 }
 
-func TestDecodeChannelRecord_RejectsAmbiguousJSON(t *testing.T) {
-	if _, err := DecodeChannelRecord([]byte(`{}`)); err == nil {
-		t.Fatal("expected an error for JSON carrying neither variant")
+func TestDecodeChannelRecord_CarriesWhatTheLibrarySent(t *testing.T) {
+	r, err := DecodeChannelRecord([]byte(`{}`))
+	if err != nil {
+		t.Fatalf("DecodeChannelRecord({}): %v", err)
 	}
-	both := `{"Helper":{"channel_id":1,"transports":[{"uri":"","protocol":0}],"communication_info":{},"peer_role":"Owner","status":"Paired","created_at":0},` +
-		`"Replica":{"channel_id":1,"replica_id":2,"transports":[{"uri":"","protocol":0}],"communication_info":{},"role":"Source","status":"Paired","created_at":0}}`
-	if _, err := DecodeChannelRecord([]byte(both)); err == nil {
-		t.Fatal("expected an error for JSON carrying both variants")
+	if r.Helper != nil || r.Replica != nil {
+		t.Fatalf("empty object must decode to no variant, got %+v", r)
 	}
 }
 
@@ -245,18 +261,6 @@ func TestEncodeShare_MatchesRustJSONShape(t *testing.T) {
 	}
 }
 
-func TestEncodeShare_DropsReplicaID(t *testing.T) {
-	rid := uint64(9)
-	s := Share{SecretID: 1, Version: 1, ReplicaID: &rid, Bytes: []byte{9}}
-	got, err := EncodeShare(s)
-	if err != nil {
-		t.Fatalf("EncodeShare: %v", err)
-	}
-	if strings.Contains(string(got), "replica") {
-		t.Fatalf("ShareRecord must never carry replica_id (matches Rust ShareRecord), got: %s", got)
-	}
-}
-
 func TestDecodeShare_KnownGoodRustSample(t *testing.T) {
 	sample := `{"secret_id":"42","version":7,"bytes":[10,20,30]}`
 	s, err := DecodeShare([]byte(sample))
@@ -268,9 +272,6 @@ func TestDecodeShare_KnownGoodRustSample(t *testing.T) {
 	}
 	if string(s.Bytes) != string([]byte{10, 20, 30}) {
 		t.Errorf("Bytes = %v", s.Bytes)
-	}
-	if s.ReplicaID != nil {
-		t.Errorf("ReplicaID must decode to nil (matches Rust ShareRecord::into_share), got %v", s.ReplicaID)
 	}
 }
 
@@ -336,18 +337,16 @@ func TestEncodeSecretValue_MatchesRustJSONShape(t *testing.T) {
 	}
 }
 
-func TestDecodeSecretValue_RejectsBadSharedKeyLength(t *testing.T) {
-	// Rust: "SharedKey payload must be 32 bytes" — SecretValueRecord::into_value.
-	sample := `{"kind":0,"bytes":[1,2,3]}`
-	if _, err := DecodeSecretValue([]byte(sample)); err == nil {
-		t.Fatal("expected error for SharedKey payload != 32 bytes")
+// What each SecretKind requires of its payload is checked by the library
+// (SecretValueRecord::into_value), so the codec carries kind and bytes
+// verbatim.
+func TestDecodeSecretValue_CarriesKindAndBytesVerbatim(t *testing.T) {
+	v, err := DecodeSecretValue([]byte(`{"kind":9,"bytes":[1,2,3]}`))
+	if err != nil {
+		t.Fatalf("DecodeSecretValue: %v", err)
 	}
-}
-
-func TestDecodeSecretValue_RejectsUnknownKind(t *testing.T) {
-	sample := `{"kind":9,"bytes":[]}`
-	if _, err := DecodeSecretValue([]byte(sample)); err == nil {
-		t.Fatal("expected error for unknown SecretKind")
+	if v.Kind != SecretKind(9) || !bytes.Equal(v.Bytes, []byte{1, 2, 3}) {
+		t.Fatalf("got %+v, want kind 9 and bytes [1 2 3]", v)
 	}
 }
 
@@ -362,7 +361,8 @@ func TestStateKeyRoundTrip_AllKinds(t *testing.T) {
 		{Kind: StateKindPendingVerification, ChannelID: &cid},
 		{Kind: StateKindPendingRecovery, SecretID: &sid, Version: &ver},
 		{Kind: StateKindPendingUnpair, ChannelID: &cid},
-		{Kind: StateKindSharingRound},
+		{Kind: StateKindSharingRound, Version: &ver},
+		{Kind: StateKindPendingReplicaDiscovery},
 	}
 	for _, want := range cases {
 		wire, err := EncodeStateKey(want)
@@ -389,11 +389,11 @@ func TestStateKeyRoundTrip_AllKinds(t *testing.T) {
 }
 
 func TestEncodeStateKey_OmitsAbsentFields(t *testing.T) {
-	got, err := EncodeStateKey(StateKey{Kind: StateKindSharingRound})
+	got, err := EncodeStateKey(StateKey{Kind: StateKindPendingReplicaDiscovery})
 	if err != nil {
 		t.Fatalf("EncodeStateKey: %v", err)
 	}
-	want := `{"kind":3}`
+	want := `{"kind":4}`
 	if string(got) != want {
 		t.Fatalf("mismatch:\n got: %s\nwant: %s", got, want)
 	}
@@ -533,12 +533,95 @@ func TestDecodeStateItem_KnownGoodRustSample_SharingRound(t *testing.T) {
 	}
 }
 
-func TestDecodeStateItem_SharingRoundRequiresAllThreeSets(t *testing.T) {
-	// Rust: parse_channel_id_set errors "SharingRound requires {field}" when
-	// the field is absent entirely (None), not merely empty.
-	sample := `{"kind":3,"version":1,"started_at":"1"}`
-	if _, err := DecodeStateItem([]byte(sample)); err == nil {
-		t.Fatal("expected error when pending/confirmed/failed are absent")
+// An absent set decodes as nil and a present one, even empty, as non-nil;
+// which sets a kind requires is checked by the library
+// (StateItemRecord::into_item).
+func TestDecodeStateItem_SetsPresenceIsCarried(t *testing.T) {
+	item, err := DecodeStateItem([]byte(`{"kind":3,"version":1,"started_at":"1","pending":[]}`))
+	if err != nil {
+		t.Fatalf("DecodeStateItem: %v", err)
+	}
+	if item.Pending == nil || len(item.Pending) != 0 {
+		t.Fatalf("present empty set must decode as non-nil empty, got %#v", item.Pending)
+	}
+	if item.Confirmed != nil || item.Failed != nil {
+		t.Fatalf("absent sets must decode as nil, got %#v / %#v", item.Confirmed, item.Failed)
+	}
+}
+
+func TestStateItemRoundTrip_PendingReplicaDiscovery(t *testing.T) {
+	lv, sa := uint32(5), uint64(100)
+	item := StateItem{
+		Kind:            StateKindPendingReplicaDiscovery,
+		LocalVersion:    &lv,
+		StartedAt:       &sa,
+		PendingReplicas: []uint64{21},
+		Reported:        map[uint64]uint32{22: 6},
+	}
+	raw, err := EncodeStateItem(item)
+	if err != nil {
+		t.Fatalf("EncodeStateItem: %v", err)
+	}
+	back, err := DecodeStateItem(raw)
+	if err != nil {
+		t.Fatalf("DecodeStateItem: %v", err)
+	}
+	if back.Kind != StateKindPendingReplicaDiscovery || back.LocalVersion == nil || *back.LocalVersion != 5 ||
+		back.StartedAt == nil || *back.StartedAt != 100 ||
+		len(back.PendingReplicas) != 1 || back.PendingReplicas[0] != 21 || back.Reported[22] != 6 {
+		t.Fatalf("round-trip lost data: %+v", back)
+	}
+}
+
+func TestPendingReplicaDiscoveryItemCarriesNoVersion(t *testing.T) {
+	lv, sa := uint32(5), uint64(100)
+	raw, err := EncodeStateItem(StateItem{Kind: StateKindPendingReplicaDiscovery, LocalVersion: &lv, StartedAt: &sa})
+	if err != nil {
+		t.Fatalf("EncodeStateItem: %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := fields["version"]; ok {
+		t.Fatalf("catch-up item must not carry the key field `version`: %s", raw)
+	}
+	key := StateItem{Kind: StateKindPendingReplicaDiscovery}.Key()
+	if key.Kind != StateKindPendingReplicaDiscovery {
+		t.Fatalf("Key() = %+v, want PendingReplicaDiscovery", key)
+	}
+	if _, err := EncodeStateKey(key); err != nil {
+		t.Fatalf("EncodeStateKey: %v", err)
+	}
+}
+
+func TestDecodeStateItem_KnownGoodRustSample_PendingReplicaDiscovery(t *testing.T) {
+	sample := `{"kind":4,"started_at":"100","local_version":5,"pending_replicas":["21"],"reported":[{"replica_id":"22","version":6}]}`
+	item, err := DecodeStateItem([]byte(sample))
+	if err != nil {
+		t.Fatalf("DecodeStateItem: %v", err)
+	}
+	if *item.LocalVersion != 5 || item.Reported[22] != 6 {
+		t.Fatalf("got %+v", item)
+	}
+	// A row written before local_version existed carries `version`. The
+	// codec carries it as given; the library reads it in place of
+	// local_version (StateItemRecord::into_item).
+	legacy := `{"kind":4,"version":5,"started_at":"100","pending_replicas":[],"reported":[]}`
+	item, err = DecodeStateItem([]byte(legacy))
+	if err != nil || item.Version == nil || *item.Version != 5 || item.LocalVersion != nil {
+		t.Fatalf("legacy row must decode verbatim: %+v, %v", item, err)
+	}
+	raw, err := EncodeStateItem(item)
+	if err != nil {
+		t.Fatalf("EncodeStateItem: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if string(fields["version"]) != "5" {
+		t.Fatalf("legacy row must reach the library with its version: %s", raw)
 	}
 }
 
@@ -588,6 +671,52 @@ func TestEncodeUserSecrets_NoDescriptionOmitsField(t *testing.T) {
 	want := `{"version":1,"secrets":[]}`
 	if string(got) != want {
 		t.Fatalf("mismatch:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func TestUserSecrets_AuthorReplicaIDRoundTrip(t *testing.T) {
+	author := uint64(18446744073709551615)
+	wire, err := EncodeUserSecrets(UserSecrets{Version: 3, AuthorReplicaID: &author})
+	if err != nil {
+		t.Fatalf("EncodeUserSecrets: %v", err)
+	}
+	want := `{"version":3,"secrets":[],"author_replica_id":"18446744073709551615"}`
+	if string(wire) != want {
+		t.Fatalf("mismatch:\n got: %s\nwant: %s", wire, want)
+	}
+	got, err := DecodeUserSecrets([]byte(want))
+	if err != nil {
+		t.Fatalf("DecodeUserSecrets: %v", err)
+	}
+	if got.AuthorReplicaID == nil || *got.AuthorReplicaID != author {
+		t.Fatalf("AuthorReplicaID: got %v", got.AuthorReplicaID)
+	}
+	again, err := EncodeUserSecrets(got)
+	if err != nil || string(again) != want {
+		t.Fatalf("re-encode: got %s err=%v", again, err)
+	}
+}
+
+func TestUserSecrets_NoAuthorReplicaIDRoundTrip(t *testing.T) {
+	got, err := DecodeUserSecrets([]byte(`{"version":3,"secrets":[]}`))
+	if err != nil {
+		t.Fatalf("DecodeUserSecrets: %v", err)
+	}
+	if got.AuthorReplicaID != nil {
+		t.Fatalf("AuthorReplicaID: got %v, want nil", *got.AuthorReplicaID)
+	}
+	wire, err := EncodeUserSecrets(got)
+	if err != nil {
+		t.Fatalf("EncodeUserSecrets: %v", err)
+	}
+	if string(wire) != `{"version":3,"secrets":[]}` {
+		t.Fatalf("author key must be omitted: %s", wire)
+	}
+}
+
+func TestDecodeUserSecrets_RejectsNonDecimalAuthor(t *testing.T) {
+	if _, err := DecodeUserSecrets([]byte(`{"version":1,"secrets":[],"author_replica_id":"x"}`)); err == nil {
+		t.Fatal("expected an error for a non-decimal author_replica_id")
 	}
 }
 
@@ -682,10 +811,61 @@ func TestStateKeyRoundTrip_PendingRecoveryCarriesSecretID(t *testing.T) {
 	}
 }
 
-func TestEncodeStateKey_PendingRecoveryRequiresSecretID(t *testing.T) {
-	ver := uint32(3)
-	if _, err := EncodeStateKey(StateKey{Kind: StateKindPendingRecovery, Version: &ver}); err == nil {
-		t.Fatal("expected an error when SecretID is absent")
+// --- SharingRound keys carry the round's version: several rounds can be in
+// flight for one secret, and an unversioned key would let one round's row
+// replace another's.
+
+func TestStateItemKey_SharingRoundCarriesVersion(t *testing.T) {
+	v1, v2 := uint32(1), uint32(2)
+	k1 := StateItem{Kind: StateKindSharingRound, Version: &v1}.Key()
+	k2 := StateItem{Kind: StateKindSharingRound, Version: &v2}.Key()
+	if k1.Kind != StateKindSharingRound || k1.Version == nil || *k1.Version != v1 {
+		t.Fatalf("key for version %d: got %+v", v1, k1)
+	}
+	if k2.Version == nil || *k2.Version == *k1.Version {
+		t.Fatalf("keys for versions %d and %d must differ: %+v vs %+v", v1, v2, k1, k2)
+	}
+}
+
+func TestStateKeyRoundTrip_SharingRoundCarriesVersion(t *testing.T) {
+	ver := uint32(7)
+	wire, err := EncodeStateKey(StateKey{Kind: StateKindSharingRound, Version: &ver})
+	if err != nil {
+		t.Fatalf("EncodeStateKey: %v", err)
+	}
+	if want := `{"kind":3,"version":7}`; string(wire) != want {
+		t.Fatalf("mismatch:\n got: %s\nwant: %s", wire, want)
+	}
+	got, err := DecodeStateKey(wire)
+	if err != nil {
+		t.Fatalf("DecodeStateKey: %v", err)
+	}
+	if got.Kind != StateKindSharingRound || got.Version == nil || *got.Version != ver {
+		t.Fatalf("got %+v, want SharingRound version %d", got, ver)
+	}
+}
+
+// The exact shape Rust's StateKeyRecord serializes for
+// StateKey::SharingRound { version: 9 }.
+func TestDecodeStateKey_SharingRoundRustSample(t *testing.T) {
+	k, err := DecodeStateKey([]byte(`{"kind":3,"version":9}`))
+	if err != nil {
+		t.Fatalf("DecodeStateKey: %v", err)
+	}
+	if k.Kind != StateKindSharingRound || k.Version == nil || *k.Version != 9 {
+		t.Fatalf("got %+v, want SharingRound version 9", k)
+	}
+}
+
+// Which fields a key kind requires is the library's decision; the codec
+// marshals the fields set and nothing else.
+func TestEncodeStateKey_MarshalsOnlyTheFieldsSet(t *testing.T) {
+	raw, err := EncodeStateKey(StateKey{Kind: StateKindSharingRound})
+	if err != nil {
+		t.Fatalf("EncodeStateKey: %v", err)
+	}
+	if string(raw) != `{"kind":3}` {
+		t.Fatalf("got %s, want {\"kind\":3}", raw)
 	}
 }
 
@@ -723,9 +903,12 @@ func TestStateItemKey_PendingRecoveryPropagatesSecretID(t *testing.T) {
 	}
 }
 
-func TestDecodeStateItem_PendingRecoveryRequiresSecretID(t *testing.T) {
-	wire := []byte(`{"kind":1,"version":4,"shares":[]}`)
-	if _, err := DecodeStateItem(wire); err == nil {
-		t.Fatal("expected an error when secret_id is absent")
+func TestDecodeStateItem_PendingRecoveryWithoutSecretIDDecodesVerbatim(t *testing.T) {
+	item, err := DecodeStateItem([]byte(`{"kind":1,"version":4,"shares":[]}`))
+	if err != nil {
+		t.Fatalf("DecodeStateItem: %v", err)
+	}
+	if item.SecretID != nil || item.Version == nil || *item.Version != 4 || item.Shares == nil {
+		t.Fatalf("got %+v", item)
 	}
 }

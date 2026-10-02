@@ -116,10 +116,11 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     // The roster names every member, including this device — a group whose
     // members cannot name themselves is not reconstructible from the payload.
     // The dispatch list above is the same set minus self.
-    let roster = stores
+    let mut roster = stores
         .channels
         .replicas_matching(secret_id, crate::protocol::types::ReplicaFilter::default())
         .await?;
+    stamp_own_row(local, &mut roster);
     let group_channel = group_channel_of(local, &roster)?;
     let group_key = match group_channel {
         Some(channel_id) => match stores
@@ -194,7 +195,8 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     }
 
     if !replicas.is_empty() {
-        let composite = build_replica_composite(&secret, split_result.as_ref(), version);
+        let composite =
+            build_replica_composite(&secret, split_result.as_ref(), version, local.replica_id);
         let k_group = group_key;
         let replica_results = distribute_composite_to_destinations(
             stores,
@@ -218,7 +220,7 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
                 version,
                 secrets: snapshot_secrets,
                 description: snapshot_description,
-                replicas: secret.replicas.clone(),
+                author_replica_id: local.replica_id,
             },
         )
         .await?;
@@ -268,7 +270,6 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     let channel_id = exchange.channel_id;
     let secret_id = local.secret_id;
     let version = request.version;
-    let replica_id = request.replica_id;
     let encoded_request = request.encode_to_vec();
 
     // A version has exactly one writer, so an existing entry at this
@@ -361,7 +362,6 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     Ok(vec![DeRecEvent::ShareStored {
         channel_id,
         version,
-        replica_id,
     }])
 }
 
@@ -654,6 +654,22 @@ fn group_channel_of(
         ))
 }
 
+/// Publish this device's own row under what it advertises now.
+///
+/// A peer's row carries every endpoint and the `communication_info` that peer
+/// advertised, but the stored own row only records what was current when it
+/// was written. Stamping it here is what lets a roster name, and reach, the
+/// device that published it.
+fn stamp_own_row(local: &Local<'_>, roster: &mut [crate::protocol::types::ReplicaMember]) {
+    let Some(own) = local.replica_id else {
+        return;
+    };
+    if let Some(member) = roster.iter_mut().find(|m| m.replica_id.0 == own) {
+        member.transports = local.own_transports.to_vec();
+        member.communication_info = super::pairing::own_communication_info(local);
+    }
+}
+
 /// Project the group onto the wire roster.
 fn build_replicas(
     roster: &[crate::protocol::types::ReplicaMember],
@@ -689,6 +705,7 @@ fn build_replica_composite(
     secret: &Secret,
     split_result: Option<&crate::primitives::sharing::request::SplitResult>,
     version: u32,
+    author_replica_id: Option<u64>,
 ) -> crate::protocol::types::ReplicaSecretPayload {
     let shares: Vec<crate::protocol::types::ChannelShare> = split_result
         .map(|r| {
@@ -707,6 +724,7 @@ fn build_replica_composite(
         shares,
         shared_key: Vec::new(),
         version,
+        author_replica_id,
     }
 }
 
@@ -911,12 +929,7 @@ async fn dispatch_composite_to_destination<S: StoreSet>(
     let composite_bytes = per_channel.encode_to_vec();
 
     let timestamp = current_timestamp();
-    let (legacy_reply_to, reply_to_transports) =
-        crate::extensions::advertised_endpoints::split_reply_to(round.reply_to);
-    // Populating the deprecated singular field is the compatibility
-    // path that keeps peers predating `replyToTransports`
-    // answerable, so the warning is expected here.
-    #[allow(deprecated)]
+    let reply_to_transports = round.reply_to.to_vec();
     let msg = StoreShareRequestMessage {
         share: composite_bytes,
         share_algorithm: SHARE_ALGORITHM_REPLICA_SECRET,
@@ -925,7 +938,6 @@ async fn dispatch_composite_to_destination<S: StoreSet>(
         version_description: description.to_owned(),
         timestamp: Some(timestamp),
         secret_id: local.secret_id,
-        reply_to: legacy_reply_to,
         reply_to_transports,
         replica_id: local.replica_id,
     };
@@ -1547,7 +1559,7 @@ mod group_conformance_tests {
                     version,
                     secrets: Vec::new(),
                     description: None,
-                    replicas: None,
+                    author_replica_id: None,
                 },
             )
             .await
@@ -1600,6 +1612,92 @@ mod group_conformance_tests {
             assert_eq!(
                 payload.shares[0].committed_share,
                 vec![0xDE, 0xAD, 0xBE, 0xEF]
+            );
+        });
+    }
+
+    /// A published roster names, and can reach, every member — the writer
+    /// included.
+    ///
+    /// The writer's stored row is seeded with one endpoint and no
+    /// `communication_info`, as rows written before the own row carried them
+    /// are: publishing stamps it from the instance, so such a group heals on
+    /// its next round.
+    #[test]
+    fn a_published_roster_describes_every_member_including_the_writer() {
+        run_async(async {
+            let lf = crate::protocol::test::LocalFixture {
+                own_transports: vec![
+                    endpoint("https://self"),
+                    TransportProtocol {
+                        uri: "grpcs://self:443".to_owned(),
+                        protocol: Protocol::Grpc as i32,
+                    },
+                ],
+                communication_info: std::collections::HashMap::from([(
+                    "name".to_owned(),
+                    "Alice-2".to_owned(),
+                )]),
+                ..LocalFixture::with_replica(SECRET_ID, 1002)
+            };
+            let mut rig = StoreRig::new();
+            seed_member(&mut rig.channels, 1002, ReplicaRole::Source, "https://self").await;
+            rig.channels
+                .save(
+                    SECRET_ID,
+                    ChannelRecord::Replica(ReplicaMember {
+                        channel_id: GROUP_CHANNEL,
+                        replica_id: ReplicaId(1003),
+                        transports: vec![endpoint("https://alice-3")],
+                        communication_info: std::collections::HashMap::from([(
+                            "name".to_owned(),
+                            "Alice-3".to_owned(),
+                        )]),
+                        role: ReplicaRole::Destination,
+                        status: ChannelStatus::Paired,
+                        created_at: 0,
+                    }),
+                )
+                .await
+                .expect("seed peer");
+            seed_group_key(&mut rig.secrets).await;
+            seed_helper_and_snapshot(&mut rig, 4, None).await;
+
+            let payload = super::build_catch_up_payload(&mut rig.stores(), &lf.local())
+                .await
+                .expect("catch-up payload")
+                .expect("a device holding a snapshot must serve one");
+
+            let members = payload
+                .secret
+                .and_then(|s| s.replicas)
+                .expect("roster is present")
+                .members;
+            let mut described: Vec<(u64, Option<String>, Vec<String>)> = members
+                .iter()
+                .map(|m| {
+                    (
+                        m.replica_id,
+                        m.communication_info.get("name").cloned(),
+                        m.transports.iter().map(|t| t.uri.clone()).collect(),
+                    )
+                })
+                .collect();
+            described.sort();
+            assert_eq!(
+                described,
+                vec![
+                    (
+                        1002,
+                        Some("Alice-2".to_owned()),
+                        vec!["https://self".to_owned(), "grpcs://self:443".to_owned()],
+                    ),
+                    (
+                        1003,
+                        Some("Alice-3".to_owned()),
+                        vec!["https://alice-3".to_owned()],
+                    ),
+                ],
             );
         });
     }
@@ -1657,6 +1755,7 @@ mod group_conformance_tests {
                 }],
                 shared_key: Vec::new(),
                 version: 4,
+                author_replica_id: None,
             };
 
             // The asker requested 9; the answerer served 4.
@@ -1664,6 +1763,7 @@ mod group_conformance_tests {
                 &mut rig.stores(),
                 &lf.local(),
                 1001,
+                SECRET_ID,
                 9,
                 &prost::Message::encode_to_vec(&payload),
             )
@@ -1711,12 +1811,14 @@ mod group_conformance_tests {
                 shares: Vec::new(),
                 shared_key: Vec::new(),
                 version: 0,
+                author_replica_id: None,
             };
 
             super::hydrate_catch_up(
                 &mut rig.stores(),
                 &lf.local(),
                 1001,
+                SECRET_ID,
                 9,
                 &prost::Message::encode_to_vec(&payload),
             )
@@ -1732,6 +1834,55 @@ mod group_conformance_tests {
             assert_eq!(
                 snapshot.version, 9,
                 "an absent payload version means the enclosing one governs"
+            );
+        });
+    }
+
+    #[test]
+    fn a_pulled_copy_reports_the_senders_secret_id() {
+        run_async(async {
+            use crate::protocol::DeRecUserSecretStore;
+
+            const SENDER_SECRET_ID: u64 = 0x5E_4DE4;
+            let lf = LocalFixture::with_replica(SECRET_ID, 1002);
+            let mut rig = StoreRig::new();
+            let payload = crate::protocol::types::ReplicaSecretPayload {
+                secret: Some(crate::protocol::types::Secret {
+                    helpers: Vec::new(),
+                    secrets: Vec::new(),
+                    replicas: Some(payload_roster()),
+                }),
+                shares: Vec::new(),
+                shared_key: Vec::new(),
+                version: 3,
+                author_replica_id: None,
+            };
+
+            let events = super::hydrate_catch_up(
+                &mut rig.stores(),
+                &lf.local(),
+                1001,
+                SENDER_SECRET_ID,
+                3,
+                &prost::Message::encode_to_vec(&payload),
+            )
+            .await
+            .expect("catch-up must hydrate");
+
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [crate::protocol::DeRecEvent::ReplicaSecretInstalled { secret_id, .. }] if *secret_id == SENDER_SECRET_ID
+                ),
+                "a pull must report the sender's secret id, as a push does: {events:?}"
+            );
+            assert!(
+                rig.user_secrets
+                    .load_latest(SECRET_ID)
+                    .await
+                    .expect("load")
+                    .is_some(),
+                "the copy is still stored under this device's own partition"
             );
         });
     }
@@ -1770,10 +1921,11 @@ pub(in crate::protocol) async fn build_catch_up_payload<S: StoreSet>(
     };
 
     let (helpers, _) = load_all_paired_targets(stores, local).await?;
-    let roster = stores
+    let mut roster = stores
         .channels
         .replicas_matching(secret_id, crate::protocol::types::ReplicaFilter::default())
         .await?;
+    stamp_own_row(local, &mut roster);
     let group_channel = group_channel_of(local, &roster)?;
     let group_key = match group_channel {
         Some(channel_id) => match stores
@@ -1818,6 +1970,7 @@ pub(in crate::protocol) async fn build_catch_up_payload<S: StoreSet>(
         // The asker files the map under this, not under the version it
         // requested — see the field's docs.
         version: snapshot.version,
+        author_replica_id: snapshot.author_replica_id,
     }))
 }
 
@@ -1840,10 +1993,10 @@ pub(in crate::protocol) async fn hydrate_catch_up<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
     from_replica_id: u64,
+    secret_id: u64,
     response_version: u32,
     payload: &[u8],
 ) -> Result<Vec<DeRecEvent>> {
-    let secret_id = local.secret_id;
     let composite = crate::protocol::types::ReplicaSecretPayload::decode(payload)
         .map_err(crate::Error::ProtobufDecode)?;
     let secret = composite.secret.ok_or(crate::Error::InvalidInput(
@@ -1855,7 +2008,30 @@ pub(in crate::protocol) async fn hydrate_catch_up<S: StoreSet>(
         composite.version
     };
 
-    let is_install = stores.user_secrets.load_latest(secret_id).await?.is_none();
+    // A catch-up answer comes from whichever member answered, so only the
+    // payload can name the author.
+    let author_replica_id = composite.author_replica_id;
+    let channel_id = ChannelId(secret.replicas.as_ref().map_or(0, |g| g.channel_id));
+
+    let is_install = match replica::arrival(stores, local, version, author_replica_id).await? {
+        replica::Arrival::Apply { is_install } => is_install,
+        replica::Arrival::Resend | replica::Arrival::Stale => {
+            return Ok(vec![DeRecEvent::NoOp]);
+        }
+        replica::Arrival::Conflict {
+            held_author_replica_id,
+        } => {
+            return Ok(vec![DeRecEvent::ReplicaVersionConflict {
+                channel_id,
+                from_replica_id,
+                secret_id,
+                version,
+                held_author_replica_id,
+                incoming_author_replica_id: author_replica_id,
+                secret,
+            }]);
+        }
+    };
 
     replica::hydrate(
         stores,
@@ -1864,13 +2040,15 @@ pub(in crate::protocol) async fn hydrate_catch_up<S: StoreSet>(
         &secret,
         &composite.shares,
         String::new(),
+        author_replica_id,
     )
     .await?;
 
     let event = if is_install {
         DeRecEvent::ReplicaSecretInstalled {
-            channel_id: ChannelId(secret.replicas.as_ref().map_or(0, |g| g.channel_id)),
+            channel_id,
             from_replica_id,
+            author_replica_id,
             secret_id,
             version,
             secret,
@@ -1878,8 +2056,9 @@ pub(in crate::protocol) async fn hydrate_catch_up<S: StoreSet>(
         }
     } else {
         DeRecEvent::ReplicaSecretReceived {
-            channel_id: ChannelId(secret.replicas.as_ref().map_or(0, |g| g.channel_id)),
+            channel_id,
             from_replica_id,
+            author_replica_id,
             secret_id,
             version,
             secret,

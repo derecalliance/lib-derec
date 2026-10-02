@@ -9,6 +9,7 @@ use crate::derec_message::{DeRecMessageBuilder, current_timestamp};
 use crate::extensions::advertised_endpoints::AdvertisedEndpoints as _;
 use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::extensions::communication_info::CommunicationInfoExt as _;
+use crate::extensions::derec_result::DeRecResultExt as _;
 use crate::extensions::transport_protocol::TransportProtocolExt as _;
 use crate::protocol::context::{Exchange, Local};
 use crate::protocol::stores::{StoreSet, Stores};
@@ -25,7 +26,7 @@ use prost::Message;
 use std::collections::HashMap;
 
 const EMPTY_UPDATE_ERROR: Error = Error::InvalidInput(
-    "UpdateChannelInfo requires at least one of communication_info or transport_protocol",
+    "UpdateChannelInfo requires at least one of communication_info or supported_transports",
 );
 
 #[cfg_attr(
@@ -118,8 +119,6 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     feature = "logging",
     tracing::instrument(skip_all, fields(trace_id = exchange.trace_id, channel_id = exchange.channel_id.0))
 )]
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 pub(in crate::protocol) async fn accept<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
@@ -142,7 +141,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
     #[cfg(feature = "logging")]
     let communication_info_updated = request.communication_info.is_some();
     #[cfg(feature = "logging")]
-    let transport_protocol_updated = request.transport_protocol.is_some();
+    let transport_protocol_updated = !request.supported_transports.is_empty();
 
     let new_info = request
         .communication_info
@@ -184,10 +183,7 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
 
     let timestamp = current_timestamp();
     let response = UpdateChannelInfoResponseMessage {
-        result: Some(DeRecResult {
-            status: StatusEnum::Ok as i32,
-            memo: String::new(),
-        }),
+        result: Some(DeRecResult::ok()),
         timestamp: Some(timestamp),
     };
 
@@ -283,14 +279,12 @@ fn decide(
     feature = "logging",
     tracing::instrument(skip_all, fields(trace_id = exchange.trace_id, channel_id = exchange.channel_id.0))
 )]
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 fn on_request(
     exchange: &Exchange<'_>,
     request: UpdateChannelInfoRequestMessage,
     own_transports: &[crate::transport::TransportProtocol],
 ) -> Result<Vec<DeRecEvent>> {
-    if request.communication_info.is_none() && request.transport_protocol.is_none() {
+    if request.communication_info.is_none() && request.supported_transports.is_empty() {
         return Err(EMPTY_UPDATE_ERROR);
     }
 
@@ -300,17 +294,24 @@ fn on_request(
     // (scheme consistency, whose policy acceptability was already settled
     // by `TransportPolicy` in `handlers::handle`) runs first, so a
     // malformed endpoint is reported as malformed rather than unservable.
-    if let Some(tp) = request.transport_protocol.as_ref() {
-        tp.validate()?;
+    if !request.supported_transports.is_empty() {
+        let mut servable = false;
+        for tp in &request.supported_transports {
+            tp.validate()?;
 
-        let protocol = derec_proto::Protocol::try_from(tp.protocol).map_err(|_| {
-            crate::transport::TransportValidationError::UnsupportedProtocol {
-                discriminant: tp.protocol,
-            }
-        })?;
+            let protocol = derec_proto::Protocol::try_from(tp.protocol).map_err(|_| {
+                crate::transport::TransportValidationError::UnsupportedProtocol {
+                    discriminant: tp.protocol,
+                }
+            })?;
 
-        if !own_transports.iter().any(|t| t.protocol == protocol) {
-            return Err(crate::Error::NoUsableEndpoint { offered: 1 });
+            servable |= own_transports.iter().any(|t| t.protocol == protocol);
+        }
+
+        if !servable {
+            return Err(crate::Error::NoUsableEndpoint {
+                offered: request.supported_transports.len(),
+            });
         }
     }
 
@@ -426,8 +427,6 @@ async fn dispatch_all<S: StoreSet>(
     events
 }
 
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 async fn dispatch_one<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
@@ -440,10 +439,6 @@ async fn dispatch_one<S: StoreSet>(
     let timestamp = current_timestamp();
     let request = UpdateChannelInfoRequestMessage {
         communication_info,
-        // The first entry also fills the deprecated singular field so a
-        // receiver predating `supportedTransports` still learns the new
-        // address. Same rule every other pairing-time message follows.
-        transport_protocol: own_transports.first().cloned(),
         supported_transports: own_transports,
         timestamp: Some(timestamp),
     };
@@ -470,7 +465,7 @@ mod tests {
     use crate::derec_message::current_timestamp;
     use crate::protocol::context::Exchange;
 
-    /// A peer-supplied `UpdateChannelInfoRequest.transport_protocol`
+    /// A peer-supplied `UpdateChannelInfoRequest.supported_transports` entry
     /// declaring `Protocol::Https` but carrying a URI with an
     /// unsupported scheme is rejected by the handler before any
     /// side-effecting action is surfaced — the gate runs after the
@@ -478,8 +473,6 @@ mod tests {
     /// event. (`http://` is intentionally accepted as a dev-mode
     /// affordance and is flagged via `tracing::warn!`; see
     /// `crate::transport`.)
-    // Compatibility, not oversight — see the `transport` module docs.
-    #[allow(deprecated)]
     #[test]
     fn on_request_rejects_scheme_mismatched_transport_protocol() {
         let channel_id = ChannelId(31);
@@ -491,9 +484,8 @@ mod tests {
         };
 
         let request = UpdateChannelInfoRequestMessage {
-            supported_transports: Vec::new(),
+            supported_transports: vec![malicious_transport],
             communication_info: None,
-            transport_protocol: Some(malicious_transport),
             timestamp: Some(current_timestamp()),
         };
 
@@ -519,8 +511,6 @@ mod tests {
     /// refused rather than followed. Unlike the pairing case, the refusal is
     /// deliverable: the channel is up, so the peer's previous endpoint still
     /// works.
-    // Compatibility, not oversight — see the `transport` module docs.
-    #[allow(deprecated)]
     #[test]
     fn on_request_refuses_an_unservable_transport_change() {
         let own = vec![crate::transport::TransportProtocol::new(
@@ -528,12 +518,11 @@ mod tests {
             derec_proto::Protocol::Https,
         )];
         let request = UpdateChannelInfoRequestMessage {
-            supported_transports: Vec::new(),
-            communication_info: None,
-            transport_protocol: Some(derec_proto::TransportProtocol {
+            supported_transports: vec![derec_proto::TransportProtocol {
                 uri: "grpcs://peer.example.com:443".to_owned(),
                 protocol: derec_proto::Protocol::Grpc as i32,
-            }),
+            }],
+            communication_info: None,
             timestamp: None,
         };
 
@@ -550,8 +539,6 @@ mod tests {
     }
 
     /// A switch to a transport this side does serve is still accepted.
-    // Compatibility, not oversight — see the `transport` module docs.
-    #[allow(deprecated)]
     #[test]
     fn on_request_accepts_a_servable_transport_change() {
         let own = vec![
@@ -565,12 +552,11 @@ mod tests {
             ),
         ];
         let request = UpdateChannelInfoRequestMessage {
-            supported_transports: Vec::new(),
-            communication_info: None,
-            transport_protocol: Some(derec_proto::TransportProtocol {
+            supported_transports: vec![derec_proto::TransportProtocol {
                 uri: "grpcs://peer.example.com:443".to_owned(),
                 protocol: derec_proto::Protocol::Grpc as i32,
-            }),
+            }],
+            communication_info: None,
             timestamp: None,
         };
 

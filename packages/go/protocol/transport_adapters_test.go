@@ -7,6 +7,8 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+
+	"github.com/derecalliance/lib-derec/packages/go/derec"
 )
 
 // recordingDialer records every endpoint it was asked to dial and refuses the
@@ -111,4 +113,29 @@ func TestSingleEndpointTransport_DoesNotFallBack(t *testing.T) {
 func TestAdaptersAreTransports(t *testing.T) {
 	var _ Transport = SequentialFailover{Dialer: newDialer()}
 	var _ Transport = SingleEndpointTransport{Dialer: newDialer()}
+}
+
+type sentinelDialer struct{ errs map[string]error }
+
+func (d sentinelDialer) SendOne(endpoint Endpoint, _ []byte) error { return d.errs[endpoint.URI] }
+
+// When no endpoint accepts the message the adapters return the dialer's own
+// error unchanged, so a caller matches it with errors.Is / errors.As exactly
+// as it would its dialer's error; the adapters add no library error code.
+func TestAdapters_ReturnTheDialersErrorUnchanged(t *testing.T) {
+	errA, errB := errors.New("a down"), errors.New("b down")
+	d := sentinelDialer{errs: map[string]error{a: errA, b: errB}}
+
+	err := (SequentialFailover{Dialer: d}).Send(endpoints(a, b), []byte("m"))
+	if !errors.Is(err, errB) {
+		t.Fatalf("SequentialFailover: got %v, want the last dialer error %v", err, errB)
+	}
+	var derecErr *derec.Error
+	if errors.As(err, &derecErr) {
+		t.Fatalf("SequentialFailover: dialer error was replaced by %v", derecErr)
+	}
+
+	if err := (SingleEndpointTransport{Dialer: d}).Send(endpoints(a, b), []byte("m")); !errors.Is(err, errA) {
+		t.Fatalf("SingleEndpointTransport: got %v, want the dialer error %v", err, errA)
+	}
 }

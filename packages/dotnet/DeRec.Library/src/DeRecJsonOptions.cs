@@ -2,9 +2,11 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 
 namespace DeRec.Library;
 
@@ -33,6 +35,11 @@ namespace DeRec.Library;
 ///     Rust side never see a literal <c>null</c>.
 ///   </description></item>
 ///   <item><description>
+///     Properties marked <see cref="OmitWhenEmptyAttribute"/> are dropped
+///     on serialize when their collection is null or empty, mirroring the Rust
+///     field's <c>#[serde(skip_serializing_if = "HashMap::is_empty")]</c>.
+///   </description></item>
+///   <item><description>
 ///     Property names round-trip verbatim — no naming-policy conversion.
 ///     Records / DTOs are expected to carry <c>[JsonPropertyName]</c>
 ///     attributes if their wire shape differs from C# convention.
@@ -52,7 +59,20 @@ public static class DeRecJsonOptions
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
         PropertyNamingPolicy = null,
         Converters = { new ByteArrayJsonNumberConverter() },
+        TypeInfoResolver = new DefaultJsonTypeInfoResolver
+        {
+            Modifiers = { OmitEmptyMarkedProperties },
+        },
     };
+
+    private static void OmitEmptyMarkedProperties(JsonTypeInfo typeInfo)
+    {
+        foreach (JsonPropertyInfo property in typeInfo.Properties)
+        {
+            if (property.AttributeProvider?.IsDefined(typeof(OmitWhenEmptyAttribute), inherit: false) == true)
+                property.ShouldSerialize = static (_, value) => value is ICollection { Count: > 0 };
+        }
+    }
 
     /// <summary>
     /// Serializes <c>byte[]</c> as a JSON array of numbers — see the
@@ -81,4 +101,14 @@ public static class DeRecJsonOptions
             writer.WriteEndArray();
         }
     }
+}
+
+/// <summary>
+/// Marks a collection property that <see cref="DeRecJsonOptions.Wire"/>
+/// omits when null or empty, matching a Rust wire field declared
+/// <c>#[serde(skip_serializing_if = "HashMap::is_empty")]</c>.
+/// </summary>
+[AttributeUsage(AttributeTargets.Property)]
+internal sealed class OmitWhenEmptyAttribute : Attribute
+{
 }

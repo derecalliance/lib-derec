@@ -5,7 +5,7 @@ use derec_library::protocol::DeRecUserSecretStore;
 use derec_library::protocol::ShareStoreFuture;
 use derec_library::protocol::types::UserSecrets;
 
-use crate::codec::{assemble_user_secrets, encode_user_secrets_payload, u64_to_sql};
+use crate::codec::{assemble_user_secrets, encode_user_secrets_payload, sql_to_u64, u64_to_sql};
 use crate::db::{SharedConnection, lock};
 
 pub struct SqliteUserSecretStore {
@@ -23,18 +23,20 @@ impl DeRecUserSecretStore for SqliteUserSecretStore {
         let conn = lock(&self.connection);
         let row = conn
             .query_row(
-                "SELECT version, description, payload FROM user_secrets WHERE secret_id = ?1",
+                "SELECT version, description, payload, author_replica_id
+                 FROM user_secrets WHERE secret_id = ?1",
                 rusqlite::params![u64_to_sql(secret_id)],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)? as u32,
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
                     ))
                 },
             )
             .ok();
-        let value = row.map(|(v, d, p)| assemble_user_secrets(v, d, p));
+        let value = row.map(|(v, d, p, a)| assemble_user_secrets(v, d, p, a.map(sql_to_u64)));
         Box::pin(std::future::ready(Ok(value)))
     }
 
@@ -42,17 +44,19 @@ impl DeRecUserSecretStore for SqliteUserSecretStore {
         let conn = lock(&self.connection);
         let payload = encode_user_secrets_payload(&value.secrets);
         conn.execute(
-            "INSERT INTO user_secrets (secret_id, version, description, payload)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO user_secrets (secret_id, version, description, payload, author_replica_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(secret_id) DO UPDATE SET
-                 version     = excluded.version,
-                 description = excluded.description,
-                 payload     = excluded.payload",
+                 version           = excluded.version,
+                 description       = excluded.description,
+                 payload           = excluded.payload,
+                 author_replica_id = excluded.author_replica_id",
             rusqlite::params![
                 u64_to_sql(secret_id),
                 value.version as i64,
                 value.description,
                 payload,
+                value.author_replica_id.map(u64_to_sql),
             ],
         )
         .expect("user_secret save_latest failed");

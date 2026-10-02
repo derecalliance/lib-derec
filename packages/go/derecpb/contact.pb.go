@@ -38,7 +38,7 @@ const (
 	// `PrePairRequest` / `PrePairResponse` and verified against the hash.
 	ContactMode_HASHED_KEYS ContactMode = 1
 	// No key material and no hash are inlined. The contact carries only
-	// `channelId`, `nonce`, and `transportProtocol`; the contact creator
+	// `channelId`, `nonce`, and `supportedTransports`; the contact creator
 	// generates key material on the fly when the corresponding
 	// `PrePairRequest` arrives. Only appropriate when the out-of-band
 	// delivery channel is fully trusted, and the channel stays unusable
@@ -153,39 +153,6 @@ type ContactMessage struct {
 	// Applications may choose to reveal this nonce only after sufficient
 	// out-of-band authentication has taken place.
 	Nonce uint64 `protobuf:"varint,6,opt,name=nonce,proto3" json:"nonce,omitempty"`
-	// Transport information used to reach the creator of this contact.
-	//
-	// This specifies both:
-	//
-	//   - the endpoint to which the first protocol message should be sent
-	//   - the transport protocol that determines how that endpoint is interpreted
-	//     and used
-	//
-	// The initiating party uses this field to deliver the initial pairing
-	// request. Subsequent protocol exchanges may continue using the same
-	// transport information or updated transport details, depending on the
-	// protocol and application behavior.
-	//
-	// Deprecated: superseded by `supportedTransports`, which carries every
-	// endpoint rather than one.
-	//
-	// **Reading this field directly is now incorrect.** Its meaning narrowed
-	// from "the endpoint" to "one entry of a list, and possibly absent": a
-	// creator that has moved past this field advertises only
-	// `supportedTransports`. A reader that was correct before this release is
-	// a bug now — it rejects, or fails to reach, a peer that is offering it a
-	// perfectly good endpoint. Resolve both spellings instead of reading
-	// either: `advertised_endpoints()` (Rust and TypeScript),
-	// `AdvertisedEndpoints()` (Go), `AdvertisedEndpoints()` (.NET).
-	//
-	// Senders still populate it: a sender that sets `supportedTransports`
-	// MUST also set this to a single best-compatibility choice, so
-	// implementations predating the list still pair.
-	//
-	// **Scheduled for removal in v0.0.5.**
-	//
-	// Deprecated: Marked as deprecated in contact.proto.
-	TransportProtocol *TransportProtocol `protobuf:"bytes,7,opt,name=transportProtocol,proto3" json:"transportProtocol,omitempty"`
 	// Timestamp indicating when the sender created this message.
 	//
 	// This value is expressed in UTC and can be used for:
@@ -206,23 +173,18 @@ type ContactMessage struct {
 	// preference rather than the sender's. The order here expresses
 	// availability, not a ranking the recipient must honor.
 	//
-	// # Compatibility
-	//
-	// Absent means "only `transportProtocol` is offered", which is how every
-	// implementation predating this field behaves. A sender populating this
-	// list MUST also set `transportProtocol` to a single best-compatibility
-	// choice so those implementations still pair.
+	// A contact MUST carry at least one entry: it is the only way the
+	// recipient learns where to send its first message.
 	//
 	// # Security
 	//
-	// `contactBindingHash` does not cover this field, exactly as it does not
-	// cover `transportProtocol`. An attacker able to rewrite an
-	// out-of-band contact can therefore remove entries. Removing the secure
-	// ones leaves only plaintext, which the recipient's transport policy
-	// refuses unless plaintext has been explicitly opted into. DeRec messages
-	// are signed and encrypted at the application layer on every transport,
-	// so substituting one secure transport for another is not a loss of
-	// confidentiality or authenticity.
+	// `contactBindingHash` does not cover this field. An attacker able to
+	// rewrite an out-of-band contact can therefore remove entries. Removing
+	// the secure ones leaves only plaintext, which the recipient's transport
+	// policy refuses unless plaintext has been explicitly opted into. DeRec
+	// messages are signed and encrypted at the application layer on every
+	// transport, so substituting one secure transport for another is not a
+	// loss of confidentiality or authenticity.
 	SupportedTransports []*TransportProtocol `protobuf:"bytes,9,rep,name=supportedTransports,proto3" json:"supportedTransports,omitempty"`
 	unknownFields       protoimpl.UnknownFields
 	sizeCache           protoimpl.SizeCache
@@ -300,14 +262,6 @@ func (x *ContactMessage) GetNonce() uint64 {
 	return 0
 }
 
-// Deprecated: Marked as deprecated in contact.proto.
-func (x *ContactMessage) GetTransportProtocol() *TransportProtocol {
-	if x != nil {
-		return x.TransportProtocol
-	}
-	return nil
-}
-
 func (x *ContactMessage) GetTimestamp() *timestamppb.Timestamp {
 	if x != nil {
 		return x.Timestamp
@@ -326,20 +280,19 @@ var File_contact_proto protoreflect.FileDescriptor
 
 const file_contact_proto_rawDesc = "" +
 	"\n" +
-	"\rcontact.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x17transportprotocol.proto\"\xfe\x04\n" +
+	"\rcontact.proto\x12 org.derecalliance.derec.protobuf\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x17transportprotocol.proto\"\xb0\x04\n" +
 	"\x0eContactMessage\x12O\n" +
 	"\vcontactMode\x18\x01 \x01(\x0e2-.org.derecalliance.derec.protobuf.ContactModeR\vcontactMode\x129\n" +
 	"\x15mlkemEncapsulationKey\x18\x02 \x01(\fH\x00R\x15mlkemEncapsulationKey\x88\x01\x01\x12+\n" +
 	"\x0eeciesPublicKey\x18\x03 \x01(\fH\x01R\x0eeciesPublicKey\x88\x01\x01\x123\n" +
 	"\x12contactBindingHash\x18\x04 \x01(\fH\x02R\x12contactBindingHash\x88\x01\x01\x12\x1c\n" +
 	"\tchannelId\x18\x05 \x01(\x04R\tchannelId\x12\x14\n" +
-	"\x05nonce\x18\x06 \x01(\x04R\x05nonce\x12e\n" +
-	"\x11transportProtocol\x18\a \x01(\v23.org.derecalliance.derec.protobuf.TransportProtocolB\x02\x18\x01R\x11transportProtocol\x128\n" +
+	"\x05nonce\x18\x06 \x01(\x04R\x05nonce\x128\n" +
 	"\ttimestamp\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12e\n" +
 	"\x13supportedTransports\x18\t \x03(\v23.org.derecalliance.derec.protobuf.TransportProtocolR\x13supportedTransportsB\x18\n" +
 	"\x16_mlkemEncapsulationKeyB\x11\n" +
 	"\x0f_eciesPublicKeyB\x15\n" +
-	"\x13_contactBindingHash*<\n" +
+	"\x13_contactBindingHashJ\x04\b\a\x10\bR\x11transportProtocol*<\n" +
 	"\vContactMode\x12\x0f\n" +
 	"\vINLINE_KEYS\x10\x00\x12\x0f\n" +
 	"\vHASHED_KEYS\x10\x01\x12\v\n" +
@@ -362,19 +315,18 @@ var file_contact_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
 var file_contact_proto_goTypes = []any{
 	(ContactMode)(0),              // 0: org.derecalliance.derec.protobuf.ContactMode
 	(*ContactMessage)(nil),        // 1: org.derecalliance.derec.protobuf.ContactMessage
-	(*TransportProtocol)(nil),     // 2: org.derecalliance.derec.protobuf.TransportProtocol
-	(*timestamppb.Timestamp)(nil), // 3: google.protobuf.Timestamp
+	(*timestamppb.Timestamp)(nil), // 2: google.protobuf.Timestamp
+	(*TransportProtocol)(nil),     // 3: org.derecalliance.derec.protobuf.TransportProtocol
 }
 var file_contact_proto_depIdxs = []int32{
 	0, // 0: org.derecalliance.derec.protobuf.ContactMessage.contactMode:type_name -> org.derecalliance.derec.protobuf.ContactMode
-	2, // 1: org.derecalliance.derec.protobuf.ContactMessage.transportProtocol:type_name -> org.derecalliance.derec.protobuf.TransportProtocol
-	3, // 2: org.derecalliance.derec.protobuf.ContactMessage.timestamp:type_name -> google.protobuf.Timestamp
-	2, // 3: org.derecalliance.derec.protobuf.ContactMessage.supportedTransports:type_name -> org.derecalliance.derec.protobuf.TransportProtocol
-	4, // [4:4] is the sub-list for method output_type
-	4, // [4:4] is the sub-list for method input_type
-	4, // [4:4] is the sub-list for extension type_name
-	4, // [4:4] is the sub-list for extension extendee
-	0, // [0:4] is the sub-list for field type_name
+	2, // 1: org.derecalliance.derec.protobuf.ContactMessage.timestamp:type_name -> google.protobuf.Timestamp
+	3, // 2: org.derecalliance.derec.protobuf.ContactMessage.supportedTransports:type_name -> org.derecalliance.derec.protobuf.TransportProtocol
+	3, // [3:3] is the sub-list for method output_type
+	3, // [3:3] is the sub-list for method input_type
+	3, // [3:3] is the sub-list for extension type_name
+	3, // [3:3] is the sub-list for extension extendee
+	0, // [0:3] is the sub-list for field type_name
 }
 
 func init() { file_contact_proto_init() }

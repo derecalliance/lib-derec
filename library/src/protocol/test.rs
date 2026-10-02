@@ -565,6 +565,7 @@ pub(crate) struct LocalFixture {
     pub(crate) replica_id: Option<u64>,
     pub(crate) own_transports: Vec<TransportProtocol>,
     pub(crate) policy: crate::transport::TransportPolicy,
+    pub(crate) communication_info: std::collections::HashMap<String, String>,
 }
 
 impl LocalFixture {
@@ -578,6 +579,7 @@ impl LocalFixture {
                 protocol: derec_proto::Protocol::Https as i32,
             }],
             policy: crate::transport::TransportPolicy::new(false),
+            communication_info: std::collections::HashMap::new(),
         }
     }
 
@@ -595,6 +597,7 @@ impl LocalFixture {
             replica_id: self.replica_id,
             own_transports: &self.own_transports,
             policy: self.policy,
+            communication_info: &self.communication_info,
         }
     }
 }

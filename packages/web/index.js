@@ -8,6 +8,8 @@ import {
   DeRecProtocolBuilder as DeRecProtocolBuilderImpl,
   envelope_apply_trace_id,
   envelope_read_trace_id,
+  protocol_version as protocolVersionImpl,
+  generate_replica_id as generateReplicaIdImpl,
 } from "./derec_library.js";
 
 /**
@@ -36,9 +38,15 @@ export function channelFilterMatches(filter, id, status, role) {
 
 export function advertisedEndpoints(message) {
   if (!message) return [];
-  const offers = message.supported_transports ?? [];
-  if (offers.length > 0) return offers;
-  return message.transport_protocol ? [message.transport_protocol] : [];
+  return message.supported_transports ?? [];
+}
+
+export function protocol_version() {
+  return protocolVersionImpl();
+}
+
+export function generate_replica_id() {
+  return generateReplicaIdImpl();
 }
 
 export function sequentialFailover(dialer) {
@@ -80,11 +88,29 @@ export const envelope = {
 export const DeRecProtocol = DeRecProtocolWasm;
 export const DeRecProtocolBuilder = DeRecProtocolBuilderImpl;
 
+// A second `free()`, or one after `build()` consumed the builder, finds the
+// handle already released; it returns instead of passing a null handle to the
+// library, the same as .NET `Dispose` and Go `Close`.
+function releaseOnce(Class) {
+  const release = Class.prototype.free;
+  Class.prototype.free = function free() {
+    if (this.__wbg_ptr !== 0) release.call(this);
+  };
+  Class.prototype[Symbol.dispose] = function dispose() {
+    this.free();
+  };
+}
+
+releaseOnce(DeRecProtocol);
+releaseOnce(DeRecProtocolBuilder);
+
 export const SenderKind = Object.freeze({ Owner: 0, Helper: 1, ReplicaSource: 3, ReplicaDestination: 4 });
 
 export const ContactMode = Object.freeze({ InlineKeys: 0, HashedKeys: 1, NoKeys: 2 });
 
 export const FlowKind = Object.freeze({ Pairing: 0, Discovery: 1, ProtectSecret: 2, VerifyShares: 3, RecoverSecret: 4, Unpair: 5, UpdateChannelInfo: 6, ReplicaDiscovery: 7, UnpairReplica: 8 });
+
+export const StatusEnum = Object.freeze({ Ok: 0, Partial: 1, Fail: 2, SizeLimitExceeded: 3, TooFrequent: 4, UnknownSecretId: 5, UnknownShareVersion: 6, DecryptionFailed: 7, VerificationFailed: 8, FormatError: 9, Rejected: 10, IncompatibleParameterRange: 11, UnsupportedTransportProtocol: 12, VersionConflict: 13, ReplicaIdConflict: 14, RequestToClose: 99 });
 
 import {
   discovery_request_produce,
@@ -105,6 +131,9 @@ import {
   pairing_response_produce_pre_pair,
   pairing_response_extract_pre_pair,
   pairing_response_process_pre_pair,
+  pairing_response_produce_pre_pair_no_keys,
+  pairing_response_process_pre_pair_no_keys,
+  pairing_fingerprint,
   recovery_request_produce,
   recovery_request_extract,
   recovery_response_produce,
@@ -157,7 +186,10 @@ export const primitives = {
       produce_pre_pair: pairing_response_produce_pre_pair,
       extract_pre_pair: pairing_response_extract_pre_pair,
       process_pre_pair: pairing_response_process_pre_pair,
+      produce_pre_pair_no_keys: pairing_response_produce_pre_pair_no_keys,
+      process_pre_pair_no_keys: pairing_response_process_pre_pair_no_keys,
     },
+    fingerprint: pairing_fingerprint,
   },
   recovery: {
     request: {

@@ -75,6 +75,32 @@ pub struct DeRecProtocolEventsResult {
     pub events_json: DeRecBuffer,
 }
 
+/// Result of [`derec_protocol_restore`].
+///
+/// A restore refused because channels already exist at the recovered ids
+/// reports which ones in `conflicting_channel_ids_json`, so the application
+/// can clear exactly those and retry.
+#[repr(C)]
+pub struct DeRecProtocolRestoreResult {
+    pub error: DeRecError,
+    /// UTF-8 JSON array of events, as on [`DeRecProtocolEventsResult`].
+    pub events_json: DeRecBuffer,
+    /// UTF-8 JSON array of decimal-string channel ids. Non-empty only when
+    /// `error.code` is `DEREC_CODE_RESTORE_CONFLICT`. Caller releases via
+    /// [`crate::interop::ffi::derec_free_buffer`].
+    pub conflicting_channel_ids_json: DeRecBuffer,
+}
+
+impl From<DeRecError> for DeRecProtocolRestoreResult {
+    fn from(error: DeRecError) -> Self {
+        Self {
+            error,
+            events_json: empty_buffer(),
+            conflicting_channel_ids_json: empty_buffer(),
+        }
+    }
+}
+
 impl From<DeRecError> for DeRecProtocolEventsResult {
     fn from(error: DeRecError) -> Self {
         Self {
@@ -275,13 +301,15 @@ pub unsafe extern "C" fn derec_protocol_reject(
 /// {
 ///   "version": 7,
 ///   "recovered_secret": {
-///     "helpers": [{ "channel_id": "11", "transport_uri": "...",
+///     "helpers": [{ "channel_id": "11",
+///                   "transports": [{ "uri": "https://helper.example", "protocol": "https" }],
 ///                   "shared_key": [..32 bytes..],
 ///                   "communication_info": {} }],
 ///     "secrets": [{ "id": [..], "name": "...", "data": [..] }],
 ///     "replicas": {
 ///       "channel_id": "21",
-///       "members": [{ "replica_id": "51966", "transport_uri": "...",
+///       "members": [{ "replica_id": "51966",
+///                     "transports": [{ "uri": "https://replica.example", "protocol": "https" }],
 ///                     "role": "Source", "communication_info": {} }],
 ///       "shared_key": [..32 bytes..]
 ///     }
@@ -290,14 +318,28 @@ pub unsafe extern "C" fn derec_protocol_reject(
 /// ```
 ///
 /// Field names mirror `SecretWire` in `protocol/events/wire.rs` — the
-/// same shape `SecretRecovered` carries. `channel_id` and `replica_id`
-/// are decimal `u64` strings (empty / absent means zero).
+/// same shape `SecretRecovered` carries, so the `secret` of that event can
+/// be passed back unchanged. `channel_id` and `replica_id` are required
+/// decimal `u64` strings; an absent, empty, or malformed id is rejected.
+/// `transports` is every endpoint the peer advertised, in its preference
+/// order; `protocol` is its name, `"https"` or `"grpc"`. An absent or
+/// `null` `transports` reads as an empty list, and a helper or member with
+/// no endpoint gets no channel: restore skips it and reports it as a
+/// `PeerNotRestored` event. `role` is `"Source"` or `"Destination"`.
 ///
 /// `replicas` is an **object**, not an array, and is omitted entirely when
 /// the `secret_id` has no replica group. Every member of the group shares
 /// the one `channel_id` and the one `shared_key` it carries, so neither is
 /// repeated per member; a member is identified by `replica_id` alone, and
 /// the group's source is the member whose `role` is `"Source"`.
+///
+/// On success the result carries the events the restore produced, as
+/// [`DeRecProtocolEventsResult`] does — one `PeerNotRestored` per skipped
+/// helper or member among them. When channels already exist at ids
+/// restore is about to write, `error.code` is
+/// `DEREC_CODE_RESTORE_CONFLICT` and `conflicting_channel_ids_json` lists
+/// exactly those ids; nothing is written, so the application can clear
+/// them and retry.
 ///
 /// # Safety
 ///
@@ -309,7 +351,7 @@ pub unsafe extern "C" fn derec_protocol_restore(
     handle: *mut DeRecProtocolHandle,
     params_json_ptr: *const u8,
     params_json_len: usize,
-) -> DeRecProtocolEventsResult {
+) -> DeRecProtocolRestoreResult {
     if handle.is_null() {
         return ffi_error(DEREC_CODE_FFI_NULL_PTR, "handle is null").into();
     }
@@ -349,153 +391,31 @@ pub unsafe extern "C" fn derec_protocol_restore(
     match h.runtime.block_on(inner.restore(&secret, params.version)) {
         Ok(events) => {
             let json = encode_events(events);
-            DeRecProtocolEventsResult {
+            DeRecProtocolRestoreResult {
                 error: success(),
                 events_json: vec_into_buffer(json),
+                conflicting_channel_ids_json: empty_buffer(),
             }
         }
-        Err(e) => from_lib_error(e).into(),
+        Err(e) => {
+            let conflicting = match &e {
+                crate::Error::Restore(crate::protocol::RestoreError::Conflict(ids)) => {
+                    let ids: Vec<String> = ids.iter().map(|c| c.0.to_string()).collect();
+                    vec_into_buffer(serde_json::to_vec(&ids).expect("a list of strings serializes"))
+                }
+                _ => empty_buffer(),
+            };
+            DeRecProtocolRestoreResult {
+                error: from_lib_error(e),
+                events_json: empty_buffer(),
+                conflicting_channel_ids_json: conflicting,
+            }
+        }
     }
 }
 
 #[derive(serde::Deserialize)]
 struct RestoreParamsJson {
     version: u32,
-    recovered_secret: SecretJsonIn,
-}
-
-#[derive(serde::Deserialize)]
-struct SecretJsonIn {
-    #[serde(default)]
-    helpers: Vec<HelperJsonIn>,
-    #[serde(default)]
-    secrets: Vec<UserSecretJsonIn>,
-    #[serde(default)]
-    replicas: Option<ReplicasJsonIn>,
-}
-
-#[derive(serde::Deserialize)]
-struct ReplicasJsonIn {
-    #[serde(default)]
-    channel_id: String,
-    #[serde(default)]
-    members: Vec<ReplicaJsonIn>,
-    #[serde(default)]
-    shared_key: Vec<u8>,
-}
-
-/// One advertised endpoint, matching the roster's JSON shape: a URI plus the
-/// `Protocol` discriminant, so no protocol is inferred from the scheme.
-#[derive(serde::Deserialize)]
-struct EndpointJsonIn {
-    uri: String,
-    protocol: i32,
-}
-
-impl From<EndpointJsonIn> for derec_proto::TransportProtocol {
-    fn from(j: EndpointJsonIn) -> Self {
-        derec_proto::TransportProtocol {
-            uri: j.uri,
-            protocol: j.protocol,
-        }
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct HelperJsonIn {
-    channel_id: String,
-    transports: Vec<EndpointJsonIn>,
-    shared_key: Vec<u8>,
-    #[serde(default)]
-    communication_info: std::collections::HashMap<String, String>,
-}
-
-#[derive(serde::Deserialize)]
-struct ReplicaJsonIn {
-    replica_id: String,
-    transports: Vec<EndpointJsonIn>,
-    /// `"Source"` or `"Destination"`.
-    role: String,
-    #[serde(default)]
-    communication_info: std::collections::HashMap<String, String>,
-}
-
-#[derive(serde::Deserialize)]
-struct UserSecretJsonIn {
-    id: Vec<u8>,
-    name: String,
-    data: Vec<u8>,
-}
-
-impl SecretJsonIn {
-    fn into_secret(self) -> Result<crate::protocol::types::Secret, String> {
-        fn parse_u64(s: &str, ctx: &str) -> Result<u64, String> {
-            if s.is_empty() {
-                return Ok(0);
-            }
-            s.parse::<u64>()
-                .map_err(|e| format!("{ctx} must be a u64 decimal string: {e}"))
-        }
-
-        let helpers = self
-            .helpers
-            .into_iter()
-            .map(|h| -> Result<_, String> {
-                Ok(crate::protocol::types::HelperInfo {
-                    channel_id: parse_u64(&h.channel_id, "helper.channel_id")?,
-                    transports: h.transports.into_iter().map(Into::into).collect(),
-                    shared_key: h.shared_key,
-                    communication_info: h.communication_info,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let replicas = self
-            .replicas
-            .map(|g| -> Result<_, String> {
-                let members = g
-                    .members
-                    .into_iter()
-                    .map(|r| -> Result<_, String> {
-                        let role = match r.role.as_str() {
-                            "Source" => crate::protocol::types::ReplicaRole::Source,
-                            "Destination" => crate::protocol::types::ReplicaRole::Destination,
-                            other => {
-                                return Err(format!(
-                                    "replica.role must be \"Source\" or \"Destination\", got {other:?}"
-                                ));
-                            }
-                        };
-                        Ok(crate::protocol::types::ReplicaInfo {
-                            replica_id: parse_u64(&r.replica_id, "replica.replica_id")?,
-                            transports: r.transports.into_iter().map(Into::into).collect(),
-                            role: role as i32,
-                            communication_info: r.communication_info,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(crate::protocol::types::Replicas {
-                    channel_id: parse_u64(&g.channel_id, "replicas.channel_id")?,
-                    members,
-                    shared_key: g.shared_key,
-                })
-            })
-            .transpose()?;
-
-        let secrets = self
-            .secrets
-            .into_iter()
-            .map(|s| crate::protocol::types::UserSecret {
-                id: s.id,
-                name: s.name,
-                data: s.data,
-            })
-            .collect();
-
-        Ok(crate::protocol::types::Secret {
-            helpers,
-            secrets,
-            replicas,
-        })
-    }
+    recovered_secret: crate::interop::recovered_secret::RecoveredSecretIn,
 }

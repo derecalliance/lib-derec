@@ -128,25 +128,14 @@ fn parse_unpair_flow(params_json: &[u8]) -> Result<DeRecFlow, String> {
 fn parse_update_channel_info_flow(params_json: &[u8]) -> Result<DeRecFlow, String> {
     let raw: UpdateChannelInfoParamsJson = serde_json::from_slice(params_json)
         .map_err(|e| format!("invalid UpdateChannelInfoParams JSON: {e}"))?;
-    // The list wins when present; the singular field is the compatibility
-    // spelling an SDK predating it still sends.
-    let own_transports: Vec<TransportProtocol> = if raw.own_transports.is_empty() {
-        raw.transport_protocol
-            .into_iter()
-            .map(|t| TransportProtocol {
-                uri: t.uri,
-                protocol: t.protocol,
-            })
-            .collect()
-    } else {
-        raw.own_transports
-            .into_iter()
-            .map(|t| TransportProtocol {
-                uri: t.uri,
-                protocol: t.protocol,
-            })
-            .collect()
-    };
+    let own_transports: Vec<TransportProtocol> = raw
+        .own_transports
+        .into_iter()
+        .map(|t| TransportProtocol {
+            uri: t.uri,
+            protocol: t.protocol,
+        })
+        .collect();
     Ok(DeRecFlow::UpdateChannelInfo {
         target: parse_target(raw.target)?,
         communication_info: raw.communication_info,
@@ -254,12 +243,8 @@ struct UpdateChannelInfoParamsJson {
     target: Option<Value>,
     #[serde(default)]
     communication_info: Option<HashMap<String, String>>,
-    /// Deprecated: superseded by `own_transports`. Accepted so an SDK
-    /// predating the list keeps working; removal is scheduled for v0.0.5.
-    #[serde(default)]
-    transport_protocol: Option<TransportProtocolJson>,
     /// Every endpoint this device can now be reached on, in preference
-    /// order. Takes precedence over the singular field above.
+    /// order.
     #[serde(default)]
     own_transports: Vec<TransportProtocolJson>,
 }
@@ -267,6 +252,9 @@ struct UpdateChannelInfoParamsJson {
 #[derive(Deserialize)]
 struct TransportProtocolJson {
     uri: String,
+    #[serde(
+        deserialize_with = "crate::interop::protocol_names::protocol_from_name_or_discriminant"
+    )]
     protocol: i32,
 }
 

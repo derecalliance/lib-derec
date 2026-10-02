@@ -12,6 +12,7 @@
 use super::load_channel_key;
 use crate::derec_message::{DeRecMessageBuilder, current_timestamp};
 use crate::extensions::channel_store::ChannelStoreExt as _;
+use crate::extensions::derec_result::DeRecResultExt as _;
 #[cfg(target_arch = "wasm32")]
 use crate::interop::wasm::now_secs;
 use crate::protocol::context::{Exchange, Local};
@@ -26,8 +27,7 @@ use crate::utils::now_secs;
 use crate::{Error, Result};
 use derec_proto::{
     DeRecResult, GetSecretIdsVersionsRequestMessage, GetSecretIdsVersionsResponseMessage,
-    GetShareRequestMessage, MessageBody, StatusEnum,
-    get_secret_ids_versions_response_message::VersionList,
+    GetShareRequestMessage, MessageBody, get_secret_ids_versions_response_message::VersionList,
     get_secret_ids_versions_response_message::version_list::VersionEntry,
 };
 use prost::Message as _;
@@ -112,20 +112,12 @@ pub(in crate::protocol) async fn start<S: StoreSet>(
     let mut asked: HashSet<ReplicaId> = HashSet::new();
     for peer in &peers {
         let timestamp = current_timestamp();
-        let (legacy_reply_to, reply_to_transports) =
-            crate::extensions::advertised_endpoints::split_reply_to(std::slice::from_ref(
-                local.primary(),
-            ));
-        // Populating the deprecated singular field is the compatibility
-        // path that keeps peers predating `replyToTransports`
-        // answerable, so the warning is expected here.
-        #[allow(deprecated)]
+        let reply_to_transports = std::slice::from_ref(local.primary()).to_vec();
         let request = GetSecretIdsVersionsRequestMessage {
             timestamp: Some(timestamp),
             // The asker names itself so the answer can be routed back to a
             // member rather than treated as an owner ↔ helper exchange.
             replica_id: Some(own),
-            reply_to: legacy_reply_to,
             reply_to_transports,
         };
         let envelope = DeRecMessageBuilder::channel()
@@ -193,10 +185,7 @@ async fn on_request<S: StoreSet>(
 
     let timestamp = current_timestamp();
     let response = GetSecretIdsVersionsResponseMessage {
-        result: Some(DeRecResult {
-            status: StatusEnum::Ok as i32,
-            memo: String::new(),
-        }),
+        result: Some(DeRecResult::ok()),
         // A device holding no snapshot reports nothing rather than version 0,
         // which would be indistinguishable from "I hold the empty version".
         secret_list: version
@@ -355,19 +344,11 @@ async fn finish<S: StoreSet>(
 
     let key = load_channel_key(stores, local, member.channel_id).await?;
     let timestamp = current_timestamp();
-    let (legacy_reply_to, reply_to_transports) =
-        crate::extensions::advertised_endpoints::split_reply_to(std::slice::from_ref(
-            local.primary(),
-        ));
-    // Populating the deprecated singular field is the compatibility
-    // path that keeps peers predating `replyToTransports`
-    // answerable, so the warning is expected here.
-    #[allow(deprecated)]
+    let reply_to_transports = std::slice::from_ref(local.primary()).to_vec();
     let request = GetShareRequestMessage {
         secret_id,
         version: group_version,
         timestamp: Some(timestamp),
-        reply_to: legacy_reply_to,
         reply_to_transports,
         replica_id: local.replica_id,
     };
@@ -455,7 +436,7 @@ mod tests {
                     version,
                     secrets: Vec::new(),
                     description: None,
-                    replicas: None,
+                    author_replica_id: None,
                 },
             )
             .await
@@ -464,10 +445,7 @@ mod tests {
 
     fn versions_response(version: Option<u32>) -> GetSecretIdsVersionsResponseMessage {
         GetSecretIdsVersionsResponseMessage {
-            result: Some(DeRecResult {
-                status: StatusEnum::Ok as i32,
-                memo: String::new(),
-            }),
+            result: Some(DeRecResult::ok()),
             secret_list: version
                 .map(|version| VersionList {
                     secret_id: SECRET_ID,

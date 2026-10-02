@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use crate::extensions::derec_result::DeRecResultExt as _;
 use crate::{
     Error,
     derec_message::{DeRecMessageBuilder, current_timestamp},
@@ -74,10 +75,7 @@ fn build_response_envelope_with_mismatched_timestamp(
     envelope_timestamp.seconds += 1;
 
     let message = GetSecretIdsVersionsResponseMessage {
-        result: Some(DeRecResult {
-            status: StatusEnum::Ok as i32,
-            memo: String::new(),
-        }),
+        result: Some(DeRecResult::ok()),
         secret_list: vec![],
         timestamp: Some(message_timestamp),
         replica_id: None,
@@ -155,8 +153,6 @@ fn test_extract_discovery_request_mismatched_timestamp_fails() {
 
     let message = GetSecretIdsVersionsRequestMessage {
         timestamp: Some(message_timestamp),
-        #[allow(deprecated)]
-        reply_to: None,
         reply_to_transports: Vec::new(),
         replica_id: None,
     };
@@ -188,8 +184,6 @@ fn test_extract_discovery_request_wrong_message_type_fails() {
         secret_id: 1,
         version: 1,
         timestamp: Some(timestamp),
-        #[allow(deprecated)]
-        reply_to: None,
         reply_to_transports: Vec::new(),
         replica_id: None,
     };
@@ -309,10 +303,7 @@ fn test_extract_discovery_response_wrong_message_type_fails() {
     let message = GetShareResponseMessage {
         share_algorithm: 0,
         committed_de_rec_share: vec![],
-        result: Some(DeRecResult {
-            status: StatusEnum::Ok as i32,
-            memo: String::new(),
-        }),
+        result: Some(DeRecResult::ok()),
         timestamp: Some(timestamp),
         secret_id: 0,
         version: 0,

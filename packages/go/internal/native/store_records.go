@@ -16,6 +16,7 @@ package native
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 )
 
@@ -166,20 +167,19 @@ func memberFromWire(w replicaMemberWire) ReplicaMember {
 
 // EncodeChannelRecord produces the JSON a ChannelStoreCallbacks.save/load
 // response must carry, matching ChannelRecord's derived Serialize output
-// byte-for-byte.
+// byte-for-byte. The variant set on r is marshalled as given; the library
+// rejects a record that does not carry exactly one.
 func EncodeChannelRecord(r ChannelRecord) ([]byte, error) {
-	switch {
-	case r.Helper != nil && r.Replica != nil:
-		return nil, fmt.Errorf("native: ChannelRecord carries both Helper and Replica")
-	case r.Helper != nil:
-		w := helperToWire(*r.Helper)
-		return json.Marshal(channelRecordWire{Helper: &w})
-	case r.Replica != nil:
-		w := memberToWire(*r.Replica)
-		return json.Marshal(channelRecordWire{Replica: &w})
-	default:
-		return nil, fmt.Errorf("native: ChannelRecord carries neither Helper nor Replica")
+	var w channelRecordWire
+	if r.Helper != nil {
+		h := helperToWire(*r.Helper)
+		w.Helper = &h
 	}
+	if r.Replica != nil {
+		m := memberToWire(*r.Replica)
+		w.Replica = &m
+	}
+	return json.Marshal(w)
 }
 
 // DecodeChannelRecord parses a ChannelRecord from a
@@ -189,18 +189,16 @@ func DecodeChannelRecord(data []byte) (ChannelRecord, error) {
 	if err := json.Unmarshal(data, &w); err != nil {
 		return ChannelRecord{}, fmt.Errorf("native: decode ChannelRecord: %w", err)
 	}
-	switch {
-	case w.Helper != nil && w.Replica != nil:
-		return ChannelRecord{}, fmt.Errorf("native: ChannelRecord JSON carries both variants")
-	case w.Helper != nil:
+	var r ChannelRecord
+	if w.Helper != nil {
 		h := helperFromWire(*w.Helper)
-		return ChannelRecord{Helper: &h}, nil
-	case w.Replica != nil:
-		m := memberFromWire(*w.Replica)
-		return ChannelRecord{Replica: &m}, nil
-	default:
-		return ChannelRecord{}, fmt.Errorf("native: ChannelRecord JSON carries neither variant")
+		r.Helper = &h
 	}
+	if w.Replica != nil {
+		m := memberFromWire(*w.Replica)
+		r.Replica = &m
+	}
+	return r, nil
 }
 
 // EncodeHelperChannelList produces the JSON a
@@ -307,23 +305,27 @@ func EncodeSecretValue(v SecretValue) ([]byte, error) {
 	return json.Marshal(secretValueWire{Kind: uint32(v.Kind), Bytes: JSONByteArray(v.Bytes)})
 }
 
-// DecodeSecretValue parses a SecretValue from a SecretStoreCallbacks.load
-// response, applying the same per-kind validation as Rust's
-// `SecretValueRecord::into_value()`.
+// EncodeSecretValueList produces the JSON array a
+// SecretStoreCallbacks.load_many call returns: one entry per requested
+// channel, in request order, each the record EncodeSecretValue produces or
+// null where values[i] is nil.
+func EncodeSecretValueList(values []*SecretValue) ([]byte, error) {
+	wires := make([]*secretValueWire, len(values))
+	for i, v := range values {
+		if v != nil {
+			wires[i] = &secretValueWire{Kind: uint32(v.Kind), Bytes: JSONByteArray(v.Bytes)}
+		}
+	}
+	return json.Marshal(wires)
+}
+
+// DecodeSecretValue parses a SecretValue from a SecretStoreCallbacks.save
+// payload. Kind and payload are carried verbatim; what each kind requires of
+// its payload is checked by the library (`SecretValueRecord::into_value()`).
 func DecodeSecretValue(data []byte) (SecretValue, error) {
 	var w secretValueWire
 	if err := json.Unmarshal(data, &w); err != nil {
 		return SecretValue{}, fmt.Errorf("native: decode SecretValue: %w", err)
-	}
-	switch SecretKind(w.Kind) {
-	case SecretKindSharedKey:
-		if len(w.Bytes) != 32 {
-			return SecretValue{}, fmt.Errorf("native: SharedKey payload must be 32 bytes, got %d", len(w.Bytes))
-		}
-	case SecretKindPairingSecret, SecretKindPairingContact:
-		// Opaque blobs — no length constraint.
-	default:
-		return SecretValue{}, fmt.Errorf("native: unknown SecretKind: %d", w.Kind)
 	}
 	return SecretValue{Kind: SecretKind(w.Kind), Bytes: []byte(w.Bytes)}, nil
 }
@@ -342,72 +344,55 @@ type stateKeyWire struct {
 
 // EncodeStateKey produces the JSON a StateStoreCallbacks.load/remove key
 // argument carries, mirroring Rust's `impl From<&StateKey> for
-// StateKeyRecord`.
+// StateKeyRecord`. Every field set on k is marshalled; which fields a kind
+// requires is decided by the library.
 func EncodeStateKey(k StateKey) ([]byte, error) {
-	w := stateKeyWire{Kind: uint32(k.Kind)}
-	switch k.Kind {
-	case StateKindPendingVerification, StateKindPendingUnpair:
-		if k.ChannelID == nil {
-			return nil, fmt.Errorf("native: StateKey kind=%d requires ChannelID", k.Kind)
-		}
-		cid := strconv.FormatUint(*k.ChannelID, 10)
-		w.ChannelID = &cid
-	case StateKindPendingRecovery:
-		if k.SecretID == nil {
-			return nil, fmt.Errorf("native: StateKey PendingRecovery requires SecretID")
-		}
-		if k.Version == nil {
-			return nil, fmt.Errorf("native: StateKey PendingRecovery requires Version")
-		}
-		sid := strconv.FormatUint(*k.SecretID, 10)
-		w.SecretID = &sid
-		v := *k.Version
-		w.Version = &v
-	case StateKindSharingRound:
-		// No secondary key.
-	default:
-		return nil, fmt.Errorf("native: unknown StateKind: %d", k.Kind)
-	}
-	return json.Marshal(w)
+	return json.Marshal(stateKeyWire{
+		Kind:      uint32(k.Kind),
+		ChannelID: decimalPtr(k.ChannelID),
+		SecretID:  decimalPtr(k.SecretID),
+		Version:   k.Version,
+	})
 }
 
 // DecodeStateKey parses a StateKey from a StateStoreCallbacks.load/remove
-// key argument. Rust never decodes this shape itself (StateKey only ever
-// crosses Rust->Go), so this is the inferred precise inverse of
-// EncodeStateKey / Rust's `impl From<&StateKey> for StateKeyRecord`.
+// key argument: the inverse of EncodeStateKey, carrying every field the
+// library sent.
 func DecodeStateKey(data []byte) (StateKey, error) {
 	var w stateKeyWire
 	if err := json.Unmarshal(data, &w); err != nil {
 		return StateKey{}, fmt.Errorf("native: decode StateKey: %w", err)
 	}
-	switch StateKind(w.Kind) {
-	case StateKindPendingVerification, StateKindPendingUnpair:
-		if w.ChannelID == nil {
-			return StateKey{}, fmt.Errorf("native: StateKey kind=%d requires channel_id", w.Kind)
-		}
-		cid, err := strconv.ParseUint(*w.ChannelID, 10, 64)
-		if err != nil {
-			return StateKey{}, fmt.Errorf("native: channel_id not a decimal u64: %w", err)
-		}
-		return StateKey{Kind: StateKind(w.Kind), ChannelID: &cid}, nil
-	case StateKindPendingRecovery:
-		if w.SecretID == nil {
-			return StateKey{}, fmt.Errorf("native: StateKey PendingRecovery requires secret_id")
-		}
-		if w.Version == nil {
-			return StateKey{}, fmt.Errorf("native: StateKey PendingRecovery requires version")
-		}
-		sid, err := strconv.ParseUint(*w.SecretID, 10, 64)
-		if err != nil {
-			return StateKey{}, fmt.Errorf("native: secret_id not a decimal u64: %w", err)
-		}
-		v := *w.Version
-		return StateKey{Kind: StateKindPendingRecovery, SecretID: &sid, Version: &v}, nil
-	case StateKindSharingRound:
-		return StateKey{Kind: StateKindSharingRound}, nil
-	default:
-		return StateKey{}, fmt.Errorf("native: unknown StateKind: %d", w.Kind)
+	channelID, err := parseDecimalPtr(w.ChannelID, "channel_id")
+	if err != nil {
+		return StateKey{}, err
 	}
+	secretID, err := parseDecimalPtr(w.SecretID, "secret_id")
+	if err != nil {
+		return StateKey{}, err
+	}
+	return StateKey{Kind: StateKind(w.Kind), ChannelID: channelID, SecretID: secretID, Version: w.Version}, nil
+}
+
+// decimalPtr renders an optional u64 as the decimal string the wire carries.
+func decimalPtr(v *uint64) *string {
+	if v == nil {
+		return nil
+	}
+	s := strconv.FormatUint(*v, 10)
+	return &s
+}
+
+// parseDecimalPtr parses an optional decimal-string u64 field.
+func parseDecimalPtr(raw *string, field string) (*uint64, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	v, err := strconv.ParseUint(*raw, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("native: %s not a decimal u64: %w", field, err)
+	}
+	return &v, nil
 }
 
 // --- StateItem ---------------------------------------------------------
@@ -430,18 +415,16 @@ type stateItemWire struct {
 	Failed    *[]string        `json:"failed,omitempty"`
 	// Replica-leg accounting, keyed by replica_id. Absent on rows written
 	// before the leg existed, which decode as empty rather than failing.
-	PendingReplicas *[]string `json:"pending_replicas,omitempty"`
-	SyncedReplicas  *[]string `json:"synced_replicas,omitempty"`
-	BehindReplicas  *[]string `json:"behind_replicas,omitempty"`
+	PendingReplicas *[]string               `json:"pending_replicas,omitempty"`
+	SyncedReplicas  *[]string               `json:"synced_replicas,omitempty"`
+	BehindReplicas  *[]string               `json:"behind_replicas,omitempty"`
+	LocalVersion    *uint32                 `json:"local_version,omitempty"`
+	Reported        *[]replicaDiscoveryWire `json:"reported,omitempty"`
 }
 
-// parseOptionalUint64Strings decodes an id set whose absence is legitimate,
-// unlike parseUint64Strings which requires the field.
-func parseOptionalUint64Strings(raw *[]string, field string) ([]uint64, error) {
-	if raw == nil {
-		return nil, nil
-	}
-	return parseUint64Strings(raw, field)
+type replicaDiscoveryWire struct {
+	ReplicaID string `json:"replica_id"`
+	Version   uint32 `json:"version"`
 }
 
 func stringifyUint64s(ids []uint64) []string {
@@ -452,9 +435,11 @@ func stringifyUint64s(ids []uint64) []string {
 	return out
 }
 
+// parseUint64Strings decodes an optional decimal-string id set. An absent
+// field decodes as nil; a present one, even empty, as a non-nil slice.
 func parseUint64Strings(raw *[]string, field string) ([]uint64, error) {
 	if raw == nil {
-		return nil, fmt.Errorf("native: SharingRound requires %s", field)
+		return nil, nil
 	}
 	out := make([]uint64, len(*raw))
 	for i, s := range *raw {
@@ -467,57 +452,32 @@ func parseUint64Strings(raw *[]string, field string) ([]uint64, error) {
 	return out, nil
 }
 
-// EncodeStateItem produces the JSON a StateStoreCallbacks.save call
-// carries, mirroring Rust's `impl From<&StateItem> for StateItemRecord`.
+// EncodeStateItem produces the JSON a StateStoreCallbacks.load/load_all
+// response carries, mirroring Rust's `impl From<&StateItem> for
+// StateItemRecord`. Every scalar field set on item is marshalled; Kind
+// selects which collections are written, since a variant's collections are
+// present on the wire even when empty. Which fields a kind requires is
+// decided by the library (`StateItemRecord::into_item()`).
 func EncodeStateItem(item StateItem) ([]byte, error) {
-	w := stateItemWire{Kind: uint32(item.Kind)}
+	w := stateItemWire{
+		Kind:         uint32(item.Kind),
+		ChannelID:    decimalPtr(item.ChannelID),
+		SecretID:     decimalPtr(item.SecretID),
+		Version:      item.Version,
+		StartedAt:    decimalPtr(item.StartedAt),
+		LocalVersion: item.LocalVersion,
+	}
 	switch item.Kind {
 	case StateKindPendingVerification:
-		if item.ChannelID == nil {
-			return nil, fmt.Errorf("native: PendingVerification StateItem requires ChannelID")
-		}
-		cid := strconv.FormatUint(*item.ChannelID, 10)
-		w.ChannelID = &cid
 		b := JSONByteArray(item.Bytes)
 		w.Bytes = &b
 	case StateKindPendingRecovery:
-		if item.SecretID == nil {
-			return nil, fmt.Errorf("native: PendingRecovery StateItem requires SecretID")
-		}
-		if item.Version == nil {
-			return nil, fmt.Errorf("native: PendingRecovery StateItem requires Version")
-		}
-		sid := strconv.FormatUint(*item.SecretID, 10)
-		w.SecretID = &sid
-		v := *item.Version
-		w.Version = &v
 		shares := make([]JSONByteArray, len(item.Shares))
 		for i, s := range item.Shares {
 			shares[i] = JSONByteArray(s)
 		}
 		w.Shares = &shares
-	case StateKindPendingUnpair:
-		if item.ChannelID == nil {
-			return nil, fmt.Errorf("native: PendingUnpair StateItem requires ChannelID")
-		}
-		if item.StartedAt == nil {
-			return nil, fmt.Errorf("native: PendingUnpair StateItem requires StartedAt")
-		}
-		cid := strconv.FormatUint(*item.ChannelID, 10)
-		w.ChannelID = &cid
-		sa := strconv.FormatUint(*item.StartedAt, 10)
-		w.StartedAt = &sa
 	case StateKindSharingRound:
-		if item.Version == nil {
-			return nil, fmt.Errorf("native: SharingRound StateItem requires Version")
-		}
-		if item.StartedAt == nil {
-			return nil, fmt.Errorf("native: SharingRound StateItem requires StartedAt")
-		}
-		v := *item.Version
-		w.Version = &v
-		sa := strconv.FormatUint(*item.StartedAt, 10)
-		w.StartedAt = &sa
 		pending := stringifyUint64s(item.Pending)
 		confirmed := stringifyUint64s(item.Confirmed)
 		failed := stringifyUint64s(item.Failed)
@@ -530,121 +490,78 @@ func EncodeStateItem(item StateItem) ([]byte, error) {
 		w.PendingReplicas = &pendingReplicas
 		w.SyncedReplicas = &syncedReplicas
 		w.BehindReplicas = &behindReplicas
-	default:
-		return nil, fmt.Errorf("native: unknown StateKind: %d", item.Kind)
+	case StateKindPendingReplicaDiscovery:
+		pendingReplicas := stringifyUint64s(item.PendingReplicas)
+		w.PendingReplicas = &pendingReplicas
+		ids := make([]uint64, 0, len(item.Reported))
+		for id := range item.Reported {
+			ids = append(ids, id)
+		}
+		sort.Slice(ids, func(a, b int) bool { return ids[a] < ids[b] })
+		reported := make([]replicaDiscoveryWire, len(ids))
+		for i, id := range ids {
+			reported[i] = replicaDiscoveryWire{ReplicaID: strconv.FormatUint(id, 10), Version: item.Reported[id]}
+		}
+		w.Reported = &reported
 	}
 	return json.Marshal(w)
 }
 
-// DecodeStateItem parses a StateItem from a StateStoreCallbacks.load/
-// load_all response, mirroring Rust's `StateItemRecord::into_item()`
-// exactly, including its per-kind required-field validation.
+// DecodeStateItem parses a StateItem from a StateStoreCallbacks.save
+// payload, carrying every field the library sent.
 func DecodeStateItem(data []byte) (StateItem, error) {
 	var w stateItemWire
 	if err := json.Unmarshal(data, &w); err != nil {
 		return StateItem{}, fmt.Errorf("native: decode StateItem: %w", err)
 	}
-	switch StateKind(w.Kind) {
-	case StateKindPendingVerification:
-		if w.ChannelID == nil {
-			return StateItem{}, fmt.Errorf("native: PendingVerification requires channel_id")
-		}
-		cid, err := strconv.ParseUint(*w.ChannelID, 10, 64)
-		if err != nil {
-			return StateItem{}, fmt.Errorf("native: channel_id not a decimal u64: %w", err)
-		}
-		if w.Bytes == nil {
-			return StateItem{}, fmt.Errorf("native: PendingVerification requires bytes")
-		}
-		return StateItem{Kind: StateKindPendingVerification, ChannelID: &cid, Bytes: []byte(*w.Bytes)}, nil
-	case StateKindPendingRecovery:
-		if w.SecretID == nil {
-			return StateItem{}, fmt.Errorf("native: PendingRecovery requires secret_id")
-		}
-		if w.Version == nil {
-			return StateItem{}, fmt.Errorf("native: PendingRecovery requires version")
-		}
-		if w.Shares == nil {
-			return StateItem{}, fmt.Errorf("native: PendingRecovery requires shares")
-		}
-		sid, err := strconv.ParseUint(*w.SecretID, 10, 64)
-		if err != nil {
-			return StateItem{}, fmt.Errorf("native: secret_id not a decimal u64: %w", err)
-		}
-		shares := make([][]byte, len(*w.Shares))
-		for i, s := range *w.Shares {
-			shares[i] = []byte(s)
-		}
-		v := *w.Version
-		return StateItem{Kind: StateKindPendingRecovery, SecretID: &sid, Version: &v, Shares: shares}, nil
-	case StateKindPendingUnpair:
-		if w.ChannelID == nil {
-			return StateItem{}, fmt.Errorf("native: PendingUnpair requires channel_id")
-		}
-		cid, err := strconv.ParseUint(*w.ChannelID, 10, 64)
-		if err != nil {
-			return StateItem{}, fmt.Errorf("native: channel_id not a decimal u64: %w", err)
-		}
-		if w.StartedAt == nil {
-			return StateItem{}, fmt.Errorf("native: PendingUnpair requires started_at")
-		}
-		sa, err := strconv.ParseUint(*w.StartedAt, 10, 64)
-		if err != nil {
-			return StateItem{}, fmt.Errorf("native: started_at not a decimal u64: %w", err)
-		}
-		return StateItem{Kind: StateKindPendingUnpair, ChannelID: &cid, StartedAt: &sa}, nil
-	case StateKindSharingRound:
-		if w.Version == nil {
-			return StateItem{}, fmt.Errorf("native: SharingRound requires version")
-		}
-		if w.StartedAt == nil {
-			return StateItem{}, fmt.Errorf("native: SharingRound requires started_at")
-		}
-		sa, err := strconv.ParseUint(*w.StartedAt, 10, 64)
-		if err != nil {
-			return StateItem{}, fmt.Errorf("native: started_at not a decimal u64: %w", err)
-		}
-		pending, err := parseUint64Strings(w.Pending, "pending")
-		if err != nil {
-			return StateItem{}, err
-		}
-		confirmed, err := parseUint64Strings(w.Confirmed, "confirmed")
-		if err != nil {
-			return StateItem{}, err
-		}
-		failed, err := parseUint64Strings(w.Failed, "failed")
-		if err != nil {
-			return StateItem{}, err
-		}
-		// The replica leg postdates the helper one: a row written by an older
-		// build carries no member state, so an absent field decodes as empty.
-		pendingReplicas, err := parseOptionalUint64Strings(w.PendingReplicas, "pending_replicas")
-		if err != nil {
-			return StateItem{}, err
-		}
-		syncedReplicas, err := parseOptionalUint64Strings(w.SyncedReplicas, "synced_replicas")
-		if err != nil {
-			return StateItem{}, err
-		}
-		behindReplicas, err := parseOptionalUint64Strings(w.BehindReplicas, "behind_replicas")
-		if err != nil {
-			return StateItem{}, err
-		}
-		v := *w.Version
-		return StateItem{
-			Kind:            StateKindSharingRound,
-			Version:         &v,
-			StartedAt:       &sa,
-			Pending:         pending,
-			Confirmed:       confirmed,
-			Failed:          failed,
-			PendingReplicas: pendingReplicas,
-			SyncedReplicas:  syncedReplicas,
-			BehindReplicas:  behindReplicas,
-		}, nil
-	default:
-		return StateItem{}, fmt.Errorf("native: unknown StateKind: %d", w.Kind)
+	item := StateItem{Kind: StateKind(w.Kind), Version: w.Version, LocalVersion: w.LocalVersion}
+	var err error
+	if item.ChannelID, err = parseDecimalPtr(w.ChannelID, "channel_id"); err != nil {
+		return StateItem{}, err
 	}
+	if item.SecretID, err = parseDecimalPtr(w.SecretID, "secret_id"); err != nil {
+		return StateItem{}, err
+	}
+	if item.StartedAt, err = parseDecimalPtr(w.StartedAt, "started_at"); err != nil {
+		return StateItem{}, err
+	}
+	if w.Bytes != nil {
+		item.Bytes = []byte(*w.Bytes)
+	}
+	if w.Shares != nil {
+		item.Shares = make([][]byte, len(*w.Shares))
+		for i, s := range *w.Shares {
+			item.Shares[i] = []byte(s)
+		}
+	}
+	sets := []struct {
+		raw   *[]string
+		field string
+		out   *[]uint64
+	}{
+		{w.Pending, "pending", &item.Pending},
+		{w.Confirmed, "confirmed", &item.Confirmed},
+		{w.Failed, "failed", &item.Failed},
+		{w.PendingReplicas, "pending_replicas", &item.PendingReplicas},
+		{w.SyncedReplicas, "synced_replicas", &item.SyncedReplicas},
+		{w.BehindReplicas, "behind_replicas", &item.BehindReplicas},
+	}
+	for _, set := range sets {
+		if *set.out, err = parseUint64Strings(set.raw, set.field); err != nil {
+			return StateItem{}, err
+		}
+	}
+	if w.Reported != nil {
+		item.Reported = make(map[uint64]uint32, len(*w.Reported))
+		for _, r := range *w.Reported {
+			id, err := strconv.ParseUint(r.ReplicaID, 10, 64)
+			if err != nil {
+				return StateItem{}, fmt.Errorf("native: reported.replica_id not a decimal u64: %w", err)
+			}
+			item.Reported[id] = r.Version
+		}
+	}
+	return item, nil
 }
 
 // --- UserSecrets ---------------------------------------------------------
@@ -661,6 +578,8 @@ type userSecretsWire struct {
 	Version     uint32           `json:"version"`
 	Secrets     []userSecretWire `json:"secrets"`
 	Description *string          `json:"description,omitempty"`
+	// Decimal-encoded u64, omitted when absent.
+	AuthorReplicaID *string `json:"author_replica_id,omitempty"`
 }
 
 // EncodeUserSecrets produces the JSON a
@@ -671,6 +590,10 @@ func EncodeUserSecrets(v UserSecrets) ([]byte, error) {
 		secrets[i] = userSecretWire{ID: JSONByteArray(s.ID), Name: s.Name, Data: JSONByteArray(s.Data)}
 	}
 	w := userSecretsWire{Version: v.Version, Secrets: secrets, Description: v.Description}
+	if v.AuthorReplicaID != nil {
+		author := strconv.FormatUint(*v.AuthorReplicaID, 10)
+		w.AuthorReplicaID = &author
+	}
 	return json.Marshal(w)
 }
 
@@ -685,7 +608,15 @@ func DecodeUserSecrets(data []byte) (UserSecrets, error) {
 	for i, s := range w.Secrets {
 		secrets[i] = UserSecret{ID: []byte(s.ID), Name: s.Name, Data: []byte(s.Data)}
 	}
-	return UserSecrets{Version: w.Version, Secrets: secrets, Description: w.Description}, nil
+	out := UserSecrets{Version: w.Version, Secrets: secrets, Description: w.Description}
+	if w.AuthorReplicaID != nil {
+		author, err := strconv.ParseUint(*w.AuthorReplicaID, 10, 64)
+		if err != nil {
+			return UserSecrets{}, fmt.Errorf("native: author_replica_id not a decimal u64: %w", err)
+		}
+		out.AuthorReplicaID = &author
+	}
+	return out, nil
 }
 
 // --- Plain number-array helpers -------------------------------------------

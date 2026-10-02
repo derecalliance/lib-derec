@@ -4,9 +4,12 @@
 package sharing_test
 
 import (
+	"reflect"
 	"testing"
 
+	"github.com/derecalliance/lib-derec/packages/go/derecpb"
 	"github.com/derecalliance/lib-derec/packages/go/primitives/sharing"
+	"google.golang.org/protobuf/proto"
 )
 
 func sharedKey() []byte {
@@ -58,7 +61,7 @@ func TestStoreShareRequestResponseRoundTrip(t *testing.T) {
 	for _, channelID := range channelIDs {
 		committedShare := shares[channelID]
 
-		requestWire, err := sharing.Request.Produce(channelID, version, secretID, committedShare, nil, "", key)
+		requestWire, err := sharing.Request.Produce(channelID, version, secretID, committedShare, nil, "", key, nil)
 		if err != nil {
 			t.Fatalf("channel %d: request produce: %v", channelID, err)
 		}
@@ -108,5 +111,56 @@ func TestStoreShareRequestResponseRoundTrip(t *testing.T) {
 		if err := sharing.Response.Process(version, extractedResp.ResponseProto); err != nil {
 			t.Fatalf("channel %d: response process: %v", channelID, err)
 		}
+	}
+}
+
+// replyToOf decodes the inner StoreShareRequestMessage proto and returns its reply-to list in
+// the same shape the producer accepted.
+func replyToOf(t *testing.T, requestProto []byte) []sharing.Endpoint {
+	t.Helper()
+	var msg derecpb.StoreShareRequestMessage
+	if err := proto.Unmarshal(requestProto, &msg); err != nil {
+		t.Fatalf("decode inner request: %v", err)
+	}
+	var out []sharing.Endpoint
+	for _, tp := range msg.GetReplyToTransports() {
+		out = append(out, sharing.Endpoint{URI: tp.GetUri(), Protocol: int32(tp.GetProtocol())})
+	}
+	return out
+}
+
+var replyTo = []sharing.Endpoint{
+	{URI: "https://owner.example/derec", Protocol: 0},
+	{URI: "grpcs://owner.example:443", Protocol: 1},
+}
+
+func produceAndExtractStoreShare(t *testing.T, rt []sharing.Endpoint) []byte {
+	t.Helper()
+	const secretID, version = uint64(9), uint32(1)
+	key := sharedKey()
+	shares, err := sharing.Request.Split(secretID, []byte{1, 2, 3}, []uint64{1, 2}, 2, version)
+	if err != nil {
+		t.Fatalf("split: %v", err)
+	}
+	wire, err := sharing.Request.Produce(1, version, secretID, shares[1], nil, "", key, rt)
+	if err != nil {
+		t.Fatalf("produce: %v", err)
+	}
+	got, err := sharing.Request.Extract(wire, key)
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	return got.RequestProto
+}
+
+func TestStoreShareRequestCarriesReplyTo(t *testing.T) {
+	if rt := replyToOf(t, produceAndExtractStoreShare(t, replyTo)); !reflect.DeepEqual(rt, replyTo) {
+		t.Fatalf("reply_to: want %+v got %+v", replyTo, rt)
+	}
+}
+
+func TestStoreShareRequestNilReplyToIsEmpty(t *testing.T) {
+	if rt := replyToOf(t, produceAndExtractStoreShare(t, nil)); len(rt) != 0 {
+		t.Fatalf("reply_to: want empty got %+v", rt)
 	}
 }

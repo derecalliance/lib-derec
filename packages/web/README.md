@@ -72,7 +72,7 @@ These represent **opaque wire-level protocol messages**.
 ## Initialization
 
 ```ts
-import init from "@derec-alliance/web";
+import { init } from "@derec-alliance/web";
 
 await init();
 ```
@@ -82,7 +82,7 @@ await init();
 ## Quick Example
 
 ```ts
-import init, { primitives } from "@derec-alliance/web";
+import { init, primitives } from "@derec-alliance/web";
 
 async function main() {
   await init();
@@ -122,7 +122,7 @@ the long-running channel to its pairing-time id.
 ### `InlineKeys` flow
 
 ```ts
-import init, { ContactMode, primitives, SenderKind } from "@derec-alliance/web";
+import { init, ContactMode, primitives, SenderKind } from "@derec-alliance/web";
 
 async function main() {
   await init();
@@ -146,7 +146,7 @@ async function main() {
 
   // Step 3: Initiator extracts the request and produces the response.
   const { request: pairRequest } =
-    primitives.pairing.request.extract(request.envelope, contact.secret_key);
+    primitives.pairing.request.extract(request.envelope, contact.secret_key, null);
   const produced = primitives.pairing.response.produce(
     channelId,
     pairRequest,
@@ -161,6 +161,7 @@ async function main() {
     request.initiator_contact_message,
     pairResponse,
     request.secret_key,
+    null,
   );
 
   // Both sides hold the same shared key and rekeyed channel id.
@@ -188,7 +189,8 @@ against `contact.contact_binding_hash`, and then runs the normal pairing
 flow on a synthesized contact with the keys filled in.
 
 ```ts
-import init, {
+import {
+  init,
   ContactMode,
   primitives,
   SenderKind,
@@ -259,7 +261,7 @@ The orchestrator handles the whole chain automatically:
   `ActionRequired` event with `action_kind: "PrePair"`. Call
   `protocol.accept(action)` to publish the keys (the library builds the
   response and routes it), or `protocol.reject(action, status, memo)` to
-  refuse.
+  refuse — `status` is a `StatusEnum` value such as `StatusEnum.Rejected`.
 - **Scanner** — `protocol.start(FlowKind.Pairing, { kind, contact })` kicks
   off the plaintext PrePair leg. `start()` returns a `DeRecEvent[]`
   containing one `PairingStarted { channel_id, kind }` event that
@@ -282,7 +284,7 @@ SDK. See [End-to-end test coverage](https://github.com/derecalliance/lib-derec#e
 ## Share Distribution (Sharing Flow)
 
 ```ts
-import init, { primitives } from "@derec-alliance/web";
+import { init, primitives } from "@derec-alliance/web";
 
 async function main() {
   await init();
@@ -319,7 +321,7 @@ main();
 ## Recovery Flow
 
 ```ts
-import init, { primitives } from "@derec-alliance/web";
+import { init, primitives } from "@derec-alliance/web";
 
 async function main() {
   await init();
@@ -366,6 +368,9 @@ to `protocol.restore(secret, version)` on a fresh `DeRecProtocol` instance to
 commit canonical helper / replica state and wipe the throwaway recovery-mode
 channels — at that point the device resumes normal operation as if the secret
 had been protected here originally.
+A helper or member with no endpoint in the recovered roster gets no channel;
+`restore` returns a `PeerNotRestored` event for it (`reason: "NoTransports"`)
+and restores the rest.
 
 ```ts
 const events = await protocol.process(responseBytes);
@@ -376,8 +381,10 @@ for (const ev of events) {
 }
 ```
 
-Errors surface as objects with a `code` field — `ALREADY_RESTORED`,
-`CONFLICT` (with `channel_ids`), `INVARIANT`, or `STORAGE`.
+Errors surface as a `DeRecError` with a `category` and `code` —
+`already_restored`, `restore_conflict` (with `channel_ids`), `invariant`,
+`invalid_recovered_secret` (a malformed `secret`), or `store_error` (a store call failed; `category`
+names the store).
 
 > **Secret format:** the recoverable secret (the bytes helpers store and
 > recovery reconstructs) is `[version byte] · payload` — v1's payload is
@@ -391,7 +398,7 @@ Errors surface as objects with a `code` field — `ALREADY_RESTORED`,
 ## Verification Flow
 
 ```ts
-import init, { primitives } from "@derec-alliance/web";
+import { init, primitives } from "@derec-alliance/web";
 
 async function main() {
   await init();
@@ -435,7 +442,7 @@ Compatible with:
 - Parcel
 
 ```ts
-import init from "@derec-alliance/web";
+import { init } from "@derec-alliance/web";
 
 await init();
 ```
@@ -446,7 +453,7 @@ await init();
 
 ```html
 <script type="module">
-  import init from "https://cdn.jsdelivr.net/npm/@derec-alliance/web/+esm";
+  import { init } from "https://cdn.jsdelivr.net/npm/@derec-alliance/web/+esm";
 
   await init();
 </script>
@@ -505,6 +512,12 @@ index.d.ts
 - No protobuf types are exposed
 - No cryptographic operations occur in JavaScript
 - Rust is the single source of truth
+- Every `DeRecProtocol` method that touches protocol state returns a
+  `Promise`, including the `set*` setters. Overlapping calls on one
+  instance — a `tick()` timer firing while `process()` handles a message —
+  queue and run in the order they were made; they never collide. A store
+  or transport callback must not await a call on the instance that
+  invoked it, since that call waits behind the callback's own caller.
 
 ---
 
@@ -586,13 +599,13 @@ Two cross-cutting metadata fields appear on every channel-mode exchange:
   end-to-end (random token on every outbound request, echo on every
   response). Primitive-only callers can manipulate it directly via
   `envelope.apply_trace_id(bytes, traceId)` and `envelope.read_trace_id(bytes)`.
-- **`replyTo`** — optional `TransportProtocol` on request bodies, telling
-  the responder to route this exchange's response to an alternate endpoint.
+- **`replyTo`** — optional `TransportProtocol` list on request bodies, telling
+  the responder to route this exchange's response to alternate endpoints.
   Set it per call (every `primitives.*.request.produce` takes a trailing
   `reply_to` arg) or protocol-wide with the `autoReplyTo` constructor flag
-  on `DeRecProtocol` (stamps `replyTo = ownTransport` on every outbound
-  request). Excludes pairing and `UpdateChannelInfo`, which already carry
-  their own `transportProtocol` field.
+  on `DeRecProtocol` (stamps this node's own transports into `replyTo` on
+  every outbound request). Excludes pairing and `UpdateChannelInfo`, which
+  already carry their own `supportedTransports` field.
 
 The motivating case for `replyTo` is replicas: when Replica A sends a
 request on a channel the helper paired with sibling Replica B, the
@@ -634,8 +647,7 @@ that you can retire as soon as the PrePair leg completes.
 
 The recommended pattern is: pair on the ephemeral URI, then — as soon
 as the pairing completes on the contact creator side — call
-`setOwnTransports` with the permanent endpoint (`setOwnTransport` is
-deprecated and removed at 0.0.5) and start an
+`setOwnTransports` with the permanent endpoint and start an
 `UpdateChannelInfo` flow against the peer to announce the swap. Once
 the peer acknowledges, retire the ephemeral URI. This keeps the
 plaintext PrePair window tight while letting subsequent traffic ride
@@ -650,6 +662,15 @@ enforces this: `start(FlowKind.ProtectSecret, ...)` throws when a
 target is still `Pending`. Treat verification as a required step in
 the pairing UX — a scanner that auto-pairs without it accepts a
 MITM-vulnerable replica.
+
+Until a device confirms, it ignores everything the peer sends on that
+channel: `process` changes no store, sends nothing back, and returns
+`{ type: "MessageIgnored", channel_id, reason: "PendingVerification",
+trace_id }`. This matters most for a replica destination. The source's own
+confirmation publishes the vault immediately, so that copy usually arrives
+before the destination's user has confirmed. Confirming does not replay it:
+once the destination's `verifyFingerprint` resolves `true`, call
+`start(FlowKind.ReplicaDiscovery)` to pull the copy from the source.
 
 ### The `derec.*` namespace in `communicationInfo` is library-owned
 

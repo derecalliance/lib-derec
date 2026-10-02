@@ -40,10 +40,6 @@ fn run_protocol_version_test() {
     println!("Protocol version test passed.");
 }
 
-// Touches the deprecated singular `transportProtocol`: this is the
-// compatibility path that keeps peers predating `supportedTransports`
-// working, so the warning is expected here rather than a defect.
-#[allow(deprecated)]
 fn run_pairing_flow_test() {
     println!("=== Pairing flow test ===");
 
@@ -68,9 +64,9 @@ fn run_pairing_flow_test() {
 
     let decoded_contact = contact_result.contact_message.clone();
     let transport = decoded_contact
-        .transport_protocol
-        .as_ref()
-        .expect("contact missing transport_protocol");
+        .supported_transports
+        .first()
+        .expect("contact missing supported_transports");
     assert_eq!(transport.uri, "https://example.com/alice");
     assert_eq!(transport.protocol(), Protocol::Https);
 
@@ -93,9 +89,9 @@ fn run_pairing_flow_test() {
 
     let initiator_tp = pair_req
         .initiator_contact_message
-        .transport_protocol
-        .as_ref()
-        .expect("initiator_contact_message should have transport_protocol");
+        .supported_transports
+        .first()
+        .expect("initiator_contact_message should have supported_transports");
     assert_eq!(initiator_tp.uri, "https://example.com/alice");
     assert_eq!(initiator_tp.protocol(), Protocol::Https);
 
@@ -106,6 +102,7 @@ fn run_pairing_flow_test() {
             .as_ref()
             .unwrap()
             .ecies_secret_key(),
+        None,
     )
     .expect("pair_request::extract failed");
 
@@ -136,6 +133,7 @@ fn run_pairing_flow_test() {
         &pair_req.initiator_contact_message,
         &extracted_response.response,
         &pair_req.secret_key,
+        None,
     )
     .expect("pair_response::process failed");
 
@@ -263,6 +261,7 @@ fn run_pairing_flow_hashed_keys_test() {
     let extracted_request = pair_request::extract(
         &pair_req.envelope,
         alice_secret.as_ref().unwrap().ecies_secret_key(),
+        None,
     )
     .expect("pair_request::extract failed");
 
@@ -284,6 +283,7 @@ fn run_pairing_flow_hashed_keys_test() {
         &pair_req.initiator_contact_message,
         &extracted_response.response,
         &pair_req.secret_key,
+        None,
     )
     .expect("pair_response::process failed");
 
@@ -692,14 +692,6 @@ fn run_request_reply_to_test() {
         vec![reply_to.clone()],
         "replyToTransports must round-trip on the inner request"
     );
-    #[allow(deprecated)]
-    {
-        assert_eq!(
-            extracted.request.reply_to,
-            Some(reply_to),
-            "the deprecated singular replyTo carries the list's first entry"
-        );
-    }
 
     let plain = disc_request::produce(channel_id, &shared_key, &[])
         .expect("disc_request::produce (no reply_to) failed");
@@ -709,14 +701,6 @@ fn run_request_reply_to_test() {
         plain_extracted.request.reply_to_transports.is_empty(),
         "an unset reply_to must decode as an empty list"
     );
-    #[allow(deprecated)]
-    {
-        assert!(
-            plain_extracted.request.reply_to.is_none(),
-            "an unset reply_to must leave the deprecated singular field absent, \
-             not present-and-empty — absent is what means 'route to the stored endpoints'"
-        );
-    }
 
     println!("Request reply_to round-trip test passed.");
 }

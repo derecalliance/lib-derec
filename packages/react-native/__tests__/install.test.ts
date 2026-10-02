@@ -1,4 +1,5 @@
 import { getNative } from '../src/native';
+import { generate_replica_id, protocol_version } from '../src';
 
 describe('native host object', () => {
   afterEach(() => {
@@ -14,7 +15,21 @@ describe('native host object', () => {
 
   it('returns the host object once installed', () => {
     // @ts-expect-error test-only global
-    globalThis.__DeRec = { version: () => '0.0.1-alpha.10' };
-    expect(getNative().version()).toBe('0.0.1-alpha.10');
+    globalThis.__DeRec = { version: () => ({ major: 0, minor: 0 }) };
+    expect(getNative().version()).toEqual({ major: 0, minor: 0 });
+  });
+
+  // The host reports the core's protocol version as two numbers; the package
+  // entry hands them through unchanged, with no parsing or formatting here.
+  it('protocol_version forwards the host major/minor', () => {
+    // @ts-expect-error test-only global
+    globalThis.__DeRec = { version: () => ({ major: 3, minor: 7 }) };
+    expect(protocol_version()).toEqual({ major: 3, minor: 7 });
+  });
+
+  it('generate_replica_id forwards the host bigint', () => {
+    // @ts-expect-error test-only global
+    globalThis.__DeRec = { generate_replica_id: () => 0x1234_5678_9abc_def0n };
+    expect(generate_replica_id()).toBe(0x1234_5678_9abc_def0n);
   });
 });

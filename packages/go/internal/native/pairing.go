@@ -15,6 +15,16 @@ type createContactMessageResult struct {
 	SecretKeyMaterial DeRecBuffer
 }
 
+type encodeContactMessageResult struct {
+	Error     DeRecError
+	WireBytes DeRecBuffer
+}
+
+type decodeContactMessageResult struct {
+	Error       DeRecError
+	ContactJSON DeRecBuffer
+}
+
 type producePairRequestMessageResult struct {
 	Error                            DeRecError
 	RequestWireBytes                 DeRecBuffer
@@ -70,6 +80,17 @@ type extractPrePairResponseResult struct {
 	ResponseProtoBytes DeRecBuffer
 }
 
+type producePrePairNoKeysResponseMessageResult struct {
+	Error             DeRecError
+	EnvelopeWireBytes DeRecBuffer
+	SecretKeyMaterial DeRecBuffer
+}
+
+type pairingFingerprintResult struct {
+	Error       DeRecError
+	Fingerprint *byte
+}
+
 type processPrePairResponseMessageResult struct {
 	Error                 DeRecError
 	MlkemEncapsulationKey DeRecBuffer
@@ -83,8 +104,11 @@ var (
 		transportProtocol *byte, transportProtocolLen uintptr,
 		hasNonce uint32, nonce uint64) createContactMessageResult
 
-	validateContactOnce sync.Once
-	validateContactFn   func(contactMessage *byte, contactMessageLen uintptr) DeRecError
+	encodeContactOnce sync.Once
+	encodeContactFn   func(contactJSON *byte, contactJSONLen uintptr) encodeContactMessageResult
+
+	decodeContactOnce sync.Once
+	decodeContactFn   func(contactWire *byte, contactWireLen uintptr) decodeContactMessageResult
 
 	producePairRequestOnce sync.Once
 	producePairRequestFn   func(senderKind int32,
@@ -95,7 +119,8 @@ var (
 
 	extractPairReqOnce sync.Once
 	extractPairReqFn   func(request *byte, requestLen uintptr,
-		secretKeyMaterial *byte, secretKeyMaterialLen uintptr) extractPairRequestResult
+		secretKeyMaterial *byte, secretKeyMaterialLen uintptr,
+		parameterRange *byte, parameterRangeLen uintptr) extractPairRequestResult
 
 	producePairResponseOnce sync.Once
 	producePairResponseFn   func(channelID uint64,
@@ -112,7 +137,8 @@ var (
 	processPairRespOnce sync.Once
 	processPairRespFn   func(contactMessage *byte, contactMessageLen uintptr,
 		responseProto *byte, responseProtoLen uintptr,
-		secretKeyMaterial *byte, secretKeyMaterialLen uintptr) processPairResponseMessageResult
+		secretKeyMaterial *byte, secretKeyMaterialLen uintptr,
+		parameterRange *byte, parameterRangeLen uintptr) processPairResponseMessageResult
 
 	producePrePairRequestOnce sync.Once
 	producePrePairRequestFn   func(transportProtocol *byte, transportProtocolLen uintptr,
@@ -132,16 +158,27 @@ var (
 	processPrePairRespOnce sync.Once
 	processPrePairRespFn   func(contactMessage *byte, contactMessageLen uintptr,
 		responseProto *byte, responseProtoLen uintptr) processPrePairResponseMessageResult
+
+	producePrePairNoKeysResponseOnce sync.Once
+	producePrePairNoKeysResponseFn   func(channelID uint64,
+		requestProto *byte, requestProtoLen uintptr) producePrePairNoKeysResponseMessageResult
+
+	processPrePairNoKeysRespOnce sync.Once
+	processPrePairNoKeysRespFn   func(contactMessage *byte, contactMessageLen uintptr,
+		responseProto *byte, responseProtoLen uintptr) processPrePairResponseMessageResult
+
+	pairingFingerprintOnce sync.Once
+	pairingFingerprintFn   func(sharedKey *byte, sharedKeyLen uintptr) pairingFingerprintResult
 )
 
 // CreateContact builds an out-of-band ContactMessage bootstrapping pairing on
 // channelID, advertising transportProtocols: a length-delimited sequence of
 // serialized TransportProtocol protos (each entry preceded by its varint byte
-// length), in this application's preference order. The first entry also fills
-// the legacy singular field for peers predating the offer list. nonce == nil lets the library generate a fresh random nonce. Returns
-// the encoded ContactMessage wire bytes and (for INLINE_KEYS / HASHED_KEYS
-// contactMode) the opaque pairing secret key material to feed back into
-// ExtractPairRequest / ProducePairResponse.
+// length), in this application's preference order. nonce == nil lets the
+// library generate a fresh random nonce. Returns the encoded ContactMessage
+// wire bytes and (for INLINE_KEYS / HASHED_KEYS contactMode) the opaque
+// pairing secret key material to feed back into ExtractPairRequest /
+// ProducePairResponse.
 func CreateContact(channelID uint64, contactMode int32, transportProtocol []byte, nonce *uint64) ([]byte, []byte, error) {
 	createContactOnce.Do(func() {
 		purego.RegisterFunc(&createContactFn, symbol("create_contact_message"))
@@ -161,14 +198,32 @@ func CreateContact(channelID uint64, contactMode int32, transportProtocol []byte
 	return bytesFromBuffer(res.ContactWireBytes), bytesFromBuffer(res.SecretKeyMaterial), nil
 }
 
-// ValidateContact structurally validates proto-encoded ContactMessage bytes
-// against the per-contactMode field-presence invariants.
-func ValidateContact(contactMessage []byte) error {
-	validateContactOnce.Do(func() {
-		purego.RegisterFunc(&validateContactFn, symbol("validate_contact_message"))
+// EncodeContact turns contactJSON, the JSON shape encode_contact_message
+// reads, into the ContactMessage wire bytes delivered out of band. The core
+// refuses a contact that violates the invariants of its contact mode.
+func EncodeContact(contactJSON []byte) ([]byte, error) {
+	encodeContactOnce.Do(func() {
+		purego.RegisterFunc(&encodeContactFn, symbol("encode_contact_message"))
 	})
-	res := validateContactFn(bytePtr(contactMessage), uintptr(len(contactMessage)))
-	return errorFrom(res)
+	res := encodeContactFn(bytePtr(contactJSON), uintptr(len(contactJSON)))
+	if err := errorFrom(res.Error); err != nil {
+		return nil, err
+	}
+	return bytesFromBuffer(res.WireBytes), nil
+}
+
+// DecodeContact turns out-of-band ContactMessage wire bytes into the JSON
+// shape decode_contact_message writes. The core refuses bytes that are not a
+// contact, or a contact that violates the invariants of its contact mode.
+func DecodeContact(contactWire []byte) ([]byte, error) {
+	decodeContactOnce.Do(func() {
+		purego.RegisterFunc(&decodeContactFn, symbol("decode_contact_message"))
+	})
+	res := decodeContactFn(bytePtr(contactWire), uintptr(len(contactWire)))
+	if err := errorFrom(res.Error); err != nil {
+		return nil, err
+	}
+	return bytesFromBuffer(res.ContactJSON), nil
 }
 
 // ProducePairRequest builds a pairing request envelope addressed to the
@@ -199,13 +254,16 @@ func ProducePairRequest(senderKind int32, transportProtocol, contactMessage, com
 // ExtractPairRequest decrypts a pairing request envelope using
 // secretKeyMaterial (the contact creator's opaque pairing secret key
 // material) and returns its channel id and inner PairRequestMessage proto
-// bytes for chaining into ProducePairResponse.
-func ExtractPairRequest(request, secretKeyMaterial []byte) (uint64, []byte, error) {
+// bytes for chaining into ProducePairResponse. parameterRange is the
+// optional serialized ParameterRange this side accepts (nil for none); a
+// request whose range does not overlap it is refused.
+func ExtractPairRequest(request, secretKeyMaterial, parameterRange []byte) (uint64, []byte, error) {
 	extractPairReqOnce.Do(func() {
 		purego.RegisterFunc(&extractPairReqFn, symbol("extract_pair_request"))
 	})
 	res := extractPairReqFn(bytePtr(request), uintptr(len(request)),
-		bytePtr(secretKeyMaterial), uintptr(len(secretKeyMaterial)))
+		bytePtr(secretKeyMaterial), uintptr(len(secretKeyMaterial)),
+		bytePtr(parameterRange), uintptr(len(parameterRange)))
 	if err := errorFrom(res.Error); err != nil {
 		return 0, nil, err
 	}
@@ -267,13 +325,17 @@ func ExtractPairResponse(response, secretKeyMaterial []byte) (uint64, []byte, er
 // returned by ExtractPairResponse) against contactMessage (the initiator
 // ContactMessage wire bytes returned by ProducePairRequest), derives the
 // pairing shared key, and returns the validated rekeyed channel id.
-func ProcessPairResponse(contactMessage, responseProto, secretKeyMaterial []byte) ([]byte, uint64, error) {
+// parameterRange is the optional serialized ParameterRange this side accepts
+// (nil for none); a response whose range does not overlap it is refused
+// before any key is derived.
+func ProcessPairResponse(contactMessage, responseProto, secretKeyMaterial, parameterRange []byte) ([]byte, uint64, error) {
 	processPairRespOnce.Do(func() {
 		purego.RegisterFunc(&processPairRespFn, symbol("process_pair_response_message"))
 	})
 	res := processPairRespFn(bytePtr(contactMessage), uintptr(len(contactMessage)),
 		bytePtr(responseProto), uintptr(len(responseProto)),
-		bytePtr(secretKeyMaterial), uintptr(len(secretKeyMaterial)))
+		bytePtr(secretKeyMaterial), uintptr(len(secretKeyMaterial)),
+		bytePtr(parameterRange), uintptr(len(parameterRange)))
 	if err := errorFrom(res.Error); err != nil {
 		return nil, 0, err
 	}
@@ -285,9 +347,8 @@ func ProcessPairResponse(contactMessage, responseProto, secretKeyMaterial []byte
 // contact), sent by a scanner reachable at transportProtocols: a
 // length-delimited sequence of serialized TransportProtocol protos (each
 // entry preceded by its varint byte length), in the scanner's own
-// preference order. The first entry also fills the deprecated singular
-// field for peers predating the list. Because the envelope carries no
-// shared key yet, these MUST be ephemeral endpoints.
+// preference order. Because the envelope carries no shared key yet, these
+// MUST be ephemeral endpoints.
 func ProducePrePairRequest(transportProtocols, contactMessage []byte) ([]byte, error) {
 	producePrePairRequestOnce.Do(func() {
 		purego.RegisterFunc(&producePrePairRequestFn, symbol("produce_pre_pair_request_message"))
@@ -364,6 +425,56 @@ func ProcessPrePairResponse(contactMessage, responseProto []byte) (mlkemEncapsul
 		return nil, nil, 0, e
 	}
 	return bytesFromBuffer(res.MlkemEncapsulationKey), bytesFromBuffer(res.EciesPublicKey), res.Nonce, nil
+}
+
+// ProducePrePairNoKeysResponse is the contact-creator side of a NO_KEYS
+// pairing: it generates fresh key material and builds a plaintext PrePair
+// response envelope publishing its public keys, acknowledging requestProto
+// (the RequestProtoBytes returned by ExtractPrePairRequest). The caller MUST
+// first match the request's nonce against the contact it issued, and MUST
+// persist the returned secret key material: the pair request that follows
+// is encrypted to it.
+func ProducePrePairNoKeysResponse(channelID uint64, requestProto []byte) (envelope, secretKeyMaterial []byte, err error) {
+	producePrePairNoKeysResponseOnce.Do(func() {
+		purego.RegisterFunc(&producePrePairNoKeysResponseFn, symbol("produce_pre_pair_no_keys_response_message"))
+	})
+	res := producePrePairNoKeysResponseFn(channelID,
+		bytePtr(requestProto), uintptr(len(requestProto)))
+	if e := errorFrom(res.Error); e != nil {
+		return nil, nil, e
+	}
+	return bytesFromBuffer(res.EnvelopeWireBytes), bytesFromBuffer(res.SecretKeyMaterial), nil
+}
+
+// ProcessPrePairNoKeysResponse is the scanner side of a NO_KEYS pairing: it
+// accepts the public keys in responseProto (the ResponseProtoBytes returned
+// by ExtractPrePairResponse) for contactMessage, returning them with the
+// echoed nonce. Nothing binds these keys to the contact, so the resulting
+// pairing MUST be confirmed by comparing PairingFingerprint out of band.
+func ProcessPrePairNoKeysResponse(contactMessage, responseProto []byte) (mlkemEncapsulationKey, eciesPublicKey []byte, nonce uint64, err error) {
+	processPrePairNoKeysRespOnce.Do(func() {
+		purego.RegisterFunc(&processPrePairNoKeysRespFn, symbol("process_pre_pair_no_keys_response_message"))
+	})
+	res := processPrePairNoKeysRespFn(
+		bytePtr(contactMessage), uintptr(len(contactMessage)),
+		bytePtr(responseProto), uintptr(len(responseProto)))
+	if e := errorFrom(res.Error); e != nil {
+		return nil, nil, 0, e
+	}
+	return bytesFromBuffer(res.MlkemEncapsulationKey), bytesFromBuffer(res.EciesPublicKey), res.Nonce, nil
+}
+
+// PairingFingerprint returns the human-readable fingerprint of a pairing's
+// sharedKey, the same value the protocol's GetFingerprint derives.
+func PairingFingerprint(sharedKey []byte) (string, error) {
+	pairingFingerprintOnce.Do(func() {
+		purego.RegisterFunc(&pairingFingerprintFn, symbol("pairing_fingerprint"))
+	})
+	res := pairingFingerprintFn(bytePtr(sharedKey), uintptr(len(sharedKey)))
+	if err := errorFrom(res.Error); err != nil {
+		return "", err
+	}
+	return stringFromCString(res.Fingerprint), nil
 }
 
 // boolToUint32 maps a Go bool onto the C ABI's uint32 flag convention.

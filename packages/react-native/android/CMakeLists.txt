@@ -14,7 +14,7 @@ find_package(fbjni REQUIRED CONFIG)
 
 # Non-recursive on purpose: `cpp/tests/` holds the host-only test harness,
 # which must not be compiled into the device library.
-file(GLOB DEREC_CPP_SOURCES "${CMAKE_SOURCE_DIR}/../cpp/*.cpp")
+file(GLOB DEREC_CPP_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/../cpp/*.cpp")
 
 add_library(derec_jsi SHARED
   ${DEREC_CPP_SOURCES}

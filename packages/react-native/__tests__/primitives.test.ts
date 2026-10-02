@@ -98,6 +98,7 @@ describe('message marshalling', () => {
     const { request } = primitives.pairing.request.extract(
       new Uint8Array([9]),
       new Uint8Array(32),
+      null,
     );
 
     expect(find('decode_message_json').args[0]).toBe(MessageKind.PairRequest);
@@ -107,6 +108,48 @@ describe('message marshalling', () => {
     // `request_proto_bytes` is an implementation detail of the C ABI and must
     // not leak into the typed surface.
     expect((request as unknown as Record<string, unknown>).request_proto_bytes).toBeUndefined();
+  });
+
+  // Parameter-range compatibility is decided in the core; the binding only
+  // forwards the caller's range, and an absent one as an empty buffer.
+  it('forwards the local parameter range to extract and process', () => {
+    const range = {
+      min_share_size: 1n,
+      max_share_size: 2n,
+      min_time_between_verifications: 0n,
+      max_time_between_verifications: 0n,
+      min_time_between_share_updates: 0n,
+      max_time_between_share_updates: 0n,
+      min_unresponsive_deletion_timeout: 0n,
+      max_unresponsive_deletion_timeout: 0n,
+      min_unresponsive_deactivation_timeout: 0n,
+      max_unresponsive_deactivation_timeout: 0n,
+    };
+    replies.extract_pair_request = { request_proto_bytes: new Uint8Array().buffer };
+    replies.process_pair_response_message = {
+      shared_key: new Uint8Array(32).buffer,
+      channel_id: 1n,
+    };
+
+    primitives.pairing.request.extract(new Uint8Array([9]), new Uint8Array(32), range);
+    const extract = find('extract_pair_request');
+    expect(extract.args).toHaveLength(3);
+    expect(Array.from(extract.args[2] as Uint8Array)).toEqual([0xaa]);
+    expect(
+      calls.some(
+        (c) => c.name === 'encode_message_json' && c.args[0] === MessageKind.ParameterRange,
+      ),
+    ).toBe(true);
+
+    primitives.pairing.response.process(
+      { channel_id: 1n, nonce: 2n, contact_mode: 0, supported_transports: [] } as never,
+      { nonce: 2n } as never,
+      new Uint8Array(32),
+      null,
+    );
+    const process = find('process_pair_response_message');
+    expect(process.args).toHaveLength(4);
+    expect((process.args[3] as Uint8Array).length).toBe(0);
   });
 
   it('selects the right message kind for each extract', () => {
@@ -161,5 +204,100 @@ describe('contact codec', () => {
     } as never);
     expect(find('encode_contact_message')).toBeDefined();
     expect(calls.some((c) => c.name === 'encode_message_json')).toBe(false);
+  });
+});
+
+describe('create_contact nonce', () => {
+  // The C entry point carries `Option<u64>` as a presence flag plus a value.
+  // A NoKeys contact is useless without the caller's nonce, so it has to
+  // reach the host rather than be replaced by a library-generated one.
+  beforeEach(() => {
+    replies.create_contact_message = {
+      contact_wire_bytes: new ArrayBuffer(0),
+      secret_key_material: new ArrayBuffer(0),
+    };
+    replies.decode_contact_message = utf8(
+      JSON.stringify({ channel_id: '3', contact_mode: 2, nonce: '424242' }),
+    ).buffer;
+  });
+
+  it('forwards an explicit nonce with the presence flag set', () => {
+    primitives.pairing.request.create_contact(3n, 2, [], 424242n);
+    const { args } = find('create_contact_message');
+    expect(args[3]).toBe(1);
+    expect(args[4]).toBe(424242n);
+  });
+
+  it('clears the presence flag when no nonce is given', () => {
+    primitives.pairing.request.create_contact(3n, 2, []);
+    const { args } = find('create_contact_message');
+    expect(args[3]).toBe(0);
+  });
+
+  it('clears the presence flag for a null nonce', () => {
+    primitives.pairing.request.create_contact(3n, 2, [], null);
+    const { args } = find('create_contact_message');
+    expect(args[3]).toBe(0);
+  });
+});
+
+describe('NoKeys pre-pair and fingerprint', () => {
+  it('exposes the same pairing and pairing.response keys', () => {
+    expect(Object.keys(primitives.pairing).sort()).toEqual(
+      ['fingerprint', 'request', 'response'].sort(),
+    );
+    expect(Object.keys(primitives.pairing.response).sort()).toEqual(
+      [
+        'produce',
+        'extract',
+        'process',
+        'produce_pre_pair',
+        'extract_pre_pair',
+        'process_pre_pair',
+        'produce_pre_pair_no_keys',
+        'process_pre_pair_no_keys',
+      ].sort(),
+    );
+  });
+
+  it('forwards produce_pre_pair_no_keys and surfaces both buffers', () => {
+    replies.produce_pre_pair_no_keys_response_message = {
+      envelope_wire_bytes: new Uint8Array([1, 2]).buffer,
+      secret_key_material: new Uint8Array([3, 4, 5]).buffer,
+    };
+    const result = primitives.pairing.response.produce_pre_pair_no_keys(7n, {
+      nonce: 9n,
+    } as never);
+    const { args } = find('produce_pre_pair_no_keys_response_message');
+    expect(args).toHaveLength(2);
+    expect(args[0]).toBe(7n);
+    expect(find('encode_message_json').args[0]).toBe(MessageKind.PrePairRequest);
+    expect(Array.from(result.envelope)).toEqual([1, 2]);
+    expect(Array.from(result.secret_key_material)).toEqual([3, 4, 5]);
+  });
+
+  it('forwards process_pre_pair_no_keys through the contact codec', () => {
+    replies.process_pre_pair_no_keys_response_message = {
+      mlkem_encapsulation_key: new Uint8Array([1]).buffer,
+      ecies_public_key: new Uint8Array([2]).buffer,
+      nonce: 424242n,
+    };
+    const result = primitives.pairing.response.process_pre_pair_no_keys(
+      { channel_id: 3n, contact_mode: 2, nonce: 424242n } as never,
+      { nonce: 424242n } as never,
+    );
+    expect(find('encode_contact_message')).toBeDefined();
+    expect(find('encode_message_json').args[0]).toBe(MessageKind.PrePairResponse);
+    expect(find('process_pre_pair_no_keys_response_message').args).toHaveLength(2);
+    expect(Array.from(result.mlkem_encapsulation_key)).toEqual([1]);
+    expect(Array.from(result.ecies_public_key)).toEqual([2]);
+    expect(result.nonce).toBe(424242n);
+  });
+
+  it('forwards the shared key to pairing_fingerprint and returns its string', () => {
+    replies.pairing_fingerprint = 'ABCD-EFGH';
+    const key = new Uint8Array(32).fill(1);
+    expect(primitives.pairing.fingerprint(key)).toBe('ABCD-EFGH');
+    expect(find('pairing_fingerprint').args).toEqual([key]);
   });
 });

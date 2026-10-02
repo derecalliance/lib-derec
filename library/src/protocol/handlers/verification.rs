@@ -419,8 +419,7 @@ async fn dispatch_one<S: StoreSet>(
     let msg =
         produce_verify_share_request_message(channel_id, secret_id, version, shared_key, reply_to)?;
 
-    let (legacy_reply_to, reply_to_transports) =
-        crate::extensions::advertised_endpoints::split_reply_to(reply_to);
+    let reply_to_transports = reply_to.to_vec();
 
     stores
         .state
@@ -428,17 +427,11 @@ async fn dispatch_one<S: StoreSet>(
             secret_id,
             StateItem::PendingVerification {
                 channel_id,
-                // Populating the deprecated singular field is the
-                // compatibility path that keeps peers predating
-                // `replyToTransports` answerable, so the warning is expected
-                // here.
-                #[allow(deprecated)]
                 request: derec_proto::VerifyShareRequestMessage {
                     secret_id,
                     version,
                     nonce: msg.nonce,
                     timestamp: None,
-                    reply_to: legacy_reply_to,
                     reply_to_transports,
                 },
             },

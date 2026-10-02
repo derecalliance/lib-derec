@@ -46,6 +46,22 @@ pub(crate) trait ContactMessageExt {
     /// a mode the OOB channel wasn't trusted for.
     fn validate(&self) -> Result<(), crate::Error>;
 
+    /// [`Self::validate`], plus the declared `contact_mode` must be the one
+    /// the calling flow expects. A pairing step that accepts only one mode
+    /// checks it here, so a contact whose `contact_mode` was altered between
+    /// the out-of-band exchange and this point is refused rather than
+    /// handled as another mode:
+    ///
+    /// - producing a pair request requires [`ContactMode::InlineKeys`]: the
+    ///   responder needs the keys inline;
+    /// - producing a PrePair request, and processing a PrePair response for a
+    ///   hashed contact, require [`ContactMode::HashedKeys`]: the keys are
+    ///   fetched and checked against the binding hash;
+    /// - processing a PrePair response for a no-keys contact requires
+    ///   [`ContactMode::NoKeys`]: no key material and no commitment, trust
+    ///   rests on the out-of-band channel alone.
+    fn validate_for_mode(&self, expected: ContactMode) -> Result<(), crate::Error>;
+
     /// Returns `true` when this contact's mode requires a `PrePairRequest`
     /// round-trip before the responder can produce a `PairRequestMessage`.
     ///
@@ -62,13 +78,8 @@ pub(crate) trait ContactMessageExt {
     /// the given ML-KEM + ECIES public key material verbatim.
     ///
     /// `own` is every endpoint the contact creator serves, in its own
-    /// preference order. It fills `supported_transports` wholesale, and
-    /// its first entry also fills the legacy singular
-    /// `transport_protocol` so peers predating the offer list still find
-    /// an endpoint. Deriving the singular field here rather than taking
-    /// it as a second argument is what keeps the two from disagreeing.
-    /// An empty `own` yields an absent singular field; callers reject
-    /// that case before constructing a contact.
+    /// preference order. It fills `supported_transports` wholesale; callers
+    /// reject an empty `own` before constructing a contact.
     ///
     /// Timestamp is stamped with the current wall-clock; callers that
     /// need deterministic timestamps must construct the proto struct
@@ -86,8 +97,7 @@ pub(crate) trait ContactMessageExt {
     /// || u64_be(channel_id))` so the scanner can verify keys received
     /// later via `PrePair` against the commitment.
     ///
-    /// `own` is outside the binding hash, exactly like the singular
-    /// field derived from it.
+    /// `own` is outside the binding hash.
     ///
     /// Timestamp is stamped with the current wall-clock.
     fn hashed_keys(
@@ -114,8 +124,6 @@ pub(crate) trait ContactMessageExt {
 }
 
 impl ContactMessageExt for ContactMessage {
-    // Compatibility, not oversight — see the `transport` module docs.
-    #[allow(deprecated)]
     fn validate(&self) -> Result<(), crate::Error> {
         let mode = ContactMode::try_from(self.contact_mode).map_err(|_| {
             #[cfg(feature = "logging")]
@@ -141,77 +149,19 @@ impl ContactMessageExt for ContactMessage {
 
         match mode {
             ContactMode::InlineKeys => {
-                if !mlkem_present {
-                    return Err(PairingError::InvalidContactMessage(
-                        "inline_keys contact missing mlkem_encapsulation_key",
-                    )
-                    .into());
-                }
-                if !ecies_present {
-                    return Err(PairingError::InvalidContactMessage(
-                        "inline_keys contact missing ecies_public_key",
-                    )
-                    .into());
-                }
-                if hash_present {
-                    return Err(PairingError::InvalidContactMessage(
-                        "inline_keys contact must not carry contact_binding_hash",
-                    )
-                    .into());
-                }
+                check_inline_keys_fields(mlkem_present, ecies_present, hash_present)?
             }
-            ContactMode::HashedKeys => {
-                if mlkem_present || ecies_present {
-                    return Err(PairingError::InvalidContactMessage(
-                        "hashed_keys contact must not carry inline keys",
-                    )
-                    .into());
-                }
-                const BINDING_HASH_LEN: usize = 48;
-                let hash = self.contact_binding_hash.as_ref().ok_or(
-                    PairingError::InvalidContactMessage(
-                        "hashed_keys contact missing contact_binding_hash",
-                    ),
-                )?;
-                if hash.is_empty() {
-                    return Err(PairingError::InvalidContactMessage(
-                        "hashed_keys contact missing contact_binding_hash",
-                    )
-                    .into());
-                }
-                if hash.len() != BINDING_HASH_LEN {
-                    return Err(PairingError::InvalidContactMessage(
-                        "hashed_keys contact_binding_hash is not a SHA-384 digest",
-                    )
-                    .into());
-                }
-            }
+            ContactMode::HashedKeys => check_hashed_keys_fields(
+                mlkem_present,
+                ecies_present,
+                self.contact_binding_hash.as_deref(),
+            )?,
             ContactMode::NoKeys => {
-                if mlkem_present || ecies_present {
-                    return Err(PairingError::InvalidContactMessage(
-                        "no_keys contact must not carry inline keys",
-                    )
-                    .into());
-                }
-                if hash_present {
-                    return Err(PairingError::InvalidContactMessage(
-                        "no_keys contact must not carry contact_binding_hash",
-                    )
-                    .into());
-                }
+                check_no_keys_fields(mlkem_present, ecies_present, hash_present)?
             }
         }
 
-        // A contact naming no endpoint at all gives the scanner nowhere to
-        // send the pair request. Either spelling satisfies this: the list,
-        // or the deprecated singular field a peer predating it fills.
-        let has_offers = !self.supported_transports.is_empty();
-        let has_singular = self
-            .transport_protocol
-            .as_ref()
-            .is_some_and(|tp| !tp.uri.trim().is_empty());
-
-        if !has_offers && !has_singular {
+        if self.supported_transports.is_empty() {
             #[cfg(feature = "logging")]
             tracing::warn!("contact advertises no usable transport endpoint");
 
@@ -221,13 +171,31 @@ impl ContactMessageExt for ContactMessage {
         Ok(())
     }
 
+    fn validate_for_mode(&self, expected: ContactMode) -> Result<(), crate::Error> {
+        if self.contact_mode != expected as i32 {
+            #[cfg(feature = "logging")]
+            tracing::warn!(
+                contact_mode = self.contact_mode,
+                expected = expected as i32,
+                "contact_mode mismatch"
+            );
+
+            return Err(PairingError::InvalidContactMessage(match expected {
+                ContactMode::InlineKeys => "expected INLINE_KEYS contact mode",
+                ContactMode::HashedKeys => "expected HASHED_KEYS contact mode",
+                ContactMode::NoKeys => "expected NO_KEYS contact mode",
+            })
+            .into());
+        }
+
+        self.validate()
+    }
+
     fn requires_pre_pair(&self) -> bool {
         self.contact_mode == ContactMode::HashedKeys as i32
             || self.contact_mode == ContactMode::NoKeys as i32
     }
 
-    // Compatibility, not oversight — see the `transport` module docs.
-    #[allow(deprecated)]
     fn inline_keys(
         channel_id: ChannelId,
         nonce: u64,
@@ -236,7 +204,6 @@ impl ContactMessageExt for ContactMessage {
     ) -> ContactMessage {
         ContactMessage {
             channel_id: channel_id.into(),
-            transport_protocol: own.first().cloned(),
             contact_mode: ContactMode::InlineKeys as i32,
             mlkem_encapsulation_key: Some(pk.mlkem_encapsulation_key),
             ecies_public_key: Some(pk.ecies_public_key),
@@ -247,8 +214,6 @@ impl ContactMessageExt for ContactMessage {
         }
     }
 
-    // Compatibility, not oversight — see the `transport` module docs.
-    #[allow(deprecated)]
     fn hashed_keys(
         channel_id: ChannelId,
         nonce: u64,
@@ -264,7 +229,6 @@ impl ContactMessageExt for ContactMessage {
 
         ContactMessage {
             channel_id: channel_id.into(),
-            transport_protocol: own.first().cloned(),
             contact_mode: ContactMode::HashedKeys as i32,
             mlkem_encapsulation_key: None,
             ecies_public_key: None,
@@ -275,12 +239,9 @@ impl ContactMessageExt for ContactMessage {
         }
     }
 
-    // Compatibility, not oversight — see the `transport` module docs.
-    #[allow(deprecated)]
     fn no_keys(channel_id: ChannelId, nonce: u64, own: Vec<TransportProtocol>) -> ContactMessage {
         ContactMessage {
             channel_id: channel_id.into(),
-            transport_protocol: own.first().cloned(),
             contact_mode: ContactMode::NoKeys as i32,
             mlkem_encapsulation_key: None,
             ecies_public_key: None,
@@ -290,6 +251,79 @@ impl ContactMessageExt for ContactMessage {
             supported_transports: own,
         }
     }
+}
+
+/// [`ContactMode::InlineKeys`]: both keys inline, no binding hash.
+fn check_inline_keys_fields(
+    mlkem_present: bool,
+    ecies_present: bool,
+    hash_present: bool,
+) -> Result<(), crate::Error> {
+    if !mlkem_present {
+        return Err(PairingError::InvalidContactMessage(
+            "inline_keys contact missing mlkem_encapsulation_key",
+        )
+        .into());
+    }
+    if !ecies_present {
+        return Err(PairingError::InvalidContactMessage(
+            "inline_keys contact missing ecies_public_key",
+        )
+        .into());
+    }
+    if hash_present {
+        return Err(PairingError::InvalidContactMessage(
+            "inline_keys contact must not carry contact_binding_hash",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// [`ContactMode::HashedKeys`]: no inline keys, and a SHA-384 binding hash.
+fn check_hashed_keys_fields(
+    mlkem_present: bool,
+    ecies_present: bool,
+    contact_binding_hash: Option<&[u8]>,
+) -> Result<(), crate::Error> {
+    const BINDING_HASH_LEN: usize = 48;
+    if mlkem_present || ecies_present {
+        return Err(PairingError::InvalidContactMessage(
+            "hashed_keys contact must not carry inline keys",
+        )
+        .into());
+    }
+    let hash = contact_binding_hash.filter(|h| !h.is_empty()).ok_or(
+        PairingError::InvalidContactMessage("hashed_keys contact missing contact_binding_hash"),
+    )?;
+    if hash.len() != BINDING_HASH_LEN {
+        return Err(PairingError::InvalidContactMessage(
+            "hashed_keys contact_binding_hash is not a SHA-384 digest",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// [`ContactMode::NoKeys`]: no key material and no binding hash.
+fn check_no_keys_fields(
+    mlkem_present: bool,
+    ecies_present: bool,
+    hash_present: bool,
+) -> Result<(), crate::Error> {
+    if mlkem_present || ecies_present {
+        return Err(PairingError::InvalidContactMessage(
+            "no_keys contact must not carry inline keys",
+        )
+        .into());
+    }
+    if hash_present {
+        return Err(PairingError::InvalidContactMessage(
+            "no_keys contact must not carry contact_binding_hash",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -303,60 +337,51 @@ mod tests {
         Timestamp { seconds, nanos: 0 }
     }
 
-    // Compatibility, not oversight — see the `transport` module docs.
-    #[allow(deprecated)]
     fn well_formed_inline_keys_contact() -> ContactMessage {
         ContactMessage {
             channel_id: 42,
-            transport_protocol: Some(TransportProtocol {
-                uri: "https://relay.example/alice".to_owned(),
-                protocol: Protocol::Https.into(),
-            }),
             contact_mode: ContactMode::InlineKeys as i32,
             mlkem_encapsulation_key: Some(vec![1; 1184]),
             ecies_public_key: Some(vec![2; 33]),
             contact_binding_hash: None,
             nonce: 0xCAFE_BABE,
             timestamp: Some(ts(1_700_000_000)),
-            supported_transports: Vec::new(),
+            supported_transports: vec![TransportProtocol {
+                uri: "https://relay.example/alice".to_owned(),
+                protocol: Protocol::Https.into(),
+            }],
         }
     }
 
-    // Compatibility, not oversight — see the `transport` module docs.
-    #[allow(deprecated)]
     fn well_formed_hashed_keys_contact() -> ContactMessage {
         ContactMessage {
             channel_id: 42,
-            transport_protocol: Some(TransportProtocol {
-                uri: "https://relay.example/alice/ephemeral".to_owned(),
-                protocol: Protocol::Https.into(),
-            }),
             contact_mode: ContactMode::HashedKeys as i32,
             mlkem_encapsulation_key: None,
             ecies_public_key: None,
             contact_binding_hash: Some(vec![0xAB; 48]),
             nonce: 0xDEAD_BEEF,
             timestamp: Some(ts(1_700_000_000)),
-            supported_transports: Vec::new(),
+            supported_transports: vec![TransportProtocol {
+                uri: "https://relay.example/alice/ephemeral".to_owned(),
+                protocol: Protocol::Https.into(),
+            }],
         }
     }
 
-    // Compatibility, not oversight — see the `transport` module docs.
-    #[allow(deprecated)]
     fn well_formed_no_keys_contact() -> ContactMessage {
         ContactMessage {
             channel_id: 1234,
-            transport_protocol: Some(TransportProtocol {
-                uri: "https://institution.example/pair".to_owned(),
-                protocol: Protocol::Https.into(),
-            }),
             contact_mode: ContactMode::NoKeys as i32,
             mlkem_encapsulation_key: None,
             ecies_public_key: None,
             contact_binding_hash: None,
             nonce: 4321,
             timestamp: Some(ts(1_700_000_000)),
-            supported_transports: Vec::new(),
+            supported_transports: vec![TransportProtocol {
+                uri: "https://institution.example/pair".to_owned(),
+                protocol: Protocol::Https.into(),
+            }],
         }
     }
 

@@ -11,8 +11,8 @@ use derec_library::protocol::types::{
 use derec_library::protocol::{
     ChannelStoreFuture, DeRecChannelStore, DeRecEvent, DeRecFlow, DeRecProtocol,
     DeRecProtocolBuilder, DeRecSecretStore, DeRecShareStore, DeRecTransport, DeRecUserSecretStore,
-    ExpiredChannelCleanup, MissingPolicy, SecretKind, SecretStoreError, SecretStoreFuture,
-    SecretValue, Share, ShareStoreFuture, TransportFuture,
+    ExpiredChannelCleanup, IgnoreReason, MissingPolicy, SecretKind, SecretStoreError,
+    SecretStoreFuture, SecretValue, Share, ShareStoreFuture, TransportFuture,
 };
 use derec_library::types::{ChannelId, ReplicaId};
 use derec_proto::{Protocol, SenderKind, TransportProtocol};
@@ -32,6 +32,8 @@ pub async fn run_all() {
     run_sharing_flow().await;
     run_verification_flow().await;
     run_replica_mirror_then_verify_flow().await;
+    run_replica_roster_describes_every_member_flow().await;
+    run_unconfirmed_destination_ignores_the_copy_flow().await;
     run_replica_verifies_only_synced_versions_flow().await;
     run_discovery_and_recovery_flow().await;
     run_unpairing_flow().await;
@@ -1890,20 +1892,30 @@ async fn run_protect_secret_with_replica_targets_flow() {
             DeRecEvent::ReplicaSecretInstalled {
                 channel_id: c,
                 from_replica_id,
+                author_replica_id,
                 secret_id,
                 version: _,
                 secret,
                 shares,
-            } if *c == replica_channel => {
-                Some((*from_replica_id, *secret_id, secret.clone(), shares.clone()))
-            }
+            } if *c == replica_channel => Some((
+                *from_replica_id,
+                *author_replica_id,
+                *secret_id,
+                secret.clone(),
+                shares.clone(),
+            )),
             _ => None,
         })
         .expect("replica.process should emit ReplicaSecretInstalled on the first sync");
-    let (received_from, received_secret_id, received_secret, shares) = received;
+    let (received_from, received_author, received_secret_id, received_secret, shares) = received;
     assert_eq!(
         received_from, owner_id,
         "from_replica_id must be owner's id"
+    );
+    assert_eq!(
+        received_author,
+        Some(owner_id),
+        "the publisher is recorded as the version's author"
     );
     assert_eq!(received_secret_id, 0xC0FFEE, "secret_id mismatch");
     assert_eq!(
@@ -2302,6 +2314,91 @@ async fn run_verification_flow() {
 /// Two independent processes are what made the original report credible, and
 /// two independent `Peer`s with separate stores are what reproduce it here:
 /// the Destination reads back only what its own hydration wrote.
+async fn run_unconfirmed_destination_ignores_the_copy_flow() {
+    println!("=== Protocol unconfirmed replica destination flow test ===");
+
+    let mut source = Peer::with_secret_id_and_replica_id(
+        "source",
+        "https://source.example.com",
+        0xC0FFEE,
+        0x5050_5050_5050_5050,
+    );
+    let mut destination = Peer::with_replica_id(
+        "destination",
+        "https://destination.example.com",
+        0xDE57_DE57_DE57_DE57,
+    );
+
+    let replica_channel =
+        pair_replica_handshake(&mut source, &mut destination, ChannelId(31)).await;
+    let destination_fp = destination
+        .protocol
+        .get_fingerprint(replica_channel)
+        .await
+        .expect("destination fingerprint");
+    assert!(
+        source
+            .protocol
+            .verify_fingerprint(replica_channel, &destination_fp)
+            .await
+            .expect("source verify_fingerprint"),
+        "the source must accept the matching fingerprint"
+    );
+
+    let early = pump(&mut source, &mut destination).await;
+    assert!(
+        early.iter().any(|e| matches!(
+            e,
+            DeRecEvent::MessageIgnored {
+                channel_id,
+                reason: IgnoreReason::PendingVerification,
+                ..
+            } if *channel_id == replica_channel
+        )),
+        "a copy that arrives before the destination confirms must be ignored, got {early:?}"
+    );
+    assert!(
+        !early.iter().any(|e| matches!(
+            e,
+            DeRecEvent::ReplicaSecretInstalled { .. }
+                | DeRecEvent::ReplicaSecretReceived { .. }
+                | DeRecEvent::ReplicaSecretAcked { .. }
+        )),
+        "nothing may be installed or acknowledged before the destination confirms: {early:?}"
+    );
+    println!("  copy sent before the destination confirmed was ignored  ✓");
+
+    let source_fp = source
+        .protocol
+        .get_fingerprint(replica_channel)
+        .await
+        .expect("source fingerprint");
+    assert!(
+        destination
+            .protocol
+            .verify_fingerprint(replica_channel, &source_fp)
+            .await
+            .expect("destination verify_fingerprint"),
+        "the destination must accept the matching fingerprint"
+    );
+    destination
+        .protocol
+        .start(DeRecFlow::ReplicaDiscovery)
+        .await
+        .expect("destination start(ReplicaDiscovery) failed");
+    let catch_up = pump(&mut destination, &mut source).await;
+    assert!(
+        catch_up.iter().any(|e| matches!(
+            e,
+            DeRecEvent::ReplicaSecretInstalled { secret_id, .. } if *secret_id == 0xC0FFEE
+        )),
+        "after confirming, ReplicaDiscovery must install the copy under the source's secret id, got {catch_up:?}"
+    );
+    println!("  destination pulled the copy with ReplicaDiscovery after confirming  ✓");
+
+    println!("Protocol unconfirmed replica destination flow test passed.\n");
+}
+
 async fn run_replica_mirror_then_verify_flow() {
     println!("=== Protocol replica mirror-then-verify flow test ===");
 
@@ -2560,6 +2657,138 @@ async fn run_replica_mirror_then_verify_flow() {
 /// perfectly well. Asserted here because "the destination cannot verify" and
 /// "the destination cannot verify *this* version" look identical from an
 /// application's logs, and only the second one is correct.
+/// A published roster describes every member the same way — the device that
+/// published it included.
+///
+/// Each device advertises two endpoints and a name. A peer's row is recorded
+/// from what that peer advertised at pairing; the publisher's own row must
+/// carry the same: every endpoint, in preference order, and its
+/// `communication_info`. Anything rebuilding the group from a `Secret` —
+/// a destination adopting the copy, a device restoring — can otherwise
+/// neither name nor reach the member that wrote it.
+async fn run_replica_roster_describes_every_member_flow() {
+    println!("=== Protocol replica roster describes every member flow test ===");
+
+    let source_id = 0xCCCC_CCCC_CCCC_CCCCu64;
+    let destination_id = 0xDDDD_DDDD_DDDD_DDDDu64;
+
+    let identity = |label: &'static str, name: &str, replica_id: u64| {
+        let uri = format!("https://{label}.example.com");
+        let endpoints = vec![uri.clone(), format!("grpcs://{label}.example.com:443")];
+        let transport = InProcessTransport::new();
+        let protocol = DeRecProtocolBuilder::new(DEFAULT_TEST_SECRET_ID)
+            .with_channel_store(InMemoryChannelStore::default())
+            .with_share_store(InMemoryShareStore::default())
+            .with_secret_store(InMemorySecretStore::default())
+            .with_user_secret_store(InMemoryUserSecretStore::default())
+            .with_transport(transport.clone())
+            .with_state_store(InMemoryStateStore::default())
+            .with_own_transports(endpoints.iter().map(String::as_str).collect::<Vec<_>>())
+            .with_threshold(2)
+            .with_replica_id(replica_id)
+            .with_communication_info(HashMap::from([("name".to_owned(), name.to_owned())]))
+            .build()
+            .expect("test fixture: builder.build() should succeed");
+        let peer = Peer {
+            label,
+            uri,
+            protocol,
+            transport,
+        };
+        (peer, endpoints)
+    };
+    let (mut source, source_endpoints) = identity("roster-source", "Alice-1", source_id);
+    let (mut destination, destination_endpoints) =
+        identity("roster-destination", "Alice-2", destination_id);
+
+    let pairing_channel = ChannelId(0x0570);
+    let group_channel =
+        pair_replica_handshake(&mut source, &mut destination, pairing_channel).await;
+    cross_confirm_fingerprint(&mut source, &mut destination, group_channel).await;
+    let _ = pump_many(&mut [&mut source, &mut destination]).await;
+
+    source
+        .protocol
+        .start(DeRecFlow::ProtectSecret {
+            secrets: vec![UserSecret {
+                id: vec![1],
+                name: "roster secret".to_owned(),
+                data: b"roster-contents".to_vec(),
+            }],
+            description: None,
+        })
+        .await
+        .expect("source start(ProtectSecret) failed");
+    let events = pump_many(&mut [&mut source, &mut destination]).await;
+
+    let secret = events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            DeRecEvent::ReplicaSecretReceived { secret, .. }
+            | DeRecEvent::ReplicaSecretInstalled { secret, .. } => Some(secret.clone()),
+            _ => None,
+        })
+        .expect("the destination must receive the published secret");
+
+    let describe = |transports: &[TransportProtocol], info: &HashMap<String, String>| {
+        (
+            transports.iter().map(|t| t.uri.clone()).collect::<Vec<_>>(),
+            info.get("name").cloned(),
+        )
+    };
+    let expected = |endpoints: &[String], name: &str| (endpoints.to_vec(), Some(name.to_owned()));
+
+    let members = secret.replicas.expect("roster is present").members;
+    assert_eq!(
+        members.len(),
+        2,
+        "both members are published, got {members:?}"
+    );
+    for (replica_id, endpoints, name) in [
+        (source_id, &source_endpoints, "Alice-1"),
+        (destination_id, &destination_endpoints, "Alice-2"),
+    ] {
+        let member = members
+            .iter()
+            .find(|m| m.replica_id == replica_id)
+            .unwrap_or_else(|| panic!("member {replica_id:#x} missing from {members:?}"));
+        assert_eq!(
+            describe(&member.transports, &member.communication_info),
+            expected(endpoints, name),
+            "published row for {name}"
+        );
+    }
+    println!("  published roster names and reaches the writer as well as its peer  ✓");
+
+    // The destination now holds the group as the roster described it. Its
+    // record of the source must be as complete as its record of itself.
+    let destination_sid = destination.protocol.secret_id();
+    let stored = destination
+        .protocol
+        .channel_store
+        .replicas(destination_sid, ReplicaFilter::default())
+        .await
+        .expect("destination roster");
+    for (replica_id, endpoints, name) in [
+        (source_id, &source_endpoints, "Alice-1"),
+        (destination_id, &destination_endpoints, "Alice-2"),
+    ] {
+        let member = stored
+            .iter()
+            .find(|m| m.replica_id == ReplicaId(replica_id))
+            .unwrap_or_else(|| panic!("destination holds no row for {replica_id:#x}"));
+        assert_eq!(
+            describe(&member.transports, &member.communication_info),
+            expected(endpoints, name),
+            "destination's stored row for {name}"
+        );
+    }
+    println!("  destination stores every member, itself included, the same way  ✓");
+
+    println!("Protocol replica roster describes every member flow test passed.\n");
+}
+
 async fn run_replica_verifies_only_synced_versions_flow() {
     println!("=== Protocol replica verifies only synced versions flow ===");
 
@@ -3360,16 +3589,6 @@ async fn run_reply_to_flow() {
         req.reply_to_transports[0].uri, "https://owner-reply.example.com",
         "replyToTransports must lead with the owner's own_transport"
     );
-    // The deprecated singular field carries the first entry so a peer
-    // predating replyToTransports still has somewhere to answer.
-    #[allow(deprecated)]
-    {
-        assert_eq!(
-            req.reply_to.as_ref().map(|t| t.uri.as_str()),
-            Some("https://owner-reply.example.com"),
-            "the legacy replyTo must be the list's first entry, not its last"
-        );
-    }
 
     let phantom_uri = "https://phantom-replica.example.com";
     let timestamp = current_timestamp();
@@ -3377,10 +3596,8 @@ async fn run_reply_to_flow() {
         uri: phantom_uri.to_owned(),
         protocol: Protocol::Https.into(),
     };
-    #[allow(deprecated)]
     let crafted = GetSecretIdsVersionsRequestMessage {
         timestamp: Some(timestamp),
-        reply_to: Some(phantom.clone()),
         reply_to_transports: vec![phantom],
         // Owner ↔ helper exchange, so no member names itself.
         replica_id: None,
@@ -4734,27 +4951,6 @@ async fn run_own_transport_set_rules() {
     let mut protocol = build(&["https://a.example", "grpcs://a.example:443"])
         .expect("distinct protocols are a valid advertisement");
     println!("  distinct protocols accepted  ✓");
-
-    // Re-pointing HTTPS leaves gRPC where it was, and keeps HTTPS in its
-    // position: changing an address is not a change of preference.
-    #[allow(deprecated)]
-    protocol
-        .set_own_transport("https://moved.example")
-        .expect("re-pointing one protocol is valid");
-    let uris: Vec<String> = protocol
-        .own_transports
-        .iter()
-        .map(|t| t.uri.clone())
-        .collect();
-    assert_eq!(
-        uris,
-        vec![
-            "https://moved.example".to_owned(),
-            "grpcs://a.example:443".to_owned()
-        ],
-        "set_own_transport must re-point only its own protocol, in place"
-    );
-    println!("  set_own_transport re-points one protocol, in place  ✓");
 
     // The runtime setter applies the same rule as the builder.
     let err = protocol

@@ -61,13 +61,17 @@ var (
 
 // ProduceGetSecretIdsVersionsRequest builds the wire-encoded DeRecMessage
 // carrying a discovery request on channelID, encrypted under sharedKey.
-func ProduceGetSecretIdsVersionsRequest(channelID uint64, sharedKey []byte) ([]byte, error) {
+func ProduceGetSecretIdsVersionsRequest(channelID uint64, sharedKey []byte, replyTo []Endpoint) ([]byte, error) {
 	produceDiscoveryReqOnce.Do(func() {
 		purego.RegisterFunc(&produceDiscoveryReqFn, symbol("produce_get_secret_ids_versions_request_message"))
 	})
+	replyToBytes, err := encodeEndpointList(replyTo)
+	if err != nil {
+		return nil, err
+	}
 	res := produceDiscoveryReqFn(channelID,
 		bytePtr(sharedKey), uintptr(len(sharedKey)),
-		nil, 0)
+		bytePtr(replyToBytes), uintptr(len(replyToBytes)))
 	if err := errorFrom(res.Error); err != nil {
 		return nil, err
 	}

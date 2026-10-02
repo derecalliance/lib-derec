@@ -10,8 +10,7 @@ use crate::{
     utils::verify_timestamps,
 };
 use derec_proto::{
-    DeRecMessage, DeRecResult, MessageBody, StatusEnum, VerifyShareRequestMessage,
-    VerifyShareResponseMessage,
+    DeRecMessage, DeRecResult, MessageBody, VerifyShareRequestMessage, VerifyShareResponseMessage,
 };
 use prost::Message;
 use sha2::{Digest, Sha384};
@@ -111,10 +110,7 @@ pub fn produce(
     let timestamp = current_timestamp();
 
     let message = VerifyShareResponseMessage {
-        result: Some(DeRecResult {
-            status: StatusEnum::Ok as i32,
-            memo: String::new(),
-        }),
+        result: Some(DeRecResult::ok()),
         secret_id: request.secret_id,
         version: request.version,
         nonce: request.nonce,
@@ -341,9 +337,6 @@ pub fn process(
     response: &VerifyShareResponseMessage,
     share_content: impl AsRef<[u8]>,
 ) -> Result<bool, crate::Error> {
-    // Anti-replay / cross-binding gate — runs BEFORE the status and
-    // hash checks so a stale/replayed response is rejected even on a
-    // structurally-OK envelope.
     response.validate_binding(request)?;
 
     let result = response.result.as_ref().ok_or(crate::Error::Invariant(
@@ -352,11 +345,6 @@ pub fn process(
 
     result.validate(|status, memo| VerificationError::NonOkStatus { status, memo })?;
 
-    // Hash against the OWNER'S nonce (from `request`), not the helper-
-    // controlled `response.nonce`. The binding gate above guarantees
-    // they are equal here, but reading from `request` explicitly
-    // documents the security invariant: the proof material is bound
-    // to the owner's challenge value.
     let expected_hash = hash_content(share_content, request.nonce);
 
     let matched: bool = expected_hash.ct_eq(response.hash.as_slice()).into();

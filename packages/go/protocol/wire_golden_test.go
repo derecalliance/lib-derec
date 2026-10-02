@@ -70,15 +70,15 @@ func goldenRestoreSecret() Secret {
 	return Secret{
 		Helpers: []Helper{
 			{
-				ChannelID:         "11",
+				ChannelID:         11,
 				Transports:        []EndpointJSON{{URI: "https://helper-a.example.com", Protocol: 0}},
 				SharedKey:         sharedKey1,
 				CommunicationInfo: map[string]string{"foo": "bar"},
 			},
 			{
-				ChannelID:    "22",
-				Transports:        []EndpointJSON{{URI: "https://helper-b.example.com", Protocol: 0}},
-				SharedKey:    sharedKey2,
+				ChannelID:  22,
+				Transports: []EndpointJSON{{URI: "https://helper-b.example.com", Protocol: 0}},
+				SharedKey:  sharedKey2,
 			},
 		},
 		Secrets: []UserSecret{
@@ -86,18 +86,18 @@ func goldenRestoreSecret() Secret {
 			{ID: []byte{0x02, 0x03}, Name: "seed", Data: []byte{0xde, 0xad, 0xbe, 0xef}},
 		},
 		Replicas: &Replicas{
-			ChannelID: "33",
+			ChannelID: 33,
 			Members: []Replica{
 				{
-					ReplicaID:         "44",
+					ReplicaID:         44,
 					Transports:        []EndpointJSON{{URI: "https://replica-a.example.com", Protocol: 0}},
-					Role:              "Source",
+					Role:              ReplicaRoleSource,
 					CommunicationInfo: map[string]string{"baz": "qux"},
 				},
 				{
-					ReplicaID:    "66",
-					Transports:        []EndpointJSON{{URI: "https://replica-b.example.com", Protocol: 0}},
-					Role:         "Destination",
+					ReplicaID:  66,
+					Transports: []EndpointJSON{{URI: "https://replica-b.example.com", Protocol: 0}},
+					Role:       ReplicaRoleDestination,
 				},
 			},
 			SharedKey: replicaGroupKey,
@@ -137,6 +137,34 @@ func TestWireGolden_ProtectSecret(t *testing.T) {
 	assertJSONEqual(t, string(got), goldenJSON(t, "protect_secret"))
 }
 
+// TestWireGolden_CoversEverySection fails when wire_golden.json gains a
+// section no test above asserts against, so a params shape added to the
+// fixture cannot go unchecked in this SDK.
+func TestWireGolden_CoversEverySection(t *testing.T) {
+	covered := map[string]bool{"restore": true, "protect_secret": true}
+	raw, err := os.ReadFile("../../../library/tests/fixtures/wire_golden.json")
+	if err != nil {
+		t.Fatalf("read wire_golden.json: %v", err)
+	}
+	var fixture map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatalf("parse wire_golden.json: %v", err)
+	}
+	for section := range fixture {
+		if strings.HasPrefix(section, "$") {
+			continue
+		}
+		if !covered[section] {
+			t.Errorf("wire_golden.json section %q has no Go assertion", section)
+		}
+	}
+	for section := range covered {
+		if _, ok := fixture[section]; !ok {
+			t.Errorf("wire_golden.json no longer has section %q", section)
+		}
+	}
+}
+
 // TestWireGolden_Restore_NilReplicasOmitsField pins the other end of the
 // omitempty behavior: a Secret with no Replicas setup must omit the
 // "replicas" key entirely, matching wire.rs's
@@ -146,7 +174,7 @@ func TestWireGolden_ProtectSecret(t *testing.T) {
 func TestWireGolden_Restore_NilReplicasOmitsField(t *testing.T) {
 	secret := Secret{
 		Helpers: []Helper{
-			{ChannelID: "1", Transports:        []EndpointJSON{{URI: "https://h.example.com", Protocol: 0}}, SharedKey: make([]byte, 32)},
+			{ChannelID: 1, Transports: []EndpointJSON{{URI: "https://h.example.com", Protocol: 0}}, SharedKey: make([]byte, 32)},
 		},
 		Secrets: []UserSecret{{ID: []byte{0x01}, Name: "n", Data: []byte{0x02}}},
 	}

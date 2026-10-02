@@ -11,6 +11,7 @@ import type {
   ContactMessage,
   ContactMode,
   DeRecEvent,
+  Endpoint,
   DiscoveryParams,
   PairingParams,
   ParameterRange,
@@ -20,6 +21,7 @@ import type {
   SecretStore,
   ShareStore,
   StateStore,
+  StatusEnum,
   ReplicaDiscoveryParams,
   Target,
   Timeouts,
@@ -79,25 +81,6 @@ function reviveEventBytes(value: unknown): unknown {
 
 function decodeEvents(buffer: ArrayBuffer): DeRecEvent[] {
   return reviveEventBytes(jsonFromBytes(buffer)) as DeRecEvent[];
-}
-
-/**
- * Maps a transport protocol name to the `derec_proto::Protocol` discriminant.
- * The shared enum fixture every other numeric mapping in this SDK is checked
- * against does not carry this enum (it
- * only covers the Rust-internal serde enums listed under its `"enums"` key);
- * the transport `Protocol` enum lives in `protobufs/transportprotocol.proto`
- * instead, where `HTTPS = 0` and `GRPC = 1` are defined.
- */
-export function protocolDiscriminant(protocol: string): number {
-  switch (protocol.toLowerCase()) {
-    case 'https':
-      return 0;
-    case 'grpc':
-      return 1;
-    default:
-      throw new Error(`DeRec: unknown transport protocol "${protocol}"`);
-  }
 }
 
 function encodeTarget(target: Target): unknown {
@@ -261,13 +244,8 @@ function buildStartParams(flowKind: FlowKind, params: unknown): Uint8Array {
       if (p.communication_info !== undefined) {
         out.communication_info = p.communication_info;
       }
-      if (p.own_transports !== undefined && p.own_transports.length > 0) {
+      if (p.own_transports !== undefined) {
         out.own_transports = p.own_transports;
-        // The first entry also fills the deprecated singular field so a peer
-        // predating `supported_transports` still learns the new address.
-        out.transport_protocol = p.own_transports[0];
-      } else if (p.transport_protocol !== undefined) {
-        out.transport_protocol = p.transport_protocol;
       }
       return jsonToBytes(out);
     }
@@ -313,7 +291,6 @@ export class DeRecProtocolBuilder {
   private readonly secretIdValue: bigint;
   private config: Record<string, unknown> = {};
   private stores: Record<string, unknown> = {};
-  private communicationInfo: Record<string, string> | undefined;
 
   constructor(secretId: bigint | number) {
     this.secretIdValue = BigInt(secretId);
@@ -350,22 +327,9 @@ export class DeRecProtocolBuilder {
   }
 
   /**
-   * @deprecated Use {@link withOwnTransports}, which takes the whole
-   * preference list — `withOwnTransports([endpoint])` is the direct
-   * replacement. Removed at 0.0.5.
-   */
-  withOwnTransport(endpoint: { uri: string; protocol: string }): this {
-    this.config.own_transport_uri = endpoint.uri;
-    this.config.own_transport_protocol = protocolDiscriminant(endpoint.protocol);
-    return this;
-  }
-
-  /**
    * Set every transport endpoint this application serves, in preference
-   * order. Written to the config's `own_transports` array, which takes
-   * precedence over `own_transport_uri` / `own_transport_protocol` on the
-   * Rust side when non-empty — see `ProtocolConfig` in
-   * `library/src/interop/ffi/protocol/handle/mod.rs`.
+   * order. Written to the config's `own_transports` array — see
+   * `ProtocolConfig` in `library/src/interop/ffi/protocol/handle/mod.rs`.
    *
    * The order given is forwarded verbatim: it is not sorted, deduplicated,
    * or reordered here. It is this application's own preference and
@@ -374,15 +338,11 @@ export class DeRecProtocolBuilder {
    * listing an endpoint this application does not serve makes pairing
    * succeed and replies vanish.
    *
-   * Supersedes {@link withOwnTransport} for applications serving more
-   * than one transport; the single-endpoint setter remains fully
-   * supported.
+   * Required: `build()` with no own transport is refused by the library,
+   * since a node with no endpoint cannot be reached by any peer.
    */
-  withOwnTransports(transports: { uri: string; protocol: string }[]): this {
-    this.config.own_transports = transports.map((t) => ({
-      uri: t.uri,
-      protocol: protocolDiscriminant(t.protocol),
-    }));
+  withOwnTransports(transports: Endpoint[]): this {
+    this.config.own_transports = transports.map(({ uri, protocol }) => ({ uri, protocol }));
     return this;
   }
 
@@ -411,23 +371,8 @@ export class DeRecProtocolBuilder {
   }
 
   /**
-   * @deprecated Use {@link withUnsafeConnection}, which names both gated
-   * schemes. Removed at 0.0.5. Default: false.
-   */
-  withUnsafeHttp(allow: boolean): this {
-    this.config.unsafe_http = allow;
-    return this;
-  }
-
-  /**
    * Accept plaintext `http://` and `grpc://` transport endpoints.
-   * **Development only.** Default: false. Supersedes
-   * {@link withUnsafeHttp}, which names only the HTTP scheme.
-   *
-   * Either flag alone is honored. Setting both to disagreeing values fails
-   * construction with the error code `CONFLICTING_PLAINTEXT_OPT_IN` rather
-   * than resolving silently, because precedence would hand the decision to
-   * the flag being removed.
+   * **Development only.** Default: false.
    */
   withUnsafeConnection(allow: boolean): this {
     this.config.unsafe_connection = allow;
@@ -435,24 +380,11 @@ export class DeRecProtocolBuilder {
   }
 
   /**
-   * Default: empty. `derec_protocol_new`'s own `communication_info` argument
-   * is a pre-encoded `CommunicationInfo` protobuf message, and this SDK has
-   * no encoder for that message — the C ABI exposes one only for
-   * `ContactMessage`. Hand-rolling one here would be SDK-side protocol logic
-   * with no test coverage — exactly what this codebase's "Rust decides, the
-   * SDK only marshals" rule forbids. Instead,
-   * `build()` constructs the protocol with an empty `communication_info`
-   * (a legitimate, always-accepted value — see `decode_communication_info`
-   * in `library/src/interop/ffi/protocol/handle/mod.rs`, which treats a zero-length
-   * buffer as "no entries") and then calls the already-bound
-   * {@link DeRecProtocol.setCommunicationInfo}, which takes the same map as
-   * plain JSON (`derec_protocol_set_communication_info` in
-   * `library/src/interop/ffi/protocol/handle/config.rs`). That setter is queued on
-   * the protocol's serial worker before `build()` returns, so it is ordered
-   * ahead of every call the caller can subsequently make.
+   * Default: empty. Written to the config's `communication_info` key, so the
+   * map is part of the protocol from construction.
    */
   withCommunicationInfo(info: Record<string, string>): this {
-    this.communicationInfo = info;
+    this.config.communication_info = info;
     return this;
   }
 
@@ -464,13 +396,7 @@ export class DeRecProtocolBuilder {
 
   /** Default: "required". */
   withUnpairAck(ack: UnpairAck): this {
-    if (ack === 'required') {
-      this.config.unpair_ack = 0;
-    } else if (ack === 'not_required') {
-      this.config.unpair_ack = 1;
-    } else {
-      throw new Error(`DeRec: unknown unpair ack "${ack as string}"`);
-    }
+    this.config.unpair_ack = ack;
     return this;
   }
 
@@ -480,17 +406,20 @@ export class DeRecProtocolBuilder {
     return this;
   }
 
-  /** Default: empty policy (every flow off). */
+  /**
+   * Default: empty policy (every flow off). A flow left out of `policy` is
+   * left out of the config, and the library applies its own default to it.
+   */
   withAutoAccept(policy: AutoAcceptPolicy): this {
     this.config.auto_accept = {
-      pairing: policy.pairing ?? false,
-      pre_pair: policy.prePair ?? false,
-      store_share: policy.storeShare ?? false,
-      verify_share: policy.verifyShare ?? false,
-      discovery: policy.discovery ?? false,
-      get_share: policy.getShare ?? false,
-      unpair: policy.unpair ?? false,
-      update_channel_info: policy.updateChannelInfo ?? false,
+      pairing: policy.pairing,
+      pre_pair: policy.prePair,
+      store_share: policy.storeShare,
+      verify_share: policy.verifyShare,
+      discovery: policy.discovery,
+      get_share: policy.getShare,
+      unpair: policy.unpair,
+      update_channel_info: policy.updateChannelInfo,
     };
     return this;
   }
@@ -508,30 +437,26 @@ export class DeRecProtocolBuilder {
    * against the peer's range on inbound ones: a range that fails to
    * intersect rejects the pairing. Every bound is optional and defaults to
    * `0`, which the protocol reads as "no constraint on this dimension".
+   * Bounds cross to the library as decimal strings, so the full `i64` range
+   * survives; a bound left out is left out of the config, and the library
+   * applies its default.
    *
    * Default: unset — no constraints advertised, every peer range accepted.
    */
   withParameterRange(range: Partial<ParameterRange>): this {
-    const n = (v: bigint | undefined) => Number(v ?? 0n);
     this.config.parameter_range = {
-      min_share_size: n(range.min_share_size),
-      max_share_size: n(range.max_share_size),
-      min_time_between_verifications: n(range.min_time_between_verifications),
-      max_time_between_verifications: n(range.max_time_between_verifications),
-      min_time_between_share_updates: n(range.min_time_between_share_updates),
-      max_time_between_share_updates: n(range.max_time_between_share_updates),
-      min_unresponsive_deletion_timeout: n(
-        range.min_unresponsive_deletion_timeout,
-      ),
-      max_unresponsive_deletion_timeout: n(
-        range.max_unresponsive_deletion_timeout,
-      ),
-      min_unresponsive_deactivation_timeout: n(
-        range.min_unresponsive_deactivation_timeout,
-      ),
-      max_unresponsive_deactivation_timeout: n(
-        range.max_unresponsive_deactivation_timeout,
-      ),
+      min_share_size: range.min_share_size?.toString(),
+      max_share_size: range.max_share_size?.toString(),
+      min_time_between_verifications: range.min_time_between_verifications?.toString(),
+      max_time_between_verifications: range.max_time_between_verifications?.toString(),
+      min_time_between_share_updates: range.min_time_between_share_updates?.toString(),
+      max_time_between_share_updates: range.max_time_between_share_updates?.toString(),
+      min_unresponsive_deletion_timeout: range.min_unresponsive_deletion_timeout?.toString(),
+      max_unresponsive_deletion_timeout: range.max_unresponsive_deletion_timeout?.toString(),
+      min_unresponsive_deactivation_timeout:
+        range.min_unresponsive_deactivation_timeout?.toString(),
+      max_unresponsive_deactivation_timeout:
+        range.max_unresponsive_deactivation_timeout?.toString(),
     };
     return this;
   }
@@ -540,8 +465,6 @@ export class DeRecProtocolBuilder {
     const config = {
       secret_id: this.secretIdValue.toString(),
       replica_id: null,
-      own_transport_uri: '',
-      own_transport_protocol: 0,
       ...this.config,
     };
     const host = (getNative() as unknown as NativeHost).protocol_new(
@@ -549,29 +472,15 @@ export class DeRecProtocolBuilder {
       new Uint8Array(0),
       this.stores,
     ) as NativeHost;
-    const protocol = DeRecProtocol.fromHost(host);
-    if (this.communicationInfo !== undefined) {
-      // `setCommunicationInfo` is asynchronous, but `build()` stays
-      // synchronous: the guarantee callers need is not that the map has been
-      // applied by the time `build()` returns, it is that no flow can run
-      // before it. Posting it here puts it on the protocol's serial worker
-      // queue ahead of anything the caller has had the chance to start, so
-      // every subsequent call observes it. Left unhandled deliberately — a
-      // failure reaches the runtime's unhandled-rejection reporting rather
-      // than being silently discarded, and `build()` has no synchronous
-      // channel to raise it on.
-      void protocol.setCommunicationInfo(this.communicationInfo);
-    }
-    return protocol;
+    return DeRecProtocol.fromHost(host);
   }
 }
 
 /**
  * Thin wrapper around the `ProtocolHost` JSI host object, mirroring
  * `@derec-alliance/nodejs`'s `DeRecProtocol` — same methods, and the same
- * sync/async split except for `setCommunicationInfo` and `setOwnTransport`,
- * which return a `Promise` here (see their own doc comments for why);
- * `secretId` is synchronous and everything else returns a `Promise`. Every method encodes its
+ * sync/async split: `secretId` is synchronous and everything else returns a
+ * `Promise`. Every method encodes its
  * arguments into the wire shape the host function expects and decodes its
  * result back into the typed value declared here; no protocol decision is
  * made in this class.
@@ -601,68 +510,39 @@ export class DeRecProtocol {
   }
 
   /**
-   * Returns a `Promise`, where `@derec-alliance/nodejs` declares this
-   * `void`. The native setter takes the same handle mutex a running flow
-   * holds across its store callbacks, so calling it on the JavaScript thread
-   * would block that thread until the flow released the mutex — which it
-   * cannot do while it is waiting on the JavaScript thread. The binding
-   * therefore queues the setter onto the same serial worker every flow runs
-   * on, which orders it after any call already in flight. The nodejs SDK is
-   * WASM and single-threaded, so it has no such hazard.
+   * Replaces this node's local communication info.
    *
-   * Callers that ignore the result behave exactly as before, so this stays
-   * source-compatible with nodejs-shaped code; awaiting it additionally
-   * surfaces a failure that would otherwise be swallowed.
+   * The native setter takes the same handle mutex a running flow holds
+   * across its store callbacks, so calling it on the JavaScript thread would
+   * block that thread until the flow released the mutex — which it cannot do
+   * while it is waiting on the JavaScript thread. The binding therefore
+   * queues the setter onto the same serial worker every flow runs on, which
+   * orders it after any call already in flight. Awaiting the returned
+   * `Promise` surfaces a failure that would otherwise be swallowed.
    */
   setCommunicationInfo(info: Record<string, string>): Promise<void> {
     return this.host.setCommunicationInfo(jsonToBytes(info)) as Promise<void>;
   }
 
   /**
-   * Replace this node's endpoint for one protocol, leaving the others
-   * alone. A node serves at most one endpoint per protocol, so the
-   * `(uri, protocol)` pair identifies the entry it replaces; an entry for a
-   * protocol not yet served is appended, and a replaced one keeps its
-   * position in the preference order.
-   *
-   * Returns a `Promise` for the same reason {@link setCommunicationInfo} does.
-   *
-   * @deprecated Use {@link setOwnTransports}, which takes the whole
-   * preference list and is the only way to change which protocols this node
-   * serves, or their order. Removed at 0.0.5.
-   */
-  setOwnTransport(uri: string, protocol: string): Promise<void> {
-    return this.host.setOwnTransport(
-      uri,
-      protocolDiscriminant(protocol),
-    ) as Promise<void>;
-  }
-
-  /**
    * Replaces every endpoint this node advertises, in preference order —
-   * the runtime counterpart to `withOwnTransports`, and the only way to
-   * change a multi-endpoint node's set ({@link setOwnTransport} collapses
-   * it to the one endpoint it is given).
+   * the runtime counterpart to `withOwnTransports`.
    *
    * Every entry is validated before any is stored, so a malformed URI
    * leaves the previous set intact. An empty array is rejected.
    *
-   * Returns a `Promise` for the same reason {@link setCommunicationInfo} does.
+   * Queued onto the serial worker for the same reason as
+   * {@link setCommunicationInfo}.
    */
-  setOwnTransports(
-    transports: { uri: string; protocol: string }[],
-  ): Promise<void> {
-    const wire = transports.map(({ uri, protocol }) => ({
-      uri,
-      protocol: protocolDiscriminant(protocol),
-    }));
+  setOwnTransports(transports: Endpoint[]): Promise<void> {
+    const wire = transports.map(({ uri, protocol }) => ({ uri, protocol }));
     return this.host.setOwnTransports(jsonToBytes(wire)) as Promise<void>;
   }
 
   /**
    * Decodes the `contact_wire_bytes` `derec_protocol_create_contact`
    * produces into a typed `ContactMessage`, so an application can read the
-   * contact's `nonce`, `transport_protocol` and mode without a protobuf
+   * contact's `nonce`, `supported_transports` and mode without a protobuf
    * codec of its own. Feed the returned object straight back into
    * `start(FlowKind.Pairing, { contact })`, which re-encodes it.
    */
@@ -713,7 +593,7 @@ export class DeRecProtocol {
     return decodeEvents(buffer);
   }
 
-  async reject(actionBytes: Uint8Array, status: number, memo: string): Promise<void> {
+  async reject(actionBytes: Uint8Array, status: StatusEnum, memo: string): Promise<void> {
     await this.host.reject(actionBytes, status, memo);
   }
 
@@ -730,6 +610,21 @@ export class DeRecProtocol {
     return jsonFromBytes(buffer) as string[];
   }
 
+  /**
+   * Rebuild this protocol's `secret_id` namespace from a recovered `Secret`.
+   * Pass the `secret` carried by the `SecretRecovered` event verbatim.
+   * A helper or member whose `transports` is empty gets no channel: it is
+   * reported as a `PeerNotRestored` event in the returned array and the rest
+   * of the roster is restored.
+   *
+   * Rejects with a `DeRecError`; among its codes:
+   *
+   * | code               | meaning                                                     |
+   * |--------------------|-------------------------------------------------------------|
+   * | `already_restored` | A user-secret snapshot already exists for this `secret_id`. |
+   * | `restore_conflict` | Channels live at ids restore is about to write. The error   |
+   * |                    | carries `channel_ids: string[]` listing the collisions.     |
+   */
   async restore(
     recoveredSecret: Extract<DeRecEvent, { type: 'SecretRecovered' }>['secret'],
     version: number,
@@ -742,5 +637,10 @@ export class DeRecProtocol {
   /** Release the native handle. Safe to call more than once. */
   free(): void {
     this.host.free();
+  }
+
+  /** Same as {@link DeRecProtocol.free}, for `using`. */
+  [Symbol.dispose](): void {
+    this.free();
   }
 }

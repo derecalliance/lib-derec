@@ -35,8 +35,6 @@ public static partial class Sharing
         {
             ArgumentNullException.ThrowIfNull(requestProtoBytes);
             ArgumentNullException.ThrowIfNull(sharedKey);
-            if (sharedKey.Length != 32)
-                throw new ArgumentException("sharedKey must be exactly 32 bytes.", nameof(sharedKey));
 
             Native.Sharing.ProduceStoreShareResponseMessageResult nativeResult =
                 Native.Sharing.produce_store_share_response_message(

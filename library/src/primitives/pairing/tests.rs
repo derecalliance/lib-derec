@@ -3,14 +3,16 @@
 
 use crate::Error;
 use crate::derec_message::current_timestamp;
+use crate::extensions::derec_result::DeRecResultExt as _;
 use crate::primitives::pairing::PairingError;
 use crate::primitives::pairing::{
     request::{
         CreateContactResult as CreateContactMessageResult,
         ExtractResult as ExtractPairingRequestResult, PrePairExtractResult, ProducePrePairResult,
         ProduceResult as ProducePairingRequestMessageResult,
-        create_contact as create_contact_message, extract as extract_pairing_request,
-        extract_pre_pair, produce as produce_pairing_request_message, produce_pre_pair_request,
+        create_contact as create_contact_message, decode_contact, encode_contact,
+        extract as extract_pairing_request, extract_pre_pair,
+        produce as produce_pairing_request_message, produce_pre_pair_request,
     },
     response::{
         ExtractResult as ExtractPairingResponseResult,
@@ -20,7 +22,6 @@ use crate::primitives::pairing::{
         ProduceResult as ProducePairingResponseMessageResult, extract as extract_pairing_response,
         extract_pre_pair as extract_pre_pair_response, process as process_pairing_response_message,
         process_pre_pair, produce as produce_pairing_response_message, produce_pre_pair,
-        produce_pre_pair_no_keys,
     },
 };
 
@@ -67,8 +68,6 @@ fn test_create_contact_message_empty_transport_uri() {
     ));
 }
 
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 #[test]
 fn test_create_contact_message() {
     let channel_id = ChannelId(42);
@@ -91,7 +90,9 @@ fn test_create_contact_message() {
     assert_eq!(contact_msg.channel_id, u64::from(channel_id));
 
     let transport = contact_msg
-        .transport_protocol
+        .supported_transports
+        .into_iter()
+        .next()
         .expect("transport protocol should be present");
 
     assert_eq!(transport.uri, transport_uri);
@@ -111,23 +112,20 @@ fn test_create_contact_message() {
     );
 }
 
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 #[test]
 fn test_produce_pairing_request_message_empty_mlkem_encapsulation_key() {
     let invalid_contact_msg = ContactMessage {
         channel_id: ChannelId(42).into(),
-        transport_protocol: Some(TransportProtocol {
-            uri: "https://relay.example/alice".to_owned(),
-            protocol: Protocol::Https.into(),
-        }),
         contact_mode: derec_proto::ContactMode::InlineKeys as i32,
         mlkem_encapsulation_key: Some(Vec::new()),
         ecies_public_key: Some(vec![1; 33]),
         contact_binding_hash: None,
         nonce: 1234,
         timestamp: Some(current_timestamp()),
-        supported_transports: Vec::new(),
+        supported_transports: vec![TransportProtocol {
+            uri: "https://relay.example/alice".to_owned(),
+            protocol: Protocol::Https.into(),
+        }],
     };
 
     let result = produce_pairing_request_message(
@@ -148,23 +146,20 @@ fn test_produce_pairing_request_message_empty_mlkem_encapsulation_key() {
     ));
 }
 
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 #[test]
 fn test_produce_pairing_request_message_empty_ecies_public_key() {
     let invalid_contact_msg = ContactMessage {
         channel_id: ChannelId(42).into(),
-        transport_protocol: Some(TransportProtocol {
-            uri: "https://relay.example/alice".to_owned(),
-            protocol: Protocol::Https.into(),
-        }),
         contact_mode: derec_proto::ContactMode::InlineKeys as i32,
         mlkem_encapsulation_key: Some(vec![1; 32]),
         ecies_public_key: Some(Vec::new()),
         contact_binding_hash: None,
         nonce: 1234,
         timestamp: Some(current_timestamp()),
-        supported_transports: Vec::new(),
+        supported_transports: vec![TransportProtocol {
+            uri: "https://relay.example/alice".to_owned(),
+            protocol: Protocol::Https.into(),
+        }],
     };
 
     let result = produce_pairing_request_message(
@@ -185,23 +180,20 @@ fn test_produce_pairing_request_message_empty_ecies_public_key() {
     ));
 }
 
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 #[test]
 fn test_produce_pairing_request_message_empty_transport_uri() {
     let invalid_contact_msg = ContactMessage {
         channel_id: ChannelId(42).into(),
-        transport_protocol: Some(TransportProtocol {
-            uri: "https://relay.example/alice".to_owned(),
-            protocol: Protocol::Https.into(),
-        }),
         contact_mode: derec_proto::ContactMode::InlineKeys as i32,
         contact_binding_hash: None,
         mlkem_encapsulation_key: Some(vec![1; 32]),
         ecies_public_key: Some(vec![1; 33]),
         nonce: 1234,
         timestamp: Some(current_timestamp()),
-        supported_transports: Vec::new(),
+        supported_transports: vec![TransportProtocol {
+            uri: "https://relay.example/alice".to_owned(),
+            protocol: Protocol::Https.into(),
+        }],
     };
 
     let result = produce_pairing_request_message(
@@ -221,8 +213,6 @@ fn test_produce_pairing_request_message_empty_transport_uri() {
     ));
 }
 
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 #[test]
 fn test_produce_pairing_request_message() {
     let channel_id = ChannelId(42);
@@ -260,6 +250,7 @@ fn test_produce_pairing_request_message() {
     } = extract_pairing_request(
         &envelope,
         alice_sk_state.as_ref().unwrap().ecies_secret_key(),
+        None,
     )
     .expect("failed to extract pairing request");
 
@@ -269,15 +260,15 @@ fn test_produce_pairing_request_message() {
     assert_eq!(pair_request_message.nonce, contact_message.nonce);
 
     let transport = pair_request_message
-        .transport_protocol
+        .supported_transports
+        .into_iter()
+        .next()
         .expect("transport protocol should be present");
 
     assert_eq!(transport.uri, bob_transport_uri);
     assert_eq!(transport.protocol, Protocol::Https as i32);
 }
 
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 #[test]
 fn test_produce_pairing_request_message_initiator_contact_message() {
     let alice_transport_uri = "https://relay.example/alice";
@@ -311,14 +302,14 @@ fn test_produce_pairing_request_message_initiator_contact_message() {
     .expect("failed to produce pairing request message");
 
     let tp = initiator_contact_message
-        .transport_protocol
+        .supported_transports
+        .into_iter()
+        .next()
         .expect("transport protocol should be present");
     assert_eq!(tp.uri, alice_transport_uri);
     assert_eq!(tp.protocol, Protocol::Https as i32);
 }
 
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 #[test]
 fn test_produce_pairing_response_message_empty_mlkem_ciphertext() {
     let alice_channel_id = ChannelId(42);
@@ -344,12 +335,11 @@ fn test_produce_pairing_response_message_empty_mlkem_ciphertext() {
         nonce: 1234,
         communication_info: None,
         parameter_range: None,
-        transport_protocol: Some(TransportProtocol {
+        timestamp: Some(current_timestamp()),
+        supported_transports: vec![TransportProtocol {
             uri: "https://relay.example/bob".to_owned(),
             protocol: Protocol::Https.into(),
-        }),
-        timestamp: Some(current_timestamp()),
-        supported_transports: Vec::new(),
+        }],
     };
 
     let result = produce_pairing_response_message(
@@ -368,8 +358,6 @@ fn test_produce_pairing_response_message_empty_mlkem_ciphertext() {
     ));
 }
 
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 #[test]
 fn test_produce_pairing_response_message_empty_ecies_public_key() {
     let alice_channel_id = ChannelId(42);
@@ -395,12 +383,11 @@ fn test_produce_pairing_response_message_empty_ecies_public_key() {
         nonce: 1234,
         communication_info: None,
         parameter_range: None,
-        transport_protocol: Some(TransportProtocol {
+        timestamp: Some(current_timestamp()),
+        supported_transports: vec![TransportProtocol {
             uri: "https://relay.example/bob".to_owned(),
             protocol: Protocol::Https.into(),
-        }),
-        timestamp: Some(current_timestamp()),
-        supported_transports: Vec::new(),
+        }],
     };
 
     let result = produce_pairing_response_message(
@@ -419,8 +406,6 @@ fn test_produce_pairing_response_message_empty_ecies_public_key() {
     ));
 }
 
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 #[test]
 fn test_produce_pairing_response_message_missing_transport_protocol() {
     let alice_channel_id = ChannelId(42);
@@ -446,7 +431,6 @@ fn test_produce_pairing_response_message_missing_transport_protocol() {
         nonce: 1234,
         communication_info: None,
         parameter_range: None,
-        transport_protocol: None,
         timestamp: Some(current_timestamp()),
         supported_transports: Vec::new(),
     };
@@ -466,8 +450,6 @@ fn test_produce_pairing_response_message_missing_transport_protocol() {
     ));
 }
 
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 #[test]
 fn test_produce_pairing_response_message_empty_transport_uri() {
     let alice_channel_id = ChannelId(42);
@@ -493,10 +475,6 @@ fn test_produce_pairing_response_message_empty_transport_uri() {
         nonce: 1234,
         communication_info: None,
         parameter_range: None,
-        transport_protocol: Some(TransportProtocol {
-            uri: "   ".to_owned(),
-            protocol: Protocol::Https.into(),
-        }),
         timestamp: Some(current_timestamp()),
         supported_transports: Vec::new(),
     };
@@ -551,6 +529,7 @@ fn test_extract_pairing_request_rejects_envelope_timestamp_mismatch() {
     let result = extract_pairing_request(
         &tampered_bytes,
         alice_sk_state.as_ref().unwrap().ecies_secret_key(),
+        None,
     );
 
     assert!(matches!(result, Err(Error::Invariant(_))));
@@ -595,6 +574,7 @@ fn test_process_pairing_response_message_missing_result() {
     } = extract_pairing_request(
         &bob_request_envelope,
         alice_sk_state.as_ref().unwrap().ecies_secret_key(),
+        None,
     )
     .expect("failed to extract pairing request");
 
@@ -611,6 +591,7 @@ fn test_process_pairing_response_message_missing_result() {
         &initiator_contact_message,
         &pair_response_msg,
         &bob_sk_state,
+        None,
     );
 
     assert!(matches!(
@@ -659,6 +640,7 @@ fn test_process_pairing_response_message_result_non_ok() {
     } = extract_pairing_request(
         &bob_request_envelope,
         alice_sk_state.as_ref().unwrap().ecies_secret_key(),
+        None,
     )
     .expect("failed to extract pairing request");
 
@@ -678,6 +660,7 @@ fn test_process_pairing_response_message_result_non_ok() {
         &initiator_contact_message,
         &pair_response_msg,
         &bob_sk_state,
+        None,
     );
 
     assert!(matches!(
@@ -726,6 +709,7 @@ fn test_process_pairing_response_message_invalid_status() {
     } = extract_pairing_request(
         &bob_request_envelope,
         alice_sk_state.as_ref().unwrap().ecies_secret_key(),
+        None,
     )
     .expect("failed to extract pairing request");
 
@@ -745,6 +729,7 @@ fn test_process_pairing_response_message_invalid_status() {
         &initiator_contact_message,
         &pair_response_msg,
         &bob_sk_state,
+        None,
     );
 
     assert!(matches!(
@@ -793,14 +778,12 @@ fn test_process_pairing_response_message_nonce_mismatch() {
     } = extract_pairing_request(
         &bob_request_envelope,
         alice_sk_state.as_ref().unwrap().ecies_secret_key(),
+        None,
     )
     .expect("failed to extract pairing request");
 
     let pair_response_msg = PairResponseMessage {
-        result: Some(DeRecResult {
-            status: StatusEnum::Ok as i32,
-            memo: String::new(),
-        }),
+        result: Some(DeRecResult::ok()),
         nonce: bob_pair_request_msg.nonce + 1,
         communication_info: None,
         parameter_range: None,
@@ -812,6 +795,7 @@ fn test_process_pairing_response_message_nonce_mismatch() {
         &initiator_contact_message,
         &pair_response_msg,
         &bob_sk_state,
+        None,
     );
 
     assert!(matches!(
@@ -860,14 +844,12 @@ fn test_process_pairing_response_message_empty_mlkem_encapsulation_key() {
     } = extract_pairing_request(
         &bob_request_envelope,
         alice_sk_state.as_ref().unwrap().ecies_secret_key(),
+        None,
     )
     .expect("failed to extract pairing request");
 
     let pair_response_msg = PairResponseMessage {
-        result: Some(DeRecResult {
-            status: StatusEnum::Ok as i32,
-            memo: String::new(),
-        }),
+        result: Some(DeRecResult::ok()),
         nonce: bob_pair_request_msg.nonce,
         communication_info: None,
         parameter_range: None,
@@ -879,7 +861,7 @@ fn test_process_pairing_response_message_empty_mlkem_encapsulation_key() {
     invalid_contact.mlkem_encapsulation_key = Some(Vec::new());
 
     let result =
-        process_pairing_response_message(&invalid_contact, &pair_response_msg, &bob_sk_state);
+        process_pairing_response_message(&invalid_contact, &pair_response_msg, &bob_sk_state, None);
 
     assert!(matches!(
         result,
@@ -927,14 +909,12 @@ fn test_process_pairing_response_message_empty_ecies_public_key() {
     } = extract_pairing_request(
         &bob_request_envelope,
         alice_sk_state.as_ref().unwrap().ecies_secret_key(),
+        None,
     )
     .expect("failed to extract pairing request");
 
     let pair_response_msg = PairResponseMessage {
-        result: Some(DeRecResult {
-            status: StatusEnum::Ok as i32,
-            memo: String::new(),
-        }),
+        result: Some(DeRecResult::ok()),
         nonce: bob_pair_request_msg.nonce,
         communication_info: None,
         parameter_range: None,
@@ -946,7 +926,7 @@ fn test_process_pairing_response_message_empty_ecies_public_key() {
     invalid_contact.ecies_public_key = Some(Vec::new());
 
     let result =
-        process_pairing_response_message(&invalid_contact, &pair_response_msg, &bob_sk_state);
+        process_pairing_response_message(&invalid_contact, &pair_response_msg, &bob_sk_state, None);
 
     assert!(matches!(
         result,
@@ -992,6 +972,7 @@ fn test_extract_pairing_response_rejects_envelope_timestamp_mismatch() {
     let ExtractPairingRequestResult { request } = extract_pairing_request(
         &request_envelope,
         initiator_secret_key.as_ref().unwrap().ecies_secret_key(),
+        None,
     )
     .expect("failed to extract pairing request");
 
@@ -1058,6 +1039,7 @@ fn test_alice_bob_pairing_flow() {
     } = extract_pairing_request(
         &bob_pair_req_envelope,
         alice_sk_state.as_ref().unwrap().ecies_secret_key(),
+        None,
     )
     .expect("failed to extract pairing request");
 
@@ -1088,6 +1070,7 @@ fn test_alice_bob_pairing_flow() {
         &initiator_contact_message,
         &alice_pair_resp_msg,
         &bob_sk_state,
+        None,
     )
     .expect("failed to process pairing response");
 
@@ -1152,6 +1135,7 @@ fn test_produce_pairing_response_returns_envelope_and_peer_transport() {
     } = extract_pairing_request(
         &bob_request_envelope,
         alice_sk_state.as_ref().unwrap().ecies_secret_key(),
+        None,
     )
     .expect("failed to extract pairing request");
 
@@ -1242,8 +1226,6 @@ fn test_create_contact_message_hashed_keys_fresh_randomness_yields_distinct_hash
     assert_ne!(a.contact_binding_hash, b.contact_binding_hash);
 }
 
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 #[test]
 fn test_produce_pre_pair_request_emits_envelope_routed_to_contact_channel() {
     let channel_id = ChannelId(42);
@@ -1270,8 +1252,8 @@ fn test_produce_pre_pair_request_emits_envelope_routed_to_contact_channel() {
     };
     assert_eq!(inner.nonce, alice_contact.nonce);
     let inner_transport = inner
-        .transport_protocol
-        .as_ref()
+        .supported_transports
+        .first()
         .expect("transport_protocol should be present");
     assert_eq!(inner_transport.uri, bob_transport.uri);
     assert_eq!(inner_transport.protocol, bob_transport.protocol);
@@ -1324,8 +1306,6 @@ fn test_produce_pre_pair_request_rejects_empty_transport_uri() {
     ));
 }
 
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 #[test]
 fn test_extract_pre_pair_roundtrip() {
     let alice_contact = make_hashed_keys_contact(ChannelId(42));
@@ -1344,8 +1324,8 @@ fn test_extract_pre_pair_roundtrip() {
 
     assert_eq!(request.nonce, alice_contact.nonce);
     let transport = request
-        .transport_protocol
-        .as_ref()
+        .supported_transports
+        .first()
         .expect("transport_protocol should be present");
     assert_eq!(transport.uri, bob_transport.uri);
     assert_eq!(transport.protocol, bob_transport.protocol);
@@ -1466,8 +1446,6 @@ fn test_produce_pre_pair_emits_envelope_carrying_initiator_public_keys() {
     );
 }
 
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 #[test]
 fn test_produce_pre_pair_rejects_responder_secret_key_material() {
     let channel_id = ChannelId(42);
@@ -1502,7 +1480,6 @@ fn test_produce_pre_pair_rejects_responder_secret_key_material() {
     let dummy_request = derec_proto::PrePairRequestMessage {
         supported_transports: Vec::new(),
         nonce: 1234,
-        transport_protocol: None,
         timestamp: Some(current_timestamp()),
     };
 
@@ -1514,8 +1491,6 @@ fn test_produce_pre_pair_rejects_responder_secret_key_material() {
     ));
 }
 
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 #[test]
 fn test_produce_pre_pair_response_keys_match_initiator_contact_keys_in_inline_mode() {
     let channel_id = ChannelId(42);
@@ -1536,7 +1511,6 @@ fn test_produce_pre_pair_response_keys_match_initiator_contact_keys_in_inline_mo
     let dummy_request = derec_proto::PrePairRequestMessage {
         supported_transports: Vec::new(),
         nonce: 7,
-        transport_protocol: None,
         timestamp: Some(current_timestamp()),
     };
 
@@ -1880,6 +1854,7 @@ fn test_process_pairing_response_rejects_tampered_channel_id_rekey() {
     } = extract_pairing_request(
         &bob_pair_req_envelope,
         alice_sk_state.as_ref().unwrap().ecies_secret_key(),
+        None,
     )
     .expect("extract_pairing_request failed");
 
@@ -1907,6 +1882,7 @@ fn test_process_pairing_response_rejects_tampered_channel_id_rekey() {
         &initiator_contact_message,
         &tampered_response,
         &bob_sk_state,
+        None,
     );
 
     assert!(matches!(
@@ -1991,6 +1967,7 @@ fn test_pairing_rekey_also_fires_in_hashed_keys_mode() {
     } = extract_pairing_request(
         &bob_pair_req_envelope,
         alice_sk_state.as_ref().unwrap().ecies_secret_key(),
+        None,
     )
     .expect("extract_pairing_request failed");
 
@@ -2020,6 +1997,7 @@ fn test_pairing_rekey_also_fires_in_hashed_keys_mode() {
         &initiator_contact_message,
         &alice_pair_resp_msg,
         &bob_sk_state,
+        None,
     )
     .expect("process_pairing_response_message failed");
 
@@ -2031,66 +2009,62 @@ fn test_pairing_rekey_also_fires_in_hashed_keys_mode() {
     );
 }
 
-/// Reference contact builders for the `validate_contact_for_mode` tests.
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
+/// Reference contact builders for the `validate_for_mode` tests.
 fn well_formed_inline_keys_contact() -> ContactMessage {
     ContactMessage {
         channel_id: 42,
-        transport_protocol: Some(TransportProtocol {
-            uri: "https://relay.example/alice".to_owned(),
-            protocol: Protocol::Https.into(),
-        }),
         contact_mode: ContactMode::InlineKeys as i32,
         mlkem_encapsulation_key: Some(vec![1; 1184]),
         ecies_public_key: Some(vec![2; 33]),
         contact_binding_hash: None,
         nonce: 0xCAFE_BABE,
         timestamp: Some(current_timestamp()),
-        supported_transports: Vec::new(),
+        supported_transports: vec![TransportProtocol {
+            uri: "https://relay.example/alice".to_owned(),
+            protocol: Protocol::Https.into(),
+        }],
     }
 }
 
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 fn well_formed_hashed_keys_contact() -> ContactMessage {
     ContactMessage {
         channel_id: 42,
-        transport_protocol: Some(TransportProtocol {
-            uri: "https://relay.example/alice/ephemeral".to_owned(),
-            protocol: Protocol::Https.into(),
-        }),
         contact_mode: ContactMode::HashedKeys as i32,
         mlkem_encapsulation_key: None,
         ecies_public_key: None,
         contact_binding_hash: Some(vec![0xAB; 48]),
         nonce: 0xDEAD_BEEF,
         timestamp: Some(current_timestamp()),
-        supported_transports: Vec::new(),
+        supported_transports: vec![TransportProtocol {
+            uri: "https://relay.example/alice/ephemeral".to_owned(),
+            protocol: Protocol::Https.into(),
+        }],
     }
 }
 
 #[test]
 fn test_validate_contact_for_mode_accepts_well_formed_inline_keys() {
-    use crate::primitives::pairing::validate_contact_for_mode;
+    use crate::extensions::contact_message::ContactMessageExt as _;
     let c = well_formed_inline_keys_contact();
-    validate_contact_for_mode(&c, ContactMode::InlineKeys)
+    c.validate_for_mode(ContactMode::InlineKeys)
         .expect("well-formed inline_keys must pass");
 }
 
 #[test]
 fn test_validate_contact_for_mode_accepts_well_formed_hashed_keys() {
-    use crate::primitives::pairing::validate_contact_for_mode;
+    use crate::extensions::contact_message::ContactMessageExt as _;
     let c = well_formed_hashed_keys_contact();
-    validate_contact_for_mode(&c, ContactMode::HashedKeys)
+    c.validate_for_mode(ContactMode::HashedKeys)
         .expect("well-formed hashed_keys must pass");
 }
 
 #[test]
 fn test_validate_contact_for_mode_rejects_mode_mismatch() {
-    use crate::primitives::pairing::validate_contact_for_mode;
+    use crate::extensions::contact_message::ContactMessageExt as _;
     let inline = well_formed_inline_keys_contact();
-    let err = validate_contact_for_mode(&inline, ContactMode::HashedKeys).unwrap_err();
+    let err = inline
+        .validate_for_mode(ContactMode::HashedKeys)
+        .unwrap_err();
     assert!(matches!(
         err,
         Error::Pairing(PairingError::InvalidContactMessage(m))
@@ -2098,7 +2072,9 @@ fn test_validate_contact_for_mode_rejects_mode_mismatch() {
     ));
 
     let hashed = well_formed_hashed_keys_contact();
-    let err = validate_contact_for_mode(&hashed, ContactMode::InlineKeys).unwrap_err();
+    let err = hashed
+        .validate_for_mode(ContactMode::InlineKeys)
+        .unwrap_err();
     assert!(matches!(
         err,
         Error::Pairing(PairingError::InvalidContactMessage(m))
@@ -2108,10 +2084,10 @@ fn test_validate_contact_for_mode_rejects_mode_mismatch() {
 
 #[test]
 fn test_validate_contact_for_mode_rejects_inline_missing_mlkem_key() {
-    use crate::primitives::pairing::validate_contact_for_mode;
+    use crate::extensions::contact_message::ContactMessageExt as _;
     let mut c = well_formed_inline_keys_contact();
     c.mlkem_encapsulation_key = Some(Vec::new());
-    let err = validate_contact_for_mode(&c, ContactMode::InlineKeys).unwrap_err();
+    let err = c.validate_for_mode(ContactMode::InlineKeys).unwrap_err();
     assert!(matches!(
         err,
         Error::Pairing(PairingError::InvalidContactMessage(m))
@@ -2120,7 +2096,7 @@ fn test_validate_contact_for_mode_rejects_inline_missing_mlkem_key() {
 
     let mut c = well_formed_inline_keys_contact();
     c.mlkem_encapsulation_key = None;
-    let err = validate_contact_for_mode(&c, ContactMode::InlineKeys).unwrap_err();
+    let err = c.validate_for_mode(ContactMode::InlineKeys).unwrap_err();
     assert!(matches!(
         err,
         Error::Pairing(PairingError::InvalidContactMessage(m))
@@ -2130,10 +2106,10 @@ fn test_validate_contact_for_mode_rejects_inline_missing_mlkem_key() {
 
 #[test]
 fn test_validate_contact_for_mode_rejects_inline_missing_ecies_key() {
-    use crate::primitives::pairing::validate_contact_for_mode;
+    use crate::extensions::contact_message::ContactMessageExt as _;
     let mut c = well_formed_inline_keys_contact();
     c.ecies_public_key = None;
-    let err = validate_contact_for_mode(&c, ContactMode::InlineKeys).unwrap_err();
+    let err = c.validate_for_mode(ContactMode::InlineKeys).unwrap_err();
     assert!(matches!(
         err,
         Error::Pairing(PairingError::InvalidContactMessage(m))
@@ -2143,10 +2119,10 @@ fn test_validate_contact_for_mode_rejects_inline_missing_ecies_key() {
 
 #[test]
 fn test_validate_contact_for_mode_rejects_inline_with_binding_hash() {
-    use crate::primitives::pairing::validate_contact_for_mode;
+    use crate::extensions::contact_message::ContactMessageExt as _;
     let mut c = well_formed_inline_keys_contact();
     c.contact_binding_hash = Some(vec![0xCD; 48]);
-    let err = validate_contact_for_mode(&c, ContactMode::InlineKeys).unwrap_err();
+    let err = c.validate_for_mode(ContactMode::InlineKeys).unwrap_err();
     assert!(matches!(
         err,
         Error::Pairing(PairingError::InvalidContactMessage(m))
@@ -2156,10 +2132,10 @@ fn test_validate_contact_for_mode_rejects_inline_with_binding_hash() {
 
 #[test]
 fn test_validate_contact_for_mode_rejects_hashed_with_inline_keys() {
-    use crate::primitives::pairing::validate_contact_for_mode;
+    use crate::extensions::contact_message::ContactMessageExt as _;
     let mut c = well_formed_hashed_keys_contact();
     c.mlkem_encapsulation_key = Some(vec![1; 1184]);
-    let err = validate_contact_for_mode(&c, ContactMode::HashedKeys).unwrap_err();
+    let err = c.validate_for_mode(ContactMode::HashedKeys).unwrap_err();
     assert!(matches!(
         err,
         Error::Pairing(PairingError::InvalidContactMessage(m))
@@ -2168,7 +2144,7 @@ fn test_validate_contact_for_mode_rejects_hashed_with_inline_keys() {
 
     let mut c = well_formed_hashed_keys_contact();
     c.ecies_public_key = Some(vec![2; 33]);
-    let err = validate_contact_for_mode(&c, ContactMode::HashedKeys).unwrap_err();
+    let err = c.validate_for_mode(ContactMode::HashedKeys).unwrap_err();
     assert!(matches!(
         err,
         Error::Pairing(PairingError::InvalidContactMessage(m))
@@ -2178,10 +2154,10 @@ fn test_validate_contact_for_mode_rejects_hashed_with_inline_keys() {
 
 #[test]
 fn test_validate_contact_for_mode_rejects_hashed_missing_binding_hash() {
-    use crate::primitives::pairing::validate_contact_for_mode;
+    use crate::extensions::contact_message::ContactMessageExt as _;
     let mut c = well_formed_hashed_keys_contact();
     c.contact_binding_hash = None;
-    let err = validate_contact_for_mode(&c, ContactMode::HashedKeys).unwrap_err();
+    let err = c.validate_for_mode(ContactMode::HashedKeys).unwrap_err();
     assert!(matches!(
         err,
         Error::Pairing(PairingError::InvalidContactMessage(m))
@@ -2190,7 +2166,7 @@ fn test_validate_contact_for_mode_rejects_hashed_missing_binding_hash() {
 
     let mut c = well_formed_hashed_keys_contact();
     c.contact_binding_hash = Some(Vec::new());
-    let err = validate_contact_for_mode(&c, ContactMode::HashedKeys).unwrap_err();
+    let err = c.validate_for_mode(ContactMode::HashedKeys).unwrap_err();
     assert!(matches!(
         err,
         Error::Pairing(PairingError::InvalidContactMessage(m))
@@ -2200,170 +2176,15 @@ fn test_validate_contact_for_mode_rejects_hashed_missing_binding_hash() {
 
 #[test]
 fn test_validate_contact_for_mode_rejects_hashed_wrong_hash_length() {
-    use crate::primitives::pairing::validate_contact_for_mode;
+    use crate::extensions::contact_message::ContactMessageExt as _;
     let mut c = well_formed_hashed_keys_contact();
     c.contact_binding_hash = Some(vec![0xAB; 32]);
-    let err = validate_contact_for_mode(&c, ContactMode::HashedKeys).unwrap_err();
+    let err = c.validate_for_mode(ContactMode::HashedKeys).unwrap_err();
     assert!(matches!(
         err,
         Error::Pairing(PairingError::InvalidContactMessage(m))
             if m == "hashed_keys contact_binding_hash is not a SHA-384 digest"
     ));
-}
-
-/// A peer-supplied `PairRequestMessage.transport_protocol` declaring
-/// `Protocol::Https` but carrying a URI with an unsupported scheme is
-/// rejected on the initiator side at extract — the producer-side
-/// `validate_inputs` catches well-behaved local builds, and this gate
-/// catches a malicious responder that bypasses it. (`http://` is
-/// intentionally accepted as a dev-mode affordance and is flagged via
-/// `tracing::warn!`; see `crate::transport`.)
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
-#[test]
-fn test_extract_pairing_request_rejects_scheme_mismatched_transport_protocol() {
-    use crate::derec_message::DeRecMessageBuilder;
-
-    let alice_channel_id = ChannelId(91);
-
-    let CreateContactMessageResult {
-        contact_message: alice_contact,
-        secret_key: alice_sk_state,
-    } = create_contact_message(
-        alice_channel_id,
-        ContactMode::InlineKeys,
-        vec![TransportProtocol {
-            uri: "https://relay.example/alice".to_owned(),
-            protocol: Protocol::Https.into(),
-        }],
-        None,
-    )
-    .expect("failed to create contact message");
-
-    let malicious_transport = TransportProtocol {
-        uri: "ws://attacker.example/inbox".to_owned(),
-        protocol: Protocol::Https.into(),
-    };
-    let timestamp = current_timestamp();
-    let request = PairRequestMessage {
-        sender_kind: SenderKind::Helper.into(),
-        mlkem_ciphertext: vec![0u8; 32],
-        ecies_public_key: vec![0u8; 33],
-        nonce: alice_contact.nonce,
-        communication_info: None,
-        parameter_range: None,
-        transport_protocol: Some(malicious_transport),
-        timestamp: Some(timestamp),
-        supported_transports: Vec::new(),
-    };
-
-    let envelope = DeRecMessageBuilder::pairing()
-        .channel_id(alice_channel_id)
-        .timestamp(timestamp)
-        .message_body(MessageBody::PairRequest(request))
-        .encrypt_pairing(
-            alice_contact
-                .ecies_public_key
-                .as_ref()
-                .expect("inline-keys contact carries ecies_public_key"),
-        )
-        .expect("encrypt pairing")
-        .build()
-        .expect("build envelope")
-        .encode_to_vec();
-
-    let result = extract_pairing_request(
-        &envelope,
-        alice_sk_state.as_ref().unwrap().ecies_secret_key(),
-    );
-
-    assert!(matches!(
-        result,
-        Err(Error::Transport(
-            crate::transport::TransportValidationError::SchemeMismatch { .. }
-        ))
-    ));
-}
-
-/// Same gate at the plaintext PrePair leg: a `PrePairRequestMessage`
-/// advertising `Protocol::Https` with a URI carrying an unsupported
-/// scheme is rejected at extract. (`http://` is intentionally accepted
-/// as a dev-mode affordance and is flagged via `tracing::warn!`; see
-/// `crate::transport`.)
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
-#[test]
-fn test_extract_pre_pair_rejects_scheme_mismatched_transport_protocol() {
-    use crate::protocol_version::ProtocolVersion;
-    use derec_proto::PrePairRequestMessage;
-
-    let channel_id = ChannelId(92);
-
-    let malicious_transport = TransportProtocol {
-        uri: "ws://attacker.example/inbox".to_owned(),
-        protocol: Protocol::Https.into(),
-    };
-    let timestamp = current_timestamp();
-    let request = PrePairRequestMessage {
-        supported_transports: Vec::new(),
-        nonce: 0xDEAD_BEEF,
-        transport_protocol: Some(malicious_transport),
-        timestamp: Some(timestamp),
-    };
-
-    let version = ProtocolVersion::current();
-    let envelope = DeRecMessage {
-        protocol_version_major: version.major,
-        protocol_version_minor: version.minor,
-        sequence: 0,
-        channel_id: channel_id.into(),
-        timestamp: Some(timestamp),
-        message: MessageBody::PrePairRequest(request).encode_to_vec(),
-        trace_id: 0,
-    }
-    .encode_to_vec();
-
-    let result = extract_pre_pair(&envelope);
-
-    assert!(matches!(
-        result,
-        Err(Error::Transport(
-            crate::transport::TransportValidationError::SchemeMismatch { .. }
-        ))
-    ));
-}
-
-/// Old peers read only the singular field, so a multi-transport contact
-/// must still fill it. The first entry is what goes there: the order is
-/// the application's stated preference and is never reinterpreted here.
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
-#[test]
-fn legacy_field_takes_the_first_entry() {
-    let own = vec![
-        TransportProtocol {
-            uri: "grpcs://me.example.com:443".to_owned(),
-            protocol: Protocol::Grpc as i32,
-        },
-        TransportProtocol {
-            uri: "https://me.example.com/derec".to_owned(),
-            protocol: Protocol::Https as i32,
-        },
-    ];
-    let result = create_contact_message(ChannelId(1), ContactMode::InlineKeys, own, Some(42))
-        .expect("creates");
-
-    assert_eq!(
-        result
-            .contact_message
-            .transport_protocol
-            .as_ref()
-            .expect("legacy field is always filled")
-            .protocol,
-        Protocol::Grpc as i32,
-        "the legacy singular field must mirror the caller's first entry, \
-         not a protocol the library picked on its own"
-    );
 }
 
 /// An empty list has no entry to advertise, so contact creation fails
@@ -2399,99 +2220,6 @@ fn contact_carries_every_served_transport() {
     );
 }
 
-/// A responder builds its PrePair reply from a request a peer sent, so the
-/// endpoint in that request is untrusted input. Validating it here rather
-/// than only at `extract_pre_pair` matters because the FFI decodes straight
-/// into this call, bypassing `extract` entirely.
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
-#[test]
-fn test_produce_pre_pair_rejects_scheme_mismatched_transport_protocol() {
-    let channel_id = ChannelId(4301);
-    let CreateContactMessageResult {
-        secret_key: alice_secret,
-        ..
-    } = create_contact_message(
-        channel_id,
-        ContactMode::InlineKeys,
-        vec![TransportProtocol {
-            uri: "https://relay.example/alice".to_owned(),
-            protocol: Protocol::Https.into(),
-        }],
-        None,
-    )
-    .expect("failed to create contact");
-
-    let request = derec_proto::PrePairRequestMessage {
-        supported_transports: Vec::new(),
-        nonce: 7,
-        transport_protocol: Some(TransportProtocol {
-            uri: "ws://attacker.example/inbox".to_owned(),
-            protocol: Protocol::Https.into(),
-        }),
-        timestamp: Some(current_timestamp()),
-    };
-
-    let result = produce_pre_pair(channel_id, &request, alice_secret.as_ref().unwrap());
-
-    assert!(
-        matches!(
-            result,
-            Err(Error::Transport(
-                crate::transport::TransportValidationError::SchemeMismatch { .. }
-            ))
-        ),
-        "a scheme-mismatched reply endpoint must be refused"
-    );
-}
-
-/// Same guard on the NoKeys leg, which generates key material before
-/// replying and so must refuse before doing that work.
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
-#[test]
-fn test_produce_pre_pair_no_keys_rejects_scheme_mismatched_transport_protocol() {
-    let request = derec_proto::PrePairRequestMessage {
-        supported_transports: Vec::new(),
-        nonce: 11,
-        transport_protocol: Some(TransportProtocol {
-            uri: "ws://attacker.example/inbox".to_owned(),
-            protocol: Protocol::Https.into(),
-        }),
-        timestamp: Some(current_timestamp()),
-    };
-
-    let result = produce_pre_pair_no_keys(ChannelId(4302), &request);
-
-    assert!(
-        matches!(
-            result,
-            Err(Error::Transport(
-                crate::transport::TransportValidationError::SchemeMismatch { .. }
-            ))
-        ),
-        "a scheme-mismatched reply endpoint must be refused"
-    );
-}
-
-/// An absent endpoint stays acceptable: the responder then routes to what
-/// it already has on file. Locks in that adding validation did not turn
-/// absence into an error.
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
-#[test]
-fn test_produce_pre_pair_no_keys_accepts_an_absent_transport_protocol() {
-    let request = derec_proto::PrePairRequestMessage {
-        supported_transports: Vec::new(),
-        nonce: 13,
-        transport_protocol: None,
-        timestamp: Some(current_timestamp()),
-    };
-
-    produce_pre_pair_no_keys(ChannelId(4303), &request)
-        .expect("an absent reply endpoint is not an error");
-}
-
 /// Builds a pairing envelope carrying `request`, encrypted to `contact`'s
 /// ECIES public key. Lets a test hand a deliberately malformed body to
 /// `extract` the way a hostile peer would.
@@ -2522,8 +2250,6 @@ fn pairing_envelope_carrying(
 /// A malformed request is refused at the parse boundary rather than
 /// travelling until something happens to read the missing field. The FFI
 /// decodes through this call, so every SDK inherits the check.
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 #[test]
 fn test_extract_pairing_request_rejects_missing_mlkem_ciphertext() {
     let channel_id = ChannelId(4401);
@@ -2552,17 +2278,20 @@ fn test_extract_pairing_request_rejects_missing_mlkem_ciphertext() {
             nonce: alice_contact.nonce,
             communication_info: None,
             parameter_range: None,
-            transport_protocol: Some(TransportProtocol {
+            timestamp: Some(timestamp),
+            supported_transports: vec![TransportProtocol {
                 uri: "https://relay.example/bob".to_owned(),
                 protocol: Protocol::Https.into(),
-            }),
-            timestamp: Some(timestamp),
-            supported_transports: Vec::new(),
+            }],
         },
         timestamp,
     );
 
-    let result = extract_pairing_request(&envelope, alice_sk.as_ref().unwrap().ecies_secret_key());
+    let result = extract_pairing_request(
+        &envelope,
+        alice_sk.as_ref().unwrap().ecies_secret_key(),
+        None,
+    );
 
     assert!(
         matches!(
@@ -2575,8 +2304,6 @@ fn test_extract_pairing_request_rejects_missing_mlkem_ciphertext() {
 
 /// A request advertising no endpoint at all is refused here too: there
 /// would be nowhere to send the response.
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 #[test]
 fn test_extract_pairing_request_rejects_a_request_advertising_no_endpoint() {
     let channel_id = ChannelId(4402);
@@ -2605,14 +2332,17 @@ fn test_extract_pairing_request_rejects_a_request_advertising_no_endpoint() {
             nonce: alice_contact.nonce,
             communication_info: None,
             parameter_range: None,
-            transport_protocol: None,
             timestamp: Some(timestamp),
             supported_transports: Vec::new(),
         },
         timestamp,
     );
 
-    let result = extract_pairing_request(&envelope, alice_sk.as_ref().unwrap().ecies_secret_key());
+    let result = extract_pairing_request(
+        &envelope,
+        alice_sk.as_ref().unwrap().ecies_secret_key(),
+        None,
+    );
 
     assert!(
         matches!(result, Err(Error::Pairing(PairingError::EmptyTransportUri))),
@@ -2651,8 +2381,12 @@ fn test_extract_pairing_request_accepts_a_well_formed_request() {
     )
     .expect("failed to produce valid pairing request");
 
-    extract_pairing_request(&envelope, alice_sk.as_ref().unwrap().ecies_secret_key())
-        .expect("a well-formed request extracts");
+    extract_pairing_request(
+        &envelope,
+        alice_sk.as_ref().unwrap().ecies_secret_key(),
+        None,
+    )
+    .expect("a well-formed request extracts");
 }
 
 /// A contact that names no endpoint at all leaves the scanner nowhere to
@@ -2679,8 +2413,7 @@ fn test_validate_rejects_a_contact_advertising_no_endpoint() {
     );
 }
 
-/// The list alone satisfies the rule: a peer that has moved past the
-/// deprecated singular field must not be refused for omitting it.
+/// A contact carrying a non-empty list is valid.
 #[test]
 fn test_validate_accepts_a_contact_carrying_only_the_list() {
     use crate::extensions::contact_message::ContactMessageExt as _;
@@ -2702,47 +2435,7 @@ fn test_validate_accepts_a_contact_carrying_only_the_list() {
         .expect("a contact carrying only the list is valid");
 }
 
-/// And the whole pairing entry point accepts it, not just `validate`.
-/// `validate_inputs` used to demand the singular field, which refused a
-/// peer doing the modern thing.
-#[test]
-fn test_produce_accepts_a_contact_carrying_only_the_list() {
-    let CreateContactMessageResult {
-        contact_message: mut alice_contact,
-        ..
-    } = create_contact_message(
-        ChannelId(5003),
-        ContactMode::InlineKeys,
-        vec![TransportProtocol {
-            uri: "https://relay.example/alice".to_owned(),
-            protocol: Protocol::Https.into(),
-        }],
-        None,
-    )
-    .expect("failed to create contact message");
-
-    // Drop the deprecated singular field, leaving only the list.
-    #[allow(deprecated)]
-    {
-        alice_contact.transport_protocol = None;
-    }
-
-    produce_pairing_request_message(
-        SenderKind::Helper,
-        vec![TransportProtocol {
-            uri: "https://relay.example/bob".to_owned(),
-            protocol: Protocol::Https.into(),
-        }],
-        &alice_contact,
-        None,
-        None,
-    )
-    .expect("a list-only contact must be accepted");
-}
-
-/// A PrePair request advertises the scanner's whole list, filling the
-/// deprecated singular field from the first entry so peers predating the
-/// list still know where to reply.
+/// A PrePair request advertises the scanner's whole list.
 #[test]
 fn test_produce_pre_pair_request_advertises_the_whole_list() {
     let channel_id = ChannelId(5004);
@@ -2786,14 +2479,6 @@ fn test_produce_pre_pair_request_advertises_the_whole_list() {
         request.supported_transports, own,
         "the whole list must travel in the sender's own order"
     );
-    #[allow(deprecated)]
-    {
-        assert_eq!(
-            request.transport_protocol.as_ref(),
-            own.first(),
-            "the first entry must fill the deprecated singular field"
-        );
-    }
 }
 
 /// An empty list is refused: the request would name nowhere to reply.
@@ -2820,4 +2505,255 @@ fn test_produce_pre_pair_request_rejects_an_empty_transport_list() {
         ),
         "a PrePair request naming no endpoint must be refused"
     );
+}
+
+fn endpoint(uri: &str) -> TransportProtocol {
+    TransportProtocol {
+        uri: uri.to_owned(),
+        protocol: Protocol::Https.into(),
+    }
+}
+
+/// Every field at its widest except `shareSize`, so a disjoint pair of these
+/// fails on that field alone.
+fn share_size_range(min: i64, max: i64) -> derec_proto::ParameterRange {
+    derec_proto::ParameterRange {
+        min_share_size: min,
+        max_share_size: max,
+        min_time_between_verifications: 0,
+        max_time_between_verifications: i64::MAX,
+        min_time_between_share_updates: 0,
+        max_time_between_share_updates: i64::MAX,
+        min_unresponsive_deletion_timeout: 0,
+        max_unresponsive_deletion_timeout: i64::MAX,
+        min_unresponsive_deactivation_timeout: 0,
+        max_unresponsive_deactivation_timeout: i64::MAX,
+    }
+}
+
+fn is_incompatible_share_size(result: &Result<impl Sized, Error>) -> bool {
+    matches!(
+        result,
+        Err(Error::Pairing(PairingError::IncompatibleParameterRange { field, .. }))
+            if *field == "shareSize"
+    )
+}
+
+#[test]
+fn test_contact_codec_round_trips_every_mode() {
+    for mode in [
+        ContactMode::InlineKeys,
+        ContactMode::HashedKeys,
+        ContactMode::NoKeys,
+    ] {
+        let CreateContactMessageResult {
+            contact_message, ..
+        } = create_contact_message(
+            ChannelId(u64::MAX),
+            mode,
+            vec![
+                endpoint("https://relay.example/alice"),
+                endpoint("https://backup.example/alice"),
+            ],
+            Some(123_456),
+        )
+        .expect("failed to create contact message");
+
+        let bytes = encode_contact(&contact_message).expect("encode_contact failed");
+        assert_eq!(
+            bytes,
+            contact_message.encode_to_vec(),
+            "the codec is the contact's protobuf encoding"
+        );
+        assert_eq!(
+            decode_contact(&bytes).expect("decode_contact failed"),
+            contact_message,
+            "{mode:?} must survive the round trip"
+        );
+    }
+}
+
+/// An `InlineKeys` contact carrying a binding hash violates its mode. It is
+/// refused on the way out, so it is never published, and on the way in, so
+/// a scanner never pairs against it.
+#[test]
+fn test_contact_codec_refuses_an_invalid_contact_both_ways() {
+    let invalid = ContactMessage {
+        channel_id: 7,
+        nonce: 9,
+        contact_mode: ContactMode::InlineKeys as i32,
+        mlkem_encapsulation_key: Some(vec![1, 2, 3]),
+        ecies_public_key: Some(vec![4, 5, 6]),
+        contact_binding_hash: Some(vec![7; 48]),
+        timestamp: None,
+        supported_transports: vec![endpoint("https://relay.example/alice")],
+    };
+
+    assert!(matches!(
+        encode_contact(&invalid),
+        Err(Error::Pairing(PairingError::InvalidContactMessage(_)))
+    ));
+    assert!(matches!(
+        decode_contact(&invalid.encode_to_vec()),
+        Err(Error::Pairing(PairingError::InvalidContactMessage(_)))
+    ));
+
+    let no_endpoint = ContactMessage {
+        supported_transports: Vec::new(),
+        contact_binding_hash: None,
+        ..invalid
+    };
+    assert!(encode_contact(&no_endpoint).is_err());
+    assert!(decode_contact(&no_endpoint.encode_to_vec()).is_err());
+}
+
+#[test]
+fn test_decode_contact_refuses_bytes_that_are_not_a_contact() {
+    assert!(matches!(
+        decode_contact(&[0xFF, 0xFF, 0xFF]),
+        Err(Error::ProtobufDecode(_))
+    ));
+}
+
+/// The contact creator refuses a requester whose range cannot overlap its
+/// own, both when the request is extracted and when a response would be
+/// produced from it, so no shared key is ever derived for it.
+#[test]
+fn test_contact_creator_refuses_an_incompatible_parameter_range() {
+    let creator_range = share_size_range(1_000_000_000, 5_000_000_000);
+    let requester_range = share_size_range(10_000_000, 500_000_000);
+
+    let CreateContactMessageResult {
+        contact_message,
+        secret_key,
+    } = create_contact_message(
+        ChannelId(42),
+        ContactMode::InlineKeys,
+        vec![endpoint("https://relay.example/alice")],
+        None,
+    )
+    .expect("failed to create contact message");
+    let secret_key = secret_key.expect("InlineKeys contact carries key material");
+
+    let ProducePairingRequestMessageResult { envelope, .. } = produce_pairing_request_message(
+        SenderKind::Helper,
+        vec![endpoint("https://relay.example/bob")],
+        &contact_message,
+        None,
+        Some(requester_range),
+    )
+    .expect("producing a request is not where ranges are compared");
+
+    let refused = extract_pairing_request(
+        &envelope,
+        secret_key.ecies_secret_key(),
+        Some(&creator_range),
+    );
+    assert!(
+        is_incompatible_share_size(&refused),
+        "extract must refuse a disjoint range"
+    );
+
+    let ExtractPairingRequestResult { request } =
+        extract_pairing_request(&envelope, secret_key.ecies_secret_key(), None)
+            .expect("no local range accepts any peer range");
+    assert_eq!(request.parameter_range.as_ref(), Some(&requester_range));
+
+    let refused = produce_pairing_response_message(
+        ChannelId(42),
+        &request,
+        &secret_key,
+        None,
+        Some(creator_range),
+        test_policy(),
+    );
+    assert!(
+        is_incompatible_share_size(&refused),
+        "produce must refuse a disjoint range"
+    );
+
+    let overlapping = share_size_range(100_000_000, 1_000_000_000);
+    extract_pairing_request(&envelope, secret_key.ecies_secret_key(), Some(&overlapping))
+        .expect("an overlapping range is accepted");
+    produce_pairing_response_message(
+        ChannelId(42),
+        &request,
+        &secret_key,
+        None,
+        Some(overlapping),
+        test_policy(),
+    )
+    .expect("an overlapping range is accepted");
+}
+
+/// The scanner refuses a response whose advertised range cannot overlap its
+/// own before deriving any key.
+#[test]
+fn test_scanner_refuses_an_incompatible_parameter_range() {
+    let creator_range = share_size_range(1_000_000_000, 5_000_000_000);
+    let scanner_range = share_size_range(10_000_000, 500_000_000);
+
+    let CreateContactMessageResult {
+        contact_message,
+        secret_key,
+    } = create_contact_message(
+        ChannelId(42),
+        ContactMode::InlineKeys,
+        vec![endpoint("https://relay.example/alice")],
+        None,
+    )
+    .expect("failed to create contact message");
+    let creator_key = secret_key.expect("InlineKeys contact carries key material");
+
+    let ProducePairingRequestMessageResult {
+        envelope,
+        initiator_contact_message,
+        secret_key: scanner_key,
+    } = produce_pairing_request_message(
+        SenderKind::Helper,
+        vec![endpoint("https://relay.example/bob")],
+        &contact_message,
+        None,
+        None,
+    )
+    .expect("failed to produce pairing request");
+
+    let ExtractPairingRequestResult { request } =
+        extract_pairing_request(&envelope, creator_key.ecies_secret_key(), None)
+            .expect("failed to extract pairing request");
+    let ProducePairingResponseMessageResult {
+        envelope: response_envelope,
+        ..
+    } = produce_pairing_response_message(
+        ChannelId(42),
+        &request,
+        &creator_key,
+        None,
+        Some(creator_range),
+        test_policy(),
+    )
+    .expect("the request advertised no range, so the creator accepts it");
+
+    let ExtractPairingResponseResult { response } =
+        extract_pairing_response(&response_envelope, scanner_key.ecies_secret_key())
+            .expect("failed to extract pairing response");
+
+    let refused = process_pairing_response_message(
+        &initiator_contact_message,
+        &response,
+        &scanner_key,
+        Some(&scanner_range),
+    );
+    assert!(
+        is_incompatible_share_size(&refused),
+        "process must refuse a disjoint range"
+    );
+
+    process_pairing_response_message(
+        &initiator_contact_message,
+        &response,
+        &scanner_key,
+        Some(&share_size_range(1_000_000_000, 2_000_000_000)),
+    )
+    .expect("an overlapping range is accepted");
 }

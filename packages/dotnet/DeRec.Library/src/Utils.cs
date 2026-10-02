@@ -2,6 +2,7 @@
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 
 namespace DeRec.Library;
@@ -16,6 +17,8 @@ namespace DeRec.Library;
 /// when <see cref="Code"/> equals <see cref="DeRecCode.NonOkStatus"/>.</item>
 /// <item><see cref="Expected"/> / <see cref="Got"/> are populated when
 /// <see cref="Code"/> equals <see cref="DeRecCode.VersionMismatch"/>.</item>
+/// <item><see cref="ConflictingChannelIds"/> is populated when
+/// <see cref="Code"/> equals <see cref="DeRecCode.RestoreConflict"/>.</item>
 /// </list>
 /// </summary>
 public sealed class DeRecException : Exception
@@ -27,7 +30,22 @@ public sealed class DeRecException : Exception
     public uint Expected { get; }
     public uint Got { get; }
 
-    internal DeRecException(int category, int code, string message, int peerStatus, string? peerMemo, uint expected, uint got)
+    /// <summary>
+    /// Channel ids that already exist at the canonical ids carried by the
+    /// recovered <c>Secret</c>, when <see cref="Code"/> equals
+    /// <see cref="DeRecCode.RestoreConflict"/>. Clear exactly these and retry
+    /// the restore. Empty for every other code.
+    /// </summary>
+    public IReadOnlyList<ulong> ConflictingChannelIds { get; }
+
+    /// <summary>Stable name of <see cref="Category"/>, e.g. <c>"pairing"</c>.</summary>
+    public string CategoryName => DeRecCategory.Name(Category);
+
+    /// <summary>Stable name of <see cref="Code"/>, e.g. <c>"no_usable_endpoint"</c>.</summary>
+    public string CodeName => DeRecCode.Name(Code);
+
+    internal DeRecException(int category, int code, string message, int peerStatus, string? peerMemo, uint expected, uint got,
+        IReadOnlyList<ulong>? conflictingChannelIds = null)
         : base(message)
     {
         Category = category;
@@ -36,6 +54,7 @@ public sealed class DeRecException : Exception
         PeerMemo = peerMemo;
         Expected = expected;
         Got = got;
+        ConflictingChannelIds = conflictingChannelIds ?? Array.Empty<ulong>();
     }
 
     public override string ToString()
@@ -49,7 +68,7 @@ public sealed class DeRecException : Exception
         {
             detail = $" expected={Expected}, got={Got}";
         }
-        return $"DeRecException(category={Category}, code={Code}): {Message}{detail}";
+        return $"DeRecException(category={Category} ({CategoryName}), code={Code} ({CodeName})): {Message}{detail}";
     }
 }
 
@@ -83,7 +102,14 @@ internal static class Utils
     /// indicates failure. Always releases the error's owned strings before
     /// returning or throwing.
     /// </summary>
-    public static void ThrowIfError(Native.DeRecError error)
+    public static void ThrowIfError(Native.DeRecError error) =>
+        ThrowIfError(error, conflictingChannelIds: null);
+
+    /// <summary>
+    /// <see cref="ThrowIfError(Native.DeRecError)"/>, attaching
+    /// <paramref name="conflictingChannelIds"/> to the thrown exception.
+    /// </summary>
+    public static void ThrowIfError(Native.DeRecError error, IReadOnlyList<ulong>? conflictingChannelIds)
     {
         if (error.Category == DeRecCategory.Ok)
         {
@@ -93,11 +119,11 @@ internal static class Utils
         }
 
         string message = error.Message != IntPtr.Zero
-            ? Marshal.PtrToStringAnsi(error.Message) ?? "unknown error"
+            ? Marshal.PtrToStringUTF8(error.Message) ?? "unknown error"
             : "unknown error";
 
         string? peerMemo = error.PeerMemo != IntPtr.Zero
-            ? Marshal.PtrToStringAnsi(error.PeerMemo)
+            ? Marshal.PtrToStringUTF8(error.PeerMemo)
             : null;
 
         var ex = new DeRecException(
@@ -107,11 +133,28 @@ internal static class Utils
             peerStatus: error.PeerStatus,
             peerMemo: peerMemo,
             expected: error.Expected,
-            got: error.Got
+            got: error.Got,
+            conflictingChannelIds: conflictingChannelIds
         );
 
         Native.Utils.derec_free_error(ref error);
         throw ex;
+    }
+
+    /// <summary>
+    /// Decodes a native JSON array of decimal-string channel ids into
+    /// <c>ulong</c> values. An empty buffer decodes to an empty list. Does not
+    /// release <paramref name="buffer"/>.
+    /// </summary>
+    public static IReadOnlyList<ulong> ParseChannelIdList(Native.Buffer buffer)
+    {
+        byte[] json = CopyBuffer(buffer);
+        if (json.Length == 0)
+        {
+            return Array.Empty<ulong>();
+        }
+        var ids = System.Text.Json.JsonSerializer.Deserialize<string[]>(json) ?? Array.Empty<string>();
+        return Array.ConvertAll(ids, id => ulong.Parse(id, System.Globalization.CultureInfo.InvariantCulture));
     }
 
     /// <summary>

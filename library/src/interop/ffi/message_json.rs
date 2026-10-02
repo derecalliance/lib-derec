@@ -511,8 +511,6 @@ mod tests {
             version: 7,
             nonce: 9_007_199_254_740_993,
             timestamp: None,
-            #[allow(deprecated)]
-            reply_to: None,
             reply_to_transports: Vec::new(),
         };
         let json = decode(
@@ -566,8 +564,6 @@ mod tests {
 
     /// `ParameterRange`'s bounds are `i64` and are surfaced as `bigint` by
     /// the WASM SDKs, so they cross this seam as strings too.
-    // Compatibility, not oversight — see the `transport` module docs.
-    #[allow(deprecated)]
     #[test]
     fn parameter_range_bounds_are_widened() {
         let message = derec_proto::PairRequestMessage {
@@ -581,7 +577,6 @@ mod tests {
                 max_share_size: i64::MAX,
                 ..Default::default()
             }),
-            transport_protocol: None,
             timestamp: None,
             supported_transports: Vec::new(),
         };
@@ -655,8 +650,6 @@ mod tests {
         let message = derec_proto::UnpairRequestMessage {
             memo: "leaving".to_owned(),
             timestamp: None,
-            #[allow(deprecated)]
-            reply_to: None,
             reply_to_transports: Vec::new(),
             replica_id: Some(u64::MAX),
         };

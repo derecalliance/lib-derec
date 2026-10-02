@@ -26,7 +26,12 @@ namespace {
 /// failure.
 struct FfiFailure {
   explicit FfiFailure(DeRecError e) : error(e) {}
+  FfiFailure(DeRecError e, std::vector<uint8_t> channelIdsJson)
+      : error(e), conflictingChannelIdsJson(std::move(channelIdsJson)) {}
   DeRecError error;
+  /// `restore`'s JSON array of colliding channel ids, empty for every other
+  /// failure. Carried as raw bytes: parsing needs the runtime.
+  std::vector<uint8_t> conflictingChannelIdsJson;
 };
 
 constexpr const char* kReentrancyMessage =
@@ -170,10 +175,12 @@ jsi::Value ProtocolHost::runAsync(
               bool failed = false;
               bool unknownFailure = false;
               DeRecError capturedError{};
+              std::vector<uint8_t> capturedChannelIdsJson;
               try {
                 bytes = body();
-              } catch (const FfiFailure& failure) {
+              } catch (FfiFailure& failure) {
                 capturedError = failure.error;
+                capturedChannelIdsJson = std::move(failure.conflictingChannelIdsJson);
                 failed = true;
               } catch (...) {
                 // Anything other than `FfiFailure` — `std::bad_alloc` from
@@ -198,7 +205,9 @@ jsi::Value ProtocolHost::runAsync(
 
               invoker->invokeAsync([state, runtime, resolve, reject, convert,
                                     bytes = std::move(bytes), failed,
-                                    unknownFailure, capturedError]() mutable {
+                                    unknownFailure, capturedError,
+                                    capturedChannelIdsJson =
+                                        std::move(capturedChannelIdsJson)]() mutable {
                 if (state->runtimeInvalidated.load()) {
                   // Queued before the runtime was torn down, reached only
                   // afterwards. Every JSI call below — including the ones the
@@ -212,7 +221,7 @@ jsi::Value ProtocolHost::runAsync(
                     // Reuses the exact error shape every synchronous FFI
                     // wrapper throws, rather than inventing a second one for
                     // the asynchronous path.
-                    throwDeRecError(jsRt, capturedError);
+                    throwDeRecError(jsRt, capturedError, capturedChannelIdsJson);
                   }
                   if (unknownFailure) {
                     throw jsi::JSError(jsRt, "DeRec: an unexpected native error occurred");
@@ -269,9 +278,8 @@ jsi::Value ProtocolHost::get(jsi::Runtime& rt, const jsi::PropNameID& name) {
                size_t) -> jsi::Value { return hostSecretId(rt2, secretId_); });
   }
 
-  // `setCommunicationInfo` and `setOwnTransport` return a Promise, unlike
-  // `@derec-alliance/nodejs` where both are synchronous. They must not run on
-  // the JavaScript thread: `derec_protocol_set_*` takes the same handle mutex
+  // `setCommunicationInfo` and `setOwnTransports` return a Promise, as in
+  // `@derec-alliance/nodejs`. They must not run on the JavaScript thread: `derec_protocol_set_*` takes the same handle mutex
   // that `derec_protocol_process`/`start`/`restore` hold for the whole
   // duration of a flow, including across store callbacks that park the worker
   // waiting on the JavaScript thread. Calling the setter synchronously would
@@ -281,9 +289,7 @@ jsi::Value ProtocolHost::get(jsi::Runtime& rt, const jsi::PropNameID& name) {
   // callback into a backend failure. The nodejs SDK is WASM and
   // single-threaded, so the hazard cannot arise there. Queuing onto the
   // serial worker instead orders the setter behind any in-flight flow, and
-  // returning a Promise keeps a caller that ignores the result — which is how
-  // nodejs code calls these — source-compatible, while letting a failure
-  // surface as a rejection rather than being swallowed.
+  // a failure surfaces as a rejection rather than being swallowed.
   if (prop == "setCommunicationInfo") {
     return jsi::Function::createFromHostFunction(
         rt, name, 1,
@@ -297,38 +303,6 @@ jsi::Value ProtocolHost::get(jsi::Runtime& rt, const jsi::PropNameID& name) {
           auto body = [handle, info = std::move(info)]() -> std::vector<uint8_t> {
             DeRecError error = derec_protocol_set_communication_info(
                 handle, info.data(), info.size());
-            if (error.code != DEREC_CODE_OK) {
-              throw FfiFailure(error);
-            }
-            return {};
-          };
-          auto convert = [](jsi::Runtime&, std::vector<uint8_t>&) {
-            return jsi::Value::undefined();
-          };
-          return runAsync(rt2, std::move(body), std::move(convert));
-        });
-  }
-
-  if (prop == "setOwnTransport") {
-    return jsi::Function::createFromHostFunction(
-        rt, name, 2,
-        [this](jsi::Runtime& rt2, const jsi::Value&, const jsi::Value* args,
-               size_t count) -> jsi::Value {
-          requireArgs(rt2, "setOwnTransport", count, 2);
-          std::string uri = args[0].asString(rt2).utf8(rt2);
-          auto protocol = static_cast<int32_t>(args[1].asNumber());
-          DeRecProtocolHandle* handle = handle_;
-
-          auto body = [handle, uri, protocol]() -> std::vector<uint8_t> {
-// This binding *is* the deprecated single-endpoint path, so it calls the
-// deprecated export on purpose — the same reason the Rust side carries
-// `#[allow(deprecated)]` on its compatibility paths. Both go at 0.0.5.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-            DeRecError error = derec_protocol_set_own_transport(
-                handle, reinterpret_cast<const uint8_t*>(uri.data()), uri.size(),
-                protocol);
-#pragma GCC diagnostic pop
             if (error.code != DEREC_CODE_OK) {
               throw FfiFailure(error);
             }
@@ -599,12 +573,14 @@ jsi::Value ProtocolHost::get(jsi::Runtime& rt, const jsi::PropNameID& name) {
 
           auto body = [handle,
                       params = std::move(params)]() -> std::vector<uint8_t> {
-            DeRecProtocolEventsResult result =
+            DeRecProtocolRestoreResult result =
                 derec_protocol_restore(handle, params.data(), params.size());
-            if (result.error.code != DEREC_CODE_OK) {
-              throw FfiFailure(result.error);
+            RestoreOutcome outcome = takeRestoreResult(result);
+            if (outcome.error.code != DEREC_CODE_OK) {
+              throw FfiFailure(outcome.error,
+                               std::move(outcome.conflictingChannelIdsJson));
             }
-            return takeBuffer(result.events_json);
+            return std::move(outcome.events);
           };
           return runAsync(rt2, std::move(body), bytesToArrayBuffer);
         });
@@ -632,8 +608,7 @@ jsi::Value ProtocolHost::get(jsi::Runtime& rt, const jsi::PropNameID& name) {
 
 std::vector<jsi::PropNameID> ProtocolHost::getPropertyNames(jsi::Runtime& rt) {
   const char* names[] = {
-      "secretId",       "setCommunicationInfo",  "setOwnTransport",
-      "setOwnTransports",
+      "secretId",       "setCommunicationInfo",  "setOwnTransports",
       "createContact",  "start",                 "process",
       "tick",           "accept",                "reject",
       "getFingerprint", "verifyFingerprint",     "removeExpiredChannels",

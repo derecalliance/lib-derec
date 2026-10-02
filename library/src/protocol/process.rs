@@ -18,6 +18,7 @@ use super::traits::{
 };
 use super::types::{SecretKind, SecretValue};
 use super::{DeRecProtocol, handlers};
+use crate::extensions::channel_store::ChannelStoreExt as _;
 use crate::{Error, Result, types::ChannelId};
 use derec_proto::DeRecMessage;
 use prost::Message;
@@ -154,6 +155,32 @@ impl<
         Ok(events)
     }
 
+    async fn is_pending_verification(&self, channel_id: ChannelId) -> Result<bool> {
+        use crate::protocol::types::{ChannelQuery, ChannelStatus, ReplicaFilter};
+
+        if let Some(record) = self
+            .channel_store
+            .load(self.secret_id, ChannelQuery::Helper { channel_id })
+            .await?
+            && record.status() == ChannelStatus::Pending
+        {
+            return Ok(true);
+        }
+
+        Ok(self
+            .channel_store
+            .replicas_matching(
+                self.secret_id,
+                ReplicaFilter {
+                    status: vec![ChannelStatus::Pending],
+                    ..Default::default()
+                },
+            )
+            .await?
+            .iter()
+            .any(|member| member.channel_id == channel_id))
+    }
+
     pub(super) fn is_message_expired(
         &self,
         envelope: &DeRecMessage,
@@ -184,7 +211,11 @@ impl<
         channel_id: ChannelId,
     ) -> Result<Vec<DeRecEvent>> {
         if self.is_message_expired(message, channel_id) {
-            return Ok(vec![DeRecEvent::NoOp]);
+            return Ok(vec![DeRecEvent::MessageIgnored {
+                channel_id,
+                reason: crate::protocol::IgnoreReason::Expired,
+                trace_id: message.trace_id,
+            }]);
         }
 
         if let Some(events) = self.process_channel_message(message, channel_id).await? {
@@ -216,21 +247,17 @@ impl<
             return Ok(None);
         };
 
-        if let Some(record) = self
-            .channel_store
-            .load(
-                self.secret_id,
-                crate::protocol::types::ChannelQuery::Helper { channel_id },
-            )
-            .await?
-            && record.status() == crate::protocol::types::ChannelStatus::Pending
-        {
+        if self.is_pending_verification(channel_id).await? {
             #[cfg(feature = "logging")]
             tracing::warn!(
                 channel_id = channel_id.0,
                 "message ignored — channel is pending fingerprint verification"
             );
-            return Ok(Some(vec![DeRecEvent::NoOp]));
+            return Ok(Some(vec![DeRecEvent::MessageIgnored {
+                channel_id,
+                reason: crate::protocol::IgnoreReason::PendingVerification,
+                trace_id: message.trace_id,
+            }]));
         }
 
         let events = handlers::handle(
@@ -427,8 +454,6 @@ mod tests {
                     version: 1,
                     nonce: 7,
                     timestamp: Some(timestamp),
-                    #[allow(deprecated)]
-                    reply_to: None,
                     reply_to_transports: Vec::new(),
                 },
             ))
@@ -524,8 +549,6 @@ mod tests {
                         version: 1,
                         nonce: 7,
                         timestamp: Some(timestamp),
-                        #[allow(deprecated)]
-                        reply_to: None,
                         reply_to_transports: Vec::new(),
                     },
                 ))
@@ -543,6 +566,316 @@ mod tests {
                 transport.sent_envelopes().is_empty(),
                 "an unauthenticated message must never be answered"
             );
+        });
+    }
+
+    const PAIRING_CHANNEL: ChannelId = ChannelId(4040);
+    const GROUP_CHANNEL: ChannelId = ChannelId(5050);
+    const SOURCE_ID: u64 = 0x5_0C;
+    const DESTINATION_ID: u64 = 0xDE_57;
+    const TRACE: u64 = 0x7_7ACE;
+
+    async fn seed_member(
+        channels: &mut InMemChannelStore,
+        channel_id: ChannelId,
+        replica_id: u64,
+        role: crate::protocol::types::ReplicaRole,
+        status: ChannelStatus,
+    ) {
+        channels
+            .save(
+                SECRET_ID,
+                ChannelRecord::Replica(crate::protocol::types::ReplicaMember {
+                    channel_id,
+                    replica_id: crate::types::ReplicaId(replica_id),
+                    transports: vec![endpoint()],
+                    communication_info: std::collections::HashMap::new(),
+                    role,
+                    status,
+                    created_at: now_secs(),
+                }),
+            )
+            .await
+            .expect("seed replica member");
+    }
+
+    async fn seed_unconfirmed_destination(
+        channels: &mut InMemChannelStore,
+        secrets: &mut InMemSecretStore,
+    ) {
+        use crate::protocol::types::ReplicaRole;
+        seed_member(
+            channels,
+            PAIRING_CHANNEL,
+            DESTINATION_ID,
+            ReplicaRole::Destination,
+            ChannelStatus::Pending,
+        )
+        .await;
+        seed_member(
+            channels,
+            PAIRING_CHANNEL,
+            SOURCE_ID,
+            ReplicaRole::Source,
+            ChannelStatus::Pending,
+        )
+        .await;
+        secrets
+            .save(
+                SECRET_ID,
+                PAIRING_CHANNEL,
+                SecretValue::SharedKey(SHARED_KEY),
+            )
+            .await
+            .expect("seed pairing key");
+    }
+
+    fn replica_push(channel_id: ChannelId, sent_at: prost_types::Timestamp) -> Vec<u8> {
+        crate::derec_message::DeRecMessageBuilder::channel()
+            .channel_id(channel_id)
+            .timestamp(sent_at)
+            .trace_id(TRACE)
+            .message_body(derec_proto::MessageBody::StoreShareRequest(
+                derec_proto::StoreShareRequestMessage {
+                    secret_id: SECRET_ID,
+                    version: 1,
+                    timestamp: Some(sent_at),
+                    replica_id: Some(SOURCE_ID),
+                    ..Default::default()
+                },
+            ))
+            .encrypt(&SHARED_KEY)
+            .expect("encrypt")
+            .build()
+            .expect("build")
+            .encode_to_vec()
+    }
+
+    fn build_with(
+        channels: InMemChannelStore,
+        secrets: InMemSecretStore,
+        user_secrets: InMemUserSecretStore,
+        transport: RecordingTransport,
+    ) -> DeRecProtocol<
+        InMemChannelStore,
+        InMemShareStore,
+        InMemSecretStore,
+        InMemUserSecretStore,
+        InMemStateStore,
+        RecordingTransport,
+    > {
+        DeRecProtocolBuilder::new(SECRET_ID)
+            .with_channel_store(channels)
+            .with_share_store(InMemShareStore::default())
+            .with_secret_store(secrets)
+            .with_user_secret_store(user_secrets)
+            .with_transport(transport)
+            .with_state_store(InMemStateStore)
+            .with_own_transports(["https://destination.example.com"])
+            .with_threshold(2)
+            .with_replica_id(DESTINATION_ID)
+            .build()
+            .expect("test protocol builds")
+    }
+
+    fn ignored(
+        reason: crate::protocol::IgnoreReason,
+        channel_id: ChannelId,
+    ) -> impl Fn(&DeRecEvent) -> bool {
+        move |e| {
+            matches!(e, DeRecEvent::MessageIgnored { channel_id: c, reason: r, trace_id }
+                if *c == channel_id && *r == reason && *trace_id == TRACE)
+        }
+    }
+
+    #[test]
+    fn an_unconfirmed_replica_destination_ignores_the_mirror_push() {
+        run_async(async {
+            let (channels, secrets) = (InMemChannelStore::default(), InMemSecretStore::default());
+            let user_secrets = InMemUserSecretStore::default();
+            let transport = RecordingTransport::default();
+            let (mut c, mut s) = (channels.clone(), secrets.clone());
+            seed_unconfirmed_destination(&mut c, &mut s).await;
+            let members_before = channels.member_rows.lock().unwrap().len();
+            let secrets_before = secrets.data.lock().unwrap().len();
+
+            let mut protocol = build_with(
+                channels.clone(),
+                secrets.clone(),
+                user_secrets.clone(),
+                transport.clone(),
+            );
+            let events = protocol
+                .process(&replica_push(
+                    PAIRING_CHANNEL,
+                    crate::derec_message::current_timestamp(),
+                ))
+                .await
+                .expect("an ignored message is not an error");
+
+            assert!(
+                events.iter().any(ignored(
+                    crate::protocol::IgnoreReason::PendingVerification,
+                    PAIRING_CHANNEL
+                )),
+                "expected MessageIgnored(PendingVerification) on the pairing channel, got {events:?}"
+            );
+            assert!(
+                !events.iter().any(|e| matches!(
+                    e,
+                    DeRecEvent::ReplicaSecretInstalled { .. }
+                        | DeRecEvent::ReplicaSecretReceived { .. }
+                )),
+                "the copy must not be installed: {events:?}"
+            );
+            assert!(
+                transport.sent_envelopes().is_empty(),
+                "nothing may be acknowledged"
+            );
+            assert!(
+                user_secrets.data.lock().unwrap().is_empty(),
+                "no snapshot may be written"
+            );
+            assert_eq!(
+                channels.member_rows.lock().unwrap().len(),
+                members_before,
+                "no member may be added"
+            );
+            assert!(
+                channels
+                    .member_rows
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .all(|m| m.status == ChannelStatus::Pending),
+                "no member may be promoted"
+            );
+            assert!(
+                channels.helper_rows.lock().unwrap().is_empty(),
+                "no helper may be written"
+            );
+            assert_eq!(
+                secrets.data.lock().unwrap().len(),
+                secrets_before,
+                "no key may be written or dropped"
+            );
+        });
+    }
+
+    #[test]
+    fn a_pending_helper_channel_ignores_inbound_traffic() {
+        run_async(async {
+            let (channels, secrets) = (InMemChannelStore::default(), InMemSecretStore::default());
+            let transport = RecordingTransport::default();
+            let (mut c, mut s) = (channels.clone(), secrets.clone());
+            seed(&mut c, &mut s).await;
+            channels
+                .helper_rows
+                .lock()
+                .unwrap()
+                .values_mut()
+                .for_each(|h| h.status = ChannelStatus::Pending);
+
+            let mut protocol = build(channels, secrets, transport.clone(), true);
+            let events = protocol
+                .process(&failing_request())
+                .await
+                .expect("ignored, not failed");
+
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    DeRecEvent::MessageIgnored {
+                        channel_id,
+                        reason: crate::protocol::IgnoreReason::PendingVerification,
+                        ..
+                    } if *channel_id == CHANNEL
+                )),
+                "expected MessageIgnored(PendingVerification), got {events:?}"
+            );
+            assert!(
+                transport.sent_envelopes().is_empty(),
+                "a pending channel is answered with nothing, not even a failure status"
+            );
+        });
+    }
+
+    #[test]
+    fn a_pending_pairing_does_not_gate_the_group_channel() {
+        run_async(async {
+            use crate::protocol::types::ReplicaRole;
+            let (channels, secrets) = (InMemChannelStore::default(), InMemSecretStore::default());
+            let transport = RecordingTransport::default();
+            let (mut c, mut s) = (channels.clone(), secrets.clone());
+            seed_unconfirmed_destination(&mut c, &mut s).await;
+            seed_member(
+                &mut c,
+                GROUP_CHANNEL,
+                0x07_4E4,
+                ReplicaRole::Source,
+                ChannelStatus::Paired,
+            )
+            .await;
+            s.save(SECRET_ID, GROUP_CHANNEL, SecretValue::SharedKey(SHARED_KEY))
+                .await
+                .expect("seed group key");
+
+            let mut protocol = build_with(
+                channels,
+                secrets,
+                InMemUserSecretStore::default(),
+                transport,
+            );
+            let outcome = protocol
+                .process(&replica_push(
+                    GROUP_CHANNEL,
+                    crate::derec_message::current_timestamp(),
+                ))
+                .await;
+
+            let gated = outcome.as_ref().is_ok_and(|events| {
+                events
+                    .iter()
+                    .any(|e| matches!(e, DeRecEvent::MessageIgnored { .. }))
+            });
+            assert!(
+                !gated,
+                "group traffic must not be gated by another channel's pairing: {outcome:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn an_expired_message_is_reported_as_ignored() {
+        run_async(async {
+            let (channels, secrets) = (InMemChannelStore::default(), InMemSecretStore::default());
+            let transport = RecordingTransport::default();
+            let (mut c, mut s) = (channels.clone(), secrets.clone());
+            seed_unconfirmed_destination(&mut c, &mut s).await;
+
+            let mut protocol = build_with(
+                channels,
+                secrets,
+                InMemUserSecretStore::default(),
+                transport.clone(),
+            );
+            let stale = prost_types::Timestamp {
+                seconds: now_secs() as i64 - 24 * 60 * 60,
+                nanos: 0,
+            };
+            let events = protocol
+                .process(&replica_push(PAIRING_CHANNEL, stale))
+                .await
+                .expect("an expired message is not an error");
+
+            assert!(
+                events.iter().any(ignored(
+                    crate::protocol::IgnoreReason::Expired,
+                    PAIRING_CHANNEL
+                )),
+                "expected MessageIgnored(Expired), got {events:?}"
+            );
+            assert!(transport.sent_envelopes().is_empty());
         });
     }
 }

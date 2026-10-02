@@ -11,7 +11,7 @@ use crate::{
 };
 use derec_cryptography::vss;
 use derec_proto::{
-    CommittedDeRecShare, DeRecMessage, DeRecResult, DeRecShare, MessageBody, StatusEnum,
+    CommittedDeRecShare, DeRecMessage, DeRecResult, DeRecShare, MessageBody,
     StoreShareRequestMessage, StoreShareResponseMessage,
 };
 use prost::Message;
@@ -133,15 +133,10 @@ pub fn produce(
     let timestamp = current_timestamp();
 
     let response = StoreShareResponseMessage {
-        result: Some(DeRecResult {
-            status: StatusEnum::Ok as i32,
-            memo: String::new(),
-        }),
+        result: Some(DeRecResult::ok()),
         version: request.version,
         timestamp: Some(timestamp),
         secret_id: request.secret_id,
-        // Helper-bound acknowledgement. Helpers hold no replica identity
-        // in either direction — see `StoreShareRequestMessage.replicaId`.
         replica_id: None,
     };
 

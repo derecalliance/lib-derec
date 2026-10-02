@@ -55,21 +55,6 @@
 //! boundary by [`TryFrom<derec_proto::TransportProtocol>`] (or by
 //! [`TryFrom<&derec_proto::TransportProtocol>`]), so they never reach
 //! the typed [`TransportProtocol`] in the first place.
-//!
-//! ## The deprecated singular `transportProtocol`
-//!
-//! Contacts and pair requests carry both a singular `transportProtocol`
-//! and a `supportedTransports` list. The singular field predates the list
-//! and is deprecated on the wire, but it is still written and still read:
-//! a peer running an implementation that predates `supportedTransports`
-//! finds an endpoint only there, and dropping it would make this library
-//! unpairable with them.
-//!
-//! Every site that touches it therefore carries `#[allow(deprecated)]`.
-//! Those are compatibility, not oversight — this is the explanation they
-//! point at rather than each restating it. The singular field is always
-//! derived from the first entry of the list, never set independently,
-//! which is what keeps the two from disagreeing.
 
 use derec_proto::Protocol;
 #[cfg(any(feature = "serde", target_arch = "wasm32"))]
@@ -95,7 +80,7 @@ const PLAINTEXT_SCHEMES: [&str; 2] = ["http://", "grpc://"];
 
 /// Library-level transport endpoint.
 ///
-/// Use this type in your `DeRecProtocolBuilder` / `set_own_transport`
+/// Use this type in your `DeRecProtocolBuilder` / `set_own_transports`
 /// calls; the library converts to the protobuf wire form internally
 /// when it needs to encode messages. Construct it from a URI string
 /// with [`TryFrom`] / [`TryInto`] (which parses the URI scheme,
@@ -385,13 +370,6 @@ pub enum TransportValidationError {
 
     #[error("transport uri contains control characters (bytes < 0x20 or = 0x7F are not allowed)")]
     ControlCharacters,
-
-    #[deprecated(
-        since = "0.0.3",
-        note = "use `UnsupportedProtocol { discriminant }`; removed at 0.0.5"
-    )]
-    #[error("unknown TransportProtocol.protocol discriminant: {0}")]
-    UnknownProtocol(i32),
 
     /// The URI scheme matches no supported transport protocol.
     ///
@@ -721,18 +699,14 @@ mod tests {
 /// a reply address without you having opted into plaintext at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct TransportPolicy {
-    /// Mirrors the resolved value of
-    /// [`DeRecProtocolBuilder::with_unsafe_connection`](crate::protocol::DeRecProtocolBuilder::with_unsafe_connection)
-    /// (or the deprecated
-    /// [`with_unsafe_http`](crate::protocol::DeRecProtocolBuilder::with_unsafe_http),
-    /// whichever was set — both set and disagreeing fails `build()`).
+    /// Mirrors
+    /// [`DeRecProtocolBuilder::with_unsafe_connection`](crate::protocol::DeRecProtocolBuilder::with_unsafe_connection).
     allow_plaintext: bool,
 }
 
 impl TransportPolicy {
-    /// Build a policy. `allow_plaintext` is the application's resolved
-    /// `unsafe_connection` (or deprecated `unsafe_http`) setting; `false` is
-    /// the production posture.
+    /// Build a policy. `allow_plaintext` is the application's
+    /// `unsafe_connection` setting; `false` is the production posture.
     pub const fn new(allow_plaintext: bool) -> Self {
         Self { allow_plaintext }
     }
@@ -778,7 +752,7 @@ impl TransportPolicy {
 
     /// Check an endpoint **this device configured for itself** — the value
     /// passed to
-    /// [`with_own_transport`](crate::protocol::DeRecProtocolBuilder::with_own_transport),
+    /// [`with_own_transports`](crate::protocol::DeRecProtocolBuilder::with_own_transports),
     /// and the `reply_to` this device stamps on its own outbound requests.
     ///
     /// Plaintext loopback is accepted whatever the setting, so local
@@ -1066,7 +1040,7 @@ mod transport_policy_tests {
                     STRICT.check_own(&ep(uri)),
                     Err(TransportValidationError::PlaintextRefused { .. })
                 ),
-                "{uri} must be refused without unsafe_http"
+                "{uri} must be refused without unsafe_connection"
             );
         }
     }
@@ -1075,7 +1049,7 @@ mod transport_policy_tests {
     /// LAN case the flag exists for, and including public hosts, which is
     /// why the setting is named the way it is.
     #[test]
-    fn unsafe_http_opens_both_paths_everywhere() {
+    fn unsafe_connection_opens_both_paths_everywhere() {
         for uri in [
             "http://localhost:8080",
             "http://192.168.1.42:8080",

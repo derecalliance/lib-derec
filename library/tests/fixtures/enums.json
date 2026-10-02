@@ -71,6 +71,30 @@
         }
       ]
     },
+    "IgnoreReason": {
+      "encoding": "name",
+      "note": "MessageIgnored.reason",
+      "variants": [
+        {
+          "name": "PendingVerification",
+          "wire": "PendingVerification"
+        },
+        {
+          "name": "Expired",
+          "wire": "Expired"
+        }
+      ]
+    },
+    "NotRestoredReason": {
+      "encoding": "name",
+      "note": "PeerNotRestored.reason",
+      "variants": [
+        {
+          "name": "NoTransports",
+          "wire": "NoTransports"
+        }
+      ]
+    },
     "DeRecEvent": {
       "encoding": "name",
       "note": "the serde `type` discriminator on every emitted event",
@@ -100,6 +124,10 @@
           "wire": "DiscoveryStarted"
         },
         {
+          "name": "MessageIgnored",
+          "wire": "MessageIgnored"
+        },
+        {
           "name": "NoOp",
           "wire": "NoOp"
         },
@@ -110,6 +138,10 @@
         {
           "name": "PairingStarted",
           "wire": "PairingStarted"
+        },
+        {
+          "name": "PeerNotRestored",
+          "wire": "PeerNotRestored"
         },
         {
           "name": "PrePairRejected",
@@ -174,6 +206,10 @@
         {
           "name": "ReplicaSyncRejected",
           "wire": "ReplicaSyncRejected"
+        },
+        {
+          "name": "ReplicaVersionConflict",
+          "wire": "ReplicaVersionConflict"
         },
         {
           "name": "SecretRecovered",
@@ -515,7 +551,8 @@
         { "name": "FfiInvalidEnum", "wire": 104, "text": "ffi_invalid_enum" },
         { "name": "FfiBadSharedKey", "wire": 105, "text": "ffi_bad_shared_key" },
         { "name": "FfiNulInString", "wire": 106, "text": "ffi_nul_in_string" },
-        { "name": "TransportInvalid", "wire": 120, "text": "transport_invalid" }
+        { "name": "TransportInvalid", "wire": 120, "text": "transport_invalid" },
+        { "name": "NoUsableEndpoint", "wire": 121, "text": "no_usable_endpoint" }
       ]
     },
     "MessageKind": {

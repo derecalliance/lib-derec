@@ -11,39 +11,15 @@ const grpcs: TransportProtocol = {
 };
 
 describe('advertisedEndpoints', () => {
-  it('prefers the offer list, preserving the peer order', () => {
+  it('returns the offer list, preserving the peer order', () => {
     expect(
       advertisedEndpoints({ supported_transports: [grpcs, https] }),
     ).toEqual([grpcs, https]);
   });
 
-  it('falls back to the singular field when the offer list is empty', () => {
-    expect(
-      advertisedEndpoints({ transport_protocol: https, supported_transports: [] }),
-    ).toEqual([https]);
-  });
-
-  it('reads a peer that sends only the singular field', () => {
-    expect(advertisedEndpoints({ transport_protocol: https })).toEqual([https]);
-  });
-
-  it('reads a peer that sends only the offer list', () => {
-    expect(advertisedEndpoints({ supported_transports: [grpcs] })).toEqual([
-      grpcs,
-    ]);
-  });
-
-  it('ignores the singular field when both are present', () => {
-    expect(
-      advertisedEndpoints({
-        transport_protocol: https,
-        supported_transports: [grpcs],
-      }),
-    ).toEqual([grpcs]);
-  });
-
-  it('yields nothing rather than a placeholder when neither is present', () => {
+  it('yields nothing rather than a placeholder when the list is absent', () => {
     expect(advertisedEndpoints({})).toEqual([]);
+    expect(advertisedEndpoints({ supported_transports: [] })).toEqual([]);
     expect(advertisedEndpoints(null)).toEqual([]);
     expect(advertisedEndpoints(undefined)).toEqual([]);
   });

@@ -572,6 +572,7 @@ mod recovery_ids_tests {
     //! `LOCAL != TARGET`.
 
     use super::*;
+    use crate::extensions::derec_result::DeRecResultExt as _;
     use crate::protocol::context::Exchange;
     use crate::protocol::test::LocalFixture;
     use crate::protocol::test::{
@@ -691,10 +692,7 @@ mod recovery_ids_tests {
         .expect("split succeeds");
         cids.iter()
             .map(|cid| GetShareResponseMessage {
-                result: Some(DeRecResult {
-                    status: StatusEnum::Ok as i32,
-                    memo: String::new(),
-                }),
+                result: Some(DeRecResult::ok()),
                 committed_de_rec_share: split
                     .shares
                     .get(cid)

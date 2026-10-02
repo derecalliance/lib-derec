@@ -539,8 +539,6 @@ fn test_process_rejects_response_with_mismatched_secret_id() {
         version: req.request.version,
         nonce: req.request.nonce,
         timestamp: req.request.timestamp,
-        #[allow(deprecated)]
-        reply_to: req.request.reply_to.clone(),
         reply_to_transports: req.request.reply_to_transports.clone(),
     };
     let result =
@@ -587,8 +585,6 @@ fn test_process_rejects_response_with_mismatched_version() {
         version: req.request.version + 1,
         nonce: req.request.nonce,
         timestamp: req.request.timestamp,
-        #[allow(deprecated)]
-        reply_to: req.request.reply_to.clone(),
         reply_to_transports: req.request.reply_to_transports.clone(),
     };
     let result =

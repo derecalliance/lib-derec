@@ -83,9 +83,9 @@ pub(in crate::protocol) async fn handle<S: StoreSet>(
 ) -> Result<Vec<DeRecEvent>> {
     match message {
         MessageBody::PairRequest(request) => {
-            if let Err(err) = crate::primitives::pairing::parameter_range::check_compatibility(
+            if let Err(err) = crate::primitives::pairing::request::check_parameter_range(
+                request,
                 pairing.parameter_range,
-                request.parameter_range.as_ref(),
             ) {
                 pair::reject(
                     stores,
@@ -278,6 +278,19 @@ fn is_reserved_key(key: &str) -> bool {
     key.starts_with("derec.")
 }
 
+/// This device's `communication_info` as its own roster row carries it.
+///
+/// The same entries a peer keeps after [`extract_communication_info`]: the
+/// reserved keys and blank values a peer would drop never reach the roster.
+pub(in crate::protocol) fn own_communication_info(local: &Local<'_>) -> HashMap<String, String> {
+    local
+        .communication_info
+        .iter()
+        .filter(|(k, v)| !is_reserved_key(k) && !v.trim().is_empty())
+        .map(|(k, v)| (k.to_owned(), v.trim().to_owned()))
+        .collect()
+}
+
 /// Write this device's own member row when it *initiates* a replica pairing.
 ///
 /// The initiator knows its identity and role at `start`, and the peer's role is
@@ -372,8 +385,8 @@ async fn persist_own_member<S: StoreSet>(
             ChannelRecord::Replica(ReplicaMember {
                 channel_id,
                 replica_id,
-                transports: vec![local.primary().clone()],
-                communication_info: HashMap::new(),
+                transports: local.own_transports.to_vec(),
+                communication_info: own_communication_info(local),
                 role,
                 status,
                 created_at: now_secs(),

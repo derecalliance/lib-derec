@@ -53,6 +53,23 @@ internal static class Utils
     // surfaces the nulled-out pointers back to the caller on return.
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern void derec_free_error(ref DeRecError error);
+
+    // Both return a static NUL-terminated UTF-8 string; never free it.
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern IntPtr derec_error_category_name(int category);
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern IntPtr derec_error_code_name(int code);
+
+    // Static NUL-terminated name ("https", "grpc") for a Protocol
+    // discriminant, or NULL when it names no defined protocol; never free it.
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern IntPtr derec_transport_protocol_name(int protocol);
+
+    // Protocol discriminant for a UTF-8 protocol name, or -1 when it names
+    // no defined protocol.
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int derec_transport_protocol_discriminant(byte[]? name, UIntPtr nameLen);
 }
 
 /// <summary>

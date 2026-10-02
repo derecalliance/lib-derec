@@ -25,10 +25,7 @@
 use std::ffi::CString;
 use std::os::raw::c_char;
 
-use crate::primitives::{
-    discovery::DiscoveryError, pairing::PairingError, recovery::RecoveryError,
-    sharing::SharingError, unpairing::UnpairingError, verification::VerificationError,
-};
+use crate::primitives::{recovery::RecoveryError, sharing::SharingError};
 
 #[repr(C)]
 pub struct DeRecError {
@@ -186,15 +183,7 @@ pub const DEREC_CODE_TRANSPORT_INVALID: i32 = 120;
 /// cannot be told. `DEREC_CATEGORY_INVALID_INPUT`.
 pub const DEREC_CODE_NO_USABLE_ENDPOINT: i32 = 121;
 
-/// Both plaintext opt-in flags were set explicitly and disagree: the
-/// deprecated `unsafe_http` says one thing and `unsafe_connection` the
-/// other. Raised at protocol construction rather than resolved by
-/// precedence, because the flag precedence would favour is the one being
-/// removed, and a configuration layer that emits every field
-/// unconditionally would otherwise let a defaulted value silently beat a
-/// deliberate one. Set only `unsafe_connection`.
-/// `DEREC_CATEGORY_INVALID_INPUT`.
-pub const DEREC_CODE_CONFLICTING_PLAINTEXT_OPT_IN: i32 = 122;
+// 122 is retired (formerly the conflicting plaintext opt-in); never reassign it.
 
 pub(crate) fn success() -> DeRecError {
     DeRecError {
@@ -259,38 +248,23 @@ pub(crate) fn from_lib_error(err: crate::Error) -> DeRecError {
 /// Map a [`crate::protocol::RestoreError`] to a typed FFI error.
 pub(crate) fn from_restore_error(err: crate::protocol::RestoreError) -> DeRecError {
     use crate::protocol::RestoreError;
-    match err {
-        RestoreError::AlreadyRestored => DeRecError {
-            category: DEREC_CATEGORY_INVALID_INPUT,
-            code: DEREC_CODE_ALREADY_RESTORED,
-            message: to_owned_cstring(&RestoreError::AlreadyRestored.to_string()),
-            peer_status: 0,
-            peer_memo: std::ptr::null_mut(),
-            expected: 0,
-            got: 0,
-        },
+    let message = match &err {
         RestoreError::Conflict(ids) => {
             let id_list: Vec<String> = ids.iter().map(|c| c.0.to_string()).collect();
-            let msg = format!("restore conflict: channel(s) [{}]", id_list.join(", "));
-            DeRecError {
-                category: DEREC_CATEGORY_INVALID_INPUT,
-                code: DEREC_CODE_RESTORE_CONFLICT,
-                message: to_owned_cstring(&msg),
-                peer_status: 0,
-                peer_memo: std::ptr::null_mut(),
-                expected: 0,
-                got: 0,
-            }
+            format!("restore conflict: channel(s) [{}]", id_list.join(", "))
         }
-        RestoreError::Invariant(msg) => DeRecError {
-            category: DEREC_CATEGORY_INVARIANT,
-            code: DEREC_CODE_INVARIANT,
-            message: to_owned_cstring(msg),
-            peer_status: 0,
-            peer_memo: std::ptr::null_mut(),
-            expected: 0,
-            got: 0,
-        },
+        RestoreError::Invariant(msg) => msg.to_string(),
+        RestoreError::AlreadyRestored => err.to_string(),
+    };
+    let (category, code) = categorize(&crate::Error::Restore(err));
+    DeRecError {
+        category,
+        code,
+        message: to_owned_cstring(&message),
+        peer_status: 0,
+        peer_memo: std::ptr::null_mut(),
+        expected: 0,
+        got: 0,
     }
 }
 
@@ -333,137 +307,8 @@ pub unsafe extern "C" fn derec_free_error(error: *mut DeRecError) {
 }
 
 fn categorize(err: &crate::Error) -> (i32, i32) {
-    match err {
-        crate::Error::Pairing(e) => (DEREC_CATEGORY_PAIRING, pairing_code(e)),
-        crate::Error::Recovery(e) => (DEREC_CATEGORY_RECOVERY, recovery_code(e)),
-        crate::Error::Discovery(e) => (DEREC_CATEGORY_DISCOVERY, discovery_code(e)),
-        crate::Error::Sharing(e) => (DEREC_CATEGORY_SHARING, sharing_code(e)),
-        crate::Error::Verification(e) => (DEREC_CATEGORY_VERIFICATION, verification_code(e)),
-        crate::Error::Unpairing(e) => (DEREC_CATEGORY_UNPAIRING, unpairing_code(e)),
-        crate::Error::DeRecMessage(_) => (DEREC_CATEGORY_DEREC_MESSAGE, DEREC_CODE_BUILDER_ERROR),
-        crate::Error::SecretStore(e) => {
-            let code = match e {
-                crate::protocol::SecretStoreError::MissingEntries {
-                    kind: crate::protocol::SecretKind::SharedKey,
-                    ..
-                } => DEREC_CODE_MISSING_SHARED_KEY,
-                _ => DEREC_CODE_STORE_ERROR,
-            };
-            (DEREC_CATEGORY_SECRET_STORE, code)
-        }
-        crate::Error::ChannelStore(_) => (DEREC_CATEGORY_CHANNEL_STORE, DEREC_CODE_STORE_ERROR),
-        crate::Error::ShareStore(_) => (DEREC_CATEGORY_SHARE_STORE, DEREC_CODE_STORE_ERROR),
-        crate::Error::StateStore(_) => (DEREC_CATEGORY_STATE_STORE, DEREC_CODE_STORE_ERROR),
-        crate::Error::Transport(_) => (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_TRANSPORT_INVALID),
-        crate::Error::NoUsableEndpoint { .. } => {
-            (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_NO_USABLE_ENDPOINT)
-        }
-        crate::Error::ConflictingPlaintextOptIn { .. } => (
-            DEREC_CATEGORY_INVALID_INPUT,
-            DEREC_CODE_CONFLICTING_PLAINTEXT_OPT_IN,
-        ),
-        crate::Error::InvalidInput(_) => (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_INVALID_INPUT),
-        crate::Error::ProtobufDecode(_) => (DEREC_CATEGORY_PROTOBUF, DEREC_CODE_PROTOBUF_DECODE),
-        crate::Error::ProtobufEncode(_) => (DEREC_CATEGORY_PROTOBUF, DEREC_CODE_PROTOBUF_ENCODE),
-        crate::Error::Invariant(_) => (DEREC_CATEGORY_INVARIANT, DEREC_CODE_INVARIANT),
-        crate::Error::RoleMismatch { .. } => {
-            (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_ROLE_MISMATCH)
-        }
-        crate::Error::ReplicaIdNotConfigured => (
-            DEREC_CATEGORY_INVALID_INPUT,
-            DEREC_CODE_REPLICA_ID_NOT_CONFIGURED,
-        ),
-        crate::Error::ReplicaIdConflict { .. } => {
-            (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_REPLICA_ID_CONFLICT)
-        }
-        crate::Error::ChannelAlreadyPaired { .. } => (
-            DEREC_CATEGORY_INVALID_INPUT,
-            DEREC_CODE_CHANNEL_ALREADY_PAIRED,
-        ),
-        crate::Error::Restore(e) => {
-            use crate::protocol::RestoreError;
-            match e {
-                RestoreError::AlreadyRestored => {
-                    (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_ALREADY_RESTORED)
-                }
-                RestoreError::Conflict(_) => {
-                    (DEREC_CATEGORY_INVALID_INPUT, DEREC_CODE_RESTORE_CONFLICT)
-                }
-                RestoreError::Invariant(_) => (DEREC_CATEGORY_INVARIANT, DEREC_CODE_INVARIANT),
-            }
-        }
-    }
-}
-
-fn pairing_code(e: &PairingError) -> i32 {
-    match e {
-        PairingError::EmptyTransportUri => DEREC_CODE_EMPTY_TRANSPORT_URI,
-        PairingError::InvalidContactMessage(_) => DEREC_CODE_INVALID_CONTACT_MESSAGE,
-        PairingError::InvalidPairRequestMessage(_) => DEREC_CODE_INVALID_PAIR_REQUEST_MESSAGE,
-        PairingError::InvalidPairResponseMessage(_) => DEREC_CODE_INVALID_PAIR_RESPONSE_MESSAGE,
-        PairingError::NonOkStatus { .. } => DEREC_CODE_NON_OK_STATUS,
-        PairingError::ProtocolViolation(_) => DEREC_CODE_PROTOCOL_VIOLATION,
-        PairingError::PrePairHashMismatch => DEREC_CODE_PREPAIR_HASH_MISMATCH,
-        PairingError::MissingReplicaId { .. } => DEREC_CODE_MISSING_REPLICA_ID,
-        PairingError::UnexpectedReplicaId { .. } => DEREC_CODE_UNEXPECTED_REPLICA_ID,
-        PairingError::IncompatibleParameterRange { .. } => DEREC_CODE_INCOMPATIBLE_PARAMETER_RANGE,
-        PairingError::Invariant(_) => DEREC_CODE_INVARIANT,
-        PairingError::ContactMessageKeygen { .. } => DEREC_CODE_KEYGEN,
-        PairingError::PairRequestKeygen { .. } => DEREC_CODE_KEYGEN,
-        PairingError::FinishPairingInitiator { .. } => DEREC_CODE_FINISH_PAIRING_INITIATOR,
-        PairingError::FinishPairingResponder { .. } => DEREC_CODE_FINISH_PAIRING_RESPONDER,
-        PairingError::PairingEncryption(_) => DEREC_CODE_ENCRYPTION,
-    }
-}
-
-fn recovery_code(e: &RecoveryError) -> i32 {
-    match e {
-        RecoveryError::EmptyResponses => DEREC_CODE_EMPTY_RESPONSES,
-        RecoveryError::NonOkStatus { .. } => DEREC_CODE_NON_OK_STATUS,
-        RecoveryError::EmptyCommittedDeRecShare => DEREC_CODE_EMPTY_COMMITTED_DEREC_SHARE,
-        RecoveryError::DecodeCommittedDeRecShare { .. } => DEREC_CODE_DECODE_COMMITTED_DEREC_SHARE,
-        RecoveryError::DecodeDeRecShare { .. } => DEREC_CODE_DECODE_DEREC_SHARE,
-        RecoveryError::SecretIdMismatch => DEREC_CODE_SECRET_ID_MISMATCH,
-        RecoveryError::VersionMismatch { .. } => DEREC_CODE_VERSION_MISMATCH,
-        RecoveryError::ReconstructionFailed { .. } => DEREC_CODE_RECONSTRUCTION_FAILED,
-        RecoveryError::MalformedRecoveredSecret { .. } => DEREC_CODE_MALFORMED_RECOVERED_SECRET,
-    }
-}
-
-fn discovery_code(e: &DiscoveryError) -> i32 {
-    match e {
-        DiscoveryError::NonOkStatus { .. } => DEREC_CODE_NON_OK_STATUS,
-    }
-}
-
-fn sharing_code(e: &SharingError) -> i32 {
-    match e {
-        SharingError::EmptyChannels => DEREC_CODE_EMPTY_CHANNELS,
-        SharingError::DuplicateChannelId(_) => DEREC_CODE_DUPLICATE_CHANNEL_ID,
-        SharingError::InvalidThreshold { .. } => DEREC_CODE_INVALID_THRESHOLD,
-        SharingError::EmptySecretData => DEREC_CODE_EMPTY_SECRET_DATA,
-        SharingError::VssShareFailed { .. } => DEREC_CODE_VSS_SHARE_FAILED,
-        SharingError::NonOkStatus { .. } => DEREC_CODE_NON_OK_STATUS,
-        SharingError::VersionMismatch { .. } => DEREC_CODE_VERSION_MISMATCH,
-    }
-}
-
-fn verification_code(e: &VerificationError) -> i32 {
-    match e {
-        VerificationError::NonOkStatus { .. } => DEREC_CODE_NON_OK_STATUS,
-        // The response did not echo the outstanding request — a
-        // replay or cross-binding attempt. Reusing the protocol-
-        // violation code because that's the closest existing
-        // semantic (validated wire material that contradicts an
-        // expected session invariant).
-        VerificationError::ResponseBindingMismatch { .. } => DEREC_CODE_PROTOCOL_VIOLATION,
-    }
-}
-
-fn unpairing_code(e: &UnpairingError) -> i32 {
-    match e {
-        UnpairingError::NonOkStatus { .. } => DEREC_CODE_NON_OK_STATUS,
-    }
+    let (category, code) = crate::interop::error_codes::classify(err);
+    (category as i32, code as i32)
 }
 
 fn to_owned_cstring(s: &str) -> *mut c_char {

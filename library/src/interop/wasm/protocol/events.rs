@@ -15,9 +15,9 @@ use crate::interop::wasm::ts_bindings_utils::js_error;
 use crate::protocol::{DeRecEvent, events::wire};
 
 pub fn event_to_js(event: DeRecEvent) -> Result<JsValue, JsValue> {
-    let mirror = wire::Event::from_event(event).map_err(|e| js_error("WASM_SERIALIZE_ERROR", e))?;
+    let mirror = wire::Event::from_event(event).map_err(|e| js_error("wasm_serialize_error", e))?;
     let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
     mirror
         .serialize(&serializer)
-        .map_err(|e| js_error("WASM_SERIALIZE_ERROR", e.to_string()))
+        .map_err(|e| js_error("wasm_serialize_error", e.to_string()))
 }

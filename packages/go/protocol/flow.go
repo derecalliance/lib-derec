@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/derecalliance/lib-derec/packages/go/derecpb"
 	"github.com/derecalliance/lib-derec/packages/go/internal/native"
 )
 
@@ -89,12 +90,10 @@ func (t Target) MarshalJSON() ([]byte, error) {
 
 // PairingParams are the parameters for FlowKindPairing.
 type PairingParams struct {
-	// Kind is the local party's role in the handshake. Matches
-	// derec_proto::SenderKind's numeric values — the same ones the
-	// SenderKind* constants in this package hold (0=Owner, 1=Helper,
-	// 3=ReplicaSource, 4=ReplicaDestination), e.g.
-	// int32(SenderKindHelper).
-	Kind int32
+	// Kind is the local party's role in the handshake, e.g.
+	// SenderKindHelper. Crosses to the library as its
+	// derec_proto::SenderKind numeric value.
+	Kind SenderKind
 	// Contact is the prost-encoded ContactMessage received out-of-band
 	// (the peer's CreatedContact.ContactBytes from CreateContact).
 	Contact []byte
@@ -206,24 +205,14 @@ type UpdateChannelInfoParams struct {
 	// (including an empty one) sets it, matching the destructive-replace
 	// semantics of SetCommunicationInfo.
 	CommunicationInfo map[string]string
-	// TransportProtocol replaces the target(s)' view of this node's
-	// transport endpoint. nil leaves it untouched.
-	//
-	// Deprecated: superseded by OwnTransports, which carries every endpoint
-	// rather than one. Scheduled for removal in v0.0.5. OwnTransports takes
-	// precedence when both are set.
-	TransportProtocol *TransportProtocolParam
 	// OwnTransports replaces the target(s)' view of every endpoint this node
-	// serves, in its own preference order. Empty leaves them untouched. The
-	// first entry also fills the deprecated singular field so a peer
-	// predating the list still learns the new address.
+	// serves, in its own preference order. Empty leaves them untouched.
 	OwnTransports []TransportProtocolParam
 }
 
 type updateChannelInfoParamsWire struct {
 	Target            Target                       `json:"target"`
 	CommunicationInfo *map[string]string           `json:"communication_info,omitempty"`
-	TransportProtocol *transportProtocolParamWire  `json:"transport_protocol,omitempty"`
 	OwnTransports     []transportProtocolParamWire `json:"own_transports,omitempty"`
 }
 
@@ -243,7 +232,7 @@ func marshalFlowParams(flowKind FlowKind, params any) ([]byte, error) {
 			return nil, fmt.Errorf("protocol: Start: FlowKindPairing requires PairingParams, got %T", params)
 		}
 		return json.Marshal(pairingParamsWire{
-			Kind:                  pp.Kind,
+			Kind:                  int32(pp.Kind),
 			Contact:               native.JSONByteArray(pp.Contact),
 			PeerCommunicationInfo: pp.PeerCommunicationInfo,
 		})
@@ -312,13 +301,6 @@ func marshalFlowParams(flowKind FlowKind, params any) ([]byte, error) {
 			for i, t := range ucip.OwnTransports {
 				w.OwnTransports[i] = transportProtocolParamWire{URI: t.URI, Protocol: t.Protocol}
 			}
-			// The first entry also fills the deprecated singular field.
-			w.TransportProtocol = &w.OwnTransports[0]
-		} else if ucip.TransportProtocol != nil {
-			w.TransportProtocol = &transportProtocolParamWire{
-				URI:      ucip.TransportProtocol.URI,
-				Protocol: ucip.TransportProtocol.Protocol,
-			}
 		}
 		return json.Marshal(w)
 	case FlowKindUnpairReplica:
@@ -382,19 +364,28 @@ func (p *DeRecProtocol) Accept(action []byte) ([]Event, error) {
 }
 
 // Reject rejects a pending action carried by an ActionRequired event's
-// Action field, with a status + memo. status matches
-// derec_proto::StatusEnum.
-func (p *DeRecProtocol) Reject(action []byte, status int32, memo string) error {
+// Action field, with a status + memo. status is the StatusEnum the peer
+// receives in the response.
+func (p *DeRecProtocol) Reject(action []byte, status derecpb.StatusEnum, memo string) error {
 	if p.closed {
 		return errors.New("protocol: Reject: protocol is closed")
 	}
-	return p.instance.Reject(action, status, memo)
+	return p.instance.Reject(action, int32(status), memo)
 }
 
 // Restore rebuilds this protocol's secret_id namespace from a recovered
 // Secret — the same typed snapshot carried by SecretRecoveredEvent.Secret
 // (and ReplicaSecretReceivedEvent.Secret); pass it verbatim along with the
 // version it was recovered at.
+//
+// A helper or member whose Transports is empty (or nil) gets no channel: it
+// is reported as an EventTypePeerNotRestored event in the returned slice and
+// the rest of the roster is restored.
+//
+// When channels already exist at ids Restore is about to write, Restore
+// fails with a *derec.Error whose Code is derec.CodeRestoreConflict and
+// whose ConflictingChannelIDs lists exactly those ids, so the application
+// can clear them and retry.
 func (p *DeRecProtocol) Restore(secret Secret, version uint32) ([]Event, error) {
 	if p.closed {
 		return nil, errors.New("protocol: Restore: protocol is closed")

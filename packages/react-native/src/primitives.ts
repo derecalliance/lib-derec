@@ -55,6 +55,7 @@ import type {
   PrePairResponseExtractResult,
   PrePairResponseMessage,
   ProcessPrePairResult,
+  ProducePrePairNoKeysResult,
   ProducePrePairResult,
   ProduceResult,
   RecoverResult,
@@ -94,22 +95,17 @@ function replyTo(value: TransportProtocol[] | undefined): Uint8Array {
 }
 
 /**
- * `ContactMessage` keeps its own dedicated codec rather than going through
- * the generic message codec: `encode_contact_message` /
- * `decode_contact_message` also enforce the mode/field invariant — an
- * `InlineKeys` contact must carry keys, a `HashedKeys` one must carry only
- * the commitment — so a malformed contact is rejected here rather than
- * travelling.
+ * Every contact crossing the native seam goes through the core's contact
+ * codec, which also refuses a contact that violates the invariants of its
+ * contact mode. Delegates to `pairing.request.encode_contact` /
+ * `decode_contact`, defined below.
  */
 function encodeContact(contact_message: ContactMessage): Uint8Array {
-  return bytes(
-    call('encode_contact_message', jsonToBytes(plainMessage(contact_message))),
-  );
+  return pairing.request.encode_contact(contact_message);
 }
 
 function decodeContact(wire: Uint8Array | ArrayBuffer): ContactMessage {
-  const json = call('decode_contact_message', wire) as ArrayBuffer;
-  return reviveMessage(jsonFromBytes(json)) as ContactMessage;
+  return pairing.request.decode_contact(wire);
 }
 
 const discovery = {
@@ -247,22 +243,24 @@ function decodeTransportList(framed: Uint8Array | ArrayBuffer): TransportProtoco
 
 const pairing = {
   request: {
+    /** Creates an out-of-band `ContactMessage`. `nonce` omitted or `null`
+     *  lets the library draw a random one; `ContactMode.NoKeys` requires the
+     *  caller to supply it. */
     create_contact(
       channel_id: bigint,
       contact_mode: ContactMode | number,
       transport_protocols: TransportProtocol[],
+      nonce?: bigint | number | null,
     ): CreateContactResult {
-      // The C entry point also accepts a caller-supplied nonce behind a
-      // presence flag. `@derec-alliance/nodejs` has no such parameter, so the
-      // flag is 0 and the library generates one — the same behaviour, not a
-      // default invented here.
+      // The C entry point carries `Option<u64>` as a presence flag plus a
+      // value; an absent nonce clears the flag and the library draws one.
       const result = call(
         'create_contact_message',
         channel_id,
         contact_mode,
         encodeTransportList(transport_protocols),
-        0,
-        0n,
+        nonce == null ? 0 : 1,
+        nonce ?? 0n,
       ) as { contact_wire_bytes: ArrayBuffer; secret_key_material: ArrayBuffer };
       return {
         contact_message: decodeContact(result.contact_wire_bytes),
@@ -270,13 +268,22 @@ const pairing = {
       };
     },
 
-    /** Proto-encodes a `ContactMessage`. Rejects a contact that violates the
-     *  mode/field invariant rather than serializing it. */
-    encode_contact: encodeContact,
+    /** Serializes a `ContactMessage` to the bytes delivered out of band.
+     *  Refuses a contact that violates the invariants of its contact mode or
+     *  advertises no endpoint. */
+    encode_contact(contact_message: ContactMessage): Uint8Array {
+      return bytes(
+        call('encode_contact_message', jsonToBytes(plainMessage(contact_message))),
+      );
+    },
 
-    /** Decodes proto `ContactMessage` bytes. Rejects a contact that violates
-     *  the mode/field invariant rather than returning it. */
-    decode_contact: decodeContact,
+    /** Parses out-of-band contact bytes back into a `ContactMessage`.
+     *  Refuses bytes that are not a contact, or a contact that violates the
+     *  invariants of its contact mode. */
+    decode_contact(bytes: Uint8Array | ArrayBuffer): ContactMessage {
+      const json = call('decode_contact_message', bytes) as ArrayBuffer;
+      return reviveMessage(jsonFromBytes(json)) as ContactMessage;
+    },
 
     produce(
       kind: SenderKind,
@@ -306,8 +313,17 @@ const pairing = {
       };
     },
 
-    extract(envelope_bytes: Uint8Array, secret_key: Uint8Array): { request: PairRequestMessage } {
-      const result = call('extract_pair_request', envelope_bytes, secret_key) as {
+    extract(
+      envelope_bytes: Uint8Array,
+      secret_key: Uint8Array,
+      parameter_range: ParameterRange | null,
+    ): { request: PairRequestMessage } {
+      const result = call(
+        'extract_pair_request',
+        envelope_bytes,
+        secret_key,
+        encodeOptionalMessage(MessageKind.ParameterRange, parameter_range),
+      ) as {
         request_proto_bytes: ArrayBuffer;
       };
       return {
@@ -393,12 +409,14 @@ const pairing = {
       contact_message: ContactMessage,
       response: PairResponseMessage,
       secret_key: Uint8Array,
+      parameter_range: ParameterRange | null,
     ): PairingProcessResult {
       const result = call(
         'process_pair_response_message',
         encodeContact(contact_message),
         encodeMessage(MessageKind.PairResponse, response),
         secret_key,
+        encodeOptionalMessage(MessageKind.ParameterRange, parameter_range),
       ) as { shared_key: ArrayBuffer; channel_id: bigint };
       return { shared_key: bytes(result.shared_key), channel_id: result.channel_id };
     },
@@ -448,6 +466,45 @@ const pairing = {
         nonce: result.nonce,
       };
     },
+
+    produce_pre_pair_no_keys(
+      channel_id: bigint,
+      request: PrePairRequestMessage,
+    ): ProducePrePairNoKeysResult {
+      const result = call(
+        'produce_pre_pair_no_keys_response_message',
+        channel_id,
+        encodeMessage(MessageKind.PrePairRequest, request),
+      ) as { envelope_wire_bytes: ArrayBuffer; secret_key_material: ArrayBuffer };
+      return {
+        envelope: bytes(result.envelope_wire_bytes),
+        secret_key_material: bytes(result.secret_key_material),
+      };
+    },
+
+    process_pre_pair_no_keys(
+      contact_message: ContactMessage,
+      response: PrePairResponseMessage,
+    ): ProcessPrePairResult {
+      const result = call(
+        'process_pre_pair_no_keys_response_message',
+        encodeContact(contact_message),
+        encodeMessage(MessageKind.PrePairResponse, response),
+      ) as {
+        mlkem_encapsulation_key: ArrayBuffer;
+        ecies_public_key: ArrayBuffer;
+        nonce: bigint;
+      };
+      return {
+        mlkem_encapsulation_key: bytes(result.mlkem_encapsulation_key),
+        ecies_public_key: bytes(result.ecies_public_key),
+        nonce: result.nonce,
+      };
+    },
+  },
+
+  fingerprint(shared_key: Uint8Array): string {
+    return call('pairing_fingerprint', shared_key) as string;
   },
 };
 

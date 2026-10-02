@@ -87,7 +87,7 @@ public static partial class Recovery
                 {
                     ChannelId = nativeResult.ChannelId,
                     RequestProtoBytes = innerBytes,
-                    ReplyTo = TransportProtocol.ResolveReplyTo(inner.ReplyTo, inner.ReplyToTransports),
+                    ReplyTo = TransportProtocol.ResolveReplyTo(inner.ReplyToTransports),
                 };
             }
             finally

@@ -20,7 +20,7 @@
 
 use std::collections::BTreeSet;
 
-use derec_library::protocol::events::PendingActionKind;
+use derec_library::protocol::events::{IgnoreReason, NotRestoredReason, PendingActionKind};
 use derec_library::protocol::types::{ChannelStatus, ReplicaRole, SecretKind, StateKind};
 
 /// Names the fixture records for one enum, in wire encoding.
@@ -158,6 +158,31 @@ fn pending_action_kind_fixture_is_complete() {
 
 /// The protobuf-derived enums are re-declared by hand in each SDK rather than
 /// re-exported from generated code, so they drift like any other mirror.
+#[test]
+fn ignore_reason_fixture_is_complete() {
+    let all = [IgnoreReason::PendingVerification, IgnoreReason::Expired];
+    let names: Vec<&str> = all
+        .iter()
+        .map(|r| match r {
+            IgnoreReason::PendingVerification => "PendingVerification",
+            IgnoreReason::Expired => "Expired",
+        })
+        .collect();
+    assert_matches_fixture("IgnoreReason", &names);
+}
+
+#[test]
+fn not_restored_reason_fixture_is_complete() {
+    let all = [NotRestoredReason::NoTransports];
+    let names: Vec<&str> = all
+        .iter()
+        .map(|r| match r {
+            NotRestoredReason::NoTransports => "NoTransports",
+        })
+        .collect();
+    assert_matches_fixture("NotRestoredReason", &names);
+}
+
 #[test]
 fn protobuf_enum_fixtures_are_complete() {
     use derec_proto::{ContactMode, SenderKind, StatusEnum};
@@ -332,7 +357,11 @@ fn typescript_declarations_cover_the_fixture() {
         let js_path = format!("{root}/packages/{pkg}/index.js");
         let js =
             std::fs::read_to_string(&js_path).unwrap_or_else(|e| panic!("reading {js_path}: {e}"));
-        for (enum_name, js_object) in [("ContactMode", "ContactMode"), ("FlowKind", "FlowKind")] {
+        for (enum_name, js_object) in [
+            ("ContactMode", "ContactMode"),
+            ("FlowKind", "FlowKind"),
+            ("StatusEnum", "StatusEnum"),
+        ] {
             let mut absent = Vec::new();
             for v in fixture["enums"][enum_name]["variants"]
                 .as_array()
@@ -366,6 +395,62 @@ fn typescript_declarations_cover_the_fixture() {
         assert!(
             missing_modes.is_empty(),
             "packages/{pkg}/index.d.ts ContactMode is missing: {missing_modes:?}"
+        );
+    }
+}
+
+/// React Native declares the same event union by hand in its own file, so it
+/// drifts independently of nodejs and web. The reason unions are checked with
+/// the tags: a reason the core emits but a union omits is as unnameable as a
+/// missing tag.
+#[test]
+fn every_typescript_surface_names_every_event_and_reason() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+    let fixture: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(format!("{root}/library/tests/fixtures/enums.json"))
+            .expect("read fixture"),
+    )
+    .expect("parse fixture");
+    let wires = |enum_name: &str| -> Vec<String> {
+        fixture["enums"][enum_name]["variants"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{enum_name} variants"))
+            .iter()
+            .map(|v| v["wire"].as_str().expect("string wire").to_owned())
+            .collect()
+    };
+
+    for surface in [
+        "packages/nodejs/index.d.ts",
+        "packages/web/index.d.ts",
+        "packages/react-native/src/types.ts",
+    ] {
+        let path = format!("{root}/{surface}");
+        let source =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
+
+        let mut missing: Vec<String> = wires("DeRecEvent")
+            .into_iter()
+            .filter(|tag| !source.contains(&format!("type: \"{tag}\"")))
+            .collect();
+
+        for reason in ["IgnoreReason", "NotRestoredReason"] {
+            let header = format!("export type {reason} =");
+            let line = source
+                .lines()
+                .find(|l| l.starts_with(&header))
+                .unwrap_or_else(|| panic!("{surface} declares no `{header}`"));
+            missing.extend(
+                wires(reason)
+                    .into_iter()
+                    .filter(|w| !line.contains(&format!("\"{w}\"")))
+                    .map(|w| format!("{reason}::{w}")),
+            );
+        }
+
+        assert!(
+            missing.is_empty(),
+            "{surface} does not name {missing:?}. Add them, then update the fixture if the core changed."
         );
     }
 }

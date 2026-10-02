@@ -32,6 +32,11 @@ type ExtractedRequest struct {
 	RequestProto []byte
 }
 
+// Endpoint is a transport endpoint: a URI and the protocol discriminant that
+// says how to reach it (see derecpb.Protocol: 0 = HTTPS, 1 = GRPC). It is the
+// same type as pairing.Endpoint.
+type Endpoint = native.Endpoint
+
 type requestAPI struct{}
 
 // Request groups the owner-side discovery operations, mirroring the Rust
@@ -40,8 +45,11 @@ var Request requestAPI
 
 // Produce builds the wire-encoded DeRecMessage carrying a discovery request
 // on channelID, encrypted under sharedKey.
-func (requestAPI) Produce(channelID uint64, sharedKey []byte) ([]byte, error) {
-	return native.ProduceGetSecretIdsVersionsRequest(channelID, sharedKey)
+//
+// replyTo lists the endpoints, in preference order, the peer should answer
+// on; nil or empty means answer on the endpoints recorded for the channel.
+func (requestAPI) Produce(channelID uint64, sharedKey []byte, replyTo []Endpoint) ([]byte, error) {
+	return native.ProduceGetSecretIdsVersionsRequest(channelID, sharedKey, replyTo)
 }
 
 // Extract decrypts a discovery request envelope and returns its channel id
@@ -105,8 +113,6 @@ func (responseAPI) Process(responseProto []byte) ([]SecretVersionEntry, error) {
 //	    [version: u32 LE]
 //	    [description_len: u32 LE]
 //	    [description: UTF-8 bytes]
-//	    [has_replica_id: u8]
-//	    [replica_id: u64 LE]  (present only when has_replica_id != 0)
 func encodeSecretList(entries []SecretVersionEntry) []byte {
 	out := make([]byte, 0)
 	out = appendUint32(out, uint32(len(entries)))

@@ -16,22 +16,69 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"github.com/derecalliance/lib-derec/packages/go/derec"
 	"github.com/derecalliance/lib-derec/packages/go/derecpb"
 	"github.com/derecalliance/lib-derec/packages/go/primitives/discovery"
 	"github.com/derecalliance/lib-derec/packages/go/primitives/envelope"
 	"github.com/derecalliance/lib-derec/packages/go/primitives/pairing"
 	"github.com/derecalliance/lib-derec/packages/go/primitives/recovery"
 	"github.com/derecalliance/lib-derec/packages/go/primitives/sharing"
+	"github.com/derecalliance/lib-derec/packages/go/primitives/unpairing"
 	"github.com/derecalliance/lib-derec/packages/go/primitives/verification"
 )
 
 func runPrimitives() {
+	runProtocolVersion()
 	runPairingFlow()
+	runNoKeysPairingFlow()
 	runSharingFlow()
 	runVerificationFlow()
 	runRecoveryFlow()
 	runDiscoveryFlow()
 	runEnvelopeTraceID()
+	runRequestReplyTo()
+}
+
+// runProtocolVersion prints the core's protocol version and checks it is the
+// version the core stamps on the envelopes it produces.
+func runProtocolVersion() {
+	fmt.Println("=== Protocol version test ===")
+	version := derec.CurrentProtocolVersion()
+	fmt.Printf("protocol version = %d.%d\n", version.Major, version.Minor)
+
+	wire, err := unpairing.Request.Produce(1, "", sharedKeyFill(1), nil)
+	must(err, "unpair request produce")
+	var msg derecpb.DeRecMessage
+	must(proto.Unmarshal(wire, &msg), "decode envelope")
+	assertTrue(int64(version.Major) == int64(msg.GetProtocolVersionMajor()) &&
+		int64(version.Minor) == int64(msg.GetProtocolVersionMinor()),
+		"protocol version %d.%d differs from envelope stamp %d.%d",
+		version.Major, version.Minor, msg.GetProtocolVersionMajor(), msg.GetProtocolVersionMinor())
+	fmt.Println("Protocol version test passed.")
+}
+
+// runRequestReplyTo checks that a request carries the reply-to endpoints it
+// was produced with, in order.
+func runRequestReplyTo() {
+	fmt.Println("=== Request reply-to test ===")
+	key := sharedKeyFill(2)
+	replyTo := []unpairing.Endpoint{
+		{URI: "https://owner.example/derec", Protocol: int32(derecpb.Protocol_HTTPS)},
+		{URI: "https://owner-backup.example/derec", Protocol: int32(derecpb.Protocol_HTTPS)},
+	}
+	wire, err := unpairing.Request.Produce(3, "bye", key, replyTo)
+	must(err, "unpair request produce with reply-to")
+	extracted, err := unpairing.Request.Extract(wire, key)
+	must(err, "unpair request extract")
+	var inner derecpb.UnpairRequestMessage
+	must(proto.Unmarshal(extracted.RequestProto, &inner), "decode unpair request")
+	got := inner.GetReplyToTransports()
+	assertTrue(len(got) == len(replyTo), "reply-to: want %d endpoints got %d", len(replyTo), len(got))
+	for i, tp := range got {
+		assertTrue(tp.GetUri() == replyTo[i].URI && int32(tp.GetProtocol()) == replyTo[i].Protocol,
+			"reply-to[%d]: want %+v got %v", i, replyTo[i], tp)
+	}
+	fmt.Println("Request reply-to test passed.")
 }
 
 // transportListBytes frames a preference-ordered endpoint list the way
@@ -78,7 +125,8 @@ func runPairingFlow() {
 	assertTrue(len(created.ContactWireBytes) != 0, "contact wire bytes must not be empty")
 	assertTrue(len(created.SecretKeyMaterial) != 0, "contact secret key material must not be empty")
 
-	must(pairing.Request.Validate(created.ContactWireBytes), "pairing.Request.Validate")
+	_, err = pairing.Request.DecodeContact(created.ContactWireBytes)
+	must(err, "pairing.Request.DecodeContact")
 
 	bobTransport := transportListBytes("https://example.com/helper")
 	producedReq, err := pairing.Request.Produce(pairing.SenderKindHelper, bobTransport, created.ContactWireBytes, nil, nil)
@@ -86,7 +134,7 @@ func runPairingFlow() {
 	assertTrue(len(producedReq.Envelope) != 0, "pair request envelope must not be empty")
 	assertTrue(len(producedReq.SecretKeyMaterial) != 0, "pair request secret key material must not be empty")
 
-	extractedReq, err := pairing.Request.Extract(producedReq.Envelope, created.SecretKeyMaterial)
+	extractedReq, err := pairing.Request.Extract(producedReq.Envelope, created.SecretKeyMaterial, nil)
 	must(err, "pairing.Request.Extract")
 	assertTrue(len(extractedReq.RequestProto) != 0, "extracted pair request proto must not be empty")
 
@@ -100,7 +148,7 @@ func runPairingFlow() {
 	must(err, "pairing.Response.Extract")
 	assertTrue(len(extractedResp.ResponseProto) != 0, "extracted pair response proto must not be empty")
 
-	processed, err := pairing.Response.Process(producedReq.InitiatorContactMessage, extractedResp.ResponseProto, producedReq.SecretKeyMaterial)
+	processed, err := pairing.Response.Process(producedReq.InitiatorContactMessage, extractedResp.ResponseProto, producedReq.SecretKeyMaterial, nil)
 	must(err, "pairing.Response.Process")
 	assertTrue(len(processed.SharedKey) != 0, "responder shared key must not be empty")
 
@@ -109,6 +157,79 @@ func runPairingFlow() {
 	assertTrue(producedResp.ChannelID != channelID, "rekeyed channel id must differ from the pre-rekey id")
 
 	fmt.Println("Pairing flow test passed.")
+}
+
+// runNoKeysPairingFlow drives a complete NO_KEYS pairing through primitives
+// only: the creator authenticates the PrePair request by nonce and generates
+// keys on the spot, the scanner accepts them unbound and finishes the
+// handshake against an INLINE_KEYS-shaped contact, and both ends confirm the
+// pairing by comparing fingerprints.
+func runNoKeysPairingFlow() {
+	fmt.Println("=== Pairing flow test (NO_KEYS + PrePair) ===")
+
+	const channelID = uint64(4)
+	nonce := uint64(424242)
+
+	aliceContact, err := pairing.Request.CreateContact(channelID, pairing.ContactModeNoKeys, transportListBytes("https://example.com/alice/ephemeral"), &nonce)
+	must(err, "pairing.Request.CreateContact (NO_KEYS)")
+	_, err = pairing.Request.DecodeContact(aliceContact.ContactWireBytes)
+	must(err, "pairing.Request.DecodeContact (NO_KEYS)")
+
+	prepairReq, err := pairing.Request.ProducePrePair(transportListBytes("https://example.com/helper/ephemeral"), aliceContact.ContactWireBytes)
+	must(err, "pairing.Request.ProducePrePair")
+
+	extractedReq, err := pairing.Request.ExtractPrePair(prepairReq.Envelope)
+	must(err, "pairing.Request.ExtractPrePair")
+	var reqMsg derecpb.PrePairRequestMessage
+	must(proto.Unmarshal(extractedReq.RequestProto, &reqMsg), "decode PrePairRequestMessage")
+	assertTrue(reqMsg.GetNonce() == nonce, "PrePair request nonce %d must match the issued contact nonce %d", reqMsg.GetNonce(), nonce)
+
+	prepairResp, err := pairing.Response.ProducePrePairNoKeys(channelID, extractedReq.RequestProto)
+	must(err, "pairing.Response.ProducePrePairNoKeys")
+	assertTrue(len(prepairResp.SecretKeyMaterial) != 0, "NO_KEYS PrePair response must carry secret key material")
+
+	extractedResp, err := pairing.Response.ExtractPrePair(prepairResp.Envelope)
+	must(err, "pairing.Response.ExtractPrePair")
+
+	processed, err := pairing.Response.ProcessPrePairNoKeys(aliceContact.ContactWireBytes, extractedResp.ResponseProto)
+	must(err, "pairing.Response.ProcessPrePairNoKeys")
+	assertTrue(len(processed.MlkemEncapsulationKey) != 0 && len(processed.EciesPublicKey) != 0, "NO_KEYS PrePair must return both public keys")
+	assertTrue(processed.Nonce == nonce, "NO_KEYS PrePair must echo the contact nonce")
+
+	var contact derecpb.ContactMessage
+	must(proto.Unmarshal(aliceContact.ContactWireBytes, &contact), "decode ContactMessage")
+	contact.ContactMode = derecpb.ContactMode_INLINE_KEYS
+	contact.MlkemEncapsulationKey = processed.MlkemEncapsulationKey
+	contact.EciesPublicKey = processed.EciesPublicKey
+	contact.ContactBindingHash = nil
+	filledIn, err := proto.Marshal(&contact)
+	must(err, "encode filled-in ContactMessage")
+
+	pairReq, err := pairing.Request.Produce(pairing.SenderKindHelper, transportListBytes("https://example.com/helper"), filledIn, nil, nil)
+	must(err, "pairing.Request.Produce")
+	extractedPairReq, err := pairing.Request.Extract(pairReq.Envelope, prepairResp.SecretKeyMaterial, nil)
+	must(err, "pairing.Request.Extract")
+	produced, err := pairing.Response.Produce(channelID, extractedPairReq.RequestProto, prepairResp.SecretKeyMaterial, nil, nil, false)
+	must(err, "pairing.Response.Produce")
+	extractedPairResp, err := pairing.Response.Extract(produced.Envelope, pairReq.SecretKeyMaterial)
+	must(err, "pairing.Response.Extract")
+	processedPair, err := pairing.Response.Process(pairReq.InitiatorContactMessage, extractedPairResp.ResponseProto, pairReq.SecretKeyMaterial, nil)
+	must(err, "pairing.Response.Process")
+
+	assertTrue(bytes.Equal(produced.SharedKey, processedPair.SharedKey), "shared keys derived by both sides must match (NO_KEYS path)")
+	assertTrue(produced.ChannelID == processedPair.ChannelID, "both sides must derive the same rekeyed channel id (NO_KEYS path)")
+
+	aliceFP, err := pairing.Fingerprint(produced.SharedKey)
+	must(err, "pairing.Fingerprint (creator)")
+	bobFP, err := pairing.Fingerprint(processedPair.SharedKey)
+	must(err, "pairing.Fingerprint (scanner)")
+	assertTrue(aliceFP != "" && aliceFP == bobFP, "fingerprints must be equal and non-empty: creator=%q scanner=%q", aliceFP, bobFP)
+	fmt.Printf("  fingerprints match: %s\n", aliceFP)
+
+	_, err = pairing.Fingerprint(make([]byte, 31))
+	assertTrue(err != nil, "pairing.Fingerprint must refuse a 31-byte shared key")
+
+	fmt.Println("Pairing flow test (NO_KEYS + PrePair) passed.")
 }
 
 // runSharingFlow mirrors run_sharing_flow_test in smoke-tests/rust/src/primitives.rs:
@@ -134,7 +255,7 @@ func runSharingFlow() {
 		assertTrue(ok, "missing share for channel %d", channelID)
 		assertTrue(len(committedShare) != 0, "empty committed share for channel %d", channelID)
 
-		requestWire, err := sharing.Request.Produce(channelID, version, secretID, committedShare, nil, "", sharedKey)
+		requestWire, err := sharing.Request.Produce(channelID, version, secretID, committedShare, nil, "", sharedKey, nil)
 		must(err, fmt.Sprintf("sharing.Request.Produce channel %d", channelID))
 		assertTrue(len(requestWire) != 0, "empty store share request envelope for channel %d", channelID)
 
@@ -179,7 +300,7 @@ func runVerificationFlow() {
 	shareContent1 := shares[channel1]
 	shareContent2 := shares[channel2]
 
-	challengeEnvelope, err := verification.Request.Produce(channel1, secretID, version, sharedKey)
+	challengeEnvelope, err := verification.Request.Produce(channel1, secretID, version, sharedKey, nil)
 	must(err, "verification.Request.Produce")
 
 	extractedReq, err := verification.Request.Extract(challengeEnvelope, sharedKey)
@@ -231,7 +352,7 @@ func runRecoveryFlow() {
 	for _, channelID := range []uint64{1, 2} {
 		key := keys[channelID]
 
-		requestWire, err := sharing.Request.Produce(channelID, version, secretID, shares[channelID], nil, "", key)
+		requestWire, err := sharing.Request.Produce(channelID, version, secretID, shares[channelID], nil, "", key, nil)
 		must(err, fmt.Sprintf("sharing.Request.Produce channel %d", channelID))
 
 		extracted, err := sharing.Request.Extract(requestWire, key)
@@ -244,7 +365,7 @@ func runRecoveryFlow() {
 	for _, channelID := range []uint64{1, 2} {
 		key := keys[channelID]
 
-		getRequestWire, err := recovery.Request.Produce(channelID, secretID, version, key)
+		getRequestWire, err := recovery.Request.Produce(channelID, secretID, version, key, nil)
 		must(err, fmt.Sprintf("recovery.Request.Produce channel %d", channelID))
 
 		extractedReq, err := recovery.Request.Extract(getRequestWire, key)
@@ -277,7 +398,7 @@ func runDiscoveryFlow() {
 	const channelID = uint64(7)
 	sharedKey := sharedKeyFill(11)
 
-	requestWire, err := discovery.Request.Produce(channelID, sharedKey)
+	requestWire, err := discovery.Request.Produce(channelID, sharedKey, nil)
 	must(err, "discovery.Request.Produce")
 	assertTrue(len(requestWire) != 0, "discovery request envelope must not be empty")
 
@@ -324,7 +445,7 @@ func runEnvelopeTraceID() {
 	const channelID = uint64(42)
 	sharedKey := sharedKeyFill(9)
 
-	result, err := discovery.Request.Produce(channelID, sharedKey)
+	result, err := discovery.Request.Produce(channelID, sharedKey, nil)
 	must(err, "discovery.Request.Produce")
 
 	traceBefore, err := envelope.ReadTraceID(result)

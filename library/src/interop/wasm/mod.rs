@@ -4,6 +4,8 @@
 pub mod envelope;
 pub mod primitives;
 pub mod protocol;
+pub mod protocol_version;
+pub mod replica_id;
 pub(crate) mod ts_bindings_utils;
 
 pub(crate) fn now_secs() -> u64 {

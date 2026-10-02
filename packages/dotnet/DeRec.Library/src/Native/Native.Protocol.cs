@@ -77,6 +77,12 @@ internal static class Protocol
         out IntPtr outPtr, out UIntPtr outLen);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate int SecretStoreLoadManyDelegate(
+        IntPtr userData, ulong secretId,
+        IntPtr channelIdsJsonPtr, UIntPtr channelIdsJsonLen, uint kind,
+        out IntPtr outPtr, out UIntPtr outLen);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate int SecretStoreSaveDelegate(
         IntPtr userData, ulong secretId, ulong channelId, uint kind,
         IntPtr bytes, UIntPtr len);
@@ -90,6 +96,7 @@ internal static class Protocol
     {
         public IntPtr UserData;
         public IntPtr Load;
+        public IntPtr LoadMany;
         public IntPtr Save;
         public IntPtr Remove;
         public IntPtr FreeBuffer;
@@ -227,8 +234,8 @@ internal static class Protocol
     /// <summary>
     /// Constructs a protocol handle. Scalar configuration is bundled into a
     /// single JSON buffer (see <c>ProtocolConfig</c> in the Rust FFI crate
-    /// for the exact shape); <c>communicationInfo</c> is a separate proto
-    /// buffer. Bundling the scalar config into JSON keeps the native
+    /// for the exact shape), including <c>communication_info</c>, so the
+    /// <c>communicationInfo</c> proto buffer is passed empty. Bundling the scalar config into JSON keeps the native
     /// signature small enough for every FFI consumer (Go via purego, .NET)
     /// to call — some callers cannot marshal many native arguments in a
     /// single call.
@@ -314,14 +321,21 @@ internal static class Protocol
         IntPtr handle, byte[] infoJson, UIntPtr infoJsonLen);
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
-    internal static extern DeRecError derec_protocol_set_own_transport(
-        IntPtr handle, byte[] uri, UIntPtr uriLen, int protocol);
-
-    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
     internal static extern DeRecError derec_protocol_set_own_transports(
         IntPtr handle, byte[] transportsJson, UIntPtr transportsJsonLen);
 
     [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
-    internal static extern DeRecProtocolEventsResult derec_protocol_restore(
+    internal static extern ulong derec_generate_replica_id();
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct DeRecProtocolRestoreResult
+    {
+        public DeRecError Error;
+        public Buffer EventsJson;
+        public Buffer ConflictingChannelIdsJson;
+    }
+
+    [DllImport("derec_library", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern DeRecProtocolRestoreResult derec_protocol_restore(
         IntPtr handle, byte[] paramsJson, UIntPtr paramsJsonLen);
 }

@@ -7,8 +7,14 @@ use tokio_postgres::{Client, NoTls};
 /// Migrations bundled into the binary at compile time. Adding a
 /// migration is two lines: drop a new `.sql` file under `migrations/`
 /// and append an entry here with a strictly increasing `version`.
-const MIGRATIONS: &[(i64, &str, &str)] =
-    &[(1, "0001_init", include_str!("../migrations/0001_init.sql"))];
+const MIGRATIONS: &[(i64, &str, &str)] = &[
+    (1, "0001_init", include_str!("../migrations/0001_init.sql")),
+    (
+        2,
+        "0002_user_secrets_author",
+        include_str!("../migrations/0002_user_secrets_author.sql"),
+    ),
+];
 
 /// Connection string default; override via `DATABASE_URL`.
 const DEFAULT_DATABASE_URL: &str = "postgres://postgres:postgres@localhost:15432/derec_test";

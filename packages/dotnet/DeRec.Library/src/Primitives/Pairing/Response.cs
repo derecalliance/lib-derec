@@ -67,6 +67,22 @@ public static partial class Pairing
             public required DeRecMessage Envelope { get; init; }
         }
 
+        public sealed class ProducePrePairNoKeysResult
+        {
+            /// <summary>
+            /// Serialized outer plaintext <see cref="DeRecMessage"/> envelope
+            /// carrying a <c>PrePairResponseMessage</c> with freshly generated
+            /// public keys. Ready to send over transport.
+            /// </summary>
+            public required DeRecMessage Envelope { get; init; }
+            /// <summary>
+            /// Secret key material generated for this pairing. The caller MUST
+            /// persist it: the <c>PairRequestMessage</c> that follows is
+            /// encrypted to it.
+            /// </summary>
+            public required byte[] SecretKeyMaterial { get; init; }
+        }
+
         public sealed class ExtractPrePairResult
         {
             public required ulong ChannelId { get; init; }
@@ -80,13 +96,15 @@ public static partial class Pairing
         public sealed class ProcessPrePairResult
         {
             /// <summary>
-            /// Initiator's ML-KEM-768 encapsulation key, validated against the
-            /// contact's <c>contactBindingHash</c>.
+            /// Initiator's ML-KEM-768 encapsulation key. Validated against the
+            /// contact's <c>contactBindingHash</c> by <see cref="ProcessPrePair"/>;
+            /// unbound for <see cref="ProcessPrePairNoKeys"/>.
             /// </summary>
             public required byte[] MlkemEncapsulationKey { get; init; }
             /// <summary>
-            /// Initiator's ECIES public key, validated against the contact's
-            /// <c>contactBindingHash</c>.
+            /// Initiator's ECIES public key. Validated against the contact's
+            /// <c>contactBindingHash</c> by <see cref="ProcessPrePair"/>;
+            /// unbound for <see cref="ProcessPrePairNoKeys"/>.
             /// </summary>
             public required byte[] EciesPublicKey { get; init; }
             /// <summary>Nonce echoed from the original <see cref="ContactMessage"/>.</summary>
@@ -98,7 +116,10 @@ public static partial class Pairing
         /// <paramref name="communicationInfo"/> and <paramref name="parameterRange"/>
         /// are optional and may be null. Both must be serialized proto
         /// bytes (<c>CommunicationInfo</c> and <c>ParameterRange</c>
-        /// respectively).
+        /// respectively). A request advertising a range that does not overlap
+        /// <paramref name="parameterRange"/> is refused with
+        /// <see cref="DeRecCode.IncompatibleParameterRange"/> and no key is
+        /// derived.
         /// </summary>
         /// <param name="unsafeConnection">Accept plaintext peer endpoints
         /// (<c>http://</c>, <c>grpc://</c>). Development only.</param>
@@ -174,14 +195,20 @@ public static partial class Pairing
         /// <summary>
         /// Processes a pairing response and derives the shared key. Throws
         /// <see cref="DeRecException"/> on peer rejection.
+        /// <paramref name="parameterRange"/> is the serialized
+        /// <c>ParameterRange</c> this side accepts, or null for none; a
+        /// response advertising a range that does not overlap it is refused
+        /// with <see cref="DeRecCode.IncompatibleParameterRange"/> before any
+        /// key is derived.
         /// </summary>
         public static ProcessResult Process(
             ContactMessage contactMessage,
             byte[] responseProtoBytes,
-            byte[] secretKeyMaterial
+            byte[] secretKeyMaterial,
+            byte[]? parameterRange = null
         )
         {
-            byte[] contactMessageBytes = contactMessage.ToProtoBytes();
+            byte[] contactMessageBytes = Request.EncodeContact(contactMessage);
 
             Native.Pairing.ProcessPairResponseMessageResult nativeResult =
                 Native.Pairing.process_pair_response_message(
@@ -190,7 +217,9 @@ public static partial class Pairing
                     responseProtoBytes,
                     (UIntPtr)responseProtoBytes.Length,
                     secretKeyMaterial,
-                    (UIntPtr)secretKeyMaterial.Length
+                    (UIntPtr)secretKeyMaterial.Length,
+                    parameterRange,
+                    (UIntPtr)(parameterRange?.Length ?? 0)
                 );
 
             try
@@ -281,10 +310,97 @@ public static partial class Pairing
             byte[] responseProtoBytes
         )
         {
-            byte[] contactMessageBytes = contactMessage.ToProtoBytes();
+            byte[] contactMessageBytes = Request.EncodeContact(contactMessage);
 
             Native.Pairing.ProcessPrePairResponseMessageResult nativeResult =
                 Native.Pairing.process_pre_pair_response_message(
+                    contactMessageBytes,
+                    (UIntPtr)contactMessageBytes.Length,
+                    responseProtoBytes,
+                    (UIntPtr)responseProtoBytes.Length
+                );
+
+            try
+            {
+                Utils.ThrowIfError(nativeResult.Error);
+                return new ProcessPrePairResult
+                {
+                    MlkemEncapsulationKey = Utils.CopyBuffer(nativeResult.MlkemEncapsulationKey),
+                    EciesPublicKey = Utils.CopyBuffer(nativeResult.EciesPublicKey),
+                    Nonce = nativeResult.Nonce,
+                };
+            }
+            finally
+            {
+                Utils.FreeBuffer(nativeResult.MlkemEncapsulationKey);
+                Utils.FreeBuffer(nativeResult.EciesPublicKey);
+            }
+        }
+    
+        /// <summary>
+        /// Contact-creator side of a <see cref="ContactMode.NoKeys"/> pairing:
+        /// generates key material and answers the <c>PrePairRequest</c> with
+        /// its public half.
+        /// </summary>
+        /// <remarks>
+        /// The caller MUST first match the request's <c>nonce</c> against the
+        /// contact it issued (the only thing that authenticates a
+        /// <c>NoKeys</c> request), MUST persist
+        /// <see cref="ProducePrePairNoKeysResult.SecretKeyMaterial"/>, and MUST
+        /// keep the resulting channel unusable until both sides confirm
+        /// <see cref="Pairing.Fingerprint"/> out of band.
+        /// </remarks>
+        /// <param name="requestProtoBytes">
+        /// <see cref="Request.ExtractPrePairResult.RequestProtoBytes"/>.
+        /// </param>
+        public static ProducePrePairNoKeysResult ProducePrePairNoKeys(
+            ulong channelId,
+            byte[] requestProtoBytes
+        )
+        {
+            Native.Pairing.ProducePrePairNoKeysResponseMessageResult nativeResult =
+                Native.Pairing.produce_pre_pair_no_keys_response_message(
+                    channelId,
+                    requestProtoBytes,
+                    (UIntPtr)requestProtoBytes.Length
+                );
+
+            try
+            {
+                Utils.ThrowIfError(nativeResult.Error);
+                return new ProducePrePairNoKeysResult
+                {
+                    Envelope = DeRecMessage.FromProtoBytes(Utils.CopyBuffer(nativeResult.EnvelopeWireBytes)),
+                    SecretKeyMaterial = Utils.CopyBuffer(nativeResult.SecretKeyMaterial),
+                };
+            }
+            finally
+            {
+                Utils.FreeBuffer(nativeResult.EnvelopeWireBytes);
+                Utils.FreeBuffer(nativeResult.SecretKeyMaterial);
+            }
+        }
+
+        /// <summary>
+        /// Scanner side of a <see cref="ContactMode.NoKeys"/> pairing: accepts
+        /// the contact creator's public keys and echoed nonce. Throws
+        /// <see cref="DeRecException"/> on non-Ok status, nonce mismatch, or
+        /// malformed fields.
+        /// </summary>
+        /// <remarks>
+        /// There is no binding hash to check the keys against, so the channel
+        /// this leads to MUST stay unusable until both sides confirm
+        /// <see cref="Pairing.Fingerprint"/> out of band.
+        /// </remarks>
+        public static ProcessPrePairResult ProcessPrePairNoKeys(
+            ContactMessage contactMessage,
+            byte[] responseProtoBytes
+        )
+        {
+            byte[] contactMessageBytes = Request.EncodeContact(contactMessage);
+
+            Native.Pairing.ProcessPrePairResponseMessageResult nativeResult =
+                Native.Pairing.process_pre_pair_no_keys_response_message(
                     contactMessageBytes,
                     (UIntPtr)contactMessageBytes.Length,
                     responseProtoBytes,

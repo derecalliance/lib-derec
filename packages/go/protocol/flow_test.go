@@ -5,6 +5,7 @@ package protocol
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -139,7 +140,7 @@ func TestCreateContact_ClosedProtocol(t *testing.T) {
 func TestStart_Pairing_InvalidContactBytes_ReturnsCleanError(t *testing.T) {
 	p := newTestProtocol(t)
 	_, err := p.Start(FlowKindPairing, PairingParams{
-		Kind:    int32(SenderKindHelper),
+		Kind:    SenderKindHelper,
 		Contact: []byte("not-a-valid-contact-message"),
 	})
 	if err == nil {
@@ -270,9 +271,9 @@ func fixtureRestoreSecret(helperChannelID uint64) Secret {
 	return Secret{
 		Helpers: []Helper{
 			{
-				ChannelID:    "11",
-				Transports:        []EndpointJSON{{URI: "https://helper.example.com", Protocol: 0}},
-				SharedKey:    sharedKey,
+				ChannelID:  helperChannelID,
+				Transports: []EndpointJSON{{URI: "https://helper.example.com", Protocol: 0}},
+				SharedKey:  sharedKey,
 			},
 		},
 		Secrets: []UserSecret{
@@ -300,6 +301,42 @@ func TestRestore_HappyPath_PersistsHelperChannel(t *testing.T) {
 
 	if _, err := p.GetFingerprint(11); err != nil {
 		t.Fatalf("GetFingerprint on the restored helper channel: %v", err)
+	}
+}
+
+// TestRestore_HelperWithoutTransports_IsReportedNotRestored restores a
+// roster whose second helper has nil Transports — marshaled as JSON null —
+// and asserts Rust restores the first, writes nothing for the second, and
+// reports it as one PeerNotRestored event.
+func TestRestore_HelperWithoutTransports_IsReportedNotRestored(t *testing.T) {
+	p := newTestProtocol(t)
+	secret := fixtureRestoreSecret(11)
+	unreachable := secret.Helpers[0]
+	unreachable.ChannelID = 12
+	unreachable.Transports = nil
+	secret.Helpers = append(secret.Helpers, unreachable)
+
+	events, err := p.Restore(secret, 7)
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	var skipped []Event
+	for _, ev := range events {
+		if ev.Type == EventTypePeerNotRestored {
+			skipped = append(skipped, ev)
+		}
+	}
+	if len(skipped) != 1 ||
+		skipped[0].ChannelID != 12 ||
+		skipped[0].ReplicaID != nil ||
+		skipped[0].Reason != NotRestoredReasonNoTransports {
+		t.Fatalf("expected one PeerNotRestored for channel 12, got %+v", events)
+	}
+	if _, err := p.GetFingerprint(11); err != nil {
+		t.Fatalf("the reachable helper must be restored: %v", err)
+	}
+	if _, err := p.GetFingerprint(12); err == nil {
+		t.Fatal("no channel may be written for a helper with no endpoint")
 	}
 }
 
@@ -333,5 +370,116 @@ func TestRestore_ClosedProtocol(t *testing.T) {
 	}
 	if _, err := p.Restore(fixtureRestoreSecret(11), 7); err == nil {
 		t.Fatal("expected an error on a closed protocol")
+	}
+}
+
+// TestRestore_Conflict_ReportsConflictingChannelIDs pre-seeds helper
+// channels at two of the recovered Secret's ids (plus one unrelated id) and
+// asserts Restore fails with CodeRestoreConflict carrying exactly the
+// colliding ids, decoded from derec_protocol_restore's
+// conflicting_channel_ids_json buffer.
+func TestRestore_Conflict_ReportsConflictingChannelIDs(t *testing.T) {
+	channel, share, secretStore, userSecret, state, transport := newTestStores()
+	const secretID = 1
+	for _, id := range []uint64{11, 13, 99} {
+		rec := ChannelRecord{Helper: &HelperChannel{
+			ChannelID:         id,
+			Transports:        []TransportEndpoint{{URI: "https://collision.example.com", Protocol: 0}},
+			CommunicationInfo: map[string]string{},
+			PeerRole:          SenderKindHelper,
+			Status:            ChannelStatusPaired,
+			CreatedAt:         1,
+		}}
+		if err := channel.Save(secretID, rec); err != nil {
+			t.Fatalf("seed channel %d: %v", id, err)
+		}
+	}
+	p, err := New(channel, share, secretStore, userSecret, state, transport, Config{
+		SecretID:          secretID,
+		OwnTransports:     []TransportProtocolParam{{URI: "https://owner.example.com", Protocol: int32(derecpb.Protocol_HTTPS)}},
+		Threshold:         proto.Uint32(2),
+		KeepVersionsCount: proto.Uint32(3),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { p.Close() })
+
+	secret := fixtureRestoreSecret(11)
+	base := secret.Helpers[0]
+	secret.Helpers = nil
+	for _, id := range []uint64{11, 12, 13} {
+		h := base
+		h.ChannelID = id
+		secret.Helpers = append(secret.Helpers, h)
+	}
+
+	_, err = p.Restore(secret, 7)
+	if err == nil {
+		t.Fatal("expected a restore conflict")
+	}
+	var derecErr *derec.Error
+	if !errors.As(err, &derecErr) {
+		t.Fatalf("expected a *derec.Error, got %T: %v", err, err)
+	}
+	if derecErr.Code != derec.CodeRestoreConflict {
+		t.Fatalf("Code = %d (%s), want CodeRestoreConflict", derecErr.Code, derecErr.CodeName())
+	}
+	got := append([]uint64(nil), derecErr.ConflictingChannelIDs...)
+	slices.Sort(got)
+	if !slices.Equal(got, []uint64{11, 13}) {
+		t.Fatalf("ConflictingChannelIDs = %v, want [11 13]", derecErr.ConflictingChannelIDs)
+	}
+
+	// Clearing exactly the reported ids lets the retry succeed; the
+	// unrelated channel 99 is torn down, which surfaces as events.
+	for _, id := range derecErr.ConflictingChannelIDs {
+		if _, err := channel.Remove(secretID, id, 0); err != nil {
+			t.Fatalf("remove channel %d: %v", id, err)
+		}
+	}
+	events, err := p.Restore(secret, 7)
+	if err != nil {
+		t.Fatalf("Restore after clearing conflicts: %v", err)
+	}
+	if len(events) == 0 {
+		t.Fatal("expected Restore to report the teardown of channel 99")
+	}
+}
+
+// TestRestore_NonConflictError_HasNoConflictingChannelIDs asserts the ids
+// field stays empty for any other restore failure.
+func TestRestore_NonConflictError_HasNoConflictingChannelIDs(t *testing.T) {
+	p := newTestProtocol(t)
+	secret := fixtureRestoreSecret(11)
+	if _, err := p.Restore(secret, 7); err != nil {
+		t.Fatalf("first Restore: %v", err)
+	}
+	_, err := p.Restore(secret, 7)
+	var derecErr *derec.Error
+	if !errors.As(err, &derecErr) {
+		t.Fatalf("expected a *derec.Error, got %T: %v", err, err)
+	}
+	if derecErr.Code == derec.CodeRestoreConflict || len(derecErr.ConflictingChannelIDs) != 0 {
+		t.Fatalf("unexpected conflict payload: code=%d ids=%v", derecErr.Code, derecErr.ConflictingChannelIDs)
+	}
+}
+
+// PairingParams.Kind is the typed SenderKind and crosses to the library as
+// its derec_proto::SenderKind numeric value, not its name.
+func TestMarshalFlowParams_PairingKindIsNumeric(t *testing.T) {
+	for kind, want := range map[SenderKind]string{
+		SenderKindOwner:              `"kind":0`,
+		SenderKindHelper:             `"kind":1`,
+		SenderKindReplicaSource:      `"kind":3`,
+		SenderKindReplicaDestination: `"kind":4`,
+	} {
+		got, err := marshalFlowParams(FlowKindPairing, PairingParams{Kind: kind, Contact: []byte{1}})
+		if err != nil {
+			t.Fatalf("marshalFlowParams(%v): %v", kind, err)
+		}
+		if !strings.Contains(string(got), want) {
+			t.Fatalf("marshalFlowParams(%v) = %s, want it to contain %s", kind, got, want)
+		}
 	}
 }

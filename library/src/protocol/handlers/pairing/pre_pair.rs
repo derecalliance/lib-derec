@@ -94,8 +94,6 @@ pub(super) async fn start<S: StoreSet>(
 ///   persists it as `PairingSecret`, and publishes the keys. First
 ///   authenticates the request by matching `request.nonce` against the
 ///   stored contact's `nonce`.
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 pub(in crate::protocol) async fn accept<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
@@ -197,8 +195,6 @@ pub(in crate::protocol) async fn accept<S: StoreSet>(
 /// `reject` arm for [`PendingAction::PrePair`]. Builds a non-Ok
 /// `PrePairResponse` (no keys) and sends it to the scanner's `replyTo`.
 /// Does NOT load `PairingSecret` — rejection carries no crypto material.
-// Compatibility, not oversight — see the `transport` module docs.
-#[allow(deprecated)]
 pub(in crate::protocol) async fn reject<S: StoreSet>(
     stores: &mut Stores<'_, S>,
     local: &Local<'_>,
@@ -371,8 +367,7 @@ pub(in crate::protocol) async fn on_response<S: StoreSet>(
     };
 
     let replica_id_to_inject = super::require_replica_id_for_kind(local_kind, replica_id)?;
-    let comm_info =
-        super::build_communication_info(pairing.communication_info, replica_id_to_inject);
+    let comm_info = super::build_communication_info(local.communication_info, replica_id_to_inject);
     let result = request::produce(
         local_kind,
         local.own_transports.to_vec(),

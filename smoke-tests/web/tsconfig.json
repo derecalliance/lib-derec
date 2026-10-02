@@ -1,6 +1,7 @@
 {
   "compilerOptions": {
     "target": "ES2022",
+    "lib": ["ES2022", "DOM", "ESNext.Disposable"],
     "module": "ESNext",
     "moduleResolution": "Bundler",
     // `channelFilterConformance.ts` imports the shared fixture. Safe as a

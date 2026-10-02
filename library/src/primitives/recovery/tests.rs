@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 DeRec Alliance. All rights reserved.
 
+use crate::extensions::derec_result::DeRecResultExt as _;
 use crate::{
     Error,
     derec_message::{DeRecMessageBuilder, current_timestamp},
@@ -99,10 +100,7 @@ fn create_response_envelope_with_mismatched_timestamp(
     let message = GetShareResponseMessage {
         share_algorithm: 0,
         committed_de_rec_share: committed_bytes,
-        result: Some(DeRecResult {
-            status: StatusEnum::Ok as i32,
-            memo: String::new(),
-        }),
+        result: Some(DeRecResult::ok()),
         timestamp: Some(message_timestamp),
         secret_id: 0,
         version: 0,
@@ -135,8 +133,6 @@ fn create_store_share_request_envelope(
         version_description: String::new(),
         timestamp: Some(timestamp),
         secret_id: 1,
-        #[allow(deprecated)]
-        reply_to: None,
         reply_to_transports: Vec::new(),
         replica_id: None,
     };
@@ -451,8 +447,6 @@ fn test_produce_get_share_response_message_request_timestamp_mismatch() {
         secret_id,
         version,
         timestamp: Some(message_timestamp),
-        #[allow(deprecated)]
-        reply_to: None,
         reply_to_transports: Vec::new(),
         replica_id: None,
     };
@@ -505,8 +499,6 @@ fn test_produce_get_share_response_message_stored_share_timestamp_mismatch() {
         version_description: String::new(),
         timestamp: Some(message_timestamp),
         secret_id,
-        #[allow(deprecated)]
-        reply_to: None,
         reply_to_transports: Vec::new(),
         replica_id: None,
     };
@@ -679,8 +671,6 @@ fn test_recovery_end_to_end() {
             version_description: String::new(),
             timestamp: Some(timestamp),
             secret_id,
-            #[allow(deprecated)]
-            reply_to: None,
             reply_to_transports: Vec::new(),
             replica_id: None,
         };

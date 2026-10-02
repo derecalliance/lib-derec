@@ -39,6 +39,18 @@ type DeRecProtocolEventsResult struct {
 	EventsJSON DeRecBuffer
 }
 
+// DeRecProtocolRestoreResult mirrors #[repr(C)] struct
+// DeRecProtocolRestoreResult in library/src/interop/ffi/protocol/handle/flow.rs:
+// the standard DeRecError envelope, a UTF-8 JSON array of events, and a
+// UTF-8 JSON array of decimal-string conflicting channel ids (non-empty
+// only on CodeRestoreConflict). Both buffers are released via
+// bytesFromBuffer.
+type DeRecProtocolRestoreResult struct {
+	Error                     DeRecError
+	EventsJSON                DeRecBuffer
+	ConflictingChannelIDsJSON DeRecBuffer
+}
+
 // DeRecProtocolCreateContactResult mirrors #[repr(C)] struct
 // DeRecProtocolCreateContactResult in
 // library/src/interop/ffi/protocol/handle/pairing.rs: the standard DeRecError
@@ -75,7 +87,7 @@ type AutoAcceptPolicy struct {
 }
 
 // RemoveExpiredChannelsPolicy is the automatic expired-channel cleanup
-// setting carried by the JSON config's "remove_expired_channels" object,
+// setting carried by the JSON config's "timeouts.expired_channels" object,
 // field for field matching RemoveExpiredChannelsConfig in
 // library/src/interop/ffi/protocol/handle/mod.rs.
 //
@@ -110,40 +122,31 @@ type TransportOffer struct {
 }
 
 // ProtocolConfig carries every derec_protocol_new argument beyond
-// the six callback structs and the communication_info proto buffer, in
-// idiomatic Go form. protocolNew renders it into the JSON config buffer
-// the FFI expects — package protocol is responsible for converting its
+// the six callback structs, in idiomatic Go form. protocolNew renders it
+// into the JSON config buffer the FFI expects — package protocol is responsible for converting its
 // own idiomatic Config into this shape.
 type ProtocolConfig struct {
 	SecretID uint64
 
-	OwnTransportURI      string
-	OwnTransportProtocol int32
 	// OwnTransports mirrors the "own_transports" JSON array documented on
 	// ProtocolConfig in library/src/interop/ffi/protocol/handle/mod.rs.
-	// Empty omits the key, in which case OwnTransportURI /
-	// OwnTransportProtocol apply; non-empty takes precedence over them
-	// entirely.
+	// Empty omits the key, which the library refuses.
 	OwnTransports []TransportOffer
 
-	Threshold         uint32
-	KeepVersionsCount uint32
+	// Threshold and KeepVersionsCount are omitted from the JSON config when
+	// nil, so the library default applies; any non-nil value, including 0,
+	// is sent for the library to accept or reject.
+	Threshold         *uint32
+	KeepVersionsCount *uint32
 
-	// CommunicationInfo is a proto-encoded derecpb.CommunicationInfo, or
-	// nil for none. Stays a separate buffer argument alongside the JSON
-	// config.
-	CommunicationInfo []byte
+	// CommunicationInfo is this node's communication_info map, sent as the
+	// JSON config's "communication_info" object. nil or empty omits the key.
+	CommunicationInfo map[string]string
 
 	// Timeouts configures the four waiting periods. nil omits the key so
 	// every library default applies; individual fields inside may also be
 	// omitted for the same effect.
 	Timeouts *TimeoutsConfig
-	// UnsafeHTTP accepts plaintext http:// transport endpoints. Development
-	// only; nil (unset) is the production posture.
-	//
-	// Deprecated: use UnsafeConnection, which names both gated schemes.
-	// Removed at 0.0.5.
-	UnsafeHTTP *bool
 	// UnsafeConnection accepts plaintext http:// and grpc:// transport
 	// endpoints. Development only; nil (unset) is the production posture.
 	UnsafeConnection     *bool
@@ -191,35 +194,30 @@ type ParameterRangeConfig struct {
 // once round-tripped through JSON's float64-backed number type in common
 // encoders, including Go's encoding/json.
 //
-// Threshold, KeepVersionsCount, AutoRespondOnFailure, UnpairAck,
-// AutoReplyTo and AutoAccept are all omitempty: the Rust struct now
-// carries a `#[serde(default = ...)]` for each of them, reading the same
-// constants DeRecProtocolBuilder::new does, so omitting a zero-valued
-// field here lets the library's default apply instead of this shim
-// inventing one. AutoAccept is a pointer for that reason — a non-pointer
-// struct is never "empty" under encoding/json's omitempty rules, so it
-// would never be omitted otherwise.
+// Every optional field is omitempty: the Rust struct carries a
+// `#[serde(default = ...)]` for each of them, reading the same constants
+// DeRecProtocolBuilder::new does, so an omitted key lets the library's
+// default apply instead of this shim inventing one. Threshold and
+// KeepVersionsCount are pointers so that only an unset value is omitted —
+// an explicit 0 reaches the library, which decides whether it is valid.
+// AutoRespondOnFailure, UnpairAck and AutoReplyTo are plain values because
+// their zero value is the library default, so omitting it changes nothing.
+// AutoAccept is a pointer because a non-pointer struct is never "empty"
+// under encoding/json's omitempty rules.
 type protocolConfigJSON struct {
-	SecretID             string            `json:"secret_id"`
-	OwnTransportURI      string            `json:"own_transport_uri"`
-	OwnTransportProtocol int32             `json:"own_transport_protocol"`
-	OwnTransports        []TransportOffer  `json:"own_transports,omitempty"`
-	Threshold            uint32            `json:"threshold,omitempty"`
-	KeepVersionsCount    uint32            `json:"keep_versions_count,omitempty"`
-	AutoRespondOnFailure bool              `json:"auto_respond_on_failure,omitempty"`
-	UnpairAck            int32             `json:"unpair_ack,omitempty"`
-	AutoReplyTo          bool              `json:"auto_reply_to,omitempty"`
-	AutoAccept           *AutoAcceptPolicy `json:"auto_accept,omitempty"`
-	Timeouts             *TimeoutsConfig   `json:"timeouts,omitempty"`
-	// UnsafeHTTP and UnsafeConnection are both omitempty: absence is
-	// meaningful and distinct from false. Only one present is honored;
-	// both present and disagreeing is CodeConflictingPlaintextOptIn from
-	// derec_protocol_new, so a nil that serialized as false would turn a
-	// deliberate setting into a construction failure.
-	UnsafeHTTP       *bool                 `json:"unsafe_http,omitempty"`
-	UnsafeConnection *bool                 `json:"unsafe_connection,omitempty"`
-	ReplicaID        *string               `json:"replica_id,omitempty"`
-	ParameterRange   *ParameterRangeConfig `json:"parameter_range,omitempty"`
+	SecretID             string                `json:"secret_id"`
+	OwnTransports        []TransportOffer      `json:"own_transports,omitempty"`
+	Threshold            *uint32               `json:"threshold,omitempty"`
+	KeepVersionsCount    *uint32               `json:"keep_versions_count,omitempty"`
+	AutoRespondOnFailure bool                  `json:"auto_respond_on_failure,omitempty"`
+	UnpairAck            int32                 `json:"unpair_ack,omitempty"`
+	AutoReplyTo          bool                  `json:"auto_reply_to,omitempty"`
+	AutoAccept           *AutoAcceptPolicy     `json:"auto_accept,omitempty"`
+	Timeouts             *TimeoutsConfig       `json:"timeouts,omitempty"`
+	UnsafeConnection     *bool                 `json:"unsafe_connection,omitempty"`
+	ReplicaID            *string               `json:"replica_id,omitempty"`
+	ParameterRange       *ParameterRangeConfig `json:"parameter_range,omitempty"`
+	CommunicationInfo    map[string]string     `json:"communication_info,omitempty"`
 }
 
 var (
@@ -251,13 +249,6 @@ var (
 	protocolRemoveExpiredChannelsFn   func(
 		handle uintptr, olderThanSecs uint64,
 	) DeRecRemovedChannelsResult
-
-	protocolSetOwnTransportOnce sync.Once
-	protocolSetOwnTransportFn   func(
-		handle uintptr,
-		uriPtr *byte, uriLen uintptr,
-		protocolNum int32,
-	) DeRecError
 
 	protocolSetOwnTransportsOnce sync.Once
 	protocolSetOwnTransportsFn   func(
@@ -304,7 +295,7 @@ var (
 	protocolRestoreFn   func(
 		handle uintptr,
 		paramsJSONPtr *byte, paramsJSONLen uintptr,
-	) DeRecProtocolEventsResult
+	) DeRecProtocolRestoreResult
 
 	protocolCreateContactOnce sync.Once
 	protocolCreateContactFn   func(
@@ -315,21 +306,11 @@ var (
 	) DeRecProtocolCreateContactResult
 )
 
-// protocolNew wraps derec_protocol_new: the scalar configuration in
-// cfg is rendered into a single JSON buffer, since purego cannot marshal
-// many native arguments in a single call — it panics with "too many stack
-// arguments" past a handful of parameters. The six callback structs are
-// still passed as individual pointers into cb, which must outlive the
-// returned handle — see builtCallbacks' doc comment.
-func protocolNew(cfg ProtocolConfig, cb *builtCallbacks) (uintptr, error) {
-	protocolNewOnce.Do(func() {
-		purego.RegisterFunc(&protocolNewFn, symbol("derec_protocol_new"))
-	})
-
+// marshalProtocolConfig renders cfg into the JSON config buffer
+// derec_protocol_new reads.
+func marshalProtocolConfig(cfg ProtocolConfig) ([]byte, error) {
 	cfgJSON := protocolConfigJSON{
 		SecretID:             strconv.FormatUint(cfg.SecretID, 10),
-		OwnTransportURI:      cfg.OwnTransportURI,
-		OwnTransportProtocol: cfg.OwnTransportProtocol,
 		OwnTransports:        cfg.OwnTransports,
 		Threshold:            cfg.Threshold,
 		KeepVersionsCount:    cfg.KeepVersionsCount,
@@ -337,9 +318,9 @@ func protocolNew(cfg ProtocolConfig, cb *builtCallbacks) (uintptr, error) {
 		UnpairAck:            cfg.UnpairAck,
 		AutoReplyTo:          cfg.AutoReplyTo,
 
-		Timeouts:         cfg.Timeouts,
-		UnsafeHTTP:       cfg.UnsafeHTTP,
-		UnsafeConnection: cfg.UnsafeConnection,
+		Timeouts:          cfg.Timeouts,
+		UnsafeConnection:  cfg.UnsafeConnection,
+		CommunicationInfo: cfg.CommunicationInfo,
 	}
 	// The zero value of AutoAcceptPolicy (every flow false) is
 	// indistinguishable from "the caller never set it" — and is also
@@ -357,12 +338,31 @@ func protocolNew(cfg ProtocolConfig, cb *builtCallbacks) (uintptr, error) {
 
 	configJSON, err := json.Marshal(cfgJSON)
 	if err != nil {
-		return 0, fmt.Errorf("native: marshal protocol config: %w", err)
+		return nil, fmt.Errorf("native: marshal protocol config: %w", err)
+	}
+	return configJSON, nil
+}
+
+// protocolNew wraps derec_protocol_new: the scalar configuration in
+// cfg is rendered into a single JSON buffer, since purego cannot marshal
+// many native arguments in a single call — it panics with "too many stack
+// arguments" past a handful of parameters. The six callback structs are
+// still passed as individual pointers into cb, which must outlive the
+// returned handle — see builtCallbacks' doc comment.
+func protocolNew(cfg ProtocolConfig, cb *builtCallbacks) (uintptr, error) {
+	protocolNewOnce.Do(func() {
+		purego.RegisterFunc(&protocolNewFn, symbol("derec_protocol_new"))
+	})
+
+	configJSON, err := marshalProtocolConfig(cfg)
+	if err != nil {
+		return 0, err
 	}
 
 	res := protocolNewFn(
 		bytePtr(configJSON), uintptr(len(configJSON)),
-		bytePtr(cfg.CommunicationInfo), uintptr(len(cfg.CommunicationInfo)),
+		// communication_info travels in configJSON; the proto buffer stays empty.
+		nil, 0,
 		&cb.Channel, &cb.Secret, &cb.Share, &cb.UserSecret, &cb.State, &cb.Transport,
 	)
 	if err := errorFrom(res.Error); err != nil {
@@ -462,7 +462,7 @@ func (p *ProtocolInstance) GetFingerprint(channelID uint64) (string, error) {
 // decimal strings.
 //
 // Independent of the configured cleanup policy — it sweeps at the
-// threshold given even when that policy is disabled. The age comparison
+// age given even when that policy is disabled. The age comparison
 // is strict, so a channel created within the current second survives
 // even olderThanSecs == 0.
 func (p *ProtocolInstance) RemoveExpiredChannels(olderThanSecs uint64) ([]byte, error) {
@@ -496,21 +496,6 @@ func (p *ProtocolInstance) VerifyFingerprint(channelID uint64, fingerprint strin
 	return matched != 0, nil
 }
 
-// SetOwnTransport wraps derec_protocol_set_own_transport: replaces this
-// node's endpoint for one protocol, leaving the others alone. A node serves
-// at most one endpoint per protocol, so the (uri, protocolNum) pair
-// identifies the entry it replaces; an entry for a protocol not yet served
-// is appended, and a replaced one keeps its position in the preference
-// order. Only mutates local state — propagating the change to paired peers
-// requires a follow-up UpdateChannelInfo flow.
-func (p *ProtocolInstance) SetOwnTransport(uri string, protocolNum int32) error {
-	protocolSetOwnTransportOnce.Do(func() {
-		purego.RegisterFunc(&protocolSetOwnTransportFn, symbol("derec_protocol_set_own_transport"))
-	})
-	uriBytes := []byte(uri)
-	return errorFrom(protocolSetOwnTransportFn(p.handle, bytePtr(uriBytes), uintptr(len(uriBytes)), protocolNum))
-}
-
 // OwnTransport is one entry of the endpoint list SetOwnTransports takes.
 // Mirrors the {uri, protocol} JSON shape the FFI uses for the
 // own_transports config array.
@@ -520,8 +505,7 @@ type OwnTransport struct {
 }
 
 // SetOwnTransports wraps derec_protocol_set_own_transports: replaces every
-// endpoint this node advertises, in preference order. SetOwnTransport
-// replaces only the entry for the protocol its URI names. A node serves at
+// endpoint this node advertises, in preference order. A node serves at
 // most one endpoint per protocol, so this list is a preference order over
 // distinct protocols and two entries of the same protocol are rejected.
 // Only mutates local state; propagating the change to paired peers requires
@@ -530,9 +514,6 @@ func (p *ProtocolInstance) SetOwnTransports(transports []OwnTransport) error {
 	protocolSetOwnTransportsOnce.Do(func() {
 		purego.RegisterFunc(&protocolSetOwnTransportsFn, symbol("derec_protocol_set_own_transports"))
 	})
-	if len(transports) == 0 {
-		return fmt.Errorf("native: own transports must not be empty")
-	}
 	transportsJSON, err := json.Marshal(transports)
 	if err != nil {
 		return fmt.Errorf("native: marshal own_transports: %w", err)
@@ -542,10 +523,9 @@ func (p *ProtocolInstance) SetOwnTransports(transports []OwnTransport) error {
 
 // SetCommunicationInfo wraps derec_protocol_set_communication_info:
 // replaces this node's local communication_info map. info is JSON-encoded
-// as a string->string object — the same wire shape the FFI uses elsewhere
-// for this map, distinct from New's proto-encoded CommunicationInfo
-// buffer. A nil/empty map is sent as a zero-length body, matching the
-// FFI's "no entries" convention (info_json_len == 0 short-circuits JSON
+// as a string->string object — the same shape New sends as the config
+// JSON's "communication_info" key. A nil/empty map is sent as a
+// zero-length body, matching the FFI's "no entries" convention (info_json_len == 0 short-circuits JSON
 // parsing on the Rust side instead of rejecting a literal `null`).
 func (p *ProtocolInstance) SetCommunicationInfo(info map[string]string) error {
 	protocolSetCommunicationInfoOnce.Do(func() {
@@ -646,16 +626,32 @@ func (p *ProtocolInstance) Reject(action []byte, status int32, memo string) erro
 // namespace from a recovered Secret. paramsJSON is a UTF-8 JSON blob of the
 // {version, recovered_secret} shape documented on
 // derec_protocol_restore in library/src/interop/ffi/protocol/handle/flow.rs.
-// Returns the resulting events as a UTF-8 JSON array.
+// Returns the resulting events as a UTF-8 JSON array. On failure the
+// error is an *Error whose ConflictingChannelIDs carries the channel ids
+// the library reported for a CodeRestoreConflict refusal (empty otherwise).
 func (p *ProtocolInstance) Restore(paramsJSON []byte) ([]byte, error) {
 	protocolRestoreOnce.Do(func() {
 		purego.RegisterFunc(&protocolRestoreFn, symbol("derec_protocol_restore"))
 	})
 	res := protocolRestoreFn(p.handle, bytePtr(paramsJSON), uintptr(len(paramsJSON)))
-	if err := errorFrom(res.Error); err != nil {
-		return nil, err
+	events := bytesFromBuffer(res.EventsJSON)
+	conflictsJSON := bytesFromBuffer(res.ConflictingChannelIDsJSON)
+	err := errorFrom(res.Error)
+	if err == nil {
+		return events, nil
 	}
-	return bytesFromBuffer(res.EventsJSON), nil
+	if len(conflictsJSON) > 0 {
+		var raw []string
+		if jerr := json.Unmarshal(conflictsJSON, &raw); jerr != nil {
+			return nil, fmt.Errorf("native: Restore: decode conflicting channel ids: %w", jerr)
+		}
+		ids, perr := parseUint64Strings(&raw, "conflicting_channel_ids_json")
+		if perr != nil {
+			return nil, perr
+		}
+		err.(*Error).ConflictingChannelIDs = ids
+	}
+	return nil, err
 }
 
 // CreateContact wraps derec_protocol_create_contact: generates an

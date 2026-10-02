@@ -13,11 +13,18 @@
 // / Request.ExtractPrePair / Response.ProducePrePair /
 // Response.ExtractPrePair / Response.ProcessPrePair), after which the
 // caller republishes the validated keys into an INLINE_KEYS-shaped contact
-// and proceeds with the normal handshake. ContactModeNoKeys is a separate
-// flow, not covered here.
+// and proceeds with the normal handshake. ContactModeNoKeys runs the same
+// PrePair exchange with Response.ProducePrePairNoKeys and
+// Response.ProcessPrePairNoKeys; nothing binds those keys to the contact, so
+// the resulting pairing MUST be confirmed by comparing Fingerprint out of
+// band before use.
 package pairing
 
-import "github.com/derecalliance/lib-derec/packages/go/internal/native"
+import (
+	"encoding/json"
+
+	"github.com/derecalliance/lib-derec/packages/go/internal/native"
+)
 
 // Endpoint is a transport endpoint: a URI and the protocol discriminant that
 // says how to reach it (see derecpb.Protocol: 0 = HTTPS, 1 = GRPC).
@@ -39,27 +46,135 @@ const (
 	// obtained via a separate PrePair exchange (not covered by this package).
 	ContactModeHashedKeys ContactMode = 1
 	// ContactModeNoKeys carries no key material or hash; the contact creator
-	// generates keys on the fly when a PrePairRequest arrives (not covered by
-	// this package).
+	// generates keys on the fly when a PrePairRequest arrives
+	// (Response.ProducePrePairNoKeys).
 	ContactModeNoKeys ContactMode = 2
 )
 
 // SenderKind identifies the logical role of the sender of a
 // PairRequestMessage. Mirrors org.derecalliance.derec.protobuf.SenderKind.
-type SenderKind int32
+//
+// Aliased rather than redeclared so it is the same type the protocol package
+// exposes (PairingParams.Kind, Event.Kind, ChannelRecord.PeerRole), without a
+// conversion between layers.
+type SenderKind = native.SenderKind
 
 const (
 	// SenderKindOwner marks the sender as an Owner (normal or recovery mode).
-	SenderKindOwner SenderKind = 0
+	SenderKindOwner = native.SenderKindOwner
 	// SenderKindHelper marks the sender as acting as a Helper.
-	SenderKindHelper SenderKind = 1
+	SenderKindHelper = native.SenderKindHelper
 	// SenderKindReplicaSource marks the sender as the Source side of a
 	// replica pair.
-	SenderKindReplicaSource SenderKind = 3
+	SenderKindReplicaSource = native.SenderKindReplicaSource
 	// SenderKindReplicaDestination marks the sender as the Destination side
 	// of a replica pair.
-	SenderKindReplicaDestination SenderKind = 4
+	SenderKindReplicaDestination = native.SenderKindReplicaDestination
 )
+
+// Timestamp is a point in time as seconds and nanoseconds since the Unix
+// epoch, mirroring google.protobuf.Timestamp.
+type Timestamp struct {
+	Seconds int64
+	Nanos   int32
+}
+
+// ContactMessage is the decoded out-of-band contact a scanner pairs
+// against: what Request.DecodeContact returns and Request.EncodeContact
+// serializes. Mirrors org.derecalliance.derec.protobuf.ContactMessage.
+//
+// The key fields present depend on ContactMode: ContactModeInlineKeys
+// carries MlkemEncapsulationKey and EciesPublicKey, ContactModeHashedKeys
+// carries ContactBindingHash, and ContactModeNoKeys carries neither. A nil
+// slice is an absent field.
+type ContactMessage struct {
+	ChannelID             uint64
+	Nonce                 uint64
+	ContactMode           ContactMode
+	MlkemEncapsulationKey []byte
+	EciesPublicKey        []byte
+	ContactBindingHash    []byte
+	// Timestamp is when the creator produced the contact; nil if unset.
+	Timestamp *Timestamp
+	// SupportedTransports is every endpoint the creator can be reached on,
+	// in its own preference order.
+	SupportedTransports []Endpoint
+}
+
+// contactMessageWire is the JSON shape encode_contact_message reads and
+// decode_contact_message writes. ChannelID and Nonce cross as decimal
+// strings; byte fields as arrays of small integers.
+type contactMessageWire struct {
+	ChannelID             uint64                `json:"channel_id,string"`
+	Nonce                 uint64                `json:"nonce,string"`
+	ContactMode           int32                 `json:"contact_mode"`
+	MlkemEncapsulationKey *native.JSONByteArray `json:"mlkem_encapsulation_key,omitempty"`
+	EciesPublicKey        *native.JSONByteArray `json:"ecies_public_key,omitempty"`
+	ContactBindingHash    *native.JSONByteArray `json:"contact_binding_hash,omitempty"`
+	Timestamp             *timestampWire        `json:"timestamp"`
+	SupportedTransports   []endpointWire        `json:"supported_transports"`
+}
+
+type timestampWire struct {
+	Seconds int64 `json:"seconds"`
+	Nanos   int32 `json:"nanos"`
+}
+
+type endpointWire struct {
+	URI      string `json:"uri"`
+	Protocol int32  `json:"protocol"`
+}
+
+func optionalBytesWire(b []byte) *native.JSONByteArray {
+	if b == nil {
+		return nil
+	}
+	v := native.JSONByteArray(b)
+	return &v
+}
+
+func (c ContactMessage) toWire() contactMessageWire {
+	w := contactMessageWire{
+		ChannelID:             c.ChannelID,
+		Nonce:                 c.Nonce,
+		ContactMode:           int32(c.ContactMode),
+		MlkemEncapsulationKey: optionalBytesWire(c.MlkemEncapsulationKey),
+		EciesPublicKey:        optionalBytesWire(c.EciesPublicKey),
+		ContactBindingHash:    optionalBytesWire(c.ContactBindingHash),
+		SupportedTransports:   make([]endpointWire, 0, len(c.SupportedTransports)),
+	}
+	if c.Timestamp != nil {
+		w.Timestamp = &timestampWire{Seconds: c.Timestamp.Seconds, Nanos: c.Timestamp.Nanos}
+	}
+	for _, e := range c.SupportedTransports {
+		w.SupportedTransports = append(w.SupportedTransports, endpointWire{URI: e.URI, Protocol: e.Protocol})
+	}
+	return w
+}
+
+func (w contactMessageWire) toContact() ContactMessage {
+	c := ContactMessage{
+		ChannelID:   w.ChannelID,
+		Nonce:       w.Nonce,
+		ContactMode: ContactMode(w.ContactMode),
+	}
+	if w.MlkemEncapsulationKey != nil {
+		c.MlkemEncapsulationKey = []byte(*w.MlkemEncapsulationKey)
+	}
+	if w.EciesPublicKey != nil {
+		c.EciesPublicKey = []byte(*w.EciesPublicKey)
+	}
+	if w.ContactBindingHash != nil {
+		c.ContactBindingHash = []byte(*w.ContactBindingHash)
+	}
+	if w.Timestamp != nil {
+		c.Timestamp = &Timestamp{Seconds: w.Timestamp.Seconds, Nanos: w.Timestamp.Nanos}
+	}
+	for _, e := range w.SupportedTransports {
+		c.SupportedTransports = append(c.SupportedTransports, Endpoint{URI: e.URI, Protocol: e.Protocol})
+	}
+	return c
+}
 
 // CreatedContact is the result of creating an out-of-band ContactMessage.
 type CreatedContact struct {
@@ -154,6 +269,19 @@ type ProducedPrePairResponse struct {
 	Envelope []byte
 }
 
+// ProducedPrePairNoKeysResponse is a produced NO_KEYS PrePair response.
+type ProducedPrePairNoKeysResponse struct {
+	// Envelope is the wire-encoded plaintext PrePair response envelope
+	// carrying the freshly generated public keys, ready to send over
+	// transport.
+	Envelope []byte
+	// SecretKeyMaterial is the key material generated for this pairing. The
+	// caller MUST persist it: the pair request that follows is encrypted to
+	// it, and it is the secretKeyMaterial for Request.Extract and
+	// Response.Produce.
+	SecretKeyMaterial []byte
+}
+
 // ExtractedPrePairResponse is a decoded PrePair response: the channel it
 // arrived on and the inner PrePairResponseMessage proto bytes, which chain
 // into Response.ProcessPrePair.
@@ -162,8 +290,9 @@ type ExtractedPrePairResponse struct {
 	ResponseProto []byte
 }
 
-// ProcessedPrePair is the result of validating a PrePair response against
-// the originating ContactMessage's binding hash.
+// ProcessedPrePair is the result of processing a PrePair response: validated
+// against the originating ContactMessage's binding hash (HASHED_KEYS), or
+// accepted unbound (NO_KEYS).
 type ProcessedPrePair struct {
 	// MlkemEncapsulationKey is the contact creator's validated ML-KEM
 	// encapsulation key.
@@ -194,10 +323,31 @@ func (requestAPI) CreateContact(channelID uint64, contactMode ContactMode, trans
 	return CreatedContact{ContactWireBytes: contactWireBytes, SecretKeyMaterial: secretKeyMaterial}, nil
 }
 
-// Validate structurally validates proto-encoded ContactMessage bytes against
-// the per-contactMode field-presence invariants.
-func (requestAPI) Validate(contactMessage []byte) error {
-	return native.ValidateContact(contactMessage)
+// EncodeContact serializes contactMessage to the protobuf bytes delivered
+// out of band (typically as a QR code). A contact that violates the
+// invariants of its ContactMode, or advertises no endpoint, is refused with
+// derec.CodeInvalidContactMessage.
+func (requestAPI) EncodeContact(contactMessage ContactMessage) ([]byte, error) {
+	contactJSON, err := json.Marshal(contactMessage.toWire())
+	if err != nil {
+		return nil, err
+	}
+	return native.EncodeContact(contactJSON)
+}
+
+// DecodeContact parses out-of-band contact bytes back into the
+// ContactMessage a scanner pairs against. Bytes that are not a contact, or a
+// contact that violates the invariants of its ContactMode, are refused.
+func (requestAPI) DecodeContact(contactMessage []byte) (ContactMessage, error) {
+	contactJSON, err := native.DecodeContact(contactMessage)
+	if err != nil {
+		return ContactMessage{}, err
+	}
+	var wire contactMessageWire
+	if err := json.Unmarshal(contactJSON, &wire); err != nil {
+		return ContactMessage{}, err
+	}
+	return wire.toContact(), nil
 }
 
 // Produce builds a pairing request envelope addressed to the creator of
@@ -220,8 +370,11 @@ func (requestAPI) Produce(senderKind SenderKind, transportProtocol, contactMessa
 // Extract decrypts a pairing request envelope (the Envelope returned by
 // Produce) using secretKeyMaterial (the contact creator's SecretKeyMaterial
 // from CreateContact) and returns its channel id and inner proto bytes.
-func (requestAPI) Extract(request, secretKeyMaterial []byte) (ExtractedRequest, error) {
-	channelID, requestProto, err := native.ExtractPairRequest(request, secretKeyMaterial)
+// parameterRange is the optional serialized ParameterRange this side accepts
+// (nil for none); a request advertising a range that does not overlap it is
+// refused with derec.CodeIncompatibleParameterRange.
+func (requestAPI) Extract(request, secretKeyMaterial, parameterRange []byte) (ExtractedRequest, error) {
+	channelID, requestProto, err := native.ExtractPairRequest(request, secretKeyMaterial, parameterRange)
 	if err != nil {
 		return ExtractedRequest{}, err
 	}
@@ -233,10 +386,8 @@ func (requestAPI) Extract(request, secretKeyMaterial []byte) (ExtractedRequest, 
 // ContactModeNoKeys contact), sent by a scanner reachable at
 // transportProtocols: a length-delimited sequence of serialized
 // TransportProtocol protos (each entry preceded by its varint byte length),
-// in the scanner's own preference order. The first entry also fills the
-// deprecated singular field for peers predating the list. Because no shared
-// key exists yet, the envelope is plaintext, so these MUST be ephemeral
-// endpoints.
+// in the scanner's own preference order. Because no shared key exists yet,
+// the envelope is plaintext, so these MUST be ephemeral endpoints.
 func (requestAPI) ProducePrePair(transportProtocols, contactMessage []byte) (ProducedPrePairRequest, error) {
 	envelope, err := native.ProducePrePairRequest(transportProtocols, contactMessage)
 	if err != nil {
@@ -267,7 +418,9 @@ var Response responseAPI
 // RequestProto returned by Request.Extract), derives the pairing shared key,
 // and returns the rekeyed channel id the responder commits to.
 // communicationInfo and parameterRange are optional serialized proto bytes
-// (nil for none).
+// (nil for none). A request advertising a range that does not overlap
+// parameterRange is refused with derec.CodeIncompatibleParameterRange and no
+// key is derived.
 //
 // unsafeConnection accepts plaintext peer endpoints (http://, grpc://) and is
 // development-only.
@@ -300,9 +453,12 @@ func (responseAPI) Extract(response, secretKeyMaterial []byte) (ExtractedRespons
 // Process validates a pairing response (the ResponseProto returned by
 // Extract) against contactMessage (the InitiatorContactMessage returned by
 // Request.Produce), derives the pairing shared key, and returns the
-// validated rekeyed channel id.
-func (responseAPI) Process(contactMessage, responseProto, secretKeyMaterial []byte) (ProcessedResponse, error) {
-	sharedKey, channelID, err := native.ProcessPairResponse(contactMessage, responseProto, secretKeyMaterial)
+// validated rekeyed channel id. parameterRange is the optional serialized
+// ParameterRange this side accepts (nil for none); a response advertising a
+// range that does not overlap it is refused with
+// derec.CodeIncompatibleParameterRange before any key is derived.
+func (responseAPI) Process(contactMessage, responseProto, secretKeyMaterial, parameterRange []byte) (ProcessedResponse, error) {
+	sharedKey, channelID, err := native.ProcessPairResponse(contactMessage, responseProto, secretKeyMaterial, parameterRange)
 	if err != nil {
 		return ProcessedResponse{}, err
 	}
@@ -350,4 +506,45 @@ func (responseAPI) ProcessPrePair(contactMessage, responseProto []byte) (Process
 		EciesPublicKey:        eciesPublicKey,
 		Nonce:                 nonce,
 	}, nil
+}
+
+// ProducePrePairNoKeys is the contact-creator side of a ContactModeNoKeys
+// pairing: it generates fresh key material and builds a plaintext PrePair
+// response envelope publishing its public keys, acknowledging requestProto
+// (the RequestProto returned by Request.ExtractPrePair). The caller MUST
+// first match the request's nonce against the contact it issued — the only
+// thing that authenticates a NO_KEYS request — and MUST persist the returned
+// SecretKeyMaterial.
+func (responseAPI) ProducePrePairNoKeys(channelID uint64, requestProto []byte) (ProducedPrePairNoKeysResponse, error) {
+	envelope, secretKeyMaterial, err := native.ProducePrePairNoKeysResponse(channelID, requestProto)
+	if err != nil {
+		return ProducedPrePairNoKeysResponse{}, err
+	}
+	return ProducedPrePairNoKeysResponse{Envelope: envelope, SecretKeyMaterial: secretKeyMaterial}, nil
+}
+
+// ProcessPrePairNoKeys is the scanner side of a ContactModeNoKeys pairing:
+// it accepts the contact creator's public keys from responseProto (the
+// ResponseProto returned by ExtractPrePair) for contactMessage (the
+// ContactModeNoKeys contact), returning them with the echoed nonce. Nothing
+// binds these keys to the contact, so the resulting pairing MUST be
+// confirmed by comparing Fingerprint out of band before use.
+func (responseAPI) ProcessPrePairNoKeys(contactMessage, responseProto []byte) (ProcessedPrePair, error) {
+	mlkemEncapsulationKey, eciesPublicKey, nonce, err := native.ProcessPrePairNoKeysResponse(contactMessage, responseProto)
+	if err != nil {
+		return ProcessedPrePair{}, err
+	}
+	return ProcessedPrePair{
+		MlkemEncapsulationKey: mlkemEncapsulationKey,
+		EciesPublicKey:        eciesPublicKey,
+		Nonce:                 nonce,
+	}, nil
+}
+
+// Fingerprint returns the human-readable fingerprint of a pairing's
+// sharedKey, the same value the protocol's GetFingerprint derives. Both ends
+// derive the same value from the same key; a ContactModeNoKeys pairing MUST
+// be confirmed by comparing it out of band before use.
+func Fingerprint(sharedKey []byte) (string, error) {
+	return native.PairingFingerprint(sharedKey)
 }

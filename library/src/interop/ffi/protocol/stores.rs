@@ -377,6 +377,12 @@ pub struct ChannelStoreCallbacks {
 }
 
 /// Caller-supplied callbacks for secret persistence.
+///
+/// `load_many` receives the requested channel ids as a JSON array of
+/// numbers and returns a JSON array with exactly one entry per requested id,
+/// in the same order: the same `{kind, bytes}` record `load` returns, or
+/// `null` when nothing of `kind` is stored for that channel. Whether a
+/// missing entry is an error is decided by the library, not the callback.
 #[repr(C)]
 pub struct SecretStoreCallbacks {
     pub user_data: *mut c_void,
@@ -384,6 +390,15 @@ pub struct SecretStoreCallbacks {
         user_data: *mut c_void,
         secret_id: u64,
         channel_id: u64,
+        kind: u32,
+        out_ptr: *mut *mut u8,
+        out_len: *mut usize,
+    ) -> i32,
+    pub load_many: extern "C" fn(
+        user_data: *mut c_void,
+        secret_id: u64,
+        channel_ids_json_ptr: *const u8,
+        channel_ids_json_len: usize,
         kind: u32,
         out_ptr: *mut *mut u8,
         out_len: *mut usize,
@@ -488,6 +503,10 @@ pub(crate) struct UserSecretsRecord {
     pub secrets: Vec<UserSecretRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Decimal-encoded publisher of `version`, like every other `u64` id in
+    /// these records. Absent when the snapshot records no author.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_replica_id: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -511,13 +530,23 @@ impl From<&UserSecrets> for UserSecretsRecord {
                 })
                 .collect(),
             description: v.description.clone(),
+            author_replica_id: v.author_replica_id.map(|id| id.to_string()),
         }
     }
 }
 
-impl From<UserSecretsRecord> for UserSecrets {
-    fn from(r: UserSecretsRecord) -> Self {
-        Self {
+impl TryFrom<UserSecretsRecord> for UserSecrets {
+    type Error = String;
+
+    fn try_from(r: UserSecretsRecord) -> Result<Self, String> {
+        let author_replica_id = r
+            .author_replica_id
+            .map(|id| {
+                id.parse::<u64>()
+                    .map_err(|_| format!("author_replica_id is not a decimal u64: {id}"))
+            })
+            .transpose()?;
+        Ok(Self {
             version: r.version,
             secrets: r
                 .secrets
@@ -529,11 +558,8 @@ impl From<UserSecretsRecord> for UserSecrets {
                 })
                 .collect(),
             description: r.description,
-            // The FFI side trades only the user-facing snapshot for
-            // now; the `replicas` cache is rebuilt on the next
-            // ProtectSecret round from live channel state.
-            replicas: None,
-        }
+            author_replica_id,
+        })
     }
 }
 
@@ -606,6 +632,88 @@ pub struct TransportCallbacks {
         bytes: *const u8,
         len: usize,
     ) -> i32,
+}
+
+/// Decode the `endpoints` buffer a [`TransportCallbacks::send`] call
+/// receives into a UTF-8 JSON array of `{"protocol": "...", "uri": "..."}`
+/// objects, order preserved. `protocol` is the name
+/// [`crate::interop::ffi::protocol_names::derec_transport_protocol_name`] gives the
+/// discriminant, the same endpoint shape the WASM SDKs hand to their
+/// transport's `send`. An entry with an unknown protocol discriminant, or a
+/// malformed buffer, is an error rather than a guessed name.
+///
+/// Release `bytes` with [`crate::interop::ffi::common::derec_free_buffer`].
+///
+/// # Safety
+///
+/// `endpoints_ptr` must be valid for reads of `endpoints_len` bytes when
+/// `endpoints_len` is non-zero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn derec_transport_endpoints_json(
+    endpoints_ptr: *const u8,
+    endpoints_len: usize,
+) -> crate::interop::ffi::message_json::DeRecMessageJsonResult {
+    use crate::interop::ffi::common::{empty_buffer, vec_into_buffer};
+    use crate::interop::ffi::error::{
+        DEREC_CODE_FFI_BAD_PROTO, DEREC_CODE_FFI_NULL_PTR, ffi_error, success,
+    };
+    use crate::interop::ffi::message_json::DeRecMessageJsonResult;
+
+    let fail = |code, message: &str| DeRecMessageJsonResult {
+        error: ffi_error(code, message),
+        bytes: empty_buffer(),
+    };
+    let mut framed: &[u8] = if endpoints_len == 0 {
+        &[]
+    } else if endpoints_ptr.is_null() {
+        return fail(DEREC_CODE_FFI_NULL_PTR, "endpoints_ptr is null");
+    } else {
+        unsafe { std::slice::from_raw_parts(endpoints_ptr, endpoints_len) }
+    };
+
+    let mut endpoints = Vec::new();
+    while !framed.is_empty() {
+        let Ok(len) = prost::encoding::decode_varint(&mut framed) else {
+            return fail(
+                DEREC_CODE_FFI_BAD_PROTO,
+                "endpoint length prefix is malformed",
+            );
+        };
+        let Some(entry) = usize::try_from(len).ok().filter(|l| *l <= framed.len()) else {
+            return fail(
+                DEREC_CODE_FFI_BAD_PROTO,
+                "endpoint entry runs past the buffer",
+            );
+        };
+        let (bytes, rest) = framed.split_at(entry);
+        framed = rest;
+        let Ok(endpoint) = TransportProtocol::decode(bytes) else {
+            return fail(
+                DEREC_CODE_FFI_BAD_PROTO,
+                "endpoint is not a valid TransportProtocol",
+            );
+        };
+        let Some(protocol) =
+            crate::interop::protocol_names::protocol_discriminant_to_name(endpoint.protocol)
+        else {
+            return fail(
+                DEREC_CODE_FFI_BAD_PROTO,
+                "unknown transport protocol discriminant",
+            );
+        };
+        endpoints.push(serde_json::json!({ "protocol": protocol, "uri": endpoint.uri }));
+    }
+
+    match serde_json::to_vec(&endpoints) {
+        Ok(bytes) => DeRecMessageJsonResult {
+            error: success(),
+            bytes: vec_into_buffer(bytes),
+        },
+        Err(_) => fail(
+            DEREC_CODE_FFI_BAD_PROTO,
+            "failed to encode endpoints as JSON",
+        ),
+    }
 }
 
 pub struct DotnetChannelStore {
@@ -857,60 +965,39 @@ impl DeRecSecretStore for DotnetSecretStore {
         kind: SecretKind,
         missing_policy: MissingPolicy,
     ) -> SecretStoreFuture<'_, Vec<(ChannelId, SecretValue)>> {
-        let ids = channel_ids.to_vec();
+        let ids_json: Vec<u64> = channel_ids.iter().map(|c| c.0).collect();
+        let ids_bytes = serde_json::to_vec(&ids_json).unwrap_or_default();
         let kind_u32 = secret_kind_to_u32(kind);
-        let cb = &self.cb;
-        let res = (|| -> Result<Vec<(ChannelId, SecretValue)>, SecretStoreError> {
-            let mut out = Vec::with_capacity(ids.len());
-            let mut missing: Vec<ChannelId> = Vec::new();
-            for id in &ids {
-                let mut ptr: *mut u8 = std::ptr::null_mut();
-                let mut len: usize = 0;
-                let rc = (cb.load)(
-                    cb.user_data,
-                    secret_id,
-                    id.0,
-                    kind_u32,
-                    &mut ptr as *mut _,
-                    &mut len as *mut _,
-                );
-                if rc == 1 {
-                    if !ptr.is_null() && len != 0 {
-                        (cb.free_buffer)(cb.user_data, ptr, len);
+        let bytes_res = self.fetch_bytes(|p, l| {
+            (self.cb.load_many)(
+                self.cb.user_data,
+                secret_id,
+                ids_bytes.as_ptr(),
+                ids_bytes.len(),
+                kind_u32,
+                p,
+                l,
+            )
+        });
+        let res = bytes_res
+            .map_err(|e| SecretStoreError::Backend(e.into()))
+            .and_then(|bytes| {
+                let entries: Vec<Option<SecretValueRecord>> = match bytes {
+                    Some(bytes) if !bytes.is_empty() => {
+                        serde_json::from_slice(&bytes).map_err(|e| {
+                            SecretStoreError::Backend(format!("SecretValue list JSON: {e}").into())
+                        })?
                     }
-                    missing.push(*id);
-                    continue;
-                }
-                if rc != 0 {
-                    if !ptr.is_null() && len != 0 {
-                        (cb.free_buffer)(cb.user_data, ptr, len);
-                    }
-                    return Err(SecretStoreError::Backend(
-                        format!("secret store load failed (rc={rc})").into(),
-                    ));
-                }
-                if ptr.is_null() || len == 0 {
-                    missing.push(*id);
-                    continue;
-                }
-                let bytes = unsafe { std::slice::from_raw_parts(ptr, len).to_vec() };
-                (cb.free_buffer)(cb.user_data, ptr, len);
-                let record: SecretValueRecord = serde_json::from_slice(&bytes).map_err(|e| {
-                    SecretStoreError::Backend(format!("SecretValue JSON: {e}").into())
-                })?;
-                let value = record
-                    .into_value()
-                    .map_err(|e| SecretStoreError::Backend(format!("SecretValue: {e}").into()))?;
-                out.push((*id, value));
-            }
-            if !missing.is_empty() && matches!(missing_policy, MissingPolicy::Fail) {
-                return Err(SecretStoreError::MissingEntries {
+                    _ => Vec::new(),
+                };
+                crate::interop::secret_batch::collect(
+                    channel_ids,
+                    entries,
                     kind,
-                    channel_ids: missing.into_iter().map(|c| c.0).collect(),
-                });
-            }
-            Ok(out)
-        })();
+                    missing_policy,
+                    |record| record.into_value(),
+                )
+            });
         Box::pin(async move { res })
     }
 
@@ -1177,8 +1264,10 @@ impl DeRecUserSecretStore for DotnetUserSecretStore {
             Ok(None) => Ok(None),
             Ok(Some(bytes)) if bytes.is_empty() => Ok(None),
             Ok(Some(bytes)) => serde_json::from_slice::<UserSecretsRecord>(&bytes)
-                .map(|r| Some(r.into()))
-                .map_err(|e| ShareStoreError::Backend(boxed_err(format!("UserSecrets JSON: {e}")))),
+                .map_err(|e| format!("UserSecrets JSON: {e}"))
+                .and_then(UserSecrets::try_from)
+                .map(Some)
+                .map_err(|e| ShareStoreError::Backend(boxed_err(e))),
         };
         Box::pin(async move { res })
     }
@@ -1420,5 +1509,172 @@ mod filter_wire_tests {
             !text.contains(&format!(":[{WIDE}")) && !text.contains(&format!(",{WIDE}")),
             "no bare numeric id may appear, got {text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod user_secrets_record_tests {
+    use super::*;
+
+    fn snapshot(author_replica_id: Option<u64>) -> UserSecrets {
+        UserSecrets {
+            version: 3,
+            secrets: Vec::new(),
+            description: None,
+            author_replica_id,
+        }
+    }
+
+    /// The author is a `u64`, so it crosses as a decimal string like every
+    /// other id: a host whose numbers are doubles must read it exactly.
+    #[test]
+    fn the_author_round_trips_as_a_decimal_string() {
+        let json = serde_json::to_value(UserSecretsRecord::from(&snapshot(Some(u64::MAX))))
+            .expect("serializes");
+        assert_eq!(json["author_replica_id"], u64::MAX.to_string());
+
+        let back: UserSecretsRecord = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(
+            UserSecrets::try_from(back).expect("converts"),
+            snapshot(Some(u64::MAX))
+        );
+    }
+
+    #[test]
+    fn an_absent_author_stays_absent() {
+        let json =
+            serde_json::to_value(UserSecretsRecord::from(&snapshot(None))).expect("serializes");
+        assert!(json.get("author_replica_id").is_none());
+        let back: UserSecretsRecord = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(
+            UserSecrets::try_from(back).expect("converts"),
+            snapshot(None)
+        );
+    }
+
+    #[test]
+    fn a_malformed_author_is_refused() {
+        let back: UserSecretsRecord = serde_json::from_str(
+            r#"{"version":3,"secrets":[],"author_replica_id":"not-a-number"}"#,
+        )
+        .expect("deserializes");
+        assert!(UserSecrets::try_from(back).is_err());
+    }
+}
+
+#[cfg(test)]
+mod record_validation_tests {
+    use super::*;
+
+    /// Bindings forward stored secret values verbatim, so the per-kind
+    /// payload rules are enforced here.
+    #[test]
+    fn a_secret_value_breaking_its_kind_is_refused() {
+        let short_key = SecretValueRecord {
+            kind: 0,
+            bytes: vec![0; 31],
+        };
+        assert!(short_key.into_value().is_err());
+
+        let unknown_kind = SecretValueRecord {
+            kind: 9,
+            bytes: Vec::new(),
+        };
+        assert!(unknown_kind.into_value().is_err());
+
+        let key = SecretValueRecord {
+            kind: 0,
+            bytes: vec![7; 32],
+        };
+        assert!(matches!(key.into_value(), Ok(SecretValue::SharedKey(k)) if k == [7; 32]));
+    }
+
+    /// A channel record must carry exactly one variant; bindings marshal
+    /// whatever the application set, and the decode here refuses the rest.
+    #[test]
+    fn a_channel_record_without_exactly_one_variant_is_refused() {
+        let helper = r#"{"schema_version":3,"channel_id":1,"transports":[{"uri":"https://h.example","protocol":0}],"communication_info":{},"peer_role":"Owner","status":"Paired","created_at":0}"#;
+        let member = r#"{"schema_version":3,"channel_id":1,"replica_id":2,"transports":[{"uri":"https://r.example","protocol":0}],"communication_info":{},"role":"Source","status":"Paired","created_at":0}"#;
+
+        assert!(
+            serde_json::from_str::<ChannelRecord>(&format!(r#"{{"Helper":{helper}}}"#)).is_ok()
+        );
+        assert!(serde_json::from_str::<ChannelRecord>("{}").is_err());
+        assert!(
+            serde_json::from_str::<ChannelRecord>(&format!(
+                r#"{{"Helper":{helper},"Replica":{member}}}"#
+            ))
+            .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod transport_endpoints_json_tests {
+    use super::*;
+    use crate::interop::ffi::common::derec_free_buffer;
+    use crate::interop::ffi::error::{DEREC_CODE_FFI_BAD_PROTO, derec_free_error};
+
+    fn frame(entries: &[derec_proto::TransportProtocol]) -> Vec<u8> {
+        let mut framed = Vec::new();
+        for entry in entries {
+            let bytes = entry.encode_to_vec();
+            prost::encoding::encode_varint(bytes.len() as u64, &mut framed);
+            framed.extend_from_slice(&bytes);
+        }
+        framed
+    }
+
+    fn decode(framed: &[u8]) -> Result<serde_json::Value, i32> {
+        let mut result = unsafe { derec_transport_endpoints_json(framed.as_ptr(), framed.len()) };
+        if result.error.code != 0 {
+            let code = result.error.code;
+            unsafe { derec_free_error(&mut result.error) };
+            return Err(code);
+        }
+        let bytes =
+            unsafe { std::slice::from_raw_parts(result.bytes.ptr, result.bytes.len) }.to_vec();
+        derec_free_buffer(result.bytes.ptr, result.bytes.len);
+        Ok(serde_json::from_slice(&bytes).expect("output is JSON"))
+    }
+
+    /// Every endpoint comes back in order, named rather than numbered.
+    #[test]
+    fn decodes_the_send_framing_into_named_endpoints() {
+        let framed = frame(&[
+            derec_proto::TransportProtocol {
+                uri: "grpcs://b.example".to_owned(),
+                protocol: derec_proto::Protocol::Grpc.into(),
+            },
+            derec_proto::TransportProtocol {
+                uri: "https://a.example/derec".to_owned(),
+                protocol: derec_proto::Protocol::Https.into(),
+            },
+        ]);
+        assert_eq!(
+            decode(&framed).unwrap(),
+            serde_json::json!([
+                { "protocol": "grpc", "uri": "grpcs://b.example" },
+                { "protocol": "https", "uri": "https://a.example/derec" },
+            ])
+        );
+        assert_eq!(decode(&[]).unwrap(), serde_json::json!([]));
+    }
+
+    /// An unknown discriminant or a truncated buffer is refused.
+    #[test]
+    fn rejects_unknown_protocols_and_truncated_buffers() {
+        let unknown = frame(&[derec_proto::TransportProtocol {
+            uri: "x://y".to_owned(),
+            protocol: 99,
+        }]);
+        assert_eq!(decode(&unknown), Err(DEREC_CODE_FFI_BAD_PROTO));
+
+        let mut truncated = frame(&[derec_proto::TransportProtocol {
+            uri: "https://a.example".to_owned(),
+            protocol: 0,
+        }]);
+        truncated.pop();
+        assert_eq!(decode(&truncated), Err(DEREC_CODE_FFI_BAD_PROTO));
     }
 }

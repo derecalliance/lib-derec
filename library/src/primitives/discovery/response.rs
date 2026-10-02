@@ -9,7 +9,7 @@ use crate::{
     utils::verify_timestamps,
 };
 use derec_proto::{
-    DeRecMessage, DeRecResult, GetSecretIdsVersionsResponseMessage, MessageBody, StatusEnum,
+    DeRecMessage, DeRecResult, GetSecretIdsVersionsResponseMessage, MessageBody,
     get_secret_ids_versions_response_message::{
         VersionList, version_list::VersionEntry as ProtoVersionEntry,
     },
@@ -52,8 +52,6 @@ impl From<&ProtoVersionEntry> for VersionEntry {
     }
 }
 
-/// One entry in a discovery response — a single secret and all versions the
-/// Helper holds for it, each paired with its human-readable description.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SecretVersionEntry {
     pub secret_id: u64,
@@ -185,14 +183,9 @@ pub fn produce(
     let secret_list: Vec<VersionList> = secret_list.iter().map(VersionList::from).collect();
 
     let message = GetSecretIdsVersionsResponseMessage {
-        result: Some(DeRecResult {
-            status: StatusEnum::Ok as i32,
-            memo: String::new(),
-        }),
+        result: Some(DeRecResult::ok()),
         secret_list,
         timestamp: Some(timestamp),
-        // Owner ↔ helper exchange: the replica path sets this, this one
-        // never does. Its absence is what marks the message helper-bound.
         replica_id: None,
     };
 

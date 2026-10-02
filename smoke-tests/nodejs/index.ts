@@ -8,12 +8,15 @@
 import { runChannelFilterConformance } from "./channelFilterConformance.js";
 import { runPrimitivesSmoke } from "./primitives.js";
 import { runProtocolSmoke } from "./protocol.js";
+import { runProtocolVersionSmoke } from "./protocolVersion.js";
 
 console.log("╔══════════════════════════════════════════╗");
 console.log("║  DeRec Node.js Smoke Tests               ║");
 console.log("╚══════════════════════════════════════════╝\n");
 
 runChannelFilterConformance();
+
+runProtocolVersionSmoke();
 
 runPrimitivesSmoke();
 

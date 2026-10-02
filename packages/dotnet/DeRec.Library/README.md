@@ -99,15 +99,20 @@ Console.WriteLine($"DeRec {version.Major}.{version.Minor}");
 ## Example: Pairing Flow
 
 The `ContactMessage` is exchanged out-of-band (QR codes, existing messaging
-channels, etc.). Two `ContactMode` values select how the public encryption
+channels, etc.). Three `ContactMode` values select how the public encryption
 material is delivered:
 
 | Mode | What the contact carries | Use when |
 |---|---|---|
 | `ContactMode.InlineKeys` (default) | Full ML-KEM encapsulation key + ECIES public key | Out-of-band channel can carry the keys (NFC, messaging). |
 | `ContactMode.HashedKeys` | Only a SHA-384 commitment to the keys | Channel is size-constrained (QR codes). Scanner fetches the actual keys via a plaintext `PrePair` round-trip and verifies them against the hash. |
+| `ContactMode.NoKeys` | Neither keys nor a commitment — only channel id, nonce and transports | Contact must be hand-typed or dictated, over a fully trusted out-of-band channel. Keys arrive via `PrePair` with nothing to check them against, so both sides confirm a fingerprint before the channel is usable. |
 
-After the handshake completes, **both modes** rekey the channel id. The
+`Pairing.Request.EncodeContact` turns a `ContactMessage` into the bytes that
+travel out of band, and `Pairing.Request.DecodeContact` turns them back. Both
+refuse a contact whose fields do not match its mode.
+
+After the handshake completes, **every mode** rekeys the channel id. The
 responder derives `SHA-384(u64_be(originalId) || sharedKey)[..8]` as a
 `ulong`, includes it in the encrypted `PairResponseMessage`, and both sides
 switch their local state to the new id. The new id never appears in plaintext
@@ -126,12 +131,12 @@ ulong channelId = 1;
 var contact = Pairing.Request.CreateContact(
     channelId,
     ContactMode.InlineKeys,
-    new TransportProtocol("https://example.com/alice"));
+    new[] { new TransportProtocol("https://example.com/alice") });
 
 // Step 2: Contact responder produces the pairing request envelope.
 var pairRequest = Pairing.Request.Produce(
     Pairing.SenderKind.Helper,
-    new TransportProtocol("https://example.com/helper"),
+    new[] { new TransportProtocol("https://example.com/helper") },
     contact.ContactMessage);
 
 // Step 3: Initiator extracts the request, then produces the response and derives the shared key.
@@ -148,6 +153,10 @@ var processed = Pairing.Response.Process(
     extractedResponse.ResponseProtoBytes,
     pairRequest.SecretKeyMaterial);
 
+// Request.Extract, Response.Produce and Response.Process each take an optional
+// serialized ParameterRange this side accepts, and refuse a peer range that does
+// not overlap it with DeRecCode.IncompatibleParameterRange.
+//
 // Both sides hold the same shared key and rekeyed channel id.
 // produced.SharedKey  ==  processed.SharedKey
 // produced.ChannelId  ==  processed.ChannelId  !=  channelId
@@ -182,11 +191,11 @@ ulong channelId = 7;
 var contact = Pairing.Request.CreateContact(
     channelId,
     ContactMode.HashedKeys,
-    new TransportProtocol("https://relay.example.com/ephemeral"));
+    new[] { new TransportProtocol("https://relay.example.com/ephemeral") });
 
 // Scanner: fetch keys via PrePair.
 var prePairReqEnv = Pairing.Request.ProducePrePair(
-    new TransportProtocol("https://scanner.example.com/ephemeral"),
+    new[] { new TransportProtocol("https://scanner.example.com/ephemeral") },
     contact.ContactMessage);
 var prePairReq = Pairing.Request.ExtractPrePair(prePairReqEnv.Envelope);
 var prePairRespEnv = Pairing.Response.ProducePrePair(
@@ -236,6 +245,67 @@ catch (DeRecException e)
     // do NOT proceed to a regular PairRequest.
 }
 ```
+
+### `NoKeys` flow (PrePair + fingerprint)
+
+`NoKeys` uses the same `PrePair` round-trip, but the contact creator
+generates its keys only when the request arrives, and the scanner has no
+commitment to check them against. A man-in-the-middle on the plaintext leg
+leaves the two sides with different shared keys, so both sides compare a
+fingerprint of the shared key out of band before trusting the channel.
+
+```csharp
+using DeRec.Library;
+using DeRec.Library.Primitives;
+
+ulong channelId = 4;
+ulong nonce = 424242; // short enough to dictate; required for NoKeys
+
+// Initiator: a NO_KEYS contact carries no keys and no secret key material.
+var contact = Pairing.Request.CreateContact(
+    channelId,
+    ContactMode.NoKeys,
+    new[] { new TransportProtocol("https://relay.example.com/ephemeral") },
+    nonce);
+
+// Scanner: ask for keys.
+var prePairReqEnv = Pairing.Request.ProducePrePair(
+    new[] { new TransportProtocol("https://scanner.example.com/ephemeral") },
+    contact.ContactMessage);
+
+// Initiator: match the request's nonce against the contact it issued, then
+// generate keys. The returned SecretKeyMaterial is the initiator's for the
+// rest of the handshake.
+var prePairReq = Pairing.Request.ExtractPrePair(prePairReqEnv.Envelope);
+var prePairResp = Pairing.Response.ProducePrePairNoKeys(
+    channelId, prePairReq.RequestProtoBytes);
+byte[] initiatorKeyMaterial = prePairResp.SecretKeyMaterial;
+
+// Scanner: accept the keys (nothing to verify them against).
+var extracted = Pairing.Response.ExtractPrePair(prePairResp.Envelope);
+var accepted = Pairing.Response.ProcessPrePairNoKeys(
+    contact.ContactMessage, extracted.ResponseProtoBytes);
+
+var filledInContact = contact.ContactMessage with
+{
+    ContactMode = ContactMode.InlineKeys,
+    MlkemEncapsulationKey = accepted.MlkemEncapsulationKey,
+    EciesPublicKey = accepted.EciesPublicKey,
+    ContactBindingHash = null,
+};
+// ... continue with the regular pairing flow against `filledInContact`,
+// using `initiatorKeyMaterial` on the initiator side.
+
+// Both sides then derive the fingerprint from their shared key and compare
+// the two strings out of band (read aloud, shown on screen).
+string fingerprint = Pairing.Fingerprint(sharedKey);
+```
+
+With the orchestrator, a `NoKeys` channel stays `ChannelStatus.Pending` —
+not a publish target, not a recovery source, inbound traffic ignored —
+until `VerifyFingerprintAsync` succeeds on both sides. Rate-limit inbound
+`PrePairRequest`s per channel and expire outstanding `NoKeys` contacts on a
+short timer.
 
 This flow is covered end to end, including the tampered-hash assertion — see
 [End-to-end test coverage](https://github.com/derecalliance/lib-derec#end-to-end-test-coverage). The
@@ -348,8 +418,29 @@ When driving the orchestrator instead of the primitives, the recovering
 device receives a `SecretRecoveredEvent` carrying the typed `Secret`. Pass it
 to `protocol.RestoreAsync(secret, version)` on a fresh `DeRecProtocol` to
 commit canonical helper / replica state and wipe the throwaway recovery-mode
-channels. Errors throw `DeRecException` with `Code` in
+channels. A helper or member with no endpoint in the recovered roster gets no
+channel; `RestoreAsync` returns a `PeerNotRestoredEvent` for it (`Reason` is
+`NotRestoredReason.NoTransports`) and restores the rest. Errors throw
+`DeRecException` with `Code` in
 {`AlreadyRestored`, `RestoreConflict`, `Invariant`, store-category code}.
+On `RestoreConflict`, `DeRecException.ConflictingChannelIds`
+(`IReadOnlyList<ulong>`, empty for every other code) lists the existing
+channels that collide with ids in the recovered `Secret` — clear exactly
+those and retry:
+
+```csharp
+try
+{
+    await protocol.RestoreAsync(recovered.Secret, version);
+}
+catch (DeRecException e) when (e.Code == DeRecCode.RestoreConflict)
+{
+    foreach (ulong channelId in e.ConflictingChannelIds)
+    {
+        // remove the stale channel at `channelId` from your stores, then retry
+    }
+}
+```
 
 > **Secret format:** the `recovered` bytes above (and the recoverable secret
 > data underlying `Secret`) are `[version byte] · payload` — v1's payload is
@@ -382,6 +473,27 @@ emitted. Follow-up peer-response events (`PairingCompletedEvent`,
 `ShareConfirmedEvent`, `SecretRecoveredEvent`, …) still surface from
 `ProcessAsync`.
 
+Every u64 identifier an event or recovered `Secret` carries (`ChannelId`,
+`PairingChannelId`, `SecretId`, `TraceId`, the replica ids, `Synced` /
+`Behind`, `HelperInfo.ChannelId`, `ReplicaInfo.ReplicaId`) is a `ulong`, the
+same type the methods take, and `ReplicaInfo.Role` is a `ReplicaRole`.
+`RejectAsync` takes the protobuf `StatusEnum` the peer receives:
+
+```csharp
+await helper.RejectAsync(action.Action,
+    Org.Derecalliance.Derec.Protobuf.StatusEnum.SizeLimitExceeded, "over quota");
+```
+
+The answer arrives typed the same way: `Status` on `ShareRejectedEvent`,
+`UnpairRejectedEvent`, `PrePairRejectedEvent`,
+`ChannelInfoUpdateRejectedEvent`, `ReplicaSyncRejectedEvent` and
+`ReplicaSecretAckedEvent` is that `StatusEnum`:
+
+```csharp
+if (ev is ShareRejectedEvent { Status: Org.Derecalliance.Derec.Protobuf.StatusEnum.SizeLimitExceeded } rejected)
+    Console.WriteLine($"helper {rejected.ChannelId} is over quota: {rejected.Memo}");
+```
+
 ```csharp
 using DeRec.Library;
 using DeRec.Library.Orchestrator;
@@ -392,15 +504,21 @@ var shareStore   = new InMemoryShareStore();
 var secretStore  = new InMemorySecretStore();
 var transport    = new RecordingTransport();
 
-using var owner = new DeRecProtocol(
-    channelStore, shareStore, secretStore, transport,
-    ownTransportUri: "https://owner.example.com");
+using var owner = new DeRecProtocolBuilder(secretId)
+    .WithChannelStore(channelStore)
+    .WithShareStore(shareStore)
+    .WithSecretStore(secretStore)
+    .WithUserSecretStore(new InMemoryUserSecretStore())
+    .WithStateStore(new InMemoryStateStore())
+    .WithTransport(transport)
+    .WithOwnTransports(new[] { new TransportProtocol("https://owner.example.com") })
+    .Build();
 
 // Pair (mirror this on the peer side).
 byte[] contact = await helper.CreateContactAsync(channelId, ContactMode.InlineKeys);
 var startEvents = await owner.StartAsync(FlowKind.Pairing, new PairingParams
 {
-    Kind = (int)Pairing.SenderKind.Owner,
+    Kind = Pairing.SenderKind.Owner,
     Contact = contact,
 });
 var started = startEvents.OfType<PairingStartedEvent>().First();
@@ -411,15 +529,16 @@ Console.WriteLine($"dispatched pair on channel {started.ChannelId}");
 // `WithAutoAccept(AutoAcceptPolicy.All())` to have the library do it.
 // Both sides surface `PairingCompletedEvent` when done.
 
-// Protect a secret across one or more helpers.
+// Protect a secret. The secret id is the one the protocol was built with,
+// and the round targets every paired helper and confirmed replica
+// destination.
 var protectEvents = await owner.StartAsync(FlowKind.ProtectSecret, new ProtectSecretParams
 {
-    SecretId = "0xCAFE",
-    TargetValue = Target.Many(helperAId, helperBId).ToJsonValue(),
     Secrets = new[]
     {
         new UserSecret { Id = new byte[] { 1 }, Name = "secret", Data = secretBytes },
     },
+    Description = "initial backup",
 });
 // One ProtectSecretStartedEvent per targeted channel (helper + replica);
 // any ProtectSecretFailedEvent { ChannelId, Version, Error } here means
@@ -471,13 +590,31 @@ Replicas mirror an Owner's secret onto a second device so the same secrets
 remain reachable after device loss. Pairings are **unidirectional** —
 one side runs as `SenderKind.ReplicaSource` (owns the secret), the other
 as `SenderKind.ReplicaDestination` (receives it). Both `DeRecProtocol`
-instances must be constructed with a stable `replicaId`:
+instances must be constructed with a stable `replicaId`. Mint it once with
+`DeRecProtocolBuilder.GenerateReplicaId()` (never `0`), persist it, and pass
+the same value on every start:
 
 ```csharp
-using var owner = new DeRecProtocol(
-    channelStore, shareStore, secretStore, transport,
-    ownTransportUri: "https://owner.example.com",
-    replicaId: 0xAAAA_AAAA_AAAA_AAAAUL);
+ulong replicaId = DeRecProtocolBuilder.GenerateReplicaId(); // persist this
+
+using var source = new DeRecProtocolBuilder(secretId)
+    .WithChannelStore(channelStore)
+    .WithShareStore(shareStore)
+    .WithSecretStore(secretStore)
+    .WithUserSecretStore(new InMemoryUserSecretStore())
+    .WithStateStore(new InMemoryStateStore())
+    .WithTransport(transport)
+    .WithOwnTransports(new[] { new TransportProtocol("https://source.example.com") })
+    .WithReplicaId(replicaId)
+    .Build();
+
+// The Source issues the contact; the Destination pairs as ReplicaDestination.
+byte[] contact = await source.CreateContactAsync(channelId, ContactMode.InlineKeys);
+await destination.StartAsync(FlowKind.Pairing, new PairingParams
+{
+    Kind = Pairing.SenderKind.ReplicaDestination,
+    Contact = contact,
+});
 ```
 
 After the handshake, channels start in `Pending` and are not eligible as
@@ -485,25 +622,29 @@ After the handshake, channels start in `Pending` and are not eligible as
 fingerprint derived from the shared key:
 
 ```csharp
-string localFp = await owner.GetFingerprintAsync(channelId);
+string localFp = await source.GetFingerprintAsync(channelId);
 string peerFp  = await destination.GetFingerprintAsync(channelId); // out of band
 
-await owner.VerifyFingerprintAsync(channelId, peerFp);             // → true
+await source.VerifyFingerprintAsync(channelId, peerFp);            // → true
 await destination.VerifyFingerprintAsync(channelId, localFp);      // → true
 ```
 
-The Source then includes the Destination in any `ProtectSecret` target
-alongside helpers. Helpers receive the usual VSS share via
-`StoreShareRequest`; the Destination receives the full secret as a typed
-`ReplicaSecretReceivedEvent`:
+The Source's confirmation publishes the current secret to every paired peer
+straight away, and every later `ProtectSecret` round includes the
+Destination alongside the helpers. Helpers receive the usual VSS share via
+`StoreShareRequest`; the Destination receives the full secret. The first
+copy of a `SecretId` surfaces as `ReplicaSecretInstalledEvent`, later
+versions as `ReplicaSecretReceivedEvent`; both carry the same fields and
+are already written to the stores when they surface:
 
 ```csharp
-var ev = events.OfType<ReplicaSecretReceivedEvent>().First();
-// ev.Secret.Helpers          — every paired helper (channel_id, transport_uri, shared_key, ...)
-// ev.Secret.Secrets[i].Data  — the actual UserSecret bytes
-// ev.Secret.Replicas         — every paired destination (replica_id, sender_kind, ...)
-// ev.Secret.OwnerReplicaId   — the Source's replica_id
-// ev.Shares                  — { ChannelId, CommittedShare } pairs keyed by helper channel id
+var ev = events.OfType<ReplicaSecretInstalledEvent>().First();
+// ev.Secret.Helpers            — every paired helper (ChannelId, Transports, SharedKey, CommunicationInfo)
+// ev.Secret.Secrets[i].Data    — the actual UserSecret bytes
+// ev.Secret.Replicas.Members   — every group member, writer included (ReplicaId, Transports, Role, CommunicationInfo)
+// ev.Secret.Replicas.Members.Single(m => m.Role == ReplicaRole.Source) — the Source
+// ev.FromReplicaId             — the member that sent this copy
+// ev.Shares                    — { ChannelId, CommittedShare } pairs keyed by helper channel id
 ```
 
 `ev.Secret` + `ev.Shares` give the Destination everything it needs to act
@@ -582,8 +723,7 @@ you can retire as soon as the PrePair leg completes.
 
 The recommended pattern is: pair on the ephemeral URI, then — as soon
 as the pairing completes on the contact creator side — call
-`SetOwnTransports` with the permanent endpoint (`SetOwnTransport` is
-deprecated and removed at 0.0.5) and start an
+`SetOwnTransports` with the permanent endpoint and start an
 `UpdateChannelInfo` flow against the peer to announce the swap. Once
 the peer acknowledges, retire the ephemeral URI. This keeps the
 plaintext PrePair window tight while letting subsequent traffic ride
@@ -599,6 +739,16 @@ throws a `DeRecException(Category = DeRecCategory.InvalidInput)` when a
 target is still `Pending`. Treat verification as a required step in the
 pairing UX — a scanner that auto-pairs without it accepts a
 MITM-vulnerable replica.
+
+Until a device confirms, it ignores everything the peer sends on that
+channel: `ProcessAsync` changes no store, sends nothing back, and returns a
+`MessageIgnoredEvent` whose `Reason` is `IgnoreReason.PendingVerification`,
+with `ChannelId` and `TraceId`. This matters most for a replica destination.
+The source's own confirmation publishes the vault immediately, so that copy
+usually arrives before the destination's user has confirmed. Confirming does
+not replay it: once the destination's `VerifyFingerprintAsync` returns `true`,
+call `StartAsync(FlowKind.ReplicaDiscovery, new ReplicaDiscoveryParams())` to
+pull the copy from the source.
 
 ### The `derec.*` namespace in `CommunicationInfo` is library-owned
 

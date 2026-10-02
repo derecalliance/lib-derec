@@ -54,7 +54,14 @@ _lint:
 	$(call section,"Lint")
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
+	# `ffi` and `logging` are not default features: without this run the C
+	# ABI layer and every logging call site would never be linted.
+	cargo clippy --workspace --all-targets --all-features -- -D warnings
 	cargo clippy -p derec-library --target wasm32-unknown-unknown -- -D warnings
+	# The SQL smoke crates are their own Cargo projects, outside the
+	# workspace, so the runs above do not reach them.
+	cd $(ROOT)/smoke-tests/sqlite && cargo fmt -- --check && cargo clippy --all-targets -- -D warnings
+	cd $(ROOT)/smoke-tests/postgres && cargo fmt -- --check && cargo clippy --all-targets -- -D warnings
 
 # Three crates publish to docs.rs, so a broken intra-doc link is as public as
 # a broken API. `-D warnings` makes rustdoc's lints fail the build the way
@@ -138,6 +145,11 @@ _test-native: _packages
 	cd $(ROOT)/smoke-tests/dotnet && dotnet run --configuration Release
 	$(call section,"Node.js binding smoke")
 	cd $(ROOT)/smoke-tests/nodejs && ./run_test.sh
+	$(call section,"Web binding smoke")
+	# Headless Chromium against a served build: the page fetches the `.wasm`
+	# over HTTP and runs as an ES module, the path an application takes. The
+	# first run downloads the browser.
+	$(ROOT)/smoke-tests/web/run_test.sh
 
 _test-js: _packages
 	$(call section,"TypeScript tests")

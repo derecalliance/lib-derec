@@ -28,7 +28,7 @@ use crate::{
 use derec_cryptography::vss;
 use derec_proto::{
     CommittedDeRecShare, DeRecMessage, DeRecResult, DeRecShare, GetShareRequestMessage,
-    GetShareResponseMessage, MessageBody, StatusEnum, StoreShareRequestMessage,
+    GetShareResponseMessage, MessageBody, StoreShareRequestMessage,
 };
 use prost::Message;
 
@@ -143,15 +143,10 @@ pub fn produce(
     let message = GetShareResponseMessage {
         share_algorithm: SHARE_ALGORITHM_VSS,
         committed_de_rec_share: stored_request.share.clone(),
-        result: Some(DeRecResult {
-            status: StatusEnum::Ok as i32,
-            memo: String::new(),
-        }),
+        result: Some(DeRecResult::ok()),
         timestamp: Some(timestamp),
         secret_id: request.secret_id,
         version: request.version,
-        // Owner ↔ helper exchange: the replica path sets this, this one
-        // never does. Its absence is what marks the message helper-bound.
         replica_id: None,
     };
 
